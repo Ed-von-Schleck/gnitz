@@ -61,6 +61,9 @@ impl CatalogEngine {
 
     // -- FK inline validation (single-worker) ------------------------------
 
+    /// Single-worker inline FK check, exercised only by the catalog tests;
+    /// production FK validation runs distributed on the wire path.
+    #[cfg(test)]
     pub(crate) fn validate_fk_inline(&self, table_id: i64, batch: &Batch) -> Result<(), String> {
         let constraints = match self.caches.fk_by_child.get(&table_id) {
             Some(c) if !c.is_empty() => c,

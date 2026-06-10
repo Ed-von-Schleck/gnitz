@@ -60,9 +60,7 @@ impl CatalogEngine {
             pending_broadcasts: Vec::new(),
             pending_dir_deletions: Vec::new(),
             checkpoint_gated_deletions: Vec::new(),
-            ddl_zone_lsn: 0,
-            cascading_drop: false,
-            in_rollback: false,
+            ctx: ApplyContext::new(),
         };
 
         if is_new {
@@ -81,8 +79,8 @@ impl CatalogEngine {
         // Phase 2: Replay catalog through hooks
         engine.replay_catalog()?;
 
-        // Enable cascading effects (e.g. auto-create FK indices)
-        engine.caches.cascade_enabled = true;
+        // Boot shard replay done: enter the live phase (see `ApplyContext`).
+        engine.ctx.go_live();
 
         Ok(engine)
     }
@@ -376,6 +374,9 @@ impl CatalogEngine {
         }
     }
 
+    /// Graceful close for tests; the server never closes the catalog (it
+    /// flushes durably per zone and exits via abort or process teardown).
+    #[cfg(test)]
     pub fn close(&mut self) {
         // Flush and close all user tables before clearing DagEngine.
         // System tables hold Borrowed handles and are flushed below.

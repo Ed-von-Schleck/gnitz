@@ -3,6 +3,11 @@ use super::*;
 impl CatalogEngine {
     // -- DDL: CREATE/DROP SCHEMA -------------------------------------------
 
+    // Like `create_table` below, the direct-call DDL entry points in this file
+    // are test-only: production DDL arrives as system-table deltas over the
+    // wire (`ingest_to_family`), never through these wrappers. `#[cfg(test)]`
+    // keeps them absent from production builds.
+    #[cfg(test)]
     pub fn create_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
         if self.caches.schema_by_name.contains_key(name) {
@@ -27,6 +32,7 @@ impl CatalogEngine {
 
     /// Drop a schema and every table, view, and index it contains
     /// (PostgreSQL's `DROP SCHEMA ... CASCADE` semantics).
+    #[cfg(test)]
     pub fn drop_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
         if !self.caches.schema_by_name.contains_key(name) {
@@ -63,6 +69,7 @@ impl CatalogEngine {
     /// from in-memory caches. Views and tables are returned separately
     /// because drop_schema drops views first (to handle view-on-view deps)
     /// and tables second (to handle FK chains).
+    #[cfg(test)]
     fn collect_schema_members(&mut self, sid: i64) -> (Vec<String>, Vec<String>) {
         let view_ids: Vec<i64> = self.caches.views_by_schema.get(&sid)
             .map(|s| s.iter().copied().collect())
@@ -85,6 +92,7 @@ impl CatalogEngine {
     /// errors, move the target to the back of the queue and retry.
     /// Finishes when the queue is empty or no progress was made in a
     /// full pass (then returns the last error).
+    #[cfg(test)]
     fn drain_drop_targets<F>(
         &mut self,
         targets: Vec<String>,
@@ -193,6 +201,7 @@ impl CatalogEngine {
         Ok(tid)
     }
 
+    #[cfg(test)]
     pub fn drop_table(&mut self, qualified_name: &str) -> Result<(), String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
         validate_user_identifier(schema_name)?;
@@ -212,6 +221,7 @@ impl CatalogEngine {
 
     // -- DDL: CREATE/DROP VIEW ---------------------------------------------
 
+    #[cfg(test)]
     pub fn drop_view(&mut self, qualified_name: &str) -> Result<(), String> {
         let (schema_name, view_name) = parse_qualified_name(qualified_name, "public");
         let qualified = format!("{}.{}", schema_name, view_name);
@@ -235,6 +245,7 @@ impl CatalogEngine {
 
     // -- DDL: CREATE/DROP INDEX --------------------------------------------
 
+    #[cfg(test)]
     pub fn create_index(
         &mut self,
         qualified_owner: &str,
@@ -320,6 +331,7 @@ impl CatalogEngine {
         Ok(index_id)
     }
 
+    #[cfg(test)]
     pub fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
         if index_name.contains(FK_INDEX_INFIX) {
             return Err("Forbidden: cannot drop internal FK index".into());
@@ -423,11 +435,11 @@ impl CatalogEngine {
     /// uniqueness is folded into the incumbent — no second index table is built
     /// (`make_index_schema` does not depend on `is_unique`; uniqueness is the flag
     /// plus the duplicate check, not a different storage layout). Empty base table
-    /// → pure flag flip. Skips the scan during catalog replay
-    /// (cascade_enabled = false) because data was validated at original write time
-    /// (mirrors the same guard in `hook_cascade_fk`).
+    /// → pure flag flip. Skips the scan outside the live phase (boot shard replay)
+    /// because data was validated at original write time (mirrors the same guard
+    /// in `hook_cascade_fk`). The flag flip below runs unconditionally.
     pub(crate) fn promote_index_to_unique(&mut self, owner_id: i64, col_idx: u32) -> Result<(), String> {
-        if self.caches.cascade_enabled {
+        if self.ctx.is_live() {
             let owner_schema = self.dag.tables.get(&owner_id).map(|e| e.schema)
                 .ok_or_else(|| format!("Index promote: owner table {} not found", owner_id))?;
             let key_type = get_index_key_type(owner_schema.columns[col_idx as usize].type_code)?;
@@ -509,6 +521,7 @@ impl CatalogEngine {
 
     // -- Write helpers for system tables -----------------------------------
 
+    #[cfg(test)]
     pub(crate) fn build_col_batch(&self, owner_id: i64, kind: i64, col_defs: &[ColumnDef], weight: i64) -> Batch {
         let schema = col_tab_schema();
         let mut bb = BatchBuilder::new(schema);
@@ -528,11 +541,13 @@ impl CatalogEngine {
         bb.finish()
     }
 
+    #[cfg(test)]
     pub(crate) fn write_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef]) -> Result<(), String> {
         let batch = self.build_col_batch(owner_id, kind, col_defs, 1);
         self.submit(SysFamily::Column, batch)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_view_deps(&mut self, vid: i64, dep_ids: &[i64]) -> Result<(), String> {
         let schema = dep_tab_schema();
         let mut bb = BatchBuilder::new(schema);

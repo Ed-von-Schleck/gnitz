@@ -264,8 +264,8 @@ fn test_fk_multiple_children_same_parent() {
         ];
         engine.create_table(name, &cols, &[0], true).unwrap()
     };
-    let child1_tid = mk_child(&mut engine, "public.child1");
-    let child2_tid = mk_child(&mut engine, "public.child2");
+    let _child1_tid = mk_child(&mut engine, "public.child1");
+    let _child2_tid = mk_child(&mut engine, "public.child2");
 
     // Both children should reference the parent
     let children = engine.fk_children_of(parent_tid);

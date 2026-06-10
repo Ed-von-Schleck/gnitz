@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use super::*;
 
 /// Cached schema wire block plus derived properties needed by the SAL
@@ -44,7 +46,7 @@ pub(crate) trait CatalogDeltaSink {
 
 impl CatalogDeltaSink for CatalogEngine {
     fn submit(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
-        if self.in_rollback {
+        if self.ctx.in_rollback() {
             // During rollback all cascade writes must bypass pending_broadcasts
             // so no compensating row is re-broadcast to workers.
             return self.submit_local(family, batch);
@@ -54,7 +56,7 @@ impl CatalogDeltaSink for CatalogEngine {
         // later trip replay_catalog.
         self.precheck_sys_ingest(id, &batch)?;
         // Apply + fire hooks, pinning this zone's writes to the DDL zone LSN.
-        self.apply_local(family, &mut batch, self.ddl_zone_lsn)?;
+        self.apply_local(family, &mut batch, self.ctx.ddl_zone_lsn())?;
 
         // Enqueue after hooks so nested cascade pushes land first and the
         // executor broadcasts children → parent. Drop empty batches so
@@ -68,7 +70,10 @@ impl CatalogDeltaSink for CatalogEngine {
     fn submit_local(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
         // No LSN pin: local applies are rollback compensation or rows the
         // workers already produce, neither of which owns this zone's durability.
-        self.apply_local(family, &mut batch, 0)
+        // `None` is deliberate even while a DDL zone is active — these rows are
+        // not in the SAL, so pinning their family's current_lsn would advance the
+        // recovery dedup watermark with no matching SAL group.
+        self.apply_local(family, &mut batch, None)
         // Deliberately no push to pending_broadcasts.
     }
 }
@@ -111,17 +116,20 @@ impl CatalogEngine {
 
     /// Apply one delta to its family's storage and fire the reaction hooks —
     /// the shared tail of [`CatalogDeltaSink::submit`] / `submit_local`. When
-    /// `pin_lsn > 0` it pins the family's `current_lsn` to the DDL zone LSN so
-    /// recovery's dedup check (`msg.lsn <= flushed`) matches the SAL group LSN;
-    /// `ingest_lsn` is seeded above every table's `current_lsn` at boot, so the
-    /// direct assignment never regresses the counter. Does NOT broadcast.
-    fn apply_local(&mut self, family: SysFamily, batch: &mut Batch, pin_lsn: u64) -> Result<(), String> {
+    /// `pin_lsn` is `Some(lsn)` it pins the family's `current_lsn` to `lsn.get()`
+    /// (the DDL zone LSN) so recovery's dedup check (`msg.lsn <= flushed`) matches
+    /// the SAL group LSN. At boot `ingest_lsn` is seeded above every table's
+    /// `current_lsn`, so the first pins never regress the counter; at runtime
+    /// un-pinned sys-table ingests auto-bump counters past the zone allocator, so
+    /// a later pin can regress a drifted counter (a pre-existing watermark
+    /// hazard, unrelated to this method). Does NOT broadcast.
+    fn apply_local(&mut self, family: SysFamily, batch: &mut Batch, pin_lsn: Option<NonZeroU64>) -> Result<(), String> {
         let id = family.id();
         let table = self.sys_table_mut(id)
             .expect("SysFamily::id() maps to a known sys table");
         ingest_batch_into(table, batch);
-        if pin_lsn > 0 {
-            table.current_lsn = pin_lsn;
+        if let Some(lsn) = pin_lsn {
+            table.current_lsn = lsn.get();
         }
         batch.set_schema(sys_tab_schema(id));
         self.fire_hooks(family, batch)
@@ -159,6 +167,9 @@ impl CatalogEngine {
     /// or already retracted; emitters resolve the friendly "does not exist"
     /// message from the caches before calling, so the `count == 0` arm only
     /// fires on cache/storage divergence.
+    /// Only the test-only direct DDL drop paths (`ddl.rs`) retract engine-side;
+    /// production retractions arrive as wire deltas.
+    #[cfg(test)]
     pub(crate) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
         let schema = sys_tab_schema(family.id());
         let batch = {
@@ -361,7 +372,7 @@ impl CatalogEngine {
         // DROP TABLE cascade legitimately retracts the owner's own indices, so
         // it is exempt (the table drop already passed its own precheck).
         if table_id == IDX_TAB_ID {
-            if self.cascading_drop {
+            if self.ctx.in_cascade_drop() {
                 return Ok(());
             }
             for &idx_id in &drop_ids {
@@ -710,19 +721,17 @@ impl CatalogEngine {
 
         // Replay each with negated weight through the no-broadcast path.
         // fire_hooks still fires so caches, dag.tables, and pending_dir_deletions
-        // are updated. The in_rollback gate in `submit` ensures any cascade that
+        // are updated. The rollback gate in `submit` ensures any cascade that
         // calls back into `submit` also bypasses broadcasts.
-        self.in_rollback = true;
-        let result = (|| -> Result<(), String> {
+        let result = self.with_rollback_compensation(|s| -> Result<(), String> {
             for (tid, mut batch) in rollback_list {
                 Self::negate_batch_in_place(&mut batch);
                 let family = SysFamily::from_id(tid)
                     .ok_or_else(|| format!("rollback: unknown system family {}", tid))?;
-                self.submit_local(family, batch)?;
+                s.submit_local(family, batch)?;
             }
             Ok(())
-        })();
-        self.in_rollback = false;
+        });
 
         // For CREATE: drain cleans up any pre-staged directories from hooks.
         // For DROP: discard keeps the entity files on disk (drop was not durable).
@@ -738,19 +747,6 @@ impl CatalogEngine {
                  aborting to prevent serving a diverged catalog. Cause: {}", e
             );
         });
-    }
-
-    /// Pin all system-table writes in the current DDL to `lsn`. Must be
-    /// called before the mutate phase so every cascading hook sees the same
-    /// value; cleared by `clear_ddl_zone_lsn` after fsync (or on error).
-    pub(crate) fn set_ddl_zone_lsn(&mut self, lsn: u64) {
-        self.ddl_zone_lsn = lsn;
-    }
-
-    /// Release the DDL zone LSN after the zone is durably committed (or
-    /// rolled back). Subsequent non-DDL ingest paths use the auto-bump.
-    pub(crate) fn clear_ddl_zone_lsn(&mut self) {
-        self.ddl_zone_lsn = 0;
     }
 
     /// Ingest a user-table batch and return the effective delta (after unique_pk
@@ -771,33 +767,6 @@ impl CatalogEngine {
             Some(eff) => Ok(eff),
             None => Err(format!("ingest returned no effective batch for table_id={}", table_id)),
         }
-    }
-
-    /// Ingest a batch into a user table AND run the single-worker DAG cascade.
-    /// For unique_pk tables, the effective batch (with auto-retractions) is
-    /// passed to the DAG evaluator so views see correct deltas.
-    /// System tables are NOT supported; use ingest_to_family for those.
-    pub fn push_and_evaluate(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
-        if table_id < FIRST_USER_TABLE_ID {
-            return Err("push_and_evaluate not supported for system tables".to_string());
-        }
-
-        let (rc, effective_opt) = self.dag.ingest_returning_effective(table_id, batch);
-        if rc < 0 {
-            return Err(format!("ingest failed for table_id={} rc={}", table_id, rc));
-        }
-
-        // Flush the source table
-        let _ = self.dag.flush(table_id);
-
-        // Run DAG cascade with the effective batch
-        if let Some(effective) = effective_opt {
-            if effective.count > 0 {
-                self.dag.evaluate_dag(table_id, effective);
-            }
-        }
-
-        Ok(())
     }
 
     /// Scan all positive-weight rows from a table.
@@ -1142,13 +1111,6 @@ impl CatalogEngine {
             .map(|c| (c.fk_col_idx, c.target_table_id, c.target_col_idx))
     }
 
-    /// Get FK column type code (for promote_to_key in distributed validation).
-    pub fn get_fk_col_type(&self, table_id: i64, fk_col_idx: usize) -> u8 {
-        self.dag.tables.get(&table_id)
-            .map(|e| e.schema.columns[fk_col_idx].type_code)
-            .unwrap_or(0)
-    }
-
     /// Number of index circuits on a table.
     pub fn get_index_circuit_count(&self, table_id: i64) -> usize {
         self.dag.tables.get(&table_id)
@@ -1289,12 +1251,6 @@ impl CatalogEngine {
         self.caches.schema_wire_cache.insert(table_id, (block, wire_safe, wire_row_fixed_stride));
     }
 
-    /// True if any lock is needed for inserts into this table.
-    /// Cached: set on table/index create/drop, no per-call overhead.
-    pub fn needs_table_lock(&self, table_id: i64) -> bool {
-        self.caches.needs_lock.contains(&table_id)
-    }
-
     /// Return the full set of table IDs that must be locked together for a
     /// write to `table_id`, sorted ascending to guarantee deadlock-free
     /// acquisition. Includes `table_id` itself plus all FK parents (to
@@ -1357,8 +1313,9 @@ impl CatalogEngine {
             .collect()
     }
 
-    /// Get max flushed LSN for a table (for SAL recovery). Handles both
-    /// user tables (via the DAG) and system tables (via direct lookup).
+    /// Get max flushed LSN for a table. Recovery itself reads the bulk map
+    /// from `collect_all_flushed_lsns`; this single-table form is test-only.
+    #[cfg(test)]
     pub fn get_max_flushed_lsn(&self, table_id: i64) -> u64 {
         if table_id > 0 && table_id < FIRST_USER_TABLE_ID {
             return self.sys_table_current_lsn(table_id);
@@ -1398,9 +1355,9 @@ impl CatalogEngine {
         for &tid in SYS_TABLE_IDS {
             map.insert(tid, self.sys_table_current_lsn(tid));
         }
-        for &tid in self.dag.tables.keys() {
+        for (&tid, entry) in self.dag.tables.iter() {
             if tid >= FIRST_USER_TABLE_ID {
-                map.insert(tid, self.get_max_flushed_lsn(tid));
+                map.insert(tid, entry.handle.current_lsn());
             }
         }
         map
@@ -1520,22 +1477,29 @@ impl CatalogEngine {
         self.dag.tables.contains_key(&table_id)
     }
 
+    // The following registry getters are exercised only by the catalog tests;
+    // production code reads the caches/DAG entries directly.
+    #[cfg(test)]
     pub fn get_schema(&self, table_id: i64) -> Option<SchemaDescriptor> {
         self.dag.tables.get(&table_id).map(|e| e.schema)
     }
 
+    #[cfg(test)]
     pub fn get_schema_name_by_id(&self, schema_id: i64) -> &str {
         self.caches.schema_by_id.get(&schema_id).map(|s| s.as_str()).unwrap_or("")
     }
 
+    #[cfg(test)]
     pub fn has_schema(&self, name: &str) -> bool {
         self.caches.schema_by_name.contains_key(name)
     }
 
+    #[cfg(test)]
     pub fn get_schema_id(&self, name: &str) -> i64 {
         self.caches.schema_by_name.get(name).copied().unwrap_or(-1)
     }
 
+    #[cfg(test)]
     pub fn schema_is_empty(&self, schema_name: &str) -> bool {
         let sid = match self.caches.schema_by_name.get(schema_name) {
             Some(&sid) => sid,
@@ -1562,10 +1526,6 @@ impl CatalogEngine {
         let iid = self.next_index_id;
         self.next_index_id += 1;
         iid
-    }
-
-    pub fn get_depth(&self, table_id: i64) -> i32 {
-        self.dag.tables.get(&table_id).map(|e| e.depth).unwrap_or(0)
     }
 
     pub fn get_qualified_name(&self, table_id: i64) -> Option<(&str, &str)> {
@@ -1611,11 +1571,13 @@ impl CatalogEngine {
         )
     }
 
+    #[cfg(test)]
     pub fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<i64> {
         let qualified = format!("{}.{}", schema_name, table_name);
         self.caches.entity_by_qname.get(&qualified).copied()
     }
 
+    #[cfg(test)]
     pub fn has_index_by_name(&self, name: &str) -> bool {
         self.caches.index_by_name.contains_key(name)
     }
@@ -1656,7 +1618,7 @@ impl CatalogEngine {
 fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor {
     let mut cols: Vec<SchemaColumn> = Vec::with_capacity(schema.pk_indices().len() + project.len());
     let mut pk_idx: Vec<u32> = Vec::with_capacity(schema.pk_indices().len());
-    for (_, ci, col) in schema.pk_columns() {
+    for (_, _, col) in schema.pk_columns() {
         pk_idx.push(cols.len() as u32);
         cols.push(*col);
     }

@@ -13,6 +13,9 @@ pub(crate) const PUBLIC_SCHEMA_ID: i64 = 2;
 pub(super) const FIRST_USER_SCHEMA_ID: i64 = gnitz_wire::FIRST_USER_SCHEMA_ID as i64;
 
 pub(super) const OWNER_KIND_TABLE: i64 = gnitz_wire::OWNER_KIND_TABLE as i64;
+// Production code never writes view column records directly (they arrive via
+// the wire path); only the catalog tests do.
+#[cfg(test)]
 pub(super) const OWNER_KIND_VIEW: i64 = gnitz_wire::OWNER_KIND_VIEW as i64;
 
 pub(crate) const SEQ_ID_SCHEMAS: i64 = 1;
@@ -37,13 +40,6 @@ pub(super) const CIRCUIT_NODES_TAB_ID: i64        = gnitz_wire::CIRCUIT_NODES_TA
 pub(super) const CIRCUIT_EDGES_TAB_ID: i64        = gnitz_wire::CIRCUIT_EDGES_TAB as i64;
 pub(super) const CIRCUIT_NODE_COLUMNS_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB as i64;
 
-// Column indices for system tables (matching COL_* constants).
-pub(super) const TABLETAB_COL_SCHEMA_ID: usize = 1;
-pub(super) const TABLETAB_COL_NAME: usize = 2;
-pub(super) const TABLETAB_COL_DIRECTORY: usize = 3;
-pub(super) const TABLETAB_COL_PK_COL_IDX: usize = 4;
-pub(super) const TABLETAB_COL_CREATED_LSN: usize = 5;
-pub(super) const TABLETAB_COL_FLAGS: usize = 6;
 pub(super) const TABLETAB_FLAG_UNIQUE_PK: u64 = 1;
 
 // PK list encoding lives in gnitz-wire so the client and engine cannot
@@ -115,21 +111,11 @@ pub(super) fn validate_pk_cols(
     Ok(())
 }
 
-pub(super) const SCHEMATAB_COL_NAME: usize = 1;
-
-pub(super) const VIEWTAB_COL_SCHEMA_ID: usize = 1;
-pub(super) const VIEWTAB_COL_NAME: usize = 2;
-pub(super) const VIEWTAB_COL_SQL_DEFINITION: usize = 3;
-pub(super) const VIEWTAB_COL_CACHE_DIRECTORY: usize = 4;
-pub(super) const VIEWTAB_COL_CREATED_LSN: usize = 5;
 pub(super) const VIEWTAB_COL_PK_COL_IDX: usize = 6;
 // Payload-column index (PK column 0 excluded) for the readers in
 // `apply_pk_col_of` / `hook_view_register`, mirroring the IDXTAB_PAY_* pattern.
 pub(crate) const VIEWTAB_PAY_PK_COL_IDX: usize = VIEWTAB_COL_PK_COL_IDX - 1;
 
-pub(super) const COLTAB_COL_OWNER_ID: usize = 1;
-pub(super) const COLTAB_COL_OWNER_KIND: usize = 2;
-pub(super) const COLTAB_COL_COL_IDX: usize = 3;
 pub(super) const COLTAB_COL_NAME: usize = 4;
 pub(super) const COLTAB_COL_TYPE_CODE: usize = 5;
 pub(super) const COLTAB_COL_IS_NULLABLE: usize = 6;
@@ -137,11 +123,9 @@ pub(super) const COLTAB_COL_FK_TABLE_ID: usize = 7;
 pub(super) const COLTAB_COL_FK_COL_IDX: usize = 8;
 
 pub(super) const IDXTAB_COL_OWNER_ID: usize = 1;
-pub(super) const IDXTAB_COL_OWNER_KIND: usize = 2;
 pub(super) const IDXTAB_COL_SOURCE_COL_IDX: usize = 3;
 pub(super) const IDXTAB_COL_NAME: usize = 4;
 pub(super) const IDXTAB_COL_IS_UNIQUE: usize = 5;
-pub(super) const IDXTAB_COL_CACHE_DIRECTORY: usize = 6;
 
 // Payload-column indices into an IDX_TAB *batch* — the layout seen by
 // `read_batch_u64`/`read_batch_string`, where the single-column PK `index_id`
@@ -151,12 +135,6 @@ pub(crate) const IDXTAB_PAY_OWNER_ID: usize       = IDXTAB_COL_OWNER_ID - 1;
 pub(crate) const IDXTAB_PAY_SOURCE_COL_IDX: usize = IDXTAB_COL_SOURCE_COL_IDX - 1;
 pub(crate) const IDXTAB_PAY_NAME: usize           = IDXTAB_COL_NAME - 1;
 pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize      = IDXTAB_COL_IS_UNIQUE - 1;
-
-// Compound-PK layout: view_id (PK0) and dep_table_id (PK1) live in the PK
-// region; dep_view_id is the sole payload column.
-pub(super) const DEPTAB_COL_VIEW_ID: usize = 0;
-pub(super) const DEPTAB_COL_DEP_TABLE_ID: usize = 1;
-pub(super) const DEPTAB_COL_DEP_VIEW_ID: usize = 2;
 
 pub(super) const SEQTAB_COL_VALUE: usize = 1;
 
@@ -170,20 +148,8 @@ pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024;          // 256 KB
 pub(super) const fn u64_col() -> SchemaColumn {
     SchemaColumn::new(type_code::U64, 0)
 }
-pub(super) const fn u64_col_nullable() -> SchemaColumn {
-    SchemaColumn::new(type_code::U64, 1)
-}
-pub(super) const fn u128_col() -> SchemaColumn {
-    SchemaColumn::new(type_code::U128, 0)
-}
 pub(super) const fn str_col() -> SchemaColumn {
     SchemaColumn::new(type_code::STRING, 0)
-}
-pub(super) const fn str_col_nullable() -> SchemaColumn {
-    SchemaColumn::new(type_code::STRING, 1)
-}
-pub(super) const fn blob_col_nullable() -> SchemaColumn {
-    SchemaColumn::new(type_code::BLOB, 1)
 }
 pub(super) const fn zero_col() -> SchemaColumn {
     SchemaColumn::new(0, 0)
@@ -281,6 +247,10 @@ pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
 /// only because every circuit-PK column is exactly 8 bytes and unsigned.
 /// Changing either encoder, the column widths, or the signedness breaks view
 /// loading (prefix seeks on `view_id.to_be_bytes()`).
+///
+/// Production circuit rows arrive pre-packed over the wire; only the tests
+/// (here and in `reopen_rebuild_tests`) build them engine-side.
+#[cfg(test)]
 pub(super) fn pack_view_pk(view_id: i64, sub: u64) -> u128 {
     ((view_id as u64 as u128) << 64) | (sub as u128)
 }

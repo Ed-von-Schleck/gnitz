@@ -259,23 +259,25 @@ fn test_ddl_sync() {
 
 #[test]
 fn test_ddl_sync_zone_lsn_tracking() {
-    // Invariant: while `ddl_zone_lsn` is set, `ingest_to_family` pins each
+    // Invariant: while a DDL zone is open, `ingest_to_family` pins each
     // touched system table's `current_lsn` to that zone LSN. After successive
     // DDL zones, `get_max_flushed_lsn` reports the most recent zone LSN,
     // and recovery can skip already-applied groups.
+    use std::num::NonZeroU64;
     use crate::catalog::sys_tables::{SCHEMA_TAB_ID, TABLE_TAB_ID, COL_TAB_ID};
 
+    let zone = |lsn: u64| NonZeroU64::new(lsn).unwrap();
     let dir = temp_dir("catalog_zone_lsn");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
     // Zone 5: create a schema. SCHEMA_TAB pinned to lsn=5.
-    engine.set_ddl_zone_lsn(5);
+    engine.ctx.open_ddl_zone(zone(5));
     engine.create_schema("z").unwrap();
     assert_eq!(engine.get_max_flushed_lsn(SCHEMA_TAB_ID), 5);
 
     // Zone 7: create a table. TABLE_TAB and COL_TAB pinned to lsn=7;
     // SCHEMA_TAB stays at 5 (untouched in this zone).
-    engine.set_ddl_zone_lsn(7);
+    engine.ctx.open_ddl_zone(zone(7));
     let cols = vec![u64_col_def("id"), u64_col_def("val")];
     let _tid = engine.create_table("z.t", &cols, &[0], false).unwrap();
     assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 7);
@@ -284,7 +286,7 @@ fn test_ddl_sync_zone_lsn_tracking() {
         "SCHEMA_TAB stays at the most recent zone that touched it");
 
     // Zone 9: another table. TABLE_TAB and COL_TAB advance to lsn=9.
-    engine.set_ddl_zone_lsn(9);
+    engine.ctx.open_ddl_zone(zone(9));
     let _tid2 = engine.create_table("z.t2", &cols, &[0], false).unwrap();
     assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 9);
     assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 9);
@@ -369,7 +371,7 @@ fn test_fk_index_metadata_queries() {
 
     // FK count
     assert!(engine.get_fk_count(child_tid) > 0);
-    let (col_idx, target_id, _parent_col) = engine.get_fk_constraint(child_tid, 0).unwrap();
+    let (_col_idx, target_id, _parent_col) = engine.get_fk_constraint(child_tid, 0).unwrap();
     assert_eq!(target_id, tid);
 
     // Create an explicit index

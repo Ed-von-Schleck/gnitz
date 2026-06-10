@@ -741,6 +741,7 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// Check if a PK exists with positive net weight.
+    #[cfg(test)] // production existence checks go through has_pk_bytes
     pub fn has_pk(&mut self, key: u128) -> bool {
         let (opk, n) = columnar::opk_key(&self.schema, key);
         self.has_pk_bytes(&opk[..n])

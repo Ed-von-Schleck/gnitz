@@ -39,7 +39,6 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) fk_by_child:      FxHashMap<i64, Vec<FkConstraint>>,
     pub(crate) fk_by_parent:     FxHashMap<i64, Vec<FkParentRef>>,
     pub(crate) needs_lock:       FxHashSet<i64>,
-    pub(crate) cascade_enabled:  bool,
 }
 
 /// Increment a schema version counter: wraps 65535 → 1, never 0.
@@ -172,8 +171,9 @@ impl CatalogEngine {
                 // Table dropped: clear per-table cache entries without bumping the
                 // schema version (there is no new schema to advertise).
                 // `clear_col_cache_no_bump` is the only column-cache cleanup on
-                // the `in_rollback` path where `cascade_retract_columns` is
-                // skipped. The schema_version / index_version counters are NOT
+                // the rollback path (`ctx.in_rollback()`) where
+                // `cascade_retract_columns` is skipped.
+                // The schema_version / index_version counters are NOT
                 // removed here: the column/index cascade fires AFTER this applier
                 // (apply_entity_by_id runs before hook_table_register) and would
                 // `or_insert` them straight back. They are purged post-cascade by
@@ -306,7 +306,11 @@ impl CatalogEngine {
         Ok(())
     }
 
-    pub(crate) fn apply_fk_by_child(&mut self, batch: &Batch) -> Result<(), String> {
+    /// Maintain `fk_by_child` and `fk_by_parent` from a single pass over a
+    /// COL_TAB delta — both caches key off the same FK fields and share their
+    /// lifecycle, and at boot replay the batch is the full sys_columns scan,
+    /// so decoding it once matters.
+    pub(crate) fn apply_fk_constraints(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let fk_table_id = self.read_batch_u64(batch, i, 6) as i64;
             if fk_table_id == 0 { continue; }
@@ -321,40 +325,27 @@ impl CatalogEngine {
                 if !constraints.iter().any(|c| c.fk_col_idx == col_idx) {
                     constraints.push(FkConstraint { fk_col_idx: col_idx, target_table_id: fk_table_id, target_col_idx });
                 }
-            } else if let Entry::Occupied(mut e) = self.caches.fk_by_child.entry(owner_id) {
-                let constraints = e.get_mut();
-                if let Some(pos) = constraints.iter().position(|c| c.fk_col_idx == col_idx) {
-                    constraints.swap_remove(pos);
-                }
-                if e.get().is_empty() { e.remove(); }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn apply_fk_by_parent(&mut self, batch: &Batch) -> Result<(), String> {
-        for i in 0..batch.count {
-            let fk_table_id = self.read_batch_u64(batch, i, 6) as i64;
-            if fk_table_id == 0 { continue; }
-
-            let weight = batch.get_weight(i);
-            let owner_id = self.read_batch_u64(batch, i, 0) as i64;
-            let col_idx = self.read_batch_u64(batch, i, 2) as usize;        // child col
-            let target_col_idx = self.read_batch_u64(batch, i, 7) as usize; // parent col (COL_TAB col 8)
-
-            if weight > 0 {
                 let parents = self.caches.fk_by_parent.entry(fk_table_id).or_default();
                 if !parents.iter().any(|r| r.child_tid == owner_id && r.fk_col_idx == col_idx) {
                     parents.push(FkParentRef {
                         child_tid: owner_id, fk_col_idx: col_idx, parent_col_idx: target_col_idx,
                     });
                 }
-            } else if let Entry::Occupied(mut e) = self.caches.fk_by_parent.entry(fk_table_id) {
-                let parents = e.get_mut();
-                if let Some(pos) = parents.iter().position(|r| r.child_tid == owner_id && r.fk_col_idx == col_idx) {
-                    parents.swap_remove(pos);
+            } else {
+                if let Entry::Occupied(mut e) = self.caches.fk_by_child.entry(owner_id) {
+                    let constraints = e.get_mut();
+                    if let Some(pos) = constraints.iter().position(|c| c.fk_col_idx == col_idx) {
+                        constraints.swap_remove(pos);
+                    }
+                    if e.get().is_empty() { e.remove(); }
                 }
-                if e.get().is_empty() { e.remove(); }
+                if let Entry::Occupied(mut e) = self.caches.fk_by_parent.entry(fk_table_id) {
+                    let parents = e.get_mut();
+                    if let Some(pos) = parents.iter().position(|r| r.child_tid == owner_id && r.fk_col_idx == col_idx) {
+                        parents.swap_remove(pos);
+                    }
+                    if e.get().is_empty() { e.remove(); }
+                }
             }
         }
         Ok(())

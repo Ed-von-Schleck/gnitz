@@ -12,6 +12,7 @@ use super::error::StorageError;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
 use super::table::{self, FlushOutcome, FlushWork, Persistence, Table};
+#[cfg(test)] // only the test-only native-u128 has_pk/retract_pk need opk_key
 use super::columnar;
 
 thread_local! {
@@ -221,8 +222,9 @@ impl PartitionedTable {
     /// ingestion does (`partition_for_pk_bytes(get_pk_bytes)`) — so a signed or
     /// compound key reaches the same partition it was ingested into. Routing on
     /// the raw native value would `mix(native) != mix(widen_pk_be(opk))` and probe
-    /// the wrong partition. The sole production caller is the lone-PK FK existence
+    /// the wrong partition. The sole caller is the test-only lone-PK FK existence
     /// check (passes a native value); all DML retraction routes through `_bytes`.
+    #[cfg(test)]
     pub fn has_pk(&mut self, key: u128) -> bool {
         let (opk, n) = columnar::opk_key(&self.schema, key);
         self.has_pk_bytes(&opk[..n])

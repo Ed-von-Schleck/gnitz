@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables)]
 //! Catalog engine: DDL operations, system table management, hook processing,
 //! and entity registry.
 //!
@@ -27,6 +26,7 @@
 //! See `hooks.rs` for the cross-sys-table ordering contract and where it's
 //! enforced.
 
+mod apply_context;
 mod sys_tables;
 mod types;
 mod utils;
@@ -58,10 +58,12 @@ use sys_tables::*;
 
 // Re-export types needed by other modules.
 pub(crate) use types::{ColumnDef, FkConstraint, FkParentRef};
-pub(crate) use gnitz_wire::{FK_INDEX_INFIX, validate_user_identifier};
-pub(crate) use utils::{BatchBuilder, parse_qualified_name,
+pub(crate) use gnitz_wire::FK_INDEX_INFIX;
+#[cfg(test)]
+pub(crate) use gnitz_wire::validate_user_identifier;
+pub(crate) use utils::{BatchBuilder,
                        index_meta_schema_desc, INDEX_META_COL_NAMES,
-                       make_fk_index_name, make_secondary_index_name, ingest_batch_into,
+                       make_fk_index_name, ingest_batch_into,
                        schema_dir, table_dir, view_dir, index_dir,
                        is_index_dir_name, is_table_dir_name, subdir_names,
                        ensure_dir, fsync_dir,
@@ -71,9 +73,12 @@ pub(crate) use utils::{BatchBuilder, parse_qualified_name,
                        retract_single_row,
                        retract_rows_by_view,
                        retract_rows_in_pk_range};
+#[cfg(test)]
+pub(crate) use utils::{parse_qualified_name, make_secondary_index_name};
 pub(crate) use cache::CatalogCacheSet;
 pub(crate) use sys_tables::SysFamily;
 pub(crate) use store::CatalogDeltaSink;
+pub(crate) use apply_context::ApplyContext;
 
 // ---------------------------------------------------------------------------
 // CatalogEngine
@@ -138,22 +143,9 @@ pub struct CatalogEngine {
     /// every worker has consumed past this DROP — hence finished the CREATE.
     pub(crate) checkpoint_gated_deletions: Vec<String>,
 
-    // 0 means "no zone active". The executor sets this before the DDL
-    // mutate phase and clears it after fsync so every hook in the same
-    // zone writes the same `current_lsn`. Recovery's dedup filter then
-    // matches the SAL group's zone LSN, preventing double-apply.
-    ddl_zone_lsn: u64,
-
-    // Set while a DROP TABLE cascade is retracting an owner's own indices.
-    // Those retractions are legitimate (the table's drop already passed the
-    // FK/view-dep precheck), so the IDX_TAB integrity guard is suppressed for
-    // them — it only protects against standalone user DROP INDEX.
-    cascading_drop: bool,
-
-    // Set only by compensate_stage_a for the duration of a rollback. Guards
-    // cascade hooks that must not re-issue broadcasts or re-run side effects
-    // (backfill_index, backfill_view, cascade_retract_columns, hook_cascade_fk)
-    // during compensation. Never nested; always cleared before returning.
-    pub(crate) in_rollback: bool,
+    // The applier's current execution context: replay/live phase, the two
+    // transient sub-operation flags (rollback / cascade-drop), and the
+    // DDL-zone LSN. See `ApplyContext`.
+    pub(crate) ctx: ApplyContext,
 }
 

@@ -9,9 +9,6 @@ fn uuid_col_def(name: &str) -> ColumnDef {
     ColumnDef { name: name.into(), type_code: type_code::UUID, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
 }
 
-fn nullable_uuid_col_def(name: &str) -> ColumnDef {
-    ColumnDef { name: name.into(), type_code: type_code::UUID, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 }
-}
 
 // ── test_uuid_pk_create_and_drop ─────────────────────────────────────
 

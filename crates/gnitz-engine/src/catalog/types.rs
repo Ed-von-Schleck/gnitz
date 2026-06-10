@@ -1,5 +1,3 @@
-use super::*;
-
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -40,20 +38,3 @@ pub(crate) struct FkParentRef {
     pub(crate) parent_col_idx: usize,  // referenced parent column position
 }
 
-// ---------------------------------------------------------------------------
-// Index info
-// ---------------------------------------------------------------------------
-
-pub(crate) struct IndexInfo {
-    pub(crate) index_id: i64,
-    pub(crate) owner_id: i64,
-    pub(crate) source_col_idx: u32,
-    pub(crate) source_col_type: u8,
-    pub(crate) index_key_type: u8,
-    pub(crate) source_pk_type: u8,
-    pub(crate) name: String,
-    pub(crate) is_unique: bool,
-    pub(crate) cache_dir: String,
-    /// Owned Table for the index storage. Box prevents moves.
-    pub(crate) table: Box<Table>,
-}

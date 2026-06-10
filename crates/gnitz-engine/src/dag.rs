@@ -82,6 +82,7 @@ impl StoreHandle {
     /// Dispatched `has_pk` that works for every variant. Takes a **native**
     /// `u128`; routes via `opk_key` internally. Never feed it `get_pk`
     /// (OPK-widened) — use [`has_pk_bytes`] for verbatim OPK bytes.
+    #[cfg(test)] // sole caller is the test-only inline FK check (validate_fk_inline)
     pub fn has_pk(&self, key: u128) -> bool {
         let tptr = self.table_ptr();
         unsafe {
@@ -511,6 +512,7 @@ impl DagEngine {
 
     // ── Cache management ────────────────────────────────────────────────
 
+    #[cfg(test)] // sole callers are the test-only drop_view path and the dag tests
     pub fn invalidate(&mut self, view_id: i64) {
         self.cache.remove(&view_id);
         self.shard_cols_cache.remove(&view_id);
@@ -1865,7 +1867,9 @@ impl DagEngine {
         out
     }
 
-    /// Close the DagEngine, dropping all cached plans.
+    /// Close the DagEngine, dropping all cached plans. Test-only, like the
+    /// `CatalogEngine::close` that drives it: the server never closes gracefully.
+    #[cfg(test)]
     pub fn close(&mut self) {
         self.cache.clear();
         self.tables.clear();

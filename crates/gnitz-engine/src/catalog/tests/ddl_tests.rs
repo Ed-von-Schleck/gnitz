@@ -118,7 +118,7 @@ fn test_edge_cases() {
         "cascade must drop the contained table");
 
     // 7. Unqualified name defaults to public
-    let tid7 = engine.create_table("tbl3", &cols, &[0], true).unwrap();
+    let _tid7 = engine.create_table("tbl3", &cols, &[0], true).unwrap();
     assert!(engine.get_by_name("public", "tbl3").is_some());
     engine.drop_table("public.tbl3").unwrap();
 

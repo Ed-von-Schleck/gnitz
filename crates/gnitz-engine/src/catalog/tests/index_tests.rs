@@ -23,7 +23,7 @@ fn test_index_creation_and_backfill() {
     let _ = engine.dag.flush(tid);
 
     // Create index
-    let idx_id = engine.create_index("public.tfanout", "val", false).unwrap();
+    let _idx_id = engine.create_index("public.tfanout", "val", false).unwrap();
     assert!(engine.has_index_by_name("public__tfanout__idx_val"));
 
     // Drop index

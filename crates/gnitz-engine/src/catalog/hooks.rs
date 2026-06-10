@@ -71,8 +71,7 @@ impl CatalogEngine {
             }
             SysFamily::Column => {
                 self.apply_col_names_invalidate(batch)?;
-                self.apply_fk_by_child(batch)?;
-                self.apply_fk_by_parent(batch)?;
+                self.apply_fk_constraints(batch)?;
                 self.apply_needs_lock(COL_TAB_ID, batch)?;
             }
             SysFamily::Index => {
@@ -166,17 +165,18 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
-            let sid = self.read_batch_u64(batch, i, 0) as i64;
-            let name = self.read_batch_string(batch, i, 1);
-            let pk = unpack_pk_cols(self.read_batch_u64(batch, i, 3));
-            let flags = self.read_batch_u64(batch, i, 5);
-            let is_unique = (flags & TABLETAB_FLAG_UNIQUE_PK) != 0;
 
             if weight > 0 {
                 // System tables are pre-registered by `register_system_table_families`
                 // before `replay_catalog` fires hooks, so their rows show up here
                 // with the DAG already populated. Skip to avoid double-registration.
                 if self.dag.tables.contains_key(&tid) { continue; }
+
+                let sid = self.read_batch_u64(batch, i, 0) as i64;
+                let name = self.read_batch_string(batch, i, 1);
+                let pk = unpack_pk_cols(self.read_batch_u64(batch, i, 3));
+                let flags = self.read_batch_u64(batch, i, 5);
+                let is_unique = (flags & TABLETAB_FLAG_UNIQUE_PK) != 0;
 
                 let col_defs = self.read_column_defs(tid);
                 if col_defs.is_empty() {
@@ -223,12 +223,12 @@ impl CatalogEngine {
                 // FK/view-dep-blocked drops before the -1 row reaches the WAL.
                 // cascade_retract_indices cleans up any in-transaction FK indices
                 // (those were never broadcast and must be physically removed).
-                // During rollback the in_rollback gate in ingest_to_family ensures
-                // these writes bypass pending_broadcasts.
+                // During rollback the rollback gate in `CatalogDeltaSink::submit`
+                // ensures these writes bypass pending_broadcasts.
                 self.cascade_retract_indices(tid)?;
                 // During CREATE TABLE rollback the column records were committed by
                 // prior RPCs; retracting them here would diverge master from workers.
-                if !self.in_rollback {
+                if !self.ctx.in_rollback() {
                     self.cascade_retract_columns(tid)?;
                 }
                 self.dag.unregister_table(tid);
@@ -253,21 +253,15 @@ impl CatalogEngine {
         let schema = sys_tab_schema(IDX_TAB_ID);
         // These retractions are part of the owner's drop, not a standalone
         // DROP INDEX, so the IDX_TAB integrity guard must not block them.
-        // Save/restore rather than blind reset so a nested cascade can't clear
-        // an outer cascade's flag.
-        let prev = self.cascading_drop;
-        self.cascading_drop = true;
-        let result = (|| {
+        self.with_cascade_drop(|s| {
             for idx_id in idx_ids {
-                let batch = retract_single_row(&self.sys_indices, &schema, idx_id as u128);
+                let batch = retract_single_row(&s.sys_indices, &schema, idx_id as u128);
                 if batch.count > 0 {
-                    self.submit(SysFamily::Index, batch)?;
+                    s.submit(SysFamily::Index, batch)?;
                 }
             }
             Ok(())
-        })();
-        self.cascading_drop = prev;
-        result
+        })
     }
 
     fn cascade_retract_columns(&mut self, owner_id: i64) -> Result<(), String> {
@@ -287,13 +281,14 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let vid = batch.get_pk(i) as i64;
-            let sid = self.read_batch_u64(batch, i, 0) as i64;
-            let name = self.read_batch_string(batch, i, 1);
 
             if weight > 0 {
                 // See hook_table_register: system tables are pre-registered, user
                 // views are not, so this only skips re-registration on replay.
                 if self.dag.tables.contains_key(&vid) { continue; }
+
+                let sid = self.read_batch_u64(batch, i, 0) as i64;
+                let name = self.read_batch_string(batch, i, 1);
 
                 let col_defs = self.read_column_defs(vid);
                 if col_defs.is_empty() {
@@ -348,7 +343,7 @@ impl CatalogEngine {
 
                 // During DROP VIEW rollback the partition files are intact; re-pushing
                 // source rows through the circuit would double every aggregation.
-                if !self.in_rollback
+                if !self.ctx.in_rollback()
                     && self.active_part_start != self.active_part_end
                     && self.dag.ensure_compiled(vid)
                     && !self.dag.view_needs_exchange(vid)
@@ -359,7 +354,7 @@ impl CatalogEngine {
                 // During CREATE VIEW rollback the circuit/dep and column records
                 // were committed by prior RPCs; retracting them here would diverge
                 // master from workers.
-                if !self.in_rollback {
+                if !self.ctx.in_rollback() {
                     self.cascade_retract_circuit_and_deps(vid)?;
                     self.cascade_retract_columns(vid)?;
                 }
@@ -464,7 +459,7 @@ impl CatalogEngine {
 
                 let mut idx_table_box = Box::new(idx_table);
                 let idx_table_ptr = &mut *idx_table_box as *mut Table;
-                if !self.in_rollback {
+                if !self.ctx.in_rollback() {
                     self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema)?;
                 }
                 self.dag.add_index_circuit(owner_id, source_col_idx, idx_id, idx_table_box, idx_schema, is_unique);
@@ -520,12 +515,12 @@ impl CatalogEngine {
         // table; running hook_cascade_fk here would allocate new index IDs for FK
         // indices that conflict with the IDX +1 rows the topological replay
         // restores a moment later.
-        if self.in_rollback { return Ok(()); }
+        if self.ctx.in_rollback() { return Ok(()); }
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             if weight <= 0 { continue; }
             let tid = batch.get_pk(i) as i64;
-            if self.caches.cascade_enabled && self.dag.tables.contains_key(&tid) {
+            if self.ctx.is_live() && self.dag.tables.contains_key(&tid) {
                 self.create_fk_indices(tid)?;
             }
         }

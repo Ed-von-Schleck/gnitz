@@ -5,10 +5,9 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 /// Lightweight row-by-row builder for constructing Batch in Rust.
-/// Operates on Batch directly.
+/// Operates on Batch directly; the schema lives on the batch itself.
 pub(crate) struct BatchBuilder {
     pub(crate) batch: Batch,
-    pub(crate) schema: SchemaDescriptor,
     // per-row state
     pub(crate) curr_null_word: u64,
     pub(crate) curr_col: usize,
@@ -16,10 +15,8 @@ pub(crate) struct BatchBuilder {
 
 impl BatchBuilder {
     pub(crate) fn new(schema: SchemaDescriptor) -> Self {
-        let batch = Batch::with_schema(schema, 8);
         BatchBuilder {
-            batch,
-            schema,
+            batch: Batch::with_schema(schema, 8),
             curr_null_word: 0,
             curr_col: 0,
         }
@@ -47,33 +44,42 @@ impl BatchBuilder {
         self.curr_col += 1;
     }
 
+    // The non-u64/string put variants are exercised only by the catalog tests
+    // (production system-table rows are u64/string-shaped); `#[cfg(test)]`
+    // keeps them out of production builds, mirroring `ddl.rs::create_table`.
+
     /// Put a u128 value for the current payload column.
+    #[cfg(test)]
     pub(crate) fn put_u128(&mut self, val: u128) {
         self.batch.extend_col(self.curr_col, &val.to_le_bytes());
         self.curr_col += 1;
     }
 
     /// Put a u8 value for the current payload column.
+    #[cfg(test)]
     pub(crate) fn put_u8(&mut self, val: u8) {
         self.batch.extend_col(self.curr_col, &[val]);
         self.curr_col += 1;
     }
 
     /// Put a u16 value for the current payload column.
+    #[cfg(test)]
     pub(crate) fn put_u16(&mut self, val: u16) {
         self.batch.extend_col(self.curr_col, &val.to_le_bytes());
         self.curr_col += 1;
     }
 
     /// Put a u32 value for the current payload column.
+    #[cfg(test)]
     pub(crate) fn put_u32(&mut self, val: u32) {
         self.batch.extend_col(self.curr_col, &val.to_le_bytes());
         self.curr_col += 1;
     }
 
     /// Put a NULL value for the current payload column.
+    #[cfg(test)]
     pub(crate) fn put_null(&mut self) {
-        let col_size = self.schema.columns[self.physical_col_idx()].size() as usize;
+        let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
         self.batch.fill_col_zero(self.curr_col, col_size);
         self.curr_null_word |= 1u64 << self.curr_col;
         self.curr_col += 1;
@@ -92,8 +98,14 @@ impl BatchBuilder {
         self.batch
     }
 
+    #[cfg(test)]
+    fn schema(&self) -> &SchemaDescriptor {
+        self.batch.schema.as_ref().expect("BatchBuilder batch always carries a schema")
+    }
+
+    #[cfg(test)]
     fn physical_col_idx(&self) -> usize {
-        self.schema.payload_col_idx(self.curr_col)
+        self.schema().payload_col_idx(self.curr_col)
     }
 }
 
@@ -104,6 +116,9 @@ impl BatchBuilder {
 // with the SQL planner) and are re-bound in `catalog/mod.rs`.
 // ---------------------------------------------------------------------------
 
+/// Only the test-only direct DDL entry points (`ddl.rs`) take qualified-name
+/// strings; the wire path ships schema and entity ids separately.
+#[cfg(test)]
 pub(crate) fn parse_qualified_name<'a>(name: &'a str, default_schema: &'a str) -> (&'a str, &'a str) {
     if let Some(dot_pos) = name.find('.') {
         (&name[..dot_pos], &name[dot_pos + 1..])
@@ -166,6 +181,9 @@ pub(crate) fn make_fk_index_name(schema_name: &str, table_name: &str, col_name: 
     format!("{}__{}{}{}", schema_name, table_name, FK_INDEX_INFIX, col_name)
 }
 
+/// Production index names arrive pre-built over the wire; only the test-only
+/// `ddl.rs::create_index` path names them engine-side.
+#[cfg(test)]
 pub(crate) fn make_secondary_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
     format!("{}__{}__idx_{}", schema_name, table_name, col_name)
 }
@@ -236,19 +254,6 @@ pub(crate) fn subdir_names(path: &str) -> Vec<String> {
 pub(crate) fn ingest_batch_into(table: &mut Table, batch: &Batch) {
     if batch.count == 0 { return; }
     let _ = table.ingest_owned_batch(batch.clone_batch());
-}
-
-/// Flush a system table, surfacing the error with a contextual message.
-/// Used on catalog paths whose only durability mechanism is flush (namely
-/// sys_circuit_* and sys_view_deps, which bypass SAL broadcast).
-pub(crate) fn flush_sys_table(table: &mut Table, name: &str) -> Result<(), String> {
-    table.flush()
-        .map_err(|e| format!("flush {} failed: {:?}", name, e))?;
-    // These tables (sys_circuit_*, sys_view_deps) are flushed only here and
-    // never via flush_family, so without compaction their L0 shards grow
-    // unbounded; they're scanned on every boot and DDL op.
-    table.compact_if_needed()
-        .map_err(|e| format!("compaction {} failed: {:?}", name, e))
 }
 
 // ---------------------------------------------------------------------------

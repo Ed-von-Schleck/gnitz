@@ -14,6 +14,7 @@
 //! into an accumulator and hands completed views to the relay task.
 
 use std::cell::{Cell, RefCell};
+use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -1117,7 +1118,8 @@ async fn handle_system_dml(
     // closes the pre-fsync window where clients could see an LSN whose
     // backing data is not yet on disk.
     let zone_lsn = shared.ingest_lsn.get() + 1;
-    unsafe { (*cat_ptr_raw).set_ddl_zone_lsn(zone_lsn); }
+    let zone_lsn_nz = NonZeroU64::new(zone_lsn).expect("zone LSN allocator starts above 0");
+    unsafe { (*cat_ptr_raw).ctx.open_ddl_zone(zone_lsn_nz); }
 
     // Clone before evaluate_dag consumes the batch; used by compensate_stage_a
     // to reconstruct the rollback list when fire_hooks succeeded but evaluate_dag
@@ -1139,7 +1141,7 @@ async fn handle_system_dml(
                 "Stage-A DDL compensation panicked after DDL error '{}': {}", e, ce
             );
         });
-        unsafe { (*cat_ptr_raw).clear_ddl_zone_lsn(); }
+        unsafe { (*cat_ptr_raw).ctx.close_ddl_zone(); }
         send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
         return;
     }
@@ -1191,7 +1193,7 @@ async fn handle_system_dml(
     // during the DDL window now see the *old* LSN; tick-derived state
     // therefore reflects only durable work.
     shared.ingest_lsn.set(zone_lsn);
-    unsafe { (*cat_ptr_raw).clear_ddl_zone_lsn(); }
+    unsafe { (*cat_ptr_raw).ctx.close_ddl_zone(); }
     // Drop is now durable, but worker processes share this tree and may still
     // be applying the CREATE of an entity dropped in the same session. Defer
     // physical removal to the next checkpoint, whose worker-ACK barrier proves
