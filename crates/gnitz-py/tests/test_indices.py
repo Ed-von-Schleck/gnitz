@@ -1419,3 +1419,265 @@ class TestAtomicUniqueTransfers:
                 client.push(tid, b)
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestUniqueIndexCreatePreflight
+#
+# CREATE UNIQUE INDEX over PRE-EXISTING data runs a global pre-flight: each
+# worker sorts its partition's index keys and streams them to the master,
+# which k-way-merges the sorted streams and rejects on any adjacent-equal
+# pair — catching within-partition and cross-partition duplicates alike
+# before anything is committed or broadcast. These tests plant data BEFORE
+# the CREATE (the steady-state INSERT-path tests above plant it after).
+# ---------------------------------------------------------------------------
+
+class TestUniqueIndexCreatePreflight:
+    def _bigint_table(self, client, sn, val_type="BIGINT NOT NULL"):
+        client.execute_sql(
+            f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val {val_type})",
+            schema_name=sn,
+        )
+
+    def _compound_pk_table(self, client, sn):
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL,"
+            " payload BIGINT, PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+
+    def _insert_rows(self, client, sn, rows, chunk=500):
+        """Multi-row INSERT of [(pk, val), ...]; 'NULL' passes through."""
+        for i in range(0, len(rows), chunk):
+            values = ", ".join(f"({pk}, {val})" for pk, val in rows[i:i + chunk])
+            client.execute_sql(f"INSERT INTO t VALUES {values}", schema_name=sn)
+
+    def test_preexisting_cross_partition_duplicate_rejected(self, client):
+        """One value held by many PKs spans partitions (and, by pigeonhole
+        over <=8 workers, repeats within at least one); the merge must reject
+        either way, and no index may be created."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn)
+            self._insert_rows(client, sn, [(pk, 42) for pk in range(1, 9)])
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert not _table_has_index(client, sn, "t"), \
+                "failed pre-flight must not create the index"
+            # The failed DDL must leave the table fully usable.
+            client.execute_sql("INSERT INTO t VALUES (100, 42)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_preexisting_duplicate_among_many_rows_rejected(self, client):
+        """A single planted duplicate pair among hundreds of distinct values
+        is found by the merge."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn)
+            rows = [(pk, pk * 10) for pk in range(1, 301)]
+            rows.append((1000, 1500))  # duplicates val of pk=150
+            self._insert_rows(client, sn, rows)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert not _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_create_succeeds_at_scale_then_enforces(self, client):
+        """A few thousand distinct values across all workers pass the
+        pre-flight; the very first post-create INSERT of a duplicate is
+        rejected (the merge's seed must be complete, never truncated) while a
+        fresh value is accepted."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn)
+            self._insert_rows(client, sn, [(pk, pk * 3 + 1) for pk in range(1, 2001)])
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                # duplicates val of pk=500 (500*3+1)
+                client.execute_sql("INSERT INTO t VALUES (9001, 1501)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (9002, 0)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_preexisting_nulls_allowed(self, client):
+        """SQL UNIQUE permits many NULLs: NULL keys never enter any worker's
+        key stream, so a NULL-heavy column passes and stays NULL-insertable."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn, val_type="BIGINT")
+            rows = [(pk, "NULL") for pk in range(1, 9)]
+            rows += [(pk, pk) for pk in range(100, 108)]
+            self._insert_rows(client, sn, rows)
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (200, NULL)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_pk_column_unique_index_short_circuits(self, client):
+        """A unique index on the sole PK column of a unique_pk table is
+        trivially satisfiable (PK uniqueness is enforced on every ingest
+        path): the create succeeds without scanning and the table keeps
+        working."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn)
+            self._insert_rows(client, sn, [(pk, pk) for pk in range(1, 50)])
+            client.execute_sql("CREATE UNIQUE INDEX ON t(pk)", schema_name=sn)
+            assert _table_has_index(client, sn, "t")
+            client.execute_sql("INSERT INTO t VALUES (1000, 1000)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_pk"], tables=["t"])
+
+    def test_pk_column_on_non_unique_pk_table_takes_full_path(self, client):
+        """A table created WITHOUT unique_pk runs no PK-uniqueness enforcement,
+        so a sole-PK-column unique index is NOT trivially unique: two live
+        rows sharing pk=1 must fail the pre-flight."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+            schema = gnitz.Schema(cols)
+            tid = client.create_table(sn, "t", cols, unique_pk=False)
+            b = gnitz.ZSetBatch(schema)
+            b.append(pk=1, val=10)
+            b.append(pk=1, val=20)  # second live row, same PK, distinct payload
+            b.append(pk=2, val=30)
+            client.push(tid, b)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(pk)", schema_name=sn)
+            assert not _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_compound_pk_member_duplicates_rejected(self, client):
+        """A member of a compound PK is not trivially unique: duplicate `a`
+        values across distinct (a, b) rows must fail the pre-flight."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._compound_pk_table(client, sn)
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1, 10), (1, 2, 20), (3, 1, 30)",
+                schema_name=sn,
+            )
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=sn)
+            assert not _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_compound_pk_member_distinct_accepted(self, client):
+        """Distinct values in a compound-PK member pass the full-path scan."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._compound_pk_table(client, sn)
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 1, 30)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO t VALUES (2, 9, 90)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a"], tables=["t"])
+
+    def test_signed_negative_duplicate_rejected(self, client):
+        """Equal negative values must collide despite the merge's u128 order
+        not being monotonic in signed value (equal value => equal key is what
+        the verdict needs)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn)
+            self._insert_rows(client, sn, [(1, -5), (2, 300), (3, -5)])
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert not _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_signed_distinct_negatives_accepted_then_enforced(self, client):
+        """Distinct negative values pass; the post-create filter then rejects a
+        re-insert of one of them (native-key round-trip, no sign confusion)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn)
+            self._insert_rows(client, sn, [(1, -1), (2, -2), (3, -3), (4, 0)])
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO t VALUES (10, -2)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (11, -9)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_multi_frame_key_train(self, unique_preflight_frame_server):
+        """With the debug seam shrinking frames to 7 keys, every worker streams
+        a multi-frame continuation train; the merge must stay exact across
+        frame boundaries — both verdicts. No-op against a release server (the
+        seam compiles out), where this degenerates to single-frame trains."""
+        client = unique_preflight_frame_server
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn)
+            self._insert_rows(client, sn, [(pk, pk * 7) for pk in range(1, 201)])
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert _table_has_index(client, sn, "t")
+            client.execute_sql(f"DROP INDEX {sn}__t__idx_val", schema_name=sn)
+
+            # Plant one duplicate pair on far-apart PKs and re-create: the
+            # equal keys are adjacent in the merged stream wherever the frame
+            # boundaries fall.
+            client.execute_sql("INSERT INTO t VALUES (1000, 700)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert not _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_worker_fault_mid_preflight(self, unique_preflight_fault_server):
+        """An injected worker fault during the pre-flight scan must surface as
+        a client error with no index created, no filter seeded, and every
+        worker drained (not wedged): the table stays fully usable, and the
+        PK short-circuit — which never fans out — still succeeds. No-op
+        against a release server (the seam compiles out)."""
+        client = unique_preflight_fault_server
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn)
+            self._insert_rows(client, sn, [(pk, pk) for pk in range(1, 33)])
+            try:
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+                seam_active = False  # release server: seam compiled out
+            except gnitz.GnitzError:
+                seam_active = True
+            if seam_active:
+                assert not _table_has_index(client, sn, "t")
+                # No filter was seeded and no index exists: a duplicate
+                # value must be accepted, proving no partial constraint
+                # leaked out of the failed DDL.
+                client.execute_sql("INSERT INTO t VALUES (100, 1)", schema_name=sn)
+                # All workers answer a full scan: nobody is wedged on a
+                # half-drained pre-flight train.
+                tid, _ = client.resolve_table(sn, "t")
+                rows = [r for r in client.scan(tid) if r.weight > 0]
+                assert len(rows) == 33
+                # The PK short-circuit returns before any fan-out, so it
+                # succeeds even while every worker's scan path is faulted.
+                client.execute_sql("CREATE UNIQUE INDEX ON t(pk)", schema_name=sn)
+                assert _table_has_index(client, sn, "t")
+        finally:
+            _drop_all(client, sn,
+                      indices=[f"{sn}__t__idx_pk", f"{sn}__t__idx_val"],
+                      tables=["t"])

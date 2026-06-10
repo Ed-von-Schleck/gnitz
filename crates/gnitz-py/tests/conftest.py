@@ -114,16 +114,21 @@ class _Server:
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
-@pytest.fixture(scope="session")
-def _srv():
-    """Session-scoped mutable server handle shared by all per-class and per-test fixtures."""
+def _server_binary():
+    """Resolve the server binary path, skipping the test if it is missing."""
     binary = os.environ.get(
         "GNITZ_SERVER_BIN",
         os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../gnitz-server")),
     )
     if not os.path.isfile(binary):
         pytest.skip(f"Server binary not found: {binary}")
-    s = _Server(binary)
+    return binary
+
+
+@pytest.fixture(scope="session")
+def _srv():
+    """Session-scoped mutable server handle shared by all per-class and per-test fixtures."""
+    s = _Server(_server_binary())
     s.start()
     yield s
     s.teardown()
@@ -146,30 +151,16 @@ def client(_srv):
         yield conn
 
 
-@pytest.fixture
-def race_server(monkeypatch):
-    """
-    A dedicated server (separate from the session server) spawned with the
-    debug-only `GNITZ_INJECT_TABLE_CREATE_DELAY_MS` seam enabled, for the
-    DROP-directory-removal race regression test.
+def _seamed_server(monkeypatch, env: dict[str, str]):
+    """Spawn a dedicated server (separate from the session server) with
+    debug-only env seams set, yielding a connected client. Shared body of the
+    seam fixtures below; no-op against a release server (the seams are
+    `#[cfg(debug_assertions)]`). Forces >= 2 workers — the paths under test
+    are distributed. monkeypatch reverts the env vars at fixture teardown."""
+    binary = _server_binary()
 
-    The seam makes every worker sleep between creating a table directory and
-    its partition subdirectories, deterministically widening the window in
-    which a master DROP `remove_dir_all` can race a lagging worker's CREATE.
-    Needs >= 2 workers for the master-vs-worker race; forces 4 if fewer.
-
-    Yields a connected client.  No-op against a release server (the seam is
-    `#[cfg(debug_assertions)]`), so the test simply passes there.
-    """
-    binary = os.environ.get(
-        "GNITZ_SERVER_BIN",
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../gnitz-server")),
-    )
-    if not os.path.isfile(binary):
-        pytest.skip(f"Server binary not found: {binary}")
-
-    # monkeypatch reverts both vars at fixture teardown.
-    monkeypatch.setenv("GNITZ_INJECT_TABLE_CREATE_DELAY_MS", "50")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
     if int(os.environ.get("GNITZ_WORKERS", "1")) < 2:
         monkeypatch.setenv("GNITZ_WORKERS", "4")
 
@@ -180,6 +171,39 @@ def race_server(monkeypatch):
             yield conn
     finally:
         s.teardown()
+
+
+@pytest.fixture
+def race_server(monkeypatch):
+    """
+    Server spawned with the `GNITZ_INJECT_TABLE_CREATE_DELAY_MS` seam, for the
+    DROP-directory-removal race regression test.
+
+    The seam makes every worker sleep between creating a table directory and
+    its partition subdirectories, deterministically widening the window in
+    which a master DROP `remove_dir_all` can race a lagging worker's CREATE.
+    """
+    yield from _seamed_server(
+        monkeypatch, {"GNITZ_INJECT_TABLE_CREATE_DELAY_MS": "50"})
+
+
+@pytest.fixture
+def unique_preflight_frame_server(monkeypatch):
+    """Server whose CREATE UNIQUE INDEX pre-flight streams tiny (7-key) frames
+    so a small table already produces multi-frame continuation trains per
+    worker. Tests using it must keep per-worker frame counts well under the
+    64-slot W2M in-flight limit (a few hundred rows is fine)."""
+    yield from _seamed_server(
+        monkeypatch, {"GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME": "7"})
+
+
+@pytest.fixture
+def unique_preflight_fault_server(monkeypatch):
+    """Server whose workers fail every CREATE UNIQUE INDEX pre-flight scan,
+    for asserting the master surfaces the fault, creates no index, seeds no
+    filter, and leaves the cluster healthy."""
+    yield from _seamed_server(
+        monkeypatch, {"GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR": "1"})
 
 
 @pytest.fixture(autouse=True, scope="class")

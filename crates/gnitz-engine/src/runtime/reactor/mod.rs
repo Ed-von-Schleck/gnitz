@@ -1321,14 +1321,14 @@ impl Reactor {
         let q = parked.entry(req_id).or_default();
         // One req_id maps to exactly one worker (`dispatch_scan_fanout`
         // allocates a distinct id per worker), so a queued frame is one of that
-        // worker's in-flight (parked, un-dropped) W2M slots. The continuation
-        // chunker fills every frame to MAX_W2M_MSG — there is no small-frame
-        // path — so depth is capped by W2M_REGION_SIZE / MAX_W2M_MSG ≈ 4, far
-        // below the 64-slot InFlightState limit. The debug_assert turns any
-        // future chunking change that breaks that bound into a test failure
-        // rather than a silent InFlightState overwrite.
+        // worker's in-flight (parked, un-dropped) W2M slots. Depth is bounded
+        // by how many frames fit in one ring; every continuation sender must
+        // keep that below `W2M_MAX_IN_FLIGHT` (enforced by frame sizing or
+        // static asserts at the senders). The debug_assert turns a frame-size
+        // change that breaks the bound into a test failure rather than a
+        // silent InFlightState overwrite.
         debug_assert!(
-            q.len() < 64,
+            q.len() < crate::runtime::w2m::W2M_MAX_IN_FLIGHT,
             "scan queue depth {} for req_id {} — W2M in-flight would overflow",
             q.len(), req_id,
         );

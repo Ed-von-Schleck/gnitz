@@ -52,6 +52,25 @@ pub const FLAG_TXN_COMMIT: u32          = 32768;
 /// (single key) and `FLAG_HAS_PK` (existence echo of the caller's payload);
 /// the gather returns the *stored* value of columns the caller does not have.
 pub const FLAG_GATHER: u32              = 65536;
+/// CREATE UNIQUE INDEX global pre-flight: each worker projects its committed
+/// partition of `target_id` to the native u128 index keys of the column named
+/// in `seek_col_idx`, sorts them, and streams the SORTED keys back as
+/// continuation frames for the master's k-way merge (see
+/// `validate_unique_index_create_async`). Unicast-shaped like a Scan: every
+/// worker gets its own req_id slot and answers with a frame train.
+pub const FLAG_UNIQUE_PREFLIGHT: u32    = 131072;
+
+/// Wire schema of every unique pre-flight reply frame: one U128 PK column
+/// holding the native index key, schema version 0. The single definition
+/// shared by the worker's encoder (`send_unique_preflight_keys`) and the
+/// master's merge decoder, so the frame layout agrees by construction and
+/// the master needs no per-stream schema capture from the first frame.
+pub(crate) fn unique_preflight_wire_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[crate::schema::SchemaColumn::new(crate::schema::type_code::U128, 0)],
+        &[0],
+    )
+}
 
 /// Pack up to 8 projected column indices into the gather control block's
 /// `seek_col_idx`. Each index is stored as `col_idx + 1` in one byte (valid
@@ -106,6 +125,7 @@ pub enum SalMessageKind {
     Backfill,
     HasPk,
     Gather,
+    UniquePreflight,
     Push,
     Tick,
     SeekByIndex,
@@ -119,8 +139,8 @@ impl SalMessageKind {
     /// Priority order matches the worker's existing if-chain (see
     /// `worker::dispatch_inner`): SHUTDOWN > FLUSH > DDL_SYNC >
     /// EXCHANGE_RELAY > PRELOADED_EXCHANGE > BACKFILL > HAS_PK >
-    /// GATHER > PUSH > TICK > SEEK_BY_INDEX > SEEK > Scan. The first
-    /// match wins.
+    /// GATHER > UNIQUE_PREFLIGHT > PUSH > TICK > SEEK_BY_INDEX > SEEK >
+    /// Scan. The first match wins.
     pub fn classify(flags: u32) -> SalMessageKind {
         if flags & FLAG_SHUTDOWN != 0           { return SalMessageKind::Shutdown; }
         if flags & FLAG_FLUSH != 0              { return SalMessageKind::Flush; }
@@ -130,6 +150,7 @@ impl SalMessageKind {
         if flags & FLAG_BACKFILL != 0           { return SalMessageKind::Backfill; }
         if flags & FLAG_HAS_PK != 0             { return SalMessageKind::HasPk; }
         if flags & FLAG_GATHER != 0             { return SalMessageKind::Gather; }
+        if flags & FLAG_UNIQUE_PREFLIGHT != 0   { return SalMessageKind::UniquePreflight; }
         if flags & FLAG_PUSH != 0               { return SalMessageKind::Push; }
         if flags & FLAG_TICK != 0               { return SalMessageKind::Tick; }
         if flags & FLAG_SEEK_BY_INDEX != 0      { return SalMessageKind::SeekByIndex; }
@@ -139,8 +160,9 @@ impl SalMessageKind {
 
     /// True when the worker must act on the group even if its per-worker
     /// data slot is empty (broadcast / control / data-rebroadcast kinds).
-    /// Unicast kinds (SEEK, SEEK_BY_INDEX, Scan, ExchangeRelay) return
-    /// false: a missing slot means the message wasn't for us.
+    /// Unicast kinds (SEEK, SEEK_BY_INDEX, Scan, UniquePreflight,
+    /// ExchangeRelay) return false: a missing slot means the message
+    /// wasn't for us.
     pub fn is_broadcast(self) -> bool {
         matches!(
             self,
@@ -159,7 +181,7 @@ impl SalMessageKind {
     /// All variants in classification priority order. Used by tests that
     /// walk every kind to exercise the dispatcher's full match.
     #[allow(dead_code)]
-    pub const ALL: [SalMessageKind; 13] = [
+    pub const ALL: [SalMessageKind; 14] = [
         SalMessageKind::Shutdown,
         SalMessageKind::Flush,
         SalMessageKind::DdlSync,
@@ -168,6 +190,7 @@ impl SalMessageKind {
         SalMessageKind::Backfill,
         SalMessageKind::HasPk,
         SalMessageKind::Gather,
+        SalMessageKind::UniquePreflight,
         SalMessageKind::Push,
         SalMessageKind::Tick,
         SalMessageKind::SeekByIndex,

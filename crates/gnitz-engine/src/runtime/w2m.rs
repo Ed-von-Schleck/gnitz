@@ -97,13 +97,19 @@ impl W2mWriter {
 // InFlightState — tracks outstanding slots and drives consume_cursor forward
 // ---------------------------------------------------------------------------
 
+/// Maximum simultaneously in-flight (parked, un-released) W2M slots per
+/// worker ring — the capacity of `InFlightState`'s queue and its `completed`
+/// bitmap (a u64, so this cannot exceed 64). Every continuation-frame sender
+/// must keep one ring's worth of frames below this bound; the reactor's
+/// scan-queue debug_assert catches violations.
+pub(crate) const W2M_MAX_IN_FLIGHT: usize = 64;
+
 struct InFlightState {
     hdr:       &'static W2mRingHeader,
     /// Index of the slot at the front of the queue (oldest in-flight).
     front_idx: u64,
-    /// new_vrc for each in-flight slot, stored at index push_idx % 64.
-    /// Capacity: 64 entries ↔ max 64 simultaneous in-flight slots.
-    queue:     [u64; 64],
+    /// new_vrc for each in-flight slot, stored at push_idx % W2M_MAX_IN_FLIGHT.
+    queue:     [u64; W2M_MAX_IN_FLIGHT],
     /// Number of in-flight slots; next push_idx = front_idx + len.
     len:       u8,
     /// Bit i is set when the slot at position (front_idx + i) has been released.
@@ -115,7 +121,7 @@ impl InFlightState {
         InFlightState {
             hdr,
             front_idx: 0,
-            queue: [0u64; 64],
+            queue: [0u64; W2M_MAX_IN_FLIGHT],
             len: 0,
             completed: 0,
         }
@@ -125,7 +131,7 @@ impl InFlightState {
     /// Returns the slot's push_idx (used for release).
     fn take(&mut self, new_vrc: u64) -> u64 {
         let idx = self.front_idx + self.len as u64;
-        self.queue[(idx % 64) as usize] = new_vrc;
+        self.queue[(idx % W2M_MAX_IN_FLIGHT as u64) as usize] = new_vrc;
         self.len += 1;
         idx
     }
@@ -136,15 +142,16 @@ impl InFlightState {
     fn release(&mut self, push_idx: u64) {
         let bit = push_idx - self.front_idx;
         assert!(
-            bit < 64,
-            "w2m in-flight bitmap overflow: {} slots simultaneously in-flight (max 64)",
+            bit < W2M_MAX_IN_FLIGHT as u64,
+            "w2m in-flight bitmap overflow: {} slots simultaneously in-flight (max {})",
             bit + 1,
+            W2M_MAX_IN_FLIGHT,
         );
         self.completed |= 1u64 << bit;
 
         let n = self.completed.trailing_ones() as u64;
         if n > 0 {
-            let last_vrc = self.queue[((self.front_idx + n - 1) % 64) as usize];
+            let last_vrc = self.queue[((self.front_idx + n - 1) % W2M_MAX_IN_FLIGHT as u64) as usize];
             // At full capacity (all 64 slots completed) n == 64, and
             // `>>= 64` is a shift-by-width: a debug-build panic, and on
             // release x86_64 a mask to `>> 0` that leaves `completed` full of

@@ -1,0 +1,298 @@
+//! Unit tests for the CREATE UNIQUE INDEX pre-flight building blocks: the
+//! worker's sorted-key frame train (`send_unique_preflight_keys`) and the
+//! master's per-key merge accounting (`PreflightAccumulator`). The full
+//! distributed path (fan-out, k-way merge over live W2M trains, DDL
+//! integration) is covered by the multi-worker E2E suite.
+
+use rustc_hash::FxHashSet;
+
+use crate::runtime::master::PreflightAccumulator;
+use crate::runtime::sal::{SalMessageKind, FLAG_UNIQUE_PREFLIGHT};
+use crate::runtime::w2m::{W2mReceiver, W2mWriter};
+use crate::runtime::w2m_ring;
+use crate::runtime::wire::{
+    self, peek_control_block, FLAG_CONTINUATION, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
+    SchemaWithVersion,
+};
+use crate::runtime::worker::send_unique_preflight_keys;
+use crate::schema::{for_each_index_key, SchemaColumn, SchemaDescriptor, type_code};
+use crate::storage::Batch;
+
+// ---------------------------------------------------------------------------
+// Frame-train round-trip
+// ---------------------------------------------------------------------------
+
+fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
+    const CAP: usize = 1 << 20;
+    let region = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            CAP,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+            -1, 0,
+        ) as *mut u8
+    };
+    assert!(!region.is_null());
+    unsafe { w2m_ring::init_region_for_tests(region, CAP as u64) };
+    let writer = W2mWriter::new(region, CAP as u64);
+    let receiver = W2mReceiver::new(vec![region]);
+    f(&writer, &receiver);
+    unsafe { libc::munmap(region as *mut libc::c_void, CAP) };
+}
+
+/// Drain every frame of one pre-flight train from the ring, asserting the
+/// flag/schema discipline the master's merge relies on, and return the keys
+/// decoded the way the merge decodes them: `ColumnLocator::native_key` on
+/// column 0 of the first frame's schema, continuations against the saved
+/// schema hint.
+fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<u128> {
+    let mut keys = Vec::new();
+    let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
+    let mut frames = 0usize;
+    loop {
+        let slot = receiver.try_read_slot(0).expect("frame missing from train");
+        assert_eq!(
+            slot.internal_req_id, expected_req_id as u32,
+            "ring prefix must carry the request id",
+        );
+        let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
+        assert_eq!(ctrl.status, 0);
+        assert_ne!(
+            ctrl.flags & FLAG_CONTINUATION, 0,
+            "every pre-flight frame carries FLAG_CONTINUATION",
+        );
+        let last = ctrl.flags & FLAG_SCAN_LAST != 0;
+        if frames == 0 {
+            assert_ne!(
+                ctrl.flags & FLAG_HAS_SCHEMA, 0,
+                "first frame must carry the synthetic schema block",
+            );
+        } else {
+            assert_eq!(
+                ctrl.flags & FLAG_HAS_SCHEMA, 0,
+                "continuation frames must not re-send the schema",
+            );
+        }
+        let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
+        let ctrl_size = ctrl.block_size;
+        let hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
+            descriptor: s, version: *v,
+        });
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl_size, ctrl, hint)
+            .expect("frame decodes");
+        if saved_schema.is_none() {
+            let s = zc.schema.expect("first frame schema");
+            assert_eq!(s.num_columns(), 1);
+            assert_eq!(s.pk_indices(), [0u32]);
+            assert_eq!(s.columns[0].type_code, type_code::U128);
+            saved_schema = Some((s, server_version));
+        }
+        if let Some(ref mb) = zc.data_batch {
+            let loc = saved_schema.as_ref().unwrap().0.locate(0);
+            for i in 0..mb.count {
+                keys.push(loc.native_key(mb, i));
+            }
+        }
+        frames += 1;
+        drop(zc);
+        drop(slot);
+        if last { break; }
+    }
+    keys
+}
+
+/// Multi-frame train: keys split across frames at `keys_per_frame`, the
+/// terminal frame tagged FLAG_SCAN_LAST, and every key — including values
+/// projected from negative signed columns and extreme u128s — round-trips
+/// through the wire to the exact native key (the OPK encode/decode cancels).
+#[test]
+fn preflight_train_multi_frame_key_roundtrip() {
+    // Sorted ascending in u128 space, as the worker sends them. The
+    // negative-i64 projections ((-2i64) etc.) zero-extend to large u128
+    // patterns; the merge order need not be monotonic in signed value, only
+    // equal-value ⇒ equal-key, so order here is plain u128 order.
+    let keys: Vec<u128> = vec![
+        0,
+        1,
+        41,
+        42,
+        (i64::MAX as u64) as u128,
+        ((-2i64) as u64) as u128,
+        ((-1i64) as u64) as u128,
+        u128::MAX - 1,
+        u128::MAX,
+    ];
+    with_test_ring(|writer, receiver| {
+        send_unique_preflight_keys(writer, 77, &keys, 9001, 4);
+        let got = drain_train(receiver, 9001);
+        assert_eq!(got, keys);
+        assert!(receiver.try_read_slot(0).is_none(), "no frames after terminal");
+    });
+}
+
+/// A train whose key count is an exact multiple of the frame size must not
+/// emit a trailing empty frame: the last full frame is the terminal one.
+#[test]
+fn preflight_train_exact_frame_boundary() {
+    let keys: Vec<u128> = (0..8u128).collect();
+    with_test_ring(|writer, receiver| {
+        send_unique_preflight_keys(writer, 77, &keys, 42, 4);
+        let got = drain_train(receiver, 42);
+        assert_eq!(got, keys);
+        assert!(receiver.try_read_slot(0).is_none());
+    });
+}
+
+/// An empty partition still answers with exactly one empty terminal frame so
+/// the master's drain sees the train end.
+#[test]
+fn preflight_train_empty_partition_single_terminal_frame() {
+    with_test_ring(|writer, receiver| {
+        send_unique_preflight_keys(writer, 77, &[], 7, 4);
+        let slot = receiver.try_read_slot(0).expect("terminal frame");
+        let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
+        assert_eq!(ctrl.status, 0);
+        assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0, "single frame must be terminal");
+        assert_eq!(ctrl.flags & wire::FLAG_HAS_DATA, 0, "no data on empty train");
+        drop(slot);
+        assert!(receiver.try_read_slot(0).is_none());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Worker projection: for_each_index_key feeding the train
+// ---------------------------------------------------------------------------
+
+/// The worker projection (`for_each_index_key` on the owner schema) and the
+/// wire round-trip compose to preserve native keys end-to-end for a signed
+/// payload column: equal signed values (including negatives) produce equal
+/// u128 keys on the master side, and retractions and NULLs never enter the
+/// stream.
+#[test]
+fn preflight_signed_payload_projection_roundtrip() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    let mut batch = Batch::with_schema(schema, 8);
+    // (pk, val, weight, null): two rows share val=-5 (the duplicate the
+    // pre-flight exists to catch), one NULL, one retracted row.
+    let rows: [(u128, i64, i64, u64); 6] = [
+        (1, -5, 1, 0),
+        (2, 300, 1, 0),
+        (3, -5, 1, 0),
+        (4, 0, 1, 1),   // NULL val: skipped
+        (5, 7, -1, 0),  // retracted: skipped
+        (6, i64::MIN, 1, 0),
+    ];
+    for &(pk, val, weight, null_word) in &rows {
+        unsafe {
+            batch.append_row_simple(pk, weight, null_word, &[val], &[0], &[std::ptr::null()], &[0]);
+        }
+    }
+
+    let mut keys: Vec<u128> = Vec::new();
+    for_each_index_key(&batch.as_mem_batch(), schema.locate(1), |k| { keys.push(k); true });
+    keys.sort_unstable();
+
+    let expected: Vec<u128> = {
+        let mut v: Vec<u128> = [-5i64, 300, -5, i64::MIN]
+            .iter()
+            .map(|&x| (x as u64) as u128)
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(keys, expected, "projection must keep two's-complement bits, zero-extended");
+
+    with_test_ring(|writer, receiver| {
+        send_unique_preflight_keys(writer, 5, &keys, 11, 3);
+        let got = drain_train(receiver, 11);
+        assert_eq!(got, keys);
+        // The duplicate pair is adjacent in the sorted stream — exactly what
+        // the master's prev == popped check rejects.
+        let dup_key = ((-5i64) as u64) as u128;
+        assert_eq!(got.iter().filter(|&&k| k == dup_key).count(), 2);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Merge accounting: verdict + all-or-nothing seed
+// ---------------------------------------------------------------------------
+
+fn offer_all(acc: &mut PreflightAccumulator, keys: &[u128]) -> bool {
+    for &k in keys {
+        if !acc.offer(k) { return false; }
+    }
+    true
+}
+
+/// Adjacent equal keys — within one worker's run or as two workers' equal
+/// heads, indistinguishable at this layer — flip the verdict; the verdict is
+/// monotonic thereafter.
+#[test]
+fn accumulator_adjacent_equal_is_duplicate() {
+    let mut acc = PreflightAccumulator::new(1000);
+    assert!(offer_all(&mut acc, &[1, 2, 3]));
+    assert!(!acc.offer(3), "equal to prev ⇒ duplicate");
+    assert!(!acc.offer(4), "verdict is monotonic");
+    assert!(acc.duplicate);
+}
+
+#[test]
+fn accumulator_distinct_keys_no_duplicate() {
+    let mut acc = PreflightAccumulator::new(1000);
+    assert!(offer_all(&mut acc, &[1, 2, 3, 100, u128::MAX]));
+    assert!(!acc.duplicate);
+    let expected: FxHashSet<u128> = [1, 2, 3, 100, u128::MAX].into_iter().collect();
+    assert_eq!(acc.into_seed(), expected, "seed under cap is the complete distinct set");
+}
+
+/// Crossing the cap clears the partial seed whole and never repopulates it:
+/// the seed is complete-or-empty, never truncated (a truncated warm filter
+/// would prove "absent" for a present key — a uniqueness hole).
+#[test]
+fn accumulator_seed_over_cap_is_empty_never_truncated() {
+    let mut acc = PreflightAccumulator::new(3);
+    assert!(offer_all(&mut acc, &[10, 20, 30]));
+    assert!(acc.offer(40), "cap overflow is not a duplicate");
+    assert!(acc.offer(50));
+    assert!(!acc.duplicate);
+    assert!(acc.into_seed().is_empty(), "seed must be cleared whole on cap overflow");
+}
+
+#[test]
+fn accumulator_seed_at_exactly_cap_is_complete() {
+    let mut acc = PreflightAccumulator::new(3);
+    assert!(offer_all(&mut acc, &[10, 20, 30]));
+    assert_eq!(acc.into_seed().len(), 3, "exactly cap keys must keep the full seed");
+}
+
+/// A duplicate found after the cap has been crossed is still detected — the
+/// verdict never depends on the seed.
+#[test]
+fn accumulator_duplicate_after_cap_crossing() {
+    let mut acc = PreflightAccumulator::new(2);
+    assert!(offer_all(&mut acc, &[1, 2, 3, 4]));
+    assert!(!acc.offer(4));
+    assert!(acc.duplicate);
+    assert!(acc.into_seed().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// SAL classification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unique_preflight_classifies_and_is_unicast() {
+    let kind = SalMessageKind::classify(FLAG_UNIQUE_PREFLIGHT);
+    assert_eq!(kind, SalMessageKind::UniquePreflight);
+    assert!(
+        !kind.is_broadcast(),
+        "pre-flight is unicast-shaped: per-worker req_id slots, like Scan",
+    );
+}

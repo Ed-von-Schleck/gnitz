@@ -1181,6 +1181,20 @@ impl CatalogEngine {
             .unwrap_or(false)
     }
 
+    /// True when `col_idx` is the table's SOLE PK column AND the table was
+    /// created with `unique_pk`, so PK uniqueness is enforced on every ingest
+    /// path (`enforce_unique_pk_partitioned` in Update mode,
+    /// `needs_pk_rejection` in Error mode, recovery via `replay_ingest`) and
+    /// no two live rows can share the column's value. Both halves are
+    /// load-bearing: without `unique_pk` none of that enforcement runs, so
+    /// even a sole PK column can carry duplicates across live rows, and a
+    /// member of a compound PK is never trivially unique.
+    pub fn col_is_enforced_unique_pk(&self, table_id: i64, col_idx: u32) -> bool {
+        self.dag.tables.get(&table_id)
+            .map(|e| e.unique_pk() && e.schema.pk_indices() == [col_idx])
+            .unwrap_or(false)
+    }
+
     /// Get child info at index: (child_table_id, fk_col_idx, parent_col_idx).
     pub fn get_fk_child_info(&self, parent_id: i64, idx: usize) -> Option<(i64, usize, usize)> {
         self.caches.fk_by_parent.get(&parent_id)

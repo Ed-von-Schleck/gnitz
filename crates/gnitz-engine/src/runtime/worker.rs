@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
-use crate::schema::SchemaDescriptor;
+use crate::schema::{for_each_index_key, SchemaDescriptor};
 use crate::dag::ExchangeCallback;
 use crate::storage::{BlobCacheGuard, FlushWork, PkBuf};
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, FLAG_CONTINUATION, FLAG_SCAN_LAST};
@@ -526,6 +526,7 @@ impl WorkerProcess {
     /// | PreloadedExchange | drained by dispatch_top_level prelude | stash by view_id    |
     /// | Backfill          | inline                 | inline                                |
     /// | HasPk             | inline                 | inline                                |
+    /// | UniquePreflight   | inline                 | inline                                |
     /// | Push              | inline (must)          | inline (must — sal_writer_excl deadlock) |
     /// | Tick              | inline + replay defer  | defer to exchange.deferred_ticks      |
     /// | SeekByIndex       | inline                 | inline                                |
@@ -676,6 +677,7 @@ impl WorkerProcess {
             | (_, SalMessageKind::Backfill)
             | (_, SalMessageKind::HasPk)
             | (_, SalMessageKind::Gather)
+            | (_, SalMessageKind::UniquePreflight)
             | (_, SalMessageKind::Push)
             | (_, SalMessageKind::SeekByIndex)
             | (_, SalMessageKind::Seek)
@@ -917,6 +919,20 @@ impl WorkerProcess {
                 DispatchResult::Continue
             }
 
+            SalMessageKind::UniquePreflight => {
+                // CREATE UNIQUE INDEX global pre-flight: project this worker's
+                // committed partition of `target_id` to native u128 index keys
+                // for the column in `seek_col_idx`, sort them, and stream the
+                // sorted keys back for the master's k-way merge. An error here
+                // surfaces as the terminal fault frame the master's merge
+                // expects (send_error in run_via_dispatch_inner).
+                let col_idx = seek_col_idx as u32;
+                if let Err(msg) = self.handle_unique_preflight(target_id, col_idx, request_id) {
+                    return DispatchResult::Error(msg);
+                }
+                DispatchResult::Continue
+            }
+
             // ExchangeRelay only ever arrives while the worker is blocked
             // inside `do_exchange_wait`; that loop consumes it directly
             // and never returns through `dispatch_inner`. PreloadedExchange
@@ -944,6 +960,16 @@ impl WorkerProcess {
         });
     }
 
+    /// True when `s` has table `tid`'s schema identity (column count + PK
+    /// layout) — the predicate deciding whether the table's cached schema
+    /// wire block may serve a response carrying `s`. `None` when the
+    /// worker's catalog has no such table; callers pick their own default.
+    fn schema_matches_table(&mut self, tid: i64, s: &SchemaDescriptor) -> Option<bool> {
+        self.cat()
+            .get_schema_desc(tid)
+            .map(|t| t.num_columns() == s.num_columns() && t.pk_indices() == s.pk_indices())
+    }
+
     fn send_response(
         &mut self,
         target_id: u64,
@@ -957,11 +983,7 @@ impl WorkerProcess {
         // HasPk UniqueIndex passes an index schema; reusing the catalog's
         // table-schema wire block for it would corrupt the master decoder.
         let prebuilt_rc: Option<Rc<Vec<u8>>> = schema.map(|s| {
-            let table_schema_matches = self.cat()
-                .get_schema_desc(tid_key)
-                .map(|t| t.num_columns() == s.num_columns() && t.pk_indices() == s.pk_indices())
-                .unwrap_or(false);
-            if !table_schema_matches {
+            if !self.schema_matches_table(tid_key, s).unwrap_or(false) {
                 return Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32));
             }
             if let Some(cached) = self.cat().get_cached_schema_wire_block(tid_key) {
@@ -1002,6 +1024,17 @@ impl WorkerProcess {
         client_version: u16,
     ) -> Option<String> {
         let tid_key = target_id as i64;
+        // This path attaches the target table's *cached* schema wire block, so
+        // `schema` must BE the table's schema. A mismatched schema (an index
+        // or synthetic schema) would make the receiver decode the frames with
+        // the table's row stride. Mismatched-schema senders must build a
+        // one-off block instead — see `send_response`'s mismatch arm and
+        // `send_unique_preflight_keys`.
+        debug_assert!(
+            schema.is_none_or(|s| self.schema_matches_table(tid_key, s).unwrap_or(true)),
+            "send_scan_response: schema does not match table {}'s cached schema",
+            tid_key,
+        );
         // Obtain prebuilt schema block + server version. include_schema controls
         // whether the first frame carries a schema block; server_version is always
         // embedded in wire_flags so the client can cache/verify.
@@ -1156,6 +1189,62 @@ impl WorkerProcess {
         let local_batch = self.cat().scan_family(source_tid)?;
         let owned = Rc::try_unwrap(local_batch).unwrap_or_else(|a| (*a).clone());
         self.evaluate_dag(source_tid, owned, request_id);
+        Ok(())
+    }
+
+    /// CREATE UNIQUE INDEX pre-flight, worker side: project every
+    /// positive-weight, non-null row of this worker's committed partition of
+    /// `owner_id` to the native u128 index key of `col_idx` (the same
+    /// `for_each_index_key` contract the master's filter warmup and merge
+    /// use), sort the keys, and stream them back sorted. No local dedup and
+    /// no within-partition duplicate check: the master's adjacent-equal merge
+    /// subsumes both, and a `Vec<u128>` (16 B/key contiguous) beats a
+    /// `BTreeSet` on both memory and sort cost.
+    ///
+    /// MUST observe the same snapshot `backfill_index` will later project:
+    /// the master sends this command inside the DDL critical section
+    /// (committer barrier drained, catalog write lock held), before the
+    /// IDX_TAB +1 broadcast, so no concurrent INSERT can interleave.
+    fn handle_unique_preflight(
+        &mut self, owner_id: i64, col_idx: u32, request_id: u64,
+    ) -> Result<(), String> {
+        // Crash-injection seam: fail the pre-flight on every worker so tests
+        // can assert the master surfaces the fault, drains the fan-out, and
+        // leaves the catalog and unique-filter state untouched.
+        #[cfg(debug_assertions)]
+        if std::env::var("GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR").is_ok() {
+            return Err("injected unique pre-flight fault".to_string());
+        }
+        let schema = self.cat().get_schema_desc(owner_id).ok_or_else(|| {
+            format!("unique pre-flight: no schema for table {}", owner_id)
+        })?;
+        // The master bounds-checks before fanning out; this guards a
+        // protocol-level mismatch rather than a user error.
+        if col_idx as usize >= schema.num_columns() {
+            return Err(format!(
+                "unique pre-flight: column {} out of range for table {}",
+                col_idx, owner_id,
+            ));
+        }
+        let loc = schema.locate(col_idx as usize);
+
+        // Project to keys, then drop the partition batch before sorting and
+        // streaming — peak memory beyond the scan itself is the 16 B/key Vec.
+        let mut keys: Vec<u128> = Vec::new();
+        {
+            let part = self.cat().scan_family(owner_id)?;
+            keys.reserve(part.count);
+            for_each_index_key(&part.as_mem_batch(), loc, |k| {
+                keys.push(k);
+                true
+            });
+        }
+        keys.sort_unstable();
+
+        send_unique_preflight_keys(
+            &self.w2m_writer, owner_id as u64, &keys, request_id,
+            unique_preflight_keys_per_frame(),
+        );
         Ok(())
     }
 
@@ -1432,6 +1521,108 @@ enum DispatchResult {
     Continue,
     Shutdown,
     Error(String),
+}
+
+// ---------------------------------------------------------------------------
+// Unique pre-flight key stream
+// ---------------------------------------------------------------------------
+
+/// Keys per W2M frame for the unique pre-flight stream: ~16 MiB of wire data
+/// per frame (32 B/key: 16 B PK + 8 B weight + 8 B null word), far under
+/// `MAX_W2M_MSG`. The reactor parks a still-streaming worker's frames per
+/// req_id while the master's merge drains a different worker, and every
+/// parked frame holds one of the worker's `W2M_MAX_IN_FLIGHT` `InFlightState`
+/// slots — so the frame size must keep `W2M_REGION_SIZE / frame_bytes` below
+/// that bound.
+const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 19;
+
+const _: () = assert!(
+    w2m_ring::W2M_REGION_SIZE / (32 * UNIQUE_PREFLIGHT_KEYS_PER_FRAME + 8)
+        < crate::runtime::w2m::W2M_MAX_IN_FLIGHT,
+    "unique pre-flight frames must be large enough that a full W2M ring holds \
+     fewer frames than the in-flight slots InFlightState can track",
+);
+
+/// Frame size for the unique pre-flight stream. Debug builds may shrink it
+/// via GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME so tests exercise multi-frame
+/// trains with small tables; such tests must keep the per-worker frame count
+/// under the `W2M_MAX_IN_FLIGHT` limit (see UNIQUE_PREFLIGHT_KEYS_PER_FRAME).
+fn unique_preflight_keys_per_frame() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(n) = std::env::var("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
+    UNIQUE_PREFLIGHT_KEYS_PER_FRAME
+}
+
+/// Stream `keys` (already sorted) to the master as a train of continuation
+/// frames carrying a synthetic single-U128-PK-column schema. Every frame is
+/// tagged `FLAG_CONTINUATION`; the terminal frame additionally
+/// `FLAG_SCAN_LAST`. An empty key set emits one empty terminal frame so the
+/// master's drain still sees the train end.
+///
+/// Deliberately NOT `send_scan_response`: that path attaches the owner
+/// table's *cached* schema wire block, which would make the master decode
+/// these frames with the table's row stride, and its `pending_scan` chunking
+/// would require materialising all keys as one 32 B/row `Batch` (2× the
+/// caller's `Vec`). The synthetic schema's wire block is built one-off (the
+/// `send_response` mismatched-schema pattern) and never written to the
+/// table-keyed schema-block cache, so the table's cached block is never
+/// poisoned. `send_encoded` blocks on a full ring until the master's merge
+/// drains it — acceptable backpressure: the worker has nothing else to do
+/// during the DDL window.
+pub(crate) fn send_unique_preflight_keys(
+    w2m_writer: &W2mWriter,
+    target_id: u64,
+    keys: &[u128],
+    request_id: u64,
+    keys_per_frame: usize,
+) {
+    debug_assert!(keys_per_frame > 0, "keys_per_frame must be positive");
+    let synthetic = crate::runtime::sal::unique_preflight_wire_schema();
+    let schema_block = ipc::build_schema_wire_block(&synthetic, &[], target_id as u32);
+
+    // Reusable chunk batch: filled, encoded, and cleared per frame.
+    let mut chunk = Batch::with_schema(synthetic, keys.len().min(keys_per_frame));
+    let mut start = 0usize;
+    loop {
+        let end = keys.len().min(start + keys_per_frame);
+        chunk.clear();
+        for &k in &keys[start..end] {
+            chunk.ensure_row_capacity();
+            // U128 PK: OPK == big-endian, so `extend_pk`'s BE bytes decode
+            // back to the native key via `ColumnLocator::native_key` on the
+            // master — the wire is encoding-transparent.
+            chunk.extend_pk(k);
+            chunk.extend_weight(&1i64.to_le_bytes());
+            chunk.extend_null_bmp(&0u64.to_le_bytes());
+            chunk.count += 1;
+        }
+        let is_first = start == 0;
+        let is_last = end == keys.len();
+        // Schema block only on the first frame; continuations decode against
+        // the master's saved schema hint (synthetic schema version is 0, so
+        // no wire_flags_set_schema_version is needed).
+        let prebuilt: Option<&[u8]> = if is_first { Some(&schema_block) } else { None };
+        let schema_for_encode = if is_first { Some(&synthetic) } else { None };
+        let flags = FLAG_CONTINUATION | if is_last { FLAG_SCAN_LAST } else { 0 };
+        let sz = ipc::wire_size_range(
+            STATUS_OK, &[], schema_for_encode, None, &chunk, chunk.count, prebuilt,
+        );
+        w2m_writer.send_encoded(sz, request_id as u32, |buf| {
+            ipc::encode_wire_into_range(
+                buf, 0, target_id, 0, flags,
+                0, STATUS_OK, // request_id 0 in payload; ring prefix carries the req_id
+                schema_for_encode, &chunk, 0, chunk.count, prebuilt,
+            );
+        });
+        if is_last { break; }
+        start = end;
+    }
 }
 
 

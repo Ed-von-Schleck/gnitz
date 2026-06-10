@@ -601,6 +601,39 @@ impl ColumnLocator {
     }
 }
 
+/// Invoke `f` with the native `u128` index key of every positive-weight,
+/// non-null row of `batch`, reading the indexed column through `loc`.
+/// Returning `false` from `f` stops *this batch's* walk early (callers use it
+/// to bail once a filter caps or a duplicate is found); it does NOT stop any
+/// surrounding frame drain — the master's drains keep consuming every frame
+/// regardless. This is the single definition of "what key does this column's
+/// value map to" — shared by the steady-state unique-filter warmup, the
+/// INSERT-path extraction, and the worker-side projection of the CREATE-time
+/// pre-flight validator, so all three agree by construction.
+///
+/// The key is the column's value decoded OPK→native: from the packed PK region
+/// when the column is itself a PK column, else from its native-LE payload slot.
+/// `get_pk` is wrong for signed single-column PKs (it returns the sign-flipped
+/// OPK value, which `index_opk_prefix` then flips again, seeking the wrong index
+/// key); `pk_native_key` is correct for every width and signedness, and equals
+/// `get_pk` for unsigned single PKs.
+///
+/// Accepts a `MemBatch` so callers can feed wire bytes without an intermediate
+/// owned `Batch` allocation (zero-copy scan path); owned batches use
+/// `Batch::as_mem_batch()`.
+pub(crate) fn for_each_index_key(
+    batch: &MemBatch<'_>,
+    loc: ColumnLocator,
+    mut f: impl FnMut(u128) -> bool,
+) {
+    for i in 0..batch.count {
+        if batch.get_weight(i) <= 0 { continue; }
+        // PK columns are never null; a NULL payload column is skipped.
+        if loc.is_null(batch, i) { continue; }
+        if !f(loc.native_key(batch, i)) { return; }
+    }
+}
+
 impl PartialEq for SchemaDescriptor {
     fn eq(&self, other: &Self) -> bool {
         if self.num_columns() != other.num_columns() || self.pk_indices() != other.pk_indices() {
