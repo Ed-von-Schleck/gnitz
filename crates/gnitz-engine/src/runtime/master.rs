@@ -17,7 +17,7 @@ thread_local! {
 
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
-use crate::schema::{pk_native_key, payload_native_key};
+use crate::schema::{pk_native_key, payload_native_key, ColumnLocator};
 
 use crate::runtime::sal::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
@@ -205,18 +205,13 @@ unsafe impl Send for WarmupGuard {}
 
 /// Column-extraction descriptor for one unique index on a table.
 /// Precomputed so the hot update path avoids catalog reborrows per row.
+/// `col_idx` keys the `unique_filters` map; `loc` is the resolved PK-or-payload
+/// read for the indexed column's value (replacing the old hand-rolled
+/// `is_pk_col` + `usize::MAX`-poisoned `src_payload_idx` + `pk_field_off`).
 #[derive(Clone, Copy)]
 struct UniqueIndexDesc {
     col_idx: u32,
-    type_code: u8,
-    is_pk_col: bool,
-    /// Index into `batch.col_data(idx)` for the source column, or
-    /// `usize::MAX` when `is_pk_col` (value is read from batch PK).
-    src_payload_idx: usize,
-    col_size: usize,
-    /// Byte offset of this column within the packed PK region. Only
-    /// meaningful when `is_pk_col`.
-    pk_field_off: usize,
+    loc: ColumnLocator,
 }
 
 /// Invoke `f` with the native `u128` index key of every positive-weight,
@@ -246,21 +241,9 @@ fn for_each_index_key(
 ) {
     for i in 0..batch.count {
         if batch.get_weight(i) <= 0 { continue; }
-        if !d.is_pk_col {
-            // `src_payload_idx` is a payload-column index; payload columns are
-            // capped at 64 by MAX_COLUMNS = 65 (one PK col min, one u64 null
-            // word per row), so `1u64 << idx` never overflows.
-            let null_word = batch.get_null_word(i);
-            if null_word & (1u64 << d.src_payload_idx) != 0 { continue; }
-        }
-        let key = if d.is_pk_col {
-            pk_native_key(
-                batch.get_pk_bytes(i), d.pk_field_off, d.col_size, d.type_code)
-        } else {
-            let col_data = batch.col_data(d.src_payload_idx, d.col_size);
-            payload_native_key(col_data, i * d.col_size, d.col_size, d.type_code)
-        };
-        if !f(key) { return; }
+        // PK columns are never null; a NULL payload column is skipped.
+        if d.loc.is_null(batch, i) { continue; }
+        if !f(d.loc.native_key(batch, i)) { return; }
     }
 }
 
@@ -1331,9 +1314,8 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     /// Collect column-extraction descriptors for every unique index on
-    /// `table_id`. Returns (col_idx, type_code, is_pk_col, payload_idx,
-    /// col_size) per unique circuit — the shape expected by
-    /// `extract_unique_index_key`.
+    /// `table_id` — one `(col_idx, ColumnLocator)` per unique circuit, the shape
+    /// `for_each_index_key` consumes.
     fn unique_index_descriptors(
         &mut self, table_id: i64,
     ) -> Option<(SchemaDescriptor, Vec<UniqueIndexDesc>)> {
@@ -1343,25 +1325,12 @@ impl MasterDispatcher {
 
         let mut out: Vec<UniqueIndexDesc> = Vec::new();
         for ci in 0..n_circuits {
-            if let Some((col_idx, is_unique, type_code)) =
+            if let Some((col_idx, is_unique, _type_code)) =
                 cat.get_index_circuit_info(table_id, ci)
             {
                 if !is_unique { continue; }
                 let source_col = col_idx as usize;
-                let is_pk_col = schema.is_pk_col(source_col);
-                let src_payload_idx = if is_pk_col {
-                    usize::MAX
-                } else {
-                    schema.payload_idx(source_col)
-                };
-                let col_size = schema.columns[source_col].size() as usize;
-                let pk_field_off = if is_pk_col {
-                    schema.pk_byte_offset(source_col) as usize
-                } else { 0 };
-                out.push(UniqueIndexDesc {
-                    col_idx, type_code, is_pk_col, src_payload_idx, col_size,
-                    pk_field_off,
-                });
+                out.push(UniqueIndexDesc { col_idx, loc: schema.locate(source_col) });
             }
         }
         if out.is_empty() { None } else { Some((schema, out)) }
@@ -1369,9 +1338,8 @@ impl MasterDispatcher {
 
     /// Column-extraction descriptor for `col_idx` of `owner_id`, built from the
     /// owner schema — used at CREATE time, before the index circuit exists, so
-    /// it cannot read `index_circuits`. Matches `unique_index_descriptors`
-    /// field-for-field, so the pre-flight key equals the steady-state
-    /// enforcement key.
+    /// it cannot read `index_circuits`. Matches `unique_index_descriptors`, so
+    /// the pre-flight key equals the steady-state enforcement key.
     fn unique_index_desc_for_col(&mut self, owner_id: i64, col_idx: u32) -> Option<UniqueIndexDesc> {
         let schema = unsafe { (*self.catalog).get_schema_desc(owner_id) }?;
         let col = col_idx as usize;
@@ -1379,17 +1347,11 @@ impl MasterDispatcher {
         // `.len()` is the capacity (MAX_COLUMNS = 65), not the table's active
         // column count. Bounding on it instead of `num_columns()` would let an
         // out-of-range `col_idx` index a zero-initialized slot and build a bogus
-        // descriptor (wrong size/offset/type) rather than return None.
+        // descriptor (wrong size/offset/type) rather than return None. `locate`
+        // also bounds-checks, but returning None here keeps the caller's
+        // "no such column" contract instead of a panic.
         if col >= schema.num_columns() { return None; }
-        let is_pk_col = schema.is_pk_col(col);
-        Some(UniqueIndexDesc {
-            col_idx,
-            type_code: schema.columns[col].type_code,
-            is_pk_col,
-            src_payload_idx: if is_pk_col { usize::MAX } else { schema.payload_idx(col) },
-            col_size: schema.columns[col].size() as usize,
-            pk_field_off: if is_pk_col { schema.pk_byte_offset(col) as usize } else { 0 },
-        })
+        Some(UniqueIndexDesc { col_idx, loc: schema.locate(col) })
     }
 
     /// True if every key in `keys` is definitely absent from the filter
@@ -1498,6 +1460,10 @@ impl MasterDispatcher {
         // cost on the common (large-INSERT) path.
         let wide = source_schema.pk_is_wide();
 
+        // Borrowed view for the per-column locator reads (FK insert / unique
+        // enforcement); zero-allocation over `batch`'s pages.
+        let mb = batch.as_mem_batch();
+
         // Build PK aggregation. Narrow path uses the pooled u128 map and yields
         // `pk_lo_hi`; the wide path uses a local PkBuf-keyed map and yields
         // `pk_lo_hi_wide`. Both feed the UPSERT PK-identification check below.
@@ -1573,42 +1539,32 @@ impl MasterDispatcher {
         let mut p1_labels: Vec<P1Label> = Vec::new();
 
         for fi in 0..n_fk {
-            let (fk_col_idx, parent_table_id, parent_col_idx, col_type, parent_schema) = unsafe {
+            let (fk_col_idx, parent_table_id, parent_col_idx, parent_schema) = unsafe {
                 let disp = &mut *disp_ptr;
                 let cat = &mut *disp.catalog;
                 let (fk_col_idx, parent_table_id, parent_col_idx) = match cat.get_fk_constraint(target_id, fi) {
                     Some(c) => c,
                     None => continue,
                 };
-                let col_type = cat.get_fk_col_type(target_id, fk_col_idx);
                 let parent_schema = cat.get_schema_desc(parent_table_id)
                     .ok_or_else(|| format!(
                         "FK parent table {} schema not found", parent_table_id))?;
-                (fk_col_idx, parent_table_id, parent_col_idx, col_type, parent_schema)
+                (fk_col_idx, parent_table_id, parent_col_idx, parent_schema)
             };
 
             // The FK column may itself be a PK column of the child table (e.g.
-            // `id BIGINT PRIMARY KEY REFERENCES parent(pid)`). In that case it
-            // has no payload slot; `payload_idx` would return the PK sentinel
-            // and `col_data(sentinel)` indexes out of bounds. Read the value
-            // from the PK region instead.
-            let is_fk_pk_col = source_schema.is_pk_col(fk_col_idx);
-            let payload_col  = if is_fk_pk_col { usize::MAX } else { source_schema.payload_idx(fk_col_idx) };
-            let pk_field_off = if is_fk_pk_col { source_schema.pk_byte_offset(fk_col_idx) as usize } else { 0 };
-            let col_size     = source_schema.columns[fk_col_idx].size() as usize;
+            // `id BIGINT PRIMARY KEY REFERENCES parent(pid)`); `locate` resolves
+            // the PK-or-payload read once, so a PK FK column reads from the
+            // packed PK region instead of a (nonexistent) payload slot.
+            let loc = source_schema.locate(fk_col_idx);
 
             let mut seen: FxHashSet<u128> = FxHashSet::default();
             let mut keys: Vec<u128> = Vec::new();
 
             for i in 0..batch.count {
                 if batch.get_weight(i) <= 0 { continue; }
-                let fk_key = if is_fk_pk_col {
-                    pk_native_key(batch.get_pk_bytes(i), pk_field_off, col_size, col_type)
-                } else {
-                    let null_word = batch.get_null_word(i);
-                    if null_word & (1u64 << payload_col) != 0 { continue; }
-                    payload_native_key(batch.col_data(payload_col), i * col_size, col_size, col_type)
-                };
+                if loc.is_null(&mb, i) { continue; }
+                let fk_key = loc.native_key(&mb, i);
                 if seen.insert(fk_key) {
                     keys.push(fk_key);
                 }
@@ -1904,19 +1860,19 @@ impl MasterDispatcher {
                         (child_tid, fk_col_idx, parent_col_idx, idx_schema)
                     };
 
-                    let col_type    = source_schema.columns[parent_col_idx].type_code;
-                    let col_size    = source_schema.columns[parent_col_idx].size() as usize;
-                    let payload_col = source_schema.payload_idx(parent_col_idx);
+                    // PK columns are skipped above (immutable under UPDATE), so
+                    // this referenced column is always a payload column.
+                    let loc = source_schema.locate(parent_col_idx);
                     let proj_pos = project.iter()
                         .position(|&c| c == parent_col_idx as u8)
                         .expect("non-PK referenced column missing from gather projection");
 
                     let mut retired: Vec<u128> = Vec::new();
                     for &i in &update_rows {
-                        let new_val = if batch.get_null_word(i) & (1u64 << payload_col) != 0 {
+                        let new_val = if loc.is_null(&mb, i) {
                             None
                         } else {
-                            Some(payload_native_key(batch.col_data(payload_col), i * col_size, col_size, col_type))
+                            Some(loc.native_key(&mb, i))
                         };
 
                         // Absent committed row → omitted from the gather map →
@@ -1957,10 +1913,10 @@ impl MasterDispatcher {
         let mut retracted_vals: FxHashSet<u128> = FxHashSet::default();
 
         for ci in 0..n_circuits {
-            let (col_idx, type_code, idx_schema) = unsafe {
+            let (col_idx, idx_schema) = unsafe {
                 let disp = &mut *disp_ptr;
                 let cat = &mut *disp.catalog;
-                let (col_idx, is_unique, type_code) = match cat.get_index_circuit_info(target_id, ci) {
+                let (col_idx, is_unique, _type_code) = match cat.get_index_circuit_info(target_id, ci) {
                     Some(info) => info,
                     None => continue,
                 };
@@ -1969,35 +1925,18 @@ impl MasterDispatcher {
                     Some(s) => s,
                     None => continue,
                 };
-                (col_idx, type_code, idx_schema)
+                (col_idx, idx_schema)
             };
 
             let source_col = col_idx as usize;
-            let is_pk_col = source_schema.is_pk_col(source_col);
-            let src_payload_idx = if is_pk_col {
-                usize::MAX
-            } else {
-                source_schema.payload_idx(source_col)
-            };
-            let col_size = source_schema.columns[source_col].size() as usize;
-            let pk_field_off = if is_pk_col {
-                source_schema.pk_byte_offset(source_col) as usize
-            } else { 0 };
-
-            // Decode the indexed column to its canonical u128 key. `get_pk` yields
-            // the OPK-widened value (sign-flipped for signed), which the downstream
-            // `index_opk_prefix` would re-OPK-encode — seeking the wrong key for a
-            // signed single PK. `pk_native_key` is correct for every width/signedness
-            // and equals `get_pk` for unsigned singles; a payload column reads from
-            // `col_data`.
-            let key_at = |i: usize| -> u128 {
-                if is_pk_col {
-                    pk_native_key(batch.get_pk_bytes(i), pk_field_off, col_size, type_code)
-                } else {
-                    payload_native_key(
-                        batch.col_data(src_payload_idx), i * col_size, col_size, type_code)
-                }
-            };
+            // Decode the indexed column to its canonical u128 key. `locate`
+            // resolves the PK-or-payload read once: a PK source column (a member
+            // of a compound PK) reads from the packed PK region, a payload column
+            // from its dense slot. `native_key` (not the OPK-widened `get_pk`) is
+            // correct for every width/signedness — `get_pk` would feed
+            // `index_opk_prefix` a re-OPK-encode, double-flipping a signed single
+            // PK. `is_null` is false for PK and checks the bit for a payload col.
+            let loc = source_schema.locate(source_col);
 
             // Index-column key is always ≤ 16 bytes → u128. `upsert_keys` carries
             // the row's own `is_upsert` flag (the row PK is no longer read at the
@@ -2024,11 +1963,8 @@ impl MasterDispatcher {
             if has_retractions {
                 for i in 0..batch.count {
                     if batch.get_weight(i) >= 0 { continue; }
-                    if !is_pk_col {
-                        let null_word = batch.get_null_word(i);
-                        if null_word & (1u64 << src_payload_idx) != 0 { continue; }
-                    }
-                    let key = key_at(i);
+                    if loc.is_null(&mb, i) { continue; }
+                    let key = loc.native_key(&mb, i);
                     retracted_vals.insert(key);
                     retracted_pairs.insert((PkBuf::from_bytes(batch.get_pk_bytes(i)), key));
                 }
@@ -2037,12 +1973,9 @@ impl MasterDispatcher {
             for i in 0..batch.count {
                 if batch.get_weight(i) <= 0 { continue; }
 
-                if !is_pk_col {
-                    let null_word = batch.get_null_word(i);
-                    if null_word & (1u64 << src_payload_idx) != 0 { continue; }
-                }
+                if loc.is_null(&mb, i) { continue; }
 
-                let key = key_at(i);
+                let key = loc.native_key(&mb, i);
 
                 // In-batch duplicate detection runs for ALL positive-weight
                 // rows, INCLUDING UPSERTs: two rows setting the same new unique
@@ -3055,21 +2988,14 @@ mod unique_filter_tests {
 
     #[test]
     fn extract_into_filter_pk_col() {
-        // Schema: PK-only U64. Test that is_pk_col=true path extracts PKs.
+        // Schema: PK-only U64. Test that the PK-column locator extracts PKs.
         let schema = u64_schema();
         let batch = make_row_batch(schema, &[
             (10, 1, 0, 0),
             (20, 1, 0, 0),
             (30, -1, 0, 0),  // delete row — should be skipped
         ]);
-        let desc = UniqueIndexDesc {
-            col_idx: 0,
-            type_code: type_code::U64,
-            is_pk_col: true,
-            src_payload_idx: usize::MAX,
-            col_size: 8,
-            pk_field_off: 0,
-        };
+        let desc = UniqueIndexDesc { col_idx: 0, loc: schema.locate(0) };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
         assert!(filter.values.contains(&10u128));
@@ -3094,14 +3020,7 @@ mod unique_filter_tests {
         let opk_widened = gnitz_wire::widen_pk_be(&opk, 8);
         assert_ne!(native, opk_widened, "signed OPK value must differ from native");
 
-        let desc = UniqueIndexDesc {
-            col_idx: 0,
-            type_code: type_code::I64,
-            is_pk_col: true,
-            src_payload_idx: usize::MAX,
-            col_size: 8,
-            pk_field_off: 0,
-        };
+        let desc = UniqueIndexDesc { col_idx: 0, loc: schema.locate(0) };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
         assert!(filter.values.contains(&native), "filter holds native signed key");
@@ -3139,14 +3058,7 @@ mod unique_filter_tests {
             (2, 1, 1, 200),  // null bit set → should be skipped
             (3, 1, 0, 300),
         ]);
-        let desc = UniqueIndexDesc {
-            col_idx: 1,
-            type_code: type_code::U64,
-            is_pk_col: false,
-            src_payload_idx: 0, // first payload column
-            col_size: 8,
-            pk_field_off: 0,
-        };
+        let desc = UniqueIndexDesc { col_idx: 1, loc: schema.locate(1) };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
         assert!(filter.values.contains(&100u128));
@@ -3162,14 +3074,7 @@ mod unique_filter_tests {
             (10, 1, 0, 0),
             (20, 1, 0, 0),
         ]);
-        let desc = UniqueIndexDesc {
-            col_idx: 0,
-            type_code: type_code::U64,
-            is_pk_col: true,
-            src_payload_idx: usize::MAX,
-            col_size: 8,
-            pk_field_off: 0,
-        };
+        let desc = UniqueIndexDesc { col_idx: 0, loc: schema.locate(0) };
         let mut filter = UniqueFilter::new();
         filter.capped = true;
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
@@ -3393,14 +3298,7 @@ mod unique_filter_tests {
             compound_pk_bytes(&[&5u32.to_be_bytes(), &2u32.to_be_bytes()]),
         ];
         let batch = build_check_batch_pkbuf(&schema, &keys, None);
-        let desc = UniqueIndexDesc {
-            col_idx: 0,
-            type_code: type_code::U32,
-            is_pk_col: true,
-            src_payload_idx: usize::MAX,
-            col_size: 4,
-            pk_field_off: 0,
-        };
+        let desc = UniqueIndexDesc { col_idx: 0, loc: schema.locate(0) };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
         assert!(filter.values.contains(&5u128), "filter holds column A's value");
@@ -3410,7 +3308,7 @@ mod unique_filter_tests {
     #[test]
     fn extract_into_filter_compound_pk_second_column_offset() {
         // Unique index on B (the second PK column at byte offset 4). Confirms
-        // pk_field_off slices the right column out of the packed key.
+        // the locator slices the right column out of the packed key.
         let schema = SchemaDescriptor::new(&[
             SchemaColumn::new(type_code::U32, 0),
             SchemaColumn::new(type_code::U32, 0),
@@ -3421,14 +3319,7 @@ mod unique_filter_tests {
             compound_pk_bytes(&[&6u32.to_be_bytes(), &22u32.to_be_bytes()]),
         ];
         let batch = build_check_batch_pkbuf(&schema, &keys, None);
-        let desc = UniqueIndexDesc {
-            col_idx: 1,
-            type_code: type_code::U32,
-            is_pk_col: true,
-            src_payload_idx: usize::MAX,
-            col_size: 4,
-            pk_field_off: 4,
-        };
+        let desc = UniqueIndexDesc { col_idx: 1, loc: schema.locate(1) };
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &desc);
         assert!(filter.values.contains(&11u128));

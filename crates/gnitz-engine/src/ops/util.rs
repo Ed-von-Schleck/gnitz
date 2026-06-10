@@ -2,7 +2,7 @@
 
 use xxhash_rust::xxh3::Xxh3Default;
 
-use crate::schema::{SchemaDescriptor, TypeCode, type_code};
+use crate::schema::{ColumnLocator, SchemaDescriptor, TypeCode, type_code};
 use crate::storage::{Batch, MemBatch, ReadCursor};
 
 /// Compare two equal-length LE byte windows of a fixed-width column under
@@ -160,40 +160,8 @@ pub(super) fn compare_cursor_payload_to_batch_row(
 }
 
 // ---------------------------------------------------------------------------
-// Fixed-width column location + raw index/group column extractors
+// Raw index/group column extractors
 // ---------------------------------------------------------------------------
-
-/// Physical location of one fixed-width column within a `MemBatch` row: either
-/// a byte offset into the PK region or a dense payload slot. Resolved once from
-/// the schema so `bytes` is a pure slice with no per-row schema walk.
-struct ColLoc {
-    is_pk: bool,
-    /// PK byte offset when `is_pk`, else the dense payload slot index.
-    off_or_pi: usize,
-    size: usize,
-}
-
-impl ColLoc {
-    fn resolve(schema: &SchemaDescriptor, col_idx: usize) -> Self {
-        let size = schema.columns[col_idx].size() as usize;
-        let is_pk = schema.is_pk_col(col_idx);
-        let off_or_pi = if is_pk {
-            schema.pk_byte_offset(col_idx) as usize
-        } else {
-            schema.payload_idx(col_idx)
-        };
-        Self { is_pk, off_or_pi, size }
-    }
-
-    #[inline]
-    fn bytes<'a>(&self, mb: &'a MemBatch, row: usize) -> &'a [u8] {
-        if self.is_pk {
-            &mb.get_pk_bytes(row)[self.off_or_pi..self.off_or_pi + self.size]
-        } else {
-            mb.get_col_ptr(row, self.off_or_pi, self.size)
-        }
-    }
-}
 
 /// Precomputed reader for one raw, injective index/group column. Built once
 /// before a population or read-back loop so the per-row path is a slice plus a
@@ -205,24 +173,32 @@ impl ColLoc {
 /// merge distinct groups. GI's gc column is always U8..I64 (size ∈ {1,2,4,8}),
 /// so `read_unsigned` never sees an out-of-range width.
 pub(super) struct IndexColExtractor {
-    loc: ColLoc,
+    loc: ColumnLocator,
 }
 
 impl IndexColExtractor {
     pub(super) fn new(schema: &SchemaDescriptor, col_idx: usize) -> Self {
-        Self { loc: ColLoc::resolve(schema, col_idx) }
+        Self { loc: schema.locate(col_idx) }
     }
 
     #[inline]
     pub(super) fn extract(&self, mb: &MemBatch, row: usize) -> u64 {
         let bytes = self.loc.bytes(mb, row);
-        if self.loc.is_pk {
+        let size = self.loc.size();
+        if self.loc.is_pk() {
             // PK columns hold OPK (big-endian) bytes at rest; widen to the
             // canonical value (native for unsigned, sign-flipped for signed).
-            gnitz_wire::widen_pk_be(bytes, self.loc.size) as u64
+            gnitz_wire::widen_pk_be(bytes, size) as u64
         } else {
-            crate::schema::read_unsigned(bytes, self.loc.size)
+            crate::schema::read_unsigned(bytes, size)
         }
+    }
+
+    /// True iff the extracted column is NULL in `row` (always false for a PK
+    /// column). The null gate GI population applies before reading a row.
+    #[inline]
+    pub(super) fn is_null(&self, mb: &MemBatch, row: usize) -> bool {
+        self.loc.is_null(mb, row)
     }
 }
 
@@ -231,7 +207,7 @@ impl IndexColExtractor {
 /// row. Callers must have passed `compiler::avi_group_key_eligible`
 /// (fixed-width, non-nullable columns), so it never sees STRING/BLOB or a NULL.
 pub(super) struct GroupKeyExtractor {
-    cols: Vec<ColLoc>,
+    cols: Vec<ColumnLocator>,
     /// Total group-key width in bytes (the group stride).
     pub(super) stride: usize,
 }
@@ -245,13 +221,15 @@ impl GroupKeyExtractor {
             // gather() reads each column's raw bytes unconditionally; a nullable
             // column would let a NULL row's stale slot bytes form a phantom key.
             // avi_group_key_eligible already excludes nullable/STRING/BLOB/float
-            // columns — assert it so a future gate change can't silently regress.
-            debug_assert_eq!(
+            // columns, but the constructor runs once per operator (not per row),
+            // so a hard assert here is free insurance against a future gate
+            // change silently corrupting group keys.
+            assert_eq!(
                 schema.columns[ci].nullable, 0,
                 "GroupKeyExtractor: group columns must be non-nullable",
             );
-            let loc = ColLoc::resolve(schema, ci);
-            stride += loc.size;
+            let loc = schema.locate(ci);
+            stride += loc.size();
             cols.push(loc);
         }
         Self { cols, stride }
@@ -262,9 +240,10 @@ impl GroupKeyExtractor {
     #[inline]
     pub(super) fn gather(&self, mb: &MemBatch, row: usize, out: &mut [u8]) {
         let mut off = 0;
-        for col in &self.cols {
-            out[off..off + col.size].copy_from_slice(col.bytes(mb, row));
-            off += col.size;
+        for loc in &self.cols {
+            let size = loc.size();
+            out[off..off + size].copy_from_slice(loc.bytes(mb, row));
+            off += size;
         }
     }
 }
@@ -417,7 +396,8 @@ impl GroupKeyRow for BatchRow<'_, '_> {
     fn payload_bytes(&self, schema: &SchemaDescriptor, c_idx: usize, cs: usize) -> Option<&[u8]> {
         // MemBatch get_col_ptr is infallible (panics OOB) — always Some, so the
         // batch path keeps its original non-null assumption and behaviour.
-        Some(self.mb.get_col_ptr(self.row, schema.payload_idx(c_idx), cs))
+        let pi = schema.try_payload_idx(c_idx).expect("group-key column is non-PK by construction");
+        Some(self.mb.get_col_ptr(self.row, pi, cs))
     }
     #[inline]
     fn blob(&self) -> &[u8] { self.mb.blob }
@@ -527,7 +507,7 @@ fn extract_group_key_row<R: GroupKeyRow>(
             hasher.update(&key.to_le_bytes());
             continue;
         }
-        let pi = schema.payload_idx(c_idx);
+        let pi = schema.try_payload_idx(c_idx).expect("non-PK: PK columns handled in the branch above");
         let is_null = schema.columns[c_idx].nullable != 0 && (null_word >> pi) & 1 != 0;
         // `size()` is already 16 for STRING/BLOB/U128/UUID (all share the wide
         // 16-byte layout), so no per-type width fixup is needed here.
@@ -618,7 +598,7 @@ mod index_col_extractor_tests {
             ],
             &[0],
         );
-        let pi = schema.payload_idx(1);
+        let pi = schema.try_payload_idx(1).unwrap();
         let mut b = Batch::with_schema(schema, 1);
         b.extend_pk(7u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -649,7 +629,7 @@ mod index_col_extractor_tests {
                 &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)],
                 &[0],
             );
-            let pi = schema.payload_idx(1);
+            let pi = schema.try_payload_idx(1).unwrap();
             let mut b = B::with_schema(schema, 1);
             b.extend_pk(0u128);
             b.extend_weight(&1i64.to_le_bytes());

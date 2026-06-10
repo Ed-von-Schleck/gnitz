@@ -97,7 +97,7 @@ impl Accumulator {
         let pi_or_pk_off = if is_pk_col {
             schema.pk_byte_offset(col_idx)
         } else {
-            schema.payload_idx(col_idx) as u8
+            schema.try_payload_idx(col_idx).expect("non-PK in the else arm of is_pk_col") as u8
         };
         Accumulator {
             acc: 0,

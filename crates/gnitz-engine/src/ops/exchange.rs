@@ -44,7 +44,7 @@ fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &Schem
         let col_size = schema.columns[col_idx].size() as usize;
         return gnitz_wire::widen_pk_be(&bytes[offset..offset + col_size], col_size);
     }
-    let pi = schema.payload_idx(col_idx);
+    let pi = schema.try_payload_idx(col_idx).expect("non-PK: PK columns early-return above");
     // NULL values shard together. Return 0 without touching the slot: a NULL
     // string/blob column's German-string length field is uninitialized, and a
     // garbage length > SHORT_STRING_THRESHOLD would drive a wild heap read. The
@@ -212,7 +212,7 @@ fn route_partition_key(
         if !schema.is_pk_col(c_idx) {
             if crate::schema::is_routable_int(tc) {
                 let cs = col.size() as usize;
-                let pi = schema.payload_idx(c_idx);
+                let pi = schema.try_payload_idx(c_idx).expect("non-PK: guarded by !is_pk_col");
                 let ptr = mb.get_col_ptr(row, pi, cs);
                 return crate::schema::payload_route_key(ptr, 0, cs, tc);
             }
@@ -220,7 +220,7 @@ fn route_partition_key(
             // so the row co-locates with its `_join_pk` partition. A NULL string
             // is a zeroed struct → empty content → 0, matching promote_into.
             if gnitz_wire::is_german_string(tc) {
-                let pi = schema.payload_idx(c_idx);
+                let pi = schema.try_payload_idx(c_idx).expect("non-PK: guarded by !is_pk_col");
                 let struct_bytes = mb.get_col_ptr(row, pi, 16);
                 return crate::ops::linear::german_string_promote_key(struct_bytes, mb.blob);
             }

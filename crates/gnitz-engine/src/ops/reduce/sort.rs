@@ -120,7 +120,7 @@ pub(super) fn argsort_delta(
     }
 
     // packed_sort fast path: non-nullable single non-PK col of a packable
-    // int type. Reads via `payload_idx` (PK-invalid) and stores keys in a
+    // int type. Reads via `try_payload_idx` (PK-guarded) and stores keys in a
     // dense Vec so the comparator skips the per-call TypeCode dispatch.
     // NULL stores as zero bytes — would interleave with integer 0, so
     // nullable falls through to compare_by_group_cols below.
@@ -130,7 +130,8 @@ pub(super) fn argsort_delta(
     {
         let ci = group_by_cols[0] as usize;
         let tc = TypeCode::from_validated_u8(schema.columns[ci].type_code);
-        let pi = schema.payload_idx(ci);
+        let pi = schema.try_payload_idx(ci)
+            .expect("non-PK: guarded by !is_pk_col on the fast-path entry above");
         macro_rules! packed_sort {
             ($T:ty, $stride:expr) => {{
                 let keys: Vec<$T> = (0..n)

@@ -283,7 +283,7 @@ fn secondary_index_bench_avi_decomposition() {
     let tmp = tempfile::tempdir().unwrap();
     let extractor = GroupKeyExtractor::new(&schema, &group_by_cols);
     let n = extractor.stride;
-    let avi_pi = schema.payload_idx(2);
+    let avi_pi = schema.try_payload_idx(2).expect("AVI agg col is a payload column by construction");
     let tc = type_code::I64;
 
     // AVI key = group_key_bytes ++ av_encoded(8).

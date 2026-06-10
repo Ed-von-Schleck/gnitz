@@ -98,7 +98,8 @@ impl ShardCursor {
 #[cfg(test)]
 fn is_null(shard: &MappedShard, row: usize, col_idx: usize, schema: &SchemaDescriptor) -> bool {
     let null_word = shard.get_null_word(row);
-    (null_word >> schema.payload_idx(col_idx)) & 1 != 0
+    let pi = schema.try_payload_idx(col_idx).expect("is_null test helper: col_idx is a payload column");
+    (null_word >> pi) & 1 != 0
 }
 
 fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {

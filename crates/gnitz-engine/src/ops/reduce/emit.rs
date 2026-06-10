@@ -1,6 +1,6 @@
 //! Output row emitters: raw reduce rows, finalized rows, gather-reduce rows.
 
-use crate::schema::{SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::schema::{ColumnLocator, SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{Batch, MemBatch};
 
 use super::super::util::write_string_from_batch;
@@ -78,30 +78,29 @@ pub(super) fn emit_reduce_row(
             let grp_idx = ci - 1; // skip PK at 0
             if grp_idx < group_by_cols.len() {
                 let src_ci = group_by_cols[grp_idx] as usize;
-                if input_schema.is_pk_col(src_ci) {
-                    // PK lives in the OPK region; decode the addressed column back
-                    // to native LE before copying into the payload region (raw
-                    // copy keeps the flipped sign bit / big-endian order for
-                    // signed and wide columns).
-                    let opk = input_mb.get_pk_bytes(exemplar_row);
-                    let off = input_schema.pk_byte_offset(src_ci) as usize;
-                    let le = gnitz_wire::decode_pk_column_owned(&opk[off..off + cs], col.type_code);
-                    output.extend_col(out_pi, &le[..cs]);
-                } else {
-                    let src_pi = input_schema.payload_idx(src_ci);
-                    // Check null from input
-                    let in_null = input_mb.get_null_word(exemplar_row);
-                    if (in_null >> src_pi) & 1 != 0 {
-                        null_word |= 1u64 << out_pi;
-                        output.fill_col_zero(out_pi, cs);
-                    } else if gnitz_wire::is_german_string(col.type_code) {
-                        write_string_from_batch(
-                            output, out_pi,
-                            input_mb, exemplar_row, src_pi,
-                        );
-                    } else {
-                        let src = input_mb.get_col_ptr(exemplar_row, src_pi, cs);
-                        output.extend_col(out_pi, src);
+                let loc = input_schema.locate(src_ci);
+                match loc {
+                    ColumnLocator::Pk { .. } => {
+                        // PK lives in the OPK region; decode the addressed column
+                        // back to native LE before copying into the payload region
+                        // (a raw copy keeps the flipped sign bit / big-endian order
+                        // for signed and wide columns).
+                        let le = gnitz_wire::decode_pk_column_owned(
+                            loc.bytes(input_mb, exemplar_row), col.type_code);
+                        output.extend_col(out_pi, &le[..cs]);
+                    }
+                    ColumnLocator::Payload { slot, .. } => {
+                        if loc.is_null(input_mb, exemplar_row) {
+                            null_word |= 1u64 << out_pi;
+                            output.fill_col_zero(out_pi, cs);
+                        } else if gnitz_wire::is_german_string(col.type_code) {
+                            write_string_from_batch(
+                                output, out_pi,
+                                input_mb, exemplar_row, slot as usize,
+                            );
+                        } else {
+                            output.extend_col(out_pi, loc.bytes(input_mb, exemplar_row));
+                        }
                     }
                 }
             } else {

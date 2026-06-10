@@ -4,6 +4,7 @@
 
 use rustc_hash::FxHashMap;
 
+use crate::storage::MemBatch;
 use crate::util::{read_u32_le, read_u64_le};
 
 pub(crate) use gnitz_wire::type_code;
@@ -394,13 +395,18 @@ impl SchemaDescriptor {
         })
     }
 
-    /// Map a logical column index to its dense payload index (batch payload
-    /// region + null-bitmap bit position). Caller must ensure `col_idx` is
-    /// not a PK column.
+    /// Dense payload slot (batch payload region + null-bitmap bit position) for a
+    /// payload column. `None` for a PK column — PK columns have no payload slot.
+    /// The only `col_idx -> payload_index` function on `SchemaDescriptor`:
+    /// because it returns `Option`, "this column is a PK and has no payload slot"
+    /// must be handled, not poisoned with a sentinel. Reading a column whose
+    /// index is not statically known to be payload goes through [`Self::locate`].
     #[inline]
-    pub fn payload_idx(&self, col_idx: usize) -> usize {
-        debug_assert!(!self.is_pk_col(col_idx), "payload_idx: col_idx must not be a pk column");
-        self.payload_mapping[col_idx] as usize
+    pub(crate) fn try_payload_idx(&self, col_idx: usize) -> Option<usize> {
+        match self.payload_mapping[col_idx] {
+            PAYLOAD_MAPPING_PK_SENTINEL => None,
+            slot => Some(slot as usize),
+        }
     }
 
     /// True iff column `ci` is a PK column.
@@ -462,6 +468,111 @@ impl SchemaDescriptor {
             off += c.size() as u16;
         }
         unreachable!("pk_byte_offset: col_idx is a pk column but not found in pk_columns()");
+    }
+
+    /// Resolve where column `col_idx`'s value lives. The canonical entry point
+    /// for reading a column whose index is not statically a payload column.
+    #[inline]
+    pub(crate) fn locate(&self, col_idx: usize) -> ColumnLocator {
+        // Release-active bound. An out-of-range `col_idx` otherwise reads a
+        // zeroed padding slot in the fixed-capacity `columns`/`payload_mapping`
+        // arrays, resolves to the PK arm, and dies in `pk_byte_offset`'s
+        // `unreachable!()` with a message naming neither `locate` nor the bad
+        // index. A `debug_assert` would let that ship in release, so this is a
+        // hard `assert!` in the `pk_index_single` canary style. It is a
+        // last-line guard against an internal bug, distinct from
+        // untrusted-index rejection (a client-supplied circuit naming an OOB
+        // column). `locate` runs once per extractor at setup, not per row, so
+        // the check is free.
+        assert!(
+            col_idx < self.num_columns(),
+            "locate: col_idx {col_idx} out of bounds (num_columns = {})",
+            self.num_columns(),
+        );
+        let size = self.columns[col_idx].size();
+        let type_code = self.columns[col_idx].type_code;
+        match self.try_payload_idx(col_idx) {
+            None => ColumnLocator::Pk { byte_off: self.pk_byte_offset(col_idx), size, type_code },
+            Some(slot) => ColumnLocator::Payload { slot: slot as u8, size, type_code },
+        }
+    }
+}
+
+/// Where a logical column's value physically lives in a row, resolved once from
+/// the schema. The only sanctioned way to read a column whose index is not
+/// statically known to be a payload column: it cannot silently treat a PK
+/// column as payload (the corruption `payload_idx`'s sentinel return invited).
+/// A 4-byte `Copy` value (three `u8` fields + a 1-byte tag). The coordinates
+/// match the schema's own widths — `pk_byte_offset` returns `u8` (PK stride ≤
+/// `MAX_PK_BYTES` = 80), `payload_mapping` slots are `u8` (< `MAX_COLUMNS` = 65,
+/// so ≤ 63 with at least one PK column), and every fixed-width column is ≤ 16
+/// bytes — so `locate` stores them without widening and a `Vec<ColumnLocator>`
+/// (group-key / emit columns) stays dense.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColumnLocator {
+    /// PK column: value is OPK-at-rest in the PK region at `byte_off`, width
+    /// `size`, type `type_code`. PK columns are non-nullable.
+    Pk { byte_off: u8, size: u8, type_code: u8 },
+    /// Payload column: value is native-LE in dense payload slot `slot` (also its
+    /// null-bitmap bit position), width `size`, type `type_code`.
+    Payload { slot: u8, size: u8, type_code: u8 },
+}
+
+const _: () = assert!(
+    std::mem::size_of::<ColumnLocator>() <= 8,
+    "ColumnLocator must stay packed; a usize coordinate would balloon it to 24 bytes",
+);
+
+impl ColumnLocator {
+    #[inline]
+    pub(crate) fn size(&self) -> usize {
+        match *self { ColumnLocator::Pk { size, .. } | ColumnLocator::Payload { size, .. } => size as usize }
+    }
+
+    #[inline]
+    pub(crate) fn is_pk(&self) -> bool { matches!(self, ColumnLocator::Pk { .. }) }
+
+    /// True iff this column is NULL in `row`. PK columns are never null.
+    #[inline]
+    pub(crate) fn is_null(&self, mb: &MemBatch, row: usize) -> bool {
+        match *self {
+            ColumnLocator::Pk { .. } => false,
+            ColumnLocator::Payload { slot, .. } => (mb.get_null_word(row) >> slot) & 1 != 0,
+        }
+    }
+
+    /// Raw at-rest bytes of the column in `row`: OPK/big-endian for a PK column,
+    /// native little-endian for a payload column. For hashing, group keys, and
+    /// verbatim copies. (Generalises the old `ColLoc::bytes`.) On a STRING/BLOB
+    /// column these are the 16-byte German-string struct (a blob heap offset for
+    /// long strings), not the content — content callers resolve through the blob
+    /// arena. The returned slice borrows the batch's page memory (`'b`), not the
+    /// `&self`/`&mb` reference, so it stays valid after the locator and the
+    /// `&MemBatch` borrow are dropped (matching `get_pk_bytes`/`get_col_ptr`,
+    /// which both return `&'b`).
+    #[inline]
+    pub(crate) fn bytes<'b>(&self, mb: &MemBatch<'b>, row: usize) -> &'b [u8] {
+        match *self {
+            ColumnLocator::Pk { byte_off, size, .. } => {
+                let o = byte_off as usize;
+                &mb.get_pk_bytes(row)[o..o + size as usize]
+            }
+            ColumnLocator::Payload { slot, size, .. } =>
+                mb.get_col_ptr(row, slot as usize, size as usize),
+        }
+    }
+
+    /// Canonical native u128 key for the value in `row` (sign-aware; the form
+    /// `has_pk` and the index seeks compare on). Callers must `is_null`-gate a
+    /// nullable payload column first; a PK column is never null.
+    #[inline]
+    pub(crate) fn native_key(&self, mb: &MemBatch, row: usize) -> u128 {
+        match *self {
+            ColumnLocator::Pk { byte_off, size, type_code } =>
+                pk_native_key(mb.get_pk_bytes(row), byte_off as usize, size as usize, type_code),
+            ColumnLocator::Payload { slot, size, type_code } =>
+                payload_native_key(mb.get_col_ptr(row, slot as usize, size as usize), 0, size as usize, type_code),
+        }
     }
 }
 
@@ -972,8 +1083,10 @@ mod tests {
         // payload_columns() walks non-PK indices in logical order.
         let payload: Vec<usize> = s.payload_columns().map(|(_, ci, _)| ci).collect();
         assert_eq!(payload, vec![1, 2]);
-        assert_eq!(s.payload_idx(1), 0);
-        assert_eq!(s.payload_idx(2), 1);
+        assert_eq!(s.try_payload_idx(1), Some(0));
+        assert_eq!(s.try_payload_idx(2), Some(1));
+        // The PK column has no payload slot.
+        assert_eq!(s.try_payload_idx(0), None);
 
         // Non-zero pk_index round-trips (use I64 col at index 1, not STRING).
         let s2 = SchemaDescriptor::new(&cols, &[1]);
@@ -985,8 +1098,9 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_idx_around_pk() {
-        // pk_index = 1: col 0 maps to payload 0, col 2 maps to payload 1.
+    fn test_try_payload_idx_around_pk() {
+        // pk_index = 1: col 0 maps to payload 0, col 2 maps to payload 1, and
+        // the PK column (1) has no payload slot.
         let s = SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0),
@@ -995,8 +1109,54 @@ mod tests {
             ],
             &[1],
         );
-        assert_eq!(s.payload_idx(0), 0);
-        assert_eq!(s.payload_idx(2), 1);
+        assert_eq!(s.try_payload_idx(0), Some(0));
+        assert_eq!(s.try_payload_idx(2), Some(1));
+        assert_eq!(s.try_payload_idx(1), None);
+    }
+
+    #[test]
+    fn test_locate_pk_and_payload_variants() {
+        // Compound narrow PK (U32, U32) + an I64 payload: a PK column resolves
+        // to the OPK byte offset within the packed region, a payload column to
+        // its dense slot. Both carry the column's width and type.
+        let s = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1],
+        );
+        assert_eq!(
+            s.locate(0),
+            ColumnLocator::Pk { byte_off: 0, size: 4, type_code: type_code::U32 },
+        );
+        assert_eq!(
+            s.locate(1),
+            ColumnLocator::Pk { byte_off: 4, size: 4, type_code: type_code::U32 },
+        );
+        assert_eq!(
+            s.locate(2),
+            ColumnLocator::Payload { slot: 0, size: 8, type_code: type_code::I64 },
+        );
+        // Accessors agree with the variant fields.
+        assert!(s.locate(0).is_pk());
+        assert!(!s.locate(2).is_pk());
+        assert_eq!(s.locate(2).size(), 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "locate: col_idx 3 out of bounds")]
+    fn test_locate_out_of_bounds_panics() {
+        let s = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0],
+        );
+        let _ = s.locate(3);
     }
 
     #[test]

@@ -128,19 +128,16 @@ pub fn op_integrate_with_indexes(
         gi_batch.consolidated = false;
 
         let gi_col = gi_desc.col_idx as usize;
-        let gi_is_pk = input_schema.is_pk_col(gi_col);
-        // PK has no payload-index slot; the null-bit probe is skipped below,
-        // so a dummy 0 is safe.
-        let gi_pi = if gi_is_pk { 0 } else { input_schema.payload_idx(gi_col) };
         let gc_extractor = super::util::IndexColExtractor::new(input_schema, gi_col);
 
         // Each row overwrites a constant-length `key[..GI_GC_BYTES + src_pk.len()]`
         // window, so no stale trailing bytes can leak across iterations.
         let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         for row in 0..batch.count {
-            // PK is never null (catalog rule: pk-not-null.md), so its dense
-            // bit position is undefined and the null probe is skipped.
-            if !gi_is_pk && (mb.get_null_word(row) >> gi_pi) & 1 != 0 {
+            // PK is never null (catalog rule: pk-not-null.md); the extractor's
+            // locator returns false for a PK column and checks the null-bitmap
+            // bit for a payload column.
+            if gc_extractor.is_null(&mb, row) {
                 continue;
             }
 
@@ -175,32 +172,22 @@ pub fn op_integrate_with_indexes(
         avi_batch.consolidated = false;
 
         let avi_col = avi_desc.agg_col_idx as usize;
-        let avi_is_pk = input_schema.is_pk_col(avi_col);
-        // Column width is loop-invariant; resolve it (and the PK byte offset or
-        // payload slot) once. A PK aggregate is sliced from the packed PK
-        // region, a payload aggregate read from its dense slot.
-        let avi_w = input_schema.columns[avi_col].size() as usize;
-        let (avi_pk_off, avi_pi) = if avi_is_pk {
-            (input_schema.pk_byte_offset(avi_col) as usize, 0)
-        } else {
-            (0, input_schema.payload_idx(avi_col))
-        };
+        // Resolve the aggregate column's location once (loop-invariant): a PK
+        // aggregate is sliced from the packed PK region, a payload aggregate read
+        // from its dense slot.
+        let avi_loc = input_schema.locate(avi_col);
 
         let extractor = super::util::GroupKeyExtractor::new(input_schema, &avi_desc.group_by_cols);
         let n = extractor.stride;
         let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         for row in 0..batch.count {
-            // PK is never null, so its dense bit position is undefined.
-            if !avi_is_pk && (mb.get_null_word(row) >> avi_pi) & 1 != 0 {
+            // PK is never null; a NULL payload aggregate is skipped.
+            if avi_loc.is_null(&mb, row) {
                 continue;
             }
 
             extractor.gather(&mb, row, &mut key);
-            let av_bytes = if avi_is_pk {
-                &mb.get_pk_bytes(row)[avi_pk_off..avi_pk_off + avi_w]
-            } else {
-                mb.get_col_ptr(row, avi_pi, avi_w)
-            };
+            let av_bytes = avi_loc.bytes(&mb, row);
             let av_u64 = super::util::encode_ordered(
                 av_bytes, avi_desc.agg_col_type_code, avi_desc.for_max,
             );

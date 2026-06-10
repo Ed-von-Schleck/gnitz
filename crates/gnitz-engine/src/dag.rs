@@ -1763,22 +1763,16 @@ impl DagEngine {
         idx_schema: &SchemaDescriptor,
     ) -> Batch {
         let source_col = source_col_idx as usize;
-        let is_pk_col = src_schema.is_pk_col(source_col);
-        let src_payload_idx = if is_pk_col {
-            usize::MAX
-        } else {
-            src_schema.payload_idx(source_col)
-        };
-        let src_col_size = src_schema.columns[source_col].size() as usize;
-        let src_col_type = src_schema.columns[source_col].type_code;
+        // `locate` resolves the PK-or-payload read once: a PK source column is
+        // sliced from the packed OPK PK region, a payload column read from its
+        // dense slot. `native_key` decodes either to the canonical u128 the
+        // index PK is OPK-encoded from; `is_null` is false for PK, checks the
+        // bit for a payload column.
+        let loc = src_schema.locate(source_col);
         let src_pk_stride = src_schema.pk_stride() as usize;
         let idx_stride = idx_schema.pk_stride() as usize;
         let idx_key_size = idx_schema.columns[0].size() as usize;
         let idx_key_type = idx_schema.columns[0].type_code;
-        // If the indexed value is in the PK, find its byte offset once.
-        let src_pk_field_off = if is_pk_col {
-            src_schema.pk_byte_offset(source_col) as usize
-        } else { 0 };
 
         let mut out = Batch::with_schema(*idx_schema, src.count.max(1));
         // MAX_PK_BYTES bounds every index schema's pk_stride (asserted in
@@ -1789,17 +1783,12 @@ impl DagEngine {
         // covers the (currently empty) tail.
         let mut idx_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
 
+        let mb = src.as_mem_batch();
         for row in 0..src.count {
             let weight = src.get_weight(row);
             if weight == 0 { continue; }
 
-            if !is_pk_col {
-                let null_word = src.get_null_word(row);
-                let payload_bit = src_schema.payload_idx(source_col);
-                if (null_word >> payload_bit) & 1 != 0 {
-                    continue;
-                }
-            }
+            if loc.is_null(&mb, row) { continue; }
 
             let src_pk_bytes = src.get_pk_bytes(row);
             // Leading index-key slot: the indexed value's native u128 (decoded
@@ -1807,12 +1796,7 @@ impl DagEngine {
             // re-encoded OPK into the promoted index key type across the full
             // idx_key_size. The index table's PK region is order-preserving like
             // any other; seeks (has_pk / seek_by_index) encode the same way.
-            let native = if is_pk_col {
-                crate::schema::pk_native_key(src_pk_bytes, src_pk_field_off, src_col_size, src_col_type)
-            } else {
-                let col_data = src.col_data(src_payload_idx);
-                crate::schema::payload_native_key(col_data, row * src_col_size, src_col_size, src_col_type)
-            };
+            let native = loc.native_key(&mb, row);
             gnitz_wire::encode_pk_column(
                 &native.to_le_bytes()[..idx_key_size], idx_key_type, &mut idx_pk_buf[..idx_key_size],
             );

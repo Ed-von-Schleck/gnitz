@@ -845,8 +845,12 @@ impl ReadCursor {
         match src {
             CursorSource::Shard(s) => s.col_ptr_by_logical(row, col_idx, col_size),
             CursorSource::Batch(b) => {
-                // Map logical → payload index
-                let payload_idx = self.schema.payload_idx(col_idx);
+                // Map logical → payload index. A PK column has no payload slot
+                // (the `is_pk_col` early-return above already covers it, but the
+                // fallible map keeps the PK case structurally a null result).
+                let Some(payload_idx) = self.schema.try_payload_idx(col_idx) else {
+                    return ptr::null();
+                };
                 if payload_idx < b.num_payload_cols() {
                     b.get_col_ptr(row, payload_idx, col_size).as_ptr()
                 } else {

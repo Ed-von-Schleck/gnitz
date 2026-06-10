@@ -215,11 +215,9 @@ fn cursor_read_string(cursor: &ReadCursor, col_idx: usize, _schema: &SchemaDescr
 
 /// Check if a column is NULL in the current cursor row.
 pub(crate) fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> bool {
-    if schema.is_pk_col(col_idx) {
+    let Some(payload_idx) = schema.try_payload_idx(col_idx) else {
         return false; // PK is never null
-    }
-    // Compute payload index
-    let payload_idx = schema.payload_idx(col_idx);
+    };
     (cursor.current_null_word >> payload_idx) & 1 != 0
 }
 
@@ -1007,6 +1005,15 @@ fn null_func_ptr() -> *const ScalarFuncKind {
     std::ptr::null()
 }
 
+/// Path of a per-worker scratch directory under `view_dir`. Rank-stamped because
+/// forked workers share `view_dir`; an un-stamped path would have every worker
+/// open the same directory and clobber each other's shard files. Single source
+/// of truth for the convention — `create_child_table` and the nested GI dir both
+/// derive their paths from it, so the rank stamp can never drift between them.
+fn child_scratch_dir(view_dir: &str, child_name: &str) -> String {
+    format!("{}/scratch_{}_w{}", view_dir, child_name, worker_rank())
+}
+
 /// Create a child table in a subdirectory of the view's directory.
 fn create_child_table(
     state: &mut EmitState,
@@ -1015,7 +1022,7 @@ fn create_child_table(
     schema: SchemaDescriptor,
     table_id: u32,
 ) -> Result<Table, crate::storage::StorageError> {
-    let child_dir = format!("{}/scratch_{}_w{}", view_dir, child_name, worker_rank());
+    let child_dir = child_scratch_dir(view_dir, child_name);
     // Track the path before creating so cleanup also removes a partially
     // created directory if Table::new fails.
     state.scratch_dirs.push(child_dir.clone());
@@ -1642,11 +1649,15 @@ fn emit_reduce(
     let mut tr_in_table_ptr: *mut Table = std::ptr::null_mut();
     let mut tr_in_table_idx: Option<usize> = None;
 
+    // Name of the trace-input scratch table; reused below to nest the GI under
+    // the very same scratch dir so the two paths can't drift apart.
+    let tr_in_name = format!("_reduce_in_{}_{}", view_id, nid);
+
     if let Some(&existing) = in_regs.get(&PORT_TRACE) {
         tr_in_reg_id = existing;
     } else if !all_linear && !will_use_avi {
         let tr_in = match create_child_table(
-            state, view_dir, &format!("_reduce_in_{}_{}", view_id, nid), in_reg_schema, view_table_id,
+            state, view_dir, &tr_in_name, in_reg_schema, view_table_id,
         ) {
             Ok(t) => t,
             Err(_) => { state.emit_failed = true; return; }
@@ -1679,9 +1690,12 @@ fn emit_reduce(
             TypeCode::U8  | TypeCode::I8  | TypeCode::U16 | TypeCode::I16 |
             TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64
         ) {
-            let gi_dir = format!(
-                "{}/scratch__reduce_in_{}_{}/_gidx", view_dir, view_id, nid,
-            );
+            // Nest the GI under the trace-input table's own scratch dir, built
+            // from the same `child_scratch_dir` convention so the rank stamp can
+            // never drift between the two. Nesting folds the GI into the parent's
+            // cleanup — the parent dir is the one registered in
+            // `state.scratch_dirs`, and `remove_dir_all` is recursive.
+            let gi_dir = format!("{}/_gidx", child_scratch_dir(view_dir, &tr_in_name));
             if let Ok(gi_table) = Table::new(
                 &gi_dir, "_gidx", crate::ops::index::make_gi_schema(&in_reg_schema), 0, 1024 * 1024, false,
             ) {

@@ -1676,7 +1676,11 @@ fn copy_cursor_cols_to_batch(
     let src_null = cursor.cursor.current_null_word;
     let mut proj_null = 0u64;
     for (k, &p) in project.iter().enumerate() {
-        let pi = src_schema.payload_idx(p as usize);
+        // The projection is master-built and excludes PK columns
+        // (`collect_fk_projection` skips `is_pk_col`; `project_schema` asserts
+        // it one frame up), so every projected column has a payload slot.
+        let pi = src_schema.try_payload_idx(p as usize)
+            .expect("FK projection excludes PK columns");
         if src_null & (1u64 << pi) != 0 {
             proj_null |= 1u64 << k;
         }

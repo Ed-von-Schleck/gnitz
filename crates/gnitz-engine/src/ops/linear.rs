@@ -566,7 +566,8 @@ impl PkPromoter {
             return PkPromoter { kind: PromoteKind::Pk { off, cs, tc } };
         }
         let tc = schema.columns[col_idx].type_code;
-        let pi = schema.payload_idx(col_idx);
+        let pi = schema.try_payload_idx(col_idx)
+            .expect("non-PK: PK columns early-return above");
         let kind = match tc {
             type_code::U128 | type_code::UUID => PromoteKind::Wide { pi },
             // BLOB shares the 16-byte German-string struct layout with STRING,

@@ -741,7 +741,7 @@ fn test_promote_agg_col_f32_ordering() {
     );
     let mb = batch.as_mem_batch();
     let encoded: Vec<u64> = (0..vals.len()).map(|row| {
-        let pi = schema.payload_idx(1); // col_idx=1, pk_index=0
+        let pi = schema.try_payload_idx(1).unwrap(); // col_idx=1, pk_index=0
         let ptr = mb.get_col_ptr(row, pi, 4);
         let raw32 = u32::from_le_bytes(ptr.try_into().unwrap());
         // Order-preserving F32 encode (the encode_ordered F32 arm, for_max=false).
@@ -3303,9 +3303,9 @@ fn avi_two_groups_distinct_byte_form_keys() {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(1), &a.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(2), &bb.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(3), &val.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(1).unwrap(), &a.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(2).unwrap(), &bb.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(3).unwrap(), &val.to_le_bytes());
             b.count += 1;
         }
         b.sorted = true;
@@ -3402,8 +3402,8 @@ fn avi_retraction_returns_next_extremum() {
         b.extend_pk(1u128);
         b.extend_weight(&(-1i64).to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(1), &1u32.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(2), &5i64.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(1).unwrap(), &1u32.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(2).unwrap(), &5i64.to_le_bytes());
         b.count += 1;
         b.sorted = true;
         b.consolidated = true;
@@ -3509,8 +3509,8 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             b.extend_pk(1u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(1), &gval.to_le_bytes()[..gsize]);
-            b.extend_col(in_schema.payload_idx(2), &100i64.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(1).unwrap(), &gval.to_le_bytes()[..gsize]);
+            b.extend_col(in_schema.try_payload_idx(2).unwrap(), &100i64.to_le_bytes());
             b.count += 1;
             b.sorted = true;
             b.consolidated = true;
@@ -3586,8 +3586,8 @@ fn trace_scan_retraction_recomputes_min() {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(1), &g.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(2), &val.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(1).unwrap(), &g.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(2).unwrap(), &val.to_le_bytes());
         b.count += 1;
     };
 
@@ -3685,8 +3685,8 @@ fn min_tie_retract_one_copy_keeps_min() {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(1), &g.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(2), &val.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(1).unwrap(), &g.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(2).unwrap(), &val.to_le_bytes());
         b.count += 1;
     };
 
@@ -3775,13 +3775,13 @@ fn min_ignores_null_values() {
         &[0],
     );
 
-    let null_bit = 1u64 << in_schema.payload_idx(2);
+    let null_bit = 1u64 << in_schema.try_payload_idx(2).unwrap();
     let mk_row = |b: &mut Batch, pk: u64, g: i64, val: i64, is_null: bool| {
         b.extend_pk(pk as u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&(if is_null { null_bit } else { 0 }).to_le_bytes());
-        b.extend_col(in_schema.payload_idx(1), &g.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(2), &val.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(1).unwrap(), &g.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(2).unwrap(), &val.to_le_bytes());
         b.count += 1;
     };
 
@@ -3852,9 +3852,9 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         b.extend_pk(1u128);
         b.extend_weight(&(-1i64).to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(1), &3u32.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(2), &4u32.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(3), &5i64.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(1).unwrap(), &3u32.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(2).unwrap(), &4u32.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(3).unwrap(), &5i64.to_le_bytes());
         b.count += 1;
         b.sorted = true;
         b.consolidated = true;
@@ -4032,10 +4032,10 @@ fn avi_wide_two_u64_groups_match_reference() {
             bt.extend_pk(i as u128 + 1);
             bt.extend_weight(&1i64.to_le_bytes());
             bt.extend_null_bmp(&0u64.to_le_bytes());
-            bt.extend_col(in_schema.payload_idx(1), &a.to_le_bytes());
-            bt.extend_col(in_schema.payload_idx(2), &b.to_le_bytes());
+            bt.extend_col(in_schema.try_payload_idx(1).unwrap(), &a.to_le_bytes());
+            bt.extend_col(in_schema.try_payload_idx(2).unwrap(), &b.to_le_bytes());
             let decoy = reference[&(a, b)].wrapping_add(1000);
-            bt.extend_col(in_schema.payload_idx(3), &decoy.to_le_bytes());
+            bt.extend_col(in_schema.try_payload_idx(3).unwrap(), &decoy.to_le_bytes());
             bt.count += 1;
         }
         bt
@@ -4108,8 +4108,8 @@ fn avi_wide_single_u128_group_distinct() {
             b.extend_pk(i as u128 + 1);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(1), &g.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(2), &999i64.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(1).unwrap(), &g.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(2).unwrap(), &999i64.to_le_bytes());
             b.count += 1;
         }
         b
@@ -4197,9 +4197,9 @@ fn avi_wide_mixed_signed_unsigned_key() {
             b.extend_pk(i as u128 + 1);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(1), &a.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(2), &bb.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(3), &777i64.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(1).unwrap(), &a.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(2).unwrap(), &bb.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(3).unwrap(), &777i64.to_le_bytes());
             b.count += 1;
         }
         b
@@ -4308,10 +4308,10 @@ fn avi_wide_prefix_collision_distinct_groups() {
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(1), &1u64.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(2), &2u64.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(3), &3u64.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(4), &999i64.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(1).unwrap(), &1u64.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(2).unwrap(), &2u64.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(3).unwrap(), &3u64.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(4).unwrap(), &999i64.to_le_bytes());
         b.count += 1;
         b
     };
@@ -4398,9 +4398,9 @@ fn avi_wide_retraction_returns_next_extremum() {
         b.extend_pk(1u128);
         b.extend_weight(&(-1i64).to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(1), &ga.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(2), &gb.to_le_bytes());
-        b.extend_col(in_schema.payload_idx(3), &5i64.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(1).unwrap(), &ga.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(2).unwrap(), &gb.to_le_bytes());
+        b.extend_col(in_schema.try_payload_idx(3).unwrap(), &5i64.to_le_bytes());
         b.count += 1;
         b.sorted = true;
         b.consolidated = true;
@@ -4498,7 +4498,7 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
         b.extend_pk(pk);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(schema.payload_idx(1), &0i64.to_le_bytes());
+        b.extend_col(schema.try_payload_idx(1).unwrap(), &0i64.to_le_bytes());
         b.count += 1;
     }
     let desc = AggDescriptor {
@@ -4538,8 +4538,8 @@ fn avi_full_path_min_max_across_high_byte() {
             b.extend_pk(pk);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(1), &5u64.to_le_bytes());
-            b.extend_col(in_schema.payload_idx(2), &v.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(1).unwrap(), &5u64.to_le_bytes());
+            b.extend_col(in_schema.try_payload_idx(2).unwrap(), &v.to_le_bytes());
             b.count += 1;
         }
         b
@@ -4746,7 +4746,7 @@ fn extract_group_key_cursor_matches_batch() {
             ],
             &[0],
         );
-        let pi = schema.payload_idx(1);
+        let pi = schema.try_payload_idx(1).unwrap();
         let mut b = Batch::with_schema(schema, 4);
         for (pk, grp) in [(1u64, -100i64), (2, 0), (3, 42), (4, i64::MAX)] {
             b.extend_pk(pk as u128);
@@ -4769,7 +4769,7 @@ fn extract_group_key_cursor_matches_batch() {
             ],
             &[0],
         );
-        let pi = schema.payload_idx(1);
+        let pi = schema.try_payload_idx(1).unwrap();
         let mut b = Batch::with_schema(schema, 4);
         // non-null rows
         for (pk, grp, null_bit) in [(1u64, 10i64, 0u64), (2, 20, 0), (3, 30, 0)] {
@@ -4799,7 +4799,7 @@ fn extract_group_key_cursor_matches_batch() {
             ],
             &[0],
         );
-        let pi = schema.payload_idx(1);
+        let pi = schema.try_payload_idx(1).unwrap();
         let mut b = Batch::with_schema(schema, 3);
         for (pk, s) in [(1u64, ""), (2, "hello"), (3, "zebra")] {
             b.extend_pk(pk as u128);
@@ -4842,8 +4842,8 @@ fn extract_group_key_cursor_matches_batch() {
             ],
             &[0],
         );
-        let pi0 = schema.payload_idx(1);
-        let pi1 = schema.payload_idx(2);
+        let pi0 = schema.try_payload_idx(1).unwrap();
+        let pi1 = schema.try_payload_idx(2).unwrap();
         let mut b = Batch::with_schema(schema, 4);
         // (non-null, non-null), (non-null, NULL), (non-null, non-null), (non-null, non-null)
         let rows: &[(u64, i64, Option<i64>)] = &[
@@ -4874,8 +4874,8 @@ fn make_fallback_batch_i64_grp(
     schema: &SchemaDescriptor,
     rows: &[(u64, i64, i64, bool, i64)], // (pk, w, grp, grp_is_null, val)
 ) -> Batch {
-    let pi_grp = schema.payload_idx(1);
-    let pi_val = schema.payload_idx(2);
+    let pi_grp = schema.try_payload_idx(1).unwrap();
+    let pi_val = schema.try_payload_idx(2).unwrap();
     let mut b = Batch::with_schema(*schema, rows.len().max(1));
     for &(pk, w, grp, grp_null, val) in rows {
         b.extend_pk(pk as u128);
@@ -5094,9 +5094,9 @@ fn fallback_min_multi_col_group() {
         _pad: [0; 2],
     };
 
-    let pi_c1 = in_schema.payload_idx(1);
-    let pi_c2 = in_schema.payload_idx(2);
-    let pi_val = in_schema.payload_idx(3);
+    let pi_c1 = in_schema.try_payload_idx(1).unwrap();
+    let pi_c2 = in_schema.try_payload_idx(2).unwrap();
+    let pi_val = in_schema.try_payload_idx(3).unwrap();
 
     let make_batch = |rows: &[(u64, i64, i64, i64, i64)]| -> Batch {
         let mut b = Batch::with_schema(in_schema, rows.len().max(1));
@@ -5187,8 +5187,8 @@ fn fallback_trace_rewind_at_most_once() {
         _pad: [0; 2],
     };
 
-    let pi_grp = in_schema.payload_idx(1);
-    let pi_val = in_schema.payload_idx(2);
+    let pi_grp = in_schema.try_payload_idx(1).unwrap();
+    let pi_val = in_schema.try_payload_idx(2).unwrap();
     let num_groups = 32usize;
 
     // Trace: one history row per group.
@@ -5273,8 +5273,8 @@ fn test_extract_group_key_128bit_collision_resistance() {
     use std::collections::HashSet;
     let schema = make_schema_u64_i64_str();
 
-    let pi_c1 = schema.payload_idx(1);
-    let pi_c2 = schema.payload_idx(2);
+    let pi_c1 = schema.try_payload_idx(1).unwrap();
+    let pi_c2 = schema.try_payload_idx(2).unwrap();
 
     // Sweep many distinct (c1, c2) multi-column keys. Each (i, j) is a distinct
     // group; the 128-bit fold must map them to distinct u128 with no collision.
@@ -5353,8 +5353,8 @@ fn make_schema_u64_blob_grp_i64() -> SchemaDescriptor {
 /// are passed in PK order so the batch is validly sorted+consolidated for use as
 /// a trace cursor.
 fn make_batch_blob_grp_i64(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8], i64)]) -> Batch {
-    let pi_grp = schema.payload_idx(1);
-    let pi_val = schema.payload_idx(2);
+    let pi_grp = schema.try_payload_idx(1).unwrap();
+    let pi_val = schema.try_payload_idx(2).unwrap();
     let mut b = Batch::with_schema(*schema, rows.len().max(1));
     for &(pk, w, blob, val) in rows {
         let gs = encode_german_string(blob, &mut b.blob);
