@@ -1228,16 +1228,20 @@ impl WorkerProcess {
         }
         let loc = schema.locate(col_idx as usize);
 
-        // Project to keys, then drop the partition batch before sorting and
-        // streaming — peak memory beyond the scan itself is the 16 B/key Vec.
+        // Stream the partition chunk-wise and project each chunk to keys —
+        // peak memory beyond one chunk is the 16 B/key Vec. Running
+        // `for_each_index_key` over each chunk keeps the single column→key
+        // definition shared with the filter warmup and the master merge.
+        let chunk_rows = self.cat().ddl_scan_chunk_rows;
         let mut keys: Vec<u128> = Vec::new();
-        {
-            let part = self.cat().scan_family(owner_id)?;
-            keys.reserve(part.count);
-            for_each_index_key(&part.as_mem_batch(), loc, |k| {
-                keys.push(k);
-                true
-            });
+        if let Some(mut handle) = self.cat().open_store_cursor(owner_id) {
+            while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
+                keys.reserve(chunk.count);
+                for_each_index_key(&chunk.as_mem_batch(), loc, |k| {
+                    keys.push(k);
+                    true
+                });
+            }
         }
         keys.sort_unstable();
 

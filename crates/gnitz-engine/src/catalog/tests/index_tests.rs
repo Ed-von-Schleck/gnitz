@@ -1583,3 +1583,135 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── chunked unique-index backfill: cross-chunk duplicate detection ────────
+//
+// The unique-index backfill scans the owner chunk-wise (drain_chunk); a
+// duplicate pair split across chunks is only visible through the `seen` set
+// carried across chunks. Shrink `ddl_scan_chunk_rows` so a handful of rows
+// spans several chunks, and place the duplicate pair at the PK extremes
+// (the scan is in PK merge order).
+
+#[test]
+fn test_unique_index_duplicate_across_chunks_rejected() {
+    let dir = temp_dir("unique_idx_dup_cross_chunk");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // The only duplicate pair is val=42 at pk 0 and pk 9 — first and last
+    // chunk at chunk_rows = 3.
+    let mut bb = BatchBuilder::new(schema);
+    for i in 0..10u64 {
+        bb.begin_row(i as u128, 1);
+        bb.put_u64(if i == 0 || i == 9 { 42 } else { 100 + i });
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    engine.ddl_scan_chunk_rows = 3;
+    let before = count_records(&mut engine.sys_indices);
+    let r = engine.create_index("public.t", "val", true);
+    assert!(r.is_err(), "cross-chunk duplicate must fail the unique backfill");
+    assert_eq!(count_records(&mut engine.sys_indices), before,
+        "the failed unique index row must net out of sys_indices");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_unique_index_duplicate_within_chunk_rejected() {
+    let dir = temp_dir("unique_idx_dup_within_chunk");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Duplicate pair at pk 0 and pk 1 — both inside the first chunk of 4.
+    let mut bb = BatchBuilder::new(schema);
+    for i in 0..10u64 {
+        bb.begin_row(i as u128, 1);
+        bb.put_u64(if i <= 1 { 42 } else { 100 + i });
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    engine.ddl_scan_chunk_rows = 4;
+    assert!(engine.create_index("public.t", "val", true).is_err(),
+        "within-chunk duplicate must still fail the unique backfill");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_unique_index_chunked_backfill_distinct_succeeds() {
+    // Positive control for the chunked scan: distinct data must build the
+    // index across several chunks with every row projected exactly once.
+    let dir = temp_dir("unique_idx_chunked_ok");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for i in 0..10u64 {
+        bb.begin_row(i as u128, 1);
+        bb.put_u64(100 + i);
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    engine.ddl_scan_chunk_rows = 3;
+    engine.create_index("public.t", "val", true).unwrap();
+
+    let entry = engine.dag.tables.get_mut(&tid).unwrap();
+    assert_eq!(entry.index_circuits.len(), 1);
+    assert_eq!(count_records(entry.index_circuits[0].table_mut()), 10,
+        "chunked backfill must project every row exactly once");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_promote_unique_duplicate_across_chunks_rejected() {
+    // Promotion (UNIQUE over an incumbent FK circuit) validates through the
+    // same chunked scan; a cross-chunk duplicate must reject the promotion
+    // and leave the incumbent non-unique.
+    let dir = temp_dir("promote_dup_cross_chunk");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let parent_tid = engine.create_table("public.parent", &[u64_col_def("id")], &[0], true).unwrap();
+    let child_cols = vec![u64_col_def("cid"), fk_col_def("refc", parent_tid, 0)];
+    let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
+
+    // Duplicate refc=42 at pk 0 and pk 9; distinct in between (ingest_to_family
+    // bypasses FK validation).
+    let schema = engine.get_schema(child_tid).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    for i in 0..10u64 {
+        bb.begin_row(i as u128, 1);
+        bb.put_u64(if i == 0 || i == 9 { 42 } else { 100 + i });
+        bb.end_row();
+    }
+    engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
+    engine.flush_family(child_tid).unwrap();
+
+    engine.ddl_scan_chunk_rows = 3;
+    assert!(engine.create_index("public.child", "refc", true).is_err(),
+        "cross-chunk duplicate must fail the promotion scan");
+    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false),
+        "the incumbent FK circuit must stay non-unique");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -61,6 +61,7 @@ impl CatalogEngine {
             pending_dir_deletions: Vec::new(),
             checkpoint_gated_deletions: Vec::new(),
             ctx: ApplyContext::new(),
+            ddl_scan_chunk_rows: crate::storage::DDL_SCAN_CHUNK_ROWS,
         };
 
         if is_new {

@@ -66,6 +66,12 @@ impl std::ops::DerefMut for DrainGuard {
 /// query can't pin an unusually large allocation for the thread's lifetime.
 const MAX_DRAIN_BUFFER_CAP: usize = 65_536;
 
+/// Default `drain_chunk` size for DDL scans (index/view backfill, unique
+/// pre-flight). Bounds peak backfill memory at O(chunk × row_width); also the
+/// default for `CatalogEngine::ddl_scan_chunk_rows`, which tests shrink to
+/// exercise chunk boundaries.
+pub(crate) const DDL_SCAN_CHUNK_ROWS: usize = 65_536;
+
 impl Drop for DrainGuard {
     #[inline]
     fn drop(&mut self) {
@@ -951,6 +957,42 @@ impl ReadCursor {
         batch.sorted = true;
         batch.consolidated = true;
         Rc::new(batch)
+    }
+
+    /// Drain up to `max_rows` net rows in merge order into an owned `Batch`
+    /// (sorted + consolidated, like `materialize`). Returns `None` once the
+    /// cursor is exhausted. Chunk boundaries cannot split a (PK, payload)
+    /// group: each drained entry is one fully-folded merge group.
+    ///
+    /// DDL backfills and uniqueness scans call this in a loop instead of
+    /// `materialize` so peak memory is O(chunk) instead of O(relation).
+    pub(crate) fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
+        debug_assert!(max_rows > 0, "drain_chunk: 0 means unlimited in the drain helpers");
+        if !self.valid {
+            return None;
+        }
+        if let Some(batch) = self.drain_single_source(max_rows) {
+            return if batch.count == 0 { None } else { Some(batch) };
+        }
+        // Merge path: `materialize`'s body with a row cap — same merge-order
+        // collection, same column-major scatter, pooled arenas reused per chunk.
+        let mut merge_order = DrainGuard::new();
+        self.drain_sorted_into(max_rows, &mut merge_order);
+        if merge_order.is_empty() {
+            return None;
+        }
+        let mut batch = super::batch::write_to_batch(
+            &self.schema,
+            merge_order.len(),
+            // Blob grows on demand inside DirectWriter; reserving
+            // `total_blob_len()` here would re-reserve the whole relation's
+            // blob arena for every chunk.
+            0,
+            |writer| self.scatter_drained_into(&merge_order, writer),
+        );
+        batch.sorted = true;
+        batch.consolidated = true;
+        Some(batch)
     }
 
     /// Bulk-drain a single-source cursor into an Batch, bypassing
@@ -1857,6 +1899,88 @@ mod tests {
         assert_eq!(found[0], mk(1, -5));
         assert_eq!(found[1], mk(1, -1));
         assert_eq!(found[2], mk(1, 3));
+    }
+
+    /// Drain a cursor via repeated `drain_chunk(n)` calls, concatenating
+    /// `(pk, weight, val)` rows. Asserts every chunk respects the row cap,
+    /// is non-empty, and carries the sorted+consolidated flags.
+    fn drain_chunks(cursor: &mut ReadCursor, n: usize) -> Vec<(u128, i64, i64)> {
+        let mut rows = Vec::new();
+        while let Some(chunk) = cursor.drain_chunk(n) {
+            assert!(chunk.count <= n, "chunk overflow: {} > {}", chunk.count, n);
+            assert!(chunk.count > 0, "drain_chunk returned an empty Some chunk");
+            assert!(chunk.sorted && chunk.consolidated);
+            for row in 0..chunk.count {
+                let val = i64::from_le_bytes(
+                    chunk.get_col_ptr(row, 0, 8).try_into().unwrap());
+                rows.push((chunk.get_pk(row), chunk.get_weight(row), val));
+            }
+        }
+        assert!(cursor.drain_chunk(n).is_none(), "exhausted cursor must stay exhausted");
+        rows
+    }
+
+    fn materialize_rows(sources: &[Rc<Batch>]) -> Vec<(u128, i64, i64)> {
+        let cursor = create_read_cursor(sources, &[], make_schema_i64());
+        let batch = cursor.materialize();
+        (0..batch.count)
+            .map(|row| {
+                let val = i64::from_le_bytes(
+                    batch.get_col_ptr(row, 0, 8).try_into().unwrap());
+                (batch.get_pk(row), batch.get_weight(row), val)
+            })
+            .collect()
+    }
+
+    /// Single-source fast path: exact multiple of the chunk size, with
+    /// remainder, single oversized chunk — all equal to `materialize`.
+    #[test]
+    fn drain_chunk_single_source_matches_materialize() {
+        let rows: Vec<(u128, i64, i64)> =
+            (1..=5).map(|i| (i as u128, 1i64, (i * 10) as i64)).collect();
+        let batch = make_batch(&rows);
+        let expected = materialize_rows(&[Rc::clone(&batch)]);
+        for chunk_rows in [1, 2, 5, 100] {
+            let mut cursor = create_read_cursor(&[Rc::clone(&batch)], &[], make_schema_i64());
+            assert_eq!(drain_chunks(&mut cursor, chunk_rows), expected,
+                "chunk_rows={}", chunk_rows);
+        }
+        // 4 rows / chunk 2: exact multiple (no trailing partial chunk).
+        let even = make_batch(&rows[..4]);
+        let mut cursor = create_read_cursor(&[Rc::clone(&even)], &[], make_schema_i64());
+        assert_eq!(drain_chunks(&mut cursor, 2), materialize_rows(&[even]));
+    }
+
+    #[test]
+    fn drain_chunk_empty_cursor_returns_none() {
+        let mut cursor = create_read_cursor(&[], &[], make_schema_i64());
+        assert!(cursor.drain_chunk(4).is_none());
+    }
+
+    /// Multi-source cursor (merge path) folds weights, drops ghosts, and
+    /// never splits a (PK, payload) group across chunks; the concatenation
+    /// equals both `materialize` and the single-source equivalent.
+    #[test]
+    fn drain_chunk_multi_source_matches_single_source() {
+        // pk=1: +1; pk=2: +2-1 = +1 (cross-source fold); pk=3: +1-1 = ghost;
+        // pk=4: weight 2 in one source.
+        let b1 = make_batch(&[(1, 1, 10), (2, 2, 20), (3, 1, 30), (4, 2, 40)]);
+        let b2 = make_batch(&[(2, -1, 20), (3, -1, 30)]);
+        let consolidated_equivalent = make_batch(&[(1, 1, 10), (2, 1, 20), (4, 2, 40)]);
+
+        let expected = materialize_rows(&[Rc::clone(&b1), Rc::clone(&b2)]);
+        assert_eq!(expected, materialize_rows(&[Rc::clone(&consolidated_equivalent)]));
+        for chunk_rows in [1, 2, 100] {
+            let mut multi = create_read_cursor(
+                &[Rc::clone(&b1), Rc::clone(&b2)], &[], make_schema_i64());
+            assert_eq!(drain_chunks(&mut multi, chunk_rows), expected,
+                "merge path, chunk_rows={}", chunk_rows);
+
+            let mut single = create_read_cursor(
+                &[Rc::clone(&consolidated_equivalent)], &[], make_schema_i64());
+            assert_eq!(drain_chunks(&mut single, chunk_rows), expected,
+                "fast path, chunk_rows={}", chunk_rows);
+        }
     }
 
     /// `copy_current_row_into` on an invalid cursor must be a no-op; the

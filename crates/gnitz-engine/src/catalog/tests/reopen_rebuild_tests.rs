@@ -21,42 +21,6 @@ fn sum_weights(mut c: CursorHandle) -> i64 {
     sum
 }
 
-/// Build the minimal identity circuit `ScanDelta(base) → Integrate` for
-/// `vid` and write its rows through the applied-delta path. The payload
-/// column layout follows `gnitz_wire::CIRCUIT_NODES_COLS` /
-/// `CIRCUIT_EDGES_COLS`; the compound PK `(view_id, sub)` is packed by
-/// `pack_view_pk`.
-fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64) {
-    let nodes_schema = sys_tab_schema(CIRCUIT_NODES_TAB_ID);
-    let mut bb = BatchBuilder::new(nodes_schema);
-    // node 0: ScanDelta(base_tid)
-    bb.begin_row(pack_view_pk(vid, 0), 1);
-    bb.put_u64(0);
-    bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
-    bb.put_u64(base_tid as u64); // source_table
-    bb.put_null();               // reindex_col
-    bb.put_null();               // expr_program
-    bb.end_row();
-    // node 1: Integrate (terminal sink — moves the delta into the view store)
-    bb.begin_row(pack_view_pk(vid, 1), 1);
-    bb.put_u64(1);
-    bb.put_u64(gnitz_wire::OPCODE_INTEGRATE);
-    bb.put_null();
-    bb.put_null();
-    bb.put_null();
-    bb.end_row();
-    engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();
-
-    let edges_schema = sys_tab_schema(CIRCUIT_EDGES_TAB_ID);
-    let mut bb = BatchBuilder::new(edges_schema);
-    bb.begin_row(pack_view_pk(vid, 0), 1);
-    bb.put_u64(1);                  // dst_node
-    bb.put_u64(gnitz_wire::PORT_IN); // dst_port
-    bb.put_u64(0);                  // src_node
-    bb.end_row();
-    engine.ingest_to_family(CIRCUIT_EDGES_TAB_ID, &bb.finish()).unwrap();
-}
-
 // ── view_and_index_rebuild_once_on_reopen ───────────────────────────────
 // Create a base table with N rows, a secondary index, and an identity view
 // over it; close; reopen. The base table must come back from its durable
@@ -132,6 +96,73 @@ fn view_and_index_rebuild_once_on_reopen() {
     assert_eq!(base_entry.index_circuits.len(), 1, "index circuit replayed");
     assert_eq!(sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()), N,
         "index must rebuild from source exactly once on reopen, not double");
+
+    engine2.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── view_and_index_rebuild_across_chunk_boundary ─────────────────────────
+// Boot backfills stream the source in DDL_SCAN_CHUNK_ROWS-sized chunks. The
+// chunk size cannot be shrunk before open() (the backfill runs during shard
+// replay, before any test code can touch the engine), so exercise the real
+// boundary with a base table one chunk plus a remainder wide. Also covers
+// the boot path with the unique duplicate check gated off (replay is not
+// live), since the rebuild itself must still ingest every chunk.
+
+#[test]
+fn view_and_index_rebuild_across_chunk_boundary() {
+    let n: usize = crate::storage::DDL_SCAN_CHUNK_ROWS + 3;
+    let dir = temp_dir("reopen_rebuild_chunked");
+
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let tid = engine.create_table("public.base", &cols, &[0], true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+    let mut next = 0usize;
+    while next < n {
+        let mut bb = BatchBuilder::new(schema);
+        for i in next..(next + 8192).min(n) {
+            bb.begin_row(i as u128, 1);
+            bb.put_u64((i * 10) as u64);
+            bb.end_row();
+        }
+        engine.ingest_to_family(tid, &bb.finish()).unwrap();
+        next += 8192;
+    }
+
+    // `val` is distinct, so the unique flavour also covers the live chunked
+    // duplicate scan (seen-set across chunks) finding nothing.
+    engine.create_index("public.base", "val", true).unwrap();
+
+    let vid = engine.allocate_table_id();
+    write_identity_circuit(&mut engine, vid, tid);
+    engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
+    engine.write_view_deps(vid, &[tid]).unwrap();
+    let batch = build_view_tab_row(vid, "v_base", "SELECT * FROM base");
+    engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
+
+    let view_entry = engine.dag.tables.get(&vid).expect("view registered");
+    assert_eq!(sum_weights(view_entry.handle.open_cursor()), n as i64,
+        "live CREATE VIEW must materialise the base rows exactly once");
+
+    engine.close();
+    drop(engine);
+
+    let mut engine2 = CatalogEngine::open(&dir).unwrap();
+
+    let base_entry = engine2.dag.tables.get(&tid).expect("base table replayed");
+    assert_eq!(sum_weights(base_entry.handle.open_cursor()), n as i64,
+        "base table must survive close() → open() from its durable shards");
+
+    let view_entry = engine2.dag.tables.get(&vid).expect("view replayed");
+    assert_eq!(sum_weights(view_entry.handle.open_cursor()), n as i64,
+        "view must rebuild across the chunk boundary exactly once");
+
+    let base_entry = engine2.dag.tables.get_mut(&tid).unwrap();
+    assert_eq!(base_entry.index_circuits.len(), 1, "index circuit replayed");
+    assert_eq!(sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()), n as i64,
+        "index must rebuild across the chunk boundary exactly once");
 
     engine2.close();
     let _ = fs::remove_dir_all(&dir);

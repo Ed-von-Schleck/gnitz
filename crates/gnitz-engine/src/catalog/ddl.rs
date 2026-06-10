@@ -357,32 +357,31 @@ impl CatalogEngine {
         );
         if !self.dag.ensure_compiled(vid) { return; }
 
+        let chunk_rows = self.ddl_scan_chunk_rows;
         let source_ids = self.dag.get_source_ids(vid);
         for source_id in source_ids {
-            let entry = match self.dag.tables.get(&source_id) {
-                Some(e) => e,
-                None => continue,
-            };
-            let schema = entry.schema;
-
-            // Scan source table into a batch
-            let scan_batch = self.scan_store(source_id, &schema);
-            if scan_batch.count == 0 { continue; }
-
-            // Execute view plan on the batch
-            let owned = Rc::try_unwrap(scan_batch).unwrap_or_else(|a| (*a).clone());
-            let out_handle = self.dag.execute_epoch(vid, owned, source_id);
-            if let Some(result) = out_handle {
-                if result.count > 0 {
-                    self.dag.ingest_to_family(vid, result);
-                    let _ = self.dag.flush(vid);
+            // Feed the source chunk-wise through the incremental plan — the
+            // normal delta push path, so the chunk sum equals the whole-batch
+            // result. The cursor owns its sources via `Rc` and stays valid
+            // while epochs ingest into the view family; the scanned source
+            // itself is never written here.
+            let Some(mut handle) = self.open_store_cursor(source_id) else { continue };
+            let mut touched = false;
+            while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
+                if let Some(result) = self.dag.execute_epoch(vid, chunk, source_id) {
+                    if result.count > 0 {
+                        self.dag.ingest_to_family(vid, result);
+                        touched = true;
+                    }
                 }
             }
+            if touched { let _ = self.dag.flush(vid); }
         }
 
-        // execute_epoch clears deltas only at epoch start, so the scanned
-        // source batch and intermediate delta registers remain pinned in the
-        // view's regfile after the last source. Release them now.
+        // execute_epoch clears deltas only at epoch start, so each chunk's
+        // epoch releases what the previous chunk pinned — but the LAST
+        // epoch's input and intermediate delta registers remain pinned in
+        // the view's regfile after the final source. Release them now.
         self.dag.clear_view_regfile_deltas(vid);
     }
 
@@ -403,28 +402,56 @@ impl CatalogEngine {
             unsafe { &*idx_table }.persistence() == Persistence::Ephemeral,
             "backfill_index into durable storage (owner {owner_id}): would double-count",
         );
-        let entry = match self.dag.tables.get(&owner_id) {
-            Some(e) => e,
+        self.stream_index_projection(owner_id, col_idx, is_unique, Some(idx_table), idx_schema)
+    }
+
+    /// Shared streaming pass for `backfill_index` and `promote_index_to_unique`:
+    /// scan `owner_id` chunk-wise, project each chunk into the index layout,
+    /// reject duplicate keys when validating, and (backfill only) ingest each
+    /// projected chunk into `idx_table`. Peak memory is O(chunk × row_width)
+    /// plus, live only, the cross-chunk `seen` set (32 B per scanned key).
+    ///
+    /// The duplicate check runs only in the live phase, matching `promote`'s
+    /// long-standing guard and `hook_cascade_fk`: a boot-replayed IDX_TAB `+1`
+    /// was validated at original write time and every later INSERT went
+    /// through the unique filter, while SAL system-table recovery runs after
+    /// `go_live()`, so a CREATE INDEX recovered from the SAL still validates.
+    /// Skipping it at boot also avoids an O(rows × 32 B) set in the single
+    /// pre-fork master process. The ingest is unconditional — it IS the
+    /// ephemeral index rebuild.
+    ///
+    /// On a duplicate found mid-stream the partially-ingested index table is
+    /// discarded whole: it is ephemeral, registered nowhere, and its directory
+    /// is pre-staged in `pending_dir_deletions` by `hook_index_register`.
+    fn stream_index_projection(
+        &mut self,
+        owner_id: i64,
+        col_idx: u32,
+        is_unique: bool,
+        idx_table: Option<*mut Table>,
+        idx_schema: &SchemaDescriptor,
+    ) -> Result<(), String> {
+        let owner_schema = match self.dag.tables.get(&owner_id) {
+            Some(e) => e.schema,
             None => return Ok(()),
         };
-        let owner_schema = entry.schema;
+        let chunk_rows = self.ddl_scan_chunk_rows;
+        let key_size = idx_schema.columns[0].size() as usize;
+        let check_dups = is_unique && self.ctx.is_live();
+        let mut seen: rustc_hash::FxHashSet<u128> = rustc_hash::FxHashSet::default();
 
-        // Scan source and project into index
-        let scan = self.scan_store(owner_id, &owner_schema);
-        if scan.count == 0 { return Ok(()); }
-
-        let projected = DagEngine::batch_project_index(&scan, col_idx, &owner_schema, idx_schema);
-        if projected.count == 0 { return Ok(()); }
-
-        if is_unique {
-            let key_size = idx_schema.columns[0].size() as usize;
-            if projected_has_dup_keys(&projected, key_size) {
+        let Some(mut handle) = self.open_store_cursor(owner_id) else { return Ok(()) };
+        while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
+            let projected = DagEngine::batch_project_index(
+                &chunk, col_idx, &owner_schema, idx_schema);
+            if projected.count == 0 { continue; }
+            if check_dups && projected_chunk_has_dup_keys(&projected, key_size, &mut seen) {
                 return Err(self.unique_create_dup_err(owner_id, col_idx as usize));
             }
+            if let Some(table) = idx_table {
+                let _ = unsafe { &mut *table }.ingest_owned_batch(projected);
+            }
         }
-
-        let table = unsafe { &mut *idx_table };
-        let _ = table.ingest_owned_batch(projected);
         Ok(())
     }
 
@@ -444,15 +471,7 @@ impl CatalogEngine {
                 .ok_or_else(|| format!("Index promote: owner table {} not found", owner_id))?;
             let key_type = get_index_key_type(owner_schema.columns[col_idx as usize].type_code)?;
             let idx_schema = make_index_schema(key_type, &owner_schema);
-            let scan = self.scan_store(owner_id, &owner_schema);
-            if scan.count > 0 {
-                let projected = DagEngine::batch_project_index(
-                    &scan, col_idx, &owner_schema, &idx_schema);
-                let key_size = idx_schema.columns[0].size() as usize;
-                if projected_has_dup_keys(&projected, key_size) {
-                    return Err(self.unique_create_dup_err(owner_id, col_idx as usize));
-                }
-            }
+            self.stream_index_projection(owner_id, col_idx, true, None, &idx_schema)?;
         }
         self.dag.set_index_circuit_uniqueness(owner_id, col_idx, true);
         Ok(())
@@ -566,8 +585,9 @@ impl CatalogEngine {
 
 }
 
-/// True if two positive-weight rows in a projected index batch share the same
-/// leading index key (the first `key_size` bytes of the index PK).
+/// True if a positive-weight row in a projected index chunk shares its leading
+/// index key (the first `key_size` bytes of the index PK) with another row of
+/// this chunk or any earlier chunk recorded in `seen`.
 ///
 /// Compound-PK index layout: index PK is `(indexed_key, src_pk…)`. Uniqueness
 /// applies to the leading `indexed_key` slot only — two rows differing only in
@@ -575,13 +595,17 @@ impl CatalogEngine {
 /// `make_index_schema` always promotes the leading key to ≤16 bytes, so a u128
 /// dedup token suffices (zero-padded LE for narrower types).
 ///
-/// Shared by `backfill_index` (fresh unique index) and `promote_index_to_unique`
+/// `seen` is caller-owned because the scan is chunked: cross-chunk duplicates
+/// are only visible through state carried across calls. Shared by
+/// `backfill_index` (fresh unique index) and `promote_index_to_unique`
 /// (UNIQUE folded into an existing circuit) so both gate on the same predicate.
-fn projected_has_dup_keys(projected: &Batch, key_size: usize) -> bool {
+fn projected_chunk_has_dup_keys(
+    projected: &Batch,
+    key_size: usize,
+    seen: &mut rustc_hash::FxHashSet<u128>,
+) -> bool {
     debug_assert!(key_size <= 16,
         "unique index key size {} exceeds 16-byte dedup buffer", key_size);
-    let mut seen: rustc_hash::FxHashSet<u128> =
-        rustc_hash::FxHashSet::with_capacity_and_hasher(projected.count, Default::default());
     for row in 0..projected.count {
         if projected.get_weight(row) <= 0 { continue; }
         let pk_bytes = projected.get_pk_bytes(row);

@@ -1622,6 +1622,18 @@ impl CatalogEngine {
         };
         entry.handle.open_cursor().cursor.materialize()
     }
+
+    /// Cursor-returning sibling of `scan_store` for callers that stream the
+    /// relation chunk-wise (`drain_chunk`) instead of materializing it whole.
+    /// `None` when the table is unregistered — callers treat that as empty.
+    /// User tables only; system tables keep `scan_family`.
+    ///
+    /// The handle owns its sources via `Rc`, so it stays valid while the
+    /// caller mutates OTHER relations (index table, view family) between
+    /// chunks; the scanned relation itself must not be written mid-loop.
+    pub(crate) fn open_store_cursor(&mut self, table_id: i64) -> Option<CursorHandle> {
+        self.dag.tables.get(&table_id).map(|e| e.handle.open_cursor())
+    }
 }
 
 /// Build the schema for a `gather_family` result: the PK columns of `schema`

@@ -32,7 +32,7 @@ pub use merge::{MemBatch, scatter_copy, scatter_multi_source};
 pub use error::StorageError;
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
-pub(crate) use read_cursor::{DrainGuard, ReadCursor};
+pub(crate) use read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
 #[cfg(test)]
 pub(crate) use read_cursor::REWIND_CALLS;
 pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_fixedint_nonnull, encode_order_preserving_pk, opk_key, with_payload_cmp};

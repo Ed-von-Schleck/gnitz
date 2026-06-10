@@ -147,5 +147,12 @@ pub struct CatalogEngine {
     // transient sub-operation flags (rollback / cascade-drop), and the
     // DDL-zone LSN. See `ApplyContext`.
     pub(crate) ctx: ApplyContext,
+
+    /// Rows per `drain_chunk` call in DDL backfills and the unique pre-flight
+    /// scan. Defaults to `DDL_SCAN_CHUNK_ROWS`; lives on the engine (not a
+    /// parameter) because the backfills are invoked from hooks, which tests
+    /// can only reach through `submit` — they shrink this field instead to
+    /// exercise chunk boundaries.
+    pub(crate) ddl_scan_chunk_rows: usize,
 }
 

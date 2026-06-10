@@ -71,6 +71,42 @@ fn build_table_tab_row(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str) 
     bb.finish()
 }
 
+/// Build the minimal identity circuit `ScanDelta(base) → Integrate` for
+/// `vid` and write its rows through the applied-delta path. The payload
+/// column layout follows `gnitz_wire::CIRCUIT_NODES_COLS` /
+/// `CIRCUIT_EDGES_COLS`; the compound PK `(view_id, sub)` is packed by
+/// `pack_view_pk`.
+fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64) {
+    let nodes_schema = sys_tab_schema(CIRCUIT_NODES_TAB_ID);
+    let mut bb = BatchBuilder::new(nodes_schema);
+    // node 0: ScanDelta(base_tid)
+    bb.begin_row(pack_view_pk(vid, 0), 1);
+    bb.put_u64(0);
+    bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
+    bb.put_u64(base_tid as u64); // source_table
+    bb.put_null();               // reindex_col
+    bb.put_null();               // expr_program
+    bb.end_row();
+    // node 1: Integrate (terminal sink — moves the delta into the view store)
+    bb.begin_row(pack_view_pk(vid, 1), 1);
+    bb.put_u64(1);
+    bb.put_u64(gnitz_wire::OPCODE_INTEGRATE);
+    bb.put_null();
+    bb.put_null();
+    bb.put_null();
+    bb.end_row();
+    engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();
+
+    let edges_schema = sys_tab_schema(CIRCUIT_EDGES_TAB_ID);
+    let mut bb = BatchBuilder::new(edges_schema);
+    bb.begin_row(pack_view_pk(vid, 0), 1);
+    bb.put_u64(1);                  // dst_node
+    bb.put_u64(gnitz_wire::PORT_IN); // dst_port
+    bb.put_u64(0);                  // src_node
+    bb.end_row();
+    engine.ingest_to_family(CIRCUIT_EDGES_TAB_ID, &bb.finish()).unwrap();
+}
+
 /// Build a raw VIEW_TAB row for tests that register a view via the raw
 /// system-table path. `sql` is stored verbatim; cache_directory is left empty
 /// (the register hook computes the real view directory itself and neither
