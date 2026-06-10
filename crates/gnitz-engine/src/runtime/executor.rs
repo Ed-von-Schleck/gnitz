@@ -1088,7 +1088,7 @@ async fn handle_system_dml(
     // unique constraint that lowers to an IDX_TAB row). The IDX_TAB row layout
     // (and the IDXTAB_PAY_* payload indices read below) is fixed by
     // `create_index` and read identically by `hook_index_register`.
-    let mut filter_seeds: Vec<(i64, u32, FxHashSet<u128>)> = Vec::new();
+    let mut filter_seeds: Vec<(i64, u32, FxHashSet<u128>, bool)> = Vec::new();
     if target_id == IDX_TAB_ID {
         for i in 0..batch.count {
             if batch.get_weight(i) > 0
@@ -1107,7 +1107,7 @@ async fn handle_system_dml(
                         return;
                     }
                     // Hold the distinct key set to seed the filter post-commit.
-                    Ok(seen) => filter_seeds.push((owner_id, col_idx, seen)),
+                    Ok((seen, capped)) => filter_seeds.push((owner_id, col_idx, seen, capped)),
                 }
             }
         }
@@ -1226,10 +1226,10 @@ async fn handle_system_dml(
         for i in 0..batch_for_undo.count {
             if batch_for_undo.get_weight(i) < 0 {
                 let owner_id = unsafe {
-                    (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, 0)
+                    (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, IDXTAB_PAY_OWNER_ID)
                 } as i64;
                 let col_idx = unsafe {
-                    (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, 2)
+                    (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, IDXTAB_PAY_SOURCE_COL_IDX)
                 } as u32;
                 unsafe { (*disp_ptr_raw).unique_filter_remove_col(owner_id, col_idx); }
             }
@@ -1244,8 +1244,8 @@ async fn handle_system_dml(
     // IDX_TAB +1 commits, and a broadcast/fsync failure aborts the process
     // before this point, so no filter is published for an index that never
     // committed. Symmetric with the removal above and needs no rollback.
-    for (owner_id, col_idx, seen) in filter_seeds {
-        unsafe { (*disp_ptr_raw).unique_filter_seed(owner_id, col_idx, seen); }
+    for (owner_id, col_idx, seen, capped) in filter_seeds {
+        unsafe { (*disp_ptr_raw).unique_filter_seed(owner_id, col_idx, seen, capped); }
     }
 
     send_ok_response(shared, fd, target_id, None, client_id, zone_lsn as u128, client_version).await;

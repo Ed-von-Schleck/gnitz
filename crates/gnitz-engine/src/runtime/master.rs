@@ -2240,7 +2240,7 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex<()>>,
         owner_id: i64,
         col_idx: u32,
-    ) -> Result<FxHashSet<u128>, String> {
+    ) -> Result<(FxHashSet<u128>, bool), String> {
         // An unknown table or out-of-range `col_idx` ⇒ nothing to validate
         // (the DDL layer validates the user's column before reaching here).
         // Bound on `num_columns()`, not the fixed `columns` array capacity
@@ -2251,15 +2251,21 @@ impl MasterDispatcher {
                 Some(s) if (col_idx as usize) < s.num_columns() => {
                     cat.col_is_enforced_unique_pk(owner_id, col_idx)
                 }
-                _ => return Ok(FxHashSet::default()),
+                _ => return Ok((FxHashSet::default(), false)),
             }
         };
         // PK short-circuit: an enforced-unique sole-PK column cannot hold two
         // live rows with the same value (see `col_is_enforced_unique_pk` for
         // why both halves of that predicate are load-bearing), so the scan
-        // cannot find a duplicate.
+        // cannot find a duplicate. The empty uncapped seed is NOT the
+        // committed value set (the scan is skipped), but warm-empty stays
+        // sound: on this column value-equality is PK-equality, and rows whose
+        // PK is committed never reach `check_keys` (Error mode fails the
+        // Phase-1 PK check; upsert mode routes them to the always-broadcast
+        // upsert path), so every `check_keys` key carries a fresh PK — hence
+        // a fresh value — and "absent" is always the correct verdict.
         if pk_trivially_unique {
-            return Ok(FxHashSet::default());
+            return Ok((FxHashSet::default(), false));
         }
 
         // Fan out the pre-flight command (col_idx rides in seek_col_idx); each
@@ -2286,19 +2292,24 @@ impl MasterDispatcher {
         Ok(merged.into_seed())
     }
 
-    /// Seed the `(table_id, col_idx)` filter from a complete distinct key set
-    /// captured under the catalog write lock (the CREATE-time pre-flight). Marks
-    /// it warm so the first INSERT skips `ensure_unique_filters_warm_async`. Over
-    /// the cap ⇒ leave the filter absent so the lazy path caps it exactly as it
-    /// would. Symmetric counterpart of `unique_filter_remove_col`, keeping the
-    /// capping invariant in one place.
+    /// Seed the `(table_id, col_idx)` filter from the CREATE-time pre-flight,
+    /// captured under the catalog write lock. Marks it warm so the first
+    /// INSERT skips `ensure_unique_filters_warm_async`. `capped = true` (the
+    /// accumulator overflowed and cleared its set whole — `seen` arrives
+    /// empty) publishes a warm+capped filter: `unique_filter_all_absent` then
+    /// always falls through to the broadcast — the same steady state the lazy
+    /// warmup converges to, without paying a redundant full-cluster scan on
+    /// the first INSERT. Symmetric counterpart of `unique_filter_remove_col`.
     pub(crate) fn unique_filter_seed(
-        &mut self, table_id: i64, col_idx: u32, seen: FxHashSet<u128>,
+        &mut self, table_id: i64, col_idx: u32, seen: FxHashSet<u128>, capped: bool,
     ) {
-        if seen.len() > UNIQUE_FILTER_CAP { return; }
         let mut filter = UniqueFilter::new();
-        filter.values = seen;   // exact distinct set; same type, move not re-hash
         filter.warm = true;     // pre-flight scanned every worker under the write lock
+        if capped {
+            filter.capped = true;
+        } else {
+            filter.values = seen;   // exact distinct set; same type, move not re-hash
+        }
         self.unique_filters.insert((table_id, col_idx), filter);
     }
 
@@ -2773,10 +2784,11 @@ impl PreflightAccumulator {
         true
     }
 
-    /// The complete distinct key set when it stayed under the cap, else
-    /// empty (`UniqueFilter::insert` cleared it whole on overflow).
-    pub(crate) fn into_seed(self) -> FxHashSet<u128> {
-        self.filter.values
+    /// The complete distinct key set plus the capped verdict. `capped = true`
+    /// means the set overflowed and was cleared whole — the caller must
+    /// publish a capped (always-broadcast) filter, never a warm-empty one.
+    pub(crate) fn into_seed(self) -> (FxHashSet<u128>, bool) {
+        (self.filter.values, self.filter.capped)
     }
 }
 
@@ -3290,6 +3302,69 @@ mod unique_filter_tests {
         filter.capped = true;
         extract_into_filter(&mut filter, &batch.as_mem_batch(), schema.locate(0));
         assert!(filter.values.is_empty(), "no-op on capped filter");
+    }
+
+    /// Zero workers, null catalog, dummy SAL: the unique-filter methods
+    /// touch only the `unique_filters` map.
+    fn filter_dispatcher() -> MasterDispatcher {
+        MasterDispatcher::new(
+            0,
+            Vec::new(),
+            std::ptr::null_mut(),
+            SalWriter::new(std::ptr::null_mut(), -1, 0, Vec::new()),
+            W2mReceiver::new(Vec::new()),
+        )
+    }
+
+    /// The full CREATE-time seed chain on a pre-flight that overflowed the
+    /// cap: the accumulator's seed is empty-because-capped, not
+    /// empty-because-the-table-is-empty, so the published filter must never
+    /// prove a key absent (it must fall through to the broadcast).
+    #[test]
+    fn capped_preflight_seed_never_proves_absence() {
+        let mut acc = PreflightAccumulator::new(3);
+        for k in [10u128, 20, 30, 40] {
+            assert!(acc.offer(k), "distinct keys never flip the verdict");
+        }
+        let (seed, capped) = acc.into_seed();
+        assert!(capped, "cap + 1 distinct keys must report capped");
+        let mut disp = filter_dispatcher();
+        disp.unique_filter_seed(7, 0, seed, capped);
+        assert!(
+            !disp.unique_filter_all_absent(7, 0, &[10]),
+            "a capped pre-flight seed must fall through to the broadcast",
+        );
+    }
+
+    /// Exactly-at-cap pre-flight: the seed is the complete distinct set, so
+    /// the published filter proves absence for fresh keys and reports seeded
+    /// keys as possibly present.
+    #[test]
+    fn at_cap_preflight_seed_proves_absence() {
+        let mut acc = PreflightAccumulator::new(3);
+        for k in [10u128, 20, 30] {
+            assert!(acc.offer(k));
+        }
+        let (seed, capped) = acc.into_seed();
+        assert!(!capped, "exactly cap distinct keys must keep the full seed");
+        let mut disp = filter_dispatcher();
+        disp.unique_filter_seed(7, 0, seed, capped);
+        assert!(disp.unique_filter_all_absent(7, 0, &[40]), "fresh key is provably absent");
+        assert!(!disp.unique_filter_all_absent(7, 0, &[20]), "seeded key falls through");
+    }
+
+    /// A capped seed publishes a warm+capped filter whose entry exists in
+    /// `unique_filters` — so `ensure_unique_filters_warm_async`'s
+    /// `contains_key` skip applies and no key is ever proven absent.
+    #[test]
+    fn unique_filter_seed_capped_publishes_warm_capped_entry() {
+        let mut disp = filter_dispatcher();
+        disp.unique_filter_seed(7, 0, FxHashSet::default(), true);
+        let filter = disp.unique_filters.get(&(7, 0)).expect("entry must exist");
+        assert!(filter.warm);
+        assert!(filter.capped);
+        assert!(filter.values.is_empty());
+        assert!(!disp.unique_filter_all_absent(7, 0, &[12345]));
     }
 
     /// `drain_index_scan` must surface a worker-side scan fault as a deferred

@@ -249,7 +249,9 @@ fn accumulator_distinct_keys_no_duplicate() {
     assert!(offer_all(&mut acc, &[1, 2, 3, 100, u128::MAX]));
     assert!(!acc.duplicate);
     let expected: FxHashSet<u128> = [1, 2, 3, 100, u128::MAX].into_iter().collect();
-    assert_eq!(acc.into_seed(), expected, "seed under cap is the complete distinct set");
+    let (seed, capped) = acc.into_seed();
+    assert_eq!(seed, expected, "seed under cap is the complete distinct set");
+    assert!(!capped, "under-cap seed must not report capped");
 }
 
 /// Crossing the cap clears the partial seed whole and never repopulates it:
@@ -262,14 +264,18 @@ fn accumulator_seed_over_cap_is_empty_never_truncated() {
     assert!(acc.offer(40), "cap overflow is not a duplicate");
     assert!(acc.offer(50));
     assert!(!acc.duplicate);
-    assert!(acc.into_seed().is_empty(), "seed must be cleared whole on cap overflow");
+    let (seed, capped) = acc.into_seed();
+    assert!(seed.is_empty(), "seed must be cleared whole on cap overflow");
+    assert!(capped, "overflow must report capped so the seed publishes a capped filter");
 }
 
 #[test]
 fn accumulator_seed_at_exactly_cap_is_complete() {
     let mut acc = PreflightAccumulator::new(3);
     assert!(offer_all(&mut acc, &[10, 20, 30]));
-    assert_eq!(acc.into_seed().len(), 3, "exactly cap keys must keep the full seed");
+    let (seed, capped) = acc.into_seed();
+    assert_eq!(seed.len(), 3, "exactly cap keys must keep the full seed");
+    assert!(!capped, "exactly cap keys must not report capped");
 }
 
 /// A duplicate found after the cap has been crossed is still detected — the
@@ -280,7 +286,8 @@ fn accumulator_duplicate_after_cap_crossing() {
     assert!(offer_all(&mut acc, &[1, 2, 3, 4]));
     assert!(!acc.offer(4));
     assert!(acc.duplicate);
-    assert!(acc.into_seed().is_empty());
+    let (seed, _capped) = acc.into_seed();
+    assert!(seed.is_empty());
 }
 
 // ---------------------------------------------------------------------------
