@@ -475,7 +475,16 @@ class TestZSetBatchExtend:
         client.drop_schema(sn)
 
     def test_extend_per_row_weight(self, client):
-        sn, tid, schema = _make_table(client)
+        # Per-row `_weight` is a Z-Set multiplicity, so the table must be
+        # non-unique-PK for it to survive the round trip: the unique_pk
+        # contract clamps each PK's accumulated weight to {0, 1}, which would
+        # store this row at weight 1 regardless of the requested 3.
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        cols = [ColumnDef("pk", TypeCode.U64, primary_key=True),
+                ColumnDef("val", TypeCode.I64)]
+        schema = Schema(cols)
+        tid = client.create_table(sn, "t", cols, unique_pk=False)
         batch = ZSetBatch(schema)
         batch.extend([{"pk": 1, "val": 10, "_weight": 3}])
         client.push(tid, batch)
