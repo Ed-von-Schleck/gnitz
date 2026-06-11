@@ -7,7 +7,7 @@ import warnings
 
 import pytest
 import gnitz
-from _serverproc import server_preexec
+from _serverproc import server_preexec, is_debug_build
 
 _TMP_DIR = os.path.expanduser("~/git/gnitz/tmp")
 os.makedirs(_TMP_DIR, exist_ok=True)
@@ -204,6 +204,30 @@ def unique_preflight_fault_server(monkeypatch):
     filter, and leaves the cluster healthy."""
     yield from _seamed_server(
         monkeypatch, {"GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR": "1"})
+
+
+@pytest.fixture
+def relay_lowspace_server(monkeypatch):
+    """Server with the one-shot low-relay-space seam (GNITZ_INJECT_RELAY_SPACE_LOW)
+    armed, for the barrier-only-checkpoint reclaim test. Unlike the other seam
+    fixtures it yields the `_Server` handle's (sock_path, proc) so the test can
+    assert the master is still alive after the low-space relay.
+
+    Skipped on a release build: without the seam no low-space relay occurs, so
+    the test would pass without exercising the reclaim path. No
+    GNITZ_CHECKPOINT_BYTES override — the only checkpoint in the green run is
+    the seam-induced one, keeping the view results reliable."""
+    if not is_debug_build():
+        pytest.skip("relay-space injection seam requires a debug build")
+    monkeypatch.setenv("GNITZ_INJECT_RELAY_SPACE_LOW", "1")
+    if int(os.environ.get("GNITZ_WORKERS", "1")) < 2:
+        monkeypatch.setenv("GNITZ_WORKERS", "4")
+    s = _Server(_server_binary())
+    try:
+        s.start()
+        yield s.sock_path, s.proc
+    finally:
+        s.teardown()
 
 
 @pytest.fixture(autouse=True, scope="class")

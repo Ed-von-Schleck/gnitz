@@ -602,8 +602,8 @@ impl MasterDispatcher {
                         // longer checks): injecting a FLAG_FLUSH mid-backfill
                         // would orphan already-written backfill groups that
                         // workers have not yet consumed and hang boot.
-                        let remaining = self.sal.mmap_size() - self.sal.cursor();
-                        if remaining < (self.sal.mmap_size() >> 3) {
+                        if !self.sal_relay_space_ok_raw() {
+                            let remaining = self.sal.mmap_size() - self.sal.cursor();
                             return Err(format!(
                                 "SAL space exhausted during backfill exchange relay \
                                  ({} bytes left)", remaining));
@@ -653,8 +653,7 @@ impl MasterDispatcher {
         let lsn = self.next_lsn();
         self.send_broadcast(0, lsn, FLAG_FLUSH, None, &schema, &[], 0, 0, 0)?;
         self.collect_acks()?;
-        self.checkpoint_post_ack();
-        Ok(())
+        self.checkpoint_post_ack()
     }
 
     // -----------------------------------------------------------------------
@@ -666,6 +665,14 @@ impl MasterDispatcher {
         static ARMED: std::sync::atomic::AtomicU32 =
             std::sync::atomic::AtomicU32::new(u32::MAX);
         &ARMED
+    }
+
+    /// Raw SAL relay-space threshold: at least 1/8 of the mmap still free.
+    /// Seam-free — the boot backfill relay checks this directly because it
+    /// must keep failing-on-low-space without observing the relay_loop test
+    /// seam (which would spuriously fail an in-progress backfill).
+    fn sal_relay_space_ok_raw(&self) -> bool {
+        self.sal.mmap_size() - self.sal.cursor() >= (self.sal.mmap_size() >> 3)
     }
 
     /// True when enough SAL space remains for a relay write (>= 1/8 of the
@@ -680,7 +687,7 @@ impl MasterDispatcher {
         {
             return false;
         }
-        self.sal.mmap_size() - self.sal.cursor() >= (self.sal.mmap_size() >> 3)
+        self.sal_relay_space_ok_raw()
     }
 
     /// relay_loop's variant: with GNITZ_INJECT_RELAY_SPACE_LOW set, the first
@@ -2408,14 +2415,22 @@ impl MasterDispatcher {
     /// discarded), then advance the epoch. Called by both the bootstrap
     /// sync path (`do_checkpoint`) and the async committer after it
     /// collects FLAG_FLUSH ACKs.
-    pub(crate) fn checkpoint_post_ack(&mut self) {
+    ///
+    /// Returns the flush error WITHOUT resetting the SAL when the system-table
+    /// flush fails: the SAL entries about to be discarded are that data's only
+    /// durable copy, so resetting on a swallowed failure destroys it — the same
+    /// hazard the boot path guards via `flush_all_system_tables`. Callers leave
+    /// the SAL intact and retry on a later checkpoint (committer) or abort boot
+    /// (`do_checkpoint`).
+    pub(crate) fn checkpoint_post_ack(&mut self) -> Result<(), String> {
         let cat = unsafe { &mut *self.catalog };
-        let _ = cat.flush_all_system_tables();
+        cat.flush_all_system_tables()?;
         // Now safe: every worker ACKed the FLUSH, so all have consumed past any
         // DROP that gated a directory — hence finished the matching CREATE.
         cat.drain_checkpoint_gated_deletions();
         self.sal.checkpoint_reset();
         gnitz_info!("SAL checkpoint epoch={}", self.sal.epoch());
+        Ok(())
     }
 
     /// Accessor for the committer. True when the SAL write cursor has

@@ -243,10 +243,7 @@ async fn run_checkpoint_phase(
     if let Some(e) = err {
         return Err(e);
     }
-    guard_panic("checkpoint_post_ack", || {
-        shared.disp().checkpoint_post_ack();
-        Ok(())
-    })
+    guard_panic("checkpoint_post_ack", || shared.disp().checkpoint_post_ack())
 }
 
 /// Commit one debounced batch of pushes. Emits every group's SAL writes

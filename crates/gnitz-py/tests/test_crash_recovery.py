@@ -20,7 +20,7 @@ import time
 
 import pytest
 import gnitz
-from _serverproc import server_preexec
+from _serverproc import server_preexec, is_debug_build
 
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
@@ -94,20 +94,6 @@ def _wait_for_crash(proc, timeout_s=15.0):
         raise RuntimeError("Server did not abort on GNITZ_INJECT_DDL_PANIC")
 
 
-def _is_debug_build():
-    """The injection seam is gated by #[cfg(debug_assertions)]. Cargo's
-    default `cargo build` is debug; release builds drop the seam."""
-    binary = os.environ.get(
-        "GNITZ_SERVER_BIN",
-        os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                     "../../../gnitz-server")),
-    )
-    # Heuristic: release binaries are stripped/smaller. Use file(1) to
-    # check for "not stripped" but this is unreliable. Best signal we
-    # have is the GNITZ_RELEASE env that the bench harness sets.
-    return os.environ.get("GNITZ_RELEASE", "0") == "0"
-
-
 def test_crash_after_push_no_tick():
     """SIGKILL after push with no checkpoint: SAL replay must restore all rows.
 
@@ -157,7 +143,7 @@ def test_ddl_crash_no_orphan_columns():
     """CREATE TABLE that aborts before its commit sentinel must leave no
     durable trace. Recovery skips the uncommitted zone; the table name is
     free for re-creation."""
-    if not _is_debug_build():
+    if not is_debug_build():
         pytest.skip("requires debug build (GNITZ_INJECT_DDL_PANIC seam)")
 
     tmpdir, data_dir, sock_path = _make_env()
@@ -236,7 +222,7 @@ def test_ddl_crash_no_orphan_columns():
 def test_ddl_crash_with_workers_no_orphans():
     """Same as test_ddl_crash_no_orphan_columns but multi-worker. Each
     worker's recovery walk independently rejects the uncommitted zone."""
-    if not _is_debug_build():
+    if not is_debug_build():
         pytest.skip("requires debug build (GNITZ_INJECT_DDL_PANIC seam)")
     if _NUM_WORKERS < 2:
         pytest.skip("requires GNITZ_WORKERS >= 2")
@@ -556,7 +542,7 @@ def test_worker_boot_flush_failure_preserves_sal():
     the master resets the SAL — destroying the only durable copy of every
     pre-crash row that had not yet been checkpointed.
     """
-    if not _is_debug_build():
+    if not is_debug_build():
         pytest.skip("requires debug build (GNITZ_INJECT_BOOT_FLUSH_ERROR seam)")
 
     tmpdir, data_dir, sock_path = _make_env()
@@ -618,7 +604,7 @@ def test_master_sys_flush_failure_preserves_sal():
     crash the catalog reverts to its pre-DDL state and gc_orphan_directories
     deletes the now-catalog-less entities' directories.
     """
-    if not _is_debug_build():
+    if not is_debug_build():
         pytest.skip("requires debug build (GNITZ_INJECT_SYS_FLUSH_ERROR seam)")
 
     tmpdir, data_dir, sock_path = _make_env()

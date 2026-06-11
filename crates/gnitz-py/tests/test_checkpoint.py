@@ -421,52 +421,6 @@ def test_unique_constraint_enforced_under_checkpoint_pressure(checkpoint_server)
 # the committer checkpoints the barrier-only batch.
 
 
-def _is_debug_build():
-    """The relay-space injection seam is gated by #[cfg(debug_assertions)].
-    Cargo's default `cargo build` is debug; release builds drop the seam."""
-    return os.environ.get("GNITZ_RELEASE", "0") == "0"
-
-
-@pytest.fixture
-def relay_lowspace_server():
-    """Function-scoped server with the one-shot low-relay-space seam armed.
-
-    Yields (sock_path, proc) so the test can assert the master is still
-    alive after the low-space relay.  No GNITZ_CHECKPOINT_BYTES override:
-    the only checkpoint in the green run is the seam-induced one, so the
-    view results stay reliable.
-    """
-    if not os.path.isfile(BINARY):
-        pytest.skip(f"Server binary not found: {BINARY}")
-    if not _is_debug_build():
-        pytest.skip("relay-space injection seam requires a debug build")
-    if WORKERS < 2:
-        pytest.skip("exchange relay requires GNITZ_WORKERS >= 2")
-    tmpdir = tempfile.mkdtemp(dir=os.path.expanduser("~/git/gnitz/tmp"),
-                              prefix="gnitz_relaylow_")
-    data_dir = os.path.join(tmpdir, "data")
-    sock_path = os.path.join(tmpdir, "gnitz.sock")
-    env = os.environ.copy()
-    env["GNITZ_INJECT_RELAY_SPACE_LOW"] = "1"
-    cmd = [BINARY, data_dir, sock_path, f"--workers={WORKERS}"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=env,
-                            preexec_fn=server_preexec)
-    for _ in range(100):
-        if os.path.exists(sock_path):
-            break
-        time.sleep(0.1)
-    else:
-        proc.kill()
-        proc.communicate()
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError("relay-lowspace server did not start")
-    yield sock_path, proc
-    proc.kill()
-    proc.wait()
-    shutil.rmtree(tmpdir, ignore_errors=True)
-
-
 def test_low_space_relay_checkpoints_without_aborting_master(relay_lowspace_server):
     """A low-SAL-space exchange relay must reclaim space and keep the master
     alive, even when the reclaim barrier lands in a barrier-only batch.

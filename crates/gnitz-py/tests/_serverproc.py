@@ -33,3 +33,11 @@ def server_preexec():
     # we were already reparented, so the death signal would never arrive.
     if os.getppid() != parent:
         os._exit(1)
+
+
+def is_debug_build():
+    """Whether the server under test still carries the `#[cfg(debug_assertions)]`
+    injection seams. Cargo's default `cargo build` is debug and keeps them;
+    release builds drop them. There is no reliable signal in the stripped
+    binary, so we trust the GNITZ_RELEASE env the bench harness sets."""
+    return os.environ.get("GNITZ_RELEASE", "0") == "0"
