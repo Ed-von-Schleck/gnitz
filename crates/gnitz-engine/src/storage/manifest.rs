@@ -73,6 +73,14 @@ pub struct PkBuf {
     pub len: u8,
 }
 
+// Prints only the meaningful `bytes[..len]` span (the 80-byte tail is always
+// zero by construction), so test assertion diffs over `PkBuf` keys are readable.
+impl std::fmt::Debug for PkBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PkBuf({:02x?})", &self.bytes[..self.len as usize])
+    }
+}
+
 // Manual Eq/Hash compare and hash only bytes[..len], so a HashSet<PkBuf>
 // touches pk_stride bytes per key rather than the full 80-byte array.
 impl PartialEq for PkBuf {
@@ -96,6 +104,23 @@ impl std::hash::Hash for PkBuf {
 impl std::borrow::Borrow<[u8]> for PkBuf {
     fn borrow(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
+    }
+}
+
+// Byte-lexicographic (`memcmp`) order over `bytes[..len]` — identical to
+// `compare_pk_bytes`, the canonical PK comparator, and consistent with the
+// `Eq`/`Hash` impls above (which also read only `bytes[..len]`). This is the
+// order `seek_first_positive_with_prefix` / `walk_to_positive_with_prefix`
+// walk the index in, and the valid merge order for the unique pre-flight
+// k-way merge whose keys are OPK leading-key spans of any width.
+impl PartialOrd for PkBuf {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PkBuf {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        super::compare_pk_bytes(self.pk_bytes(), other.pk_bytes())
     }
 }
 
@@ -125,6 +150,16 @@ impl PkBuf {
     #[inline]
     pub fn pk_bytes(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
+    }
+
+    /// The key zero-padded to `width` bytes — sound because the tail past
+    /// `len` is always zero by construction. Used where a narrower key (e.g.
+    /// an index leading-key span) must be widened to a full PK stride whose
+    /// suffix is zero.
+    #[inline]
+    pub fn padded(&self, width: usize) -> &[u8] {
+        debug_assert!(self.len as usize <= width && width <= MAX_PK_BYTES);
+        &self.bytes[..width]
     }
 }
 

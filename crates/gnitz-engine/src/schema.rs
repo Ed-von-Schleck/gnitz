@@ -601,40 +601,106 @@ impl ColumnLocator {
     }
 }
 
-/// Invoke `f` with the native `u128` index key and the weight of every
-/// positive-weight, non-null row of `batch`, reading the indexed column
-/// through `loc`. The weight matters because scans are consolidated: a row at
-/// weight `w ≥ 2` is the same (PK, payload) element `w` times, and uniqueness
-/// consumers must see that multiplicity (membership-only consumers ignore it).
-/// Returning `false` from `f` stops *this batch's* walk early (callers use it
-/// to bail once a filter caps or a duplicate is found); it does NOT stop any
-/// surrounding frame drain — the master's drains keep consuming every frame
-/// regardless. This is the single definition of "what key does this column's
-/// value map to" — shared by the steady-state unique-filter warmup, the
-/// INSERT-path extraction, and the worker-side projection of the CREATE-time
-/// pre-flight validator, so all three agree by construction.
+impl SchemaDescriptor {
+    /// Byte width of the leading `n` columns. For an index schema this is the
+    /// OPK leading-key span width (`idx_key_size`) — the sum of every promoted
+    /// column's width, never just `columns[0]` (a composite `UNIQUE (a, b)`
+    /// span can exceed 16 bytes); the source-PK suffix begins there.
+    #[inline]
+    pub(crate) fn leading_key_size(&self, n: usize) -> usize {
+        self.columns[..n].iter().map(|c| c.size() as usize).sum()
+    }
+}
+
+/// Precomputed read/encode plan for one index's OPK leading-key span: per
+/// indexed column, the owner-side read coordinate (PK-or-payload, resolved via
+/// `locate` — a PK source column is sliced from the packed OPK PK region, a
+/// payload column read from its dense slot) and the promoted index column it
+/// is encoded at. Built once per circuit so the row paths do no catalog
+/// reborrow, schema indexing, or allocation; `Copy`, so descriptors carrying
+/// it stay allocation-free.
 ///
-/// The key is the column's value decoded OPK→native: from the packed PK region
-/// when the column is itself a PK column, else from its native-LE payload slot.
-/// `get_pk` is wrong for signed single-column PKs (it returns the sign-flipped
-/// OPK value, which `index_opk_prefix` then flips again, seeking the wrong index
-/// key); `pk_native_key` is correct for every width and signedness, and equals
-/// `get_pk` for unsigned single PKs.
-///
-/// Accepts a `MemBatch` so callers can feed wire bytes without an intermediate
-/// owned `Batch` allocation (zero-copy scan path); owned batches use
-/// `Batch::as_mem_batch()`.
-pub(crate) fn for_each_index_key(
-    batch: &MemBatch<'_>,
-    loc: ColumnLocator,
-    mut f: impl FnMut(u128, i64) -> bool,
-) {
-    for i in 0..batch.count {
-        let w = batch.get_weight(i);
-        if w <= 0 { continue; }
-        // PK columns are never null; a NULL payload column is skipped.
-        if loc.is_null(batch, i) { continue; }
-        if !f(loc.native_key(batch, i), w) { return; }
+/// The span is the single definition of "what key do this row's indexed
+/// columns map to", shared by every uniqueness-enforcement site (in-batch
+/// validator, backfill dedup via `batch_project_index`, broadcast-skip filter,
+/// insert-time check, pre-flight) — byte-equal ⟺ index-value equal at any
+/// width, and byte-lexicographic order is the seek/merge order.
+#[derive(Clone, Copy)]
+pub(crate) struct IndexKeySpec {
+    n: u8,
+    locators: [ColumnLocator; gnitz_wire::PK_LIST_MAX_COLS],
+    idx_cols: [SchemaColumn; gnitz_wire::PK_LIST_MAX_COLS],
+}
+
+impl IndexKeySpec {
+    /// `cols` is the circuit's source column list (owner-schema indices);
+    /// `idx_schema` supplies the promoted leading columns the span encodes at.
+    pub(crate) fn new(
+        cols: &[u32], owner: &SchemaDescriptor, idx_schema: &SchemaDescriptor,
+    ) -> Self {
+        debug_assert!(!cols.is_empty() && cols.len() <= gnitz_wire::PK_LIST_MAX_COLS);
+        let mut locators = [ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 };
+                            gnitz_wire::PK_LIST_MAX_COLS];
+        let mut idx_cols = [SchemaColumn::new(0, 0); gnitz_wire::PK_LIST_MAX_COLS];
+        for (i, &c) in cols.iter().enumerate() {
+            locators[i] = owner.locate(c as usize);
+            idx_cols[i] = idx_schema.columns[i];
+        }
+        IndexKeySpec { n: cols.len() as u8, locators, idx_cols }
+    }
+
+    /// The promoted index columns of the leading span, in index order.
+    #[inline]
+    pub(crate) fn idx_cols(&self) -> &[SchemaColumn] {
+        &self.idx_cols[..self.n as usize]
+    }
+
+    /// Span width (`idx_key_size`); see `SchemaDescriptor::leading_key_size`.
+    #[inline]
+    pub(crate) fn key_size(&self) -> usize {
+        self.idx_cols().iter().map(|c| c.size() as usize).sum()
+    }
+
+    /// Write one row's OPK leading-key span into `dst[..key_size()]`. Returns
+    /// `false` (skip — the row is not indexed, `dst` partially written) when ANY
+    /// indexed column is NULL: SQL NULL-distinctness, a row with a NULL in any
+    /// indexed column never collides. The per-column encode is byte-identical
+    /// to the seek-side `index_opk_prefix_composite`, so the in-memory key, the
+    /// projected index entry, and the seek prefix agree by construction.
+    ///
+    /// `encode_pk_column` is equality-correct for every type a unique index
+    /// permits; the signed sign-flip at the *promoted* width
+    /// (order-preservation) is deferred to a later pass and not required for
+    /// uniqueness (equality, not order).
+    pub(crate) fn write_span(&self, mb: &MemBatch, row: usize, dst: &mut [u8]) -> bool {
+        let mut off = 0;
+        for (loc, col) in self.locators[..self.n as usize].iter().zip(self.idx_cols()) {
+            if loc.is_null(mb, row) { return false; }
+            let size = col.size() as usize;
+            let native = loc.native_key(mb, row);
+            // `encode_pk_column` requires `dst.len() == src.len()`; both are `size`.
+            gnitz_wire::encode_pk_column(
+                &native.to_le_bytes()[..size], col.type_code, &mut dst[off..off + size]);
+            off += size;
+        }
+        true
+    }
+
+    /// `write_span` into a caller-reused `PkBuf` — no intermediate stack
+    /// buffer, no `from_bytes` re-copy (this runs in the backfill scan and on
+    /// every insert). Maintains `PkBuf`'s "tail past `len` is zero" invariant
+    /// (zeroing only when this key is narrower than the previous one in the
+    /// reused scratch — free in the common same-circuit loop), so callers may
+    /// slice `out.bytes[..stride]` as the span zero-padded to any wider stride.
+    /// A NULL-skipped row returns `false` with `out` unchanged in meaning.
+    pub(crate) fn key_bytes(
+        &self, mb: &MemBatch, row: usize, out: &mut crate::storage::PkBuf,
+    ) -> bool {
+        if !self.write_span(mb, row, &mut out.bytes) { return false; }
+        let len = self.key_size();
+        if (out.len as usize) > len { out.bytes[len..out.len as usize].fill(0); }
+        out.len = len as u8;
+        true
     }
 }
 

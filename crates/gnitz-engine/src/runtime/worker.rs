@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
-use crate::schema::{for_each_index_key, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use crate::dag::ExchangeCallback;
 use crate::storage::{BlobCacheGuard, FlushWork, PkBuf};
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, FLAG_CONTINUATION, FLAG_SCAN_LAST};
@@ -46,8 +46,8 @@ struct PendingScan {
 enum HasPkLookup {
     /// Check the table's primary-key store.
     PrimaryKey,
-    /// Check a unique secondary index on the carried column list (always
-    /// single-column — composite UNIQUE is not yet supported).
+    /// Check a unique secondary index on the carried column list (single- or
+    /// multi-column; a composite index is located by its exact list).
     UniqueIndex(gnitz_wire::PkColList),
 }
 
@@ -947,13 +947,17 @@ impl WorkerProcess {
 
             SalMessageKind::UniquePreflight => {
                 // CREATE UNIQUE INDEX global pre-flight: project this worker's
-                // committed partition of `target_id` to native u128 index keys
-                // for the column in `seek_col_idx`, sort them, and stream the
-                // sorted keys back for the master's k-way merge. An error here
-                // surfaces as the terminal fault frame the master's merge
-                // expects (send_error in run_via_dispatch_inner).
-                let col_idx = seek_col_idx as u32;
-                if let Err(msg) = self.handle_unique_preflight(target_id, col_idx, request_id) {
+                // committed partition of `target_id` to OPK leading-key spans for
+                // the column list in `seek_col_idx` (packed via pack_pk_cols),
+                // sort them, and stream the sorted spans back for the master's
+                // k-way merge. An error here surfaces as the terminal fault frame
+                // the master's merge expects (send_error in run_via_dispatch_inner).
+                let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
+                if !cols.is_well_formed() {
+                    return DispatchResult::Error(format!(
+                        "unique pre-flight: invalid column list for table {target_id}"));
+                }
+                if let Err(msg) = self.handle_unique_preflight(target_id, cols.as_slice(), request_id) {
                     return DispatchResult::Error(msg);
                 }
                 DispatchResult::Continue
@@ -1220,21 +1224,23 @@ impl WorkerProcess {
 
     /// CREATE UNIQUE INDEX pre-flight, worker side: project every
     /// positive-weight, non-null row of this worker's committed partition of
-    /// `owner_id` to the native u128 index key of `col_idx` (the same
-    /// `for_each_index_key` contract the master's filter warmup and merge
-    /// use), sort the keys, and stream them back sorted. A consolidated row
-    /// at weight ≥ 2 emits its key twice — it IS that many live instances of
-    /// the key, and the duplicate must be visible to the merge as an adjacent
-    /// pair. No local dedup and no within-partition duplicate check: the
-    /// master's adjacent-equal merge subsumes both, and a `Vec<u128>`
-    /// (16 B/key contiguous) beats a `BTreeSet` on both memory and sort cost.
+    /// `owner_id` to the OPK leading-key span of `col_indices` (the same
+    /// `IndexKeySpec::key_bytes` contract the master's filter warmup and merge use),
+    /// sort the spans byte-lexicographically, and stream them back sorted. A
+    /// consolidated row at weight ≥ 2 emits its span twice — it IS that many
+    /// live instances of the key, and the duplicate must be visible to the merge
+    /// as an adjacent pair. No local dedup and no within-partition duplicate
+    /// check: the master's adjacent-equal merge subsumes both, and a
+    /// `Vec<PkBuf>` (contiguous, sorted via `PkBuf: Ord`) beats a `BTreeSet` on
+    /// both memory and sort cost. The span is the composite generalisation of the
+    /// old single-`u128` key — a `UNIQUE (a, b)` span exceeds 16 bytes.
     ///
     /// MUST observe the same snapshot `backfill_index` will later project:
     /// the master sends this command inside the DDL critical section
     /// (committer barrier drained, catalog write lock held), before the
     /// IDX_TAB +1 broadcast, so no concurrent INSERT can interleave.
     fn handle_unique_preflight(
-        &mut self, owner_id: i64, col_idx: u32, request_id: u64,
+        &mut self, owner_id: i64, col_indices: &[u32], request_id: u64,
     ) -> Result<(), String> {
         // Crash-injection seam: fail the pre-flight on every worker so tests
         // can assert the master surfaces the fault, drains the fan-out, and
@@ -1246,39 +1252,44 @@ impl WorkerProcess {
         let schema = self.cat().get_schema_desc(owner_id).ok_or_else(|| {
             format!("unique pre-flight: no schema for table {}", owner_id)
         })?;
-        // The master bounds-checks before fanning out; this guards a
-        // protocol-level mismatch rather than a user error.
-        if col_idx as usize >= schema.num_columns() {
-            return Err(format!(
-                "unique pre-flight: column {} out of range for table {}",
-                col_idx, owner_id,
-            ));
-        }
-        let loc = schema.locate(col_idx as usize);
+        // The index circuit is not registered until this pre-flight succeeds, so
+        // build its schema from the owner schema + column list — identical inputs
+        // to the master's own build, so the reply frame layout agrees by
+        // construction. `make_index_schema` also bounds-checks the columns (a
+        // protocol-level mismatch rather than a user error) and yields the
+        // promoted per-column types/sizes for the span.
+        let idx_schema = crate::catalog::make_index_schema(col_indices, &schema)?;
+        let spec = crate::schema::IndexKeySpec::new(col_indices, &schema, &idx_schema);
+        let frame_schema = crate::runtime::sal::unique_preflight_wire_schema(
+            &idx_schema, col_indices.len());
 
-        // Stream the partition chunk-wise and project each chunk to keys —
-        // peak memory beyond one chunk is the 16 B/key Vec. Running
-        // `for_each_index_key` over each chunk keeps the single column→key
-        // definition shared with the filter warmup and the master merge.
+        // Stream the partition chunk-wise and project each chunk to spans —
+        // peak memory beyond one chunk is the span Vec. `key_bytes` keeps the
+        // single column→span definition shared with the filter warmup and the
+        // master merge.
         let chunk_rows = self.cat().ddl_scan_chunk_rows;
-        let mut keys: Vec<u128> = Vec::new();
+        let mut keys: Vec<PkBuf> = Vec::new();
+        let mut keybuf = PkBuf::empty(0);
         if let Some(mut handle) = self.cat().open_store_cursor(owner_id) {
             while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
+                let mb = chunk.as_mem_batch();
                 keys.reserve(chunk.count);
-                for_each_index_key(&chunk.as_mem_batch(), loc, |k, w| {
-                    keys.push(k);
+                for row in 0..chunk.count {
+                    let w = chunk.get_weight(row);
+                    if w <= 0 { continue; }
+                    if !spec.key_bytes(&mb, row, &mut keybuf) { continue; }
+                    keys.push(keybuf);
                     // Chunks are consolidated: weight ≥ 2 is the same row w
                     // times; one extra copy suffices to put an adjacent equal
                     // pair in the sorted stream for the master's merge.
-                    if w > 1 { keys.push(k); }
-                    true
-                });
+                    if w > 1 { keys.push(keybuf); }
+                }
             }
         }
         keys.sort_unstable();
 
         send_unique_preflight_keys(
-            &self.w2m_writer, owner_id as u64, &keys, request_id,
+            &self.w2m_writer, owner_id as u64, &keys, &frame_schema, request_id,
             unique_preflight_keys_per_frame(),
         );
         Ok(())
@@ -1297,10 +1308,6 @@ impl WorkerProcess {
 
         let (schema, result) = match lookup {
             HasPkLookup::UniqueIndex(cols) => {
-                // Unique circuits are always single-column (composite UNIQUE is
-                // not yet supported).
-                debug_assert_eq!(cols.as_slice().len(), 1,
-                    "unique-index has_pk lookup must be single-column");
                 let index_handle = self.cat().get_index_store_handle(target_id, cols.as_slice());
                 if index_handle.is_null() {
                     return Err(format!(
@@ -1327,11 +1334,11 @@ impl WorkerProcess {
                 let table = unsafe { &*index_handle };
                 let mut cursor = table.open_cursor();
                 // The check batch's PK is the OPK index composite
-                // `(indexed-value, src_pk_cols)`; the leading `idx_key_size`
-                // bytes are the OPK-encoded indexed value. Prefix-match that
-                // whole leading column — OPK puts the distinguishing bytes last,
-                // so a source-width prefix would match only the zero high bytes.
-                let idx_key_size = schema.columns[0].size() as usize;
+                // `(indexed-value…, src_pk_cols)`; the leading `idx_key_size`
+                // bytes are the OPK-encoded indexed value(s). Prefix-match that
+                // whole leading span — OPK puts the distinguishing bytes last, so
+                // a source-width prefix would match only the zero high bytes.
+                let idx_key_size = schema.leading_key_size(cols.as_slice().len());
                 let result = filter_by_pk_bytes(&batch, schema, n, |pkb| {
                     cursor.cursor.seek_first_positive_with_prefix(&pkb[..idx_key_size])
                 });
@@ -1567,17 +1574,29 @@ enum DispatchResult {
 // Unique pre-flight key stream
 // ---------------------------------------------------------------------------
 
-/// Keys per W2M frame for the unique pre-flight stream: ~16 MiB of wire data
-/// per frame (32 B/key: 16 B PK + 8 B weight + 8 B null word), far under
-/// `MAX_W2M_MSG`. The reactor parks a still-streaming worker's frames per
-/// req_id while the master's merge drains a different worker, and every
-/// parked frame holds one of the worker's `W2M_MAX_IN_FLIGHT` `InFlightState`
-/// slots — so the frame size must keep `W2M_REGION_SIZE / frame_bytes` below
-/// that bound.
-const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 19;
+/// Keys per W2M frame for the unique pre-flight stream. The per-key wire size is
+/// `idx_key_size + 16` (the OPK leading-key span + 8 B weight + 8 B null word).
+/// The span is variable-width now: a single ≤8-byte column promotes to a U64 (8
+/// B) span — `PREFLIGHT_MIN_KEY_BYTES` below — so the *narrowest* frame is the
+/// binding case, where the most frames fit in a ring. A composite span can reach
+/// `MAX_PK_BYTES` (80 B) → ~96 B/key, still far under `MAX_W2M_MSG` (256 MiB) at
+/// this key count.
+///
+/// The reactor parks a still-streaming worker's frames per req_id while the
+/// master's merge drains a different worker, and every parked frame holds one of
+/// the worker's `W2M_MAX_IN_FLIGHT` `InFlightState` slots — so the *minimum*
+/// frame size must keep `W2M_REGION_SIZE / frame_bytes` below that bound. The old
+/// fixed `U128` reply column made every frame 32 B/key; the variable span can be
+/// narrower, so the count is raised so the narrowest frame still clears the bound.
+const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 20;
+
+/// Smallest possible per-key wire size: an 8-byte promoted span (the narrowest a
+/// unique index key can be — every ≤8-byte integer promotes to U64) + 8 B weight
+/// + 8 B null word. Drives the in-flight-slot bound below for the narrowest frame.
+const PREFLIGHT_MIN_KEY_BYTES: usize = 8 + 8 + 8;
 
 const _: () = assert!(
-    w2m_ring::W2M_REGION_SIZE / (32 * UNIQUE_PREFLIGHT_KEYS_PER_FRAME + 8)
+    w2m_ring::W2M_REGION_SIZE / (PREFLIGHT_MIN_KEY_BYTES * UNIQUE_PREFLIGHT_KEYS_PER_FRAME + 8)
         < crate::runtime::w2m::W2M_MAX_IN_FLIGHT,
     "unique pre-flight frames must be large enough that a full W2M ring holds \
      fewer frames than the in-flight slots InFlightState can track",
@@ -1600,7 +1619,9 @@ fn unique_preflight_keys_per_frame() -> usize {
 }
 
 /// Stream `keys` (already sorted) to the master as a train of continuation
-/// frames carrying a synthetic single-U128-PK-column schema. Every frame is
+/// frames carrying the synthetic pre-flight frame schema (`frame_schema` =
+/// `unique_preflight_wire_schema`, whose PK region is exactly the OPK
+/// leading-key span; each `keys[i]` is that span verbatim). Every frame is
 /// tagged `FLAG_CONTINUATION`; the terminal frame additionally
 /// `FLAG_SCAN_LAST`. An empty key set emits one empty terminal frame so the
 /// master's drain still sees the train end.
@@ -1618,26 +1639,26 @@ fn unique_preflight_keys_per_frame() -> usize {
 pub(crate) fn send_unique_preflight_keys(
     w2m_writer: &W2mWriter,
     target_id: u64,
-    keys: &[u128],
+    keys: &[PkBuf],
+    frame_schema: &SchemaDescriptor,
     request_id: u64,
     keys_per_frame: usize,
 ) {
     debug_assert!(keys_per_frame > 0, "keys_per_frame must be positive");
-    let synthetic = crate::runtime::sal::unique_preflight_wire_schema();
-    let schema_block = ipc::build_schema_wire_block(&synthetic, &[], target_id as u32);
+    let schema_block = ipc::build_schema_wire_block(frame_schema, &[], target_id as u32);
 
     // Reusable chunk batch: filled, encoded, and cleared per frame.
-    let mut chunk = Batch::with_schema(synthetic, keys.len().min(keys_per_frame));
+    let mut chunk = Batch::with_schema(*frame_schema, keys.len().min(keys_per_frame));
     let mut start = 0usize;
     loop {
         let end = keys.len().min(start + keys_per_frame);
         chunk.clear();
-        for &k in &keys[start..end] {
+        for k in &keys[start..end] {
             chunk.ensure_row_capacity();
-            // U128 PK: OPK == big-endian, so `extend_pk`'s BE bytes decode
-            // back to the native key via `ColumnLocator::native_key` on the
-            // master — the wire is encoding-transparent.
-            chunk.extend_pk(k);
+            // The span is already OPK; write the raw bytes into the PK region
+            // (len == pk_stride). The master reads them back verbatim via
+            // `mb.get_pk_bytes(row)` → `PkBuf` — the wire is byte-transparent.
+            chunk.extend_pk_bytes(k.pk_bytes());
             chunk.extend_weight(&1i64.to_le_bytes());
             chunk.extend_null_bmp(&0u64.to_le_bytes());
             chunk.count += 1;
@@ -1648,7 +1669,7 @@ pub(crate) fn send_unique_preflight_keys(
         // the master's saved schema hint (synthetic schema version is 0, so
         // no wire_flags_set_schema_version is needed).
         let prebuilt: Option<&[u8]> = if is_first { Some(&schema_block) } else { None };
-        let schema_for_encode = if is_first { Some(&synthetic) } else { None };
+        let schema_for_encode = if is_first { Some(frame_schema) } else { None };
         let flags = FLAG_CONTINUATION | if is_last { FLAG_SCAN_LAST } else { 0 };
         let sz = ipc::wire_size_range(
             STATUS_OK, &[], schema_for_encode, None, &chunk, chunk.count, prebuilt,

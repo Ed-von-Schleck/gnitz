@@ -1978,20 +1978,39 @@ fn test_composite_index_does_not_answer_single_column() {
 }
 
 #[test]
-fn test_composite_unique_rejected() {
-    // CREATE UNIQUE INDEX over multiple columns is rejected (composite UNIQUE is
-    // deferred); single-column UNIQUE still works.
-    let dir = temp_dir("composite_unique_reject");
+fn test_composite_unique_created_and_enforced() {
+    // CREATE UNIQUE INDEX over multiple columns is now supported, and the
+    // in-batch validator enforces uniqueness over the composite (a, b) span:
+    // a duplicate (a, b) is rejected, two rows differing only in b are admitted.
+    let dir = temp_dir("composite_unique_ok");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
-    engine.create_table("public.t", &cols, &[0], true).unwrap();
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
 
-    let err = engine.create_index("public.t", &["a", "b"], true)
-        .expect_err("composite UNIQUE must be rejected");
-    assert!(err.contains("not yet supported"), "got: {err}");
+    engine.create_index("public.t", &["a", "b"], true)
+        .expect("composite UNIQUE (a, b) must be created");
+    let schema = engine.get_schema(tid).unwrap();
 
-    // Single-column UNIQUE is fine.
-    engine.create_index("public.t", &["a"], true).unwrap();
+    // Commit (id=1, a=5, b=1).
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(5); bb.put_u64(1); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // A second row with the same (a, b) = (5, 1) violates the composite index.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(2u128, 1); bb.put_u64(5); bb.put_u64(1); bb.end_row();
+    let err = engine.validate_unique_indices(tid, &bb.finish())
+        .expect_err("duplicate (a, b) must violate");
+    assert!(err.contains("Unique index violation"), "got: {err}");
+    // The diagnostic names both columns of the composite.
+    assert!(err.contains('a') && err.contains('b'), "violation should name (a, b): {err}");
+
+    // A row sharing only a (a=5, b=2) is a distinct composite → admitted.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(3u128, 1); bb.put_u64(5); bb.put_u64(2); bb.end_row();
+    assert!(engine.validate_unique_indices(tid, &bb.finish()).is_ok(),
+        "rows differing only in the trailing column must be admitted");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

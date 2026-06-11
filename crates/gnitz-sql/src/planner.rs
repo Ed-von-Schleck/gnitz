@@ -276,11 +276,11 @@ fn execute_create_table(
     //     before the engine catalog reports the same.
     let mut pk_indices: Vec<u32> = Vec::new();
     let mut pk_decl_seen = false;
-    // Columns carrying a UNIQUE constraint, paired with the user-specified
-    // constraint name (if any). Column-level `UNIQUE` carries no name, so it is
-    // always collected with `None`; only table-level `CONSTRAINT <name>
-    // UNIQUE(col)` supplies one.
-    let mut unique_cols: Vec<(u32, Option<String>)> = Vec::new();
+    // Column lists carrying a UNIQUE constraint, paired with the user-specified
+    // constraint name (if any). A column-level `UNIQUE` is a 1-element list and
+    // carries no name (always `None`); a table-level `UNIQUE (a, b, …)` is the
+    // full ordered list and may carry a `CONSTRAINT <name>`.
+    let mut unique_cols: Vec<(Vec<u32>, Option<String>)> = Vec::new();
 
     // Table-level PRIMARY KEY (...). Done before the inline pass so an
     // unknown column name produces a Bind error rather than being eclipsed
@@ -337,9 +337,9 @@ fn execute_create_table(
                     cols[i].type_code   = parent_pk_type;
                 }
                 ColumnOption::Unique { is_primary: false, .. }
-                    if !unique_cols.iter().any(|(c, _)| *c == i as u32) =>
+                    if !unique_cols.iter().any(|(c, _)| c.as_slice() == [i as u32]) =>
                 {
-                    unique_cols.push((i as u32, None));
+                    unique_cols.push((vec![i as u32], None));
                 }
                 _ => {}
             }
@@ -370,32 +370,38 @@ fn execute_create_table(
         }
     }
 
-    // Phase 5 — table-level UNIQUE constraints (single-column only). The engine
-    // has no composite secondary index and `create_index` is single-column, so
-    // multi-column UNIQUE is rejected rather than silently dropped.
+    // Phase 5 — table-level UNIQUE constraints, single- or multi-column. Each
+    // named column is resolved to its index in declared order (order is
+    // significant: it drives the composite index's leading-key span and prefix
+    // seeks).
     for constraint in &create.constraints {
         if let TableConstraint::Unique { name: name_ident, columns, .. } = constraint {
             if columns.is_empty() {
                 return Err(GnitzSqlError::Plan("UNIQUE constraint cannot be empty".into()));
             }
-            if columns.len() != 1 {
-                return Err(GnitzSqlError::Unsupported(
-                    "multi-column UNIQUE constraints are not supported".into()));
+            let mut col_indices: Vec<u32> = Vec::with_capacity(columns.len());
+            for col_ident in columns {
+                let col_name = &col_ident.value;
+                let idx = cols.iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                    .ok_or_else(|| GnitzSqlError::Bind(format!(
+                        "UNIQUE column '{}' not found in table definition", col_name)))?;
+                if col_indices.contains(&(idx as u32)) {
+                    return Err(GnitzSqlError::Plan(format!(
+                        "duplicate column '{}' in UNIQUE constraint", col_name)));
+                }
+                col_indices.push(idx as u32);
             }
-            let col_name = &columns[0].value;
-            let idx = cols.iter()
-                .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                .ok_or_else(|| GnitzSqlError::Bind(format!(
-                    "UNIQUE column '{}' not found in table definition", col_name)))?;
-            if unique_cols.iter().any(|(c, _)| *c == idx as u32) {
+            if unique_cols.iter().any(|(c, _)| c.as_slice() == col_indices.as_slice()) {
                 return Err(GnitzSqlError::Plan(format!(
-                    "duplicate UNIQUE constraint on column '{}'", col_name)));
+                    "duplicate UNIQUE constraint on column(s) ({})",
+                    columns.iter().map(|c| c.value.as_str()).collect::<Vec<_>>().join(", "))));
             }
             let constraint_name = name_ident.as_ref().map(|n| n.value.clone());
             if let Some(ref name) = constraint_name {
                 validate_user_index_name(name)?;
             }
-            unique_cols.push((idx as u32, constraint_name));
+            unique_cols.push((col_indices, constraint_name));
         }
     }
 
@@ -448,26 +454,30 @@ fn execute_create_table(
         cols[i as usize].is_nullable = false;
     }
 
-    // A lone-PK column is already unique; drop a redundant secondary unique
-    // index on it. A compound-PK member declared UNIQUE is NOT individually
-    // unique, so a UNIQUE on it is meaningful and is kept (the engine supports
-    // unique indices on PK columns).
-    let lone_pk = (pk_indices.len() == 1).then(|| pk_indices[0]);
-    unique_cols.retain(|(c, _)| Some(*c) != lone_pk);
+    // A lone single-column PK is already unique; drop a redundant secondary
+    // unique index equal to it. A compound-PK member declared UNIQUE is NOT
+    // individually unique, and a composite UNIQUE (len > 1) never equals a
+    // single-element lone PK, so both are kept (the engine supports unique
+    // indices on PK columns, and the engine's trivial-uniqueness short-circuit
+    // skips the pre-flight scan for a composite UNIQUE equal to a compound PK).
+    let lone_pk: &[u32] = if pk_indices.len() == 1 { &pk_indices } else { &[] };
+    unique_cols.retain(|(c, _)| c.as_slice() != lone_pk);
 
     // Pre-validate index-eligibility BEFORE create_table: DDL is not
     // transactional, so a type error after the table is created would leave an
     // orphan table. `is_pk_eligible` is the exact index-eligible allow-list, so
     // this one gate covers every rejected type. A UNIQUE+FK column always
     // passes — its type was rewritten to the parent's (integer) PK type above.
-    for (c, _) in &unique_cols {
-        let tc = cols[*c as usize].type_code;
-        if !tc.is_pk_eligible() {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "UNIQUE column '{}' of type {:?} is not supported \
-                 (UNIQUE requires a fixed-width integer, U128, or UUID column; \
-                 String, Blob, and float columns cannot carry a UNIQUE index)",
-                cols[*c as usize].name, tc)));
+    for (col_indices, _) in &unique_cols {
+        for &c in col_indices {
+            let tc = cols[c as usize].type_code;
+            if !tc.is_pk_eligible() {
+                return Err(GnitzSqlError::Unsupported(format!(
+                    "UNIQUE column '{}' of type {:?} is not supported \
+                     (UNIQUE requires a fixed-width integer, U128, or UUID column; \
+                     String, Blob, and float columns cannot carry a UNIQUE index)",
+                    cols[c as usize].name, tc)));
+            }
         }
     }
 
@@ -480,11 +490,15 @@ fn execute_create_table(
     // only on transport-level errors. On failure, best-effort drop_table to
     // avoid an orphaned table with missing constraints (DDL is not
     // transactional across the create_table / create_index boundary).
-    for (c, constraint_name) in &unique_cols {
-        let col = &cols[*c as usize];
-        let index_name = constraint_name.clone()
-            .unwrap_or_else(|| default_index_name(schema_name, &table_name, &col.name));
-        if let Err(e) = client.create_index(tid, &[*c], &[col.type_code], &index_name, true) {
+    for (col_indices, constraint_name) in &unique_cols {
+        let col_types: Vec<TypeCode> =
+            col_indices.iter().map(|&c| cols[c as usize].type_code).collect();
+        let index_name = constraint_name.clone().unwrap_or_else(|| {
+            let col_names: Vec<&str> = col_indices.iter()
+                .map(|&c| cols[c as usize].name.as_str()).collect();
+            default_index_name(schema_name, &table_name, &col_names)
+        });
+        if let Err(e) = client.create_index(tid, col_indices, &col_types, &index_name, true) {
             let _ = client.drop_table(schema_name, &table_name);
             return Err(GnitzSqlError::Exec(e));
         }
@@ -793,11 +807,12 @@ fn execute_create_view(
 }
 
 /// Catalog name for an auto-generated (unnamed) secondary index:
-/// `{schema}__{table}__idx_{col}`. `DROP INDEX <name>` resolves this exact
-/// string, so the format is a stable contract (the drop-by-name tests in
-/// `planner_create_table` pin it).
-fn default_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
-    format!("{schema_name}__{table_name}__idx_{col_name}")
+/// `{schema}__{table}__idx_{col1}_{col2}…` (column names joined with `_`).
+/// `DROP INDEX <name>` resolves this exact string, so the format is a stable
+/// contract (the drop-by-name tests in `planner_create_table` pin it); this is
+/// its single definition, shared by CREATE INDEX and CREATE TABLE … UNIQUE.
+fn default_index_name(schema_name: &str, table_name: &str, col_names: &[&str]) -> String {
+    format!("{schema_name}__{table_name}__idx_{}", col_names.join("_"))
 }
 
 fn execute_create_index(
@@ -855,15 +870,6 @@ fn execute_create_index(
         col_indices.push(col_idx as u32);
     }
 
-    // The distributed uniqueness-check pipeline (filters, routing cache,
-    // has_pk checks) is single-column throughout; the engine hook rejects a
-    // composite UNIQUE row identically.
-    if is_unique && col_indices.len() > 1 {
-        return Err(GnitzSqlError::Unsupported(
-            "composite UNIQUE indexes are not yet supported".to_string()
-        ));
-    }
-
     // Limit pre-check — runs before the client push so an over-limit index
     // raises a clean planner error here, not after the IDX_TAB row already
     // committed. `index_key_types` is the same promotion + arity/stride
@@ -875,8 +881,10 @@ fn execute_create_index(
     gnitz_core::index_key_types(&raw_types, schema.pk_count(), schema.pk_stride())
         .map_err(GnitzSqlError::Unsupported)?;   // also rejects String/Blob/float
 
-    let index_name = explicit_name
-        .unwrap_or_else(|| default_index_name(schema_name, &table_name, &col_names.join("_")));
+    let index_name = explicit_name.unwrap_or_else(|| {
+        let names: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+        default_index_name(schema_name, &table_name, &names)
+    });
 
     let index_id = client.create_index(
         table_id, &col_indices, &col_types, &index_name, is_unique,

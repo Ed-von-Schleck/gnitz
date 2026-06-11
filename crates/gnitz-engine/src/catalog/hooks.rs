@@ -407,17 +407,6 @@ impl CatalogEngine {
                     cols.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS));
             }
             let is_unique = self.read_batch_u64(batch, i, 4) != 0;
-            // Reject composite UNIQUE here too. The unique-enforcement pipeline
-            // is single-column throughout (filters, routing cache, has_pk
-            // checks), and the SQL planner already rejects composite UNIQUE —
-            // but a raw gnitz-core client can push an IDX_TAB row with a
-            // multi-column list and is_unique = 1 directly, bypassing the
-            // planner. The single-column unique-enforcement reads
-            // (`col_indices.as_slice()[0]`) would then check uniqueness on only
-            // the first column and raise false conflicts on distinct rows.
-            if is_unique && cols.as_slice().len() > 1 {
-                return Err("composite UNIQUE indexes are not yet supported".to_string());
-            }
 
             if weight > 0 {
                 // Keep worker next_index_id in sync with master-assigned IDs so that

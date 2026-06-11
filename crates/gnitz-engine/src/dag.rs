@@ -3,7 +3,7 @@
 use std::cell::UnsafeCell;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::schema::{SchemaDescriptor, ColumnLocator};
+use crate::schema::SchemaDescriptor;
 use gnitz_wire::PkColList;
 use crate::compiler::{self, CompileOutput, ExternalTable, SubPlan};
 use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, Persistence, PkBuf, Table, PartitionedTable, StorageError};
@@ -220,19 +220,16 @@ impl IndexCircuitEntry {
         unsafe { &mut *self.index_table.get() }
     }
 
-    /// The source column of a unique circuit, `None` for a non-unique one.
+    /// The source column list of a unique circuit, `None` for a non-unique one.
     /// The single accessor for the unique-enforcement machinery (filters,
-    /// routing cache, has_pk pre-checks), which is single-column throughout:
-    /// `hook_index_register` rejects composite UNIQUE at registration, so a
-    /// unique circuit always carries a 1-element list. When composite UNIQUE
-    /// lands, changing this signature makes the compiler enumerate every
-    /// consumer of that assumption.
+    /// routing cache, has_pk pre-checks). The returned slice has length ≥ 1: a
+    /// single-column unique index yields a 1-element list, a composite
+    /// `UNIQUE (a, b, …)` the full ordered list. Order is significant (it drives
+    /// the leading-key span encoding and prefix seeks).
     #[inline]
-    pub fn unique_col(&self) -> Option<u32> {
+    pub fn unique_cols(&self) -> Option<&[u32]> {
         if !self.is_unique { return None; }
-        debug_assert_eq!(self.col_indices.as_slice().len(), 1,
-            "unique index circuit must be single-column");
-        Some(self.col_indices.as_slice()[0])
+        Some(self.col_indices.as_slice())
     }
 }
 
@@ -1869,49 +1866,23 @@ impl DagEngine {
         let mut idx_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
 
         let mb = src.as_mem_batch();
-        let n_cols = source_col_indices.len();
 
-        // Hoist every per-column read coordinate — `locate` (PK-vs-payload),
-        // the promoted slot size, and the promoted type — into fixed
-        // PK_LIST_MAX_COLS-wide stack arrays so the row loop does no per-column
-        // method call or schema indexing (this runs once per index circuit on
-        // every base-table push). `locate` resolves the PK-or-payload read
-        // once: a PK source column is sliced from the packed OPK PK region, a
-        // payload column read from its dense slot.
-        let mut locators = [ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 };
-                            gnitz_wire::PK_LIST_MAX_COLS];
-        let mut sizes = [0usize; gnitz_wire::PK_LIST_MAX_COLS];
-        let mut types = [0u8;    gnitz_wire::PK_LIST_MAX_COLS];
-        for i in 0..n_cols {
-            locators[i] = src_schema.locate(source_col_indices[i] as usize);
-            sizes[i]    = idx_schema.columns[i].size() as usize;
-            types[i]    = idx_schema.columns[i].type_code;
-        }
-        let idx_key_size: usize = sizes[..n_cols].iter().sum();
+        // Per-column read/encode plan, hoisted once per call (this runs once
+        // per index circuit on every base-table push) so the row loop does no
+        // per-column method call or schema indexing.
+        let spec = crate::schema::IndexKeySpec::new(source_col_indices, src_schema, idx_schema);
+        let idx_key_size = spec.key_size();
 
         for row in 0..src.count {
             let weight = src.get_weight(row);
             if weight == 0 { continue; }
-            // NULL in ANY indexed column ⇒ row not indexed (`is_null` is false
-            // for a PK column, checks the bit for a payload column).
-            if locators[..n_cols].iter().any(|loc| loc.is_null(&mb, row)) { continue; }
-
-            // Leading index-key slots: each indexed value's native u128
-            // (decoded from the source OPK PK column, or read from the
-            // native-LE payload), re-encoded OPK into its promoted slot at the
-            // running offset. The index table's PK region is order-preserving
-            // like any other; seeks (has_pk / seek_by_index) encode the same
-            // way.
-            let mut off = 0usize;
-            for i in 0..n_cols {
-                let size = sizes[i];
-                let native = locators[i].native_key(&mb, row);
-                gnitz_wire::encode_pk_column(
-                    &native.to_le_bytes()[..size], types[i],
-                    &mut idx_pk_buf[off..off + size],
-                );
-                off += size;
-            }
+            // Leading index-key slots: each indexed value re-encoded OPK into
+            // its promoted slot. The index table's PK region is
+            // order-preserving like any other; seeks (has_pk / seek_by_index)
+            // encode the same way. NULL in ANY indexed column ⇒ row not
+            // indexed; retractions (weight < 0) DO project, so the index
+            // entry retracts with its source row.
+            if !spec.write_span(&mb, row, &mut idx_pk_buf) { continue; }
             // The source PK region is laid out in pk_indices order, so the
             // index's trailing PK suffix is byte-identical to the source's PK
             // (already OPK).

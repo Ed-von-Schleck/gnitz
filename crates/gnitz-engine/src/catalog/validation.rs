@@ -32,9 +32,10 @@ impl CatalogEngine {
             let is_lone_pk = pk.len() == 1 && pk[0] == col.fk_col_idx;
             if !is_lone_pk {
                 // A composite index does not satisfy a single-column FK: a
-                // unique (a, b) does not guarantee uniqueness of `a` alone.
+                // unique (a, b) does not guarantee uniqueness of `a` alone, so
+                // match only a single-column unique index on the referenced col.
                 let has_unique = entry.index_circuits.iter()
-                    .any(|ic| ic.unique_col() == Some(col.fk_col_idx));
+                    .any(|ic| ic.unique_cols() == Some(&[col.fk_col_idx][..]));
                 if !has_unique {
                     return Err(
                         "FK must reference the primary key or a UNIQUE-indexed column".into()
@@ -95,7 +96,7 @@ impl CatalogEngine {
                 // A composite index does not satisfy a single-column FK:
                 // match a single-column unique circuit exactly.
                 Some(target_entry.index_circuits.iter()
-                    .find(|ic| ic.unique_col() == Some(target_col_idx as u32))
+                    .find(|ic| ic.unique_cols() == Some(&[target_col_idx as u32][..]))
                     .ok_or_else(|| format!(
                         "FK target {} col {} has no UNIQUE index", target_id, target_col_idx))?)
             };
@@ -221,29 +222,37 @@ impl CatalogEngine {
             }
         }
 
-        // (source PK, value) pairs retracted in this batch over the current
-        // index's column. Allocation reused across indices via `clear` (the key
-        // is index-specific, so the *contents* are rebuilt per index).
-        let mut retracted: FxHashSet<(PkBuf, u128)> = FxHashSet::default();
+        // (holder source PK, leading-key span) pairs retracted in this batch
+        // over the current index's columns. Allocation reused across indices via
+        // `clear` (the key is index-specific, so the *contents* are rebuilt per
+        // index). The span replaces the old single-`u128` value so a composite
+        // `UNIQUE (a, b, …)` whose span exceeds 16 bytes is keyed without
+        // truncation.
+        let mut retracted: FxHashSet<(PkBuf, PkBuf)> = FxHashSet::default();
 
-        // Reused across indices like `retracted`; cleared per index. The
-        // canonical u128 key identifies the indexed value for every accepted
-        // type (pk_native_key/payload_native_key map to ≤16 bytes).
-        let mut seen: FxHashSet<u128> =
+        // Reused across indices like `retracted`; cleared per index. The OPK
+        // leading-key span identifies the indexed value for every accepted type
+        // at any width (byte-equal ⟺ value-equal). Scratch `keybuf` is the
+        // reused destination `IndexKeySpec::key_bytes` writes each row's span
+        // into — no per-row allocation.
+        let mut seen: FxHashSet<PkBuf> =
             FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
+        let mut keybuf = PkBuf::empty(0);
 
         for ic in &entry.index_circuits {
-            let Some(unique_col) = ic.unique_col() else { continue };
+            let Some(unique_slice) = ic.unique_cols() else { continue };
             seen.clear();
-            let source_col_idx = unique_col as usize;
-            // A unique index may be on a PK column (e.g. a single member of a
-            // compound PK), whose value lives in the packed PK, not a payload
-            // slot. `locate` resolves that once; `is_null` is false for a PK
-            // column and checks the bitmap for a NULL payload column.
-            let loc = schema.locate(source_col_idx);
+            // Own the column list (`PkColList` is Copy) so it outlives the
+            // `&entry` borrow when passed to the `&mut self` error formatters
+            // on the return paths below.
+            let col_list = gnitz_wire::PkColList::from_slice(unique_slice);
+            let cols = col_list.as_slice();
 
-            let idx_key_size = ic.index_schema.columns[0].size() as usize;
-            let idx_key_type = ic.index_schema.columns[0].type_code;
+            // Per-circuit read/encode plan. A unique index may be on a PK
+            // column (a member of a compound PK), whose value lives in the
+            // packed PK, not a payload slot — the spec's `locate` resolves that.
+            let spec = crate::schema::IndexKeySpec::new(cols, &schema, &ic.index_schema);
+            let idx_key_size = spec.key_size();
             let idx_table = ic.table_mut();
             let mut cursor = idx_table.open_cursor();
 
@@ -252,31 +261,31 @@ impl CatalogEngine {
             // (validation is pre-apply), so a collision against a value retracted
             // *by its current holder* is transient. Pairing on the holder PK —
             // not the value alone — stops a forged `P_other/v@-1` naming a
-            // non-holder from exempting a real `P2/v@+1`.
+            // non-holder from exempting a real `P2/v@+1`. A row with a NULL in
+            // ANY indexed column is not indexed (`key_bytes` → false).
             retracted.clear();
             if has_retractions {
                 for row in 0..batch.count {
                     if batch.get_weight(row) >= 0 { continue; }
-                    if loc.is_null(&mb, row) { continue; }
-                    let key_u128 = loc.native_key(&mb, row);
+                    if !spec.key_bytes(&mb, row, &mut keybuf) { continue; }
                     retracted.insert((
-                        PkBuf::from_bytes(batch.get_pk_bytes(row)), key_u128));
+                        PkBuf::from_bytes(batch.get_pk_bytes(row)), keybuf));
                 }
             }
 
             for row in 0..batch.count {
                 let w = batch.get_weight(row);
                 if w <= 0 { continue; }
-                // PK columns are non-nullable; a NULL payload column is skipped.
-                if loc.is_null(&mb, row) { continue; }
-                let key_u128 = loc.native_key(&mb, row);
+                // PK columns are non-nullable; a row NULL in any indexed column
+                // is skipped (NULL-distinct).
+                if !spec.key_bytes(&mb, row, &mut keybuf) { continue; }
 
                 // One row at weight w is the value w times. On a non-unique_pk
                 // table that is w live instances (enforce_unique_pk collapses
                 // it to one on unique_pk tables) — the same violation as w
                 // separate +1 rows, which `seen` below rejects.
                 if !unique_pk && w > 1 {
-                    return Err(self.unique_violation_err(table_id, source_col_idx, true));
+                    return Err(self.unique_violation_err(table_id, cols, true));
                 }
 
                 // UPSERT iff the row's PK is a net-positive PK in this batch AND
@@ -306,16 +315,15 @@ impl CatalogEngine {
                     entry.handle.has_pk_bytes(batch.get_pk_bytes(row))
                 };
 
-                if !seen.insert(key_u128) {
-                    return Err(self.unique_violation_err(table_id, source_col_idx, true));
+                if !seen.insert(keybuf) {
+                    return Err(self.unique_violation_err(table_id, cols, true));
                 }
 
-                // Index PK layout: leading indexed-key column (OPK-encoded,
-                // idx_key_size bytes) followed by the full source PK bytes —
-                // always idx_key_size + src_pk_stride wide. OPK-encode the native
-                // value and prefix-match the whole leading column.
-                let opk = crate::schema::index_opk_prefix(key_u128, idx_key_type, idx_key_size);
-                if !cursor.cursor.seek_first_positive_with_prefix(&opk[..idx_key_size]) {
+                // Index PK layout: leading indexed-key columns (OPK-encoded,
+                // idx_key_size bytes total) followed by the full source PK bytes —
+                // always idx_key_size + src_pk_stride wide. `keybuf` already holds
+                // the OPK composite span; prefix-match it whole.
+                if !cursor.cursor.seek_first_positive_with_prefix(keybuf.pk_bytes()) {
                     continue;
                 }
                 let pk_bytes = cursor.cursor.current_pk_bytes();
@@ -334,10 +342,10 @@ impl CatalogEngine {
                 // the value at apply. The `upserted_pks` membership test subsumes
                 // the same-PK upsert case (the row's own PK is a positive PK).
                 if retracted.contains(
-                    &(PkBuf::from_bytes(existing_src_pk), key_u128)) { continue; }
+                    &(PkBuf::from_bytes(existing_src_pk), keybuf)) { continue; }
                 if is_upsert && upserted_pks.contains(existing_src_pk) { continue; }
 
-                return Err(self.unique_violation_err(table_id, source_col_idx, false));
+                return Err(self.unique_violation_err(table_id, cols, false));
             }
         }
         Ok(())

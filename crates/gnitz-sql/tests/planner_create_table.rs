@@ -642,16 +642,16 @@ fn test_named_unique_constraint_droppable_by_name() {
 }
 
 #[test]
-fn test_multi_column_unique_rejected() {
+fn test_multi_column_unique_created_droppable_by_autoname() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute(
-        "CREATE TABLE um (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, UNIQUE(a, b))"));
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("multi-column UNIQUE"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
-    }
+    // Composite UNIQUE is now supported; the unnamed index's auto-name joins the
+    // column names with `_` (mirroring CREATE INDEX's `col_names.join("_")`), so
+    // it is droppable by `{schema}__um__idx_a_b`.
+    p.execute(
+        "CREATE TABLE um (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT, UNIQUE(a, b))").unwrap();
+    p.execute(&format!("DROP INDEX {sn}__um__idx_a_b")).unwrap();
 }
 
 #[test]

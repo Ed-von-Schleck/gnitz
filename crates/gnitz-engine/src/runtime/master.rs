@@ -17,7 +17,8 @@ thread_local! {
 
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
-use crate::schema::{pk_native_key, payload_native_key, ColumnLocator, for_each_index_key};
+use crate::schema::{pk_native_key, payload_native_key, IndexKeySpec, SchemaColumn};
+use gnitz_wire::PkColList;
 
 use crate::runtime::sal::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
@@ -81,31 +82,26 @@ enum P1Label {
 /// Side table for interpreting Phase 2 results (unique-index checks).
 enum P2Label {
     /// Non-UPSERT values for one unique index: any hit is a violation.
-    NonUpsert { source_col: usize },
-    /// UPSERT values for one unique index: hits must be verified via
-    /// `fan_out_seek_by_index` to confirm the holder is the same row.
+    /// `col_indices` is the index's full column list, for the composite-aware
+    /// error message.
+    NonUpsert { col_indices: PkColList },
+    /// UPSERT values for one unique index: hits must be verified via a per-holder
+    /// seek to confirm the holder is the same row. `col_indices` drives the seek
+    /// routing and the error; the index schema (PK stride and per-column
+    /// promoted types/widths for the span decode) is read from the positionally
+    /// paired `PipelinedCheck`, which the verify loop still holds.
     Upsert {
-        col_idx: u32,
-        source_col: usize,
-        /// Type and byte width of the leading index column, used to reproduce
-        /// the OPK probe bytes (`index_opk_prefix`) the workers echoed into the
-        /// `occupied` result set — the native lookup key must be encoded the
-        /// same way before the membership test.
-        idx_key_type: u8,
-        idx_key_size: usize,
-        /// Byte width of the index table's PK (the indexed column). Used to
-        /// look up the index key in the `HashSet<PkBuf>` result set.
-        idx_pk_stride: u8,
-        /// (index value, is_upsert) per pending verify. `is_upsert` is true only
-        /// for a genuine upsert target (net-positive committed PK); it gates the
-        /// implicit exemption so a fresh-PK row routed here by `retracted_vals`
-        /// cannot ride a holder's implicit retraction.
-        upsert_keys: Vec<(u128, bool)>,
-        /// (source PK, value) pairs retracted in this batch (value in the same
-        /// key space as `upsert_keys`). At the verify a different holder is exempt
-        /// only when it is retracting the value here; combined with the holder
-        /// being an upserted PK (`existing_pks`), this also admits a bulk shift.
-        retracted_pairs: FxHashSet<(PkBuf, u128)>,
+        col_indices: PkColList,
+        /// (index-value span, is_upsert) per pending verify. `is_upsert` is true
+        /// only for a genuine upsert target (net-positive committed PK); it gates
+        /// the implicit exemption so a fresh-PK row routed here by
+        /// `retracted_vals` cannot ride a holder's implicit retraction.
+        upsert_keys: Vec<(PkBuf, bool)>,
+        /// (source PK, value span) pairs retracted in this batch. At the verify a
+        /// different holder is exempt only when it is retracting the value here;
+        /// combined with the holder being an upserted PK (`existing_pks`), this
+        /// also admits a bulk shift.
+        retracted_pairs: FxHashSet<(PkBuf, PkBuf)>,
     },
     /// UPDATE retired a referenced UNIQUE value that is still present in a
     /// child index: a non-empty result set is a RESTRICT violation.
@@ -141,14 +137,25 @@ enum P2Label {
 //   5. The master event loop is single-threaded, so there is no race
 //      between query, warmup, and ingest.
 
-/// Maximum number of values tracked per `(table_id, col_idx)` filter.
-/// Chosen to bound worst-case memory to ~32 MB/filter (u128 HashSet
-/// overhead ≈ 32 B/entry). Filters that would exceed this disable
-/// themselves.
+/// Maximum number of values tracked per `(table_id, packed_cols)` filter.
+/// Filters that would exceed this disable themselves. Kept at 1M even though a
+/// `PkBuf` key (81 bytes: `[u8; 80]` + len) is ~5× a `u128`'s 16: at the cap,
+/// hashbrown's inline storage (7/8 max load → 2²¹ power-of-two buckets × 82 B)
+/// allocates ≈170 MB per maxed filter, vs ≈36 MB for the old `u128` keys —
+/// bounded, and only reached by a table holding 1M distinct unique values.
+/// Lowering the cap would shrink the broadcast-skip reach (every unique index
+/// with > cap distinct values reverts to always-broadcast on the insert hot
+/// path); the cap stays the lever for a memory-constrained deployment. The
+/// PkBuf width is identical for the single-column ≤16-byte and the composite
+/// cases — one key type, one code path.
 const UNIQUE_FILTER_CAP: usize = 1_000_000;
 
 struct UniqueFilter {
-    values: FxHashSet<u128>,
+    /// The OPK leading-key spans known present in the index. A `PkBuf` holds the
+    /// full composite span at any width, so a `UNIQUE (a, b)` whose span exceeds
+    /// 16 bytes is tracked without truncation (a truncating `u128` could prove a
+    /// present key absent and wrongly skip the broadcast).
+    values: FxHashSet<PkBuf>,
     /// Maximum distinct values tracked: `UNIQUE_FILTER_CAP` in production,
     /// parameterizable so tests exercise the cap discipline cheaply.
     cap: usize,
@@ -175,7 +182,7 @@ impl UniqueFilter {
 
     /// On overflow the set is cleared WHOLE, never truncated: a partial set
     /// would prove "absent" for a present key — a uniqueness hole.
-    fn insert(&mut self, key: u128) {
+    fn insert(&mut self, key: PkBuf) {
         if self.capped { return; }
         self.values.insert(key);
         if self.values.len() > self.cap {
@@ -193,7 +200,9 @@ impl UniqueFilter {
 struct WarmupGuard {
     disp_ptr: *mut MasterDispatcher,
     table_id: i64,
-    cols: Vec<u32>,
+    /// `pack_pk_cols(col_indices)` per cold filter — the `unique_filters` map
+    /// key, so the drop handler removes exactly the entries this warmup created.
+    keys: Vec<u64>,
     disarmed: bool,
 }
 
@@ -202,8 +211,8 @@ impl Drop for WarmupGuard {
         if !self.disarmed {
             unsafe {
                 let disp = &mut *self.disp_ptr;
-                for &col in &self.cols {
-                    disp.unique_filter_remove_col(self.table_id, col);
+                for &packed in &self.keys {
+                    disp.unique_filter_remove(self.table_id, packed);
                 }
             }
         }
@@ -213,29 +222,34 @@ impl Drop for WarmupGuard {
 // Safety: WarmupGuard is only used inside the single-threaded master event loop.
 unsafe impl Send for WarmupGuard {}
 
-/// Column-extraction descriptor for one unique index on a table.
-/// Precomputed so the hot update path avoids catalog reborrows per row.
-/// `col_idx` keys the `unique_filters` map; `loc` is the resolved
-/// PK-or-payload read for the indexed column's value.
+/// Column-extraction descriptor for one unique index on a table, `Copy` (built
+/// fresh per batch on the hot ingest path — no heap allocation). `packed`
+/// (= `pack_pk_cols(col_indices)`) keys the `unique_filters` map and is the
+/// exact `IDXTAB_PAY_SOURCE_COLS` value, so seed/drop/warmup all derive the
+/// same key; `spec` is the per-circuit span encode plan.
 #[derive(Clone, Copy)]
 struct UniqueIndexDesc {
-    col_idx: u32,
-    loc: ColumnLocator,
+    packed: u64,
+    spec: IndexKeySpec,
 }
 
-/// Walk every positive-weight, non-null row of `batch` and insert the
-/// indexed-column value into `filter`. Respects the filter's capped state by
-/// stopping the walk once the filter caps. Thin caller of `for_each_index_key`
-/// so the key contract is shared with the CREATE-time validator.
+/// Walk every positive-weight, non-null row of `batch` and insert the indexed
+/// columns' OPK leading-key span into `filter`. Respects the filter's capped
+/// state by stopping the walk once the filter caps. A row with a NULL in any
+/// indexed column is skipped (`key_bytes` → false), sharing the NULL-distinct
+/// key contract with the CREATE-time validator and the projection.
 fn extract_into_filter(
     filter: &mut UniqueFilter,
     batch: &crate::storage::MemBatch<'_>,
-    loc: ColumnLocator,
+    spec: &IndexKeySpec,
 ) {
-    for_each_index_key(batch, loc, |key, _w| {
-        filter.insert(key);
-        !filter.capped // stop walking once the filter caps
-    });
+    let mut keybuf = PkBuf::empty(0);
+    for row in 0..batch.count {
+        if batch.get_weight(row) <= 0 { continue; }
+        if !spec.key_bytes(batch, row, &mut keybuf) { continue; }
+        filter.insert(keybuf);
+        if filter.capped { return; } // stop walking once the filter caps
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,9 +279,12 @@ pub struct MasterDispatcher {
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
     router: PartitionRouter,
-    /// Per-(table_id, unique_col_idx) filter skipping redundant Phase 2
-    /// unique-index broadcasts. See the UniqueFilter comment block above.
-    unique_filters: FxHashMap<(i64, u32), UniqueFilter>,
+    /// Per-(table_id, packed_col_list) filter skipping redundant Phase 2
+    /// unique-index broadcasts. The `u64` is `pack_pk_cols(col_indices)` — the
+    /// same value stored in `IDXTAB_PAY_SOURCE_COLS` — so a composite index is
+    /// identified by its whole column list, and dropping `(a, b)` never touches a
+    /// distinct single-column filter on `a`. See the UniqueFilter comment block.
+    unique_filters: FxHashMap<(i64, u64), UniqueFilter>,
 
     /// Per-`target_id` pool of `Batch`es reused by `build_check_batch` for
     /// FK / unique-index validation. After the awaited pipeline returns,
@@ -792,9 +809,16 @@ impl MasterDispatcher {
         if n_idx == 0 { return; }
 
         for ci in 0..n_idx {
-            // The routing cache is keyed (table, col); only unique circuits
-            // (single-column) participate.
-            let Some(col_idx) = cat.unique_index_circuit_col(target_id, ci) else { continue };
+            // The routing cache is keyed (table, col, u128); only SINGLE-COLUMN
+            // unique circuits populate it. A composite unique seek
+            // broadcasts-and-merges instead — widening the cache's unbounded
+            // per-distinct-value map to composite `PkBuf` keys would grow every
+            // entry ~5× for the dominant single-column population — so its
+            // routing is never recorded.
+            let col_idx = match cat.unique_index_circuit_cols(target_id, ci) {
+                Some(c) if c.len() == 1 => c[0],
+                _ => continue,
+            };
             for (w, wi) in worker_indices[..self.num_workers].iter().enumerate() {
                 if !wi.is_empty() {
                     self.router.record_routing_from_source(
@@ -960,6 +984,55 @@ impl MasterDispatcher {
             }
         }
         Ok(acc)
+    }
+
+    /// Resolve the committed holder of a unique index value: seek the index by
+    /// the value's native per-column keys and return the holder's source PK (or
+    /// `None`). Used by the UPSERT verify, which must confirm a colliding
+    /// committed value is held by the same row (or a row releasing it in this
+    /// batch); the caller decodes the OPK span to `natives` via
+    /// `span_to_natives`.
+    ///
+    /// Arity gates the routing: a single-column unique seek keeps the unicast
+    /// routing-cache fast path (the common same-PK upsert whose value is
+    /// unchanged lands here, so it is hot); a composite unique seek
+    /// broadcasts-and-merges (the routing cache stays single-column — see
+    /// `record_index_routing`), with the trailing native values riding
+    /// `seek_pk_extra` as 16-byte LE slots, the exact wire form the worker's
+    /// SeekByIndex handler reassembles. A unique index yields at most one
+    /// holder, so merging one row is correct.
+    async fn seek_unique_holder(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        target_id: i64,
+        col_indices: PkColList,
+        natives: [u128; gnitz_wire::PK_LIST_MAX_COLS],
+    ) -> Result<Option<PkBuf>, String> {
+        let cols = col_indices.as_slice();
+        if cols.len() == 1 {
+            // single-column unique: unicast to the one owning worker (routing cache).
+            let slot = Self::fan_out_seek_by_index_async(
+                disp_ptr, reactor, sal_excl, target_id, cols[0], natives[0]).await?;
+            let ctrl = peek_control_block(slot.bytes()).map_err(|e| e.to_string())?;
+            if ctrl.flags & FLAG_HAS_DATA == 0 { return Ok(None); }
+            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
+                slot.bytes(), ctrl.block_size, ctrl, None).map_err(|e| e.to_string())?;
+            Ok(zc.data_batch.filter(|b| b.count > 0)
+                .map(|b| PkBuf::from_bytes(b.get_pk_bytes(0))))
+        } else {
+            // composite unique: broadcast-and-merge. natives[0] → seek_pk;
+            // natives[1..] → 16-byte LE slots in seek_pk_extra.
+            let mut extra = [0u8; (gnitz_wire::PK_LIST_MAX_COLS - 1) * 16];
+            for (slot, &v) in extra.chunks_exact_mut(16).zip(&natives[1..cols.len()]) {
+                slot.copy_from_slice(&v.to_le_bytes());
+            }
+            let batch = Self::fan_out_seek_by_index_collect_async(
+                disp_ptr, reactor, sal_excl, target_id,
+                gnitz_wire::pack_pk_cols(cols), natives[0],
+                &extra[..(cols.len() - 1) * 16]).await?;
+            Ok(batch.filter(|b| b.count > 0).map(|b| PkBuf::from_bytes(b.get_pk_bytes(0))))
+        }
     }
 
     /// Fan out a SCAN to all workers, forward every response frame directly
@@ -1336,8 +1409,8 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     /// Collect column-extraction descriptors for every unique index on
-    /// `table_id` — one `(col_idx, ColumnLocator)` per unique circuit, the shape
-    /// `for_each_index_key` consumes.
+    /// `table_id` — the filter-map key plus the span encode plan per unique
+    /// circuit, the shape `extract_into_filter` consumes.
     fn unique_index_descriptors(
         &mut self, table_id: i64,
     ) -> Option<(SchemaDescriptor, Vec<UniqueIndexDesc>)> {
@@ -1347,20 +1420,27 @@ impl MasterDispatcher {
 
         let mut out: Vec<UniqueIndexDesc> = Vec::new();
         for ci in 0..n_circuits {
-            let Some(col_idx) = cat.unique_index_circuit_col(table_id, ci) else { continue };
-            out.push(UniqueIndexDesc { col_idx, loc: schema.locate(col_idx as usize) });
+            let Some(cols) = cat.unique_index_circuit_cols(table_id, ci) else { continue };
+            let idx_schema = match cat.get_index_circuit_schema(table_id, ci) {
+                Some(s) => s,
+                None => continue,
+            };
+            out.push(UniqueIndexDesc {
+                packed: gnitz_wire::pack_pk_cols(cols),
+                spec: IndexKeySpec::new(cols, &schema, &idx_schema),
+            });
         }
         if out.is_empty() { None } else { Some((schema, out)) }
     }
 
     /// True if every key in `keys` is definitely absent from the filter
-    /// for `(table_id, col_idx)`. Returns false if the filter is capped,
+    /// for `(table_id, packed)`. Returns false if the filter is capped,
     /// not warm (caller is expected to warm it first), or contains any
     /// key. On false, caller must fall through to the Phase 2 broadcast.
     fn unique_filter_all_absent(
-        &self, table_id: i64, col_idx: u32, keys: &[u128],
+        &self, table_id: i64, packed: u64, keys: &[PkBuf],
     ) -> bool {
-        let filter = match self.unique_filters.get(&(table_id, col_idx)) {
+        let filter = match self.unique_filters.get(&(table_id, packed)) {
             Some(f) => f,
             None => return false,
         };
@@ -1381,12 +1461,12 @@ impl MasterDispatcher {
         };
         let mb = batch.as_mem_batch();
         for d in descs {
-            let filter = match self.unique_filters.get_mut(&(table_id, d.col_idx)) {
+            let filter = match self.unique_filters.get_mut(&(table_id, d.packed)) {
                 Some(f) => f,
                 None => continue, // not warm — warmup will pick this up
             };
             if filter.capped { continue; }
-            extract_into_filter(filter, &mb, d.loc);
+            extract_into_filter(filter, &mb, &d.spec);
         }
     }
 
@@ -1400,11 +1480,13 @@ impl MasterDispatcher {
         self.check_batch_pool.remove(&table_id);
     }
 
-    /// Remove the unique-filter entry for a single (owner_table_id, col_idx)
-    /// pair. Called on DROP INDEX so subsequent INSERTs re-trigger warmup for
-    /// the now-absent index while leaving unrelated filters on the same table.
-    pub(crate) fn unique_filter_remove_col(&mut self, owner_id: i64, col_idx: u32) {
-        self.unique_filters.remove(&(owner_id, col_idx));
+    /// Remove the unique-filter entry for a single (owner_table_id, packed)
+    /// pair. `packed` is the `pack_pk_cols(col_indices)` / `IDXTAB_PAY_SOURCE_COLS`
+    /// value. Called on DROP INDEX so subsequent INSERTs re-trigger warmup for
+    /// the now-absent index while leaving unrelated filters on the same table; a
+    /// non-existent key (e.g. a non-unique FK index) is a harmless no-op.
+    pub(crate) fn unique_filter_remove(&mut self, owner_id: i64, packed: u64) {
+        self.unique_filters.remove(&(owner_id, packed));
     }
 
     // -----------------------------------------------------------------------
@@ -1913,13 +1995,16 @@ impl MasterDispatcher {
         // across indices (`retracted_pairs` is moved into the label below, so it
         // is rebuilt each index).
         let has_retractions = (0..batch.count).any(|i| batch.get_weight(i) < 0);
-        let mut retracted_vals: FxHashSet<u128> = FxHashSet::default();
+        let mut retracted_vals: FxHashSet<PkBuf> = FxHashSet::default();
+        // Reused scratch the per-row OPK leading-key span is written into; each
+        // `key_bytes` call overwrites it. No per-row allocation.
+        let mut keybuf = PkBuf::empty(0);
 
         for ci in 0..n_circuits {
-            let (col_idx, idx_schema) = unsafe {
+            let (col_indices, idx_schema) = unsafe {
                 let disp = &mut *disp_ptr;
                 let cat = &mut *disp.catalog;
-                let col_idx = match cat.unique_index_circuit_col(target_id, ci) {
+                let cols = match cat.unique_index_circuit_cols(target_id, ci) {
                     Some(c) => c,
                     None => continue,
                 };
@@ -1927,37 +2012,37 @@ impl MasterDispatcher {
                     Some(s) => s,
                     None => continue,
                 };
-                (col_idx, idx_schema)
+                // Own the list (PkColList is Copy) so it survives the catalog
+                // borrow and feeds the P2Label / error formatters.
+                (PkColList::from_slice(cols), idx_schema)
             };
+            let cols = col_indices.as_slice();
 
-            let source_col = col_idx as usize;
-            // Decode the indexed column to its canonical u128 key. `locate`
-            // resolves the PK-or-payload read once: a PK source column (a member
-            // of a compound PK) reads from the packed PK region, a payload column
-            // from its dense slot. `native_key` (not the OPK-widened `get_pk`) is
-            // correct for every width/signedness — `get_pk` would feed
-            // `index_opk_prefix` a re-OPK-encode, double-flipping a signed single
-            // PK. `is_null` is false for PK and checks the bit for a payload col.
-            let loc = source_schema.locate(source_col);
+            // Per-circuit read/encode plan: `key_bytes` builds the OPK
+            // leading-key span — null-correct (skip on any NULL) and
+            // equality-correct at any width.
+            let spec = IndexKeySpec::new(cols, &source_schema, &idx_schema);
+            // The (table, this) filter-map key AND the worker's index-store hint —
+            // a single-column hint cannot locate a composite index.
+            let packed = gnitz_wire::pack_pk_cols(cols);
 
-            // Index-column key is always ≤ 16 bytes → u128. `upsert_keys` carries
-            // the row's own `is_upsert` flag (the row PK is no longer read at the
-            // verify). `check_keys`/`seen` take every positive row on a pure
-            // INSERT — size them to `batch.count` to skip growth reallocs on the
-            // hot path; `upsert_keys` stays `Vec::new()` (empty on an insert-only
-            // batch).
-            let mut upsert_keys: Vec<(u128, bool)> = Vec::new();
-            let mut check_keys: Vec<u128> = Vec::with_capacity(batch.count);
-            let mut seen: FxHashSet<u128> =
+            // `upsert_keys` carries the row's own `is_upsert` flag (the row PK is
+            // no longer read at the verify). `check_keys`/`seen` take every
+            // positive row on a pure INSERT — size them to `batch.count` to skip
+            // growth reallocs on the hot path; `upsert_keys` stays `Vec::new()`
+            // (empty on an insert-only batch).
+            let mut upsert_keys: Vec<(PkBuf, bool)> = Vec::new();
+            let mut check_keys: Vec<PkBuf> = Vec::with_capacity(batch.count);
+            let mut seen: FxHashSet<PkBuf> =
                 FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
 
             // `retracted_vals` routes a fresh-PK insertion of a retracted value
             // into the verify path (where the holder is discovered);
-            // `retracted_pairs` carries the precise `(holder PK, value)` check into
-            // it. `retracted_pairs` is moved into the label below (so it is rebuilt
-            // per index), and is sized only when the batch actually retracts.
+            // `retracted_pairs` carries the precise `(holder PK, value span)` check
+            // into it. `retracted_pairs` is moved into the label below (so it is
+            // rebuilt per index), and is sized only when the batch actually retracts.
             retracted_vals.clear();
-            let mut retracted_pairs: FxHashSet<(PkBuf, u128)> = if has_retractions {
+            let mut retracted_pairs: FxHashSet<(PkBuf, PkBuf)> = if has_retractions {
                 FxHashSet::with_capacity_and_hasher(batch.count, Default::default())
             } else {
                 FxHashSet::default()
@@ -1965,10 +2050,9 @@ impl MasterDispatcher {
             if has_retractions {
                 for i in 0..batch.count {
                     if batch.get_weight(i) >= 0 { continue; }
-                    if loc.is_null(&mb, i) { continue; }
-                    let key = loc.native_key(&mb, i);
-                    retracted_vals.insert(key);
-                    retracted_pairs.insert((PkBuf::from_bytes(batch.get_pk_bytes(i)), key));
+                    if !spec.key_bytes(&mb, i, &mut keybuf) { continue; }
+                    retracted_vals.insert(keybuf);
+                    retracted_pairs.insert((PkBuf::from_bytes(batch.get_pk_bytes(i)), keybuf));
                 }
             }
 
@@ -1976,9 +2060,8 @@ impl MasterDispatcher {
                 let w = batch.get_weight(i);
                 if w <= 0 { continue; }
 
-                if loc.is_null(&mb, i) { continue; }
-
-                let key = loc.native_key(&mb, i);
+                // A row NULL in any indexed column is not indexed (NULL-distinct).
+                if !spec.key_bytes(&mb, i, &mut keybuf) { continue; }
 
                 // One row at weight w is the value w times. On a non-unique_pk
                 // table that is w live instances (enforce_unique_pk collapses
@@ -1986,7 +2069,7 @@ impl MasterDispatcher {
                 // separate +1 rows, which `seen` below rejects.
                 if !unique_pk && w > 1 {
                     return Err(unsafe {
-                        (*disp_ptr).unique_violation_err(target_id, source_col, true)
+                        (*disp_ptr).unique_violation_err(target_id, cols, true)
                     });
                 }
 
@@ -1994,9 +2077,9 @@ impl MasterDispatcher {
                 // rows, INCLUDING UPSERTs: two rows setting the same new unique
                 // value in one transaction is a violation regardless of whether
                 // their PKs already exist.
-                if !seen.insert(key) {
+                if !seen.insert(keybuf) {
                     return Err(unsafe {
-                        (*disp_ptr).unique_violation_err(target_id, source_col, true)
+                        (*disp_ptr).unique_violation_err(target_id, cols, true)
                     });
                 }
 
@@ -2007,30 +2090,38 @@ impl MasterDispatcher {
                 // existing PK is NOT an upsert (no enforce_unique_pk), so it must
                 // take the broadcast path where any committed hit is a violation.
                 let is_upsert = unique_pk && existing_pks.contains(batch.get_pk_bytes(i));
-                if is_upsert || retracted_vals.contains(&key) {
+                if is_upsert || retracted_vals.contains(&keybuf) {
                     // Carry the row's own `is_upsert`: a fresh-PK row routed here by
                     // a value in `retracted_vals` must get only the
                     // explicit-retraction exemption at the verify, never the
                     // implicit one.
-                    upsert_keys.push((key, is_upsert));
+                    upsert_keys.push((keybuf, is_upsert));
                     continue;
                 }
-                check_keys.push(key);
+                check_keys.push(keybuf);
             }
+
+            // Unique check batches zero-pad each OPK span to the index PK stride
+            // (leading span = the value, suffix = zero — byte-identical to the old
+            // single-column `build_check_batch`): `padded` is sound because
+            // `key_bytes` keeps the tail past the span zero.
+            let stride = idx_schema.pk_stride() as usize;
 
             if !check_keys.is_empty() {
                 let skip_broadcast = unsafe {
-                    (*disp_ptr).unique_filter_all_absent(target_id, col_idx, &check_keys)
+                    (*disp_ptr).unique_filter_all_absent(target_id, packed, &check_keys)
                 };
 
                 if !skip_broadcast {
                     let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
-                    let chk_batch = build_check_batch(&idx_schema, &check_keys, pooled);
-                    p2_labels.push(P2Label::NonUpsert { source_col });
+                    let chk_batch = build_check_batch_with(
+                        &idx_schema, &check_keys, pooled,
+                        |b, k| b.extend_pk_bytes(k.padded(stride)));
+                    p2_labels.push(P2Label::NonUpsert { col_indices });
                     p2_checks.push(PipelinedCheck {
                         target_id,
                         flags: FLAG_HAS_PK,
-                        col_hint: gnitz_wire::pack_pk_cols(&[col_idx]),
+                        col_hint: packed,
                         payload: Some(CheckPayload::Broadcast(chk_batch)),
                         schema: idx_schema,
                     });
@@ -2038,20 +2129,17 @@ impl MasterDispatcher {
             }
 
             if !upsert_keys.is_empty() {
-                let u_keys: Vec<u128> = upsert_keys.iter().map(|&(k, _)| k).collect();
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
-                let u_batch = build_check_batch(&idx_schema, &u_keys, pooled);
-                let idx_pk_stride = idx_schema.pk_stride();
-                let idx_key_type = idx_schema.columns[0].type_code;
-                let idx_key_size = idx_schema.columns[0].size() as usize;
+                let u_batch = build_check_batch_with(
+                    &idx_schema, &upsert_keys, pooled,
+                    |b, (k, _)| b.extend_pk_bytes(k.padded(stride)));
                 p2_labels.push(P2Label::Upsert {
-                    col_idx, source_col, idx_key_type, idx_key_size, idx_pk_stride,
-                    upsert_keys, retracted_pairs,
+                    col_indices, upsert_keys, retracted_pairs,
                 });
                 p2_checks.push(PipelinedCheck {
                     target_id,
                     flags: FLAG_HAS_PK,
-                    col_hint: gnitz_wire::pack_pk_cols(&[col_idx]),
+                    col_hint: packed,
                     payload: Some(CheckPayload::Broadcast(u_batch)),
                     schema: idx_schema,
                 });
@@ -2081,10 +2169,10 @@ impl MasterDispatcher {
 
         for (idx, label) in p2_labels.iter().enumerate() {
             match label {
-                P2Label::NonUpsert { source_col } => {
+                P2Label::NonUpsert { col_indices } => {
                     if !p2_results[idx].is_empty() {
                         return Err(unsafe {
-                            (*disp_ptr).unique_violation_err(target_id, *source_col, false)
+                            (*disp_ptr).unique_violation_err(target_id, col_indices.as_slice(), false)
                         });
                     }
                 }
@@ -2102,69 +2190,60 @@ impl MasterDispatcher {
                         ));
                     }
                 }
-                P2Label::Upsert { col_idx, source_col, idx_key_type, idx_key_size,
-                                  idx_pk_stride, upsert_keys, retracted_pairs } => {
+                P2Label::Upsert { col_indices, upsert_keys, retracted_pairs } => {
                     // Fan out all seeks before collecting: sal_excl is released
                     // before each reply wait, so the seek futures run
                     // concurrently rather than serializing one RTT per key.
                     let occupied = &p2_results[idx];
-                    // Each pending entry carries the index value and the row's own
-                    // `is_upsert` flag; the row PK no longer participates (the
+                    // The positionally paired check still holds the index schema
+                    // (reclaim_check_batches takes only the payload).
+                    let idx_schema = &p2_checks[idx].schema;
+                    let stride = idx_schema.pk_stride() as usize;
+                    let idx_cols = &idx_schema.columns[..col_indices.as_slice().len()];
+                    // Each pending entry carries the index-value span and the row's
+                    // own `is_upsert` flag; the row PK no longer participates (the
                     // same-PK case is subsumed by `existing_pks.contains(found_pk)`).
-                    let mut pending: Vec<(u128, bool)> = Vec::new();
+                    let mut pending: Vec<(PkBuf, bool)> = Vec::new();
                     let mut futs = Vec::new();
                     for &(key_pk, is_upsert) in upsert_keys {
-                        // occupied holds index-table PKs as the probe wrote them:
-                        // index_opk_prefix(native key) ++ zero suffix — i.e. OPK
-                        // bytes, not native LE. Reproduce that encoding exactly
-                        // before the membership test (the returned buf is zero-
-                        // filled past idx_key_size, so one slice covers narrow and
-                        // wide index PKs).
-                        let buf = crate::schema::index_opk_prefix(key_pk, *idx_key_type, *idx_key_size);
-                        if !occupied.contains(&buf[..*idx_pk_stride as usize]) { continue; }
+                        // occupied holds index PKs at full stride, zero-suffixed
+                        // (the probe wrote the OPK span padded to the stride).
+                        // `key_pk` is already that OPK span — pad to the stride and
+                        // test directly; do NOT re-OPK-encode an encoded span.
+                        if !occupied.contains(key_pk.padded(stride)) { continue; }
                         pending.push((key_pk, is_upsert));
                         // async fn futures are !Unpin; box-pin for join_all_unpin.
-                        futs.push(Box::pin(Self::fan_out_seek_by_index_async(
-                            disp_ptr, reactor, sal_excl, target_id, *col_idx, key_pk,
+                        // One homogeneous future type (all inputs Copy, no `dyn`):
+                        // `seek_unique_holder` gates arity internally.
+                        futs.push(Box::pin(Self::seek_unique_holder(
+                            disp_ptr, reactor, sal_excl, target_id,
+                            *col_indices, span_to_natives(&key_pk, idx_cols),
                         )));
                     }
-                    let slots = crate::runtime::reactor::join_all_unpin(futs).await;
-                    for ((key_pk, is_upsert), slot_result) in pending.into_iter().zip(slots) {
-                        let slot = slot_result?;
-                        let ctrl = peek_control_block(slot.bytes())
-                            .map_err(|e| e.to_string())?;
-                        if ctrl.flags & FLAG_HAS_DATA != 0 {
-                            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
-                                slot.bytes(), ctrl.block_size, ctrl, None,
-                            ).map_err(|e| e.to_string())?;
-                            if let Some(ref found) = zc.data_batch {
-                                if found.count > 0 {
-                                    let found_pk = found.get_pk_bytes(0);
-                                    // The committed holder is acceptable only if it
-                                    // releases this value in this batch. Implicit
-                                    // release (holder is itself an upserted PK, so
-                                    // enforce_unique_pk retracts its committed row —
-                                    // covers a same-PK re-upsert and a bulk shift)
-                                    // applies ONLY when the colliding row is also an
-                                    // upsert: `is_upsert` implies `unique_pk &&
-                                    // existing_pks.contains(row_pk)`. A fresh-PK row
-                                    // routed here by `retracted_vals` has
-                                    // is_upsert=false, so it cannot ride the holder's
-                                    // implicit retraction and land a second live
-                                    // holder. Explicit release (holder retracts this
-                                    // exact (PK, value) pair) needs no such gate and
-                                    // admits a transfer onto a fresh PK. `seen`
-                                    // already barred two live rows sharing the value.
-                                    let exempt = (is_upsert && existing_pks.contains(found_pk))
-                                        || retracted_pairs.contains(
-                                            &(PkBuf::from_bytes(found_pk), key_pk));
-                                    if !exempt {
-                                        return Err(unsafe {
-                                            (*disp_ptr).unique_violation_err(target_id, *source_col, false)
-                                        });
-                                    }
-                                }
-                            }
+                    let holders = crate::runtime::reactor::join_all_unpin(futs).await;
+                    for ((key_pk, is_upsert), holder_result) in pending.into_iter().zip(holders) {
+                        // A unique index yields at most one holder; the merged
+                        // `Option<PkBuf>` is the committed holder's source PK.
+                        let Some(found_pk) = holder_result? else { continue };
+                        // The committed holder is acceptable only if it releases
+                        // this value in this batch. Implicit release (holder is
+                        // itself an upserted PK, so enforce_unique_pk retracts its
+                        // committed row — covers a same-PK re-upsert and a bulk
+                        // shift) applies ONLY when the colliding row is also an
+                        // upsert: `is_upsert` implies `unique_pk &&
+                        // existing_pks.contains(row_pk)`. A fresh-PK row routed here
+                        // by `retracted_vals` has is_upsert=false, so it cannot ride
+                        // the holder's implicit retraction and land a second live
+                        // holder. Explicit release (holder retracts this exact
+                        // (PK, value span) pair) needs no such gate and admits a
+                        // transfer onto a fresh PK. `seen` already barred two live
+                        // rows sharing the value.
+                        let exempt = (is_upsert && existing_pks.contains(found_pk.pk_bytes()))
+                            || retracted_pairs.contains(&(found_pk, key_pk));
+                        if !exempt {
+                            return Err(unsafe {
+                                (*disp_ptr).unique_violation_err(target_id, col_indices.as_slice(), false)
+                            });
                         }
                     }
                 }
@@ -2201,17 +2280,17 @@ impl MasterDispatcher {
                 None => return Ok(()),
             };
             let missing: Vec<UniqueIndexDesc> = descs.into_iter()
-                .filter(|d| !disp.unique_filters.contains_key(&(table_id, d.col_idx)))
+                .filter(|d| !disp.unique_filters.contains_key(&(table_id, d.packed)))
                 .collect();
             if missing.is_empty() { return Ok(()); }
             for d in &missing {
-                disp.unique_filters.insert((table_id, d.col_idx), UniqueFilter::new());
+                disp.unique_filters.insert((table_id, d.packed), UniqueFilter::new());
             }
-            let missing_cols: Vec<u32> = missing.iter().map(|d| d.col_idx).collect();
+            let missing_keys: Vec<u64> = missing.iter().map(|d| d.packed).collect();
             let guard = WarmupGuard {
                 disp_ptr,
                 table_id,
-                cols: missing_cols,
+                keys: missing_keys,
                 disarmed: false,
             };
             (missing, guard)
@@ -2236,8 +2315,10 @@ impl MasterDispatcher {
         let scan_result = drain_index_scan(slots, &req_ids, reactor, |mb| unsafe {
             let disp = &mut *disp_ptr;
             for d in &missing {
-                if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
-                    if !filter.capped { extract_into_filter(filter, mb, d.loc); }
+                if let Some(filter) = disp.unique_filters.get_mut(&(table_id, d.packed)) {
+                    if !filter.capped {
+                        extract_into_filter(filter, mb, &d.spec);
+                    }
                 }
             }
         }).await;
@@ -2251,7 +2332,7 @@ impl MasterDispatcher {
             Ok(()) => {
                 let disp = unsafe { &mut *disp_ptr };
                 for d in &missing {
-                    if let Some(f) = disp.unique_filters.get_mut(&(table_id, d.col_idx)) {
+                    if let Some(f) = disp.unique_filters.get_mut(&(table_id, d.packed)) {
                         f.warm = true;
                     }
                 }
@@ -2266,20 +2347,21 @@ impl MasterDispatcher {
     }
 
     /// Pre-flight global uniqueness check for CREATE UNIQUE INDEX, distributed:
-    /// each worker projects its committed partition to the indexed column's
-    /// native u128 keys, sorts them locally, and streams the SORTED keys back;
-    /// the master runs a streaming k-way merge (`merge_index_scan`) whose
-    /// single adjacent-equal check catches both within-partition and
-    /// cross-partition duplicates that no per-worker `backfill_index` can see.
-    /// Master memory is `O(num_workers)` plus the (≤ cap) filter seed — never
-    /// the table's distinct-key cardinality. The u128 key is lossless and
-    /// injective for every type a unique index permits (`get_index_key_type`
-    /// rejects floats/STRING/BLOB; fixed-width values zero-extend), so u128
-    /// equality ⟺ index-value equality and ascending u128 order is a valid
-    /// merge order.
+    /// each worker projects its committed partition to the indexed columns' OPK
+    /// leading-key spans, sorts them locally (byte-lexicographic), and streams
+    /// the SORTED spans back; the master runs a streaming k-way merge
+    /// (`merge_index_scan`) whose single adjacent-equal check catches both
+    /// within-partition and cross-partition duplicates that no per-worker
+    /// `backfill_index` can see. Master memory is `O(num_workers)` plus the
+    /// (≤ cap) filter seed — never the table's distinct-key cardinality. The OPK
+    /// leading-key span is lossless and injective for every type a unique index
+    /// permits (`index_key_type` rejects floats/STRING/BLOB), so byte equality ⟺
+    /// index-value equality and byte-lexicographic order is a valid merge order
+    /// at any width — replacing the old numeric `u128` order, which a composite
+    /// key has no meaningful value for.
     ///
     /// On success the index is safe to commit and broadcast and the returned
-    /// distinct key set seeds the master's unique filter; on failure the
+    /// distinct span set seeds the master's unique filter; on failure the
     /// caller returns a client error and never broadcasts, so no worker
     /// reaches the fatal `DdlSync` backfill path.
     ///
@@ -2289,60 +2371,65 @@ impl MasterDispatcher {
     /// backfill and no concurrent INSERT can be ordered between the snapshot and
     /// the backfill.
     ///
-    /// An out-of-range `col_idx` yields an empty set (nothing to validate).
+    /// An unknown table yields an empty set (nothing to validate).
     pub async fn validate_unique_index_create_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
         owner_id: i64,
-        col_idx: u32,
-    ) -> Result<(FxHashSet<u128>, bool), String> {
-        // An unknown table or out-of-range `col_idx` ⇒ nothing to validate
-        // (the DDL layer validates the user's column before reaching here).
-        // Bound on `num_columns()`, not the fixed `columns` array capacity
-        // (MAX_COLUMNS), which would accept out-of-range indices.
-        let pk_trivially_unique = unsafe {
+        col_indices: &[u32],
+    ) -> Result<(FxHashSet<PkBuf>, bool), String> {
+        let (idx_schema, packed) = unsafe {
             let cat = &mut *(*disp_ptr).catalog;
-            match cat.get_schema_desc(owner_id) {
-                Some(s) if (col_idx as usize) < s.num_columns() => {
-                    cat.col_is_enforced_unique_pk(owner_id, col_idx)
-                }
-                _ => return Ok((FxHashSet::default(), false)),
+            let owner_schema = match cat.get_schema_desc(owner_id) {
+                Some(s) => s,
+                None => return Ok((FxHashSet::default(), false)),
+            };
+            // Trivial-uniqueness short-circuit, generalised to the compound PK:
+            // a composite index whose columns equal the table's enforced-unique
+            // PK (in any order) can never collide, so the scan is skipped.
+            // `group_cols_eq_pk` is order-insensitive set equality and returns
+            // false for an out-of-range index, so no separate bounds check is
+            // needed; it subsumes the old sole-PK-column case exactly. The
+            // empty uncapped seed is NOT the committed value set (the scan is
+            // skipped), but warm-empty stays sound: value-equality is
+            // PK-equality here, and rows whose PK is committed never reach
+            // `check_keys` (Error mode fails the Phase-1 PK check; upsert mode
+            // routes them to the always-broadcast upsert path), so every
+            // `check_keys` key carries a fresh PK — hence a fresh value — and
+            // "absent" is always the correct verdict.
+            if cat.table_has_unique_pk(owner_id) && owner_schema.group_cols_eq_pk(col_indices) {
+                return Ok((FxHashSet::default(), false));
             }
+            // Build the index schema (the circuit is not registered until this
+            // pre-flight succeeds) for the merge's reply-frame layout and the
+            // promoted per-column widths. Identical inputs to each worker's own
+            // build, so the frame schema agrees by construction. `packed` is
+            // the column list the worker resolves the seek by.
+            (crate::catalog::make_index_schema(col_indices, &owner_schema)?,
+             gnitz_wire::pack_pk_cols(col_indices))
         };
-        // PK short-circuit: an enforced-unique sole-PK column cannot hold two
-        // live rows with the same value (see `col_is_enforced_unique_pk` for
-        // why both halves of that predicate are load-bearing), so the scan
-        // cannot find a duplicate. The empty uncapped seed is NOT the
-        // committed value set (the scan is skipped), but warm-empty stays
-        // sound: on this column value-equality is PK-equality, and rows whose
-        // PK is committed never reach `check_keys` (Error mode fails the
-        // Phase-1 PK check; upsert mode routes them to the always-broadcast
-        // upsert path), so every `check_keys` key carries a fresh PK — hence
-        // a fresh value — and "absent" is always the correct verdict.
-        if pk_trivially_unique {
-            return Ok((FxHashSet::default(), false));
-        }
+        let frame_schema = unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
-        // Fan out the pre-flight command (col_idx rides in seek_col_idx); each
-        // worker answers with its sorted-key continuation-frame train.
-        // `_lease` held across the full merge below; the merge drains every
-        // worker's whole train, so the gate must stay open until the merge
-        // (or a cancellation) ends.
+        // Fan out the pre-flight command (the packed column list rides in
+        // seek_col_idx); each worker answers with its sorted-span
+        // continuation-frame train. `_lease` held across the full merge below;
+        // the merge drains every worker's whole train, so the gate must stay open
+        // until the merge (or a cancellation) ends.
         let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(owner_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
                 owner_id, lsn, FLAG_UNIQUE_PREFLIGHT, 0, &[], &schema, &col_names,
-                0, col_idx as u64, req_ids, -1, 0, None, &[],
+                0, packed, req_ids, -1, 0, None, &[],
             )
         })
         .await?;
 
-        let merged = merge_index_scan(slots, &req_ids, reactor).await?;
+        let merged = merge_index_scan(slots, &req_ids, reactor, &frame_schema).await?;
         if merged.duplicate {
             return Err(unsafe {
-                (*disp_ptr).unique_create_dup_err(owner_id, col_idx as usize)
+                (*disp_ptr).unique_create_dup_err(owner_id, col_indices)
             });
         }
         Ok(merged.into_seed())
@@ -2355,9 +2442,9 @@ impl MasterDispatcher {
     /// empty) publishes a warm+capped filter: `unique_filter_all_absent` then
     /// always falls through to the broadcast — the same steady state the lazy
     /// warmup converges to, without paying a redundant full-cluster scan on
-    /// the first INSERT. Symmetric counterpart of `unique_filter_remove_col`.
+    /// the first INSERT. Symmetric counterpart of `unique_filter_remove`.
     pub(crate) fn unique_filter_seed(
-        &mut self, table_id: i64, col_idx: u32, seen: FxHashSet<u128>, capped: bool,
+        &mut self, table_id: i64, packed: u64, seen: FxHashSet<PkBuf>, capped: bool,
     ) {
         let mut filter = UniqueFilter::new();
         filter.warm = true;     // pre-flight scanned every worker under the write lock
@@ -2366,7 +2453,7 @@ impl MasterDispatcher {
         } else {
             filter.values = seen;   // exact distinct set; same type, move not re-hash
         }
-        self.unique_filters.insert((table_id, col_idx), filter);
+        self.unique_filters.insert((table_id, packed), filter);
     }
 
     /// Commit N push batches as a single SAL group write. Called from
@@ -2462,13 +2549,14 @@ impl MasterDispatcher {
 
     /// Delegate unique-index violation formatting to the catalog, the single
     /// source of truth for the message text and the table/column name lookups.
-    fn unique_violation_err(&mut self, target_id: i64, col_idx: usize, in_batch: bool) -> String {
-        unsafe { (*self.catalog).unique_violation_err(target_id, col_idx, in_batch) }
+    /// `col_indices` is the index's full column list (composite-aware).
+    fn unique_violation_err(&mut self, target_id: i64, col_indices: &[u32], in_batch: bool) -> String {
+        unsafe { (*self.catalog).unique_violation_err(target_id, col_indices, in_batch) }
     }
 
     /// Delegate `CREATE UNIQUE INDEX` duplicate-value rejection to the catalog.
-    fn unique_create_dup_err(&mut self, owner_id: i64, col_idx: usize) -> String {
-        unsafe { (*self.catalog).unique_create_dup_err(owner_id, col_idx) }
+    fn unique_create_dup_err(&mut self, owner_id: i64, col_indices: &[u32]) -> String {
+        unsafe { (*self.catalog).unique_create_dup_err(owner_id, col_indices) }
     }
 
     /// Build the `(pk_names_joined, schema_name, table_name)` triple used
@@ -2707,10 +2795,6 @@ struct PreflightKeyStream {
     /// Worker index (error attribution) and scan request id (frame pulls).
     w: usize,
     req_id: u64,
-    /// Locator for column 0 of the shared pre-flight wire schema — the same
-    /// OPK→native round-trip the worker used to encode, so the wire is
-    /// encoding-transparent.
-    loc: ColumnLocator,
     /// Ring slot backing `mb`. Holding it parks the frame's ring bytes.
     slot: Option<W2mSlot>,
     /// Zero-copy view of the current frame's key batch (`None` for an empty
@@ -2723,11 +2807,10 @@ struct PreflightKeyStream {
 }
 
 impl PreflightKeyStream {
-    fn new(w: usize, req_id: u64, loc: ColumnLocator) -> Self {
+    fn new(w: usize, req_id: u64) -> Self {
         PreflightKeyStream {
             w,
             req_id,
-            loc,
             slot: None,
             mb: None,
             row: 0,
@@ -2778,20 +2861,23 @@ impl PreflightKeyStream {
         }
     }
 
-    /// Yield this worker's next key, pulling continuation frames on demand.
+    /// Yield this worker's next span, pulling continuation frames on demand.
     /// Returns `None` once the train is terminal (or an error voided the
-    /// verdict — the post-merge drain still pulls any remaining frames).
+    /// verdict — the post-merge drain still pulls any remaining frames). The
+    /// whole PK region IS the OPK leading-key span (`pk_stride == idx_key_size`),
+    /// read verbatim as a `PkBuf` — no column-0 decode, so the wire is
+    /// byte-transparent for a span of any width.
     async fn next_key(
         &mut self,
         frame_schema: &SchemaDescriptor,
         reactor: &crate::runtime::reactor::Reactor,
         deferred: &mut Option<String>,
-    ) -> Option<u128> {
+    ) -> Option<PkBuf> {
         loop {
             if deferred.is_none() {
                 if let Some(mb) = &self.mb {
                     if self.row < mb.count {
-                        let key = self.loc.native_key(mb, self.row);
+                        let key = PkBuf::from_bytes(mb.get_pk_bytes(self.row));
                         self.row += 1;
                         return Some(key);
                     }
@@ -2813,14 +2899,14 @@ impl PreflightKeyStream {
 /// frame-pulling loop so the verdict and the all-or-nothing seed rule are
 /// directly testable with a small cap.
 pub(crate) struct PreflightAccumulator {
-    prev: Option<u128>,
+    prev: Option<PkBuf>,
     pub(crate) duplicate: bool,
     /// Seed collection reuses `UniqueFilter`'s cap discipline: on overflow
     /// `insert` clears the set WHOLE and disables itself, so the seed is
     /// complete-or-empty, never truncated — a truncated seed would publish a
     /// warm but incomplete filter whose "proven absent" answers would let a
-    /// genuine duplicate skip the INSERT broadcast. Every key reaching
-    /// `insert` is distinct (keys arrive sorted, so duplicates are adjacent
+    /// genuine duplicate skip the INSERT broadcast. Every span reaching
+    /// `insert` is distinct (spans arrive sorted, so duplicates are adjacent
     /// and stop at the `prev` check).
     filter: UniqueFilter,
 }
@@ -2834,10 +2920,11 @@ impl PreflightAccumulator {
         }
     }
 
-    /// Offer the next key in globally-sorted merge order. Returns `false`
+    /// Offer the next span in globally-sorted merge order. Returns `false`
     /// once a duplicate is found — the verdict is monotonic, so the caller
-    /// stops merging useful keys (but still drains every worker's train).
-    pub(crate) fn offer(&mut self, key: u128) -> bool {
+    /// stops merging useful spans (but still drains every worker's train).
+    /// Span equality (byte-equal ⟺ value-equal) replaces the old `u128` equality.
+    pub(crate) fn offer(&mut self, key: PkBuf) -> bool {
         if self.duplicate { return false; }
         if self.prev == Some(key) {
             self.duplicate = true;
@@ -2848,10 +2935,10 @@ impl PreflightAccumulator {
         true
     }
 
-    /// The complete distinct key set plus the capped verdict. `capped = true`
+    /// The complete distinct span set plus the capped verdict. `capped = true`
     /// means the set overflowed and was cleared whole — the caller must
     /// publish a capped (always-broadcast) filter, never a warm-empty one.
-    pub(crate) fn into_seed(self) -> (FxHashSet<u128>, bool) {
+    pub(crate) fn into_seed(self) -> (FxHashSet<PkBuf>, bool) {
         (self.filter.values, self.filter.capped)
     }
 }
@@ -2865,7 +2952,8 @@ impl PreflightAccumulator {
 /// classes: two equal keys from one worker are adjacent in its sorted run and
 /// pop consecutively (within-partition), and the same value held by two
 /// workers surfaces as two equal heads (cross-partition). Takes no catalog
-/// lock — it only compares u128s and reads single-column wire frames.
+/// lock — it only compares OPK spans (`PkBuf`) read verbatim from the frames'
+/// PK regions against `frame_schema`.
 ///
 /// On any terminal outcome (duplicate, fault, decode error) every worker's
 /// train is still drained to its terminal frame — `FLAG_SCAN_LAST` or a fault
@@ -2878,29 +2966,30 @@ async fn merge_index_scan(
     slots: Vec<W2mSlot>,
     req_ids: &[u64; crate::runtime::sal::MAX_WORKERS],
     reactor: &crate::runtime::reactor::Reactor,
+    frame_schema: &SchemaDescriptor,
 ) -> Result<PreflightAccumulator, String> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
-    // Both sides agree on the frame layout by construction: the worker
-    // encodes against this same schema, so no per-stream schema capture from
-    // the first frame is needed.
-    let frame_schema = unique_preflight_wire_schema();
-    let loc = frame_schema.locate(0);
-
+    // Both sides agree on the frame layout by construction: `frame_schema` is
+    // `unique_preflight_wire_schema` of the same idx_schema the worker encodes
+    // against, so no per-stream schema capture from the first frame is needed.
+    // The PK region IS the OPK leading-key span; the merge reads it verbatim
+    // as a `PkBuf`.
     let nw = slots.len();
     let mut deferred: Option<String> = None;
     let mut streams: Vec<PreflightKeyStream> = Vec::with_capacity(nw);
 
     // Seed each stream with its first frame and prime the heap with each
     // worker's minimum (next_key pulls continuations if a first frame is
-    // empty but non-terminal). Ordering the heap by (key, worker) pops equal
-    // keys adjacently regardless of which workers hold them.
-    let mut heap: BinaryHeap<Reverse<(u128, usize)>> = BinaryHeap::with_capacity(nw);
+    // empty but non-terminal). Ordering the heap by (span, worker) — byte-
+    // lexicographic via `PkBuf: Ord` — pops equal spans adjacently regardless
+    // of which workers hold them, the merge order replacing numeric `u128`.
+    let mut heap: BinaryHeap<Reverse<(PkBuf, usize)>> = BinaryHeap::with_capacity(nw);
     for (w, slot) in slots.into_iter().enumerate() {
-        let mut s = PreflightKeyStream::new(w, req_ids[w], loc);
-        s.attach_frame(slot, &frame_schema, &mut deferred);
-        if let Some(key) = s.next_key(&frame_schema, reactor, &mut deferred).await {
+        let mut s = PreflightKeyStream::new(w, req_ids[w]);
+        s.attach_frame(slot, frame_schema, &mut deferred);
+        if let Some(key) = s.next_key(frame_schema, reactor, &mut deferred).await {
             heap.push(Reverse((key, w)));
         }
         streams.push(s);
@@ -2910,7 +2999,7 @@ async fn merge_index_scan(
     while let Some(Reverse((key, w))) = heap.pop() {
         if deferred.is_some() { break; }
         if !acc.offer(key) { break; } // first duplicate is conclusive
-        if let Some(next) = streams[w].next_key(&frame_schema, reactor, &mut deferred).await {
+        if let Some(next) = streams[w].next_key(frame_schema, reactor, &mut deferred).await {
             heap.push(Reverse((next, w)));
         }
     }
@@ -3105,6 +3194,23 @@ fn u128_to_pkbuf(pk: u128, pk_stride: u8) -> PkBuf {
     PkBuf::from_bytes(&pk.to_be_bytes()[16 - pk_stride as usize..])
 }
 
+/// Decode an OPK leading-key span back to its native per-column values — the
+/// inverse of `IndexKeySpec::write_span`, so the master stays the OPK *decoder*
+/// and the worker the sole OPK *encoder*. `idx_cols` are the span's promoted
+/// index columns; trailing array slots stay zero.
+fn span_to_natives(span: &PkBuf, idx_cols: &[SchemaColumn]) -> [u128; gnitz_wire::PK_LIST_MAX_COLS] {
+    let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
+    let mut off = 0;
+    for (native, col) in natives.iter_mut().zip(idx_cols) {
+        let sz = col.size() as usize;
+        let le = gnitz_wire::decode_pk_column_owned(
+            &span.pk_bytes()[off..off + sz], col.type_code);
+        *native = u128::from_le_bytes(le);
+        off += sz;
+    }
+    natives
+}
+
 /// Encode a native index-seek key into the routing-cache representation
 /// `extract_col_key` stores: OPK-widened for integer / U128 / UUID columns.
 /// Returns `None` for STRING/BLOB, whose cache keys are XXH3 of the bytes and
@@ -3204,6 +3310,13 @@ mod unique_filter_tests {
         SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
     }
 
+    /// OPK leading-key span of a single U64 value — the form `key_bytes`
+    /// produces for a U64-promoted index column (U64 OPK == big-endian). Used to
+    /// build expected filter/accumulator keys in these unit tests.
+    fn span_u64(v: u64) -> PkBuf {
+        PkBuf::from_bytes(&v.to_be_bytes())
+    }
+
     fn two_col_schema() -> SchemaDescriptor {
         // PK U64 at index 0, payload U64 at index 1.
         SchemaDescriptor::new(
@@ -3213,6 +3326,13 @@ mod unique_filter_tests {
             ],
             &[0],
         )
+    }
+
+    /// Span-extraction spec for a unique index on `cols` of `schema`, promoted
+    /// via `make_index_schema` exactly as production circuit registration does.
+    fn test_spec(cols: &[u32], schema: &SchemaDescriptor) -> IndexKeySpec {
+        let idx_schema = crate::catalog::make_index_schema(cols, schema).unwrap();
+        IndexKeySpec::new(cols, schema, &idx_schema)
     }
 
     fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, u64, i64)]) -> Batch {
@@ -3254,10 +3374,10 @@ mod unique_filter_tests {
     #[test]
     fn filter_insert_basic() {
         let mut f = UniqueFilter::new();
-        f.insert(1);
-        f.insert(2);
-        assert!(f.values.contains(&1));
-        assert!(f.values.contains(&2));
+        f.insert(span_u64(1));
+        f.insert(span_u64(2));
+        assert!(f.values.contains(&span_u64(1)));
+        assert!(f.values.contains(&span_u64(2)));
         assert!(!f.capped);
     }
 
@@ -3266,14 +3386,14 @@ mod unique_filter_tests {
         // Exceed a small parameterized cap, verify the filter flips to
         // capped and its values HashSet is cleared whole.
         let mut f = UniqueFilter::with_cap(8);
-        for k in 0..10u128 {
-            f.insert(k);
+        for k in 0..10u64 {
+            f.insert(span_u64(k));
             if f.capped { break; }
         }
         assert!(f.capped, "filter should be capped after exceeding the limit");
         assert!(f.values.is_empty(), "values cleared once capped");
         // Further inserts are no-ops.
-        f.insert(99999999);
+        f.insert(span_u64(99999999));
         assert!(f.values.is_empty());
     }
 
@@ -3287,33 +3407,37 @@ mod unique_filter_tests {
             (30, -1, 0, 0),  // delete row — should be skipped
         ]);
         let mut filter = UniqueFilter::new();
-        extract_into_filter(&mut filter, &batch.as_mem_batch(), schema.locate(0));
-        assert!(filter.values.contains(&10u128));
-        assert!(filter.values.contains(&20u128));
-        assert!(!filter.values.contains(&30u128), "negative weight skipped");
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
+        assert!(filter.values.contains(&span_u64(10)));
+        assert!(filter.values.contains(&span_u64(20)));
+        assert!(!filter.values.contains(&span_u64(30)), "negative weight skipped");
     }
 
     #[test]
     fn extract_into_filter_signed_pk_col_uses_native_key() {
         // Single signed I64 PK. The OPK bytes at rest are sign-bit-flipped, so
         // `get_pk` (OPK-widened) differs from the native value. The extraction
-        // must yield the *native* key (`pk_native_key`) — feeding the OPK value
-        // would make `index_opk_prefix` flip the sign bit again and seek a wrong
-        // key, hiding genuine duplicates.
+        // must build the span from the *native* key (`pk_native_key`) re-encoded
+        // at the promoted U64 index type — feeding the at-rest OPK value would
+        // double-flip and seek a wrong key, hiding genuine duplicates.
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::I64, 0)], &[0]);
         let mut opk = [0u8; 8];
         gnitz_wire::encode_pk_column(&(-5i64).to_le_bytes(), type_code::I64, &mut opk);
         let keys = [PkBuf::from_bytes(&opk)];
         let batch = build_check_batch_pkbuf(&schema, &keys, None);
 
-        let native = (-5i64) as u64 as u128;
-        let opk_widened = gnitz_wire::widen_pk_be(&opk, 8);
-        assert_ne!(native, opk_widened, "signed OPK value must differ from native");
+        // The filter span is the U64-promoted OPK of the NATIVE value (BE of the
+        // two's-complement u64 bits, no extra sign flip).
+        let native_span = PkBuf::from_bytes(&((-5i64) as u64).to_be_bytes());
+        // The I64-at-rest OPK bytes (sign-bit-flipped) are a DIFFERENT span.
+        let at_rest_opk_span = PkBuf::from_bytes(&opk);
+        assert_ne!(native_span, at_rest_opk_span, "signed at-rest OPK differs from native span");
 
         let mut filter = UniqueFilter::new();
-        extract_into_filter(&mut filter, &batch.as_mem_batch(), schema.locate(0));
-        assert!(filter.values.contains(&native), "filter holds native signed key");
-        assert!(!filter.values.contains(&opk_widened), "must not hold OPK-widened key");
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
+        assert!(filter.values.contains(&native_span), "filter holds the native-value span");
+        assert!(!filter.values.contains(&at_rest_opk_span),
+            "must not hold the sign-flipped at-rest OPK span");
     }
 
     #[test]
@@ -3348,10 +3472,11 @@ mod unique_filter_tests {
             (3, 1, 0, 300),
         ]);
         let mut filter = UniqueFilter::new();
-        extract_into_filter(&mut filter, &batch.as_mem_batch(), schema.locate(1));
-        assert!(filter.values.contains(&100u128));
-        assert!(!filter.values.contains(&200u128), "null values skipped");
-        assert!(filter.values.contains(&300u128));
+        // Single payload column promoted to a U64 index column (8-byte span).
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[1], &schema));
+        assert!(filter.values.contains(&span_u64(100)));
+        assert!(!filter.values.contains(&span_u64(200)), "null values skipped");
+        assert!(filter.values.contains(&span_u64(300)));
         assert_eq!(filter.values.len(), 2);
     }
 
@@ -3364,7 +3489,7 @@ mod unique_filter_tests {
         ]);
         let mut filter = UniqueFilter::new();
         filter.capped = true;
-        extract_into_filter(&mut filter, &batch.as_mem_batch(), schema.locate(0));
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
         assert!(filter.values.is_empty(), "no-op on capped filter");
     }
 
@@ -3387,15 +3512,15 @@ mod unique_filter_tests {
     #[test]
     fn capped_preflight_seed_never_proves_absence() {
         let mut acc = PreflightAccumulator::new(3);
-        for k in [10u128, 20, 30, 40] {
-            assert!(acc.offer(k), "distinct keys never flip the verdict");
+        for k in [10u64, 20, 30, 40] {
+            assert!(acc.offer(span_u64(k)), "distinct keys never flip the verdict");
         }
         let (seed, capped) = acc.into_seed();
         assert!(capped, "cap + 1 distinct keys must report capped");
         let mut disp = filter_dispatcher();
         disp.unique_filter_seed(7, 0, seed, capped);
         assert!(
-            !disp.unique_filter_all_absent(7, 0, &[10]),
+            !disp.unique_filter_all_absent(7, 0, &[span_u64(10)]),
             "a capped pre-flight seed must fall through to the broadcast",
         );
     }
@@ -3406,15 +3531,15 @@ mod unique_filter_tests {
     #[test]
     fn at_cap_preflight_seed_proves_absence() {
         let mut acc = PreflightAccumulator::new(3);
-        for k in [10u128, 20, 30] {
-            assert!(acc.offer(k));
+        for k in [10u64, 20, 30] {
+            assert!(acc.offer(span_u64(k)));
         }
         let (seed, capped) = acc.into_seed();
         assert!(!capped, "exactly cap distinct keys must keep the full seed");
         let mut disp = filter_dispatcher();
         disp.unique_filter_seed(7, 0, seed, capped);
-        assert!(disp.unique_filter_all_absent(7, 0, &[40]), "fresh key is provably absent");
-        assert!(!disp.unique_filter_all_absent(7, 0, &[20]), "seeded key falls through");
+        assert!(disp.unique_filter_all_absent(7, 0, &[span_u64(40)]), "fresh key is provably absent");
+        assert!(!disp.unique_filter_all_absent(7, 0, &[span_u64(20)]), "seeded key falls through");
     }
 
     /// A capped seed publishes a warm+capped filter whose entry exists in
@@ -3428,7 +3553,7 @@ mod unique_filter_tests {
         assert!(filter.warm);
         assert!(filter.capped);
         assert!(filter.values.is_empty());
-        assert!(!disp.unique_filter_all_absent(7, 0, &[12345]));
+        assert!(!disp.unique_filter_all_absent(7, 0, &[span_u64(12345)]));
     }
 
     /// `drain_index_scan` must surface a worker-side scan fault as a deferred
@@ -3649,8 +3774,9 @@ mod unique_filter_tests {
         ];
         let batch = build_check_batch_pkbuf(&schema, &keys, None);
         let mut filter = UniqueFilter::new();
-        extract_into_filter(&mut filter, &batch.as_mem_batch(), schema.locate(0));
-        assert!(filter.values.contains(&5u128), "filter holds column A's value");
+        // Index on a U32 column promotes to a U64 (8-byte) index column.
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
+        assert!(filter.values.contains(&span_u64(5)), "filter holds column A's value");
         assert_eq!(filter.values.len(), 1, "the shared A=5 collapses to one entry");
     }
 
@@ -3669,9 +3795,9 @@ mod unique_filter_tests {
         ];
         let batch = build_check_batch_pkbuf(&schema, &keys, None);
         let mut filter = UniqueFilter::new();
-        extract_into_filter(&mut filter, &batch.as_mem_batch(), schema.locate(1));
-        assert!(filter.values.contains(&11u128));
-        assert!(filter.values.contains(&22u128));
+        extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[1], &schema));
+        assert!(filter.values.contains(&span_u64(11)));
+        assert!(filter.values.contains(&span_u64(22)));
         assert_eq!(filter.values.len(), 2);
     }
 }

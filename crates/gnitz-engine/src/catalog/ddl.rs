@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::PkBuf;
 
 impl CatalogEngine {
     // -- DDL: CREATE/DROP SCHEMA -------------------------------------------
@@ -441,21 +442,18 @@ impl CatalogEngine {
             None => return Ok(()),
         };
         let chunk_rows = self.ddl_scan_chunk_rows;
-        // The duplicate check runs only for a UNIQUE index, and every unique
-        // index is single-column (composite UNIQUE is not yet supported) — so
-        // its key width is the single leading promoted column, and the error
-        // names that column.
-        let key_size = idx_schema.columns[0].size() as usize;
+        // The duplicate check applies to the full composite leading span.
+        let idx_key_size = idx_schema.leading_key_size(col_indices.len());
         let check_dups = is_unique && self.ctx.is_live();
-        let mut seen: rustc_hash::FxHashSet<u128> = rustc_hash::FxHashSet::default();
+        let mut seen: rustc_hash::FxHashSet<PkBuf> = rustc_hash::FxHashSet::default();
 
         let Some(mut handle) = self.open_store_cursor(owner_id) else { return Ok(()) };
         while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
             let projected = DagEngine::batch_project_index(
                 &chunk, col_indices, &owner_schema, idx_schema);
             if projected.count == 0 { continue; }
-            if check_dups && projected_chunk_has_dup_keys(&projected, key_size, &mut seen) {
-                return Err(self.unique_create_dup_err(owner_id, col_indices[0] as usize));
+            if check_dups && projected_chunk_has_dup_keys(&projected, idx_key_size, &mut seen) {
+                return Err(self.unique_create_dup_err(owner_id, col_indices));
             }
             if let Some(table) = idx_table {
                 let _ = unsafe { &mut *table }.ingest_owned_batch(projected);
@@ -597,11 +595,13 @@ impl CatalogEngine {
 /// index key (the first `key_size` bytes of the index PK) with another row of
 /// this chunk or any earlier chunk recorded in `seen`.
 ///
-/// Compound-PK index layout: index PK is `(indexed_key, src_pk…)`. Uniqueness
-/// applies to the leading `indexed_key` slot only — two rows differing only in
+/// Compound-PK index layout: index PK is `(indexed_key…, src_pk…)`. Uniqueness
+/// applies to the leading `indexed_key` span only — two rows differing only in
 /// their source-PK suffix represent two source rows sharing the indexed value.
-/// `make_index_schema` always promotes the leading key to ≤16 bytes, so a u128
-/// dedup token suffices (zero-padded LE for narrower types).
+/// For a composite `UNIQUE (a, b, …)` the span is the sum of every promoted
+/// column's width and can exceed 16 bytes, so the dedup token is a `PkBuf`
+/// holding the raw span (a stack key, no per-row heap allocation), not a
+/// truncating `u128`.
 ///
 /// `seen` is caller-owned because the scan is chunked: cross-chunk duplicates
 /// are only visible through state carried across calls. Shared by
@@ -610,10 +610,8 @@ impl CatalogEngine {
 fn projected_chunk_has_dup_keys(
     projected: &Batch,
     key_size: usize,
-    seen: &mut rustc_hash::FxHashSet<u128>,
+    seen: &mut rustc_hash::FxHashSet<PkBuf>,
 ) -> bool {
-    debug_assert!(key_size <= 16,
-        "unique index key size {} exceeds 16-byte dedup buffer", key_size);
     for row in 0..projected.count {
         let weight = projected.get_weight(row);
         if weight <= 0 { continue; }
@@ -623,9 +621,72 @@ fn projected_chunk_has_dup_keys(
         // here (batch_project_index skips them).
         if weight > 1 { return true; }
         let pk_bytes = projected.get_pk_bytes(row);
-        let mut buf = [0u8; 16];
-        buf[..key_size].copy_from_slice(&pk_bytes[..key_size]);
-        if !seen.insert(u128::from_le_bytes(buf)) { return true; }
+        if !seen.insert(PkBuf::from_bytes(&pk_bytes[..key_size])) { return true; }
     }
     false
+}
+
+#[cfg(test)]
+mod dup_key_tests {
+    use super::*;
+    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+
+    /// Build a projected-index batch whose PK region is each supplied span
+    /// (here the whole index PK; the dedup keys on the leading `key_size`).
+    fn idx_batch(spans: &[[u8; 24]]) -> Batch {
+        // Three U64 PK columns → a 24-byte composite span (> 16 bytes).
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0); 3], &[0, 1, 2]);
+        let mut b = Batch::with_schema(schema, spans.len().max(1));
+        for s in spans {
+            b.ensure_row_capacity();
+            b.extend_pk_bytes(s);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    /// A >16-byte composite span is deduped on its FULL width: two spans sharing
+    /// their leading 16 bytes but differing in the trailing 8 are distinct (the
+    /// `u128` truncation this replaced would have falsely reported a duplicate),
+    /// while an exact repeat is a duplicate.
+    #[test]
+    fn dup_keys_over_16_bytes_no_truncation() {
+        let span = |tail: u64| {
+            let mut s = [0u8; 24];
+            s[..16].copy_from_slice(&[7u8; 16]);   // shared leading 16 bytes
+            s[16..].copy_from_slice(&tail.to_be_bytes());
+            s
+        };
+
+        let mut seen = rustc_hash::FxHashSet::default();
+        assert!(
+            !projected_chunk_has_dup_keys(&idx_batch(&[span(1), span(2)]), 24, &mut seen),
+            "distinct 24-byte spans sharing a 16-byte prefix are NOT duplicates",
+        );
+
+        let mut seen2 = rustc_hash::FxHashSet::default();
+        assert!(
+            projected_chunk_has_dup_keys(&idx_batch(&[span(1), span(1)]), 24, &mut seen2),
+            "identical 24-byte spans are duplicates",
+        );
+    }
+
+    /// `seen` carries cross-chunk state: a duplicate split across two chunk
+    /// calls is caught on the second chunk.
+    #[test]
+    fn dup_keys_cross_chunk() {
+        let span = |tail: u64| {
+            let mut s = [0u8; 24];
+            s[16..].copy_from_slice(&tail.to_be_bytes());
+            s
+        };
+        let mut seen = rustc_hash::FxHashSet::default();
+        assert!(!projected_chunk_has_dup_keys(&idx_batch(&[span(1)]), 24, &mut seen));
+        assert!(
+            projected_chunk_has_dup_keys(&idx_batch(&[span(1)]), 24, &mut seen),
+            "the same span in a later chunk is a cross-chunk duplicate",
+        );
+    }
 }

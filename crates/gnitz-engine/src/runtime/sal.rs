@@ -53,23 +53,33 @@ pub const FLAG_TXN_COMMIT: u32          = 32768;
 /// the gather returns the *stored* value of columns the caller does not have.
 pub const FLAG_GATHER: u32              = 65536;
 /// CREATE UNIQUE INDEX global pre-flight: each worker projects its committed
-/// partition of `target_id` to the native u128 index keys of the column named
-/// in `seek_col_idx`, sorts them, and streams the SORTED keys back as
+/// partition of `target_id` to the OPK leading-key spans of the column list
+/// packed in `seek_col_idx`, sorts them, and streams the SORTED spans back as
 /// continuation frames for the master's k-way merge (see
 /// `validate_unique_index_create_async`). Unicast-shaped like a Scan: every
 /// worker gets its own req_id slot and answers with a frame train.
 pub const FLAG_UNIQUE_PREFLIGHT: u32    = 131072;
 
-/// Wire schema of every unique pre-flight reply frame: one U128 PK column
-/// holding the native index key, schema version 0. The single definition
-/// shared by the worker's encoder (`send_unique_preflight_keys`) and the
-/// master's merge decoder, so the frame layout agrees by construction and
-/// the master needs no per-stream schema capture from the first frame.
-pub(crate) fn unique_preflight_wire_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[crate::schema::SchemaColumn::new(crate::schema::type_code::U128, 0)],
-        &[0],
-    )
+/// Wire schema of every unique pre-flight reply frame: the leading `n_promoted`
+/// columns of the index schema, all marked PK, schema version 0. Its `pk_stride`
+/// is exactly `idx_key_size`, and the OPK leading-key span fills that PK region
+/// verbatim — there is no single fixed-width column to represent a composite
+/// (e.g. 24-byte) span, so the schema is built per-index from `idx_schema` (the
+/// width is known at pre-flight time). The single-column ≤16-byte case is the
+/// `n_promoted == 1` degenerate, replacing the old fixed `U128` column.
+///
+/// Index columns are always non-nullable (`make_index_schema` builds each with
+/// `nullable = 0`, and a NULL-valued row never enters the index), so
+/// `SchemaDescriptor::new`'s "PK columns must be non-nullable" assertion holds.
+/// The single definition shared by the worker's encoder
+/// (`send_unique_preflight_keys`) and the master's merge decoder, so the frame
+/// layout agrees by construction.
+pub(crate) fn unique_preflight_wire_schema(
+    idx_schema: &SchemaDescriptor, n_promoted: usize,
+) -> SchemaDescriptor {
+    let cols = &idx_schema.columns[..n_promoted];
+    let pks: Vec<u32> = (0..n_promoted as u32).collect();
+    SchemaDescriptor::new(cols, &pks)
 }
 
 /// Pack up to 8 projected column indices into the gather control block's

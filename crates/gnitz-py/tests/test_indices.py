@@ -1911,18 +1911,33 @@ class TestCompositeIndex:
         finally:
             _drop_all(client, sn, tables=["t"])
 
-    def test_composite_unique_rejected(self, client):
+    def test_composite_unique_created_and_enforced(self, client):
+        """Composite UNIQUE (a, b) is created (all (a, b) pairs distinct) and
+        enforced end-to-end: a duplicate (a, b) is rejected, rows sharing only
+        `a` or only `b` are admitted (the trailing/leading column distinguishes
+        them — the regression a u128-leading-column truncation would have
+        falsely merged), and the composite seek returns exactly one row."""
         sn = _sn()
         client.create_schema(sn)
         try:
             self._setup(client, sn)
+            # (a, b) pairs are all distinct: (1,100), (1,200), (2,100).
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a, b)", schema_name=sn)
+
+            # A duplicate (a, b) = (1, 100) is rejected by the steady-state check.
             with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE UNIQUE INDEX ON t(a, b)", schema_name=sn)
-            # Single-column UNIQUE still works (c holds distinct values 7,8,9).
-            client.execute_sql("CREATE UNIQUE INDEX ON t(c)", schema_name=sn)
+                client.execute_sql("INSERT INTO t VALUES (40, 1, 100, 1)", schema_name=sn)
+
+            # A row sharing only `a` (a=1, b=999) is a distinct composite → admitted;
+            # likewise one sharing only `b` (a=9, b=100).
+            client.execute_sql("INSERT INTO t VALUES (41, 1, 999, 1)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (42, 9, 100, 1)", schema_name=sn)
+
+            # The composite seek (broadcast-and-merge) returns exactly one row.
+            assert _pks(client.execute_sql(
+                "SELECT * FROM t WHERE a = 1 AND b = 200", schema_name=sn)) == [20]
         finally:
-            _drop_all(client, sn, tables=["t"])
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
 
     def test_create_index_limits(self, client):
         sn = _sn()
@@ -1941,3 +1956,181 @@ class TestCompositeIndex:
                 client.execute_sql("CREATE INDEX ON t(a, a)", schema_name=sn)
         finally:
             _drop_all(client, sn, tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestCompositeUniqueIndex
+# ---------------------------------------------------------------------------
+
+class TestCompositeUniqueIndex:
+    """Composite UNIQUE (a, b): both DDL entry points, distributed create-time
+    pre-flight, distributed insert-time enforcement, NULL-distinctness, the
+    trivial-PK short-circuit, and atomic composite-value transfer. Multi-worker
+    coverage comes from GNITZ_WORKERS=4 in the E2E run."""
+
+    def test_table_level_unique_constraint_entry_point(self, client):
+        """CREATE TABLE ... UNIQUE (a, b) (table constraint) creates and enforces
+        the composite index — the removed table-level planner gate."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "a BIGINT NOT NULL, b BIGINT NOT NULL, UNIQUE (a, b))",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO t VALUES (1, 5, 1)", schema_name=sn)
+            # Distinct composite admitted; duplicate rejected.
+            client.execute_sql("INSERT INTO t VALUES (2, 5, 2)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO t VALUES (3, 5, 1)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
+
+    def test_create_preflight_rejects_cross_partition_duplicate(self, client):
+        """A pre-existing duplicate (a, b) spread across a wide PK range is
+        invisible to any single worker's backfill but caught by the master
+        composite pre-flight. The index must NOT exist afterward, and a fresh
+        duplicate INSERT must still be permitted (no phantom constraint)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            spread = [1, 7, 13, 1000, 99999, 123456, 777777, 8888888, 73501234, 901234567]
+            # All share (a, b) = (5, 9): a cross-partition composite duplicate.
+            rows = ", ".join(f"({pk}, 5, 9)" for pk in spread)
+            client.execute_sql(f"INSERT INTO t VALUES {rows}", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(a, b)", schema_name=sn)
+            assert not _table_has_index(client, sn, "t"), \
+                "no index may exist after a rejected composite CREATE UNIQUE INDEX"
+            client.execute_sql("INSERT INTO t VALUES (2, 5, 9)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
+
+    def test_create_preflight_accepts_leading_column_collision(self, client):
+        """Many rows sharing the leading column `a` but with distinct trailing
+        `b` are all distinct composites — CREATE UNIQUE INDEX (a, b) succeeds
+        (the regression a u128 leading-column truncation would have falsely
+        rejected), then enforces correctly."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            spread = [1, 1000, 99999, 8888888, 901234567]
+            # All share a=5 but every b is distinct → distinct composites.
+            rows = ", ".join(f"({pk}, 5, {i})" for i, pk in enumerate(spread))
+            client.execute_sql(f"INSERT INTO t VALUES {rows}", schema_name=sn)
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a, b)", schema_name=sn)
+            # A genuine duplicate (a=5, b=0) is still rejected.
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO t VALUES (10, 5, 0)", schema_name=sn)
+            # A distinct trailing column is admitted.
+            client.execute_sql("INSERT INTO t VALUES (11, 5, 999)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
+
+    def test_insert_duplicate_on_different_worker_rejected(self, client):
+        """An insert-time duplicate (a, b) committed on a DIFFERENT worker than
+        the holder must be rejected (the distributed cross-worker check). Wide
+        PK spread scatters holders across workers."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a, b)", schema_name=sn)
+            spread = [1, 1000, 99999, 8888888, 901234567]
+            for i, pk in enumerate(spread):
+                client.execute_sql(f"INSERT INTO t VALUES ({pk}, 5, {i})", schema_name=sn)
+            # Re-insert each (a, b) on a fresh PK (likely a different worker) —
+            # all must be rejected.
+            for i in range(len(spread)):
+                with pytest.raises(gnitz.GnitzError):
+                    client.execute_sql(
+                        f"INSERT INTO t VALUES ({2000 + i}, 5, {i})", schema_name=sn)
+            # A fully fresh composite is still admitted.
+            client.execute_sql("INSERT INTO t VALUES (3000, 6, 0)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
+
+    def test_null_distinctness(self, client):
+        """A row NULL in ANY indexed column is not indexed and never collides:
+        multiple (NULL, b), (a, NULL), and (NULL, NULL) rows are all admitted,
+        while a fully non-null (a, b) still enforces."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE UNIQUE INDEX ON t(a, b)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, NULL, 1)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (2, NULL, 1)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (3, 5, NULL)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (4, 5, NULL)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (5, NULL, NULL)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (6, NULL, NULL)", schema_name=sn)
+            # A fully non-null (a, b) still enforces.
+            client.execute_sql("INSERT INTO t VALUES (7, 5, 1)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("INSERT INTO t VALUES (8, 5, 1)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
+
+    def test_trivial_pk_shortcircuit(self, client):
+        """UNIQUE over a table whose PK is exactly those columns (any order) is
+        created without a duplicate error and admits rows the PK already
+        permits — the trivial-uniqueness short-circuit (group_cols_eq_pk)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, "
+                "v BIGINT NOT NULL, PRIMARY KEY (a, b))",
+                schema_name=sn,
+            )
+            # Duplicate v across distinct (a, b) PKs — a per-column unique would
+            # choke, but the composite over the PK columns can never collide.
+            client.execute_sql("INSERT INTO t VALUES (1, 2, 100)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 3, 100)", schema_name=sn)
+            # UNIQUE on the PK columns in the reverse order still short-circuits.
+            client.execute_sql("CREATE UNIQUE INDEX ON t(b, a)", schema_name=sn)
+            # A new (a, b) the PK permits is admitted.
+            client.execute_sql("INSERT INTO t VALUES (2, 3, 100)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_b_a"], tables=["t"])
+
+    def test_composite_bulk_shift_accepted(self, client):
+        """UPDATE t SET b = b + 1 over a dense (a, b) sequence under a composite
+        UNIQUE (a, b) ships same-PK upserts whose new composite value is held by
+        the previous (also-upserted) row — exercising the upsert verify's
+        decode-span -> native composite holder seek. Must succeed."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "a BIGINT NOT NULL, b BIGINT NOT NULL, UNIQUE (a, b))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 7, 1), (2, 7, 2), (3, 7, 3)", schema_name=sn)
+            client.execute_sql("UPDATE t SET b = b + 1", schema_name=sn)
+            tid, _ = client.resolve_table(sn, "t")
+            rows = sorted((r.pk, r.a, r.b) for r in client.scan(tid) if r.weight > 0)
+            assert rows == [(1, 7, 2), (2, 7, 3), (3, 7, 4)], rows
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
