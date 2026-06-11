@@ -133,30 +133,35 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // a latency tax.
         let (pushes, barrier_senders) = debounce_drain(&mut rx, pushes, barrier_senders);
 
-        // Barrier-only tick: nothing to commit, just signal.
-        if pushes.is_empty() {
-            merge_pool.clear();
-            for b in barrier_senders { let _ = b.send(()); }
-            continue;
-        }
-
-        // Phase 1 — checkpoint (if the SAL has crossed its threshold).
-        // Must complete fully (emit + ACKs + post_ack) before commit
+        // Checkpoint decision for the whole batch, barrier-only batches
+        // included: relay_loop's low-space barrier arrives precisely to
+        // reclaim SAL space. Barrier batches also honor the relay-space
+        // threshold directly, covering GNITZ_CHECKPOINT_BYTES configs above
+        // it. Must complete fully (emit + ACKs + post_ack) before commit
         // groups go out: workers bump their expected_epoch on FLAG_FLUSH,
         // so commit groups written AFTER FLAG_FLUSH in the same epoch
         // would be silently skipped by workers.
-        if shared.disp().sal_needs_checkpoint() {
+        let has_barriers = !barrier_senders.is_empty();
+        if shared.disp().sal_needs_checkpoint()
+            || (has_barriers && !shared.disp().sal_has_relay_space())
+        {
             if let Err(e) = run_checkpoint_phase(&shared, &mut fut_slots, &mut ack_slots).await {
+                // Barrier semantics are "committer reached this point", not
+                // "checkpoint succeeded": signal anyway. relay_loop rechecks
+                // space and aborts if reclaim failed.
+                crate::gnitz_warn!("checkpoint failed: {}", e);
                 for p in pushes { let _ = p.done.send(Err(e.clone())); }
+                if has_barriers { merge_pool.clear(); }
                 for b in barrier_senders { let _ = b.send(()); }
                 continue;
             }
         }
 
-        // Phase 2 — commit the batched pushes.  Its own lock scope.
-        commit_pushes(&shared, pushes, &mut fut_slots, &mut ack_slots, &mut merge_pool).await;
+        if !pushes.is_empty() {
+            commit_pushes(&shared, pushes, &mut fut_slots, &mut ack_slots, &mut merge_pool).await;
+        }
 
-        if !barrier_senders.is_empty() {
+        if has_barriers {
             merge_pool.clear();
         }
         for b in barrier_senders { let _ = b.send(()); }

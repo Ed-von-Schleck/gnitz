@@ -400,3 +400,130 @@ def test_unique_constraint_enforced_under_checkpoint_pressure(checkpoint_server)
             )
         except gnitz.GnitzError:
             pass  # expected
+
+
+# ---------------------------------------------------------------------------
+# Low-space exchange relay must reclaim SAL space without crashing the master
+# ---------------------------------------------------------------------------
+#
+# When SAL space runs low before an exchange relay, relay_loop fires a
+# committer barrier to reclaim space via a checkpoint, rechecks, and fatally
+# aborts the master if space is still low.  Before the fix the committer's
+# barrier-only batch short-circuited without ever checkpointing: with no push
+# in flight the reclaim barrier landed in a barrier-only batch, the epoch never
+# bumped, relay_loop's recheck still read low, and the master aborted (an
+# availability bug — workers self-exit via getppid()).
+#
+# Driving real exhaustion needs ~7/8 of the 1 GiB SAL mmap, so a debug-only
+# seam (GNITZ_INJECT_RELAY_SPACE_LOW) makes the first exchange relay report
+# low space one-shot, armed at the current SAL epoch.  Only a checkpoint (which
+# bumps the epoch) disarms it, so the green run delivers the relay exactly when
+# the committer checkpoints the barrier-only batch.
+
+
+def _is_debug_build():
+    """The relay-space injection seam is gated by #[cfg(debug_assertions)].
+    Cargo's default `cargo build` is debug; release builds drop the seam."""
+    return os.environ.get("GNITZ_RELEASE", "0") == "0"
+
+
+@pytest.fixture
+def relay_lowspace_server():
+    """Function-scoped server with the one-shot low-relay-space seam armed.
+
+    Yields (sock_path, proc) so the test can assert the master is still
+    alive after the low-space relay.  No GNITZ_CHECKPOINT_BYTES override:
+    the only checkpoint in the green run is the seam-induced one, so the
+    view results stay reliable.
+    """
+    if not os.path.isfile(BINARY):
+        pytest.skip(f"Server binary not found: {BINARY}")
+    if not _is_debug_build():
+        pytest.skip("relay-space injection seam requires a debug build")
+    if WORKERS < 2:
+        pytest.skip("exchange relay requires GNITZ_WORKERS >= 2")
+    tmpdir = tempfile.mkdtemp(dir=os.path.expanduser("~/git/gnitz/tmp"),
+                              prefix="gnitz_relaylow_")
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+    env = os.environ.copy()
+    env["GNITZ_INJECT_RELAY_SPACE_LOW"] = "1"
+    cmd = [BINARY, data_dir, sock_path, f"--workers={WORKERS}"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=env,
+                            preexec_fn=server_preexec)
+    for _ in range(100):
+        if os.path.exists(sock_path):
+            break
+        time.sleep(0.1)
+    else:
+        proc.kill()
+        proc.communicate()
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise RuntimeError("relay-lowspace server did not start")
+    yield sock_path, proc
+    proc.kill()
+    proc.wait()
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_low_space_relay_checkpoints_without_aborting_master(relay_lowspace_server):
+    """A low-SAL-space exchange relay must reclaim space and keep the master
+    alive, even when the reclaim barrier lands in a barrier-only batch.
+
+    The GROUP BY view forces an exchange (and thus a relay) when the tick
+    fires.  Inserting a few hundred rows from a single serial client — well
+    under TICK_COALESCE_ROWS (10 000) — lets the exchange tick fire from the
+    idle timer with no push in flight, so relay_loop's reclaim barrier reaches
+    the committer as a barrier-only batch: exactly the path that used to abort.
+    """
+    sock_path, proc = relay_lowspace_server
+    client = gnitz.connect(sock_path)
+    try:
+        sn = "rls_" + str(random.randint(100_000, 999_999))
+        client.create_schema(sn)
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "grp BIGINT NOT NULL, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT grp, SUM(val) AS total FROM t GROUP BY grp",
+            schema_name=sn,
+        )
+        vid, _ = client.resolve_table(sn, "v")
+
+        n = 300
+        vals = ", ".join(f"({i}, 1, {i})" for i in range(1, n + 1))
+        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+        expected = sum(range(1, n + 1))
+
+        # Poll the view until the aggregate matches: the exchange can only
+        # complete once the relay is delivered, which requires the low-space
+        # barrier to have reclaimed SAL space via a checkpoint.
+        got = None
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break  # master died — assertion below reports it
+            try:
+                totals = {row[1]: row[2]
+                          for row in client.scan(vid) if row.weight > 0}
+            except Exception:
+                break  # connection broke (likely a dead master)
+            if totals.get(1) == expected:
+                got = totals[1]
+                break
+            time.sleep(0.1)
+
+        assert proc.poll() is None, (
+            "master aborted on a low-space exchange relay — the barrier-only "
+            "committer batch never checkpointed to reclaim SAL space"
+        )
+        assert got == expected, \
+            f"view never converged: SUM(val) = {got} != {expected}"
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass

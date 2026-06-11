@@ -598,6 +598,16 @@ impl MasterDispatcher {
                 progressed = true;
                 if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
                     if let Some(relay) = acc.process(w, decoded) {
+                        // Backfill keeps fail-on-low-space (prepare_relay no
+                        // longer checks): injecting a FLAG_FLUSH mid-backfill
+                        // would orphan already-written backfill groups that
+                        // workers have not yet consumed and hang boot.
+                        let remaining = self.sal.mmap_size() - self.sal.cursor();
+                        if remaining < (self.sal.mmap_size() >> 3) {
+                            return Err(format!(
+                                "SAL space exhausted during backfill exchange relay \
+                                 ({} bytes left)", remaining));
+                        }
                         let prep = self.prepare_relay(relay)?;
                         self.emit_relay(prep)?;
                     }
@@ -651,26 +661,50 @@ impl MasterDispatcher {
     // Exchange relay
     // -----------------------------------------------------------------------
 
-    /// CPU-only first half of exchange relay: looks up shard columns via
-    /// the catalog DAG, scatters the payloads into per-worker batches,
-    /// True when enough SAL space remains for a relay write.  The threshold
-    /// mirrors the one in `prepare_relay` but is checked *before* consuming
-    /// the relay so a low-space condition can be resolved (checkpoint) rather
-    /// than silently discarding the relay and deadlocking blocked workers.
+    #[cfg(debug_assertions)]
+    fn seam_armed_epoch() -> &'static std::sync::atomic::AtomicU32 {
+        static ARMED: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(u32::MAX);
+        &ARMED
+    }
+
+    /// True when enough SAL space remains for a relay write (>= 1/8 of the
+    /// mmap). Checked *before* consuming a relay so a low-space condition
+    /// can be resolved (checkpoint) rather than silently discarding the
+    /// relay and deadlocking blocked workers. While the debug seam is armed,
+    /// reports low until the next checkpoint bumps the SAL epoch.
     pub(crate) fn sal_has_relay_space(&self) -> bool {
+        #[cfg(debug_assertions)]
+        if Self::seam_armed_epoch().load(std::sync::atomic::Ordering::Relaxed)
+            == self.sal.epoch()
+        {
+            return false;
+        }
         self.sal.mmap_size() - self.sal.cursor() >= (self.sal.mmap_size() >> 3)
     }
 
-    /// and collects column names. No SAL write yet — `relay_loop` runs
-    /// this without `sal_writer_excl` so the lock covers only the
-    /// synchronous SAL write in `emit_relay`.
-    pub(crate) fn prepare_relay(&mut self, relay: PendingRelay) -> Result<RelayPrepared, String> {
-        let remaining = self.sal.mmap_size() - self.sal.cursor();
-        if remaining < (self.sal.mmap_size() >> 3) {
-            return Err(format!(
-                "SAL space exhausted during exchange relay ({} bytes left)", remaining));
+    /// relay_loop's variant: with GNITZ_INJECT_RELAY_SPACE_LOW set, the first
+    /// call arms the seam at the current epoch (one-shot: the CAS from the
+    /// u32::MAX sentinel succeeds once per process), then defers to
+    /// sal_has_relay_space() so relay_loop and the committer see the same
+    /// verdict until a checkpoint bumps the epoch and disarms it.
+    pub(crate) fn sal_has_relay_space_arming(&self) -> bool {
+        #[cfg(debug_assertions)]
+        if std::env::var("GNITZ_INJECT_RELAY_SPACE_LOW").is_ok() {
+            let _ = Self::seam_armed_epoch().compare_exchange(
+                u32::MAX, self.sal.epoch(),
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed);
         }
+        self.sal_has_relay_space()
+    }
 
+    /// CPU-only first half of exchange relay: looks up shard columns via
+    /// the catalog DAG, scatters the payloads into per-worker batches, and
+    /// collects column names. No SAL write yet — `relay_loop` runs this
+    /// without `sal_writer_excl` so the lock covers only the synchronous
+    /// SAL write in `emit_relay`.
+    pub(crate) fn prepare_relay(&mut self, relay: PendingRelay) -> Result<RelayPrepared, String> {
         let PendingRelay { view_id, payloads, schema, source_id } = relay;
 
         let cat = unsafe { &mut *self.catalog };

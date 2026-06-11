@@ -523,33 +523,18 @@ async fn run_tick(
 /// (needs sal_writer_excl), neither of which can block-acquire from
 /// inside the reactor's tick.
 ///
-/// V.7 liveness: the loop never exits on inner errors; only an
-/// unrecoverable channel close (all senders dropped) terminates it.
+/// A lost relay wedges workers blocked in `do_exchange_wait` forever
+/// (they ACK neither tick nor relay and the master stays alive), so both
+/// failure modes — an `emit_relay` error and no space after a reclaim
+/// checkpoint — `gnitz_fatal_abort!` rather than warn-and-drop: a loud,
+/// recoverable crash (workers self-exit via `getppid()`, operator
+/// restarts) beats a silent permanent cluster wedge.
 async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
     loop {
         let relay = match rx.recv().await {
             Some(r) => r,
             None => return,
         };
-
-        // Check space BEFORE consuming the relay. If SAL capacity is low,
-        // force a checkpoint to reclaim space. A lost relay causes an
-        // unrecoverable cluster deadlock (workers in do_exchange_wait block
-        // indefinitely), so gnitz_fatal_abort! is correct if space remains
-        // exhausted after the checkpoint.
-        let space_ok = unsafe { (*shared.dispatcher).sal_has_relay_space() };
-        if !space_ok {
-            gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
-            let (tx, rx_done) = oneshot::channel();
-            shared.committer_tx.send(CommitRequest::Barrier { done: tx });
-            let _ = rx_done.await;
-            if !unsafe { (*shared.dispatcher).sal_has_relay_space() } {
-                gnitz_fatal_abort!(
-                    "SAL space exhausted even after forced checkpoint; \
-                     cannot deliver exchange relay — aborting to prevent cluster deadlock"
-                );
-            }
-        }
 
         // Phase 1: CPU work + catalog read only — no SAL mutex.
         let prep = {
@@ -561,14 +546,40 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
                 Err(e) => gnitz_fatal_abort!("prepare_relay failed: {}", e),
             }
         };
-        // Phase 2: SAL write only — grab the mutex, no awaits inside.
-        {
-            let _sal = shared.sal_writer_excl.lock().await;
-            if let Err(e) = guard_panic("emit_relay", || unsafe {
-                (*shared.dispatcher).emit_relay(prep)
-            }) {
-                gnitz_warn!("emit_relay failed: {}", e);
+
+        // Phase 2: emit under the SAL mutex. The space check shares the
+        // lock with the write, so no other SAL writer can consume the
+        // margin in between. The barrier await MUST happen with the lock
+        // dropped: the committer's checkpoint takes sal_writer_excl, so
+        // holding it across the barrier deadlocks master-side.
+        let mut prep = Some(prep);
+        let mut reclaimed = false;
+        loop {
+            {
+                let _sal = shared.sal_writer_excl.lock().await;
+                if unsafe { (*shared.dispatcher).sal_has_relay_space_arming() } {
+                    if let Err(e) = guard_panic("emit_relay", || unsafe {
+                        (*shared.dispatcher).emit_relay(
+                            prep.take().expect("relay emitted once"))
+                    }) {
+                        gnitz_fatal_abort!(
+                            "emit_relay failed; a lost relay wedges workers \
+                             blocked in exchange wait: {}", e);
+                    }
+                    break;
+                }
+                if reclaimed {
+                    gnitz_fatal_abort!(
+                        "SAL space exhausted even after forced checkpoint; \
+                         cannot deliver exchange relay — aborting to prevent \
+                         cluster deadlock");
+                }
             }
+            gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
+            let (tx, rx_done) = oneshot::channel();
+            shared.committer_tx.send(CommitRequest::Barrier { done: tx });
+            let _ = rx_done.await;
+            reclaimed = true;
         }
     }
 }
