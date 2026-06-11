@@ -318,7 +318,14 @@ impl WorkerProcess {
 
     // ── Main event loop ────────────────────────────────────────────────
 
-    pub fn run(&mut self) -> i32 {
+    pub fn run(&mut self, boot_error: Option<String>) -> i32 {
+        if let Some(e) = boot_error {
+            // Master's wait_all_workers turns this nonzero status into a boot
+            // abort BEFORE the SAL sentinel is zeroed — the replayed data's
+            // only durable copy survives for the next boot.
+            self.send_error(&e, 0);
+            return 1;
+        }
         // Startup ACK is unsolicited; request_id=0 is the reserved untagged slot.
         self.send_ack(0, 0, 0);
 

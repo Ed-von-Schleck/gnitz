@@ -347,6 +347,17 @@ impl PartitionedTable {
         self.tables.iter().map(|t| t.current_lsn).max().unwrap_or(0)
     }
 
+    /// Recovery watermark: the **min** `current_lsn` across partitions, 0 when
+    /// empty. `flush` commits partitions sequentially, so a partial family
+    /// flush (ENOSPC/EIO on a later partition after an earlier one committed)
+    /// advances only the committed partitions' counters. The recovery dedupe
+    /// filter must use this floor — skipping by the max would drop committed
+    /// SAL zones whose rows the lagging partition never flushed. Under-dedupe
+    /// (re-replaying already-flushed zones) is safe: replay is idempotent.
+    pub fn min_flushed_lsn(&self) -> u64 {
+        self.tables.iter().map(|t| t.current_lsn).min().unwrap_or(0)
+    }
+
     // ------------------------------------------------------------------
     // Partition lifecycle
     // ------------------------------------------------------------------
@@ -832,5 +843,88 @@ mod tests {
             assert!(seen.contains(&pk), "pk {pk} missing from create_cursor_compacting");
         }
         assert_eq!(seen.len(), rows.len(), "all rows surfaced via compacting cursor");
+    }
+
+    /// Recovery watermark after a *partial* family flush. `flush` commits
+    /// partitions sequentially, so ENOSPC/EIO on a later partition leaves an
+    /// earlier one's manifest advanced while the lagging partition's rows stay
+    /// only in the SAL. The recovery dedupe filter must read the **min**
+    /// `current_lsn` (`min_flushed_lsn`), not the max (`current_lsn`): skipping
+    /// by the max over-skips committed SAL zones the lagging partition never
+    /// flushed, silently dropping its rows on the next boot. Red before the
+    /// fix — `min_flushed_lsn` did not exist and recovery used the max.
+    #[test]
+    fn min_flushed_lsn_floors_recovery_watermark_after_partial_flush() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("pt_partial_flush_lsn");
+        let path = tdir.to_str().unwrap().to_owned();
+
+        // Two live partitions (0 and 1) of a 256-way durable table.
+        let open = || PartitionedTable::new(
+            &path, "test", make_schema(), 830, 256, Persistence::Durable, 0, 2,
+            partition_arena_size(256),
+        ).unwrap();
+        let mut pt = open();
+
+        // PKs that route to live partitions 0 and 1 (narrow PK ⇒
+        // partition_for_key matches the stored-bytes routing).
+        let mut p0 = Vec::new();
+        let mut p1 = Vec::new();
+        for k in 0u64..200_000 {
+            match partition_for_key(k as u128) {
+                0 if p0.len() < 3 => p0.push(k),
+                1 if p1.is_empty() => p1.push(k),
+                _ => {}
+            }
+            if p0.len() == 3 && !p1.is_empty() { break; }
+        }
+        assert_eq!((p0.len(), p1.len()), (3, 1), "need PKs routed to partitions 0 and 1");
+
+        // Each durable Table::ingest bumps that partition's current_lsn by 1.
+        // Partition A (0) takes three ingests, B (1) one, so A leads.
+        for &k in &p0 {
+            pt.ingest_owned_batch(make_batch(&[(k, 1, k as i64)])).unwrap();
+        }
+        pt.ingest_owned_batch(make_batch(&[(p1[0], 1, 0)])).unwrap();
+
+        let lsn_a = pt.tables[0].current_lsn;
+        let lsn_b = pt.tables[1].current_lsn;
+        assert!(lsn_a > lsn_b, "partition A must lead before the partial flush ({lsn_a} vs {lsn_b})");
+
+        // Partial family flush: only partition A commits a durable shard; B's
+        // rows stay in its memtable (the ENOSPC-on-B case).
+        assert!(pt.tables[0].flush().unwrap(), "partition A flush must write a shard");
+        drop(pt);
+
+        // Next boot: reopen both partitions from disk.
+        let pt2 = open();
+        let a_reloaded = pt2.tables[0].current_lsn;
+        let b_reloaded = pt2.tables[1].current_lsn;
+
+        // A's flushed shard stamps lsn_max = current_lsn-1; reopen restores +1.
+        // B never flushed, so it reopens at the floor, below A.
+        assert_eq!(a_reloaded, lsn_a, "flushed partition keeps its LSN across reopen");
+        assert!(
+            b_reloaded < a_reloaded,
+            "unflushed partition B reopens below A ({b_reloaded} vs {a_reloaded})",
+        );
+
+        // The fix: recovery aggregates with min, so B's still-in-SAL zones
+        // replay. The max (current_lsn) would skip them and drop B's rows.
+        assert_eq!(
+            pt2.min_flushed_lsn(), b_reloaded,
+            "recovery watermark is the lagging partition's floor",
+        );
+        assert!(pt2.min_flushed_lsn() < a_reloaded);
+        assert_eq!(pt2.current_lsn(), a_reloaded, "current_lsn still reports the max for the allocator");
+
+        // The StoreHandle dispatch the recovery walk actually calls (dag.rs)
+        // must route Partitioned → min for recovery_lsn and → max for current_lsn.
+        let handle = crate::dag::StoreHandle::Partitioned(
+            std::cell::UnsafeCell::new(Box::new(pt2)),
+        );
+        assert_eq!(handle.recovery_lsn(), b_reloaded);
+        assert_eq!(handle.current_lsn(), a_reloaded);
     }
 }

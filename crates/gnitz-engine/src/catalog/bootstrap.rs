@@ -367,12 +367,18 @@ impl CatalogEngine {
     // -- Close engine ------------------------------------------------------
 
     /// Flush all system tables (memtable → shard). Called at checkpoint and close.
-    pub fn flush_all_system_tables(&mut self) {
+    /// Returns the first failure (with the offending sys table id) so the boot
+    /// path can abort before the SAL — the only durable copy of replayed DDL —
+    /// is reset.
+    pub fn flush_all_system_tables(&mut self) -> Result<(), String> {
         for info in SYS_TAB_INFOS {
             if let Some(table) = self.sys_table_mut(info.id) {
-                let _ = table.flush_durable();
+                table.flush_durable().map_err(|e| {
+                    format!("boot flush of system table {} failed: {}", info.id, e)
+                })?;
             }
         }
+        Ok(())
     }
 
     /// Graceful close for tests; the server never closes the catalog (it
@@ -390,6 +396,6 @@ impl CatalogEngine {
         }
         // tables.clear() in dag.close() drops Box<PartitionedTable> automatically.
         self.dag.close();
-        self.flush_all_system_tables();
+        let _ = self.flush_all_system_tables();
     }
 }

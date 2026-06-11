@@ -545,3 +545,123 @@ def test_recreated_schema_survives_recovery():
         _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_worker_boot_flush_failure_preserves_sal():
+    """A worker boot-flush failure must abort boot BEFORE the master zeroes the
+    SAL's first commit sentinel, so the replayed-but-unflushed rows' only
+    durable copy (the SAL) survives for the next boot.
+
+    Without the fix the worker swallows the flush error, acks readiness, and
+    the master resets the SAL — destroying the only durable copy of every
+    pre-crash row that had not yet been checkpointed.
+    """
+    if not _is_debug_build():
+        pytest.skip("requires debug build (GNITZ_INJECT_BOOT_FLUSH_ERROR seam)")
+
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # ---- Phase 1: create table, push rows, kill before any checkpoint. -
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("boot_flush")
+        conn.execute_sql(
+            "CREATE TABLE t ("
+            "  pk BIGINT NOT NULL PRIMARY KEY,"
+            "  val BIGINT NOT NULL)",
+            schema_name="boot_flush",
+        )
+        conn.execute_sql(
+            "INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)",
+            schema_name="boot_flush",
+        )
+        conn.close()
+        # Hard kill: the rows live only in the SAL + memtable, never flushed.
+        _stop_server(proc)
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 2: boot with the injected flush fault must FAIL. --------
+        # Every worker reports the boot-flush failure on its startup ACK; the
+        # master aborts in collect_acks before resetting the SAL.
+        proc = _start_server(
+            data_dir, sock_path, workers=_NUM_WORKERS,
+            extra_env={"GNITZ_INJECT_BOOT_FLUSH_ERROR": "1"},
+            expect_socket=False,
+        )
+        rc = proc.wait(timeout=15)
+        assert rc != 0, f"boot should have aborted on the flush fault, got rc={rc}"
+        assert not os.path.exists(sock_path), "failed boot must not accept requests"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 3: a clean boot recovers every pre-crash row. ----------
+        # Proves the failed boot left the SAL intact.
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        tid, _ = conn.resolve_table("boot_flush", "t")
+        rows = list(conn.scan(tid))
+        assert len(rows) == 3, f"expected 3 rows after the failed boot, got {rows}"
+        assert {r["pk"] for r in rows} == {1, 2, 3}, "wrong PKs after recovery"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_master_sys_flush_failure_preserves_sal():
+    """A master system-table boot-flush failure must abort boot BEFORE the SAL
+    reset, so the replayed-but-unflushed DDL's only durable copy (the SAL)
+    survives.
+
+    Without the fix the error is swallowed and the SAL is reset; after a later
+    crash the catalog reverts to its pre-DDL state and gc_orphan_directories
+    deletes the now-catalog-less entities' directories.
+    """
+    if not _is_debug_build():
+        pytest.skip("requires debug build (GNITZ_INJECT_SYS_FLUSH_ERROR seam)")
+
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # ---- Phase 1: create a table, kill before any checkpoint. ---------
+        # The DDL is committed in the SAL but not yet flushed to the
+        # system-table shards.
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("sys_flush")
+        conn.execute_sql(
+            "CREATE TABLE t ("
+            "  pk BIGINT NOT NULL PRIMARY KEY,"
+            "  val BIGINT NOT NULL)",
+            schema_name="sys_flush",
+        )
+        conn.close()
+        _stop_server(proc)
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 2: boot with the injected sys-flush fault must FAIL. ----
+        # The master aborts after recover_system_tables_from_sal, before the
+        # fork and long before the SAL reset.
+        proc = _start_server(
+            data_dir, sock_path, workers=_NUM_WORKERS,
+            extra_env={"GNITZ_INJECT_SYS_FLUSH_ERROR": "1"},
+            expect_socket=False,
+        )
+        rc = proc.wait(timeout=15)
+        assert rc != 0, f"boot should have aborted on the sys-flush fault, got rc={rc}"
+        assert not os.path.exists(sock_path), "failed boot must not accept requests"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 3: a clean boot recovers the DDL and accepts inserts. ---
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        tid, _ = conn.resolve_table("sys_flush", "t")
+        conn.execute_sql("INSERT INTO t VALUES (7, 700)", schema_name="sys_flush")
+        rows = list(conn.scan(tid))
+        assert len(rows) == 1 and rows[0]["val"] == 700, f"unexpected rows: {rows}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

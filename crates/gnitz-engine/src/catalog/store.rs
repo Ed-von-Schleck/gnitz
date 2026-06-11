@@ -1370,7 +1370,11 @@ impl CatalogEngine {
         }
         for (&tid, entry) in self.dag.tables.iter() {
             if tid >= FIRST_USER_TABLE_ID {
-                map.insert(tid, entry.handle.current_lsn());
+                // recovery_lsn (min across partitions), not current_lsn (max):
+                // a partial family flush must not over-skip a lagging
+                // partition's still-in-SAL rows. The allocator below keeps the
+                // max via max_table_current_lsn for its upper-bound needs.
+                map.insert(tid, entry.handle.recovery_lsn());
             }
         }
         map

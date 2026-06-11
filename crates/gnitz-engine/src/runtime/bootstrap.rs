@@ -319,7 +319,22 @@ pub fn server_main(
     {
         let catalog = unsafe { &mut *catalog_ptr };
         recover_system_tables_from_sal(sal_ptr as *const u8, catalog);
-        catalog.flush_all_system_tables();
+        // Abort before forking workers and long before the SAL reset: the
+        // replayed DDL lives only in master memory until this flush makes it
+        // durable, so a swallowed failure followed by the SAL reset destroys
+        // its only durable copy (and gc_orphan_directories would later delete
+        // the now-catalog-less entities' flushed shards).
+        if let Err(e) = catalog.flush_all_system_tables() {
+            let msg = format!("Error: {}\n", e);
+            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            return 1;
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var("GNITZ_INJECT_SYS_FLUSH_ERROR").is_ok() {
+            let msg = b"Error: injected system table flush fault\n";
+            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            return 1;
+        }
 
         // Reclaim table/view/index directories whose DROP committed but whose
         // deferred deletion was lost to a crash before the next checkpoint.
@@ -455,8 +470,25 @@ pub fn server_main(
             // reset_sal() resets the write cursor to 0, so a second crash before
             // a checkpoint would overwrite SAL entries and make replayed data
             // unreachable (SAL walk stops at the first partially-overwritten group).
+            // The verdict rides the startup ACK (see worker.run): a failed flush
+            // must abort boot before the master zeroes the SAL sentinel, or the
+            // replayed rows' only durable copy is destroyed.
+            let mut boot_flush_err: Option<String> = None;
             for tid in catalog.iter_user_table_ids() {
-                let _ = catalog.flush_family(tid);
+                if let Err(e) = catalog.flush_family(tid) {
+                    boot_flush_err = Some(format!("boot flush of table {tid} failed: {e}"));
+                    break;
+                }
+            }
+            #[cfg(debug_assertions)]
+            if boot_flush_err.is_none()
+                && std::env::var("GNITZ_INJECT_BOOT_FLUSH_ERROR").is_ok()
+            {
+                boot_flush_err = Some("injected boot flush fault".to_string());
+            }
+            if let Some(e) = &boot_flush_err {
+                // stderr is redirected to worker_N.log above.
+                eprintln!("{e}");
             }
 
             catalog.invalidate_all_plans();
@@ -482,10 +514,10 @@ pub fn server_main(
                 sal_reader,
                 w2m_writer,
             );
-            worker.run();
+            let rc = worker.run(boot_flush_err);
 
             // Defensive — WorkerProcess::run() exits via libc::_exit
-            unsafe { libc::_exit(0); }
+            unsafe { libc::_exit(rc); }
         }
 
         worker_pids[w] = pid;

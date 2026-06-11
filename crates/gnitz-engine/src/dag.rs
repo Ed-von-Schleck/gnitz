@@ -194,6 +194,18 @@ impl StoreHandle {
             StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).current_lsn() },
         }
     }
+
+    /// Recovery watermark of the store: the LSN below which committed SAL
+    /// zones may be skipped on replay. Borrowed → `current_lsn`; Partitioned →
+    /// the **min** across partitions (see `PartitionedTable::min_flushed_lsn`),
+    /// so a partial family flush never causes the dedupe filter to over-skip a
+    /// lagging partition's unflushed rows.
+    pub fn recovery_lsn(&self) -> u64 {
+        match self {
+            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).min_flushed_lsn() },
+        }
+    }
 }
 
 impl IndexCircuitEntry {

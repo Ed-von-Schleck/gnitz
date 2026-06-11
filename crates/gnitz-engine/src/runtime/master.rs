@@ -2376,7 +2376,7 @@ impl MasterDispatcher {
     /// collects FLAG_FLUSH ACKs.
     pub(crate) fn checkpoint_post_ack(&mut self) {
         let cat = unsafe { &mut *self.catalog };
-        cat.flush_all_system_tables();
+        let _ = cat.flush_all_system_tables();
         // Now safe: every worker ACKed the FLUSH, so all have consumed past any
         // DROP that gated a directory — hence finished the matching CREATE.
         cat.drain_checkpoint_gated_deletions();
