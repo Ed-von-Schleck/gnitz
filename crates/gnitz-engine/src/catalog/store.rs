@@ -198,21 +198,25 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Visit every positive-weight `sys_indices` row whose owner/source-column
-    /// match `(owner_id, col_idx)`, invoking `f(index_id, is_unique)` for each.
-    /// Centralises the IDX_TAB cursor walk shared by the DROP INDEX uniqueness
-    /// checks (the drop-time FK guard in `precheck_sys_ingest` and the
-    /// post-retraction circuit demotion in `hook_index_register`). Rows that have
-    /// already netted to zero weight are skipped by the cursor.
-    pub(crate) fn for_each_index_on_column(
-        &self, owner_id: i64, col_idx: usize, mut f: impl FnMut(i64, bool),
+    /// Visit every positive-weight `sys_indices` row whose owner and **exact
+    /// column list** match `(owner_id, cols)`, invoking `f(index_id, is_unique)`
+    /// for each. Centralises the IDX_TAB cursor walk shared by the DROP INDEX
+    /// uniqueness checks (the drop-time FK guard in `precheck_sys_ingest` and the
+    /// post-retraction circuit demotion in `hook_index_register`). The persisted
+    /// `source_cols` field is the packed `u64` (flag bit 63 set for the packed
+    /// form), so decode it via `unpack_pk_cols` and compare ordered lists — a
+    /// bare compare would never match a packed row. Rows that have already netted
+    /// to zero weight are skipped by the cursor.
+    pub(crate) fn for_each_index_on_cols(
+        &self, owner_id: i64, cols: &[u32], mut f: impl FnMut(i64, bool),
     ) {
         let mut cursor = self.sys_indices.open_cursor();
         while cursor.cursor.valid {
             if cursor.cursor.current_weight > 0 {
                 let row_owner = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
-                let row_col   = cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COL_IDX) as usize;
-                if row_owner == owner_id && row_col == col_idx {
+                let row_cols  = gnitz_wire::unpack_pk_cols(
+                    cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COLS));
+                if row_owner == owner_id && row_cols.as_slice() == cols {
                     let row_id  = cursor.cursor.current_key as u64 as i64;
                     let is_uniq = cursor_read_u64(&cursor, IDXTAB_COL_IS_UNIQUE) != 0;
                     f(row_id, is_uniq);
@@ -308,8 +312,16 @@ impl CatalogEngine {
                 }
                 IDX_TAB_ID => {
                     let owner_id = self.read_batch_u64(batch, i, 0) as i64;
-                    let source_col_idx = self.read_batch_u64(batch, i, 2) as usize;
+                    // source_cols carries pack_pk_cols(&col_indices); decode and
+                    // validate each column (a single-column index is the 1-element
+                    // degenerate case).
+                    let cols = gnitz_wire::unpack_pk_cols(self.read_batch_u64(batch, i, 2));
                     let index_name = self.read_batch_string(batch, i, 3);
+                    if !cols.is_well_formed() {
+                        return Err(format!(
+                            "Index: column list count {} out of range 1..={}",
+                            cols.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS));
+                    }
 
                     let entry = self.dag.tables.get(&owner_id)
                         .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
@@ -328,19 +340,17 @@ impl CatalogEngine {
                         return Err(format!("Index: owner {} is not a base table", owner_id));
                     }
 
-                    if source_col_idx >= entry.schema.num_columns() {
-                        return Err(format!(
-                            "Index: column index {} out of bounds for table '{}' \
-                             (tid={}, columns={})",
-                            source_col_idx,
+                    // Bounds, per-column eligibility (STRING/BLOB/float), and
+                    // arity/stride limits, identical to what registration will
+                    // enforce — only the table-name context is added here.
+                    make_index_schema(cols.as_slice(), &entry.schema).map_err(|e| {
+                        format!(
+                            "{} for table '{}' (tid={})",
+                            e,
                             self.caches.entity_by_id.get(&owner_id)
                                 .map(|(_, n)| n.as_str()).unwrap_or("?"),
-                            owner_id,
-                            entry.schema.num_columns()));
-                    }
-
-                    let col_type = entry.schema.columns[source_col_idx].type_code;
-                    get_index_key_type(col_type)?;
+                            owner_id)
+                    })?;
 
                     let idx_id = batch.get_pk(i) as i64;
                     if let Some(&existing) = self.caches.index_by_name.get(&index_name) {
@@ -380,7 +390,7 @@ impl CatalogEngine {
                         return Err("Integrity violation: cannot drop an internal FK index".into());
                     }
                 }
-                let (owner_id, src_col) = {
+                let (owner_id, cols) = {
                     let mut cursor = self.sys_indices.open_cursor();
                     // sys_indices has a single U64 PK; OPK == big-endian.
                     cursor.cursor.seek_bytes(&(idx_id as u64).to_be_bytes());
@@ -388,8 +398,13 @@ impl CatalogEngine {
                         continue;
                     }
                     (cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64,
-                     cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COL_IDX) as usize)
+                     gnitz_wire::unpack_pk_cols(cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COLS)))
                 };
+                // FK backing is single-column: a composite index never satisfies
+                // a single-column FK/uniqueness requirement, so dropping
+                // one is never blocked by the FK-target guard.
+                if cols.as_slice().len() != 1 { continue; }
+                let src_col = cols.as_slice()[0] as usize;
                 if self.fk_children_of(owner_id).iter().any(|r| r.parent_col_idx == src_col) {
                     // The FK target column must retain uniqueness for FK child
                     // inserts to validate. The drop is allowed when uniqueness is
@@ -405,7 +420,7 @@ impl CatalogEngine {
                         // still present) for any other unique index on this column
                         // that would survive (exclude every id in this drop batch).
                         let mut unique_remains = false;
-                        self.for_each_index_on_column(owner_id, src_col, |row_id, is_uniq| {
+                        self.for_each_index_on_cols(owner_id, &[src_col as u32], |row_id, is_uniq| {
                             if is_uniq && drop_ids.binary_search(&row_id).is_err() {
                                 unique_remains = true;
                             }
@@ -892,39 +907,41 @@ impl CatalogEngine {
         Ok(out)
     }
 
-    /// Index-assisted lookup: prefix-scan the index by the leading indexed
-    /// column value, reconstruct the source PK from the index PK suffix,
-    /// and resolve to the source row.
+    /// Index-assisted lookup: prefix-scan the index by `natives` — the native
+    /// key values of the leading `natives.len()` indexed columns
+    /// (`natives.len()` may be `< col_indices.len()` for a leading-prefix
+    /// scan) — reconstruct the source PK from the index PK suffix, and resolve
+    /// to the source rows.
     ///
-    /// `prefix` is the indexed column value in LE bytes (at most 8 bytes for
-    /// a promoted U64 — `make_index_schema` always promotes to ≤8). The
-    /// trailing bytes of the stored index PK are zero in `batch_project_index`
-    /// for narrow indexed columns, so a `starts_with(prefix)` check terminates
-    /// the scan at the right key boundary.
-    pub fn seek_by_index(&mut self, table_id: i64, col_idx: u32, prefix: &[u8])
+    /// Rows with a NULL in ANY indexed column are absent from the index
+    /// (`batch_project_index` skips them), so a prefix scan returns only rows
+    /// whose trailing indexed columns are all non-NULL — the SQL planner must
+    /// not serve a prefix predicate from an index whose uncovered trailing
+    /// columns are nullable.
+    pub fn seek_by_index(&mut self, table_id: i64, col_indices: &[u32], natives: &[u128])
         -> Result<Option<Batch>, String>
     {
         let entry = self.dag.tables.get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
 
         let ic = entry.index_circuits.iter()
-            .find(|ic| ic.col_idx == col_idx)
-            .ok_or_else(|| format!("No index on col_idx {} for table {}", col_idx, table_id))?;
+            .find(|ic| ic.col_indices.as_slice() == col_indices)
+            .ok_or_else(|| format!("No index on cols {:?} for table {}", col_indices, table_id))?;
 
         let src_pk_stride = entry.schema.pk_stride() as usize;
-        let idx_key_size = ic.index_schema.columns[0].size() as usize;
-        let idx_key_type = ic.index_schema.columns[0].type_code;
+        // The full leading-key region width = sum over ALL indexed columns'
+        // promoted widths; the source PK suffix begins there.
+        let idx_key_size: usize = (0..col_indices.len())
+            .map(|i| ic.index_schema.columns[i].size() as usize)
+            .sum();
 
-        // `prefix` is the indexed value in native little-endian bytes (source-
-        // column width). The index PK region is OPK-at-rest, so zero-extend to
-        // the promoted index key width and OPK-encode to match stored entries.
-        let mut native_le = [0u8; 16];
-        let n = prefix.len().min(idx_key_size);
-        native_le[..n].copy_from_slice(&prefix[..n]);
-        let opk = crate::schema::index_opk_prefix(
-            u128::from_le_bytes(native_le), idx_key_type, idx_key_size,
+        // OPK-encode each supplied native into its slot. The index PK region is
+        // OPK-at-rest, so the prefix must be order-preserving to match stored
+        // entries (`batch_project_index` encodes identically).
+        let (opk, prefix_len) = crate::schema::index_opk_prefix_composite(
+            natives, &ic.index_schema.columns[..natives.len()],
         );
-        let opk_prefix = &opk[..idx_key_size];
+        let opk_prefix = &opk[..prefix_len];
 
         let idx_table = ic.table_mut();
         let mut cursor = idx_table.open_cursor();
@@ -1117,20 +1134,31 @@ impl CatalogEngine {
             .unwrap_or(0)
     }
 
-    /// Get index circuit info at index: (col_idx, is_unique, type_code).
+    /// Get index circuit info at index: (col_indices, is_unique). Production
+    /// consumers go through `unique_index_circuit_col` / `index_circuit_for_cols`;
+    /// only the catalog tests enumerate raw circuit info.
+    #[cfg(test)]
     pub fn get_index_circuit_info(&self, table_id: i64, idx: usize)
-        -> Option<(u32, bool, u8)>
+        -> Option<(PkColList, bool)>
     {
         let entry = self.dag.tables.get(&table_id)?;
         let ic = entry.index_circuits.get(idx)?;
-        let type_code = entry.schema.columns[ic.col_idx as usize].type_code;
-        Some((ic.col_idx, ic.is_unique, type_code))
+        Some((ic.col_indices, ic.is_unique))
     }
 
-    /// Get index store handle for a specific column index (for worker has_pk via index).
-    pub fn get_index_store_handle(&self, table_id: i64, col_idx: u32) -> *const Table {
+    /// The source column of the unique circuit at position `idx`, `None` when
+    /// the circuit is missing or non-unique. The unique-enforcement machinery
+    /// (routing cache, filters, has_pk pre-checks) iterates circuits through
+    /// this single accessor — see `IndexCircuitEntry::unique_col`.
+    pub fn unique_index_circuit_col(&self, table_id: i64, idx: usize) -> Option<u32> {
+        self.dag.tables.get(&table_id)?.index_circuits.get(idx)?.unique_col()
+    }
+
+    /// Get index store handle for an exact column list (for worker has_pk via
+    /// a unique index — always single-column today).
+    pub fn get_index_store_handle(&self, table_id: i64, cols: &[u32]) -> *const Table {
         self.dag.tables.get(&table_id)
-            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == col_idx))
+            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
             .map(|ic| ic.table_mut() as *const Table)
             .unwrap_or(std::ptr::null())
     }
@@ -1155,11 +1183,11 @@ impl CatalogEngine {
     /// `ic.is_unique` (unicast a unique match to one worker, broadcast-and-merge
     /// a non-unique one). Returning the entry means callers scan the circuit
     /// list once and cannot ask whether a non-existent index is unique.
-    pub fn index_circuit_for_col(
-        &self, table_id: i64, col_idx: u32,
+    pub fn index_circuit_for_cols(
+        &self, table_id: i64, cols: &[u32],
     ) -> Option<&crate::dag::IndexCircuitEntry> {
         self.dag.tables.get(&table_id)
-            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == col_idx))
+            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
     }
 
     /// True if the table has at least one unique secondary index circuit.
@@ -1201,10 +1229,10 @@ impl CatalogEngine {
             .map(|r| (r.child_tid, r.fk_col_idx, r.parent_col_idx))
     }
 
-    /// Get the index schema for a specific column's FK index on a table.
-    pub fn get_index_schema_by_col(&self, table_id: i64, col_idx: u32) -> Option<SchemaDescriptor> {
+    /// Get the index schema for a specific column list's index on a table.
+    pub fn get_index_schema_by_cols(&self, table_id: i64, cols: &[u32]) -> Option<SchemaDescriptor> {
         self.dag.tables.get(&table_id)
-            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == col_idx))
+            .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
             .map(|ic| ic.index_schema)
     }
 

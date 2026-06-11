@@ -226,9 +226,10 @@ int gnitz_seek(GnitzConn *conn,
 
 int gnitz_seek_by_index(GnitzConn *conn,
                         uint64_t table_id,
-                        uint64_t col_idx,
-                        uint64_t key_lo,
-                        uint64_t key_hi,
+                        const uint32_t *col_indices_ptr,
+                        size_t n_cols,
+                        const uint64_t *key_vals_ptr,
+                        size_t n_vals,
                         GnitzBatch **out_batch);
 
 int gnitz_execute_sql(GnitzConn *conn, const char *sql, const char *schema, uint64_t *out_id);

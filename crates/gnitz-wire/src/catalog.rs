@@ -188,12 +188,35 @@ impl PkColList {
         cols[0] = idx;
         PkColList { cols, len: 1 }
     }
+    /// Construct from a column-index slice. Panics on an out-of-range length
+    /// (`1..=PK_LIST_MAX_COLS`) — like `pack_pk_cols`, callers must validate the
+    /// arity before constructing, because a silent clamp here would desync the
+    /// list from the persisted/packed form it round-trips with.
+    pub fn from_slice(cols: &[u32]) -> Self {
+        assert!(
+            (1..=PK_LIST_MAX_COLS).contains(&cols.len()),
+            "PkColList::from_slice: count {} out of range 1..={PK_LIST_MAX_COLS}",
+            cols.len(),
+        );
+        let mut arr = [0u32; PK_LIST_MAX_COLS];
+        arr[..cols.len()].copy_from_slice(cols);
+        PkColList { cols: arr, len: cols.len() }
+    }
     /// The count exactly as decoded from the wire. May be 0 or larger than
     /// `PK_LIST_MAX_COLS` for a malformed/crafted packed value — deliberately
-    /// NOT clamped, because `validate_pk_cols` gates on this raw value to
+    /// NOT clamped, because `is_well_formed` gates on this raw value to
     /// reject out-of-range counts. Not a safe slice length: iterate
     /// `as_slice()` instead.
     pub fn decoded_count(&self) -> usize { self.len }
+    /// True iff the decoded count is a valid list length
+    /// (`1..=PK_LIST_MAX_COLS`). Every consumer of a wire-decoded list must
+    /// gate on this before trusting `as_slice()`: a crafted packed value can
+    /// carry a zero or over-range count, and `as_slice()` silently clamps —
+    /// so without this check an over-range list reads back truncated and an
+    /// empty one reads back as zero columns.
+    pub fn is_well_formed(&self) -> bool {
+        (1..=PK_LIST_MAX_COLS).contains(&self.len)
+    }
     /// Always in bounds: indexes at most the `PK_LIST_MAX_COLS`-element
     /// backing array even when the decoded count is out of range. A crafted
     /// over-range wire count must NOT panic here — it has to survive long
@@ -201,10 +224,31 @@ impl PkColList {
     pub fn as_slice(&self) -> &[u32] { &self.cols[..self.len.min(PK_LIST_MAX_COLS)] }
 }
 
+/// The `Err`-returning form of [`pack_pk_cols`]' panicking contract, plus the
+/// no-duplicates rule both consumers (table PKs and index column lists) share:
+/// count in `1..=PK_LIST_MAX_COLS`, every index within the 7-bit field, no
+/// repeated column. Call this at user-input boundaries so `pack_pk_cols` and
+/// `PkColList::from_slice` can never panic downstream.
+pub fn validate_pk_col_list(cols: &[u32]) -> Result<(), String> {
+    if !(1..=PK_LIST_MAX_COLS).contains(&cols.len()) {
+        return Err(format!(
+            "column count {} out of range 1..={PK_LIST_MAX_COLS}", cols.len()));
+    }
+    for (i, &c) in cols.iter().enumerate() {
+        if c >= 128 {
+            return Err(format!("column index {c} exceeds 127"));
+        }
+        if cols[..i].contains(&c) {
+            return Err(format!("duplicate column {c} in list"));
+        }
+    }
+    Ok(())
+}
+
 /// Pack a PK column-index list into the persisted `u64` form. Panics on a
 /// violated contract because a silent truncation here corrupts the
 /// catalog encoding; callers (client + engine) must reject out-of-range
-/// lists before calling this.
+/// lists before calling this (see [`validate_pk_col_list`]).
 pub fn pack_pk_cols(pk_cols: &[u32]) -> u64 {
     assert!(
         (1..=PK_LIST_MAX_COLS).contains(&pk_cols.len()),
@@ -234,4 +278,40 @@ pub fn unpack_pk_cols(packed: u64) -> PkColList {
         *slot = ((packed >> (4 + 7 * i)) & 0x7f) as u32;
     }
     PkColList { cols, len: n }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_slice_roundtrips_as_slice() {
+        for cols in [
+            vec![0u32],
+            vec![3u32],
+            vec![1u32, 2],
+            vec![2u32, 5, 7],
+            vec![9u32, 1, 4, 6],
+        ] {
+            let list = PkColList::from_slice(&cols);
+            assert_eq!(list.as_slice(), cols.as_slice());
+            assert_eq!(list.decoded_count(), cols.len());
+        }
+    }
+
+    #[test]
+    fn from_slice_matches_pack_unpack_roundtrip() {
+        // from_slice and pack→unpack must agree for every 1..=PK_LIST_MAX_COLS list.
+        for cols in [vec![0u32], vec![1u32, 127], vec![5u32, 6, 7], vec![1u32, 2, 3, 4]] {
+            let via_slice = PkColList::from_slice(&cols);
+            let via_wire = unpack_pk_cols(pack_pk_cols(&cols));
+            assert_eq!(via_slice, via_wire);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn from_slice_panics_on_empty() {
+        let _ = PkColList::from_slice(&[]);
+    }
 }

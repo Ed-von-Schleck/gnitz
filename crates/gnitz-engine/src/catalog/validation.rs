@@ -31,8 +31,10 @@ impl CatalogEngine {
             let pk = entry.schema.pk_indices();
             let is_lone_pk = pk.len() == 1 && pk[0] == col.fk_col_idx;
             if !is_lone_pk {
+                // A composite index does not satisfy a single-column FK: a
+                // unique (a, b) does not guarantee uniqueness of `a` alone.
                 let has_unique = entry.index_circuits.iter()
-                    .any(|ic| ic.col_idx == col.fk_col_idx && ic.is_unique);
+                    .any(|ic| ic.unique_col() == Some(col.fk_col_idx));
                 if !has_unique {
                     return Err(
                         "FK must reference the primary key or a UNIQUE-indexed column".into()
@@ -90,8 +92,10 @@ impl CatalogEngine {
             let idx_ic = if is_lone_pk {
                 None
             } else {
+                // A composite index does not satisfy a single-column FK:
+                // match a single-column unique circuit exactly.
                 Some(target_entry.index_circuits.iter()
-                    .find(|ic| ic.col_idx as usize == target_col_idx && ic.is_unique)
+                    .find(|ic| ic.unique_col() == Some(target_col_idx as u32))
                     .ok_or_else(|| format!(
                         "FK target {} col {} has no UNIQUE index", target_id, target_col_idx))?)
             };
@@ -229,9 +233,9 @@ impl CatalogEngine {
             FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
 
         for ic in &entry.index_circuits {
-            if !ic.is_unique { continue; }
+            let Some(unique_col) = ic.unique_col() else { continue };
             seen.clear();
-            let source_col_idx = ic.col_idx as usize;
+            let source_col_idx = unique_col as usize;
             // A unique index may be on a PK column (e.g. a single member of a
             // compound PK), whose value lives in the packed PK, not a payload
             // slot. `locate` resolves that once; `is_null` is false for a PK

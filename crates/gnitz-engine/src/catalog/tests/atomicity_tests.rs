@@ -322,7 +322,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
 
     let cols = vec![u64_col_def("id"), i64_col_def("val"), i64_col_def("ts")];
     let tid = engine.create_table("public.idxtest", &cols, &[0], false).unwrap();
-    let orig_idx_id = engine.create_index("public.idxtest", "val", false).unwrap();
+    let orig_idx_id = engine.create_index("public.idxtest", &["val"], false).unwrap();
     let init_rows = count_records(&mut engine.sys_indices);
 
     let orig_name = "public__idxtest__idx_val";
@@ -379,7 +379,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     let owner_dir = format!("{}/public/leaktest_{}", dir, tid);
     let idx_dir = format!("{}/idx_{}", owner_dir, expected_idx_id);
 
-    let result = engine.create_index("public.leaktest", "val", true);
+    let result = engine.create_index("public.leaktest", &["val"], true);
     assert!(result.is_err(), "unique index with duplicate values must fail");
 
     // Simulate compensate_stage_a: drain pending_dir_deletions.

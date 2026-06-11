@@ -165,6 +165,61 @@ pub fn is_pk_eligible(tc: u8) -> bool {
     TypeCode::try_from_u8(tc).is_some_and(|t| t.is_pk_eligible())
 }
 
+/// Promote a base-table column's type to the leading-key type its secondary
+/// index stores: a ≤8-byte integer (U8..U64, I8..I64) promotes to `U64`;
+/// `U128`/`UUID` keep their 16-byte width; STRING/BLOB/float (and any unknown
+/// code) are index-ineligible and return `Err`. The single source of truth for
+/// index-key promotion, shared by the engine's `make_index_schema` and the SQL
+/// planner's CREATE INDEX limit pre-check so the nice SQL error and the engine
+/// backstop can never disagree on a column's promoted width.
+pub fn index_key_type(field_type_code: u8) -> Result<u8, String> {
+    use type_code as tc;
+    match field_type_code {
+        tc::U128 => Ok(tc::U128),
+        tc::UUID => Ok(tc::UUID),
+        tc::U64 => Ok(tc::U64),
+        tc::I64 | tc::U32 | tc::I32 |
+        tc::U16 | tc::I16 | tc::U8 | tc::I8 => Ok(tc::U64),
+        tc::F32 | tc::F64 | tc::STRING | tc::BLOB => {
+            Err(format!("Secondary index on column type {} not supported", field_type_code))
+        }
+        _ => Err(format!("Unknown column type code: {}", field_type_code)),
+    }
+}
+
+/// Promote every indexed column type via [`index_key_type`] and validate the
+/// resulting index-record layout. An index schema is
+/// `(promoted_0, …, promoted_{n-1}, src_pk_0, …)` with every column in the PK,
+/// so its PK arity is `n + src_pk_count` (capped by `MAX_PK_COLUMNS`) and its
+/// PK stride is `Σ wire_stride(promoted_i) + src_pk_stride` (capped by
+/// `MAX_PK_BYTES`). Returns the promoted type list. The single source of truth
+/// shared by the SQL planner's CREATE INDEX pre-check and the engine's
+/// `make_index_schema`, so the friendly planner error and the engine backstop
+/// can never disagree on a column's promoted width or the limits.
+pub fn index_key_types(
+    col_types: &[u8], src_pk_count: usize, src_pk_stride: usize,
+) -> Result<Vec<u8>, String> {
+    let promoted: Vec<u8> = col_types.iter()
+        .map(|&t| index_key_type(t))
+        .collect::<Result<_, _>>()?;
+    let n = promoted.len();
+    if n + src_pk_count > crate::MAX_PK_COLUMNS {
+        return Err(format!(
+            "index arity {n} + source PK arity {src_pk_count} exceeds the limit of {}",
+            crate::MAX_PK_COLUMNS,
+        ));
+    }
+    let stride: usize =
+        promoted.iter().map(|&t| wire_stride(t)).sum::<usize>() + src_pk_stride;
+    if stride > crate::MAX_PK_BYTES {
+        return Err(format!(
+            "index record stride {stride} exceeds the limit of {} bytes",
+            crate::MAX_PK_BYTES,
+        ));
+    }
+    Ok(promoted)
+}
+
 /// Whether a raw wire type code uses the 16-byte German-string layout. u8-based
 /// counterpart to [`TypeCode::is_german_string`] for callers holding a raw
 /// `type_code` (mirrors the free `wire_stride`/`is_pk_eligible`). Unknown codes
@@ -358,6 +413,21 @@ pub const fn wire_stride(tc: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Index-key promotion: ≤8-byte ints → U64; U128/UUID keep width; STRING/
+    /// BLOB/float (and unknown) are rejected.
+    #[test]
+    fn index_key_type_promotion() {
+        use type_code as tc;
+        for t in [tc::U8, tc::I8, tc::U16, tc::I16, tc::U32, tc::I32, tc::U64, tc::I64] {
+            assert_eq!(index_key_type(t).unwrap(), tc::U64, "{t} must promote to U64");
+        }
+        assert_eq!(index_key_type(tc::U128).unwrap(), tc::U128);
+        assert_eq!(index_key_type(tc::UUID).unwrap(), tc::UUID);
+        for t in [tc::F32, tc::F64, tc::STRING, tc::BLOB] {
+            assert!(index_key_type(t).is_err(), "{t} must be rejected");
+        }
+    }
 
     /// The reindex / `_join_pk` width policy (the single source of truth the
     /// engine compiler and SQL planner both derive from): a ≤8-byte integer key

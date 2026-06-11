@@ -23,7 +23,7 @@ use crate::storage::batch_pool::PooledSendBuf;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES,
                      TABLE_TAB_ID, IDX_TAB_ID,
-                     IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COL_IDX, IDXTAB_PAY_IS_UNIQUE,
+                     IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE,
                      BatchBuilder, index_meta_schema_desc, INDEX_META_COL_NAMES};
 use crate::runtime::committer::{self, CommitRequest};
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, FLAG_GET_INDICES, SchemaWithVersion};
@@ -704,8 +704,10 @@ async fn handle_message(
     if flags & FLAG_SEEK_BY_INDEX != 0 {
         let _g = shared.catalog_rwlock.read().await;
         handle_seek_by_index(shared, fd, client_id, target_id,
-                             decoded.control.seek_col_idx as u32,
-                             decoded.control.seek_pk, client_version).await;
+                             decoded.control.seek_col_idx,        // pack_pk_cols(col_indices)
+                             decoded.control.seek_pk,
+                             &decoded.control.seek_pk_extra,
+                             client_version).await;
         return;
     }
 
@@ -829,9 +831,11 @@ async fn handle_seek(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_seek_by_index(
     shared: &Rc<Shared>, fd: i32, client_id: u64,
-    target_id: i64, col_idx: u32, key: u128, client_version: u16,
+    target_id: i64, seek_col_idx: u64, seek_pk: u128, seek_pk_extra: &[u8],
+    client_version: u16,
 ) {
     if !shared.cat().has_id(target_id) {
         let msg = format!("table {} not found", target_id);
@@ -839,65 +843,70 @@ async fn handle_seek_by_index(
         return;
     }
     if target_id >= FIRST_USER_TABLE_ID {
-        // Reject out-of-range column indices before forwarding to workers, so
-        // the client gets a clean error instead of a worker crash.
+        // seek_col_idx carries pack_pk_cols(col_indices); decode and validate the
+        // full list before classifying. The raw wire value has the packed flag at
+        // bit 63 set, so the old `col_idx as usize >= num_columns` guard would
+        // always trip — validate the unpacked columns instead.
+        let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
         if let Some(schema) = shared.cat().get_schema_desc(target_id) {
-            if col_idx as usize >= schema.num_columns() {
+            let ok = cols.is_well_formed()
+                && cols.as_slice().iter().all(|&c| (c as usize) < schema.num_columns());
+            if !ok {
                 let msg = format!(
-                    "seek_by_index: column index {} out of range for table {}",
-                    col_idx, target_id,
-                );
+                    "seek_by_index: invalid column list for table {}", target_id);
                 send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
                 return;
             }
         }
-        // Single catalog scan classifies the column. The uniqueness flag is
-        // copied out immediately (`Option<bool>`), so no catalog borrow is held
-        // across the await in the no-index arm.
+        // Single catalog scan classifies the column list (exact list match). The
+        // uniqueness flag is copied out immediately (`Option<bool>`), so no
+        // catalog borrow is held across the await in the no-index arm.
         let is_unique = match shared.cat()
-            .index_circuit_for_col(target_id, col_idx)
+            .index_circuit_for_cols(target_id, cols.as_slice())
             .map(|ic| ic.is_unique)
         {
             Some(u) => u,
             None => {
-                // No secondary index on this column: a dedicated control-only
-                // status, caught here with zero worker dispatch, so the SQL
-                // planner falls back to a scan or a CREATE INDEX hint without a
-                // prior catalog probe.
+                // No secondary index for this column list: a dedicated
+                // control-only status, caught here with zero worker dispatch, so
+                // the SQL planner falls back to a scan or a CREATE INDEX hint
+                // without a prior catalog probe.
                 send_control_only(shared, fd, target_id, client_id, STATUS_NO_INDEX).await;
                 return;
             }
         };
         if is_unique {
-            // Unique index: at most one match, on a single worker. Forward that
-            // worker's slot directly (1 round-trip) instead of broadcasting to
-            // all workers and merging.
+            // Unique index: always single-column (composite UNIQUE is not yet
+            // supported), and a unique seek supplies exactly one value
+            // (seek_pk_extra empty). At most one match, on a single worker —
+            // forward that worker's slot directly (1 round-trip, keeping the
+            // unicast-on-cache-hit routing) instead of broadcasting.
             match MasterDispatcher::fan_out_seek_by_index_async(
                 shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
-                target_id, col_idx, key,
+                target_id, cols.as_slice()[0], seek_pk,
             ).await {
                 Ok(slot) => shared.reactor.send_slot_or_close(fd, slot).await,
                 Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
             }
             return;
         }
-        // Non-unique indexed value matches rows scattered across workers, so
-        // broadcast and merge all matches into one response.
+        // Non-unique (any arity) indexed value matches rows scattered across
+        // workers, so broadcast and merge all matches into one response. Forward
+        // the wire frame verbatim (packed seek_col_idx, seek_pk + seek_pk_extra).
         match MasterDispatcher::fan_out_seek_by_index_collect_async(
             shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
-            target_id, col_idx, key,
+            target_id, seek_col_idx, seek_pk, seek_pk_extra,
         ).await {
             Ok(merged) => {
                 send_ok_response(
                     shared, fd, target_id, merged.as_ref(),
-                    client_id, key, client_version,
+                    client_id, seek_pk, client_version,
                 ).await;
             }
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
     } else {
         // System tables never carry secondary indexes.
-        let _ = (col_idx, key, client_version);
         let msg = format!("SEEK_BY_INDEX on system table {} is not supported", target_id);
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
     }
@@ -934,7 +943,8 @@ async fn handle_get_indices(
     let mut bb = BatchBuilder::new(desc);
     if let Some(entry) = shared.cat().dag.tables.get(&target_id) {
         for ic in &entry.index_circuits {
-            bb.begin_row(ic.col_idx as u128, 1);   // PK = col_idx (unique: deduped)
+            // PK = packed column list (unique per circuit: deduped by list).
+            bb.begin_row(gnitz_wire::pack_pk_cols(ic.col_indices.as_slice()) as u128, 1);
             bb.put_u64(ic.is_unique as u64);        // payload: is_unique
             bb.end_row();
         }
@@ -1106,7 +1116,15 @@ async fn handle_system_dml(
                 && unsafe { (*cat_ptr_raw).read_batch_u64(&batch, i, IDXTAB_PAY_IS_UNIQUE) } != 0
             {
                 let owner_id = unsafe { (*cat_ptr_raw).read_batch_u64(&batch, i, IDXTAB_PAY_OWNER_ID) } as i64;
-                let col_idx  = unsafe { (*cat_ptr_raw).read_batch_u64(&batch, i, IDXTAB_PAY_SOURCE_COL_IDX) } as u32;
+                // source_cols is the packed list. Only a well-formed
+                // single-column list is pre-flighted: a composite or malformed
+                // UNIQUE row is rejected by hook_index_register inside the
+                // ingest below with a precise error, and pre-flighting its
+                // leading column here would run a wasted distributed scan that
+                // could surface a misleading "duplicate value" error first.
+                let packed = unsafe { (*cat_ptr_raw).read_batch_u64(&batch, i, IDXTAB_PAY_SOURCE_COLS) };
+                let cols = gnitz_wire::unpack_pk_cols(packed);
+                let &[col_idx] = cols.as_slice() else { continue };
                 match MasterDispatcher::validate_unique_index_create_async(
                     shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
                     owner_id, col_idx,
@@ -1239,10 +1257,17 @@ async fn handle_system_dml(
                 let owner_id = unsafe {
                     (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, IDXTAB_PAY_OWNER_ID)
                 } as i64;
-                let col_idx = unsafe {
-                    (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, IDXTAB_PAY_SOURCE_COL_IDX)
-                } as u32;
-                unsafe { (*disp_ptr_raw).unique_filter_remove_col(owner_id, col_idx); }
+                let packed = unsafe {
+                    (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, IDXTAB_PAY_SOURCE_COLS)
+                };
+                // Only single-column indexes carry a unique filter (every unique
+                // index is single-column). Removing the filter for a composite
+                // drop's leading column would spuriously clear a legitimately
+                // distinct single-column unique index on that column.
+                let cols = gnitz_wire::unpack_pk_cols(packed);
+                if let &[col_idx] = cols.as_slice() {
+                    unsafe { (*disp_ptr_raw).unique_filter_remove_col(owner_id, col_idx); }
+                }
             }
         }
     }

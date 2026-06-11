@@ -131,51 +131,76 @@ pub(crate) fn parse_qualified_name<'a>(name: &'a str, default_schema: &'a str) -
 // Index key type promotion
 // ---------------------------------------------------------------------------
 
+/// Promote one base-table column type to its secondary-index leading-key type.
+/// Thin re-export of `gnitz_wire::index_key_type` (the single source of truth,
+/// shared with the SQL planner's CREATE INDEX limit pre-check) so the engine and
+/// the planner can never disagree on a column's promoted width.
 pub(crate) fn get_index_key_type(field_type_code: u8) -> Result<u8, String> {
-    match field_type_code {
-        type_code::U128 => Ok(type_code::U128),
-        type_code::UUID => Ok(type_code::UUID),
-        type_code::U64 => Ok(type_code::U64),
-        type_code::I64 | type_code::U32 | type_code::I32 |
-        type_code::U16 | type_code::I16 | type_code::U8 | type_code::I8 => Ok(type_code::U64),
-        type_code::F32 | type_code::F64 | type_code::STRING | type_code::BLOB => {
-            Err(format!("Secondary index on column type {} not supported", field_type_code))
-        }
-        _ => Err(format!("Unknown column type code: {}", field_type_code)),
-    }
+    gnitz_wire::index_key_type(field_type_code)
 }
 
-/// Build a compound-PK index schema for a secondary index on `source`.
+/// Build a compound-PK index schema for a secondary index on `source_cols`
+/// of `source`, validating the column list along the way.
 ///
-/// Layout: `(indexed_col: <promoted>, src_pk_0, src_pk_1, …)` with every
-/// column in the PK and zero payload columns. `seek_by_index` walks the
-/// index by prefix-scanning the leading indexed column, then reads the
-/// source PK bytes directly out of the index PK region.
+/// Layout: `(promoted_c0, promoted_c1, …, src_pk_0, src_pk_1, …)` — every
+/// indexed column promoted independently and packed in declared order, then the
+/// source PK columns, all in the PK with zero payload columns. The leading
+/// indexed-key region is `Σ promoted widths`; `seek_by_index` prefix-scans it
+/// (full or leading-prefix), then reads the source PK bytes directly out of the
+/// index PK suffix. The 1-element list is the single-column index.
+///
+/// Bounds-checks every column, promotes it (rejecting STRING/BLOB/float), and
+/// validates the index-schema PK limits — all **before** calling
+/// `SchemaDescriptor::new`: that constructor is a `const fn` whose `assert!`s
+/// fire in release and abort the master. An over-limit schema is reachable only
+/// for a *composite* index (a single-column index — including every FK
+/// auto-index — always fits, since `PK_LIST_MAX_COLS < MAX_PK_COLUMNS` reserves
+/// the prefix slot), via a raw `gnitz-core` client or a crafted/over-range
+/// persisted row replayed at boot, neither of which goes through the SQL
+/// planner's pre-check. Validating here converts the abort into a clean ingest
+/// `Err` for every path (defence in depth at the catalog trust boundary).
 pub(crate) fn make_index_schema(
-    index_key_type: u8,
+    source_cols: &[u32],
     source: &SchemaDescriptor,
-) -> SchemaDescriptor {
-    let src_pk = source.pk_indices();
-    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(1 + src_pk.len());
-    let mut pk_indices: Vec<u32> = Vec::with_capacity(1 + src_pk.len());
-    cols.push(SchemaColumn::new(index_key_type, 0));
-    pk_indices.push(0);
-    for (i, &ci) in src_pk.iter().enumerate() {
-        cols.push(SchemaColumn::new(source.columns[ci as usize].type_code, 0));
-        pk_indices.push((i + 1) as u32);
+) -> Result<SchemaDescriptor, String> {
+    let mut col_types: Vec<u8> = Vec::with_capacity(source_cols.len());
+    for &c in source_cols {
+        if c as usize >= source.num_columns() {
+            return Err(format!(
+                "Index: column index {} out of bounds (columns={})",
+                c, source.num_columns()));
+        }
+        col_types.push(source.columns[c as usize].type_code);
     }
-    SchemaDescriptor::new(&cols, &pk_indices)
+    let src_pk = source.pk_indices();
+    // Shared with the SQL planner's CREATE INDEX pre-check, so the promotion
+    // rule and the arity/stride limits can never disagree across the layers.
+    let promoted = gnitz_wire::index_key_types(
+        &col_types, src_pk.len(), source.pk_stride() as usize)?;
+    let n = promoted.len();
+    let arity = n + src_pk.len();
+    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(arity);
+    let mut pk_indices: Vec<u32> = Vec::with_capacity(arity);
+    for (i, &t) in promoted.iter().enumerate() {
+        cols.push(SchemaColumn::new(t, 0));
+        pk_indices.push(i as u32);
+    }
+    for (j, &ci) in src_pk.iter().enumerate() {
+        cols.push(SchemaColumn::new(source.columns[ci as usize].type_code, 0));
+        pk_indices.push((n + j) as u32);
+    }
+    Ok(SchemaDescriptor::new(&cols, &pk_indices))
 }
 
-/// Wire schema for the GET_INDICES descriptor list: `(col_idx PK, is_unique)`.
-/// `col_idx` is the PK (unique per the `index_circuits` dedup by column), so no
-/// synthetic ordinal is needed. The server ships this block on the data path;
-/// the client decodes against the wire schema and reads columns by position.
+/// Wire schema for the GET_INDICES descriptor list: `(packed_cols PK, is_unique)`.
+/// The PK carries `pack_pk_cols(&col_indices)` — unique per circuit (circuits
+/// dedup by column list), so a valid PK. The server ships this block on the data
+/// path; the client decodes against the wire schema and reads columns by position.
 pub(crate) fn index_meta_schema_desc() -> SchemaDescriptor {
     let u64c = SchemaColumn::new(type_code::U64, 0);
-    SchemaDescriptor::new(&[u64c, u64c], &[0])   // [col_idx (PK), is_unique]
+    SchemaDescriptor::new(&[u64c, u64c], &[0])   // [packed_cols (PK), is_unique]
 }
-pub(crate) const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"col_idx", b"is_unique"];
+pub(crate) const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"cols", b"is_unique"];
 
 pub(crate) fn make_fk_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
     format!("{}__{}{}{}", schema_name, table_name, FK_INDEX_INFIX, col_name)

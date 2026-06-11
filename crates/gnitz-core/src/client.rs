@@ -61,26 +61,19 @@ fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
 /// Decode the persisted PK-list `u64` (from `TABLE_TAB.pk_col_idx`) into a
 /// `Vec<usize>` for the `Schema` type. The shared `gnitz_wire::unpack_pk_cols`
 /// handles both the bare-scalar (pre-compound) row form and the packed
-/// compound form. Rejects a `decoded_count()` that doesn't match the
-/// returned slice length: that signals a malformed wire payload
-/// (count exceeding `PK_LIST_MAX_COLS`) that the server's `validate_pk_cols`
-/// would have rejected too — silently truncating here would hide the
-/// divergence from the client.
+/// compound form. Rejects a malformed count (`is_well_formed`) — an empty or
+/// over-`PK_LIST_MAX_COLS` payload the server's `validate_pk_cols` would have
+/// rejected too; silently truncating here would hide the divergence from the
+/// client.
 fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
     let pkl = gnitz_wire::unpack_pk_cols(packed);
-    let slice = pkl.as_slice();
-    if slice.is_empty() {
-        return Err(ClientError::ServerError(
-            "catalog returned an empty primary key column list".to_string()
-        ));
-    }
-    if pkl.decoded_count() != slice.len() {
+    if !pkl.is_well_formed() {
         return Err(ClientError::ServerError(format!(
-            "PK column count {} exceeds maximum {}",
+            "PK column count {} out of range 1..={}",
             pkl.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS
         )));
     }
-    Ok(slice.iter().map(|&c| c as usize).collect())
+    Ok(pkl.as_slice().iter().map(|&c| c as usize).collect())
 }
 
 fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
@@ -120,10 +113,12 @@ struct ViewRecord {
 // --- GnitzClient ---
 
 /// A tiny owned secondary-index descriptor. `index_id` has no consumer, so it
-/// is omitted; `col_idx` is the unique key (the circuit list is deduped by
-/// column) and `is_unique` is the system's operative uniqueness truth.
+/// is omitted; `cols` is the index's declared column list (the unique key — the
+/// circuit list is deduped by column list) and `is_unique` is the system's
+/// operative uniqueness truth. `PkColList` is `Copy`, so `IndexMeta` stays
+/// `Copy` (no `.cloned()` churn at its consumers).
 #[derive(Clone, Copy, Debug)]
-pub struct IndexMeta { pub col_idx: u32, pub is_unique: bool }
+pub struct IndexMeta { pub cols: gnitz_wire::PkColList, pub is_unique: bool }
 
 pub struct GnitzClient {
     conn:         Connection,
@@ -185,18 +180,37 @@ impl GnitzClient {
         self.conn.seek(table_id, pk, &mut self.schema_cache)
     }
 
+    /// Seek a secondary index by `col_indices` (the index's FULL declared column
+    /// list — the server matches the circuit by exact list) supplying `key_vals`
+    /// native key values. `key_vals.len()` may be `< col_indices.len()` for a
+    /// leading-prefix seek. This is the single choke point shared by the SQL
+    /// planner and every binding; the two arity guards below are load-bearing,
+    /// not cosmetic — they prevent a `pack_pk_cols` panic and a silently-misread
+    /// frame (the worker derives the value count from the wire byte length).
     pub fn seek_by_index(
-        &mut self, table_id: u64, col_idx: u64, key: u128,
+        &mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128],
     ) -> ScanResult {
-        self.conn.seek_by_index(table_id, col_idx, key, &mut self.schema_cache)
+        // pack_pk_cols asserts its contract — reject here, never panic.
+        gnitz_wire::validate_pk_col_list(col_indices)
+            .map_err(|e| ClientError::ServerError(format!("seek_by_index: {e}")))?;
+        // K rides as the wire byte count (K = 1 + seek_pk_extra.len()/16 ≥ 1), so
+        // an empty key_vals would be misread by the worker as one value `0`. More
+        // values than columns is rejected by the worker too; fail it here for a
+        // clean local error.
+        if key_vals.is_empty() || key_vals.len() > col_indices.len() {
+            return Err(ClientError::ServerError(format!(
+                "seek_by_index: key value count {} must be in 1..={}",
+                key_vals.len(), col_indices.len())));
+        }
+        self.conn.seek_by_index(table_id, col_indices, key_vals, &mut self.schema_cache)
     }
 
     /// The secondary-index descriptor for `col_idx` of `table_id`, served from a
     /// durable, epoch-validated cache instead of an `IDX_TAB` scan. The cache
-    /// holds the projected `(col_idx, is_unique)` circuit list at the server's
+    /// holds the projected `(cols, is_unique)` circuit list at the server's
     /// index epoch; a GET_INDICES round-trip either confirms it (unchanged) or
-    /// replaces it. `col_idx` is unique per row (the server dedups circuits by
-    /// column), so a plain `find` is exact.
+    /// replaces it. The column list is unique per row (the server dedups
+    /// circuits by list), so a plain `find` is exact.
     ///
     /// The reported uniqueness matches the server's authoritative pre-create FK
     /// gate `validate_fk_column` exactly — both read `is_unique` off the same
@@ -207,28 +221,61 @@ impl GnitzClient {
     pub fn index_for_column(
         &mut self, table_id: u64, col_idx: usize,
     ) -> Result<Option<IndexMeta>, ClientError> {
+        let list = self.refresh_indices(table_id)?;
+        // Exact single-element match: a composite index does NOT answer a
+        // single-column FK/uniqueness query (a `(a, b)` index does not guarantee
+        // uniqueness of `a` alone).
+        Ok(list.iter().find(|m| m.cols.as_slice() == [col_idx as u32]).copied())
+    }
+
+    /// The full secondary-index list for `table_id`, served from the same
+    /// durable, epoch-validated cache `index_for_column` uses (one GET_INDICES
+    /// round-trip, no extra wire traffic). Used by the SQL point-lookup planner,
+    /// which must see every index's full declared column list to plan a
+    /// leading-prefix seek.
+    pub fn table_indexes(
+        &mut self, table_id: u64,
+    ) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
+        self.refresh_indices(table_id)
+    }
+
+    /// GET_INDICES refresh-and-cache: send the cached index epoch; on an
+    /// unchanged epoch reuse the cached `Arc<Vec<IndexMeta>>`, otherwise decode
+    /// the fresh descriptor list and replace the cache entry. The PK column of
+    /// each descriptor carries `pack_pk_cols(col_list)`, decoded via the shared
+    /// `unpack_pk_cols`; a malformed decode is rejected by the same
+    /// `is_well_formed` guard `decode_pk_cols` uses (reading `pks.get(i) as u32`
+    /// would truncate the packed `u64`'s high columns and drop the
+    /// `PK_LIST_PACKED_FLAG` at bit 63).
+    fn refresh_indices(
+        &mut self, table_id: u64,
+    ) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
         let cached_epoch = self.index_cache.peek(&table_id).map(|(_, e)| *e).unwrap_or(0);
         let (batch, epoch) = self.conn.fetch_indices(table_id, cached_epoch)?;
-        let list = if epoch == cached_epoch && cached_epoch != 0 {
+        if epoch == cached_epoch && cached_epoch != 0 {
             // Unchanged: the server only sends the no-data reply with a returned
             // epoch equal to a non-zero cached epoch, so the entry is present.
-            self.index_cache.get(&table_id).map(|(l, _)| Arc::clone(l)).unwrap()
-        } else {
-            let mut fresh = Vec::new();
-            if let Some(b) = batch {                 // None ⇒ changed-to-empty list
-                for i in 0..b.len() {
-                    if b.weights[i] <= 0 { continue; }
-                    fresh.push(IndexMeta {
-                        col_idx:   b.pks.get(i) as u32,            // PK column
-                        is_unique: col_u64(&b.columns[1], i)? != 0,
-                    });
+            return Ok(self.index_cache.get(&table_id).map(|(l, _)| Arc::clone(l)).unwrap());
+        }
+        let mut fresh = Vec::new();
+        if let Some(b) = batch {                 // None ⇒ changed-to-empty list
+            for i in 0..b.len() {
+                if b.weights[i] <= 0 { continue; }
+                let cols = gnitz_wire::unpack_pk_cols(b.pks.get(i) as u64);
+                if !cols.is_well_formed() {
+                    return Err(ClientError::ServerError(format!(
+                        "index column count {} out of range 1..={}",
+                        cols.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS)));
                 }
+                fresh.push(IndexMeta {
+                    cols,
+                    is_unique: col_u64(&b.columns[1], i)? != 0,
+                });
             }
-            let rc = Arc::new(fresh);
-            self.index_cache.put(table_id, (Arc::clone(&rc), epoch));
-            rc
-        };
-        Ok(list.iter().find(|m| m.col_idx as usize == col_idx).copied())
+        }
+        let rc = Arc::new(fresh);
+        self.index_cache.put(table_id, (Arc::clone(&rc), epoch));
+        Ok(rc)
     }
 
     /// Persist a secondary-index catalog row over an already-resolved base table.
@@ -237,15 +284,26 @@ impl GnitzClient {
     /// may only back a base table — a view is a read-only derived relation whose
     /// store is maintained solely by its circuit, so indexing a snapshot of
     /// derived data has no defined semantics — and the SQL layer rejects a view
-    /// target with a precise error before reaching here. `col_idx`/`col_type`
-    /// identify the indexed column within the resolved table; `index_name` is the
-    /// final catalog name (auto-generated or user-supplied) that `DROP INDEX`
-    /// resolves against.
+    /// target with a precise error before reaching here. `col_indices`/`col_types`
+    /// identify the indexed columns within the resolved table, in declared order;
+    /// `index_name` is the final catalog name (auto-generated or user-supplied)
+    /// that `DROP INDEX` resolves against. A 1-element list is the single-column
+    /// case; the persisted `source_cols` slot always carries `pack_pk_cols`.
     pub fn create_index(
-        &mut self, table_id: u64, col_idx: usize, col_type: TypeCode, index_name: &str,
-        is_unique: bool,
+        &mut self, table_id: u64, col_indices: &[u32], col_types: &[TypeCode],
+        index_name: &str, is_unique: bool,
     ) -> Result<u64, ClientError> {
-        validate_index_col_type(col_type)?;
+        // Arity, 7-bit column range, duplicates — the Err form of the
+        // pack_pk_cols contract, so the pack below can never panic.
+        gnitz_wire::validate_pk_col_list(col_indices)
+            .map_err(|e| ClientError::ServerError(format!("create_index: {e}")))?;
+        if col_types.len() != col_indices.len() {
+            return Err(ClientError::ServerError(
+                "create_index: col_indices and col_types length mismatch".to_string()));
+        }
+        for &ct in col_types {
+            validate_index_col_type(ct)?;
+        }
 
         // Reject a duplicate name before allocating an index_id: a duplicate would
         // create an undroppable orphan in IDX_TAB (`drop_index_by_name` returns
@@ -273,7 +331,7 @@ impl GnitzClient {
             .add_row(index_id as u128, 1)
             .u64_val(table_id)
             .u64_val(0)
-            .u64_val(col_idx as u64)
+            .u64_val(gnitz_wire::pack_pk_cols(col_indices))
             .str_val(index_name)
             .u64_val(is_unique as u64)
             .str_val("");

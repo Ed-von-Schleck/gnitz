@@ -398,8 +398,26 @@ impl CatalogEngine {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
             let owner_id = self.read_batch_u64(batch, i, 0) as i64;
-            let source_col_idx = self.read_batch_u64(batch, i, 2) as u32;
+            // source_cols carries pack_pk_cols(&col_indices); decode it (a
+            // single-column index is the 1-element degenerate case).
+            let cols = gnitz_wire::unpack_pk_cols(self.read_batch_u64(batch, i, 2));
+            if !cols.is_well_formed() {
+                return Err(format!(
+                    "Index: column list count {} out of range 1..={}",
+                    cols.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS));
+            }
             let is_unique = self.read_batch_u64(batch, i, 4) != 0;
+            // Reject composite UNIQUE here too. The unique-enforcement pipeline
+            // is single-column throughout (filters, routing cache, has_pk
+            // checks), and the SQL planner already rejects composite UNIQUE —
+            // but a raw gnitz-core client can push an IDX_TAB row with a
+            // multi-column list and is_unique = 1 directly, bypassing the
+            // planner. The single-column unique-enforcement reads
+            // (`col_indices.as_slice()[0]`) would then check uniqueness on only
+            // the first column and raise false conflicts on distinct rows.
+            if is_unique && cols.as_slice().len() > 1 {
+                return Err("composite UNIQUE indexes are not yet supported".to_string());
+            }
 
             if weight > 0 {
                 // Keep worker next_index_id in sync with master-assigned IDs so that
@@ -409,18 +427,18 @@ impl CatalogEngine {
                     self.next_index_id = idx_id + 1;
                 }
 
-                // One circuit per column (dedup by col_idx). If an incumbent
-                // exists, don't build a second table — but a UNIQUE newcomer over
-                // a non-unique incumbent must promote it. Promotion is
-                // order-independent (the circuit is unique iff ANY index on the
-                // column is unique), so replay reconstructs an identical result
-                // regardless of index_id ordering.
+                // One circuit per column list (dedup by ordered list). If an
+                // incumbent exists, don't build a second table — but a UNIQUE
+                // newcomer over a non-unique incumbent must promote it. Promotion
+                // is order-independent (the circuit is unique iff ANY index on the
+                // column list is unique), so replay reconstructs an identical
+                // result regardless of index_id ordering.
                 let incumbent_unique = self.dag.tables.get(&owner_id)
-                    .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_idx == source_col_idx))
+                    .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols.as_slice()))
                     .map(|ic| ic.is_unique);
                 if let Some(was_unique) = incumbent_unique {
                     if is_unique && !was_unique {
-                        self.promote_index_to_unique(owner_id, source_col_idx)?;
+                        self.promote_index_to_unique(owner_id, cols.as_slice())?;
                     }
                     continue;
                 }
@@ -437,10 +455,10 @@ impl CatalogEngine {
                     return Err(format!("Index: owner {} is not a base table", owner_id));
                 }
                 let owner_schema = entry.schema;
-                let source_col_type = owner_schema.columns[source_col_idx as usize].type_code;
-
-                let index_key_type = get_index_key_type(source_col_type)?;
-                let idx_schema = make_index_schema(index_key_type, &owner_schema);
+                // make_index_schema bounds-checks and promotes every column
+                // (defence in depth at the catalog trust boundary; a crafted wire
+                // row could name an out-of-range or ineligible column).
+                let idx_schema = make_index_schema(cols.as_slice(), &owner_schema)?;
 
                 let owner_dir = self.dag.tables.get(&owner_id)
                     .map(|e| e.directory.clone()).unwrap_or_default();
@@ -460,33 +478,33 @@ impl CatalogEngine {
                 let mut idx_table_box = Box::new(idx_table);
                 let idx_table_ptr = &mut *idx_table_box as *mut Table;
                 if !self.ctx.in_rollback() {
-                    self.backfill_index(owner_id, source_col_idx, is_unique, idx_table_ptr, &idx_schema)?;
+                    self.backfill_index(owner_id, cols.as_slice(), is_unique, idx_table_ptr, &idx_schema)?;
                 }
-                self.dag.add_index_circuit(owner_id, source_col_idx, idx_id, idx_table_box, idx_schema, is_unique);
+                self.dag.add_index_circuit(owner_id, cols.as_slice(), idx_id, idx_table_box, idx_schema, is_unique);
 
                 // Only truncate after all fallible steps succeed.
                 self.pending_dir_deletions.truncate(cleanup_idx);
             } else {
-                // DROP INDEX: determine what remains for this column in sys_indices
-                // (the -1 row has already been applied to sys_indices by
-                // ingest_to_family before fire_hooks runs, so its net weight is 0
-                // and the scan skips it).
+                // DROP INDEX: determine what remains for this column list in
+                // sys_indices (the -1 row has already been applied to sys_indices
+                // by ingest_to_family before fire_hooks runs, so its net weight is
+                // 0 and the scan skips it).
                 let (has_any, remains_unique) =
-                    self.check_remaining_index_uniqueness(owner_id, source_col_idx);
+                    self.check_remaining_index_uniqueness(owner_id, cols.as_slice());
                 if has_any {
                     // Another index (e.g. the FK auto-index) still covers this
-                    // column. Demote the circuit rather than destroying it.
-                    self.dag.set_index_circuit_uniqueness(owner_id, source_col_idx, remains_unique);
+                    // column list. Demote the circuit rather than destroying it.
+                    self.dag.set_index_circuit_uniqueness(owner_id, cols.as_slice(), remains_unique);
                 } else if let Some((owner_dir, creating_idx_id)) = self.dag.tables.get(&owner_id)
                     .and_then(|e| e.index_circuits.iter()
-                        .find(|ic| ic.col_idx == source_col_idx)
+                        .find(|ic| ic.col_indices.as_slice() == cols.as_slice())
                         .map(|ic| (e.directory.clone(), ic.index_id)))
                 {
-                    // No index remains on the column — drop the circuit. Use the
-                    // creating index_id for the directory path, not the dropped
+                    // No index remains on the column list — drop the circuit. Use
+                    // the creating index_id for the directory path, not the dropped
                     // index_id: when a second index promoted an incumbent circuit,
                     // the real directory on disk carries the first registrant's id.
-                    self.dag.remove_index_circuit(owner_id, source_col_idx);
+                    self.dag.remove_index_circuit(owner_id, cols.as_slice());
                     self.pending_dir_deletions.push(index_dir(&owner_dir, creating_idx_id));
                 }
             }
@@ -499,11 +517,11 @@ impl CatalogEngine {
     /// on `owner_id` / `col_idx`. Returns `(has_any, remains_unique)` to drive
     /// circuit demotion or deletion in `hook_index_register`'s retraction branch.
     fn check_remaining_index_uniqueness(
-        &self, owner_id: i64, col_idx: u32,
+        &self, owner_id: i64, cols: &[u32],
     ) -> (bool, bool) {
         let mut has_any = false;
         let mut remains_unique = false;
-        self.for_each_index_on_column(owner_id, col_idx as usize, |_row_id, is_uniq| {
+        self.for_each_index_on_cols(owner_id, cols, |_row_id, is_uniq| {
             has_any = true;
             remains_unique |= is_uniq;
         });

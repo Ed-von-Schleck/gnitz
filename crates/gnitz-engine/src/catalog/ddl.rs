@@ -249,7 +249,7 @@ impl CatalogEngine {
     pub fn create_index(
         &mut self,
         qualified_owner: &str,
-        col_name: &str,
+        col_names: &[&str],
         is_unique: bool,
     ) -> Result<i64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_owner, "public");
@@ -257,22 +257,27 @@ impl CatalogEngine {
         let owner_id = *self.caches.entity_by_qname.get(&qualified)
             .ok_or_else(|| format!("Table does not exist: {}", qualified))?;
 
-        // Find column
+        // Resolve each column name to its index, in declared order.
         let col_defs = self.read_column_defs(owner_id);
-        let col_idx = col_defs.iter().position(|cd| cd.name == col_name)
-            .ok_or("Column not found in owner")?;
+        let col_indices: Vec<u32> = col_names.iter().map(|name| {
+            col_defs.iter().position(|cd| cd.name == *name)
+                .map(|p| p as u32)
+                .ok_or_else(|| format!("Column not found in owner: {}", name))
+        }).collect::<Result<_, _>>()?;
 
         // STRING and BLOB values cannot be reduced to a comparable u128 key
         // without collision; the distributed uniqueness-check pipeline would
         // silently bypass or falsely reject rows. (Non-unique FK indices use the
         // xxhash-based extract_col_key path and are unaffected.)
-        if is_unique && gnitz_wire::is_german_string(col_defs[col_idx].type_code) {
+        if is_unique && col_indices.iter()
+            .any(|&c| gnitz_wire::is_german_string(col_defs[c as usize].type_code))
+        {
             return Err(
                 "UNIQUE index on STRING or BLOB columns is not supported".into()
             );
         }
 
-        let index_name = make_secondary_index_name(schema_name, table_name, col_name);
+        let index_name = make_secondary_index_name(schema_name, table_name, &col_names.join("_"));
         // Reject a duplicate before allocating an index_id. Otherwise
         // apply_index_by_name silently overwrites the cache entry and orphans
         // the previous index circuit.
@@ -291,7 +296,7 @@ impl CatalogEngine {
             bb.begin_row(index_id as u128, 1);
             bb.put_u64(owner_id as u64);
             bb.put_u64(OWNER_KIND_TABLE as u64);
-            bb.put_u64(col_idx as u64);
+            bb.put_u64(gnitz_wire::pack_pk_cols(&col_indices));
             bb.put_string(&index_name);
             bb.put_u64(if is_unique { 1 } else { 0 });
             bb.put_string("");
@@ -309,7 +314,7 @@ impl CatalogEngine {
                 undo.begin_row(index_id as u128, -1);
                 undo.put_u64(owner_id as u64);
                 undo.put_u64(OWNER_KIND_TABLE as u64);
-                undo.put_u64(col_idx as u64);
+                undo.put_u64(gnitz_wire::pack_pk_cols(&col_indices));
                 undo.put_string(&index_name);
                 undo.put_u64(if is_unique { 1 } else { 0 });
                 undo.put_string("");
@@ -390,7 +395,7 @@ impl CatalogEngine {
     pub(crate) fn backfill_index(
         &mut self,
         owner_id: i64,
-        col_idx: u32,
+        col_indices: &[u32],
         is_unique: bool,
         idx_table: *mut Table,
         idx_schema: &SchemaDescriptor,
@@ -402,7 +407,7 @@ impl CatalogEngine {
             unsafe { &*idx_table }.persistence() == Persistence::Ephemeral,
             "backfill_index into durable storage (owner {owner_id}): would double-count",
         );
-        self.stream_index_projection(owner_id, col_idx, is_unique, Some(idx_table), idx_schema)
+        self.stream_index_projection(owner_id, col_indices, is_unique, Some(idx_table), idx_schema)
     }
 
     /// Shared streaming pass for `backfill_index` and `promote_index_to_unique`:
@@ -426,7 +431,7 @@ impl CatalogEngine {
     fn stream_index_projection(
         &mut self,
         owner_id: i64,
-        col_idx: u32,
+        col_indices: &[u32],
         is_unique: bool,
         idx_table: Option<*mut Table>,
         idx_schema: &SchemaDescriptor,
@@ -436,6 +441,10 @@ impl CatalogEngine {
             None => return Ok(()),
         };
         let chunk_rows = self.ddl_scan_chunk_rows;
+        // The duplicate check runs only for a UNIQUE index, and every unique
+        // index is single-column (composite UNIQUE is not yet supported) — so
+        // its key width is the single leading promoted column, and the error
+        // names that column.
         let key_size = idx_schema.columns[0].size() as usize;
         let check_dups = is_unique && self.ctx.is_live();
         let mut seen: rustc_hash::FxHashSet<u128> = rustc_hash::FxHashSet::default();
@@ -443,10 +452,10 @@ impl CatalogEngine {
         let Some(mut handle) = self.open_store_cursor(owner_id) else { return Ok(()) };
         while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
             let projected = DagEngine::batch_project_index(
-                &chunk, col_idx, &owner_schema, idx_schema);
+                &chunk, col_indices, &owner_schema, idx_schema);
             if projected.count == 0 { continue; }
             if check_dups && projected_chunk_has_dup_keys(&projected, key_size, &mut seen) {
-                return Err(self.unique_create_dup_err(owner_id, col_idx as usize));
+                return Err(self.unique_create_dup_err(owner_id, col_indices[0] as usize));
             }
             if let Some(table) = idx_table {
                 let _ = unsafe { &mut *table }.ingest_owned_batch(projected);
@@ -465,15 +474,14 @@ impl CatalogEngine {
     /// → pure flag flip. Skips the scan outside the live phase (boot shard replay)
     /// because data was validated at original write time (mirrors the same guard
     /// in `hook_cascade_fk`). The flag flip below runs unconditionally.
-    pub(crate) fn promote_index_to_unique(&mut self, owner_id: i64, col_idx: u32) -> Result<(), String> {
+    pub(crate) fn promote_index_to_unique(&mut self, owner_id: i64, col_indices: &[u32]) -> Result<(), String> {
         if self.ctx.is_live() {
             let owner_schema = self.dag.tables.get(&owner_id).map(|e| e.schema)
                 .ok_or_else(|| format!("Index promote: owner table {} not found", owner_id))?;
-            let key_type = get_index_key_type(owner_schema.columns[col_idx as usize].type_code)?;
-            let idx_schema = make_index_schema(key_type, &owner_schema);
-            self.stream_index_projection(owner_id, col_idx, true, None, &idx_schema)?;
+            let idx_schema = make_index_schema(col_indices, &owner_schema)?;
+            self.stream_index_projection(owner_id, col_indices, true, None, &idx_schema)?;
         }
-        self.dag.set_index_circuit_uniqueness(owner_id, col_idx, true);
+        self.dag.set_index_circuit_uniqueness(owner_id, col_indices, true);
         Ok(())
     }
 
@@ -503,7 +511,7 @@ impl CatalogEngine {
             bb.begin_row(index_id as u128, 1);
             bb.put_u64(table_id as u64);           // owner_id
             bb.put_u64(OWNER_KIND_TABLE as u64);   // owner_kind
-            bb.put_u64(col_idx as u64);            // source_col_idx
+            bb.put_u64(gnitz_wire::pack_pk_cols(&[col_idx as u32]));  // source_cols (packed)
             bb.put_string(&index_name);            // name
             bb.put_u64(0);                         // is_unique (FK indices are not unique)
             bb.put_string("");                     // cache_directory
@@ -523,7 +531,7 @@ impl CatalogEngine {
                 ub.begin_row(index_id as u128, -1);
                 ub.put_u64(table_id as u64);
                 ub.put_u64(OWNER_KIND_TABLE as u64);
-                ub.put_u64(col_idx as u64);
+                ub.put_u64(gnitz_wire::pack_pk_cols(&[col_idx as u32]));  // source_cols (packed)
                 ub.put_string(&index_name);
                 ub.put_u64(0);
                 ub.put_string("");

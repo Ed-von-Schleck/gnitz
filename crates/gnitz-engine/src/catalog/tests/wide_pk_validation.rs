@@ -49,20 +49,20 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
 /// table; the caller must keep the returned Box alive for the engine's use.
 fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows: &[([u8; 24], u64, i64)]) -> Box<Table> {
     let schema = wide_unique_schema();
-    let idx_schema = make_index_schema(get_index_key_type(type_code::U64).unwrap(), &schema);
+    let idx_schema = make_index_schema(&[3], &schema).unwrap();
 
     let mut base = Box::new(Table::new(&format!("{dir}/base"), "base", schema, tid as u32, 256 * 1024, Persistence::Ephemeral).unwrap());
     let mut idx = Table::new(&format!("{dir}/idx"), "idx", idx_schema, tid as u32 + 1, 256 * 1024, Persistence::Ephemeral).unwrap();
 
     let bb = wide_val_batch(&schema, base_rows);
-    let idx_batch = DagEngine::batch_project_index(&bb, 3, &schema, &idx_schema);
+    let idx_batch = DagEngine::batch_project_index(&bb, &[3], &schema, &idx_schema);
     base.ingest_owned_batch(bb).unwrap();
     base.flush().unwrap();
     idx.ingest_owned_batch(idx_batch).unwrap();
     idx.flush().unwrap();
 
     engine.dag.register_table(tid, StoreHandle::Borrowed(&mut *base as *mut Table), schema, RelationKind::BaseTable { unique_pk: true }, 0, dir.to_string());
-    engine.dag.add_index_circuit(tid, 3, tid + 1, Box::new(idx), idx_schema, true);
+    engine.dag.add_index_circuit(tid, &[3], tid + 1, Box::new(idx), idx_schema, true);
     base
 }
 
@@ -78,12 +78,12 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
     let _base = setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
 
     // The indexed column resolves to its circuit, carrying the uniqueness flag.
-    let ic = engine.index_circuit_for_col(tid, 3).expect("indexed column must resolve");
+    let ic = engine.index_circuit_for_cols(tid, &[3]).expect("indexed column must resolve");
     assert!(ic.is_unique, "col 3 was created UNIQUE");
     // An unindexed column resolves to nothing …
-    assert!(engine.index_circuit_for_col(tid, 0).is_none(), "unindexed column has no circuit");
+    assert!(engine.index_circuit_for_cols(tid, &[0]).is_none(), "unindexed column has no circuit");
     // … and so does an unknown table.
-    assert!(engine.index_circuit_for_col(tid + 9999, 3).is_none(), "unknown table has no circuit");
+    assert!(engine.index_circuit_for_cols(tid + 9999, &[3]).is_none(), "unknown table has no circuit");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

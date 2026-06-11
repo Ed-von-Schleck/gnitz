@@ -687,8 +687,11 @@ pub fn execute_select(
             (s2, b2, lsn)
         } else {
             let mut hit = None;
-            for (col_idx, key, residual) in collect_index_seek_candidates(where_expr, &schema) {
-                match client.seek_by_index(tid, col_idx as u64, key) {
+            let candidates =
+                collect_index_seek_candidates(where_expr, &schema, || client.table_indexes(tid))
+                    .map_err(GnitzSqlError::Exec)?;
+            for (col_indices, key_vals, residual) in candidates {
+                match client.seek_by_index(tid, col_indices.as_slice(), &key_vals) {
                     Ok((s, b, lsn)) => {
                         let preds = bind_residuals(binder, &residual, &schema)?;
                         let (s2, b2) = apply_residual_filter((s, b), &preds, &schema)?;
@@ -846,46 +849,95 @@ fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
     Some((col_idx, key))
 }
 
-/// Every non-PK `col = literal` seek candidate among the conjuncts of `expr`,
-/// each paired with the residual conjuncts (all the *other* conjuncts) to
-/// evaluate after the seek.
-///
-/// Pure syntax: no catalog probe, no binding, no I/O. The caller attempts each
-/// candidate's `seek_by_index` in turn and treats `ClientError::NoIndex` as
-/// "this column has no index — try the next candidate". Returning *all*
-/// candidates lets `WHERE unindexed = 1 AND indexed = 2` find the index whichever
-/// conjunct carries it; flattening the whole `AND`-tree extends that to
+/// One index-servable seek candidate: the index's FULL declared column list,
+/// the covered leading key values, and the residual conjuncts to filter after
+/// the seek.
+type IndexSeekCandidate<'e> = (gnitz_core::PkColList, Vec<u128>, Vec<&'e Expr>);
+
+/// Every index-servable seek candidate among the conjuncts of `expr` —
+/// `(index column list, covered leading key values, residual conjuncts)` —
+/// best candidate first. The caller attempts each candidate's `seek_by_index`
+/// in turn and treats `ClientError::NoIndex` as "try the next candidate".
+/// Matching every index against every `col = literal` conjunct lets
+/// `WHERE unindexed = 1 AND indexed = 2` find the index whichever conjunct
+/// carries it; flattening the whole `AND`-tree extends that to
 /// three-or-more-way conjunctions. PK columns are skipped —
 /// `try_extract_pk_seek_residual` handles them first — and so are column types
 /// that can never carry a secondary index.
+///
+/// `fetch_indexes` (one epoch-validated GET_INDICES round-trip) is called only
+/// when at least one eligible equality exists, so a WHERE that can never seek
+/// (`x > 5`, an OR-tree, …) costs no wire traffic here.
 fn collect_index_seek_candidates<'e>(
-    expr:   &'e Expr,
-    schema: &Schema,
-) -> Vec<(usize, u128, Vec<&'e Expr>)> {
+    expr:          &'e Expr,
+    schema:        &Schema,
+    fetch_indexes: impl FnOnce() -> Result<Arc<Vec<gnitz_core::IndexMeta>>, ClientError>,
+) -> Result<Vec<IndexSeekCandidate<'e>>, ClientError> {
     let mut conjuncts = Vec::new();
     flatten_conjuncts(expr, &mut conjuncts);
 
-    let mut out = Vec::new();
-    for (i, &cand) in conjuncts.iter().enumerate() {
-        if let Some((col_idx, key)) = try_col_eq_literal(cand, schema) {
-            // A secondary index is only creatable on an `is_pk_eligible` integer
-            // scalar (validate_index_col_type), so a float/string/blob
-            // `col = <integer-literal>` — which try_col_eq_literal still matches,
-            // since parse_pk_literal_packed accepts an integer literal for any
-            // type — could only ever answer NoIndex. Skipping it (and the PK
-            // columns, handled first) avoids a guaranteed-futile round trip.
-            let tc = schema.columns[col_idx].type_code;
-            if !schema.is_pk_col(col_idx) && tc.is_pk_eligible() {
-                let residual = conjuncts.iter()
-                    .enumerate()
-                    .filter(|&(j, _)| j != i)
-                    .map(|(_, &e)| e)
-                    .collect();
-                out.push((col_idx, key, residual));
+    // Every `col = literal` equality, tagged with its conjunct index so the
+    // residual can exclude exactly the consumed conjuncts. PK columns and
+    // index-ineligible types can never carry a secondary index, so they are
+    // never collected.
+    let mut eqs: Vec<(usize /*conjunct*/, usize /*col*/, u128 /*key*/)> = Vec::new();
+    for (ci, &cand) in conjuncts.iter().enumerate() {
+        if let Some((col, key)) = try_col_eq_literal(cand, schema) {
+            let tc = schema.columns[col].type_code;
+            if !schema.is_pk_col(col) && tc.is_pk_eligible() {
+                eqs.push((ci, col, key));
             }
         }
     }
-    out
+    if eqs.is_empty() { return Ok(Vec::new()); }
+
+    let indexes = fetch_indexes()?;
+    let mut out: Vec<IndexSeekCandidate<'e>> = Vec::new();
+    for meta in indexes.iter() {
+        // The index's FULL declared column list (sent verbatim for the exact
+        // circuit match); `vals` covers a leading prefix of it (`<=` arity).
+        let idx_cols = meta.cols.as_slice();
+        let mut vals: Vec<u128> = Vec::new();
+        let mut consumed: Vec<usize> = Vec::new();
+        for &col in idx_cols {
+            match eqs.iter().find(|&&(_, c, _)| c as u32 == col) {
+                Some(&(conj, _, key)) => { vals.push(key); consumed.push(conj); }
+                None => break,   // leading-prefix rule: stop at first uncovered col
+            }
+        }
+        if vals.is_empty() { continue; }   // index does not apply
+
+        // Leading-prefix safety: a row is omitted from the index if ANY indexed
+        // column is NULL (`batch_project_index`). The covered columns are
+        // non-null (they equal a non-null literal), but an uncovered *trailing*
+        // column that is nullable would drop rows whose trailing value is NULL —
+        // rows the prefix predicate still matches — so the seek would silently
+        // lose them. Reject the prefix; a different index or (for UPDATE/DELETE)
+        // the full-scan fallback serves the query correctly, and direct SELECT
+        // raises its clean "non-indexed" error rather than returning wrong rows.
+        if vals.len() < idx_cols.len()
+            && idx_cols[vals.len()..]
+                .iter()
+                .any(|&c| schema.columns[c as usize].is_nullable)
+        {
+            continue;
+        }
+
+        let residual: Vec<&Expr> = conjuncts.iter()
+            .enumerate()
+            .filter(|(i, _)| !consumed.contains(i))
+            .map(|(_, &e)| e)
+            .collect();
+        out.push((meta.cols, vals, residual));
+    }
+
+    // Best first: longer covered prefix wins; on a tie the tighter index (fewer
+    // columns — an exact lookup over a leading-prefix scan) wins.
+    out.sort_by(|a, b| {
+        b.1.len().cmp(&a.1.len())
+            .then_with(|| a.0.as_slice().len().cmp(&b.0.as_slice().len()))
+    });
+    Ok(out)
 }
 
 /// Bind the residual conjuncts collected as raw `&Expr` by the seek extractors
@@ -1546,8 +1598,11 @@ pub fn execute_update(
         // Path 2: secondary-index seek (any index, unique or not). Applies the
         // residual per row and updates *all* matches. Falls through to Path 3
         // when no candidate column carries an index.
-        for (col_idx, key, residual) in collect_index_seek_candidates(where_expr, &schema) {
-            let (schema_opt, batch_opt, _) = match client.seek_by_index(table_id, col_idx as u64, key) {
+        let candidates =
+            collect_index_seek_candidates(where_expr, &schema, || client.table_indexes(table_id))
+                .map_err(GnitzSqlError::Exec)?;
+        for (col_indices, key_vals, residual) in candidates {
+            let (schema_opt, batch_opt, _) = match client.seek_by_index(table_id, col_indices.as_slice(), &key_vals) {
                 Ok(r) => r,
                 Err(ClientError::NoIndex) => continue,
                 Err(e) => return Err(GnitzSqlError::Exec(e)),
@@ -1702,8 +1757,11 @@ pub fn execute_delete(
             // Path 3: secondary-index seek (any index, unique or not). Applies
             // the residual per row and deletes *all* matches. Falls through to
             // Path 4 when no candidate column carries an index.
-            for (col_idx, key, residual) in collect_index_seek_candidates(where_expr, &schema) {
-                let (schema_opt, batch_opt, _) = match client.seek_by_index(table_id, col_idx as u64, key) {
+            let candidates =
+                collect_index_seek_candidates(where_expr, &schema, || client.table_indexes(table_id))
+                    .map_err(GnitzSqlError::Exec)?;
+            for (col_indices, key_vals, residual) in candidates {
+                let (schema_opt, batch_opt, _) = match client.seek_by_index(table_id, col_indices.as_slice(), &key_vals) {
                     Ok(r) => r,
                     Err(ClientError::NoIndex) => continue,
                     Err(e) => return Err(GnitzSqlError::Exec(e)),
@@ -2454,19 +2512,30 @@ mod tests {
         assert_eq!(residual.len(), 1);
     }
 
+    fn idx_metas(col_lists: &[&[u32]]) -> Arc<Vec<gnitz_core::IndexMeta>> {
+        Arc::new(col_lists.iter().map(|cols| gnitz_core::IndexMeta {
+            cols: gnitz_core::PkColList::from_slice(cols), is_unique: false,
+        }).collect())
+    }
+
     #[test]
     fn collect_index_seek_candidates_skips_float_col() {
-        // `WHERE val = 1` on a float column emits no candidate: a secondary
-        // index can never cover it, so issuing a seek would be a guaranteed
-        // NoIndex round trip.
+        // `WHERE val = 1` on a float column emits no candidate even with an index
+        // present: a float column is never index-key-eligible, so it is filtered
+        // out of the equality set before any index is consulted — fetch_indexes
+        // must not even be called (no GET_INDICES round-trip).
         let schema = make_schema_col(TypeCode::F64);
         let expr = eq_expr("val", num_expr("1"));
-        assert!(super::collect_index_seek_candidates(&expr, &schema).is_empty());
+        let cands = super::collect_index_seek_candidates(&expr, &schema, || {
+            panic!("no eligible equality — the index list must not be fetched")
+        }).unwrap();
+        assert!(cands.is_empty());
     }
 
     #[test]
     fn collect_index_seek_candidates_flattens_and_tree() {
-        // pk(U64) + a,b,c (all U64, pk-eligible non-PK).
+        // pk(U64) + a,b,c (all U64, pk-eligible non-PK), each with its own
+        // single-column index.
         let schema = Schema {
             columns: vec![
                 col_def("pk", TypeCode::U64, false),
@@ -2486,13 +2555,17 @@ mod tests {
             op:    BinaryOperator::And,
             right: Box::new(eq_expr("c", num_expr("3"))),
         };
-        let cands = super::collect_index_seek_candidates(&expr, &schema);
-        // All three conjuncts are candidates — would regress to just `c` under a
-        // two-way-only extractor.
-        let cols: Vec<usize> = cands.iter().map(|(c, _, _)| *c).collect();
-        assert_eq!(cols, vec![1, 2, 3]);
-        // Each candidate's residual is the other two conjuncts.
-        for (_, _, residual) in &cands {
+        let indexes = idx_metas(&[&[1], &[2], &[3]]);
+        let cands = super::collect_index_seek_candidates(&expr, &schema, || Ok(indexes)).unwrap();
+        // One candidate per applicable index; flattening the whole AND-tree finds
+        // all three (would regress to just `c` under a two-way-only extractor).
+        let mut cols: Vec<Vec<u32>> = cands.iter().map(|(c, _, _)| c.as_slice().to_vec()).collect();
+        cols.sort();
+        assert_eq!(cols, vec![vec![1], vec![2], vec![3]]);
+        // Each candidate binds exactly its one covered value, residual is the
+        // other two conjuncts.
+        for (_, vals, residual) in &cands {
+            assert_eq!(vals.len(), 1);
             assert_eq!(residual.len(), 2);
         }
     }

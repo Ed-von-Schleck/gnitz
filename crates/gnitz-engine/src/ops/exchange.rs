@@ -131,8 +131,9 @@ impl PartitionRouter {
 
     /// Scan every row in `batch` and record or retract its index key → worker mapping.
     /// Rows with negative weight retract; non-negative weight records.
-    /// Test-only today: no production path populates the router cache yet (the
-    /// master unicast-seek optimisation it backs is not wired up).
+    /// Test-only: the production path populates the cache through the sibling
+    /// `record_routing_from_source` (`write_commit_group → record_index_routing`),
+    /// which `fan_out_seek_by_index_async` reads to unicast a unique-index seek.
     #[cfg(test)]
     pub fn record_routing(
         &mut self,

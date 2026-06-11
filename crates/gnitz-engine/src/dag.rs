@@ -3,7 +3,8 @@
 use std::cell::UnsafeCell;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::schema::SchemaDescriptor;
+use crate::schema::{SchemaDescriptor, ColumnLocator};
+use gnitz_wire::PkColList;
 use crate::compiler::{self, CompileOutput, ExternalTable, SubPlan};
 use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, Persistence, PkBuf, Table, PartitionedTable, StorageError};
 use crate::ops;
@@ -218,6 +219,21 @@ impl IndexCircuitEntry {
     pub fn table_mut(&self) -> &mut Table {
         unsafe { &mut *self.index_table.get() }
     }
+
+    /// The source column of a unique circuit, `None` for a non-unique one.
+    /// The single accessor for the unique-enforcement machinery (filters,
+    /// routing cache, has_pk pre-checks), which is single-column throughout:
+    /// `hook_index_register` rejects composite UNIQUE at registration, so a
+    /// unique circuit always carries a 1-element list. When composite UNIQUE
+    /// lands, changing this signature makes the compiler enumerate every
+    /// consumer of that assumption.
+    #[inline]
+    pub fn unique_col(&self) -> Option<u32> {
+        if !self.is_unique { return None; }
+        debug_assert_eq!(self.col_indices.as_slice().len(), 1,
+            "unique index circuit must be single-column");
+        Some(self.col_indices.as_slice()[0])
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +243,11 @@ impl IndexCircuitEntry {
 /// A secondary index on a column.
 /// Owns the index Table via Box — dropping the entry drops the table.
 pub struct IndexCircuitEntry {
-    pub col_idx: u32,
+    /// The index's declared column list, in order. A 1-element list is the
+    /// single-column case. Dedup/lookup is exact ordered-list equality on
+    /// `col_indices.as_slice()`; order is significant (it drives leading-prefix
+    /// seeks).
+    pub col_indices: PkColList,
     /// The index_id of the IDX_TAB row that caused Table::new to be called.
     /// When a second index promotes an incumbent circuit (UNIQUE+FK case), no
     /// new directory is created; this field identifies the actual on-disk path
@@ -462,7 +482,7 @@ impl DagEngine {
     pub fn add_index_circuit(
         &mut self,
         table_id: i64,
-        col_idx: u32,
+        col_indices: &[u32],
         index_id: i64,
         index_table: Box<Table>,
         index_schema: SchemaDescriptor,
@@ -470,7 +490,7 @@ impl DagEngine {
     ) {
         if let Some(entry) = self.tables.get_mut(&table_id) {
             entry.index_circuits.push(IndexCircuitEntry {
-                col_idx,
+                col_indices: PkColList::from_slice(col_indices),
                 index_id,
                 index_table: UnsafeCell::new(index_table),
                 index_schema,
@@ -479,22 +499,22 @@ impl DagEngine {
         }
     }
 
-    pub fn remove_index_circuit(&mut self, table_id: i64, col_idx: u32) {
+    pub fn remove_index_circuit(&mut self, table_id: i64, col_indices: &[u32]) {
         if let Some(entry) = self.tables.get_mut(&table_id) {
             // retain() drops non-matching entries, which drops Box<Table> automatically.
-            entry.index_circuits.retain(|ic| ic.col_idx != col_idx);
+            entry.index_circuits.retain(|ic| ic.col_indices.as_slice() != col_indices);
         }
     }
 
-    /// Set the uniqueness flag of the index circuit on `col_idx` in place (the
-    /// circuit list is deduped by col_idx, so at most one entry matches).
-    /// Promotion (`true`) folds a UNIQUE index into an existing non-unique
-    /// circuit when both target the same column; demotion (`false`) is used by
-    /// the DROP INDEX retraction path when the UNIQUE index is dropped but
-    /// another index (e.g. an FK auto-index) still covers the column.
-    pub fn set_index_circuit_uniqueness(&mut self, table_id: i64, col_idx: u32, is_unique: bool) {
+    /// Set the uniqueness flag of the index circuit on `col_indices` in place
+    /// (the circuit list is deduped by column list, so at most one entry
+    /// matches). Promotion (`true`) folds a UNIQUE index into an existing
+    /// non-unique circuit when both target the same column list; demotion
+    /// (`false`) is used by the DROP INDEX retraction path when the UNIQUE index
+    /// is dropped but another index (e.g. an FK auto-index) still covers it.
+    pub fn set_index_circuit_uniqueness(&mut self, table_id: i64, col_indices: &[u32], is_unique: bool) {
         if let Some(entry) = self.tables.get_mut(&table_id) {
-            if let Some(ic) = entry.index_circuits.iter_mut().find(|ic| ic.col_idx == col_idx) {
+            if let Some(ic) = entry.index_circuits.iter_mut().find(|ic| ic.col_indices.as_slice() == col_indices) {
                 ic.is_unique = is_unique;
             }
         }
@@ -934,7 +954,7 @@ impl DagEngine {
         source: &Batch,
     ) {
         let index_batches: Vec<Batch> = entry.index_circuits.iter()
-            .map(|ic| Self::batch_project_index(source, ic.col_idx, schema, &ic.index_schema))
+            .map(|ic| Self::batch_project_index(source, ic.col_indices.as_slice(), schema, &ic.index_schema))
             .collect();
         let _ = entry.handle.ingest_owned_batch(source.clone_batch());
         for (ic, idx_batch) in entry.index_circuits.iter_mut().zip(index_batches) {
@@ -1832,55 +1852,71 @@ impl DagEngine {
     /// by each source PK column laid out contiguously after it.
     pub(crate) fn batch_project_index(
         src: &Batch,
-        source_col_idx: u32,
+        source_col_indices: &[u32],
         src_schema: &SchemaDescriptor,
         idx_schema: &SchemaDescriptor,
     ) -> Batch {
-        let source_col = source_col_idx as usize;
-        // `locate` resolves the PK-or-payload read once: a PK source column is
-        // sliced from the packed OPK PK region, a payload column read from its
-        // dense slot. `native_key` decodes either to the canonical u128 the
-        // index PK is OPK-encoded from; `is_null` is false for PK, checks the
-        // bit for a payload column.
-        let loc = src_schema.locate(source_col);
         let src_pk_stride = src_schema.pk_stride() as usize;
         let idx_stride = idx_schema.pk_stride() as usize;
-        let idx_key_size = idx_schema.columns[0].size() as usize;
-        let idx_key_type = idx_schema.columns[0].type_code;
 
         let mut out = Batch::with_schema(*idx_schema, src.count.max(1));
         // MAX_PK_BYTES bounds every index schema's pk_stride (asserted in
         // SchemaDescriptor::new), so the scratch PK buffer lives on the stack
         // with no per-batch heap allocation. The used [..idx_stride] prefix is
         // fully overwritten each row (the leading [..idx_key_size] OPK-encoded
-        // indexed value and trailing source PK suffix); the single zero-init
+        // indexed value(s) and trailing source PK suffix); the single zero-init
         // covers the (currently empty) tail.
         let mut idx_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
 
         let mb = src.as_mem_batch();
+        let n_cols = source_col_indices.len();
+
+        // Hoist every per-column read coordinate — `locate` (PK-vs-payload),
+        // the promoted slot size, and the promoted type — into fixed
+        // PK_LIST_MAX_COLS-wide stack arrays so the row loop does no per-column
+        // method call or schema indexing (this runs once per index circuit on
+        // every base-table push). `locate` resolves the PK-or-payload read
+        // once: a PK source column is sliced from the packed OPK PK region, a
+        // payload column read from its dense slot.
+        let mut locators = [ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 };
+                            gnitz_wire::PK_LIST_MAX_COLS];
+        let mut sizes = [0usize; gnitz_wire::PK_LIST_MAX_COLS];
+        let mut types = [0u8;    gnitz_wire::PK_LIST_MAX_COLS];
+        for i in 0..n_cols {
+            locators[i] = src_schema.locate(source_col_indices[i] as usize);
+            sizes[i]    = idx_schema.columns[i].size() as usize;
+            types[i]    = idx_schema.columns[i].type_code;
+        }
+        let idx_key_size: usize = sizes[..n_cols].iter().sum();
+
         for row in 0..src.count {
             let weight = src.get_weight(row);
             if weight == 0 { continue; }
+            // NULL in ANY indexed column ⇒ row not indexed (`is_null` is false
+            // for a PK column, checks the bit for a payload column).
+            if locators[..n_cols].iter().any(|loc| loc.is_null(&mb, row)) { continue; }
 
-            if loc.is_null(&mb, row) { continue; }
-
-            let src_pk_bytes = src.get_pk_bytes(row);
-            // Leading index-key slot: the indexed value's native u128 (decoded
-            // from the source OPK PK column, or read from the native-LE payload),
-            // re-encoded OPK into the promoted index key type across the full
-            // idx_key_size. The index table's PK region is order-preserving like
-            // any other; seeks (has_pk / seek_by_index) encode the same way.
-            let native = loc.native_key(&mb, row);
-            gnitz_wire::encode_pk_column(
-                &native.to_le_bytes()[..idx_key_size], idx_key_type, &mut idx_pk_buf[..idx_key_size],
-            );
-
+            // Leading index-key slots: each indexed value's native u128
+            // (decoded from the source OPK PK column, or read from the
+            // native-LE payload), re-encoded OPK into its promoted slot at the
+            // running offset. The index table's PK region is order-preserving
+            // like any other; seeks (has_pk / seek_by_index) encode the same
+            // way.
+            let mut off = 0usize;
+            for i in 0..n_cols {
+                let size = sizes[i];
+                let native = locators[i].native_key(&mb, row);
+                gnitz_wire::encode_pk_column(
+                    &native.to_le_bytes()[..size], types[i],
+                    &mut idx_pk_buf[off..off + size],
+                );
+                off += size;
+            }
             // The source PK region is laid out in pk_indices order, so the
             // index's trailing PK suffix is byte-identical to the source's PK
             // (already OPK).
             idx_pk_buf[idx_key_size..idx_key_size + src_pk_stride]
-                .copy_from_slice(src_pk_bytes);
-
+                .copy_from_slice(src.get_pk_bytes(row));
             out.extend_pk_bytes(&idx_pk_buf[..idx_stride]);
             out.extend_weight(&weight.to_le_bytes());
             // Index schema has zero payload columns, but the null_bmp region
@@ -1983,10 +2019,10 @@ mod tests {
         let mut tbl = make_test_table("idx_parent");
         dag.register_table(50, StoreHandle::Borrowed(&mut *tbl as *mut Table), schema, RelationKind::BaseTable { unique_pk: false }, 0, String::new());
         let idx_tbl = make_test_table("idx_child");
-        dag.add_index_circuit(50, 2, 999, idx_tbl, schema, false);
+        dag.add_index_circuit(50, &[2], 999, idx_tbl, schema, false);
         assert_eq!(dag.tables[&50].index_circuits.len(), 1);
 
-        dag.remove_index_circuit(50, 2);
+        dag.remove_index_circuit(50, &[2]);
         assert_eq!(dag.tables[&50].index_circuits.len(), 0);
         dag.close();
         let _ = std::fs::remove_dir_all(dag_test_dir("idx_parent"));
@@ -2029,7 +2065,7 @@ mod tests {
         let idx_tbl = Box::new(
             Table::new(&idx_dir, "flush_ic_idx", idx_schema, 1, 256 * 1024, Persistence::Durable).unwrap(),
         );
-        dag.add_index_circuit(70, 1, 999, idx_tbl, idx_schema, false);
+        dag.add_index_circuit(70, &[1], 999, idx_tbl, idx_schema, false);
 
         // Put one row in the index table's memtable.
         {

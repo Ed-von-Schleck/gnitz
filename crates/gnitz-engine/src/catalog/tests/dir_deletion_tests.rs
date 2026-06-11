@@ -135,7 +135,7 @@ fn gc_reclaims_orphan_index_dir() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![u64_col_def("id"), u64_col_def("val")];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
-    let idx_id = engine.create_index("public.t", "val", false).unwrap();
+    let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
 
     let tbl_dir = format!("{}/public/t_{}", dir, tid);
     let live_idx = format!("{}/idx_{}", tbl_dir, idx_id);
@@ -172,7 +172,7 @@ fn gc_leaves_live_entities_untouched() {
     bb.begin_row(1u128, 1); bb.put_u64(7); bb.end_row();
     engine.ingest_to_family(t1, &bb.finish()).unwrap();
     engine.flush_family(t1).unwrap();
-    let i1 = engine.create_index("public.flushed", "val", false).unwrap();
+    let i1 = engine.create_index("public.flushed", &["val"], false).unwrap();
 
     let t2 = engine.create_table("public.empty", &cols, &[0], true).unwrap();
 

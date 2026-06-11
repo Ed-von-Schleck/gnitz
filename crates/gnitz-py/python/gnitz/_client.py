@@ -82,8 +82,12 @@ class Connection:
     def seek(self, table_id: int, pk: int = 0):
         return self._client.seek_lazy(table_id, pk)
 
-    def seek_by_index(self, table_id: int, col_idx: int, key: int = 0):
-        return self._client.seek_by_index_lazy(table_id, col_idx, key)
+    def seek_by_index(self, table_id: int, col_indices, key_vals):
+        """Seek a secondary index. ``col_indices`` is the index's full declared
+        column list and ``key_vals`` the leading native key values
+        (``len(key_vals)`` may be ``< len(col_indices)`` for a leading-prefix
+        seek). Both are lists; a single-column seek passes 1-element lists."""
+        return self._client.seek_by_index_lazy(table_id, col_indices, key_vals)
 
     def execute_sql(self, sql: str, schema_name: str = "public") -> list:
         return self._client.execute_sql(schema_name, sql)

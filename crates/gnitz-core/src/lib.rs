@@ -16,7 +16,10 @@ pub use connection::{
     FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
 };
 pub use client::{GnitzClient, IndexMeta};
-pub use gnitz_wire::{FK_INDEX_INFIX, validate_user_identifier};
+pub use gnitz_wire::{
+    FK_INDEX_INFIX, validate_user_identifier,
+    index_key_types, PkColList,
+};
 pub use protocol::{
     ProtocolError,
     TypeCode, FixedInt, ColumnDef, PkColumn, PkTuple, Schema, ColData, ZSetBatch, BatchAppender, meta_schema,

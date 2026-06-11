@@ -46,16 +46,20 @@ struct PendingScan {
 enum HasPkLookup {
     /// Check the table's primary-key store.
     PrimaryKey,
-    /// Check a unique secondary index on `col_idx` (0-indexed).
-    UniqueIndex(u32),
+    /// Check a unique secondary index on the carried column list (always
+    /// single-column — composite UNIQUE is not yet supported).
+    UniqueIndex(gnitz_wire::PkColList),
 }
 
 impl HasPkLookup {
+    /// `seek_col_idx == 0` → PrimaryKey. Otherwise `seek_col_idx` carries
+    /// `pack_pk_cols(col_indices)` whose packed flag (bit 63) is always set, so a
+    /// real index check is never 0 and never collides with the PK sentinel.
     fn from_wire(seek_col_idx: u64) -> Self {
-        if seek_col_idx > 0 {
-            HasPkLookup::UniqueIndex((seek_col_idx - 1) as u32)
-        } else {
+        if seek_col_idx == 0 {
             HasPkLookup::PrimaryKey
+        } else {
+            HasPkLookup::UniqueIndex(gnitz_wire::unpack_pk_cols(seek_col_idx))
         }
     }
 }
@@ -853,28 +857,43 @@ impl WorkerProcess {
             }
 
             SalMessageKind::SeekByIndex => {
-                let col_idx = seek_col_idx as u32;
-                // The indexed source column is at most 16 bytes (UUID/U128) and
-                // we never need `seek_pk_extra` here — index keys are always
-                // promoted to ≤16 bytes. We pass the value's native source-width
-                // bytes; `seek_by_index` zero-extends and OPK-encodes them to the
-                // promoted index key before seeking the OPK-at-rest index.
-                let col_size = self.cat()
-                    .get_schema_desc(target_id)
-                    .and_then(|s| s.columns.get(col_idx as usize).map(|c| c.size() as usize))
-                    .unwrap_or(0);
-                if col_size == 0 {
-                    return DispatchResult::Error(format!(
-                        "seek_by_index: invalid column index {} for table {}",
-                        col_idx, target_id,
-                    ));
+                // seek_col_idx carries pack_pk_cols(col_indices); the packed flag
+                // (bit 63) is always set, so a real index seek is never 0.
+                // Validate each column against the schema before touching the
+                // catalog.
+                let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
+                let ncol = self.cat().get_schema_desc(target_id).map(|s| s.num_columns());
+                match ncol {
+                    Some(nc) if cols.is_well_formed()
+                        && cols.as_slice().iter().all(|&c| (c as usize) < nc) => {}
+                    _ => return DispatchResult::Error(format!(
+                        "seek_by_index: invalid column list for table {target_id}")),
                 }
-                let key_bytes = seek_pk.to_le_bytes();
-                let prefix = &key_bytes[..col_size.min(16)];
-                match self.cat().seek_by_index(target_id, col_idx, prefix) {
+                // Reassemble the K native values: slot 0 in seek_pk, slots 1..K in
+                // seek_pk_extra. A prefix seek supplies K < cols.len() values. Each
+                // extra slot is exactly 16 bytes; reject a misaligned payload at
+                // the trust boundary rather than silently dropping trailing bytes.
+                if !seek_pk_extra.len().is_multiple_of(16) {
+                    return DispatchResult::Error(
+                        "seek_by_index: seek_pk_extra length is not a multiple of 16".to_string());
+                }
+                let k = 1 + seek_pk_extra.len() / 16;
+                if k > cols.as_slice().len() {
+                    return DispatchResult::Error(format!(
+                        "seek_by_index: {k} key values exceed index arity {}",
+                        cols.as_slice().len()));
+                }
+                let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
+                natives[0] = seek_pk;
+                for i in 1..k {
+                    natives[i] = u128::from_le_bytes(
+                        seek_pk_extra[(i - 1) * 16..i * 16].try_into().unwrap());
+                }
+                match self.cat().seek_by_index(target_id, cols.as_slice(), &natives[..k]) {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
-                        self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id, client_id, seek_pk);
+                        self.send_response(target_id as u64, result.as_ref(),
+                                           schema.as_ref(), request_id, client_id, seek_pk);
                     }
                     Err(msg) => return DispatchResult::Error(msg),
                 }
@@ -1277,11 +1296,15 @@ impl WorkerProcess {
         let n = batch.as_ref().map(|b| b.count).unwrap_or(0);
 
         let (schema, result) = match lookup {
-            HasPkLookup::UniqueIndex(col_idx) => {
-                let index_handle = self.cat().get_index_store_handle(target_id, col_idx);
+            HasPkLookup::UniqueIndex(cols) => {
+                // Unique circuits are always single-column (composite UNIQUE is
+                // not yet supported).
+                debug_assert_eq!(cols.as_slice().len(), 1,
+                    "unique-index has_pk lookup must be single-column");
+                let index_handle = self.cat().get_index_store_handle(target_id, cols.as_slice());
                 if index_handle.is_null() {
                     return Err(format!(
-                        "No unique index on column {} for table {}", col_idx, target_id
+                        "No unique index on columns {:?} for table {}", cols.as_slice(), target_id
                     ));
                 }
                 // The check target is the unique INDEX table, whose schema is
@@ -1290,11 +1313,11 @@ impl WorkerProcess {
                 // from this schema, so an owner-table fallback would compute the
                 // wrong prefix width. The broadcast always carries the index
                 // schema today, so the fallback is currently unreachable, but
-                // `get_index_schema_by_col` keeps it type-correct.
+                // `get_index_schema_by_cols` keeps it type-correct.
                 let schema = batch.as_ref()
                     .and_then(|b| b.schema)
-                    .or_else(|| self.cat().get_index_schema_by_col(target_id, col_idx))
-                    .ok_or_else(|| format!("no index schema for tid={} col={}", target_id, col_idx))?;
+                    .or_else(|| self.cat().get_index_schema_by_cols(target_id, cols.as_slice()))
+                    .ok_or_else(|| format!("no index schema for tid={} cols={:?}", target_id, cols.as_slice()))?;
                 // Index layout: PK = (indexed-key field, src_pk_cols). The
                 // check-batch carries the promoted indexed value in the low
                 // bytes of its PK. Any positive-weight match means the value
@@ -1982,20 +2005,25 @@ mod tests {
     }
 
     #[test]
-    fn from_wire_one_is_unique_index_col0() {
-        assert!(matches!(HasPkLookup::from_wire(1), HasPkLookup::UniqueIndex(0)));
+    fn from_wire_packed_single_col_is_unique_index() {
+        // seek_col_idx carries pack_pk_cols(&[col]); the packed flag (bit 63) is
+        // always set, so it is never 0 and decodes back to the column list.
+        for col in [0u32, 1, 5, 63] {
+            let packed = gnitz_wire::pack_pk_cols(&[col]);
+            match HasPkLookup::from_wire(packed) {
+                HasPkLookup::UniqueIndex(cols) => assert_eq!(cols.as_slice(), [col]),
+                HasPkLookup::PrimaryKey => panic!("packed list must decode to UniqueIndex"),
+            }
+        }
     }
 
     #[test]
-    fn from_wire_two_is_unique_index_col1() {
-        assert!(matches!(HasPkLookup::from_wire(2), HasPkLookup::UniqueIndex(1)));
-    }
-
-    #[test]
-    fn from_wire_large_value_is_unique_index_not_primary_key() {
-        // Before the fix, (u64::MAX as i32) = -1 < 0 would return PrimaryKey.
-        assert!(matches!(HasPkLookup::from_wire(u64::MAX), HasPkLookup::UniqueIndex(_)));
-        assert!(matches!(HasPkLookup::from_wire(i32::MAX as u64 + 1), HasPkLookup::UniqueIndex(_)));
+    fn from_wire_packed_is_never_primary_key() {
+        // A packed single-column list always sets the flag bit, so it never
+        // collides with the PK sentinel (0).
+        assert!(gnitz_wire::pack_pk_cols(&[0]) != 0);
+        assert!(matches!(HasPkLookup::from_wire(gnitz_wire::pack_pk_cols(&[0])),
+                         HasPkLookup::UniqueIndex(_)));
     }
 
     // -- Walk-the-matrix dispatch tests ---------------------------------------

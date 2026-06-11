@@ -51,7 +51,7 @@ use crate::storage::{Batch, PartitionedTable, Persistence, partition_arena_size,
 pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
 pub(crate) use sys_tables::{SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID};
 pub(crate) use sys_tables::{TABLE_TAB_ID, IDX_TAB_ID};
-pub(crate) use sys_tables::{IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COL_IDX, IDXTAB_PAY_IS_UNIQUE};
+pub(crate) use sys_tables::{IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE};
 
 // Import everything from sys_tables for internal use.
 use sys_tables::*;

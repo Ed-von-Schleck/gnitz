@@ -65,7 +65,7 @@ pub(super) fn validate_pk_cols(
     col_defs: &[super::types::ColumnDef],
     pk: &PkColList,
 ) -> Result<(), String> {
-    if !(1..=gnitz_wire::PK_LIST_MAX_COLS).contains(&pk.decoded_count()) {
+    if !pk.is_well_formed() {
         return Err(format!(
             "Primary Key column count {} out of range 1..={}",
             pk.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS));
@@ -123,7 +123,9 @@ pub(super) const COLTAB_COL_FK_TABLE_ID: usize = 7;
 pub(super) const COLTAB_COL_FK_COL_IDX: usize = 8;
 
 pub(super) const IDXTAB_COL_OWNER_ID: usize = 1;
-pub(super) const IDXTAB_COL_SOURCE_COL_IDX: usize = 3;
+// Holds `pack_pk_cols(&col_indices)` for every row (single- and multi-column
+// indexes alike); decoded via `unpack_pk_cols`.
+pub(super) const IDXTAB_COL_SOURCE_COLS: usize = 3;
 pub(super) const IDXTAB_COL_NAME: usize = 4;
 pub(super) const IDXTAB_COL_IS_UNIQUE: usize = 5;
 
@@ -131,10 +133,10 @@ pub(super) const IDXTAB_COL_IS_UNIQUE: usize = 5;
 // `read_batch_u64`/`read_batch_string`, where the single-column PK `index_id`
 // (full-schema column 0) is excluded. Each is the matching IDXTAB_COL_*
 // full-schema index minus one.
-pub(crate) const IDXTAB_PAY_OWNER_ID: usize       = IDXTAB_COL_OWNER_ID - 1;
-pub(crate) const IDXTAB_PAY_SOURCE_COL_IDX: usize = IDXTAB_COL_SOURCE_COL_IDX - 1;
-pub(crate) const IDXTAB_PAY_NAME: usize           = IDXTAB_COL_NAME - 1;
-pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize      = IDXTAB_COL_IS_UNIQUE - 1;
+pub(crate) const IDXTAB_PAY_OWNER_ID: usize    = IDXTAB_COL_OWNER_ID - 1;
+pub(crate) const IDXTAB_PAY_SOURCE_COLS: usize = IDXTAB_COL_SOURCE_COLS - 1;
+pub(crate) const IDXTAB_PAY_NAME: usize        = IDXTAB_COL_NAME - 1;
+pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize   = IDXTAB_COL_IS_UNIQUE - 1;
 
 pub(super) const SEQTAB_COL_VALUE: usize = 1;
 

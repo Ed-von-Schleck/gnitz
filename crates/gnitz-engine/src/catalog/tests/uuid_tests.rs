@@ -70,7 +70,7 @@ fn test_uuid_secondary_index() {
     engine.dag.ingest_to_family(tid, bb.finish());
     let _ = engine.dag.flush(tid);
 
-    engine.create_index("public.uuid_idxtab", "uid", false).unwrap();
+    engine.create_index("public.uuid_idxtab", &["uid"], false).unwrap();
     assert!(engine.has_index_by_name("public__uuid_idxtab__idx_uid"));
 
     engine.drop_index("public__uuid_idxtab__idx_uid").unwrap();

@@ -69,8 +69,9 @@ class TestIndexDdl:
             assert r["type"] == "IndexCreated"
             assert r["index_id"] > 0
 
-            # Verify IdxTab row exists with correct owner_id and source_col_idx
-            from gnitz.core import IDX_TAB
+            # Verify IdxTab row exists with correct owner_id and source_cols
+            # (the packed column-list u64, decoded via the shared codec).
+            from gnitz.core import IDX_TAB, unpack_pk_cols
             raw = client._client.scan(IDX_TAB)
             schema_obj, batch_obj, _ = raw
             assert batch_obj is not None
@@ -81,7 +82,7 @@ class TestIndexDdl:
                     continue
                 owner_id = batch_obj.columns[1][i] if batch_obj.columns[1] else None
                 src_col  = batch_obj.columns[3][i] if batch_obj.columns[3] else None
-                if owner_id == tid and src_col == 1:
+                if owner_id == tid and unpack_pk_cols(src_col) == [1]:
                     found = True
                     break
             assert found, "IdxTab row not found"
@@ -242,7 +243,7 @@ class TestIndexSeek:
             )
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
 
-            result = client.seek_by_index(tid, col_idx=1, key=42)
+            result = client.seek_by_index(tid, [1], [42])
             assert result.batch is not None
             assert len(result.batch.pks) == 1
             assert result.batch.pks[0] == 1
@@ -261,7 +262,7 @@ class TestIndexSeek:
             )
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
 
-            result = client.seek_by_index(tid, col_idx=1, key=999)
+            result = client.seek_by_index(tid, [1], [999])
             assert result.batch is None or len(result.batch.pks) == 0
         finally:
             _drop_all(client, sn,
@@ -279,7 +280,7 @@ class TestIndexSeek:
             )
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
 
-            result = client.seek_by_index(tid, col_idx=1, key=77)
+            result = client.seek_by_index(tid, [1], [77])
             assert result.batch is not None
             assert len(result.batch.pks) == 1
             assert result.batch.pks[0] == 10
@@ -296,7 +297,7 @@ class TestIndexSeek:
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
             client.execute_sql("INSERT INTO t VALUES (5, 55)", schema_name=sn)
 
-            result = client.seek_by_index(tid, col_idx=1, key=55)
+            result = client.seek_by_index(tid, [1], [55])
             assert result.batch is not None
             assert len(result.batch.pks) == 1
             assert result.batch.pks[0] == 5
@@ -1777,3 +1778,166 @@ class TestUniqueIndexCreatePreflight:
             assert _table_has_index(client, sn, "t")
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_pk"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestCompositeIndex — multi-column secondary indexes
+# ---------------------------------------------------------------------------
+
+def _pks(results):
+    """Sorted PKs of a Rows result."""
+    assert results[0]["type"] == "Rows", results[0]
+    return sorted(row.pk for row in results[0]["rows"])
+
+
+class TestCompositeIndex:
+    """CREATE INDEX (a, b), full-key and out-of-order WHERE lookups,
+    leading-prefix seeks, the nullable-trailing-prefix guard, DROP-INDEX
+    exact-list matching, and the composite-UNIQUE / limit rejections."""
+
+    def _setup(self, client, sn, b_nullable=False):
+        b_decl = "b BIGINT" if b_nullable else "b BIGINT NOT NULL"
+        client.execute_sql(
+            f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            f"a BIGINT NOT NULL, {b_decl}, c BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t VALUES "
+            "(10, 1, 100, 7), (20, 1, 200, 8), (30, 2, 100, 9)",
+            schema_name=sn,
+        )
+
+    def test_full_key_and_out_of_order(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
+
+            # Full-key seek a=1 AND b=200 -> pk 20.
+            assert _pks(client.execute_sql(
+                "SELECT * FROM t WHERE a = 1 AND b = 200", schema_name=sn)) == [20]
+
+            # Out-of-order WHERE binds each value to the index's declared column,
+            # not AST order: b=200 AND a=1 must return the same row.
+            assert _pks(client.execute_sql(
+                "SELECT * FROM t WHERE b = 200 AND a = 1", schema_name=sn)) == [20]
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_leading_prefix_served_by_index(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)  # b NOT NULL
+            client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
+
+            # Leading-prefix WHERE a=1 over index (a, b) (b non-nullable) is
+            # served by the index and returns both a=1 rows.
+            assert _pks(client.execute_sql(
+                "SELECT * FROM t WHERE a = 1", schema_name=sn)) == [10, 20]
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_tiebreak_prefers_tighter_index(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(a, b, c)", schema_name=sn)
+
+            # With both (a,b) and (a,b,c), WHERE a=1 AND b=200 must still return
+            # the correct row regardless of which index the planner picks.
+            assert _pks(client.execute_sql(
+                "SELECT * FROM t WHERE a = 1 AND b = 200", schema_name=sn)) == [20]
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_nullable_trailing_prefix_not_used(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn, b_nullable=True)
+            # Add a row with NULL b that the prefix predicate a=1 still matches.
+            client.execute_sql(
+                "INSERT INTO t VALUES (40, 1, NULL, 11)", schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
+
+            # Leading-prefix WHERE a=1 over (a, b) with b nullable is NOT served
+            # by the index (it would silently drop the (1, NULL) row), so direct
+            # SELECT raises the clean "non-indexed" error.
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("SELECT * FROM t WHERE a = 1", schema_name=sn)
+
+            # The full key still uses the index and finds the non-null row.
+            assert _pks(client.execute_sql(
+                "SELECT * FROM t WHERE a = 1 AND b = 200", schema_name=sn)) == [20]
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_residual_non_equality_on_prefix_column(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql("CREATE INDEX ON t(a)", schema_name=sn)
+
+            # WHERE a = 1 AND a > 5 consumes the equality a=1 via the index and
+            # keeps a > 5 as a residual filter — the residual is excluded by the
+            # consumed conjunct's physical index, not by column, so a > 5 survives
+            # and (since a=1) matches no row.
+            res = client.execute_sql(
+                "SELECT * FROM t WHERE a = 1 AND a > 5", schema_name=sn)
+            assert res[0]["type"] == "Rows"
+            assert len(res[0]["rows"]) == 0
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_drop_index_exact_list(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql("CREATE INDEX ON t(a)", schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
+
+            # Drop only the composite (a, b); the single-column (a) index survives
+            # and still serves WHERE a = 1.
+            client.execute_sql(f"DROP INDEX {sn}__t__idx_a_b", schema_name=sn)
+            assert _pks(client.execute_sql(
+                "SELECT * FROM t WHERE a = 1", schema_name=sn)) == [10, 20]
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_composite_unique_rejected(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "CREATE UNIQUE INDEX ON t(a, b)", schema_name=sn)
+            # Single-column UNIQUE still works (c holds distinct values 7,8,9).
+            client.execute_sql("CREATE UNIQUE INDEX ON t(c)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_create_index_limits(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "a BIGINT NOT NULL, s VARCHAR NOT NULL)",
+                schema_name=sn,
+            )
+            # Index on a STRING column is rejected.
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE INDEX ON t(s)", schema_name=sn)
+            # Duplicate column in the index list is rejected.
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE INDEX ON t(a, a)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, tables=["t"])

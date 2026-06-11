@@ -53,8 +53,9 @@ enum CheckPayload {
 }
 
 /// A single distributed has-pk check queued for pipelined execution.
-/// `flags` is typically FLAG_HAS_PK; `col_hint` is (source_col_idx + 1)
-/// for an index check or 0 for a PK check.
+/// `flags` is typically FLAG_HAS_PK; `col_hint` is `pack_pk_cols(&[col])` for an
+/// index check (the packed flag at bit 63 is always set, so it never collides
+/// with the PK sentinel) or 0 for a PK check.
 struct PipelinedCheck {
     target_id: i64,
     flags: u32,
@@ -791,15 +792,15 @@ impl MasterDispatcher {
         if n_idx == 0 { return; }
 
         for ci in 0..n_idx {
-            if let Some((col_idx, is_unique, _tc)) = cat.get_index_circuit_info(target_id, ci) {
-                if !is_unique { continue; }
-                for (w, wi) in worker_indices[..self.num_workers].iter().enumerate() {
-                    if !wi.is_empty() {
-                        self.router.record_routing_from_source(
-                            source_batch, wi, schema,
-                            target_id as u32, col_idx, w as u32,
-                        );
-                    }
+            // The routing cache is keyed (table, col); only unique circuits
+            // (single-column) participate.
+            let Some(col_idx) = cat.unique_index_circuit_col(target_id, ci) else { continue };
+            for (w, wi) in worker_indices[..self.num_workers].iter().enumerate() {
+                if !wi.is_empty() {
+                    self.router.record_routing_from_source(
+                        source_batch, wi, schema,
+                        target_id as u32, col_idx, w as u32,
+                    );
                 }
             }
         }
@@ -919,8 +920,13 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, col_idx: u32, key: u128,
+        target_id: i64, seek_col_idx: u64, seek_pk: u128, seek_pk_extra: &[u8],
     ) -> Result<Option<Batch>, String> {
+        // The master forwards the client's wire frame verbatim — it never
+        // decodes seek_pk_extra into u128s and re-encodes them (the worker is
+        // the sole OPK encoder). seek_col_idx carries pack_pk_cols(col_indices),
+        // already validated by the caller; key slots 1..K ride in seek_pk_extra
+        // (empty for a single-value seek).
         // `_lease` held across the single-frame collect: its workers stream, so
         // releasing the gate before the slots are inspected risks a discarded
         // late frame.
@@ -929,7 +935,7 @@ impl MasterDispatcher {
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
                 target_id, lsn, FLAG_SEEK_BY_INDEX, 0, &[], &schema, &col_names,
-                key, col_idx as u64, req_ids, -1, 0, None, &[],
+                seek_pk, seek_col_idx, req_ids, -1, 0, None, seek_pk_extra,
             )
         }).await?;
 
@@ -1341,13 +1347,8 @@ impl MasterDispatcher {
 
         let mut out: Vec<UniqueIndexDesc> = Vec::new();
         for ci in 0..n_circuits {
-            if let Some((col_idx, is_unique, _type_code)) =
-                cat.get_index_circuit_info(table_id, ci)
-            {
-                if !is_unique { continue; }
-                let source_col = col_idx as usize;
-                out.push(UniqueIndexDesc { col_idx, loc: schema.locate(source_col) });
-            }
+            let Some(col_idx) = cat.unique_index_circuit_col(table_id, ci) else { continue };
+            out.push(UniqueIndexDesc { col_idx, loc: schema.locate(col_idx as usize) });
         }
         if out.is_empty() { None } else { Some((schema, out)) }
     }
@@ -1595,7 +1596,7 @@ impl MasterDispatcher {
             } else {
                 let idx_schema = unsafe {
                     let cat = &mut *(*disp_ptr).catalog;
-                    cat.get_index_schema_by_col(parent_table_id, parent_col_idx as u32)
+                    cat.get_index_schema_by_cols(parent_table_id, &[parent_col_idx as u32])
                         .ok_or_else(|| format!(
                             "FK check: no unique index on parent table {} col {}",
                             parent_table_id, parent_col_idx))?
@@ -1606,7 +1607,7 @@ impl MasterDispatcher {
                 p1_checks.push(PipelinedCheck {
                     target_id: parent_table_id,
                     flags: FLAG_HAS_PK,
-                    col_hint: (parent_col_idx as u64) + 1,
+                    col_hint: gnitz_wire::pack_pk_cols(&[parent_col_idx as u32]),
                     payload: Some(CheckPayload::Broadcast(check_batch)),
                     schema: idx_schema,
                 });
@@ -1665,7 +1666,7 @@ impl MasterDispatcher {
                             Some(info) => info,
                             None => continue,
                         };
-                        let idx_schema = cat.get_index_schema_by_col(child_tid, fk_col_idx as u32)
+                        let idx_schema = cat.get_index_schema_by_cols(child_tid, &[fk_col_idx as u32])
                             .ok_or_else(|| format!(
                                 "FK RESTRICT check failed: no index on child table {} col {}",
                                 child_tid, fk_col_idx))?;
@@ -1708,7 +1709,7 @@ impl MasterDispatcher {
                     p1_checks.push(PipelinedCheck {
                         target_id: child_tid,
                         flags: FLAG_HAS_PK,
-                        col_hint: (fk_col_idx as u64) + 1,
+                        col_hint: gnitz_wire::pack_pk_cols(&[fk_col_idx as u32]),
                         payload: Some(CheckPayload::Broadcast(check_batch)),
                         schema: idx_schema,
                     });
@@ -1855,7 +1856,7 @@ impl MasterDispatcher {
                         };
                         // PK columns are immutable under UPDATE — nothing to enforce.
                         if source_schema.is_pk_col(parent_col_idx) { continue; }
-                        let idx_schema = match cat.get_index_schema_by_col(child_tid, fk_col_idx as u32) {
+                        let idx_schema = match cat.get_index_schema_by_cols(child_tid, &[fk_col_idx as u32]) {
                             Some(s) => s,
                             None => continue,
                         };
@@ -1918,11 +1919,10 @@ impl MasterDispatcher {
             let (col_idx, idx_schema) = unsafe {
                 let disp = &mut *disp_ptr;
                 let cat = &mut *disp.catalog;
-                let (col_idx, is_unique, _type_code) = match cat.get_index_circuit_info(target_id, ci) {
-                    Some(info) => info,
+                let col_idx = match cat.unique_index_circuit_col(target_id, ci) {
+                    Some(c) => c,
                     None => continue,
                 };
-                if !is_unique { continue; }
                 let idx_schema = match cat.get_index_circuit_schema(target_id, ci) {
                     Some(s) => s,
                     None => continue,
@@ -2030,7 +2030,7 @@ impl MasterDispatcher {
                     p2_checks.push(PipelinedCheck {
                         target_id,
                         flags: FLAG_HAS_PK,
-                        col_hint: (col_idx as u64) + 1,
+                        col_hint: gnitz_wire::pack_pk_cols(&[col_idx]),
                         payload: Some(CheckPayload::Broadcast(chk_batch)),
                         schema: idx_schema,
                     });
@@ -2051,7 +2051,7 @@ impl MasterDispatcher {
                 p2_checks.push(PipelinedCheck {
                     target_id,
                     flags: FLAG_HAS_PK,
-                    col_hint: (col_idx as u64) + 1,
+                    col_hint: gnitz_wire::pack_pk_cols(&[col_idx]),
                     payload: Some(CheckPayload::Broadcast(u_batch)),
                     schema: idx_schema,
                 });
@@ -2066,7 +2066,7 @@ impl MasterDispatcher {
             p2_checks.push(PipelinedCheck {
                 target_id: child_tid,
                 flags: FLAG_HAS_PK,
-                col_hint: (fk_col as u64) + 1,
+                col_hint: gnitz_wire::pack_pk_cols(&[fk_col]),
                 payload: Some(CheckPayload::Broadcast(chk_batch)),
                 schema: idx_schema,
             });

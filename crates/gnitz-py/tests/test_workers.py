@@ -77,7 +77,7 @@ def test_index_maintained_on_all_workers(client):
 
         tid, _ = client.resolve_table(sn, "t")
         for i in range(1, n + 1):
-            result = client.seek_by_index(tid, col_idx=1, key=i * 100)
+            result = client.seek_by_index(tid, [1], [i * 100])
             assert result.batch is not None and len(result.batch.pks) == 1, \
                 f"cust_id={i * 100} not found via index"
             assert result.batch.pks[0] == i
@@ -145,7 +145,7 @@ def test_seek_by_index_broadcast(client):
         client.execute_sql("INSERT INTO t VALUES (7, 1234)", schema_name=sn)
 
         tid, _ = client.resolve_table(sn, "t")
-        result = client.seek_by_index(tid, col_idx=1, key=1234)
+        result = client.seek_by_index(tid, [1], [1234])
         assert result.batch is not None and len(result.batch.pks) == 1
         assert result.batch.pks[0] == 7
     finally:

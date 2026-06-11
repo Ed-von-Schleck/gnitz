@@ -173,12 +173,12 @@ impl Connection {
 
     pub fn seek_by_index(
         &mut self,
-        table_id: u64,
-        col_idx:  u64,
-        key:      u128,
-        cache:    &mut LruCache<u64, (Arc<Schema>, u16)>,
+        table_id:    u64,
+        col_indices: &[u32],
+        key_vals:    &[u128],
+        cache:       &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> ScanResult {
-        let msg = self.roundtrip_seek_by_index(table_id, col_idx, key, cache)?;
+        let msg = self.roundtrip_seek_by_index(table_id, col_indices, key_vals, cache)?;
         let schema = msg.schema.map(Arc::new).or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
         Ok((schema, msg.data_batch, msg.seek_pk as u64))
     }
@@ -295,16 +295,28 @@ impl Connection {
 
     fn roundtrip_seek_by_index(
         &mut self,
-        table_id: u64,
-        col_idx:  u64,
-        key:      u128,
-        cache:    &mut LruCache<u64, (Arc<Schema>, u16)>,
+        table_id:    u64,
+        col_indices: &[u32],
+        key_vals:    &[u128],
+        cache:       &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         // Embed the cached schema version so the server can omit the schema
         // block on a warm-cache hit (matching roundtrip_push/scan).
         let cached_version = cache.peek(&table_id).map(|(_, v)| *v).unwrap_or(0);
         let flags = wire_flags_set_schema_version(FLAG_SEEK_BY_INDEX, cached_version);
-        send_message(self.sock.as_raw_fd(), table_id, self.client_id, flags, &PkTuple::from_u128_narrow(key), col_idx, None, None)?;
+        // Pack the K = key_vals.len() native values as 16-byte LE slots into a
+        // PkTuple (stride K×16 ≤ 64 ≤ MAX_PK_BYTES); send_message's split_wire
+        // routes slot 0 → seek_pk and slots 1..K → seek_pk_extra. K=1 is
+        // byte-identical to the legacy single-value frame. seek_col_idx carries
+        // pack_pk_cols(col_indices). Arity is validated upstream in
+        // GnitzClient::seek_by_index (the one choke point for every binding).
+        let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+        for (i, &v) in key_vals.iter().enumerate() {
+            buf[i * 16..i * 16 + 16].copy_from_slice(&v.to_le_bytes());
+        }
+        let pk = PkTuple::from_bytes(&buf[..key_vals.len() * 16]);
+        let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
+        send_message(self.sock.as_raw_fd(), table_id, self.client_id, flags, &pk, seek_col_idx, None, None)?;
         let msg = self.recv_message_cached_inner(table_id, cache)?;
         check_response(msg)
     }

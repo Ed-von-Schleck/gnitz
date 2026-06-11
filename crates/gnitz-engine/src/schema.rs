@@ -819,6 +819,31 @@ pub(crate) fn index_opk_prefix(
     opk
 }
 
+/// Composite generalisation of [`index_opk_prefix`]: OPK-encode each native
+/// value into its index column's slot at the running offset, returning the
+/// buffer and the filled prefix length. `cols` is the leading slice of the
+/// circuit's `index_schema.columns`; `natives.len() == cols.len()` may be
+/// `< N` (a leading-prefix seek): only the supplied leading columns are
+/// encoded; the rest of the buffer stays zero. Byte-identical to
+/// `index_opk_prefix` for a 1-element list, so the seek path stays
+/// byte-consistent with `batch_project_index`.
+pub(crate) fn index_opk_prefix_composite(
+    natives: &[u128], cols: &[SchemaColumn],
+) -> ([u8; MAX_PK_BYTES], usize) {
+    debug_assert_eq!(natives.len(), cols.len(),
+        "index_opk_prefix_composite: one index column per supplied value");
+    let mut opk = [0u8; MAX_PK_BYTES];
+    let mut off = 0;
+    for (native, col) in natives.iter().zip(cols) {
+        let size = col.size() as usize;
+        gnitz_wire::encode_pk_column(
+            &native.to_le_bytes()[..size], col.type_code, &mut opk[off..off + size],
+        );
+        off += size;
+    }
+    (opk, off)
+}
+
 /// Prepare the 16-byte German string output struct for a copy operation.
 /// Fills length, prefix, and (for short strings) inline suffix.
 /// For long strings dest[8..16] is left as zero — the caller must resolve

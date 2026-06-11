@@ -484,7 +484,7 @@ fn execute_create_table(
         let col = &cols[*c as usize];
         let index_name = constraint_name.clone()
             .unwrap_or_else(|| default_index_name(schema_name, &table_name, &col.name));
-        if let Err(e) = client.create_index(tid, *c as usize, col.type_code, &index_name, true) {
+        if let Err(e) = client.create_index(tid, &[*c], &[col.type_code], &index_name, true) {
             let _ = client.drop_table(schema_name, &table_name);
             return Err(GnitzSqlError::Exec(e));
         }
@@ -818,34 +818,68 @@ fn execute_create_index(
         validate_user_index_name(name)?;
     }
 
-    if ci.columns.len() != 1 {
-        return Err(GnitzSqlError::Unsupported(
-            "CREATE INDEX: only single-column indices supported".to_string()
+    if ci.columns.is_empty() {
+        return Err(GnitzSqlError::Bind(
+            "CREATE INDEX: at least one column required".to_string()
         ));
     }
-    let col_name = match &ci.columns[0].column.expr {
-        Expr::Identifier(id) => id.value.clone(),
-        _ => return Err(GnitzSqlError::Bind(
-            "CREATE INDEX: column must be a simple identifier".to_string()
-        )),
-    };
     let is_unique = ci.unique;
 
     // Resolve the target as a base table: this rejects a view (read-only — a
     // view's store is maintained solely by its circuit, so indexing a snapshot of
     // derived data has no defined semantics) with a precise error, and yields the
-    // schema used to resolve the indexed column. The client write below takes the
-    // already-resolved (table_id, col_idx), so the name is resolved exactly once.
+    // schema used to resolve the indexed columns. The client write below takes the
+    // already-resolved (table_id, col_indices), so the name is resolved once.
     let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
-    let col_idx = find_unique_column(&schema.columns, &col_name)?
-        .ok_or_else(|| GnitzSqlError::Bind(
-            format!("column '{}' not found", col_name)
-        ))?;
+
+    // Resolve each indexed column to its index, in declared order; each must be a
+    // simple identifier. Reject duplicate columns.
+    let mut col_names: Vec<String> = Vec::with_capacity(ci.columns.len());
+    let mut col_indices: Vec<u32> = Vec::with_capacity(ci.columns.len());
+    for c in &ci.columns {
+        let col_name = match &c.column.expr {
+            Expr::Identifier(id) => id.value.clone(),
+            _ => return Err(GnitzSqlError::Bind(
+                "CREATE INDEX: column must be a simple identifier".to_string()
+            )),
+        };
+        let col_idx = find_unique_column(&schema.columns, &col_name)?
+            .ok_or_else(|| GnitzSqlError::Bind(
+                format!("column '{}' not found", col_name)
+            ))?;
+        if col_indices.contains(&(col_idx as u32)) {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "CREATE INDEX: duplicate column '{}' in index list", col_name)));
+        }
+        col_names.push(col_name);
+        col_indices.push(col_idx as u32);
+    }
+
+    // The distributed uniqueness-check pipeline (filters, routing cache,
+    // has_pk checks) is single-column throughout; the engine hook rejects a
+    // composite UNIQUE row identically.
+    if is_unique && col_indices.len() > 1 {
+        return Err(GnitzSqlError::Unsupported(
+            "composite UNIQUE indexes are not yet supported".to_string()
+        ));
+    }
+
+    // Limit pre-check — runs before the client push so an over-limit index
+    // raises a clean planner error here, not after the IDX_TAB row already
+    // committed. `index_key_types` is the same promotion + arity/stride
+    // validation the engine's `make_index_schema` runs, so the friendly error
+    // here and the engine backstop can never disagree.
+    let col_types: Vec<TypeCode> = col_indices.iter()
+        .map(|&c| schema.columns[c as usize].type_code).collect();
+    let raw_types: Vec<u8> = col_types.iter().map(|&tc| tc as u8).collect();
+    gnitz_core::index_key_types(&raw_types, schema.pk_count(), schema.pk_stride())
+        .map_err(GnitzSqlError::Unsupported)?;   // also rejects String/Blob/float
+
     let index_name = explicit_name
-        .unwrap_or_else(|| default_index_name(schema_name, &table_name, &col_name));
+        .unwrap_or_else(|| default_index_name(schema_name, &table_name, &col_names.join("_")));
 
     let index_id = client.create_index(
-        table_id, col_idx, schema.columns[col_idx].type_code, &index_name, is_unique,
+        table_id, &col_indices, &col_types, &index_name, is_unique,
     ).map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::IndexCreated { index_id })

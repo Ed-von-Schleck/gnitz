@@ -1147,22 +1147,37 @@ fn empty_schema_sentinel() -> Schema {
 
 /// Low-level seek on secondary index.
 /// table_id: source TABLE id (not the index id).
-/// col_idx: 0-based column index the index was created on.
-/// key_lo/key_hi: 128-bit index key split into two u64.
+/// col_indices_ptr/n_cols: the index's FULL declared column list (the server
+///   matches the circuit by exact list), 0-based column indices.
+/// key_vals_ptr/n_vals: `n_vals` 128-bit native key values, each stored as two
+///   consecutive `u64` (`lo` then `hi`) — so the buffer holds `2 * n_vals` u64
+///   elements. `n_vals` may be `< n_cols` for a leading-prefix seek. The lo/hi
+///   split is the same portable encoding as the rest of this FFI; a raw
+///   `*const u128` array is avoided because its `__int128` layout is arch-
+///   dependent.
 /// out_batch: receives pointer to result batch (NULL if not found).
 /// Returns 0 on success, -1 on error (call gnitz_last_error for message).
 #[no_mangle]
 pub unsafe extern "C" fn gnitz_seek_by_index(
-    conn:      *mut GnitzConn,
-    table_id:  u64,
-    col_idx:   u64,
-    key_lo:    u64,
-    key_hi:    u64,
-    out_batch: *mut *mut GnitzBatch,
+    conn:           *mut GnitzConn,
+    table_id:       u64,
+    col_indices_ptr: *const u32,
+    n_cols:         usize,
+    key_vals_ptr:   *const u64,
+    n_vals:         usize,
+    out_batch:      *mut *mut GnitzBatch,
 ) -> c_int {
     clear_error();
     let c = check_ptr_mut!(conn, -1);
-    match c.0.seek_by_index(table_id, col_idx, key_lo as u128 | (key_hi as u128) << 64) {
+    let cols: &[u32] = std::slice::from_raw_parts(col_indices_ptr, n_cols);
+    // Read the lo/hi halves element-wise and reassemble each u128 by shifting —
+    // never reinterpret `*const u64` as `*const u128` (a u64 buffer is only
+    // 8-byte aligned, and a 16-byte u128 load over it is undefined behaviour).
+    let halves: &[u64] = std::slice::from_raw_parts(key_vals_ptr, n_vals * 2);
+    let keys: Vec<u128> = (0..n_vals)
+        .map(|i| (halves[2 * i] as u128) | ((halves[2 * i + 1] as u128) << 64))
+        .collect();
+    match c.0.seek_by_index(table_id, cols, &keys) {
         Ok((server_schema, data, _)) => {
             if !out_batch.is_null() {
                 match data {

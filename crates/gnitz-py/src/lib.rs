@@ -1511,11 +1511,24 @@ impl PyGnitzClient {
         to_py_err(client!(self).alloc_schema_id())
     }
 
-    /// seek_by_index(table_id, col_idx, key) -> (Schema | None, ZSetBatch | None, view_lsn: int)
+    /// seek_by_index(table_id, col_indices, key_vals) -> (Schema | None, ZSetBatch | None, view_lsn: int)
+    ///
+    /// `col_indices` is the index's FULL declared column list (the server matches
+    /// the circuit by exact list); `key_vals` supplies the leading native key
+    /// values (`len(key_vals)` may be `< len(col_indices)` for a leading-prefix
+    /// seek). Arity is validated once inside `GnitzClient::seek_by_index` (the
+    /// single choke point for every binding), so no validation is duplicated here.
+    /// Key values are decoded through `extract_uuid_or_u128`, so a UUID-keyed seek
+    /// accepts the same `uuid.UUID` / hex-string forms the insert paths do.
+    #[pyo3(signature = (table_id, col_indices, key_vals))]
     pub fn seek_by_index(
-        &mut self, py: Python<'_>, table_id: u64, col_idx: u64, key: u128,
+        &mut self, py: Python<'_>, table_id: u64,
+        col_indices: Vec<u32>, key_vals: Bound<'_, PyList>,
     ) -> PyResult<PyObject> {
-        response_to_py_tuple(py, client!(self).seek_by_index(table_id, col_idx, key))
+        let keys: Vec<u128> = key_vals.iter()
+            .map(|item| extract_uuid_or_u128(&item))
+            .collect::<PyResult<_>>()?;
+        response_to_py_tuple(py, client!(self).seek_by_index(table_id, &col_indices, &keys))
     }
 
     /// seek(table_id, pk) -> (Schema | None, ZSetBatch | None, view_lsn: int)
@@ -1544,11 +1557,16 @@ impl PyGnitzClient {
         response_to_lazy(py, client!(self).seek(table_id, &t))
     }
 
-    /// seek_by_index_lazy(table_id, col_idx, key) -> ScanResult (native)
+    /// seek_by_index_lazy(table_id, col_indices, key_vals) -> ScanResult (native)
+    #[pyo3(signature = (table_id, col_indices, key_vals))]
     pub fn seek_by_index_lazy(
-        &mut self, py: Python<'_>, table_id: u64, col_idx: u64, key: u128,
+        &mut self, py: Python<'_>, table_id: u64,
+        col_indices: Vec<u32>, key_vals: Bound<'_, PyList>,
     ) -> PyResult<Py<PyScanResult>> {
-        response_to_lazy(py, client!(self).seek_by_index(table_id, col_idx, key))
+        let keys: Vec<u128> = key_vals.iter()
+            .map(|item| extract_uuid_or_u128(&item))
+            .collect::<PyResult<_>>()?;
+        response_to_lazy(py, client!(self).seek_by_index(table_id, &col_indices, &keys))
     }
 
     /// execute_sql(schema_name, sql) -> list of result dicts

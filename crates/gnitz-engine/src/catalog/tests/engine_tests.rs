@@ -375,14 +375,14 @@ fn test_fk_index_metadata_queries() {
     assert_eq!(target_id, tid);
 
     // Create an explicit index
-    let _iid = engine.create_index("public.parent", "val", false).unwrap();
+    let _iid = engine.create_index("public.parent", &["val"], false).unwrap();
 
     assert!(engine.get_index_circuit_count(tid) > 0);
-    let (ic_col, _is_unique, _tc) = engine.get_index_circuit_info(tid, 0).unwrap();
-    assert_eq!(ic_col, 1); // val is column 1
+    let (ic_cols, _is_unique) = engine.get_index_circuit_info(tid, 0).unwrap();
+    assert_eq!(ic_cols.as_slice(), [1]); // val is column 1
 
     // Index store handle should be non-null
-    let idx_ptr = engine.get_index_store_handle(tid, 1);
+    let idx_ptr = engine.get_index_store_handle(tid, &[1]);
     assert!(!idx_ptr.is_null());
 
     engine.close();

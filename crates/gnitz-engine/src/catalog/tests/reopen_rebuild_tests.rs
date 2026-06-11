@@ -51,7 +51,7 @@ fn view_and_index_rebuild_once_on_reopen() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
 
     // Secondary index on val (backfills the N committed rows).
-    engine.create_index("public.base", "val", false).unwrap();
+    engine.create_index("public.base", &["val"], false).unwrap();
 
     // Identity view over base. Circuit and dep rows must precede the VIEW_TAB
     // row so registration can compile and backfill.
@@ -133,7 +133,7 @@ fn view_and_index_rebuild_across_chunk_boundary() {
 
     // `val` is distinct, so the unique flavour also covers the live chunked
     // duplicate scan (seen-set across chunks) finding nothing.
-    engine.create_index("public.base", "val", true).unwrap();
+    engine.create_index("public.base", &["val"], true).unwrap();
 
     let vid = engine.allocate_table_id();
     write_identity_circuit(&mut engine, vid, tid);

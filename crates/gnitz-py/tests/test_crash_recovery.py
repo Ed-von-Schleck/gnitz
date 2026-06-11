@@ -282,7 +282,8 @@ def test_ddl_crash_with_workers_no_orphans():
 
 def _index_on_col(conn, owner_tid, col_idx):
     """True if a live IdxTab row indexes column `col_idx` of table `owner_tid`."""
-    from gnitz.core import IDX_TAB
+    from gnitz.core import IDX_TAB, unpack_pk_cols
+
     _, batch_obj, _ = conn._client.scan(IDX_TAB)
     if batch_obj is None:
         return False
@@ -290,7 +291,7 @@ def _index_on_col(conn, owner_tid, col_idx):
         if batch_obj.weights[i] <= 0:
             continue
         if (batch_obj.columns[1][i] == owner_tid
-                and batch_obj.columns[3][i] == col_idx):
+                and unpack_pk_cols(batch_obj.columns[3][i]) == [col_idx]):
             return True
     return False
 
