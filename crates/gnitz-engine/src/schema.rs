@@ -1099,10 +1099,101 @@ pub(crate) fn compare_german_strings(
     }
 }
 
+/// Validate that a peer-supplied schema descriptor matches the expected one:
+/// column count, PK column indices, per-column type codes and nullability.
+/// Used at every trust boundary where rows are decoded against a descriptor
+/// the sender chose (client INSERT frames, worker reply trains) — batch append
+/// helpers do not validate shape, so an unguarded mismatch turns into
+/// misinterpreted bytes handed onward.
+pub(crate) fn validate_schema_match(
+    wire: &SchemaDescriptor, expected: &SchemaDescriptor,
+) -> Result<(), String> {
+    if wire.num_columns() != expected.num_columns() {
+        return Err(format!(
+            "Schema mismatch: expected {} columns, got {}",
+            expected.num_columns(), wire.num_columns(),
+        ));
+    }
+    if wire.pk_indices() != expected.pk_indices() {
+        return Err(format!(
+            "Schema mismatch: expected pk_indices={:?}, got {:?}",
+            expected.pk_indices(), wire.pk_indices(),
+        ));
+    }
+    for i in 0..wire.num_columns() {
+        if wire.columns[i].type_code != expected.columns[i].type_code {
+            return Err(format!(
+                "Schema mismatch at column {}: expected type {}, got {}",
+                i, expected.columns[i].type_code, wire.columns[i].type_code,
+            ));
+        }
+        if wire.columns[i].nullable != expected.columns[i].nullable {
+            return Err(format!(
+                "Schema mismatch at column {}: expected nullable={}, got {}",
+                i, expected.columns[i].nullable, wire.columns[i].nullable,
+            ));
+        }
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, col1_nullable),
+            ],
+            &[0],
+        )
+    }
+
+    #[test]
+    fn validate_schema_match_ok() {
+        let sd = two_col_schema(0);
+        assert!(validate_schema_match(&sd, &sd).is_ok());
+    }
+
+    #[test]
+    fn validate_schema_match_rejects_column_count_mismatch() {
+        let wire = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
+        assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
+    }
+
+    #[test]
+    fn validate_schema_match_rejects_pk_index_mismatch() {
+        let wire = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[1],
+        );
+        assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
+    }
+
+    #[test]
+    fn validate_schema_match_rejects_type_code_mismatch() {
+        let wire = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::F64, 0),
+            ],
+            &[0],
+        );
+        assert!(validate_schema_match(&wire, &two_col_schema(0)).is_err());
+    }
+
+    #[test]
+    fn validate_schema_match_rejects_nullable_mismatch() {
+        let wire     = two_col_schema(0); // col1 not-nullable
+        let expected = two_col_schema(1); // col1 nullable
+        assert!(validate_schema_match(&wire, &expected).is_err());
+    }
 
     // Claim 6: the malformed-long-string fallback must zero both the length
     // field (dest[0..4]) AND the prefix field (dest[4..8]).  Before the fix,

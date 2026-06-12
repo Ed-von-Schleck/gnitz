@@ -1820,7 +1820,11 @@ fn increment_key_in_place(p: &mut [u8]) -> bool {
 /// the projected columns in `project` order as payload. `project` must list
 /// only non-PK columns (PK members are resolved from the packed PK without a
 /// gather); a projected PK column would be emitted twice.
-fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor {
+///
+/// `pub(crate)`: the master's gather drain builds the same descriptor as the
+/// expected reply schema, so a projected reply with the wrong shape errors
+/// instead of mis-decoding.
+pub(crate) fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor {
     let mut cols: Vec<SchemaColumn> = Vec::with_capacity(schema.pk_indices().len() + project.len());
     let mut pk_idx: Vec<u32> = Vec::with_capacity(schema.pk_indices().len());
     for (_, _, col) in schema.pk_columns() {

@@ -77,7 +77,7 @@ pub(crate) use utils::{BatchBuilder,
 pub(crate) use utils::{parse_qualified_name, make_secondary_index_name};
 pub(crate) use cache::CatalogCacheSet;
 pub(crate) use sys_tables::SysFamily;
-pub(crate) use store::CatalogDeltaSink;
+pub(crate) use store::{CatalogDeltaSink, project_schema};
 pub(crate) use apply_context::ApplyContext;
 
 // ---------------------------------------------------------------------------

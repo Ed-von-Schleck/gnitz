@@ -4,7 +4,7 @@
 //! the master via the SAL (shared append-only log), sends responses via a
 //! per-worker W2M shared region.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
@@ -25,9 +25,10 @@ use crate::storage::Batch;
 // PendingScan
 // ---------------------------------------------------------------------------
 
-/// State for a multi-chunk SCAN response in progress. The worker emits one
-/// frame per `drain_sal` pass; `next_row == 0` means the first chunk still
-/// needs a schema block. Non-zero `next_row` is a pure-data continuation.
+/// State for one multi-chunk reply train (scan, or an oversized seek/gather
+/// reply) in progress. The worker emits one frame per `drain_sal` pass;
+/// `next_row == 0` means the first chunk still needs a schema block. Non-zero
+/// `next_row` is a pure-data continuation.
 struct PendingScan {
     batch: Rc<Batch>,
     next_row: usize,
@@ -189,7 +190,48 @@ pub struct WorkerProcess {
     w2m_writer: W2mWriter,
     exchange: WorkerExchangeHandler,
     pending_deltas: HashMap<i64, Batch>,
-    pending_scan: Option<PendingScan>,
+    /// FIFO queue of in-progress chunked reply trains. Two clients can run two
+    /// large requests concurrently (connections are independent reactor tasks
+    /// and `handle_scan` holds only the catalog read lock), so a scalar slot
+    /// would let the second train overwrite the first and hang its master-side
+    /// drain forever.
+    ///
+    /// Trains drain strictly FIFO — the front train finishes before the next
+    /// starts. Do NOT interleave streams round-robin: the master drains one
+    /// request's train at a time, so an interleaved second train's frames
+    /// would sit parked in `scan_parked` holding un-released ring slots;
+    /// `consume_cursor` (released in ring order, `w2m.rs`) could then never
+    /// pass them, the ring fills, the worker blocks in `send_encoded`, and the
+    /// cluster deadlocks. FIFO is deadlock-free: every fan-out writes its
+    /// group to all workers under `sal_writer_excl`, so all worker queues
+    /// share one global request order; each master task drains workers in
+    /// ascending index order; the earliest-ordered awaited train always has
+    /// its frames at the front of some worker's queue with a live consumer.
+    ///
+    /// Chunks are emitted ONLY from `drain_sal` / `run` — never from
+    /// `do_exchange_wait`'s inline dispatch loop. That loop can ENQUEUE trains
+    /// (the Scan/seek/gather arms dispatch inline in both contexts); they must
+    /// stay queued until the exchange completes. Emitting there would let
+    /// `send_encoded` block on a full W2M ring — full because the queued
+    /// train's master-side consumer paces a slow client TCP connection — while
+    /// the `ExchangeRelay` this worker is waiting for sits unread in the SAL:
+    /// the join would stall indefinitely on an unrelated slow client.
+    /// Queued-but-unemitted is safe; the relay does not depend on any train
+    /// draining.
+    pending_streams: VecDeque<PendingScan>,
+    /// Per-frame wire budget for chunked reply trains (`send_scan_response`,
+    /// `stream_batch_response`, `emit_pending_scan_chunk`): `MAX_W2M_MSG` in
+    /// production. Debug builds may shrink it via `GNITZ_REPLY_FRAME_BUDGET`
+    /// (read once at construction) so e2e tests exercise multi-frame trains
+    /// with small tables. Any override must keep each worker's whole train
+    /// under `W2M_MAX_IN_FLIGHT` (64) frames — the master parks a full train
+    /// per ring while draining another worker — so reply sizes in such tests
+    /// must stay below 64 × budget.
+    ///
+    /// This budgets only the chunk split point; single-frame paths that cannot
+    /// chunk (non-wire-safe STRING replies) check the hard `MAX_W2M_MSG` ring
+    /// limit instead.
+    reply_frame_budget: usize,
     read_cursor: u64,
     expected_epoch: u32,
 }
@@ -261,6 +303,50 @@ fn uring_batch_fdatasync_with(
     Ok(())
 }
 
+/// Debug-only test seam: parse env var `var` as a `usize`. Always `None` in
+/// release builds, which never read the environment.
+fn debug_env_usize(var: &str) -> Option<usize> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var(var).ok().and_then(|v| v.parse().ok())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = var;
+        None
+    }
+}
+
+/// Provenance of the schema attached to a worker reply, declared by the
+/// dispatch arm that knows where the descriptor came from.
+///
+/// `Table` is the target table's own schema: the reply may serve (and
+/// populate) the table's cached schema wire block. `OneOff` is a projected or
+/// synthetic schema — Gather's projection, HasPk UniqueIndex's index schema —
+/// whose block is built fresh per reply: serving the table's cached block for
+/// those would make the master decode the frames with the table's row stride,
+/// and caching them would poison the table's block.
+#[derive(Clone, Copy)]
+enum ReplySchema<'a> {
+    None,
+    Table(&'a SchemaDescriptor),
+    OneOff(&'a SchemaDescriptor),
+}
+
+impl<'a> ReplySchema<'a> {
+    /// The table's own schema, or `None` when the catalog has no such table.
+    fn table(s: Option<&'a SchemaDescriptor>) -> Self {
+        s.map_or(ReplySchema::None, ReplySchema::Table)
+    }
+
+    fn descriptor(self) -> Option<&'a SchemaDescriptor> {
+        match self {
+            ReplySchema::None => None,
+            ReplySchema::Table(s) | ReplySchema::OneOff(s) => Some(s),
+        }
+    }
+}
+
 /// Filter a check-batch to the rows whose PK `exists` accepts, copying each
 /// matched row into the result. Keys on verbatim OPK bytes, correct for every
 /// PK width. `exists` receives the row's raw OPK PK bytes.
@@ -309,7 +395,10 @@ impl WorkerProcess {
                 pending_relays: HashMap::new(),
             },
             pending_deltas: HashMap::new(),
-            pending_scan: None,
+            pending_streams: VecDeque::new(),
+            reply_frame_budget: debug_env_usize("GNITZ_REPLY_FRAME_BUDGET")
+                .filter(|&n| n > 0 && n <= w2m_ring::MAX_W2M_MSG as usize)
+                .unwrap_or(w2m_ring::MAX_W2M_MSG as usize),
             read_cursor: 0,
             expected_epoch: 1,
         }
@@ -348,9 +437,10 @@ impl WorkerProcess {
         self.send_ack(0, 0, 0);
 
         loop {
-            // Skip the SAL wait when a chunked SCAN is in progress: the pending
-            // state drives the next drain_sal to emit the next chunk immediately.
-            if self.pending_scan.is_none() {
+            // Skip the SAL wait while a chunked reply train is in progress: the
+            // queued state drives the next drain_sal to emit the next chunk
+            // immediately.
+            if self.pending_streams.is_empty() {
                 let ready = self.sal_reader.wait(1000);
                 if ready == 0 {
                     let ppid = unsafe { libc::getppid() };
@@ -373,9 +463,12 @@ impl WorkerProcess {
 
     /// Process all pending SAL message groups. Returns true on shutdown.
     fn drain_sal(&mut self) -> bool {
-        // Emit the next pending scan chunk before draining new SAL messages.
-        // One chunk per drain_sal pass; send_encoded provides backpressure.
-        if self.pending_scan.is_some() {
+        // Emit the next chunk of the FRONT pending train before draining new
+        // SAL messages. One chunk per drain_sal pass; send_encoded provides
+        // backpressure. Single-frame replies for other requests still go out
+        // immediately between chunks (distinct ring-prefix request ids; the
+        // master reactor routes per id).
+        if !self.pending_streams.is_empty() {
             self.emit_pending_scan_chunk();
         }
         while let Some((kind, target_id, wire)) = self.next_sal_message() {
@@ -401,12 +494,16 @@ impl WorkerProcess {
         false
     }
 
-    /// Emit one frame of a pending chunked scan. Clears `pending_scan` when
-    /// the last chunk is sent. Called at the top of every `drain_sal` pass when
-    /// `pending_scan.is_some()`.
+    /// Emit one frame of the FRONT pending train; pops it off the queue when
+    /// its terminal chunk is sent. Called at the top of every `drain_sal` pass
+    /// while `pending_streams` is non-empty (see the field doc for why
+    /// emission is FIFO and confined to `drain_sal` / `run`). Unit tests set
+    /// a small `reply_frame_budget` to force multi-frame trains from small
+    /// batches.
     fn emit_pending_scan_chunk(&mut self) {
+        let budget = self.reply_frame_budget;
         let (batch, next_row, request_id, client_id, target_id, prebuilt_schema, server_version) = {
-            let ps = match self.pending_scan.as_ref() {
+            let ps = match self.pending_streams.front() {
                 Some(ps) => ps,
                 None => return,
             };
@@ -437,7 +534,7 @@ impl WorkerProcess {
         let sz_0 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 0, prebuilt_opt);
         let sz_1 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 1, prebuilt_opt);
         let per_row = sz_1.saturating_sub(sz_0);
-        let usable = (w2m_ring::MAX_W2M_MSG as usize).saturating_sub(sz_0);
+        let usable = budget.saturating_sub(sz_0);
         let max_rows = match usable.checked_div(per_row) {
             Some(rows) => rows.max(1).min(remaining),
             None => remaining.max(1), // per_row == 0: constant wire size, send all
@@ -464,10 +561,11 @@ impl WorkerProcess {
         });
 
         if has_more {
-            debug_assert!(self.pending_scan.is_some());
-            self.pending_scan.as_mut().unwrap().next_row = next_row + max_rows;
+            self.pending_streams.front_mut()
+                .expect("emit_pending_scan_chunk: front train vanished mid-emit")
+                .next_row = next_row + max_rows;
         } else {
-            self.pending_scan = None;
+            self.pending_streams.pop_front();
         }
     }
 
@@ -838,11 +936,16 @@ impl WorkerProcess {
                 let gathered = self.cat().gather_family_bytes(target_id, &pks, &project);
                 match gathered {
                     Ok(result) => {
+                        // The projected reply schema is synthetic — never the
+                        // table's cached block.
                         let schema = result.schema;
-                        self.send_response(
-                            target_id as u64, Some(&result), schema.as_ref(),
+                        if let Some(err) = self.stream_batch_response(
+                            target_id as u64, Some(result),
+                            schema.as_ref().map_or(ReplySchema::None, ReplySchema::OneOff),
                             request_id, client_id, 0,
-                        );
+                        ) {
+                            return DispatchResult::Error(err);
+                        }
                     }
                     Err(msg) => return DispatchResult::Error(msg),
                 }
@@ -897,8 +1000,12 @@ impl WorkerProcess {
                 match self.cat().seek_by_index(target_id, cols.as_slice(), &natives[..k]) {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
-                        self.send_response(target_id as u64, result.as_ref(),
-                                           schema.as_ref(), request_id, client_id, seek_pk);
+                        if let Some(err) = self.stream_batch_response(
+                            target_id as u64, result, ReplySchema::table(schema.as_ref()),
+                            request_id, client_id, seek_pk,
+                        ) {
+                            return DispatchResult::Error(err);
+                        }
                     }
                     Err(msg) => return DispatchResult::Error(msg),
                 }
@@ -923,8 +1030,12 @@ impl WorkerProcess {
                 match self.cat().seek_by_index_range(target_id, cols.as_slice(), &desc) {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
-                        self.send_response(target_id as u64, result.as_ref(),
-                                           schema.as_ref(), request_id, client_id, 0);
+                        if let Some(err) = self.stream_batch_response(
+                            target_id as u64, result, ReplySchema::table(schema.as_ref()),
+                            request_id, client_id, 0,
+                        ) {
+                            return DispatchResult::Error(err);
+                        }
                     }
                     Err(msg) => return DispatchResult::Error(msg),
                 }
@@ -954,7 +1065,9 @@ impl WorkerProcess {
                 match result {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
-                        self.send_response(target_id as u64, result.as_ref(), schema.as_ref(), request_id, client_id, seek_pk);
+                        self.send_response(
+                            target_id as u64, result.as_ref(), ReplySchema::table(schema.as_ref()),
+                            request_id, client_id, seek_pk);
                     }
                     Err(msg) => return DispatchResult::Error(msg),
                 }
@@ -966,7 +1079,8 @@ impl WorkerProcess {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
                         if let Some(err) = self.send_scan_response(
-                            target_id as u64, result, schema.as_ref(), request_id, client_id, client_version,
+                            target_id as u64, result, ReplySchema::table(schema.as_ref()),
+                            request_id, client_id, client_version,
                         ) {
                             return DispatchResult::Error(err);
                         }
@@ -1021,17 +1135,58 @@ impl WorkerProcess {
         });
     }
 
-    /// True when `s` has table `tid`'s schema identity (column count + PK
-    /// layout) — the predicate deciding whether the table's cached schema
-    /// wire block may serve a response carrying `s`. `None` when the
-    /// worker's catalog has no such table; callers pick their own default.
-    fn schema_matches_table(&mut self, tid: i64, s: &SchemaDescriptor) -> Option<bool> {
-        self.cat()
-            .get_schema_desc(tid)
-            .map(|t| t.num_columns() == s.num_columns() && t.pk_indices() == s.pk_indices())
+    /// Reply schema wire block: the table's cached block for `Table`, a
+    /// one-off (never cached) block for `OneOff`. Returns the block and the
+    /// table's schema version (`(None, 0)` for `ReplySchema::None`).
+    fn reply_schema_block(&mut self, tid_key: i64, schema: ReplySchema<'_>)
+        -> (Option<Rc<Vec<u8>>>, u16)
+    {
+        let block = match schema {
+            ReplySchema::None => return (None, 0),
+            ReplySchema::OneOff(s) => {
+                Rc::new(ipc::build_schema_wire_block(s, &[], tid_key as u32))
+            }
+            ReplySchema::Table(s) => {
+                if let Some(cached) = self.cat().get_cached_schema_wire_block(tid_key) {
+                    return (Some(cached.block), cached.version);
+                }
+                let col_names = self.cat().get_col_names_bytes(tid_key);
+                let (name_refs, n) = ipc::col_names_as_refs(&col_names);
+                let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], tid_key as u32));
+                let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(s);
+                self.cat().set_schema_wire_block(tid_key, block.clone(), wire_safe, wire_row_stride);
+                block
+            }
+        };
+        (Some(block), self.cat().get_schema_version(tid_key))
     }
 
     fn send_response(
+        &mut self,
+        target_id: u64,
+        result: Option<&Batch>,
+        schema: ReplySchema<'_>,
+        request_id: u64,
+        client_id: u64,
+        seek_pk: u128,
+    ) {
+        let (prebuilt_rc, server_version) = self.reply_schema_block(target_id as i64, schema);
+        let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
+        let sz = ipc::wire_size(STATUS_OK, &[], schema.descriptor(), None, result, prebuilt, &[]);
+        self.send_response_prebuilt(
+            target_id, result, schema.descriptor(), request_id, client_id, seek_pk,
+            prebuilt, server_version, sz,
+        );
+    }
+
+    /// Encode tail of `send_response`: emit one frame with an already-resolved
+    /// schema block. `prebuilt`/`server_version` must come from
+    /// `reply_schema_block` for this `schema`, and `sz` must be the frame's
+    /// wire size for these exact arguments — split out so a caller that
+    /// already resolved the block and size (the `stream_batch_response`
+    /// single-frame fast path) does not compute either twice.
+    #[allow(clippy::too_many_arguments)]
+    fn send_response_prebuilt(
         &mut self,
         target_id: u64,
         result: Option<&Batch>,
@@ -1039,28 +1194,11 @@ impl WorkerProcess {
         request_id: u64,
         client_id: u64,
         seek_pk: u128,
+        prebuilt: Option<&[u8]>,
+        server_version: u16,
+        sz: usize,
     ) {
-        let tid_key = target_id as i64;
-        // HasPk UniqueIndex passes an index schema; reusing the catalog's
-        // table-schema wire block for it would corrupt the master decoder.
-        let prebuilt_rc: Option<Rc<Vec<u8>>> = schema.map(|s| {
-            if !self.schema_matches_table(tid_key, s).unwrap_or(false) {
-                return Rc::new(ipc::build_schema_wire_block(s, &[], target_id as u32));
-            }
-            if let Some(cached) = self.cat().get_cached_schema_wire_block(tid_key) {
-                return cached.block;
-            }
-            let col_names = self.cat().get_col_names_bytes(tid_key);
-            let (name_refs, n) = ipc::col_names_as_refs(&col_names);
-            let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], target_id as u32));
-            let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(s);
-            self.cat().set_schema_wire_block(tid_key, block.clone(), wire_safe, wire_row_stride);
-            block
-        });
-        let prebuilt: Option<&[u8]> = prebuilt_rc.as_deref().map(|v| v.as_slice());
-        let server_version = if schema.is_some() { self.cat().get_schema_version(tid_key) } else { 0 };
         let flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
-        let sz = ipc::wire_size(STATUS_OK, &[], schema, None, result, prebuilt, &[]);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into(
                 buf, 0, target_id, client_id, flags,
@@ -1070,61 +1208,96 @@ impl WorkerProcess {
         });
     }
 
+    /// Reply with `result`, chunking through `pending_streams` when it exceeds
+    /// one W2M frame. Single-frame replies are byte-identical to
+    /// `send_response` (no train flags, `seek_pk` + `request_id` echoed in the
+    /// payload), so slot-forwarding consumers see no wire change; only a real
+    /// multi-frame train carries FLAG_CONTINUATION / FLAG_SCAN_LAST. The
+    /// schema is always embedded on the train's first frame (internal
+    /// consumers decode with it; there is no client cache on these paths).
+    fn stream_batch_response(
+        &mut self,
+        target_id: u64,
+        result: Option<Batch>,
+        schema: ReplySchema<'_>,
+        request_id: u64,
+        client_id: u64,
+        seek_pk: u128,
+    ) -> Option<String> {
+        let Some(batch) = result.filter(|b| b.count > 0) else {
+            self.send_response(target_id, None, schema, request_id, client_id, seek_pk);
+            return None;
+        };
+        let tid_key = target_id as i64;
+        let is_wire_safe = schema.descriptor().map(schema_wire_safe).unwrap_or(true);
+        let (prebuilt_rc, server_version) = self.reply_schema_block(tid_key, schema);
+        let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
+        // For a full-range wire-safe batch the blob region is empty and every
+        // region is `count · stride`, so wire_size_range(count) equals the
+        // wire_size the single-frame path below would compute.
+        let sz = if is_wire_safe {
+            ipc::wire_size_range(STATUS_OK, &[], schema.descriptor(), None, &batch, batch.count, prebuilt)
+        } else {
+            ipc::wire_size(STATUS_OK, &[], schema.descriptor(), None, Some(&batch), prebuilt, &[])
+        };
+        // Non-wire-safe replies cannot chunk, so they single-frame up to the
+        // hard ring limit; wire-safe replies chunk past the (overridable)
+        // frame budget.
+        let frame_cap = if is_wire_safe {
+            self.reply_frame_budget
+        } else {
+            w2m_ring::MAX_W2M_MSG as usize
+        };
+        if sz <= frame_cap {
+            self.send_response_prebuilt(
+                target_id, Some(&batch), schema.descriptor(), request_id, client_id,
+                seek_pk, prebuilt, server_version, sz);
+            return None;
+        }
+        if !is_wire_safe {
+            return Some(format!(
+                "result wire_size={sz} > MAX_W2M_MSG={}; STRING-column chunking not \
+                 yet implemented — add a tighter predicate or LIMIT",
+                w2m_ring::MAX_W2M_MSG));
+        }
+        self.pending_streams.push_back(PendingScan {
+            batch: Rc::new(batch), next_row: 0, request_id, client_id, target_id,
+            prebuilt_schema: prebuilt_rc, server_version,
+        });
+        None
+    }
+
     /// Send a SCAN response for `batch`. For wire-safe schemas, large batches
-    /// are split across multiple frames via `pending_scan`; the first chunk is
-    /// emitted at the top of the next `drain_sal` pass. For non-wire-safe
+    /// are split across multiple frames via `pending_streams`; the first chunk
+    /// is emitted at the top of the next `drain_sal` pass. For non-wire-safe
     /// (STRING-column) schemas, a single frame is sent; returns an error message
     /// if the batch exceeds `MAX_W2M_MSG`.
     fn send_scan_response(
         &mut self,
         target_id: u64,
         batch: Rc<Batch>,
-        schema: Option<&SchemaDescriptor>,
+        schema: ReplySchema<'_>,
         request_id: u64,
         client_id: u64,
         client_version: u16,
     ) -> Option<String> {
         let tid_key = target_id as i64;
-        // This path attaches the target table's *cached* schema wire block, so
-        // `schema` must BE the table's schema. A mismatched schema (an index
-        // or synthetic schema) would make the receiver decode the frames with
-        // the table's row stride. Mismatched-schema senders must build a
-        // one-off block instead — see `send_response`'s mismatch arm and
-        // `send_unique_preflight_keys`.
-        debug_assert!(
-            schema.is_none_or(|s| self.schema_matches_table(tid_key, s).unwrap_or(true)),
-            "send_scan_response: schema does not match table {tid_key}'s cached schema",
-        );
         // Obtain prebuilt schema block + server version. include_schema controls
         // whether the first frame carries a schema block; server_version is always
         // embedded in wire_flags so the client can cache/verify.
-        let (prebuilt_rc, server_version) = if let Some(s) = schema {
-            let (block, server_version) = match self.cat().get_cached_schema_wire_block(tid_key) {
-                Some(cached) => (cached.block, cached.version),
-                None => {
-                    let col_names = self.cat().get_col_names_bytes(tid_key);
-                    let (name_refs, n) = ipc::col_names_as_refs(&col_names);
-                    let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], target_id as u32));
-                    let ver = self.cat().get_schema_version(tid_key);
-                    let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(s);
-                    self.cat().set_schema_wire_block(tid_key, block.clone(), wire_safe, wire_row_stride);
-                    (block, ver)
-                }
-            };
-            let prebuilt = if gnitz_wire::wire_should_include_schema(client_version, server_version) { Some(block) } else { None };
-            (prebuilt, server_version)
-        } else {
-            (None, 0u16)
-        };
+        let (block_rc, server_version) = self.reply_schema_block(tid_key, schema);
+        let prebuilt_rc = block_rc.filter(|_| {
+            gnitz_wire::wire_should_include_schema(client_version, server_version)
+        });
         let schema_version_flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
 
         // When schema omission is in effect (prebuilt_rc=None), pass schema=None to
         // the encode functions so has_schema stays false. Passing schema=Some with
         // prebuilt=None would cause encode_wire_into_range to emit a schema block
         // with empty column names, corrupting the client's schema cache.
-        let schema_for_encode = if prebuilt_rc.is_some() { schema } else { None };
+        let schema_for_encode = if prebuilt_rc.is_some() { schema.descriptor() } else { None };
 
-        let is_wire_safe = schema.map(schema_wire_safe).unwrap_or(true);
+        let is_wire_safe = schema.descriptor().map(schema_wire_safe).unwrap_or(true);
 
         if !is_wire_safe {
             // STRING-column tables: no chunking. Check size; error if too big.
@@ -1155,7 +1328,7 @@ impl WorkerProcess {
             ipc::wire_size_range(STATUS_OK, &[], schema_for_encode, None, &batch, total_rows, prebuilt)
         };
 
-        if total_sz <= w2m_ring::MAX_W2M_MSG as usize {
+        if total_sz <= self.reply_frame_budget {
             // Single-frame response: FLAG_CONTINUATION keeps the client reading
             // (terminal frame signals scan end); FLAG_SCAN_LAST tells master this
             // worker's chunk train is done.
@@ -1169,8 +1342,9 @@ impl WorkerProcess {
                 );
             });
         } else {
-            // Multi-chunk: store pending state; first chunk emitted next drain_sal.
-            self.pending_scan = Some(PendingScan {
+            // Multi-chunk: enqueue the train; its first chunk is emitted on the
+            // next drain_sal pass, after any earlier queued train fully drains.
+            self.pending_streams.push_back(PendingScan {
                 batch,
                 next_row: 0,
                 request_id,
@@ -1336,7 +1510,7 @@ impl WorkerProcess {
     ) -> Result<(), String> {
         let n = batch.as_ref().map(|b| b.count).unwrap_or(0);
 
-        let (schema, result) = match lookup {
+        match lookup {
             HasPkLookup::UniqueIndex(cols) => {
                 let index_handle = self.cat().get_index_store_handle(target_id, cols.as_slice());
                 if index_handle.is_null() {
@@ -1372,7 +1546,9 @@ impl WorkerProcess {
                 let result = filter_by_pk_bytes(&batch, schema, n, |pkb| {
                     cursor.cursor.seek_first_positive_with_prefix(&pkb[..idx_key_size])
                 });
-                (schema, result)
+                // The index schema is not table `target_id`'s own — one-off block.
+                self.send_response(target_id as u64, Some(&result), ReplySchema::OneOff(&schema),
+                                   request_id, client_id, seek_pk);
             }
             HasPkLookup::PrimaryKey => {
                 let schema = self.cat().get_schema_desc(target_id)
@@ -1384,10 +1560,10 @@ impl WorkerProcess {
                 let result = filter_by_pk_bytes(&batch, schema, n, |pkb| {
                     ptable_handle.is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk_bytes(pkb))
                 });
-                (schema, result)
+                self.send_response(target_id as u64, Some(&result), ReplySchema::Table(&schema),
+                                   request_id, client_id, seek_pk);
             }
-        };
-        self.send_response(target_id as u64, Some(&result), Some(&schema), request_id, client_id, seek_pk);
+        }
         Ok(())
     }
 
@@ -1639,15 +1815,9 @@ const _: () = {
 /// trains with small tables; such tests must keep the per-worker frame count
 /// under the `W2M_MAX_IN_FLIGHT` limit (see UNIQUE_PREFLIGHT_KEYS_PER_FRAME).
 fn unique_preflight_keys_per_frame() -> usize {
-    #[cfg(debug_assertions)]
-    if let Some(n) = std::env::var("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    debug_env_usize("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME")
         .filter(|&n| n > 0)
-    {
-        return n;
-    }
-    UNIQUE_PREFLIGHT_KEYS_PER_FRAME
+        .unwrap_or(UNIQUE_PREFLIGHT_KEYS_PER_FRAME)
 }
 
 /// Stream `keys` (already sorted) to the master as a train of continuation
@@ -1660,10 +1830,10 @@ fn unique_preflight_keys_per_frame() -> usize {
 ///
 /// Deliberately NOT `send_scan_response`: that path attaches the owner
 /// table's *cached* schema wire block, which would make the master decode
-/// these frames with the table's row stride, and its `pending_scan` chunking
-/// would require materialising all keys as one 32 B/row `Batch` (2× the
-/// caller's `Vec`). The synthetic schema's wire block is built one-off (the
-/// `send_response` mismatched-schema pattern) and never written to the
+/// these frames with the table's row stride, and its `pending_streams`
+/// chunking would require materialising all keys as one 32 B/row `Batch` (2×
+/// the caller's `Vec`). The synthetic schema's wire block is built one-off (the
+/// `ReplySchema::OneOff` pattern) and never written to the
 /// table-keyed schema-block cache, so the table's cached block is never
 /// poisoned. `send_encoded` blocks on a full ring until the master's merge
 /// drains it — acceptable backpressure: the worker has nothing else to do
@@ -2007,28 +2177,16 @@ mod tests {
 
         let w2m_writer = W2mWriter::new(region_ptr, region_size as u64);
 
-        let mut wp = WorkerProcess {
-            worker_id: 0,
-            num_workers: 1,
-            master_pid: 0,
-            catalog: std::ptr::null_mut(),
-            sal_reader: unsafe { std::mem::zeroed() },
-            w2m_writer,
-            exchange: make_handler(),
-            pending_deltas: HashMap::new(),
-            pending_scan: None,
-            read_cursor: 0,
-            expected_epoch: 1,
-        };
+        let mut wp = make_test_worker(std::ptr::null_mut(), w2m_writer);
 
         let req_ack: u64 = 42;
         let req_resp: u64 = 0xCAFE_BABE_DEAD_BEEF;
         let req_err: u64 = u64::MAX;
         wp.send_ack(7, 0, req_ack);
-        // Pass schema=None: send_response consults the catalog only when a
-        // schema is present, and this test uses a null catalog pointer.
+        // Pass ReplySchema::None: send_response consults the catalog only
+        // when a schema is present, and this test uses a null catalog pointer.
         // The id round-trip is the assertion of interest.
-        wp.send_response(8, None, None, req_resp, 0, 0u128);
+        wp.send_response(8, None, ReplySchema::None, req_resp, 0, 0u128);
         wp.send_error("boom", req_err);
 
         // Decode the three messages back from the ring via try_consume.
@@ -2081,6 +2239,26 @@ mod tests {
 
     // -- Walk-the-matrix dispatch tests ---------------------------------------
 
+    /// The one test constructor for `WorkerProcess`. Fields a test does not
+    /// exercise stay null/zeroed/default; pre-seeded state (`sal_reader`,
+    /// `pending_streams`, `reply_frame_budget`) is assigned after construction.
+    fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerProcess {
+        WorkerProcess {
+            worker_id: 0,
+            num_workers: 1,
+            master_pid: 0,
+            catalog,
+            sal_reader: unsafe { std::mem::zeroed() },
+            w2m_writer: writer,
+            exchange: make_handler(),
+            pending_deltas: HashMap::new(),
+            pending_streams: VecDeque::new(),
+            reply_frame_budget: w2m_ring::MAX_W2M_MSG as usize,
+            read_cursor: 0,
+            expected_epoch: 1,
+        }
+    }
+
     /// Build a worker that's safe for `dispatch` calls whose behavior
     /// does not enter the catalog (Tick/DdlSync/ExchangeRelay/PreloadedExchange
     /// inside an exchange wait, plus ExchangeRelay/PreloadedExchange at
@@ -2089,19 +2267,7 @@ mod tests {
     /// The W2M ring is unused by these arms; sal_reader is also unused
     /// because we drive `dispatch` directly.
     fn make_worker_for_matrix() -> WorkerProcess {
-        WorkerProcess {
-            worker_id: 0,
-            num_workers: 1,
-            master_pid: 0,
-            catalog: std::ptr::null_mut(),
-            sal_reader: unsafe { std::mem::zeroed() },
-            w2m_writer: unsafe { std::mem::zeroed() },
-            exchange: make_handler(),
-            pending_deltas: HashMap::new(),
-            pending_scan: None,
-            read_cursor: 0,
-            expected_epoch: 1,
-        }
+        make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() })
     }
 
     /// Tick inside an exchange wait MUST defer to `deferred_ticks`,
@@ -2303,20 +2469,8 @@ mod tests {
         };
         assert_eq!(r3.status, 0);
 
-        let sal_reader = SalReader::new(sal_ptr as *const u8, 0, SAL_SIZE, -1);
-        let mut wp = WorkerProcess {
-            worker_id: 0,
-            num_workers: 1,
-            master_pid: 0,
-            catalog: std::ptr::null_mut(),
-            sal_reader,
-            w2m_writer: unsafe { std::mem::zeroed() },
-            exchange: make_handler(),
-            pending_deltas: HashMap::new(),
-            pending_scan: None,
-            read_cursor: 0,
-            expected_epoch: 1,
-        };
+        let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
+        wp.sal_reader = SalReader::new(sal_ptr as *const u8, 0, SAL_SIZE, -1);
 
         // First call: epoch 1 group 1 — consumed.
         let cursor_before = wp.read_cursor;
@@ -2357,7 +2511,7 @@ mod tests {
         unsafe { libc::munmap(sal_ptr as *mut libc::c_void, SAL_SIZE); }
     }
 
-    // -- pending_scan chunking tests -----------------------------------------------
+    // -- pending stream chunking tests -----------------------------------------------
 
     fn make_ring() -> (*mut u8, W2mWriter) {
         let size = w2m_ring::W2M_REGION_SIZE;
@@ -2387,13 +2541,9 @@ mod tests {
     }
 
     fn consume_one(ptr: *mut u8) -> Vec<u8> {
-        let hdr = unsafe { w2m_ring::W2mRingHeader::from_raw(ptr as *const u8) };
-        let rc = w2m_ring::W2M_HEADER_SIZE as u64;
-        let (data_ptr, sz, _, _) = unsafe {
-            w2m_ring::try_consume(hdr, ptr as *const u8, rc)
-                .expect("expected one ring message")
-        };
-        unsafe { std::slice::from_raw_parts(data_ptr, sz as usize) }.to_vec()
+        let (_, frame) = walk_frames(ptr).into_iter().next()
+            .expect("expected one ring message");
+        frame
     }
 
     /// First (and only) PendingScan chunk — next_row == 0, so the prebuilt schema
@@ -2405,28 +2555,20 @@ mod tests {
         let schema_block = Rc::new(ipc::build_schema_wire_block(&schema, &[], 1));
 
         let (ptr, writer) = make_ring();
-        let mut wp = WorkerProcess {
-            worker_id: 0, num_workers: 1, master_pid: 0,
-            catalog: std::ptr::null_mut(),
-            sal_reader: unsafe { std::mem::zeroed() },
-            w2m_writer: writer,
-            exchange: make_handler(),
-            pending_deltas: HashMap::new(),
-            pending_scan: Some(PendingScan {
-                batch: Rc::new(batch),
-                next_row: 0,
-                request_id: 7,
-                client_id: 42,
-                target_id: 1,
-                prebuilt_schema: Some(schema_block),
-                server_version: 0,
-            }),
-            read_cursor: 0,
-            expected_epoch: 1,
-        };
+        let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+        wp.pending_streams.push_back(PendingScan {
+            batch: Rc::new(batch),
+            next_row: 0,
+            request_id: 7,
+            client_id: 42,
+            target_id: 1,
+            prebuilt_schema: Some(schema_block),
+            server_version: 0,
+        });
 
         wp.emit_pending_scan_chunk();
-        assert!(wp.pending_scan.is_none(), "10 rows fit in one chunk; pending_scan must clear");
+        assert!(wp.pending_streams.is_empty(),
+            "10 rows fit in one chunk; the train must pop off the queue");
 
         let data = consume_one(ptr);
         let decoded = ipc::decode_wire_ipc(&data)
@@ -2452,28 +2594,19 @@ mod tests {
         let batch = make_n_row_batch(schema, 10);
 
         let (ptr, writer) = make_ring();
-        let mut wp = WorkerProcess {
-            worker_id: 0, num_workers: 1, master_pid: 0,
-            catalog: std::ptr::null_mut(),
-            sal_reader: unsafe { std::mem::zeroed() },
-            w2m_writer: writer,
-            exchange: make_handler(),
-            pending_deltas: HashMap::new(),
-            pending_scan: Some(PendingScan {
-                batch: Rc::new(batch),
-                next_row: 5,
-                request_id: 9,
-                client_id: 0,
-                target_id: 1,
-                prebuilt_schema: None,
-                server_version: 0,
-            }),
-            read_cursor: 0,
-            expected_epoch: 1,
-        };
+        let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+        wp.pending_streams.push_back(PendingScan {
+            batch: Rc::new(batch),
+            next_row: 5,
+            request_id: 9,
+            client_id: 0,
+            target_id: 1,
+            prebuilt_schema: None,
+            server_version: 0,
+        });
 
         wp.emit_pending_scan_chunk();
-        assert!(wp.pending_scan.is_none(), "remaining 5 rows fit in one chunk");
+        assert!(wp.pending_streams.is_empty(), "remaining 5 rows fit in one chunk");
 
         let data = consume_one(ptr);
         assert!(
@@ -2495,29 +2628,19 @@ mod tests {
 
     /// send_scan_response with schema=None (avoids catalog) emits a single ring
     /// message with FLAG_CONTINUATION | FLAG_SCAN_LAST for a small wire-safe batch,
-    /// and leaves pending_scan == None.
+    /// and leaves the stream queue empty.
     #[test]
     fn test_send_scan_response_single_frame() {
         let schema = test_schema();
         let batch = make_n_row_batch(schema, 5);
 
         let (ptr, writer) = make_ring();
-        let mut wp = WorkerProcess {
-            worker_id: 0, num_workers: 1, master_pid: 0,
-            catalog: std::ptr::null_mut(),
-            sal_reader: unsafe { std::mem::zeroed() },
-            w2m_writer: writer,
-            exchange: make_handler(),
-            pending_deltas: HashMap::new(),
-            pending_scan: None,
-            read_cursor: 0,
-            expected_epoch: 1,
-        };
+        let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
-        let err = wp.send_scan_response(1, Rc::new(batch), None, 3, 0, 0);
+        let err = wp.send_scan_response(1, Rc::new(batch), ReplySchema::None, 3, 0, 0);
         assert!(err.is_none(), "small wire-safe batch must not error");
-        assert!(wp.pending_scan.is_none(),
-            "batch fits in one frame; send_scan_response must not set pending_scan");
+        assert!(wp.pending_streams.is_empty(),
+            "batch fits in one frame; send_scan_response must not enqueue a train");
 
         let data = consume_one(ptr);
         let ctrl = ipc::peek_control_block(&data).expect("peek_control_block");
@@ -2552,4 +2675,286 @@ mod tests {
             "U64-only schema must be wire-safe (chunking enabled)");
     }
 
+    // -- stream_batch_response / pending_streams FIFO tests --------------------
+
+    /// Read every published message off a test ring in publish order,
+    /// returning `(ring_prefix_req_id, frame_bytes)`.
+    fn walk_frames(ptr: *mut u8) -> Vec<(u32, Vec<u8>)> {
+        let hdr = unsafe { w2m_ring::W2mRingHeader::from_raw(ptr as *const u8) };
+        let mut rc = w2m_ring::W2M_HEADER_SIZE as u64;
+        let mut out = Vec::new();
+        while let Some((data_ptr, sz, new_rc, req_id)) = unsafe {
+            w2m_ring::try_consume(hdr, ptr as *const u8, rc)
+        } {
+            let data = unsafe { std::slice::from_raw_parts(data_ptr, sz as usize) };
+            out.push((req_id, data.to_vec()));
+            rc = new_rc;
+        }
+        out
+    }
+
+    /// A zero-filled batch of `count` rows (with_schema zero-fills the data
+    /// region, so setting `count` directly yields decodable all-zero rows).
+    /// Used to make wire sizes cross MAX_W2M_MSG without writing 256 MiB.
+    fn zero_batch(schema: SchemaDescriptor, count: usize) -> Batch {
+        let mut b = Batch::with_schema(schema, count);
+        b.count = count;
+        b
+    }
+
+    /// Two queued trains drain strictly FIFO: every frame of train A
+    /// (multi-chunk, terminal FLAG_SCAN_LAST) precedes train B's, and B's
+    /// first chunk carries B's own schema block.
+    #[test]
+    fn test_pending_streams_fifo_two_trains() {
+        use crate::schema::{SchemaColumn, type_code};
+
+        let schema_a = test_schema();
+        // B's schema has 3 columns so its frames are distinguishable from A's.
+        let schema_b = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0],
+        );
+        let batch_a = make_n_row_batch(schema_a, 10);
+        let batch_b = make_n_row_batch(schema_b, 5);
+        let block_a = Rc::new(ipc::build_schema_wire_block(&schema_a, &[], 1));
+        let block_b = Rc::new(ipc::build_schema_wire_block(&schema_b, &[], 2));
+
+        // Budget: first chunk (with A's schema block) carries ~4 rows, so
+        // train A spans at least two frames.
+        let sz_0 = ipc::wire_size_range(
+            STATUS_OK, &[], None, None, &batch_a, 0, Some(block_a.as_slice()));
+        let sz_1 = ipc::wire_size_range(
+            STATUS_OK, &[], None, None, &batch_a, 1, Some(block_a.as_slice()));
+        let budget = sz_0 + (sz_1 - sz_0) * 4;
+
+        let (ptr, writer) = make_ring();
+        let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+        wp.pending_streams.push_back(PendingScan {
+            batch: Rc::new(batch_a), next_row: 0, request_id: 11, client_id: 0,
+            target_id: 1, prebuilt_schema: Some(block_a), server_version: 0,
+        });
+        wp.pending_streams.push_back(PendingScan {
+            batch: Rc::new(batch_b), next_row: 0, request_id: 22, client_id: 0,
+            target_id: 2, prebuilt_schema: Some(block_b), server_version: 0,
+        });
+
+        // One chunk per pass, as drain_sal drives it.
+        wp.reply_frame_budget = budget;
+        let mut passes = 0;
+        while !wp.pending_streams.is_empty() {
+            wp.emit_pending_scan_chunk();
+            passes += 1;
+            assert!(passes < 50, "trains must drain within a bounded pass count");
+        }
+
+        let frames = walk_frames(ptr);
+        let a_frames: Vec<_> = frames.iter().filter(|(req, _)| *req == 11).collect();
+        let b_frames: Vec<_> = frames.iter().filter(|(req, _)| *req == 22).collect();
+        assert!(a_frames.len() >= 2, "budget must split train A into multiple chunks");
+        assert!(!b_frames.is_empty());
+        let first_b = frames.iter().position(|(req, _)| *req == 22).unwrap();
+        let last_a = frames.iter().rposition(|(req, _)| *req == 11).unwrap();
+        assert!(last_a < first_b, "train A's frames must FULLY precede train B's");
+
+        // Per train: every frame is a continuation, only the last is terminal,
+        // the chunks cover every row exactly once, and the FIRST chunk carries
+        // that train's own schema block (decodes standalone with its column
+        // count; continuations decode only against the train's schema hint).
+        for (req, schema, ncols, total_rows) in [
+            (11u32, &schema_a, 2usize, 10usize),
+            (22u32, &schema_b, 3usize, 5usize),
+        ] {
+            let train: Vec<_> = frames.iter().filter(|(r, _)| *r == req).collect();
+            let mut rows = 0usize;
+            for (i, (_, bytes)) in train.iter().enumerate() {
+                let ctrl = ipc::peek_control_block(bytes).expect("ctrl");
+                assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
+                let is_last = i == train.len() - 1;
+                assert_eq!(ctrl.flags & FLAG_SCAN_LAST != 0, is_last,
+                    "FLAG_SCAN_LAST only on the train's terminal chunk");
+                if i == 0 {
+                    let decoded = ipc::decode_wire_ipc(bytes)
+                        .expect("first chunk must decode standalone");
+                    let s = decoded.schema.expect("first chunk carries a schema block");
+                    assert_eq!(s.num_columns(), ncols, "the block is this train's schema");
+                    rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
+                } else {
+                    let hint = ipc::SchemaWithVersion { descriptor: schema, version: 0 };
+                    let decoded = ipc::decode_wire_ipc_with_schema(bytes, hint)
+                        .expect("continuation decodes against the schema hint");
+                    rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
+                }
+            }
+            assert_eq!(rows, total_rows, "the train's chunks cover all rows exactly once");
+        }
+
+        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+    }
+
+    /// A fitting result through `stream_batch_response` must be byte-identical
+    /// to `send_response` (same flags, `seek_pk` + `request_id` echo): unicast
+    /// consumers forward these slots verbatim, so the single-frame wire shape
+    /// must not change. Covers both the non-empty and the empty-result paths.
+    #[test]
+    fn test_stream_batch_response_single_frame_byte_identical() {
+        let schema = test_schema();
+        let batch = make_n_row_batch(schema, 5);
+
+        let (ptr_ref, writer_ref) = make_ring();
+        let (ptr_new, writer_new) = make_ring();
+        let mut wp_ref = make_test_worker(std::ptr::null_mut(), writer_ref);
+        let mut wp_new = make_test_worker(std::ptr::null_mut(), writer_new);
+
+        let req = 0xCAFE_u64;
+        let client = 7u64;
+        let pk = 0xDEAD_BEEF_u128;
+        wp_ref.send_response(8, Some(&batch), ReplySchema::None, req, client, pk);
+        wp_ref.send_response(8, None, ReplySchema::None, req + 1, client, 0);
+
+        assert!(wp_new.stream_batch_response(
+            8, Some(batch.clone()), ReplySchema::None, req, client, pk).is_none());
+        assert!(wp_new.stream_batch_response(8, None, ReplySchema::None, req + 1, client, 0).is_none());
+        assert!(wp_new.pending_streams.is_empty(), "fitting results never enqueue");
+
+        let ref_frames = walk_frames(ptr_ref);
+        let new_frames = walk_frames(ptr_new);
+        assert_eq!(ref_frames.len(), 2);
+        assert_eq!(ref_frames, new_frames,
+            "single-frame stream_batch_response must be byte-identical to send_response");
+
+        unsafe {
+            libc::munmap(ptr_ref as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
+            libc::munmap(ptr_new as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
+        }
+    }
+
+    /// An oversized wire-safe result (> MAX_W2M_MSG) enqueues a train instead
+    /// of hitting the ring-size assert; nothing is emitted until drain_sal.
+    #[test]
+    fn test_stream_batch_response_oversized_enqueues_train() {
+        let schema = test_schema(); // 32 B/row on the wire
+        let rows = (w2m_ring::MAX_W2M_MSG as usize / 32) + 4096;
+        let batch = zero_batch(schema, rows);
+
+        let (ptr, writer) = make_ring();
+        let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+        let err = wp.stream_batch_response(3, Some(batch), ReplySchema::None, 5, 9, 0);
+        assert!(err.is_none(), "oversized wire-safe result must chunk, not error");
+        assert_eq!(wp.pending_streams.len(), 1);
+        let ps = wp.pending_streams.front().unwrap();
+        assert_eq!(ps.next_row, 0);
+        assert_eq!(ps.request_id, 5);
+        assert_eq!(ps.client_id, 9);
+        assert!(walk_frames(ptr).is_empty(),
+            "the train's first chunk is emitted by drain_sal, not at enqueue time");
+
+        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+    }
+
+    fn worker_temp_dir(name: &str) -> String {
+        crate::util::raise_fd_limit_for_tests();
+        let path = std::env::temp_dir()
+            .join(format!("gnitz_worker_test_{name}"))
+            .to_str().unwrap().to_owned();
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    /// An oversized non-wire-safe (STRING) result returns the clean error —
+    /// the variable-width streaming chunker is an explicit non-goal.
+    #[test]
+    fn test_stream_batch_response_oversized_string_errors() {
+        use crate::catalog::ColumnDef;
+        use crate::schema::type_code;
+
+        let dir = worker_temp_dir("string_oversized");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let cols = vec![
+            ColumnDef { name: "id".into(), type_code: type_code::U64,
+                        is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef { name: "s".into(), type_code: type_code::STRING,
+                        is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ];
+        let tid = engine.create_table("public.tstr", &cols, &[0], true).unwrap();
+        let schema = engine.get_schema_desc(tid).unwrap();
+        assert!(!schema_wire_safe(&schema));
+
+        // 40 B/row (8 pk + 8 weight + 8 null + 16 string struct), empty blob.
+        let rows = (w2m_ring::MAX_W2M_MSG as usize / 40) + 4096;
+        let batch = zero_batch(schema, rows);
+
+        let (ptr, writer) = make_ring();
+        let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
+        let err = wp.stream_batch_response(
+            tid as u64, Some(batch), ReplySchema::Table(&schema), 5, 0, 0,
+        ).expect("oversized STRING result must surface the clean error");
+        assert!(err.contains("STRING-column chunking"), "error names the limitation: {err}");
+        assert!(wp.pending_streams.is_empty(), "non-wire-safe results never enqueue");
+
+        engine.close();
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+    }
+
+    /// A projected (gather) reply schema must ride a ONE-OFF wire block: the
+    /// table-keyed cache must neither serve it (the master would decode
+    /// projected rows with the base table's stride) nor store it (a later
+    /// table reply would be decoded with the projected stride).
+    #[test]
+    fn test_stream_batch_response_projected_schema_one_off_block() {
+        use crate::catalog::ColumnDef;
+        use crate::schema::type_code;
+
+        let dir = worker_temp_dir("projected_one_off");
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let mk = |name: &str| ColumnDef {
+            name: name.into(), type_code: type_code::U64,
+            is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+        };
+        let cols = vec![mk("id"), mk("a"), mk("b")];
+        let tid = engine.create_table("public.tproj", &cols, &[0], true).unwrap();
+        let table_schema = engine.get_schema_desc(tid).unwrap();
+        let projected = crate::catalog::project_schema(&table_schema, &[1]);
+        assert_ne!(projected.num_columns(), table_schema.num_columns());
+
+        let (ptr, writer) = make_ring();
+        let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
+
+        // Fitting projected reply: one frame carrying the projected schema.
+        let small = zero_batch(projected, 2);
+        assert!(wp.stream_batch_response(
+            tid as u64, Some(small), ReplySchema::OneOff(&projected), 5, 0, 0).is_none());
+        let frames = walk_frames(ptr);
+        assert_eq!(frames.len(), 1);
+        let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("decode projected reply");
+        assert_eq!(decoded.schema.expect("schema block present").num_columns(),
+                   projected.num_columns());
+
+        // Oversized projected reply: the queued train holds the one-off block.
+        let rows = (w2m_ring::MAX_W2M_MSG as usize / 32) + 4096;
+        let big = zero_batch(projected, rows);
+        assert!(wp.stream_batch_response(
+            tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0).is_none());
+        assert_eq!(wp.pending_streams.len(), 1);
+        let expected_block = ipc::build_schema_wire_block(&projected, &[], tid as u32);
+        let ps = wp.pending_streams.front().unwrap();
+        assert_eq!(
+            ps.prebuilt_schema.as_deref().map(Vec::as_slice),
+            Some(expected_block.as_slice()),
+            "the train's schema block is the one-off projected block",
+        );
+
+        // Both paths left the table's cached wire block untouched.
+        assert!(engine.get_cached_schema_wire_block(tid).is_none(),
+            "a projected reply must never populate the table's schema-block cache");
+
+        engine.close();
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+    }
 }

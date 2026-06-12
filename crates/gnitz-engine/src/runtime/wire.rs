@@ -834,18 +834,6 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
     })
 }
 
-fn schemas_layout_equal(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
-    if a.num_columns() != b.num_columns() || a.pk_indices() != b.pk_indices() { return false; }
-    for i in 0..a.num_columns() {
-        if a.columns[i].type_code != b.columns[i].type_code
-            || a.columns[i].nullable != b.columns[i].nullable
-        {
-            return false;
-        }
-    }
-    true
-}
-
 fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescriptor, &'static str> {
     // Parse directly from WAL block bytes; no Batch allocation needed.
     // META_SCHEMA_DESC layout: pk(reg 0), weight(1), null_bmp(2),
@@ -1105,7 +1093,7 @@ fn decode_wire_body(
         let parsed = decode_schema_block(&data[off..off + schema_size], verify_checksum)?;
         // Integrity cross-check against hint even when versions match.
         if let Some(ref hint) = schema_hint {
-            if !schemas_layout_equal(&parsed, hint.descriptor) {
+            if crate::schema::validate_schema_match(&parsed, hint.descriptor).is_err() {
                 return Err("schema mismatch: client schema differs from server schema");
             }
             wire_schema = Some(*hint.descriptor);

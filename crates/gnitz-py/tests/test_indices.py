@@ -47,6 +47,15 @@ def _table_has_index(client, sn, table):
     return False
 
 
+def _insert_rows(client, sn, rows, chunk=500):
+    """Multi-row INSERT into table `t` of same-width value tuples, split into
+    at-most-`chunk`-row statements; a literal 'NULL' passes through."""
+    for i in range(0, len(rows), chunk):
+        values = ", ".join(
+            f"({', '.join(str(v) for v in r)})" for r in rows[i:i + chunk])
+        client.execute_sql(f"INSERT INTO t VALUES {values}", schema_name=sn)
+
+
 # ---------------------------------------------------------------------------
 # TestIndexDdl
 # ---------------------------------------------------------------------------
@@ -1468,12 +1477,6 @@ class TestUniqueIndexCreatePreflight:
             schema_name=sn,
         )
 
-    def _insert_rows(self, client, sn, rows, chunk=500):
-        """Multi-row INSERT of [(pk, val), ...]; 'NULL' passes through."""
-        for i in range(0, len(rows), chunk):
-            values = ", ".join(f"({pk}, {val})" for pk, val in rows[i:i + chunk])
-            client.execute_sql(f"INSERT INTO t VALUES {values}", schema_name=sn)
-
     def test_preexisting_cross_partition_duplicate_rejected(self, client):
         """One value held by many PKs spans partitions (and, by pigeonhole
         over <=8 workers, repeats within at least one); the merge must reject
@@ -1482,7 +1485,7 @@ class TestUniqueIndexCreatePreflight:
         client.create_schema(sn)
         try:
             self._bigint_table(client, sn)
-            self._insert_rows(client, sn, [(pk, 42) for pk in range(1, 9)])
+            _insert_rows(client, sn, [(pk, 42) for pk in range(1, 9)])
             with pytest.raises(gnitz.GnitzError):
                 client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
             assert not _table_has_index(client, sn, "t"), \
@@ -1501,7 +1504,7 @@ class TestUniqueIndexCreatePreflight:
             self._bigint_table(client, sn)
             rows = [(pk, pk * 10) for pk in range(1, 301)]
             rows.append((1000, 1500))  # duplicates val of pk=150
-            self._insert_rows(client, sn, rows)
+            _insert_rows(client, sn, rows)
             with pytest.raises(gnitz.GnitzError):
                 client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
             assert not _table_has_index(client, sn, "t")
@@ -1517,7 +1520,7 @@ class TestUniqueIndexCreatePreflight:
         client.create_schema(sn)
         try:
             self._bigint_table(client, sn)
-            self._insert_rows(client, sn, [(pk, pk * 3 + 1) for pk in range(1, 2001)])
+            _insert_rows(client, sn, [(pk, pk * 3 + 1) for pk in range(1, 2001)])
             client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
             with pytest.raises(gnitz.GnitzError):
                 # duplicates val of pk=500 (500*3+1)
@@ -1535,7 +1538,7 @@ class TestUniqueIndexCreatePreflight:
             self._bigint_table(client, sn, val_type="BIGINT")
             rows = [(pk, "NULL") for pk in range(1, 9)]
             rows += [(pk, pk) for pk in range(100, 108)]
-            self._insert_rows(client, sn, rows)
+            _insert_rows(client, sn, rows)
             client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
             client.execute_sql("INSERT INTO t VALUES (200, NULL)", schema_name=sn)
         finally:
@@ -1550,7 +1553,7 @@ class TestUniqueIndexCreatePreflight:
         client.create_schema(sn)
         try:
             self._bigint_table(client, sn)
-            self._insert_rows(client, sn, [(pk, pk) for pk in range(1, 50)])
+            _insert_rows(client, sn, [(pk, pk) for pk in range(1, 50)])
             client.execute_sql("CREATE UNIQUE INDEX ON t(pk)", schema_name=sn)
             assert _table_has_index(client, sn, "t")
             client.execute_sql("INSERT INTO t VALUES (1000, 1000)", schema_name=sn)
@@ -1620,7 +1623,7 @@ class TestUniqueIndexCreatePreflight:
         client.create_schema(sn)
         try:
             self._bigint_table(client, sn)
-            self._insert_rows(client, sn, [(1, -5), (2, 300), (3, -5)])
+            _insert_rows(client, sn, [(1, -5), (2, 300), (3, -5)])
             with pytest.raises(gnitz.GnitzError):
                 client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
             assert not _table_has_index(client, sn, "t")
@@ -1634,7 +1637,7 @@ class TestUniqueIndexCreatePreflight:
         client.create_schema(sn)
         try:
             self._bigint_table(client, sn)
-            self._insert_rows(client, sn, [(1, -1), (2, -2), (3, -3), (4, 0)])
+            _insert_rows(client, sn, [(1, -1), (2, -2), (3, -3), (4, 0)])
             client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
             with pytest.raises(gnitz.GnitzError):
                 client.execute_sql("INSERT INTO t VALUES (10, -2)", schema_name=sn)
@@ -1652,7 +1655,7 @@ class TestUniqueIndexCreatePreflight:
         client.create_schema(sn)
         try:
             self._bigint_table(client, sn)
-            self._insert_rows(client, sn, [(pk, pk * 7) for pk in range(1, 201)])
+            _insert_rows(client, sn, [(pk, pk * 7) for pk in range(1, 201)])
             client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
             assert _table_has_index(client, sn, "t")
             client.execute_sql(f"DROP INDEX {sn}__t__idx_val", schema_name=sn)
@@ -1678,7 +1681,7 @@ class TestUniqueIndexCreatePreflight:
         client.create_schema(sn)
         try:
             self._bigint_table(client, sn)
-            self._insert_rows(client, sn, [(pk, pk) for pk in range(1, 33)])
+            _insert_rows(client, sn, [(pk, pk) for pk in range(1, 33)])
             try:
                 client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
                 seam_active = False  # release server: seam compiled out
@@ -2320,5 +2323,124 @@ class TestIndexRangeSql:
             q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
             assert q("SELECT * FROM t WHERE x > 3000000000") == []
             assert q("SELECT * FROM t WHERE x < 3000000000") == [1, 2, 3]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestIndexCollectMerge — broadcast-and-merge reply correctness: the merged
+# result of a non-unique seek / ordered range scan equals a scan-and-filter
+# reference, including after retractions (net weights).
+# ---------------------------------------------------------------------------
+
+class TestIndexCollectMerge:
+    def test_nonunique_collect_matches_scan_reference_with_retraction(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "x BIGINT NOT NULL, y BIGINT NOT NULL)", schema_name=sn)
+            # 200 rows scattered across workers; 10 rows per x value.
+            vals = ",".join(f"({i}, {i % 20}, {i * 3})" for i in range(200))
+            client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+
+            # Scan-and-filter reference from the full table scan.
+            tid, _ = client.resolve_table(sn, "t")
+            ref = {r.pk: (r.x, r.y) for r in client.scan(tid) if r.weight > 0}
+            assert len(ref) == 200
+            q = lambda s: _result_rows(client.execute_sql(s, schema_name=sn))
+
+            eq_expect = sorted((pk, x, y) for pk, (x, y) in ref.items() if x == 7)
+            assert q("SELECT * FROM t WHERE x = 7") == eq_expect
+            rng_expect = sorted((pk, x, y) for pk, (x, y) in ref.items() if x > 15)
+            assert q("SELECT * FROM t WHERE x > 15") == rng_expect
+
+            # Retract part of the result set; the merged reply must reflect
+            # net weights (mandatory for any index access path).
+            client.execute_sql("DELETE FROM t WHERE pk IN (7, 27, 47)", schema_name=sn)
+            eq_after = [t for t in eq_expect if t[0] not in (7, 27, 47)]
+            assert q("SELECT * FROM t WHERE x = 7") == eq_after
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestChunkedReplyTrains — multi-frame worker reply trains for non-unique
+# seeks and ordered range scans, forced small via the GNITZ_REPLY_FRAME_BUDGET
+# debug seam (16 KiB per frame). Against a release server the seam is a no-op
+# and this degrades to a normal single-frame merge test.
+# ---------------------------------------------------------------------------
+
+class TestChunkedReplyTrains:
+    def test_chunked_seek_and_range_replies_return_full_set(self, reply_frame_budget_server):
+        client = reply_frame_budget_server
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "x BIGINT NOT NULL, y BIGINT NOT NULL)", schema_name=sn)
+            # ~100 KB of matching base rows per worker per value: each worker's
+            # reply spans several 16 KiB frames (well under the 64-frame
+            # in-flight bound documented on the fixture).
+            n = 20_000
+            _insert_rows(client, sn, [(i, i % 2, i * 7) for i in range(n)], chunk=1000)
+            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
+
+            # Non-unique point seek over a chunked train per worker.
+            assert q("SELECT * FROM t WHERE x = 1") == list(range(1, n, 2))
+            # Ordered range scan returning every row.
+            assert q("SELECT * FROM t WHERE x >= 0") == list(range(n))
+
+            # Payload integrity through chunk boundaries: full-row values.
+            rows = _result_rows(client.execute_sql(
+                "SELECT * FROM t WHERE x = 0", schema_name=sn))
+            assert rows == [(i, 0, i * 7) for i in range(0, n, 2)]
+
+            # Retraction across a chunked result reflects net weights.
+            client.execute_sql("DELETE FROM t WHERE pk IN (1, 3, 5)", schema_name=sn)
+            assert q("SELECT * FROM t WHERE x = 1") == list(range(7, n, 2))
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestMergedReplyCap — a merged index reply over MAX_FRAME_PAYLOAD_CLIENT
+# (256 MiB) surfaces the server's clean reply-cap error instead of a
+# client-side frame rejection or a worker abort. ~300 MB of base rows, so
+# slow-marked.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+class TestMergedReplyCap:
+    def test_merged_reply_over_cap_errors_cleanly(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        cols = ([gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                 gnitz.ColumnDef("x", gnitz.TypeCode.I64)]
+                + [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64) for i in range(14)])
+        schema = gnitz.Schema(cols)
+        tid = client.create_table(sn, "t", cols)
+        try:
+            # 2.1 M rows x 144 wire bytes ≈ 300 MB, all sharing x = 1.
+            n, step = 2_100_000, 100_000
+            payload = {f"c{i}": i for i in range(14)}
+            for lo in range(0, n, step):
+                b = gnitz.ZSetBatch(schema)
+                b.extend({"pk": pk, "x": 1, **payload} for pk in range(lo, lo + step))
+                client.push(tid, b)
+            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+
+            with pytest.raises(gnitz.GnitzError, match="reply cap"):
+                client.execute_sql("SELECT * FROM t WHERE x = 1", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="reply cap"):
+                client.execute_sql("SELECT * FROM t WHERE x > 0", schema_name=sn)
+
+            # The cluster stays healthy: a bounded query still answers.
+            assert _result_pks(client.execute_sql(
+                "SELECT * FROM t WHERE pk = 42", schema_name=sn)) == [42]
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])

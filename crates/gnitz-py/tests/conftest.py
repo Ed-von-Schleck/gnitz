@@ -198,6 +198,18 @@ def unique_preflight_frame_server(monkeypatch):
 
 
 @pytest.fixture
+def reply_frame_budget_server(monkeypatch):
+    """Server whose workers chunk reply trains past a tiny 16 KiB frame budget
+    (debug-only seam), so modest tables already produce multi-frame seek /
+    range / gather / scan reply trains per worker. Tests using it must keep
+    each worker's total reply under 64 x budget = 1 MiB (the W2M in-flight
+    slot bound — the master parks a full train per ring while draining
+    another worker)."""
+    yield from _seamed_server(
+        monkeypatch, {"GNITZ_REPLY_FRAME_BUDGET": str(16 * 1024)})
+
+
+@pytest.fixture
 def unique_preflight_fault_server(monkeypatch):
     """Server whose workers fail every CREATE UNIQUE INDEX pre-flight scan,
     for asserting the master surfaces the fault, creates no index, seeds no
