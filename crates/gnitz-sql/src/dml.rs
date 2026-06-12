@@ -4,9 +4,8 @@ use sqlparser::ast::{
     FromTable, Assignment, AssignmentTarget,
     OnInsert, OnConflict, OnConflictAction, ConflictTarget,
 };
-use std::ops::Bound;
 use std::sync::Arc;
-use gnitz_core::{Schema, ZSetBatch, ColData, PkColumn, PkTuple, TypeCode, FixedInt, WireConflictMode, ClientError};
+use gnitz_core::{Schema, ZSetBatch, ColData, PkColumn, PkTuple, TypeCode, FixedInt, WireConflictMode, ClientError, Cut, RangeDescriptor};
 use gnitz_core::GnitzClient;
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
 use crate::binder::{Binder, find_unique_column};
@@ -426,53 +425,46 @@ fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
         .map_err(|_| GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")))
 }
 
-/// Parse a numeric SQL literal into its packed-u128 PK form. The returned
-/// u128 holds the on-disk LE bytes in its low `pk_stride` bytes: signed
-/// types pass through `(v as iN as uN) as u128` so the low `stride` bytes
-/// match the column's native LE encoding (e.g. `-1_i8` → `0xFF`, not
-/// `0xFFFF_FFFF_FFFF_FFFF`).
-///
-/// `negated` is true when the literal sits under `Expr::UnaryOp(Minus, _)`;
-/// the prepend-`-`-then-parse rule accepts `i64::MIN`'s digit string
-/// (which would overflow a plain `i64::parse` followed by `checked_neg`).
+/// Parse a numeric SQL literal as `i128`, applying `negated` (the literal sat
+/// under `Expr::UnaryOp(Minus, _)`) by prepending `-` to the digit string
+/// before parsing — that rule accepts a type minimum's own digit string
+/// (e.g. `i64::MIN`'s), which a parse-then-negate would overflow. `i128`
+/// covers every ≤8-byte type with room to spare, so an out-of-type-range
+/// literal is *representable* — callers classify it against
+/// `FixedInt::range` and decline or saturate, never wrap.
+fn parse_literal_i128(n_str: &str, negated: bool) -> Option<i128> {
+    let s_owned;
+    let s: &str = if negated { s_owned = format!("-{n_str}"); &s_owned } else { n_str };
+    s.parse::<i128>().ok()
+}
+
+/// Parse a numeric SQL literal into its packed-u128 PK form: the low
+/// `wire_stride` bytes carry the column's native LE encoding
+/// (`FixedInt::pack` — e.g. `-1_i8` → `0xFF`, not `0xFFFF_FFFF_FFFF_FFFF`),
+/// the rest stay zero. An out-of-type-range literal declines (`None`) instead
+/// of wrapping: without the `FixedInt::range` check, `x = 3000000000` on an
+/// I32 column would cast to `-1294967296` and seek the wrong value (silent
+/// wrong rows — the cff7c58-class trap).
 ///
 /// This helper is the single source of truth for INSERT/SEEK PK routing —
 /// `extract_pk_value`, `try_col_eq_literal`, and `try_extract_pk_in` all
 /// dispatch through it so the master cannot send INSERT and DELETE for the
 /// same key to different workers.
 fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u128> {
-    let s_owned;
-    let s: &str = if negated { s_owned = format!("-{n_str}"); &s_owned } else { n_str };
     match tc {
-        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-            // `try_from` narrowing declines an out-of-range literal instead of
-            // wrapping it: without this `x = 3000000000` on an I32 column would
-            // cast to `-1294967296` and seek the wrong value (silent wrong rows
-            // — the cff7c58-class trap).
-            let v = s.parse::<i64>().ok()?;
-            Some(match tc {
-                TypeCode::I8  => (i8::try_from(v).ok()?  as u8)  as u128,
-                TypeCode::I16 => (i16::try_from(v).ok()? as u16) as u128,
-                TypeCode::I32 => (i32::try_from(v).ok()? as u32) as u128,
-                _             => (v as u64) as u128,
-            })
-        }
+        // 16-byte types are their own packed form. U128/UUID take the full
+        // unsigned range; I128 (the internal join-key promotion type) is
+        // two's complement at 16 bytes, exactly `as u128`.
         TypeCode::U128 | TypeCode::UUID => {
             if negated { return None; }
-            s.parse::<u128>().ok()
+            n_str.parse::<u128>().ok()
         }
+        TypeCode::I128 => parse_literal_i128(n_str, negated).map(|v| v as u128),
         _ => {
-            if negated { return None; }
-            // Unsigned ≤8B: `try_from` narrowing declines an out-of-range
-            // literal rather than truncating to the wrong value at OPK-encode
-            // time.
-            let v = s.parse::<u64>().ok()?;
-            Some(match tc {
-                TypeCode::U8  => u8::try_from(v).ok()?  as u128,
-                TypeCode::U16 => u16::try_from(v).ok()? as u128,
-                TypeCode::U32 => u32::try_from(v).ok()? as u128,
-                _             => v as u128,   // U64 (and any other ≤8B unsigned type)
-            })
+            let fi = FixedInt::from_type_code(tc)?;
+            let (min, max) = fi.range();
+            let v = parse_literal_i128(n_str, negated)?;
+            (min <= v && v <= max).then(|| fi.pack(v))
         }
     }
 }
@@ -715,14 +707,8 @@ pub fn execute_select(
                     Ok(list)
                 }).map_err(GnitzSqlError::Exec)?;
             for cand in range_cands {
-                if cand.empty {
-                    // Provably-empty range (a saturated lower>max or upper<min):
-                    // serve an empty batch locally, no server round-trip.
-                    hit = Some((None, Some(ZSetBatch::new(&schema)), 0u64));
-                    break;
-                }
                 match client.seek_by_index_range(
-                    tid, cand.idx_cols.as_slice(), &cand.eq_vals, cand.lo, cand.hi,
+                    tid, cand.idx_cols.as_slice(), &cand.desc,
                 ) {
                     Ok(res) => {
                         hit = Some(residual_filtered(binder, &schema, res, &cand.residual)?);
@@ -1020,60 +1006,50 @@ fn residual_conjuncts<'e>(conjuncts: &[&'e Expr], consumed: &[usize]) -> Vec<&'e
 // Ordered range scans over a secondary index
 // ---------------------------------------------------------------------------
 
-/// A range-bound literal classified against the column type's representable
-/// range. `In` is the in-range native (packed LE, as `parse_pk_literal_packed`
-/// produces); `BelowMin`/`AboveMax` mark a literal past the type's min/max so the
-/// range planner can SATURATE (widen the bound to unbounded, or mark the range
-/// provably empty) instead of wrapping it — the cff7c58-class trap one layer up.
-#[derive(Clone, Copy)]
-enum RangeLit { In(u128), BelowMin, AboveMax }
-
+/// Which end of the candidate interval a conjunct bounds. This is the only
+/// start/end distinction left in range planning — every bound becomes a
+/// `Cut`, and the side only says whether that cut starts or ends the interval.
 #[derive(Clone, Copy, PartialEq)]
-enum RangeSide { Lower, Upper }
+enum RangeSide { Start, End }
 
-/// One end of a range predicate on a column: which side it bounds, whether the
-/// endpoint is inclusive, and the (possibly saturated) bound value.
-struct RangeEnd { side: RangeSide, incl: bool, bound: RangeLit }
+/// One end of a range predicate on a column: which interval end it bounds and
+/// the cut it induces there.
+struct RangeEnd { side: RangeSide, cut: Cut }
 
-/// Map a chosen range end to its scan bound, saturating an out-of-type-range
-/// literal: past the type range away from the interval (below a lower end,
-/// above an upper end) → Unbounded; across it → None (provably empty range).
-fn saturated_bound(end: &RangeEnd) -> Option<Bound<u128>> {
-    match (end.bound, end.side) {
-        (RangeLit::In(v), _) =>
-            Some(if end.incl { Bound::Included(v) } else { Bound::Excluded(v) }),
-        (RangeLit::BelowMin, RangeSide::Lower)
-        | (RangeLit::AboveMax, RangeSide::Upper) => Some(Bound::Unbounded),
-        _ => None,
-    }
-}
-
-/// Parse a range-bound literal for column type `tc`, classified against the
-/// type's representable range (`FixedInt::range`). Parses as `i128` so a
-/// literal past the type's min/max is detected (and saturated by the caller)
-/// rather than wrapped. Returns `None` for a type that cannot carry an ordered
-/// range bound here (UUID, float, string) so the predicate stays a residual.
-fn parse_range_bound(tc: TypeCode, n_str: &str, negated: bool) -> Option<RangeLit> {
-    // U128: full unsigned range, no saturation possible (an i128 compare cannot
-    // represent its upper half), so handle it directly.
+/// Parse a range-end literal for column type `tc` into its cut; `mk` is the
+/// constructor for an in-range literal — `Cut::After` when the cut falls
+/// above the literal's whole duplicate group (`col > v` for a start cut,
+/// `col <= v` for an end cut), `Cut::Before` when below (`>=`, `<`). Parses
+/// as `i128` so a literal past the type's min/max SATURATES to the matching
+/// `Cut::type_edges` edge instead of wrapping into a different in-range value
+/// (the cff7c58-class trap one layer up) — and saturation is
+/// constructor-independent: below the type minimum cuts at `Before(min)`,
+/// above the maximum at `After(max)`. A bound saturating *towards* its
+/// interval thereby yields a zero-width interval the engine rejects
+/// byte-wise, so there is no empty-range special case anywhere. Returns
+/// `None` for a type that cannot carry an ordered range bound here (UUID,
+/// float, string) so the predicate stays a residual.
+fn parse_range_cut(tc: TypeCode, n_str: &str, negated: bool, mk: fn(u128) -> Cut) -> Option<Cut> {
+    // U128: full unsigned range — saturation is impossible (an i128 cannot
+    // represent its upper half), and a literal past u128::MAX fails the parse,
+    // keeping the conjunct a residual.
     if tc == TypeCode::U128 {
         if negated { return None; }
-        return n_str.parse::<u128>().ok().map(RangeLit::In);
+        return n_str.parse::<u128>().ok().map(mk);
     }
-    let (min, max) = FixedInt::from_type_code(tc)?.range();
-    let s_owned;
-    let s: &str = if negated { s_owned = format!("-{n_str}"); &s_owned } else { n_str };
-    let v = s.parse::<i128>().ok()?;
-    if v < min { return Some(RangeLit::BelowMin); }
-    if v > max { return Some(RangeLit::AboveMax); }
-    // In range: re-pack to the column's native LE u128 (guaranteed to succeed).
-    parse_pk_literal_packed(tc, n_str, negated).map(RangeLit::In)
+    let fi = FixedInt::from_type_code(tc)?;
+    let (min, max) = fi.range();
+    let (below, above) = Cut::type_edges(tc)?;
+    let v = parse_literal_i128(n_str, negated)?;
+    Some(if v < min { below } else if v > max { above } else { mk(fi.pack(v)) })
 }
 
-/// Parse a `BETWEEN` endpoint expression to a `RangeLit` (numeric literal only).
-fn between_bound(tc: TypeCode, expr: &Expr) -> Option<RangeLit> {
+/// Parse a `BETWEEN` endpoint expression to its cut (numeric literal only).
+/// Both BETWEEN ends are inclusive: the start cuts before its boundary group
+/// (`Cut::Before`), the end after its group (`Cut::After`).
+fn between_cut(tc: TypeCode, expr: &Expr, mk: fn(u128) -> Cut) -> Option<Cut> {
     match extract_sql_literal(expr)? {
-        SqlLiteral::Number(n, negated) => parse_range_bound(tc, n, negated),
+        SqlLiteral::Number(n, negated) => parse_range_cut(tc, n, negated, mk),
         _ => None,
     }
 }
@@ -1092,30 +1068,27 @@ fn try_col_range_literal(expr: &Expr, schema: &Schema) -> Option<(usize, RangeEn
         _ => return None,
     };
     use BinaryOperator as B;
-    let (side, incl) = match (op, flipped) {
-        (B::Gt,   false) | (B::Lt,   true) => (RangeSide::Lower, false),  // col > lit / lit < col
-        (B::GtEq, false) | (B::LtEq, true) => (RangeSide::Lower, true),   // col >= lit / lit <= col
-        (B::Lt,   false) | (B::Gt,   true) => (RangeSide::Upper, false),  // col < lit / lit > col
-        (B::LtEq, false) | (B::GtEq, true) => (RangeSide::Upper, true),   // col <= lit / lit >= col
+    let (side, mk): (RangeSide, fn(u128) -> Cut) = match (op, flipped) {
+        (B::Gt,   false) | (B::Lt,   true) => (RangeSide::Start, Cut::After),   // col > lit / lit < col
+        (B::GtEq, false) | (B::LtEq, true) => (RangeSide::Start, Cut::Before),  // col >= lit / lit <= col
+        (B::Lt,   false) | (B::Gt,   true) => (RangeSide::End,   Cut::Before),  // col < lit / lit > col
+        (B::LtEq, false) | (B::GtEq, true) => (RangeSide::End,   Cut::After),   // col <= lit / lit >= col
         _ => return None,
     };
     let col_idx = find_unique_column(&schema.columns, &col_id.value).ok().flatten()?;
     let tc = schema.columns[col_idx].type_code;
     let SqlLiteral::Number(n_str, negated) = lit else { return None; };
-    let bound = parse_range_bound(tc, n_str, negated)?;
-    Some((col_idx, RangeEnd { side, incl, bound }))
+    let cut = parse_range_cut(tc, n_str, negated, mk)?;
+    Some((col_idx, RangeEnd { side, cut }))
 }
 
 /// One index-servable range candidate: the index's FULL declared column list,
-/// the equality-pinned leading values, the (possibly saturated) range bounds
-/// on the next index column, an `empty` flag for a provably-empty range, and
-/// the residual conjuncts to filter after the scan.
+/// the wire descriptor (the equality-pinned leading values plus the half-open
+/// cut interval on the next index column), and the residual conjuncts to
+/// filter after the scan.
 struct IndexRangeCandidate<'e> {
     idx_cols: gnitz_core::PkColList,
-    eq_vals: Vec<u128>,
-    lo: Bound<u128>,
-    hi: Bound<u128>,
-    empty: bool,
+    desc: RangeDescriptor,
     residual: Vec<&'e Expr>,
 }
 
@@ -1134,11 +1107,9 @@ fn try_col_between(expr: &Expr, schema: &Schema) -> Option<(usize, [RangeEnd; 2]
     let Expr::Identifier(id) = be.as_ref() else { return None };
     let col = find_unique_column(&schema.columns, &id.value).ok().flatten()?;
     let tc = schema.columns[col].type_code;
-    let lo = between_bound(tc, low)?;
-    let hi = between_bound(tc, high)?;
     Some((col, [
-        RangeEnd { side: RangeSide::Lower, incl: true, bound: lo },
-        RangeEnd { side: RangeSide::Upper, incl: true, bound: hi },
+        RangeEnd { side: RangeSide::Start, cut: between_cut(tc, low, Cut::Before)? },
+        RangeEnd { side: RangeSide::End,   cut: between_cut(tc, high, Cut::After)? },
     ]))
 }
 
@@ -1147,12 +1118,13 @@ fn try_col_between(expr: &Expr, schema: &Schema) -> Option<(usize, [RangeEnd; 2]
 /// equality conjuncts (the leading prefix) and range ends (incl. desugared
 /// `BETWEEN`); for each index consume the equality conjuncts as the leading `E`
 /// columns, then require column `E` to be covered by ≥1 range end. The FIRST
-/// lower end and FIRST upper end on column `E` become the scan bounds — never a
-/// compare of two packed natives to pick the tighter one (the cff7c58 trap one
+/// start-side and FIRST end-side cut on column `E` become the interval — never
+/// a compare of two packed natives to pick the tighter one (the cff7c58 trap one
 /// layer up; `apply_residual_filter` trims any redundant same-side end exactly).
-/// Out-of-type-range bounds saturate: a lower `AboveMax` / upper `BelowMin` makes
-/// the range provably empty, a lower `BelowMin` / upper `AboveMax` widens that
-/// side to unbounded.
+/// An unconstrained side widens to the column type's edge cut, and an
+/// out-of-type-range literal saturates to the same edges (`parse_range_cut`) —
+/// a contradictory bound yields a zero-width interval the engine rejects
+/// byte-wise, so there is no empty-range special case.
 fn collect_index_range_candidates<'e>(
     expr:          &'e Expr,
     schema:        &Schema,
@@ -1187,14 +1159,14 @@ fn collect_index_range_candidates<'e>(
         if n_eq >= idx_cols.len() { continue; }   // no column left to range over
         let range_col = idx_cols[n_eq];
 
-        // First lower end and first upper end on the range column become the
-        // bounds. Never compare multiple same-side bounds (the cff7c58 trap one
-        // layer up); `apply_residual_filter` trims any redundant same-side end.
-        let lower_idx = ends.iter()
-            .position(|e| e.col as u32 == range_col && e.end.side == RangeSide::Lower);
-        let upper_idx = ends.iter()
-            .position(|e| e.col as u32 == range_col && e.end.side == RangeSide::Upper);
-        if lower_idx.is_none() && upper_idx.is_none() { continue; }   // range column not covered
+        // First start-side and first end-side cut on the range column become
+        // the interval. Never compare multiple same-side cuts (the cff7c58 trap
+        // one layer up); `apply_residual_filter` trims any redundant same-side end.
+        let start_idx = ends.iter()
+            .position(|e| e.col as u32 == range_col && e.end.side == RangeSide::Start);
+        let end_idx = ends.iter()
+            .position(|e| e.col as u32 == range_col && e.end.side == RangeSide::End);
+        if start_idx.is_none() && end_idx.is_none() { continue; }   // range column not covered
 
         // Covered columns are the equality prefix + the range column (n_eq + 1);
         // the leading-prefix safety rejection is shared with the equality path.
@@ -1202,24 +1174,21 @@ fn collect_index_range_candidates<'e>(
             continue;
         }
 
-        // Saturate the bounds; a `None` from `saturated_bound` marks the range
-        // provably empty. The `Unbounded` substituted for an empty range is never
-        // consulted — `execute_select` short-circuits on `cand.empty` before
-        // reading `lo`/`hi`.
-        let resolve = |idx: Option<usize>| match idx {
-            None    => Some(Bound::Unbounded),                // side not constrained
-            Some(i) => saturated_bound(&ends[i].end),
-        };
-        let (lo, hi) = (resolve(lower_idx), resolve(upper_idx));
-        let empty = lo.is_none() || hi.is_none();
-        let (lo, hi) = (lo.unwrap_or(Bound::Unbounded), hi.unwrap_or(Bound::Unbounded));
+        // An unconstrained side widens to the type-edge cut — `Before(min)` /
+        // `After(max)` ARE "unbounded", since no index entry lies outside the
+        // range column's type. (At least one end on this column parsed into
+        // `ends`, so the type is range-servable and the edges exist.)
+        let tc = schema.columns[range_col as usize].type_code;
+        let Some((edge_start, edge_end)) = Cut::type_edges(tc) else { continue };
+        let start = start_idx.map_or(edge_start, |i| ends[i].end.cut);
+        let end   = end_idx.map_or(edge_end,     |i| ends[i].end.cut);
 
         // Consume the range conjuncts whose ends were ALL chosen as bounds. A
         // simple `col OP lit` has one end; a BETWEEN has two sharing one
         // conjunct, and with only one chosen its un-applied half must stay a
         // residual filter (else `b > 5 AND b BETWEEN 10 AND 50` would lose
         // `b >= 10` while seeding lo from `b > 5`).
-        let chosen = [lower_idx, upper_idx];
+        let chosen = [start_idx, end_idx];
         let mut consumed = eq_consumed;
         for cj in chosen.iter().flatten().map(|&i| ends[i].conjunct) {
             let all_chosen = ends.iter().enumerate()
@@ -1229,14 +1198,15 @@ fn collect_index_range_candidates<'e>(
         }
 
         out.push(IndexRangeCandidate {
-            idx_cols: meta.cols, eq_vals, lo, hi, empty,
+            idx_cols: meta.cols,
+            desc: RangeDescriptor::new(&eq_vals, start, end),
             residual: residual_conjuncts(&conjuncts, &consumed),
         });
     }
 
     // Best first: more equality-pinned columns first, then the tighter index.
     out.sort_by(|a, b| {
-        b.eq_vals.len().cmp(&a.eq_vals.len())
+        b.desc.eq_vals().len().cmp(&a.desc.eq_vals().len())
             .then_with(|| a.idx_cols.as_slice().len().cmp(&b.idx_cols.as_slice().len()))
     });
     Ok(out)
@@ -3131,7 +3101,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Ordered range-scan extraction (plans/secondary-index-range-scan.md)
+    // Ordered range-scan extraction
     // ------------------------------------------------------------------
 
     fn parse_expr_sql(src: &str) -> Expr {
@@ -3157,41 +3127,62 @@ mod tests {
         // Unsigned ≤8B range-checks too.
         assert_eq!(super::parse_pk_literal_packed(TypeCode::U8, "300", false), None);
         assert_eq!(super::parse_pk_literal_packed(TypeCode::U8, "255", false), Some(255));
+        // I128 (the internal join-key type): full-width two's complement,
+        // negatives included.
+        assert_eq!(super::parse_pk_literal_packed(TypeCode::I128, "5", true),
+                   Some((-5i128) as u128));
     }
 
     #[test]
-    fn parse_range_bound_saturates() {
-        use super::RangeLit;
-        let ck = |tc, s, neg| super::parse_range_bound(tc, s, neg);
-        assert!(matches!(ck(TypeCode::I32, "5", false), Some(RangeLit::In(5))));
-        assert!(matches!(ck(TypeCode::I32, "5", true),
-            Some(RangeLit::In(v)) if v == (-5i32 as u32) as u128));
-        assert!(matches!(ck(TypeCode::I32, "3000000000", false), Some(RangeLit::AboveMax)));
-        assert!(matches!(ck(TypeCode::I32, "3000000000", true), Some(RangeLit::BelowMin)));
-        assert!(matches!(ck(TypeCode::U8, "300", false), Some(RangeLit::AboveMax)));
+    fn parse_range_cut_saturates() {
+        use Cut::{After, Before};
+        let ck = |tc, s, neg, mk: fn(u128) -> Cut| super::parse_range_cut(tc, s, neg, mk);
+        // In-range literals: `mk` picks the cut side, the value packs to the
+        // column's native LE u128 (negatives two's-complement at native width).
+        assert_eq!(ck(TypeCode::I32, "5", false, Before), Some(Before(5)));
+        assert_eq!(ck(TypeCode::I32, "5", false, After),  Some(After(5)));
+        assert_eq!(ck(TypeCode::I32, "5", true,  Before),
+                   Some(Before((-5i32 as u32) as u128)));
+        // Saturation is constructor-independent: past the type range, the cut
+        // lands on the type edge whichever interval end asked for it — a bound
+        // saturating towards its interval becomes a zero-width range.
+        let (min, max) = ((i32::MIN as u32) as u128, i32::MAX as u128);
+        assert_eq!(ck(TypeCode::I32, "3000000000", false, Before), Some(After(max)));
+        assert_eq!(ck(TypeCode::I32, "3000000000", false, After),  Some(After(max)));
+        assert_eq!(ck(TypeCode::I32, "3000000000", true,  Before), Some(Before(min)));
+        assert_eq!(ck(TypeCode::I32, "3000000000", true,  After),  Some(Before(min)));
+        assert_eq!(ck(TypeCode::U8, "300", false, Before), Some(After(255)));
         // Non-range-servable scalar types decline.
-        assert!(ck(TypeCode::String, "5", false).is_none());
+        assert_eq!(ck(TypeCode::String, "5", false, Before), None);
     }
 
     #[test]
     fn try_col_range_literal_orientations() {
         use super::RangeSide;
+        use Cut::{After, Before};
         let schema = Schema {
             columns: vec![col_def("id", TypeCode::U64, false), col_def("x", TypeCode::I64, false)],
             pk_cols: vec![0],
         };
         let ck = |sql: &str| super::try_col_range_literal(&parse_expr_sql(sql), &schema);
-        // col > lit and the flipped lit < col are the same lower-exclusive end.
+        // col > lit and the flipped lit < col are the same start cut, falling
+        // above the literal's whole duplicate group.
         let (c, e) = ck("x > 5").unwrap();
         assert_eq!(c, 1);
-        assert!(e.side == RangeSide::Lower && !e.incl);
+        assert!(e.side == RangeSide::Start && e.cut == After(5));
         let (_, e) = ck("5 < x").unwrap();
-        assert!(e.side == RangeSide::Lower && !e.incl);
-        // col <= lit / lit >= col → upper inclusive.
+        assert!(e.side == RangeSide::Start && e.cut == After(5));
+        // col <= lit / lit >= col → the end side, cutting above the same group
+        // (same cut as `x > 5`; only the side differs).
         let (_, e) = ck("x <= 5").unwrap();
-        assert!(e.side == RangeSide::Upper && e.incl);
+        assert!(e.side == RangeSide::End && e.cut == After(5));
         let (_, e) = ck("5 >= x").unwrap();
-        assert!(e.side == RangeSide::Upper && e.incl);
+        assert!(e.side == RangeSide::End && e.cut == After(5));
+        // col >= lit / col < lit cut below the group.
+        let (_, e) = ck("x >= 5").unwrap();
+        assert!(e.side == RangeSide::Start && e.cut == Before(5));
+        let (_, e) = ck("x < 5").unwrap();
+        assert!(e.side == RangeSide::End && e.cut == Before(5));
         // Equality is not a range end.
         assert!(ck("x = 5").is_none());
     }
@@ -3210,32 +3201,35 @@ mod tests {
 
     #[test]
     fn range_candidate_composite_eq_prefix() {
+        use Cut::Before;
         let schema = abc_schema();
         let expr = parse_expr_sql("a = 7 AND b < 50");
         let cands = super::collect_index_range_candidates(
             &expr, &schema, || Ok(idx_list(&[(&[1, 2], false)]))).unwrap();
         assert_eq!(cands.len(), 1);
         let c = &cands[0];
-        assert_eq!(c.eq_vals, vec![7u128]);
-        assert_eq!(c.lo, Bound::Unbounded);
-        assert_eq!(c.hi, Bound::Excluded(50u128));
-        assert!(!c.empty);
+        assert_eq!(c.desc.eq_vals(), &[7u128]);
+        // No start conjunct → the U64 edge cut; `b < 50` cuts below 50's group.
+        assert_eq!(c.desc.start, Before(0));
+        assert_eq!(c.desc.end, Before(50));
         assert!(c.residual.is_empty(), "both conjuncts consumed");
     }
 
     #[test]
     fn range_candidate_between_desugars() {
+        use Cut::{After, Before};
         let schema = Schema {
             columns: vec![col_def("id", TypeCode::U64, false), col_def("x", TypeCode::I64, false)],
             pk_cols: vec![0],
         };
-        // BETWEEN → inclusive lower + inclusive upper, both consumed.
+        // BETWEEN → inclusive lower + inclusive upper, both consumed:
+        // [Before(10), After(20)) keeps both boundary groups whole.
         let expr = parse_expr_sql("x BETWEEN 10 AND 20");
         let cands = super::collect_index_range_candidates(
             &expr, &schema, || Ok(idx_list(&[(&[1], false)]))).unwrap();
         assert_eq!(cands.len(), 1);
         let c = &cands[0];
-        assert_eq!((c.lo, c.hi), (Bound::Included(10), Bound::Included(20)));
+        assert_eq!((c.desc.start, c.desc.end), (Before(10), After(20)));
         assert!(c.residual.is_empty());
 
         // NOT BETWEEN is non-contiguous → contributes no range end → no candidate.
@@ -3247,72 +3241,56 @@ mod tests {
 
     #[test]
     fn range_candidate_redundant_same_side_keeps_first() {
+        use Cut::After;
         let schema = Schema {
             columns: vec![col_def("id", TypeCode::U64, false), col_def("x", TypeCode::U64, false)],
             pk_cols: vec![0],
         };
-        // First lower end becomes the bound; the second stays a residual (the
-        // planner never compares two packed natives to pick the tighter one).
+        // First lower end becomes the start cut; the second stays a residual
+        // (the planner never compares two packed natives to pick the tighter
+        // one).
         for sql in ["x > 5 AND x > 10", "x > 10 AND x > 5"] {
             let expr = parse_expr_sql(sql);
             let cands = super::collect_index_range_candidates(
                 &expr, &schema, || Ok(idx_list(&[(&[1], false)]))).unwrap();
             assert_eq!(cands.len(), 1, "{sql}");
             let c = &cands[0];
-            // The FIRST conjunct's bound is taken; the other is residual.
+            // The FIRST conjunct's cut is taken; the other is residual.
             let first_val: u128 = if sql.starts_with("x > 5") { 5 } else { 10 };
-            assert_eq!(c.lo, Bound::Excluded(first_val), "{sql}");
+            assert_eq!(c.desc.start, After(first_val), "{sql}");
             assert_eq!(c.residual.len(), 1, "{sql}: other same-side end stays residual");
         }
     }
 
     #[test]
     fn range_candidate_saturates_out_of_range() {
+        use Cut::{After, Before};
         let schema = Schema {
             columns: vec![col_def("id", TypeCode::U64, false), col_def("x", TypeCode::I32, false)],
             pk_cols: vec![0],
         };
-        // Lower above the type max ⇒ provably empty.
+        let (min, max) = ((i32::MIN as u32) as u128, i32::MAX as u128);
+
+        // Lower above the type max ⇒ a zero-width interval (start == end) the
+        // engine rejects byte-wise — no planner-side empty special case.
         let expr = parse_expr_sql("x > 3000000000");
         let c = super::collect_index_range_candidates(
             &expr, &schema, || Ok(idx_list(&[(&[1], false)]))).unwrap();
         assert_eq!(c.len(), 1);
-        assert!(c[0].empty, "lower AboveMax → provably-empty range");
+        assert_eq!((c[0].desc.start, c[0].desc.end), (After(max), After(max)));
 
-        // Upper above the type max ⇒ unbounded-above (and no lower) → full scan.
+        // Upper above the type max ⇒ saturates to the edge (and no lower
+        // conjunct widens to the other edge) → full scan.
         let expr = parse_expr_sql("x < 3000000000");
         let c = super::collect_index_range_candidates(
             &expr, &schema, || Ok(idx_list(&[(&[1], false)]))).unwrap();
         assert_eq!(c.len(), 1);
-        assert!(!c[0].empty && c[0].lo == Bound::Unbounded && c[0].hi == Bound::Unbounded);
-    }
-
-    #[test]
-    fn test_saturated_bound_corners() {
-        use super::{saturated_bound, RangeEnd, RangeLit, RangeSide};
-        use std::ops::Bound;
-
-        let mk = |side, incl, bound| RangeEnd { side, incl, bound };
-
-        // In-range literals carry their inclusivity through unchanged.
-        assert_eq!(saturated_bound(&mk(RangeSide::Lower, true,  RangeLit::In(42))),
-                   Some(Bound::Included(42)));
-        assert_eq!(saturated_bound(&mk(RangeSide::Upper, false, RangeLit::In(100))),
-                   Some(Bound::Excluded(100)));
-
-        // Past the type range *away* from the interval → widen to Unbounded.
-        assert_eq!(saturated_bound(&mk(RangeSide::Lower, true, RangeLit::BelowMin)),
-                   Some(Bound::Unbounded));
-        assert_eq!(saturated_bound(&mk(RangeSide::Upper, true, RangeLit::AboveMax)),
-                   Some(Bound::Unbounded));
-
-        // *Across* the interval → provably empty (None → caller sets `empty`).
-        assert_eq!(saturated_bound(&mk(RangeSide::Upper, true, RangeLit::BelowMin)), None);
-        assert_eq!(saturated_bound(&mk(RangeSide::Lower, true, RangeLit::AboveMax)), None);
+        assert_eq!((c[0].desc.start, c[0].desc.end), (Before(min), After(max)));
     }
 
     #[test]
     fn range_candidate_residual_non_range_conjunct() {
+        use Cut::After;
         let schema = abc_schema();
         // `b` indexed, `a` not part of the index → `a = 7` stays residual.
         let expr = parse_expr_sql("b > 10 AND a = 7");
@@ -3320,8 +3298,8 @@ mod tests {
             &expr, &schema, || Ok(idx_list(&[(&[2], false)]))).unwrap();
         assert_eq!(cands.len(), 1);
         let c = &cands[0];
-        assert!(c.eq_vals.is_empty());
-        assert_eq!(c.lo, Bound::Excluded(10));
+        assert!(c.desc.eq_vals().is_empty());
+        assert_eq!(c.desc.start, After(10));
         assert_eq!(c.residual.len(), 1, "`a = 7` is a residual conjunct");
     }
 }

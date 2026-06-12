@@ -185,8 +185,8 @@ impl Connection {
     }
 
     /// Ordered range scan over a secondary index, described by `desc` (the
-    /// equality-pinned leading values plus the `lo`/`hi` bounds on the next
-    /// index column). Arity is validated upstream in
+    /// equality-pinned leading values plus the half-open cut interval on the
+    /// next index column). Arity is validated upstream in
     /// `GnitzClient::seek_by_index_range`, the single choke point.
     pub fn seek_by_index_range(
         &mut self,
@@ -338,10 +338,10 @@ impl Connection {
         check_response(msg)
     }
 
-    /// Send a SEEK_BY_INDEX_RANGE frame. The encoded §2 descriptor rides the
-    /// **explicit** `seek_pk_extra` blob (up to 82 bytes at max index arity —
-    /// over the 64-byte `PkTuple` cap), so it goes through
-    /// `send_message_with_extra`, not `send_message`. Native bound values ship
+    /// Send a SEEK_BY_INDEX_RANGE frame. The encoded `RangeDescriptor` rides
+    /// the **explicit** `seek_pk_extra` blob (up to 82 bytes at max index
+    /// arity — over the 64-byte `PkTuple` cap), so it goes through
+    /// `send_message_with_extra`, not `send_message`. Native cut values ship
     /// verbatim; the worker is the sole OPK encoder.
     fn roundtrip_seek_by_index_range(
         &mut self,

@@ -242,8 +242,8 @@ pub fn send_message(
 }
 
 /// Control-only frame carrying an **explicit, arbitrary-length** `seek_pk_extra`
-/// blob, the channel for the SEEK_BY_INDEX_RANGE descriptor (§2 of
-/// `plans/secondary-index-range-scan.md`). `encode_message` derives
+/// blob, the channel for the SEEK_BY_INDEX_RANGE `RangeDescriptor`.
+/// `encode_message` derives
 /// `seek_pk_extra` from `seek_pk.split_wire()`, which a `PkTuple` caps at 64
 /// bytes (`MAX_PK_BYTES - 16`); a max-arity range descriptor is up to 82 bytes,
 /// so it cannot ride a `PkTuple`. This passes the blob straight to

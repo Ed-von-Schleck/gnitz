@@ -713,7 +713,7 @@ async fn handle_message(
         let _g = shared.catalog_rwlock.read().await;
         handle_seek_by_index_range(shared, fd, client_id, target_id,
                              decoded.control.seek_col_idx,        // pack_pk_cols(col_indices)
-                             &decoded.control.seek_pk_extra,      // §2 range descriptor
+                             &decoded.control.seek_pk_extra,      // encoded RangeDescriptor
                              client_version).await;
         return;
     }
@@ -932,7 +932,7 @@ async fn handle_seek_by_index(
 
 /// SELECT-path ordered range scan over a secondary index. Validate the column
 /// list, confirm an index on it exists (else STATUS_NO_INDEX, like
-/// `handle_seek_by_index`), then broadcast the §2 range descriptor to all
+/// `handle_seek_by_index`), then broadcast the range descriptor to all
 /// workers and merge — a range's matches scatter by source PK, so there is no
 /// single-worker fast path. The descriptor is forwarded verbatim (the worker is
 /// the sole OPK encoder).

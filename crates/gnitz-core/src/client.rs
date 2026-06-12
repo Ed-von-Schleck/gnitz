@@ -1,4 +1,3 @@
-use std::ops::Bound;
 use std::sync::Arc;
 use lru::LruCache;
 use gnitz_wire::RangeDescriptor;
@@ -207,40 +206,37 @@ impl GnitzClient {
         self.conn.seek_by_index(table_id, col_indices, key_vals, &mut self.schema_cache)
     }
 
-    /// Ordered range scan over a secondary index: the leading `eq_vals.len()`
-    /// columns are equality-pinned, and the next index column is bounded by
-    /// `lo`/`hi`. This is the single choke point for arity validation, shared
-    /// by the SQL planner and every binding — the guards below are
-    /// load-bearing: they keep the equality prefix within the index (matching
-    /// the engine method's own self-guard) and stop a malformed (empty-range)
-    /// frame the worker would reject anyway.
+    /// Ordered range scan over a secondary index: the leading
+    /// `desc.eq_vals().len()` columns are equality-pinned, and the next index
+    /// column is bounded by the descriptor's half-open cut interval
+    /// `[start, end)`. The guards below fail a malformed request fast, before
+    /// any round trip; the engine method self-guards the same arity rule, so
+    /// a binding that bypasses this entry point still cannot drive it out of
+    /// bounds.
+    ///
+    /// `Before(type_min)‥After(type_max)` is a legitimate full index scan over
+    /// the range column's non-NULL rows — the SQL planner sends exactly that
+    /// for an unconstrained or saturated side (e.g. `x < 3e9` on an I32
+    /// column), and a column-NULL row is absent from the index, matching SQL
+    /// range NULL-exclusion. A zero-width or inverted interval is equally
+    /// legitimate: the engine detects it byte-wise and returns nothing.
     pub fn seek_by_index_range(
         &mut self,
         table_id:    u64,
         col_indices: &[u32],
-        eq_vals:     &[u128],
-        lo:          Bound<u128>,
-        hi:          Bound<u128>,
+        desc:        &RangeDescriptor,
     ) -> ScanResult {
         gnitz_wire::validate_pk_col_list(col_indices)
             .map_err(|e| ClientError::ServerError(format!("seek_by_index_range: {e}")))?;
         // The range column sits right after the equality prefix, so the prefix
         // must be strictly shorter than the index column list. (Written `>=`,
         // never a `+ 1` that could overflow on an adversarial length.)
-        if eq_vals.len() >= col_indices.len() {
+        if desc.eq_vals().len() >= col_indices.len() {
             return Err(ClientError::ServerError(format!(
                 "seek_by_index_range: {} equality values leave no range column \
-                 within index arity {}", eq_vals.len(), col_indices.len())));
+                 within index arity {}", desc.eq_vals().len(), col_indices.len())));
         }
-        // `lo == hi == Unbounded` is a legitimate full index scan over the range
-        // column's non-null rows: the SQL planner saturates an out-of-type-range
-        // bound to unbounded (e.g. `x < 3e9` on an I32 column → unbounded-above),
-        // and a column-NULL row is absent from the index, exactly matching SQL
-        // range NULL-exclusion. An unbounded side covers the engine's 0x00/0xFF
-        // OPK sentinel, so both-unbounded yields every indexed row.
-        self.conn.seek_by_index_range(
-            table_id, col_indices, &RangeDescriptor::new(eq_vals, lo, hi),
-            &mut self.schema_cache)
+        self.conn.seek_by_index_range(table_id, col_indices, desc, &mut self.schema_cache)
     }
 
     /// The secondary-index descriptor for `col_idx` of `table_id`, served from a

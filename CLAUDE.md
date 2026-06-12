@@ -4,5 +4,7 @@ Never check or confirm that compilation warnings or Clippy errors/warnings are c
 
 Use `semble search` (the semble MCP server is installed) to find code by describing what it does or naming a symbol/identifier instead of grep. There are other useful semble commands as well. Prefer it over grep + read every time.
 
+gnitz is **pre-alpha** and not used in production anywhere because it has not been released, so there are **never** any compatibility concerns and there should **never** be legacy code remaining.
+
 Read foundations.md for Z-Set algebra, DBSP model, and consolidation invariants.
 Read dev-guide.md for GnitzDB-specific development guidelines.

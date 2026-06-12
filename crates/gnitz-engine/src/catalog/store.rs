@@ -1,5 +1,4 @@
 use std::num::NonZeroU64;
-use std::ops;
 
 use super::*;
 
@@ -1000,41 +999,43 @@ impl CatalogEngine {
         }
     }
 
-    /// Ordered range scan over a secondary index, normalized to a half-open
-    /// byte-key interval `[start, end)` over the index PK space. The leading
-    /// `eq_natives.len()` columns are equality-pinned; the next index column is
-    /// the range column, bounded by `lo`/`hi`. Both bounds are mapped to cut
-    /// points once here, so the walk is a single uniform iterator — seek to
-    /// `start`, advance while `key < end` — with no per-row inclusivity test.
-    /// Returns this worker's matching source rows; the master broadcasts to every
-    /// worker and merges (the index is partitioned by source PK, so a range's
-    /// matches scatter across workers).
+    /// Ordered range scan over a secondary index: the leading
+    /// `range.eq_vals().len()` columns are equality-pinned, and the next index
+    /// column is bounded by the descriptor's half-open cut interval
+    /// `[start, end)`. Each `Cut` maps to one byte key in the index PK space —
+    ///
+    /// | cut         | byte key                                                |
+    /// |-------------|---------------------------------------------------------|
+    /// | `Before(v)` | `pad(group(v))` — below every duplicate of `v`          |
+    /// | `After(v)`  | `pad(succ(group(v)))` — above every duplicate of `v`;   |
+    /// |             | `succ` overflow ⇒ no key space above the group (`+∞`)   |
+    ///
+    /// where `group(v)` is the `prefix_len`-byte `[eq OPK ‖ promoted slot OPK]`
+    /// group key, `pad` zero-extends to the index PK stride, and `succ` is the
+    /// fixed-width byte successor. The walk is then uniform — seek to `start`,
+    /// advance while `key < end` — with `start ≥ end` (or a `+∞` start)
+    /// provably empty. SQL bound semantics (inclusivity, unboundedness,
+    /// out-of-range saturation) are resolved to cuts in the planner; none of
+    /// them reach this layer.
     ///
     /// Correctness rests on the post-`cff7c58` OPK ordering invariant: the index
     /// PK region is `[promoted leading-key OPK ‖ source-PK OPK]` and memcmp order
     /// on those bytes equals typed order (signed and composite included). For any
     /// `prefix_len`-byte group key `p`, every full key `k` with
-    /// `k[..prefix_len] == p` satisfies `pad(p) ≤ k < pad(succ(p))`, so cutting
-    /// the key space at `pad(group)` / `pad(succ(group))` includes or excludes
-    /// whole duplicate groups with no per-row prefix slicing. Bound → cut point:
+    /// `k[..prefix_len] == p` satisfies `pad(p) ≤ k < pad(succ(p))`, so a cut key
+    /// includes or excludes whole duplicate groups with no per-row inclusivity
+    /// test.
     ///
-    /// | bound            | cut point                                              |
-    /// |------------------|--------------------------------------------------------|
-    /// | lo `Unbounded`   | `start = pad(eq_key)`                                   |
-    /// | lo `Included(v)` | `start = pad(group(v))`                                 |
-    /// | lo `Excluded(v)` | `start = pad(succ(group(v)))`; `succ` overflow → empty |
-    /// | hi `Excluded(v)` | `end = pad(group(v))`                                   |
-    /// | hi `Included(v)` | `end = pad(succ(group(v)))`; `succ` overflow → to end  |
-    /// | hi `Unbounded`   | `end = pad(succ(eq_key))`; empty `eq_key` → to end      |
+    /// Returns this worker's matching source rows; the master broadcasts to every
+    /// worker and merges (the index is partitioned by source PK, so a range's
+    /// matches scatter across workers).
     pub fn seek_by_index_range(
         &mut self,
         table_id: i64,
         col_indices: &[u32],
-        eq_natives: &[u128],
-        lo: ops::Bound<u128>,
-        hi: ops::Bound<u128>,
+        range: &gnitz_wire::RangeDescriptor,
     ) -> Result<Option<Batch>, String> {
-        use ops::Bound::{Excluded, Included, Unbounded};
+        use gnitz_wire::Cut;
 
         let entry = self.dag.tables.get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
@@ -1050,6 +1051,7 @@ impl CatalogEngine {
         // `n_eq >= len`, never a `+ 1` that could overflow on an adversarial
         // length.) It also keeps `prefix_len < idx_pk_stride` strict, so `pad`
         // always extends the group key.
+        let eq_natives = range.eq_vals();
         let n_eq = eq_natives.len();
         if n_eq >= col_indices.len() {
             return Err(format!(
@@ -1061,64 +1063,41 @@ impl CatalogEngine {
         let src_pk_stride = src_schema.pk_stride() as usize;
         let idx_pk_stride = ic.index_schema.pk_stride() as usize;       // leading + source PK
         let idx_key_size  = ic.index_schema.leading_key_size(col_indices.len());
-        let eq_size       = ic.index_schema.leading_key_size(n_eq);     // equality prefix bytes
-        let prefix_len    = ic.index_schema.leading_key_size(n_eq + 1); // + the range slot
+        let prefix_len    = ic.index_schema.leading_key_size(n_eq + 1); // eq prefix + range slot
 
-        // Every cut point is `pad(group(v))` for some (n_eq + 1)-column group key,
-        // so one IndexKeySpec over the equality prefix PLUS the range column
-        // encodes both bounds through the same path the write side uses
-        // (`write_span`/`batch_project_index` — byte-identical by construction).
-        // Stack scratch throughout: MAX_PK_BYTES bounds every index schema's
-        // pk_stride (asserted in SchemaDescriptor::new), and `seek_prefix` leaves
-        // the bytes past `prefix_len` zero, so `group(v)` IS `pad(group(v))`.
+        // Every cut key is `pad(group(v))` or its successor for a full
+        // (n_eq + 1)-column group key, so one IndexKeySpec over the equality
+        // prefix PLUS the range column encodes both cuts through the same path
+        // the write side uses (`write_span`/`batch_project_index` —
+        // byte-identical by construction). Stack scratch throughout: MAX_PK_BYTES
+        // bounds every index schema's pk_stride (asserted in
+        // SchemaDescriptor::new), and `seek_prefix` leaves the bytes past
+        // `prefix_len` zero, so `group(v)` IS `pad(group(v))`.
         let spec = crate::schema::IndexKeySpec::new(
             &col_indices[..=n_eq], &src_schema, &ic.index_schema);
         let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
         natives[..n_eq].copy_from_slice(eq_natives);
-        let mut group = |v: u128| {
-            natives[n_eq] = v;
-            spec.seek_prefix(&natives[..=n_eq]).0
-        };
-
-        // `pad(eq_key)`: encode any group, then zero the range slot — the OPK of
-        // the placeholder 0 is not all-zero for a signed slot (the sign flip maps
-        // 0 to 0x80…), so the fill is not redundant.
-        let mut eq_key = group(0);
-        eq_key[eq_size..].fill(0);
-
-        // Lower cut. An `Excluded` bound steps to the byte successor of the whole
-        // boundary group, so the seek lands strictly past every duplicate of `v`
-        // in O(log N) (no per-row skip); successor overflow means `v` is the
-        // maximal group and excluding it leaves nothing above — empty.
-        let start = match lo {
-            Unbounded   => eq_key,
-            Included(v) => group(v),
-            Excluded(v) => {
-                let mut s = group(v);
-                if !increment_key_in_place(&mut s[..prefix_len]) {
-                    return Ok(None);
-                }
-                s
+        // Cut → byte key, `None` = `+∞`. `After` steps to the byte successor of
+        // the whole group, so e.g. an exclusive lower bound seeks strictly past
+        // every duplicate of `v` in O(log N) (no per-row skip); the carry may
+        // ripple into the equality prefix, which is exactly the first key of the
+        // next equality group.
+        let mut cut_key = |c: Cut| {
+            natives[n_eq] = c.value();
+            let mut k = spec.seek_prefix(&natives[..=n_eq]).0;
+            match c {
+                Cut::Before(_) => Some(k),
+                Cut::After(_)  => increment_key_in_place(&mut k[..prefix_len]).then_some(k),
             }
         };
+        let (start, end) = (cut_key(range.start), cut_key(range.end));
 
-        // Upper cut; `end == None` scans to the table end. Successor overflow on
-        // the inclusive/unbounded side means no key space exists above the group —
-        // exactly the scan-to-end case. (`n_eq == 0` with no upper bound is the
-        // empty-slice overflow of `increment_key_in_place`.)
-        let mut end_buf = eq_key;
-        let has_end = match hi {
-            Excluded(v) => { end_buf = group(v); true }
-            Included(v) => { end_buf = group(v);
-                             increment_key_in_place(&mut end_buf[..prefix_len]) }
-            Unbounded   => increment_key_in_place(&mut end_buf[..eq_size]),
-        };
-        let end = has_end.then(|| &end_buf[..idx_pk_stride]);
-
-        // Provably-empty interval (an inverted range like `x > 5 AND x < 3` the
-        // planner does not pre-reject, or a carry that collapsed `start` onto
-        // `end`): short-circuit before constructing any cursor or running the
-        // O(log N) seek.
+        // A `+∞` start, or `start ≥ end`, is provably empty (a zero-width
+        // saturated interval, or an inverted range like `x > 5 AND x < 3` the
+        // planner does not pre-reject): short-circuit before constructing any
+        // cursor or running the O(log N) seek.
+        let Some(start) = start else { return Ok(None) };
+        let end = end.as_ref().map(|e| &e[..idx_pk_stride]);
         if end.is_some_and(|e| &start[..idx_pk_stride] >= e) {
             return Ok(None);
         }
@@ -1825,10 +1804,9 @@ impl CatalogEngine {
 }
 
 /// Fixed-width byte-string successor: `p + 1` with carry, in place. Returns
-/// `false` when `p` is all-0xFF (or empty) — no successor exists at this width.
-/// The empty-slice case is load-bearing: it is exactly the
-/// `n_eq == 0, hi == Unbounded` → scan-to-end row of `seek_by_index_range`'s
-/// cut-point mapping.
+/// `false` when `p` is all-0xFF (or empty) — no successor exists at this
+/// width: a `Cut::After` of a group whose key is already maximal cuts at `+∞`
+/// (scan to the table end, or a provably-empty start).
 fn increment_key_in_place(p: &mut [u8]) -> bool {
     for b in p.iter_mut().rev() {
         *b = b.wrapping_add(1);

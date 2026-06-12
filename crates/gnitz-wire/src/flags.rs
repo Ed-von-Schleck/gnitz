@@ -39,7 +39,7 @@ pub const FLAG_GET_INDICES: u64 = 1 << 54;
 /// GET_INDICES (answered master-locally) a range seek *fans out* to workers,
 /// so the master→worker leg carries a *separate* `u32` SAL dispatch flag
 /// (`runtime::sal::FLAG_SEEK_BY_INDEX_RANGE_SAL`); this high bit is never
-/// written to the SAL group header. See `plans/secondary-index-range-scan.md`.
+/// written to the SAL group header.
 pub const FLAG_SEEK_BY_INDEX_RANGE: u64 = 1 << 55;
 
 // ---------------------------------------------------------------------------

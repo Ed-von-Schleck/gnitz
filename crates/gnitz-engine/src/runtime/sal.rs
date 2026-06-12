@@ -65,8 +65,7 @@ pub const FLAG_UNIQUE_PREFLIGHT: u32    = 131072;
 /// Distinct from the client→master `u64` wire flag `FLAG_SEEK_BY_INDEX_RANGE`
 /// (bit 55), which lives among the wire packed fields and is never classified
 /// here. A range seek must fan out (its matches scatter by source PK), so the
-/// worker classifies it from this `u32` flag. See
-/// `plans/secondary-index-range-scan.md`.
+/// worker classifies it from this `u32` flag.
 pub const FLAG_SEEK_BY_INDEX_RANGE_SAL: u32 = 1 << 18;
 
 /// Wire schema of every unique pre-flight reply frame: the leading `n_promoted`

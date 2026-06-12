@@ -19,6 +19,7 @@ pub use client::{GnitzClient, IndexMeta};
 pub use gnitz_wire::{
     FK_INDEX_INFIX, validate_user_identifier,
     index_key_types, PkColList,
+    Cut, RangeDescriptor,
 };
 pub use protocol::{
     ProtocolError,

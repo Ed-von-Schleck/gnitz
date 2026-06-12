@@ -910,25 +910,17 @@ impl WorkerProcess {
                     Ok(cols) => cols,
                     Err(msg) => return DispatchResult::Error(msg),
                 };
-                // Decode the §2 range descriptor from seek_pk_extra. `decode`
+                // Decode the range descriptor from seek_pk_extra. `decode`
                 // validates the exact length and arity cap at the trust boundary
                 // (mirroring the SeekByIndex `% 16` guard), so a malformed frame
                 // is rejected rather than mis-decoded; the arity check against
-                // the actual column list stays here.
+                // the actual column list is the engine method's self-guard,
+                // whose Err surfaces through the same error path below.
                 let desc = match gnitz_wire::RangeDescriptor::decode(&seek_pk_extra) {
                     Ok(desc) => desc,
                     Err(e) => return DispatchResult::Error(format!("seek_by_index_range: {e}")),
                 };
-                // The range column sits right after the equality prefix, so the
-                // prefix must be strictly shorter than the index column list.
-                if desc.eq_vals().len() >= cols.as_slice().len() {
-                    return DispatchResult::Error(format!(
-                        "seek_by_index_range: n_eq {} exceeds index arity {}",
-                        desc.eq_vals().len(), cols.as_slice().len()));
-                }
-                match self.cat().seek_by_index_range(
-                    target_id, cols.as_slice(), desc.eq_vals(), desc.lo, desc.hi,
-                ) {
+                match self.cat().seek_by_index_range(target_id, cols.as_slice(), &desc) {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
                         self.send_response(target_id as u64, result.as_ref(),

@@ -284,10 +284,11 @@ impl FixedInt {
     }
 
     /// The representable `(min, max)` of this integer type, widened to `i128`
-    /// so one pair covers signed and unsigned variants. The SQL range planner
-    /// classifies bound literals against this to saturate an out-of-range
-    /// bound (to unbounded, or to a provably-empty range) instead of wrapping
-    /// it into a different in-range value.
+    /// so one pair covers signed and unsigned variants. The SQL layer
+    /// classifies literals against this — declining an out-of-range
+    /// PK/equality literal, saturating an out-of-range range bound to the
+    /// type-edge cut (`Cut::type_edges`) — instead of wrapping it into a
+    /// different in-range value.
     pub const fn range(self) -> (i128, i128) {
         match self {
             Self::U8  => (0, u8::MAX as i128),
@@ -299,6 +300,17 @@ impl FixedInt {
             Self::U64 => (0, u64::MAX as i128),
             Self::I64 => (i64::MIN as i128, i64::MAX as i128),
         }
+    }
+
+    /// Pack an in-range value (per [`Self::range`]) into the column's native
+    /// LE `u128`: the low `width()` bytes are the value's native encoding —
+    /// two's complement at native width for signed types, so `-1` on an `I8`
+    /// column packs to `0xFF`, not `0xFFFF…` — and the rest stay zero. This is
+    /// the convention every native PK/equality/range value on the wire uses
+    /// (the SQL layer's literal parsing routes through here).
+    pub const fn pack(self, v: i128) -> u128 {
+        debug_assert!(self.range().0 <= v && v <= self.range().1);
+        (v as u128) & (u128::MAX >> (128 - 8 * self.width()))
     }
 
     /// Decode the leading `width()` little-endian bytes of `b` as this integer,
