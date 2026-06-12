@@ -665,23 +665,31 @@ impl IndexKeySpec {
     /// `false` (skip — the row is not indexed, `dst` partially written) when ANY
     /// indexed column is NULL: SQL NULL-distinctness, a row with a NULL in any
     /// indexed column never collides. The per-column encode is byte-identical
-    /// to the seek-side `index_opk_prefix_composite`, so the in-memory key, the
+    /// to the seek-side [`Self::seek_prefix`], so the in-memory key, the
     /// projected index entry, and the seek prefix agree by construction.
     ///
-    /// `encode_pk_column` is equality-correct for every type a unique index
-    /// permits; the signed sign-flip at the *promoted* width
-    /// (order-preservation) is deferred to a later pass and not required for
-    /// uniqueness (equality, not order).
+    /// Each column encodes through `encode_pk_column_promoted`, sign-extending a
+    /// signed source from its native width before OPK-encoding at the promoted
+    /// index column: the span is order-preserving for every type (a signed source
+    /// promotes to a signed `I64`/`I128` index column whose sign-flip puts
+    /// negatives below non-negatives), and equality-correct (equal logical values
+    /// pack byte-identically regardless of source/target width). A column whose
+    /// source already matches the index type (`U128`/`UUID`, base unsigned ≤8B)
+    /// reduces to `encode_pk_column`.
     pub(crate) fn write_span(&self, mb: &MemBatch, row: usize, dst: &mut [u8]) -> bool {
         let mut off = 0;
         for (loc, col) in self.locators[..self.n as usize].iter().zip(self.idx_cols()) {
             if loc.is_null(mb, row) { return false; }
-            let size = col.size() as usize;
-            let native = loc.native_key(mb, row);
-            // `encode_pk_column` requires `dst.len() == src.len()`; both are `size`.
-            gnitz_wire::encode_pk_column(
-                &native.to_le_bytes()[..size], col.type_code, &mut dst[off..off + size]);
-            off += size;
+            let src_w = loc.size();             // source column width
+            let target_w = col.size() as usize; // promoted index column width
+            let native = loc.native_key(mb, row); // zero-extended native LE in u128
+            // Sign-extends a signed source / zero-extends an unsigned source from
+            // `src_w`, then OPK-encodes at the promoted target. `src_w == target_w`
+            // (no promotion, e.g. U128) reduces to `encode_pk_column`.
+            gnitz_wire::encode_pk_column_promoted(
+                &native.to_le_bytes()[..src_w], loc.type_code(), col.type_code,
+                &mut dst[off..off + target_w]);
+            off += target_w;
         }
         true
     }
@@ -701,6 +709,31 @@ impl IndexKeySpec {
         if (out.len as usize) > len { out.bytes[len..out.len as usize].fill(0); }
         out.len = len as u8;
         true
+    }
+
+    /// Seek-side counterpart of [`Self::write_span`]: OPK-encode native key
+    /// values (zero-extended, as `pk_native_key`/`payload_native_key` produce
+    /// them) into the leading-key prefix, returning the buffer and the filled
+    /// prefix length. For a leading-prefix seek, build the spec over only the
+    /// supplied columns. Each column makes the same `encode_pk_column_promoted`
+    /// call as `write_span`, so the seek prefix matches the projected entries
+    /// by construction. Bytes past the prefix stay zero (the source-PK suffix
+    /// is not part of the leading-column prefix).
+    pub(crate) fn seek_prefix(&self, natives: &[u128]) -> ([u8; MAX_PK_BYTES], usize) {
+        debug_assert_eq!(natives.len(), self.n as usize,
+            "seek_prefix: one native value per spec column");
+        let mut opk = [0u8; MAX_PK_BYTES];
+        let mut off = 0;
+        for (native, (loc, col)) in natives.iter()
+            .zip(self.locators[..self.n as usize].iter().zip(self.idx_cols()))
+        {
+            let size = col.size() as usize;
+            gnitz_wire::encode_pk_column_promoted(
+                &native.to_le_bytes()[..loc.size()], loc.type_code(), col.type_code,
+                &mut opk[off..off + size]);
+            off += size;
+        }
+        (opk, off)
     }
 }
 
@@ -869,45 +902,26 @@ pub(crate) fn payload_native_key(
 }
 
 /// OPK-encode a native index-key value into the index's leading-column bytes,
-/// for a prefix seek or a check-batch composite PK. The leading index column is
-/// the promoted key type (`idx_key_type`, width `idx_key_size`); the index PK
-/// region is OPK-at-rest, so the prefix must be order-preserving to match the
-/// entries `batch_project_index` writes. Bytes beyond `idx_key_size` stay zero
-/// (the source-PK suffix is not part of the leading-column prefix).
+/// for a prefix seek or a check-batch composite PK — the scalar sibling of
+/// [`IndexKeySpec::seek_prefix`] for callers whose source column lives in
+/// another table's schema (FK probes). `src_type` is the *source* column type
+/// (the value in `native` is zero-extended): a signed source sign-extends from
+/// its native width before OPK-encoding at the promoted `idx_key_type`,
+/// byte-identical to the write-side `IndexKeySpec::write_span`. Bytes beyond
+/// the leading column stay zero (the source-PK suffix is not part of the
+/// leading-column prefix).
 #[inline]
 pub(crate) fn index_opk_prefix(
     native: u128,
+    src_type: u8,
     idx_key_type: u8,
-    idx_key_size: usize,
 ) -> [u8; MAX_PK_BYTES] {
     let mut opk = [0u8; MAX_PK_BYTES];
-    gnitz_wire::encode_pk_column(&native.to_le_bytes()[..idx_key_size], idx_key_type, &mut opk[..idx_key_size]);
+    let src_w = gnitz_wire::wire_stride(src_type);
+    let idx_w = gnitz_wire::wire_stride(idx_key_type);
+    gnitz_wire::encode_pk_column_promoted(
+        &native.to_le_bytes()[..src_w], src_type, idx_key_type, &mut opk[..idx_w]);
     opk
-}
-
-/// Composite generalisation of [`index_opk_prefix`]: OPK-encode each native
-/// value into its index column's slot at the running offset, returning the
-/// buffer and the filled prefix length. `cols` is the leading slice of the
-/// circuit's `index_schema.columns`; `natives.len() == cols.len()` may be
-/// `< N` (a leading-prefix seek): only the supplied leading columns are
-/// encoded; the rest of the buffer stays zero. Byte-identical to
-/// `index_opk_prefix` for a 1-element list, so the seek path stays
-/// byte-consistent with `batch_project_index`.
-pub(crate) fn index_opk_prefix_composite(
-    natives: &[u128], cols: &[SchemaColumn],
-) -> ([u8; MAX_PK_BYTES], usize) {
-    debug_assert_eq!(natives.len(), cols.len(),
-        "index_opk_prefix_composite: one index column per supplied value");
-    let mut opk = [0u8; MAX_PK_BYTES];
-    let mut off = 0;
-    for (native, col) in natives.iter().zip(cols) {
-        let size = col.size() as usize;
-        gnitz_wire::encode_pk_column(
-            &native.to_le_bytes()[..size], col.type_code, &mut opk[off..off + size],
-        );
-        off += size;
-    }
-    (opk, off)
 }
 
 /// Prepare the 16-byte German string output struct for a copy operation.

@@ -166,20 +166,23 @@ pub fn is_pk_eligible(tc: u8) -> bool {
 }
 
 /// Promote a base-table column's type to the leading-key type its secondary
-/// index stores: a ≤8-byte integer (U8..U64, I8..I64) promotes to `U64`;
-/// `U128`/`UUID` keep their 16-byte width; STRING/BLOB/float (and any unknown
-/// code) are index-ineligible and return `Err`. The single source of truth for
-/// index-key promotion, shared by the engine's `make_index_schema` and the SQL
-/// planner's CREATE INDEX limit pre-check so the nice SQL error and the engine
-/// backstop can never disagree on a column's promoted width.
+/// index stores: an unsigned ≤8-byte integer (U8..U64) promotes to `U64`, a
+/// signed ≤8-byte integer (I8..I64) to `I64`; `U128`/`UUID` keep their 16-byte
+/// width; STRING/BLOB/float (and any unknown code) are index-ineligible and
+/// return `Err`. Signed columns keep a *signed* promoted code so the OPK leading
+/// key is order-preserving (`encode_pk_column` sign-flips only signed codes);
+/// `wire_stride(I64) == wire_stride(U64) == 8`, so the index record's arity and
+/// stride are identical to the old unsigned promotion. The single source of
+/// truth for index-key promotion, shared by the engine's `make_index_schema` and
+/// the SQL planner's CREATE INDEX limit pre-check so the nice SQL error and the
+/// engine backstop can never disagree on a column's promoted width.
 pub fn index_key_type(field_type_code: u8) -> Result<u8, String> {
     use type_code as tc;
     match field_type_code {
         tc::U128 => Ok(tc::U128),
         tc::UUID => Ok(tc::UUID),
-        tc::U64 => Ok(tc::U64),
-        tc::I64 | tc::U32 | tc::I32 |
-        tc::U16 | tc::I16 | tc::U8 | tc::I8 => Ok(tc::U64),
+        tc::U64 | tc::U32 | tc::U16 | tc::U8 => Ok(tc::U64),
+        tc::I64 | tc::I32 | tc::I16 | tc::I8 => Ok(tc::I64),
         tc::F32 | tc::F64 | tc::STRING | tc::BLOB => {
             Err(format!("Secondary index on column type {} not supported", field_type_code))
         }
@@ -414,13 +417,20 @@ pub const fn wire_stride(tc: u8) -> usize {
 mod tests {
     use super::*;
 
-    /// Index-key promotion: ≤8-byte ints → U64; U128/UUID keep width; STRING/
-    /// BLOB/float (and unknown) are rejected.
+    /// Index-key promotion: unsigned ≤8-byte ints → U64, signed ≤8-byte ints →
+    /// I64 (order-preserving signed leading key); U128/UUID keep width; STRING/
+    /// BLOB/float (and unknown) are rejected. `wire_stride` of both U64 and I64 is
+    /// 8, so the index record stride is unchanged by the signed promotion.
     #[test]
     fn index_key_type_promotion() {
         use type_code as tc;
-        for t in [tc::U8, tc::I8, tc::U16, tc::I16, tc::U32, tc::I32, tc::U64, tc::I64] {
+        for t in [tc::U8, tc::U16, tc::U32, tc::U64] {
             assert_eq!(index_key_type(t).unwrap(), tc::U64, "{t} must promote to U64");
+        }
+        for t in [tc::I8, tc::I16, tc::I32, tc::I64] {
+            assert_eq!(index_key_type(t).unwrap(), tc::I64, "{t} must promote to I64");
+            assert_eq!(wire_stride(index_key_type(t).unwrap()), wire_stride(tc::U64),
+                "signed promotion must keep the 8-byte width");
         }
         assert_eq!(index_key_type(tc::U128).unwrap(), tc::U128);
         assert_eq!(index_key_type(tc::UUID).unwrap(), tc::UUID);

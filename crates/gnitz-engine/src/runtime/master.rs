@@ -1665,8 +1665,11 @@ impl MasterDispatcher {
             let is_parent_pk = pk.len() == 1 && pk[0] as usize == parent_col_idx;
 
             if is_parent_pk {
+                // Base table: the PK column does not promote, so its own type is
+                // both the source and the leading-key type (identity encode).
+                let src_type = parent_schema.columns[parent_col_idx].type_code;
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
-                let check_batch = build_check_batch(&parent_schema, &keys, pooled);
+                let check_batch = build_check_batch(&parent_schema, &keys, src_type, pooled);
                 p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
                 p1_checks.push(PipelinedCheck {
                     target_id: parent_table_id,
@@ -1684,7 +1687,9 @@ impl MasterDispatcher {
                             parent_table_id, parent_col_idx))?
                 };
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
-                let check_batch = build_check_batch(&idx_schema, &keys, pooled);
+                // `loc` is the child FK column; its type drives the sign-extension
+                // into the parent index's promoted leading key.
+                let check_batch = build_check_batch(&idx_schema, &keys, loc.type_code(), pooled);
                 p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
                 p1_checks.push(PipelinedCheck {
                     target_id: parent_table_id,
@@ -1785,8 +1790,13 @@ impl MasterDispatcher {
                     };
                     if keys.is_empty() { continue; }
 
+                    // The keys are the referenced parent column's values; its type
+                    // drives the sign-extension into the child index's promoted
+                    // leading key (equal logical values sign-extend to the same
+                    // promoted image from either side's width).
+                    let src_type = source_schema.columns[parent_col_idx].type_code;
                     let pooled = unsafe { (*disp_ptr).pool_pop_batch(child_tid) };
-                    let check_batch = build_check_batch(&idx_schema, &keys, pooled);
+                    let check_batch = build_check_batch(&idx_schema, &keys, src_type, pooled);
                     p1_labels.push(P1Label::FkRestrict { child_tid });
                     p1_checks.push(PipelinedCheck {
                         target_id: child_tid,
@@ -1894,7 +1904,10 @@ impl MasterDispatcher {
         // the OLD committed value for each updated PK and RESTRICT-check any
         // value that both changed and is still referenced. Pipelined into the
         // Phase-2 burst alongside the unique-index broadcasts.
-        let mut p2_restrict: Vec<(i64, u32, SchemaDescriptor, Vec<u128>)> = Vec::new();
+        // (child_tid, fk_col, child_idx_schema, src_type, retired_parent_values).
+        // `src_type` is the referenced parent column's type, threaded into the
+        // child index's OPK seek so a signed column sign-extends correctly.
+        let mut p2_restrict: Vec<(i64, u32, SchemaDescriptor, u8, Vec<u128>)> = Vec::new();
         if n_children > 0 && !existing_pks.is_empty() {
             // Resolve the OLD committed values for all updated PKs in ONE
             // batched gather, rather than one serial seek per (updated PK ×
@@ -1974,7 +1987,10 @@ impl MasterDispatcher {
                         }
                     }
                     if !retired.is_empty() {
-                        p2_restrict.push((child_tid, fk_col_idx as u32, idx_schema, retired));
+                        // `loc` is the referenced parent (payload) column; its
+                        // type drives the sign-extension at the seek encode.
+                        p2_restrict.push((
+                            child_tid, fk_col_idx as u32, idx_schema, loc.type_code(), retired));
                     }
                 }
             }
@@ -2147,9 +2163,9 @@ impl MasterDispatcher {
         }
 
         // RESTRICT probes for referenced UNIQUE values retired by UPDATE.
-        for (child_tid, fk_col, idx_schema, keys) in p2_restrict {
+        for (child_tid, fk_col, idx_schema, src_type, keys) in p2_restrict {
             let pooled = unsafe { (*disp_ptr).pool_pop_batch(child_tid) };
-            let chk_batch = build_check_batch(&idx_schema, &keys, pooled);
+            let chk_batch = build_check_batch(&idx_schema, &keys, src_type, pooled);
             p2_labels.push(P2Label::FkRestrict { child_tid });
             p2_checks.push(PipelinedCheck {
                 target_id: child_tid,
@@ -3163,10 +3179,17 @@ fn build_check_batch_with<K>(
     batch
 }
 
-/// Build a constraint-check batch from narrow `u128` PK keys.
+/// Build a constraint-check batch from narrow `u128` PK keys. `src_type` is the
+/// type of the column the keys came from (the child FK column, or the parent
+/// PK/indexed column): a signed source sign-extends from its native width before
+/// OPK-encoding at the leading promoted key column, byte-identical to the
+/// write-side `IndexKeySpec::write_span`. For a base-table schema (the FK parent
+/// fast-path) the key column does not promote, so `src_type == idx_key_type` and
+/// the encode is the identity path.
 fn build_check_batch(
     schema: &SchemaDescriptor,
     keys: &[u128],
+    src_type: u8,
     pooled: Option<Batch>,
 ) -> Batch {
     // The index PK composite is `(indexed-value, src_pk_cols)` and is OPK-at-
@@ -3182,10 +3205,9 @@ fn build_check_batch(
     // `pk_indices()[0]` resolves both: an index schema is laid out
     // `(promoted_c0, src_pk…)`, so `pk_indices()[0] == 0 == columns[0]`.
     let key_col = schema.pk_indices()[0] as usize;
-    let idx_key_size = schema.columns[key_col].size() as usize;
     let idx_key_type = schema.columns[key_col].type_code;
     build_check_batch_with(schema, keys, pooled, |b, &k| {
-        let buf = crate::schema::index_opk_prefix(k, idx_key_type, idx_key_size);
+        let buf = crate::schema::index_opk_prefix(k, src_type, idx_key_type);
         b.extend_pk_bytes(&buf[..stride]);
     })
 }
@@ -3370,7 +3392,7 @@ mod unique_filter_tests {
         assert_eq!(schema.num_payload_cols(), 64);
 
         let keys = vec![42u128];
-        let batch = build_check_batch(&schema, &keys, None);
+        let batch = build_check_batch(&schema, &keys, type_code::U64, None);
         assert_eq!(batch.count, 1);
 
         let null_word = u64::from_le_bytes(batch.null_bmp_data()[0..8].try_into().unwrap());
@@ -3391,7 +3413,7 @@ mod unique_filter_tests {
         let schema = SchemaDescriptor::new(&cols, &[1]);
 
         let keys = vec![42u128];
-        let batch = build_check_batch(&schema, &keys, None);
+        let batch = build_check_batch(&schema, &keys, type_code::U64, None);
 
         // The parent stores id=42 as `encode_pk_column(42, U64)` = 42u64.to_be_bytes().
         let mut expected = [0u8; 8];
@@ -3444,29 +3466,36 @@ mod unique_filter_tests {
 
     #[test]
     fn extract_into_filter_signed_pk_col_uses_native_key() {
-        // Single signed I64 PK. The OPK bytes at rest are sign-bit-flipped, so
-        // `get_pk` (OPK-widened) differs from the native value. The extraction
-        // must build the span from the *native* key (`pk_native_key`) re-encoded
-        // at the promoted U64 index type — feeding the at-rest OPK value would
-        // double-flip and seek a wrong key, hiding genuine duplicates.
+        // Single signed I64 PK indexed by itself. Its leading index key now
+        // promotes to a *signed* I64 (order-preserving), so the extracted span is
+        // the I64-OPK (sign-bit-flipped) of the NATIVE value — for a self-indexed
+        // I64 PK that equals the source's at-rest OPK bytes, since the source type
+        // already matches the index type. The extraction must build the span from
+        // the *native* key (`pk_native_key`) re-encoded at the promoted index type
+        // — feeding the OPK-widened `get_pk` value would double-flip and seek a
+        // wrong key, hiding genuine duplicates.
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::I64, 0)], &[0]);
         let mut opk = [0u8; 8];
         gnitz_wire::encode_pk_column(&(-5i64).to_le_bytes(), type_code::I64, &mut opk);
         let keys = [PkBuf::from_bytes(&opk)];
         let batch = build_check_batch_pkbuf(&schema, &keys, None);
 
-        // The filter span is the U64-promoted OPK of the NATIVE value (BE of the
-        // two's-complement u64 bits, no extra sign flip).
-        let native_span = PkBuf::from_bytes(&((-5i64) as u64).to_be_bytes());
-        // The I64-at-rest OPK bytes (sign-bit-flipped) are a DIFFERENT span.
-        let at_rest_opk_span = PkBuf::from_bytes(&opk);
-        assert_ne!(native_span, at_rest_opk_span, "signed at-rest OPK differs from native span");
+        // The promoted leading key is I64, so the filter span is the I64-OPK of
+        // the native value (= the at-rest OPK bytes here).
+        let promoted_span = PkBuf::from_bytes(&opk);
+        // The old U64-promotion image (BE of the two's-complement u64 bits, no
+        // sign flip) is a DIFFERENT, non-order-preserving span the extractor must
+        // NOT hold.
+        let unsigned_span = PkBuf::from_bytes(&((-5i64) as u64).to_be_bytes());
+        assert_ne!(promoted_span, unsigned_span,
+            "signed I64 OPK (sign-flipped) differs from the unsigned image");
 
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
-        assert!(filter.values.contains(&native_span), "filter holds the native-value span");
-        assert!(!filter.values.contains(&at_rest_opk_span),
-            "must not hold the sign-flipped at-rest OPK span");
+        assert!(filter.values.contains(&promoted_span),
+            "filter holds the I64-promoted native span");
+        assert!(!filter.values.contains(&unsigned_span),
+            "must not hold the non-order-preserving unsigned image");
     }
 
     #[test]

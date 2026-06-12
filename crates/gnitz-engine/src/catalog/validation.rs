@@ -45,12 +45,13 @@ impl CatalogEngine {
             entry.schema.columns[col.fk_col_idx as usize].type_code
         };
 
-        // Promote BOTH sides before comparing. `get_index_key_type` maps signed
-        // ints to their unsigned index-key code (I64→U64) and is idempotent on
-        // already-unsigned codes, so an I64 child column referencing an I64
-        // parent column compares equal — as does the legacy U64-vs-U64 case.
-        // Comparing the promoted child against the parent's raw type_code would
-        // wrongly reject identical-type FKs once PKs are stored as signed I64.
+        // Promote BOTH sides before comparing. `get_index_key_type` maps each
+        // ≤8-byte int to its index-key code (signed I8..I64 → I64, unsigned
+        // U8..U64 → U64) and is idempotent on the already-promoted widths, so an
+        // I64 child column referencing an I64 parent column compares equal — as
+        // does the U64-vs-U64 case. Comparing the promoted child against the
+        // parent's raw type_code would wrongly reject identical-type FKs once a
+        // narrower signed column promotes to I64.
         let promoted = get_index_key_type(col.type_code)?;
         let target_promoted = get_index_key_type(target_type)?;
         if promoted != target_promoted {
@@ -124,12 +125,13 @@ impl CatalogEngine {
                     target_entry.handle.has_pk(fk_key)
                 } else {
                     let ks = idx_key_size.unwrap();
-                    // OPK-encode the native FK value into the leading index key
-                    // column; the index PK is OPK-at-rest, so prefix-match the
-                    // whole leading column (idx_key_size), not a source-width LE
+                    // OPK-encode the native FK value (sign-extending from the
+                    // child column's width) into the leading index key column;
+                    // the index PK is OPK-at-rest, so prefix-match the whole
+                    // leading column (idx_key_size), not a source-width LE
                     // prefix.
                     let opk = crate::schema::index_opk_prefix(
-                        fk_key, idx_key_type.unwrap(), ks);
+                        fk_key, loc.type_code(), idx_key_type.unwrap());
                     idx_cursor.as_mut().unwrap().cursor
                         .seek_first_positive_with_prefix(&opk[..ks])
                 };

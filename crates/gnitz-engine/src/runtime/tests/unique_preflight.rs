@@ -35,6 +35,14 @@ fn span_u128(v: u128) -> PkBuf {
     PkBuf::from_bytes(&v.to_be_bytes())
 }
 
+/// OPK leading-key span of a single promoted-I64 value (order-preserving
+/// big-endian with the sign bit flipped) — what an I64 indexed column projects.
+fn span_i64(v: i64) -> PkBuf {
+    let mut b = [0u8; 8];
+    gnitz_wire::encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut b);
+    PkBuf::from_bytes(&b)
+}
+
 /// Frame schema of a single-U128-span pre-flight reply (one U128 PK column),
 /// so the round-trip tests ship a 16-byte PK span per row.
 fn u128_frame_schema() -> SchemaDescriptor {
@@ -271,17 +279,15 @@ fn preflight_signed_payload_projection_roundtrip() {
 
     let keys = project_sorted(&batch, &schema, &[1]);
 
-    // Expected spans: U64-promoted OPK (big-endian of the two's-complement u64
-    // bits) of the four non-NULL, non-retracted values, sorted byte-lex.
+    // Expected spans: the signed I64-promoted OPK of the four non-NULL,
+    // non-retracted values, sorted byte-lex. The signed promotion makes
+    // negatives sort below non-negatives — i64::MIN first, 300 last.
     let expected: Vec<PkBuf> = {
-        let mut v: Vec<PkBuf> = [-5i64, 300, -5, i64::MIN]
-            .iter()
-            .map(|&x| PkBuf::from_bytes(&(x as u64).to_be_bytes()))
-            .collect();
+        let mut v: Vec<PkBuf> = [-5i64, 300, -5, i64::MIN].iter().map(|&x| span_i64(x)).collect();
         v.sort_unstable();
         v
     };
-    assert_eq!(keys, expected, "projection must keep two's-complement bits, OPK-encoded");
+    assert_eq!(keys, expected, "projection must be the order-preserving signed I64 OPK");
 
     let frame_schema = unique_preflight_wire_schema(&make_index_schema(&[1], &schema).unwrap(), 1);
     with_test_ring(|writer, receiver| {
@@ -290,7 +296,7 @@ fn preflight_signed_payload_projection_roundtrip() {
         assert_eq!(got, keys);
         // The duplicate pair is adjacent in the sorted stream — exactly what the
         // master's prev == popped check rejects.
-        let dup = PkBuf::from_bytes(&((-5i64) as u64).to_be_bytes());
+        let dup = span_i64(-5);
         assert_eq!(got.iter().filter(|&&k| k == dup).count(), 2);
     });
 }
@@ -321,8 +327,8 @@ fn preflight_weight2_row_emits_adjacent_pair() {
     }
 
     let keys = project_sorted(&batch, &schema, &[1]);
-    let s = |v: i64| PkBuf::from_bytes(&(v as u64).to_be_bytes());
-    assert_eq!(keys, vec![s(7), s(9), s(9), s(11)], "weight-2 row must emit its span twice");
+    assert_eq!(keys, vec![span_i64(7), span_i64(9), span_i64(9), span_i64(11)],
+        "weight-2 row must emit its span twice");
 
     let mut acc = PreflightAccumulator::new(1000);
     assert!(!offer_all(&mut acc, &keys), "the adjacent pair must flip the verdict");

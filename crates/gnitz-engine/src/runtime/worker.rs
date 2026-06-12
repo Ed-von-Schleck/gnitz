@@ -1576,9 +1576,9 @@ enum DispatchResult {
 
 /// Keys per W2M frame for the unique pre-flight stream. The per-key wire size is
 /// `idx_key_size + 16` (the OPK leading-key span + 8 B weight + 8 B null word).
-/// The span is variable-width now: a single ≤8-byte column promotes to a U64 (8
-/// B) span — `PREFLIGHT_MIN_KEY_BYTES` below — so the *narrowest* frame is the
-/// binding case, where the most frames fit in a ring. A composite span can reach
+/// The span is variable-width now: a single ≤8-byte column promotes to an 8-byte
+/// (U64/I64) span — `PREFLIGHT_MIN_KEY_BYTES` below — so the *narrowest* frame is
+/// the binding case, where the most frames fit in a ring. A composite span can reach
 /// `MAX_PK_BYTES` (80 B) → ~96 B/key, still far under `MAX_W2M_MSG` (256 MiB) at
 /// this key count.
 ///
@@ -1590,17 +1590,19 @@ enum DispatchResult {
 /// narrower, so the count is raised so the narrowest frame still clears the bound.
 const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 20;
 
-/// Smallest possible per-key wire size: an 8-byte promoted span (the narrowest a
-/// unique index key can be — every ≤8-byte integer promotes to U64) + 8 B weight
-/// + 8 B null word. Drives the in-flight-slot bound below for the narrowest frame.
-const PREFLIGHT_MIN_KEY_BYTES: usize = 8 + 8 + 8;
-
-const _: () = assert!(
-    w2m_ring::W2M_REGION_SIZE / (PREFLIGHT_MIN_KEY_BYTES * UNIQUE_PREFLIGHT_KEYS_PER_FRAME + 8)
-        < crate::runtime::w2m::W2M_MAX_IN_FLIGHT,
-    "unique pre-flight frames must be large enough that a full W2M ring holds \
-     fewer frames than the in-flight slots InFlightState can track",
-);
+const _: () = {
+    // Smallest possible per-key wire size: an 8-byte promoted span (the narrowest
+    // a unique index key can be — every ≤8-byte integer promotes to an 8-byte
+    // U64/I64 key) + 8 B weight + 8 B null word — the binding case for the
+    // in-flight-slot bound.
+    const PREFLIGHT_MIN_KEY_BYTES: usize = 8 + 8 + 8;
+    assert!(
+        w2m_ring::W2M_REGION_SIZE / (PREFLIGHT_MIN_KEY_BYTES * UNIQUE_PREFLIGHT_KEYS_PER_FRAME + 8)
+            < crate::runtime::w2m::W2M_MAX_IN_FLIGHT,
+        "unique pre-flight frames must be large enough that a full W2M ring holds \
+         fewer frames than the in-flight slots InFlightState can track",
+    );
+};
 
 /// Frame size for the unique pre-flight stream. Debug builds may shrink it
 /// via GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME so tests exercise multi-frame

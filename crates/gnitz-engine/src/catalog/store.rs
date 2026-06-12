@@ -931,12 +931,14 @@ impl CatalogEngine {
         let src_pk_stride = entry.schema.pk_stride() as usize;
         let idx_key_size = ic.index_schema.leading_key_size(col_indices.len());
 
-        // OPK-encode each supplied native into its slot. The index PK region is
-        // OPK-at-rest, so the prefix must be order-preserving to match stored
-        // entries (`batch_project_index` encodes identically).
-        let (opk, prefix_len) = crate::schema::index_opk_prefix_composite(
-            natives, &ic.index_schema.columns[..natives.len()],
-        );
+        // OPK-encode the supplied natives into a leading-key prefix. The spec
+        // pairs each source column (the sign-extension width) with its promoted
+        // index column; the index PK region is OPK-at-rest, so the prefix is
+        // order-preserving and matches stored entries (`batch_project_index`
+        // encodes through the same spec).
+        let spec = crate::schema::IndexKeySpec::new(
+            &col_indices[..natives.len()], &entry.schema, &ic.index_schema);
+        let (opk, prefix_len) = spec.seek_prefix(natives);
         let opk_prefix = &opk[..prefix_len];
 
         let idx_table = ic.table_mut();

@@ -695,7 +695,9 @@ fn test_seek_by_index_negative_i64() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
-    // Index stores I64 values as their raw bit pattern (2's complement).
+    // The seek key is the value's native bit pattern (2's complement); the index
+    // stores it order-preserving (signed I64 OPK) and the seek re-encodes
+    // identically, so an equality lookup finds it regardless of sign.
     let result = engine.seek_by_index(tid, &[1], &[(-1i64) as u64 as u128]).unwrap();
     assert!(result.is_some(), "index must find row with score=-1");
     assert_eq!(result.unwrap().get_pk(0), 2);
@@ -730,7 +732,9 @@ fn test_seek_by_index_negative_i32() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
-    // I32 values are zero-extended to u64 in the index (NOT sign-extended).
+    // The seek key is the I32 value's zero-extended native bit pattern; projection
+    // and seek both sign-extend it from I32 into the promoted signed I64 index
+    // column, so the equality lookup matches.
     let result = engine.seek_by_index(tid, &[1], &[(-1i32) as u32 as u128]).unwrap();
     assert!(result.is_some(), "index must find row with score=-1");
     assert_eq!(result.unwrap().get_pk(0), 1);
@@ -738,6 +742,10 @@ fn test_seek_by_index_negative_i32() {
     let result2 = engine.seek_by_index(tid, &[1], &[(-100i32) as u32 as u128]).unwrap();
     assert!(result2.is_some(), "index must find row with score=-100");
     assert_eq!(result2.unwrap().get_pk(0), 2);
+
+    let result3 = engine.seek_by_index(tid, &[1], &[42u128]).unwrap();
+    assert!(result3.is_some(), "index must still find positive values");
+    assert_eq!(result3.unwrap().get_pk(0), 3);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -799,11 +807,12 @@ fn test_seek_by_index_u16_column() {
 
 #[test]
 fn index_native_key_payload_matches_pk_signed() {
-    // The FK/index key space is NATIVE (zero-extended bits, signedness erased
-    // by the U64 promotion). A value derived from a native-LE payload column
-    // must equal the value decoded from the same value stored OPK in a PK
+    // The FK/index key space is NATIVE (zero-extended bits, signedness carried in
+    // the low source-width bytes only). A value derived from a native-LE payload
+    // column must equal the value decoded from the same value stored OPK in a PK
     // column, so FK existence checks agree. has_pk/seek_by_index then re-encode
-    // this native value to OPK to hit the order-preserving index.
+    // this native value to OPK (sign-extending from the source width) to hit the
+    // order-preserving index.
     use crate::schema::{pk_native_key, payload_native_key};
     use gnitz_wire::encode_pk_column;
 
@@ -828,37 +837,6 @@ fn index_native_key_payload_matches_pk_signed() {
     assert_eq!(payload_native_key(&(-1i32).to_le_bytes(), 0, 4, type_code::I32), 0xFFFF_FFFFu128);
     assert_eq!(payload_native_key(&(-1i16).to_le_bytes(), 0, 2, type_code::I16), 0xFFFFu128);
     assert_eq!(payload_native_key(&[0xFFu8], 0, 1, type_code::I8), 0xFFu128);
-}
-
-#[test]
-fn test_seek_by_index_i32_negative_value() {
-    let dir = temp_dir("catalog_seekidx_i32_neg");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), i32_col_def("temp")];
-    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
-    engine.create_index("public.t", &["temp"], false).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
-
-    // Insert a row with a negative I32 value
-    let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1); bb.put_u32((-5i32) as u32); bb.end_row();
-    bb.begin_row(2u128, 1); bb.put_u32(10u32); bb.end_row();
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.flush_family(tid).unwrap();
-
-    // Seek negative value: key = zero-extended u32 representation of -5
-    let neg5_key = (-5i32) as u32 as u128;
-    let result = engine.seek_by_index(tid, &[1], &[neg5_key]).unwrap();
-    assert!(result.is_some(), "I32 negative index lookup must find the row");
-    assert_eq!(result.unwrap().get_pk(0), 1);
-
-    // Seek positive value
-    let result2 = engine.seek_by_index(tid, &[1], &[10u128]).unwrap();
-    assert!(result2.is_some());
-    assert_eq!(result2.unwrap().get_pk(0), 2);
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2055,12 +2033,12 @@ fn test_make_index_schema_over_limit_errs_not_panics() {
 }
 
 #[test]
-fn test_index_opk_prefix_composite_matches_projection() {
-    // The seek encoder (index_opk_prefix_composite) and the projection encoder
+fn test_seek_prefix_matches_projection() {
+    // The seek encoder (IndexKeySpec::seek_prefix) and the projection encoder
     // (batch_project_index) must produce byte-identical leading-key bytes for the
     // same native values — that equality is what makes every composite seek find
     // the projected entry.
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code as tc};
+    use crate::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor, type_code as tc};
     let src = SchemaDescriptor::new(
         &[SchemaColumn::new(tc::U64, 0), SchemaColumn::new(tc::I32, 0), SchemaColumn::new(tc::U64, 0)],
         &[0],
@@ -2076,10 +2054,132 @@ fn test_index_opk_prefix_composite_matches_projection() {
     let key_size: usize = (0..2).map(|i| idx.columns[i].size() as usize).sum();
     let proj_key = &projected.get_pk_bytes(0)[..key_size];
 
-    let (opk, plen) = crate::schema::index_opk_prefix_composite(
-        &[(-5i32) as u32 as u128, 42u128], &idx.columns[..2],
-    );
+    let spec = IndexKeySpec::new(&[1, 2], &src, &idx);
+    let (opk, plen) = spec.seek_prefix(&[(-5i32) as u32 as u128, 42u128]);
     assert_eq!(plen, key_size);
     assert_eq!(&opk[..plen], proj_key,
                "seek prefix bytes must equal projected leading-key bytes");
+}
+
+// ── Signed secondary-index ordering (order-preserving signed leading key) ────
+
+/// Zero-extended native u128 (two's-complement low `sz` bytes) of a value — the
+/// exact form `payload_native_key`/`pk_native_key` produce.
+fn native_u128_at(v: i64, sz: usize) -> u128 {
+    let mask = if sz >= 16 { u128::MAX } else { (1u128 << (sz * 8)) - 1 };
+    (v as u64 as u128) & mask
+}
+
+/// Project a single value (zero-extended native `u128`) through a one-column
+/// secondary index — `src` column 1 indexed by `idx` — returning the OPK
+/// leading-key span the write path (`IndexKeySpec::write_span` via
+/// `batch_project_index`) stores.
+fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u128) -> Vec<u8> {
+    let mut bb = BatchBuilder::new(src);
+    bb.begin_row(1u128, 1);
+    match src.columns[1].size() {
+        1 => bb.put_u8(native as u8),
+        2 => bb.put_u16(native as u16),
+        4 => bb.put_u32(native as u32),
+        8 => bb.put_u64(native as u64),
+        16 => bb.put_u128(native),
+        sz => unreachable!("unexpected column width {sz}"),
+    }
+    bb.end_row();
+    let projected = crate::dag::DagEngine::batch_project_index(&bb.finish(), &[1], &src, idx);
+    let key_size = idx.columns[0].size() as usize;
+    projected.get_pk_bytes(0)[..key_size].to_vec()
+}
+
+#[test]
+fn signed_index_width_ladder_promotes_to_i64_and_orders() {
+    // Every signed width promotes to the 8-byte signed I64 index key (so the
+    // record stride is unchanged) and produces an ORDER-PRESERVING leading key
+    // at its own width — the `encode_pk_column_promoted` sign-extension puts
+    // negatives below non-negatives, the invariant a future range / ordered
+    // index scan relies on. Fails under the old U64 promotion (negatives sorted
+    // AFTER non-negatives); passes now.
+    use crate::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
+    for &(t, sz) in &[(tc::I8, 1usize), (tc::I16, 2), (tc::I32, 4), (tc::I64, 8)] {
+        let src = SchemaDescriptor::new(
+            &[SchemaColumn::new(tc::U64, 0), SchemaColumn::new(t, 0)], &[0]);
+        let idx = make_index_schema(&[1], &src).unwrap();
+        assert_eq!(idx.columns[0].type_code, tc::I64, "tc={t} must promote to I64");
+        assert_eq!(idx.columns[0].size(), 8, "promoted signed key keeps the 8-byte width");
+
+        let lo = if sz == 8 { i64::MIN } else { -(1i64 << (sz * 8 - 1)) };
+        let hi = if sz == 8 { i64::MAX } else { (1i64 << (sz * 8 - 1)) - 1 };
+        let values = [lo, -3, -1, 0, 1, hi];
+        let spans: Vec<Vec<u8>> = values.iter()
+            .map(|&v| project_leading_span(src, &idx, native_u128_at(v, sz)))
+            .collect();
+        for w in spans.windows(2) {
+            assert!(w[0] < w[1],
+                "tc={t} spans must sort numerically: {:?} !< {:?}", w[0], w[1]);
+        }
+    }
+}
+
+#[test]
+fn write_span_matches_seek_prefix_across_type_ladder() {
+    // Write/seek byte-equality: the projected leading-key span (write side) must
+    // byte-equal `index_opk_prefix` (seek side) for the same value, at every
+    // type — the equality a partial application of the signed-encoding change
+    // would break (and which keeps `WHERE col = v` seeks correct).
+    use crate::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
+    let cases: &[(u8, usize, &[i64])] = &[
+        (tc::I8,  1, &[-128, -1, 0, 1, 127]),
+        (tc::I16, 2, &[-32768, -1, 0, 1, 32767]),
+        (tc::I32, 4, &[i32::MIN as i64, -42, -1, 0, 1, 42, i32::MAX as i64]),
+        (tc::I64, 8, &[i64::MIN, -42, -1, 0, 1, 42, i64::MAX]),
+        (tc::U8,  1, &[0, 1, 200, 255]),
+        (tc::U32, 4, &[0, 1, 42, u32::MAX as i64]),
+        (tc::U64, 8, &[0, 1, 42, -1 /* = u64::MAX bits */]),
+        (tc::U128, 16, &[0, 1, 42, -1]),
+    ];
+    for &(t, sz, values) in cases {
+        let src = SchemaDescriptor::new(
+            &[SchemaColumn::new(tc::U64, 0), SchemaColumn::new(t, 0)], &[0]);
+        let idx = make_index_schema(&[1], &src).unwrap();
+        let idx_type = idx.columns[0].type_code;
+        let idx_size = idx.columns[0].size() as usize;
+        for &v in values {
+            let native = native_u128_at(v, sz);
+            let write_span = project_leading_span(src, &idx, native);
+            let seek = crate::schema::index_opk_prefix(native, t, idx_type);
+            assert_eq!(&write_span[..], &seek[..idx_size],
+                "write/seek byte mismatch for tc={t} v={v}");
+        }
+    }
+}
+
+#[test]
+fn composite_index_signed_leading_unsigned_tiebreak_orders() {
+    // Index on (signed i32, unsigned u64): the leading signed column orders
+    // numerically (negatives below non-negatives) and the unsigned column breaks
+    // ties. Asserts the full composite span sorts in tuple-numeric order.
+    use crate::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
+    let src = SchemaDescriptor::new(
+        &[SchemaColumn::new(tc::U64, 0), SchemaColumn::new(tc::I32, 0),
+          SchemaColumn::new(tc::U64, 0)],
+        &[0]);
+    let idx = make_index_schema(&[1, 2], &src).unwrap();
+    let key_size: usize = (0..2).map(|i| idx.columns[i].size() as usize).sum();
+    // (a, b) in strictly ascending numeric order — including same-`a` tie pairs.
+    let rows: &[(i32, u64)] = &[
+        (i32::MIN, 5), (-1, 0), (-1, 9), (0, 0), (0, 1), (1, 0), (i32::MAX, 7),
+    ];
+    let mut spans: Vec<Vec<u8>> = Vec::new();
+    for (i, &(a, b)) in rows.iter().enumerate() {
+        let mut bb = BatchBuilder::new(src);
+        bb.begin_row((i as u128) + 1, 1);
+        bb.put_u32(a as u32); bb.put_u64(b);
+        bb.end_row();
+        let projected = crate::dag::DagEngine::batch_project_index(&bb.finish(), &[1, 2], &src, &idx);
+        spans.push(projected.get_pk_bytes(0)[..key_size].to_vec());
+    }
+    for w in spans.windows(2) {
+        assert!(w[0] < w[1],
+            "composite (signed, unsigned) spans must sort in tuple-numeric order");
+    }
 }
