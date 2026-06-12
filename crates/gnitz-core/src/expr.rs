@@ -48,9 +48,9 @@ impl std::fmt::Display for ExprDecodeErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExprDecodeErr::BadMagic         => write!(f, "ExprProgram magic mismatch"),
-            ExprDecodeErr::BadVersion(v)    => write!(f, "ExprProgram unknown version {}", v),
+            ExprDecodeErr::BadVersion(v)    => write!(f, "ExprProgram unknown version {v}"),
             ExprDecodeErr::NonZeroReserved  => write!(f, "ExprProgram reserved bytes must be zero"),
-            ExprDecodeErr::UnalignedCode(n) => write!(f, "ExprProgram code length {} not a multiple of 4", n),
+            ExprDecodeErr::UnalignedCode(n) => write!(f, "ExprProgram code length {n} not a multiple of 4"),
             ExprDecodeErr::Truncated        => write!(f, "ExprProgram blob truncated"),
         }
     }

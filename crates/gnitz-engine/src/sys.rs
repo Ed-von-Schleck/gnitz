@@ -199,17 +199,17 @@ mod tests {
     fn test_raise_fd_limit() {
         // Should succeed (may be no-op if already ≥ 1024)
         let r = raise_fd_limit(1024);
-        assert!(r >= 1024, "expected ≥1024, got {}", r);
+        assert!(r >= 1024, "expected ≥1024, got {r}");
     }
 
     #[test]
     fn test_server_create() {
         let path = "/tmp/gnitz_test_sys_server_create.sock";
         let fd = server_create(path);
-        assert!(fd >= 0, "server_create failed: {}", fd);
+        assert!(fd >= 0, "server_create failed: {fd}");
         unsafe {
             libc::close(fd);
-            libc::unlink(format!("{}\0", path).as_ptr() as *const libc::c_char);
+            libc::unlink(format!("{path}\0").as_ptr() as *const libc::c_char);
         }
     }
 
@@ -219,20 +219,20 @@ mod tests {
         let long_path = "/tmp/".to_string() + &"a".repeat(110);
         assert!(long_path.len() >= 108);
         let fd = server_create(&long_path);
-        assert!(fd < 0, "expected error for overlong path, got fd={}", fd);
+        assert!(fd < 0, "expected error for overlong path, got fd={fd}");
     }
 
     #[test]
     fn test_server_create_is_nonblocking() {
         let path = "/tmp/gnitz_test_sys_server_nonblocking.sock";
         let fd = server_create(path);
-        assert!(fd >= 0, "server_create failed: {}", fd);
+        assert!(fd >= 0, "server_create failed: {fd}");
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
         unsafe {
             libc::close(fd);
-            libc::unlink(format!("{}\0", path).as_ptr() as *const libc::c_char);
+            libc::unlink(format!("{path}\0").as_ptr() as *const libc::c_char);
         }
-        assert!(flags >= 0, "F_GETFL failed: {}", flags);
-        assert!(flags & libc::O_NONBLOCK != 0, "socket is not non-blocking, flags={:#o}", flags);
+        assert!(flags >= 0, "F_GETFL failed: {flags}");
+        assert!(flags & libc::O_NONBLOCK != 0, "socket is not non-blocking, flags={flags:#o}");
     }
 }

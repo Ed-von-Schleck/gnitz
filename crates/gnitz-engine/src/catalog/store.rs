@@ -145,12 +145,12 @@ impl CatalogEngine {
     pub fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
             let family = SysFamily::from_id(table_id)
-                .ok_or_else(|| format!("Unknown system family {}", table_id))?;
+                .ok_or_else(|| format!("Unknown system family {table_id}"))?;
             self.submit(family, batch.clone())
         } else {
             let rc = self.dag.ingest_by_ref(table_id, batch);
             if rc < 0 {
-                Err(format!("ingest_to_family failed for table_id={} rc={}", table_id, rc))
+                Err(format!("ingest_to_family failed for table_id={table_id} rc={rc}"))
             } else {
                 Ok(())
             }
@@ -188,11 +188,11 @@ impl CatalogEngine {
     /// Also resolves `sid`, erroring if the schema does not exist.
     fn precheck_qname_unique(&self, sid: i64, name: &str, self_id: i64) -> Result<(), String> {
         let schema_name = self.caches.schema_by_id.get(&sid)
-            .ok_or_else(|| format!("Schema with ID {} does not exist", sid))?;
-        let qualified = format!("{}.{}", schema_name, name);
+            .ok_or_else(|| format!("Schema with ID {sid} does not exist"))?;
+        let qualified = format!("{schema_name}.{name}");
         if let Some(&existing) = self.caches.entity_by_qname.get(&qualified) {
             if existing != self_id {
-                return Err(format!("Table or view already exists: {}", qualified));
+                return Err(format!("Table or view already exists: {qualified}"));
             }
         }
         Ok(())
@@ -246,7 +246,7 @@ impl CatalogEngine {
                 SCHEMA_TAB_ID => {
                     let name = self.read_batch_string(batch, i, 0);
                     if self.caches.schema_by_name.contains_key(&name) {
-                        return Err(format!("Schema already exists: {}", name));
+                        return Err(format!("Schema already exists: {name}"));
                     }
                 }
                 TABLE_TAB_ID => {
@@ -261,10 +261,9 @@ impl CatalogEngine {
 
                     if col_defs.is_empty() {
                         return Err(format!(
-                            "catalog invariant violated: table '{}' (tid={}) registered \
+                            "catalog invariant violated: table '{name}' (tid={tid}) registered \
                              before its column records. COL_TAB writes must precede \
-                             TABLE_TAB writes (see hooks.rs dispatch doc).",
-                            name, tid));
+                             TABLE_TAB writes (see hooks.rs dispatch doc)."));
                     }
                     validate_pk_cols(&col_defs, &pk)?;
                     if col_defs.len() > crate::schema::MAX_COLUMNS {
@@ -293,10 +292,9 @@ impl CatalogEngine {
                     let col_count = self.scan_column_defs(vid, true)?.len();
                     if col_count == 0 {
                         return Err(format!(
-                            "catalog invariant violated: view '{}' (vid={}) registered \
+                            "catalog invariant violated: view '{name}' (vid={vid}) registered \
                              before its column records. COL_TAB writes must precede \
-                             VIEW_TAB writes (see hooks.rs dispatch doc).",
-                            name, vid));
+                             VIEW_TAB writes (see hooks.rs dispatch doc)."));
                     }
                     // Reject an over-wide view here — before apply_entity_by_qname
                     // mutates the caches — so a rejected DDL leaves clean state,
@@ -324,7 +322,7 @@ impl CatalogEngine {
                     }
 
                     let entry = self.dag.tables.get(&owner_id)
-                        .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
+                        .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
 
                     // Only base tables can own a secondary index: index
                     // projection runs only on the base-table DML paths
@@ -337,7 +335,7 @@ impl CatalogEngine {
                     // broadcast, and `hook_index_register` re-checks for the
                     // paths that skip precheck (boot replay, worker ddl_sync).
                     if !entry.kind.is_base_table() {
-                        return Err(format!("Index: owner {} is not a base table", owner_id));
+                        return Err(format!("Index: owner {owner_id} is not a base table"));
                     }
 
                     // Bounds, per-column eligibility (STRING/BLOB/float), and
@@ -355,7 +353,7 @@ impl CatalogEngine {
                     let idx_id = batch.get_pk(i) as i64;
                     if let Some(&existing) = self.caches.index_by_name.get(&index_name) {
                         if existing != idx_id {
-                            return Err(format!("Index already exists: {}", index_name));
+                            return Err(format!("Index already exists: {index_name}"));
                         }
                     }
                 }
@@ -450,7 +448,7 @@ impl CatalogEngine {
                     let (sn, tn) = self.caches.entity_by_id.get(&r.child_tid)
                         .cloned().unwrap_or_default();
                     return Err(format!(
-                        "Integrity violation: table referenced by '{}.{}'", sn, tn
+                        "Integrity violation: table referenced by '{sn}.{tn}'"
                     ));
                 }
             }
@@ -478,7 +476,7 @@ impl CatalogEngine {
                     if still_active {
                         let (sn, tn) = self.caches.entity_by_id.get(&id)
                             .cloned().unwrap_or_default();
-                        return Err(format!("View dependency: entity '{}.{}'", sn, tn));
+                        return Err(format!("View dependency: entity '{sn}.{tn}'"));
                     }
                 }
             }
@@ -608,7 +606,7 @@ impl CatalogEngine {
         for schema_name in self.caches.schema_by_id.values() {
             let schema_dir = schema_dir(&self.base_dir, schema_name);
             for name in subdir_names(&schema_dir) {
-                let full = format!("{}/{}", schema_dir, name);
+                let full = format!("{schema_dir}/{name}");
 
                 if live_tables.contains(full.as_str()) {
                     // Live table/view: sweep orphaned `idx_<id>` sub-dirs left by
@@ -618,7 +616,7 @@ impl CatalogEngine {
                         if !is_index_dir_name(&idx_name) {
                             continue;
                         }
-                        let idx_full = format!("{}/{}", full, idx_name);
+                        let idx_full = format!("{full}/{idx_name}");
                         if live_indices.contains(&idx_full) {
                             continue;
                         }
@@ -741,7 +739,7 @@ impl CatalogEngine {
             for (tid, mut batch) in rollback_list {
                 Self::negate_batch_in_place(&mut batch);
                 let family = SysFamily::from_id(tid)
-                    .ok_or_else(|| format!("rollback: unknown system family {}", tid))?;
+                    .ok_or_else(|| format!("rollback: unknown system family {tid}"))?;
                 s.submit_local(family, batch)?;
             }
             Ok(())
@@ -775,11 +773,11 @@ impl CatalogEngine {
         }
         let (rc, effective_opt) = self.dag.ingest_returning_effective(table_id, batch);
         if rc < 0 {
-            return Err(format!("ingest failed for table_id={} rc={}", table_id, rc));
+            return Err(format!("ingest failed for table_id={table_id} rc={rc}"));
         }
         match effective_opt {
             Some(eff) => Ok(eff),
-            None => Err(format!("ingest returned no effective batch for table_id={}", table_id)),
+            None => Err(format!("ingest returned no effective batch for table_id={table_id}")),
         }
     }
 
@@ -790,7 +788,7 @@ impl CatalogEngine {
         } else {
             self.dag.tables.get(&table_id)
                 .map(|e| e.schema)
-                .ok_or_else(|| format!("Unknown table_id {}", table_id))?
+                .ok_or_else(|| format!("Unknown table_id {table_id}"))?
         };
         // The CIRCUIT_* tables are now SQL-introspectable: every operator's
         // parameter shape is expressible in catalog schema.
@@ -807,7 +805,7 @@ impl CatalogEngine {
         } else {
             self.dag.tables.get(&table_id)
                 .map(|e| e.schema)
-                .ok_or_else(|| format!("Unknown table_id {}", table_id))?
+                .ok_or_else(|| format!("Unknown table_id {table_id}"))?
         };
 
         // Create cursor and seek. The new CircuitNodes/CircuitEdges/
@@ -846,7 +844,7 @@ impl CatalogEngine {
         } else {
             self.dag.tables.get(&table_id)
                 .map(|e| e.schema)
-                .ok_or_else(|| format!("Unknown table_id {}", table_id))?
+                .ok_or_else(|| format!("Unknown table_id {table_id}"))?
         };
 
         let mut cursor = if table_id < FIRST_USER_TABLE_ID {
@@ -892,7 +890,7 @@ impl CatalogEngine {
     ) -> Result<Batch, String> {
         let schema = self.dag.tables.get(&table_id)
             .map(|e| e.schema)
-            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
         let result_schema = project_schema(&schema, project);
         let mut out = Batch::with_schema(result_schema, pks.len());
         let mut cursor = self.dag.tables.get(&table_id).unwrap().handle.open_cursor();
@@ -922,11 +920,11 @@ impl CatalogEngine {
         -> Result<Option<Batch>, String>
     {
         let entry = self.dag.tables.get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
 
         let ic = entry.index_circuits.iter()
             .find(|ic| ic.col_indices.as_slice() == col_indices)
-            .ok_or_else(|| format!("No index on cols {:?} for table {}", col_indices, table_id))?;
+            .ok_or_else(|| format!("No index on cols {col_indices:?} for table {table_id}"))?;
 
         let src_pk_stride = entry.schema.pk_stride() as usize;
         let idx_key_size = ic.index_schema.leading_key_size(col_indices.len());
@@ -983,17 +981,17 @@ impl CatalogEngine {
     pub fn flush_family(&mut self, table_id: i64) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
             if let Some(table) = self.sys_table_mut(table_id) {
-                table.flush().map_err(|e| format!("flush error: {}", e))?;
+                table.flush().map_err(|e| format!("flush error: {e}"))?;
                 // Compact so L0 shards don't accumulate without bound across
                 // DDL-heavy sessions (system catalog tables are scanned on every
                 // boot and DDL op).
-                table.compact_if_needed().map_err(|e| format!("compaction error: {:?}", e))?;
+                table.compact_if_needed().map_err(|e| format!("compaction error: {e:?}"))?;
             }
             Ok(())
         } else {
             let rc = self.dag.flush(table_id);
             if rc < 0 {
-                Err(format!("flush failed for table_id={} rc={}", table_id, rc))
+                Err(format!("flush failed for table_id={table_id} rc={rc}"))
             } else {
                 Ok(())
             }
@@ -1008,8 +1006,8 @@ impl CatalogEngine {
     ) -> Result<Vec<(usize, crate::storage::FlushWork)>, String> {
         if table_id < FIRST_USER_TABLE_ID {
             if let Some(table) = self.sys_table_mut(table_id) {
-                table.flush().map_err(|e| format!("flush error: {}", e))?;
-                table.compact_if_needed().map_err(|e| format!("compaction error: {:?}", e))?;
+                table.flush().map_err(|e| format!("flush error: {e}"))?;
+                table.compact_if_needed().map_err(|e| format!("compaction error: {e:?}"))?;
             }
             Ok(Vec::new())
         } else {
@@ -1042,7 +1040,7 @@ impl CatalogEngine {
         // Hooks have no observable ordering dependency on the storage write.
         self.fire_hooks(family, &batch)?;
         let table = self.sys_table_mut(table_id)
-            .ok_or_else(|| format!("Unknown system table_id {}", table_id))?;
+            .ok_or_else(|| format!("Unknown system table_id {table_id}"))?;
         let _ = table.ingest_owned_batch_memonly(batch);
         Ok(())
     }
@@ -1050,7 +1048,7 @@ impl CatalogEngine {
     /// Raw store ingest: SAL recovery path — no unique_pk, no hooks, no index projection.
     pub fn raw_store_ingest(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         let entry = self.dag.tables.get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
         let _ = entry.handle.ingest_owned_batch(batch);
         Ok(())
     }
@@ -1073,7 +1071,7 @@ impl CatalogEngine {
         }
         let (rc, _effective) = self.dag.ingest_returning_effective(table_id, batch);
         if rc < 0 {
-            return Err(format!("replay_ingest failed for table_id={} rc={}", table_id, rc));
+            return Err(format!("replay_ingest failed for table_id={table_id} rc={rc}"));
         }
         Ok(())
     }
@@ -1440,9 +1438,8 @@ impl CatalogEngine {
                     let actual = (pk & 0x1FF) as i64;
                     if actual != expected {
                         return Err(format!(
-                            "entity (owner_id={}): column records are non-contiguous; \
-                             expected index {}, got {}",
-                            owner_id, expected, actual));
+                            "entity (owner_id={owner_id}): column records are non-contiguous; \
+                             expected index {expected}, got {actual}"));
                     }
                     expected += 1;
                 }
@@ -1612,7 +1609,7 @@ impl CatalogEngine {
 
     #[cfg(test)]
     pub fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<i64> {
-        let qualified = format!("{}.{}", schema_name, table_name);
+        let qualified = format!("{schema_name}.{table_name}");
         self.caches.entity_by_qname.get(&qualified).copied()
     }
 
@@ -1675,7 +1672,7 @@ fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor
     }
     for &p in project {
         debug_assert!(!schema.is_pk_col(p as usize),
-            "project_schema: projected column {} is a PK column", p);
+            "project_schema: projected column {p} is a PK column");
         cols.push(schema.columns[p as usize]);
     }
     SchemaDescriptor::new(&cols, &pk_idx)

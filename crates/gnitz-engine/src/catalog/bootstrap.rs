@@ -8,7 +8,7 @@ impl CatalogEngine {
     pub fn open(base_dir: &str) -> Result<Self, String> {
         ensure_dir(base_dir)?;
 
-        let sys_dir = format!("{}/{}", base_dir, SYS_CATALOG_DIRNAME);
+        let sys_dir = format!("{base_dir}/{SYS_CATALOG_DIRNAME}");
         ensure_dir(&sys_dir)?;
 
         // Create system tables (single-partition; durability derived from the

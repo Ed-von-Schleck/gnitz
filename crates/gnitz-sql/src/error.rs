@@ -12,11 +12,11 @@ pub enum GnitzSqlError {
 impl fmt::Display for GnitzSqlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GnitzSqlError::Parse(e)       => write!(f, "parse error: {}", e),
-            GnitzSqlError::Bind(s)        => write!(f, "bind error: {}", s),
-            GnitzSqlError::Plan(s)        => write!(f, "plan error: {}", s),
-            GnitzSqlError::Exec(e)        => write!(f, "exec error: {}", e),
-            GnitzSqlError::Unsupported(s) => write!(f, "unsupported: {}", s),
+            GnitzSqlError::Parse(e)       => write!(f, "parse error: {e}"),
+            GnitzSqlError::Bind(s)        => write!(f, "bind error: {s}"),
+            GnitzSqlError::Plan(s)        => write!(f, "plan error: {s}"),
+            GnitzSqlError::Exec(e)        => write!(f, "exec error: {e}"),
+            GnitzSqlError::Unsupported(s) => write!(f, "unsupported: {s}"),
         }
     }
 }
@@ -40,13 +40,13 @@ pub fn extract_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<
     name.0.last()
         .and_then(|p| p.as_ident())
         .map(|i| i.value.clone())
-        .ok_or_else(|| GnitzSqlError::Bind(format!("empty name in {}", context)))
+        .ok_or_else(|| GnitzSqlError::Bind(format!("empty name in {context}")))
 }
 
 /// Extract table name from a TableFactor::Table.
 pub fn extract_table_factor_name(tf: &sqlparser::ast::TableFactor, context: &str) -> Result<String, GnitzSqlError> {
     match tf {
         sqlparser::ast::TableFactor::Table { name, .. } => extract_name(name, context),
-        _ => Err(GnitzSqlError::Unsupported(format!("{}: only simple table references supported", context))),
+        _ => Err(GnitzSqlError::Unsupported(format!("{context}: only simple table references supported"))),
     }
 }

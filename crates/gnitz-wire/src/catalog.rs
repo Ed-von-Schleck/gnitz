@@ -91,12 +91,11 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
     }
     if name.as_bytes()[0] == b'_' {
         return Err(format!(
-            "User identifiers cannot start with '_' (reserved for system prefix): {}",
-            name));
+            "User identifiers cannot start with '_' (reserved for system prefix): {name}"));
     }
     for &ch in name.as_bytes() {
         if !is_valid_ident_char(ch) {
-            return Err(format!("Identifier contains invalid characters: {}", name));
+            return Err(format!("Identifier contains invalid characters: {name}"));
         }
     }
     Ok(())

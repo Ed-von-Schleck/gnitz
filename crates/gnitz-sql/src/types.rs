@@ -25,7 +25,7 @@ pub fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlError> {
         DataType::Boolean => Err(GnitzSqlError::Unsupported(
             "BOOLEAN has no gnitz type; use TINYINT(1)".to_string()
         )),
-        _ => Err(GnitzSqlError::Unsupported(format!("unsupported SQL type: {:?}", dt))),
+        _ => Err(GnitzSqlError::Unsupported(format!("unsupported SQL type: {dt:?}"))),
     }
 }
 
@@ -182,13 +182,13 @@ mod tests {
     #[test]
     fn boolean_gives_helpful_error() {
         let msg = err(DataType::Boolean);
-        assert!(msg.contains("TINYINT(1)"), "error should mention TINYINT(1): {}", msg);
+        assert!(msg.contains("TINYINT(1)"), "error should mention TINYINT(1): {msg}");
     }
 
     #[test]
     fn unknown_type_gives_unsupported_error() {
         // Date is not supported
         let msg = err(DataType::Date);
-        assert!(msg.contains("unsupported SQL type"), "unexpected error: {}", msg);
+        assert!(msg.contains("unsupported SQL type"), "unexpected error: {msg}");
     }
 }

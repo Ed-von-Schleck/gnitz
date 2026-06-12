@@ -2007,9 +2007,9 @@ mod tests {
         });
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(50),
-            "timer fired too early: {:?}", elapsed);
+            "timer fired too early: {elapsed:?}");
         assert!(elapsed < Duration::from_millis(500),
-            "timer fired too late: {:?}", elapsed);
+            "timer fired too late: {elapsed:?}");
     }
 
     /// Earlier timer must resolve before a later timer.
@@ -2417,7 +2417,7 @@ mod tests {
         // R_start before W_start, R_end also before W_start (writer waits).
         let r_end_pos = o.iter().position(|&s| s == "R_end").unwrap();
         let w_start_pos = o.iter().position(|&s| s == "W_start").unwrap();
-        assert!(r_end_pos < w_start_pos, "writer must run after reader finishes: {:?}", o);
+        assert!(r_end_pos < w_start_pos, "writer must run after reader finishes: {o:?}");
     }
 
     /// A `LockFuture` dropped while parked (e.g. via `select2`) leaves a
@@ -2717,7 +2717,7 @@ mod tests {
         let r = make_reactor();
         let id = r.submit_fsync(i32::MAX);
         let rc = r.block_on_fsync(id);
-        assert!(rc < 0, "fdatasync on a bogus fd must return rc<0, got {}", rc);
+        assert!(rc < 0, "fdatasync on a bogus fd must return rc<0, got {rc}");
     }
 
     /// `submit_fsync` flushes the SQE to the kernel before returning.
@@ -2979,7 +2979,7 @@ mod tests {
             libc::close(sender);
             assert_eq!(sent as usize, payload_len,
                 "send_buffer must loop on partial CQEs until the full \
-                 payload is sent (got rc={}, expected {})", sent, payload_len);
+                 payload is sent (got rc={sent}, expected {payload_len})");
             assert_eq!(received, payload_len,
                 "receiver must observe every byte — a truncated send_buffer \
                  would leave the client blocked waiting for bytes that never \
@@ -3584,7 +3584,7 @@ mod tests {
         let w_pos  = o.iter().position(|&s| s == "W").expect("W not seen");
         let r2_pos = o.iter().position(|&s| s == "R2").expect("R2 not seen");
         assert!(w_pos < r2_pos,
-            "writer-preference violated: W must precede R2, got {:?}", o);
+            "writer-preference violated: W must precede R2, got {o:?}");
     }
 
     /// WriteFuture::Drop path 3: readers hold the lock, the dropped
@@ -4058,7 +4058,7 @@ mod tests {
                 r.test_route_scan_slot(slot); // discarded (lease gone)
                 read += 1;
             } else if Instant::now() > deadline {
-                panic!("scan lease drop failed to free the ring — writer wedged at {}/{}", read, TOTAL);
+                panic!("scan lease drop failed to free the ring — writer wedged at {read}/{TOTAL}");
             } else {
                 std::thread::sleep(Duration::from_millis(1));
             }

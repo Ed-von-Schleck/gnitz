@@ -331,7 +331,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     let batch = build_idx_tab_row(new_idx_id, tid, 2, orig_name, false);
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
     assert!(result.is_err(),
-        "expected error: index name '{}' already exists", orig_name);
+        "expected error: index name '{orig_name}' already exists");
 
     assert_eq!(
         engine.caches.index_by_name.get(orig_name).copied(),
@@ -376,8 +376,8 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
 
     // Capture the expected index directory before create_index allocates the id.
     let expected_idx_id = engine.next_index_id;
-    let owner_dir = format!("{}/public/leaktest_{}", dir, tid);
-    let idx_dir = format!("{}/idx_{}", owner_dir, expected_idx_id);
+    let owner_dir = format!("{dir}/public/leaktest_{tid}");
+    let idx_dir = format!("{owner_dir}/idx_{expected_idx_id}");
 
     let result = engine.create_index("public.leaktest", &["val"], true);
     assert!(result.is_err(), "unique index with duplicate values must fail");
@@ -388,8 +388,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     // The index directory must be cleaned up (not orphaned on disk).
     assert!(
         !std::path::Path::new(&idx_dir).exists(),
-        "index directory must not leak after failed backfill: {} (not cleaned up before fix)",
-        idx_dir
+        "index directory must not leak after failed backfill: {idx_dir} (not cleaned up before fix)"
     );
     assert!(
         engine.dag.tables.get(&tid).map(|e| e.index_circuits.is_empty()).unwrap_or(true),

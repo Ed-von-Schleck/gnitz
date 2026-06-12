@@ -66,7 +66,7 @@ mod tests {
             bf.add(i as u128);
         }
         for i in 0u64..100 {
-            assert!(bf.may_contain(i as u128), "false negative for key {}", i);
+            assert!(bf.may_contain(i as u128), "false negative for key {i}");
         }
     }
 
@@ -83,7 +83,7 @@ mod tests {
             }
         }
         // 10 bits/key, 7 probes → theoretical ~0.8%. Allow up to 5%.
-        assert!(fp < 50, "FPR too high: {}/1000", fp);
+        assert!(fp < 50, "FPR too high: {fp}/1000");
     }
 
     #[test]
@@ -127,8 +127,7 @@ mod tests {
         for i in 0u64..100 {
             assert!(
                 bf.may_contain(base | i as u128),
-                "false negative for high-bit key {}",
-                i
+                "false negative for high-bit key {i}"
             );
         }
     }
@@ -148,7 +147,7 @@ mod tests {
                 fp += 1;
             }
         }
-        assert!(fp < 10, "too many false positives for low-bit keys: {}/100", fp);
+        assert!(fp < 10, "too many false positives for low-bit keys: {fp}/100");
     }
 
     #[test]
@@ -163,7 +162,7 @@ mod tests {
             bf.add(i as u128);
         }
         for i in 100u64..110 {
-            assert!(bf.may_contain(i as u128), "false negative after reset+readd for key {}", i);
+            assert!(bf.may_contain(i as u128), "false negative after reset+readd for key {i}");
         }
         // Original keys must not reliably appear (zero bits, near-zero FPR expected).
         let mut fp = 0u32;
@@ -172,6 +171,6 @@ mod tests {
                 fp += 1;
             }
         }
-        assert!(fp < 5, "old keys still present after reset: {}/10", fp);
+        assert!(fp < 5, "old keys still present after reset: {fp}/10");
     }
 }

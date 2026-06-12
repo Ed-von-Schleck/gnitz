@@ -144,12 +144,12 @@ impl CatalogEngine {
                 let sid = self.read_batch_u64(batch, i, 0) as i64;
                 let name = self.read_batch_string(batch, i, 1);
                 let schema_name = self.caches.schema_by_id.get(&sid).map_or("", String::as_str);
-                let qualified = format!("{}.{}", schema_name, name);
+                let qualified = format!("{schema_name}.{name}");
                 self.caches.entity_by_qname.insert(qualified, tid);
             } else {
                 // entity_by_id is still present (ENTITY_BY_QNAME fires before ENTITY_BY_ID)
                 if let Some((sn, en)) = self.caches.entity_by_id.get(&tid) {
-                    let qualified = format!("{}.{}", sn, en);
+                    let qualified = format!("{sn}.{en}");
                     self.caches.entity_by_qname.remove(&qualified);
                 }
             }

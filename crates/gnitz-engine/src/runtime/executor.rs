@@ -163,7 +163,7 @@ impl ServerExecutor {
         let reactor = match Reactor::new(256) {
             Ok(r) => Rc::new(r),
             Err(e) => {
-                eprintln!("io_uring init failed: {}", e);
+                eprintln!("io_uring init failed: {e}");
                 return -1;
             }
         };
@@ -350,8 +350,7 @@ async fn worker_watcher(shared: Rc<Shared>) {
         if crashed >= 0 {
             let base_dir = shared.cat().base_dir.clone();
             eprintln!(
-                "Worker {} crashed (log: {}/worker_{}.log), shutting down",
-                crashed, base_dir, crashed,
+                "Worker {crashed} crashed (log: {base_dir}/worker_{crashed}.log), shutting down",
             );
             shared.disp().shutdown_workers();
             shared.reactor.request_shutdown();
@@ -600,7 +599,7 @@ async fn handle_message(
     let (peeked_target_id, peeked_client_id) = match ipc::peek_routing_header(data) {
         Ok(v) => v,
         Err(e) => {
-            let msg = format!("decode error: {}", e);
+            let msg = format!("decode error: {e}");
             send_error(shared, fd, 0, 0, msg.as_bytes()).await;
             return;
         }
@@ -621,7 +620,7 @@ async fn handle_message(
         let ctrl = match ipc::peek_control_block(data) {
             Ok(c) => c,
             Err(e) => {
-                let msg = format!("decode error: {}", e);
+                let msg = format!("decode error: {e}");
                 send_error(shared, fd, 0, 0, msg.as_bytes()).await;
                 return;
             }
@@ -646,7 +645,7 @@ async fn handle_message(
             match ipc::decode_wire_with_hint(data, hint) {
                 Ok(d) => d,
                 Err(e) => {
-                    let msg = format!("decode error: {}", e);
+                    let msg = format!("decode error: {e}");
                     send_error(shared, fd, ctrl.target_id as i64, ctrl.client_id, msg.as_bytes()).await;
                     return;
                 }
@@ -655,7 +654,7 @@ async fn handle_message(
             match ipc::decode_wire(data) {
                 Ok(d) => d,
                 Err(e) => {
-                    let msg = format!("decode error: {}", e);
+                    let msg = format!("decode error: {e}");
                     send_error(shared, fd, 0, 0, msg.as_bytes()).await;
                     return;
                 }
@@ -745,7 +744,7 @@ async fn handle_message(
 
         let _cat = shared.catalog_rwlock.read().await;
         if !shared.cat().has_id(target_id) {
-            let msg = format!("table {} not found", target_id);
+            let msg = format!("table {target_id} not found");
             send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
             return;
         }
@@ -809,7 +808,7 @@ async fn handle_seek(
     target_id: i64, pk: u128, seek_pk_extra: &[u8], client_version: u16,
 ) {
     if !shared.cat().has_id(target_id) {
-        let msg = format!("table {} not found", target_id);
+        let msg = format!("table {target_id} not found");
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
         return;
     }
@@ -838,7 +837,7 @@ async fn handle_seek_by_index(
     client_version: u16,
 ) {
     if !shared.cat().has_id(target_id) {
-        let msg = format!("table {} not found", target_id);
+        let msg = format!("table {target_id} not found");
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
         return;
     }
@@ -853,7 +852,7 @@ async fn handle_seek_by_index(
                 && cols.as_slice().iter().all(|&c| (c as usize) < schema.num_columns());
             if !ok {
                 let msg = format!(
-                    "seek_by_index: invalid column list for table {}", target_id);
+                    "seek_by_index: invalid column list for table {target_id}");
                 send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
                 return;
             }
@@ -908,7 +907,7 @@ async fn handle_seek_by_index(
         }
     } else {
         // System tables never carry secondary indexes.
-        let msg = format!("SEEK_BY_INDEX on system table {} is not supported", target_id);
+        let msg = format!("SEEK_BY_INDEX on system table {target_id} is not supported");
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
     }
 }
@@ -994,7 +993,7 @@ async fn handle_scan(
     }
     let _g = shared.catalog_rwlock.read().await;
     if !shared.cat().has_id(target_id) {
-        let msg = format!("table {} not found", target_id);
+        let msg = format!("table {target_id} not found");
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
         return;
     }

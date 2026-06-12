@@ -133,7 +133,7 @@ fn decode_german_string(st: [u8; 16], blob: &[u8]) -> Result<String, ProtocolErr
     }
     let bytes = gnitz_wire::decode_german_string(&st, blob);
     String::from_utf8(bytes)
-        .map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {}", e)))
+        .map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {e}")))
 }
 
 // ── Region read helpers ───────────────────────────────────────────────────────
@@ -146,7 +146,7 @@ fn read_64bit_region<T: Copy + Default>(
     let expected = count * 8;
     if sz != expected {
         return Err(ProtocolError::DecodeError(format!(
-            "{} region size mismatch: expected {}, got {}", label, expected, sz
+            "{label} region size mismatch: expected {expected}, got {sz}"
         )));
     }
     let src = &data[off..off + expected];
@@ -187,7 +187,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
             TypeCode::String => {
                 let strings = match &batch.columns[ci] {
                     ColData::Strings(v) => v,
-                    _ => panic!("encode_wal_block: expected Strings for String column {}", ci),
+                    _ => panic!("encode_wal_block: expected Strings for String column {ci}"),
                 };
                 let mut col_bytes = Vec::with_capacity(count * 16);
                 for (row, val) in strings.iter().enumerate() {
@@ -203,7 +203,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
             TypeCode::Blob => {
                 let bytes_col = match &batch.columns[ci] {
                     ColData::Bytes(v) => v,
-                    _ => panic!("encode_wal_block: expected Bytes for BLOB column {}", ci),
+                    _ => panic!("encode_wal_block: expected Bytes for BLOB column {ci}"),
                 };
                 let mut col_bytes = Vec::with_capacity(count * 16);
                 for (row, val) in bytes_col.iter().enumerate() {
@@ -219,7 +219,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
             TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
                 let vals = match &batch.columns[ci] {
                     ColData::U128s(v) => v,
-                    _ => panic!("encode_wal_block: expected U128s for U128/UUID/I128 column {}", ci),
+                    _ => panic!("encode_wal_block: expected U128s for U128/UUID/I128 column {ci}"),
                 };
                 let mut col_bytes = Vec::with_capacity(count * 16);
                 for &v in vals {
@@ -234,7 +234,7 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
                 let stride = col.type_code.wire_stride();
                 let fixed = match &batch.columns[ci] {
                     ColData::Fixed(v) => v,
-                    _ => panic!("encode_wal_block: expected Fixed for column {}", ci),
+                    _ => panic!("encode_wal_block: expected Fixed for column {ci}"),
                 };
                 assert_eq!(fixed.len(), count * stride,
                     "col {} Fixed length {} != count*stride {}", ci, fixed.len(), count * stride);
@@ -329,8 +329,7 @@ pub fn decode_wal_block(
 
     if format_ver != WAL_FORMAT_VERSION {
         return Err(ProtocolError::DecodeError(format!(
-            "unsupported WAL format version: expected {}, got {}",
-            WAL_FORMAT_VERSION, format_ver
+            "unsupported WAL format version: expected {WAL_FORMAT_VERSION}, got {format_ver}"
         )));
     }
     if total_size > data.len() {
@@ -349,8 +348,7 @@ pub fn decode_wal_block(
     let expected_num_regions = 3 + schema.num_payload_cols() + 1;
     if num_regions != expected_num_regions {
         return Err(ProtocolError::DecodeError(format!(
-            "WAL block num_regions mismatch: expected {}, got {}",
-            expected_num_regions, num_regions
+            "WAL block num_regions mismatch: expected {expected_num_regions}, got {num_regions}"
         )));
     }
     let pk_stride = schema.pk_stride();
@@ -368,7 +366,7 @@ pub fn decode_wal_block(
         let sz  = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
         if off > total_size || off + sz > total_size {
             return Err(ProtocolError::DecodeError(format!(
-                "WAL region {} out of bounds (off={}, sz={}, total={})", i, off, sz, total_size
+                "WAL region {i} out of bounds (off={off}, sz={sz}, total={total_size})"
             )));
         }
         dir.push((off, sz));
@@ -390,7 +388,7 @@ pub fn decode_wal_block(
     let expected_pk_sz = count * pk_stride;
     if pk_sz != expected_pk_sz {
         return Err(ProtocolError::DecodeError(format!(
-            "pk region size mismatch: expected {}, got {}", expected_pk_sz, pk_sz
+            "pk region size mismatch: expected {expected_pk_sz}, got {pk_sz}"
         )));
     }
     // Gate on PK column count, not stride: single-PK stays on the existing
@@ -405,7 +403,7 @@ pub fn decode_wal_block(
         // schema whose packed PK region exceeds the field width.
         if pk_stride > u8::MAX as usize {
             return Err(ProtocolError::DecodeError(format!(
-                "compound pk_stride {} exceeds 255", pk_stride
+                "compound pk_stride {pk_stride} exceeds 255"
             )));
         }
         let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
@@ -479,8 +477,7 @@ pub fn decode_wal_block(
                 let expected_sz = count * 16;
                 if reg_sz != expected_sz {
                     return Err(ProtocolError::DecodeError(format!(
-                        "String column {} region size mismatch: expected {}, got {}",
-                        ci, expected_sz, reg_sz
+                        "String column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
                     )));
                 }
                 let mut vals: Vec<Option<String>> = Vec::with_capacity(count);
@@ -493,7 +490,7 @@ pub fn decode_wal_block(
                     let struct_start = reg_off + row * 16;
                     if struct_start + 16 > data.len() {
                         return Err(ProtocolError::DecodeError(format!(
-                            "German String struct out of bounds at row {}, col {}", row, ci
+                            "German String struct out of bounds at row {row}, col {ci}"
                         )));
                     }
                     let mut st = [0u8; 16];
@@ -506,8 +503,7 @@ pub fn decode_wal_block(
                 let expected_sz = count * 16;
                 if reg_sz != expected_sz {
                     return Err(ProtocolError::DecodeError(format!(
-                        "Blob column {} region size mismatch: expected {}, got {}",
-                        ci, expected_sz, reg_sz
+                        "Blob column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
                     )));
                 }
                 let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
@@ -520,7 +516,7 @@ pub fn decode_wal_block(
                     let struct_start = reg_off + row * 16;
                     if struct_start + 16 > data.len() {
                         return Err(ProtocolError::DecodeError(format!(
-                            "Blob German struct out of bounds at row {}, col {}", row, ci
+                            "Blob German struct out of bounds at row {row}, col {ci}"
                         )));
                     }
                     let mut st = [0u8; 16];
@@ -546,7 +542,7 @@ pub fn decode_wal_block(
                 let expected_sz = count * 16;
                 if reg_sz != expected_sz {
                     return Err(ProtocolError::DecodeError(format!(
-                        "U128/UUID/I128 column {} region size mismatch: expected {}, got {}", ci, expected_sz, reg_sz
+                        "U128/UUID/I128 column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
                     )));
                 }
                 let mut vals: Vec<u128> = Vec::with_capacity(count);
@@ -566,12 +562,12 @@ pub fn decode_wal_block(
                 let expected_sz = count * stride;
                 if reg_sz != expected_sz {
                     return Err(ProtocolError::DecodeError(format!(
-                        "Fixed column {} region size mismatch: expected {}, got {}", ci, expected_sz, reg_sz
+                        "Fixed column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
                     )));
                 }
                 if reg_off + reg_sz > data.len() {
                     return Err(ProtocolError::DecodeError(format!(
-                        "Fixed column {} region out of bounds", ci
+                        "Fixed column {ci} region out of bounds"
                     )));
                 }
                 columns.push(ColData::Fixed(data[reg_off..reg_off + reg_sz].to_vec()));
@@ -673,9 +669,9 @@ mod tests {
         for s in &["", "a", "abcd", "abcdefghijkl"] {
             let mut blob = Vec::new();
             let st = encode_german_string(s, &mut blob);
-            assert!(blob.is_empty(), "short string '{}' should not use blob", s);
+            assert!(blob.is_empty(), "short string '{s}' should not use blob");
             let decoded = decode_german_string(st, &[]).unwrap();
-            assert_eq!(&decoded, s, "roundtrip failed for '{}'", s);
+            assert_eq!(&decoded, s, "roundtrip failed for '{s}'");
         }
     }
 
@@ -1046,7 +1042,7 @@ mod tests {
             .collect();
         assert_eq!(body.len(), 208);
         let computed = xxh3_64(&body);
-        eprintln!("Rust xxh3_64(body) = 0x{:016X}", computed);
+        eprintln!("Rust xxh3_64(body) = 0x{computed:016X}");
         eprintln!("Expected           = 0x741C9E0BA1D8A9FD");
         assert_eq!(computed, 0x741C9E0BA1D8A9FD_u64,
             "Rust and Python xxh3_64 disagree for same bytes!");

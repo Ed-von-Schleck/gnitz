@@ -46,9 +46,8 @@ fn test_w2m_concurrent_publish_consume_ordered() {
         if let Some(decoded) = receiver.try_read(0) {
             assert_eq!(
                 decoded.control.request_id, next_expected,
-                "msg ordering broke at req_id={}: writer-cross-reader \
+                "msg ordering broke at req_id={next_expected}: writer-cross-reader \
                  or decode-after-release race",
-                next_expected,
             );
             next_expected += 1;
         } else {
@@ -64,7 +63,7 @@ fn test_w2m_concurrent_publish_consume_ordered() {
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
-            "test timed out at req_id={}", next_expected,
+            "test timed out at req_id={next_expected}",
         );
     }
 
@@ -118,11 +117,11 @@ fn test_w2m_concurrent_large_messages_ordered() {
         if let Some(decoded) = receiver.try_read(0) {
             assert_eq!(
                 decoded.control.request_id, next_expected,
-                "large-msg ordering broke at req_id={}", next_expected,
+                "large-msg ordering broke at req_id={next_expected}",
             );
             assert_eq!(
                 decoded.control.error_msg, pad,
-                "payload corrupted at req_id={}", next_expected,
+                "payload corrupted at req_id={next_expected}",
             );
             next_expected += 1;
         } else {
@@ -131,7 +130,7 @@ fn test_w2m_concurrent_large_messages_ordered() {
         let _ = done.load(Ordering::Acquire);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(30),
-            "test timed out at req_id={}", next_expected,
+            "test timed out at req_id={next_expected}",
         );
     }
 

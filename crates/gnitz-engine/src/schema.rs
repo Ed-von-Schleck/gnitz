@@ -1403,7 +1403,7 @@ mod tests {
             assert_eq!(
                 s.pk_stride(),
                 s.columns[s.pk_indices()[0] as usize].size(),
-                "pk_stride mismatch for type_code {}", tc,
+                "pk_stride mismatch for type_code {tc}",
             );
         }
     }

@@ -1352,7 +1352,7 @@ fn emit_node(
                 out_reg_of.insert(nid, in_reg);
                 return;
             }
-            let child_name = format!("_hist_{}_{}", view_id, nid);
+            let child_name = format!("_hist_{view_id}_{nid}");
             let hist_table = match create_child_table(
                 state, view_dir, &child_name, in_reg_schema, view_table_id,
             ) {
@@ -1444,7 +1444,7 @@ fn emit_node(
         gnitz_wire::OpNode::IntegrateTrace => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_reg_schema = reg_schemas[in_reg as usize];
-            let child_name = format!("_int_{}_{}", view_id, nid);
+            let child_name = format!("_int_{view_id}_{nid}");
             match create_child_table(state, view_dir, &child_name, in_reg_schema, view_table_id) {
                 Ok(t) => {
                     let table_idx = owned_tables.len();
@@ -1601,7 +1601,7 @@ fn emit_reduce(
     let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols, &agg_descs);
 
     let trace_table = match create_child_table(
-        state, view_dir, &format!("_reduce_{}_{}", view_id, nid), reduce_out_schema, view_table_id,
+        state, view_dir, &format!("_reduce_{view_id}_{nid}"), reduce_out_schema, view_table_id,
     ) {
         Ok(t) => t,
         Err(_) => { state.emit_failed = true; return; }
@@ -1651,7 +1651,7 @@ fn emit_reduce(
 
     // Name of the trace-input scratch table; reused below to nest the GI under
     // the very same scratch dir so the two paths can't drift apart.
-    let tr_in_name = format!("_reduce_in_{}_{}", view_id, nid);
+    let tr_in_name = format!("_reduce_in_{view_id}_{nid}");
 
     if let Some(&existing) = in_regs.get(&PORT_TRACE) {
         tr_in_reg_id = existing;
@@ -1718,7 +1718,7 @@ fn emit_reduce(
         avi_agg_col_type_code = in_reg_schema.columns[agg_col_idx as usize].type_code;
         avi_agg_col_idx = agg_col_idx;
         avi_group_cols = gcols_u32.clone();
-        let avi_child = format!("_avidx_{}_{}", view_id, nid);
+        let avi_child = format!("_avidx_{view_id}_{nid}");
         if let Ok(av_table) = create_child_table(
             state, view_dir, &avi_child,
             crate::ops::index::make_avi_schema(&in_reg_schema, &gcols_u32),
@@ -1805,8 +1805,7 @@ fn build_gather_agg_descs(
     if agg_count > 0 {
         assert!(
             num_out_cols >= agg_count,
-            "GATHER_REDUCE: agg_count ({}) exceeds partial schema column count ({})",
-            agg_count, num_out_cols,
+            "GATHER_REDUCE: agg_count ({agg_count}) exceeds partial schema column count ({num_out_cols})",
         );
         for (ai, &(func_id, _)) in agg_specs.iter().enumerate() {
             let agg_op = AggOp::try_from(func_id as u8)
@@ -1858,7 +1857,7 @@ fn emit_gather_reduce(
     let agg_descs = build_gather_agg_descs(&partial_schema, &agg_specs);
 
     let trace_table = match create_child_table(
-        state, view_dir, &format!("_gather_{}_{}", view_id, nid), partial_schema, view_table_id,
+        state, view_dir, &format!("_gather_{view_id}_{nid}"), partial_schema, view_table_id,
     ) {
         Ok(t) => t,
         Err(_) => { state.emit_failed = true; return; }
@@ -3265,7 +3264,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&view_dir);
         assert!(
             leftover.is_empty(),
-            "scratch dirs must be removed on compile failure, found: {:?}", leftover,
+            "scratch dirs must be removed on compile failure, found: {leftover:?}",
         );
     }
 
@@ -3304,7 +3303,7 @@ mod tests {
         // (big-endian) image leads the PK region (where load_circuit seeks).
         let pk = |sub: u64| -> u128 { ((view_id as u128) << 64) | (sub as u128) };
 
-        let mut nodes_tab = Table::new(&format!("{}/nodes", dir), "nodes", nodes_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
+        let mut nodes_tab = Table::new(&format!("{dir}/nodes"), "nodes", nodes_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         {
             let mut bb = BatchBuilder::new(nodes_schema);
             bb.begin_row(pk(1), 1);
@@ -3316,9 +3315,9 @@ mod tests {
             bb.end_row();
             nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
         }
-        let mut edges_tab = Table::new(&format!("{}/edges", dir), "edges", edges_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
+        let mut edges_tab = Table::new(&format!("{dir}/edges"), "edges", edges_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         let _ = &mut edges_tab; // empty
-        let mut cols_tab = Table::new(&format!("{}/cols", dir), "cols", cols_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
+        let mut cols_tab = Table::new(&format!("{dir}/cols"), "cols", cols_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         let _ = &mut cols_tab; // empty
 
         let result = load_circuit(
@@ -3346,7 +3345,7 @@ mod tests {
         // (big-endian) image leads the PK region (where load_circuit seeks).
         let pk = |sub: u64| -> u128 { ((view_id as u128) << 64) | (sub as u128) };
 
-        let mut nodes_tab = Table::new(&format!("{}/nodes", dir), "nodes", nodes_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
+        let mut nodes_tab = Table::new(&format!("{dir}/nodes"), "nodes", nodes_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         {
             let mut bb = BatchBuilder::new(nodes_schema);
             // node 0: ScanDelta(source 99)
@@ -3367,7 +3366,7 @@ mod tests {
             bb.end_row();
             nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
         }
-        let mut edges_tab = Table::new(&format!("{}/edges", dir), "edges", edges_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
+        let mut edges_tab = Table::new(&format!("{dir}/edges"), "edges", edges_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         {
             let mut bb = BatchBuilder::new(edges_schema);
             // Edge 0 → 7, but node 7 does not exist.
@@ -3378,7 +3377,7 @@ mod tests {
             bb.end_row();
             edges_tab.ingest_owned_batch(bb.finish()).unwrap();
         }
-        let mut cols_tab = Table::new(&format!("{}/cols", dir), "cols", cols_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
+        let mut cols_tab = Table::new(&format!("{dir}/cols"), "cols", cols_schema, 0, 256 * 1024, Persistence::Ephemeral).unwrap();
         let _ = &mut cols_tab;
 
         let result = load_circuit(

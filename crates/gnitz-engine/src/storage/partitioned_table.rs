@@ -73,9 +73,9 @@ impl PartitionedTable {
         let mut tables = Vec::with_capacity((part_end - part_start) as usize);
         for p in part_start..part_end {
             let part_dir = if num_partitions == 1 {
-                format!("{}/part_0", dir)
+                format!("{dir}/part_0")
             } else {
-                format!("{}/part_{}", dir, p)
+                format!("{dir}/part_{p}")
             };
             let t = Table::new(&part_dir, name, schema, table_id, arena_size, persistence)?;
             tables.push(t);
@@ -543,7 +543,7 @@ mod tests {
         pt.ingest_owned_batch(make_batch(&rows)).unwrap();
 
         for &(pk, _, _) in &rows {
-            assert!(pt.has_pk(pk as u128), "PK {} not found", pk);
+            assert!(pt.has_pk(pk as u128), "PK {pk} not found");
         }
         assert!(!pt.has_pk(999999));
     }

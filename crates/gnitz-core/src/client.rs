@@ -79,11 +79,11 @@ fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
 fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
     if col_idx >= 512 {
         return Err(ClientError::ServerError(
-            format!("column index {} exceeds maximum 511", col_idx)));
+            format!("column index {col_idx} exceeds maximum 511")));
     }
     if owner_id > (u64::MAX >> 9) {
         return Err(ClientError::ServerError(
-            format!("owner_id {} exceeds 55-bit maximum for column ID packing", owner_id)));
+            format!("owner_id {owner_id} exceeds 55-bit maximum for column ID packing")));
     }
     Ok((owner_id << 9) | col_idx as u64)
 }
@@ -317,7 +317,7 @@ impl GnitzClient {
                 let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
                 if name == index_name {
                     return Err(ClientError::ServerError(format!(
-                        "index '{}' already exists", index_name
+                        "index '{index_name}' already exists"
                     )));
                 }
             }
@@ -343,7 +343,7 @@ impl GnitzClient {
     pub fn drop_index_by_name(&mut self, index_name: &str) -> Result<(), ClientError> {
         let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
         let idx_batch = idx_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("index '{}' not found", index_name))
+            ClientError::ServerError(format!("index '{index_name}' not found"))
         })?;
         for i in 0..idx_batch.len() {
             if idx_batch.weights[i] <= 0 { continue; }
@@ -370,7 +370,7 @@ impl GnitzClient {
             self.push(IDX_TAB, idx_schema, &batch)?;
             return Ok(());
         }
-        Err(ClientError::ServerError(format!("index '{}' not found", index_name)))
+        Err(ClientError::ServerError(format!("index '{index_name}' not found")))
     }
 
     pub fn delete(
@@ -436,7 +436,7 @@ impl GnitzClient {
     pub fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
         let (_, data, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let data = data.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{}' not found", name))
+            ClientError::ServerError(format!("Schema '{name}' not found"))
         })?;
         let schema_id = find_schema_id(&data, name)?;
 
@@ -468,7 +468,7 @@ impl GnitzClient {
 
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{}' not found", schema_name))
+            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
@@ -500,13 +500,13 @@ impl GnitzClient {
     pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> Result<(), ClientError> {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{}' not found", schema_name))
+            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         let tbl_batch = tbl_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Table '{}.{}' not found", schema_name, table_name))
+            ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found"))
         })?;
         let record = find_table_record(&tbl_batch, schema_id, table_name)?;
 
@@ -617,7 +617,7 @@ impl GnitzClient {
 
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{}' not found", schema_name))
+            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
@@ -698,7 +698,7 @@ impl GnitzClient {
             {
                 let mut a = BatchAppender::new(&mut edges, edges_s);
                 for (dst_node, dst_port, src_node) in &rows.edges {
-                    debug_assert!(*dst_node < (1u64 << 40), "dst_node {} exceeds 40-bit cap", dst_node);
+                    debug_assert!(*dst_node < (1u64 << 40), "dst_node {dst_node} exceeds 40-bit cap");
                     // Compound PK (view_id, sub): sub packs (dst_node, dst_port).
                     let sub = ((*dst_node as u128) << 8) | (*dst_port as u128);
                     let pk = (vid as u128) | (sub << 64);
@@ -749,13 +749,13 @@ impl GnitzClient {
     pub fn drop_view(&mut self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{}' not found", schema_name))
+            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
         let view_batch = view_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("View '{}.{}' not found", schema_name, view_name))
+            ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found"))
         })?;
         let vr = find_view_record(&view_batch, schema_id, view_name)?;
 
@@ -781,13 +781,13 @@ impl GnitzClient {
     ) -> Result<(u64, Schema), ClientError> {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{}' not found", schema_name))
+            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         let tbl_batch = tbl_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Table '{}.{}' not found", schema_name, table_name))
+            ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found"))
         })?;
         let record = find_table_record(&tbl_batch, schema_id, table_name)?;
 
@@ -807,7 +807,7 @@ impl GnitzClient {
     ) -> Result<(u64, Schema), ClientError> {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{}' not found", schema_name))
+            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
         })?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
@@ -830,7 +830,7 @@ impl GnitzClient {
         let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
         let view_batch = view_batch.ok_or_else(|| {
             ClientError::ServerError(
-                format!("Table or view '{}.{}' not found", schema_name, name)
+                format!("Table or view '{schema_name}.{name}' not found")
             )
         })?;
         let record = find_view_record(&view_batch, schema_id, name)?;
@@ -878,7 +878,7 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
             return Ok(batch.pks.get(i) as u64);
         }
     }
-    Err(ClientError::ServerError(format!("Schema '{}' not found", name)))
+    Err(ClientError::ServerError(format!("Schema '{name}' not found")))
 }
 
 fn find_table_record(
@@ -900,7 +900,7 @@ fn find_table_record(
             flags:       col_u64(&batch.columns[6], i)?,
         });
     }
-    Err(ClientError::ServerError(format!("Table '{}' not found", table_name)))
+    Err(ClientError::ServerError(format!("Table '{table_name}' not found")))
 }
 
 fn find_view_record(
@@ -922,7 +922,7 @@ fn find_view_record(
             pk_col_idx:      col_u64(&batch.columns[6], i)?,
         });
     }
-    Err(ClientError::ServerError(format!("View '{}' not found", view_name)))
+    Err(ClientError::ServerError(format!("View '{view_name}' not found")))
 }
 
 impl GnitzClient {

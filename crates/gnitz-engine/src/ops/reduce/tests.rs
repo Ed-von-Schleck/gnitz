@@ -757,8 +757,7 @@ fn test_promote_agg_col_f32_ordering() {
         assert_eq!(
             ieee_order_bits_f32_reverse(ieee_order_bits_f32(bits)),
             bits,
-            "round-trip failed for {:?}",
-            v
+            "round-trip failed for {v:?}"
         );
     }
 }

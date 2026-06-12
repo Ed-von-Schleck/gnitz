@@ -1680,9 +1680,7 @@ mod tests {
             let partition = (hash_u128(pk_u128) % num_workers as u64) as usize;
             assert!(
                 partition < num_workers,
-                "partition {} out of range for pk={}",
-                partition,
-                pk
+                "partition {partition} out of range for pk={pk}"
             );
         }
     }

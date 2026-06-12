@@ -203,14 +203,14 @@ pub(crate) fn index_meta_schema_desc() -> SchemaDescriptor {
 pub(crate) const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"cols", b"is_unique"];
 
 pub(crate) fn make_fk_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
-    format!("{}__{}{}{}", schema_name, table_name, FK_INDEX_INFIX, col_name)
+    format!("{schema_name}__{table_name}{FK_INDEX_INFIX}{col_name}")
 }
 
 /// Production index names arrive pre-built over the wire; only the test-only
 /// `ddl.rs::create_index` path names them engine-side.
 #[cfg(test)]
 pub(crate) fn make_secondary_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
-    format!("{}__{}__idx_{}", schema_name, table_name, col_name)
+    format!("{schema_name}__{table_name}__idx_{col_name}")
 }
 
 // ---------------------------------------------------------------------------
@@ -226,22 +226,22 @@ pub(crate) fn make_secondary_index_name(schema_name: &str, table_name: &str, col
 /// DROP+CREATE of the same schema name reuses the path, which is why recreation
 /// must cancel a pending deletion of it.
 pub(crate) fn schema_dir(base_dir: &str, schema_name: &str) -> String {
-    format!("{}/{}", base_dir, schema_name)
+    format!("{base_dir}/{schema_name}")
 }
 
 /// `<base_dir>/<schema_name>/<name>_<tid>` — a table's directory.
 pub(crate) fn table_dir(base_dir: &str, schema_name: &str, name: &str, tid: i64) -> String {
-    format!("{}/{}/{}_{}", base_dir, schema_name, name, tid)
+    format!("{base_dir}/{schema_name}/{name}_{tid}")
 }
 
 /// `<base_dir>/<schema_name>/view_<name>_<vid>` — a view's directory.
 pub(crate) fn view_dir(base_dir: &str, schema_name: &str, name: &str, vid: i64) -> String {
-    format!("{}/{}/view_{}_{}", base_dir, schema_name, name, vid)
+    format!("{base_dir}/{schema_name}/view_{name}_{vid}")
 }
 
 /// `<owner_dir>/idx_<idx_id>` — an index's directory, nested in its owner.
 pub(crate) fn index_dir(owner_dir: &str, idx_id: i64) -> String {
-    format!("{}/idx_{}", owner_dir, idx_id)
+    format!("{owner_dir}/idx_{idx_id}")
 }
 
 /// True if `name` is shaped like an index directory (`idx_<digits>`).
@@ -318,12 +318,12 @@ pub(crate) fn cursor_read_string(cursor: &CursorHandle, logical_col: usize) -> S
 pub(crate) fn ensure_dir(path: &str) -> Result<(), String> {
     // Reject any embedded NUL bytes (should never happen with clean paths)
     if path.contains('\0') {
-        return Err(format!("Path contains NUL byte: {:?}", path));
+        return Err(format!("Path contains NUL byte: {path:?}"));
     }
     match fs::create_dir_all(path) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(format!("Failed to create directory '{}': {}", path, e)),
+        Err(e) => Err(format!("Failed to create directory '{path}': {e}")),
     }
 }
 

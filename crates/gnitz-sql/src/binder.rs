@@ -47,11 +47,11 @@ pub fn resolve_qualified_column(
 ) -> Result<usize, GnitzSqlError> {
     let (_, schema, offset) = tables.get(table_alias)
         .ok_or_else(|| GnitzSqlError::Bind(
-            format!("table alias '{}' not found", table_alias)
+            format!("table alias '{table_alias}' not found")
         ))?;
     let idx = find_unique_column(&schema.columns, col_name)?
         .ok_or_else(|| GnitzSqlError::Bind(
-            format!("column '{}' not found in table '{}'", col_name, table_alias)
+            format!("column '{col_name}' not found in table '{table_alias}'")
         ))?;
     Ok(offset + idx)
 }
@@ -70,14 +70,14 @@ pub fn resolve_unqualified_column(
         if let Some(idx) = find_unique_column(&schema.columns, col_name)? {
             if found.is_some() {
                 return Err(GnitzSqlError::Bind(
-                    format!("ambiguous column '{}' — qualify with table alias", col_name)
+                    format!("ambiguous column '{col_name}' — qualify with table alias")
                 ));
             }
             found = Some(offset + idx);
         }
     }
     found.ok_or_else(|| GnitzSqlError::Bind(
-        format!("column '{}' not found in any table", col_name)
+        format!("column '{col_name}' not found in any table")
     ))
 }
 
@@ -137,13 +137,17 @@ impl<'a> Binder<'a> {
         self.cache.insert(name, resolved);
     }
 
+    // `self` is only used for recursion today, but binding is a Binder
+    // operation (callers hold one) and future binding state (parameters,
+    // aliases) belongs here — keep the method form.
+    #[allow(clippy::only_used_in_recursion)]
     pub fn bind_expr(&self, expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
         match expr {
             Expr::Identifier(ident) => {
                 let col_name = &ident.value;
                 let idx = find_unique_column(&schema.columns, col_name)?
                     .ok_or_else(|| GnitzSqlError::Bind(
-                        format!("column '{}' not found", col_name)
+                        format!("column '{col_name}' not found")
                     ))?;
                 Ok(BoundExpr::ColRef(idx))
             }
@@ -156,7 +160,7 @@ impl<'a> Binder<'a> {
                         } else if let Ok(f) = n.parse::<f64>() {
                             Ok(BoundExpr::LitFloat(f))
                         } else {
-                            Err(GnitzSqlError::Bind(format!("invalid number literal: {}", n)))
+                            Err(GnitzSqlError::Bind(format!("invalid number literal: {n}")))
                         }
                     }
                     Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
@@ -185,7 +189,7 @@ impl<'a> Binder<'a> {
                     BinaryOperator::And       => BinOp::And,
                     BinaryOperator::Or        => BinOp::Or,
                     op => return Err(GnitzSqlError::Unsupported(
-                        format!("binary operator {:?} not supported", op)
+                        format!("binary operator {op:?} not supported")
                     )),
                 };
                 Ok(BoundExpr::BinOp(Box::new(l), bop, Box::new(r)))
@@ -196,7 +200,7 @@ impl<'a> Binder<'a> {
                     UnaryOperator::Minus => UnaryOp::Neg,
                     UnaryOperator::Not   => UnaryOp::Not,
                     op => return Err(GnitzSqlError::Unsupported(
-                        format!("unary operator {:?} not supported", op)
+                        format!("unary operator {op:?} not supported")
                     )),
                 };
                 Ok(BoundExpr::UnaryOp(uop, Box::new(inner)))
@@ -248,7 +252,7 @@ impl<'a> Binder<'a> {
                     // ambiguous even when qualified (`jv.id` over a dup-named view).
                     let idx = find_unique_column(&schema.columns, col_name)?
                         .ok_or_else(|| GnitzSqlError::Bind(
-                            format!("column '{}' not found", col_name)
+                            format!("column '{col_name}' not found")
                         ))?;
                     Ok(BoundExpr::ColRef(idx))
                 } else {
@@ -322,16 +326,16 @@ impl<'a> Binder<'a> {
                             }
                         }
                         Err(GnitzSqlError::Unsupported(
-                            format!("{}: requires exactly one column argument", name)
+                            format!("{name}: requires exactly one column argument")
                         ))
                     }
                     _ => Err(GnitzSqlError::Unsupported(
-                        format!("function '{}' not supported", name)
+                        format!("function '{name}' not supported")
                     )),
                 }
             }
             _ => Err(GnitzSqlError::Unsupported(
-                format!("expression type not supported: {:?}", expr)
+                format!("expression type not supported: {expr:?}")
             )),
         }
     }
@@ -374,9 +378,9 @@ mod tests {
         match r {
             Err(GnitzSqlError::Unsupported(msg)) => {
                 assert!(msg.contains(want_substr),
-                    "got Unsupported({:?}), expected to contain {:?}", msg, want_substr);
+                    "got Unsupported({msg:?}), expected to contain {want_substr:?}");
             }
-            Err(e) => panic!("expected Unsupported, got {:?}", e),
+            Err(e) => panic!("expected Unsupported, got {e:?}"),
             Ok(_)  => panic!("expected Unsupported, got Ok"),
         }
     }
@@ -401,7 +405,7 @@ mod tests {
         match find_unique_column(&cols, "id") {
             Err(GnitzSqlError::Bind(s)) =>
                 assert!(s.contains("ambiguous"), "got: {s}"),
-            other => panic!("expected Bind(ambiguous), got {:?}", other),
+            other => panic!("expected Bind(ambiguous), got {other:?}"),
         }
     }
 
@@ -411,7 +415,7 @@ mod tests {
         for &tc in &[TypeCode::U128, TypeCode::UUID, TypeCode::Blob, TypeCode::String, TypeCode::I128] {
             let schema = schema_with_val(tc);
             for fname in &["MIN", "MAX"] {
-                let expr = parse(&format!("{}(c)", fname));
+                let expr = parse(&format!("{fname}(c)"));
                 let r = binder.bind_expr(&expr, &schema);
                 assert_unsupported(r, fname);
             }
@@ -432,7 +436,7 @@ mod tests {
         for &tc in &accepted {
             let schema = schema_with_val(tc);
             for fname in &["MIN", "MAX"] {
-                let expr = parse(&format!("{}(c)", fname));
+                let expr = parse(&format!("{fname}(c)"));
                 let r = binder.bind_expr(&expr, &schema);
                 assert!(r.is_ok(),
                     "expected {}({:?}) to bind, got {:?}", fname, tc, r.err());

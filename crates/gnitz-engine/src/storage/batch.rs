@@ -1934,7 +1934,7 @@ mod tests {
             b.extend_col(0, &0i64.to_le_bytes());
             b.count += 1;
             assert_eq!(b.get_pk(0), pk,
-                "type_code {} narrow-stride round-trip", tc);
+                "type_code {tc} narrow-stride round-trip");
         }
     }
 
@@ -2004,7 +2004,7 @@ mod tests {
             b.count += 1;
         }
         for (i, &pk) in keys.iter().enumerate() {
-            assert_eq!(b.get_pk(i), pk, "row {} pk roundtrip", i);
+            assert_eq!(b.get_pk(i), pk, "row {i} pk roundtrip");
         }
         let iter_pks: Vec<u128> = b.pk_iter().collect();
         assert_eq!(iter_pks, keys);

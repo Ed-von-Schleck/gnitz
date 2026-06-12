@@ -1516,7 +1516,7 @@ mod tests {
             assert_eq!(
                 &client_bytes[..],
                 &engine_buf[..written],
-                "ctrl block byte mismatch for error_msg={:?}", error_msg,
+                "ctrl block byte mismatch for error_msg={error_msg:?}",
             );
         }
     }

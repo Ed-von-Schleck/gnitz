@@ -404,7 +404,7 @@ impl CircuitBuilder {
         let sharded = self.shard(input, group_cols);
         let group: Vec<u16> = group_cols.iter().map(|&c| c as u16).collect();
         let func = AggFunc::from_wire(agg_func_id)
-            .unwrap_or_else(|| panic!("unknown agg func id {}", agg_func_id));
+            .unwrap_or_else(|| panic!("unknown agg func id {agg_func_id}"));
         let nid = self.alloc_node(OpNode::Reduce {
             group_cols: group,
             agg: AggKind::Specs(vec![(func, agg_col_idx as u16)]),
@@ -424,7 +424,7 @@ impl CircuitBuilder {
         let group: Vec<u16> = group_cols.iter().map(|&c| c as u16).collect();
         let specs: Vec<(AggFunc, u16)> = agg_specs.iter()
             .map(|&(func_id, col)| (
-                AggFunc::from_wire(func_id).unwrap_or_else(|| panic!("unknown agg func id {}", func_id)),
+                AggFunc::from_wire(func_id).unwrap_or_else(|| panic!("unknown agg func id {func_id}")),
                 col as u16,
             ))
             .collect();

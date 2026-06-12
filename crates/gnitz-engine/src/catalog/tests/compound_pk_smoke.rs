@@ -124,8 +124,7 @@ fn schema_roundtrip_wire_preserves_pk_order() {
         let (decoded, _names) = batch_to_schema(&batch).unwrap();
         assert!(
             original == decoded,
-            "pk_indices {:?} did not survive wire round-trip",
-            pk_indices,
+            "pk_indices {pk_indices:?} did not survive wire round-trip",
         );
     }
 }

@@ -146,9 +146,8 @@ impl WorkerExchangeHandler {
     fn stash_preloaded(&mut self, view_id: i64, batch: Batch) {
         debug_assert!(
             !self.stash.contains_key(&view_id),
-            "stash_preloaded: view_id={} already has a preloaded batch — \
+            "stash_preloaded: view_id={view_id} already has a preloaded batch — \
              multi-source preloaded for the same view would silently overwrite",
-            view_id,
         );
         self.stash.insert(view_id, batch);
     }
@@ -250,7 +249,7 @@ fn uring_batch_fdatasync_with(
                 }
                 continue;
             }
-            Err(e) => return Err(format!("uring submit_and_wait: {}", e)),
+            Err(e) => return Err(format!("uring submit_and_wait: {e}")),
         }
         for cqe in ring.completion() {
             if cqe.result() < 0 {
@@ -423,12 +422,10 @@ impl WorkerProcess {
         let sz_0 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 0, prebuilt_opt);
         let sz_1 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch, 1, prebuilt_opt);
         let per_row = sz_1.saturating_sub(sz_0);
-        #[allow(clippy::manual_checked_ops)]
-        let max_rows = if per_row > 0 {
-            let usable = (w2m_ring::MAX_W2M_MSG as usize).saturating_sub(sz_0);
-            (usable / per_row).max(1).min(remaining)
-        } else {
-            remaining.max(1)
+        let usable = (w2m_ring::MAX_W2M_MSG as usize).saturating_sub(sz_0);
+        let max_rows = match usable.checked_div(per_row) {
+            Some(rows) => rows.max(1).min(remaining),
+            None => remaining.max(1), // per_row == 0: constant wire size, send all
         };
         let has_more = next_row + max_rows < batch.count;
         // FLAG_CONTINUATION is always set on worker scan frames so the client's
@@ -1062,8 +1059,7 @@ impl WorkerProcess {
         // `send_unique_preflight_keys`.
         debug_assert!(
             schema.is_none_or(|s| self.schema_matches_table(tid_key, s).unwrap_or(true)),
-            "send_scan_response: schema does not match table {}'s cached schema",
-            tid_key,
+            "send_scan_response: schema does not match table {tid_key}'s cached schema",
         );
         // Obtain prebuilt schema block + server version. include_schema controls
         // whether the first frame carries a schema block; server_version is always
@@ -1205,7 +1201,7 @@ impl WorkerProcess {
                 return Ok(());
             }
             let schema = self.cat().get_schema_desc(target_id)
-                .ok_or_else(|| format!("no schema for tid={}", target_id))?;
+                .ok_or_else(|| format!("no schema for tid={target_id}"))?;
             Batch::with_schema(schema, 0)
         };
         self.evaluate_dag(target_id, delta, request_id);
@@ -1250,7 +1246,7 @@ impl WorkerProcess {
             return Err("injected unique pre-flight fault".to_string());
         }
         let schema = self.cat().get_schema_desc(owner_id).ok_or_else(|| {
-            format!("unique pre-flight: no schema for table {}", owner_id)
+            format!("unique pre-flight: no schema for table {owner_id}")
         })?;
         // The index circuit is not registered until this pre-flight succeeds, so
         // build its schema from the owner schema + column list — identical inputs
@@ -1346,7 +1342,7 @@ impl WorkerProcess {
             }
             HasPkLookup::PrimaryKey => {
                 let schema = self.cat().get_schema_desc(target_id)
-                    .ok_or_else(|| format!("no schema for tid={}", target_id))?;
+                    .ok_or_else(|| format!("no schema for tid={target_id}"))?;
                 let ptable_handle = self.cat().get_ptable_handle(target_id);
                 // Route on verbatim OPK bytes for every PK width. The old narrow
                 // arm fed `get_pk` (OPK-widened) to `has_pk(u128)`, which
@@ -1367,7 +1363,7 @@ impl WorkerProcess {
         let mut dir_inodes: Vec<(u64, u64, libc::c_int)> = Vec::new();
 
         let mut ring = io_uring::IoUring::new(256)
-            .map_err(|e| format!("io_uring::new failed: {}", e))?;
+            .map_err(|e| format!("io_uring::new failed: {e}"))?;
 
         const FD_CHUNK_THRESHOLD: usize = 256;
         let mut pending: Vec<(i64, Vec<(usize, FlushWork)>)> = Vec::new();
@@ -1375,7 +1371,7 @@ impl WorkerProcess {
 
         for tid in ids {
             let works = self.cat().flush_family_prepare(tid)
-                .map_err(|e| format!("flush_prepare tid={}: {}", tid, e))?;
+                .map_err(|e| format!("flush_prepare tid={tid}: {e}"))?;
             if works.is_empty() { continue; }
             let added_fds: usize = works.iter()
                 .map(|(_, w)| w.shard_fd().is_some() as usize
@@ -1406,7 +1402,7 @@ impl WorkerProcess {
             unsafe { libc::close(fd); }
         }
         if let Some(err) = fsync_err {
-            return Err(format!("dir fsync failed: {}", err));
+            return Err(format!("dir fsync failed: {err}"));
         }
         Ok(())
     }
@@ -1431,14 +1427,14 @@ impl WorkerProcess {
 
         for (tid, works) in pending.drain(..) {
             let dirfds = self.cat().flush_family_commit_batch(tid, works)
-                .map_err(|e| format!("flush_commit tid={}: {}", tid, e))?;
+                .map_err(|e| format!("flush_commit tid={tid}: {e}"))?;
             for dirfd in dirfds {
                 let mut stat: libc::stat = unsafe { std::mem::zeroed() };
                 if unsafe { libc::fstat(dirfd, &mut stat) } < 0 {
                     let err = std::io::Error::last_os_error();
-                    return Err(format!("fstat: {}", err));
+                    return Err(format!("fstat: {err}"));
                 }
-                dir_inodes.push((stat.st_dev as u64, stat.st_ino as u64, dirfd));
+                dir_inodes.push((stat.st_dev, stat.st_ino, dirfd));
             }
         }
         Ok(())
@@ -1735,7 +1731,7 @@ mod tests {
             Err(e) if e.raw_os_error().is_some_and(|c| {
                 c == libc::ENOSYS || c == libc::EPERM || c == libc::EACCES
             }) => None,
-            Err(e) => panic!("io_uring::new: {}", e),
+            Err(e) => panic!("io_uring::new: {e}"),
         }
     }
 
@@ -1750,7 +1746,7 @@ mod tests {
 
         let mut fds: Vec<libc::c_int> = Vec::new();
         for i in 0..10 {
-            let path = dir.path().join(format!("f_{}.bin", i));
+            let path = dir.path().join(format!("f_{i}.bin"));
             let path_c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
             let fd = unsafe {
                 libc::open(
@@ -1789,7 +1785,7 @@ mod tests {
 
         let mut fds: Vec<libc::c_int> = Vec::new();
         for i in 0..3 {
-            let path = dir.path().join(format!("eintr_{}.bin", i));
+            let path = dir.path().join(format!("eintr_{i}.bin"));
             let path_c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
             let fd = unsafe {
                 libc::open(path_c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644)
@@ -1812,7 +1808,7 @@ mod tests {
             }
         });
 
-        assert!(result.is_ok(), "EINTR should be retried, got: {:?}", result);
+        assert!(result.is_ok(), "EINTR should be retried, got: {result:?}");
         assert_eq!(call_count, 2, "exactly one EINTR then one successful submit expected");
 
         for fd in fds {

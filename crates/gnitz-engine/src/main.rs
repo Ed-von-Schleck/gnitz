@@ -80,7 +80,7 @@ fn main() {
     while i < args.len() {
         let arg = &args[i];
         if arg == "--help" || arg == "-h" {
-            eprint!("{}", HELP_TEXT);
+            eprint!("{HELP_TEXT}");
             process::exit(0);
         } else if let Some(val) = arg.strip_prefix("--log-level=") {
             level = parse_level(val);

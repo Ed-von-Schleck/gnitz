@@ -81,8 +81,7 @@ mod tests {
         let computed = checksum(&body);
         assert_eq!(
             computed, 0x741C9E0BA1D8A9FD_u64,
-            "xxhash-rust and C XXH3_64bits disagree: got 0x{:016X}",
-            computed
+            "xxhash-rust and C XXH3_64bits disagree: got 0x{computed:016X}"
         );
     }
 }

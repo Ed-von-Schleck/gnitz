@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn test_eventfd_create_close() {
         let fd = eventfd_create();
-        assert!(fd >= 0, "eventfd_create failed: {}", fd);
+        assert!(fd >= 0, "eventfd_create failed: {fd}");
         unsafe { libc::close(fd); }
     }
 
@@ -165,7 +165,7 @@ mod tests {
         assert!(fd >= 0);
         assert_eq!(eventfd_signal(fd), 0);
         let r = eventfd_wait(fd, 1000);
-        assert!(r > 0, "expected >0, got {}", r);
+        assert!(r > 0, "expected >0, got {r}");
         unsafe { libc::close(fd); }
     }
 
@@ -174,7 +174,7 @@ mod tests {
         let fd = eventfd_create();
         assert!(fd >= 0);
         let r = eventfd_wait(fd, 10);
-        assert_eq!(r, 0, "expected 0 (timeout), got {}", r);
+        assert_eq!(r, 0, "expected 0 (timeout), got {r}");
         unsafe { libc::close(fd); }
     }
 
@@ -259,7 +259,7 @@ mod tests {
         // time we issued the syscall (equally acceptable proof).
         assert!(
             rc == 0 || (rc == -1 && errno == libc::EAGAIN),
-            "futex_wait_u32 returned rc={} errno={}", rc, errno,
+            "futex_wait_u32 returned rc={rc} errno={errno}",
         );
         let final_val = unsafe { (*atomic_ptr).load(Ordering::Acquire) };
         assert_eq!(final_val, 8);
@@ -291,7 +291,7 @@ mod tests {
 
         let mut ring = match IoUring::new(8) {
             Ok(r) => r,
-            Err(e) => panic!("IoUring::new: {}", e),
+            Err(e) => panic!("IoUring::new: {e}"),
         };
 
         // One-entry FutexWaitV array (heap-stable), waiting for value 0.
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn test_memfd_create_and_ftruncate() {
         let fd = memfd_create(b"test_memfd");
-        assert!(fd >= 0, "memfd_create failed: {}", fd);
+        assert!(fd >= 0, "memfd_create failed: {fd}");
         assert_eq!(crate::sys::ftruncate(fd, 4096), 0);
         // Verify size
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };

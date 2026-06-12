@@ -1333,7 +1333,7 @@ mod tests {
         let mut out = batch.clone_batch();
         promoter.promote_into(&mb, &mut out);
         for row in 0..batch.count {
-            assert_eq!(out.get_pk(row), promoter.promote(&mb, row), "row {} narrow", row);
+            assert_eq!(out.get_pk(row), promoter.promote(&mb, row), "row {row} narrow");
         }
 
         // Pk variant (reindex on PK column itself).
@@ -1341,7 +1341,7 @@ mod tests {
         let mut out_pk = batch.clone_batch();
         promoter_pk.promote_into(&mb, &mut out_pk);
         for row in 0..batch.count {
-            assert_eq!(out_pk.get_pk(row), promoter_pk.promote(&mb, row), "row {} pk", row);
+            assert_eq!(out_pk.get_pk(row), promoter_pk.promote(&mb, row), "row {row} pk");
         }
 
         // Signed (I64) schema — the discriminating case. The oracle is sign-aware
@@ -1357,14 +1357,14 @@ mod tests {
         let mut s_out = s_batch.clone_batch();
         s_narrow.promote_into(&s_mb, &mut s_out);
         for row in 0..s_batch.count {
-            assert_eq!(s_out.get_pk(row), s_narrow.promote(&s_mb, row), "row {} signed narrow", row);
+            assert_eq!(s_out.get_pk(row), s_narrow.promote(&s_mb, row), "row {row} signed narrow");
         }
 
         let s_pk = PkPromoter::new(&s_schema, 0);
         let mut s_out_pk = s_batch.clone_batch();
         s_pk.promote_into(&s_mb, &mut s_out_pk);
         for row in 0..s_batch.count {
-            assert_eq!(s_out_pk.get_pk(row), s_pk.promote(&s_mb, row), "row {} signed pk", row);
+            assert_eq!(s_out_pk.get_pk(row), s_pk.promote(&s_mb, row), "row {row} signed pk");
         }
     }
 
@@ -1390,7 +1390,7 @@ mod tests {
         assert_eq!(opk[0], 0x7F, "OPK leading byte of -3:I64 is 0x7F (sign-flipped), not 0xFF");
 
         for row in 0..batch.count {
-            assert_eq!(out.get_pk(row), promoter.promote(&mb, row), "row {} narrow signed", row);
+            assert_eq!(out.get_pk(row), promoter.promote(&mb, row), "row {row} narrow signed");
         }
     }
 
@@ -1428,7 +1428,7 @@ mod tests {
             // (what extract_col_key returns for this value).
             let expect =
                 crate::schema::payload_route_key(&vals[row].to_le_bytes(), 0, 8, type_code::I64);
-            assert_eq!(out_pk.get_pk(row), expect, "row {}: routing key mismatch", row);
+            assert_eq!(out_pk.get_pk(row), expect, "row {row}: routing key mismatch");
         }
     }
 

@@ -995,7 +995,7 @@ impl DagEngine {
             None => return Ok(vec![]),
         };
         let works = entry.handle.flush_prepare()
-            .map_err(|_| format!("flush_prepare failed for table_id={}", table_id))?;
+            .map_err(|_| format!("flush_prepare failed for table_id={table_id}"))?;
         for ic in &mut entry.index_circuits {
             // Index tables are created Ephemeral, so this is an inline write
             // that returns DoneInline/Empty and resets the memtable. A Pending
@@ -1004,13 +1004,12 @@ impl DagEngine {
                 Ok(FlushOutcome::Empty) | Ok(FlushOutcome::DoneInline) => {}
                 Ok(FlushOutcome::Pending(_)) => {
                     return Err(format!(
-                        "index flush_prepare unexpectedly returned Pending for table_id={}",
-                        table_id
+                        "index flush_prepare unexpectedly returned Pending for table_id={table_id}"
                     ));
                 }
                 Err(_) => {
                     return Err(format!(
-                        "index flush_prepare failed for table_id={}", table_id
+                        "index flush_prepare failed for table_id={table_id}"
                     ));
                 }
             }
@@ -1029,7 +1028,7 @@ impl DagEngine {
             None => return Ok(vec![]),
         };
         entry.handle.flush_commit_batch(works)
-            .map_err(|_| format!("flush_commit_batch failed for table_id={}", table_id))
+            .map_err(|_| format!("flush_commit_batch failed for table_id={table_id}"))
     }
 
     // ── DAG traversal helpers ───────────────────────────────────────────
@@ -1927,7 +1926,7 @@ mod tests {
 
     fn dag_test_dir(name: &str) -> String {
         std::env::temp_dir()
-            .join(format!("gnitz_dag_test_{}", name))
+            .join(format!("gnitz_dag_test_{name}"))
             .to_str().unwrap().to_owned()
     }
 

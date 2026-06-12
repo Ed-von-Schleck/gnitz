@@ -38,7 +38,7 @@ fn try_compile_string_cmp(
                 BinOp::Gt => { let r = eb.str_col_le_const(idx, const_idx); eb.bool_not(r) },
                 BinOp::Ge => { let r = eb.str_col_lt_const(idx, const_idx); eb.bool_not(r) },
                 _ => return Err(GnitzSqlError::Unsupported(
-                    format!("operator {:?} not supported for strings", op)
+                    format!("operator {op:?} not supported for strings")
                 )),
             };
             return Ok(Some((reg, false)));
@@ -56,7 +56,7 @@ fn try_compile_string_cmp(
                 BinOp::Gt => eb.str_col_lt_col(*b, *a),
                 BinOp::Ge => eb.str_col_le_col(*b, *a),
                 _ => return Err(GnitzSqlError::Unsupported(
-                    format!("operator {:?} not supported for strings", op)
+                    format!("operator {op:?} not supported for strings")
                 )),
             };
             return Ok(Some((reg, false)));

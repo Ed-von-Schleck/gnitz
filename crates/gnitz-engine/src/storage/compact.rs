@@ -329,8 +329,7 @@ pub fn merge_and_route(
         .collect();
     let out_filenames: Vec<String> = (0..num_guards)
         .map(|i| format!(
-            "{}/shard_{}_{}_L{}_G{}.db",
-            out_dir_str, table_id, lsn_tag, level_num, i
+            "{out_dir_str}/shard_{table_id}_{lsn_tag}_L{level_num}_G{i}.db"
         ))
         .collect();
 
@@ -460,7 +459,7 @@ mod tests {
         let mut prev = 0u128;
         for i in 0..merged.count {
             let pk = merged.get_pk(i);
-            assert!(pk > prev, "not sorted at row {}: {} <= {}", i, pk, prev);
+            assert!(pk > prev, "not sorted at row {i}: {pk} <= {prev}");
             prev = pk;
         }
 
@@ -715,7 +714,7 @@ mod tests {
         let mut results = [GuardResult::zeroed(), GuardResult::zeroed()];
         let rc = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, &mut results, false);
 
-        assert!(rc.is_err(), "expected failure, got {:?}", rc);
+        assert!(rc.is_err(), "expected failure, got {rc:?}");
         let guard0_file = dir.join("shard_0_99_L1_G0.db");
         assert!(!guard0_file.exists(), "guard 0 output should have been cleaned up");
 
@@ -921,7 +920,7 @@ mod tests {
         compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let rows = read_3col_shard(output.to_str().unwrap(), &schema);
-        assert_eq!(rows.len(), 1, "expected 1 surviving row, got {:?}", rows);
+        assert_eq!(rows.len(), 1, "expected 1 surviving row, got {rows:?}");
         assert_eq!(rows[0], (1, 1, 0, 15000));
 
         let _ = fs::remove_dir_all(&dir);
@@ -967,7 +966,7 @@ mod tests {
         compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let rows = read_3col_shard(output.to_str().unwrap(), &schema);
-        assert_eq!(rows.len(), 2, "expected 2 surviving rows, got {:?}", rows);
+        assert_eq!(rows.len(), 2, "expected 2 surviving rows, got {rows:?}");
         assert_eq!(rows[0], (1, 1, 0, 600));
         assert_eq!(rows[1], (2, 1, 1, 800));
 
@@ -995,7 +994,7 @@ mod tests {
         for tick in 2..=10u64 {
             let old_sum = (tick - 1) * 5000;
             let new_sum = tick * 5000;
-            let p = dir.join(format!("t{}.db", tick));
+            let p = dir.join(format!("t{tick}.db"));
             write_3col_shard(p.to_str().unwrap(), &[
                 (1, -1, 0, old_sum as i64),
                 (1,  1, 0, new_sum as i64),
@@ -1055,7 +1054,7 @@ mod tests {
 
         let fn0 = crate::util::cstr_from_buf(&results[0].filename);
         let rows = read_3col_shard(fn0, &schema);
-        assert_eq!(rows.len(), 2, "expected 2 rows, got {:?}", rows);
+        assert_eq!(rows.len(), 2, "expected 2 rows, got {rows:?}");
         assert_eq!(rows[0], (10, 1, 0, 300));
         assert_eq!(rows[1], (20, 1, 1, 400));
 
@@ -1130,7 +1129,7 @@ mod tests {
         let mut prev = 0u128;
         for i in 0..merged.count {
             let pk = merged.get_pk(i);
-            assert!(pk > prev, "not sorted at row {}: {} <= {}", i, pk, prev);
+            assert!(pk > prev, "not sorted at row {i}: {pk} <= {prev}");
             prev = pk;
         }
 
@@ -1170,7 +1169,7 @@ mod tests {
 
         // Verify all keys readable
         for &pk in &[50u64, 100, 150, 250] {
-            assert!(shard.find_row_index(pk as u128).is_some(), "key {} not found in output shard", pk);
+            assert!(shard.find_row_index(pk as u128).is_some(), "key {pk} not found in output shard");
         }
 
         let _ = fs::remove_dir_all(&dir);

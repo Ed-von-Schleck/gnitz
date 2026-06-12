@@ -339,7 +339,7 @@ impl MasterDispatcher {
     fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<Vec<u8>>>) {
         let cat = unsafe { &mut *self.catalog };
         let schema = cat.get_schema_desc(target_id)
-            .unwrap_or_else(|| panic!("master: no schema for target_id={}", target_id));
+            .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"));
         let names = cat.get_col_names_bytes(target_id);
         (schema, names)
     }
@@ -356,7 +356,7 @@ impl MasterDispatcher {
     {
         let cat = unsafe { &mut *self.catalog };
         let schema = cat.get_schema_desc(target_id)
-            .unwrap_or_else(|| panic!("master: no schema for target_id={}", target_id));
+            .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"));
         if let Some(cached) = cat.get_cached_schema_wire_block(target_id) {
             return (schema, cached.block, cached.wire_safe, cached.wire_row_fixed_stride);
         }
@@ -568,7 +568,7 @@ impl MasterDispatcher {
                     Some(decoded) => {
                         if decoded.control.status != 0 {
                             let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-                            return Err(format!("worker {}: {}", w, msg));
+                            return Err(format!("worker {w}: {msg}"));
                         }
                         results[w] = Some(decoded);
                         break;
@@ -624,7 +624,7 @@ impl MasterDispatcher {
                             let remaining = self.sal.mmap_size() - self.sal.cursor();
                             return Err(format!(
                                 "SAL space exhausted during backfill exchange relay \
-                                 ({} bytes left)", remaining));
+                                 ({remaining} bytes left)"));
                         }
                         let prep = self.prepare_relay(relay)?;
                         self.emit_relay(prep)?;
@@ -632,7 +632,7 @@ impl MasterDispatcher {
                 } else {
                     if decoded.control.status != 0 {
                         let msg = String::from_utf8_lossy(&decoded.control.error_msg);
-                        return Err(format!("worker {}: {}", w, msg));
+                        return Err(format!("worker {w}: {msg}"));
                     }
                     collected[w] = true;
                     remaining -= 1;
@@ -857,7 +857,7 @@ impl MasterDispatcher {
         let num_workers = unsafe { (*disp_ptr).num_workers };
         let schema = unsafe {
             (*(*disp_ptr).catalog).get_schema_desc(target_id)
-                .ok_or_else(|| format!("seek: table {} not found", target_id))?
+                .ok_or_else(|| format!("seek: table {target_id} not found"))?
         };
         let stride = schema.pk_stride() as usize;
         let worker = if schema.pk_is_wide() {
@@ -919,7 +919,7 @@ impl MasterDispatcher {
         let mut data_idx = None;
         for (w, slot) in slots.iter().enumerate() {
             let ctrl = peek_control_block(slot.bytes())
-                .map_err(|e| format!("seek_by_index: worker {}: {}", w, e))?;
+                .map_err(|e| format!("seek_by_index: worker {w}: {e}"))?;
             if ctrl.status != 0 {
                 return Err(format!(
                     "worker {}: seek_by_index: {}",
@@ -966,7 +966,7 @@ impl MasterDispatcher {
         let mut acc: Option<Batch> = None;
         for (w, slot) in slots.iter().enumerate() {
             let ctrl = peek_control_block(slot.bytes())
-                .map_err(|e| format!("seek_by_index: worker {}: {}", w, e))?;
+                .map_err(|e| format!("seek_by_index: worker {w}: {e}"))?;
             if ctrl.status != 0 {
                 return Err(format!(
                     "worker {}: seek_by_index: {}",
@@ -974,7 +974,7 @@ impl MasterDispatcher {
             }
             if ctrl.flags & FLAG_HAS_DATA == 0 { continue; }
             let decoded = wire::decode_wire_ipc(slot.bytes())
-                .map_err(|e| format!("seek_by_index: worker {}: decode: {}", w, e))?;
+                .map_err(|e| format!("seek_by_index: worker {w}: decode: {e}"))?;
             if let Some(b) = decoded.data_batch {
                 if b.count == 0 { continue; }
                 match acc.as_mut() {
@@ -1092,7 +1092,7 @@ impl MasterDispatcher {
                 if ctrl.status != 0 {
                     if deferred_err.is_none() {
                         let msg = String::from_utf8_lossy(&ctrl.error_msg).to_string();
-                        deferred_err = Some(format!("worker {}: scan: {}", w, msg));
+                        deferred_err = Some(format!("worker {w}: scan: {msg}"));
                     }
                     drop(slot); // terminal fault frame; free the ring slot
                 } else if !disconnected {
@@ -1241,7 +1241,7 @@ impl MasterDispatcher {
 
         let parent_schema = unsafe {
             (&*(*disp_ptr).catalog).get_schema_desc(target_id)
-                .ok_or_else(|| format!("gather: no schema for table {}", target_id))?
+                .ok_or_else(|| format!("gather: no schema for table {target_id}"))?
         };
 
         let req_ids: Vec<u64> = {
@@ -1525,7 +1525,7 @@ impl MasterDispatcher {
             let unique_pk = cat.table_has_unique_pk(target_id);
             let source_schema = cat.get_schema_desc(target_id)
                 .ok_or_else(|| format!(
-                    "validate_all_distributed: no schema for table {}", target_id))?;
+                    "validate_all_distributed: no schema for table {target_id}"))?;
             (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema)
         };
 
@@ -1633,7 +1633,7 @@ impl MasterDispatcher {
                 };
                 let parent_schema = cat.get_schema_desc(parent_table_id)
                     .ok_or_else(|| format!(
-                        "FK parent table {} schema not found", parent_table_id))?;
+                        "FK parent table {parent_table_id} schema not found"))?;
                 (fk_col_idx, parent_table_id, parent_col_idx, parent_schema)
             };
 
@@ -1683,8 +1683,7 @@ impl MasterDispatcher {
                     let cat = &mut *(*disp_ptr).catalog;
                     cat.get_index_schema_by_cols(parent_table_id, &[parent_col_idx as u32])
                         .ok_or_else(|| format!(
-                            "FK check: no unique index on parent table {} col {}",
-                            parent_table_id, parent_col_idx))?
+                            "FK check: no unique index on parent table {parent_table_id} col {parent_col_idx}"))?
                 };
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
                 // `loc` is the child FK column; its type drives the sign-extension
@@ -1755,8 +1754,7 @@ impl MasterDispatcher {
                         };
                         let idx_schema = cat.get_index_schema_by_cols(child_tid, &[fk_col_idx as u32])
                             .ok_or_else(|| format!(
-                                "FK RESTRICT check failed: no index on child table {} col {}",
-                                child_tid, fk_col_idx))?;
+                                "FK RESTRICT check failed: no index on child table {child_tid} col {fk_col_idx}"))?;
                         (child_tid, fk_col_idx, parent_col_idx, idx_schema)
                     };
 
@@ -1857,8 +1855,7 @@ impl MasterDispatcher {
                                 (s, t, ts, tt)
                             };
                             return Err(format!(
-                                "Foreign Key violation in '{}.{}': value not found in target '{}.{}'",
-                                sn, tn, tsn, ttn
+                                "Foreign Key violation in '{sn}.{tn}': value not found in target '{tsn}.{ttn}'"
                             ));
                         }
                     }
@@ -1871,8 +1868,7 @@ impl MasterDispatcher {
                                 (s, t, cs, ct)
                             };
                             return Err(format!(
-                                "Foreign Key violation: cannot delete from '{}.{}', row still referenced by '{}.{}'",
-                                sn, tn, csn, ctn,
+                                "Foreign Key violation: cannot delete from '{sn}.{tn}', row still referenced by '{csn}.{ctn}'",
                             ));
                         }
                     }
@@ -1887,8 +1883,7 @@ impl MasterDispatcher {
                             };
                             let key_str = format_pk_value_bytes(conflict_pk.pk_bytes(), &source_schema);
                             return Err(format!(
-                                "duplicate key value violates unique constraint \"{}_{}_pkey\": Key ({})=({}) already exists",
-                                sn, tn, pk_names, key_str,
+                                "duplicate key value violates unique constraint \"{sn}_{tn}_pkey\": Key ({pk_names})=({key_str}) already exists",
                             ));
                         }
                     }
@@ -2201,8 +2196,7 @@ impl MasterDispatcher {
                             (s, t, cs, ct)
                         };
                         return Err(format!(
-                            "Foreign Key violation: cannot update '{}.{}', row still referenced by '{}.{}'",
-                            sn, tn, csn, ctn,
+                            "Foreign Key violation: cannot update '{sn}.{tn}', row still referenced by '{csn}.{ctn}'",
                         ));
                     }
                 }
@@ -2596,8 +2590,7 @@ impl MasterDispatcher {
     ) -> String {
         let (pk_names, sn, tn) = self.pk_violation_context(target_id, schema);
         format!(
-            "duplicate key value violates unique constraint \"{}_{}_pkey\": Batch contains multiple rows with key ({})=({})",
-            sn, tn, pk_names, key_str,
+            "duplicate key value violates unique constraint \"{sn}_{tn}_pkey\": Batch contains multiple rows with key ({pk_names})=({key_str})",
         )
     }
 }
@@ -2636,7 +2629,7 @@ fn worker_error_scan<'a>(
     for (w, d) in it {
         if d.control.status != 0 {
             let msg = String::from_utf8_lossy(&d.control.error_msg);
-            return Some(format!("worker {}: {}: {}", w, op, msg));
+            return Some(format!("worker {w}: {op}: {msg}"));
         }
     }
     None
@@ -3083,7 +3076,7 @@ async fn single_worker_async(
         .expect("W2M ctrl corrupt in single_worker_async");
     if ctrl.status != 0 {
         let msg = String::from_utf8_lossy(&ctrl.error_msg);
-        return Err(format!("worker {}: {}: {}", worker, op_name, msg));
+        return Err(format!("worker {worker}: {op_name}: {msg}"));
     }
     Ok(slot)
 }
@@ -3116,7 +3109,7 @@ fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) -> String {
         gnitz_wire::decode_pk_column(&pk_bytes[off..off + size], col.type_code, &mut le[..size]);
         let v = u128::from_le_bytes(le);
         let s = match col.type_code {
-            crate::schema::type_code::U128 => format!("{}", v),
+            crate::schema::type_code::U128 => format!("{v}"),
             crate::schema::type_code::UUID => format_uuid_hyphenated(v),
             crate::schema::type_code::I64  => format!("{}", v as u64 as i64),
             crate::schema::type_code::I32  => format!("{}", v as u64 as i32),

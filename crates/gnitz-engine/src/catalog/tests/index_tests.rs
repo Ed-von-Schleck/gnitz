@@ -71,7 +71,7 @@ fn test_index_live_fanout() {
     assert_eq!(entry.index_circuits.len(), 1, "Expected 1 index circuit");
     let idx_table = entry.index_circuits[0].table_mut();
     let idx_count = count_records(idx_table);
-    assert_eq!(idx_count, 6, "Index fanout: expected 6, got {}", idx_count);
+    assert_eq!(idx_count, 6, "Index fanout: expected 6, got {idx_count}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -92,7 +92,7 @@ fn test_system_table_flush_compacts_l0() {
         bb.put_u64(0);                 // owner_id
         bb.put_u64(0);                 // owner_kind
         bb.put_u64(0);                 // source_col_idx
-        bb.put_string(&format!("idx{}", i));
+        bb.put_string(&format!("idx{i}"));
         bb.put_u64(0);                 // is_unique
         bb.put_string("");             // cache_directory
         bb.end_row();
@@ -102,8 +102,7 @@ fn test_system_table_flush_compacts_l0() {
     let shards = engine.sys_indices.all_shard_arcs().len();
     assert!(
         (shards as u64) < flushes / 2,
-        "system catalog L0 must be compacted: {} shards after {} flushes",
-        shards, flushes
+        "system catalog L0 must be compacted: {shards} shards after {flushes} flushes"
     );
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -365,7 +364,7 @@ fn test_validate_unique_transfer_accepted() {
     bb.begin_row(1u128, -1); bb.put_u64(5); bb.end_row();
     bb.begin_row(2u128, 1); bb.put_u64(5); bb.end_row();
     let result = engine.validate_unique_indices(tid, &bb.finish());
-    assert!(result.is_ok(), "transfer should be accepted: {:?}", result);
+    assert!(result.is_ok(), "transfer should be accepted: {result:?}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -394,7 +393,7 @@ fn test_validate_unique_swap_accepted() {
     bb.begin_row(1u128, 1); bb.put_u64(6); bb.end_row();
     bb.begin_row(2u128, 1); bb.put_u64(5); bb.end_row();
     let result = engine.validate_unique_indices(tid, &bb.finish());
-    assert!(result.is_ok(), "swap should be accepted: {:?}", result);
+    assert!(result.is_ok(), "swap should be accepted: {result:?}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -424,7 +423,7 @@ fn test_validate_unique_bulk_shift_accepted() {
     bb.begin_row(2u128, 1); bb.put_u64(3); bb.end_row();
     bb.begin_row(3u128, 1); bb.put_u64(4); bb.end_row();
     let result = engine.validate_unique_indices(tid, &bb.finish());
-    assert!(result.is_ok(), "bulk shift should be accepted: {:?}", result);
+    assert!(result.is_ok(), "bulk shift should be accepted: {result:?}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -451,7 +450,7 @@ fn test_validate_unique_bulk_swap_accepted() {
     bb.begin_row(1u128, 1); bb.put_u64(2); bb.end_row();
     bb.begin_row(2u128, 1); bb.put_u64(1); bb.end_row();
     let result = engine.validate_unique_indices(tid, &bb.finish());
-    assert!(result.is_ok(), "bulk swap should be accepted: {:?}", result);
+    assert!(result.is_ok(), "bulk swap should be accepted: {result:?}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -1497,7 +1496,7 @@ fn test_drop_unique_index_on_fk_column_keeps_shared_directory() {
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
     engine.create_index("public.child", &["refc"], true).unwrap();
 
-    let tbl_dir = format!("{}/public/child_{}", dir, child_tid);
+    let tbl_dir = format!("{dir}/public/child_{child_tid}");
     assert_eq!(count_idx_dirs(&tbl_dir), 1,
         "promotion must reuse the FK index directory, not build a second one");
 
@@ -1534,7 +1533,7 @@ fn test_failed_create_index_leaves_no_directory() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
-    let tbl_dir = format!("{}/public/t_{}", dir, tid);
+    let tbl_dir = format!("{dir}/public/t_{tid}");
     assert!(engine.create_index("public.t", &["val"], true).is_err());
     assert_eq!(count_idx_dirs(&tbl_dir), 0,
         "a failed unique create_index must leave no index directory behind");

@@ -849,7 +849,7 @@ impl<'a> BatchAppender<'a> {
         let ci = self.col_index();
         match &mut self.batch.columns[ci] {
             ColData::Fixed(buf) => buf.extend_from_slice(&v.to_le_bytes()),
-            _ => panic!("BatchAppender: u64_val called on non-Fixed column at schema index {}", ci),
+            _ => panic!("BatchAppender: u64_val called on non-Fixed column at schema index {ci}"),
         }
         self.cursor += 1;
         self
@@ -860,7 +860,7 @@ impl<'a> BatchAppender<'a> {
         let ci = self.col_index();
         match &mut self.batch.columns[ci] {
             ColData::Fixed(buf) => buf.extend_from_slice(&v.to_le_bytes()),
-            _ => panic!("BatchAppender: i64_val called on non-Fixed column at schema index {}", ci),
+            _ => panic!("BatchAppender: i64_val called on non-Fixed column at schema index {ci}"),
         }
         self.cursor += 1;
         self
@@ -871,7 +871,7 @@ impl<'a> BatchAppender<'a> {
         let ci = self.col_index();
         match &mut self.batch.columns[ci] {
             ColData::Strings(v) => v.push(Some(s.to_string())),
-            _ => panic!("BatchAppender: str_val called on non-Strings column at schema index {}", ci),
+            _ => panic!("BatchAppender: str_val called on non-Strings column at schema index {ci}"),
         }
         self.cursor += 1;
         self
@@ -893,7 +893,7 @@ impl<'a> BatchAppender<'a> {
         let ci = self.col_index();
         match &mut self.batch.columns[ci] {
             ColData::Strings(v) => v.push(None),
-            _ => panic!("BatchAppender: str_null called on non-Strings column at schema index {}", ci),
+            _ => panic!("BatchAppender: str_null called on non-Strings column at schema index {ci}"),
         }
         self.mark_current_null(ci);
         self.cursor += 1;
@@ -905,7 +905,7 @@ impl<'a> BatchAppender<'a> {
         let ci = self.col_index();
         match &mut self.batch.columns[ci] {
             ColData::Bytes(v) => v.push(Some(b.to_vec())),
-            _ => panic!("BatchAppender: bytes_val called on non-Bytes column at schema index {}", ci),
+            _ => panic!("BatchAppender: bytes_val called on non-Bytes column at schema index {ci}"),
         }
         self.cursor += 1;
         self
@@ -916,7 +916,7 @@ impl<'a> BatchAppender<'a> {
         let ci = self.col_index();
         match &mut self.batch.columns[ci] {
             ColData::Bytes(v) => v.push(None),
-            _ => panic!("BatchAppender: bytes_null called on non-Bytes column at schema index {}", ci),
+            _ => panic!("BatchAppender: bytes_null called on non-Bytes column at schema index {ci}"),
         }
         self.mark_current_null(ci);
         self.cursor += 1;
@@ -928,7 +928,7 @@ impl<'a> BatchAppender<'a> {
         let ci = self.col_index();
         match &mut self.batch.columns[ci] {
             ColData::U128s(vec) => vec.push(v),
-            _ => panic!("BatchAppender: u128_val called on non-U128s column at schema index {}", ci),
+            _ => panic!("BatchAppender: u128_val called on non-U128s column at schema index {ci}"),
         }
         self.cursor += 1;
         self

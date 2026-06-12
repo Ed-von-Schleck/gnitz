@@ -68,7 +68,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
         let col_idx = batch.pks.get(i) as u64;
         if col_idx != i as u64 {
             return Err(ProtocolError::DecodeError(format!(
-                "schema batch col_idx out of order: expected {}, got {}", i, col_idx
+                "schema batch col_idx out of order: expected {i}, got {col_idx}"
             )));
         }
 
@@ -80,7 +80,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
         );
         let name = match &names_col[i] {
             Some(s) => s.clone(),
-            None => return Err(ProtocolError::DecodeError(format!("null name at col {}", i))),
+            None => return Err(ProtocolError::DecodeError(format!("null name at col {i}"))),
         };
 
         let tc = type_code_from_u64(type_code_raw)?;
@@ -153,7 +153,7 @@ mod tests {
     fn make_meta_batch(ncols: usize) -> ZSetBatch {
         let schema = Schema {
             columns: (0..ncols).map(|i| ColumnDef {
-                name:        format!("col{}", i),
+                name:        format!("col{i}"),
                 type_code:   TypeCode::U64,
                 is_nullable: false,
                 fk_table_id: 0,

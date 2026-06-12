@@ -6,12 +6,12 @@ use super::*;
 fn test_identifiers() {
     // Valid names
     for name in &["orders", "Orders123", "my_table", "a", "A1_b2", "1a", "99_problems"] {
-        assert!(validate_user_identifier(name).is_ok(), "Rejected valid: {}", name);
+        assert!(validate_user_identifier(name).is_ok(), "Rejected valid: {name}");
     }
     // Invalid names
     for name in &["_private", "_", "_system", "__init__", "", "has space",
                    "has-dash", "has.dot", "has@", "table$"] {
-        assert!(validate_user_identifier(name).is_err(), "Accepted invalid: {}", name);
+        assert!(validate_user_identifier(name).is_err(), "Accepted invalid: {name}");
     }
     // Qualified name parsing
     assert_eq!(parse_qualified_name("orders", "public"), ("public", "orders"));
@@ -133,7 +133,7 @@ fn test_edge_cases() {
         &[0], true).is_err());
 
     // 10. Too many columns (> MAX_COLUMNS = 65)
-    let many: Vec<ColumnDef> = (0..66).map(|i| u64_col_def(&format!("c{}", i))).collect();
+    let many: Vec<ColumnDef> = (0..66).map(|i| u64_col_def(&format!("c{i}"))).collect();
     assert!(engine.create_table("public.too_many", &many, &[0], true).is_err());
 
     // 11. Drop system schema
@@ -268,7 +268,7 @@ fn test_restart_full() {
         assert_eq!(schema.num_columns(), 2);
         // Sequence recovery: new table should get higher ID
         let new_tid = engine.create_table("marketing.other", &cols, &[0], true).unwrap();
-        assert!(new_tid > first_tid, "Allocator sequence recovery failed: {} <= {}", new_tid, first_tid);
+        assert!(new_tid > first_tid, "Allocator sequence recovery failed: {new_tid} <= {first_tid}");
         engine.close();
     }
 
@@ -354,7 +354,7 @@ fn test_nullable_pk_rejected() {
         str_col_def("name"),
     ];
     let err = engine.create_table("public.bad_pk_null", &cols, &[0], true).unwrap_err();
-    assert!(err.contains("nullable"), "expected nullable-PK error, got: {}", err);
+    assert!(err.contains("nullable"), "expected nullable-PK error, got: {err}");
 
     // Sanity: same shape with is_nullable=false succeeds.
     let cols_ok = vec![u64_col_def("id"), str_col_def("name")];
@@ -389,8 +389,8 @@ fn test_hook_table_register_rejects_malformed_pk() {
     let mut assert_rejects = |raw_pk_cols: u64, snippet: &str| {
         let batch = build_table_tab_row(&dir, tid, raw_pk_cols, "bad_table");
         let res = engine.ingest_to_family(TABLE_TAB_ID, &batch);
-        let err = res.expect_err(&format!("expected Err containing '{}', got Ok", snippet));
-        assert!(err.contains(snippet), "expected '{}', got: {}", snippet, err);
+        let err = res.expect_err(&format!("expected Err containing '{snippet}', got Ok"));
+        assert!(err.contains(snippet), "expected '{snippet}', got: {err}");
     };
 
     // Count out of range (decoded count, not clamped slice length).
@@ -493,7 +493,7 @@ fn test_apply_pk_col_of_round_trips_compound_list() {
         let stored = engine.caches.pk_col_of.get(&tid)
             .copied().expect("pk_col_of entry must exist after apply");
         assert_eq!(stored.as_slice(), pk_cols.as_slice(),
-            "compound PK list must round-trip in full (input={:?})", pk_cols);
+            "compound PK list must round-trip in full (input={pk_cols:?})");
     }
 
     engine.close();
@@ -528,7 +528,7 @@ fn test_drop_view_removes_directory() {
         .expect("view registered in dag")
         .directory.clone();
     assert!(std::path::Path::new(&view_dir).exists(),
-        "view dir should exist after create: {}", view_dir);
+        "view dir should exist after create: {view_dir}");
 
     // Drop removes catalog metadata and queues the physical directory into
     // pending_dir_deletions (deferred so the rmdir can't race the WAL fsync).
@@ -537,7 +537,7 @@ fn test_drop_view_removes_directory() {
     engine.drop_view("public.myview").unwrap();
     engine.drain_pending_dir_deletions();
     assert!(!std::path::Path::new(&view_dir).exists(),
-        "view dir must be deleted on drop: {}", view_dir);
+        "view dir must be deleted on drop: {view_dir}");
 
     // No double-drop: the view is gone from the catalog.
     assert!(engine.drop_view("public.myview").is_err(),

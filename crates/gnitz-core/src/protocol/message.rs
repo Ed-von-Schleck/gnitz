@@ -94,7 +94,7 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
 
     if tid != IPC_CONTROL_TID {
         return Err(ProtocolError::DecodeError(format!(
-            "expected control TID 0x{:08X}, got 0x{:08X}", IPC_CONTROL_TID, tid
+            "expected control TID 0x{IPC_CONTROL_TID:08X}, got 0x{tid:08X}"
         )));
     }
     if batch.len() != 1 {
@@ -112,7 +112,7 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
                 "control block col {} Fixed len {} != 8", ci, v.len()
             ))),
             _ => Err(ProtocolError::DecodeError(format!(
-                "control block col {} is not Fixed", ci
+                "control block col {ci} is not Fixed"
             ))),
         }
     }
@@ -124,7 +124,7 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
                 "control block col {} U128s len {} != 1", ci, v.len()
             ))),
             _ => Err(ProtocolError::DecodeError(format!(
-                "control block col {} is not U128s", ci
+                "control block col {ci} is not U128s"
             ))),
         }
     }
@@ -562,9 +562,9 @@ mod tests {
         let nulls: Vec<u64>   = (0..n).map(|i| if i % 3 == 0 { 1u64 } else { 0u64 }).collect();
 
         let col1: Vec<Option<String>> = (0..n).map(|i| {
-            if i % 3 == 0 { None } else { Some(format!("nullable_{}", i)) }
+            if i % 3 == 0 { None } else { Some(format!("nullable_{i}")) }
         }).collect();
-        let col2: Vec<Option<String>> = (0..n).map(|i| Some(format!("nonnull_{}", i))).collect();
+        let col2: Vec<Option<String>> = (0..n).map(|i| Some(format!("nonnull_{i}"))).collect();
 
         let batch = ZSetBatch {
             pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),

@@ -18,8 +18,8 @@ impl From<ProtocolError> for ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ClientError::Protocol(e)    => write!(f, "protocol error: {}", e),
-            ClientError::ServerError(s) => write!(f, "server error: {}", s),
+            ClientError::Protocol(e)    => write!(f, "protocol error: {e}"),
+            ClientError::ServerError(s) => write!(f, "server error: {s}"),
             ClientError::SchemaMismatch => write!(f, "schema version mismatch"),
             ClientError::NoIndex        => write!(f, "no index on requested column"),
         }

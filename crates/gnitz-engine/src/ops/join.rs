@@ -2260,7 +2260,7 @@ mod tests {
             .collect();
         assert_eq!(out.count, expected.len());
         for (i, &p) in expected.iter().enumerate() {
-            assert_eq!(get_payload_i64(&out, i), p, "row {}", i);
+            assert_eq!(get_payload_i64(&out, i), p, "row {i}");
         }
     }
 }

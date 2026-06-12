@@ -486,8 +486,7 @@ pub(crate) unsafe fn sal_read_group_header(
     if my_size > 0 && my_offset > 0 {
         debug_assert!(
             my_offset + my_size <= payload_size,
-            "SAL group header corrupt: my_offset={} my_size={} payload_size={}",
-            my_offset, my_size, payload_size
+            "SAL group header corrupt: my_offset={my_offset} my_size={my_size} payload_size={payload_size}"
         );
         let data_size = if my_offset + my_size <= payload_size { my_size as u32 } else { 0 };
         SalReadResult {

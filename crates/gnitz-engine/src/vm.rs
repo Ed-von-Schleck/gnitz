@@ -779,7 +779,7 @@ pub fn execute_epoch_multi(
             if let Some(ref s) = input_batch.schema {
                 assert_eq!(
                     s.num_columns(), program.reg_meta[input_reg as usize].schema.num_columns(),
-                    "VM register {} schema/batch column-count mismatch", input_reg,
+                    "VM register {input_reg} schema/batch column-count mismatch",
                 );
             }
         }

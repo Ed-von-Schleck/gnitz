@@ -56,8 +56,7 @@ impl CatalogEngine {
         let target_promoted = get_index_key_type(target_type)?;
         if promoted != target_promoted {
             return Err(format!(
-                "FK type mismatch: promoted code {} vs target {}",
-                promoted, target_promoted
+                "FK type mismatch: promoted code {promoted} vs target {target_promoted}"
             ));
         }
         Ok(())
@@ -75,7 +74,7 @@ impl CatalogEngine {
         };
 
         let entry = self.dag.tables.get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
         let schema = entry.schema;
         let mb = batch.as_mem_batch();
 
@@ -85,7 +84,7 @@ impl CatalogEngine {
             let target_col_idx = constraint.target_col_idx;
 
             let target_entry = self.dag.tables.get(&target_id)
-                .ok_or_else(|| format!("FK target table {} not found", target_id))?;
+                .ok_or_else(|| format!("FK target table {target_id} not found"))?;
 
             // Probe the parent PK when the referenced column is the lone PK;
             // otherwise seek the parent's UNIQUE index circuit for the column.
@@ -99,7 +98,7 @@ impl CatalogEngine {
                 Some(target_entry.index_circuits.iter()
                     .find(|ic| ic.unique_cols() == Some(&[target_col_idx as u32][..]))
                     .ok_or_else(|| format!(
-                        "FK target {} col {} has no UNIQUE index", target_id, target_col_idx))?)
+                        "FK target {target_id} col {target_col_idx} has no UNIQUE index"))?)
             };
             let idx_key_size = idx_ic.map(|ic| ic.index_schema.columns[0].size() as usize);
             let idx_key_type = idx_ic.map(|ic| ic.index_schema.columns[0].type_code);
@@ -141,8 +140,7 @@ impl CatalogEngine {
                     let (tsn, ttn) = self.caches.entity_by_id.get(&target_id)
                         .cloned().unwrap_or_default();
                     return Err(format!(
-                        "Foreign Key violation in '{}.{}': value not found in target '{}.{}'",
-                        sn, tn, tsn, ttn
+                        "Foreign Key violation in '{sn}.{tn}': value not found in target '{tsn}.{ttn}'"
                     ));
                 }
             }
@@ -159,7 +157,7 @@ impl CatalogEngine {
     /// so we only reject if the NEW value collides with a DIFFERENT row's entry.
     pub(crate) fn validate_unique_indices(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         let entry = self.dag.tables.get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {}", table_id))?;
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
 
         // Quick check: any unique index circuits?
         let has_unique = entry.index_circuits.iter().any(|ic| ic.is_unique);

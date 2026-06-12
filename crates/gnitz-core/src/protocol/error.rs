@@ -11,10 +11,10 @@ pub enum ProtocolError {
 impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProtocolError::BadMagic(got) => write!(f, "bad magic: 0x{:016X}", got),
-            ProtocolError::UnknownTypeCode(code) => write!(f, "unknown type code: {}", code),
-            ProtocolError::DecodeError(msg) => write!(f, "decode error: {}", msg),
-            ProtocolError::IoError(e) => write!(f, "io error: {}", e),
+            ProtocolError::BadMagic(got) => write!(f, "bad magic: 0x{got:016X}"),
+            ProtocolError::UnknownTypeCode(code) => write!(f, "unknown type code: {code}"),
+            ProtocolError::DecodeError(msg) => write!(f, "decode error: {msg}"),
+            ProtocolError::IoError(e) => write!(f, "io error: {e}"),
         }
     }
 }

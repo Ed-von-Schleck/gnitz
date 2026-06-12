@@ -370,11 +370,11 @@ fn append_row_inner(
             }
             ColData::Bytes(_) => {
                 return Err(format!(
-                    "col {} is a BLOB column; not yet supported in C API row writer", ci));
+                    "col {ci} is a BLOB column; not yet supported in C API row writer"));
             }
             ColData::U128s(v) => {
                 if offset + 16 > col_data.len() {
-                    return Err(format!("col_data too short for U128 at col {}", ci));
+                    return Err(format!("col_data too short for U128 at col {ci}"));
                 }
                 let lo = u64::from_le_bytes(col_data[offset..offset+8].try_into().unwrap());
                 let hi = u64::from_le_bytes(col_data[offset+8..offset+16].try_into().unwrap());
@@ -1437,7 +1437,7 @@ mod tests {
                 gnitz_schema_add_col(sch, cname.as_ptr(), *tc as c_int,
                                      if *nullable { 1 } else { 0 }),
                 0,
-                "gnitz_schema_add_col failed for {}", name,
+                "gnitz_schema_add_col failed for {name}",
             );
         }
         sch

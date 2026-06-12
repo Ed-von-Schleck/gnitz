@@ -1026,7 +1026,7 @@ mod tests {
 
         // Add enough shards to trigger compaction to L1
         for i in 0..5u64 {
-            let name = format!("s{}.db", i);
+            let name = format!("s{i}.db");
             let pk = i * 10 + 1;
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 100]);
             idx.add_shard(&path, i, i + 1).unwrap();
@@ -1046,7 +1046,7 @@ mod tests {
             let pk = (i * 10 + 1) as u128;
             let mut found = false;
             idx2.find_pk(pk, &mut |_, _| found = true);
-            assert!(found, "key {} not found after manifest roundtrip", pk);
+            assert!(found, "key {pk} not found after manifest roundtrip");
         }
 
         assert_eq!(idx.max_lsn(), idx2.max_lsn());
@@ -1062,7 +1062,7 @@ mod tests {
         // Add > L0_COMPACT_THRESHOLD shards
         let mut all_pks = Vec::new();
         for i in 0..5u64 {
-            let name = format!("s{}.db", i);
+            let name = format!("s{i}.db");
             let pk = (i + 1) * 10;
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64]);
             idx.add_shard(&path, i, i + 1).unwrap();
@@ -1082,7 +1082,7 @@ mod tests {
         for pk in &all_pks {
             let mut found = false;
             idx.find_pk(*pk as u128, &mut |_, _| found = true);
-            assert!(found, "key {} lost after compaction", pk);
+            assert!(found, "key {pk} lost after compaction");
         }
     }
 
@@ -1098,7 +1098,7 @@ mod tests {
         let guard = idx.levels[0].get_or_create_guard(0);
         let mut all_pks = Vec::new();
         for i in 0..6u64 {
-            let name = format!("guard_s{}.db", i);
+            let name = format!("guard_s{i}.db");
             let pk = i + 1;
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
             let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
@@ -1116,7 +1116,7 @@ mod tests {
         for pk in &all_pks {
             let mut found = false;
             idx.find_pk(*pk as u128, &mut |_, _| found = true);
-            assert!(found, "key {} lost after guard compaction", pk);
+            assert!(found, "key {pk} lost after guard compaction");
         }
     }
 
@@ -1132,7 +1132,7 @@ mod tests {
         for i in 0..3u64 {
             let path = write_test_shard(
                 dir.path(),
-                &format!("src_{}.db", i),
+                &format!("src_{i}.db"),
                 &[i + 1],
                 &[(i as i64 + 1) * 10],
             );
@@ -1208,7 +1208,7 @@ mod tests {
         // Insert 5 L0 shards (> L0_COMPACT_THRESHOLD) with keys all below 100.
         let low_keys = [50u64, 60, 70, 80, 90];
         for (i, &k) in low_keys.iter().enumerate() {
-            let name = format!("l0_{}.db", i);
+            let name = format!("l0_{i}.db");
             let p = write_test_shard(dir.path(), &name, &[k], &[k as i64 * 10]);
             idx.add_shard(&p, (i + 2) as u64, (i + 2) as u64).unwrap();
         }
@@ -1332,7 +1332,7 @@ mod tests {
         let mut all_pks = Vec::new();
         for i in 0..5u64 {
             let pk = (i + 1) * 10;
-            let path = write_test_shard(dir.path(), &format!("s{}.db", i), &[pk], &[pk as i64]);
+            let path = write_test_shard(dir.path(), &format!("s{i}.db"), &[pk], &[pk as i64]);
             idx.add_shard(&path, i, i + 1).unwrap();
             all_pks.push(pk);
         }
@@ -1353,7 +1353,7 @@ mod tests {
         for pk in &all_pks {
             let mut found = false;
             idx.find_pk(*pk as u128, &mut |_, _| found = true);
-            assert!(found, "pk {} lost from L0 after failed run_compact", pk);
+            assert!(found, "pk {pk} lost from L0 after failed run_compact");
         }
     }
 
@@ -1373,7 +1373,7 @@ mod tests {
         // L1 guard at key=100: 5 shards (> GUARD_FILE_THRESHOLD=4) with keys in [100, 199]
         let src_pks: Vec<u64> = vec![100, 120, 140, 160, 180];
         for (i, &pk) in src_pks.iter().enumerate() {
-            let name = format!("src_{}.db", i);
+            let name = format!("src_{i}.db");
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
             let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
             idx.levels[0].get_or_create_guard(100).entries.push(entry);
@@ -1401,7 +1401,7 @@ mod tests {
         for &pk in &src_pks {
             let mut found = false;
             idx.find_pk(pk as u128, &mut |_, _| found = true);
-            assert!(found, "key {} lost after vertical compaction (routing gap bug)", pk);
+            assert!(found, "key {pk} lost after vertical compaction (routing gap bug)");
         }
 
         // The destination key 250 must also still be present

@@ -50,7 +50,7 @@ impl ServerHandle {
            .stdout(Stdio::null())
            .stderr(Stdio::from(stderr_file)); // captured for post-mortem
         if workers > 1 {
-            cmd.arg(format!("--workers={}", workers));
+            cmd.arg(format!("--workers={workers}"));
         }
         let mut proc = cmd.spawn().expect("failed to spawn server");
 

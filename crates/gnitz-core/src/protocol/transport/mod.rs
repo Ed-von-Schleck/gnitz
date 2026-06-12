@@ -347,7 +347,7 @@ pub fn recv_framed(sock_fd: RawFd, max_payload_len: usize) -> Result<Vec<u8>, Pr
     }
     if payload_len > max_payload_len {
         return Err(ProtocolError::DecodeError(format!(
-            "payload length {} exceeds maximum {} bytes", payload_len, max_payload_len
+            "payload length {payload_len} exceeds maximum {max_payload_len} bytes"
         )));
     }
     let mut buf: Vec<u8> = Vec::with_capacity(payload_len);

@@ -48,7 +48,7 @@ pub fn execute_statement(
         Statement::Update { .. } => dml::execute_update(client, schema_name, stmt, &mut binder),
         Statement::Delete(_)     => dml::execute_delete(client, schema_name, stmt, &mut binder),
         _ => Err(GnitzSqlError::Unsupported(
-            format!("unsupported SQL statement: {:?}", stmt)
+            format!("unsupported SQL statement: {stmt:?}")
         )),
     }
 }
@@ -93,8 +93,7 @@ fn resolve_fk_target_inline(
         current_pk_cols[0] as usize
     } else {
         return Err(GnitzSqlError::Bind(format!(
-            "self-referencing FK against '{}' must name the referenced column",
-            ref_table,
+            "self-referencing FK against '{ref_table}' must name the referenced column",
         )));
     };
 
@@ -114,9 +113,8 @@ fn resolve_fk_target_inline(
     };
     if !is_compat {
         return Err(GnitzSqlError::Bind(format!(
-            "FK type mismatch: column type {:?} is not compatible with referenced \
-             column type {:?}",
-            fk_col_type, parent_col_type,
+            "FK type mismatch: column type {fk_col_type:?} is not compatible with referenced \
+             column type {parent_col_type:?}",
         )));
     }
     Ok((0, ref_col_idx as u64, parent_col_type))
@@ -144,7 +142,7 @@ fn resolve_fk_target(
     }
 
     let (ref_tid, ref_schema) = client.resolve_table_id(schema_name, &ref_table)
-        .map_err(|e| GnitzSqlError::Bind(format!("FK target '{}': {}", ref_table, e)))?;
+        .map_err(|e| GnitzSqlError::Bind(format!("FK target '{ref_table}': {e}")))?;
 
     if referred_columns.len() > 1 {
         return Err(GnitzSqlError::Unsupported(
@@ -165,8 +163,7 @@ fn resolve_fk_target(
         ref_schema.pk_index_single()
     } else {
         return Err(GnitzSqlError::Bind(format!(
-            "FK against compound-PK table '{}' must name the referenced column",
-            ref_table,
+            "FK against compound-PK table '{ref_table}' must name the referenced column",
         )));
     };
 
@@ -195,9 +192,8 @@ fn resolve_fk_target(
     };
     if !is_compat {
         return Err(GnitzSqlError::Bind(format!(
-            "FK type mismatch: column type {:?} is not compatible with referenced \
-             column type {:?}",
-            fk_col_type, parent_col_type,
+            "FK type mismatch: column type {fk_col_type:?} is not compatible with referenced \
+             column type {parent_col_type:?}",
         )));
     }
 
@@ -358,7 +354,7 @@ fn execute_create_table(
             let col_idx = cols.iter()
                 .position(|c| c.name.eq_ignore_ascii_case(local_col_name))
                 .ok_or_else(|| GnitzSqlError::Bind(format!(
-                    "FOREIGN KEY column '{}' not found in table definition", local_col_name
+                    "FOREIGN KEY column '{local_col_name}' not found in table definition"
                 )))?;
             let (tid, idx, parent_pk_type) = resolve_fk_target(
                 client, schema_name, foreign_table, referred_columns, cols[col_idx].type_code,
@@ -385,10 +381,10 @@ fn execute_create_table(
                 let idx = cols.iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| GnitzSqlError::Bind(format!(
-                        "UNIQUE column '{}' not found in table definition", col_name)))?;
+                        "UNIQUE column '{col_name}' not found in table definition")))?;
                 if col_indices.contains(&(idx as u32)) {
                     return Err(GnitzSqlError::Plan(format!(
-                        "duplicate column '{}' in UNIQUE constraint", col_name)));
+                        "duplicate column '{col_name}' in UNIQUE constraint")));
                 }
                 col_indices.push(idx as u32);
             }
@@ -527,7 +523,7 @@ fn execute_drop(
                 client.drop_index_by_name(&name).map_err(GnitzSqlError::Exec)?;
             }
             _ => return Err(GnitzSqlError::Unsupported(
-                format!("DROP {:?} not supported", object_type)
+                format!("DROP {object_type:?} not supported")
             )),
         }
     }
@@ -555,7 +551,7 @@ fn execute_create_view(
         ));
     }
 
-    let sql_text = format!("{}", stmt);
+    let sql_text = format!("{stmt}");
 
     // Process CTEs (WITH clause) — inline them into the binder cache
     if let Some(with) = &query.with {
@@ -570,17 +566,17 @@ fn execute_create_view(
             let cte_select = match cte.query.body.as_ref() {
                 SetExpr::Select(s) => s,
                 _ => return Err(GnitzSqlError::Unsupported(
-                    format!("CTE '{}': only SELECT supported", cte_name)
+                    format!("CTE '{cte_name}': only SELECT supported")
                 )),
             };
             if cte_select.from.len() != 1 || !cte_select.from[0].joins.is_empty() {
                 return Err(GnitzSqlError::Unsupported(
-                    format!("CTE '{}': only single table without JOINs", cte_name)
+                    format!("CTE '{cte_name}': only single table without JOINs")
                 ));
             }
             let cte_table_name = extract_table_factor_name(
                 &cte_select.from[0].relation,
-                &format!("CTE '{}'", cte_name),
+                &format!("CTE '{cte_name}'"),
             )?;
             // Resolve the CTE's source table and cache the CTE name as an alias.
             let (cte_tid, cte_schema) = binder.resolve(client, &cte_table_name)?;
@@ -620,10 +616,9 @@ fn execute_create_view(
                 || !proj_is_identity
             {
                 return Err(GnitzSqlError::Unsupported(format!(
-                    "CTE '{}': only a plain column pass-through of a single table is \
+                    "CTE '{cte_name}': only a plain column pass-through of a single table is \
                      supported; WHERE, a subset/reordered/computed projection, GROUP BY, \
-                     HAVING, DISTINCT, ORDER BY and LIMIT inside a CTE are not yet supported",
-                    cte_name
+                     HAVING, DISTINCT, ORDER BY and LIMIT inside a CTE are not yet supported"
                 )));
             }
             // Apply CTE column aliases (`WITH cte(a, b) AS ...`): rename the
@@ -860,11 +855,11 @@ fn execute_create_index(
         };
         let col_idx = find_unique_column(&schema.columns, &col_name)?
             .ok_or_else(|| GnitzSqlError::Bind(
-                format!("column '{}' not found", col_name)
+                format!("column '{col_name}' not found")
             ))?;
         if col_indices.contains(&(col_idx as u32)) {
             return Err(GnitzSqlError::Unsupported(format!(
-                "CREATE INDEX: duplicate column '{}' in index list", col_name)));
+                "CREATE INDEX: duplicate column '{col_name}' in index list")));
         }
         col_names.push(col_name);
         col_indices.push(col_idx as u32);
@@ -960,7 +955,7 @@ fn build_projection(
                     let out_type = bound.infer_type(source_schema);
                     items.push(ProjectionItem::Computed { bound_expr: bound, _out_type: out_type });
                     out_cols.push(ColumnDef {
-                        name: format!("_expr{}", idx),
+                        name: format!("_expr{idx}"),
                         type_code: out_type,
                         is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
                     });
@@ -1778,7 +1773,7 @@ fn execute_create_group_by_view(
                         AggFunc::Max => "_max",
                         AggFunc::Avg => "_avg",
                     };
-                    format!("{}{}", prefix, idx)
+                    format!("{prefix}{idx}")
                 });
                 agg_mappings.push(AggMapping {
                     specs_start: start, is_avg,
@@ -2085,7 +2080,7 @@ fn having_agg_func(
         "max" => AggFunc::Max,
         "avg" => AggFunc::Avg,
         _ => return Err(GnitzSqlError::Unsupported(
-            format!("HAVING: function '{}' not supported", name)
+            format!("HAVING: function '{name}' not supported")
         )),
     };
     Ok((agg_func, arg_col))
@@ -2122,7 +2117,7 @@ fn push_agg_specs(
     // its own wildcard guard and a future caller cannot reintroduce the panic.
     if !matches!(agg_func, AggFunc::Count) && arg_col.is_none() {
         return Err(GnitzSqlError::Plan(format!(
-            "{:?} requires an argument column; only COUNT(*) accepts a wildcard", agg_func
+            "{agg_func:?} requires an argument column; only COUNT(*) accepts a wildcard"
         )));
     }
     Ok(match agg_func {
@@ -2157,7 +2152,7 @@ fn append_having_agg(
     let is_avg = push_agg_specs(agg_func, arg_col, agg_specs)?;
     agg_mappings.push(AggMapping {
         specs_start: start, is_avg,
-        output_name: format!("_having_agg{}", agg_idx),
+        output_name: format!("_having_agg{agg_idx}"),
         output_type: out_type, agg_func, arg_col,
     });
     Ok(())
@@ -2218,15 +2213,14 @@ fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlE
             let col_name = &ident.value;
             let src = find_unique_column(&ctx.source_schema.columns, col_name)?
                 .ok_or_else(|| GnitzSqlError::Bind(
-                    format!("HAVING: column '{}' not found", col_name)
+                    format!("HAVING: column '{col_name}' not found")
                 ))?;
             // HAVING may only reference grouped columns. The old `position()`
             // bound a local solely to compute `1 + gpos`, which now lives inside
             // `group_col_reduce_pos`; binding it here would be a dead local.
             if !ctx.group_col_indices.contains(&src) {
                 return Err(GnitzSqlError::Bind(format!(
-                    "HAVING: column '{}' must appear in GROUP BY or an aggregate function",
-                    col_name)));
+                    "HAVING: column '{col_name}' must appear in GROUP BY or an aggregate function")));
             }
             let reduce_col = group_col_reduce_pos(
                 src, ctx.group_set_eq_pk, ctx.single_col_natural_pk,
@@ -2274,7 +2268,7 @@ fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlE
                 sqlparser::ast::BinaryOperator::And   => BinOp::And,
                 sqlparser::ast::BinaryOperator::Or    => BinOp::Or,
                 op => return Err(GnitzSqlError::Unsupported(
-                    format!("HAVING: operator {:?} not supported", op)
+                    format!("HAVING: operator {op:?} not supported")
                 )),
             };
             Ok(BoundExpr::BinOp(Box::new(l), bop, Box::new(r)))
@@ -2287,7 +2281,7 @@ fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlE
                     } else if let Ok(f) = n.parse::<f64>() {
                         Ok(BoundExpr::LitFloat(f))
                     } else {
-                        Err(GnitzSqlError::Bind(format!("HAVING: invalid number {}", n)))
+                        Err(GnitzSqlError::Bind(format!("HAVING: invalid number {n}")))
                     }
                 }
                 _ => Err(GnitzSqlError::Unsupported("HAVING: unsupported value type".to_string())),
@@ -2295,7 +2289,7 @@ fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlE
         }
         Expr::Nested(inner) => bind_having_expr(inner, ctx),
         _ => Err(GnitzSqlError::Unsupported(
-            format!("HAVING: unsupported expression {:?}", expr)
+            format!("HAVING: unsupported expression {expr:?}")
         )),
     }
 }
@@ -2562,7 +2556,7 @@ fn execute_create_set_op_view(
             cb.union(except_lr, correction)
         }
         _ => return Err(GnitzSqlError::Unsupported(
-            format!("set operation {:?} not supported", op)
+            format!("set operation {op:?} not supported")
         )),
     };
 

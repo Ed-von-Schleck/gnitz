@@ -87,7 +87,7 @@ mod tests {
         let pks: Vec<u128> = (0u128..1000).collect();
         let filter = build(&pks).unwrap();
         for &pk in &pks {
-            assert!(may_contain(&filter, pk), "false negative for key {}", pk);
+            assert!(may_contain(&filter, pk), "false negative for key {pk}");
         }
     }
 
@@ -102,7 +102,7 @@ mod tests {
             }
         }
         // Xor8 theoretical FPR ~0.39%. Allow up to 2%.
-        assert!(fp < 200, "FPR too high: {}/10000", fp);
+        assert!(fp < 200, "FPR too high: {fp}/10000");
     }
 
     #[test]
@@ -127,7 +127,7 @@ mod tests {
         for &pk in &pks {
             assert!(
                 may_contain(&restored, pk),
-                "roundtrip false negative for key {:#034x}", pk,
+                "roundtrip false negative for key {pk:#034x}",
             );
         }
     }
@@ -192,7 +192,7 @@ mod tests {
         ];
         let filter = build(&pks).unwrap();
         for &pk in &pks {
-            assert!(may_contain(&filter, pk), "false negative for pk {:#034x}", pk);
+            assert!(may_contain(&filter, pk), "false negative for pk {pk:#034x}");
         }
     }
 }

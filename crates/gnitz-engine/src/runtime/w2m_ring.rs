@@ -218,7 +218,7 @@ pub unsafe fn init_region(ptr: *mut u8, capacity: u64) {
     // at phys(vwc). If capacity is not 8-aligned, phys(vwc) can sit fewer than
     // 8 bytes from the end of the buffer, causing those writes to cross the
     // mmap boundary.
-    assert!(capacity.is_multiple_of(8), "W2M capacity={} must be 8-byte aligned", capacity);
+    assert!(capacity.is_multiple_of(8), "W2M capacity={capacity} must be 8-byte aligned");
     // Zero the header first so re-init on a previously-live region
     // clears every byte, including padding.
     std::ptr::write_bytes(ptr, 0, W2M_HEADER_SIZE);
@@ -240,7 +240,7 @@ pub unsafe fn init_region(ptr: *mut u8, capacity: u64) {
 fn phys(virt: u64, cap: u64) -> u64 {
     let header = W2M_HEADER_SIZE as u64;
     let dcap = cap - header;
-    debug_assert!(virt >= header, "virtual cursor below HEADER: {}", virt);
+    debug_assert!(virt >= header, "virtual cursor below HEADER: {virt}");
     debug_assert!(dcap > 0, "data capacity must be positive");
     header + (virt - header) % dcap
 }
@@ -253,7 +253,7 @@ fn phys(virt: u64, cap: u64) -> u64 {
 fn room_for(vwc: u64, vrc: u64, total: u64, cap: u64) -> bool {
     let header = W2M_HEADER_SIZE as u64;
     let dcap = cap - header;
-    debug_assert!(vrc <= vwc, "cursor inversion: vrc={} vwc={}", vrc, vwc);
+    debug_assert!(vrc <= vwc, "cursor inversion: vrc={vrc} vwc={vwc}");
     debug_assert!(vwc - vrc <= dcap,
         "used {} exceeds DCAP {} (vwc={} vrc={})", vwc - vrc, dcap, vwc, vrc);
     let used = vwc - vrc;
@@ -441,7 +441,7 @@ pub(crate) unsafe fn try_reserve(
 #[cfg(test)]
 pub(crate) unsafe fn init_region_for_tests(ptr: *mut u8, capacity: u64) {
     assert!(capacity >= W2M_HEADER_SIZE as u64 + 16);
-    assert!(capacity.is_multiple_of(8), "W2M capacity={} must be 8-byte aligned", capacity);
+    assert!(capacity.is_multiple_of(8), "W2M capacity={capacity} must be 8-byte aligned");
     std::ptr::write_bytes(ptr, 0, W2M_HEADER_SIZE);
     let hdr = &*(ptr as *const W2mRingHeader);
     hdr.write_cursor.store(W2M_HEADER_SIZE as u64, Ordering::Release);
@@ -516,7 +516,7 @@ pub unsafe fn try_consume(
 ) -> Option<(*const u8, u32, u64, u32)> {
     let mut vrc = read_cursor;
     let vwc = hdr.write_cursor.load(Ordering::Acquire);
-    debug_assert!(vrc <= vwc, "read_cursor {} ahead of write_cursor {}", vrc, vwc);
+    debug_assert!(vrc <= vwc, "read_cursor {vrc} ahead of write_cursor {vwc}");
     if vrc == vwc {
         return None;
     }
@@ -705,7 +705,7 @@ mod tests {
             for tag in 0u8..2 {
                 match try_publish(hdr, ptr, msg_sz, |slot| { slot[0] = tag; }) {
                     TryPublish::Ok(_) => {}
-                    TryPublish::Full => panic!("tag {} publish", tag),
+                    TryPublish::Full => panic!("tag {tag} publish"),
                 }
                 let (_data_ptr, sz, new_rc, _req_id) = try_consume(hdr, ptr, rc)
                     .expect("tag consume");
@@ -962,7 +962,7 @@ mod tests {
             };
 
             // 4 contiguous publishes.
-            for tag in 1u8..=4 { assert!(publish(tag), "publish #{}", tag); }
+            for tag in 1u8..=4 { assert!(publish(tag), "publish #{tag}"); }
 
             // Consume 3, leaving msg #4 unread at rc = HEADER + 3*total.
             let mut rc = hdr.read_cursor().load(Ordering::Acquire);
@@ -991,7 +991,7 @@ mod tests {
                     hdr.advance_read_cursors(new_rc);
                     rc = new_rc;
                     assert!(publish(tag),
-                        "publish #{} after drain", tag);
+                        "publish #{tag} after drain");
                 }
             }
 

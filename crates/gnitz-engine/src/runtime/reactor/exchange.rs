@@ -43,7 +43,7 @@ pub struct PendingRelay {
 
 impl ExchangeAccumulator {
     pub fn new(nw: usize) -> Self {
-        debug_assert!(nw <= MAX_WORKERS, "ExchangeAccumulator: nw={} exceeds MAX_WORKERS={}", nw, MAX_WORKERS);
+        debug_assert!(nw <= MAX_WORKERS, "ExchangeAccumulator: nw={nw} exceeds MAX_WORKERS={MAX_WORKERS}");
         ExchangeAccumulator { rounds: FxHashMap::default(), nw }
     }
 

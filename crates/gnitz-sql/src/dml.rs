@@ -72,9 +72,8 @@ fn validate_conflict_target(
             let pk_name = schema.columns[schema.pk_index_single()].name.as_str();
             if !col_name.eq_ignore_ascii_case(pk_name) {
                 return Err(GnitzSqlError::Unsupported(format!(
-                    "ON CONFLICT ({}) — only the primary key column '{}' is \
-                     supported as a conflict target",
-                    col_name, pk_name
+                    "ON CONFLICT ({col_name}) — only the primary key column '{pk_name}' is \
+                     supported as a conflict target"
                 )));
             }
             Ok(())
@@ -225,7 +224,7 @@ fn bind_do_update_rhs(
             let col_idx = schema.columns.iter()
                 .position(|c| c.name.eq_ignore_ascii_case(col_name))
                 .ok_or_else(|| GnitzSqlError::Bind(format!(
-                    "EXCLUDED.{}: column not found", col_name
+                    "EXCLUDED.{col_name}: column not found"
                 )))?;
             return Ok(BoundUpdateExpr::Excluded(BoundExpr::ColRef(col_idx)));
         }
@@ -420,10 +419,10 @@ fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
     } else if s.len() == 32 {
         s.to_string()
     } else {
-        return Err(GnitzSqlError::Bind(format!("invalid UUID literal: {:?}", s)));
+        return Err(GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")));
     };
     u128::from_str_radix(&hex, 16)
-        .map_err(|_| GnitzSqlError::Bind(format!("invalid UUID literal: {:?}", s)))
+        .map_err(|_| GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")))
 }
 
 /// Parse a numeric SQL literal into its packed-u128 PK form. The returned
@@ -442,7 +441,7 @@ fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
 /// same key to different workers.
 fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u128> {
     let s_owned;
-    let s: &str = if negated { s_owned = format!("-{}", n_str); &s_owned } else { n_str };
+    let s: &str = if negated { s_owned = format!("-{n_str}"); &s_owned } else { n_str };
     match tc {
         TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
             let v = s.parse::<i64>().ok()?;
@@ -513,20 +512,18 @@ fn parse_one_pk_literal(
                     | TypeCode::U64 | TypeCode::U128 | TypeCode::UUID
                 ) {
                     GnitzSqlError::Bind(format!(
-                        "PK column '{}' of type {:?} does not accept negative literals",
-                        col_name, tc))
+                        "PK column '{col_name}' of type {tc:?} does not accept negative literals"))
                 } else {
-                    let s_disp = if negated { format!("-{}", n) } else { n.to_string() };
+                    let s_disp = if negated { format!("-{n}") } else { n.to_string() };
                     GnitzSqlError::Bind(format!(
-                        "PK column '{}' value is not a valid {:?}: {}",
-                        col_name, tc, s_disp))
+                        "PK column '{col_name}' value is not a valid {tc:?}: {s_disp}"))
                 }
             })
         }
         // UUID accepts a single-quoted UUID string; non-UUID PKs are numeric only.
         Some(SqlLiteral::Str(s)) if tc == TypeCode::UUID => parse_uuid_str(s),
         _ => Err(GnitzSqlError::Bind(format!(
-            "PK column '{}' value must be a numeric literal", col_name
+            "PK column '{col_name}' value must be a numeric literal"
         ))),
     }
 }
@@ -591,7 +588,7 @@ fn append_value_to_col(
                 // Build the effective numeric string with optional leading minus.
                 let neg_buf;
                 let n: &str = if negated {
-                    neg_buf = format!("-{}", n);
+                    neg_buf = format!("-{n}");
                     &neg_buf
                 } else {
                     n.as_str()
@@ -599,22 +596,22 @@ fn append_value_to_col(
                 match col {
                     ColData::Fixed(buf) => {
                         match tc {
-                            TypeCode::U8  => { let v = n.parse::<u8>().map_err(|_| GnitzSqlError::Bind(format!("invalid u8: {}", n)))?; buf.push(v); }
-                            TypeCode::I8  => { let v = n.parse::<i8>().map_err(|_| GnitzSqlError::Bind(format!("invalid i8: {}", n)))?; buf.push(v as u8); }
-                            TypeCode::U16 => { let v = n.parse::<u16>().map_err(|_| GnitzSqlError::Bind(format!("invalid u16: {}", n)))?; buf.extend_from_slice(&v.to_le_bytes()); }
-                            TypeCode::I16 => { let v = n.parse::<i16>().map_err(|_| GnitzSqlError::Bind(format!("invalid i16: {}", n)))?; buf.extend_from_slice(&v.to_le_bytes()); }
-                            TypeCode::U32 => { let v = n.parse::<u32>().map_err(|_| GnitzSqlError::Bind(format!("invalid u32: {}", n)))?; buf.extend_from_slice(&v.to_le_bytes()); }
-                            TypeCode::I32 => { let v = n.parse::<i32>().map_err(|_| GnitzSqlError::Bind(format!("invalid i32: {}", n)))?; buf.extend_from_slice(&v.to_le_bytes()); }
-                            TypeCode::U64 => { let v = n.parse::<u64>().map_err(|_| GnitzSqlError::Bind(format!("invalid u64: {}", n)))?; buf.extend_from_slice(&v.to_le_bytes()); }
-                            TypeCode::I64 => { let v = n.parse::<i64>().map_err(|_| GnitzSqlError::Bind(format!("invalid i64: {}", n)))?; buf.extend_from_slice(&v.to_le_bytes()); }
-                            TypeCode::F32 => { let v = n.parse::<f32>().map_err(|_| GnitzSqlError::Bind(format!("invalid f32: {}", n)))?; buf.extend_from_slice(&v.to_le_bytes()); }
-                            TypeCode::F64 => { let v = n.parse::<f64>().map_err(|_| GnitzSqlError::Bind(format!("invalid f64: {}", n)))?; buf.extend_from_slice(&v.to_le_bytes()); }
-                            _ => return Err(GnitzSqlError::Bind(format!("unexpected type {:?} for number literal", tc))),
+                            TypeCode::U8  => { let v = n.parse::<u8>().map_err(|_| GnitzSqlError::Bind(format!("invalid u8: {n}")))?; buf.push(v); }
+                            TypeCode::I8  => { let v = n.parse::<i8>().map_err(|_| GnitzSqlError::Bind(format!("invalid i8: {n}")))?; buf.push(v as u8); }
+                            TypeCode::U16 => { let v = n.parse::<u16>().map_err(|_| GnitzSqlError::Bind(format!("invalid u16: {n}")))?; buf.extend_from_slice(&v.to_le_bytes()); }
+                            TypeCode::I16 => { let v = n.parse::<i16>().map_err(|_| GnitzSqlError::Bind(format!("invalid i16: {n}")))?; buf.extend_from_slice(&v.to_le_bytes()); }
+                            TypeCode::U32 => { let v = n.parse::<u32>().map_err(|_| GnitzSqlError::Bind(format!("invalid u32: {n}")))?; buf.extend_from_slice(&v.to_le_bytes()); }
+                            TypeCode::I32 => { let v = n.parse::<i32>().map_err(|_| GnitzSqlError::Bind(format!("invalid i32: {n}")))?; buf.extend_from_slice(&v.to_le_bytes()); }
+                            TypeCode::U64 => { let v = n.parse::<u64>().map_err(|_| GnitzSqlError::Bind(format!("invalid u64: {n}")))?; buf.extend_from_slice(&v.to_le_bytes()); }
+                            TypeCode::I64 => { let v = n.parse::<i64>().map_err(|_| GnitzSqlError::Bind(format!("invalid i64: {n}")))?; buf.extend_from_slice(&v.to_le_bytes()); }
+                            TypeCode::F32 => { let v = n.parse::<f32>().map_err(|_| GnitzSqlError::Bind(format!("invalid f32: {n}")))?; buf.extend_from_slice(&v.to_le_bytes()); }
+                            TypeCode::F64 => { let v = n.parse::<f64>().map_err(|_| GnitzSqlError::Bind(format!("invalid f64: {n}")))?; buf.extend_from_slice(&v.to_le_bytes()); }
+                            _ => return Err(GnitzSqlError::Bind(format!("unexpected type {tc:?} for number literal"))),
                         }
                         Ok(())
                     }
                     ColData::U128s(v) => {
-                        let val = n.parse::<u128>().map_err(|_| GnitzSqlError::Bind(format!("invalid u128: {}", n)))?;
+                        let val = n.parse::<u128>().map_err(|_| GnitzSqlError::Bind(format!("invalid u128: {n}")))?;
                         v.push(val);
                         Ok(())
                     }
@@ -641,7 +638,7 @@ fn append_value_to_col(
             )),
         },
         _ => Err(GnitzSqlError::Unsupported(
-            format!("unsupported value expression in INSERT: {:?}", val_expr)
+            format!("unsupported value expression in INSERT: {val_expr:?}")
         )),
     }
 }
@@ -1079,9 +1076,8 @@ fn eval_expr(
                 ColData::U128s(_) => {
                     let type_name = if schema.columns[*c].type_code == TypeCode::UUID { "UUID" } else { "U128" };
                     Err(GnitzSqlError::Unsupported(format!(
-                        "residual filter on {} column not supported; \
-                         use a primary-key seek or CREATE INDEX for equality lookups",
-                        type_name
+                        "residual filter on {type_name} column not supported; \
+                         use a primary-key seek or CREATE INDEX for equality lookups"
                     )))
                 }
             }
@@ -1425,7 +1421,7 @@ fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Resu
                     TypeCode::I32 => buf.extend_from_slice(&(i as i32).to_le_bytes()),
                     TypeCode::U64 => buf.extend_from_slice(&(i as u64).to_le_bytes()),
                     TypeCode::I64 => buf.extend_from_slice(&i.to_le_bytes()),
-                    _ => return Err(GnitzSqlError::Bind(format!("cannot assign Int to {:?}", tc))),
+                    _ => return Err(GnitzSqlError::Bind(format!("cannot assign Int to {tc:?}"))),
                 },
                 _ => return Err(GnitzSqlError::Bind("Int value for non-numeric column".to_string())),
             }
@@ -1447,7 +1443,7 @@ fn extract_assignment_col_name(
     match &assignment.target {
         AssignmentTarget::ColumnName(obj_name) => extract_name(obj_name, clause),
         _ => Err(GnitzSqlError::Unsupported(format!(
-            "only simple column assignments supported in {}", clause
+            "only simple column assignments supported in {clause}"
         ))),
     }
 }
@@ -1468,16 +1464,16 @@ fn resolve_set_target(
     let col_idx = schema.columns.iter()
         .position(|c| c.name.eq_ignore_ascii_case(&col_name))
         .ok_or_else(|| GnitzSqlError::Bind(format!(
-            "column '{}' not found in {}", col_name, clause
+            "column '{col_name}' not found in {clause}"
         )))?;
     if schema.is_pk_col(col_idx) {
         return Err(GnitzSqlError::Unsupported(format!(
-            "cannot assign to primary key column in {}", clause
+            "cannot assign to primary key column in {clause}"
         )));
     }
     if seen.contains(&col_idx) {
         return Err(GnitzSqlError::Bind(format!(
-            "multiple assignments to column '{}' in {}", col_name, clause
+            "multiple assignments to column '{col_name}' in {clause}"
         )));
     }
     seen.push(col_idx);
@@ -2121,7 +2117,7 @@ mod tests {
         if let ColData::U128s(v) = &mut batch.columns[1] { v.push(0); }
         let pred = BoundExpr::ColRef(1);
         let err = super::eval_expr(&pred, &batch, 0, &schema).unwrap_err();
-        assert!(err.to_string().contains("UUID"), "error should mention UUID: {}", err);
+        assert!(err.to_string().contains("UUID"), "error should mention UUID: {err}");
     }
 
     // ------------------------------------------------------------------
@@ -2617,7 +2613,7 @@ mod tests {
                 assert_eq!(*stride, 16);
                 assert!(buf.is_empty());
             }
-            other => panic!("expected PkColumn::Bytes, got {:?}", other),
+            other => panic!("expected PkColumn::Bytes, got {other:?}"),
         }
     }
 

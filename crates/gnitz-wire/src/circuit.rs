@@ -313,7 +313,7 @@ pub fn decode_op_node(
         x if x == OPCODE_GATHER_REDUCE           => OpNode::GatherReduce,
         x if x == OPCODE_SEEK_TRACE              => OpNode::SeekTrace,
         x if x == OPCODE_CLEAR_DELTAS            => OpNode::ClearDeltas,
-        _ => return Err(format!("unknown opcode {}", opcode)),
+        _ => return Err(format!("unknown opcode {opcode}")),
     })
 }
 

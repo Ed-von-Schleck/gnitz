@@ -152,7 +152,7 @@ fn recover_system_tables_from_sal(
     );
 
     if replayed > 0 {
-        let msg = format!("SAL system table recovery: replayed {} entries\n", replayed);
+        let msg = format!("SAL system table recovery: replayed {replayed} entries\n");
         unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
     }
 }
@@ -183,7 +183,7 @@ fn recover_from_sal(
     );
 
     if replayed > 0 {
-        let msg = format!("SAL recovery: replayed {} blocks\n", replayed);
+        let msg = format!("SAL recovery: replayed {replayed} blocks\n");
         unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
     }
 }
@@ -239,7 +239,7 @@ pub fn server_main(
     let catalog = match CatalogEngine::open(data_dir) {
         Ok(c) => c,
         Err(e) => {
-            let msg = format!("Error: failed to open catalog: {}\n", e);
+            let msg = format!("Error: failed to open catalog: {e}\n");
             unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
             return 1;
         }
@@ -248,7 +248,7 @@ pub fn server_main(
 
     let nw = num_workers as usize;
     {
-        let msg = format!("Starting {} workers\n", num_workers);
+        let msg = format!("Starting {num_workers} workers\n");
         unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
         let msg = format!(
             "Worker logs: {}/worker_N.log (N=0..{})\n",
@@ -259,7 +259,7 @@ pub fn server_main(
     }
 
     // --- Shared Append-Only Log (file-backed, master→all workers) ---
-    let sal_path = format!("{}/wal.sal\0", data_dir);
+    let sal_path = format!("{data_dir}/wal.sal\0");
     let sal_fd = unsafe {
         libc::open(
             sal_path.as_ptr() as *const libc::c_char,
@@ -302,12 +302,12 @@ pub fn server_main(
     // (durable up to the last checkpoint) are authoritative. The marker
     // is touched once so subsequent boots skip the wipe.
     {
-        let v2_marker_path = format!("{}/wal.sal.v2", data_dir);
+        let v2_marker_path = format!("{data_dir}/wal.sal.v2");
         if !std::path::Path::new(&v2_marker_path).exists() {
             unsafe { libc::memset(sal_ptr as *mut libc::c_void, 0, SAL_MMAP_SIZE); }
             sys::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
             if let Err(e) = std::fs::File::create(&v2_marker_path) {
-                let msg = format!("Error: failed to create wal.sal.v2 marker: {}\n", e);
+                let msg = format!("Error: failed to create wal.sal.v2 marker: {e}\n");
                 unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
                 return 1;
             }
@@ -325,7 +325,7 @@ pub fn server_main(
         // its only durable copy (and gc_orphan_directories would later delete
         // the now-catalog-less entities' flushed shards).
         if let Err(e) = catalog.flush_all_system_tables() {
-            let msg = format!("Error: {}\n", e);
+            let msg = format!("Error: {e}\n");
             unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
             return 1;
         }
@@ -349,7 +349,7 @@ pub fn server_main(
     let mut w2m_fds: Vec<i32> = Vec::with_capacity(nw);
     let mut w2m_sizes: Vec<u64> = Vec::with_capacity(nw);
     for w in 0..nw {
-        let name = format!("w2m_{}", w);
+        let name = format!("w2m_{w}");
         let wfd = ipc_sys::memfd_create(name.as_bytes());
         if wfd < 0 {
             let msg = b"Error: memfd_create failed\n";
@@ -391,7 +391,7 @@ pub fn server_main(
 
     // Log fd assignments
     {
-        let msg = format!("SAL fd={}\n", sal_fd);
+        let msg = format!("SAL fd={sal_fd}\n");
         unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
         for w in 0..nw {
             let msg = format!(
@@ -425,7 +425,7 @@ pub fn server_main(
             }
 
             // Redirect stdout/stderr to worker log file
-            let log_path = format!("{}/worker_{}.log\0", data_dir, w);
+            let log_path = format!("{data_dir}/worker_{w}.log\0");
             unsafe {
                 let log_fd = libc::open(
                     log_path.as_ptr() as *const libc::c_char,
@@ -503,7 +503,7 @@ pub fn server_main(
             unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
 
             // Re-init logging with worker tag
-            let wtag = format!("W{}", w);
+            let wtag = format!("W{w}");
             crate::log::init(log_level, wtag.as_bytes());
 
             let mut worker = WorkerProcess::new(
@@ -543,7 +543,7 @@ pub fn server_main(
     // Wait for all workers to complete recovery and signal readiness
     let dispatcher = unsafe { &mut *dispatcher_ptr };
     if let Err(e) = dispatcher.collect_acks() {
-        let msg = format!("Error collecting worker acks: {}\n", e);
+        let msg = format!("Error collecting worker acks: {e}\n");
         unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
         return 1;
     }
@@ -558,7 +558,7 @@ pub fn server_main(
 
     // Backfill exchange views
     if let Err(e) = backfill_exchange_views(catalog, dispatcher) {
-        let msg = format!("Error: backfill failed: {}\n", e);
+        let msg = format!("Error: backfill failed: {e}\n");
         unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
         return 1;
     }

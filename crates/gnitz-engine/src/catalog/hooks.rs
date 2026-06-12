@@ -149,7 +149,7 @@ impl CatalogEngine {
             directory, name, schema, id as u32, NUM_PARTITIONS,
             kind.persistence(), self.active_part_start, self.active_part_end,
             partition_arena_size(NUM_PARTITIONS),
-        ).map_err(|e| format!("Failed to create '{}': error {} (dir={})", name, e, directory))?;
+        ).map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))?;
         if kind.is_base_table() {
             // Tag base-table shards as PkUnique so the read cursor can skip
             // payload comparison on a cross-source PK tie. Every base table
@@ -181,10 +181,9 @@ impl CatalogEngine {
                 let col_defs = self.read_column_defs(tid);
                 if col_defs.is_empty() {
                     return Err(format!(
-                        "catalog invariant violated: table '{}' (tid={}) registered \
+                        "catalog invariant violated: table '{name}' (tid={tid}) registered \
                          before its column records. COL_TAB writes must precede \
                          TABLE_TAB writes (see hooks.rs dispatch doc).",
-                        name, tid,
                     ));
                 }
 
@@ -293,10 +292,9 @@ impl CatalogEngine {
                 let col_defs = self.read_column_defs(vid);
                 if col_defs.is_empty() {
                     return Err(format!(
-                        "catalog invariant violated: view '{}' (vid={}) registered \
+                        "catalog invariant violated: view '{name}' (vid={vid}) registered \
                          before its column records. COL_TAB writes must precede \
                          VIEW_TAB writes (see hooks.rs dispatch doc).",
-                        name, vid,
                     ));
                 }
 
@@ -433,7 +431,7 @@ impl CatalogEngine {
                 }
 
                 let entry = self.dag.tables.get(&owner_id)
-                    .ok_or_else(|| format!("Index: owner table {} not found", owner_id))?;
+                    .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
                 // Boot replay and worker ddl_sync reach this hook without
                 // precheck_sys_ingest, so re-reject a non-base-table owner
                 // here: a persisted or broadcast IDX_TAB row naming a view
@@ -441,7 +439,7 @@ impl CatalogEngine {
                 // then silently serves stale results (index projection runs
                 // only on the base-table DML paths).
                 if !entry.kind.is_base_table() {
-                    return Err(format!("Index: owner {} is not a base table", owner_id));
+                    return Err(format!("Index: owner {owner_id} is not a base table"));
                 }
                 let owner_schema = entry.schema;
                 // make_index_schema bounds-checks and promotes every column
@@ -460,9 +458,9 @@ impl CatalogEngine {
                 self.pending_dir_deletions.push(idx_dir.clone());
 
                 let idx_table = Table::new(
-                    &idx_dir, &format!("_idx_{}", idx_id), idx_schema, idx_id as u32,
+                    &idx_dir, &format!("_idx_{idx_id}"), idx_schema, idx_id as u32,
                     SYS_TABLE_ARENA, Persistence::Ephemeral,
-                ).map_err(|e| format!("Failed to create index table: error {}", e))?;
+                ).map_err(|e| format!("Failed to create index table: error {e}"))?;
 
                 let mut idx_table_box = Box::new(idx_table);
                 let idx_table_ptr = &mut *idx_table_box as *mut Table;

@@ -83,9 +83,7 @@ impl ExprProgram {
         );
         assert!(
             num_regs == 0 || result_reg < num_regs,
-            "ExprProgram: result_reg={} >= num_regs={}",
-            result_reg,
-            num_regs
+            "ExprProgram: result_reg={result_reg} >= num_regs={num_regs}"
         );
         let mut const_prefixes = Vec::with_capacity(const_strings.len());
         let mut const_lengths = Vec::with_capacity(const_strings.len());

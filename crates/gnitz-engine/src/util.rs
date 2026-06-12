@@ -159,7 +159,7 @@ where F: FnOnce() -> Result<T, String>,
 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(r) => r,
-        Err(_) => Err(format!("internal server error (panic in {})", op)),
+        Err(_) => Err(format!("internal server error (panic in {op})")),
     }
 }
 

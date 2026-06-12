@@ -12,7 +12,7 @@ impl CatalogEngine {
     pub fn create_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
         if self.caches.schema_by_name.contains_key(name) {
-            return Err(format!("Schema already exists: {}", name));
+            return Err(format!("Schema already exists: {name}"));
         }
         let sid = self.allocate_schema_id();
 
@@ -80,11 +80,11 @@ impl CatalogEngine {
             .unwrap_or_default();
         let views = view_ids.iter()
             .filter_map(|&id| self.caches.entity_by_id.get(&id)
-                .map(|(sn, en)| format!("{}.{}", sn, en)))
+                .map(|(sn, en)| format!("{sn}.{en}")))
             .collect();
         let tables = table_ids.iter()
             .filter_map(|&id| self.caches.entity_by_id.get(&id)
-                .map(|(sn, en)| format!("{}.{}", sn, en)))
+                .map(|(sn, en)| format!("{sn}.{en}")))
             .collect();
         (views, tables)
     }
@@ -148,7 +148,7 @@ impl CatalogEngine {
         if !self.caches.schema_by_name.contains_key(schema_name) {
             return Err("Schema does not exist".into());
         }
-        let qualified = format!("{}.{}", schema_name, table_name);
+        let qualified = format!("{schema_name}.{table_name}");
         if self.caches.entity_by_qname.contains_key(&qualified) {
             return Err("Table already exists".into());
         }
@@ -208,9 +208,9 @@ impl CatalogEngine {
         validate_user_identifier(schema_name)?;
         validate_user_identifier(table_name)?;
 
-        let qualified = format!("{}.{}", schema_name, table_name);
+        let qualified = format!("{schema_name}.{table_name}");
         let tid = *self.caches.entity_by_qname.get(&qualified)
-            .ok_or_else(|| format!("Table does not exist: {}", qualified))?;
+            .ok_or_else(|| format!("Table does not exist: {qualified}"))?;
 
         // Retract only the TABLE_TAB row. Its -1 fires hook_table_register,
         // which cascades cascade_retract_indices + cascade_retract_columns. The
@@ -225,9 +225,9 @@ impl CatalogEngine {
     #[cfg(test)]
     pub fn drop_view(&mut self, qualified_name: &str) -> Result<(), String> {
         let (schema_name, view_name) = parse_qualified_name(qualified_name, "public");
-        let qualified = format!("{}.{}", schema_name, view_name);
+        let qualified = format!("{schema_name}.{view_name}");
         let vid = *self.caches.entity_by_qname.get(&qualified)
-            .ok_or_else(|| format!("View does not exist: {}", qualified))?;
+            .ok_or_else(|| format!("View does not exist: {qualified}"))?;
 
         self.dag.invalidate(vid);
 
@@ -254,16 +254,16 @@ impl CatalogEngine {
         is_unique: bool,
     ) -> Result<i64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_owner, "public");
-        let qualified = format!("{}.{}", schema_name, table_name);
+        let qualified = format!("{schema_name}.{table_name}");
         let owner_id = *self.caches.entity_by_qname.get(&qualified)
-            .ok_or_else(|| format!("Table does not exist: {}", qualified))?;
+            .ok_or_else(|| format!("Table does not exist: {qualified}"))?;
 
         // Resolve each column name to its index, in declared order.
         let col_defs = self.read_column_defs(owner_id);
         let col_indices: Vec<u32> = col_names.iter().map(|name| {
             col_defs.iter().position(|cd| cd.name == *name)
                 .map(|p| p as u32)
-                .ok_or_else(|| format!("Column not found in owner: {}", name))
+                .ok_or_else(|| format!("Column not found in owner: {name}"))
         }).collect::<Result<_, _>>()?;
 
         // STRING and BLOB values cannot be reduced to a comparable u128 key
@@ -283,7 +283,7 @@ impl CatalogEngine {
         // apply_index_by_name silently overwrites the cache entry and orphans
         // the previous index circuit.
         if self.caches.index_by_name.contains_key(&index_name) {
-            return Err(format!("Index already exists: {}", index_name));
+            return Err(format!("Index already exists: {index_name}"));
         }
         let index_id = self.allocate_index_id();
 
@@ -343,7 +343,7 @@ impl CatalogEngine {
             return Err("Forbidden: cannot drop internal FK index".into());
         }
         let idx_id = *self.caches.index_by_name.get(index_name)
-            .ok_or_else(|| format!("Index does not exist: {}", index_name))?;
+            .ok_or_else(|| format!("Index does not exist: {index_name}"))?;
 
         // precheck_sys_ingest enforces the FK-target uniqueness guard on the -1;
         // the cascade (circuit demotion/deletion) is the applier's reaction in
@@ -475,7 +475,7 @@ impl CatalogEngine {
     pub(crate) fn promote_index_to_unique(&mut self, owner_id: i64, col_indices: &[u32]) -> Result<(), String> {
         if self.ctx.is_live() {
             let owner_schema = self.dag.tables.get(&owner_id).map(|e| e.schema)
-                .ok_or_else(|| format!("Index promote: owner table {} not found", owner_id))?;
+                .ok_or_else(|| format!("Index promote: owner table {owner_id} not found"))?;
             let idx_schema = make_index_schema(col_indices, &owner_schema)?;
             self.stream_index_projection(owner_id, col_indices, true, None, &idx_schema)?;
         }

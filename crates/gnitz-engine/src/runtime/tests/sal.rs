@@ -418,7 +418,7 @@ fn test_commit_sentinel_zero_payload() {
             let (msg, _) = reader.try_read(0).unwrap();
             assert_eq!(msg.lsn, 123);
             assert!(msg.wire_data.is_none(),
-                "sentinel must carry no per-worker payload for worker {}", w);
+                "sentinel must carry no per-worker payload for worker {w}");
         }
 
         libc::close(efd1);

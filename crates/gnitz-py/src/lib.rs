@@ -128,7 +128,7 @@ impl PySchema {
         let ncols = columns.len();
         if ncols == 0 || ncols > MAX_COLUMNS {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Schema must have 1 to {} columns", MAX_COLUMNS
+                "Schema must have 1 to {MAX_COLUMNS} columns"
             )));
         }
         let list = match (pk_index, pk_indices) {
@@ -167,15 +167,14 @@ impl PySchema {
         }
         if total_stride > MAX_PK_BYTES {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "total PK stride {} exceeds maximum {} bytes",
-                total_stride, MAX_PK_BYTES
+                "total PK stride {total_stride} exceeds maximum {MAX_PK_BYTES} bytes"
             )));
         }
         // ZSetBatch.nulls stores one u64 per row; null bits map to payload column indices.
         let payload_count = ncols - list.len();
         if payload_count > 64 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "schema has {} payload columns; null bitmap supports at most 64", payload_count
+                "schema has {payload_count} payload columns; null bitmap supports at most 64"
             )));
         }
         Ok(PySchema { columns: columns.unbind(), pk_indices: list })
@@ -657,7 +656,7 @@ fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
         let hex = s.replace('-', "");
         return u128::from_str_radix(&hex, 16)
             .map_err(|_| pyo3::exceptions::PyValueError::new_err(
-                format!("invalid UUID/U128 hex string: {:?}", s)
+                format!("invalid UUID/U128 hex string: {s:?}")
             ));
     }
     Err(pyo3::exceptions::PyTypeError::new_err(
@@ -1124,7 +1123,7 @@ impl PyScanResult {
         let n = self.__len__();
         if n != 1 {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Expected exactly 1 row, got {}", n),
+                format!("Expected exactly 1 row, got {n}"),
             ));
         }
         let mut iter = self.__iter__(py)?;
@@ -1135,7 +1134,7 @@ impl PyScanResult {
         let n = self.__len__();
         if n > 1 {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Expected at most 1 row, got {}", n),
+                format!("Expected at most 1 row, got {n}"),
             ));
         }
         let mut iter = self.__iter__(py)?;
@@ -1431,7 +1430,7 @@ impl PyGnitzClient {
             None | Some("update") => gnitz_core::WireConflictMode::Update,
             Some("error") => gnitz_core::WireConflictMode::Error,
             Some(other) => return Err(GnitzError::new_err(format!(
-                "invalid conflict_mode '{}': expected 'update' or 'error'", other
+                "invalid conflict_mode '{other}': expected 'update' or 'error'"
             ))),
         };
         to_py_err(client!(self).push_with_mode(target_id, batch.schema.as_ref(), &batch.batch, mode))
@@ -1979,7 +1978,7 @@ impl PyAsyncTransport {
         let raw_dup = unsafe { libc::dup(sock_fd) };
         if raw_dup < 0 {
             let err = std::io::Error::last_os_error();
-            return Err(GnitzError::new_err(format!("dup socket fd: {}", err)));
+            return Err(GnitzError::new_err(format!("dup socket fd: {err}")));
         }
         let dup_fd = DupFd(raw_dup);
 

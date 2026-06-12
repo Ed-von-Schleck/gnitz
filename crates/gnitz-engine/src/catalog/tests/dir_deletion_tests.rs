@@ -14,7 +14,7 @@ fn defer_then_drain_gated_deletions() {
 
     engine.create_schema("s").unwrap();
     let tid = engine.create_table("s.t", &cols, &[0], true).unwrap();
-    let tbl_dir = format!("{}/s/t_{}", dir, tid);
+    let tbl_dir = format!("{dir}/s/t_{tid}");
     assert!(Path::new(&tbl_dir).exists());
 
     // DROP SCHEMA cascade queues the table dir and the schema dir.
@@ -57,7 +57,7 @@ fn drop_then_recreate_schema_survives_gated_drain() {
     // Recreate before any checkpoint drains the gated queue.
     engine.create_schema("s").unwrap(); // cancels the gated <dir>/s removal
     let new_tid = engine.create_table("s.t", &cols, &[0], true).unwrap();
-    let new_dir = format!("{}/s/t_{}", dir, new_tid);
+    let new_dir = format!("{dir}/s/t_{new_tid}");
     assert!(Path::new(&new_dir).exists());
 
     // The gating checkpoint fires (drained from the checkpoint post-ack path).
@@ -66,7 +66,7 @@ fn drop_then_recreate_schema_survives_gated_drain() {
     // RED without the cancel: drain removed <dir>/s recursively, wiping new_dir.
     assert!(Path::new(&new_dir).exists(),
         "recreated schema's new table dir must survive the gated drain");
-    assert!(Path::new(&format!("{}/s", dir)).exists());
+    assert!(Path::new(&format!("{dir}/s")).exists());
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ fn gc_reclaims_orphan_table_dir() {
     bb.begin_row(1u128, 1); bb.put_u64(10); bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
-    let live_dir = format!("{}/public/t_{}", dir, tid);
+    let live_dir = format!("{dir}/public/t_{tid}");
     assert!(Path::new(&live_dir).exists());
 
     // Fabricate a sibling orphan dir: table-shaped (`<name>_<digits>`), no live
@@ -113,7 +113,7 @@ fn gc_reclaims_orphan_view_dir() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![u64_col_def("id")];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
-    let live_dir = format!("{}/public/t_{}", dir, tid);
+    let live_dir = format!("{dir}/public/t_{tid}");
 
     let ghost = format!("{}/public/view_ghost_{}", dir, 4242);
     std::fs::create_dir_all(&ghost).unwrap();
@@ -137,15 +137,15 @@ fn gc_reclaims_orphan_index_dir() {
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let idx_id = engine.create_index("public.t", &["val"], false).unwrap();
 
-    let tbl_dir = format!("{}/public/t_{}", dir, tid);
-    let live_idx = format!("{}/idx_{}", tbl_dir, idx_id);
+    let tbl_dir = format!("{dir}/public/t_{tid}");
+    let live_idx = format!("{tbl_dir}/idx_{idx_id}");
     assert!(Path::new(&live_idx).exists(), "live index dir must exist");
 
     // A fabricated orphan index dir, plus a non-index sub-dir that the pattern
     // guard must leave alone.
     let ghost_idx = format!("{}/idx_{}", tbl_dir, idx_id + 9999);
     std::fs::create_dir_all(&ghost_idx).unwrap();
-    let non_idx = format!("{}/data_keep", tbl_dir);
+    let non_idx = format!("{tbl_dir}/data_keep");
     std::fs::create_dir_all(&non_idx).unwrap();
 
     engine.gc_orphan_directories();
@@ -180,16 +180,16 @@ fn gc_leaves_live_entities_untouched() {
     let t3 = engine.create_table("s2.t", &cols, &[0], true).unwrap();
 
     let dirs = [
-        format!("{}/public/flushed_{}", dir, t1),
-        format!("{}/public/flushed_{}/idx_{}", dir, t1, i1),
-        format!("{}/public/empty_{}", dir, t2),
-        format!("{}/s2/t_{}", dir, t3),
+        format!("{dir}/public/flushed_{t1}"),
+        format!("{dir}/public/flushed_{t1}/idx_{i1}"),
+        format!("{dir}/public/empty_{t2}"),
+        format!("{dir}/s2/t_{t3}"),
     ];
-    for d in &dirs { assert!(Path::new(d).exists(), "precondition: {} exists", d); }
+    for d in &dirs { assert!(Path::new(d).exists(), "precondition: {d} exists"); }
 
     engine.gc_orphan_directories();
 
-    for d in &dirs { assert!(Path::new(d).exists(), "live dir {} must survive", d); }
+    for d in &dirs { assert!(Path::new(d).exists(), "live dir {d} must survive"); }
     assert!(engine.pending_dir_deletions.is_empty());
     assert_eq!(engine.scan_family(t1).unwrap().count, 1,
         "flushed table must still read back after the sweep");
@@ -206,8 +206,8 @@ fn gc_skips_non_table_shaped_entries() {
     let cols = vec![u64_col_def("id")];
     engine.create_table("public.t", &cols, &[0], true).unwrap();
 
-    let keep1 = format!("{}/public/notatable", dir);     // no underscore
-    let keep2 = format!("{}/public/foo_notanumber", dir); // non-numeric suffix
+    let keep1 = format!("{dir}/public/notatable");     // no underscore
+    let keep2 = format!("{dir}/public/foo_notanumber"); // non-numeric suffix
     std::fs::create_dir_all(&keep1).unwrap();
     std::fs::create_dir_all(&keep2).unwrap();
 
@@ -227,7 +227,7 @@ fn gc_is_idempotent() {
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![u64_col_def("id")];
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
-    let live = format!("{}/public/t_{}", dir, tid);
+    let live = format!("{dir}/public/t_{tid}");
 
     let ghost = format!("{}/public/ghost_{}", dir, tid + 5000);
     std::fs::create_dir_all(&ghost).unwrap();
@@ -252,8 +252,8 @@ fn gc_drains_sal_replay_queue() {
     let dir = temp_dir("gc_drain_replay_queue");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let gone_schema = format!("{}/goneschema", dir);
-    let gone_table = format!("{}/t_1", gone_schema);
+    let gone_schema = format!("{dir}/goneschema");
+    let gone_table = format!("{gone_schema}/t_1");
     std::fs::create_dir_all(&gone_table).unwrap();
     // Residue a replayed DROP SCHEMA leaves on the queue.
     engine.pending_dir_deletions.push(gone_schema.clone());
@@ -276,7 +276,7 @@ fn gc_drains_sal_replay_queue() {
 fn gc_recreated_schema_survives_drain() {
     let dir = temp_dir("gc_recreate_schema_drain");
     let mut engine = CatalogEngine::open(&dir).unwrap();
-    let schema_path = format!("{}/s", dir);
+    let schema_path = format!("{dir}/s");
 
     // Reproduce the recovery residue directly: a replayed DROP s left <base>/s
     // on pending_dir_deletions.
@@ -291,7 +291,7 @@ fn gc_recreated_schema_survives_drain() {
 
     let cols = vec![u64_col_def("id")];
     let tid = engine.create_table("s.t", &cols, &[0], true).unwrap();
-    let tbl = format!("{}/s/t_{}", dir, tid);
+    let tbl = format!("{dir}/s/t_{tid}");
     assert!(Path::new(&tbl).exists());
 
     engine.gc_orphan_directories();

@@ -17,7 +17,7 @@ use std::fs;
 fn temp_dir(name: &str) -> String {
     crate::util::raise_fd_limit_for_tests();
     let path = std::env::temp_dir()
-        .join(format!("gnitz_catalog_test_{}", name))
+        .join(format!("gnitz_catalog_test_{name}"))
         .to_str().unwrap().to_owned();
     let _ = fs::remove_dir_all(&path);
     path
@@ -63,7 +63,7 @@ fn build_table_tab_row(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str) 
     bb.begin_row(tid as u128, 1);
     bb.put_u64(PUBLIC_SCHEMA_ID as u64);
     bb.put_string(table_name);
-    bb.put_string(&format!("{}/public/{}", dir, table_name));
+    bb.put_string(&format!("{dir}/public/{table_name}"));
     bb.put_u64(raw_pk_cols);
     bb.put_u64(0); // created_lsn
     bb.put_u64(0); // flags

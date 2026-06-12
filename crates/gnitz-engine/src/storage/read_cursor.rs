@@ -1943,7 +1943,7 @@ mod tests {
         for chunk_rows in [1, 2, 5, 100] {
             let mut cursor = create_read_cursor(&[Rc::clone(&batch)], &[], make_schema_i64());
             assert_eq!(drain_chunks(&mut cursor, chunk_rows), expected,
-                "chunk_rows={}", chunk_rows);
+                "chunk_rows={chunk_rows}");
         }
         // 4 rows / chunk 2: exact multiple (no trailing partial chunk).
         let even = make_batch(&rows[..4]);
@@ -1974,12 +1974,12 @@ mod tests {
             let mut multi = create_read_cursor(
                 &[Rc::clone(&b1), Rc::clone(&b2)], &[], make_schema_i64());
             assert_eq!(drain_chunks(&mut multi, chunk_rows), expected,
-                "merge path, chunk_rows={}", chunk_rows);
+                "merge path, chunk_rows={chunk_rows}");
 
             let mut single = create_read_cursor(
                 &[Rc::clone(&consolidated_equivalent)], &[], make_schema_i64());
             assert_eq!(drain_chunks(&mut single, chunk_rows), expected,
-                "fast path, chunk_rows={}", chunk_rows);
+                "fast path, chunk_rows={chunk_rows}");
         }
     }
 

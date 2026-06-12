@@ -12,7 +12,7 @@ fn test_enforce_unique_pk() {
     // Create a Table directly (Single store) to test enforce_unique_pk
     ensure_dir(&dir).unwrap();
     let schema = make_schema(&[u64_col(), u64_col()], 0); // id (PK), val
-    let tdir = format!("{}/upk_table", dir);
+    let tdir = format!("{dir}/upk_table");
     let mut table = Table::new(&tdir, "upk", schema, 100, SYS_TABLE_ARENA, crate::storage::Persistence::Ephemeral).unwrap();
 
     let mut dag = DagEngine::new();
@@ -121,7 +121,7 @@ fn test_sequence_gap_recovery() {
         bb.begin_row(250u128, 1);
         bb.put_u64(PUBLIC_SCHEMA_ID as u64); // schema_id
         bb.put_string("gap_table");
-        bb.put_string(&format!("{}/public/gap", dir));
+        bb.put_string(&format!("{dir}/public/gap"));
         bb.put_u64(0); // pk_col_idx
         bb.put_u64(0); // created_lsn
         bb.put_u64(0); // flags
@@ -154,7 +154,7 @@ fn test_sequence_gap_recovery() {
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
         let new_tid = engine.create_table("public.tnext", &cols, &[0], true).unwrap();
-        assert_eq!(new_tid, 251, "Sequence recovery: expected 251, got {}", new_tid);
+        assert_eq!(new_tid, 251, "Sequence recovery: expected 251, got {new_tid}");
         engine.close();
     }
 

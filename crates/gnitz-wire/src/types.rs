@@ -49,7 +49,7 @@ impl TypeCode {
     #[inline]
     pub fn from_validated_u8(v: u8) -> Self {
         Self::try_from_u8(v)
-            .unwrap_or_else(|| panic!("invalid type_code {} in validated schema", v))
+            .unwrap_or_else(|| panic!("invalid type_code {v} in validated schema"))
     }
 
     /// Convert a raw u8 wire value. Returns `None` for unknown codes.
@@ -184,9 +184,9 @@ pub fn index_key_type(field_type_code: u8) -> Result<u8, String> {
         tc::U64 | tc::U32 | tc::U16 | tc::U8 => Ok(tc::U64),
         tc::I64 | tc::I32 | tc::I16 | tc::I8 => Ok(tc::I64),
         tc::F32 | tc::F64 | tc::STRING | tc::BLOB => {
-            Err(format!("Secondary index on column type {} not supported", field_type_code))
+            Err(format!("Secondary index on column type {field_type_code} not supported"))
         }
-        _ => Err(format!("Unknown column type code: {}", field_type_code)),
+        _ => Err(format!("Unknown column type code: {field_type_code}")),
     }
 }
 

@@ -211,7 +211,7 @@ impl Table {
         };
 
         if persistence == Persistence::Durable {
-            let manifest_path = format!("{}/manifest.bin", dir);
+            let manifest_path = format!("{dir}/manifest.bin");
             table.shard_index.load_manifest(&manifest_path)?;
             table.shard_index.gc_orphans();
             table.current_lsn = table.shard_index.max_lsn() + 1;
@@ -1013,9 +1013,9 @@ fn erase_stale_shards(dir: &str, table_id: u32) {
     // `eph_shard_*` left by a crashed prior process, (b) pre-upgrade
     // `eph_shard_*`/`shard_*` from before in-memory flushes existed, and
     // (c) `hcomp_*` from disk compaction of spilled data — not routine flushes.
-    let eph_prefix   = format!("eph_shard_{}_",  table_id);
-    let shard_prefix = format!("shard_{}_",      table_id);
-    let hcomp_prefix = format!("hcomp_{}_",      table_id);
+    let eph_prefix   = format!("eph_shard_{table_id}_");
+    let shard_prefix = format!("shard_{table_id}_");
+    let hcomp_prefix = format!("hcomp_{table_id}_");
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
@@ -1407,7 +1407,7 @@ mod tests {
                     .filter_map(|e| e.file_name().into_string().ok())
                     .collect();
                 assert!(dir_entries.iter().any(|n| n.ends_with(".tmp")),
-                    ".tmp files must exist before Drop, got {:?}", dir_entries);
+                    ".tmp files must exist before Drop, got {dir_entries:?}");
                 drop(work);
             }
             other => panic!("expected Pending, got non-pending outcome: {}",
@@ -1422,7 +1422,7 @@ mod tests {
             .filter(|n| n.ends_with(".tmp"))
             .collect();
         assert!(leftover_tmp.is_empty(),
-            "Drop must unlink all .tmp files, found: {:?}", leftover_tmp);
+            "Drop must unlink all .tmp files, found: {leftover_tmp:?}");
     }
 
     /// Table::new on a corrupted manifest must return Err and must not run

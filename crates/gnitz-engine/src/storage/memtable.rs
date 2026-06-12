@@ -781,7 +781,7 @@ mod tests {
         // Check agg_val (payload column 1) = 15000
         let agg_bytes = consolidated.get_col_ptr(0, 1, 8);
         let agg_val = i64::from_le_bytes(agg_bytes.try_into().unwrap());
-        assert_eq!(agg_val, 15000, "expected agg_val=15000, got {}", agg_val);
+        assert_eq!(agg_val, 15000, "expected agg_val=15000, got {agg_val}");
     }
 
     // ── append_row_simple tests ──────────────────────────────────────────
@@ -1594,7 +1594,7 @@ mod tests {
         // Some may be zero-cap (empty blob), so just verify at least 2 buffers.
         let mut count = 0;
         while acquire_buf().capacity() > 0 { count += 1; }
-        assert!(count >= 2, "expected at least 2 recycled buffers, got {}", count);
+        assert!(count >= 2, "expected at least 2 recycled buffers, got {count}");
     }
 
     #[test]
