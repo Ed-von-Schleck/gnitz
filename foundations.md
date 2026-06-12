@@ -306,5 +306,12 @@ semantics.
 
 PK columns are not included in the payload region pointers.
 
-Null bitmap uses **payload column indexing**: bit N = N-th non-PK column.
-For schema column ci: `payload_idx = ci if ci < pk_index else ci - 1`.
+Null bitmap uses **payload column indexing**: bit N is the N-th non-PK
+column in schema order. The dense payload index is assigned by scanning the
+columns left to right and numbering only the non-PK columns 0, 1, 2, …
+(`SchemaDescriptor::compute_mappings`): `payload_mapping[ci]` holds that slot
+for a payload column and `PAYLOAD_MAPPING_PK_SENTINEL` for a PK column, with
+the inverse in `payload_to_ci[pi]`. For a **single-PK** schema this reduces to
+the closed form `payload_idx = ci if ci < pk_index else ci - 1`; with a
+**compound PK** the columns are renumbered around *every* PK position, so the
+closed form does not hold — read `payload_mapping`, never `ci - 1`.
