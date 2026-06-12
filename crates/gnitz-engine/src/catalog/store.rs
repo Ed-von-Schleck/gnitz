@@ -1,5 +1,5 @@
 use std::num::NonZeroU64;
-use std::{cmp, ops};
+use std::ops;
 
 use super::*;
 
@@ -1000,21 +1000,32 @@ impl CatalogEngine {
         }
     }
 
-    /// Ordered range scan over a secondary index: the leading
-    /// `eq_natives.len()` columns are equality-pinned, and the next index
-    /// column is the range column, bounded by `lo`/`hi`. An `Unbounded` side
-    /// covers the 0x00/0xFF OPK sentinel itself, so it cannot wrongly drop a
-    /// row whose range column maps exactly to that sentinel (e.g. a U32
-    /// column holding `u32::MAX` with no upper bound). Returns this worker's
-    /// matching source rows; the master broadcasts to every worker and merges
-    /// (the index is partitioned by source PK, so a range's matches scatter
-    /// across workers).
+    /// Ordered range scan over a secondary index, normalized to a half-open
+    /// byte-key interval `[start, end)` over the index PK space. The leading
+    /// `eq_natives.len()` columns are equality-pinned; the next index column is
+    /// the range column, bounded by `lo`/`hi`. Both bounds are mapped to cut
+    /// points once here, so the walk is a single uniform iterator — seek to
+    /// `start`, advance while `key < end` — with no per-row inclusivity test.
+    /// Returns this worker's matching source rows; the master broadcasts to every
+    /// worker and merges (the index is partitioned by source PK, so a range's
+    /// matches scatter across workers).
     ///
-    /// Correctness rests on the post-`cff7c58` OPK ordering invariant: the
-    /// leading-key OPK is order-preserving (memcmp == typed order, signed and
-    /// composite included), so a raw byte compare of
-    /// `current_pk_bytes()[..prefix_len]` against `lo_prefix`/`hi_prefix` IS the
-    /// typed lexicographic compare. See `plans/secondary-index-range-scan.md`.
+    /// Correctness rests on the post-`cff7c58` OPK ordering invariant: the index
+    /// PK region is `[promoted leading-key OPK ‖ source-PK OPK]` and memcmp order
+    /// on those bytes equals typed order (signed and composite included). For any
+    /// `prefix_len`-byte group key `p`, every full key `k` with
+    /// `k[..prefix_len] == p` satisfies `pad(p) ≤ k < pad(succ(p))`, so cutting
+    /// the key space at `pad(group)` / `pad(succ(group))` includes or excludes
+    /// whole duplicate groups with no per-row prefix slicing. Bound → cut point:
+    ///
+    /// | bound            | cut point                                              |
+    /// |------------------|--------------------------------------------------------|
+    /// | lo `Unbounded`   | `start = pad(eq_key)`                                   |
+    /// | lo `Included(v)` | `start = pad(group(v))`                                 |
+    /// | lo `Excluded(v)` | `start = pad(succ(group(v)))`; `succ` overflow → empty |
+    /// | hi `Excluded(v)` | `end = pad(group(v))`                                   |
+    /// | hi `Included(v)` | `end = pad(succ(group(v)))`; `succ` overflow → to end  |
+    /// | hi `Unbounded`   | `end = pad(succ(eq_key))`; empty `eq_key` → to end      |
     pub fn seek_by_index_range(
         &mut self,
         table_id: i64,
@@ -1031,55 +1042,85 @@ impl CatalogEngine {
             .find(|ic| ic.col_indices.as_slice() == col_indices)
             .ok_or_else(|| format!("No index on cols {col_indices:?} for table {table_id}"))?;
 
-        // Precondition: the range column sits right after the equality prefix,
-        // so `n_eq + 1` leading columns must exist. The worker validates this
-        // at the trust boundary, but this `pub` method is also reachable from
-        // unit tests — guard here too, *before* any `columns[n_eq]` /
-        // `leading_key_size(n_eq + 1)` indexing below would panic out of
-        // bounds. (Written `n_eq >= len`, never a `+ 1` that could overflow on
-        // an adversarial length.) It also keeps `prefix_len < idx_pk_stride`
-        // strict, so the exclusive-lower `seek_key[prefix_len..]` suffix is
-        // always non-empty.
+        // Precondition: the range column sits right after the equality prefix, so
+        // `n_eq + 1` leading columns must exist. The worker validates this at the
+        // trust boundary, but this `pub` method is also reachable from unit tests —
+        // guard here too, *before* the `col_indices[..=n_eq]` /
+        // `leading_key_size(n_eq + 1)` indexing below would panic. (Written
+        // `n_eq >= len`, never a `+ 1` that could overflow on an adversarial
+        // length.) It also keeps `prefix_len < idx_pk_stride` strict, so `pad`
+        // always extends the group key.
         let n_eq = eq_natives.len();
         if n_eq >= col_indices.len() {
             return Err(format!(
                 "seek_by_index_range: n_eq {n_eq} has no range column within index \
                  arity {} on cols {col_indices:?}", col_indices.len()));
         }
-        let lo_excl = matches!(lo, Excluded(_));
-        let hi_excl = matches!(hi, Excluded(_));
 
         let src_schema    = entry.schema;
         let src_pk_stride = src_schema.pk_stride() as usize;
         let idx_pk_stride = ic.index_schema.pk_stride() as usize;       // leading + source PK
         let idx_key_size  = ic.index_schema.leading_key_size(col_indices.len());
         let eq_size       = ic.index_schema.leading_key_size(n_eq);     // equality prefix bytes
-        let slot_size     = ic.index_schema.columns[n_eq].size() as usize;
-        let prefix_len    = eq_size + slot_size;                        // == leading_key_size(n_eq + 1)
-        let src_type      = src_schema.columns[col_indices[n_eq] as usize].type_code;
-        let idx_key_type  = ic.index_schema.columns[n_eq].type_code;
+        let prefix_len    = ic.index_schema.leading_key_size(n_eq + 1); // + the range slot
 
-        // Two byte prefixes: identical equality slots, range slot differs.
-        let mut lo_prefix = vec![0u8; prefix_len];
-        if n_eq > 0 {
-            // n_eq == 0 (pure range, e.g. `x > 10`) must NOT reach
-            // IndexKeySpec::new: an empty `cols` slice trips its
-            // `debug_assert!(!cols.is_empty())`. The empty equality prefix is
-            // already all-zero, so skip the encode.
-            let spec = crate::schema::IndexKeySpec::new(
-                &col_indices[..n_eq], &src_schema, &ic.index_schema);
-            let (opk, plen) = spec.seek_prefix(eq_natives);            // plen == eq_size
-            lo_prefix[..plen].copy_from_slice(&opk[..plen]);
-        }
-        let mut hi_prefix = lo_prefix.clone();
-        if let Included(v) | Excluded(v) = lo {
-            lo_prefix[eq_size..].copy_from_slice(
-                &crate::schema::index_opk_prefix(v, src_type, idx_key_type)[..slot_size]);
-        } // Unbounded: 0x00 * slot_size == OPK minimum (signed INT_MIN sign-flips to all-zero)
-        match hi {
-            Included(v) | Excluded(v) => hi_prefix[eq_size..].copy_from_slice(
-                &crate::schema::index_opk_prefix(v, src_type, idx_key_type)[..slot_size]),
-            Unbounded => hi_prefix[eq_size..].fill(0xFF),              // OPK maximum
+        // Every cut point is `pad(group(v))` for some (n_eq + 1)-column group key,
+        // so one IndexKeySpec over the equality prefix PLUS the range column
+        // encodes both bounds through the same path the write side uses
+        // (`write_span`/`batch_project_index` — byte-identical by construction).
+        // Stack scratch throughout: MAX_PK_BYTES bounds every index schema's
+        // pk_stride (asserted in SchemaDescriptor::new), and `seek_prefix` leaves
+        // the bytes past `prefix_len` zero, so `group(v)` IS `pad(group(v))`.
+        let spec = crate::schema::IndexKeySpec::new(
+            &col_indices[..=n_eq], &src_schema, &ic.index_schema);
+        let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
+        natives[..n_eq].copy_from_slice(eq_natives);
+        let mut group = |v: u128| {
+            natives[n_eq] = v;
+            spec.seek_prefix(&natives[..=n_eq]).0
+        };
+
+        // `pad(eq_key)`: encode any group, then zero the range slot — the OPK of
+        // the placeholder 0 is not all-zero for a signed slot (the sign flip maps
+        // 0 to 0x80…), so the fill is not redundant.
+        let mut eq_key = group(0);
+        eq_key[eq_size..].fill(0);
+
+        // Lower cut. An `Excluded` bound steps to the byte successor of the whole
+        // boundary group, so the seek lands strictly past every duplicate of `v`
+        // in O(log N) (no per-row skip); successor overflow means `v` is the
+        // maximal group and excluding it leaves nothing above — empty.
+        let start = match lo {
+            Unbounded   => eq_key,
+            Included(v) => group(v),
+            Excluded(v) => {
+                let mut s = group(v);
+                if !increment_key_in_place(&mut s[..prefix_len]) {
+                    return Ok(None);
+                }
+                s
+            }
+        };
+
+        // Upper cut; `end == None` scans to the table end. Successor overflow on
+        // the inclusive/unbounded side means no key space exists above the group —
+        // exactly the scan-to-end case. (`n_eq == 0` with no upper bound is the
+        // empty-slice overflow of `increment_key_in_place`.)
+        let mut end_buf = eq_key;
+        let has_end = match hi {
+            Excluded(v) => { end_buf = group(v); true }
+            Included(v) => { end_buf = group(v);
+                             increment_key_in_place(&mut end_buf[..prefix_len]) }
+            Unbounded   => increment_key_in_place(&mut end_buf[..eq_size]),
+        };
+        let end = has_end.then(|| &end_buf[..idx_pk_stride]);
+
+        // Provably-empty interval (an inverted range like `x > 5 AND x < 3` the
+        // planner does not pre-reject, or a carry that collapsed `start` onto
+        // `end`): short-circuit before constructing any cursor or running the
+        // O(log N) seek.
+        if end.is_some_and(|e| &start[..idx_pk_stride] >= e) {
+            return Ok(None);
         }
 
         // One index cursor + one reused source cursor (both raw-pointer/Rc-backed,
@@ -1088,50 +1129,17 @@ impl CatalogEngine {
         let mut src_cursor = entry.handle.open_cursor();
         let mut acc = Batch::with_schema(src_schema, 0);
 
-        // Seed the seek key with the lower-bound prefix. For an *exclusive* finite
-        // lower bound, pad the source-PK suffix with 0xFF (the OPK maximum) so the
-        // binary search lands at the first entry strictly past the boundary group
-        // in O(log N). With 0x00 the seek lands on the first member of the
-        // boundary group, and the loop below would then skip every duplicate of
-        // the lower value one entry at a time — O(N) on a low-cardinality column
-        // with a large duplicate group. `suffix_len = idx_pk_stride - prefix_len ≥
-        // src_pk_stride > 0` because the range column is a leading column, so the
-        // suffix always exists. (Inclusive or unbounded-below keeps 0x00.)
-        let mut seek_key = vec![0u8; idx_pk_stride];
-        seek_key[..prefix_len].copy_from_slice(&lo_prefix);
-        if lo_excl {
-            seek_key[prefix_len..].fill(0xFF);
-        }
-        idx_cursor.cursor.seek_bytes(&seek_key);
+        idx_cursor.cursor.seek_bytes(&start[..idx_pk_stride]);
         while idx_cursor.cursor.valid {
-            {
-                let cur = &idx_cursor.cursor.current_pk_bytes()[..prefix_len];
-                // Upper bound terminates the scan (entries ordered by leading OPK).
-                match cur.cmp(hi_prefix.as_slice()) {
-                    cmp::Ordering::Greater => break,
-                    cmp::Ordering::Equal if hi_excl => break,
-                    _ => {}
-                }
-                // Defensive lower trim. The 0xFF-suffixed exclusive seek above
-                // lands past the boundary group, so `Equal` with an exclusive
-                // lower only fires for the astronomically-rare entry whose
-                // source PK is itself all-0xFF (e.g. a U64 source PK of
-                // u64::MAX); the inclusive seek lands at `cur >= lo_prefix`, so
-                // `Less` never fires. Both are kept so the walk stays correct
-                // independent of the seed.
-                match cur.cmp(lo_prefix.as_slice()) {
-                    cmp::Ordering::Less => { idx_cursor.cursor.advance(); continue; }
-                    cmp::Ordering::Equal if lo_excl => { idx_cursor.cursor.advance(); continue; }
-                    _ => {}
-                }
-            }
+            let cur_pk = idx_cursor.cursor.current_pk_bytes();
+            if end.is_some_and(|e| cur_pk >= e) { break; }
             if idx_cursor.cursor.current_weight > 0 {
                 Self::resolve_index_entry_into(
-                    idx_cursor.cursor.current_pk_bytes(), idx_key_size, src_pk_stride,
-                    &mut src_cursor, &mut acc);
+                    cur_pk, idx_key_size, src_pk_stride, &mut src_cursor, &mut acc);
             }
             idx_cursor.cursor.advance();
         }
+
         Ok((acc.count > 0).then_some(acc))
     }
 
@@ -1816,6 +1824,19 @@ impl CatalogEngine {
     }
 }
 
+/// Fixed-width byte-string successor: `p + 1` with carry, in place. Returns
+/// `false` when `p` is all-0xFF (or empty) — no successor exists at this width.
+/// The empty-slice case is load-bearing: it is exactly the
+/// `n_eq == 0, hi == Unbounded` → scan-to-end row of `seek_by_index_range`'s
+/// cut-point mapping.
+fn increment_key_in_place(p: &mut [u8]) -> bool {
+    for b in p.iter_mut().rev() {
+        *b = b.wrapping_add(1);
+        if *b != 0 { return true; }
+    }
+    false
+}
+
 /// Build the schema for a `gather_family` result: the PK columns of `schema`
 /// (in pk-list order, so the packed PK round-trips identically) followed by
 /// the projected columns in `project` order as payload. `project` must list
@@ -1880,4 +1901,26 @@ fn copy_cursor_cols_to_batch(
         }
     }
     out.count += 1;
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::increment_key_in_place;
+
+    #[test]
+    fn test_increment_key_in_place() {
+        let mut k1 = [0x00, 0x01];
+        assert!(increment_key_in_place(&mut k1));
+        assert_eq!(k1, [0x00, 0x02]);              // no carry
+
+        let mut k2 = [0x00, 0xFF];
+        assert!(increment_key_in_place(&mut k2));
+        assert_eq!(k2, [0x01, 0x00]);              // carry chain
+
+        let mut k3 = [0xFF, 0xFF];
+        assert!(!increment_key_in_place(&mut k3)); // overflow at width
+
+        let mut k4: [u8; 0] = [];
+        assert!(!increment_key_in_place(&mut k4)); // empty
+    }
 }

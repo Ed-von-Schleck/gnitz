@@ -1035,6 +1035,19 @@ enum RangeSide { Lower, Upper }
 /// endpoint is inclusive, and the (possibly saturated) bound value.
 struct RangeEnd { side: RangeSide, incl: bool, bound: RangeLit }
 
+/// Map a chosen range end to its scan bound, saturating an out-of-type-range
+/// literal: past the type range away from the interval (below a lower end,
+/// above an upper end) → Unbounded; across it → None (provably empty range).
+fn saturated_bound(end: &RangeEnd) -> Option<Bound<u128>> {
+    match (end.bound, end.side) {
+        (RangeLit::In(v), _) =>
+            Some(if end.incl { Bound::Included(v) } else { Bound::Excluded(v) }),
+        (RangeLit::BelowMin, RangeSide::Lower)
+        | (RangeLit::AboveMax, RangeSide::Upper) => Some(Bound::Unbounded),
+        _ => None,
+    }
+}
+
 /// Parse a range-bound literal for column type `tc`, classified against the
 /// type's representable range (`FixedInt::range`). Parses as `i128` so a
 /// literal past the type's min/max is detected (and saturated by the caller)
@@ -1189,26 +1202,17 @@ fn collect_index_range_candidates<'e>(
             continue;
         }
 
-        // Saturate the bounds; detect a provably-empty range.
-        let mut lo = Bound::Unbounded;
-        let mut hi = Bound::Unbounded;
-        let mut empty = false;
-        if let Some(li) = lower_idx {
-            match ends[li].end.bound {
-                RangeLit::In(v) if ends[li].end.incl => lo = Bound::Included(v),
-                RangeLit::In(v)                      => lo = Bound::Excluded(v),
-                RangeLit::BelowMin                   => {}            // unbounded below
-                RangeLit::AboveMax                   => empty = true, // lower > type max → empty
-            }
-        }
-        if let Some(ui) = upper_idx {
-            match ends[ui].end.bound {
-                RangeLit::In(v) if ends[ui].end.incl => hi = Bound::Included(v),
-                RangeLit::In(v)                      => hi = Bound::Excluded(v),
-                RangeLit::AboveMax                   => {}            // unbounded above
-                RangeLit::BelowMin                   => empty = true, // upper < type min → empty
-            }
-        }
+        // Saturate the bounds; a `None` from `saturated_bound` marks the range
+        // provably empty. The `Unbounded` substituted for an empty range is never
+        // consulted — `execute_select` short-circuits on `cand.empty` before
+        // reading `lo`/`hi`.
+        let resolve = |idx: Option<usize>| match idx {
+            None    => Some(Bound::Unbounded),                // side not constrained
+            Some(i) => saturated_bound(&ends[i].end),
+        };
+        let (lo, hi) = (resolve(lower_idx), resolve(upper_idx));
+        let empty = lo.is_none() || hi.is_none();
+        let (lo, hi) = (lo.unwrap_or(Bound::Unbounded), hi.unwrap_or(Bound::Unbounded));
 
         // Consume the range conjuncts whose ends were ALL chosen as bounds. A
         // simple `col OP lit` has one end; a BETWEEN has two sharing one
@@ -3281,6 +3285,30 @@ mod tests {
             &expr, &schema, || Ok(idx_list(&[(&[1], false)]))).unwrap();
         assert_eq!(c.len(), 1);
         assert!(!c[0].empty && c[0].lo == Bound::Unbounded && c[0].hi == Bound::Unbounded);
+    }
+
+    #[test]
+    fn test_saturated_bound_corners() {
+        use super::{saturated_bound, RangeEnd, RangeLit, RangeSide};
+        use std::ops::Bound;
+
+        let mk = |side, incl, bound| RangeEnd { side, incl, bound };
+
+        // In-range literals carry their inclusivity through unchanged.
+        assert_eq!(saturated_bound(&mk(RangeSide::Lower, true,  RangeLit::In(42))),
+                   Some(Bound::Included(42)));
+        assert_eq!(saturated_bound(&mk(RangeSide::Upper, false, RangeLit::In(100))),
+                   Some(Bound::Excluded(100)));
+
+        // Past the type range *away* from the interval → widen to Unbounded.
+        assert_eq!(saturated_bound(&mk(RangeSide::Lower, true, RangeLit::BelowMin)),
+                   Some(Bound::Unbounded));
+        assert_eq!(saturated_bound(&mk(RangeSide::Upper, true, RangeLit::AboveMax)),
+                   Some(Bound::Unbounded));
+
+        // *Across* the interval → provably empty (None → caller sets `empty`).
+        assert_eq!(saturated_bound(&mk(RangeSide::Upper, true, RangeLit::BelowMin)), None);
+        assert_eq!(saturated_bound(&mk(RangeSide::Lower, true, RangeLit::AboveMax)), None);
     }
 
     #[test]

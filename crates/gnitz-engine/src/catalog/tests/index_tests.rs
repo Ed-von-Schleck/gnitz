@@ -2471,3 +2471,93 @@ fn test_seek_by_index_range_no_range_column_errs() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_seek_by_index_range_exclusive_lower_type_max() {
+    // Lower-bound successor overflow: `x > u64::MAX` cuts at the byte successor
+    // of the maximal group, which does not exist → provably empty. `x >= u64::MAX`
+    // keeps the maximal group.
+    let dir = temp_dir("catalog_range_excl_lower_max");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, x) in [(1u128, 10u64), (2, 20), (3, u64::MAX), (4, u64::MAX)] {
+        bb.begin_row(pk, 1); bb.put_u64(x); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let c = &[1u32];
+    let max = u64::MAX as u128;
+    // x > u64::MAX → nothing above the maximal group.
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Excluded(max), Unbounded), Vec::<u128>::new());
+    // x >= u64::MAX → exactly the two MAX rows.
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Included(max), Unbounded), vec![3, 4]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_inclusive_upper_type_max() {
+    // Upper-bound successor overflow: `x <= u64::MAX` cuts at the byte successor
+    // of the maximal group, which does not exist → scan to table end (every row,
+    // including the MAX one).
+    let dir = temp_dir("catalog_range_incl_upper_max");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, x) in [(1u128, 10u64), (2, 20), (3, u64::MAX)] {
+        bb.begin_row(pk, 1); bb.put_u64(x); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let c = &[1u32];
+    // x <= u64::MAX → every indexed row, the MAX row included.
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], Unbounded, Included(u64::MAX as u128)),
+        vec![1, 2, 3]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
+    // A range slot at the type max forces the successor carry out of the range
+    // slot and into the equality prefix. Index (a, b); the (8, 0) row must never
+    // leak into an a==7 scan.
+    let dir = temp_dir("catalog_range_carry_eq");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["a", "b"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, a, b) in [(1u128, 7u64, u64::MAX), (2, 8, 0u64)] {
+        bb.begin_row(pk, 1); bb.put_u64(a); bb.put_u64(b); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let c = &[1u32, 2u32];   // index (a, b)
+    let max = u64::MAX as u128;
+    // a = 7 AND b > u64::MAX → empty: the successor of group(7, MAX) collapses
+    // onto succ(eq_key=7) = 8, so start == end. The (8, 0) row must not leak in.
+    assert_eq!(range_pks(&mut engine, tid, c, &[7], Excluded(max), Unbounded), Vec::<u128>::new());
+    // a = 7 AND b <= u64::MAX → only (7, u64::MAX); (8, 0) is a different group.
+    assert_eq!(range_pks(&mut engine, tid, c, &[7], Unbounded, Included(max)), vec![1]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
