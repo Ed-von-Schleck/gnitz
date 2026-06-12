@@ -19,7 +19,7 @@ exactly one slot per worker and accumulates all workers' batches into one merged
 `Batch`, so master heap peaks at the sum across workers.
 
 Point seeks on a high-cardinality non-unique index already have this ceiling; the
-ordered range scan (`plans/secondary-index-range-scan.md`) makes it easy to hit —
+ordered range scan (landed in `0b2af7c`) makes it easy to hit —
 `WHERE x > 0` can match most of a table.
 
 The `Scan` path does **not** have this problem: it streams. `send_scan_response`

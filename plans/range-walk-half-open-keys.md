@@ -83,25 +83,27 @@ Let `eq_key` = the `eq_size`-byte OPK of the equality prefix (empty when
 | hi `Included(v)`| `end = succ(group(v)).map(pad)`; `succ` fails → `None` = scan to table end (the group is the last representable one) |
 | hi `Unbounded`  | `end = succ(eq_key).map(pad)`; `n_eq == 0` ⇒ empty `eq_key` ⇒ `None` = scan to table end |
 
-The walk becomes:
+After normalization the walk seeks to `start` and advances while `key < end` —
+one full-key slice compare per row (`idx_pk_stride` bytes, vs. today's two
+three-way compares over `prefix_len` bytes). Two refinements keep the hot path
+tight:
 
-```rust
-idx_cursor.cursor.seek_bytes(&start);
-while idx_cursor.cursor.valid
-    && end.as_deref().is_none_or(|e| idx_cursor.cursor.current_pk_bytes() < e)
-{
-    if idx_cursor.cursor.current_weight > 0 {
-        Self::resolve_index_entry_into(
-            idx_cursor.cursor.current_pk_bytes(), idx_key_size, src_pk_stride,
-            &mut src_cursor, &mut acc);
-    }
-    idx_cursor.cursor.advance();
-}
-```
+- **Cut keys are stack-allocated.** `eq_key`, `start`, and `end` are
+  `[0u8; MAX_PK_BYTES]` arrays sliced to `idx_pk_stride`, never `Vec`s.
+  `MAX_PK_BYTES` (80) bounds every index schema's `pk_stride` — asserted in
+  `SchemaDescriptor::new` — so the scan setup does zero heap allocation. This is
+  the same scratch idiom `batch_project_index` already uses on the write side
+  (`dag.rs`: `let mut idx_pk_buf = [0u8; MAX_PK_BYTES]`).
+- **The walk is unswitched on the upper bound.** A scan with no upper key
+  (`end == None`, e.g. `x > 10`) runs the row loop with zero per-row compares;
+  the bounded scan breaks on `key >= end`. The `Option` discriminant is tested
+  once, not per row.
 
-One full-key slice compare per row (`idx_pk_stride` bytes, vs. today's two
-three-way compares over `prefix_len` bytes); zero compares when `end` is
-`None`.
+A provably-empty interval — `start >= end`, reached by an inverted range like
+`x > 5 AND x < 3` that the planner does not pre-reject, or by a carry that
+collapsed `start` onto `end` — returns `Ok(None)` before any cursor is opened or
+the O(log N) seek runs. The full method is in **Complete `seek_by_index_range`**
+below.
 
 ### Why each deleted piece is subsumed
 
@@ -132,10 +134,10 @@ three-way compares over `prefix_len` bytes); zero compares when `end` is
 range slot ripples into the equality bytes. Example: index `(a, b)`, query
 `a = 7 AND b > u64::MAX`. `group(u64::MAX) = opk(7) ‖ 0xFF*8`, so
 `start = opk(8) ‖ 0x00…` — and `end = succ(opk(7)) ‖ 0x00… = opk(8) ‖ 0x00…`.
-`start == end`, the `<` condition fails on the first visited key, empty
-result, no special case. Only a carry out of the **entire** prefix (all bytes
-`0xFF`) needs handling, and the table above pins both occurrences: early
-`Ok(None)` on the lower side, `end = None` on the upper side.
+`start == end`, so the empty-interval guard returns `Ok(None)` at once — no
+special case. Only a carry out of the **entire** prefix (all bytes `0xFF`) needs
+handling, and the mapping table pins both occurrences: early `Ok(None)` on the
+lower side, `end = None` on the upper side.
 
 ### The `succ` helper
 
@@ -154,6 +156,214 @@ fn increment_key_in_place(p: &mut [u8]) -> bool {
 Private to `store.rs` (single consumer). The empty-slice case returning
 `false` is load-bearing: it is exactly the `n_eq == 0, hi == Unbounded` →
 scan-to-end row of the mapping table.
+
+Its direct unit test lives in a `#[cfg(test)] mod` inside `store.rs`, so the
+helper needs no widened visibility (the existing engine tests in
+`catalog/tests/index_tests.rs` are a sibling module and could not reach a
+module-private fn):
+
+```rust
+#[test]
+fn test_increment_key_in_place() {
+    let mut k1 = [0x00, 0x01];
+    assert!(increment_key_in_place(&mut k1));
+    assert_eq!(k1, [0x00, 0x02]);              // no carry
+
+    let mut k2 = [0x00, 0xFF];
+    assert!(increment_key_in_place(&mut k2));
+    assert_eq!(k2, [0x01, 0x00]);              // carry chain
+
+    let mut k3 = [0xFF, 0xFF];
+    assert!(!increment_key_in_place(&mut k3)); // overflow at width
+
+    let mut k4: [u8; 0] = [];
+    assert!(!increment_key_in_place(&mut k4)); // empty
+}
+```
+
+### Complete `seek_by_index_range`
+
+The full method after normalization. The doc comment carries the mapping table
+and the group-containment argument; the OPK-invariant paragraph is retained.
+Cut keys are `[0u8; MAX_PK_BYTES]` stack scratch sliced to `idx_pk_stride`
+(`SchemaDescriptor::new` asserts the bound), the empty-interval guard precedes
+cursor setup, and the walk is unswitched on `end.is_some()`.
+
+```rust
+/// Ordered range scan over a secondary index, normalized to a half-open
+/// byte-key interval `[start, end)` over the index PK space. The leading
+/// `eq_natives.len()` columns are equality-pinned; the next index column is the
+/// range column, bounded by `lo`/`hi`. Both bounds are mapped to cut points
+/// once here, so the walk is a single uniform iterator — seek to `start`,
+/// advance while `key < end` — with no per-row inclusivity test. Returns this
+/// worker's matching source rows; the master broadcasts to every worker and
+/// merges (the index is partitioned by source PK, so a range's matches scatter
+/// across workers).
+///
+/// Correctness rests on the post-`cff7c58` OPK ordering invariant: the index PK
+/// region is `[promoted leading-key OPK ‖ source-PK OPK]` and memcmp order on
+/// those bytes equals typed order (signed and composite included). For any
+/// `prefix_len`-byte group key `p`, every full key `k` with `k[..prefix_len] ==
+/// p` satisfies `pad(p) ≤ k < pad(succ(p))`, so cutting the key space at
+/// `pad(group)` / `pad(succ(group))` includes or excludes whole duplicate
+/// groups with no per-row prefix slicing. Bound → cut point:
+///
+/// | bound            | cut point                                              |
+/// |------------------|--------------------------------------------------------|
+/// | lo `Unbounded`   | `start = pad(eq_key)`                                   |
+/// | lo `Included(v)` | `start = pad(group(v))`                                 |
+/// | lo `Excluded(v)` | `start = pad(succ(group(v)))`; `succ` overflow → empty |
+/// | hi `Excluded(v)` | `end = pad(group(v))`                                   |
+/// | hi `Included(v)` | `end = pad(succ(group(v)))`; `succ` overflow → to end  |
+/// | hi `Unbounded`   | `end = pad(succ(eq_key))`; empty `eq_key` → to end      |
+pub fn seek_by_index_range(
+    &mut self,
+    table_id: i64,
+    col_indices: &[u32],
+    eq_natives: &[u128],
+    lo: ops::Bound<u128>,
+    hi: ops::Bound<u128>,
+) -> Result<Option<Batch>, String> {
+    use ops::Bound::{Excluded, Included, Unbounded};
+
+    let entry = self.dag.tables.get(&table_id)
+        .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+    let ic = entry.index_circuits.iter()
+        .find(|ic| ic.col_indices.as_slice() == col_indices)
+        .ok_or_else(|| format!("No index on cols {col_indices:?} for table {table_id}"))?;
+
+    // Precondition: the range column sits right after the equality prefix, so
+    // `n_eq + 1` leading columns must exist. The worker validates this at the
+    // trust boundary, but this `pub` method is also reachable from unit tests —
+    // guard here too, *before* any `columns[n_eq]` / `leading_key_size(n_eq+1)`
+    // indexing below would panic. (Written `n_eq >= len`, never a `+ 1` that
+    // could overflow on an adversarial length.) It also keeps `prefix_len <
+    // idx_pk_stride` strict, so `pad` always extends the group key.
+    let n_eq = eq_natives.len();
+    if n_eq >= col_indices.len() {
+        return Err(format!(
+            "seek_by_index_range: n_eq {n_eq} has no range column within index \
+             arity {} on cols {col_indices:?}", col_indices.len()));
+    }
+
+    let src_schema    = entry.schema;
+    let src_pk_stride = src_schema.pk_stride() as usize;
+    let idx_pk_stride = ic.index_schema.pk_stride() as usize;       // leading + source PK
+    let idx_key_size  = ic.index_schema.leading_key_size(col_indices.len());
+    let eq_size       = ic.index_schema.leading_key_size(n_eq);     // equality prefix bytes
+    let slot_size     = ic.index_schema.columns[n_eq].size() as usize;
+    let prefix_len    = eq_size + slot_size;                        // == leading_key_size(n_eq + 1)
+    let src_type      = src_schema.columns[col_indices[n_eq] as usize].type_code;
+    let idx_key_type  = ic.index_schema.columns[n_eq].type_code;
+
+    // Stack scratch, like `batch_project_index`: MAX_PK_BYTES bounds every index
+    // schema's pk_stride (asserted in SchemaDescriptor::new), so the cut keys
+    // need no heap allocation. Only `[..idx_pk_stride]` is ever read; the tail
+    // past the written prefix stays zero — i.e. `pad(p)`, the minimal key of
+    // group `p`.
+    let mut eq_key = [0u8; crate::schema::MAX_PK_BYTES];
+    if n_eq > 0 {
+        // n_eq == 0 (pure range, e.g. `x > 10`) must NOT reach IndexKeySpec::new:
+        // an empty `cols` slice trips its `debug_assert!(!cols.is_empty())`. The
+        // empty equality prefix is already all-zero, so skip the encode.
+        let spec = crate::schema::IndexKeySpec::new(
+            &col_indices[..n_eq], &src_schema, &ic.index_schema);
+        let (opk, _) = spec.seek_prefix(eq_natives);               // filled width == eq_size
+        eq_key[..eq_size].copy_from_slice(&opk[..eq_size]);
+    }
+
+    // group(v) = eq_key ‖ opk_slot(v), `prefix_len` bytes; the buffer tail stays
+    // zero. `index_opk_prefix` is the same scalar encoder the write path uses.
+    let write_group = |v: u128, buf: &mut [u8; crate::schema::MAX_PK_BYTES]| {
+        buf[..eq_size].copy_from_slice(&eq_key[..eq_size]);
+        buf[eq_size..prefix_len].copy_from_slice(
+            &crate::schema::index_opk_prefix(v, src_type, idx_key_type)[..slot_size]);
+    };
+
+    // Lower cut. `Excluded` steps to the byte successor of the whole boundary
+    // group, so the seek lands strictly past every duplicate of `v` in O(log N)
+    // (no per-row skip). A successor overflow means `v` is the maximal group:
+    // excluding it leaves nothing above, so the range is empty.
+    let mut start = [0u8; crate::schema::MAX_PK_BYTES];
+    match lo {
+        Unbounded   => start[..eq_size].copy_from_slice(&eq_key[..eq_size]),
+        Included(v) => write_group(v, &mut start),
+        Excluded(v) => {
+            write_group(v, &mut start);
+            if !increment_key_in_place(&mut start[..prefix_len]) {
+                return Ok(None);
+            }
+        }
+    }
+
+    // Upper cut. `end == None` scans to the table end (no upper key). A successor
+    // overflow on the inclusive/unbounded side means the group is the last
+    // representable one — exactly that case.
+    let mut end: Option<[u8; crate::schema::MAX_PK_BYTES]> = None;
+    match hi {
+        Excluded(v) => {
+            let mut e = [0u8; crate::schema::MAX_PK_BYTES];
+            write_group(v, &mut e);
+            end = Some(e);
+        }
+        Included(v) => {
+            let mut e = [0u8; crate::schema::MAX_PK_BYTES];
+            write_group(v, &mut e);
+            if increment_key_in_place(&mut e[..prefix_len]) { end = Some(e); }
+        }
+        Unbounded if n_eq > 0 => {
+            // Terminate at the first key of the next equality group.
+            let mut e = [0u8; crate::schema::MAX_PK_BYTES];
+            e[..eq_size].copy_from_slice(&eq_key[..eq_size]);
+            if increment_key_in_place(&mut e[..eq_size]) { end = Some(e); }
+        }
+        Unbounded => {}  // n_eq == 0: no equality group to terminate, scan to end
+    }
+
+    // Provably-empty interval (an inverted range like `x > 5 AND x < 3` the
+    // planner does not pre-reject, or a carry that collapsed `start` onto `end`):
+    // short-circuit before constructing any cursor or running the O(log N) seek.
+    if let Some(ref e) = end {
+        if start[..idx_pk_stride] >= e[..idx_pk_stride] {
+            return Ok(None);
+        }
+    }
+
+    // One index cursor + one reused source cursor (both raw-pointer/Rc-backed,
+    // like `seek_by_index`); copy each match straight into the accumulator.
+    let mut idx_cursor = ic.table_mut().open_cursor();
+    let mut src_cursor = entry.handle.open_cursor();
+    let mut acc = Batch::with_schema(src_schema, 0);
+
+    idx_cursor.cursor.seek_bytes(&start[..idx_pk_stride]);
+
+    // Unswitched on the upper bound: the `None` arm runs the row loop with zero
+    // per-row compares.
+    if let Some(ref e) = end {
+        let e_slice = &e[..idx_pk_stride];
+        while idx_cursor.cursor.valid {
+            let cur_pk = idx_cursor.cursor.current_pk_bytes();
+            if cur_pk >= e_slice { break; }
+            if idx_cursor.cursor.current_weight > 0 {
+                Self::resolve_index_entry_into(
+                    cur_pk, idx_key_size, src_pk_stride, &mut src_cursor, &mut acc);
+            }
+            idx_cursor.cursor.advance();
+        }
+    } else {
+        while idx_cursor.cursor.valid {
+            if idx_cursor.cursor.current_weight > 0 {
+                Self::resolve_index_entry_into(
+                    idx_cursor.cursor.current_pk_bytes(), idx_key_size, src_pk_stride,
+                    &mut src_cursor, &mut acc);
+            }
+            idx_cursor.cursor.advance();
+        }
+    }
+
+    Ok((acc.count > 0).then_some(acc))
+}
+```
 
 ### Planner: one saturation helper instead of two mirror blocks
 
@@ -196,11 +406,41 @@ let hi = resolve(upper_idx);
 (`empty = true` leaves the bound value irrelevant — `execute_select`
 short-circuits on `cand.empty` before reading `lo`/`hi`.)
 
+Direct corner test (`dml.rs` `#[cfg(test)] mod tests`), pinning the four
+`(RangeLit, RangeSide)` mappings the two old blocks encoded:
+
+```rust
+#[test]
+fn test_saturated_bound_corners() {
+    use super::{saturated_bound, RangeEnd, RangeLit, RangeSide};
+    use std::ops::Bound;
+
+    let mk = |side, incl, bound| RangeEnd { side, incl, bound };
+
+    // In-range literals carry their inclusivity through unchanged.
+    assert_eq!(saturated_bound(&mk(RangeSide::Lower, true,  RangeLit::In(42))),
+               Some(Bound::Included(42)));
+    assert_eq!(saturated_bound(&mk(RangeSide::Upper, false, RangeLit::In(100))),
+               Some(Bound::Excluded(100)));
+
+    // Past the type range *away* from the interval → widen to Unbounded.
+    assert_eq!(saturated_bound(&mk(RangeSide::Lower, true, RangeLit::BelowMin)),
+               Some(Bound::Unbounded));
+    assert_eq!(saturated_bound(&mk(RangeSide::Upper, true, RangeLit::AboveMax)),
+               Some(Bound::Unbounded));
+
+    // *Across* the interval → provably empty (None → caller sets `empty`).
+    assert_eq!(saturated_bound(&mk(RangeSide::Upper, true, RangeLit::BelowMin)), None);
+    assert_eq!(saturated_bound(&mk(RangeSide::Lower, true, RangeLit::AboveMax)), None);
+}
+```
+
 ## The change, by file
 
 ### 1. `crates/gnitz-engine/src/catalog/store.rs`
 
-In `seek_by_index_range` (currently :1018-1136), unchanged signature:
+In `seek_by_index_range` (currently :1018-1136), unchanged signature — the full
+method is in **Complete `seek_by_index_range`** above:
 
 - Keep: the table/index lookup, the `n_eq >= col_indices.len()` self-guard,
   the stride/size derivation block, the `IndexKeySpec::seek_prefix` eq-encode
@@ -208,19 +448,25 @@ In `seek_by_index_range` (currently :1018-1136), unchanged signature:
   and the `Ok((acc.count > 0).then_some(acc))` return.
 - Replace the `lo_prefix`/`hi_prefix` construction, `lo_excl`/`hi_excl`, the
   seed block, and the trim-laden loop with:
-  - `eq_key: Vec<u8>` (eq_size bytes) from `seek_prefix`;
-  - a `group(v)` closure: `eq_key ‖ index_opk_prefix(v, src_type, idx_key_type)[..slot_size]`;
-  - the six-row mapping table above producing `start: Vec<u8>` and
-    `end: Option<Vec<u8>>` (early `return Ok(None)` on lower-`succ` failure);
-  - the four-line walk.
-- Add `increment_key_in_place` as a private fn.
+  - `eq_key: [0u8; MAX_PK_BYTES]` (eq_size bytes) from `seek_prefix`;
+  - a `write_group` closure that fills `eq_key ‖ index_opk_prefix(v, src_type,
+    idx_key_type)[..slot_size]` into a caller-supplied buffer;
+  - the six-row mapping table producing `start: [0u8; MAX_PK_BYTES]` and
+    `end: Option<[u8; MAX_PK_BYTES]>` (early `return Ok(None)` on lower-`succ`
+    failure), all sliced to `idx_pk_stride`;
+  - the empty-interval guard (`start[..idx_pk_stride] >= end`);
+  - the walk, unswitched on `end.is_some()`.
+- Add `increment_key_in_place` as a private fn, plus its inline `#[cfg(test)]`
+  unit test.
 - Doc comment: replace the sentinel-inclusivity paragraph with the mapping
   table and the group-containment argument; the OPK-invariant paragraph stays.
-- The `use std::cmp` import added for the three-way trims becomes unused —
-  remove it (slice `<` suffices).
+- `use std::{cmp, ops};` (store.rs:2) loses its only `cmp` user — narrow it to
+  `use std::ops;` (line 730's `std::cmp::Reverse` is fully qualified; slice
+  `<`/`>=` replaces the three-way `cmp::Ordering` trims).
 
-Net: −2 buffers, −2 flags, −2 per-row branches, −~25 comment lines justifying
-the trims/seed; +~10-line helper, +~15-line normalization.
+Net: −3 heap buffers (now stack scratch), −2 flags, −2 per-row branches, −~25
+comment lines justifying the trims/seed; +~10-line helper, +~30-line
+normalization.
 
 ### 2. `crates/gnitz-sql/src/dml.rs`
 
@@ -269,9 +515,9 @@ defensive trim's only live case today and must now be excluded by the `start`
 cut alone — plus the 110 gnitz-sql unit tests, `TestIndexRangeSql` (9 tests,
 gnitz-py), and the three `@_NEEDS_MULTI` worker broadcast tests.
 
-New engine tests (`catalog/tests/index_tests.rs`), written **before** the
-refactor — all four also pass against the current implementation, so they
-bisect cleanly:
+New engine tests, written **before** the refactor in
+`catalog/tests/index_tests.rs` — all three pass against the current walk too
+(they pin behavior, not mechanism), so they bisect cleanly:
 
 1. **Exclusive lower at the type maximum** (lower-`succ` overflow): U64 `x`
    with rows at `x = u64::MAX`; `(&[], Excluded(u64::MAX), Unbounded)` → empty;
@@ -284,21 +530,26 @@ bisect cleanly:
    `(&[7], Excluded(u64::MAX), Unbounded)` → empty — the `(8, 0)` row must not
    leak in; `(&[7], Unbounded, Included(u64::MAX))` → the `(7, u64::MAX)` row
    only.
-4. **`increment_key_in_place` unit coverage** (direct): carry chain
-   (`[0x00, 0xFF] → [0x01, 0x00]`), no-carry, all-`0xFF` → `false`,
-   empty → `false`.
+
+`test_increment_key_in_place` (shown above) lands **with** the helper in step 2,
+in a `#[cfg(test)] mod` inside `store.rs` so the helper stays private — it cannot
+predate the refactor since the fn does not yet exist. It covers the carry chain
+(`[0x00, 0xFF] → [0x01, 0x00]`), no-carry, all-`0xFF` → `false`, and
+empty → `false`.
 
 Planner: the existing `range_candidate_saturates_out_of_range` covers both
-saturation directions through the new helper; add one `saturated_bound` direct
-test for the four `(RangeLit, RangeSide)` corners.
+saturation directions through the new helper; `test_saturated_bound_corners`
+(shown above) pins the four `(RangeLit, RangeSide)` corners directly.
 
 ## Migration order
 
-1. Add the four new engine tests + the `succ` unit test; run against the
-   current walk — green.
-2. Replace the walk with the normalization (file change 1); all engine tests
-   green, comment deltas included in the same change.
-3. Planner helper (file change 2); gnitz-sql tests green.
+1. Add the three seek-level engine tests (mapping items 1–3); run against the
+   current walk — green (they pin behavior, not mechanism).
+2. Replace the walk with the normalization (file change 1) and add
+   `increment_key_in_place` + its inline unit test; all engine tests green,
+   comment deltas in the same change.
+3. Planner helper + the `saturated_bound` corner test (file change 2);
+   gnitz-sql tests green.
 4. Full sweep: `cargo clippy --workspace --all-targets`,
    `cargo test --workspace`, `make pyext && pytest -m "not slow"`.
 

@@ -4,15 +4,20 @@
 
 Each item below is an independent, unimplemented future change.
 
-- **Non-equi join predicates** (range joins, `<`/`>` ON clauses) — the one join
-  shape where a secondary index is the natural access path: the trace probe is
-  equality-only (`seek_bytes` + equal-key-run walk), so a range predicate has no
-  single key to reindex on. An ordered index on the inner side, range-scanned per
-  delta, drives the match instead. Two prerequisites: the index leading-key bytes
-  must be ordered at rest (today's keys are equality-correct, but signed columns
-  are not ordered), and — because index entries are partitioned by source PK — a
-  distributed range join needs a range-aware exchange or a broadcast, not the
-  equality scatter. Unbuilt.
+- **Non-equi join predicates** (range joins, `<`/`>` ON clauses) — the join
+  itself remains; its access substrate has landed. Done: the order-preserving
+  signed key encoding (`cff7c58`) and the ordered range-scan primitive with
+  broadcast+merge distribution plus SQL range-SELECT planning (`0b2af7c`).
+  Remaining: the `DeltaTraceRange` join operator (a per-delta-row half-open
+  range probe of the other side's **ordered reindex trace** — the trace, not
+  the secondary index, is the right ordered structure: covering, view-owned,
+  and present over filtered inputs), a **broadcast** input relay (a range
+  probe's matches scatter across every worker, so the equality scatter cannot
+  route it), an ownership filter for trace integration under broadcast, a
+  **symmetric output re-key** onto the source-PK pair (the delta-side
+  `_join_pk` differs between the two join terms for a range pair, so
+  insert/retract emissions would never cancel), and an output exchange that
+  keeps the view output PK-partitioned. Extracted to `plans/range-join.md`.
 - **Python / C binding surface for compound-PK *result* rows** — views whose
   *output* PK is itself compound. (A join view's source PK rides as payload, so
   join/GROUP-BY result rows are unaffected; this is only about views that persist a
@@ -47,8 +52,11 @@ Each item below is an independent, unimplemented future change.
   `(promoted key, src_pk)` — non-covering, forcing a PK heap fetch for the
   payload. An equi-join needs same-key rows co-located *with* their payload, which
   is exactly what reindex+trace gives and a source-PK-partitioned index does not.
-  Secondary indexes earn their place in a join only for **range / non-equi**
-  predicates (§1).
+  Secondary indexes serve **single-table** range predicates (landed, `0b2af7c`);
+  the range / non-equi **join** (§1) likewise keeps the reindex+trace shape,
+  swapping the equality probe for an ordered range walk — see
+  `plans/range-join.md` for why the index loses there too (non-covering,
+  user-managed lifecycle, absent over filtered inputs).
 - **Mixed string/native equijoin keys** (`VARCHAR = U128`, etc.) stay rejected: a
   128-bit string content hash never byte-equals a native integer encoding, so the
   join would match nothing. A permanent semantic boundary, not a deferral.
