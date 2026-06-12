@@ -318,6 +318,22 @@ pub fn seek_by_index_range(
         .find(|ic| ic.col_indices.as_slice() == col_indices)
         .ok_or_else(|| format!("No index on cols {col_indices:?} for table {table_id}"))?;
 
+    // Precondition: the range column sits at position `n_eq` among the index's
+    // leading columns, so `n_eq + 1` of them must exist. The worker validates
+    // this at the trust boundary, but `seek_by_index_range` is a `pub` method
+    // reachable directly from unit tests — guard here too, *before* any
+    // `columns[n_eq]` / `leading_key_size(n_eq + 1)` indexing below, which would
+    // otherwise panic out of bounds. `n_eq >= len` (not `n_eq + 1 > len`) avoids
+    // overflowing the `+ 1` on an adversarial descriptor byte. This also makes
+    // `prefix_len < idx_pk_stride` strict, so the exclusive-lower `seek_key
+    // [prefix_len..]` suffix below is always a non-empty slice.
+    if n_eq >= col_indices.len() {
+        return Err(format!(
+            "seek_by_index_range: n_eq {n_eq} has no range column within index \
+             arity {} on cols {col_indices:?}", col_indices.len()));
+    }
+    debug_assert_eq!(eq_natives.len(), n_eq, "eq_natives must hold exactly n_eq values");
+
     let src_schema    = entry.schema;
     let src_pk_stride = src_schema.pk_stride() as usize;
     let idx_pk_stride = ic.index_schema.pk_stride() as usize;       // leading + source PK
@@ -397,7 +413,17 @@ pub fn seek_by_index_range(
                 && src_cursor.cursor.current_weight > 0
                 && src_cursor.cursor.current_pk_bytes() == &src_pk[..src_pk_stride]
             {
-                src_cursor.cursor.copy_current_row_into(&mut acc, 1);
+                // Copy the row at its true Z-Set multiplicity — the net
+                // `current_weight` — never a hardcoded 1. This mirrors what the
+                // point seek does today (`seek_family_bytes` →
+                // `copy_cursor_row_with_weight(.., current_weight)`), so folding
+                // `seek_by_index` onto the shared resolve helper below cannot
+                // regress its weights, and the `(ℤ[D], +, 0, -)` group structure
+                // any downstream COUNT/SUM relies on stays intact. (For a
+                // unique-PK base table the net is 1, so this is observationally
+                // identical there — but the primitive must not assume it.)
+                let w = src_cursor.cursor.current_weight;
+                src_cursor.cursor.copy_current_row_into(&mut acc, w);
             }
         }
         idx_cursor.cursor.advance();
@@ -410,9 +436,10 @@ pub fn seek_by_index_range(
 single-column scalar sibling of `seek_prefix`; it sign-extends the signed source
 from its native width before OPK-encoding at the promoted index column, so the
 bound bytes are byte-identical to stored entries. Factor the source-PK-reconstruct
-+ `copy_current_row_into` block into a private helper and call it from
++ `copy_current_row_into` block into a private helper — copying the cursor's net
+`current_weight`, exactly as `copy_cursor_row_with_weight` does — and call it from
 `seek_by_index`'s loop too, so the point seek drops its per-row `seek_family_bytes`
-`Batch` allocation as well.
+`Batch` allocation while keeping its existing weight-preserving behavior.
 
 ### 4. Worker dispatch (`runtime/worker.rs`) + executor routing (`runtime/executor.rs`)
 
@@ -618,6 +645,18 @@ SQL feature; include only if Python-level range index access is wanted now.
 - **Worker is the sole OPK encoder.** The client/master ship native bound values
   (and the descriptor) verbatim; only the worker OPK-encodes. Preserves the
   existing trust boundary.
+- **Preserve source multiplicity.** Resolve each match with the source row's net
+  `current_weight`, never a hardcoded `1`. The point seek already does this
+  (`copy_cursor_row_with_weight(.., current_weight)`); the shared resolve helper
+  must too, or routing `seek_by_index` through it silently truncates weights and
+  breaks the Z-Set group structure (`foundations.md` §1) that downstream
+  COUNT/SUM depend on.
+- **The engine method self-guards its arity.** `seek_by_index_range` returns
+  `Err` when `n_eq >= col_indices.len()` (no range column within the index),
+  *before* indexing `columns[n_eq]` / `leading_key_size(n_eq + 1)`. The worker
+  enforces the same bound at the trust boundary, but the `pub` method is also
+  reachable from tests, and the guard keeps `prefix_len < idx_pk_stride` strict
+  so the exclusive-lower `seek_key[prefix_len..]` suffix is never an empty slice.
 - **Trust-boundary validation.** Validate the descriptor length and `n_eq` arity
   in the worker before decoding, mirroring the `seek_pk_extra.len() % 16` guard;
   never index past a malformed frame.
@@ -720,6 +759,12 @@ Rust (`gnitz-engine`, `seek_by_index_range` unit tests against a seeded index):
 - **Retraction**: insert rows in range, retract some, assert the range scan
   reflects net positive weight (no ghost entries) — the mandatory retraction test
   for any new index access path (dev-guide IPC checklist).
+- **Multiplicity preserved** (regression guard for the weight fix): seed the
+  index plus a source row at net weight 2 by ingesting a batch directly into the
+  `CatalogStore` (bypassing DML unique-PK enforcement, which would otherwise pin
+  every base row to weight 1); assert the range scan returns that row at weight 2,
+  not 1 — proving the resolve copies `current_weight` rather than a hardcoded
+  constant.
 - **NULL exclusion**: a row with NULL in the indexed column is absent from results
   of any range predicate.
 

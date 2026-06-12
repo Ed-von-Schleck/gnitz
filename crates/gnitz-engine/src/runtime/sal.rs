@@ -59,6 +59,15 @@ pub const FLAG_GATHER: u32              = 65536;
 /// `validate_unique_index_create_async`). Unicast-shaped like a Scan: every
 /// worker gets its own req_id slot and answers with a frame train.
 pub const FLAG_UNIQUE_PREFLIGHT: u32    = 131072;
+/// Ordered range scan over a secondary index (master→worker leg). The
+/// `u32`-space dispatch flag for `SalMessageKind::SeekByIndexRange`; bit 18,
+/// the next free SAL group-header bit above `FLAG_UNIQUE_PREFLIGHT` (1<<17).
+/// Distinct from the client→master `u64` wire flag `FLAG_SEEK_BY_INDEX_RANGE`
+/// (bit 55), which lives among the wire packed fields and is never classified
+/// here. A range seek must fan out (its matches scatter by source PK), so the
+/// worker classifies it from this `u32` flag. See
+/// `plans/secondary-index-range-scan.md`.
+pub const FLAG_SEEK_BY_INDEX_RANGE_SAL: u32 = 1 << 18;
 
 /// Wire schema of every unique pre-flight reply frame: the leading `n_promoted`
 /// columns of the index schema, all marked PK, schema version 0. Its `pk_stride`
@@ -139,6 +148,7 @@ pub enum SalMessageKind {
     Push,
     Tick,
     SeekByIndex,
+    SeekByIndexRange,
     Seek,
     Scan,
 }
@@ -149,8 +159,10 @@ impl SalMessageKind {
     /// Priority order matches the worker's existing if-chain (see
     /// `worker::dispatch_inner`): SHUTDOWN > FLUSH > DDL_SYNC >
     /// EXCHANGE_RELAY > PRELOADED_EXCHANGE > BACKFILL > HAS_PK >
-    /// GATHER > UNIQUE_PREFLIGHT > PUSH > TICK > SEEK_BY_INDEX > SEEK >
-    /// Scan. The first match wins.
+    /// GATHER > UNIQUE_PREFLIGHT > PUSH > TICK > SEEK_BY_INDEX_RANGE >
+    /// SEEK_BY_INDEX > SEEK > Scan. The first match wins. (Each kind owns a
+    /// distinct bit, so the relative order of the disjoint range/point/seek
+    /// arms is immaterial; it tracks the worker's if-chain for readability.)
     pub fn classify(flags: u32) -> SalMessageKind {
         if flags & FLAG_SHUTDOWN != 0           { return SalMessageKind::Shutdown; }
         if flags & FLAG_FLUSH != 0              { return SalMessageKind::Flush; }
@@ -163,6 +175,7 @@ impl SalMessageKind {
         if flags & FLAG_UNIQUE_PREFLIGHT != 0   { return SalMessageKind::UniquePreflight; }
         if flags & FLAG_PUSH != 0               { return SalMessageKind::Push; }
         if flags & FLAG_TICK != 0               { return SalMessageKind::Tick; }
+        if flags & FLAG_SEEK_BY_INDEX_RANGE_SAL != 0 { return SalMessageKind::SeekByIndexRange; }
         if flags & FLAG_SEEK_BY_INDEX != 0      { return SalMessageKind::SeekByIndex; }
         if flags & FLAG_SEEK != 0               { return SalMessageKind::Seek; }
         SalMessageKind::Scan
@@ -191,7 +204,7 @@ impl SalMessageKind {
     /// All variants in classification priority order. Used by tests that
     /// walk every kind to exercise the dispatcher's full match.
     #[allow(dead_code)]
-    pub const ALL: [SalMessageKind; 14] = [
+    pub const ALL: [SalMessageKind; 15] = [
         SalMessageKind::Shutdown,
         SalMessageKind::Flush,
         SalMessageKind::DdlSync,
@@ -204,6 +217,7 @@ impl SalMessageKind {
         SalMessageKind::Push,
         SalMessageKind::Tick,
         SalMessageKind::SeekByIndex,
+        SalMessageKind::SeekByIndexRange,
         SalMessageKind::Seek,
         SalMessageKind::Scan,
     ];

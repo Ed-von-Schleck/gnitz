@@ -1,4 +1,5 @@
 use std::num::NonZeroU64;
+use std::{cmp, ops};
 
 use super::*;
 
@@ -926,7 +927,8 @@ impl CatalogEngine {
             .find(|ic| ic.col_indices.as_slice() == col_indices)
             .ok_or_else(|| format!("No index on cols {col_indices:?} for table {table_id}"))?;
 
-        let src_pk_stride = entry.schema.pk_stride() as usize;
+        let src_schema = entry.schema;
+        let src_pk_stride = src_schema.pk_stride() as usize;
         let idx_key_size = ic.index_schema.leading_key_size(col_indices.len());
 
         // OPK-encode the supplied natives into a leading-key prefix. The spec
@@ -935,12 +937,18 @@ impl CatalogEngine {
         // order-preserving and matches stored entries (`batch_project_index`
         // encodes through the same spec).
         let spec = crate::schema::IndexKeySpec::new(
-            &col_indices[..natives.len()], &entry.schema, &ic.index_schema);
+            &col_indices[..natives.len()], &src_schema, &ic.index_schema);
         let (opk, prefix_len) = spec.seek_prefix(natives);
         let opk_prefix = &opk[..prefix_len];
 
-        let idx_table = ic.table_mut();
-        let mut cursor = idx_table.open_cursor();
+        // One index cursor + one source cursor, both owned (Rc-backed snapshots),
+        // reused across the whole walk. The shared `resolve_index_entry_into`
+        // helper copies each match straight into `acc` at its net weight, so the
+        // point seek no longer opens a cursor and heap-allocates a one-row Batch
+        // per match (the old `seek_family_bytes` path).
+        let mut idx_cursor = ic.table_mut().open_cursor();
+        let mut src_cursor = entry.handle.open_cursor();
+        let mut acc = Batch::with_schema(src_schema, 0);
 
         // Seek to the first positive-weight match, then walk forward with
         // `walk_to_positive_with_prefix` after each consumed entry. Re-calling
@@ -953,28 +961,178 @@ impl CatalogEngine {
         // their source rows (partitioned by source PK), so a value's matches can
         // be spread across workers: this returns one worker's partial set and
         // the master (`fan_out_seek_by_index_collect_async`) merges across all.
-        let mut result: Option<Batch> = None;
-        let mut hit = cursor.cursor.seek_first_positive_with_prefix(opk_prefix);
+        let mut hit = idx_cursor.cursor.seek_first_positive_with_prefix(opk_prefix);
         while hit {
-            // Copy the source PK out of the index PK suffix into a fixed buffer
-            // before the `&mut self` resolve below releases the cursor borrow.
-            // Widened to MAX_PK_BYTES so wide (`src_pk_stride > 16`) sources
-            // resolve via `seek_family_bytes`.
-            let current_pk = cursor.cursor.current_pk_bytes();
-            let mut src_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
-            src_pk_buf[..src_pk_stride].copy_from_slice(
-                &current_pk[idx_key_size..idx_key_size + src_pk_stride],
-            );
-            if let Some(batch) = self.seek_family_bytes(table_id, &src_pk_buf[..src_pk_stride])? {
-                match result.as_mut() {
-                    Some(acc) => acc.append_batch(&batch, 0, batch.count),
-                    None => result = Some(batch),
+            Self::resolve_index_entry_into(
+                idx_cursor.cursor.current_pk_bytes(), idx_key_size, src_pk_stride,
+                &mut src_cursor, &mut acc);
+            idx_cursor.cursor.advance();
+            hit = idx_cursor.cursor.walk_to_positive_with_prefix(opk_prefix);
+        }
+        Ok((acc.count > 0).then_some(acc))
+    }
+
+    /// Resolve one secondary-index entry to its source row and append it to
+    /// `acc`. Reconstructs the source PK from the index PK suffix
+    /// (`idx_pk_bytes[idx_key_size..idx_key_size + src_pk_stride]`), seeks the
+    /// **reused** `src_cursor`, and—when the row is present, live, and the PK
+    /// matches—copies it at its net `current_weight` (never a hardcoded 1, so
+    /// Z-Set multiplicity is preserved). Shared by `seek_by_index` and
+    /// `seek_by_index_range`; widening `src_pk` to `MAX_PK_BYTES` keeps wide
+    /// (`src_pk_stride > 16`) sources correct.
+    fn resolve_index_entry_into(
+        idx_pk_bytes: &[u8],
+        idx_key_size: usize,
+        src_pk_stride: usize,
+        src_cursor: &mut CursorHandle,
+        acc: &mut Batch,
+    ) {
+        let mut src_pk = [0u8; crate::schema::MAX_PK_BYTES];
+        src_pk[..src_pk_stride].copy_from_slice(
+            &idx_pk_bytes[idx_key_size..idx_key_size + src_pk_stride]);
+        src_cursor.cursor.seek_bytes(&src_pk[..src_pk_stride]);
+        if src_cursor.cursor.valid
+            && src_cursor.cursor.current_weight > 0
+            && src_cursor.cursor.current_pk_bytes() == &src_pk[..src_pk_stride]
+        {
+            let w = src_cursor.cursor.current_weight;
+            src_cursor.cursor.copy_current_row_into(acc, w);
+        }
+    }
+
+    /// Ordered range scan over a secondary index: the leading
+    /// `eq_natives.len()` columns are equality-pinned, and the next index
+    /// column is the range column, bounded by `lo`/`hi`. An `Unbounded` side
+    /// covers the 0x00/0xFF OPK sentinel itself, so it cannot wrongly drop a
+    /// row whose range column maps exactly to that sentinel (e.g. a U32
+    /// column holding `u32::MAX` with no upper bound). Returns this worker's
+    /// matching source rows; the master broadcasts to every worker and merges
+    /// (the index is partitioned by source PK, so a range's matches scatter
+    /// across workers).
+    ///
+    /// Correctness rests on the post-`cff7c58` OPK ordering invariant: the
+    /// leading-key OPK is order-preserving (memcmp == typed order, signed and
+    /// composite included), so a raw byte compare of
+    /// `current_pk_bytes()[..prefix_len]` against `lo_prefix`/`hi_prefix` IS the
+    /// typed lexicographic compare. See `plans/secondary-index-range-scan.md`.
+    pub fn seek_by_index_range(
+        &mut self,
+        table_id: i64,
+        col_indices: &[u32],
+        eq_natives: &[u128],
+        lo: ops::Bound<u128>,
+        hi: ops::Bound<u128>,
+    ) -> Result<Option<Batch>, String> {
+        use ops::Bound::{Excluded, Included, Unbounded};
+
+        let entry = self.dag.tables.get(&table_id)
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let ic = entry.index_circuits.iter()
+            .find(|ic| ic.col_indices.as_slice() == col_indices)
+            .ok_or_else(|| format!("No index on cols {col_indices:?} for table {table_id}"))?;
+
+        // Precondition: the range column sits right after the equality prefix,
+        // so `n_eq + 1` leading columns must exist. The worker validates this
+        // at the trust boundary, but this `pub` method is also reachable from
+        // unit tests — guard here too, *before* any `columns[n_eq]` /
+        // `leading_key_size(n_eq + 1)` indexing below would panic out of
+        // bounds. (Written `n_eq >= len`, never a `+ 1` that could overflow on
+        // an adversarial length.) It also keeps `prefix_len < idx_pk_stride`
+        // strict, so the exclusive-lower `seek_key[prefix_len..]` suffix is
+        // always non-empty.
+        let n_eq = eq_natives.len();
+        if n_eq >= col_indices.len() {
+            return Err(format!(
+                "seek_by_index_range: n_eq {n_eq} has no range column within index \
+                 arity {} on cols {col_indices:?}", col_indices.len()));
+        }
+        let lo_excl = matches!(lo, Excluded(_));
+        let hi_excl = matches!(hi, Excluded(_));
+
+        let src_schema    = entry.schema;
+        let src_pk_stride = src_schema.pk_stride() as usize;
+        let idx_pk_stride = ic.index_schema.pk_stride() as usize;       // leading + source PK
+        let idx_key_size  = ic.index_schema.leading_key_size(col_indices.len());
+        let eq_size       = ic.index_schema.leading_key_size(n_eq);     // equality prefix bytes
+        let slot_size     = ic.index_schema.columns[n_eq].size() as usize;
+        let prefix_len    = eq_size + slot_size;                        // == leading_key_size(n_eq + 1)
+        let src_type      = src_schema.columns[col_indices[n_eq] as usize].type_code;
+        let idx_key_type  = ic.index_schema.columns[n_eq].type_code;
+
+        // Two byte prefixes: identical equality slots, range slot differs.
+        let mut lo_prefix = vec![0u8; prefix_len];
+        if n_eq > 0 {
+            // n_eq == 0 (pure range, e.g. `x > 10`) must NOT reach
+            // IndexKeySpec::new: an empty `cols` slice trips its
+            // `debug_assert!(!cols.is_empty())`. The empty equality prefix is
+            // already all-zero, so skip the encode.
+            let spec = crate::schema::IndexKeySpec::new(
+                &col_indices[..n_eq], &src_schema, &ic.index_schema);
+            let (opk, plen) = spec.seek_prefix(eq_natives);            // plen == eq_size
+            lo_prefix[..plen].copy_from_slice(&opk[..plen]);
+        }
+        let mut hi_prefix = lo_prefix.clone();
+        if let Included(v) | Excluded(v) = lo {
+            lo_prefix[eq_size..].copy_from_slice(
+                &crate::schema::index_opk_prefix(v, src_type, idx_key_type)[..slot_size]);
+        } // Unbounded: 0x00 * slot_size == OPK minimum (signed INT_MIN sign-flips to all-zero)
+        match hi {
+            Included(v) | Excluded(v) => hi_prefix[eq_size..].copy_from_slice(
+                &crate::schema::index_opk_prefix(v, src_type, idx_key_type)[..slot_size]),
+            Unbounded => hi_prefix[eq_size..].fill(0xFF),              // OPK maximum
+        }
+
+        // One index cursor + one reused source cursor (both raw-pointer/Rc-backed,
+        // like `seek_by_index`); copy each match straight into the accumulator.
+        let mut idx_cursor = ic.table_mut().open_cursor();
+        let mut src_cursor = entry.handle.open_cursor();
+        let mut acc = Batch::with_schema(src_schema, 0);
+
+        // Seed the seek key with the lower-bound prefix. For an *exclusive* finite
+        // lower bound, pad the source-PK suffix with 0xFF (the OPK maximum) so the
+        // binary search lands at the first entry strictly past the boundary group
+        // in O(log N). With 0x00 the seek lands on the first member of the
+        // boundary group, and the loop below would then skip every duplicate of
+        // the lower value one entry at a time — O(N) on a low-cardinality column
+        // with a large duplicate group. `suffix_len = idx_pk_stride - prefix_len ≥
+        // src_pk_stride > 0` because the range column is a leading column, so the
+        // suffix always exists. (Inclusive or unbounded-below keeps 0x00.)
+        let mut seek_key = vec![0u8; idx_pk_stride];
+        seek_key[..prefix_len].copy_from_slice(&lo_prefix);
+        if lo_excl {
+            seek_key[prefix_len..].fill(0xFF);
+        }
+        idx_cursor.cursor.seek_bytes(&seek_key);
+        while idx_cursor.cursor.valid {
+            {
+                let cur = &idx_cursor.cursor.current_pk_bytes()[..prefix_len];
+                // Upper bound terminates the scan (entries ordered by leading OPK).
+                match cur.cmp(hi_prefix.as_slice()) {
+                    cmp::Ordering::Greater => break,
+                    cmp::Ordering::Equal if hi_excl => break,
+                    _ => {}
+                }
+                // Defensive lower trim. The 0xFF-suffixed exclusive seek above
+                // lands past the boundary group, so `Equal` with an exclusive
+                // lower only fires for the astronomically-rare entry whose
+                // source PK is itself all-0xFF (e.g. a U64 source PK of
+                // u64::MAX); the inclusive seek lands at `cur >= lo_prefix`, so
+                // `Less` never fires. Both are kept so the walk stays correct
+                // independent of the seed.
+                match cur.cmp(lo_prefix.as_slice()) {
+                    cmp::Ordering::Less => { idx_cursor.cursor.advance(); continue; }
+                    cmp::Ordering::Equal if lo_excl => { idx_cursor.cursor.advance(); continue; }
+                    _ => {}
                 }
             }
-            cursor.cursor.advance();
-            hit = cursor.cursor.walk_to_positive_with_prefix(opk_prefix);
+            if idx_cursor.cursor.current_weight > 0 {
+                Self::resolve_index_entry_into(
+                    idx_cursor.cursor.current_pk_bytes(), idx_key_size, src_pk_stride,
+                    &mut src_cursor, &mut acc);
+            }
+            idx_cursor.cursor.advance();
         }
-        Ok(result)
+        Ok((acc.count > 0).then_some(acc))
     }
 
     /// Flush a table's WAL.

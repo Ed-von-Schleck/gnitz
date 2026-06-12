@@ -14,6 +14,7 @@ pub use header::{
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_SHUTDOWN,
     FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH, FLAG_HAS_PK, FLAG_SEEK,
     FLAG_SEEK_BY_INDEX, FLAG_ALLOCATE_INDEX_ID, FLAG_GET_INDICES,
+    FLAG_SEEK_BY_INDEX_RANGE,
     WireConflictMode,
     wire_flags_set_conflict_mode, wire_flags_get_conflict_mode,
     wire_flags_set_schema_version, wire_flags_get_schema_version,
@@ -33,6 +34,7 @@ pub use transport::{
     hello_handshake,
 };
 pub use message::{
-    Message, send_message, send_message_noschema, recv_message, encode_message,
+    Message, send_message, send_message_noschema, send_message_with_extra,
+    recv_message, encode_message,
     parse_response, encode_control_block, decode_control_block,
 };

@@ -2134,3 +2134,191 @@ class TestCompositeUniqueIndex:
             assert rows == [(1, 7, 2), (2, 7, 3), (3, 7, 4)], rows
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
+
+
+# ---------------------------------------------------------------------------
+# TestIndexRangeSql — ordered range scans over a secondary index (direct SELECT)
+# ---------------------------------------------------------------------------
+
+def _result_pks(result):
+    """Sorted list of PKs from a SELECT Rows result (positive weight only)."""
+    assert result[0]["type"] == "Rows"
+    return sorted(row.pk for row in result[0]["rows"] if row.weight > 0)
+
+
+def _result_rows(result):
+    """Sorted list of full-row value tuples (schema order, PK first) from a
+    SELECT Rows result (positive weight only)."""
+    assert result[0]["type"] == "Rows"
+    return sorted(tuple(row) for row in result[0]["rows"] if row.weight > 0)
+
+
+class TestIndexRangeSql:
+    def test_range_open_ended(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 0), (2, 10), (3, 20), (4, 30)",
+                               schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
+            assert q("SELECT * FROM t WHERE x > 10") == [3, 4]
+            assert q("SELECT * FROM t WHERE x >= 10") == [2, 3, 4]
+            assert q("SELECT * FROM t WHERE x < 20") == [1, 2]
+            assert q("SELECT * FROM t WHERE x <= 20") == [1, 2, 3]
+            assert q("SELECT * FROM t WHERE 10 < x") == [3, 4]   # flipped orientation
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+
+    def test_range_between(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 0), (2, 10), (3, 20), (4, 30)",
+                               schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
+            assert q("SELECT * FROM t WHERE x BETWEEN 10 AND 20") == [2, 3]
+            # NOT BETWEEN on the sole indexed column with no other predicate is not
+            # a contiguous interval and not servable → clean error (not mis-served).
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("SELECT * FROM t WHERE x NOT BETWEEN 10 AND 20",
+                                   schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+
+    def test_range_signed_between(self, client):
+        """The cff7c58 payoff: a signed range returns the contiguous signed
+        interval (OPK(-5) < OPK(5)), not an inverted/empty set."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x INT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, -10), (2, -5), (3, 0), (4, 5), (5, 10)",
+                schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
+            assert q("SELECT * FROM t WHERE x BETWEEN -5 AND 5") == [2, 3, 4]
+            assert q("SELECT * FROM t WHERE x > -5") == [3, 4, 5]
+            assert q("SELECT * FROM t WHERE x < 0") == [1, 2]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+
+    def test_range_composite_served_by_range(self, client):
+        """On index (a, b), `a = 5 AND b > 10` is served by the composite range
+        scan, NOT a bare `a = 5` prefix seek + residual: a row at (5, 0) must be
+        absent, and an (8, 11) row never enters the candidate (scan stops < a=8)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 5, 0), (2, 5, 20), (3, 5, 11), (4, 8, 11)",
+                schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
+            assert _result_rows(client.execute_sql(
+                "SELECT * FROM t WHERE a = 5 AND b > 10", schema_name=sn)) == \
+                [(2, 5, 20), (3, 5, 11)]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
+
+    def test_range_nonindexed_rejects(self, client):
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 5)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("SELECT * FROM t WHERE x > 5", schema_name=sn)
+        finally:
+            _drop_all(client, sn, tables=["t"])
+
+    def test_range_residual_conjunct(self, client):
+        """A non-range residual conjunct is applied after the range scan."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "x BIGINT NOT NULL, y BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 100)",
+                schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+            # x > 5 (range) AND y = 100 (residual) → pks 1 and 3.
+            assert _result_pks(client.execute_sql(
+                "SELECT * FROM t WHERE x > 5 AND y = 100", schema_name=sn)) == [1, 3]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+
+    def test_residual_between_binds(self, client):
+        """`x > 5 AND y BETWEEN 1 AND 9` (only x indexed): the y BETWEEN residual
+        now binds and filters (regression guard for the Expr::Between binder arm)
+        instead of failing to bind. NOT BETWEEN likewise filters."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "x BIGINT NOT NULL, y BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 5), (2, 20, 50), (3, 30, 1)",
+                schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
+            assert q("SELECT * FROM t WHERE x > 5 AND y BETWEEN 1 AND 9") == [1, 3]
+            assert q("SELECT * FROM t WHERE x > 5 AND y NOT BETWEEN 1 AND 9") == [2]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+
+    def test_range_redundant_same_side(self, client):
+        """`x > 5 AND x > 10` keeps the first end as the bound and trims the slack
+        via the residual; order-independent (proves no packed-native compare)."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+                schema_name=sn)
+            vals = ",".join(f"({i}, {i})" for i in range(1, 16))
+            client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
+            assert q("SELECT * FROM t WHERE x > 5 AND x > 10") == list(range(11, 16))
+            assert q("SELECT * FROM t WHERE x > 10 AND x > 5") == list(range(11, 16))
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+
+    def test_range_out_of_range_saturation(self, client):
+        """An out-of-type-range bound saturates: `x > 3e9` on an INT (I32) column
+        is provably empty; `x < 3e9` saturates to unbounded and returns all rows."""
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x INT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 1), (2, 100), (3, 1000)",
+                               schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
+            assert q("SELECT * FROM t WHERE x > 3000000000") == []
+            assert q("SELECT * FROM t WHERE x < 3000000000") == [1, 2, 3]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])

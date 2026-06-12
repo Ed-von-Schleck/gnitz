@@ -6,11 +6,12 @@ use lru::LruCache;
 use crate::protocol::{
     Message, Schema, ZSetBatch, PkTuple,
     STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+    FLAG_SEEK_BY_INDEX_RANGE,
     FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID, FLAG_GET_INDICES,
     FLAG_CONTINUATION, WireConflictMode,
     wire_flags_set_conflict_mode, wire_flags_set_schema_version, wire_flags_get_schema_version,
     wire_flags_set_index_version, wire_flags_get_index_version,
-    send_message, send_message_noschema, recv_message,
+    send_message, send_message_noschema, send_message_with_extra, recv_message,
     connect as proto_connect,
     hello_handshake,
 };
@@ -183,6 +184,22 @@ impl Connection {
         Ok((schema, msg.data_batch, msg.seek_pk as u64))
     }
 
+    /// Ordered range scan over a secondary index, described by `desc` (the
+    /// equality-pinned leading values plus the `lo`/`hi` bounds on the next
+    /// index column). Arity is validated upstream in
+    /// `GnitzClient::seek_by_index_range`, the single choke point.
+    pub fn seek_by_index_range(
+        &mut self,
+        table_id:    u64,
+        col_indices: &[u32],
+        desc:        &gnitz_wire::RangeDescriptor,
+        cache:       &mut LruCache<u64, (Arc<Schema>, u16)>,
+    ) -> ScanResult {
+        let msg = self.roundtrip_seek_by_index_range(table_id, col_indices, desc, cache)?;
+        let schema = msg.schema.map(Arc::new).or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
+        Ok((schema, msg.data_batch, msg.seek_pk as u64))
+    }
+
     /// Pure transport for GET_INDICES: send the cached index epoch and receive
     /// the server's reply on a dedicated path — `recv_message(fd, None, ..)`,
     /// never `recv_message_cached_inner` — so the per-table `schema_cache` is
@@ -317,6 +334,28 @@ impl Connection {
         let pk = PkTuple::from_bytes(&buf[..key_vals.len() * 16]);
         let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
         send_message(self.sock.as_raw_fd(), table_id, self.client_id, flags, &pk, seek_col_idx, None, None)?;
+        let msg = self.recv_message_cached_inner(table_id, cache)?;
+        check_response(msg)
+    }
+
+    /// Send a SEEK_BY_INDEX_RANGE frame. The encoded §2 descriptor rides the
+    /// **explicit** `seek_pk_extra` blob (up to 82 bytes at max index arity —
+    /// over the 64-byte `PkTuple` cap), so it goes through
+    /// `send_message_with_extra`, not `send_message`. Native bound values ship
+    /// verbatim; the worker is the sole OPK encoder.
+    fn roundtrip_seek_by_index_range(
+        &mut self,
+        table_id:    u64,
+        col_indices: &[u32],
+        desc:        &gnitz_wire::RangeDescriptor,
+        cache:       &mut LruCache<u64, (Arc<Schema>, u16)>,
+    ) -> Result<Message, ClientError> {
+        let cached_version = cache.peek(&table_id).map(|(_, v)| *v).unwrap_or(0);
+        let flags = wire_flags_set_schema_version(FLAG_SEEK_BY_INDEX_RANGE, cached_version);
+        let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
+        send_message_with_extra(
+            self.sock.as_raw_fd(), table_id, self.client_id, flags, seek_col_idx,
+            &desc.encode())?;
         let msg = self.recv_message_cached_inner(table_id, cache)?;
         check_response(msg)
     }

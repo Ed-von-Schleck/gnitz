@@ -334,6 +334,27 @@ impl<'a> Binder<'a> {
                     )),
                 }
             }
+            Expr::Between { expr, negated, low, high } => {
+                // `e BETWEEN lo AND hi` ≡ `e >= lo AND e <= hi`; NOT BETWEEN is
+                // its negation. Bind `e` twice rather than require BoundExpr:
+                // Clone. NULL semantics are SQL-correct: a NULL operand makes the
+                // AND NULL, and NOT(NULL) is NULL → the row is excluded under
+                // either form. This makes a *residual* BETWEEN filterable (e.g. on
+                // a non-covered column behind an index range scan), independent of
+                // the range collector's own BETWEEN desugar which extracts a bound.
+                let ge = BoundExpr::BinOp(
+                    Box::new(self.bind_expr(expr, schema)?), BinOp::Ge,
+                    Box::new(self.bind_expr(low,  schema)?));
+                let le = BoundExpr::BinOp(
+                    Box::new(self.bind_expr(expr, schema)?), BinOp::Le,
+                    Box::new(self.bind_expr(high, schema)?));
+                let between = BoundExpr::BinOp(Box::new(ge), BinOp::And, Box::new(le));
+                Ok(if *negated {
+                    BoundExpr::UnaryOp(UnaryOp::Not, Box::new(between))
+                } else {
+                    between
+                })
+            }
             _ => Err(GnitzSqlError::Unsupported(
                 format!("expression type not supported: {expr:?}")
             )),
@@ -406,6 +427,27 @@ mod tests {
             Err(GnitzSqlError::Bind(s)) =>
                 assert!(s.contains("ambiguous"), "got: {s}"),
             other => panic!("expected Bind(ambiguous), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bind_between_desugars_to_comparison_tree() {
+        let binder = Binder::new("s");
+        let schema = schema_with_val(TypeCode::I64);   // (pk U64, c I64)
+        // `c BETWEEN 1 AND 9` ≡ `c >= 1 AND c <= 9` — a residual BETWEEN now binds
+        // (regression guard for the new Expr::Between arm) instead of Unsupported.
+        match binder.bind_expr(&parse("c BETWEEN 1 AND 9"), &schema).unwrap() {
+            BoundExpr::BinOp(l, BinOp::And, r) => {
+                assert!(matches!(*l, BoundExpr::BinOp(_, BinOp::Ge, _)));
+                assert!(matches!(*r, BoundExpr::BinOp(_, BinOp::Le, _)));
+            }
+            other => panic!("expected And(Ge, Le), got {other:?}"),
+        }
+        // `c NOT BETWEEN 1 AND 9` ≡ NOT(c >= 1 AND c <= 9).
+        match binder.bind_expr(&parse("c NOT BETWEEN 1 AND 9"), &schema).unwrap() {
+            BoundExpr::UnaryOp(UnaryOp::Not, inner) =>
+                assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::And, _))),
+            other => panic!("expected Not(And(..)), got {other:?}"),
         }
     }
 

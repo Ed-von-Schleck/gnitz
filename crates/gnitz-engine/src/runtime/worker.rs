@@ -319,6 +319,21 @@ impl WorkerProcess {
         unsafe { &mut *self.catalog }
     }
 
+    /// Decode `seek_col_idx` — `pack_pk_cols(col_indices)`, whose packed flag
+    /// (bit 63) is always set, so a real index seek is never 0 — and validate
+    /// every column against the table's schema before touching the catalog.
+    /// Shared by the SeekByIndex and SeekByIndexRange arms.
+    fn validated_index_cols(
+        &mut self, target_id: i64, seek_col_idx: u64, op: &str,
+    ) -> Result<gnitz_wire::PkColList, String> {
+        let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
+        match self.cat().get_schema_desc(target_id).map(|s| s.num_columns()) {
+            Some(nc) if cols.is_well_formed()
+                && cols.as_slice().iter().all(|&c| (c as usize) < nc) => Ok(cols),
+            _ => Err(format!("{op}: invalid column list for table {target_id}")),
+        }
+    }
+
     // ── Main event loop ────────────────────────────────────────────────
 
     pub fn run(&mut self, boot_error: Option<String>) -> i32 {
@@ -688,6 +703,7 @@ impl WorkerProcess {
             | (_, SalMessageKind::UniquePreflight)
             | (_, SalMessageKind::Push)
             | (_, SalMessageKind::SeekByIndex)
+            | (_, SalMessageKind::SeekByIndexRange)
             | (_, SalMessageKind::Seek)
             | (_, SalMessageKind::Scan) => {
                 self.run_via_dispatch_inner(kind, target_id, wire)
@@ -854,18 +870,10 @@ impl WorkerProcess {
             }
 
             SalMessageKind::SeekByIndex => {
-                // seek_col_idx carries pack_pk_cols(col_indices); the packed flag
-                // (bit 63) is always set, so a real index seek is never 0.
-                // Validate each column against the schema before touching the
-                // catalog.
-                let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-                let ncol = self.cat().get_schema_desc(target_id).map(|s| s.num_columns());
-                match ncol {
-                    Some(nc) if cols.is_well_formed()
-                        && cols.as_slice().iter().all(|&c| (c as usize) < nc) => {}
-                    _ => return DispatchResult::Error(format!(
-                        "seek_by_index: invalid column list for table {target_id}")),
-                }
+                let cols = match self.validated_index_cols(target_id, seek_col_idx, "seek_by_index") {
+                    Ok(cols) => cols,
+                    Err(msg) => return DispatchResult::Error(msg),
+                };
                 // Reassemble the K native values: slot 0 in seek_pk, slots 1..K in
                 // seek_pk_extra. A prefix seek supplies K < cols.len() values. Each
                 // extra slot is exactly 16 bytes; reject a misaligned payload at
@@ -891,6 +899,40 @@ impl WorkerProcess {
                         let schema = self.cat().get_schema_desc(target_id);
                         self.send_response(target_id as u64, result.as_ref(),
                                            schema.as_ref(), request_id, client_id, seek_pk);
+                    }
+                    Err(msg) => return DispatchResult::Error(msg),
+                }
+                DispatchResult::Continue
+            }
+
+            SalMessageKind::SeekByIndexRange => {
+                let cols = match self.validated_index_cols(target_id, seek_col_idx, "seek_by_index_range") {
+                    Ok(cols) => cols,
+                    Err(msg) => return DispatchResult::Error(msg),
+                };
+                // Decode the §2 range descriptor from seek_pk_extra. `decode`
+                // validates the exact length and arity cap at the trust boundary
+                // (mirroring the SeekByIndex `% 16` guard), so a malformed frame
+                // is rejected rather than mis-decoded; the arity check against
+                // the actual column list stays here.
+                let desc = match gnitz_wire::RangeDescriptor::decode(&seek_pk_extra) {
+                    Ok(desc) => desc,
+                    Err(e) => return DispatchResult::Error(format!("seek_by_index_range: {e}")),
+                };
+                // The range column sits right after the equality prefix, so the
+                // prefix must be strictly shorter than the index column list.
+                if desc.eq_vals().len() >= cols.as_slice().len() {
+                    return DispatchResult::Error(format!(
+                        "seek_by_index_range: n_eq {} exceeds index arity {}",
+                        desc.eq_vals().len(), cols.as_slice().len()));
+                }
+                match self.cat().seek_by_index_range(
+                    target_id, cols.as_slice(), desc.eq_vals(), desc.lo, desc.hi,
+                ) {
+                    Ok(result) => {
+                        let schema = self.cat().get_schema_desc(target_id);
+                        self.send_response(target_id as u64, result.as_ref(),
+                                           schema.as_ref(), request_id, client_id, 0);
                     }
                     Err(msg) => return DispatchResult::Error(msg),
                 }

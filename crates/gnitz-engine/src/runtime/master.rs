@@ -22,8 +22,9 @@ use gnitz_wire::PkColList;
 
 use crate::runtime::sal::{
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
-    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_BACKFILL, FLAG_GATHER, FLAG_UNIQUE_PREFLIGHT,
-    FLAG_TICK, FLAG_FLUSH, SalWriter, pack_gather_cols, unique_preflight_wire_schema,
+    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE_SAL, FLAG_BACKFILL, FLAG_GATHER,
+    FLAG_UNIQUE_PREFLIGHT, FLAG_TICK, FLAG_FLUSH, SalWriter, pack_gather_cols,
+    unique_preflight_wire_schema,
 };
 use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_SCAN_LAST, WireConflictMode, SchemaWithVersion, DecodedWire, col_names_as_refs, peek_control_block};
 use gnitz_wire::wire_flags_set_conflict_mode;
@@ -946,19 +947,59 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64, seek_col_idx: u64, seek_pk: u128, seek_pk_extra: &[u8],
     ) -> Result<Option<Batch>, String> {
-        // The master forwards the client's wire frame verbatim — it never
-        // decodes seek_pk_extra into u128s and re-encodes them (the worker is
-        // the sole OPK encoder). seek_col_idx carries pack_pk_cols(col_indices),
-        // already validated by the caller; key slots 1..K ride in seek_pk_extra
-        // (empty for a single-value seek).
-        // `_lease` held across the single-frame collect: its workers stream, so
-        // releasing the gate before the slots are inspected risks a discarded
-        // late frame.
+        Self::fan_out_index_collect_common(
+            disp_ptr, reactor, sal_excl, target_id,
+            FLAG_SEEK_BY_INDEX, seek_pk, seek_col_idx, seek_pk_extra, "seek_by_index",
+        ).await
+    }
+
+    /// SELECT-path ordered range scan over a secondary index: broadcast the range
+    /// descriptor to ALL workers and MERGE every matching base row into one batch.
+    ///
+    /// Differs from `fan_out_seek_by_index_collect_async` only in the
+    /// master→worker leg: the `u32` SAL dispatch flag
+    /// `FLAG_SEEK_BY_INDEX_RANGE_SAL` (so the worker classifies it as
+    /// `SeekByIndexRange`, not a point seek), and the descriptor riding
+    /// `seek_pk_extra` (arbitrary length — this leg is not `PkTuple`-bound; the
+    /// worker is the sole OPK encoder, so the descriptor is forwarded verbatim).
+    /// A range's matches scatter by source PK, so broadcast-and-merge is the
+    /// correct, in-tree mechanism — no range-aware exchange is needed.
+    pub async fn fan_out_seek_by_index_range_collect_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        target_id: i64, seek_col_idx: u64, seek_pk_extra: &[u8],
+    ) -> Result<Option<Batch>, String> {
+        Self::fan_out_index_collect_common(
+            disp_ptr, reactor, sal_excl, target_id,
+            FLAG_SEEK_BY_INDEX_RANGE_SAL, 0, seek_col_idx, seek_pk_extra, "seek_by_index_range",
+        ).await
+    }
+
+    /// Shared skeleton of the two broadcast-and-merge index seeks above:
+    /// fan one frame out to ALL workers under `sal_flag` and merge every
+    /// worker's matching base rows into one batch.
+    ///
+    /// The master forwards the client's wire payload verbatim — it never
+    /// decodes seek_pk_extra into u128s and re-encodes them (the worker is
+    /// the sole OPK encoder). seek_col_idx carries pack_pk_cols(col_indices),
+    /// already validated by the caller.
+    /// `_lease` held across the single-frame collect: its workers stream, so
+    /// releasing the gate before the slots are inspected risks a discarded
+    /// late frame.
+    #[allow(clippy::too_many_arguments)]
+    async fn fan_out_index_collect_common(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        target_id: i64, sal_flag: u32, seek_pk: u128,
+        seek_col_idx: u64, seek_pk_extra: &[u8], op: &str,
+    ) -> Result<Option<Batch>, String> {
         let (slots, _req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
-                target_id, lsn, FLAG_SEEK_BY_INDEX, 0, &[], &schema, &col_names,
+                target_id, lsn, sal_flag, 0, &[], &schema, &col_names,
                 seek_pk, seek_col_idx, req_ids, -1, 0, None, seek_pk_extra,
             )
         }).await?;
@@ -966,15 +1007,14 @@ impl MasterDispatcher {
         let mut acc: Option<Batch> = None;
         for (w, slot) in slots.iter().enumerate() {
             let ctrl = peek_control_block(slot.bytes())
-                .map_err(|e| format!("seek_by_index: worker {w}: {e}"))?;
+                .map_err(|e| format!("{op}: worker {w}: {e}"))?;
             if ctrl.status != 0 {
                 return Err(format!(
-                    "worker {}: seek_by_index: {}",
-                    w, String::from_utf8_lossy(&ctrl.error_msg)));
+                    "worker {w}: {op}: {}", String::from_utf8_lossy(&ctrl.error_msg)));
             }
             if ctrl.flags & FLAG_HAS_DATA == 0 { continue; }
             let decoded = wire::decode_wire_ipc(slot.bytes())
-                .map_err(|e| format!("seek_by_index: worker {w}: decode: {e}"))?;
+                .map_err(|e| format!("{op}: worker {w}: decode: {e}"))?;
             if let Some(b) = decoded.data_batch {
                 if b.count == 0 { continue; }
                 match acc.as_mut() {

@@ -241,6 +241,31 @@ pub fn send_message(
     send_framed(sock_fd, &payload)
 }
 
+/// Control-only frame carrying an **explicit, arbitrary-length** `seek_pk_extra`
+/// blob, the channel for the SEEK_BY_INDEX_RANGE descriptor (§2 of
+/// `plans/secondary-index-range-scan.md`). `encode_message` derives
+/// `seek_pk_extra` from `seek_pk.split_wire()`, which a `PkTuple` caps at 64
+/// bytes (`MAX_PK_BYTES - 16`); a max-arity range descriptor is up to 82 bytes,
+/// so it cannot ride a `PkTuple`. This passes the blob straight to
+/// `encode_control_block`, whose BLOB column is already arbitrary-length.
+/// `seek_pk` is fixed at 0 (unused by the range seek). No schema/data block.
+pub fn send_message_with_extra(
+    sock_fd:       RawFd,
+    target_id:     u64,
+    client_id:     u64,
+    flags:         u64,
+    seek_col_idx:  u64,
+    seek_pk_extra: &[u8],
+) -> Result<(), ProtocolError> {
+    let ctrl_hdr = Header {
+        status: STATUS_OK, target_id, client_id, flags,
+        seek_pk: 0, seek_col_idx,
+        request_id: 0,
+    };
+    let payload = encode_control_block(&ctrl_hdr, "", seek_pk_extra)?;
+    send_framed(sock_fd, &payload)
+}
+
 /// Like `send_message` but omits the schema block from the wire frame.
 /// The data block is still encoded using `data_schema`; the server must
 /// reconstruct the schema from its catalog (guided by the schema version in

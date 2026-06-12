@@ -2182,3 +2182,292 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
             "composite (signed, unsigned) spans must sort in tuple-numeric order");
     }
 }
+
+// ── seek_by_index_range tests ────────────────────────────────────────────
+//
+// Ordered range scans over a secondary index (plans/secondary-index-range-scan.md).
+
+use std::ops::Bound::{self, Excluded, Included, Unbounded};
+
+/// Collect the positive-weight source PKs returned by a range scan, sorted.
+fn range_pks(
+    engine: &mut CatalogEngine, tid: i64, cols: &[u32], eq: &[u128],
+    lo: Bound<u128>, hi: Bound<u128>,
+) -> Vec<u128> {
+    let r = engine.seek_by_index_range(tid, cols, eq, lo, hi).unwrap();
+    let mut pks: Vec<u128> = match r {
+        Some(b) => (0..b.count).filter(|&i| b.get_weight(i) > 0).map(|i| b.get_pk(i)).collect(),
+        None => Vec::new(),
+    };
+    pks.sort();
+    pks
+}
+
+#[test]
+fn test_seek_by_index_range_unsigned_pure_range() {
+    let dir = temp_dir("catalog_range_unsigned");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // x ∈ {0,10,20,30} at PKs {1,2,3,4}.
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, x) in [(1u128, 0u64), (2, 10), (3, 20), (4, 30)] {
+        bb.begin_row(pk, 1); bb.put_u64(x); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let c = &[1u32];
+    // x > 10  → {20,30} = PKs {3,4}
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Excluded(10), Unbounded), vec![3, 4]);
+    // x >= 10 → {10,20,30} = PKs {2,3,4}
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Included(10), Unbounded), vec![2, 3, 4]);
+    // x < 20  → {0,10} = PKs {1,2}
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Unbounded, Excluded(20)), vec![1, 2]);
+    // x <= 20 → {0,10,20} = PKs {1,2,3}
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Unbounded, Included(20)), vec![1, 2, 3]);
+    // 10 < x < 30 → {20} = PK {3}
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Excluded(10), Excluded(30)), vec![3]);
+    // 10 <= x <= 20 → {10,20} = PKs {2,3}
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Included(10), Included(20)), vec![2, 3]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_signed_between() {
+    let dir = temp_dir("catalog_range_signed");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), i32_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // x ∈ {-10,-5,0,5,10} at PKs {1..5}. The cff7c58 payoff: OPK(-5) < OPK(5).
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, x) in [(1u128, -10i32), (2, -5), (3, 0), (4, 5), (5, 10)] {
+        bb.begin_row(pk, 1); bb.put_u32(x as u32); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let pk = |v: i32| (v as u32) as u128;
+    let c = &[1u32];
+    // x BETWEEN -5 AND 5 → {-5,0,5} = PKs {2,3,4} (contiguous signed interval).
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], Included(pk(-5)), Included(pk(5))),
+        vec![2, 3, 4]);
+    // x > -5 → {0,5,10} = PKs {3,4,5}
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Excluded(pk(-5)), Unbounded), vec![3, 4, 5]);
+    // x < 0 → {-10,-5} = PKs {1,2}
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Unbounded, Excluded(pk(0))), vec![1, 2]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_composite_eq_prefix() {
+    let dir = temp_dir("catalog_range_composite");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["a", "b"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // (a,b): three a==7 rows, one a==8 row (must never enter the a==7 scan).
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, a, b) in [(1u128, 7u64, 10u64), (2, 7, 49), (3, 7, 50), (4, 8, 0)] {
+        bb.begin_row(pk, 1); bb.put_u64(a); bb.put_u64(b); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let c = &[1u32, 2u32];   // index (a, b)
+    // a = 7 AND b < 50 → {(7,10),(7,49)} = PKs {1,2}; (8,0) is absent (scan stops
+    // before a==8 because OPK(a=8)‖.. > OPK(a=7)‖0xFF).
+    assert_eq!(range_pks(&mut engine, tid, c, &[7], Unbounded, Excluded(50)), vec![1, 2]);
+    // a = 7 AND b <= 50 → {(7,10),(7,49),(7,50)} = PKs {1,2,3}
+    assert_eq!(range_pks(&mut engine, tid, c, &[7], Unbounded, Included(50)), vec![1, 2, 3]);
+    // a = 7 AND b > 10 → {(7,49),(7,50)} = PKs {2,3}
+    assert_eq!(range_pks(&mut engine, tid, c, &[7], Excluded(10), Unbounded), vec![2, 3]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_open_ended() {
+    let dir = temp_dir("catalog_range_open");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, x) in [(1u128, 1u64), (2, 2), (3, 3), (4, 4)] {
+        bb.begin_row(pk, 1); bb.put_u64(x); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let c = &[1u32];
+    // x > 2 (unbounded above) → {3,4}
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Excluded(2), Unbounded), vec![3, 4]);
+    // x < 3 (unbounded below) → {1,2}
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Unbounded, Excluded(3)), vec![1, 2]);
+    // fully unbounded (a saturated `x < HUGE`) → every indexed row.
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Unbounded, Unbounded), vec![1, 2, 3, 4]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_exclusive_lower_large_dup_group() {
+    let dir = temp_dir("catalog_range_dupgroup");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // A large x==10 duplicate group (distinct source PKs, including u64::MAX whose
+    // OPK source-PK suffix is all-0xFF), plus two strictly-greater rows.
+    let mut bb = BatchBuilder::new(schema);
+    for pk in [1u128, 2, 3, 4, 5, u64::MAX as u128] {
+        bb.begin_row(pk, 1); bb.put_u64(10); bb.end_row();
+    }
+    bb.begin_row(100, 1); bb.put_u64(20); bb.end_row();
+    bb.begin_row(101, 1); bb.put_u64(30); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let c = &[1u32];
+    // x > 10 (exclusive): every x==10 row excluded — including the all-0xFF source
+    // PK that the 0xFF-suffixed seed lands on and the loop's boundary trim drops.
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Excluded(10), Unbounded), vec![100, 101]);
+    // x >= 10 (inclusive): the whole group plus the greater rows.
+    assert_eq!(
+        range_pks(&mut engine, tid, c, &[], Included(10), Unbounded),
+        vec![1, 2, 3, 4, 5, 100, 101, u64::MAX as u128]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_retraction() {
+    let dir = temp_dir("catalog_range_retract");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, x) in [(1u128, 5u64), (2, 15), (3, 25)] {
+        bb.begin_row(pk, 1); bb.put_u64(x); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // Retract PK 2 (x=15) → net weight 0; it must vanish from the range scan
+    // (no ghost entry) at both the index and the source resolve.
+    let schema = engine.get_schema(tid).unwrap();
+    let mut rb = BatchBuilder::new(schema);
+    rb.begin_row(2, -1); rb.put_u64(15); rb.end_row();
+    engine.ingest_to_family(tid, &rb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let c = &[1u32];
+    // x > 0 → {5,25} = PKs {1,3}; PK 2 (retracted x=15) absent.
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Excluded(0), Unbounded), vec![1, 3]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_multiplicity_preserved() {
+    let dir = temp_dir("catalog_range_mult");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Seed a source row at net weight 2 by ingesting directly (bypassing DML
+    // unique-PK enforcement, which would pin every base row to weight 1).
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 2); bb.put_u64(100); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // The range scan must return the row at weight 2, not a hardcoded 1 — the
+    // resolve copies the source cursor's net `current_weight`.
+    let r = engine
+        .seek_by_index_range(tid, &[1], &[], Excluded(50), Unbounded)
+        .unwrap()
+        .expect("range scan must return the weight-2 row");
+    assert_eq!(r.count, 1);
+    assert_eq!(r.get_pk(0), 1);
+    assert_eq!(r.get_weight(0), 2, "range scan must preserve source multiplicity");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_null_excluded() {
+    let dir = temp_dir("catalog_range_null");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![
+        u64_col_def("id"),
+        ColumnDef { name: "x".into(), type_code: type_code::I64,
+                    is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+    ];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // PK 2 has x = NULL — absent from the index, so excluded from every range.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1); bb.put_u64(5); bb.end_row();
+    bb.begin_row(2u128, 1); bb.put_null(); bb.end_row();
+    bb.begin_row(3u128, 1); bb.put_u64(15); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let c = &[1u32];
+    // x < 100 → {5,15} = PKs {1,3}; the NULL-x PK 2 never appears.
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Unbounded, Excluded(100)), vec![1, 3]);
+    // fully unbounded scan also excludes NULL (index has no entry for it).
+    assert_eq!(range_pks(&mut engine, tid, c, &[], Unbounded, Unbounded), vec![1, 3]);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_no_range_column_errs() {
+    let dir = temp_dir("catalog_range_arity");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+
+    // n_eq == arity → no range column; the pub method must self-guard with Err,
+    // never panic indexing columns[n_eq].
+    let r = engine.seek_by_index_range(tid, &[1], &[10], Excluded(0), Unbounded);
+    assert!(r.is_err(), "n_eq == index arity must be rejected");
+    assert!(r.err().unwrap().contains("no range column"));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

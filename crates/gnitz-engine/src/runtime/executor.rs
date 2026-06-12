@@ -709,6 +709,14 @@ async fn handle_message(
                              client_version).await;
         return;
     }
+    if flags & gnitz_wire::FLAG_SEEK_BY_INDEX_RANGE != 0 {
+        let _g = shared.catalog_rwlock.read().await;
+        handle_seek_by_index_range(shared, fd, client_id, target_id,
+                             decoded.control.seek_col_idx,        // pack_pk_cols(col_indices)
+                             &decoded.control.seek_pk_extra,      // §2 range descriptor
+                             client_version).await;
+        return;
+    }
 
     // GET_INDICES must be routed before the generic empty-batch scan dispatch
     // below, which keys only on target_id and would otherwise swallow it. The
@@ -830,6 +838,24 @@ async fn handle_seek(
     }
 }
 
+/// Decode `seek_col_idx` (`pack_pk_cols(col_indices)` — the packed flag at bit
+/// 63 is always set, so the old `col_idx as usize >= num_columns` guard would
+/// always trip) and validate the full list against the table's schema before
+/// classifying. Shared by the SEEK_BY_INDEX and SEEK_BY_INDEX_RANGE handlers.
+fn validated_index_cols(
+    shared: &Rc<Shared>, target_id: i64, seek_col_idx: u64, op: &str,
+) -> Result<gnitz_wire::PkColList, String> {
+    let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
+    if let Some(schema) = shared.cat().get_schema_desc(target_id) {
+        let ok = cols.is_well_formed()
+            && cols.as_slice().iter().all(|&c| (c as usize) < schema.num_columns());
+        if !ok {
+            return Err(format!("{op}: invalid column list for table {target_id}"));
+        }
+    }
+    Ok(cols)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_seek_by_index(
     shared: &Rc<Shared>, fd: i32, client_id: u64,
@@ -842,21 +868,13 @@ async fn handle_seek_by_index(
         return;
     }
     if target_id >= FIRST_USER_TABLE_ID {
-        // seek_col_idx carries pack_pk_cols(col_indices); decode and validate the
-        // full list before classifying. The raw wire value has the packed flag at
-        // bit 63 set, so the old `col_idx as usize >= num_columns` guard would
-        // always trip — validate the unpacked columns instead.
-        let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-        if let Some(schema) = shared.cat().get_schema_desc(target_id) {
-            let ok = cols.is_well_formed()
-                && cols.as_slice().iter().all(|&c| (c as usize) < schema.num_columns());
-            if !ok {
-                let msg = format!(
-                    "seek_by_index: invalid column list for table {target_id}");
+        let cols = match validated_index_cols(shared, target_id, seek_col_idx, "seek_by_index") {
+            Ok(cols) => cols,
+            Err(msg) => {
                 send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
                 return;
             }
-        }
+        };
         // Single catalog scan classifies the column list (exact list match). The
         // uniqueness flag is copied out immediately (`Option<bool>`), so no
         // catalog borrow is held across the await in the no-index arm.
@@ -909,6 +927,57 @@ async fn handle_seek_by_index(
         // System tables never carry secondary indexes.
         let msg = format!("SEEK_BY_INDEX on system table {target_id} is not supported");
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+    }
+}
+
+/// SELECT-path ordered range scan over a secondary index. Validate the column
+/// list, confirm an index on it exists (else STATUS_NO_INDEX, like
+/// `handle_seek_by_index`), then broadcast the §2 range descriptor to all
+/// workers and merge — a range's matches scatter by source PK, so there is no
+/// single-worker fast path. The descriptor is forwarded verbatim (the worker is
+/// the sole OPK encoder).
+async fn handle_seek_by_index_range(
+    shared: &Rc<Shared>, fd: i32, client_id: u64,
+    target_id: i64, seek_col_idx: u64, seek_pk_extra: &[u8],
+    client_version: u16,
+) {
+    if !shared.cat().has_id(target_id) {
+        let msg = format!("table {target_id} not found");
+        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+        return;
+    }
+    if target_id < FIRST_USER_TABLE_ID {
+        let msg = format!("SEEK_BY_INDEX_RANGE on system table {target_id} is not supported");
+        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+        return;
+    }
+    let cols = match validated_index_cols(shared, target_id, seek_col_idx, "seek_by_index_range") {
+        Ok(cols) => cols,
+        Err(msg) => {
+            send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+            return;
+        }
+    };
+    // Confirm a secondary index on this exact column list exists. `.is_some()`
+    // copies a bool out, so no catalog borrow is held across the await below.
+    let has_index = shared.cat()
+        .index_circuit_for_cols(target_id, cols.as_slice())
+        .is_some();
+    if !has_index {
+        send_control_only(shared, fd, target_id, client_id, STATUS_NO_INDEX).await;
+        return;
+    }
+    match MasterDispatcher::fan_out_seek_by_index_range_collect_async(
+        shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
+        target_id, seek_col_idx, seek_pk_extra,
+    ).await {
+        Ok(merged) => {
+            send_ok_response(
+                shared, fd, target_id, merged.as_ref(),
+                client_id, 0, client_version,
+            ).await;
+        }
+        Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
     }
 }
 

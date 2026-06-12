@@ -32,6 +32,16 @@ pub const FLAG_CONTINUATION:   u64 = 1 << 52;
 /// `runtime/wire.rs`).
 pub const FLAG_GET_INDICES: u64 = 1 << 54;
 
+/// SEEK_BY_INDEX_RANGE request flag. The client→master leg of an ordered
+/// range scan over a secondary index. Like GET_INDICES it is a high request
+/// bit (54 taken, 55 the next free) that rides above the SAL mirror and the
+/// bit-16–47 packed fields, so it never collides with a packed field. Unlike
+/// GET_INDICES (answered master-locally) a range seek *fans out* to workers,
+/// so the master→worker leg carries a *separate* `u32` SAL dispatch flag
+/// (`runtime::sal::FLAG_SEEK_BY_INDEX_RANGE_SAL`); this high bit is never
+/// written to the SAL group header. See `plans/secondary-index-range-scan.md`.
+pub const FLAG_SEEK_BY_INDEX_RANGE: u64 = 1 << 55;
+
 // ---------------------------------------------------------------------------
 // Wire-level packed fields: bits 16-39 of wire_flags
 // ---------------------------------------------------------------------------
@@ -59,6 +69,8 @@ const _: () = {
     assert!(packed & (FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION) == 0);
     assert!(FLAG_GET_INDICES & (SAL_FLAGS_MASK | packed
             | FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION) == 0);
+    assert!(FLAG_SEEK_BY_INDEX_RANGE & (SAL_FLAGS_MASK | packed
+            | FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION | FLAG_GET_INDICES) == 0);
 };
 
 #[inline]
