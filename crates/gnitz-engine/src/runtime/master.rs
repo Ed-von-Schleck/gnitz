@@ -3176,8 +3176,14 @@ fn build_check_batch(
     // composites share this layout (the suffix width differs, the leading does
     // not), so there is no narrow/wide split.
     let stride = schema.pk_stride() as usize;
-    let idx_key_size = schema.columns[0].size() as usize;
-    let idx_key_type = schema.columns[0].type_code;
+    // The leading key column is the index's column 0 for an index schema, but
+    // the PK column for a base-table schema (the FK parent fast-path passes the
+    // parent base table, whose lone PK may be declared at any column position).
+    // `pk_indices()[0]` resolves both: an index schema is laid out
+    // `(promoted_c0, src_pk…)`, so `pk_indices()[0] == 0 == columns[0]`.
+    let key_col = schema.pk_indices()[0] as usize;
+    let idx_key_size = schema.columns[key_col].size() as usize;
+    let idx_key_type = schema.columns[key_col].type_code;
     build_check_batch_with(schema, keys, pooled, |b, &k| {
         let buf = crate::schema::index_opk_prefix(k, idx_key_type, idx_key_size);
         b.extend_pk_bytes(&buf[..stride]);
@@ -3369,6 +3375,29 @@ mod unique_filter_tests {
 
         let null_word = u64::from_le_bytes(batch.null_bmp_data()[0..8].try_into().unwrap());
         assert_eq!(null_word, u64::MAX, "all 64 payload columns must be marked null");
+    }
+
+    #[test]
+    fn check_batch_nonleading_pk_probe_matches_stored_opk() {
+        // Base table `(label STRING, id U64 PRIMARY KEY)` — PK at column 1.
+        // The FK parent fast-path passes a base-table schema whose lone PK may
+        // be declared at any column position; resolving the leading key column
+        // from `columns[0]` (the STRING) would encode the probe at the wrong
+        // type/width and mangle the existence check.
+        let cols = vec![
+            SchemaColumn::new(type_code::STRING, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ];
+        let schema = SchemaDescriptor::new(&cols, &[1]);
+
+        let keys = vec![42u128];
+        let batch = build_check_batch(&schema, &keys, None);
+
+        // The parent stores id=42 as `encode_pk_column(42, U64)` = 42u64.to_be_bytes().
+        let mut expected = [0u8; 8];
+        gnitz_wire::encode_pk_column(&42u64.to_le_bytes(), type_code::U64, &mut expected);
+        assert_eq!(batch.get_pk_bytes(0), &expected[..],
+            "probe key must equal the stored OPK PK for a non-leading PK column");
     }
 
     #[test]

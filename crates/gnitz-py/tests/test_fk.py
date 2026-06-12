@@ -136,6 +136,51 @@ class TestFkInlineReferences:
         finally:
             _cleanup(client, sn, "child", "parent")
 
+    def test_fk_parent_pk_not_first_column(self, client):
+        """Regression: parent PK declared at a NON-leading column position.
+
+        The distributed FK existence check (`build_check_batch`) resolved the
+        probe key's type and width from the parent's first declared column
+        instead of its PK column. Here the parent leads with a 16-byte STRING
+        and its BIGINT PK is the second column, so the probe was encoded at the
+        wrong width and zeroed out — a valid child reference was rejected (and a
+        dangling one could be silently accepted if an all-zero parent key
+        existed). The probe must encode at the PK column's type/width.
+        """
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            # `id` (the PK) is the SECOND declared column; the leading STRING
+            # `label` is wider, so columns[0] differs from the PK column.
+            client.execute_sql(
+                "CREATE TABLE users ("
+                "  label VARCHAR(255) NOT NULL,"
+                "  id BIGINT NOT NULL PRIMARY KEY"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE orders ("
+                "  oid BIGINT NOT NULL PRIMARY KEY,"
+                "  user_id BIGINT NOT NULL REFERENCES users(id)"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO users VALUES ('alice', 42)", schema_name=sn,
+            )
+            # Valid reference to users(id = 42) must succeed (pre-fix: rejected).
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 42)", schema_name=sn,
+            )
+            # A dangling reference must still be rejected.
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.execute_sql(
+                    "INSERT INTO orders VALUES (2, 999)", schema_name=sn,
+                )
+        finally:
+            _cleanup(client, sn, "orders", "users")
+
 
 class TestFkTableLevel:
     """Table-level FOREIGN KEY syntax: FOREIGN KEY (col) REFERENCES parent(pk)."""
