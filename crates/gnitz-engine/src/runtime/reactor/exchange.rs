@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 
-use crate::runtime::sal::MAX_WORKERS;
+use crate::runtime::sal::{BACKFILL_PAD_BIT, MAX_WORKERS};
 use crate::runtime::wire::DecodedWire;
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
@@ -29,6 +29,12 @@ struct ExchangeRound {
     payloads: [Option<Batch>; MAX_WORKERS],
     count:    usize,
     schema:   Option<SchemaDescriptor>,
+    /// AND of every worker's per-chunk backfill pad bit (`seek_col_idx &
+    /// BACKFILL_PAD_BIT`). Starts `true`; a single non-pad worker clears it.
+    /// True once the round completes ⇒ every worker is exhausted and this is the
+    /// final (all-pad) round. Always `false` for steady-state exchanges (their
+    /// `seek_col_idx` is 0); the reactor relay path ignores it.
+    all_pad:  bool,
 }
 
 /// One completed exchange ready for relay.  The relay task owns this:
@@ -39,6 +45,10 @@ pub struct PendingRelay {
     pub payloads:  Vec<Option<Batch>>,
     pub schema:    SchemaDescriptor,
     pub source_id: i64,
+    /// True iff every worker reported a backfill pad for this round (the final,
+    /// all-pad round). The boot backfill relay (`collect_acks_and_relay`) reads
+    /// this to decide the stop signal; the steady-state relay path ignores it.
+    pub all_pad:   bool,
 }
 
 impl ExchangeAccumulator {
@@ -62,12 +72,16 @@ impl ExchangeAccumulator {
             payloads: [const { None }; MAX_WORKERS],
             count:    0,
             schema:   None,
+            all_pad:  true,
         });
 
         round.payloads[w] = decoded.data_batch;
         if let Some(schema) = decoded.schema {
             round.schema = Some(schema);
         }
+        // AND this worker's per-chunk backfill pad bit. 0 for steady-state
+        // exchanges, which clears all_pad harmlessly (the reactor ignores it).
+        round.all_pad &= (decoded.control.seek_col_idx & BACKFILL_PAD_BIT) != 0;
         round.count += 1;
 
         if round.count == nw {
@@ -81,7 +95,7 @@ impl ExchangeAccumulator {
                 }
             };
             let payloads: Vec<Option<Batch>> = round.payloads.into_iter().take(nw).collect();
-            Some(PendingRelay { view_id: vid, payloads, schema, source_id })
+            Some(PendingRelay { view_id: vid, payloads, schema, source_id, all_pad: round.all_pad })
         } else {
             None
         }
@@ -142,5 +156,36 @@ mod tests {
         let result = acc.process(1, make_wire(5, 0, false));
         assert!(result.is_none(), "schema-less round must return None");
         assert!(acc.rounds.is_empty(), "completed schema-less round must not leak");
+    }
+
+    fn make_wire_pad(view_id: i64, source_id: i64, pad: bool, with_schema: bool) -> DecodedWire {
+        use crate::runtime::sal::BACKFILL_PAD_BIT;
+        let mut w = make_wire(view_id, source_id, with_schema);
+        w.control.seek_col_idx = if pad { BACKFILL_PAD_BIT } else { 0 };
+        w
+    }
+
+    #[test]
+    fn all_pad_is_and_of_worker_pad_bits() {
+        // Every worker padded ⇒ the round is the final all-pad round.
+        let mut acc = ExchangeAccumulator::new(2);
+        assert!(acc.process(0, make_wire_pad(1, 0, true, true)).is_none());
+        let relay = acc.process(1, make_wire_pad(1, 0, true, false))
+            .expect("round completes");
+        assert!(relay.all_pad, "all workers padded ⇒ all_pad");
+
+        // A single non-pad worker clears all_pad (backfill must continue).
+        let mut acc = ExchangeAccumulator::new(2);
+        assert!(acc.process(0, make_wire_pad(2, 0, true, true)).is_none());
+        let relay = acc.process(1, make_wire_pad(2, 0, false, false))
+            .expect("round completes");
+        assert!(!relay.all_pad, "a non-pad worker clears all_pad");
+
+        // Steady-state exchanges pass seek_col_idx == 0 ⇒ all_pad false.
+        let mut acc = ExchangeAccumulator::new(2);
+        assert!(acc.process(0, make_wire(3, 0, true)).is_none());
+        let relay = acc.process(1, make_wire(3, 0, false))
+            .expect("round completes");
+        assert!(!relay.all_pad, "steady-state (seek_col_idx==0) ⇒ all_pad false");
     }
 }

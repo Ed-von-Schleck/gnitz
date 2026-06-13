@@ -16,6 +16,7 @@ use crate::runtime::sal::{
     SAL_MMAP_SIZE, FLAG_EXCHANGE, FLAG_CHECKPOINT,
     SalReader, SalMessageKind,
     schema_wire_safe,
+    BACKFILL_PAD_BIT, BACKFILL_DECISION_STOP, BACKFILL_DECISION_CHECKPOINT,
 };
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::w2m_ring;
@@ -71,6 +72,18 @@ struct DeferredDdl {
     batch: Batch,
 }
 
+/// Per-chunk collective decision the master stamps onto a distributed-backfill
+/// relay (in `seek_col_idx`), recorded into `WorkerExchangeHandler::
+/// backfill_signal` and read once per chunk by `handle_backfill`.
+/// `BACKFILL_DECISION_CHECKPOINT` is folded into `Continue` after its inline SAL
+/// re-epoch is applied (see `consume_backfill_decision`), so the slot only ever
+/// holds the loop verdict.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BackfillRound {
+    Stop,
+    Continue,
+}
+
 // ---------------------------------------------------------------------------
 // DispatchContext + DispatchOutcome
 //
@@ -122,8 +135,21 @@ struct WorkerExchangeHandler {
     /// match the active exchange wait. Keyed by the tuple so a stashed
     /// relay for one source never satisfies a wait for a different source
     /// of the same view (which would drive the inline DAG re-entry with
-    /// the wrong sharding columns).
-    pending_relays: HashMap<(i64, i64), Batch>,
+    /// the wrong sharding columns). The `u64` is the relay's backfill decision
+    /// (`seek_col_idx`), applied when the relay is later un-parked and consumed
+    /// — so a parked CHECKPOINT/STOP is never lost (in practice backfill runs in
+    /// lockstep and never parks, but carrying it keeps the path correct).
+    pending_relays: HashMap<(i64, i64), (Batch, u64)>,
+    /// `Some(pad)` while a distributed backfill drains this worker's source
+    /// partition: `do_exchange_wait` stamps the pad bit onto every outbound
+    /// FLAG_EXCHANGE and relay consumption acts on the master's stamped decision.
+    /// `None` outside backfill, so steady-state exchanges keep a 0 pad bit and
+    /// ignore the (also-0) relay decision.
+    backfill_pad: Option<bool>,
+    /// The master's per-chunk stop/continue verdict for the current backfill
+    /// chunk (last relay of the chunk wins; every round of a chunk carries the
+    /// same verdict). `take`n once per chunk by `handle_backfill`.
+    backfill_signal: Option<BackfillRound>,
 }
 
 impl WorkerExchangeHandler {
@@ -393,6 +419,8 @@ impl WorkerProcess {
                 deferred: Vec::new(),
                 deferred_ticks: Vec::new(),
                 pending_relays: HashMap::new(),
+                backfill_pad: None,
+                backfill_signal: None,
             },
             pending_deltas: HashMap::new(),
             pending_streams: VecDeque::new(),
@@ -753,12 +781,15 @@ impl WorkerProcess {
             }
             (DispatchContext::InsideExchangeWait { want_key, schema },
                 SalMessageKind::ExchangeRelay) => {
-                // source_id is echoed back via seek_pk_lo (see
-                // master::relay_exchange). Decode once, before taking
-                // the batch out.
+                // source_id is echoed back via seek_pk; the backfill round
+                // decision rides in seek_col_idx. Decode both before taking the
+                // batch out.
                 let decoded = wire.and_then(|d| ipc::decode_wire(d).ok());
                 let relay_source_id = decoded.as_ref()
                     .map(|d| d.control.seek_pk as i64)
+                    .unwrap_or(0);
+                let relay_decision = decoded.as_ref()
+                    .map(|d| d.control.seek_col_idx)
                     .unwrap_or(0);
                 let relay_batch = decoded
                     .and_then(|d| d.data_batch)
@@ -768,9 +799,16 @@ impl WorkerProcess {
                     });
                 let relay_key = (target_id, relay_source_id);
                 if relay_key == want_key {
+                    // Consumed for the active wait: act on the decision (record
+                    // the slot, apply any inline checkpoint) before returning.
+                    self.consume_backfill_decision(relay_decision);
                     return DispatchOutcome::RelayMatched(relay_batch);
                 }
-                self.exchange.pending_relays.insert(relay_key, relay_batch);
+                // Not the relay we're blocked on: park it (with its decision) for
+                // a later wait. During backfill the cluster runs in lockstep and
+                // this never fires, but carrying the decision keeps it correct if
+                // it ever does.
+                self.exchange.pending_relays.insert(relay_key, (relay_batch, relay_decision));
                 DispatchOutcome::Continue
             }
 
@@ -872,8 +910,7 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Flush => {
-                self.read_cursor = 0;
-                self.expected_epoch += 1;
+                self.advance_read_epoch();
                 match self.handle_flush_all() {
                     Ok(()) => self.send_ack(0, FLAG_CHECKPOINT as u64, request_id),
                     Err(msg) => self.send_error(&msg, request_id),
@@ -1416,14 +1453,93 @@ impl WorkerProcess {
         Ok(())
     }
 
+    /// Distributed CREATE-VIEW backfill, worker side. Streams this worker's
+    /// committed `source_tid` partition through the incremental plan one chunk at
+    /// a time (peak RAM ~O(chunk), not O(partition)), driving an exchange round
+    /// per chunk per exchanging view across the cross-worker barrier.
+    ///
+    /// All workers must issue the SAME number of rounds, but partitions are
+    /// unequal — so a worker that has drained its partition keeps issuing EMPTY
+    /// (pad) rounds to stay in lockstep, until the master signals stop. The stop
+    /// decision is collective: each worker stamps a per-chunk pad bit onto every
+    /// FLAG_EXCHANGE it issues (`do_exchange_wait`), the master ANDs them and
+    /// stamps the verdict back onto each relay, and the worker records it into a
+    /// single per-chunk slot read here. A worker missing the source opens no
+    /// cursor and pads every round — the barrier still needs its report.
+    ///
+    /// A source feeding NO exchange view has no barrier: no relay arrives, the
+    /// slot stays `None`, and the worker self-terminates on local drain
+    /// exhaustion.
     fn handle_backfill(&mut self, source_tid: i64, request_id: u64) -> Result<(), String> {
-        if !self.cat().has_id(source_tid) {
-            return Ok(());
+        let chunk_rows = self.cat().ddl_scan_chunk_rows;
+        let has = self.cat().has_id(source_tid);
+        // Needed to synthesize empty pad chunks. A missing source still pads.
+        let schema = self.cat().get_schema_desc(source_tid)
+            .ok_or_else(|| format!("backfill: no schema for source {source_tid}"))?;
+        let mut handle = if has { self.cat().open_store_cursor(source_tid) } else { None };
+
+        loop {
+            // `None` ⇒ partition exhausted (or absent): this round is an empty
+            // PAD. The master ANDs the pad bit across workers and stamps the
+            // collective stop/continue/checkpoint decision back onto each relay.
+            let drained = handle.as_mut().and_then(|h| h.cursor.drain_chunk(chunk_rows));
+            let pad = drained.is_none();
+            let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
+            self.exchange.backfill_pad = Some(pad);
+            self.evaluate_dag(source_tid, chunk, request_id);
+            // do_exchange_wait applied any inline CHECKPOINT per relay and folded
+            // it into Continue; the slot now holds the chunk's stop/continue
+            // verdict, or `None` if this chunk issued no exchange (a non-barrier
+            // source). Stop on the master's verdict, or — with no barrier (no
+            // relay, so no signal) — on local drain exhaustion.
+            let signal = self.exchange.backfill_signal.take();
+            if signal == Some(BackfillRound::Stop) || (signal.is_none() && pad) {
+                break;
+            }
         }
-        let local_batch = self.cat().scan_family(source_tid)?;
-        let owned = Rc::try_unwrap(local_batch).unwrap_or_else(|a| (*a).clone());
-        self.evaluate_dag(source_tid, owned, request_id);
+
+        // Steady-state ticks must keep passing a 0 pad bit (see do_exchange_wait).
+        self.exchange.backfill_pad = None;
+        // Distributed analogue of backfill_view's post-loop release: free the last
+        // chunk's pinned delta registers across the source's dependent closure
+        // (and assert each backfilled view is ephemeral).
+        self.cat().dag.clear_regfile_deltas_from_source(source_tid);
         Ok(())
+    }
+
+    /// Reset the SAL read side — rewind the read cursor and advance the expected
+    /// epoch — mirroring the master's `sal.checkpoint_reset` on the read side.
+    /// Shared by the FLAG_FLUSH dispatch arm and the inline backfill checkpoint
+    /// in `consume_backfill_decision`.
+    fn advance_read_epoch(&mut self) {
+        self.read_cursor = 0;
+        self.expected_epoch += 1;
+    }
+
+    /// Act on the backfill decision a master stamped onto a relay's
+    /// `seek_col_idx`, the moment that relay is consumed for its matching wait.
+    /// No-op outside a backfill (steady-state relays carry CONTINUE == 0 and
+    /// there is no loop reading the slot).
+    fn consume_backfill_decision(&mut self, decision: u64) {
+        if self.exchange.backfill_pad.is_none() {
+            return;
+        }
+        // CHECKPOINT is a CONTINUE that also applies the relay-driven half of a
+        // SAL checkpoint inline: advance the read epoch so post-reset groups (the
+        // master writes them at `write_cursor == 0` in the bumped epoch) are
+        // accepted and any pre-reset group parks via `next_sal_message`'s epoch
+        // check. Deliberately NOT the FLAG_FLUSH arm — no `handle_flush_all`, no
+        // FLAG_CHECKPOINT ACK; the master's consumption proof is the next round's
+        // FLAG_EXCHANGE report, which a checkpoint ACK would be misread as a
+        // terminal ACK that retires the worker.
+        if decision == BACKFILL_DECISION_CHECKPOINT {
+            self.advance_read_epoch();
+        }
+        self.exchange.backfill_signal = Some(if decision == BACKFILL_DECISION_STOP {
+            BackfillRound::Stop
+        } else {
+            BackfillRound::Continue
+        });
     }
 
     /// CREATE UNIQUE INDEX pre-flight, worker side: project every
@@ -1694,11 +1810,15 @@ impl WorkerProcess {
         }
 
         let schema = batch.schema;
+        // During a backfill, stamp this chunk's pad bit onto the FLAG_EXCHANGE so
+        // the master can AND it across workers and decide termination. Outside a
+        // backfill (backfill_pad == None) the field stays 0, exactly as before.
+        let pad_bit = if self.exchange.backfill_pad == Some(true) { BACKFILL_PAD_BIT } else { 0 };
         let sz = ipc::wire_size(STATUS_OK, &[], schema.as_ref(), None, Some(batch), None, &[]);
         self.w2m_writer.send_encoded(sz, tick_request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
                 buf, 0, view_id as u64, 0, FLAG_EXCHANGE as u64,
-                source_id as u128, 0, tick_request_id, STATUS_OK, &[],
+                source_id as u128, pad_bit, tick_request_id, STATUS_OK, &[],
                 schema.as_ref(), None, Some(batch), None, &[],
             );
         });
@@ -1708,7 +1828,8 @@ impl WorkerProcess {
         let ctx = DispatchContext::InsideExchangeWait { want_key, schema };
 
         loop {
-            if let Some(b) = self.exchange.pending_relays.remove(&want_key) {
+            if let Some((b, decision)) = self.exchange.pending_relays.remove(&want_key) {
+                self.consume_backfill_decision(decision);
                 return b;
             }
 
@@ -1721,7 +1842,8 @@ impl WorkerProcess {
             }
 
             loop {
-                if let Some(b) = self.exchange.pending_relays.remove(&want_key) {
+                if let Some((b, decision)) = self.exchange.pending_relays.remove(&want_key) {
+                    self.consume_backfill_decision(decision);
                     return b;
                 }
 
@@ -2037,6 +2159,8 @@ mod tests {
             deferred: Vec::<DeferredDdl>::new(),
             deferred_ticks: Vec::new(),
             pending_relays: HashMap::new(),
+            backfill_pad: None,
+            backfill_signal: None,
         }
     }
 
@@ -2111,11 +2235,11 @@ mod tests {
         batch_b.count = 7;
         let mut batch_c = Batch::with_schema(schema, 0);
         batch_c.count = 9;
-        h.pending_relays.insert((200, 0), batch_b);
-        h.pending_relays.insert((300, 0), batch_c);
+        h.pending_relays.insert((200, 0), (batch_b, 0));
+        h.pending_relays.insert((300, 0), (batch_c, 0));
 
         // Nested wait for view 200 finds its relay without touching the SAL.
-        let b = h.pending_relays.remove(&(200, 0)).expect("view 200 relay queued");
+        let (b, _) = h.pending_relays.remove(&(200, 0)).expect("view 200 relay queued");
         assert_eq!(b.count, 7);
         assert!(!h.pending_relays.contains_key(&(200, 0)));
         // Unrelated view 300 remains parked for its own wait.
@@ -2137,15 +2261,15 @@ mod tests {
         batch_b.count = 11;
 
         // Same view_id=100, different source_ids 10 and 20.
-        h.pending_relays.insert((100, 10), batch_a);
-        h.pending_relays.insert((100, 20), batch_b);
+        h.pending_relays.insert((100, 10), (batch_a, 0));
+        h.pending_relays.insert((100, 20), (batch_b, 0));
 
         // Retrieving one does NOT retrieve the other.
-        let a = h.pending_relays.remove(&(100, 10)).expect("(100,10) queued");
+        let (a, _) = h.pending_relays.remove(&(100, 10)).expect("(100,10) queued");
         assert_eq!(a.count, 3);
         assert!(h.pending_relays.contains_key(&(100, 20)),
             "retrieving (100,10) must leave (100,20) in place");
-        let b = h.pending_relays.remove(&(100, 20)).expect("(100,20) queued");
+        let (b, _) = h.pending_relays.remove(&(100, 20)).expect("(100,20) queued");
         assert_eq!(b.count, 11);
     }
 

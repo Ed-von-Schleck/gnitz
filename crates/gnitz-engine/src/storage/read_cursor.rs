@@ -1229,9 +1229,9 @@ pub fn create_read_cursor(
 // CursorHandle — owning wrapper around ReadCursor
 // ---------------------------------------------------------------------------
 
-/// Owns a `ReadCursor`.  Since the cursor now owns its data via `Arc`s in
+/// Owns a `ReadCursor`.  Since the cursor now owns its data via `Rc`s in
 /// each `CursorSource`, this is a thin newtype — the separate "owned
-/// snapshots" vector that previously kept `Arc<Batch>` alive alongside
+/// snapshots" vector that previously kept `Rc<Batch>` alive alongside
 /// transmuted-to-`'static` `MemBatch` views is gone.
 pub struct CursorHandle {
     pub(crate) cursor: ReadCursor,

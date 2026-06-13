@@ -68,6 +68,35 @@ pub const FLAG_UNIQUE_PREFLIGHT: u32    = 131072;
 /// worker classifies it from this `u32` flag.
 pub const FLAG_SEEK_BY_INDEX_RANGE_SAL: u32 = 1 << 18;
 
+// ---------------------------------------------------------------------------
+// Chunked distributed-backfill exchange coordination
+// ---------------------------------------------------------------------------
+//
+// A distributed CREATE-VIEW backfill streams the source partition through the
+// incremental plan one chunk at a time, issuing one exchange round per chunk
+// per exchanging view. All workers must issue the SAME number of rounds (short
+// partitions pad with empty rounds), so termination and SAL reclamation are
+// decided collectively by the master and stamped back on each relay. Both legs
+// reuse the otherwise-unused `seek_col_idx` control field — no new SAL flag and
+// no wire-format change. The value `0` doubles as "no backfill coordination",
+// so steady-state exchanges (which already pass a literal `0`) are unaffected.
+
+/// Up-leg (worker→master, on `FLAG_EXCHANGE`): the per-chunk PAD bit. Set when
+/// this worker's `drain_chunk` returned `None` — its partition is exhausted and
+/// the chunk it is participating in is an empty pad. The master ANDs this bit
+/// across all workers for a round; an all-pad round is the final round.
+pub const BACKFILL_PAD_BIT: u64 = 1;
+
+/// Down-leg (master→worker, on `FLAG_EXCHANGE_RELAY`): the collective decision
+/// the master stamps onto a round's relay after ANDing the round's pad bits and
+/// checking SAL space. `CONTINUE` keeps the loop going; `STOP` ends every
+/// worker's loop on the same (all-pad) round; `CHECKPOINT` is a continue that
+/// also tells the worker to advance its SAL read epoch + reset its read cursor
+/// inline (the master reclaims the SAL write side at the next round barrier).
+pub const BACKFILL_DECISION_CONTINUE: u64 = 0;
+pub const BACKFILL_DECISION_STOP: u64 = 1;
+pub const BACKFILL_DECISION_CHECKPOINT: u64 = 2;
+
 /// Wire schema of every unique pre-flight reply frame: the leading `n_promoted`
 /// columns of the index schema, all marked PK, schema version 0. Its `pk_stride`
 /// is exactly `idx_key_size`, and the OPK leading-key span fills that PK region

@@ -61,7 +61,17 @@ impl CatalogEngine {
             pending_dir_deletions: Vec::new(),
             checkpoint_gated_deletions: Vec::new(),
             ctx: ApplyContext::new(),
-            ddl_scan_chunk_rows: crate::storage::DDL_SCAN_CHUNK_ROWS,
+            // Rows per chunk for the chunked DDL scans (view + index backfill).
+            // `GNITZ_DDL_SCAN_CHUNK_ROWS` overrides the default — chiefly so
+            // multi-worker E2E tests can shrink it to force many chunked backfill
+            // rounds (lockstep padding, SAL reclaim) over small tables. A 0 or
+            // unparseable value falls back to the default (drain_chunk requires
+            // max_rows > 0).
+            ddl_scan_chunk_rows: std::env::var("GNITZ_DDL_SCAN_CHUNK_ROWS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(crate::storage::DDL_SCAN_CHUNK_ROWS),
         };
 
         if is_new {

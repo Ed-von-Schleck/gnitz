@@ -545,6 +545,39 @@ impl DagEngine {
         }
     }
 
+    /// Distributed-backfill analogue of `backfill_view`'s post-loop
+    /// `clear_view_regfile_deltas` (catalog/ddl.rs). A worker's
+    /// `handle_backfill(source_id)` drives `evaluate_dag_multi_worker`, which
+    /// evaluates the whole transitive dependent closure of `source_id`; the last
+    /// chunk's input + intermediate delta registers stay pinned in every touched
+    /// view's regfile after the loop. Walk that closure and release them, so peak
+    /// resident memory falls back to ~O(chunk) once the backfill drains.
+    ///
+    /// Also carries `backfill_view`'s Ephemeral guard: every view backfilled this
+    /// way must be ephemeral, else its manifest-loaded shards would double-count
+    /// against the deltas the backfill ingests.
+    pub fn clear_regfile_deltas_from_source(&mut self, source_id: i64) {
+        self.get_dep_map();
+        let mut stack: Vec<i64> =
+            self.dep_map.get(&source_id).cloned().unwrap_or_default();
+        let mut seen: FxHashSet<i64> = FxHashSet::default();
+        while let Some(view_id) = stack.pop() {
+            if !seen.insert(view_id) {
+                continue;
+            }
+            debug_assert!(
+                self.tables.get(&view_id)
+                    .is_none_or(|e| e.kind.persistence() == Persistence::Ephemeral),
+                "distributed backfill into durable relation {view_id}: \
+                 would double-count loaded shards",
+            );
+            self.clear_view_regfile_deltas(view_id);
+            if let Some(deps) = self.dep_map.get(&view_id) {
+                stack.extend(deps.iter().copied());
+            }
+        }
+    }
+
     // ── Cache management ────────────────────────────────────────────────
 
     #[cfg(test)] // sole callers are the test-only drop_view path and the dag tests

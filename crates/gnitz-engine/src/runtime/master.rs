@@ -25,6 +25,7 @@ use crate::runtime::sal::{
     FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE_SAL, FLAG_BACKFILL, FLAG_GATHER,
     FLAG_UNIQUE_PREFLIGHT, FLAG_TICK, FLAG_FLUSH, SalWriter, pack_gather_cols,
     unique_preflight_wire_schema,
+    BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, BACKFILL_DECISION_CHECKPOINT,
 };
 use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_CONTINUATION, FLAG_SCAN_LAST, WireConflictMode, SchemaWithVersion, DecodedWire, col_names_as_refs, peek_control_block};
 use gnitz_wire::wire_flags_set_conflict_mode;
@@ -603,6 +604,9 @@ impl MasterDispatcher {
         let mut collected = vec![false; nw];
         let mut remaining = nw;
         let mut acc = crate::runtime::reactor::ExchangeAccumulator::new(nw);
+        // Armed when a round is stamped CHECKPOINT; the actual SAL reset is
+        // deferred to the next round barrier (see the decision block below).
+        let mut pending_reset = false;
 
         while remaining > 0 {
             // One full pass over all workers per iteration. If a pass
@@ -618,18 +622,41 @@ impl MasterDispatcher {
                 progressed = true;
                 if (decoded.control.flags as u32) & FLAG_EXCHANGE != 0 {
                     if let Some(relay) = acc.process(w, decoded) {
-                        // Backfill keeps fail-on-low-space (prepare_relay no
-                        // longer checks): injecting a FLAG_FLUSH mid-backfill
-                        // would orphan already-written backfill groups that
-                        // workers have not yet consumed and hang boot.
-                        if !self.sal_relay_space_ok_raw() {
-                            let remaining = self.sal.mmap_size() - self.sal.cursor();
-                            return Err(format!(
-                                "SAL space exhausted during backfill exchange relay \
-                                 ({remaining} bytes left)"));
+                        // A round just completed. If a prior round was stamped
+                        // CHECKPOINT, every worker has now consumed that relay
+                        // — a worker issues its next round only after consuming
+                        // the prior relay and bumping its read epoch inline, so
+                        // this round's `num_workers` reports prove it. Reclaim
+                        // the SAL write side NOW, before writing this round, so
+                        // this round lands at write_cursor 0 in the new epoch the
+                        // workers already expect. Direct checkpoint_reset only —
+                        // never checkpoint_post_ack / FLAG_FLUSH, which a
+                        // mid-backfill flush would race, orphaning unconsumed
+                        // backfill groups and hanging boot.
+                        if pending_reset {
+                            self.sal.checkpoint_reset();
+                            pending_reset = false;
                         }
+                        // Decide this round's collective verdict, stamped onto
+                        // its relay. Stop takes precedence: an all-pad round ends
+                        // the backfill and its leftover SAL is reclaimed by the
+                        // normal post-backfill checkpoint. Otherwise, when SAL
+                        // space is low, stamp CHECKPOINT (continue + tell workers
+                        // to re-epoch inline) and arm the reset for the next round
+                        // barrier; this round's relay is still written at the high
+                        // cursor (a single round fits the 1/8 reserve).
+                        let decision = if relay.all_pad {
+                            BACKFILL_DECISION_STOP
+                        } else if !self.sal_relay_space_ok_raw()
+                            || Self::inject_backfill_reclaim()
+                        {
+                            pending_reset = true;
+                            BACKFILL_DECISION_CHECKPOINT
+                        } else {
+                            BACKFILL_DECISION_CONTINUE
+                        };
                         let prep = self.prepare_relay(relay)?;
-                        self.emit_relay(prep)?;
+                        self.emit_relay_with_decision(prep, decision)?;
                     }
                 } else {
                     if decoded.control.status != 0 {
@@ -687,6 +714,27 @@ impl MasterDispatcher {
         &ARMED
     }
 
+    /// Debug-only backfill seam: when `GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW` is
+    /// set, `collect_acks_and_relay` treats SAL space as low on every non-stop
+    /// round, forcing a per-round CHECKPOINT + reset. Lets tests exercise the SAL
+    /// reclamation protocol (worker re-epoch, master `checkpoint_reset`, epoch
+    /// advancing many times) over a small table that would otherwise never
+    /// approach the 1 GiB mmap. Release builds compile this to `false`.
+    #[cfg(debug_assertions)]
+    fn inject_backfill_reclaim() -> bool {
+        // The env var can't change mid-boot; read it once. `collect_acks_and_relay`
+        // calls this once per round, and the seam's whole purpose is to drive the
+        // round count up — so an uncached read would re-allocate per round.
+        use std::sync::OnceLock;
+        static ARMED: OnceLock<bool> = OnceLock::new();
+        *ARMED.get_or_init(
+            || std::env::var_os("GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW").is_some())
+    }
+    #[cfg(not(debug_assertions))]
+    fn inject_backfill_reclaim() -> bool {
+        false
+    }
+
     /// Raw SAL relay-space threshold: at least 1/8 of the mmap still free.
     /// Seam-free — the boot backfill relay checks this directly because it
     /// must keep failing-on-low-space without observing the relay_loop test
@@ -732,7 +780,9 @@ impl MasterDispatcher {
     /// without `sal_writer_excl` so the lock covers only the synchronous
     /// SAL write in `emit_relay`.
     pub(crate) fn prepare_relay(&mut self, relay: PendingRelay) -> Result<RelayPrepared, String> {
-        let PendingRelay { view_id, payloads, schema, source_id } = relay;
+        // `all_pad` is the backfill stop signal, read by the caller before
+        // `prepare_relay`; the relay scatter itself does not depend on it.
+        let PendingRelay { view_id, payloads, schema, source_id, all_pad: _ } = relay;
 
         let cat = unsafe { &mut *self.catalog };
         // A join-shard scatter (cols from a reindex chain) must route by the
@@ -808,22 +858,34 @@ impl MasterDispatcher {
         Ok(RelayPrepared { view_id, source_id, dest_batches, schema, name_bytes })
     }
 
-    /// Synchronous second half: writes the FLAG_EXCHANGE_RELAY group to
-    /// SAL and signals workers. Caller holds `sal_writer_excl` for the
-    /// duration of this call; no awaits inside.
+    /// Synchronous second half of a steady-state relay: writes the
+    /// FLAG_EXCHANGE_RELAY group to SAL and signals workers, with no backfill
+    /// coordination. Caller holds `sal_writer_excl` for the duration; no awaits
+    /// inside. CONTINUE == 0 is the value a non-backfill relay's `seek_col_idx`
+    /// has always carried, so this is byte-identical to the pre-backfill relay.
     pub(crate) fn emit_relay(&mut self, prep: RelayPrepared) -> Result<(), String> {
+        self.emit_relay_with_decision(prep, BACKFILL_DECISION_CONTINUE)
+    }
+
+    /// As `emit_relay`, but stamps the boot backfill round `decision` (a
+    /// `BACKFILL_DECISION_*`) onto the relay's `seek_col_idx`. Only the boot
+    /// backfill collect-loop (`collect_acks_and_relay`) needs the non-CONTINUE
+    /// values; the steady-state reactor path goes through `emit_relay`.
+    pub(crate) fn emit_relay_with_decision(&mut self, prep: RelayPrepared, decision: u64) -> Result<(), String> {
         let RelayPrepared { view_id, source_id, dest_batches, schema, name_bytes } = prep;
         let refs: Vec<Option<&Batch>> = dest_batches.iter()
             .map(|b| if b.count > 0 { Some(b) } else { None })
             .collect();
         let lsn = self.next_lsn();
-        // Echo `source_id` back via `seek_pk_lo` so the worker's
-        // `do_exchange_wait` can match on (view_id, source_id). Without
-        // this, a multi-source view (join over 2+ tables) can deliver
-        // the wrong source's relay to a waiting exchange and the worker
-        // demuxes against the wrong sharding columns.
+        // Echo `source_id` back via `seek_pk` so the worker's `do_exchange_wait`
+        // can match on (view_id, source_id). Without this, a multi-source view
+        // (join over 2+ tables) can deliver the wrong source's relay to a
+        // waiting exchange and the worker demuxes against the wrong sharding
+        // columns. `seek_col_idx` carries the backfill round `decision`
+        // (BACKFILL_DECISION_*); CONTINUE == 0 is the steady-state value, so a
+        // non-backfill relay is byte-identical to before.
         self.send_to_workers(view_id, lsn, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes,
-                              source_id as u128, 0, 0)
+                              source_id as u128, decision, 0)
     }
 
     fn record_index_routing(
