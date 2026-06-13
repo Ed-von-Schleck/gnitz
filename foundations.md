@@ -37,27 +37,31 @@ signed; STRING, BLOB, and float columns cannot be PK columns, and PK
 columns are non-nullable. Floats are excluded because IEEE-754 breaks the
 byte-equal key contract: -0.0 and +0.0 compare unequal byte-wise but equal
 numerically, and NaN has no single canonical bit pattern. The PK columns
-are packed in PK-list order, each contributing its native LE bytes; the
-concatenation is the key.
+are packed in PK-list order and stored order-preserving big-endian (OPK, §6);
+the concatenation is the key.
 
-**PK ordering is type-aware.** A primary key is *not* ordered by a flat
-comparison of its packed bytes. A single unsigned column orders by native
-magnitude. A single signed column orders in signed order: a negative
-integer's packed bytes (`0xFFFF…`) would otherwise sort after a positive
-one, inverting it. A compound key orders lexicographically by column in
-PK-list order; its internal column boundaries are invisible to a flat
-compare. Every ordered operation — merge, sort, consolidation, range scan —
-honours this type-aware order, never the raw packed representation.
+**PK ordering is type-aware.** A primary key orders by typed value: a single
+unsigned column orders by magnitude; a single signed column orders in signed
+order (a negative integer's native bytes `0xFFFF…` would otherwise sort after a
+positive one, inverting it); a compound key orders lexicographically by column
+in PK-list order. This order is baked into the stored bytes by the
+order-preserving (OPK) encoding (§6) — each column byte-reversed to big-endian,
+signed columns' leading sign bit flipped — so an unsigned byte comparison
+(`memcmp`) over the encoded PK region *is* the typed order, for unsigned,
+signed, and compound keys at any width. Every ordered operation — merge, sort,
+consolidation, range scan — is that single byte comparison; none needs a
+type-aware comparator over native bytes.
 
-**Hash invariant.** `hash_u128(v as u128) == hash_u128(v)` for all narrow
-PK types (after the native-LE pack-and-zero-extend described above). XOR8
-filter probes and partition routing both depend on this invariant — the
-hash sees the full 128-bit slot, but unused high bytes are zero, so a
-value stored at any stride hashes identically regardless of how it
-crossed the wire boundary.
+**Hash invariant.** Partition routing and XOR8 filter probes hash the OPK PK
+region read big-endian into a `u128` (left-zero-padded). The same logical value
+hashes identically regardless of its stored stride — a narrow key at 4/8 bytes
+and the same value in a 16-byte slot produce the same `u128`, the unused high
+bytes being zero — so a value hashes the same however it crossed the wire
+boundary, and equal join keys co-partition.
 
-**Physical representation.** `ArenaZSetBatch`: columnar buffers where each
-row is (pk_lo, pk_hi, weight, null_word, col_0, col_1, ...). Multiple
+**Physical representation.** The in-engine batch is region-based (§6): a flat
+buffer of contiguous columnar regions — PK (OPK bytes, `pk_stride`/row),
+weight, null word, then payload columns — not separate per-row fields. Multiple
 rows may share the same PK if their payloads differ.
 
 **PK uniqueness is not a general invariant.** The 128-bit PK slot is a
@@ -287,22 +291,22 @@ single narrow scalar PK, 16 bytes for U128, or the compound sum for
 multi-column PKs.
 
 ```
-region[0] = pk         (count × pk_stride bytes, LE; pk_stride = packed PK-column sum, ≤ 16 for narrow keys)
+region[0] = pk         (count × pk_stride bytes, OPK big-endian; pk_stride = packed PK-column sum, ≤ 16 for narrow keys)
 region[1] = weight     (count × 8 bytes, i64 LE)
 region[2] = null       (count × 8 bytes, u64 LE, 1 bit per payload col)
 region[3..3+P-1] = payload columns (non-PK, schema order)
 region[3+P] = blob     (variable-length string heap)
 ```
 
-The in-engine `ArenaZSetBatch` uses separate pk_lo (u64) and pk_hi (u64)
-fields in its columnar layout regardless of schema type. Boundary code
-(WAL encode/decode, shard read/write) packs each PK column's native LE
-bytes, in PK-list order, into the low `pk_stride` bytes of the 128-bit
-slot and truncates back to
-`pk_stride` on emit. Signed integers use their native bit pattern
-(`(v as iN as uN) as u128`), not sign-extension — the type-aware
-comparator (§1 "PK ordering is type-aware") restores the ordering
-semantics.
+The PK region holds **order-preserving big-endian (OPK)** bytes, in both the
+at-rest files and the in-engine batch. Each PK column is byte-reversed from its
+native little-endian form to big-endian and, for signed columns, has the sign
+bit of its leading byte flipped; the columns are concatenated in PK-list order.
+The encoding is a fixed-width bijection, so OPK byte equality is exactly PK
+equality (consolidation groups on it), and an unsigned byte comparison
+(`memcmp`) over the region is the typed lexicographic order — no type-aware
+comparator and no native-LE form survive in the stored representation. The
+narrow-PK value is recovered by reading the region big-endian into a `u128`.
 
 PK columns are not included in the payload region pointers.
 
