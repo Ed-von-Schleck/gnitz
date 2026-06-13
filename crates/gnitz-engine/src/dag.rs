@@ -408,6 +408,10 @@ pub struct DagEngine {
     // tc is non-zero for a cross-width join key and threads to the scatter packer.
     join_shard_cols_cache: FxHashMap<(i64, i64), Vec<(i32, u8)>>,
     exchange_info_cache: FxHashMap<i64, ExchangeInfo>,
+    // Whether a view is a non-equi (range) join — its input relay broadcasts and
+    // its driver branch double-exchanges. Memoized per view_id; evicted in
+    // lockstep with the sibling view-keyed caches.
+    range_join_cache: FxHashMap<i64, bool>,
     pub(crate) tables: FxHashMap<i64, TableEntry>,
     sys: SysTableRefs,
 }
@@ -435,6 +439,7 @@ impl DagEngine {
             shard_cols_cache: FxHashMap::default(),
             join_shard_cols_cache: FxHashMap::default(),
             exchange_info_cache: FxHashMap::default(),
+            range_join_cache: FxHashMap::default(),
             tables: FxHashMap::default(),
             sys: SysTableRefs::null(),
         }
@@ -473,6 +478,7 @@ impl DagEngine {
         self.shard_cols_cache.remove(&table_id);
         self.join_shard_cols_cache.retain(|&(v, s), _| v != table_id && s != table_id);
         self.exchange_info_cache.remove(&table_id);
+        self.range_join_cache.remove(&table_id);
         self.dep_map_valid = false;
     }
 
@@ -547,6 +553,7 @@ impl DagEngine {
         self.shard_cols_cache.remove(&view_id);
         self.join_shard_cols_cache.retain(|&(v, _), _| v != view_id);
         self.exchange_info_cache.remove(&view_id);
+        self.range_join_cache.remove(&view_id);
         self.dep_map_valid = false;
     }
 
@@ -555,6 +562,7 @@ impl DagEngine {
         self.shard_cols_cache.clear();
         self.join_shard_cols_cache.clear();
         self.exchange_info_cache.clear();
+        self.range_join_cache.clear();
         self.dep_map_valid = false;
     }
 
@@ -773,6 +781,23 @@ impl DagEngine {
     pub fn view_needs_exchange(&mut self, view_id: i64) -> bool {
         let loaded = self.load_meta_circuit(view_id);
         loaded.nodes.values().any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. }))
+    }
+
+    /// Whether a view is a non-equi (range) join — has any
+    /// `Join(DeltaTraceRange)` node. The precise discriminator for the
+    /// range-join driver branch and the broadcast input relay. It is NOT
+    /// `has_join_shard && has_exchange`: that predicate is also true for every
+    /// GROUP BY / reduce / single-sided set-op view (a group reindex matches
+    /// `reindex_cols_through_filters`), which must keep the plain `has_exchange`
+    /// arm. Memoized in `range_join_cache`, evicted with the sibling view caches.
+    pub fn view_is_range_join(&mut self, view_id: i64) -> bool {
+        if let Some(&v) = self.range_join_cache.get(&view_id) {
+            return v;
+        }
+        let loaded = self.load_meta_circuit(view_id);
+        let is_range = crate::compiler::circuit_is_range_join(&loaded);
+        self.range_join_cache.insert(view_id, is_range);
+        is_range
     }
 
     // ── Compilation ─────────────────────────────────────────────────────
@@ -1208,7 +1233,39 @@ impl DagEngine {
                 info.is_trivial && info.is_co_partitioned
             };
 
-            let out_delta = if has_exchange && self.view_has_side_b(view_id) {
+            let out_delta = if self.view_is_range_join(view_id) {
+                // Range join: broadcast input relay → pre → output exchange → post.
+                // Checked FIRST: a range join has has_exchange == true (its output
+                // ExchangeShard), so it would otherwise be swallowed by the
+                // has_exchange arm below, which never relays the join input. No
+                // co-partition shortcut applies: a range probe needs the full
+                // delta even when the join key equals the source PK.
+                //
+                // Set the source schema for exchange wire encoding: a batch with
+                // rows but a None schema emits FLAG_HAS_DATA without FLAG_HAS_SCHEMA
+                // and panics the reactor decode. Mirrors the has_join_shard arm.
+                let mut input_with_schema = input;
+                if input_with_schema.schema.is_none() {
+                    if let Some(entry) = self.tables.get(&src_id) {
+                        input_with_schema.set_schema(entry.schema);
+                    }
+                }
+                // (1) Broadcast the source delta to every worker (master relay).
+                let bc = exchange.do_exchange(view_id, &input_with_schema, src_id);
+                let exchange_schema = self.get_exchange_schema(view_id)
+                    .unwrap_or_else(|| self.tables[&view_id].schema);
+                // (2) Pre plan on the full delta: reindex, ownership-filter the
+                // traces, range-probe, normalize, re-key onto the source-PK pair.
+                let pre_result = match self.execute_pre_phase(view_id, bc, src_id) {
+                    Some(mut b) => { b.set_schema(exchange_schema); b }
+                    None => Batch::with_schema(exchange_schema, 0),
+                };
+                // (3) Output exchange on the pair-PK (GroupKey scatter), then
+                // consolidate (probe output is unsorted, mixed-sign) → post sink.
+                let post_in = exchange.do_exchange(view_id, &pre_result, 0);
+                let post_in = Self::consolidate_exchanged(post_in, &exchange_schema);
+                self.execute_post_phase(view_id, post_in)
+            } else if has_exchange && self.view_has_side_b(view_id) {
                 // Binary set-op: two HashRow→ExchangeShard sides, each scattered
                 // by its hash PK, then combined.
                 self.run_two_sided(view_id, input, src_id,
@@ -1911,6 +1968,7 @@ impl DagEngine {
         self.shard_cols_cache.clear();
         self.join_shard_cols_cache.clear();
         self.exchange_info_cache.clear();
+        self.range_join_cache.clear();
         self.dep_map.clear();
         self.source_map.clear();
     }
@@ -1980,6 +2038,29 @@ mod tests {
         dag.shard_cols_cache.insert(99, vec![1]);
         dag.invalidate_all();
         assert!(dag.shard_cols_cache.is_empty());
+    }
+
+    /// `range_join_cache` must be evicted in lockstep with the sibling view-keyed
+    /// caches at every invalidation site, or it drifts (a dropped view's stale
+    /// `true`/`false` survives, and the cache disagrees with the live circuit).
+    #[test]
+    fn test_range_join_cache_eviction() {
+        let mut dag = DagEngine::new();
+
+        // invalidate(view_id) drops the per-view entry.
+        dag.range_join_cache.insert(42, true);
+        dag.invalidate(42);
+        assert!(!dag.range_join_cache.contains_key(&42), "invalidate must evict");
+
+        // unregister_table(table_id) drops it (the production view-drop path).
+        dag.range_join_cache.insert(43, true);
+        dag.unregister_table(43);
+        assert!(!dag.range_join_cache.contains_key(&43), "unregister_table must evict");
+
+        // invalidate_all() clears it (the production bulk flush).
+        dag.range_join_cache.insert(44, false);
+        dag.invalidate_all();
+        assert!(dag.range_join_cache.is_empty(), "invalidate_all must clear");
     }
 
     #[test]

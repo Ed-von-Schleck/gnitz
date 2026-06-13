@@ -464,3 +464,101 @@ fn test_join_duplicate_output_columns_rejected() {
         e => panic!("expected Plan, got {:?}", e),
     }
 }
+
+// ── Range / band join: planner admission ─────────────────────────────
+
+/// A pure range join registers cleanly: its output PK is the source-PK pair.
+#[test]
+fn test_range_join_accepts_pure_range() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE rj_a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE rj_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)").unwrap();
+    // Alias the two `id` columns so the projection has no duplicate output names.
+    p.execute("CREATE VIEW rj_v AS SELECT rj_a.id AS aid, rj_b.id AS bid, rj_b.y AS by FROM rj_a JOIN rj_b ON rj_a.x < rj_b.y").unwrap();
+    assert!(client.resolve_table_or_view_id(&sn, "rj_v").is_ok(), "range-join view should register");
+}
+
+/// A band join (eq prefix + range) registers cleanly.
+#[test]
+fn test_range_join_accepts_band() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE bj_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE bj_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE VIEW bj_v AS SELECT * FROM bj_a JOIN bj_b ON bj_a.k = bj_b.k AND bj_a.lo <= bj_b.t").unwrap();
+    assert!(client.resolve_table_or_view_id(&sn, "bj_v").is_ok(), "band-join view should register");
+}
+
+/// A LEFT JOIN with a range predicate is rejected (range-aware anti-join is out
+/// of scope).
+#[test]
+fn test_range_join_reject_left_outer() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE rl_a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE rl_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)").unwrap();
+    let err = must_err(p.execute("CREATE VIEW rl_v AS SELECT * FROM rl_a LEFT JOIN rl_b ON rl_a.x < rl_b.y"));
+    match err {
+        GnitzSqlError::Unsupported(s) => assert!(s.contains("LEFT JOIN with a range predicate"), "got: {s}"),
+        e => panic!("expected Unsupported, got {:?}", e),
+    }
+    assert!(client.resolve_table_or_view_id(&sn, "rl_v").is_err(), "no view should be registered");
+}
+
+/// Two range conjuncts are rejected (the one-range-conjunct rule).
+#[test]
+fn test_range_join_reject_two_range_conjuncts() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE r2_a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, w BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE r2_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL, z BIGINT NOT NULL)").unwrap();
+    let err = must_err(p.execute("CREATE VIEW r2_v AS SELECT * FROM r2_a JOIN r2_b ON r2_a.x < r2_b.y AND r2_a.w > r2_b.z"));
+    assert!(matches!(err, GnitzSqlError::Unsupported(_)), "expected Unsupported, got {:?}", err);
+    assert!(client.resolve_table_or_view_id(&sn, "r2_v").is_err(), "no view should be registered");
+}
+
+/// A string/blob range pair is rejected (content hash is not order-preserving),
+/// even though the same columns may equijoin.
+#[test]
+fn test_range_join_reject_string_range_pair() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE rs_a (id BIGINT NOT NULL PRIMARY KEY, s VARCHAR NOT NULL)").unwrap();
+    p.execute("CREATE TABLE rs_b (id BIGINT NOT NULL PRIMARY KEY, s VARCHAR NOT NULL)").unwrap();
+    let err = must_err(p.execute("CREATE VIEW rs_v AS SELECT * FROM rs_a JOIN rs_b ON rs_a.s < rs_b.s"));
+    match err {
+        GnitzSqlError::Unsupported(s) => assert!(s.contains("order-preserving"), "got: {s}"),
+        e => panic!("expected Unsupported, got {:?}", e),
+    }
+}
+
+/// A range self-join is rejected (the self-join guard fires for both join kinds).
+#[test]
+fn test_range_join_reject_self_join() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE rself (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)").unwrap();
+    let err = must_err(p.execute("CREATE VIEW rself_v AS SELECT * FROM rself a JOIN rself b ON a.x < b.y"));
+    assert!(matches!(err, GnitzSqlError::Unsupported(_)), "expected Unsupported, got {:?}", err);
+}
+
+/// The output pair-PK count cap: two 2-column-PK tables sum to a 4-column pair-PK
+/// (accepted), but adding a third PK column each would exceed it. Here both PKs
+/// are 2 columns, so pair-PK = 4 = cap → accepted.
+#[test]
+fn test_range_join_pair_pk_at_cap() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE rp_a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, x BIGINT NOT NULL, PRIMARY KEY (k1, k2))").unwrap();
+    p.execute("CREATE TABLE rp_b (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, y BIGINT NOT NULL, PRIMARY KEY (k1, k2))").unwrap();
+    p.execute("CREATE VIEW rp_v AS SELECT rp_a.x, rp_b.y FROM rp_a JOIN rp_b ON rp_a.x < rp_b.y").unwrap();
+    assert!(client.resolve_table_or_view_id(&sn, "rp_v").is_ok(), "4-column pair-PK is at the cap, should register");
+}

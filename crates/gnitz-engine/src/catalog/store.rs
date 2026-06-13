@@ -1096,7 +1096,7 @@ impl CatalogEngine {
             let mut k = spec.seek_prefix(&natives[..=n_eq]).0;
             match c {
                 Cut::Before(_) => Some(k),
-                Cut::After(_)  => increment_key_in_place(&mut k[..prefix_len]).then_some(k),
+                Cut::After(_)  => crate::storage::increment_key_in_place(&mut k[..prefix_len]).then_some(k),
             }
         };
         let (start, end) = (cut_key(range.start), cut_key(range.end));
@@ -1817,18 +1817,6 @@ impl CatalogEngine {
     }
 }
 
-/// Fixed-width byte-string successor: `p + 1` with carry, in place. Returns
-/// `false` when `p` is all-0xFF (or empty) — no successor exists at this
-/// width: a `Cut::After` of a group whose key is already maximal cuts at `+∞`
-/// (scan to the table end, or a provably-empty start).
-fn increment_key_in_place(p: &mut [u8]) -> bool {
-    for b in p.iter_mut().rev() {
-        *b = b.wrapping_add(1);
-        if *b != 0 { return true; }
-    }
-    false
-}
-
 /// Build the schema for a `gather_family` result: the PK columns of `schema`
 /// (in pk-list order, so the packed PK round-trips identically) followed by
 /// the projected columns in `project` order as payload. `project` must list
@@ -1899,24 +1887,6 @@ fn copy_cursor_cols_to_batch(
     out.count += 1;
 }
 
-#[cfg(test)]
-mod store_tests {
-    use super::increment_key_in_place;
-
-    #[test]
-    fn test_increment_key_in_place() {
-        let mut k1 = [0x00, 0x01];
-        assert!(increment_key_in_place(&mut k1));
-        assert_eq!(k1, [0x00, 0x02]);              // no carry
-
-        let mut k2 = [0x00, 0xFF];
-        assert!(increment_key_in_place(&mut k2));
-        assert_eq!(k2, [0x01, 0x00]);              // carry chain
-
-        let mut k3 = [0xFF, 0xFF];
-        assert!(!increment_key_in_place(&mut k3)); // overflow at width
-
-        let mut k4: [u8; 0] = [];
-        assert!(!increment_key_in_place(&mut k4)); // empty
-    }
-}
+// `increment_key_in_place` and its unit coverage moved to
+// `storage/range_key.rs` (the shared home for the byte successor and the
+// range-join cut-point derivation).

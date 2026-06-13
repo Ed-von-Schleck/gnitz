@@ -3,12 +3,12 @@ use std::rc::Rc;
 use sqlparser::ast::{
     Statement, ObjectType, ColumnOption, TableConstraint, Query, SetExpr, Expr,
     SelectItem, TableFactor, JoinOperator, JoinConstraint, GroupByExpr,
-    SetOperator, SetQuantifier,
+    SetOperator, SetQuantifier, BinaryOperator,
     FunctionArguments, FunctionArg, FunctionArgExpr,
 };
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{
-    GnitzClient, IndexMeta, CircuitBuilder, ExprBuilder,
+    GnitzClient, IndexMeta, CircuitBuilder, ExprBuilder, RangeRel,
     AGG_COUNT, AGG_COUNT_NON_NULL, AGG_SUM, AGG_MIN, AGG_MAX,
 };
 use crate::error::{GnitzSqlError, extract_name, extract_table_factor_name};
@@ -1073,10 +1073,27 @@ fn execute_create_join_view(
     alias_map.insert(left_alias.to_lowercase(), (left_tid, Rc::clone(&left_schema), 0));
     alias_map.insert(right_alias.to_lowercase(), (right_tid, Rc::clone(&right_schema), left_schema.columns.len()));
 
-    // Extract equijoin keys + the per-pair common reindex output type `T`.
-    let (left_join_cols, right_join_cols, target_tcs) = extract_equijoin_keys(
+    // Classify the ON clause: equality prefix pairs + an optional range conjunct.
+    let (left_join_cols, right_join_cols, target_tcs, range_conjunct) = extract_join_predicates(
         on_expr, &left_schema, &right_schema, &alias_map,
     )?;
+
+    // Range (band) join: one range conjunct (optionally behind equality
+    // conjuncts) routes to the broadcast / re-key / output-exchange circuit.
+    if let Some(range) = range_conjunct {
+        if is_left_join {
+            return Err(GnitzSqlError::Unsupported(
+                "LEFT JOIN with a range predicate is not supported".into()));
+        }
+        return build_range_join_view(
+            client, schema_name, view_name, sql_text, select, &alias_map,
+            left_tid, right_tid, &left_schema, &right_schema,
+            &left_join_cols, &right_join_cols, &target_tcs, range,
+        );
+    }
+
+    // Equi-join path (zero range conjuncts) — byte-identical to before. The
+    // reindex-slot arity cap was already enforced in extract_join_predicates.
     let k = left_join_cols.len();   // == right_join_cols.len(), 1..=PK_LIST_MAX_COLS
 
     // Per-side carried target tc for each key pair: `T_i` only when the side's own
@@ -1262,61 +1279,14 @@ fn execute_create_join_view(
         out_cols.push(c);
     }
 
-    // Compute user-specified projection and view schema.
-    // `combined_idx` is the 0-based index in [A_cols..B_cols]; union output col = combined_idx + k.
+    // Compute the user projection + view schema via the shared join-projection
+    // helper. A lone `SELECT *` flows through its Wildcard arm and stays identity
+    // (the projection map is then skipped below), so no wildcard fast path here.
     let is_wildcard = select.projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_)));
-    let (final_cols, final_projection) = if is_wildcard {
-        let proj: Vec<usize> = (k..k + left_n + right_n).collect();
-        (out_cols, proj)
-    } else {
-        let mut cols = Vec::new();
-        let mut proj = Vec::new();
-        // Always include all k join PK columns first.
-        for c in out_cols.iter().take(k) {
-            cols.push(c.clone());
-        }
-        for item in &select.projection {
-            match item {
-                SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                    let idx = resolve_unqualified_column(&ident.value, &alias_map)?;
-                    cols.push(out_cols[k + idx].clone());
-                    proj.push(idx + k); // union output col index = combined_idx + k
-                }
-                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
-                    let idx = resolve_qualified_column(
-                        &parts[0].value, &parts[1].value, &alias_map,
-                    )?;
-                    cols.push(out_cols[k + idx].clone());
-                    proj.push(idx + k);
-                }
-                SelectItem::ExprWithAlias { expr, alias } => {
-                    let idx = match expr {
-                        Expr::Identifier(ident) =>
-                            resolve_unqualified_column(&ident.value, &alias_map)?,
-                        Expr::CompoundIdentifier(parts) if parts.len() == 2 =>
-                            resolve_qualified_column(&parts[0].value, &parts[1].value, &alias_map)?,
-                        _ => return Err(GnitzSqlError::Unsupported(
-                            "JOIN view: only column references supported in AS clause".to_string()
-                        )),
-                    };
-                    let mut col = out_cols[k + idx].clone();
-                    col.name = alias.value.clone();
-                    cols.push(col);
-                    proj.push(idx + k);
-                }
-                SelectItem::Wildcard(_) => {
-                    for (i, col) in out_cols.iter().enumerate().skip(k) {
-                        cols.push(col.clone());
-                        proj.push(i);
-                    }
-                }
-                _ => return Err(GnitzSqlError::Unsupported(
-                    "unsupported SELECT item in JOIN view".to_string()
-                )),
-            }
-        }
-        (cols, proj)
-    };
+    let (final_cols, final_projection) = build_join_view_projection(
+        &select.projection, &alias_map, &out_cols[..k], left_n + right_n, k,
+        |idx| out_cols[k + idx].clone(), "JOIN view",
+    )?;
 
     // Apply final column projection before sink when not identity.
     // Identity = selecting all left+right cols in canonical order [k..k+left_n+right_n].
@@ -1350,6 +1320,260 @@ fn execute_create_join_view(
     Ok(SqlResult::ViewCreated { view_id })
 }
 
+/// Build a non-equi (range / band) join view: `n_eq` equality conjuncts (possibly
+/// zero) plus exactly one range conjunct. Both sides reindex onto
+/// `[eq slots…, range slot]` at the pair's common promoted type, so each side's
+/// trace is an ordered arrangement by the range key; the active delta is
+/// broadcast and probed against the other side's owned trace by an ordered range
+/// walk. Because the two terms emit with different delta-side keys, the output is
+/// re-keyed onto the **source-PK pair** `(a.pk…, b.pk…)` — the only identity
+/// under which a `+1` and its later `-1` (from opposite terms, on different
+/// workers) are byte-identical — then exchanged by that pair-PK, so the view is
+/// PK-partitioned like every other view. INNER join only.
+#[allow(clippy::too_many_arguments)]
+fn build_range_join_view(
+    client:          &mut GnitzClient,
+    schema_name:     &str,
+    view_name:       &str,
+    sql_text:        &str,
+    select:          &sqlparser::ast::Select,
+    alias_map:       &JoinAliasMap,
+    left_tid:        u64,
+    right_tid:       u64,
+    left_schema:     &Schema,
+    right_schema:    &Schema,
+    left_join_cols:  &[usize],
+    right_join_cols: &[usize],
+    eq_tcs:          &[u8],
+    range:           RangeConjunct,
+) -> Result<SqlResult, GnitzSqlError> {
+    let left_n  = left_schema.columns.len();
+    let right_n = right_schema.columns.len();
+    let n_eq = left_join_cols.len();
+    let k = n_eq + 1;                       // reindex slots: eq prefix + range slot
+    let pa = left_schema.pk_cols.len();
+    let pb = right_schema.pk_cols.len();
+    let pair_pk = pa + pb;                  // output PK arity
+
+    // The reindex-slot arity cap (k ≤ PK_LIST_MAX_COLS) was enforced in
+    // extract_join_predicates. Here we additionally cap the output pair-PK.
+    //
+    // Output pair-PK arity cap (a.pk_count + b.pk_count ≤ PK_LIST_MAX_COLS) — the
+    // binding constraint on the synthesized output PK; the stride ceiling is
+    // non-binding (≤ 4·16 = 64 ≤ MAX_PK_BYTES). The engine's validate_pk_cols is
+    // the backstop; this is the friendly planner error.
+    if pair_pk > gnitz_core::PK_LIST_MAX_COLS {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "range JOIN output PK has {pair_pk} columns (a.pk {pa} + b.pk {pb}), \
+             exceeding the {}-column limit", gnitz_core::PK_LIST_MAX_COLS)));
+    }
+    // The widest intermediate is the re-key output: pair-PK + k `_join_pk` slots +
+    // every A and B column. Reject before the server's hard column-count assertion.
+    let rekey_cols = pair_pk + k + left_n + right_n;
+    if rekey_cols > gnitz_core::MAX_COLUMNS {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "range JOIN view has {rekey_cols} intermediate columns, exceeding the \
+             {}-column limit", gnitz_core::MAX_COLUMNS)));
+    }
+
+    // Reindex columns and per-pair common type T: eq pairs first, range slot last.
+    let left_reindex_cols:  Vec<usize> = left_join_cols.iter().copied()
+        .chain(std::iter::once(range.left_col)).collect();
+    let right_reindex_cols: Vec<usize> = right_join_cols.iter().copied()
+        .chain(std::iter::once(range.right_col)).collect();
+    let all_tcs: Vec<u8> = eq_tcs.iter().copied().chain(std::iter::once(range.tc)).collect();
+
+    // Per-side carried target tc per slot (0 = self-derive); see the equi path.
+    let side_tcs = |cols: &[usize], schema: &Schema| -> Vec<u8> {
+        cols.iter().zip(&all_tcs).map(|(&c, &t)| {
+            schema.columns[c].type_code.carried_reindex_tc(TypeCode::from_validated_u8(t))
+        }).collect()
+    };
+    let left_target_tcs  = side_tcs(&left_reindex_cols,  left_schema);
+    let right_target_tcs = side_tcs(&right_reindex_cols, right_schema);
+
+    // §3 table: term AB ({y : x OP y}) wants trace y `converse(OP)` delta x; term
+    // BA ({x : x OP y}) wants trace x `OP` delta y.
+    let rel_ab = converse_rel(range.op);
+    let rel_ba = range.op;
+
+    let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
+    let mut cb = CircuitBuilder::new(view_id, 0);
+    let input_a = cb.input_delta_tagged(left_tid);
+    let input_b = cb.input_delta_tagged(right_tid);
+
+    // NULL exclusion (SQL 3VL) over ALL key cols (eq + range) when any is nullable.
+    // INNER join only, so no null-fill branches.
+    let left_key_nullable  = left_reindex_cols.iter().any(|&c| left_schema.columns[c].is_nullable);
+    let right_key_nullable = right_reindex_cols.iter().any(|&c| right_schema.columns[c].is_nullable);
+    let input_a = if left_key_nullable {
+        cb.filter(input_a, Some(multi_null_filter_prog(&left_reindex_cols, left_schema, false)?))
+    } else { input_a };
+    let input_b = if right_key_nullable {
+        cb.filter(input_b, Some(multi_null_filter_prog(&right_reindex_cols, right_schema, false)?))
+    } else { input_b };
+
+    let reindex_a = cb.map_reindex(input_a, &left_reindex_cols, &left_target_tcs, build_reindex_program(left_schema));
+    let reindex_b = cb.map_reindex(input_b, &right_reindex_cols, &right_target_tcs, build_reindex_program(right_schema));
+
+    // Trace = the worker-owned slice only (PartitionFilter between reindex and
+    // integrate); the join terms probe the UNFILTERED (full, broadcast) reindex.
+    let filt_a = cb.partition_filter(reindex_a);
+    let trace_a = cb.integrate_trace(filt_a);
+    let filt_b = cb.partition_filter(reindex_b);
+    let trace_b = cb.integrate_trace(filt_b);
+    let join_ab = cb.join_with_trace_range_node(reindex_a, trace_b, n_eq as u8, rel_ab); // ΔA ⋈θ I(B)
+    let join_ba = cb.join_with_trace_range_node(reindex_b, trace_a, n_eq as u8, rel_ba); // ΔB ⋈θ I(A)
+
+    // Per-term normalize payload to [A cols, B cols] (verbatim from the equi path,
+    // with k = n_eq + 1).
+    let proj_ab: Vec<usize> = (k..k + left_n + right_n).collect();
+    let proj_ab_node = cb.map(join_ab, &proj_ab);
+    let mut proj_ba: Vec<usize> = Vec::new();
+    for i in 0..left_n  { proj_ba.push(k + right_n + i); }
+    for i in 0..right_n { proj_ba.push(k + i); }
+    let proj_ba_node = cb.map(join_ba, &proj_ba);
+    let merged = cb.union(proj_ab_node, proj_ba_node);
+
+    // Re-key onto the source-PK pair `[a.pk…, b.pk…]`. The merged layout is
+    // `[_join_pk × k, A cols, B cols]`; A's PK col j sits at `k + j`, B's at
+    // `k + left_n + j`. Targets all 0 (self-derive — each slot keeps its source PK
+    // type, no cross-side promotion).
+    let mut union_cols: Vec<ColumnDef> = Vec::with_capacity(k + left_n + right_n);
+    for (i, &t) in all_tcs.iter().enumerate() {
+        union_cols.push(ColumnDef {
+            name: format!("_join_pk_{i}"), type_code: TypeCode::from_validated_u8(t),
+            is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+        });
+    }
+    for col in &left_schema.columns  { union_cols.push(col.clone()); }
+    for col in &right_schema.columns { union_cols.push(col.clone()); }
+    let union_schema = Schema { columns: union_cols, pk_cols: (0..k).collect() };
+
+    let mut pair_pk_cols: Vec<usize> = Vec::with_capacity(pair_pk);
+    for &a_pk in &left_schema.pk_cols  { pair_pk_cols.push(k + a_pk); }
+    for &b_pk in &right_schema.pk_cols { pair_pk_cols.push(k + left_n + b_pk); }
+    let zero_tcs = vec![0u8; pair_pk];
+    let rekey = cb.map_reindex(merged, &pair_pk_cols, &zero_tcs, build_reindex_program(&union_schema));
+
+    // Re-key output layout: `[_pair_pk × pair_pk (PK), _join_pk × k, A cols, B cols]`.
+    // The user projection drops the k `_join_pk` slots (they DIFFER per term and
+    // must not survive into the exchanged/consolidated output) and selects user
+    // columns from A/B. A/B columns start at this payload offset.
+    let payload_offset = pair_pk + k;
+    let combined_coldef = |idx: usize| -> ColumnDef {
+        if idx < left_n { left_schema.columns[idx].clone() }
+        else { right_schema.columns[idx - left_n].clone() }
+    };
+
+    // Leading output PK columns: A's then B's source-PK column types (the re-key
+    // self-derive output type), non-nullable, `_pair_pk_{slot}` numbered across
+    // both sides.
+    let pair_pk_coldefs: Vec<ColumnDef> = left_schema.pk_cols.iter().map(|&c| (left_schema, c))
+        .chain(right_schema.pk_cols.iter().map(|&c| (right_schema, c)))
+        .enumerate()
+        .map(|(slot, (schema, c))| ColumnDef {
+            name: format!("_pair_pk_{slot}"),
+            type_code: schema.columns[c].type_code.reindex_output_type(),
+            is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+        })
+        .collect();
+
+    // User projection via the shared helper. Always applied (it must drop the
+    // `_join_pk` slots, which DIFFER per term); keeps the pair-PK region and
+    // selects user columns from A/B as the payload.
+    let is_wildcard = select.projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_)));
+    let (final_cols, final_projection) = build_join_view_projection(
+        &select.projection, alias_map, &pair_pk_coldefs, left_n + right_n, payload_offset,
+        combined_coldef, "range JOIN view",
+    )?;
+
+    let projected = cb.map(rekey, &final_projection);
+    // ExchangeShard on EXACTLY the pair-PK columns in order — must equal view_pk,
+    // so the GroupKey scatter routes by `partition_for_pk_bytes` identically to
+    // the view scan/seek (the compound-key alignment invariant).
+    let pair_pk_idxs: Vec<usize> = (0..pair_pk).collect();
+    let sharded = cb.shard(projected, &pair_pk_idxs);
+    cb.sink(sharded);
+    let circuit = cb.build();
+
+    let view_pk: Vec<u32> = (0..pair_pk as u32).collect();
+    debug_assert_eq!(pair_pk_idxs, view_pk.iter().map(|&c| c as usize).collect::<Vec<_>>(),
+        "range join: ExchangeShard cols must equal view_pk in strict order");
+    if !is_wildcard {
+        reject_duplicate_column_names(
+            final_cols.iter().map(|c| c.name.as_str()), "range join view")?;
+    }
+    client.create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols, &view_pk)
+        .map_err(GnitzSqlError::Exec)?;
+
+    Ok(SqlResult::ViewCreated { view_id })
+}
+
+/// Build a join view's user projection: the leading PK columns followed by the
+/// selected payload columns, plus the parallel union-column index list the
+/// output `Map` projects. Shared by the equi (`execute_create_join_view`) and
+/// range (`build_range_join_view`) builders, which differ only in their PK region
+/// and where the A‖B payload columns sit in the union layout:
+///   - `leading_cols`: the synthesized PK columns, cloned verbatim into the output
+///     schema (`_join_pk` slots for equi, `_pair_pk` slots for range).
+///   - `coldef(i)`: maps a combined A‖B column index (`0..n_combined`) to its
+///     output `ColumnDef` (equi reads the pre-built, LEFT-join-nullable-adjusted
+///     list; range reads the raw source schemas — INNER only).
+///   - `payload_offset`: the union-column index of combined column 0.
+///
+/// A lone `SELECT *` flows through the `Wildcard` arm, so neither caller needs a
+/// separate wildcard fast path. `label` names the view kind in error messages.
+fn build_join_view_projection(
+    projection:     &[SelectItem],
+    alias_map:      &JoinAliasMap,
+    leading_cols:   &[ColumnDef],
+    n_combined:     usize,
+    payload_offset: usize,
+    coldef:         impl Fn(usize) -> ColumnDef,
+    label:          &str,
+) -> Result<(Vec<ColumnDef>, Vec<usize>), GnitzSqlError> {
+    let mut cols: Vec<ColumnDef> = leading_cols.to_vec();
+    let mut proj: Vec<usize> = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                let idx = resolve_unqualified_column(&ident.value, alias_map)?;
+                cols.push(coldef(idx));
+                proj.push(payload_offset + idx);
+            }
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
+                let idx = resolve_qualified_column(&parts[0].value, &parts[1].value, alias_map)?;
+                cols.push(coldef(idx));
+                proj.push(payload_offset + idx);
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let idx = match expr {
+                    Expr::Identifier(ident) =>
+                        resolve_unqualified_column(&ident.value, alias_map)?,
+                    Expr::CompoundIdentifier(parts) if parts.len() == 2 =>
+                        resolve_qualified_column(&parts[0].value, &parts[1].value, alias_map)?,
+                    _ => return Err(GnitzSqlError::Unsupported(
+                        format!("{label}: only column references supported in AS clause"))),
+                };
+                let mut col = coldef(idx);
+                col.name = alias.value.clone();
+                cols.push(col);
+                proj.push(payload_offset + idx);
+            }
+            SelectItem::Wildcard(_) => {
+                for i in 0..n_combined {
+                    cols.push(coldef(i));
+                    proj.push(payload_offset + i);
+                }
+            }
+            _ => return Err(GnitzSqlError::Unsupported(
+                format!("unsupported SELECT item in {label}"))),
+        }
+    }
+    Ok((cols, proj))
+}
+
 /// Multi-column NULL predicate for a Filter over a composite equijoin key,
 /// reusing the WHERE-clause bound-expr → ExprProgram path so each column index
 /// maps to its payload byte. A composite key is NULL — and matches nothing
@@ -1360,7 +1584,7 @@ fn execute_create_join_view(
 ///                       `c0 IS NULL OR … OR ck IS NULL`.
 /// The two are exact De Morgan complements, so the LEFT-join match/bypass split
 /// partitions the preserved side with no gap and no double-count. `cols` is
-/// non-empty (k ≥ 1 is guaranteed by extract_equijoin_keys). At k = 1 this emits
+/// non-empty (k ≥ 1 is guaranteed by extract_join_predicates). At k = 1 this emits
 /// exactly the single-column IsNotNull/IsNull program, so existing single-key
 /// plans are byte-identical.
 fn multi_null_filter_prog(
@@ -1466,47 +1690,110 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, Gni
             left.name, left.type_code, right.name, right.type_code)))
 }
 
-/// Per-position-paired equijoin key columns plus the per-pair common reindex
-/// output type: `(left_cols, right_cols, target_tcs)`.
-type EquijoinKeys = (Vec<usize>, Vec<usize>, Vec<u8>);
+/// Validate the range conjunct's key pair and return its common reindex output
+/// type `T`. A range bound must be order-preserving: STRING/BLOB reindex to a
+/// 16-byte content hash that is equality-correct but NOT order-preserving, so
+/// they are rejected here (they remain legal in the equality prefix). Floats are
+/// rejected by `validate_join_key_pair`, which then resolves the common integer
+/// type via `join_key_common_type` (cross-sign promotion included).
+fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, GnitzSqlError> {
+    for col in [left, right] {
+        if col.type_code.is_german_string() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "range join key column '{}' ({:?}): a string/blob content hash is not \
+                 order-preserving and cannot bound a range conjunct",
+                col.name, col.type_code)));
+        }
+    }
+    validate_join_key_pair(left, right)
+}
+
+/// Map a SQL comparison operator to its `RangeRel`, or `None` for a non-range
+/// operator (`=`, `AND`, arithmetic, …).
+fn sql_binop_to_range_rel(op: &BinaryOperator) -> Option<RangeRel> {
+    match op {
+        BinaryOperator::Lt   => Some(RangeRel::Lt),
+        BinaryOperator::LtEq => Some(RangeRel::Le),
+        BinaryOperator::Gt   => Some(RangeRel::Gt),
+        BinaryOperator::GtEq => Some(RangeRel::Ge),
+        _ => None,
+    }
+}
+
+/// The order-reversing converse of a `RangeRel` (`x OP y` ⟺ `y converse(OP) x`).
+/// Used both to canonicalize a right-table-first range conjunct to left-first and
+/// to derive term AB's rel from the canonical OP (§3 table).
+fn converse_rel(r: RangeRel) -> RangeRel {
+    match r {
+        RangeRel::Lt => RangeRel::Gt,
+        RangeRel::Le => RangeRel::Ge,
+        RangeRel::Gt => RangeRel::Lt,
+        RangeRel::Ge => RangeRel::Le,
+    }
+}
+
+/// The single range conjunct of a band/range join, canonicalized to
+/// `left_col OP right_col` (both table-relative). `op` is the canonical OP as a
+/// `RangeRel`; `tc` is the pair's common reindex output type.
+#[derive(Debug)]
+struct RangeConjunct {
+    left_col:  usize,
+    right_col: usize,
+    op:        RangeRel,
+    tc:        u8,
+}
+
+/// The full ON-clause classification: per-position-paired equality-prefix key
+/// columns (`left_cols`, `right_cols`) with their per-pair common reindex output
+/// type (`target_tcs`), plus an optional single range conjunct.
+type JoinPredicates = (Vec<usize>, Vec<usize>, Vec<u8>, Option<RangeConjunct>);
 
 /// Alias map for JOIN column resolution: alias/name → (table_id, schema,
 /// global column offset). `Rc<Schema>` so the per-side schemas resolved by the
 /// binder are shared, not deep-cloned, into the map.
 type JoinAliasMap = HashMap<String, (u64, Rc<Schema>, usize)>;
 
-/// Extract the ordered list of equijoin key columns from an ON expression.
-/// Returns (left_cols, right_cols, target_tcs), per-table-relative, paired by
-/// position; `target_tcs[i]` is the pair's common reindex output type `T`.
-fn extract_equijoin_keys(
+/// Classify a JOIN ON clause into its equality-prefix pairs and an optional
+/// single range conjunct. A pure superset of the old equi-only extraction: with
+/// zero range conjuncts the equality pairs (and therefore the equi circuit and
+/// its serialization) are byte-for-byte unchanged. Returns
+/// `(left_eq, right_eq, eq_tcs, range)`, all table-relative and position-paired.
+fn extract_join_predicates(
     on_expr:      &Expr,
     left_schema:  &Schema,
     right_schema: &Schema,
     alias_map:    &JoinAliasMap,
-) -> Result<EquijoinKeys, GnitzSqlError> {
+) -> Result<JoinPredicates, GnitzSqlError> {
     let mut left_cols  = Vec::new();
     let mut right_cols = Vec::new();
     let mut target_tcs = Vec::new();
-    collect_equijoin_keys(on_expr, left_schema, right_schema, alias_map,
-                          &mut left_cols, &mut right_cols, &mut target_tcs)?;
-    if left_cols.is_empty() {
+    let mut range: Option<RangeConjunct> = None;
+    collect_join_predicates(on_expr, left_schema, right_schema, alias_map,
+                            &mut left_cols, &mut right_cols, &mut target_tcs, &mut range)?;
+    if left_cols.is_empty() && range.is_none() {
         return Err(GnitzSqlError::Bind(
-            "JOIN ON must have at least one equijoin predicate".into()));
+            "JOIN ON must have at least one equijoin or range predicate".into()));
     }
-    // Each equijoin key column becomes one synthetic `_join_pk` output PK slot,
-    // persisted through the PK-list codec, which holds at most PK_LIST_MAX_COLS
-    // columns — the same cap CREATE TABLE enforces. Reject a wider ON conjunction
-    // here as a clean planner error rather than a `pack_pk_cols` panic at
-    // registration.
-    if left_cols.len() > gnitz_core::PK_LIST_MAX_COLS {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "JOIN ON: at most {} equijoin key columns are supported (got {})",
-            gnitz_core::PK_LIST_MAX_COLS, left_cols.len())));
+    // Reindex-slot arity cap: each equality pair plus the optional range slot
+    // becomes one synthetic `_join_pk` PK-list slot, and the codec holds at most
+    // PK_LIST_MAX_COLS. Reject a wider ON here as a clean planner error rather than
+    // a `pack_pk_cols` panic at registration. (The output pair-PK has its own cap,
+    // checked in the range circuit builder.)
+    let slots = left_cols.len() + range.is_some() as usize;
+    if slots > gnitz_core::PK_LIST_MAX_COLS {
+        return Err(GnitzSqlError::Unsupported(if range.is_none() {
+            format!("JOIN ON: at most {} equijoin key columns are supported (got {})",
+                gnitz_core::PK_LIST_MAX_COLS, left_cols.len())
+        } else {
+            format!("range JOIN ON: at most {} join key columns (equality prefix + \
+                     range) are supported (got {})", gnitz_core::PK_LIST_MAX_COLS, slots)
+        }));
     }
-    Ok((left_cols, right_cols, target_tcs))
+    Ok((left_cols, right_cols, target_tcs, range))
 }
 
-fn collect_equijoin_keys(
+#[allow(clippy::too_many_arguments)]
+fn collect_join_predicates(
     expr:         &Expr,
     left_schema:  &Schema,
     right_schema: &Schema,
@@ -1514,52 +1801,84 @@ fn collect_equijoin_keys(
     left_cols:    &mut Vec<usize>,
     right_cols:   &mut Vec<usize>,
     target_tcs:   &mut Vec<u8>,
+    range:        &mut Option<RangeConjunct>,
 ) -> Result<(), GnitzSqlError> {
+    // The one-range-conjunct rule, named in the rejection of anything that is not
+    // an AND of column equijoins plus at most one column range conjunct.
+    let unsupported = || GnitzSqlError::Unsupported(
+        "JOIN ON: only an AND-conjunction of column equijoins plus at most one \
+         range conjunct (<, <=, >, >=) between the two tables is supported".into());
     match expr {
         // Parentheses: `ON (a.x = b.x) AND a.y = b.y`, `ON (a.x = b.x AND a.y = b.y)`.
         // sqlparser wraps a parenthesized sub-expression in Expr::Nested; unwrap it
-        // so grouping never changes which equijoins are extracted. This mirrors the
+        // so grouping never changes which predicates are extracted. This mirrors the
         // WHERE binder (`binder.rs` Expr::Nested arm) and the HAVING path
-        // (`bind_having_expr`), both of which already unwrap Nested — the JOIN ON
-        // predicate path was the lone gap among the predicate binders. (The view
-        // *output* projection is a separate path and is not covered here.)
+        // (`bind_having_expr`), both of which already unwrap Nested.
         Expr::Nested(inner) => {
-            collect_equijoin_keys(inner, left_schema, right_schema, alias_map, left_cols, right_cols, target_tcs)?;
+            collect_join_predicates(inner, left_schema, right_schema, alias_map,
+                                    left_cols, right_cols, target_tcs, range)?;
         }
-        Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::And, right } => {
-            collect_equijoin_keys(left,  left_schema, right_schema, alias_map, left_cols, right_cols, target_tcs)?;
-            collect_equijoin_keys(right, left_schema, right_schema, alias_map, left_cols, right_cols, target_tcs)?;
-        }
-        Expr::BinaryOp { left, op: sqlparser::ast::BinaryOperator::Eq, right } => {
-            let l = resolve_join_col_ref(left,  alias_map)?;  // global index
-            let r = resolve_join_col_ref(right, alias_map)?;  // global index
-            let left_n = left_schema.columns.len();
-            let (li, ri) = if l < left_n && r >= left_n {
-                (l, r - left_n)
-            } else if r < left_n && l >= left_n {
-                (r, l - left_n)
-            } else {
-                return Err(GnitzSqlError::Bind(
-                    "JOIN ON: each side of = must reference a different table".into()));
-            };
-            // Drop an exact-duplicate pair (`a.x = b.x AND a.x = b.x`, or the same
-            // pair written with the sides swapped, `a.x = b.x AND b.x = a.x`). Both
-            // produce byte-identical key slots; keeping them only widens the
-            // synthetic PK and can spuriously trip the arity cap. A pair that shares
-            // one column but not the other (`a.x = b.x AND a.x = b.y`) is a distinct
-            // constraint — different `ri` — and is kept.
-            if left_cols.iter().zip(right_cols.iter()).any(|(&pl, &pr)| pl == li && pr == ri) {
-                return Ok(());
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                collect_join_predicates(left,  left_schema, right_schema, alias_map,
+                                        left_cols, right_cols, target_tcs, range)?;
+                collect_join_predicates(right, left_schema, right_schema, alias_map,
+                                        left_cols, right_cols, target_tcs, range)?;
             }
-            // Push T only on the same path that pushes (li, ri) — after the dup
-            // early-return — so the three vectors stay parallel.
-            let t = validate_join_key_pair(&left_schema.columns[li], &right_schema.columns[ri])?;
-            left_cols.push(li);
-            right_cols.push(ri);
-            target_tcs.push(t);
-        }
-        _ => return Err(GnitzSqlError::Unsupported(
-            "JOIN ON: only an AND-conjunction of column equijoins is supported".into())),
+            BinaryOperator::Eq => {
+                let l = resolve_join_col_ref(left,  alias_map)?;  // global index
+                let r = resolve_join_col_ref(right, alias_map)?;  // global index
+                let left_n = left_schema.columns.len();
+                let (li, ri) = if l < left_n && r >= left_n {
+                    (l, r - left_n)
+                } else if r < left_n && l >= left_n {
+                    (r, l - left_n)
+                } else {
+                    return Err(GnitzSqlError::Bind(
+                        "JOIN ON: each side of = must reference a different table".into()));
+                };
+                // Drop an exact-duplicate pair (`a.x = b.x AND a.x = b.x`, or the
+                // same pair with the sides swapped). Both produce byte-identical key
+                // slots; keeping them only widens the synthetic PK and can spuriously
+                // trip the arity cap. A pair sharing one column but not the other
+                // (`a.x = b.x AND a.x = b.y`) is distinct — different `ri` — and kept.
+                if left_cols.iter().zip(right_cols.iter()).any(|(&pl, &pr)| pl == li && pr == ri) {
+                    return Ok(());
+                }
+                // Push T only on the same path that pushes (li, ri) — after the dup
+                // early-return — so the three vectors stay parallel.
+                let t = validate_join_key_pair(&left_schema.columns[li], &right_schema.columns[ri])?;
+                left_cols.push(li);
+                right_cols.push(ri);
+                target_tcs.push(t);
+            }
+            _ => {
+                // Range conjunct (`<`, `<=`, `>`, `>=`) — exactly one allowed.
+                let Some(rel) = sql_binop_to_range_rel(op) else { return Err(unsupported()); };
+                let l = resolve_join_col_ref(left,  alias_map)?;
+                let r = resolve_join_col_ref(right, alias_map)?;
+                let left_n = left_schema.columns.len();
+                // Canonicalize to `left_col OP right_col`: if the right table's
+                // column is the LEFT operand (`b.y > a.x`), swap operands and take
+                // the converse operator (`a.x < b.y`).
+                let (li, ri, canon_op) = if l < left_n && r >= left_n {
+                    (l, r - left_n, rel)
+                } else if r < left_n && l >= left_n {
+                    (r, l - left_n, converse_rel(rel))
+                } else {
+                    return Err(GnitzSqlError::Bind(
+                        "JOIN ON: each side of a range comparison must reference a different table".into()));
+                };
+                if range.is_some() {
+                    return Err(GnitzSqlError::Unsupported(
+                        "JOIN ON: at most one range conjunct (<, <=, >, >=) is supported".into()));
+                }
+                let t = validate_range_join_key_pair(
+                    &left_schema.columns[li], &right_schema.columns[ri])?;
+                *range = Some(RangeConjunct { left_col: li, right_col: ri, op: canon_op, tc: t });
+            }
+        },
+        _ => return Err(unsupported()),
     }
     Ok(())
 }
@@ -2671,7 +2990,7 @@ mod tests {
 
     // ── Multi-column equijoin key extraction / validation ────────────────────
     //
-    // These exercise the k ≥ 2 logic directly: extract_equijoin_keys and
+    // These exercise the k ≥ 2 logic directly: extract_join_predicates and
     // validate_join_key_pair return their result *before* the `k > 1` planner
     // gate in execute_create_join_view, so a composite key is fully testable
     // here even though CREATE VIEW still rejects it end-to-end.
@@ -2711,18 +3030,35 @@ mod tests {
         right: Vec<ColumnDef>,
     ) -> Result<(Vec<usize>, Vec<usize>), GnitzSqlError> {
         let (ls, rs, am) = join_ctx(left, right);
-        extract_equijoin_keys(&parse_on(on), &ls, &rs, &am).map(|(l, r, _)| (l, r))
+        extract_join_predicates(&parse_on(on), &ls, &rs, &am).map(|(l, r, _, _)| (l, r))
     }
 
+    /// The equi-join half of `JoinPredicates` (no range conjunct): paired key
+    /// columns + per-pair common reindex type. Named for legible helper returns.
+    type EquiKeys = (Vec<usize>, Vec<usize>, Vec<u8>);
+
     /// Like `extract` but also returns the per-pair common reindex output type
-    /// `T`, for cross-width promotion assertions.
+    /// `T`, for cross-width promotion assertions. Asserts no range conjunct.
     fn extract_with_tcs(
         on: &str,
         left:  Vec<ColumnDef>,
         right: Vec<ColumnDef>,
-    ) -> Result<super::EquijoinKeys, GnitzSqlError> {
+    ) -> Result<EquiKeys, GnitzSqlError> {
         let (ls, rs, am) = join_ctx(left, right);
-        extract_equijoin_keys(&parse_on(on), &ls, &rs, &am)
+        extract_join_predicates(&parse_on(on), &ls, &rs, &am).map(|(l, r, t, range)| {
+            assert!(range.is_none(), "expected no range conjunct");
+            (l, r, t)
+        })
+    }
+
+    /// Full classification including the optional range conjunct.
+    fn extract_full(
+        on: &str,
+        left:  Vec<ColumnDef>,
+        right: Vec<ColumnDef>,
+    ) -> Result<JoinPredicates, GnitzSqlError> {
+        let (ls, rs, am) = join_ctx(left, right);
+        extract_join_predicates(&parse_on(on), &ls, &rs, &am)
     }
 
     fn two_u64() -> Vec<ColumnDef> {
@@ -2790,8 +3126,11 @@ mod tests {
         // Both refs on the same table → Bind.
         assert!(matches!(extract("a.x = a.y", two_u64(), two_u64()).unwrap_err(),
                          GnitzSqlError::Bind(_)));
-        // Non-Eq / non-And operator → Unsupported.
-        assert!(matches!(extract("a.x < b.x", two_u64(), two_u64()).unwrap_err(),
+        // A non-eq, non-and, non-range operator (`<>`) → Unsupported.
+        assert!(matches!(extract("a.x <> b.x", two_u64(), two_u64()).unwrap_err(),
+                         GnitzSqlError::Unsupported(_)));
+        // OR is not an AND-conjunction → Unsupported.
+        assert!(matches!(extract("a.x = b.x OR a.y = b.y", two_u64(), two_u64()).unwrap_err(),
                          GnitzSqlError::Unsupported(_)));
     }
 
@@ -2907,5 +3246,93 @@ mod tests {
         // k ≥ 2: a multi-leaf And for want_null=false, a multi-leaf Or for true.
         multi_null_filter_prog(&[0, 1, 2], &schema, false).unwrap();
         multi_null_filter_prog(&[0, 1, 2], &schema, true).unwrap();
+    }
+
+    // ── Range / band join extraction ─────────────────────────────────────────
+
+    /// An equi-only ON yields no range conjunct (the pure superset property — the
+    /// equi path is byte-identical because nothing about its inputs changed).
+    #[test]
+    fn extract_equi_only_has_no_range() {
+        let (_, _, _, range) = extract_full("a.x = b.x AND a.y = b.y", two_u64(), two_u64()).unwrap();
+        assert!(range.is_none());
+    }
+
+    /// The §3 rel mapping for all four operators in BOTH operand orders. The
+    /// canonical form is always `left_col OP right_col`; a right-table-first
+    /// conjunct flips the operator to its converse.
+    #[test]
+    fn range_rel_mapping_both_operand_orders() {
+        // (ON clause, canonical op, left_col, right_col). two_u64 = [x=0, y=1].
+        let cases: &[(&str, RangeRel)] = &[
+            ("a.x < b.y",  RangeRel::Lt),
+            ("a.x <= b.y", RangeRel::Le),
+            ("a.x > b.y",  RangeRel::Gt),
+            ("a.x >= b.y", RangeRel::Ge),
+            // Right-table-first: `b.y > a.x` ⟺ `a.x < b.y`, etc.
+            ("b.y > a.x",  RangeRel::Lt),
+            ("b.y >= a.x", RangeRel::Le),
+            ("b.y < a.x",  RangeRel::Gt),
+            ("b.y <= a.x", RangeRel::Ge),
+        ];
+        for (on, want_op) in cases {
+            let (eq_l, _, _, range) = extract_full(on, two_u64(), two_u64()).unwrap();
+            assert!(eq_l.is_empty(), "{on}: pure range join has no eq prefix");
+            let rc = range.unwrap_or_else(|| panic!("{on}: expected a range conjunct"));
+            assert_eq!(rc.op, *want_op, "{on}");
+            assert_eq!((rc.left_col, rc.right_col), (0, 1), "{on}: canonicalized to a.x / b.y");
+        }
+    }
+
+    /// A band join (equality prefix + one range conjunct): the eq pair and the
+    /// range conjunct are both extracted.
+    #[test]
+    fn extract_band_join_eq_prefix_plus_range() {
+        // a.k = b.k AND a.lo <= b.t. cols: a=[k=0, lo=1], b=[k=0, t=1].
+        let (eq_l, eq_r, eq_tcs, range) =
+            extract_full("a.x = b.x AND a.y <= b.y", two_u64(), two_u64()).unwrap();
+        assert_eq!((eq_l, eq_r), (vec![0], vec![0]));
+        assert_eq!(eq_tcs, vec![TypeCode::U64 as u8]);
+        let rc = range.expect("range conjunct");
+        assert_eq!((rc.left_col, rc.right_col, rc.op), (1, 1, RangeRel::Le));
+    }
+
+    /// Rejections at extraction: two range conjuncts, OR, and a string/blob range
+    /// pair (the content hash is not order-preserving).
+    #[test]
+    fn range_extraction_rejections() {
+        // Two range conjuncts → Unsupported.
+        assert!(matches!(
+            extract_full("a.x < b.x AND a.y < b.y", two_u64(), two_u64()).unwrap_err(),
+            GnitzSqlError::Unsupported(_)));
+        // String range pair → Unsupported (not order-preserving).
+        let s = vec![col("x", TypeCode::String, false), col("y", TypeCode::String, false)];
+        assert!(matches!(
+            extract_full("a.x < b.x", s.clone(), s).unwrap_err(),
+            GnitzSqlError::Unsupported(_)));
+        // BLOB range pair → Unsupported.
+        let bl = vec![col("x", TypeCode::Blob, false), col("y", TypeCode::Blob, false)];
+        assert!(matches!(
+            extract_full("a.x > b.x", bl.clone(), bl).unwrap_err(),
+            GnitzSqlError::Unsupported(_)));
+        // Float range pair → Unsupported (via validate_join_key_pair).
+        let f = vec![col("x", TypeCode::F64, false), col("y", TypeCode::F64, false)];
+        assert!(matches!(
+            extract_full("a.x < b.x", f.clone(), f).unwrap_err(),
+            GnitzSqlError::Unsupported(_)));
+        // Both range operands on the same table → Bind.
+        assert!(matches!(
+            extract_full("a.x < a.y", two_u64(), two_u64()).unwrap_err(),
+            GnitzSqlError::Bind(_)));
+    }
+
+    /// A signed range pair via cross-sign promotion resolves to the common type
+    /// (U32 vs I64 → I64), the same ladder the equi path uses.
+    #[test]
+    fn range_pair_cross_sign_promotes() {
+        let l = vec![col("id", TypeCode::U64, false), col("x", TypeCode::U32, false)];
+        let r = vec![col("id", TypeCode::U64, false), col("y", TypeCode::I64, false)];
+        let (_, _, _, range) = extract_full("a.x < b.y", l, r).unwrap();
+        assert_eq!(range.unwrap().tc, TypeCode::I64 as u8);
     }
 }

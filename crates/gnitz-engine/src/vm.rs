@@ -29,6 +29,11 @@ pub enum Instr {
     JoinDT { delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema_idx: u16 },
     JoinDD { a_reg: u16, b_reg: u16, out_reg: u16, right_schema_idx: u16 },
     JoinDTOuter { delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema_idx: u16 },
+    JoinDTRange {
+        delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema_idx: u16,
+        n_eq: u8, rel: gnitz_wire::RangeRel,
+    },
+    PartitionFilter { in_reg: u16, out_reg: u16, worker_id: u32, num_workers: u32 },
     AntiJoinDT { delta_reg: u16, trace_reg: u16, out_reg: u16 },
     AntiJoinDD { a_reg: u16, b_reg: u16, out_reg: u16 },
     SemiJoinDT { delta_reg: u16, trace_reg: u16, out_reg: u16 },
@@ -262,6 +267,21 @@ impl ProgramBuilder {
     pub fn add_join_dt_outer(&mut self, delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {
         let right_schema_idx = self.schema_idx(right_schema);
         self.instructions.push(Instr::JoinDTOuter { delta_reg, trace_reg, out_reg, right_schema_idx });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_join_dt_range(
+        &mut self, delta_reg: u16, trace_reg: u16, out_reg: u16,
+        right_schema: SchemaDescriptor, n_eq: u8, rel: gnitz_wire::RangeRel,
+    ) {
+        let right_schema_idx = self.schema_idx(right_schema);
+        self.instructions.push(Instr::JoinDTRange {
+            delta_reg, trace_reg, out_reg, right_schema_idx, n_eq, rel,
+        });
+    }
+
+    pub fn add_partition_filter(&mut self, in_reg: u16, out_reg: u16, worker_id: u32, num_workers: u32) {
+        self.instructions.push(Instr::PartitionFilter { in_reg, out_reg, worker_id, num_workers });
     }
 
     pub fn add_anti_join_dt(&mut self, delta_reg: u16, trace_reg: u16, out_reg: u16) {
@@ -977,6 +997,28 @@ pub fn execute_epoch_multi(
                     let result = ops::op_null_extend(consolidated, &left_schema, right_schema);
                     reg_mut!(*out_reg).batch = result;
                 }
+            }
+
+            Instr::JoinDTRange { delta_reg, trace_reg, out_reg, right_schema_idx, n_eq, rel } => {
+                let left_schema = reg!(*delta_reg).schema;
+                let right_schema = &program.schemas[*right_schema_idx as usize];
+                if let Some(cursor) = cursor_mut!(*trace_reg) {
+                    let result = ops::op_join_delta_trace_range(
+                        &reg!(*delta_reg).batch, cursor, &left_schema, right_schema,
+                        *n_eq as usize, *rel,
+                    );
+                    reg_mut!(*out_reg).batch = result;
+                }
+                // Absent trace ⟹ empty arrangement on the other side ⟹ no matches;
+                // out_reg keeps whatever it held (an empty batch), like JoinDT.
+            }
+
+            Instr::PartitionFilter { in_reg, out_reg, worker_id, num_workers } => {
+                let schema = reg!(*in_reg).schema;
+                let result = ops::op_partition_filter(
+                    &reg!(*in_reg).batch, &schema, *worker_id, *num_workers,
+                );
+                reg_mut!(*out_reg).batch = result;
             }
 
             Instr::AntiJoinDT { delta_reg, trace_reg, out_reg } => {

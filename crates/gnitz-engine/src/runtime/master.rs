@@ -32,7 +32,8 @@ use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
 use crate::storage::{Batch, ConsolidatedBatch, partition_for_pk_bytes, PkBuf};
 use crate::ops::{
-    PartitionRouter, RouteMode, op_repartition_batches_mode, op_relay_scatter_consolidated_mode,
+    PartitionRouter, RouteMode, op_relay_broadcast,
+    op_repartition_batches_mode, op_relay_scatter_consolidated_mode,
     worker_for_partition, with_worker_indices,
 };
 
@@ -755,23 +756,36 @@ impl MasterDispatcher {
             (cat.dag.get_shard_cols(view_id), Vec::new(), false)
         };
 
-        let col_indices: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
-
-        let consolidated_sources: Option<Vec<Option<&ConsolidatedBatch>>> = payloads.iter()
-            .map(|opt| match opt {
-                None => Some(None),
-                Some(b) => ConsolidatedBatch::from_batch_ref(b).map(Some),
-            })
-            .collect();
-
-        let mode = if is_join { RouteMode::JoinPromote } else { RouteMode::GroupKey };
-        let dest_batches = match consolidated_sources {
-            Some(sources) => {
-                op_relay_scatter_consolidated_mode(&sources, &col_indices, &target_tcs, &schema, self.num_workers, mode)
-            }
-            None => {
-                let sources: Vec<Option<&Batch>> = payloads.iter().map(|opt| opt.as_ref()).collect();
-                op_repartition_batches_mode(&sources, &col_indices, &target_tcs, &schema, self.num_workers, mode)
+        // A range-join input relay (source_id > 0) must BROADCAST the full delta to
+        // every worker: a range probe's matches are spread over the whole key
+        // space, so the equality scatter — one destination per row — would strand
+        // most matches. Each worker integrates only its owned slice (PartitionFilter)
+        // and probes that slice, so every match is still emitted exactly once
+        // cluster-wide. The output relay (source_id == 0) is NOT a range-join input
+        // relay (is_join is false there) and keeps the GroupKey scatter.
+        let dest_batches = if is_join && cat.dag.view_is_range_join(view_id) {
+            let sources: Vec<Option<&Batch>> = payloads.iter().map(|opt| opt.as_ref()).collect();
+            op_relay_broadcast(&sources, &schema, self.num_workers)
+        } else {
+            // Equality scatter: route each row to the worker owning its key
+            // partition. The shard cols / consolidation are built here, where used —
+            // the broadcast arm above needs none of them.
+            let col_indices: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
+            let mode = if is_join { RouteMode::JoinPromote } else { RouteMode::GroupKey };
+            let consolidated_sources: Option<Vec<Option<&ConsolidatedBatch>>> = payloads.iter()
+                .map(|opt| match opt {
+                    None => Some(None),
+                    Some(b) => ConsolidatedBatch::from_batch_ref(b).map(Some),
+                })
+                .collect();
+            match consolidated_sources {
+                Some(sources) => {
+                    op_relay_scatter_consolidated_mode(&sources, &col_indices, &target_tcs, &schema, self.num_workers, mode)
+                }
+                None => {
+                    let sources: Vec<Option<&Batch>> = payloads.iter().map(|opt| opt.as_ref()).collect();
+                    op_repartition_batches_mode(&sources, &col_indices, &target_tcs, &schema, self.num_workers, mode)
+                }
             }
         };
 

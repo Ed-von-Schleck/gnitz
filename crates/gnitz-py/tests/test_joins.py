@@ -219,8 +219,10 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
 
-    def test_join_non_equi_rejects(self, client):
-        """Non-equi join condition should be rejected."""
+    def test_join_non_equi_range_accepted(self, client):
+        """A non-equi (range) join condition is now supported: it compiles to a
+        DeltaTraceRange join whose output PK is the source-PK pair (t1.id, t2.id).
+        (See tests/test_workers.py::TestRangeJoin for full distributed coverage.)"""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -232,11 +234,20 @@ class TestJoins:
                 "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)",
                 schema_name=sn,
             )
-            with pytest.raises(Exception):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT * FROM t1 JOIN t2 ON t1.a < t2.b",
-                    schema_name=sn,
-                )
+            # Previously rejected; now a valid pure range join.
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT t1.a AS a, t2.b AS b FROM t1 JOIN t2 ON t1.a < t2.b",
+                schema_name=sn,
+            )
+            t1 = [(1, 10), (2, 30), (3, 50)]   # (id, a)
+            t2 = [(1, 20), (2, 40)]            # (id, b)
+            client.execute_sql("INSERT INTO t1 VALUES " + ",".join(f"({i},{a})" for i, a in t1), schema_name=sn)
+            client.execute_sql("INSERT INTO t2 VALUES " + ",".join(f"({i},{b})" for i, b in t2), schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            # The view's pair-PK columns (r[0], r[1]) = (t1.id, t2.id).
+            pairs = {(r[0], r[1]) for r in client.scan(vid) if r.weight > 0}
+            want = {(ai, bi) for (ai, a) in t1 for (bi, b) in t2 if a < b}
+            assert pairs == want, f"range join: got {pairs}, want {want}"
         finally:
             _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
 

@@ -22,14 +22,29 @@ use crate::vm::{ProgramBuilder, VmHandle};
 /// spill entirely could revisit it.
 pub static WORKER_RANK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Set the calling process's worker rank. Called post-fork before any view is
-/// compiled, so the scratch tables a worker opens carry its own rank.
-pub fn set_worker_rank(rank: u32) {
+/// Sibling of `WORKER_RANK`: the worker count baked into this process's compiled
+/// plans. Set alongside the rank post-fork. Defaults to 1 (single process /
+/// unit tests), which makes `PartitionFilter` a keep-all identity and the
+/// broadcast input relay degenerate. `num_workers` is fixed for a process's
+/// lifetime, so a topology change is a restart-and-recompile, not a live
+/// plan-cache invalidation.
+pub static NUM_WORKERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// Set the calling process's worker rank and worker count. Called post-fork
+/// before any view is compiled, so the scratch tables a worker opens carry its
+/// own rank and its `PartitionFilter` nodes are emitted with this process's
+/// `(worker_id, num_workers)`.
+pub fn set_worker_rank(rank: u32, num_workers: u32) {
     WORKER_RANK.store(rank, std::sync::atomic::Ordering::Relaxed);
+    NUM_WORKERS.store(num_workers.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
-fn worker_rank() -> u32 {
+pub fn worker_rank() -> u32 {
     WORKER_RANK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn num_workers() -> u32 {
+    NUM_WORKERS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // Engine-only port aliases (all equal to wire constants).
@@ -521,6 +536,19 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
         }
     }
     seqs.into_iter().flatten().collect()
+}
+
+/// Whether a loaded meta-circuit is a non-equi (range) join — it has any
+/// `Join(DeltaTraceRange)` node. The precise range-join discriminator for the
+/// dag driver branch and the broadcast input relay. It is deliberately NOT
+/// `has_join_shard && has_exchange`: that predicate is also true for every
+/// GROUP BY / reduce / single-sided set-op view (a group reindex matches
+/// `reindex_cols_through_filters`, and the view has an output `ExchangeShard`),
+/// so keying on it would divert those views into the broadcast path and corrupt
+/// them. Shared by `DagEngine::view_is_range_join` and its unit test.
+pub(crate) fn circuit_is_range_join(loaded: &LoadedCircuit) -> bool {
+    loaded.nodes.values().any(|op|
+        matches!(op, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { .. })))
 }
 
 fn compute_join_shard_map(loaded: &LoadedCircuit) -> HashMap<i64, Vec<(i32, u8)>> {
@@ -1402,6 +1430,14 @@ fn emit_node(
                     reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema);
                     builder.add_join_dd(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
+                gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => {
+                    // Same output layout as the equi delta-trace join; only the
+                    // probe differs. `n_eq`/`rel` ride to the op so it can derive
+                    // the eq-prefix / range-slot split and the cut direction.
+                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema);
+                    builder.add_join_dt_range(
+                        a_reg as u16, b_reg as u16, reg_id as u16, b_schema, *n_eq, *rel);
+                }
             }
         }
 
@@ -1417,6 +1453,8 @@ fn emit_node(
                 gnitz_wire::JoinKind::DeltaDelta => {
                     builder.add_anti_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
+                gnitz_wire::JoinKind::DeltaTraceRange { .. } =>
+                    unreachable!("no anti-join range variant; planner rejects LEFT/anti + range"),
             }
         }
 
@@ -1432,6 +1470,8 @@ fn emit_node(
                 gnitz_wire::JoinKind::DeltaDelta => {
                     builder.add_semi_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
+                gnitz_wire::JoinKind::DeltaTraceRange { .. } =>
+                    unreachable!("no semi-join range variant; planner rejects semi + range"),
             }
         }
 
@@ -1463,6 +1503,18 @@ fn emit_node(
         }
 
         gnitz_wire::OpNode::ExchangeShard { .. } => {}
+
+        gnitz_wire::OpNode::PartitionFilter => {
+            // Pass-through schema; drops the rows this worker does not own before
+            // they reach `integrate_trace`. Worker identity is the compile-time
+            // `(worker_rank, num_workers)` of this process (default `(0, 1)` =
+            // keep-all for single-process / unit tests).
+            let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
+            reg_schemas[reg_id as usize] = reg_schemas[in_reg as usize];
+            reg_kinds[reg_id as usize] = 0;
+            builder.add_partition_filter(
+                in_reg as u16, reg_id as u16, worker_rank(), num_workers());
+        }
 
         gnitz_wire::OpNode::ExchangeGather => {
             if let Some(&in_reg) = in_regs.get(&PORT_IN) {
@@ -3724,6 +3776,73 @@ mod tests {
             vec![(1, 0)],
             "ScanDelta → Filter → Map(reindex) must map source 42 to col 1"
         );
+    }
+
+    #[test]
+    fn test_circuit_is_range_join_discriminator() {
+        use gnitz_wire::{AggKind, JoinKind, MapKind, OpNode};
+        let dummy_blob: Vec<u8> = vec![
+            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+
+        // A GROUP BY view: ScanDelta → Map(reindex) → ExchangeShard → Reduce →
+        // IntegrateSink. It has BOTH a reindex Map (has_join_shard) AND an
+        // ExchangeShard (has_exchange), so the wrong discriminator
+        // `has_join_shard && has_exchange` would (incorrectly) call it a range
+        // join. circuit_is_range_join must return false — no DeltaTraceRange node.
+        let mut gb = HashMap::new();
+        gb.insert(0, OpNode::ScanDelta(7));
+        gb.insert(1, OpNode::Map(MapKind::Expression {
+            program: dummy_blob.clone(), reindex_cols: vec![1], reindex_target_tcs: vec![],
+        }));
+        gb.insert(2, OpNode::ExchangeShard { shard_cols: vec![1] });
+        gb.insert(3, OpNode::Reduce { group_cols: vec![1], agg: AggKind::Null });
+        gb.insert(4, OpNode::IntegrateSink);
+        let gb_edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN), (3, 4, PORT_IN)];
+        let gb_loaded = make_loaded(gb, gb_edges);
+        assert!(!circuit_is_range_join(&gb_loaded),
+            "GROUP BY view must NOT be classified as a range join");
+
+        // A range join: a Join(DeltaTraceRange) node makes it true.
+        let mut rj = HashMap::new();
+        rj.insert(0, OpNode::ScanDelta(7));
+        rj.insert(1, OpNode::ScanTrace(8));
+        rj.insert(2, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 0, rel: gnitz_wire::RangeRel::Lt }));
+        rj.insert(3, OpNode::IntegrateSink);
+        let rj_edges = vec![(0, 2, PORT_IN_A), (1, 2, PORT_TRACE), (2, 3, PORT_IN)];
+        let rj_loaded = make_loaded(rj, rj_edges);
+        assert!(circuit_is_range_join(&rj_loaded),
+            "a Join(DeltaTraceRange) node must classify the view as a range join");
+    }
+
+    #[test]
+    fn test_reindex_cols_through_filters_with_partition_filter_after_map() {
+        use gnitz_wire::{MapKind, OpNode};
+        // Range-join shape: ScanDelta → Map(reindex) → PartitionFilter →
+        // IntegrateTrace. PartitionFilter sits AFTER the reindex Map, so the walk
+        // (which stops at the Map and only steps through Filter nodes) reaches the
+        // Map and returns its cols unchanged — the range circuit keeps
+        // has_join_shard == true exactly like an equi-join.
+        let dummy_blob: Vec<u8> = vec![
+            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(99));
+        nodes.insert(1, OpNode::Map(MapKind::Expression {
+            program: dummy_blob,
+            reindex_cols: vec![2],
+            reindex_target_tcs: vec![],
+        }));
+        nodes.insert(2, OpNode::PartitionFilter);
+        nodes.insert(3, OpNode::IntegrateTrace);
+        let edges = vec![
+            (0, 1, PORT_IN),     // ScanDelta → reindex Map
+            (1, 2, PORT_IN),     // Map → PartitionFilter
+            (2, 3, PORT_IN),     // PartitionFilter → IntegrateTrace
+        ];
+        let loaded = make_loaded(nodes, edges);
+        assert_eq!(reindex_cols_through_filters(&loaded, 0), vec![(2, 0)],
+            "PartitionFilter after the reindex Map must not change the walk result");
     }
 
     #[test]

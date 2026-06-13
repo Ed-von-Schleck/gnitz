@@ -3,10 +3,10 @@
 use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::is_german_string;
+use gnitz_wire::{is_german_string, RangeRel};
 use crate::storage::{
-    write_to_batch, Batch, ConsolidatedBatch, MemBatch, ReadCursor, scatter_copy,
-    with_payload_cmp,
+    range_cut_points, write_to_batch, Batch, ConsolidatedBatch, MemBatch, ReadCursor,
+    scatter_copy, with_payload_cmp,
 };
 
 use super::util::{all_payload_null_mask, merge_null_words, write_string_from_batch};
@@ -384,6 +384,84 @@ pub fn op_join_delta_trace_outer(
     let cs = Batch::consolidate_if_needed(delta, left_schema);
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
     join_dt_merge_walk::<true>(consolidated, cursor, left_schema, right_schema)
+}
+
+// ---------------------------------------------------------------------------
+// Non-equi (range) join delta-trace
+// ---------------------------------------------------------------------------
+
+/// Range join delta-trace: like `op_join_delta_trace`, but each consolidated
+/// delta row probes the trace by an ordered half-open `[start, end)` byte
+/// interval (the §3 cut-point table) instead of an equal-key seek. `n_eq`
+/// leading PK slots are equality-pinned (the band-join prefix), `rel` is the
+/// relation the trace slot must satisfy versus the delta slot.
+///
+/// Both sides reindex to `[eq slots…, range slot]` at the pair's common promoted
+/// type, so the trace PK region is an ordered arrangement by the range key and
+/// the probe bound is the delta row's own packed PK bytes — no decode/re-encode.
+/// Stays delta-driven (no trace-driven swap variant in slice 1).
+pub fn op_join_delta_trace_range(
+    delta: &Batch,
+    cursor: &mut ReadCursor,
+    left_schema: &SchemaDescriptor,
+    right_schema: &SchemaDescriptor,
+    n_eq: usize,
+    rel: RangeRel,
+) -> Batch {
+    let left_npc = left_schema.num_payload_cols();
+    let right_npc = right_schema.num_payload_cols();
+    let out_npc = left_npc + right_npc;
+
+    let cs = Batch::consolidate_if_needed(delta, left_schema);
+    let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
+    let n = consolidated.count;
+    if n == 0 {
+        return Batch::empty(out_npc, left_schema.pk_stride());
+    }
+
+    // Trace PK = [eq slots…, range slot]. Both sides pack at the same common type,
+    // so the delta PK shape equals the trace PK shape.
+    let stride = right_schema.pk_stride() as usize;
+    let eq_size = right_schema.leading_key_size(n_eq);
+    debug_assert_eq!(left_schema.pk_stride() as usize, stride,
+        "range join: delta and trace PK strides must match (common-T reindex)");
+    debug_assert_eq!(right_schema.pk_indices().len(), n_eq + 1,
+        "range join: trace PK arity must be n_eq + 1");
+    // (`range_cut_points` asserts the range slot is non-empty per row.)
+
+    let delta_mb = consolidated.as_mem_batch();
+    let mut output = Batch::empty_joined(left_schema, right_schema);
+
+    for i in 0..n {
+        let pk_i = consolidated.get_pk_bytes(i);
+        let w_delta = consolidated.get_weight(i);
+        let (eq, d) = pk_i.split_at(eq_size);
+
+        // Provably-empty interval (e.g. `Gt` of the maximal slot): no match.
+        let Some((start, end)) = range_cut_points(eq, d, rel) else { continue };
+
+        // Per-row re-seek (O(log T)); supports the backward seeks `Lt`/`Le` with
+        // n_eq == 0 require (all rows seek to 0x00…).
+        cursor.seek_bytes(start.as_slice());
+        while cursor.valid
+            && end.as_ref().is_none_or(|e| cursor.current_pk_cmp_bytes(e.as_slice()).is_lt())
+        {
+            let w_out = w_delta.wrapping_mul(cursor.current_weight);
+            if w_out != 0 {
+                write_join_row(
+                    &mut output, &delta_mb, i, cursor, w_out,
+                    left_schema, right_schema,
+                );
+            }
+            cursor.advance();
+        }
+    }
+
+    // Probe order is delta-major with arbitrary trace payload runs per row — not
+    // (PK, payload)-sorted. The re-key + output exchange + consolidation downstream
+    // restore order; do not let a merge trust this batch as sorted.
+    output.sorted = false;
+    output
 }
 
 // ---------------------------------------------------------------------------
@@ -954,6 +1032,29 @@ mod tests {
         ConsolidatedBatch::new_unchecked(b)
     }
 
+    /// Build a band-join trace/delta over the `(U64 k, U64 range)` compound PK
+    /// using OPK (big-endian) encoding, so memcmp on the PK region is numeric
+    /// order — the contract the range probe relies on. Rows must be passed in
+    /// ascending `(k, range)` order. (`make_compound_batch` writes native LE
+    /// bytes, correct only for the equality DD joins that compare PKs for
+    /// equality, not the range probe that compares them for order.)
+    fn make_band_batch(
+        schema: &SchemaDescriptor,
+        rows: &[(u64, u64, i64, i64)],
+    ) -> ConsolidatedBatch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(k, range, w, val) in rows {
+            b.extend_pk_opk(schema, &[k as u128, range as u128]);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
     fn make_schema_signed() -> SchemaDescriptor {
         SchemaDescriptor::new(
             &[
@@ -1481,6 +1582,176 @@ mod tests {
             !out.sorted || actually_sorted,
             "join_dt_swapped marked output sorted but payload order is {pairs:?}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Range join DT
+    // -----------------------------------------------------------------------
+
+    /// Right-payload (trace I64 col) + weight of each emitted range-join row, in
+    /// emission order. The trace payload identifies which trace rows matched.
+    fn range_out_pairs(out: &Batch) -> Vec<(i64, i64)> {
+        (0..out.count)
+            .map(|r| (crate::util::read_i64_le(out.col_data(1), r * 8), out.get_weight(r)))
+            .collect()
+    }
+
+    fn trace_cursor(batch: ConsolidatedBatch, schema: SchemaDescriptor) -> crate::storage::CursorHandle {
+        use std::rc::Rc;
+        crate::storage::CursorHandle::from_owned(&[Rc::new(batch.into_inner())], schema)
+    }
+
+    /// All four rels over an unsigned key, n_eq = 0. The boundary case x == y
+    /// must match `Le`/`Ge` and not `Lt`/`Gt`. The trace payload tags the rows
+    /// {y=10→110, y=20→120, y=30→130}; the delta probes x = 20.
+    #[test]
+    fn test_range_dt_four_rels_unsigned() {
+        let schema = make_schema_u64_i64();
+        let cases = [
+            (RangeRel::Lt, vec![110]),       // y < 20
+            (RangeRel::Le, vec![110, 120]),  // y <= 20
+            (RangeRel::Gt, vec![130]),       // y > 20
+            (RangeRel::Ge, vec![120, 130]),  // y >= 20
+        ];
+        for (rel, want) in cases {
+            let mut ch = trace_cursor(
+                make_batch(&schema, &[(10, 1, 110), (20, 1, 120), (30, 1, 130)]), schema);
+            let delta = make_batch(&schema, &[(20, 1, 200)]);
+            let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, rel);
+            let got: Vec<i64> = range_out_pairs(&out).into_iter().map(|(p, _)| p).collect();
+            assert_eq!(got, want, "rel {rel:?}");
+            // The left PK (delta range key x) and left payload survive on every row.
+            for r in 0..out.count {
+                assert_eq!(out.get_pk(r) as u64, 20);
+                assert_eq!(crate::util::read_i64_le(out.col_data(0), r * 8), 200);
+            }
+        }
+    }
+
+    /// Band join (n_eq = 1): the probe stays inside the delta row's equality
+    /// group. A trace row in the NEXT eq group with an in-range slot must NOT
+    /// match.
+    #[test]
+    fn test_range_dt_eq_prefix_stops_at_group_edge() {
+        let schema = make_schema_compound(); // (U64 k, U64 range) PK, I64 payload
+        // Trace sorted by (k, range): k=1 group then k=2 group. k=2,y=5 has an
+        // in-range slot for x=15 but is in a different group → must not match.
+        let trace = make_band_batch(&schema, &[
+            (1, 10, 1, 110),
+            (1, 20, 1, 120),
+            (2, 5,  1, 205),
+        ]);
+        let mut ch = trace_cursor(trace, schema);
+        let delta = make_band_batch(&schema, &[(1, 15, 1, 200)]);
+        // rel Lt: {y < 15 within k=1} = {10}. k=2,y=5 excluded by the group edge.
+        let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 1, RangeRel::Lt);
+        let got: Vec<i64> = range_out_pairs(&out).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(got, vec![110]);
+    }
+
+    /// Band join, `Le` with a maximal range slot (`d = u64::MAX`): the end cut's
+    /// carry ripples into the eq prefix (next group's first key). The whole k=1
+    /// group matches and the k=2 group does not — no panic, no spill.
+    #[test]
+    fn test_range_dt_eq_prefix_ripple_le_max() {
+        let schema = make_schema_compound();
+        let trace = make_band_batch(&schema, &[
+            (1, 0,        1, 100),
+            (1, u64::MAX, 1, 199),
+            (2, 0,        1, 200),
+        ]);
+        let mut ch = trace_cursor(trace, schema);
+        let delta = make_band_batch(&schema, &[(1, u64::MAX, 1, 9)]);
+        // y <= u64::MAX within k=1 → both k=1 rows; k=2 excluded.
+        let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 1, RangeRel::Le);
+        let mut got: Vec<i64> = range_out_pairs(&out).into_iter().map(|(p, _)| p).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![100, 199]);
+    }
+
+    /// `n_eq = 0`, `rel = Lt`, multiple delta rows: every row's start cut is the
+    /// all-`0x00` lower bound, so each probe re-seeks the cursor *backward* from
+    /// where the previous row's walk ended. All matches must still be found.
+    #[test]
+    fn test_range_dt_lt_backward_reseek() {
+        let schema = make_schema_u64_i64();
+        let mut ch = trace_cursor(
+            make_batch(&schema, &[(5, 1, 105), (15, 1, 115), (25, 1, 125)]), schema);
+        // Two delta rows; consolidation sorts them ascending (10, 30). Processing
+        // 30 after 10 forces a backward seek to 0x00 for the second probe.
+        let delta = make_batch(&schema, &[(30, 1, 300), (10, 1, 100)]);
+        let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, RangeRel::Lt);
+        // x=10 → {y<10}={105}; x=30 → {y<30}={105,115,125}. 4 rows total.
+        let mut pairs: Vec<(u64, i64)> = (0..out.count)
+            .map(|r| (out.get_pk(r) as u64, crate::util::read_i64_le(out.col_data(1), r * 8)))
+            .collect();
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(10, 105), (30, 105), (30, 115), (30, 125)]);
+    }
+
+    /// Signed range pair via cross-sign promotion (both sides reindex to I64).
+    /// Negative trace keys must order below positives — guards an OPK sign-flip
+    /// regression at the probe layer (raw bytes would put -100 above +50).
+    #[test]
+    fn test_range_dt_signed_promoted_key() {
+        let schema = make_schema_signed(); // I64 PK, I64 payload
+        let trace = make_signed_batch(&schema, &[(-100, 1, 1), (0, 1, 2), (50, 1, 3)]);
+        let mut ch = trace_cursor(trace, schema);
+        let delta = make_signed_batch(&schema, &[(0, 1, 9)]);
+        // Gt: {y > 0} = {50→3}. Lt: {y < 0} = {-100→1}.
+        let mut ch2 = trace_cursor(
+            make_signed_batch(&schema, &[(-100, 1, 1), (0, 1, 2), (50, 1, 3)]), schema);
+        let out_gt = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, RangeRel::Gt);
+        let out_lt = op_join_delta_trace_range(&delta, ch2.cursor_mut(), &schema, &schema, 0, RangeRel::Lt);
+        assert_eq!(range_out_pairs(&out_gt).into_iter().map(|(p, _)| p).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(range_out_pairs(&out_lt).into_iter().map(|(p, _)| p).collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// Output weight = `w_delta × w_trace` (wrapping); a retraction delta negates,
+    /// a doubled trace doubles, and a zero-weight trace row is skipped.
+    #[test]
+    fn test_range_dt_weights() {
+        let schema = make_schema_u64_i64();
+        // Trace: y=10 (w=2), y=20 (w=0, must be skipped), y=30 (w=1).
+        let mut trace = Batch::with_schema(schema, 3);
+        for &(pk, w, val) in &[(10u64, 2i64, 110i64), (20, 0, 120), (30, 1, 130)] {
+            trace.extend_pk(pk as u128);
+            trace.extend_weight(&w.to_le_bytes());
+            trace.extend_null_bmp(&0u64.to_le_bytes());
+            trace.extend_col(0, &val.to_le_bytes());
+            trace.count += 1;
+        }
+        trace.sorted = true;
+        let mut ch = trace_cursor(ConsolidatedBatch::new_unchecked(trace), schema);
+        // Delta retraction: x=40, w=-1, so all matches negate.
+        let delta = make_batch(&schema, &[(40, -1, 400)]);
+        // rel Lt: {y < 40} = all three, but y=20's product is -1*0 = 0 (skipped).
+        let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, RangeRel::Lt);
+        let mut got = range_out_pairs(&out);
+        got.sort_unstable();
+        // y=10: -1*2 = -2; y=30: -1*1 = -1; y=20 skipped.
+        assert_eq!(got, vec![(110, -2), (130, -1)]);
+    }
+
+    /// `Gt` of the maximal slot (n_eq = 0, x = u64::MAX) is provably empty — the
+    /// cut helper returns `None` and the probe emits nothing without seeking.
+    #[test]
+    fn test_range_dt_gt_max_is_empty() {
+        let schema = make_schema_u64_i64();
+        let mut ch = trace_cursor(make_batch(&schema, &[(10, 1, 110)]), schema);
+        let delta = make_batch(&schema, &[(u64::MAX, 1, 1)]);
+        let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, RangeRel::Gt);
+        assert_eq!(out.count, 0);
+    }
+
+    /// Empty delta → empty output, no panic.
+    #[test]
+    fn test_range_dt_empty_delta() {
+        let schema = make_schema_u64_i64();
+        let mut ch = trace_cursor(make_batch(&schema, &[(10, 1, 110)]), schema);
+        let delta = make_batch(&schema, &[]);
+        let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, RangeRel::Le);
+        assert_eq!(out.count, 0);
     }
 
     // -----------------------------------------------------------------------

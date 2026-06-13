@@ -47,6 +47,12 @@ pub const OPCODE_MAP_KEY_ONLY:           u64 = 28;
 pub const OPCODE_MAP_HASH_ROW:           u64 = 29;
 /// Read-only trace source for join trace ports; never participates in cascade.
 pub const OPCODE_SCAN_TRACE_TABLE:       u64 = 31;
+/// Non-equi (range) join: symmetric delta-trace join whose probe is an ordered
+/// half-open range walk over the trace instead of an equal-key seek.
+pub const OPCODE_JOIN_DELTA_TRACE_RANGE: u64 = 32;
+/// Drop trace rows this worker does not own (range-join broadcast input). Worker
+/// identity is a compile-time constant, so the node carries no payload.
+pub const OPCODE_PARTITION_FILTER:       u64 = 33;
 
 // ---------------------------------------------------------------------------
 // Circuit-layer type aliases
@@ -78,6 +84,7 @@ pub const NODE_COL_KIND_NULL_EXT: u64 = 3;  // NULL_EXTEND payload type codes
 pub const NODE_COL_KIND_AGG_SPEC: u64 = 4;  // REDUCE aggregate specs (value1=func_id, value2=col_idx)
 pub const NODE_COL_KIND_BRANCH_ID: u64 = 5; // MAP_HASH_ROW per-side branch discriminator (value1=branch_id)
 pub const NODE_COL_KIND_REINDEX:  u64 = 6;  // MAP_EXPR equijoin pre-index cols (value1=col_idx, position=key order)
+pub const NODE_COL_KIND_RANGE_JOIN: u64 = 7; // JOIN_DELTA_TRACE_RANGE params (value1=n_eq, value2=rel)
 
 // ---------------------------------------------------------------------------
 // Aggregate function IDs
@@ -125,9 +132,32 @@ pub enum AggKind {
     Specs(Vec<(AggFunc, u16)>),
 }
 
-/// Join physical strategy.
+/// The relation a **trace** slot must satisfy versus the **delta** slot in a
+/// range-join probe (`{ trace_slot REL delta_slot }`). Canonicalized from the ON
+/// clause's `L.x OP R.y` per the §3 table of `plans/range-join.md`: term AB's
+/// rel is the converse of OP, term BA's rel is OP itself. Wire values are stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum JoinKind { DeltaTrace, DeltaTraceOuter, DeltaDelta }
+#[repr(u64)]
+pub enum RangeRel { Lt = 0, Le = 1, Gt = 2, Ge = 3 }
+
+impl RangeRel {
+    pub fn from_wire(v: u64) -> Option<Self> {
+        match v {
+            0 => Some(RangeRel::Lt),
+            1 => Some(RangeRel::Le),
+            2 => Some(RangeRel::Gt),
+            3 => Some(RangeRel::Ge),
+            _ => None,
+        }
+    }
+    pub fn as_u64(self) -> u64 { self as u64 }
+}
+
+/// Join physical strategy. `DeltaTraceRange` keeps `JoinKind: Copy` (its fields
+/// are `Copy`); only `OpNode::Join` ever carries it (anti/semi range joins are
+/// out of scope and rejected in the planner).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinKind { DeltaTrace, DeltaTraceOuter, DeltaDelta, DeltaTraceRange { n_eq: u8, rel: RangeRel } }
 
 /// MAP sub-variant discriminant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,6 +226,10 @@ pub enum OpNode {
     SeekTrace,
     /// `OPCODE_CLEAR_DELTAS = 15`. Server-internal.
     ClearDeltas,
+    /// `OPCODE_PARTITION_FILTER = 33`. Keep only rows whose packed-PK partition is
+    /// owned by this worker (range-join broadcast input). Worker identity is a
+    /// compile-time constant, so no payload travels on the wire.
+    PartitionFilter,
 }
 
 /// One decoded row of the `CircuitNodeColumns` system table for a single node,
@@ -301,6 +335,17 @@ pub fn decode_op_node(
         x if x == OPCODE_JOIN_DELTA_TRACE        => OpNode::Join(JoinKind::DeltaTrace),
         x if x == OPCODE_JOIN_DELTA_TRACE_OUTER  => OpNode::Join(JoinKind::DeltaTraceOuter),
         x if x == OPCODE_JOIN_DELTA_DELTA        => OpNode::Join(JoinKind::DeltaDelta),
+        x if x == OPCODE_JOIN_DELTA_TRACE_RANGE  => {
+            // n_eq + rel ride in a single NODE_COL_KIND_RANGE_JOIN row. Reject a
+            // missing row or an unknown rel at this decode trust boundary rather
+            // than letting a bogus probe shape survive downstream.
+            let row = cols.iter().find(|c| c.kind == NODE_COL_KIND_RANGE_JOIN)
+                .ok_or_else(|| "JOIN_DELTA_TRACE_RANGE missing range-join param row".to_string())?;
+            let n_eq = row.value1 as u8;
+            let rel = RangeRel::from_wire(row.value2)
+                .ok_or_else(|| format!("JOIN_DELTA_TRACE_RANGE unknown rel {}", row.value2))?;
+            OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel })
+        }
         x if x == OPCODE_ANTI_JOIN_DELTA_TRACE   => OpNode::AntiJoin(JoinKind::DeltaTrace),
         x if x == OPCODE_ANTI_JOIN_DELTA_DELTA   => OpNode::AntiJoin(JoinKind::DeltaDelta),
         x if x == OPCODE_SEMI_JOIN_DELTA_TRACE   => OpNode::SemiJoin(JoinKind::DeltaTrace),
@@ -313,6 +358,7 @@ pub fn decode_op_node(
         x if x == OPCODE_GATHER_REDUCE           => OpNode::GatherReduce,
         x if x == OPCODE_SEEK_TRACE              => OpNode::SeekTrace,
         x if x == OPCODE_CLEAR_DELTAS            => OpNode::ClearDeltas,
+        x if x == OPCODE_PARTITION_FILTER        => OpNode::PartitionFilter,
         _ => return Err(format!("unknown opcode {opcode}")),
     })
 }
@@ -382,6 +428,43 @@ mod tests {
     fn decode_legacy_cell_yields_zero_target_tcs() {
         let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(7), Some(vec![1, 2, 3]), &[]).unwrap();
         assert_eq!(reindex_of(node), (vec![7], vec![0]));
+    }
+
+    /// A range-join node decodes its `(n_eq, rel)` from the NODE_COL_KIND_RANGE_JOIN
+    /// param row.
+    #[test]
+    fn decode_range_join_params() {
+        let cols = [CircuitNodeColumn {
+            kind: NODE_COL_KIND_RANGE_JOIN, position: 0,
+            value1: 2, value2: RangeRel::Gt.as_u64(),
+        }];
+        let node = decode_op_node(OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, None, &cols).unwrap();
+        assert_eq!(node, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 2, rel: RangeRel::Gt }));
+    }
+
+    /// A range-join opcode with no param row is rejected at the decode trust
+    /// boundary rather than defaulting to a bogus probe shape.
+    #[test]
+    fn decode_range_join_rejects_missing_param_row() {
+        let err = decode_op_node(OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, None, &[]).unwrap_err();
+        assert!(err.contains("missing range-join param row"), "got: {err}");
+    }
+
+    /// An out-of-range `rel` value is rejected, not silently mapped.
+    #[test]
+    fn decode_range_join_rejects_unknown_rel() {
+        let cols = [CircuitNodeColumn {
+            kind: NODE_COL_KIND_RANGE_JOIN, position: 0, value1: 0, value2: 99,
+        }];
+        let err = decode_op_node(OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, None, &cols).unwrap_err();
+        assert!(err.contains("unknown rel"), "got: {err}");
+    }
+
+    /// The partition-filter opcode decodes to the payload-free node.
+    #[test]
+    fn decode_partition_filter() {
+        let node = decode_op_node(OPCODE_PARTITION_FILTER, None, None, None, &[]).unwrap();
+        assert_eq!(node, OpNode::PartitionFilter);
     }
 
     /// A non-zero `value2` that is not a PK-eligible type code is rejected at the

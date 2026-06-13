@@ -1,6 +1,6 @@
 use crate::expr::ExprProgram;
 
-pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode};
+pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel};
 
 pub type NodeId  = u64;
 pub type Port    = u8;
@@ -175,12 +175,18 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         OpNode::Join(JoinKind::DeltaTrace)         => ((OPCODE_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
         OpNode::Join(JoinKind::DeltaTraceOuter)    => ((OPCODE_JOIN_DELTA_TRACE_OUTER, None, None, None), Vec::new()),
         OpNode::Join(JoinKind::DeltaDelta)         => ((OPCODE_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }) => (
+            (OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, None),
+            vec![(NODE_COL_KIND_RANGE_JOIN, 0, n_eq as u64, rel.as_u64())],
+        ),
         OpNode::AntiJoin(JoinKind::DeltaTrace)      => ((OPCODE_ANTI_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
         OpNode::AntiJoin(JoinKind::DeltaTraceOuter) => unreachable!("no wire opcode for anti-join outer; no builder creates this variant"),
         OpNode::AntiJoin(JoinKind::DeltaDelta)      => ((OPCODE_ANTI_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::AntiJoin(JoinKind::DeltaTraceRange { .. }) => unreachable!("no wire opcode for anti-join range; no builder creates this variant"),
         OpNode::SemiJoin(JoinKind::DeltaTrace)      => ((OPCODE_SEMI_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
         OpNode::SemiJoin(JoinKind::DeltaTraceOuter) => unreachable!("no wire opcode for semi-join outer; no builder creates this variant"),
         OpNode::SemiJoin(JoinKind::DeltaDelta)      => ((OPCODE_SEMI_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::SemiJoin(JoinKind::DeltaTraceRange { .. }) => unreachable!("no wire opcode for semi-join range; no builder creates this variant"),
         OpNode::IntegrateSink  => ((OPCODE_INTEGRATE, None, None, None), Vec::new()),
         OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None, None), Vec::new()),
         OpNode::ExchangeShard { shard_cols } => {
@@ -193,6 +199,7 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         OpNode::GatherReduce  => ((OPCODE_GATHER_REDUCE, None, None, None), Vec::new()),
         OpNode::SeekTrace     => ((OPCODE_SEEK_TRACE, None, None, None), Vec::new()),
         OpNode::ClearDeltas   => ((OPCODE_CLEAR_DELTAS, None, None, None), Vec::new()),
+        OpNode::PartitionFilter => ((OPCODE_PARTITION_FILTER, None, None, None), Vec::new()),
     }
 }
 
@@ -375,6 +382,27 @@ impl CircuitBuilder {
 
     pub fn join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
         self.binary_join(OpNode::Join(JoinKind::DeltaTrace), delta, trace_node)
+    }
+
+    /// Non-equi (range) join term: the delta probes `trace_node` with an ordered
+    /// half-open range walk per the §3 cut-point table. `n_eq` leading key slots
+    /// are equality-pinned (the band-join prefix); `rel` is the relation the trace
+    /// slot must satisfy versus the delta slot. Mirrors `join_with_trace_node` but
+    /// for `JoinKind::DeltaTraceRange`.
+    pub fn join_with_trace_range_node(
+        &mut self, delta: NodeId, trace_node: NodeId, n_eq: u8, rel: RangeRel,
+    ) -> NodeId {
+        self.binary_join(OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }), delta, trace_node)
+    }
+
+    /// Keep only rows this worker owns (by packed-PK partition) before they
+    /// integrate into a range-join trace under the broadcast input relay. Worker
+    /// identity is baked in at compile time, so the node carries no payload;
+    /// single-process compiles emit `(0, 1)` = keep-all.
+    pub fn partition_filter(&mut self, input: NodeId) -> NodeId {
+        let nid = self.alloc_node(OpNode::PartitionFilter);
+        self.connect(input, nid, gnitz_wire::PORT_IN);
+        nid
     }
 
     pub fn anti_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
@@ -560,6 +588,51 @@ mod tests {
                 assert_eq!(*reindex_target_tcs, vec![0, type_code::I64]);
             }
             other => panic!("expected Map(Expression), got {other:?}"),
+        }
+    }
+
+    /// A range-join node round-trips its `(n_eq, rel)` through the single
+    /// NODE_COL_KIND_RANGE_JOIN param row, and a partition-filter node round-trips
+    /// as a bare opcode.
+    #[test]
+    fn range_join_and_partition_filter_roundtrip() {
+        use gnitz_wire::NODE_COL_KIND_RANGE_JOIN;
+        let mut cb = CircuitBuilder::new(9, 100);
+        let a = cb.input_delta_tagged(100);
+        let b = cb.input_delta_tagged(200);
+        let reindex_b = cb.map_reindex(b, &[0], &[], empty_prog());
+        let filt_b = cb.partition_filter(reindex_b);
+        let trace_b = cb.integrate_trace(filt_b);
+        let join = cb.join_with_trace_range_node(a, trace_b, 1, RangeRel::Le);
+        cb.sink(join);
+        let rows = cb.build().into_rows();
+
+        // Exactly one range-join param row: (n_eq=1, rel=Le).
+        let rj: Vec<_> = rows.node_columns.iter()
+            .filter(|(_, kind, ..)| *kind == NODE_COL_KIND_RANGE_JOIN)
+            .map(|&(_, _, pos, v1, v2)| (pos, v1, v2))
+            .collect();
+        assert_eq!(rj, vec![(0, 1, RangeRel::Le.as_u64())]);
+
+        let decoded = Circuit::from_rows(9, rows).expect("from_rows");
+        assert!(decoded.nodes.values().any(|n| matches!(n, OpNode::PartitionFilter)));
+        assert!(decoded.nodes.values().any(|n|
+            matches!(n, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 1, rel: RangeRel::Le }))));
+    }
+
+    /// Every `RangeRel` survives the wire round-trip with the right discriminant.
+    #[test]
+    fn range_rel_roundtrips_all_four() {
+        for rel in [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge] {
+            let mut cb = CircuitBuilder::new(1, 100);
+            let a = cb.input_delta_tagged(100);
+            let trace = cb.trace_scan(200);
+            let join = cb.join_with_trace_range_node(a, trace, 0, rel);
+            cb.sink(join);
+            let decoded = Circuit::from_rows(1, cb.build().into_rows()).expect("from_rows");
+            assert!(decoded.nodes.values().any(|n|
+                matches!(n, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 0, rel: r }) if *r == rel)),
+                "rel {rel:?} did not round-trip");
         }
     }
 

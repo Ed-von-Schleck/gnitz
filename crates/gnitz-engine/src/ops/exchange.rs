@@ -76,6 +76,47 @@ pub fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
     (partition / chunk).min(num_workers - 1)
 }
 
+/// Keep only the rows this worker owns, by packed-PK partition — the trace-side
+/// counterpart of the range-join broadcast input relay. Every worker receives the
+/// full broadcast delta; before it integrates into a range-join trace, this drops
+/// the rows whose `partition_for_pk_bytes` partition is not assigned to
+/// `worker_id`. It is the SAME hash the equality scatter (`RouteMode::JoinPromote`)
+/// applies to the SAME packed PK bytes, so the integrated trace is partitioned
+/// identically to a scattered equi-join trace — no trace replicates, no match
+/// duplicates. Worker identity is a compile-time constant baked into the emitted
+/// instruction; `num_workers <= 1` (single process) keeps every row.
+pub(crate) fn op_partition_filter(
+    batch: &Batch,
+    schema: &SchemaDescriptor,
+    worker_id: u32,
+    num_workers: u32,
+) -> Batch {
+    let n = batch.count;
+    if num_workers <= 1 || n == 0 {
+        // Single process owns every partition; degenerate to identity (preserving
+        // the source's sorted/consolidated flags via clone_batch).
+        return batch.clone_batch();
+    }
+    let nw = num_workers as usize;
+    let wid = worker_id as usize;
+    let mb = batch.as_mem_batch();
+
+    // Keep just this worker's partitions, routed by the same `worker_for_partition`
+    // the equality scatter uses — no 256-entry table needed for a single worker.
+    let mut indices: Vec<u32> = Vec::with_capacity(n / nw + 1);
+    for i in 0..n {
+        if worker_for_partition(partition_for_pk_bytes(mb.get_pk_bytes(i)), nw) == wid {
+            indices.push(i as u32);
+        }
+    }
+    let mut out = Batch::from_indexed_rows(&mb, &indices, schema);
+    // Filtering keeps the ascending row order and (PK, payload) distinctness of
+    // the input, so the consolidated/sorted flags carry through unchanged.
+    out.sorted = batch.sorted;
+    out.consolidated = batch.consolidated;
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Partition routing cache
 // ---------------------------------------------------------------------------
@@ -768,6 +809,38 @@ pub(crate) fn op_relay_scatter_consolidated_mode(
     })
 }
 
+/// Broadcast relay: deliver the FULL delta to every worker. The per-worker
+/// source slices are disjoint (each is one worker's base-table-PK-partitioned
+/// slice), so their concatenation is the full delta with no duplication; that
+/// concatenation is then cloned to each of `num_workers` destinations. The
+/// range-join probe needs the whole delta on every worker — a range match can
+/// live on any worker's trace — which the equality scatter (one destination per
+/// row) cannot deliver. Sibling of `op_repartition_batches_mode` /
+/// `op_relay_scatter_consolidated_mode`, but without `col_indices` / `RouteMode`
+/// (broadcast routes nothing). All destination batches are byte-identical.
+pub(crate) fn op_relay_broadcast(
+    sources: &[Option<&Batch>],
+    schema: &SchemaDescriptor,
+    num_workers: usize,
+) -> Vec<Batch> {
+    let total: usize = sources.iter().flatten().map(|b| b.count).sum();
+    if total == 0 {
+        return (0..num_workers).map(|_| Batch::empty_with_schema(schema)).collect();
+    }
+    // Concatenate the disjoint slices into the full delta once (append_batch
+    // relocates each source's blob, so independent source blobs stay valid).
+    let mut full = Batch::with_schema(*schema, total);
+    for src in sources.iter().flatten() {
+        if src.count > 0 {
+            full.append_batch(src, 0, src.count);
+        }
+    }
+    // Clone to every worker; the last destination takes ownership of `full`.
+    let mut out: Vec<Batch> = (1..num_workers).map(|_| full.clone_batch()).collect();
+    out.push(full);
+    out
+}
+
 /// Scatter non-consolidated batches across workers by hashing each row.
 #[cfg(test)]
 pub fn op_relay_scatter(
@@ -1232,6 +1305,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_partition_filter_partitions_rows_by_owner() {
+        let schema = make_schema_u64_i64();
+        let num_workers = 4u32;
+        let rows: Vec<(u64, i64, i64)> = (0..40u64).map(|i| (i * 7 + 1, 1, i as i64)).collect();
+        let batch = make_batch(&schema, &rows).into_inner();
+
+        // Each row kept by exactly the worker that owns its PK partition; the
+        // union across workers is the whole batch with no duplication.
+        let mut total_kept = 0usize;
+        for wid in 0..num_workers {
+            let out = op_partition_filter(&batch, &schema, wid, num_workers);
+            total_kept += out.count;
+            for r in 0..out.count {
+                let pk = out.get_pk_bytes(r);
+                let owner = worker_for_partition(partition_for_pk_bytes(pk), num_workers as usize);
+                assert_eq!(owner as u32, wid, "row routed to wrong worker");
+            }
+        }
+        assert_eq!(total_kept, batch.count, "partition filter dropped or duplicated rows");
+    }
+
+    #[test]
+    fn test_partition_filter_single_worker_keeps_all() {
+        let schema = make_schema_u64_i64();
+        let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).into_inner();
+        let out = op_partition_filter(&batch, &schema, 0, 1);
+        assert_eq!(out.count, 3, "(0, 1) must keep every row");
+    }
+
+    #[test]
+    fn test_partition_filter_empty_in_empty_out() {
+        let schema = make_schema_u64_i64();
+        let batch = make_batch(&schema, &[]).into_inner();
+        let out = op_partition_filter(&batch, &schema, 1, 4);
+        assert_eq!(out.count, 0);
     }
 
     #[test]

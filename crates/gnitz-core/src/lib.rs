@@ -45,7 +45,7 @@ pub use protocol::{
 pub use expr::{ExprBuilder, ExprProgram, ExprDecodeErr, EXPR_BLOB_MAGIC, EXPR_BLOB_VERSION};
 pub use circuit::{
     CircuitBuilder, NodeId, Port, TableId,
-    Circuit, OpNode, MapKind, JoinKind, AggKind, AggFunc, CircuitRows,
+    Circuit, OpNode, MapKind, JoinKind, AggKind, AggFunc, CircuitRows, RangeRel,
 };
 pub use types::{
     CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_NODE_COLUMNS_TAB,
