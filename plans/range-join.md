@@ -406,12 +406,12 @@ Next to `join_with_trace_node` (:376):
     (`k + left_n + b_pk_idx`) over the layout `[_join_pk_0..k, A cols, B cols]`;
     targets all `0` (self-derive — no cross-side promotion, each slot keeps its
     source PK type).
-  - user projection `Map` over the re-key output, selecting the
-    `pa + pb` leading PK-copy columns' payload twins implicitly (as the equi
-    path does for `_join_pk`) plus the user's selected columns; then
-    `shard(node, &pair_pk_idxs)` with `pair_pk_idxs == (0..pa+pb).collect()`
-    → `sink`. (`shard()` takes a `&[usize]` column **list**, not a range — do
-    not pass `&[0..pa+pb]`.)
+  - user projection `Map` over the re-key output, **dropping** the `k` synthetic
+    `_join_pk` slots and selecting the `pa + pb` leading PK-copy columns' payload
+    twins implicitly (as the equi path does for `_join_pk`) plus the user's
+    selected columns; then `shard(node, &pair_pk_idxs)` with
+    `pair_pk_idxs == (0..pa+pb).collect()` → `sink`. (`shard()` takes a
+    `&[usize]` column **list**, not a range — do not pass `&[0..pa+pb]`.)
   - **Routing invariant**: the `ExchangeShard` columns must equal `view_pk` in
     strict order (`shard_cols == (0..pa+pb)`). The output relay's
     `RouteMode::GroupKey` scatter routes by the packed PK region
@@ -430,15 +430,24 @@ Next to `join_with_trace_node` (:376):
   - Output schema: `pa + pb` leading `ColumnDef`s named `_pair_pk_{i}`
     (types = source PK column types, non-nullable) + user-selected columns;
     `view_pk = 0..pa+pb`. Duplicate-name rejection as today.
-  - **Fuse the re-key and the user projection (recommended default, not
-    optional)**: emit a single `map_reindex` whose program produces exactly the
-    user columns over `pair_pk_cols`. Besides saving a node, this is the safer
-    form: it never materializes the synthetic `_join_pk` slots (positions
-    `0..k`), whose *values* differ between term AB (`OPK(a.x)`) and term BA
-    (`OPK(b.y)`). A non-fused path is correct only as long as the trailing user
-    projection drops `0..k`; the fused path makes that drop structural, so a
-    differing key slot can never leak into the exchanged/consolidated output and
-    leave a permanent cross-worker ghost.
+  - **The re-key and the user projection are two nodes — they cannot be fused.**
+    A `map_reindex`'s output schema is structurally `[new PK ‖ *full* input
+    payload]`: `reindex_output_schema` (`compiler.rs:811`) copies
+    `in_schema.columns[..n]` verbatim, and the emit dispatch (`compiler.rs:1254`)
+    forces that schema whenever `reindex_cols` is non-empty — the reindex
+    program's `COPY_COL` selection never narrows the column set. So the re-key
+    node **always** carries the `k` `_join_pk` slots into its payload; a plain
+    `Map(Projection)` (`MapKind::Projection`, schema via `build_map_output_schema`,
+    `compiler.rs:1291`) is required to drop them, exactly as the equi path's final
+    projection does (`planner.rs:1325`). That projection **must sit between the
+    re-key and the `shard`** (in the pre-plan, before `ExchangeShard`): the
+    `_join_pk` *values* differ between term AB (`OPK(a.x)`) and term BA
+    (`OPK(b.y)`), so if they reached the exchange a pair's `+1` and `-1` would
+    carry different payloads on different workers and never consolidate — a
+    permanent cross-worker ghost. Dropping them before the exchange makes every
+    emission for a pair byte-identical regardless of term. (Projecting *after*
+    the exchange cannot fix this — by then the differing slots are already in the
+    consolidated key.)
 
 ### 4. `crates/gnitz-engine/src/ops/join.rs` — the operator
 
@@ -506,8 +515,21 @@ equals `worker_id`. Identity (no copy) when `num_workers == 1`.
 ### 7. `crates/gnitz-engine/src/dag.rs` — broadcast detection + driver branch
 
 - `view_is_range_join(view_id) -> bool`: any `Join(DeltaTraceRange { .. })`
-  node in the meta circuit; cached like `join_shard_cols_cache`. This is the
-  **only** correct branch discriminator (see below).
+  node in the meta circuit, memoized in a new `range_join_cache:
+  FxHashMap<i64, bool>` on `DagEngine` (keyed by view_id, like
+  `shard_cols_cache`). Initialize it in the struct and `DagEngine::new`, and —
+  load-bearing — evict it next to the sibling view-keyed caches at **all three**
+  invalidation sites, or dropped-view entries accumulate for the process
+  lifetime (table IDs are monotonic and never reused, so this is dead memory
+  rather than a reuse hazard) and the cache drifts out of lockstep with
+  `cache`/`shard_cols_cache`/`join_shard_cols_cache`/`exchange_info_cache`:
+  - `unregister_table` (`dag.rs:470`, the production view/table drop path):
+    `self.range_join_cache.remove(&table_id);`
+  - `invalidate_all` (`dag.rs:553`, production bulk flush via
+    `invalidate_all_plans`): `self.range_join_cache.clear();`
+  - `invalidate` (`dag.rs:544`, `#[cfg(test)]`):
+    `self.range_join_cache.remove(&view_id);`
+  This is the **only** correct branch discriminator (see below).
 - `evaluate_dag_multi_worker` (:1167-1259): the runtime branch chain is
   `has_exchange && view_has_side_b` (two-sided set-ops, :1211) → `has_exchange`
   (:1216) → `has_join_shard` (:1240) → plain pre (:1256). Insert the range-join
@@ -527,8 +549,17 @@ equals `worker_id`. Identity (no copy) when `num_workers == 1`.
       // Range join: broadcast input relay → pre → output exchange → post.
       // No co-partition shortcut: a range probe needs the full delta even
       // when the join key equals the source PK.
-      let mut input_ws = input;            // set source schema as :1246-1252
-      let bc = exchange.do_exchange(view_id, &input_ws, src_id);
+      // Set the source schema for exchange wire encoding: a batch with rows
+      // but a None schema emits FLAG_HAS_DATA without FLAG_HAS_SCHEMA and panics
+      // the reactor decode ("exchange FLAG_HAS_DATA without schema — ring
+      // corrupt"). Mirrors the has_join_shard arm (dag.rs:1246-1253).
+      let mut input_with_schema = input;
+      if input_with_schema.schema.is_none() {
+          if let Some(entry) = self.tables.get(&src_id) {
+              input_with_schema.set_schema(entry.schema);
+          }
+      }
+      let bc = exchange.do_exchange(view_id, &input_with_schema, src_id);
       let exchange_schema = self.get_exchange_schema(view_id)
           .unwrap_or_else(|| self.tables[&view_id].schema);
       let pre_result = match self.execute_pre_phase(view_id, bc, src_id) {
@@ -561,8 +592,14 @@ equals `worker_id`. Identity (no copy) when `num_workers == 1`.
   `source_id == 0` output relay takes the existing `get_shard_cols` +
   `RouteMode::GroupKey` path verbatim.
 - SAL relay space: a broadcast group carries ~`num_workers ×` the delta bytes;
-  the existing `sal_has_relay_space` throttle covers it. (De-duplicating the
-  shared bytes into one group read by all workers is a follow-on.)
+  the existing `sal_has_relay_space` throttle covers it. The existing
+  `send_broadcast` / `write_broadcast_direct` primitives (`master.rs:487`,
+  `sal.rs:880`) do **not** avoid this: "broadcast" there means *encode once,
+  `memcpy` the payload into every worker's slot* (`sal.rs:927`) — still
+  `num_workers` physical copies, since `sal_begin_group` lays out one independent
+  data slot per worker with no shared-region concept. True write-once dedup (one
+  shared SAL group region read by all workers) needs a SAL group-format change
+  and is a follow-on, not a correctness concern.
 
 ## Correctness invariants to preserve
 
@@ -611,7 +648,13 @@ equals `worker_id`. Identity (no copy) when `num_workers == 1`.
   live deltas; a local-only backfill replay would miss every cross-partition
   match (`a` owned by `w`, `b` owned by `w'`). Match completeness then follows
   from replaying both sources: backfilling A builds `trace_A` (no matches yet),
-  backfilling B fires term BA against the full `trace_A`.
+  backfilling B fires term BA against the full `trace_A`. (The worker backfill
+  scan `handle_backfill` (`worker.rs:1419`) today materializes each partition
+  whole via `scan_family`; under the broadcast relay that concatenates to
+  `O(num_workers × N)` at the master and can trip the *"SAL space exhausted
+  during backfill exchange relay"* guard on large tables. Bounding it to
+  `O(chunk)` is a pre-existing, view-type-agnostic scalability gap tracked in
+  `chunked-distributed-backfill.md`; correctness here does not depend on it.)
 
 ## Migration order
 
