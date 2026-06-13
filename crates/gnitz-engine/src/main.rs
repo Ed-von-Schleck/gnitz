@@ -17,6 +17,9 @@ mod sys;
 mod catalog;
 mod runtime;
 
+#[cfg(test)]
+mod test_rng;
+
 use std::env;
 use std::process;
 

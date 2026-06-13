@@ -1223,12 +1223,20 @@ class TestRangeJoin:
         same-range row in a different equality group must NOT match (group edge).
 
         The eq key spans dozens of distinct values, so its groups demonstrably
-        spread across all four workers, and each group's two rows sit on DIFFERENT
+        spread across all four workers, and each group's rows sit on DIFFERENT
         base-table PK partitions (their ids differ by the group count) before the
         eq-prefix scatter re-homes them onto hash(k). A mis-routed scatter (lost
         matches) or a wrongly-retained PartitionFilter (which hashes the full
         [k, lo] key and drops rows whose full-key partition ≠ their [k] partition)
-        fails the cross-filter reference."""
+        fails the cross-filter reference.
+
+        Sizing straddles the join's size-adaptive selector: the small `b` side is
+        seeded FIRST (one row per group → a thin per-worker trace_b), then the
+        larger `a` side is inserted in ONE epoch (three rows per group). On each
+        worker the eq-prefix-scattered |ΔA| outnumbers its integrated trace_b, so
+        the `join_ab` term takes the trace-driven `range_merge_walk` rather than
+        the per-row probe — exercising Strategy 2 end to end through the scatter,
+        output exchange, and consolidate pipeline."""
         sn = "bj" + _uid()
         client.create_schema(sn)
         try:
@@ -1242,15 +1250,50 @@ class TestRangeJoin:
                 "CREATE VIEW v AS SELECT a.lo AS alo, b.t AS bt "
                 "FROM a JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
             ng = 40                                                       # 40 distinct eq groups
-            a_rows = [(i, i % ng, (i * 3) % 20) for i in range(1, 2 * ng + 1)]   # (id, k, lo)
-            b_rows = [(i, i % ng, (i * 7) % 20) for i in range(1, 2 * ng + 1)]   # (id, k, t)
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{k},{lo})" for i, k, lo in a_rows), schema_name=sn)
+            # Small trace side first (1 row/group), then the wide delta side in one
+            # epoch (3 rows/group) so |ΔA_worker| > |trace_b_worker| → merge walk.
+            b_rows = [(i, i % ng, (i * 7) % 20) for i in range(1, ng + 1)]       # (id, k, t)
+            a_rows = [(i, i % ng, (i * 3) % 20) for i in range(1, 3 * ng + 1)]   # (id, k, lo)
             client.execute_sql(
                 "INSERT INTO b VALUES " + ",".join(f"({i},{k},{t})" for i, k, t in b_rows), schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO a VALUES " + ",".join(f"({i},{k},{lo})" for i, k, lo in a_rows), schema_name=sn)
             vid, _ = client.resolve_table(sn, "v")
             got = _view_pairs(client, vid)
             want = _range_ref(a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] <= b[2])
+            assert got == want
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+    def test_pure_range_oversized_delta_merge_walk(self, client):
+        """Pure range join (`n_eq = 0`, one whole-trace eq group) where a single
+        epoch's broadcast delta outnumbers the per-worker trace, forcing the
+        degenerate single-group `range_merge_walk`. The small `b` side is seeded
+        first; the larger `a` side is then inserted in one epoch. Because pure
+        range broadcasts the delta in full but PartitionFilters the trace to ~1/W
+        per worker, the `join_ab` term's |ΔA| (full) exceeds its trace_b slice and
+        takes Strategy 2. The merge emits the same pairs as the per-row probe
+        (trace-major, re-ordered downstream); the result equals the cross-filter
+        reference."""
+        sn = "rjm" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x < b.y", schema_name=sn)
+            # Thin trace (b) first, then a wide single-epoch delta (a).
+            b_rows = [(i, (i * 5) % 23) for i in range(1, 9)]        # 8 trace rows
+            a_rows = [(i, (i * 7) % 23) for i in range(1, 49)]       # 48 delta rows ≫ 8
+            client.execute_sql(
+                "INSERT INTO b VALUES " + ",".join(f"({i},{y})" for i, y in b_rows), schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO a VALUES " + ",".join(f"({i},{x})" for i, x in a_rows), schema_name=sn)
+            vid, _ = client.resolve_table(sn, "v")
+            got = _view_pairs(client, vid)
+            want = _range_ref(a_rows, b_rows, lambda a, b: a[1] < b[1])
             assert got == want
         finally:
             _drop_all(client, sn, views=["v"], tables=["a", "b"])

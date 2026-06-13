@@ -222,6 +222,23 @@ The accumulator stores values as `u64` bit patterns (8 bytes). The output
 column is always 8 bytes. MIN/MAX on STRING stores the German String
 compare key (first 8 bytes), not the full 16-byte string struct.
 
+## Range/band join distribution
+
+A non-equi join can't be key-partitioned (matches cross partitions), so
+`build_range_join_view` routes the two cases differently, setting what
+`op_join_delta_trace_range`'s size selector (`n > trace_len` → merge-walk, else
+per-row) sees per worker:
+
+- **Pure range (`n_eq == 0`):** broadcasts the **full** delta but
+  `partition_filter`s the trace to ~1/W. So `n` (full) vs ~count/W → bulk
+  epoch picks merge, incremental trickle picks per-row (*not* "smaller drives").
+- **Band (`n_eq ≥ 1`):** eq-scatters both to ~1/W, so `n > trace_len` ≈ global
+  M vs N.
+
+To force a strategy in an E2E, seed the small side first, then insert the larger
+in one epoch. Both paths emit the same multiset (pinned by
+`test_range_dt_merge_vs_per_row_differential`).
+
 ## Benchmarking
 
 ```bash

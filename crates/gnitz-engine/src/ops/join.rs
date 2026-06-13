@@ -391,15 +391,22 @@ pub fn op_join_delta_trace_outer(
 // ---------------------------------------------------------------------------
 
 /// Range join delta-trace: like `op_join_delta_trace`, but each consolidated
-/// delta row probes the trace by an ordered half-open `[start, end)` byte
-/// interval (the §3 cut-point table) instead of an equal-key seek. `n_eq`
-/// leading PK slots are equality-pinned (the band-join prefix), `rel` is the
-/// relation the trace slot must satisfy versus the delta slot.
+/// delta row matches the trace by an ordered half-open `[start, end)` range
+/// (the §3 cut-point table) instead of an equal-key seek. `n_eq` leading PK
+/// slots are equality-pinned (the band-join prefix), `rel` is the relation the
+/// trace slot must satisfy versus the delta slot.
 ///
 /// Both sides reindex to `[eq slots…, range slot]` at the pair's common promoted
 /// type, so the trace PK region is an ordered arrangement by the range key and
 /// the probe bound is the delta row's own packed PK bytes — no decode/re-encode.
-/// Stays delta-driven (no trace-driven swap variant in slice 1).
+///
+/// Size-adaptive, mirroring the equi-join (`op_join_delta_trace`): rewind so
+/// `estimated_length` sees the full trace, then drive from whichever side is
+/// smaller. When `|delta| ≤ |trace|` keep the delta-driven per-row probe
+/// (`range_per_row_seek`); when the delta outnumbers the trace, sweep the trace
+/// forward exactly once with a monotone delta pointer (`range_merge_walk`),
+/// eliminating the per-row re-seek and the shared-region re-advance. Both emit
+/// the identical match multiset, unsorted, re-ordered downstream.
 pub fn op_join_delta_trace_range(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -408,9 +415,7 @@ pub fn op_join_delta_trace_range(
     n_eq: usize,
     rel: RangeRel,
 ) -> Batch {
-    let left_npc = left_schema.num_payload_cols();
-    let right_npc = right_schema.num_payload_cols();
-    let out_npc = left_npc + right_npc;
+    let out_npc = left_schema.num_payload_cols() + right_schema.num_payload_cols();
 
     let cs = Batch::consolidate_if_needed(delta, left_schema);
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
@@ -421,13 +426,39 @@ pub fn op_join_delta_trace_range(
 
     // Trace PK = [eq slots…, range slot]. Both sides pack at the same common type,
     // so the delta PK shape equals the trace PK shape.
-    let stride = right_schema.pk_stride() as usize;
-    let eq_size = right_schema.leading_key_size(n_eq);
-    debug_assert_eq!(left_schema.pk_stride() as usize, stride,
+    debug_assert_eq!(left_schema.pk_stride(), right_schema.pk_stride(),
         "range join: delta and trace PK strides must match (common-T reindex)");
     debug_assert_eq!(right_schema.pk_indices().len(), n_eq + 1,
         "range join: trace PK arity must be n_eq + 1");
     // (`range_cut_points` asserts the range slot is non-empty per row.)
+
+    // The same trace register may be reused across a tick; reset to position 0 so
+    // `estimated_length` sees the full trace and the merge walk starts at the
+    // head. The per-row path seeks absolutely, so the rewind is harmless there.
+    cursor.rewind();
+    let trace_len = cursor.estimated_length();
+    if n > trace_len {
+        range_merge_walk(consolidated, cursor, left_schema, right_schema, n_eq, rel)
+    } else {
+        range_per_row_seek(consolidated, cursor, left_schema, right_schema, n_eq, rel)
+    }
+}
+
+/// Strategy 1 — delta-driven per-row probe (`|delta| ≤ |trace|`). For each
+/// consolidated delta row, derive its `[start, end)` cut interval and walk the
+/// matching trace run. The start cut is globally monotone non-decreasing across
+/// rows, so `seek_bytes` becomes the hint-seeded `seek_bytes_forward` once
+/// `galloping-forward-seek.md` lands (a one-call swap, same matches).
+fn range_per_row_seek(
+    consolidated: &Batch,
+    cursor: &mut ReadCursor,
+    left_schema: &SchemaDescriptor,
+    right_schema: &SchemaDescriptor,
+    n_eq: usize,
+    rel: RangeRel,
+) -> Batch {
+    let eq_size = right_schema.leading_key_size(n_eq);
+    let n = consolidated.count;
 
     let delta_mb = consolidated.as_mem_batch();
     let mut output = Batch::empty_joined(left_schema, right_schema);
@@ -462,6 +493,109 @@ pub fn op_join_delta_trace_range(
     // restore order; do not let a merge trust this batch as sorted.
     output.sorted = false;
     output
+}
+
+/// Strategy 2 — trace-driven eq-group merge walk (`|delta| > |trace|`). Sweeps
+/// the (smaller) trace forward exactly once — no per-row seek — keeping a
+/// monotone pointer into the current delta eq group and emitting the matching
+/// contiguous delta sub-range per trace row. Both sides are globally sorted by
+/// `[eq…, range]`, so eq groups line up by a forward scan: skip any trace group
+/// below the current delta group, then walk the matching group. Structurally the
+/// equi-join's `join_dt_swapped` (drive the smaller side, never seek), but with a
+/// monotone delta pointer replacing its per-trace-row binary search —
+/// `O(r + m + output)` with no binary search of any kind.
+fn range_merge_walk(
+    consolidated: &Batch,
+    cursor: &mut ReadCursor,
+    left_schema: &SchemaDescriptor,
+    right_schema: &SchemaDescriptor,
+    n_eq: usize,
+    rel: RangeRel,
+) -> Batch {
+    let eq_size = right_schema.leading_key_size(n_eq);
+    // `MemBatch::get_pk_bytes` returns `&'a` tied to the batch data (not a `&self`
+    // borrow), so `e` is held freely across the walk while `delta_mb` is read again.
+    let delta_mb = consolidated.as_mem_batch();
+    let mut output = Batch::empty_joined(left_schema, right_schema);
+    let m = consolidated.count;
+
+    // The selector rewound the cursor to the trace head. One forward sweep of the
+    // (smaller) trace: each row is touched once, by either the group-skip or the
+    // group-walk. No seek.
+    let mut lo = 0; // start of the current delta eq group
+    while lo < m && cursor.valid {
+        // Delta eq group [lo, hi): contiguous rows sharing the eq prefix E.
+        let e = &delta_mb.get_pk_bytes(lo)[..eq_size];
+        let mut hi = lo + 1;
+        while hi < m && &delta_mb.get_pk_bytes(hi)[..eq_size] == e {
+            hi += 1;
+        }
+
+        // Forward-advance over any trace eq group below E (none when n_eq == 0).
+        // The cursor moves forward only and delta groups ascend, so this never
+        // re-scans — skip + walk over all groups totals O(r).
+        while cursor.valid && &cursor.current_pk_bytes()[..eq_size] < e {
+            cursor.advance();
+        }
+
+        let mut ptr = lo; // monotone delta pointer
+        while cursor.valid {
+            // Bind the PK once: both the eq-group test and the range-slot read come
+            // from it, so the row is fetched from the cursor a single time.
+            let pk = cursor.current_pk_bytes();
+            if &pk[..eq_size] != e {
+                break;
+            }
+            let s = &pk[eq_size..]; // trace range slot (PK is exactly stride bytes)
+            let w_t = cursor.current_weight;
+            // Advance `ptr` and select the matching contiguous delta sub-range.
+            // The `pk`/`s` cursor borrow dies in the pointer advance — before the
+            // emission reborrows the cursor and the trailing `advance()`.
+            let (rs, re) = match rel {
+                // prefix [lo, ub): grows as s↑
+                RangeRel::Gt => { advance_delta_ptr(&delta_mb, eq_size, &mut ptr, hi, |d| d < s); (lo, ptr) }
+                RangeRel::Ge => { advance_delta_ptr(&delta_mb, eq_size, &mut ptr, hi, |d| d <= s); (lo, ptr) }
+                // suffix [lb, hi): its lower bound rises (shrinks) as s↑
+                RangeRel::Lt => { advance_delta_ptr(&delta_mb, eq_size, &mut ptr, hi, |d| d <= s); (ptr, hi) }
+                RangeRel::Le => { advance_delta_ptr(&delta_mb, eq_size, &mut ptr, hi, |d| d < s); (ptr, hi) }
+            };
+            for k in rs..re {
+                let w_out = delta_mb.get_weight(k).wrapping_mul(w_t);
+                if w_out != 0 {
+                    write_join_row(
+                        &mut output, &delta_mb, k, cursor, w_out,
+                        left_schema, right_schema,
+                    );
+                }
+            }
+            cursor.advance();
+        }
+        lo = hi;
+    }
+
+    // Trace-major with delta runs per trace row — not (PK, payload)-sorted.
+    output.sorted = false;
+    output
+}
+
+/// Advance the monotone delta pointer `*ptr` forward over the eq group `[*, hi)`
+/// while the range slot at `*ptr` satisfies `pred` against the current trace
+/// slot. Serves as both the prefix upper bound (`Gt`/`Ge`) and the suffix lower
+/// bound (`Lt`/`Le`): as the trace slot ascends the prefix end and the suffix
+/// start each move forward only, so starting at the group head and advancing is
+/// exact and amortizes to `O(m_group)` across the whole trace group. Compares the
+/// delta row's range slot by `memcmp` (OPK order = typed order).
+#[inline]
+fn advance_delta_ptr(
+    delta_mb: &MemBatch,
+    eq_size: usize,
+    ptr: &mut usize,
+    hi: usize,
+    pred: impl Fn(&[u8]) -> bool,
+) {
+    while *ptr < hi && pred(&delta_mb.get_pk_bytes(*ptr)[eq_size..]) {
+        *ptr += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1752,6 +1886,280 @@ mod tests {
         let delta = make_batch(&schema, &[]);
         let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, RangeRel::Le);
         assert_eq!(out.count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Range join DT: Strategy 2 (merge walk) vs Strategy 1 (per-row) oracle
+    // -----------------------------------------------------------------------
+
+    use crate::test_rng::Rng;
+
+    /// Schema with `n_eq` U64 equality columns + 1 U64 range column (all PK) and
+    /// a single trailing I64 payload — the canonical band-join reindex shape.
+    fn make_range_schema(n_eq: usize) -> SchemaDescriptor {
+        let mut cols: Vec<SchemaColumn> =
+            (0..n_eq + 1).map(|_| SchemaColumn::new(type_code::U64, 0)).collect();
+        cols.push(SchemaColumn::new(type_code::I64, 0)); // payload
+        let pk: Vec<u32> = (0..n_eq as u32 + 1).collect();
+        SchemaDescriptor::new(&cols, &pk)
+    }
+
+    /// Build a batch over `make_range_schema(n_eq)`. Each row is
+    /// `(eq_cols, range, weight, payload)`; the `n_eq + 1` PK columns are
+    /// OPK-encoded (big-endian U64) so memcmp equals numeric order. Rows must be
+    /// pre-sorted ascending by `(eq.., range)` — the merge walk groups by a
+    /// forward scan and the cursor expects sorted PK bytes.
+    fn make_range_batch(
+        schema: &SchemaDescriptor,
+        rows: &[(Vec<u64>, u64, i64, i64)],
+    ) -> ConsolidatedBatch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for (eq, range, w, val) in rows {
+            let mut vals: Vec<u128> = eq.iter().map(|&x| x as u128).collect();
+            vals.push(*range as u128);
+            b.extend_pk_opk(schema, &vals);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    }
+
+    /// Random small `(eq.., range, weight, payload)` rows, sorted by `(eq.., range)`.
+    /// Weights span `{-2,-1,0,1,2}` so the trace carries tombstones (weight ≤ 0)
+    /// and the delta carries retractions; the small key space forces dense eq
+    /// groups, boundary equality (`d == s`), and non-matching groups.
+    fn gen_range_rows(rng: &mut Rng, n_eq: usize, n_rows: usize, key_space: u64)
+        -> Vec<(Vec<u64>, u64, i64, i64)> {
+        const WEIGHTS: [i64; 5] = [-2, -1, 0, 1, 2];
+        let mut rows: Vec<(Vec<u64>, u64, i64, i64)> = (0..n_rows).map(|_| {
+            let eq: Vec<u64> = (0..n_eq).map(|_| rng.gen_range(key_space)).collect();
+            let range = rng.gen_range(key_space);
+            let w = WEIGHTS[rng.gen_range(5) as usize];
+            let val = rng.gen_range(4) as i64; // few payloads → multiset duplicates
+            (eq, range, w, val)
+        }).collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        rows
+    }
+
+    /// Output as a `(pk_bytes, left_payload, right_payload) → Σweight` multiset,
+    /// dropping net-zero entries — the consolidated form the two strategies must
+    /// agree on regardless of (delta-major vs trace-major) emission order.
+    fn range_multiset(out: &Batch) -> std::collections::BTreeMap<(Vec<u8>, i64, i64), i64> {
+        let mut m = std::collections::BTreeMap::new();
+        for r in 0..out.count {
+            let pk = out.get_pk_bytes(r).to_vec();
+            let lp = crate::util::read_i64_le(out.col_data(0), r * 8);
+            let rp = crate::util::read_i64_le(out.col_data(1), r * 8);
+            *m.entry((pk, lp, rp)).or_insert(0i64) += out.get_weight(r);
+        }
+        m.retain(|_, w| *w != 0);
+        m
+    }
+
+    /// Assert the trace-driven merge (Strategy 2) emits the same consolidated
+    /// multiset as the per-row probe (Strategy 1, the shipped oracle). One trace
+    /// batch drives both: per-row seeks absolutely, then a rewind feeds the merge
+    /// from the head — exactly what the selector does. Returns the merged row
+    /// count so callers can assert non-vacuous coverage.
+    fn assert_merge_eq_per_row(
+        schema: SchemaDescriptor,
+        n_eq: usize,
+        rel: RangeRel,
+        delta: &Batch,
+        trace: ConsolidatedBatch,
+    ) -> usize {
+        let mut ch = trace_cursor(trace, schema);
+        let oracle = range_per_row_seek(delta, ch.cursor_mut(), &schema, &schema, n_eq, rel);
+        ch.cursor_mut().rewind();
+        let merged = range_merge_walk(delta, ch.cursor_mut(), &schema, &schema, n_eq, rel);
+        assert!(!merged.sorted, "merge output must be marked unsorted");
+        assert_eq!(
+            range_multiset(&oracle), range_multiset(&merged),
+            "merge vs per-row mismatch: n_eq={n_eq} rel={rel:?}",
+        );
+        merged.count
+    }
+
+    /// Differential: the merge walk matches the per-row oracle over random
+    /// delta + trace for all four rels and `n_eq ∈ {0, 1, 2}`. The small key
+    /// space exercises dense groups, boundary equality, tombstones (trace weight
+    /// 0/≤0), retractions (delta weight < 0), multiset duplicates, empty trace,
+    /// and non-matching groups in one sweep.
+    #[test]
+    fn test_range_dt_merge_vs_per_row_differential() {
+        let rels = [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge];
+        let mut rng = Rng::new(0xC0FF_EE12_3456_789A);
+        let mut total = 0usize;
+        for n_eq in 0..=2usize {
+            let schema = make_range_schema(n_eq);
+            for &rel in &rels {
+                for _ in 0..40 {
+                    let n_delta = 1 + rng.gen_range(7) as usize;
+                    let n_trace = rng.gen_range(8) as usize;
+                    let delta_rows = gen_range_rows(&mut rng, n_eq, n_delta, 4);
+                    let trace_rows = gen_range_rows(&mut rng, n_eq, n_trace, 4);
+                    let delta = make_range_batch(&schema, &delta_rows);
+                    let trace = make_range_batch(&schema, &trace_rows);
+                    total += assert_merge_eq_per_row(schema, n_eq, rel, &delta, trace);
+                }
+            }
+        }
+        assert!(total > 0, "differential never emitted a row — inputs too sparse");
+    }
+
+    /// `d == s` boundary: `Le`/`Ge` include the equal trace slot, `Lt`/`Gt`
+    /// exclude it. Merge must split it exactly where the per-row cut does.
+    #[test]
+    fn test_range_dt_merge_boundary_equality() {
+        let schema = make_schema_u64_i64();
+        let delta = make_batch(&schema, &[(20, 1, 200)]);
+        for rel in [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge] {
+            let trace = make_batch(&schema, &[(10, 1, 110), (20, 1, 120), (30, 1, 130)]);
+            assert_merge_eq_per_row(schema, 0, rel, &delta, trace);
+        }
+    }
+
+    /// Maximal range slot, `n_eq = 0`: `Gt` of `u64::MAX` is provably empty in
+    /// the per-row path (`range_cut_points → None`); the merge must agree (the
+    /// maximal delta row is never `< s`, so the prefix excludes it). All rels.
+    #[test]
+    fn test_range_dt_merge_maximal_slot_n_eq0() {
+        let schema = make_schema_u64_i64();
+        let delta = make_batch(&schema, &[(u64::MAX, 1, 9)]);
+        for rel in [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge] {
+            let trace = make_batch(&schema, &[(0, 1, 100), (50, 1, 150), (u64::MAX, 1, 199)]);
+            assert_merge_eq_per_row(schema, 0, rel, &delta, trace);
+        }
+    }
+
+    /// Maximal slot in a non-maximal eq group (`n_eq = 1`): `Gt`/`Ge` of
+    /// `u64::MAX` in group k=1 yield a zero-width `(next_E‖0, next_E‖0)` cut — no
+    /// match, and crucially no spill into the k=2 group. Merge must agree.
+    #[test]
+    fn test_range_dt_merge_maximal_slot_n_eq1() {
+        let schema = make_schema_compound(); // (U64 k, U64 range), I64 payload
+        let delta = make_band_batch(&schema, &[(1, u64::MAX, 1, 9)]);
+        for rel in [RangeRel::Gt, RangeRel::Ge, RangeRel::Lt, RangeRel::Le] {
+            let trace = make_band_batch(&schema, &[(1, 0, 1, 100), (1, 50, 1, 150), (2, 0, 1, 200)]);
+            assert_merge_eq_per_row(schema, 1, rel, &delta, trace);
+        }
+    }
+
+    /// Mid-group tombstone: a trace row with weight ≤ 0 must still advance the
+    /// delta pointer (it participates in the monotone walk) yet emit nothing
+    /// (its product is net-zero / suppressed). Covers a zero and a negative
+    /// trace weight against the per-row oracle.
+    #[test]
+    fn test_range_dt_merge_tombstone_advances_pointer() {
+        let schema = make_schema_u64_i64();
+        let delta = make_batch(&schema, &[(40, -1, 400)]); // retraction
+        for rel in [RangeRel::Lt, RangeRel::Le] {
+            // y=20 is a tombstone (w=0), y=25 carries a negative weight.
+            let trace = make_batch(&schema, &[(10, 1, 110), (20, 0, 120), (25, -1, 125), (30, 1, 130)]);
+            assert_merge_eq_per_row(schema, 0, rel, &delta, trace);
+        }
+    }
+
+    /// High fan-out (`output ≫ r`), both pointer directions: every delta row
+    /// matches most of its trace group. The suffix rel (`Lt`) over large `d` and
+    /// the prefix rel (`Gt`) over small `d` each drive the monotone pointer the
+    /// full width of the group; output must equal the oracle.
+    #[test]
+    fn test_range_dt_merge_high_fanout_both_directions() {
+        let schema = make_schema_u64_i64();
+        let trace_rows: Vec<(u64, i64, i64)> =
+            (0..8u64).map(|y| (y, 1, 100 + y as i64)).collect();
+        // suffix rel: large delta keys → each matches the whole low prefix.
+        let delta_lt = make_batch(&schema, &[(5, 1, 1), (6, 1, 2), (7, 1, 3)]);
+        let n1 = assert_merge_eq_per_row(schema, 0, RangeRel::Lt, &delta_lt,
+            make_batch(&schema, &trace_rows));
+        // prefix rel: small delta keys → each matches the whole high suffix.
+        let delta_gt = make_batch(&schema, &[(0, 1, 1), (1, 1, 2), (2, 1, 3)]);
+        let n2 = assert_merge_eq_per_row(schema, 0, RangeRel::Gt, &delta_gt,
+            make_batch(&schema, &trace_rows));
+        assert!(n1 > 8 && n2 > 8, "high fan-out should emit ≫ |trace| rows: {n1}, {n2}");
+    }
+
+    /// Multiset delta + multi-payload trace: duplicate `[eq‖d]` on both sides
+    /// (distinct payloads). The merge must emit the full cross-product per trace
+    /// row, weights multiplied — same as the per-row oracle.
+    #[test]
+    fn test_range_dt_merge_multiset_multipayload() {
+        let schema = make_schema_u64_i64();
+        // Trace PK=10 twice (distinct payloads); delta PK=15 twice.
+        let trace = make_batch(&schema, &[(10, 1, 101), (10, 2, 102), (20, 1, 200)]);
+        let delta = make_batch(&schema, &[(15, 1, 1), (15, 3, 2)]);
+        // Lt: y < 15 → both PK=10 rows; each delta row matches both → 4 rows.
+        assert_merge_eq_per_row(schema, 0, RangeRel::Lt, &delta, trace);
+    }
+
+    /// `n_eq = 0`, `Lt`/`Le`: one eq group spanning the whole trace, walked once.
+    /// The degenerate single-group case the pure-range merge targets.
+    #[test]
+    fn test_range_dt_merge_n_eq0_single_walk() {
+        let schema = make_schema_u64_i64();
+        let delta = make_batch(&schema, &[(15, 1, 1), (25, 1, 2), (35, 1, 3)]);
+        for rel in [RangeRel::Lt, RangeRel::Le] {
+            let trace = make_batch(&schema, &[(10, 1, 110), (20, 1, 120), (30, 1, 130)]);
+            assert_merge_eq_per_row(schema, 0, rel, &delta, trace);
+        }
+    }
+
+    /// Empty trace with a non-empty delta: the merge (which the `n > trace_len`
+    /// selector picks when `trace_len == 0`) walks zero trace rows and emits
+    /// nothing — same as the per-row path landing every seek on an invalid cursor.
+    #[test]
+    fn test_range_dt_merge_empty_trace() {
+        let schema = make_schema_u64_i64();
+        let delta = make_batch(&schema, &[(10, 1, 1), (20, 1, 2)]);
+        // Through the public selector: n=2 > trace_len=0 → merge path, empty out.
+        let mut ch = trace_cursor(make_batch(&schema, &[]), schema);
+        let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, RangeRel::Le);
+        assert_eq!(out.count, 0);
+    }
+
+    /// Band join with non-matching groups (`n_eq = 1`): a trace eq group with no
+    /// delta group (merge forward-skips it) and a delta eq group with no trace
+    /// group (emits nothing). Only the shared group k=3 produces output.
+    #[test]
+    fn test_range_dt_merge_non_matching_groups() {
+        let schema = make_schema_compound();
+        // Trace groups k=1, k=3; delta groups k=2 (no trace), k=3 (matches).
+        let delta = make_band_batch(&schema, &[(2, 7, 1, 2), (3, 7, 1, 3)]);
+        for rel in [RangeRel::Lt, RangeRel::Le, RangeRel::Gt, RangeRel::Ge] {
+            let trace = make_band_batch(&schema, &[(1, 5, 1, 15), (3, 5, 1, 35), (3, 9, 1, 39)]);
+            assert_merge_eq_per_row(schema, 1, rel, &delta, trace);
+        }
+    }
+
+    /// The public selector routes by size: an oversized delta (`n > trace_len`)
+    /// takes the merge, a small delta the per-row path — both equal the per-row
+    /// oracle. Pins the `n > trace_len` boundary end to end.
+    #[test]
+    fn test_range_dt_selector_routes_by_size() {
+        let schema = make_schema_u64_i64();
+        let trace_rows: Vec<(u64, i64, i64)> =
+            (0..4u64).map(|y| (y * 10, 1, 100 + y as i64)).collect();
+        // Oversized delta (8 > 4) → merge; small delta (2 ≤ 4) → per-row.
+        for delta_rows in [
+            vec![(5u64, 1i64, 0i64), (6, 1, 0), (7, 1, 0), (8, 1, 0),
+                 (9, 1, 0), (11, 1, 0), (12, 1, 0), (13, 1, 0)],
+            vec![(15, 1, 0), (25, 1, 0)],
+        ] {
+            let delta = make_batch(&schema, &delta_rows);
+            // Oracle: force the per-row path directly.
+            let mut ch_oracle = trace_cursor(make_batch(&schema, &trace_rows), schema);
+            let oracle = range_per_row_seek(&delta, ch_oracle.cursor_mut(), &schema, &schema, 0, RangeRel::Lt);
+            // Subject: the public selector.
+            let mut ch = trace_cursor(make_batch(&schema, &trace_rows), schema);
+            let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, RangeRel::Lt);
+            assert_eq!(range_multiset(&oracle), range_multiset(&out));
+        }
     }
 
     // -----------------------------------------------------------------------

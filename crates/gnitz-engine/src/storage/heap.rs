@@ -534,26 +534,7 @@ mod tests {
     }
 
     // --- property test: random k-way merges vs sorted reference ---
-    //
-    // Tiny xorshift64* — no rand crate dep, deterministic across hosts.
-    struct Rng(u64);
-    impl Rng {
-        fn new(seed: u64) -> Self { Self(seed | 1) }
-        fn next_u64(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x >> 12;
-            x ^= x << 25;
-            x ^= x >> 27;
-            self.0 = x;
-            x.wrapping_mul(0x2545F4914F6CDD1D)
-        }
-        fn gen_u128(&mut self) -> u128 {
-            ((self.next_u64() as u128) << 64) | (self.next_u64() as u128)
-        }
-        fn gen_range(&mut self, max: u64) -> u64 {
-            self.next_u64() % max
-        }
-    }
+    use crate::test_rng::Rng;
 
     #[test]
     fn property_kway_merge_random() {
