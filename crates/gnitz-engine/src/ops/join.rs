@@ -5,7 +5,8 @@ use std::cmp::Ordering;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::{is_german_string, RangeRel};
 use crate::storage::{
-    range_cut_points, write_to_batch, Batch, ConsolidatedBatch, MemBatch, ReadCursor,
+    range_cut_points, range_group_cut_points, write_to_batch, Batch, ConsolidatedBatch,
+    MemBatch, ReadCursor,
     scatter_copy, with_payload_cmp,
 };
 
@@ -495,15 +496,14 @@ fn range_per_row_seek(
     output
 }
 
-/// Strategy 2 — trace-driven eq-group merge walk (`|delta| > |trace|`). Sweeps
-/// the (smaller) trace forward exactly once — no per-row seek — keeping a
-/// monotone pointer into the current delta eq group and emitting the matching
-/// contiguous delta sub-range per trace row. Both sides are globally sorted by
-/// `[eq…, range]`, so eq groups line up by a forward scan: skip any trace group
-/// below the current delta group, then walk the matching group. Structurally the
-/// equi-join's `join_dt_swapped` (drive the smaller side, never seek), but with a
-/// monotone delta pointer replacing its per-trace-row binary search —
-/// `O(r + m + output)` with no binary search of any kind.
+/// Strategy 2 — trace-driven eq-group merge walk (`|delta| > |trace|`). Per delta
+/// eq-group, `range_group_cut_points` gives the one `[start, end)` span covering
+/// the whole group; seek to `start` and sweep only that span with a monotone
+/// delta pointer, emitting the matching contiguous delta sub-range per trace row.
+/// The seek skips untouched trace groups *and* the intra-group dead head/tail, so
+/// every walked trace row matches some delta row — none is walked redundantly.
+/// Structurally a sort-merge band join: `O(g·log r + covered + m + output)`,
+/// `g` = #delta groups, `covered` = matched trace rows.
 fn range_merge_walk(
     consolidated: &Batch,
     cursor: &mut ReadCursor,
@@ -514,37 +514,43 @@ fn range_merge_walk(
 ) -> Batch {
     let eq_size = right_schema.leading_key_size(n_eq);
     // `MemBatch::get_pk_bytes` returns `&'a` tied to the batch data (not a `&self`
-    // borrow), so `e` is held freely across the walk while `delta_mb` is read again.
+    // borrow), so `e` is held freely across grouping while `delta_mb` is read again.
     let delta_mb = consolidated.as_mem_batch();
     let mut output = Batch::empty_joined(left_schema, right_schema);
     let m = consolidated.count;
 
-    // The selector rewound the cursor to the trace head. One forward sweep of the
-    // (smaller) trace: each row is touched once, by either the group-skip or the
-    // group-walk. No seek.
     let mut lo = 0; // start of the current delta eq group
-    while lo < m && cursor.valid {
-        // Delta eq group [lo, hi): contiguous rows sharing the eq prefix E.
+    while lo < m {
+        // Delta eq group [lo, hi): contiguous rows sharing the eq prefix E, range
+        // slots ascending in [d_lo, d_hi].
         let e = &delta_mb.get_pk_bytes(lo)[..eq_size];
         let mut hi = lo + 1;
         while hi < m && &delta_mb.get_pk_bytes(hi)[..eq_size] == e {
             hi += 1;
         }
 
-        // Forward-advance over any trace eq group below E (none when n_eq == 0).
-        // The cursor moves forward only and delta groups ascend, so this never
-        // re-scans — skip + walk over all groups totals O(r).
-        while cursor.valid && &cursor.current_pk_bytes()[..eq_size] < e {
-            cursor.advance();
-        }
+        // One cut spanning the whole group. `None` ⇒ provably-empty group (e.g.
+        // Gt of an all-maximal slot) — skip it.
+        let d_lo = &delta_mb.get_pk_bytes(lo)[eq_size..];
+        let d_hi = &delta_mb.get_pk_bytes(hi - 1)[eq_size..];
+        let Some((start, end)) = range_group_cut_points(e, d_lo, d_hi, rel) else {
+            lo = hi;
+            continue;
+        };
 
+        // Seek to the covered start (absolute today; the targets ascend across
+        // groups, so `seek_bytes_forward` slots in once that primitive lands).
+        // Skips untouched trace groups and the intra-group dead head in one hop.
+        cursor.seek_bytes(start.as_slice());
         let mut ptr = lo; // monotone delta pointer
         while cursor.valid {
-            // Bind the PK once: both the eq-group test and the range-slot read come
-            // from it, so the row is fetched from the cursor a single time.
+            // Bind the PK once: both the span-end bound and the range-slot read
+            // use it, so the row is fetched from the cursor a single time. Every
+            // key in [start, end) carries eq prefix E, so `end` alone delimits
+            // the group — no per-row eq check needed.
             let pk = cursor.current_pk_bytes();
-            if &pk[..eq_size] != e {
-                break;
+            if end.as_ref().is_some_and(|e2| pk >= e2.as_slice()) {
+                break; // reached the covered-span end (the dead tail follows)
             }
             let s = &pk[eq_size..]; // trace range slot (PK is exactly stride bytes)
             let w_t = cursor.current_weight;
@@ -2096,6 +2102,25 @@ mod tests {
         let delta = make_batch(&schema, &[(15, 1, 1), (15, 3, 2)]);
         // Lt: y < 15 → both PK=10 rows; each delta row matches both → 4 rows.
         assert_merge_eq_per_row(schema, 0, RangeRel::Lt, &delta, trace);
+    }
+
+    /// Seek-anchoring elides dead trace regions: the delta's covered span is a
+    /// narrow slice of a large trace. `Gt`/`Ge` seek past the dead low head (to
+    /// `succ(min_d)`); `Lt`/`Le` stop before the dead high tail (at `max_d`). Both
+    /// must match the per-row oracle over the same large trace.
+    #[test]
+    fn test_range_dt_merge_seek_anchored_elides_dead_region() {
+        let schema = make_schema_u64_i64();
+        let trace_rows: Vec<(u64, i64, i64)> =
+            (0..30u64).map(|y| (y, 1, 100 + y as i64)).collect();
+        // Gt over a large min: covered = (25, 30); the 0..=25 head is seek-skipped.
+        let delta_gt = make_batch(&schema, &[(25, 1, 1), (26, 1, 2)]);
+        assert_merge_eq_per_row(schema, 0, RangeRel::Gt, &delta_gt,
+            make_batch(&schema, &trace_rows));
+        // Lt over a small max: covered = [0, 4); the 4..30 tail is early-stopped.
+        let delta_lt = make_batch(&schema, &[(3, 1, 1), (4, 1, 2)]);
+        assert_merge_eq_per_row(schema, 0, RangeRel::Lt, &delta_lt,
+            make_batch(&schema, &trace_rows));
     }
 
     /// `n_eq = 0`, `Lt`/`Le`: one eq group spanning the whole trace, walked once.
