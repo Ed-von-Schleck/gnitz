@@ -18,8 +18,11 @@ table: K matches cost K unclustered seeks — `O(K · S · log N)` (S = sources 
 the merge cursor) with hostile cache behavior on large K.
 
 Single-group lookups (full-arity equality seeks, unique seeks) are already
-source-PK-ascending and are not the target; they share the helper but gain
-only the (cheap, nearly-sorted) sort.
+source-PK-ascending: an equality prefix that pins every indexed column
+(`natives.len() == col_indices.len()`) leaves only the trailing source-PK
+suffix to order the entries, so the walk yields them ascending and distinct.
+They share the helper but skip the sort entirely, so the point-lookup path pays
+nothing for this change.
 
 Two further inefficiencies on these paths are independent of the sort but
 fixed in the same edit: both methods open the base-table cursor and allocate
@@ -32,9 +35,11 @@ resolution even though the final row count is known once the walk finishes.
 ## Design
 
 Split the walk into collect-then-resolve, shared by both methods. Collecting
-source PKs first lets the resolve phase sort them; it also lets both seeks
-skip base-cursor and accumulator construction entirely when the walk found
-nothing, and size the accumulator exactly when it did.
+source PKs first lets the caller sort them before the resolve sweep; it also
+lets both seeks skip base-cursor and accumulator construction entirely when the
+walk found nothing, and size the accumulator exactly when it did. The walk's
+index cursor is dropped the moment collection finishes, so it never coexists
+with the base cursor.
 
 ### Shared resolve helper
 
@@ -44,31 +49,41 @@ advanced past them by resolve time), the helper drops the old `MAX_PK_BYTES`
 scratch-copy: `PkBuf` already stores the exact `src_pk_stride` bytes inline
 (up to `MAX_PK_BYTES`), so wide (`src_pk_stride > 16`) sources stay correct.
 
+The helper resolves in the order it is given; sorting is the caller's
+responsibility (it owns the arity knowledge that decides whether a sort is even
+needed — see below). Mirrors `gather_family_bytes`, whose contract is likewise
+"pass PKs ascending for monotone probes; correctness does not require it."
+
 ```rust
 // catalog/store.rs — associated fn on CatalogEngine, replacing
 // `resolve_index_entry_into`. Called by both `seek_by_index` and
 // `seek_by_index_range`.
-/// Resolve collected source PKs against the base table in ascending PK order.
-/// Sorting first turns K random point-seeks into a monotone forward sweep:
-/// each `seek_bytes` lower-bounds at or past the previous position's key, so
-/// shard pages and the merge state stay hot. The collected PKs are the index
-/// entries' source-PK OPK suffixes, whose memcmp order equals the base table's
-/// storage order, so the byte sort *is* the seek order. Resolution semantics
-/// are identical to the previous per-entry path: present, live, exact-PK rows
-/// are appended at their net `current_weight` (never a hardcoded 1, so Z-Set
-/// multiplicity is preserved).
+/// Resolve already-collected source PKs against the base table, appending each
+/// present, live, exact-PK row to `acc` at its net `current_weight` (never a
+/// hardcoded 1, so Z-Set multiplicity is preserved). Callers pass `pks`
+/// ascending: each `seek_bytes` then lower-bounds at or past the previous key,
+/// turning K scattered point-seeks into a monotone forward sweep that keeps
+/// shard pages and merge state hot. The PKs are the index entries' source-PK
+/// OPK suffixes, whose memcmp order equals the base table's storage order, so a
+/// byte sort *is* the seek order. `PkBuf` carries the exact `src_pk_stride`
+/// bytes inline (up to `MAX_PK_BYTES`), so wide sources resolve with no widen.
 fn resolve_collected_pks_into(
-    pks: &mut [crate::storage::PkBuf],
+    pks: &[crate::storage::PkBuf],
     src_cursor: &mut CursorHandle,
     acc: &mut Batch,
 ) {
-    pks.sort_unstable_by(|a, b| a.pk_bytes().cmp(b.pk_bytes()));
     for pk in pks.iter() {
         let bytes = pk.pk_bytes();
         src_cursor.cursor.seek_bytes(bytes);
+        // `current_weight > 0` is kept deliberately, not as redundancy: the
+        // single-source cursor path (`drive_single`) does not consolidate, so
+        // it can surface a tombstone an uncompacted source still holds. One
+        // predictable branch, dwarfed by the seek, keeps this correct against
+        // any cursor and matches every other point-seek here (`seek_family`,
+        // `gather_family_bytes`).
         if src_cursor.cursor.valid
-            && src_cursor.cursor.current_weight > 0
             && src_cursor.cursor.current_pk_bytes() == bytes
+            && src_cursor.cursor.current_weight > 0
         {
             let w = src_cursor.cursor.current_weight;
             src_cursor.cursor.copy_current_row_into(acc, w);
@@ -97,6 +112,10 @@ while idx_cursor.cursor.valid {
     }
     idx_cursor.cursor.advance();
 }
+// Collection is done; free the index merge tree and its shard snapshots before
+// opening the base cursor (`open_cursor` returns an owned, Rc/Arc-snapshot
+// handle), so the two never coexist and obsolete shards can be reclaimed.
+drop(idx_cursor);
 
 // Zero matches: skip base-cursor construction (Rc-snapshot clones +
 // tournament-tree build in `open_cursor`) and the accumulator allocation.
@@ -104,12 +123,17 @@ if pks.is_empty() {
     return Ok(None);
 }
 
+// A range spans many duplicate groups, so the collected source PKs interleave
+// across the base table — sort to recover the ascending sweep. `PkBuf: Ord`
+// delegates to `compare_pk_bytes` (memcmp), the base table's storage order.
+pks.sort_unstable();
+
 // Base table holds unique PKs and each row carries one indexed value, so the
 // collected PKs are distinct and `pks.len()` is a tight upper bound on the
 // result row count — size `acc` once instead of growing it row by row.
 let mut src_cursor = entry.handle.open_cursor();
 let mut acc = Batch::with_schema(src_schema, pks.len());
-Self::resolve_collected_pks_into(&mut pks, &mut src_cursor, &mut acc);
+Self::resolve_collected_pks_into(&pks, &mut src_cursor, &mut acc);
 
 Ok((acc.count > 0).then_some(acc))
 ```
@@ -131,20 +155,30 @@ while hit {
     idx_cursor.cursor.advance();
     hit = idx_cursor.cursor.walk_to_positive_with_prefix(opk_prefix);
 }
+drop(idx_cursor);
 
 if pks.is_empty() {
     return Ok(None);
 }
 
+// Full-arity equality (`natives.len() == col_indices.len()`) pins every indexed
+// column, so the entries vary only in their trailing source-PK suffix: the
+// collected PKs are already ascending and distinct — skip the sort. A leading-
+// prefix seek leaves trailing indexed columns free, interleaving source PKs
+// across groups, so it must sort.
+if natives.len() < col_indices.len() {
+    pks.sort_unstable();
+}
+
 let mut src_cursor = entry.handle.open_cursor();
 let mut acc = Batch::with_schema(src_schema, pks.len());
-Self::resolve_collected_pks_into(&mut pks, &mut src_cursor, &mut acc);
+Self::resolve_collected_pks_into(&pks, &mut src_cursor, &mut acc);
 
 Ok((acc.count > 0).then_some(acc))
 ```
 
-(`src_pk_stride` is already bound in `seek_by_index`; the walk no longer needs
-`idx_pk_stride`.)
+(`src_pk_stride` and the `natives` / `col_indices` slices are already bound in
+`seek_by_index`; the walk no longer needs `idx_pk_stride`.)
 
 ### Why this is semantics-preserving
 
@@ -174,19 +208,7 @@ For wide rows this is well under the accumulator's K full rows that already
 exist on this path; for very narrow rows it can exceed them, so peak memory on
 a large-K scan rises by roughly that amount. It is a single bounded allocation
 freed right after resolution, traded for the seek-locality win — acceptable
-for the large-K range scans this targets. If worker-side incremental result
-production is ever added, sort per emitted chunk instead of globally: the
-helper takes `&mut [PkBuf]`, so call it per collected slice. (A tighter
-representation — one flat `K × src_pk_stride` byte buffer sorted via an index
-permutation — would shrink the per-entry overhead but adds sorting complexity;
-defer it until a profile shows memory pressure.)
-
-### Follow-on (separate, optional)
-
-A forward-galloping `seek_bytes` variant (lower-bound restricted to
-`[current position ..)` with exponential probe) would make the sorted sweep
-amortized `O(K · log(N/K))` per source instead of `O(K · log N)`. The sort
-above is its prerequisite; measure before adding it.
+for the large-K range scans this targets.
 
 ## Tests
 
@@ -198,6 +220,10 @@ above is its prerequisite; measure before adding it.
 - Unit: a table with `src_pk_stride > 16` (wide / composite PK) round-trips
   through collect → sort → resolve, confirming `PkBuf` carries the full-width
   source PK (regression guard for dropping the `MAX_PK_BYTES` scratch-copy).
+- Unit: a full-arity equality seek on a **non-unique** index
+  (`natives.len() == col_indices.len()`, multiple matching rows whose source PKs
+  are *not* the index emission order) returns the correct multiset — exercises
+  the sort-skip branch and asserts the entries were already source-PK-ascending.
 - Existing index-range e2e suites cover end-to-end semantics; they compare
   order-insensitively (master merge order is already worker-interleaved).
 - Perf: time a range scan matching ≥ 1M rows on a multi-shard table before and
