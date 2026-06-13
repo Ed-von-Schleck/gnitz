@@ -48,7 +48,7 @@ client/wire-protocol change; everything is planner + engine + master relay.
 
 ## Background — current state (verified against code)
 
-**Equi-join circuit** (`gnitz-sql/src/planner.rs:1017-1351`,
+**Equi-join circuit** (`gnitz-sql/src/planner.rs:1009-1351`,
 `execute_create_join_view`): per side `input_delta_tagged` → optional
 `Filter(multi_null_filter_prog)` (only when a key column is nullable, :1128-1173)
 → `map_reindex(cols, target_tcs, build_reindex_program)` (:1141, :1174) →
@@ -93,10 +93,19 @@ columns included.
   driver's `has_exchange` branch (`dag.rs:1216-1239`) runs `pre` → sets the
   pre-plan `exchange_schema` (`get_exchange_schema`, compiled from
   `pre.out_reg`'s schema at `compiler.rs:2278`) → `exchange.do_exchange(view,
-  pre_result, 0)` → `consolidate_exchanged` → `post`. The branches
-  `has_exchange` / `has_join_shard` are **mutually exclusive** today
-  (:1211-1259) — a view with both would take the `has_exchange` arm and never
-  broadcast its input. The range join needs a new combined branch.
+  pre_result, 0)` → `consolidate_exchanged` → `post`. **`has_join_shard` is
+  NOT join-specific**: it is `!get_join_shard_cols(view_id, src_id).is_empty()`
+  (`dag.rs:1201`), and `reindex_cols_through_filters` (`compiler.rs:488`)
+  matches *"a join (or group) reindex"* (its own comment, :505) — so a GROUP BY
+  / reduce / single-sided set-op view has **both** `has_join_shard == true`
+  **and** `has_exchange == true`. The two arms do not separate by boolean
+  value; only the if/else **ordering** (`has_exchange` checked first, :1216)
+  routes GROUP BY to the exchange arm and equi-joins (which have
+  `has_exchange == false`, 0-exchange) to the `has_join_shard` arm (:1240).
+  **Consequence (load-bearing):** the new range-join branch must NOT key on
+  `has_join_shard && has_exchange` — that predicate is true for every GROUP BY
+  view and would capture and break them. It must key on the precise
+  `view_is_range_join(view_id)` predicate (§7).
 - The single-worker drivers (`evaluate_dag` :1076, `execute_epoch_for_dag`
   :1419) run pre → post back-to-back with no IPC; `skip_exchange` shortcuts
   exist for trivially co-partitioned views (:1206-1209) and a join-shard
@@ -106,13 +115,14 @@ columns included.
 - There is **no broadcast primitive** in `ops/exchange.rs` — every scatter
   hashes each row to exactly one destination.
 
-**Join operators** (`ops/join.rs`): `op_join_delta_trace` (:221-257)
+**Join operators** (`ops/join.rs`): `op_join_delta_trace` (:226-255)
 consolidates the delta, picks delta-driven `join_dt_merge_walk` (:262-324,
 per-row `cursor.seek_bytes(pk)` + equal-key-run walk, weight
 `w_delta.wrapping_mul(w_trace)`, skip 0) or trace-driven `join_dt_swapped`
-(:326-369). Row emission via `write_join_row` (:419-474): output layout
+(:326-369) when `|Δ| > |trace|` (the `n > trace_len` heuristic, :250). Row
+emission via `write_join_row` (:419-474): output layout
 `[delta PK ‖ delta payload ‖ trace payload]`, schema from
-`merge_schemas_for_join` (`compiler.rs:753`). `ReadCursor::seek_bytes`
+`merge_schemas_for_join` (`compiler.rs:779`). `ReadCursor::seek_bytes`
 (`storage/read_cursor.rs:518`) is an arbitrary-position lower-bound re-seek
 (rebuilds the tournament tree) — the index range scan's
 `resolve_index_entry_into` already re-seeks one cursor in arbitrary key order,
@@ -130,12 +140,12 @@ plan caches are per-process).
 `decode_op_node` (:218). Highest opcode today is 31; 32/33 are free.
 
 **Half-open range walk.** The single-table range scan (`seek_by_index_range`,
-`catalog/store.rs:1032-1123`) walks a half-open `[start, end)` byte interval.
+`catalog/store.rs:1041-1137`) walks a half-open `[start, end)` byte interval.
 Its bounds ride in `RangeDescriptor { eq, n_eq, start: Cut, end: Cut }`
 (`gnitz-wire/src/range.rs`), where `Cut { Before(u128), After(u128) }` is a
 two-variant cut descriptor; the Cut→byte-key mapping is the inline `cut_key`
-closure (`store.rs:1085-1092`) over a fixed-width successor
-`increment_key_in_place` (`store.rs:1810`, returns `bool` — `false` on
+closure (`store.rs:1094-1101`) over a fixed-width successor
+`increment_key_in_place` (`store.rs:1824`, returns `bool` — `false` on
 carry-out of an all-`0xFF` or empty key). That mapping is keyed at
 `index_key_type` and is driven by one planner-chosen `Cut` per bound, not by a
 trace-slot-vs-delta-slot `RangeRel` that derives *both* interval ends from one
@@ -220,9 +230,9 @@ while cursor.valid
 ```
 
 `cursor.valid` and `cursor.current_weight` are public fields;
-`current_pk_cmp_bytes` (`read_cursor.rs:550`) is the OPK-memcmp comparator the
-equi-join merge-walk uses (`current_pk_bytes()`, :527, returns the raw region if
-a bare slice compare is preferred). Pure byte compares are valid here for the
+`current_pk_cmp_bytes` (`read_cursor.rs:563`) is the OPK-memcmp comparator the
+equi-join merge-walk uses (returns `std::cmp::Ordering`; `current_pk_bytes()`,
+:540, returns the raw region if a bare slice compare is preferred). Pure byte compares are valid here for the
 same reasons the single-table range scan's are: OPK at rest, both sides
 byte-identical at the common `T`, and (PK, payload) sort puts every row of a PK
 interval in one contiguous run.
@@ -231,12 +241,16 @@ interval in one contiguous run.
 `Gt`/`Ge` `end` — empty tail, no special case). Equal-key runs with mixed
 payloads need no handling beyond what `<` on full PK bytes gives.
 
-Lift `increment_key_in_place` out of `catalog/store.rs:1810` (module-private,
+Lift `increment_key_in_place` out of `catalog/store.rs:1824` (file-private,
 returning `bool`) into a shared module (e.g. `storage/range_key.rs`) and host
-the §3 `RangeRel`→cut-point derivation there. The single-table scan's cut-point
-logic lives inline in `seek_by_index_range`'s `cut_key` closure and is
-index-scan-specific, so it is not shareable directly; `seek_by_index_range` can
-adopt the extracted helper as a second consumer.
+the §3 `RangeRel`→cut-point derivation (`range_cut_points`) there.
+`increment_key_in_place` then has two consumers: `seek_by_index_range`'s
+existing `cut_key` closure and the new `range_cut_points`. The cut-point
+*derivation* is not shared: the index scan drives off native-`u128` `Cut`
+values re-encoded through `seek_prefix` (`RangeDescriptor { eq: [u128; …],
+start/end: Cut }`), whereas the probe drives off the delta row's raw OPK PK
+bytes — different representations, so `seek_by_index_range` keeps its own
+`cut_key` closure and does **not** call `range_cut_points`.
 
 Per-row `seek_bytes` repositioning is O(log T) and supports the backward seeks
 that `Lt`/`Le` with `n_eq == 0` require (all rows share `start = 0x00…`).
@@ -286,8 +300,9 @@ logical pair `(a, b)` routes to the same worker with identical
 view output table is partitioned by its PK like every other view — scans,
 seeks, and downstream views need **no changes**.
 
-**Epoch flow** (multi-worker, new dag branch — `has_exchange && has_join_shard`,
-placed before the plain `has_exchange` arm):
+**Epoch flow** (multi-worker, new dag branch — keyed on
+`view_is_range_join(view_id)`, placed first in the chain, before the plain
+`has_exchange` arm):
 
 ```
 worker: local ΔA slice ──FLAG_EXCHANGE──► master: prepare_relay(src_id>0)
@@ -330,11 +345,15 @@ one more key column in the list. INNER join only, so no null-fill branches.
   *"range join key … content hash is not order-preserving"*; floats already
   rejected.
 - `n_eq + 1 ≤ PK_LIST_MAX_COLS` (same cap as the equality path).
-- Output PK: route the synthesized `[a.pk…, b.pk…]` list through the existing
-  `validate_pk_cols` (`catalog/sys_tables.rs`) — it enforces both
-  `a.pk_count + b.pk_count ≤ PK_LIST_MAX_COLS` (= 4) **and** the `MAX_PK_BYTES`
-  stride ceiling; a 4-column pair-PK of wide types can pass the count and fail
-  the stride.
+- Output PK: the binding constraint is the **count cap**
+  `a.pk_count + b.pk_count ≤ PK_LIST_MAX_COLS` (= 4). Route the synthesized
+  `[a.pk…, b.pk…]` list through the existing `validate_pk_cols`
+  (`catalog/sys_tables.rs:64`, count check at :71). Its `MAX_PK_BYTES` stride
+  ceiling (:105) is **non-binding** here: `MAX_PK_BYTES = MAX_PK_COLUMNS·16
+  = 80` (`gnitz-wire/src/catalog.rs:124`), while any ≤ 4-column pair-PK is at
+  most `4·16 = 64` bytes, so anything that passes the count passes the stride.
+  Keep `validate_pk_cols` as the single defensive gate, but the only rejection
+  the pair-PK can actually hit is the 4-column count.
 - LEFT/OUTER + range conjunct: reject (*"LEFT JOIN with a range predicate is
   not supported"*). Anti/semi-join machinery is equality-shaped; out of scope.
 - Self-join: still rejected (source-id discriminator, unchanged).
@@ -402,14 +421,24 @@ Next to `join_with_trace_node` (:376):
     A subset or permutation silently falls to a column-wise hash that diverges
     from scan routing, stranding rows on a worker the scan never reads. The
     GROUP-BY-equals-PK reduce view (`planner.rs:1876`) routes the same way;
-    assert this equality in the planner.
+    assert this equality in the planner. A pair-PK of wide types can exceed
+    16 bytes; `partition_for_pk_bytes` (`storage/partitioned_table.rs:458`)
+    then hashes the full region via `xxh::checksum` instead of the `u128`
+    `widen_pk_be` path — consistently for both the scatter and view scan/seek
+    (same function, same packed bytes), so wide compound pair-PKs route
+    correctly with no extra handling.
   - Output schema: `pa + pb` leading `ColumnDef`s named `_pair_pk_{i}`
     (types = source PK column types, non-nullable) + user-selected columns;
-    `view_pk = 0..pa+pb`. Duplicate-name rejection as today. **Simplification
-    (optional)**: fuse the re-key `map_reindex` and the user-projection `Map`
-    into one `map_reindex` whose program emits exactly the user columns over
-    `pair_pk_cols` — one fewer node, and the differing `_join_pk` slots are
-    never materialized after the re-key.
+    `view_pk = 0..pa+pb`. Duplicate-name rejection as today.
+  - **Fuse the re-key and the user projection (recommended default, not
+    optional)**: emit a single `map_reindex` whose program produces exactly the
+    user columns over `pair_pk_cols`. Besides saving a node, this is the safer
+    form: it never materializes the synthetic `_join_pk` slots (positions
+    `0..k`), whose *values* differ between term AB (`OPK(a.x)`) and term BA
+    (`OPK(b.y)`). A non-fused path is correct only as long as the trailing user
+    projection drops `0..k`; the fused path makes that drop structural, so a
+    differing key slot can never leak into the exchanged/consolidated output and
+    leave a permanent cross-worker ghost.
 
 ### 4. `crates/gnitz-engine/src/ops/join.rs` — the operator
 
@@ -432,13 +461,14 @@ left). Mark the output unsorted (probe order is delta-major, payload-runs
 arbitrary). No swapped/trace-driven variant in slice 1.
 
 Shared helper: `storage/range_key.rs` (or `ops/util.rs`) hosting the
-`increment_key_in_place` lifted from `catalog/store.rs:1810` plus a new
+`increment_key_in_place` lifted from `catalog/store.rs:1824` plus a new
 `range_cut_points(eq, d, rel, stride) -> Option<(start, Option<end>)>`
 (`None` = provably empty) implementing the §3 table. `succ(eq)` for the
 `Gt`/`Ge` `end` is `increment_key_in_place` on the `eq`-prefix sub-slice
-followed by zero-padding the slot region. `seek_by_index_range` can adopt
-`range_cut_points` as a second consumer; its inline `cut_key` closure is not
-shaped for the `RangeRel` derivation.
+followed by zero-padding the slot region. Only `increment_key_in_place` is
+shared with `seek_by_index_range`; `range_cut_points` is range-join-specific
+(byte/`RangeRel`-shaped, not native-`u128`/`Cut`-shaped), so the index scan
+does not consume it.
 
 `ops/linear.rs` (or `ops/exchange.rs`): `op_partition_filter(batch, worker_id,
 num_workers) -> Batch` — copy-through of rows whose
@@ -455,33 +485,45 @@ equals `worker_id`. Identity (no copy) when `num_workers == 1`.
 ### 6. `crates/gnitz-engine/src/compiler.rs` — emit arms + worker identity
 
 - `OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel })`: output schema via
-  `merge_schemas_for_join` (:753, unchanged); `builder.add_join_dt_range(…)`.
-- `OpNode::PartitionFilter`: pass-through schema; emit with the dag's
+  `merge_schemas_for_join` (:779, unchanged); `builder.add_join_dt_range(…)`.
+- `OpNode::PartitionFilter`: pass-through schema; emit with the worker's
   `(worker_id, num_workers)`.
-- Thread `(worker_id, num_workers)` into the DAG/compile context: new fields on
-  the catalog DAG, set once at worker startup (default `(0, 1)` for
-  single-process and unit tests).
+- Worker identity is **already a compile-time static**: `WORKER_RANK`
+  (`compiler.rs:23`) is set by `set_worker_rank(worker_id)` post-fork
+  (`runtime/worker.rs:383`), where `num_workers` is also in scope (:375/:386).
+  Reuse it: expose `worker_rank()` (currently file-private, :31) and add a
+  sibling `NUM_WORKERS` static set in the same call. This is lighter than new
+  DAG-context fields and matches the existing pattern; both default to
+  `(0, 1)` for single-process and unit tests (`PartitionFilter(0,1)` =
+  keep-all).
 - `reindex_cols_through_filters` (:488) is untouched: it walks
   `ScanDelta → Filter* → Map(reindex)`; `PartitionFilter` sits *after* the
   Map. Verify with the existing unit tests plus one new case.
-- The 1-exchange split (:2251-2310) already handles the range-join circuit
+- The 1-exchange split (:2250-2319) already handles the range-join circuit
   (everything before `ExchangeShard` → pre, sink → post; the pre VM owns the
   trace tables exactly as equi-join pre-only plans do).
 
 ### 7. `crates/gnitz-engine/src/dag.rs` — broadcast detection + driver branch
 
 - `view_is_range_join(view_id) -> bool`: any `Join(DeltaTraceRange { .. })`
-  node in the meta circuit; cached like `join_shard_cols_cache`.
+  node in the meta circuit; cached like `join_shard_cols_cache`. This is the
+  **only** correct branch discriminator (see below).
 - `evaluate_dag_multi_worker` (:1167-1259): the runtime branch chain is
   `has_exchange && view_has_side_b` (two-sided set-ops, :1211) → `has_exchange`
-  (:1216) → `has_join_shard` (:1240) → plain pre (:1256). Insert the combined
-  branch **between the two-sided arm and the plain `has_exchange` arm** — range
-  joins have `view_has_side_b == false`, so they fall past :1211 and would
-  otherwise be swallowed by the `has_exchange` arm at :1216, which never relays
-  the join input:
+  (:1216) → `has_join_shard` (:1240) → plain pre (:1256). Insert the range-join
+  branch keyed on **`view_is_range_join(view_id)`**, placed **first in the
+  chain** (before the two-sided arm at :1211). It must precede the `has_exchange`
+  arm at :1216 because a range join has `has_exchange == true` (its output
+  `ExchangeShard`) and would otherwise be swallowed there, which never relays
+  the join input. **Do not** gate it on `has_join_shard && has_exchange`: that
+  predicate is also true for every GROUP BY / reduce / single-sided set-op view
+  (`has_join_shard` matches group reindexes — `compiler.rs:505`), so it would
+  divert them into the broadcast path and corrupt them. `view_is_range_join` is
+  exclusive (a range join is never a two-sided set-op), so placing it first is
+  safe:
 
   ```rust
-  } else if has_join_shard && has_exchange {
+  let out_delta = if self.view_is_range_join(view_id) {
       // Range join: broadcast input relay → pre → output exchange → post.
       // No co-partition shortcut: a range probe needs the full delta even
       // when the join key equals the source PK.
@@ -496,7 +538,8 @@ equals `worker_id`. Identity (no copy) when `num_workers == 1`.
       let post_in = exchange.do_exchange(view_id, &pre_result, 0);
       let post_in = Self::consolidate_exchanged(post_in, &exchange_schema);
       self.execute_post_phase(view_id, post_in)
-  }
+  } else if has_exchange && self.view_has_side_b(view_id) {
+      // ... existing arms unchanged ...
   ```
 
 - `plan_source_co_partitioned` (:855) and `skip_exchange` (:1206-1209) must
@@ -505,9 +548,9 @@ equals `worker_id`. Identity (no copy) when `num_workers == 1`.
 ### 8. `crates/gnitz-engine/src/runtime/master.rs` + `ops/exchange.rs` — broadcast relay
 
 - `prepare_relay` (:733) receives the per-worker source slices as
-  `PendingRelay.payloads` (`[Option<Batch>; MAX_WORKERS]`, each worker's
-  base-table-PK-partitioned slice — disjoint, so their concatenation is the full
-  delta with no duplication). After the `is_join` classification (:745-756),
+  `PendingRelay.payloads` (`Vec<Option<Batch>>`, one entry per worker — each
+  worker's base-table-PK-partitioned slice — disjoint, so their concatenation is
+  the full delta with no duplication). After the `is_join` classification (:745-756),
   when `is_join && cat.dag.view_is_range_join(view_id)` → skip the scatter and
   call a new `op_relay_broadcast(sources, num_workers)`: concatenate all
   non-empty payloads once, clone per worker (`Vec<Batch>` of length
@@ -530,9 +573,9 @@ equals `worker_id`. Identity (no copy) when `num_workers == 1`.
   bit of signed columns at rest, so `compare_pk_bytes` is a plain memcmp that is
   numerically correct for unsigned and signed keys at any width. Never compare
   un-promoted natives; never hand-roll a bound encode — the bound *is* the
-  delta row's packed PK bytes. (`foundations.md` §6 describes a native-LE-at-rest
-  layout with a type-aware comparator that does not match this code; update it
-  to the OPK-at-rest reality this probe depends on.)
+  delta row's packed PK bytes. (`foundations.md` §6 already documents this
+  OPK-at-rest layout and its memcmp comparator; the probe relies on it as
+  written — no foundations edit is needed.)
 - **One packer still routes both sides.** Trace contents, the
   `PartitionFilter` ownership hash, and (in the equality fallback paths) the
   scatter all key off the same `ReindexPacker` output bytes. The ownership
@@ -573,7 +616,7 @@ equals `worker_id`. Identity (no copy) when `num_workers == 1`.
 ## Migration order
 
 1. **Shared cut-point helper** — lift `increment_key_in_place` from
-   `catalog/store.rs:1810` into a shared module and build the §3
+   `catalog/store.rs:1824` into a shared module and build the §3
    `RangeRel`→cut-point derivation there. The single-table scan's `cut_key`
    logic is index-scan-specific and not reusable directly.
 2. **Wire + builder** (§1, §2): opcodes, `RangeRel`, node columns, encode/
@@ -641,6 +684,13 @@ Multi-worker E2E (`make e2e`, `GNITZ_WORKERS=4`, new `TestRangeJoin` in
   the double exchange.
 - View-over-range-join-view (e.g. GROUP BY over `v`) stays consistent under
   retraction — output deltas are well-formed for downstream circuits.
+- **Branch-routing regression** (guards the §7 discriminator): in the same
+  cluster as a range-join view, run a plain GROUP BY view and a single-sided
+  set-op view (both have `has_join_shard == true` and `has_exchange == true`)
+  and confirm they still produce correct results — i.e. they take the
+  `has_exchange` arm, not the range-join broadcast branch. A Rust unit test on
+  the dag asserting `view_is_range_join` is `false` for a GROUP BY meta-circuit
+  pins the predicate cheaply.
 
 ## Out of scope (follow-ons, in rough order of value)
 
