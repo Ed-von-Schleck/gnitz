@@ -1,5 +1,6 @@
 #![cfg(feature = "integration")]
 
+use gnitz_core::{OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_PARTITION_FILTER};
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
@@ -561,4 +562,46 @@ fn test_range_join_pair_pk_at_cap() {
     p.execute("CREATE TABLE rp_b (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, y BIGINT NOT NULL, PRIMARY KEY (k1, k2))").unwrap();
     p.execute("CREATE VIEW rp_v AS SELECT rp_a.x, rp_b.y FROM rp_a JOIN rp_b ON rp_a.x < rp_b.y").unwrap();
     assert!(client.resolve_table_or_view_id(&sn, "rp_v").is_ok(), "4-column pair-PK is at the cap, should register");
+}
+
+// ── Range/band-join circuit shape (the §1 PartitionFilter split) ─────────────
+
+/// The §1 split, pinned at the circuit level. A band join (`n_eq ≥ 1`) is
+/// eq-prefix-scattered, so its per-side trace is already partitioned and the
+/// circuit carries NO `PartitionFilter`. A pure range join (`n_eq == 0`)
+/// broadcasts, so each side keeps a `PartitionFilter` to drop the rows the worker
+/// does not own before integrating — two of them, one per side. Both are range
+/// circuits: each has two `Join(DeltaTraceRange)` terms (the bilinear AB/BA form).
+#[test]
+fn test_range_join_partition_filter_circuit_shape() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE cs_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE TABLE cs_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)").unwrap();
+        // Band join (one eq conjunct + one range conjunct).
+        p.execute("CREATE VIEW cs_band AS SELECT cs_a.id AS aid, cs_b.id AS bid \
+                   FROM cs_a JOIN cs_b ON cs_a.k = cs_b.k AND cs_a.lo <= cs_b.t").unwrap();
+        // Pure range join (no eq conjunct).
+        p.execute("CREATE VIEW cs_pure AS SELECT cs_a.id AS aid, cs_b.id AS bid \
+                   FROM cs_a JOIN cs_b ON cs_a.lo <= cs_b.t").unwrap();
+    }
+    let band = client.resolve_table_or_view_id(&sn, "cs_band").unwrap().0;
+    let pure = client.resolve_table_or_view_id(&sn, "cs_pure").unwrap().0;
+
+    // The nodes table is invariant once both circuits are built — scan it once and
+    // count over the single batch.
+    let nodes = scan_circuit_nodes(&mut client);
+    let nodes = nodes.as_ref();
+
+    assert_eq!(opcode_node_count(nodes, band, OPCODE_PARTITION_FILTER), 0,
+        "band join scatters by the eq prefix — no PartitionFilter");
+    assert_eq!(opcode_node_count(nodes, pure, OPCODE_PARTITION_FILTER), 2,
+        "pure range join broadcasts — one PartitionFilter per side");
+
+    assert_eq!(opcode_node_count(nodes, band, OPCODE_JOIN_DELTA_TRACE_RANGE), 2,
+        "band join is a range circuit — two DeltaTraceRange terms");
+    assert_eq!(opcode_node_count(nodes, pure, OPCODE_JOIN_DELTA_TRACE_RANGE), 2,
+        "pure range join — two DeltaTraceRange terms");
 }

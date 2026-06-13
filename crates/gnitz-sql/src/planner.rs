@@ -1324,7 +1324,8 @@ fn execute_create_join_view(
 /// zero) plus exactly one range conjunct. Both sides reindex onto
 /// `[eq slots…, range slot]` at the pair's common promoted type, so each side's
 /// trace is an ordered arrangement by the range key; the active delta is
-/// broadcast and probed against the other side's owned trace by an ordered range
+/// eq-prefix-scattered (band join, `n_eq ≥ 1`) or broadcast (pure range join,
+/// `n_eq == 0`) and probed against the other side's trace by an ordered range
 /// walk. Because the two terms emit with different delta-side keys, the output is
 /// re-keyed onto the **source-PK pair** `(a.pk…, b.pk…)` — the only identity
 /// under which a `+1` and its later `-1` (from opposite terms, on different
@@ -1416,12 +1417,20 @@ fn build_range_join_view(
     let reindex_a = cb.map_reindex(input_a, &left_reindex_cols, &left_target_tcs, build_reindex_program(left_schema));
     let reindex_b = cb.map_reindex(input_b, &right_reindex_cols, &right_target_tcs, build_reindex_program(right_schema));
 
-    // Trace = the worker-owned slice only (PartitionFilter between reindex and
-    // integrate); the join terms probe the UNFILTERED (full, broadcast) reindex.
-    let filt_a = cb.partition_filter(reindex_a);
-    let trace_a = cb.integrate_trace(filt_a);
-    let filt_b = cb.partition_filter(reindex_b);
-    let trace_b = cb.integrate_trace(filt_b);
+    // Band join (n_eq ≥ 1): the input relay scatters by the eq prefix, so each
+    // side's trace is already eq-prefix-partitioned — integrate the scattered
+    // reindex directly. Pure range join (n_eq == 0): the input is broadcast, so
+    // each worker must drop the rows it does not own (PartitionFilter between
+    // reindex and integrate) before integrating, or traces replicate and matches
+    // duplicate. The join terms probe the UNFILTERED reindex either way — for a
+    // band join that reindex IS the worker's scattered eq-prefix slice.
+    let (int_a, int_b) = if n_eq == 0 {
+        (cb.partition_filter(reindex_a), cb.partition_filter(reindex_b))
+    } else {
+        (reindex_a, reindex_b)
+    };
+    let trace_a = cb.integrate_trace(int_a);
+    let trace_b = cb.integrate_trace(int_b);
     let join_ab = cb.join_with_trace_range_node(reindex_a, trace_b, n_eq as u8, rel_ab); // ΔA ⋈θ I(B)
     let join_ba = cb.join_with_trace_range_node(reindex_b, trace_a, n_eq as u8, rel_ba); // ΔB ⋈θ I(A)
 

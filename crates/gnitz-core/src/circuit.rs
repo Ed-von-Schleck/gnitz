@@ -396,9 +396,10 @@ impl CircuitBuilder {
     }
 
     /// Keep only rows this worker owns (by packed-PK partition) before they
-    /// integrate into a range-join trace under the broadcast input relay. Worker
-    /// identity is baked in at compile time, so the node carries no payload;
-    /// single-process compiles emit `(0, 1)` = keep-all.
+    /// integrate into a **pure** range-join trace under the broadcast input relay
+    /// (a band join's eq-prefix scatter omits this node — its trace is already
+    /// eq-prefix-partitioned). Worker identity is baked in at compile time, so the
+    /// node carries no payload; single-process compiles emit `(0, 1)` = keep-all.
     pub fn partition_filter(&mut self, input: NodeId) -> NodeId {
         let nid = self.alloc_node(OpNode::PartitionFilter);
         self.connect(input, nid, gnitz_wire::PORT_IN);

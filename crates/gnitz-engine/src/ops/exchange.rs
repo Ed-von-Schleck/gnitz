@@ -77,10 +77,13 @@ pub fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
 }
 
 /// Keep only the rows this worker owns, by packed-PK partition — the trace-side
-/// counterpart of the range-join broadcast input relay. Every worker receives the
-/// full broadcast delta; before it integrates into a range-join trace, this drops
+/// counterpart of the **pure** range-join broadcast input relay. A pure range
+/// join (n_eq == 0) has no eq prefix to scatter by, so it broadcasts; every worker
+/// receives the full delta and, before it integrates into the trace, this drops
 /// the rows whose `partition_for_pk_bytes` partition is not assigned to
-/// `worker_id`. It is the SAME hash the equality scatter (`RouteMode::JoinPromote`)
+/// `worker_id`. (A band join scatters by the eq prefix instead — its trace is
+/// already eq-prefix-partitioned and carries no `PartitionFilter`.) It is the SAME
+/// hash the equality scatter (`RouteMode::JoinPromote`)
 /// applies to the SAME packed PK bytes, so the integrated trace is partitioned
 /// identically to a scattered equi-join trace — no trace replicates, no match
 /// duplicates. Worker identity is a compile-time constant baked into the emitted

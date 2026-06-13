@@ -8,7 +8,6 @@
 //! These tests assert the emitted Filter-node count for each key-nullability /
 //! join-type combination by reading back the circuit's `nodes` system table.
 
-use gnitz_core::{GnitzClient, ColData, PkColumn, CIRCUIT_NODES_TAB, OPCODE_FILTER};
 use gnitz_sql::{SqlPlanner, SqlResult};
 use gnitz_test_harness::ServerHandle;
 
@@ -23,37 +22,6 @@ fn view_id_of(results: &[SqlResult]) -> u64 {
             _ => None,
         })
         .expect("CREATE VIEW did not return a view id")
-}
-
-/// Count Filter nodes belonging to `vid` in the circuit `nodes` system table.
-/// The compound PK is (view_id, sub) packed LE into 16 bytes (view_id in the
-/// low 8); the opcode is schema column 3 (Fixed u64-LE, non-PK).
-fn filter_node_count(client: &mut GnitzClient, vid: u64) -> usize {
-    let (_, batch, _) = client.scan(CIRCUIT_NODES_TAB).unwrap();
-    let batch = match batch {
-        Some(b) => b,
-        None => return 0,
-    };
-    let opcodes = match &batch.columns[3] {
-        ColData::Fixed(buf) => buf,
-        other => panic!("opcode column not Fixed: {other:?}"),
-    };
-    let mut count = 0;
-    for i in 0..batch.len() {
-        let pk = match &batch.pks {
-            PkColumn::Bytes { .. } => batch.pks.get_bytes(i),
-            other => panic!("circuit nodes PK not wide bytes: {other:?}"),
-        };
-        let row_vid = u64::from_le_bytes(pk[0..8].try_into().unwrap());
-        if row_vid != vid {
-            continue;
-        }
-        let opcode = u64::from_le_bytes(opcodes[i * 8..i * 8 + 8].try_into().unwrap());
-        if opcode == OPCODE_FILTER {
-            count += 1;
-        }
-    }
-    count
 }
 
 /// All-NOT-NULL keys: zero Filter nodes — byte-identical to the original plan.

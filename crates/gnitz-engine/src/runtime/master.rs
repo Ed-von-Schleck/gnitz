@@ -756,21 +756,35 @@ impl MasterDispatcher {
             (cat.dag.get_shard_cols(view_id), Vec::new(), false)
         };
 
-        // A range-join input relay (source_id > 0) must BROADCAST the full delta to
-        // every worker: a range probe's matches are spread over the whole key
-        // space, so the equality scatter — one destination per row — would strand
-        // most matches. Each worker integrates only its owned slice (PartitionFilter)
-        // and probes that slice, so every match is still emitted exactly once
-        // cluster-wide. The output relay (source_id == 0) is NOT a range-join input
-        // relay (is_join is false there) and keeps the GroupKey scatter.
-        let dest_batches = if is_join && cat.dag.view_is_range_join(view_id) {
-            let sources: Vec<Option<&Batch>> = payloads.iter().map(|opt| opt.as_ref()).collect();
+        // A range-join INPUT relay (source_id > 0, is_join over a DeltaTraceRange
+        // view): `view_range_join_n_eq` reads the equality-conjunct count straight
+        // off the join node. The trace-side reindex key is [eq cols…, range col]
+        // (len n_eq + 1). A band join (n_eq ≥ 1) scatters by the eq PREFIX — route
+        // by the first n_eq slots, dropping the trailing range slot, so equal
+        // eq-values co-partition both sides and the range probe is partition-local.
+        // A pure range join (n_eq == 0) has no eq prefix: its matches are spread
+        // over the whole key space, so it BROADCASTS the full delta and each worker
+        // trims to its owned slice (PartitionFilter) before integrating. The output
+        // relay (source_id == 0) is NOT a join relay (is_join is false there) and
+        // keeps the GroupKey scatter.
+        let range_n_eq = if is_join { cat.dag.view_range_join_n_eq(view_id) } else { None };
+
+        let dest_batches = if range_n_eq == Some(0) {
+            // Pure range join: broadcast the full delta to every worker.
+            let sources: Vec<Option<&Batch>> = payloads.iter().map(|o| o.as_ref()).collect();
             op_relay_broadcast(&sources, &schema, self.num_workers)
         } else {
-            // Equality scatter: route each row to the worker owning its key
-            // partition. The shard cols / consolidation are built here, where used —
-            // the broadcast arm above needs none of them.
-            let col_indices: Vec<u32> = shard_cols.iter().map(|&c| c as u32).collect();
+            // Scatter. Band join (range_n_eq == Some(n_eq ≥ 1)): route by the eq
+            // prefix shard_cols[..n_eq]. Equi-join: full shard cols. Both
+            // JoinPromote. GROUP BY / set-op: full shard cols, GroupKey.
+            let route_len = range_n_eq.map_or(shard_cols.len(), |n_eq| n_eq as usize);
+            debug_assert!(range_n_eq.is_none_or(|n_eq| shard_cols.len() == n_eq as usize + 1),
+                "range-join reindex key = [eq…, range]: len must be n_eq + 1");
+            let col_indices: Vec<u32> = shard_cols[..route_len].iter().map(|&c| c as u32).collect();
+            // target_tcs is EMPTY for a GroupKey scatter (no promotion) and has
+            // length shard_cols.len() for any join; slice it to the routing prefix
+            // when promoting, empty otherwise.
+            let route_tcs: &[u8] = if is_join { &target_tcs[..route_len] } else { &[] };
             let mode = if is_join { RouteMode::JoinPromote } else { RouteMode::GroupKey };
             let consolidated_sources: Option<Vec<Option<&ConsolidatedBatch>>> = payloads.iter()
                 .map(|opt| match opt {
@@ -780,11 +794,11 @@ impl MasterDispatcher {
                 .collect();
             match consolidated_sources {
                 Some(sources) => {
-                    op_relay_scatter_consolidated_mode(&sources, &col_indices, &target_tcs, &schema, self.num_workers, mode)
+                    op_relay_scatter_consolidated_mode(&sources, &col_indices, route_tcs, &schema, self.num_workers, mode)
                 }
                 None => {
-                    let sources: Vec<Option<&Batch>> = payloads.iter().map(|opt| opt.as_ref()).collect();
-                    op_repartition_batches_mode(&sources, &col_indices, &target_tcs, &schema, self.num_workers, mode)
+                    let sources: Vec<Option<&Batch>> = payloads.iter().map(|o| o.as_ref()).collect();
+                    op_repartition_batches_mode(&sources, &col_indices, route_tcs, &schema, self.num_workers, mode)
                 }
             }
         };

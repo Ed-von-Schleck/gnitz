@@ -50,8 +50,9 @@ pub const OPCODE_SCAN_TRACE_TABLE:       u64 = 31;
 /// Non-equi (range) join: symmetric delta-trace join whose probe is an ordered
 /// half-open range walk over the trace instead of an equal-key seek.
 pub const OPCODE_JOIN_DELTA_TRACE_RANGE: u64 = 32;
-/// Drop trace rows this worker does not own (range-join broadcast input). Worker
-/// identity is a compile-time constant, so the node carries no payload.
+/// Drop trace rows this worker does not own (**pure** range-join broadcast input;
+/// a band join scatters by its eq prefix and omits this node). Worker identity is
+/// a compile-time constant, so the node carries no payload.
 pub const OPCODE_PARTITION_FILTER:       u64 = 33;
 
 // ---------------------------------------------------------------------------
@@ -227,7 +228,8 @@ pub enum OpNode {
     /// `OPCODE_CLEAR_DELTAS = 15`. Server-internal.
     ClearDeltas,
     /// `OPCODE_PARTITION_FILTER = 33`. Keep only rows whose packed-PK partition is
-    /// owned by this worker (range-join broadcast input). Worker identity is a
+    /// owned by this worker (**pure** range-join broadcast input; a band join
+    /// scatters by its eq prefix and omits this node). Worker identity is a
     /// compile-time constant, so no payload travels on the wire.
     PartitionFilter,
 }

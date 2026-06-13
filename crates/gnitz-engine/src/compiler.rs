@@ -538,17 +538,25 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
     seqs.into_iter().flatten().collect()
 }
 
-/// Whether a loaded meta-circuit is a non-equi (range) join — it has any
-/// `Join(DeltaTraceRange)` node. The precise range-join discriminator for the
-/// dag driver branch and the broadcast input relay. It is deliberately NOT
-/// `has_join_shard && has_exchange`: that predicate is also true for every
-/// GROUP BY / reduce / single-sided set-op view (a group reindex matches
-/// `reindex_cols_through_filters`, and the view has an output `ExchangeShard`),
-/// so keying on it would divert those views into the broadcast path and corrupt
-/// them. Shared by `DagEngine::view_is_range_join` and its unit test.
-pub(crate) fn circuit_is_range_join(loaded: &LoadedCircuit) -> bool {
-    loaded.nodes.values().any(|op|
-        matches!(op, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { .. })))
+/// The equality-conjunct count `n_eq` of a non-equi (range / band) join, or
+/// `None` if the loaded meta-circuit is not one — read straight off its
+/// `Join(DeltaTraceRange { n_eq, .. })` node (both bilinear terms carry the same
+/// `n_eq`). `Some` is the precise range-join discriminator for the dag driver
+/// branch and the input relay; the `n_eq` value tells the relay whether to
+/// eq-prefix-scatter (`n_eq ≥ 1`, band join) or broadcast (`n_eq == 0`, pure
+/// range join) without re-deriving it from the reindex key.
+///
+/// It is deliberately NOT `has_join_shard && has_exchange`: that predicate is
+/// also true for every GROUP BY / reduce / single-sided set-op view (a group
+/// reindex matches `reindex_cols_through_filters`, and the view has an output
+/// `ExchangeShard`), so keying on it would divert those views into the relay
+/// path and corrupt them. Shared by `DagEngine::view_range_join_n_eq` and its
+/// unit test.
+pub(crate) fn circuit_range_join_n_eq(loaded: &LoadedCircuit) -> Option<u8> {
+    loaded.nodes.values().find_map(|op| match op {
+        gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq, .. }) => Some(*n_eq),
+        _ => None,
+    })
 }
 
 fn compute_join_shard_map(loaded: &LoadedCircuit) -> HashMap<i64, Vec<(i32, u8)>> {
@@ -3779,7 +3787,7 @@ mod tests {
     }
 
     #[test]
-    fn test_circuit_is_range_join_discriminator() {
+    fn test_circuit_range_join_n_eq_discriminator() {
         use gnitz_wire::{AggKind, JoinKind, MapKind, OpNode};
         let dummy_blob: Vec<u8> = vec![
             0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -3789,7 +3797,7 @@ mod tests {
         // IntegrateSink. It has BOTH a reindex Map (has_join_shard) AND an
         // ExchangeShard (has_exchange), so the wrong discriminator
         // `has_join_shard && has_exchange` would (incorrectly) call it a range
-        // join. circuit_is_range_join must return false — no DeltaTraceRange node.
+        // join. circuit_range_join_n_eq must return None — no DeltaTraceRange node.
         let mut gb = HashMap::new();
         gb.insert(0, OpNode::ScanDelta(7));
         gb.insert(1, OpNode::Map(MapKind::Expression {
@@ -3800,19 +3808,19 @@ mod tests {
         gb.insert(4, OpNode::IntegrateSink);
         let gb_edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN), (3, 4, PORT_IN)];
         let gb_loaded = make_loaded(gb, gb_edges);
-        assert!(!circuit_is_range_join(&gb_loaded),
+        assert_eq!(circuit_range_join_n_eq(&gb_loaded), None,
             "GROUP BY view must NOT be classified as a range join");
 
-        // A range join: a Join(DeltaTraceRange) node makes it true.
+        // A range join: a Join(DeltaTraceRange) node makes it Some, carrying n_eq.
         let mut rj = HashMap::new();
         rj.insert(0, OpNode::ScanDelta(7));
         rj.insert(1, OpNode::ScanTrace(8));
-        rj.insert(2, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 0, rel: gnitz_wire::RangeRel::Lt }));
+        rj.insert(2, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 2, rel: gnitz_wire::RangeRel::Lt }));
         rj.insert(3, OpNode::IntegrateSink);
         let rj_edges = vec![(0, 2, PORT_IN_A), (1, 2, PORT_TRACE), (2, 3, PORT_IN)];
         let rj_loaded = make_loaded(rj, rj_edges);
-        assert!(circuit_is_range_join(&rj_loaded),
-            "a Join(DeltaTraceRange) node must classify the view as a range join");
+        assert_eq!(circuit_range_join_n_eq(&rj_loaded), Some(2),
+            "a Join(DeltaTraceRange) node classifies the view as a range join, carrying its n_eq");
     }
 
     #[test]

@@ -1151,12 +1151,15 @@ def test_range_scan_max_arity_descriptor(client):
 # ---------------------------------------------------------------------------
 # Non-equi (range / band) join — SQL E2E
 #
-# Both sides reindex onto [eq keys…, range key]; the active delta is broadcast
-# to every worker and probed against the other side's owned trace by an ordered
-# range walk; the output is re-keyed onto the source-PK pair (a.pk, b.pk) and
-# exchanged by it, so the view is PK-partitioned like every other view. These
-# run at GNITZ_WORKERS=4 under `make e2e`, exercising the broadcast input relay,
-# the PartitionFilter-owned traces, the double exchange, and cross-worker
+# Both sides reindex onto [eq keys…, range key]. A band join (n_eq ≥ 1) scatters
+# its delta by the eq PREFIX, so equal eq-values co-partition both sides and the
+# range walk runs partition-local (no PartitionFilter). A pure range join
+# (n_eq == 0) has no eq prefix: its delta is broadcast to every worker and probed
+# against the other side's PartitionFilter-owned trace by an ordered range walk.
+# Either way the output is re-keyed onto the source-PK pair (a.pk, b.pk) and
+# exchanged by it, so the view is PK-partitioned like every other view. These run
+# at GNITZ_WORKERS=4 under `make e2e`, exercising the eq-prefix scatter (band) and
+# broadcast (pure range) input relays, the double exchange, and cross-worker
 # retraction cancellation.
 # ---------------------------------------------------------------------------
 
@@ -1217,7 +1220,15 @@ class TestRangeJoin:
 
     def test_band_join_eq_prefix_plus_range(self, client):
         """Band join `ON a.k = b.k AND a.lo <= b.t` — composite trace key; a
-        same-range row in a different equality group must NOT match (group edge)."""
+        same-range row in a different equality group must NOT match (group edge).
+
+        The eq key spans dozens of distinct values, so its groups demonstrably
+        spread across all four workers, and each group's two rows sit on DIFFERENT
+        base-table PK partitions (their ids differ by the group count) before the
+        eq-prefix scatter re-homes them onto hash(k). A mis-routed scatter (lost
+        matches) or a wrongly-retained PartitionFilter (which hashes the full
+        [k, lo] key and drops rows whose full-key partition ≠ their [k] partition)
+        fails the cross-filter reference."""
         sn = "bj" + _uid()
         client.create_schema(sn)
         try:
@@ -1230,8 +1241,9 @@ class TestRangeJoin:
             client.execute_sql(
                 "CREATE VIEW v AS SELECT a.lo AS alo, b.t AS bt "
                 "FROM a JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
-            a_rows = [(i, i % 4, (i * 3) % 20) for i in range(1, 25)]   # (id, k, lo)
-            b_rows = [(i, i % 4, (i * 7) % 20) for i in range(1, 25)]   # (id, k, t)
+            ng = 40                                                       # 40 distinct eq groups
+            a_rows = [(i, i % ng, (i * 3) % 20) for i in range(1, 2 * ng + 1)]   # (id, k, lo)
+            b_rows = [(i, i % ng, (i * 7) % 20) for i in range(1, 2 * ng + 1)]   # (id, k, t)
             client.execute_sql(
                 "INSERT INTO a VALUES " + ",".join(f"({i},{k},{lo})" for i, k, lo in a_rows), schema_name=sn)
             client.execute_sql(
@@ -1648,6 +1660,75 @@ class TestRangeJoin:
             # Move it back.
             client.execute_sql("UPDATE a SET k = 100 WHERE id = 1", schema_name=sn)
             assert _view_pairs(client, vid) == {(1, 1)}
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+    def test_band_join_cross_width_eq_key(self, client):
+        """Band join whose EQUALITY key is cross-width promoted: `a.k` is INT
+        UNSIGNED (U32), `b.k` is BIGINT (I64) → common type T=I64. The U32 side
+        routes the scatter through the ReindexPacker (packs at T), while the
+        already-I64 side routes through the single-column route_key (OPK-encoded at
+        its own width, which IS T). Equal k values must hash to the same partition
+        on BOTH legs or the eq-prefix scatter strands matches. No other band test
+        promotes the eq key — test_signed_band_over_the_wire promotes the RANGE
+        column, not the equality prefix."""
+        sn = "bjx" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k INT UNSIGNED NOT NULL, lo BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.lo AS alo, b.t AS bt "
+                "FROM a JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
+            ng = 16                                                      # k ∈ 0..15 (non-negative: U32 side)
+            a_rows = [(i, i % ng, (i * 3) % 20) for i in range(1, 2 * ng + 1)]   # (id, k:U32, lo)
+            b_rows = [(i, i % ng, (i * 7) % 20) for i in range(1, 2 * ng + 1)]   # (id, k:I64, t)
+            client.execute_sql(
+                "INSERT INTO a VALUES " + ",".join(f"({i},{k},{lo})" for i, k, lo in a_rows), schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO b VALUES " + ",".join(f"({i},{k},{t})" for i, k, t in b_rows), schema_name=sn)
+            vid, _ = client.resolve_table(sn, "v")
+            got = _view_pairs(client, vid)
+            want = _range_ref(a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] <= b[2])
+            assert got == want
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+    def test_band_join_backfill_over_populated_tables(self, client):
+        """CREATE VIEW with an eq prefix over ALREADY-POPULATED tables yields the
+        full match set via the eq-prefix scatter — confirming the backfill replay
+        rides the SAME relay, so each source is PARTITIONED, not replicated. Unlike
+        test_backfill_over_populated_tables (a pure `>=` range join that still
+        broadcasts), the band case no longer contributes the O(num_workers × N)
+        backfill blow-up."""
+        sn = "bjb" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
+                schema_name=sn)
+            ng = 24
+            a_rows = [(i, i % ng, (i * 11) % 17) for i in range(1, 2 * ng + 1)]   # (id, k, lo)
+            b_rows = [(i, i % ng, (i * 13) % 17) for i in range(1, 2 * ng + 1)]   # (id, k, t)
+            client.execute_sql(
+                "INSERT INTO a VALUES " + ",".join(f"({i},{k},{lo})" for i, k, lo in a_rows), schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO b VALUES " + ",".join(f"({i},{k},{t})" for i, k, t in b_rows), schema_name=sn)
+            # View created AFTER the data is loaded — pure backfill path.
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.lo AS alo, b.t AS bt "
+                "FROM a JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
+            vid, _ = client.resolve_table(sn, "v")
+            got = _view_pairs(client, vid)
+            want = _range_ref(a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] <= b[2])
+            assert got == want
         finally:
             _drop_all(client, sn, views=["v"], tables=["a", "b"])
 

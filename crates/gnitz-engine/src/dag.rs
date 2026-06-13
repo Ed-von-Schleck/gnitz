@@ -411,7 +411,7 @@ pub struct DagEngine {
     // Whether a view is a non-equi (range) join — its input relay broadcasts and
     // its driver branch double-exchanges. Memoized per view_id; evicted in
     // lockstep with the sibling view-keyed caches.
-    range_join_cache: FxHashMap<i64, bool>,
+    range_join_cache: FxHashMap<i64, Option<u8>>,
     pub(crate) tables: FxHashMap<i64, TableEntry>,
     sys: SysTableRefs,
 }
@@ -783,21 +783,23 @@ impl DagEngine {
         loaded.nodes.values().any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. }))
     }
 
-    /// Whether a view is a non-equi (range) join — has any
-    /// `Join(DeltaTraceRange)` node. The precise discriminator for the
-    /// range-join driver branch and the broadcast input relay. It is NOT
+    /// The equality-conjunct count of a non-equi (range / band) join view, or
+    /// `None` if the view is not one — read off its `Join(DeltaTraceRange)` node.
+    /// `Some` is the precise discriminator for the range-join driver branch; the
+    /// `n_eq` value drives the input relay's eq-prefix scatter (`n_eq ≥ 1`, band
+    /// join) vs. broadcast (`n_eq == 0`, pure range join). It is NOT
     /// `has_join_shard && has_exchange`: that predicate is also true for every
     /// GROUP BY / reduce / single-sided set-op view (a group reindex matches
     /// `reindex_cols_through_filters`), which must keep the plain `has_exchange`
     /// arm. Memoized in `range_join_cache`, evicted with the sibling view caches.
-    pub fn view_is_range_join(&mut self, view_id: i64) -> bool {
+    pub fn view_range_join_n_eq(&mut self, view_id: i64) -> Option<u8> {
         if let Some(&v) = self.range_join_cache.get(&view_id) {
             return v;
         }
         let loaded = self.load_meta_circuit(view_id);
-        let is_range = crate::compiler::circuit_is_range_join(&loaded);
-        self.range_join_cache.insert(view_id, is_range);
-        is_range
+        let n_eq = crate::compiler::circuit_range_join_n_eq(&loaded);
+        self.range_join_cache.insert(view_id, n_eq);
+        n_eq
     }
 
     // ── Compilation ─────────────────────────────────────────────────────
@@ -1233,13 +1235,16 @@ impl DagEngine {
                 info.is_trivial && info.is_co_partitioned
             };
 
-            let out_delta = if self.view_is_range_join(view_id) {
-                // Range join: broadcast input relay → pre → output exchange → post.
+            let out_delta = if self.view_range_join_n_eq(view_id).is_some() {
+                // Range join: input relay (eq-prefix scatter for a band join,
+                // broadcast for a pure range join) → pre → output exchange → post.
                 // Checked FIRST: a range join has has_exchange == true (its output
                 // ExchangeShard), so it would otherwise be swallowed by the
                 // has_exchange arm below, which never relays the join input. No
-                // co-partition shortcut applies: a range probe needs the full
-                // delta even when the join key equals the source PK.
+                // co-partition shortcut applies: a pure range probe needs the full
+                // delta even when the join key equals the source PK, and a band join
+                // always routes through the relay by decision (see prepare_relay)
+                // rather than taking a co-partition exchange-skip.
                 //
                 // Set the source schema for exchange wire encoding: a batch with
                 // rows but a None schema emits FLAG_HAS_DATA without FLAG_HAS_SCHEMA
@@ -1250,12 +1255,17 @@ impl DagEngine {
                         input_with_schema.set_schema(entry.schema);
                     }
                 }
-                // (1) Broadcast the source delta to every worker (master relay).
+                // (1) Relay the source delta (eq-prefix scatter for a band join or
+                // broadcast for a pure range join, decided master-side in
+                // `prepare_relay`).
                 let bc = exchange.do_exchange(view_id, &input_with_schema, src_id);
                 let exchange_schema = self.get_exchange_schema(view_id)
                     .unwrap_or_else(|| self.tables[&view_id].schema);
-                // (2) Pre plan on the full delta: reindex, ownership-filter the
-                // traces, range-probe, normalize, re-key onto the source-PK pair.
+                // (2) Pre plan on the relayed delta (the worker's eq-prefix slice for
+                // a band join; the full broadcast delta for a pure range join):
+                // reindex, ownership-filter the traces (pure range only — band-join
+                // traces are already eq-prefix-partitioned by the scatter),
+                // range-probe, normalize, re-key onto the source-PK pair.
                 let pre_result = match self.execute_pre_phase(view_id, bc, src_id) {
                     Some(mut b) => { b.set_schema(exchange_schema); b }
                     None => Batch::with_schema(exchange_schema, 0),
@@ -2042,23 +2052,23 @@ mod tests {
 
     /// `range_join_cache` must be evicted in lockstep with the sibling view-keyed
     /// caches at every invalidation site, or it drifts (a dropped view's stale
-    /// `true`/`false` survives, and the cache disagrees with the live circuit).
+    /// `Some(n_eq)`/`None` survives, and the cache disagrees with the live circuit).
     #[test]
     fn test_range_join_cache_eviction() {
         let mut dag = DagEngine::new();
 
         // invalidate(view_id) drops the per-view entry.
-        dag.range_join_cache.insert(42, true);
+        dag.range_join_cache.insert(42, Some(1));
         dag.invalidate(42);
         assert!(!dag.range_join_cache.contains_key(&42), "invalidate must evict");
 
         // unregister_table(table_id) drops it (the production view-drop path).
-        dag.range_join_cache.insert(43, true);
+        dag.range_join_cache.insert(43, Some(0));
         dag.unregister_table(43);
         assert!(!dag.range_join_cache.contains_key(&43), "unregister_table must evict");
 
         // invalidate_all() clears it (the production bulk flush).
-        dag.range_join_cache.insert(44, false);
+        dag.range_join_cache.insert(44, None);
         dag.invalidate_all();
         assert!(dag.range_join_cache.is_empty(), "invalidate_all must clear");
     }
