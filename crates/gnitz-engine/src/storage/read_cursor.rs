@@ -522,6 +522,19 @@ impl ReadCursor {
         self.rebuild_and_drive();
     }
 
+    /// Seek to `key` (exact `pk_stride` OPK bytes) and report whether it landed
+    /// on a *present, live* row: positioned, PK byte-equal, and net weight > 0.
+    /// The weight gate is load-bearing, not redundant — a single-source cursor
+    /// (`drive_single`) does not consolidate, so it can surface a tombstone an
+    /// uncompacted source still holds; every point lookup must filter it. Folds
+    /// the `seek_bytes` + valid/exact-PK/positive-weight predicate that point
+    /// seeks (`seek_family`, `gather_family_bytes`, index resolve, the
+    /// unique-upsert probe, single-row retract) would otherwise open-code.
+    pub fn seek_exact_live(&mut self, key: &[u8]) -> bool {
+        self.seek_bytes(key);
+        self.valid && self.current_pk_eq(key) && self.current_weight > 0
+    }
+
     /// PK region of the current row as raw bytes, without copying. Byte-addressed
     /// sibling of the `current_key` field; correct for compound/wide PKs.
     pub fn current_pk_bytes(&self) -> &[u8] {

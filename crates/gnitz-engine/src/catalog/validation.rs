@@ -302,11 +302,7 @@ impl CatalogEngine {
                     false
                 } else if wide {
                     let row_pk_bytes = batch.get_pk_bytes(row);
-                    let cur = base_cursor.as_mut().unwrap();
-                    cur.cursor.seek_bytes(row_pk_bytes);
-                    cur.cursor.valid
-                        && cur.cursor.current_weight > 0
-                        && cur.cursor.current_pk_bytes() == row_pk_bytes
+                    base_cursor.as_mut().unwrap().cursor.seek_exact_live(row_pk_bytes)
                 } else {
                     // Verbatim OPK bytes — never `get_pk` (OPK-widened), which
                     // `has_pk(u128)` re-OPK-encodes (double sign-flip for signed),

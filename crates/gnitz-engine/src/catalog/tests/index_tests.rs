@@ -2578,3 +2578,280 @@ fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── collect-then-resolve: sorted source-PK resolution ────────────────────
+//
+// `seek_by_index` (prefix) and `seek_by_index_range` collect the matched
+// source PKs, sort them (skipping the sort only for a full-arity equality
+// seek, whose single duplicate group is already ascending), then resolve in
+// one monotone forward sweep. These tests pin the observable contract: the
+// resolved multiset, net-weight handling, the wide-PK byte path, and the
+// sort-skip branch.
+
+/// Collect `(pk, payload_col0, weight)` for every positive-weight row of a
+/// narrow-PK result batch, sorted by PK — the order-insensitive reference form
+/// for comparing a seek result against an expected multiset.
+fn result_triples(r: Option<Batch>) -> Vec<(u128, u64, i64)> {
+    let mut out: Vec<(u128, u64, i64)> = match r {
+        Some(b) => {
+            let col = b.col_data(0);
+            (0..b.count)
+                .filter(|&i| b.get_weight(i) > 0)
+                .map(|i| {
+                    let v = u64::from_le_bytes(col[i * 8..i * 8 + 8].try_into().unwrap());
+                    (b.get_pk(i), v, b.get_weight(i))
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    out.sort();
+    out
+}
+
+#[test]
+fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
+    // A range spanning ≥ 2 duplicate groups, with source PKs deliberately
+    // scrambled so the index-emission order (2,5,8,1,3,7) interleaves across
+    // groups and the resolve sort genuinely reorders to (1,2,3,5,7,8). The
+    // resolved multiset must match a scan-and-filter reference; a retraction in
+    // one group must drop that row at net weight 0.
+    let dir = temp_dir("catalog_range_multigroup");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // x=10 at PKs {5,2,8}, x=20 at PKs {3,7,1} — two duplicate groups.
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, x) in [(5u128, 10u64), (2, 10), (8, 10), (3, 20), (7, 20), (1, 20)] {
+        bb.begin_row(pk, 1); bb.put_u64(x); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // x ∈ [10, 20] → all six rows, each at weight 1.
+    let r = engine
+        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(10), After(20)))
+        .unwrap();
+    assert_eq!(
+        result_triples(r),
+        vec![(1, 20, 1), (2, 10, 1), (3, 20, 1), (5, 10, 1), (7, 20, 1), (8, 10, 1)],
+    );
+
+    // Retract PK 5 (x=10) → net weight 0; it must vanish from the scan.
+    let schema = engine.get_schema(tid).unwrap();
+    let mut rb = BatchBuilder::new(schema);
+    rb.begin_row(5, -1); rb.put_u64(10); rb.end_row();
+    engine.ingest_to_family(tid, &rb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let r = engine
+        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(10), After(20)))
+        .unwrap();
+    assert_eq!(
+        result_triples(r),
+        vec![(1, 20, 1), (2, 10, 1), (3, 20, 1), (7, 20, 1), (8, 10, 1)],
+        "retracted PK 5 must be absent at net weight 0",
+    );
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_prefix_multi_group_sorted() {
+    // A leading-prefix seek (a only) over a composite index (a, b) spans every
+    // b-group under that a. The source PKs interleave across the b-groups
+    // (emission 2,5,1,8), so the prefix path must sort (natives.len() <
+    // col_indices.len()) before resolving. A row under a different a must not
+    // leak in.
+    let dir = temp_dir("catalog_prefix_multigroup");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("a"), u64_col_def("b")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["a", "b"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // a=7: b=100 at PKs {5,2}, b=200 at PKs {8,1}. a=8 at PK 99 (must not match).
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, a, b) in [(5u128, 7u64, 100u64), (2, 7, 100), (8, 7, 200), (1, 7, 200), (99, 8, 100)] {
+        bb.begin_row(pk, 1); bb.put_u64(a); bb.put_u64(b); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // Prefix seek a=7 → PKs {1,2,5,8}, all with a=7; PK 99 (a=8) absent.
+    let r = engine.seek_by_index(tid, &[1, 2], &[7u128]).unwrap()
+        .expect("prefix seek must find the a=7 rows");
+    let mut pks: Vec<u128> = (0..r.count).filter(|&i| r.get_weight(i) > 0).map(|i| r.get_pk(i)).collect();
+    pks.sort();
+    assert_eq!(pks, vec![1, 2, 5, 8]);
+    assert!((0..r.count).all(|i| r.get_weight(i) == 1), "every matched row is at weight 1");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_empty_interval_short_circuits() {
+    // A non-degenerate `[start, end)` (start < end) that nonetheless straddles a
+    // value gap matches no row: the walk collects nothing, so the `pks.is_empty()`
+    // short-circuit returns `Ok(None)` without opening the base cursor. (The
+    // `start ≥ end` / `+∞` short-circuits fire *before* the walk and so do not
+    // exercise this path.)
+    let dir = temp_dir("catalog_range_empty_interval");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Values {10, 30}; the half-open interval for 15 < x < 25 is non-empty but
+    // contains no indexed value.
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, x) in [(1u128, 10u64), (2, 30)] {
+        bb.begin_row(pk, 1); bb.put_u64(x); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let r = engine
+        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], After(15), Before(25)))
+        .unwrap();
+    assert!(r.is_none(), "an empty-but-valid interval returns Ok(None) via pks.is_empty()");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
+    // Regression guard for dropping the `MAX_PK_BYTES` scratch-copy: a wide
+    // (`src_pk_stride` = 24 > 16) source PK must round-trip through
+    // collect → sort → resolve carrying its full width. Each PK varies past byte
+    // 16 (col c), so a 16-byte-truncated key would resolve the wrong row; `PkBuf`
+    // stores all 24 bytes inline and the resolve seeks the full key. The index
+    // emits the entries by indexed value x (collected order (3,_,1),(1,_,5),
+    // (2,_,9)), which is not source-PK order, so the resolve sort genuinely
+    // reorders by the full 24-byte key.
+    //
+    // Wide PKs are DDL-rejected for base tables, so this builds the DAG table and
+    // index circuit directly (as `wide_pk_validation.rs` does). The leading PK
+    // column is distinct per row: the base flush orders the shard by the wide PK,
+    // which the resolve's binary-search seek relies on.
+    use crate::dag::{DagEngine, RelationKind, StoreHandle};
+    use crate::schema::{SchemaColumn, SchemaDescriptor};
+    use crate::storage::{Persistence, Table};
+
+    fn u64c() -> SchemaColumn { SchemaColumn::new(type_code::U64, 0) }
+    fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
+        // Unsigned compound PK: OPK == big-endian per column.
+        let mut p = [0u8; 24];
+        p[0..8].copy_from_slice(&a.to_be_bytes());
+        p[8..16].copy_from_slice(&b.to_be_bytes());
+        p[16..24].copy_from_slice(&c.to_be_bytes());
+        p
+    }
+
+    let dir = temp_dir("catalog_range_wide_pk");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let tid = engine.next_table_id;
+
+    // pk_stride = 24: three U64 PK columns + one U64 payload `x` (source col 3).
+    let schema = SchemaDescriptor::new(&[u64c(), u64c(), u64c(), u64c()], &[0, 1, 2]);
+    let idx_schema = make_index_schema(&[3], &schema).unwrap();
+
+    // (pk, x): distinct leading column, distinct trailing column (past byte 16);
+    // indexed values 10/20/30 chosen so the index emission order (by x) differs
+    // from the source-PK sort order.
+    let rows: [([u8; 24], u64); 3] = [(pk24(3, 0, 1), 10), (pk24(1, 0, 5), 20), (pk24(2, 0, 9), 30)];
+    let mut bb = Batch::with_schema(schema, rows.len());
+    for &(pk, x) in &rows {
+        bb.extend_pk_bytes(&pk);
+        bb.extend_weight(&1i64.to_le_bytes());
+        bb.extend_null_bmp(&0u64.to_le_bytes());
+        bb.extend_col(0, &x.to_le_bytes());
+        bb.count += 1;
+    }
+    // Rows were appended out of PK order; clear the (default-true) flags so the
+    // ingest's `into_consolidated` actually sorts the shard. `BatchBuilder`
+    // resets these per row; a hand-built batch must do so itself.
+    bb.sorted = false;
+    bb.consolidated = false;
+    let idx_batch = DagEngine::batch_project_index(&bb, &[3], &schema, &idx_schema);
+
+    let mut base = Box::new(Table::new(
+        &format!("{dir}/base"), "base", schema, tid as u32, 256 * 1024, Persistence::Ephemeral).unwrap());
+    let mut idx = Table::new(
+        &format!("{dir}/idx"), "idx", idx_schema, tid as u32 + 1, 256 * 1024, Persistence::Ephemeral).unwrap();
+    base.ingest_owned_batch(bb).unwrap();
+    base.flush().unwrap();
+    idx.ingest_owned_batch(idx_batch).unwrap();
+    idx.flush().unwrap();
+
+    engine.dag.register_table(
+        tid, StoreHandle::Borrowed(&mut *base as *mut Table), schema,
+        RelationKind::BaseTable { unique_pk: true }, 0, dir.clone());
+    engine.dag.add_index_circuit(tid, &[3], tid + 1, Box::new(idx), idx_schema, false);
+
+    // x ∈ [10, 30] → all three wide-PK rows, resolved by their full 24-byte key.
+    let r = engine
+        .seek_by_index_range(tid, &[3], &RangeDescriptor::new(&[], Before(10), After(30)))
+        .unwrap()
+        .expect("wide-PK range scan must resolve all three rows");
+    let mut got: Vec<([u8; 24], u64)> = (0..r.count)
+        .filter(|&i| r.get_weight(i) > 0)
+        .map(|i| {
+            let pk: [u8; 24] = r.get_pk_bytes(i).try_into().unwrap();
+            let x = u64::from_le_bytes(r.col_data(0)[i * 8..i * 8 + 8].try_into().unwrap());
+            (pk, x)
+        })
+        .collect();
+    got.sort();
+    let mut want = vec![(pk24(3, 0, 1), 10), (pk24(1, 0, 5), 20), (pk24(2, 0, 9), 30)];
+    want.sort();
+    assert_eq!(got, want, "wide source PKs must resolve at full 24-byte width");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_seek_by_index_full_arity_nonunique_sort_skipped() {
+    // A full-arity equality seek (`natives.len() == col_indices.len()`) on a
+    // NON-unique index pins the one duplicate group, so the index already emits
+    // its members source-PK-ascending and the path skips the sort. The rows are
+    // *inserted* out of PK order (9,3,6); the result must come back in ascending
+    // PK order (3,6,9) — confirming the collected entries were already sorted, so
+    // skipping the sort is correct.
+    let dir = temp_dir("catalog_full_arity_skip");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("x")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["x"], false).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+
+    // x=50 at PKs {9,3,6} (inserted scrambled); x=60 at PK 1 (must not match).
+    let mut bb = BatchBuilder::new(schema);
+    for (pk, x) in [(9u128, 50u64), (3, 50), (6, 50), (1, 60)] {
+        bb.begin_row(pk, 1); bb.put_u64(x); bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    let r = engine.seek_by_index(tid, &[1], &[50u128]).unwrap()
+        .expect("full-arity equality seek must find the x=50 group");
+    // Read PKs in *result-batch order* (no re-sort): the resolve appends in the
+    // collected order, which for the skipped-sort path is the index emission
+    // order — already source-PK-ascending.
+    let pks_in_order: Vec<u128> = (0..r.count).map(|i| r.get_pk(i)).collect();
+    assert_eq!(
+        pks_in_order, vec![3, 6, 9],
+        "full-arity equality entries arrive source-PK-ascending; the sort is correctly skipped");
+    assert!((0..r.count).all(|i| r.get_weight(i) == 1));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

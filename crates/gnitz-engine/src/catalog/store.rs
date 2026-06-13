@@ -822,12 +822,7 @@ impl CatalogEngine {
         };
 
         let (opk, stride) = crate::storage::opk_key(&schema, pk);
-        cursor.cursor.seek_bytes(&opk[..stride]);
-        if !cursor.cursor.valid { return Ok(None); }
-        if cursor.cursor.current_pk_bytes() != &opk[..stride] {
-            return Ok(None);
-        }
-        if cursor.cursor.current_weight <= 0 { return Ok(None); }
+        if !cursor.cursor.seek_exact_live(&opk[..stride]) { return Ok(None); }
 
         let mut batch = Batch::with_schema(schema, 1);
         self.copy_cursor_row_to_batch(&cursor, &mut batch);
@@ -836,8 +831,8 @@ impl CatalogEngine {
 
     /// Byte-keyed sibling of [`seek_family`]: point lookup by full PK bytes,
     /// correct for `pk_stride > 16` where a `u128` key cannot encode the PK.
-    /// Mirrors `seek_family` exactly — open the merged cursor, `seek_bytes`,
-    /// confirm exact PK and positive weight.
+    /// Mirrors `seek_family` exactly — open the merged cursor and
+    /// `seek_exact_live`.
     pub fn seek_family_bytes(&mut self, table_id: i64, pk: &[u8]) -> Result<Option<Batch>, String> {
         let schema = if table_id < FIRST_USER_TABLE_ID {
             sys_tab_schema(table_id)
@@ -856,10 +851,7 @@ impl CatalogEngine {
             self.dag.tables.get(&table_id).unwrap().handle.open_cursor()
         };
 
-        cursor.cursor.seek_bytes(pk);
-        if !cursor.cursor.valid { return Ok(None); }
-        if cursor.cursor.current_pk_bytes() != pk { return Ok(None); }
-        if cursor.cursor.current_weight <= 0 { return Ok(None); }
+        if !cursor.cursor.seek_exact_live(pk) { return Ok(None); }
 
         let mut batch = Batch::with_schema(schema, 1);
         self.copy_cursor_row_to_batch(&cursor, &mut batch);
@@ -895,12 +887,9 @@ impl CatalogEngine {
         let mut out = Batch::with_schema(result_schema, pks.len());
         let mut cursor = self.dag.tables.get(&table_id).unwrap().handle.open_cursor();
         for pk in pks {
-            let bytes = pk.pk_bytes();
-            cursor.cursor.seek_bytes(bytes);
-            if !cursor.cursor.valid { continue; }
-            if cursor.cursor.current_pk_bytes() != bytes { continue; }
-            if cursor.cursor.current_weight <= 0 { continue; }
-            copy_cursor_cols_to_batch(&cursor, &mut out, &schema, project);
+            if cursor.cursor.seek_exact_live(pk.pk_bytes()) {
+                copy_cursor_cols_to_batch(&cursor, &mut out, &schema, project);
+            }
         }
         Ok(out)
     }
@@ -940,15 +929,11 @@ impl CatalogEngine {
         let (opk, prefix_len) = spec.seek_prefix(natives);
         let opk_prefix = &opk[..prefix_len];
 
-        // One index cursor + one source cursor, both owned (Rc-backed snapshots),
-        // reused across the whole walk. The shared `resolve_index_entry_into`
-        // helper copies each match straight into `acc` at its net weight, so the
-        // point seek no longer opens a cursor and heap-allocates a one-row Batch
-        // per match (the old `seek_family_bytes` path).
-        let mut idx_cursor = ic.table_mut().open_cursor();
-        let mut src_cursor = entry.handle.open_cursor();
-        let mut acc = Batch::with_schema(src_schema, 0);
-
+        // One index cursor for the walk; collect each positive match's source-PK
+        // suffix. The walk yields only positive-weight entries
+        // (`walk_to_positive_with_prefix`), so every yielded entry is live — push
+        // its source PK unconditionally.
+        //
         // Seek to the first positive-weight match, then walk forward with
         // `walk_to_positive_with_prefix` after each consumed entry. Re-calling
         // `seek_first_positive_with_prefix` inside the loop would re-seek and
@@ -960,43 +945,67 @@ impl CatalogEngine {
         // their source rows (partitioned by source PK), so a value's matches can
         // be spread across workers: this returns one worker's partial set and
         // the master (`fan_out_seek_by_index_collect_async`) merges across all.
+        let mut idx_cursor = ic.table_mut().open_cursor();
+        let mut pks: Vec<crate::storage::PkBuf> = Vec::new();
+
         let mut hit = idx_cursor.cursor.seek_first_positive_with_prefix(opk_prefix);
         while hit {
-            Self::resolve_index_entry_into(
-                idx_cursor.cursor.current_pk_bytes(), idx_key_size, src_pk_stride,
-                &mut src_cursor, &mut acc);
+            let cur_pk = idx_cursor.cursor.current_pk_bytes();
+            pks.push(crate::storage::PkBuf::from_bytes(
+                &cur_pk[idx_key_size..idx_key_size + src_pk_stride]));
             idx_cursor.cursor.advance();
             hit = idx_cursor.cursor.walk_to_positive_with_prefix(opk_prefix);
         }
-        Ok((acc.count > 0).then_some(acc))
+        // Free the index merge tree and its shard snapshots before the base
+        // cursor opens, so the two never coexist.
+        drop(idx_cursor);
+
+        // Full-arity equality (`natives.len() == col_indices.len()`) pins every
+        // indexed column, so the entries vary only in their trailing source-PK
+        // suffix and the walk already yields them ascending — skip the sort. A
+        // leading-prefix seek leaves trailing indexed columns free, interleaving
+        // source PKs across groups, so it must sort to recover storage order.
+        if natives.len() < col_indices.len() {
+            pks.sort_unstable();
+        }
+        Ok(Self::resolve_source_pks(&entry.handle, src_schema, &pks))
     }
 
-    /// Resolve one secondary-index entry to its source row and append it to
-    /// `acc`. Reconstructs the source PK from the index PK suffix
-    /// (`idx_pk_bytes[idx_key_size..idx_key_size + src_pk_stride]`), seeks the
-    /// **reused** `src_cursor`, and—when the row is present, live, and the PK
-    /// matches—copies it at its net `current_weight` (never a hardcoded 1, so
-    /// Z-Set multiplicity is preserved). Shared by `seek_by_index` and
-    /// `seek_by_index_range`; widening `src_pk` to `MAX_PK_BYTES` keeps wide
-    /// (`src_pk_stride > 16`) sources correct.
-    fn resolve_index_entry_into(
-        idx_pk_bytes: &[u8],
-        idx_key_size: usize,
-        src_pk_stride: usize,
-        src_cursor: &mut CursorHandle,
-        acc: &mut Batch,
-    ) {
-        let mut src_pk = [0u8; crate::schema::MAX_PK_BYTES];
-        src_pk[..src_pk_stride].copy_from_slice(
-            &idx_pk_bytes[idx_key_size..idx_key_size + src_pk_stride]);
-        src_cursor.cursor.seek_bytes(&src_pk[..src_pk_stride]);
-        if src_cursor.cursor.valid
-            && src_cursor.cursor.current_weight > 0
-            && src_cursor.cursor.current_pk_bytes() == &src_pk[..src_pk_stride]
-        {
-            let w = src_cursor.cursor.current_weight;
-            src_cursor.cursor.copy_current_row_into(acc, w);
+    /// Resolve already-collected source PKs against the base table into a result
+    /// batch — every present, live, exact-PK row at its net `current_weight`
+    /// (never a hardcoded 1, so Z-Set multiplicity is preserved) — or `None` when
+    /// nothing resolves.
+    ///
+    /// `pks` must be **ascending** in `compare_pk_bytes` (storage) order: each
+    /// `seek_exact_live` then lower-bounds at or past the previous key, turning K
+    /// scattered point-seeks into one monotone forward sweep that keeps shard
+    /// pages and merge state hot. The PKs are index entries' source-PK OPK
+    /// suffixes, whose memcmp order equals base storage order, so a byte sort *is*
+    /// the seek order; `PkBuf` carries the exact `src_pk_stride` bytes inline (up
+    /// to `MAX_PK_BYTES`), so wide sources resolve with no widen. `acc` is sized
+    /// to `pks.len()` — a tight upper bound, since base PKs are unique and each
+    /// carries one indexed value — so it never grows row by row; an empty `pks`
+    /// short-circuits before the base cursor's snapshot clone + tree build.
+    fn resolve_source_pks(
+        handle: &StoreHandle,
+        src_schema: SchemaDescriptor,
+        pks: &[crate::storage::PkBuf],
+    ) -> Option<Batch> {
+        debug_assert!(
+            pks.windows(2).all(|w| w[0] <= w[1]),
+            "resolve_source_pks requires ascending PKs for the monotone sweep");
+        if pks.is_empty() {
+            return None;
         }
+        let mut src_cursor = handle.open_cursor();
+        let mut acc = Batch::with_schema(src_schema, pks.len());
+        for pk in pks {
+            if src_cursor.cursor.seek_exact_live(pk.pk_bytes()) {
+                let w = src_cursor.cursor.current_weight;
+                src_cursor.cursor.copy_current_row_into(&mut acc, w);
+            }
+        }
+        (acc.count > 0).then_some(acc)
     }
 
     /// Ordered range scan over a secondary index: the leading
@@ -1102,24 +1111,29 @@ impl CatalogEngine {
             return Ok(None);
         }
 
-        // One index cursor + one reused source cursor (both raw-pointer/Rc-backed,
-        // like `seek_by_index`); copy each match straight into the accumulator.
+        // One index cursor for the walk; collect each positive match's source PK.
         let mut idx_cursor = ic.table_mut().open_cursor();
-        let mut src_cursor = entry.handle.open_cursor();
-        let mut acc = Batch::with_schema(src_schema, 0);
+        let mut pks: Vec<crate::storage::PkBuf> = Vec::new();
 
         idx_cursor.cursor.seek_bytes(&start[..idx_pk_stride]);
         while idx_cursor.cursor.valid {
             let cur_pk = idx_cursor.cursor.current_pk_bytes();
             if end.is_some_and(|e| cur_pk >= e) { break; }
             if idx_cursor.cursor.current_weight > 0 {
-                Self::resolve_index_entry_into(
-                    cur_pk, idx_key_size, src_pk_stride, &mut src_cursor, &mut acc);
+                pks.push(crate::storage::PkBuf::from_bytes(
+                    &cur_pk[idx_key_size..idx_key_size + src_pk_stride]));
             }
             idx_cursor.cursor.advance();
         }
+        // Free the index merge tree and its shard snapshots before the base
+        // cursor opens, so the two never coexist and obsolete shards can be
+        // reclaimed.
+        drop(idx_cursor);
 
-        Ok((acc.count > 0).then_some(acc))
+        // A range spans many duplicate groups, so the collected source PKs
+        // interleave across the base table — sort to recover the ascending sweep.
+        pks.sort_unstable();
+        Ok(Self::resolve_source_pks(&entry.handle, src_schema, &pks))
     }
 
     /// Flush a table's WAL.

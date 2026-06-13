@@ -355,11 +355,7 @@ pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u
     let mut cursor = table.open_cursor();
     // OPK-encode the native PK; correct for single-column and compound system PKs.
     let (opk, stride) = crate::storage::opk_key(schema, pk);
-    cursor.cursor.seek_bytes(&opk[..stride]);
-    if cursor.cursor.valid
-        && cursor.cursor.current_pk_bytes() == &opk[..stride]
-        && cursor.cursor.current_weight > 0
-    {
+    if cursor.cursor.seek_exact_live(&opk[..stride]) {
         copy_cursor_row_with_weight(&cursor, &mut batch, -1);
     }
     batch
