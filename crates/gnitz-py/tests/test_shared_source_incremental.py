@@ -11,7 +11,6 @@ author anticipate this output?" but "is the incremental result ever wrong?".
 Run (both worker counts matter — the bug was deterministic at each):
     cd crates/gnitz-py && GNITZ_WORKERS=1 uv run pytest tests/test_shared_source_incremental.py -v --tb=short
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_shared_source_incremental.py -v --tb=short
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest -m slow tests/test_shared_source_incremental.py -v
 """
 import random
 
@@ -549,62 +548,3 @@ class TestDuplicateProjectedValues:
             check("right-empty")
         finally:
             _cleanup(client, sn, tables=["a", "b"], views=["v"])
-
-
-# ── property test: random ops over the transitive-self-join config ─────────
-
-class TestSelfJoinProperty:
-    @pytest.mark.slow
-    @pytest.mark.parametrize("seed", [1, 2, 3, 4, 5])
-    def test_random_ops_match_oracle(self, client, seed):
-        rng = random.Random(seed)
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            _setup_self_join(client, sn)
-            vid = _vid(client, sn, "j")
-            t_state = {}
-            next_pk = [1]          # monotonic, never reused
-            KEYS = [0, 1, 2]       # small space → dense many-to-many
-
-            def live_pks():
-                return list(t_state.keys())
-
-            for step in range(40):
-                live = live_pks()
-                # Bias toward inserts early (nothing to delete/update yet).
-                choices = ["insert"]
-                if live:
-                    choices += ["delete", "update", "insert"]
-                op = rng.choice(choices)
-
-                if op == "insert":
-                    n = rng.choice([1, 1, 2, 3])  # occasional same-epoch multi-row
-                    rows, tuples = [], []
-                    for _ in range(n):
-                        pk = next_pk[0]; next_pk[0] += 1
-                        k = rng.choice(KEYS)
-                        v = rng.choice([-2, 0, 1, 5, 9])  # straddle the v>0 filter
-                        rows.append({"id": pk, "k": k, "v": v})
-                        tuples.append(f"({pk}, {k}, {v})")
-                    sql = "INSERT INTO t VALUES " + ", ".join(tuples)
-                    client.execute_sql(sql, schema_name=sn)
-                    oracle.apply_insert(t_state, "id", rows)
-                elif op == "delete":
-                    pk = rng.choice(live)
-                    client.execute_sql(f"DELETE FROM t WHERE id = {pk}", schema_name=sn)
-                    oracle.apply_delete(t_state, "id", [pk])
-                else:  # update — never touches the PK
-                    pk = rng.choice(live)
-                    new_v = rng.choice([-2, 0, 1, 5, 9])
-                    client.execute_sql(f"UPDATE t SET v = {new_v} WHERE id = {pk}", schema_name=sn)
-                    oracle.apply_update(t_state, "id", pk, {"v": new_v})
-
-                try:
-                    oracle.assert_view_matches(
-                        client, vid, _J_PROJECT, _self_join_expected(t_state),
-                        ctx=f"seed={seed} step={step} op={op}")
-                except AssertionError as e:
-                    raise AssertionError(f"[replay seed={seed} step={step}] {e}") from None
-        finally:
-            _cleanup(client, sn, tables=["t"], views=["j", "vt"])

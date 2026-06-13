@@ -45,10 +45,10 @@ pyext:
 	cd crates/gnitz-py && uv run maturin develop 2>&1 | tail -1
 
 e2e: server pyext
-	cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
+	cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/ -v
 
 e2e-release: release-server pyext
-	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release GNITZ_WORKERS=4 uv run pytest tests/ -m "not slow" -v
+	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release GNITZ_WORKERS=4 uv run pytest tests/ -v
 
 release-test:
 	$(MAKE) test

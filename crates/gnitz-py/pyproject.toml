@@ -15,7 +15,6 @@ classifiers      = [
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "maturin>=1.0,<2.0"]
 
 [tool.pytest.ini_options]
-markers = ["slow: large-scale / bulk tests (deselect with -m 'not slow')"]
 xfail_strict = true
 
 [tool.maturin]
