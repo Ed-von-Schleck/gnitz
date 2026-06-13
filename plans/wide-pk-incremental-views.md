@@ -4,14 +4,10 @@
 
 Each item below is an independent, unimplemented future change.
 
-- **Range / non-equi join — remaining extensions.** The non-equi (range / band)
-  join landed (`5e4ad9a`): `DeltaTraceRange` operator, broadcast input relay,
-  ownership-filtered traces, symmetric source-PK re-key + output exchange. What
-  remains:
-  - **Band-join equality-prefix co-partition scatter** (`n_eq ≥ 1`): scatter both
-    sides by the equality prefix instead of broadcasting — single-destination
-    routing and partition-local probes for band joins. Extracted to
-    `plans/band-join-eq-prefix-scatter.md`.
+- **Range / non-equi join — remaining extensions.** INNER range / band joins
+  exist: a `DeltaTraceRange` operator with a symmetric source-PK re-key + output
+  exchange; band joins (`n_eq ≥ 1`) scatter the input delta by the equality
+  prefix, pure range joins (`n_eq == 0`) broadcast it. Open extensions:
   - **Pure-range distribution beyond broadcast** (`n_eq == 0`): a range-aware
     (order-preserving) exchange that range-partitions both sides so a probe
     touches only boundary-overlapping workers, and/or a write-once broadcast SAL
@@ -23,10 +19,10 @@ Each item below is an independent, unimplemented future change.
   - **Multiple range conjuncts / residual ON predicates**: a post-join `Filter`
     over the normalized output (the operator exists; the 3VL bookkeeping and
     planning surface do not).
-  - **Probe-loop performance**: monotone cursor reuse for `Gt`/`Ge` (consolidated
-    delta ⇒ non-decreasing `start`), a shared-prefix single walk for `Lt`/`Le`,
-    and a trace-driven swapped variant for `|Δ| > |trace|` (the equi-join already
-    swaps; the range op is delta-driven only).
+  - **Probe-loop performance**: size-adaptive delta-driven (monotone forward seek)
+    vs trace-driven (per-eq-group merge walk) probing — the range op is
+    delta-driven and re-seeks the trace per row, where the equi-join already swaps
+    by size. Extracted to `plans/range-join-probe-loop.md`.
 - **Python / C binding surface for compound-PK *result* rows** — views whose
   *output* PK is itself compound. (A join view's source PK rides as payload, so
   join/GROUP-BY result rows are unaffected; this is only about views that persist a
@@ -61,11 +57,10 @@ Each item below is an independent, unimplemented future change.
   `(promoted key, src_pk)` — non-covering, forcing a PK heap fetch for the
   payload. An equi-join needs same-key rows co-located *with* their payload, which
   is exactly what reindex+trace gives and a source-PK-partitioned index does not.
-  Secondary indexes serve **single-table** range predicates (landed, `0b2af7c`);
-  the range / non-equi **join** (landed, `5e4ad9a`) likewise keeps the
-  reindex+trace shape, swapping the equality probe for an ordered range walk — the
-  index loses there too (non-covering, user-managed lifecycle, absent over
-  filtered inputs).
+  Secondary indexes serve **single-table** range predicates; the range / non-equi
+  **join** likewise keeps the reindex+trace shape, swapping the equality probe for
+  an ordered range walk — the index loses there too (non-covering, user-managed
+  lifecycle, absent over filtered inputs).
 - **Mixed string/native equijoin keys** (`VARCHAR = U128`, etc.) stay rejected: a
   128-bit string content hash never byte-equals a native integer encoding, so the
   join would match nothing. A permanent semantic boundary, not a deferral.
