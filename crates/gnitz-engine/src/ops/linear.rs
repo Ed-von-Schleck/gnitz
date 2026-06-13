@@ -8,6 +8,8 @@ use crate::storage::{Batch, ConsolidatedBatch, MemBatch, with_payload_cmp};
 use crate::expr::ScalarFuncKind;
 use crate::xxh;
 
+use super::cogroup::{cogroup_union, BatchCursor};
+
 
 // ---------------------------------------------------------------------------
 // Linear operators
@@ -226,75 +228,21 @@ where
     let mb_a = batch_a.as_mem_batch();
     let mb_b = batch_b.as_mem_batch();
 
-    enum RunSrc {
-        None,
-        A { start: usize },
-        B { start: usize },
-    }
+    let mut a = BatchCursor::new(batch_a);
+    let mut b = BatchCursor::new(batch_b);
 
-    let mut i = 0usize;
-    let mut j = 0usize;
-    let mut run_src = RunSrc::None;
-
-    while i < n_a && j < n_b {
-        // OPK bytes are order-preserving for all PK widths, so a raw byte
-        // compare replaces the former `get_pk(u128)` (narrow-only) comparison.
-        let ord = mb_a.get_pk_bytes(i).cmp(mb_b.get_pk_bytes(j));
-
-        if ord == Ordering::Less {
-            match run_src {
-                RunSrc::A { .. } => {}
-                RunSrc::B { start } => {
-                    output.append_batch(batch_b, start, j);
-                    run_src = RunSrc::A { start: i };
-                }
-                RunSrc::None => {
-                    run_src = RunSrc::A { start: i };
-                }
-            }
-            i += 1;
-        } else if ord == Ordering::Greater {
-            match run_src {
-                RunSrc::B { .. } => {}
-                RunSrc::A { start } => {
-                    output.append_batch(batch_a, start, i);
-                    run_src = RunSrc::B { start: j };
-                }
-                RunSrc::None => {
-                    run_src = RunSrc::B { start: j };
-                }
-            }
-            j += 1;
-        } else {
-            // Equal PKs: flush pending run, then merge-sort the equal-PK
-            // sub-ranges from both batches by payload to preserve (PK, payload)
-            // sort order.
-            match run_src {
-                RunSrc::A { start } => output.append_batch(batch_a, start, i),
-                RunSrc::B { start } => output.append_batch(batch_b, start, j),
-                RunSrc::None => {}
-            }
-            run_src = RunSrc::None;
-
-            // Find the end of the equal-PK run in each batch (byte-wise; `i`/`j`
-            // stay fixed as the reference row until `i = i_end; j = j_end`).
-            let mut i_end = i + 1;
-            while i_end < n_a
-                && mb_a.get_pk_bytes(i_end) == mb_a.get_pk_bytes(i)
-            {
-                i_end += 1;
-            }
-            let mut j_end = j + 1;
-            while j_end < n_b
-                && mb_b.get_pk_bytes(j_end) == mb_b.get_pk_bytes(j)
-            {
-                j_end += 1;
-            }
-
-            // Merge the two equal-PK sub-ranges by payload order. Coalesces
-            // contiguous single-source runs into one `append_batch` per run
-            // because the row count per group is often single-digit and
-            // `append_batch` has fixed per-call overhead from offset math.
+    // Symmetric full-outer co-group (Z-Set `+`: every row from both sides). The
+    // skeleton bulk-appends each single-source run itself; only the shared-PK
+    // groups need the payload merge below, which coalesces contiguous
+    // single-source runs into one append each (the row count per group is often
+    // single-digit and `append_batch` has fixed per-call offset overhead).
+    cogroup_union(
+        &mut a,
+        &mut b,
+        &mut output,
+        |out, ra, rb| {
+            let (i, i_end) = (ra.start, ra.end);
+            let (j, j_end) = (rb.start, rb.end);
             let (mut ia, mut jb) = (i, j);
             if ia < i_end && jb < j_end {
                 let mut prev_a = row_cmp(schema, &mb_a, ia, &mb_b, jb)
@@ -306,10 +254,10 @@ where
                         != Ordering::Greater;
                     if pick_a != prev_a {
                         if prev_a {
-                            output.append_batch(batch_a, run_start, ia);
+                            out.append_batch(batch_a, run_start, ia);
                             run_start = jb;
                         } else {
-                            output.append_batch(batch_b, run_start, jb);
+                            out.append_batch(batch_b, run_start, jb);
                             run_start = ia;
                         }
                         prev_a = pick_a;
@@ -318,47 +266,29 @@ where
                 }
                 // Flush the in-progress run, folding its side's still-unpicked
                 // tail (rows the loop never reached because the *other* side
-                // exhausted first) into the same append. The opposite side
-                // then drains as a separate run.
+                // exhausted first) into the same append. The opposite side then
+                // drains as a separate run.
                 if prev_a {
-                    output.append_batch(batch_a, run_start, i_end);
+                    out.append_batch(batch_a, run_start, i_end);
                     if jb < j_end {
-                        output.append_batch(batch_b, jb, j_end);
+                        out.append_batch(batch_b, jb, j_end);
                     }
                 } else {
-                    output.append_batch(batch_b, run_start, j_end);
+                    out.append_batch(batch_b, run_start, j_end);
                     if ia < i_end {
-                        output.append_batch(batch_a, ia, i_end);
+                        out.append_batch(batch_a, ia, i_end);
                     }
                 }
             } else {
                 if ia < i_end {
-                    output.append_batch(batch_a, ia, i_end);
+                    out.append_batch(batch_a, ia, i_end);
                 }
                 if jb < j_end {
-                    output.append_batch(batch_b, jb, j_end);
+                    out.append_batch(batch_b, jb, j_end);
                 }
             }
-
-            i = i_end;
-            j = j_end;
-        }
-    }
-
-    // Flush final run
-    match run_src {
-        RunSrc::A { start } => output.append_batch(batch_a, start, i),
-        RunSrc::B { start } => output.append_batch(batch_b, start, j),
-        RunSrc::None => {}
-    }
-
-    // Remaining
-    if i < n_a {
-        output.append_batch(batch_a, i, n_a);
-    }
-    if j < n_b {
-        output.append_batch(batch_b, j, n_b);
-    }
+        },
+    );
 
     output.sorted = true;
     output.consolidated = false;
@@ -865,6 +795,33 @@ mod tests {
         assert!(out.sorted);
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!(get_payload_i64(&out, 1), 20);
+    }
+
+    /// Skewed tiny ⋃ huge union: the gallop skip jumps the long b-only prefix in
+    /// one `advance_to`, and the shared PK=5 carries interleaved payloads on BOTH
+    /// sides ({100,300} ⋃ {200,400}). Output must be the full union multiset,
+    /// (PK, payload)-sorted (Z-Set `+` keeps every row, weights unfolded).
+    #[test]
+    fn test_union_merge_skewed_interleaved_payloads() {
+        let schema = make_schema_u64_i64();
+        let a = make_batch(&schema, &[(5, 1, 100), (5, 1, 300)]); // tiny side
+        let b = make_batch(&schema, &[
+            (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40),
+            (5, 1, 200), (5, 1, 400), (6, 1, 60), (7, 1, 70),
+        ]); // huge side; PK=5 interleaves with a
+        let out = op_union(a, Some(&b), &schema);
+
+        let got: Vec<(u64, i64)> = (0..out.count)
+            .map(|r| (out.get_pk(r) as u64, get_payload_i64(&out, r)))
+            .collect();
+        let want: Vec<(u64, i64)> = vec![
+            (1, 10), (2, 20), (3, 30), (4, 40),
+            (5, 100), (5, 200), (5, 300), (5, 400),
+            (6, 60), (7, 70),
+        ];
+        assert_eq!(got, want, "full union, (PK, payload)-sorted");
+        assert!(out.sorted);
+        assert!(!out.consolidated, "Z-Set + does not fold weights");
     }
 
     #[test]

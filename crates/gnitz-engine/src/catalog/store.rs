@@ -887,7 +887,10 @@ impl CatalogEngine {
         let mut out = Batch::with_schema(result_schema, pks.len());
         let mut cursor = self.dag.tables.get(&table_id).unwrap().handle.open_cursor();
         for pk in pks {
-            if cursor.cursor.seek_exact_live(pk.pk_bytes()) {
+            // Order is not required for correctness; `advance_to` is
+            // backward-capable, so it matches `seek_exact_live` on any input and
+            // additionally fast-paths the (common) ascending-`pks` caller.
+            if cursor.cursor.advance_to_exact_live(pk.pk_bytes()) {
                 copy_cursor_cols_to_batch(&cursor, &mut out, &schema, project);
             }
         }
@@ -1000,7 +1003,9 @@ impl CatalogEngine {
         let mut src_cursor = handle.open_cursor();
         let mut acc = Batch::with_schema(src_schema, pks.len());
         for pk in pks {
-            if src_cursor.cursor.seek_exact_live(pk.pk_bytes()) {
+            // PKs are asserted ascending above, so the galloping `advance_to`
+            // seeds each probe at the prior position — one monotone forward sweep.
+            if src_cursor.cursor.advance_to_exact_live(pk.pk_bytes()) {
                 let w = src_cursor.cursor.current_weight;
                 src_cursor.cursor.copy_current_row_into(&mut acc, w);
             }

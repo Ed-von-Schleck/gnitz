@@ -19,10 +19,6 @@ Each item below is an independent, unimplemented future change.
   - **Multiple range conjuncts / residual ON predicates**: a post-join `Filter`
     over the normalized output (the operator exists; the 3VL bookkeeping and
     planning surface do not).
-  - **Probe-loop performance**: size-adaptive delta-driven (monotone forward seek)
-    vs trace-driven (per-eq-group merge walk) probing — the range op is
-    delta-driven and re-seeks the trace per row, where the equi-join already swaps
-    by size. Extracted to `plans/range-join-probe-loop.md`.
 - **Python / C binding surface for compound-PK *result* rows** — views whose
   *output* PK is itself compound. (A join view's source PK rides as payload, so
   join/GROUP-BY result rows are unaffected; this is only about views that persist a

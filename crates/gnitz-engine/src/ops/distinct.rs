@@ -3,6 +3,7 @@
 use crate::schema::SchemaDescriptor;
 use crate::storage::{write_to_batch, Batch, ConsolidatedBatch, ReadCursor, scatter_copy};
 
+use super::cogroup::cogroup_left;
 use super::util::{signum, compare_cursor_payload_to_batch_row};
 
 // ---------------------------------------------------------------------------
@@ -25,48 +26,48 @@ pub fn op_distinct(
         return (ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema)), consolidated);
     }
 
-    // 2. Walk consolidated, collect emitting indices and weights
+    // 2. Co-group the consolidated delta against the integral trace on PK, then
+    //    run a (PK, payload) sub-merge inside each group: for each delta element
+    //    fold the byte-equal trace row's weight and compute the sign change
+    //    signum(w_old + w_delta) − signum(w_old). `cogroup_left` visits every
+    //    delta group (every element transitions or not); the inner payload merge
+    //    walks the delta sub-range and the trace PK group in lockstep, both
+    //    being (PK, payload)-sorted, so the per-element trace probe is the
+    //    monotone forward walk the old per-row `seek_bytes` open-coded.
     let mut emit_indices: Vec<u32> = Vec::with_capacity(n);
     let mut emit_weights: Vec<i64> = Vec::with_capacity(n);
 
     let consolidated_mb = consolidated.as_mem_batch();
-    let mut prev_key: Option<&[u8]> = None;
 
-    for i in 0..n {
-        let key = consolidated.get_pk_bytes(i);
-        let w_delta = consolidated.get_weight(i);
-
-        if prev_key != Some(key) {
-            cursor.seek_bytes(key);
-        }
-        prev_key = Some(key);
-
-        let w_old: i64 = loop {
-            if !cursor.valid || cursor.current_pk_bytes() != key {
-                break 0;
-            }
-            match compare_cursor_payload_to_batch_row(cursor, &consolidated_mb, i, schema) {
-                std::cmp::Ordering::Less => {
-                    cursor.advance();
+    cogroup_left(&consolidated, cursor, |key, range, m| {
+        for i in range {
+            let w_old: i64 = loop {
+                if !m.valid || !m.current_pk_eq(key) {
+                    break 0;
                 }
-                std::cmp::Ordering::Equal => {
-                    let w = cursor.current_weight;
-                    cursor.advance();
-                    break w;
+                match compare_cursor_payload_to_batch_row(m, &consolidated_mb, i, schema) {
+                    std::cmp::Ordering::Less => {
+                        m.advance();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let w = m.current_weight;
+                        m.advance();
+                        break w;
+                    }
+                    std::cmp::Ordering::Greater => break 0,
                 }
-                std::cmp::Ordering::Greater => break 0,
-            }
-        };
+            };
 
-        let s_old = signum(w_old);
-        let w_new = w_old.wrapping_add(w_delta);
-        let s_new = signum(w_new);
-        let out_w = s_new - s_old;
-        if out_w != 0 {
-            emit_indices.push(i as u32);
-            emit_weights.push(out_w);
+            let s_old = signum(w_old);
+            let w_new = w_old.wrapping_add(consolidated.get_weight(i));
+            let s_new = signum(w_new);
+            let out_w = s_new - s_old;
+            if out_w != 0 {
+                emit_indices.push(i as u32);
+                emit_weights.push(out_w);
+            }
         }
-    }
+    });
 
     // 3. Scatter-copy emitting rows
     if emit_indices.is_empty() {
@@ -153,6 +154,31 @@ mod tests {
         assert_eq!(out2.count, 1);
         assert_eq!((out2.get_pk(0) as u64), 2);
         assert_eq!(out2.get_weight(0), -1);
+    }
+
+    /// Several payloads at one PK, exercising the (PK, payload) sub-merge inside
+    /// the `cogroup_left` group: a retraction-to-zero (emit -1), a no-op bump
+    /// (positive → positive), and a brand-new payload (emit +1) — all in one PK
+    /// group, walked against a multi-payload trace group in lockstep.
+    #[test]
+    fn test_distinct_multi_payload_group_submerge() {
+        use std::rc::Rc;
+        use crate::storage::CursorHandle;
+
+        let schema = make_schema_u64_i64();
+        // Trace PK=1 carries payloads 10, 20, 30 (each weight 1).
+        let trace = Rc::new(make_batch(&schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]));
+        let mut ch = CursorHandle::from_owned(&[trace], schema);
+
+        // Delta at PK=1: retract 10 (1→0 ⇒ -1), bump 20 (1→2 ⇒ no change),
+        // add new 40 (0→1 ⇒ +1). Payload 30 is untouched.
+        let delta = make_batch(&schema, &[(1, -1, 10), (1, 1, 20), (1, 1, 40)]);
+        let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
+
+        assert_eq!(out.count, 2, "only the 10-retract and 40-insert transition");
+        let payload = |r: usize| crate::util::read_i64_le(out.col_data(0), r * 8);
+        assert_eq!((payload(0), out.get_weight(0)), (10, -1));
+        assert_eq!((payload(1), out.get_weight(1)), (40, 1));
     }
 
     fn make_schema_u64_i32() -> SchemaDescriptor {

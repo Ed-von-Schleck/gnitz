@@ -147,6 +147,50 @@ pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
 }
 
+// ---------------------------------------------------------------------------
+// Sorted-stream lower-bound search (stateless + galloping)
+// ---------------------------------------------------------------------------
+
+/// Lower bound (first index with `get(i) >= key`) over `[lo, hi)`. `get(i)`
+/// yields row `i`'s OPK PK bytes; memcmp order equals typed order at every PK
+/// width. The named `'a` is load-bearing: a bare `Fn(usize) -> &[u8]` desugars
+/// to a higher-ranked bound the `|i| self.get_pk_bytes(i)` closures (result
+/// borrows `self`) cannot satisfy.
+#[inline]
+pub fn binary_lower_bound<'a>(
+    mut lo: usize, mut hi: usize, key: &[u8], get: &impl Fn(usize) -> &'a [u8],
+) -> usize {
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if get(mid) < key { lo = mid + 1; } else { hi = mid; }
+    }
+    lo
+}
+
+/// Lower bound over `[0, count)`, seeded at `hint`. Galloping forward when the
+/// boundary is after the hint (`O(log gap)`), `O(1)` when the boundary IS the
+/// hint (consecutive keys in one inter-row gap, or a run past the source end with
+/// `hint == count`), and a bounded `[0, hint)` search when the boundary is before
+/// it. Correct for ANY hint, and since `[0, hint] ⊆ [0, count)` it is **never
+/// asymptotically worse** than `binary_lower_bound(0, count, …)` — a backward or
+/// stale hint forfeits only the speedup, at the cost of at most two extra
+/// comparisons.
+#[inline]
+pub fn gallop_lower_bound_bytes<'a>(
+    count: usize, key: &[u8], hint: usize, get: impl Fn(usize) -> &'a [u8],
+) -> usize {
+    let h = hint.min(count);
+    if h < count && get(h) < key {           // boundary strictly after the hint
+        let mut lo = h;                       // invariant: get(lo) < key
+        let mut step = 1usize;
+        while lo + step < count && get(lo + step) < key { lo += step; step *= 2; }
+        let hi = (lo + step).min(count);      // get(hi) >= key, or hi == count
+        return binary_lower_bound(lo + 1, hi, key, &get);
+    }
+    if h == 0 || get(h - 1) < key { return h; } // boundary is exactly h (incl. h == count)
+    binary_lower_bound(0, h, key, &get)         // genuine overshoot: bounded [0, h)
+}
+
 // The order-preserving column encoder/decoder primitives live in `gnitz-wire`
 // so the client write path (`gnitz-core`) and the server read path share one
 // implementation. Re-exported here so engine modules can spell them
@@ -1237,5 +1281,47 @@ mod tests {
                 assert_opk_equivalence(&s, &a, &b);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // gallop_lower_bound_bytes / binary_lower_bound
+    // -----------------------------------------------------------------------
+
+    /// Galloping seek equals the from-scratch lower bound for EVERY hint and key.
+    /// Sweeps `hint` across `0..=count` (gallop branch, O(1) boundary-at-hint,
+    /// `hint == count` run-off, and the overshoot fallback all fall out of the
+    /// full sweep) and `key` across below-min / present / absent-between /
+    /// duplicate / above-max values. 2-byte BE keys so memcmp order = numeric.
+    #[test]
+    fn gallop_lower_bound_matches_binary_over_all_hints() {
+        let vals: [u16; 8] = [10, 10, 20, 30, 30, 30, 40, 50]; // duplicates + gaps
+        let arr: Vec<[u8; 2]> = vals.iter().map(|v| v.to_be_bytes()).collect();
+        let count = arr.len();
+        let get = |i: usize| &arr[i][..];
+
+        let probes: [u16; 12] = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60];
+        for &p in &probes {
+            let key = p.to_be_bytes();
+            // Naive linear reference: first index whose bytes are >= key.
+            let expected = (0..count).find(|&i| get(i) >= &key[..]).unwrap_or(count);
+            assert_eq!(
+                binary_lower_bound(0, count, &key, &get), expected,
+                "binary_lower_bound key={p}");
+            for hint in 0..=count {
+                assert_eq!(
+                    gallop_lower_bound_bytes(count, &key, hint, get), expected,
+                    "gallop key={p} hint={hint}");
+            }
+        }
+    }
+
+    /// `count == 0` returns 0 for every hint and never indexes the (empty) array.
+    #[test]
+    fn gallop_lower_bound_count_zero() {
+        let arr: Vec<[u8; 2]> = vec![];
+        let get = |i: usize| &arr[i][..];
+        let key = 7u16.to_be_bytes();
+        assert_eq!(gallop_lower_bound_bytes(0, &key, 0, get), 0);
+        assert_eq!(binary_lower_bound(0, 0, &key, &get), 0);
     }
 }

@@ -10,6 +10,7 @@ use crate::storage::{
     scatter_copy, with_payload_cmp,
 };
 
+use super::cogroup::{cogroup_intersection, cogroup_left, BatchCursor};
 use super::util::{all_payload_null_mask, merge_null_words, write_string_from_batch};
 
 thread_local! {
@@ -25,52 +26,10 @@ thread_local! {
 // Anti-join delta-trace
 // ---------------------------------------------------------------------------
 
-/// Merge-walk a sorted delta's PKs against the trace `cursor` (positioned by an
-/// internal `seek` to the first PK), returning the indices of delta rows to
-/// emit. `emit_when_present` selects semi-join (emit rows whose key is in the
-/// trace) vs anti-join (emit rows whose key is absent). A key is "present" iff
-/// some trace entry for it has positive weight — an uncompacted trace may hold a
-/// tombstone (weight ≤ 0) before a live row, so every entry for the PK is
-/// scanned. Consecutive duplicate PKs reuse the previous presence result instead
-/// of re-seeking (which would be O(log N) per duplicate).
-fn dt_emit_indices(
-    cursor: &mut ReadCursor,
-    batch: &Batch,
-    emit_when_present: bool,
-    emit_indices: &mut Vec<u32>,
-) {
-    let n = batch.count;
-    let mut prev_in_trace = false;
-    // Seek/compare by the batch row's OPK bytes directly — no native-value
-    // round-trip, correct at every PK width/signedness.
-    cursor.seek_bytes(batch.get_pk_bytes(0));
-
-    for i in 0..n {
-        let pk = batch.get_pk_bytes(i);
-
-        let in_trace = if i > 0 && pk == batch.get_pk_bytes(i - 1) {
-            prev_in_trace
-        } else {
-            while cursor.valid && cursor.current_pk_cmp_bytes(pk).is_lt() {
-                cursor.advance();
-            }
-            let mut found = false;
-            while cursor.valid && cursor.current_pk_cmp_bytes(pk) == Ordering::Equal {
-                if cursor.current_weight > 0 { found = true; }
-                cursor.advance();
-            }
-            found
-        };
-
-        if in_trace == emit_when_present {
-            emit_indices.push(i as u32);
-        }
-
-        prev_in_trace = in_trace;
-    }
-}
-
 /// Emit delta rows whose key has NO positive-weight match in the trace.
+/// `cogroup_left` visits every delta group (the match side galloping-skips to
+/// it); the group is emitted iff `group_has_positive` reports no live row in the
+/// trace group — i.e. the key is absent from Distinct(trace).
 pub fn op_anti_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -87,7 +46,12 @@ pub fn op_anti_join_delta_trace(
     JOIN_EMIT_INDICES.with(|pool| {
         let mut emit_indices = pool.borrow_mut();
         emit_indices.clear();
-        dt_emit_indices(cursor, consolidated, false, &mut emit_indices);
+
+        cogroup_left(consolidated, cursor, |key, range, m| {
+            if !m.group_has_positive(key) {
+                for i in range { emit_indices.push(i as u32); }
+            }
+        });
 
         if emit_indices.is_empty() {
             return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
@@ -99,6 +63,8 @@ pub fn op_anti_join_delta_trace(
             write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
                 scatter_copy(&mb, &emit_indices, &[], writer);
             });
+        // emit_indices ascend (groups visited in key order, ranges ascending),
+        // so rows come out in consolidated-delta order: (PK, payload)-sorted.
         output.sorted = true;
         output.consolidated = true;
         ConsolidatedBatch::new_unchecked(output)
@@ -110,6 +76,10 @@ pub fn op_anti_join_delta_trace(
 // ---------------------------------------------------------------------------
 
 /// Emit delta rows whose key HAS a positive-weight match in the trace.
+/// `cogroup_intersection` visits only shared keys (both pointers galloping-skip
+/// to catch up, optimal whichever side is larger — replacing the old size
+/// selector + swapped path); the delta group is emitted iff `group_has_positive`
+/// reports a live row in the trace group.
 pub fn op_semi_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -123,24 +93,15 @@ pub fn op_semi_join_delta_trace(
         return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
     }
 
-    // Reset cursor to position 0 for the same reason as op_join_delta_trace:
-    // the same trace register may be shared across multiple ops in one tick.
-    cursor.rewind();
-
-    let trace_len = cursor.estimated_length();
-
     JOIN_EMIT_INDICES.with(|pool| {
         let mut emit_indices = pool.borrow_mut();
         emit_indices.clear();
 
-        if n > trace_len {
-            // Adaptive swap: iterate trace, binary-search delta
-            return ConsolidatedBatch::new_unchecked(
-                semi_join_dt_swapped(consolidated, cursor, schema, &mut emit_indices));
-        }
-
-        // Merge-walk
-        dt_emit_indices(cursor, consolidated, true, &mut emit_indices);
+        cogroup_intersection(consolidated, cursor, |key, range, m| {
+            if m.group_has_positive(key) {
+                for i in range { emit_indices.push(i as u32); }
+            }
+        });
 
         if emit_indices.is_empty() {
             return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
@@ -158,81 +119,24 @@ pub fn op_semi_join_delta_trace(
     })
 }
 
-fn semi_join_dt_swapped(
-    consolidated: &Batch,
-    cursor: &mut ReadCursor,
-    schema: &SchemaDescriptor,
-    emit_indices: &mut Vec<u32>,
-) -> Batch {
-    let npc = schema.num_payload_cols();
-    let n = consolidated.count;
-
-    use crate::schema::MAX_PK_BYTES;
-    let stride = schema.pk_stride() as usize;
-    let mut last_pk_buf = [0u8; MAX_PK_BYTES];
-    let mut has_last = false;
-
-    while cursor.valid {
-        if cursor.current_weight <= 0 {
-            cursor.advance();
-            continue;
-        }
-
-        // Copy current PK bytes before the dedup compare and before advance().
-        let mut t_pk_buf = [0u8; MAX_PK_BYTES];
-        t_pk_buf[..stride].copy_from_slice(cursor.current_pk_bytes());
-        let t_pk_bytes = &t_pk_buf[..stride];
-
-        // Skip duplicate PKs in trace (different payloads) — delta indices
-        // were already pushed for the first occurrence of this PK.
-        if has_last && last_pk_buf[..stride] == *t_pk_bytes {
-            cursor.advance();
-            continue;
-        }
-
-        // Binary search in consolidated delta by the OPK bytes (raw memcmp).
-        let pos = consolidated.find_lower_bound_bytes(t_pk_bytes);
-        let mut j = pos;
-        while j < n && consolidated.get_pk_bytes(j) == t_pk_bytes {
-            emit_indices.push(j as u32);
-            j += 1;
-        }
-        last_pk_buf[..stride].copy_from_slice(t_pk_bytes);
-        has_last = true;
-        cursor.advance();
-    }
-
-    if emit_indices.is_empty() {
-        return Batch::empty(npc, schema.pk_stride());
-    }
-
-    let mb = consolidated.as_mem_batch();
-    let blob_cap = mb.blob.len().max(1);
-    let mut output =
-        write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
-            scatter_copy(&mb, emit_indices, &[], writer);
-        });
-    // Swapped order: output is in trace key order, which is sorted.
-    // Rows come from the consolidated delta so (PK, payload) pairs are unique.
-    output.sorted = true;
-    output.consolidated = true;
-    output
-}
-
 // ---------------------------------------------------------------------------
 // Inner join delta-trace
 // ---------------------------------------------------------------------------
 
 /// Join delta rows against trace. Output schema: [left_PK, left_payload..., right_payload...].
+///
+/// `cogroup_intersection` on the join key: the match (trace) side is forward-only,
+/// so each trace group is walked once and producted against the whole
+/// (random-access) delta group `[i, j)` — trace-major emission. Galloping skips
+/// make this optimal in both former selector regimes (huge delta + tiny trace,
+/// and the reverse) with no `rewind` / `estimated_length` / size selector.
 pub fn op_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
-    let left_npc = left_schema.num_payload_cols();
-    let right_npc = right_schema.num_payload_cols();
-    let out_npc = left_npc + right_npc;
+    let out_npc = left_schema.num_payload_cols() + right_schema.num_payload_cols();
 
     let cs = Batch::consolidate_if_needed(delta, left_schema);
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
@@ -241,130 +145,27 @@ pub fn op_join_delta_trace(
         return Batch::empty(out_npc, left_schema.pk_stride());
     }
 
-    // The same trace register may be reused by multiple join ops in one tick
-    // (e.g. both join_ba and correction_raw share trace_a in a LEFT JOIN circuit).
-    // Reset to position 0 so estimated_length() sees the full trace and
-    // join_dt_swapped iterates from the beginning.
-    cursor.rewind();
-
-    let trace_len = cursor.estimated_length();
-    if n > trace_len {
-        return join_dt_swapped(consolidated, cursor, left_schema, right_schema);
-    }
-
-    join_dt_merge_walk::<false>(consolidated, cursor, left_schema, right_schema)
-}
-
-/// Merge-walk consolidated `delta` against the trace `cursor`, emitting the join
-/// product for every matching (delta, trace) pair. With `EMIT_UNMATCHED` (left
-/// outer join) a delta row with no positive-weight trace match additionally emits
-/// a null-filled right side; without it (inner join) unmatched rows are dropped.
-/// Const-generic so the inner path compiles the outer-only bookkeeping away.
-fn join_dt_merge_walk<const EMIT_UNMATCHED: bool>(
-    delta: &Batch,
-    cursor: &mut ReadCursor,
-    left_schema: &SchemaDescriptor,
-    right_schema: &SchemaDescriptor,
-) -> Batch {
-    let left_npc = left_schema.num_payload_cols();
-    let right_npc = right_schema.num_payload_cols();
-    let out_npc = left_npc + right_npc;
-    let n = delta.count;
-    if n == 0 {
-        return Batch::empty(out_npc, left_schema.pk_stride());
-    }
-
-    let delta_mb = delta.as_mem_batch();
+    let delta_mb = consolidated.as_mem_batch();
     let mut output = Batch::empty_joined(left_schema, right_schema);
 
-    cursor.seek_bytes(delta.get_pk_bytes(0));
-
-    for i in 0..n {
-        let pk_i = delta.get_pk_bytes(i);
-        let w_delta = delta.get_weight(i);
-
-        if i > 0 && pk_i == delta.get_pk_bytes(i - 1) {
-            // Multiset delta: same PK, different payload — re-seek trace.
-            cursor.seek_bytes(pk_i);
-        } else {
-            while cursor.valid && cursor.current_pk_cmp_bytes(pk_i).is_lt() {
-                cursor.advance();
+    cogroup_intersection(consolidated, cursor, |key, range, m| {
+        while m.valid && m.current_pk_eq(key) {
+            let w_trace = m.current_weight;
+            for i in range.clone() {
+                let w_out = consolidated.get_weight(i).wrapping_mul(w_trace);
+                if w_out != 0 {
+                    write_join_row(
+                        &mut output, &delta_mb, i, m, w_out,
+                        left_schema, right_schema,
+                    );
+                }
             }
+            m.advance();
         }
-
-        // `matched` reflects membership in Distinct(trace): set it on any
-        // positive-weight entry, not merely a non-zero join product. An
-        // uncompacted trace may present a tombstone (weight ≤ 0) for the PK;
-        // a tombstone alone must NOT suppress the outer null-fill.
-        let mut matched = false;
-        while cursor.valid && cursor.current_pk_cmp_bytes(pk_i) == Ordering::Equal {
-            let w_trace = cursor.current_weight;
-            if EMIT_UNMATCHED && w_trace > 0 {
-                matched = true;
-            }
-            let w_out = w_delta.wrapping_mul(w_trace);
-            if w_out != 0 {
-                write_join_row(
-                    &mut output, &delta_mb, i, cursor, w_out,
-                    left_schema, right_schema,
-                );
-            }
-            cursor.advance();
-        }
-
-        if EMIT_UNMATCHED && !matched {
-            write_join_row_null_right(
-                &mut output, &delta_mb, i, w_delta,
-                left_schema, right_schema,
-            );
-        }
-    }
-
-    output.sorted = true;
-    output
-}
-
-fn join_dt_swapped(
-    delta: &Batch,
-    cursor: &mut ReadCursor,
-    left_schema: &SchemaDescriptor,
-    right_schema: &SchemaDescriptor,
-) -> Batch {
-    use crate::schema::MAX_PK_BYTES;
-    let n = delta.count;
-    let stride = left_schema.pk_stride() as usize;
-
-    let delta_mb = delta.as_mem_batch();
-    let mut output = Batch::empty_joined(left_schema, right_schema);
-
-    while cursor.valid {
-        // Copy trace PK bytes to a stack buffer so cursor.advance() does not
-        // conflict with a live borrow of cursor in the inner group walk.
-        let mut t_pk_buf = [0u8; MAX_PK_BYTES];
-        t_pk_buf[..stride].copy_from_slice(cursor.current_pk_bytes());
-        let t_pk_bytes = &t_pk_buf[..stride];
-        let w_trace = cursor.current_weight;
-
-        let pos = delta.find_lower_bound_bytes(t_pk_bytes);
-        let mut j = pos;
-        while j < n && delta.get_pk_bytes(j) == t_pk_bytes {
-            let w_delta = delta.get_weight(j);
-            let w_out = w_delta.wrapping_mul(w_trace);
-            if w_out != 0 {
-                write_join_row(
-                    &mut output, &delta_mb, j, cursor, w_out,
-                    left_schema, right_schema,
-                );
-            }
-            j += 1;
-        }
-        cursor.advance();
-    }
+    });
 
     // Trace-major cartesian emission is PK-sorted but NOT (PK, payload)-sorted
-    // (left payloads interleave across trace entries). Unlike semi_join_dt_swapped
-    // (delta-only rows, deduped trace PKs), this output is genuinely unsorted —
-    // do not let into_consolidated/fold_sorted or an N-way merge trust it.
+    // (left payloads interleave across trace entries); downstream re-sorts.
     output.sorted = false;
     output
 }
@@ -373,18 +174,60 @@ fn join_dt_swapped(
 // Outer join delta-trace
 // ---------------------------------------------------------------------------
 
-/// Left outer join: like inner join, but unmatched delta rows emit null-filled
-/// right side. Always merge-walks — the swapped (trace-driven) path can't emit
-/// the null-fill for delta rows absent from the trace.
+/// Left outer join: like inner join, but a delta group with no positive-weight
+/// trace match additionally emits null-filled right sides. `cogroup_left` visits
+/// every delta group; `matched` is a property of the **trace group** (any
+/// positive-weight row), shared by every delta row in the group, so the
+/// null-fill decision is made once per group after the (trace-major) product.
 pub fn op_join_delta_trace_outer(
     delta: &Batch,
     cursor: &mut ReadCursor,
     left_schema: &SchemaDescriptor,
     right_schema: &SchemaDescriptor,
 ) -> Batch {
+    let out_npc = left_schema.num_payload_cols() + right_schema.num_payload_cols();
+
     let cs = Batch::consolidate_if_needed(delta, left_schema);
     let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
-    join_dt_merge_walk::<true>(consolidated, cursor, left_schema, right_schema)
+    let n = consolidated.count;
+    if n == 0 {
+        return Batch::empty(out_npc, left_schema.pk_stride());
+    }
+
+    let delta_mb = consolidated.as_mem_batch();
+    let mut output = Batch::empty_joined(left_schema, right_schema);
+
+    cogroup_left(consolidated, cursor, |key, range, m| {
+        // Walk the trace group once: product against the whole delta group and
+        // record whether any positive-weight trace row exists. A tombstone
+        // (weight ≤ 0) still products but does NOT suppress the null-fill.
+        let mut matched = false;
+        while m.valid && m.current_pk_eq(key) {
+            let w_trace = m.current_weight;
+            if w_trace > 0 { matched = true; }
+            for i in range.clone() {
+                let w_out = consolidated.get_weight(i).wrapping_mul(w_trace);
+                if w_out != 0 {
+                    write_join_row(
+                        &mut output, &delta_mb, i, m, w_out,
+                        left_schema, right_schema,
+                    );
+                }
+            }
+            m.advance();
+        }
+        if !matched {
+            for i in range {
+                write_join_row_null_right(
+                    &mut output, &delta_mb, i, consolidated.get_weight(i),
+                    left_schema, right_schema,
+                );
+            }
+        }
+    });
+
+    output.sorted = false;
+    output
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +244,9 @@ pub fn op_join_delta_trace_outer(
 /// type, so the trace PK region is an ordered arrangement by the range key and
 /// the probe bound is the delta row's own packed PK bytes — no decode/re-encode.
 ///
-/// Size-adaptive, mirroring the equi-join (`op_join_delta_trace`): rewind so
+/// Size-adaptive. Unlike the equi-join (now a single symmetric co-group), the
+/// two range strategies are structurally distinct algorithms — not two spellings
+/// of one merge — so the selector is load-bearing, not redundant: rewind so
 /// `estimated_length` sees the full trace, then drive from whichever side is
 /// smaller. When `|delta| ≤ |trace|` keep the delta-driven per-row probe
 /// (`range_per_row_seek`); when the delta outnumbers the trace, sweep the trace
@@ -434,8 +279,8 @@ pub fn op_join_delta_trace_range(
     // (`range_cut_points` asserts the range slot is non-empty per row.)
 
     // The same trace register may be reused across a tick; reset to position 0 so
-    // `estimated_length` sees the full trace and the merge walk starts at the
-    // head. The per-row path seeks absolutely, so the rewind is harmless there.
+    // `estimated_length` sees the full trace and both strategies' first
+    // `advance_to` galloping-seeks forward from the head.
     cursor.rewind();
     let trace_len = cursor.estimated_length();
     if n > trace_len {
@@ -448,8 +293,9 @@ pub fn op_join_delta_trace_range(
 /// Strategy 1 — delta-driven per-row probe (`|delta| ≤ |trace|`). For each
 /// consolidated delta row, derive its `[start, end)` cut interval and walk the
 /// matching trace run. The start cut is globally monotone non-decreasing across
-/// rows, so `seek_bytes` becomes the hint-seeded `seek_bytes_forward` once
-/// `galloping-forward-seek.md` lands (a one-call swap, same matches).
+/// rows (except `Lt`/`Le` at `n_eq == 0`, where every row seeks the minimum), so
+/// the hint-seeded `advance_to` galloping-skips forward across the monotone runs
+/// and falls back to a bounded backward search on the rare reset — same matches.
 fn range_per_row_seek(
     consolidated: &Batch,
     cursor: &mut ReadCursor,
@@ -472,9 +318,10 @@ fn range_per_row_seek(
         // Provably-empty interval (e.g. `Gt` of the maximal slot): no match.
         let Some((start, end)) = range_cut_points(eq, d, rel) else { continue };
 
-        // Per-row re-seek (O(log T)); supports the backward seeks `Lt`/`Le` with
-        // n_eq == 0 require (all rows seek to 0x00…).
-        cursor.seek_bytes(start.as_slice());
+        // Galloping forward skip seeded at the live position; falls back to a
+        // bounded backward search on the `Lt`/`Le` `n_eq == 0` reset (all rows
+        // seek 0x00…), so it stays correct for that non-monotone case too.
+        cursor.advance_to(start.as_slice());
         while cursor.valid
             && end.as_ref().is_none_or(|e| cursor.current_pk_cmp_bytes(e.as_slice()).is_lt())
         {
@@ -538,10 +385,10 @@ fn range_merge_walk(
             continue;
         };
 
-        // Seek to the covered start (absolute today; the targets ascend across
-        // groups, so `seek_bytes_forward` slots in once that primitive lands).
-        // Skips untouched trace groups and the intra-group dead head in one hop.
-        cursor.seek_bytes(start.as_slice());
+        // Galloping forward skip to the covered start: the targets ascend across
+        // groups, so `advance_to` seeded at the live position skips untouched
+        // trace groups and the intra-group dead head in one hop.
+        cursor.advance_to(start.as_slice());
         let mut ptr = lo; // monotone delta pointer
         while cursor.valid {
             // Bind the PK once: both the span-end bound and the range-slot read
@@ -741,7 +588,46 @@ pub fn op_semi_join_delta_delta(
     batch_b: &Batch,
     schema: &SchemaDescriptor,
 ) -> ConsolidatedBatch {
-    ConsolidatedBatch::new_unchecked(filter_join_dd(batch_a, batch_b, schema, true))
+    ConsolidatedBatch::new_unchecked(semi_join_dd(batch_a, batch_b, schema))
+}
+
+/// PK-only semi-join DD: emit each A PK group iff B has a positive-weight row at
+/// that PK. `cogroup_intersection` over a `BatchCursor` on B visits only shared
+/// PKs (galloping past the gaps — the skewed tiny ΔB ⋈ huge ΔA case gets the same
+/// speedup the delta-trace joins do), and the callback brackets B's equal-PK
+/// group by index to test presence.
+fn semi_join_dd(
+    batch_a: &Batch,
+    batch_b: &Batch,
+    schema: &SchemaDescriptor,
+) -> Batch {
+    let npc = schema.num_payload_cols();
+    let cs_a = Batch::consolidate_if_needed(batch_a, schema);
+    let cs_b = Batch::consolidate_if_needed(batch_b, schema);
+    let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
+    let cb: &Batch = cs_b.as_deref().unwrap_or(batch_b);
+    let n_a = ca.count;
+    if n_a == 0 {
+        return Batch::empty(npc, schema.pk_stride());
+    }
+
+    let mut output = Batch::empty_with_schema(schema);
+    let mut bc = BatchCursor::new(cb);
+
+    cogroup_intersection(ca, &mut bc, |_key, a_range, m| {
+        // Intersection ⇒ m is at B's equal-PK group; bracket and test presence.
+        let b_end = m.group_end();
+        let present = (m.pos..b_end).any(|j| cb.get_weight(j) > 0);
+        m.seek(b_end);
+        if present {
+            output.append_batch(ca, a_range.start, a_range.end);
+        }
+    });
+
+    output.sorted = true;
+    output.consolidated = true;
+    gnitz_debug!("op_semi_join_dd: a={} b={} out={}", n_a, cb.count, output.count);
+    output
 }
 
 /// Payload-aware anti-join DD: excludes A rows only when B has a matching
@@ -779,50 +665,37 @@ where
 
     let mb_a = ca.as_mem_batch();
     let mb_b = cb.as_mem_batch();
-    let mut idx_a = 0usize;
-    let mut idx_b = 0usize;
     let mut output = Batch::empty_with_schema(schema);
+    let mut bc = BatchCursor::new(cb);
 
-    while idx_a < n_a {
-        let key_a = ca.get_pk_bytes(idx_a);
-
-        // Advance B past every PK group ordered before key_a.
-        while idx_b < n_b && cb.get_pk_bytes(idx_b) < key_a {
-            idx_b += 1;
-        }
-
-        // Extent of B's PK group matching key_a.
-        let b_group_start = idx_b;
-        let mut b_group_end = idx_b;
-        while b_group_end < n_b && cb.get_pk_bytes(b_group_end) == key_a {
-            b_group_end += 1;
-        }
-
-        // Extent of A's PK group.
-        let a_group_start = idx_a;
-        let mut a_group_end = idx_a;
-        while a_group_end < n_a && ca.get_pk_bytes(a_group_end) == key_a {
-            a_group_end += 1;
-        }
-
-        // Both groups are payload-sorted (consolidated), so a single B cursor
-        // advances monotonically across all A rows — O(N+M) per group, not
-        // O(N×M).
-        let mut scan_b = b_group_start;
+    // `cogroup_left` visits every A PK group (anti emits per A row whether or not
+    // B matches). Inside each group, a (PK, payload) sub-merge walks A's rows and
+    // B's equal-PK group in lockstep — both payload-sorted — emitting each A row
+    // with no positive-weight (PK, payload) match in B, coalescing unmatched runs.
+    cogroup_left(ca, &mut bc, |key, a_range, m| {
+        // B's equal-PK group, or an empty range when B lacks the key (cogroup_left
+        // lands m at lower_bound(key), which may be a later key's row).
+        let has_b = m.pos < cb.count && cb.get_pk_bytes(m.pos) == key;
+        let (b_start, b_end) = if has_b {
+            (m.pos, m.group_end())
+        } else {
+            (m.pos, m.pos)
+        };
+        let mut scan_b = b_start;
         let mut unmatched_start: Option<usize> = None;
-        for idx_a_row in a_group_start..a_group_end {
+        for idx_a_row in a_range.clone() {
             // Reuse the comparison that ends the advance: when the loop breaks
             // with scan_b in range, `ord` already holds the (≥ Equal) result for
             // the current B row, so the match test needs no second row_cmp.
             let mut ord = Ordering::Greater;
-            while scan_b < b_group_end {
+            while scan_b < b_end {
                 ord = row_cmp(schema, &mb_b, scan_b, &mb_a, idx_a_row);
                 if ord != Ordering::Less {
                     break;
                 }
                 scan_b += 1;
             }
-            let matched = scan_b < b_group_end
+            let matched = scan_b < b_end
                 && ord == Ordering::Equal
                 && cb.get_weight(scan_b) > 0;
             if !matched {
@@ -834,77 +707,14 @@ where
             }
         }
         if let Some(rs) = unmatched_start.take() {
-            output.append_batch(ca, rs, a_group_end);
+            output.append_batch(ca, rs, a_range.end);
         }
-
-        idx_a = a_group_end;
-    }
+        m.seek(b_end);
+    });
 
     output.sorted = true;
     output.consolidated = true;
     gnitz_debug!("op_anti_join_dd: a={} b={} out={}", n_a, n_b, output.count);
-    output
-}
-
-/// Shared merge-walk for semi-join DD (PK-only matching).
-/// `emit_on_match=false` → anti-join (unused after payload-aware split),
-/// `emit_on_match=true` → semi-join.
-fn filter_join_dd(
-    batch_a: &Batch,
-    batch_b: &Batch,
-    schema: &SchemaDescriptor,
-    emit_on_match: bool,
-) -> Batch {
-    let npc = schema.num_payload_cols();
-    let cs_a = Batch::consolidate_if_needed(batch_a, schema);
-    let cs_b = Batch::consolidate_if_needed(batch_b, schema);
-    let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
-    let cb: &Batch = cs_b.as_deref().unwrap_or(batch_b);
-    let n_a = ca.count;
-    let n_b = cb.count;
-
-    if n_a == 0 {
-        return Batch::empty(npc, schema.pk_stride());
-    }
-
-    let mut idx_a = 0usize;
-    let mut idx_b = 0usize;
-    let mut output = Batch::empty_with_schema(schema);
-
-    while idx_a < n_a {
-        let key_a = ca.get_pk_bytes(idx_a);
-
-        // Advance B past every PK group ordered before key_a.
-        while idx_b < n_b && cb.get_pk_bytes(idx_b) < key_a {
-            idx_b += 1;
-        }
-
-        let mut has_match = false;
-        if idx_b < n_b && cb.get_pk_bytes(idx_b) == key_a {
-            let mut scan_b = idx_b;
-            while scan_b < n_b && cb.get_pk_bytes(scan_b) == key_a {
-                if cb.get_weight(scan_b) > 0 {
-                    has_match = true;
-                    break;
-                }
-                scan_b += 1;
-            }
-        }
-
-        let start_a = idx_a;
-        while idx_a < n_a && ca.get_pk_bytes(idx_a) == key_a {
-            idx_a += 1;
-        }
-
-        if has_match == emit_on_match {
-            output.append_batch(ca, start_a, idx_a);
-        }
-    }
-
-    output.sorted = true;
-    output.consolidated = true;
-    let tag = if emit_on_match { "semi" } else { "anti" };
-    gnitz_debug!("op_{}_join_dd: a={} b={} out={}", tag, n_a, n_b, output.count);
     output
 }
 
@@ -940,53 +750,36 @@ pub fn op_join_delta_delta(
     let mb_a = ca.as_mem_batch();
     let mb_b = cb.as_mem_batch();
     let mut output = Batch::empty_joined(left_schema, right_schema);
+    let mut bc = BatchCursor::new(cb);
 
-    let mut idx_a = 0usize;
-    let mut idx_b = 0usize;
-
-    while idx_a < n_a && idx_b < n_b {
-        let key_a = ca.get_pk_bytes(idx_a);
-        let key_b = cb.get_pk_bytes(idx_b);
-
-        match key_a.cmp(key_b) {
-            Ordering::Less => idx_a += 1,
-            Ordering::Greater => idx_b += 1,
-            Ordering::Equal => {
-                let match_pk = key_a;
-
-                let start_a = idx_a;
-                idx_a += 1;
-                while idx_a < n_a && ca.get_pk_bytes(idx_a) == match_pk {
-                    idx_a += 1;
-                }
-
-                let start_b = idx_b;
-                idx_b += 1;
-                while idx_b < n_b && cb.get_pk_bytes(idx_b) == match_pk {
-                    idx_b += 1;
-                }
-
-                for i in start_a..idx_a {
-                    let wa = ca.get_weight(i);
-                    if wa == 0 {
-                        continue;
-                    }
-                    for j in start_b..idx_b {
-                        let wb = cb.get_weight(j);
-                        let w_out = wa.wrapping_mul(wb);
-                        if w_out != 0 {
-                            write_join_row_from_batches(
-                                &mut output,
-                                &mb_a, i, &mb_b, j,
-                                w_out,
-                                left_schema, right_schema,
-                            );
-                        }
-                    }
+    // `cogroup_intersection` over a `BatchCursor` on B emits at shared PKs only,
+    // galloping past the gaps (the skewed tiny ⋈ huge case gets the same speedup
+    // the delta-trace joins get). Inside each group, bracket B's equal-PK group
+    // by index and emit the A-major × B-inner cartesian product (left payload
+    // ascending then right payload ascending ⇒ output stays (PK, payload)-sorted).
+    cogroup_intersection(ca, &mut bc, |_key, a_range, m| {
+        let b_start = m.pos;
+        let b_end = m.group_end();
+        for i in a_range {
+            let wa = ca.get_weight(i);
+            if wa == 0 {
+                continue;
+            }
+            for j in b_start..b_end {
+                let wb = cb.get_weight(j);
+                let w_out = wa.wrapping_mul(wb);
+                if w_out != 0 {
+                    write_join_row_from_batches(
+                        &mut output,
+                        &mb_a, i, &mb_b, j,
+                        w_out,
+                        left_schema, right_schema,
+                    );
                 }
             }
         }
-    }
+        m.seek(b_end);
+    });
 
     output.sorted = true;
     gnitz_debug!("op_join_dd: a={} b={} out={}", n_a, n_b, output.count);
@@ -1529,9 +1322,9 @@ mod tests {
         assert_eq!((out.get_pk(1) as u64), 3);
     }
 
-    /// Compound PK: the merge-walk advance loop compares trace PK vs delta PK.
-    /// Raw u128 order is last-column-major, so without `current_pk_cmp` the
-    /// scan mislocates and matches/anti-matches are wrong.
+    /// Compound PK: the co-group compares trace PK vs delta PK by bytes. Raw
+    /// u128 order is last-column-major, so a byte compare (not u128) is required
+    /// or the scan mislocates and matches/anti-matches are wrong.
     #[test]
     fn test_semi_anti_join_dt_compound_pk() {
         use std::rc::Rc;
@@ -1693,12 +1486,13 @@ mod tests {
     }
 
     #[test]
-    fn test_join_dt_swapped_marks_output_unsorted() {
+    fn test_join_dt_many_to_many_output_unsorted() {
         use crate::storage::CursorHandle;
         use std::rc::Rc;
-        // Many-to-many join with delta larger than the trace forces join_dt_swapped
-        // (n=3 > trace_len=2). The swapped path emits the cartesian product in
-        // trace-major order, interleaving left payloads out of (PK, payload) order.
+        // Many-to-many inner join: the unified co-group walks each trace group
+        // once and products it against the whole delta group, emitting the
+        // cartesian product in trace-major order — left payloads interleave out
+        // of (PK, payload) order, so the output must be marked unsorted.
         let schema = make_schema_u64_i64();
         // Trace: PK=1 with two right payloads (100, 200).
         let trace = Rc::new(make_batch(&schema, &[(1, 1, 100), (1, 1, 200)]).into_inner());
@@ -1720,7 +1514,7 @@ mod tests {
         let actually_sorted = pairs.windows(2).all(|w| w[0] <= w[1]);
         assert!(
             !out.sorted || actually_sorted,
-            "join_dt_swapped marked output sorted but payload order is {pairs:?}",
+            "many-to-many join marked output sorted but payload order is {pairs:?}",
         );
     }
 
@@ -2230,11 +2024,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Semi-join DT: swapped-path weight inflation + u128::MAX sentinel
+    // Semi-join DT: large-delta regime weight inflation + u128::MAX sentinel
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_semi_join_dt_swapped_max_pk() {
+    fn test_semi_join_dt_large_delta_max_pk() {
         use std::rc::Rc;
         use crate::storage::CursorHandle;
 
@@ -2246,7 +2040,7 @@ mod tests {
         let trace = Rc::new(make_batch(&schema, &[(max_pk, 1, 0)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
-        // Build 25 delta rows so n > trace_len triggers swapped path
+        // Build 25 delta rows: a large delta against a 1-row trace
         let mut rows: Vec<(u64, i64, i64)> = (1u64..=24).map(|i| (i, 1, i as i64)).collect();
         rows.push((max_pk, 1, 0));
         rows.sort_by_key(|r| r.0);
@@ -2254,12 +2048,12 @@ mod tests {
 
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Only PK=u64::MAX from delta matches — must emit exactly 1 row
-        assert_eq!(out.count, 1, "PK=u64::MAX must match on swapped path");
+        assert_eq!(out.count, 1, "PK=u64::MAX must match (large delta vs tiny trace)");
         assert_eq!((out.get_pk(0) as u64), max_pk);
     }
 
     #[test]
-    fn test_semi_join_dt_swapped_no_weight_inflation() {
+    fn test_semi_join_dt_no_weight_inflation() {
         use std::rc::Rc;
         use crate::storage::CursorHandle;
 
@@ -2272,7 +2066,7 @@ mod tests {
         ]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
-        // Delta: 20+ rows to trigger n > trace_len swap path
+        // Delta: 25 rows — a large delta against a 3-row (same-PK) trace
         let mut rows: Vec<(u64, i64, i64)> = (1u64..=25).map(|pk| (pk, 1, pk as i64 * 10)).collect();
         rows.sort_by_key(|r| r.0);
         let delta = make_batch(&schema, &rows);
@@ -2529,7 +2323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_join_dt_duplicate_pk_cached_no_reseek() {
+    fn test_anti_join_dt_duplicate_pk_group() {
         use std::rc::Rc;
         use crate::storage::CursorHandle;
         let schema = make_schema_u64_i64();
@@ -2678,16 +2472,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Wide-PK join_dt_merge_walk tests
+    // Wide-PK inner-join multiset-delta tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_join_dt_merge_walk_wide_pk_multiset_delta() {
+    fn test_join_dt_wide_pk_multiset_delta() {
         use crate::storage::CursorHandle;
         use std::rc::Rc;
         // Two delta rows sharing the same wide PK but different payloads (multiset
         // delta). One trace row for that PK. Inner join must produce 2 output rows.
-        // This exercises the pk_i == delta.get_pk_bytes(i - 1) re-seek branch.
+        // The co-group hands the whole same-PK delta group to the callback at
+        // once, producted against the once-walked trace group (no re-seek).
         let schema = schema_wide_pk();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
@@ -2715,19 +2510,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Wide-PK join_dt_swapped prefix-collision test
+    // Wide-PK inner-join prefix-collision test
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_join_dt_swapped_wide_pk_prefix_collision() {
+    fn test_join_dt_wide_pk_prefix_collision() {
         use crate::storage::CursorHandle;
         use std::rc::Rc;
         // Two wide-PK rows sharing the same first 16 OPK bytes (columns 0 and 1
-        // identical) but differing in column 2. The swapped path must treat them
+        // identical) but differing in column 2. The co-group must treat them
         // as distinct keys, not conflate via u128 prefix.
         // Row A: pk=(1,1,2), Row B: pk=(1,1,9).
         // Trace: Row A (+1). Delta: Row A (+1) and Row B (+1).
-        // Trigger swapped path: delta (2 rows) > trace (1 row).
+        // Large delta (2 rows) vs 1-row trace.
         let schema = schema_wide_pk();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 2, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
@@ -2753,7 +2548,7 @@ mod tests {
     fn test_outer_join_dt_wide_pk_multiset_delta() {
         use crate::storage::CursorHandle;
         use std::rc::Rc;
-        // Same multiset delta setup as merge_walk, but for outer join.
+        // Same multiset delta setup as the inner-join test, but for outer join.
         let schema = schema_wide_pk();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
@@ -2820,15 +2615,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Wide-PK semi_join_dt_swapped — prefix collision and negative weight
+    // Wide-PK semi-join (large delta) — prefix collision and negative weight
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_semi_join_dt_swapped_wide_pk_prefix_collision() {
+    fn test_semi_join_dt_wide_pk_prefix_collision() {
         use crate::storage::CursorHandle;
         use std::rc::Rc;
         // Prefix-collision pair: same first 16 OPK bytes (c0=1,c1=1), differ
-        // in c2. Trigger swapped path: make delta larger than trace.
+        // in c2. Large delta vs tiny trace exercises the galloping skip.
         // Trace has (1,1,0) only. Delta has (1,1,0) and (1,1,1<<56).
         // Only (1,1,0) should be semi-joined.
         let schema = schema_wide_pk();
@@ -2840,7 +2635,7 @@ mod tests {
         let delta_cb = make_wide_batch(&schema, &[
             (1, 1, 0,        1, 10),
             (1, 1, c2_large, 1, 20),
-            (2, 0, 0,        1, 30), // extra row to ensure n > trace_len=1
+            (2, 0, 0,        1, 30), // extra row so the delta outnumbers the 1-row trace
         ]);
         let delta = delta_cb.into_inner();
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
@@ -2850,7 +2645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_semi_join_dt_swapped_wide_pk_negative_weight_trace() {
+    fn test_semi_join_dt_wide_pk_negative_weight_trace() {
         use crate::storage::CursorHandle;
         use std::rc::Rc;
         // Trace entry for a wide PK with weight <= 0 must be skipped (no emit).
@@ -2858,7 +2653,7 @@ mod tests {
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(5, 5, 5, -1, 99)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
-        // Make delta larger so the swapped path is taken.
+        // Large delta vs a 1-row trace.
         let delta_cb = make_wide_batch(&schema, &[
             (5, 5, 5, 1, 10),
             (6, 6, 6, 1, 20),

@@ -435,7 +435,16 @@ pub fn op_reduce(
         let mut trace_out_key_buf = [0u8; crate::schema::MAX_PK_BYTES];
         let trace_out_key =
             trace_out_seek_key(output_schema, group_pk_bytes, group_key, &mut trace_out_key_buf);
-        trace_out_cursor.seek_group(trace_out_key);
+        // Natural-PK grouping visits groups in ascending output-PK order, so the
+        // retraction probe is monotone → galloping `advance_to` seeded at the
+        // live position. Payload GROUP BY keys on the synthetic `group_key`,
+        // whose order need not match trace_out storage order, so it keeps the
+        // absolute `seek_group` (correct for a non-monotone probe).
+        if group_by_pk {
+            trace_out_cursor.advance_to(trace_out_key);
+        } else {
+            trace_out_cursor.seek_group(trace_out_key);
+        }
         let has_old = trace_out_cursor.valid
             && trace_out_cursor.current_pk_eq(trace_out_key);
 
@@ -494,7 +503,10 @@ pub fn op_reduce(
 
                 if let Some(ti_cursor) = trace_in.as_deref_mut() {
                     if group_by_pk {
-                        ti_cursor.seek_group(group_pk_bytes);
+                        // MIN/MAX history read; group_by_pk visits groups in
+                        // ascending output-PK order, so the probe is monotone →
+                        // galloping `advance_to`.
+                        ti_cursor.advance_to(group_pk_bytes);
                         while ti_cursor.valid
                             && ti_cursor.current_pk_eq(group_pk_bytes)
                         {

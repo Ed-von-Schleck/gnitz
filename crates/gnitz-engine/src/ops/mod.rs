@@ -1,3 +1,4 @@
+pub(crate) mod cogroup;
 mod distinct;
 mod exchange;
 pub(crate) mod index;

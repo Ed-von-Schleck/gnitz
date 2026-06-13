@@ -987,17 +987,16 @@ impl Batch {
     /// `key` must be exactly `pk_stride` OPK bytes — identical width to the
     /// stored regions it is compared against.
     pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
-        let mut lo = 0usize;
-        let mut hi = self.count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.get_pk_bytes(mid) < key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
+        super::columnar::binary_lower_bound(0, self.count, key, &|i| self.get_pk_bytes(i))
+    }
+
+    /// Galloping forward lower bound seeded at `hint` (the caller's live
+    /// position): `O(log gap)` when the boundary is just ahead, `O(1)` when it
+    /// IS the hint, never worse than `find_lower_bound_bytes`. Used by the
+    /// sorted-stream co-group merge, whose probe keys ascend, so the boundary
+    /// only moves forward. `key` must be exactly `pk_stride` OPK bytes.
+    pub fn advance_to(&self, key: &[u8], hint: usize) -> usize {
+        super::columnar::gallop_lower_bound_bytes(self.count, key, hint, |i| self.get_pk_bytes(i))
     }
 
     /// Bulk-copy rows [start, end) from another Batch (same schema).

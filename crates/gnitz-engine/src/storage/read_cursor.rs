@@ -164,6 +164,15 @@ impl CursorSource {
         }
     }
 
+    /// Galloping forward lower bound seeded at `hint` (this source's live
+    /// position). Forwards to the per-source `advance_to`.
+    fn advance_to(&self, key: &[u8], hint: usize) -> usize {
+        match self {
+            CursorSource::Batch(b) => b.advance_to(key, hint),
+            CursorSource::Shard(s) => s.advance_to(key, hint),
+        }
+    }
+
     #[inline]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
         match self {
@@ -323,6 +332,15 @@ impl CursorState {
     /// `pk_stride` OPK bytes.
     fn seek_bytes(&mut self, src: &CursorSource, key: &[u8]) {
         self.position = src.find_lower_bound_bytes(key);
+        self.skip_ghosts(src);
+    }
+
+    /// Galloping forward seek to the first row whose OPK bytes are `>= key`,
+    /// seeded at the live `position`. Forward-only and position-owned, so a
+    /// stale or non-monotone hint is unrepresentable — equals `seek_bytes`'s
+    /// landing index for any key, only cheaper when the boundary moves forward.
+    fn advance_to(&mut self, src: &CursorSource, key: &[u8]) {
+        self.position = src.advance_to(key, self.position);
         self.skip_ghosts(src);
     }
 
@@ -522,6 +540,24 @@ impl ReadCursor {
         self.rebuild_and_drive();
     }
 
+    /// Galloping forward lower-bound seek, seeding each source's search at that
+    /// source's live `position` (the stream owns its hint — there is no hint
+    /// parameter). Lands on the identical row `seek_bytes(key)` would
+    /// (`gallop_lower_bound_bytes` == `find_lower_bound_bytes` for every hint),
+    /// only cheaper when the boundary moves forward. Backward-capable: a
+    /// non-monotone hint forfeits the speedup (the search falls back to a bounded
+    /// `[0, position)` scan) but never correctness — so monotone consumers (the
+    /// co-group merges, the natural-PK reduce reads) get the skip while
+    /// non-monotone ones (the unordered `gather_family_bytes` resolve, the
+    /// `Lt`/`Le` range reset) stay correct. `key` must be exactly `pk_stride` OPK
+    /// bytes.
+    pub fn advance_to(&mut self, key: &[u8]) {
+        for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
+            state.advance_to(src, key);
+        }
+        self.rebuild_and_drive();
+    }
+
     /// Seek to `key` (exact `pk_stride` OPK bytes) and report whether it landed
     /// on a *present, live* row: positioned, PK byte-equal, and net weight > 0.
     /// The weight gate is load-bearing, not redundant — a single-source cursor
@@ -532,6 +568,23 @@ impl ReadCursor {
     /// unique-upsert probe, single-row retract) would otherwise open-code.
     pub fn seek_exact_live(&mut self, key: &[u8]) -> bool {
         self.seek_bytes(key);
+        self.valid && self.current_pk_eq(key) && self.current_weight > 0
+    }
+
+    /// Galloping forward sibling of [`seek_exact_live`]: `advance_to(key)` then
+    /// the same present/exact-PK/positive-weight gate. For an **ascending** probe
+    /// sequence (each `key` ≥ the last) the per-source search is seeded at the
+    /// live position, turning K scattered point-seeks into one monotone forward
+    /// sweep that keeps shard pages and merge state hot. Correct for any probe
+    /// order — `advance_to` is backward-capable — so an out-of-order key only
+    /// forfeits the speedup, never correctness. `key` must be exactly `pk_stride`
+    /// OPK bytes. Both an ascending resolve loop (the sorted-`&[PkBuf]` callers)
+    /// and an unordered batch sharing one cursor (`gather_family_bytes`) use this:
+    /// the former gets the full sweep, the latter still beats re-seeking from
+    /// scratch via the bounded `[0, position)` backward branch. A lone random
+    /// point lookup can keep `seek_exact_live`.
+    pub fn advance_to_exact_live(&mut self, key: &[u8]) -> bool {
+        self.advance_to(key);
         self.valid && self.current_pk_eq(key) && self.current_weight > 0
     }
 
@@ -554,6 +607,25 @@ impl ReadCursor {
     #[inline]
     pub fn current_pk_eq(&self, key_bytes: &[u8]) -> bool {
         self.current_pk_bytes() == key_bytes
+    }
+
+    /// Walk the equal-PK group at the current position to its end, reporting
+    /// whether any entry has positive weight — i.e. whether `key` is a member of
+    /// `Distinct(trace)`. An uncompacted trace may present a tombstone
+    /// (weight ≤ 0) *before* a live row, so the whole group is scanned, not just
+    /// its head. Consumes the group: on return the cursor sits at the first row
+    /// past it, satisfying the co-group callback's "walk the whole group"
+    /// contract. `key` is the group's OPK bytes (the `key` handed to a
+    /// `cogroup_left`/`cogroup_intersection` callback).
+    pub fn group_has_positive(&mut self, key: &[u8]) -> bool {
+        let mut present = false;
+        while self.valid && self.current_pk_eq(key) {
+            if self.current_weight > 0 {
+                present = true;
+            }
+            self.advance();
+        }
+        present
     }
 
     /// Storage-order comparison of the current row's PK against an OPK `key`
@@ -1682,6 +1754,34 @@ mod tests {
                     assert_eq!(c.current_pk_bytes(), &k.to_be_bytes()[..], "key={key}");
                 }
                 None => assert!(!c.valid, "key={key} past end must be invalid"),
+            }
+        }
+    }
+
+    /// `advance_to` (forward-only, position-seeded) lands on the identical row a
+    /// from-scratch `seek_bytes` would, across a monotone ascending probe sweep —
+    /// for both a single-source cursor and a multi-source cursor (exercising the
+    /// loser-tree rebuild). The reused position must never change the landing.
+    #[test]
+    fn advance_to_lands_like_seek_bytes_monotone() {
+        let schema = make_schema_i64();
+        let b0 = make_batch(&[(10u128, 1, 100), (30, 1, 300), (50, 1, 500), (70, 1, 700)]);
+        let b1 = make_batch(&[(20u128, 1, 200), (40, 1, 400), (60, 1, 600)]);
+        // Monotone ascending: below-min, present, absent-between, above-max.
+        let probes: &[u128] = &[0, 10, 15, 20, 35, 50, 55, 70, 71];
+
+        for sources in [vec![Rc::clone(&b0)], vec![Rc::clone(&b0), Rc::clone(&b1)]] {
+            let mut adv = create_read_cursor(&sources, &[], schema);
+            for &key in probes {
+                adv.advance_to(&key.to_be_bytes());
+                // A fresh cursor seeking the same key from scratch is the oracle.
+                let mut fresh = create_read_cursor(&sources, &[], schema);
+                fresh.seek_bytes(&key.to_be_bytes());
+                assert_eq!(adv.valid, fresh.valid, "n_src={} key={key}", sources.len());
+                if adv.valid {
+                    assert_eq!(adv.current_key, fresh.current_key, "key={key}");
+                    assert_eq!(adv.current_pk_bytes(), fresh.current_pk_bytes(), "key={key}");
+                }
             }
         }
     }
