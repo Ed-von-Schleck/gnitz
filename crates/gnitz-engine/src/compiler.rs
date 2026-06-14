@@ -501,6 +501,26 @@ pub(crate) fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), i32> {
 /// for O(V+E) traversal instead of rescanning the flat edge list per node.
 /// Shared by `compute_join_shard_map` and `DagEngine::get_join_shard_cols`.
 pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32) -> Vec<(i32, u8)> {
+    // In a JOIN view the input scatter key is defined by the reindex that feeds the
+    // trace/probe (IntegrateTrace or a join node). An input may carry OTHER reindexes
+    // off the same scan that re-key the already-scattered rows in place and must NOT
+    // contribute to the scatter key — notably the band LEFT join's `a.pk` re-key for
+    // the null-fill set difference (keyed differently from the eq-prefix join key).
+    // Those feed a plain Map → Distinct, never the trace/probe, so we drop them. The
+    // nullable-key null/not-null sibling reindexes carry the SAME key as the match
+    // reindex and remain (deduped). Non-join views (PK-redistribution, GROUP BY) have
+    // no join node, so the guard is off and every reindex is collected as before.
+    let is_join_view = loaded.nodes.values().any(|op| matches!(op,
+        gnitz_wire::OpNode::Join(_)
+        | gnitz_wire::OpNode::AntiJoin(_)
+        | gnitz_wire::OpNode::SemiJoin(_)));
+    let feeds_trace_or_join = |nid: i32| loaded.outgoing.get(&nid).is_some_and(|outs|
+        outs.iter().any(|&(d, _)| matches!(loaded.nodes.get(&d),
+            Some(gnitz_wire::OpNode::IntegrateTrace
+               | gnitz_wire::OpNode::Join(_)
+               | gnitz_wire::OpNode::AntiJoin(_)
+               | gnitz_wire::OpNode::SemiJoin(_)))));
+
     let mut queue = VecDeque::from([scan_nid]);
     // `visited` bounds the walk to O(nodes): without it a Filter diamond (two
     // edge paths reaching the same Filter) would re-push and re-expand nodes.
@@ -518,10 +538,12 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
             for &(dst, _port) in outs {
                 match loaded.nodes.get(&dst) {
                     // A non-empty reindex Map is a join (or group) reindex; an empty
-                    // reindex_cols is a plain projection Map — skip it.
+                    // reindex_cols is a plain projection Map — skip it. In a join view
+                    // a reindex only defines the scatter key if it feeds the trace/probe.
                     Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
                         reindex_cols, reindex_target_tcs, ..
-                    })) if !reindex_cols.is_empty() => {
+                    })) if !reindex_cols.is_empty()
+                        && (!is_join_view || feeds_trace_or_join(dst)) => {
                         let seq: Vec<(i32, u8)> = reindex_cols.iter().enumerate()
                             .map(|(i, &rc)| {
                                 (rc as i32, reindex_target_tcs.get(i).copied().unwrap_or(0))
@@ -3964,6 +3986,41 @@ mod tests {
         let loaded = make_loaded(nodes, edges);
         assert_eq!(reindex_cols_through_filters(&loaded, 0), vec![(2, 0)],
             "identical sibling sequences must collapse to one, not concatenate");
+    }
+
+    /// Band LEFT join shape: the left scan feeds BOTH the join reindex (`[eq, range]`,
+    /// feeding the DeltaTraceRange) AND an auxiliary `a.pk` re-key (feeding only the
+    /// null-fill's Map → Distinct). Only the join reindex defines the input scatter
+    /// key; the auxiliary re-key must be ignored (it re-keys already-scattered rows in
+    /// place). A naive walk would concatenate both and corrupt the eq-prefix scatter.
+    #[test]
+    fn test_reindex_cols_through_filters_ignores_aux_rekey_in_join_view() {
+        use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel};
+        let dummy_blob: Vec<u8> = vec![
+            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        // ScanDelta(10) ──► Map(reindex [1,2]) ──► Join(DeltaTraceRange)
+        //              │                       └─► IntegrateTrace
+        //              └──► Map(reindex [0]) ──► Map(Projection) ──► Distinct   (a_all → proj_a → D)
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(10));
+        nodes.insert(1, OpNode::Map(MapKind::Expression {
+            program: dummy_blob.clone(), reindex_cols: vec![1, 2], reindex_target_tcs: vec![],
+        }));
+        nodes.insert(2, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 1, rel: RangeRel::Le }));
+        nodes.insert(3, OpNode::IntegrateTrace);
+        nodes.insert(4, OpNode::Map(MapKind::Expression {
+            program: dummy_blob, reindex_cols: vec![0], reindex_target_tcs: vec![],
+        }));
+        nodes.insert(5, OpNode::Map(MapKind::Projection(vec![])));
+        nodes.insert(6, OpNode::Distinct);
+        let edges = vec![
+            (0, 1, PORT_IN), (1, 2, PORT_IN_A), (1, 3, PORT_IN),    // join reindex → Join + trace
+            (0, 4, PORT_IN), (4, 5, PORT_IN), (5, 6, PORT_IN),      // aux a.pk re-key → proj → distinct
+        ];
+        let loaded = make_loaded(nodes, edges);
+        assert_eq!(reindex_cols_through_filters(&loaded, 0), vec![(1, 0), (2, 0)],
+            "only the trace/probe-feeding reindex defines the scatter key; the a.pk re-key is ignored");
     }
 
     /// Pure ScanTrace sources (Python-API joins) must also appear in the map.

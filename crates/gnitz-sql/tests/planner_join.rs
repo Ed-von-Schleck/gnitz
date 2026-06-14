@@ -1,6 +1,12 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::{OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_PARTITION_FILTER};
+use gnitz_core::{
+    OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_PARTITION_FILTER,
+    OPCODE_MAP_EXPR, OPCODE_MAP_PROJ, OPCODE_DISTINCT, OPCODE_NEGATE, OPCODE_UNION,
+    OPCODE_NULL_EXTEND, OPCODE_EXCHANGE_SHARD, OPCODE_INTEGRATE_TRACE,
+    OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_OUTER,
+    OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_SEMI_JOIN_DELTA_TRACE, OPCODE_DELAY,
+};
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
@@ -493,10 +499,26 @@ fn test_range_join_accepts_band() {
     assert!(client.resolve_table_or_view_id(&sn, "bj_v").is_ok(), "band-join view should register");
 }
 
-/// A LEFT JOIN with a range predicate is rejected (range-aware anti-join is out
-/// of scope).
+/// A band LEFT JOIN (≥1 equality conjunct + a range conjunct) registers cleanly —
+/// the null-fill is partition-local on the eq-prefix scatter.
 #[test]
-fn test_range_join_reject_left_outer() {
+fn test_band_left_join_accepts() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE bl_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE bl_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE VIEW bl_v AS SELECT bl_a.id AS aid, bl_b.id AS bid \
+               FROM bl_a LEFT JOIN bl_b ON bl_a.k = bl_b.k AND bl_a.lo <= bl_b.t").unwrap();
+    assert!(client.resolve_table_or_view_id(&sn, "bl_v").is_ok(), "band LEFT-join view should register");
+}
+
+/// A pure-range LEFT JOIN (no equality conjunct) is rejected: the null-fill would
+/// need a per-a.pk existence gather in series with the pair-PK output exchange —
+/// two sequential exchanges, which the single-boundary executor cannot run. Band
+/// LEFT (an equality conjunct present) is the supported form.
+#[test]
+fn test_pure_range_left_join_rejected() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
@@ -504,7 +526,7 @@ fn test_range_join_reject_left_outer() {
     p.execute("CREATE TABLE rl_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)").unwrap();
     let err = must_err(p.execute("CREATE VIEW rl_v AS SELECT * FROM rl_a LEFT JOIN rl_b ON rl_a.x < rl_b.y"));
     match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("LEFT JOIN with a range predicate"), "got: {s}"),
+        GnitzSqlError::Unsupported(s) => assert!(s.contains("pure-range LEFT JOIN"), "got: {s}"),
         e => panic!("expected Unsupported, got {:?}", e),
     }
     assert!(client.resolve_table_or_view_id(&sn, "rl_v").is_err(), "no view should be registered");
@@ -604,4 +626,64 @@ fn test_range_join_partition_filter_circuit_shape() {
         "band join is a range circuit — two DeltaTraceRange terms");
     assert_eq!(opcode_node_count(nodes, pure, OPCODE_JOIN_DELTA_TRACE_RANGE), 2,
         "pure range join — two DeltaTraceRange terms");
+}
+
+// ── Band LEFT-join circuit shape (the null-fill set-difference) ───────────────
+
+/// The band LEFT null-fill, pinned at the circuit level. Built over the SAME
+/// tables as an INNER band view, the LEFT view adds exactly the set-difference
+/// chain `distinct(π_A(inner))` → `negate` → `union` (A − D) → `null_extend` →
+/// re-key → project → `union` (inner ∪ null-fill): `map_reindex ×3`, `map ×2`,
+/// `distinct ×1`, `negate ×1`, `union ×2`, `null_extend ×1`. Crucially it adds
+/// **zero** ExchangeShard, range/anti/semi/outer Join, IntegrateTrace, Delay, or
+/// PartitionFilter — the null-fill is partition-local and reuses the inner output,
+/// riding the one existing pair-PK output exchange. The INNER view is unchanged
+/// (no distinct / null_extend / negate).
+#[test]
+fn test_band_left_join_circuit_shape() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE bls_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE TABLE bls_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)").unwrap();
+        // INNER and LEFT band views over identical tables and ON clause.
+        p.execute("CREATE VIEW bls_inner AS SELECT bls_a.id AS aid, bls_b.id AS bid \
+                   FROM bls_a JOIN bls_b ON bls_a.k = bls_b.k AND bls_a.lo <= bls_b.t").unwrap();
+        p.execute("CREATE VIEW bls_left AS SELECT bls_a.id AS aid, bls_b.id AS bid \
+                   FROM bls_a LEFT JOIN bls_b ON bls_a.k = bls_b.k AND bls_a.lo <= bls_b.t").unwrap();
+    }
+    let inner = client.resolve_table_or_view_id(&sn, "bls_inner").unwrap().0;
+    let left  = client.resolve_table_or_view_id(&sn, "bls_left").unwrap().0;
+
+    let nodes = scan_circuit_nodes(&mut client);
+    let nodes = nodes.as_ref();
+    let n_inner = |op: u64| opcode_node_count(nodes, inner, op);
+    let n_left  = |op: u64| opcode_node_count(nodes, left, op);
+
+    // The null-fill adds exactly this set-difference chain over the inner skeleton.
+    assert_eq!(n_left(OPCODE_MAP_EXPR)    - n_inner(OPCODE_MAP_EXPR),    3, "rekey_a + a_all + nf_rekey");
+    assert_eq!(n_left(OPCODE_MAP_PROJ)    - n_inner(OPCODE_MAP_PROJ),    2, "proj_a + nf_proj");
+    assert_eq!(n_left(OPCODE_DISTINCT)    - n_inner(OPCODE_DISTINCT),    1, "one distinct(π_A(inner))");
+    assert_eq!(n_left(OPCODE_NEGATE)      - n_inner(OPCODE_NEGATE),      1, "negate(D) for A − D");
+    assert_eq!(n_left(OPCODE_UNION)       - n_inner(OPCODE_UNION),       2, "A − D diff + inner ∪ null-fill");
+    assert_eq!(n_left(OPCODE_NULL_EXTEND) - n_inner(OPCODE_NULL_EXTEND), 1, "null_extend(diff)");
+
+    // No extra exchange, no extra join machinery, no extra trace/delay/partition —
+    // the null-fill is partition-local and reuses the inner range output.
+    assert_eq!(n_left(OPCODE_EXCHANGE_SHARD),      n_inner(OPCODE_EXCHANGE_SHARD), "no added ExchangeShard");
+    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_RANGE), n_inner(OPCODE_JOIN_DELTA_TRACE_RANGE), "no added range Join");
+    assert_eq!(n_left(OPCODE_INTEGRATE_TRACE),     n_inner(OPCODE_INTEGRATE_TRACE), "no added IntegrateTrace");
+    assert_eq!(n_left(OPCODE_PARTITION_FILTER), 0, "band LEFT carries no PartitionFilter");
+    assert_eq!(n_left(OPCODE_DELAY), 0, "no Delay node");
+    assert_eq!(n_left(OPCODE_ANTI_JOIN_DELTA_TRACE), 0, "set-difference form uses no anti-join");
+    assert_eq!(n_left(OPCODE_SEMI_JOIN_DELTA_TRACE), 0, "no semi-join");
+    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
+    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_OUTER), 0, "no outer-join operator");
+
+    // Exactly one distinct, and the INNER view is shape-unchanged by the LEFT path.
+    assert_eq!(n_left(OPCODE_DISTINCT), 1, "exactly one distinct in the band LEFT circuit");
+    assert_eq!(n_inner(OPCODE_DISTINCT), 0, "INNER band view has no distinct");
+    assert_eq!(n_inner(OPCODE_NULL_EXTEND), 0, "INNER band view has no null_extend");
+    assert_eq!(n_inner(OPCODE_NEGATE), 0, "INNER band view has no negate");
 }

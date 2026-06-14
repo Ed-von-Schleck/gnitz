@@ -1174,6 +1174,26 @@ def _view_pairs(client, vid):
     return {(r[0], r[1]) for r in client.scan(vid) if r.weight > 0}
 
 
+def _band_left_ref(a_rows, b_rows, pred):
+    """Reference LEFT band-join result as a set of (a_id, b_id_or_None): every left
+    row with ≥1 match contributes one (a_id, b_id) per match; every left row with NO
+    match contributes its null-fill (a_id, None). Rows are (id, *cols) tuples."""
+    out = set()
+    for a in a_rows:
+        matches = [b for b in b_rows if pred(a, b)]
+        if matches:
+            out |= {(a[0], b[0]) for b in matches}
+        else:
+            out.add((a[0], None))
+    return out
+
+
+def _band_left_rows(client, vid):
+    """Live LEFT band-join view as {(aid, bid)}, bid None for a null-fill row. The
+    view must project `a.id AS aid, b.id AS bid` (b.id is NULL on a null-fill)."""
+    return {(r["aid"], r["bid"]) for r in client.scan(vid) if r.weight > 0}
+
+
 _RANGE_OPS = [
     ("<",  lambda a, b: a < b),
     ("<=", lambda a, b: a <= b),
@@ -1806,7 +1826,9 @@ class TestRangeJoin:
                 "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL, "
                 "z BIGINT NOT NULL, s VARCHAR(20) NOT NULL, fy DOUBLE NOT NULL)", schema_name=sn)
             rejected = {
-                "left_outer":  "CREATE VIEW v AS SELECT * FROM a LEFT JOIN b ON a.x < b.y",
+                # Band LEFT (with an eq conjunct) IS supported; only PURE-range LEFT
+                # (no eq conjunct → would need two sequential exchanges) is rejected.
+                "pure_range_left": "CREATE VIEW v AS SELECT * FROM a LEFT JOIN b ON a.x < b.y",
                 "two_range":   "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.x < b.y AND a.w > b.z",
                 "string_pair": "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.s < b.s",
                 "float_pair":  "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fx < b.fy",
@@ -1818,5 +1840,220 @@ class TestRangeJoin:
                 # No view should have been registered by a rejected CREATE.
                 with pytest.raises(Exception):
                     client.resolve_table(sn, "v")
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+    # ── Band LEFT OUTER (eq prefix + range): the null-fill set-difference ──────
+    #
+    # View projects `a.id AS aid, b.id AS bid`; a null-fill row is (aid, None)
+    # because its b.id is NULL. The reference is `_band_left_ref`.
+
+    def _mk_band_left(self, client, sn):
+        """CREATE a/b/v for the standard band LEFT view and return (vid, pred)."""
+        client.execute_sql(
+            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
+            schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
+            schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid "
+            "FROM a LEFT JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
+        vid, _ = client.resolve_table(sn, "v")
+        return vid, (lambda a, b: a[1] == b[1] and a[2] <= b[2])
+
+    def test_band_left_delta_a_then_b(self, client):
+        """ΔA then ΔB, plus retraction and match-multiplicity. An a with no b in its
+        k-group satisfying lo<=t null-fills; a ΔB that gives it a first match retracts
+        the null-fill and emits the pair; deleting that b restores the null-fill. An a
+        with two matches stays matched until the LAST retracts (distinct over summed
+        a.pk weights — multiplicity, not a 0-boundary crossing, until the end)."""
+        sn = "blab" + _uid()
+        client.create_schema(sn)
+        try:
+            vid, pred = self._mk_band_left(client, sn)
+
+            # Seed b thin: one row in group k=1 only.
+            b_rows = [(1, 1, 50)]
+            client.execute_sql("INSERT INTO b VALUES (1, 1, 50)", schema_name=sn)
+
+            # a1 (k=1, lo=10) matches b1; a2 (k=2) and a3 (k=3, lo=999) have no b in
+            # their group satisfying the band → null-fills.
+            a_rows = [(1, 1, 10), (2, 2, 10), (3, 3, 999)]
+            client.execute_sql("INSERT INTO a VALUES (1,1,10), (2,2,10), (3,3,999)", schema_name=sn)
+            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
+            assert _band_left_rows(client, vid) == {(1, 1), (2, None), (3, None)}
+
+            # ΔB: b2 in group k=2 (t=20 ≥ a2.lo=10) → a2 gains its first match.
+            b_rows.append((2, 2, 20))
+            client.execute_sql("INSERT INTO b VALUES (2, 2, 20)", schema_name=sn)
+            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
+            assert _band_left_rows(client, vid) == {(1, 1), (2, 2), (3, None)}
+
+            # Delete b2 → a2's last (only) match gone → (a2, NULL) returns.
+            b_rows = [r for r in b_rows if r[0] != 2]
+            client.execute_sql("DELETE FROM b WHERE id = 2", schema_name=sn)
+            assert _band_left_rows(client, vid) == {(1, 1), (2, None), (3, None)}
+
+            # Multiplicity: add b3 (k=1, t=30) so a1 matches BOTH b1 and b3.
+            b_rows.append((3, 1, 30))
+            client.execute_sql("INSERT INTO b VALUES (3, 1, 30)", schema_name=sn)
+            rows = _band_left_rows(client, vid)
+            assert rows == _band_left_ref(a_rows, b_rows, pred)
+            assert (1, None) not in rows                      # matched twice — no null-fill
+            # Drop one of a1's two matches → still matched.
+            b_rows = [r for r in b_rows if r[0] != 1]
+            client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=sn)
+            rows = _band_left_rows(client, vid)
+            assert (1, None) not in rows
+            assert rows == {(1, 3), (2, None), (3, None)}
+            # Drop a1's last match → (a1, NULL) finally appears.
+            b_rows = [r for r in b_rows if r[0] != 3]
+            client.execute_sql("DELETE FROM b WHERE id = 3", schema_name=sn)
+            assert _band_left_rows(client, vid) == {(1, None), (2, None), (3, None)}
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+    def test_band_left_same_epoch_match(self, client):
+        """Same-epoch insert-and-match: b's match already sits in the trace, then a is
+        inserted; its match is decided in the SAME epoch as its insertion. The result
+        is exactly one (a, b) and NO net (a, NULL) — distinct sees ΔD=+a in this epoch
+        (the inner join's AB term) and cancels ΔA=+a. This is the case a key-only
+        anti-join cannot get right for a range predicate. A non-matching a inserted in
+        the same epoch still null-fills, proving the epoch handles a mixed batch."""
+        sn = "blse" + _uid()
+        client.create_schema(sn)
+        try:
+            vid, pred = self._mk_band_left(client, sn)
+            # b's matches live in the trace before a arrives.
+            b_rows = [(1, 1, 50)]
+            client.execute_sql("INSERT INTO b VALUES (1, 1, 50)", schema_name=sn)
+            # One epoch: a1 matches the existing b1; a2 (k=7) has no b.
+            a_rows = [(1, 1, 10), (2, 7, 10)]
+            client.execute_sql("INSERT INTO a VALUES (1,1,10), (2,7,10)", schema_name=sn)
+            rows = _band_left_rows(client, vid)
+            assert rows == _band_left_ref(a_rows, b_rows, pred)
+            assert rows == {(1, 1), (2, None)}
+            assert (1, None) not in rows                      # no same-epoch null-fill for a1
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+    def test_band_left_delete_matched_row(self, client):
+        """Delete a matched left row: from steady state (a matched, no null-fill),
+        deleting a retracts (a, b) and emits NO (a, NULL) — ΔA=−a and ΔD=−a cancel
+        (distinct 1→0 in the same epoch). A broken cancellation would surface a
+        spurious (a, NULL) tombstone in the integrated view."""
+        sn = "bldm" + _uid()
+        client.create_schema(sn)
+        try:
+            vid, _pred = self._mk_band_left(client, sn)
+            client.execute_sql("INSERT INTO b VALUES (1, 1, 50)", schema_name=sn)
+            client.execute_sql("INSERT INTO a VALUES (1, 1, 10)", schema_name=sn)
+            rows = _band_left_rows(client, vid)
+            assert rows == {(1, 1)}
+            assert (1, None) not in rows
+            # Delete the matched a → fully gone, no null-fill emitted.
+            client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
+            assert _band_left_rows(client, vid) == set()
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+    def test_band_left_cross_worker_eq_groups(self, client):
+        """Many distinct eq-key groups spread across all four workers, some matched
+        and some not. The partition-local distinct must be globally correct: never a
+        spurious null-fill for a matched a, never a dropped null-fill for an unmatched
+        a whose group lives on another worker. b is seeded only in EVEN groups; a is
+        inserted in EVERY group, so odd-group a's null-fill and even-group a's match."""
+        sn = "blcw" + _uid()
+        client.create_schema(sn)
+        try:
+            vid, pred = self._mk_band_left(client, sn)
+            ng = 40                                            # groups fan out across W=4
+            b_rows = [(g, g, 100) for g in range(2, ng + 1, 2)]   # even groups only
+            a_rows = [(g, g, 10) for g in range(1, ng + 1)]       # all groups, lo=10 ≤ 100
+            client.execute_sql(
+                "INSERT INTO b VALUES " + ",".join(f"({i},{k},{t})" for i, k, t in b_rows),
+                schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO a VALUES " + ",".join(f"({i},{k},{lo})" for i, k, lo in a_rows),
+                schema_name=sn)
+            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
+            # Sanity: even groups matched, odd groups null-filled.
+            rows = _band_left_rows(client, vid)
+            assert (2, 2) in rows and (1, None) in rows and (3, None) in rows
+            assert (1, 1) not in rows
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+    def test_band_left_null_join_key(self, client):
+        """A left row with a NULL eq or NULL range column can never satisfy the
+        predicate (SQL 3VL): it is filtered out of the inner match (never in D) yet is
+        still a left row (in A, sourced from the UNFILTERED input) → null-filled
+        exactly once. No bypass branch exists; the A − D difference subsumes it."""
+        sn = "blnk" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, lo BIGINT)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid "
+                "FROM a LEFT JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
+            vid, _ = client.resolve_table(sn, "v")
+            client.execute_sql("INSERT INTO b VALUES (1, 1, 100)", schema_name=sn)
+            # a1: NULL eq key. a2: NULL range key. a3: fully defined, matches b1.
+            client.execute_sql(
+                "INSERT INTO a VALUES (1, NULL, 10), (2, 1, NULL), (3, 1, 10)", schema_name=sn)
+            rows = _band_left_rows(client, vid)
+            assert rows == {(1, None), (2, None), (3, 1)}
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+    def test_band_left_payload_fidelity_wide_pk(self, client):
+        """Byte-exact (A, D) cancellation under a STRING column, a nullable column
+        carrying NULL, and a 2-column (wide) source PK. A matched left row's +1 (from
+        A) and −1 (from distinct(π_A(inner))) must be byte-identical so they cancel —
+        a stride/encoding mismatch would leave a spurious (a, NULL). Phase 1 inserts
+        only matched a's and asserts ZERO null-fills with exact payload; phase 2 adds
+        unmatched a's and asserts their null-fills carry the exact A payload."""
+        sn = "blpf" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id1 BIGINT NOT NULL, id2 BIGINT NOT NULL, k BIGINT NOT NULL, "
+                "lo BIGINT NOT NULL, s VARCHAR(16) NOT NULL, note BIGINT, PRIMARY KEY (id1, id2))",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id1 AS aid1, a.id2 AS aid2, a.s AS asv, "
+                "a.note AS anote, b.id AS bid "
+                "FROM a LEFT JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
+            vid, _ = client.resolve_table(sn, "v")
+
+            def rowset():
+                return {(r["aid1"], r["aid2"], r["asv"], r["anote"], r["bid"])
+                        for r in client.scan(vid) if r.weight > 0}
+
+            client.execute_sql("INSERT INTO b VALUES (1, 1, 100), (2, 2, 100)", schema_name=sn)
+            # Phase 1 — every a matches (string + nullable note in payload).
+            client.execute_sql(
+                "INSERT INTO a VALUES (1, 1, 1, 10, 'alpha', 7), (1, 2, 2, 20, 'beta', NULL)",
+                schema_name=sn)
+            got = rowset()
+            assert got == {(1, 1, "alpha", 7, 1), (1, 2, "beta", None, 2)}
+            assert all(r[4] is not None for r in got), "matched rows must not null-fill (clean A − D)"
+
+            # Phase 2 — add unmatched a's (group with no b / lo above every b.t).
+            client.execute_sql(
+                "INSERT INTO a VALUES (2, 1, 9, 10, 'gamma', 42), (2, 2, 1, 999, 'delta', NULL)",
+                schema_name=sn)
+            assert rowset() == {
+                (1, 1, "alpha", 7, 1), (1, 2, "beta", None, 2),
+                (2, 1, "gamma", 42, None), (2, 2, "delta", None, None),
+            }
         finally:
             _drop_all(client, sn, views=["v"], tables=["a", "b"])
