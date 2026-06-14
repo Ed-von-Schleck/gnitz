@@ -6,6 +6,7 @@ use gnitz_core::{
     OPCODE_NULL_EXTEND, OPCODE_EXCHANGE_SHARD, OPCODE_INTEGRATE_TRACE,
     OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_OUTER,
     OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_SEMI_JOIN_DELTA_TRACE, OPCODE_DELAY,
+    OPCODE_SCAN_DELTA, OPCODE_REDUCE,
 };
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
@@ -513,23 +514,115 @@ fn test_band_left_join_accepts() {
     assert!(client.resolve_table_or_view_id(&sn, "bl_v").is_ok(), "band LEFT-join view should register");
 }
 
-/// A pure-range LEFT JOIN (no equality conjunct) is rejected: the null-fill would
-/// need a per-a.pk existence gather in series with the pair-PK output exchange —
-/// two sequential exchanges, which the single-boundary executor cannot run. Band
-/// LEFT (an equality conjunct present) is the supported form.
+/// A pure-range LEFT JOIN (no equality conjunct) now registers: existence of a
+/// match collapses to a threshold test against a single scalar — `MAX`/`MIN` of
+/// the right range column — so the null-fill is `null_extend(A ⋈ {m})`, a range
+/// join whose trace side is one row. That rides the single pair-PK output
+/// exchange like the inner pairs (no second sequential exchange). The scalar `m`
+/// is computed in an internal one-row aggregate view, seeded by a one-row
+/// sentinel so it is never empty. See plans/range-join-left-outer-pure-range.md.
 #[test]
-fn test_pure_range_left_join_rejected() {
+fn test_pure_range_left_join_accepts() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE rl_a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)").unwrap();
     p.execute("CREATE TABLE rl_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)").unwrap();
-    let err = must_err(p.execute("CREATE VIEW rl_v AS SELECT * FROM rl_a LEFT JOIN rl_b ON rl_a.x < rl_b.y"));
+    assert!(p.execute(
+        "CREATE VIEW rl_v AS SELECT rl_a.id AS aid, rl_b.id AS bid \
+         FROM rl_a LEFT JOIN rl_b ON rl_a.x < rl_b.y").is_ok(),
+        "pure-range LEFT JOIN should now register");
+    assert!(client.resolve_table_or_view_id(&sn, "rl_v").is_ok(),
+        "pure-range LEFT-join view should register");
+}
+
+/// A pure-range LEFT JOIN whose promoted compare type is 16-byte (here `U64` vs
+/// `I64` → `I128`) is rejected, not accepted: the threshold null-fill aggregates the
+/// range column with a `MIN`/`MAX` reduce, which — like the binder's MIN/MAX — handles
+/// only ≤8-byte integer keys. Pins that the planner returns a clean `Unsupported`
+/// (building no `__m`/sentinel objects) rather than a reduce over a width it cannot
+/// aggregate.
+#[test]
+fn test_pure_range_left_join_rejects_wide_compare_type() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE rlw_a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT UNSIGNED NOT NULL)").unwrap();
+    p.execute("CREATE TABLE rlw_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)").unwrap();
+    let err = must_err(p.execute(
+        "CREATE VIEW rlw_v AS SELECT rlw_a.id AS aid, rlw_b.id AS bid \
+         FROM rlw_a LEFT JOIN rlw_b ON rlw_a.x < rlw_b.y"));
     match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("pure-range LEFT JOIN"), "got: {s}"),
+        GnitzSqlError::Unsupported(s) => assert!(s.contains("compare type"), "got: {s}"),
         e => panic!("expected Unsupported, got {:?}", e),
     }
-    assert!(client.resolve_table_or_view_id(&sn, "rl_v").is_err(), "no view should be registered");
+    assert!(client.resolve_table_or_view_id(&sn, "rlw_v").is_err(), "no view should be registered");
+}
+
+/// The pure-range LEFT null-fill, pinned at the circuit level. Built over the
+/// SAME tables as an INNER pure-range view, the LEFT view adds the THRESHOLD
+/// form — NOT the band set-difference. Concretely it adds **+2** range
+/// `DeltaTraceRange` terms (the inner has 2; the LEFT has 4 — the matched
+/// null-fill `ΔA_keep ⋈ trace_m` and `Δm ⋈ trace_a`), exactly one `null_extend`,
+/// and a third `ScanDelta` source + a third `IntegrateTrace` (the `__m` delta and
+/// its one-row `trace_m`). Crucially it adds **zero** `distinct` and **zero**
+/// `negate` (no negate-driven set-difference) and keeps exactly **one**
+/// `ExchangeShard` (the pair-PK output) — `trace_m` carries no `PartitionFilter`.
+/// The auxiliary `__m` view is registered separately and is a scalar `REDUCE`.
+#[test]
+fn test_pure_range_left_join_circuit_shape() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE pls_a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE TABLE pls_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)").unwrap();
+        // INNER and LEFT pure-range views over identical tables and ON clause.
+        p.execute("CREATE VIEW pls_inner AS SELECT pls_a.id AS aid, pls_b.id AS bid \
+                   FROM pls_a JOIN pls_b ON pls_a.x < pls_b.y").unwrap();
+        p.execute("CREATE VIEW pls_left AS SELECT pls_a.id AS aid, pls_b.id AS bid \
+                   FROM pls_a LEFT JOIN pls_b ON pls_a.x < pls_b.y").unwrap();
+    }
+    let inner = client.resolve_table_or_view_id(&sn, "pls_inner").unwrap().0;
+    let left  = client.resolve_table_or_view_id(&sn, "pls_left").unwrap().0;
+
+    let nodes = scan_circuit_nodes(&mut client);
+    let nodes = nodes.as_ref();
+    let n_inner = |op: u64| opcode_node_count(nodes, inner, op);
+    let n_left  = |op: u64| opcode_node_count(nodes, left, op);
+
+    // Threshold form: +2 range terms (4 total), +1 null_extend, +1 ScanDelta
+    // source (__m), +1 IntegrateTrace (trace_m). NO distinct, NO negate.
+    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_RANGE), 4, "inner 2 + null-fill 2 range terms");
+    assert_eq!(n_inner(OPCODE_JOIN_DELTA_TRACE_RANGE), 2, "INNER pure-range has 2 range terms");
+    assert_eq!(n_left(OPCODE_NULL_EXTEND) - n_inner(OPCODE_NULL_EXTEND), 1, "one null_extend");
+    assert_eq!(n_left(OPCODE_SCAN_DELTA) - n_inner(OPCODE_SCAN_DELTA), 1, "third source: the __m delta");
+    assert_eq!(n_left(OPCODE_INTEGRATE_TRACE) - n_inner(OPCODE_INTEGRATE_TRACE), 1, "trace_m");
+
+    // The threshold null-fill is NOT the band set-difference.
+    assert_eq!(n_left(OPCODE_DISTINCT), 0, "threshold form has no distinct");
+    assert_eq!(n_left(OPCODE_NEGATE), 0, "threshold form has no negate");
+    assert_eq!(n_inner(OPCODE_DISTINCT), 0, "INNER pure-range has no distinct");
+
+    // Single output exchange; trace_m is replicated (no PartitionFilter), and the
+    // inner's two PartitionFilters (one per side) are unchanged.
+    assert_eq!(n_left(OPCODE_EXCHANGE_SHARD), 1, "exactly one pair-PK output exchange");
+    assert_eq!(n_inner(OPCODE_EXCHANGE_SHARD), 1, "INNER pure-range has one output exchange");
+    assert_eq!(n_left(OPCODE_PARTITION_FILTER), 2, "two side PartitionFilters; trace_m has none");
+
+    // No outer/anti/semi/equi join machinery, no Delay.
+    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_OUTER), 0, "no outer-join operator");
+    assert_eq!(n_left(OPCODE_ANTI_JOIN_DELTA_TRACE), 0, "no anti-join");
+    assert_eq!(n_left(OPCODE_SEMI_JOIN_DELTA_TRACE), 0, "no semi-join");
+    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
+    assert_eq!(n_left(OPCODE_DELAY), 0, "no Delay node");
+
+    // The auxiliary `__m` aggregate view is registered separately and is a scalar
+    // REDUCE (it must not be counted as part of `pls_left`'s opcodes).
+    let m_view = client.resolve_table_or_view_id(&sn, "__pls_left__m")
+        .expect("the internal __m aggregate view should be registered").0;
+    assert_eq!(opcode_node_count(nodes, m_view, OPCODE_REDUCE), 1, "__m is a scalar MIN/MAX reduce");
+    assert_eq!(n_left(OPCODE_REDUCE), 0, "v_left itself carries no reduce");
 }
 
 /// Two range conjuncts are rejected (the one-range-conjunct rule).

@@ -6,7 +6,7 @@ use sqlparser::ast::{
     SetOperator, SetQuantifier, BinaryOperator,
     FunctionArguments, FunctionArg, FunctionArgExpr,
 };
-use gnitz_core::{ColumnDef, Schema, TypeCode};
+use gnitz_core::{ColumnDef, FixedInt, Schema, TypeCode};
 use gnitz_core::{
     GnitzClient, IndexMeta, CircuitBuilder, ExprBuilder, RangeRel,
     AGG_COUNT, AGG_COUNT_NON_NULL, AGG_SUM, AGG_MIN, AGG_MAX,
@@ -518,6 +518,21 @@ fn execute_drop(
             }
             ObjectType::View => {
                 client.drop_view(schema_name, &name).map_err(GnitzSqlError::Exec)?;
+                // Cascade-drop the internal pure-range-LEFT helpers, if this was
+                // such a view: `__<v>__m` (the one-row aggregate view) then
+                // `__<v>__sent` (its sentinel table). Ordered so each is dropped
+                // only AFTER its sole dependent — the engine rejects dropping a
+                // table/view that still has a live dependent (so a user could not
+                // otherwise drop `b` while `__m` reads it). Absent for ordinary
+                // views, so probe-then-drop and skip a missing helper.
+                let m_name = format!("__{name}__m");
+                if client.resolve_table_or_view_id(schema_name, &m_name).is_ok() {
+                    client.drop_view(schema_name, &m_name).map_err(GnitzSqlError::Exec)?;
+                }
+                let sent_name = format!("__{name}__sent");
+                if client.resolve_table_or_view_id(schema_name, &sent_name).is_ok() {
+                    client.drop_table(schema_name, &sent_name).map_err(GnitzSqlError::Exec)?;
+                }
             }
             ObjectType::Index => {
                 client.drop_index_by_name(&name).map_err(GnitzSqlError::Exec)?;
@@ -1330,11 +1345,18 @@ fn execute_create_join_view(
 /// PK-partitioned like every other view.
 ///
 /// `is_left_join` selects INNER vs LEFT OUTER. INNER emits only the matched pairs.
-/// LEFT (band only, `n_eq ≥ 1`) additionally emits one `(a, NULL)` row per left row
-/// with no range match, computed as the Z-set difference `A − distinct(π_A(inner))`
-/// (the matched left rows are read straight off the inner output) — partition-local,
-/// riding the same pair-PK output exchange (see `plans/range-join-left-outer.md`).
-/// Pure-range LEFT (`n_eq == 0`) is rejected.
+/// LEFT additionally emits one `(a, NULL)` row per left row with no range match,
+/// computed two ways by `n_eq`:
+///   - **Band (`n_eq ≥ 1`):** the Z-set difference `A − distinct(π_A(inner))` (the
+///     matched left rows are read straight off the inner output) — partition-local
+///     on the eq-scatter (see `plans/range-join-left-outer.md`).
+///   - **Pure range (`n_eq == 0`):** match existence collapses to a threshold test
+///     `a.x OP MAX/MIN(b.range_col)`, so the null-fill is `null_extend(A ⋈ {m})`
+///     against an internal one-row aggregate view `__m` (a third broadcast delta
+///     source) — no `distinct`/`negate` (see
+///     `plans/range-join-left-outer-pure-range.md`).
+///
+/// Both ride the single pair-PK output exchange.
 #[allow(clippy::too_many_arguments)]
 fn build_range_join_view(
     client:          &mut GnitzClient,
@@ -1361,18 +1383,10 @@ fn build_range_join_view(
     let pb = right_schema.pk_cols.len();
     let pair_pk = pa + pb;                  // output PK arity
 
-    // Pure-range LEFT (no equality conjunct) needs a global per-a.pk existence
-    // gather in series with the pair-PK output exchange — two sequential exchanges,
-    // which the single-boundary executor cannot run (compiler.rs splits a circuit at
-    // its ExchangeShard nodes and accepts 0/1/2, the 2 case being two *parallel*
-    // set-op sides). Band LEFT (n_eq ≥ 1) co-locates each left row with all its
-    // candidate matches on the eq-prefix worker, so the null-fill is partition-local.
+    // Pure-range LEFT (no equality conjunct) is supported via the threshold
+    // null-fill: match existence collapses to `a.x OP MAX/MIN(b.range_col)`,
+    // computed by the internal one-row `__m` aggregate view built just below.
     // See plans/range-join-left-outer-pure-range.md.
-    if is_left_join && n_eq == 0 {
-        return Err(GnitzSqlError::Unsupported(
-            "pure-range LEFT JOIN (no equality conjunct) is not supported; add an \
-             equality conjunct (band join) or use INNER JOIN".into()));
-    }
 
     // The reindex-slot arity cap (k ≤ PK_LIST_MAX_COLS) was enforced in
     // extract_join_predicates. Here we additionally cap the output pair-PK.
@@ -1415,6 +1429,29 @@ fn build_range_join_view(
     // BA ({x : x OP y}) wants trace x `OP` delta y.
     let rel_ab = converse_rel(range.op);
     let rel_ba = range.op;
+
+    // Pure-range LEFT: build the internal one-row aggregate `__m = MAX/MIN(b.range_col)`
+    // (and its non-empty-guaranteeing sentinel) BEFORE the view circuit, so `v_left`
+    // can depend on it as a third broadcast delta source. `None` for INNER and band.
+    let m_view_id: Option<u64> = if is_left_join && n_eq == 0 {
+        // The threshold null-fill aggregates `b.range_col` with a MIN/MAX reduce, which
+        // — exactly like the binder's MIN/MAX guard — handles only ≤8-byte integer keys.
+        // But the promoted compare type `Tc` can be a 16-byte I128/U128 (`U64` vs `I64`
+        // → I128; a U128/UUID pair → U128). Reject that here, before any `__m`/sentinel
+        // objects are created, rather than feeding the reduce a width it cannot aggregate.
+        let range_tc = TypeCode::from_validated_u8(range.tc);
+        if FixedInt::from_type_code(range_tc).is_none() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "pure-range LEFT JOIN on a {range_tc:?} compare type is not supported; its \
+                 threshold null-fill needs a MIN/MAX over the range column, which handles \
+                 only ≤8-byte integer keys — use INNER JOIN, or add an equality conjunct \
+                 (band join)")));
+        }
+        Some(build_pure_range_left_aggregate(
+            client, schema_name, view_name, right_tid, right_schema, &range)?)
+    } else {
+        None
+    };
 
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, 0);
@@ -1528,45 +1565,119 @@ fn build_range_join_view(
 
     let projected = cb.map(rekey, &final_projection);
 
-    // ---- LEFT null-fill (band only; partition-local — see plan §3) ----
-    // nullfill = null_extend(A − distinct(π_A(inner))). The matched left rows (with
-    // full A payload) are read straight off the inner output, so this is a pure Z-set
-    // difference; the only non-linear node is the `distinct`, which absorbs the
-    // within-epoch ΔA/Δmatched simultaneity. Every node is co-located on the eq-prefix
-    // worker (a.pk is unique → its rows never span workers), so no a.pk exchange — the
-    // null-fills ride the existing pair-PK output exchange with the inner pairs.
+    // ---- LEFT null-fill ----
+    // Both forms produce `nf_keyed`, the null-fill source keyed by the preserved-row
+    // identity `[a.pk…, A]` (the IDENTICAL encoding `a_all` uses), so the shared tail
+    // below can `null_extend` → re-key onto the pair-PK → project, riding the existing
+    // pair-PK output exchange with the inner pairs (no extra exchange).
     let sink_input = if !is_left_join {
         projected
     } else {
         let zero_a = vec![0u8; pa];
 
-        // D = distinct(π_A(inner)) in a.pk space. A reindex Map's OUTPUT schema is
-        // always [new-PK, <every input column>] (`reindex_output_schema`), regardless
-        // of what the copy program writes — so a "copy A only" program would still
-        // declare B and the _join_pk slots in the layout. The only clean [a.pk, A] is
-        // re-key (copy the whole union payload, mirroring the inner rekey) THEN project
-        // the A region. A's PK cols are the leading `pa` slots of `pair_pk_cols` (`k +
-        // a_pk` in `merged`) — reuse that slice so D keys on the identical columns as
-        // the inner pair-PK re-key.
-        let rekey_a = cb.map_reindex(
-            merged, &pair_pk_cols[..pa], &zero_a, build_reindex_program(&union_schema));
-        // rekey_a payload = [_join_pk × k, A, B]; A starts at absolute col `pa + k`.
-        let a_cols: Vec<usize> = (pa + k..pa + k + left_n).collect();
-        let proj_a = cb.map(rekey_a, &a_cols);          // [a.pk, A]
-        let matched = cb.distinct(proj_a);              // partition-local distinct (§3)
+        let nf_keyed = if n_eq == 0 {
+            // ── Pure-range threshold form (plan §1–§3) ──────────────────────────
+            // The unmatched left rows are exactly `A` on the null-fill side of the
+            // scalar threshold `m`: `nf = (ΔA_keep ⋈ trace_m) ∪ (Δm ⋈ trace_a)` on
+            // the complement op `OP'`, plus the NULL-key rows (never matched). NO
+            // `distinct`/`negate`: a matched a is below the threshold so `A ⋈ {m}`
+            // emits nothing for it, and the one-row `{m}` cannot multiply weights —
+            // so this is weight-exact even for a bag-valued left input (plan §2).
+            let range_tc = TypeCode::from_validated_u8(range.tc);
+            let m_schema = Schema { columns: pure_range_m_output_cols(range_tc), pk_cols: vec![0] };
 
-        // A = every left row (incl. NULL-key rows the inner match filtered out),
-        // re-keyed to a.pk with the IDENTICAL [a.pk, A] encoding as proj_a so a matched
-        // row's +1 (A) and −1 (D) are byte-identical and cancel (§4, §8).
-        let a_all = cb.map_reindex(
-            input_a_raw, &left_schema.pk_cols, &zero_a, build_reindex_program(left_schema));
+            // The third (broadcast) delta source `__m`, reindexed onto the promoted
+            // compare type `Tc` so it co-orders with `reindex_a`'s a.x — restoring the
+            // true signedness the I64-labelled reduce output hid (plan §5). Its one row
+            // is replicated on EVERY worker by the n_eq==0 broadcast relay, so
+            // `reindex_m` carries NO `partition_filter` (unlike `int_a`/`int_b`);
+            // `trace_m` is the one-row trace the matched null-fill (`ΔA_keep ⋈ trace_m`)
+            // probes.
+            let mid       = m_view_id.expect("pure-range LEFT built __m above");
+            let input_m   = cb.input_delta_tagged(mid);
+            let carried_m = m_schema.columns[1].type_code.carried_reindex_tc(range_tc);
+            let reindex_m = cb.map_reindex(input_m, &[1], &[carried_m], build_reindex_program(&m_schema));
+            let trace_m   = cb.integrate_trace(reindex_m);
 
-        // A − D, then attach the NULL B columns: [a.pk, A, NULL B].
+            let nf_op = complement_rel(range.op);
+            // Mirror the inner converse split (`rel_ab = converse(op)`, `rel_ba = op`):
+            // the (delta a.x, trace m) term carries `converse(OP')`; the (delta m,
+            // trace a.x) term carries `OP'`. All four range nodes carry n_eq == 0 —
+            // load-bearing for the view-level `circuit_range_join_n_eq` discriminator,
+            // which reads an ARBITRARY `DeltaTraceRange.n_eq` (HashMap order) and is
+            // correct only because they all agree.
+            let j_am = cb.join_with_trace_range_node(int_a, trace_m, 0, converse_rel(nf_op));
+            let j_ma = cb.join_with_trace_range_node(reindex_m, trace_a, 0, nf_op);
+            // Range-join output = [_join_pk × k, delta payload, trace payload]; project
+            // each to the A columns. `j_am`: A is the delta payload at `k..k+left_n`.
+            // `j_ma`: A is the trace payload, after Δm's payload (`__m`'s 2 columns).
+            let m_payload = m_schema.columns.len();   // __m's output arity ([_group_pk, m])
+            let nf_am = cb.map(j_am, &(k..k + left_n).collect::<Vec<_>>());
+            let nf_ma = cb.map(j_ma, &(k + m_payload..k + m_payload + left_n).collect::<Vec<_>>());
+            let nf_match_raw = cb.union(nf_am, nf_ma);             // [_join_pk(PK), A]
+
+            // A `map` keeps each range term's `_join_pk` as the PK, so `nf_match_raw`
+            // is `[_join_pk, A]` — a.pk lives INSIDE A, not in the PK. Re-key onto
+            // `[a.pk…, A]` (band's `a_all` shape) so the shared tail matches: reindex
+            // by a.pk's position within A (`1 + pk` past the leading `_join_pk`), then
+            // project the A region back out, dropping the now-stale `_join_pk`.
+            let jp = ColumnDef { name: "_jp".into(), type_code: range_tc,
+                is_nullable: false, fk_table_id: 0, fk_col_idx: 0 };
+            let nf_raw_schema = Schema {
+                columns: std::iter::once(jp).chain(left_schema.columns.iter().cloned()).collect(),
+                pk_cols: vec![0],
+            };
+            let a_pk_in_raw: Vec<usize> = left_schema.pk_cols.iter().map(|&p| 1 + p).collect();
+            let nf_match_keyed = cb.map_reindex(
+                nf_match_raw, &a_pk_in_raw, &zero_a, build_reindex_program(&nf_raw_schema));
+            let nf_match = cb.map(nf_match_keyed, &(pa + 1..pa + 1 + left_n).collect::<Vec<_>>());
+
+            // NULL-range-key rows are filtered out of `reindex_a`/`trace_a` (3VL) and
+            // never match the threshold, so they need their own branch off the
+            // UNFILTERED broadcast `input_a_raw`, re-keyed to a.pk (already the clean
+            // `[a.pk…, A]` shape) and routed ONCE by a local `partition_filter` (no
+            // exchange) — else broadcast yields W× copies the pair-PK shard would sum.
+            if left_key_nullable {
+                let anull = cb.filter(input_a_raw,
+                    Some(multi_null_filter_prog(&left_reindex_cols, left_schema, true)?));
+                let anull_keyed = cb.map_reindex(
+                    anull, &left_schema.pk_cols, &zero_a, build_reindex_program(left_schema));
+                let anull_owned = cb.partition_filter(anull_keyed);
+                cb.union(nf_match, anull_owned)
+            } else {
+                nf_match
+            }
+        } else {
+            // ── Band set-difference form (plan §3) ──────────────────────────────
+            // nf = A − distinct(π_A(inner)). The matched left rows (with full A
+            // payload) are read straight off the inner output, so this is a pure
+            // Z-set difference; the only non-linear node is the `distinct`, which
+            // absorbs the within-epoch ΔA/Δmatched simultaneity. Every node is
+            // co-located on the eq-prefix worker (a.pk unique → never spans workers).
+            //
+            // A reindex Map's OUTPUT schema is always [new-PK, <every input column>]
+            // (`reindex_output_schema`), so the only clean [a.pk, A] is re-key (copy
+            // the whole union payload, mirroring the inner rekey) THEN project the A
+            // region. A's PK cols are the leading `pa` slots of `pair_pk_cols`.
+            let rekey_a = cb.map_reindex(
+                merged, &pair_pk_cols[..pa], &zero_a, build_reindex_program(&union_schema));
+            let a_cols: Vec<usize> = (pa + k..pa + k + left_n).collect();
+            let proj_a = cb.map(rekey_a, &a_cols);          // [a.pk, A]
+            let matched = cb.distinct(proj_a);              // partition-local distinct (§3)
+
+            // A = every left row (incl. NULL-key rows the inner match filtered out),
+            // re-keyed to a.pk with the IDENTICAL [a.pk, A] encoding as proj_a so a
+            // matched row's +1 (A) and −1 (D) are byte-identical and cancel (§4, §8).
+            let a_all = cb.map_reindex(
+                input_a_raw, &left_schema.pk_cols, &zero_a, build_reindex_program(left_schema));
+            let neg = cb.negate(matched);
+            cb.union(a_all, neg)                            // A − D, keyed [a.pk, A]
+        };
+
+        // Shared tail: attach the NULL B columns, then re-key onto the pair-PK.
         let right_col_tcs: Vec<u64> =
             right_schema.columns.iter().map(|c| c.type_code as u64).collect();
-        let neg = cb.negate(matched);
-        let diff = cb.union(a_all, neg);
-        let nullfill = cb.null_extend(diff, &right_col_tcs);
+        let nullfill = cb.null_extend(nf_keyed, &right_col_tcs);   // [a.pk×pa, A, NULL B]
 
         // Re-key nullfill ([a.pk×pa (PK), A, B]) onto the pair-PK. a.pk from the PK
         // region (0..pa); b.pk from the NULL B payload (pa + left_n + b_pk) → packs to
@@ -1833,6 +1944,123 @@ fn converse_rel(r: RangeRel) -> RangeRel {
         RangeRel::Gt => RangeRel::Lt,
         RangeRel::Ge => RangeRel::Le,
     }
+}
+
+/// The logical complement of a `RangeRel`: `NOT (x OP y)`. Used for the pure-range
+/// LEFT null-fill, whose predicate is the complement of the inner match
+/// (`matched ⟺ a.x OP m`, `null-filled ⟺ a.x complement(OP) m`; §1 table).
+fn complement_rel(r: RangeRel) -> RangeRel {
+    match r {
+        RangeRel::Lt => RangeRel::Ge,
+        RangeRel::Le => RangeRel::Gt,
+        RangeRel::Gt => RangeRel::Le,
+        RangeRel::Ge => RangeRel::Lt,
+    }
+}
+
+/// Output columns of the internal pure-range-LEFT `__m` aggregate view: a scalar
+/// (no-GROUP-BY) reduce emits a synthetic `_group_pk` (U128) plus the single
+/// aggregate column. The reduce labels a non-float MIN/MAX `I64`
+/// (`compiler::agg_output_type`), but `__m` ends with a compute map that
+/// RE-LABELS the value column to the promoted compare type `Tc` (a byte
+/// reinterpret — the bits are already the `Tc` extreme). Declaring `m` as `Tc`
+/// lets `v_left`'s `reindex_m` self-derive the `Tc` OPK order; reindexing the raw
+/// `I64`-labelled column to `Tc` is instead rejected by the compiler as an
+/// invalid cross-sign promotion (`join_key_common_type(I64, U64) = I128 ≠ U64`).
+fn pure_range_m_output_cols(tc: TypeCode) -> Vec<ColumnDef> {
+    vec![
+        ColumnDef { name: "_group_pk".into(), type_code: TypeCode::U128,
+                    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef { name: "m".into(),         type_code: tc,
+                    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+    ]
+}
+
+/// The native bit pattern (low-width bytes of a `u128`) of an integer type's
+/// extreme, to seed the pure-range-LEFT sentinel via `BatchAppender::add_row`.
+/// `want_max` selects the maximum (else the minimum); the table's OPK packer then
+/// turns these bits into the order-preserving extreme key on push.
+///
+/// `Tc` is always a ≤8-byte integer here: `build_range_join_view` rejects a 16-byte
+/// (I128/U128) compare type before reaching this, since the MIN/MAX reduce backing
+/// `__m` cannot aggregate one. So `FixedInt` — the source of truth for native PK
+/// packing — covers every reachable case, and the sentinel's extreme packs into the
+/// identical native LE form as every real PK/range value.
+fn tc_extreme_pk(tc: TypeCode, want_max: bool) -> u128 {
+    let Some(fi) = FixedInt::from_type_code(tc) else {
+        unreachable!("pure-range Tc is a ≤8-byte integer (16-byte rejected upstream), got {tc:?}");
+    };
+    let (min, max) = fi.range();
+    fi.pack(if want_max { max } else { min })
+}
+
+/// Build the internal pure-range-LEFT aggregate `__<view>__m = MAX/MIN(b.range_col)`
+/// and its one-row sentinel table, returning the `__m` view id.
+///
+/// The threshold is `MAX` for `< <=` (matched ⟺ `a.x < MAX(b.y)`) and `MIN` for
+/// `> >=`. The aggregate is computed in the promoted compare type `Tc`: each arm
+/// reindexes its range value onto a `Tc` synthetic PK, projects key-only so the
+/// two arms share a schema, unions, and the scalar reduce aggregates that single
+/// column. The sentinel is the `Tc` extreme (`Tc_min` for a MAX threshold, so it
+/// never displaces a real `b`; `Tc_max` for MIN), which keeps `__m` non-empty so
+/// an empty or all-NULL-range `b` reads as that extreme and EVERY left row
+/// null-fills (plan §5). Seeding the sentinel in `Tc` (not `b.range_col`'s type)
+/// is load-bearing: a left key whose domain extends below `b.range_col`'s would
+/// otherwise be wrongly excluded on empty `b`.
+fn build_pure_range_left_aggregate(
+    client:       &mut GnitzClient,
+    schema_name:  &str,
+    view_name:    &str,
+    right_tid:    u64,
+    right_schema: &Schema,
+    range:        &RangeConjunct,
+) -> Result<u64, GnitzSqlError> {
+    use gnitz_core::{ZSetBatch, BatchAppender};
+    let tc = TypeCode::from_validated_u8(range.tc);
+    let want_max = matches!(range.op, RangeRel::Lt | RangeRel::Le);
+    let agg_func = if want_max { AGG_MAX } else { AGG_MIN };
+
+    // One-row sentinel TABLE `__<view>__sent`: a single Tc-typed PK column seeded
+    // with the Tc extreme (Tc_min for a MAX threshold, Tc_max for MIN).
+    let sent_name = format!("__{view_name}__sent");
+    let sent_cols = vec![ColumnDef {
+        name: "v".into(), type_code: tc, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+    }];
+    let sent_tid = client.create_table(schema_name, &sent_name, &sent_cols, &[0u32], true)
+        .map_err(GnitzSqlError::Exec)?;
+    let sent_schema = Schema { columns: sent_cols, pk_cols: vec![0] };
+    let mut batch = ZSetBatch::new(&sent_schema);
+    BatchAppender::new(&mut batch, &sent_schema).add_row(tc_extreme_pk(tc, !want_max), 1);
+    client.push(sent_tid, &sent_schema, &batch).map_err(GnitzSqlError::Exec)?;
+
+    // The one-row scalar aggregate VIEW `__<view>__m`. Built directly as a
+    // no-GROUP-BY reduce — the SQL surface cannot express a bare scalar aggregate.
+    let m_view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
+    let mut cb = CircuitBuilder::new(m_view_id, 0);
+    let in_b    = cb.input_delta_tagged(right_tid);
+    let in_sent = cb.input_delta_tagged(sent_tid);
+    let carried_b = right_schema.columns[range.right_col].type_code.carried_reindex_tc(tc);
+    // b's range value promoted to Tc lands in the reindex PK; `map_hash_row` then
+    // moves that Tc PK into a payload column (decoding OPK → native), so the reduce
+    // aggregates a NATIVE-valued payload (col 1) — not the OPK PK bytes. The sentinel
+    // (a single Tc-PK column) takes the same shape, so the two arms union cleanly.
+    let mb  = cb.map_reindex(in_b, &[range.right_col], &[carried_b], build_reindex_program(right_schema));
+    let mbh = cb.map_hash_row(mb, &[0], 0);
+    let sh  = cb.map_hash_row(in_sent, &[0], 0);
+    let u   = cb.union(mbh, sh);
+    let red = cb.reduce_multi(u, &[], &[(agg_func, 1)]);
+    // RE-LABEL the I64-typed reduce output (the aggregate-output contract) to Tc:
+    // a byte reinterpret (the stored bits ARE the Tc extreme), so the declared
+    // output column is Tc and v_left's reindex_m self-derives the Tc OPK order.
+    let mut relabel = ExprBuilder::new();
+    relabel.copy_col(TypeCode::I64 as u32, 1, 0);   // reduce agg (col 1) → payload m (declared Tc)
+    let m_out = cb.map_expr(red, relabel.build(0));
+    cb.sink(m_out);
+    let circuit = cb.build();
+    let m_name = format!("__{view_name}__m");
+    client.create_view_with_circuit(schema_name, &m_name, "", circuit,
+        &pure_range_m_output_cols(tc), &[0]).map_err(GnitzSqlError::Exec)?;
+    Ok(m_view_id)
 }
 
 /// The single range conjunct of a band/range join, canonicalized to
