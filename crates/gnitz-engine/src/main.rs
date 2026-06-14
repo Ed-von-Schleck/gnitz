@@ -20,6 +20,9 @@ mod runtime;
 #[cfg(test)]
 mod test_rng;
 
+#[cfg(test)]
+mod bench_cursor;
+
 use std::env;
 use std::process;
 
