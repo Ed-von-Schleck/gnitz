@@ -40,35 +40,32 @@ numerically, and NaN has no single canonical bit pattern. The PK columns
 are packed in PK-list order and stored order-preserving big-endian (OPK, §6);
 the concatenation is the key.
 
-**PK ordering is type-aware.** A primary key orders by typed value: a single
-unsigned column orders by magnitude; a single signed column orders in signed
-order (a negative integer's native bytes `0xFFFF…` would otherwise sort after a
-positive one, inverting it); a compound key orders lexicographically by column
-in PK-list order. This order is baked into the stored bytes by the
-order-preserving (OPK) encoding (§6) — each column byte-reversed to big-endian,
-signed columns' leading sign bit flipped — so an unsigned byte comparison
-(`memcmp`) over the encoded PK region *is* the typed order, for unsigned,
-signed, and compound keys at any width. Every ordered operation — merge, sort,
-consolidation, range scan — is that single byte comparison; none needs a
-type-aware comparator over native bytes.
+**PK order is typed; comparison is not.** A primary key's order is the typed
+lexicographic order — unsigned columns by magnitude, signed columns in signed
+order, compound keys column-by-column in PK-list order. That order is carried by
+the bytes themselves: a PK is stored as an order-preserving key (OPK, §6) whose
+plain unsigned byte comparison *is* the typed order, at any width. So a PK is an
+**opaque, ordered byte string wherever it flows** — every ordered operation
+(merge, sort, consolidation, range scan) is one byte comparison
+(`compare_pk_bytes`), and the encode/decode boundary is the only type-aware
+code. The encoding is also a bijection (§6), so equal keys are byte-equal and
+consolidation and dedup group on the raw bytes.
 
-**Hash invariant.** Partition routing and XOR8 filter probes hash the OPK PK
-region read big-endian into a `u128` (left-zero-padded). The same logical value
-hashes identically regardless of its stored stride — a narrow key at 4/8 bytes
-and the same value in a 16-byte slot produce the same `u128`, the unused high
-bytes being zero — so a value hashes the same however it crossed the wire
-boundary, and equal join keys co-partition.
+**Hash invariant.** Partition routing and XOR8 filter probes hash a PK by its
+OPK bytes, making the hash a **pure function of the logical key**: every
+producer and consumer agrees, equal keys co-partition and co-probe, and physical
+width or padding at the wire boundary never changes where a key lands.
 
 **Physical representation.** The in-engine batch is region-based (§6): a flat
 buffer of contiguous columnar regions — PK (OPK bytes, `pk_stride`/row),
 weight, null word, then payload columns — not separate per-row fields. Multiple
 rows may share the same PK if their payloads differ.
 
-**PK uniqueness is not a general invariant.** The 128-bit PK slot is a
+**PK uniqueness is not a general invariant.** The PK region is a
 sort/routing key. It is unique for base table batches (DML-enforced — every
 SQL-created table is registered `unique_pk`) and reduce output
 (one row per group). It is NOT unique for
-intermediate batches: `map_reindex` overwrites the PK slot with a
+intermediate batches: `map_reindex` overwrites the PK region with a
 join/group column value, and join output inherits the left input's PK.
 Multiple output rows may share the same PK with different payloads.
 All operators use full (PK, payload) identity — none assume PK
@@ -91,9 +88,9 @@ drops elements with net weight zero ("ghost elimination").
 
 **GnitzDB's consolidation uses a total order** (implementation choice —
 hash grouping is theoretically valid, but sort-merge enables N-way
-merging, range scans, and compaction). Sort key: PK first (u128: high
-64 bits, then low 64 bits), then payload columns in schema order
-(`compare_rows`).
+merging, range scans, and compaction). Sort key: PK first by unsigned
+byte comparison over the OPK region (`compare_pk_bytes`; §1, §6), then
+payload columns in schema order (`compare_rows`).
 
 > **Invariant: all merge/consolidation paths must sort by (PK, payload),
 > not just PK.** PK-only ordering interleaves rows with matching PKs but
@@ -185,21 +182,20 @@ Only non-linear and bilinear operators need the integral. The output of
   `(k, NULL)` tuples, then runs a standard inner join.
 
 *Set-difference form (the general null-fill).* A LEFT outer join is equivalently
-`inner ∪ null_extend(A − distinct(π_A(inner)))`, where `π_A(inner)` carries the
-**preserved side's full payload**. The null-fill is then a Z-set **difference**
-(`A − D`, realized as `union(A, negate(D))` — linear), not an anti-join requiring
-payload recovery: the matched preserved rows are read straight off the inner
-output, deduplicated to one row per preserved identity by `distinct`. The matched
-set `D` is keyed by the **preserved row's identity** (its source PK), so it works
-even when one preserved row matches a whole interval of the other side (range /
-band joins). The equi join may instead key the matched set by the join key as the
-right-only `distinct(B_keys)` optimization — valid only because equi-match
-existence is a function of `B` alone — but the identity-keyed difference is the
-general form. Because the lone non-linear operator (`distinct`) natively absorbs
-the within-epoch `ΔA` / `Δmatched` simultaneity (DBSP Prop 4.7: it emits `+a`/`−a`
-exactly on the per-identity 0-boundary crossing), **no delta-delta cross term is
-needed** despite the matched set depending on the preserved side. GnitzDB's band
-LEFT join (`build_range_join_view`) uses this form.
+`inner ∪ null_extend(A − distinct(π_A(inner)))`, where `π_A(inner)` projects the
+**preserved side's full payload**. The null-fill is thus a Z-set **difference**
+`A − D` — linear (adding `A` and `−D`), not an anti-join that must recover
+payload: the matched preserved rows are read straight off the inner output and
+deduplicated to one row per preserved identity by `distinct`. Keying `D` by the
+**preserved row's identity** (its source PK) is what makes this the general form —
+it holds even when one preserved row matches a whole interval of the other side
+(range / band joins). An equi join may instead key `D` by the join key (the
+`distinct(B_keys)` form), valid only because equi-match existence is a function of
+`B` alone. **No delta-delta cross term is needed** despite `D` depending on the
+preserved side: the lone non-linear operator, `distinct`, natively absorbs the
+within-epoch `ΔA` / `Δmatched` simultaneity (DBSP Prop 4.7 — it emits `+a` / `−a`
+exactly on the per-identity 0-boundary crossing). GnitzDB's band/range LEFT join
+uses this form.
 
 **Non-linear operators** — require access to the accumulated integral:
 
@@ -302,28 +298,25 @@ inputs, including NaN.
 ## 6. The Region Convention
 
 Column buffers are stored as flat (pointer, size) pairs in canonical order.
-This layout applies to WAL blocks and shard files. `pk_stride` is the sum
-of each PK column's `wire_stride()`, tightly packed: 1/2/4/8 bytes for a
-single narrow scalar PK, 16 bytes for U128, or the compound sum for
-multi-column PKs.
+This layout applies to WAL blocks and shard files. `pk_stride` is the encoded
+key width — the sum of the PK columns' encoded widths, tightly packed (no
+inter-column padding) — and is fixed for a given schema.
 
 ```
-region[0] = pk         (count × pk_stride bytes, OPK big-endian; pk_stride = packed PK-column sum, ≤ 16 for narrow keys)
+region[0] = pk         (count × pk_stride bytes, OPK key)
 region[1] = weight     (count × 8 bytes, i64 LE)
 region[2] = null       (count × 8 bytes, u64 LE, 1 bit per payload col)
 region[3..3+P-1] = payload columns (non-PK, schema order)
 region[3+P] = blob     (variable-length string heap)
 ```
 
-The PK region holds **order-preserving big-endian (OPK)** bytes, in both the
-at-rest files and the in-engine batch. Each PK column is byte-reversed from its
-native little-endian form to big-endian and, for signed columns, has the sign
-bit of its leading byte flipped; the columns are concatenated in PK-list order.
-The encoding is a fixed-width bijection, so OPK byte equality is exactly PK
-equality (consolidation groups on it), and an unsigned byte comparison
-(`memcmp`) over the region is the typed lexicographic order — no type-aware
-comparator and no native-LE form survive in the stored representation. The
-narrow-PK value is recovered by reading the region big-endian into a `u128`.
+The PK region holds the **order-preserving key (OPK)** — the same encoding at
+rest and in-engine — formed by concatenating the PK columns in PK-list order,
+each encoded big-endian with signed columns sign-flipped. Two properties make it
+load-bearing: an unsigned byte comparison of two keys *is* their typed PK order
+(so every ordered path is one `memcmp`, §1), and the encoding is a bijection —
+byte-equality is PK-equality (consolidation and dedup group on the raw bytes)
+and the column values decode back out.
 
 PK columns are not included in the payload region pointers.
 
