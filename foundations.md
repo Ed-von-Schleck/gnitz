@@ -184,6 +184,23 @@ Only non-linear and bilinear operators need the integral. The output of
   Feldera uses a different approach: a "saturate" operator injects ghost
   `(k, NULL)` tuples, then runs a standard inner join.
 
+*Set-difference form (the general null-fill).* A LEFT outer join is equivalently
+`inner ∪ null_extend(A − distinct(π_A(inner)))`, where `π_A(inner)` carries the
+**preserved side's full payload**. The null-fill is then a Z-set **difference**
+(`A − D`, realized as `union(A, negate(D))` — linear), not an anti-join requiring
+payload recovery: the matched preserved rows are read straight off the inner
+output, deduplicated to one row per preserved identity by `distinct`. The matched
+set `D` is keyed by the **preserved row's identity** (its source PK), so it works
+even when one preserved row matches a whole interval of the other side (range /
+band joins). The equi join may instead key the matched set by the join key as the
+right-only `distinct(B_keys)` optimization — valid only because equi-match
+existence is a function of `B` alone — but the identity-keyed difference is the
+general form. Because the lone non-linear operator (`distinct`) natively absorbs
+the within-epoch `ΔA` / `Δmatched` simultaneity (DBSP Prop 4.7: it emits `+a`/`−a`
+exactly on the per-identity 0-boundary crossing), **no delta-delta cross term is
+needed** despite the matched set depending on the preserved side. GnitzDB's band
+LEFT join (`build_range_join_view`) uses this form.
+
 **Non-linear operators** — require access to the accumulated integral:
 
 *Distinct:* O(|delta|) via DBSP Proposition 4.7 — point lookups into
