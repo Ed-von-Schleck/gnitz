@@ -35,19 +35,20 @@ When adding a new constraint, validation rule, or invariant:
 - [ ] Run `make e2e` (rebuilds both server and Python extension).
 - [ ] Is there a multi-worker E2E test in `test_workers.py`?
 - [ ] Is there a Rust unit test?
-- [ ] Does the feature use `hash_row_by_columns` for exchange routing across
-      tables where the same logical value may have different column types
-      (e.g., PK = U64 vs join column = I64)? The hash must produce
-      identical partitions regardless of type.
-- [ ] **Narrow-PK hash invariance**: if the code touches exchange routing or
-      XOR8 filter construction for U64-PK tables, confirm it zero-extends the
-      stored value to u128 before hashing (`hash_u128(pk as u128)`). The
-      physical storage uses 8 bytes/row for U64 PKs, but partition assignment
-      must be identical to a U128 table holding the same value.
-- [ ] **Schema-dependent PK stride**: IPC fast paths (WAL encode/decode, shard
-      read/write, wire batch serialization) derive `pk_stride` from the schema
-      (`pk_stride = 8` for U64, `pk_stride = 16` for U128). Hard-coding 16 is
-      wrong for U64-PK tables. See `foundations.md` §6 for the region layout.
+- [ ] **Route and filter by the OPK key, never by native bytes or a fixed
+      width.** Row routing and XOR8 filter construction must derive the key from
+      the canonical OPK bytes (`partition_for_pk_bytes` is the universal PK
+      router at every width), so the same logical value co-partitions and
+      co-probes regardless of its stored width or declared column type. A join
+      key whose two sides differ in type/width (e.g. U64 PK vs I64 column) is
+      promoted to the pair's common type and OPK-encoded on both sides — the
+      key bytes come out byte-identical, so never re-hash the native column
+      bytes.
+- [ ] **Take `pk_stride` from the schema; never hard-code a key width.** IPC
+      fast paths (WAL encode/decode, shard read/write, wire serialization) read
+      `pk_stride` (`SchemaDescriptor::pk_stride`); key width varies by schema, so
+      a hard-coded width corrupts every table whose key is a different width. See
+      `foundations.md` §6 for the region layout.
 
 ## Debug logging
 
