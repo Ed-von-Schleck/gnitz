@@ -148,6 +148,88 @@ pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 // ---------------------------------------------------------------------------
+// Stride-dispatched OPK ordering (the PK analogue of `with_payload_cmp!`)
+// ---------------------------------------------------------------------------
+
+/// OPK byte ordering, specialized by `pk_stride` and selected **once per drive**
+/// by [`with_pk_ord!`] — the PK comparator the keyless loser tree reads through
+/// its sources, replacing the cached `u128` node key. OPK byte order equals typed
+/// PK order at every width, so one comparator shape serves all signedness/arity:
+///   * stride **8** / **16** — load the OPK bytes big-endian into a `u64`/`u128`
+///     register and compare (exactly what the dropped node key cached), so a
+///     compare stays a single register `cmp`;
+///   * any other stride — the dynamic `compare_pk_bytes` memcmp (a length-checked
+///     slice compare). This covers the rare 1/2/4-byte single-scalar PKs (a small
+///     regression vs the old register key) and compound `> 16`-byte PKs (which the
+///     old `u128` key only prefix-matched, then tie-broke on the full bytes).
+///
+/// PK **equality** is width-agnostic slice equality (`a == b`) and needs no
+/// dispatch — only ordering benefits from the register load — so `same_pk` in the
+/// drivers is a plain byte compare and only `less` carries a `PkOrd`.
+pub(crate) trait PkOrd: Copy {
+    fn cmp(self, a: &[u8], b: &[u8]) -> Ordering;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PkOrd8;
+#[derive(Clone, Copy)]
+pub(crate) struct PkOrd16;
+#[derive(Clone, Copy)]
+pub(crate) struct PkOrdDyn;
+
+impl PkOrd for PkOrd8 {
+    #[inline(always)]
+    fn cmp(self, a: &[u8], b: &[u8]) -> Ordering {
+        debug_assert_eq!(a.len(), 8, "PkOrd8 on a non-8-byte PK region");
+        debug_assert_eq!(b.len(), 8, "PkOrd8 on a non-8-byte PK region");
+        // SAFETY: PkOrd8 is selected only at `pk_stride == 8`, and `get_pk_bytes`
+        // returns exactly `pk_stride` bytes, so `a`/`b` are 8 bytes. Reading a
+        // `[u8; 8]` (alignment 1) from the slice base is in-bounds and aligned —
+        // a register-cheap load with no length check (what `try_into` would add).
+        let av = u64::from_be_bytes(unsafe { *(a.as_ptr() as *const [u8; 8]) });
+        let bv = u64::from_be_bytes(unsafe { *(b.as_ptr() as *const [u8; 8]) });
+        av.cmp(&bv)
+    }
+}
+
+impl PkOrd for PkOrd16 {
+    #[inline(always)]
+    fn cmp(self, a: &[u8], b: &[u8]) -> Ordering {
+        debug_assert_eq!(a.len(), 16, "PkOrd16 on a non-16-byte PK region");
+        debug_assert_eq!(b.len(), 16, "PkOrd16 on a non-16-byte PK region");
+        // SAFETY: as PkOrd8 — selected only at `pk_stride == 16`, so `a`/`b` are
+        // 16 bytes; `[u8; 16]` has alignment 1.
+        let av = u128::from_be_bytes(unsafe { *(a.as_ptr() as *const [u8; 16]) });
+        let bv = u128::from_be_bytes(unsafe { *(b.as_ptr() as *const [u8; 16]) });
+        av.cmp(&bv)
+    }
+}
+
+impl PkOrd for PkOrdDyn {
+    #[inline(always)]
+    fn cmp(self, a: &[u8], b: &[u8]) -> Ordering {
+        compare_pk_bytes(a, b)
+    }
+}
+
+/// Select the OPK ordering by `$schema.pk_stride()` and hand it to a generic
+/// helper as the trailing argument: `with_pk_ord!(schema, func, args...)` expands
+/// to `func(args..., pk_ord)`. Mirrors [`with_payload_cmp!`] so a driver that
+/// needs both selects payload (outer) then PK (inner), each monomorphizing its
+/// own branch-free copy of the hot loop. The `PkOrd` value is zero-sized, so it
+/// is passed by value with no cost and its `cmp` inlines to the register compare.
+macro_rules! with_pk_ord {
+    ($schema:expr, $f:path $(, $arg:expr)* $(,)?) => {
+        match $schema.pk_stride() {
+            8  => $f($($arg,)* $crate::storage::columnar::PkOrd8),
+            16 => $f($($arg,)* $crate::storage::columnar::PkOrd16),
+            _  => $f($($arg,)* $crate::storage::columnar::PkOrdDyn),
+        }
+    };
+}
+pub(crate) use with_pk_ord;
+
+// ---------------------------------------------------------------------------
 // Sorted-stream lower-bound search (stateless + galloping)
 // ---------------------------------------------------------------------------
 

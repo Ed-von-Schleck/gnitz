@@ -9,12 +9,12 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
-use super::columnar::{ColumnarSource, SortEntry};
+use super::columnar::{ColumnarSource, SortEntry, PkOrd};
 // `columnar` as a module path is needed only by the test module's
 // `compare_pk_bytes`/`compare_rows` calls; dispatch uses `with_payload_cmp!`.
 #[cfg(test)]
 use super::columnar;
-use super::with_payload_cmp;
+use super::{with_payload_cmp, with_pk_ord};
 use super::batch::FIXED_REGION_BYTES;
 use crate::schema::{BlobCache, SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
@@ -262,12 +262,6 @@ impl MemBatchCursor {
             self.position += 1;
         }
     }
-
-    #[inline]
-    pub fn peek_key(&self, batch: &SortedMemBatch) -> u128 {
-        debug_assert!(self.is_valid());
-        pk_sort_key(batch.get_pk_bytes(self.position))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,16 +428,12 @@ pub fn merge_batches(
         .map(|i| MemBatchCursor::new(batches[i].count))
         .collect();
 
-    // The heap key (`peek_key` → `pk_sort_key` → `pack_pk_be`) is
-    // order-preserving for both widths, so a single closure set serves both —
-    // the only remaining split is the fast/generic payload comparator.
+    // Dispatch the payload comparator (outer) then the stride comparator (inner),
+    // each monomorphizing its own branch-free copy of the merge loop.
     with_payload_cmp!(schema, merge_run, &mut cursors, batches, schema, writer)
 }
 
-/// N-way merge closure builder for all PK widths. `node.key` (the
-/// order-preserving sort key) settles distinct keys with no column work; a key
-/// tie falls to a raw OPK-byte compare (implied-equal for narrow, separates
-/// low-16-colliding distinct wide PKs) then a payload tiebreak.
+/// Payload-dispatch layer; defers to the stride dispatch in `merge_run_pk`.
 #[inline]
 fn merge_run<RowCmp>(
     cursors: &mut [MemBatchCursor],
@@ -454,61 +444,70 @@ fn merge_run<RowCmp>(
 ) where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
+    with_pk_ord!(schema, merge_run_pk, cursors, batches, schema, writer, row_cmp)
+}
+
+/// N-way merge closure builder. The keyless heap reads each player's OPK bytes
+/// through `(source_idx, row)`: the stride-dispatched `pk_ord` settles the PK
+/// axis, then the payload `row_cmp`. `same_pk` is the width-agnostic OPK byte
+/// equality (so two distinct wide PKs sharing a 16-byte prefix never fold);
+/// `eq_payload` is the payload term.
+#[inline]
+fn merge_run_pk<RowCmp, PK>(
+    cursors: &mut [MemBatchCursor],
+    batches: &[SortedMemBatch],
+    schema: &SchemaDescriptor,
+    writer: &mut DirectWriter,
+    row_cmp: RowCmp,
+    pk_ord: PK,
+) where
+    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+    PK: PkOrd,
+{
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
     // by `advance`.  `source_idx` doubles as the batch index here.
     let less = |a: &HeapNode, b: &HeapNode| -> bool {
-        match a.key.cmp(&b.key) {
+        let ba = &batches[a.source_idx as usize];
+        let bb = &batches[b.source_idx as usize];
+        match pk_ord.cmp(ba.get_pk_bytes(a.row as usize), bb.get_pk_bytes(b.row as usize)) {
             Ordering::Less => true,
             Ordering::Greater => false,
-            Ordering::Equal => {
-                let ba = &batches[a.source_idx];
-                let bb = &batches[b.source_idx];
-                match ba.get_pk_bytes(a.row).cmp(bb.get_pk_bytes(b.row)) {
-                    Ordering::Less => true,
-                    Ordering::Greater => false,
-                    Ordering::Equal =>
-                        row_cmp(schema, &ba.0, a.row, &bb.0, b.row) == Ordering::Less,
-                }
-            }
+            Ordering::Equal =>
+                row_cmp(schema, &ba.0, a.row as usize, &bb.0, b.row as usize) == Ordering::Less,
         }
     };
-    let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+    let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
         batches[a_src].get_pk_bytes(a_row) == batches[b_src].get_pk_bytes(b_row)
-            && row_cmp(schema, &batches[a_src].0, a_row, &batches[b_src].0, b_row)
-                == Ordering::Equal
     };
-    merge_batches_inner(cursors, batches, schema, writer, less, eq_payload);
+    let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+        row_cmp(schema, &batches[a_src].0, a_row, &batches[b_src].0, b_row) == Ordering::Equal
+    };
+    merge_batches_inner(cursors, batches, writer, less, same_pk, eq_payload);
 }
 
-/// Single generic N-way merge driver body. Monomorphised on the `less` and
-/// `eq_payload` closure types its caller selects per PK width — each width
-/// compiles to its own branch-free copy of the hot loop with no width term
-/// inside. The `u128` key handed to the heap (via `peek_key` → `pk_sort_key`)
-/// is order-preserving: the exact OPK for narrow and the OPK 16-byte prefix
-/// for wide; `less` orders correctly for both (narrow reads `node.key`, wide
-/// reads `node.key` first then tie-breaks on raw PK bytes).
+/// Single generic N-way merge driver body. Monomorphised on the `less` /
+/// `same_pk` / `eq_payload` closures its caller selects per stride and payload —
+/// each combination compiles to its own branch-free copy of the hot loop. The
+/// keyless node carries only the row; `less`/`same_pk` read the OPK bytes through
+/// `(source_idx, row)`, and the output PK is re-derived from `(src, row)` in the
+/// emit (`write_row` reads `get_pk_bytes`).
 #[inline]
-fn merge_batches_inner<L, EQ>(
+fn merge_batches_inner<L, SP, EQ>(
     cursors: &mut [MemBatchCursor],
     batches: &[SortedMemBatch],
-    _schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
     less: L,
+    same_pk: SP,
     eq_payload: EQ,
 ) where
     L: Fn(&HeapNode, &HeapNode) -> bool + Copy,
+    SP: Fn(usize, usize, usize, usize) -> bool,
     EQ: Fn(usize, usize, usize, usize) -> bool,
 {
     let mut tree = LoserTree::build(
         cursors.len(),
-        |i| {
-            if cursors[i].is_valid() {
-                Some((cursors[i].peek_key(&batches[i]), cursors[i].position))
-            } else {
-                None
-            }
-        },
+        |i| cursors[i].is_valid().then(|| cursors[i].position as u32),
         less,
     );
     drive_merge(
@@ -516,15 +515,12 @@ fn merge_batches_inner<L, EQ>(
         less,
         |src| {
             cursors[src].advance();
-            if cursors[src].is_valid() {
-                Some((cursors[src].peek_key(&batches[src]), cursors[src].position))
-            } else {
-                None
-            }
+            cursors[src].is_valid().then(|| cursors[src].position as u32)
         },
+        same_pk,
         eq_payload,
         |src, row| batches[src].get_weight(row),
-        |group_src, group_row, _key, w| {
+        |group_src, group_row, w| {
             writer.write_row(&batches[group_src], group_row, w);
             std::ops::ControlFlow::Continue(())
         },

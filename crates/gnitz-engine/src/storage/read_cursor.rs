@@ -9,11 +9,11 @@ use std::ptr;
 use std::rc::Rc;
 
 use super::batch::{Batch, FIXED_REGION_BYTES};
-use super::columnar::{self, ColumnarSource};
-use super::with_payload_cmp;
+use super::columnar::{self, ColumnarSource, PkOrd};
+use super::{with_payload_cmp, with_pk_ord};
 use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
-use super::merge::{pack_pk_be, pk_sort_key, ColPtr, MemBatch, UnifiedSource};
+use super::merge::{pack_pk_be, ColPtr, MemBatch, UnifiedSource};
 use super::shard_reader::{MappedShard, RegionView};
 
 thread_local! {
@@ -181,17 +181,6 @@ impl CursorSource {
         }
     }
 
-    /// Loser-tree heap key: the order-preserving `pk_sort_key`. For
-    /// `pk_stride ≤ 16` this is the whole PK (authoritative); for
-    /// `pk_stride > 16` it is the order-preserving 16-byte OPK prefix
-    /// (authoritative when two prefixes differ, else tie-broken via
-    /// `compare_pk_bytes` on the full `get_pk_bytes` slice). Decoupled from the
-    /// public `current_key` field, which keeps the raw `pack_pk_le` value.
-    #[inline]
-    fn get_pk_prefix(&self, row: usize) -> u128 {
-        pk_sort_key(self.get_pk_bytes(row))
-    }
-
     /// Build a `UnifiedSource` view backed by either a `MemBatch`'s flat data
     /// buffer (always Raw regions) or a `MappedShard`'s mmap (Raw or Constant
     /// regions, indexed by payload position).
@@ -356,12 +345,18 @@ impl CursorState {
 // ReadCursor
 // ---------------------------------------------------------------------------
 
-/// Three-way dispatch on source count, replacing the previous
-/// `tree: Option<LoserTree>` + parallel `entries.len() == 1` checks.
-/// `Empty`/`Single`/`Multi` are exhaustive so each call site dispatches once.
+/// Dispatch on source count, replacing the previous `tree: Option<LoserTree>` +
+/// parallel `entries.len() == 1` checks. The variants are exhaustive so each call
+/// site dispatches once. `Pair` (exactly 2 sources) bypasses the loser tree with
+/// a one-compare-per-row 2-head merge read straight from `states[0]`/`states[1]`
+/// — the frequent DBSP shape (a delta against a well-compacted trace) that would
+/// otherwise pay the heap's fixed per-emit cost (`bench_merge_scan_by_k`'s
+/// k1→k2 cliff). `Pair` keeps no separate head state, so the seek/rewind paths
+/// (which only rebuild a `Multi` tree) re-drive it with no special handling.
 enum SourceMode {
     Empty,
     Single,
+    Pair,
     Multi(LoserTree),
 }
 
@@ -394,75 +389,63 @@ pub struct ReadCursor {
 trait RowComparator: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy {}
 impl<F> RowComparator for F where F: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy {}
 
-/// Resolve the PK ordering after a heap-key tie. Narrow PKs (key = whole PK)
-/// are byte-equal by definition; wide PKs (16-byte OPK prefix) may collide on
-/// the key yet differ in the full bytes, so the full compare is required.
+/// The full loser-tree order — the stride-dispatched OPK byte order (`pk_ord`),
+/// then the payload `row_cmp`. The **single** source of truth for "which head
+/// sorts first": the tree build, every `drive`, and the forward-seek fast path
+/// all key the heap through it, so a tree maintained in place can never order
+/// rows differently from how it was built. `pk_ord.cmp` on each player's full OPK
+/// bytes (read straight from its source via `(source_idx, row)`) is exact at
+/// every width — no cached key, no wide-prefix tie-break. All-PkUnique callers
+/// pass a trivial `|_, _, _, _, _| Ordering::Equal` (a PK tie ⇒ the same Z-set
+/// element).
 #[inline]
-fn pk_cmp_after_key_tie(
-    schema: &SchemaDescriptor,
-    sources: &[CursorSource],
-    a: &HeapNode,
-    b: &HeapNode,
-) -> Ordering {
-    if schema.pk_is_wide() {
-        columnar::compare_pk_bytes(
-            sources[a.source_idx].get_pk_bytes(a.row),
-            sources[b.source_idx].get_pk_bytes(b.row),
-        )
-    } else {
-        Ordering::Equal
-    }
-}
-
-/// The full loser-tree order — heap key, then the wide-prefix tie-break
-/// (`pk_cmp_after_key_tie`), then the payload `row_cmp`. The **single** source of
-/// truth for "which head sorts first": the tree build, every `drive`, and the
-/// forward-seek fast path all key the heap through it, so a tree maintained in
-/// place can never order rows differently from how it was built. All-PkUnique
-/// callers pass a trivial `|_, _, _, _, _| Ordering::Equal` (a PK tie ⇒ the same
-/// Z-set element); the wide tie-break still separates a low-16 prefix collision.
-#[inline]
-fn heap_less_with<'a, RowCmp: RowComparator + 'a>(
+fn heap_less_with<'a, PK: PkOrd + 'a, RowCmp: RowComparator + 'a>(
     schema: &'a SchemaDescriptor,
     sources: &'a [CursorSource],
+    pk_ord: PK,
     row_cmp: RowCmp,
 ) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a {
-    move |a, b| match a.key.cmp(&b.key) {
-        Ordering::Less => true,
-        Ordering::Greater => false,
-        Ordering::Equal => match pk_cmp_after_key_tie(schema, sources, a, b) {
+    move |a, b| {
+        let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
+        let (b_src, b_row) = (b.source_idx as usize, b.row as usize);
+        match pk_ord.cmp(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
             Ordering::Less => true,
             Ordering::Greater => false,
-            Ordering::Equal => row_cmp(
-                schema,
-                &sources[a.source_idx], a.row,
-                &sources[b.source_idx], b.row,
-            ) == Ordering::Less,
-        },
+            Ordering::Equal => {
+                row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less
+            }
+        }
     }
 }
 
 impl ReadCursor {
     #[inline]
-    fn build_tree_with<RowCmp: RowComparator>(
+    fn build_tree_with<RowCmp: RowComparator, PK: PkOrd>(
+        sources: &[CursorSource],
+        states: &[CursorState],
+        schema: &SchemaDescriptor,
+        row_cmp: RowCmp,
+        pk_ord: PK,
+    ) -> LoserTree {
+        // Keyless leaf: it carries only the row index. The comparator reads each
+        // player's OPK bytes through `(source_idx, row)` — the stride-dispatched
+        // `pk_ord`, then the payload tiebreak — the shared `heap_less_with` order
+        // the drive and forward-seek paths reuse.
+        let init = |i: usize| states[i].is_valid().then(|| states[i].position as u32);
+        LoserTree::build(sources.len(), init, heap_less_with(schema, sources, pk_ord, row_cmp))
+    }
+
+    /// Non-PkUnique payload-dispatch layer; defers to the stride dispatch in
+    /// `build_tree_with`. Split so `with_payload_cmp!` can hand it the
+    /// monomorphized `row_cmp`, which it then threads through `with_pk_ord!`.
+    #[inline]
+    fn build_tree_with_payload<RowCmp: RowComparator>(
         sources: &[CursorSource],
         states: &[CursorState],
         schema: &SchemaDescriptor,
         row_cmp: RowCmp,
     ) -> LoserTree {
-        // Heap key is the order-preserving `pk_sort_key` (whole PK for narrow,
-        // OPK 16-byte prefix for wide). A differing key settles the order; a key
-        // tie falls to a raw OPK-byte compare (implied-equal for narrow,
-        // separating wide low-16 collisions) then the payload tiebreak — the
-        // shared `heap_less_with` order the drive and forward-seek paths reuse.
-        let init = |i: usize| {
-            if states[i].is_valid() {
-                Some((sources[i].get_pk_prefix(states[i].position), states[i].position))
-            } else {
-                None
-            }
-        };
-        LoserTree::build(sources.len(), init, heap_less_with(schema, sources, row_cmp))
+        with_pk_ord!(schema, Self::build_tree_with, sources, states, schema, row_cmp)
     }
 
     fn build_tree(
@@ -471,16 +454,15 @@ impl ReadCursor {
         schema: &SchemaDescriptor,
         is_pk_unique: bool,
     ) -> LoserTree {
-        // PkUnique skips the payload tiebreak (a PK tie ⇒ same element); the
-        // non-PkUnique comparator is the live `with_payload_cmp!` selection.
-        // Each arm passes a non-capturing closure so `build_tree_with` inlines
-        // it — a direct fn-item reference would fix the source-ref lifetime and
-        // conflict with the `_with` HRTB Fn bound.
+        // PkUnique skips the payload tiebreak (a PK tie ⇒ same element) and
+        // dispatches only the stride; non-PkUnique dispatches payload (outer) then
+        // stride (inner). Each arm passes non-capturing closures so the inner
+        // helper inlines them — a direct fn-item reference would fix the
+        // source-ref lifetime and conflict with the `_with` HRTB Fn bound.
         if is_pk_unique {
-            #[allow(clippy::redundant_closure)]
-            Self::build_tree_with(sources, states, schema, |_, _, _, _, _| Ordering::Equal)
+            with_pk_ord!(schema, Self::build_tree_with, sources, states, schema, |_, _, _, _, _| Ordering::Equal)
         } else {
-            with_payload_cmp!(schema, Self::build_tree_with, sources, states, schema)
+            with_payload_cmp!(schema, Self::build_tree_with_payload, sources, states, schema)
         }
     }
 
@@ -493,6 +475,7 @@ impl ReadCursor {
         let mode = match sources.len() {
             0 => SourceMode::Empty,
             1 => SourceMode::Single,
+            2 => SourceMode::Pair,
             _ => SourceMode::Multi(Self::build_tree(&sources, &states, &schema, is_pk_unique)),
         };
         let mut cursor = ReadCursor {
@@ -545,8 +528,8 @@ impl ReadCursor {
 
     /// Byte-addressed sibling of [`seek`]. `key` must be exactly `pk_stride`
     /// bytes. Correct at every PK width: the inner `drive`/`build_tree` key the
-    /// heap via `get_pk_prefix` (prefix + `compare_pk_bytes` tie-break for
-    /// wide), so this survives `pk_stride > 16` where the u128 `seek` cannot.
+    /// heap via the stride-dispatched `pk_ord` over the full OPK bytes, so this
+    /// survives `pk_stride > 16` where the u128 `seek` cannot.
     pub fn seek_bytes(&mut self, key: &[u8]) {
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
             state.seek_bytes(src, key);
@@ -603,36 +586,56 @@ impl ReadCursor {
     /// `matches!(self.mode, SourceMode::Multi)` and `key` > the current emitted PK.
     fn seek_forward_multi(&mut self, key: &[u8]) {
         if self.is_pk_unique {
-            // A cross-source PK tie ⇒ the same Z-set element, so the payload
-            // tiebreak is trivial — exactly how `build_tree` keys a PkUnique tree.
-            self.gallop_heap_forward(key, |_, _, _, _, _| Ordering::Equal);
-            self.drive_pk_unique();
+            with_pk_ord!(self.schema, Self::seek_forward_multi_pk_unique, self, key);
         } else {
             with_payload_cmp!(self.schema, Self::seek_forward_multi_with, self, key);
         }
     }
 
+    /// All-PkUnique forward seek: gallop with the trivial payload tiebreak (a PK
+    /// tie ⇒ the same Z-set element), then drive. `pk_ord` is reused for the
+    /// gallop and the drive, so the stride is dispatched once for both.
+    #[inline]
+    fn seek_forward_multi_pk_unique<PK: PkOrd>(&mut self, key: &[u8], pk_ord: PK) {
+        self.gallop_heap_forward(key, pk_ord, |_, _, _, _, _| Ordering::Equal);
+        self.drive_pk_unique_inner(pk_ord);
+    }
+
     /// Non-PkUnique forward seek: gallop with the live payload comparator, then
-    /// drive. Split out so `with_payload_cmp!` can hand it the monomorphized
-    /// `row_cmp`.
+    /// drive. Split so `with_payload_cmp!` hands it the monomorphized `row_cmp`,
+    /// which it threads through `with_pk_ord!` for the stride dispatch.
     #[inline]
     fn seek_forward_multi_with<RowCmp: RowComparator>(&mut self, key: &[u8], row_cmp: RowCmp) {
-        self.gallop_heap_forward(key, row_cmp);
-        self.drive_with(row_cmp);
+        with_pk_ord!(self.schema, Self::seek_forward_multi_both, self, key, row_cmp);
+    }
+
+    #[inline]
+    fn seek_forward_multi_both<RowCmp: RowComparator, PK: PkOrd>(
+        &mut self,
+        key: &[u8],
+        row_cmp: RowCmp,
+        pk_ord: PK,
+    ) {
+        self.gallop_heap_forward(key, pk_ord, row_cmp);
+        self.drive_with_inner(row_cmp, pk_ord);
     }
 
     /// Maintain the `Multi` loser tree in place while galloping its heads forward
-    /// to `key`, keyed by the shared `heap_less_with(.., row_cmp)` order. Scoping
-    /// the heap/sources/states borrows to this call frees `self` for the caller's
-    /// following `drive`. Precondition: `matches!(self.mode, SourceMode::Multi)`.
-    fn gallop_heap_forward<RowCmp: RowComparator>(&mut self, key: &[u8], row_cmp: RowCmp) {
-        let is_wide = self.schema.pk_is_wide();
+    /// to `key`, keyed by the shared `heap_less_with(.., pk_ord, row_cmp)` order.
+    /// Scoping the heap/sources/states borrows to this call frees `self` for the
+    /// caller's following `drive`. Precondition: `matches!(self.mode, SourceMode::Multi)`.
+    fn gallop_heap_forward<PK: PkOrd, RowCmp: RowComparator>(
+        &mut self,
+        key: &[u8],
+        pk_ord: PK,
+        row_cmp: RowCmp,
+    ) {
         let heap = match &mut self.mode {
             SourceMode::Multi(h) => h,
             _ => unreachable!("gallop_heap_forward requires SourceMode::Multi"),
         };
-        let less = heap_less_with(&self.schema, &self.sources, row_cmp);
-        Self::seek_phase(heap, &self.sources, &mut self.states, key, is_wide, &less);
+        let less = heap_less_with(&self.schema, &self.sources, pk_ord, row_cmp);
+        Self::seek_phase(heap, &self.sources, &mut self.states, key, pk_ord, &less);
     }
 
     /// Advance every laggard head (OPK `< key`) to its own `lower_bound(key)`,
@@ -642,44 +645,29 @@ impl ReadCursor {
     /// the loop touches at most `num_sources` leaves and always terminates. On
     /// return every head is `>= key`, leaving the tree positioned exactly as a
     /// from-scratch rebuild at `key` would; the caller's `drive` then folds the
-    /// first live group. `key` is exactly `pk_stride` OPK bytes; `is_wide` is
-    /// `schema.pk_is_wide()`.
-    fn seek_phase(
+    /// first live group. `key` is exactly `pk_stride` OPK bytes; `pk_ord` is the
+    /// stride-dispatched OPK comparator.
+    fn seek_phase<PK: PkOrd>(
         heap: &mut LoserTree,
         sources: &[CursorSource],
         states: &mut [CursorState],
         key: &[u8],
-        is_wide: bool,
+        pk_ord: PK,
         less: &impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
-        // The heap key is the order-preserving `pk_sort_key` (`pack_pk_be`): the
-        // exact whole PK for narrow (`stride <= 16`), the leading-16 OPK prefix for
-        // wide. `target` packs `key` the same way, so `top.cmp(&target)` is the OPK
-        // byte order without a memory load on the common narrow path.
-        let target = pack_pk_be(key);
         while !heap.is_empty() {
-            let HeapNode { key: top, source_idx: src, row } = *heap.peek();
-            // The root is the global min, so once it reaches `key` every head has:
-            // a greater packed key always positions; an equal one positions unless
-            // a wide prefix tie hides full bytes `< key`. Otherwise the root lags —
-            // fall through and gallop it forward.
-            let positioned = match top.cmp(&target) {
-                Ordering::Greater => true,
-                Ordering::Less => false,
-                Ordering::Equal => {
-                    !is_wide || sources[src].get_pk_bytes(row).cmp(key) != Ordering::Less
-                }
-            };
-            if positioned {
+            let HeapNode { source_idx: src, row } = *heap.peek();
+            let (src, row) = (src as usize, row as usize);
+            // The root is the global min, so once its OPK bytes reach `key` every
+            // head has. `pk_ord.cmp` compares the full stride bytes — exact at
+            // every width, so no wide-prefix recheck. Otherwise the root lags;
+            // gallop it forward.
+            if pk_ord.cmp(sources[src].get_pk_bytes(row), key) != Ordering::Less {
                 break;
             }
             states[src].advance_to(&sources[src], key); // gallop this laggard
             if states[src].is_valid() {
-                heap.replace_top(
-                    sources[src].get_pk_prefix(states[src].position),
-                    states[src].position,
-                    less,
-                );
+                heap.replace_top(states[src].position as u32, less);
             } else {
                 heap.pop_top(less);
             }
@@ -747,13 +735,83 @@ impl ReadCursor {
     /// `cogroup_left`/`cogroup_intersection` callback).
     pub fn group_has_positive(&mut self, key: &[u8]) -> bool {
         let mut present = false;
-        while self.valid && self.current_pk_eq(key) {
-            if self.current_weight > 0 {
-                present = true;
-            }
-            self.advance();
-        }
+        self.walk_pk_group(key, |w| present |= w > 0);
         present
+    }
+
+    /// Walk the equal-`key` PK group from the current position to its end,
+    /// invoking `f` with each non-ghost `(PK, payload)` sub-group's **net**
+    /// weight — exactly the rows the old `while current_pk_eq { advance }` loop
+    /// observed, one per consolidated sub-group (never the whole PK group summed,
+    /// which would mis-report a group whose payloads' weights offset). The
+    /// comparator dispatch is hoisted out of the per-row loop. On return the
+    /// cursor sits at the first row past the group with every `current_*` field
+    /// committed (or `valid == false` at end of source) — the same postcondition
+    /// the replaced loop left, which the next co-group `key()` / loop guard reads.
+    fn walk_pk_group<F: FnMut(i64)>(&mut self, key: &[u8], mut f: F) {
+        // Single bypass: a tight position scan reading only `get_weight` /
+        // `get_pk_bytes` (the cursor-free floor's cost), skipping the per-row
+        // `current_*` materialization (`current_key` recompute, null word, …).
+        // The terminating `drive_single` commits the exit row so the
+        // postcondition holds. This is the cogroup-benchmark's hot path.
+        if matches!(self.mode, SourceMode::Single) {
+            while self.states[0].is_valid() {
+                let pos = self.states[0].position;
+                if self.sources[0].get_pk_bytes(pos) != key {
+                    break;
+                }
+                f(self.sources[0].get_weight(pos));
+                self.states[0].advance(&self.sources[0]);
+            }
+            self.drive_single();
+            return;
+        }
+        // Empty / Multi: the per-row-commit walk with the comparator dispatch
+        // hoisted out of the advance loop (Empty's guard fails on `!valid`). The
+        // Multi heap fold dominates the per-row `current_*` commit, so a lean
+        // emit there saves little; correctness and the dispatch hoist are the win.
+        self.for_each_pk_group_row(key, |c| f(c.current_weight));
+    }
+
+    /// Walk the equal-`key` PK group, invoking `f(&*self)` at each emitted row so
+    /// the callback can read the current trace row's columns / weight (e.g.
+    /// `write_join_row`, `push_current_row`). Unlike [`walk_pk_group`] this commits
+    /// `current_*` per row (the callback reads through it), but hoists the
+    /// `is_pk_unique` + `with_payload_cmp!` dispatch out of the loop. `f` must not
+    /// re-enter the cursor. Same exit postcondition and `(PK, payload)`-sub-group
+    /// granularity as [`walk_pk_group`]; same group-walk contract as the
+    /// `while current_pk_eq { advance }` loops it replaces.
+    pub(crate) fn for_each_pk_group_row<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], f: F) {
+        if self.is_pk_unique {
+            self.for_each_pk_group_row_pk_unique(key, f);
+        } else {
+            with_payload_cmp!(self.schema, Self::for_each_pk_group_row_with, self, key, f);
+        }
+    }
+
+    /// All-PkUnique specialization of [`for_each_pk_group_row`]: advances via the
+    /// payload-comparator-free `advance_pk_unique`.
+    fn for_each_pk_group_row_pk_unique<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], mut f: F) {
+        while self.valid && self.current_pk_eq(key) {
+            f(&*self);
+            self.advance_pk_unique();
+        }
+    }
+
+    /// Non-PkUnique specialization of [`for_each_pk_group_row`]: the monomorphized
+    /// `row_cmp` (selected once by `with_payload_cmp!`) is threaded through each
+    /// `advance_with`, so the per-row advance never re-selects the comparator.
+    #[inline]
+    fn for_each_pk_group_row_with<RowCmp: RowComparator, F: FnMut(&ReadCursor)>(
+        &mut self,
+        key: &[u8],
+        mut f: F,
+        row_cmp: RowCmp,
+    ) {
+        while self.valid && self.current_pk_eq(key) {
+            f(&*self);
+            self.advance_with(row_cmp);
+        }
     }
 
     /// Storage-order comparison of the current row's PK against an OPK `key`
@@ -827,25 +885,27 @@ impl ReadCursor {
         }
     }
 
+    /// Step past the previously-emitted row before a re-drive. Only `Single`
+    /// pre-steps: its `drive` just commits the row at the current position, so we
+    /// must advance off it first. `Empty`/`Pair`/`Multi` do not — their drives
+    /// already consumed the emitted group (the `Pair` fold and the heap fold both
+    /// advance every head past it), so the next drive opens a fresh group.
     #[inline]
-    fn advance_pk_unique(&mut self) {
+    fn pre_step_single(&mut self) {
         if matches!(self.mode, SourceMode::Single) {
             self.states[0].advance(&self.sources[0]);
         }
+    }
+
+    #[inline]
+    fn advance_pk_unique(&mut self) {
+        self.pre_step_single();
         self.drive_pk_unique();
     }
 
-    /// Step past the previously-emitted row, then drive to the next group.
-    /// For single-source cursors `drive` just commits the row at the
-    /// current position, so we must step past it first. Multi-source
-    /// cursors don't pre-advance: `drive`'s inner fold popped the
-    /// previously-emitted group's rows from the heap, so the next call
-    /// opens a new group from the heap root.
     #[inline]
     fn advance_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
-        if matches!(self.mode, SourceMode::Single) {
-            self.states[0].advance(&self.sources[0]);
-        }
+        self.pre_step_single();
         self.drive_with(row_cmp);
     }
 
@@ -858,59 +918,82 @@ impl ReadCursor {
         }
     }
 
-    /// N-way merge driver for all-PkUnique cursors. Skips payload comparison:
-    /// a cross-source PK tie implies the same Z-set element (no retractions
-    /// exist in any source). For narrow PKs the comparator is a single u128
-    /// compare; for wide PKs it falls back to `compare_pk_bytes` on a prefix
-    /// collision.
+    /// Drive the non-`Multi` modes, returning `true` if one handled the step;
+    /// `Multi` returns `false` so the caller dispatches its own monomorphized
+    /// `*_inner`. Shared by `drive_pk_unique` and `drive_with` so the
+    /// Empty/Single/Pair ladder lives in one place. `row_cmp` reaches only the
+    /// `Pair` bypass (PkUnique passes the trivial equal-PK ⇒ same-element cmp).
+    #[inline]
+    fn drive_small_modes<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) -> bool {
+        if matches!(self.mode, SourceMode::Empty) { self.valid = false; return true; }
+        if matches!(self.mode, SourceMode::Single) { self.drive_single(); return true; }
+        if matches!(self.mode, SourceMode::Pair) {
+            with_pk_ord!(self.schema, Self::drive_pair_inner, self, row_cmp);
+            return true;
+        }
+        false
+    }
+
+    /// N-way merge driver for all-PkUnique cursors. Skips payload comparison: a
+    /// cross-source PK tie implies the same Z-set element (no retractions exist in
+    /// any source). The narrow/wide fork is gone — the stride-dispatched `pk_ord`
+    /// compares the full OPK bytes at every width, so a wide prefix collision can
+    /// no longer false-merge two distinct PKs.
     #[inline]
     fn drive_pk_unique(&mut self) {
+        // PkUnique Empty/Single/Pair: equal PK ⇒ same element, so the payload
+        // tiebreak is trivial (the Pair fold still sums weights across the heads).
+        if self.drive_small_modes(|_, _, _, _, _| Ordering::Equal) { return; }
+        with_pk_ord!(self.schema, Self::drive_pk_unique_inner, self);
+    }
+
+    /// `Multi` PkUnique drive, monomorphized on the stride comparator `pk_ord`.
+    /// Precondition: `matches!(self.mode, SourceMode::Multi)`.
+    #[inline]
+    fn drive_pk_unique_inner<PK: PkOrd>(&mut self, pk_ord: PK) {
         let heap = match &mut self.mode {
-            SourceMode::Empty  => { self.valid = false; return; }
-            SourceMode::Single => { self.drive_single(); return; }
             SourceMode::Multi(h) => h,
+            _ => unreachable!("drive_pk_unique_inner requires SourceMode::Multi"),
         };
         let schema  = &self.schema;
         let sources = &self.sources;
         let states  = &mut self.states;
-
-        let emitted = if schema.pk_is_wide() {
-            // Wide PkUnique: prefix tie-break via compare_pk_bytes; no row_cmp.
-            let less = |a: &HeapNode, b: &HeapNode| -> bool {
-                match a.key.cmp(&b.key) {
-                    Ordering::Less    => true,
-                    Ordering::Greater => false,
-                    Ordering::Equal   => columnar::compare_pk_bytes(
-                        sources[a.source_idx].get_pk_bytes(a.row),
-                        sources[b.source_idx].get_pk_bytes(b.row),
-                    ) == Ordering::Less,
-                }
-            };
-            let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-                // No row_cmp: matching PK bytes ⇒ same element under PkUnique.
-                debug_assert_eq!(
-                    columnar::compare_rows(schema, &sources[a_src], a_row, &sources[b_src], b_row),
-                    Ordering::Equal,
-                    "PkUnique shard has a PK tie with different payloads — corrupted data or wrong flag",
-                );
-                sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
-            };
-            Self::drive_inner(heap, sources, states, schema, less, eq_payload)
-        } else {
-            // Narrow PkUnique: the u128 heap key IS the whole PK; a tie means
-            // same PK → same element. eq_payload is trivially true.
-            let less = |a: &HeapNode, b: &HeapNode| -> bool { a.key < b.key };
-            let eq_payload = |_, _, _, _| true;
-            Self::drive_inner(heap, sources, states, schema, less, eq_payload)
+        // `less` is the pure OPK order (no payload term). `same_pk` is the
+        // width-agnostic OPK byte equality; matching PK ⇒ same element, so
+        // `eq_payload` is trivially true. The debug-assert pins the PkUnique
+        // invariant (equal PK ⇒ equal payload), firing only on a real violation.
+        let less = |a: &HeapNode, b: &HeapNode| -> bool {
+            pk_ord.cmp(
+                sources[a.source_idx as usize].get_pk_bytes(a.row as usize),
+                sources[b.source_idx as usize].get_pk_bytes(b.row as usize),
+            ).is_lt()
         };
+        let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+            let eq = sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row);
+            debug_assert!(
+                !eq || columnar::compare_rows(schema, &sources[a_src], a_row, &sources[b_src], b_row)
+                    == Ordering::Equal,
+                "PkUnique shard has a PK tie with different payloads — corrupted data or wrong flag",
+            );
+            eq
+        };
+        let eq_payload = |_, _, _, _| true;
+        let emitted = Self::drive_inner(heap, sources, states, less, same_pk, eq_payload);
+        self.commit_emitted(emitted);
+    }
 
+    /// Commit (or invalidate from) the `(net_weight, source_idx, row)` a `Multi`
+    /// drive emitted. `current_key` is recomputed from the row's PK bytes here
+    /// (off the comparator) to honour its native-value / wide-prefix contract.
+    #[inline]
+    fn commit_emitted(&mut self, emitted: Option<(i64, usize, usize)>) {
         if let Some((weight, idx, row)) = emitted {
             self.valid = true;
-            self.current_key = Self::current_key_from_bytes(sources[idx].get_pk_bytes(row));
+            self.current_key = Self::current_key_from_bytes(self.sources[idx].get_pk_bytes(row));
             self.current_weight = weight;
             self.current_entry_idx = idx;
             self.current_row = row;
-            self.current_null_word = sources[idx].get_null_word(row);
+            self.current_null_word = self.sources[idx].get_null_word(row);
         } else {
             self.valid = false;
         }
@@ -940,24 +1023,25 @@ impl ReadCursor {
         }
     }
 
-    /// Shared N-way merge driver body for [`drive_with`]. Mirrors storage's
-    /// `merge_batches_inner`: the caller selects only `less`/`eq_payload` per PK
-    /// width, and monomorphization compiles each width to its own branch-free
-    /// copy of the (width-independent) advance/weight/emit hot loop. Returns the
-    /// emitted group as `(weight, source_idx, row)`, or `None` if drained. The
-    /// heap group key is not returned — `current_key` is recomputed from PK
-    /// bytes at the commit point to honour its raw `pack_pk_le` contract.
+    /// Shared N-way merge driver body for the `Multi` drives. Mirrors storage's
+    /// `merge_batches_inner`: the caller selects `less` / `same_pk` / `eq_payload`
+    /// (per stride and payload), and monomorphization compiles each combination to
+    /// its own branch-free copy of the (selector-independent) advance/weight/emit
+    /// hot loop. Returns the emitted group as `(weight, source_idx, row)`, or
+    /// `None` if drained — `current_key` is recomputed from PK bytes at the commit
+    /// point (`commit_emitted`), off the comparator.
     #[inline]
-    fn drive_inner<L, EQ>(
+    fn drive_inner<L, SP, EQ>(
         heap: &mut LoserTree,
         sources: &[CursorSource],
         states: &mut [CursorState],
-        _schema: &SchemaDescriptor,
         less: L,
+        same_pk: SP,
         eq_payload: EQ,
     ) -> Option<(i64, usize, usize)>
     where
         L: Fn(&HeapNode, &HeapNode) -> bool + Copy,
+        SP: Fn(usize, usize, usize, usize) -> bool,
         EQ: Fn(usize, usize, usize, usize) -> bool,
     {
         let mut emitted: Option<(i64, usize, usize)> = None;
@@ -965,15 +1049,12 @@ impl ReadCursor {
             heap, less,
             |src| {
                 states[src].advance(&sources[src]);
-                if states[src].is_valid() {
-                    Some((sources[src].get_pk_prefix(states[src].position), states[src].position))
-                } else {
-                    None
-                }
+                states[src].is_valid().then(|| states[src].position as u32)
             },
+            same_pk,
             eq_payload,
             |src, row| sources[src].get_weight(row),
-            |gs, gr, _gk, nw| {
+            |gs, gr, nw| {
                 emitted = Some((nw, gs, gr));
                 std::ops::ControlFlow::Break(())
             },
@@ -981,18 +1062,27 @@ impl ReadCursor {
         emitted
     }
 
-    /// Heap path: emit one consolidated non-ghost group, or invalidate.
+    /// Drive to the next group with the live payload comparator. Empty/Single/Pair
+    /// go through `drive_small_modes`; the `Multi` heap path dispatches the stride
+    /// comparator (`with_pk_ord!`) into `drive_with_inner`.
     ///
-    /// `drive_merge` folds tied rows for us; we hand it `Break` from `emit`
-    /// the first time we see a non-ghost group to return immediately.
-    /// Ghost groups (net weight = 0) cause `drive_merge` to skip emit and
-    /// open the next group, so the loop naturally walks past them.
+    /// On the heap path `drive_merge` folds tied rows for us; we hand it `Break`
+    /// from `emit` the first time we see a non-ghost group to return immediately.
+    /// Ghost groups (net weight = 0) cause `drive_merge` to skip emit and open the
+    /// next group, so the loop naturally walks past them.
     #[inline]
     fn drive_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
+        if self.drive_small_modes(row_cmp) { return; }
+        with_pk_ord!(self.schema, Self::drive_with_inner, self, row_cmp);
+    }
+
+    /// `Multi` non-PkUnique drive, monomorphized on payload (`row_cmp`) and stride
+    /// (`pk_ord`). Precondition: `matches!(self.mode, SourceMode::Multi)`.
+    #[inline]
+    fn drive_with_inner<RowCmp: RowComparator, PK: PkOrd>(&mut self, row_cmp: RowCmp, pk_ord: PK) {
         let heap = match &mut self.mode {
-            SourceMode::Empty  => { self.valid = false; return; }
-            SourceMode::Single => { self.drive_single(); return; }
             SourceMode::Multi(h) => h,
+            _ => unreachable!("drive_with_inner requires SourceMode::Multi"),
         };
         let schema  = &self.schema;
         let sources = &self.sources;
@@ -1000,33 +1090,112 @@ impl ReadCursor {
         // `drive_inner` returns the emitted group as a tuple rather than writing
         // `self.current_*` directly: its closures already reborrow `&sources` +
         // `&mut states`, so also capturing `&mut self.current_*` would force a
-        // whole-`self` borrow. We commit the tuple (and fetch `get_null_word`)
-        // after it returns.
+        // whole-`self` borrow. `commit_emitted` writes the tuple after it returns.
         //
-        // `less` is the shared `heap_less_with` order: `node.key` settles distinct
-        // keys with no column work, a key tie falls to a raw OPK-byte compare
-        // (implied-equal for narrow, separating wide low-16 collisions) then the
-        // payload tiebreak. `eq_payload` keeps the byte term so two distinct wide
-        // PKs sharing a prefix AND a payload are not folded into one group.
-        let less = heap_less_with(schema, sources, row_cmp);
-        let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+        // `less` is the shared `heap_less_with` order: the stride-dispatched OPK
+        // compare settles the PK axis, then the payload `row_cmp`. `same_pk` is the
+        // width-agnostic OPK byte equality (so two distinct wide PKs sharing a
+        // prefix never fold); `eq_payload` is now payload-only (the PK term is
+        // `same_pk`).
+        let less = heap_less_with(schema, sources, pk_ord, row_cmp);
+        let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
             sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
-            && row_cmp(schema, &sources[a_src], a_row,
-                               &sources[b_src], b_row) == Ordering::Equal
         };
-        let emitted = Self::drive_inner(heap, sources, states, schema, less, eq_payload);
-        // Heap key is the OPK; recompute current_key (narrow native value /
-        // wide prefix) here, off the comparator. One pack per emitted group.
-        if let Some((weight, idx, row)) = emitted {
-            self.valid = true;
-            self.current_key = Self::current_key_from_bytes(self.sources[idx].get_pk_bytes(row));
-            self.current_weight = weight;
-            self.current_entry_idx = idx;
-            self.current_row = row;
-            self.current_null_word = self.sources[idx].get_null_word(row);
-        } else {
-            self.valid = false;
-        }
+        let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+            row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
+        };
+        let emitted = Self::drive_inner(heap, sources, states, less, same_pk, eq_payload);
+        self.commit_emitted(emitted);
+    }
+
+    /// Two-head merge bypass for `SourceMode::Pair` — the heap-free analogue of
+    /// `drive_single`. Reads the two heads straight from `states[0]`/`states[1]`
+    /// (no cached head positions, so the seek/rewind paths re-drive a Pair with no
+    /// special handling), merges by one stride-dispatched PK compare (`pk_ord`)
+    /// plus the payload `row_cmp` on a PK tie, folds equal `(PK, payload)` across
+    /// both heads, and skips ghost groups — committing the first live group's
+    /// exemplar. Consumes the emitted group (advances both heads past it), so the
+    /// next call opens the next group — the same postcondition `drive_with_inner`'s
+    /// heap fold leaves, which is why `advance` must NOT pre-step for a Pair.
+    /// Monomorphized on payload (`row_cmp`) and stride (`pk_ord`); PkUnique passes
+    /// the trivial `row_cmp` (equal PK ⇒ same element).
+    #[inline]
+    fn drive_pair_inner<RowCmp: RowComparator, PK: PkOrd>(&mut self, row_cmp: RowCmp, pk_ord: PK) {
+        debug_assert!(matches!(self.mode, SourceMode::Pair));
+        let schema  = &self.schema;
+        let sources = &self.sources;
+        let states  = &mut self.states;
+
+        let emitted: Option<(i64, usize, usize)> = loop {
+            let v0 = states[0].is_valid();
+            let v1 = states[1].is_valid();
+            if !v0 && !v1 {
+                break None;
+            }
+            // Pick the exemplar (the smaller head by (PK, payload)), capturing its
+            // PK bytes from the same fetch, and note whether the OTHER head's
+            // current row is also in this group. The latter is true ONLY when the
+            // two heads tie on both PK and payload: a PK difference (Less/Greater)
+            // or a same-PK payload difference makes the loser a strictly-later
+            // group, so it cannot fold now — and the selection compare already
+            // told us which, letting the common (distinct-PK) path skip the other
+            // head's fold probe entirely.
+            let (ex_src, ex_pk, other_in_group): (usize, &[u8], bool) = if !v1 {
+                (0, sources[0].get_pk_bytes(states[0].position), false)
+            } else if !v0 {
+                (1, sources[1].get_pk_bytes(states[1].position), false)
+            } else {
+                let p0 = sources[0].get_pk_bytes(states[0].position);
+                let p1 = sources[1].get_pk_bytes(states[1].position);
+                match pk_ord.cmp(p0, p1) {
+                    Ordering::Less => (0, p0, false),
+                    Ordering::Greater => (1, p1, false),
+                    Ordering::Equal => {
+                        match row_cmp(schema, &sources[0], states[0].position,
+                                              &sources[1], states[1].position) {
+                            Ordering::Greater => (1, p1, false),
+                            Ordering::Less => (0, p0, false),
+                            Ordering::Equal => (0, p0, true), // identical (PK,payload): fold both
+                        }
+                    }
+                }
+            };
+            let ex_row = states[ex_src].position;
+
+            // Account the exemplar's weight and consume it WITHOUT a same-group
+            // test — by construction it is the group's first row (mirrors
+            // `drive_merge`'s group-open, which skips the first-row test).
+            let mut net = sources[ex_src].get_weight(ex_row);
+            states[ex_src].advance(&sources[ex_src]);
+
+            // Fold one head's run into `net`: accumulate every remaining row equal
+            // to the exemplar `(ex_pk, payload)` and advance past it. Applied to
+            // the exemplar's own source (intra-source duplicates — a memtable run
+            // is sorted but not necessarily consolidated) and, when it joined this
+            // group, to the other head.
+            let mut fold_run = |s: usize, net: &mut i64| {
+                while states[s].is_valid() {
+                    let pos = states[s].position;
+                    if sources[s].get_pk_bytes(pos) != ex_pk
+                        || row_cmp(schema, &sources[s], pos, &sources[ex_src], ex_row)
+                            != Ordering::Equal
+                    {
+                        break;
+                    }
+                    *net += sources[s].get_weight(pos);
+                    states[s].advance(&sources[s]);
+                }
+            };
+            fold_run(ex_src, &mut net);
+            if other_in_group {
+                fold_run(1 - ex_src, &mut net);
+            }
+            if net != 0 {
+                break Some((net, ex_src, ex_row));
+            }
+            // Ghost group (net weight 0 across both heads): walk to the next.
+        };
+        self.commit_emitted(emitted);
     }
 
     /// Approximate the number of rows remaining in this cursor (upper bound).
@@ -2302,5 +2471,148 @@ mod tests {
         let mut out = Batch::with_schema(schema, 1);
         cursor.copy_current_row_into(&mut out, 1);
         assert_eq!(out.count, 0, "invalid cursor copy must not write a row");
+    }
+
+    // -- Phase A: walk_pk_group / for_each_pk_group_row --------------------
+
+    /// `group_has_positive` must fold per `(PK, payload)` sub-group, never sum
+    /// the whole PK group: a group with one payload at net +1 and another at net
+    /// −1 is *present* (the +1 payload is live), yet a whole-group sum (0) would
+    /// report it absent. Pinned for both the Single lean scan and the Multi fold.
+    #[test]
+    fn group_has_positive_offsetting_payloads_is_present() {
+        let schema = make_schema_i64();
+        // Single source, pre-consolidated: PK=5 payload 100 @ +1, payload 200 @ −1.
+        let single = make_batch(&[(5, 1, 100), (5, -1, 200)]);
+        let mut c = create_read_cursor(std::slice::from_ref(&single), &[], schema);
+        assert!(c.group_has_positive(&5u128.to_be_bytes()),
+            "Single: the +1 payload is live; a whole-group sum (0) reports absent");
+
+        // Multi source: the +1 and −1 payloads arrive in different batches, so the
+        // heap fold (drive) produces the two sub-groups — the path a "sum the PK
+        // group" regression would corrupt.
+        let b1 = make_batch(&[(5, 1, 100)]);
+        let b2 = make_batch(&[(5, -1, 200)]);
+        let mut c = create_read_cursor(&[b1, b2], &[], schema);
+        assert!(c.group_has_positive(&5u128.to_be_bytes()),
+            "Multi: per-(PK,payload) fold must keep the +1 payload visible");
+    }
+
+    /// After walking the equal-PK group at `key`, the cursor's committed
+    /// `current_*` must equal a from-scratch `seek_bytes(next_key)` — `next_key`
+    /// being the first PK strictly past the group. This is what catches a wrong
+    /// exit-state commit (e.g. a naive heap-root peek) that would corrupt the
+    /// next co-group group's `key()` / loop guard.
+    fn assert_walk_exit_matches_seek(sources: &[Rc<Batch>], key: u128, next_key: u128) {
+        let schema = make_schema_i64();
+        let mut walked = create_read_cursor(sources, &[], schema);
+        walked.advance_to(&key.to_be_bytes()); // position at the group head, as a co-group does
+        walked.group_has_positive(&key.to_be_bytes());
+
+        let mut fresh = create_read_cursor(sources, &[], schema);
+        fresh.seek_bytes(&next_key.to_be_bytes());
+
+        assert_eq!(walked.valid, fresh.valid, "valid after walk(key={key})");
+        if walked.valid {
+            assert_eq!(walked.current_key, fresh.current_key, "current_key key={key}");
+            assert_eq!(walked.current_pk_bytes(), fresh.current_pk_bytes(), "pk_bytes key={key}");
+            assert_eq!(walked.current_weight, fresh.current_weight, "weight key={key}");
+            assert_eq!(walked.current_null_word, fresh.current_null_word, "null_word key={key}");
+        }
+    }
+
+    #[test]
+    fn group_has_positive_exit_state_matches_fresh_seek() {
+        // Single source: walk a mid group (→ lands on PK=10) and the last group
+        // (→ exhausts). The −1 payload at PK=5 exercises the tombstone-before-end.
+        let single = make_batch(&[(5, 1, 100), (5, -1, 200), (10, 1, 1000), (10, 1, 2000)]);
+        assert_walk_exit_matches_seek(std::slice::from_ref(&single), 5, 10);
+        assert_walk_exit_matches_seek(std::slice::from_ref(&single), 10, 11);
+
+        // Multi source: same PKs split across batches (the heap-fold path).
+        let b1 = make_batch(&[(5, 1, 100), (10, 1, 1000)]);
+        let b2 = make_batch(&[(5, -1, 200), (10, 1, 2000)]);
+        assert_walk_exit_matches_seek(&[Rc::clone(&b1), Rc::clone(&b2)], 5, 10);
+        assert_walk_exit_matches_seek(&[b1, b2], 10, 11);
+    }
+
+    /// `for_each_pk_group_row` visits one entry per non-ghost (PK, payload)
+    /// sub-group with `current_*` committed (the callback reads columns/weight),
+    /// then leaves the exit state at the first row past the group.
+    #[test]
+    fn for_each_pk_group_row_visits_subgroups_and_exits_clean() {
+        let schema = make_schema_i64();
+        let b1 = make_batch(&[(5, 1, 100), (10, 1, 1000)]);
+        let b2 = make_batch(&[(5, 3, 200)]); // PK=5 payload 200 @ +3
+        let mut c = create_read_cursor(&[b1, b2], &[], schema);
+
+        let mut seen: Vec<(u64, i64)> = Vec::new();
+        c.for_each_pk_group_row(&5u128.to_be_bytes(), |cur| {
+            seen.push((cur.current_key as u64, cur.current_weight));
+        });
+        // Two sub-groups at PK=5: payload 100 @ +1, payload 200 @ +3 (payload-sorted).
+        assert_eq!(seen, vec![(5, 1), (5, 3)]);
+        // Exit: positioned at PK=10, fully committed.
+        assert!(c.valid);
+        assert_eq!(c.current_key, 10);
+        assert_eq!(c.current_weight, 1);
+    }
+
+    // -- Phase C: Pair (k=2) bypass ≡ Multi --------------------------------
+
+    /// Build a 2-source cursor but FORCE `SourceMode::Multi` (the production
+    /// selector always picks `Pair` at len 2, so there is otherwise no Multi(k=2)
+    /// to compare against). Re-seats each head at the start, builds the loser
+    /// tree, and drives — mirroring `new()`'s Multi arm.
+    fn create_cursor_force_multi(batches: &[Rc<Batch>]) -> ReadCursor {
+        let mut c = create_read_cursor(batches, &[], make_schema_i64());
+        for (src, state) in c.sources.iter().zip(c.states.iter_mut()) {
+            state.position = 0;
+            state.skip_ghosts(src);
+        }
+        c.mode = SourceMode::Multi(
+            ReadCursor::build_tree(&c.sources, &c.states, &c.schema, c.is_pk_unique),
+        );
+        c.drive();
+        c
+    }
+
+    /// Pair (the production k=2 path) must produce output identical to the loser
+    /// tree on the same two sources — full scan and every `advance_to` landing —
+    /// including cross-source ghost folding, same-PK / multi-payload groups, and
+    /// cross-source weight sums.
+    #[test]
+    fn pair_equiv_multi() {
+        type Rows = &'static [(u128, i64, i64)];
+        let cases: &[(Rows, Rows)] = &[
+            (&[(1, 1, 10), (3, 1, 30), (5, 1, 50)], &[(2, 1, 20), (4, 1, 40)]), // interleaved
+            (&[(1, 1, 10), (2, 1, 20)], &[(2, -1, 20), (3, 1, 30)]),            // pk=2 ghost-folds
+            (&[(5, 1, 100)], &[(5, 1, 200)]),                                   // same PK, two payloads
+            (&[(5, 1, 100)], &[(5, -1, 100)]),                                  // same (PK,payload) → ghost
+            (&[(5, 3, 100), (5, 1, 200)], &[(5, -1, 100)]),                     // multi-payload, partial fold
+            (&[(1, 2, 10), (2, 5, 20)], &[(1, 1, 10), (2, 1, 20)]),             // cross-source weight sum
+        ];
+        for (a, b) in cases {
+            let srcs = [make_batch(a), make_batch(b)];
+
+            let mut pair = create_read_cursor(&srcs, &[], make_schema_i64());
+            assert!(matches!(pair.mode, SourceMode::Pair), "production must pick Pair at len 2");
+            let mut multi = create_cursor_force_multi(&srcs);
+            assert!(matches!(multi.mode, SourceMode::Multi(_)));
+            assert_eq!(scan_all(&mut pair), scan_all(&mut multi), "scan a={a:?} b={b:?}");
+
+            // advance_to: each landing (valid, PK bytes, net weight) matches Multi.
+            for key in 0u128..=6 {
+                let mut p = create_read_cursor(&srcs, &[], make_schema_i64());
+                let mut m = create_cursor_force_multi(&srcs);
+                p.advance_to(&key.to_be_bytes());
+                m.advance_to(&key.to_be_bytes());
+                assert_eq!(p.valid, m.valid, "advance_to({key}) valid a={a:?} b={b:?}");
+                if p.valid {
+                    assert_eq!(p.current_pk_bytes(), m.current_pk_bytes(), "advance_to({key}) pk a={a:?} b={b:?}");
+                    assert_eq!(p.current_weight, m.current_weight, "advance_to({key}) weight a={a:?} b={b:?}");
+                }
+            }
+        }
     }
 }

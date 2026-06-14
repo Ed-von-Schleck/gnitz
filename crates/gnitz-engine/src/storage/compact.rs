@@ -7,11 +7,12 @@ use std::ffi::CStr;
 // `$crate::storage::*` paths).
 #[cfg(test)]
 use super::columnar;
-use super::with_payload_cmp;
+use super::columnar::PkOrd;
+use super::{with_payload_cmp, with_pk_ord};
 use super::error::StorageError;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::batch::Batch;
-use super::merge::BlobCacheGuard;
+use super::merge::{BlobCacheGuard, pack_pk_be};
 use super::shard_file::PkUniqueChecker;
 use crate::schema::SchemaDescriptor;
 use super::shard_reader::MappedShard;
@@ -81,18 +82,6 @@ impl ShardCursor {
     fn skip_ghosts(&mut self, shard: &MappedShard) {
         self.position = shard.next_non_ghost(self.position);
     }
-
-    /// Order-preserving sort key for the row at the cursor — the same key the
-    /// flush/merge/read paths use (`pk_sort_key`). Exact for narrow PKs; the
-    /// OPK 16-byte prefix for wide. Returning the raw `get_pk()` (as this did
-    /// before) mis-ordered narrow compound and signed PKs, whose raw-LE order
-    /// diverges from `compare_pk_bytes` — the order the input shards are
-    /// physically written in.
-    #[inline]
-    fn peek_key(&self, shard: &MappedShard) -> u128 {
-        debug_assert!(self.is_valid());
-        super::merge::pk_sort_key(shard.get_pk_bytes(self.position))
-    }
 }
 
 #[cfg(test)]
@@ -111,15 +100,17 @@ fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Open input shards, build cursors and heap, run N-way merge loop.
-/// Calls `emit(key, net_weight, shard, row)` for each non-ghost consolidated row.
+/// Calls `emit(key, net_weight, shard, row)` for each non-ghost consolidated row,
+/// where `key` is the row's `pack_pk_be` guard-routing key — re-derived from its
+/// OPK bytes in the emit, since the keyless heap carries no cached key.
 ///
 /// The payload-aware heap ordering ensures equal (PK, payload) entries appear
 /// consecutively at the heap minimum, so the pending-group drain accumulates
 /// their weights in O(1) per step.
 ///
-/// File I/O lives here (not in `open_and_merge_inner`) so the cursor + heap
-/// loop is the only piece monomorphised across the two comparator
-/// specialisations — no duplicated open/error code in the binary.
+/// File I/O lives here (not in `open_and_merge_inner`) so the cursor + heap loop
+/// is the only piece monomorphised across the payload×stride specialisations —
+/// no duplicated open/error code in the binary.
 fn open_and_merge(
     input_files: &[&CStr],
     schema: &SchemaDescriptor,
@@ -137,115 +128,87 @@ fn open_and_merge(
         .map(|i| ShardCursor::new(&shards[i]))
         .collect();
 
-    // Select the comparator closure set once — never a per-comparison branch
-    // (mirrors `merge.rs`). Wide (`pk_stride > 16`) adds a `compare_pk_bytes`
-    // tiebreak on an OPK-prefix collision; `schema.payload_cmp` selects the
-    // payload-comparator fast path (pre-computed in SchemaDescriptor::new).
-    //
-    // Select the wide vs narrow merge path once, then dispatch the payload
-    // comparator from the pre-computed schema field via `with_payload_cmp!`.
-    if schema.pk_is_wide() {
-        with_payload_cmp!(schema, open_and_merge_wide_with, &shards, cursors, schema, emit)
-    } else {
-        with_payload_cmp!(schema, open_and_merge_narrow_with, &shards, cursors, schema, emit)
-    }
+    // Dispatch the payload comparator (outer) then the stride comparator (inner),
+    // each once — never a per-comparison branch. The old narrow/wide fork is gone:
+    // `pk_ord` compares the full OPK bytes at every width.
+    with_payload_cmp!(schema, open_and_merge_with_payload, &shards, cursors, schema, emit);
     Ok(())
 }
 
-/// Narrow-region (`pk_stride <= 16`) closure builder. The heap key is the
-/// order-preserving `pk_sort_key`, which is injective at narrow stride, so
-/// `less` orders the PK axis with a raw `a.key.cmp(&b.key)` and tie-breaks on
-/// payload; `eq_payload` is payload-only (equal keys ⇒ equal PKs).
+/// Payload-dispatch layer; defers to the stride dispatch in `open_and_merge_pk`.
 #[inline]
-fn open_and_merge_narrow_with<RowCmp>(
+fn open_and_merge_with_payload<RowCmp>(
     shards: &[MappedShard],
     cursors: Vec<ShardCursor>,
     schema: &SchemaDescriptor,
     emit: impl FnMut(u128, i64, &MappedShard, usize),
     row_cmp: RowCmp,
 ) where RowCmp: Fn(&SchemaDescriptor, &MappedShard, usize, &MappedShard, usize) -> std::cmp::Ordering + Copy
+{
+    with_pk_ord!(schema, open_and_merge_pk, shards, cursors, schema, emit, row_cmp)
+}
+
+/// N-way merge closure builder. The keyless heap reads each player's OPK bytes
+/// through `(source_idx, row)`: the stride-dispatched `pk_ord` settles the PK
+/// axis, then the payload `row_cmp`. `same_pk` is the width-agnostic OPK byte
+/// equality (so two distinct wide PKs sharing a 16-byte prefix never fold);
+/// `eq_payload` is the payload term.
+#[inline]
+fn open_and_merge_pk<RowCmp, PK>(
+    shards: &[MappedShard],
+    cursors: Vec<ShardCursor>,
+    schema: &SchemaDescriptor,
+    emit: impl FnMut(u128, i64, &MappedShard, usize),
+    row_cmp: RowCmp,
+    pk_ord: PK,
+) where
+    RowCmp: Fn(&SchemaDescriptor, &MappedShard, usize, &MappedShard, usize) -> std::cmp::Ordering + Copy,
+    PK: PkOrd,
 {
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
     // by `advance`. `source_idx` doubles as the shard index here.
     let less = |a: &HeapNode, b: &HeapNode| -> bool {
-        match a.key.cmp(&b.key) {
+        let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
+        let (b_src, b_row) = (b.source_idx as usize, b.row as usize);
+        match pk_ord.cmp(shards[a_src].get_pk_bytes(a_row), shards[b_src].get_pk_bytes(b_row)) {
             std::cmp::Ordering::Less => true,
             std::cmp::Ordering::Greater => false,
-            std::cmp::Ordering::Equal => row_cmp(schema, &shards[a.source_idx], a.row,
-                                                         &shards[b.source_idx], b.row)
-                == std::cmp::Ordering::Less,
+            std::cmp::Ordering::Equal =>
+                row_cmp(schema, &shards[a_src], a_row, &shards[b_src], b_row) == std::cmp::Ordering::Less,
         }
     };
-    let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-        row_cmp(schema, &shards[a_src], a_row,
-                        &shards[b_src], b_row) == std::cmp::Ordering::Equal
-    };
-    open_and_merge_inner(shards, cursors, schema, emit, less, eq_payload);
-}
-
-/// Wide-region (`pk_stride > 16`) closure builder. `less` settles off the
-/// order-preserving 16-byte OPK prefix (`node.key`) and only pays a
-/// `compare_pk_bytes` column walk on a prefix collision; `eq_payload` adds the
-/// `compare_pk_bytes` term so distinct wide PKs sharing a prefix + payload are
-/// not folded into one summed group. Mirrors `merge.rs::merge_run_wide_with`.
-#[inline]
-fn open_and_merge_wide_with<RowCmp>(
-    shards: &[MappedShard],
-    cursors: Vec<ShardCursor>,
-    schema: &SchemaDescriptor,
-    emit: impl FnMut(u128, i64, &MappedShard, usize),
-    row_cmp: RowCmp,
-) where RowCmp: Fn(&SchemaDescriptor, &MappedShard, usize, &MappedShard, usize) -> std::cmp::Ordering + Copy
-{
-    let less = |a: &HeapNode, b: &HeapNode| -> bool {
-        match a.key.cmp(&b.key) {
-            std::cmp::Ordering::Less => true,
-            std::cmp::Ordering::Greater => false,
-            std::cmp::Ordering::Equal => {
-                match shards[a.source_idx].get_pk_bytes(a.row)
-                    .cmp(shards[b.source_idx].get_pk_bytes(b.row)) {
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Greater => false,
-                    std::cmp::Ordering::Equal => row_cmp(schema, &shards[a.source_idx], a.row,
-                                                                 &shards[b.source_idx], b.row)
-                        == std::cmp::Ordering::Less,
-                }
-            }
-        }
-    };
-    let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+    let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
         shards[a_src].get_pk_bytes(a_row) == shards[b_src].get_pk_bytes(b_row)
-        && row_cmp(schema, &shards[a_src], a_row,
-                           &shards[b_src], b_row) == std::cmp::Ordering::Equal
     };
-    open_and_merge_inner(shards, cursors, schema, emit, less, eq_payload);
+    let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
+        row_cmp(schema, &shards[a_src], a_row, &shards[b_src], b_row) == std::cmp::Ordering::Equal
+    };
+    open_and_merge_inner(shards, cursors, emit, less, same_pk, eq_payload);
 }
 
-/// Inner cursor + tree merge body, monomorphised on the `less` / `eq_payload`
-/// closure set its caller selects per PK width so LLVM inlines a branch-free
-/// hot loop across `LoserTree::build` and the per-row advance loop alike.
+/// Inner cursor + tree merge body, monomorphised on the `less` / `same_pk` /
+/// `eq_payload` closures its caller selects per stride and payload so LLVM
+/// inlines a branch-free hot loop across `LoserTree::build` and the per-row
+/// advance loop alike. The keyless node carries only the row; the guard-routing
+/// `u128` passed to `emit` is re-derived from the group row's OPK bytes via
+/// `pack_pk_be` (= the old cached `group_key`).
 #[inline]
-fn open_and_merge_inner<L, EQ>(
+fn open_and_merge_inner<L, SP, EQ>(
     shards: &[MappedShard],
     mut cursors: Vec<ShardCursor>,
-    _schema: &SchemaDescriptor,
     mut emit: impl FnMut(u128, i64, &MappedShard, usize),
     less: L,
+    same_pk: SP,
     eq_payload: EQ,
 ) where
     L: Fn(&HeapNode, &HeapNode) -> bool + Copy,
+    SP: Fn(usize, usize, usize, usize) -> bool,
     EQ: Fn(usize, usize, usize, usize) -> bool,
 {
     let mut tree = LoserTree::build(
         cursors.len(),
-        |i| {
-            if cursors[i].is_valid() {
-                Some((cursors[i].peek_key(&shards[i]), cursors[i].position))
-            } else {
-                None
-            }
-        },
+        |i| cursors[i].is_valid().then(|| cursors[i].position as u32),
         less,
     );
     drive_merge(
@@ -253,16 +216,13 @@ fn open_and_merge_inner<L, EQ>(
         less,
         |src| {
             cursors[src].advance(&shards[src]);
-            if cursors[src].is_valid() {
-                Some((cursors[src].peek_key(&shards[src]), cursors[src].position))
-            } else {
-                None
-            }
+            cursors[src].is_valid().then(|| cursors[src].position as u32)
         },
+        same_pk,
         eq_payload,
         |src, row| shards[src].get_weight(row),
-        |group_src, group_row, group_key, w| {
-            emit(group_key, w, &shards[group_src], group_row);
+        |group_src, group_row, w| {
+            emit(pack_pk_be(shards[group_src].get_pk_bytes(group_row)), w, &shards[group_src], group_row);
             std::ops::ControlFlow::Continue(())
         },
     );
@@ -362,8 +322,13 @@ pub fn merge_and_route(
         let cpath = std::ffi::CString::new(out_filenames[i].as_str()).unwrap();
         let flags = checkers[i].flags_if(can_tag_pk_unique);
         if let Err(e) = batches[i].write_as_shard_with_flags(&cpath, table_id, flags) {
-            for fname in out_filenames.iter().take(i) {
-                let _ = std::fs::remove_file(fname);
+            // Only guards with rows were written (the loop `continue`s on empty
+            // shards), so only those filenames exist on disk. Removing a path for
+            // an empty guard could `unlink` an unrelated file sharing the name.
+            for (j, fname) in out_filenames.iter().enumerate().take(i) {
+                if batches[j].count > 0 {
+                    let _ = std::fs::remove_file(fname);
+                }
             }
             return Err(e);
         }
@@ -1218,9 +1183,9 @@ mod tests {
 
     /// Regression: a narrow compound `(U64, U64)` PK whose raw-LE u128
     /// order diverges from `compare_pk_bytes`. The input shards are physically
-    /// written in compound order; before the `peek_key → pk_sort_key` fix the
-    /// N-way merge compared raw-LE and produced mis-ordered output plus missed
-    /// cross-shard consolidation.
+    /// written in compound (OPK) order; an N-way merge that compared raw-LE u128
+    /// instead would produce mis-ordered output plus missed cross-shard
+    /// consolidation.
     #[test]
     fn test_compact_narrow_compound_opk_order() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -507,12 +507,9 @@ pub fn op_reduce(
                         // ascending output-PK order, so the probe is monotone →
                         // galloping `advance_to`.
                         ti_cursor.advance_to(group_pk_bytes);
-                        while ti_cursor.valid
-                            && ti_cursor.current_pk_eq(group_pk_bytes)
-                        {
-                            ti_cursor.push_current_row(&mut trace_rows);
-                            ti_cursor.advance();
-                        }
+                        ti_cursor.for_each_pk_group_row(group_pk_bytes, |c| {
+                            c.push_current_row(&mut trace_rows);
+                        });
                     } else if let Some(gi_c) = gi.as_deref_mut() {
                         // The GI key is `[gc(LE) ‖ src_pk(OPK)]`. gc is stored
                         // and probed in the same LE encoding (the GI is only
@@ -530,12 +527,9 @@ pub fn op_reduce(
                             // entries; `seek_group` is an absolute binary search
                             // so a backward re-seek is O(log N) and correct.
                             ti_cursor.seek_group(src_pk_bytes);
-                            while ti_cursor.valid
-                                && ti_cursor.current_pk_eq(src_pk_bytes)
-                            {
-                                ti_cursor.push_current_row(&mut trace_rows);
-                                ti_cursor.advance();
-                            }
+                            ti_cursor.for_each_pk_group_row(src_pk_bytes, |c| {
+                                c.push_current_row(&mut trace_rows);
+                            });
                             gi_c.advance();
                             hit = gi_c.walk_to_positive_with_prefix(&prefix);
                         }

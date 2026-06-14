@@ -149,19 +149,18 @@ pub fn op_join_delta_trace(
     let mut output = Batch::empty_joined(left_schema, right_schema);
 
     cogroup_intersection(consolidated, cursor, |key, range, m| {
-        while m.valid && m.current_pk_eq(key) {
-            let w_trace = m.current_weight;
+        m.for_each_pk_group_row(key, |c| {
+            let w_trace = c.current_weight;
             for i in range.clone() {
                 let w_out = consolidated.get_weight(i).wrapping_mul(w_trace);
                 if w_out != 0 {
                     write_join_row(
-                        &mut output, &delta_mb, i, m, w_out,
+                        &mut output, &delta_mb, i, c, w_out,
                         left_schema, right_schema,
                     );
                 }
             }
-            m.advance();
-        }
+        });
     });
 
     // Trace-major cartesian emission is PK-sorted but NOT (PK, payload)-sorted
@@ -202,20 +201,19 @@ pub fn op_join_delta_trace_outer(
         // record whether any positive-weight trace row exists. A tombstone
         // (weight ≤ 0) still products but does NOT suppress the null-fill.
         let mut matched = false;
-        while m.valid && m.current_pk_eq(key) {
-            let w_trace = m.current_weight;
+        m.for_each_pk_group_row(key, |c| {
+            let w_trace = c.current_weight;
             if w_trace > 0 { matched = true; }
             for i in range.clone() {
                 let w_out = consolidated.get_weight(i).wrapping_mul(w_trace);
                 if w_out != 0 {
                     write_join_row(
-                        &mut output, &delta_mb, i, m, w_out,
+                        &mut output, &delta_mb, i, c, w_out,
                         left_schema, right_schema,
                     );
                 }
             }
-            m.advance();
-        }
+        });
         if !matched {
             for i in range {
                 write_join_row_null_right(
