@@ -15,7 +15,7 @@ Each item below is an independent, unimplemented future change.
     fix for broadcast cost at large `W`; needs partition-boundary metadata +
     rebalancing.
   - **LEFT/OUTER range join**: range-aware anti/semi-join semantics (today INNER
-    only; LEFT + range is rejected).
+    only; LEFT + range is rejected). Extracted to `plans/range-join-left-outer.md`.
   - **Multiple range conjuncts / residual ON predicates**: a post-join `Filter`
     over the normalized output (the operator exists; the 3VL bookkeeping and
     planning surface do not).
