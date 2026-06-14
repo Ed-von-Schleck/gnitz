@@ -258,6 +258,9 @@ mod tests {
     /// match-group rows the callback walked (each with its weight).
     type Triple = (u64, Range<usize>, Vec<(u64, i64)>);
 
+    /// A co-group test case: `(delta_rows, match_rows)`, each `(pk, weight, payload)`.
+    type CoGroupCase = (&'static [(u64, i64, i64)], &'static [(u64, i64, i64)]);
+
     /// Recover a u64 PK from its OPK byte window (unsigned ⇒ OPK == BE).
     fn pk_of(key: &[u8]) -> u64 {
         gnitz_wire::widen_pk_be(key, key.len()) as u64
@@ -354,7 +357,7 @@ mod tests {
     #[test]
     fn intersection_matches_reference_all_shapes() {
         let s = schema();
-        let cases: &[(&[(u64, i64, i64)], &[(u64, i64, i64)])] = &[
+        let cases: &[CoGroupCase] = &[
             // (delta, match)
             (&[], &[(1, 1, 10)]),                                  // empty delta
             (&[(1, 1, 10)], &[]),                                  // empty match
@@ -397,7 +400,7 @@ mod tests {
     #[test]
     fn left_matches_reference_all_shapes() {
         let s = schema();
-        let cases: &[(&[(u64, i64, i64)], &[(u64, i64, i64)])] = &[
+        let cases: &[CoGroupCase] = &[
             (&[], &[(1, 1, 10)]),
             (&[(1, 1, 10)], &[]),                                   // every delta key, empty match
             (&[(1, 1, 10), (3, 1, 30)], &[(2, 1, 20)]),            // match absent for delta keys
@@ -470,7 +473,7 @@ mod tests {
     /// gallop skip over a long run), all-equal, and one-empty-side shapes.
     #[test]
     fn union_emits_every_row_both_sides() {
-        let cases: &[(&[(u64, i64, i64)], &[(u64, i64, i64)])] = &[
+        let cases: &[CoGroupCase] = &[
             (&[(1, 1, 10), (3, 1, 30), (5, 1, 50)], &[(2, 1, 20), (3, 1, 33), (4, 1, 40)]),
             (&[(1, 1, 1)], &[(2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5), (6, 1, 6)]), // tiny ∪ huge
             (&[(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5)], &[(3, 1, 9)]),  // huge ∪ tiny

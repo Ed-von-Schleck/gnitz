@@ -414,6 +414,34 @@ fn pk_cmp_after_key_tie(
     }
 }
 
+/// The full loser-tree order — heap key, then the wide-prefix tie-break
+/// (`pk_cmp_after_key_tie`), then the payload `row_cmp`. The **single** source of
+/// truth for "which head sorts first": the tree build, every `drive`, and the
+/// forward-seek fast path all key the heap through it, so a tree maintained in
+/// place can never order rows differently from how it was built. All-PkUnique
+/// callers pass a trivial `|_, _, _, _, _| Ordering::Equal` (a PK tie ⇒ the same
+/// Z-set element); the wide tie-break still separates a low-16 prefix collision.
+#[inline]
+fn heap_less_with<'a, RowCmp: RowComparator + 'a>(
+    schema: &'a SchemaDescriptor,
+    sources: &'a [CursorSource],
+    row_cmp: RowCmp,
+) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a {
+    move |a, b| match a.key.cmp(&b.key) {
+        Ordering::Less => true,
+        Ordering::Greater => false,
+        Ordering::Equal => match pk_cmp_after_key_tie(schema, sources, a, b) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => row_cmp(
+                schema,
+                &sources[a.source_idx], a.row,
+                &sources[b.source_idx], b.row,
+            ) == Ordering::Less,
+        },
+    }
+}
+
 impl ReadCursor {
     #[inline]
     fn build_tree_with<RowCmp: RowComparator>(
@@ -425,7 +453,8 @@ impl ReadCursor {
         // Heap key is the order-preserving `pk_sort_key` (whole PK for narrow,
         // OPK 16-byte prefix for wide). A differing key settles the order; a key
         // tie falls to a raw OPK-byte compare (implied-equal for narrow,
-        // separating wide low-16 collisions) then the payload tiebreak.
+        // separating wide low-16 collisions) then the payload tiebreak — the
+        // shared `heap_less_with` order the drive and forward-seek paths reuse.
         let init = |i: usize| {
             if states[i].is_valid() {
                 Some((sources[i].get_pk_prefix(states[i].position), states[i].position))
@@ -433,22 +462,7 @@ impl ReadCursor {
                 None
             }
         };
-        let less = move |a: &HeapNode, b: &HeapNode| {
-            match a.key.cmp(&b.key) {
-                Ordering::Less => true,
-                Ordering::Greater => false,
-                Ordering::Equal => match pk_cmp_after_key_tie(schema, sources, a, b) {
-                    Ordering::Less => true,
-                    Ordering::Greater => false,
-                    Ordering::Equal => row_cmp(
-                        schema,
-                        &sources[a.source_idx], a.row,
-                        &sources[b.source_idx], b.row,
-                    ) == Ordering::Less,
-                },
-            }
-        };
-        LoserTree::build(sources.len(), init, less)
+        LoserTree::build(sources.len(), init, heap_less_with(schema, sources, row_cmp))
     }
 
     fn build_tree(
@@ -551,11 +565,125 @@ impl ReadCursor {
     /// non-monotone ones (the unordered `gather_family_bytes` resolve, the
     /// `Lt`/`Le` range reset) stay correct. `key` must be exactly `pk_stride` OPK
     /// bytes.
+    ///
+    /// On a live multi-source cursor a *strictly-forward* seek additionally
+    /// maintains the loser tree in place (`seek_forward_multi`) instead of
+    /// rebuilding it: the dominant access pattern (the co-group / range / reduce
+    /// drivers all repositioning in ascending key order) thus pays one
+    /// `Θ(log num_sources)` walk-up per galloped laggard and **zero** allocation,
+    /// not a from-scratch `Θ(num_sources)` rebuild + its two Vec allocations on
+    /// every step.
     pub fn advance_to(&mut self, key: &[u8]) {
+        // Strictly-forward seek on a live multi-source cursor: maintain the loser
+        // tree in place instead of rebuilding it. The boundary is strict — `key`
+        // must be > the current emitted PK. At `key == current_pk` the lower bound
+        // of `key` can be a row this cursor already consumed (an earlier payload at
+        // the same PK), which a forward gallop cannot reach; that case — and every
+        // backward / exhausted / Single / Empty case — takes the absolute
+        // reposition + rebuild below. `self.valid` is checked first so
+        // `current_pk_cmp_bytes` never reads an unpositioned cursor.
+        if self.valid
+            && matches!(self.mode, SourceMode::Multi(_))
+            && self.current_pk_cmp_bytes(key) == Ordering::Less
+        {
+            self.seek_forward_multi(key);
+            return;
+        }
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
             state.advance_to(src, key);
         }
         self.rebuild_and_drive();
+    }
+
+    /// Gallop the `Multi` loser tree forward to the first head `>= key`, then
+    /// drive the first live group. The gallop keys the heap through the shared
+    /// `heap_less_with` order, so an all-PkUnique cursor passes the trivial
+    /// payload tiebreak while everything else routes the live comparator through
+    /// `with_payload_cmp!`. Precondition (enforced by [`advance_to`]'s dispatch):
+    /// `matches!(self.mode, SourceMode::Multi)` and `key` > the current emitted PK.
+    fn seek_forward_multi(&mut self, key: &[u8]) {
+        if self.is_pk_unique {
+            // A cross-source PK tie ⇒ the same Z-set element, so the payload
+            // tiebreak is trivial — exactly how `build_tree` keys a PkUnique tree.
+            self.gallop_heap_forward(key, |_, _, _, _, _| Ordering::Equal);
+            self.drive_pk_unique();
+        } else {
+            with_payload_cmp!(self.schema, Self::seek_forward_multi_with, self, key);
+        }
+    }
+
+    /// Non-PkUnique forward seek: gallop with the live payload comparator, then
+    /// drive. Split out so `with_payload_cmp!` can hand it the monomorphized
+    /// `row_cmp`.
+    #[inline]
+    fn seek_forward_multi_with<RowCmp: RowComparator>(&mut self, key: &[u8], row_cmp: RowCmp) {
+        self.gallop_heap_forward(key, row_cmp);
+        self.drive_with(row_cmp);
+    }
+
+    /// Maintain the `Multi` loser tree in place while galloping its heads forward
+    /// to `key`, keyed by the shared `heap_less_with(.., row_cmp)` order. Scoping
+    /// the heap/sources/states borrows to this call frees `self` for the caller's
+    /// following `drive`. Precondition: `matches!(self.mode, SourceMode::Multi)`.
+    fn gallop_heap_forward<RowCmp: RowComparator>(&mut self, key: &[u8], row_cmp: RowCmp) {
+        let is_wide = self.schema.pk_is_wide();
+        let heap = match &mut self.mode {
+            SourceMode::Multi(h) => h,
+            _ => unreachable!("gallop_heap_forward requires SourceMode::Multi"),
+        };
+        let less = heap_less_with(&self.schema, &self.sources, row_cmp);
+        Self::seek_phase(heap, &self.sources, &mut self.states, key, is_wide, &less);
+    }
+
+    /// Advance every laggard head (OPK `< key`) to its own `lower_bound(key)`,
+    /// restoring the loser tree with one `replace_top`/`pop_top` per gallop. Only
+    /// the current root is ever a laggard — it is the global min, so once it is
+    /// `>= key` every head is — and each gallop moves that source to `>= key`, so
+    /// the loop touches at most `num_sources` leaves and always terminates. On
+    /// return every head is `>= key`, leaving the tree positioned exactly as a
+    /// from-scratch rebuild at `key` would; the caller's `drive` then folds the
+    /// first live group. `key` is exactly `pk_stride` OPK bytes; `is_wide` is
+    /// `schema.pk_is_wide()`.
+    fn seek_phase(
+        heap: &mut LoserTree,
+        sources: &[CursorSource],
+        states: &mut [CursorState],
+        key: &[u8],
+        is_wide: bool,
+        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
+    ) {
+        // The heap key is the order-preserving `pk_sort_key` (`pack_pk_be`): the
+        // exact whole PK for narrow (`stride <= 16`), the leading-16 OPK prefix for
+        // wide. `target` packs `key` the same way, so `top.cmp(&target)` is the OPK
+        // byte order without a memory load on the common narrow path.
+        let target = pack_pk_be(key);
+        while !heap.is_empty() {
+            let HeapNode { key: top, source_idx: src, row } = *heap.peek();
+            // The root is the global min, so once it reaches `key` every head has:
+            // a greater packed key always positions; an equal one positions unless
+            // a wide prefix tie hides full bytes `< key`. Otherwise the root lags —
+            // fall through and gallop it forward.
+            let positioned = match top.cmp(&target) {
+                Ordering::Greater => true,
+                Ordering::Less => false,
+                Ordering::Equal => {
+                    !is_wide || sources[src].get_pk_bytes(row).cmp(key) != Ordering::Less
+                }
+            };
+            if positioned {
+                break;
+            }
+            states[src].advance_to(&sources[src], key); // gallop this laggard
+            if states[src].is_valid() {
+                heap.replace_top(
+                    sources[src].get_pk_prefix(states[src].position),
+                    states[src].position,
+                    less,
+                );
+            } else {
+                heap.pop_top(less);
+            }
+        }
     }
 
     /// Seek to `key` (exact `pk_stride` OPK bytes) and report whether it landed
@@ -875,23 +1003,12 @@ impl ReadCursor {
         // whole-`self` borrow. We commit the tuple (and fetch `get_null_word`)
         // after it returns.
         //
-        // `node.key` (the order-preserving `pk_sort_key`) settles distinct keys
-        // with no column work; a key tie falls to a raw OPK-byte compare
+        // `less` is the shared `heap_less_with` order: `node.key` settles distinct
+        // keys with no column work, a key tie falls to a raw OPK-byte compare
         // (implied-equal for narrow, separating wide low-16 collisions) then the
         // payload tiebreak. `eq_payload` keeps the byte term so two distinct wide
         // PKs sharing a prefix AND a payload are not folded into one group.
-        let less = |a: &HeapNode, b: &HeapNode| -> bool {
-            match a.key.cmp(&b.key) {
-                Ordering::Less => true,
-                Ordering::Greater => false,
-                Ordering::Equal => match pk_cmp_after_key_tie(schema, sources, a, b) {
-                    Ordering::Less => true,
-                    Ordering::Greater => false,
-                    Ordering::Equal => row_cmp(schema, &sources[a.source_idx], a.row,
-                                               &sources[b.source_idx], b.row) == Ordering::Less,
-                },
-            }
-        };
+        let less = heap_less_with(schema, sources, row_cmp);
         let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
             sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
             && row_cmp(schema, &sources[a_src], a_row,
@@ -1758,10 +1875,39 @@ mod tests {
         }
     }
 
+    /// Drive one reused cursor over `sources` through `probes`, asserting each
+    /// `advance_to` lands exactly where a from-scratch `seek_bytes` on a fresh
+    /// cursor would. The fresh cursor is the oracle for any probe order — a
+    /// strict-forward step (the in-place loser-tree gallop), an `Equal` re-seek
+    /// of the current key, or a backward step (both the rebuild fallback). The
+    /// reused position must never change the landing — including the emitted
+    /// weight, which pins cross-source ghost folding.
+    fn assert_advance_to_matches_seek_oracle(
+        schema: SchemaDescriptor,
+        sources: &[Rc<Batch>],
+        probes: &[u128],
+    ) {
+        let n = sources.len();
+        let mut adv = create_read_cursor(sources, &[], schema);
+        for &key in probes {
+            adv.advance_to(&key.to_be_bytes());
+            let mut fresh = create_read_cursor(sources, &[], schema);
+            fresh.seek_bytes(&key.to_be_bytes());
+            assert_eq!(adv.valid, fresh.valid, "n_src={n} key={key}");
+            if adv.valid {
+                assert_eq!(adv.current_key, fresh.current_key, "n_src={n} key={key}");
+                assert_eq!(adv.current_pk_bytes(), fresh.current_pk_bytes(), "n_src={n} key={key}");
+                assert_eq!(adv.current_weight, fresh.current_weight, "n_src={n} key={key}");
+            }
+        }
+    }
+
     /// `advance_to` (forward-only, position-seeded) lands on the identical row a
     /// from-scratch `seek_bytes` would, across a monotone ascending probe sweep —
-    /// for both a single-source cursor and a multi-source cursor (exercising the
-    /// loser-tree rebuild). The reused position must never change the landing.
+    /// for both a single-source cursor (rebuild fallback) and a multi-source
+    /// cursor (the in-place loser-tree gallop). The sweep also re-seeks the
+    /// current key (probe `20` after landing on `20` from probe `15`), exercising
+    /// the `Equal` rebuild fallback on the same cursor.
     #[test]
     fn advance_to_lands_like_seek_bytes_monotone() {
         let schema = make_schema_i64();
@@ -1769,21 +1915,71 @@ mod tests {
         let b1 = make_batch(&[(20u128, 1, 200), (40, 1, 400), (60, 1, 600)]);
         // Monotone ascending: below-min, present, absent-between, above-max.
         let probes: &[u128] = &[0, 10, 15, 20, 35, 50, 55, 70, 71];
+        assert_advance_to_matches_seek_oracle(schema, &[Rc::clone(&b0)], probes);
+        assert_advance_to_matches_seek_oracle(schema, &[b0, b1], probes);
+    }
 
-        for sources in [vec![Rc::clone(&b0)], vec![Rc::clone(&b0), Rc::clone(&b1)]] {
-            let mut adv = create_read_cursor(&sources, &[], schema);
-            for &key in probes {
-                adv.advance_to(&key.to_be_bytes());
-                // A fresh cursor seeking the same key from scratch is the oracle.
-                let mut fresh = create_read_cursor(&sources, &[], schema);
-                fresh.seek_bytes(&key.to_be_bytes());
-                assert_eq!(adv.valid, fresh.valid, "n_src={} key={key}", sources.len());
-                if adv.valid {
-                    assert_eq!(adv.current_key, fresh.current_key, "key={key}");
-                    assert_eq!(adv.current_pk_bytes(), fresh.current_pk_bytes(), "key={key}");
-                }
-            }
-        }
+    /// A strict-forward seek must skip a source already past the probe key while
+    /// galloping a lagging source up to it — the loser-tree maintenance touches
+    /// only laggards. After emitting `5`, `b_lag`'s head is `30` and `b_ahead`'s
+    /// is `50`; seeking `40` gallops `b_lag` (30 → 90) while leaving `b_ahead`
+    /// (50) untouched, then lands on `50`. The trailing `95` then exhausts the
+    /// last live source (the `pop_top` branch).
+    #[test]
+    fn advance_to_forward_skips_ahead_source() {
+        let schema = make_schema_i64();
+        let b_lag = make_batch(&[(5u128, 1, 50), (30, 1, 300), (90, 1, 900)]);
+        let b_ahead = make_batch(&[(50u128, 1, 500), (60, 1, 600), (70, 1, 700)]);
+        assert_advance_to_matches_seek_oracle(schema, &[b_lag, b_ahead], &[40, 55, 65, 95]);
+    }
+
+    /// Interleaved forward/backward sweep on one reused multi-source cursor: the
+    /// forward steps take the in-place gallop, the backward / current-key steps
+    /// the rebuild fallback. Each landing still matches the from-scratch oracle —
+    /// the fast path must leave the cursor in a state the rebuild can recover.
+    #[test]
+    fn advance_to_interleaved_forward_backward() {
+        let schema = make_schema_i64();
+        let b0 = make_batch(&[(10u128, 1, 100), (30, 1, 300), (50, 1, 500), (70, 1, 700)]);
+        let b1 = make_batch(&[(20u128, 1, 200), (40, 1, 400), (60, 1, 600)]);
+        // up, up, up, BACK, up, BACK, up, BACK.
+        assert_advance_to_matches_seek_oracle(schema, &[b0, b1], &[0, 30, 50, 20, 60, 10, 70, 5]);
+    }
+
+    /// A forward gallop that lands on a ghost group (PK nets to 0 across two runs
+    /// at the seek target) must fold it and land on the first *live* row past it,
+    /// exactly as a from-scratch `seek_bytes` would. Pins the seek-phase /
+    /// ghost-fold handoff.
+    #[test]
+    fn advance_to_forward_lands_past_straddling_ghost() {
+        let schema = make_schema_i64();
+        // PK=200 nets to 0: +1 from b_a, -1 from b_b. Live trace = {10, 20, 400}.
+        let b_a = make_batch(&[(10u128, 1, 100), (200, 1, 2000), (400, 1, 4000)]);
+        let b_b = make_batch(&[(20u128, 1, 200), (200, -1, 2000)]);
+        // After emitting 10, b_a head=200, b_b head=20. Seeking 150 gallops b_b
+        // (20 → 200) past its live row, positions both at the ghost 200, folds it
+        // to zero, and must land on the first live row past it (400).
+        let mut adv = create_read_cursor(&[Rc::clone(&b_a), Rc::clone(&b_b)], &[], schema);
+        adv.advance_to(&(150u128).to_be_bytes());
+        assert!(adv.valid, "must land on a live row past the ghost");
+        assert_eq!(adv.current_key, 400, "ghost 200 must be folded; first live row is 400");
+        assert_eq!(adv.current_weight, 1, "landed row's net weight");
+        // The same landing also matches the from-scratch oracle.
+        assert_advance_to_matches_seek_oracle(schema, &[b_a, b_b], &[150]);
+    }
+
+    /// A source whose `lower_bound(key)` is its end exhausts mid-sweep, forcing
+    /// the seek-phase `pop_top` branch; the remaining source must still merge
+    /// correctly, and a later forward seek over the now-drained heap must
+    /// invalidate cleanly (the fast path no-ops on an empty tree).
+    #[test]
+    fn advance_to_forward_exhausts_source_mid_sweep() {
+        let schema = make_schema_i64();
+        let b_short = make_batch(&[(10u128, 1, 100), (20, 1, 200)]); // max 20
+        let b_long = make_batch(&[(10u128, 1, 100), (50, 1, 500), (90, 1, 900)]);
+        // 40 gallops b_short to its end (pop_top), leaving b_long to emit 50;
+        // 60 → 90; 100 → exhausted (fast path over an empty heap).
+        assert_advance_to_matches_seek_oracle(schema, &[b_short, b_long], &[40, 60, 100]);
     }
 
     #[test]
