@@ -20,6 +20,7 @@ pub use gnitz_wire::{
     FK_INDEX_INFIX, validate_user_identifier,
     index_key_types, PkColList,
     Cut, RangeDescriptor,
+    validate_dist_prefix, pack_table_flags, table_flags_dist_prefix,
 };
 pub use protocol::{
     ProtocolError,

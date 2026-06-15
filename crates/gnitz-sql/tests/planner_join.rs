@@ -520,7 +520,7 @@ fn test_band_left_join_accepts() {
 /// against a one-row `m`. That rides the single pair-PK output exchange like the
 /// inner pairs (no second sequential exchange). The scalar `m` is computed by an
 /// INLINE shard-free reduce over the broadcast `b` — no catalog helpers, no
-/// sentinel. See plans/range-join-left-outer-pure-range.md.
+/// sentinel.
 #[test]
 fn test_pure_range_left_join_accepts() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };

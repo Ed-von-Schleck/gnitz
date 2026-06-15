@@ -177,7 +177,10 @@ impl CatalogEngine {
         }
 
         let directory = table_dir(&self.base_dir, schema_name, table_name, tid);
-        let flags = if unique_pk { TABLETAB_FLAG_UNIQUE_PK } else { 0 };
+        // This in-process test shortcut always builds full-PK-distributed tables
+        // (`k = 0` = default). CLUSTER BY routing is exercised through
+        // `SchemaDescriptor::new_with_dist` and the SQL planner, not here.
+        let flags = gnitz_wire::pack_table_flags(unique_pk, 0);
 
         // Write columns first (table hook reads them via sys_columns)
         self.write_column_records(tid, OWNER_KIND_TABLE, col_defs)?;

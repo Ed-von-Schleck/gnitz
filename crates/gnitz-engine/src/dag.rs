@@ -776,16 +776,20 @@ impl DagEngine {
         }
 
         // SQL planner views feed the shard from a ScanDelta; Python API joins use
-        // ScanTrace. Skip iff that source table's PK is exactly the shard key — a
-        // strict full-PK-sequence match, so a single component of a compound PK is
-        // not co-partitioned.
+        // ScanTrace. Skip iff that source table's distribution prefix
+        // (`pk_indices[..k]`) is exactly the shard key — an exact-prefix match.
+        // For a default full-PK table this is the strict full-PK case as before;
+        // for a `CLUSTER BY prefix` table it also lets an unfiltered
+        // `GROUP BY prefix` / reduce run locally (every row for a group value
+        // already lives on one worker), since this governs every single-source
+        // `ExchangeShard` view, not just joins.
         let tid = match loaded.nodes.get(src_nid) {
             Some(gnitz_wire::OpNode::ScanDelta(t))
             | Some(gnitz_wire::OpNode::ScanTrace(t)) => *t as i64,
             _ => return false,
         };
         self.tables.get(&tid)
-            .is_some_and(|entry| entry.schema.shard_cols_match_pk(&shard_cols))
+            .is_some_and(|entry| entry.schema.shard_cols_match_dist_key(&shard_cols))
     }
 
     /// Ensure a view's plan is compiled. Returns true if compilation succeeded.

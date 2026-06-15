@@ -176,7 +176,11 @@ impl CatalogEngine {
                 let name = self.read_batch_string(batch, i, 1);
                 let pk = unpack_pk_cols(self.read_batch_u64(batch, i, 3));
                 let flags = self.read_batch_u64(batch, i, 5);
-                let is_unique = (flags & TABLETAB_FLAG_UNIQUE_PK) != 0;
+                let is_unique = gnitz_wire::table_flags_unique(flags);
+                // Distribution prefix length k (0 = default = full PK).
+                // `new_with_dist` clamps an out-of-range k, so a crafted flag
+                // cannot index out of bounds.
+                let dist_prefix_len = gnitz_wire::table_flags_dist_prefix(flags);
 
                 let col_defs = self.read_column_defs(tid);
                 if col_defs.is_empty() {
@@ -200,7 +204,7 @@ impl CatalogEngine {
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = table_dir(&self.base_dir, &schema_name, &name, tid);
-                let tbl_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice());
+                let tbl_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice(), dist_prefix_len);
 
                 // One kind drives the whole property bundle: durability and
                 // Pk-unique tagging.
@@ -320,7 +324,10 @@ impl CatalogEngine {
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = view_dir(&self.base_dir, &schema_name, &name, vid);
-                let view_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice());
+                // Views are not distributed by a chosen key (§2): `0` is the
+                // full-PK default sentinel every non-CLUSTER BY caller passes.
+                let view_schema =
+                    self.build_schema_from_col_defs(&col_defs, pk.as_slice(), 0);
 
                 // See hook_table_register: one kind drives the bundle.
                 let kind = RelationKind::View;

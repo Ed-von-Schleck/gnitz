@@ -607,13 +607,15 @@ fn compute_co_partitioned(
             if cols.iter().any(|&(_, tc)| tc != 0) {
                 continue;
             }
-            // Co-partitioned only when the shard key is EXACTLY the source PK in
-            // schema order. One component of a compound PK does not co-partition:
-            // the source is partitioned by the full PK, so sharding by a single
-            // column leaves rows that agree on it (but differ in the rest of the
-            // PK) on different workers.
+            // Co-partitioned only when the shard (= join) key is EXACTLY the
+            // source's distribution prefix in PK order (`pk_indices[..k]`). For a
+            // default full-PK table that is the whole PK; for a `CLUSTER BY prefix`
+            // table it is the leading `k` columns rows are actually hashed by. The
+            // match is EXACT (`cols.len() == k`), never a super-prefix: a
+            // super-prefix skip could route the two join sides at mismatched
+            // widths and silently drop matches (see `shard_cols_match_dist_key`).
             let col_indices: Vec<i32> = cols.iter().map(|&(c, _)| c).collect();
-            if ext.schema.shard_cols_match_pk(&col_indices) {
+            if ext.schema.shard_cols_match_dist_key(&col_indices) {
                 co_partitioned.insert(tid);
             }
         }

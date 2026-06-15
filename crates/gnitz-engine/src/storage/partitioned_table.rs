@@ -130,13 +130,13 @@ impl PartitionedTable {
             }
             part_indices[..np].iter_mut().for_each(Vec::clear);
 
-            // Route every row on its verbatim OPK bytes. For `stride <= 16`,
-            // `partition_for_pk_bytes(bytes)` == `partition_for_key(get_pk(i))`
-            // (since `get_pk = widen_pk_be ∘ get_pk_bytes`), so a single
-            // stride-agnostic loop subsumes the old narrow/wide split — and routes
-            // signed/compound PKs to the same partition every other surface uses.
+            // Route every row by the table's distribution prefix via the shared
+            // `partition_for_pk` (the leading OPK bytes; the full PK for the
+            // default). Ingest, probe (`local_index_bytes`), and the write-side
+            // scatter all funnel through it, so a row lands in the same partition
+            // wherever it is routed.
             for i in 0..mb.count {
-                part_indices[partition_for_pk_bytes(mb.get_pk_bytes(i))].push(i as u32);
+                part_indices[self.schema.partition_for_pk(mb.get_pk_bytes(i))].push(i as u32);
             }
 
             let offset = self.part_offset as usize;
@@ -403,12 +403,18 @@ impl PartitionedTable {
     // Internal
     // ------------------------------------------------------------------
 
-    /// Maps an OPK PK key to this worker's local partition slot. The sole router
-    /// now that the native `u128` path routes through `opk_key` → these bytes;
-    /// `partition_for_pk_bytes` is bit-identical to `partition_for_key` for
-    /// `len <= 16`.
+    /// Maps a full OPK PK key to this worker's local partition slot. The sole
+    /// router now that the native `u128` path routes through `opk_key` → these
+    /// bytes; `partition_for_pk_bytes` is bit-identical to `partition_for_key`
+    /// for `len <= 16`.
+    ///
+    /// `key` is the **full** PK, but partition *selection* goes through
+    /// `schema.partition_for_pk` (hashing only the distribution prefix, exactly as
+    /// ingest does — see its doc) so a probe lands in the partition the row was
+    /// routed to. The in-partition match then keys on the full `key`, so
+    /// prefix-twins coexist in one partition, distinguished by their full PK.
     fn local_index_bytes(&self, key: &[u8]) -> Option<usize> {
-        let p = partition_for_pk_bytes(key) as u32;
+        let p = self.schema.partition_for_pk(key) as u32;
         let local = p.wrapping_sub(self.part_offset) as usize;
         if local < self.tables.len() {
             Some(local)
@@ -586,6 +592,105 @@ mod tests {
 
         let (_, found) = pt.retract_pk(99);
         assert!(!found);
+    }
+
+    /// §4.4 regression: a `CLUSTER BY prefix` table with a compound PK. Two rows
+    /// that share the distribution prefix but differ in the PK suffix
+    /// ("prefix twins") must co-locate, and each must be independently findable
+    /// and retractable. The probe (`local_index_bytes`) slices to the
+    /// distribution prefix exactly as ingest does — without that slice the
+    /// retraction probe would land in the full-key partition and miss the row
+    /// (UPSERT would duplicate the PK, DELETE would be dropped). The chosen twins
+    /// route their full PK to a *different* partition than their prefix, so the
+    /// slice is observably exercised.
+    #[test]
+    fn prefix_distribution_routes_twins_together_and_retracts() {
+        crate::util::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("prefix_twins");
+        // 2×U64 compound PK, CLUSTER BY col0 (k=1, dist_stride=8) + I64 payload.
+        let schema = SchemaDescriptor::new_with_dist(
+            &[
+                SchemaColumn::new(type_code::U64, 0), // col 0 (distribution key)
+                SchemaColumn::new(type_code::U64, 0), // col 1
+                SchemaColumn::new(type_code::I64, 0), // payload
+            ],
+            &[0, 1],
+            1,
+        );
+        assert_eq!(schema.dist_stride(), 8, "CLUSTER BY one U64 column ⇒ 8-byte prefix");
+        // All 256 partitions live so any prefix-routed partition exists locally.
+        let mut pt = PartitionedTable::new(
+            tdir.to_str().unwrap(), "test", schema, 900, 256, Persistence::Ephemeral, 0, 256,
+            partition_arena_size(256),
+        ).unwrap();
+
+        // OPK bytes for (col0, col1): each column big-endian, tightly packed.
+        let pk_bytes = |c0: u64, c1: u64| {
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&c0.to_be_bytes());
+            b[8..].copy_from_slice(&c1.to_be_bytes());
+            b
+        };
+
+        // Find a c0 whose 8-byte prefix routes differently from both full 16-byte
+        // twin keys, so the probe's prefix slice is observably load-bearing.
+        let (c0, twin_a, twin_b) = (1u64..5000)
+            .find_map(|c0| {
+                let pp = partition_for_pk_bytes(&c0.to_be_bytes());
+                let (a, b) = (pk_bytes(c0, 1), pk_bytes(c0, 2));
+                (pp != partition_for_pk_bytes(&a) && pp != partition_for_pk_bytes(&b))
+                    .then_some((c0, a, b))
+            })
+            .expect("a prefix routing differently from its full keys exists");
+        // Both twins share the distribution prefix ⇒ same prefix partition.
+        assert_eq!(
+            partition_for_pk_bytes(&twin_a[..8]), partition_for_pk_bytes(&twin_b[..8]),
+            "prefix twins co-partition on col0",
+        );
+
+        let mut batch = Batch::with_schema(schema, 2);
+        for (pk, val) in [(twin_a, 100i64), (twin_b, 200)] {
+            batch.extend_pk_bytes(&pk);
+            batch.extend_weight(&1i64.to_le_bytes());
+            batch.extend_null_bmp(&0u64.to_le_bytes());
+            batch.extend_col(0, &val.to_le_bytes());
+            batch.count += 1;
+        }
+        batch.sorted = false;
+        batch.consolidated = false;
+        pt.ingest_owned_batch(batch).unwrap();
+
+        // Both twins are found via the prefix-sliced probe; an absent suffix in
+        // the same (populated) prefix-partition is not — the in-partition match
+        // is on the full PK, not the prefix.
+        assert!(pt.has_pk_bytes(&twin_a), "twin A found");
+        assert!(pt.has_pk_bytes(&twin_b), "twin B found");
+        assert!(!pt.has_pk_bytes(&pk_bytes(c0, 999)), "absent suffix not found");
+
+        // `retract_pk_bytes` is the uniqueness/retraction *lookup* (enforce_unique_pk
+        // writes the actual -1 from the found row). It must reach the prefix-
+        // partition the row lives in and surface the matching twin's weight and
+        // payload — not the other twin's. Under the §4.4 bug (probe not sliced to
+        // the prefix) it would route by the full key to a different partition and
+        // miss the row entirely.
+        let read_found_val = |pt: &PartitionedTable| {
+            let p = pt.found_col_ptr(0, 8);
+            assert!(!p.is_null(), "found-row payload pointer is null");
+            i64::from_le_bytes(unsafe { std::slice::from_raw_parts(p, 8) }.try_into().unwrap())
+        };
+        let (wa, fa) = pt.retract_pk_bytes(&twin_a);
+        assert_eq!((wa, fa), (1, true), "twin A found in its prefix-partition");
+        assert_eq!(read_found_val(&pt), 100, "found the correct twin (A), not B");
+
+        let (wb, fb) = pt.retract_pk_bytes(&twin_b);
+        assert_eq!((wb, fb), (1, true), "twin B found in the same prefix-partition");
+        assert_eq!(read_found_val(&pt), 200, "twin B's payload is distinct from A's");
+
+        // An absent suffix routing to the same populated prefix-partition is not
+        // found — confirms the in-partition match keys on the full PK.
+        let (_, found_absent) = pt.retract_pk_bytes(&pk_bytes(c0, 999));
+        assert!(!found_absent, "absent suffix in a populated prefix-partition is not found");
     }
 
     fn make_wide_schema() -> SchemaDescriptor {

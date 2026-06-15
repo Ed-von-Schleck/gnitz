@@ -164,21 +164,11 @@ impl CatalogEngine {
         if !has_unique { return Ok(()); }
 
         let schema = entry.schema;
-        let wide = schema.pk_is_wide();
         let unique_pk = entry.unique_pk();
         let src_pk_stride = schema.pk_stride() as usize;
         // Borrows `batch` (the `&Batch` param), independent of the `&mut self`
         // cache reads below.
         let mb = batch.as_mem_batch();
-
-        // One base-table cursor, reused across every row's UPSERT probe on the
-        // wide path. The narrow `has_pk(u128)` probe is cheaper (memtable bloom
-        // + shard scan, no merge), so narrow keeps it and opens no cursor.
-        let mut base_cursor = if unique_pk && wide {
-            Some(entry.handle.open_cursor())
-        } else {
-            None
-        };
 
         // Any retraction in the batch? Computed once: the per-index `retracted`
         // set is populated only when a retraction exists, so insert-only batches
@@ -293,23 +283,22 @@ impl CatalogEngine {
                 // bare committedness) matches the distributed `existing_pks`: a PK
                 // carrying both a +1 and a -1 (net ≤ 0) has an order-dependent
                 // surviving state under enforce_unique_pk, so both validators
-                // decline to treat it as an upsert. The membership test
-                // short-circuits before the committed probe, so a non-upserted PK
-                // pays no seek.
-                let is_upsert = if !unique_pk
-                    || !upserted_pks.contains(batch.get_pk_bytes(row))
-                {
-                    false
-                } else if wide {
-                    let row_pk_bytes = batch.get_pk_bytes(row);
-                    base_cursor.as_mut().unwrap().cursor.seek_exact_live(row_pk_bytes)
-                } else {
-                    // Verbatim OPK bytes — never `get_pk` (OPK-widened), which
-                    // `has_pk(u128)` re-OPK-encodes (double sign-flip for signed),
-                    // so an existing signed PK would be missed and the UPSERT
-                    // misclassified as a fresh insert.
-                    entry.handle.has_pk_bytes(batch.get_pk_bytes(row))
-                };
+                // decline to treat it as an upsert. `&&` short-circuits, so the
+                // membership test runs before the committed probe and a
+                // non-upserted PK pays no seek.
+                //
+                // Both PK widths probe via `has_pk_bytes` (verbatim OPK bytes —
+                // never `get_pk`, which is OPK-widened and would double-encode a
+                // signed/compound PK, missing the existing row). This routes the
+                // last PK probe through the same distribution-aware
+                // `local_index_bytes` funnel as ingest and retraction — mandatory
+                // under prefix distribution, where the wide cursor's
+                // all-owned-partitions merge would otherwise probe a partition the
+                // row was never routed to — and replaces that merge tree with a
+                // per-row single-partition bloom + XOR8-gated shard scan.
+                let is_upsert = unique_pk
+                    && upserted_pks.contains(batch.get_pk_bytes(row))
+                    && entry.handle.has_pk_bytes(batch.get_pk_bytes(row));
 
                 if !seen.insert(keybuf) {
                     return Err(self.unique_violation_err(table_id, cols, true));

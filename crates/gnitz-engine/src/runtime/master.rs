@@ -31,7 +31,7 @@ use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_CONTINUATION, FLAG_SCAN_LAS
 use gnitz_wire::wire_flags_set_conflict_mode;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
-use crate::storage::{Batch, ConsolidatedBatch, partition_for_pk_bytes, PkBuf};
+use crate::storage::{Batch, ConsolidatedBatch, PkBuf};
 use crate::ops::{
     PartitionRouter, RouteMode, op_relay_broadcast,
     op_repartition_batches_mode, op_relay_scatter_consolidated_mode,
@@ -950,18 +950,22 @@ impl MasterDispatcher {
             (*(*disp_ptr).catalog).get_schema_desc(target_id)
                 .ok_or_else(|| format!("seek: table {target_id} not found"))?
         };
+        // `stride` (full PK width) drives `assemble_wide_pk`'s reassembly; the
+        // shared `partition_for_pk` then selects the worker off the distribution
+        // prefix. A FLAG_SEEK always carries the full PK and the prefix ⊆ the PK,
+        // so a full-PK seek still pins exactly one worker — no broadcast clause.
         let stride = schema.pk_stride() as usize;
         let worker = if schema.pk_is_wide() {
             let full_pk_buf = crate::schema::assemble_wide_pk(&schema, pk, seek_pk_extra, stride)
                 .map_err(|e| format!("seek: table {target_id}: {e}"))?;
-            worker_for_partition(partition_for_pk_bytes(&full_pk_buf[..stride]), num_workers)
+            worker_for_partition(schema.partition_for_pk(&full_pk_buf), num_workers)
         } else {
-            // Narrow path: `pk` is the native seek key, but ingestion routes on
-            // the OPK bytes (partition_for_key(get_pk) == partition_for_pk_bytes(opk)).
-            // Encode native → OPK and route on those bytes; hashing the native
-            // value misroutes signed/compound narrow PKs to the wrong worker.
+            // Narrow path: `pk` is the native seek key, but ingestion routes on the
+            // OPK bytes (partition_for_key(get_pk) == partition_for_pk_bytes(opk)).
+            // Encode native → OPK and route those bytes; hashing the native value
+            // misroutes signed/compound narrow PKs.
             let (opk, _) = crate::storage::opk_key(&schema, pk);
-            worker_for_partition(partition_for_pk_bytes(&opk[..stride]), num_workers)
+            worker_for_partition(schema.partition_for_pk(&opk), num_workers)
         };
         single_worker_async(disp_ptr, reactor, sal_excl, target_id, FLAG_SEEK,
                             worker, pk, 0, "seek", seek_pk_extra).await

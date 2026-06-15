@@ -149,6 +149,19 @@ pub struct SchemaDescriptor {
     /// cached `pk_stride: u8` fields on `MappedShard`/`DirectWriter`/
     /// `MemBatch`; today's worst case is 5 × 16 = 80, well under 255.
     pk_stride: u8,
+    /// Byte width of the **distribution prefix** — the OPK bytes of the first
+    /// `dist_prefix_len` PK columns, the leading slice every write-side
+    /// table-key router (`partition_for_pk_bytes`) hashes to pick a partition.
+    /// Summed alongside `pk_stride` in `new_with_dist`, walking the PK columns
+    /// in PK-list order, so it matches the OPK encoder's tight big-endian layout
+    /// exactly. `dist_stride == pk_stride` for the default (full-PK) distribution,
+    /// making every sliced route byte-identical to today's full-PK routing.
+    dist_stride: u8,
+    /// Distribution prefix length `k`: the number of leading PK columns rows are
+    /// hash-distributed by (`1 ≤ k ≤ pk_count`). Read by
+    /// `shard_cols_match_dist_key` to detect co-partitioned joins / local GROUP
+    /// BY. `k == pk_count` is the default (full-PK) distribution.
+    dist_prefix_len: u8,
     /// payload_mapping[ci] = dense payload index, or PAYLOAD_MAPPING_PK_SENTINEL.
     /// Same encoding as `SortDesc::pi` in `ops/reduce.rs`: PK columns hold the
     /// sentinel, payload columns hold their dense payload slot. Lets call
@@ -203,11 +216,40 @@ impl SchemaDescriptor {
     /// use. Accepts up to `MAX_PK_COLUMNS` entries.
     #[track_caller]
     pub const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
+        // Default distribution = the full PK: today's behavior, byte-for-byte.
+        Self::new_with_dist(cols, pk_indices, pk_indices.len())
+    }
+
+    /// Construct a `SchemaDescriptor` whose hash-distribution key is the leading
+    /// `dist_prefix_len` PK columns (a per-table choice persisted in
+    /// `TABLE_TAB.flags`; see `gnitz_wire::pack_table_flags`). `dist_prefix_len`
+    /// is **normalized**: `0` (the persisted "default" sentinel) and any value
+    /// past `|PK|` (only reachable from a corrupted catalog flag) both clamp to
+    /// the full PK, so `dist_stride == pk_stride` and routing stays byte-identical
+    /// to the full-PK default. Only base-table schemas carry a chosen prefix;
+    /// every derived schema (join/map/reduce/projection output, built via `new`)
+    /// gets the full-PK default and is never table-key-routed.
+    #[track_caller]
+    pub const fn new_with_dist(
+        cols: &[SchemaColumn],
+        pk_indices: &[u32],
+        dist_prefix_len: usize,
+    ) -> Self {
         assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");
         assert!(
             pk_indices.len() <= MAX_PK_COLUMNS,
             "new: pk_indices.len() exceeds MAX_PK_COLUMNS",
         );
+
+        // 0 is the persisted default ("full PK"); a value past |PK| can only
+        // come from a corrupted catalog flag — clamp it rather than index out of
+        // bounds in the `dist_stride` sum below.
+        let dist_k = if dist_prefix_len == 0 || dist_prefix_len > pk_indices.len() {
+            pk_indices.len()
+        } else {
+            dist_prefix_len
+        };
+
         let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
         let mut i = 0;
         while i < cols.len() {
@@ -216,6 +258,7 @@ impl SchemaDescriptor {
         }
         let mut pk_arr = [0u32; MAX_PK_COLUMNS];
         let mut stride_acc: u16 = 0;
+        let mut dist_stride_acc: u16 = 0;
         let mut k = 0;
         while k < pk_indices.len() {
             assert!(
@@ -261,7 +304,14 @@ impl SchemaDescriptor {
                  (compare_pk_bytes has no float ordering)",
             );
             pk_arr[k] = pk_indices[k];
-            stride_acc += cols[pk_indices[k] as usize].size() as u16;
+            let col_size = cols[pk_indices[k] as usize].size() as u16;
+            stride_acc += col_size;
+            // PK-list order with no inter-column padding ⇒ the running sum of the
+            // first `dist_k` PK column widths is exactly the OPK byte width of the
+            // distribution prefix (`columnar::encode_order_preserving_pk` layout).
+            if k < dist_k {
+                dist_stride_acc += col_size;
+            }
             k += 1;
         }
         assert!(
@@ -284,6 +334,8 @@ impl SchemaDescriptor {
             pk_count: pk_indices.len() as u32,
             pk_indices: pk_arr,
             pk_stride,
+            dist_stride: dist_stride_acc as u8,
+            dist_prefix_len: dist_k as u8,
             payload_mapping,
             payload_to_ci,
             payload_cmp,
@@ -328,6 +380,38 @@ impl SchemaDescriptor {
     #[inline]
     pub const fn pk_stride(&self) -> u8 {
         self.pk_stride
+    }
+
+    /// Byte width of the distribution prefix (the leading PK slice that
+    /// `partition_for_pk` hashes); `pk_stride()` for the full-PK default. Prefer
+    /// `partition_for_pk` over reading this and slicing by hand.
+    #[inline]
+    pub const fn dist_stride(&self) -> u8 {
+        self.dist_stride
+    }
+
+    /// The single **table-key router**: maps a row's full OPK PK bytes to a
+    /// partition by hashing only the leading distribution prefix
+    /// (`key[..dist_stride()]`). Every write-side scatter, ingest/probe, and seek
+    /// routes a base-table PK through here, so the "slice to the distribution
+    /// prefix" contract — the load-bearing half of the prefix-distribution feature
+    /// — lives in one place and cannot be forgotten by a new caller. For the
+    /// full-PK default `dist_stride() == pk_stride()`, so this is byte-identical to
+    /// hashing the whole PK. `key` is the full PK (`key.len() >= dist_stride()`).
+    ///
+    /// Not for **join-key** routing: the exchange relay scatters route an already
+    /// reindexed `_join_pk` over a derived schema and call `partition_for_pk_bytes`
+    /// directly (their key is the whole region, never a table prefix).
+    #[inline]
+    pub fn partition_for_pk(&self, key: &[u8]) -> usize {
+        crate::storage::partition_for_pk_bytes(&key[..self.dist_stride() as usize])
+    }
+
+    /// Distribution prefix length `k` — leading PK columns rows are hashed by
+    /// (`k == pk_count` for the full-PK default).
+    #[inline]
+    pub const fn dist_prefix_len(&self) -> u8 {
+        self.dist_prefix_len
     }
 
     /// True iff the PK region is too wide to pack into a `u128` word
@@ -442,19 +526,29 @@ impl SchemaDescriptor {
         cols.len() == pk.len() && pk.iter().all(|p| cols.contains(p))
     }
 
-    /// True iff `cols` is exactly `pk_indices()` in schema order — strict
-    /// sequence equality, in contrast to the set-equality `group_cols_eq_pk`.
-    /// This is the co-partition contract the exchange router enforces
-    /// (`fill_worker_indices` routes by `partition_for_pk_bytes`, which hashes
-    /// the OPK bytes in schema order, only when the shard key is the full source
-    /// PK in that order): a derived operator sharded by the full source PK stays
-    /// co-partitioned with its source, whereas one component of a compound PK —
-    /// or a permuted PK — does not. The DAG/compiler co-partition analyzers carry
-    /// shard columns as `i32`, so this takes `&[i32]`; PK indices are small and
-    /// non-negative, so the per-element compare is exact.
-    pub fn shard_cols_match_pk(&self, cols: &[i32]) -> bool {
+    /// True iff `cols` is **exactly** this table's distribution prefix —
+    /// `pk_indices()[..k]` in PK order, where `k = dist_prefix_len()`. The
+    /// co-partition contract the exchange router enforces (`fill_worker_indices`
+    /// routes by `partition_for_pk_bytes` over the leading `dist_stride` OPK bytes
+    /// in schema order): a reindex/shard key equal to the distribution prefix
+    /// means a derived operator co-partitions with this base table and its
+    /// network exchange can be skipped. For the full-PK default (`k == |PK|`) this
+    /// reduces to "shard key is exactly the source PK in order"; one component of
+    /// a compound PK — or a permuted PK — never matches. The DAG/compiler
+    /// co-partition analyzers carry shard columns as `i32`, so this takes
+    /// `&[i32]`; PK indices are small and non-negative, so the compare is exact.
+    ///
+    /// **Exact `== k`, never a super-prefix (`>= k`)**, and load-bearing: a
+    /// super-prefix gate would let the two sides of a join skip at *different*
+    /// prefix widths, hashing equal join keys to different workers so the elided
+    /// exchange silently drops matches. A side whose join-key length ≠ its own `k`
+    /// instead exchanges and repartitions to the full key, reconverging with the
+    /// other side. (`dist_prefix_len ≤ pk_count`, so `pk[..k]` is in range; the
+    /// `cluster_by_super_prefix_join_safety` E2E test exercises this.)
+    pub fn shard_cols_match_dist_key(&self, cols: &[i32]) -> bool {
+        let k = self.dist_prefix_len() as usize;
         let pk = self.pk_indices();
-        cols.len() == pk.len() && cols.iter().zip(pk).all(|(&c, &p)| c == p as i32)
+        cols.len() == k && cols.iter().zip(&pk[..k]).all(|(&c, &p)| c == p as i32)
     }
 
     /// Byte offset of `col_idx` within the row's PK region. Walks
@@ -1141,6 +1235,91 @@ pub(crate) fn validate_schema_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Distribution prefix (CLUSTER BY) ────────────────────────────────────
+
+    /// 3-column compound PK `(U32, U64, U64)` + one payload, so the columns have
+    /// distinct widths and a prefix stride is unambiguous.
+    fn three_col_pk_schema(dist_k: usize) -> SchemaDescriptor {
+        SchemaDescriptor::new_with_dist(
+            &[
+                SchemaColumn::new(type_code::U32, 0), // col 0: 4 bytes
+                SchemaColumn::new(type_code::U64, 0), // col 1: 8 bytes
+                SchemaColumn::new(type_code::U64, 0), // col 2: 8 bytes
+                SchemaColumn::new(type_code::I64, 0), // payload
+            ],
+            &[0, 1, 2],
+            dist_k,
+        )
+    }
+
+    #[test]
+    fn default_dist_is_full_pk() {
+        // `new` (no clause) and `new_with_dist(.., 0)` and `new_with_dist(.., |PK|)`
+        // all yield dist_stride == pk_stride and dist_prefix_len == pk_count.
+        let pk_stride = 4 + 8 + 8; // U32 + U64 + U64
+        for s in [
+            three_col_pk_schema(0),               // 0 = persisted default sentinel
+            three_col_pk_schema(3),               // explicit full PK
+            SchemaDescriptor::new(                 // bare `new`
+                &[
+                    SchemaColumn::new(type_code::U32, 0),
+                    SchemaColumn::new(type_code::U64, 0),
+                    SchemaColumn::new(type_code::U64, 0),
+                    SchemaColumn::new(type_code::I64, 0),
+                ],
+                &[0, 1, 2],
+            ),
+        ] {
+            assert_eq!(s.pk_stride() as usize, pk_stride);
+            assert_eq!(s.dist_stride(), s.pk_stride(), "default: dist == full PK");
+            assert_eq!(s.dist_prefix_len(), s.pk_indices().len() as u8);
+        }
+    }
+
+    #[test]
+    fn dist_stride_sums_leading_prefix_columns() {
+        // k=1 ⇒ just col 0 (U32 = 4 bytes).
+        let s1 = three_col_pk_schema(1);
+        assert_eq!(s1.dist_prefix_len(), 1);
+        assert_eq!(s1.dist_stride(), 4);
+        // k=2 ⇒ col 0 + col 1 (U32 + U64 = 12 bytes).
+        let s2 = three_col_pk_schema(2);
+        assert_eq!(s2.dist_prefix_len(), 2);
+        assert_eq!(s2.dist_stride(), 12);
+    }
+
+    #[test]
+    fn dist_prefix_clamps_out_of_range() {
+        // A k past |PK| (only reachable from a corrupted catalog flag) clamps to
+        // the full PK rather than overflowing the prefix sum.
+        let s = three_col_pk_schema(99);
+        assert_eq!(s.dist_prefix_len(), 3);
+        assert_eq!(s.dist_stride(), s.pk_stride());
+    }
+
+    #[test]
+    fn shard_cols_match_dist_key_is_exact_prefix() {
+        let k1 = three_col_pk_schema(1); // CLUSTER BY col0
+        // Exact prefix at k=1 matches; the full PK and a super-prefix do not.
+        assert!(k1.shard_cols_match_dist_key(&[0]));
+        assert!(!k1.shard_cols_match_dist_key(&[0, 1]), "super-prefix must NOT match");
+        assert!(!k1.shard_cols_match_dist_key(&[0, 1, 2]));
+        assert!(!k1.shard_cols_match_dist_key(&[1]), "non-leading column");
+        assert!(!k1.shard_cols_match_dist_key(&[]));
+
+        // Default (full-PK) schema: dist key is the whole PK, exactly.
+        let full = three_col_pk_schema(0);
+        assert!(full.shard_cols_match_dist_key(&[0, 1, 2]));
+        assert!(!full.shard_cols_match_dist_key(&[0]), "a single component is not the full key");
+        assert!(!full.shard_cols_match_dist_key(&[0, 1]));
+
+        // k=2 matches exactly [0,1], not [0] and not [0,1,2].
+        let k2 = three_col_pk_schema(2);
+        assert!(k2.shard_cols_match_dist_key(&[0, 1]));
+        assert!(!k2.shard_cols_match_dist_key(&[0]));
+        assert!(!k2.shard_cols_match_dist_key(&[0, 1, 2]));
+    }
 
     fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {
         SchemaDescriptor::new(

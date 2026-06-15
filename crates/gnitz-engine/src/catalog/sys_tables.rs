@@ -40,8 +40,6 @@ pub(super) const CIRCUIT_NODES_TAB_ID: i64        = gnitz_wire::CIRCUIT_NODES_TA
 pub(super) const CIRCUIT_EDGES_TAB_ID: i64        = gnitz_wire::CIRCUIT_EDGES_TAB as i64;
 pub(super) const CIRCUIT_NODE_COLUMNS_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB as i64;
 
-pub(super) const TABLETAB_FLAG_UNIQUE_PK: u64 = 1;
-
 // PK list encoding lives in gnitz-wire so the client and engine cannot
 // drift on the on-disk format. Re-export under the historical paths so
 // existing `pub(super)` callers in this crate keep working unchanged.

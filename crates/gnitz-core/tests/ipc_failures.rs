@@ -188,7 +188,7 @@ fn setup_test_table(sock_path: &str) -> (GnitzClient, u64, Schema) {
     let mut client = GnitzClient::connect(sock_path).unwrap();
     client.create_schema("ipctest").unwrap();
     let cols = three_col().columns;
-    let tid  = client.create_table("ipctest", "t1", &cols, &[0u32], true).unwrap();
+    let tid  = client.create_table("ipctest", "t1", &cols, &[0u32], true, 0).unwrap();
     let schema = Schema { columns: cols, pk_cols: vec![0] };
     (client, tid, schema)
 }

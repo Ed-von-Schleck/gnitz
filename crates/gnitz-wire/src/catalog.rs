@@ -244,6 +244,27 @@ pub fn validate_pk_col_list(cols: &[u32]) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a `CLUSTER BY` column list against the table's PK, returning the
+/// distribution prefix length `k` (`= cols.len()`) when `cols` is exactly the
+/// PK's leading prefix in PK order. The distribution key is constrained to a
+/// **leading PK prefix** so write-side routing is a pure byte-slice of the OPK
+/// region (no gather, no separate packer). No type/null/width re-checks — those
+/// are inherited from the PK validation, since `dist ⊆ pk`. Shared by the SQL
+/// planner (pre-engine `CLUSTER BY` check) so the surface error names PK column
+/// order.
+pub fn validate_dist_prefix(pk: &[u32], cols: &[u32]) -> Result<usize, String> {
+    if cols.is_empty() || cols.len() > pk.len() {
+        return Err(format!(
+            "CLUSTER BY expects 1..={} leading PRIMARY KEY columns, got {}",
+            pk.len(), cols.len()));
+    }
+    if cols != &pk[..cols.len()] {
+        return Err("CLUSTER BY columns must be a leading prefix of the PRIMARY KEY, \
+                    in PK order; reorder the PK so the distribution column(s) lead".into());
+    }
+    Ok(cols.len())
+}
+
 /// Pack a PK column-index list into the persisted `u64` form. Panics on a
 /// violated contract because a silent truncation here corrupts the
 /// catalog encoding; callers (client + engine) must reject out-of-range
@@ -279,6 +300,50 @@ pub fn unpack_pk_cols(packed: u64) -> PkColList {
     PkColList { cols, len: n }
 }
 
+// ---------------------------------------------------------------------------
+// TABLE_TAB.flags layout — the single source of truth shared by the gnitz-core
+// writer and the gnitz-engine reader, so the bit packing cannot drift.
+//
+//   bit 0        unique_pk (TABLE_FLAG_UNIQUE_PK)
+//   bits [1..8)  reserved for future boolean flags
+//   bits [8..16) distribution prefix length k (0 = default = full PK)
+//
+// `k` is byte-aligned (not bit-1-adjacent) so the boolean flag bits [1..8)
+// stay free for future flags without colliding with `k`.
+// ---------------------------------------------------------------------------
+
+/// Bit 0: the table's PK is unique (DML-enforced upsert / dedup). Set for every
+/// SQL-created table.
+pub const TABLE_FLAG_UNIQUE_PK: u64 = 1;
+/// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`.
+pub const TABLE_FLAG_DIST_SHIFT: u32 = 8;
+/// Mask for the distribution-prefix-length byte (one byte: 0..=255). An
+/// explicit prefix is `1..=PK_LIST_MAX_COLS`, well within the byte; the full
+/// byte is deliberate headroom.
+pub const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
+
+/// Pack the persisted `TABLE_TAB.flags` u64 from its logical fields. With
+/// `dist_prefix_len == 0` (the default = full PK) this is byte-identical to the
+/// pre-distribution-key encoding `unique_pk as u64`.
+#[inline]
+pub fn pack_table_flags(unique_pk: bool, dist_prefix_len: usize) -> u64 {
+    (((dist_prefix_len as u64) & TABLE_FLAG_DIST_MASK) << TABLE_FLAG_DIST_SHIFT)
+        | if unique_pk { TABLE_FLAG_UNIQUE_PK } else { 0 }
+}
+
+/// Decode the `unique_pk` bit from `TABLE_TAB.flags`.
+#[inline]
+pub fn table_flags_unique(flags: u64) -> bool {
+    flags & TABLE_FLAG_UNIQUE_PK != 0
+}
+
+/// Decode the distribution prefix length `k` from `TABLE_TAB.flags`. `0` means
+/// "default = full PK"; the schema constructor normalizes that to `k = |PK|`.
+#[inline]
+pub fn table_flags_dist_prefix(flags: u64) -> usize {
+    ((flags >> TABLE_FLAG_DIST_SHIFT) & TABLE_FLAG_DIST_MASK) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +377,43 @@ mod tests {
     #[should_panic(expected = "out of range")]
     fn from_slice_panics_on_empty() {
         let _ = PkColList::from_slice(&[]);
+    }
+
+    #[test]
+    fn validate_dist_prefix_accepts_leading_rejects_rest() {
+        // Exact leading prefixes of PK (0, 1) are accepted, returning k.
+        assert_eq!(validate_dist_prefix(&[0, 1], &[0]), Ok(1));
+        assert_eq!(validate_dist_prefix(&[0, 1], &[0, 1]), Ok(2));
+        // A single-column PK: only the whole PK is a valid prefix.
+        assert_eq!(validate_dist_prefix(&[3], &[3]), Ok(1));
+        // Reordered PK so the distribution column leads: prefix is the new lead.
+        assert_eq!(validate_dist_prefix(&[2, 1], &[2]), Ok(1));
+
+        // Non-leading PK column, non-contiguous-prefix, wrong order, empty, and
+        // over-long lists are all rejected.
+        assert!(validate_dist_prefix(&[0, 1], &[1]).is_err(), "non-leading PK column");
+        assert!(validate_dist_prefix(&[0, 1, 2], &[0, 2]).is_err(), "skips col 1");
+        assert!(validate_dist_prefix(&[0, 1], &[1, 0]).is_err(), "wrong order");
+        assert!(validate_dist_prefix(&[0, 1], &[]).is_err(), "empty");
+        assert!(validate_dist_prefix(&[0, 1], &[0, 1, 2]).is_err(), "longer than PK");
+        assert!(validate_dist_prefix(&[0, 1], &[5]).is_err(), "non-PK column");
+    }
+
+    #[test]
+    fn table_flags_roundtrip() {
+        // Default (k = 0 = full PK) is byte-identical to the old `unique_pk as u64`.
+        assert_eq!(pack_table_flags(false, 0), 0);
+        assert_eq!(pack_table_flags(true, 0), 1);
+        // k rides in byte 1; the unique bit is untouched.
+        for &uniq in &[false, true] {
+            for k in 0..=PK_LIST_MAX_COLS {
+                let f = pack_table_flags(uniq, k);
+                assert_eq!(table_flags_dist_prefix(f), k);
+                assert_eq!(table_flags_unique(f), uniq);
+            }
+        }
+        // The boolean flag bits [1..8) stay clear of the k byte.
+        assert_eq!(pack_table_flags(true, 2) >> TABLE_FLAG_DIST_SHIFT, 2);
+        assert_eq!(pack_table_flags(true, 2) & 0xFE, 0, "bits [1..8) are free");
     }
 }

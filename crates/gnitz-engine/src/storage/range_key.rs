@@ -6,7 +6,7 @@
 //!
 //! `range_cut_points` derives the half-open `[start, end)` byte interval one
 //! range-join term walks over the other side's reindex trace, implementing the
-//! §3 cut-point table of `plans/range-join.md`. It drives off the delta row's
+//! cut-point table for each range relation. It drives off the delta row's
 //! raw OPK PK bytes (eq prefix + range slot) rather than the index scan's
 //! native-`u128` `Cut` values, so the two derivations are not shared — only the
 //! byte successor is.

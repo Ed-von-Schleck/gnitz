@@ -4,7 +4,7 @@ use sqlparser::ast::{
     Statement, ObjectType, ColumnOption, TableConstraint, Query, SetExpr, Expr,
     SelectItem, TableFactor, JoinOperator, JoinConstraint, GroupByExpr,
     SetOperator, SetQuantifier, BinaryOperator,
-    FunctionArguments, FunctionArg, FunctionArgExpr,
+    FunctionArguments, FunctionArg, FunctionArgExpr, WrappedCollection,
 };
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{
@@ -477,7 +477,28 @@ fn execute_create_table(
         }
     }
 
-    let tid = client.create_table(schema_name, &table_name, &cols, &pk_indices, true)
+    // Phase 6 — CLUSTER BY (hash distribution key). The named columns must be the
+    // PK's leading prefix in PK order; the prefix length `k` is persisted in
+    // `TABLE_TAB.flags` and drives write-side routing and co-partition detection.
+    // No clause ⇒ `k = 0` ⇒ default full-PK distribution (byte-identical to before
+    // this feature). `GenericDialect` parses `CLUSTER BY a, b` into `cluster_by`.
+    let dist_prefix_len = if let Some(cluster) = &create.cluster_by {
+        let (WrappedCollection::NoWrapping(idents) | WrappedCollection::Parentheses(idents)) =
+            cluster;
+        let mut cluster_indices: Vec<u32> = Vec::with_capacity(idents.len());
+        for col_ident in idents {
+            let idx = find_unique_column(&cols, &col_ident.value)?
+                .ok_or_else(|| GnitzSqlError::Bind(format!(
+                    "CLUSTER BY column '{}' not found", col_ident.value)))?;
+            cluster_indices.push(idx as u32);
+        }
+        gnitz_core::validate_dist_prefix(&pk_indices, &cluster_indices)
+            .map_err(GnitzSqlError::Plan)?
+    } else {
+        0
+    };
+
+    let tid = client.create_table(schema_name, &table_name, &cols, &pk_indices, true, dist_prefix_len)
         .map_err(GnitzSqlError::Exec)?;
 
     // Unique secondary indices: created after the table exists (create_index
@@ -1334,12 +1355,12 @@ fn execute_create_join_view(
 /// computed two ways by `n_eq`:
 ///   - **Band (`n_eq ≥ 1`):** the Z-set difference `A − distinct(π_A(inner))` (the
 ///     matched left rows are read straight off the inner output) — partition-local
-///     on the eq-scatter (see `plans/range-join-left-outer.md`).
+///     on the eq-scatter.
 ///   - **Pure range (`n_eq == 0`):** match existence collapses to a threshold test
 ///     `a.x OP MAX/MIN(b.range_col)`, so the null-fill is the subtraction
 ///     `A − (A ⋈ {m})` against the one-row threshold `m`, computed by an INLINE
 ///     shard-free reduce over the broadcast ΔB — no catalog helpers, no sentinel,
-///     no `distinct` (see `plans/range-join-left-outer-pure-range.md`).
+///     no `distinct`.
 ///
 /// Both ride the single pair-PK output exchange.
 #[allow(clippy::too_many_arguments)]

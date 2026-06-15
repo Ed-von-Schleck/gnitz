@@ -324,8 +324,13 @@ fn fill_worker_indices(
     // width (it calls `widen_pk_be`), so narrow PKs take it too.
     let is_pk_routing = col_indices == schema.pk_indices();
     if is_pk_routing {
+        // Write-side table-key scatter: `partition_for_pk` hashes the table's
+        // distribution prefix, exactly as `PartitionedTable` ingest/probe do, so a
+        // row's DML scatter lands on the worker that owns its partition. The
+        // join-relay scatters route by the *join* key over a derived schema and
+        // call `partition_for_pk_bytes` directly (see `op_repartition_batches_mode`).
         for i in 0..batch.count {
-            let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
+            let partition = schema.partition_for_pk(mb.get_pk_bytes(i));
             out[w_map[partition]].push(i as u32);
         }
     } else {
@@ -888,8 +893,9 @@ pub fn op_multi_scatter(
             let spec = col_specs[si];
             let is_pk_routing = spec == schema.pk_indices();
             if is_pk_routing {
+                // Distribution-prefix route, exactly as `fill_worker_indices`.
                 for i in 0..n {
-                    let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
+                    let partition = schema.partition_for_pk(mb.get_pk_bytes(i));
                     flat_indices[si * num_workers + w_map[partition]].push(i as u32);
                 }
             } else {

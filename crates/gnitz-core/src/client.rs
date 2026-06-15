@@ -483,6 +483,11 @@ impl GnitzClient {
         Ok(())
     }
 
+    /// `dist_prefix_len` is the hash-distribution prefix length `k`: rows are
+    /// partitioned by the first `k` PK columns (`CLUSTER BY` the PK's leading
+    /// prefix). `0` means the default — distribute by the full PK, byte-identical
+    /// to the pre-distribution-key behavior. The SQL planner validates `k` against
+    /// the PK before calling this; the single-PK Python/test surfaces pass `0`.
     pub fn create_table(
         &mut self,
         schema_name: &str,
@@ -490,6 +495,7 @@ impl GnitzClient {
         columns: &[ColumnDef],
         pk_cols: &[u32],
         unique_pk: bool,
+        dist_prefix_len: usize,
     ) -> Result<u64, ClientError> {
         if !(1..=gnitz_wire::PK_LIST_MAX_COLS).contains(&pk_cols.len()) {
             return Err(ClientError::ServerError(format!(
@@ -525,7 +531,7 @@ impl GnitzClient {
             .str_val("")
             .u64_val(pk_packed)
             .u64_val(0)
-            .u64_val(unique_pk as u64);
+            .u64_val(gnitz_wire::pack_table_flags(unique_pk, dist_prefix_len));
         self.conn.push(TABLE_TAB, tbl_schema, &tb, &mut self.schema_cache)?;
 
         Ok(new_tid)

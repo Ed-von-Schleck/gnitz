@@ -620,7 +620,8 @@ pub unsafe extern "C" fn gnitz_create_table(
     let pk_slice: Vec<u32> = s.0.pk_cols.iter().map(|&c| c as u32).collect();
     match c.0.create_table(
         cstr(schema_name), cstr(table_name),
-        &s.0.columns, &pk_slice, unique_pk != 0,
+        // `0` = default full-PK distribution; the C API has no CLUSTER BY surface.
+        &s.0.columns, &pk_slice, unique_pk != 0, 0,
     ) {
         Ok(id) => id, Err(e) => { set_error(e); 0 }
     }

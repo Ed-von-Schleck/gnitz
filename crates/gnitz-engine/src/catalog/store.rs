@@ -1624,7 +1624,13 @@ impl CatalogEngine {
         self.scan_column_defs(owner_id, false).unwrap()
     }
 
-    pub(crate) fn build_schema_from_col_defs(&self, col_defs: &[ColumnDef], pk_cols: &[u32]) -> SchemaDescriptor {
+    /// `dist_prefix_len` is the persisted distribution prefix length `k`
+    /// (`0` = default = full PK; clamped by `new_with_dist`). The table-register
+    /// path passes the decoded `k`; the view path passes the full-PK default
+    /// (views are not distributed by a chosen key).
+    pub(crate) fn build_schema_from_col_defs(
+        &self, col_defs: &[ColumnDef], pk_cols: &[u32], dist_prefix_len: usize,
+    ) -> SchemaDescriptor {
         assert!(
             col_defs.len() <= crate::schema::MAX_COLUMNS,
             "build_schema_from_col_defs: too many columns ({}) for entity (type_codes: {:?})",
@@ -1635,7 +1641,7 @@ impl CatalogEngine {
         for (i, cd) in col_defs.iter().enumerate() {
             cols[i] = SchemaColumn::new(cd.type_code, if cd.is_nullable { 1 } else { 0 });
         }
-        SchemaDescriptor::new(&cols[..col_defs.len()], pk_cols)
+        SchemaDescriptor::new_with_dist(&cols[..col_defs.len()], pk_cols, dist_prefix_len)
     }
 
     // -- FK constraint queries ---------------------------------------------

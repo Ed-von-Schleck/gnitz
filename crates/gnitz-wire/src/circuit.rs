@@ -135,8 +135,8 @@ pub enum AggKind {
 
 /// The relation a **trace** slot must satisfy versus the **delta** slot in a
 /// range-join probe (`{ trace_slot REL delta_slot }`). Canonicalized from the ON
-/// clause's `L.x OP R.y` per the §3 table of `plans/range-join.md`: term AB's
-/// rel is the converse of OP, term BA's rel is OP itself. Wire values are stable.
+/// clause's `L.x OP R.y`: term AB's rel is the converse of OP, term BA's rel is
+/// OP itself. Wire values are stable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum RangeRel { Lt = 0, Le = 1, Gt = 2, Ge = 3 }
