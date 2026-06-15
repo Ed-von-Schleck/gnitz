@@ -740,8 +740,9 @@ impl DagEngine {
     }
 
     /// True iff the view's output `ExchangeShard` is a no-op (every row already on
-    /// its PK-owner) and can be skipped: the shard reads from a bare scan whose PK
-    /// is the shard key. Collapses the former `ExchangeInfo { is_trivial,
+    /// the worker owning its distribution key) and can be skipped: the shard reads
+    /// a scan — through any Filter chain — whose distribution prefix is the shard
+    /// key. Collapses the former `ExchangeInfo { is_trivial,
     /// is_co_partitioned }` — whose sole reader ANDed both fields — into the one
     /// bit they encoded, making the impossible `{ is_trivial: false,
     /// is_co_partitioned: true }` state unrepresentable.
@@ -764,29 +765,16 @@ impl DagEngine {
             _ => None,
         }) else { return false };
 
-        // The shard's sole input must be a bare scan: exactly one incoming edge,
-        // from a node that itself has none.
-        let incoming: Vec<i32> = loaded.edges.iter()
-            .filter(|&&(_, dst, _)| dst == enid)
-            .map(|&(src, _, _)| src)
-            .collect();
-        let [src_nid] = incoming.as_slice() else { return false };
-        if loaded.edges.iter().any(|&(_, dst, _)| dst == *src_nid) {
-            return false;
-        }
-
-        // SQL planner views feed the shard from a ScanDelta; Python API joins use
-        // ScanTrace. Skip iff that source table's distribution prefix
-        // (`pk_indices[..k]`) is exactly the shard key — an exact-prefix match.
-        // For a default full-PK table this is the strict full-PK case as before;
-        // for a `CLUSTER BY prefix` table it also lets an unfiltered
-        // `GROUP BY prefix` / reduce run locally (every row for a group value
-        // already lives on one worker), since this governs every single-source
+        // Resolve the shard's source table, walking back through any Filter chain
+        // (`scan_tid_through_filters`). Skip iff that table's distribution prefix
+        // (`pk_indices[..k]`) is exactly the shard key — an exact-prefix match. For
+        // a default full-PK table this is the strict full-PK case as before; for a
+        // `CLUSTER BY prefix` table it also lets a (possibly filtered)
+        // `GROUP BY prefix` / reduce run locally — every row for a group value
+        // already lives on one worker — since this governs every single-source
         // `ExchangeShard` view, not just joins.
-        let tid = match loaded.nodes.get(src_nid) {
-            Some(gnitz_wire::OpNode::ScanDelta(t))
-            | Some(gnitz_wire::OpNode::ScanTrace(t)) => *t as i64,
-            _ => return false,
+        let Some(tid) = crate::compiler::scan_tid_through_filters(&loaded, enid) else {
+            return false;
         };
         self.tables.get(&tid)
             .is_some_and(|entry| entry.schema.shard_cols_match_dist_key(&shard_cols))
@@ -1234,8 +1222,9 @@ impl DagEngine {
     ///
     /// Near-copy of `evaluate_dag()` with these critical differences:
     /// 1. Exchange views: call `exchange.do_exchange()` between pre and post
-    ///    phases — unless `view_skips_exchange` (the shard reads a bare scan
-    ///    whose PK is already the shard key, so the shuffle is a no-op).
+    ///    phases — unless `view_skips_exchange` (the shard reads a scan, through
+    ///    any Filter chain, whose distribution prefix is already the shard key,
+    ///    so the shuffle is a no-op).
     /// 2. Join shard exchange: when `get_join_shard_cols` is non-empty AND NOT
     ///    `plan_source_co_partitioned`, call exchange before execute_epoch.
     /// 3. Always queue downstream views even when output is empty (ensures

@@ -560,6 +560,35 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
     seqs.into_iter().flatten().collect()
 }
 
+/// Walk back from an `ExchangeShard` (`enid`) through `Filter` nodes to the source
+/// scan (`ScanDelta` for SQL planner views, `ScanTrace` for Python API joins),
+/// returning its table id — or `None` on a fan-in (≠ 1 incoming edge) or any
+/// non-`Filter`, non-scan node. `Filter` is the only operator transparent to the
+/// shard key: row-selective, never re-keys the PK region, never moves a row
+/// off-worker; Map/Reduce/Distinct/join change the key or its distribution, and a
+/// `PartitionFilter` (range-join broadcast input) is not a `Filter` either. The
+/// backward dual of `reindex_cols_through_filters`, reading the same `loaded.incoming`
+/// adjacency as `ancestors_inclusive` / `exchange_input_node`. The chain is acyclic
+/// and each hop has exactly one incoming edge, so it terminates without a visited
+/// guard.
+pub(crate) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Option<i64> {
+    let mut cur = enid;
+    loop {
+        let ins = loaded.incoming.get(&cur)?;
+        // Bail on a fan-in (≠ 1 incoming edge): a multi-input node (Union, set op)
+        // draws from more than one source, so no single table's distribution prefix
+        // governs the shard key and it can never co-partition. (0 edges = root.)
+        if ins.len() != 1 { return None; }
+        let src_nid = ins[0].0;
+        match loaded.nodes.get(&src_nid) {
+            Some(gnitz_wire::OpNode::ScanDelta(t))
+            | Some(gnitz_wire::OpNode::ScanTrace(t)) => return Some(*t as i64),
+            Some(gnitz_wire::OpNode::Filter(_)) => cur = src_nid,
+            _ => return None,
+        }
+    }
+}
+
 /// The equality-conjunct count `n_eq` of a non-equi (range / band) join, or
 /// `None` if the loaded meta-circuit is not one — read straight off its
 /// `Join(DeltaTraceRange { n_eq, .. })` node (both bilinear terms carry the same
@@ -3536,6 +3565,20 @@ mod tests {
         lc
     }
 
+    /// A minimal but structurally valid serialized expr-program blob for tests
+    /// that need a `Map(Expression { program, .. })` or `Filter(Some(..))` to
+    /// exist without ever executing it: magic `GNIT`, version 1, zero-length
+    /// code, no constants.
+    fn dummy_expr_blob() -> Vec<u8> {
+        vec![
+            0x47, 0x4e, 0x49, 0x54, // magic "GNIT"
+            0x01, // version
+            0, 0, 0, 0, 0, // reserved
+            0, 0, 0, 0, // code_len = 0
+            0, // nconst = 0
+        ]
+    }
+
     fn empty_rw() -> Rewrites {
         Rewrites {
             skip_nodes:    HashSet::new(),
@@ -3742,13 +3785,7 @@ mod tests {
         // Minimal two-sided SQL join circuit skeleton:
         //   ScanDelta(left_tid=10) → Map(reindex_col=1) → Join → IntegrateSink
         //   ScanDelta(right_tid=20) → Map(reindex_col=0) → Join
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, // magic
-            0x01,                   // version
-            0, 0, 0, 0, 0,          // reserved
-            0, 0, 0, 0,             // code_len = 0
-            0,                      // nconst = 0
-        ];
+        let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
         nodes.insert(0, OpNode::ScanDelta(10));
         nodes.insert(1, OpNode::Map(MapKind::Expression {
@@ -3793,9 +3830,7 @@ mod tests {
         // ScanDelta(42) → Filter → Map(reindex_col=1) → Join → IntegrateSink.
         // The reindex Map is two hops from the scan (a Filter sits between),
         // so the one-hop lookup misses it; BFS through Filter must find it.
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
         nodes.insert(0, OpNode::ScanDelta(42));
         nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
@@ -3829,9 +3864,7 @@ mod tests {
     #[test]
     fn test_circuit_range_join_n_eq_discriminator() {
         use gnitz_wire::{AggKind, JoinKind, MapKind, OpNode};
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let dummy_blob = dummy_expr_blob();
 
         // A GROUP BY view: ScanDelta → Map(reindex) → ExchangeShard → Reduce →
         // IntegrateSink. It has BOTH a reindex Map (has_join_shard) AND an
@@ -3873,9 +3906,7 @@ mod tests {
         // where a Join node IS present (is_join_view == true) and the reindex feeds
         // it directly, is covered by
         // test_reindex_cols_through_filters_range_join_feeds_join_directly.
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
         nodes.insert(0, OpNode::ScanDelta(99));
         nodes.insert(1, OpNode::Map(MapKind::Expression {
@@ -3907,9 +3938,7 @@ mod tests {
     #[test]
     fn test_reindex_cols_through_filters_range_join_feeds_join_directly() {
         use gnitz_wire::{JoinKind, MapKind, OpNode};
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let dummy_blob = dummy_expr_blob();
         // ScanDelta(99) ─► Map(reindex=[2]) ─┬─► Join(DeltaTraceRange)  [delta, PORT_IN_A]
         //                                     └─► PartitionFilter ─► IntegrateTrace ─► Join  [PORT_TRACE]
         let mut nodes = HashMap::new();
@@ -3940,9 +3969,7 @@ mod tests {
     #[test]
     fn test_reindex_col_through_filters_trivial_and_absent() {
         use gnitz_wire::{MapKind, OpNode};
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let dummy_blob = dummy_expr_blob();
         // Trivial: ScanDelta → Map(reindex) directly (no Filter).
         let mut nodes = HashMap::new();
         nodes.insert(0, OpNode::ScanDelta(7));
@@ -3971,9 +3998,7 @@ mod tests {
     #[test]
     fn test_reindex_cols_through_filters_multi_join() {
         use gnitz_wire::{MapKind, OpNode};
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let dummy_blob = dummy_expr_blob();
         // ScanDelta(0) ──► Map(reindex_col=2)
         //              └──► Filter ──► Map(reindex_col=5)
         let mut nodes = HashMap::new();
@@ -4003,9 +4028,7 @@ mod tests {
     #[test]
     fn test_reindex_cols_through_filters_overlapping_key_verbatim() {
         use gnitz_wire::{MapKind, OpNode};
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
         nodes.insert(0, OpNode::ScanDelta(42));
         nodes.insert(1, OpNode::Map(MapKind::Expression {
@@ -4026,9 +4049,7 @@ mod tests {
     #[test]
     fn test_reindex_cols_through_filters_sibling_maps_collapse() {
         use gnitz_wire::{MapKind, OpNode};
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let dummy_blob = dummy_expr_blob();
         // ScanDelta(7) ──► Filter(not-null) ──► Map(reindex [2])
         //              └──► Filter(is-null)  ──► Map(reindex [2])  (identical seq)
         let mut nodes = HashMap::new();
@@ -4058,9 +4079,7 @@ mod tests {
     #[test]
     fn test_reindex_cols_through_filters_ignores_aux_rekey_in_join_view() {
         use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel};
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let dummy_blob = dummy_expr_blob();
         // ScanDelta(10) ──► Map(reindex [1,2]) ──► Join(DeltaTraceRange)
         //              │                       └─► IntegrateTrace
         //              └──► Map(reindex [0]) ──► Map(Projection) ──► Distinct   (a_all → proj_a → D)
@@ -4090,9 +4109,7 @@ mod tests {
     fn test_compute_join_shard_map_scan_trace_unchanged() {
         use gnitz_wire::{MapKind, OpNode};
 
-        let dummy_blob: Vec<u8> = vec![
-            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
+        let dummy_blob = dummy_expr_blob();
         let mut nodes = HashMap::new();
         nodes.insert(0, OpNode::ScanDelta(10));
         nodes.insert(1, OpNode::ScanTrace(20));
@@ -4124,6 +4141,112 @@ mod tests {
             !map.contains_key(&20),
             "ScanTrace-only source with no reindex Map must not be in join_shard_map"
         );
+    }
+
+    // ── scan_tid_through_filters: the backward (shard → scan) Filter walk ───────
+    //
+    // The view exchange-skip detector's source resolution. The skip itself has no
+    // observable "fired" signal at the E2E layer (exchanging is also correct), so
+    // these unit tests are what pin that the walk engages exactly when it should:
+    // through Filter chains, never across a re-keying Map / PartitionFilter / fan-in.
+
+    /// `ScanDelta → Filter → ExchangeShard` (filtered `GROUP BY prefix`) resolves to
+    /// the source tid; a chain of Filters and a `ScanTrace` source resolve too.
+    #[test]
+    fn test_scan_tid_through_filters_filter_chain() {
+        use gnitz_wire::OpNode;
+        let dummy_blob = dummy_expr_blob();
+        // ScanDelta(7) → Filter → ExchangeShard.
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
+        nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
+        let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
+        assert_eq!(scan_tid_through_filters(&loaded, 2), Some(7),
+            "one Filter between scan and shard is transparent to the shard key");
+
+        // ScanTrace(8) → Filter → Filter → ExchangeShard.
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanTrace(8));
+        nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
+        nodes.insert(2, OpNode::Filter(Some(dummy_blob)));
+        nodes.insert(3, OpNode::ExchangeShard { shard_cols: vec![0] });
+        let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN)]);
+        assert_eq!(scan_tid_through_filters(&loaded, 3), Some(8),
+            "a chain of Filters is transparent, and ScanTrace sources resolve too");
+    }
+
+    /// A re-keying `Map` rewrites the PK region, so the walk must bail there — even
+    /// with a Filter below it (the DISTINCT / set-op `HashRow` reindex shape).
+    #[test]
+    fn test_scan_tid_through_filters_stops_at_map() {
+        use gnitz_wire::{MapKind, OpNode};
+        let dummy_blob = dummy_expr_blob();
+        // ScanDelta(7) → Map(reindex) → ExchangeShard.
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(1, OpNode::Map(MapKind::Expression {
+            program: dummy_blob.clone(), reindex_cols: vec![2], reindex_target_tcs: vec![],
+        }));
+        nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
+        let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
+        assert_eq!(scan_tid_through_filters(&loaded, 2), None,
+            "a reindex Map re-keys the PK; the walk must bail rather than cross it");
+
+        // ScanDelta(7) → Map(reindex) → Filter → ExchangeShard: a Filter below the
+        // Map does not rescue it — the walk still reaches the Map and bails.
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(1, OpNode::Map(MapKind::Expression {
+            program: dummy_blob.clone(), reindex_cols: vec![2], reindex_target_tcs: vec![],
+        }));
+        nodes.insert(2, OpNode::Filter(Some(dummy_blob)));
+        nodes.insert(3, OpNode::ExchangeShard { shard_cols: vec![0] });
+        let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN)]);
+        assert_eq!(scan_tid_through_filters(&loaded, 3), None,
+            "a Filter below a reindex Map does not make the Map transparent");
+    }
+
+    /// A `PartitionFilter` (range-join broadcast input) is a distinct OpNode variant,
+    /// not a `Filter`, so it is never crossed — the same exclusion
+    /// `reindex_cols_through_filters` makes on the forward walk.
+    #[test]
+    fn test_scan_tid_through_filters_partition_filter() {
+        use gnitz_wire::OpNode;
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(1, OpNode::PartitionFilter);
+        nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
+        let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
+        assert_eq!(scan_tid_through_filters(&loaded, 2), None,
+            "PartitionFilter is not a Filter; the walk must bail");
+    }
+
+    /// A fan-in (≠ 1 incoming edge) is not a linear chain — bail. Tested at the shard
+    /// itself (two scans feeding it) and one hop in (two scans feeding a Filter).
+    #[test]
+    fn test_scan_tid_through_filters_fan_in() {
+        use gnitz_wire::OpNode;
+        let dummy_blob = dummy_expr_blob();
+        // Two scans feed the ExchangeShard directly (set-op-like fan-in).
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(1, OpNode::ScanDelta(8));
+        nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
+        let loaded = make_loaded(nodes, vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)]);
+        assert_eq!(scan_tid_through_filters(&loaded, 2), None,
+            "a shard with two incoming edges is a fan-in, not a linear chain");
+
+        // Fan-in one hop in: two scans feed a Filter that feeds the shard. The shard
+        // has one incoming edge, but the Filter has two — bail at the Filter.
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(1, OpNode::ScanDelta(8));
+        nodes.insert(2, OpNode::Filter(Some(dummy_blob)));
+        nodes.insert(3, OpNode::ExchangeShard { shard_cols: vec![0] });
+        let loaded = make_loaded(nodes, vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B), (2, 3, PORT_IN)]);
+        assert_eq!(scan_tid_through_filters(&loaded, 3), None,
+            "a fan-in at an intervening Filter also bails (the Filter has two incoming edges)");
     }
 
     // ── Finding 1: ExchangeGather must forward its output to exchange-input reg ──

@@ -198,6 +198,55 @@ fn cluster_by_group_by_prefix_multiworker() {
     );
 }
 
+// ── Filtered GROUP BY the distribution prefix still runs locally ─────────────
+
+// Filtered GROUP BY on the distribution prefix: a `Filter` between the scan and
+// the `ExchangeShard` (`SELECT a … WHERE v >= 30 GROUP BY a`) no longer breaks the
+// exchange-skip detector. A Filter is row-selective and never moves a row off its
+// worker, so `GROUP BY a` (the distribution prefix) co-partitions exactly as the
+// unfiltered case does. The skip is invisible at this layer (exchanging is also
+// correct), so this asserts the *engaged* skip stays correct under W=4: a skip that
+// wrongly fired would drop the surviving filtered rows on some worker. `GROUP BY b`
+// (a non-prefix column) + the same WHERE must still exchange and stay correct.
+#[test]
+fn cluster_by_filtered_group_by_prefix_multiworker() {
+    let srv = match ServerHandle::start_n(4) { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn,
+        "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, v BIGINT NOT NULL, \
+         PRIMARY KEY (a, b)) CLUSTER BY a");
+    // GROUP BY a (= distribution prefix) with a WHERE: the planner emits a
+    // ScanDelta → Filter → ExchangeShard chain that the relaxed detector now walks
+    // through, skipping the shuffle. Created before the data (live backfill of an
+    // exchange-requiring view on a multi-worker server in one session is a separate,
+    // unsupported path), so it materializes incrementally tick by tick.
+    exec(&mut client, &sn,
+        "CREATE VIEW gf_pre AS SELECT a AS ka, COUNT(*) AS n, SUM(v) AS s \
+         FROM t WHERE v >= 30 GROUP BY a");
+    // GROUP BY b (a non-leading PK column, not the distribution key) with the same
+    // WHERE: still exchanges, since b is not the distribution prefix.
+    exec(&mut client, &sn,
+        "CREATE VIEW gf_other AS SELECT b AS kb, COUNT(*) AS n, SUM(v) AS s \
+         FROM t WHERE v >= 30 GROUP BY b");
+
+    exec(&mut client, &sn,
+        "INSERT INTO t (a, b, v) VALUES \
+         (1, 1, 10), (1, 2, 20), (1, 3, 30), (2, 1, 40), (2, 2, 50), (3, 1, 60)");
+
+    // WHERE v >= 30 keeps (1,3,30), (2,1,40), (2,2,50), (3,1,60).
+    assert_eq!(
+        payload_rows(&mut client, &sn, "gf_pre", &["ka", "n", "s"]),
+        vec![vec![1, 1, 30], vec![2, 2, 90], vec![3, 1, 60]],
+        "filtered GROUP BY the distribution prefix co-partitions and aggregates \
+         only the surviving rows correctly under W=4",
+    );
+    assert_eq!(
+        payload_rows(&mut client, &sn, "gf_other", &["kb", "n", "s"]),
+        vec![vec![1, 2, 100], vec![2, 1, 50], vec![3, 1, 30]],
+        "filtered GROUP BY a non-prefix column still exchanges and stays correct",
+    );
+}
+
 // ── Uniqueness / retraction under a prefix key (the §4.4 regression) ─────────
 
 // On a `CLUSTER BY k1` compound-PK table, two rows that share the distribution
