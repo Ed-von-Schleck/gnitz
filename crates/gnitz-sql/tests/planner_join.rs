@@ -516,11 +516,11 @@ fn test_band_left_join_accepts() {
 
 /// A pure-range LEFT JOIN (no equality conjunct) now registers: existence of a
 /// match collapses to a threshold test against a single scalar — `MAX`/`MIN` of
-/// the right range column — so the null-fill is `null_extend(A ⋈ {m})`, a range
-/// join whose trace side is one row. That rides the single pair-PK output
-/// exchange like the inner pairs (no second sequential exchange). The scalar `m`
-/// is computed in an internal one-row aggregate view, seeded by a one-row
-/// sentinel so it is never empty. See plans/range-join-left-outer-pure-range.md.
+/// the right range column — so the null-fill is the subtraction `A − (A ⋈ {m})`
+/// against a one-row `m`. That rides the single pair-PK output exchange like the
+/// inner pairs (no second sequential exchange). The scalar `m` is computed by an
+/// INLINE shard-free reduce over the broadcast `b` — no catalog helpers, no
+/// sentinel. See plans/range-join-left-outer-pure-range.md.
 #[test]
 fn test_pure_range_left_join_accepts() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
@@ -537,11 +537,10 @@ fn test_pure_range_left_join_accepts() {
 }
 
 /// A pure-range LEFT JOIN whose promoted compare type is 16-byte (here `U64` vs
-/// `I64` → `I128`) is rejected, not accepted: the threshold null-fill aggregates the
-/// range column with a `MIN`/`MAX` reduce, which — like the binder's MIN/MAX — handles
-/// only ≤8-byte integer keys. Pins that the planner returns a clean `Unsupported`
-/// (building no `__m`/sentinel objects) rather than a reduce over a width it cannot
-/// aggregate.
+/// `I64` → `I128`) is rejected, not accepted: the threshold null-fill reduces the
+/// range column with `MIN`/`MAX` into an 8-byte accumulator, so a 16-byte (or
+/// narrower) `Tc` is unsupported. Pins that the planner returns a clean
+/// `Unsupported` up front rather than failing the compile.
 #[test]
 fn test_pure_range_left_join_rejects_wide_compare_type() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
@@ -561,14 +560,17 @@ fn test_pure_range_left_join_rejects_wide_compare_type() {
 
 /// The pure-range LEFT null-fill, pinned at the circuit level. Built over the
 /// SAME tables as an INNER pure-range view, the LEFT view adds the THRESHOLD
-/// form — NOT the band set-difference. Concretely it adds **+2** range
-/// `DeltaTraceRange` terms (the inner has 2; the LEFT has 4 — the matched
-/// null-fill `ΔA_keep ⋈ trace_m` and `Δm ⋈ trace_a`), exactly one `null_extend`,
-/// and a third `ScanDelta` source + a third `IntegrateTrace` (the `__m` delta and
-/// its one-row `trace_m`). Crucially it adds **zero** `distinct` and **zero**
-/// `negate` (no negate-driven set-difference) and keeps exactly **one**
-/// `ExchangeShard` (the pair-PK output) — `trace_m` carries no `PartitionFilter`.
-/// The auxiliary `__m` view is registered separately and is a scalar `REDUCE`.
+/// SUBTRACTION form — NOT the band set-difference, and with NO catalog helpers.
+/// Concretely it adds **+2** range `DeltaTraceRange` terms (inner 2, LEFT 4 — the
+/// matched `int_a ⋈ trace_m` and `reindex_m ⋈ trace_a`), exactly one `null_extend`,
+/// an INLINE shard-free `REDUCE` (the `m = MAX/MIN(b.y)` threshold, emitted
+/// already typed as the compare type — no relabel) and its one-row `trace_m` (one
+/// extra `IntegrateTrace`), plus one `negate` and one extra `union` (the
+/// `A − matched` subtraction). Crucially the sources stay the SAME two
+/// (`a`, `b` — no `__m`/`__sent` delta), it keeps exactly **one** `ExchangeShard`
+/// (the pair-PK output — the reduce is shard-free) and the inner's two
+/// `PartitionFilter`s (`trace_m`/`reindex_m` have none), and adds **zero**
+/// `distinct`. No `__pls_left__m`/`__pls_left__sent` catalog objects are created.
 #[test]
 fn test_pure_range_left_join_circuit_shape() {
     let srv = match ServerHandle::start() { Some(s) => s, None => return };
@@ -591,22 +593,33 @@ fn test_pure_range_left_join_circuit_shape() {
     let n_inner = |op: u64| opcode_node_count(nodes, inner, op);
     let n_left  = |op: u64| opcode_node_count(nodes, left, op);
 
-    // Threshold form: +2 range terms (4 total), +1 null_extend, +1 ScanDelta
-    // source (__m), +1 IntegrateTrace (trace_m). NO distinct, NO negate.
+    // Threshold SUBTRACTION form: +2 range terms (4 total), +1 null_extend, SAME
+    // two sources (no __m delta), +1 IntegrateTrace (trace_m).
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_RANGE), 4, "inner 2 + null-fill 2 range terms");
     assert_eq!(n_inner(OPCODE_JOIN_DELTA_TRACE_RANGE), 2, "INNER pure-range has 2 range terms");
     assert_eq!(n_left(OPCODE_NULL_EXTEND) - n_inner(OPCODE_NULL_EXTEND), 1, "one null_extend");
-    assert_eq!(n_left(OPCODE_SCAN_DELTA) - n_inner(OPCODE_SCAN_DELTA), 1, "third source: the __m delta");
+    assert_eq!(n_left(OPCODE_SCAN_DELTA) - n_inner(OPCODE_SCAN_DELTA), 0,
+        "same two sources (a, b) — no helper delta source");
     assert_eq!(n_left(OPCODE_INTEGRATE_TRACE) - n_inner(OPCODE_INTEGRATE_TRACE), 1, "trace_m");
 
-    // The threshold null-fill is NOT the band set-difference.
-    assert_eq!(n_left(OPCODE_DISTINCT), 0, "threshold form has no distinct");
-    assert_eq!(n_left(OPCODE_NEGATE), 0, "threshold form has no negate");
-    assert_eq!(n_inner(OPCODE_DISTINCT), 0, "INNER pure-range has no distinct");
+    // The INLINE threshold reduce: one shard-free REDUCE (emitting the threshold
+    // already typed as the compare type, so no relabel), absent from the INNER view.
+    assert_eq!(n_left(OPCODE_REDUCE), 1, "v_left carries the inline MIN/MAX reduce");
+    assert_eq!(n_inner(OPCODE_REDUCE), 0, "INNER pure-range has no reduce");
 
-    // Single output exchange; trace_m is replicated (no PartitionFilter), and the
-    // inner's two PartitionFilters (one per side) are unchanged.
-    assert_eq!(n_left(OPCODE_EXCHANGE_SHARD), 1, "exactly one pair-PK output exchange");
+    // The `A − matched` subtraction: one negate + one extra union beyond the inner's
+    // single merge union (the matched-union and the (A − matched) union). NOT band's
+    // distinct.
+    assert_eq!(n_left(OPCODE_DISTINCT), 0, "threshold form has no distinct");
+    assert_eq!(n_inner(OPCODE_DISTINCT), 0, "INNER pure-range has no distinct");
+    assert_eq!(n_left(OPCODE_NEGATE), 1, "subtraction form: one negate (A − matched)");
+    assert_eq!(n_left(OPCODE_UNION) - n_inner(OPCODE_UNION), 3,
+        "subtraction adds the matched-union and the (A − matched) union beyond the merge union");
+
+    // Single output exchange (the reduce is SHARD-FREE — run locally on every worker
+    // over the broadcast b); trace_m is replicated (no PartitionFilter); the inner's
+    // two side PartitionFilters are unchanged.
+    assert_eq!(n_left(OPCODE_EXCHANGE_SHARD), 1, "exactly one pair-PK output exchange (shard-free reduce)");
     assert_eq!(n_inner(OPCODE_EXCHANGE_SHARD), 1, "INNER pure-range has one output exchange");
     assert_eq!(n_left(OPCODE_PARTITION_FILTER), 2, "two side PartitionFilters; trace_m has none");
 
@@ -617,12 +630,12 @@ fn test_pure_range_left_join_circuit_shape() {
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
     assert_eq!(n_left(OPCODE_DELAY), 0, "no Delay node");
 
-    // The auxiliary `__m` aggregate view is registered separately and is a scalar
-    // REDUCE (it must not be counted as part of `pls_left`'s opcodes).
-    let m_view = client.resolve_table_or_view_id(&sn, "__pls_left__m")
-        .expect("the internal __m aggregate view should be registered").0;
-    assert_eq!(opcode_node_count(nodes, m_view, OPCODE_REDUCE), 1, "__m is a scalar MIN/MAX reduce");
-    assert_eq!(n_left(OPCODE_REDUCE), 0, "v_left itself carries no reduce");
+    // No per-view catalog helpers are created (the user-surface leak this redesign
+    // removes): neither the old `__m` aggregate view nor the `__sent` sentinel table.
+    assert!(client.resolve_table_or_view_id(&sn, "__pls_left__m").is_err(),
+        "no internal __m aggregate view should be registered");
+    assert!(client.resolve_table_or_view_id(&sn, "__pls_left__sent").is_err(),
+        "no internal __sent sentinel table should be registered");
 }
 
 /// Two range conjuncts are rejected (the one-range-conjunct rule).

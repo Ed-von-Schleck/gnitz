@@ -2062,10 +2062,11 @@ class TestRangeJoin:
     #
     # `∃b. a.x < b.y  ⟺  a.x < MAX(b.y)`, so the unmatched left rows are exactly
     # those on the null-fill side of a single scalar threshold `m` (MAX for `< <=`,
-    # MIN for `> >=`), computed by an internal one-row aggregate view seeded by a
-    # one-row sentinel (so it is never empty). The view projects `a.id AS aid,
-    # b.id AS bid`; a null-fill row is (aid, None). The reference reuses
-    # `_band_left_ref` with a pure-range predicate.
+    # MIN for `> >=`). The null-fill is the subtraction `A − (A ⋈ {m})` against the
+    # one-row `m`, computed by an INLINE shard-free reduce over the broadcast `b`
+    # (no catalog helpers, no sentinel — an empty `m` simply null-fills all of `A`).
+    # The view projects `a.id AS aid, b.id AS bid`; a null-fill row is (aid, None).
+    # The reference reuses `_band_left_ref` with a pure-range predicate.
 
     def _mk_pure_range_left(self, client, sn, op="<",
                             a_x="BIGINT NOT NULL", b_y="BIGINT NOT NULL"):
@@ -2117,7 +2118,8 @@ class TestRangeJoin:
     def test_pure_range_left_same_epoch_match(self, client):
         """Same-epoch insert-and-match: b already covers a's match (m already past
         a.x) before a is inserted. Exactly one pair and NO net (a, NULL) — the
-        matched a is below the threshold so `A ⋈ {m}` emits nothing for it. A
+        matched a's passthrough `+a` and its `matched = A ⋈ {m}` term `−a` are
+        byte-identical and cancel in-epoch, so no (a, NULL) ever surfaces. A
         non-matching a inserted in the same epoch still null-fills."""
         sn = "prse" + _uid()
         client.create_schema(sn)
@@ -2213,11 +2215,12 @@ class TestRangeJoin:
             _drop_all(client, sn, views=["v"], tables=["a", "b"])
 
     def test_pure_range_left_empty_b_all_nullfill(self, client):
-        """Empty (and re-filled) right side. With NO b, MAX(b.y) is the sentinel Tc
-        extreme so EVERY left row null-fills — INCLUDING an a.x below b.y's type
-        minimum (a.x:I64 negative vs b.y:INT UNSIGNED, whose min is 0; the sentinel
-        is the I64 extreme, not the U32 one). Re-inserting b retracts the now-matched
-        a's null-fills."""
+        """Empty (and re-filled) right side. With NO b the threshold `m` is empty, so
+        the subtraction `A − (A ⋈ {m})` is `A − ∅ = A` and EVERY left row null-fills
+        — no sentinel needed. The compare type is I64 (a.x:BIGINT vs b.y:INT UNSIGNED
+        promote to I64), so a NEGATIVE a.x below b.y's unsigned min orders correctly:
+        on refill it matches (−5 < 100 in signed order, not as a huge unsigned). Re-
+        inserting b retracts the now-matched a's null-fills."""
         sn = "preb" + _uid()
         client.create_schema(sn)
         try:
@@ -2240,8 +2243,8 @@ class TestRangeJoin:
 
     def test_pure_range_left_all_null_range_b(self, client):
         """A b with rows but ALL range values NULL behaves identically to empty b
-        (MIN/MAX skip NULL → no value → sentinel) → every a null-fills. Nulling the
-        last live b.y re-null-fills the matched a's."""
+        (MIN/MAX skip NULL → no value → empty `m` → `A − ∅ = A`) → every a null-fills.
+        Nulling the last live b.y re-null-fills the matched a's."""
         sn = "prnb" + _uid()
         client.create_schema(sn)
         try:

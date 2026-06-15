@@ -899,21 +899,32 @@ fn reindex_output_schema(
 }
 
 /// Determine the output type for an aggregate function.
-/// Must match `UniversalAccumulator.output_column_type()`:
 ///   COUNT, COUNT_NON_NULL → I64
 ///   SUM/MIN/MAX on float → F64
-///   everything else → I64  (including MIN/MAX on STRING, I32, etc.)
+///   MIN/MAX on U64 → U64
+///   everything else → I64  (SUM, and MIN/MAX on STRING / narrower ints)
+///
+/// MIN/MAX of a column of type T is itself a value of type T. The accumulator is
+/// an 8-byte slot, so every ≤8-byte integer fits; the narrower ones widen
+/// losslessly to the I64 slot width (which the 8-byte trace read-back also
+/// assumes), but U64 stays U64 — widened to signed I64, an unsigned extremum
+/// above `i64::MAX` would read back negative. SUM stays I64: it can overflow the
+/// source width. Mirrored by the SQL planner's `agg_result_type`.
 const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
     match agg_op {
-        AggOp::Count | AggOp::CountNonNull => type_code::I64,
-        AggOp::Sum | AggOp::Min | AggOp::Max => {
+        AggOp::Count | AggOp::CountNonNull | AggOp::Null => type_code::I64,
+        AggOp::Sum => {
+            if col_type_code.is_float() { type_code::F64 } else { type_code::I64 }
+        }
+        AggOp::Min | AggOp::Max => {
             if col_type_code.is_float() {
                 type_code::F64
+            } else if matches!(col_type_code, TypeCode::U64) {
+                type_code::U64
             } else {
                 type_code::I64
             }
         }
-        AggOp::Null => type_code::I64,
     }
 }
 
@@ -2744,6 +2755,11 @@ mod tests {
         assert_eq!(agg_output_type(AggOp::Min, TypeCode::I32), type_code::I64);
         assert_eq!(agg_output_type(AggOp::Max, TypeCode::F32), type_code::F64);
         assert_eq!(agg_output_type(AggOp::Max, TypeCode::String), type_code::I64);
+        // MIN/MAX preserve U64 (else an extremum > i64::MAX reads back negative);
+        // SUM over U64 still widens to I64.
+        assert_eq!(agg_output_type(AggOp::Min, TypeCode::U64), type_code::U64);
+        assert_eq!(agg_output_type(AggOp::Max, TypeCode::U64), type_code::U64);
+        assert_eq!(agg_output_type(AggOp::Sum, TypeCode::U64), type_code::I64);
     }
 
     #[test]

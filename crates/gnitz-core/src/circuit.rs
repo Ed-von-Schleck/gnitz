@@ -422,34 +422,17 @@ impl CircuitBuilder {
         self.binary_join(OpNode::SemiJoin(JoinKind::DeltaTrace), delta, trace_node)
     }
 
-    /// Reduce with automatic shard insertion (required for multi-worker correctness).
-    pub fn reduce(
-        &mut self,
-        input: NodeId,
-        group_cols: &[usize],
-        agg_func_id: u64,
-        agg_col_idx: usize,
-    ) -> NodeId {
-        let sharded = self.shard(input, group_cols);
-        let group: Vec<u16> = group_cols.iter().map(|&c| c as u16).collect();
-        let func = AggFunc::from_wire(agg_func_id)
-            .unwrap_or_else(|| panic!("unknown agg func id {agg_func_id}"));
-        let nid = self.alloc_node(OpNode::Reduce {
-            group_cols: group,
-            agg: AggKind::Specs(vec![(func, agg_col_idx as u16)]),
-        });
-        self.connect(sharded, nid, gnitz_wire::PORT_IN);
-        nid
-    }
-
-    /// Multi-aggregate reduce. `agg_specs`: list of (agg_func_id, col_idx).
-    pub fn reduce_multi(
+    /// Shared `Reduce`-node construction: map the group cols + agg specs, alloc
+    /// the node, and wire `input` to `PORT_IN`. The caller decides the
+    /// partitioning of `input` — `reduce`/`reduce_multi` shard first;
+    /// `reduce_multi_local` passes a deliberately pre-replicated input straight
+    /// through. Empty `agg_specs` ⇒ `AggKind::Null` (group-only distinct-reduce).
+    fn reduce_node(
         &mut self,
         input: NodeId,
         group_cols: &[usize],
         agg_specs: &[(u64, usize)],
     ) -> NodeId {
-        let sharded = self.shard(input, group_cols);
         let group: Vec<u16> = group_cols.iter().map(|&c| c as u16).collect();
         let specs: Vec<(AggFunc, u16)> = agg_specs.iter()
             .map(|&(func_id, col)| (
@@ -461,8 +444,48 @@ impl CircuitBuilder {
             group_cols: group,
             agg: if specs.is_empty() { AggKind::Null } else { AggKind::Specs(specs) },
         });
-        self.connect(sharded, nid, gnitz_wire::PORT_IN);
+        self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
+    }
+
+    /// Reduce with automatic shard insertion (required for multi-worker correctness).
+    pub fn reduce(
+        &mut self,
+        input: NodeId,
+        group_cols: &[usize],
+        agg_func_id: u64,
+        agg_col_idx: usize,
+    ) -> NodeId {
+        let sharded = self.shard(input, group_cols);
+        self.reduce_node(sharded, group_cols, &[(agg_func_id, agg_col_idx)])
+    }
+
+    /// Multi-aggregate reduce with automatic shard insertion (required for
+    /// multi-worker correctness). `agg_specs`: list of (agg_func_id, col_idx).
+    pub fn reduce_multi(
+        &mut self,
+        input: NodeId,
+        group_cols: &[usize],
+        agg_specs: &[(u64, usize)],
+    ) -> NodeId {
+        let sharded = self.shard(input, group_cols);
+        self.reduce_node(sharded, group_cols, agg_specs)
+    }
+
+    /// Shard-free multi-aggregate reduce: aggregates `input` **locally on every
+    /// worker** with NO upstream `ExchangeShard`.
+    ///
+    /// **Precondition (a soft contract — the builder cannot type-enforce it):**
+    /// `input` must already be replicated/broadcast (byte-identical *contents* per
+    /// worker), so each worker's local reduce computes the SAME global aggregate.
+    /// Misused on a partitioned input it silently computes per-worker partials.
+    pub fn reduce_multi_local(
+        &mut self,
+        input: NodeId,
+        group_cols: &[usize],
+        agg_specs: &[(u64, usize)],
+    ) -> NodeId {
+        self.reduce_node(input, group_cols, agg_specs)
     }
 
     /// Exchange shard: routes rows to workers by hashing the given columns.

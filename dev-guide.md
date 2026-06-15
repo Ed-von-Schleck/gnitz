@@ -217,7 +217,9 @@ REDUCE output schema column types:
 
 - COUNT, COUNT_NON_NULL → **I64**
 - SUM/MIN/MAX on F32/F64 → **F64**
-- SUM/MIN/MAX on anything else → **I64**
+- MIN/MAX on U64 → **U64** (an unsigned 64-bit extremum widened to signed I64
+  would read back negative once it exceeds `i64::MAX`)
+- SUM, and MIN/MAX on anything else → **I64** (narrower ints widen losslessly)
 
 The accumulator stores values as `u64` bit patterns (8 bytes). The output
 column is always 8 bytes. MIN/MAX on STRING stores the German String
