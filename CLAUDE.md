@@ -13,7 +13,7 @@ Read dev-guide.md for GnitzDB-specific development guidelines.
 # GnitzDB Theoretical Foundations
 
 Every storage operation, DBSP operator, and merge path derives from these
-definitions. Bugs almost always trace to violating an invariant stated here.
+definitions. Bugs often trace to violating an invariant stated here.
 
 ## 1. Z-Sets
 

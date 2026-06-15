@@ -3864,11 +3864,13 @@ mod tests {
     #[test]
     fn test_reindex_cols_through_filters_with_partition_filter_after_map() {
         use gnitz_wire::{MapKind, OpNode};
-        // Range-join shape: ScanDelta → Map(reindex) → PartitionFilter →
-        // IntegrateTrace. PartitionFilter sits AFTER the reindex Map, so the walk
-        // (which stops at the Map and only steps through Filter nodes) reaches the
-        // Map and returns its cols unchanged — the range circuit keeps
-        // has_join_shard == true exactly like an equi-join.
+        // A reindex Map followed by a PartitionFilter, with NO join node present
+        // (so is_join_view == false and the feeds_trace_or_join guard is off): the
+        // walk reaches the Map and returns its cols, then stops — a PartitionFilter
+        // is not a Filter, so it is never stepped through. The real range circuit,
+        // where a Join node IS present (is_join_view == true) and the reindex feeds
+        // it directly, is covered by
+        // test_reindex_cols_through_filters_range_join_feeds_join_directly.
         let dummy_blob: Vec<u8> = vec![
             0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
@@ -3889,6 +3891,48 @@ mod tests {
         let loaded = make_loaded(nodes, edges);
         assert_eq!(reindex_cols_through_filters(&loaded, 0), vec![(2, 0)],
             "PartitionFilter after the reindex Map must not change the walk result");
+    }
+
+    /// Real pure-range-join shape (planner.rs, `n_eq == 0`): the reindex Map feeds
+    /// the `Join(DeltaTraceRange)` node DIRECTLY as the delta term AND feeds a
+    /// `PartitionFilter → IntegrateTrace` toward the trace term. A Join node is
+    /// present, so `is_join_view == true` and the `feeds_trace_or_join` guard is
+    /// live — and it returns true via the DIRECT Map→Join edge, so the reindex key
+    /// is still collected as the scatter key. This is what keeps
+    /// `get_join_shard_cols` non-empty for a pure range join (hence
+    /// `prepare_relay`'s `is_join` / `range_n_eq` and the broadcast routing). Guards
+    /// against the misreading that the reindex only feeds the PartitionFilter.
+    #[test]
+    fn test_reindex_cols_through_filters_range_join_feeds_join_directly() {
+        use gnitz_wire::{JoinKind, MapKind, OpNode};
+        let dummy_blob: Vec<u8> = vec![
+            0x47, 0x4e, 0x49, 0x54, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        // ScanDelta(99) ─► Map(reindex=[2]) ─┬─► Join(DeltaTraceRange)  [delta, PORT_IN_A]
+        //                                     └─► PartitionFilter ─► IntegrateTrace ─► Join  [PORT_TRACE]
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(99));
+        nodes.insert(1, OpNode::Map(MapKind::Expression {
+            program: dummy_blob,
+            reindex_cols: vec![2],
+            reindex_target_tcs: vec![],
+        }));
+        nodes.insert(2, OpNode::PartitionFilter);
+        nodes.insert(3, OpNode::IntegrateTrace);
+        nodes.insert(4, OpNode::Join(JoinKind::DeltaTraceRange {
+            n_eq: 0, rel: gnitz_wire::RangeRel::Le,
+        }));
+        let edges = vec![
+            (0, 1, PORT_IN),       // ScanDelta → reindex Map
+            (1, 4, PORT_IN_A),     // reindex Map → Join (delta term, DIRECT edge)
+            (1, 2, PORT_IN),       // reindex Map → PartitionFilter (toward the trace)
+            (2, 3, PORT_IN),       // PartitionFilter → IntegrateTrace
+            (3, 4, PORT_TRACE),    // IntegrateTrace → Join (trace term)
+        ];
+        let loaded = make_loaded(nodes, edges);
+        assert_eq!(reindex_cols_through_filters(&loaded, 0), vec![(2, 0)],
+            "the reindex feeds the Join directly, so feeds_trace_or_join is true \
+             even with a PartitionFilter toward the trace");
     }
 
     #[test]

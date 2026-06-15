@@ -367,16 +367,6 @@ impl SysTableRefs {
 }
 
 // ---------------------------------------------------------------------------
-// Exchange info
-// ---------------------------------------------------------------------------
-
-/// Cached exchange metadata for a view.
-pub struct ExchangeInfo {
-    pub is_trivial: bool,
-    pub is_co_partitioned: bool,
-}
-
-// ---------------------------------------------------------------------------
 // ExchangeCallback — trait for multi-worker exchange IPC
 // ---------------------------------------------------------------------------
 
@@ -407,7 +397,13 @@ pub struct DagEngine {
     // Each entry is (reindex column, carried promotion target tc) — the carried
     // tc is non-zero for a cross-width join key and threads to the scatter packer.
     join_shard_cols_cache: FxHashMap<(i64, i64), Vec<(i32, u8)>>,
-    exchange_info_cache: FxHashMap<i64, ExchangeInfo>,
+    // Whether a view's output ExchangeShard is a no-op (every row already on its
+    // PK-owner) and the IPC shuffle can be skipped. Memoized per view_id; evicted
+    // in lockstep with the sibling view caches.
+    skip_exchange_cache: FxHashMap<i64, bool>,
+    // Whether a view has an ExchangeShard node at all. Memoized per view_id;
+    // evicted in lockstep with the sibling view caches.
+    needs_exchange_cache: FxHashMap<i64, bool>,
     // Whether a view is a non-equi (range) join — its input relay broadcasts and
     // its driver branch double-exchanges. Memoized per view_id; evicted in
     // lockstep with the sibling view-keyed caches.
@@ -438,7 +434,8 @@ impl DagEngine {
             dep_map_valid: false,
             shard_cols_cache: FxHashMap::default(),
             join_shard_cols_cache: FxHashMap::default(),
-            exchange_info_cache: FxHashMap::default(),
+            skip_exchange_cache: FxHashMap::default(),
+            needs_exchange_cache: FxHashMap::default(),
             range_join_cache: FxHashMap::default(),
             tables: FxHashMap::default(),
             sys: SysTableRefs::null(),
@@ -477,7 +474,8 @@ impl DagEngine {
         self.cache.remove(&table_id);
         self.shard_cols_cache.remove(&table_id);
         self.join_shard_cols_cache.retain(|&(v, s), _| v != table_id && s != table_id);
-        self.exchange_info_cache.remove(&table_id);
+        self.skip_exchange_cache.remove(&table_id);
+        self.needs_exchange_cache.remove(&table_id);
         self.range_join_cache.remove(&table_id);
         self.dep_map_valid = false;
     }
@@ -585,7 +583,8 @@ impl DagEngine {
         self.cache.remove(&view_id);
         self.shard_cols_cache.remove(&view_id);
         self.join_shard_cols_cache.retain(|&(v, _), _| v != view_id);
-        self.exchange_info_cache.remove(&view_id);
+        self.skip_exchange_cache.remove(&view_id);
+        self.needs_exchange_cache.remove(&view_id);
         self.range_join_cache.remove(&view_id);
         self.dep_map_valid = false;
     }
@@ -594,7 +593,8 @@ impl DagEngine {
         self.cache.clear();
         self.shard_cols_cache.clear();
         self.join_shard_cols_cache.clear();
-        self.exchange_info_cache.clear();
+        self.skip_exchange_cache.clear();
+        self.needs_exchange_cache.clear();
         self.range_join_cache.clear();
         self.dep_map_valid = false;
     }
@@ -706,6 +706,18 @@ impl DagEngine {
         cols
     }
 
+    /// Whether `get_join_shard_cols` would be empty, without cloning the cached
+    /// Vec — the hot-path arm in `evaluate_dag_multi_worker` tests only emptiness.
+    fn join_shard_cols_is_empty(&mut self, view_id: i64, source_id: i64) -> bool {
+        if let Some(cols) = self.join_shard_cols_cache.get(&(view_id, source_id)) {
+            return cols.is_empty();
+        }
+        let cols = self.compute_join_shard_cols(view_id, source_id);
+        let empty = cols.is_empty();
+        self.join_shard_cols_cache.insert((view_id, source_id), cols);
+        empty
+    }
+
     fn compute_join_shard_cols(&self, view_id: i64, source_id: i64) -> Vec<(i32, u8)> {
         let loaded = self.load_meta_circuit(view_id);
 
@@ -727,65 +739,53 @@ impl DagEngine {
         crate::compiler::reindex_cols_through_filters(&loaded, scan_nid)
     }
 
-    /// Get exchange info for a view: (shard_cols, is_trivial, is_co_partitioned).
-    pub fn get_exchange_info(&mut self, view_id: i64) -> &ExchangeInfo {
-        if self.exchange_info_cache.contains_key(&view_id) {
-            return &self.exchange_info_cache[&view_id];
+    /// True iff the view's output `ExchangeShard` is a no-op (every row already on
+    /// its PK-owner) and can be skipped: the shard reads from a bare scan whose PK
+    /// is the shard key. Collapses the former `ExchangeInfo { is_trivial,
+    /// is_co_partitioned }` — whose sole reader ANDed both fields — into the one
+    /// bit they encoded, making the impossible `{ is_trivial: false,
+    /// is_co_partitioned: true }` state unrepresentable.
+    fn view_skips_exchange(&mut self, view_id: i64) -> bool {
+        if let Some(&skip) = self.skip_exchange_cache.get(&view_id) {
+            return skip;
         }
+        let skip = self.compute_view_skips_exchange(view_id);
+        self.skip_exchange_cache.insert(view_id, skip);
+        skip
+    }
 
+    fn compute_view_skips_exchange(&self, view_id: i64) -> bool {
         let loaded = self.load_meta_circuit(view_id);
 
-        let mut shard_cols = Vec::new();
-        let mut is_trivial = false;
-        let mut is_co_partitioned = false;
+        // The view's output ExchangeShard and its shard columns.
+        let Some((enid, shard_cols)) = loaded.nodes.iter().find_map(|(&nid, op)| match op {
+            gnitz_wire::OpNode::ExchangeShard { shard_cols } =>
+                Some((nid, shard_cols.iter().map(|&c| c as i32).collect::<Vec<_>>())),
+            _ => None,
+        }) else { return false };
 
-        // Find the ExchangeShard node and its shard columns.
-        let exchange_nid = loaded.nodes.iter().find_map(|(&nid, op)| {
-            if let gnitz_wire::OpNode::ExchangeShard { shard_cols: sc } = op {
-                Some((nid, sc.iter().map(|&c| c as i32).collect::<Vec<_>>()))
-            } else {
-                None
-            }
-        });
-        if let Some((enid, cols)) = exchange_nid {
-            shard_cols = cols;
-
-            // Collect nodes that feed directly into ExchangeShard.
-            let incoming_srcs: Vec<i32> = loaded.edges.iter()
-                .filter(|&&(_, dst, _)| dst == enid)
-                .map(|&(src, _, _)| src)
-                .collect();
-
-            if incoming_srcs.len() == 1 {
-                let src_nid = incoming_srcs[0];
-                if !loaded.edges.iter().any(|&(_, dst, _)| dst == src_nid) {
-                    is_trivial = true;
-                    // SQL planner views feed the shard from a ScanDelta; Python
-                    // API joins use ScanTrace. Either is co-partitionable when the
-                    // shard key is the source PK.
-                    let tid = match loaded.nodes.get(&src_nid) {
-                        Some(gnitz_wire::OpNode::ScanTrace(t))
-                        | Some(gnitz_wire::OpNode::ScanDelta(t)) => Some(*t),
-                        _ => None,
-                    };
-                    if let Some(tid) = tid {
-                        if tid > 0 {
-                            if let Some(entry) = self.tables.get(&(tid as i64)) {
-                                // Strict full-PK-sequence match: a single component
-                                // of a compound PK is not co-partitioned.
-                                if entry.schema.shard_cols_match_pk(&shard_cols) {
-                                    is_co_partitioned = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // The shard's sole input must be a bare scan: exactly one incoming edge,
+        // from a node that itself has none.
+        let incoming: Vec<i32> = loaded.edges.iter()
+            .filter(|&&(_, dst, _)| dst == enid)
+            .map(|&(src, _, _)| src)
+            .collect();
+        let [src_nid] = incoming.as_slice() else { return false };
+        if loaded.edges.iter().any(|&(_, dst, _)| dst == *src_nid) {
+            return false;
         }
 
-        self.shard_cols_cache.insert(view_id, shard_cols.clone());
-        self.exchange_info_cache.insert(view_id, ExchangeInfo { is_trivial, is_co_partitioned });
-        &self.exchange_info_cache[&view_id]
+        // SQL planner views feed the shard from a ScanDelta; Python API joins use
+        // ScanTrace. Skip iff that source table's PK is exactly the shard key — a
+        // strict full-PK-sequence match, so a single component of a compound PK is
+        // not co-partitioned.
+        let tid = match loaded.nodes.get(src_nid) {
+            Some(gnitz_wire::OpNode::ScanDelta(t))
+            | Some(gnitz_wire::OpNode::ScanTrace(t)) => *t as i64,
+            _ => return false,
+        };
+        self.tables.get(&tid)
+            .is_some_and(|entry| entry.schema.shard_cols_match_pk(&shard_cols))
     }
 
     /// Ensure a view's plan is compiled. Returns true if compilation succeeded.
@@ -810,10 +810,21 @@ impl DagEngine {
             .and_then(|p| p.exchange_in_schema)
     }
 
-    /// Check if a view needs exchange (has EXCHANGE_SHARD node).
+    /// Check if a view needs exchange (has an `ExchangeShard` node). Memoized in a
+    /// sibling `bool` cache: the hot path calls this once per view per tick, and
+    /// the underlying `load_meta_circuit` is a `load_circuit` + `topo_sort`
+    /// (`O(V+E)` with several allocations). Stays `pub` and derives from the meta
+    /// circuit (system tables), not `self.cache`, so it is correct for uncompiled
+    /// views — the startup `backfill_exchange_views` path relies on that.
     pub fn view_needs_exchange(&mut self, view_id: i64) -> bool {
+        if let Some(&needs) = self.needs_exchange_cache.get(&view_id) {
+            return needs;
+        }
         let loaded = self.load_meta_circuit(view_id);
-        loaded.nodes.values().any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. }))
+        let needs = loaded.nodes.values()
+            .any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. }));
+        self.needs_exchange_cache.insert(view_id, needs);
+        needs
     }
 
     /// The equality-conjunct count of a non-equi (range / band) join view, or
@@ -1217,7 +1228,8 @@ impl DagEngine {
     ///
     /// Near-copy of `evaluate_dag()` with these critical differences:
     /// 1. Exchange views: call `exchange.do_exchange()` between pre and post
-    ///    phases — unless `skip_exchange` (both trivial AND co-partitioned).
+    ///    phases — unless `view_skips_exchange` (the shard reads a bare scan
+    ///    whose PK is already the shard key, so the shuffle is a no-op).
     /// 2. Join shard exchange: when `get_join_shard_cols` is non-empty AND NOT
     ///    `plan_source_co_partitioned`, call exchange before execute_epoch.
     /// 3. Always queue downstream views even when output is empty (ensures
@@ -1256,17 +1268,12 @@ impl DagEngine {
 
             self.ensure_compiled(view_id);
 
+            // Only `has_exchange` is eager — two arms test it. The two single-use
+            // checks (`view_skips_exchange` and the join-shard-cols emptiness test)
+            // are evaluated at their sole consumer arm below: the range-join arm
+            // (taken first) and the set-op arm read neither, so deferring keeps them
+            // off the cache lookup and the first-call circuit load.
             let has_exchange = self.view_needs_exchange(view_id);
-
-            let has_join_shard = {
-                let cols = self.get_join_shard_cols(view_id, src_id);
-                !cols.is_empty()
-            };
-
-            let skip_exchange = {
-                let info = self.get_exchange_info(view_id);
-                info.is_trivial && info.is_co_partitioned
-            };
 
             let out_delta = if self.view_range_join_n_eq(view_id).is_some() {
                 // Range join: input relay (eq-prefix scatter for a band join,
@@ -1281,7 +1288,7 @@ impl DagEngine {
                 //
                 // Set the source schema for exchange wire encoding: a batch with
                 // rows but a None schema emits FLAG_HAS_DATA without FLAG_HAS_SCHEMA
-                // and panics the reactor decode. Mirrors the has_join_shard arm.
+                // and panics the reactor decode. Mirrors the join-shard arm.
                 let mut input_with_schema = input;
                 if input_with_schema.schema.is_none() {
                     if let Some(entry) = self.tables.get(&src_id) {
@@ -1330,15 +1337,17 @@ impl DagEngine {
                 // unsorted/unconsolidated after a HashRow reindex or a scatter;
                 // the post phase's distinct/join operators need sorted,
                 // weight-merged input.
-                let post_in = if skip_exchange {
+                let post_in = if self.view_skips_exchange(view_id) {
                     pre_result
                 } else {
                     exchange.do_exchange(view_id, &pre_result, 0)
                 };
                 let post_in = Self::consolidate_exchanged(post_in, &exchange_schema);
                 self.execute_post_phase(view_id, post_in)
-            } else if has_join_shard {
-                // Join shard exchange
+            } else if !self.join_shard_cols_is_empty(view_id, src_id) {
+                // Join shard exchange. The col list is tested only on this arm, so
+                // its emptiness is checked here rather than eagerly above the chain;
+                // the body drives off `plan_source_co_partitioned`.
                 let copart_join = self.plan_source_co_partitioned(view_id, src_id);
                 if copart_join {
                     self.execute_pre_phase(view_id, input, src_id)
@@ -2010,7 +2019,8 @@ impl DagEngine {
         self.tables.clear();
         self.shard_cols_cache.clear();
         self.join_shard_cols_cache.clear();
-        self.exchange_info_cache.clear();
+        self.skip_exchange_cache.clear();
+        self.needs_exchange_cache.clear();
         self.range_join_cache.clear();
         self.dep_map.clear();
         self.source_map.clear();
@@ -2063,15 +2073,14 @@ mod tests {
     fn test_invalidation() {
         let mut dag = DagEngine::new();
         dag.shard_cols_cache.insert(42, vec![0]);
-        dag.exchange_info_cache.insert(42, ExchangeInfo {
-            is_trivial: true,
-            is_co_partitioned: false,
-        });
+        dag.skip_exchange_cache.insert(42, true);
+        dag.needs_exchange_cache.insert(42, true);
         dag.dep_map_valid = true;
 
         dag.invalidate(42);
         assert!(!dag.shard_cols_cache.contains_key(&42));
-        assert!(!dag.exchange_info_cache.contains_key(&42));
+        assert!(!dag.skip_exchange_cache.contains_key(&42));
+        assert!(!dag.needs_exchange_cache.contains_key(&42));
         assert!(!dag.dep_map_valid);
 
         dag.dep_map_valid = true;
