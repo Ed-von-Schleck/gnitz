@@ -274,15 +274,13 @@ feature small:
   on here).
 - **Persisted state is one small integer**, not a packed column list (§5).
 
-`dist_stride` is the encoded byte width of the first *k* PK columns:
-`schema.pk_byte_offset(pk_indices()[k])` for `k < |PK|`, else `pk_stride`.
-`pk_byte_offset` (`schema.rs:463-471`) takes a **column index** and returns that
-column's byte offset within the PK region by accumulating `col.size()` over
-`pk_columns()` in PK-list order — so it must be passed `pk_indices()[k]` (the column
-index of the *k*-th PK column), **never the bare position `k`**. The same
-`col.size()` widths drive the OPK encoder, so the offset matches the physical layout
-exactly. `pk_byte_offset` `debug_assert!`s `is_pk_col`; in release that assert
-compiles out, so passing `k` instead of `pk_indices()[k]` would silently misbehave.
+`dist_stride` is the encoded byte width of the first *k* PK columns — the sum of
+`columns[pk_indices[0..k]].size()`. It is computed once in
+`SchemaDescriptor::new_with_dist` (§5.1) alongside `pk_stride`, walking the PK
+columns in PK-list order, so it matches the OPK encoder's physical layout exactly
+and needs no separate `pk_byte_offset` call (and no `pk_indices()[k]`-vs-bare-`k`
+footgun). For the default (`k = |PK|`) it equals `pk_stride`, making every sliced
+route byte-identical to today's full-PK route.
 
 Consequence for the headline use case: to co-locate `orders` with `customers` on
 `customer_id`, declare `orders` `PRIMARY KEY (customer_id, order_id)` and
@@ -356,14 +354,23 @@ and intended: it fingerprints the in-partition *match* identity (the full PK), w
 
 Widen **both** detectors to read the table's distribution prefix:
 
-- Add `shard_cols_match_dist_key(cols, k)`: `cols == pk_indices[..k]` for the
-  table's *k*. (`shard_cols_match_pk` is the special case `k = |PK|`.) Use it in
+- Add `shard_cols_match_dist_key` — the **exact-prefix** generalization of
+  `shard_cols_match_pk` (`shard_cols_match_pk` is the `k = |PK|` case). Use it in
   `compute_co_partitioned` (`compiler.rs:616`, join sources) **and**
   `compute_view_skips_exchange` (`dag.rs:788`, single-source `ExchangeShard` views)
-  in place of `shard_cols_match_pk`. Each detector needs the table's *k*: the join
-  detector reads schema off `ExternalTable`, the view detector off
-  `self.tables[&tid]`, so *k* must reach both (§5 threads it onto `ExternalTable` and
-  `TableEntry` — or, more simply, onto `SchemaDescriptor`, which both already hold).
+  in place of `shard_cols_match_pk`. Both detectors already hold the table's
+  `SchemaDescriptor` (`ext.schema`; `entry.schema`), and the prefix length rides on
+  that descriptor (§5.1), so neither needs *k* threaded separately.
+
+  ```rust
+  // schema.rs — strict length equality (`== k`), NOT a super-prefix (`>= k`); see
+  // the correctness note below. `dist_prefix_len ≤ pk_count`, so `pk[..k]` is in range.
+  pub fn shard_cols_match_dist_key(&self, cols: &[i32]) -> bool {
+      let k = self.dist_prefix_len() as usize;
+      let pk = self.pk_indices();
+      cols.len() == k && cols.iter().zip(&pk[..k]).all(|(&c, &p)| c == p as i32)
+  }
+  ```
 - **The view detector is not join-specific.** `compute_view_skips_exchange` governs
   the exchange-skip for every single-source `ExchangeShard` view, so widening it also
   lets a **GROUP BY / reduce** whose grouping key equals the table's distribution
@@ -386,9 +393,10 @@ Widen **both** detectors to read the table's distribution prefix:
     through Filters — so the GROUP BY bonus fires only for an *unfiltered* `GROUP BY
     prefix`. `compute_co_partitioned` (joins) is more permissive: it resolves the
     reindex key *through* Filters (`reindex_cols_through_filters`), so a filtered join
-    still co-partitions. Relaxing `compute_view_skips_exchange` to walk Filters would
-    extend the GROUP BY bonus to `GROUP BY prefix … WHERE …` and unify the two
-    detectors (§11); it is an optimization, not required for correctness.
+    still co-partitions. Relaxing `compute_view_skips_exchange` to walk Filters extends
+    the GROUP BY bonus to `GROUP BY prefix … WHERE …` and unifies the two detectors; it
+    is a separable optimization (`plans/filtered-groupby-copartition.md`), not required
+    for correctness here.
 - The `tc != 0` promotion guard stays (`compiler.rs:607`). A promoted reindex slot
   is at a different width than the native distribution key, so the cogroup memcmp
   would not match even though the rows co-locate; such joins keep exchanging. The
@@ -410,12 +418,29 @@ Widen **both** detectors to read the table's distribution prefix:
   (`dag.rs:1330-1336,1353-1355`). So a distribution prefix that is a *proper* prefix
   of the PK joins correctly without any added relabel.
 
-The detector is **conservative but never wrong**: it fires only on an exact
-`cols == pk_indices[..k]` match. A key that is a *super-prefix* of the distribution
-key (e.g. `GROUP BY (customer_id, order_id)` on a `CLUSTER BY customer_id` table)
-also co-locates — each finer group is wholly inside one prefix-partition — yet is
-not detected, so it exchanges unnecessarily. Recognizing super-prefixes is a
-possible future refinement; it cannot cause a false skip.
+**Exact match, never a super-prefix — and the strictness is load-bearing for
+joins, not mere conservatism.** `shard_cols_match_dist_key` fires only on
+`cols.len() == k`. A super-prefix gate (`cols.len() >= k`) is a **correctness bug**
+in the join detector: it lets the two sides skip at *different* prefix widths. Take
+a 2-column join with side A `CLUSTER BY a₁` (k=1, PK `(a₁,a₂)`) and side B default
+`CLUSTER BY (b₁,b₂)` (k=2). Under `>= k` both pass independently, so both skip — but
+A's rows stay hashed on `a₁` while B's stay hashed on `(b₁,b₂)`, so rows with equal
+join keys land on different workers and the elided exchange silently drops matches.
+Exact match makes this impossible: if a side's join-key length ≠ its *k*, it does
+**not** skip, so it exchanges and repartitions to the *full* join key — which equals
+the other (skipping) side's native distribution — and the sides reconverge on one
+worker. A skip therefore happens only when the whole join key *is* the distribution
+prefix, where both sides route at the same width by construction.
+
+Super-prefix co-location is nonetheless real and **safe for the single-source view
+(GROUP BY/reduce) detector**: `GROUP BY (customer_id, order_id)` on a
+`CLUSTER BY customer_id` table groups within prefix-partitions, each finer group
+wholly on one worker, so a local reduce + gather is correct. The shared primitive
+stays exact (so the join detector cannot misuse it); the unfiltered exact case
+already covers the common GROUP BY, and recognizing GROUP BY super-prefixes — should
+it ever pay — must go behind a *separate*, view-only predicate, never by widening
+`shard_cols_match_dist_key`. The exact detector is otherwise conservative: an
+exact-`k` GROUP BY/join is detected, anything else exchanges (correctly).
 
 ### 4.4 The probe-routing invariant, and FK checks
 
@@ -428,6 +453,29 @@ PK.* `local_index_bytes` (`partitioned_table.rs:410-418`) is the single funnel f
 `has_pk_bytes`/`retract_pk_bytes`/`enforce_unique_pk` (one `retract_pk_bytes` call,
 `dag.rs:1858`), so it is the only probe site the core feature must touch.
 
+**Unifying the upsert-validation probe onto that funnel.**
+`validate_unique_indices` (`catalog/validation.rs:158-348`) classifies each row as an
+UPSERT by probing whether its PK already has a live row. The narrow path already
+goes through `entry.handle.has_pk_bytes(...)` — i.e. `local_index_bytes`, so it is
+distribution-aware for free. The **wide** path instead opens one
+`entry.handle.open_cursor()` (which gathers every owned partition's runs and shards
+into a single merge tree, `partitioned_table.rs:168-185`) and reuses it for
+`seek_exact_live` per row. `has_pk_bytes` is byte-wide-safe (`dag.rs:94-106`) and
+semantically identical (`Table::has_pk_bytes` returns net `w > 0`, `table.rs:753-766`
+— exactly `seek_exact_live`'s present/exact/positive gate), so the wide branch can be
+dropped: both widths probe via `has_pk_bytes`, which replaces an all-owned-partitions
+merge tree per validation batch with a per-row single-partition bloom + XOR8-gated
+shard scan, and routes the last PK probe through the same distribution-aware funnel
+as everything else.
+
+```rust
+// validation.rs — delete the `base_cursor` (and now-unused `wide`/`row_pk_bytes`);
+// collapse the wide/narrow branches:
+let is_upsert = unique_pk
+    && upserted_pks.contains(batch.get_pk_bytes(row))
+    && entry.handle.has_pk_bytes(batch.get_pk_bytes(row));
+```
+
 **FK existence checks stay correct with no change.** A FK references a single parent
 column (`parent_col_idx`). `is_parent_pk = pk.len()==1 && pk[0]==parent_col_idx`
 (`master.rs:1786`) fires *only* for a **lone-PK** parent — and a lone-PK parent has
@@ -439,92 +487,261 @@ column) **broadcasts** (`:1818`), and broadcast is correct under *any* distribut
 prefix-distributed parent needs no FK change to remain correct; FK checks just
 broadcast more than strictly necessary.
 
-**Scatter-by-prefix is a deferrable optimization, and is not "one boolean."** To
-turn a broadcast into a scatter when the child's referenced columns cover the
-parent's first-*k* PK columns: `ScatterSource` currently passes the full parent
-schema, and `build_check_batch` (`master.rs:3314-3338`) fills exactly the lone PK
-column's bytes (`:3336`). Scattering by a prefix requires (a) filling the parent's
-first-*k* PK columns' OPK bytes into the check batch in PK order, and (b) routing the
-`with_worker_indices` call at `:1282` by `dist_stride` (via a synthetic prefix-PK
-schema or a prefix-sliced router). The parent gather at `:1382` routes by the parent
-PK identically and would need the same treatment. This is real, multi-site work for
-a broadcast-elision win on compound-PK parents; defer it unless that broadcast is
-shown to matter.
+**No scatter-by-prefix optimization is reachable, so none is built.** Turning a
+broadcast into a prefix-scatter would only help a parent whose *base table* is probed
+by its distribution-prefix columns. That requires a **compound** FK referencing the
+parent's PK prefix — and compound-parent FK resolution is out of scope at the DDL
+layer (`ddl.rs`), so no such check exists. A single-column FK against a non-lone-PK
+parent is checked against a **unique index** (`master.rs:1802-1820`), which is
+distributed by its own key, not the base table's prefix (secondary indexes are not
+prefix-distributed, §2). So the lone-PK fast-path (already a scatter) is the only
+base-table FK probe, and it is already optimal. FK checks need no change here.
 
 ## 5. Data-model / persistence changes
 
-- **Persist *k* in the existing `flags` column** (`TABLE_TAB`,
-  `sys_tables.rs:184-186`): a 3-bit field above `TABLETAB_FLAG_UNIQUE_PK` (bits
-  `[1..4)`), with `0` meaning "default = full PK." Only bit 0 of `flags` is in use
-  today (verified exhaustively: `TABLETAB_FLAG` has exactly three sites — the
-  constant `sys_tables.rs:43`, the read `(flags & TABLETAB_FLAG_UNIQUE_PK)` at
-  `hooks.rs:179`, and a `#[cfg(test)]` write at `ddl.rs:180`; the production write is
-  `client.rs:528` `unique_pk as u64`; the `drop_table` round-trip reads `flags`
-  (`client.rs:934`) and re-writes it **verbatim** (`:556`), so packed bits survive a
-  DROP). Concretely: the writer becomes `flags = (k_field << 1) | (unique_pk as u64)`
-  and the reader adds `let k = (flags >> 1) & 0x7;`. **Both** write sites must change
-  — `client.rs:528` (production) and `ddl.rs:195` (test-only) — or catalog
-  round-trip tests diverge. Two bits actually suffice (an explicit prefix is always
-  `< |PK| ≤ 4`, since `k = |PK|` is the default `0`), so the third bit is headroom.
-  This adds no `TABLE_TAB` column and no change to the positional decode at either
-  site — `flags` is already read there. Guard against future code that reconstructs
-  a `TABLE_TAB` row from `unique_pk` alone: it would silently zero *k*, since *k* now
-  rides the same column.
-- **Validate** with a small `validate_dist_prefix(pk, cols) -> k`: the named columns
-  must equal `pk_indices[..cols.len()]` and `1 ≤ cols.len() ≤ |pk|`. No type/null
-  re-checks — those are inherited from `validate_pk_cols`
-  (`sys_tables.rs:64-112`: eligibility, non-null, no-dups, width), since `dist ⊆
-  pk`. A prefix variant of `shard_cols_match_pk` (`schema.rs:455-458`) is the natural
-  sequence-equality primitive.
-- **`TableEntry`** (`dag.rs:310-317`) gains `dist_prefix_len: u8` (decoded from
-  flags in `hook_table_register`, threaded through `register_table`; `0` normalized
-  to `|pk|`). `RelationKind` stays 1 byte — the distribution key is data on
-  `TableEntry`, not a `RelationKind` variant (widening `BaseTable{unique_pk}` would
-  break the `:283` 1-byte niche assert).
-- **`dist_stride`** = the encoded byte width of the first *k* PK columns =
-  `schema.pk_byte_offset(pk_indices()[k])` for `k < |PK|`, else `pk_stride`. It is a
-  pure function of `schema` + *k* (so it can live on the schema, §11 simplification).
-- **`PartitionedTable`** gains `dist_stride: usize`, **computed in
-  `PartitionedTable::new` at construction** (from the schema + decoded *k*), so the
-  per-row ingest and probe loops read a field, and — critically for recovery (§7) —
-  every `PartitionedTable` carries its final `dist_stride` the moment it exists. This
-  threads a new argument through `PartitionedTable::new` (already
-  `#[allow(too_many_arguments)]`), `build_partitioned_storage` (`hooks.rs:140`), and
-  `register_table`; the **view** registration path also calls
-  `build_partitioned_storage` and must pass the full-PK default (`dist_stride =
-  pk_stride`).
-- **`ExternalTable`** (compiler-side) carries *k* so `compute_co_partitioned` can
-  call `shard_cols_match_dist_key`.
+### 5.1 The distribution prefix lives on `SchemaDescriptor`
+
+`dist_stride` is a pure function of `(columns, pk_indices, k)`. Every site that
+routes by, or detects co-partitioning on, the table key already holds the table's
+`SchemaDescriptor`: storage (`PartitionedTable.schema`), DML scatter
+(`fill_worker_indices`'s `schema` arg), SEEK (`get_schema_desc`,
+`master.rs:949-952`), and **both** detectors (`ext.schema`; `entry.schema`). So the
+prefix rides on the descriptor — no separate field or argument on `PartitionedTable`,
+`TableEntry`, or `ExternalTable`, and no extra parameter on `PartitionedTable::new`
+or `fill_worker_indices`.
+
+`SchemaDescriptor` gains two `u8` fields, both computed once in the constructor:
+
+- `dist_prefix_len: u8` — *k*, the column count. Read by `shard_cols_match_dist_key`.
+- `dist_stride: u8` — the byte width of the first *k* PK columns. Read by the
+  routers. `dist_stride ≤ pk_stride ≤ MAX_PK_BYTES = 80`, so `u8` suffices.
+
+This is safe and total: `SchemaDescriptor` is never serialized as raw bytes (it is
+rebuilt on every worker from `COL_TAB`/`TABLE_TAB` via `build_schema_from_col_defs`,
+so `#[repr(C)]` is for stable field layout, not the wire), and the **only**
+struct-literal construction is inside `new` — every other site calls `new`/
+`new_with_dist`. `PartialEq` stays structural (columns + PK only); distribution is
+physical metadata and is deliberately excluded, which is correct because derived
+schemas (join/map/reduce/projection outputs, all built via `new` → full-PK default)
+are never table-key-routed — only base-table schemas' prefixes are ever read.
+
+`new` delegates to a single `new_with_dist` that normalizes and clamps *k* and sums
+`dist_stride` alongside `pk_stride` in the existing PK loop:
+
+```rust
+// schema.rs
+#[track_caller]
+pub const fn new(cols: &[SchemaColumn], pk_indices: &[u32]) -> Self {
+    // Default distribution = full PK: today's behavior, byte-for-byte.
+    Self::new_with_dist(cols, pk_indices, pk_indices.len())
+}
+
+#[track_caller]
+pub const fn new_with_dist(
+    cols: &[SchemaColumn],
+    pk_indices: &[u32],
+    dist_prefix_len: usize,
+) -> Self {
+    assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");
+    assert!(pk_indices.len() <= MAX_PK_COLUMNS, "new: pk_indices.len() exceeds MAX_PK_COLUMNS");
+
+    // 0 is the persisted default ("full PK"); a value past |PK| can only come
+    // from a corrupted catalog flag — clamp it rather than index out of bounds
+    // in the dist_stride sum below.
+    let dist_k = if dist_prefix_len == 0 || dist_prefix_len > pk_indices.len() {
+        pk_indices.len()
+    } else {
+        dist_prefix_len
+    };
+
+    let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
+    let mut i = 0;
+    while i < cols.len() { columns[i] = cols[i]; i += 1; }
+
+    let mut pk_arr = [0u32; MAX_PK_COLUMNS];
+    let mut stride_acc: u16 = 0;
+    let mut dist_stride_acc: u16 = 0;
+    let mut k = 0;
+    while k < pk_indices.len() {
+        assert!((pk_indices[k] as usize) < cols.len(), "new: pk index out of range");
+        let mut j = 0;
+        while j < k { assert!(pk_indices[j] != pk_indices[k], "new: duplicate PK column index"); j += 1; }
+        let col = cols[pk_indices[k] as usize];
+        assert!(col.type_code != type_code::STRING && col.type_code != type_code::BLOB,
+            "new: STRING and BLOB columns cannot be PK columns");
+        assert!(col.nullable == 0, "new: PK columns must be non-nullable");
+        assert!(col.type_code != type_code::F32 && col.type_code != type_code::F64,
+            "new: F32 and F64 columns cannot be PK columns");
+        let col_size = col.size() as u16;
+        pk_arr[k] = pk_indices[k];
+        stride_acc += col_size;
+        if k < dist_k { dist_stride_acc += col_size; } // tight, PK-list order ⇒ matches OPK layout
+        k += 1;
+    }
+    assert!(stride_acc <= u8::MAX as u16, "new: pk_stride exceeds u8 width");
+    assert!(stride_acc as usize <= MAX_PK_BYTES, "new: pk_stride exceeds MAX_PK_BYTES");
+
+    let (payload_mapping, payload_to_ci) = compute_mappings(cols.len(), pk_indices);
+    let payload_cmp = compute_payload_cmp(cols, &payload_mapping);
+    SchemaDescriptor {
+        num_columns: cols.len() as u32,
+        pk_count: pk_indices.len() as u32,
+        pk_indices: pk_arr,
+        pk_stride: stride_acc as u8,
+        dist_stride: dist_stride_acc as u8,
+        dist_prefix_len: dist_k as u8,
+        payload_mapping,
+        payload_to_ci,
+        payload_cmp,
+        columns,
+    }
+}
+
+#[inline] pub const fn dist_stride(&self) -> u8 { self.dist_stride }
+#[inline] pub const fn dist_prefix_len(&self) -> u8 { self.dist_prefix_len }
+```
+
+`build_schema_from_col_defs` (`store.rs:1627`) gains a `dist_prefix_len` argument
+forwarded to `new_with_dist`: the table-register path (`hooks.rs:203`) passes the
+decoded *k*; the **view** path (`hooks.rs:323`) passes `pk_cols.len()` (the full-PK
+default — views are not distributed by a chosen key, §2). `PartitionedTable::new`
+needs no new argument — it already takes `schema`, and reads `schema.dist_stride()`.
+
+### 5.2 Persisting *k* in `TABLE_TAB.flags`
+
+Persist *k* in the existing `flags` column (`TABLE_TAB`, `sys_tables.rs:184-186`),
+**byte-aligned**: bit 0 stays `TABLETAB_FLAG_UNIQUE_PK`; *k* occupies byte 1 (bits
+`[8..16)`), with `0` meaning "default = full PK." Byte alignment keeps the boolean
+flag bits `[1..8)` free for future flags without colliding with *k* (the bit-1-
+adjacent packing would force the next boolean flag to dodge *k*). One source of
+truth, in `gnitz-wire` (visible to both the `gnitz-core` writer and the
+`gnitz-engine` reader — the same crate as `pack_pk_cols`):
+
+```rust
+// gnitz-wire/src/catalog.rs — TABLE_TAB.flags layout:
+//   bit 0        unique_pk (TABLETAB_FLAG_UNIQUE_PK)
+//   bits [8..16) distribution prefix length k (0 = default = full PK)
+pub const TABLE_FLAG_DIST_SHIFT: u32 = 8;
+pub const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
+
+#[inline]
+pub fn pack_table_flags(unique_pk: bool, dist_prefix_len: usize) -> u64 {
+    ((dist_prefix_len as u64) << TABLE_FLAG_DIST_SHIFT) | (unique_pk as u64)
+}
+#[inline]
+pub fn table_flags_dist_prefix(flags: u64) -> usize {
+    ((flags >> TABLE_FLAG_DIST_SHIFT) & TABLE_FLAG_DIST_MASK) as usize
+}
+```
+
+`flags` is only ever produced at three sites and consumed at one — all switch to the
+helper, so no encoding can drift:
+
+- production write `client.rs:528`: `.u64_val(pack_table_flags(unique_pk, dist_prefix_len))`;
+- `#[cfg(test)]` write `ddl.rs:~180`: `let flags = pack_table_flags(unique_pk, dist_prefix_len);`
+  (emits `k = 0` until a test exercises `CLUSTER BY`, which is the default and stays
+  byte-identical to today);
+- the `drop_table` round-trip reads `flags` and re-writes it **verbatim**
+  (`client.rs`), so packed bits survive a DROP unchanged;
+- read `hooks.rs:178-179`: keep `is_unique = (flags & TABLETAB_FLAG_UNIQUE_PK) != 0`
+  and add `let k = table_flags_dist_prefix(flags);`.
+
+`k < |PK| ≤ PK_LIST_MAX_COLS = 4` for an explicit prefix (since `k = |PK|` is the
+default `0`), so two bits would actually suffice; the full byte is deliberate
+headroom and self-documenting (`& 0xFF`). No `TABLE_TAB` column is added and the
+positional decode is unchanged — `flags` (payload col 5) is already read there.
+
+### 5.3 DDL validation
+
+`validate_dist_prefix(pk, cols) -> Result<usize, String>` returns *k* (= `cols.len()`)
+when the named columns are exactly the PK's leading prefix in PK order, else an error
+pointing at PK column order. No type/null/width re-checks — those are inherited from
+`validate_pk_cols` (`sys_tables.rs:64-112`), since `dist ⊆ pk`.
+
+```rust
+pub fn validate_dist_prefix(pk: &[u32], cols: &[u32]) -> Result<usize, String> {
+    if cols.is_empty() || cols.len() > pk.len() {
+        return Err(format!(
+            "CLUSTER BY expects 1..={} leading PRIMARY KEY columns, got {}",
+            pk.len(), cols.len()));
+    }
+    if cols != &pk[..cols.len()] {
+        return Err("CLUSTER BY columns must be a leading prefix of the PRIMARY KEY, \
+                    in PK order; reorder the PK so the distribution column(s) lead".into());
+    }
+    Ok(cols.len())
+}
+```
+
+`RelationKind` stays 1 byte — distribution is data on the schema, not a
+`RelationKind` variant (widening `BaseTable{unique_pk}` would break the `dag.rs:283`
+1-byte niche assert).
 
 ## 6. Implementation (sites)
 
-Sites are grouped **mandatory** (core correctness) vs **optional** (further
-optimization).
-
-**Mandatory:**
+Every site is required: the four table-key routers are an all-or-none set (§4.2), and
+the upsert-probe unification (§4.4) routes the last PK probe through the same
+distribution-aware funnel.
 
 | Concern | Site | Change |
 |---|---|---|
+| Schema descriptor | `schema.rs` | add `dist_stride: u8` + `dist_prefix_len: u8`; `new_with_dist` (`new` delegates with `pk.len()`); accessors; `shard_cols_match_dist_key` (exact). §5.1 |
 | DDL parse | `gnitz-sql/src/planner.rs:239` (`execute_create_table`) | read `create.cluster_by` — `CLUSTER BY a, b` (unparenthesized comma list) is parsed into `cluster_by` by `GenericDialect` (sqlparser 0.56 `parser/mod.rs:7162-7168`); resolve idents like the PK pass. `DISTRIBUTE BY` has **no** AST node, so `CLUSTER BY` (or a `WITH (...)` option) is the surface. |
-| DDL validate | `gnitz-sql` + `sys_tables.rs` | `validate_dist_prefix(pk, cols) -> k` (cols == PK[..k]) |
-| DDL persist | `client.rs:528` **and** `ddl.rs:195` | `flags = (k << 1) \| unique_pk` at **both** write sites |
-| DDL apply | `hooks.rs:164-243` (`:178-179`) | decode `k = (flags>>1)&0x7`; compute `dist_stride`; pass to `build_partitioned_storage` → `PartitionedTable::new` |
-| Sys-table flags | `sys_tables.rs:43` | reserve flag bits `[1..4)` for *k* |
-| Storage ingest routing | `partitioned_table.rs:29-35,138-140` | carry cached `dist_stride`; ingest routes by `pk_bytes[..dist_stride]` |
-| **PK probe (uniqueness/retraction)** | `partitioned_table.rs:410-418` | `local_index_bytes` slices to `[..dist_stride]`. **Omitting this silently loses retractions / duplicates PKs (§4.4).** |
-| DML scatter | `master.rs:2606`, `exchange.rs:325-330` | pass the *committed table's* `dist_stride`; slice in the `is_pk_routing` branch only (relay scatters untouched) |
-| SEEK routing | `master.rs:953-967` | slice the assembled OPK to `[..dist_stride]` (still pins one worker; no broadcast clause) |
-| Co-partition (joins) | `compiler.rs:597-622`, `schema.rs:455-458` | `shard_cols_match_dist_key`; thread *k* onto `ExternalTable` |
-| Co-partition (single-source views) | `dag.rs:757-789` | same `shard_cols_match_dist_key` (`:788`); read *k* from `TableEntry`. Governs GROUP BY/reduce skips (§4.3). |
-| Catalog | `dag.rs:310-317` | `TableEntry.dist_prefix_len`; set from hook; thread through `register_table` |
-| Recovery | (none) | ingest re-hash and probe read the cached `dist_stride`; ordering already safe (§7) |
+| DDL validate | `gnitz-sql` + `sys_tables.rs` | `validate_dist_prefix(pk, cols) -> k` (cols == PK[..k]). §5.3 |
+| Flag helper | `gnitz-wire/src/catalog.rs` | `pack_table_flags` / `table_flags_dist_prefix` (byte-aligned: *k* in bits `[8..16)`). §5.2 |
+| DDL persist | `client.rs:528` **and** `ddl.rs:~180` | both write `pack_table_flags(unique_pk, k)`; `create_table` gains a `dist_prefix_len` param |
+| DDL apply | `hooks.rs:164-243` (`:178-203`) | `let k = table_flags_dist_prefix(flags);` pass *k* to `build_schema_from_col_defs` → `new_with_dist`; the schema then carries `dist_stride` for `build_partitioned_storage` |
+| Storage ingest routing | `partitioned_table.rs:138-140` | route by `&pk_bytes[..schema.dist_stride()]` (the struct already holds `schema`) |
+| **PK probe (uniqueness/retraction)** | `partitioned_table.rs:410-418` | `local_index_bytes` slices to `[..schema.dist_stride()]`. **Omitting this silently loses retractions / duplicates PKs (§4.4).** |
+| Upsert-probe unification | `catalog/validation.rs:158-348` | drop the wide-PK `base_cursor` branch (`:177-181, :303-305`) and the now-unused `wide`/`row_pk_bytes`; both widths probe via `entry.handle.has_pk_bytes(...)`, routing the last PK probe through `local_index_bytes` (§4.4) |
+| DML scatter | `exchange.rs:325-330` (`fill_worker_indices`) | slice the `is_pk_routing` branch to `[..schema.dist_stride()]` (relay scatters untouched). No call-site change at `master.rs:2606` — it already passes `schema`. |
+| SEEK routing | `master.rs:949-965` | route on `[..schema.dist_stride()]` (keep `pk_stride` for `assemble_wide_pk`); still pins one worker, no broadcast clause |
+| Co-partition (joins) | `compiler.rs:597-622` | `ext.schema.shard_cols_match_dist_key(&cols)` (keep the `tc != 0` guard) |
+| Co-partition (single-source views) | `dag.rs:757-789` (`:788`) | `entry.schema.shard_cols_match_dist_key(&shard_cols)`. Governs GROUP BY/reduce skips (§4.3). |
+| Test scatter helper | `exchange.rs:868-939` (`op_multi_scatter`, `#[cfg(test)]`) | slice the `is_pk_routing` branch to `[..schema.dist_stride()]` so prefix-distributed test tables route as production does |
+| Recovery | (none) | ingest re-hash and probe read `schema.dist_stride()`; the schema carries it at construction, ordering already safe (§7) |
 
-**Optional (deferrable optimization, §4.4):**
+The four production table-key routers and the test helper, all sliced to the **same**
+`schema.dist_stride()` (byte-identical to today when `dist_stride == pk_stride`):
 
-| Concern | Site | Change |
-|---|---|---|
-| FK scatter-by-prefix | `master.rs:1282,1382,3314-3338`, `catalog/validation.rs` | fill the parent's first-*k* PK columns into the check/gather batch and route by the parent's `dist_stride`; until done, compound-PK parents broadcast (correct, slower) |
-| Filtered GROUP BY locality | `dag.rs:767-776` | relax the bare-scan restriction to walk Filters, unifying with `compute_co_partitioned`; extends the §4.3 bonus to `GROUP BY prefix … WHERE …` |
+```rust
+// partitioned_table.rs — ingest (was: partition_for_pk_bytes(mb.get_pk_bytes(i)))
+let dist = self.schema.dist_stride() as usize;            // hoist before the loop
+for i in 0..mb.count {
+    part_indices[partition_for_pk_bytes(&mb.get_pk_bytes(i)[..dist])].push(i as u32);
+}
+
+// partitioned_table.rs — local_index_bytes (probe funnel: has_pk_bytes / retract_pk_bytes)
+fn local_index_bytes(&self, key: &[u8]) -> Option<usize> {
+    let dist = self.schema.dist_stride() as usize;
+    let p = partition_for_pk_bytes(&key[..dist]) as u32; // key is the full PK; slice to the prefix
+    let local = p.wrapping_sub(self.part_offset) as usize;
+    (local < self.tables.len()).then_some(local)
+}
+
+// exchange.rs — fill_worker_indices (and the same edit in #[cfg(test)] op_multi_scatter)
+if is_pk_routing {
+    let dist = schema.dist_stride() as usize;
+    for i in 0..batch.count {
+        out[w_map[partition_for_pk_bytes(&mb.get_pk_bytes(i)[..dist])]].push(i as u32);
+    }
+} else { /* GroupKey fallback — unchanged */ }
+
+// master.rs — fan_out_seek_async
+let stride = schema.pk_stride() as usize;     // full width: assemble_wide_pk needs it
+let dist = schema.dist_stride() as usize;     // routing width
+let worker = if schema.pk_is_wide() {
+    let buf = crate::schema::assemble_wide_pk(&schema, pk, seek_pk_extra, stride)?;
+    worker_for_partition(partition_for_pk_bytes(&buf[..dist]), num_workers)
+} else {
+    let (opk, _) = crate::storage::opk_key(&schema, pk);
+    worker_for_partition(partition_for_pk_bytes(&opk[..dist]), num_workers)
+};
+```
+
+A filtered `GROUP BY prefix … WHERE …` still exchanges (the view detector requires a
+bare scan, §4.3); relaxing that to co-partition is a separable optimization, designed
+in `plans/filtered-groupby-copartition.md`.
 
 ## 7. Recovery
 
@@ -534,14 +751,15 @@ optimization).
   both run in the master pre-fork. User-data SAL replay (`recover_from_sal`,
   `bootstrap.rs:164-189`) runs only in each forked child. Both catalog paths fire the
   same `hook_table_register` → `build_partitioned_storage` (`hooks.rs:140-162`), so a
-  single decode-and-plumb edit covers both. **Precondition:** `dist_stride` must be
-  materialized *inside* `PartitionedTable::new` at construction (§5). Given that,
-  every `PartitionedTable` carries its final `dist_stride` before any user row is
-  re-ingested — so re-ingest re-hashes by the correct prefix and there is **no change
-  to `replay_ingest` / `bootstrap.rs`**.
+  single decode-and-plumb edit covers both. **Precondition:** `dist_stride` is carried
+  on the `SchemaDescriptor`, materialized in `new_with_dist` (§5.1), and the schema is
+  passed to `PartitionedTable::new` at construction. Given that, every
+  `PartitionedTable` knows its distribution width before any user row is re-ingested —
+  so re-ingest re-hashes by the correct prefix and there is **no change to
+  `replay_ingest` / `bootstrap.rs`**.
 - A table's re-hash on replay flows through `ingest_owned_batch`
   (`partitioned_table.rs:138-140`), and the per-partition probe through
-  `local_index_bytes` (`:410-418`); both read the cached `dist_stride`. The SAL
+  `local_index_bytes` (`:410-418`); both read `self.schema.dist_stride()`. The SAL
   `FLAG_PUSH` groups were scattered by the prefix at write time; each worker reads the
   shared SAL but materializes only partitions it owns (`trim_worker_partitions` drops
   foreign child tables; the re-scatter skips foreign-partition rows), so the re-hash
@@ -558,8 +776,11 @@ optimization).
 - A table has one distribution key, so a fact table co-partitions with at most one
   dimension; other joins still exchange (or use a replicated dimension — separate
   plan).
-- The co-partition detector matches an *exact* prefix, not a super-prefix (§4.3), so
-  some safely-co-located joins/GROUP BYs still exchange.
+- The co-partition detector matches an *exact* prefix, not a super-prefix (§4.3).
+  For GROUP BY this is conservative (a super-prefix grouping is safe but still
+  exchanges); for joins it is **required** — a super-prefix join skip can route the
+  two sides at mismatched widths and drop matches, so exact match is correctness, not
+  just caution.
 - **Distribution-prefix skew is the dominant cost (§11).** The full-PK default
   spreads rows by a (near-)unique key. A short, low-cardinality prefix (e.g.
   `customer_id` when a few customers hold most rows) concentrates rows onto a few of
@@ -582,6 +803,13 @@ optimization).
 - **Proper-prefix correctness**: the `orders` side above (distribution prefix ⊊ PK)
   returns rows correctly grouped by `customer_id` (verifies the local `map_reindex`
   relabel runs under exchange-skip).
+- **Super-prefix join safety (exact-match regression)**: a 2-column join with side A
+  `PRIMARY KEY (a1, a2) CLUSTER BY a1` (k=1) and side B `PRIMARY KEY (b1, b2)` default
+  (k=2) on `a1=b1 AND a2=b2` must return correct results. Assert A is **not**
+  exchange-skipped (a relay scatter fires on A) — it routes by `a1` but the join key
+  is `(a1,a2)`, so it must repartition to the full key to meet B. A super-prefix
+  detector (`cols.len() >= k`) would wrongly skip A and silently drop matches; this
+  test fails under that bug and passes under exact match (§4.3). Run at `GNITZ_WORKERS=4`.
 - **Uniqueness / retraction under a prefix key (the §4.4 regression)**: on a
   `CLUSTER BY prefix` table with a *compound* PK, insert two rows that share the
   distribution prefix but differ in the PK suffix, then UPSERT one and DELETE the
@@ -592,15 +820,16 @@ optimization).
 - **All-sites-or-none**: a test that ingests, then seeks and deletes by full PK on a
   prefix-distributed table — exercising ingest, probe, and SEEK together — to catch a
   partial rollout where one router slices and another does not.
-- **FK**: existence checks against a prefix-distributed parent stay correct
-  (compound-PK parents broadcast; lone-PK parents scatter); if the optional
-  scatter-by-prefix is built, assert it routes to the owning worker.
+- **FK**: existence checks against a prefix-distributed parent stay correct —
+  lone-PK parents scatter (by the full parent PK = its distribution prefix), every
+  other parent broadcasts (correct under any distribution).
 - **GROUP BY co-partition (§4.3)**: an unfiltered `GROUP BY prefix` on a
   prefix-distributed table skips its exchange and returns results identical to the
   exchanged path; a `GROUP BY` on a non-prefix column still exchanges; a filtered
-  `GROUP BY prefix … WHERE …` still exchanges (bare-scan limit) unless the §6 optional
-  relaxation lands. (DISTINCT and set-ops always exchange — they reindex to a
-  synthetic PK — so they are *not* expected to skip.) Run under `GNITZ_WORKERS=4`.
+  `GROUP BY prefix … WHERE …` still exchanges (the view detector's bare-scan limit —
+  relaxing it is `plans/filtered-groupby-copartition.md`). (DISTINCT and set-ops
+  always exchange — they reindex to a synthetic PK — so they are *not* expected to
+  skip.) Run under `GNITZ_WORKERS=4`.
 - **Skew sanity (§11)**: ingesting a low-cardinality-prefix dataset lands rows on a
   strict subset of partitions/workers (documents the hazard; not a correctness
   assertion).
@@ -621,6 +850,10 @@ optimization).
   scatters route by the join key / packed `_join_pk` and are untouched; the
   `tc == 0` co-partition gate keeps a skipped local join's two sides byte-equal at
   native width, and `widen_pk_be` keeps co-location robust across widths ≤ 16.
+- **Co-partition detection is exact-prefix** — `shard_cols_match_dist_key` fires only
+  on `cols.len() == k`, so a skipped join's two sides always route at the same
+  distribution width and equal join keys co-locate; a super-prefix match (which would
+  desync the widths) is never accepted (§4.3).
 - **256-bucket / contiguous-worker model** unchanged; `worker_for_partition` /
   `partition_range` are key-agnostic and untouched.
 - **Source of truth on durable base tables** — replay re-derives partition placement
@@ -631,7 +864,7 @@ optimization).
   latent bug beyond the partial-rollout hazard (§4.2), which the all-sites-or-none
   contract and its test (§9) close.
 
-## 11. Performance: allocation, cache, skew, and a simplification
+## 11. Performance: allocation, cache, and skew
 
 **The routing change adds zero allocation and zero copy.** `&pk_bytes[..dist_stride]`
 is a pointer/length narrowing of the existing `get_pk_bytes(i)` slice — no heap
@@ -647,12 +880,12 @@ line(s); a narrow prefix (≤ 16 B) reads *fewer* bytes and stays on the `widen_
 fast path (a prefix of exactly 16 B is meaningfully cheaper to route than 17 B, which
 falls to `xxh3`). There is no pointer-chasing or extra indirection.
 
-**Hoist `dist_stride` into a local before the hot loop.** Cache it on
-`PartitionedTable` (§5), store it as `usize` once (`pk_byte_offset`/`pk_stride` return
-`u8`), and bind `let dist_stride = self.dist_stride;` outside the per-row loops in
-`ingest_owned_batch` and `local_index_bytes` so the width is a register, not a field
-reload through `&self`, and `partition_for_pk_bytes`'s `len <= 16` branch stays
-predictable. Same for the `dist_stride` argument threaded into `fill_worker_indices`.
+**Hoist `dist_stride` into a local before the hot loop.** Bind
+`let dist = self.schema.dist_stride() as usize;` (it returns `u8`) outside the
+per-row loops in `ingest_owned_batch` and inside `local_index_bytes`, and the same
+`let dist = schema.dist_stride() as usize;` in `fill_worker_indices`, so the width is
+a register rather than a field reload through `&self`/`&schema` each row, and
+`partition_for_pk_bytes`'s `len <= 16` branch stays predictable.
 
 **Skew has a compounding cost, not just an imbalance (§8).** A low-cardinality
 distribution prefix concentrates rows onto a few of the 256 partitions. Because each
@@ -664,15 +897,6 @@ skew shows up twice: once as cross-worker load imbalance, and again as
 flush/compaction amplification on the hot worker's hot partitions. The full-PK default
 avoids both by spreading on a near-unique key. Weigh this per table against the
 shuffle it eliminates.
-
-**Simplification — carry the prefix on `SchemaDescriptor`.** `dist_stride` is a pure
-function of `(schema, k)`. If `SchemaDescriptor` carried `dist_prefix_len` (or the
-derived `dist_stride`), every consumer — storage, the two detectors, the routers —
-would read one field instead of *k* being threaded separately onto `ExternalTable`,
-`TableEntry`, and `PartitionedTable::new`. Both detectors already hold a
-`SchemaDescriptor`, and `dist_stride` would then be derivable wherever the schema is.
-Weigh against `SchemaDescriptor` being widely shared/immutable; if it is the wrong
-home, the per-struct threading in §5 stands.
 
 **The win it buys.** A co-partitioned **join** drops straight to `execute_pre_phase`
 (`copart_join`, `dag.rs:1353-1355`): no per-row IPC scatter, no wire
