@@ -42,17 +42,21 @@ because `seen.remove` on the delete prevents the stale re-negation.
 
 The divergence is an oversight, not a semantic distinction. The two variants
 *intentionally* differ only in whether they emit the **stored-row** retraction
-into the effective batch (partitioned emits it for downstream views; Single's doc
-comment, `dag.rs:1800-1802`, says retractions "pass through"). That distinction is
-about store state; it has nothing to do with maintaining the intra-batch `seen`
-map, which both variants need and only one gets right.
+into the effective batch (partitioned emits it for downstream views; the Single
+variant emits nothing — its `w > 0` branch calls `table.retract_pk_bytes`, which
+is read-only, and discards the result, `dag.rs:1830`). That distinction is about
+store state; it has nothing to do with maintaining the intra-batch `seen` map,
+which both variants need and only one gets right. The Single path's documented
+use — a "view store with no INSERT-over-existing row to retract" (`dag.rs:1800-1802`)
+— matches no relation that exists today, so it is both buggy and obsolete, not a
+deliberate variant worth keeping.
 
 ## Why this is dead in production
 
 The Single path fires only for a `StoreHandle::Borrowed` handle that is also
 `unique_pk == true` — a combination no production relation has:
 
-- `StoreHandle` has exactly two variants (`dag.rs:20-27`): `Partitioned` (base
+- `StoreHandle` has exactly two variants (`dag.rs:20-28`): `Partitioned` (base
   tables and views) and `Borrowed` (system tables, owned by `CatalogEngine`).
 - `table_ptr()` is non-null **only** for `Borrowed`; `ptable_ptr()` is non-null
   **only** for `Partitioned` (`dag.rs:40-53`). The dispatch in
@@ -62,40 +66,55 @@ The Single path fires only for a `StoreHandle::Borrowed` handle that is also
 - `unique_pk()` is true only for `RelationKind::BaseTable { unique_pk: true }`
   (`dag.rs:325-326`). Every base table is registered `Partitioned` (`hooks.rs:218`);
   every view is registered `Partitioned` (`hooks.rs:339`). The only `Borrowed`
-  registration in production is for system tables (`bootstrap.rs`), which are
-  `RelationKind::SystemCatalog` (`unique_pk == false`).
+  registration in production is for system tables (`bootstrap.rs:314-316`), which
+  are `RelationKind::SystemCatalog` (`unique_pk == false`).
 
 So `Borrowed && unique_pk` never co-occurs at runtime. The partitioned variant's
 own comment confirms it is the live path: *"this is the sole path now"*
-(`dag.rs:1866`). The Single variant's doc comment ("Used for Single (view)
-stores", `dag.rs:1800-1802`) describes a configuration that no longer exists —
-views are `Partitioned`.
+(`dag.rs:1866`).
 
-The only code that reaches Single `enforce_unique_pk` is two test fixtures that
-register a `Borrowed` + `unique_pk: true` table and ingest through
-`ingest_to_family`:
+**Exactly one test reaches the Single `enforce_unique_pk`:**
+`engine_tests.rs::test_enforce_unique_pk` (registration `:20`), which registers a
+`Borrowed` + `unique_pk: true` `Table` and drives it through `dag.ingest_to_family`
+(→ `ingest_returning_effective` → Single dispatch; `dag.rs:937-939, 984-986`). It
+covers insert / intra-batch dup / insert+delete but **not** the `+1, -1, +1` case,
+so it does not lock in the buggy behaviour.
 
-- `catalog/tests/engine_tests.rs::test_enforce_unique_pk` (registration at
-  `engine_tests.rs:20`) — covers insert / intra-batch dup / insert+delete, but
-  **not** the `+1, -1, +1` case, so it does not lock in the buggy behavior.
-- `catalog/tests/wide_pk_validation.rs` (registrations at `:64`, `:182`; ingests at
-  `:216`, `:224`) — exercises the wide-PK (`pk_stride > 16`) `PkBuf` keying that
-  avoids a `u128` round-trip.
+Three other fixtures register the same `Borrowed` + `unique_pk: true` combination
+but **never** call `ingest_to_family` / `ingest_returning_effective` on it, so none
+reaches `enforce_unique_pk`; all three seed with `Table::ingest_owned_batch` and
+exercise only read/validation paths:
 
-That keying logic is **identical** in both variants (both key on
-`get_pk_bytes` / `PkBuf`), so the wide-PK coverage belongs on the live
-partitioned path, not the dead Single one.
+- `wide_pk_validation.rs:64` (`setup_wide_unique`) — tests `validate_unique_indices`.
+  Its own doc comment states it bypasses `ingest_to_family`.
+- `wide_pk_validation.rs:182` (`wide_pk_seek_family_bytes_resolves_non_pk_col`) —
+  tests `seek_family_bytes` (a read path).
+- `index_tests.rs:2794` — tests `seek_by_index_range` (a read path).
+
+(The `ingest_to_family` calls at `wide_pk_validation.rs:216,224` are in
+`seek_family_bytes_matches_seek_family_narrow`, on a *normally-created, Partitioned,
+narrow-PK* table from `create_table(..., true)` at `:207` — they exercise
+`enforce_unique_pk_partitioned`, the live path, not the Single one.)
+
+So removing the Single path requires changing exactly one test
+(`test_enforce_unique_pk`); the three read-only fixtures keep their `Borrowed`
+handles untouched. The wide-PK `PkBuf` keying those fixtures exercise lives in
+`validate_unique_indices` / `seek_family_bytes` / `batch_project_index`, **not** in
+`enforce_unique_pk` — the dead variant has no wide-PK coverage to preserve.
 
 ## Plan: remove the Single path
 
-Per the project rule that no legacy code remains, delete the vestigial variant
-and move its still-useful coverage onto the path that actually runs. This
-eliminates the bug by construction (there is no second `seen`-handling copy to
-drift) and makes the wide-PK test exercise production code.
+Per the project rule that no legacy code remains, delete the vestigial variant,
+fold the one live test onto the path that actually runs, and add the missing
+regression. This eliminates the bug by construction (there is no second
+`seen`-handling copy to drift) and makes the intra-batch coverage exercise
+production code.
 
 ### 1. Delete `enforce_unique_pk` (Single)
 
-Remove `dag.rs:1798-1848` (the doc comment through the function body).
+Remove `dag.rs:1798-1848` (the doc comment through the function body). **Keep**
+`normalize_unique_pk_weights` (`dag.rs:1783-1796`) immediately above it — it is
+shared and still called by `enforce_unique_pk_partitioned` (`dag.rs:1874`).
 
 ### 2. Collapse the dispatch in `ingest_returning_effective`
 
@@ -119,56 +138,71 @@ let effective_batch = if unique_pk {
 };
 ```
 
-`tbl_ptr` is then unused by this function; drop its binding (`dag.rs:977`) if no
-other statement references it.
+`tbl_ptr` is then unused by this function; drop its binding (`dag.rs:977`). The
+`debug_assert!` turns any future stray `Borrowed` + `unique_pk` registration into
+a loud failure at its first ingest, rather than a silent no-enforcement passthrough.
 
-### 3. Migrate the two test fixtures to a single-partition `PartitionedTable`
+### 3. Migrate the one live fixture
 
-`PartitionedTable::new(dir, name, schema, table_id, 1, persistence, 0, 1,
-arena_size)` (`partitioned_table.rs:39-49`) builds a single-partition table whose
-`ptable_ptr` is non-null, so it routes to `enforce_unique_pk_partitioned`. In both
-`engine_tests.rs::test_enforce_unique_pk` and the `wide_pk_validation.rs` tests,
-replace the `Table::new(...)` + `StoreHandle::Borrowed(table_ptr)` setup with:
+Only `engine_tests.rs::test_enforce_unique_pk` touches the Single path, and its
+current body scans the `Table` it owns directly (`scan(&mut table)`,
+`engine_tests.rs:30-38`). That `table` cannot survive a move into a `Partitioned`
+handle, so do **not** hand-build a `PartitionedTable` and re-register it (that
+re-introduces the moved-`table` scan problem). Rewrite the test on the high-level
+`CatalogEngine` API, mirroring the existing `test_ingest_unique_pk_partitioned`
+(`engine_tests.rs:203-230`):
 
 ```rust
-let pt = PartitionedTable::new(&tdir, "upk", schema, 100, 1,
-    crate::storage::Persistence::Ephemeral, 0, 1, SYS_TABLE_ARENA).unwrap();
-dag.register_table(100,
-    StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))),
-    schema, RelationKind::BaseTable { unique_pk: true }, 0, tdir.clone());
+let mut engine = CatalogEngine::open(&dir).unwrap();
+let cols = vec![u64_col_def("id"), u64_col_def("val")];
+let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk ⟹ Partitioned
+let schema = engine.get_schema(tid).unwrap();
+// per case: engine.ingest_to_family(tid, &batch); engine.flush_family(tid);
+//           assert_eq!(engine.scan_family(tid).count, expected);
 ```
 
-The partitioned variant emits the stored-row retraction into the effective batch,
-so a cross-batch upsert now yields `(-1 old, +1 new)` instead of the Single path's
-insert-only delta. Adjust the assertions accordingly (the `engine_tests.rs:64-68`
-note about the Single path not emitting the stored retraction no longer applies —
-remove it and assert the retraction is present).
+Port the existing cases unchanged — their net live-row counts (`1, 2, 3, 3`) are
+identical on the partitioned path, because none is a cross-batch upsert, so the
+partitioned variant's extra stored-row retraction never fires. Drop the manual
+`Table`/`Borrowed` setup, the `scan` closure, and the `:64-68` note (it described
+the Single path's non-emission of the stored retraction — irrelevant here). Follow
+the existing partitioned test's ingest → `flush_family` → `scan_family` rhythm so
+the scan is deterministic. Leave `wide_pk_validation.rs` and `index_tests.rs`
+untouched.
 
 ### 4. Add the `+1, -1, +1` regression case
 
-To `test_enforce_unique_pk` (now on the partitioned path), append a fourth case: a
-single batch with rows `+1 K(v)`, `-1 K(v)`, `+1 K(v)`, and assert `K` survives at
-net weight `+1`. This guards the live path against re-introducing the
-`seen`-staleness defect.
+Append a case to the rewritten `test_enforce_unique_pk`: a single batch with rows
+`+1 K(v)`, `-1 K(v)`, `+1 K(v)` on a fresh PK, ingest + flush, and assert the scan
+count rises by exactly one (K survives at net `+1`). On the deleted Single path
+this nets to `0`; on the partitioned path it nets to `+1`, so the case is a genuine
+guard against re-introducing the `seen`-staleness defect.
 
-## Folded-in optimization: drop the redundant `PkBuf` alloc on the surviving path
+For a tighter function-level guard, optionally also add a sibling of the
+`test_enforce_unique_pk_partitioned_*` unit tests in `dag.rs` (≈`:2196+`) that
+calls `DagEngine::enforce_unique_pk_partitioned(&mut pt, &schema, batch)` on the
+same `+1, -1, +1` batch and asserts the returned effective batch nets to `+1` for
+`K`. None of the existing partitioned unit tests covers insert→delete→re-insert.
 
-On the same `enforce_unique_pk_partitioned`, the intra-batch insertion bookkeeping
-re-allocates a `PkBuf` key even when the PK already lives in `seen`
-(`dag.rs:1906-1912`):
+## Folded-in optimization: one map probe instead of two on the surviving path
+
+On `enforce_unique_pk_partitioned`, the `w > 0` insertion bookkeeping does
+`seen.get` then an unconditional `seen.insert` (`dag.rs:1906-1912`):
 
 ```rust
 if let Some(&prev_pos) = seen.get(pkb) {
     effective.append_batch_negated(&batch, prev_pos, prev_pos + 1);
 }
 effective.append_batch(&batch, row, row + 1);
-seen.insert(PkBuf::from_bytes(pkb), row);   // re-allocates the key on a hit
+seen.insert(PkBuf::from_bytes(pkb), row);   // rebuilds the key on every +1 row
 ```
 
-`seen.get` then `seen.insert` is two hashes plus a fresh `PkBuf::from_bytes` (a heap
-allocation) on every `+1` row, including when the key is a repeat. Use a single
-`get_mut` and update the position in place on a hit, allocating the key only on the
-miss:
+`PkBuf` is a `Copy` 81-byte stack value (`manifest.rs:71` — `[u8; 80]` + `len`),
+and `seen.get(pkb)` already does a zero-allocation heterogeneous lookup via
+`Borrow<[u8]>` (`manifest.rs:104`), so there is **no heap allocation** on this path.
+What every `+1` row pays is two hash probes plus, in the unconditional `insert`, an
+80-byte stack `PkBuf` build and a bucket write. Fold the lookup and the update into
+one `get_mut`, building the key only when the PK is new:
 
 ```rust
 if let Some(prev_pos) = seen.get_mut(pkb) {
@@ -180,16 +214,45 @@ if let Some(prev_pos) = seen.get_mut(pkb) {
 effective.append_batch(&batch, row, row + 1);
 ```
 
-The `append_batch(&batch, row, row + 1)` of the new insertion stays
-**unconditional** — it runs on both the hit and miss arms (the original appends it
-after the `if`). The negation, when a prior insertion exists, is still appended
-before it. Effective output is identical to the original for every input; only the
-per-hit `PkBuf` allocation and one hash lookup are removed.
+`append_batch(&batch, row, row + 1)` stays **unconditional** (it runs on both arms,
+as in the original); the negation, when a prior insertion exists, is still appended
+before it. Output is identical to the original for every input (verified on the hit
+and miss arms). The saving — one hash probe, one `PkBuf` build, one bucket write —
+applies **only to repeated-PK rows within a batch** (intra-batch upserts / dedup);
+an all-distinct batch still pays `get_mut` + `insert` and is unchanged. This is a
+small, low-risk cleanup, not a hot-path win.
 
-> Apply the same `get_mut` shape to the `w < 0` branch's `seen.get` +
-> `append_batch_negated` + `seen.remove` (`dag.rs:1925-1928`) only if convenient —
-> there the key is being removed, so no allocation is saved; leave it as-is to keep
-> the diff minimal.
+> Leave the `w < 0` branch's `seen.get` + `seen.remove` (`dag.rs:1925-1928`) as-is:
+> it removes the key, so `get_mut` buys nothing there.
+
+## Coverage gap: wide-PK enforcement is untested
+
+Because the wide_pk fixtures never reach `enforce_unique_pk`/`_partitioned`, the
+wide-PK (`pk_stride > 16`) `PkBuf` keying on the *enforcement* path has no test —
+the `test_enforce_unique_pk_partitioned_*` unit tests (`dag.rs:2196+`) all use
+narrow `I64`/`U64` PKs. This keying is the very logic the `PkBuf`-over-`u128`
+comments on both variants warn about (a `u128` round-trip double-flips a signed PK's
+sign bit), so it is worth one direct test: build a Partitioned table with a 24-byte
+(3×`u64`) PK and run an intra-batch dedup + cross-batch upsert through
+`enforce_unique_pk_partitioned`, asserting the effective batch keys and retracts on
+the full 24 bytes. A `Table::ingest_owned_batch`-only fixture like `setup_wide_unique`
+cannot cover this — the batch must flow through the enforcement function.
+
+## Simplification: rename the sole survivor
+
+With the Single variant gone, `enforce_unique_pk_partitioned` is the only
+enforcement function and the `_partitioned` suffix is vestigial. Renaming it to
+`enforce_unique_pk` makes the prose that already calls it that accurate again
+(`validation.rs`, `master.rs`, `table.rs:798`, `store.rs:1225`,
+`dml.rs:187/295/2021`). Trade-off: it also renames the
+`test_enforce_unique_pk_partitioned_*` unit tests and touches those comment sites —
+mechanical, but more churn than the removal itself. Optional; fold into the same
+change or skip.
+
+Also drop the stale claim in `wide_pk_validation.rs:47` that "the `enforce_unique_pk`
+u128 keying panics on a wide PK" — the surviving function keys on `PkBuf` for every
+width and would not panic; only the `create_table` stride gate still justifies
+`setup_wide_unique`'s direct seeding.
 
 ## Minimal alternative (if removal is deferred)
 
@@ -211,6 +274,8 @@ partitioned variant's `seen` maintenance in the `w < 0` branch of
 ```
 
 This still requires adding the `+1, -1, +1` regression case to
-`test_enforce_unique_pk`. It is strictly inferior to removal — it keeps a
-production-dead duplicate alive and leaves the wide-PK test exercising code that
-never runs — and is recorded only as a fallback.
+`test_enforce_unique_pk`. It is strictly inferior to removal: it patches only the
+intra-batch defect (the Single path still never emits the stored-row retraction, so
+it stays divergent from the live semantics for cross-batch upserts), it keeps a
+production-dead duplicate alive against the no-legacy rule, and it leaves the
+wide-PK enforcement gap unaddressed. Recorded only as a fallback.
