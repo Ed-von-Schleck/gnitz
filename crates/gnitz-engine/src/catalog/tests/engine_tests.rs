@@ -2,22 +2,17 @@ use super::*;
 
 // ── test_enforce_unique_pk ───────────────────────────────────────────
 
-/// Test unique_pk enforcement via a single-partition Table (system table range).
-/// DagEngine.enforce_unique_pk only operates on Single stores; PartitionedTable
-/// unique_pk is handled by the ingest layer.
+/// Unique-PK enforcement through the production partitioned path: insert,
+/// intra-batch dedup, insert+delete cancellation, and the `+1, -1, +1`
+/// re-insert regression (the deleted Single-store variant netted this to 0 by
+/// failing to clear its intra-batch `seen` map on the delete).
 #[test]
 fn test_enforce_unique_pk() {
     let dir = temp_dir("enforce_upk");
-
-    // Create a Table directly (Single store) to test enforce_unique_pk
-    ensure_dir(&dir).unwrap();
-    let schema = make_schema(&[u64_col(), u64_col()], 0); // id (PK), val
-    let tdir = format!("{dir}/upk_table");
-    let mut table = Table::new(&tdir, "upk", schema, 100, SYS_TABLE_ARENA, crate::storage::Persistence::Ephemeral).unwrap();
-
-    let mut dag = DagEngine::new();
-    let table_ptr = &mut table as *mut Table;
-    dag.register_table(100, StoreHandle::Borrowed(table_ptr), schema, RelationKind::BaseTable { unique_pk: true }, 0, tdir.clone());
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap(); // unique_pk ⟹ Partitioned
+    let schema = engine.get_schema(tid).unwrap();
 
     let make_row = |pk: u64, val: u64, w: i64| -> Batch {
         let mut bb = BatchBuilder::new(schema);
@@ -26,48 +21,42 @@ fn test_enforce_unique_pk() {
         bb.end_row();
         bb.finish()
     };
-
-    let scan = |table: &mut Table| -> usize {
-        let mut c = table.open_cursor();
-        let mut count = 0;
-        while c.cursor.valid {
-            if c.cursor.current_weight > 0 { count += 1; }
-            c.cursor.advance();
-        }
-        count
+    let live = |engine: &mut CatalogEngine| -> usize {
+        engine.flush_family(tid).unwrap();
+        engine.scan_family(tid).unwrap().count
     };
 
-    // ST1: insert new PK
-    dag.ingest_to_family(100, make_row(1, 10, 1));
-    assert_eq!(scan(&mut table), 1);
+    // ST1: insert a new PK.
+    engine.ingest_to_family(tid, &make_row(1, 10, 1)).unwrap();
+    assert_eq!(live(&mut engine), 1);
 
-    // ST2: insert different PK
-    dag.ingest_to_family(100, make_row(2, 20, 1));
-    assert_eq!(scan(&mut table), 2);
+    // ST2: insert a different PK.
+    engine.ingest_to_family(tid, &make_row(2, 20, 1)).unwrap();
+    assert_eq!(live(&mut engine), 2);
 
-    // ST3: intra-batch duplicate — last value wins (enforce_unique_pk
-    // handles intra-batch dedup correctly)
+    // ST3: intra-batch duplicate — last value wins (one net row for PK=5).
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(5u128, 1); bb.put_u64(10); bb.end_row();
     bb.begin_row(5u128, 1); bb.put_u64(20); bb.end_row();
-    dag.ingest_to_family(100, bb.finish());
-    assert_eq!(scan(&mut table), 3, "Intra-batch dup: PK=5 has 1 net row");
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    assert_eq!(live(&mut engine), 3);
 
-    // ST4: intra-batch insert then delete cancel each other
-    let mut bb2 = BatchBuilder::new(schema);
-    bb2.begin_row(6u128, 1); bb2.put_u64(10); bb2.end_row();
-    bb2.begin_row(6u128, -1); bb2.put_u64(10); bb2.end_row();
-    dag.ingest_to_family(100, bb2.finish());
-    // PK=6 cancelled, existing PKs (1,2,5) remain
-    assert_eq!(scan(&mut table), 3, "Insert+delete cancel: PK=6 not added");
+    // ST4: intra-batch insert then delete cancel (PK=6 not added).
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(6u128, 1);  bb.put_u64(10); bb.end_row();
+    bb.begin_row(6u128, -1); bb.put_u64(10); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    assert_eq!(live(&mut engine), 3);
 
-    // Note: cross-batch upsert (retract stored row + insert new) requires
-    // the _enforce_unique_pk path which emits the stored retraction.
-    // DagEngine.enforce_unique_pk calls retract_pk but doesn't emit
-    // the retraction into the effective batch. Full-stack upsert is covered
-    // by the E2E suite.
+    // ST5: regression — +1, -1, +1 on a fresh PK must net to +1, not 0.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(7u128, 1);  bb.put_u64(100); bb.end_row();
+    bb.begin_row(7u128, -1); bb.put_u64(100); bb.end_row();
+    bb.begin_row(7u128, 1);  bb.put_u64(200); bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    assert_eq!(live(&mut engine), 4, "+1,-1,+1 must leave PK=7 live");
 
-    dag.close();
+    engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 

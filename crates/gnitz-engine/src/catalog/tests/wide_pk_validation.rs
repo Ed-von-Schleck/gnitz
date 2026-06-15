@@ -44,8 +44,9 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
 /// Register a wide-PK table on `engine.dag` with a UNIQUE secondary index on
 /// the `val` column (source col 3), seeded with `base_rows` in both the base
 /// table and the projected index. Bypasses `create_table` (stride gate) and
-/// `ingest_to_family` (the `enforce_unique_pk` u128 keying panics on a wide
-/// PK), populating the underlying tables directly. The dag borrows the base
+/// `ingest_to_family`, seeding the base and index tables directly so it can
+/// attach a unique secondary index over an explicit wide PK with byte-level
+/// control; it does not exercise the enforcement path. The dag borrows the base
 /// table; the caller must keep the returned Box alive for the engine's use.
 fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows: &[([u8; 24], u64, i64)]) -> Box<Table> {
     let schema = wide_unique_schema();

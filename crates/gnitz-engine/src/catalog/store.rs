@@ -1222,7 +1222,7 @@ impl CatalogEngine {
     /// retractions (which carry zero-padded payloads on the wire) are
     /// resolved against the actual stored payload instead of being
     /// added as orphaned rows. The retract-and-insert pattern in
-    /// `enforce_unique_pk_partitioned` makes the replay idempotent
+    /// `enforce_unique_pk` makes the replay idempotent
     /// w.r.t. already-flushed data.
     ///
     /// Index shards see duplicate `(+1, -1)` projections when a batch

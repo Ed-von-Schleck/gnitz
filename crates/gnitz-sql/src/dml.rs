@@ -184,7 +184,7 @@ pub fn execute_insert(
                 // Use Update mode: merged batch contains both +1 (new
                 // merged rows, which may UPSERT) and untouched +1 rows
                 // for non-conflicting inserts. Workers handle the
-                // retract-and-insert via enforce_unique_pk_partitioned.
+                // retract-and-insert via enforce_unique_pk.
                 client.push_with_mode(tid, &schema, &merged, WireConflictMode::Update)?;
             }
             Ok(SqlResult::RowsAffected { count: n })
@@ -292,7 +292,7 @@ fn client_side_filter_do_nothing(
 /// Build a merged batch for ON CONFLICT DO UPDATE:
 ///   - For each incoming row whose PK exists in the store: evaluate
 ///     assignments against (existing_row, excluded_row) and emit the
-///     merged row as +1 (worker's enforce_unique_pk_partitioned will
+///     merged row as +1 (worker's enforce_unique_pk will
 ///     retract the old payload).
 ///   - For each incoming row whose PK does NOT exist: pass through as a
 ///     plain +1 insert.
@@ -2018,7 +2018,7 @@ pub fn execute_delete(
             // for a compound PK). Seek each key and retract only those that exist,
             // so RowsAffected reports rows actually removed rather than the raw
             // list length, with a repeated key counted once. (Positivity is not at
-            // stake here — the engine's enforce_unique_pk_partitioned already drops
+            // stake here — the engine's enforce_unique_pk already drops
             // a retraction of an absent/tombstoned key; this seek is purely about
             // an accurate count.) PkTuple::from_u128 produces the same seek key
             // Path 1 builds for `pk = v` (low `pk_stride` bytes = the column's

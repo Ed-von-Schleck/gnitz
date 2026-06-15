@@ -795,7 +795,7 @@ impl Table {
     /// bloom gates the run lookup at every PK width.
     pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, bool) {
         // Reached only on `unique_pk` base tables (via
-        // `enforce_unique_pk_partitioned`), which are always durable and never
+        // `enforce_unique_pk`), which are always durable and never
         // acquire `in_memory_l0`. `get_weight_for_row_bytes` /
         // `scan_shards_for_pk_bytes` (the found-row path) likewise scan only the
         // memtable and disk shards; a future caller on an in-memory-bearing
