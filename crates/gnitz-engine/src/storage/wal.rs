@@ -146,7 +146,10 @@ pub fn encode(
 
 /// Validate a WAL block and extract header fields + directory entries.
 ///
-/// On success: header fields and directory arrays are populated.
+/// On success: header fields and directory arrays are populated, and every
+/// region's `[offset, offset + size)` extent is guaranteed to lie within the
+/// block (`offset + size <= total_size <= block.len()`) — decoders can index
+/// each region without a further bounds check.
 ///
 /// `out_region_offsets` and `out_region_sizes` must have at least `max_regions`
 /// entries. Only `min(num_regions, max_regions)` entries are written.
@@ -201,8 +204,19 @@ pub fn validate_and_parse(
         if dir_off + 8 > total_size {
             return Err(StorageError::Truncated);
         }
-        out_region_offsets[i] = read_u32_le(block, dir_off) as u64;
-        out_region_sizes[i] = read_u32_le(block, dir_off + 4);
+        let off = read_u32_le(block, dir_off) as usize;
+        let sz = read_u32_le(block, dir_off + 4) as usize;
+        // The region's data extent must lie within the block. `total_size <=
+        // block.len()` (checked above), so this is the tightest in-block bound.
+        // Without it a directory entry could name a region running past the
+        // block end, which decoders would silently zero-fill (a dropped column,
+        // or an emptied blob heap) rather than reject. `off`/`sz` are u32, so
+        // `off + sz` cannot overflow usize on a 64-bit target.
+        if off + sz > total_size {
+            return Err(StorageError::Truncated);
+        }
+        out_region_offsets[i] = off as u64;
+        out_region_sizes[i] = sz as u32;
     }
 
     Ok(())
@@ -399,6 +413,35 @@ mod tests {
             &mut [], &mut [], 0, true,
         ).unwrap();
         assert_eq!(num_regions, 0);
+    }
+
+    #[test]
+    fn rejects_region_extent_past_block() {
+        // A directory entry whose [offset, offset + size) runs past total_size
+        // must be rejected, not silently accepted — decoders rely on this to
+        // avoid zero-filling an out-of-bounds region. checksum=false isolates
+        // the extent check from the (directory-covering) checksum.
+        let (_regions, ptrs, sizes) = make_test_regions();
+        let mut buf = vec![0u8; 4096];
+        let block_len = encode(&mut buf, 0, 1, 1, 2, &ptrs, &sizes, 0, false).unwrap();
+
+        // Point region 0's offset at the block end; its size (16) now overruns.
+        write_u32_le(&mut buf, HEADER_SIZE, block_len as u32);
+
+        let mut lsn = 0u64;
+        let mut tid = 0u32;
+        let mut count = 0u32;
+        let mut num_regions = 0u32;
+        let mut blob_size = 0u64;
+        let mut offsets = [0u64; 16];
+        let mut rsizes = [0u32; 16];
+
+        let rc = validate_and_parse(
+            &buf[..block_len],
+            &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
+            &mut offsets, &mut rsizes, 16, false,
+        );
+        assert_eq!(rc, Err(StorageError::Truncated));
     }
 
     #[test]
