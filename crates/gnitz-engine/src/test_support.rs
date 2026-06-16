@@ -1,8 +1,12 @@
-//! Shared `#[cfg(test)]` builders for the crate's wide-PK tests: a single
-//! `(U64, U64, U64)`-PK + `I64`-payload schema and one OPK-encoding batch
-//! builder, so no test re-derives the order-preserving key layout (§6) by hand.
+//! Shared `#[cfg(test)]` test helpers: OPK-encoding batch builders (a canonical
+//! `(U64, U64, U64)`-PK + `I64`-payload schema, so no test re-derives the §6
+//! order-preserving key layout by hand) and the crate's arbitrary type-code
+//! proptest strategies (a single source of truth, so PK-eligibility can't drift
+//! from `is_pk_eligible`).
 
 use std::cmp::Ordering;
+
+use proptest::prelude::*;
 
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{compare_pk_bytes, encode_order_preserving_pk, Batch, ConsolidatedBatch};
@@ -87,4 +91,41 @@ pub(crate) fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -
     b.extend_col(0, &val.to_le_bytes());
     b.count += 1;
     b
+}
+
+// ---------------------------------------------------------------------------
+// Shared proptest strategies
+// ---------------------------------------------------------------------------
+
+/// Every wire `TypeCode`. The single source of truth for the schema-generating
+/// proptests across the crate; since any column type is a valid payload, this
+/// doubles as the arbitrary-payload-type strategy.
+pub(crate) fn arb_type_code() -> impl Strategy<Value = u8> {
+    prop_oneof![
+        Just(type_code::U8),
+        Just(type_code::I8),
+        Just(type_code::U16),
+        Just(type_code::I16),
+        Just(type_code::U32),
+        Just(type_code::I32),
+        Just(type_code::U64),
+        Just(type_code::I64),
+        Just(type_code::U128),
+        Just(type_code::I128),
+        Just(type_code::UUID),
+        Just(type_code::F32),
+        Just(type_code::F64),
+        Just(type_code::STRING),
+        Just(type_code::BLOB),
+    ]
+}
+
+/// The PK-eligible type codes, derived from [`gnitz_wire::is_pk_eligible`] so the
+/// set can never drift from the predicate the schema layer enforces (fixed-width
+/// integer scalars: U8..U64, I8..I64, U128, I128, UUID — STRING / BLOB / float
+/// are rejected by `SchemaDescriptor::new`).
+pub(crate) fn arb_pk_type() -> impl Strategy<Value = u8> {
+    arb_type_code().prop_filter("type code must be PK-eligible", |&tc| {
+        gnitz_wire::is_pk_eligible(tc)
+    })
 }

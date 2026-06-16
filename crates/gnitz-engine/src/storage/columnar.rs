@@ -1320,19 +1320,10 @@ mod tests {
     mod opk_proptest {
         use super::*;
         use proptest::prelude::*;
+        use crate::test_support::arb_pk_type;
 
         fn tc_size(tc: u8) -> usize {
             SchemaColumn::new(tc, 0).size() as usize
-        }
-
-        fn arb_pk_type() -> impl Strategy<Value = u8> {
-            prop_oneof![
-                Just(type_code::U8), Just(type_code::I8),
-                Just(type_code::U16), Just(type_code::I16),
-                Just(type_code::U32), Just(type_code::I32),
-                Just(type_code::U64), Just(type_code::I64),
-                Just(type_code::U128), Just(type_code::UUID),
-            ]
         }
 
         /// `(column type codes, pk_indices permutation, a_bytes, b_bytes)`.

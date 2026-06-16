@@ -63,26 +63,26 @@ impl PkUniqueChecker {
         }
         let prefix = pack_pk_be(pk_bytes);
         let n = pk_bytes.len().min(MAX_PK_BYTES);
-        if prefix != self.last_prefix {
-            // Distinct prefix ⇒ distinct PK. Wide PKs need last_pk for the
-            // collision path; narrow PKs (n ≤ 16) can't collide since pack_pk_be
-            // is injective for ≤16 bytes, so skip the copy for them.
-            self.last_prefix = prefix;
-            if n > 16 {
-                self.last_pk[..n].copy_from_slice(&pk_bytes[..n]);
-            }
-            self.has_last = true;
+        // Is this row an adjacent duplicate of its predecessor? For narrow keys
+        // (n ≤ 16) pack_pk_be is injective, so an equal prefix *is* an equal PK
+        // and last_pk is never maintained; for wide keys the prefix is lossy, so
+        // a prefix tie is only confirmed by the full byte compare. The has_last
+        // guard keeps the first row — or a genuine all-zero key, which aliases
+        // the zero-initialised last_prefix/last_pk — from reading as a duplicate.
+        let is_duplicate = self.has_last
+            && prefix == self.last_prefix
+            && (n <= 16 || self.last_pk[..n] == pk_bytes[..n]);
+        if is_duplicate {
+            self.qualifies = false;
             return;
         }
-        // Prefix collision — full byte compare (wide PKs only in practice).
-        if self.has_last && self.last_pk[..n] == pk_bytes[..n] {
-            // Identical adjacent OPK bytes ⇒ duplicate PK ⇒ not unique.
-            self.qualifies = false;
-        } else {
-            // Same prefix, different PK (or first row with prefix=0). Update last.
+        // Remember this row as the predecessor for the next observe. Narrow keys
+        // skip the last_pk copy — for them the prefix alone is authoritative.
+        self.last_prefix = prefix;
+        if n > 16 {
             self.last_pk[..n].copy_from_slice(&pk_bytes[..n]);
-            self.has_last = true;
         }
+        self.has_last = true;
     }
 
     /// Returns `SHARD_FLAG_PK_UNIQUE` when `enabled` and the observed stream
@@ -1002,5 +1002,74 @@ mod tests {
         for p in &pks128 {
             assert!(xor8::may_contain(&f128, *p));
         }
+    }
+
+    const FLAG: u8 = crate::layout::SHARD_FLAG_PK_UNIQUE;
+
+    /// `flags_if(true)` after observing the given OPK byte rows in order.
+    fn tag(rows: &[(&[u8], i64)]) -> u8 {
+        let mut c = PkUniqueChecker::new();
+        for &(pk, w) in rows {
+            c.observe(pk, w);
+        }
+        c.flags_if(true)
+    }
+
+    #[test]
+    fn pk_unique_checker_narrow_adjacent_duplicate() {
+        let k5 = 5u64.to_be_bytes();
+        let k6 = 6u64.to_be_bytes();
+        // Regression: a narrow (≤16B) duplicate appearing exactly twice was
+        // missed. pack_pk_be is injective for ≤16B, so the prefix tie alone
+        // proves the duplicate — last_pk is not maintained for narrow keys, and
+        // the old fall-through byte compare ran against a stale/zero buffer.
+        assert_eq!(tag(&[(&k5, 1), (&k5, 1)]), 0, "adjacent narrow dup must disqualify");
+        assert_eq!(tag(&[(&k5, 1), (&k6, 1)]), FLAG, "distinct narrow keys qualify");
+        assert_eq!(tag(&[(&k5, 1)]), FLAG, "single key qualifies");
+        // Three consecutive copies were caught even before the fix; assert the
+        // post-fix behavior is still correct.
+        assert_eq!(tag(&[(&k5, 1), (&k5, 1), (&k5, 1)]), 0);
+    }
+
+    #[test]
+    fn pk_unique_checker_all_zero_key() {
+        // The all-zero key aliases the initial last_prefix/last_pk state. A lone
+        // zero key (or zero followed by a distinct key) must still qualify; only
+        // an actual adjacent zero duplicate disqualifies. The audit's proposed
+        // short-circuit dropped the has_last guard and regressed this case.
+        let z = 0u64.to_be_bytes();
+        let k1 = 1u64.to_be_bytes();
+        assert_eq!(tag(&[(&z, 1)]), FLAG, "lone zero key qualifies");
+        assert_eq!(tag(&[(&z, 1), (&k1, 1)]), FLAG, "zero then distinct qualifies");
+        assert_eq!(tag(&[(&z, 1), (&z, 1)]), 0, "adjacent zero dup disqualifies");
+    }
+
+    #[test]
+    fn pk_unique_checker_wide_prefix_twins() {
+        // Wide (>16B) keys sharing a 16-byte prefix: the prefix tie is not
+        // authoritative, so the full byte compare on last_pk decides.
+        let mut a = [0u8; 24];
+        let mut b = [0u8; 24];
+        a[..16].copy_from_slice(&[7u8; 16]);
+        b[..16].copy_from_slice(&[7u8; 16]);
+        a[16] = 1;
+        b[16] = 2;
+        assert_eq!(tag(&[(&a, 1), (&b, 1)]), FLAG, "wide prefix-twins, distinct tails qualify");
+        assert_eq!(tag(&[(&a, 1), (&a, 1)]), 0, "identical wide keys disqualify");
+        // Interleaving a distinct-prefix row must not lose the wide last_pk.
+        let c = [9u8; 24];
+        assert_eq!(tag(&[(&a, 1), (&c, 1), (&a, 1)]), FLAG, "non-adjacent wide repeats qualify");
+    }
+
+    #[test]
+    fn pk_unique_checker_weight_and_disabled() {
+        let k1 = 1u64.to_be_bytes();
+        let k2 = 2u64.to_be_bytes();
+        // A negative weight disqualifies regardless of PK distinctness.
+        assert_eq!(tag(&[(&k1, 1), (&k2, -1)]), 0, "negative weight disqualifies");
+        // flags_if(false) never tags, even for a clean unique stream.
+        let mut c = PkUniqueChecker::new();
+        c.observe(&k1, 1);
+        assert_eq!(c.flags_if(false), 0, "disabled tagging never sets the flag");
     }
 }

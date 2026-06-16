@@ -1522,10 +1522,16 @@ impl Batch {
         offset: usize,
         checksum: bool,
     ) -> usize {
-        debug_assert!(
-            start_row + count <= self.count,
-            "encode_range_to_wire: range [{start_row}, {}) out of bounds (batch count = {})",
-            start_row + count, self.count,
+        // Release-active: this bounds the `unsafe` region_ptr().add(start_row *
+        // stride) below. A debug-only check would strip in release and let a
+        // bad range form an out-of-bounds pointer (UB) instead of aborting.
+        // `saturating_add` (not `+`) so an overflowing range fails the bound
+        // rather than wrapping to a small value that slips past it.
+        let end = start_row.saturating_add(count);
+        assert!(
+            end <= self.count,
+            "encode_range_to_wire: range [{start_row}, {end}) out of bounds (batch count = {})",
+            self.count,
         );
         // Wire-safe precondition: a wire-safe schema carries no long strings, so
         // the blob heap is empty and is intentionally dropped below. Callers gate
@@ -1546,7 +1552,7 @@ impl Batch {
         for i in 0..blob_idx {
             let stride = self.strides[i] as usize;
             // SAFETY: start_row * stride is within the allocated region (the
-            // debug_assert above guarantees start_row + count <= self.count).
+            // assert above guarantees start_row + count <= self.count).
             ptrs[i]  = unsafe { self.region_ptr(i).add(start_row * stride) };
             sizes[i] = (count * stride) as u32;
         }

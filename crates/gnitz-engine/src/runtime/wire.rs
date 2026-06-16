@@ -1193,46 +1193,14 @@ mod tests {
     use proptest::collection::vec;
     use proptest::test_runner::TestCaseError;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::test_support::arb_type_code;
     use gnitz_wire::{is_pk_eligible, MAX_PK_COLUMNS};
-
-    fn arb_type_code() -> impl Strategy<Value = u8> {
-        prop_oneof![
-            Just(type_code::U8),  Just(type_code::I8),
-            Just(type_code::U16), Just(type_code::I16),
-            Just(type_code::U32), Just(type_code::I32),
-            Just(type_code::F32), Just(type_code::U64),
-            Just(type_code::I64), Just(type_code::F64),
-            Just(type_code::U128), Just(type_code::UUID),
-            Just(type_code::STRING), Just(type_code::BLOB),
-            Just(type_code::I128),
-        ]
-    }
-
-    /// `proptest!` requires the generated value to be `Debug` so it can print
-    /// failing cases. `SchemaDescriptor` deliberately has no `Debug` impl, so
-    /// wrap it in a newtype whose `Debug` prints only the load-bearing fields
-    /// (the same ones `assert_descriptor_eq` compares).
-    #[derive(Clone)]
-    struct ArbSchema(SchemaDescriptor);
-
-    impl std::fmt::Debug for ArbSchema {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let sd = &self.0;
-            let types: Vec<u8> = (0..sd.num_columns()).map(|i| sd.columns[i].type_code).collect();
-            let nullable: Vec<u8> = (0..sd.num_columns()).map(|i| sd.columns[i].nullable).collect();
-            f.debug_struct("ArbSchema")
-                .field("pk_indices", &sd.pk_indices())
-                .field("types", &types)
-                .field("nullable", &nullable)
-                .finish()
-        }
-    }
 
     /// `max_pk` bounds the generated PK arity: the engine codec supports up to
     /// `MAX_PK_COLUMNS` (5, the secondary-index schema width), but the persisted
     /// client codec caps at `PK_LIST_MAX_COLS` (4) — tests that decode through the
     /// client (`batch_to_schema` → `Schema::validate_pk_cols`) must stay within it.
-    fn arb_schema(max_pk: usize) -> impl Strategy<Value = ArbSchema> {
+    fn arb_schema(max_pk: usize) -> impl Strategy<Value = SchemaDescriptor> {
         // n_cols ≥ 1, so `1..=n_cols.min(max_pk)` is never empty.
         (1usize..=8).prop_flat_map(move |n_cols| {
             (
@@ -1265,7 +1233,7 @@ mod tests {
                 })
                 .collect();
 
-            ArbSchema(SchemaDescriptor::new(&cols, &pk_indices))
+            SchemaDescriptor::new(&cols, &pk_indices)
         })
     }
 
@@ -1311,7 +1279,7 @@ mod tests {
         /// Engine encoder → engine decoder.
         #[test]
         fn schema_roundtrip_engine_codec(original in arb_schema(MAX_PK_COLUMNS)) {
-            let original = &original.0;
+            let original = &original;
             let names: Vec<Vec<u8>> = (0..original.num_columns())
                 .map(|i| format!("c{i}").into_bytes())
                 .collect();
@@ -1331,7 +1299,7 @@ mod tests {
                 encode_wal_block, decode_wal_block, VerifyChecksum,
             };
 
-            let original = &original.0;
+            let original = &original;
             let client = descriptor_to_client_schema(original);
             let ms = meta_schema();
             let batch = schema_to_batch(&client);
@@ -1349,7 +1317,7 @@ mod tests {
             use gnitz_core::protocol::types::meta_schema;
             use gnitz_core::protocol::wal_block::{decode_wal_block, VerifyChecksum};
 
-            let original = &original.0;
+            let original = &original;
             let names: Vec<Vec<u8>> = (0..original.num_columns())
                 .map(|i| format!("c{i}").into_bytes())
                 .collect();
@@ -1373,7 +1341,7 @@ mod tests {
             use gnitz_core::protocol::types::meta_schema;
             use gnitz_core::protocol::wal_block::encode_wal_block;
 
-            let original = &original.0;
+            let original = &original;
             let client = descriptor_to_client_schema(original);
             let ms = meta_schema();
             let batch = schema_to_batch(&client);

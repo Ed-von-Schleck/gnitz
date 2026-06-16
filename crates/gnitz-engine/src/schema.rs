@@ -865,6 +865,32 @@ impl IndexKeySpec {
     }
 }
 
+impl std::fmt::Debug for SchemaDescriptor {
+    // The fixed-size `columns` / `pk_indices` arrays make a derive useless (it
+    // would dump all MAX_COLUMNS slots). Print only the live columns — their
+    // type, a `?` for nullable, and `pk` for PK columns — plus the PK index list.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SchemaDescriptor {{ columns: [")?;
+        for ci in 0..self.num_columns() {
+            if ci > 0 {
+                write!(f, ", ")?;
+            }
+            let col = self.columns[ci];
+            match TypeCode::try_from_u8(col.type_code) {
+                Some(t) => write!(f, "{t:?}")?,
+                None => write!(f, "type({})", col.type_code)?,
+            }
+            if col.nullable != 0 {
+                write!(f, "?")?;
+            }
+            if self.is_pk_col(ci) {
+                write!(f, " pk")?;
+            }
+        }
+        write!(f, "], pk_indices: {:?} }}", self.pk_indices())
+    }
+}
+
 impl PartialEq for SchemaDescriptor {
     fn eq(&self, other: &Self) -> bool {
         if self.num_columns() != other.num_columns() || self.pk_indices() != other.pk_indices() {

@@ -24,6 +24,9 @@ mod partitioned_table;
 pub(crate) mod batch_pool;
 mod error;
 
+#[cfg(test)]
+mod data_roundtrip_proptest;
+
 // ── Public API ──────────────────────────────────────────────────────────────
 pub use table::{Table, FlushOutcome, FlushWork, Persistence};
 pub use partitioned_table::{PartitionedTable, partition_for_key, partition_for_pk_bytes, partition_arena_size};
