@@ -667,8 +667,14 @@ impl DagEngine {
         // Populate `outgoing`/`incoming` adjacency so annotation helpers like
         // `reindex_cols_through_filters` can traverse the graph. (`load_circuit`
         // returns a circuit with empty adjacency maps; only `compile_view` runs
-        // topo_sort itself.) Ignore cycle errors — adjacency is filled regardless.
-        let _ = compiler::topo_sort(&mut loaded);
+        // topo_sort itself.) A malformed cyclic circuit cannot compile or execute
+        // (`compile_view` rejects it the same way), so present it as empty here, just
+        // like a failed load above — every metadata query then reads the conservative
+        // "nothing special" answer (no exchange skip, no shard/join cols, no range
+        // join) off an empty circuit instead of walking a cyclic adjacency.
+        if compiler::topo_sort(&mut loaded).is_err() {
+            return compiler::LoadedCircuit::empty();
+        }
         loaded
     }
 

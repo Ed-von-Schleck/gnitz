@@ -568,9 +568,10 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
 /// off-worker; Map/Reduce/Distinct/join change the key or its distribution, and a
 /// `PartitionFilter` (range-join broadcast input) is not a `Filter` either. The
 /// backward dual of `reindex_cols_through_filters`, reading the same `loaded.incoming`
-/// adjacency as `ancestors_inclusive` / `exchange_input_node`. The chain is acyclic
-/// and each hop has exactly one incoming edge, so it terminates without a visited
-/// guard.
+/// adjacency as `ancestors_inclusive` / `exchange_input_node`. The chain is acyclic —
+/// both `compile_view` and `load_meta_circuit` reject a malformed cyclic circuit (the
+/// latter presents it as empty, so this walk is never entered on one) — and each hop
+/// has exactly one incoming edge, so it terminates without a visited guard.
 pub(crate) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Option<i64> {
     let mut cur = enid;
     loop {
