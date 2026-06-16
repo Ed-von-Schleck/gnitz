@@ -4226,12 +4226,22 @@ mod tests {
     // these unit tests are what pin that the walk engages exactly when it should:
     // through Filter chains, never across a re-keying Map / PartitionFilter / fan-in.
 
-    /// `ScanDelta → Filter → ExchangeShard` (filtered `GROUP BY prefix`) resolves to
-    /// the source tid; a chain of Filters and a `ScanTrace` source resolve too.
+    /// A bare `ScanDelta → ExchangeShard` (the no-`WHERE` case) resolves to the source
+    /// tid; `ScanDelta → Filter → ExchangeShard` (filtered `GROUP BY prefix`) does too,
+    /// as do a chain of Filters and a `ScanTrace` source.
     #[test]
     fn test_scan_tid_through_filters_filter_chain() {
         use gnitz_wire::OpNode;
         let dummy_blob = dummy_expr_blob();
+        // ScanDelta(7) → ExchangeShard, no Filter: the zero-hop base case (no `WHERE`),
+        // which already co-partitioned before the walk reached through Filters.
+        let mut nodes = HashMap::new();
+        nodes.insert(0, OpNode::ScanDelta(7));
+        nodes.insert(1, OpNode::ExchangeShard { shard_cols: vec![0] });
+        let loaded = make_loaded(nodes, vec![(0, 1, PORT_IN)]);
+        assert_eq!(scan_tid_through_filters(&loaded, 1), Some(7),
+            "a bare scan feeding the shard resolves on the first hop (no-`WHERE` case)");
+
         // ScanDelta(7) → Filter → ExchangeShard.
         let mut nodes = HashMap::new();
         nodes.insert(0, OpNode::ScanDelta(7));

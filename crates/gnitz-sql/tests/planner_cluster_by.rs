@@ -245,6 +245,32 @@ fn cluster_by_filtered_group_by_prefix_multiworker() {
         vec![vec![1, 2, 100], vec![2, 1, 50], vec![3, 1, 30]],
         "filtered GROUP BY a non-prefix column still exchanges and stays correct",
     );
+
+    // Retraction through the elided filtered path. A base-table DELETE arrives as a
+    // retraction delta on the same ScanDelta → Filter → ExchangeShard chain. The
+    // filter is row-local, so the retraction routes by the same distribution prefix
+    // as the insert did and the skipped exchange stays a no-op — deleting a *surviving*
+    // row (a row of a different a-group than its neighbors would land on a different
+    // worker) must retract exactly its group's aggregate, and deleting a *filtered-out*
+    // row must change nothing (the Filter drops the retraction before the shard).
+    assert_eq!(affected(&mut client, &sn, "DELETE FROM t WHERE a = 2 AND b = 1"), 1,
+        "the surviving (2,1,40) row is deleted");
+    assert_eq!(affected(&mut client, &sn, "DELETE FROM t WHERE a = 1 AND b = 1"), 1,
+        "the filtered-out (1,1,10) row is deleted");
+
+    // Now t = (1,2,20),(1,3,30),(2,2,50),(3,1,60); WHERE v >= 30 keeps (1,3,30),
+    // (2,2,50),(3,1,60). Group a=2 lost a survivor; group a=1 lost a filtered-out row.
+    assert_eq!(
+        payload_rows(&mut client, &sn, "gf_pre", &["ka", "n", "s"]),
+        vec![vec![1, 1, 30], vec![2, 1, 50], vec![3, 1, 60]],
+        "deleting a survivor retracts its group's aggregate on the elided path; \
+         deleting a filtered-out row is a no-op — both correct under W=4",
+    );
+    assert_eq!(
+        payload_rows(&mut client, &sn, "gf_other", &["kb", "n", "s"]),
+        vec![vec![1, 1, 60], vec![2, 1, 50], vec![3, 1, 30]],
+        "the non-prefix exchanging view tracks the same retractions correctly",
+    );
 }
 
 // ── Uniqueness / retraction under a prefix key (the §4.4 regression) ─────────
