@@ -986,6 +986,7 @@ pub fn op_multi_scatter(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+    use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
     #[test]
     #[should_panic(expected = "source index must fit in u8")]
@@ -1108,64 +1109,30 @@ mod tests {
         assert_ne!(k_short, k_long);
     }
 
-    fn make_wide_schema() -> SchemaDescriptor {
-        // 3×U64 compound PK → pk_stride = 24 (wide).
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0, 1, 2],
-        )
-    }
-
-    fn wide_pk(c0: u64, c1: u64, c2: u64) -> [u8; 24] {
-        let mut pk = [0u8; 24];
-        pk[..8].copy_from_slice(&c0.to_le_bytes());
-        pk[8..16].copy_from_slice(&c1.to_le_bytes());
-        pk[16..24].copy_from_slice(&c2.to_le_bytes());
-        pk
-    }
-
-    /// Build a pre-consolidated wide-PK batch. `rows` must already be
-    /// sorted ascending by (c0,c1,c2) with unique PKs.
-    fn make_wide_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], i64, i64)]) -> ConsolidatedBatch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
-        for &(pk, w, val) in rows {
-            b.extend_pk_bytes(&pk);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
-    }
-
     #[test]
     fn test_relay_scatter_wide_pk_order_and_routing() {
-        let schema = make_wide_schema();
+        let schema = wide_pk_3xu64_schema();
         let num_workers = 4;
-        // 3 sources, interleaved, with a low-16 collision: (1,1,*) appears
-        // in all three with differing c2 — prefix-equal, distinguished only
-        // by compare_pk_bytes' third column walk.
+        // (1,1,*) prefix-twins span the three sources: they share the leading
+        // BE(1)++BE(1) 16-byte OPK prefix and differ only in the trailing column,
+        // so the scatter's wide comparator (`select_wide`) must walk past byte 16.
+        // The multi-byte values are LE/BE order inversions — c2 ∈ {1,2,256,257}
+        // and c0 ∈ {2,256} — so OPK encoding is load-bearing for the builder's
+        // sorted assert (a dropped BE flip sorts 256 before 1/2 and trips it).
         let b0 = make_wide_batch(&schema, &[
-            (wide_pk(0, 0, 0), 1, 10),
-            (wide_pk(1, 1, 0), 1, 11),
-            (wide_pk(5, 9, 2), 1, 12),
+            (0, 0, 0,   1, 10),
+            (1, 1, 1,   1, 11),
+            (1, 1, 256, 1, 12),   // shares BE(1)++BE(1) prefix with (1,1,1); c2 multi-byte
         ]);
         let b1 = make_wide_batch(&schema, &[
-            (wide_pk(1, 1, 1), 1, 20),
-            (wide_pk(2, 2, 2), 1, 21),
-            (wide_pk(9, 9, 9), 1, 22),
+            (1, 1, 257, 1, 20),   // third prefix-twin
+            (2, 2, 2,   1, 21),
+            (256, 0, 0, 1, 22),   // c0 multi-byte: under LE this sorts before (2,2,2)
         ]);
         let b2 = make_wide_batch(&schema, &[
-            (wide_pk(1, 1, 2), 1, 30),
-            (wide_pk(3, 3, 3), 1, 31),
-            (wide_pk(7, 0, 0), 1, 32),
+            (1, 1, 2,   1, 30),   // fourth prefix-twin
+            (3, 3, 3,   1, 31),
+            (7, 0, 0,   1, 32),
         ]);
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
         let result = op_relay_scatter_consolidated(&sources, schema.pk_indices(), &schema, num_workers);
@@ -1390,14 +1357,17 @@ mod tests {
 
     #[test]
     fn test_relay_scatter_wide_pk_single_source_bulk_drain() {
-        let schema = make_wide_schema();
+        let schema = wide_pk_3xu64_schema();
         let num_workers = 4;
         // Exactly one active source → the num_active == 1 bulk-drain path.
+        // One value past 255 (c0 = 256) so the drain routes a realistic wide OPK
+        // and the shared builder's sorted assert covers this path, which has no
+        // ordering check of its own (under LE, 256 would sort before (7,8,9)).
         let b0 = make_wide_batch(&schema, &[
-            (wide_pk(1, 2, 3), 1, 1),
-            (wide_pk(4, 5, 6), 1, 2),
-            (wide_pk(7, 8, 9), 1, 3),
-            (wide_pk(10, 11, 12), 1, 4),
+            (1, 2, 3,     1, 1),
+            (4, 5, 6,     1, 2),
+            (7, 8, 9,     1, 3),
+            (256, 11, 12, 1, 4),   // c0 multi-byte: under LE this sorts before (7,8,9)
         ]);
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0)];
         let result = op_relay_scatter_consolidated(&sources, schema.pk_indices(), &schema, num_workers);

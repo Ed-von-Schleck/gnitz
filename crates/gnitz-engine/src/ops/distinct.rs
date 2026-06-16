@@ -95,6 +95,7 @@ mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
     use crate::storage::Batch;
+    use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -480,50 +481,21 @@ mod tests {
     // Wide-PK distinct tests (§8)
     // -----------------------------------------------------------------------
 
-    fn make_schema_wide_pk() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0u32, 1u32, 2u32],
-        )
-    }
-
-    fn make_wide_batch_for_distinct(
-        schema: &SchemaDescriptor,
-        rows: &[(u64, u64, u64, i64, i64)], // (c0, c1, c2, weight, payload)
-    ) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
-        for &(c0, c1, c2, w, val) in rows {
-            b.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b.sorted = true;
-        b.consolidated = true;
-        b
-    }
-
     #[test]
     fn test_distinct_wide_pk_empty_trace_three_new_rows() {
         use std::rc::Rc;
         use crate::storage::CursorHandle;
         // Trace empty; delta has three wide-PK rows with distinct PKs.
         // All three must emit +1.
-        let schema = make_schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let empty = Rc::new(Batch::empty(1, schema.pk_stride()));
         let mut ch = CursorHandle::from_owned(&[empty], schema);
 
-        let delta = make_wide_batch_for_distinct(&schema, &[
+        let delta = make_wide_batch(&schema, &[
             (1, 0, 0, 1, 10),
             (2, 0, 0, 1, 20),
             (3, 0, 0, 1, 30),
-        ]);
+        ]).into_inner();
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         assert_eq!(out.count, 3, "three new wide-PK rows must each emit +1");
         for i in 0..3 {
@@ -537,11 +509,11 @@ mod tests {
         use crate::storage::CursorHandle;
         // Trace has (1,0,0, payload=99, w=1). Delta re-adds same (PK, payload).
         // Already in set → output must be empty.
-        let schema = make_schema_wide_pk();
-        let trace = Rc::new(make_wide_batch_for_distinct(&schema, &[(1, 0, 0, 1, 99)]));
+        let schema = wide_pk_3xu64_schema();
+        let trace = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 99)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
-        let delta = make_wide_batch_for_distinct(&schema, &[(1, 0, 0, 1, 99)]);
+        let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 99)]).into_inner();
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         assert_eq!(out.count, 0, "re-adding an existing (PK,payload) must produce no output");
     }
@@ -554,14 +526,14 @@ mod tests {
         // differing in c2. One row in trace (w=1), one new row in delta (w=+1).
         // The row in the trace must not emit; the new row must emit +1.
         // This tests the cursor.current_pk_bytes() != key break condition.
-        let schema = make_schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         // (1,1,0) is already in the trace
-        let trace = Rc::new(make_wide_batch_for_distinct(&schema, &[(1, 1, 0, 1, 50)]));
+        let trace = Rc::new(make_wide_batch(&schema, &[(1, 1, 0, 1, 50)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta has the NEW key (1,1, 1<<56) which shares 16 OPK bytes with (1,1,0)
         let c2_new = 1u64 << 56;
-        let delta = make_wide_batch_for_distinct(&schema, &[(1, 1, c2_new, 1, 60)]);
+        let delta = make_wide_batch(&schema, &[(1, 1, c2_new, 1, 60)]).into_inner();
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         // The new row is not in the trace → emit +1. The old row is not in delta.
         assert_eq!(out.count, 1, "prefix-collision new row must emit +1");

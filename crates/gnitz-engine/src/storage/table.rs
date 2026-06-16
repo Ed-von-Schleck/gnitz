@@ -1038,6 +1038,7 @@ fn erase_stale_shards(dir: &str, table_id: u32) {
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::test_support::wide_pk_3xu64_schema;
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -1483,16 +1484,7 @@ mod tests {
     fn table_wide_pk_has_and_retract_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("wide_pk_test");
-        // (U64, U64, U64) PK + I64 payload.
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0, 1, 2],
-        );
+        let schema = wide_pk_3xu64_schema();
         assert_eq!(schema.pk_stride(), 24);
 
         let pk3 = |a: u64, b: u64, c: u64| {

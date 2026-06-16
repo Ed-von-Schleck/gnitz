@@ -747,6 +747,7 @@ mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
     use crate::storage::Batch;
+    use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -1132,46 +1133,14 @@ mod tests {
     // Wide-PK union merge (pk_stride > 16)
     // -----------------------------------------------------------------------
 
-    fn make_schema_wide_pk_3xu64_i64() -> SchemaDescriptor {
-        // PK = (U64, U64, U64) = 24 bytes (wide); one I64 payload column.
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0, 1, 2],
-        )
-    }
-
-    fn make_wide_batch(
-        schema: &SchemaDescriptor,
-        rows: &[(u64, u64, u64, i64, i64)],
-    ) -> Batch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
-        for &(k0, k1, k2, w, val) in rows {
-            let mut pk = [0u8; 24];
-            pk[0..8].copy_from_slice(&k0.to_le_bytes());
-            pk[8..16].copy_from_slice(&k1.to_le_bytes());
-            pk[16..24].copy_from_slice(&k2.to_le_bytes());
-            b.extend_pk_bytes(&pk);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b.sorted = true;
-        b.consolidated = true;
-        b
-    }
-
     fn wide_pk_triple(b: &Batch, row: usize) -> (u64, u64, u64) {
         let pk = b.get_pk_bytes(row);
+        // OPK encodes each U64 column big-endian (the §6 at-rest layout), so
+        // the columns must be read back big-endian.
         (
-            u64::from_le_bytes(pk[0..8].try_into().unwrap()),
-            u64::from_le_bytes(pk[8..16].try_into().unwrap()),
-            u64::from_le_bytes(pk[16..24].try_into().unwrap()),
+            u64::from_be_bytes(pk[0..8].try_into().unwrap()),
+            u64::from_be_bytes(pk[8..16].try_into().unwrap()),
+            u64::from_be_bytes(pk[16..24].try_into().unwrap()),
         )
     }
 
@@ -1181,9 +1150,9 @@ mod tests {
         // panicked in get_pk -> widen_pk_le. Verify it merges correctly:
         // sorted by (PK, payload), all rows present, equal-PK groups
         // payload-sorted, weights not summed (union, not consolidation).
-        let schema = make_schema_wide_pk_3xu64_i64();
-        let a = make_wide_batch(&schema, &[(0, 0, 1, 1, 20), (0, 0, 3, 1, 300)]);
-        let b = make_wide_batch(&schema, &[(0, 0, 1, 1, 10), (0, 0, 2, 1, 200)]);
+        let schema = wide_pk_3xu64_schema();
+        let a = make_wide_batch(&schema, &[(0, 0, 1, 1, 20), (0, 0, 3, 1, 300)]).into_inner();
+        let b = make_wide_batch(&schema, &[(0, 0, 1, 1, 10), (0, 0, 2, 1, 200)]).into_inner();
 
         let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 4);

@@ -834,6 +834,7 @@ mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
     use crate::storage::{Batch, ConsolidatedBatch};
+    use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -1194,24 +1195,8 @@ mod tests {
     fn test_join_dd_wide_pk_works() {
         // Wide PK: 3× U64 = 24-byte stride. The byte-API port handles all widths
         // without panicking and produces correct Cartesian product output.
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0, 1, 2],
-        );
-        let mut a = Batch::with_schema(schema, 1);
-        a.extend_pk_opk(&schema, &[1, 0, 0]);
-        a.extend_weight(&1i64.to_le_bytes());
-        a.extend_null_bmp(&0u64.to_le_bytes());
-        a.extend_col(0, &7i64.to_le_bytes());
-        a.count += 1;
-        a.sorted = true;
-        a.consolidated = true;
-        let a = ConsolidatedBatch::new_unchecked(a);
+        let schema = wide_pk_3xu64_schema();
+        let a = make_wide_batch(&schema, &[(1, 0, 0, 1, 7)]);
         // Self-join: (1,0,0) × (1,0,0) → one output row with weight 1*1=1.
         let out = op_join_delta_delta(&a, &a, &schema, &schema);
         assert_eq!(out.count, 1);
@@ -2432,37 +2417,6 @@ mod tests {
     // Wide-PK test helpers
     // -----------------------------------------------------------------------
 
-    /// Wide PK: 3 × U64 = 24-byte stride, exceeds the 16-byte u128.
-    fn schema_wide_pk() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0u32, 1u32, 2u32],
-        )
-    }
-
-    /// Build a wide-PK batch using OPK encoding (required for correct ordering).
-    fn make_wide_batch(
-        schema: &SchemaDescriptor,
-        rows: &[(u64, u64, u64, i64, i64)], // (c0, c1, c2, weight, payload)
-    ) -> ConsolidatedBatch {
-        let mut b = Batch::with_schema(*schema, rows.len().max(1));
-        for &(c0, c1, c2, w, val) in rows {
-            b.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &val.to_le_bytes());
-            b.count += 1;
-        }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
-    }
-
     fn wide_pk_bytes(schema: &SchemaDescriptor, c0: u64, c1: u64, c2: u64) -> Vec<u8> {
         let mut tmp = Batch::with_schema(*schema, 1);
         tmp.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
@@ -2481,7 +2435,7 @@ mod tests {
         // delta). One trace row for that PK. Inner join must produce 2 output rows.
         // The co-group hands the whole same-PK delta group to the callback at
         // once, producted against the once-walked trace group (no re-seek).
-        let schema = schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
@@ -2521,7 +2475,7 @@ mod tests {
         // Row A: pk=(1,1,2), Row B: pk=(1,1,9).
         // Trace: Row A (+1). Delta: Row A (+1) and Row B (+1).
         // Large delta (2 rows) vs 1-row trace.
-        let schema = schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 2, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
@@ -2547,7 +2501,7 @@ mod tests {
         use crate::storage::CursorHandle;
         use std::rc::Rc;
         // Same multiset delta setup as the inner-join test, but for outer join.
-        let schema = schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
@@ -2584,7 +2538,7 @@ mod tests {
         use std::rc::Rc;
         // Delta: (1,1,2) and (1,1,9). Trace: (1,1,9) only.
         // Anti-join: emit delta rows whose PK is NOT in trace → only (1,1,2).
-        let schema = schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 9, 1, 50)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
@@ -2601,7 +2555,7 @@ mod tests {
         use std::rc::Rc;
         // Delta: (1,1,2) and (1,1,9). Trace: (1,1,9) only.
         // Semi-join: emit delta rows whose PK IS in trace → only (1,1,9).
-        let schema = schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 9, 1, 50)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
@@ -2624,7 +2578,7 @@ mod tests {
         // in c2. Large delta vs tiny trace exercises the galloping skip.
         // Trace has (1,1,0) only. Delta has (1,1,0) and (1,1,1<<56).
         // Only (1,1,0) should be semi-joined.
-        let schema = schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 0, 1, 99)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
@@ -2647,7 +2601,7 @@ mod tests {
         use crate::storage::CursorHandle;
         use std::rc::Rc;
         // Trace entry for a wide PK with weight <= 0 must be skipped (no emit).
-        let schema = schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(5, 5, 5, -1, 99)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
@@ -2669,7 +2623,7 @@ mod tests {
     #[test]
     fn test_join_dd_wide_pk_cartesian() {
         // Two wide-PK batches with two matching PKs.
-        let schema = schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let a = make_wide_batch(&schema, &[
             (1, 0, 0, 1, 10),
             (2, 0, 0, 1, 20),
@@ -2689,7 +2643,7 @@ mod tests {
     fn test_semi_join_dd_wide_pk() {
         // Wide-PK semi-join: A has (1,0,0) and (3,0,0); B has (1,0,0) only.
         // Output: only (1,0,0) from A.
-        let schema = schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let a = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (3, 0, 0, 1, 30)]);
         let b = make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]);
         let out = op_semi_join_delta_delta(&a, &b, &schema);
@@ -2703,7 +2657,7 @@ mod tests {
         // an exact (PK, payload) match with positive weight.
         // A has (1,0,0,payload=10) and (3,0,0,payload=30); B has (1,0,0,payload=10).
         // Output: only (3,0,0) from A (the (1,0,0) row is excluded by exact match).
-        let schema = schema_wide_pk();
+        let schema = wide_pk_3xu64_schema();
         let a = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (3, 0, 0, 1, 30)]);
         let b = make_wide_batch(&schema, &[(1, 0, 0, 1, 10)]);  // same payload as A's first row
         let out = op_anti_join_delta_delta(&a, &b, &schema);

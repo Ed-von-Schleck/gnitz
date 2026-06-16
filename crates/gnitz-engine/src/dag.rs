@@ -2345,19 +2345,10 @@ mod tests {
     // PKs, so this is the only coverage of `PkBuf` keying at pk_stride > 16.
     #[test]
     fn test_enforce_unique_pk_wide_pk() {
-        use crate::schema::{SchemaColumn, type_code};
+        use crate::test_support::wide_pk_3xu64_schema;
         crate::util::raise_fd_limit_for_tests();
 
-        // 3×U64 PK (24 bytes) + one I64 payload.
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0), // payload
-            ],
-            &[0, 1, 2],
-        );
+        let schema = wide_pk_3xu64_schema();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_wide");
         let mut pt = crate::storage::PartitionedTable::new(

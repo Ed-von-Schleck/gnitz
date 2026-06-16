@@ -1853,6 +1853,7 @@ pub fn write_to_batch(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::test_support::wide_pk_3xu64_schema;
 
     fn single_col_pk_schema(tc: u8) -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -2210,15 +2211,7 @@ mod tests {
         // Compound PK (3xU64, stride 24): exercises the column-walk path.
         // The result of find_lower_bound_bytes must equal the first index
         // where compare_pk_bytes(row, key) is not Less, for every probe.
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0, 1, 2],
-        );
+        let schema = wide_pk_3xu64_schema();
         assert_eq!(schema.pk_stride(), 24);
         let mut b = Batch::empty_with_schema(&schema);
         let pks: [[u8; 24]; 5] = [
@@ -2313,15 +2306,7 @@ mod tests {
         // 3-column compound PK (U64 + U64 + U64) — pk_stride = 24, exercising
         // the wide-stride byte API. extend_pk panics for this stride, so the
         // test must use extend_pk_bytes / get_pk_bytes throughout.
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0, 1, 2],
-        );
+        let schema = wide_pk_3xu64_schema();
         assert_eq!(schema.pk_stride(), 24);
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(3);

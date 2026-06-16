@@ -1217,6 +1217,7 @@ mod tests {
     use super::*;
     use super::super::batch::Batch;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::test_support::wide_pk_3xu64_schema;
 
     fn make_schema_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -1841,25 +1842,11 @@ mod tests {
     // helper hardcodes 16).
     // -----------------------------------------------------------------------
 
-    fn make_schema_compound_pk_24() -> SchemaDescriptor {
-        // 3 × U64 = pk_stride 24, plus one I64 payload to keep the batch
-        // shape close to the existing single-PK tests.
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0, 1, 2],
-        )
-    }
-
     fn make_batch_compound_pk_24(rows: &[([u8; 24], i64, i64)]) -> Batch {
         // `empty_with_schema` installs the schema; no follow-up `set_schema`
         // call (it bakes in the single-PK invariant `num_payload + 1 ==
         // num_columns`, which doesn't hold for compound PKs).
-        let schema = make_schema_compound_pk_24();
+        let schema = wide_pk_3xu64_schema();
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(rows.len().max(1));
         for (pk, w, val) in rows {
@@ -1874,7 +1861,7 @@ mod tests {
 
     #[test]
     fn test_scatter_col_first_dynamic_wide_pk() {
-        let schema = make_schema_compound_pk_24();
+        let schema = wide_pk_3xu64_schema();
         // Three source rows with distinguishable PKs and payloads.
         let pk_a = [1u8; 24];
         let pk_b = [2u8; 24];
@@ -1922,7 +1909,7 @@ mod tests {
 
     #[test]
     fn test_scatter_multi_source_dynamic_wide_pk() {
-        let schema = make_schema_compound_pk_24();
+        let schema = wide_pk_3xu64_schema();
         let pk_a = [0xaau8; 24];
         let pk_b = [0xbbu8; 24];
         let pk_c = [0xccu8; 24];
@@ -1973,7 +1960,7 @@ mod tests {
 
     #[test]
     fn test_scatter_unified_sources_dynamic_wide_pk() {
-        let schema = make_schema_compound_pk_24();
+        let schema = wide_pk_3xu64_schema();
         let pk_a = [0x11u8; 24];
         let pk_b = [0x22u8; 24];
         let pk_c = [0x33u8; 24];

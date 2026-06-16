@@ -1635,6 +1635,7 @@ pub fn create_cursor_from_snapshots(
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::test_support::wide_pk_3xu64_schema;
 
     fn make_schema_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -2228,21 +2229,6 @@ mod tests {
         );
     }
 
-    /// 3×U64 compound PK (stride 24, wide): col_0 in PK bytes 0..8, col_1 in
-    /// 8..16, col_2 in 16..24. The u128 heap key only carries the low-16
-    /// prefix, so col_2 lives entirely past it.
-    fn make_wide_pk_schema() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0, 1, 2],
-        )
-    }
-
     /// OPK bytes for a 3×U64 compound PK: each column big-endian, concatenated
     /// in pk-list order (the at-rest form).
     fn pk3(a: u64, b: u64, c: u64) -> [u8; 24] {
@@ -2254,7 +2240,7 @@ mod tests {
     }
 
     fn make_wide_batch(rows: &[([u8; 24], i64, i64)]) -> Rc<Batch> {
-        let schema = make_wide_pk_schema();
+        let schema = wide_pk_3xu64_schema();
         let mut bt = Batch::with_schema(schema, rows.len().max(1));
         for (pk, w, val) in rows {
             bt.extend_pk_bytes(pk);
@@ -2273,7 +2259,7 @@ mod tests {
     /// and differ only in `col_2`; the prefix tie-break must keep them ordered.
     #[test]
     fn seek_bytes_wide_pk_24_byte_stride() {
-        let schema = make_wide_pk_schema();
+        let schema = wide_pk_3xu64_schema();
         let pk_a = pk3(0, 0, 0);
         let pk_b = pk3(1, 0, 0);
         let pk_c = pk3(1, 0, 1); // differs from pk_b only past byte 16
@@ -2298,7 +2284,7 @@ mod tests {
     /// payload-only `eq_payload` would collapse them.
     #[test]
     fn wide_pk_prefix_collision_not_consolidated() {
-        let schema = make_wide_pk_schema();
+        let schema = wide_pk_3xu64_schema();
         let pk_x = pk3(1, 1, 100);
         let pk_y = pk3(1, 1, 200);
         // Two sources so the merge heap, not a pre-sorted single batch, drives

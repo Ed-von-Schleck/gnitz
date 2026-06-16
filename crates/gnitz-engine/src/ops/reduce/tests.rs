@@ -246,17 +246,10 @@ fn reduce_trace_seek_wide_pk() {
     use std::rc::Rc;
     use crate::storage::CursorHandle;
     use crate::schema::{SchemaColumn, type_code};
+    use crate::test_support::wide_pk_3xu64_schema;
 
     // Wide PK: 3×U64 (stride 24) + I64 val. GROUP BY the full PK.
-    let in_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0, 1, 2],
-    );
+    let in_schema = wide_pk_3xu64_schema();
     // Output: natural wide PK (3×U64) + SUM(I64, nullable).
     let out_schema = SchemaDescriptor::new(
         &[

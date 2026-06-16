@@ -500,6 +500,7 @@ pub fn partition_arena_size(num_partitions: u32) -> u64 {
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::test_support::wide_pk_3xu64_schema;
 
     fn make_schema() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -708,19 +709,6 @@ mod tests {
         assert!(!found_absent, "absent suffix in a populated prefix-partition is not found");
     }
 
-    fn make_wide_schema() -> SchemaDescriptor {
-        // 3×U64 compound PK → pk_stride = 24 (> 16, wide).
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0, 1, 2],
-        )
-    }
-
     #[test]
     fn partition_for_pk_bytes_narrow_invariance() {
         // For every narrow width, routing the physically-stored OPK
@@ -771,7 +759,7 @@ mod tests {
         crate::util::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("wide_test");
-        let schema = make_wide_schema();
+        let schema = wide_pk_3xu64_schema();
         // Only partition 0 is live. Per-partition Table::ingest (and its
         // memtable upsert, which still calls get_pk and is an out-of-scope
         // boundary for wide PKs) only runs for rows routed to partition 0.
@@ -786,10 +774,14 @@ mod tests {
         let mut n = 0;
         let mut k = 0u64;
         while n < 200 {
+            // OPK bytes for the 3×U64 compound PK: each column big-endian, tightly
+            // packed (all-unsigned ⇒ OPK == plain big-endian) — the bytes the ingest
+            // path routes. Raw little-endian would scatter a 24-byte layout no
+            // production wide PK carries.
             let mut pk = [0u8; 24];
-            pk[..8].copy_from_slice(&(k * 7 + 13).to_le_bytes());
-            pk[8..16].copy_from_slice(&(k * 31 + 5).to_le_bytes());
-            pk[16..24].copy_from_slice(&(k + 1).to_le_bytes());
+            pk[..8].copy_from_slice(&(k * 7 + 13).to_be_bytes());
+            pk[8..16].copy_from_slice(&(k * 31 + 5).to_be_bytes());
+            pk[16..24].copy_from_slice(&(k + 1).to_be_bytes());
             k += 1;
             if partition_for_pk_bytes(&pk) == 0 {
                 continue; // would hit the out-of-scope memtable boundary

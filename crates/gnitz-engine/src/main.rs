@@ -19,6 +19,8 @@ mod runtime;
 
 #[cfg(test)]
 mod test_rng;
+#[cfg(test)]
+mod test_support;
 
 use std::env;
 use std::process;
