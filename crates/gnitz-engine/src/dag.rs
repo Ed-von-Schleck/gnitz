@@ -6,7 +6,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::PkColList;
 use crate::compiler::{self, CompileOutput, ExternalTable, SubPlan};
-use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, Persistence, PkBuf, Table, PartitionedTable, StorageError};
+use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, Persistence, Table, PartitionedTable, StorageError};
 use crate::ops;
 use crate::vm;
 
@@ -1147,11 +1147,8 @@ impl DagEngine {
         if let Some(d) = delta_opt {
             crate::storage::batch_pool::recycle(d);
         }
-        pending.sort_by_key(|n| std::cmp::Reverse(n.depth));
         let mut pending_pos: FxHashMap<(i64, i64), usize> = FxHashMap::default();
-        for (i, pe) in pending.iter().enumerate() {
-            pending_pos.insert((pe.view_id, pe.source_id), i);
-        }
+        Self::resort_pending(&mut pending, &mut pending_pos);
         (pending, pending_pos)
     }
 
@@ -1200,13 +1197,10 @@ impl DagEngine {
                 continue;
             }
 
-            // Queue dependents
-            let dep_view_ids: Vec<i64> = self.dep_map
-                .get(&view_id)
-                .cloned()
-                .unwrap_or_default();
-
-            if dep_view_ids.is_empty() {
+            // Queue dependents. Borrow the dep list rather than cloning it; the
+            // borrow of `self.dep_map` coexists with `&self.tables` (disjoint
+            // fields) and is taken after the `&mut self` ingest below.
+            if self.dep_map.get(&view_id).is_none_or(|d| d.is_empty()) {
                 // Terminal view: move batch directly — no clone for unique_pk.
                 self.ingest_to_family(view_id, out_delta);
             } else {
@@ -1218,7 +1212,7 @@ impl DagEngine {
                     &mut pending,
                     &mut pending_pos,
                     &self.tables,
-                    &dep_view_ids,
+                    &self.dep_map[&view_id],
                     view_id,
                     src_schema,
                     Some(&out_delta),
@@ -1382,16 +1376,10 @@ impl DagEngine {
                 self.execute_pre_phase(view_id, input, src_id)
             };
 
-            let has_output = out_delta.as_ref().map(|b| b.count > 0).unwrap_or(false);
-
-            // Multi-worker: ALWAYS queue dependents (even empty output)
-            let dep_view_ids: Vec<i64> = self.dep_map
-                .get(&view_id)
-                .cloned()
-                .unwrap_or_default();
+            let has_output = out_delta.as_ref().is_some_and(|b| b.count > 0);
 
             if has_output {
-                if dep_view_ids.is_empty() {
+                if self.dep_map.get(&view_id).is_none_or(|d| d.is_empty()) {
                     // Terminal view: move batch directly — no clone for unique_pk.
                     self.ingest_to_family(view_id, out_delta.unwrap());
                     dirty_views.insert(view_id);
@@ -1401,16 +1389,20 @@ impl DagEngine {
                 dirty_views.insert(view_id);
             }
 
-            // Multi-worker queues empty placeholders so exchange-dependent
-            // views still fire, so pass the producer's delta only when it has
-            // output (an empty `out_delta` Some(count==0) must NOT be merged).
+            // Multi-worker queues empty placeholders so exchange-dependent views
+            // still fire, so pass the producer's delta only when it has output
+            // (an empty `out_delta` Some(count==0) must NOT be merged). Borrow
+            // the dep list (disjoint from `&self.tables`) rather than cloning;
+            // `map_or` yields an empty slice for a view with no dependents, which
+            // queue_dependents treats as a no-op — preserving the always-queue path.
             let src_schema = self.tables[&view_id].schema;
             let delta = if has_output { out_delta.as_ref() } else { None };
+            let dep_view_ids = self.dep_map.get(&view_id).map_or(&[][..], Vec::as_slice);
             Self::queue_dependents(
                 &mut pending,
                 &mut pending_pos,
                 &self.tables,
-                &dep_view_ids,
+                dep_view_ids,
                 view_id,
                 src_schema,
                 delta,
@@ -1468,6 +1460,7 @@ impl DagEngine {
         src_schema: SchemaDescriptor,
         delta: Option<&Batch>,
     ) {
+        let mut pushed = false;
         for &dep_id in dep_view_ids {
             let dep_depth = match tables.get(&dep_id) {
                 Some(e) => e.depth,
@@ -1485,7 +1478,6 @@ impl DagEngine {
                     pending[existing_idx].batch = merged;
                 }
             } else {
-                let new_idx = pending.len();
                 let batch = match delta {
                     Some(d) => d.clone_batch(),
                     None => Batch::with_schema(src_schema, 0),
@@ -1496,9 +1488,21 @@ impl DagEngine {
                     source_id: view_id,
                     batch,
                 });
-                pending_pos.insert((dep_id, view_id), new_idx);
-                Self::resort_pending(pending, pending_pos);
+                pushed = true;
             }
+        }
+        // New entries are not recorded in `pending_pos` here: the end-of-loop
+        // `resort_pending` rebuilds it wholesale, and nothing reads a new entry's
+        // slot before then — `dep_view_ids` is deduped (get_dep_map), so no later
+        // iteration probes a `(dep_id, view_id)` key an earlier one pushed. The
+        // pre-existing slots the merge branch *does* probe stay valid because
+        // `pending` is only appended to here (the merge mutates a batch in place,
+        // never moves an entry). One stable resort at the end restores descending
+        // depth order while preserving per-depth insertion order. A resort is
+        // needed iff at least one edge was pushed; pure merges change neither
+        // membership nor depth.
+        if pushed {
+            Self::resort_pending(pending, pending_pos);
         }
     }
 
@@ -1825,8 +1829,9 @@ impl DagEngine {
     ///
     /// Emits the stored-row retraction (`-1`, old payload) into the effective
     /// batch so downstream views see the old payload removed before the new one
-    /// lands. Keys on `get_pk_bytes` (verbatim OPK) and dedups via `PkBuf` —
-    /// correct for every PK width. Never round-trips through a native `u128`
+    /// lands. Keys on `get_pk_bytes` (verbatim OPK) and dedups on `&[u8]` slices
+    /// borrowed from the batch's PK region — correct for every PK width. Never
+    /// round-trips through a native `u128`
     /// (which `opk_key` would re-encode, double-flipping a signed PK's sign bit,
     /// so the probe would match no stored row and the retraction would be
     /// silently dropped).
@@ -1849,13 +1854,13 @@ impl DagEngine {
         // batch index (not an effective index): `append_batch_negated` reads from
         // `batch`, and the effective batch carries extra store-retraction rows
         // that break any 1:1 correspondence with `row`.
-        let mut seen: FxHashMap<PkBuf, usize> =
+        let mut seen: FxHashMap<&[u8], usize> =
             FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
         // pk set of store rows already retracted in this batch. `retract_pk_bytes`
         // is read-only (it only arms the `found_*` accessors), so emitting the
         // stored-row retraction more than once per PK would drive downstream
         // weights negative; this set gates the emission to exactly once.
-        let mut store_retracted: FxHashSet<PkBuf> =
+        let mut store_retracted: FxHashSet<&[u8]> =
             FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
 
         for row in 0..batch.count {
@@ -1871,7 +1876,7 @@ impl DagEngine {
             let (_existing_w, found) = ptable.retract_pk_bytes(pkb);
             if found && !store_retracted.contains(pkb) {
                 effective.append_row_from_ptable_found(ptable, pkb, -1);
-                store_retracted.insert(PkBuf::from_bytes(pkb));
+                store_retracted.insert(pkb);
             }
 
             if w > 0 {
@@ -1881,7 +1886,7 @@ impl DagEngine {
                     effective.append_batch_negated(&batch, *prev_pos, *prev_pos + 1);
                     *prev_pos = row;
                 } else {
-                    seen.insert(PkBuf::from_bytes(pkb), row);
+                    seen.insert(pkb, row);
                 }
                 effective.append_batch(&batch, row, row + 1);
             } else {
@@ -2342,7 +2347,7 @@ mod tests {
     // Wide-PK enforcement: a >16-byte compound PK must key the intra-batch
     // `seen` map, the store probe, and the emitted retraction on its full OPK
     // bytes. The other enforce_unique_pk unit tests use narrow single-column
-    // PKs, so this is the only coverage of `PkBuf` keying at pk_stride > 16.
+    // PKs, so this is the only coverage of `&[u8]` slice keying at pk_stride > 16.
     #[test]
     fn test_enforce_unique_pk_wide_pk() {
         use crate::test_support::{opk_pk, wide_pk_3xu64_schema, wide_row};
