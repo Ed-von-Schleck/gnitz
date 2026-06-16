@@ -1155,108 +1155,35 @@ impl DagEngine {
     // ── evaluate_dag (single-worker) ────────────────────────────────────
 
     /// Full single-worker DAG evaluation.
-    pub fn evaluate_dag(&mut self, source_id: i64, delta: Batch) -> i32 {
-        gnitz_debug!("dag: evaluate_dag source_id={} delta_count={} tables={}",
-            source_id, delta.count, self.tables.len());
-        // 1. Get dep_map
-        self.get_dep_map();
-        let view_ids: Vec<i64> = self.dep_map
-            .get(&source_id)
-            .cloned()
-            .unwrap_or_default();
-
-        if view_ids.is_empty() {
-            return 0;
-        }
-
-        // 2. Build initial pending list
-        let (mut pending, mut pending_pos) = self.build_pending(&view_ids, source_id, delta);
-        let mut dirty_views: FxHashSet<i64> = FxHashSet::default();
-
-        // 3. Process
-        while let Some(entry) = pending.pop() {
-            let view_id = entry.view_id;
-            let src_id = entry.source_id;
-            let input = entry.batch;
-            pending_pos.remove(&(view_id, src_id));
-
-            // Check table still exists (may have been dropped)
-            if !self.tables.contains_key(&view_id) {
-                crate::storage::batch_pool::recycle(input);
-                continue;
-            }
-
-            // Execute
-            let out_delta = match self.execute_epoch_for_dag(view_id, input, src_id) {
-                Some(batch) => batch,
-                None => continue,
-            };
-
-            if out_delta.count == 0 {
-                crate::storage::batch_pool::recycle(out_delta);
-                continue;
-            }
-
-            // Queue dependents. Borrow the dep list rather than cloning it; the
-            // borrow of `self.dep_map` coexists with `&self.tables` (disjoint
-            // fields) and is taken after the `&mut self` ingest below.
-            if self.dep_map.get(&view_id).is_none_or(|d| d.is_empty()) {
-                // Terminal view: move batch directly — no clone for unique_pk.
-                self.ingest_to_family(view_id, out_delta);
-            } else {
-                // This driver returns early on count == 0, so the producer
-                // always has output here — pass Some.
-                let src_schema = self.tables[&view_id].schema;
-                self.ingest_by_ref(view_id, &out_delta);
-                Self::queue_dependents(
-                    &mut pending,
-                    &mut pending_pos,
-                    &self.tables,
-                    &self.dep_map[&view_id],
-                    view_id,
-                    src_schema,
-                    Some(&out_delta),
-                );
-                crate::storage::batch_pool::recycle(out_delta);
-            }
-            dirty_views.insert(view_id);
-        }
-
-        // Flush each modified view trace exactly once after the full DAG settles.
-        for vid in dirty_views {
-            let _ = self.flush(vid);
-        }
-
-        0
-    }
-
-    // ── evaluate_dag_multi_worker ──────────────────────────────────────
-
-    /// Multi-worker DAG evaluation with exchange IPC.
+    /// Shared engine for both DAG evaluation modes. Seeds the pending queue from
+    /// `source_id`'s direct dependents, then repeatedly pops the shallowest
+    /// pending edge, runs `execute` on it, ingests the output, and fans that
+    /// output onto each downstream edge — until the queue drains. Every modified
+    /// view trace is flushed exactly once after the DAG settles.
     ///
-    /// Near-copy of `evaluate_dag()` with these critical differences:
-    /// 1. Exchange views: call `exchange.do_exchange()` between pre and post
-    ///    phases — unless `view_skips_exchange` (the shard reads a scan, through
-    ///    any Filter chain, whose distribution prefix is already the shard key,
-    ///    so the shuffle is a no-op).
-    /// 2. Join shard exchange: when `get_join_shard_cols` is non-empty AND NOT
-    ///    `plan_source_co_partitioned`, call exchange before execute_epoch.
-    /// 3. Always queue downstream views even when output is empty (ensures
-    ///    exchange-dependent views still fire).
-    /// 4. Exchange schema: use `get_exchange_schema()` for pre-plan output,
-    ///    not the view's output schema.
-    pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(
+    /// `execute` is the per-view step: the single-worker driver runs
+    /// `execute_epoch_for_dag`; the multi-worker driver runs the exchange-aware
+    /// `execute_multi_worker_step` (capturing its `ExchangeCallback`). It takes
+    /// the engine as an explicit `&mut Self` argument — borrowed only for the
+    /// call, never captured — and returns the view's output delta, or
+    /// `None`/empty when the view produced nothing this epoch.
+    ///
+    /// `queue_empty` decides the fate of a view that produced no output:
+    /// single-worker drops it (`false` — nothing downstream can change), while
+    /// multi-worker still fans an empty placeholder onto each dependent (`true`)
+    /// so collective exchange rounds stay in lockstep across workers.
+    fn drive_dag(
         &mut self,
         source_id: i64,
         delta: Batch,
-        exchange: &mut E,
+        queue_empty: bool,
+        mut execute: impl FnMut(&mut Self, i64, Batch, i64) -> Option<Batch>,
     ) -> i32 {
         self.get_dep_map();
         let view_ids: Vec<i64> = self.dep_map
             .get(&source_id)
             .cloned()
             .unwrap_or_default();
-
         if view_ids.is_empty() {
             return 0;
         }
@@ -1270,131 +1197,37 @@ impl DagEngine {
             let input = entry.batch;
             pending_pos.remove(&(view_id, src_id));
 
+            // The table may have been dropped between queueing and now.
             if !self.tables.contains_key(&view_id) {
                 crate::storage::batch_pool::recycle(input);
                 continue;
             }
 
-            self.ensure_compiled(view_id);
-
-            // Only `has_exchange` is eager — two arms test it. The two single-use
-            // checks (`view_skips_exchange` and the join-shard-cols emptiness test)
-            // are evaluated at their sole consumer arm below: the range-join arm
-            // (taken first) and the set-op arm read neither, so deferring keeps them
-            // off the cache lookup and the first-call circuit load.
-            let has_exchange = self.view_needs_exchange(view_id);
-
-            let out_delta = if self.view_range_join_n_eq(view_id).is_some() {
-                // Range join: input relay (eq-prefix scatter for a band join,
-                // broadcast for a pure range join) → pre → output exchange → post.
-                // Checked FIRST: a range join has has_exchange == true (its output
-                // ExchangeShard), so it would otherwise be swallowed by the
-                // has_exchange arm below, which never relays the join input. No
-                // co-partition shortcut applies: a pure range probe needs the full
-                // delta even when the join key equals the source PK, and a band join
-                // always routes through the relay by decision (see prepare_relay)
-                // rather than taking a co-partition exchange-skip.
-                //
-                // Set the source schema for exchange wire encoding: a batch with
-                // rows but a None schema emits FLAG_HAS_DATA without FLAG_HAS_SCHEMA
-                // and panics the reactor decode. Mirrors the join-shard arm.
-                let mut input_with_schema = input;
-                if input_with_schema.schema.is_none() {
-                    if let Some(entry) = self.tables.get(&src_id) {
-                        input_with_schema.set_schema(entry.schema);
-                    }
-                }
-                // (1) Relay the source delta (eq-prefix scatter for a band join or
-                // broadcast for a pure range join, decided master-side in
-                // `prepare_relay`).
-                let bc = exchange.do_exchange(view_id, &input_with_schema, src_id);
-                let exchange_schema = self.get_exchange_schema(view_id)
-                    .unwrap_or_else(|| self.tables[&view_id].schema);
-                // (2) Pre plan on the relayed delta (the worker's eq-prefix slice for
-                // a band join; the full broadcast delta for a pure range join):
-                // reindex, ownership-filter the traces (pure range only — band-join
-                // traces are already eq-prefix-partitioned by the scatter),
-                // range-probe, normalize, re-key onto the source-PK pair.
-                let pre_result = match self.execute_pre_phase(view_id, bc, src_id) {
-                    Some(mut b) => { b.set_schema(exchange_schema); b }
-                    None => Batch::with_schema(exchange_schema, 0),
-                };
-                // (3) Output exchange on the pair-PK (GroupKey scatter), then
-                // consolidate (probe output is unsorted, mixed-sign) → post sink.
-                let post_in = exchange.do_exchange(view_id, &pre_result, 0);
-                let post_in = Self::consolidate_exchanged(post_in, &exchange_schema);
-                self.execute_post_phase(view_id, post_in)
-            } else if has_exchange && self.view_has_side_b(view_id) {
-                // Binary set-op: two HashRow→ExchangeShard sides, each scattered
-                // by its hash PK, then combined.
-                self.run_two_sided(view_id, input, src_id,
-                    |pre, side_src| exchange.do_exchange(view_id, &pre, side_src))
-            } else if has_exchange {
-                // Exchange view: pre-plan → exchange IPC → post-plan
-                let exchange_schema = self.get_exchange_schema(view_id)
-                    .unwrap_or_else(|| self.tables[&view_id].schema);
-
-                let pre_result = match self.execute_pre_phase(view_id, input, src_id) {
-                    Some(mut batch) => {
-                        batch.set_schema(exchange_schema);
-                        batch
-                    }
-                    None => Batch::with_schema(exchange_schema, 0),
-                };
-
-                // The relayed (or, when skipping IPC, the local pre) batch is
-                // unsorted/unconsolidated after a HashRow reindex or a scatter;
-                // the post phase's distinct/join operators need sorted,
-                // weight-merged input.
-                let post_in = if self.view_skips_exchange(view_id) {
-                    pre_result
-                } else {
-                    exchange.do_exchange(view_id, &pre_result, 0)
-                };
-                let post_in = Self::consolidate_exchanged(post_in, &exchange_schema);
-                self.execute_post_phase(view_id, post_in)
-            } else if !self.join_shard_cols_is_empty(view_id, src_id) {
-                // Join shard exchange. The col list is tested only on this arm, so
-                // its emptiness is checked here rather than eagerly above the chain;
-                // the body drives off `plan_source_co_partitioned`.
-                let copart_join = self.plan_source_co_partitioned(view_id, src_id);
-                if copart_join {
-                    self.execute_pre_phase(view_id, input, src_id)
-                } else {
-                    // Set batch schema for the exchange wire encoding.
-                    let mut input_with_schema = input;
-                    if input_with_schema.schema.is_none() {
-                        if let Some(entry) = self.tables.get(&src_id) {
-                            input_with_schema.set_schema(entry.schema);
-                        }
-                    }
-                    let exchanged = exchange.do_exchange(view_id, &input_with_schema, src_id);
-                    self.execute_pre_phase(view_id, exchanged, src_id)
-                }
-            } else {
-                // No exchange: simple single-phase execution
-                self.execute_pre_phase(view_id, input, src_id)
-            };
-
+            let out_delta = execute(&mut *self, view_id, input, src_id);
             let has_output = out_delta.as_ref().is_some_and(|b| b.count > 0);
 
             if has_output {
                 if self.dep_map.get(&view_id).is_none_or(|d| d.is_empty()) {
-                    // Terminal view: move batch directly — no clone for unique_pk.
+                    // Terminal view: move the batch into its family (no clone for
+                    // unique_pk) — there is nothing downstream to fan onto.
                     self.ingest_to_family(view_id, out_delta.unwrap());
                     dirty_views.insert(view_id);
                     continue;
                 }
                 self.ingest_by_ref(view_id, out_delta.as_ref().unwrap());
                 dirty_views.insert(view_id);
+            } else if !queue_empty {
+                // Single-worker: an empty output has no downstream effect.
+                if let Some(b) = out_delta {
+                    crate::storage::batch_pool::recycle(b);
+                }
+                continue;
             }
 
-            // Multi-worker queues empty placeholders so exchange-dependent views
-            // still fire, so pass the producer's delta only when it has output
-            // (an empty `out_delta` Some(count==0) must NOT be merged). Borrow
-            // the dep list (disjoint from `&self.tables`) rather than cloning;
-            // `map_or` yields an empty slice for a view with no dependents, which
-            // queue_dependents treats as a no-op — preserving the always-queue path.
+            // Fan the output — or, under `queue_empty`, an empty placeholder —
+            // onto each dependent edge. Borrow the dep list (disjoint from
+            // `&self.tables`) rather than cloning; `map_or` yields an empty slice
+            // for a view with no dependents, which queue_dependents no-ops.
             let src_schema = self.tables[&view_id].schema;
             let delta = if has_output { out_delta.as_ref() } else { None };
             let dep_view_ids = self.dep_map.get(&view_id).map_or(&[][..], Vec::as_slice);
@@ -1418,6 +1251,158 @@ impl DagEngine {
         }
 
         0
+    }
+
+    /// Single-worker DAG evaluation: run each view's epoch directly, with no
+    /// exchange IPC. An empty output is dropped — nothing downstream can change.
+    pub fn evaluate_dag(&mut self, source_id: i64, delta: Batch) -> i32 {
+        gnitz_debug!("dag: evaluate_dag source_id={} delta_count={} tables={}",
+            source_id, delta.count, self.tables.len());
+        self.drive_dag(source_id, delta, false, |this, view_id, input, src_id| {
+            this.execute_epoch_for_dag(view_id, input, src_id)
+        })
+    }
+
+    /// Multi-worker DAG evaluation with exchange IPC. Same traversal as the
+    /// single-worker `evaluate_dag`, but each view runs through
+    /// `execute_multi_worker_step` (the pre / exchange / post dance), and
+    /// `queue_empty = true` keeps empty placeholders flowing downstream so
+    /// collective exchange rounds stay in lockstep across workers.
+    pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(
+        &mut self,
+        source_id: i64,
+        delta: Batch,
+        exchange: &mut E,
+    ) -> i32 {
+        self.drive_dag(source_id, delta, true, |this, view_id, input, src_id| {
+            this.execute_multi_worker_step(view_id, input, src_id, exchange)
+        })
+    }
+
+    /// Run one multi-worker DAG step: ensure the view's circuit is compiled, then
+    /// dispatch on its exchange shape and run the view's epoch, returning the
+    /// output delta (`None` when a phase produced nothing). Exchange shapes,
+    /// tested in order:
+    /// 1. Range join: relay the source delta (eq-prefix scatter for a band join,
+    ///    broadcast for a pure range join) → pre → output exchange → post.
+    ///    Checked FIRST: a range join has `has_exchange == true` (its output
+    ///    ExchangeShard) and would otherwise be swallowed by the plain-exchange
+    ///    arm, which never relays the join input.
+    /// 2. Binary set-op (`has_exchange` + side B): two HashRow→ExchangeShard
+    ///    sides, each scattered by its hash PK, then combined.
+    /// 3. Plain exchange: pre-plan → exchange IPC (skipped when
+    ///    `view_skips_exchange`) → consolidate → post-plan, keyed off
+    ///    `get_exchange_schema()` rather than the view's output schema.
+    /// 4. Join shard (`get_join_shard_cols` non-empty AND NOT
+    ///    `plan_source_co_partitioned`): exchange before execute_epoch.
+    /// 5. No exchange: single-phase execute.
+    fn execute_multi_worker_step<E: ExchangeCallback>(
+        &mut self,
+        view_id: i64,
+        input: Batch,
+        src_id: i64,
+        exchange: &mut E,
+    ) -> Option<Batch> {
+        self.ensure_compiled(view_id);
+
+        // Only `has_exchange` is eager — two arms test it. The two single-use
+        // checks (`view_skips_exchange` and the join-shard-cols emptiness test)
+        // are evaluated at their sole consumer arm below: the range-join arm
+        // (taken first) and the set-op arm read neither, so deferring keeps them
+        // off the cache lookup and the first-call circuit load.
+        let has_exchange = self.view_needs_exchange(view_id);
+
+        if self.view_range_join_n_eq(view_id).is_some() {
+            // Range join: input relay (eq-prefix scatter for a band join,
+            // broadcast for a pure range join) → pre → output exchange → post.
+            // Checked FIRST: a range join has has_exchange == true (its output
+            // ExchangeShard), so it would otherwise be swallowed by the
+            // has_exchange arm below, which never relays the join input. No
+            // co-partition shortcut applies: a pure range probe needs the full
+            // delta even when the join key equals the source PK, and a band join
+            // always routes through the relay by decision (see prepare_relay)
+            // rather than taking a co-partition exchange-skip.
+            //
+            // Set the source schema for exchange wire encoding: a batch with
+            // rows but a None schema emits FLAG_HAS_DATA without FLAG_HAS_SCHEMA
+            // and panics the reactor decode. Mirrors the join-shard arm.
+            let mut input_with_schema = input;
+            if input_with_schema.schema.is_none() {
+                if let Some(entry) = self.tables.get(&src_id) {
+                    input_with_schema.set_schema(entry.schema);
+                }
+            }
+            // (1) Relay the source delta (eq-prefix scatter for a band join or
+            // broadcast for a pure range join, decided master-side in
+            // `prepare_relay`).
+            let bc = exchange.do_exchange(view_id, &input_with_schema, src_id);
+            let exchange_schema = self.get_exchange_schema(view_id)
+                .unwrap_or_else(|| self.tables[&view_id].schema);
+            // (2) Pre plan on the relayed delta (the worker's eq-prefix slice for
+            // a band join; the full broadcast delta for a pure range join):
+            // reindex, ownership-filter the traces (pure range only — band-join
+            // traces are already eq-prefix-partitioned by the scatter),
+            // range-probe, normalize, re-key onto the source-PK pair.
+            let pre_result = match self.execute_pre_phase(view_id, bc, src_id) {
+                Some(mut b) => { b.set_schema(exchange_schema); b }
+                None => Batch::with_schema(exchange_schema, 0),
+            };
+            // (3) Output exchange on the pair-PK (GroupKey scatter), then
+            // consolidate (probe output is unsorted, mixed-sign) → post sink.
+            let post_in = exchange.do_exchange(view_id, &pre_result, 0);
+            let post_in = Self::consolidate_exchanged(post_in, &exchange_schema);
+            self.execute_post_phase(view_id, post_in)
+        } else if has_exchange && self.view_has_side_b(view_id) {
+            // Binary set-op: two HashRow→ExchangeShard sides, each scattered
+            // by its hash PK, then combined.
+            self.run_two_sided(view_id, input, src_id,
+                |pre, side_src| exchange.do_exchange(view_id, &pre, side_src))
+        } else if has_exchange {
+            // Exchange view: pre-plan → exchange IPC → post-plan
+            let exchange_schema = self.get_exchange_schema(view_id)
+                .unwrap_or_else(|| self.tables[&view_id].schema);
+
+            let pre_result = match self.execute_pre_phase(view_id, input, src_id) {
+                Some(mut batch) => {
+                    batch.set_schema(exchange_schema);
+                    batch
+                }
+                None => Batch::with_schema(exchange_schema, 0),
+            };
+
+            // The relayed (or, when skipping IPC, the local pre) batch is
+            // unsorted/unconsolidated after a HashRow reindex or a scatter;
+            // the post phase's distinct/join operators need sorted,
+            // weight-merged input.
+            let post_in = if self.view_skips_exchange(view_id) {
+                pre_result
+            } else {
+                exchange.do_exchange(view_id, &pre_result, 0)
+            };
+            let post_in = Self::consolidate_exchanged(post_in, &exchange_schema);
+            self.execute_post_phase(view_id, post_in)
+        } else if !self.join_shard_cols_is_empty(view_id, src_id) {
+            // Join shard exchange. The col list is tested only on this arm, so
+            // its emptiness is checked here rather than eagerly above the chain;
+            // the body drives off `plan_source_co_partitioned`.
+            let copart_join = self.plan_source_co_partitioned(view_id, src_id);
+            if copart_join {
+                self.execute_pre_phase(view_id, input, src_id)
+            } else {
+                // Set batch schema for the exchange wire encoding.
+                let mut input_with_schema = input;
+                if input_with_schema.schema.is_none() {
+                    if let Some(entry) = self.tables.get(&src_id) {
+                        input_with_schema.set_schema(entry.schema);
+                    }
+                }
+                let exchanged = exchange.do_exchange(view_id, &input_with_schema, src_id);
+                self.execute_pre_phase(view_id, exchanged, src_id)
+            }
+        } else {
+            // No exchange: simple single-phase execution
+            self.execute_pre_phase(view_id, input, src_id)
+        }
     }
 
     // ── Private helpers ─────────────────────────────────────────────────
