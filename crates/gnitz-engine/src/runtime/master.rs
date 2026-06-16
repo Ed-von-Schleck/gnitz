@@ -35,7 +35,7 @@ use crate::storage::{Batch, ConsolidatedBatch, PkBuf};
 use crate::ops::{
     PartitionRouter, RouteMode, op_relay_broadcast,
     op_repartition_batches_mode, op_relay_scatter_consolidated_mode,
-    worker_for_partition, with_worker_indices,
+    worker_for_partition, with_worker_indices, with_broadcast_indices,
 };
 
 
@@ -1227,17 +1227,58 @@ impl MasterDispatcher {
         // `send_encoded` — draining the doomed trains would be pure waste. On
         // a fault the client sees its data frames followed by a STATUS_ERROR
         // frame, which `recv_scan_response` handles mid-stream.
-        for (w, mut slot) in slots.into_iter().enumerate() {
-            loop {
-                let (_, has_more) = parse_train_header(&slot, w, "scan")?;
-                // Forward slot to client; send_slot drops it on return.
-                let rc = reactor.send_slot(fd, slot).await;
-                if rc < 0 { return Ok(false); }
-                if !has_more { break; }
-                slot = reactor.await_scan_slot(req_ids[w] as u32).await;
+        for (w, slot) in slots.into_iter().enumerate() {
+            if !drain_scan_train(reactor, fd, slot, req_ids[w] as u32, w).await? {
+                return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Single-source SCAN: send the SCAN to **one** worker and forward its
+    /// continuation train to the client. Used for a **replicated** relation,
+    /// whose full copy lives on every worker — `fan_out_scan_async` would
+    /// concatenate W identical copies. Worker 0 always exists, and replicated
+    /// tables are exempt from the bootstrap trim, so it holds the full copy at
+    /// partition 0. Same train/lease contract as `fan_out_scan_async`; the only
+    /// differences are the unicast write and draining a single worker's train.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fan_out_scan_single_worker_async(
+        disp_ptr: *mut MasterDispatcher,
+        reactor: &crate::runtime::reactor::Reactor,
+        sal_excl: &Rc<AsyncMutex<()>>,
+        target_id: i64,
+        worker: usize,
+        client_id: u64,
+        fd: i32,
+        client_version: u16,
+    ) -> Result<bool, String> {
+        let req_id = {
+            let _guard = sal_excl.lock().await;
+            unsafe {
+                let disp = &mut *disp_ptr;
+                let (schema, col_names) = disp.get_schema_and_names(target_id);
+                let req_id = reactor.alloc_scan_request_id();
+                let lsn = disp.next_lsn();
+                let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, client_version);
+                let nw = disp.num_workers;
+                // write_group_direct keys replies by worker slot; under unicast
+                // only `worker`'s slot is written and replies, all on this req_id.
+                let ids = [req_id; crate::runtime::sal::MAX_WORKERS];
+                disp.write_group_with_req_ids(
+                    target_id, lsn, 0, wire_flags, &[], &schema, &col_names,
+                    0, 0, &ids[..nw], worker as i32, client_id, None, &[],
+                )?;
+                disp.signal_one(worker);
+                req_id
+            }
+        };
+        // Hold the scan id active across the whole continuation drain (see
+        // `fan_out_scan_async`): a cancelled drain must keep the id active so the
+        // gate discards — not parks — late frames.
+        let _lease = reactor.scan_lease(&[req_id as u32]);
+        let slot = reactor.await_scan_slot(req_id as u32).await;
+        drain_scan_train(reactor, fd, slot, req_id as u32, worker).await
     }
 
     /// Async version of `execute_pipeline`. Writes each check with
@@ -2605,9 +2646,14 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         let (schema, schema_block, wire_safe, wire_row_stride) =
             self.cached_schema_block(target_id);
+        let nw = self.num_workers;
         let pk_col = schema.pk_indices();
         let wire_flags = wire_flags_set_conflict_mode(0, mode);
-        with_worker_indices(batch, pk_col, &schema, self.num_workers, |worker_indices| {
+        // Identical scatter for both routings; only the per-worker index fill
+        // differs (full broadcast vs PK-partitioned). One `scatter_wire_group`
+        // call site keeps the atomic-zone framing, LSN, ACK accounting, and the
+        // committer's single `fdatasync` shared between them.
+        let scatter = |worker_indices: &[Vec<u32>]| {
             self.record_index_routing(target_id, &schema, batch, worker_indices);
             self.sal.scatter_wire_group(
                 batch, worker_indices, &schema, None,
@@ -2617,7 +2663,15 @@ impl MasterDispatcher {
                 Some(schema_block.as_slice()),
                 Some((wire_safe, wire_row_stride)),
             )
-        })
+        };
+        if schema.replicated() {
+            // Replicated: the whole batch lands in every worker's ingest + SAL
+            // slot, so each worker durably logs the full table and enforces
+            // uniqueness against its identical full copy.
+            with_broadcast_indices(batch, nw, scatter)
+        } else {
+            with_worker_indices(batch, pk_col, &schema, nw, scatter)
+        }
     }
 
     /// Write a FLAG_FLUSH checkpoint group with per-worker req_ids.
@@ -2853,6 +2907,30 @@ fn parse_train_header(
     let has_more = ctrl.flags & FLAG_SCAN_LAST == 0
         && ctrl.flags & FLAG_CONTINUATION != 0;
     Ok((ctrl, has_more))
+}
+
+/// Forward one worker's SCAN continuation train to the client: send each frame
+/// to `fd` (dropping it before awaiting the next, per the W2M ring contract) and
+/// loop until the train header reports no more frames. `slot` is the first,
+/// already-awaited frame. Returns `Ok(false)` if the client disconnects
+/// mid-stream and `Err` on a malformed train header. Shared by
+/// `fan_out_scan_async` (one call per worker) and
+/// `fan_out_scan_single_worker_async` (one call for the single source worker).
+async fn drain_scan_train(
+    reactor: &crate::runtime::reactor::Reactor,
+    fd: i32,
+    mut slot: W2mSlot,
+    req_id: u32,
+    worker: usize,
+) -> Result<bool, String> {
+    loop {
+        let (_, has_more) = parse_train_header(&slot, worker, "scan")?;
+        let rc = reactor.send_slot(fd, slot).await;
+        if rc < 0 { return Ok(false); }
+        if !has_more { break; }
+        slot = reactor.await_scan_slot(req_id).await;
+    }
+    Ok(true)
 }
 
 /// Fan-out reply-train drain shared by the unique-filter warmup and the

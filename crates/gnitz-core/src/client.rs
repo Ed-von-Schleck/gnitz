@@ -488,6 +488,7 @@ impl GnitzClient {
     /// prefix). `0` means the default — distribute by the full PK, byte-identical
     /// to the pre-distribution-key behavior. The SQL planner validates `k` against
     /// the PK before calling this; the single-PK Python/test surfaces pass `0`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_table(
         &mut self,
         schema_name: &str,
@@ -495,6 +496,7 @@ impl GnitzClient {
         columns: &[ColumnDef],
         pk_cols: &[u32],
         unique_pk: bool,
+        replicated: bool,
         dist_prefix_len: usize,
     ) -> Result<u64, ClientError> {
         if !(1..=gnitz_wire::PK_LIST_MAX_COLS).contains(&pk_cols.len()) {
@@ -531,7 +533,7 @@ impl GnitzClient {
             .str_val("")
             .u64_val(pk_packed)
             .u64_val(0)
-            .u64_val(gnitz_wire::pack_table_flags(unique_pk, dist_prefix_len));
+            .u64_val(gnitz_wire::pack_table_flags(unique_pk, replicated, dist_prefix_len));
         self.conn.push(TABLE_TAB, tbl_schema, &tb, &mut self.schema_cache)?;
 
         Ok(new_tid)
@@ -879,6 +881,24 @@ impl GnitzClient {
         // hash column for join/set-op/distinct views, or the source PK passed
         // through (0..k) for a plain projection over a compound-PK table.
         Ok((record.vid, Schema { columns, pk_cols: decode_pk_cols(record.pk_col_idx)? }))
+    }
+
+    /// True iff base table `tid` is REPLICATED (decoded from `TABLE_TAB.flags`).
+    /// Scans `TABLE_TAB` and matches by PK; a `tid` that is not a base table
+    /// (e.g. a view id, absent from `TABLE_TAB`) yields `false`. The SQL planner
+    /// consults this when building an aggregate directly over a source: a reduce
+    /// over a replicated relation must be the shard-free `reduce_multi_local`
+    /// (every worker holds the full copy, so a sharded reduce would
+    /// N-fold-multiply the aggregate — see the replicated-tables design).
+    pub fn table_replicated(&mut self, tid: u64) -> Result<bool, ClientError> {
+        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
+        let Some(tbl_batch) = tbl_batch else { return Ok(false); };
+        for i in 0..tbl_batch.len() {
+            if tbl_batch.weights[i] <= 0 { continue; }
+            if tbl_batch.pks.get(i) as u64 != tid { continue; }
+            return Ok(gnitz_wire::table_flags_replicated(col_u64(&tbl_batch.columns[6], i)?));
+        }
+        Ok(false)
     }
 
     // --- Private helpers (delegating to module-level functions) ---

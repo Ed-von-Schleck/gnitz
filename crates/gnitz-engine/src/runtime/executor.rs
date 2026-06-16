@@ -1066,6 +1066,12 @@ async fn handle_scan(
         send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
         return;
     }
+    // A replicated relation (a replicated base table, or a view all of whose
+    // sources are replicated) holds an identical full copy on every worker;
+    // gathering all workers would return N copies, so read just one (worker 0,
+    // which always exists and — replicated tables are exempt from the bootstrap
+    // trim — holds the full copy at partition 0).
+    let replicated = shared.cat().relation_output_is_replicated(target_id);
     let lsn = shared.last_tick_lsn.get();
 
     // On a cache miss, master sends a preliminary schema-only frame before
@@ -1092,10 +1098,17 @@ async fn handle_scan(
         client_version
     };
 
-    let result = MasterDispatcher::fan_out_scan_async(
-        shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
-        target_id, client_id, fd, effective_client_version,
-    ).await;
+    let result = if replicated {
+        MasterDispatcher::fan_out_scan_single_worker_async(
+            shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
+            target_id, 0, client_id, fd, effective_client_version,
+        ).await
+    } else {
+        MasterDispatcher::fan_out_scan_async(
+            shared.dispatcher, &shared.reactor, &shared.sal_writer_excl,
+            target_id, client_id, fd, effective_client_version,
+        ).await
+    };
     match result {
         Ok(true) => {
             let terminal = make_terminal_scan_frame(target_id, client_id, lsn);

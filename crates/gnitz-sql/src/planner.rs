@@ -5,6 +5,7 @@ use sqlparser::ast::{
     SelectItem, TableFactor, JoinOperator, JoinConstraint, GroupByExpr,
     SetOperator, SetQuantifier, BinaryOperator,
     FunctionArguments, FunctionArg, FunctionArgExpr, WrappedCollection,
+    SqlOption, Value, ValueWithSpan,
 };
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 use gnitz_core::{
@@ -234,6 +235,32 @@ fn validate_user_index_name(name: &str) -> Result<(), GnitzSqlError> {
             gnitz_core::FK_INDEX_INFIX)));
     }
     Ok(())
+}
+
+/// Extract the `REPLICATED` table property from a `CREATE TABLE … WITH (…)`
+/// option list. Surface: `CREATE TABLE t (…) WITH (replicated = true)`. A
+/// replicated table keeps a full copy on every worker (broadcast writes,
+/// single-source reads). Only the `replicated` key is recognized; any other
+/// `WITH` option is rejected so a typo cannot be silently ignored (gnitz has no
+/// other table-level `WITH` options today).
+fn parse_replicated_option(with_options: &[SqlOption]) -> Result<bool, GnitzSqlError> {
+    let mut replicated = false;
+    for opt in with_options {
+        match opt {
+            SqlOption::KeyValue { key, value }
+                if key.value.eq_ignore_ascii_case("replicated") =>
+            {
+                let Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. }) = value else {
+                    return Err(GnitzSqlError::Plan(
+                        "WITH (replicated = …) expects a boolean (true/false)".into()));
+                };
+                replicated = *b;
+            }
+            other => return Err(GnitzSqlError::Plan(format!(
+                "unsupported CREATE TABLE option in WITH (…): {other:?}"))),
+        }
+    }
+    Ok(replicated)
 }
 
 fn execute_create_table(
@@ -498,7 +525,19 @@ fn execute_create_table(
         0
     };
 
-    let tid = client.create_table(schema_name, &table_name, &cols, &pk_indices, true, dist_prefix_len)
+    // Phase 7 — REPLICATED (full copy on every worker), via `WITH (replicated = true)`.
+    // Mutually exclusive with CLUSTER BY: a hash-distribution prefix is meaningless
+    // when every worker already holds the whole table. The flags packing cannot make
+    // the conflict unrepresentable (replicated is a boolean bit, k a byte), so reject
+    // it here.
+    let replicated = parse_replicated_option(&create.with_options)?;
+    if replicated && dist_prefix_len != 0 {
+        return Err(GnitzSqlError::Plan(
+            "REPLICATED and CLUSTER BY are mutually exclusive: a replicated table keeps \
+             a full copy on every worker, so a hash-distribution prefix is meaningless".into()));
+    }
+
+    let tid = client.create_table(schema_name, &table_name, &cols, &pk_indices, true, replicated, dist_prefix_len)
         .map_err(GnitzSqlError::Exec)?;
 
     // Unique secondary indices: created after the table exists (create_index
@@ -2243,6 +2282,14 @@ fn execute_create_group_by_view(
     // 1. Resolve source table
     let table_name = extract_table_factor_name(&select.from[0].relation, "GROUP BY")?;
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
+    // A reduce directly over a REPLICATED source must run shard-free on every
+    // worker (`reduce_multi_local`): the full copy is already on every worker, so
+    // a sharded reduce would scatter W identical copies into each group owner and
+    // N-fold-multiply the aggregate. The result is itself replicated (identical on
+    // every worker), so the engine single-sources its read. Views resolve to
+    // non-replicated (the MVP user surface is base-table dimensions; circuit-level
+    // distribution propagation through nested views is a later superset).
+    let source_replicated = client.table_replicated(source_tid).map_err(GnitzSqlError::Exec)?;
     // The compound-PK source guard is intentionally NOT applied here: the engine
     // reduce output already emits a full compound natural-PK region
     // (`build_reduce_output_schema` walks `pk_columns()` for `group_set_eq_pk`),
@@ -2481,7 +2528,13 @@ fn execute_create_group_by_view(
     } else {
         group_col_indices.clone()
     };
-    let reduced = cb.reduce_multi(filtered, &reduce_group_cols, &agg_specs);
+    let reduced = if source_replicated {
+        // Shard-free: every worker reduces its full local copy to the same global
+        // aggregate (no ExchangeShard ⇒ no gather barrier, no N-fold sum).
+        cb.reduce_multi_local(filtered, &reduce_group_cols, &agg_specs)
+    } else {
+        cb.reduce_multi(filtered, &reduce_group_cols, &agg_specs)
+    };
 
     // 6. Post-reduce MAP: project group cols + compute aggregates (AVG = SUM/COUNT)
     //    Reduce output: [pk, (group_cols...), agg0, agg1, ...]

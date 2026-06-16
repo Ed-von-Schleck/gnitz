@@ -305,16 +305,24 @@ pub fn unpack_pk_cols(packed: u64) -> PkColList {
 // writer and the gnitz-engine reader, so the bit packing cannot drift.
 //
 //   bit 0        unique_pk (TABLE_FLAG_UNIQUE_PK)
-//   bits [1..8)  reserved for future boolean flags
+//   bit 1        replicated (TABLE_FLAG_REPLICATED) — full copy on every worker
+//   bits [2..8)  reserved for future boolean flags
 //   bits [8..16) distribution prefix length k (0 = default = full PK)
 //
 // `k` is byte-aligned (not bit-1-adjacent) so the boolean flag bits [1..8)
-// stay free for future flags without colliding with `k`.
+// stay free for future flags without colliding with `k`. `replicated` and a
+// non-default `k` are mutually exclusive (a CLUSTER BY prefix is meaningless
+// when every worker holds the full copy); the packing cannot represent that
+// constraint, so DDL validation must enforce it.
 // ---------------------------------------------------------------------------
 
 /// Bit 0: the table's PK is unique (DML-enforced upsert / dedup). Set for every
 /// SQL-created table.
 pub const TABLE_FLAG_UNIQUE_PK: u64 = 1;
+/// Bit 1: the table is **replicated** — every worker holds an identical full
+/// copy (writes broadcast, reads single-source). Mutually exclusive with a
+/// non-default `dist_prefix_len` (enforced at DDL, not by this packing).
+pub const TABLE_FLAG_REPLICATED: u64 = 1 << 1;
 /// Bit position of the distribution-prefix-length byte in `TABLE_TAB.flags`.
 pub const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 /// Mask for the distribution-prefix-length byte (one byte: 0..=255). An
@@ -323,18 +331,25 @@ pub const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 pub const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
 
 /// Pack the persisted `TABLE_TAB.flags` u64 from its logical fields. With
-/// `dist_prefix_len == 0` (the default = full PK) this is byte-identical to the
-/// pre-distribution-key encoding `unique_pk as u64`.
+/// `replicated == false` and `dist_prefix_len == 0` (the default = full PK) this
+/// is byte-identical to the pre-distribution-key encoding `unique_pk as u64`.
 #[inline]
-pub fn pack_table_flags(unique_pk: bool, dist_prefix_len: usize) -> u64 {
+pub fn pack_table_flags(unique_pk: bool, replicated: bool, dist_prefix_len: usize) -> u64 {
     (((dist_prefix_len as u64) & TABLE_FLAG_DIST_MASK) << TABLE_FLAG_DIST_SHIFT)
         | if unique_pk { TABLE_FLAG_UNIQUE_PK } else { 0 }
+        | if replicated { TABLE_FLAG_REPLICATED } else { 0 }
 }
 
 /// Decode the `unique_pk` bit from `TABLE_TAB.flags`.
 #[inline]
 pub fn table_flags_unique(flags: u64) -> bool {
     flags & TABLE_FLAG_UNIQUE_PK != 0
+}
+
+/// Decode the `replicated` bit from `TABLE_TAB.flags`.
+#[inline]
+pub fn table_flags_replicated(flags: u64) -> bool {
+    flags & TABLE_FLAG_REPLICATED != 0
 }
 
 /// Decode the distribution prefix length `k` from `TABLE_TAB.flags`. `0` means
@@ -401,19 +416,24 @@ mod tests {
 
     #[test]
     fn table_flags_roundtrip() {
-        // Default (k = 0 = full PK) is byte-identical to the old `unique_pk as u64`.
-        assert_eq!(pack_table_flags(false, 0), 0);
-        assert_eq!(pack_table_flags(true, 0), 1);
-        // k rides in byte 1; the unique bit is untouched.
+        // Default (not replicated, k = 0 = full PK) is byte-identical to the old
+        // `unique_pk as u64`.
+        assert_eq!(pack_table_flags(false, false, 0), 0);
+        assert_eq!(pack_table_flags(true, false, 0), 1);
+        // k rides in byte 1; the unique and replicated bits are untouched.
         for &uniq in &[false, true] {
-            for k in 0..=PK_LIST_MAX_COLS {
-                let f = pack_table_flags(uniq, k);
-                assert_eq!(table_flags_dist_prefix(f), k);
-                assert_eq!(table_flags_unique(f), uniq);
+            for &repl in &[false, true] {
+                for k in 0..=PK_LIST_MAX_COLS {
+                    let f = pack_table_flags(uniq, repl, k);
+                    assert_eq!(table_flags_dist_prefix(f), k);
+                    assert_eq!(table_flags_unique(f), uniq);
+                    assert_eq!(table_flags_replicated(f), repl);
+                }
             }
         }
-        // The boolean flag bits [1..8) stay clear of the k byte.
-        assert_eq!(pack_table_flags(true, 2) >> TABLE_FLAG_DIST_SHIFT, 2);
-        assert_eq!(pack_table_flags(true, 2) & 0xFE, 0, "bits [1..8) are free");
+        // `replicated` is bit 1; reserved bits [2..8) stay clear of the k byte.
+        assert_eq!(pack_table_flags(true, true, 0) & 0xFF, 0b11);
+        assert_eq!(pack_table_flags(true, true, 2) >> TABLE_FLAG_DIST_SHIFT, 2);
+        assert_eq!(pack_table_flags(true, true, 2) & 0xFC, 0, "reserved bits [2..8) are free");
     }
 }

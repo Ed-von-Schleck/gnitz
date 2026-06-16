@@ -780,6 +780,26 @@ impl DagEngine {
             .is_some_and(|entry| entry.schema.shard_cols_match_dist_key(&shard_cols))
     }
 
+    /// True iff every base-table source feeding `view_id` is replicated (and the
+    /// view has at least one source). Such a view's `ExchangeShard`s are all
+    /// skipped (`compute_co_partitioned` marks replicated sources co-partitioned),
+    /// so every worker computes the full result locally — the output is itself
+    /// **replicated** and its read must single-source (design §4.2). A view with
+    /// any partitioned source (e.g. partitioned ⋈ replicated) is partitioned and
+    /// its read gathers normally. A non-base-table source (a nested view) reads as
+    /// non-replicated here, so nested-over-replicated views are conservatively
+    /// treated as partitioned — the MVP surface is base-table dimensions.
+    ///
+    /// Sources come from the cached `source_map` (`get_source_ids`), which records
+    /// exactly `circuit.dependencies()` — the deduped `ScanDelta` source set — so
+    /// this answers the question off the dependency map with no circuit load.
+    pub(crate) fn view_all_sources_replicated(&mut self, view_id: i64) -> bool {
+        let sources = self.get_source_ids(view_id);
+        !sources.is_empty()
+            && sources.iter().all(|tid|
+                self.tables.get(tid).is_some_and(|e| e.schema.replicated()))
+    }
+
     /// Ensure a view's plan is compiled. Returns true if compilation succeeded.
     pub fn ensure_compiled(&mut self, view_id: i64) -> bool {
         if self.cache.contains_key(&view_id) {

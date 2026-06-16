@@ -454,6 +454,15 @@ pub fn server_main(
             let (part_start, part_end) = partition_range(w as u32, num_workers);
             catalog.set_active_partitions(part_start, part_end);
             catalog.trim_worker_partitions(part_start, part_end);
+            // Re-home inherited single-partition (replicated / replicated-derived)
+            // stores from the pre-fork master's `part_0` to THIS worker's own
+            // `part_{part_start}` dir before any flush — all workers share the data
+            // directory, so a fixed `part_0` would collide. The inherited store is
+            // empty; FLAG_PUSH replay (below) fills the re-homed store.
+            if let Err(e) = catalog.rehome_single_partition_stores(part_start) {
+                let msg = format!("W{w} rehome single-partition stores failed: {e}\n");
+                unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            }
 
             // Construct channel types for this worker
             let sal_reader = SalReader::new(

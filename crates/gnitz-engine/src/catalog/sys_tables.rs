@@ -89,7 +89,7 @@ pub(super) fn validate_pk_cols(
         }
     }
     // The PK region must fit MAX_PK_BYTES. Strides ≤ 16 widen to a `u128` value
-    // via `storage::batch::widen_pk_be`; wider compound PKs (stride > 16) route
+    // via `gnitz_wire::widen_pk_be`; wider compound PKs (stride > 16) route
     // through the byte-path accessors (`get_pk_bytes` / `compare_pk_bytes`). The
     // `PK_LIST_MAX_COLS` cap above bounds a valid PK at 64 bytes (four `U128` at
     // the current cap of 4); MAX_PK_BYTES is the

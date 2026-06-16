@@ -144,11 +144,42 @@ impl CatalogEngine {
         name: &str,
         id: i64,
         schema: SchemaDescriptor,
+        single_partition: bool,
     ) -> Result<PartitionedTable, String> {
+        // A `single_partition` relation is a single-partition (`num_partitions =
+        // 1`) store on every node with a non-empty active range. It is either a
+        // replicated base table (full copy on every worker) or a replicated-derived
+        // view (the local slice each worker produces from a join/reduce against a
+        // replicated source — the output is keyed by the join/group key but produced
+        // on the source side's worker, so it does NOT fit a 256-partition store
+        // trimmed to the worker's range; partition routing would silently drop every
+        // row whose key partition the worker does not own). Both cases hold their
+        // whole local dataset at one partition and read by single-source (replicated)
+        // or union-gather (locally partitioned), governed by the read path, not the
+        // store shape.
+        //
+        // The single partition is built at THIS node's own range start
+        // (`[part_start, part_start + 1)`), not a fixed `part_0`: workers share the
+        // data directory, so each worker's full copy must land in a distinct
+        // `part_{start}` dir (a fixed `part_0` would collide on flush). A live CREATE
+        // runs this hook on each worker post-fork at its own `part_start`, so each
+        // builds a distinct dir directly. The pre-fork master (range start 0) builds
+        // `part_0`; a worker that inherits it across the fork re-homes it to its own
+        // start before any flush (`rehome_single_partition_stores`). The single-
+        // partition path must NOT fire for an empty active range (the post-fork
+        // master, `[0, 0)`): there the master builds zero partition Tables and stays
+        // inert via the `tables.is_empty()` guards.
+        let part_start = self.active_part_start;
+        let active_nonempty = self.active_part_end > part_start;
+        let (num_parts, part_end) = if single_partition && active_nonempty {
+            (1u32, part_start + 1)
+        } else {
+            (NUM_PARTITIONS, self.active_part_end)
+        };
         let mut pt = PartitionedTable::new(
-            directory, name, schema, id as u32, NUM_PARTITIONS,
-            kind.persistence(), self.active_part_start, self.active_part_end,
-            partition_arena_size(NUM_PARTITIONS),
+            directory, name, schema, id as u32, num_parts,
+            kind.persistence(), part_start, part_end,
+            partition_arena_size(num_parts),
         ).map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))?;
         if kind.is_base_table() {
             // Tag base-table shards as PkUnique so the read cursor can skip
@@ -181,6 +212,25 @@ impl CatalogEngine {
                 // `new_with_dist` clamps an out-of-range k, so a crafted flag
                 // cannot index out of bounds.
                 let dist_prefix_len = gnitz_wire::table_flags_dist_prefix(flags);
+                // Replicated: a full copy on every worker (single partition 0).
+                // Rides on the SchemaDescriptor so the write scatter, read gather,
+                // join co-partition analyzer, and bootstrap trim all see it.
+                let is_replicated = gnitz_wire::table_flags_replicated(flags);
+
+                // REPLICATED and a non-default CLUSTER BY prefix are mutually
+                // exclusive — a hash-distribution prefix is meaningless when every
+                // worker holds the full copy. The flags word cannot make the conflict
+                // unrepresentable (`replicated` is a bit, `k` a byte), so the planner
+                // rejects it; re-check at the catalog trust boundary so a crafted or
+                // corrupt row can never build a schema that is both replicated and
+                // prefix-distributed (consumers branch on the two bits independently).
+                if is_replicated && dist_prefix_len != 0 {
+                    return Err(format!(
+                        "catalog invariant violated: table '{name}' (tid={tid}) is \
+                         REPLICATED with a non-default distribution prefix \
+                         (k={dist_prefix_len}); these are mutually exclusive.",
+                    ));
+                }
 
                 let col_defs = self.read_column_defs(tid);
                 if col_defs.is_empty() {
@@ -204,7 +254,9 @@ impl CatalogEngine {
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = table_dir(&self.base_dir, &schema_name, &name, tid);
-                let tbl_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice(), dist_prefix_len);
+                let tbl_schema = self
+                    .build_schema_from_col_defs(&col_defs, pk.as_slice(), dist_prefix_len)
+                    .with_replicated(is_replicated);
 
                 // One kind drives the whole property bundle: durability and
                 // Pk-unique tagging.
@@ -214,7 +266,8 @@ impl CatalogEngine {
                 // directory is created, compensate_stage_a's drain removes it.
                 let cleanup_idx = self.pending_dir_deletions.len();
                 self.pending_dir_deletions.push(directory.clone());
-                let pt = self.build_partitioned_storage(kind, &directory, &name, tid, tbl_schema)?;
+                let pt = self.build_partitioned_storage(
+                    kind, &directory, &name, tid, tbl_schema, is_replicated)?;
                 // Success: remove the pre-staged entry.
                 self.pending_dir_deletions.truncate(cleanup_idx);
 
@@ -331,12 +384,26 @@ impl CatalogEngine {
 
                 // See hook_table_register: one kind drives the bundle.
                 let kind = RelationKind::View;
+                // A view with any replicated source is replicated-derived: its
+                // output (a join/reduce against a full copy) is keyed by the
+                // join/group key but physically produced on the source side's
+                // worker, so it does NOT fit a 256-partition store trimmed to the
+                // worker's range (partition routing would drop every output row
+                // whose key partition this worker does not own — see
+                // `build_partitioned_storage`). Build it single-partition; the
+                // read path single-sources it (all sources replicated ⇒ replicated
+                // output) or union-gathers it (mixed ⇒ locally partitioned). The
+                // circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
+                // so `get_source_ids` resolves here.
+                let source_ids = self.dag.get_source_ids(vid);
+                let has_replicated_source = source_ids.iter()
+                    .any(|id| self.dag.tables.get(id).is_some_and(|e| e.schema.replicated()));
                 let cleanup_idx = self.pending_dir_deletions.len();
                 self.pending_dir_deletions.push(directory.clone());
-                let et = self.build_partitioned_storage(kind, &directory, &name, vid, view_schema)?;
+                let et = self.build_partitioned_storage(
+                    kind, &directory, &name, vid, view_schema, has_replicated_source)?;
                 self.pending_dir_deletions.truncate(cleanup_idx);
 
-                let source_ids = self.dag.get_source_ids(vid);
                 let max_depth = source_ids.iter()
                     .filter_map(|id| self.dag.tables.get(id))
                     .map(|e| e.depth + 1)

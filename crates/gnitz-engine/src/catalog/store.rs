@@ -1260,12 +1260,74 @@ impl CatalogEngine {
 
     /// Trim worker partitions to assigned range. System tables hold Borrowed
     /// (non-partitioned) handles, so the filter is the handle.
+    ///
+    /// **Single-partition stores are exempt.** A `num_partitions == 1` store
+    /// (a replicated base table's full copy, or a replicated-derived view's local
+    /// slice) holds its whole local dataset at partition 0, built across the fork
+    /// at `[0, 1)`. A worker whose range excludes 0 (every worker but worker 0)
+    /// would otherwise drop it here, and the subsequent FLAG_PUSH replay would
+    /// no-op into an empty `tables` vec — silent data loss after every reboot with
+    /// W > 1. Exempting them keeps the copy on every worker, which is the whole
+    /// point of replication.
     pub fn trim_worker_partitions(&mut self, start: u32, end: u32) {
         for entry in self.dag.tables.values() {
             if let Some(ptable) = entry.handle.as_partitioned_mut() {
+                if ptable.num_partitions() == 1 { continue; }
                 ptable.close_partitions_outside(start, end);
             }
         }
+    }
+
+    /// Re-home every inherited single-partition store to THIS worker's own
+    /// partition index `part_start`. The pre-fork master builds a replicated base
+    /// table (or replicated-derived view) at `part_0`; workers inherit that
+    /// `part_0` store across the fork. Because all workers share the data
+    /// directory, leaving them at `part_0` collides on flush (every worker writing
+    /// the same shard files). Each worker therefore rebuilds the store at
+    /// `part_{part_start}`. The inherited store is empty — the master ingests no
+    /// user data — so nothing is lost; the subsequent FLAG_PUSH replay fills the
+    /// re-homed store. Called post-fork after `set_active_partitions`, before the
+    /// user-data replay. (The live CREATE path already builds the store at the
+    /// worker's own `part_start`, so it needs no re-home; this only repairs the
+    /// recovery inherit.)
+    pub fn rehome_single_partition_stores(&mut self, part_start: u32) -> Result<(), String> {
+        // Worker 0's `part_start` is 0 — the inherited store already lives at
+        // `part_0`, so its re-home target is its current home. Skip the no-op
+        // rebuild (and the empty-store allocation it would do).
+        if part_start == 0 {
+            return Ok(());
+        }
+        let tids: Vec<i64> = self.dag.tables.iter()
+            .filter(|(_, e)| e.handle.as_partitioned_mut()
+                .map(|p| p.num_partitions() == 1).unwrap_or(false))
+            .map(|(&tid, _)| tid)
+            .collect();
+        for tid in tids {
+            let entry = self.dag.tables.get_mut(&tid).expect("tid taken from iter");
+            let pt = PartitionedTable::new(
+                &entry.directory, "", entry.schema, tid as u32,
+                1, entry.kind.persistence(), part_start, part_start + 1,
+                crate::storage::partition_arena_size(1),
+            ).map_err(|e| format!("rehome single-partition store tid={tid}: {e:?}"))?;
+            entry.handle = StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt)));
+        }
+        Ok(())
+    }
+
+    /// True iff a read of relation `id` (base table or view) must be
+    /// **single-sourced** because its output is replicated — a full identical
+    /// copy lives on every worker. A base table carries the flag on its schema;
+    /// a view is replicated iff all its sources are (design §4.2). Consulted by
+    /// the scan dispatch so a replicated relation is read from one worker instead
+    /// of gathering N identical copies. SEEK already unicasts to one worker, so it
+    /// needs no equivalent check.
+    pub fn relation_output_is_replicated(&mut self, id: i64) -> bool {
+        match self.dag.tables.get(&id) {
+            Some(e) if e.kind.is_base_table() => return e.schema.replicated(),
+            Some(_) => {} // view — fall through (releases the `tables` borrow)
+            None => return false,
+        }
+        self.dag.view_all_sources_replicated(id)
     }
 
     /// Invalidate all cached plans.

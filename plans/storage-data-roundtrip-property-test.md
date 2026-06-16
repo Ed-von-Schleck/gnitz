@@ -1,184 +1,171 @@
 # Storage-layer data round-trip property test
 
-The schema codec has its own round-trip property test (see
-`plans/schema-roundtrip-property-test.md`). The **data** layer — the
+The schema codec already has a round-trip property test (`arb_schema` +
+`schema_roundtrip_engine_codec` / `schema_roundtrip_client_codec` in
+`crates/gnitz-engine/src/runtime/wire.rs`). The **data** layer — the
 end-to-end path from `Batch` → `MemTable` → shard file →
 `MappedShard` / `ReadCursor` — has no analogous coverage. Every existing
 storage unit test fixes a single concrete schema (almost always
-`(U64 PK)` or `(U64 PK, U64)`) and exercises one code path at a time.
-The result is that PK-width and PK-arity assumptions hard-coded across
-unrelated files stay quiet until a single change routes traffic through
-them.
+`(U64 PK)` or `(U64 PK, I64)`) and exercises one code path at a time.
+PK-width and PK-arity assumptions hard-coded across unrelated files stay
+quiet until a single change routes traffic through them; the storage
+layer is the right place to catch them because its bugs propagate
+silently into every layer above.
 
-The compound-PK secondary-index work turned up storage-layer bugs of
-this exact shape, all rooted in PK-width assumptions that hold for the
-`(U64 PK)` fixtures every existing test uses:
+PK width is the load-bearing axis. A PK region is stored as
+order-preserving bytes (OPK, §6). On the **bloom** build/probe, strides `≤ 16`
+widen to a `u128` fast key via `gnitz_wire::widen_pk_be` (in `gnitz-wire`,
+`pk.rs`), which zero-extends **any** width — including the non-power-of-two
+compound strides (6, 10, 12) a multi-column or secondary-index key produces —
+while strides `> 16` cannot fit a `u128` and collapse to a `u128` via xxh3
+(`xxh::checksum`). Both arms feed the same XOR8 filter, and build
+(`shard_file.rs`) and probe (`shard_index.rs`) branch identically. The **ordered**
+paths (merge, sort, seek, retract) never use the `u128` key: they compare raw
+OPK bytes through `compare_pk_bytes` (a plain unsigned `memcmp`, width-agnostic),
+and `full_scan` / `has_pk_bytes` / `retract_pk_bytes` are all byte-path and
+correct at every width. The only `pk_stride ≤ 16` hard assumptions
+(`widen_pk_be`'s `debug_assert`, the `u128`-keyed `opk_key`, the narrow
+`extend_pk` / `has_pk(u128)` / `retract_pk(u128)` convenience wrappers) sit on
+encode/reindex helpers the wide byte path bypasses — so a wide PK never trips
+the read round-trip, but no test sweeps width across all the arms at once.
 
-- `shard_reader::open` hard-codes `num_non_pk = num_cols - 1`. Zero-payload
-  schemas (`pk_count == num_cols`) compute `num_regions` one short and
-  return `InvalidShard` on every read.
-- `shard_file::detect_encoding` writes `value[..element_width]` into a
-  `[u8; 16]` Constant buffer; `element_width = 24` overruns and panics.
-- `Batch::get_pk` / `MappedShard::get_pk` route every PK through
-  `widen_pk_le`, which only accepts `pk_stride ∈ {1, 2, 4, 8, 16}` and
-  panics on every other width. A compound index PK whose total stride is
-  not a power of two — e.g. a secondary index `(U64 indexed-key, U32
-  source-PK)` = 12 bytes, or `(U16, U16, U16)` = 6 bytes — panics the
-  moment its key is widened: in `MemTable::upsert_sorted_batch`'s bloom
-  loop on first ingest, and in `ReadCursor::drive_single` on first scan.
-
-The wide-PK case (`pk_stride > 16`) is partly papered over today: the
-bloom loop is guarded by `if !self.schema.pk_is_wide()` and the storage
-sort/merge uses `merge::pack_pk_le` (which prefix-truncates instead of
-panicking). But `ReadCursor` still widens every PK to a `u128` key
-(`drive_single`, `build_tree`, `MappedShard::get_pk` all call
-`widen_pk_le`), so any `full_scan()` over a wide-PK table panics during
-cursor construction — the `u128` key model cannot represent a >16-byte
-PK at all.
-
-Two fixes fall out, both landed alongside the proptest below:
-
-1. **Generalise `widen_pk_le` to zero-extend any `stride ≤ 16`.** A
-   compound PK ≤ 16 bytes packs losslessly into a `u128`, and
-   `make_slow_pk_cmp` already recovers the exact bytes via
-   `a.to_le_bytes()[..stride]` before handing them to
-   `compare_pk_bytes`. This is the same prefix-pack `pack_pk_le` performs
-   on the comparator path; aligning the two removes the panic for every
-   narrow compound PK while leaving the `> 16` arm a panic (a >16-byte
-   key genuinely cannot fit a `u128`).
-2. **Read wide-PK (`> 16`) tables through the byte-addressed shard APIs,
-   never `ReadCursor`.** `MappedShard::to_owned_batch` /
-   `slice_to_owned_batch` and `get_pk_bytes` operate on raw bytes and are
-   correct for any width.
-
-These are storage-internal, touch neither operators nor planner, and are
-each independently reproducible once the test fixture iterates over
-`(type_code, num_pk_cols)` instead of fixing them. Add one property test
-that does.
-
-## Storage fix: narrow compound PK widening
-
-`crates/gnitz-engine/src/storage/batch.rs`, `widen_pk_le`. Add a fallback
-arm for any `stride ≤ 16`; keep the `> 16` arm a panic.
-
-```rust
-/// LE-widen a single- or compound-PK region slice to its u128 key.
-/// Widths 1/2/4/8/16 hit a specialised arm; any other `stride ≤ 16`
-/// (a non-power-of-two compound region) zero-extends, which is lossless
-/// and round-trips through `make_slow_pk_cmp`'s `to_le_bytes()[..stride]`.
-/// `stride > 16` cannot fit a u128 and is a routing bug — callers must use
-/// `get_pk_bytes`/`pk_bytes` — so it panics to surface the misroute.
-///
-/// `stride` is taken explicitly rather than from `src.len()` because the
-/// fixed-array callers (`PkBuf::as_u128_single_pk`) pass a constant-length
-/// backing array whose length carries no width information.
-/// Contract: `src.len() >= stride`.
-#[inline(always)]
-pub(super) fn widen_pk_le(src: &[u8], stride: usize) -> u128 {
-    match stride {
-        1  => src[0] as u128,
-        2  => u16::from_le_bytes(src[..2].try_into().unwrap()) as u128,
-        4  => u32::from_le_bytes(src[..4].try_into().unwrap()) as u128,
-        8  => u64::from_le_bytes(src[..8].try_into().unwrap()) as u128,
-        16 => u128::from_le_bytes(src[..16].try_into().unwrap()),
-        n if n <= 16 => {
-            let mut bytes = [0u8; 16];
-            bytes[..n].copy_from_slice(&src[..n]);
-            u128::from_le_bytes(bytes)
-        }
-        n => panic!("widen_pk_le: wide PK region (stride {n}); caller must use get_pk_bytes/pk_bytes instead"),
-    }
-}
-```
-
-A single-column PK always has a stride in `{1,2,4,8,16}` (it is one
-column's `size()`, UUID at most), so the new arm fires only for compound
-PKs — the only legitimate source of strides like 6 or 12 — and the
-existing single-PK misroute guard (`> 16` panics) is unchanged. With this
-in place the `MemTable` bloom guard (`if !self.schema.pk_is_wide()`) stays
-correct: it skips only the genuinely-unpackable `> 16` case, and every
-narrow compound PK now feeds the bloom (and `lookup_pk`, `find_lower_bound`,
-the cursor) without panicking.
+The catalog admits any PK whose total stride is `1..=MAX_PK_BYTES`
+(`MAX_PK_BYTES == MAX_PK_COLUMNS * 16 == 80`), enforced in
+`catalog/sys_tables.rs` (`validate_pk_cols`) — there is **no** power-of-two
+stride restriction. So a user table can already carry a 12-byte `(U64, U32)`
+PK or a 24-byte `(UUID, U64)` PK (24 > 16, the wide arm). Index circuits and
+other internal tables construct `SchemaDescriptor`s directly and can pack
+zero-payload, arbitrary-stride keys. A single proptest that iterates over
+`(type codes, pk arity, payload shape)` instead of fixing them exercises
+every width arm in one sweep.
 
 ## Scope
 
 In:
 
-- A single proptest at the storage-layer boundary that, for an
-  arbitrary valid schema:
+- A round-trip proptest at the storage-layer boundary that, for an
+  arbitrary valid schema and either persistence mode:
   1. Generates `n` random rows for that schema (PKs distinct, payload
-     values arbitrary in-type, null bitmaps randomised).
-  2. Ingests them into a `Table` (durable=false to keep the test in
-     `~/git/gnitz/tmp/`).
-  3. Forces a flush so the data exits the memtable into a shard file.
-  4. Re-opens the table directory (`Table::new`) and scans.
-  5. Asserts the scanned set equals the ingested set (as Z-Sets,
-     i.e. multiset equality on (PK, payload) tuples).
-- A second proptest covering point lookups: for each generated row,
-  `Table::has_pk(pk)` returns `true` for a single-PK schema; for
-  compound schemas, a prefix-scan via cursor returns the row. The
-  bloom-filter and PK-hash paths are width-sensitive and load-bearing
-  for `validate_unique_indices` / `validate_fk_parent_restrict`.
-- A third proptest covering retraction: ingest `n` rows, retract a
-  random half, scan, assert the surviving set equals the un-retracted
-  half. Exercises `retract_pk`'s memtable / shard reconciliation,
-  which has its own width assumptions.
-- Schema generation respects the catalog's `pk_stride ∈ {1, 2, 4, 8, 16}`
-  rule (enforced in `catalog/sys_tables.rs`) for user-table-shaped
-  schemas. **Crucially**, separately generate *index-schema-shaped*
-  schemas with arbitrary total strides, including non-power-of-two narrow
-  strides (6, 12 — the case the `widen_pk_le` fix addresses) and wide
-  strides `> 16` (UUID + companion = 24). These bypass the catalog rule
-  and exist legitimately for index circuits and other internal tables.
-- The index-schema round-trip splits on width: strides `≤ 16` read back
-  through `Table::full_scan()` (the cursor path, now correct after the
-  `widen_pk_le` fix); strides `> 16` cannot use the cursor at all and
-  read back through the single flushed shard's `to_owned_batch`. Both
-  assert the same Z-Set equality.
+     values arbitrary in-type, null bitmaps randomised on nullable columns).
+  2. Ingests them into a `Table` and forces a flush.
+  3. Scans the table back and asserts the scanned set equals the ingested
+     set as Z-Sets — multiset equality on `(PK bytes, null word,
+     decoded-payload)` tuples.
+- The round-trip checks **both read paths at every width**, rather than
+  splitting paths by width (`full_scan` is width-agnostic — it merges via
+  `compare_pk_bytes` over raw OPK bytes — so it reads wide PKs correctly too):
+  - `Table::full_scan()` (the `ReadCursor` / `UnifiedCursor` byte-merge path)
+    is asserted in **both** persistence arms. With `Persistence::Durable` it
+    reads from the on-disk shard; with `Persistence::Ephemeral` it reads the
+    `in_memory_l0` runs. This sweeps the cursor's N-way merge over both
+    backing stores across the full width axis.
+  - With `Persistence::Durable`, the single flushed shard is **also** read
+    back directly through `MappedShard::to_owned_batch`, exercising the
+    on-disk region layout, the wide-PK `RegionView::Raw` guard
+    (`shard_reader.rs`), and the shard decode independent of the cursor.
+  - Schema generation covers narrow (`≤ 16`), non-power-of-two narrow
+    (6, 10, 12), and wide (`> 16`) strides, plus zero-payload (index-shaped)
+    and payload-bearing (user-shaped) layouts — so one proptest drives the
+    narrow-widen, wide-byte-path, and zero-payload region-count arms together.
+- A point-lookup proptest (`Persistence::Durable`): `Table::has_pk_bytes`
+  re-finds every ingested row **both before and after flush** (so the
+  pre-flush memtable bloom and the post-flush on-disk XOR8 bloom — `xxh3`
+  collapse for stride `> 16`, `widen_pk_be` for `≤ 16` — are both probed),
+  and a synthesized **absent** PK returns `false` both times (exercising
+  bloom discrimination and the run-scan resolution of a bloom false
+  positive). `has_pk_bytes` is byte-keyed and uniform across all widths;
+  the narrow `has_pk(u128)` wrapper (test-only, `opk_key` `debug_assert`s
+  `stride ≤ 16`) is not used. The generator deliberately produces
+  **prefix-twin** wide PKs (sharing the leading 16 OPK bytes, differing in
+  the tail) to stress the memtable bloom, which keys on a 16-byte prefix
+  (`pack_pk_be`) for all widths and therefore collides for wide twins — a
+  tolerated false positive that must fall through to the scan. These paths
+  are load-bearing for `validate_unique_indices` / `validate_fk_parent_restrict`.
+- A retraction proptest (`Persistence::Durable`, unit-weight rows): ingest
+  `n` rows, flush (→ shard), retract a deterministic half via
+  `retract_pk_bytes` (asserting `(weight, found)` and that post-retract
+  `has_pk_bytes` is `false`), then `full_scan` — which reconciles
+  shard `(+1)` against the memtable retraction `(−1)` to net zero, no second
+  flush needed — and assert the surviving set equals the un-retracted half.
+  `retract_pk_bytes` is **base-table-only**: it scans memtable + disk shards
+  and `debug_assert`s `in_memory_l0.is_empty()`, so this sub-test **must** be
+  `Durable` (an `Ephemeral` flush parks rows in `in_memory_l0`, tripping the
+  assert and bypassing the reconciliation). It is the width-swept
+  generalisation of the existing `table_wide_pk_has_and_retract_bytes`.
 
 Out:
 
 - Proptests on the SQL planner, the join / reduce operators, or the
-  multi-worker exchange path. Each is its own surface; the storage
-  layer is the right place to start because its bugs propagate
-  silently into every layer above.
+  multi-worker exchange path. Each is its own surface.
 - Fuzzing the binary shard format against random bytes — that's
   malformed-input coverage, a separate scope.
-- Replacing the existing concrete-schema tests. They document specific
-  behaviours (e.g. negative-i64 encoding, German-string blob layout)
-  that random generation won't reliably hit. The proptest adds a
-  width-axis sweep on top of, not in place of, the existing fixtures.
+- Replacing the existing concrete-schema tests (e.g. `to_owned_batch_*`
+  in `shard_reader.rs`, the mixed-tier and overflow tests in `table.rs`).
+  They document specific behaviours — negative-i64 encoding, German-string
+  blob layout, cross-tier retraction — that random generation won't
+  reliably hit. The proptest adds a width-axis sweep on top of, not in
+  place of, the existing fixtures.
+- The ephemeral **spill-to-shard** path (`spill_in_memory_to_disk` past
+  `EPHEMERAL_INMEM_CEILING == 4 MiB`). Proptest-sized data (`≤ 64` rows)
+  never breaches the ceiling, so the `Ephemeral` arm stays in `in_memory_l0`.
+  Forcing a spill needs `set_inmem_ceiling_for_test`; it is covered by the
+  existing `nondurable_ceiling_spill_to_disk` fixture and out of this sweep.
+- Concurrency / multi-worker proptests. The storage `Table` is
+  single-threaded; the exchange and partition routing are tested
+  elsewhere. The proptest stays in-process.
+- Generated SQL DDL. Schemas come from direct `SchemaDescriptor::new`
+  calls; the proptest deliberately bypasses planner admission so it can
+  exercise legitimate-but-internal shapes (wide PK, zero-payload index
+  keys, the 5th PK-column slot, non-canonical PK column order).
+- PK-column value **decoding** (`extract_pk_value`). The round-trip keys
+  on raw OPK bytes (the canonical key); decoding PK columns back to native
+  values is a separate concern.
 
 ## Touchpoints
 
-`crates/gnitz-engine/src/storage/tests/data_roundtrip_proptest.rs` (new):
+New module `crates/gnitz-engine/src/storage/data_roundtrip_proptest.rs`,
+declared `#[cfg(test)] mod data_roundtrip_proptest;` from `storage/mod.rs`.
+This is the **first** dedicated test-only module under `storage/` (every
+other storage test is an in-file `mod tests`); the sweep spans `Table`,
+`Batch`, `MappedShard`, and the shard reader, so a shared module is cleaner
+than wedging it into one file's `mod tests`. The module **must** be in-crate:
+`MappedShard::to_owned_batch` is `pub(crate)` (and `MappedShard` is not
+re-exported from `storage/mod.rs`), and the helper relies on the
+`#[cfg(test)]` `Batch::extend_pk_opk`.
 
 ```rust
 use std::collections::HashMap;
 use proptest::prelude::*;
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-use crate::storage::{Batch, Table};
+use crate::storage::{Batch, Persistence, Table};
 
 fn arb_pk_type() -> impl Strategy<Value = u8> {
+    // The exact set admitted by `TypeCode::is_pk_eligible`: fixed-width
+    // signed/unsigned ints, U128, I128, UUID. STRING / BLOB / float are
+    // PK-ineligible (and STRING/BLOB/float-as-PK panics in SchemaDescriptor::new).
     prop_oneof![
-        Just(type_code::U8),  Just(type_code::I8),
-        Just(type_code::U16), Just(type_code::I16),
-        Just(type_code::U32), Just(type_code::I32),
-        Just(type_code::U64), Just(type_code::I64),
-        Just(type_code::U128), Just(type_code::UUID),
+        Just(type_code::U8),   Just(type_code::I8),
+        Just(type_code::U16),  Just(type_code::I16),
+        Just(type_code::U32),  Just(type_code::I32),
+        Just(type_code::U64),  Just(type_code::I64),
+        Just(type_code::U128), Just(type_code::I128),
+        Just(type_code::UUID),
     ]
 }
 
 fn arb_payload_type() -> impl Strategy<Value = u8> {
+    // All 15 type codes are valid payloads. BLOB shares STRING's 16-byte
+    // German-string layout and must be covered too (region-count + blob arena).
     prop_oneof![
         arb_pk_type(),
         Just(type_code::F32), Just(type_code::F64),
-        Just(type_code::STRING),
+        Just(type_code::STRING), Just(type_code::BLOB),
     ]
 }
 
 /// Build a schema from PK type codes + payload (type, nullable) pairs.
-/// PK columns come first (non-nullable); payloads follow.
+/// PK columns come first (non-nullable); payloads follow. `nullable` is a
+/// `u8` (0 / 1), matching `SchemaColumn::new`'s parameter type.
 fn build_schema(pk_types: &[u8], payloads: &[(u8, u8)]) -> SchemaDescriptor {
     let mut cols = Vec::with_capacity(pk_types.len() + payloads.len());
     let mut pk_indices = Vec::with_capacity(pk_types.len());
@@ -196,100 +183,137 @@ fn pk_stride_of(types: &[u8]) -> usize {
     types.iter().map(|&t| SchemaColumn::new(t, 0).size() as usize).sum()
 }
 
-/// User-table-shaped: total PK stride ∈ {1, 2, 4, 8, 16} (catalog rule).
-fn arb_user_schema() -> impl Strategy<Value = SchemaDescriptor> {
-    let pk = prop::collection::vec(arb_pk_type(), 1..=4)
-        .prop_filter("pk_stride must be 1/2/4/8/16",
-            |t| matches!(pk_stride_of(t), 1 | 2 | 4 | 8 | 16));
+/// Arbitrary valid schema. PK arity is 1..=MAX_PK_COLUMNS (== 5 — this is the
+/// in-memory descriptor cap = 4 user columns + 1 index-prefix slot; the
+/// user-facing SQL cap, PK_LIST_MAX_COLS == 4, is intentionally exceeded
+/// because the proptest exercises internal index-shaped schemas). The total
+/// stride is constrained to <= MAX_PK_BYTES; this filter is a safety net
+/// (currently always true, since MAX_PK_COLUMNS * 16 == MAX_PK_BYTES, but it
+/// auto-corrects if either constant changes). The generator naturally
+/// produces narrow (<=16), non-power-of-two narrow (6, 10, 12), and wide
+/// (>16) strides — the three width arms — plus zero-payload (index-shaped)
+/// and payload-bearing (user-shaped) layouts.
+fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
+    let pk = prop::collection::vec(arb_pk_type(), 1..=crate::schema::MAX_PK_COLUMNS)
+        .prop_filter("pk_stride must fit MAX_PK_BYTES",
+            |t| pk_stride_of(t) <= crate::schema::MAX_PK_BYTES);
     let payload = prop::collection::vec((arb_payload_type(), 0u8..=1), 0..=4);
     (pk, payload).prop_map(|(pk, pl)| build_schema(&pk, &pl))
 }
 
-/// Index-schema-shaped: arbitrary total stride (incl. non-power-of-two
-/// narrow and `> 16` wide), zero payload columns — matches the layout
-/// `make_index_schema` produces. PK arity is capped at `MAX_PK_COLUMNS`.
-fn arb_index_schema() -> impl Strategy<Value = SchemaDescriptor> {
-    prop::collection::vec(arb_pk_type(), 1..=crate::schema::MAX_PK_COLUMNS)
-        .prop_map(|pk| build_schema(&pk, &[]))
-}
-
 proptest! {
-    /// Ingest → flush → scan must round-trip the multiset of rows.
+    /// Ingest -> flush -> scan must round-trip the multiset of rows, for both
+    /// persistence modes and at every PK width. `SchemaDescriptor` is `Copy`,
+    /// so passing `schema` to `Table::new` by value leaves it usable below.
     #[test]
-    fn batch_roundtrip_user_schema(schema in arb_user_schema(), rows in 1usize..=64) {
-        let dir = TestDir::new();
-        let mut table = Table::new(dir.path(), "t", schema, 1, 1 << 20, false).unwrap();
-        let original = arb_batch(&schema, rows);
-        table.ingest_owned_batch(original.clone_batch()).unwrap();
-        table.flush().unwrap();
-        let scanned = table.full_scan();
-        prop_assert_eq!(
-            zset_of(&original, &schema),
-            zset_of(scanned.as_ref(), &schema),
-            "scan does not match ingest under schema {:?}",
-            schema_summary(&schema),
-        );
-    }
-
-    /// Same property for wide / zero-payload index schemas. Catches the
-    /// `shard_reader num_cols-1` undercount and the `detect_encoding`
-    /// overrun, and — after the `widen_pk_le` fix — exercises every
-    /// non-power-of-two narrow compound stride through the bloom/cursor.
-    /// Strides `> 16` cannot use the cursor; read them back through the
-    /// flushed shard directly.
-    #[test]
-    fn batch_roundtrip_index_schema(schema in arb_index_schema(), rows in 1usize..=64) {
-        let dir = TestDir::new();
-        let mut table = Table::new(dir.path(), "t", schema, 1, 1 << 20, false).unwrap();
+    fn batch_roundtrip(
+        schema in arb_schema(),
+        rows in 1usize..=64,
+        durable in any::<bool>(),
+    ) {
+        let dir = tempfile::tempdir().unwrap();   // RAII: unlinked on drop
+        let tdir = dir.path().join("rt");
+        let persistence = if durable { Persistence::Durable } else { Persistence::Ephemeral };
+        let mut table = Table::new(
+            tdir.to_str().unwrap(), "t", schema, 1, 1 << 20, persistence,
+        ).unwrap();
         let original = arb_batch(&schema, rows);
         table.ingest_owned_batch(original.clone_batch()).unwrap();
         table.flush().unwrap();
 
         let expected = zset_of(&original, &schema);
-        if schema.pk_stride() as usize > 16 {
-            // u128-keyed ReadCursor cannot represent a >16-byte PK; read
-            // the single flushed shard through the byte-addressed path.
-            let shards = table.all_shard_arcs();
+
+        // Cursor / byte-merge path — width-agnostic, exercised for both stores.
+        let scanned = table.full_scan();
+        prop_assert_eq!(
+            &expected, &zset_of(scanned.as_ref(), &schema),
+            "full_scan does not match ingest under stride {}", schema.pk_stride(),
+        );
+
+        let shards = table.all_shard_arcs();
+        if durable {
+            // A durable flush synchronously commits exactly one on-disk shard.
             prop_assert_eq!(shards.len(), 1);
-            let scanned = shards[0].to_owned_batch(&schema);
-            prop_assert_eq!(expected, zset_of(&scanned, &schema));
+            // Direct shard decode: on-disk region layout + wide-PK Raw guard.
+            let owned = shards[0].to_owned_batch(&schema);
+            prop_assert_eq!(&expected, &zset_of(&owned, &schema));
         } else {
-            let scanned = table.full_scan();
-            prop_assert_eq!(expected, zset_of(scanned.as_ref(), &schema));
+            // A sub-ceiling ephemeral flush writes no shard; rows live in
+            // in_memory_l0 and are served by full_scan (asserted above).
+            prop_assert!(shards.is_empty());
         }
+        table.close();
     }
 
-    /// has_pk and prefix-scan return `true` for every ingested row.
+    /// has_pk_bytes re-finds every ingested row before and after flush; an
+    /// absent PK is rejected both times. Durable so the post-flush XOR8 bloom
+    /// (xxh3 collapse for stride > 16, widen_pk_be for <= 16) is probed.
     #[test]
-    fn point_lookup_after_flush(schema in arb_user_schema(), rows in 1usize..=64) {
-        // Ingest + flush, then iterate rows and assert the table can
-        // re-find each one. Narrow-PK path uses has_pk(u128); compound-PK
-        // path uses seek_first_positive_with_prefix on the cursor.
+    fn point_lookup_after_flush(schema in arb_schema(), rows in 1usize..=64) {
+        // Durable table. Build rows with prefix-twin wide PKs (see arb_batch),
+        // ingest. For each row: prop_assert!(table.has_pk_bytes(&pk)) (memtable).
+        // Synthesize an absent PK and prop_assert!(!has_pk_bytes(absent)).
+        // flush(), then repeat both assertions against the on-disk shard.
     }
 
-    /// Retraction reconciles memtable and shard.
+    /// Retraction reconciles memtable and shard. Durable, unit-weight rows.
     #[test]
-    fn retract_then_scan(schema in arb_user_schema(), rows in 2usize..=64) {
-        // Ingest n rows, retract a deterministic half, flush, scan,
-        // assert the surviving set matches expectation.
+    fn retract_then_scan(schema in arb_schema(), rows in 2usize..=64) {
+        // Durable table; ingest n unit-weight rows; flush (-> shard). For a
+        // deterministic half, (w, found) = retract_pk_bytes(&pk):
+        // prop_assert_eq!((w, found), (1, true)) then
+        // prop_assert!(!has_pk_bytes(&pk)). full_scan reconciles +1/-1 to zero
+        // for the retracted half; assert zset_of(full_scan) == the un-retracted
+        // half. No second flush: the cursor merges shard + memtable runs.
     }
 }
 ```
 
 ### Helpers
 
-`arb_batch(schema, n)` walks `schema.columns`, generates random in-range
-values per type, and builds the batch via `Batch::extend_pk_bytes`
-(correct for any width) + per-column fills, keeping the `n` PKs distinct.
-The helper IS the test — its correctness over arbitrary width is what
-makes the proptest interesting.
+`arb_batch(schema, n)` builds the batch row-by-row via
+`Batch::with_schema(*schema, n)` + the public `extend_*` appenders, bumping
+`batch.count` per row (the appenders clear `sorted`/`consolidated`, so the
+batch is correctly marked unsorted and `ingest_owned_batch` sorts and
+consolidates it). It walks `schema.payload_columns()` — yielding
+`(payload_idx, col_idx, &SchemaColumn)` — and fills per type. **The helper
+IS the test**: its correctness over arbitrary width is what makes the
+proptest interesting. Per row:
+
+- **PK**: generate one native `u128` per PK column (masked to the column's
+  `size()`), then `batch.extend_pk_opk(schema, &native_pk_vals)`. This
+  OPK-encodes (big-endian, sign-flip for signed columns) via
+  `encode_order_preserving_pk` — the same path real data takes — so the test
+  exercises the OPK encoder, not just opaque bytes. (Do **not** write raw LE
+  bytes via `extend_pk_bytes`; that round-trips only because storage treats
+  PKs as opaque, and never invokes the sign-flip / typed-order encoder.)
+  Keep PKs distinct by fixing the **trailing** PK column to the row ordinal
+  while the leading columns vary; when leading columns repeat this naturally
+  yields the **prefix-twin** wide PKs (shared 16-byte OPK prefix, distinct
+  tail) the point-lookup test wants.
+- **weight**: `extend_weight(&w.to_le_bytes())` — a positive `i64` (base-table
+  positivity, §1); the retraction test fixes `w == 1`.
+- **null word**: `extend_null_bmp(&nw.to_le_bytes())`. Set bit `pi` only for
+  **nullable** payload columns (`col.nullable != 0`); non-nullable columns
+  must stay `0`.
+- **payload columns** (`extend_col(pi, bytes)`, `bytes.len() == col.size()`):
+  - null cell → `fill_col_zero(pi, col.size() as usize)` (zeros; `zset_of`
+    won't read them).
+  - fixed-width → the value's little-endian bytes.
+  - STRING / BLOB → `let gs = gnitz_wire::encode_german_string(&value,
+    &mut batch.blob); batch.extend_col(pi, &gs);`. `encode_german_string`
+    returns the 16-byte struct and, for `len > 12`
+    (`SHORT_STRING_THRESHOLD`), appends to `batch.blob` and writes the
+    correct offset. Generate empty, short (`≤ 12`), and at least one
+    long (`> 12`) value so the inline-vs-blob split and the blob arena /
+    offset path are both exercised.
 
 `zset_of` reduces a batch to a multiset of `(pk_bytes, null_word,
-logical_payload_values) → weight`. STRING/BLOB columns must be **decoded**
-before comparison: the on-disk 16-byte German-string struct embeds a blob
-offset for long (`> 12` byte) strings, so two batches holding the same
-logical string carry different struct bytes. Comparing raw struct bytes
-would yield false inequalities; decode to the logical value instead.
+logical_payload_values) → weight`. STRING / BLOB columns are **decoded**
+before comparison: the 16-byte German-string struct embeds a blob offset for
+long strings, so two batches holding the same logical string carry different
+struct bytes. `get_col_ptr`'s second argument is the **payload index** (not
+the schema column index), matching `payload_columns()`'s `pi`.
 
 ```rust
 type RowKey = (Vec<u8>, u64, Vec<Vec<u8>>);
@@ -324,96 +348,47 @@ fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
 }
 ```
 
-`TestDir` is a RAII guard that creates a unique directory **under
-`~/git/gnitz/tmp/`** (not the system `/tmp`, per project convention) and
-unlinks it on drop. With 256 cases × ~5 tests each generating a fresh
-non-durable table, leaking directories would exhaust inodes during a
-`PROPTEST_CASES=4096` sweep, so cleanup must be automatic rather than
-relying on `Table`'s in-directory stale-shard erase. Implement it with
-`tempfile::Builder::new().tempdir_in(gnitz_tmp_root())` so the existing
-`tempfile` dev-dependency does the unlinking.
+Temp directories use plain `tempfile::tempdir()` (a `tempfile::TempDir` RAII
+guard that unlinks its tree on drop), matching the universal storage-test
+precedent — pass `dir.path().join(name).to_str().unwrap()` (a `&str`) as
+`Table::new`'s first argument. Each proptest case binds and drops its own
+`TempDir`, so there is no accumulation even under a `PROPTEST_CASES=4096`
+sweep; no custom guard or pinned tmp root is needed. (The
+`~/git/gnitz/tmp/` location in dev-guide is the Python E2E log dir, a
+different directory from the repo root and not the Rust storage-test
+convention, which is `tempfile::tempdir()` under the system temp.)
 
-`Cargo.toml` (`gnitz-engine`, `[dev-dependencies]`): add `proptest` if
-not already present. (Check via `cargo tree -p gnitz-engine`; the
-schema codec proptest plan may have already pulled it in.)
+`proptest` and `tempfile` are already `gnitz-engine` dev-dependencies; no
+Cargo change is needed.
 
-## Implementation sketch — what the failures look like
+## What a failure looks like
 
-Pre-fix, running on a randomly-generated 2-column compound-PK schema
-with `pk_indices = [0, 1]`:
+Proptest prints the shrunk input on the failing assertion, including the
+schema. A region-count or width bug reduces to a one-line failure naming the
+minimal schema, e.g.:
 
 ```text
-test batch_roundtrip_user_schema failed:
-  schema: pk_stride=16 pk_count=2 payload_cols=0
-  shrunk to minimal:
-    schema { columns: [U64, U64], pk_indices: [0, 1] }
-    rows:   1
-  message: scan returned Err(InvalidShard)
+test batch_roundtrip failed:
+  schema { columns: [U64, U64], pk_indices: [0, 1] }   (pk_stride=16, 0 payload)
+  rows: 1, durable: true
+  message: full_scan does not match ingest under stride 16
 ```
 
-That single line names `shard_reader::num_cols - 1`. The
-`detect_encoding` overrun surfaces the same way (any stride > 16 panics
-inside the constant-encoding detector), as does the narrow-compound
-`widen_pk_le` panic (a stride-12 index schema crashes inside
-`MemTable::upsert_sorted_batch`'s bloom loop on first ingest). Each
-reduces to a one-line proptest failure with the shrunk schema named.
-
-Today, those bugs surface only when the secondary-index path on a
-compound-PK source happens to construct an index table with the
-exact wrong shape, two file boundaries and several call layers away.
-
-## Migration order
-
-1. Add `proptest` to `gnitz-engine` dev-dependencies (no-op if already
-   present).
-2. Land the `widen_pk_le` fix above. On its own it stops every
-   narrow-compound index table from panicking on ingest/scan; the
-   proptest below is what proves it and guards against regression.
-3. Land the `arb_user_schema` generator and the first round-trip
-   property test. This commit alone catches the `shard_reader num_cols-1`
-   regression for any zero-payload user schema.
-4. Add `arb_index_schema` and the index-shape proptest. Exercises every
-   compound stride (including the non-power-of-two narrow strides the
-   `widen_pk_le` fix unblocks) and the `> 16` shard read-back path, and
-   catches the `detect_encoding` overrun.
-5. Add the point-lookup and retraction proptests. These mostly buy
-   coverage for paths that *aren't* covered by ingest→scan alone:
-   `has_pk`, `retract_pk`, memtable/shard reconciliation.
-
-Each step is independently mergeable. Step 2 fixes a live panic; step 4
-is the highest-leverage test (the `shard_reader`, `detect_encoding`, and
-compound-stride paths in one sweep).
-
-## Out of scope
-
-- **Concurrency / multi-worker proptests.** The storage layer is
-  single-threaded; the exchange and partition routing are tested
-  elsewhere. The proptest stays in-process.
-- **Generated SQL DDL.** The schemas come from direct
-  `SchemaDescriptor::new` calls; we deliberately bypass planner
-  admission to exercise legitimate-but-not-yet-admitted shapes (wide
-  PK, compound PK with non-canonical column order).
-- **Variable-length payload value generation.** STRING and BLOB
-  generation can stay minimal (empty + a few short literals); the
-  bugs this plan targets are PK-shape bugs, not blob-encoding bugs.
-  A separate proptest can extend payload-value coverage if a
-  blob-encoding regression appears.
+A zero-payload schema (`pk_count == num_cols`) stresses region counting in
+the shard reader; a `> 16`-stride schema stresses the byte-path read-back and
+the `to_owned_batch` `RegionView::Raw` guard; a non-power-of-two narrow stride
+(6, 10, 12) stresses `widen_pk_be`'s zero-extend and the bloom that consumes
+the widened key; a prefix-twin wide pair stresses the 16-byte-prefix memtable
+bloom.
 
 ## Testing
 
-- `cargo test -p gnitz-engine data_roundtrip` (or whatever the module
-  name resolves to) runs the proptests. Default 256 cases per test;
-  with ~5 tests this costs a few seconds on a debug build.
-- The proptest seed must be CI-visible on failure: proptest's default
-  output already prints the shrunk input on the failing assertion,
-  including the schema. Capture that in the PR description when
-  reporting a new failure.
-- Once green: treat the proptest as the gate for any new storage-layer
-  change that touches PK arithmetic, region counting, or encoding
-  selection. A future PR that adds a new width-dependent code path
-  (e.g. a vectorised partition router for wide PKs) must run this
-  proptest with `PROPTEST_CASES=4096` once as part of the review.
-- Future-proofing: when wide-PK schemas become user-visible (the
-  `wide-pk-trace-cursor.md` work + downstream planner gate lift), the
-  index-shape proptest is the regression guard that prevents that
-  lift from re-exposing the bugs this plan just closed.
+- `cargo test -p gnitz-engine data_roundtrip` runs the proptests. Default
+  256 cases per test; three tests cost a few seconds on a debug build (the
+  `Durable` arms do real shard I/O into a temp dir).
+- On failure, proptest's default output prints the shrunk input (schema +
+  row count + persistence flag) on the failing assertion. Capture that in
+  the PR description.
+- Treat the proptest as the gate for any new storage-layer change that
+  touches PK arithmetic, region counting, or encoding selection: run it once
+  with `PROPTEST_CASES=4096` as part of reviewing such a change.

@@ -420,7 +420,7 @@ fn test_create_view_with_nullable_first_column_rejected() {
         ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
         ColumnDef { name: "v".into(),  type_code: TypeCode::I64, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
     ];
-    let src_tid = client.create_table(&sn, "src", &cols, &[0u32], true, 0).unwrap();
+    let src_tid = client.create_table(&sn, "src", &cols, &[0u32], true, false, 0).unwrap();
 
     // Manually construct a SCAN→SINK circuit and try to register a view whose
     // first output column is nullable.

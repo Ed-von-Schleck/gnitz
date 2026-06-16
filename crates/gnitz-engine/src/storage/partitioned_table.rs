@@ -70,13 +70,19 @@ impl PartitionedTable {
             }
         }
 
+        // The partition directory is `part_{p}` for both partition counts. For a
+        // single-partition store the one child lives at `part_{part_start}`: a
+        // replicated table (or replicated-derived view) is built at
+        // `[worker.part_start, +1)`, so its shard dir is distinct on every worker
+        // even though all workers share the data directory — a fixed `part_0`
+        // would collide (every worker flushing the same files). The master's
+        // pre-fork copy is built at `[0, 1)`, i.e. `part_0`, and a worker that
+        // inherits it across the fork re-homes it to its own `part_{part_start}`
+        // (`rehome_single_partition_stores`) before any flush. `num_partitions ==
+        // 1` is always built with exactly one partition.
         let mut tables = Vec::with_capacity((part_end - part_start) as usize);
         for p in part_start..part_end {
-            let part_dir = if num_partitions == 1 {
-                format!("{dir}/part_0")
-            } else {
-                format!("{dir}/part_{p}")
-            };
+            let part_dir = format!("{dir}/part_{p}");
             let t = Table::new(&part_dir, name, schema, table_id, arena_size, persistence)?;
             tables.push(t);
         }
@@ -96,6 +102,15 @@ impl PartitionedTable {
         for t in &mut self.tables {
             t.enable_pk_unique_tagging();
         }
+    }
+
+    /// Configured partition count (1 or 256). A single-partition store holds its
+    /// whole local dataset at partition 0 — either a replicated base table (full
+    /// copy on every worker) or a replicated-derived view (the local slice each
+    /// worker produces). The bootstrap trim exempts these so partition 0 is never
+    /// dropped on a worker whose range excludes it.
+    pub fn num_partitions(&self) -> u32 {
+        self.num_partitions
     }
 
     // ------------------------------------------------------------------

@@ -364,6 +364,40 @@ where
     })
 }
 
+/// Broadcast sibling of [`fill_worker_indices`]: fills **every** worker's slot
+/// with **all** row indices `0..batch.count` instead of PK-partitioning them.
+fn fill_broadcast_indices(batch: &Batch, num_workers: usize, out: &mut Vec<Vec<u32>>) {
+    if out.len() < num_workers {
+        out.resize_with(num_workers, Vec::new);
+    }
+    for wi in out[..num_workers].iter_mut() {
+        wi.clear();
+        wi.extend(0..batch.count as u32);
+    }
+}
+
+/// Like [`with_worker_indices`] but a full **broadcast** rather than a
+/// PK-partitioned scatter. Used by the write path for a replicated table: the
+/// same `scatter_wire_group(... FLAG_PUSH ...)` machinery then lands the whole
+/// batch in every worker's ingest + SAL slot (inheriting the atomic zone, LSN,
+/// ACK accounting, and the committer's single `fdatasync`), so every worker
+/// holds an identical full copy. Same TLS-pool reuse and borrow contract as
+/// `with_worker_indices`.
+pub fn with_broadcast_indices<F, R>(
+    batch: &Batch,
+    num_workers: usize,
+    f: F,
+) -> R
+where
+    F: FnOnce(&[Vec<u32>]) -> R,
+{
+    SCATTER_INDICES.with(|pool| {
+        let mut worker_indices = pool.borrow_mut();
+        fill_broadcast_indices(batch, num_workers, &mut worker_indices);
+        f(&worker_indices[..num_workers])
+    })
+}
+
 /// Compute per-worker row-index lists for `batch` without building sub-batches.
 /// Returns `worker_indices[w]` = row indices from `batch` destined for worker `w`.
 /// Use `with_worker_indices` instead when the caller can borrow the routing table

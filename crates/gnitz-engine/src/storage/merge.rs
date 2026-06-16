@@ -380,7 +380,7 @@ impl<'a> DirectWriter<'a> {
 ///
 /// NOT a value accessor — for a U64 OPK value 1 (`[0,…,0,1]` at `[..8]`) this
 /// packs as `1·2^64`, not 1. Sibling of `pack_pk_le`, opposite alignment from
-/// `batch::widen_pk_be` (right-aligned value recovery); never conflate them.
+/// `gnitz_wire::widen_pk_be` (right-aligned value recovery); never conflate them.
 #[inline(always)]
 pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
     let take = pk_bytes.len().min(16);

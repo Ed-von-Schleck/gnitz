@@ -627,26 +627,46 @@ fn compute_co_partitioned(
     join_shard_map: &HashMap<i64, Vec<(i32, u8)>>,
     ext_tables: &[ExternalTable],
 ) -> HashSet<i64> {
+    // Replication skip, computed once for the whole join: if ANY participating
+    // source is replicated, EVERY participant skips its exchange. This deliberately
+    // does NOT widen `shard_cols_match_dist_key` (the pure prefix predicate also
+    // used by the partner-less single-source view-skip path, which must keep its
+    // exact semantics).
+    //   * a REPLICATED source always skips — its full copy is on every worker, so
+    //     its delta and trace are already present everywhere (the write broadcast
+    //     did the work the exchange would have);
+    //   * a partitioned source whose join PARTNER is replicated also skips — it
+    //     stays in its own PK partitioning and `cogroup`s against the full local
+    //     dim copy, so no exchange is needed on either side (design §4.5). This is
+    //     the case hash co-partitioning cannot serve: the fact need not be
+    //     distributed by the join key, so one fact can join many replicated dims.
+    let any_replicated = ext_tables.iter()
+        .any(|t| t.schema.replicated() && join_shard_map.contains_key(&t.table_id));
     let mut co_partitioned = HashSet::new();
     for (&tid, cols) in join_shard_map {
-        if let Some(ext) = ext_tables.iter().find(|t| t.table_id == tid) {
-            // A non-zero carried tc means the slot width differs from the source,
-            // so native PK partitions do not align with the T-width trace key — the
-            // source must go through the exchange even if its PK matches the key.
-            if cols.iter().any(|&(_, tc)| tc != 0) {
-                continue;
-            }
-            // Co-partitioned only when the shard (= join) key is EXACTLY the
-            // source's distribution prefix in PK order (`pk_indices[..k]`). For a
-            // default full-PK table that is the whole PK; for a `CLUSTER BY prefix`
-            // table it is the leading `k` columns rows are actually hashed by. The
-            // match is EXACT (`cols.len() == k`), never a super-prefix: a
-            // super-prefix skip could route the two join sides at mismatched
-            // widths and silently drop matches (see `shard_cols_match_dist_key`).
-            let col_indices: Vec<i32> = cols.iter().map(|&(c, _)| c).collect();
-            if ext.schema.shard_cols_match_dist_key(&col_indices) {
-                co_partitioned.insert(tid);
-            }
+        let Some(ext) = ext_tables.iter().find(|t| t.table_id == tid) else { continue };
+
+        if any_replicated {
+            co_partitioned.insert(tid);
+            continue;
+        }
+
+        // A non-zero carried tc means the slot width differs from the source,
+        // so native PK partitions do not align with the T-width trace key — the
+        // source must go through the exchange even if its PK matches the key.
+        if cols.iter().any(|&(_, tc)| tc != 0) {
+            continue;
+        }
+        // Co-partitioned only when the shard (= join) key is EXACTLY the
+        // source's distribution prefix in PK order (`pk_indices[..k]`). For a
+        // default full-PK table that is the whole PK; for a `CLUSTER BY prefix`
+        // table it is the leading `k` columns rows are actually hashed by. The
+        // match is EXACT (`cols.len() == k`), never a super-prefix: a
+        // super-prefix skip could route the two join sides at mismatched
+        // widths and silently drop matches (see `shard_cols_match_dist_key`).
+        let col_indices: Vec<i32> = cols.iter().map(|&(c, _)| c).collect();
+        if ext.schema.shard_cols_match_dist_key(&col_indices) {
+            co_partitioned.insert(tid);
         }
     }
     co_partitioned
@@ -2665,6 +2685,61 @@ mod tests {
         m.insert(9i64, vec![(0, 0)]);
         assert!(compute_co_partitioned(&m, &ext1).contains(&9),
             "single-PK shard [pk] stays co-partitioned");
+    }
+
+    #[test]
+    fn test_compute_co_partitioned_replicated() {
+        // Two single-PK (U64) join sides; the join key is a NON-PK payload column
+        // (col 1), so neither side's shard key matches its distribution prefix —
+        // the only reason to skip the exchange is replication.
+        let base = || SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I64, 0)],
+            &[0],
+        );
+        let replicated = base().with_replicated(true);
+        let join_on_payload = || {
+            let mut m = HashMap::new();
+            m.insert(7i64, vec![(1i32, 0u8)]); // dim  shards on payload col 1
+            m.insert(8i64, vec![(1i32, 0u8)]); // fact shards on payload col 1
+            m
+        };
+
+        // partitioned ⋈ partitioned on a non-PK key: neither side skips.
+        let ext_pp = vec![
+            ExternalTable { table_id: 7, schema: base() },
+            ExternalTable { table_id: 8, schema: base() },
+        ];
+        let co = compute_co_partitioned(&join_on_payload(), &ext_pp);
+        assert!(!co.contains(&7) && !co.contains(&8),
+            "two partitioned sides on a non-PK key both go through the exchange");
+
+        // partitioned fact ⋈ REPLICATED dim: BOTH skip — the dim because it is
+        // replicated, the fact because its join partner is replicated (it stays in
+        // its own PK partitioning and joins the full local dim copy).
+        let ext_pr = vec![
+            ExternalTable { table_id: 7, schema: replicated },
+            ExternalTable { table_id: 8, schema: base() },
+        ];
+        let co = compute_co_partitioned(&join_on_payload(), &ext_pr);
+        assert!(co.contains(&7), "a replicated source always skips its exchange");
+        assert!(co.contains(&8), "a partitioned fact skips when its partner is replicated");
+
+        // replicated ⋈ replicated: both skip (output is replicated; single-sourced on read).
+        let ext_rr = vec![
+            ExternalTable { table_id: 7, schema: replicated },
+            ExternalTable { table_id: 8, schema: replicated },
+        ];
+        let co = compute_co_partitioned(&join_on_payload(), &ext_rr);
+        assert!(co.contains(&7) && co.contains(&8), "replicated ⋈ replicated: both sides skip");
+
+        // A replicated source skips even with a promoted (non-zero tc) key: the
+        // write broadcast already placed its full trace on every worker, so the
+        // tc-promotion exchange gate (which blocks a partitioned source) does not apply.
+        let ext_r = vec![ExternalTable { table_id: 7, schema: replicated }];
+        let mut promoted = HashMap::new();
+        promoted.insert(7i64, vec![(0i32, type_code::I64)]);
+        assert!(compute_co_partitioned(&promoted, &ext_r).contains(&7),
+            "replicated source skips regardless of carried type-promotion");
     }
 
     #[test]

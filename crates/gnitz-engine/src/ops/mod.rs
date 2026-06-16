@@ -13,7 +13,7 @@ mod bench_secondary_index;
 
 pub use distinct::op_distinct;
 pub use exchange::{
-    PartitionRouter, with_worker_indices, worker_for_partition,
+    PartitionRouter, with_worker_indices, with_broadcast_indices, worker_for_partition,
 };
 pub(crate) use exchange::{RouteMode, op_partition_filter, op_relay_broadcast, op_repartition_batches_mode, op_relay_scatter_consolidated_mode};
 // Only the test harness routes via the eager (cloning) variant now; the

@@ -162,6 +162,15 @@ pub struct SchemaDescriptor {
     /// `shard_cols_match_dist_key` to detect co-partitioned joins / local GROUP
     /// BY. `k == pk_count` is the default (full-PK) distribution.
     dist_prefix_len: u8,
+    /// `true` iff this is a **replicated** base table: every worker holds an
+    /// identical full copy (single partition at index 0), writes broadcast, and
+    /// reads single-source. Set only on base-table schemas decoded from
+    /// `TABLE_TAB.flags` (see `gnitz_wire::table_flags_replicated`); every
+    /// derived/intermediate schema (join/map/reduce/projection output, built via
+    /// `new`/`new_with_dist`) is non-replicated, and a relation derived from
+    /// replicated sources tracks its distribution at the circuit level, not here.
+    /// Mutually exclusive with a non-default `dist_prefix_len` (DDL-enforced).
+    replicated: bool,
     /// payload_mapping[ci] = dense payload index, or PAYLOAD_MAPPING_PK_SENTINEL.
     /// Same encoding as `SortDesc::pi` in `ops/reduce.rs`: PK columns hold the
     /// sentinel, payload columns hold their dense payload slot. Lets call
@@ -336,11 +345,25 @@ impl SchemaDescriptor {
             pk_stride,
             dist_stride: dist_stride_acc as u8,
             dist_prefix_len: dist_k as u8,
+            // Distribution is a base-table property set via `with_replicated`
+            // after decoding `TABLE_TAB.flags`; every constructor defaults it off.
+            replicated: false,
             payload_mapping,
             payload_to_ci,
             payload_cmp,
             columns,
         }
+    }
+
+    /// Return a copy of this schema marked replicated (`true`) or partitioned
+    /// (`false`). Used by the catalog DDL hook after decoding
+    /// `gnitz_wire::table_flags_replicated`. A replicated table must carry the
+    /// default full-PK distribution (`dist_prefix_len == pk_count`); the DDL
+    /// layer enforces that, so this is a pure tag.
+    #[inline]
+    pub const fn with_replicated(mut self, replicated: bool) -> Self {
+        self.replicated = replicated;
+        self
     }
 
     pub const fn minimal_u64() -> Self {
@@ -412,6 +435,17 @@ impl SchemaDescriptor {
     #[inline]
     pub const fn dist_prefix_len(&self) -> u8 {
         self.dist_prefix_len
+    }
+
+    /// True iff this is a replicated base table — a full copy on every worker
+    /// (single partition 0), with broadcast writes and single-source reads.
+    /// Consulted by the write scatter (broadcast vs partition-scatter), the read
+    /// gather (single-source vs union), the join co-partition analyzer (a
+    /// replicated source, or a partitioned source whose join partner is
+    /// replicated, skips its exchange), and the bootstrap trim exemption.
+    #[inline]
+    pub const fn replicated(&self) -> bool {
+        self.replicated
     }
 
     /// True iff the PK region is too wide to pack into a `u128` word
