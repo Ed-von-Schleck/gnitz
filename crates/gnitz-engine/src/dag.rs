@@ -2345,7 +2345,7 @@ mod tests {
     // PKs, so this is the only coverage of `PkBuf` keying at pk_stride > 16.
     #[test]
     fn test_enforce_unique_pk_wide_pk() {
-        use crate::test_support::wide_pk_3xu64_schema;
+        use crate::test_support::{opk_pk, wide_pk_3xu64_schema, wide_row};
         crate::util::raise_fd_limit_for_tests();
 
         let schema = wide_pk_3xu64_schema();
@@ -2356,34 +2356,17 @@ mod tests {
             crate::storage::partition_arena_size(256),
         ).unwrap();
 
-        // Unsigned columns ⇒ OPK is plain big-endian: the 24-byte key is the
-        // three values laid out big-endian back to back.
-        let pk24 = |a: u64, b: u64, c: u64| {
-            let mut k = [0u8; 24];
-            k[0..8].copy_from_slice(&a.to_be_bytes());
-            k[8..16].copy_from_slice(&b.to_be_bytes());
-            k[16..24].copy_from_slice(&c.to_be_bytes());
-            k
-        };
-        let row = |pk: [u8; 24], payload: i64, w: i64| {
-            let mut b = Batch::with_schema(schema, 1);
-            b.extend_pk_bytes(&pk);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-            b.extend_col(0, &payload.to_le_bytes());
-            b.count += 1;
-            b
-        };
+        let pk24 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
 
         // Seed the store with K=(1,2,3) → 100.
-        let eff = DagEngine::enforce_unique_pk(&mut pt, &schema, row(pk24(1, 2, 3), 100, 1));
+        let eff = DagEngine::enforce_unique_pk(&mut pt, &schema, wide_row(&schema, &pk24(1, 2, 3), 1, 100));
         assert_eq!(eff.count, 1, "fresh wide-PK insert is a single +1 row");
         pt.ingest_owned_batch(eff).unwrap();
         assert!(pt.has_pk_bytes(&pk24(1, 2, 3)), "seed row must be live");
 
         // Cross-batch upsert: a +1 on the same wide PK retracts the stored
         // payload (keyed and emitted on the full 24 bytes) and inserts the new.
-        let eff = DagEngine::enforce_unique_pk(&mut pt, &schema, row(pk24(1, 2, 3), 200, 1));
+        let eff = DagEngine::enforce_unique_pk(&mut pt, &schema, wide_row(&schema, &pk24(1, 2, 3), 1, 200));
         assert_eq!(eff.count, 2, "stored-row retraction + new insert");
         assert_eq!(eff.get_weight(0), -1, "stored retraction at -1");
         assert_eq!(eff.get_pk_bytes(0), &pk24(1, 2, 3)[..], "retraction keys on the full 24-byte PK");

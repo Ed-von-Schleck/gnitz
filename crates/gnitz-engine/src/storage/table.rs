@@ -1038,7 +1038,7 @@ fn erase_stale_shards(dir: &str, table_id: u32) {
 mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use crate::test_support::wide_pk_3xu64_schema;
+    use crate::test_support::{opk_pk, wide_pk_3xu64_schema, wide_row};
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -1487,12 +1487,7 @@ mod tests {
         let schema = wide_pk_3xu64_schema();
         assert_eq!(schema.pk_stride(), 24);
 
-        let pk3 = |a: u64, b: u64, c: u64| {
-            let mut v = a.to_le_bytes().to_vec();
-            v.extend_from_slice(&b.to_le_bytes());
-            v.extend_from_slice(&c.to_le_bytes());
-            v
-        };
+        let pk3 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
         let wide_batch = |rows: &[(Vec<u8>, i64, i64)]| -> Batch {
             let mut b = Batch::with_schema(schema, rows.len().max(1));
             for (pk, w, val) in rows {
@@ -1550,6 +1545,79 @@ mod tests {
         let (w2, found2) = t.retract_pk_bytes(&pk3(1, 1, 100));
         assert_eq!(w2, 0);
         assert!(!found2);
+
+        t.close();
+    }
+
+    /// Wide (`pk_stride = 24`) PK with a *signed* leading column: OPK must order a
+    /// negative leading value before a positive one, end-to-end through storage
+    /// (compare, scan, membership, retract). This is the case where hand-written
+    /// big-endian/little-endian bytes are wrong and only the real encoder's
+    /// sign-flip is correct.
+    #[test]
+    fn table_wide_signed_compound_pk_opk_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("wide_signed_pk_test");
+        // (I64, U64, U64) PK [stride 24, wide] + I64 payload used as an order marker.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+        );
+        assert_eq!(schema.pk_stride(), 24);
+        assert!(schema.pk_is_wide());
+
+        let key = |a: i64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
+
+        // Direct sign-flip property: a negative leading column sorts before a
+        // positive one in OPK byte order. Plain big-endian (no flip) would place
+        // 0xFF.. (negatives) after 0x00.. (positives) and fail this.
+        assert_eq!(
+            columnar::compare_pk_bytes(&key(-1, 0, 0), &key(1, 0, 0)),
+            std::cmp::Ordering::Less,
+            "OPK must order a negative signed PK column before a positive one",
+        );
+
+        let mut t = Table::new(
+            tdir.to_str().unwrap(), "test", schema, 4243, 1 << 20, Persistence::Durable,
+        ).unwrap();
+
+        // Payload marker == the signed leading value, so scan order is read back
+        // without decoding the PK. `w` lets the same builder emit the DBSP -1
+        // retraction row below.
+        let row = |a: i64, w: i64| wide_row(&schema, &key(a, 0, 0), w, a);
+        for a in [3i64, -5, 0, -1] {                  // scrambled insertion order
+            t.ingest_owned_batch(row(a, 1)).unwrap();
+        }
+        t.flush().unwrap();                           // Durable: one on-disk shard
+
+        // Membership at signed width, byte-keyed (both must survive the flush).
+        assert!(t.has_pk_bytes(&key(-5, 0, 0)));
+        assert!(t.has_pk_bytes(&key(3, 0, 0)));
+        assert!(!t.has_pk_bytes(&key(-2, 0, 0)), "absent signed key must not be found");
+
+        // full_scan returns rows in OPK (= typed signed) order: -5, -1, 0, 3.
+        // A missing sign-flip would scan back as 0, 3, -5, -1 and fail here.
+        let scanned = t.full_scan();
+        let payloads: Vec<i64> = (0..scanned.count)
+            .map(|r| i64::from_le_bytes(scanned.get_col_ptr(r, 0, 8).try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            payloads, vec![-5, -1, 0, 3],
+            "wide signed compound PK must scan back in typed (sign-flipped) order",
+        );
+
+        // `retract_pk_bytes` reports the live (weight, found) for the signed OPK
+        // key at wide width — a read-only probe; the row is removed by a DBSP -1
+        // ingest, whose memtable weight nets the shard's +1 to zero.
+        let (w, found) = t.retract_pk_bytes(&key(-5, 0, 0));
+        assert_eq!((w, found), (1, true));
+        t.ingest_owned_batch(row(-5, -1)).unwrap();
+        assert!(!t.has_pk_bytes(&key(-5, 0, 0)), "retracted signed key is gone");
 
         t.close();
     }

@@ -738,17 +738,7 @@ impl Batch {
     /// tables where `extend_pk` (no sign flip) writes incorrect OPK bytes.
     #[cfg(test)]
     pub fn extend_pk_opk(&mut self, schema: &SchemaDescriptor, native_col_vals: &[u128]) {
-        let stride = self.strides[REG_PK] as usize;
-        let mut le = [0u8; schema::MAX_PK_BYTES];
-        let mut off = 0;
-        for ((_o, _ci, col), &v) in schema.pk_columns().zip(native_col_vals) {
-            let cs = col.size() as usize;
-            le[off..off + cs].copy_from_slice(&v.to_le_bytes()[..cs]);
-            off += cs;
-        }
-        let mut opk = [0u8; schema::MAX_PK_BYTES];
-        super::columnar::encode_order_preserving_pk(schema, &le[..stride], &mut opk[..stride]);
-        self.extend_pk_bytes(&opk[..stride]);
+        self.extend_pk_bytes(&crate::test_support::opk_pk(schema, native_col_vals));
     }
 
     /// Overwrite the narrow PK at `row` with a `u128`, writing right-aligned

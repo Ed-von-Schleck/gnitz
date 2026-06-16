@@ -246,7 +246,7 @@ fn reduce_trace_seek_wide_pk() {
     use std::rc::Rc;
     use crate::storage::CursorHandle;
     use crate::schema::{SchemaColumn, type_code};
-    use crate::test_support::wide_pk_3xu64_schema;
+    use crate::test_support::{opk_pk, wide_pk_3xu64_schema};
 
     // Wide PK: 3×U64 (stride 24) + I64 val. GROUP BY the full PK.
     let in_schema = wide_pk_3xu64_schema();
@@ -262,14 +262,7 @@ fn reduce_trace_seek_wide_pk() {
     );
     assert!(in_schema.pk_is_wide(), "test invariant: stride 24 is wide");
 
-    let pk = |a: u64, b: u64, c: u64| -> [u8; 24] {
-        // Compound PK of unsigned U64 columns: OPK == BE per column.
-        let mut k = [0u8; 24];
-        k[0..8].copy_from_slice(&a.to_be_bytes());
-        k[8..16].copy_from_slice(&b.to_be_bytes());
-        k[16..24].copy_from_slice(&c.to_be_bytes());
-        k
-    };
+    let pk = |a: u64, b: u64, c: u64| opk_pk(&in_schema, &[a as u128, b as u128, c as u128]);
 
     let agg = AggDescriptor {
         col_idx: 3, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
@@ -340,6 +333,7 @@ fn reduce_trace_seek_compound_pk() {
     use std::rc::Rc;
     use crate::storage::CursorHandle;
     use crate::schema::{SchemaColumn, type_code};
+    use crate::test_support::opk_pk;
 
     let in_schema = SchemaDescriptor::new(
         &[
@@ -360,13 +354,7 @@ fn reduce_trace_seek_compound_pk() {
     assert!(in_schema.pk_indices().len() > 1, "test invariant: compound PK");
     assert!(!in_schema.pk_is_wide(), "test invariant: stride 16 is narrow");
 
-    let pk = |a: u64, b: u64| -> [u8; 16] {
-        // Compound PK of unsigned U64 columns: OPK == BE per column.
-        let mut k = [0u8; 16];
-        k[0..8].copy_from_slice(&a.to_be_bytes());
-        k[8..16].copy_from_slice(&b.to_be_bytes());
-        k
-    };
+    let pk = |a: u64, b: u64| opk_pk(&in_schema, &[a as u128, b as u128]);
     let agg = AggDescriptor {
         col_idx: 2, agg_op: AggOp::Sum, col_type_code: TypeCode::I64, _pad: [0; 2],
     };

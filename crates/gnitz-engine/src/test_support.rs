@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{compare_pk_bytes, Batch, ConsolidatedBatch};
+use crate::storage::{compare_pk_bytes, encode_order_preserving_pk, Batch, ConsolidatedBatch};
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
 /// (`pk_stride = 24`, so `pk_is_wide()`) with a single I64 payload column.
@@ -19,6 +19,25 @@ pub(crate) fn wide_pk_3xu64_schema() -> SchemaDescriptor {
         ],
         &[0, 1, 2],
     )
+}
+
+/// OPK-encode native PK column values (one per PK column, in `pk_columns()`
+/// order) into the canonical order-preserving key — the exact bytes the ingest
+/// path produces, and byte-identical to [`Batch::extend_pk_opk`]. Signed columns
+/// are passed as `v as u128` (the low `size()` little-endian bytes are the
+/// two's-complement image the encoder sign-flips).
+pub(crate) fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
+    let stride = schema.pk_stride() as usize;
+    let mut le = vec![0u8; stride];
+    let mut off = 0;
+    for ((_ord, _ci, col), &v) in schema.pk_columns().zip(vals) {
+        let cs = col.size() as usize;
+        le[off..off + cs].copy_from_slice(&v.to_le_bytes()[..cs]);
+        off += cs;
+    }
+    let mut opk = vec![0u8; stride];
+    encode_order_preserving_pk(schema, &le, &mut opk);
+    opk
 }
 
 /// Build a consolidated wide-PK batch from native `(c0, c1, c2, weight, payload)`
@@ -55,4 +74,17 @@ pub(crate) fn make_wide_batch(
     b.sorted = true;
     b.consolidated = true;
     ConsolidatedBatch::new_unchecked(b)
+}
+
+/// Build a one-row `Batch` from OPK-encoded `pk` bytes (see [`opk_pk`]), DBSP
+/// weight `w`, and a single non-null I64 payload `val` at payload slot 0 — the
+/// row shape wide-PK storage/dag tests ingest one at a time.
+pub(crate) fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -> Batch {
+    let mut b = Batch::with_schema(*schema, 1);
+    b.extend_pk_bytes(pk);
+    b.extend_weight(&w.to_le_bytes());
+    b.extend_null_bmp(&0u64.to_le_bytes());
+    b.extend_col(0, &val.to_le_bytes());
+    b.count += 1;
+    b
 }
