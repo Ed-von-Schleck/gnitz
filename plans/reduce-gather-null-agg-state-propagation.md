@@ -183,35 +183,53 @@ Pass `old_null_word` to **both** `emit_reduce_row` calls — the retraction
 
 Gate the all-linear fold (`:483-486`) so a NULL old aggregate is not folded back
 in. The gate keys on the **raw** old null bit (the bit `emit_reduce_row` set from
-`is_zero()`), read at the agg's output payload index via `try_payload_idx`:
+`is_zero()`), read at the agg's output payload index. That index is loop-invariant,
+so precompute it once before the group loop (next to `old_vals`, `:229`) rather than
+per group; `try_payload_idx` is the only correct `col_idx → payload_idx` map (the
+closed form `agg_col_idx - 1` is off by `num_pk_cols - 1` under a compound output
+PK):
+
+```rust
+    // Aggregates' output payload indices = the null-bitmap bit positions
+    // emit_reduce_row writes. Loop-invariant — hoisted out of the group loop.
+    let agg_payload_idx: Vec<usize> = (0..num_aggs)
+        .map(|k| output_schema.try_payload_idx(num_out_cols - num_aggs + k)
+            .expect("agg column is a payload column"))
+        .collect();
+```
 
 ```rust
         if all_linear && has_old {
             for k in 0..num_aggs {
-                let agg_col_idx = num_out_cols - num_aggs + k;
-                let pi = output_schema.try_payload_idx(agg_col_idx)
-                    .expect("agg column is a payload column");
-                if (old_null_word >> pi) & 1 == 0 {
+                // A NULL old aggregate has zero-filled old_vals[k]; folding it
+                // adds 0 yet spuriously sets has_value, decoding NULL as 0. Skip.
+                if (old_null_word >> agg_payload_idx[k]) & 1 == 0 {
                     accs[k].merge_accumulated(old_vals[k], 1);
                 }
             }
         }
 ```
 
-Why this is correct for every linear aggregate. `COUNT(*)` (`Count`) never has
-the bit set — `step_from_batch` sets `has_value` unconditionally — so it always
-folds. `SUM` and `COUNT_NON_NULL` *can* have it set for an all-NULL group: `SUM`
-skips every null row and `COUNT_NON_NULL` returns before `has_value` when the
-value is null, so both leave `has_value = false` → `is_zero()` → the emit sets the
-raw null bit. (The bit is set even for `COUNT_NON_NULL`, whose output column is
-schema-non-nullable and therefore *decodes* to `0`; see
-`planner_group_by.rs::test_aggregate_all_null_group_emits_null`.) For such a
-column `old_vals[k]` is the zero-filled byte (`fill_col_zero`), so folding it via
-`merge_accumulated(0, 1)` would add `0` while *spuriously* setting
-`has_value = true`; skipping the fold leaves the new row's null-ness driven solely
-by the delta step — exactly what keeps an already-NULL aggregate NULL. Combined
-with §A's retraction null-marking, this also removes the `COUNT_NON_NULL` ghost,
-not only `SUM`'s.
+Why this is correct for every linear aggregate. `COUNT(*)` (`Count`) never sets the
+null bit — `step_from_batch` sets `has_value` unconditionally — so it always folds.
+`SUM` and `COUNT_NON_NULL` *can* set it for an all-NULL group: `SUM` skips every
+null row and `COUNT_NON_NULL` returns before `has_value` on a null value, so both
+leave `has_value = false` → `is_zero()` → the emit sets the raw null bit (set even
+for `COUNT_NON_NULL`, whose output column is schema-non-nullable and therefore
+*decodes* to `0`; see `planner_group_by.rs::test_aggregate_all_null_group_emits_null`).
+For such a column `old_vals[k]` is the zero-filled byte (`fill_col_zero`), so folding
+it via `merge_accumulated(0, 1)` would add `0` while *spuriously* setting
+`has_value = true`; skipping the fold leaves the new row's null-ness driven solely by
+the delta step.
+
+Division of labor with §A. §A's retraction null-marking is what cancels the prior
+row's ghost, and it does so for **every** aggregate: the retraction reproduces
+trace_out's current null bit, so it byte-matches and cancels the row it retracts
+regardless of the fold. §B governs only the **new** row. For `SUM` the gate is a
+correctness fix — the column is schema-nullable, so a folded `0` and a NULL decode
+differently. For `COUNT_NON_NULL` it is representational consistency — the bit
+decodes to `0` either way, but the gate keeps the new row's null bit set to match
+the from-inception insert path, preventing a set→clear drift on the first mutation.
 
 The MIN/MAX (non-linear) new value is recomputed from history+delta via the
 replay/AVI/GI path (`:487-575`), which resets and re-steps the accumulators — it
@@ -237,14 +255,25 @@ Capture the old null word after `has_old` (`:77-79`), mirroring §B:
         let old_null_word = if has_old { trace_out_cursor.current_null_word } else { 0 };
 ```
 
-Rewrite the combine loop (`:50-66`). Read the per-row null word, skip NULL
-partials, and index by the true payload slot (`try_payload_idx`, not
-`agg_col_idx - 1`). The `agg_col_idx - 1` closed form is wrong for a compound
-output PK — `get_col_ptr` wants a payload index, and the closed form is off by
-`num_pk_cols - 1`, so it would read the wrong agg column. `try_payload_idx` is
-correct at any PK arity and is also the slot the null bit must be read at (the
-position the emitter wrote). The row weight stays `w`; do **not** shadow it with
-the column width:
+Precompute the aggregates' payload indices once before the group loop (next to
+`old_vals`, `:36`) — they are loop-invariant, and the combine loop below would
+otherwise recompute them per partial row:
+
+```rust
+    // Payload slots of the agg columns: the null-bitmap bit positions and the
+    // get_col_ptr payload indices. `try_payload_idx` is the only correct
+    // col_idx → payload_idx map; the closed form `agg_col_idx - 1` is off by
+    // `num_pk_cols - 1` under a compound output PK and would read the wrong column.
+    let agg_payload_idx: Vec<usize> = (0..num_aggs)
+        .map(|k| partial_schema.try_payload_idx(num_out_cols - num_aggs + k)
+            .expect("agg column is a payload column"))
+        .collect();
+```
+
+Rewrite the combine loop (`:50-66`): read the per-row null word, skip NULL partials,
+and index both the null bit and `get_col_ptr` (a payload-indexed read) by the hoisted
+payload slot — never `agg_col_idx - 1`, which is the wrong payload index under a
+compound PK. The row weight stays `w`; do **not** shadow it with the column width:
 
 ```rust
         while idx < n && smb.get_pk_bytes(idx) == group_pk_bytes
@@ -252,9 +281,7 @@ the column width:
             let w = smb.get_weight(idx);
             let in_null_word = smb.get_null_word(idx);
             for k in 0..num_aggs {
-                let agg_col_idx = num_out_cols - num_aggs + k;
-                let pi = partial_schema.try_payload_idx(agg_col_idx)
-                    .expect("agg column is a payload column");
+                let pi = agg_payload_idx[k];
                 // A NULL partial (a worker that saw only NULLs for this group)
                 // contributes nothing: reading its zero-filled bytes as a value
                 // would corrupt MIN/MAX (combine(0)) and SUM.
@@ -302,10 +329,7 @@ any PK arity, and zero-fills a NULL column — leave it):
             // nothing (folding 0 into MIN/MAX via combine, or flipping SUM's
             // has_value, corrupts it).
             for k in 0..num_aggs {
-                let agg_col_idx = num_out_cols - num_aggs + k;
-                let pi = partial_schema.try_payload_idx(agg_col_idx)
-                    .expect("agg column is a payload column");
-                if (old_null_word >> pi) & 1 == 0 {
+                if (old_null_word >> agg_payload_idx[k]) & 1 == 0 {
                     accs[k].merge_accumulated(old_vals[k], 1);
                 }
             }
@@ -528,9 +552,10 @@ SUM through the replay path, which would not exercise the §B fold-gate:
   `plans/sum-nullable-retraction-becomes-null.md`; §B's fold-gate (which keeps an
   *already*-NULL SUM null) is a prerequisite for it.
 - **§C is latent.** `op_gather_reduce` is reachable only from a compiler unit test
-  (`compiler.rs:4355`); SQL distributed reduce uses `reduce_multi`
-  (`ExchangeShard` scatter → one local `op_reduce`), never a partial-aggregate
-  combine. §C therefore fixes no user-facing bug today — it hardens the function
+  (`compiler.rs:4355`); SQL distributed reduce uses `reduce_multi`/`reduce_multi_local`
+  (`ExchangeShard` scatter or local pass → one `op_reduce`), never a partial-aggregate
+  combine — `gnitz-sql` emits no `GatherReduce` node. §C therefore fixes no
+  user-facing bug today — it hardens the function
   (NULL-skip + compound-PK `try_payload_idx` indexing) for the future GatherReduce
   planning milestone, which owns wiring it up. Land §C with that milestone or now;
   either way it is behavior-preserving for the test-only callers.
@@ -540,5 +565,6 @@ SUM through the replay path, which would not exercise the §B fold-gate:
   `op_reduce` retraction block, that `plans/adaptive-minmax-agg-output-type.md`
   §3c rewrites for value *width*. Merge the two rather than applying blindly: that
   plan changes the literal `8` reads here to schema-derived widths via
-  `readback_agg_bits`, and adopts the same `try_payload_idx(agg_col_idx)` in place
-  of `agg_col_idx - 1`.
+  `readback_agg_bits`, and adopts the same `try_payload_idx`-derived payload slot in
+  place of `agg_col_idx - 1` (here hoisted once into `agg_payload_idx`; the merge
+  keeps the hoist and swaps the `8` for the width).
