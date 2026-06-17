@@ -4,7 +4,6 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::storage::MemBatch;
 use crate::util::{read_u32_le, read_u64_le};
 
 pub(crate) use gnitz_wire::type_code;
@@ -631,6 +630,22 @@ impl SchemaDescriptor {
     }
 }
 
+/// The three per-row region reads a [`ColumnLocator`]/[`IndexKeySpec`] needs from
+/// a physical batch, abstracted so schema (L1) does not name `storage::MemBatch`
+/// (L2) — the up-edge that would re-form the `schema ↔ storage` cycle. The sole
+/// implementor is `storage::MemBatch`; every call site monomorphizes to it, so
+/// this is **static dispatch only** — never take `&dyn RowView` (it would add a
+/// vtable to the per-row locator paths). The `&'b` returns are decoupled from
+/// `&self` so `bytes()` can hand back a slice that outlives the row-view borrow.
+pub(crate) trait RowView<'b> {
+    /// The row's null-bitmap word (bit N = payload slot N is NULL).
+    fn get_null_word(&self, row: usize) -> u64;
+    /// The row's packed OPK PK-region bytes (`pk_stride` wide).
+    fn get_pk_bytes(&self, row: usize) -> &'b [u8];
+    /// `size` bytes of payload column `col` (native LE) in `row`.
+    fn get_col_ptr(&self, row: usize, col: usize, size: usize) -> &'b [u8];
+}
+
 /// Where a logical column's value physically lives in a row, resolved once from
 /// the schema. The only sanctioned way to read a column whose index is not
 /// statically known to be a payload column: it cannot silently treat a PK
@@ -674,7 +689,7 @@ impl ColumnLocator {
 
     /// True iff this column is NULL in `row`. PK columns are never null.
     #[inline]
-    pub(crate) fn is_null(&self, mb: &MemBatch, row: usize) -> bool {
+    pub(crate) fn is_null<'b>(&self, mb: &impl RowView<'b>, row: usize) -> bool {
         match *self {
             ColumnLocator::Pk { .. } => false,
             ColumnLocator::Payload { slot, .. } => (mb.get_null_word(row) >> slot) & 1 != 0,
@@ -688,10 +703,10 @@ impl ColumnLocator {
     /// long strings), not the content — content callers resolve through the blob
     /// arena. The returned slice borrows the batch's page memory (`'b`), not the
     /// `&self`/`&mb` reference, so it stays valid after the locator and the
-    /// `&MemBatch` borrow are dropped (matching `get_pk_bytes`/`get_col_ptr`,
-    /// which both return `&'b`).
+    /// row-view borrow are dropped (matching [`RowView::get_pk_bytes`]/
+    /// [`RowView::get_col_ptr`], which both return `&'b`).
     #[inline]
-    pub(crate) fn bytes<'b>(&self, mb: &MemBatch<'b>, row: usize) -> &'b [u8] {
+    pub(crate) fn bytes<'b>(&self, mb: &impl RowView<'b>, row: usize) -> &'b [u8] {
         match *self {
             ColumnLocator::Pk { byte_off, size, .. } => {
                 let o = byte_off as usize;
@@ -706,7 +721,7 @@ impl ColumnLocator {
     /// `has_pk` and the index seeks compare on). Callers must `is_null`-gate a
     /// nullable payload column first; a PK column is never null.
     #[inline]
-    pub(crate) fn native_key(&self, mb: &MemBatch, row: usize) -> u128 {
+    pub(crate) fn native_key<'b>(&self, mb: &impl RowView<'b>, row: usize) -> u128 {
         match *self {
             ColumnLocator::Pk { byte_off, size, type_code } =>
                 pk_native_key(mb.get_pk_bytes(row), byte_off as usize, size as usize, type_code),
@@ -724,7 +739,7 @@ impl ColumnLocator {
     /// routing image (this returns `payload_route_key`'s raw low-8-byte image for
     /// them); a caller routing by string content hashes it before reaching here.
     #[inline]
-    pub(crate) fn route_key(&self, mb: &MemBatch, row: usize) -> u128 {
+    pub(crate) fn route_key<'b>(&self, mb: &impl RowView<'b>, row: usize) -> u128 {
         match *self {
             ColumnLocator::Pk { byte_off, size, .. } =>
                 pk_route_key(mb.get_pk_bytes(row), byte_off as usize, size as usize),
@@ -809,7 +824,7 @@ impl IndexKeySpec {
     /// pack byte-identically regardless of source/target width). A column whose
     /// source already matches the index type (`U128`/`UUID`, base unsigned ≤8B)
     /// reduces to `encode_pk_column`.
-    pub(crate) fn write_span(&self, mb: &MemBatch, row: usize, dst: &mut [u8]) -> bool {
+    pub(crate) fn write_span<'b>(&self, mb: &impl RowView<'b>, row: usize, dst: &mut [u8]) -> bool {
         let mut off = 0;
         for (loc, col) in self.locators[..self.n as usize].iter().zip(self.idx_cols()) {
             if loc.is_null(mb, row) { return false; }
@@ -834,8 +849,8 @@ impl IndexKeySpec {
     /// reused scratch — free in the common same-circuit loop), so callers may
     /// slice `out.bytes[..stride]` as the span zero-padded to any wider stride.
     /// A NULL-skipped row returns `false` with `out` unchanged in meaning.
-    pub(crate) fn key_bytes(
-        &self, mb: &MemBatch, row: usize, out: &mut key::PkBuf,
+    pub(crate) fn key_bytes<'b>(
+        &self, mb: &impl RowView<'b>, row: usize, out: &mut key::PkBuf,
     ) -> bool {
         if !self.write_span(mb, row, &mut out.bytes) { return false; }
         let len = self.key_size();

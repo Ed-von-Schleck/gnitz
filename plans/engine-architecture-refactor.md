@@ -261,17 +261,18 @@ own narrow surface; the leaves share nothing but being leaves.
 
 ## 4. Stage A — break the cycle, place the leaves, remove misplaced state (P0)
 
-### W1 — Create `schema::key`; relocate the OPK cluster
+### W1 — Create `schema::key`; relocate the OPK cluster — ✅ DONE
 *Breaks C1 (3 of 4 edges). Depends on: none. Effort: M.*
+
+> **Done.** All listed symbols + private `mix` + `pk_sort_key` moved
+> byte-identically into `schema::key`; `schema.rs` repointed; OPK tests followed
+> (16, green). Re-exports live in the **leaf** modules (consumers use facade *and*
+> leaf paths), so `mod.rs` only sheds the now-test-only `encode_order_preserving_pk`. Gates green.
 
 **Rationale.** OPK encode/route and the PK key buffer are pure layout/key
 operations that belong below both schema and storage. Moving them down removes
 three `schema → storage` up-edges and makes them available to schema without an
 upward reach.
-
-**Scope.** new `src/schema/key.rs` (turning `schema.rs` into the `schema/`
-directory module — see §6 for the rest of the split); `src/storage/columnar.rs`;
-`src/storage/partitioned_table.rs`; `src/storage/manifest.rs`; `src/storage/mod.rs`.
 
 **Steps.**
 1. Create `schema/key.rs`. Move **verbatim**, keeping `#[inline]`:
@@ -294,65 +295,31 @@ directory module — see §6 for the rest of the split); `src/storage/columnar.r
 5. **Verify:** `cargo build` + `make test` green; `grep crate::storage src/schema*`
    shows only `MemBatch` remains (handled by W2).
 
-**Correction to scope estimate.** The "~57 refs" figure is the *broad*
-`storage → schema` downward surface, not refs to these three columnar symbols
-(`compare_pk_bytes` ~20 + `encode_order_preserving_pk` ~5 + `opk_key` ~11 ≈ 36, or
-~50 including `pack_pk_be`). The re-export in step 2 keeps every one compiling.
-
 **Perf / Dup.** `encode_order_preserving_pk` and `partition_for_pk_bytes` are
 per-row on ingest/backfill/exchange/join. Move bodies **byte-for-byte**; the
 narrow (`≤16` → `widen_pk_be`) vs wide (`xxh >> 56`) split in
 `partition_for_pk_bytes` must stay bit-identical so producer and consumer
 co-partition. Do not leave a compat copy behind — re-export the moved item.
 
-### W2 — Break the last `schema → storage` edge with a `RowView` trait
-*Breaks C1 (4th edge), fully. Depends on: none — prototyped and validated to compile
-standalone, so it can land before, with, or after W1. Effort: S (prototype done).*
+### W2 — Break the last `schema → storage` edge with a `RowView` trait — ✅ DONE
+*Breaks C1 (4th edge), fully. Depends on: none. Effort: S.*
 
-**Rationale and chosen design.** `ColumnLocator` (a `Copy` enum) and `IndexKeySpec`
-are **pure schema-derived data**; `locate()` (schema.rs:604) returns
-`ColumnLocator`, and `IndexKeySpec` has private fields. Only their *read methods*
-(`is_null`/`bytes`/`native_key`/`route_key`/`write_span`/`key_bytes`) name
-`MemBatch`, as a `&MemBatch` parameter. Moving these structs into storage would
-re-create the cycle. The clean break keeps the structs in schema and abstracts only
-the batch parameter:
+> **Done.** Added `pub(crate) trait RowView<'b>` (3 accessors —
+> `get_null_word`/`get_pk_bytes`/`get_col_ptr`) inline in `schema.rs`; the six
+> locator read methods (`is_null`/`bytes`/`native_key`/`route_key`/`write_span`/
+> `key_bytes`) now take `&impl RowView<'b>` instead of `&MemBatch`, bodies
+> unchanged. `impl<'b> RowView<'b> for MemBatch<'b>` (UFCS-forwarding, `#[inline]`)
+> sits by the `MemBatch` def in `storage/merge.rs`; `use crate::storage::MemBatch`
+> deleted from schema; call sites unchanged (inference picks `V = MemBatch`). Gates
+> green: no `crate::storage` in `src/schema*`; codegen-identity holds (0 `RowView`
+> symbols — fully inlined, no vtable). The `schema/` carve later relocates the trait
+> to `row_view.rs`.
 
-1. Define a `pub(crate) trait RowView<'b>` (inline in `schema.rs`; the schema/
-   carve later relocates it to `schema/row_view.rs`) with the three accessors the
-   methods actually use: `get_null_word(&self, row) -> u64`,
-   `get_pk_bytes(&self, row) -> &'b [u8]`, `get_col_ptr(&self, row, col, size) -> &'b [u8]`.
-   The `&'b` returns (decoupled from `&self`) are what let `bytes()` keep returning a
-   batch-lifetime slice.
-2. Change the six read methods from `&MemBatch` to `&impl RowView<'b>` (each method
-   gains a `<'b>`), keeping `#[inline]` and the `'b` lifetimes exactly; the method
-   bodies are unchanged (`mb.get_pk_bytes(row)` now resolves to the trait method).
-   (`IndexKeySpec::seek_prefix` takes `&[u128]`, not `&MemBatch` — leave it.)
-3. Next to the `MemBatch` definition (`storage/merge.rs`, which the W9 carve later
-   moves to `repr/merge.rs`), `impl<'b> RowView<'b> for MemBatch<'b>` forwarding via
-   UFCS (`MemBatch::get_pk_bytes(self, row)`) to the inherent `&'a`-returning
-   accessors, each `#[inline]`.
-4. Delete `use crate::storage::MemBatch` from schema. Call sites
-   (`ops/exchange.rs`, master/worker preflight, catalog validators) are unchanged
-   — type inference picks `V = MemBatch`.
-5. **Verify:** `grep crate::storage src/schema*` no longer shows `MemBatch`; build +
-   test green.
-
-**Tests are unaffected.** Schema's inline tests construct **no** `MemBatch` and call
-none of the `&MemBatch` read methods (the only `MemBatch` reference in `schema.rs`
-is the `:7` production import this workstream deletes). The locator read-method
-tests live in `ops`/`catalog`/`runtime`, where `MemBatch` is already legitimate and
-inference picks `V = MemBatch`.
-
-**Validated (prototype).** The change compiles first try — no lifetime errors, no
-warnings — and the full unit suite passes (every locator/key path: exchange
-`route_key`, preflight/validation `write_span`/`key_bytes`, `unique_preflight` — all
-green). Zero-cost confirmed by a release-binary codegen diff: `RowView` leaves **0
-symbols** (fully monomorphized + inlined, no vtable); `IndexKeySpec::write_span`
-disassembles **instruction-identical** to the pre-change build (the only deltas are
-`%rip` displacements to relocated shared symbols and one panic-location constant whose
-embedded source line shifted because the trait def added lines); `ColumnLocator::native_key`
-is equivalent and 5 instructions shorter; total `.text` is 9 lines smaller. **Never**
-take `&dyn RowView` — static dispatch only.
+**Rationale.** `ColumnLocator`/`IndexKeySpec` are pure schema-derived data; only
+their read methods named `MemBatch` (as a `&MemBatch` param). Moving the structs
+down into storage would re-form the cycle, so the trait abstracts the batch
+parameter and keeps the structs in schema. **Static dispatch only — never
+`&dyn RowView`.**
 
 ### W3 — Create the `foundation/` umbrella; relocate `WORKER_RANK`/`NUM_WORKERS`
 *Removes problem #4; lands the L0 leaves. Depends on: none. Effort: M.*
@@ -855,7 +822,7 @@ sort key, or re-extract a local copy of them.
 ## 10. Sequencing summary
 
 ```
-Stage A (P0, structural)    W1 ─┬─ W2            break C1 (key seam + RowView)
+Stage A (P0, structural)    W1 ─┬─ W2            break C1 (key seam ✅ + RowView ✅)
                             W3  │                foundation/ umbrella + worker_ctx
                             W4  │                BatchBuilder → storage (auto-fixes C2 test edge)
                             W5 ─┘                test-edge cleanup (C3/C4/E5) → cfg(test) acyclicity

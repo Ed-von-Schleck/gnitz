@@ -16,7 +16,7 @@ use super::columnar::{ColumnarSource, SortEntry, PkOrd};
 use super::columnar;
 use super::{with_payload_cmp, with_pk_ord};
 use super::batch::FIXED_REGION_BYTES;
-use crate::schema::{BlobCache, SchemaDescriptor, MAX_COLUMNS};
+use crate::schema::{BlobCache, RowView, SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use crate::util::read_u64_le;
 use gnitz_wire::is_german_string;
@@ -218,6 +218,26 @@ impl<'a> MemBatch<'a> {
     }
 }
 
+/// `MemBatch` is the sole physical batch the schema-layer locators read through
+/// [`RowView`] — the trait lives up in `schema` so the L1 locator types never
+/// name this L2 type (breaking the last `schema → storage` up-edge). Each method
+/// forwards via UFCS to the inherent accessor of the same name, so the call binds
+/// to the concrete read rather than recursing into the trait; `#[inline]` plus
+/// monomorphization erase the trait entirely (no vtable — §3 / W2 guardrail).
+impl<'b> RowView<'b> for MemBatch<'b> {
+    #[inline]
+    fn get_null_word(&self, row: usize) -> u64 {
+        MemBatch::get_null_word(self, row)
+    }
+    #[inline]
+    fn get_pk_bytes(&self, row: usize) -> &'b [u8] {
+        MemBatch::get_pk_bytes(self, row)
+    }
+    #[inline]
+    fn get_col_ptr(&self, row: usize, col: usize, size: usize) -> &'b [u8] {
+        MemBatch::get_col_ptr(self, row, col, size)
+    }
+}
 
 impl<'a> ColumnarSource for MemBatch<'a> {
     #[inline]
