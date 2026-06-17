@@ -39,7 +39,7 @@ pub use error::StorageError;
 pub(crate) use read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
 #[cfg(test)]
 pub(crate) use read_cursor::REWIND_CALLS;
-pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_fixedint_nonnull, encode_order_preserving_pk, opk_key, with_payload_cmp, with_pk_ord};
+pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_fixedint_nonnull, opk_key, with_payload_cmp, with_pk_ord};
 pub(crate) use range_key::{increment_key_in_place, range_cut_points, range_group_cut_points};
 pub(crate) use merge::{BlobCacheGuard, DirectWriter, pk_sort_key};
 pub(crate) use batch::carve_writer_slices;

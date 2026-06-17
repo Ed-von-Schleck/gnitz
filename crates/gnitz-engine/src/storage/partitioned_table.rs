@@ -449,40 +449,10 @@ impl Drop for PartitionedTable {
 // Hash routing
 // ---------------------------------------------------------------------------
 
-// Multiplicative hash: two Fibonacci multipliers XOR'd together.
-// ~4 instructions vs ~20 for XXH3-64; distribution across 256 buckets
-// is sufficient for worker routing. XXH3 is reserved for filters
-// (xor8, bloom) where collision quality matters.
-#[inline(always)]
-fn mix(pk: u128) -> usize {
-    let lo = pk as u64;
-    let hi = (pk >> 64) as u64;
-    let h = lo.wrapping_mul(0x9e3779b97f4a7c15_u64)
-             ^ hi.wrapping_mul(0x6c62272e07bb0142_u64);
-    (h >> 56) as usize
-}
-
-#[inline]
-pub fn partition_for_key(pk: u128) -> usize {
-    mix(pk)
-}
-
-/// Route an OPK PK region (any width) to a partition. For `len ≤ 16` the OPK
-/// bytes are big-endian, so `widen_pk_be` right-aligns them to recover the
-/// native unsigned value (sign-flipped for signed); `mix` of that equals
-/// `partition_for_key(widen_pk_be(bytes))`. This is the invariant the join
-/// router relies on: `extract_col_key` (both PK and OPK-encoded payload paths)
-/// also funnels through `widen_pk_be`, so the two sides of a distributed join
-/// agree. For wide regions (`len > 16`) it takes the top 8 bits of xxh3 of the
-/// OPK bytes directly (uniformly distributed already).
-#[inline]
-pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
-    if bytes.len() <= 16 {
-        mix(gnitz_wire::widen_pk_be(bytes, bytes.len()))
-    } else {
-        (crate::xxh::checksum(bytes) >> 56) as usize
-    }
-}
+// `partition_for_key` / `partition_for_pk_bytes` (and the private `mix` hash)
+// moved to `schema::key`; re-exported so `partitioned_table::*` and
+// `crate::storage::*` routing call sites are unchanged.
+pub use crate::schema::key::{partition_for_key, partition_for_pk_bytes};
 
 pub fn partition_arena_size(num_partitions: u32) -> u64 {
     if num_partitions <= 1 {

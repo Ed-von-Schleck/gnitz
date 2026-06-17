@@ -61,107 +61,11 @@ const _: () = assert!(
     "V4 manifest layout assumes an 80-byte PK capacity",
 );
 
-/// Width-tagged PK byte buffer. Plain value type — no generics, no
-/// trait bounds. `len` mirrors the owning table's `pk_stride`, so a
-/// manifest round-trip preserves the exact key width. Only
-/// `bytes[..len]` is meaningful; the tail is always zero by
-/// construction, which lets the single-PK fast path widen `bytes[..len]`
-/// to a `u128` with no ambiguity.
-#[derive(Clone, Copy)]
-pub struct PkBuf {
-    pub bytes: [u8; MAX_PK_BYTES],
-    pub len: u8,
-}
-
-// Prints only the meaningful `bytes[..len]` span (the 80-byte tail is always
-// zero by construction), so test assertion diffs over `PkBuf` keys are readable.
-impl std::fmt::Debug for PkBuf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PkBuf({:02x?})", &self.bytes[..self.len as usize])
-    }
-}
-
-// Manual Eq/Hash compare and hash only bytes[..len], so a HashSet<PkBuf>
-// touches pk_stride bytes per key rather than the full 80-byte array.
-impl PartialEq for PkBuf {
-    fn eq(&self, other: &Self) -> bool {
-        self.len == other.len
-            && self.bytes[..self.len as usize] == other.bytes[..other.len as usize]
-    }
-}
-impl Eq for PkBuf {}
-
-impl std::hash::Hash for PkBuf {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.bytes[..self.len as usize].hash(state);
-    }
-}
-
-// Enables zero-allocation heterogeneous lookup: a raw &[u8] slice can be
-// passed to HashSet<PkBuf>::contains / HashMap<PkBuf, _>::get without
-// constructing a PkBuf. The Hash impl above hashes bytes[..len], matching
-// <[u8] as Hash>, as the Borrow contract requires.
-impl std::borrow::Borrow<[u8]> for PkBuf {
-    fn borrow(&self) -> &[u8] {
-        &self.bytes[..self.len as usize]
-    }
-}
-
-// Byte-lexicographic (`memcmp`) order over `bytes[..len]` — identical to
-// `compare_pk_bytes`, the canonical PK comparator, and consistent with the
-// `Eq`/`Hash` impls above (which also read only `bytes[..len]`). This is the
-// order `seek_first_positive_with_prefix` / `walk_to_positive_with_prefix`
-// walk the index in, and the valid merge order for the unique pre-flight
-// k-way merge whose keys are OPK leading-key spans of any width.
-impl PartialOrd for PkBuf {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for PkBuf {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        super::compare_pk_bytes(self.pk_bytes(), other.pk_bytes())
-    }
-}
-
-impl PkBuf {
-    /// All-zero `bytes`, `len = stride`. The zero-row / placeholder /
-    /// empty-shard form.
-    pub fn empty(stride: u8) -> Self {
-        debug_assert!(stride as usize <= MAX_PK_BYTES);
-        PkBuf { bytes: [0u8; MAX_PK_BYTES], len: stride }
-    }
-
-    /// `len = slice.len()`, `bytes[..len]` copied from `slice`, tail
-    /// zero. The only row constructor: `MappedShard::get_pk_bytes(row)`
-    /// returns exactly `pk_stride` bytes, and manifest `parse` passes
-    /// its on-disk `len`/payload slice.
-    pub fn from_bytes(slice: &[u8]) -> Self {
-        debug_assert!(slice.len() <= MAX_PK_BYTES);
-        let mut bytes = [0u8; MAX_PK_BYTES];
-        bytes[..slice.len()].copy_from_slice(slice);
-        PkBuf { bytes, len: slice.len() as u8 }
-    }
-
-    /// `&self.bytes[..len]` — the OPK bytes of this bound. After the
-    /// OPK-at-rest flip all PK comparison and range logic operates on these
-    /// raw order-preserving bytes (`compare_pk_bytes` / `pack_pk_be`), so this
-    /// is the single PK accessor.
-    #[inline]
-    pub fn pk_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len as usize]
-    }
-
-    /// The key zero-padded to `width` bytes — sound because the tail past
-    /// `len` is always zero by construction. Used where a narrower key (e.g.
-    /// an index leading-key span) must be widened to a full PK stride whose
-    /// suffix is zero.
-    #[inline]
-    pub fn padded(&self, width: usize) -> &[u8] {
-        debug_assert!(self.len as usize <= width && width <= MAX_PK_BYTES);
-        &self.bytes[..width]
-    }
-}
+// `PkBuf` — the width-tagged PK byte buffer — now lives in `schema::key`
+// (its `Ord` delegates to `compare_pk_bytes`, which moved there too).
+// Re-exported so `manifest::PkBuf` paths and this module's own uses are
+// unchanged.
+pub(crate) use crate::schema::key::PkBuf;
 
 /// On-disk manifest entry. Matches the V4 binary format exactly.
 #[derive(Clone, Copy)]

@@ -9,7 +9,8 @@ use std::cmp::Ordering;
 use proptest::prelude::*;
 
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{compare_pk_bytes, encode_order_preserving_pk, Batch, ConsolidatedBatch};
+use crate::schema::key::{compare_pk_bytes, encode_order_preserving_pk};
+use crate::storage::{Batch, ConsolidatedBatch};
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
 /// (`pk_stride = 24`, so `pk_is_wide()`) with a single I64 payload column.
@@ -23,6 +24,16 @@ pub(crate) fn wide_pk_3xu64_schema() -> SchemaDescriptor {
         ],
         &[0, 1, 2],
     )
+}
+
+/// An all-PK schema: one column per type code in `types`, every column a PK
+/// column (`pk_indices = 0..n`) and no payload — the generic PK-shape builder
+/// for the OPK encode/compare/route tests.
+pub(crate) fn pk_only_schema(types: &[u8]) -> SchemaDescriptor {
+    let cols: Vec<SchemaColumn> =
+        types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
+    let pk: Vec<u32> = (0..types.len() as u32).collect();
+    SchemaDescriptor::new(&cols, &pk)
 }
 
 /// OPK-encode native PK column values (one per PK column, in `pk_columns()`

@@ -368,36 +368,13 @@ impl<'a> DirectWriter<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Narrow-region PK key packing + ordered-comparison dispatch
+// Narrow-region PK key packing
 // ---------------------------------------------------------------------------
 
-/// BE sort-key packer over an OPK region. Left-aligns the bytes at the MSB end
-/// of a `u128` and reads big-endian, so `pack_pk_be(a).cmp(&pack_pk_be(b))`
-/// equals the lexicographic byte order of the OPK regions — exactly
-/// `compare_pk_bytes`. Narrow (`len ≤ 16`) = the exact key; wide (`len > 16`) =
-/// the order-preserving leading-16 prefix (authoritative whenever two prefixes
-/// differ; a prefix collision needs a `compare_pk_bytes` tiebreak).
-///
-/// NOT a value accessor — for a U64 OPK value 1 (`[0,…,0,1]` at `[..8]`) this
-/// packs as `1·2^64`, not 1. Sibling of `pack_pk_le`, opposite alignment from
-/// `gnitz_wire::widen_pk_be` (right-aligned value recovery); never conflate them.
-#[inline(always)]
-pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
-    let take = pk_bytes.len().min(16);
-    let mut buf = [0u8; 16];
-    buf[..take].copy_from_slice(&pk_bytes[..take]);
-    u128::from_be_bytes(buf)
-}
-
-/// Order-preserving sort key for a PK region. After the OPK-at-rest flip the PK
-/// bytes are already order-preserving big-endian, so this is just `pack_pk_be`:
-///   * `pk_stride ≤ 16`  — the *whole* PK, exact and authoritative.
-///   * `pk_stride > 16`   — the order-preserving 16-byte *prefix*, needing a
-///     `compare_pk_bytes` tiebreak on a prefix collision.
-#[inline]
-pub(crate) fn pk_sort_key(pk_bytes: &[u8]) -> u128 {
-    pack_pk_be(pk_bytes)
-}
+// `pack_pk_be` / `pk_sort_key` moved to `schema::key`; re-exported so
+// `merge::*` / `super::merge::*` call sites and this module's own `pk_sort_key`
+// uses are unchanged.
+pub(crate) use crate::schema::key::{pack_pk_be, pk_sort_key};
 
 // ---------------------------------------------------------------------------
 // merge_batches: the main entry point

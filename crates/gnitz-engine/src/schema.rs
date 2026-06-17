@@ -14,6 +14,11 @@ pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
 pub use gnitz_wire::MAX_COLUMNS;
 pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 
+/// Order-preserving primary-key (OPK) primitives — encode/compare/route/pack
+/// and the width-tagged `PkBuf`. Sits below both schema and storage; storage
+/// re-exports each item so its call sites are unchanged.
+pub(crate) mod key;
+
 // ---------------------------------------------------------------------------
 // Schema descriptor
 // ---------------------------------------------------------------------------
@@ -97,7 +102,7 @@ pub fn assemble_wide_pk(
     le[..NARROW_PK_MAX_BYTES].copy_from_slice(&low.to_le_bytes());
     le[NARROW_PK_MAX_BYTES..stride].copy_from_slice(&extra[..needed]);
     let mut opk = [0u8; MAX_PK_BYTES];
-    crate::storage::encode_order_preserving_pk(schema, &le[..stride], &mut opk[..stride]);
+    key::encode_order_preserving_pk(schema, &le[..stride], &mut opk[..stride]);
     Ok(opk)
 }
 
@@ -317,7 +322,7 @@ impl SchemaDescriptor {
             stride_acc += col_size;
             // PK-list order with no inter-column padding ⇒ the running sum of the
             // first `dist_k` PK column widths is exactly the OPK byte width of the
-            // distribution prefix (`columnar::encode_order_preserving_pk` layout).
+            // distribution prefix (`key::encode_order_preserving_pk` layout).
             if k < dist_k {
                 dist_stride_acc += col_size;
             }
@@ -427,7 +432,7 @@ impl SchemaDescriptor {
     /// directly (their key is the whole region, never a table prefix).
     #[inline]
     pub fn partition_for_pk(&self, key: &[u8]) -> usize {
-        crate::storage::partition_for_pk_bytes(&key[..self.dist_stride() as usize])
+        crate::schema::key::partition_for_pk_bytes(&key[..self.dist_stride() as usize])
     }
 
     /// Distribution prefix length `k` — leading PK columns rows are hashed by
@@ -830,7 +835,7 @@ impl IndexKeySpec {
     /// slice `out.bytes[..stride]` as the span zero-padded to any wider stride.
     /// A NULL-skipped row returns `false` with `out` unchanged in meaning.
     pub(crate) fn key_bytes(
-        &self, mb: &MemBatch, row: usize, out: &mut crate::storage::PkBuf,
+        &self, mb: &MemBatch, row: usize, out: &mut key::PkBuf,
     ) -> bool {
         if !self.write_span(mb, row, &mut out.bytes) { return false; }
         let len = self.key_size();
