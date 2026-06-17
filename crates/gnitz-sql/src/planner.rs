@@ -2216,22 +2216,29 @@ struct AggMapping {
     arg_col: Option<usize>,
 }
 
-/// Mirror the engine's `agg_output_type`: SUM/MIN/MAX over a float column
-/// resolve to F64, MIN/MAX over U64 stay U64, COUNT/COUNT_NON_NULL to I64,
-/// everything else I64. A planner/compiler mismatch silently scrambles the
-/// view's output column positions.
+/// Mirror the engine's `agg_output_type`: COUNT/COUNT_NON_NULL → I64, AVG → F64,
+/// float SUM/MIN/MAX → F64. SUM over a non-float column widens to I64 (it can
+/// overflow the source width); MIN/MAX over a non-float column *preserve the
+/// source type* (the extremum is one of the input rows, so it is representable
+/// in that type — incl. U64). The binder restricts MIN/MAX inputs to ≤8-byte
+/// integers and floats, so the source type returned here is always ≤8 bytes —
+/// the engine's I64 fallback for STRING / 16-byte MIN/MAX sources is reachable
+/// only via the low-level circuit API, never from SQL. A planner/compiler
+/// mismatch silently scrambles the view's output column positions, widths, and
+/// types.
 fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Schema) -> TypeCode {
     match func {
         AggFunc::Count | AggFunc::CountNonNull => TypeCode::I64,
         AggFunc::Avg => TypeCode::F64,
-        AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
-            match src_col {
-                Some(c) if schema.columns[c].type_code.is_float() => TypeCode::F64,
-                Some(c) if matches!(func, AggFunc::Min | AggFunc::Max)
-                    && schema.columns[c].type_code == TypeCode::U64 => TypeCode::U64,
-                _ => TypeCode::I64,
-            }
-        }
+        AggFunc::Sum => match src_col {
+            Some(c) if schema.columns[c].type_code.is_float() => TypeCode::F64,
+            _ => TypeCode::I64,
+        },
+        AggFunc::Min | AggFunc::Max => match src_col {
+            Some(c) if schema.columns[c].type_code.is_float() => TypeCode::F64,
+            Some(c) => schema.columns[c].type_code,   // preserve the source type (incl. U64)
+            None => TypeCode::I64,
+        },
     }
 }
 
@@ -2470,20 +2477,20 @@ fn execute_create_group_by_view(
     // group cols carried as payload.
     let agg_col_offset = reduce_schema_cols.len();
     for &(op, col) in &agg_specs {
-        // Mirror the engine's agg_output_type so the planner's virtual schema
-        // matches the compiler's physical reduce schema (F64 for float SUM/MIN/MAX,
-        // U64 for MIN/MAX over an unsigned 64-bit column).
-        let type_code = if (op == AGG_SUM || op == AGG_MIN || op == AGG_MAX)
-            && source_schema.columns[col].type_code.is_float()
-        {
-            TypeCode::F64
-        } else if (op == AGG_MIN || op == AGG_MAX)
-            && source_schema.columns[col].type_code == TypeCode::U64
-        {
-            TypeCode::U64
-        } else {
-            TypeCode::I64
+        // Route through the shared agg_result_type so the planner's virtual
+        // reduce schema matches the compiler's physical reduce output (§3a):
+        // float SUM/MIN/MAX → F64, MIN/MAX preserve the source type, SUM/COUNT*
+        // → I64. AVG never reaches this loop (push_agg_specs expands it to a
+        // SUM + COUNT_NON_NULL pair), so `op` is always one of these five codes.
+        let func = match op {
+            AGG_COUNT          => AggFunc::Count,
+            AGG_COUNT_NON_NULL => AggFunc::CountNonNull,
+            AGG_SUM            => AggFunc::Sum,
+            AGG_MIN            => AggFunc::Min,
+            AGG_MAX            => AggFunc::Max,
+            other => unreachable!("agg_specs holds valid non-AVG agg op codes, got {other}"),
         };
+        let type_code = agg_result_type(func, Some(col), &source_schema);
         reduce_schema_cols.push(ColumnDef {
             name: "_agg".into(), type_code, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
         });

@@ -375,6 +375,29 @@ fn decode_float(bytes: &[u8], tc: TypeCode) -> f64 {
     }
 }
 
+/// Reconstruct the 8-byte `i64` accumulator bits from an emitted agg column.
+///
+/// `bytes.len()` is the *output* column width. An 8-byte column (SUM, COUNT,
+/// `I64`/`U64`/`F64` — including a float MIN/MAX, which widens to `F64` and
+/// stores the `f64::to_bits` value even for an `F32` source) holds the raw
+/// accumulator bits verbatim. A narrow (<8-byte) column is only ever a
+/// narrow-integer MIN/MAX value; `decode_signed` sign/zero-extends it back into
+/// the slot exactly as the load path produced it.
+///
+/// Width-gating (not a source-type dispatch) is load-bearing: a float MIN/MAX
+/// stores `F64` bits under an `F32` source type, and COUNT can carry a
+/// non-integer source `col_type_code` (e.g. `COUNT(uuid_col)` → `UUID`) — either
+/// would mis-decode or hit `decode_signed`'s `unreachable!()` if dispatched on
+/// the source type. The narrow branch is reached only for narrow integers, where
+/// `decode_signed` is exactly right.
+pub(super) fn readback_agg_bits(bytes: &[u8], src_tc: TypeCode) -> u64 {
+    if bytes.len() == 8 {
+        u64::from_le_bytes(bytes.try_into().unwrap())
+    } else {
+        decode_signed(bytes, src_tc) as u64
+    }
+}
+
 /// True iff `group_cols` is a single column whose type permits using
 /// the source column directly as the output PK (vs. a synthetic U128).
 /// Shared between `compiler::build_reduce_output_schema` and

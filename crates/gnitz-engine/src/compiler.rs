@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
+use crate::schema::{type_code, is_fixed_int, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::expr::{ExprProgram, Plan, ScalarFuncKind};
 use crate::ops::{AggDescriptor, AggOp};
 use crate::storage::{CursorHandle, Persistence, Table, ReadCursor};
@@ -952,16 +952,22 @@ fn reindex_output_schema(
 
 /// Determine the output type for an aggregate function.
 ///   COUNT, COUNT_NON_NULL → I64
-///   SUM/MIN/MAX on float → F64
-///   MIN/MAX on U64 → U64
-///   everything else → I64  (SUM, and MIN/MAX on STRING / narrower ints)
+///   SUM on float → F64, else I64  (SUM can overflow the source width)
+///   MIN/MAX on float → F64; on a ≤8-byte integer → that source type; else I64
 ///
-/// MIN/MAX of a column of type T is itself a value of type T. The accumulator is
-/// an 8-byte slot, so every ≤8-byte integer fits; the narrower ones widen
-/// losslessly to the I64 slot width (which the 8-byte trace read-back also
-/// assumes), but U64 stays U64 — widened to signed I64, an unsigned extremum
-/// above `i64::MAX` would read back negative. SUM stays I64: it can overflow the
-/// source width. Mirrored by the SQL planner's `agg_result_type`.
+/// MIN/MAX *select* an existing row, so a ≤8-byte integer extremum is itself a
+/// value of the source type T and is always representable in it — `MIN(INT)` is
+/// `INT`, `MAX(SMALLINT UNSIGNED)` is `SMALLINT UNSIGNED`, etc. Those keep their
+/// own type: the row emitters serialize the accumulator at the output column
+/// width, so a narrow column writes the correct low bytes, and the width-gated
+/// trace read-back (`readback_agg_bits`) reconstructs the 8-byte accumulator
+/// from that width. The old U64 special case folds into this rule — the source
+/// type simply *is* `U64`. Any non-float, non-≤8-byte-integer source (STRING /
+/// 16-byte types) keeps the 8-byte `I64` slot, which for STRING holds the
+/// German-string compare key the accumulator computes; SQL rejects MIN/MAX on
+/// those upstream, but the low-level circuit API allows `MAX(STRING)`, so the
+/// fallback is load-bearing. SUM stays I64: it can overflow the source width.
+/// Mirrored by the SQL planner's `agg_result_type`.
 const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
     match agg_op {
         AggOp::Count | AggOp::CountNonNull | AggOp::Null => type_code::I64,
@@ -971,8 +977,8 @@ const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
         AggOp::Min | AggOp::Max => {
             if col_type_code.is_float() {
                 type_code::F64
-            } else if matches!(col_type_code, TypeCode::U64) {
-                type_code::U64
+            } else if is_fixed_int(col_type_code as u8) {
+                col_type_code as u8
             } else {
                 type_code::I64
             }
@@ -2859,14 +2865,26 @@ mod tests {
         assert_eq!(agg_output_type(AggOp::Count, TypeCode::I64), type_code::I64);
         assert_eq!(agg_output_type(AggOp::Sum, TypeCode::F64), type_code::F64);
         assert_eq!(agg_output_type(AggOp::Sum, TypeCode::I32), type_code::I64);
-        assert_eq!(agg_output_type(AggOp::Min, TypeCode::I32), type_code::I64);
         assert_eq!(agg_output_type(AggOp::Max, TypeCode::F32), type_code::F64);
-        assert_eq!(agg_output_type(AggOp::Max, TypeCode::String), type_code::I64);
-        // MIN/MAX preserve U64 (else an extremum > i64::MAX reads back negative);
-        // SUM over U64 still widens to I64.
+        // MIN/MAX select an existing row, so they preserve the source type: every
+        // ≤8-byte integer keeps its own type (no widening to I64).
+        assert_eq!(agg_output_type(AggOp::Min, TypeCode::I8),  type_code::I8);
+        assert_eq!(agg_output_type(AggOp::Max, TypeCode::I16), type_code::I16);
+        assert_eq!(agg_output_type(AggOp::Min, TypeCode::I32), type_code::I32);
+        assert_eq!(agg_output_type(AggOp::Max, TypeCode::U8),  type_code::U8);
+        assert_eq!(agg_output_type(AggOp::Min, TypeCode::U16), type_code::U16);
+        assert_eq!(agg_output_type(AggOp::Max, TypeCode::U32), type_code::U32);
+        // U64 folds into the general rule (the source type *is* U64); SUM over
+        // U64 still widens to I64.
         assert_eq!(agg_output_type(AggOp::Min, TypeCode::U64), type_code::U64);
         assert_eq!(agg_output_type(AggOp::Max, TypeCode::U64), type_code::U64);
         assert_eq!(agg_output_type(AggOp::Sum, TypeCode::U64), type_code::I64);
+        // Non-fixed-int sources (STRING / 16-byte) keep the 8-byte I64 slot: the
+        // accumulator holds an 8-byte compare key, not a value of the source
+        // type. SQL rejects these for MIN/MAX, but the low-level circuit API
+        // allows MAX(STRING), so the I64 fallback must hold.
+        assert_eq!(agg_output_type(AggOp::Max, TypeCode::String), type_code::I64);
+        assert_eq!(agg_output_type(AggOp::Min, TypeCode::U128), type_code::I64);
     }
 
     #[test]

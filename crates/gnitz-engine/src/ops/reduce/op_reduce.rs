@@ -11,6 +11,7 @@ use super::super::util::{
 };
 use super::agg::{
     Accumulator, AggDescriptor, apply_agg_from_value_index, is_single_col_natural_pk,
+    readback_agg_bits,
 };
 use super::emit::{emit_finalized_row, emit_reduce_row};
 use super::sort::{
@@ -227,6 +228,15 @@ pub fn op_reduce(
 
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, input_schema)).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
+    // Output width of each trailing agg column (loop-invariant across the
+    // 100k+-group loop below). MIN/MAX now emit at the source type's width, so a
+    // narrow column is < 8 bytes; the trace read-back uses this as both the
+    // per-row offset stride and the slice length before `readback_agg_bits`
+    // rebuilds the 8-byte accumulator (width-gated, so a float MIN/MAX widened
+    // to F64 is read verbatim).
+    let agg_col_widths: Vec<usize> = (0..num_aggs)
+        .map(|k| output_schema.columns[num_out_cols - num_aggs + k].size() as usize)
+        .collect();
 
     // We need mutable access to optional cursors. Take ownership via Option::take pattern.
     // The caller passes these as Option<&mut ReadCursor>, but we need to use them
@@ -449,13 +459,15 @@ pub fn op_reduce(
             && trace_out_cursor.current_pk_eq(trace_out_key);
 
         if has_old {
-            // Read old agg values from trace_out
+            // Read old agg values from trace_out at each agg column's output
+            // width (`agg_col_widths`), then rebuild the 8-byte accumulator.
             for k in 0..num_aggs {
                 let agg_col_idx = num_out_cols - num_aggs + k;
-                let ptr = trace_out_cursor.col_ptr(agg_col_idx, 8);
+                let cw = agg_col_widths[k];
+                let ptr = trace_out_cursor.col_ptr(agg_col_idx, cw);
                 if !ptr.is_null() {
-                    let bytes = unsafe { std::slice::from_raw_parts(ptr, 8) };
-                    old_vals[k] = u64::from_le_bytes(bytes.try_into().unwrap());
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr, cw) };
+                    old_vals[k] = readback_agg_bits(bytes, agg_descs[k].col_type_code);
                 } else {
                     old_vals[k] = 0;
                 }

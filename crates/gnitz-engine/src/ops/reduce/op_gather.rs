@@ -3,7 +3,7 @@
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ReadCursor};
 
-use super::agg::{Accumulator, AggDescriptor};
+use super::agg::{Accumulator, AggDescriptor, readback_agg_bits};
 use super::emit::emit_gather_row;
 use super::sort::sort_owned;
 
@@ -34,6 +34,14 @@ pub fn op_gather_reduce(
     let mut output = Batch::with_schema(*partial_schema, n);
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, partial_schema)).collect();
     let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
+    // Output width of each trailing agg column (loop-invariant). MIN/MAX now
+    // emit at the source type's width, so a narrow column is < 8 bytes; the read
+    // sites below use this both as the per-row offset stride and the slice
+    // length, then `readback_agg_bits` rebuilds the 8-byte accumulator
+    // (width-gated, so a float MIN/MAX widened to F64 is read verbatim).
+    let agg_col_widths: Vec<usize> = (0..num_aggs)
+        .map(|k| partial_schema.columns[num_out_cols - num_aggs + k].size() as usize)
+        .collect();
 
     let mut idx = 0usize;
     while idx < n {
@@ -52,10 +60,11 @@ pub fn op_gather_reduce(
         {
             let w = smb.get_weight(idx);
             for k in 0..num_aggs {
-                let agg_col_idx = num_out_cols - num_aggs + k;
-                let pi = agg_col_idx - 1; // -1 for PK (pk_index=0 always in output schema)
-                let ptr = smb.get_col_ptr(idx, pi, 8);
-                let bits = u64::from_le_bytes(ptr.try_into().unwrap());
+                let pi = num_out_cols - num_aggs + k - 1; // -1 for PK (pk_index=0 always in output schema)
+                let bits = readback_agg_bits(
+                    smb.get_col_ptr(idx, pi, agg_col_widths[k]),
+                    agg_descs[k].col_type_code,
+                );
                 if w > 0 {
                     accs[k].combine(bits);
                 } else if w < 0 && accs[k].is_linear() {
@@ -81,10 +90,11 @@ pub fn op_gather_reduce(
         if has_old {
             for k in 0..num_aggs {
                 let agg_col_idx = num_out_cols - num_aggs + k;
-                let ptr = trace_out_cursor.col_ptr(agg_col_idx, 8);
+                let cw = agg_col_widths[k];
+                let ptr = trace_out_cursor.col_ptr(agg_col_idx, cw);
                 if !ptr.is_null() {
-                    let bytes = unsafe { std::slice::from_raw_parts(ptr, 8) };
-                    old_vals[k] = u64::from_le_bytes(bytes.try_into().unwrap());
+                    let bytes = unsafe { std::slice::from_raw_parts(ptr, cw) };
+                    old_vals[k] = readback_agg_bits(bytes, agg_descs[k].col_type_code);
                 } else {
                     old_vals[k] = 0;
                 }

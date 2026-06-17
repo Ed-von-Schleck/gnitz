@@ -66,10 +66,13 @@ def _make_i32_reduce_view(client, sn, tid, agg_func_id, vname=None):
     red = cb.reduce(inp, group_by_cols=[1], agg_func_id=agg_func_id, agg_col_idx=2)
     cb.sink(red)
     circuit = cb.build()
+    # MIN/MAX (3/4) emit the source column's type — the I32 `val` stays I32, not
+    # widened to BIGINT. SUM (2) still widens to I64 (it can overflow I32).
+    agg_tc = gnitz.TypeCode.I32 if agg_func_id in (3, 4) else gnitz.TypeCode.I64
     out_cols = [
         gnitz.ColumnDef("pk", gnitz.TypeCode.U128, primary_key=True),
         gnitz.ColumnDef("grp", gnitz.TypeCode.I64),
-        gnitz.ColumnDef("agg", gnitz.TypeCode.I64),
+        gnitz.ColumnDef("agg", agg_tc),
     ]
     vid = client.create_view_with_circuit(sn, vname, circuit, out_cols)
     return vid, vname

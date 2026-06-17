@@ -1297,3 +1297,270 @@ class TestGroupByKeyCorrectness:
             client.drop_table(sn, tname)
         finally:
             client.drop_schema(sn)
+
+
+class TestAdaptiveMinMaxOutputType:
+    """MIN/MAX preserve the source column's type instead of widening to BIGINT.
+
+    `MIN(INT)` is `INT`, `MAX(SMALLINT UNSIGNED)` is `SMALLINT UNSIGNED`, etc. —
+    the extremum is one of the input rows, so it is always representable in the
+    source type. The reduce emits the value at the source-column width and the
+    trace read-backs reconstruct the 8-byte accumulator from that width
+    (width-gated, so an F32 MIN/MAX that widens to F64 is still read verbatim).
+    Run with GNITZ_WORKERS>=2 (conftest default 4) so a group's rows spread over
+    workers and the gather-reduce combine and its retraction read a narrow agg
+    column, with >=2 groups per partial batch to catch the per-row offset bug.
+    """
+
+    @staticmethod
+    def _col_type(schema, name):
+        for c in schema.columns:
+            if c.name == name:
+                return c.type_code
+        raise KeyError(
+            f"column {name!r} not in view schema {[c.name for c in schema.columns]}")
+
+    # (label, SQL type, expected view TypeCode, {group key: [source values]}).
+    # Each value set straddles its type's interesting boundary: negatives down to
+    # the type minimum for the signed widths, and values above i32::MAX for the
+    # unsigned zero-extension path (a sign-extended read would turn those
+    # negative and break MAX).
+    _NARROW_CASES = [
+        ("tinyint", "TINYINT", gnitz.TypeCode.I8, {
+            10: [-128, -5, 60, 127],
+            20: [-1, 0, 1, 9],
+            30: [100, -120, 33, 7],
+        }),
+        ("smallint", "SMALLINT", gnitz.TypeCode.I16, {
+            10: [-32768, -5, 30000, 32767],
+            20: [-1, 0, 1000, 9],
+            30: [12345, -12345, 33, 7],
+        }),
+        ("int", "INT", gnitz.TypeCode.I32, {
+            10: [-2_000_000_000, -5, 2_000_000_000, 7],
+            20: [-1, 0, 123456, 9],
+            30: [42, -42, 100000, -99999],
+        }),
+        ("int_unsigned", "INT UNSIGNED", gnitz.TypeCode.U32, {
+            10: [0, 4_000_000_000, 2_147_483_648, 100],
+            20: [2_147_483_647, 2_147_483_649, 1, 4_294_967_295],
+            30: [10, 20, 30, 40],
+        }),
+    ]
+
+    @pytest.mark.parametrize(
+        "label,sql_type,py_tc,groups", _NARROW_CASES,
+        ids=[c[0] for c in _NARROW_CASES],
+    )
+    def test_narrow_minmax_preserves_source_type(
+        self, client, label, sql_type, py_tc, groups,
+    ):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  k BIGINT NOT NULL,"
+                f"  v {sql_type} NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, MIN(v) AS lo, MAX(v) AS hi "
+                "FROM t GROUP BY k",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table_id(sn, "v")
+
+            # The view's MIN/MAX columns must carry the SOURCE type, not BIGINT.
+            assert self._col_type(vschema, "lo") == py_tc, (
+                f"{label}: MIN column type {self._col_type(vschema, 'lo')} != {py_tc}")
+            assert self._col_type(vschema, "hi") == py_tc, (
+                f"{label}: MAX column type {self._col_type(vschema, 'hi')} != {py_tc}")
+
+            # Replicate each group's values across distinct PKs so a group's rows
+            # spread over the workers (drives the gather-reduce combine on a
+            # narrow column); >=2 groups land in one partial batch.
+            pk = 0
+            rows_sql = []
+            expected = {}
+            for g, vals in groups.items():
+                for _rep in range(4):
+                    for val in vals:
+                        pk += 1
+                        rows_sql.append(f"({pk}, {g}, {val})")
+                expected[g] = (min(vals), max(vals))
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn)
+
+            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid) if r.weight > 0}
+            assert got == expected, (
+                f"{label}: per-group (MIN, MAX) wrong: {got} != {expected}")
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_f32_minmax_stays_f64_across_workers(self, client):
+        """MIN/MAX over an F32 (FLOAT) column widen to F64: the output column is
+        8 bytes holding `f64::to_bits`, so the width-gated read-back reads it
+        verbatim instead of mis-decoding it as F32. Many groups plus an
+        incremental update exercise the gather combine and its retraction on
+        that 8-byte-but-float-source column."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  k BIGINT NOT NULL,"
+                "  v FLOAT NOT NULL"  # F32
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, MIN(v) AS lo, MAX(v) AS hi "
+                "FROM t GROUP BY k",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table_id(sn, "v")
+            assert self._col_type(vschema, "lo") == gnitz.TypeCode.F64, (
+                f"F32 MIN must widen to F64, got {self._col_type(vschema, 'lo')}")
+            assert self._col_type(vschema, "hi") == gnitz.TypeCode.F64
+
+            # F32-exact values (dyadic, small) so the F32->F64 widening is exact.
+            pk = 0
+            rows_sql = []
+            expected = {}
+            for g in range(8):
+                vals = [-2.25 + g, 1.5 + g, 4.0 + g, 0.5 + g]
+                for _rep in range(3):
+                    for val in vals:
+                        pk += 1
+                        rows_sql.append(f"({pk}, {g}, {val})")
+                expected[g] = (min(vals), max(vals))
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn)
+
+            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid) if r.weight > 0}
+            for g, (lo, hi) in expected.items():
+                assert abs(got[g][0] - lo) < 1e-6, f"group {g} MIN: {got[g][0]} != {lo}"
+                assert abs(got[g][1] - hi) < 1e-6, f"group {g} MAX: {got[g][1]} != {hi}"
+
+            # Incremental: push a new global MAX into group 0 — triggers the
+            # gather retraction read-back of the prior F64-widened MAX.
+            client.execute_sql(
+                f"INSERT INTO t VALUES ({pk + 1}, 0, 99.5)", schema_name=sn)
+            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid) if r.weight > 0}
+            assert abs(got[0][1] - 99.5) < 1e-6, f"new MAX must be 99.5, got {got[0][1]}"
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    @pytest.mark.parametrize(
+        "sql_type,py_tc,vals,drop_value,expect_after,is_max", [
+            # MIN held by a negative row; deleting it recovers the next-smallest.
+            ("INT", gnitz.TypeCode.I32, [-1000, -5, 50, 200], -1000, -5, False),
+            # MAX above i32::MAX; the retraction must read the old MAX
+            # zero-extended (a sign-extended read turns 4e9 negative and breaks it).
+            ("INT UNSIGNED", gnitz.TypeCode.U32,
+             [100, 2_000_000_000, 4_000_000_000], 4_000_000_000, 2_000_000_000, True),
+        ], ids=["int_min", "u32_max_above_i32max"],
+    )
+    def test_narrow_minmax_retraction(
+        self, client, sql_type, py_tc, vals, drop_value, expect_after, is_max,
+    ):
+        """Deleting the row holding a group's extremum retracts the old narrow
+        value (read from trace_out at the source width) and recomputes the next
+        extremum. A wrong-width / sign-extended read corrupts the retraction."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+                f"v {sql_type} NOT NULL)",
+                schema_name=sn,
+            )
+            agg = "MAX" if is_max else "MIN"
+            client.execute_sql(
+                f"CREATE VIEW v AS SELECT k, {agg}(v) AS m FROM t GROUP BY k",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table_id(sn, "v")
+            assert self._col_type(vschema, "m") == py_tc
+
+            # Group 1 is retracted from; group 2 is an untouched control (so a
+            # partial batch carries >1 group). Separate INSERTs drive incremental
+            # extremum updates, each reading the prior narrow value back.
+            pk = 0
+            drop_pk = None
+            for val in vals:
+                pk += 1
+                if val == drop_value:
+                    drop_pk = pk
+                client.execute_sql(
+                    f"INSERT INTO t VALUES ({pk}, 1, {val})", schema_name=sn)
+            pk += 1
+            client.execute_sql(f"INSERT INTO t VALUES ({pk}, 2, 7)", schema_name=sn)
+
+            extremum = max(vals) if is_max else min(vals)
+            got = {r["k"]: r["m"] for r in client.scan(vid) if r.weight > 0}
+            assert got[1] == extremum, f"initial {agg}: {got[1]} != {extremum}"
+
+            client.execute_sql(f"DELETE FROM t WHERE pk = {drop_pk}", schema_name=sn)
+            got = {r["k"]: r["m"] for r in client.scan(vid) if r.weight > 0}
+            assert got[1] == expect_after, (
+                f"after retracting the {agg} holder, {agg} must recover "
+                f"{expect_after}, got {got[1]}")
+            assert got[2] == 7, "untouched group must be unchanged"
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_narrow_minmax_having_and_projection(self, client):
+        """HAVING and the projected column both read the agg at the source width
+        (the planner's `reduce_schema` mirror). A SMALLINT MAX must filter and
+        project correctly as SMALLINT — if the mirror still said BIGINT, the
+        finalize copy and the HAVING bind would use the wrong width."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+                "v SMALLINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, MAX(v) AS m FROM t GROUP BY k "
+                "HAVING MAX(v) > 1000",
+                schema_name=sn,
+            )
+            vid, vschema = client.resolve_table_id(sn, "v")
+            assert self._col_type(vschema, "m") == gnitz.TypeCode.I16, (
+                f"projected MAX must be SMALLINT/I16, got {self._col_type(vschema, 'm')}")
+
+            # Groups straddling the threshold 1000 (values within I16 range):
+            #   k=10 MAX=900   excluded     k=20 MAX=1500  kept
+            #   k=30 MAX=30000 kept         k=40 MAX=1000  excluded (not > 1000)
+            client.execute_sql(
+                "INSERT INTO t VALUES "
+                "(1,10,900),(2,10,500),(3,10,-100),"
+                "(4,20,1500),(5,20,200),(6,20,-5),"
+                "(7,30,30000),(8,30,123),(9,30,-32768),"
+                "(10,40,1000),(11,40,0),(12,40,7)",
+                schema_name=sn,
+            )
+            got = {r["k"]: r["m"] for r in client.scan(vid) if r.weight > 0}
+            assert got == {20: 1500, 30: 30000}, (
+                f"HAVING MAX(v) > 1000 wrong: {got}")
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
