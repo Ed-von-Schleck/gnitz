@@ -238,6 +238,172 @@ fn test_reduce_sum_retraction() {
     assert_eq!(out2.count, 2);
 }
 
+/// Nullable SUM must transition to NULL when a retraction removes the last
+/// non-null contributor from a still-surviving group. Drives `op_reduce` on the
+/// linear fold (Count + Sum + CountNonNull) with the finalize program the SQL
+/// planner builds for a nullable SUM: the SUM is null-gated by the hidden
+/// COUNT_NON_NULL companion (`sum / (cnt != 0)` → NULL when the count is zero,
+/// `sum` when it is positive). Pins the mechanism without the planner — a bare
+/// `[Count, Sum]` reduce has no extra column to carry the non-null count, which
+/// is exactly the defect the companion fixes.
+#[test]
+fn test_reduce_nullable_sum_retraction_becomes_null() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+    use crate::schema::{SchemaColumn, type_code};
+    use crate::expr::{
+        ExprProgram, EXPR_COPY_COL, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_CMP_NE,
+        EXPR_INT_DIV, EXPR_EMIT,
+    };
+
+    // Input: pk(U64), grp(I64), val(I64, NULLABLE).
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1), // nullable source
+        ],
+        &[0],
+    );
+
+    // Raw reduce output: synthetic U128 _group_pk | grp | count | sum | cnn.
+    // The aggregate column order mirrors agg_descs = [Count, Sum, CountNonNull].
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0), // _group_pk
+            SchemaColumn::new(type_code::I64, 0),  // grp
+            SchemaColumn::new(type_code::I64, 0),  // count
+            SchemaColumn::new(type_code::I64, 1),  // sum (nullable)
+            SchemaColumn::new(type_code::I64, 0),  // cnn (companion)
+        ],
+        &[0],
+    );
+
+    // Finalized output projects [pk, grp, count, sum] — companion stripped.
+    let fin_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0), // _group_pk
+            SchemaColumn::new(type_code::I64, 0),  // grp
+            SchemaColumn::new(type_code::I64, 0),  // count
+            SchemaColumn::new(type_code::I64, 1),  // sum (nullable)
+        ],
+        &[0],
+    );
+
+    // Finalize program (full reduce-output column indices; resolved below):
+    //   copy grp(col 1) → fin payload 0, count(col 2) → fin payload 1,
+    //   emit sum-gate = sum(col 3) / (cnn(col 4) != 0) → fin payload 2.
+    // div-by-zero (cnn == 0) marks the SUM NULL; div-by-1 (cnn > 0) is exact.
+    let i64_tc = type_code::I64 as i64;
+    let code: Vec<i64> = vec![
+        EXPR_COPY_COL,     i64_tc, 1, 0, // grp   → fin payload 0
+        EXPR_COPY_COL,     i64_tc, 2, 1, // count → fin payload 1
+        EXPR_LOAD_COL_INT, 0, 4, 0,      // r0 = cnn (col 4)
+        EXPR_LOAD_CONST,   1, 0, 0,      // r1 = 0
+        EXPR_CMP_NE,       2, 0, 1,      // r2 = (cnn != 0) → 1/0
+        EXPR_LOAD_COL_INT, 3, 3, 0,      // r3 = sum (col 3)
+        EXPR_INT_DIV,      4, 3, 2,      // r4 = sum / gate (NULL when gate == 0)
+        EXPR_EMIT,         0, 4, 2,      // emit r4 → fin payload 2 (sum)
+    ];
+    let mut fin_prog = ExprProgram::new(code, 5, 0, vec![]);
+    fin_prog.resolve_column_indices(&out_schema);
+
+    let aggs = [
+        AggDescriptor { col_idx: 0, agg_op: AggOp::Count,        col_type_code: TypeCode::I64, _pad: [0; 2] },
+        AggDescriptor { col_idx: 2, agg_op: AggOp::Sum,          col_type_code: TypeCode::I64, _pad: [0; 2] },
+        AggDescriptor { col_idx: 2, agg_op: AggOp::CountNonNull, col_type_code: TypeCode::I64, _pad: [0; 2] },
+    ];
+
+    // Tick 1: insert (pk1, grp=10, val=5) and (pk2, grp=10, val=NULL).
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let delta1 = {
+        let mut b = Batch::with_schema(in_schema, 2);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &10i64.to_le_bytes()); // grp
+        b.extend_col(1, &5i64.to_le_bytes());  // val = 5
+        b.count += 1;
+        // val is payload col 1 → its null bit is bit 1.
+        b.extend_pk(2u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&(1u64 << 1).to_le_bytes());
+        b.extend_col(0, &10i64.to_le_bytes()); // grp
+        b.extend_col(1, &0i64.to_le_bytes());  // val = NULL (placeholder bytes)
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+
+    let (raw1, fin1) = op_reduce(
+        &delta1, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &aggs,
+        None, false, TypeCode::U64, None, 0,
+        Some(&fin_prog), Some(&fin_schema),
+    );
+    let fin1 = fin1.expect("finalize output present");
+    // One group: count=2, sum=5 (non-null while a contributor remains), cnn=1.
+    assert_eq!(raw1.count, 1);
+    assert_eq!(fin1.count, 1);
+    assert_eq!(fin1.get_weight(0), 1);
+    assert_eq!(crate::util::read_i64_le(fin1.col_data(1), 0), 2, "count=2");
+    assert_eq!(crate::util::read_i64_le(fin1.col_data(2), 0), 5, "sum=5");
+    assert_eq!((fin1.get_null_word(0) >> 2) & 1, 0, "sum non-null while a contributor remains");
+
+    // Tick 2: retract (pk1, val=5). The group survives via (pk2, NULL): count
+    // drops to 1, the last non-null contributor is gone → SUM must become NULL.
+    let prev_out = Rc::new(raw1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
+    let delta2 = {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&(-1i64).to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &10i64.to_le_bytes());
+        b.extend_col(1, &5i64.to_le_bytes());
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+
+    let (_raw2, fin2) = op_reduce(
+        &delta2, None, to_ch2.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &aggs,
+        None, false, TypeCode::U64, None, 0,
+        Some(&fin_prog), Some(&fin_schema),
+    );
+    let fin2 = fin2.expect("finalize output present");
+    // Retract the old aggregate (w=-1) and insert the new one (w=+1).
+    assert_eq!(fin2.count, 2);
+
+    // The insert row (weight +1) carries the surviving group's new state.
+    let insert_row = (0..fin2.count)
+        .find(|&r| fin2.get_weight(r) == 1)
+        .expect("an insert row");
+    assert_eq!(
+        crate::util::read_i64_le(fin2.col_data(1), insert_row * 8), 1,
+        "COUNT(*) survives at 1",
+    );
+    assert_eq!(
+        (fin2.get_null_word(insert_row) >> 2) & 1, 1,
+        "SUM becomes NULL once its last non-null contributor is retracted",
+    );
+
+    // The retraction row re-emits the prior (non-null) SUM, cancelling the old
+    // output byte-for-byte — the fix introduces no ghost.
+    let retract_row = (0..fin2.count)
+        .find(|&r| fin2.get_weight(r) == -1)
+        .expect("a retract row");
+    assert_eq!((fin2.get_null_word(retract_row) >> 2) & 1, 0, "retracted SUM was non-null");
+    assert_eq!(
+        crate::util::read_i64_le(fin2.col_data(2), retract_row * 8), 5,
+        "retracted SUM = 5",
+    );
+}
+
 /// Reduce-of-trace over a wide PK (3×U64, stride 24, GROUP BY the full PK).
 /// The retraction read seeks `trace_out` by the group's PK bytes; the u128
 /// `seek` cannot carry a stride-24 key.

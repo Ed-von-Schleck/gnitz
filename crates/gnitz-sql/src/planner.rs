@@ -2209,11 +2209,42 @@ fn resolve_join_col_ref(
 /// Tracks how a user-level aggregate maps to reduce agg_specs.
 struct AggMapping {
     specs_start: usize,     // index into agg_specs
-    is_avg: bool,
+    shape: AggShape,
     output_name: String,
     output_type: TypeCode,
     agg_func: AggFunc,
     arg_col: Option<usize>,
+}
+
+impl AggMapping {
+    /// Whether the aggregate's argument column holds floats — selects the float
+    /// vs integer load/divide path when finalizing AVG / nullable SUM.
+    fn arg_is_float(&self, schema: &Schema) -> bool {
+        self.arg_col
+            .map(|c| schema.columns[c].type_code.is_float())
+            .unwrap_or(false)
+    }
+}
+
+/// How an aggregate's value column is finalized — which also fixes how many
+/// physical specs `push_agg_specs` emits and how the SELECT projection / HAVING
+/// binding read the result. `Avg` and `NullfillSum` each carry a hidden
+/// COUNT_NON_NULL companion at `specs_start + 1`: their null-ness derives from
+/// `companion == 0`, never the value column's saturating `has_value` bit.
+/// `Direct` is a single spec copied straight through.
+#[derive(Clone, Copy)]
+enum AggShape {
+    Direct,
+    Avg,
+    NullfillSum,
+}
+
+impl AggShape {
+    /// True iff a hidden COUNT_NON_NULL companion sits at `specs_start + 1` and
+    /// carries this aggregate's null-ness (AVG and nullable-source SUM).
+    fn has_count_companion(self) -> bool {
+        matches!(self, AggShape::Avg | AggShape::NullfillSum)
+    }
 }
 
 /// One physical reduce spec: the wire agg op code (`AGG_*`), its source column,
@@ -2412,7 +2443,7 @@ fn execute_create_group_by_view(
                 let out_type = agg_result_type(*func, src_col, &source_schema);
                 let agg_idx = agg_mappings.len();
                 let start = agg_specs.len();
-                let is_avg = push_agg_specs(*func, src_col, &source_schema, &mut agg_specs)?;
+                let shape = push_agg_specs(*func, src_col, &source_schema, &mut agg_specs)?;
                 let out_name = alias.unwrap_or_else(|| {
                     let prefix = match func {
                         AggFunc::Count | AggFunc::CountNonNull => "_count",
@@ -2424,7 +2455,7 @@ fn execute_create_group_by_view(
                     format!("{prefix}{idx}")
                 });
                 agg_mappings.push(AggMapping {
-                    specs_start: start, is_avg,
+                    specs_start: start, shape,
                     output_name: out_name, output_type: out_type,
                     agg_func: *func, arg_col: src_col,
                 });
@@ -2619,50 +2650,82 @@ fn execute_create_group_by_view(
             }
             GroupBySelectItem::Aggregate { agg_idx } => {
                 let m = &agg_mappings[*agg_idx];
-                if m.is_avg {
-                    // AVG = SUM / COUNT: two agg_specs were pushed (SUM, COUNT)
-                    let sum_col = (agg_col_offset + m.specs_start) as u32;
-                    let cnt_col = (agg_col_offset + m.specs_start + 1) as u32;
-                    // For a float source, the SUM accumulator stores IEEE-754
-                    // bits; loading those as an int and casting numerically would
-                    // produce a wildly wrong value. Load them directly as float.
-                    let is_float_src = m.arg_col
-                        .map(|c| source_schema.columns[c].type_code.is_float())
-                        .unwrap_or(false);
-                    let sum_f = if is_float_src {
-                        post_map_eb.load_col_float(sum_col as usize)
-                    } else {
-                        let sum_reg = post_map_eb.load_col_int(sum_col as usize);
-                        post_map_eb.int_to_float(sum_reg)
-                    };
-                    let cnt_reg = post_map_eb.load_col_int(cnt_col as usize);
-                    let cnt_f = post_map_eb.int_to_float(cnt_reg);
-                    let avg_reg = post_map_eb.float_div(sum_f, cnt_f);
-                    post_map_eb.emit_col(avg_reg, payload_idx);
-                    out_cols.push(ColumnDef {
-                        // AVG of an empty / all-NULL group is NULL (COUNT_NON_NULL=0
-                        // → float_div by zero marks the result NULL), so the column
-                        // must be nullable to match what the circuit can emit.
-                        name: m.output_name.clone(), type_code: TypeCode::F64,
-                        is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
-                    });
-                    payload_idx += 1;
-                } else {
-                    // Direct aggregate: single spec
-                    let agg_col = (agg_col_offset + m.specs_start) as u32;
-                    let tc = reduce_schema.columns[agg_col as usize].type_code;
-                    post_map_eb.copy_col(tc as u32, agg_col, payload_idx);
-                    out_cols.push(ColumnDef {
-                        name: m.output_name.clone(), type_code: m.output_type,
-                        // SUM/MIN/MAX emit NULL for an all-NULL group (emit.rs sets
-                        // the null bit when the accumulator is_zero(), since it skips
-                        // NULL inputs). COUNT/COUNT_NON_NULL always return an integer
-                        // (0, never NULL). Match emit.rs so a schema-driven decoder
-                        // reads NULL instead of raw zero bytes.
-                        is_nullable: matches!(m.agg_func, AggFunc::Sum | AggFunc::Min | AggFunc::Max),
-                        fk_table_id: 0, fk_col_idx: 0,
-                    });
-                    payload_idx += 1;
+                let sum_col = agg_col_offset + m.specs_start;
+                let cnt_col = agg_col_offset + m.specs_start + 1;
+                match m.shape {
+                    AggShape::Avg => {
+                        // AVG = SUM / COUNT: two agg_specs were pushed (SUM, COUNT).
+                        // For a float source, the SUM accumulator stores IEEE-754
+                        // bits; loading those as an int and casting numerically would
+                        // produce a wildly wrong value. Load them directly as float.
+                        let sum_f = if m.arg_is_float(&source_schema) {
+                            post_map_eb.load_col_float(sum_col)
+                        } else {
+                            let sum_reg = post_map_eb.load_col_int(sum_col);
+                            post_map_eb.int_to_float(sum_reg)
+                        };
+                        let cnt_reg = post_map_eb.load_col_int(cnt_col);
+                        let cnt_f = post_map_eb.int_to_float(cnt_reg);
+                        let avg_reg = post_map_eb.float_div(sum_f, cnt_f);
+                        post_map_eb.emit_col(avg_reg, payload_idx);
+                        out_cols.push(ColumnDef {
+                            // AVG of an empty / all-NULL group is NULL (COUNT_NON_NULL=0
+                            // → float_div by zero marks the result NULL), so the column
+                            // must be nullable to match what the circuit can emit.
+                            name: m.output_name.clone(), type_code: TypeCode::F64,
+                            is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
+                        });
+                        payload_idx += 1;
+                    }
+                    AggShape::NullfillSum => {
+                        // Nullable-source SUM: the raw SUM column's null bit is the
+                        // accumulator's `has_value`, which saturates true on the
+                        // linear fold and so emits a concrete 0 (not NULL) when the
+                        // last non-null contributor is retracted from a surviving
+                        // group. Derive null-ness from the hidden COUNT_NON_NULL
+                        // companion instead, the same way AVG does — divide the SUM by
+                        // `cnt != 0`: the divisor is 1 when the count is positive (an
+                        // exact identity divisor — `x / 1` for every i64, `x / 1.0`
+                        // for float) and 0 when it is zero (div-by-zero marks the row
+                        // NULL). This distinguishes SUM({5,-5})=0 from SUM({NULL})=NULL.
+                        // Unlike AVG the gate is type-preserving: SUM keeps its own
+                        // output type (I64, or F64 for a float source).
+                        let cnt_reg = post_map_eb.load_col_int(cnt_col);
+                        let zero = post_map_eb.load_const(0);
+                        let gate = post_map_eb.cmp_ne(cnt_reg, zero);
+                        let gated = if m.arg_is_float(&source_schema) {
+                            let sum_f = post_map_eb.load_col_float(sum_col);
+                            let gate_f = post_map_eb.int_to_float(gate);
+                            post_map_eb.float_div(sum_f, gate_f)
+                        } else {
+                            let sum_reg = post_map_eb.load_col_int(sum_col);
+                            post_map_eb.div(sum_reg, gate)
+                        };
+                        post_map_eb.emit_col(gated, payload_idx);
+                        out_cols.push(ColumnDef {
+                            // A surviving group whose non-null count is zero yields
+                            // NULL (div-by-zero), so the column must be nullable.
+                            name: m.output_name.clone(), type_code: m.output_type,
+                            is_nullable: true, fk_table_id: 0, fk_col_idx: 0,
+                        });
+                        payload_idx += 1;
+                    }
+                    AggShape::Direct => {
+                        // Direct aggregate: single spec copied straight through.
+                        let tc = reduce_schema.columns[sum_col].type_code;
+                        post_map_eb.copy_col(tc as u32, sum_col as u32, payload_idx);
+                        out_cols.push(ColumnDef {
+                            name: m.output_name.clone(), type_code: m.output_type,
+                            // SUM/MIN/MAX emit NULL for an all-NULL group (emit.rs sets
+                            // the null bit when the accumulator is_zero(), since it skips
+                            // NULL inputs). COUNT/COUNT_NON_NULL always return an integer
+                            // (0, never NULL). Match emit.rs so a schema-driven decoder
+                            // reads NULL instead of raw zero bytes.
+                            is_nullable: matches!(m.agg_func, AggFunc::Sum | AggFunc::Min | AggFunc::Max),
+                            fk_table_id: 0, fk_col_idx: 0,
+                        });
+                        payload_idx += 1;
+                    }
                 }
             }
         }
@@ -2745,7 +2808,7 @@ fn having_agg_func(
 /// column too, so `MAX(c2)` never binds to `SUM(c1)`.
 fn agg_mapping_matches(m: &AggMapping, agg_func: AggFunc, arg_col: Option<usize>) -> bool {
     match agg_func {
-        AggFunc::Avg => m.agg_func == AggFunc::Avg && m.is_avg && m.arg_col == arg_col,
+        AggFunc::Avg => m.agg_func == AggFunc::Avg && m.arg_col == arg_col,
         AggFunc::Count => m.agg_func == AggFunc::Count,
         AggFunc::CountNonNull => m.agg_func == AggFunc::CountNonNull && m.arg_col == arg_col,
         AggFunc::Sum => m.agg_func == AggFunc::Sum && m.arg_col == arg_col,
@@ -2767,7 +2830,7 @@ fn push_agg_specs(
     arg_col: Option<usize>,
     schema: &Schema,
     agg_specs: &mut Vec<AggSpec>,
-) -> Result<bool, GnitzSqlError> {
+) -> Result<AggShape, GnitzSqlError> {
     // Every aggregate except COUNT(*) needs a column argument, which the specs
     // below unwrap. Validating here — the single source of truth for spec
     // layout — covers both the SELECT-list and HAVING callers, so neither needs
@@ -2781,16 +2844,35 @@ fn push_agg_specs(
         agg_specs.push(AggSpec { op, col, out_type: agg_result_type(func, Some(col), schema) });
     };
     Ok(match agg_func {
-        AggFunc::Count => { push(AGG_COUNT, AggFunc::Count, 0); false }
-        AggFunc::CountNonNull => { push(AGG_COUNT_NON_NULL, AggFunc::CountNonNull, arg_col.unwrap()); false }
-        AggFunc::Sum => { push(AGG_SUM, AggFunc::Sum, arg_col.unwrap()); false }
-        AggFunc::Min => { push(AGG_MIN, AggFunc::Min, arg_col.unwrap()); false }
-        AggFunc::Max => { push(AGG_MAX, AggFunc::Max, arg_col.unwrap()); false }
+        AggFunc::Count => { push(AGG_COUNT, AggFunc::Count, 0); AggShape::Direct }
+        AggFunc::CountNonNull => { push(AGG_COUNT_NON_NULL, AggFunc::CountNonNull, arg_col.unwrap()); AggShape::Direct }
+        AggFunc::Sum => {
+            let c = arg_col.unwrap();
+            push(AGG_SUM, AggFunc::Sum, c);
+            // A nullable source means the group's non-null count can fall back to
+            // zero — its last contributor retracted — while the group still
+            // survives (via COUNT(*) or another aggregate), which SQL renders as
+            // NULL. The raw SUM column cannot express that on the linear fold: its
+            // `has_value` boolean saturates true and never returns to false, so a
+            // netted-to-zero SUM emits a concrete 0 where NULL is correct. Attach a
+            // hidden COUNT_NON_NULL companion and let the finalize null-gate the
+            // SUM on it — distinguishing SUM({5,-5})=0 from SUM({NULL})=NULL. A
+            // non-nullable source can never be NULL on a surviving group, so it
+            // keeps its plain single-spec copy.
+            if schema.columns[c].is_nullable {
+                push(AGG_COUNT_NON_NULL, AggFunc::CountNonNull, c);
+                AggShape::NullfillSum
+            } else {
+                AggShape::Direct
+            }
+        }
+        AggFunc::Min => { push(AGG_MIN, AggFunc::Min, arg_col.unwrap()); AggShape::Direct }
+        AggFunc::Max => { push(AGG_MAX, AggFunc::Max, arg_col.unwrap()); AggShape::Direct }
         AggFunc::Avg => {
             let c = arg_col.unwrap();
             push(AGG_SUM, AggFunc::Sum, c);
             push(AGG_COUNT_NON_NULL, AggFunc::CountNonNull, c);
-            true
+            AggShape::Avg
         }
     })
 }
@@ -2809,9 +2891,9 @@ fn append_having_agg(
     let out_type = agg_result_type(agg_func, arg_col, source_schema);
     let agg_idx = agg_mappings.len();
     let start = agg_specs.len();
-    let is_avg = push_agg_specs(agg_func, arg_col, source_schema, agg_specs)?;
+    let shape = push_agg_specs(agg_func, arg_col, source_schema, agg_specs)?;
     agg_mappings.push(AggMapping {
-        specs_start: start, is_avg,
+        specs_start: start, shape,
         output_name: format!("_having_agg{agg_idx}"),
         output_type: out_type, agg_func, arg_col,
     });
@@ -2839,6 +2921,12 @@ fn collect_having_aggs(
             collect_having_aggs(right, source_schema, agg_specs, agg_mappings)
         }
         Expr::UnaryOp { expr, .. } => collect_having_aggs(expr, source_schema, agg_specs, agg_mappings),
+        // `<agg> IS [NOT] NULL` materialises its aggregate (and, for a nullable
+        // SUM, the companion COUNT_NON_NULL `bind_having_null_test` reads) even
+        // when the SELECT list omits it.
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_having_aggs(inner, source_schema, agg_specs, agg_mappings)
+        }
         Expr::Nested(inner) => collect_having_aggs(inner, source_schema, agg_specs, agg_mappings),
         _ => Ok(()),
     }
@@ -2857,6 +2945,23 @@ struct HavingCtx<'a> {
     single_col_natural_pk: bool,
     agg_mappings:          &'a [AggMapping],
     agg_col_offset:        usize,
+}
+
+/// Resolve a HAVING aggregate function reference to its reduce `AggMapping`, or a
+/// Bind error naming the unresolved aggregate. Shared by the value-position binder
+/// (`bind_having_expr`) and the IS [NOT] NULL binder (`bind_having_null_test`) so
+/// the lookup and its error message stay in one place.
+fn resolve_having_mapping<'a>(
+    func: &sqlparser::ast::Function,
+    ctx: &HavingCtx<'a>,
+) -> Result<&'a AggMapping, GnitzSqlError> {
+    let (agg_func, arg_col) = having_agg_func(func, ctx.source_schema)?;
+    ctx.agg_mappings.iter()
+        .find(|m| agg_mapping_matches(m, agg_func, arg_col))
+        .ok_or_else(|| GnitzSqlError::Bind(format!(
+            "HAVING: aggregate {:?}({}) could not be resolved", agg_func,
+            arg_col.map_or("*".to_string(), |c| ctx.source_schema.columns[c].name.clone()),
+        )))
 }
 
 /// Bind a HAVING expression against the reduce-output (grouped) relation —
@@ -2888,29 +2993,46 @@ fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlE
             Ok(BoundExpr::ColRef(reduce_col))
         }
         Expr::Function(func) => {
-            let (agg_func, arg_col) = having_agg_func(func, ctx.source_schema)?;
-            let m = ctx.agg_mappings.iter()
-                .find(|m| agg_mapping_matches(m, agg_func, arg_col))
-                .ok_or_else(|| GnitzSqlError::Bind(format!(
-                    "HAVING: aggregate {:?}({}) could not be resolved", agg_func,
-                    arg_col.map_or("*".to_string(), |c| ctx.source_schema.columns[c].name.clone()),
-                )))?;
-            if m.is_avg {
-                // AVG = SUM / COUNT, both materialised as reduce columns. Force
-                // float division (an int-source SUM/COUNT would otherwise
-                // truncate) by lifting SUM to float via `* 1.0`.
-                let sum_col = ctx.agg_col_offset + m.specs_start;
-                let cnt_col = ctx.agg_col_offset + m.specs_start + 1;
-                let sum_f = BoundExpr::BinOp(
-                    Box::new(BoundExpr::ColRef(sum_col)),
-                    BinOp::Mul,
-                    Box::new(BoundExpr::LitFloat(1.0)),
-                );
-                Ok(BoundExpr::BinOp(
-                    Box::new(sum_f), BinOp::Div, Box::new(BoundExpr::ColRef(cnt_col)),
-                ))
-            } else {
-                Ok(BoundExpr::ColRef(ctx.agg_col_offset + m.specs_start))
+            let m = resolve_having_mapping(func, ctx)?;
+            let sum_col = ctx.agg_col_offset + m.specs_start;
+            let cnt_col = ctx.agg_col_offset + m.specs_start + 1;
+            match m.shape {
+                AggShape::Avg => {
+                    // AVG = SUM / COUNT, both materialised as reduce columns. Force
+                    // float division (an int-source SUM/COUNT would otherwise
+                    // truncate) by lifting SUM to float via `* 1.0`.
+                    let sum_f = BoundExpr::BinOp(
+                        Box::new(BoundExpr::ColRef(sum_col)),
+                        BinOp::Mul,
+                        Box::new(BoundExpr::LitFloat(1.0)),
+                    );
+                    Ok(BoundExpr::BinOp(
+                        Box::new(sum_f), BinOp::Div, Box::new(BoundExpr::ColRef(cnt_col)),
+                    ))
+                }
+                AggShape::NullfillSum => {
+                    // Same companion gate the SELECT projection applies: the raw SUM
+                    // column saturates to a concrete 0 once its last non-null
+                    // contributor is retracted, so read null-ness from the
+                    // COUNT_NON_NULL companion via `sum / (cnt != 0)` — an exact
+                    // identity divisor (1) while the count is positive, div-by-zero
+                    // → NULL when it is 0. `compile_bound_expr` dispatches int vs
+                    // float Div on the SUM column's type, so the gate is
+                    // type-preserving without an explicit branch here. Binding the
+                    // raw SUM column instead would read the saturated 0 and disagree
+                    // with the projection (e.g. admit an all-NULL group under
+                    // `HAVING SUM(v) = 0`).
+                    Ok(BoundExpr::BinOp(
+                        Box::new(BoundExpr::ColRef(sum_col)),
+                        BinOp::Div,
+                        Box::new(BoundExpr::BinOp(
+                            Box::new(BoundExpr::ColRef(cnt_col)),
+                            BinOp::Ne,
+                            Box::new(BoundExpr::LitInt(0)),
+                        )),
+                    ))
+                }
+                AggShape::Direct => Ok(BoundExpr::ColRef(sum_col)),
             }
         }
         Expr::BinaryOp { left, op, right } => {
@@ -2947,9 +3069,51 @@ fn bind_having_expr(expr: &Expr, ctx: &HavingCtx) -> Result<BoundExpr, GnitzSqlE
                 _ => Err(GnitzSqlError::Unsupported("HAVING: unsupported value type".to_string())),
             }
         }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            bind_having_null_test(inner, matches!(expr, Expr::IsNull(_)), ctx)
+        }
         Expr::Nested(inner) => bind_having_expr(inner, ctx),
         _ => Err(GnitzSqlError::Unsupported(
             format!("HAVING: unsupported expression {expr:?}")
+        )),
+    }
+}
+
+/// Bind a HAVING `<agg> IS [NOT] NULL` test. Only aggregates whose null-ness is
+/// carried by a hidden COUNT_NON_NULL companion — nullable-source SUM and AVG —
+/// are supported: their value column's raw null bit is unreliable (a linear-fold
+/// SUM emits 0, not NULL, once its last non-null contributor is retracted, and
+/// AVG has no single raw column), so the projected null-ness is `companion == 0`.
+/// Binding the test to `companion {== | !=} 0` keeps HAVING in agreement with the
+/// SELECT projection's gate. Other operands stay unsupported, as they were before
+/// IS [NOT] NULL was accepted in HAVING at all.
+fn bind_having_null_test(
+    inner: &Expr,
+    want_null: bool,
+    ctx: &HavingCtx,
+) -> Result<BoundExpr, GnitzSqlError> {
+    match inner {
+        Expr::Nested(i) => bind_having_null_test(i, want_null, ctx),
+        Expr::Function(func) => {
+            let m = resolve_having_mapping(func, ctx)?;
+            if m.shape.has_count_companion() {
+                // The companion COUNT_NON_NULL sits at specs_start + 1; the value
+                // is NULL exactly when that count is 0.
+                let cnt_col = ctx.agg_col_offset + m.specs_start + 1;
+                let bop = if want_null { BinOp::Eq } else { BinOp::Ne };
+                Ok(BoundExpr::BinOp(
+                    Box::new(BoundExpr::ColRef(cnt_col)),
+                    bop,
+                    Box::new(BoundExpr::LitInt(0)),
+                ))
+            } else {
+                Err(GnitzSqlError::Unsupported(format!(
+                    "HAVING: IS [NOT] NULL on {:?} is not supported", m.agg_func
+                )))
+            }
+        }
+        _ => Err(GnitzSqlError::Unsupported(
+            "HAVING: IS [NOT] NULL is only supported on nullable SUM/AVG aggregates".to_string()
         )),
     }
 }

@@ -526,6 +526,196 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_sum_delete_to_all_null_emits_null(self, client):
+        """SUM over a nullable column must become NULL when a retraction removes
+        the last non-NULL contributor from a still-surviving group — the SUM
+        analog of test_avg_delete_to_all_null_emits_null. On the linear fold the
+        accumulator tracked presence as a saturating has_value bool, so a SUM that
+        netted back to 0 emitted a concrete 0 where SQL wants NULL. The fix adds a
+        hidden COUNT_NON_NULL companion and null-gates the SUM on it in the reduce
+        finalize. Runs under GNITZ_WORKERS=1 and =4: GROUP BY shards each group
+        onto one worker, so the 4-worker run confirms the fix on the sharded path.
+        """
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  k BIGINT NOT NULL,"
+                "  v BIGINT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, SUM(v) AS sm, COUNT(*) AS c "
+                "FROM t GROUP BY k",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # Group k=10: one non-NULL (v=5) and one NULL contributor.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 1
+            assert rows[0]["k"] == 10
+            assert rows[0]["sm"] == 5, f"SUM(5, NULL) = 5, got {rows[0]['sm']}"
+            assert rows[0]["c"] == 2
+
+            # Retract the last non-NULL contributor. The NULL row keeps the group
+            # alive (c=1), so SUM over {NULL} must be NULL, not 0.
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 1, f"group must persist via its NULL row, got {rows}"
+            assert rows[0]["k"] == 10
+            assert rows[0]["c"] == 1
+            assert rows[0]["sm"] is None, (
+                f"SUM of a group with no non-NULL values must be NULL, got {rows[0]['sm']}")
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_sum_all_null_group_emits_null(self, client):
+        """The stays-NULL direction: a group that is all-NULL from the start has
+        SUM = NULL while still reporting its true COUNT(*). A non-NULL group
+        alongside it confirms only the all-NULL group is NULL (and is unaffected
+        by sharding onto a different worker)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  k BIGINT NOT NULL,"
+                "  v BIGINT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, SUM(v) AS sm, COUNT(*) AS c "
+                "FROM t GROUP BY k",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # k=10: two NULL rows (SUM NULL, c=2). k=20: a non-NULL row (SUM=7).
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, NULL), (2, 10, NULL), (3, 20, 7)",
+                schema_name=sn,
+            )
+            rows = {r["k"]: r for r in client.scan(vid) if r.weight > 0}
+            assert rows[10]["c"] == 2
+            assert rows[10]["sm"] is None, (
+                f"SUM of an all-NULL group must be NULL, got {rows[10]['sm']}")
+            assert rows[20]["c"] == 1
+            assert rows[20]["sm"] == 7
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_sum_is_null(self, client):
+        """HAVING SUM(v) IS NULL admits exactly the groups with no non-NULL
+        contributor, agreeing with the companion-gated projection rather than the
+        raw SUM column's saturating has_value bit. SUM(v) appears only in HAVING
+        (not the SELECT list), so the planner must materialise it — and its hidden
+        COUNT_NON_NULL companion — from the predicate alone. Membership updates
+        incrementally as the last non-NULL value is retracted."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  k BIGINT NOT NULL,"
+                "  v BIGINT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, COUNT(*) AS c "
+                "FROM t GROUP BY k HAVING SUM(v) IS NULL",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # k=10 has a non-NULL value (SUM=5) → excluded.
+            # k=20 is all-NULL (SUM=NULL) → admitted.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL), (3, 20, NULL)",
+                schema_name=sn,
+            )
+            rows = {r["k"]: r for r in client.scan(vid) if r.weight > 0}
+            assert set(rows) == {20}, f"only the all-NULL group passes HAVING, got {set(rows)}"
+            assert rows[20]["c"] == 1
+
+            # Retract k=10's last non-NULL value → its SUM becomes NULL → admitted.
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            rows = {r["k"]: r for r in client.scan(vid) if r.weight > 0}
+            assert set(rows) == {10, 20}, (
+                f"k=10 enters HAVING once its SUM becomes NULL, got {set(rows)}")
+            assert rows[10]["c"] == 1
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_sum_value_gates_on_null(self, client):
+        """HAVING SUM(v) = 0 — SUM in *value* position, not IS NULL — must admit a
+        genuine-zero group {5, -5} yet exclude a group whose SUM became NULL when
+        its last non-NULL contributor was retracted. The value binds through the
+        same COUNT_NON_NULL companion gate the SELECT projection uses; binding the
+        raw SUM column instead would read the saturated 0 and wrongly admit the
+        all-NULL group (NULL = 0 is UNKNOWN, so it must not pass)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  k BIGINT NOT NULL,"
+                "  v BIGINT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, COUNT(*) AS c "
+                "FROM t GROUP BY k HAVING SUM(v) = 0",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # k=10: {5, -5} → SUM = 0, a genuine zero → admitted.
+            # k=20: {5, NULL} → SUM = 5 → excluded for now.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 5), (2, 10, -5), (3, 20, 5), (4, 20, NULL)",
+                schema_name=sn,
+            )
+            rows = {r["k"]: r for r in client.scan(vid) if r.weight > 0}
+            assert set(rows) == {10}, f"only the genuine-zero group passes, got {set(rows)}"
+            assert rows[10]["c"] == 2
+
+            # Retract k=20's last non-NULL value. Its raw SUM nets to 0, but with no
+            # non-NULL contributor the SUM is NULL → SUM(v) = 0 is UNKNOWN → still
+            # excluded. A raw (un-gated) SUM column would read 0 and wrongly admit it.
+            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+            rows = {r["k"]: r for r in client.scan(vid) if r.weight > 0}
+            assert set(rows) == {10}, (
+                f"a group whose SUM became NULL must not satisfy SUM(v) = 0, got {set(rows)}")
+            assert rows[10]["c"] == 2
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_group_by_with_where(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
