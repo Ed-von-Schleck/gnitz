@@ -2039,6 +2039,273 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Const-stride scatter pins (PKS=8 and PKS=16 arms)
+    //
+    // The wide-PK tests above force the *dynamic* arm (stride 24). All other
+    // set-op/union/scatter tests use a U128 PK (stride 16) only transitively;
+    // none exercise the literal `PKS=8` arm, and none pin `scatter_multi_source`
+    // / `scatter_unified_sources_with_weights` to a *specific* const width. These
+    // build PKs as distinguishable byte patterns (via `extend_pk_bytes`, which is
+    // byte-transparent — scatter copies PK bytes verbatim) and assert the exact
+    // PK bytes, weights, and payloads land per output row. If a const arm
+    // dispatched the wrong width (e.g. PKS=8 routed to `::<16>`), the per-row PK
+    // copy would read/write 16 bytes against an 8-byte-strided region and either
+    // panic on the out-of-bounds slice or scramble the PK bytes — caught here.
+    // -----------------------------------------------------------------------
+
+    /// Build a stride-8 `(U64 pk, I64 payload)` batch from raw 8-byte PK
+    /// patterns. PK bytes are stored verbatim (scatter is byte-transparent).
+    fn make_batch_pk8(rows: &[([u8; 8], i64, i64)]) -> Batch {
+        let schema = make_schema_u64_pk();
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(rows.len().max(1));
+        for (pk, w, val) in rows {
+            b.extend_pk_bytes(pk);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    /// Build a stride-16 `(U128 pk, I64 payload)` batch from raw 16-byte PK
+    /// patterns.
+    fn make_batch_pk16(rows: &[([u8; 16], i64, i64)]) -> Batch {
+        let schema = make_schema_i64(); // U128 pk + I64 payload → stride 16
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(rows.len().max(1));
+        for (pk, w, val) in rows {
+            b.extend_pk_bytes(pk);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    #[test]
+    fn test_scatter_multi_source_const_pk8() {
+        let schema = make_schema_u64_pk(); // stride 8
+        let pk_a = [0x11u8; 8];
+        let pk_b = [0x22u8; 8];
+        let pk_c = [0x33u8; 8];
+        let pk_d = [0x44u8; 8];
+        let s0 = make_batch_pk8(&[(pk_a, 1, 10), (pk_b, 1, 20)]);
+        let s1 = make_batch_pk8(&[(pk_c, 1, 30), (pk_d, 1, 40)]);
+        let mb0 = s0.as_mem_batch();
+        let mb1 = s1.as_mem_batch();
+        let sources: Vec<Option<MemBatch<'_>>> = vec![Some(mb0.clone()), Some(mb1.clone())];
+        let rows: &[(u8, u32)] = &[(1, 0), (0, 1), (0, 0), (1, 1)];
+
+        let n = rows.len();
+        let mut pk = vec![0u8; n * 8];
+        let mut wt = vec![0u8; n * 8];
+        let mut nb = vec![0u8; n * 8];
+        let mut col0 = vec![0u8; n * 8];
+        let mut blob: Vec<u8> = Vec::with_capacity(1);
+        {
+            let mut writer = DirectWriter {
+                pk: &mut pk,
+                pk_stride: 8,
+                weight: &mut wt,
+                null_bmp: &mut nb,
+                col_bufs: vec![&mut col0],
+                blob: &mut blob,
+                blob_cache: BlobCacheGuard::acquire(&schema, 0),
+                count: 0,
+                schema,
+            };
+            assert_eq!(writer.pk_stride, 8, "test must exercise the const PKS=8 arm");
+            scatter_multi_source(&sources, rows, &mut writer);
+            assert_eq!(writer.row_count(), 4);
+        }
+        // Emission order (1,0),(0,1),(0,0),(1,1) ⇒ pk_c, pk_b, pk_a, pk_d.
+        assert_eq!(&pk[0..8], &pk_c);
+        assert_eq!(&pk[8..16], &pk_b);
+        assert_eq!(&pk[16..24], &pk_a);
+        assert_eq!(&pk[24..32], &pk_d);
+        let vals: Vec<i64> = (0..4)
+            .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
+            .collect();
+        assert_eq!(vals, vec![30, 20, 10, 40]);
+        let weights: Vec<i64> = (0..4)
+            .map(|i| i64::from_le_bytes(wt[i * 8..i * 8 + 8].try_into().unwrap()))
+            .collect();
+        assert_eq!(weights, vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn test_scatter_multi_source_const_pk16() {
+        let schema = make_schema_i64(); // U128 pk → stride 16
+        let pk_a = [0xa1u8; 16];
+        let pk_b = [0xb2u8; 16];
+        let pk_c = [0xc3u8; 16];
+        let pk_d = [0xd4u8; 16];
+        let s0 = make_batch_pk16(&[(pk_a, 1, 10), (pk_b, 1, 20)]);
+        let s1 = make_batch_pk16(&[(pk_c, 1, 30), (pk_d, 1, 40)]);
+        let mb0 = s0.as_mem_batch();
+        let mb1 = s1.as_mem_batch();
+        let sources: Vec<Option<MemBatch<'_>>> = vec![Some(mb0.clone()), Some(mb1.clone())];
+        let rows: &[(u8, u32)] = &[(1, 0), (0, 1), (0, 0), (1, 1)];
+
+        let n = rows.len();
+        let mut pk = vec![0u8; n * 16];
+        let mut wt = vec![0u8; n * 8];
+        let mut nb = vec![0u8; n * 8];
+        let mut col0 = vec![0u8; n * 8];
+        let mut blob: Vec<u8> = Vec::with_capacity(1);
+        {
+            let mut writer = DirectWriter {
+                pk: &mut pk,
+                pk_stride: 16,
+                weight: &mut wt,
+                null_bmp: &mut nb,
+                col_bufs: vec![&mut col0],
+                blob: &mut blob,
+                blob_cache: BlobCacheGuard::acquire(&schema, 0),
+                count: 0,
+                schema,
+            };
+            assert_eq!(writer.pk_stride, 16, "test must exercise the const PKS=16 arm");
+            scatter_multi_source(&sources, rows, &mut writer);
+            assert_eq!(writer.row_count(), 4);
+        }
+        assert_eq!(&pk[0..16], &pk_c);
+        assert_eq!(&pk[16..32], &pk_b);
+        assert_eq!(&pk[32..48], &pk_a);
+        assert_eq!(&pk[48..64], &pk_d);
+        let vals: Vec<i64> = (0..4)
+            .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
+            .collect();
+        assert_eq!(vals, vec![30, 20, 10, 40]);
+    }
+
+    #[test]
+    fn test_scatter_unified_sources_const_pk8() {
+        let schema = make_schema_u64_pk(); // stride 8
+        let pk_a = [0x11u8; 8];
+        let pk_b = [0x22u8; 8];
+        let pk_c = [0x33u8; 8];
+        let s = make_batch_pk8(&[(pk_a, 1, 7), (pk_b, 1, 8), (pk_c, 1, 9)]);
+        let mb = s.as_mem_batch();
+
+        // Build a UnifiedSource pointing into `mb`. Only PK, null_bmp, and one
+        // payload column are read; the rest are zero-stride placeholders.
+        let pk_base = mb.data.as_ptr().wrapping_add(mb.offsets[super::super::batch::REG_PK]);
+        let nbm_base = mb.data.as_ptr().wrapping_add(mb.offsets[super::super::batch::REG_NULL_BMP]);
+        let col0_base = mb.data.as_ptr().wrapping_add(mb.offsets[super::super::batch::REG_PAYLOAD_START]);
+        let zero: u8 = 0;
+        let mut cols = [ColPtr { base: &zero as *const u8, stride: 0 }; MAX_COLUMNS - 1];
+        cols[0] = ColPtr { base: col0_base, stride: 8 };
+        let src = UnifiedSource {
+            pk: ColPtr { base: pk_base, stride: 8 },
+            null_bmp: ColPtr { base: nbm_base, stride: 8 },
+            cols,
+            blob_ptr: mb.blob.as_ptr(),
+            blob_len: mb.blob.len(),
+        };
+        let sources = vec![src];
+        let rows: &[(u32, u32, i64)] = &[(0, 2, 5), (0, 0, -1), (0, 1, 3)];
+
+        let n = rows.len();
+        let mut pk = vec![0u8; n * 8];
+        let mut wt = vec![0u8; n * 8];
+        let mut nb = vec![0u8; n * 8];
+        let mut col0 = vec![0u8; n * 8];
+        let mut blob: Vec<u8> = Vec::with_capacity(1);
+        {
+            let mut writer = DirectWriter {
+                pk: &mut pk,
+                pk_stride: 8,
+                weight: &mut wt,
+                null_bmp: &mut nb,
+                col_bufs: vec![&mut col0],
+                blob: &mut blob,
+                blob_cache: BlobCacheGuard::acquire(&schema, 0),
+                count: 0,
+                schema,
+            };
+            assert_eq!(writer.pk_stride, 8, "test must exercise the const PKS=8 arm");
+            scatter_unified_sources_with_weights(&sources, rows, &mut writer);
+            assert_eq!(writer.row_count(), 3);
+        }
+        // Emission order rows[2],rows[0],rows[1] ⇒ pk_c, pk_a, pk_b.
+        assert_eq!(&pk[0..8], &pk_c);
+        assert_eq!(&pk[8..16], &pk_a);
+        assert_eq!(&pk[16..24], &pk_b);
+        let weights: Vec<i64> = (0..3)
+            .map(|i| i64::from_le_bytes(wt[i * 8..i * 8 + 8].try_into().unwrap()))
+            .collect();
+        assert_eq!(weights, vec![5, -1, 3]);
+        let vals: Vec<i64> = (0..3)
+            .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
+            .collect();
+        assert_eq!(vals, vec![9, 7, 8]);
+    }
+
+    #[test]
+    fn test_scatter_unified_sources_const_pk16() {
+        let schema = make_schema_i64(); // U128 pk → stride 16
+        let pk_a = [0xa1u8; 16];
+        let pk_b = [0xb2u8; 16];
+        let pk_c = [0xc3u8; 16];
+        let s = make_batch_pk16(&[(pk_a, 1, 7), (pk_b, 1, 8), (pk_c, 1, 9)]);
+        let mb = s.as_mem_batch();
+
+        let pk_base = mb.data.as_ptr().wrapping_add(mb.offsets[super::super::batch::REG_PK]);
+        let nbm_base = mb.data.as_ptr().wrapping_add(mb.offsets[super::super::batch::REG_NULL_BMP]);
+        let col0_base = mb.data.as_ptr().wrapping_add(mb.offsets[super::super::batch::REG_PAYLOAD_START]);
+        let zero: u8 = 0;
+        let mut cols = [ColPtr { base: &zero as *const u8, stride: 0 }; MAX_COLUMNS - 1];
+        cols[0] = ColPtr { base: col0_base, stride: 8 };
+        let src = UnifiedSource {
+            pk: ColPtr { base: pk_base, stride: 16 },
+            null_bmp: ColPtr { base: nbm_base, stride: 8 },
+            cols,
+            blob_ptr: mb.blob.as_ptr(),
+            blob_len: mb.blob.len(),
+        };
+        let sources = vec![src];
+        let rows: &[(u32, u32, i64)] = &[(0, 2, 5), (0, 0, -1), (0, 1, 3)];
+
+        let n = rows.len();
+        let mut pk = vec![0u8; n * 16];
+        let mut wt = vec![0u8; n * 8];
+        let mut nb = vec![0u8; n * 8];
+        let mut col0 = vec![0u8; n * 8];
+        let mut blob: Vec<u8> = Vec::with_capacity(1);
+        {
+            let mut writer = DirectWriter {
+                pk: &mut pk,
+                pk_stride: 16,
+                weight: &mut wt,
+                null_bmp: &mut nb,
+                col_bufs: vec![&mut col0],
+                blob: &mut blob,
+                blob_cache: BlobCacheGuard::acquire(&schema, 0),
+                count: 0,
+                schema,
+            };
+            assert_eq!(writer.pk_stride, 16, "test must exercise the const PKS=16 arm");
+            scatter_unified_sources_with_weights(&sources, rows, &mut writer);
+            assert_eq!(writer.row_count(), 3);
+        }
+        assert_eq!(&pk[0..16], &pk_c);
+        assert_eq!(&pk[16..32], &pk_a);
+        assert_eq!(&pk[32..48], &pk_b);
+        let weights: Vec<i64> = (0..3)
+            .map(|i| i64::from_le_bytes(wt[i * 8..i * 8 + 8].try_into().unwrap()))
+            .collect();
+        assert_eq!(weights, vec![5, -1, 3]);
+        let vals: Vec<i64> = (0..3)
+            .map(|i| i64::from_le_bytes(col0[i * 8..i * 8 + 8].try_into().unwrap()))
+            .collect();
+        assert_eq!(vals, vec![9, 7, 8]);
+    }
+
+    // -----------------------------------------------------------------------
     // Narrow-region merge dispatch: signed / narrow-unsigned / compound
     // -----------------------------------------------------------------------
 
@@ -2619,6 +2886,35 @@ mod tests {
         );
         assert_eq!(two.iter().map(|r| r.2).collect::<Vec<_>>(), vec![100, 200]);
         assert!(two.iter().all(|r| r.0 == p && r.1 == 1));
+    }
+
+    /// PIN — root adjacency of equal-(PK, payload) rows across batches.
+    /// Three single-row batches, all PK=5: b1/b3 carry the *same* payload
+    /// (val=100) with opposite weights, b2 carries a different payload
+    /// (val=200) and sits between them in batch order. Each batch is trivially
+    /// (PK, payload)-sorted, but the matching val=100 rows are NOT adjacent in
+    /// batch order.
+    ///
+    /// The merge heap MUST order by (PK, payload) so the two val=100 rows reach
+    /// `drive_merge`'s fold root consecutively and their +1/-1 weights cancel;
+    /// val=200 survives at weight 1. A PK-only heap `less` (dropping the
+    /// payload tiebreak) leaves the three same-PK rows unordered among
+    /// themselves, the fold breaks on the first payload mismatch, and the
+    /// +1/-1 pair never folds — leaking a spurious row.
+    #[test]
+    fn test_merge_same_pk_nonadjacent_payload_interleave() {
+        let schema = make_schema_i64();
+        let b1 = make_batch_i64(&[(5, 1, 100)]);
+        let b2 = make_batch_i64(&[(5, 1, 200)]);
+        let b3 = make_batch_i64(&[(5, -1, 100)]);
+
+        let result = run_merge(&[b1, b2, b3], &schema);
+        assert_eq!(
+            result.len(),
+            1,
+            "val=100 +1/-1 pair must cancel; only val=200 survives, got {result:?}"
+        );
+        assert_eq!(result[0], (5, 0, 1, 200));
     }
 
     #[test]

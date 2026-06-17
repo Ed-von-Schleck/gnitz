@@ -747,7 +747,7 @@ mod tests {
     use super::*;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
     use crate::storage::Batch;
-    use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
+    use crate::test_support::{make_wide_batch, opk_pk, wide_pk_3xu64_schema};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -871,6 +871,89 @@ mod tests {
         assert!(out.sorted);
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!(get_payload_i64(&out, 1), 10);
+    }
+
+    /// Read a STRING/BLOB payload column's value back out as a `String`.
+    /// Mirrors join.rs's `read_str_payload`; short (≤12 byte) values live inline
+    /// in the 16-byte German-string struct, long ones in the blob heap.
+    fn read_str_col(batch: &Batch, col: usize, row: usize) -> String {
+        let off = row * 16;
+        let gs = &batch.col_data(col)[off..off + 16];
+        let length = u32::from_le_bytes(gs[0..4].try_into().unwrap()) as usize;
+        if length == 0 {
+            return String::new();
+        }
+        if length <= crate::schema::SHORT_STRING_THRESHOLD {
+            String::from_utf8_lossy(&gs[4..4 + length]).to_string()
+        } else {
+            let blob_off = u64::from_le_bytes(gs[8..16].try_into().unwrap()) as usize;
+            String::from_utf8_lossy(&batch.blob[blob_off..blob_off + length]).to_string()
+        }
+    }
+
+    /// Build a `Batch` for a `(U64 pk, STRING payload)` schema from
+    /// `(pk, weight, &str)` rows. Short (≤12 byte) strings are stored inline;
+    /// the resulting batch is marked sorted+consolidated (caller supplies rows
+    /// already in (PK, payload) order).
+    fn make_str_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, s) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            let bytes = s.as_bytes();
+            let mut gs = [0u8; 16];
+            gs[0..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            if bytes.len() <= crate::schema::SHORT_STRING_THRESHOLD {
+                let copy_len = bytes.len().min(12);
+                gs[4..4 + copy_len].copy_from_slice(&bytes[..copy_len]);
+            } else {
+                gs[4..8].copy_from_slice(&bytes[..4]);
+                let offset = b.blob.len() as u64;
+                gs[8..16].copy_from_slice(&offset.to_le_bytes());
+                b.blob.extend_from_slice(bytes);
+            }
+            b.extend_col(0, &gs);
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        b
+    }
+
+    /// Pin: the GENERIC `RowCmp` arm (`compare_rows`, German-string comparison)
+    /// must drive `op_union_merge_inner`'s shared-PK payload merge. A
+    /// `(U64 pk, STRING payload)` schema resolves to `PayloadCmpKind::Generic`,
+    /// so `with_payload_cmp!` threads the string-aware comparator into the merge.
+    /// Two rows share PK=1 with payloads "banana" (in a) and "apple" (in b); the
+    /// union must produce both rows (PK, payload)-sorted: "apple" before
+    /// "banana". The fixed-int comparator would treat these German-string structs
+    /// as raw 8-byte integers and order them by the wrong bytes (or merge them),
+    /// so a fixed-int dispatch through this path flips the string order.
+    #[test]
+    fn test_union_merge_generic_rowcmp_shared_pk_string_payload() {
+        let schema = make_schema_pk_u64_payload_string();
+        // Guard: the schema must select the GENERIC comparator. If a future
+        // change moved STRING into the fixed-int fast path, this pin would no
+        // longer exercise the generic arm — fail loudly here instead.
+        assert_eq!(
+            schema.payload_cmp,
+            crate::schema::PayloadCmpKind::Generic,
+            "U64+STRING schema must use the GENERIC payload comparator",
+        );
+
+        let a = make_str_batch(&schema, &[(1, 1, "banana")]);
+        let b = make_str_batch(&schema, &[(1, 1, "apple")]);
+        let out = op_union(a, Some(&b), &schema);
+
+        assert_eq!(out.count, 2, "Z-Set + keeps both shared-PK rows");
+        assert!(out.sorted);
+        // Both rows carry PK=1.
+        assert_eq!(out.get_pk(0) as u64, 1);
+        assert_eq!(out.get_pk(1) as u64, 1);
+        // (PK, payload) order: German-string compare puts "apple" before "banana".
+        assert_eq!(read_str_col(&out, 0, 0), "apple", "row0 payload (string-sorted)");
+        assert_eq!(read_str_col(&out, 0, 1), "banana", "row1 payload (string-sorted)");
     }
 
     // -----------------------------------------------------------------------
@@ -1860,6 +1943,106 @@ mod tests {
         }
         // Rows 0 and 1 share col2 but differ in col1 → distinct keys.
         assert_ne!(out.get_pk_bytes(0), out.get_pk_bytes(1));
+    }
+
+    #[test]
+    fn test_reindex_packer_copartition_contract_wide() {
+        // WIDE-branch (key len > 16) co-partition pin. A 3×U64 reindex key is 24
+        // OPK bytes, so `partition_for_pk_bytes` takes its `len > 16` arm
+        // (`xxh3_64(bytes) >> 56`), NOT the narrow `mix(widen_pk_be(..))` arm the
+        // existing 12-byte contract test exercises. The wide key is built by three
+        // INDEPENDENT code paths — the exchange scatter (`pack_into` → scratch),
+        // the reindexed trace store (`promote_into` → `get_pk_bytes`), and the
+        // storage/ingest OPK encoder (`opk_pk` = `encode_order_preserving_pk`,
+        // which never touches `ReindexPacker`) — so a fork in any single path's
+        // wide-key construction breaks the byte-equality teeth, and a fork in
+        // `partition_for_pk_bytes`'s wide arm breaks the formula-pin teeth.
+        //
+        // Source: narrow U64 PK + three U64 payload columns; reindex on the three
+        // payloads (the `map_reindex` repartition-by-3-column-key shape).
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0), // PK (not part of the key)
+                SchemaColumn::new(type_code::U64, 0), // c1 payload → key slot 0
+                SchemaColumn::new(type_code::U64, 0), // c2 payload → key slot 1
+                SchemaColumn::new(type_code::U64, 0), // c3 payload → key slot 2
+            ],
+            &[0],
+        );
+        // Non-trivial, high-entropy column values (so a forked hash seed/shift in
+        // the wide arm lands on a different bucket with overwhelming probability).
+        let key: [u64; 3] = [
+            0x0102_0304_0506_0708,
+            0xA0B0_C0D0_E0F0_0102,
+            0xdead_beef_cafe_1234,
+        ];
+        let mut b = Batch::with_schema(schema, 1);
+        b.extend_pk(42u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &key[0].to_le_bytes()); // payload pi 0 (c1)
+        b.extend_col(1, &key[1].to_le_bytes()); // payload pi 1 (c2)
+        b.extend_col(2, &key[2].to_le_bytes()); // payload pi 2 (c3)
+        b.count += 1;
+        let mb = b.as_mem_batch();
+
+        // Reindex on the three U64 payload columns → a 24-byte (3×U64) OPK key.
+        let cols = [1u32, 2u32, 3u32];
+        let packer = ReindexPacker::new(&schema, &cols, &[]);
+        assert_eq!(packer.out_stride, 24, "3×U64 reindex key must be 24 bytes (wide)");
+
+        // The reindex output schema = natural 3×U64 PK (what `op_map` stamps and
+        // what the trace store holds); identical layout to `wide_pk_3xu64_schema`
+        // minus the trailing payload.
+        let out_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0, 1, 2],
+        );
+        assert!(out_schema.pk_is_wide(), "test invariant: 24-byte key is wide");
+
+        // PATH 1 — trace store: promote_into stamps the `_join_pk`; read it back.
+        let mut out = make_zeroed_batch(&out_schema, 1);
+        packer.promote_into(&mb, &mut out);
+        let consumer = out.get_pk_bytes(0);
+
+        // PATH 2 — exchange scatter: pack_into into a scratch buffer.
+        let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+        packer.pack_into(&mut buf[..packer.out_stride], &mb, 0);
+        let producer = &buf[..packer.out_stride];
+
+        // PATH 3 — storage/ingest OPK encoder (no ReindexPacker involved at all).
+        let oracle = opk_pk(&out_schema, &[key[0] as u128, key[1] as u128, key[2] as u128]);
+
+        // (1) BYTE-EQUALITY teeth: all three independent builders agree, and the
+        // key is genuinely wide (> 16 bytes).
+        assert_eq!(consumer.len(), 24, "consumer key is the 24-byte wide region");
+        assert!(consumer.len() > 16, "wide branch requires key len > 16");
+        assert_eq!(producer, consumer, "scatter (pack_into) == trace store (_join_pk)");
+        assert_eq!(consumer, oracle.as_slice(), "trace store == ingest OPK encoder");
+        assert_eq!(producer, oracle.as_slice(), "scatter == ingest OPK encoder");
+
+        // (2) CO-PARTITION teeth: producer and consumer route to the same partition
+        // through the WIDE arm of partition_for_pk_bytes.
+        let p_consumer = crate::storage::partition_for_pk_bytes(consumer);
+        let p_producer = crate::storage::partition_for_pk_bytes(producer);
+        let p_oracle = crate::storage::partition_for_pk_bytes(oracle.as_slice());
+        assert_eq!(p_producer, p_consumer, "producer/consumer co-partition (wide)");
+        assert_eq!(p_consumer, p_oracle, "trace store / ingest co-partition (wide)");
+
+        // (3) WIDE-ARM FORMULA pin: the partition is the top 8 bits of XXH3-64 over
+        // the OPK bytes, recomputed independently here. A forked hash seed or a
+        // shifted bucket-bit extraction in `partition_for_pk_bytes`'s `len > 16`
+        // arm diverges from this reference even though it would still keep
+        // producer == consumer (both call the same forked function). This is the
+        // teeth that survives the "both paths share one partition_for_pk_bytes"
+        // case called out for cluster C2.
+        let expected = (crate::xxh::checksum(consumer) >> 56) as usize;
+        assert_eq!(p_consumer, expected, "wide partition == (xxh3_64(opk) >> 56)");
+        assert!(expected < 256, "256-bucket routing (top 8 bits)");
     }
 
     #[test]

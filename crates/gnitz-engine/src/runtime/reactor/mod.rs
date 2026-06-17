@@ -639,10 +639,18 @@ impl Reactor {
                     std::sync::atomic::Ordering::AcqRel,
                 );
             }
+            // Order witness (test-only): records that the flag publish
+            // precedes the reader_seq snapshot. Swapping these two
+            // operations flips the recorded order — see the
+            // `refresh_publishes_flag_before_snapshotting_reader_seq` pin.
+            #[cfg(test)]
+            test_refresh_hooks::record_flag_published();
             // Now snapshot expected reader_seq. Any worker store that
             // happens-before this load MUST have been preceded by a
             // write_cursor Release store, so the post-loop
             // `write_cursor != read_cursor` check below catches it.
+            #[cfg(test)]
+            test_refresh_hooks::record_reader_seq_snapshot();
             let expected = hdr.reader_seq()
                 .load(std::sync::atomic::Ordering::Acquire);
             let uaddr = hdr.reader_seq() as *const std::sync::atomic::AtomicU32 as u64;
@@ -650,6 +658,12 @@ impl Reactor {
                 .val(expected as u64)
                 .uaddr(uaddr)
                 .flags(FUTEX2_SIZE_U32);
+            // Test-only barrier: block until the helper thread has
+            // published (so its write_cursor Release is globally visible
+            // before the unread-data check below), making the `wc != rc`
+            // outcome deterministic instead of racy.
+            #[cfg(test)]
+            test_refresh_hooks::await_helper_publish();
             // Unread-data check: if write_cursor has advanced past
             // read_cursor, a publish is pending that we haven't
             // drained. Signal the caller to drain before arming.
@@ -1945,6 +1959,105 @@ impl Drop for SendFuture {
 }
 
 // (oneshot, mpsc, AsyncMutex, AsyncRwLock, join2, join_all, select2 live in sync.rs)
+
+/// Test-only instrumentation for `refresh_futex_waitv_vals`. The pin
+/// `refresh_publishes_flag_before_snapshotting_reader_seq` arms a probe
+/// on the reactor thread, then `refresh_futex_waitv_vals` stamps a
+/// monotonically increasing sequence at the flag-publish site and again
+/// at the reader_seq-snapshot site. The pin asserts the flag stamp is
+/// strictly smaller (published first); reordering the two operations
+/// flips the stamps. The probe also exposes a publish-barrier so the pin
+/// can deterministically force a worker publish to be visible before the
+/// unread-data check.
+#[cfg(test)]
+pub(crate) mod test_refresh_hooks {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// Shared state between the reactor thread (which runs the refresh)
+    /// and the test's helper thread (which publishes into the ring).
+    pub(crate) struct RefreshProbe {
+        /// Monotonic stamp source; each `record_*` claims the next value.
+        seq: AtomicU32,
+        /// Stamp captured at the `fetch_or(FLAG_MASTER_PARKED)` site.
+        pub(crate) flag_seq: AtomicU32,
+        /// Stamp captured at the `reader_seq` snapshot site.
+        pub(crate) snap_seq: AtomicU32,
+        /// Set by the helper thread after it has published into the ring.
+        /// The refresh barrier spins on this so the publish's
+        /// `write_cursor` Release is visible before the unread-data check.
+        pub(crate) helper_published: Arc<AtomicBool>,
+        /// When true, `await_helper_publish` spins until `helper_published`.
+        wait_for_publish: bool,
+    }
+
+    impl RefreshProbe {
+        pub(crate) fn new(helper_published: Arc<AtomicBool>, wait_for_publish: bool) -> Self {
+            RefreshProbe {
+                seq: AtomicU32::new(1),
+                flag_seq: AtomicU32::new(0),
+                snap_seq: AtomicU32::new(0),
+                helper_published,
+                wait_for_publish,
+            }
+        }
+        fn stamp(&self) -> u32 {
+            self.seq.fetch_add(1, Ordering::SeqCst)
+        }
+    }
+
+    thread_local! {
+        static PROBE: RefCell<Option<Rc<RefreshProbe>>> = const { RefCell::new(None) };
+    }
+
+    /// Arm the probe on the current (reactor) thread. Returns the handle
+    /// so the test can read the stamps after the refresh runs.
+    pub(crate) fn arm(probe: Rc<RefreshProbe>) {
+        PROBE.with(|p| *p.borrow_mut() = Some(probe));
+    }
+
+    /// Disarm; subsequent refreshes are uninstrumented.
+    pub(crate) fn disarm() {
+        PROBE.with(|p| *p.borrow_mut() = None);
+    }
+
+    /// Stamp the flag-publish site (`fetch_or(FLAG_MASTER_PARKED)`).
+    pub(crate) fn record_flag_published() {
+        PROBE.with(|p| {
+            if let Some(probe) = p.borrow().as_ref() {
+                let s = probe.stamp();
+                probe.flag_seq.store(s, Ordering::SeqCst);
+            }
+        });
+    }
+
+    /// Stamp the reader_seq-snapshot site.
+    pub(crate) fn record_reader_seq_snapshot() {
+        PROBE.with(|p| {
+            if let Some(probe) = p.borrow().as_ref() {
+                let s = probe.stamp();
+                probe.snap_seq.store(s, Ordering::SeqCst);
+            }
+        });
+    }
+
+    /// Block until the helper thread reports it has published (only when
+    /// the probe was armed with `wait_for_publish`).
+    pub(crate) fn await_helper_publish() {
+        let flag = PROBE.with(|p| {
+            p.borrow().as_ref().and_then(|probe| {
+                probe.wait_for_publish.then(|| Arc::clone(&probe.helper_published))
+            })
+        });
+        if let Some(flag) = flag {
+            while !flag.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -3410,6 +3523,162 @@ mod tests {
         unsafe { libc::waitpid(pid, &mut status, 0); }
 
         reactor.request_shutdown();
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, CAPACITY);
+            libc::close(fd);
+        }
+    }
+
+    /// Lost-wake guard for `refresh_futex_waitv_vals` (cluster C6).
+    ///
+    /// The refresh MUST publish `FLAG_MASTER_PARKED` (`fetch_or`) BEFORE
+    /// it snapshots `reader_seq`, so a worker that advances `reader_seq`
+    /// after observing the flag is either caught by the worker's own
+    /// `FUTEX_WAKE` (it sees the flag) or by the refresh's post-snapshot
+    /// `write_cursor != read_cursor` check. If the snapshot is taken
+    /// first, a worker publishing in the window between the snapshot and
+    /// the `fetch_or` neither sees the flag (so it issues no wake) nor is
+    /// reliably reflected in the stale `reader_seq` expected value — the
+    /// classic lost-wake race.
+    ///
+    /// This pin ISOLATES the refresh path: it drives
+    /// `refresh_futex_waitv_vals` directly, with NO `tick()` and NO
+    /// safety-net drain, so the store ordering is not masked. A helper
+    /// thread spins until it observes `FLAG_MASTER_PARKED` set, then
+    /// publishes into the ring (advancing `write_cursor` and
+    /// `reader_seq`). The pin then asserts:
+    ///   1. refresh reports "pending" (`true`) — the caller drains rather
+    ///      than arms a doomed wait — i.e. the publish is observed;
+    ///   2. via a `#[cfg(test)]` order-witness probe, the flag publish was
+    ///      stamped strictly before the `reader_seq` snapshot.
+    ///
+    /// Teeth: reordering the two operations (snapshot before `fetch_or`)
+    /// flips the order stamps, failing assertion (2).
+    #[test]
+    fn refresh_publishes_flag_before_snapshotting_reader_seq() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
+        use crate::runtime::w2m_ring::{self, W2mRingHeader, FLAG_MASTER_PARKED};
+        use crate::runtime::wire as ipc;
+        use crate::runtime::wire::STATUS_OK;
+
+        const CAPACITY: usize = 64 * 1024;
+        const TIMEOUT: Duration = Duration::from_secs(10);
+
+        // memfd + mmap a tiny shared W2M ring (same setup the existing
+        // cross-process stress tests use, but shared with a thread).
+        let fd = crate::runtime::sys::memfd_create(b"w2m_refresh_pin");
+        assert!(fd >= 0, "memfd_create failed");
+        assert_eq!(crate::sys::ftruncate(fd, CAPACITY as i64), 0);
+        let ptr = crate::runtime::sys::mmap_shared(fd, CAPACITY);
+        assert!(!ptr.is_null(), "mmap_shared failed");
+        unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
+
+        // Arm the order-witness probe on this (reactor) thread. The
+        // `wait_for_publish` barrier makes the helper's publish visible to
+        // the refresh's `wc != rc` check deterministically.
+        let helper_published = Arc::new(AtomicBool::new(false));
+        let probe = Rc::new(test_refresh_hooks::RefreshProbe::new(
+            Arc::clone(&helper_published),
+            /* wait_for_publish */ true,
+        ));
+        test_refresh_hooks::arm(Rc::clone(&probe));
+
+        // Helper thread: spin until FLAG_MASTER_PARKED is GLOBALLY visible
+        // (Acquire), then publish exactly one message. If the flag became
+        // visible only after the refresh snapshotted reader_seq, the
+        // worker's FUTEX_WAKE would target a not-yet-armed waiter.
+        let ptr_addr = ptr as usize;
+        let helper_published_thread = Arc::clone(&helper_published);
+        let started = Arc::new(AtomicBool::new(false));
+        let started_thread = Arc::clone(&started);
+        let helper = std::thread::spawn(move || {
+            let region = ptr_addr as *mut u8;
+            let hdr = unsafe { W2mRingHeader::from_raw(region as *const u8) };
+            started_thread.store(true, Ordering::Release);
+            // Spin until the master publishes park intent.
+            let spin_deadline = Instant::now() + TIMEOUT;
+            while hdr.waiter_flags().load(Ordering::Acquire) & FLAG_MASTER_PARKED == 0 {
+                if Instant::now() >= spin_deadline {
+                    // Refresh never set the flag — let the main thread's
+                    // join+assert report the failure (helper_published
+                    // stays false → barrier on main thread also times out
+                    // via its own deadline below).
+                    return;
+                }
+                std::hint::spin_loop();
+            }
+            // Flag observed: publish one frame. send_encoded commits the
+            // write_cursor (Release) then bumps reader_seq.
+            let writer = W2mWriter::new(region, CAPACITY as u64);
+            let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
+            writer.send_encoded(sz, 1u32, |buf| {
+                ipc::encode_wire_into(
+                    buf, 0, 0, 0, 0,
+                    0u128, 0, 1u64, STATUS_OK, &[], None, None, None, None, &[],
+                );
+            });
+            helper_published_thread.store(true, Ordering::Release);
+        });
+
+        // Wait for the helper to be live before we drive refresh, so the
+        // flag→publish handshake is the only ordering left to resolve.
+        let start = Instant::now();
+        while !started.load(Ordering::Acquire) {
+            assert!(start.elapsed() < TIMEOUT, "helper thread never started");
+            std::hint::spin_loop();
+        }
+
+        // Build the reactor and wire up ONLY the state refresh needs
+        // (w2m receiver + the FutexWaitV storage slot) — deliberately NOT
+        // calling attach_w2m, so no drain loop, no SQE arm, no tick().
+        let reactor = Reactor::new(16).expect("reactor");
+        reactor.inner
+            .w2m
+            .set(W2mReceiver::new(vec![ptr]))
+            .ok()
+            .expect("w2m set");
+        *reactor.inner.futex_waitv_storage.borrow_mut() =
+            Some(vec![FutexWaitV::new()].into_boxed_slice());
+
+        // Drive the isolated refresh exactly once. Internally it publishes
+        // the flag, the helper observes it and publishes, the refresh's
+        // barrier waits for that publish, then the unread-data check runs.
+        let pending = reactor.refresh_futex_waitv_vals();
+
+        helper.join().expect("helper thread panicked");
+        test_refresh_hooks::disarm();
+
+        // The helper did publish (it observed the flag). If it timed out
+        // without seeing the flag, that itself is a lost-wake symptom.
+        assert!(
+            helper_published.load(Ordering::Acquire),
+            "helper never observed FLAG_MASTER_PARKED — flag was not published \
+             before the refresh completed (lost-wake symptom)",
+        );
+
+        // (1) The publish must be observed: refresh reports pending so the
+        // caller drains instead of arming a doomed FUTEX_WAITV.
+        assert!(
+            pending,
+            "refresh did not report pending despite an in-window publish — \
+             the caller would arm a doomed wait (lost wake)",
+        );
+
+        // (2) Order witness: the flag publish was stamped strictly before
+        // the reader_seq snapshot. This is the load-bearing teeth — it is
+        // what distinguishes correct ordering from the masked reorder.
+        let flag_seq = probe.flag_seq.load(Ordering::SeqCst);
+        let snap_seq = probe.snap_seq.load(Ordering::SeqCst);
+        assert!(flag_seq != 0 && snap_seq != 0, "probe stamps not recorded");
+        assert!(
+            flag_seq < snap_seq,
+            "FLAG_MASTER_PARKED must be published (stamp {flag_seq}) BEFORE \
+             reader_seq is snapshotted (stamp {snap_seq}); reordering them \
+             opens the lost-wake window",
+        );
+
         unsafe {
             libc::munmap(ptr as *mut libc::c_void, CAPACITY);
             libc::close(fd);

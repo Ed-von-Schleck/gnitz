@@ -16,8 +16,17 @@ use std::fs;
 
 fn temp_dir(name: &str) -> String {
     crate::util::raise_fd_limit_for_tests();
+    // Namespace the fixed path by user: /tmp is shared and sticky, so a dir
+    // left by a DIFFERENT user (mode 0755, owner-only-writable) would occupy
+    // the bare `gnitz_catalog_test_{name}` path forever — the start-of-test
+    // `remove_dir_all` cannot delete it (sticky bit) and `CatalogEngine::open`
+    // then fails EACCES creating subdirs under it. Per-user namespacing keeps
+    // each user on a path they own (so the remove-at-start self-cleans the
+    // previous same-user run — no turd accumulation), while never colliding
+    // across users. Falls back to the pid if $USER is unset.
+    let owner = std::env::var("USER").unwrap_or_else(|_| std::process::id().to_string());
     let path = std::env::temp_dir()
-        .join(format!("gnitz_catalog_test_{name}"))
+        .join(format!("gnitz_catalog_test_{owner}_{name}"))
         .to_str().unwrap().to_owned();
     let _ = fs::remove_dir_all(&path);
     path

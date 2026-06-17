@@ -3850,6 +3850,137 @@ mod tests {
         );
     }
 
+    // ── §3: Join must be emitted before the Integrate that writes the trace ──
+    //
+    // Within an epoch a DeltaTrace join reads `z⁻¹(I(B))` — the trace state
+    // BEFORE this epoch's delta is integrated. That old-state guarantee is
+    // enforced purely by compiled instruction order: the JoinDT instruction must
+    // appear before any Integrate instruction that writes a trace this epoch.
+    // build_plan emits in topological order, and the `Join → Integrate*` edge
+    // makes the join a strict predecessor — but nothing else asserts it, so a
+    // future reordering of the emit loop could silently invert it and feed the
+    // join post-delta state. Pin the program-order relation.
+
+    /// Index of the first `Instr` matching `pred` in a built program.
+    fn first_instr_pos(plan: &PlanBuildResult, pred: impl Fn(&crate::vm::Instr) -> bool) -> usize {
+        plan.vm.program.instructions.iter().position(pred)
+            .expect("program must contain the expected instruction")
+    }
+
+    #[test]
+    fn test_join_emitted_before_integrate_sink() {
+        // ScanDelta(10) --PORT_IN_A--> Join(DeltaTrace)(2) --PORT_IN--> IntegrateSink(3)
+        // ScanTrace(20) --PORT_TRACE-> Join(DeltaTrace)(2)
+        // The `Join → IntegrateSink` edge makes the join a topological predecessor
+        // of the sink Integrate, so its JoinDT instruction must precede the
+        // sink Integrate (which writes this epoch's output delta into view storage).
+        let schema = two_col_schema();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
+        nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 2, PORT_IN_A),  // delta side
+            (1, 2, PORT_TRACE), // trace side
+            (2, 3, PORT_IN),    // join feeds the sink
+        ];
+        let loaded = make_loaded(nodes, edges);
+
+        let ext = [
+            ExternalTable { table_id: 10, schema },
+            ExternalTable { table_id: 20, schema },
+        ];
+        let ordered = loaded.ordered.clone();
+        let plan = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext,
+            "", 0, 1,
+            Some(2), // bypass out_schema mismatch; sink_reg set by IntegrateSink
+            &[], vec![],
+        ).expect("build_plan must succeed for the ScanDelta→Join(DT)←ScanTrace→sink circuit");
+
+        // Exactly one JoinDT and one Integrate (the sink) are emitted.
+        let n_join = plan.vm.program.instructions.iter()
+            .filter(|i| matches!(i, crate::vm::Instr::JoinDT { .. })).count();
+        let n_int = plan.vm.program.instructions.iter()
+            .filter(|i| matches!(i, crate::vm::Instr::Integrate { .. })).count();
+        assert_eq!(n_join, 1, "expected exactly one JoinDT instruction, got {n_join}");
+        assert_eq!(n_int, 1, "expected exactly one (sink) Integrate instruction, got {n_int}");
+
+        let jpos = first_instr_pos(&plan, |i| matches!(i, crate::vm::Instr::JoinDT { .. }));
+        let ipos = first_instr_pos(&plan, |i| matches!(i, crate::vm::Instr::Integrate { .. }));
+        assert!(
+            jpos < ipos,
+            "JoinDT (program pos {jpos}) must be emitted before the sink Integrate \
+             (program pos {ipos}): the join reads z⁻¹(I) — trace state before this \
+             epoch's delta is integrated — and instruction order is what enforces it",
+        );
+    }
+
+    #[test]
+    fn test_join_emitted_before_integrate_trace() {
+        // Shared-source / chained-trace shape: the join's output is itself fed into
+        // an IntegrateTrace (a downstream operator's z⁻¹ history) AND the view sink.
+        //
+        // ScanDelta(10) --PORT_IN_A--> Join(DeltaTrace)(2) ─┬─PORT_IN─► IntegrateTrace(3)
+        // ScanTrace(20) --PORT_TRACE-> Join(DeltaTrace)(2)  └─PORT_IN─► IntegrateSink(4)
+        //
+        // Both Integrate* nodes are strict topological successors of the join, so
+        // its JoinDT instruction must precede BOTH Integrate instructions — i.e.
+        // it must precede the FIRST one. (IntegrateTrace writes a real trace table;
+        // IntegrateSink writes view storage with a null target.)
+        let schema = two_col_schema();
+        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+        let view_dir = format!("{}/join_before_int_trace_{}", base, std::process::id());
+        let _ = std::fs::remove_dir_all(&view_dir);
+        std::fs::create_dir_all(&view_dir).unwrap();
+
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(10));
+        nodes.insert(1, gnitz_wire::OpNode::ScanTrace(20));
+        nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+        nodes.insert(3, gnitz_wire::OpNode::IntegrateTrace);
+        nodes.insert(4, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![
+            (0, 2, PORT_IN_A),  // delta side
+            (1, 2, PORT_TRACE), // trace side
+            (2, 3, PORT_IN),    // join feeds an IntegrateTrace (downstream z⁻¹ history)
+            (2, 4, PORT_IN),    // join also feeds the view sink
+        ];
+        let loaded = make_loaded(nodes, edges);
+
+        let ext = [
+            ExternalTable { table_id: 10, schema },
+            ExternalTable { table_id: 20, schema },
+        ];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(
+            &loaded, &empty_rw(), &ordered, &ext,
+            &view_dir, 0, 1,
+            Some(2), // bypass out_schema mismatch; sink_reg set by IntegrateSink
+            &[], vec![],
+        );
+        let _ = std::fs::remove_dir_all(&view_dir);
+        let plan = result.expect("build_plan must succeed for the join→IntegrateTrace+sink circuit");
+
+        // Two Integrate instructions are emitted (the trace and the sink); the JoinDT
+        // must precede the first of them.
+        let n_int = plan.vm.program.instructions.iter()
+            .filter(|i| matches!(i, crate::vm::Instr::Integrate { .. })).count();
+        assert_eq!(n_int, 2, "expected two Integrate instructions (trace + sink), got {n_int}");
+
+        let jpos = first_instr_pos(&plan, |i| matches!(i, crate::vm::Instr::JoinDT { .. }));
+        let first_ipos = first_instr_pos(&plan, |i| matches!(i, crate::vm::Instr::Integrate { .. }));
+        assert!(
+            jpos < first_ipos,
+            "JoinDT (program pos {jpos}) must be emitted before the first Integrate \
+             (program pos {first_ipos}): the join reads z⁻¹(I) — trace state before \
+             this epoch's delta is integrated into any trace — and instruction order \
+             is what enforces it",
+        );
+    }
+
     // ── compute_join_shard_map covers ScanDelta (SQL-planner join pattern) ──
 
     /// compute_join_shard_map must find ScanDelta → Map(reindex) chains, not

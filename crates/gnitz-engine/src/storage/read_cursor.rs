@@ -1862,6 +1862,56 @@ mod tests {
         assert_eq!(rows[1], (5, 0, 1)); // payload=200
     }
 
+    /// Drain that READS THE PAYLOAD VALUE of each row (logical col 1, the
+    /// I64 payload), unlike `scan_all` which only captures PK + weight. The
+    /// payload read is what gives the root-adjacency pin its teeth: a PK-only
+    /// merge leaks an *extra* row whose payload value distinguishes it from
+    /// the survivor.
+    fn scan_all_with_val(cursor: &mut ReadCursor) -> Vec<(u64, i64, i64)> {
+        let mut rows = Vec::new();
+        while cursor.valid {
+            let p = cursor.col_ptr(1, 8);
+            assert!(!p.is_null(), "payload col_ptr null for a valid cursor row");
+            let val = i64::from_le_bytes(
+                unsafe { std::slice::from_raw_parts(p, 8) }.try_into().unwrap(),
+            );
+            rows.push((cursor.current_key as u64, cursor.current_weight, val));
+            cursor.advance();
+        }
+        rows
+    }
+
+    /// PIN — root adjacency of equal-(PK, payload) rows across cursor sources.
+    /// Three single-row batches, all PK=5: b1/b3 carry the *same* payload
+    /// (val=100) with opposite weights, b2 carries a different payload
+    /// (val=200) and sits between them in source order. Each batch is
+    /// (PK, payload)-sorted, but the matching val=100 rows are NOT adjacent in
+    /// source order.
+    ///
+    /// The cursor's N-way merge heap MUST order by (PK, payload) so the two
+    /// val=100 rows reach the fold root consecutively and their +1/-1 weights
+    /// cancel via ghost elimination; only val=200 survives. A PK-only heap
+    /// `less` (dropping the payload tiebreak) leaves the three same-PK rows
+    /// unordered among themselves, the fold breaks on the first payload
+    /// mismatch, and the +1/-1 pair never folds — surfacing a spurious row.
+    /// We assert on the PAYLOAD VALUE (via `scan_all_with_val`) so the leaked
+    /// row cannot hide behind a matching PK/weight.
+    #[test]
+    fn test_cursor_same_pk_nonadjacent_payload_fold() {
+        let schema = make_schema_i64();
+        let b1 = make_batch(&[(5, 1, 100)]);
+        let b2 = make_batch(&[(5, 1, 200)]);
+        let b3 = make_batch(&[(5, -1, 100)]);
+
+        let mut cursor = create_read_cursor(&[b1, b2, b3], &[], schema);
+        let rows = scan_all_with_val(&mut cursor);
+        assert_eq!(
+            rows,
+            vec![(5, 1, 200)],
+            "val=100 +1/-1 pair must ghost-cancel; only (pk=5, w=1, val=200) survives"
+        );
+    }
+
     #[test]
     fn test_weight_accumulation_across_sources() {
         let schema = make_schema_i64();

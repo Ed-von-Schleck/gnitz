@@ -461,6 +461,74 @@ fn index_key_spec_skips_any_null_column() {
         "NULL in the second indexed column ⇒ skipped");
 }
 
+/// `key_bytes` reuses the caller's `PkBuf` scratch across specs of DIFFERENT
+/// widths. When a NARROWER span (single U64 → 8 bytes) reuses a buffer that a
+/// WIDER span (composite U64,U64 → 16 bytes) just filled, the high bytes the
+/// wide write left in `bytes[8..16]` MUST be re-zeroed: `PkBuf`'s "tail past
+/// `len` is zero" invariant is what makes `padded(width)` sound and what lets
+/// the single-PK fast path widen `bytes[..len]` to a `u128`. A stale tail would
+/// silently corrupt any wider-stride read of this narrowed key.
+#[test]
+fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
+    // Owner: PK U64; two non-null U64 payload columns.
+    let owner = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ],
+        &[0],
+    );
+    // One row whose col2 carries distinct all-nonzero high bytes, so the wide
+    // span writes nonzero bytes into the trailing 8 bytes the narrow span must
+    // then reclaim. col1 is arbitrary (it never lands in the narrow span).
+    const COL1: u64 = 0xAABB_CCDD_EEFF_0011;
+    const COL2: u64 = 0x1122_3344_5566_7788;
+    let mut batch = Batch::with_schema(owner, 1);
+    unsafe {
+        batch.append_row_simple(
+            1, 1, 0,
+            &[COL1 as i64, COL2 as i64], &[0, 0],
+            &[std::ptr::null(), std::ptr::null()], &[0, 0]);
+    }
+    let mb = batch.as_mem_batch();
+
+    // WIDE composite span over (col1, col2): two promoted U64 columns ⇒ 16 bytes.
+    let wide_cols = [1u32, 2];
+    let wide_idx = make_index_schema(&wide_cols, &owner).expect("wide index schema");
+    let wide = IndexKeySpec::new(&wide_cols, &owner, &wide_idx);
+    assert_eq!(wide.key_size(), 16, "two U64 index columns ⇒ 16-byte span");
+
+    // NARROW span over (col2) alone: one promoted U64 column ⇒ 8 bytes.
+    let narrow_cols = [2u32];
+    let narrow_idx = make_index_schema(&narrow_cols, &owner).expect("narrow index schema");
+    let narrow = IndexKeySpec::new(&narrow_cols, &owner, &narrow_idx);
+    assert_eq!(narrow.key_size(), 8, "single U64 index column ⇒ 8-byte span");
+
+    // ONE reused scratch buffer: wide first, then narrow.
+    let mut keybuf = PkBuf::empty(0);
+
+    assert!(wide.key_bytes(&mb, 0, &mut keybuf), "wide row is indexed");
+    assert_eq!(keybuf.len, 16);
+    // The wide write dirtied the trailing 8 bytes with col2's big-endian image —
+    // the precondition that gives the narrowing tail-zero step teeth.
+    assert_eq!(&keybuf.bytes[8..16], &COL2.to_be_bytes(),
+        "wide span packs col2 into bytes[8..16]");
+
+    assert!(narrow.key_bytes(&mb, 0, &mut keybuf), "narrow row is indexed");
+    // The narrow span is col2's 8-byte OPK, and ONLY 8 bytes are meaningful.
+    assert_eq!(keybuf.len, 8, "narrow span is one U64 ⇒ len == 8");
+    assert_eq!(keybuf.pk_bytes(), &COL2.to_be_bytes(),
+        "narrow span content is col2's big-endian OPK");
+    // The invariant under test: the tail the wider write left MUST be re-zeroed.
+    assert!(keybuf.bytes[8..].iter().all(|&b| b == 0),
+        "narrowing must re-zero every byte past len — stale wide-write tail leaked");
+    // ... and `padded(16)` (which the invariant makes sound) reads that tail as
+    // zero, so this narrow key widened to a 16-byte stride has a zero suffix.
+    assert_eq!(&keybuf.padded(16)[8..16], &[0u8; 8],
+        "padded(16) suffix of a narrowed key must be zero");
+}
+
 // ---------------------------------------------------------------------------
 // Merge accounting: verdict + all-or-nothing seed
 // ---------------------------------------------------------------------------

@@ -1085,6 +1085,45 @@ mod tests {
         assert_eq!((out.get_pk(0) as u64), 1);
     }
 
+    /// Pin: the GENERIC `RowCmp` arm (`compare_rows`, German-string comparison)
+    /// must drive `filter_join_dd_with_payload_inner`'s shared-PK (PK, payload)
+    /// sub-merge. A `(U64 pk, STRING payload)` schema resolves to
+    /// `PayloadCmpKind::Generic`, so `with_payload_cmp!` threads the
+    /// string-aware comparator into the anti-join.
+    ///
+    /// A = [(1,1,"drop"), (1,1,"keep")] (payload-sorted: "drop" < "keep"),
+    /// B = [(1,1,"drop")]. The anti-join (EXCEPT) excludes an A row only when B
+    /// has a *matching (PK, payload)*: "drop" matches and is dropped; "keep" has
+    /// no match and survives. The fixed-int comparator treats the German-string
+    /// structs as raw 8-byte integers — it cannot tell "drop" from "keep"
+    /// correctly, so it either suppresses the wrong row (dropping "keep") or
+    /// fails to suppress "drop", changing the surviving string.
+    #[test]
+    fn test_anti_join_dd_generic_rowcmp_same_pk_string() {
+        let schema = make_schema_u64_string();
+        // Guard: the schema must select the GENERIC comparator, else this pin
+        // would not exercise the string-aware arm.
+        assert_eq!(
+            schema.payload_cmp,
+            crate::schema::PayloadCmpKind::Generic,
+            "U64+STRING schema must use the GENERIC payload comparator",
+        );
+
+        // Rows supplied in (PK, payload) order ("drop" < "keep") so the
+        // sorted+consolidated flags `make_batch_str` sets are truthful.
+        let a = make_batch_str(&schema, &[(1, 1, "drop"), (1, 1, "keep")]);
+        let b = make_batch_str(&schema, &[(1, 1, "drop")]);
+        let out = op_anti_join_delta_delta(&a, &b, &schema);
+
+        assert_eq!(out.count, 1, "only the unmatched A row survives EXCEPT");
+        assert_eq!(out.get_pk(0) as u64, 1);
+        // The surviving row is "keep" — "drop" matched B and was excluded.
+        assert_eq!(
+            read_str_payload(&out, 0, 0), "keep",
+            "generic string compare must keep \"keep\" and drop \"drop\"",
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Semi-join DD tests
     // -----------------------------------------------------------------------

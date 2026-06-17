@@ -891,6 +891,61 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// PIN — root adjacency of equal-(PK, payload) rows across shards.
+    /// Three single-row shards, all PK=1, two of which share the *exact*
+    /// payload (0,100) with opposite weights; the third carries a different
+    /// payload (0,200). Each shard is internally (PK, payload)-sorted (one
+    /// row), but across shards the matching payload-100 rows are NOT adjacent
+    /// in shard order — they bracket the payload-200 row.
+    ///
+    /// The k-way heap MUST order by (PK, payload) so the two payload-100 rows
+    /// reach the fold root consecutively and cancel; the payload-200 row
+    /// survives. A PK-only heap `less` (dropping the payload tiebreak) leaves
+    /// the three same-PK rows unordered among themselves, so `drive_merge`'s
+    /// fold breaks on the first payload mismatch and the +1/-1 payload-100
+    /// pair never sums — leaking a spurious row.
+    #[test]
+    fn test_compact_same_pk_nonadjacent_payload_interleave() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/compact_test_3col_nonadjacent");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let schema = make_3col_schema();
+
+        // s1: (pk=1, +1, payload (0,100))
+        let s1 = dir.join("s1.db");
+        write_3col_shard(s1.to_str().unwrap(), &[(1, 1, 0, 100)], &schema);
+
+        // s2: (pk=1, +1, payload (0,200)) — different payload, between the
+        // two payload-100 rows in shard order.
+        let s2 = dir.join("s2.db");
+        write_3col_shard(s2.to_str().unwrap(), &[(1, 1, 0, 200)], &schema);
+
+        // s3: (pk=1, -1, payload (0,100)) — retracts the s1 row.
+        let s3 = dir.join("s3.db");
+        write_3col_shard(s3.to_str().unwrap(), &[(1, -1, 0, 100)], &schema);
+
+        let output = dir.join("merged.db");
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cs3 = std::ffi::CString::new(s3.to_str().unwrap()).unwrap();
+        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
+
+        let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
+        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+
+        let rows = read_3col_shard(output.to_str().unwrap(), &schema);
+        assert_eq!(
+            rows.len(),
+            1,
+            "payload-100 +1/-1 pair must cancel; only payload-200 survives, got {rows:?}"
+        );
+        assert_eq!(rows[0], (1, 1, 0, 200));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Multiple groups with interleaved shards: ensures the pending-group
     /// algorithm handles group boundaries correctly across PKs.
     #[test]

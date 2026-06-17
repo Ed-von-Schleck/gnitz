@@ -333,6 +333,105 @@ fn test_int_to_float() {
 }
 
 #[test]
+fn test_unsigned_opcode_swap_and_eval() {
+    // U64-typed schema: pk=col0(U64), payload=col1(U64). resolve_column_indices
+    // tracks col1's register as U64 and must swap the signed comparison /
+    // division / cast opcodes to their unsigned forms (EXPR_UCMP_GT / EXPR_UDIV
+    // / EXPR_UMOD / EXPR_UINT_TO_FLOAT). eval_batch ends in `_ => {}`, so a
+    // mis-routed or removed U-arm is silent for values >= 2^63 — this pin makes
+    // it loud by both (1) asserting the swap fired in prog.code and (2) running
+    // eval on v=u64::MAX and asserting the UNSIGNED result, which diverges from
+    // the signed interpretation that all other tests (BIGINT < 2^63) exercise.
+    let schema = make_schema(0, &[8, 8]);
+
+    // v = u64::MAX (bit pattern 0xFFFF...FF, i.e. -1 as i64); divisor const = 2.
+    // Unsigned: MAX > 100, MAX/2 = 9223372036854775807, MAX%2 = 1.
+    // Signed:   -1 < 100 (false), -1/2 = 0,             -1%2 = -1.
+    let v_bits = u64::MAX as i64; // == -1i64
+    let batch = make_int_batch(&schema, &[(1, 1, 0, &[v_bits])]);
+    let mb = batch.as_mem_batch();
+
+    // (a) col1 > 100  → EXPR_CMP_GT must swap to EXPR_UCMP_GT.
+    let code = vec![
+        EXPR_LOAD_COL_INT, 0, 1, 0, // r0 = col1 (U64)
+        EXPR_LOAD_CONST, 1, 100, 0, // r1 = 100
+        EXPR_CMP_GT, 2, 0, 1,       // r2 = (r0 > r1)
+    ];
+    let prog_gt = make_prog(&schema, code, 3, 2, vec![]);
+    // Instruction 2 (offset 8) is the comparison opcode after resolution.
+    assert_eq!(
+        prog_gt.code[8], EXPR_UCMP_GT,
+        "U64 operand must swap CMP_GT → UCMP_GT (got opcode {})",
+        prog_gt.code[8],
+    );
+    let (val, is_null) = eval_predicate(&prog_gt, &mb, 0);
+    assert!(!is_null);
+    assert_eq!(
+        val, 1,
+        "u64::MAX > 100 is TRUE under unsigned compare; signed (-1 > 100) is false",
+    );
+
+    // (b) col1 / 2  → EXPR_INT_DIV must swap to EXPR_UDIV.
+    let code = vec![
+        EXPR_LOAD_COL_INT, 0, 1, 0,
+        EXPR_LOAD_CONST, 1, 2, 0,
+        EXPR_INT_DIV, 2, 0, 1,
+    ];
+    let prog_div = make_prog(&schema, code, 3, 2, vec![]);
+    assert_eq!(
+        prog_div.code[8], EXPR_UDIV,
+        "U64 operand must swap INT_DIV → UDIV (got opcode {})",
+        prog_div.code[8],
+    );
+    let (val, is_null) = eval_predicate(&prog_div, &mb, 0);
+    assert!(!is_null);
+    assert_eq!(
+        val, 9223372036854775807,
+        "u64::MAX / 2 == 9223372036854775807 (unsigned); signed -1/2 would be 0",
+    );
+
+    // (c) col1 % 2  → EXPR_INT_MOD must swap to EXPR_UMOD.
+    let code = vec![
+        EXPR_LOAD_COL_INT, 0, 1, 0,
+        EXPR_LOAD_CONST, 1, 2, 0,
+        EXPR_INT_MOD, 2, 0, 1,
+    ];
+    let prog_mod = make_prog(&schema, code, 3, 2, vec![]);
+    assert_eq!(
+        prog_mod.code[8], EXPR_UMOD,
+        "U64 operand must swap INT_MOD → UMOD (got opcode {})",
+        prog_mod.code[8],
+    );
+    let (val, is_null) = eval_predicate(&prog_mod, &mb, 0);
+    assert!(!is_null);
+    assert_eq!(
+        val, 1,
+        "u64::MAX % 2 == 1 (unsigned); signed -1 % 2 would be -1",
+    );
+
+    // (d) CAST col1 to float  → EXPR_INT_TO_FLOAT must swap to EXPR_UINT_TO_FLOAT.
+    let code = vec![
+        EXPR_LOAD_COL_INT, 0, 1, 0,  // r0 = col1 (U64)
+        EXPR_INT_TO_FLOAT, 1, 0, 0,  // r1 = (f64) r0
+    ];
+    let prog_cast = make_prog(&schema, code, 2, 1, vec![]);
+    // Instruction 1 (offset 4) is the cast opcode after resolution.
+    assert_eq!(
+        prog_cast.code[4], EXPR_UINT_TO_FLOAT,
+        "U64 operand must swap INT_TO_FLOAT → UINT_TO_FLOAT (got opcode {})",
+        prog_cast.code[4],
+    );
+    let (val, is_null) = eval_predicate(&prog_cast, &mb, 0);
+    assert!(!is_null);
+    let f = bits_to_float(val);
+    assert_eq!(
+        f, u64::MAX as f64,
+        "u64::MAX cast to float is ~1.8e19 (unsigned); signed (-1) would be -1.0",
+    );
+    assert!(f > 0.0, "unsigned cast of u64::MAX must be a large positive float");
+}
+
+#[test]
 fn test_emit_with_targets() {
     let schema = make_schema(0, &[8, 9, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[10, 20])]);

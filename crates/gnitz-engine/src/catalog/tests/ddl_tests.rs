@@ -668,3 +668,99 @@ fn test_view_backfill_chunked_matches_unchunked() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── drop_cascade_broadcasts_children_before_parents ──────────────────
+// fire_hooks enqueues a table retraction's cascade children (IDX/COL)
+// BEFORE the parent TABLE row: cascade_retract_indices / _columns call
+// `submit` from inside hook_table_register, each pushing to
+// pending_broadcasts, and the top-level TABLE batch is pushed only after
+// fire_hooks returns (CatalogDeltaSink::submit). The executor forwards the
+// queue in order, so workers see children → parent — the order in which a
+// drop's dependent rows can be safely applied.
+//
+// This pins ORDER, which end-state cache assertions cannot see: a reorder
+// that appends the parent first nets to the same in-process catalog state
+// yet ships an unsafe broadcast order to workers.
+#[test]
+fn drop_cascade_broadcasts_children_before_parents() {
+    let dir = temp_dir("drop_cascade_broadcast_order");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // Table with one (non-unique) secondary index.
+    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    engine.create_index("public.t", &["val"], false).unwrap();
+
+    // Clear the broadcasts accumulated by create_table + create_index.
+    let _ = engine.drain_pending_broadcasts();
+
+    // Submit the table retraction; its -1 fires hook_table_register, whose
+    // retract branch cascades the owned index (IDX) and columns (COL).
+    engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
+
+    // Collect the broadcast family-id sequence.
+    let tids: Vec<i64> = engine.drain_pending_broadcasts()
+        .iter().map(|(tab, _)| *tab).collect();
+
+    let pos = |id: i64| tids.iter().position(|&t| t == id);
+    let idx_pos = pos(IDX_TAB_ID)
+        .unwrap_or_else(|| panic!("IDX_TAB retraction must be broadcast; seq={tids:?}"));
+    let col_pos = pos(COL_TAB_ID)
+        .unwrap_or_else(|| panic!("COL_TAB retraction must be broadcast; seq={tids:?}"));
+    let tab_pos = pos(TABLE_TAB_ID)
+        .unwrap_or_else(|| panic!("TABLE_TAB retraction must be broadcast; seq={tids:?}"));
+
+    // Children strictly precede the parent table row.
+    assert!(idx_pos < tab_pos,
+        "secondary-index retraction must broadcast before its owner table: seq={tids:?}");
+    assert!(col_pos < tab_pos,
+        "column retraction must broadcast before its owner table: seq={tids:?}");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── table_retract_applies_qname_before_id ────────────────────────────
+// Within the SysFamily::Table arm of fire_hooks, apply_entity_by_qname
+// fires BEFORE apply_entity_by_id. That order is load-bearing on retract:
+// apply_entity_by_qname reconstructs the qualified name from entity_by_id
+// (still present) to remove the entity_by_qname entry. Reverse the two and
+// the -1 reads an already-removed entity_by_id, leaks a stale
+// entity_by_qname[qn] → old tid, and the recreate is then rejected by the
+// qname-uniqueness guard (or resolves to the wrong tid).
+//
+// End-state cache assertions on a single create/drop miss this: both orders
+// leave the same caches. The teeth show only across a drop + same-name
+// recreate.
+#[test]
+fn table_retract_applies_qname_before_id() {
+    let dir = temp_dir("table_retract_qname_before_id");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), i64_col_def("val")];
+
+    // Create, then drop, a table named `public.t`.
+    let tid1 = engine.create_table("public.t", &cols, &[0], true).unwrap();
+    assert_eq!(engine.caches.entity_by_qname.get("public.t").copied(), Some(tid1));
+    engine.drop_table("public.t").unwrap();
+
+    // The drop must have cleared the qname mapping; a reversed qname/id
+    // retraction order leaves it pointing at the dropped tid.
+    assert!(!engine.caches.entity_by_qname.contains_key("public.t"),
+        "drop must clear entity_by_qname; a reversed retraction order leaks a stale mapping");
+
+    // Recreate under the same qualified name. A leaked stale mapping would
+    // make the qname-uniqueness guard reject this create.
+    let recreate = engine.create_table("public.t", &cols, &[0], true);
+    assert!(recreate.is_ok(),
+        "recreate of a dropped same-name table must succeed; a stale qname mapping blocks it: {recreate:?}");
+    let tid2 = recreate.unwrap();
+    assert_ne!(tid1, tid2, "recreated table must get a fresh tid");
+
+    // entity_by_qname must resolve to the NEW tid.
+    assert_eq!(engine.caches.entity_by_qname.get("public.t").copied(), Some(tid2),
+        "entity_by_qname must resolve to the NEW tid after drop + recreate");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
