@@ -178,25 +178,9 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Optio
     }
     let stride = pk_sz / n;
     let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
-    let mut pks: Vec<u128> = if stride > 16 {
-        // Compound PK region wider than a u128: collapse the row's OPK
-        // bytes with the same xxh3-64 used by partition_for_pk_bytes's
-        // wide branch. The filter wants the full 64 bits of entropy
-        // zero-extended to u128 (NOT the top-8-bit bucket index that
-        // partition_for_pk_bytes derives from the same checksum).
-        pk_bytes
-            .chunks_exact(stride)
-            .map(|c| crate::foundation::xxh::checksum(c) as u128)
-            .collect()
-    } else {
-        // stride <= 16: the row's OPK bytes are big-endian, so right-align
-        // them into a u128 via `widen_pk_be` — identical to the value the
-        // narrow probe derives and to partition_for_pk_bytes's narrow branch.
-        pk_bytes
-            .chunks_exact(stride)
-            .map(|c| gnitz_wire::widen_pk_be(c, stride))
-            .collect()
-    };
+    // One fingerprint per row's OPK region (`stride` bytes); `xor8::fingerprint`
+    // owns the narrow/wide derivation that the probe side must match exactly.
+    let mut pks: Vec<u128> = pk_bytes.chunks_exact(stride).map(xor8::fingerprint).collect();
     // The XOR filter's hypergraph peeling fails (hang/panic) on duplicate
     // fingerprints. The PK region is sorted, so rows that share a PK but
     // differ in payload (valid under (PK, payload) element identity) produce

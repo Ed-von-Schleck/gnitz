@@ -26,7 +26,7 @@ pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
 /// so the client's loop termination — "stop on no FLAG_CONTINUATION" — still works).
 pub(crate) const FLAG_SCAN_LAST: u64 = 1 << 53;
 
-// WAL block header field offsets (matches storage/wal.rs; duplicated here to
+// WAL block header field offsets (matches storage/lsm/wal.rs; duplicated here to
 // avoid cross-module coupling between runtime and storage internals).
 const WAL_OFF_COUNT:       usize = 12;
 pub(crate) const WAL_OFF_SIZE: usize = 16;

@@ -1,0 +1,330 @@
+//! Hot per-row accessors for [`MappedShard`]: the self-describing
+//! [`RegionView`] reads (`get_pk_bytes`, `get_weight`, `get_null_word`,
+//! `get_col_ptr`, …), the XOR8 probe, the OPK binary-search helpers, and the
+//! bulk `*_owned_batch` materializers. All `#[inline]`; the comparators read
+//! every stride/offset straight off the mapped regions.
+
+use std::ptr;
+
+use crate::foundation::codec::{read_i64_le, read_u64_le};
+use super::super::xor8;
+use super::{MappedShard, RegionView};
+
+impl MappedShard {
+    #[inline]
+    pub(crate) fn data(&self) -> &[u8] {
+        self.mmap.as_slice()
+    }
+
+    // The value accessor: production reads PK regions as raw OPK bytes
+    // (`get_pk_bytes`); only tests recover the native value via `get_pk`.
+    #[cfg(test)]
+    #[inline(always)]
+    pub(crate) fn get_pk(&self, row: usize) -> u128 {
+        let stride = self.pk_stride as usize;
+        let data = self.data();
+        match &self.pk {
+            RegionView::Raw { offset, .. } => {
+                let src = &data[offset + row * stride..offset + row * stride + stride];
+                gnitz_wire::widen_pk_be(src, stride)
+            }
+            // The Constant region stores the OPK bytes left-aligned at
+            // `value[..stride]`. `widen_pk_be` right-aligns the active bytes,
+            // recovering the native unsigned value (sign-flipped for signed).
+            RegionView::Constant { value, .. } => gnitz_wire::widen_pk_be(&value[..stride], stride),
+            RegionView::TwoValue { .. } => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        let stride = self.pk_stride as usize;
+        let data = self.data();
+        match &self.pk {
+            RegionView::Raw { offset, .. } => {
+                &data[offset + row * stride
+                    ..offset + row * stride + stride]
+            }
+            // value is [u8; 16]; stride <= 16 is guaranteed by the constructor.
+            // When RegionView::Constant is widened to hold larger values,
+            // this arm must be updated alongside it.
+            RegionView::Constant { value, .. } => &value[..stride],
+            RegionView::TwoValue { .. } => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn get_weight(&self, row: usize) -> i64 {
+        match &self.weight {
+            RegionView::Raw { offset, .. } => read_i64_le(self.data(), offset + row * 8),
+            RegionView::Constant { value, .. } => i64::from_le_bytes(value[..8].try_into().unwrap()),
+            RegionView::TwoValue { value_a, value_b, bitvec_off } => {
+                let byte = self.data()[bitvec_off + row / 8];
+                if (byte >> (row % 8)) & 1 == 0 { *value_a } else { *value_b }
+            }
+        }
+    }
+
+    /// Advance `pos` past any ghost (weight == 0) rows. Returns the first
+    /// position at or after `pos` whose weight is non-zero, or `self.count`
+    /// if no such row exists.
+    #[inline]
+    pub fn next_non_ghost(&self, mut pos: usize) -> usize {
+        if !self.has_ghosts {
+            return pos;
+        }
+        while pos < self.count && self.get_weight(pos) == 0 {
+            pos += 1;
+        }
+        pos
+    }
+
+    #[inline]
+    pub fn get_null_word(&self, row: usize) -> u64 {
+        match &self.null_bmp {
+            RegionView::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
+            RegionView::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
+            RegionView::TwoValue { .. } => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn get_col_ptr(&self, row: usize, payload_col_idx: usize, col_size: usize) -> &[u8] {
+        match &self.col_regions[payload_col_idx] {
+            RegionView::Raw { offset, size } => {
+                let start = offset + row * col_size;
+                assert!(
+                    start + col_size <= offset + size,
+                    "get_col_ptr out of bounds: row={} payload_col={} col_size={} region_end={}",
+                    row, payload_col_idx, col_size, offset + size,
+                );
+                &self.data()[start..start + col_size]
+            }
+            RegionView::Constant { value, .. } => &value[..col_size],
+            RegionView::TwoValue { .. } => unreachable!(),
+        }
+    }
+
+    /// Get a raw pointer to a column value, indexed by *logical* column index.
+    /// For the PK column, returns a pointer into the pk region (16 bytes).
+    /// Returns null for out-of-range column indices.
+    #[inline]
+    pub fn col_ptr_by_logical(&self, row: usize, col_idx: usize, col_size: usize) -> *const u8 {
+        if col_idx >= self.col_to_payload.len() {
+            return ptr::null();
+        }
+        let payload_idx = self.col_to_payload[col_idx];
+        let base = self.mmap.ptr;
+        if payload_idx == usize::MAX {
+            // PK column (pk_stride bytes)
+            match &self.pk {
+                RegionView::Raw { offset, .. } => {
+                    let stride = self.pk_stride as usize;
+                    let off = offset + row * stride;
+                    if off + stride > self.mmap.len {
+                        return ptr::null();
+                    }
+                    return unsafe { base.add(off) };
+                }
+                RegionView::Constant { offset, .. } => {
+                    return unsafe { base.add(*offset) };
+                }
+                RegionView::TwoValue { .. } => unreachable!(),
+            }
+        }
+        if payload_idx >= self.col_regions.len() {
+            return ptr::null();
+        }
+        match &self.col_regions[payload_idx] {
+            RegionView::Raw { offset, size } => {
+                let off = offset + row * col_size;
+                if off + col_size > offset + size {
+                    return ptr::null();
+                }
+                unsafe { base.add(off) }
+            }
+            RegionView::Constant { offset, .. } => {
+                unsafe { base.add(*offset) }
+            }
+            RegionView::TwoValue { .. } => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub fn blob_slice(&self) -> &[u8] {
+        &self.data()[self.blob_off..self.blob_off + self.blob_len]
+    }
+
+    #[inline]
+    pub fn blob_ptr(&self) -> *const u8 {
+        unsafe { self.mmap.ptr.add(self.blob_off) }
+    }
+
+    pub fn has_xor8(&self) -> bool {
+        self.xor8_filter.is_some()
+    }
+
+    pub fn xor8_may_contain(&self, key: u128) -> bool {
+        match &self.xor8_filter {
+            Some(filter) => xor8::may_contain(filter, key),
+            None => true,
+        }
+    }
+
+    /// Test-only u128 oracle that cross-checks `find_lower_bound_bytes` (the
+    /// production path): binary search for the first row where PK >= key.
+    /// Returns `count` if no such row exists.
+    #[cfg(test)]
+    pub(crate) fn find_lower_bound(&self, key: u128) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.get_pk(mid) < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// First row whose OPK bytes are `>= key`. After the OPK-at-rest flip this
+    /// is a raw `memcmp` binary search — correct at every PK width with no
+    /// schema dependency. `key` must be exactly `pk_stride` OPK bytes.
+    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
+        super::super::columnar::binary_lower_bound(0, self.count, key, &|i| self.get_pk_bytes(i))
+    }
+
+    /// Galloping forward lower bound seeded at `hint` (the caller's live
+    /// position): `O(log gap)` when the boundary is just ahead, `O(1)` when it
+    /// IS the hint, never worse than `find_lower_bound_bytes`. Byte-identical
+    /// body to `Batch::advance_to` — same `count`/`get_pk_bytes` contract. `key`
+    /// must be exactly `pk_stride` OPK bytes.
+    pub fn advance_to(&self, key: &[u8], hint: usize) -> usize {
+        super::super::columnar::gallop_lower_bound_bytes(self.count, key, hint, |i| self.get_pk_bytes(i))
+    }
+
+    /// Test-only u128 oracle (exact-match point lookup) cross-checking the
+    /// production byte path. Returns the row index, or `None` if absent.
+    #[cfg(test)]
+    pub(crate) fn find_row_index(&self, key: u128) -> Option<usize> {
+        let idx = self.find_lower_bound(key);
+        if idx < self.count && self.get_pk(idx) == key {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Bulk-copy a contiguous slice of rows into an Batch.
+    /// Bypasses per-row cursor overhead entirely — one memcpy per column.
+    #[allow(clippy::uninit_vec)]
+    pub(crate) fn slice_to_owned_batch(
+        &self,
+        start: usize,
+        row_count: usize,
+        schema: &crate::schema::SchemaDescriptor,
+    ) -> super::super::batch::Batch {
+        use super::super::batch::{compute_offsets, strides_from_schema, Batch};
+
+        if row_count == 0 {
+            return Batch::empty_with_schema(schema);
+        }
+
+        let shard = self.data();
+
+        // Compute the final columnar layout before allocating anything.
+        let (strides, num_regions_u8) = strides_from_schema(schema);
+        let nr = num_regions_u8 as usize; // 4 + npc
+        let (offsets, total_size) = compute_offsets(&strides, nr, row_count);
+
+        // One allocation for all fixed-stride columnar data.
+        let mut data = super::super::batch_pool::acquire_buf();
+        data.clear();
+        data.reserve(total_size);
+        unsafe { data.set_len(total_size) };
+
+        // Write each region directly into its final slice — no intermediate buffers.
+        let expand_into = |region: &RegionView, stride: usize, dst: &mut [u8]| {
+            match region {
+                RegionView::Raw { offset, .. } => {
+                    let begin = offset + start * stride;
+                    dst.copy_from_slice(&shard[begin..begin + row_count * stride]);
+                }
+                RegionView::Constant { value, .. } => {
+                    for chunk in dst.chunks_exact_mut(stride) {
+                        chunk.copy_from_slice(&value[..stride]);
+                    }
+                }
+                RegionView::TwoValue { value_a, value_b, bitvec_off } => {
+                    let a_bytes = value_a.to_le_bytes();
+                    let b_bytes = value_b.to_le_bytes();
+                    for i in 0..row_count {
+                        let row = start + i;
+                        let bit = (shard[bitvec_off + row / 8] >> (row % 8)) & 1;
+                        let src = if bit == 0 { &a_bytes[..stride] } else { &b_bytes[..stride] };
+                        dst[i * stride..(i + 1) * stride].copy_from_slice(src);
+                    }
+                }
+            }
+        };
+
+        let pk_stride = self.pk_stride as usize;
+        let sz8 = row_count * 8;
+        expand_into(&self.pk, pk_stride, &mut data[offsets[0]..][..row_count * pk_stride]);
+        expand_into(&self.weight,   8,  &mut data[offsets[1]..][..sz8]);
+        expand_into(&self.null_bmp, 8,  &mut data[offsets[2]..][..sz8]);
+
+        for (pi, _ci, col) in schema.payload_columns() {
+            let stride = col.size() as usize;
+            let off = offsets[3 + pi];
+            let sz = row_count * stride;
+            expand_into(&self.col_regions[pi], stride, &mut data[off..][..sz]);
+        }
+
+        // Blob: one allocation, copy entire blob region (string offsets stay valid).
+        let blob = if self.blob_len > 0 {
+            let src = &shard[self.blob_off..self.blob_off + self.blob_len];
+            let mut buf = super::super::batch_pool::acquire_buf();
+            buf.clear();
+            buf.reserve(self.blob_len);
+            unsafe { buf.set_len(self.blob_len) };
+            buf.copy_from_slice(src);
+            buf
+        } else {
+            Vec::new()
+        };
+
+        let mut batch = unsafe {
+            Batch::from_prebuilt(data, blob, strides, offsets, num_regions_u8, row_count)
+        };
+        batch.sorted = true;
+        batch.consolidated = true;
+        batch.set_schema(*schema);
+        batch
+    }
+
+    /// Bulk-copy all rows into an Batch.
+    pub(crate) fn to_owned_batch(
+        &self,
+        schema: &crate::schema::SchemaDescriptor,
+    ) -> super::super::batch::Batch {
+        self.slice_to_owned_batch(0, self.count, schema)
+    }
+}
+
+impl super::super::columnar::ColumnarSource for MappedShard {
+    #[inline]
+    fn get_null_word(&self, row: usize) -> u64 {
+        self.get_null_word(row)
+    }
+    #[inline]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        self.get_col_ptr(row, payload_col, col_size)
+    }
+    #[inline]
+    fn blob_slice(&self) -> &[u8] {
+        self.blob_slice()
+    }
+}

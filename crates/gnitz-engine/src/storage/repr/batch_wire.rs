@@ -15,8 +15,8 @@ use super::batch::{
     Batch, MAX_BATCH_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, pk_stride,
 };
 use super::merge::MemBatch;
-use super::super::shard_file;
-use super::super::wal;
+use super::super::lsm::shard_file;
+use super::super::lsm::wal;
 use super::super::error::StorageError;
 use crate::schema::SchemaDescriptor;
 

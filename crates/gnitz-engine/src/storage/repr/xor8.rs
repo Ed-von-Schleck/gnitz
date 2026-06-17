@@ -4,6 +4,28 @@ use xorf::{Filter, Xor8};
 const MAGIC: &[u8; 4] = b"GXF1";
 const HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + seed + block_length + fp_count
 
+/// Derive the XOR8 membership fingerprint for one PK's OPK byte region.
+///
+/// Narrow keys (`≤ 16` OPK bytes) right-align their order-preserving big-endian
+/// bytes into a `u128` via `widen_pk_be`; wide keys (`> 16` bytes — a compound
+/// PK past `u128`) collapse to the full 64-bit xxh3 checksum, zero-extended. The
+/// filter is keyed by the full logical PK, so this keeps the entire entropy —
+/// it is deliberately *not* `partition_for_pk_bytes`, which reduces the same two
+/// hashes to a top-8-bit bucket index.
+///
+/// This is the single derivation the build side ([`build`], via
+/// `build_xor8_from_pk_region`) and the probe side (`ShardEntry::probe_pk_bytes`)
+/// both call, so a probe fingerprint is always byte-identical to the one
+/// inserted at build time.
+#[inline]
+pub(crate) fn fingerprint(opk: &[u8]) -> u128 {
+    if opk.len() > 16 {
+        xxh::checksum(opk) as u128
+    } else {
+        gnitz_wire::widen_pk_be(opk, opk.len())
+    }
+}
+
 /// Build an Xor8 filter from a slice of u128 PKs. Deduplicates before building.
 /// Returns None if the input is empty.
 ///

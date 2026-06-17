@@ -4,18 +4,8 @@
 //! Engine code imports from `crate::storage::{Type, fn}`.
 
 // Internal — not accessible outside storage/
-// L3 LSM + leaf modules (stay at storage level)
-mod wal;
-mod manifest;
-mod compact;
-mod shard_file;
-mod shard_reader;
-mod shard_index;
-mod memtable;
-mod read_cursor;
-mod layout;
-mod table;
-mod partitioned_table;
+// L3 LSM lives under `lsm/`; the `StorageError` leaf stays at storage level.
+mod lsm;
 mod error;
 
 // L2 representation lives under `repr/`. It has no facade of its own; the leaf
@@ -23,16 +13,16 @@ mod error;
 // keep their `super::<mod>` paths and the in-storage `with_pk_ord!` /
 // `crate::storage::batch_pool` paths resolve without touching the moved bodies.
 mod repr;
-use repr::{batch, batch_wire, bloom, columnar, heap, merge, range_key, scatter, xor8};
+use repr::{batch, batch_wire, columnar, merge, range_key, scatter};
 pub(crate) use repr::batch_pool;
 
 #[cfg(test)]
 mod data_roundtrip_proptest;
 
 // ── Public API ──────────────────────────────────────────────────────────────
-pub use table::{Table, FlushOutcome, FlushWork, Persistence};
-pub use partitioned_table::{PartitionedTable, partition_for_key, partition_for_pk_bytes, partition_arena_size};
-pub use read_cursor::CursorHandle;
+pub use lsm::table::{Table, FlushOutcome, FlushWork, Persistence};
+pub use lsm::partitioned_table::{PartitionedTable, partition_for_key, partition_for_pk_bytes, partition_arena_size};
+pub use lsm::read_cursor::CursorHandle;
 pub use batch::{Batch, ConsolidatedBatch, write_to_batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use merge::MemBatch;
@@ -40,18 +30,18 @@ pub use scatter::{scatter_copy, scatter_multi_source};
 pub use error::StorageError;
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
-pub(crate) use read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
+pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
 #[cfg(test)]
-pub(crate) use read_cursor::REWIND_CALLS;
+pub(crate) use lsm::read_cursor::REWIND_CALLS;
 #[cfg(test)]
-pub(crate) use partitioned_table::partial_flush_lsn_fixture;
-pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_fixedint_nonnull, opk_key, with_payload_cmp, with_pk_ord};
+pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
+pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_fixedint_nonnull, opk_key, with_payload_cmp};
 pub(crate) use range_key::{increment_key_in_place, range_cut_points, range_group_cut_points};
 pub(crate) use merge::{BlobCacheGuard, DirectWriter, pk_sort_key};
 pub(crate) use batch::carve_writer_slices;
 pub(crate) use batch::{BatchBuilder, index_meta_schema_desc, INDEX_META_COL_NAMES,
                        make_index_schema, project_schema};
-pub(crate) use manifest::PkBuf;
+pub(crate) use lsm::manifest::PkBuf;
 
 /// Append the `.tmp` suffix to a CStr basename and return a new CString.
 pub(super) fn cstr_with_tmp_suffix(base: &std::ffi::CStr) -> Result<std::ffi::CString, error::StorageError> {

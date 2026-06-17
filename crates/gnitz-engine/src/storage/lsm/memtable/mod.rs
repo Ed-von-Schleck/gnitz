@@ -1,90 +1,24 @@
 //! MemTable: manages sorted runs, Bloom filter, PK lookups, and shard flush.
+//!
+//! Split into sorted-run management ([`runs`]) and point lookup + Bloom probe
+//! ([`lookup`]); the `MemTable` struct, its constructor, the inline-consolidate
+//! threshold, and the found-row state accessor live here so both sub-modules
+//! read the (private) fields directly.
 
-use std::cmp::Ordering;
 use std::rc::Rc;
 
-use super::batch::{Batch, write_to_batch, ConsolidatedBatch};
+use super::batch::Batch;
 use super::bloom::BloomFilter;
-use super::columnar;
-use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
-use super::merge::{self, pack_pk_be, SortedMemBatch};
 
-// Accessible to the tests submodule (private items are visible to descendants).
-#[cfg(test)]
-use super::batch::relocate_string_cell;
+mod runs;
+mod lookup;
+
+pub(crate) use runs::consolidate_runs;
+pub(crate) use lookup::run_pk_match_rows;
 
 /// Maximum sorted runs before inline consolidation merges them into one.
 const INLINE_CONSOLIDATE_THRESHOLD: usize = 16;
-
-/// Start index of the first exact-match candidate for OPK `key` in `run`.
-/// Returns `run.count` when `key` falls outside the run's `[min, max]` range
-/// (so the caller's `get_pk_bytes(lo) == key` loop runs zero times). After the
-/// OPK-at-rest flip this is a raw `memcmp` binary search at every PK width —
-/// no schema, no pk_is_fast dispatch. `key` is exactly `pk_stride` OPK bytes.
-///
-/// Named `exact_match_start` rather than `lower_bound` because it returns
-/// `run.count` (past-the-end) for out-of-range keys, which is not standard
-/// lower-bound behaviour; callers always use it as the start of an exact-match
-/// scan, never for range queries.
-fn run_exact_match_start_bytes(run: &Batch, key: &[u8]) -> usize {
-    if run.count == 0 {
-        return 0;
-    }
-    // O(1) range reject before the binary search (cache-miss avoidance).
-    if key < run.get_pk_bytes(0) || key > run.get_pk_bytes(run.count - 1) {
-        return run.count;
-    }
-    run.find_lower_bound_bytes(key)
-}
-
-/// Iterator over the run-row indices whose PK equals `key`. Runs are PK-sorted,
-/// so exact matches form one contiguous range beginning at the lower bound;
-/// iteration is lazy and stops at the first non-matching row, visiting only the
-/// matching rows. Factors out the per-run exact-match scan shared by every PK
-/// lookup so callers never re-derive the bound check or the index step.
-pub(crate) fn run_pk_match_rows<'a>(run: &'a Batch, key: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
-    let start = run_exact_match_start_bytes(run, key);
-    (start..run.count).take_while(move |&lo| run.get_pk_bytes(lo) == key)
-}
-
-/// Merge N sorted MemBatch views into a single consolidated Batch.
-fn consolidate_batches(
-    batches: &[SortedMemBatch],
-    schema: &SchemaDescriptor,
-) -> Batch {
-    if batches.is_empty() {
-        return Batch::empty_with_schema(schema);
-    }
-
-    let total_rows: usize = batches.iter().map(|b| b.count).sum();
-    let total_blob: usize = batches.iter().map(|b| b.blob.len()).sum();
-    if total_rows == 0 {
-        return Batch::empty_with_schema(schema);
-    }
-
-    let mut result = write_to_batch(schema, total_rows, total_blob, |writer| {
-        merge::merge_batches(batches, schema, writer);
-    });
-    result.sorted = true;
-    result.consolidated = true;
-    result
-}
-
-/// Fold flushed runs (each individually (PK,payload)-sorted) into one run.
-/// Single-run input is returned by clone (no merge). Used by `Table` to
-/// consolidate `in_memory_l0` (the in-heap non-durable flush run set).
-pub(crate) fn consolidate_runs(runs: &[Rc<Batch>], schema: &SchemaDescriptor) -> Rc<Batch> {
-    if runs.len() == 1 {
-        return Rc::clone(&runs[0]);
-    }
-    let sorted: Vec<SortedMemBatch> = runs
-        .iter()
-        .map(|r| r.as_sorted_mem_batch().expect("flushed runs are sorted"))
-        .collect();
-    Rc::new(consolidate_batches(&sorted, schema))
-}
-
 
 pub struct MemTable {
     runs: Vec<Rc<Batch>>,
@@ -119,130 +53,6 @@ impl MemTable {
         }
     }
 
-    /// Append a consolidated batch as a new run.
-    pub fn upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
-        let batch = batch.into_inner();
-        if batch.count == 0 {
-            return Ok(());
-        }
-        self.check_capacity()?;
-        // The bloom is keyed by the OPK bytes (via `pack_pk_be`), the same
-        // derivation `may_contain_pk` uses — consistent for signed PKs, whose
-        // sign-flipped `get_pk` value would not be. `pack_pk_be` truncates to
-        // the leading 16 OPK bytes, so wide PKs (`pk_stride > 16`) hash their
-        // prefix: add and probe pack identically, so there is no false
-        // negative; two wide PKs sharing a 16-byte prefix collide to one slot,
-        // a tolerated false positive resolved by the run scan.
-        for i in 0..batch.count {
-            self.bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
-        }
-        self.total_row_count += batch.count;
-        self.runs_bytes += batch.total_bytes();
-        self.runs.push(Rc::new(batch));
-        self.maybe_inline_consolidate();
-        Ok(())
-    }
-
-    /// Bloom probe for a PK by its OPK bytes. Keyed identically to the
-    /// insert side (`pack_pk_be` of the OPK region), so it never produces a
-    /// false negative for any PK type. `opk_key` is exactly `pk_stride` bytes.
-    pub fn may_contain_pk(&self, opk_key: &[u8]) -> bool {
-        self.bloom.may_contain(pack_pk_be(opk_key))
-    }
-
-    pub fn should_flush(&self) -> bool {
-        self.runs_bytes > self.max_bytes * 3 / 4
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.total_row_count == 0
-    }
-
-    #[cfg(test)]
-    pub(crate) fn total_row_count(&self) -> usize {
-        self.total_row_count
-    }
-
-    fn runs_as_sorted(&self) -> Vec<SortedMemBatch<'_>> {
-        self.runs.iter()
-            .map(|r| r.as_sorted_mem_batch().expect("MemTable runs are always sorted"))
-            .collect()
-    }
-
-    /// Borrow the current sorted runs. Each run is independently
-    /// sorted+consolidated; cross-run merging is deferred to the consumer
-    /// (typically a `ReadCursor`).
-    pub fn snapshot_runs(&self) -> &[Rc<Batch>] {
-        &self.runs
-    }
-
-    /// Collapse runs into one merged run in-place.
-    /// `has_found` is dropped because run/row indices change.
-    fn force_consolidate(&mut self) {
-        if self.runs.len() <= 1 {
-            return;
-        }
-        let batches = self.runs_as_sorted();
-        let merged = consolidate_batches(&batches, &self.schema);
-        // batches borrow from self.runs; release before clear() reborrows mut.
-        drop(batches);
-        self.runs.clear();
-        self.runs_bytes = merged.total_bytes();
-        self.total_row_count = merged.count;
-        // Rebuild bloom from surviving rows only: stale hashes from
-        // weight-cancelled rows are cleared here, reducing false-positive rate.
-        self.bloom.reset();
-        if merged.count > 0 {
-            // pack_pk_be takes the leading min(len,16) OPK bytes, which is exactly
-            // what the probe side hashes for both narrow and wide PKs.
-            for i in 0..merged.count {
-                self.bloom.add(pack_pk_be(merged.get_pk_bytes(i)));
-            }
-            self.runs.push(Rc::new(merged));
-        }
-        self.has_found = false;
-    }
-
-    /// Consolidate runs and return an `Rc<Batch>` of the merged result.
-    /// The memtable retains the merged run until `reset()`, so a failed
-    /// flush IO leaves the data intact for retry.
-    pub fn consolidate_for_flush(&mut self) -> Rc<Batch> {
-        self.force_consolidate();
-        if self.runs.is_empty() {
-            Rc::new(Batch::empty_with_schema(&self.schema))
-        } else {
-            Rc::clone(&self.runs[0])
-        }
-    }
-
-    /// Look up a PK across all sorted runs.
-    ///
-    /// Returns `(net_weight, has_found, row_count)` where `row_count` is the
-    /// number of memtable rows matching `key` (across all runs).
-    /// Look up a PK across all sorted runs by its OPK `key` bytes. Returns
-    /// `(net_weight, has_found, row_count)`. The universal lookup at every PK
-    /// width — `find_lower_bound_bytes` is a raw memcmp search on the OPK
-    /// regions. `key` is exactly `pk_stride` OPK bytes.
-    pub fn lookup_pk_bytes(&mut self, key: &[u8]) -> (i64, bool, usize) {
-        let mut total_w: i64 = 0;
-        let mut row_count: usize = 0;
-        self.has_found = false;
-
-        for (ri, run) in self.runs.iter().enumerate() {
-            for lo in run_pk_match_rows(run, key) {
-                total_w += run.get_weight(lo);
-                if !self.has_found {
-                    self.found_run = ri;
-                    self.found_row = lo;
-                    self.has_found = true;
-                }
-                row_count += 1;
-            }
-        }
-
-        (total_w, self.has_found, row_count)
-    }
-
     /// The row most recently located by `find_positive_payload_row*` / the
     /// retract probe, as `(run, row)`, or `None` when nothing is armed. The
     /// `Table` layer wraps this in a `FoundRow` `ColumnarSource` view.
@@ -253,150 +63,6 @@ impl MemTable {
             None
         }
     }
-
-    /// Find the net weight for rows matching both PK (OPK `key` bytes) and
-    /// full payload. `key` is exactly `pk_stride` OPK bytes.
-    pub fn find_weight_for_row_bytes<S: super::columnar::ColumnarSource>(
-        &self,
-        key: &[u8],
-        ref_source: &S,
-        ref_row: usize,
-    ) -> i64 {
-        let mut total_w: i64 = 0;
-
-        for run in &self.runs {
-            for lo in run_pk_match_rows(run, key) {
-                let ord = columnar::compare_rows(
-                    &self.schema, run.as_ref(), lo, ref_source, ref_row,
-                );
-                if ord == Ordering::Equal {
-                    total_w += run.get_weight(lo);
-                }
-            }
-        }
-
-        total_w
-    }
-
-    /// Find the first memtable row whose (PK, payload) has positive net weight
-    /// across all runs.  Sets `found_run`/`found_row`/`has_found` on success.
-    /// Returns true if such a row was found, false otherwise.
-    ///
-    /// Used by `Table::retract_pk` to locate the live row for an UPDATE+DELETE
-    /// sequence where the old payload has been cancelled but the new payload
-    /// is still positive.
-    /// Find the first memtable row whose (PK, payload) has positive net weight
-    /// across all runs, keyed by OPK `key` bytes. Sets
-    /// `found_run`/`found_row`/`has_found` on success.
-    pub fn find_positive_payload_row_bytes(&mut self, key: &[u8]) -> bool {
-        self.has_found = false;
-
-        // Pass 1 — one binary search per run; collect every (run, row, weight)
-        // whose PK matches into `cand_scratch`. This is the only scan of the
-        // runs. The buffer is reused across calls (cleared, capacity retained),
-        // so this path allocates only while warming up to its high-water mark.
-        //
-        // Candidate count C is structurally bounded: `retract_pk_bytes` reaches
-        // this only when a PK has multiple un-consolidated memtable rows, runs
-        // are capped at `INLINE_CONSOLIDATE_THRESHOLD - 1` before a merge, and
-        // each run is `(PK, payload)`-consolidated, so a PK adds at most a
-        // retract+insert pair per run — hence `C ≤ 2R < 2·INLINE_CONSOLIDATE_-
-        // THRESHOLD` (~30). C only approaches that bound for a key re-updated on
-        // nearly every un-consolidated run; absent that it stays small. A
-        // `ConsolidatedBatch` folds only by (PK, payload), so the synthetic
-        // multi-payload case exceeds even 2R — the growable buffer absorbs any C.
-        self.cand_scratch.clear();
-        for (ri, run) in self.runs.iter().enumerate() {
-            for lo in run_pk_match_rows(run, key) {
-                self.cand_scratch.push((ri, lo, run.get_weight(lo)));
-            }
-        }
-
-        // Pass 2 — group equal payloads via `== Equal` and return the first group
-        // (in run order) whose weights net strictly positive. Only equality is
-        // needed, matching the replaced code; the result never depends on
-        // `compare_rows` being a total order. Skipping an already-grouped payload
-        // (the `already_grouped` check) is load-bearing for correctness, not just
-        // speed: a later candidate whose own weight is positive but whose full
-        // group nets ≤ 0 must not be returned. Entries are `Copy`, so indexing
-        // copies each tuple out and never holds a borrow on `cand_scratch`.
-        for i in 0..self.cand_scratch.len() {
-            let (ri, row, w0) = self.cand_scratch[i];
-            // Skip a payload already evaluated by an earlier candidate.
-            let already_grouped = self.cand_scratch[..i].iter().any(|&(rj, rowj, _)| {
-                columnar::compare_rows(
-                    &self.schema, self.runs[ri].as_ref(), row, self.runs[rj].as_ref(), rowj,
-                ) == Ordering::Equal
-            });
-            if already_grouped {
-                continue;
-            }
-            let mut net = w0;
-            for k in i + 1..self.cand_scratch.len() {
-                let (rk, rowk, wk) = self.cand_scratch[k];
-                if columnar::compare_rows(
-                    &self.schema, self.runs[ri].as_ref(), row, self.runs[rk].as_ref(), rowk,
-                ) == Ordering::Equal
-                {
-                    net += wk;
-                }
-            }
-            if net > 0 {
-                self.found_run = ri;
-                self.found_row = row;
-                self.has_found = true;
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Pre-rewrite per-candidate re-scan, retained only as the micro-benchmark
-    /// baseline (see `memtable_find_positive_payload_row_bench`). Each
-    /// PK-matching candidate re-scans every run via `find_weight_for_row_bytes`;
-    /// the production function above replaced this with a single grouping pass.
-    /// Selects the same row, so the bench can assert the two agree before timing.
-    #[cfg(test)]
-    fn find_positive_payload_row_rescan_baseline(&mut self, key: &[u8]) -> bool {
-        for (ri, run) in self.runs.iter().enumerate() {
-            for lo in run_pk_match_rows(run, key) {
-                let net_w = self.find_weight_for_row_bytes(key, run.as_ref(), lo);
-                if net_w > 0 {
-                    self.found_run = ri;
-                    self.found_row = lo;
-                    self.has_found = true;
-                    return true;
-                }
-            }
-        }
-        self.has_found = false;
-        false
-    }
-
-    /// Clear all runs and bloom filter.  Ready for reuse.
-    pub fn reset(&mut self) {
-        self.runs.clear();
-        self.runs_bytes = 0;
-        self.total_row_count = 0;
-        self.has_found = false;
-        self.bloom.reset();
-    }
-
-    /// If the run count has reached the threshold, merge all runs into a
-    /// single consolidated run.  Bounds the cost of cursor builds and
-    /// `lookup_pk()`, and eliminates weight-cancelled rows early.
-    fn maybe_inline_consolidate(&mut self) {
-        if self.runs.len() >= INLINE_CONSOLIDATE_THRESHOLD {
-            self.force_consolidate();
-        }
-    }
-
-    fn check_capacity(&self) -> Result<(), StorageError> {
-        if self.runs_bytes > self.max_bytes {
-            return Err(StorageError::Capacity);
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -406,6 +72,10 @@ impl MemTable {
 #[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
+    use super::super::batch::{ConsolidatedBatch, relocate_string_cell};
+    use super::super::error::StorageError;
+    use super::super::merge::SortedMemBatch;
+    use super::runs::consolidate_batches;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
@@ -1467,7 +1137,7 @@ mod tests {
         let mut dst_blob = Vec::new();
 
         // Must not panic
-        super::relocate_string_cell(&src_struct, src_blob, &mut dst, &mut dst_blob);
+        relocate_string_cell(&src_struct, src_blob, &mut dst, &mut dst_blob);
 
         // The corrupted string should have length set to 0
         let out_len = u32::from_le_bytes(dst[0..4].try_into().unwrap());
