@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use crate::schema::{ColumnLocator, SchemaColumn, SchemaDescriptor, type_code};
 use crate::storage::{Batch, ConsolidatedBatch, MemBatch, with_payload_cmp};
 use crate::expr::ScalarFuncKind;
-use crate::xxh;
+use crate::foundation::xxh;
 
 use super::cogroup::{cogroup_union, BatchCursor};
 
@@ -778,7 +778,7 @@ mod tests {
     }
 
     fn get_payload_i64(b: &Batch, row: usize) -> i64 {
-        crate::util::read_i64_le(b.col_data(0), row * 8)
+        crate::foundation::codec::read_i64_le(b.col_data(0), row * 8)
     }
 
     // -----------------------------------------------------------------------
@@ -2040,7 +2040,7 @@ mod tests {
         // producer == consumer (both call the same forked function). This is the
         // teeth that survives the "both paths share one partition_for_pk_bytes"
         // case called out for cluster C2.
-        let expected = (crate::xxh::checksum(consumer) >> 56) as usize;
+        let expected = (crate::foundation::xxh::checksum(consumer) >> 56) as usize;
         assert_eq!(p_consumer, expected, "wide partition == (xxh3_64(opk) >> 56)");
         assert!(expected < 256, "256-bucket routing (top 8 bits)");
     }

@@ -406,7 +406,7 @@ impl WorkerProcess {
     ) -> Self {
         // Isolate this worker's scratch operator-state tables from siblings'
         // (all forked workers share the view directory under one base_dir).
-        crate::compiler::set_worker_rank(worker_id, num_workers as u32);
+        crate::foundation::worker_ctx::set_worker_rank(worker_id, num_workers as u32);
         WorkerProcess {
             worker_id,
             num_workers,
@@ -1719,7 +1719,7 @@ impl WorkerProcess {
             dir_inodes.iter().map(|&(_, _, fd)| fd).collect();
         let mut fsync_err = None;
         for fd in dedup_dirfds(dir_inodes) {
-            if let Err(e) = crate::util::fsync_eintr(fd) {
+            if let Err(e) = crate::foundation::posix_io::fsync_eintr(fd) {
                 fsync_err = Some(e);
                 break;
             }
@@ -2981,7 +2981,7 @@ mod tests {
     }
 
     fn worker_temp_dir(name: &str) -> String {
-        crate::util::raise_fd_limit_for_tests();
+        crate::foundation::posix_io::raise_fd_limit_for_tests();
         let path = std::env::temp_dir()
             .join(format!("gnitz_worker_test_{name}"))
             .to_str().unwrap().to_owned();

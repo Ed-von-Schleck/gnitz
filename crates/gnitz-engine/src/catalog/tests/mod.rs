@@ -15,7 +15,7 @@ use super::sys_tables::*;
 use std::fs;
 
 fn temp_dir(name: &str) -> String {
-    crate::util::raise_fd_limit_for_tests();
+    crate::foundation::posix_io::raise_fd_limit_for_tests();
     // Namespace the fixed path by user: /tmp is shared and sticky, so a dir
     // left by a DIFFERENT user (mode 0755, owner-only-writable) would occupy
     // the bare `gnitz_catalog_test_{name}` path forever — the start-of-test

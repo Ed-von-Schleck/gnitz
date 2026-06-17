@@ -9,7 +9,7 @@ use std::rc::Rc;
 use super::columnar;
 use super::error::StorageError;
 use crate::schema::SchemaDescriptor;
-use crate::util::{fdatasync_eintr, fsync_eintr};
+use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 use super::memtable::{self, MemTable};
 use super::batch::Batch;
 #[cfg(test)]

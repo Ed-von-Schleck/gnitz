@@ -5,7 +5,7 @@
 use crate::schema::{
     german_string_tail, SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL,
 };
-use crate::util::read_u32_le;
+use crate::foundation::codec::read_u32_le;
 
 gnitz_wire::cast_consts! { pub(crate) i64;
     EXPR_LOAD_COL_INT, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_CONST,

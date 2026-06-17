@@ -469,6 +469,7 @@ pub fn partition_arena_size(num_partitions: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
     use crate::test_support::wide_pk_3xu64_schema;
 
@@ -503,7 +504,7 @@ mod tests {
 
     #[test]
     fn single_partition_lifecycle() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("sp_test");
         let schema = make_schema();
@@ -522,7 +523,7 @@ mod tests {
 
     #[test]
     fn multi_partition_hash_routing() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("mp_test");
         let schema = make_schema();
@@ -542,7 +543,7 @@ mod tests {
 
     #[test]
     fn multi_partition_cursor() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("mc_test");
         let schema = make_schema();
@@ -560,7 +561,7 @@ mod tests {
 
     #[test]
     fn retract_pk_routing() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("rt_test");
         let schema = make_schema();
@@ -591,7 +592,7 @@ mod tests {
     /// slice is observably exercised.
     #[test]
     fn prefix_distribution_routes_twins_together_and_retracts() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("prefix_twins");
         // 2×U64 compound PK, CLUSTER BY col0 (k=1, dist_stride=8) + I64 payload.
@@ -726,7 +727,7 @@ mod tests {
 
     #[test]
     fn ingest_owned_batch_wide_routing() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("wide_test");
         let schema = wide_pk_3xu64_schema();
@@ -773,7 +774,7 @@ mod tests {
 
     #[test]
     fn close_partitions_outside() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cpo_test");
         let schema = make_schema();
@@ -793,7 +794,7 @@ mod tests {
     /// or `found_null_word()` would index into the now-smaller vector.
     #[test]
     fn close_partitions_outside_invalidates_found_partition() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cpo_stale_test");
         let schema = make_schema();
@@ -844,7 +845,7 @@ mod tests {
     /// files. Guards against the durability fix over-broadening to base tables.
     #[test]
     fn flush_prepare_durable_returns_pending() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("pt_durable_flush");
         let schema = make_schema();
@@ -870,7 +871,7 @@ mod tests {
     /// rows stay readable.
     #[test]
     fn flush_prepare_nondurable_no_work_no_files() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("pt_nondurable_flush");
         let schema = make_schema();
@@ -900,7 +901,7 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)] // the test's whole point is this read path
     fn create_cursor_compacting_gathers_in_memory_runs() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("pt_ccc_inmem");
         let schema = make_schema();
@@ -937,7 +938,7 @@ mod tests {
     /// fix — `min_flushed_lsn` did not exist and recovery used the max.
     #[test]
     fn min_flushed_lsn_floors_recovery_watermark_after_partial_flush() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("pt_partial_flush_lsn");
         let path = tdir.to_str().unwrap().to_owned();

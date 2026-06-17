@@ -18,7 +18,7 @@ use super::{with_payload_cmp, with_pk_ord};
 use super::batch::FIXED_REGION_BYTES;
 use crate::schema::{BlobCache, RowView, SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
-use crate::util::read_u64_le;
+use crate::foundation::codec::read_u64_le;
 use gnitz_wire::is_german_string;
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-use crate::xxh;
+use crate::foundation::xxh;
 
 const BITS_PER_KEY: usize = 10;
 const NUM_PROBES: usize = 7;

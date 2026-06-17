@@ -17,7 +17,7 @@ use super::shard_file::PkUniqueChecker;
 use crate::schema::SchemaDescriptor;
 use super::shard_reader::MappedShard;
 #[cfg(test)]
-use crate::util::{read_i64_le, read_u32_le};
+use crate::foundation::codec::{read_i64_le, read_u32_le};
 
 #[cfg(test)]
 use crate::schema::type_code;
@@ -42,7 +42,7 @@ impl GuardResult {
     }
 
     pub fn filename_str(&self) -> &str {
-        crate::util::cstr_from_buf(&self.filename)
+        crate::foundation::codec::cstr_from_buf(&self.filename)
     }
 }
 
@@ -1072,7 +1072,7 @@ mod tests {
         let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 99, 1, 1, &mut results, false).unwrap();
         assert!(n > 0, "merge_and_route should produce output");
 
-        let fn0 = crate::util::cstr_from_buf(&results[0].filename);
+        let fn0 = crate::foundation::codec::cstr_from_buf(&results[0].filename);
         let rows = read_3col_shard(fn0, &schema);
         assert_eq!(rows.len(), 2, "expected 2 rows, got {rows:?}");
         assert_eq!(rows[0], (10, 1, 0, 300));
@@ -1182,7 +1182,7 @@ mod tests {
         let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 42, 2, 1, &mut results, false).unwrap();
         assert!(n > 0, "merge_and_route should produce output");
 
-        let fn0 = crate::util::cstr_from_buf(&results[0].filename);
+        let fn0 = crate::foundation::codec::cstr_from_buf(&results[0].filename);
         let cpath = std::ffi::CString::new(fn0).unwrap();
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 4, "all 4 keys must be present in output");

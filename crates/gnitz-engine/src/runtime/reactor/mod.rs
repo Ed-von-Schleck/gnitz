@@ -40,7 +40,7 @@ use self::uring::IoUringRing;
 use crate::runtime::wire::{self, DecodedWire, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::sal::MAX_WORKERS;
-use crate::runtime::sys::FUTEX2_SIZE_U32;
+use crate::foundation::syscall::FUTEX2_SIZE_U32;
 use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
 
 /// High bit of `internal_req_id` (u32) marks scan-allocated request IDs.
@@ -2629,7 +2629,7 @@ mod tests {
     #[test]
     fn fsync_future_roundtrip() {
         let r = make_reactor();
-        let fd = crate::runtime::sys::memfd_create(b"reactor_fsync_future");
+        let fd = crate::foundation::syscall::memfd_create(b"reactor_fsync_future");
         let rc: Rc<StdCell<i32>> = Rc::new(StdCell::new(1));
         let rc2 = Rc::clone(&rc);
         let fsync = r.fsync(fd);
@@ -2808,7 +2808,7 @@ mod tests {
     #[test]
     fn fsync_real_memfd_roundtrip() {
         let r = make_reactor();
-        let fd = crate::runtime::sys::memfd_create(b"reactor_fsync_ok");
+        let fd = crate::foundation::syscall::memfd_create(b"reactor_fsync_ok");
         let id = r.submit_fsync(fd);
         let rc = r.block_on_fsync(id);
         unsafe { libc::close(fd); }
@@ -2839,7 +2839,7 @@ mod tests {
     #[test]
     fn fsync_submit_flushes_sqe_before_returning() {
         let r = make_reactor();
-        let fd = crate::runtime::sys::memfd_create(b"reactor_fsync_flush");
+        let fd = crate::foundation::syscall::memfd_create(b"reactor_fsync_flush");
         let id = r.submit_fsync(fd);
 
         // Spin briefly (no further ticks driven from outside) until the
@@ -3341,10 +3341,10 @@ mod tests {
         const N_MESSAGES: u64 = 500;
         const TIMEOUT_SECS: u64 = 30;
 
-        let fd = crate::runtime::sys::memfd_create(b"w2m_stress");
+        let fd = crate::foundation::syscall::memfd_create(b"w2m_stress");
         assert!(fd >= 0, "memfd_create failed");
-        assert_eq!(crate::sys::ftruncate(fd, CAPACITY as i64), 0);
-        let ptr = crate::runtime::sys::mmap_shared(fd, CAPACITY);
+        assert_eq!(crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64), 0);
+        let ptr = crate::foundation::syscall::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null(), "mmap_shared failed");
         unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
 
@@ -3450,10 +3450,10 @@ mod tests {
         const N_MESSAGES: u64 = 5_000;
         const TIMEOUT_SECS: u64 = 60;
 
-        let fd = crate::runtime::sys::memfd_create(b"w2m_stress_hv");
+        let fd = crate::foundation::syscall::memfd_create(b"w2m_stress_hv");
         assert!(fd >= 0);
-        assert_eq!(crate::sys::ftruncate(fd, CAPACITY as i64), 0);
-        let ptr = crate::runtime::sys::mmap_shared(fd, CAPACITY);
+        assert_eq!(crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64), 0);
+        let ptr = crate::foundation::syscall::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null());
         unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
 
@@ -3568,10 +3568,10 @@ mod tests {
 
         // memfd + mmap a tiny shared W2M ring (same setup the existing
         // cross-process stress tests use, but shared with a thread).
-        let fd = crate::runtime::sys::memfd_create(b"w2m_refresh_pin");
+        let fd = crate::foundation::syscall::memfd_create(b"w2m_refresh_pin");
         assert!(fd >= 0, "memfd_create failed");
-        assert_eq!(crate::sys::ftruncate(fd, CAPACITY as i64), 0);
-        let ptr = crate::runtime::sys::mmap_shared(fd, CAPACITY);
+        assert_eq!(crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64), 0);
+        let ptr = crate::foundation::syscall::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null(), "mmap_shared failed");
         unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
 
@@ -4266,7 +4266,7 @@ mod tests {
         use crate::runtime::w2m::{W2mWriter, W2mReceiver};
         use crate::runtime::w2m_ring::{self, W2M_HEADER_SIZE};
         use crate::runtime::wire::{self as ipc, STATUS_OK};
-        use gnitz_wire::align8;
+        use crate::foundation::codec::align8;
 
         const TOTAL: usize = 8;
 

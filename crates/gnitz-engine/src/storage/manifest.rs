@@ -1,5 +1,6 @@
 use crate::schema::MAX_PK_BYTES;
-use crate::util::{read_u64_le, write_u64_le, fdatasync_eintr, fsync_eintr};
+use crate::foundation::codec::{read_u64_le, write_u64_le};
+use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 use super::error::StorageError;
 
 // ---------------------------------------------------------------------------
@@ -101,7 +102,7 @@ impl ManifestEntryRaw {
     }
 
     pub fn filename_str(&self) -> &str {
-        crate::util::cstr_from_buf(&self.filename)
+        crate::foundation::codec::cstr_from_buf(&self.filename)
     }
 }
 
@@ -264,7 +265,7 @@ pub fn read_file(
         }
 
         let mut buf = vec![0u8; file_size];
-        let bytes_read = crate::util::read_all_fd(fd, &mut buf);
+        let bytes_read = crate::foundation::posix_io::read_all_fd(fd, &mut buf);
         libc::close(fd);
 
         if bytes_read < 0 || (bytes_read as usize) < file_size {
@@ -339,7 +340,7 @@ pub fn prepare_file(
             return Err(StorageError::Io);
         }
 
-        let rc = crate::util::write_all_fd(fd, &buf[..written]);
+        let rc = crate::foundation::posix_io::write_all_fd(fd, &buf[..written]);
         if rc < 0 {
             libc::close(fd);
             libc::unlink(tmp_path.as_ptr());
@@ -387,7 +388,7 @@ pub fn entry_count(path: &std::ffi::CStr) -> Result<Option<usize>, StorageError>
             return Ok(None);
         }
         let mut hdr = [0u8; HEADER_SIZE];
-        let n = crate::util::read_all_fd(fd, &mut hdr);
+        let n = crate::foundation::posix_io::read_all_fd(fd, &mut hdr);
         libc::close(fd);
         if n < HEADER_SIZE as i64 {
             return Err(StorageError::Truncated);

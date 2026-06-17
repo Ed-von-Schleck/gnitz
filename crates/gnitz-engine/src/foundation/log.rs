@@ -119,7 +119,7 @@ fn write_millis(buf: &mut [u8], val: u32) -> usize {
 #[macro_export]
 macro_rules! gnitz_error {
     ($($arg:tt)*) => {
-        $crate::log::_emit("ERROR", &format!($($arg)*));
+        $crate::foundation::log::_emit("ERROR", &format!($($arg)*));
     };
 }
 
@@ -127,7 +127,7 @@ macro_rules! gnitz_error {
 #[macro_export]
 macro_rules! gnitz_warn {
     ($($arg:tt)*) => {
-        $crate::log::_emit("WARN", &format!($($arg)*));
+        $crate::foundation::log::_emit("WARN", &format!($($arg)*));
     };
 }
 
@@ -135,8 +135,8 @@ macro_rules! gnitz_warn {
 #[macro_export]
 macro_rules! gnitz_info {
     ($($arg:tt)*) => {
-        if $crate::log::is_info() {
-            $crate::log::_emit("INFO", &format!($($arg)*));
+        if $crate::foundation::log::is_info() {
+            $crate::foundation::log::_emit("INFO", &format!($($arg)*));
         }
     };
 }
@@ -145,8 +145,8 @@ macro_rules! gnitz_info {
 #[macro_export]
 macro_rules! gnitz_debug {
     ($($arg:tt)*) => {
-        if $crate::log::is_debug() {
-            $crate::log::_emit("DEBUG", &format!($($arg)*));
+        if $crate::foundation::log::is_debug() {
+            $crate::foundation::log::_emit("DEBUG", &format!($($arg)*));
         }
     };
 }
@@ -159,7 +159,7 @@ macro_rules! gnitz_debug {
 #[macro_export]
 macro_rules! gnitz_fatal_abort {
     ($($arg:tt)*) => {{
-        $crate::log::_emit("FATAL", &format!($($arg)*));
+        $crate::foundation::log::_emit("FATAL", &format!($($arg)*));
         unsafe { ::libc::_exit(134) };
     }};
 }

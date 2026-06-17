@@ -2,7 +2,7 @@
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, encode_german_string, try_decode_german_string};
 use crate::storage::{Batch, MemBatch};
-use crate::util::align8;
+use crate::foundation::codec::align8;
 
 // ---------------------------------------------------------------------------
 // Constants re-exported from gnitz_wire
@@ -356,7 +356,7 @@ pub(crate) fn encode_ctrl_block_direct(
     buf[OFF_SEEK_COL_IDX..OFF_SEEK_COL_IDX + 8].copy_from_slice(&seek_col_idx.to_le_bytes());
     buf[OFF_REQUEST_ID..OFF_REQUEST_ID + 8].copy_from_slice(&request_id.to_le_bytes());
     if checksum {
-        let cs = crate::xxh::checksum(&buf[gnitz_wire::WAL_HEADER_SIZE..]);
+        let cs = crate::foundation::xxh::checksum(&buf[gnitz_wire::WAL_HEADER_SIZE..]);
         buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].copy_from_slice(&cs.to_le_bytes());
     }
     CTRL_BLOCK_SIZE_NO_BLOB
@@ -851,7 +851,7 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
 
     if verify_checksum && total_size > HEADER {
         let expected = u64::from_le_bytes(data[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].try_into().unwrap());
-        let actual = crate::xxh::checksum(&data[HEADER..total_size]);
+        let actual = crate::foundation::xxh::checksum(&data[HEADER..total_size]);
         if actual != expected { return Err("schema block checksum mismatch"); }
     }
 

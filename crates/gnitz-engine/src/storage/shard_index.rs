@@ -112,7 +112,7 @@ impl ShardEntry {
         }
         if self.shard.has_xor8() {
             let fp = if key.len() > 16 {
-                crate::xxh::checksum(key) as u128
+                crate::foundation::xxh::checksum(key) as u128
             } else {
                 gnitz_wire::widen_pk_be(key, key.len())
             };
@@ -875,6 +875,7 @@ impl ShardIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
     use super::super::shard_file;
 
@@ -991,7 +992,7 @@ mod tests {
 
     #[test]
     fn test_add_shard_and_find_pk() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1019,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_manifest_roundtrip_with_levels() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1054,7 +1055,7 @@ mod tests {
 
     #[test]
     fn test_run_compact_l0_to_l1() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1088,7 +1089,7 @@ mod tests {
 
     #[test]
     fn test_compact_guards_if_needed() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1122,7 +1123,7 @@ mod tests {
 
     #[test]
     fn test_compact_guard_vertical_failure_leaves_index_unchanged() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1173,7 +1174,7 @@ mod tests {
         // Regression: when L1's first guard key is > 0, l1_guard_keys must
         // still anchor the guard space at 0 so keys below the first guard are
         // routable and readable.
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1194,7 +1195,7 @@ mod tests {
         // Regression for the find_guard_idx/find_guard_for_key mismatch: a key
         // inserted below L1's first guard key (100) must remain findable after
         // an L0→L1 compaction.
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1259,7 +1260,7 @@ mod tests {
 
     #[test]
     fn test_try_cleanup() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1286,7 +1287,7 @@ mod tests {
 
     #[test]
     fn test_max_lsn() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1309,7 +1310,7 @@ mod tests {
 
     #[test]
     fn test_run_compact_fails_on_long_path_l0_intact() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
 
@@ -1362,7 +1363,7 @@ mod tests {
     /// range's lower bound). Without the fix, keys 100-199 become unfindable.
     #[test]
     fn test_compact_guard_vertical_routing_gap() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1412,7 +1413,7 @@ mod tests {
 
     #[test]
     fn test_gc_orphans_removes_stale_shard() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1433,7 +1434,7 @@ mod tests {
 
     #[test]
     fn test_gc_orphans_ignores_other_table_id() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1452,7 +1453,7 @@ mod tests {
 
     #[test]
     fn test_gc_orphans_removes_manifest_tmp() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1467,7 +1468,7 @@ mod tests {
 
     #[test]
     fn test_gc_orphans_removes_tmp_suffix_orphans() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         let idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -1485,7 +1486,7 @@ mod tests {
 
     #[test]
     fn test_gc_orphans_empty_index_removes_stray() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
         // Empty index — no load_manifest call.
@@ -1503,7 +1504,7 @@ mod tests {
     /// identical to the pre-PkBuf u128 logic (golden values).
     #[test]
     fn test_single_pk_probe_and_sort_golden() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = test_schema();
 
@@ -1541,7 +1542,7 @@ mod tests {
     /// get_pk_bytes on a count == 0 shard.
     #[test]
     fn test_empty_shard_sentinel() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
 
         let single = test_schema();
@@ -1601,7 +1602,7 @@ mod tests {
         // probe_pk_bytes's compound arm prunes an out-of-range key (exercises
         // the stride assert + pk_in_range wiring).
         let dir = tempfile::tempdir().unwrap();
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let p = write_compound_shard(
             dir.path(),
             "compound.db",
@@ -1634,7 +1635,7 @@ mod tests {
     /// anchor guard `vec![0]` for every PK width, wide included.
     #[test]
     fn test_l1_guard_keys_wide_bypass() {
-        crate::util::raise_fd_limit_for_tests();
+        raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = wide_schema();
         assert_eq!(schema.pk_stride(), 24);

@@ -1,6 +1,5 @@
 //! Runtime coordination subsystem: IPC channels, master/worker/executor/committer/bootstrap.
 
-pub(crate) mod sys;
 pub(crate) mod w2m_ring;
 pub(crate) mod wire;
 pub(crate) mod sal;

@@ -1,0 +1,70 @@
+//! Little-endian byte codec: fixed-width integer pack/unpack (aligned and
+//! unaligned), C-string extraction, and 8-byte alignment. The genuine
+//! cross-layer leaf — every wire/shard/mmap path reads and writes through it.
+
+#[inline]
+pub fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+
+#[inline]
+pub fn read_u64_le(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+#[inline]
+pub fn read_i64_le(buf: &[u8], off: usize) -> i64 {
+    i64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+#[inline]
+pub fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
+    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+#[inline]
+pub fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
+    buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
+}
+
+pub fn cstr_from_buf(buf: &[u8]) -> &str {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end]).unwrap_or("")
+}
+
+pub use gnitz_wire::align8;
+
+// The four `*_raw` accessors below do unaligned `u32`/`u64` reads and writes at
+// `base + offset` bytes for the SAL and W2M mmap paths, where the offset is
+// computed from a `*mut u8` base pointer that need not meet the alignment a
+// `*mut u{32,64}` dereference requires — hence `read_unaligned`/`write_unaligned`.
+// Each `# Safety` clause is the same contract: `base + offset + N` must lie
+// inside a live allocation, writable for the writes and readable for the reads.
+
+/// # Safety
+/// `base + offset + 8` must lie inside a live, writable allocation.
+#[inline]
+pub(crate) unsafe fn write_u64_raw(base: *mut u8, offset: usize, val: u64) {
+    (base.add(offset) as *mut u64).write_unaligned(val);
+}
+
+/// # Safety
+/// `base + offset + 8` must lie inside a live, readable allocation.
+#[inline]
+pub(crate) unsafe fn read_u64_raw(base: *const u8, offset: usize) -> u64 {
+    (base.add(offset) as *const u64).read_unaligned()
+}
+
+/// # Safety
+/// `base + offset + 4` must lie inside a live, writable allocation.
+#[inline]
+pub(crate) unsafe fn write_u32_raw(base: *mut u8, offset: usize, val: u32) {
+    (base.add(offset) as *mut u32).write_unaligned(val);
+}
+
+/// # Safety
+/// `base + offset + 4` must lie inside a live, readable allocation.
+#[inline]
+pub(crate) unsafe fn read_u32_raw(base: *const u8, offset: usize) -> u32 {
+    (base.add(offset) as *const u32).read_unaligned()
+}

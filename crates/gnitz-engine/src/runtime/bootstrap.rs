@@ -12,8 +12,8 @@ use crate::runtime::sal::{
     FLAG_PUSH, FLAG_DDL_SYNC, FLAG_TXN_COMMIT, SAL_MMAP_SIZE, SalWriter, SalReader,
 };
 use crate::runtime::w2m::{W2mWriter, W2mReceiver};
-use crate::runtime::sys as ipc_sys;
-use crate::sys;
+use crate::foundation::syscall;
+use crate::foundation::posix_io;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::w2m_ring::{self, W2M_REGION_SIZE};
 use crate::runtime::worker::WorkerProcess;
@@ -232,7 +232,7 @@ pub fn server_main(
     log_level: u32,
 ) -> i32 {
     // Raise fd limit (partition directories + shard files)
-    sys::raise_fd_limit(65536);
+    posix_io::raise_fd_limit(65536);
 
     gnitz_info!("Opening database at {}", data_dir);
 
@@ -272,14 +272,14 @@ pub fn server_main(
         unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
         return 1;
     }
-    sys::try_set_nocow(sal_fd);
+    posix_io::try_set_nocow(sal_fd);
     // Check existing size and fallocate if needed
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     unsafe { libc::fstat(sal_fd, &mut stat); }
     if (stat.st_size as usize) < SAL_MMAP_SIZE {
-        sys::fallocate(sal_fd, SAL_MMAP_SIZE as i64);
+        posix_io::fallocate(sal_fd, SAL_MMAP_SIZE as i64);
     }
-    let sal_ptr = ipc_sys::mmap_shared(sal_fd, SAL_MMAP_SIZE);
+    let sal_ptr = syscall::mmap_shared(sal_fd, SAL_MMAP_SIZE);
     if sal_ptr.is_null() {
         let msg = b"Error: failed to mmap SAL\n";
         unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
@@ -288,7 +288,7 @@ pub fn server_main(
     // Pre-fault writable PTEs so the hot write path never page-faults.
     // MADV_POPULATE_WRITE (Linux 5.14+) installs dirty PTEs and triggers
     // the filesystem mkwrite callback upfront, without dirtying page contents.
-    sys::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
+    posix_io::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
 
     // --- V2 migration: clean break, sentinel marker file ---
     //
@@ -305,7 +305,7 @@ pub fn server_main(
         let v2_marker_path = format!("{data_dir}/wal.sal.v2");
         if !std::path::Path::new(&v2_marker_path).exists() {
             unsafe { libc::memset(sal_ptr as *mut libc::c_void, 0, SAL_MMAP_SIZE); }
-            sys::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
+            posix_io::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
             if let Err(e) = std::fs::File::create(&v2_marker_path) {
                 let msg = format!("Error: failed to create wal.sal.v2 marker: {e}\n");
                 unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
@@ -350,14 +350,14 @@ pub fn server_main(
     let mut w2m_sizes: Vec<u64> = Vec::with_capacity(nw);
     for w in 0..nw {
         let name = format!("w2m_{w}");
-        let wfd = ipc_sys::memfd_create(name.as_bytes());
+        let wfd = syscall::memfd_create(name.as_bytes());
         if wfd < 0 {
             let msg = b"Error: memfd_create failed\n";
             unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
             return 1;
         }
-        sys::ftruncate(wfd, W2M_REGION_SIZE as i64);
-        let wptr = ipc_sys::mmap_shared(wfd, W2M_REGION_SIZE);
+        posix_io::ftruncate(wfd, W2M_REGION_SIZE as i64);
+        let wptr = syscall::mmap_shared(wfd, W2M_REGION_SIZE);
         if wptr.is_null() {
             let msg = b"Error: mmap W2M failed\n";
             unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
@@ -366,7 +366,7 @@ pub fn server_main(
         // Hint THP backing for the W2M region (memfd/shmem backing).
         // Requires: echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled
         // If shmem_enabled remains "never", this call is silently inert — no harm.
-        sys::madvise_hugepage(wptr, W2M_REGION_SIZE);
+        posix_io::madvise_hugepage(wptr, W2M_REGION_SIZE);
         // Initialize the SPSC ring header (cursors at HEADER_SIZE,
         // capacity = full region).
         unsafe {
@@ -380,7 +380,7 @@ pub fn server_main(
     // --- M2W eventfds (master→worker signaling; W2M uses futex now) ---
     let mut m2w_efds: Vec<i32> = Vec::with_capacity(nw);
     for _ in 0..nw {
-        let m2w = ipc_sys::eventfd_create();
+        let m2w = syscall::eventfd_create();
         if m2w < 0 {
             let msg = b"Error: eventfd_create failed\n";
             unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
@@ -513,7 +513,7 @@ pub fn server_main(
 
             // Re-init logging with worker tag
             let wtag = format!("W{w}");
-            crate::log::init(log_level, wtag.as_bytes());
+            crate::foundation::log::init(log_level, wtag.as_bytes());
 
             let mut worker = WorkerProcess::new(
                 w as u32,
@@ -574,7 +574,7 @@ pub fn server_main(
 
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);
-    let server_fd = sys::server_create(socket_path);
+    let server_fd = posix_io::server_create(socket_path);
     if server_fd < 0 {
         let msg = b"Error: failed to create server socket\n";
         unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
@@ -651,7 +651,7 @@ mod recovery_tests {
 
             cur = write_ddl_group(ptr, cur, nw, 102, 6, 1, size as u64);
             // Sentinel for lsn=6.
-            let efds: Vec<i32> = (0..nw).map(|_| ipc_sys::eventfd_create()).collect();
+            let efds: Vec<i32> = (0..nw).map(|_| syscall::eventfd_create()).collect();
             let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
             writer.reset(cur, 1);
             writer.write_commit_sentinel(6).unwrap();
@@ -682,7 +682,7 @@ mod recovery_tests {
             cur = write_ddl_group(ptr, cur, nw, 201, 9, 1, size as u64);
             cur = write_ddl_group(ptr, cur, nw, 202, 9, 1, size as u64);
 
-            let efds: Vec<i32> = (0..nw).map(|_| ipc_sys::eventfd_create()).collect();
+            let efds: Vec<i32> = (0..nw).map(|_| syscall::eventfd_create()).collect();
             let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
             writer.reset(cur, 1);
             writer.write_commit_sentinel(9).unwrap();
@@ -736,7 +736,7 @@ mod recovery_tests {
             assert_eq!(res.status, 0);
             // No sentinel — zone unclosed.
 
-            let efd = ipc_sys::eventfd_create();
+            let efd = syscall::eventfd_create();
             let reader = SalReader::new(ptr as *const u8, 0, size, efd);
             let committed = collect_committed_lsns(&reader);
             assert!(!committed.contains(&11),

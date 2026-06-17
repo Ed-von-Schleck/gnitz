@@ -50,7 +50,7 @@ fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &Schem
     // 128-bit join-scatter image `german_string_promote_key` produces.
     if gnitz_wire::is_german_string(loc.type_code()) {
         let content = crate::schema::german_string_content(loc.bytes(mb, row), mb.blob);
-        return if content.is_empty() { 0u128 } else { crate::xxh::checksum(content) as u128 };
+        return if content.is_empty() { 0u128 } else { crate::foundation::xxh::checksum(content) as u128 };
     }
     // PK column → widen its OPK bytes; integer / U128 / UUID payload → OPK-encode
     // then widen. Both agree with `partition_for_pk_bytes` on the PK side
@@ -1720,8 +1720,8 @@ mod tests {
         // record_routing uses col_idx=1 (STRING column), so look up the hashed key.
         let mb = b.as_mem_batch();
         let struct_bytes = mb.get_col_ptr(0, 0, 16); // payload_idx(1, 0) = 0
-        let length = crate::util::read_u32_le(struct_bytes, 0) as usize;
-        let hashed_key = crate::xxh::checksum(&struct_bytes[4..4 + length]);
+        let length = crate::foundation::codec::read_u32_le(struct_bytes, 0) as usize;
+        let hashed_key = crate::foundation::xxh::checksum(&struct_bytes[4..4 + length]);
         assert_eq!(router.worker_for_index_key(1, 1, hashed_key as u128), 2);
 
         // Long string (> 12 bytes)
@@ -1788,7 +1788,7 @@ mod tests {
 
     #[test]
     fn test_partition_routing_invariance_narrow_pk() {
-        use crate::xxh::hash_u128;
+        use crate::foundation::xxh::hash_u128;
         let num_workers = 4usize;
         let pks: Vec<u64> = vec![
             1,

@@ -10,14 +10,14 @@ use std::ptr;
 use libc::c_int;
 
 use crate::layout::*;
-use crate::util::write_u64_le;
+use crate::foundation::codec::write_u64_le;
 use super::error::StorageError;
 use super::xor8;
 use xorf::Xor8;
-use crate::xxh;
+use crate::foundation::xxh;
 use super::merge::pack_pk_be;
 use crate::schema::MAX_PK_BYTES;
-use crate::util::{fdatasync_eintr, fsync_eintr};
+use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 
 fn align64(val: usize) -> usize {
     (val + ALIGNMENT - 1) & !(ALIGNMENT - 1)
@@ -186,7 +186,7 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Optio
         // partition_for_pk_bytes derives from the same checksum).
         pk_bytes
             .chunks_exact(stride)
-            .map(|c| crate::xxh::checksum(c) as u128)
+            .map(|c| crate::foundation::xxh::checksum(c) as u128)
             .collect()
     } else {
         // stride <= 16: the row's OPK bytes are big-endian, so right-align
@@ -653,7 +653,7 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
             StorageError::Io
         };
 
-        if crate::util::write_all_fd(fd, image) < 0 {
+        if crate::foundation::posix_io::write_all_fd(fd, image) < 0 {
             return Err(abort(fd, tmp_name.as_ptr()));
         }
 
@@ -675,6 +675,7 @@ pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foundation::codec::read_u64_le;
     use super::super::shard_reader::MappedShard;
     use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 
@@ -713,17 +714,17 @@ mod tests {
         let image = build_shard_image(42, row_count, &regions);
 
         assert_eq!(
-            crate::util::read_u64_le(&image, OFF_MAGIC),
+            read_u64_le(&image, OFF_MAGIC),
             SHARD_MAGIC
         );
         assert_eq!(
-            crate::util::read_u64_le(&image, OFF_VERSION),
+            read_u64_le(&image, OFF_VERSION),
             SHARD_VERSION
         );
-        assert_eq!(crate::util::read_u64_le(&image, OFF_ROW_COUNT), 3);
-        assert_eq!(crate::util::read_u64_le(&image, OFF_TABLE_ID), 42);
-        assert!(crate::util::read_u64_le(&image, OFF_XOR8_OFFSET) > 0);
-        assert!(crate::util::read_u64_le(&image, OFF_XOR8_SIZE) > 0);
+        assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), 3);
+        assert_eq!(read_u64_le(&image, OFF_TABLE_ID), 42);
+        assert!(read_u64_le(&image, OFF_XOR8_OFFSET) > 0);
+        assert!(read_u64_le(&image, OFF_XOR8_SIZE) > 0);
     }
 
     #[test]
@@ -857,7 +858,7 @@ mod tests {
 
         let image = build_shard_image(99, n, &regions);
         assert_eq!(
-            crate::util::read_u64_le(&image, OFF_VERSION),
+            read_u64_le(&image, OFF_VERSION),
             SHARD_VERSION,
             "must write V6"
         );
@@ -900,8 +901,8 @@ mod tests {
         let image = build_shard_image(1, n, &regions);
 
         // PK region should be Constant-encoded → directory entry size == 8 (one elem).
-        let dir_off = crate::util::read_u64_le(&image, OFF_DIR_OFFSET) as usize;
-        let pk_region_sz = crate::util::read_u64_le(&image, dir_off + 8) as usize;
+        let dir_off = read_u64_le(&image, OFF_DIR_OFFSET) as usize;
+        let pk_region_sz = read_u64_le(&image, dir_off + 8) as usize;
         assert_eq!(pk_region_sz, 8, "Constant PK region must store a single 8B value");
 
         // Verify encoding byte is ENCODING_CONSTANT.
@@ -957,7 +958,7 @@ mod tests {
                 .expect("wide compound region must build a filter");
         for row in &rows {
             assert!(
-                xor8::may_contain(&f, crate::xxh::checksum(row) as u128),
+                xor8::may_contain(&f, crate::foundation::xxh::checksum(row) as u128),
                 "no false negative for wide-region row"
             );
         }

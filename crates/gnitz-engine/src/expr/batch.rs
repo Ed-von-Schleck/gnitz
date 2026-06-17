@@ -27,7 +27,7 @@ use super::program::{
 };
 use crate::storage::MemBatch;
 use crate::schema::{compare_german_strings, PAYLOAD_MAPPING_PK_SENTINEL};
-use crate::util::read_u64_le;
+use crate::foundation::codec::read_u64_le;
 
 pub(in crate::expr) const MORSEL: usize = 256;
 pub(in crate::expr) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4

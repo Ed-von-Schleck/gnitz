@@ -4,7 +4,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::util::{read_u32_le, read_u64_le};
+use crate::foundation::codec::{read_u32_le, read_u64_le};
 
 pub(crate) use gnitz_wire::type_code;
 pub(crate) use gnitz_wire::{is_fixed_int, is_routable_int, is_signed_int};

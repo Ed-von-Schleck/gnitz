@@ -1,7 +1,7 @@
 use std::ptr;
 
-use crate::util::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
-use crate::xxh;
+use crate::foundation::codec::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
+use crate::foundation::xxh;
 use super::error::StorageError;
 
 //  WAL block header layout (48 bytes):
@@ -27,7 +27,7 @@ const OFF_CHECKSUM: usize = 24;
 const OFF_NUM_REGIONS: usize = 32;
 const OFF_BLOB_SIZE: usize = 40;
 
-use crate::util::align8;
+use crate::foundation::codec::align8;
 
 /// Compute the total byte size of a WAL block with the given regions.
 pub(crate) fn block_size(num_regions: usize, region_sizes: &[u32]) -> usize {

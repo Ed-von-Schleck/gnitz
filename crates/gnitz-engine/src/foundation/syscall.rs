@@ -235,7 +235,7 @@ mod tests {
 
         let fd = memfd_create(b"test_futex_shared");
         assert!(fd >= 0);
-        assert_eq!(crate::sys::ftruncate(fd, 4096), 0);
+        assert_eq!(crate::foundation::posix_io::ftruncate(fd, 4096), 0);
         let ptr = mmap_shared(fd, 4096);
         assert!(!ptr.is_null());
 
@@ -282,7 +282,7 @@ mod tests {
 
         let fd = memfd_create(b"test_futex_waitv");
         assert!(fd >= 0);
-        assert_eq!(crate::sys::ftruncate(fd, 4096), 0);
+        assert_eq!(crate::foundation::posix_io::ftruncate(fd, 4096), 0);
         let ptr = mmap_shared(fd, 4096);
         assert!(!ptr.is_null());
 
@@ -349,7 +349,7 @@ mod tests {
     fn test_memfd_create_and_ftruncate() {
         let fd = memfd_create(b"test_memfd");
         assert!(fd >= 0, "memfd_create failed: {fd}");
-        assert_eq!(crate::sys::ftruncate(fd, 4096), 0);
+        assert_eq!(crate::foundation::posix_io::ftruncate(fd, 4096), 0);
         // Verify size
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         unsafe { libc::fstat(fd, &mut stat); }
@@ -361,7 +361,7 @@ mod tests {
     fn test_mmap_shared() {
         let fd = memfd_create(b"test_mmap");
         assert!(fd >= 0);
-        assert_eq!(crate::sys::ftruncate(fd, 8192), 0);
+        assert_eq!(crate::foundation::posix_io::ftruncate(fd, 8192), 0);
         let ptr = mmap_shared(fd, 8192);
         assert!(!ptr.is_null(), "mmap_shared returned null");
         // Write and read back

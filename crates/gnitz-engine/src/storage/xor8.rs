@@ -1,4 +1,4 @@
-use crate::xxh;
+use crate::foundation::xxh;
 use xorf::{Filter, Xor8};
 
 const MAGIC: &[u8; 4] = b"GXF1";

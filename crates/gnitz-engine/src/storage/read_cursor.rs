@@ -2030,7 +2030,7 @@ mod tests {
     /// to the row-major scatter.  Now the column-major path handles it directly.
     #[test]
     fn test_scatter_constant_pk_shard() {
-        crate::util::raise_fd_limit_for_tests();
+        crate::foundation::posix_io::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_i64();
 

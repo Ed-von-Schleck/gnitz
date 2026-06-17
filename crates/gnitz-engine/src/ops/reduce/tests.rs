@@ -6,6 +6,7 @@ use crate::schema::{
     type_code,
 };
 use crate::storage::{Batch, ConsolidatedBatch};
+use crate::foundation::codec::{read_i64_le, read_u64_le};
 
 use super::super::util::{
     extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse,
@@ -208,7 +209,7 @@ fn test_reduce_sum_retraction() {
     );
     // SUM of (100+200+300) = 600
     assert_eq!(out1.count, 1);
-    let sum1 = crate::util::read_i64_le(out1.col_data(1), 0);
+    let sum1 = read_i64_le(out1.col_data(1), 0);
     assert_eq!(sum1, 600);
 
     // Tick 2: retract pk=2 (val=200) → SUM should go from 600 to 400
@@ -348,8 +349,8 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     assert_eq!(raw1.count, 1);
     assert_eq!(fin1.count, 1);
     assert_eq!(fin1.get_weight(0), 1);
-    assert_eq!(crate::util::read_i64_le(fin1.col_data(1), 0), 2, "count=2");
-    assert_eq!(crate::util::read_i64_le(fin1.col_data(2), 0), 5, "sum=5");
+    assert_eq!(read_i64_le(fin1.col_data(1), 0), 2, "count=2");
+    assert_eq!(read_i64_le(fin1.col_data(2), 0), 5, "sum=5");
     assert_eq!((fin1.get_null_word(0) >> 2) & 1, 0, "sum non-null while a contributor remains");
 
     // Tick 2: retract (pk1, val=5). The group survives via (pk2, NULL): count
@@ -384,7 +385,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         .find(|&r| fin2.get_weight(r) == 1)
         .expect("an insert row");
     assert_eq!(
-        crate::util::read_i64_le(fin2.col_data(1), insert_row * 8), 1,
+        read_i64_le(fin2.col_data(1), insert_row * 8), 1,
         "COUNT(*) survives at 1",
     );
     assert_eq!(
@@ -399,7 +400,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         .expect("a retract row");
     assert_eq!((fin2.get_null_word(retract_row) >> 2) & 1, 0, "retracted SUM was non-null");
     assert_eq!(
-        crate::util::read_i64_le(fin2.col_data(2), retract_row * 8), 5,
+        read_i64_le(fin2.col_data(2), retract_row * 8), 5,
         "retracted SUM = 5",
     );
 }
@@ -586,7 +587,7 @@ fn reduce_trace_seek_wide_pk() {
     );
     assert_eq!(out1.count, 1, "one group");
     assert_eq!(out1.get_pk_bytes(0), &pk(7, 7, 7)[..]);
-    assert_eq!(crate::util::read_i64_le(out1.col_data(0), 0), 300);
+    assert_eq!(read_i64_le(out1.col_data(0), 0), 300);
 
     // Tick 2: retract the val=200 row. SUM 300 → 100; reads the prior aggregate
     // out of trace_out by PK bytes.
@@ -613,9 +614,9 @@ fn reduce_trace_seek_wide_pk() {
         "wide-PK retraction must read trace_out and emit retract+insert");
     assert_eq!(out2.get_weight(0), -1);
     assert_eq!(out2.get_pk_bytes(0), &pk(7, 7, 7)[..]);
-    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 0), 300, "retracted old SUM");
+    assert_eq!(read_i64_le(out2.col_data(0), 0), 300, "retracted old SUM");
     assert_eq!(out2.get_weight(1), 1);
-    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 8), 100, "new SUM");
+    assert_eq!(read_i64_le(out2.col_data(0), 8), 100, "new SUM");
 }
 
 /// Incremental REDUCE over a narrow COMPOUND PK (2×U64, stride 16), GROUP BY
@@ -677,9 +678,9 @@ fn reduce_trace_seek_compound_pk() {
     );
     assert_eq!(out1.count, 2, "two groups");
     assert_eq!(out1.get_pk_bytes(0), &pk(1, 5)[..]);
-    assert_eq!(crate::util::read_i64_le(out1.col_data(0), 0), 100);
+    assert_eq!(read_i64_le(out1.col_data(0), 0), 100);
     assert_eq!(out1.get_pk_bytes(1), &pk(2, 3)[..]);
-    assert_eq!(crate::util::read_i64_le(out1.col_data(0), 8), 200);
+    assert_eq!(read_i64_le(out1.col_data(0), 8), 200);
 
     // Tick 2: insert (2,3)->50. SUM for (2,3) goes 200 → 250: retract 200,
     // insert 250. Group (1,5) is untouched.
@@ -705,9 +706,9 @@ fn reduce_trace_seek_compound_pk() {
         "compound-PK retraction must read trace_out and emit retract+insert");
     assert_eq!(out2.get_pk_bytes(0), &pk(2, 3)[..]);
     assert_eq!(out2.get_weight(0), -1);
-    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 0), 200, "retracted old SUM");
+    assert_eq!(read_i64_le(out2.col_data(0), 0), 200, "retracted old SUM");
     assert_eq!(out2.get_weight(1), 1);
-    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 8), 250, "new SUM");
+    assert_eq!(read_i64_le(out2.col_data(0), 8), 250, "new SUM");
 }
 
 /// Incremental REDUCE over a narrow SIGNED single-column PK (I64), GROUP BY the
@@ -764,7 +765,7 @@ fn reduce_trace_seek_signed_pk() {
     );
     assert_eq!(out1.count, 2, "two groups (-1 sorts before 2)");
     assert_eq!(opk_pk_i64(out1.get_pk_bytes(0)), -1);
-    assert_eq!(crate::util::read_i64_le(out1.col_data(0), 0), 200);
+    assert_eq!(read_i64_le(out1.col_data(0), 0), 200);
 
     // Tick 2: insert key=-1 -> 50. SUM goes 200 → 250: retract + insert.
     let prev_out = Rc::new(out1);
@@ -789,9 +790,9 @@ fn reduce_trace_seek_signed_pk() {
         "signed-PK retraction must read trace_out and emit retract+insert");
     assert_eq!(opk_pk_i64(out2.get_pk_bytes(0)), -1);
     assert_eq!(out2.get_weight(0), -1);
-    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 0), 200, "retracted old SUM");
+    assert_eq!(read_i64_le(out2.col_data(0), 0), 200, "retracted old SUM");
     assert_eq!(out2.get_weight(1), 1);
-    assert_eq!(crate::util::read_i64_le(out2.col_data(0), 8), 250, "new SUM");
+    assert_eq!(read_i64_le(out2.col_data(0), 8), 250, "new SUM");
 }
 
 #[test]
@@ -831,7 +832,7 @@ fn test_reduce_count() {
     // Each pk forms its own group, COUNT=1 for each
     assert_eq!(out.count, 3);
     for i in 0..3 {
-        let count = crate::util::read_i64_le(out.col_data(0), i * 8);
+        let count = read_i64_le(out.col_data(0), i * 8);
         assert_eq!(count, 1, "each single-row group has count=1");
     }
 }
@@ -904,7 +905,7 @@ fn test_reduce_gi_same_pk_multiple_payloads() {
          `if` leaves replay empty → no output");
 
     // Output payload layout: col_data[0]=grp(I64), col_data[1]=agg(I64)
-    let agg = crate::util::read_i64_le(out.col_data(1), 0);
+    let agg = read_i64_le(out.col_data(1), 0);
     assert_eq!(agg, zebra_ck,
         "MAX of {{zebra+1}} must be zebra_ck; got {agg} (apple_ck={apple_ck})");
 }
@@ -949,7 +950,7 @@ fn test_gather_reduce_retraction() {
 
     let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
     assert_eq!(out1.count, 1);
-    let global_count = crate::util::read_i64_le(out1.col_data(0), 0);
+    let global_count = read_i64_le(out1.col_data(0), 0);
     assert_eq!(global_count, 4);
 
     // Tick 2: retract 1 from each worker → partial counts are -1 each → global delta = -2
@@ -1132,9 +1133,9 @@ fn test_reduce_sum_i32() {
     );
     assert_eq!(out.count, 3);
     // Check values: row offsets depend on PK order (group_by_pk path)
-    let sum0 = crate::util::read_i64_le(out.col_data(0), 0);
-    let sum1 = crate::util::read_i64_le(out.col_data(0), 8);
-    let sum2 = crate::util::read_i64_le(out.col_data(0), 16);
+    let sum0 = read_i64_le(out.col_data(0), 0);
+    let sum1 = read_i64_le(out.col_data(0), 8);
+    let sum2 = read_i64_le(out.col_data(0), 16);
     assert_eq!(sum0, 100, "SUM of I32 100");
     assert_eq!(sum1, 200, "SUM of I32 200");
     assert_eq!(sum2, -50, "SUM of I32 -50 (sign extension)");
@@ -1213,7 +1214,7 @@ fn test_reduce_max_i16() {
         None, false, TypeCode::U64, None, 0, None, None,
     );
     assert_eq!(out.count, 1);
-    let max_val = crate::util::read_i64_le(out.col_data(0), 0);
+    let max_val = read_i64_le(out.col_data(0), 0);
     assert_eq!(max_val, 200, "MAX of I16 {{-100, 200, 50}} should be 200");
 }
 
@@ -1253,7 +1254,7 @@ fn test_gather_reduce_min_retraction() {
 
     let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
     assert_eq!(out1.count, 1);
-    let min1 = crate::util::read_i64_le(out1.col_data(0), 0);
+    let min1 = read_i64_le(out1.col_data(0), 0);
     assert_eq!(min1, 5);
 
     // Tick 2: partial MIN=3 from one worker. The old global (5) should be folded in
@@ -1272,10 +1273,10 @@ fn test_gather_reduce_min_retraction() {
     let out2 = op_gather_reduce(&partial2, to_ch2.cursor_mut(), &schema, &[agg]);
     // Should have: retract old (5, w=-1) + insert new (3, w=+1)
     assert_eq!(out2.count, 2, "should retract old MIN and emit new MIN");
-    let retracted = crate::util::read_i64_le(out2.col_data(0), 0);
+    let retracted = read_i64_le(out2.col_data(0), 0);
     assert_eq!(retracted, 5, "retraction should be old MIN value 5");
     assert_eq!(out2.get_weight(0), -1);
-    let new_min = crate::util::read_i64_le(out2.col_data(0), 8);
+    let new_min = read_i64_le(out2.col_data(0), 8);
     assert_eq!(new_min, 3, "new MIN should be 3 (min of old 5 and partial 3)");
     assert_eq!(out2.get_weight(1), 1);
 }
@@ -2240,7 +2241,7 @@ fn test_reduce_min_pk_col_compound_pk() {
     // per input row; MIN within each group equals the row's pk_col_1.
     assert_eq!(out.count, 2);
     let mins: Vec<i64> = (0..out.count)
-        .map(|i| crate::util::read_i64_le(out.col_data(0), i * 8))
+        .map(|i| read_i64_le(out.col_data(0), i * 8))
         .collect();
     // Output is in pk_indices order = [0, 1] ascending, so (10,7) precedes (20,3).
     assert_eq!(mins, vec![7, 3],
@@ -2283,7 +2284,7 @@ fn test_reduce_min_pk_col_single_pk_u64() {
     // GROUP BY pk → each row is its own group; MIN(pk) per group equals the row's pk.
     assert_eq!(out.count, 3);
     let mins: Vec<i64> = (0..out.count)
-        .map(|i| crate::util::read_i64_le(out.col_data(0), i * 8))
+        .map(|i| read_i64_le(out.col_data(0), i * 8))
         .collect();
     assert_eq!(mins, vec![7, 42, 99]);
 }
@@ -2545,7 +2546,7 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
             let pk_bytes = out.get_pk_bytes(i);
             // Output group-key PK is unsigned U64, OPK == BE at rest.
             let pk = u64::from_be_bytes(pk_bytes.try_into().unwrap());
-            let cnt = crate::util::read_i64_le(out.col_data(0), i * 8);
+            let cnt = read_i64_le(out.col_data(0), i * 8);
             (pk, cnt)
         })
         .collect();
@@ -2980,7 +2981,7 @@ fn test_reduce_min_max_i64_boundary() {
             None, false, TypeCode::U64, None, 0, None, None,
         );
         assert_eq!(out.count, 1);
-        let min = crate::util::read_i64_le(out.col_data(1), 0);
+        let min = read_i64_le(out.col_data(1), 0);
         assert_eq!(min, i64::MIN, "MIN(I64) signed ordering preserved");
     }
 
@@ -3006,7 +3007,7 @@ fn test_reduce_min_max_i64_boundary() {
             None, false, TypeCode::U64, None, 0, None, None,
         );
         assert_eq!(out.count, 1);
-        let max = crate::util::read_i64_le(out.col_data(1), 0);
+        let max = read_i64_le(out.col_data(1), 0);
         assert_eq!(max, i64::MAX, "MAX(I64) signed ordering preserved");
     }
 }
@@ -3181,8 +3182,8 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
     let pk1_val = u128::from_be_bytes(pk1.try_into().unwrap());
     assert_eq!(pk0_val, 3, "PK-sorted: 3 precedes 5");
     assert_eq!(pk1_val, 5);
-    let sum0 = crate::util::read_i64_le(out.col_data(0), 0);
-    let sum1 = crate::util::read_i64_le(out.col_data(0), 8);
+    let sum0 = read_i64_le(out.col_data(0), 0);
+    let sum1 = read_i64_le(out.col_data(0), 8);
     assert_eq!(sum0, 20, "SUM for pk=3");
     assert_eq!(sum1, 40, "SUM for pk=5 (10+30) — pre-fix produced two split rows");
     assert!(out.sorted, "output is PK-sorted by the fast path");
@@ -3221,8 +3222,8 @@ fn test_reduce_group_by_pk_unsorted_input_count() {
     let pk0 = u128::from_be_bytes(out.get_pk_bytes(0).try_into().unwrap());
     let pk1 = u128::from_be_bytes(out.get_pk_bytes(1).try_into().unwrap());
     assert_eq!((pk0, pk1), (3, 5));
-    let c0 = crate::util::read_i64_le(out.col_data(0), 0);
-    let c1 = crate::util::read_i64_le(out.col_data(0), 8);
+    let c0 = read_i64_le(out.col_data(0), 0);
+    let c1 = read_i64_le(out.col_data(0), 8);
     assert_eq!((c0, c1), (1, 2), "pk=3 → 1, pk=5 → 2");
 }
 
@@ -3261,8 +3262,8 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
     let pk0 = u128::from_be_bytes(out.get_pk_bytes(0).try_into().unwrap());
     let pk1 = u128::from_be_bytes(out.get_pk_bytes(1).try_into().unwrap());
     assert_eq!((pk0, pk1), (3, 5));
-    let sum0 = crate::util::read_i64_le(out.col_data(0), 0);
-    let sum1 = crate::util::read_i64_le(out.col_data(0), 8);
+    let sum0 = read_i64_le(out.col_data(0), 0);
+    let sum1 = read_i64_le(out.col_data(0), 8);
     assert_eq!((sum0, sum1), (20, 40));
 }
 
@@ -3369,7 +3370,7 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
         })
         .collect();
     let sums: Vec<i64> = (0..out.count)
-        .map(|i| crate::util::read_i64_le(out.col_data(0), i * 8))
+        .map(|i| read_i64_le(out.col_data(0), i * 8))
         .collect();
     // Canonical signed order: -3, -1, 2.
     assert_eq!(pks, vec![-3, -1, 2],
@@ -3426,7 +3427,7 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
         .map(|i| {
             let pk = u128::from_be_bytes(out.get_pk_bytes(i).try_into().unwrap());
             let w = out.get_weight(i);
-            let sum = crate::util::read_i64_le(out.col_data(0), i * 8);
+            let sum = read_i64_le(out.col_data(0), i * 8);
             (pk, w, sum)
         })
         .collect();
@@ -3622,9 +3623,9 @@ fn avi_two_groups_distinct_byte_form_keys() {
     assert_eq!(out.count, 2, "two groups → two rows");
     // Output payload: a at pi 0, b at pi 1, min at pi 2.
     for i in 0..out.count {
-        let a = crate::util::read_u32_le(out.col_data(0), i * 4);
-        let bb = crate::util::read_u32_le(out.col_data(1), i * 4);
-        let min = crate::util::read_i64_le(out.col_data(2), i * 8);
+        let a = crate::foundation::codec::read_u32_le(out.col_data(0), i * 4);
+        let bb = crate::foundation::codec::read_u32_le(out.col_data(1), i * 4);
+        let min = read_i64_le(out.col_data(2), i * 8);
         let expected = match (a, bb) {
             (1, 1) => 10,
             (2, 2) => 20,
@@ -3737,7 +3738,7 @@ fn avi_retraction_returns_next_extremum() {
     let mut inserted = None;
     for i in 0..out.count {
         let w = out.get_weight(i);
-        let v = crate::util::read_i64_le(out.col_data(1), i * 8);
+        let v = read_i64_le(out.col_data(1), i * 8);
         if w < 0 { retracted = Some(v); } else { inserted = Some(v); }
     }
     assert_eq!(retracted, Some(5), "must retract the stale MIN");
@@ -3821,7 +3822,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
 
         assert_eq!(out.count, 1, "stride {stride}");
         // Output payload: g at pi 0, min at pi 1.
-        let min = crate::util::read_i64_le(out.col_data(1), 0);
+        let min = read_i64_le(out.col_data(1), 0);
         assert_eq!(min, 42, "stride {stride}: indexed MIN");
     }
 }
@@ -3916,7 +3917,7 @@ fn trace_scan_retraction_recomputes_min() {
     let mut new_min = None;
     for i in 0..out.count {
         let w = out.get_weight(i);
-        let v = crate::util::read_i64_le(out.col_data(1), i * 8);
+        let v = read_i64_le(out.col_data(1), i * 8);
         if w > 0 {
             new_min = Some(v);
         }
@@ -4013,7 +4014,7 @@ fn min_tie_retract_one_copy_keeps_min() {
     let mut new_min = None;
     for i in 0..out.count {
         if out.get_weight(i) > 0 {
-            new_min = Some(crate::util::read_i64_le(out.col_data(1), i * 8));
+            new_min = Some(read_i64_le(out.col_data(1), i * 8));
         }
     }
     assert_eq!(new_min, Some(5),
@@ -4083,7 +4084,7 @@ fn min_ignores_null_values() {
     );
 
     assert_eq!(out.count, 1);
-    let min = crate::util::read_i64_le(out.col_data(1), 0);
+    let min = read_i64_le(out.col_data(1), 0);
     assert_eq!(min, 3, "MIN must ignore the NULL row and pick 3, not 0");
 }
 
@@ -4188,7 +4189,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
     let mut inserted = None;
     for i in 0..out.count {
         if out.get_weight(i) > 0 {
-            inserted = Some(crate::util::read_i64_le(out.col_data(2), i * 8));
+            inserted = Some(read_i64_le(out.col_data(2), i * 8));
         }
     }
     assert_eq!(inserted, Some(9),
@@ -4331,9 +4332,9 @@ fn avi_wide_two_u64_groups_match_reference() {
     assert_eq!(out.count, reference.len(), "one row per group");
     let mut seen: BTreeMap<(u64, u64), i64> = BTreeMap::new();
     for i in 0..out.count {
-        let a = crate::util::read_u64_le(out.col_data(0), i * 8);
-        let b = crate::util::read_u64_le(out.col_data(1), i * 8);
-        let m = crate::util::read_i64_le(out.col_data(2), i * 8);
+        let a = read_u64_le(out.col_data(0), i * 8);
+        let b = read_u64_le(out.col_data(1), i * 8);
+        let m = read_i64_le(out.col_data(2), i * 8);
         seen.insert((a, b), m);
     }
     assert_eq!(seen, reference,
@@ -4423,7 +4424,7 @@ fn avi_wide_single_u128_group_distinct() {
     assert_eq!(out.count, 2);
     for i in 0..out.count {
         let g = out.get_pk(i);
-        let m = crate::util::read_i64_le(out.col_data(0), i * 8);
+        let m = read_i64_le(out.col_data(0), i * 8);
         let expected = if g == g1 { 10 } else if g == g2 { 20 } else { panic!("group {g}") };
         assert_eq!(m, expected, "U128 group {g} must resolve its own MIN");
     }
@@ -4523,9 +4524,9 @@ fn avi_wide_mixed_signed_unsigned_key() {
 
     assert_eq!(out.count, 3);
     for i in 0..out.count {
-        let a = crate::util::read_i64_le(out.col_data(0), i * 8);
-        let bb = crate::util::read_u64_le(out.col_data(1), i * 8);
-        let m = crate::util::read_i64_le(out.col_data(2), i * 8);
+        let a = read_i64_le(out.col_data(0), i * 8);
+        let bb = read_u64_le(out.col_data(1), i * 8);
+        let m = read_i64_le(out.col_data(2), i * 8);
         let expected = match (a, bb) {
             (-5, 10) => 100,
             (-5, 11) => 50,
@@ -4624,8 +4625,8 @@ fn avi_wide_prefix_collision_distinct_groups() {
     );
 
     assert_eq!(out.count, 1, "delta touched only group (1,2,3)");
-    let c = crate::util::read_u64_le(out.col_data(2), 0);
-    let m = crate::util::read_i64_le(out.col_data(3), 0);
+    let c = read_u64_le(out.col_data(2), 0);
+    let m = read_i64_le(out.col_data(3), 0);
     assert_eq!(c, 3, "must resolve group (1,2,3)");
     assert_eq!(m, 100,
         "the 16-byte-prefix-sharing decoy (1,2,4)'s smaller value must not leak");
@@ -4736,7 +4737,7 @@ fn avi_wide_retraction_returns_next_extremum() {
     let mut inserted = None;
     for i in 0..out.count {
         let w = out.get_weight(i);
-        let v = crate::util::read_i64_le(out.col_data(2), i * 8);
+        let v = read_i64_le(out.col_data(2), i * 8);
         if w < 0 { retracted = Some(v); } else { inserted = Some(v); }
     }
     assert_eq!(retracted, Some(5), "must retract the stale wide-key MIN");
@@ -4932,7 +4933,7 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
     assert!(out.sorted && out.consolidated, "group-by-PK output must be sorted+consolidated");
     let mut counts: Vec<i64> = (0..out.count)
         .filter(|&i| out.get_weight(i) > 0)
-        .map(|i| crate::util::read_i64_le(out.col_data(0), i * 8))
+        .map(|i| read_i64_le(out.col_data(0), i * 8))
         .collect();
     counts.sort_unstable();
     assert_eq!(counts, vec![1, 2], "two distinct compound PKs with counts 1 and 2");
@@ -5171,8 +5172,8 @@ fn read_grp_min_pairs(out: &Batch) -> Vec<(i64, i64)> {
     let mut pairs: Vec<(i64, i64)> = (0..out.count)
         .filter(|&i| out.get_weight(i) > 0)
         .map(|i| {
-            let g = crate::util::read_i64_le(grp_data, i * 8);
-            let m = crate::util::read_i64_le(min_data, i * 8);
+            let g = read_i64_le(grp_data, i * 8);
+            let m = read_i64_le(min_data, i * 8);
             (g, m)
         })
         .collect();
@@ -5281,8 +5282,8 @@ fn run_fallback_min_i64_grp(
     let mut live: std::collections::BTreeMap<i64, i64> = got1.iter().cloned().collect();
     for i in 0..out2.count {
         let w = out2.get_weight(i);
-        let g = crate::util::read_i64_le(grp_data, i * 8);
-        let m = crate::util::read_i64_le(min_data, i * 8);
+        let g = read_i64_le(grp_data, i * 8);
+        let m = read_i64_le(min_data, i * 8);
         if w < 0 {
             live.remove(&g);
         } else if w > 0 {
@@ -5423,7 +5424,7 @@ fn fallback_min_multi_col_group() {
     // No retraction (trace_out was empty), just one insert for group (1,1).
     assert_eq!(out2.count, 1, "tick 2 must emit one row for group (1,1)");
     let out2_min = out2.col_data(2);
-    let new_min = crate::util::read_i64_le(out2_min, 0);
+    let new_min = read_i64_le(out2_min, 0);
     assert_eq!(new_min, 5,
         "MIN for group (1,1) must be 5 — trace rows (10,20) + delta (5) → min=5");
 }
@@ -5712,7 +5713,7 @@ fn test_reduce_max_blob_group_retraction() {
     );
     assert_eq!(out1.count, 2, "two distinct blobs → two groups (must not merge on shared prefix)");
     let maxes1: std::collections::BTreeSet<i64> = (0..out1.count)
-        .map(|i| crate::util::read_i64_le(out1.col_data(1), i * 8))
+        .map(|i| read_i64_le(out1.col_data(1), i * 8))
         .collect();
     assert_eq!(maxes1, [20i64, 30].into_iter().collect(),
         "MAX(blob_a)=30, MAX(blob_b)=20");
@@ -5735,9 +5736,9 @@ fn test_reduce_max_blob_group_retraction() {
     // blob_a's MAX updates 30 → 10: retract old (30, w=-1) + insert new (10, w=+1).
     // blob_b is untouched.
     let retract = (0..out2.count).find(|&i| out2.get_weight(i) < 0)
-        .map(|i| crate::util::read_i64_le(out2.col_data(1), i * 8));
+        .map(|i| read_i64_le(out2.col_data(1), i * 8));
     let insert = (0..out2.count).find(|&i| out2.get_weight(i) > 0)
-        .map(|i| crate::util::read_i64_le(out2.col_data(1), i * 8));
+        .map(|i| read_i64_le(out2.col_data(1), i * 8));
     assert_eq!(retract, Some(30), "retract old MAX(blob_a)=30");
     assert_eq!(insert, Some(10), "insert new MAX(blob_a)=10 after the 30 row is gone");
 }
@@ -5775,6 +5776,6 @@ fn gather_combine_skips_null_partial() {
     let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
     let out = op_gather_reduce(&partial, to_ch.cursor_mut(), &schema, &[agg_min]);
     assert_eq!(out.count, 1);
-    assert_eq!(crate::util::read_i64_le(out.col_data(0), 0), 5,
+    assert_eq!(read_i64_le(out.col_data(0), 0), 5,
         "gather MIN must ignore the all-NULL partial, not combine it as 0");
 }

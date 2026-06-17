@@ -177,7 +177,7 @@ mod tests {
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
 
         assert_eq!(out.count, 2, "only the 10-retract and 40-insert transition");
-        let payload = |r: usize| crate::util::read_i64_le(out.col_data(0), r * 8);
+        let payload = |r: usize| crate::foundation::codec::read_i64_le(out.col_data(0), r * 8);
         assert_eq!((payload(0), out.get_weight(0)), (10, -1));
         assert_eq!((payload(1), out.get_weight(1)), (40, 1));
     }

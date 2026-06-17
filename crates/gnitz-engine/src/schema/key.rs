@@ -110,7 +110,7 @@ pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
     if bytes.len() <= 16 {
         mix(gnitz_wire::widen_pk_be(bytes, bytes.len()))
     } else {
-        (crate::xxh::checksum(bytes) >> 56) as usize
+        (crate::foundation::xxh::checksum(bytes) >> 56) as usize
     }
 }
 

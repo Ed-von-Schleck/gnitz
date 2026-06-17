@@ -10,7 +10,7 @@ use super::columnar::ColumnarSource;
 use super::merge::{self, MemBatch};
 use super::shard_file;
 use crate::schema::{self, BlobCache, SchemaDescriptor};
-use crate::util::{read_i64_le, read_u64_le};
+use crate::foundation::codec::{read_i64_le, read_u64_le};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
 #[inline(always)]
@@ -52,7 +52,7 @@ pub(super) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 fn alloc_large_zeroed(size: usize) -> Vec<u8> {
     let v = vec![0u8; size];
     if size >= HUGEPAGE_THRESHOLD {
-        crate::sys::madvise_hugepage(v.as_ptr() as *mut u8, size);
+        crate::foundation::posix_io::madvise_hugepage(v.as_ptr() as *mut u8, size);
     }
     v
 }
@@ -306,7 +306,7 @@ impl Batch {
         // zeroed allocation.
         let data = if total_size >= HUGEPAGE_THRESHOLD {
             let mut v = vec![0u8; total_size];
-            crate::sys::madvise_hugepage(v.as_mut_ptr(), total_size);
+            crate::foundation::posix_io::madvise_hugepage(v.as_mut_ptr(), total_size);
             v
         } else {
             let mut buf = super::batch_pool::acquire_buf();
@@ -617,7 +617,7 @@ impl Batch {
                 // We still want THP backing for large buffers.
                 let mut v = Vec::with_capacity(new_total);
                 unsafe { v.set_len(new_total); }
-                crate::sys::madvise_hugepage(v.as_ptr() as *mut u8, new_total);
+                crate::foundation::posix_io::madvise_hugepage(v.as_ptr() as *mut u8, new_total);
                 v
             } else {
                 let mut buf = super::batch_pool::acquire_buf();
@@ -1829,7 +1829,7 @@ pub fn write_to_batch(
         buf.clear();
         buf.reserve(max_blob);
         if max_blob >= HUGEPAGE_THRESHOLD {
-            crate::sys::madvise_hugepage(buf.as_mut_ptr(), buf.capacity());
+            crate::foundation::posix_io::madvise_hugepage(buf.as_mut_ptr(), buf.capacity());
         }
         buf
     };
@@ -2269,7 +2269,7 @@ mod tests {
         // preserve byte-for-byte equivalence with the old extend_pk(pk)
         // path: the stored PK region bytes are the same LE bytes
         // extend_pk would have written.
-        crate::util::raise_fd_limit_for_tests();
+        crate::foundation::posix_io::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("appendrow_byte_test");
         let schema = SchemaDescriptor::new(

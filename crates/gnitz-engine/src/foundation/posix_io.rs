@@ -1,20 +1,86 @@
-//! Non-IPC Linux syscall wrappers: fallocate, fdatasync, NOCOW, madvise,
-//! server socket, fd-limit.
-//!
-//! Split from ipc_sys.rs — these are pure OS helpers with no IPC dependency.
+//! POSIX I/O primitives and non-IPC Linux syscall wrappers: fd read/write with
+//! EINTR/partial-write handling, fdatasync/fsync, fallocate, ftruncate, NOCOW,
+//! madvise, server socket, fd-limit, plus the `catch_unwind` panic guard.
+
+use libc::c_int;
+
+/// Write all bytes to fd, handling partial writes and EINTR.
+/// Returns 0 on success, -3 on error.
+pub unsafe fn write_all_fd(fd: c_int, data: &[u8]) -> i32 {
+    let mut written: usize = 0;
+    let total = data.len();
+    while written < total {
+        let ret = libc::write(
+            fd,
+            data[written..].as_ptr() as *const libc::c_void,
+            total - written,
+        );
+        if ret < 0 {
+            let e = *libc::__errno_location();
+            if e == libc::EINTR {
+                continue;
+            }
+            return -3;
+        }
+        if ret == 0 {
+            // POSIX guarantees regular files never return 0 for a non-zero
+            // count, but some device types can — without this guard the loop
+            // would spin forever at 100% CPU. Treat it as an error.
+            return -3;
+        }
+        written += ret as usize;
+    }
+    0
+}
+
+/// Read up to `buf.len()` bytes from fd. Returns bytes read, or -3 on error.
+pub unsafe fn read_all_fd(fd: c_int, buf: &mut [u8]) -> i64 {
+    let total = buf.len();
+    let mut offset: usize = 0;
+    while offset < total {
+        let ret = libc::read(
+            fd,
+            buf[offset..].as_mut_ptr() as *mut libc::c_void,
+            total - offset,
+        );
+        if ret < 0 {
+            let e = *libc::__errno_location();
+            if e == libc::EINTR {
+                continue;
+            }
+            return -3;
+        }
+        if ret == 0 {
+            break; // EOF
+        }
+        offset += ret as usize;
+    }
+    offset as i64
+}
+
+/// `fdatasync` with EINTR retry. Returns the OS error on any other failure.
+pub(crate) fn fdatasync_eintr(fd: c_int) -> std::io::Result<()> {
+    loop {
+        let rc = unsafe { libc::fdatasync(fd) };
+        if rc >= 0 { return Ok(()); }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted { return Err(err); }
+    }
+}
+
+/// `fsync` with EINTR retry. Returns the OS error on any other failure.
+pub(crate) fn fsync_eintr(fd: c_int) -> std::io::Result<()> {
+    loop {
+        let rc = unsafe { libc::fsync(fd) };
+        if rc >= 0 { return Ok(()); }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted { return Err(err); }
+    }
+}
 
 /// Pre-allocate blocks for fd. Returns 0 on success, -1 on error.
 pub fn fallocate(fd: i32, length: i64) -> i32 {
     unsafe { libc::fallocate(fd, 0, 0, length as libc::off_t) }
-}
-
-/// Pre-allocate blocks without changing file size (FALLOC_FL_KEEP_SIZE).
-/// Useful for WAL files opened with O_APPEND — allocates extents so future
-/// writes avoid extent-tree allocation overhead on btrfs/XFS.
-/// Returns 0 on success, -1 on error (non-fatal).
-#[allow(dead_code)]
-pub fn fallocate_keep_size(fd: i32, length: i64) -> i32 {
-    unsafe { libc::fallocate(fd, libc::FALLOC_FL_KEEP_SIZE, 0, length as libc::off_t) }
 }
 
 /// Set file size via ftruncate. Returns 0 on success, -1 on error.
@@ -151,6 +217,34 @@ pub fn raise_fd_limit(target: u64) -> i64 {
     }
 }
 
+/// Run `f` under `catch_unwind`. On panic, returns
+/// `Err("internal server error (panic in <op>)")`. Otherwise the closure's
+/// `Result` is returned unchanged. Used in async handlers and the committer
+/// task where a panic must not propagate (per async-invariants V.4 / V.7).
+pub fn guard_panic<T, F>(op: &'static str, f: F) -> Result<T, String>
+where F: FnOnce() -> Result<T, String>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(_) => Err(format!("internal server error (panic in {op})")),
+    }
+}
+
+/// Raise RLIMIT_NOFILE soft limit to the hard limit.
+/// Called once per process via `std::sync::Once`; safe to invoke from any test.
+#[cfg(test)]
+pub fn raise_fd_limit_for_tests() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| unsafe {
+        let mut rlim: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 && rlim.rlim_cur < rlim.rlim_max {
+            rlim.rlim_cur = rlim.rlim_max;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -158,10 +252,25 @@ pub fn raise_fd_limit(target: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn test_write_all_fd_roundtrip() {
+        // Guards the happy path of the partial-write loop (and that the new
+        // ret==0 guard does not break a normal full write).
+        let mut f = tempfile::tempfile().unwrap();
+        let data = b"hello write_all_fd partial-write loop";
+        let rc = unsafe { write_all_fd(f.as_raw_fd(), data) };
+        assert_eq!(rc, 0);
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        assert_eq!(&buf, data);
+    }
 
     #[test]
     fn test_fallocate() {
-        use std::os::unix::io::AsRawFd;
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let raw_fd = tmp.as_file().as_raw_fd();
         let r = fallocate(raw_fd, 1048576);
@@ -172,25 +281,9 @@ mod tests {
     }
 
     #[test]
-    fn test_fallocate_keep_size() {
-        use std::os::unix::io::AsRawFd;
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let raw_fd = tmp.as_file().as_raw_fd();
-        let r = fallocate_keep_size(raw_fd, 1048576);
-        // May return -1 on filesystems that don't support KEEP_SIZE (non-fatal)
-        if r == 0 {
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            unsafe { libc::fstat(raw_fd, &mut stat); }
-            assert_eq!(stat.st_size, 0, "KEEP_SIZE must not change st_size");
-            assert!(stat.st_blocks > 0, "blocks should be allocated");
-        }
-    }
-
-    #[test]
     fn test_try_set_nocow() {
         // On non-btrfs this returns -1, but must not crash
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        use std::os::unix::io::AsRawFd;
         let raw_fd = tmp.as_file().as_raw_fd();
         let _ = try_set_nocow(raw_fd); // just verify no crash/panic
     }

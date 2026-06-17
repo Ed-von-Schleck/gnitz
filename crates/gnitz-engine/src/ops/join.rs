@@ -832,6 +832,7 @@ fn write_join_row_from_batches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::foundation::codec::read_i64_le;
     use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
     use crate::storage::{Batch, ConsolidatedBatch};
     use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
@@ -924,7 +925,7 @@ mod tests {
     }
 
     fn get_payload_i64(b: &Batch, row: usize) -> i64 {
-        crate::util::read_i64_le(b.col_data(0), row * 8)
+        read_i64_le(b.col_data(0), row * 8)
     }
 
     fn make_schema_compound() -> SchemaDescriptor {
@@ -1529,8 +1530,8 @@ mod tests {
         // flag may be true ONLY if the rows are actually in (left, right) order.
         let pairs: Vec<(i64, i64)> = (0..out.count)
             .map(|r| (
-                crate::util::read_i64_le(out.col_data(0), r * 8),
-                crate::util::read_i64_le(out.col_data(1), r * 8),
+                read_i64_le(out.col_data(0), r * 8),
+                read_i64_le(out.col_data(1), r * 8),
             ))
             .collect();
         let actually_sorted = pairs.windows(2).all(|w| w[0] <= w[1]);
@@ -1548,7 +1549,7 @@ mod tests {
     /// emission order. The trace payload identifies which trace rows matched.
     fn range_out_pairs(out: &Batch) -> Vec<(i64, i64)> {
         (0..out.count)
-            .map(|r| (crate::util::read_i64_le(out.col_data(1), r * 8), out.get_weight(r)))
+            .map(|r| (read_i64_le(out.col_data(1), r * 8), out.get_weight(r)))
             .collect()
     }
 
@@ -1579,7 +1580,7 @@ mod tests {
             // The left PK (delta range key x) and left payload survive on every row.
             for r in 0..out.count {
                 assert_eq!(out.get_pk(r) as u64, 20);
-                assert_eq!(crate::util::read_i64_le(out.col_data(0), r * 8), 200);
+                assert_eq!(read_i64_le(out.col_data(0), r * 8), 200);
             }
         }
     }
@@ -1639,7 +1640,7 @@ mod tests {
         let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, RangeRel::Lt);
         // x=10 → {y<10}={105}; x=30 → {y<30}={105,115,125}. 4 rows total.
         let mut pairs: Vec<(u64, i64)> = (0..out.count)
-            .map(|r| (out.get_pk(r) as u64, crate::util::read_i64_le(out.col_data(1), r * 8)))
+            .map(|r| (out.get_pk(r) as u64, read_i64_le(out.col_data(1), r * 8)))
             .collect();
         pairs.sort_unstable();
         assert_eq!(pairs, vec![(10, 105), (30, 105), (30, 115), (30, 125)]);
@@ -1775,8 +1776,8 @@ mod tests {
         let mut m = std::collections::BTreeMap::new();
         for r in 0..out.count {
             let pk = out.get_pk_bytes(r).to_vec();
-            let lp = crate::util::read_i64_le(out.col_data(0), r * 8);
-            let rp = crate::util::read_i64_le(out.col_data(1), r * 8);
+            let lp = read_i64_le(out.col_data(0), r * 8);
+            let rp = read_i64_le(out.col_data(1), r * 8);
             *m.entry((pk, lp, rp)).or_insert(0i64) += out.get_weight(r);
         }
         m.retain(|_, w| *w != 0);

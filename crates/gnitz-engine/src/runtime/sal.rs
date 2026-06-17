@@ -5,17 +5,17 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::runtime::sys as ipc_sys;
-use crate::sys;
+use crate::foundation::syscall;
+use crate::foundation::posix_io;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, DirectWriter, carve_writer_slices, scatter_copy};
-use crate::util::{align8, read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw, write_u32_le};
+use crate::foundation::codec::{align8, read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw, write_u32_le};
 use crate::runtime::wire::{
     encode_wire_into, wire_size, STATUS_OK,
     build_schema_wire_block, encode_ctrl_block_direct, CTRL_BLOCK_SIZE_NO_BLOB,
     FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED,
 };
-use crate::xxh;
+use crate::foundation::xxh;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -670,7 +670,7 @@ impl SalWriter {
         let end_raw = (target + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let end = end_raw.min(self.mmap_size);
         if end > start {
-            sys::madvise_willneed(
+            posix_io::madvise_willneed(
                 unsafe { self.ptr.add(start as usize) },
                 (end - start) as usize,
             );
@@ -995,12 +995,12 @@ impl SalWriter {
 
     pub fn signal_all(&self) {
         for w in 0..self.num_workers {
-            ipc_sys::eventfd_signal(self.m2w_efds[w]);
+            syscall::eventfd_signal(self.m2w_efds[w]);
         }
     }
 
     pub fn signal_one(&self, worker: usize) {
-        ipc_sys::eventfd_signal(self.m2w_efds[worker]);
+        syscall::eventfd_signal(self.m2w_efds[worker]);
     }
 
     pub fn needs_checkpoint(&self) -> bool {
@@ -1081,6 +1081,6 @@ impl SalReader {
     }
 
     pub fn wait(&self, timeout_ms: i32) -> i32 {
-        ipc_sys::eventfd_wait(self.m2w_efd, timeout_ms)
+        syscall::eventfd_wait(self.m2w_efd, timeout_ms)
     }
 }

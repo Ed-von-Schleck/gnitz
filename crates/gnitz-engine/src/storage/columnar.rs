@@ -15,7 +15,7 @@ use crate::schema::{
         U128 as TYPE_U128, UUID as TYPE_UUID,
     },
 };
-use crate::util::{read_u32_le, read_u64_le};
+use crate::foundation::codec::{read_u32_le, read_u64_le};
 
 // ---------------------------------------------------------------------------
 // ColumnarSource trait

@@ -34,7 +34,7 @@ use crate::runtime::reactor::{
 };
 use crate::schema::{SchemaDescriptor, validate_schema_match};
 use crate::storage::Batch;
-use crate::util::guard_panic;
+use crate::foundation::posix_io::guard_panic;
 
 const TICK_COALESCE_ROWS: usize = 10_000;
 const TICK_DEADLINE_MS: u64 = 20;

@@ -3,7 +3,7 @@ use crate::runtime::sal::{
     MAX_WORKERS, FLAG_DDL_SYNC, FLAG_TXN_COMMIT,
     SAL_STATUS_HAS_DATA, SAL_STATUS_NO_DATA_FOR_WORKER, SAL_STATUS_NO_MESSAGE,
 };
-use crate::runtime::sys as ipc_sys;
+use crate::foundation::syscall;
 
 unsafe fn alloc_mmap(size: usize) -> *mut u8 {
     let ptr = libc::mmap(
@@ -201,7 +201,7 @@ fn test_sal_cross_process() {
     unsafe {
         let size = 1 << 20;
         let ptr = alloc_mmap(size);
-        let efd = ipc_sys::eventfd_create();
+        let efd = syscall::eventfd_create();
         assert!(efd >= 0);
 
         let pid = libc::fork();
@@ -213,11 +213,11 @@ fn test_sal_cross_process() {
                 ptr, 0, 1, 99, 555, 0, 1, size as u64,
                 ptrs.as_ptr(), sizes.as_ptr(),
             );
-            ipc_sys::eventfd_signal(efd);
+            syscall::eventfd_signal(efd);
             libc::_exit(0);
         }
 
-        let r = ipc_sys::eventfd_wait(efd, 5000);
+        let r = syscall::eventfd_wait(efd, 5000);
         assert!(r > 0, "eventfd timed out");
 
         let rr = sal_read_group_header(ptr, 0, 0);
@@ -359,8 +359,8 @@ fn test_commit_sentinel_round_trip() {
         // Sentinel via SalWriter at the same LSN. m2w_efds empty so
         // signal_all is a no-op (we never call it here anyway, but its
         // presence in SalWriter::new requires the vec).
-        let efd1 = ipc_sys::eventfd_create();
-        let efd2 = ipc_sys::eventfd_create();
+        let efd1 = syscall::eventfd_create();
+        let efd2 = syscall::eventfd_create();
         assert!(efd1 >= 0 && efd2 >= 0);
         let mut writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2]);
         writer.reset(r2.new_cursor, 1);
@@ -404,10 +404,10 @@ fn test_commit_sentinel_zero_payload() {
         let size = 1 << 20;
         let ptr = alloc_mmap(size);
 
-        let efd1 = ipc_sys::eventfd_create();
-        let efd2 = ipc_sys::eventfd_create();
-        let efd3 = ipc_sys::eventfd_create();
-        let efd4 = ipc_sys::eventfd_create();
+        let efd1 = syscall::eventfd_create();
+        let efd2 = syscall::eventfd_create();
+        let efd3 = syscall::eventfd_create();
+        let efd4 = syscall::eventfd_create();
         assert!(efd1 >= 0 && efd2 >= 0 && efd3 >= 0 && efd4 >= 0);
         let mut writer = SalWriter::new(ptr, -1, size as u64, vec![efd1, efd2, efd3, efd4]);
         writer.reset(0, 1);
@@ -457,7 +457,7 @@ fn test_batched_push_shares_zone_lsn() {
         assert_eq!(r2.status, 0);
 
         // Closing sentinel.
-        let efds: Vec<i32> = (0..nw).map(|_| ipc_sys::eventfd_create()).collect();
+        let efds: Vec<i32> = (0..nw).map(|_| syscall::eventfd_create()).collect();
         let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
         writer.reset(r2.new_cursor, 1);
         writer.write_commit_sentinel(zone_lsn).unwrap();
@@ -528,7 +528,7 @@ fn test_zone_two_groups_one_sentinel() {
         assert_eq!(r2.status, 0);
 
         // Sentinel.
-        let efds: Vec<i32> = (0..nw).map(|_| ipc_sys::eventfd_create()).collect();
+        let efds: Vec<i32> = (0..nw).map(|_| syscall::eventfd_create()).collect();
         for &e in &efds { assert!(e >= 0); }
         let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
         writer.reset(r2.new_cursor, 1);
@@ -601,8 +601,8 @@ fn test_sal_cross_process_checkpoint() {
     unsafe {
         let size = 1 << 20;
         let ptr = alloc_mmap(size);
-        let efd = ipc_sys::eventfd_create();
-        let efd2 = ipc_sys::eventfd_create();
+        let efd = syscall::eventfd_create();
+        let efd2 = syscall::eventfd_create();
         assert!(efd >= 0 && efd2 >= 0);
 
         let pid = libc::fork();
@@ -614,9 +614,9 @@ fn test_sal_cross_process_checkpoint() {
                 ptr, 0, 1, 0, 10, 0, 1, size as u64,
                 ptrs.as_ptr(), sizes.as_ptr(),
             );
-            ipc_sys::eventfd_signal(efd);
+            syscall::eventfd_signal(efd);
 
-            ipc_sys::eventfd_wait(efd2, 5000);
+            syscall::eventfd_wait(efd2, 5000);
 
             std::ptr::write_bytes(ptr, 0, size);
             let buf2 = make_test_data(0xBB, 64);
@@ -626,17 +626,17 @@ fn test_sal_cross_process_checkpoint() {
                 ptr, 0, 1, 0, 20, 0, 2, size as u64,
                 ptrs2.as_ptr(), sizes2.as_ptr(),
             );
-            ipc_sys::eventfd_signal(efd);
+            syscall::eventfd_signal(efd);
             libc::_exit(0);
         }
 
-        ipc_sys::eventfd_wait(efd, 5000);
+        syscall::eventfd_wait(efd, 5000);
         let rr1 = sal_read_group_header(ptr, 0, 0);
         assert_eq!(rr1.epoch, 1);
         assert_eq!(rr1.lsn, 10);
-        ipc_sys::eventfd_signal(efd2);
+        syscall::eventfd_signal(efd2);
 
-        ipc_sys::eventfd_wait(efd, 5000);
+        syscall::eventfd_wait(efd, 5000);
         let rr2 = sal_read_group_header(ptr, 0, 0);
         assert_eq!(rr2.epoch, 2);
         assert_eq!(rr2.lsn, 20);

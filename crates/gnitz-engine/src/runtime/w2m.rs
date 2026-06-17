@@ -3,7 +3,7 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::runtime::sys as ipc_sys;
+use crate::foundation::syscall;
 use crate::runtime::w2m_ring::{self, W2mRingHeader, FLAG_MASTER_PARKED, FLAG_WRITER_PARKED, TryReserve};
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire};
 
@@ -45,7 +45,7 @@ impl W2mWriter {
                         .fetch_or(FLAG_WRITER_PARKED, Ordering::AcqRel);
                     let room_now = unsafe { w2m_ring::has_room(hdr, sz) };
                     if !room_now {
-                        let rc = ipc_sys::futex_wait_u32(
+                        let rc = syscall::futex_wait_u32(
                             hdr.writer_seq() as *const AtomicU32,
                             expected,
                             -1,
@@ -54,7 +54,7 @@ impl W2mWriter {
                         // directly. EINTR (signal) and EAGAIN (value already changed)
                         // are both harmless — retry. Anything else is fatal.
                         if rc < 0 {
-                            let errno = ipc_sys::errno();
+                            let errno = syscall::errno();
                             if errno != libc::EINTR && errno != libc::EAGAIN {
                                 crate::gnitz_fatal_abort!(
                                     "W2mWriter::send_encoded: futex_wait_u32 failed: \
@@ -82,11 +82,11 @@ impl W2mWriter {
 
         hdr.reader_seq().fetch_add(1, Ordering::Release);
         if hdr.waiter_flags().load(Ordering::Acquire) & FLAG_MASTER_PARKED != 0 {
-            let rc = ipc_sys::futex_wake_u32(hdr.reader_seq() as *const AtomicU32, 1);
+            let rc = syscall::futex_wake_u32(hdr.reader_seq() as *const AtomicU32, 1);
             if rc < 0 {
                 crate::gnitz_fatal_abort!(
                     "W2mWriter::send_encoded: futex_wake_u32 failed: rc={} errno={}",
-                    rc, ipc_sys::errno(),
+                    rc, syscall::errno(),
                 );
             }
         }
@@ -162,13 +162,13 @@ impl InFlightState {
             self.hdr.advance_consume_cursor(last_vrc);
             self.hdr.writer_seq().fetch_add(1, Ordering::Release);
             if self.hdr.waiter_flags().load(Ordering::Acquire) & FLAG_WRITER_PARKED != 0 {
-                let rc = ipc_sys::futex_wake_u32(
+                let rc = syscall::futex_wake_u32(
                     self.hdr.writer_seq() as *const AtomicU32, 1,
                 );
                 if rc < 0 {
                     crate::gnitz_fatal_abort!(
                         "W2mSlot::drop: futex_wake_u32 failed: rc={} errno={}",
-                        rc, ipc_sys::errno(),
+                        rc, syscall::errno(),
                     );
                 }
             }
@@ -285,7 +285,7 @@ impl W2mReceiver {
         let rc = if wc != rc_cur {
             0
         } else {
-            ipc_sys::futex_wait_u32(
+            syscall::futex_wait_u32(
                 hdr.reader_seq() as *const AtomicU32,
                 expected,
                 timeout_ms,
@@ -307,7 +307,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
     use crate::runtime::w2m_ring::{self, W2mRingHeader, W2M_HEADER_SIZE};
-    use gnitz_wire::align8;
+    use crate::foundation::codec::align8;
 
     unsafe fn alloc_region(size: usize) -> *mut u8 {
         let ptr = libc::mmap(
