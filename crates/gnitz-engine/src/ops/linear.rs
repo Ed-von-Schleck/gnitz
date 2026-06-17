@@ -2143,4 +2143,64 @@ mod tests {
             assert_eq!(&got[8..16], &want1, "row {row} promoted Narrow slot (U32→U64)");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // op_filter
+    // -----------------------------------------------------------------------
+
+    /// Per-row differential oracle for the batch filter path: 20 rows (≥
+    /// THRESHOLD=16, so the batch evaluator is taken) filtered by `col[1] > 10`
+    /// must keep exactly the rows whose payload exceeds 10, in input PK order.
+    #[test]
+    fn test_filter_batch_matches_per_row() {
+        use crate::expr::{self, ExprProgram, Plan, ScalarFuncKind};
+
+        let schema = make_schema_u64_i64();
+        // (pk, weight, payload); a row passes iff payload > 10.
+        let batch = make_batch(&schema, &[
+            (1,  1, 5),    // fail
+            (2,  1, 15),   // pass
+            (3,  1, 25),   // pass
+            (4,  1, 10),   // fail (= not >)
+            (5,  1, 20),   // pass
+            (6,  1, 3),    // fail
+            (7,  1, 30),   // pass
+            (8,  1, 10),   // fail
+            (9,  1, 11),   // pass
+            (10, 1, 0),    // fail
+            (11, 1, 50),   // pass
+            (12, 1, 9),    // fail
+            (13, 1, 12),   // pass
+            (14, 1, 8),    // fail
+            (15, 1, 100),  // pass
+            (16, 1, 10),   // fail
+            (17, 1, 1),    // fail
+            (18, 1, 13),   // pass
+            (19, 1, 7),    // fail
+            (20, 1, 22),   // pass
+        ]);
+
+        // Predicate: col[1] > 10
+        let code = vec![
+            expr::EXPR_LOAD_COL_INT, 0, 1, 0,
+            expr::EXPR_LOAD_CONST, 1, 10, 0,
+            expr::EXPR_CMP_GT, 2, 0, 1,
+        ];
+        let prog = ExprProgram::new(code, 3, 2, vec![]);
+        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, &schema));
+
+        let out = op_filter(&batch, &func, &schema);
+        // pk=2(15), 3(25), 5(20), 7(30), 9(11), 11(50), 13(12), 15(100), 18(13), 20(22)
+        assert_eq!(out.count, 10, "expected 10 rows with val > 10");
+        assert_eq!(out.get_pk(0) as u64, 2);
+        assert_eq!(out.get_pk(1) as u64, 3);
+        assert_eq!(out.get_pk(2) as u64, 5);
+        assert_eq!(out.get_pk(3) as u64, 7);
+        assert_eq!(out.get_pk(4) as u64, 9);
+        assert_eq!(out.get_pk(5) as u64, 11);
+        assert_eq!(out.get_pk(6) as u64, 13);
+        assert_eq!(out.get_pk(7) as u64, 15);
+        assert_eq!(out.get_pk(8) as u64, 18);
+        assert_eq!(out.get_pk(9) as u64, 20);
+    }
 }

@@ -358,35 +358,25 @@ parameter and keeps the structs in schema. **Static dispatch only — never
 > build, clippy (all targets), `make test` (1302). (`storage/batch.rs` becomes
 > `repr/batch.rs` in W9 — these travel with it.)
 
-### W5 — Test-edge cleanup: extend acyclicity to `cfg(test)` builds
+### W5 — Test-edge cleanup: extend acyclicity to `cfg(test)` builds — ✅ DONE
 *Removes the test-only up-edges the refutations rest on. Depends on: W4. Effort: S.*
 
-The production layering is acyclic; the only remaining cross-layer **up-edges** are
-test-only. Clean each by moving the test to the layer that owns the symbol (a
-generalization of the original single-edge W5):
-
-- **C3** (`storage/partitioned_table.rs:1036` → `dag::StoreHandle`, in
-  `#[cfg(test)] mod tests` @500): move the `StoreHandle::Partitioned`
-  recovery_lsn/current_lsn dispatch assertion into a `dag`-side test (`dag.rs`'s
-  test mod already constructs `StoreHandle::Borrowed`). Share the `PartitionedTable`
-  min-vs-max-LSN fixture via `test_support` (do not copy the setup).
-- **C4** (`catalog/tests/compound_pk_smoke.rs:114` → `runtime::wire::{schema_to_batch,
-  batch_to_schema}`): move the wire round-trip case into `runtime/tests/wire.rs`
-  (which already round-trips these and asserts pk-order). The catalog file keeps its
-  catalog-API-only peer test `schema_roundtrip_catalog_preserves_pk_order` — **no
-  coverage lost**.
-- **E5** (`expr/tests/plan_tests.rs:100` → `crate::ops::op_filter`, an L4-internal
-  edge *against* the `ops → expr` direction): move the differential oracle test into
-  `ops/linear.rs`'s test mod, where `op_filter` lives and `expr` is a legitimate
-  down-dep.
-- **E6** (`storage/batch.rs:740` `extend_pk_opk` → `test_support::opk_pk`): leave as
-  an accepted fixture inversion — `test_support` is a crate-root `#[cfg(test)]`
-  fixture that depends *up* on schema+storage, so it cannot sink below them (§7).
-- C2 is handled by W4 step 4.
-
-**Verify:** no `crate::dag` ref under `src/storage/` (incl. `cfg(test)`); no
-`crate::catalog` in `compiler*` and no `crate::runtime` in `catalog/` (incl.
-`cfg(test)`, modulo the accepted E6 fixture inversion). `make test` green.
+> **Done.** The three test-only up-edges each moved to the layer owning the symbol.
+> **C3** — the `StoreHandle::Partitioned` recovery_lsn/current_lsn dispatch assertion
+> became `dag::tests::store_handle_partitioned_lsn_dispatch`, built on a new
+> `#[cfg(test)] pub(crate) partial_flush_lsn_fixture` (the partial-flush min≠max
+> table). The fixture lives in `storage::partitioned_table` (re-exported `pub(crate)`),
+> **not** `test_support`: the partial flush reads the private per-partition `tables`
+> field, so hoisting it would force a production widening the guardrail forbids — the
+> setup is still defined once, and the storage test keeps its min/max public-method
+> assertions. **C4** — `schema_roundtrip_wire_preserves_pk_order` moved into
+> `runtime/tests/wire.rs`; catalog keeps its API-only peer (no coverage lost). **E5** —
+> `test_filter_batch_matches_per_row` moved into `ops/linear.rs`, adapted to its
+> existing `make_schema_u64_i64`/`make_batch` helpers. **E6** left as the accepted
+> `test_support` fixture inversion; **C2** was W4. Cycle gate green incl. `cfg(test)`:
+> no `crate::dag` in `storage/`, no `crate::runtime` in `catalog/`, no `crate::ops` in
+> `expr/`, no `crate::catalog` in `compiler*`. Gates green: build, clippy,
+> `make test` (1303, +1 from the split-out dag dispatch test), `make e2e` (1043).
 
 ---
 
@@ -798,7 +788,7 @@ sort key, or re-extract a local copy of them.
 Stage A (P0, structural)    W1 ─┬─ W2            break C1 (key seam ✅ + RowView ✅)
                             W3  │                foundation/ umbrella + worker_ctx ✅
                             W4  │                BatchBuilder → storage (auto-fixes C2 test edge) ✅
-                            W5 ─┘                test-edge cleanup (C3/C4/E5) → cfg(test) acyclicity
+                            W5 ─┘                test-edge cleanup (C3/C4/E5) → cfg(test) acyclicity ✅
 Stage B (P1, edges+surface) W6   W7   W8         batch_wire + 3rd edge · ops::reindex · surface sweep (8a prod + 8b test)
 Stage C (P2, splits+regroup) W9 W10 W11 W12 W13 W14   god-file carves into the layer tree (gated on W6/W7/W8)
 ```

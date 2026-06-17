@@ -39,6 +39,8 @@ pub use error::StorageError;
 pub(crate) use read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
 #[cfg(test)]
 pub(crate) use read_cursor::REWIND_CALLS;
+#[cfg(test)]
+pub(crate) use partitioned_table::partial_flush_lsn_fixture;
 pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_fixedint_nonnull, opk_key, with_payload_cmp, with_pk_ord};
 pub(crate) use range_key::{increment_key_in_place, range_cut_points, range_group_cut_points};
 pub(crate) use merge::{BlobCacheGuard, DirectWriter, pk_sort_key};

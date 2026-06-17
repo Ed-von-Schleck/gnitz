@@ -217,6 +217,31 @@ fn test_schema_roundtrip_long_names() {
     assert_eq!(names2[1], long_name);
 }
 
+/// Compound-PK order (including a non-identity `pk_indices` permutation) must
+/// survive the `schema_to_batch` → `batch_to_schema` wire round-trip. The
+/// catalog-restart peer of this — `schema_roundtrip_catalog_preserves_pk_order`
+/// in `catalog/tests/compound_pk_smoke.rs` — exercises the same property through
+/// the catalog API.
+#[test]
+fn schema_roundtrip_wire_preserves_pk_order() {
+    let u64c = SchemaColumn::new(type_code::U64, 0);
+    let u32c = SchemaColumn::new(type_code::U32, 0);
+    let cases: &[(&[SchemaColumn], &[u32])] = &[
+        (&[u64c, u64c], &[0, 1]),
+        (&[u64c, u64c], &[1, 0]),
+        (&[u32c, u32c, u32c, u32c], &[0, 1, 2, 3]),
+    ];
+    for &(cols, pk_indices) in cases {
+        let original = SchemaDescriptor::new(cols, pk_indices);
+        let batch = schema_to_batch(&original, &[]);
+        let (decoded, _names) = batch_to_schema(&batch).unwrap();
+        assert!(
+            original == decoded,
+            "pk_indices {pk_indices:?} did not survive wire round-trip",
+        );
+    }
+}
+
 #[test]
 fn test_encode_decode_string_column() {
     let sd = string_schema();

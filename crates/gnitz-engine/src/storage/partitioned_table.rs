@@ -463,6 +463,117 @@ pub fn partition_arena_size(num_partitions: u32) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Shared test fixture
+// ---------------------------------------------------------------------------
+
+/// A reopened [`PartitionedTable`] left in a **partial-flush** LSN state: a
+/// 256-way durable table whose partition 0 flushed a durable shard (so it leads)
+/// while partition 1 never flushed (so it reopens at the floor, the ENOSPC-on-B
+/// case). This is the only shape where `min_flushed_lsn()` (the recovery
+/// watermark) and `current_lsn()` (the LSN-allocator max) diverge, so it is the
+/// single source for both the storage-side watermark test and the `dag`-side
+/// `StoreHandle::Partitioned` dispatch test — the latter could not tell
+/// `recovery_lsn` from `current_lsn` on a `min == max` table.
+///
+/// Lives here (not in `test_support`) because the partial flush reads the private
+/// per-partition `tables` field; hoisting it would force a production widening
+/// purely to relocate a test.
+#[cfg(test)]
+pub(crate) struct PartialFlushLsn {
+    /// Keeps the on-disk table alive for `pt`'s lifetime.
+    _dir: tempfile::TempDir,
+    /// The reopened table; `pt.min_flushed_lsn() < pt.current_lsn()`.
+    pub pt: PartitionedTable,
+    /// The lagging partition's floor — `pt.min_flushed_lsn()` and the value
+    /// `StoreHandle::Partitioned::recovery_lsn` must report.
+    pub recovery_lsn: u64,
+    /// The leading partition's LSN — `pt.current_lsn()` and the value
+    /// `StoreHandle::Partitioned::current_lsn` must report.
+    pub current_lsn: u64,
+}
+
+#[cfg(test)]
+pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+
+    crate::foundation::posix_io::raise_fd_limit_for_tests();
+
+    let schema = || SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    // One-row (pk, weight=1, payload) batch routed by its narrow PK.
+    let row = |pk: u64, val: i64| {
+        let mut b = Batch::with_schema(schema(), 1);
+        b.extend_pk(pk as u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes());
+        b.count += 1;
+        b
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let tdir = dir.path().join("pt_partial_flush_lsn");
+    let path = tdir.to_str().unwrap().to_owned();
+
+    // Two live partitions (0 and 1) of a 256-way durable table.
+    let open = || PartitionedTable::new(
+        &path, "test", schema(), 830, 256, Persistence::Durable, 0, 2,
+        partition_arena_size(256),
+    ).unwrap();
+    let mut pt = open();
+
+    // PKs that route to live partitions 0 and 1 (narrow PK ⇒ partition_for_key
+    // matches the stored-bytes routing).
+    let mut p0 = Vec::new();
+    let mut p1 = Vec::new();
+    for k in 0u64..200_000 {
+        match partition_for_key(k as u128) {
+            0 if p0.len() < 3 => p0.push(k),
+            1 if p1.is_empty() => p1.push(k),
+            _ => {}
+        }
+        if p0.len() == 3 && !p1.is_empty() { break; }
+    }
+    assert_eq!((p0.len(), p1.len()), (3, 1), "need PKs routed to partitions 0 and 1");
+
+    // Each durable Table::ingest bumps that partition's current_lsn by 1.
+    // Partition A (0) takes three ingests, B (1) one, so A leads.
+    for &k in &p0 {
+        pt.ingest_owned_batch(row(k, k as i64)).unwrap();
+    }
+    pt.ingest_owned_batch(row(p1[0], 0)).unwrap();
+
+    let lsn_a = pt.tables[0].current_lsn;
+    let lsn_b = pt.tables[1].current_lsn;
+    assert!(lsn_a > lsn_b, "partition A must lead before the partial flush ({lsn_a} vs {lsn_b})");
+
+    // Partial family flush: only partition A commits a durable shard; B's rows
+    // stay in its memtable.
+    assert!(pt.tables[0].flush().unwrap(), "partition A flush must write a shard");
+    drop(pt);
+
+    // Next boot: reopen both partitions from disk.
+    let pt = open();
+    let a_reloaded = pt.tables[0].current_lsn;
+    let b_reloaded = pt.tables[1].current_lsn;
+
+    // A's flushed shard stamps lsn_max = current_lsn-1; reopen restores +1.
+    // B never flushed, so it reopens at the floor, below A.
+    assert_eq!(a_reloaded, lsn_a, "flushed partition keeps its LSN across reopen");
+    assert!(
+        b_reloaded < a_reloaded,
+        "unflushed partition B reopens below A ({b_reloaded} vs {a_reloaded})",
+    );
+
+    PartialFlushLsn { _dir: dir, pt, recovery_lsn: b_reloaded, current_lsn: a_reloaded }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -938,76 +1049,19 @@ mod tests {
     /// fix — `min_flushed_lsn` did not exist and recovery used the max.
     #[test]
     fn min_flushed_lsn_floors_recovery_watermark_after_partial_flush() {
-        raise_fd_limit_for_tests();
-        let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("pt_partial_flush_lsn");
-        let path = tdir.to_str().unwrap().to_owned();
-
-        // Two live partitions (0 and 1) of a 256-way durable table.
-        let open = || PartitionedTable::new(
-            &path, "test", make_schema(), 830, 256, Persistence::Durable, 0, 2,
-            partition_arena_size(256),
-        ).unwrap();
-        let mut pt = open();
-
-        // PKs that route to live partitions 0 and 1 (narrow PK ⇒
-        // partition_for_key matches the stored-bytes routing).
-        let mut p0 = Vec::new();
-        let mut p1 = Vec::new();
-        for k in 0u64..200_000 {
-            match partition_for_key(k as u128) {
-                0 if p0.len() < 3 => p0.push(k),
-                1 if p1.is_empty() => p1.push(k),
-                _ => {}
-            }
-            if p0.len() == 3 && !p1.is_empty() { break; }
-        }
-        assert_eq!((p0.len(), p1.len()), (3, 1), "need PKs routed to partitions 0 and 1");
-
-        // Each durable Table::ingest bumps that partition's current_lsn by 1.
-        // Partition A (0) takes three ingests, B (1) one, so A leads.
-        for &k in &p0 {
-            pt.ingest_owned_batch(make_batch(&[(k, 1, k as i64)])).unwrap();
-        }
-        pt.ingest_owned_batch(make_batch(&[(p1[0], 1, 0)])).unwrap();
-
-        let lsn_a = pt.tables[0].current_lsn;
-        let lsn_b = pt.tables[1].current_lsn;
-        assert!(lsn_a > lsn_b, "partition A must lead before the partial flush ({lsn_a} vs {lsn_b})");
-
-        // Partial family flush: only partition A commits a durable shard; B's
-        // rows stay in its memtable (the ENOSPC-on-B case).
-        assert!(pt.tables[0].flush().unwrap(), "partition A flush must write a shard");
-        drop(pt);
-
-        // Next boot: reopen both partitions from disk.
-        let pt2 = open();
-        let a_reloaded = pt2.tables[0].current_lsn;
-        let b_reloaded = pt2.tables[1].current_lsn;
-
-        // A's flushed shard stamps lsn_max = current_lsn-1; reopen restores +1.
-        // B never flushed, so it reopens at the floor, below A.
-        assert_eq!(a_reloaded, lsn_a, "flushed partition keeps its LSN across reopen");
-        assert!(
-            b_reloaded < a_reloaded,
-            "unflushed partition B reopens below A ({b_reloaded} vs {a_reloaded})",
-        );
-
-        // The fix: recovery aggregates with min, so B's still-in-SAL zones
-        // replay. The max (current_lsn) would skip them and drop B's rows.
+        let f = partial_flush_lsn_fixture();
+        // The fix: recovery aggregates with min, so the lagging partition's
+        // still-in-SAL zones replay. The max (current_lsn) would skip them and
+        // drop its rows. (The StoreHandle dispatch over this same min-vs-max
+        // split is pinned by dag::tests::store_handle_partitioned_lsn_dispatch.)
         assert_eq!(
-            pt2.min_flushed_lsn(), b_reloaded,
+            f.pt.min_flushed_lsn(), f.recovery_lsn,
             "recovery watermark is the lagging partition's floor",
         );
-        assert!(pt2.min_flushed_lsn() < a_reloaded);
-        assert_eq!(pt2.current_lsn(), a_reloaded, "current_lsn still reports the max for the allocator");
-
-        // The StoreHandle dispatch the recovery walk actually calls (dag.rs)
-        // must route Partitioned → min for recovery_lsn and → max for current_lsn.
-        let handle = crate::dag::StoreHandle::Partitioned(
-            std::cell::UnsafeCell::new(Box::new(pt2)),
+        assert!(f.pt.min_flushed_lsn() < f.current_lsn);
+        assert_eq!(
+            f.pt.current_lsn(), f.current_lsn,
+            "current_lsn still reports the max for the allocator",
         );
-        assert_eq!(handle.recovery_lsn(), b_reloaded);
-        assert_eq!(handle.current_lsn(), a_reloaded);
     }
 }

@@ -2394,4 +2394,23 @@ mod tests {
         DagEngine::vm_epoch_result(42, r);
         unreachable!("vm_epoch_result must not return on Err");
     }
+
+    /// `StoreHandle::Partitioned` must dispatch `recovery_lsn` → the table's
+    /// `min_flushed_lsn` (recovery watermark) and `current_lsn` → its `current_lsn`
+    /// (the LSN-allocator max). Built on the partial-flush fixture where the two
+    /// diverge, so a swapped dispatch is caught. (The underlying min/max
+    /// aggregation is pinned storage-side by
+    /// `min_flushed_lsn_floors_recovery_watermark_after_partial_flush`.)
+    #[test]
+    fn store_handle_partitioned_lsn_dispatch() {
+        let f = crate::storage::partial_flush_lsn_fixture();
+        let (recovery, current) = (f.recovery_lsn, f.current_lsn);
+        assert!(recovery < current, "fixture must have min < max to distinguish the two");
+
+        let handle = StoreHandle::Partitioned(
+            std::cell::UnsafeCell::new(Box::new(f.pt)),
+        );
+        assert_eq!(handle.recovery_lsn(), recovery, "Partitioned recovery_lsn → min_flushed_lsn");
+        assert_eq!(handle.current_lsn(), current, "Partitioned current_lsn → max current_lsn");
+    }
 }

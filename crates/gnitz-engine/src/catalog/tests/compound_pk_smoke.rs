@@ -110,26 +110,6 @@ fn routing_symmetry_four_u32() {
 }
 
 #[test]
-fn schema_roundtrip_wire_preserves_pk_order() {
-    use crate::runtime::wire::{schema_to_batch, batch_to_schema};
-
-    let cases: &[(&[SchemaColumn], &[u32])] = &[
-        (&[u64_col(), u64_col()], &[0, 1]),
-        (&[u64_col(), u64_col()], &[1, 0]),
-        (&[u32_col(), u32_col(), u32_col(), u32_col()], &[0, 1, 2, 3]),
-    ];
-    for &(cols, pk_indices) in cases {
-        let original = SchemaDescriptor::new(cols, pk_indices);
-        let batch = schema_to_batch(&original, &[]);
-        let (decoded, _names) = batch_to_schema(&batch).unwrap();
-        assert!(
-            original == decoded,
-            "pk_indices {pk_indices:?} did not survive wire round-trip",
-        );
-    }
-}
-
-#[test]
 fn schema_roundtrip_catalog_preserves_pk_order() {
     let cols = vec![
         u64_col_def("payload"),
