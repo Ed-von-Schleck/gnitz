@@ -213,13 +213,18 @@ passes the agg's **source type** for the narrow branch:
                         agg_descs[k].col_type_code)
   };
   ```
-- `op_gather.rs:57` (combine) — schema is `partial_schema`, `agg_descs` is a param:
+- `op_gather.rs:57` (combine) — schema is `partial_schema`, `agg_descs` is a param.
+  The combine loop already binds `let w = smb.get_weight(idx)` (the **row weight**,
+  `i64`, drives the `combine` vs `merge_accumulated(-1)` branch), so the column
+  width must use a different name — shadowing `w` would break the branch and trip
+  a `usize < 0` lint:
   ```rust
-  let w = partial_schema.columns[agg_col_idx].size() as usize;
-  let bits = readback_agg_bits(smb.get_col_ptr(idx, pi, w), agg_descs[k].col_type_code);
+  let cw = partial_schema.columns[agg_col_idx].size() as usize;   // column width ≠ row weight
+  let bits = readback_agg_bits(smb.get_col_ptr(idx, pi, cw), agg_descs[k].col_type_code);
   ```
 - `op_gather.rs:84` (gather retraction) — mirror `op_reduce.rs:455`, reading width
-  from `partial_schema.columns[agg_col_idx].size()`.
+  from `partial_schema.columns[agg_col_idx].size()` (no row-weight `w` is in scope
+  in the retraction block, so `w` is free to reuse there).
 
 `combine` and `merge_accumulated` require the fully extended value (cross-worker
 MIN/MAX comparison, and the U64 unsigned-compare path), which `readback_agg_bits`
@@ -286,6 +291,14 @@ delivers. For every existing 8-byte output column the helper is a verbatim
 - **Atomic landing.** §3a (engine output width), §3b (both planner mirrors), and
   §3c (engine read-backs) are one change; any subset corrupts agg values via
   width/offset mismatch.
+- **Shared read-back loops.** §3c rewrites the same three loops
+  (`op_reduce.rs:451-462`, `op_gather.rs:50-66`, `op_gather.rs:81-104`) that
+  `plans/reduce-gather-null-agg-state-propagation.md` rewrites to honor the old
+  null word. The two are orthogonal — this plan fixes the value *width*, that one
+  fixes *null-ness* — but they overlap line-for-line, so merge them rather than
+  applying both blindly. Both replace `op_gather`'s `pi = agg_col_idx - 1` with
+  `partial_schema.try_payload_idx(agg_col_idx)` (the null-bit/value indexing the
+  closed form gets wrong under a compound PK).
 - **Unblocks** the relaxed ≤8-byte range-column requirement in
   `plans/band-left-bag-multiplicity-overfill.md`; that plan's threshold builder
   consumes the source-typed reduce result directly with no relabel and no narrow
