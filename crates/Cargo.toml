@@ -15,6 +15,10 @@ members = [
 # so `#[should_panic]` tests can observe them.
 [profile.release]
 panic = "abort"
+# Fat LTO so hot paths inline across crate/module boundaries — e.g. the
+# `repr::scatter` kernels calling `DirectWriter` in a sibling module, and the
+# operator layer calling into storage.
+lto = true
 
 [profile.dev]
 panic = "unwind"
