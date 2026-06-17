@@ -43,6 +43,8 @@ pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_fixedint_
 pub(crate) use range_key::{increment_key_in_place, range_cut_points, range_group_cut_points};
 pub(crate) use merge::{BlobCacheGuard, DirectWriter, pk_sort_key};
 pub(crate) use batch::carve_writer_slices;
+pub(crate) use batch::{BatchBuilder, index_meta_schema_desc, INDEX_META_COL_NAMES,
+                       make_index_schema, project_schema};
 pub(crate) use manifest::PkBuf;
 
 /// Append the `.tmp` suffix to a CStr basename and return a new CString.

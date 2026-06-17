@@ -61,13 +61,11 @@ pub(crate) use types::{ColumnDef, FkConstraint, FkParentRef};
 pub(crate) use gnitz_wire::FK_INDEX_INFIX;
 #[cfg(test)]
 pub(crate) use gnitz_wire::validate_user_identifier;
-pub(crate) use utils::{BatchBuilder,
-                       index_meta_schema_desc, INDEX_META_COL_NAMES,
-                       make_fk_index_name, ingest_batch_into,
+pub(crate) use utils::{make_fk_index_name, ingest_batch_into,
                        schema_dir, table_dir, view_dir, index_dir,
                        is_index_dir_name, is_table_dir_name, subdir_names,
                        ensure_dir, fsync_dir,
-                       get_index_key_type, make_index_schema,
+                       get_index_key_type,
                        cursor_read_u64, cursor_read_string,
                        retract_single_row,
                        retract_rows_by_view,
@@ -76,8 +74,13 @@ pub(crate) use utils::{BatchBuilder,
 pub(crate) use utils::{parse_qualified_name, make_secondary_index_name};
 pub(crate) use cache::CatalogCacheSet;
 pub(crate) use sys_tables::SysFamily;
-pub(crate) use store::{CatalogDeltaSink, project_schema};
+pub(crate) use store::CatalogDeltaSink;
 pub(crate) use apply_context::ApplyContext;
+// `BatchBuilder` and the schema-shaping free fns hold no catalog state and live
+// in `storage`; re-export them so catalog's ddl/bootstrap/store callers compile
+// unchanged. (`index_meta_schema_desc`/`INDEX_META_COL_NAMES` have no catalog
+// consumer — `runtime::executor` imports those from `storage` directly.)
+pub(crate) use crate::storage::{BatchBuilder, make_index_schema, project_schema};
 
 // ---------------------------------------------------------------------------
 // CatalogEngine

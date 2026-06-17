@@ -1890,30 +1890,6 @@ impl CatalogEngine {
     }
 }
 
-/// Build the schema for a `gather_family` result: the PK columns of `schema`
-/// (in pk-list order, so the packed PK round-trips identically) followed by
-/// the projected columns in `project` order as payload. `project` must list
-/// only non-PK columns (PK members are resolved from the packed PK without a
-/// gather); a projected PK column would be emitted twice.
-///
-/// `pub(crate)`: the master's gather drain builds the same descriptor as the
-/// expected reply schema, so a projected reply with the wrong shape errors
-/// instead of mis-decoding.
-pub(crate) fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(schema.pk_indices().len() + project.len());
-    let mut pk_idx: Vec<u32> = Vec::with_capacity(schema.pk_indices().len());
-    for (_, _, col) in schema.pk_columns() {
-        pk_idx.push(cols.len() as u32);
-        cols.push(*col);
-    }
-    for &p in project {
-        debug_assert!(!schema.is_pk_col(p as usize),
-            "project_schema: projected column {p} is a PK column");
-        cols.push(schema.columns[p as usize]);
-    }
-    SchemaDescriptor::new(&cols, &pk_idx)
-}
-
 /// Projecting sibling of `copy_cursor_row_with_weight`: append the cursor's
 /// current row to `out` (which has the `project_schema` layout) with weight 1,
 /// copying only the columns named in `project`. The projected payload column

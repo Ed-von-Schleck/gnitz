@@ -3478,7 +3478,7 @@ mod tests {
         // A single CircuitNodes row with an opcode decode_op_node rejects (item
         // 16). Previously the node was silently skipped; load_circuit must now
         // return None rather than emit a partial circuit.
-        use crate::catalog::BatchBuilder;
+        use crate::storage::BatchBuilder;
         let dir = load_circuit_test_dir("baddecode");
         let nodes_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODES_COLS);
         let edges_schema = wire_sys_schema(gnitz_wire::CIRCUIT_EDGES_COLS);
@@ -3520,7 +3520,7 @@ mod tests {
     fn test_load_circuit_aborts_on_orphan_edge() {
         // Two valid nodes plus an edge whose dst (node 7) does not exist (item
         // 28). load_circuit must return None rather than create a phantom node.
-        use crate::catalog::BatchBuilder;
+        use crate::storage::BatchBuilder;
         let dir = load_circuit_test_dir("orphanedge");
         let nodes_schema = wire_sys_schema(gnitz_wire::CIRCUIT_NODES_COLS);
         let edges_schema = wire_sys_schema(gnitz_wire::CIRCUIT_EDGES_COLS);

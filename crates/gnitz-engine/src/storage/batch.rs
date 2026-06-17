@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use super::columnar::ColumnarSource;
 use super::merge::{self, MemBatch};
 use super::shard_file;
-use crate::schema::{self, BlobCache, SchemaDescriptor};
+use crate::schema::{self, BlobCache, SchemaColumn, SchemaDescriptor, type_code};
 use crate::foundation::codec::{read_i64_le, read_u64_le};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
@@ -1860,6 +1860,215 @@ pub fn write_to_batch(
     }
 }
 
+// ---------------------------------------------------------------------------
+// BatchBuilder — construct Batch rows for system table mutations
+//
+// A pure storage utility: it holds no catalog state and builds a `Batch`
+// row-by-row from a schema, so it lives here with `Batch`. Re-exported from
+// `catalog` for its DDL/bootstrap/store callers; `runtime::executor` and the
+// `compiler` tests import it from `storage` directly.
+// ---------------------------------------------------------------------------
+
+/// Lightweight row-by-row builder for constructing Batch in Rust.
+/// Operates on Batch directly; the schema lives on the batch itself.
+pub(crate) struct BatchBuilder {
+    pub(crate) batch: Batch,
+    // per-row state
+    pub(crate) curr_null_word: u64,
+    pub(crate) curr_col: usize,
+}
+
+impl BatchBuilder {
+    pub(crate) fn new(schema: SchemaDescriptor) -> Self {
+        BatchBuilder {
+            batch: Batch::with_schema(schema, 8),
+            curr_null_word: 0,
+            curr_col: 0,
+        }
+    }
+
+    /// Begin a new row with the given PK and weight.
+    pub(crate) fn begin_row(&mut self, pk: u128, weight: i64) {
+        self.batch.ensure_row_capacity();
+        self.batch.extend_pk(pk);
+        self.batch.extend_weight(&weight.to_le_bytes());
+        self.curr_null_word = 0;
+        self.curr_col = 0;
+    }
+
+    /// Put a u64 value for the current payload column.
+    pub(crate) fn put_u64(&mut self, val: u64) {
+        self.batch.extend_col(self.curr_col, &val.to_le_bytes());
+        self.curr_col += 1;
+    }
+
+    /// Put a string value for the current payload column.
+    pub(crate) fn put_string(&mut self, s: &str) {
+        let st = crate::schema::encode_german_string(s.as_bytes(), &mut self.batch.blob);
+        self.batch.extend_col(self.curr_col, &st);
+        self.curr_col += 1;
+    }
+
+    // The non-u64/string put variants are exercised only by the catalog tests
+    // (production system-table rows are u64/string-shaped); `#[cfg(test)]`
+    // keeps them out of production builds, mirroring `ddl.rs::create_table`.
+
+    /// Put a u128 value for the current payload column.
+    #[cfg(test)]
+    pub(crate) fn put_u128(&mut self, val: u128) {
+        self.batch.extend_col(self.curr_col, &val.to_le_bytes());
+        self.curr_col += 1;
+    }
+
+    /// Put a u8 value for the current payload column.
+    #[cfg(test)]
+    pub(crate) fn put_u8(&mut self, val: u8) {
+        self.batch.extend_col(self.curr_col, &[val]);
+        self.curr_col += 1;
+    }
+
+    /// Put a u16 value for the current payload column.
+    #[cfg(test)]
+    pub(crate) fn put_u16(&mut self, val: u16) {
+        self.batch.extend_col(self.curr_col, &val.to_le_bytes());
+        self.curr_col += 1;
+    }
+
+    /// Put a u32 value for the current payload column.
+    #[cfg(test)]
+    pub(crate) fn put_u32(&mut self, val: u32) {
+        self.batch.extend_col(self.curr_col, &val.to_le_bytes());
+        self.curr_col += 1;
+    }
+
+    /// Put a NULL value for the current payload column.
+    #[cfg(test)]
+    pub(crate) fn put_null(&mut self) {
+        let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
+        self.batch.fill_col_zero(self.curr_col, col_size);
+        self.curr_null_word |= 1u64 << self.curr_col;
+        self.curr_col += 1;
+    }
+
+    /// Finish the current row (writes null bitmap).
+    pub(crate) fn end_row(&mut self) {
+        self.batch.extend_null_bmp(&self.curr_null_word.to_le_bytes());
+        self.batch.count += 1;
+        self.batch.sorted = false;
+        self.batch.consolidated = false;
+    }
+
+    /// Convenience: begin + put columns + end for a simple row.
+    pub(crate) fn finish(self) -> Batch {
+        self.batch
+    }
+
+    #[cfg(test)]
+    fn schema(&self) -> &SchemaDescriptor {
+        self.batch.schema.as_ref().expect("BatchBuilder batch always carries a schema")
+    }
+
+    #[cfg(test)]
+    fn physical_col_idx(&self) -> usize {
+        self.schema().payload_col_idx(self.curr_col)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema-shaping free functions
+//
+// Built purely from a `SchemaDescriptor` (no catalog state). Re-exported from
+// `catalog` so its callers compile unchanged; the runtime gather/preflight
+// paths also build the same descriptors.
+// ---------------------------------------------------------------------------
+
+/// Build a compound-PK index schema for a secondary index on `source_cols`
+/// of `source`, validating the column list along the way.
+///
+/// Layout: `(promoted_c0, promoted_c1, …, src_pk_0, src_pk_1, …)` — every
+/// indexed column promoted independently and packed in declared order, then the
+/// source PK columns, all in the PK with zero payload columns. The leading
+/// indexed-key region is `Σ promoted widths`; `seek_by_index` prefix-scans it
+/// (full or leading-prefix), then reads the source PK bytes directly out of the
+/// index PK suffix. The 1-element list is the single-column index.
+///
+/// Bounds-checks every column, promotes it (rejecting STRING/BLOB/float), and
+/// validates the index-schema PK limits — all **before** calling
+/// `SchemaDescriptor::new`: that constructor is a `const fn` whose `assert!`s
+/// fire in release and abort the master. An over-limit schema is reachable only
+/// for a *composite* index (a single-column index — including every FK
+/// auto-index — always fits, since `PK_LIST_MAX_COLS < MAX_PK_COLUMNS` reserves
+/// the prefix slot), via a raw `gnitz-core` client or a crafted/over-range
+/// persisted row replayed at boot, neither of which goes through the SQL
+/// planner's pre-check. Validating here converts the abort into a clean ingest
+/// `Err` for every path (defence in depth at the catalog trust boundary).
+pub(crate) fn make_index_schema(
+    source_cols: &[u32],
+    source: &SchemaDescriptor,
+) -> Result<SchemaDescriptor, String> {
+    let mut col_types: Vec<u8> = Vec::with_capacity(source_cols.len());
+    for &c in source_cols {
+        if c as usize >= source.num_columns() {
+            return Err(format!(
+                "Index: column index {} out of bounds (columns={})",
+                c, source.num_columns()));
+        }
+        col_types.push(source.columns[c as usize].type_code);
+    }
+    let src_pk = source.pk_indices();
+    // Shared with the SQL planner's CREATE INDEX pre-check, so the promotion
+    // rule and the arity/stride limits can never disagree across the layers.
+    let promoted = gnitz_wire::index_key_types(
+        &col_types, src_pk.len(), source.pk_stride() as usize)?;
+    let n = promoted.len();
+    let arity = n + src_pk.len();
+    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(arity);
+    let mut pk_indices: Vec<u32> = Vec::with_capacity(arity);
+    for (i, &t) in promoted.iter().enumerate() {
+        cols.push(SchemaColumn::new(t, 0));
+        pk_indices.push(i as u32);
+    }
+    for (j, &ci) in src_pk.iter().enumerate() {
+        cols.push(SchemaColumn::new(source.columns[ci as usize].type_code, 0));
+        pk_indices.push((n + j) as u32);
+    }
+    Ok(SchemaDescriptor::new(&cols, &pk_indices))
+}
+
+/// Wire schema for the GET_INDICES descriptor list: `(packed_cols PK, is_unique)`.
+/// The PK carries `pack_pk_cols(&col_indices)` — unique per circuit (circuits
+/// dedup by column list), so a valid PK. The server ships this block on the data
+/// path; the client decodes against the wire schema and reads columns by position.
+pub(crate) fn index_meta_schema_desc() -> SchemaDescriptor {
+    let u64c = SchemaColumn::new(type_code::U64, 0);
+    SchemaDescriptor::new(&[u64c, u64c], &[0])   // [packed_cols (PK), is_unique]
+}
+pub(crate) const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"cols", b"is_unique"];
+
+/// Build the schema for a `gather_family` result: the PK columns of `schema`
+/// (in pk-list order, so the packed PK round-trips identically) followed by
+/// the projected columns in `project` order as payload. `project` must list
+/// only non-PK columns (PK members are resolved from the packed PK without a
+/// gather); a projected PK column would be emitted twice.
+///
+/// `pub(crate)`: the master's gather drain builds the same descriptor as the
+/// expected reply schema, so a projected reply with the wrong shape errors
+/// instead of mis-decoding.
+pub(crate) fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> SchemaDescriptor {
+    let mut cols: Vec<SchemaColumn> = Vec::with_capacity(schema.pk_indices().len() + project.len());
+    let mut pk_idx: Vec<u32> = Vec::with_capacity(schema.pk_indices().len());
+    for (_, _, col) in schema.pk_columns() {
+        pk_idx.push(cols.len() as u32);
+        cols.push(*col);
+    }
+    for &p in project {
+        debug_assert!(!schema.is_pk_col(p as usize),
+            "project_schema: projected column {p} is a PK column");
+        cols.push(schema.columns[p as usize]);
+    }
+    SchemaDescriptor::new(&cols, &pk_idx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1874,6 +2083,27 @@ mod tests {
             ],
             &[0],
         )
+    }
+
+    // Compound-PK regression guard for the precomputed payload→logical
+    // mapping. 4-column schema with pk_indices=[1, 2]: payload slot 0
+    // must map to logical column 0, slot 1 to logical column 3 — never
+    // 0 and 1 (the bug the previous single-PK reimplementation would
+    // have introduced for any non-leading compound PK).
+    #[test]
+    fn batch_builder_physical_col_idx_compound_pk() {
+        let cols = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ];
+        let schema = SchemaDescriptor::new(&cols, &[1, 2]);
+        let mut bb = BatchBuilder::new(schema);
+        assert_eq!(bb.curr_col, 0);
+        assert_eq!(bb.physical_col_idx(), 0);
+        bb.curr_col = 1;
+        assert_eq!(bb.physical_col_idx(), 3);
     }
 
     #[test]

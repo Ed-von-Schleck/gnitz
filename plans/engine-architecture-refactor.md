@@ -321,69 +321,42 @@ down into storage would re-form the cycle, so the trait abstracts the batch
 parameter and keeps the structs in schema. **Static dispatch only — never
 `&dyn RowView`.**
 
-### W3 — Create the `foundation/` umbrella; relocate `WORKER_RANK`/`NUM_WORKERS`
+### W3 — Create the `foundation/` umbrella; relocate `WORKER_RANK`/`NUM_WORKERS` — ✅ DONE
 *Removes problem #4; lands the L0 leaves. Depends on: none. Effort: M.*
 
-**Rationale.** Move the multi-process global state out of the SQL planner, and
-group the L0 leaves under one umbrella so the layering is legible. The only
-worker-rank edges are `runtime/worker.rs:409` (writer) and `compiler.rs` internal
-reads (1135, 1609) — there are **no `ops` readers**.
+> **Done.** `foundation/mod.rs` (`#[macro_use]`) umbrellas six L0 leaves: `log`
+> (whole; macro bodies repointed `$crate::log::` → `$crate::foundation::log::`,
+> `is_*`/`_emit` kept `pub` for `#[macro_export]` hygiene), `xxh` and `syscall`
+> (whole-file moves of `xxh.rs` / `runtime/sys.rs`), and `codec` (LE pack + raw +
+> `align8`/`cstr_from_buf`) + `posix_io` (util fd/sync + crate-root `sys.rs` FILE
+> syscalls + `guard_panic` + `raise_fd_limit_for_tests`) carved from
+> `util.rs`/`sys.rs`. NEW `worker_ctx` holds the two now-**private** statics +
+> `pub(crate)` `set_worker_rank`/`worker_rank`/`num_workers` lifted verbatim from
+> `compiler.rs` (worker.rs writes them; compiler.rs imports the two readers). Dead
+> `fallocate_keep_size` + its test dropped; ~25 consumer files repointed;
+> `util.rs`/`sys.rs` deleted. Accessors stay `Relaxed` atomic loads (no lock, no
+> per-call lookup). Gates green incl. `make e2e` (GNITZ_WORKERS=4) for the syscall
+> fold; no `compiler::{worker_rank,num_workers,WORKER_RANK,NUM_WORKERS}` refs
+> remain. `guard_panic` lives in `posix_io` (libc-free process-safety helper, kept
+> out of the byte-codec leaf).
 
-**Steps.**
-1. Create `src/foundation/` and move the leaves in:
-   - `log.rs` → `foundation/log.rs`. **Update the `#[macro_export]` macro bodies'
-     internal paths** from `$crate::log::_emit` to `$crate::foundation::log::_emit`
-     (`is_debug`/`is_info`/`_emit` cannot drop below `pub` — macro hygiene — but
-     their *path* moves). `#[macro_use]` stays at the `foundation` mod decl.
-   - `xxh.rs` → `foundation/xxh.rs` (whole).
-   - Split `util.rs`: LE pack helpers → `foundation/codec.rs`; fd/sync helpers
-     (`write_all_fd`/`read_all_fd`/`fd*sync_eintr`) → `foundation/posix_io.rs`.
-   - Crate-root `sys.rs` FILE syscalls (`fallocate`/`ftruncate`/`try_set_nocow`/
-     `madvise_*`/`server_create`/`raise_fd_limit`) → `foundation/posix_io.rs`
-     (joining util's fd helpers). `posix_io` stays `pub(crate)` so storage can call
-     `madvise_*`.
-   - `runtime/sys.rs` (eventfd/futex/memfd/mmap_shared/errno) folded **down** into
-     `foundation/syscall.rs` — turning runtime's sideways uses into clean DOWN
-     edges.
-2. New `foundation/worker_ctx.rs` (L0 leaf) holding the two statics **private to
-   the module** plus `pub(crate)` accessors `set_worker_rank` / `worker_rank` /
-   `num_workers` (moved verbatim from compiler.rs:37–47).
-3. Repoint `runtime/worker.rs:409` → `crate::foundation::worker_ctx::set_worker_rank`;
-   `compiler.rs:1135/1609` → `worker_rank`/`num_workers`; delete the statics +
-   accessors from compiler.rs.
-4. Delete dead `posix_io::fallocate_keep_size` (the old `sys::fallocate_keep_size`,
-   `sys.rs:16`, `#[allow(dead_code)]`) together with its only caller, the
-   self-referential test `test_fallocate_keep_size` (`sys.rs:174–187`).
-5. **Verify:** no `compiler::{worker_rank,num_workers,WORKER_RANK,NUM_WORKERS}`
-   refs remain crate-wide; build + test green.
-
-**Perf.** Accessors stay plain `Relaxed` atomic loads — no lock, no per-call
-lookup, no parameter threading onto hot loops.
-
-### W4 — Relocate `BatchBuilder` (and its index-meta cluster) to `storage`
+### W4 — Relocate `BatchBuilder` (and its index-meta cluster) to `storage` — ✅ DONE
 *Removes a misplaced cross-layer utility; auto-fixes the C2 test edge. Depends on: none. Effort: S.*
 
-**Rationale.** `BatchBuilder` (catalog/utils.rs:9) builds a `storage::Batch` from a
-schema and holds **no catalog state**, yet is consumed in production by
-`runtime/executor.rs:1012`. The cluster imported *with* it
-(`index_meta_schema_desc`, `INDEX_META_COL_NAMES`) and the schema-shaping free fns
-`make_index_schema` / `project_schema` (real production runtime callers at
-`master.rs:1418/2588`, `worker.rs:1581`) hold no catalog state either. Their home
-is storage.
-
-**Steps.**
-1. Move `BatchBuilder` + `index_meta_schema_desc` + `INDEX_META_COL_NAMES` into
-   storage (alongside `Batch` in `storage/repr/batch.rs`); `make_index_schema` /
-   `project_schema` travel with them.
-2. `pub(crate) use crate::storage::BatchBuilder;` from `catalog/mod.rs` so catalog's
-   own ddl/bootstrap/store callers compile unchanged.
-3. Repoint `runtime/executor.rs:27` to `crate::storage::BatchBuilder` (one line) —
-   deleting the runtime → catalog-for-a-builder edge.
-4. **Repoint the C2 test edge:** `compiler.rs:3500/3542`'s
-   `use crate::catalog::BatchBuilder` → `crate::storage::BatchBuilder`. This turns
-   the test-only L5→L6 up-edge into a clean L5→L2 DOWN edge (do the repoint; do not
-   rely on the catalog re-export to mask it).
-5. **Verify:** build + test green.
+> **Done.** `BatchBuilder` + `index_meta_schema_desc` + `INDEX_META_COL_NAMES` +
+> `make_index_schema` (from `catalog/utils.rs`) and `project_schema` (from
+> `catalog/store.rs`) moved **verbatim** into `storage/batch.rs` beside `Batch`, all
+> `pub(crate)`. `catalog/mod.rs` re-exports `BatchBuilder`/`make_index_schema`/
+> `project_schema` from `storage` so its ddl/bootstrap/store/hooks callers — and the
+> runtime gather/preflight callers of the two free fns — compile unchanged;
+> `index_meta_schema_desc`/`INDEX_META_COL_NAMES` have no catalog consumer, so
+> `runtime::executor` imports those (and `BatchBuilder`) straight from `storage`,
+> deleting the runtime→catalog-for-a-builder edge. The C2 test edge
+> (`compiler.rs` `use crate::catalog::BatchBuilder` → `crate::storage::BatchBuilder`)
+> is repointed — a clean L5→L2 DOWN edge, not masked by the re-export. The compound-PK
+> `physical_col_idx` test followed `BatchBuilder` into `storage/batch.rs`. Gates green:
+> build, clippy (all targets), `make test` (1302). (`storage/batch.rs` becomes
+> `repr/batch.rs` in W9 — these travel with it.)
 
 ### W5 — Test-edge cleanup: extend acyclicity to `cfg(test)` builds
 *Removes the test-only up-edges the refutations rest on. Depends on: W4. Effort: S.*
@@ -823,8 +796,8 @@ sort key, or re-extract a local copy of them.
 
 ```
 Stage A (P0, structural)    W1 ─┬─ W2            break C1 (key seam ✅ + RowView ✅)
-                            W3  │                foundation/ umbrella + worker_ctx
-                            W4  │                BatchBuilder → storage (auto-fixes C2 test edge)
+                            W3  │                foundation/ umbrella + worker_ctx ✅
+                            W4  │                BatchBuilder → storage (auto-fixes C2 test edge) ✅
                             W5 ─┘                test-edge cleanup (C3/C4/E5) → cfg(test) acyclicity
 Stage B (P1, edges+surface) W6   W7   W8         batch_wire + 3rd edge · ops::reindex · surface sweep (8a prod + 8b test)
 Stage C (P2, splits+regroup) W9 W10 W11 W12 W13 W14   god-file carves into the layer tree (gated on W6/W7/W8)
@@ -838,9 +811,6 @@ guardrails and the §7 test policy.
 
 ### Decisions to confirm before committing the affected seam
 
-- **`foundation::log` macro paths (W3):** the `#[macro_export]` macro bodies must
-  update `$crate::log::…` → `$crate::foundation::log::…`; confirm this mechanical
-  find-replace over the macro definitions.
 - **Commit ordering:** `schema::key` (W1) moves as ONE commit carrying `PkBuf`
   *together with* `compare_pk_bytes` (its `Ord` delegates to it); W4 must land
   before or with the W12 query regroup (or the repointed `compiler` tests break).

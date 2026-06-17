@@ -23,8 +23,8 @@ use crate::storage::batch_pool::PooledSendBuf;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES,
                      TABLE_TAB_ID, IDX_TAB_ID,
-                     IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE,
-                     BatchBuilder, index_meta_schema_desc, INDEX_META_COL_NAMES};
+                     IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE};
+use crate::storage::{BatchBuilder, index_meta_schema_desc, INDEX_META_COL_NAMES};
 use crate::runtime::committer::{self, CommitRequest};
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, FLAG_GET_INDICES, SchemaWithVersion};
 use crate::runtime::master::{MasterDispatcher, first_worker_error_opt};
