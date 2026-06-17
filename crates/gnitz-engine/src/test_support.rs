@@ -104,6 +104,58 @@ pub(crate) fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -
     b
 }
 
+/// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
+/// key (negatives sort before positives only because the encoder sign-flips).
+pub(crate) fn make_schema_i64pk_i64() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+/// Build a sorted, consolidated batch with an I64 PK and a single I64 payload
+/// from native `(pk, weight, payload)` tuples. The PK is OPK-encoded via
+/// [`Batch::extend_pk_opk`] (sign-flipped big-endian), so the bytes match an
+/// ingested row; callers must pass OPK-sorted rows.
+pub(crate) fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
+    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    for &(pk, w, val) in rows {
+        b.extend_pk_opk(schema, &[(pk as u64) as u128]);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes());
+        b.count += 1;
+    }
+    b.sorted = true;
+    b.consolidated = true;
+    b
+}
+
+/// U64 pk + a single STRING payload column.
+pub(crate) fn make_schema_pk_u64_payload_string() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::STRING, 0),
+        ],
+        &[0],
+    )
+}
+
+/// U64 pk + a single BLOB payload column.
+pub(crate) fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::BLOB, 0),
+        ],
+        &[0],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Shared proptest strategies
 // ---------------------------------------------------------------------------

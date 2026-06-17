@@ -7,6 +7,7 @@ use crate::schema::{
 };
 use crate::storage::{Batch, ConsolidatedBatch};
 use crate::foundation::codec::{read_i64_le, read_u64_le};
+use crate::test_support::make_schema_i64pk_i64;
 
 use super::super::util::{
     extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse,
@@ -3121,17 +3122,6 @@ fn make_batch_raw_pk<T: Copy>(
     b
 }
 
-/// I64 pk + I64 payload schema (signed-PK exercise of the order-preserving key).
-fn make_schema_i64pk_i64val() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
-
 /// Common output schema for SUM aggregates over a single-col PK:
 /// `U128 pk, I64 sum (nullable)`.
 fn make_pk_sum_out_schema() -> SchemaDescriptor {
@@ -3326,7 +3316,7 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
     use std::rc::Rc;
     use crate::storage::CursorHandle;
 
-    let in_schema = make_schema_i64pk_i64val();
+    let in_schema = make_schema_i64pk_i64();
     // Output PK is naturally U128 here too (extends signed encoding via
     // emit_pk on a single-col PK; we only check ordering of payload).
     let out_schema = SchemaDescriptor::new(
@@ -3451,7 +3441,7 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
 
 #[test]
 fn test_sort_owned_signed_pk_canonical_order() {
-    let schema = make_schema_i64pk_i64val();
+    let schema = make_schema_i64pk_i64();
     let batch = make_batch_raw_pk(&schema, &[
         (-1, 1, 10),
         (2, 1, 20),

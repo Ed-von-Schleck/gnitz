@@ -5,6 +5,7 @@ pub(crate) mod index;
 mod join;
 mod linear;
 mod reduce;
+mod reindex;
 mod scan;
 pub(crate) mod util;
 

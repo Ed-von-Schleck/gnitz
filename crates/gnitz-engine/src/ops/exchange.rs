@@ -10,6 +10,7 @@ use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ConsolidatedBatch, MemBatch, compare_pk_bytes, pk_sort_key, partition_for_key, partition_for_pk_bytes, write_to_batch, scatter_multi_source};
 
 use super::util::extract_group_key;
+use super::reindex::{ReindexPacker, german_string_promote_key};
 
 // ---------------------------------------------------------------------------
 // Exchange repartitioning
@@ -237,7 +238,7 @@ fn route_partition_key(
             // so the row co-locates with its `_join_pk` partition. A NULL string
             // is a zeroed struct → empty content → 0, matching promote_into.
             if gnitz_wire::is_german_string(tc) {
-                return crate::ops::linear::german_string_promote_key(loc.bytes(mb, row), mb.blob);
+                return german_string_promote_key(loc.bytes(mb, row), mb.blob);
             }
         }
     }
@@ -298,9 +299,9 @@ fn compound_join_packer(
     col_indices: &[u32],
     target_tcs: &[u8],
     schema: &SchemaDescriptor,
-) -> Option<crate::ops::linear::ReindexPacker> {
+) -> Option<ReindexPacker> {
     (mode == RouteMode::JoinPromote && (col_indices.len() > 1 || key_is_promoted(target_tcs)))
-        .then(|| crate::ops::linear::ReindexPacker::new(schema, col_indices, target_tcs))
+        .then(|| ReindexPacker::new(schema, col_indices, target_tcs))
 }
 
 fn fill_worker_indices(
@@ -1940,7 +1941,7 @@ mod tests {
         ];
         let cb = make_join_key_batch(&schema, rows);
 
-        let packer = crate::ops::linear::ReindexPacker::new(&schema, &cols, &[]);
+        let packer = ReindexPacker::new(&schema, &cols, &[]);
         let expected_worker = |sb: &Batch, r: usize| -> usize {
             let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
             packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
@@ -2006,7 +2007,7 @@ mod tests {
         let cols = [1u32];
         let targets = [type_code::I64];
 
-        let packer = crate::ops::linear::ReindexPacker::new(&schema, &cols, &targets);
+        let packer = ReindexPacker::new(&schema, &cols, &targets);
         let expected_worker = |sb: &Batch, r: usize| -> usize {
             let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
             packer.pack_into(&mut buf[..packer.out_stride], &sb.as_mem_batch(), r);
@@ -2053,7 +2054,7 @@ mod tests {
         let pk_cb = ConsolidatedBatch::new_unchecked(pb);
         let pk_cols = [0u32];
         let pk_targets = [type_code::I64];
-        let pk_packer = crate::ops::linear::ReindexPacker::new(&pk_schema, &pk_cols, &pk_targets);
+        let pk_packer = ReindexPacker::new(&pk_schema, &pk_cols, &pk_targets);
         let pk_repart = op_repartition_batches_mode(
             &[Some(&pk_cb)], &pk_cols, &pk_targets, &pk_schema, num_workers, RouteMode::JoinPromote);
         assert_eq!(total_rows(&pk_repart), pk_rows.len(), "PK-key: no dropped rows");
