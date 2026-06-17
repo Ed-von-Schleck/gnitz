@@ -15,20 +15,22 @@ use super::batch::{
     Batch, MAX_BATCH_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT, pk_stride,
 };
 use super::merge::MemBatch;
-use super::shard_file;
+use super::super::shard_file;
+use super::super::wal;
+use super::super::error::StorageError;
 use crate::schema::SchemaDescriptor;
 
 impl Batch {
     /// Write this batch as a shard file directly to disk.
     #[cfg(test)]
-    pub fn write_as_shard(&self, path: &CStr, table_id: u32) -> Result<(), super::error::StorageError> {
+    pub fn write_as_shard(&self, path: &CStr, table_id: u32) -> Result<(), StorageError> {
         let regions = self.regions();
         shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true, 0)
     }
 
     /// Write this batch as a shard file with an explicit flags byte.
     /// Use `SHARD_FLAG_PK_UNIQUE` when the output was verified by `PkUniqueChecker`.
-    pub fn write_as_shard_with_flags(&self, path: &CStr, table_id: u32, flags: u8) -> Result<(), super::error::StorageError> {
+    pub fn write_as_shard_with_flags(&self, path: &CStr, table_id: u32, flags: u8) -> Result<(), StorageError> {
         let regions = self.regions();
         shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true, flags)
     }
@@ -42,7 +44,7 @@ impl Batch {
         for (i, size) in sizes[..nr_wire].iter_mut().enumerate() {
             *size = self.region_size(i) as u32;
         }
-        super::wal::block_size(nr_wire, &sizes[..nr_wire])
+        wal::block_size(nr_wire, &sizes[..nr_wire])
     }
 
     /// Byte count of the WAL-block encoding for `count` rows from this batch.
@@ -57,7 +59,7 @@ impl Batch {
         }
         // blob is always empty for wire-safe schemas
         sizes[blob_idx] = 0;
-        super::wal::block_size(nr_wire, &sizes[..nr_wire])
+        wal::block_size(nr_wire, &sizes[..nr_wire])
     }
 
     /// Encode rows `[start_row, start_row + count)` into WAL V4 wire format at
@@ -110,7 +112,7 @@ impl Batch {
         // blob: null ptr with 0 bytes — no long strings in wire-safe schemas
         ptrs[blob_idx]  = std::ptr::null();
         sizes[blob_idx] = 0;
-        let new_offset = super::wal::encode(
+        let new_offset = wal::encode(
             out, offset, 0, table_id, count as u32,
             &ptrs[..nr_wire], &sizes[..nr_wire], 0, checksum,
         ).expect("WAL encode failed: buffer too small");
@@ -127,7 +129,7 @@ impl Batch {
             sizes[i] = self.region_size(i) as u32;
         }
         let blob_size = self.blob.len() as u64;
-        let new_offset = super::wal::encode(
+        let new_offset = wal::encode(
             out, offset, 0, table_id, self.count as u32,
             &ptrs[..nr_wire], &sizes[..nr_wire], blob_size, checksum,
         ).expect("WAL encode failed: buffer too small");
@@ -154,7 +156,7 @@ impl Batch {
         let mut offsets = [0u64; 128];
         let mut sizes = [0u32; 128];
 
-        if super::wal::validate_and_parse(
+        if wal::validate_and_parse(
             data, &mut lsn, &mut tid, &mut count, &mut num_regions,
             &mut blob_size, &mut offsets, &mut sizes, 128, verify_checksum,
         ).is_err() {
@@ -242,7 +244,7 @@ pub fn decode_mem_batch_from_wal_block<'a>(
     let mut wal_offsets = [0u64; MAX_BATCH_REGIONS];
     let mut sizes       = [0u32; MAX_BATCH_REGIONS];
 
-    super::wal::validate_and_parse(
+    wal::validate_and_parse(
         data, &mut _lsn, &mut _tid, &mut count, &mut num_regions,
         &mut _blob_size, &mut wal_offsets, &mut sizes, MAX_BATCH_REGIONS as u32, false,
     ).map_err(|_| "data WAL block invalid")?;

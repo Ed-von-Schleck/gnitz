@@ -30,13 +30,13 @@ pub(crate) const MAX_BATCH_REGIONS: usize = 68;
 // Three fixed regions (PK is 16 bytes/row; weight and null_bmp are 8 bytes/row);
 // payload columns start at index 3 and continue for `num_payload_cols()` slots.
 // Use these constants instead of bare numeric literals.
-pub(super) const REG_PK: usize = 0;
-pub(super) const REG_WEIGHT: usize = 1;
-pub(super) const REG_NULL_BMP: usize = 2;
-pub(super) const REG_PAYLOAD_START: usize = 3;
+pub(in crate::storage) const REG_PK: usize = 0;
+pub(in crate::storage) const REG_WEIGHT: usize = 1;
+pub(in crate::storage) const REG_NULL_BMP: usize = 2;
+pub(in crate::storage) const REG_PAYLOAD_START: usize = 3;
 /// Stride (in bytes) of the weight and null_bmp fixed regions.
 const FIXED_REGION_STRIDE: u8 = 8;
-pub(super) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
+pub(in crate::storage) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
 
 /// Allocate a zeroed buffer and request hugepage backing for large allocations.
 ///
@@ -64,7 +64,7 @@ fn alloc_large_zeroed(size: usize) -> Vec<u8> {
 /// otherwise misalign the following region. MORSEL=256 batches are already
 /// aligned, but smaller batches are not. Total allocation grows by at most 7
 /// bytes per region boundary.
-pub(super) fn compute_offsets(strides: &[u8; MAX_BATCH_REGIONS], num_regions: usize, capacity: usize) -> ([usize; MAX_BATCH_REGIONS], usize) {
+pub(in crate::storage) fn compute_offsets(strides: &[u8; MAX_BATCH_REGIONS], num_regions: usize, capacity: usize) -> ([usize; MAX_BATCH_REGIONS], usize) {
     // Offsets are `usize`, not `u32`: a single large batch (a wide multi-column
     // join, a bulk full-scan/merge) can have a cumulative offset > 4 GB even
     // though each individual region is still capped at 4 GB by the u32 wire
@@ -84,7 +84,7 @@ pub(super) fn compute_offsets(strides: &[u8; MAX_BATCH_REGIONS], num_regions: us
 
 /// Copy a 16-byte German String struct from source into a destination slice,
 /// relocating long-string blob data into `dst_blob`.
-pub(super) fn relocate_string_cell(
+pub(in crate::storage) fn relocate_string_cell(
     src_struct: &[u8],
     src_blob: &[u8],
     dst: &mut [u8],
@@ -125,7 +125,7 @@ pub(super) fn pk_stride(schema: &SchemaDescriptor) -> u8 {
 }
 
 /// Build a strides array from a SchemaDescriptor.
-pub(super) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_REGIONS], u8) {
+pub(in crate::storage) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_REGIONS], u8) {
     let mut strides = [0u8; MAX_BATCH_REGIONS];
     strides[REG_PK] = pk_stride(schema);
     strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
@@ -421,7 +421,7 @@ impl Batch {
     ///
     /// # Safety
     /// Caller must guarantee the layout invariant described above.
-    pub(super) unsafe fn from_prebuilt(
+    pub(in crate::storage) unsafe fn from_prebuilt(
         data: Vec<u8>,
         blob: Vec<u8>,
         strides: [u8; MAX_BATCH_REGIONS],
@@ -881,7 +881,7 @@ impl Batch {
     }
 
     /// Returns `None` for unsorted batches; `count <= 1` is always sorted.
-    pub(super) fn as_sorted_mem_batch(&self) -> Option<merge::SortedMemBatch<'_>> {
+    pub(in crate::storage) fn as_sorted_mem_batch(&self) -> Option<merge::SortedMemBatch<'_>> {
         if self.sorted || self.count <= 1 {
             Some(merge::SortedMemBatch::new_unchecked(self.as_mem_batch()))
         } else {
@@ -910,7 +910,7 @@ impl Batch {
         }
         let blob_cap = batch.blob.len().max(1);
         write_to_batch(schema, indices.len(), blob_cap, |writer| {
-            merge::scatter_copy(batch, indices, &[], writer);
+            super::scatter::scatter_copy(batch, indices, &[], writer);
         })
     }
 

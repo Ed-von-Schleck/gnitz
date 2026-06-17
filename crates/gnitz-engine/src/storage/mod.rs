@@ -4,27 +4,27 @@
 //! Engine code imports from `crate::storage::{Type, fn}`.
 
 // Internal — not accessible outside storage/
-mod bloom;
-mod xor8;
+// L3 LSM + leaf modules (stay at storage level)
 mod wal;
 mod manifest;
-mod columnar;
-mod heap;
 mod compact;
 mod shard_file;
 mod shard_reader;
 mod shard_index;
-mod merge;
-mod batch;
-mod batch_wire;
 mod memtable;
 mod read_cursor;
-mod range_key;
 mod layout;
 mod table;
 mod partitioned_table;
-pub(crate) mod batch_pool;
 mod error;
+
+// L2 representation lives under `repr/`. It has no facade of its own; the leaf
+// items are re-exported below and the submodules aliased here so the LSM siblings
+// keep their `super::<mod>` paths and the in-storage `with_pk_ord!` /
+// `crate::storage::batch_pool` paths resolve without touching the moved bodies.
+mod repr;
+use repr::{batch, batch_wire, bloom, columnar, heap, merge, range_key, scatter, xor8};
+pub(crate) use repr::batch_pool;
 
 #[cfg(test)]
 mod data_roundtrip_proptest;
@@ -35,7 +35,8 @@ pub use partitioned_table::{PartitionedTable, partition_for_key, partition_for_p
 pub use read_cursor::CursorHandle;
 pub use batch::{Batch, ConsolidatedBatch, write_to_batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
-pub use merge::{MemBatch, scatter_copy, scatter_multi_source};
+pub use merge::MemBatch;
+pub use scatter::{scatter_copy, scatter_multi_source};
 pub use error::StorageError;
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
