@@ -3,40 +3,64 @@
 ## Defect
 
 `SUM` over a nullable column emits a concrete `0` instead of `NULL` when a
-retraction removes the **last non-null contributor** from a group that survives
-(via `COUNT(*)` or another aggregate). SQL `SUM` of a group with no non-null
-values is `NULL`; the engine yields `0`.
+retraction removes the **last non-null contributor** from a group that still
+survives (via `COUNT(*)` or another aggregate). SQL `SUM` of a group with no
+non-null values is `NULL`; the engine yields `0`.
 
 Root cause: the accumulator (`ops/reduce/agg.rs`) tracks presence as a saturating
-boolean `has_value`, not a non-null count. `SUM` is emitted NULL iff
-`is_zero() == !has_value`. Both `step_from_batch` (non-null row) and
-`merge_accumulated` (fold) set `has_value = true` and never clear it. Across a
-retraction the *value* nets correctly (SUM is linear), but `has_value` cannot
-fall back to `false`, so a group whose non-null count returns to 0 keeps
-`has_value = true` and emits `SUM = 0`.
+boolean `has_value`, not a non-null count. The emit path writes a `SUM` column
+NULL iff `is_zero()`, and `is_zero()` is exactly `!has_value` (`agg.rs:109-111`,
+consumed at `emit.rs:66` and `emit.rs:240`). Every non-null `step_from_batch` and
+every `merge_accumulated` fold sets `has_value = true`; only `reset()` clears it.
+On the linear fast path the accumulator is never reset, so across a retraction the
+*value* nets correctly (SUM is linear) but `has_value` cannot fall back to
+`false`: a group whose non-null count returns to 0 keeps `has_value = true` and
+emits `SUM = 0`.
 
-This is the converse of the "stays-NULL" fold defect fixed in
-`plans/reduce-gather-null-agg-state-propagation.md` §B. That fold-gate keeps an
-*already-NULL* SUM null; it cannot make a *non-null* SUM become null, because the
-all-linear path has no history to detect the non-null count crossing zero.
+A boolean cannot encode "non-null count crossed back to zero"; only a real count
+can. `SUM = 0` is itself ambiguous — `SUM({5, −5}) = 0` (non-null) and
+`SUM({NULL}) = NULL` are indistinguishable under `has_value`.
 
-No ghost results: the retraction row still cancels the old output row byte-for-byte
-(old SUM was non-null, re-emitted non-null). The new row simply carries the wrong
-value (`0` where `NULL` is correct).
+No new ghost rows in the target scenario: the old `SUM` was non-null and the
+retraction row re-emits it non-null (the `use_old_val` branch never null-marks —
+`emit.rs:60-71`), cancelling the prior output byte-for-byte; only the new insert
+row carries the wrong value (`0` where `NULL` is correct).
 
 ## Reachability
 
-- **MIN/MAX:** unaffected. Non-linear; recomputed from history+delta each tick
-  (replay / AVI), so `has_value` is rebuilt and correctly drops to false.
-- **SUM alongside MIN/MAX in one reduce:** unaffected — the reduce is non-linear,
-  so SUM also replays history and rebuilds `has_value`.
-- **All-linear SUM (SUM/COUNT only), single worker:** affected. The fast fold
-  path (`op_reduce.rs:483-486`) has no `trace_in` (the compiler allocates it only
-  for `!all_linear && !will_use_avi`, `compiler.rs:1803`).
-- **Distributed (gather), any SUM:** affected. `op_gather_reduce` folds the old
-  global SUM linearly (`op_gather.rs:101-104`) and has no per-worker input
-  history, so even if every worker emitted a correct NULL partial the gather's
-  old-global fold re-creates `has_value = true`.
+The bug lives on the **linear fold** path, which folds the previous *output* value
+forward without replaying inputs. It is absent wherever the reduce resets and
+re-steps net-positive rows.
+
+- **MIN/MAX — unaffected.** Non-linear; recomputed from history+delta each tick
+  (replay / AVI). The replay consolidates `history + delta`, drops net-zero rows,
+  `reset()`s every accumulator, then re-steps only `w > 0` rows
+  (`op_reduce.rs:560-574`), so `has_value` rebuilds and correctly falls to `false`.
+- **SUM alongside MIN/MAX — unaffected.** One non-linear agg makes the whole
+  reduce non-linear (`all_linear == false`, `op_reduce.rs:163`), so SUM rides the
+  same reset+replay. A retracted `(pk,5,+1)/(pk,5,−1)` pair nets to zero in the
+  consolidation and never re-sets `has_value`.
+- **All-linear SUM (SUM/COUNT only), single worker — affected.** The fast fold
+  folds the old output value with `merge_accumulated(old_vals[k], 1)` and never
+  resets (`op_reduce.rs:483-486`); no `trace_in` is allocated (only
+  `!all_linear && !will_use_avi` gets one — `compiler.rs:1779,1803`).
+- **Multi-worker GROUP BY — affected, via the same per-worker fold.**
+  `reduce_multi` inserts an `ExchangeShard` on the group columns
+  (`circuit.rs:465-472`, used at `planner.rs:2539`), so each group is owned wholly
+  by one worker whose `op_reduce` computes the *complete* group on the same buggy
+  linear fold. The downstream `ExchangeGather` only unions disjoint groups; it does
+  not re-aggregate. A 4-worker run reproduces the bug on whichever worker owns the
+  group — an integration check, not a distinct aggregation path.
+- **Global aggregate (no GROUP BY) — affected, same fold.** Built with
+  `reduce_multi_local` over a broadcast input (`circuit.rs:482-489`; e.g.
+  `planner.rs:1648`): every worker computes the same complete aggregate on the
+  linear fold.
+
+There is **no partial-then-combine reduce on the SQL path.** `op_gather_reduce`
+(its linear old-global fold is `op_gather.rs:101-104`) is constructed only by
+engine test scaffolding (`compiler.rs:4490`, inside `#[test]`); the circuit builder
+exposes no method that emits an `OpNode::GatherReduce`, and no planner path builds
+one. It is unreached dead code, out of scope here.
 
 Trigger shape: `SELECT k, SUM(v), COUNT(*) FROM t GROUP BY k` with `v` nullable;
 insert `(k, v)` and `(k, NULL)`, then retract `(k, v)`. Expected surviving row
@@ -44,124 +68,103 @@ insert `(k, v)` and `(k, NULL)`, then retract `(k, v)`. Expected surviving row
 
 ## Reproduction
 
-Unit test in `crates/gnitz-engine/src/ops/reduce/tests.rs` (fails on current code
-*and* after the prerequisite plan's §A/§B — it is a distinct defect):
+The fix lives in the SQL planner (it injects a companion aggregate and a finalize
+gate), so a unit test that calls `op_reduce` directly with a bare `[Count, Sum]`
+descriptor list cannot be made to pass — `op_reduce` has no extra column in which
+to carry the non-null count, and that absence is the defect. Both tests below
+exercise the companion + finalize together.
 
-```rust
-#[test]
-fn sum_becomes_null_when_last_value_retracted() {
-    use std::rc::Rc;
-    use crate::storage::CursorHandle;
-
-    // in: pk(U64), grp(I64), val(I64 nullable); out: pk(U128), grp, count, sum.
-    let in_schema = SchemaDescriptor::new(&[
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::I64, 0),
-        SchemaColumn::new(type_code::I64, 1),
-    ], &[0]);
-    let out_schema = SchemaDescriptor::new(&[
-        SchemaColumn::new(type_code::U128, 0),
-        SchemaColumn::new(type_code::I64, 0),
-        SchemaColumn::new(type_code::I64, 1),
-        SchemaColumn::new(type_code::I64, 1),
-    ], &[0]);
-    let aggs = [
-        AggDescriptor { col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2] },
-        AggDescriptor { col_idx: 2, agg_op: AggOp::Sum,   col_type_code: TypeCode::I64, _pad: [0; 2] },
-    ];
-    let sum_null_bit = 1u64 << 2; // sum is payload index 2
-
-    // Tick 1: group 10 = {(pk1,val=5),(pk2,val=NULL)} → COUNT=2, SUM=5.
-    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
-    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
-    let delta1 = {
-        let mut b = Batch::with_schema(in_schema, 2);
-        b.extend_pk(1u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &10i64.to_le_bytes());
-        b.extend_col(1, &5i64.to_le_bytes());
-        b.count += 1;
-        b.extend_pk(2u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&(1u64 << 1).to_le_bytes()); // val NULL
-        b.extend_col(0, &10i64.to_le_bytes());
-        b.extend_col(1, &0i64.to_le_bytes());
-        b.count += 1;
-        b.sorted = true; b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
-    };
-    let (out1, _) = op_reduce(&delta1, None, to_ch.cursor_mut(),
-        &in_schema, &out_schema, &[1u32], &aggs,
-        None, false, TypeCode::U64, None, 0, None, None);
-    assert!(out1.as_mem_batch().get_null_word(0) & sum_null_bit == 0, "tick1 SUM=5");
-
-    // Tick 2: retract (pk1, val=5). Group 10 = {(pk2,val=NULL)} → COUNT=1, SUM=NULL.
-    let prev = Rc::new(out1);
-    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
-    let delta2 = {
-        let mut b = Batch::with_schema(in_schema, 1);
-        b.extend_pk(1u128);
-        b.extend_weight(&(-1i64).to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &10i64.to_le_bytes());
-        b.extend_col(1, &5i64.to_le_bytes());
-        b.count += 1;
-        b.sorted = true; b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
-    };
-    let (out2, _) = op_reduce(&delta2, None, to_ch2.cursor_mut(),
-        &in_schema, &out_schema, &[1u32], &aggs,
-        None, false, TypeCode::U64, None, 0, None, None);
-    let mb2 = out2.as_mem_batch();
-    let new_row = (0..out2.count).find(|&i| out2.get_weight(i) > 0).expect("insert row");
-    assert!(mb2.get_null_word(new_row) & sum_null_bit != 0,
-        "SUM must become NULL when the last non-null value is retracted (null_word={:#x})",
-        mb2.get_null_word(new_row));
-}
-```
-
-E2E (`crates/gnitz-py/tests/`), both `GNITZ_WORKERS=1` and `GNITZ_WORKERS=4`, on
-`SELECT k, SUM(v) AS sm, COUNT(*) AS c FROM t GROUP BY k` with `v` nullable:
-insert `(k, 5)` and `(k, NULL)`, then retract `(k, 5)`; assert the surviving row
-has `sm IS NULL` and `c = 2`. The 4-worker run is what exercises the gather
-old-global fold path.
+- **Engine level** (`ops/reduce/tests.rs`): drive `op_reduce` with
+  `aggs = [Count, Sum, CountNonNull(same col)]`, a finalize `ExprProgram` that
+  emits `SUM` null-gated by the companion (see Fix), and a finalize output schema
+  projecting `[pk, grp, count, sum]` (companion stripped). After tick 1
+  `{(pk1,5),(pk2,NULL)}` and tick 2 retract `(pk1,5)`, assert the finalized insert
+  row has the `SUM` null bit set and `COUNT(*) = 1`. Pins the mechanism without the
+  planner.
+- **E2E** (`gnitz-py/tests/`), `GNITZ_WORKERS=1` and `=4`, on
+  `SELECT k, SUM(v) AS sm, COUNT(*) AS c FROM t GROUP BY k` with `v` nullable:
+  insert `(k, 5)` and `(k, NULL)`, retract `(k, 5)`; assert the surviving row has
+  `sm IS NULL` and `c = 1`. The 4-worker run confirms the fix holds when the
+  group's reduce is sharded onto one worker.
 
 ## Fix
 
-SUM's *value* is linearly maintainable; its *NULL-ness* is a boundary condition
-(`NULL ⇔ non-null count == 0`), which the saturating `has_value` bool cannot
-track across retractions. A correct incremental answer needs the non-null count.
+The mechanism already exists — `AVG` is built from exactly these parts. Reuse them.
 
-**Recommended — companion `COUNT_NON_NULL`.** For each nullable `SUM(v)` the
-planner emits a hidden companion `COUNT_NON_NULL(v)` on the same column; `SUM` is
-written NULL iff its companion count `== 0`. The count is linear and is maintained
-by the *same* fold (`op_reduce`) and combine + old-global fold (`op_gather`)
-already in place, so it fixes the single-worker *and* distributed cases and keeps
-the linear fast path. A real count reaches 0 on the last retraction where the
-bool cannot.
+`AggOp::CountNonNull` is a first-class linear aggregate (`agg.rs:24,56`), maintained
+by the same `step_from_batch` / `merge_accumulated` / `combine` paths as `COUNT`
+(`agg.rs:135-153,234,265`) and typed `I64` by both `agg_output_type`
+(`compiler.rs:967`) and `agg_result_type` (`planner.rs:2225`). `AVG(v)` already
+plans as a `SUM(v) + COUNT_NON_NULL(v)` spec pair (`push_agg_specs`,
+`planner.rs:2770-2775`) and derives its NULL in the fused finalize MAP:
+`float_div(sum, cnt)` returns NULL when `cnt == 0` (`planner.rs:2609-2636`),
+because division by zero yields NULL for both int and float
+(`expr/tests/batch_tests.rs:258,298`).
 
-Threading (needs a design pass on exactly where the companion lives):
-- Planner (`gnitz-sql/src/planner.rs`, agg-spec construction near `:2563`):
-  inject the companion descriptor for every nullable-source `SUM`; record the
-  SUM→companion pairing.
-- Reduce output schema / trace: one extra non-nullable I64 column per paired SUM.
-- Emit (`emit_reduce_row`/`emit_gather_row`): null-mark the SUM column from its
-  companion slot instead of `is_zero()`. (Equivalently, fold the decision into
-  the finalize program so the companion never reaches user output.)
-- Strip the companion before user-visible output (it must not appear in the
-  view's projected schema).
+For each `SUM(v)` whose source column `v` is nullable, the planner emits a hidden
+companion `COUNT_NON_NULL(v)` and builds the finalize column as a *type-preserving*
+null-gate in place of a plain `copy_col`. Dispatch on the source type, as AVG does
+at `planner.rs:2616-2624`:
 
-**Rejected — force history replay for nullable SUM.** Making nullable SUM
-non-linear (exclude it from `op_reduce.rs:163` / `compiler.rs:1779` `all_linear`,
-and allocate `trace_in` for it) repairs the single-worker case via replay, but
-**not** gather: the gather has no input history and still folds the old global
-SUM linearly, so `GNITZ_WORKERS > 1` stays wrong. It also pays a full history
-replay per epoch for a previously O(delta) aggregate. Incomplete; do not pursue.
+- integer source:
+  `emit_col(int_div(load_col_int(sum), cmp_ne(load_col_int(cnt), load_const(0))), out_idx)`
+- float source:
+  `emit_col(float_div(load_col_float(sum), int_to_float(cmp_ne(load_col_int(cnt), load_const(0)))), out_idx)`
+
+`cmp_ne` yields i64 `1`/`0` (`expr/batch.rs:427`); dividing by `1` is exact
+(identity for every `i64`, and `x / 1.0` is exact) and dividing by `0` produces
+NULL. So the gate keeps the SUM value when the non-null count is positive and marks
+it NULL when the count is zero — distinguishing `SUM({5, −5}) = 0` from
+`SUM({NULL}) = NULL`. The companion is consumed by the finalize and never
+projected, exactly as AVG's count is.
+
+This covers every affected path with **no engine change**:
+
+- The companion is just another linear spec, so the existing fold (`op_reduce`
+  linear path and the non-linear replay alike) maintains it, and the compiler's
+  reduce-output schema picks it up through the shared `agg_output_type`.
+- The finalize MAP is always attached after the reduce (`planner.rs:2687`) and
+  fused into the reduce's inline finalize program (`compiler.rs:101,1321`). It runs
+  **per group on complete aggregates** in every reachable layout — single-worker,
+  group-sharded multi-worker, and broadcast global — so a count of zero is always
+  the true non-null count.
+- The finalize runs on **both** the retraction row (old `SUM`/old `cnt`) and the
+  insert row (new `SUM`/new `cnt`) (`op_reduce.rs:471-479,588-596`). Because
+  null-ness is derived purely from the exact companion on each, a re-emitted
+  retraction is gated identically to the original emission and cancels — the fix
+  introduces no ghost and needs no separate retraction-null handling. The raw `SUM`
+  null bit (`has_value`) becomes irrelevant for nullable SUM, in both the
+  stays-NULL and becomes-NULL directions.
+
+A non-nullable-source `SUM` over a surviving (non-empty) group always has non-null
+count ≥ 1, so it can never be NULL — it keeps its plain `copy_col` and gets no
+companion. The companion is emitted strictly for nullable-source SUM.
+
+Threading (sites):
+- `push_agg_specs` (`planner.rs:2750`): for a nullable-source `SUM`, push
+  `(AGG_SUM, c)` then `(AGG_COUNT_NON_NULL, c)` — the AVG two-spec shape. Each
+  nullable SUM materializes its own companion; do not dedup against an `AVG(v)` or
+  `COUNT(v)` companion (a redundant linear accumulator is negligible).
+- `AggMapping`: add an `is_nullfill_sum: bool` alongside `is_avg`; set it for a
+  nullable-source SUM so the projection knows to gate.
+- SELECT projection (`planner.rs:2637-2653`): when `is_nullfill_sum`, build the
+  gate above (honoring the `is_float` source split) and push one nullable output
+  column; do not project the companion.
+- HAVING runs on the raw reduce output before the finalize MAP
+  (`planner.rs:2667-2685`), so it sees the raw `SUM` column. Numeric predicates
+  (`SUM(v) > k`) are unaffected (`0 > k` and `NULL > k` both drop the row). Bind
+  `SUM(v) IS NULL` / `IS NOT NULL` to `companion == 0` / `companion != 0` so HAVING
+  agrees with the projected null-ness.
 
 ## Scope
 
-- Correctness only; no change to SUM's value arithmetic or to which groups emit.
-- Prerequisite: `plans/reduce-gather-null-agg-state-propagation.md` (its §A
-  retraction null-word emit and §B fold-gate keep an *already*-NULL SUM null;
-  this plan adds the *becomes*-NULL transition on top).
+- Correctness only; no change to SUM's value arithmetic or to which groups emit a
+  row.
+- Self-contained for nullable SUM: null-ness is derived entirely from the companion
+  `COUNT_NON_NULL` in the finalize, covering both the all-NULL group gaining another
+  NULL (stays NULL) and the last non-null being retracted (becomes NULL), without
+  relying on `has_value`-based emit logic.
+- Out of scope: pruning a group that loses its **last** row (a `has_value`-vs-
+  `acc == 0` emit question, independent of SUM null-ness); nullable MIN/MAX null
+  transitions (already handled by the non-linear replay); `op_gather_reduce`
+  (unreached dead code).
