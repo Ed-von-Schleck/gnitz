@@ -7,7 +7,7 @@ use sqlparser::ast::{
     FunctionArguments, FunctionArg, FunctionArgExpr, WrappedCollection,
     SqlOption, Value, ValueWithSpan,
 };
-use gnitz_core::{ColumnDef, Schema, TypeCode};
+use gnitz_core::{ColumnDef, FixedInt, Schema, TypeCode};
 use gnitz_core::{
     GnitzClient, IndexMeta, CircuitBuilder, ExprBuilder, RangeRel,
     AGG_COUNT, AGG_COUNT_NON_NULL, AGG_SUM, AGG_MIN, AGG_MAX,
@@ -1470,24 +1470,20 @@ fn build_range_join_view(
     let rel_ab = converse_rel(range.op);
     let rel_ba = range.op;
 
-    // Pure-range LEFT: the threshold null-fill aggregates `b.range_col` with an
-    // INLINE MIN/MAX reduce (built inside `v_left`'s null-fill block, §below) whose
-    // output `reindex_m` reindexes onto the compare type `Tc`. Non-float MIN/MAX
-    // carries its source type (`agg_output_type`), and the 8-byte accumulator emits
-    // a native-width value, so `Tc` must be an 8-byte integer (`BIGINT` / `BIGINT
-    // UNSIGNED`): the reduce then yields a `Tc`-typed result the reindex consumes
-    // directly. A 16-byte `Tc` (`U64` vs `I64` → I128; a U128/UUID pair → U128) the
-    // accumulator cannot aggregate, and a narrower int would have its reduce output
-    // widened to I64 (breaking the reindex to the narrow `Tc`); reject either here,
-    // before the circuit is built, rather than failing the compile.
+    // Pure-range LEFT: the inline threshold null-fill reduces the range column with
+    // MIN/MAX (an 8-byte accumulator), then reindexes the result onto the range slot
+    // type. MIN/MAX preserves the source integer type, so any ≤8-byte integer range
+    // column yields a result the reindex consumes directly. A 16-byte U128/UUID/I128
+    // range column has no 8-byte accumulator. Reject up front rather than failing the
+    // compile. (Band LEFT, n_eq ≥ 1, uses the cap-free `A − distinct(π_A(inner))`
+    // set-difference null-fill instead, so it has no range-type restriction.)
     if is_left_join && n_eq == 0 {
         let range_tc = TypeCode::from_validated_u8(range.tc);
-        if !matches!(range_tc, TypeCode::I64 | TypeCode::U64) {
+        if FixedInt::from_type_code(range_tc).is_none() {
             return Err(GnitzSqlError::Unsupported(format!(
-                "pure-range LEFT JOIN on a {range_tc:?} compare type is not supported; its \
-                 threshold null-fill reduces the range column with MIN/MAX into an 8-byte \
-                 accumulator — use BIGINT / BIGINT UNSIGNED range columns, INNER JOIN, or \
-                 add an equality conjunct (band join)")));
+                "pure-range LEFT JOIN needs a ≤8-byte integer range column (got {range_tc:?}); \
+                 its threshold null-fill reduces the range column with MIN/MAX, which has no \
+                 16-byte accumulator — use a narrower range column, INNER JOIN, or a band join")));
         }
     }
 
@@ -1639,11 +1635,10 @@ fn build_range_join_view(
             // MIN/MAX), and — because non-float MIN/MAX now carries its source type
             // (`agg_output_type`) — emits its result already typed `Tc`. `reindex_m`
             // therefore self-derives the correct OPK order straight off the reduce,
-            // with no relabel (the cap to `Tc ∈ {I64, U64}` keeps the result the
-            // accumulator's native 8-byte width). `reduce_multi_local` is the
-            // shard-free reduce; its one output row is replicated on EVERY worker by
-            // the n_eq==0 broadcast, so `reindex_m` carries NO `partition_filter`
-            // (unlike `int_a`/`int_b`); `trace_m` is the one-row trace `matched` probes.
+            // with no relabel. `reduce_multi_local` is the shard-free reduce; its one
+            // output row is replicated on EVERY worker by the n_eq==0 broadcast, so
+            // `reindex_m` carries NO `partition_filter` (unlike `int_a`/`int_b`);
+            // `trace_m` is the one-row trace `matched` probes.
             let mbh       = cb.map_hash_row(reindex_b, &[0], 0);
             let red       = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)]);  // [_group_pk:U128, m:Tc]
             let carried_m = range_tc.carried_reindex_tc(range_tc);
@@ -2019,10 +2014,11 @@ fn converse_rel(r: RangeRel) -> RangeRel {
 /// Output columns of the inline pure-range-LEFT threshold `m`: the scalar
 /// (no-GROUP-BY) reduce emits a synthetic `_group_pk` (U128) plus the single
 /// aggregate column. Non-float MIN/MAX carries its source type
-/// (`compiler::agg_output_type`), and the compare type `Tc` is capped to an 8-byte
-/// integer (`I64`/`U64`, the accumulator's native width), so the reduce emits the
-/// value already typed `Tc`. Declaring `m` as `Tc` here lets `reindex_m`
-/// self-derive the `Tc` OPK order directly off the reduce output — no relabel.
+/// (`compiler::agg_output_type`), and the compare type `Tc` is capped to a ≤8-byte
+/// integer (the pure-range LEFT cap; the 8-byte accumulator emits at `Tc`'s native
+/// width), so the reduce emits the value already typed `Tc`. Declaring `m` as `Tc`
+/// here lets `reindex_m` self-derive the `Tc` OPK order directly off the reduce
+/// output — no relabel.
 fn pure_range_m_output_cols(tc: TypeCode) -> Vec<ColumnDef> {
     vec![
         ColumnDef { name: "_group_pk".into(), type_code: TypeCode::U128,

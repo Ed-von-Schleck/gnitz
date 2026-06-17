@@ -537,9 +537,10 @@ fn test_pure_range_left_join_accepts() {
 }
 
 /// A pure-range LEFT JOIN whose promoted compare type is 16-byte (here `U64` vs
-/// `I64` → `I128`) is rejected, not accepted: the threshold null-fill reduces the
-/// range column with `MIN`/`MAX` into an 8-byte accumulator, so a 16-byte (or
-/// narrower) `Tc` is unsupported. Pins that the planner returns a clean
+/// `I64` → `I128`) is rejected: the threshold null-fill reduces the range column
+/// with `MIN`/`MAX`, which has no 16-byte accumulator. A ≤8-byte integer range
+/// column is now accepted (see `test_pure_range_left_join_accepts_narrow_int`);
+/// only the 16-byte case stays unsupported. Pins that the planner returns a clean
 /// `Unsupported` up front rather than failing the compile.
 #[test]
 fn test_pure_range_left_join_rejects_wide_compare_type() {
@@ -552,10 +553,88 @@ fn test_pure_range_left_join_rejects_wide_compare_type() {
         "CREATE VIEW rlw_v AS SELECT rlw_a.id AS aid, rlw_b.id AS bid \
          FROM rlw_a LEFT JOIN rlw_b ON rlw_a.x < rlw_b.y"));
     match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.contains("compare type"), "got: {s}"),
+        GnitzSqlError::Unsupported(s) => assert!(s.contains("16-byte accumulator"), "got: {s}"),
         e => panic!("expected Unsupported, got {:?}", e),
     }
     assert!(client.resolve_table_or_view_id(&sn, "rlw_v").is_err(), "no view should be registered");
+}
+
+/// Narrow integer range columns (`INT`/I32, `INT UNSIGNED`/U32, `SMALLINT`/I16)
+/// register for a pure-range LEFT JOIN. MIN/MAX preserves the source integer type,
+/// so the inline threshold reduce emits the narrow type that `reindex_m` consumes
+/// at its native width directly — no widen-to-I64 step to break the reindex. These
+/// do NOT compile under the old `{I64, U64}`-only cap.
+#[test]
+fn test_pure_range_left_join_accepts_narrow_int() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let types = ["INT", "INT UNSIGNED", "SMALLINT"];
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        for (i, ty) in types.iter().enumerate() {
+            p.execute(&format!(
+                "CREATE TABLE na_{i} (id BIGINT NOT NULL PRIMARY KEY, x {ty} NOT NULL)")).unwrap();
+            p.execute(&format!(
+                "CREATE TABLE nb_{i} (id BIGINT NOT NULL PRIMARY KEY, y {ty} NOT NULL)")).unwrap();
+            assert!(p.execute(&format!(
+                "CREATE VIEW nv_{i} AS SELECT na_{i}.id AS aid, nb_{i}.id AS bid \
+                 FROM na_{i} LEFT JOIN nb_{i} ON na_{i}.x < nb_{i}.y")).is_ok(),
+                "pure-range LEFT on a narrow int ({ty}) should register");
+        }
+    }
+    for (i, ty) in types.iter().enumerate() {
+        assert!(client.resolve_table_or_view_id(&sn, &format!("nv_{i}")).is_ok(),
+            "narrow-int pure-range LEFT view ({ty}) should register");
+    }
+}
+
+/// A pure-range LEFT JOIN on a 16-byte integer range column (`DECIMAL(38,0)` → U128)
+/// is rejected: its threshold null-fill has no 16-byte MIN/MAX accumulator. The cap
+/// is specific to the pure-range LEFT null-fill — the matching INNER pure-range join
+/// over the same 16-byte column still registers (only the LEFT direction reduces).
+#[test]
+fn test_pure_range_left_join_rejects_wide_int_range_column() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE wr_a (id BIGINT NOT NULL PRIMARY KEY, x DECIMAL(38,0) NOT NULL)").unwrap();
+        p.execute("CREATE TABLE wr_b (id BIGINT NOT NULL PRIMARY KEY, y DECIMAL(38,0) NOT NULL)").unwrap();
+        let err = must_err(p.execute(
+            "CREATE VIEW wr_left AS SELECT wr_a.id AS aid, wr_b.id AS bid \
+             FROM wr_a LEFT JOIN wr_b ON wr_a.x < wr_b.y"));
+        match err {
+            GnitzSqlError::Unsupported(s) => assert!(s.contains("16-byte accumulator"), "got: {s}"),
+            e => panic!("expected Unsupported, got {:?}", e),
+        }
+        // The matching INNER join over the same 16-byte column still registers — the
+        // cap is on the LEFT null-fill's reduce, not on 16-byte range joins as such.
+        p.execute(
+            "CREATE VIEW wr_inner AS SELECT wr_a.id AS aid, wr_b.id AS bid \
+             FROM wr_a JOIN wr_b ON wr_a.x < wr_b.y").unwrap();
+    }
+    assert!(client.resolve_table_or_view_id(&sn, "wr_left").is_err(), "no LEFT view should register");
+    assert!(client.resolve_table_or_view_id(&sn, "wr_inner").is_ok(),
+        "INNER pure-range over a 16-byte column still registers");
+}
+
+/// A band LEFT JOIN (≥1 equality conjunct + range conjunct) on a 16-byte range
+/// column (`DECIMAL(38,0)` → U128) registers: band's null-fill is the cap-free
+/// `A − distinct(π_A(inner))` set-difference (no MIN/MAX), so it has NO range-type
+/// restriction — the pure-range cap relaxation leaves band entirely untouched.
+#[test]
+fn test_band_left_join_accepts_wide_range_column() {
+    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE bw_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo DECIMAL(38,0) NOT NULL)").unwrap();
+    p.execute("CREATE TABLE bw_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t DECIMAL(38,0) NOT NULL)").unwrap();
+    assert!(p.execute(
+        "CREATE VIEW bw_v AS SELECT bw_a.id AS aid, bw_b.id AS bid \
+         FROM bw_a LEFT JOIN bw_b ON bw_a.k = bw_b.k AND bw_a.lo <= bw_b.t").is_ok(),
+        "band LEFT on a 16-byte range column should register (band is uncapped)");
+    assert!(client.resolve_table_or_view_id(&sn, "bw_v").is_ok(),
+        "band LEFT-join view over a 16-byte range column should register");
 }
 
 /// The pure-range LEFT null-fill, pinned at the circuit level. Built over the

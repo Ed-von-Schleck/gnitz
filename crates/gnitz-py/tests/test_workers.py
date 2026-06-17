@@ -2402,3 +2402,38 @@ class TestRangeJoin:
             }
         finally:
             _drop_all(client, sn, views=["v"], tables=["a", "b"])
+
+    @pytest.mark.parametrize("ty", ["INT NOT NULL", "INT UNSIGNED NOT NULL", "SMALLINT NOT NULL"])
+    def test_pure_range_left_narrow_int_range(self, client, ty):
+        """A pure-range LEFT JOIN on a NARROW integer range column (I32/U32/I16)
+        null-fills correctly across workers — these were rejected by the old
+        `{I64, U64}`-only cap. MIN/MAX preserves the source integer type, so the
+        inline threshold reduce emits the narrow type the `reindex_m` consumes
+        directly. Matched a's are suppressed, unmatched a's null-fill, and deleting
+        the EXTREME b raises the threshold so an untouched a between the old and new
+        MAX re-null-fills (values stay within SMALLINT's ±32767)."""
+        sn = "prni" + _uid()
+        client.create_schema(sn)
+        try:
+            vid, pred = self._mk_pure_range_left(client, sn, "<", a_x=ty, b_y=ty)
+            # MAX(b.y) = 100. a's spread across workers; some below MAX, some at/above.
+            b_rows = [(1, 20), (2, 60), (3, 100)]
+            client.execute_sql(
+                "INSERT INTO b VALUES " + ",".join(f"({i},{y})" for i, y in b_rows), schema_name=sn)
+            a_rows = [(1, 10), (2, 70), (3, 100), (4, 200)]
+            client.execute_sql(
+                "INSERT INTO a VALUES " + ",".join(f"({i},{x})" for i, x in a_rows), schema_name=sn)
+            rows = _band_left_rows(client, vid)
+            assert rows == _band_left_ref(a_rows, b_rows, pred)
+            assert (3, None) in rows and (4, None) in rows    # x >= 100 → null-fill
+            assert (1, None) not in rows                      # x=10 < 100 → matched
+
+            # Delete the EXTREME b3 (y=100). New MAX = 60 → a2 (x=70 >= 60) flips to
+            # null-fill though a2 was untouched.
+            client.execute_sql("DELETE FROM b WHERE id = 3", schema_name=sn)
+            b_rows = [r for r in b_rows if r[0] != 3]
+            rows = _band_left_rows(client, vid)
+            assert rows == _band_left_ref(a_rows, b_rows, pred)
+            assert (2, None) in rows
+        finally:
+            _drop_all(client, sn, views=["v"], tables=["a", "b"])
