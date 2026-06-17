@@ -1259,40 +1259,37 @@ impl ReadCursor {
         self.sources[self.current_entry_idx].blob_slice()
     }
 
-    /// Copy the current row into `batch` with an explicit weight.
+    /// Copy the current row into `batch` with an explicit weight, leaving
+    /// `batch`'s sorted/consolidated flags untouched.
+    ///
+    /// This is `Batch::append_row_from_source_bytes` applied at the cursor's
+    /// current position: `CursorSource` implements `ColumnarSource`, so the shared
+    /// appender does the weight/null/payload write (German-string blob relocation
+    /// included) with no hand-rolled per-column loop here. The byte-form PK is
+    /// correct at every width.
     pub(crate) fn copy_current_row_into(&self, batch: &mut Batch, weight: i64) {
-        // `current_pk_bytes()` indexes `self.sources[current_entry_idx]`, which
-        // panics on an unpositioned/Empty cursor (empty `sources`). The col/blob
-        // helpers below already no-op on `!valid`; restore that contract here so
-        // the byte-form PK write does too.
+        // `current_pk_bytes()` and the appender both index the positioned source,
+        // which panics on an unpositioned cursor (empty `sources`). Keep the
+        // no-op-on-`!valid` contract.
         if !self.valid {
             return;
         }
-        // Byte-form is correct at every width; for narrow PKs these bytes equal
-        // what `extend_pk(current_key)` would have re-encoded.
-        batch.extend_pk_bytes(self.current_pk_bytes());
-        batch.extend_weight(&weight.to_le_bytes());
-        batch.extend_null_bmp(&self.current_null_word.to_le_bytes());
-        let blob_ptr = self.blob_ptr();
-        let src_blob: &[u8] = if blob_ptr.is_null() { &[] } else {
-            unsafe { std::slice::from_raw_parts(blob_ptr, self.blob_len()) }
-        };
-        for (payload_idx, ci, col) in self.schema.payload_columns() {
-            let col_size = col.size() as usize;
-            let ptr = self.col_ptr(ci, col_size);
-            if !ptr.is_null() {
-                let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
-                if gnitz_wire::is_german_string(col.type_code) && col_size == 16 {
-                    let cell = crate::schema::relocate_german_string_vec(data, src_blob, &mut batch.blob, None);
-                    batch.extend_col(payload_idx, &cell);
-                } else {
-                    batch.extend_col(payload_idx, data);
-                }
-            } else {
-                batch.fill_col_zero(payload_idx, col_size);
-            }
-        }
-        batch.count += 1;
+        // Stay flag-neutral: whether appending a row preserves sort/consolidation
+        // depends on the caller's access pattern, which only the caller knows. The
+        // catalog retraction helpers build in (PK, payload) order and keep the
+        // batch's initial `true,true`; op_gather/op_reduce re-assert the flags they
+        // need. The shared appender clears both unconditionally (its bulk callers
+        // append out of order), so save and restore them across the delegation.
+        let (sorted, consolidated) = (batch.sorted, batch.consolidated);
+        batch.append_row_from_source_bytes(
+            self.current_pk_bytes(),
+            weight,
+            &self.sources[self.current_entry_idx],
+            self.current_row,
+            None,
+        );
+        batch.sorted = sorted;
+        batch.consolidated = consolidated;
     }
 
     /// Materialize all non-zero-weight rows in merge order into an owned
