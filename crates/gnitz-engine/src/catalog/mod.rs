@@ -69,7 +69,6 @@ pub(crate) use utils::{BatchBuilder,
                        ensure_dir, fsync_dir,
                        get_index_key_type, make_index_schema,
                        cursor_read_u64, cursor_read_string,
-                       copy_cursor_row_with_weight,
                        retract_single_row,
                        retract_rows_by_view,
                        retract_rows_in_pk_range};

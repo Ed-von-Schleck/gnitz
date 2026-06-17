@@ -371,7 +371,7 @@ impl CatalogEngine {
         cursor: &CursorHandle,
         batch: &mut Batch,
     ) {
-        copy_cursor_row_with_weight(cursor, batch, cursor.cursor.current_weight);
+        cursor.cursor.copy_current_row_into(batch, cursor.cursor.current_weight);
     }
 
     // -- Close engine ------------------------------------------------------

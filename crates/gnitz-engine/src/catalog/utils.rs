@@ -337,17 +337,6 @@ pub(crate) fn fsync_dir(path: &str) {
 // Copy/retract helpers
 // ---------------------------------------------------------------------------
 
-/// Copy a single cursor row into `batch` with an explicit weight.
-/// Handles out-of-line German strings by copying blob data and rewriting offsets.
-/// The schema is taken from the cursor (always matches the table schema).
-pub(crate) fn copy_cursor_row_with_weight(
-    cursor: &CursorHandle,
-    batch: &mut Batch,
-    weight: i64,
-) {
-    cursor.cursor.copy_current_row_into(batch, weight);
-}
-
 /// Seek a system table by PK, copy the matching row with weight=-1.
 /// Returns a single-row retraction batch (or empty batch if PK not found).
 pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u128) -> Batch {
@@ -356,7 +345,7 @@ pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u
     // OPK-encode the native PK; correct for single-column and compound system PKs.
     let (opk, stride) = crate::storage::opk_key(schema, pk);
     if cursor.cursor.seek_exact_live(&opk[..stride]) {
-        copy_cursor_row_with_weight(&cursor, &mut batch, -1);
+        cursor.cursor.copy_current_row_into(&mut batch, -1);
     }
     batch
 }
@@ -391,7 +380,7 @@ pub(crate) fn retract_rows_in_pk_range(
     while cursor.cursor.valid {
         if cursor.cursor.current_key >= pk_end { break; }
         if cursor.cursor.current_weight > 0 {
-            copy_cursor_row_with_weight(&cursor, &mut batch, -1);
+            cursor.cursor.copy_current_row_into(&mut batch, -1);
         }
         cursor.cursor.advance();
     }
@@ -411,7 +400,7 @@ pub(crate) fn retract_rows_by_view(table: &Table, schema: &SchemaDescriptor, vie
     let mut cursor = table.open_cursor();
     let mut hit = cursor.cursor.seek_first_positive_with_prefix(&prefix);
     while hit {
-        copy_cursor_row_with_weight(&cursor, &mut batch, -1);
+        cursor.cursor.copy_current_row_into(&mut batch, -1);
         cursor.cursor.advance();
         hit = cursor.cursor.walk_to_positive_with_prefix(&prefix);
     }
