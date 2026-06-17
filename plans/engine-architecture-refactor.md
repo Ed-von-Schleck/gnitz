@@ -157,8 +157,8 @@ crates/gnitz-engine/src/
 │
 ├── expr/                    L4a — scalar-eval LEAF, its OWN top-level dir (distinct consumer set)
 │   ├── mod.rs               facade: ExprProgram, ScalarFuncKind, Plan, resolve_column_indices
-│   ├── program.rs           ExprProgram + opcodes  (OutputColKind MOVED to ops::reduce::finalize)
-│   ├── plan.rs              ScalarFuncKind + Plan    (FinalizeContext MOVED to ops::reduce::finalize)
+│   ├── program.rs           ExprProgram + opcodes + OutputColKind + classify_output_cols (STAY — W8 §5 decline)
+│   ├── plan.rs              ScalarFuncKind + Plan + FinalizeContext (STAYS — W8 §5 decline: keeps eval cluster sealed)
 │   └── batch.rs             §8-cluster-4 expr half WHOLE: eval_batch morsel loop + EvalScratch
 │
 ├── ops/                     L4b — operators (TWO facades: compute→query, exchange→runtime)
@@ -172,7 +172,7 @@ crates/gnitz-engine/src/
 │   │   ├── range.rs           op_join_delta_trace_range + range_per_row_seek/range_merge_walk
 │   │   ├── delta_delta.rs     op_{,anti_,semi_}join_delta_delta + §8-cluster-7 filter_join_dd_with_payload_inner
 │   │   └── rowwrite.rs        shared write_join_row* (dependency of BOTH delta_trace + delta_delta — MUST stay inlinable)
-│   ├── reduce/                mod/op_reduce/op_gather/agg/emit/sort + finalize.rs (relocated FinalizeContext + OutputColKind)
+│   ├── reduce/                mod/op_reduce/op_gather/agg/emit/sort (no finalize.rs — W8 §5 declined the relocation)
 │   └── exchange/              SECOND facade — sole client runtime::master; depends DOWN on ops::reindex
 │       ├── router.rs          PartitionRouter/worker_for_partition/with_*_indices/RouteMode
 │       └── relay.rs           §8-cluster-7 relay_walk_inner WHOLE
@@ -382,163 +382,93 @@ parameter and keeps the structs in schema. **Static dispatch only — never
 
 ## 5. Stage B — fix wrong-direction edges, narrow surface (P1)
 
-### W6 — Extract `storage::repr::batch_wire`; sever all three repr→disk edges
+### W6 — Extract `storage::repr::batch_wire`; sever all three repr→disk edges — ✅ DONE
 *Removes problem #3; shrinks batch.rs. Depends on: none. Effort: M.*
 
-Move the wire/shard serialization cluster — `wire_byte_size`,
-`wire_byte_size_range`, `encode_range_to_wire`, `encode_to_wire`,
-`decode_from_wal_block`, `write_as_shard`/`write_as_shard_with_flags`, and the free
-`decode_mem_batch_from_wal_block` (`batch.rs` ~1473–1748, **~228 production LOC**,
-not the ~700 first estimated — that figure conflated the ~680-LOC test module) —
-into a new `src/storage/repr/batch_wire.rs`. Delete `use super::shard_file` and the
-`super::wal` calls from `batch.rs`; re-export the moved items from `storage/mod.rs`
-for callers in `ops/{scan,distinct,exchange}` and `runtime/wire`.
+> **Done.** The wire/shard cluster moved **byte-for-byte** into a new
+> `storage::batch_wire` (flat for now — W9 relocates it under `repr/` with `batch.rs`):
+> `wire_byte_size`/`wire_byte_size_range`/`encode_range_to_wire`/`encode_to_wire`/
+> `decode_from_wal_block` as an `impl Batch` block, the free
+> `decode_mem_batch_from_wal_block`, and `write_as_shard`/`write_as_shard_with_flags`.
+> `batch.rs` sheds `use super::shard_file` and every `super::wal` call; the lone
+> production widening is a `pub(super) region_stride` accessor (the only private field
+> the range encoders read). `storage/mod.rs` repoints only the
+> `decode_mem_batch_from_wal_block` re-export — the method callers (`ops`,
+> `runtime::wire`) call through `Batch` and are unchanged. `write_to_batch` STAYS
+> (pure arena/`DirectWriter`/`batch_pool`). **Third edge:**
+> `append_row_from_ptable_found(&PartitionedTable)` → `append_found_row(null_word,
+> col_ptr: impl Fn, blob_src)`; `dag.rs` reads the found row through the table
+> accessors and passes them in, so the repr method names no LSM type — a monomorphized
+> closure keeps the per-column copy loop inlinable, no behaviour change. The 5 wire
+> tests followed the cluster into `batch_wire`; the found-row test was renamed +
+> adapted in place. Gates green: build, clippy (all-targets), `make test` (1303),
+> `make e2e` (GNITZ_WORKERS=4, 1043).
 
-**`write_to_batch` STAYS in `batch.rs`** — it is pure arena-alloc + `DirectWriter`
-+ `batch_pool`, not wal/shard-coupled; it belongs with the repr core.
-
-**Also sever the third edge:** decouple `Batch::append_row_from_ptable_found`
-(`batch.rs:1109`) from `&PartitionedTable` — have the caller (`dag.rs:1848`) read
-the found-row columns via `PartitionedTable`'s accessors and pass plain
-`(col_ptr, len, null_word)` args, so the repr method stops naming the L3 type. Keep
-the copy loop `#[inline]`; no behaviour change.
-
-**Verify:** `batch.rs` imports no disk-half/LSM module; build + test green.
-
-**Perf / Dup.** Serialization runs per-flush/per-IPC, not per-row. Keep region-copy
-loops `#[inline]`; **no** trait-object `SerializeTarget`; region layout /
-`pk_stride` byte-identical (§9). `batch_wire` reads stride/offset from the
-`SchemaDescriptor` / `MemBatch` view; it does **not** re-derive region math.
-
-### W7 — Extract `ops::reindex` (exchange stops reaching into linear)
+### W7 — Extract `ops::reindex` (exchange stops reaching into linear) — ✅ DONE
 *Removes an intra-`ops` leaky reach; relieves two files. Depends on: none. Effort: M.*
 
-`ops/exchange.rs` reaches into `ops::linear`'s reindex internals (exchange.rs
-240/301/303/1943/2009/2056); half of `linear.rs` is in fact PK-promotion
-infrastructure. Create `src/ops/reindex.rs` and move `PkPromoter`, `ColPromoter`,
-`ReindexPacker`, `german_string_promote_key`, and the private `reindex_hash_row`
-(linear.rs ~398–700) into it. Repoint `exchange.rs` and `linear.rs` to
-`crate::ops::reindex::`; leave `linear.rs` as true linear ops only and fix its doc
-header. **Verify:** `exchange` no longer names `crate::ops::linear`; build + test
-green.
+> **Done.** `PkPromoter`/`ColPromoter`/`ReindexPacker`/`german_string_promote_key`/
+> `reindex_hash_row` (+ the private `PromoteKind`) moved **verbatim** into a new
+> `ops::reindex`, carrying every `#[inline]` and const-generic arm. Visibilities
+> preserved (`german_string_promote_key`/`ReindexPacker` `pub(crate)`, `PkPromoter`
+> `pub(super)`), the one production bump being `reindex_hash_row` private →
+> `pub(super)` for `op_map`'s cross-file call. `exchange.rs`'s six reindex reaches
+> repointed to `crate::ops::reindex::` — it no longer names `crate::ops::linear`.
+> `linear.rs` is true linear ops only: `op_map` calls in via
+> `use super::reindex::{ReindexPacker, reindex_hash_row}`, doc header fixed, dead
+> `ColumnLocator`/`type_code`/`xxh` imports dropped. The 16 reindex-subject tests
+> followed their subject into `reindex`; the 24 linear-op tests stay (incl. the
+> op_map-reindex and op_filter-blob tests, whose subject is the linear op); 4 trivial
+> shared schema/batch builders are duplicated test-side (no forked OPK logic). Gates
+> green: build, clippy (all-targets), `make test` (1303), test-count parity (40 = 24
+> + 16).
 
-**Perf / Dup.** `ReindexPacker` / `german_string_promote_key` are per-row and
-**must** produce byte-identical keys on producer and consumer. Keep them `#[inline]`
-and monomorphic; set each moved item's visibility deliberately (`reindex_hash_row`
-becomes `pub(super)`/`pub(crate)` as needed); never let exchange grow its own
-promotion copy. (`PkPromoter::promote_into` is already `#[cfg(test)] pub(super)`;
-`ReindexPacker::promote_into` at `linear.rs:729` is the production entry, not a test
-helper — keep its `pub(crate)`.)
+### W8 — Inter-module surface-reduction sweep — ✅ DONE
+*Removes problems #5 and #6. Depends on: none. Effort: L.*
 
-### W8 — Inter-module surface-reduction sweep
-*Removes problems #5 and #6. Depends on: none (lands before the Stage C splits so the
-new sub-modules inherit correct visibility). Effort: L.*
-
-Narrowing is compile-time only and can only **help** the optimizer (it never blocks
-inlining when the item itself — not a forwarding wrapper — is re-exported). The
-sweep is far larger than first scoped; apply in batches, building between each.
-
-**8a — production surface (verified zero-external-consumer narrowings):**
-1. **storage/repr → pub(crate) (or pub(super)):** `columnar::{ColumnarSource,
-   compare_rows, compare_rows_fixedint_nonnull, binary_lower_bound,
-   gallop_lower_bound_bytes, schema_is_fixedint_nonnull, with_pk_ord}`;
-   `merge::{merge_batches, sort_and_consolidate, fold_sorted, SortedMemBatch,
-   MemBatchCursor}`; `heap::{HeapNode, LoserTree, drive_merge}`;
-   `bloom::BloomFilter`; `xor8::{build, may_contain, serialize, deserialize,
-   serialized_size}`. (All `pub` today with zero non-storage consumers; several are
-   §8 do-not-touch clusters — narrow visibility only, do not move them.)
-2. **storage/lsm:** `read_cursor::{create_read_cursor, create_cursor_from_snapshots}`
-   → `pub(super)`/`pub(crate)`; `Table::{snapshot_runs, in_memory_runs}` →
-   `pub(crate)` (NB: **not** `cfg(test)` — they have heavy production consumers in
-   `partitioned_table.rs`); `Table::all_shard_arcs` → `pub(crate)` (its lone
-   out-of-storage consumer is a catalog test).
-3. **query → pub(crate):** `compiler::{compile_view, CompileOutput, SubPlan,
-   SideBPlan, ExternalTable, cursor_read_i64}` (only `dag` consumes);
-   `vm::{execute_epoch, execute_epoch_multi, ProgramBuilder, VmHandle, Instr,
-   RegisterKind, RegisterMeta, Program, Register, RegisterFile, IntegrateGi,
-   IntegrateAvi}`; `dag::CachedPlan`.
-4. **runtime → pub(crate) (runtime is *closed*: only `server_main` + `sal::MAX_WORKERS`
-   escape):** `ServerExecutor`, `WorkerProcess`, `MasterDispatcher`; the **SAL type
-   cluster** `{SalWriter, SalReader, SalMessage, SalMessageKind, SAL_MMAP_SIZE,
-   compute_wire_props, BACKFILL_*}`; the **wire codec family**
-   `{encode_wire*, decode_wire*, wire_size*, peek_control_block, peek_routing_header,
-   build_schema_wire_block, schema_to_batch, batch_to_schema, DecodedWire,
-   DecodedControl, DecodedWireZeroCopy, SchemaWithVersion, FLAG_BATCH_SORTED,
-   FLAG_BATCH_CONSOLIDATED}`; the **w2m types** `{W2mReceiver, W2mWriter, W2mSlot,
-   W2mRingHeader, FLAG_WRITER_PARKED, FLAG_MASTER_PARKED, TryPublish, Reservation,
-   W2M_*_SIZE, MAX_W2M_MSG}` and `w2m_ring::{init_region, try_publish, try_consume}`;
-   the **reactor production surface** `reactor::sync::*`, the Future types
-   `{ReplyFuture, FsyncFuture, AcceptFuture, RecvFuture, SendFuture}`,
-   `reactor::ring::{Cqe, Ring, CQE_F_MORE}`, `reactor::uring::IoUringRing`,
-   `reactor::exchange::{ExchangeAccumulator, PendingRelay}`, `KIND_*`; the
-   committer/executor task structs `{CommitRequest, Shared, run, TickTrigger}`.
-   **Keep public:** `server_main`, `sal::MAX_WORKERS`.
-5. **Facade re-exports** in `ops/mod.rs` for `make_gi_schema`, `make_avi_schema`,
-   `all_payload_null_mask`, `AVI_AV_BYTES` so `compiler.rs` (1066/1845/1869) and
-   `master.rs:3375` import `crate::ops::X`, not the `index`/`util` internals.
-6. **Raw-pointer leaks → typed handles / `pub(crate)`:** `ops/index.rs`
-   `GiDesc`/`AviDesc` `pub table: *mut storage::Table` → `pub(crate)` field behind
-   constrained accessors; **all three** catalog raw-handle escapes —
-   `get_dag_ptr` (`*mut DagEngine`), `get_ptable_handle` (`*mut PartitionedTable`),
-   `get_index_store_handle` (`*const Table`) — get a typed handle return or
-   `pub(crate)` visibility instead of a bare public raw pointer.
-7. **schema → pub(crate):** `PayloadCmpKind` (consumed by storage + ops via the
-   `with_payload_cmp!` macro, *not* runtime), `assemble_wide_pk` (two runtime
-   callers), `dist_prefix_len` → private, `prep_german_string_copy` → private,
-   `{NARROW_PK_MAX_BYTES, pk_index_single, payload_mapping_byte, pk_byte_offset,
-   PAYLOAD_MAPPING_PK_SENTINEL}` → `pub(crate)`.
-8. **expr → relocate/narrow:** `plan::FinalizeContext` + `program::OutputColKind` →
-   relocate into `ops::reduce::finalize` (consumed exclusively there);
-   `program::is_strictly_non_nullable` → `pub(crate)`.
-9. **catalog facade cleanup (drop the zero-external re-exports from `mod.rs`):** the
-   ~20 `utils` re-exports (`make_fk_index_name`, `ingest_batch_into`,
-   `schema_dir`/`table_dir`/`view_dir`/`index_dir`, `is_*_dir_name`, `subdir_names`,
-   `ensure_dir`, `fsync_dir`, `cursor_read_u64`/`cursor_read_string`,
-   `copy_cursor_row_with_weight`, `retract_*`, `get_index_key_type`) and the
-   type/const re-exports (`FkConstraint`, `FkParentRef`, `CatalogCacheSet`,
-   `ApplyContext`, `SysFamily`, `CatalogDeltaSink`, `SYSTEM_SCHEMA_ID`,
-   `PUBLIC_SCHEMA_ID`, `FK_INDEX_INFIX`) keep their definitions but leave the facade
-   (catalog-internal consumers import from `utils::`/`types::` directly). Narrow
-   `close`, `drain_pending_dir_deletions`, `cancel_gated_deletion`, `get_schema_id`,
-   `raw_store_ingest` to `pub(crate)`.
-10. **Fold `layout.rs` into `storage::lsm::layout`** (`pub(crate)` consts; only
-    storage consumes it) and drop it from the `main.rs` roster.
-
-**8b — test-only surface (the ~43 `#[cfg(test)] pub` → narrower batch):** sweep
-every `#[cfg(test)]` directly above a plain `pub` item and tighten to
-`#[cfg(test)] pub(crate)` (a different top-level dir's test consumes it) or
-`#[cfg(test)] pub(super)` (only the same file's/dir's test mod consumes it). Rule of
-thumb verified against consumers:
-- **`pub(super)`:** `dag::close`, the reactor scaffolds
-  `{inject_cqe, inject_parked_reply, test_init_state, test_route_reply,
-  test_route_scan_slot, block_on, block_on_fsync, block_until_idle,
-  has_pending_tasks, poll_nonblocking, task_count}`, `exchange::record_routing`, the
-  four test-only relay wrappers `{op_repartition_batch, op_relay_scatter,
-  op_relay_scatter_consolidated, op_multi_scatter}`.
-- **`pub(crate)`:** `vm::ProgramBuilder::build`, `posix_io::raise_fd_limit_for_tests`,
-  `shard_file::{build_shard_image, write_shard_at}`,
-  `batch::{extend_pk_opk, set_pk_at, pk_iter, append_row, append_row_simple,
-  append_row_from_source}`, `partitioned_table::has_pk`, `shard_index::find_pk`,
-  `table::{memtable_is_empty, set_inmem_ceiling_for_test, memtable_upsert_sorted_batch,
-  retract_pk}`, `memtable::total_row_count`, `read_cursor::CursorHandle::from_owned`,
-  `shard_reader::{get_pk, find_lower_bound, find_row_index}`,
-  `w2m_ring::{TryPublish, try_publish, advance_read_cursors, writer_wrap_count}`,
-  `wire::{encode_wire, decode_wire_ipc_with_schema}` (`batch_to_schema` is already
-  `pub(crate)`), `exchange::compute_worker_indices` (a catalog test consumes it —
-  cross-dir, so `pub(crate)` not `pub(super)`), `schema::pk_is_signed_single_col`,
-  `plan::evaluate_predicate`, and the catalog `#[cfg(test)] pub` method clusters in
-  `ddl.rs` (`create_schema`/`drop_schema`/`drop_table`/`drop_view`/`create_index`/
-  `drop_index` — already `cfg(test)`-gated, only `pub`→`pub(crate)` remains) and
-  `store.rs` (`get_schema`, `get_by_name`, `has_schema`, `has_index_by_name`,
-  `get_index_circuit_info`, `get_max_flushed_lsn`, `schema_is_empty`,
-  `get_schema_name_by_id`, `get_schema_id`).
-- **Keep as-is:** the `#[cfg(test)] pub(crate) use read_cursor::REWIND_CALLS`
-  re-export in `storage/mod.rs:41` (consumed by `ops/reduce/tests.rs` *through* the
-  facade — dropping it breaks the test build); `log::{is_debug,is_info,_emit}`
-  (cannot drop below `pub` — `#[macro_export]` hygiene); `util::align8` (a live
-  re-export with three production consumers — not dead).
-
-**Verify:** build + test green after each batch.
+> **Done.** Surface narrowed across the crate; gates green (build, clippy
+> `--all-targets`, `make test` 1303). The load-bearing realization: in a binary
+> crate every top-level module is reachable crate-wide and storage's submodules are
+> already private `mod`, so `pub → pub(crate)` on a path-reachable item is an
+> intent-signal, not a reachability change — the reachability wins come from *closing
+> modules* and `→ private`.
+> - **8a.1–3,7 (signal):** storage repr (`columnar`/`merge`/`heap`/`bloom`/`xor8`) +
+>   lsm (`read_cursor` create fns, `Table::{snapshot_runs,in_memory_runs,all_shard_arcs}`),
+>   query (`compiler`/`vm`/`dag` listed items), and schema (`PayloadCmpKind`,
+>   `assemble_wide_pk`, `pk_index_single`, `payload_mapping_byte`, `pk_byte_offset`,
+>   `NARROW_PK_MAX_BYTES`, `PAYLOAD_MAPPING_PK_SENTINEL`) → `pub(crate)`;
+>   `dist_prefix_len` + `prep_german_string_copy` → **private** (real narrowing).
+> - **8a.4 runtime CLOSED:** the effective fix is sealing all `runtime` submodules to
+>   private `mod` + re-exporting `MAX_WORKERS` — only `server_main` + `MAX_WORKERS`
+>   escape (verified: `main.rs` is the sole external consumer). Per-item `pub→pub(crate)`
+>   would be moot inside a `pub(crate) mod`, so it was skipped in favour of the seal.
+> - **8a.5 ops facade:** `make_{gi,avi}_schema` + `all_payload_null_mask` +
+>   `AVI_AV_BYTES` re-exported from `ops/mod.rs`; `index`+`util` sealed to private
+>   `mod`; the 4 compiler/master callers repointed to `crate::ops::X`.
+> - **8a.6 raw pointers:** `GiDesc`/`AviDesc` fields → `pub(crate)`; the three catalog
+>   handles (`get_dag_ptr`/`get_ptable_handle`/`get_index_store_handle`) → `pub(crate)`,
+>   keeping the raw-ptr returns (§8 cluster-6 aliasing discipline — no typed wrapper).
+> - **8a.9 catalog facade:** the zero-external re-exports → `pub(in crate::catalog)`
+>   (they reach submodules through their existing `use super::*` glob, so this narrows
+>   the crate surface with zero submodule churn — chosen over drop-and-direct-import);
+>   `ColumnDef`/`SEQ_*`/`*_TAB_ID`/`IDXTAB_PAY_*` stay `pub(crate)`; the 5 methods
+>   (`close`/`drain_pending_dir_deletions`/`cancel_gated_deletion`/`get_schema_id`/
+>   `raw_store_ingest`) → `pub(crate)`.
+> - **8a.10:** `layout.rs` folded into `storage::layout` (`pub(crate)` consts), dropped
+>   from `main.rs` (relocated under `lsm/` in W10).
+> - **8b:** ~40 `#[cfg(test)] pub` → `pub(super)` (dag::close, 11 reactor scaffolds, 4
+>   relay wrappers) / `pub(crate)` (the rest). Corrections vs the prescription:
+>   `record_routing` needs `pub(crate)` (a `runtime/master.rs` test consumes it cross-dir);
+>   `compute_worker_indices`'s `ops/mod.rs` re-export dropped to `pub(crate) use`;
+>   `append_row`/`append_row_simple` no longer exist. `REWIND_CALLS` / `log` macros /
+>   `align8` kept as-is.
+> - **DECLINED — 8a.8 relocation.** Moving `FinalizeContext` + `OutputColKind` into
+>   `ops::reduce::finalize` would force widening the §8 do-not-touch eval cluster
+>   (`EvalScratch`, `eval_batch`, `MORSEL`, `NULL_WORDS_PER_REG`, scratch fields — all
+>   `pub(in crate::expr)`) to `pub(crate)`: a net surface **widening** that inverts
+>   W8's goal. `FinalizeContext` is precisely the boundary that keeps the eval
+>   internals sealed in `expr`, so it stays. Only `is_strictly_non_nullable` →
+>   `pub(in crate::expr)` was applied.
 
 ---
 
@@ -579,12 +509,58 @@ splits its god-files and moves the residual files into the §2 tree.
 
 ### Workstream grouping for Stage C
 
-- **W9 (storage-repr, L):** `batch.rs` residual, `merge.rs`→`scatter.rs`,
-  `read_cursor.rs` four-way; create `storage/repr/`. Depends on W6.
-- **W10 (storage-LSM, L):** `table`, `shard_index`, `memtable`, `shard_reader`,
-  `compact`; create `storage/lsm/` (fold `layout.rs` in). Depends on none.
-- **W11 (ops, L):** `join` four-way (+ `test_common`), `exchange` router/relay,
-  `reduce` +`finalize`; `expr` stays a top-level leaf. Depends on W7.
+- **W9 (storage-repr, L) — ✅ DONE.** Created `storage/repr/`; moved the nine L2 files
+  (`batch`/`batch_wire`/`batch_pool`/`columnar`/`merge`/`heap`/`range_key`/`bloom`/`xor8`)
+  in **byte-identically** — `storage/mod.rs` aliases the submodules (`use repr::{…}` +
+  `pub(crate) use repr::batch_pool`) so the LSM siblings keep their `super::<mod>` /
+  `crate::storage::<mod>` paths and the in-storage `with_pk_ord!` resolves untouched; the
+  only body edits were `batch_wire`'s repr→lsm up-refs (`super::`→`super::super::`) and
+  `batch.rs`'s region consts + builders read by lsm bumped `pub(super)`→`pub(in crate::storage)`
+  (preserving pre-move reach, not a widening). `merge.rs`→`merge.rs` + `scatter.rs` (the 3
+  scatter entry points + const-`PKS`/`N` gather helpers verbatim; `DirectWriter`'s
+  fixed-region fields → `pub(super)` for the sibling, scatter tests rebuilt on the public
+  `DirectWriter::new()` per §7-rule-4 — no test-driven widening). `read_cursor.rs`→
+  `read_cursor/{mod,source,output,handle}.rs` (stays at `storage/` for now — W10 relocates
+  under `lsm/`): source accessors (`CursorSource`, `pub(super)`) · merge state machine +
+  `CursorState` (`mod`) · drain/materialize/scatter (`output`, an `impl ReadCursor`
+  continuation reading the parent's private fields — submodules are descendants, so **no
+  field bumps**) · `CursorHandle` (`handle`). Tests stay in `mod.rs` (subject is
+  `ReadCursor`; they build cursors only via `create_read_cursor`). Gates green: build, clippy
+  `--all-targets`, `make test` (1303, parity), `make e2e` (GNITZ_WORKERS=4).
+- **W10 (storage-LSM, L) — ✅ DONE.** Created `storage/lsm/`; moved the eleven L3 files
+  (`table`·`partitioned_table`·`memtable`·`shard_reader`·`shard_file`·`shard_index`·`compact`·
+  `manifest`·`wal`·`layout` + W9's `read_cursor/`) under it. `storage/mod.rs` re-exports the LSM
+  facade through `lsm::`; `lsm/mod.rs` aliases the repr submodules + `error`/`cstr_with_tmp_suffix`/
+  `compare_pk_bytes`/`with_*` macros so the siblings keep their `super::<mod>` paths, and repoints
+  the `repr::batch_wire → lsm::{wal,shard_file}` exception (those two `pub(super)`). Five god-files
+  split **byte-identically** along the §6 seams (every `#[inline]`/const-generic carried;
+  `drive_merge` call sites untouched — §8 cluster-1): `compact` → `merge` (kernel + `merge_and_route`)
+  + `route` (`find_guard_for_key` / `GuardResult` / `compact_shards`); `shard_reader` → `open` (cold
+  validation) + `access` (hot `RegionView` accessors + `ColumnarSource`); `memtable` → `runs` +
+  `lookup`; `shard_index` → `index` (state + the `should_compact` / `run_compact` trigger) + `persist`
+  (manifest serde); `table` → `mod` (ingest/cursor/lookup) + `flush` (two-phase state machine). Each split keeps its type
+  defs + tests in `mod.rs` (read_cursor precedent — tests hit the public surface via `use super::*`,
+  reading sibling-defined private fields as descendants needs no bumps); the only visibility bumps
+  are §7-rule-3 cross-sub-file production reaches — `pub(super)` **restoring the original
+  module-wide scope** (shard_index's 9 index helpers reached by persist/tests, memtable's
+  `consolidate_batches`, table's `flush_inner`/`open_dirfd`/`in_memory_bytes`), never a test-driven
+  widening of a never-exposed private. Gates green: build, clippy `--all-targets`, `make test`
+  (1303, parity), `make e2e` (GNITZ_WORKERS=4, 1043).
+- **W11 (ops, L) — ✅ DONE.** `join.rs` carved **byte-identically** into
+  `join/{delta_trace, range, delta_delta, rowwrite}.rs` + `mod.rs`: the shared
+  `write_join_row*` writers land in `rowwrite` as `#[inline] pub(super)` (kept
+  inlinable across the split — §8 cluster-7), `advance_delta_ptr` stays range-private,
+  every const-generic/`#[inline]` carried verbatim. `exchange.rs` → `exchange/{router,
+  relay}.rs`: `router` owns `PartitionRouter` + the routing-key helpers (4 bumped
+  `pub(super)` for `relay`'s cross-file reach) + the shared `SCATTER_INDICES`; `relay`
+  owns the scatter/repartition ops + `relay_walk_inner`; the `cfg(test)`-only scatter
+  helpers gate `relay`'s `SCATTER_INDICES`/`ReindexPacker` imports `#[cfg(test)]`.
+  `reduce/` was already split (`mod/op_reduce/op_gather/agg/emit/sort`, no `finalize.rs`
+  — W8 §5); `expr` stays a top-level leaf. Tests follow their subjects (join 24/20/27/4
+  + `test_common` `pub(super)` builders; exchange 7 router / 24 relay, the 4 trivial
+  shared builders duplicated router-side per the W7 precedent — no exchange `test_common`).
+  Gates green: build, clippy `--all-targets`, `make test` (1303, parity), `make e2e`
+  (GNITZ_WORKERS=4).
 - **W12 (query-core, L):** create `query/`, move+split `compiler`, `vm`, `dag`.
   Depends on W3, W8.
 - **W13 (catalog, L):** `store.rs` four-file carve + `write_path.rs`. Depends on W8.
@@ -789,8 +765,8 @@ Stage A (P0, structural)    W1 ─┬─ W2            break C1 (key seam ✅ + 
                             W3  │                foundation/ umbrella + worker_ctx ✅
                             W4  │                BatchBuilder → storage (auto-fixes C2 test edge) ✅
                             W5 ─┘                test-edge cleanup (C3/C4/E5) → cfg(test) acyclicity ✅
-Stage B (P1, edges+surface) W6   W7   W8         batch_wire + 3rd edge · ops::reindex · surface sweep (8a prod + 8b test)
-Stage C (P2, splits+regroup) W9 W10 W11 W12 W13 W14   god-file carves into the layer tree (gated on W6/W7/W8)
+Stage B (P1, edges+surface) W6 ─ W7   W8         batch_wire + 3rd edge ✅ · ops::reindex ✅ · surface sweep ✅
+Stage C (P2, splits+regroup) W9 ✅ W10 ✅ W11 ✅ W12 W13 W14   god-file carves into the layer tree (gated on W6/W7/W8)
 ```
 
 W1–W8 are small, independent (except W5→W4; W2 was prototyped standalone, so it does
