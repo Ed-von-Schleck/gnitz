@@ -3,12 +3,10 @@
 //! `Batch` owns its memory (two `Vec<u8>` buffers — data + blob).
 //! `MemBatch<'a>` in the merge module is the borrowed slice-view counterpart.
 
-use std::ffi::CStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::columnar::ColumnarSource;
 use super::merge::{self, MemBatch};
-use super::shard_file;
 use crate::schema::{self, BlobCache, SchemaColumn, SchemaDescriptor, type_code};
 use crate::foundation::codec::{read_i64_le, read_u64_le};
 
@@ -1099,54 +1097,6 @@ impl Batch {
         self.consolidated = false;
     }
 
-    /// Copy the found row from a PartitionedTable into this batch.
-    ///
-    /// `pk_bytes` must be exactly `pk_stride` bytes — the stored PK region
-    /// for the row, identical width to this batch's PK regions. For a narrow
-    /// PK these are the same LE bytes `extend_pk` would have written, so
-    /// single-PK callers are byte-for-byte unaffected. `extend_pk_bytes`
-    /// asserts `pk_bytes.len() == pk_stride`.
-    pub fn append_row_from_ptable_found(
-        &mut self,
-        ptable: &super::partitioned_table::PartitionedTable,
-        pk_bytes: &[u8],
-        weight: i64,
-    ) {
-        self.ensure_row_capacity();
-        let schema = self.schema.expect("append_row_from_ptable_found requires schema");
-        let null_word = ptable.found_null_word();
-
-        self.extend_pk_bytes(pk_bytes);
-        self.extend_weight(&weight.to_le_bytes());
-        self.extend_null_bmp(&null_word.to_le_bytes());
-
-        for (pi, _ci, col_desc) in schema.payload_columns() {
-            let cs = col_desc.size() as usize;
-            let is_null = (null_word >> pi) & 1 != 0;
-            if is_null {
-                self.fill_col_zero(pi, cs);
-            } else if gnitz_wire::is_german_string(col_desc.type_code) {
-                let src = ptable.found_col_ptr(pi, cs);
-                assert!(!src.is_null());
-                let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
-                let src_blob = ptable.found_blob_slice();
-                let dest = crate::schema::relocate_german_string_vec(
-                    src_slice, src_blob, &mut self.blob, None,
-                );
-                self.extend_col(pi, &dest);
-            } else {
-                let src = ptable.found_col_ptr(pi, cs);
-                assert!(!src.is_null());
-                let src_slice = unsafe { std::slice::from_raw_parts(src, cs) };
-                self.extend_col(pi, src_slice);
-            }
-        }
-
-        self.count += 1;
-        self.sorted = false;
-        self.consolidated = false;
-    }
-
     /// Append a single row from raw C-style region pointers.
     ///
     /// # Safety
@@ -1322,6 +1272,13 @@ impl Batch {
         }
     }
 
+    /// Per-row byte stride of a fixed/payload region. Used by the range-wire
+    /// encoders in `batch_wire`, which size regions for an arbitrary row count
+    /// rather than `self.count` (so `region_size` does not fit).
+    pub(super) fn region_stride(&self, idx: usize) -> u8 {
+        self.strides[idx]
+    }
+
     pub fn regions(&self) -> Vec<(*const u8, usize)> {
         let npc = self.num_payload_cols();
         let mut r = Vec::with_capacity(REG_PAYLOAD_START + npc + 1);
@@ -1468,206 +1425,6 @@ impl Batch {
     #[cfg(test)]
     pub(crate) fn data_capacity(&self) -> usize { self.data.capacity() }
 
-    /// Write this batch as a shard file directly to disk.
-    #[cfg(test)]
-    pub fn write_as_shard(&self, path: &CStr, table_id: u32) -> Result<(), super::error::StorageError> {
-        let regions = self.regions();
-        shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true, 0)
-    }
-
-    /// Write this batch as a shard file with an explicit flags byte.
-    /// Use `SHARD_FLAG_PK_UNIQUE` when the output was verified by `PkUniqueChecker`.
-    pub fn write_as_shard_with_flags(&self, path: &CStr, table_id: u32, flags: u8) -> Result<(), super::error::StorageError> {
-        let regions = self.regions();
-        shard_file::write_shard_streaming(libc::AT_FDCWD, path, table_id, self.count as u32, &regions, true, flags)
-    }
-
-    // ── Wire serialization (used by runtime::sal / runtime::wire) ───────────
-
-    /// Byte count of the WAL-block encoding for this batch.
-    pub fn wire_byte_size(&self, _table_id: u32) -> usize {
-        let nr_wire = self.num_regions_total();
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
-        for (i, size) in sizes[..nr_wire].iter_mut().enumerate() {
-            *size = self.region_size(i) as u32;
-        }
-        super::wal::block_size(nr_wire, &sizes[..nr_wire])
-    }
-
-    /// Byte count of the WAL-block encoding for `count` rows from this batch.
-    /// Only valid for wire-safe schemas — all region strides are multiples of 8
-    /// so there is no alignment padding and the result is linear in `count`.
-    pub fn wire_byte_size_range(&self, count: usize) -> usize {
-        let nr_wire = self.num_regions_total();
-        let blob_idx = nr_wire - 1;
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
-        for (i, size) in sizes[..blob_idx].iter_mut().enumerate() {
-            *size = (count * self.strides[i] as usize) as u32;
-        }
-        // blob is always empty for wire-safe schemas
-        sizes[blob_idx] = 0;
-        super::wal::block_size(nr_wire, &sizes[..nr_wire])
-    }
-
-    /// Encode rows `[start_row, start_row + count)` into WAL V4 wire format at
-    /// `out[offset..]`. Returns bytes written. Only valid for wire-safe schemas
-    /// (no STRING columns, all strides 8-aligned). The blob region is encoded
-    /// as empty since wire-safe batches carry no long strings.
-    pub fn encode_range_to_wire(
-        &self,
-        start_row: usize,
-        count: usize,
-        table_id: u32,
-        out: &mut [u8],
-        offset: usize,
-        checksum: bool,
-    ) -> usize {
-        // Release-active: this bounds the `unsafe` region_ptr().add(start_row *
-        // stride) below. A debug-only check would strip in release and let a
-        // bad range form an out-of-bounds pointer (UB) instead of aborting.
-        // `saturating_add` (not `+`) so an overflowing range fails the bound
-        // rather than wrapping to a small value that slips past it.
-        let end = start_row.saturating_add(count);
-        assert!(
-            end <= self.count,
-            "encode_range_to_wire: range [{start_row}, {end}) out of bounds (batch count = {})",
-            self.count,
-        );
-        // Wire-safe precondition: a wire-safe schema carries no long strings, so
-        // the blob heap is empty and is intentionally dropped below. Callers gate
-        // this encoder on `schema_wire_safe`; a STRING/BLOB batch routes to the
-        // full-blob `encode_wire_into` path. Assert it so a future caller that
-        // mis-routes string data fails loudly here rather than shipping structs
-        // whose heap vanished.
-        debug_assert!(
-            self.blob.is_empty(),
-            "encode_range_to_wire on a batch with a {}-byte blob: wire-safe schemas \
-             carry no long strings; the heap would be silently dropped",
-            self.blob.len(),
-        );
-        let nr_wire = self.num_regions_total();
-        let blob_idx = nr_wire - 1;
-        let mut ptrs  = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
-        for i in 0..blob_idx {
-            let stride = self.strides[i] as usize;
-            // SAFETY: start_row * stride is within the allocated region (the
-            // assert above guarantees start_row + count <= self.count).
-            ptrs[i]  = unsafe { self.region_ptr(i).add(start_row * stride) };
-            sizes[i] = (count * stride) as u32;
-        }
-        // blob: null ptr with 0 bytes — no long strings in wire-safe schemas
-        ptrs[blob_idx]  = std::ptr::null();
-        sizes[blob_idx] = 0;
-        let new_offset = super::wal::encode(
-            out, offset, 0, table_id, count as u32,
-            &ptrs[..nr_wire], &sizes[..nr_wire], 0, checksum,
-        ).expect("WAL encode failed: buffer too small");
-        new_offset - offset
-    }
-
-    /// Encode self into WAL V4 wire format at out[offset..]. Returns bytes written.
-    pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize, checksum: bool) -> usize {
-        let nr_wire = self.num_regions_total();
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
-        for i in 0..nr_wire {
-            ptrs[i] = self.region_ptr(i);
-            sizes[i] = self.region_size(i) as u32;
-        }
-        let blob_size = self.blob.len() as u64;
-        let new_offset = super::wal::encode(
-            out, offset, 0, table_id, self.count as u32,
-            &ptrs[..nr_wire], &sizes[..nr_wire], blob_size, checksum,
-        ).expect("WAL encode failed: buffer too small");
-        new_offset - offset
-    }
-
-    /// Decode a WAL block from `data` using `schema`. Returns (Batch, bytes_consumed).
-    /// Does not set sorted/consolidated — caller derives those from wire header flags.
-    /// Set `verify_checksum = false` for trusted IPC paths (W2M ring).
-    pub fn decode_from_wal_block(
-        data: &[u8],
-        schema: &SchemaDescriptor,
-        verify_checksum: bool,
-    ) -> Result<(Self, usize), &'static str> {
-        let npc = schema.num_payload_cols();
-        // V4: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + npc payload + blob
-        let expected_regions = 3 + npc + 1;
-
-        let mut lsn = 0u64;
-        let mut tid = 0u32;
-        let mut count = 0u32;
-        let mut num_regions = 0u32;
-        let mut blob_size = 0u64;
-        let mut offsets = [0u64; 128];
-        let mut sizes = [0u32; 128];
-
-        if super::wal::validate_and_parse(
-            data, &mut lsn, &mut tid, &mut count, &mut num_regions,
-            &mut blob_size, &mut offsets, &mut sizes, 128, verify_checksum,
-        ).is_err() {
-            return Err("WAL block validation failed");
-        }
-        if (num_regions as usize) != expected_regions {
-            return Err("WAL block region count mismatch");
-        }
-
-        let bytes_consumed = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-        let n = count as usize;
-
-        // Zero-row block: `from_regions` would hard-code pk_stride=16; use the
-        // schema-correct empty batch so callers never observe a stale stride
-        // (e.g. empty transaction boundaries in the SAL).
-        if n == 0 {
-            let mut batch = Batch::empty_with_schema(schema);
-            batch.set_schema(*schema);
-            return Ok((batch, bytes_consumed));
-        }
-
-        // Validate per-region byte sizes against the schema-expected strides
-        // (`n > 0` here — the zero-row block returned early above). `from_regions`
-        // derives strides by dividing the supplied sizes by `count`, so a
-        // mismatch would silently propagate into the decoded Batch — and
-        // `get_pk` reads `strides[REG_PK]`, which a stride > 16 would make
-        // `widen_pk_le` panic on. (Blob region is variable-length.)
-        let pk_stride = schema.pk_stride() as usize;
-        if sizes[REG_PK] as usize != n * pk_stride {
-            return Err("WAL block PK region size mismatch");
-        }
-        if sizes[REG_WEIGHT] as usize != n * 8 {
-            return Err("WAL block weight region size mismatch");
-        }
-        if sizes[REG_NULL_BMP] as usize != n * 8 {
-            return Err("WAL block null bitmap region size mismatch");
-        }
-        for (pi, _, col) in schema.payload_columns() {
-            if sizes[REG_PAYLOAD_START + pi] as usize != n * col.size() as usize {
-                return Err("WAL block payload region size mismatch");
-            }
-        }
-
-        let nr_mem = expected_regions;
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
-        let mut region_sizes = [0u32; MAX_BATCH_REGIONS + 1];
-
-        // `validate_and_parse` guaranteed every region's `[off, off + sz)` lies
-        // within the block, so each pointer is in-bounds; a zero-size region
-        // keeps its null pointer.
-        for i in 0..nr_mem {
-            region_sizes[i] = sizes[i];
-            if sizes[i] > 0 {
-                ptrs[i] = unsafe { data.as_ptr().add(offsets[i] as usize) };
-            }
-        }
-
-        let mut batch = unsafe {
-            Batch::from_regions(&ptrs[..nr_mem], &region_sizes[..nr_mem], n, npc)
-        };
-        batch.set_schema(*schema);
-        Ok((batch, bytes_consumed))
-    }
-
     pub fn mark_sorted(&mut self) { self.sorted = true; }
     pub fn mark_consolidated(&mut self) { self.consolidated = true; }
 }
@@ -1721,74 +1478,6 @@ impl ConsolidatedBatch {
 impl std::ops::Deref for ConsolidatedBatch {
     type Target = Batch;
     fn deref(&self) -> &Batch { &self.0 }
-}
-
-/// Decode a WAL data block into a `MemBatch<'a>` that borrows the buffer
-/// directly. No allocation; caller must keep `data` live for as long as the
-/// returned `MemBatch` is used. Checksum verification is skipped (IPC trusted
-/// path).
-///
-/// The returned `MemBatch` carries the parsed region offsets by value.
-/// `validate_and_parse` guarantees every region's `[offset, offset + size)`
-/// lies within the block; here we additionally require each fixed region to be
-/// large enough for `count` rows at its schema stride, so the hot-path `get_*`
-/// accessors never read past a region on a corrupted WAL block.
-pub fn decode_mem_batch_from_wal_block<'a>(
-    data: &'a [u8],
-    schema: &SchemaDescriptor,
-) -> Result<MemBatch<'a>, &'static str> {
-    let npc = schema.num_payload_cols();
-    let expected_regions = 3 + npc + 1; // pk, weight, null_bmp, payload…, blob
-
-    let mut _lsn = 0u64; let mut _tid = 0u32; let mut count = 0u32;
-    let mut num_regions = 0u32; let mut _blob_size = 0u64;
-    let mut wal_offsets = [0u64; MAX_BATCH_REGIONS];
-    let mut sizes       = [0u32; MAX_BATCH_REGIONS];
-
-    super::wal::validate_and_parse(
-        data, &mut _lsn, &mut _tid, &mut count, &mut num_regions,
-        &mut _blob_size, &mut wal_offsets, &mut sizes, MAX_BATCH_REGIONS as u32, false,
-    ).map_err(|_| "data WAL block invalid")?;
-
-    if num_regions as usize != expected_regions {
-        return Err("data WAL block region count mismatch");
-    }
-
-    let n = count as usize;
-    let pk_stride_val = pk_stride(schema);
-
-    let mut offsets = [0usize; MAX_BATCH_REGIONS];
-
-    // Each fixed region must be large enough for `n` rows at its schema stride.
-    // `validate_and_parse` already bounded `off + sz` to the block, so a region
-    // big enough for the rows is also fully in-bounds.
-    let validate = |r: usize, row_stride: usize| -> Result<usize, &'static str> {
-        if n == 0 { return Ok(0); }
-        if (sizes[r] as usize) < n * row_stride {
-            return Err("data WAL region too small");
-        }
-        Ok(wal_offsets[r] as usize)
-    };
-
-    offsets[REG_PK]       = validate(REG_PK,       pk_stride_val as usize)?;
-    offsets[REG_WEIGHT]   = validate(REG_WEIGHT,   8)?;
-    offsets[REG_NULL_BMP] = validate(REG_NULL_BMP, 8)?;
-
-    for (pi, _ci, col) in schema.payload_columns() {
-        let stride = col.size() as usize;
-        offsets[REG_PAYLOAD_START + pi] = validate(REG_PAYLOAD_START + pi, stride)?;
-    }
-
-    // The blob extent is bounded by `validate_and_parse` like every region;
-    // a zero-size heap is an empty slice.
-    let blob_r = REG_PAYLOAD_START + npc;
-    let blob = {
-        let off = wal_offsets[blob_r] as usize;
-        let sz  = sizes[blob_r] as usize;
-        if sz == 0 { &[] } else { &data[off..off + sz] }
-    };
-
-    Ok(MemBatch { data, offsets, pk_stride: pk_stride_val, blob, count: n })
 }
 
 /// Allocate a single contiguous arena, run a merge/copy operation via
@@ -2493,12 +2182,11 @@ mod tests {
     }
 
     #[test]
-    fn append_row_from_ptable_found_narrow_byte_roundtrip() {
-        // Narrow single-PK round-trip through the byte-typed
-        // append_row_from_ptable_found. The byte-typed signature must
-        // preserve byte-for-byte equivalence with the old extend_pk(pk)
-        // path: the stored PK region bytes are the same LE bytes
-        // extend_pk would have written.
+    fn found_row_append_narrow_byte_roundtrip() {
+        // Narrow single-PK round-trip through append_row_from_source_bytes fed by
+        // a found-row ColumnarSource view. The byte-typed PK path must preserve
+        // byte-for-byte equivalence with the old extend_pk(pk) path: the stored
+        // PK region bytes are the same LE bytes extend_pk would have written.
         crate::foundation::posix_io::raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("appendrow_byte_test");
@@ -2524,15 +2212,16 @@ mod tests {
         src.count += 1;
         pt.ingest_owned_batch(src).unwrap();
 
-        // retract_pk arms `last_found_partition`; append_row_from_ptable_found
-        // then reads the found row.
+        // retract_pk arms `last_found_partition`; found_row() exposes the stored
+        // row as a ColumnarSource that append_row_from_source_bytes copies in.
         let (_w, found) = pt.retract_pk(pk_val as u128);
         assert!(found);
+        let found_row = pt.found_row().expect("retract_pk armed the found row");
 
         let mut dst = Batch::with_schema(schema, 1);
         // PK region is OPK (big-endian) at rest; the lookup key must match.
         let pk_bytes = pk_val.to_be_bytes();
-        dst.append_row_from_ptable_found(&pt, &pk_bytes, -1);
+        dst.append_row_from_source_bytes(&pk_bytes, -1, &found_row, 0, None);
         assert_eq!(dst.count, 1);
         assert_eq!(dst.get_pk_bytes(0), &pk_bytes);
         assert_eq!(dst.get_pk(0), pk_val as u128);
@@ -2631,117 +2320,10 @@ mod tests {
         b.extend_pk(1u128 << 100);
     }
 
-    #[test]
-    fn decode_from_wal_block_rejects_mismatched_pk_stride() {
-        let schema = single_col_pk_schema(type_code::U64); // pk_stride = 8
-        let mut b = Batch::with_schema(schema, 1);
-        b.extend_pk(42u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &7i64.to_le_bytes());
-        b.count += 1;
-
-        let sz = b.wire_byte_size(1);
-        let mut buf = vec![0u8; sz];
-        b.encode_to_wire(1, &mut buf, 0, false);
-        // Corrupt the REG_PK (region 0) size directory entry: claim 24 bytes.
-        let size_off = gnitz_wire::WAL_HEADER_SIZE + REG_PK * 8 + 4;
-        buf[size_off..size_off + 4].copy_from_slice(&24u32.to_le_bytes());
-        let r = Batch::decode_from_wal_block(&buf, &schema, false);
-        assert_eq!(r.err(), Some("WAL block PK region size mismatch"));
-    }
-
-    #[test]
-    fn decode_from_wal_block_rejects_mismatched_weight_region() {
-        let schema = single_col_pk_schema(type_code::U64);
-        let mut b = Batch::with_schema(schema, 1);
-        b.extend_pk(42u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &7i64.to_le_bytes());
-        b.count += 1;
-
-        let sz = b.wire_byte_size(1);
-        let mut buf = vec![0u8; sz];
-        b.encode_to_wire(1, &mut buf, 0, false);
-        // Corrupt the REG_WEIGHT (region 1) size: claim 4 bytes instead of 8.
-        let size_off = gnitz_wire::WAL_HEADER_SIZE + REG_WEIGHT * 8 + 4;
-        buf[size_off..size_off + 4].copy_from_slice(&4u32.to_le_bytes());
-        let r = Batch::decode_from_wal_block(&buf, &schema, false);
-        assert_eq!(r.err(), Some("WAL block weight region size mismatch"));
-    }
-
-    #[test]
-    fn decode_from_wal_block_rejects_region_offset_past_block() {
-        let schema = single_col_pk_schema(type_code::U64);
-        let mut b = Batch::with_schema(schema, 1);
-        b.extend_pk(42u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &7i64.to_le_bytes());
-        b.count += 1;
-
-        let sz = b.wire_byte_size(1);
-        let mut buf = vec![0u8; sz];
-        b.encode_to_wire(1, &mut buf, 0, false);
-        // Corrupt the REG_PK (region 0) OFFSET directory entry: point it past the
-        // block while leaving its size (= n*pk_stride) schema-valid. The region's
-        // [off, off + sz) now overruns the block, so `validate_and_parse` rejects
-        // it instead of the decoder silently zero-filling the PK column.
-        let block_end = buf.len() as u32;
-        let off_off = gnitz_wire::WAL_HEADER_SIZE + REG_PK * 8;
-        buf[off_off..off_off + 4].copy_from_slice(&block_end.to_le_bytes());
-        // verify_checksum = false: the unverified IPC path is the one this guards.
-        let r = Batch::decode_from_wal_block(&buf, &schema, false);
-        assert_eq!(r.err(), Some("WAL block validation failed"));
-    }
-
-    #[test]
-    fn decode_mem_batch_rejects_blob_region_past_block() {
-        let schema = single_col_pk_schema(type_code::U64);
-        let mut b = Batch::with_schema(schema, 1);
-        b.extend_pk(42u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &7i64.to_le_bytes());
-        b.count += 1;
-
-        let sz = b.wire_byte_size(1);
-        let mut buf = vec![0u8; sz];
-        b.encode_to_wire(1, &mut buf, 0, false);
-        // Fixed regions stay schema-valid; corrupt only the variable-length BLOB
-        // region (index REG_PAYLOAD_START + npc) so [off, off + sz) overruns the
-        // block: offset = block end, size = 8. `validate_and_parse` rejects the
-        // OOB extent, so the decoder never resolves strings against an empty heap.
-        let blob_r = REG_PAYLOAD_START + schema.num_payload_cols();
-        let entry = gnitz_wire::WAL_HEADER_SIZE + blob_r * 8;
-        let block_end = buf.len() as u32;
-        buf[entry..entry + 4].copy_from_slice(&block_end.to_le_bytes());  // offset
-        buf[entry + 4..entry + 8].copy_from_slice(&8u32.to_le_bytes());   // size
-        let r = decode_mem_batch_from_wal_block(&buf, &schema);
-        assert_eq!(r.err(), Some("data WAL block invalid"));
-    }
-
-    #[test]
-    #[should_panic(expected = "wire-safe schemas")]
-    fn encode_range_to_wire_panics_on_nonempty_blob() {
-        let schema = single_col_pk_schema(type_code::U64);
-        let mut b = Batch::with_schema(schema, 1);
-        b.extend_pk(1u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &7i64.to_le_bytes());
-        b.count += 1;
-        // A non-empty heap on a wire-safe encode must fail loudly, not vanish.
-        b.blob.push(0xAB);
-        let mut out = vec![0u8; b.wire_byte_size(1) + 16];
-        b.encode_range_to_wire(0, 1, 1, &mut out, 0, false);
-    }
-
     /// A long-string German cell whose heap region [offset, offset+len) overruns
     /// the source blob must relocate to an empty string, not read out of bounds.
-    /// This is the safety primitive that `append_row_from_ptable_found` and
-    /// `write_join_row` now rely on instead of the deleted `write_string_from_raw`.
+    /// This is the safety primitive that `append_row_from_source_bytes` and
+    /// `write_join_row` rely on instead of the deleted `write_string_from_raw`.
     #[test]
     fn relocate_german_string_oob_falls_back_to_empty() {
         // Build a long-string cell: length=100 (> 12), prefix bytes, and a

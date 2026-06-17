@@ -287,28 +287,15 @@ impl PartitionedTable {
     }
 
     // ------------------------------------------------------------------
-    // Found-row accessors
+    // Found-row accessor
     // ------------------------------------------------------------------
 
-    pub fn found_null_word(&self) -> u64 {
-        match self.last_found_partition {
-            Some(local) => self.tables[local].found_null_word(),
-            None => 0,
-        }
-    }
-
-    pub fn found_col_ptr(&self, payload_col: usize, col_size: usize) -> *const u8 {
-        match self.last_found_partition {
-            Some(local) => self.tables[local].found_col_ptr(payload_col, col_size),
-            None => std::ptr::null(),
-        }
-    }
-
-    pub fn found_blob_slice(&self) -> &[u8] {
-        match self.last_found_partition {
-            Some(local) => self.tables[local].found_blob_slice(),
-            None        => &[],
-        }
+    /// The row most recently located by `retract_pk*`, as a `ColumnarSource`
+    /// view, or `None` when the last probe missed (no partition armed). Routes
+    /// to the found row of the partition that held the hit.
+    pub(crate) fn found_row(&self) -> Option<table::FoundRow<'_>> {
+        self.last_found_partition
+            .and_then(|local| self.tables[local].found_row())
     }
 
     // ------------------------------------------------------------------
@@ -686,7 +673,7 @@ mod tests {
         let (w, found) = pt.retract_pk(10);
         assert_eq!(w, 1);
         assert!(found);
-        assert!(!pt.found_col_ptr(0, 8).is_null());
+        assert!(pt.found_row().is_some());
 
         let (_, found) = pt.retract_pk(99);
         assert!(!found);
@@ -773,9 +760,10 @@ mod tests {
         // the prefix) it would route by the full key to a different partition and
         // miss the row entirely.
         let read_found_val = |pt: &PartitionedTable| {
-            let p = pt.found_col_ptr(0, 8);
-            assert!(!p.is_null(), "found-row payload pointer is null");
-            i64::from_le_bytes(unsafe { std::slice::from_raw_parts(p, 8) }.try_into().unwrap())
+            let fr = pt.found_row().expect("found-row payload available");
+            i64::from_le_bytes(
+                columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap(),
+            )
         };
         let (wa, fa) = pt.retract_pk_bytes(&twin_a);
         assert_eq!((wa, fa), (1, true), "twin A found in its prefix-partition");
@@ -902,7 +890,7 @@ mod tests {
 
     /// A stale `last_found_partition` (set by a prior `retract_pk` hit) must be
     /// invalidated when `close_partitions_outside` rebuilds the `tables` vector,
-    /// or `found_null_word()` would index into the now-smaller vector.
+    /// or `found_row()` would index into the now-smaller vector.
     #[test]
     fn close_partitions_outside_invalidates_found_partition() {
         raise_fd_limit_for_tests();
@@ -926,9 +914,8 @@ mod tests {
         let (start, end) = if part >= 200 { (0u32, 10u32) } else { (200u32, 210u32) };
         pt.close_partitions_outside(start, end);
 
-        // Must not panic and must report the cleared-found default.
-        assert_eq!(pt.found_null_word(), 0);
-        assert!(pt.found_col_ptr(0, 8).is_null());
+        // Must not panic and must report the cleared-found state (no found row).
+        assert!(pt.found_row().is_none());
     }
 
     // ── In-memory ephemeral flush across partitions ──────────────────────

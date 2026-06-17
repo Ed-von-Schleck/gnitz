@@ -16,6 +16,7 @@ mod shard_reader;
 mod shard_index;
 mod merge;
 mod batch;
+mod batch_wire;
 mod memtable;
 mod read_cursor;
 mod range_key;
@@ -31,7 +32,8 @@ mod data_roundtrip_proptest;
 pub use table::{Table, FlushOutcome, FlushWork, Persistence};
 pub use partitioned_table::{PartitionedTable, partition_for_key, partition_for_pk_bytes, partition_arena_size};
 pub use read_cursor::CursorHandle;
-pub use batch::{Batch, ConsolidatedBatch, write_to_batch, decode_mem_batch_from_wal_block};
+pub use batch::{Batch, ConsolidatedBatch, write_to_batch};
+pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use merge::{MemBatch, scatter_copy, scatter_multi_source};
 pub use error::StorageError;
 

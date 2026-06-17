@@ -1845,7 +1845,10 @@ impl DagEngine {
             // the stored (PK, payload) so downstream views drop the old payload.
             let (_existing_w, found) = ptable.retract_pk_bytes(pkb);
             if found && !store_retracted.contains(pkb) {
-                effective.append_row_from_ptable_found(ptable, pkb, -1);
+                // `retract_pk_bytes` armed the stored row as a `ColumnarSource`
+                // view; copy it in at weight -1 via the canonical source-append.
+                let found_row = ptable.found_row().expect("retract_pk_bytes reported a found row");
+                effective.append_row_from_source_bytes(pkb, -1, &found_row, 0, None);
                 store_retracted.insert(pkb);
             }
 

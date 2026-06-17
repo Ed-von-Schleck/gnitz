@@ -243,32 +243,14 @@ impl MemTable {
         (total_w, self.has_found, row_count)
     }
 
-    fn found_entry(&self) -> Option<(&Batch, usize)> {
+    /// The row most recently located by `find_positive_payload_row*` / the
+    /// retract probe, as `(run, row)`, or `None` when nothing is armed. The
+    /// `Table` layer wraps this in a `FoundRow` `ColumnarSource` view.
+    pub(super) fn found_entry(&self) -> Option<(&Batch, usize)> {
         if self.has_found && self.found_run < self.runs.len() {
             Some((self.runs[self.found_run].as_ref(), self.found_row))
         } else {
             None
-        }
-    }
-
-    pub fn found_col_ptr(&self, payload_col: usize, col_size: usize) -> *const u8 {
-        match self.found_entry() {
-            Some((run, row)) => run.get_col_ptr(row, payload_col, col_size).as_ptr(),
-            None => std::ptr::null(),
-        }
-    }
-
-    pub fn found_null_word(&self) -> u64 {
-        match self.found_entry() {
-            Some((run, row)) => run.get_null_word(row),
-            None => 0,
-        }
-    }
-
-    pub fn found_blob_slice(&self) -> &[u8] {
-        match self.found_entry() {
-            Some((run, _)) => &run.blob,
-            None => &[],
         }
     }
 
@@ -1048,11 +1030,8 @@ mod tests {
         assert!(mt.has_found);
 
         // The found row should have payload = 200
-        let col_ptr = mt.found_col_ptr(0, 8);
-        assert!(!col_ptr.is_null());
-        let val = i64::from_le_bytes(
-            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
-        );
+        let (run, row) = mt.found_entry().expect("a live row was found");
+        let val = i64::from_le_bytes(run.get_col_ptr(row, 0, 8).try_into().unwrap());
         assert_eq!(val, 200, "found row should be the live val=200 row, not the retracted val=100");
 
         // PK with no rows at all → not found
@@ -1103,11 +1082,8 @@ mod tests {
         assert!(mt.has_found);
 
         // Found row decodes the live payload (100).
-        let col_ptr = mt.found_col_ptr(0, 8);
-        assert!(!col_ptr.is_null());
-        let val = i64::from_le_bytes(
-            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
-        );
+        let (run, row) = mt.found_entry().expect("a live row was found");
+        let val = i64::from_le_bytes(run.get_col_ptr(row, 0, 8).try_into().unwrap());
         assert_eq!(val, 100, "found row should decode the live payload");
 
         // Cross-check: PK 10 has a single payload, so its PK aggregate equals
@@ -1122,8 +1098,8 @@ mod tests {
     /// Found-index contract: after a hit, the `found_run`/`found_row` indices
     /// must address the row of the winning group — even when an *earlier* run
     /// holds a fully-cancelled payload, so the winning group's first member is
-    /// in a later run (found_run != 0). Guards that `found_col_ptr` /
-    /// `found_null_word` read the live row, not the cancelled one.
+    /// in a later run (found_run != 0). Guards that `found_entry` addresses the
+    /// live row, not the cancelled one.
     #[test]
     fn test_find_positive_payload_row_found_index_validity() {
         let schema = make_u64_i64_schema();
@@ -1144,12 +1120,9 @@ mod tests {
 
         // Payload column is non-null in the fixture, so the null word is 0 and
         // the decoded value is the live payload (200), not the cancelled 100.
-        assert_eq!(mt.found_null_word(), 0);
-        let col_ptr = mt.found_col_ptr(0, 8);
-        assert!(!col_ptr.is_null());
-        let val = i64::from_le_bytes(
-            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
-        );
+        let (run, row) = mt.found_entry().expect("a live row was found");
+        assert_eq!(run.get_null_word(row), 0);
+        let val = i64::from_le_bytes(run.get_col_ptr(row, 0, 8).try_into().unwrap());
         assert_eq!(val, 200);
     }
 
@@ -1174,11 +1147,8 @@ mod tests {
         assert!(mt.has_found);
 
         // Returned row decodes one of the two positive payloads...
-        let col_ptr = mt.found_col_ptr(0, 8);
-        assert!(!col_ptr.is_null());
-        let val = i64::from_le_bytes(
-            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
-        );
+        let (run, row) = mt.found_entry().expect("a live row was found");
+        let val = i64::from_le_bytes(run.get_col_ptr(row, 0, 8).try_into().unwrap());
         assert!(val == 100 || val == 200, "found a positive group's payload");
 
         // ...and that payload's group genuinely nets strictly positive (internal

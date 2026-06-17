@@ -132,6 +132,39 @@ enum FoundSource {
     Shard(Rc<MappedShard>, usize),
 }
 
+/// A [`ColumnarSource`](super::columnar::ColumnarSource) view over the row a
+/// `retract_pk*` call most recently located (the "found row"). Both arms wrap a
+/// type that already implements `ColumnarSource` — a memtable run (`Batch`) or a
+/// `MappedShard` — so the found row flows as the canonical columnar abstraction
+/// rather than a raw-pointer triple, and the stored (PK, payload) can be copied
+/// into a batch through `Batch::append_row_from_source_bytes`. A `FoundRow` is
+/// pinned to its single located row, so the trait's `row` argument is ignored.
+pub(crate) enum FoundRow<'a> {
+    Mem(&'a Batch, usize),
+    Shard(&'a MappedShard, usize),
+}
+
+impl columnar::ColumnarSource for FoundRow<'_> {
+    fn get_null_word(&self, _row: usize) -> u64 {
+        match *self {
+            FoundRow::Mem(b, r) => columnar::ColumnarSource::get_null_word(b, r),
+            FoundRow::Shard(s, r) => columnar::ColumnarSource::get_null_word(s, r),
+        }
+    }
+    fn get_col_ptr(&self, _row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        match *self {
+            FoundRow::Mem(b, r) => columnar::ColumnarSource::get_col_ptr(b, r, payload_col, col_size),
+            FoundRow::Shard(s, r) => columnar::ColumnarSource::get_col_ptr(s, r, payload_col, col_size),
+        }
+    }
+    fn blob_slice(&self) -> &[u8] {
+        match *self {
+            FoundRow::Mem(b, _) => columnar::ColumnarSource::blob_slice(b),
+            FoundRow::Shard(s, _) => columnar::ColumnarSource::blob_slice(s),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Table
 // ---------------------------------------------------------------------------
@@ -882,27 +915,15 @@ impl Table {
     // Found-row accessors (after retract_pk)
     // ------------------------------------------------------------------
 
-    pub fn found_null_word(&self) -> u64 {
+    /// The row most recently located by `retract_pk*`, as a `ColumnarSource`
+    /// view, or `None` when the last probe missed. The memtable arm resolves
+    /// through `MemTable::found_entry`; the shard arm borrows the mapped shard
+    /// held live by `FoundSource::Shard`.
+    pub(crate) fn found_row(&self) -> Option<FoundRow<'_>> {
         match &self.found_source {
-            FoundSource::MemTable => self.memtable.found_null_word(),
-            FoundSource::Shard(arc, idx) => arc.get_null_word(*idx),
-            FoundSource::None => 0,
-        }
-    }
-
-    pub fn found_col_ptr(&self, payload_col: usize, col_size: usize) -> *const u8 {
-        match &self.found_source {
-            FoundSource::MemTable => self.memtable.found_col_ptr(payload_col, col_size),
-            FoundSource::Shard(arc, idx) => arc.get_col_ptr(*idx, payload_col, col_size).as_ptr(),
-            FoundSource::None => std::ptr::null(),
-        }
-    }
-
-    pub fn found_blob_slice(&self) -> &[u8] {
-        match &self.found_source {
-            FoundSource::MemTable      => self.memtable.found_blob_slice(),
-            FoundSource::Shard(arc, _) => arc.blob_slice(),
-            FoundSource::None          => &[],
+            FoundSource::None => None,
+            FoundSource::MemTable => self.memtable.found_entry().map(|(b, r)| FoundRow::Mem(b, r)),
+            FoundSource::Shard(arc, idx) => Some(FoundRow::Shard(arc, *idx)),
         }
     }
 
@@ -1183,8 +1204,11 @@ mod tests {
         let (w, found) = t.retract_pk(10);
         assert_eq!(w, 1);
         assert!(found);
-        assert_ne!(t.found_null_word(), u64::MAX); // should return valid null word
-        assert!(!t.found_col_ptr(0, 8).is_null()); // payload column accessible
+        // The retracted row is the found row: a valid null word and an
+        // accessible payload column, read through the ColumnarSource view.
+        let fr = t.found_row().expect("retracted row is the found row");
+        assert_ne!(columnar::ColumnarSource::get_null_word(&fr, 0), u64::MAX);
+        assert_eq!(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).len(), 8);
 
         let (w, found) = t.retract_pk(99);
         assert_eq!(w, 0);
@@ -1244,10 +1268,9 @@ mod tests {
         assert!(found);
 
         // The found row must be val=200, not the cancelled val=100
-        let col_ptr = t.found_col_ptr(0, 8);
-        assert!(!col_ptr.is_null());
+        let fr = t.found_row().expect("retracted row is the found row");
         let val = i64::from_le_bytes(
-            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
+            columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap(),
         );
         assert_eq!(val, 200, "retract_pk must return the live (val=200) row, not the retracted val=100");
     }
@@ -1378,10 +1401,9 @@ mod tests {
         assert_eq!(w, 1);
         assert!(found);
 
-        let col_ptr = t.found_col_ptr(0, 8);
-        assert!(!col_ptr.is_null());
+        let fr = t.found_row().expect("retracted row is the found row");
         let val = i64::from_le_bytes(
-            unsafe { std::slice::from_raw_parts(col_ptr, 8) }.try_into().unwrap(),
+            columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap(),
         );
         assert_eq!(val, 200, "shard fallback must pick live payload (val=200), not cancelled (val=100)");
     }
