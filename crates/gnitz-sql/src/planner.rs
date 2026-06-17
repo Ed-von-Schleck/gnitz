@@ -2216,6 +2216,17 @@ struct AggMapping {
     arg_col: Option<usize>,
 }
 
+/// One physical reduce spec: the wire agg op code (`AGG_*`), its source column,
+/// and the output column type it produces. `out_type` is computed once at spec
+/// creation by `push_agg_specs` (the spec-layout authority), so the reduce
+/// schema builder reads it directly instead of reconstructing it from `op`. The
+/// circuit builder consumes only `(op, col)`.
+struct AggSpec {
+    op: u64,
+    col: usize,
+    out_type: TypeCode,
+}
+
 /// Mirror the engine's `agg_output_type`: COUNT/COUNT_NON_NULL → I64, AVG → F64,
 /// float SUM/MIN/MAX → F64. SUM over a non-float column widens to I64 (it can
 /// overflow the source width); MIN/MAX over a non-float column *preserve the
@@ -2329,7 +2340,7 @@ fn execute_create_group_by_view(
     // 3. Analyze SELECT items → group cols + aggregates
     let mut agg_mappings: Vec<AggMapping> = Vec::new();
     let mut select_items: Vec<GroupBySelectItem> = Vec::new();
-    let mut agg_specs: Vec<(u64, usize)> = Vec::new();
+    let mut agg_specs: Vec<AggSpec> = Vec::new();
 
     for (idx, item) in select.projection.iter().enumerate() {
         let (expr, alias) = match item {
@@ -2401,7 +2412,7 @@ fn execute_create_group_by_view(
                 let out_type = agg_result_type(*func, src_col, &source_schema);
                 let agg_idx = agg_mappings.len();
                 let start = agg_specs.len();
-                let is_avg = push_agg_specs(*func, src_col, &mut agg_specs)?;
+                let is_avg = push_agg_specs(*func, src_col, &source_schema, &mut agg_specs)?;
                 let out_name = alias.unwrap_or_else(|| {
                     let prefix = match func {
                         AggFunc::Count | AggFunc::CountNonNull => "_count",
@@ -2476,23 +2487,14 @@ fn execute_create_group_by_view(
     // of the reduce schema: the PK region plus, on the synthetic path only, the
     // group cols carried as payload.
     let agg_col_offset = reduce_schema_cols.len();
-    for &(op, col) in &agg_specs {
-        // Route through the shared agg_result_type so the planner's virtual
-        // reduce schema matches the compiler's physical reduce output (§3a):
-        // float SUM/MIN/MAX → F64, MIN/MAX preserve the source type, SUM/COUNT*
-        // → I64. AVG never reaches this loop (push_agg_specs expands it to a
-        // SUM + COUNT_NON_NULL pair), so `op` is always one of these five codes.
-        let func = match op {
-            AGG_COUNT          => AggFunc::Count,
-            AGG_COUNT_NON_NULL => AggFunc::CountNonNull,
-            AGG_SUM            => AggFunc::Sum,
-            AGG_MIN            => AggFunc::Min,
-            AGG_MAX            => AggFunc::Max,
-            other => unreachable!("agg_specs holds valid non-AVG agg op codes, got {other}"),
-        };
-        let type_code = agg_result_type(func, Some(col), &source_schema);
+    for spec in &agg_specs {
+        // Each spec carries the output column type push_agg_specs computed for it
+        // (float SUM/MIN/MAX → F64, MIN/MAX preserve the source type, SUM/COUNT*
+        // → I64), so the planner's virtual reduce schema matches the compiler's
+        // physical reduce output (§3a) with no per-op reconstruction.
         reduce_schema_cols.push(ColumnDef {
-            name: "_agg".into(), type_code, is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+            name: "_agg".into(), type_code: spec.out_type,
+            is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
         });
     }
     let reduce_schema = Schema { columns: reduce_schema_cols, pk_cols: reduce_pk_cols };
@@ -2535,12 +2537,16 @@ fn execute_create_group_by_view(
     } else {
         group_col_indices.clone()
     };
+    // The circuit builder needs only (op, col) per spec; out_type is the
+    // planner's concern and already shaped reduce_schema above.
+    let circuit_specs: Vec<(u64, usize)> =
+        agg_specs.iter().map(|s| (s.op, s.col)).collect();
     let reduced = if source_replicated {
         // Shard-free: every worker reduces its full local copy to the same global
         // aggregate (no ExchangeShard ⇒ no gather barrier, no N-fold sum).
-        cb.reduce_multi_local(filtered, &reduce_group_cols, &agg_specs)
+        cb.reduce_multi_local(filtered, &reduce_group_cols, &circuit_specs)
     } else {
-        cb.reduce_multi(filtered, &reduce_group_cols, &agg_specs)
+        cb.reduce_multi(filtered, &reduce_group_cols, &circuit_specs)
     };
 
     // 6. Post-reduce MAP: project group cols + compute aggregates (AVG = SUM/COUNT)
@@ -2750,14 +2756,17 @@ fn agg_mapping_matches(m: &AggMapping, agg_func: AggFunc, arg_col: Option<usize>
 
 /// Push the engine `agg_specs` for one aggregate and return whether it is an
 /// AVG (which materialises two specs — SUM then COUNT_NON_NULL). The single
-/// source of truth for the spec layout, shared by the SELECT projection and the
-/// HAVING-only materialisation so the two stay in lockstep — notably the
-/// AVG-emits-two-specs invariant, on which the reduce-output column positions
-/// and `AggMapping::specs_start` both depend.
+/// source of truth for the spec layout — and for each spec's output column type,
+/// recorded here (the one place the AVG split lives) so the reduce schema
+/// builder never reconstructs it from the op code. Shared by the SELECT
+/// projection and the HAVING-only materialisation so the two stay in lockstep —
+/// notably the AVG-emits-two-specs invariant, on which the reduce-output column
+/// positions and `AggMapping::specs_start` both depend.
 fn push_agg_specs(
     agg_func: AggFunc,
     arg_col: Option<usize>,
-    agg_specs: &mut Vec<(u64, usize)>,
+    schema: &Schema,
+    agg_specs: &mut Vec<AggSpec>,
 ) -> Result<bool, GnitzSqlError> {
     // Every aggregate except COUNT(*) needs a column argument, which the specs
     // below unwrap. Validating here — the single source of truth for spec
@@ -2768,16 +2777,19 @@ fn push_agg_specs(
             "{agg_func:?} requires an argument column; only COUNT(*) accepts a wildcard"
         )));
     }
+    let mut push = |op: u64, func: AggFunc, col: usize| {
+        agg_specs.push(AggSpec { op, col, out_type: agg_result_type(func, Some(col), schema) });
+    };
     Ok(match agg_func {
-        AggFunc::Count => { agg_specs.push((AGG_COUNT, 0)); false }
-        AggFunc::CountNonNull => { agg_specs.push((AGG_COUNT_NON_NULL, arg_col.unwrap())); false }
-        AggFunc::Sum => { agg_specs.push((AGG_SUM, arg_col.unwrap())); false }
-        AggFunc::Min => { agg_specs.push((AGG_MIN, arg_col.unwrap())); false }
-        AggFunc::Max => { agg_specs.push((AGG_MAX, arg_col.unwrap())); false }
+        AggFunc::Count => { push(AGG_COUNT, AggFunc::Count, 0); false }
+        AggFunc::CountNonNull => { push(AGG_COUNT_NON_NULL, AggFunc::CountNonNull, arg_col.unwrap()); false }
+        AggFunc::Sum => { push(AGG_SUM, AggFunc::Sum, arg_col.unwrap()); false }
+        AggFunc::Min => { push(AGG_MIN, AggFunc::Min, arg_col.unwrap()); false }
+        AggFunc::Max => { push(AGG_MAX, AggFunc::Max, arg_col.unwrap()); false }
         AggFunc::Avg => {
             let c = arg_col.unwrap();
-            agg_specs.push((AGG_SUM, c));
-            agg_specs.push((AGG_COUNT_NON_NULL, c));
+            push(AGG_SUM, AggFunc::Sum, c);
+            push(AGG_COUNT_NON_NULL, AggFunc::CountNonNull, c);
             true
         }
     })
@@ -2791,13 +2803,13 @@ fn append_having_agg(
     agg_func: AggFunc,
     arg_col: Option<usize>,
     source_schema: &Schema,
-    agg_specs: &mut Vec<(u64, usize)>,
+    agg_specs: &mut Vec<AggSpec>,
     agg_mappings: &mut Vec<AggMapping>,
 ) -> Result<(), GnitzSqlError> {
     let out_type = agg_result_type(agg_func, arg_col, source_schema);
     let agg_idx = agg_mappings.len();
     let start = agg_specs.len();
-    let is_avg = push_agg_specs(agg_func, arg_col, agg_specs)?;
+    let is_avg = push_agg_specs(agg_func, arg_col, source_schema, agg_specs)?;
     agg_mappings.push(AggMapping {
         specs_start: start, is_avg,
         output_name: format!("_having_agg{agg_idx}"),
@@ -2811,7 +2823,7 @@ fn append_having_agg(
 fn collect_having_aggs(
     expr: &Expr,
     source_schema: &Schema,
-    agg_specs: &mut Vec<(u64, usize)>,
+    agg_specs: &mut Vec<AggSpec>,
     agg_mappings: &mut Vec<AggMapping>,
 ) -> Result<(), GnitzSqlError> {
     match expr {
