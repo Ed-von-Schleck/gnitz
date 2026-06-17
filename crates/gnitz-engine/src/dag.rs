@@ -328,7 +328,7 @@ impl TableEntry {
 }
 
 /// Type alias — the cache stores CompileOutput directly.
-pub type CachedPlan = CompileOutput;
+pub(crate) type CachedPlan = CompileOutput;
 
 // ---------------------------------------------------------------------------
 // System table references
@@ -1947,7 +1947,7 @@ impl DagEngine {
     /// Close the DagEngine, dropping all cached plans. Test-only, like the
     /// `CatalogEngine::close` that drives it: the server never closes gracefully.
     #[cfg(test)]
-    pub fn close(&mut self) {
+    pub(super) fn close(&mut self) {
         self.cache.clear();
         self.tables.clear();
         self.shard_cols_cache.clear();

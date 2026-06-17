@@ -58,7 +58,7 @@ impl SchemaColumn {
 /// this width the order-agnostic byte paths keep the PK in a `u128`
 /// (`get_pk`/`partition_for_key`); above it the region is "wide" and must
 /// be handled via the raw-bytes accessors and `compare_pk_bytes`.
-pub const NARROW_PK_MAX_BYTES: usize = 16;
+pub(crate) const NARROW_PK_MAX_BYTES: usize = 16;
 
 /// Reassemble a wide PK's full byte image from its wire split: the low
 /// `NARROW_PK_MAX_BYTES` carried as a `u128` plus the `extra` tail (PK bytes
@@ -71,7 +71,7 @@ pub const NARROW_PK_MAX_BYTES: usize = 16;
 /// `seek_bytes`/`partition_for_pk_bytes` compare against OPK storage. Errors if
 /// `extra` is shorter than the wide suffix `stride - 16`. Callers must only
 /// invoke this for wide PKs (`pk_is_wide()`, `stride > 16`).
-pub fn assemble_wide_pk(
+pub(crate) fn assemble_wide_pk(
     schema: &SchemaDescriptor,
     low: u128,
     extra: &[u8],
@@ -110,13 +110,13 @@ pub fn assemble_wide_pk(
 /// "this slot refers to a PK column, not a payload column". Using
 /// `u8::MAX` (not 0) keeps the sentinel unambiguous against a real
 /// payload index of 0.
-pub const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
+pub(crate) const PAYLOAD_MAPPING_PK_SENTINEL: u8 = u8::MAX;
 
 /// Pre-computed payload row-comparator strategy for a schema. Stored on
 /// `SchemaDescriptor` and computed once in `new()` so every merge/sort/join
 /// dispatch reads a single field instead of iterating over columns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PayloadCmpKind {
+pub(crate) enum PayloadCmpKind {
     /// All payload columns are non-nullable fixed-width ints ≤ 8 bytes (any sign).
     /// Vacuously true for zero-payload (all-PK) schemas.
     FixedIntNonnull,
@@ -437,7 +437,7 @@ impl SchemaDescriptor {
     /// Distribution prefix length `k` — leading PK columns rows are hashed by
     /// (`k == pk_count` for the full-PK default).
     #[inline]
-    pub const fn dist_prefix_len(&self) -> u8 {
+    const fn dist_prefix_len(&self) -> u8 {
         self.dist_prefix_len
     }
 
@@ -469,7 +469,7 @@ impl SchemaDescriptor {
     /// today, so it is gated to test builds to keep the production API minimal.
     #[cfg(test)]
     #[inline]
-    pub const fn pk_is_signed_single_col(&self) -> bool {
+    pub(crate) const fn pk_is_signed_single_col(&self) -> bool {
         if self.pk_count != 1 {
             return false;
         }
@@ -488,7 +488,7 @@ impl SchemaDescriptor {
     /// to production.
     #[inline]
     #[track_caller]
-    pub const fn pk_index_single(&self) -> u32 {
+    pub(crate) const fn pk_index_single(&self) -> u32 {
         assert!(self.pk_count == 1, "compound PK not yet supported here");
         self.pk_indices[0]
     }
@@ -543,7 +543,7 @@ impl SchemaDescriptor {
     /// own slot (e.g. `SortDesc::pi`) read the precomputed byte directly
     /// without a branch.
     #[inline]
-    pub fn payload_mapping_byte(&self, ci: usize) -> u8 {
+    pub(crate) fn payload_mapping_byte(&self, ci: usize) -> u8 {
         self.payload_mapping[ci]
     }
 
@@ -592,7 +592,7 @@ impl SchemaDescriptor {
     /// Byte offset of `col_idx` within the row's PK region. Walks
     /// `pk_columns()` in pk-list order; caller must ensure `col_idx` is
     /// a PK column.
-    pub fn pk_byte_offset(&self, col_idx: usize) -> u8 {
+    pub(crate) fn pk_byte_offset(&self, col_idx: usize) -> u8 {
         debug_assert!(self.is_pk_col(col_idx), "pk_byte_offset: col_idx must be a pk column");
         let mut off: u16 = 0;
         for (_, pk_ci, c) in self.pk_columns() {
@@ -1104,7 +1104,7 @@ pub(crate) fn index_opk_prefix(
 /// the blob data and write the new offset in.
 /// Returns (dest_struct, is_long_string).
 #[inline]
-pub(crate) fn prep_german_string_copy(src: &[u8]) -> ([u8; 16], bool) {
+fn prep_german_string_copy(src: &[u8]) -> ([u8; 16], bool) {
     debug_assert!(src.len() >= 16, "prep_german_string_copy: src must be a 16-byte German string struct");
     let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
     let mut dest = [0u8; 16];

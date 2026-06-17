@@ -3,7 +3,7 @@ use crate::foundation::xxh;
 const BITS_PER_KEY: usize = 10;
 const NUM_PROBES: usize = 7;
 
-pub struct BloomFilter {
+pub(crate) struct BloomFilter {
     bits: Vec<u8>,
     num_bits: u64,
 }

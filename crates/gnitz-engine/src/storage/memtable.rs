@@ -159,7 +159,7 @@ impl MemTable {
     }
 
     #[cfg(test)]
-    pub fn total_row_count(&self) -> usize {
+    pub(crate) fn total_row_count(&self) -> usize {
         self.total_row_count
     }
 

@@ -3372,7 +3372,7 @@ fn build_check_batch_with<K>(
         }
         _ => Batch::with_schema(*schema, keys.len()),
     };
-    let null_word: u64 = crate::ops::util::all_payload_null_mask(npc);
+    let null_word: u64 = crate::ops::all_payload_null_mask(npc);
     for key in keys {
         batch.ensure_row_capacity();
         push_pk(&mut batch, key);

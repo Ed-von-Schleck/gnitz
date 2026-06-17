@@ -166,7 +166,7 @@ impl W2mRingHeader {
     #[inline]
     pub fn consume_cursor(&self) -> &AtomicU64 { &self.consume_cursor }
     #[cfg(test)]
-    pub fn advance_read_cursors(&self, new_rc: u64) {
+    pub(crate) fn advance_read_cursors(&self, new_rc: u64) {
         self.read_cursor().store(new_rc, Ordering::Release);
         self.consume_cursor().store(new_rc, Ordering::Release);
     }
@@ -188,7 +188,7 @@ impl W2mRingHeader {
     pub fn capacity(&self) -> u64 { self.capacity }
     #[cfg(test)]
     #[inline]
-    pub fn writer_wrap_count(&self) -> u64 {
+    pub(crate) fn writer_wrap_count(&self) -> u64 {
         self.writer_wrap_count.load(Ordering::Relaxed)
     }
 }
@@ -267,7 +267,7 @@ fn room_for(vwc: u64, vrc: u64, total: u64, cap: u64) -> bool {
 
 /// Outcome of `try_publish`.
 #[cfg(test)]
-pub enum TryPublish {
+pub(crate) enum TryPublish {
     /// Published successfully; the new (virtual) write cursor is returned.
     Ok(u64),
     /// No contiguous room before `capacity` and no room to wrap without
@@ -335,7 +335,7 @@ pub(crate) enum TryReserve {
 /// (which is the same pointer reinterpreted as `*mut u8`). The caller
 /// must be the sole producer on this ring.
 #[cfg(test)]
-pub unsafe fn try_publish(
+pub(crate) unsafe fn try_publish(
     hdr: &W2mRingHeader,
     data_base: *mut u8,
     sz: usize,

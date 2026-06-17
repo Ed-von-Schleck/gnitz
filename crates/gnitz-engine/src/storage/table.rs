@@ -734,37 +734,37 @@ impl Table {
 
     /// Borrow the current memtable runs (for PartitionedTable cursor
     /// gathering).  See `MemTable::snapshot_runs` for lifetime rules.
-    pub fn snapshot_runs(&self) -> &[Rc<Batch>] {
+    pub(crate) fn snapshot_runs(&self) -> &[Rc<Batch>] {
         self.memtable.snapshot_runs()
     }
 
     /// Borrow the non-durable in-memory flush runs (for PartitionedTable cursor
     /// gathering). Empty for every durable table.
-    pub fn in_memory_runs(&self) -> &[Rc<Batch>] {
+    pub(crate) fn in_memory_runs(&self) -> &[Rc<Batch>] {
         &self.in_memory_l0
     }
 
     /// Get all shard Rcs (for PartitionedTable cursor gathering).
-    pub fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
+    pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
         self.shard_index.all_shard_arcs()
     }
 
     /// Test helper: returns true when the memtable has no rows.
     #[cfg(test)]
-    pub fn memtable_is_empty(&self) -> bool {
+    pub(crate) fn memtable_is_empty(&self) -> bool {
         self.memtable.is_empty()
     }
 
     /// Test helper: shrink the per-table heap ceiling so spill paths can be
     /// exercised without ingesting megabytes.
     #[cfg(test)]
-    pub fn set_inmem_ceiling_for_test(&mut self, bytes: usize) {
+    pub(crate) fn set_inmem_ceiling_for_test(&mut self, bytes: usize) {
         self.inmem_ceiling_override = Some(bytes);
     }
 
     /// Test helper: upsert a consolidated batch directly into the memtable (no WAL).
     #[cfg(test)]
-    pub fn memtable_upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
+    pub(crate) fn memtable_upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
         self.cached_full_scan = None;
         self.memtable.upsert_sorted_batch(batch)
     }
@@ -817,7 +817,7 @@ impl Table {
     /// keys on verbatim OPK bytes via `retract_pk_bytes`, so this native entry
     /// point has no production caller and is retained only for unit tests.
     #[cfg(test)]
-    pub fn retract_pk(&mut self, key: u128) -> (i64, bool) {
+    pub(crate) fn retract_pk(&mut self, key: u128) -> (i64, bool) {
         let (opk, n) = columnar::opk_key(&self.schema, key);
         self.retract_pk_bytes(&opk[..n])
     }

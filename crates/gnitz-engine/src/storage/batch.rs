@@ -735,7 +735,7 @@ impl Batch {
     /// column in `pk_columns()` order. Use for signed or compound PK test
     /// tables where `extend_pk` (no sign flip) writes incorrect OPK bytes.
     #[cfg(test)]
-    pub fn extend_pk_opk(&mut self, schema: &SchemaDescriptor, native_col_vals: &[u128]) {
+    pub(crate) fn extend_pk_opk(&mut self, schema: &SchemaDescriptor, native_col_vals: &[u128]) {
         self.extend_pk_bytes(&crate::test_support::opk_pk(schema, native_col_vals));
     }
 
@@ -745,7 +745,7 @@ impl Batch {
     /// Test-only: production reindex paths write OPK via `set_pk_at_bytes`.
     #[cfg(test)]
     #[inline]
-    pub fn set_pk_at(&mut self, row: usize, pk: u128) {
+    pub(crate) fn set_pk_at(&mut self, row: usize, pk: u128) {
         let stride = self.strides[REG_PK] as usize;
         if stride > 16 {
             panic!("set_pk_at: wide region; use set_pk_at_bytes");
@@ -774,7 +774,7 @@ impl Batch {
     /// test); production reads PK regions as OPK bytes via `get_pk_bytes`.
     #[cfg(test)]
     #[inline]
-    pub fn pk_iter(&self) -> impl Iterator<Item = u128> + '_ {
+    pub(crate) fn pk_iter(&self) -> impl Iterator<Item = u128> + '_ {
         (0..self.count).map(|row| self.get_pk(row))
     }
 
@@ -1301,7 +1301,7 @@ impl Batch {
     /// verbatim OPK bytes (`append_row_from_source_bytes`), so this native entry
     /// point has no production caller and is retained only for unit tests.
     #[cfg(test)]
-    pub fn append_row_from_source<S: ColumnarSource>(
+    pub(crate) fn append_row_from_source<S: ColumnarSource>(
         &mut self,
         key: u128,
         weight: i64,

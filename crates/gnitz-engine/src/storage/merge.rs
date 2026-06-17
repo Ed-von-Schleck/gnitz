@@ -124,7 +124,7 @@ impl Drop for BlobCacheGuard {
 /// `merge_batches` requires `&[SortedMemBatch]` so the compiler enforces that
 /// only certified-sorted inputs reach the N-way merge.
 #[repr(transparent)]
-pub struct SortedMemBatch<'a>(MemBatch<'a>);
+pub(crate) struct SortedMemBatch<'a>(MemBatch<'a>);
 
 impl<'a> SortedMemBatch<'a> {
     /// Wrap `mb` asserting it is already sorted by (PK, payload).
@@ -258,7 +258,7 @@ impl<'a> ColumnarSource for MemBatch<'a> {
 // MemBatchCursor: position within a MemBatch
 // ---------------------------------------------------------------------------
 
-pub struct MemBatchCursor {
+pub(crate) struct MemBatchCursor {
     pub position: usize,
     pub count: usize,
 }
@@ -411,7 +411,7 @@ pub(crate) use crate::schema::key::{pack_pk_be, pk_sort_key};
 ///
 /// The `SortedMemBatch` parameter enforces at the call site that every input
 /// is certified sorted by (PK, payload).
-pub fn merge_batches(
+pub(crate) fn merge_batches(
     batches: &[SortedMemBatch],
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
@@ -531,7 +531,7 @@ fn merge_batches_inner<L, SP, EQ>(
 /// Sort a single batch by (PK, payload) and consolidate: sum weights for
 /// identical (PK, payload) rows, drop ghosts (net weight == 0).
 ///
-pub fn sort_and_consolidate(
+pub(crate) fn sort_and_consolidate(
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
@@ -576,7 +576,7 @@ fn sort_consolidate_inner<RowCmp>(
 
 /// Weight-fold an already-sorted batch: sum weights for identical (PK, payload)
 /// rows and drop ghosts (net weight == 0). Caller must guarantee sorted input.
-pub fn fold_sorted(
+pub(crate) fn fold_sorted(
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,

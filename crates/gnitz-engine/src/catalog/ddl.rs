@@ -9,7 +9,7 @@ impl CatalogEngine {
     // wire (`ingest_to_family`), never through these wrappers. `#[cfg(test)]`
     // keeps them absent from production builds.
     #[cfg(test)]
-    pub fn create_schema(&mut self, name: &str) -> Result<(), String> {
+    pub(crate) fn create_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
         if self.caches.schema_by_name.contains_key(name) {
             return Err(format!("Schema already exists: {name}"));
@@ -34,7 +34,7 @@ impl CatalogEngine {
     /// Drop a schema and every table, view, and index it contains
     /// (PostgreSQL's `DROP SCHEMA ... CASCADE` semantics).
     #[cfg(test)]
-    pub fn drop_schema(&mut self, name: &str) -> Result<(), String> {
+    pub(crate) fn drop_schema(&mut self, name: &str) -> Result<(), String> {
         validate_user_identifier(name)?;
         if !self.caches.schema_by_name.contains_key(name) {
             return Err("Schema does not exist".into());
@@ -206,7 +206,7 @@ impl CatalogEngine {
     }
 
     #[cfg(test)]
-    pub fn drop_table(&mut self, qualified_name: &str) -> Result<(), String> {
+    pub(crate) fn drop_table(&mut self, qualified_name: &str) -> Result<(), String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
         validate_user_identifier(schema_name)?;
         validate_user_identifier(table_name)?;
@@ -226,7 +226,7 @@ impl CatalogEngine {
     // -- DDL: CREATE/DROP VIEW ---------------------------------------------
 
     #[cfg(test)]
-    pub fn drop_view(&mut self, qualified_name: &str) -> Result<(), String> {
+    pub(crate) fn drop_view(&mut self, qualified_name: &str) -> Result<(), String> {
         let (schema_name, view_name) = parse_qualified_name(qualified_name, "public");
         let qualified = format!("{schema_name}.{view_name}");
         let vid = *self.caches.entity_by_qname.get(&qualified)
@@ -250,7 +250,7 @@ impl CatalogEngine {
     // -- DDL: CREATE/DROP INDEX --------------------------------------------
 
     #[cfg(test)]
-    pub fn create_index(
+    pub(crate) fn create_index(
         &mut self,
         qualified_owner: &str,
         col_names: &[&str],
@@ -341,7 +341,7 @@ impl CatalogEngine {
     }
 
     #[cfg(test)]
-    pub fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
+    pub(crate) fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
         if index_name.contains(FK_INDEX_INFIX) {
             return Err("Forbidden: cannot drop internal FK index".into());
         }

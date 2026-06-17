@@ -426,7 +426,7 @@ pub fn wire_size(
 /// Encode a full IPC wire message. Returns heap-allocated Vec<u8>.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub fn encode_wire(
+pub(crate) fn encode_wire(
     target_id: u64,
     client_id: u64,
     flags: u64,
@@ -1022,7 +1022,7 @@ fn decode_wire_impl(
 /// continuation frames via `decode_wire_ipc_zero_copy_with_ctrl` to avoid
 /// the owned `Batch` allocation.
 #[cfg(test)]
-pub fn decode_wire_ipc_with_schema<'a>(
+pub(crate) fn decode_wire_ipc_with_schema<'a>(
     data: &[u8],
     hint: SchemaWithVersion<'a>,
 ) -> Result<DecodedWire, &'static str> {

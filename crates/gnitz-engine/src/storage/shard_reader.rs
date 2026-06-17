@@ -9,7 +9,7 @@ use std::ptr;
 use xorf::Xor8;
 
 use crate::foundation::posix_io;
-use crate::layout::*;
+use super::layout::*;
 use crate::foundation::codec::{read_u64_le, read_i64_le};
 use crate::foundation::xxh;
 use super::error::StorageError;
@@ -340,7 +340,7 @@ impl MappedShard {
     // (`get_pk_bytes`); only tests recover the native value via `get_pk`.
     #[cfg(test)]
     #[inline(always)]
-    pub fn get_pk(&self, row: usize) -> u128 {
+    pub(crate) fn get_pk(&self, row: usize) -> u128 {
         let stride = self.pk_stride as usize;
         let data = self.data();
         match &self.pk {
@@ -495,7 +495,7 @@ impl MappedShard {
     /// production path): binary search for the first row where PK >= key.
     /// Returns `count` if no such row exists.
     #[cfg(test)]
-    pub fn find_lower_bound(&self, key: u128) -> usize {
+    pub(crate) fn find_lower_bound(&self, key: u128) -> usize {
         let mut lo = 0usize;
         let mut hi = self.count;
         while lo < hi {
@@ -528,7 +528,7 @@ impl MappedShard {
     /// Test-only u128 oracle (exact-match point lookup) cross-checking the
     /// production byte path. Returns the row index, or `None` if absent.
     #[cfg(test)]
-    pub fn find_row_index(&self, key: u128) -> Option<usize> {
+    pub(crate) fn find_row_index(&self, key: u128) -> Option<usize> {
         let idx = self.find_lower_bound(key);
         if idx < self.count && self.get_pk(idx) == key {
             Some(idx)
@@ -1438,7 +1438,7 @@ mod tests {
         // Patch the PK directory entry (index 0) encoding byte to CONSTANT.
         let mut data = std::fs::read(&path).unwrap();
         let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
-        data[dir_off + 24] = crate::layout::ENCODING_CONSTANT;
+        data[dir_off + 24] = ENCODING_CONSTANT;
         std::fs::write(&path, &data).unwrap();
 
         assert_eq!(

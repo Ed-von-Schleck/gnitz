@@ -481,7 +481,7 @@ impl Reactor {
     /// Drive `fut` to completion. Single-threaded, blocking. Spawns the
     /// future as a task internally and returns its output via a shared cell.
     #[cfg(test)]
-    pub fn block_on<F, T>(&self, fut: F) -> T
+    pub(super) fn block_on<F, T>(&self, fut: F) -> T
     where
         F: Future<Output = T> + 'static,
         T: 'static,
@@ -708,7 +708,7 @@ impl Reactor {
     }
 
     #[cfg(test)]
-    pub fn block_on_fsync(&self, id: u64) -> i32 {
+    pub(super) fn block_on_fsync(&self, id: u64) -> i32 {
         loop {
             if let Some(rc) = self.inner.parked_fsync_results.borrow_mut().remove(&id) {
                 return rc;
@@ -912,7 +912,7 @@ impl Reactor {
 
     /// Drive the reactor until the task slab is empty. Blocks.
     #[cfg(test)]
-    pub fn block_until_idle(&self) {
+    pub(super) fn block_until_idle(&self) {
         while !self.inner.tasks.borrow().is_empty() {
             self.tick(true);
         }
@@ -927,13 +927,13 @@ impl Reactor {
 
     /// True while at least one task is alive in the slab.
     #[cfg(test)]
-    pub fn has_pending_tasks(&self) -> bool {
+    pub(super) fn has_pending_tasks(&self) -> bool {
         !self.inner.tasks.borrow().is_empty()
     }
 
     /// Drive ready tasks and process CQEs without blocking.
     #[cfg(test)]
-    pub fn poll_nonblocking(&self) {
+    pub(super) fn poll_nonblocking(&self) {
         self.tick(false);
     }
 
@@ -1471,7 +1471,7 @@ impl Reactor {
     /// with `rc` as the CQE `res`. Dispatched on the next `tick` (or via
     /// `drain_injected_cqes`).
     #[cfg(test)]
-    pub fn inject_cqe(&self, kind: u64, id: u64, rc: i32) {
+    pub(super) fn inject_cqe(&self, kind: u64, id: u64, rc: i32) {
         self.inner.injected_cqes.borrow_mut().push_back(Cqe {
             user_data: udata(kind, id),
             res: rc,
@@ -1482,7 +1482,7 @@ impl Reactor {
     /// Test-only: park a synthetic `DecodedWire` for `req_id` and wake
     /// any matching awaiter.
     #[cfg(test)]
-    pub fn inject_parked_reply(&self, req_id: u64, decoded: DecodedWire) {
+    pub(super) fn inject_parked_reply(&self, req_id: u64, decoded: DecodedWire) {
         self.inner.parked_replies.borrow_mut().insert(req_id, decoded);
         if let Some(waker) = self.inner.reply_wakers.borrow_mut().remove(&req_id) {
             waker.wake();
@@ -1492,24 +1492,24 @@ impl Reactor {
     /// Test-only: size the exchange accumulator so `route_reply` can
     /// be driven directly.
     #[cfg(test)]
-    pub fn test_init_state(&self, num_workers: usize) {
+    pub(super) fn test_init_state(&self, num_workers: usize) {
         *self.inner.exchange_acc.borrow_mut() = ExchangeAccumulator::new(num_workers);
     }
 
     /// Test-only: drive `route_reply` with a synthetic decoded wire.
     #[cfg(test)]
-    pub fn test_route_reply(&self, w: usize, decoded: DecodedWire) {
+    pub(super) fn test_route_reply(&self, w: usize, decoded: DecodedWire) {
         self.route_reply(w, decoded)
     }
 
     /// Test-only: drive `route_scan_slot` with a real slot.
     #[cfg(test)]
-    pub fn test_route_scan_slot(&self, slot: W2mSlot) {
+    pub(super) fn test_route_scan_slot(&self, slot: W2mSlot) {
         self.route_scan_slot(slot);
     }
 
     #[cfg(test)]
-    pub fn task_count(&self) -> usize {
+    pub(super) fn task_count(&self) -> usize {
         self.inner.tasks.borrow().len()
     }
 }

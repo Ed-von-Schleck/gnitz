@@ -3,7 +3,6 @@ compile_error!("GnitzDB requires a little-endian target; the wire format is LE-o
 
 #[macro_use]
 mod foundation;
-mod layout;
 mod schema;
 mod storage;
 mod expr;
@@ -57,7 +56,7 @@ fn parse_level(s: &str) -> u32 {
 /// write path rejects groups wider than `MAX_WORKERS` — so reject them at the
 /// boundary with a clear message instead of crashing later.
 fn parse_workers(val: &str) -> Result<u32, String> {
-    const MAX: u32 = runtime::sal::MAX_WORKERS as u32;
+    const MAX: u32 = runtime::MAX_WORKERS as u32;
     match val.parse::<u32>() {
         Ok(n) if (1..=MAX).contains(&n) => Ok(n),
         Ok(n) => Err(format!("--workers must be between 1 and {MAX} (got {n})")),
@@ -118,7 +117,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::parse_workers;
-    use super::runtime::sal::MAX_WORKERS;
+    use super::runtime::MAX_WORKERS;
 
     #[test]
     fn parse_workers_accepts_valid_range() {

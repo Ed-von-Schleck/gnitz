@@ -9,7 +9,7 @@ use std::ptr;
 
 use libc::c_int;
 
-use crate::layout::*;
+use super::layout::*;
 use crate::foundation::codec::write_u64_le;
 use super::error::StorageError;
 use super::xor8;
@@ -88,7 +88,7 @@ impl PkUniqueChecker {
     /// Returns `SHARD_FLAG_PK_UNIQUE` when `enabled` and the observed stream
     /// was unique, otherwise 0. Convenience for flush and compaction callers.
     pub fn flags_if(&self, enabled: bool) -> u8 {
-        use crate::layout::SHARD_FLAG_PK_UNIQUE;
+        use super::layout::SHARD_FLAG_PK_UNIQUE;
         if enabled && self.qualifies { SHARD_FLAG_PK_UNIQUE } else { 0 }
     }
 }
@@ -214,7 +214,7 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Optio
 ///
 /// Returns the complete file image ready for writing.
 #[cfg(test)]
-pub fn build_shard_image(
+pub(crate) fn build_shard_image(
     table_id: u32,
     row_count: u32,
     regions: &[(*const u8, usize)],
@@ -633,7 +633,7 @@ fn write_shard_streaming_inner(
 /// `dirfd`: directory fd for openat/renameat.  Use `libc::AT_FDCWD` (-100)
 /// for absolute paths.
 #[cfg(test)]
-pub fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool) -> Result<(), StorageError> {
+pub(crate) fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool) -> Result<(), StorageError> {
     let tmp_name = super::cstr_with_tmp_suffix(basename)?;
 
     unsafe {
@@ -1005,7 +1005,7 @@ mod tests {
         }
     }
 
-    const FLAG: u8 = crate::layout::SHARD_FLAG_PK_UNIQUE;
+    const FLAG: u8 = SHARD_FLAG_PK_UNIQUE;
 
     /// `flags_if(true)` after observing the given OPK byte rows in order.
     fn tag(rows: &[(&[u8], i64)]) -> u8 {

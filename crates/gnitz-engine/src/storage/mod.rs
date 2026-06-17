@@ -20,6 +20,7 @@ mod batch_wire;
 mod memtable;
 mod read_cursor;
 mod range_key;
+mod layout;
 mod table;
 mod partitioned_table;
 pub(crate) mod batch_pool;

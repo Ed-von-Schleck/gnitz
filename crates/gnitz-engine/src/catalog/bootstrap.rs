@@ -394,7 +394,7 @@ impl CatalogEngine {
     /// Graceful close for tests; the server never closes the catalog (it
     /// flushes durably per zone and exits via abort or process teardown).
     #[cfg(test)]
-    pub fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         // Flush and close all user tables before clearing DagEngine.
         // System tables hold Borrowed handles and are flushed below.
         for entry in self.dag.tables.values_mut() {

@@ -21,7 +21,7 @@ use crate::foundation::codec::{read_u32_le, read_u64_le};
 // ColumnarSource trait
 // ---------------------------------------------------------------------------
 
-pub trait ColumnarSource {
+pub(crate) trait ColumnarSource {
     fn get_null_word(&self, row: usize) -> u64;
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8];
     fn blob_slice(&self) -> &[u8];
@@ -36,7 +36,7 @@ pub trait ColumnarSource {
 /// This is the canonical implementation with the hoisted null_word optimisation:
 /// null words are read once per row outside the column loop.
 #[inline]
-pub fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
+pub(crate) fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
     schema: &SchemaDescriptor,
     src_a: &A,
     row_a: usize,
@@ -232,7 +232,7 @@ pub(crate) use with_pk_ord;
 /// to a higher-ranked bound the `|i| self.get_pk_bytes(i)` closures (result
 /// borrows `self`) cannot satisfy.
 #[inline]
-pub fn binary_lower_bound<'a>(
+pub(crate) fn binary_lower_bound<'a>(
     mut lo: usize, mut hi: usize, key: &[u8], get: &impl Fn(usize) -> &'a [u8],
 ) -> usize {
     while lo < hi {
@@ -251,7 +251,7 @@ pub fn binary_lower_bound<'a>(
 /// stale hint forfeits only the speedup, at the cost of at most two extra
 /// comparisons.
 #[inline]
-pub fn gallop_lower_bound_bytes<'a>(
+pub(crate) fn gallop_lower_bound_bytes<'a>(
     count: usize, key: &[u8], hint: usize, get: impl Fn(usize) -> &'a [u8],
 ) -> usize {
     let h = hint.min(count);

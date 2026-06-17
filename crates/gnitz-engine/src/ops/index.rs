@@ -8,17 +8,22 @@ use crate::storage::Batch;
 // ---------------------------------------------------------------------------
 
 /// GI/AVI descriptor for integrate_with_indexes.
+///
+/// The `table` raw pointer is `pub(crate)` rather than `pub`: it is a bare
+/// `*mut Table` whose access is constrained to crate-internal call sites
+/// (the compiler emits the desc in `vm`, `op_integrate_with_indexes` consumes
+/// it) — never a cross-boundary handle.
 pub struct GiDesc {
-    pub table: *mut crate::storage::Table,
-    pub col_idx: u32,
+    pub(crate) table: *mut crate::storage::Table,
+    pub(crate) col_idx: u32,
 }
 
 pub struct AviDesc {
-    pub table: *mut crate::storage::Table,
-    pub for_max: bool,
-    pub agg_col_type_code: u8,
-    pub group_by_cols: Vec<u32>,
-    pub agg_col_idx: u32,
+    pub(crate) table: *mut crate::storage::Table,
+    pub(crate) for_max: bool,
+    pub(crate) agg_col_type_code: u8,
+    pub(crate) group_by_cols: Vec<u32>,
+    pub(crate) agg_col_idx: u32,
 }
 
 /// Width of the GI key's leading `gc` (group-code) prefix: a single U64. The

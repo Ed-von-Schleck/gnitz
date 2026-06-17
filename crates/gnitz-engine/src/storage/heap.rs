@@ -26,7 +26,7 @@
 //! and compact peel the root one at a time.
 
 #[derive(Clone, Copy)]
-pub struct HeapNode {
+pub(crate) struct HeapNode {
     /// `u32` (not `usize`): sources are `u32`-bounded and rows-per-source
     /// `< 2^32` (asserted at tree build), so the node is 8 bytes — a single
     /// register swap in `walk_up`. Indexes into the caller's `usize`-typed
@@ -42,7 +42,7 @@ const SENTINEL: u32 = u32::MAX;
 
 const SENTINEL_NODE: HeapNode = HeapNode { source_idx: SENTINEL, row: 0 };
 
-pub struct LoserTree {
+pub(crate) struct LoserTree {
     /// `tree[0]` is the overall champion. `tree[1..tree.len()]` hold the
     /// loser of each internal node's most recent match. A loser of
     /// `SENTINEL` means the subtree has no real player on one side
@@ -228,7 +228,7 @@ impl LoserTree {
 /// constant `Break(())`. Forced inlining lets LLVM evaluate the branch
 /// at compile time and DCE the unused arm in each monomorphisation.
 #[inline(always)]
-pub fn drive_merge<ADV, SP, EQ, W, EM>(
+pub(crate) fn drive_merge<ADV, SP, EQ, W, EM>(
     heap: &mut LoserTree,
     less: impl Fn(&HeapNode, &HeapNode) -> bool,
     mut advance: ADV,

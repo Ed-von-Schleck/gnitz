@@ -66,7 +66,7 @@ struct Rewrites {
 }
 
 /// External table handle + schema.
-pub struct ExternalTable {
+pub(crate) struct ExternalTable {
     pub table_id: i64,
     pub schema: SchemaDescriptor,
 }
@@ -81,7 +81,7 @@ pub struct ExternalTable {
 /// binary set-op, and (c) the post-combine phase (single- and two-exchange
 /// views). All three are structurally identical; the difference is only which
 /// part of the plan graph they cover.
-pub struct SubPlan {
+pub(crate) struct SubPlan {
     pub vm: Box<VmHandle>,
     pub num_regs: u32,
     pub in_reg: u16,
@@ -96,7 +96,7 @@ pub struct SubPlan {
 /// EXCEPT / INTERSECT) which repartition **two** `HashRow`-reindexed inputs.
 /// Side A reuses [`CompileOutput::pre`]; this struct carries the parallel
 /// right-hand sub-pipeline.
-pub struct SideBPlan {
+pub(crate) struct SideBPlan {
     pub plan: SubPlan,
     pub exchange_schema: SchemaDescriptor,
     /// Register in the post VM seeded with this side's relayed/exchanged batch.
@@ -115,7 +115,7 @@ pub struct SideBPlan {
 /// * **Two exchanges** (binary set-ops, `side_b.is_some()`): `pre` is side A,
 ///   `side_b` is side B; each is exchanged independently, then `post` runs
 ///   the combine over both relayed inputs.
-pub struct CompileOutput {
+pub(crate) struct CompileOutput {
     pub pre: SubPlan,
     /// Post-combine phase; `None` for views with no exchange.
     /// `SubPlan::in_reg` is the seed register for the relayed batch.
@@ -137,7 +137,7 @@ pub struct CompileOutput {
 // ---------------------------------------------------------------------------
 
 /// Read an i64 value from a cursor's current row at the given column index.
-pub fn cursor_read_i64(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> i64 {
+pub(crate) fn cursor_read_i64(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> i64 {
     let col_size = schema.columns[col_idx].size() as usize;
     let ptr = cursor.col_ptr(col_idx, col_size);
     if ptr.is_null() {
@@ -1032,7 +1032,7 @@ fn avi_group_key_eligible(schema: &SchemaDescriptor, gcols: &[u32]) -> bool {
         }
         stride += col.size() as usize;
     }
-    let key_bytes = stride + crate::ops::util::AVI_AV_BYTES;
+    let key_bytes = stride + crate::ops::AVI_AV_BYTES;
     key_bytes <= crate::schema::MAX_PK_BYTES
 }
 
@@ -1811,7 +1811,7 @@ fn emit_reduce(
             // `state.scratch_dirs`, and `remove_dir_all` is recursive.
             let gi_dir = format!("{}/_gidx", child_scratch_dir(view_dir, &tr_in_name));
             if let Ok(gi_table) = Table::new(
-                &gi_dir, "_gidx", crate::ops::index::make_gi_schema(&in_reg_schema), 0, 1024 * 1024, Persistence::Ephemeral,
+                &gi_dir, "_gidx", crate::ops::make_gi_schema(&in_reg_schema), 0, 1024 * 1024, Persistence::Ephemeral,
             ) {
                 let idx = owned_tables.len();
                 owned_tables.push(Box::new(gi_table));
@@ -1835,7 +1835,7 @@ fn emit_reduce(
         let avi_child = format!("_avidx_{view_id}_{nid}");
         if let Ok(av_table) = create_child_table(
             state, view_dir, &avi_child,
-            crate::ops::index::make_avi_schema(&in_reg_schema, &gcols_u32),
+            crate::ops::make_avi_schema(&in_reg_schema, &gcols_u32),
             view_table_id,
         ) {
             let idx = owned_tables.len();
@@ -2287,7 +2287,7 @@ fn source_reg_map_u16(m: &HashMap<i64, i32>) -> HashMap<i64, u16> {
 /// # Safety
 /// All table handles must be valid pointers or null.
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn compile_view(
+pub(crate) unsafe fn compile_view(
     view_id: u64,
     sys_nodes: *mut Table,
     sys_edges: *mut Table,

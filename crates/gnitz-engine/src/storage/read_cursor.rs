@@ -1549,7 +1549,7 @@ impl ReadCursor {
 ///
 /// Both inputs are passed by `Rc`, so the cursor owns its data and has no
 /// borrow lifetime — see the `CursorSource` doc comment.
-pub fn create_read_cursor(
+pub(crate) fn create_read_cursor(
     batches: &[Rc<Batch>],
     shard_arcs: &[Rc<MappedShard>],
     schema: SchemaDescriptor,
@@ -1597,7 +1597,7 @@ impl CursorHandle {
     ///
     /// Convenience wrapper used by test code.
     #[cfg(test)]
-    pub fn from_owned(
+    pub(crate) fn from_owned(
         snapshots: &[Rc<Batch>],
         schema: crate::schema::SchemaDescriptor,
     ) -> CursorHandle {
@@ -1615,7 +1615,7 @@ impl CursorHandle {
 /// Each snapshot's `Rc<Batch>` and shard's `Rc<MappedShard>` is cloned into
 /// the corresponding `CursorSource` entry, keeping the data alive for the
 /// cursor's entire lifetime without any unsafe lifetime extension.
-pub fn create_cursor_from_snapshots(
+pub(crate) fn create_cursor_from_snapshots(
     snapshots: &[Rc<Batch>],
     shard_arcs: &[Rc<MappedShard>],
     schema: SchemaDescriptor,

@@ -240,7 +240,7 @@ impl PartitionedTable {
     /// the wrong partition. The sole caller is the test-only lone-PK FK existence
     /// check (passes a native value); all DML retraction routes through `_bytes`.
     #[cfg(test)]
-    pub fn has_pk(&mut self, key: u128) -> bool {
+    pub(crate) fn has_pk(&mut self, key: u128) -> bool {
         let (opk, n) = columnar::opk_key(&self.schema, key);
         self.has_pk_bytes(&opk[..n])
     }

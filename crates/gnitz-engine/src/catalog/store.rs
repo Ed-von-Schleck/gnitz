@@ -505,7 +505,7 @@ impl CatalogEngine {
     /// Physically remove the directories queued by table/view/index drop
     /// hooks. The executor calls this only after the DDL zone's fdatasync
     /// confirms the drop is durable — see `pending_dir_deletions`.
-    pub fn drain_pending_dir_deletions(&mut self) {
+    pub(crate) fn drain_pending_dir_deletions(&mut self) {
         Self::remove_queued_dirs(std::mem::take(&mut self.pending_dir_deletions));
     }
 
@@ -552,7 +552,7 @@ impl CatalogEngine {
     /// Clearing it here lets the recreating hook reclaim that residue before the
     /// boot-time `gc_orphan_directories` drain (or any later checkpoint) can
     /// `remove_dir_all` the live schema and the tables beneath it.
-    pub fn cancel_gated_deletion(&mut self, dir: &str) {
+    pub(crate) fn cancel_gated_deletion(&mut self, dir: &str) {
         self.checkpoint_gated_deletions.retain(|d| d != dir);
         self.pending_dir_deletions.retain(|d| d != dir);
     }
@@ -1210,7 +1210,7 @@ impl CatalogEngine {
     }
 
     /// Raw store ingest: SAL recovery path — no unique_pk, no hooks, no index projection.
-    pub fn raw_store_ingest(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
+    pub(crate) fn raw_store_ingest(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         let entry = self.dag.tables.get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
         let _ = entry.handle.ingest_owned_batch(batch);
@@ -1360,7 +1360,7 @@ impl CatalogEngine {
     /// consumers go through `unique_index_circuit_cols` / `index_circuit_for_cols`;
     /// only the catalog tests enumerate raw circuit info.
     #[cfg(test)]
-    pub fn get_index_circuit_info(&self, table_id: i64, idx: usize)
+    pub(crate) fn get_index_circuit_info(&self, table_id: i64, idx: usize)
         -> Option<(PkColList, bool)>
     {
         let entry = self.dag.tables.get(&table_id)?;
@@ -1379,7 +1379,7 @@ impl CatalogEngine {
 
     /// Get index store handle for an exact column list (for worker has_pk via
     /// a unique index, single- or multi-column).
-    pub fn get_index_store_handle(&self, table_id: i64, cols: &[u32]) -> *const Table {
+    pub(crate) fn get_index_store_handle(&self, table_id: i64, cols: &[u32]) -> *const Table {
         self.dag.tables.get(&table_id)
             .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
             .map(|ic| ic.table_mut() as *const Table)
@@ -1530,7 +1530,7 @@ impl CatalogEngine {
     // -- Store handle accessors -----------------------------------------------
 
     /// Get raw PartitionedTable handle for a user table.
-    pub fn get_ptable_handle(&self, table_id: i64) -> Option<*mut PartitionedTable> {
+    pub(crate) fn get_ptable_handle(&self, table_id: i64) -> Option<*mut PartitionedTable> {
         self.dag.tables.get(&table_id).and_then(|e| {
             match &e.handle {
                 StoreHandle::Partitioned(cell) => Some(unsafe { &mut **cell.get() as *mut PartitionedTable }),
@@ -1549,7 +1549,7 @@ impl CatalogEngine {
     }
 
     /// Get a raw mutable pointer to the DagEngine.
-    pub fn get_dag_ptr(&mut self) -> *mut DagEngine {
+    pub(crate) fn get_dag_ptr(&mut self) -> *mut DagEngine {
         &mut self.dag as *mut DagEngine
     }
 
@@ -1566,7 +1566,7 @@ impl CatalogEngine {
     /// Get max flushed LSN for a table. Recovery itself reads the bulk map
     /// from `collect_all_flushed_lsns`; this single-table form is test-only.
     #[cfg(test)]
-    pub fn get_max_flushed_lsn(&self, table_id: i64) -> u64 {
+    pub(crate) fn get_max_flushed_lsn(&self, table_id: i64) -> u64 {
         if table_id > 0 && table_id < FIRST_USER_TABLE_ID {
             return self.sys_table_current_lsn(table_id);
         }
@@ -1740,27 +1740,27 @@ impl CatalogEngine {
     // The following registry getters are exercised only by the catalog tests;
     // production code reads the caches/DAG entries directly.
     #[cfg(test)]
-    pub fn get_schema(&self, table_id: i64) -> Option<SchemaDescriptor> {
+    pub(crate) fn get_schema(&self, table_id: i64) -> Option<SchemaDescriptor> {
         self.dag.tables.get(&table_id).map(|e| e.schema)
     }
 
     #[cfg(test)]
-    pub fn get_schema_name_by_id(&self, schema_id: i64) -> &str {
+    pub(crate) fn get_schema_name_by_id(&self, schema_id: i64) -> &str {
         self.caches.schema_by_id.get(&schema_id).map(|s| s.as_str()).unwrap_or("")
     }
 
     #[cfg(test)]
-    pub fn has_schema(&self, name: &str) -> bool {
+    pub(crate) fn has_schema(&self, name: &str) -> bool {
         self.caches.schema_by_name.contains_key(name)
     }
 
     #[cfg(test)]
-    pub fn get_schema_id(&self, name: &str) -> i64 {
+    pub(crate) fn get_schema_id(&self, name: &str) -> i64 {
         self.caches.schema_by_name.get(name).copied().unwrap_or(-1)
     }
 
     #[cfg(test)]
-    pub fn schema_is_empty(&self, schema_name: &str) -> bool {
+    pub(crate) fn schema_is_empty(&self, schema_name: &str) -> bool {
         let sid = match self.caches.schema_by_name.get(schema_name) {
             Some(&sid) => sid,
             None => return true,
@@ -1840,13 +1840,13 @@ impl CatalogEngine {
     }
 
     #[cfg(test)]
-    pub fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<i64> {
+    pub(crate) fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<i64> {
         let qualified = format!("{schema_name}.{table_name}");
         self.caches.entity_by_qname.get(&qualified).copied()
     }
 
     #[cfg(test)]
-    pub fn has_index_by_name(&self, name: &str) -> bool {
+    pub(crate) fn has_index_by_name(&self, name: &str) -> bool {
         self.caches.index_by_name.contains_key(name)
     }
 

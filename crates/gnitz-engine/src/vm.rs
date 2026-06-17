@@ -12,7 +12,7 @@ use crate::expr::ScalarFuncKind;
 // ---------------------------------------------------------------------------
 
 /// One VM instruction with all operator-specific data pre-resolved.
-pub enum Instr {
+pub(crate) enum Instr {
     Halt,
     ClearDeltas,
     Delay { src: u16, state_reg: u16, dst: u16 },
@@ -79,13 +79,13 @@ pub enum Instr {
 }
 
 /// GI descriptor embedded in an Integrate instruction.
-pub struct IntegrateGi {
+pub(crate) struct IntegrateGi {
     pub table_idx: u16,
     pub col_idx: u32,
 }
 
 /// AVI descriptor embedded in an Integrate instruction.
-pub struct IntegrateAvi {
+pub(crate) struct IntegrateAvi {
     pub table_idx: u16,
     pub for_max: bool,
     pub agg_col_type_code: u8,
@@ -98,7 +98,7 @@ pub struct IntegrateAvi {
 // ProgramBuilder — constructs a Program via incremental add_*() calls.
 // ---------------------------------------------------------------------------
 
-pub struct ProgramBuilder {
+pub(crate) struct ProgramBuilder {
     num_registers: u16,
     instructions: Vec<Instr>,
     funcs: Vec<*const ScalarFuncKind>,
@@ -428,7 +428,7 @@ impl ProgramBuilder {
     ///
     /// Used by test code — production code uses `build_with_owned`.
     #[cfg(test)]
-    pub fn build(self, reg_schemas: &[SchemaDescriptor], reg_kinds: &[u8]) -> Box<VmHandle> {
+    pub(crate) fn build(self, reg_schemas: &[SchemaDescriptor], reg_kinds: &[u8]) -> Box<VmHandle> {
         assert_eq!(reg_schemas.len(), self.num_registers as usize);
         assert_eq!(reg_kinds.len(), self.num_registers as usize);
 
@@ -536,7 +536,7 @@ impl ProgramBuilder {
 /// The compile-time assertions below are machine-checked: reordering any
 /// owned vec before `program` produces a compile error, not a use-after-free.
 #[allow(clippy::vec_box)]
-pub struct VmHandle {
+pub(crate) struct VmHandle {
     pub program: Program,
     pub regfile: RegisterFile,
     /// Cursor handles for owned trace registers, kept alive across the epoch.
@@ -619,7 +619,7 @@ impl VmHandle {
 /// Register kind: delta (transient), trace (persistent cursor + table),
 /// or delay_state (persistent batch for z⁻¹ cross-epoch storage).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RegisterKind {
+pub(crate) enum RegisterKind {
     Delta,
     Trace,
     DelayState,
@@ -627,13 +627,13 @@ pub enum RegisterKind {
 
 /// Per-register metadata.
 #[derive(Clone)]
-pub struct RegisterMeta {
+pub(crate) struct RegisterMeta {
     pub schema: SchemaDescriptor,
     pub kind: RegisterKind,
 }
 
 /// A compiled DBSP program ready for execution.
-pub struct Program {
+pub(crate) struct Program {
     pub instructions: Vec<Instr>,
     pub reg_meta: Vec<RegisterMeta>,
     /// Shared resource arrays — referenced by index from instructions.
@@ -659,7 +659,7 @@ unsafe impl Send for Program {}
 // ---------------------------------------------------------------------------
 
 /// Runtime state for one register.
-pub struct Register {
+pub(crate) struct Register {
     pub kind: RegisterKind,
     pub schema: SchemaDescriptor,
     /// Delta: current batch.  Trace: unused (empty).
@@ -669,7 +669,7 @@ pub struct Register {
 }
 
 /// Collection of registers for a single plan execution.
-pub struct RegisterFile {
+pub(crate) struct RegisterFile {
     pub registers: Vec<Register>,
 }
 
@@ -747,7 +747,7 @@ impl RegisterFile {
 ///
 /// Returns `Ok(Some(batch))` if output was produced, `Ok(None)` if empty,
 /// or `Err(rc)` on error.
-pub fn execute_epoch(
+pub(crate) fn execute_epoch(
     program: &Program,
     regfile: &mut RegisterFile,
     input_batch: Batch,
@@ -771,7 +771,7 @@ pub fn execute_epoch(
 /// `(reg, batch)` is moved into place; later seeds win on a duplicate register.
 /// Takes an iterator so the single-input `execute_epoch` (the hot per-epoch
 /// entry) seeds via `iter::once` with no heap allocation.
-pub fn execute_epoch_multi(
+pub(crate) fn execute_epoch_multi(
     program: &Program,
     regfile: &mut RegisterFile,
     inputs: impl IntoIterator<Item = (u16, Batch)>,

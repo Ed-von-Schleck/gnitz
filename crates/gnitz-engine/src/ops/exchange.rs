@@ -180,7 +180,7 @@ impl PartitionRouter {
     /// `record_routing_from_source` (`write_commit_group → record_index_routing`),
     /// which `fan_out_seek_by_index_async` reads to unicast a unique-index seek.
     #[cfg(test)]
-    pub fn record_routing(
+    pub(crate) fn record_routing(
         &mut self,
         batch: &Batch,
         schema: &SchemaDescriptor,
@@ -404,7 +404,7 @@ where
 /// Use `with_worker_indices` instead when the caller can borrow the routing table
 /// for the duration of the scatter.
 #[cfg(test)]
-pub fn compute_worker_indices(
+pub(crate) fn compute_worker_indices(
     batch: &Batch,
     col_indices: &[u32],
     schema: &SchemaDescriptor,
@@ -418,7 +418,7 @@ pub fn compute_worker_indices(
 }
 
 #[cfg(test)]
-pub fn op_repartition_batch(
+pub(super) fn op_repartition_batch(
     batch: &Batch,
     col_indices: &[u32],
     schema: &SchemaDescriptor,
@@ -788,7 +788,7 @@ fn relay_scatter_merge_walk(
 /// All sources must satisfy the consolidated invariant (sorted, no duplicate PKs).
 /// Output batches are sorted but not consolidated (duplicate PKs can appear across sources).
 #[cfg(test)]
-pub fn op_relay_scatter_consolidated(
+pub(super) fn op_relay_scatter_consolidated(
     sources: &[Option<&ConsolidatedBatch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
@@ -886,7 +886,7 @@ pub(crate) fn op_relay_broadcast(
 
 /// Scatter non-consolidated batches across workers by hashing each row.
 #[cfg(test)]
-pub fn op_relay_scatter(
+pub(super) fn op_relay_scatter(
     sources: &[Option<&Batch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
@@ -905,7 +905,7 @@ pub fn op_relay_scatter(
 /// must drive `op_repartition_batches_mode` / `op_relay_scatter_consolidated_mode`
 /// with `RouteMode::JoinPromote`, not this helper.
 #[cfg(test)]
-pub fn op_multi_scatter(
+pub(super) fn op_multi_scatter(
     batch: &Batch,
     col_specs: &[&[u32]],
     schema: &SchemaDescriptor,

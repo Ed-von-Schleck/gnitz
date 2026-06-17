@@ -31,7 +31,7 @@ impl ScalarFuncKind {
     /// the batch evaluator's regression tests at m=1; the production path
     /// always goes through `run_filter`.
     #[cfg(test)]
-    pub fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
+    pub(crate) fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
         let ScalarFuncKind::Plan(p) = self;
         p.evaluate_predicate(batch, row)
     }
@@ -419,7 +419,7 @@ impl Plan {
     /// bit_only and nullable, at bit 0 of `bool_bits[r * NULL_WORDS_PER_REG]`,
     /// since the unpack to `regs` is skipped in that case).
     #[cfg(test)]
-    pub fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
+    pub(crate) fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
         let FilterKernel::Interpreted { prog, no_nulls } = &self.filter
             else { return true };
         let mut scratch = self.scratch.borrow_mut();

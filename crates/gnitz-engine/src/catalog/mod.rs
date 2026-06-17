@@ -47,21 +47,24 @@ use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 use crate::dag::{DagEngine, RelationKind, StoreHandle};
 use crate::storage::{Batch, PartitionedTable, Persistence, partition_arena_size, CursorHandle, Table};
 
-// Re-export items used by other crate modules.
+// ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
-pub(crate) use sys_tables::{SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID};
 pub(crate) use sys_tables::{TABLE_TAB_ID, IDX_TAB_ID};
 pub(crate) use sys_tables::{IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE};
+pub(crate) use types::ColumnDef;
 
 // Import everything from sys_tables for internal use.
 use sys_tables::*;
 
-// Re-export types needed by other modules.
-pub(crate) use types::{ColumnDef, FkConstraint, FkParentRef};
-pub(crate) use gnitz_wire::FK_INDEX_INFIX;
+// ── Catalog-internal re-exports — no out-of-catalog consumer (W8). These reach
+//    the submodules through their `use super::*` glob, so they stay re-exported
+//    but scoped to the catalog subtree rather than the crate-wide surface. ─────
+pub(in crate::catalog) use sys_tables::{SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID};
+pub(in crate::catalog) use types::{FkConstraint, FkParentRef};
+pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 #[cfg(test)]
-pub(crate) use gnitz_wire::validate_user_identifier;
-pub(crate) use utils::{make_fk_index_name, ingest_batch_into,
+pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
+pub(in crate::catalog) use utils::{make_fk_index_name, ingest_batch_into,
                        schema_dir, table_dir, view_dir, index_dir,
                        is_index_dir_name, is_table_dir_name, subdir_names,
                        ensure_dir, fsync_dir,
@@ -71,11 +74,11 @@ pub(crate) use utils::{make_fk_index_name, ingest_batch_into,
                        retract_rows_by_view,
                        retract_rows_in_pk_range};
 #[cfg(test)]
-pub(crate) use utils::{parse_qualified_name, make_secondary_index_name};
-pub(crate) use cache::CatalogCacheSet;
-pub(crate) use sys_tables::SysFamily;
-pub(crate) use store::CatalogDeltaSink;
-pub(crate) use apply_context::ApplyContext;
+pub(in crate::catalog) use utils::{parse_qualified_name, make_secondary_index_name};
+pub(in crate::catalog) use cache::CatalogCacheSet;
+pub(in crate::catalog) use sys_tables::SysFamily;
+pub(in crate::catalog) use store::CatalogDeltaSink;
+pub(in crate::catalog) use apply_context::ApplyContext;
 // `BatchBuilder` and the schema-shaping free fns hold no catalog state and live
 // in `storage`; re-export them so catalog's ddl/bootstrap/store callers compile
 // unchanged. (`index_meta_schema_desc`/`INDEX_META_COL_NAMES` have no catalog

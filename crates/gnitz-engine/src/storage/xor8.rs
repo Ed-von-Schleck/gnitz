@@ -9,7 +9,7 @@ const HEADER_SIZE: usize = 4 + 8 + 4 + 4; // magic + seed + block_length + fp_co
 ///
 /// Duplicate PKs are deduplicated before building — shard files may contain
 /// retraction rows where the same PK appears with different payloads/weights.
-pub fn build(pks: &[u128]) -> Option<Xor8> {
+pub(crate) fn build(pks: &[u128]) -> Option<Xor8> {
     if pks.is_empty() {
         return None;
     }
@@ -23,14 +23,14 @@ pub fn build(pks: &[u128]) -> Option<Xor8> {
 }
 
 /// Check if a key may be present in the filter.
-pub fn may_contain(filter: &Xor8, key: u128) -> bool {
+pub(crate) fn may_contain(filter: &Xor8, key: u128) -> bool {
     let h = xxh::hash_u128(key);
     filter.contains(&h)
 }
 
 /// Serialize an Xor8 filter to bytes.
 /// Format: [magic:4B "GXF1"][seed:u64 LE][block_length:u32 LE][fp_count:u32 LE][fingerprints]
-pub fn serialize(filter: &Xor8) -> Vec<u8> {
+pub(crate) fn serialize(filter: &Xor8) -> Vec<u8> {
     let fp_count = u32::try_from(filter.fingerprints.len()).expect("xor8 filter too large to serialize");
     let block_length = u32::try_from(filter.block_length).expect("xor8 block_length too large to serialize");
     let mut buf = Vec::with_capacity(serialized_size(filter));
@@ -44,7 +44,7 @@ pub fn serialize(filter: &Xor8) -> Vec<u8> {
 
 /// Deserialize an Xor8 filter from bytes.
 /// Returns None if the buffer is too short, has wrong magic, or is internally inconsistent.
-pub fn deserialize(buf: &[u8]) -> Option<Xor8> {
+pub(crate) fn deserialize(buf: &[u8]) -> Option<Xor8> {
     if buf.len() < HEADER_SIZE {
         return None;
     }
@@ -74,7 +74,7 @@ pub fn deserialize(buf: &[u8]) -> Option<Xor8> {
 }
 
 /// Returns the serialized size of a filter.
-pub fn serialized_size(filter: &Xor8) -> usize {
+pub(crate) fn serialized_size(filter: &Xor8) -> usize {
     HEADER_SIZE + filter.fingerprints.len()
 }
 

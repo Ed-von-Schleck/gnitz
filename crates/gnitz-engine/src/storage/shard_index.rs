@@ -283,7 +283,7 @@ impl ShardIndex {
     /// signed/compound columns) and delegates to [`find_pk_bytes`], the
     /// production path. Wide PKs cannot fit a u128.
     #[cfg(test)]
-    pub fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
+    pub(crate) fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
         let (opk, stride) = super::columnar::opk_key(&self.schema, key);
         self.find_pk_bytes(&opk[..stride], visitor);
     }

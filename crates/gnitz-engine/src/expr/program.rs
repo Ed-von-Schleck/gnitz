@@ -143,7 +143,7 @@ impl ExprProgram {
     /// Must be called after `resolve_column_indices`: column-bearing operands
     /// are read as resolved payload bytes (SENTINEL → PK, never nullable;
     /// otherwise dense payload index 0..N-1).
-    pub fn is_strictly_non_nullable(&self, schema: &crate::schema::SchemaDescriptor) -> bool {
+    pub(in crate::expr) fn is_strictly_non_nullable(&self, schema: &crate::schema::SchemaDescriptor) -> bool {
         let nullable_payload = |a: usize| -> bool {
             a < schema.num_payload_cols()
                 && schema.columns[schema.payload_col_idx(a)].nullable != 0
