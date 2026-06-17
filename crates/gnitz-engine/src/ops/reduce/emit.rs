@@ -24,16 +24,33 @@ fn emit_pk(
     }
 }
 
-/// Emit one reduce output row.
+/// Emit one aggregate column: NULL (and zero-filled) when the accumulator holds
+/// no value, else its value bits truncated to the column width. Shared by
+/// `emit_reduce_row` and `emit_gather_row` so the two emitters cannot drift.
+#[inline]
+fn emit_agg_col(
+    output: &mut Batch,
+    acc: &Accumulator,
+    out_pi: usize,
+    cs: usize,
+    null_word: &mut u64,
+) {
+    if acc.is_zero() {
+        *null_word |= 1u64 << out_pi;
+        output.fill_col_zero(out_pi, cs);
+    } else {
+        output.extend_col(out_pi, &acc.get_value_bits().to_le_bytes()[..cs]);
+    }
+}
+
+/// Emit one reduce output row — the +1 new-value row. Retractions are not built
+/// here; they are byte-copied from the stored row via `copy_current_row_into`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_reduce_row(
     output: &mut Batch,
     input_mb: &MemBatch,
     exemplar_row: usize,
     group_key: u128,
-    weight: i64,
-    old_vals: &[u64],
-    use_old_val: bool,
     accs: &[Accumulator],
     input_schema: &SchemaDescriptor,
     output_schema: &SchemaDescriptor,
@@ -44,7 +61,7 @@ pub(super) fn emit_reduce_row(
     let num_out_cols = output_schema.num_columns();
 
     emit_pk(output, output_schema, input_mb.get_pk_bytes(exemplar_row), group_key);
-    output.extend_weight(&weight.to_le_bytes());
+    output.extend_weight(&1i64.to_le_bytes());
 
     // Build null word and payload columns
     let mut null_word: u64 = 0;
@@ -55,20 +72,7 @@ pub(super) fn emit_reduce_row(
         // Determine if this is an agg column or a group exemplar column
         let agg_base = num_out_cols - num_aggs;
         if ci >= agg_base {
-            // Aggregate column
-            let agg_idx = ci - agg_base;
-            let bits = if use_old_val {
-                old_vals[agg_idx]
-            } else {
-                accs[agg_idx].get_value_bits()
-            };
-            // Null if accumulator is zero (no value) and not using old val
-            if !use_old_val && accs[agg_idx].is_zero() {
-                null_word |= 1u64 << out_pi;
-                output.fill_col_zero(out_pi, cs);
-            } else {
-                output.extend_col(out_pi, &bits.to_le_bytes()[..cs]);
-            }
+            emit_agg_col(output, &accs[ci - agg_base], out_pi, cs, &mut null_word);
         } else if use_natural_pk {
             // use_natural_pk: no group exemplar columns in output (PK IS the group)
             // This shouldn't happen — with use_natural_pk, non-agg non-PK cols don't exist
@@ -204,16 +208,13 @@ pub(super) fn emit_finalized_row(
     fin_output.count += 1;
 }
 
-/// Emit one gather-reduce output row.
-#[allow(clippy::too_many_arguments)]
+/// Emit one gather-reduce output row — the +1 new-global row. Retractions are
+/// byte-copied from the stored row via `copy_current_row_into`, not built here.
 pub(super) fn emit_gather_row(
     output: &mut Batch,
     input_mb: &MemBatch,
     exemplar_row: usize,
     group_key: u128,
-    weight: i64,
-    old_vals: &[u64],
-    use_old_val: bool,
     accs: &[Accumulator],
     schema: &SchemaDescriptor,
     num_aggs: usize,
@@ -222,7 +223,7 @@ pub(super) fn emit_gather_row(
     let agg_base = num_cols - num_aggs;
 
     emit_pk(output, schema, input_mb.get_pk_bytes(exemplar_row), group_key);
-    output.extend_weight(&weight.to_le_bytes());
+    output.extend_weight(&1i64.to_le_bytes());
 
     let mut null_word: u64 = 0;
     let in_null = input_mb.get_null_word(exemplar_row);
@@ -231,18 +232,7 @@ pub(super) fn emit_gather_row(
         let cs = col.size() as usize;
 
         if ci >= agg_base {
-            let agg_idx = ci - agg_base;
-            let bits = if use_old_val {
-                old_vals[agg_idx]
-            } else {
-                accs[agg_idx].get_value_bits()
-            };
-            if !use_old_val && accs[agg_idx].is_zero() {
-                null_word |= 1u64 << out_pi;
-                output.fill_col_zero(out_pi, cs);
-            } else {
-                output.extend_col(out_pi, &bits.to_le_bytes()[..cs]);
-            }
+            emit_agg_col(output, &accs[ci - agg_base], out_pi, cs, &mut null_word);
         } else {
             // Group exemplar column: copy from input
             let src_pi = out_pi; // same position

@@ -10,8 +10,8 @@ use super::super::util::{
     GroupKeyExtractor, cmp_col_window, extract_group_key, extract_group_key_cursor,
 };
 use super::agg::{
-    Accumulator, AggDescriptor, apply_agg_from_value_index, is_single_col_natural_pk,
-    readback_agg_bits,
+    Accumulator, AggDescriptor, apply_agg_from_value_index, fold_old_aggs,
+    is_single_col_natural_pk,
 };
 use super::emit::{emit_finalized_row, emit_reduce_row};
 use super::sort::{
@@ -227,7 +227,6 @@ pub fn op_reduce(
     let mut fin_ctx = finalize_prog.map(|p| crate::expr::FinalizeContext::new(p, output_schema));
 
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, input_schema)).collect();
-    let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
     // Output width of each trailing agg column (loop-invariant across the
     // 100k+-group loop below). MIN/MAX now emit at the source type's width, so a
     // narrow column is < 8 bytes; the trace read-back uses this as both the
@@ -237,6 +236,11 @@ pub fn op_reduce(
     let agg_col_widths: Vec<usize> = (0..num_aggs)
         .map(|k| output_schema.columns[num_out_cols - num_aggs + k].size() as usize)
         .collect();
+    // First aggregate column's logical index / payload slot (the aggregates are
+    // the trailing output columns, so these hold at any PK arity). Loop-invariant
+    // — hoisted out of the group loop alongside `agg_col_widths`.
+    let cbase = num_out_cols - num_aggs;
+    let pbase = output_schema.num_payload_cols() - num_aggs;
 
     // We need mutable access to optional cursors. Take ownership via Option::take pattern.
     // The caller passes these as Option<&mut ReadCursor>, but we need to use them
@@ -459,27 +463,11 @@ pub fn op_reduce(
             && trace_out_cursor.current_pk_eq(trace_out_key);
 
         if has_old {
-            // Read old agg values from trace_out at each agg column's output
-            // width (`agg_col_widths`), then rebuild the 8-byte accumulator.
-            for k in 0..num_aggs {
-                let agg_col_idx = num_out_cols - num_aggs + k;
-                let cw = agg_col_widths[k];
-                let ptr = trace_out_cursor.col_ptr(agg_col_idx, cw);
-                if !ptr.is_null() {
-                    let bytes = unsafe { std::slice::from_raw_parts(ptr, cw) };
-                    old_vals[k] = readback_agg_bits(bytes, agg_descs[k].col_type_code);
-                } else {
-                    old_vals[k] = 0;
-                }
-            }
-            // Emit retraction row (weight=-1)
-            emit_reduce_row(
-                &mut raw_output, &mb, group_start_idx,
-                group_key, -1,
-                &old_vals, true, // use_old_val=true
-                &accs, input_schema, output_schema,
-                group_by_cols, use_natural_pk, num_aggs,
-            );
+            // δ_out's −Agg(history) term IS the stored output row: copy trace_out's
+            // current row at weight -1. Byte-identical (PK, payload, null bits,
+            // blobs) by construction, so it consolidates against the row it cancels
+            // with zero per-column reconstruction and no null plumbing.
+            trace_out_cursor.copy_current_row_into(&mut raw_output, -1);
             if let (Some(prog), Some(fin_schema), Some(ref mut fin_out), Some(ctx)) =
                 (finalize_prog, finalize_out_schema, &mut fin_output, fin_ctx.as_mut())
             {
@@ -493,9 +481,9 @@ pub fn op_reduce(
 
         // New value calculation
         if all_linear && has_old {
-            for k in 0..num_aggs {
-                accs[k].merge_accumulated(old_vals[k], 1);
-            }
+            // new = old + delta: fold the old aggregates straight off the
+            // still-positioned trace cursor into the accumulators.
+            fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, &agg_col_widths, cbase, pbase);
         } else if !all_linear {
             if let (Some(ref mut avi_c), Some(extractor)) = (&mut avi, &avi_extractor) {
                 // AVI path: gather the full group key and prefix-seek the index.
@@ -592,8 +580,7 @@ pub fn op_reduce(
         if any_nonzero {
             emit_reduce_row(
                 &mut raw_output, &mb, group_start_idx,
-                group_key, 1,
-                &old_vals, false, // use_old_val=false
+                group_key,
                 &accs, input_schema, output_schema,
                 group_by_cols, use_natural_pk, num_aggs,
             );

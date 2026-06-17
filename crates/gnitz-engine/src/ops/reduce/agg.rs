@@ -398,6 +398,36 @@ pub(super) fn readback_agg_bits(bytes: &[u8], src_tc: TypeCode) -> u64 {
     }
 }
 
+/// Fold the old aggregate values stored in `cursor`'s current row into `accs`
+/// at weight +1 — the `new = old + delta` step shared by `op_reduce`'s linear
+/// fast path and `op_gather_reduce`'s old-global fold.
+///
+/// A NULL old aggregate contributes nothing: folding its zero bytes would
+/// saturate `has_value`, decoding NULL as 0. The aggregates are the trailing
+/// output columns (`build_reduce_output_schema` appends them last), so `cbase`
+/// (first agg column index) and `pbase` (first agg payload slot) address each
+/// value and its null bit at any PK arity.
+pub(super) fn fold_old_aggs(
+    accs: &mut [Accumulator],
+    cursor: &ReadCursor,
+    agg_descs: &[AggDescriptor],
+    agg_col_widths: &[usize],
+    cbase: usize,
+    pbase: usize,
+) {
+    for (k, acc) in accs.iter_mut().enumerate() {
+        if (cursor.current_null_word >> (pbase + k)) & 1 != 0 {
+            continue;
+        }
+        let cw = agg_col_widths[k];
+        let ptr = cursor.col_ptr(cbase + k, cw);
+        if !ptr.is_null() {
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, cw) };
+            acc.merge_accumulated(readback_agg_bits(bytes, agg_descs[k].col_type_code), 1);
+        }
+    }
+}
+
 /// True iff `group_cols` is a single column whose type permits using
 /// the source column directly as the output PK (vs. a synthetic U128).
 /// Shared between `compiler::build_reduce_output_schema` and

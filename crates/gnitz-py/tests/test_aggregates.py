@@ -620,6 +620,71 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_min_retraction_to_and_from_null(self, client):
+        """A nullable MIN that is NULL (every contributor NULL) is a live state, kept
+        alive by COUNT(*). MIN is a Direct passthrough, so its raw null bit is
+        user-visible — a retraction must reproduce that NULL exactly. The old code
+        re-emitted the retracted MIN as a concrete 0, which does not cancel the prior
+        NULL row (compare_rows ranks null < non-null) and leaks a stale ghost. Insert
+        an all-NULL group, add a non-NULL row (the prior MIN=NULL row must retract as
+        NULL → exactly one clean view row), then retract the non-NULL row (MIN returns
+        to NULL, no ghost). No existing E2E retracts a nullable MIN to NULL. Runs under
+        GNITZ_WORKERS=1 and =4: GROUP BY shards each group whole onto one worker, so
+        the 4-worker run confirms the per-worker fix on the sharded path."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  k BIGINT NOT NULL,"
+                "  v BIGINT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, COUNT(*) AS c, MIN(v) AS mn "
+                "FROM t GROUP BY k",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # Tick 1: an all-NULL group. COUNT(*) keeps it alive; MIN = NULL.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, NULL), (2, 10, NULL)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 1
+            assert rows[0]["k"] == 10
+            assert rows[0]["c"] == 2
+            assert rows[0]["mn"] is None, (
+                f"all-NULL group MIN must be NULL, got {rows[0]['mn']}")
+
+            # Tick 2: a non-NULL row → MIN = 5. The prior (MIN=NULL) row must be
+            # retracted *as NULL* to cancel tick 1 byte-for-byte; a bad retraction
+            # (MIN re-emitted as 0) leaves the stale NULL row live → two rows here.
+            client.execute_sql("INSERT INTO t VALUES (3, 10, 5)", schema_name=sn)
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 1, f"stale MIN=NULL ghost not cancelled: {rows}"
+            assert rows[0]["c"] == 3
+            assert rows[0]["mn"] == 5, f"MIN must be 5, got {rows[0]['mn']}"
+            assert rows[0].weight == 1, f"live row must be weight 1, got {rows[0].weight}"
+
+            # Tick 3: retract the only non-NULL row → MIN returns to NULL, c=2.
+            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 1, f"group must persist via its NULL rows: {rows}"
+            assert rows[0]["c"] == 2
+            assert rows[0]["mn"] is None, (
+                f"MIN must return to NULL once the non-NULL row is gone, got {rows[0]['mn']}")
+            assert rows[0].weight == 1, f"no ghost: live row must be weight 1, got {rows[0].weight}"
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_having_sum_is_null(self, client):
         """HAVING SUM(v) IS NULL admits exactly the groups with no non-NULL
         contributor, agreeing with the companion-gated projection rather than the

@@ -3,7 +3,7 @@
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ReadCursor};
 
-use super::agg::{Accumulator, AggDescriptor, readback_agg_bits};
+use super::agg::{Accumulator, AggDescriptor, fold_old_aggs, readback_agg_bits};
 use super::emit::emit_gather_row;
 use super::sort::sort_owned;
 
@@ -27,13 +27,8 @@ pub fn op_gather_reduce(
 
     let smb = sorted.as_mem_batch();
 
-    // Derive group_indices layout
-    let num_group_cols = num_out_cols - 1 - num_aggs; // -1 for PK
-    let _use_natural_pk_gather = num_group_cols == 0;
-
     let mut output = Batch::with_schema(*partial_schema, n);
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, partial_schema)).collect();
-    let mut old_vals: Vec<u64> = vec![0u64; num_aggs];
     // Output width of each trailing agg column (loop-invariant). MIN/MAX now
     // emit at the source type's width, so a narrow column is < 8 bytes; the read
     // sites below use this both as the per-row offset stride and the slice
@@ -42,6 +37,12 @@ pub fn op_gather_reduce(
     let agg_col_widths: Vec<usize> = (0..num_aggs)
         .map(|k| partial_schema.columns[num_out_cols - num_aggs + k].size() as usize)
         .collect();
+    // First aggregate column's payload slot and logical index: the aggregates
+    // are the trailing payload columns, so the null-bitmap bit / get_col_ptr
+    // index (`pbase`) and the logical column index (`cbase`) are correct at any
+    // PK arity.
+    let pbase = partial_schema.num_payload_cols() - num_aggs;
+    let cbase = num_out_cols - num_aggs;
 
     let mut idx = 0usize;
     while idx < n {
@@ -55,12 +56,18 @@ pub fn op_gather_reduce(
             acc.reset();
         }
 
-        // Accumulate all partial deltas for this group
+        // Accumulate all partial deltas for this group; a NULL partial
+        // contributes nothing (combining its zero bytes would corrupt MIN/MAX —
+        // e.g. global MIN(5, 0) = 0 — and saturate has_value for SUM).
         while idx < n && smb.get_pk_bytes(idx) == group_pk_bytes
         {
             let w = smb.get_weight(idx);
+            let in_null_word = smb.get_null_word(idx);
             for k in 0..num_aggs {
-                let pi = num_out_cols - num_aggs + k - 1; // -1 for PK (pk_index=0 always in output schema)
+                let pi = pbase + k;
+                if (in_null_word >> pi) & 1 != 0 {
+                    continue;
+                }
                 let bits = readback_agg_bits(
                     smb.get_col_ptr(idx, pi, agg_col_widths[k]),
                     agg_descs[k].col_type_code,
@@ -88,31 +95,13 @@ pub fn op_gather_reduce(
             && trace_out_cursor.current_pk_eq(group_pk_bytes);
 
         if has_old {
-            for k in 0..num_aggs {
-                let agg_col_idx = num_out_cols - num_aggs + k;
-                let cw = agg_col_widths[k];
-                let ptr = trace_out_cursor.col_ptr(agg_col_idx, cw);
-                if !ptr.is_null() {
-                    let bytes = unsafe { std::slice::from_raw_parts(ptr, cw) };
-                    old_vals[k] = readback_agg_bits(bytes, agg_descs[k].col_type_code);
-                } else {
-                    old_vals[k] = 0;
-                }
-            }
+            // δ_out's −Agg(history) term IS the stored global row: copy trace_out's
+            // current row at weight -1 (byte-identical PK/payload/null bits, no
+            // reconstruction). The copy takes &self, so the fold below still reads it.
+            trace_out_cursor.copy_current_row_into(&mut output, -1);
 
-            // Emit retraction
-            emit_gather_row(
-                &mut output, &smb, exemplar_row,
-                group_pk, -1,
-                &old_vals, true,
-                &accs, partial_schema, num_aggs,
-            );
-
-            // Fold old global into accumulators
-            for k in 0..num_aggs {
-                accs[k].merge_accumulated(old_vals[k], 1);
-            }
-
+            // Fold old global into the accumulators (new = old + delta).
+            fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, &agg_col_widths, cbase, pbase);
         }
 
         // Emit new global if non-zero
@@ -120,8 +109,7 @@ pub fn op_gather_reduce(
         if any_nonzero {
             emit_gather_row(
                 &mut output, &smb, exemplar_row,
-                group_pk, 1,
-                &old_vals, false,
+                group_pk,
                 &accs, partial_schema, num_aggs,
             );
         }

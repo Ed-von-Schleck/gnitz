@@ -404,6 +404,134 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     );
 }
 
+/// A group whose MIN is NULL (all contributors NULL) is kept alive by COUNT(*).
+/// When a non-NULL row later joins it, the group's old (NULL-MIN) output row must
+/// be retracted *as NULL* to cancel the tick-1 row byte-for-byte. MIN is a Direct
+/// passthrough, so the raw null bit is user-visible — the primary user-facing bug.
+#[test]
+fn null_min_retraction_re_emits_null() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+
+    // in: pk(U64), grp(I64), val(I64 nullable); out (payload GROUP BY grp):
+    // pk(U128), grp(I64), count(I64), min(I64 nullable). min is payload index 2.
+    let in_schema = SchemaDescriptor::new(&[
+        SchemaColumn::new(type_code::U64, 0),
+        SchemaColumn::new(type_code::I64, 0),
+        SchemaColumn::new(type_code::I64, 1),
+    ], &[0]);
+    let out_schema = SchemaDescriptor::new(&[
+        SchemaColumn::new(type_code::U128, 0),
+        SchemaColumn::new(type_code::I64, 0),
+        SchemaColumn::new(type_code::I64, 1),
+        SchemaColumn::new(type_code::I64, 1),
+    ], &[0]);
+    let aggs = [
+        AggDescriptor { col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2] },
+        AggDescriptor { col_idx: 2, agg_op: AggOp::Min,   col_type_code: TypeCode::I64, _pad: [0; 2] },
+    ];
+    let min_null_bit = 1u64 << 2;
+
+    // Tick 1: (pk=1, grp=10, val=NULL) → COUNT keeps the group alive, MIN=NULL.
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let delta1 = {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&(1u64 << 1).to_le_bytes()); // val (payload idx 1) NULL
+        b.extend_col(0, &10i64.to_le_bytes());
+        b.extend_col(1, &0i64.to_le_bytes());
+        b.count += 1; b.sorted = true; b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let (out1, _) = op_reduce(&delta1, None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &aggs,
+        None, false, TypeCode::U64, None, 0, None, None);
+    assert_eq!(out1.count, 1);
+    assert!(out1.as_mem_batch().get_null_word(0) & min_null_bit != 0,
+        "tick1 MIN must be NULL");
+
+    // Tick 2: (pk=2, grp=10, val=7) → MIN=7, retracts the NULL row.
+    let prev = Rc::new(out1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let delta2 = {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(2u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &10i64.to_le_bytes());
+        b.extend_col(1, &7i64.to_le_bytes());
+        b.count += 1; b.sorted = true; b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let (out2, _) = op_reduce(&delta2, None, to_ch2.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &aggs,
+        None, false, TypeCode::U64, None, 0, None, None);
+    let mb2 = out2.as_mem_batch();
+    let retr = (0..out2.count).find(|&i| out2.get_weight(i) < 0).expect("retraction row");
+    assert!(mb2.get_null_word(retr) & min_null_bit != 0,
+        "retraction of an all-NULL MIN group must re-emit MIN as NULL to cancel \
+         the tick-1 row (null_word={:#x})", mb2.get_null_word(retr));
+}
+
+/// A linear SUM whose group stays all-NULL across a fold must keep the new
+/// output row's raw SUM bit NULL: folding a previously-NULL SUM's zero bytes
+/// would saturate `has_value` and decode NULL as 0. Pins the linear-fold null
+/// gate that skips a NULL old aggregate. This is the raw SUM bit only — a
+/// nullable SUM's user-visible null-ness rides the NullfillSum companion, which
+/// `test_reduce_nullable_sum_retraction_becomes_null` covers.
+#[test]
+fn null_sum_fold_stays_null() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+
+    let in_schema = SchemaDescriptor::new(&[
+        SchemaColumn::new(type_code::U64, 0),
+        SchemaColumn::new(type_code::I64, 0),
+        SchemaColumn::new(type_code::I64, 1),
+    ], &[0]);
+    let out_schema = SchemaDescriptor::new(&[
+        SchemaColumn::new(type_code::U128, 0),
+        SchemaColumn::new(type_code::I64, 0),
+        SchemaColumn::new(type_code::I64, 1),
+        SchemaColumn::new(type_code::I64, 1),
+    ], &[0]);
+    let aggs = [
+        AggDescriptor { col_idx: 2, agg_op: AggOp::Count, col_type_code: TypeCode::I64, _pad: [0; 2] },
+        AggDescriptor { col_idx: 2, agg_op: AggOp::Sum,   col_type_code: TypeCode::I64, _pad: [0; 2] },
+    ];
+    let sum_null_bit = 1u64 << 2;
+    let null_row = |pk: u128| {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(pk);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&(1u64 << 1).to_le_bytes()); // val NULL
+        b.extend_col(0, &10i64.to_le_bytes());
+        b.extend_col(1, &0i64.to_le_bytes());
+        b.count += 1; b.sorted = true; b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (out1, _) = op_reduce(&null_row(1), None, to_ch.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &aggs,
+        None, false, TypeCode::U64, None, 0, None, None);
+    assert!(out1.as_mem_batch().get_null_word(0) & sum_null_bit != 0, "tick1 SUM NULL");
+
+    let prev = Rc::new(out1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let (out2, _) = op_reduce(&null_row(2), None, to_ch2.cursor_mut(),
+        &in_schema, &out_schema, &[1u32], &aggs,
+        None, false, TypeCode::U64, None, 0, None, None);
+    let mb2 = out2.as_mem_batch();
+    let new_row = (0..out2.count).find(|&i| out2.get_weight(i) > 0).expect("insert row");
+    assert!(mb2.get_null_word(new_row) & sum_null_bit != 0,
+        "SUM of a still-all-NULL group must stay NULL (null_word={:#x})",
+        mb2.get_null_word(new_row));
+}
+
 /// Reduce-of-trace over a wide PK (3×U64, stride 24, GROUP BY the full PK).
 /// The retraction read seeks `trace_out` by the group's PK bytes; the u128
 /// `seek` cannot carry a stride-24 key.
@@ -2050,8 +2178,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
     // Synthetic group_key is irrelevant on the byte path; pass arbitrary value.
     emit_reduce_row(
         &mut output, &mb, 0,
-        0u128, 1,
-        &[0u64], false,
+        0u128,
         &accs, &in_schema, &out_schema,
         &[0u32, 1u32], true /* use_natural_pk */, 1,
     );
@@ -5613,4 +5740,41 @@ fn test_reduce_max_blob_group_retraction() {
         .map(|i| crate::util::read_i64_le(out2.col_data(1), i * 8));
     assert_eq!(retract, Some(30), "retract old MAX(blob_a)=30");
     assert_eq!(insert, Some(10), "insert new MAX(blob_a)=10 after the 30 row is gone");
+}
+
+/// Gather-reduce must ignore a NULL partial when combining a group: a NULL MIN
+/// partial injected as `combine(0)` would corrupt the global MIN (MIN(5,0)=0).
+/// Latent today (op_gather_reduce is unwired in SQL planning) but a real value
+/// bug for the future GatherReduce milestone.
+#[test]
+fn gather_combine_skips_null_partial() {
+    use std::rc::Rc;
+    use crate::storage::CursorHandle;
+
+    // partial/output: pk(U128), min(I64 nullable). min is payload index 0.
+    let schema = SchemaDescriptor::new(&[
+        SchemaColumn::new(type_code::U128, 0),
+        SchemaColumn::new(type_code::I64, 1),
+    ], &[0]);
+    let agg_min = AggDescriptor { col_idx: 1, agg_op: AggOp::Min, col_type_code: TypeCode::I64, _pad: [0; 2] };
+
+    // Group pk=1: an all-NULL partial and a MIN=5 partial → global MIN = 5.
+    let mut partial = Batch::with_schema(schema, 2);
+    partial.extend_pk(1u128);
+    partial.extend_weight(&1i64.to_le_bytes());
+    partial.extend_null_bmp(&1u64.to_le_bytes()); // min (payload idx 0) NULL
+    partial.extend_col(0, &0i64.to_le_bytes());
+    partial.count += 1;
+    partial.extend_pk(1u128);
+    partial.extend_weight(&1i64.to_le_bytes());
+    partial.extend_null_bmp(&0u64.to_le_bytes());
+    partial.extend_col(0, &5i64.to_le_bytes());
+    partial.count += 1;
+
+    let empty_out = Rc::new(Batch::empty_with_schema(&schema));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
+    let out = op_gather_reduce(&partial, to_ch.cursor_mut(), &schema, &[agg_min]);
+    assert_eq!(out.count, 1);
+    assert_eq!(crate::util::read_i64_le(out.col_data(0), 0), 5,
+        "gather MIN must ignore the all-NULL partial, not combine it as 0");
 }
