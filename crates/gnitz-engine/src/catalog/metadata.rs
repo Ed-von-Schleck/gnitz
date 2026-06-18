@@ -29,14 +29,18 @@ impl CatalogEngine {
 
     /// Get FK constraint at index: (fk_col_idx, target_table_id, target_col_idx).
     pub fn get_fk_constraint(&self, table_id: i64, idx: usize) -> Option<(usize, i64, usize)> {
-        self.caches.fk_by_child.get(&table_id)
+        self.caches
+            .fk_by_child
+            .get(&table_id)
             .and_then(|v| v.get(idx))
             .map(|c| (c.fk_col_idx, c.target_table_id, c.target_col_idx))
     }
 
     /// Number of index circuits on a table.
     pub fn get_index_circuit_count(&self, table_id: i64) -> usize {
-        self.dag.tables.get(&table_id)
+        self.dag
+            .tables
+            .get(&table_id)
             .map(|e| e.index_circuits.len())
             .unwrap_or(0)
     }
@@ -45,9 +49,7 @@ impl CatalogEngine {
     /// consumers go through `unique_index_circuit_cols` / `index_circuit_for_cols`;
     /// only the catalog tests enumerate raw circuit info.
     #[cfg(test)]
-    pub(crate) fn get_index_circuit_info(&self, table_id: i64, idx: usize)
-        -> Option<(PkColList, bool)>
-    {
+    pub(crate) fn get_index_circuit_info(&self, table_id: i64, idx: usize) -> Option<(PkColList, bool)> {
         let entry = self.dag.tables.get(&table_id)?;
         let ic = entry.index_circuits.get(idx)?;
         Some((ic.col_indices, ic.is_unique))
@@ -65,7 +67,9 @@ impl CatalogEngine {
     /// Get index store handle for an exact column list (for worker has_pk via
     /// a unique index, single- or multi-column).
     pub(crate) fn get_index_store_handle(&self, table_id: i64, cols: &[u32]) -> *const Table {
-        self.dag.tables.get(&table_id)
+        self.dag
+            .tables
+            .get(&table_id)
             .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
             .map(|ic| ic.table_mut() as *const Table)
             .unwrap_or(std::ptr::null())
@@ -73,7 +77,9 @@ impl CatalogEngine {
 
     /// Get the SchemaDescriptor for the index circuit at position idx.
     pub fn get_index_circuit_schema(&self, table_id: i64, idx: usize) -> Option<SchemaDescriptor> {
-        self.dag.tables.get(&table_id)
+        self.dag
+            .tables
+            .get(&table_id)
             .and_then(|e| e.index_circuits.get(idx))
             .map(|ic| ic.index_schema)
     }
@@ -91,10 +97,10 @@ impl CatalogEngine {
     /// `ic.is_unique` (unicast a unique match to one worker, broadcast-and-merge
     /// a non-unique one). Returning the entry means callers scan the circuit
     /// list once and cannot ask whether a non-existent index is unique.
-    pub fn index_circuit_for_cols(
-        &self, table_id: i64, cols: &[u32],
-    ) -> Option<&crate::query::IndexCircuitEntry> {
-        self.dag.tables.get(&table_id)
+    pub fn index_circuit_for_cols(&self, table_id: i64, cols: &[u32]) -> Option<&crate::query::IndexCircuitEntry> {
+        self.dag
+            .tables
+            .get(&table_id)
             .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
     }
 
@@ -102,7 +108,9 @@ impl CatalogEngine {
     /// Used to decide whether distributed unique-index validation is needed.
     /// Non-unique circuits (e.g. FK indices) do not count.
     pub fn has_any_unique_index(&self, table_id: i64) -> bool {
-        self.dag.tables.get(&table_id)
+        self.dag
+            .tables
+            .get(&table_id)
             .map(|e| e.index_circuits.iter().any(|ic| ic.is_unique))
             .unwrap_or(false)
     }
@@ -111,21 +119,23 @@ impl CatalogEngine {
     /// distributed validator to decide whether Error-mode inserts need
     /// an against-store PK rejection broadcast.
     pub fn table_has_unique_pk(&self, table_id: i64) -> bool {
-        self.dag.tables.get(&table_id)
-            .map(|e| e.unique_pk())
-            .unwrap_or(false)
+        self.dag.tables.get(&table_id).map(|e| e.unique_pk()).unwrap_or(false)
     }
 
     /// Get child info at index: (child_table_id, fk_col_idx, parent_col_idx).
     pub fn get_fk_child_info(&self, parent_id: i64, idx: usize) -> Option<(i64, usize, usize)> {
-        self.caches.fk_by_parent.get(&parent_id)
+        self.caches
+            .fk_by_parent
+            .get(&parent_id)
             .and_then(|v| v.get(idx))
             .map(|r| (r.child_tid, r.fk_col_idx, r.parent_col_idx))
     }
 
     /// Get the index schema for a specific column list's index on a table.
     pub fn get_index_schema_by_cols(&self, table_id: i64, cols: &[u32]) -> Option<SchemaDescriptor> {
-        self.dag.tables.get(&table_id)
+        self.dag
+            .tables
+            .get(&table_id)
             .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
             .map(|ic| ic.index_schema)
     }
@@ -135,8 +145,7 @@ impl CatalogEngine {
         if let Some(names) = self.caches.col_names.get(&table_id) {
             return names.clone();
         }
-        let names: Vec<String> = self.read_column_defs(table_id)
-            .into_iter().map(|cd| cd.name).collect();
+        let names: Vec<String> = self.read_column_defs(table_id).into_iter().map(|cd| cd.name).collect();
         self.caches.col_names.insert(table_id, names.clone());
         names
     }
@@ -157,10 +166,14 @@ impl CatalogEngine {
     /// for `table_id`, or `None` if the block isn't yet cached. Wire props
     /// are paired with the block so they share invalidation.
     pub fn get_cached_schema_wire_block(&self, table_id: i64) -> Option<CachedSchemaWire> {
-        let (block, wire_safe, wire_row_fixed_stride) =
-            self.caches.schema_wire_cache.get(&table_id)?.clone();
+        let (block, wire_safe, wire_row_fixed_stride) = self.caches.schema_wire_cache.get(&table_id)?.clone();
         let version = self.caches.get_schema_version(table_id);
-        Some(CachedSchemaWire { block, version, wire_safe, wire_row_fixed_stride })
+        Some(CachedSchemaWire {
+            block,
+            version,
+            wire_safe,
+            wire_row_fixed_stride,
+        })
     }
 
     /// Return the current schema version for `table_id` (1 if unknown).
@@ -183,7 +196,9 @@ impl CatalogEngine {
         wire_safe: bool,
         wire_row_fixed_stride: u32,
     ) {
-        self.caches.schema_wire_cache.insert(table_id, (block, wire_safe, wire_row_fixed_stride));
+        self.caches
+            .schema_wire_cache
+            .insert(table_id, (block, wire_safe, wire_row_fixed_stride));
     }
 
     /// Return the full set of table IDs that must be locked together for a
@@ -216,11 +231,9 @@ impl CatalogEngine {
 
     /// Get raw PartitionedTable handle for a user table.
     pub(crate) fn get_ptable_handle(&self, table_id: i64) -> Option<*mut PartitionedTable> {
-        self.dag.tables.get(&table_id).and_then(|e| {
-            match &e.handle {
-                StoreHandle::Partitioned(cell) => Some(unsafe { &mut **cell.get() as *mut PartitionedTable }),
-                _ => None,
-            }
+        self.dag.tables.get(&table_id).and_then(|e| match &e.handle {
+            StoreHandle::Partitioned(cell) => Some(unsafe { &mut **cell.get() as *mut PartitionedTable }),
+            _ => None,
         })
     }
 
@@ -242,7 +255,11 @@ impl CatalogEngine {
 
     /// Returns all child tables that have FK constraints targeting `parent_id`.
     pub(crate) fn fk_children_of(&self, parent_id: i64) -> &[FkParentRef] {
-        self.caches.fk_by_parent.get(&parent_id).map(|v| v.as_slice()).unwrap_or(&[])
+        self.caches
+            .fk_by_parent
+            .get(&parent_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// `(schema, table, columns)` names for `(table_id, col_indices)`, each
@@ -253,11 +270,10 @@ impl CatalogEngine {
     /// constraint-violation paths that format these names. `get_column_names`
     /// returns an owned `Vec`, so it does not borrow-conflict with the later
     /// `get_qualified_name`.
-    fn qualified_col_names(&mut self, table_id: i64, col_indices: &[u32])
-        -> (String, String, String)
-    {
+    fn qualified_col_names(&mut self, table_id: i64, col_indices: &[u32]) -> (String, String, String) {
         let names = self.get_column_names(table_id);
-        let col = col_indices.iter()
+        let col = col_indices
+            .iter()
             .map(|&ci| names.get(ci as usize).cloned().unwrap_or_else(|| "?".to_string()))
             .collect::<Vec<_>>()
             .join(", ");
@@ -271,9 +287,7 @@ impl CatalogEngine {
     /// already-committed data. Single source of truth for this message — the
     /// distributed path (`MasterDispatcher`) delegates here. A composite index
     /// passes its full `col_indices`, joined as `(a, b)`.
-    pub(crate) fn unique_violation_err(
-        &mut self, table_id: i64, col_indices: &[u32], in_batch: bool,
-    ) -> String {
+    pub(crate) fn unique_violation_err(&mut self, table_id: i64, col_indices: &[u32], in_batch: bool) -> String {
         let (sn, tn, col) = self.qualified_col_names(table_id, col_indices);
         if in_batch {
             format!("Unique index violation on '{sn}.{tn}' column '{col}': duplicate in batch")
@@ -287,8 +301,6 @@ impl CatalogEngine {
     /// contract as [`Self::unique_violation_err`].
     pub(crate) fn unique_create_dup_err(&mut self, table_id: i64, col_indices: &[u32]) -> String {
         let (sn, tn, col) = self.qualified_col_names(table_id, col_indices);
-        format!(
-            "cannot create unique index on '{sn}.{tn}' column '{col}': column contains duplicate values"
-        )
+        format!("cannot create unique index on '{sn}.{tn}' column '{col}': column contains duplicate values")
     }
 }

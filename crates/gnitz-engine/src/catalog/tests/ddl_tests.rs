@@ -9,8 +9,18 @@ fn test_identifiers() {
         assert!(validate_user_identifier(name).is_ok(), "Rejected valid: {name}");
     }
     // Invalid names
-    for name in &["_private", "_", "_system", "__init__", "", "has space",
-                   "has-dash", "has.dot", "has@", "table$"] {
+    for name in &[
+        "_private",
+        "_",
+        "_system",
+        "__init__",
+        "",
+        "has space",
+        "has-dash",
+        "has.dot",
+        "has@",
+        "table$",
+    ] {
         assert!(validate_user_identifier(name).is_err(), "Accepted invalid: {name}");
     }
     // Qualified name parsing
@@ -114,8 +124,10 @@ fn test_edge_cases() {
     engine.create_table("my_schema.tbl2", &cols, &[0], true).unwrap();
     engine.drop_schema("my_schema").unwrap();
     assert!(!engine.has_schema("my_schema"));
-    assert!(engine.get_by_name("my_schema", "tbl2").is_none(),
-        "cascade must drop the contained table");
+    assert!(
+        engine.get_by_name("my_schema", "tbl2").is_none(),
+        "cascade must drop the contained table"
+    );
 
     // 7. Unqualified name defaults to public
     let _tid7 = engine.create_table("tbl3", &cols, &[0], true).unwrap();
@@ -128,9 +140,20 @@ fn test_edge_cases() {
     assert!(engine.get_by_name("public", "tbl4").is_none());
 
     // 9. Invalid PK type (STRING)
-    assert!(engine.create_table("public.bad_pk",
-        &[ColumnDef { name: "id".into(), type_code: type_code::STRING, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }],
-        &[0], true).is_err());
+    assert!(engine
+        .create_table(
+            "public.bad_pk",
+            &[ColumnDef {
+                name: "id".into(),
+                type_code: type_code::STRING,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0
+            }],
+            &[0],
+            true
+        )
+        .is_err());
 
     // 10. Too many columns (> MAX_COLUMNS = 65)
     let many: Vec<ColumnDef> = (0..66).map(|i| u64_col_def(&format!("c{i}"))).collect();
@@ -159,7 +182,14 @@ fn test_edge_cases() {
     engine.drop_table("public.tbl_rc").unwrap();
 
     // 15. U128 PK support
-    let tid15 = engine.create_table("public.u128t", &[u128_col_def("uuid_pk"), str_col_def("data")], &[0], true).unwrap();
+    let tid15 = engine
+        .create_table(
+            "public.u128t",
+            &[u128_col_def("uuid_pk"), str_col_def("data")],
+            &[0],
+            true,
+        )
+        .unwrap();
     let s15 = engine.get_schema(tid15).unwrap();
     assert_eq!(s15.columns[0].type_code, type_code::U128);
     engine.drop_table("public.u128t").unwrap();
@@ -218,19 +248,24 @@ fn test_nonempty_schema_drop_rejected() {
     assert!(engine.pending_dir_deletions.is_empty(), "precondition: no dir queued");
 
     // A direct SCHEMA_TAB -1 (bypassing any cascade) is rejected by the guard.
-    let err = engine
-        .submit_retraction(SysFamily::Schema, sid as u128)
-        .unwrap_err();
-    assert!(err.contains("Schema not empty"),
-        "expected a non-empty-schema rejection, got: {err}");
+    let err = engine.submit_retraction(SysFamily::Schema, sid as u128).unwrap_err();
+    assert!(
+        err.contains("Schema not empty"),
+        "expected a non-empty-schema rejection, got: {err}"
+    );
 
     // Nothing was orphaned: the schema, its member, and the caches all survive,
     // and the rejected drop (running before any write) queued no dir deletion.
     assert!(engine.has_schema("s"), "schema must survive a rejected drop");
-    assert_eq!(engine.get_by_name("s", "t"), Some(tid),
-        "member row + caches must survive a rejected drop");
-    assert!(engine.pending_dir_deletions.is_empty(),
-        "a rejected non-empty drop must queue no directory deletion");
+    assert_eq!(
+        engine.get_by_name("s", "t"),
+        Some(tid),
+        "member row + caches must survive a rejected drop"
+    );
+    assert!(
+        engine.pending_dir_deletions.is_empty(),
+        "a rejected non-empty drop must queue no directory deletion"
+    );
 
     // Emptying the schema first lets the same drop succeed (guard now passes).
     engine.drop_table("s.t").unwrap();
@@ -309,7 +344,10 @@ fn test_restart_full() {
         assert_eq!(schema.num_columns(), 2);
         // Sequence recovery: new table should get higher ID
         let new_tid = engine.create_table("marketing.other", &cols, &[0], true).unwrap();
-        assert!(new_tid > first_tid, "Allocator sequence recovery failed: {new_tid} <= {first_tid}");
+        assert!(
+            new_tid > first_tid,
+            "Allocator sequence recovery failed: {new_tid} <= {first_tid}"
+        );
         engine.close();
     }
 
@@ -390,11 +428,13 @@ fn test_nullable_pk_rejected() {
             type_code: type_code::U64,
             is_nullable: true,
             fk_table_id: 0,
-            fk_col_idx:  0,
+            fk_col_idx: 0,
         },
         str_col_def("name"),
     ];
-    let err = engine.create_table("public.bad_pk_null", &cols, &[0], true).unwrap_err();
+    let err = engine
+        .create_table("public.bad_pk_null", &cols, &[0], true)
+        .unwrap_err();
     assert!(err.contains("nullable"), "expected nullable-PK error, got: {err}");
 
     // Sanity: same shape with is_nullable=false succeeds.
@@ -421,8 +461,20 @@ fn test_hook_table_register_rejects_malformed_pk() {
     let col_defs = vec![
         u64_col_def("c0"),
         str_col_def("c1"),
-        ColumnDef { name: "c2".into(), type_code: type_code::U64, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
-        ColumnDef { name: "c3".into(), type_code: type_code::F32, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef {
+            name: "c2".into(),
+            type_code: type_code::U64,
+            is_nullable: true,
+            fk_table_id: 0,
+            fk_col_idx: 0,
+        },
+        ColumnDef {
+            name: "c3".into(),
+            type_code: type_code::F32,
+            is_nullable: false,
+            fk_table_id: 0,
+            fk_col_idx: 0,
+        },
     ];
     let tid = engine.allocate_table_id();
     engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
@@ -435,10 +487,10 @@ fn test_hook_table_register_rejects_malformed_pk() {
     };
 
     // Count out of range (decoded count, not clamped slice length).
-    assert_rejects(PK_LIST_PACKED_FLAG, "out of range 1..=4");          // count 0
-    assert_rejects(PK_LIST_PACKED_FLAG | 5, "out of range 1..=4");      // count 5
-    assert_rejects(PK_LIST_PACKED_FLAG | 15, "out of range 1..=4");     // count 15
-    // Out-of-bounds index (index 5, only 3 columns).
+    assert_rejects(PK_LIST_PACKED_FLAG, "out of range 1..=4"); // count 0
+    assert_rejects(PK_LIST_PACKED_FLAG | 5, "out of range 1..=4"); // count 5
+    assert_rejects(PK_LIST_PACKED_FLAG | 15, "out of range 1..=4"); // count 15
+                                                                    // Out-of-bounds index (index 5, only 3 columns).
     assert_rejects(PK_LIST_PACKED_FLAG | 1 | (5 << 4), "out of bounds");
     // Duplicate index [0, 0]. The `(0 << N)` forms document the slot layout
     // (count=2, idx0@bit4=0, idx1@bit11=0) even though they evaluate to 0.
@@ -523,18 +575,21 @@ fn test_apply_pk_col_of_round_trips_compound_list() {
     );
 
     // Compound PK lists 2..=4 round-trip element-for-element.
-    for (tid_offset, pk_cols) in [
-        (0i64, vec![0u32, 1]),
-        (1,    vec![0u32, 3, 5]),
-        (2,    vec![1u32, 2, 7, 11]),
-    ] {
+    for (tid_offset, pk_cols) in [(0i64, vec![0u32, 1]), (1, vec![0u32, 3, 5]), (2, vec![1u32, 2, 7, 11])] {
         let tid: i64 = 9100 + tid_offset;
         let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&pk_cols), "t");
         engine.apply_pk_col_of(TABLE_TAB_ID, &batch).unwrap();
-        let stored = engine.caches.pk_col_of.get(&tid)
-            .copied().expect("pk_col_of entry must exist after apply");
-        assert_eq!(stored.as_slice(), pk_cols.as_slice(),
-            "compound PK list must round-trip in full (input={pk_cols:?})");
+        let stored = engine
+            .caches
+            .pk_col_of
+            .get(&tid)
+            .copied()
+            .expect("pk_col_of entry must exist after apply");
+        assert_eq!(
+            stored.as_slice(),
+            pk_cols.as_slice(),
+            "compound PK list must round-trip in full (input={pk_cols:?})"
+        );
     }
 
     engine.close();
@@ -565,11 +620,17 @@ fn test_drop_view_removes_directory() {
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
 
     // The register hook created the physical view directory on disk.
-    let view_dir = engine.dag.tables.get(&vid)
+    let view_dir = engine
+        .dag
+        .tables
+        .get(&vid)
         .expect("view registered in dag")
-        .directory.clone();
-    assert!(std::path::Path::new(&view_dir).exists(),
-        "view dir should exist after create: {view_dir}");
+        .directory
+        .clone();
+    assert!(
+        std::path::Path::new(&view_dir).exists(),
+        "view dir should exist after create: {view_dir}"
+    );
 
     // Drop removes catalog metadata and queues the physical directory into
     // pending_dir_deletions (deferred so the rmdir can't race the WAL fsync).
@@ -577,12 +638,13 @@ fn test_drop_view_removes_directory() {
     // drive that step directly here.
     engine.drop_view("public.myview").unwrap();
     engine.drain_pending_dir_deletions();
-    assert!(!std::path::Path::new(&view_dir).exists(),
-        "view dir must be deleted on drop: {view_dir}");
+    assert!(
+        !std::path::Path::new(&view_dir).exists(),
+        "view dir must be deleted on drop: {view_dir}"
+    );
 
     // No double-drop: the view is gone from the catalog.
-    assert!(engine.drop_view("public.myview").is_err(),
-        "second drop must error");
+    assert!(engine.drop_view("public.myview").is_err(), "second drop must error");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -600,7 +662,9 @@ fn test_drop_view_cascades_columns_and_view_deps() {
     let dir = temp_dir("drop_view_cascade");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    let base_tid = engine.create_table("public.base", &[u64_col_def("id")], &[0], true).unwrap();
+    let base_tid = engine
+        .create_table("public.base", &[u64_col_def("id")], &[0], true)
+        .unwrap();
 
     // Baseline: system + base-table column rows; no view-dep rows yet.
     let base_cols = count_records(&mut engine.sys_columns);
@@ -617,19 +681,29 @@ fn test_drop_view_cascades_columns_and_view_deps() {
 
     engine.write_view_deps(vid, &[base_tid]).unwrap();
 
-    assert!(count_records(&mut engine.sys_columns) > base_cols,
-        "view column rows must be present before drop");
-    assert!(count_records(&mut engine.sys_view_deps) > base_deps,
-        "view-dep row must be present before drop");
+    assert!(
+        count_records(&mut engine.sys_columns) > base_cols,
+        "view column rows must be present before drop"
+    );
+    assert!(
+        count_records(&mut engine.sys_view_deps) > base_deps,
+        "view-dep row must be present before drop"
+    );
 
     // Drop the view: the VIEW_TAB -1 cascade must retract both families.
     engine.drop_view("public.depview").unwrap();
     engine.drain_pending_dir_deletions();
 
-    assert_eq!(count_records(&mut engine.sys_columns), base_cols,
-        "sys_columns must return to baseline after drop_view (column cascade)");
-    assert_eq!(count_records(&mut engine.sys_view_deps), base_deps,
-        "sys_view_deps must return to baseline after drop_view (dep cascade)");
+    assert_eq!(
+        count_records(&mut engine.sys_columns),
+        base_cols,
+        "sys_columns must return to baseline after drop_view (column cascade)"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_view_deps),
+        base_deps,
+        "sys_view_deps must return to baseline after drop_view (dep cascade)"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -645,12 +719,18 @@ fn test_drop_view_cascades_columns_and_view_deps() {
 #[test]
 fn ddl_emitters_use_no_raw_handle_capability() {
     let src = include_str!("../ddl.rs");
-    assert!(!src.contains("ingest_batch_into"),
-        "ddl.rs must not call ingest_batch_into — route writes through submit/submit_local");
-    assert!(!src.contains("sys_table_mut"),
-        "ddl.rs must not call sys_table_mut — the emitters cannot name a sys_* handle");
-    assert!(!src.contains("self.sys_"),
-        "ddl.rs must not touch a sys_* handle directly — emit a delta via submit instead");
+    assert!(
+        !src.contains("ingest_batch_into"),
+        "ddl.rs must not call ingest_batch_into — route writes through submit/submit_local"
+    );
+    assert!(
+        !src.contains("sys_table_mut"),
+        "ddl.rs must not call sys_table_mut — the emitters cannot name a sys_* handle"
+    );
+    assert!(
+        !src.contains("self.sys_"),
+        "ddl.rs must not touch a sys_* handle directly — emit a delta via submit instead"
+    );
 }
 
 // ── test_view_backfill_chunked_matches_unchunked ──────────────────────────
@@ -694,8 +774,7 @@ fn test_view_backfill_chunked_matches_unchunked() {
         let mut c = engine.dag.tables.get(&id).unwrap().handle.open_cursor();
         let mut rows = Vec::new();
         while c.cursor.valid {
-            rows.push((c.cursor.current_key, c.cursor.current_weight,
-                       cursor_read_string(&c, 1)));
+            rows.push((c.cursor.current_key, c.cursor.current_weight, cursor_read_string(&c, 1)));
             c.cursor.advance();
         }
         rows
@@ -703,8 +782,11 @@ fn test_view_backfill_chunked_matches_unchunked() {
 
     let base_rows = scan_rows(&engine, tid);
     assert_eq!(base_rows.len() as u64, n, "base table must hold every row");
-    assert_eq!(scan_rows(&engine, vid), base_rows,
-        "chunked view backfill must equal the base table row-for-row");
+    assert_eq!(
+        scan_rows(&engine, vid),
+        base_rows,
+        "chunked view backfill must equal the base table row-for-row"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -740,22 +822,22 @@ fn drop_cascade_broadcasts_children_before_parents() {
     engine.submit_retraction(SysFamily::Table, tid as u128).unwrap();
 
     // Collect the broadcast family-id sequence.
-    let tids: Vec<i64> = engine.drain_pending_broadcasts()
-        .iter().map(|(tab, _)| *tab).collect();
+    let tids: Vec<i64> = engine.drain_pending_broadcasts().iter().map(|(tab, _)| *tab).collect();
 
     let pos = |id: i64| tids.iter().position(|&t| t == id);
-    let idx_pos = pos(IDX_TAB_ID)
-        .unwrap_or_else(|| panic!("IDX_TAB retraction must be broadcast; seq={tids:?}"));
-    let col_pos = pos(COL_TAB_ID)
-        .unwrap_or_else(|| panic!("COL_TAB retraction must be broadcast; seq={tids:?}"));
-    let tab_pos = pos(TABLE_TAB_ID)
-        .unwrap_or_else(|| panic!("TABLE_TAB retraction must be broadcast; seq={tids:?}"));
+    let idx_pos = pos(IDX_TAB_ID).unwrap_or_else(|| panic!("IDX_TAB retraction must be broadcast; seq={tids:?}"));
+    let col_pos = pos(COL_TAB_ID).unwrap_or_else(|| panic!("COL_TAB retraction must be broadcast; seq={tids:?}"));
+    let tab_pos = pos(TABLE_TAB_ID).unwrap_or_else(|| panic!("TABLE_TAB retraction must be broadcast; seq={tids:?}"));
 
     // Children strictly precede the parent table row.
-    assert!(idx_pos < tab_pos,
-        "secondary-index retraction must broadcast before its owner table: seq={tids:?}");
-    assert!(col_pos < tab_pos,
-        "column retraction must broadcast before its owner table: seq={tids:?}");
+    assert!(
+        idx_pos < tab_pos,
+        "secondary-index retraction must broadcast before its owner table: seq={tids:?}"
+    );
+    assert!(
+        col_pos < tab_pos,
+        "column retraction must broadcast before its owner table: seq={tids:?}"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -787,20 +869,27 @@ fn table_retract_applies_qname_before_id() {
 
     // The drop must have cleared the qname mapping; a reversed qname/id
     // retraction order leaves it pointing at the dropped tid.
-    assert!(!engine.caches.entity_by_qname.contains_key("public.t"),
-        "drop must clear entity_by_qname; a reversed retraction order leaks a stale mapping");
+    assert!(
+        !engine.caches.entity_by_qname.contains_key("public.t"),
+        "drop must clear entity_by_qname; a reversed retraction order leaks a stale mapping"
+    );
 
     // Recreate under the same qualified name. A leaked stale mapping would
     // make the qname-uniqueness guard reject this create.
     let recreate = engine.create_table("public.t", &cols, &[0], true);
-    assert!(recreate.is_ok(),
-        "recreate of a dropped same-name table must succeed; a stale qname mapping blocks it: {recreate:?}");
+    assert!(
+        recreate.is_ok(),
+        "recreate of a dropped same-name table must succeed; a stale qname mapping blocks it: {recreate:?}"
+    );
     let tid2 = recreate.unwrap();
     assert_ne!(tid1, tid2, "recreated table must get a fresh tid");
 
     // entity_by_qname must resolve to the NEW tid.
-    assert_eq!(engine.caches.entity_by_qname.get("public.t").copied(), Some(tid2),
-        "entity_by_qname must resolve to the NEW tid after drop + recreate");
+    assert_eq!(
+        engine.caches.entity_by_qname.get("public.t").copied(),
+        Some(tid2),
+        "entity_by_qname must resolve to the NEW tid after drop + recreate"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

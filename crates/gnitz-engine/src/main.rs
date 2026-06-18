@@ -3,13 +3,13 @@ compile_error!("GnitzDB requires a little-endian target; the wire format is LE-o
 
 #[macro_use]
 mod foundation;
-mod schema;
-mod storage;
+mod catalog;
 mod expr;
 mod ops;
 mod query;
-mod catalog;
 mod runtime;
+mod schema;
+mod storage;
 
 #[cfg(test)]
 mod test_rng;

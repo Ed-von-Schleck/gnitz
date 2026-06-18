@@ -106,7 +106,10 @@ impl CursorSource {
     /// Infallible: `MappedShard::open` validates all encoding constraints and
     /// region sizes at open time, so no arm here can fail.
     pub(super) fn to_unified(&self, schema: &SchemaDescriptor) -> UnifiedSource {
-        let mut cols = [ColPtr { base: ptr::null(), stride: 0 }; MAX_COLUMNS - 1];
+        let mut cols = [ColPtr {
+            base: ptr::null(),
+            stride: 0,
+        }; MAX_COLUMNS - 1];
         match self {
             CursorSource::Batch(b) => {
                 let mb = b.as_mem_batch();
@@ -140,9 +143,10 @@ impl CursorSource {
                 let data_ptr = s.data().as_ptr();
 
                 let pk = match &s.pk {
-                    RegionView::Raw { offset, .. } => {
-                        ColPtr { base: unsafe { data_ptr.add(*offset) }, stride: pk_stride }
-                    }
+                    RegionView::Raw { offset, .. } => ColPtr {
+                        base: unsafe { data_ptr.add(*offset) },
+                        stride: pk_stride,
+                    },
                     // stride=0: base.add(ri * 0) == base for every row, reads
                     // the constant value identically to null_bmp Constant.
                     RegionView::Constant { value, .. } => ColPtr {
@@ -153,12 +157,10 @@ impl CursorSource {
                 };
 
                 let null_bmp = match &s.null_bmp {
-                    RegionView::Raw { offset, .. } => {
-                        ColPtr {
-                            base: unsafe { data_ptr.add(*offset) },
-                            stride: FIXED_REGION_BYTES,
-                        }
-                    }
+                    RegionView::Raw { offset, .. } => ColPtr {
+                        base: unsafe { data_ptr.add(*offset) },
+                        stride: FIXED_REGION_BYTES,
+                    },
                     RegionView::Constant { value, .. } => ColPtr {
                         base: value.as_ptr(),
                         stride: 0,
@@ -169,9 +171,10 @@ impl CursorSource {
                 for (pi, _ci, col) in schema.payload_columns() {
                     let cs = col.size() as usize;
                     cols[pi] = match &s.col_regions[pi] {
-                        RegionView::Raw { offset, .. } => {
-                            ColPtr { base: unsafe { data_ptr.add(*offset) }, stride: cs }
-                        }
+                        RegionView::Raw { offset, .. } => ColPtr {
+                            base: unsafe { data_ptr.add(*offset) },
+                            stride: cs,
+                        },
                         RegionView::Constant { value, .. } => ColPtr {
                             base: value.as_ptr(),
                             stride: 0,

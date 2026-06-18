@@ -36,23 +36,37 @@ fn test_enforce_unique_pk() {
 
     // ST3: intra-batch duplicate — last value wins (one net row for PK=5).
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(5u128, 1); bb.put_u64(10); bb.end_row();
-    bb.begin_row(5u128, 1); bb.put_u64(20); bb.end_row();
+    bb.begin_row(5u128, 1);
+    bb.put_u64(10);
+    bb.end_row();
+    bb.begin_row(5u128, 1);
+    bb.put_u64(20);
+    bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     assert_eq!(live(&mut engine), 3);
 
     // ST4: intra-batch insert then delete cancel (PK=6 not added).
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(6u128, 1);  bb.put_u64(10); bb.end_row();
-    bb.begin_row(6u128, -1); bb.put_u64(10); bb.end_row();
+    bb.begin_row(6u128, 1);
+    bb.put_u64(10);
+    bb.end_row();
+    bb.begin_row(6u128, -1);
+    bb.put_u64(10);
+    bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     assert_eq!(live(&mut engine), 3);
 
     // ST5: regression — +1, -1, +1 on a fresh PK must net to +1, not 0.
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(7u128, 1);  bb.put_u64(100); bb.end_row();
-    bb.begin_row(7u128, -1); bb.put_u64(100); bb.end_row();
-    bb.begin_row(7u128, 1);  bb.put_u64(200); bb.end_row();
+    bb.begin_row(7u128, 1);
+    bb.put_u64(100);
+    bb.end_row();
+    bb.begin_row(7u128, -1);
+    bb.put_u64(100);
+    bb.end_row();
+    bb.begin_row(7u128, 1);
+    bb.put_u64(200);
+    bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     assert_eq!(live(&mut engine), 4, "+1,-1,+1 must leave PK=7 live");
 
@@ -72,12 +86,12 @@ fn test_orphaned_metadata_recovery() {
         let idx_schema = idx_tab_schema();
         let mut bb = BatchBuilder::new(idx_schema);
         bb.begin_row(888u128, 1);
-        bb.put_u64(99999);   // owner_id (non-existent)
+        bb.put_u64(99999); // owner_id (non-existent)
         bb.put_u64(OWNER_KIND_TABLE as u64);
-        bb.put_u64(1);       // source_col_idx
+        bb.put_u64(1); // source_col_idx
         bb.put_string("orphaned_idx");
-        bb.put_u64(0);       // is_unique
-        bb.put_string("");   // cache_dir
+        bb.put_u64(0); // is_unique
+        bb.put_string(""); // cache_dir
         bb.end_row();
         ingest_batch_into(&mut engine.sys_indices, &bb.finish());
         let _ = engine.sys_indices.flush();
@@ -122,14 +136,14 @@ fn test_sequence_gap_recovery() {
         let mut cbb = BatchBuilder::new(col_schema);
         let pk = pack_column_id(250, 0);
         cbb.begin_row(pk as u128, 1);
-        cbb.put_u64(250);   // owner_id
+        cbb.put_u64(250); // owner_id
         cbb.put_u64(OWNER_KIND_TABLE as u64);
-        cbb.put_u64(0);     // col_idx
+        cbb.put_u64(0); // col_idx
         cbb.put_string("id");
         cbb.put_u64(type_code::U64 as u64);
-        cbb.put_u64(0);     // is_nullable
-        cbb.put_u64(0);     // fk_table_id
-        cbb.put_u64(0);     // fk_col_idx
+        cbb.put_u64(0); // is_nullable
+        cbb.put_u64(0); // fk_table_id
+        cbb.put_u64(0); // fk_col_idx
         cbb.end_row();
         ingest_batch_into(&mut engine.sys_columns, &cbb.finish());
 
@@ -162,9 +176,15 @@ fn test_ingest_scan_seek_family() {
 
     // Ingest via CatalogEngine (user table path)
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1); bb.put_u64(100); bb.end_row();
-    bb.begin_row(2u128, 1); bb.put_u64(200); bb.end_row();
-    bb.begin_row(3u128, 1); bb.put_u64(300); bb.end_row();
+    bb.begin_row(1u128, 1);
+    bb.put_u64(100);
+    bb.end_row();
+    bb.begin_row(2u128, 1);
+    bb.put_u64(200);
+    bb.end_row();
+    bb.begin_row(3u128, 1);
+    bb.put_u64(300);
+    bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -199,13 +219,17 @@ fn test_ingest_unique_pk_partitioned() {
 
     // Insert row with PK=1, val=100
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1); bb.put_u64(100); bb.end_row();
+    bb.begin_row(1u128, 1);
+    bb.put_u64(100);
+    bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
     // Insert row with PK=1 again, val=200 (should retract old + insert new)
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1); bb.put_u64(200); bb.end_row();
+    bb.begin_row(1u128, 1);
+    bb.put_u64(200);
+    bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -252,8 +276,8 @@ fn test_ddl_sync_zone_lsn_tracking() {
     // touched system table's `current_lsn` to that zone LSN. After successive
     // DDL zones, `get_max_flushed_lsn` reports the most recent zone LSN,
     // and recovery can skip already-applied groups.
+    use crate::catalog::sys_tables::{COL_TAB_ID, SCHEMA_TAB_ID, TABLE_TAB_ID};
     use std::num::NonZeroU64;
-    use crate::catalog::sys_tables::{SCHEMA_TAB_ID, TABLE_TAB_ID, COL_TAB_ID};
 
     let zone = |lsn: u64| NonZeroU64::new(lsn).unwrap();
     let dir = temp_dir("catalog_zone_lsn");
@@ -271,8 +295,11 @@ fn test_ddl_sync_zone_lsn_tracking() {
     let _tid = engine.create_table("z.t", &cols, &[0], false).unwrap();
     assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 7);
     assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 7);
-    assert_eq!(engine.get_max_flushed_lsn(SCHEMA_TAB_ID), 5,
-        "SCHEMA_TAB stays at the most recent zone that touched it");
+    assert_eq!(
+        engine.get_max_flushed_lsn(SCHEMA_TAB_ID),
+        5,
+        "SCHEMA_TAB stays at the most recent zone that touched it"
+    );
 
     // Zone 9: another table. TABLE_TAB and COL_TAB advance to lsn=9.
     engine.ctx.open_ddl_zone(zone(9));
@@ -305,8 +332,12 @@ fn test_raw_store_ingest() {
 
     // Raw ingest (SAL recovery path — no hooks, no unique_pk, no index projection)
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(10u128, 1); bb.put_u64(1000); bb.end_row();
-    bb.begin_row(20u128, 1); bb.put_u64(2000); bb.end_row();
+    bb.begin_row(10u128, 1);
+    bb.put_u64(1000);
+    bb.end_row();
+    bb.begin_row(20u128, 1);
+    bb.put_u64(2000);
+    bb.end_row();
     engine.raw_store_ingest(tid, bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
 
@@ -407,9 +438,27 @@ fn test_get_column_names_cached() {
     let dir = temp_dir("catalog_colnames");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let cols = vec![
-        ColumnDef { name: "pk".into(), type_code: type_code::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-        ColumnDef { name: "alpha".into(), type_code: type_code::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-        ColumnDef { name: "beta".into(), type_code: type_code::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+        ColumnDef {
+            name: "pk".into(),
+            type_code: type_code::U64,
+            is_nullable: false,
+            fk_table_id: 0,
+            fk_col_idx: 0,
+        },
+        ColumnDef {
+            name: "alpha".into(),
+            type_code: type_code::U64,
+            is_nullable: false,
+            fk_table_id: 0,
+            fk_col_idx: 0,
+        },
+        ColumnDef {
+            name: "beta".into(),
+            type_code: type_code::U64,
+            is_nullable: false,
+            fk_table_id: 0,
+            fk_col_idx: 0,
+        },
     ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
 
@@ -460,11 +509,11 @@ fn test_circuit_table_surface_introspectable() {
     let mut bb = BatchBuilder::new(schema);
     let pk = pack_view_pk(0, 42); // view_id=0, sub=node_id=42
     bb.begin_row(pk, 1);
-    bb.put_u64(42);  // node_id
-    bb.put_u64(11);  // opcode
-    bb.put_null();   // source_table (NULL)
-    bb.put_null();   // reindex_col (NULL)
-    bb.put_null();   // expr_program (NULL)
+    bb.put_u64(42); // node_id
+    bb.put_u64(11); // opcode
+    bb.put_null(); // source_table (NULL)
+    bb.put_null(); // reindex_col (NULL)
+    bb.put_null(); // expr_program (NULL)
     bb.end_row();
     engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();
 

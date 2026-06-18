@@ -4,7 +4,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::foundation::syscall;
-use crate::runtime::w2m_ring::{self, W2mRingHeader, FLAG_MASTER_PARKED, FLAG_WRITER_PARKED, TryReserve};
+use crate::runtime::w2m_ring::{self, TryReserve, W2mRingHeader, FLAG_MASTER_PARKED, FLAG_WRITER_PARKED};
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire};
 
 /// Worker's write side of a single W2M ring.
@@ -18,7 +18,8 @@ impl W2mWriter {
     pub fn new(region_ptr: *mut u8, region_size: u64) -> Self {
         let hdr = unsafe { W2mRingHeader::from_raw(region_ptr as *const u8) };
         assert_eq!(
-            hdr.capacity(), region_size,
+            hdr.capacity(),
+            region_size,
             "W2mWriter region_size must match ring header capacity",
         );
         W2mWriter { region_ptr }
@@ -31,7 +32,8 @@ impl W2mWriter {
         assert!(
             (sz as u64) <= w2m_ring::MAX_W2M_MSG,
             "W2mWriter::send_encoded: sz={} exceeds MAX_W2M_MSG={}",
-            sz, w2m_ring::MAX_W2M_MSG,
+            sz,
+            w2m_ring::MAX_W2M_MSG,
         );
         let hdr = unsafe { W2mRingHeader::from_raw(self.region_ptr as *const u8) };
 
@@ -41,15 +43,10 @@ impl W2mWriter {
                 TryReserve::Ok(r) => break r,
                 TryReserve::Full => {
                     let expected = hdr.writer_seq().load(Ordering::Acquire);
-                    hdr.waiter_flags()
-                        .fetch_or(FLAG_WRITER_PARKED, Ordering::AcqRel);
+                    hdr.waiter_flags().fetch_or(FLAG_WRITER_PARKED, Ordering::AcqRel);
                     let room_now = unsafe { w2m_ring::has_room(hdr, sz) };
                     if !room_now {
-                        let rc = syscall::futex_wait_u32(
-                            hdr.writer_seq() as *const AtomicU32,
-                            expected,
-                            -1,
-                        );
+                        let rc = syscall::futex_wait_u32(hdr.writer_seq() as *const AtomicU32, expected, -1);
                         // libc::syscall returns -1 on error (not -errno); read errno
                         // directly. EINTR (signal) and EAGAIN (value already changed)
                         // are both harmless — retry. Anything else is fatal.
@@ -59,22 +56,20 @@ impl W2mWriter {
                                 crate::gnitz_fatal_abort!(
                                     "W2mWriter::send_encoded: futex_wait_u32 failed: \
                                      rc={} errno={}",
-                                    rc, errno,
+                                    rc,
+                                    errno,
                                 );
                             }
                         }
                     }
-                    hdr.waiter_flags()
-                        .fetch_and(!FLAG_WRITER_PARKED, Ordering::AcqRel);
+                    hdr.waiter_flags().fetch_and(!FLAG_WRITER_PARKED, Ordering::AcqRel);
                 }
             }
         };
 
         unsafe {
             if reservation.slot_len > 0 {
-                let slice = std::slice::from_raw_parts_mut(
-                    reservation.slot_ptr, reservation.slot_len,
-                );
+                let slice = std::slice::from_raw_parts_mut(reservation.slot_ptr, reservation.slot_len);
                 encode_fn(slice);
             }
             w2m_ring::commit(hdr, reservation);
@@ -86,7 +81,8 @@ impl W2mWriter {
             if rc < 0 {
                 crate::gnitz_fatal_abort!(
                     "W2mWriter::send_encoded: futex_wake_u32 failed: rc={} errno={}",
-                    rc, syscall::errno(),
+                    rc,
+                    syscall::errno(),
                 );
             }
         }
@@ -105,13 +101,13 @@ impl W2mWriter {
 pub(crate) const W2M_MAX_IN_FLIGHT: usize = 64;
 
 struct InFlightState {
-    hdr:       &'static W2mRingHeader,
+    hdr: &'static W2mRingHeader,
     /// Index of the slot at the front of the queue (oldest in-flight).
     front_idx: u64,
     /// new_vrc for each in-flight slot, stored at push_idx % W2M_MAX_IN_FLIGHT.
-    queue:     [u64; W2M_MAX_IN_FLIGHT],
+    queue: [u64; W2M_MAX_IN_FLIGHT],
     /// Number of in-flight slots; next push_idx = front_idx + len.
-    len:       u8,
+    len: u8,
     /// Bit i is set when the slot at position (front_idx + i) has been released.
     completed: u64,
 }
@@ -156,19 +152,22 @@ impl InFlightState {
             // `>>= 64` is a shift-by-width: a debug-build panic, and on
             // release x86_64 a mask to `>> 0` that leaves `completed` full of
             // stale ones, corrupting the next release. Zero it explicitly.
-            if n == 64 { self.completed = 0; } else { self.completed >>= n; }
+            if n == 64 {
+                self.completed = 0;
+            } else {
+                self.completed >>= n;
+            }
             self.front_idx += n;
             self.len -= n as u8;
             self.hdr.advance_consume_cursor(last_vrc);
             self.hdr.writer_seq().fetch_add(1, Ordering::Release);
             if self.hdr.waiter_flags().load(Ordering::Acquire) & FLAG_WRITER_PARKED != 0 {
-                let rc = syscall::futex_wake_u32(
-                    self.hdr.writer_seq() as *const AtomicU32, 1,
-                );
+                let rc = syscall::futex_wake_u32(self.hdr.writer_seq() as *const AtomicU32, 1);
                 if rc < 0 {
                     crate::gnitz_fatal_abort!(
                         "W2mSlot::drop: futex_wake_u32 failed: rc={} errno={}",
-                        rc, syscall::errno(),
+                        rc,
+                        syscall::errno(),
                     );
                 }
             }
@@ -185,9 +184,9 @@ impl InFlightState {
 /// Dropping advances `consume_cursor` (possibly past multiple slots when
 /// out-of-order slots complete a contiguous prefix) and wakes a parked writer.
 pub struct W2mSlot {
-    bytes:    &'static [u8],
+    bytes: &'static [u8],
     /// Borrowed directly from the ring prefix to forward to `send_buffer` without re-encoding.
-    frame:    &'static [u8],
+    frame: &'static [u8],
     push_idx: u64,
     /// `internal_req_id` from the slot prefix, set by the worker via
     /// `try_reserve`. Used by the master to route scan responses without
@@ -197,13 +196,17 @@ pub struct W2mSlot {
     /// Valid for the slot's lifetime: W2mReceiver outlives all slots
     /// (slots borrow from its mmaps), and the master thread is the
     /// sole accessor of both.
-    state:    *mut InFlightState,
+    state: *mut InFlightState,
 }
 
 impl W2mSlot {
-    pub fn bytes(&self) -> &[u8] { self.bytes }
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes
+    }
     /// The framed bytes ready for `send_buffer`: `[sz_as_u32_le | payload]`.
-    pub(crate) fn frame_bytes(&self) -> &[u8] { self.frame }
+    pub(crate) fn frame_bytes(&self) -> &[u8] {
+        self.frame
+    }
 }
 
 impl Drop for W2mSlot {
@@ -219,17 +222,20 @@ impl Drop for W2mSlot {
 /// Master's read side of W2M.
 pub struct W2mReceiver {
     region_ptrs: Vec<*mut u8>,
-    in_flight:   Vec<UnsafeCell<InFlightState>>,
+    in_flight: Vec<UnsafeCell<InFlightState>>,
 }
 
 unsafe impl Send for W2mReceiver {}
 
 impl W2mReceiver {
     pub fn new(region_ptrs: Vec<*mut u8>) -> Self {
-        let in_flight = region_ptrs.iter().map(|&p| {
-            let hdr = unsafe { W2mRingHeader::from_raw(p as *const u8) };
-            UnsafeCell::new(InFlightState::new(hdr))
-        }).collect();
+        let in_flight = region_ptrs
+            .iter()
+            .map(|&p| {
+                let hdr = unsafe { W2mRingHeader::from_raw(p as *const u8) };
+                UnsafeCell::new(InFlightState::new(hdr))
+            })
+            .collect();
         W2mReceiver { region_ptrs, in_flight }
     }
 
@@ -248,9 +254,8 @@ impl W2mReceiver {
     pub fn try_read_slot(&self, worker: usize) -> Option<W2mSlot> {
         let hdr = unsafe { self.header(worker) };
         let cursor = hdr.read_cursor().load(Ordering::Acquire);
-        let (ptr, sz, new_vrc, req_id) = unsafe {
-            w2m_ring::try_consume(hdr, self.region_ptrs[worker] as *const u8, cursor)?
-        };
+        let (ptr, sz, new_vrc, req_id) =
+            unsafe { w2m_ring::try_consume(hdr, self.region_ptrs[worker] as *const u8, cursor)? };
 
         hdr.advance_read_cursor(new_vrc);
 
@@ -262,7 +267,13 @@ impl W2mReceiver {
         let state = self.in_flight[worker].get();
         let push_idx = unsafe { (*state).take(new_vrc) };
 
-        Some(W2mSlot { bytes, frame, push_idx, internal_req_id: req_id, state })
+        Some(W2mSlot {
+            bytes,
+            frame,
+            push_idx,
+            internal_req_id: req_id,
+            state,
+        })
     }
 
     pub fn try_read(&self, worker: usize) -> Option<DecodedWire> {
@@ -271,7 +282,8 @@ impl W2mReceiver {
             Ok(decoded) => Some(decoded),
             Err(e) => crate::gnitz_fatal_abort!(
                 "W2mReceiver::try_read: worker={} decode failed: {:?} — ring corrupt",
-                worker, e,
+                worker,
+                e,
             ),
         }
     }
@@ -285,17 +297,15 @@ impl W2mReceiver {
         let rc = if wc != rc_cur {
             0
         } else {
-            syscall::futex_wait_u32(
-                hdr.reader_seq() as *const AtomicU32,
-                expected,
-                timeout_ms,
-            )
+            syscall::futex_wait_u32(hdr.reader_seq() as *const AtomicU32, expected, timeout_ms)
         };
         hdr.waiter_flags().fetch_and(!FLAG_MASTER_PARKED, Ordering::AcqRel);
         rc
     }
 
-    pub fn num_workers(&self) -> usize { self.region_ptrs.len() }
+    pub fn num_workers(&self) -> usize {
+        self.region_ptrs.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,9 +315,9 @@ impl W2mReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
-    use crate::runtime::w2m_ring::{self, W2mRingHeader, W2M_HEADER_SIZE};
     use crate::foundation::codec::align8;
+    use crate::runtime::w2m_ring::{self, W2mRingHeader, W2M_HEADER_SIZE};
+    use std::sync::atomic::Ordering;
 
     unsafe fn alloc_region(size: usize) -> *mut u8 {
         let ptr = libc::mmap(
@@ -346,8 +356,12 @@ mod tests {
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
 
-            writer.send_encoded(64, 0, |s| { s[0] = 1; });
-            writer.send_encoded(64, 0, |s| { s[0] = 2; });
+            writer.send_encoded(64, 0, |s| {
+                s[0] = 1;
+            });
+            writer.send_encoded(64, 0, |s| {
+                s[0] = 2;
+            });
 
             let slot_a = receiver.try_read_slot(0).expect("slot A");
             let new_vrc_a = hdr.read_cursor().load(Ordering::Acquire);
@@ -356,19 +370,22 @@ mod tests {
             let new_vrc_b = hdr.read_cursor().load(Ordering::Acquire);
 
             assert_eq!(
-                hdr.consume_cursor().load(Ordering::Acquire), W2M_HEADER_SIZE as u64,
+                hdr.consume_cursor().load(Ordering::Acquire),
+                W2M_HEADER_SIZE as u64,
                 "consume_cursor must not advance while slots are in-flight",
             );
 
             drop(slot_a);
             assert_eq!(
-                hdr.consume_cursor().load(Ordering::Acquire), new_vrc_a,
+                hdr.consume_cursor().load(Ordering::Acquire),
+                new_vrc_a,
                 "consume_cursor must advance to new_vrc_a after slot A drop",
             );
 
             drop(slot_b);
             assert_eq!(
-                hdr.consume_cursor().load(Ordering::Acquire), new_vrc_b,
+                hdr.consume_cursor().load(Ordering::Acquire),
+                new_vrc_b,
                 "consume_cursor must advance to new_vrc_b after slot B drop",
             );
 
@@ -386,8 +403,12 @@ mod tests {
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
 
-            writer.send_encoded(64, 0, |s| { s[0] = 1; });
-            writer.send_encoded(64, 0, |s| { s[0] = 2; });
+            writer.send_encoded(64, 0, |s| {
+                s[0] = 1;
+            });
+            writer.send_encoded(64, 0, |s| {
+                s[0] = 2;
+            });
 
             let slot_a = receiver.try_read_slot(0).expect("slot A");
             let slot_b = receiver.try_read_slot(0).expect("slot B");
@@ -398,14 +419,16 @@ mod tests {
             // Drop B first. B is not the head, so consume_cursor must not advance.
             drop(slot_b);
             assert_eq!(
-                hdr.consume_cursor().load(Ordering::Acquire), initial_cc,
+                hdr.consume_cursor().load(Ordering::Acquire),
+                initial_cc,
                 "consume_cursor must not advance when non-head slot is released",
             );
 
             // Drop A. Both A and B complete the prefix — consume_cursor jumps to new_vrc_b.
             drop(slot_a);
             assert_eq!(
-                hdr.consume_cursor().load(Ordering::Acquire), new_vrc_b,
+                hdr.consume_cursor().load(Ordering::Acquire),
+                new_vrc_b,
                 "consume_cursor must advance through both A and B on head release",
             );
 
@@ -427,7 +450,9 @@ mod tests {
 
             // Fill the ring (non-blocking direct call).
             let hdr_raw = W2mRingHeader::from_raw(ptr as *const u8);
-            match w2m_ring::try_publish(hdr_raw, ptr, msg_sz, |s| { s[0] = 1; }) {
+            match w2m_ring::try_publish(hdr_raw, ptr, msg_sz, |s| {
+                s[0] = 1;
+            }) {
                 w2m_ring::TryPublish::Ok(_) => {}
                 w2m_ring::TryPublish::Full => panic!("ring should have room for first message"),
             }
@@ -440,7 +465,9 @@ mod tests {
             // Spawn a thread that tries to publish a second message.
             // It will block until consume_cursor advances.
             let handle = std::thread::spawn(move || {
-                writer.send_encoded(msg_sz, 0, |s| { s[0] = 2; });
+                writer.send_encoded(msg_sz, 0, |s| {
+                    s[0] = 2;
+                });
                 let _ = done_tx.send(());
             });
 
@@ -473,9 +500,12 @@ mod tests {
             let receiver = W2mReceiver::new(vec![ptr]);
             let hdr = receiver.header(0);
 
-            for i in 0..64u8 { writer.send_encoded(8, 0, |s| { s[0] = i; }); }
-            let mut slots: Vec<_> =
-                (0..64).map(|_| receiver.try_read_slot(0).expect("slot")).collect();
+            for i in 0..64u8 {
+                writer.send_encoded(8, 0, |s| {
+                    s[0] = i;
+                });
+            }
+            let mut slots: Vec<_> = (0..64).map(|_| receiver.try_read_slot(0).expect("slot")).collect();
             // new_vrc of the 64th slot — where consume_cursor must land once the
             // whole prefix retires.
             let last_vrc = hdr.read_cursor().load(Ordering::Acquire);
@@ -485,7 +515,8 @@ mod tests {
             let head = slots.remove(0);
             slots.clear(); // drops push_idx 1..63
             assert_eq!(
-                hdr.consume_cursor().load(Ordering::Acquire), W2M_HEADER_SIZE as u64,
+                hdr.consume_cursor().load(Ordering::Acquire),
+                W2M_HEADER_SIZE as u64,
                 "no prefix may retire until the head releases",
             );
 
@@ -493,7 +524,8 @@ mod tests {
             // `completed >>= 64` without the Fix F guard is UB.
             drop(head);
             assert_eq!(
-                hdr.consume_cursor().load(Ordering::Acquire), last_vrc,
+                hdr.consume_cursor().load(Ordering::Acquire),
+                last_vrc,
                 "head release must retire the full 64-slot prefix to the last new_vrc",
             );
 

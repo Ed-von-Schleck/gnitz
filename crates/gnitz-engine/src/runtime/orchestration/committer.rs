@@ -23,17 +23,15 @@
 //!   signals via a oneshot — used by DDL to drain the committer before
 //!   catalog mutation.
 
+use crate::foundation::posix_io::guard_panic;
+use crate::runtime::master::{first_worker_error_opt, MasterDispatcher};
+use crate::runtime::reactor::{join_into, mpsc, oneshot, AsyncMutex, Reactor, ReplyFuture};
+use crate::runtime::wire::{DecodedWire, WireConflictMode};
+use crate::storage::Batch;
+use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Instant;
-use rustc_hash::FxHashMap;
-use crate::runtime::wire::{DecodedWire, WireConflictMode};
-use crate::runtime::master::{MasterDispatcher, first_worker_error_opt};
-use crate::runtime::reactor::{
-    AsyncMutex, Reactor, ReplyFuture, join_into, mpsc, oneshot,
-};
-use crate::storage::Batch;
-use crate::foundation::posix_io::guard_panic;
 
 const MAX_PENDING_ROWS: usize = 100_000;
 const TICK_COALESCE_ROWS: usize = 10_000;
@@ -89,7 +87,9 @@ pub struct Shared {
 
 impl Shared {
     #[allow(clippy::mut_from_ref)]
-    fn disp(&self) -> &mut MasterDispatcher { unsafe { &mut *self.disp_ptr } }
+    fn disp(&self) -> &mut MasterDispatcher {
+        unsafe { &mut *self.disp_ptr }
+    }
 }
 
 /// The committer task loop. Returns when all senders drop (shutdown).
@@ -117,8 +117,8 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
     // skip the `strides_from_schema + zero-fill via buf.resize` cost.
     // Capacity sized for typical hot-table fan-out; grows on demand.
     const EXPECTED_HOT_TABLES: usize = 16;
-    let mut merge_pool: FxHashMap<(i64, u8), Batch> = FxHashMap::with_capacity_and_hasher(
-        EXPECTED_HOT_TABLES, Default::default());
+    let mut merge_pool: FxHashMap<(i64, u8), Batch> =
+        FxHashMap::with_capacity_and_hasher(EXPECTED_HOT_TABLES, Default::default());
     loop {
         // Block for the first request, exit if no senders remain.
         let first = match rx.recv().await {
@@ -142,17 +142,21 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         // so commit groups written AFTER FLAG_FLUSH in the same epoch
         // would be silently skipped by workers.
         let has_barriers = !barrier_senders.is_empty();
-        if shared.disp().sal_needs_checkpoint()
-            || (has_barriers && !shared.disp().sal_has_relay_space())
-        {
+        if shared.disp().sal_needs_checkpoint() || (has_barriers && !shared.disp().sal_has_relay_space()) {
             if let Err(e) = run_checkpoint_phase(&shared, &mut fut_slots, &mut ack_slots).await {
                 // Barrier semantics are "committer reached this point", not
                 // "checkpoint succeeded": signal anyway. relay_loop rechecks
                 // space and aborts if reclaim failed.
                 crate::gnitz_warn!("checkpoint failed: {}", e);
-                for p in pushes { let _ = p.done.send(Err(e.clone())); }
-                if has_barriers { merge_pool.clear(); }
-                for b in barrier_senders { let _ = b.send(()); }
+                for p in pushes {
+                    let _ = p.done.send(Err(e.clone()));
+                }
+                if has_barriers {
+                    merge_pool.clear();
+                }
+                for b in barrier_senders {
+                    let _ = b.send(());
+                }
                 continue;
             }
         }
@@ -164,7 +168,9 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         if has_barriers {
             merge_pool.clear();
         }
-        for b in barrier_senders { let _ = b.send(()); }
+        for b in barrier_senders {
+            let _ = b.send(());
+        }
     }
 }
 
@@ -174,7 +180,12 @@ fn start_batch(req: CommitRequest) -> (Vec<PendingPush>, Vec<oneshot::Sender<()>
     let mut barriers = Vec::new();
     match req {
         CommitRequest::Push { tid, batch, mode, done } => {
-            pushes.push(PendingPush { tid, batch: Some(batch), mode, done });
+            pushes.push(PendingPush {
+                tid,
+                batch: Some(batch),
+                mode,
+                done,
+            });
         }
         CommitRequest::Barrier { done } => barriers.push(done),
     }
@@ -191,14 +202,20 @@ fn debounce_drain(
     mut pushes: Vec<PendingPush>,
     mut barrier_senders: Vec<oneshot::Sender<()>>,
 ) -> (Vec<PendingPush>, Vec<oneshot::Sender<()>>) {
-    let mut row_count: usize = pushes.iter()
+    let mut row_count: usize = pushes
+        .iter()
         .map(|p| p.batch.as_ref().expect("batch present in debounce_drain").count)
         .sum();
     while row_count < MAX_PENDING_ROWS {
         match rx.try_recv() {
             Some(CommitRequest::Push { tid, batch, mode, done }) => {
                 row_count += batch.count;
-                pushes.push(PendingPush { tid, batch: Some(batch), mode, done });
+                pushes.push(PendingPush {
+                    tid,
+                    batch: Some(batch),
+                    mode,
+                    done,
+                });
             }
             Some(CommitRequest::Barrier { done }) => {
                 barrier_senders.push(done);
@@ -304,8 +321,7 @@ async fn commit_pushes(
             // this, append_batch writes rows under the wrong column layout.
             let merged = match guard_panic("commit_merge", || {
                 if single_push {
-                    Ok(pushes[run_start].batch.take()
-                        .expect("PendingPush.batch already taken"))
+                    Ok(pushes[run_start].batch.take().expect("PendingPush.batch already taken"))
                 } else {
                     let schema = shared.disp().schema_desc_for(tid);
                     let mut m = match merge_pool.remove(&(tid, mode_u8)) {
@@ -314,7 +330,9 @@ async fn commit_pushes(
                     };
                     m.clear();
                     for p in pushes[run_start..run_end].iter() {
-                        let pb = p.batch.as_ref()
+                        let pb = p
+                            .batch
+                            .as_ref()
                             .expect("PendingPush.batch is missing in multi-push run");
                         m.append_batch(pb, 0, pb.count);
                     }
@@ -323,15 +341,19 @@ async fn commit_pushes(
             }) {
                 Ok(m) => m,
                 Err(panic_msg) => {
-                    let placeholder = guard_panic("commit_fallback_schema", || Ok(
-                        Batch::empty_with_schema(&shared.disp().schema_desc_for(tid))
-                    ))
-                    .unwrap_or_else(|_| Batch::empty_with_schema(
-                        &crate::schema::SchemaDescriptor::minimal_u64()));
+                    let placeholder = guard_panic("commit_fallback_schema", || {
+                        Ok(Batch::empty_with_schema(&shared.disp().schema_desc_for(tid)))
+                    })
+                    .unwrap_or_else(|_| Batch::empty_with_schema(&crate::schema::SchemaDescriptor::minimal_u64()));
                     groups.push(GroupInfo {
-                        start: run_start, end: run_end, tid, mode_u8, req_ids,
+                        start: run_start,
+                        end: run_end,
+                        tid,
+                        mode_u8,
+                        req_ids,
                         merged: Some(placeholder),
-                        write_err: Some(panic_msg), lsn: 0,
+                        write_err: Some(panic_msg),
+                        lsn: 0,
                     });
                     run_start = run_end;
                     continue;
@@ -339,9 +361,14 @@ async fn commit_pushes(
             };
 
             groups.push(GroupInfo {
-                start: run_start, end: run_end, tid, mode_u8, req_ids,
+                start: run_start,
+                end: run_end,
+                tid,
+                mode_u8,
+                req_ids,
                 merged: Some(merged),
-                write_err: None, lsn: 0,
+                write_err: None,
+                lsn: 0,
             });
             run_start = run_end;
         }
@@ -362,12 +389,18 @@ async fn commit_pushes(
         let _sal_excl = shared.sal_writer_excl.lock().await;
 
         for g in groups.iter_mut() {
-            if g.write_err.is_some() { continue; }
+            if g.write_err.is_some() {
+                continue;
+            }
             let mode = pushes[g.start].mode;
             let merged = g.merged.as_ref().expect("merged set in Phase A");
-            let err = guard_panic("commit_write", || Ok(
-                shared.disp().write_commit_group(g.tid, zone_lsn, merged, mode, &g.req_ids).err()
-            )).unwrap_or_else(Some);
+            let err = guard_panic("commit_write", || {
+                Ok(shared
+                    .disp()
+                    .write_commit_group(g.tid, zone_lsn, merged, mode, &g.req_ids)
+                    .err())
+            })
+            .unwrap_or_else(Some);
             g.write_err = err;
             g.lsn = zone_lsn;
         }
@@ -391,7 +424,9 @@ async fn commit_pushes(
         // debugging rather than asserting invisibility after restart.
         #[cfg(debug_assertions)]
         if std::env::var("GNITZ_INJECT_PUSH_ABORT").as_deref() == Ok("after_groups") {
-            unsafe { libc::abort(); }
+            unsafe {
+                libc::abort();
+            }
         }
 
         // Close the zone with the commit sentinel before fsync.  If this
@@ -434,7 +469,9 @@ async fn commit_pushes(
 
         let mut cursor = 0usize;
         for g in groups.iter_mut() {
-            if g.write_err.is_some() { continue; }
+            if g.write_err.is_some() {
+                continue;
+            }
             if let Some(e) = first_worker_error_opt("commit", &ack_slots[cursor..cursor + nw]) {
                 g.write_err = Some(e);
             }
@@ -466,13 +503,20 @@ async fn commit_pushes(
             for g in &groups {
                 if g.write_err.is_none() {
                     let entry = tr.entry(g.tid).or_insert(0);
-                    if *entry == 0 { tids.push(g.tid); }
+                    if *entry == 0 {
+                        tids.push(g.tid);
+                    }
                     *entry += g.merged.as_ref().expect("merged set in Phase A").count;
                 }
             }
             shared.t_last_push.set(Some(Instant::now()));
         }
-        if shared.tick_rows.borrow().values().any(|&rows| rows >= TICK_COALESCE_ROWS) {
+        if shared
+            .tick_rows
+            .borrow()
+            .values()
+            .any(|&rows| rows >= TICK_COALESCE_ROWS)
+        {
             (shared.fire_auto_tick)();
         }
     }
@@ -484,9 +528,7 @@ async fn commit_pushes(
     {
         let fsync_rc = fsync_fut.await;
         if fsync_rc < 0 {
-            crate::gnitz_fatal_abort!(
-                "SAL fdatasync (committer) failed rc={}", fsync_rc
-            );
+            crate::gnitz_fatal_abort!("SAL fdatasync (committer) failed rc={}", fsync_rc);
         }
     }
 
@@ -503,7 +545,9 @@ async fn commit_pushes(
     // constrained INSERT re-validates from scratch.
     {
         for g in groups.iter_mut() {
-            if g.write_err.is_some() { continue; }
+            if g.write_err.is_some() {
+                continue;
+            }
             let merged = g.merged.as_ref().expect("merged set in Phase A");
             if let Err(e) = guard_panic("unique_filter_ingest", || {
                 shared.disp().unique_filter_ingest_batch(g.tid, merged);

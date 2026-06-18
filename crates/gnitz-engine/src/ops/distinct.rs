@@ -1,10 +1,10 @@
 //! DBSP distinct operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{write_to_batch, Batch, ConsolidatedBatch, ReadCursor, scatter_copy};
+use crate::storage::{scatter_copy, write_to_batch, Batch, ConsolidatedBatch, ReadCursor};
 
 use super::cogroup::cogroup_left;
-use super::util::{signum, compare_cursor_payload_to_batch_row};
+use super::util::{compare_cursor_payload_to_batch_row, signum};
 
 // ---------------------------------------------------------------------------
 // Distinct
@@ -23,7 +23,10 @@ pub fn op_distinct(
     let consolidated = delta.into_consolidated(schema);
     let n = consolidated.count;
     if n == 0 {
-        return (ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema)), consolidated);
+        return (
+            ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema)),
+            consolidated,
+        );
     }
 
     // 2. Co-group the consolidated delta against the integral trace on PK, then
@@ -71,15 +74,17 @@ pub fn op_distinct(
 
     // 3. Scatter-copy emitting rows
     if emit_indices.is_empty() {
-        return (ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema)), consolidated);
+        return (
+            ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema)),
+            consolidated,
+        );
     }
 
     let mb = consolidated.as_mem_batch();
     let blob_cap = mb.blob.len().max(1);
-    let mut output =
-        write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
-            scatter_copy(&mb, &emit_indices, &emit_weights, writer);
-        });
+    let mut output = write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
+        scatter_copy(&mb, &emit_indices, &emit_weights, writer);
+    });
     output.sorted = true;
     output.consolidated = true;
 
@@ -93,7 +98,7 @@ pub fn op_distinct(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Batch;
     use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
@@ -107,10 +112,7 @@ mod tests {
         )
     }
 
-    fn make_batch(
-        schema: &SchemaDescriptor,
-        rows: &[(u64, i64, i64)],
-    ) -> Batch {
+    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
         for &(pk, w, val) in rows {
@@ -127,8 +129,8 @@ mod tests {
 
     #[test]
     fn test_op_distinct_boundary() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
 
@@ -163,8 +165,8 @@ mod tests {
     /// group, walked against a multi-payload trace group in lockstep.
     #[test]
     fn test_distinct_multi_payload_group_submerge() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
         // Trace PK=1 carries payloads 10, 20, 30 (each weight 1).
@@ -212,10 +214,7 @@ mod tests {
         )
     }
 
-    fn make_batch_narrow<const N: usize>(
-        schema: &SchemaDescriptor,
-        rows: &[(u64, i64, i64)],
-    ) -> Batch {
+    fn make_batch_narrow<const N: usize>(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
         let col_size = N;
@@ -237,8 +236,8 @@ mod tests {
 
     #[test]
     fn test_distinct_i32_payload_no_panic() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i32();
         let trace = Rc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]));
@@ -250,10 +249,7 @@ mod tests {
         assert_eq!(out.count, 0, "I32: matching (PK,payload) should produce no output");
 
         // New (PK=1, val=99) → new element → +1 output
-        let mut ch2 = CursorHandle::from_owned(
-            &[Rc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]))],
-            schema,
-        );
+        let mut ch2 = CursorHandle::from_owned(&[Rc::new(make_batch_narrow::<4>(&schema, &[(1, 1, 42)]))], schema);
         let delta2 = make_batch_narrow::<4>(&schema, &[(1, 1, 99)]);
         let (out2, _) = op_distinct(delta2, ch2.cursor_mut(), &schema);
         assert_eq!(out2.count, 1, "I32: new (PK,payload) should produce +1");
@@ -261,8 +257,8 @@ mod tests {
 
     #[test]
     fn test_distinct_i16_payload_no_panic() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i16();
         let trace = Rc::new(make_batch_narrow::<2>(&schema, &[(5, 1, -100)]));
@@ -275,8 +271,8 @@ mod tests {
 
     #[test]
     fn test_distinct_i8_payload_no_panic() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i8();
         let trace = Rc::new(make_batch_narrow::<1>(&schema, &[(7, 1, -1)]));
@@ -322,8 +318,8 @@ mod tests {
     /// and must dispatch through `compare_german_strings` like STRING.
     #[test]
     fn test_distinct_blob_payload_no_panic() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_blob();
 
@@ -362,10 +358,7 @@ mod tests {
         b
     }
 
-    fn make_compound_batch(
-        schema: &SchemaDescriptor,
-        rows: &[(u64, u64, i64, i64)],
-    ) -> Batch {
+    fn make_compound_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(c0, c1, w, val) in rows {
             b.extend_pk_bytes(&compound_pk_bytes(c0, c1));
@@ -384,8 +377,8 @@ mod tests {
     /// an element already in the trace must net to no output (not emit `+1`).
     #[test]
     fn test_distinct_compound_pk_finds_existing() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_compound();
         // Trace in storage order: (1,5) then (2,3).
@@ -395,7 +388,10 @@ mod tests {
         // Re-add (2,3) with the same payload → already present → no output.
         let delta = make_compound_batch(&schema, &[(2, 3, 1, 200)]);
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
-        assert_eq!(out.count, 0, "compound: re-adding an existing element must net to no output");
+        assert_eq!(
+            out.count, 0,
+            "compound: re-adding an existing element must net to no output"
+        );
 
         // Adding a genuinely new (2,3) payload IS a new element → +1.
         let trace2 = Rc::new(make_compound_batch(&schema, &[(1, 5, 1, 100), (2, 3, 1, 200)]));
@@ -417,10 +413,7 @@ mod tests {
         )
     }
 
-    fn make_signed_batch(
-        schema: &SchemaDescriptor,
-        rows: &[(i64, i64, i64)],
-    ) -> Batch {
+    fn make_signed_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
             b.extend_pk((pk as u64) as u128);
@@ -438,8 +431,8 @@ mod tests {
     /// u128. The trace seek to a negative key must find the existing element.
     #[test]
     fn test_distinct_signed_pk_finds_existing() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_signed();
         // Storage (signed) order: -3, -1, 2.
@@ -449,7 +442,10 @@ mod tests {
         // Re-add (-1) with the same payload → already present → no output.
         let delta = make_signed_batch(&schema, &[(-1, 1, 10)]);
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
-        assert_eq!(out.count, 0, "signed: re-adding an existing element must net to no output");
+        assert_eq!(
+            out.count, 0,
+            "signed: re-adding an existing element must net to no output"
+        );
 
         // Retract (-1) fully → element leaves the set → -1.
         let trace2 = Rc::new(make_signed_batch(&schema, &[(-3, 1, 30), (-1, 1, 10), (2, 1, 20)]));
@@ -463,8 +459,8 @@ mod tests {
 
     #[test]
     fn test_op_distinct_consolidated_flag() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
         let empty = Rc::new(Batch::empty(1, 16));
@@ -483,19 +479,15 @@ mod tests {
 
     #[test]
     fn test_distinct_wide_pk_empty_trace_three_new_rows() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
         // Trace empty; delta has three wide-PK rows with distinct PKs.
         // All three must emit +1.
         let schema = wide_pk_3xu64_schema();
         let empty = Rc::new(Batch::empty(1, schema.pk_stride()));
         let mut ch = CursorHandle::from_owned(&[empty], schema);
 
-        let delta = make_wide_batch(&schema, &[
-            (1, 0, 0, 1, 10),
-            (2, 0, 0, 1, 20),
-            (3, 0, 0, 1, 30),
-        ]).into_inner();
+        let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (2, 0, 0, 1, 20), (3, 0, 0, 1, 30)]).into_inner();
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         assert_eq!(out.count, 3, "three new wide-PK rows must each emit +1");
         for i in 0..3 {
@@ -505,8 +497,8 @@ mod tests {
 
     #[test]
     fn test_distinct_wide_pk_already_in_trace() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
         // Trace has (1,0,0, payload=99, w=1). Delta re-adds same (PK, payload).
         // Already in set → output must be empty.
         let schema = wide_pk_3xu64_schema();
@@ -515,13 +507,16 @@ mod tests {
 
         let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 99)]).into_inner();
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
-        assert_eq!(out.count, 0, "re-adding an existing (PK,payload) must produce no output");
+        assert_eq!(
+            out.count, 0,
+            "re-adding an existing (PK,payload) must produce no output"
+        );
     }
 
     #[test]
     fn test_distinct_wide_pk_prefix_collision() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
         // Two wide-PK rows with the same 16-byte OPK prefix (c0=1,c1=1) but
         // differing in c2. One row in trace (w=1), one new row in delta (w=+1).
         // The row in the trace must not emit; the new row must emit +1.
@@ -542,8 +537,8 @@ mod tests {
 
     #[test]
     fn test_distinct_u128_max_sentinel_bug() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
         // Single-column U128 PK schema. Trace has (u128::MAX, payload, w=1).
         // Delta re-adds the same (u128::MAX, payload, w=+1). The old sentinel bug
         // (prev_key = u128::MAX) would skip the seek and compute w_old = 0,
@@ -578,6 +573,9 @@ mod tests {
         delta.consolidated = true;
 
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
-        assert_eq!(out.count, 0, "u128::MAX PK re-add must produce no output (sentinel bug regression)");
+        assert_eq!(
+            out.count, 0,
+            "u128::MAX PK re-add must produce no output (sentinel bug regression)"
+        );
     }
 }

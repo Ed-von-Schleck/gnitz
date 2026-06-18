@@ -10,11 +10,7 @@ pub unsafe fn write_all_fd(fd: c_int, data: &[u8]) -> i32 {
     let mut written: usize = 0;
     let total = data.len();
     while written < total {
-        let ret = libc::write(
-            fd,
-            data[written..].as_ptr() as *const libc::c_void,
-            total - written,
-        );
+        let ret = libc::write(fd, data[written..].as_ptr() as *const libc::c_void, total - written);
         if ret < 0 {
             let e = *libc::__errno_location();
             if e == libc::EINTR {
@@ -38,11 +34,7 @@ pub unsafe fn read_all_fd(fd: c_int, buf: &mut [u8]) -> i64 {
     let total = buf.len();
     let mut offset: usize = 0;
     while offset < total {
-        let ret = libc::read(
-            fd,
-            buf[offset..].as_mut_ptr() as *mut libc::c_void,
-            total - offset,
-        );
+        let ret = libc::read(fd, buf[offset..].as_mut_ptr() as *mut libc::c_void, total - offset);
         if ret < 0 {
             let e = *libc::__errno_location();
             if e == libc::EINTR {
@@ -62,9 +54,13 @@ pub unsafe fn read_all_fd(fd: c_int, buf: &mut [u8]) -> i64 {
 pub(crate) fn fdatasync_eintr(fd: c_int) -> std::io::Result<()> {
     loop {
         let rc = unsafe { libc::fdatasync(fd) };
-        if rc >= 0 { return Ok(()); }
+        if rc >= 0 {
+            return Ok(());
+        }
         let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted { return Err(err); }
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     }
 }
 
@@ -72,9 +68,13 @@ pub(crate) fn fdatasync_eintr(fd: c_int) -> std::io::Result<()> {
 pub(crate) fn fsync_eintr(fd: c_int) -> std::io::Result<()> {
     loop {
         let rc = unsafe { libc::fsync(fd) };
-        if rc >= 0 { return Ok(()); }
+        if rc >= 0 {
+            return Ok(());
+        }
         let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted { return Err(err); }
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
     }
 }
 
@@ -114,8 +114,12 @@ pub fn try_set_nocow(fd: i32) -> i32 {
 /// For memfd/shmem: requires `shmem_enabled` = `advise` or `within_size`.
 /// For writable file-backed mmap: silently ignored by the kernel.
 pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || size == 0 { return; }
-    unsafe { libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_HUGEPAGE); }
+    if ptr.is_null() || size == 0 {
+        return;
+    }
+    unsafe {
+        libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_HUGEPAGE);
+    }
 }
 
 /// Pre-fault writable page-table entries for [ptr, ptr+size).
@@ -124,22 +128,32 @@ pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
 /// fault.  Unlike memset, this does not dirty page contents or pollute
 /// CPU caches.  Returns 0 on success, -1 on error.
 pub fn madvise_populate_write(ptr: *mut u8, size: usize) -> i32 {
-    if ptr.is_null() || size == 0 { return 0; }
+    if ptr.is_null() || size == 0 {
+        return 0;
+    }
     unsafe { libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_POPULATE_WRITE) }
 }
 
 /// Hint the kernel to read-ahead [ptr, ptr+size) into page cache.
 /// Best-effort: ignores errors and is a no-op for null ptr or size 0.
 pub fn madvise_willneed(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || size == 0 { return; }
-    unsafe { libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_WILLNEED); }
+    if ptr.is_null() || size == 0 {
+        return;
+    }
+    unsafe {
+        libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_WILLNEED);
+    }
 }
 
 /// Hint the kernel to read-ahead [ptr, ptr+size) sequentially.
 /// Best-effort: ignores errors and is a no-op for null ptr or size 0.
 pub fn madvise_sequential(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || size == 0 { return; }
-    unsafe { libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_SEQUENTIAL); }
+    if ptr.is_null() || size == 0 {
+        return;
+    }
+    unsafe {
+        libc::madvise(ptr as *mut libc::c_void, size, libc::MADV_SEQUENTIAL);
+    }
 }
 
 /// Create a Unix domain SOCK_STREAM server socket: socket + bind + listen.
@@ -222,7 +236,8 @@ pub fn raise_fd_limit(target: u64) -> i64 {
 /// `Result` is returned unchanged. Used in async handlers and the committer
 /// task where a panic must not propagate (per async-invariants V.4 / V.7).
 pub fn guard_panic<T, F>(op: &'static str, f: F) -> Result<T, String>
-where F: FnOnce() -> Result<T, String>,
+where
+    F: FnOnce() -> Result<T, String>,
 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(r) => r,
@@ -276,7 +291,9 @@ mod tests {
         let r = fallocate(raw_fd, 1048576);
         assert_eq!(r, 0, "fallocate failed");
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        unsafe { libc::fstat(raw_fd, &mut stat); }
+        unsafe {
+            libc::fstat(raw_fd, &mut stat);
+        }
         assert_eq!(stat.st_size, 1048576);
     }
 
@@ -326,6 +343,9 @@ mod tests {
             libc::unlink(format!("{path}\0").as_ptr() as *const libc::c_char);
         }
         assert!(flags >= 0, "F_GETFL failed: {flags}");
-        assert!(flags & libc::O_NONBLOCK != 0, "socket is not non-blocking, flags={flags:#o}");
+        assert!(
+            flags & libc::O_NONBLOCK != 0,
+            "socket is not non-blocking, flags={flags:#o}"
+        );
     }
 }

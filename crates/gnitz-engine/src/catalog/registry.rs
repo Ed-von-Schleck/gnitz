@@ -9,7 +9,9 @@ impl CatalogEngine {
 
     /// Collect all user table IDs.
     pub fn iter_user_table_ids(&self) -> Vec<i64> {
-        self.dag.tables.keys()
+        self.dag
+            .tables
+            .keys()
             .filter(|&&tid| tid >= FIRST_USER_TABLE_ID)
             .copied()
             .collect()
@@ -23,11 +25,7 @@ impl CatalogEngine {
     /// gap or duplicate — a gap would silently mismap columns in
     /// `build_schema_from_col_defs`, so the create-precheck path rejects it.
     /// The non-checking form is infallible by construction.
-    pub(crate) fn scan_column_defs(
-        &self,
-        owner_id: i64,
-        check_contiguity: bool,
-    ) -> Result<Vec<ColumnDef>, String> {
+    pub(crate) fn scan_column_defs(&self, owner_id: i64, check_contiguity: bool) -> Result<Vec<ColumnDef>, String> {
         let start_pk = pack_column_id(owner_id, 0);
         let end_pk = pack_column_id(owner_id + 1, 0);
         let mut cursor = self.sys_columns.open_cursor();
@@ -38,7 +36,9 @@ impl CatalogEngine {
         let mut expected: i64 = 0;
         while cursor.cursor.valid {
             let pk = cursor.cursor.current_key as u64;
-            if pk >= end_pk { break; }
+            if pk >= end_pk {
+                break;
+            }
             if cursor.cursor.current_weight > 0 {
                 if check_contiguity {
                     // pack_column_id layout: owner_id << 9 | col_idx (lower 9 bits).
@@ -46,16 +46,17 @@ impl CatalogEngine {
                     if actual != expected {
                         return Err(format!(
                             "entity (owner_id={owner_id}): column records are non-contiguous; \
-                             expected index {expected}, got {actual}"));
+                             expected index {expected}, got {actual}"
+                        ));
                     }
                     expected += 1;
                 }
                 defs.push(ColumnDef {
-                    name:        cursor_read_string(&cursor, COLTAB_COL_NAME),
-                    type_code:   cursor_read_u64(&cursor, COLTAB_COL_TYPE_CODE) as u8,
+                    name: cursor_read_string(&cursor, COLTAB_COL_NAME),
+                    type_code: cursor_read_u64(&cursor, COLTAB_COL_TYPE_CODE) as u8,
                     is_nullable: cursor_read_u64(&cursor, COLTAB_COL_IS_NULLABLE) != 0,
                     fk_table_id: cursor_read_u64(&cursor, COLTAB_COL_FK_TABLE_ID) as i64,
-                    fk_col_idx:  cursor_read_u64(&cursor, COLTAB_COL_FK_COL_IDX) as u32,
+                    fk_col_idx: cursor_read_u64(&cursor, COLTAB_COL_FK_COL_IDX) as u32,
                 });
             }
             cursor.cursor.advance();
@@ -72,7 +73,10 @@ impl CatalogEngine {
     /// path passes the decoded `k`; the view path passes the full-PK default
     /// (views are not distributed by a chosen key).
     pub(crate) fn build_schema_from_col_defs(
-        &self, col_defs: &[ColumnDef], pk_cols: &[u32], dist_prefix_len: usize,
+        &self,
+        col_defs: &[ColumnDef],
+        pk_cols: &[u32],
+        dist_prefix_len: usize,
     ) -> SchemaDescriptor {
         assert!(
             col_defs.len() <= crate::schema::MAX_COLUMNS,
@@ -92,14 +96,18 @@ impl CatalogEngine {
     pub(crate) fn read_batch_u64(&self, batch: &Batch, row: usize, payload_col: usize) -> u64 {
         let off = row * 8;
         let col = batch.col_data(payload_col);
-        if off + 8 > col.len() { return 0; }
+        if off + 8 > col.len() {
+            return 0;
+        }
         u64::from_le_bytes(col[off..off + 8].try_into().unwrap_or([0; 8]))
     }
 
     pub(crate) fn read_batch_string(&self, batch: &Batch, row: usize, payload_col: usize) -> String {
         let off = row * 16;
         let data = batch.col_data(payload_col);
-        if off + 16 > data.len() { return String::new(); }
+        if off + 16 > data.len() {
+            return String::new();
+        }
         let st: [u8; 16] = data[off..off + 16].try_into().unwrap_or([0; 16]);
         let bytes = crate::schema::decode_german_string(&st, &batch.blob);
         String::from_utf8(bytes).unwrap_or_default()
@@ -120,7 +128,11 @@ impl CatalogEngine {
 
     #[cfg(test)]
     pub(crate) fn get_schema_name_by_id(&self, schema_id: i64) -> &str {
-        self.caches.schema_by_id.get(&schema_id).map(|s| s.as_str()).unwrap_or("")
+        self.caches
+            .schema_by_id
+            .get(&schema_id)
+            .map(|s| s.as_str())
+            .unwrap_or("")
     }
 
     #[cfg(test)]
@@ -171,7 +183,10 @@ impl CatalogEngine {
     }
 
     pub fn get_qualified_name(&self, table_id: i64) -> Option<(&str, &str)> {
-        self.caches.entity_by_id.get(&table_id).map(|(s, t)| (s.as_str(), t.as_str()))
+        self.caches
+            .entity_by_id
+            .get(&table_id)
+            .map(|(s, t)| (s.as_str(), t.as_str()))
     }
 
     #[cfg(test)]

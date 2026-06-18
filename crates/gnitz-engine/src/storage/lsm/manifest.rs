@@ -1,7 +1,7 @@
-use crate::schema::MAX_PK_BYTES;
+use super::error::StorageError;
 use crate::foundation::codec::{read_u64_le, write_u64_le};
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
-use super::error::StorageError;
+use crate::schema::MAX_PK_BYTES;
 
 // ---------------------------------------------------------------------------
 // Manifest file format (V4)
@@ -57,10 +57,7 @@ const _: () = assert!(
 // silently grow PkBuf::bytes while the windows stay fixed, so serialize's
 // copy_from_slice of the full bytes array would panic at runtime. Force
 // a deliberate build break (→ V5 format decision) instead.
-const _: () = assert!(
-    MAX_PK_BYTES == 80,
-    "V4 manifest layout assumes an 80-byte PK capacity",
-);
+const _: () = assert!(MAX_PK_BYTES == 80, "V4 manifest layout assumes an 80-byte PK capacity",);
 
 // `PkBuf` — the width-tagged PK byte buffer — now lives in `schema::key`
 // (its `Ord` delegates to `compare_pk_bytes`, which moved there too).
@@ -84,13 +81,13 @@ pub struct ManifestEntryRaw {
 impl Default for ManifestEntryRaw {
     fn default() -> Self {
         Self {
-            table_id:  0,
-            pk_min:    PkBuf::empty(0),
-            pk_max:    PkBuf::empty(0),
-            min_lsn:   0,
-            max_lsn:   0,
-            filename:  [0; 128],
-            level:     0,
+            table_id: 0,
+            pk_min: PkBuf::empty(0),
+            pk_max: PkBuf::empty(0),
+            min_lsn: 0,
+            max_lsn: 0,
+            filename: [0; 128],
+            level: 0,
             guard_key: 0,
         }
     }
@@ -108,11 +105,7 @@ impl ManifestEntryRaw {
 
 /// Serialize manifest entries into `out_buf`.
 /// Returns bytes written, or `BufferTooSmall` if `out_buf` cannot fit.
-pub fn serialize(
-    out_buf: &mut [u8],
-    entries: &[ManifestEntryRaw],
-    global_max_lsn: u64,
-) -> Result<usize, StorageError> {
+pub fn serialize(out_buf: &mut [u8], entries: &[ManifestEntryRaw], global_max_lsn: u64) -> Result<usize, StorageError> {
     let count = entries.len();
     let total = HEADER_SIZE + count * ENTRY_SIZE_V4;
     if out_buf.len() < total {
@@ -137,18 +130,14 @@ pub fn serialize(
         let off = HEADER_SIZE + i * ENTRY_SIZE_V4;
         write_u64_le(out_buf, off + OFF_TABLE_ID, e.table_id);
         out_buf[off + OFF_PK_MIN] = e.pk_min.len;
-        out_buf[off + OFF_PK_MIN + 1..off + OFF_PK_MIN + 1 + MAX_PK_BYTES]
-            .copy_from_slice(&e.pk_min.bytes);
+        out_buf[off + OFF_PK_MIN + 1..off + OFF_PK_MIN + 1 + MAX_PK_BYTES].copy_from_slice(&e.pk_min.bytes);
         out_buf[off + OFF_PK_MAX] = e.pk_max.len;
-        out_buf[off + OFF_PK_MAX + 1..off + OFF_PK_MAX + 1 + MAX_PK_BYTES]
-            .copy_from_slice(&e.pk_max.bytes);
+        out_buf[off + OFF_PK_MAX + 1..off + OFF_PK_MAX + 1 + MAX_PK_BYTES].copy_from_slice(&e.pk_max.bytes);
         write_u64_le(out_buf, off + OFF_MIN_LSN, e.min_lsn);
         write_u64_le(out_buf, off + OFF_MAX_LSN, e.max_lsn);
-        out_buf[off + OFF_FILENAME..off + OFF_FILENAME + 128]
-            .copy_from_slice(&e.filename);
+        out_buf[off + OFF_FILENAME..off + OFF_FILENAME + 128].copy_from_slice(&e.filename);
         write_u64_le(out_buf, off + OFF_LEVEL, e.level);
-        out_buf[off + OFF_GUARD_KEY..off + OFF_GUARD_KEY + 16]
-            .copy_from_slice(&e.guard_key.to_le_bytes());
+        out_buf[off + OFF_GUARD_KEY..off + OFF_GUARD_KEY + 16].copy_from_slice(&e.guard_key.to_le_bytes());
     }
 
     Ok(total)
@@ -182,10 +171,8 @@ pub fn parse(
         return Err(StorageError::InvalidVersion);
     }
 
-    let body = count.checked_mul(ENTRY_SIZE_V4)
-        .ok_or(StorageError::Truncated)?;
-    let expected_data = HEADER_SIZE.checked_add(body)
-        .ok_or(StorageError::Truncated)?;
+    let body = count.checked_mul(ENTRY_SIZE_V4).ok_or(StorageError::Truncated)?;
+    let expected_data = HEADER_SIZE.checked_add(body).ok_or(StorageError::Truncated)?;
     if buf.len() < expected_data {
         return Err(StorageError::Truncated);
     }
@@ -200,11 +187,11 @@ pub fn parse(
         entry.pk_max = parse_pkbuf(buf, off + OFF_PK_MAX)?;
         entry.min_lsn = read_u64_le(buf, off + OFF_MIN_LSN);
         entry.max_lsn = read_u64_le(buf, off + OFF_MAX_LSN);
-        entry.filename
+        entry
+            .filename
             .copy_from_slice(&buf[off + OFF_FILENAME..off + OFF_FILENAME + 128]);
         entry.level = read_u64_le(buf, off + OFF_LEVEL);
-        entry.guard_key =
-            u128::from_le_bytes(buf[off + OFF_GUARD_KEY..off + OFF_GUARD_KEY + 16].try_into().unwrap());
+        entry.guard_key = u128::from_le_bytes(buf[off + OFF_GUARD_KEY..off + OFF_GUARD_KEY + 16].try_into().unwrap());
 
         *out_entry = entry;
     }
@@ -292,10 +279,14 @@ pub struct PreparedManifest {
 impl Drop for PreparedManifest {
     fn drop(&mut self) {
         if let Some(fd) = self.fd.take() {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
         if !self.committed {
-            unsafe { libc::unlink(self.tmp_path.as_ptr()); }
+            unsafe {
+                libc::unlink(self.tmp_path.as_ptr());
+            }
         }
     }
 }
@@ -347,7 +338,12 @@ pub fn prepare_file(
             return Err(StorageError::Io);
         }
 
-        Ok(PreparedManifest { fd: Some(fd), tmp_path, final_path, committed: false })
+        Ok(PreparedManifest {
+            fd: Some(fd),
+            tmp_path,
+            final_path,
+            committed: false,
+        })
     }
 }
 
@@ -550,10 +546,7 @@ mod tests {
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
         let mut lsn = 0u64;
-        assert_eq!(
-            parse(&buf, &mut out, 1, &mut lsn),
-            Err(StorageError::InvalidVersion),
-        );
+        assert_eq!(parse(&buf, &mut out, 1, &mut lsn), Err(StorageError::InvalidVersion),);
     }
 
     #[test]
@@ -567,10 +560,7 @@ mod tests {
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
         let mut lsn = 0u64;
-        assert_eq!(
-            parse(&buf, &mut out, 1, &mut lsn),
-            Err(StorageError::Truncated),
-        );
+        assert_eq!(parse(&buf, &mut out, 1, &mut lsn), Err(StorageError::Truncated),);
     }
 
     #[test]
@@ -607,10 +597,7 @@ mod tests {
 
     #[test]
     fn truncated() {
-        assert_eq!(
-            parse(&[0u8; 10], &mut [], 0, &mut 0u64),
-            Err(StorageError::Truncated),
-        );
+        assert_eq!(parse(&[0u8; 10], &mut [], 0, &mut 0u64), Err(StorageError::Truncated),);
     }
 
     #[test]

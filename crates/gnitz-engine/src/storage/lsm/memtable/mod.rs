@@ -11,11 +11,11 @@ use super::batch::Batch;
 use super::bloom::BloomFilter;
 use crate::schema::SchemaDescriptor;
 
-mod runs;
 mod lookup;
+mod runs;
 
-pub(crate) use runs::consolidate_runs;
 pub(crate) use lookup::run_pk_match_rows;
+pub(crate) use runs::consolidate_runs;
 
 /// Maximum sorted runs before inline consolidation merges them into one.
 const INLINE_CONSOLIDATE_THRESHOLD: usize = 16;
@@ -71,12 +71,12 @@ impl MemTable {
 // std::f*::consts.
 #[allow(clippy::approx_constant)]
 mod tests {
-    use super::*;
-    use super::super::batch::{ConsolidatedBatch, relocate_string_cell};
+    use super::super::batch::{relocate_string_cell, ConsolidatedBatch};
     use super::super::error::StorageError;
     use super::super::merge::SortedMemBatch;
     use super::runs::consolidate_batches;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use super::*;
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -154,8 +154,10 @@ mod tests {
 
         let snap = mt.consolidate_for_flush();
         assert_eq!(snap.count, 2);
-        assert!(Rc::ptr_eq(&snap, &original),
-            "singleton path must Rc::clone the existing run");
+        assert!(
+            Rc::ptr_eq(&snap, &original),
+            "singleton path must Rc::clone the existing run"
+        );
 
         // Multi-run path: add a second run, drop the singleton handle, then
         // consolidate. The merged batch must be a fresh allocation distinct
@@ -246,10 +248,7 @@ mod tests {
         let mut mt = MemTable::new(schema, 64); // tiny capacity
 
         // First upsert fills past max_bytes (4 rows × 40 bytes = 160 > 64)
-        let b1 = make_batch(
-            &schema,
-            &[(10, 1, 100), (20, 1, 200), (30, 1, 300), (40, 1, 400)],
-        );
+        let b1 = make_batch(&schema, &[(10, 1, 100), (20, 1, 200), (30, 1, 300), (40, 1, 400)]);
         mt.upsert_sorted_batch(b1).unwrap(); // OK — check fires before adding
 
         // Second upsert fails: runs_bytes (160) > max_bytes (64)
@@ -348,8 +347,8 @@ mod tests {
         // Schema has 2 columns: PK (U64) + payload (I64)
         // Regions: pk(0), weight(1), null(2), col0(3), blob(4)
         assert_eq!(batch.num_regions_total(), 5);
-        assert_eq!(batch.region_size(0), 8);  // pk: 1 row * 8 bytes (U64 PK)
-        assert_eq!(batch.region_size(3), 8);  // col0: 1 row * 8 bytes
+        assert_eq!(batch.region_size(0), 8); // pk: 1 row * 8 bytes (U64 PK)
+        assert_eq!(batch.region_size(3), 8); // col0: 1 row * 8 bytes
         assert!(!batch.region_ptr(0).is_null());
     }
 
@@ -408,13 +407,13 @@ mod tests {
         let run1 = make_reduce_batch(&[(0, 1, 0, 5000)]);
         // Tick 2: retract old, insert new
         let run2 = make_reduce_batch(&[
-            (0, -1, 0, 5000),   // retract sum=5000
-            (0,  1, 0, 10000),  // insert sum=10000
+            (0, -1, 0, 5000), // retract sum=5000
+            (0, 1, 0, 10000), // insert sum=10000
         ]);
         // Tick 3: retract old, insert new
         let run3 = make_reduce_batch(&[
-            (0, -1, 0, 10000),  // retract sum=10000
-            (0,  1, 0, 15000),  // insert sum=15000
+            (0, -1, 0, 10000), // retract sum=10000
+            (0, 1, 0, 15000),  // insert sum=15000
         ]);
 
         let batches: Vec<SortedMemBatch> = vec![
@@ -426,8 +425,11 @@ mod tests {
         let consolidated = consolidate_batches(&batches, &schema);
 
         // After consolidation: only (PK=0, group=0, sum=15000, w=+1) should remain
-        assert_eq!(consolidated.count, 1,
-            "expected 1 row after consolidation, got {}", consolidated.count);
+        assert_eq!(
+            consolidated.count, 1,
+            "expected 1 row after consolidation, got {}",
+            consolidated.count
+        );
         assert_eq!(consolidated.get_pk(0), 0);
         assert_eq!(consolidated.get_weight(0), 1);
         // Check agg_val (payload column 1) = 15000
@@ -455,10 +457,7 @@ mod tests {
     #[test]
     fn test_append_row_simple_nullable_string() {
         // Schema: U64(pk=0), STRING(nullable)
-        let schema = make_schema_cols(&[
-            (type_code::U64, 0),
-            (type_code::STRING, 1),
-        ], 0);
+        let schema = make_schema_cols(&[(type_code::U64, 0), (type_code::STRING, 1)], 0);
         let mut batch = Batch::with_schema(schema, 4);
 
         // Row 0: non-null string "not null"
@@ -494,11 +493,10 @@ mod tests {
     #[test]
     fn test_append_row_simple_multi_string() {
         // Schema: U64(pk=0), STRING(name), STRING(desc)
-        let schema = make_schema_cols(&[
-            (type_code::U64, 0),
-            (type_code::STRING, 0),
-            (type_code::STRING, 0),
-        ], 0);
+        let schema = make_schema_cols(
+            &[(type_code::U64, 0), (type_code::STRING, 0), (type_code::STRING, 0)],
+            0,
+        );
         let mut batch = Batch::with_schema(schema, 4);
 
         let cases: &[(&[u8], &[u8])] = &[
@@ -530,21 +528,24 @@ mod tests {
         // Schema: U64(pk=0), then one of each remaining type
         // Payload cols (pi): U8(0), I8(1), U16(2), I16(3), U32(4), I32(5),
         //                     F32(6), U64(7), I64(8), F64(9), STRING(10), U128(11)
-        let schema = make_schema_cols(&[
-            (type_code::U64, 0),    // pk
-            (type_code::U8, 0),     // pi 0
-            (type_code::I8, 0),     // pi 1
-            (type_code::U16, 0),    // pi 2
-            (type_code::I16, 0),    // pi 3
-            (type_code::U32, 0),    // pi 4
-            (type_code::I32, 0),    // pi 5
-            (type_code::F32, 0),    // pi 6
-            (type_code::U64, 0),    // pi 7
-            (type_code::I64, 0),    // pi 8
-            (type_code::F64, 0),    // pi 9
-            (type_code::STRING, 0), // pi 10
-            (type_code::U128, 0),   // pi 11
-        ], 0);
+        let schema = make_schema_cols(
+            &[
+                (type_code::U64, 0),    // pk
+                (type_code::U8, 0),     // pi 0
+                (type_code::I8, 0),     // pi 1
+                (type_code::U16, 0),    // pi 2
+                (type_code::I16, 0),    // pi 3
+                (type_code::U32, 0),    // pi 4
+                (type_code::I32, 0),    // pi 5
+                (type_code::F32, 0),    // pi 6
+                (type_code::U64, 0),    // pi 7
+                (type_code::I64, 0),    // pi 8
+                (type_code::F64, 0),    // pi 9
+                (type_code::STRING, 0), // pi 10
+                (type_code::U128, 0),   // pi 11
+            ],
+            0,
+        );
         let mut batch = Batch::with_schema(schema, 1);
 
         let n = 12;
@@ -553,17 +554,17 @@ mod tests {
         let mut ptrs = vec![std::ptr::null::<u8>(); n];
         let mut lens = vec![0u32; n];
 
-        lo[0] = 42;        // U8: 42
-        lo[1] = -7;        // I8: -7
-        lo[2] = 1000;      // U16: 1000
-        lo[3] = -500;      // I16: -500
-        lo[4] = 70000;     // U32: 70000
-        lo[5] = -12345;    // I32: -12345
-        // F32: 3.14 → store as f64 bit pattern (float2longlong convention)
+        lo[0] = 42; // U8: 42
+        lo[1] = -7; // I8: -7
+        lo[2] = 1000; // U16: 1000
+        lo[3] = -500; // I16: -500
+        lo[4] = 70000; // U32: 70000
+        lo[5] = -12345; // I32: -12345
+                        // F32: 3.14 → store as f64 bit pattern (float2longlong convention)
         lo[6] = f64::to_bits(3.14f64) as i64;
-        lo[7] = 0x1234_5678_9ABC_DEF0u64 as i64;  // U64
-        lo[8] = -99999;    // I64
-        // F64: 2.718281828 → store as bit pattern
+        lo[7] = 0x1234_5678_9ABC_DEF0u64 as i64; // U64
+        lo[8] = -99999; // I64
+                        // F64: 2.718281828 → store as bit pattern
         lo[9] = f64::to_bits(2.718281828f64) as i64;
         // STRING: "hello world!"
         let s = b"hello world!";
@@ -618,10 +619,13 @@ mod tests {
     /// against the pre-fix `_` arm, which sliced `[u8;8][..16]` (OOB panic).
     #[test]
     fn test_append_row_simple_i128_payload() {
-        let schema = make_schema_cols(&[
-            (type_code::U64, 0),   // pk
-            (type_code::I128, 0),  // pi 0: I128 payload
-        ], 0);
+        let schema = make_schema_cols(
+            &[
+                (type_code::U64, 0),  // pk
+                (type_code::I128, 0), // pi 0: I128 payload
+            ],
+            0,
+        );
         let mut batch = Batch::with_schema(schema, 1);
         // A negative value with bits in both halves: bit 127 set. The I128 column
         // is the first (and only) payload column, so lo/hi are indexed at pi = 0.
@@ -646,17 +650,20 @@ mod tests {
     /// unrelated bytes from the start of the blob.
     #[test]
     fn test_append_row_blob_length_header() {
-        let schema = make_schema_cols(&[
-            (type_code::U64, 0),    // PK
-            (type_code::STRING, 0), // STRING payload
-        ], 0);
+        let schema = make_schema_cols(
+            &[
+                (type_code::U64, 0),    // PK
+                (type_code::STRING, 0), // STRING payload
+            ],
+            0,
+        );
         let mut batch = Batch::with_schema(schema, 1);
 
         // Build a German String struct with length=20 but only 5 blob bytes available.
         // This triggers the malformed-wire-data fallback branch in append_row.
         let mut gs_struct = [0u8; 16];
         gs_struct[0..4].copy_from_slice(&20u32.to_le_bytes()); // declared length = 20
-        gs_struct[4..8].copy_from_slice(&0u32.to_le_bytes());  // prefix bytes = 0
+        gs_struct[4..8].copy_from_slice(&0u32.to_le_bytes()); // prefix bytes = 0
         gs_struct[8..16].copy_from_slice(&0u64.to_le_bytes()); // blob offset = 0
 
         let blob_src = b"hello"; // only 5 bytes — out of bounds for length=20
@@ -702,7 +709,10 @@ mod tests {
         // The found row should have payload = 200
         let (run, row) = mt.found_entry().expect("a live row was found");
         let val = i64::from_le_bytes(run.get_col_ptr(row, 0, 8).try_into().unwrap());
-        assert_eq!(val, 200, "found row should be the live val=200 row, not the retracted val=100");
+        assert_eq!(
+            val, 200,
+            "found row should be the live val=200 row, not the retracted val=100"
+        );
 
         // PK with no rows at all → not found
         let found2 = mt.find_positive_payload_row_bytes(&99u64.to_be_bytes());
@@ -739,11 +749,14 @@ mod tests {
         let mut mt = MemTable::new(schema, 1 << 20);
 
         // Run 0: filler PK 5, then PK 10 payload 100 (+1)
-        mt.upsert_sorted_batch(make_batch(&schema, &[(5, 1, 50), (10, 1, 100)])).unwrap();
+        mt.upsert_sorted_batch(make_batch(&schema, &[(5, 1, 50), (10, 1, 100)]))
+            .unwrap();
         // Run 1: PK 10 payload 100 (-1), filler PK 20
-        mt.upsert_sorted_batch(make_batch(&schema, &[(10, -1, 100), (20, 1, 200)])).unwrap();
+        mt.upsert_sorted_batch(make_batch(&schema, &[(10, -1, 100), (20, 1, 200)]))
+            .unwrap();
         // Run 2: PK 10 payload 100 (+1), filler PK 30
-        mt.upsert_sorted_batch(make_batch(&schema, &[(10, 1, 100), (30, 1, 300)])).unwrap();
+        mt.upsert_sorted_batch(make_batch(&schema, &[(10, 1, 100), (30, 1, 300)]))
+            .unwrap();
         assert_eq!(mt.runs.len(), 3, "three un-consolidated runs");
 
         let pk10 = 10u64.to_be_bytes();
@@ -845,7 +858,10 @@ mod tests {
     fn build_bench_memtable(r: usize, c: usize, filler: usize) -> MemTable {
         assert!(c.is_multiple_of(2), "bench uses cancelling pairs; C must be even");
         assert!(c <= 2 * r, "each batch adds at most a +/- pair per PK");
-        assert!((2..INLINE_CONSOLIDATE_THRESHOLD).contains(&r), "R below merge threshold");
+        assert!(
+            (2..INLINE_CONSOLIDATE_THRESHOLD).contains(&r),
+            "R below merge threshold"
+        );
         const HOT: u64 = 1_000_000;
         const SENTINEL_HI: u64 = HOT + 1; // keeps HOT inside every run's [min,max]
 
@@ -1148,7 +1164,7 @@ mod tests {
     /// Bug 5: append_row_from_source must not panic when blob offset is invalid.
     #[test]
     fn test_append_row_from_source_corrupted_blob() {
-        use crate::schema::{BlobCache, SchemaColumn, type_code};
+        use crate::schema::{type_code, BlobCache, SchemaColumn};
 
         // Schema: col0 = PK (U64), col1 = STRING
         let schema = SchemaDescriptor::new(
@@ -1210,12 +1226,18 @@ mod tests {
         let mut drained = Vec::new();
         loop {
             let buf = acquire_buf();
-            if buf.capacity() == 0 { break; }
-            if buf.capacity() >= data_cap { found = true; }
+            if buf.capacity() == 0 {
+                break;
+            }
+            if buf.capacity() >= data_cap {
+                found = true;
+            }
             drained.push(buf);
         }
         assert!(found, "pool should contain the recycled data buffer");
-        for buf in drained { recycle_buf(buf); }
+        for buf in drained {
+            recycle_buf(buf);
+        }
     }
 
     #[test]
@@ -1233,7 +1255,9 @@ mod tests {
         // Original had data + blob, clone has data + blob.
         // Some may be zero-cap (empty blob), so just verify at least 2 buffers.
         let mut count = 0;
-        while acquire_buf().capacity() > 0 { count += 1; }
+        while acquire_buf().capacity() > 0 {
+            count += 1;
+        }
         assert!(count >= 2, "expected at least 2 recycled buffers, got {count}");
     }
 

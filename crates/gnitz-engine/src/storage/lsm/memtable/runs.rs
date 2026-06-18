@@ -4,17 +4,14 @@
 
 use std::rc::Rc;
 
-use super::super::batch::{Batch, write_to_batch, ConsolidatedBatch};
+use super::super::batch::{write_to_batch, Batch, ConsolidatedBatch};
 use super::super::error::StorageError;
-use crate::schema::SchemaDescriptor;
 use super::super::merge::{self, pack_pk_be, SortedMemBatch};
 use super::{MemTable, INLINE_CONSOLIDATE_THRESHOLD};
+use crate::schema::SchemaDescriptor;
 
 /// Merge N sorted MemBatch views into a single consolidated Batch.
-pub(super) fn consolidate_batches(
-    batches: &[SortedMemBatch],
-    schema: &SchemaDescriptor,
-) -> Batch {
+pub(super) fn consolidate_batches(batches: &[SortedMemBatch], schema: &SchemaDescriptor) -> Batch {
     if batches.is_empty() {
         return Batch::empty_with_schema(schema);
     }
@@ -85,7 +82,8 @@ impl MemTable {
     }
 
     fn runs_as_sorted(&self) -> Vec<SortedMemBatch<'_>> {
-        self.runs.iter()
+        self.runs
+            .iter()
             .map(|r| r.as_sorted_mem_batch().expect("MemTable runs are always sorted"))
             .collect()
     }

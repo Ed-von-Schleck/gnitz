@@ -5,17 +5,15 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{
-    compare_german_strings, read_signed, SchemaDescriptor,
-    type_code::{
-        BLOB as TYPE_BLOB, F32 as TYPE_F32, F64 as TYPE_F64,
-        I128 as TYPE_I128,
-        STRING as TYPE_STRING,
-        U8 as TYPE_U8, U16 as TYPE_U16, U32 as TYPE_U32, U64 as TYPE_U64,
-        U128 as TYPE_U128, UUID as TYPE_UUID,
-    },
-};
 use crate::foundation::codec::{read_u32_le, read_u64_le};
+use crate::schema::{
+    compare_german_strings, read_signed,
+    type_code::{
+        BLOB as TYPE_BLOB, F32 as TYPE_F32, F64 as TYPE_F64, I128 as TYPE_I128, STRING as TYPE_STRING,
+        U128 as TYPE_U128, U16 as TYPE_U16, U32 as TYPE_U32, U64 as TYPE_U64, U8 as TYPE_U8, UUID as TYPE_UUID,
+    },
+    SchemaDescriptor,
+};
 
 // ---------------------------------------------------------------------------
 // ColumnarSource trait
@@ -233,11 +231,18 @@ pub(crate) use with_pk_ord;
 /// borrows `self`) cannot satisfy.
 #[inline]
 pub(crate) fn binary_lower_bound<'a>(
-    mut lo: usize, mut hi: usize, key: &[u8], get: &impl Fn(usize) -> &'a [u8],
+    mut lo: usize,
+    mut hi: usize,
+    key: &[u8],
+    get: &impl Fn(usize) -> &'a [u8],
 ) -> usize {
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if get(mid) < key { lo = mid + 1; } else { hi = mid; }
+        if get(mid) < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
     lo
 }
@@ -252,18 +257,27 @@ pub(crate) fn binary_lower_bound<'a>(
 /// comparisons.
 #[inline]
 pub(crate) fn gallop_lower_bound_bytes<'a>(
-    count: usize, key: &[u8], hint: usize, get: impl Fn(usize) -> &'a [u8],
+    count: usize,
+    key: &[u8],
+    hint: usize,
+    get: impl Fn(usize) -> &'a [u8],
 ) -> usize {
     let h = hint.min(count);
-    if h < count && get(h) < key {           // boundary strictly after the hint
-        let mut lo = h;                       // invariant: get(lo) < key
+    if h < count && get(h) < key {
+        // boundary strictly after the hint
+        let mut lo = h; // invariant: get(lo) < key
         let mut step = 1usize;
-        while lo + step < count && get(lo + step) < key { lo += step; step *= 2; }
-        let hi = (lo + step).min(count);      // get(hi) >= key, or hi == count
+        while lo + step < count && get(lo + step) < key {
+            lo += step;
+            step *= 2;
+        }
+        let hi = (lo + step).min(count); // get(hi) >= key, or hi == count
         return binary_lower_bound(lo + 1, hi, key, &get);
     }
-    if h == 0 || get(h - 1) < key { return h; } // boundary is exactly h (incl. h == count)
-    binary_lower_bound(0, h, key, &get)         // genuine overshoot: bounded [0, h)
+    if h == 0 || get(h - 1) < key {
+        return h;
+    } // boundary is exactly h (incl. h == count)
+    binary_lower_bound(0, h, key, &get) // genuine overshoot: bounded [0, h)
 }
 
 // ---------------------------------------------------------------------------
@@ -287,8 +301,10 @@ pub(crate) fn schema_is_fixedint_nonnull(schema: &SchemaDescriptor) -> bool {
 #[inline]
 pub(crate) fn compare_rows_fixedint_nonnull<A: ColumnarSource, B: ColumnarSource>(
     schema: &SchemaDescriptor,
-    src_a: &A, row_a: usize,
-    src_b: &B, row_b: usize,
+    src_a: &A,
+    row_a: usize,
+    src_b: &B,
+    row_b: usize,
 ) -> Ordering {
     use crate::schema::read_unsigned;
     debug_assert!(
@@ -315,7 +331,9 @@ pub(crate) fn compare_rows_fixedint_nonnull<A: ColumnarSource, B: ColumnarSource
         let av = read_unsigned(src_a.get_col_ptr(row_a, payload_col, cs), cs) ^ sign_flip;
         let bv = read_unsigned(src_b.get_col_ptr(row_b, payload_col, cs), cs) ^ sign_flip;
         let ord = av.cmp(&bv);
-        if ord != Ordering::Equal { return ord; }
+        if ord != Ordering::Equal {
+            return ord;
+        }
     }
     Ordering::Equal
 }
@@ -371,7 +389,7 @@ pub(crate) struct SortEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::pk_only_schema;
 
     /// A minimal ColumnarSource for unit tests.
@@ -434,8 +452,8 @@ mod tests {
         // Row A: col1 = NULL (null_word bit 0 set), col2 = -5.0
         // Row B: col1 = 10, col2 = 5.0
         let batch = batch_from_rows(&[
-            (1, 0, -5.0),   // row 0: null_word=1 → payload col 0 is null
-            (0, 10, 5.0),   // row 1: null_word=0 → nothing null
+            (1, 0, -5.0), // row 0: null_word=1 → payload col 0 is null
+            (0, 10, 5.0), // row 1: null_word=0 → nothing null
         ]);
         // null < non-null
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
@@ -449,8 +467,8 @@ mod tests {
         let schema = make_schema_nullable_float();
         // Both rows have col1 = NULL, col2 differs
         let batch = batch_from_rows(&[
-            (1, 0, -5.0),   // null col1, f64 = -5.0
-            (1, 0, 5.0),    // null col1, f64 = 5.0
+            (1, 0, -5.0), // null col1, f64 = -5.0
+            (1, 0, 5.0),  // null col1, f64 = 5.0
         ]);
         // null == null → fall through to col2: -5.0 < 5.0
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Less);
@@ -462,10 +480,7 @@ mod tests {
         let schema = make_schema_nullable_float();
         // Row B: col1 = 10, col2 = 5.0
         // Row C: col1 = 10, col2 = -5.0
-        let batch = batch_from_rows(&[
-            (0, 10, 5.0),
-            (0, 10, -5.0),
-        ]);
+        let batch = batch_from_rows(&[(0, 10, 5.0), (0, 10, -5.0)]);
         // col1 equal (10 == 10), col2: 5.0 > -5.0
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Greater);
     }
@@ -474,9 +489,7 @@ mod tests {
     #[test]
     fn test_compare_rows_equality() {
         let schema = make_schema_nullable_float();
-        let batch = batch_from_rows(&[
-            (0, 10, -5.0),
-        ]);
+        let batch = batch_from_rows(&[(0, 10, -5.0)]);
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 0), Ordering::Equal);
     }
 
@@ -486,7 +499,11 @@ mod tests {
         for &nw in null_words {
             null_bmp.extend_from_slice(&nw.to_le_bytes());
         }
-        TestBatch { null_bmp, col_data: vec![col_data], blob: vec![] }
+        TestBatch {
+            null_bmp,
+            col_data: vec![col_data],
+            blob: vec![],
+        }
     }
 
     /// Test signed integer comparison: negative < positive via sign extension.
@@ -596,13 +613,7 @@ mod tests {
             (type_code::U16, 2),
             (type_code::U8, 1),
         ] {
-            let schema = SchemaDescriptor::new(
-                &[
-                    SchemaColumn::new(type_code::U64, 0),
-                    SchemaColumn::new(tc, 0),
-                ],
-                &[0],
-            );
+            let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0]);
             let max = u64::MAX >> (64 - size * 8);
             let mut col0 = Vec::new();
             col0.extend_from_slice(&0u64.to_le_bytes()[..size]);
@@ -623,10 +634,7 @@ mod tests {
         let schema = make_schema_nullable_float();
         // Row 0: col0=0, col1=NaN
         // Row 1: col0=0, col1=1.0
-        let batch = batch_from_rows(&[
-            (0, 0, f64::NAN),
-            (0, 0, 1.0),
-        ]);
+        let batch = batch_from_rows(&[(0, 0, f64::NAN), (0, 0, 1.0)]);
         // total_cmp: positive NaN is ordered above all finite values
         assert_eq!(compare_rows(&schema, &batch, 0, &batch, 1), Ordering::Greater);
         assert_eq!(compare_rows(&schema, &batch, 1, &batch, 0), Ordering::Less);
@@ -656,9 +664,13 @@ mod tests {
         let mut b = [0u8; 16];
         // "abc" < "abd"
         a[0..4].copy_from_slice(&3u32.to_le_bytes());
-        a[4] = b'a'; a[5] = b'b'; a[6] = b'c';
+        a[4] = b'a';
+        a[5] = b'b';
+        a[6] = b'c';
         b[0..4].copy_from_slice(&3u32.to_le_bytes());
-        b[4] = b'a'; b[5] = b'b'; b[6] = b'd';
+        b[4] = b'a';
+        b[5] = b'b';
+        b[6] = b'd';
         assert_eq!(compare_german_strings(&a, &[], &b, &[]), Ordering::Less);
 
         // Equal
@@ -682,12 +694,18 @@ mod tests {
 
         // Equal long strings
         let (sb_eq, blob_b_eq) = make_long_string(&data_a);
-        assert_eq!(compare_german_strings(&sa, &blob_a, &sb_eq, &blob_b_eq), Ordering::Equal);
+        assert_eq!(
+            compare_german_strings(&sa, &blob_a, &sb_eq, &blob_b_eq),
+            Ordering::Equal
+        );
 
         // Prefix differs early → less
         let data_b_prefix: Vec<u8> = b"aello_world_long_A".to_vec();
         let (sb_prefix, blob_b_prefix) = make_long_string(&data_b_prefix);
-        assert_eq!(compare_german_strings(&sb_prefix, &blob_b_prefix, &sa, &blob_a), Ordering::Less);
+        assert_eq!(
+            compare_german_strings(&sb_prefix, &blob_b_prefix, &sa, &blob_a),
+            Ordering::Less
+        );
     }
 
     #[test]
@@ -700,7 +718,10 @@ mod tests {
         s_short[8..14].copy_from_slice(&short_data[4..]);
         let long_data: Vec<u8> = b"01234567890123456789".to_vec(); // len=20
         let (s_long, blob_long) = make_long_string(&long_data);
-        assert_eq!(compare_german_strings(&s_short, &[], &s_long, &blob_long), Ordering::Less);
+        assert_eq!(
+            compare_german_strings(&s_short, &[], &s_long, &blob_long),
+            Ordering::Less
+        );
     }
 
     /// Test STRING column comparison via compare_rows (short strings).
@@ -718,12 +739,16 @@ mod tests {
         // "abc" (len=3)
         let mut s1 = [0u8; 16];
         s1[0..4].copy_from_slice(&3u32.to_le_bytes());
-        s1[4] = b'a'; s1[5] = b'b'; s1[6] = b'c';
+        s1[4] = b'a';
+        s1[5] = b'b';
+        s1[6] = b'c';
         col0.extend_from_slice(&s1);
         // "abd" (len=3)
         let mut s2 = [0u8; 16];
         s2[0..4].copy_from_slice(&3u32.to_le_bytes());
-        s2[4] = b'a'; s2[5] = b'b'; s2[6] = b'd';
+        s2[4] = b'a';
+        s2[5] = b'b';
+        s2[6] = b'd';
         col0.extend_from_slice(&s2);
 
         let batch = single_col_batch(&[0, 0], col0);
@@ -773,15 +798,18 @@ mod tests {
     #[test]
     fn test_compare_rows_fixedint_nonnull_matches_generic() {
         // Signed: MIN / -1 / 0 / 1 / MAX exercise the sign-flip across the MSB.
-        check_single_col_fixedint(type_code::I8,  &[i8::MIN as i128, -1, 0, 1, i8::MAX as i128]);
+        check_single_col_fixedint(type_code::I8, &[i8::MIN as i128, -1, 0, 1, i8::MAX as i128]);
         check_single_col_fixedint(type_code::I16, &[i16::MIN as i128, -1, 0, 1, i16::MAX as i128]);
         check_single_col_fixedint(type_code::I32, &[i32::MIN as i128, -1, 0, 1, i32::MAX as i128]);
         check_single_col_fixedint(type_code::I64, &[i64::MIN as i128, -1, 0, 1, i64::MAX as i128]);
         // Unsigned: include high-bit-set values that signed reads would invert.
-        check_single_col_fixedint(type_code::U8,  &[0, 1, 0x7F, 0x80, 0xFF]);
+        check_single_col_fixedint(type_code::U8, &[0, 1, 0x7F, 0x80, 0xFF]);
         check_single_col_fixedint(type_code::U16, &[0, 1, 0x7FFF, 0x8000, 0xFFFF]);
         check_single_col_fixedint(type_code::U32, &[0, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF]);
-        check_single_col_fixedint(type_code::U64, &[0, 1, 0x7FFF_FFFF_FFFF_FFFF, 0x8000_0000_0000_0000, u64::MAX as i128]);
+        check_single_col_fixedint(
+            type_code::U64,
+            &[0, 1, 0x7FFF_FFFF_FFFF_FFFF, 0x8000_0000_0000_0000, u64::MAX as i128],
+        );
 
         // Multi-column schemas. (I32, I64) is all-signed (primary diff col 0,
         // tie-break col 1); (I32, U32) and (U64, I64) mix signedness — the case
@@ -795,8 +823,14 @@ mod tests {
             let (col0, col1) = mixed_rows(c0, c1);
             let n = col0.len() / SchemaColumn::new(c0, 0).size() as usize;
             let mut null_bmp = Vec::new();
-            for _ in 0..n { null_bmp.extend_from_slice(&0u64.to_le_bytes()); }
-            let batch = TestBatch { null_bmp, col_data: vec![col0, col1], blob: vec![] };
+            for _ in 0..n {
+                null_bmp.extend_from_slice(&0u64.to_le_bytes());
+            }
+            let batch = TestBatch {
+                null_bmp,
+                col_data: vec![col0, col1],
+                blob: vec![],
+            };
             for i in 0..n {
                 for j in 0..n {
                     assert_eq!(
@@ -832,17 +866,22 @@ mod tests {
     fn test_schema_is_fixedint_nonnull_bounds() {
         // All-signed, non-nullable → true
         assert!(schema_is_fixedint_nonnull(&make_schema(&[
-            (type_code::I8, 0), (type_code::I16, 0),
-            (type_code::I32, 0), (type_code::I64, 0),
+            (type_code::I8, 0),
+            (type_code::I16, 0),
+            (type_code::I32, 0),
+            (type_code::I64, 0),
         ])));
         // All-unsigned, non-nullable → true
         assert!(schema_is_fixedint_nonnull(&make_schema(&[
-            (type_code::U8, 0), (type_code::U16, 0),
-            (type_code::U32, 0), (type_code::U64, 0),
+            (type_code::U8, 0),
+            (type_code::U16, 0),
+            (type_code::U32, 0),
+            (type_code::U64, 0),
         ])));
         // Mixed signed/unsigned, non-nullable → true (the old split missed this)
         assert!(schema_is_fixedint_nonnull(&make_schema(&[
-            (type_code::I64, 0), (type_code::U32, 0),
+            (type_code::I64, 0),
+            (type_code::U32, 0),
         ])));
         // Empty payload (all-PK) → vacuously true
         assert!(schema_is_fixedint_nonnull(&pk_only_schema(&[type_code::U64])));
@@ -853,8 +892,12 @@ mod tests {
 
         // Each non-fixed-int type → false (U128/UUID exceed 8 bytes; floats/strings/blobs)
         for tc in [
-            type_code::U128, type_code::UUID, type_code::F32, type_code::F64,
-            type_code::STRING, type_code::BLOB,
+            type_code::U128,
+            type_code::UUID,
+            type_code::F32,
+            type_code::F64,
+            type_code::STRING,
+            type_code::BLOB,
         ] {
             assert!(
                 !schema_is_fixedint_nonnull(&make_schema(&[(tc, 0)])),
@@ -864,7 +907,8 @@ mod tests {
 
         // A single disqualifier among valid columns kills it.
         assert!(!schema_is_fixedint_nonnull(&make_schema(&[
-            (type_code::I64, 0), (type_code::U128, 0),
+            (type_code::I64, 0),
+            (type_code::U128, 0),
         ])));
     }
 
@@ -878,10 +922,14 @@ mod tests {
 
         fn arb_fixedint_type() -> impl Strategy<Value = u8> {
             prop_oneof![
-                Just(type_code::I8),  Just(type_code::U8),
-                Just(type_code::I16), Just(type_code::U16),
-                Just(type_code::I32), Just(type_code::U32),
-                Just(type_code::I64), Just(type_code::U64),
+                Just(type_code::I8),
+                Just(type_code::U8),
+                Just(type_code::I16),
+                Just(type_code::U16),
+                Just(type_code::I32),
+                Just(type_code::U32),
+                Just(type_code::I64),
+                Just(type_code::U64),
             ]
         }
 
@@ -890,14 +938,16 @@ mod tests {
         /// including mixed; random bytes frequently set the high bit, so a
         /// signedness bug surfaces as a fast-vs-generic disagreement.
         fn arb_case() -> impl Strategy<Value = (Vec<u8>, usize, Vec<Vec<u8>>)> {
-            (prop::collection::vec(arb_fixedint_type(), 1..=4), 2usize..=6usize)
-                .prop_flat_map(|(types, n)| {
-                    let cols: Vec<_> = types.iter().map(|&t| {
+            (prop::collection::vec(arb_fixedint_type(), 1..=4), 2usize..=6usize).prop_flat_map(|(types, n)| {
+                let cols: Vec<_> = types
+                    .iter()
+                    .map(|&t| {
                         let cs = SchemaColumn::new(t, 0).size() as usize;
                         prop::collection::vec(any::<u8>(), n * cs)
-                    }).collect();
-                    (Just(types), Just(n), cols)
-                })
+                    })
+                    .collect();
+                (Just(types), Just(n), cols)
+            })
         }
 
         proptest! {
@@ -946,12 +996,16 @@ mod tests {
             // Naive linear reference: first index whose bytes are >= key.
             let expected = (0..count).find(|&i| get(i) >= &key[..]).unwrap_or(count);
             assert_eq!(
-                binary_lower_bound(0, count, &key, &get), expected,
-                "binary_lower_bound key={p}");
+                binary_lower_bound(0, count, &key, &get),
+                expected,
+                "binary_lower_bound key={p}"
+            );
             for hint in 0..=count {
                 assert_eq!(
-                    gallop_lower_bound_bytes(count, &key, hint, get), expected,
-                    "gallop key={p} hint={hint}");
+                    gallop_lower_bound_bytes(count, &key, hint, get),
+                    expected,
+                    "gallop key={p} hint={hint}"
+                );
             }
         }
     }

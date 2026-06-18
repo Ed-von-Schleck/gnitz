@@ -83,7 +83,14 @@ pub(super) fn create_child_table(
     // Track the path before creating so cleanup also removes a partially
     // created directory if Table::new fails.
     state.scratch_dirs.push(child_dir.clone());
-    Table::new(&child_dir, child_name, schema, table_id, 256 * 1024, Persistence::Ephemeral)
+    Table::new(
+        &child_dir,
+        child_name,
+        schema,
+        table_id,
+        256 * 1024,
+        Persistence::Ephemeral,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -97,18 +104,23 @@ pub(super) fn is_join_trace_side(loaded: &LoadedCircuit, nid: i32) -> bool {
     // an `.any()` test would still skip, and the normal consumer's `in_regs`
     // lookup would miss and fall back to register 0 — reading unrelated payload.
     // The skip is only safe when EVERY outgoing edge is a join trace side.
-    loaded.outgoing.get(&nid).map(|outs| {
-        !outs.is_empty() && outs.iter().all(|&(dst, port)| {
-            port == PORT_TRACE
-                && matches!(
-                    loaded.nodes.get(&dst),
-                    Some(gnitz_wire::OpNode::Join(_))
-                    | Some(gnitz_wire::OpNode::AntiJoin(_))
-                    | Some(gnitz_wire::OpNode::SemiJoin(_))
-                    | Some(gnitz_wire::OpNode::SeekTrace)
-                )
+    loaded
+        .outgoing
+        .get(&nid)
+        .map(|outs| {
+            !outs.is_empty()
+                && outs.iter().all(|&(dst, port)| {
+                    port == PORT_TRACE
+                        && matches!(
+                            loaded.nodes.get(&dst),
+                            Some(gnitz_wire::OpNode::Join(_))
+                                | Some(gnitz_wire::OpNode::AntiJoin(_))
+                                | Some(gnitz_wire::OpNode::SemiJoin(_))
+                                | Some(gnitz_wire::OpNode::SeekTrace)
+                        )
+                })
         })
-    }).unwrap_or(false)
+        .unwrap_or(false)
 }
 
 pub(super) struct EmitState {
@@ -215,13 +227,23 @@ pub(super) fn emit_node(
                 match decode_expr_blob(blob) {
                     Some(dep) => {
                         let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
-                        create_expr_predicate(code, dep.num_regs, dep.result_reg, dep.const_strings,
-                            &in_schema, owned_expr_progs, owned_funcs)
+                        create_expr_predicate(
+                            code,
+                            dep.num_regs,
+                            dep.result_reg,
+                            dep.const_strings,
+                            &in_schema,
+                            owned_expr_progs,
+                            owned_funcs,
+                        )
                     }
                     // A present-but-corrupt blob is catalog corruption. Falling
                     // back to null_func_ptr (pass-all) would silently turn a
                     // WHERE into WHERE TRUE; abort the compile instead.
-                    None => { state.emit_failed = true; return; }
+                    None => {
+                        state.emit_failed = true;
+                        return;
+                    }
                 }
             } else {
                 // Absent blob = no WHERE clause; pass-all is intentional.
@@ -234,18 +256,23 @@ pub(super) fn emit_node(
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_reg_schema = reg_schemas[in_reg as usize];
             match mk {
-                gnitz_wire::MapKind::Expression { program, reindex_cols, reindex_target_tcs } => {
+                gnitz_wire::MapKind::Expression {
+                    program,
+                    reindex_cols,
+                    reindex_target_tcs,
+                } => {
                     // A corrupt MAP blob would otherwise be skipped, leaving the
                     // output register at the default empty schema and silently
                     // producing wrong/empty downstream results. Abort the compile.
                     let dep = match decode_expr_blob(program) {
                         Some(d) => d,
-                        None => { state.emit_failed = true; return; }
+                        None => {
+                            state.emit_failed = true;
+                            return;
+                        }
                     };
                     // Identity MAP: if no reindex and schemas match, skip if sequential copy.
-                    if reindex_cols.is_empty()
-                        && schemas_physically_identical(&in_reg_schema, &loaded.out_schema)
-                    {
+                    if reindex_cols.is_empty() && schemas_physically_identical(&in_reg_schema, &loaded.out_schema) {
                         let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
                         let prog = ExprProgram::new(code, dep.num_regs, 0, Vec::new());
                         // Elide only when the block copy skips exactly the inherited
@@ -313,13 +340,28 @@ pub(super) fn emit_node(
                     } else {
                         loaded.out_schema
                     };
-                    let fp = create_expr_map(code, dep.num_regs, dep.const_strings,
-                        &in_reg_schema, &node_schema, owned_expr_progs, owned_funcs);
+                    let fp = create_expr_map(
+                        code,
+                        dep.num_regs,
+                        dep.const_strings,
+                        &in_reg_schema,
+                        &node_schema,
+                        owned_expr_progs,
+                        owned_funcs,
+                    );
                     reg_schemas[reg_id as usize] = node_schema;
                     reg_kinds[reg_id as usize] = 0;
                     let cols_u32: Vec<u32> = reindex_cols.iter().map(|&c| c as u32).collect();
-                    builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema,
-                        &cols_u32, reindex_target_tcs, false, 0);
+                    builder.add_map(
+                        in_reg as u16,
+                        reg_id as u16,
+                        fp,
+                        node_schema,
+                        &cols_u32,
+                        reindex_target_tcs,
+                        false,
+                        0,
+                    );
                 }
 
                 gnitz_wire::MapKind::HashRow(proj_cols, branch_id) => {
@@ -327,7 +369,8 @@ pub(super) fn emit_node(
                     // Projection, but prepend a synthetic U128 PK that op_map sets
                     // to a hash of those payload columns (reindex_hash path).
                     let src_indices: Vec<i32> = proj_cols.iter().map(|&c| c as i32).collect();
-                    let src_types: Vec<u8> = src_indices.iter()
+                    let src_types: Vec<u8> = src_indices
+                        .iter()
                         .map(|&i| in_reg_schema.columns[i as usize].type_code)
                         .collect();
                     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
@@ -337,23 +380,35 @@ pub(super) fn emit_node(
                     }
                     let node_schema = SchemaDescriptor::new(&cols[..1 + src_indices.len()], &[0]);
                     let fp = create_universal_projection(
-                        &src_indices, &src_types, &in_reg_schema, &node_schema, owned_funcs,
+                        &src_indices,
+                        &src_types,
+                        &in_reg_schema,
+                        &node_schema,
+                        owned_funcs,
                     );
                     reg_schemas[reg_id as usize] = node_schema;
                     reg_kinds[reg_id as usize] = 0;
-                    builder.add_map(in_reg as u16, reg_id as u16, fp, node_schema,
-                        &[], &[], true, *branch_id);
+                    builder.add_map(
+                        in_reg as u16,
+                        reg_id as u16,
+                        fp,
+                        node_schema,
+                        &[],
+                        &[],
+                        true,
+                        *branch_id,
+                    );
                 }
 
                 gnitz_wire::MapKind::Projection(cols) => {
                     let src_indices: Vec<i32> = cols.iter().map(|&c| c as i32).collect();
-                    let src_types: Vec<u8> = src_indices.iter()
+                    let src_types: Vec<u8> = src_indices
+                        .iter()
                         .map(|&i| in_reg_schema.columns[i as usize].type_code)
                         .collect();
                     let schema = build_map_output_schema(&in_reg_schema, &src_indices);
-                    let fp = create_universal_projection(
-                        &src_indices, &src_types, &in_reg_schema, &schema, owned_funcs,
-                    );
+                    let fp =
+                        create_universal_projection(&src_indices, &src_types, &in_reg_schema, &schema, owned_funcs);
                     reg_schemas[reg_id as usize] = schema;
                     reg_kinds[reg_id as usize] = 0;
                     builder.add_map(in_reg as u16, reg_id as u16, fp, schema, &[], &[], false, 0);
@@ -364,9 +419,7 @@ pub(super) fn emit_node(
                     let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
                     let pk_len = copy_pk_columns_into(&in_reg_schema, &mut cols, &mut pk_idx);
                     let s = SchemaDescriptor::new(&cols[..pk_len], &pk_idx[..pk_len]);
-                    let fp = create_universal_projection(
-                        &[], &[], &in_reg_schema, &s, owned_funcs,
-                    );
+                    let fp = create_universal_projection(&[], &[], &in_reg_schema, &s, owned_funcs);
                     reg_schemas[reg_id as usize] = s;
                     reg_kinds[reg_id as usize] = 0;
                     builder.add_map(in_reg as u16, reg_id as u16, fp, s, &[], &[], false, 0);
@@ -410,11 +463,12 @@ pub(super) fn emit_node(
                 return;
             }
             let child_name = format!("_hist_{view_id}_{nid}");
-            let hist_table = match create_child_table(
-                state, view_dir, &child_name, in_reg_schema, view_table_id,
-            ) {
+            let hist_table = match create_child_table(state, view_dir, &child_name, in_reg_schema, view_table_id) {
                 Ok(t) => t,
-                Err(_) => { state.emit_failed = true; return; }
+                Err(_) => {
+                    state.emit_failed = true;
+                    return;
+                }
             };
             let table_idx = owned_tables.len();
             owned_tables.push(Box::new(hist_table));
@@ -432,10 +486,25 @@ pub(super) fn emit_node(
 
         gnitz_wire::OpNode::Reduce { group_cols, agg } => {
             emit_reduce(
-                loaded, rw, nid, reg_id, group_cols, agg, &in_regs,
-                builder, state, out_reg_of, reg_schemas, reg_kinds,
-                owned_tables, owned_funcs, owned_expr_progs, owned_trace_regs,
-                view_dir, view_table_id, view_id,
+                loaded,
+                rw,
+                nid,
+                reg_id,
+                group_cols,
+                agg,
+                &in_regs,
+                builder,
+                state,
+                out_reg_of,
+                reg_schemas,
+                reg_kinds,
+                owned_tables,
+                owned_funcs,
+                owned_expr_progs,
+                owned_trace_regs,
+                view_dir,
+                view_table_id,
+                view_id,
             );
         }
 
@@ -464,8 +533,7 @@ pub(super) fn emit_node(
                     // probe differs. `n_eq`/`rel` ride to the op so it can derive
                     // the eq-prefix / range-slot split and the cut direction.
                     reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema);
-                    builder.add_join_dt_range(
-                        a_reg as u16, b_reg as u16, reg_id as u16, b_schema, *n_eq, *rel);
+                    builder.add_join_dt_range(a_reg as u16, b_reg as u16, reg_id as u16, b_schema, *n_eq, *rel);
                 }
             }
         }
@@ -482,8 +550,9 @@ pub(super) fn emit_node(
                 gnitz_wire::JoinKind::DeltaDelta => {
                     builder.add_anti_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
-                gnitz_wire::JoinKind::DeltaTraceRange { .. } =>
-                    unreachable!("no anti-join range variant; planner rejects LEFT/anti + range"),
+                gnitz_wire::JoinKind::DeltaTraceRange { .. } => {
+                    unreachable!("no anti-join range variant; planner rejects LEFT/anti + range")
+                }
             }
         }
 
@@ -499,8 +568,9 @@ pub(super) fn emit_node(
                 gnitz_wire::JoinKind::DeltaDelta => {
                     builder.add_semi_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
-                gnitz_wire::JoinKind::DeltaTraceRange { .. } =>
-                    unreachable!("no semi-join range variant; planner rejects semi + range"),
+                gnitz_wire::JoinKind::DeltaTraceRange { .. } => {
+                    unreachable!("no semi-join range variant; planner rejects semi + range")
+                }
             }
         }
 
@@ -527,7 +597,9 @@ pub(super) fn emit_node(
                 // Must fail the compile: emitting the view without the Integrate
                 // would compile a view that never persists its differential
                 // state, leaving its output permanently empty.
-                Err(_) => { state.emit_failed = true; }
+                Err(_) => {
+                    state.emit_failed = true;
+                }
             }
         }
 
@@ -541,8 +613,7 @@ pub(super) fn emit_node(
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             reg_schemas[reg_id as usize] = reg_schemas[in_reg as usize];
             reg_kinds[reg_id as usize] = 0;
-            builder.add_partition_filter(
-                in_reg as u16, reg_id as u16, worker_rank(), num_workers());
+            builder.add_partition_filter(in_reg as u16, reg_id as u16, worker_rank(), num_workers());
         }
 
         gnitz_wire::OpNode::ExchangeGather => {
@@ -580,10 +651,20 @@ pub(super) fn emit_node(
         gnitz_wire::OpNode::GatherReduce => {
             let raw_cols = loaded.gather_reduce_cols.get(&nid).map(|v| v.as_slice()).unwrap_or(&[]);
             emit_gather_reduce(
-                raw_cols, nid, reg_id, &in_regs,
-                builder, state, out_reg_of, reg_schemas, reg_kinds,
-                owned_tables, owned_trace_regs,
-                view_dir, view_table_id, view_id,
+                raw_cols,
+                nid,
+                reg_id,
+                &in_regs,
+                builder,
+                state,
+                out_reg_of,
+                reg_schemas,
+                reg_kinds,
+                owned_tables,
+                owned_trace_regs,
+                view_dir,
+                view_table_id,
+                view_id,
             );
         }
 
@@ -615,8 +696,13 @@ pub(super) fn emit_simple_integrate(builder: &mut ProgramBuilder, in_reg: u16, t
     builder.add_integrate(
         in_reg,
         table_ptr,
-        std::ptr::null_mut(), 0, // no GI
-        std::ptr::null_mut(), false, 0, &[], 0, // no AVI
+        std::ptr::null_mut(),
+        0, // no GI
+        std::ptr::null_mut(),
+        false,
+        0,
+        &[],
+        0, // no AVI
     );
 }
 
@@ -659,17 +745,21 @@ pub(super) fn emit_reduce(
     match agg {
         gnitz_wire::AggKind::Null => {
             agg_descs.push(AggDescriptor {
-                col_idx: 0, agg_op: AggOp::Null, col_type_code: TypeCode::U64, _pad: [0; 2],
+                col_idx: 0,
+                agg_op: AggOp::Null,
+                col_type_code: TypeCode::U64,
+                _pad: [0; 2],
             });
         }
         gnitz_wire::AggKind::Specs(specs) => {
             for &(ref func, col_idx) in specs {
                 let agg_op = AggOp::from(*func);
-                let col_type_code = TypeCode::from_validated_u8(
-                    in_reg_schema.columns[col_idx as usize].type_code,
-                );
+                let col_type_code = TypeCode::from_validated_u8(in_reg_schema.columns[col_idx as usize].type_code);
                 agg_descs.push(AggDescriptor {
-                    col_idx: col_idx as u32, agg_op, col_type_code, _pad: [0; 2],
+                    col_idx: col_idx as u32,
+                    agg_op,
+                    col_type_code,
+                    _pad: [0; 2],
                 });
             }
             if agg_descs.len() == 1 {
@@ -682,10 +772,17 @@ pub(super) fn emit_reduce(
     let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols, &agg_descs);
 
     let trace_table = match create_child_table(
-        state, view_dir, &format!("_reduce_{view_id}_{nid}"), reduce_out_schema, view_table_id,
+        state,
+        view_dir,
+        &format!("_reduce_{view_id}_{nid}"),
+        reduce_out_schema,
+        view_table_id,
     ) {
         Ok(t) => t,
-        Err(_) => { state.emit_failed = true; return; }
+        Err(_) => {
+            state.emit_failed = true;
+            return;
+        }
     };
     let trace_table_idx = owned_tables.len();
     owned_tables.push(Box::new(trace_table));
@@ -721,9 +818,9 @@ pub(super) fn emit_reduce(
     // MIN/MAX.
     let will_use_avi = agg_descs.len() == 1
         && matches!(agg_func_id, AggOp::Min | AggOp::Max)
-        && agg_value_idx_eligible(
-            TypeCode::from_validated_u8(in_reg_schema.columns[agg_col_idx as usize].type_code),
-        )
+        && agg_value_idx_eligible(TypeCode::from_validated_u8(
+            in_reg_schema.columns[agg_col_idx as usize].type_code,
+        ))
         && avi_group_key_eligible(&in_reg_schema, &gcols_u32);
 
     let mut tr_in_reg_id: i32 = -1;
@@ -737,11 +834,12 @@ pub(super) fn emit_reduce(
     if let Some(&existing) = in_regs.get(&PORT_TRACE) {
         tr_in_reg_id = existing;
     } else if !all_linear && !will_use_avi {
-        let tr_in = match create_child_table(
-            state, view_dir, &tr_in_name, in_reg_schema, view_table_id,
-        ) {
+        let tr_in = match create_child_table(state, view_dir, &tr_in_name, in_reg_schema, view_table_id) {
             Ok(t) => t,
-            Err(_) => { state.emit_failed = true; return; }
+            Err(_) => {
+                state.emit_failed = true;
+                return;
+            }
         };
         let idx = owned_tables.len();
         owned_tables.push(Box::new(tr_in));
@@ -767,10 +865,19 @@ pub(super) fn emit_reduce(
         // zero-filled slot and would collide it with a real group 0. Fall back to
         // the predicate-filtered full trace scan, which distinguishes NULL from 0.
         let gc_nullable = in_reg_schema.columns[gc_col_idx].nullable != 0;
-        if !gc_nullable && matches!(gc_tc,
-            TypeCode::U8  | TypeCode::I8  | TypeCode::U16 | TypeCode::I16 |
-            TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64
-        ) {
+        if !gc_nullable
+            && matches!(
+                gc_tc,
+                TypeCode::U8
+                    | TypeCode::I8
+                    | TypeCode::U16
+                    | TypeCode::I16
+                    | TypeCode::U32
+                    | TypeCode::I32
+                    | TypeCode::U64
+                    | TypeCode::I64
+            )
+        {
             // Nest the GI under the trace-input table's own scratch dir, built
             // from the same `child_scratch_dir` convention so the rank stamp can
             // never drift between the two. Nesting folds the GI into the parent's
@@ -778,7 +885,12 @@ pub(super) fn emit_reduce(
             // `state.scratch_dirs`, and `remove_dir_all` is recursive.
             let gi_dir = format!("{}/_gidx", child_scratch_dir(view_dir, &tr_in_name));
             if let Ok(gi_table) = Table::new(
-                &gi_dir, "_gidx", crate::ops::make_gi_schema(&in_reg_schema), 0, 1024 * 1024, Persistence::Ephemeral,
+                &gi_dir,
+                "_gidx",
+                crate::ops::make_gi_schema(&in_reg_schema),
+                0,
+                1024 * 1024,
+                Persistence::Ephemeral,
             ) {
                 let idx = owned_tables.len();
                 owned_tables.push(Box::new(gi_table));
@@ -801,7 +913,9 @@ pub(super) fn emit_reduce(
         avi_group_cols = gcols_u32.clone();
         let avi_child = format!("_avidx_{view_id}_{nid}");
         if let Ok(av_table) = create_child_table(
-            state, view_dir, &avi_child,
+            state,
+            view_dir,
+            &avi_child,
             crate::ops::make_avi_schema(&in_reg_schema, &gcols_u32),
             view_table_id,
         ) {
@@ -815,9 +929,13 @@ pub(super) fn emit_reduce(
         builder.add_integrate(
             in_reg_id as u16,
             std::ptr::null_mut(),
-            std::ptr::null_mut(), 0,
-            avi_table_ptr, avi_for_max, avi_agg_col_type_code,
-            &avi_group_cols, avi_agg_col_idx,
+            std::ptr::null_mut(),
+            0,
+            avi_table_ptr,
+            avi_for_max,
+            avi_agg_col_type_code,
+            &avi_group_cols,
+            avi_agg_col_idx,
         );
     }
 
@@ -844,9 +962,12 @@ pub(super) fn emit_reduce(
         &agg_descs,
         &gcols_u32,
         reduce_out_schema,
-        avi_table_ptr, avi_for_max, avi_agg_col_type_code,
+        avi_table_ptr,
+        avi_for_max,
+        avi_agg_col_type_code,
         avi_agg_col_idx,
-        gi_table_ptr, gi_col_idx,
+        gi_table_ptr,
+        gi_col_idx,
         fin_prog_ptr,
         fin_schema_ptr,
     );
@@ -855,9 +976,13 @@ pub(super) fn emit_reduce(
         builder.add_integrate(
             in_reg_id as u16,
             tr_in_table_ptr,
-            gi_table_ptr, gi_col_idx,
-            avi_table_ptr, avi_for_max, avi_agg_col_type_code,
-            &avi_group_cols, avi_agg_col_idx,
+            gi_table_ptr,
+            gi_col_idx,
+            avi_table_ptr,
+            avi_for_max,
+            avi_agg_col_type_code,
+            &avi_group_cols,
+            avi_agg_col_idx,
         );
     }
 
@@ -889,19 +1014,23 @@ pub(super) fn build_gather_agg_descs(
             "GATHER_REDUCE: agg_count ({agg_count}) exceeds partial schema column count ({num_out_cols})",
         );
         for (ai, &(func_id, _)) in agg_specs.iter().enumerate() {
-            let agg_op = AggOp::try_from(func_id as u8)
-                .unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
+            let agg_op =
+                AggOp::try_from(func_id as u8).unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
             let agg_col_in_partial = num_out_cols - agg_count + ai;
-            let col_type = TypeCode::from_validated_u8(
-                partial_schema.columns[agg_col_in_partial].type_code,
-            );
+            let col_type = TypeCode::from_validated_u8(partial_schema.columns[agg_col_in_partial].type_code);
             agg_descs.push(AggDescriptor {
-                col_idx: agg_col_in_partial as u32, agg_op, col_type_code: col_type, _pad: [0; 2],
+                col_idx: agg_col_in_partial as u32,
+                agg_op,
+                col_type_code: col_type,
+                _pad: [0; 2],
             });
         }
     } else {
         agg_descs.push(AggDescriptor {
-            col_idx: 0, agg_op: AggOp::Null, col_type_code: TypeCode::U64, _pad: [0; 2],
+            col_idx: 0,
+            agg_op: AggOp::Null,
+            col_type_code: TypeCode::U64,
+            _pad: [0; 2],
         });
     }
     agg_descs
@@ -931,17 +1060,25 @@ pub(super) fn emit_gather_reduce(
     let in_reg_id = in_regs.get(&PORT_IN).copied().unwrap_or(0);
     let partial_schema = reg_schemas[in_reg_id as usize];
 
-    let agg_specs: Vec<(u64, u64)> = raw_cols.iter()
+    let agg_specs: Vec<(u64, u64)> = raw_cols
+        .iter()
         .filter(|(k, _, _, _)| *k == gnitz_wire::NODE_COL_KIND_AGG_SPEC)
         .map(|(_, _, v1, v2)| (*v1, *v2))
         .collect();
     let agg_descs = build_gather_agg_descs(&partial_schema, &agg_specs);
 
     let trace_table = match create_child_table(
-        state, view_dir, &format!("_gather_{view_id}_{nid}"), partial_schema, view_table_id,
+        state,
+        view_dir,
+        &format!("_gather_{view_id}_{nid}"),
+        partial_schema,
+        view_table_id,
     ) {
         Ok(t) => t,
-        Err(_) => { state.emit_failed = true; return; }
+        Err(_) => {
+            state.emit_failed = true;
+            return;
+        }
     };
     let table_idx = owned_tables.len();
     owned_tables.push(Box::new(trace_table));
@@ -960,7 +1097,6 @@ pub(super) fn emit_gather_reduce(
     builder.add_gather_reduce(in_reg_id as u16, reg_id as u16, raw_delta_id as u16, &agg_descs);
     emit_simple_integrate(builder, raw_delta_id as u16, trace_table_ptr);
 }
-
 
 #[allow(clippy::too_many_arguments, clippy::vec_box)]
 pub(super) fn build_plan(
@@ -1000,8 +1136,7 @@ pub(super) fn build_plan(
 
     // Schedule position within THIS compiled slice (exchange views compile
     // sub-slices, so index `ordered`, not loaded.ordered).
-    let pos: HashMap<i32, usize> =
-        ordered.iter().copied().enumerate().map(|(i, n)| (n, i)).collect();
+    let pos: HashMap<i32, usize> = ordered.iter().copied().enumerate().map(|(i, n)| (n, i)).collect();
 
     for &nid in ordered {
         if rw.skip_nodes.contains(&nid) {
@@ -1010,16 +1145,22 @@ pub(super) fn build_plan(
         // Ops that destructively empty an input register, and the port they empty.
         // (Union's in_a and AntiJoinDT's delta side are both PORT_IN_A == PORT_IN.)
         let dtor_port = match loaded.nodes.get(&nid) {
-            Some(gnitz_wire::OpNode::Distinct)
-            | Some(gnitz_wire::OpNode::Union)
-            | Some(gnitz_wire::OpNode::Delay) => Some(PORT_IN),
+            Some(gnitz_wire::OpNode::Distinct) | Some(gnitz_wire::OpNode::Union) | Some(gnitz_wire::OpNode::Delay) => {
+                Some(PORT_IN)
+            }
             Some(gnitz_wire::OpNode::AntiJoin(gnitz_wire::JoinKind::DeltaTrace)) => Some(PORT_IN_A),
             _ => None,
         };
         let Some(port) = dtor_port else { continue };
-        let Some(in_edges) = loaded.incoming.get(&nid) else { continue };
-        let Some(&(pred, _)) = in_edges.iter().find(|&&(_, p)| p == port) else { continue };
-        let Some(co_readers) = loaded.consumers.get(&pred) else { continue };
+        let Some(in_edges) = loaded.incoming.get(&nid) else {
+            continue;
+        };
+        let Some(&(pred, _)) = in_edges.iter().find(|&&(_, p)| p == port) else {
+            continue;
+        };
+        let Some(co_readers) = loaded.consumers.get(&pred) else {
+            continue;
+        };
         let Some(&dtor_pos) = pos.get(&nid) else { continue };
         for &other in co_readers {
             if other == nid || rw.skip_nodes.contains(&other) {
@@ -1108,12 +1249,25 @@ pub(super) fn build_plan(
         }
         let reg_id = *out_reg_of.get(&nid).unwrap();
         emit_node(
-            loaded, rw, nid, reg_id,
-            &mut builder, &mut state, &mut out_reg_of,
-            &mut reg_schemas, &mut reg_kinds,
-            &mut owned_tables, &mut owned_funcs, &mut owned_expr_progs, &mut owned_trace_regs,
-            ext_tables, &mut ext_trace_regs, &mut source_reg_map,
-            view_dir, view_table_id, view_id,
+            loaded,
+            rw,
+            nid,
+            reg_id,
+            &mut builder,
+            &mut state,
+            &mut out_reg_of,
+            &mut reg_schemas,
+            &mut reg_kinds,
+            &mut owned_tables,
+            &mut owned_funcs,
+            &mut owned_expr_progs,
+            &mut owned_trace_regs,
+            ext_tables,
+            &mut ext_trace_regs,
+            &mut source_reg_map,
+            view_dir,
+            view_table_id,
+            view_id,
         );
     }
 
@@ -1169,8 +1323,12 @@ pub(super) fn build_plan(
     }
 
     let vm = builder.build_with_owned(
-        &reg_schemas, &reg_kinds,
-        owned_tables, owned_funcs, owned_expr_progs, owned_trace_regs,
+        &reg_schemas,
+        &reg_kinds,
+        owned_tables,
+        owned_funcs,
+        owned_expr_progs,
+        owned_trace_regs,
     );
 
     Some(PlanBuildResult {
@@ -1196,9 +1354,13 @@ pub(super) fn ancestors_inclusive(loaded: &LoadedCircuit, start: i32) -> HashSet
     let mut set = HashSet::new();
     let mut queue = VecDeque::from([start]);
     while let Some(cur) = queue.pop_front() {
-        if !set.insert(cur) { continue; }
+        if !set.insert(cur) {
+            continue;
+        }
         if let Some(ins) = loaded.incoming.get(&cur) {
-            for &(src, _port) in ins { queue.push_back(src); }
+            for &(src, _port) in ins {
+                queue.push_back(src);
+            }
         }
     }
     set
@@ -1206,7 +1368,9 @@ pub(super) fn ancestors_inclusive(loaded: &LoadedCircuit, start: i32) -> HashSet
 
 /// The node feeding an `ExchangeShard` on `PORT_IN` (the value to repartition).
 pub(super) fn exchange_input_node(loaded: &LoadedCircuit, ex_nid: i32) -> i32 {
-    loaded.incoming.get(&ex_nid)
+    loaded
+        .incoming
+        .get(&ex_nid)
         .and_then(|ins| ins.iter().find(|&&(_, port)| port == PORT_IN))
         .map(|&(src, _)| src)
         .unwrap_or(-1)
@@ -1228,4 +1392,3 @@ pub(super) fn phase_rewrites(rw: &Rewrites, nids: &HashSet<i32>) -> Rewrites {
 pub(super) fn source_reg_map_u16(m: &HashMap<i64, i32>) -> HashMap<i64, u16> {
     m.iter().map(|(&tid, &reg)| (tid, reg as u16)).collect()
 }
-

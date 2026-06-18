@@ -10,16 +10,16 @@
 
 use std::ffi::CStr;
 
+use super::super::batch::Batch;
 use super::super::columnar::PkOrd;
-use super::super::{with_payload_cmp, with_pk_ord};
 use super::super::error::StorageError;
 use super::super::heap::{drive_merge, HeapNode, LoserTree};
-use super::super::batch::Batch;
-use super::super::merge::{BlobCacheGuard, pack_pk_be};
+use super::super::merge::{pack_pk_be, BlobCacheGuard};
 use super::super::shard_file::PkUniqueChecker;
-use crate::schema::SchemaDescriptor;
 use super::super::shard_reader::MappedShard;
-use super::route::{GuardResult, find_guard_for_key};
+use super::super::{with_payload_cmp, with_pk_ord};
+use super::route::{find_guard_for_key, GuardResult};
+use crate::schema::SchemaDescriptor;
 
 // ---------------------------------------------------------------------------
 // Shard cursor (position + ghost skip)
@@ -88,9 +88,7 @@ pub(super) fn open_and_merge(
         }
     }
 
-    let cursors: Vec<ShardCursor> = (0..shards.len())
-        .map(|i| ShardCursor::new(&shards[i]))
-        .collect();
+    let cursors: Vec<ShardCursor> = (0..shards.len()).map(|i| ShardCursor::new(&shards[i])).collect();
 
     // Dispatch the payload comparator (outer) then the stride comparator (inner),
     // each once — never a per-comparison branch. The old narrow/wide fork is gone:
@@ -107,7 +105,8 @@ fn open_and_merge_with_payload<RowCmp>(
     schema: &SchemaDescriptor,
     emit: impl FnMut(u128, i64, &MappedShard, usize),
     row_cmp: RowCmp,
-) where RowCmp: Fn(&SchemaDescriptor, &MappedShard, usize, &MappedShard, usize) -> std::cmp::Ordering + Copy
+) where
+    RowCmp: Fn(&SchemaDescriptor, &MappedShard, usize, &MappedShard, usize) -> std::cmp::Ordering + Copy,
 {
     with_pk_ord!(schema, open_and_merge_pk, shards, cursors, schema, emit, row_cmp)
 }
@@ -138,8 +137,9 @@ fn open_and_merge_pk<RowCmp, PK>(
         match pk_ord.cmp(shards[a_src].get_pk_bytes(a_row), shards[b_src].get_pk_bytes(b_row)) {
             std::cmp::Ordering::Less => true,
             std::cmp::Ordering::Greater => false,
-            std::cmp::Ordering::Equal =>
-                row_cmp(schema, &shards[a_src], a_row, &shards[b_src], b_row) == std::cmp::Ordering::Less,
+            std::cmp::Ordering::Equal => {
+                row_cmp(schema, &shards[a_src], a_row, &shards[b_src], b_row) == std::cmp::Ordering::Less
+            }
         }
     };
     let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
@@ -186,7 +186,12 @@ fn open_and_merge_inner<L, SP, EQ>(
         eq_payload,
         |src, row| shards[src].get_weight(row),
         |group_src, group_row, w| {
-            emit(pack_pk_be(shards[group_src].get_pk_bytes(group_row)), w, &shards[group_src], group_row);
+            emit(
+                pack_pk_be(shards[group_src].get_pk_bytes(group_row)),
+                w,
+                &shards[group_src],
+                group_row,
+            );
             std::ops::ControlFlow::Continue(())
         },
     );
@@ -217,19 +222,11 @@ pub fn merge_and_route(
     let num_guards = guard_keys.len();
     let out_dir_str = output_dir.to_str().unwrap_or("");
 
-    let mut batches: Vec<Batch> = (0..num_guards)
-        .map(|_| Batch::with_schema(*schema, 256))
-        .collect();
-    let mut blob_caches: Vec<BlobCacheGuard> = (0..num_guards)
-        .map(|_| BlobCacheGuard::acquire(schema, 256))
-        .collect();
-    let mut checkers: Vec<PkUniqueChecker> = (0..num_guards)
-        .map(|_| PkUniqueChecker::new())
-        .collect();
+    let mut batches: Vec<Batch> = (0..num_guards).map(|_| Batch::with_schema(*schema, 256)).collect();
+    let mut blob_caches: Vec<BlobCacheGuard> = (0..num_guards).map(|_| BlobCacheGuard::acquire(schema, 256)).collect();
+    let mut checkers: Vec<PkUniqueChecker> = (0..num_guards).map(|_| PkUniqueChecker::new()).collect();
     let out_filenames: Vec<String> = (0..num_guards)
-        .map(|i| format!(
-            "{out_dir_str}/shard_{table_id}_{lsn_tag}_L{level_num}_G{i}.db"
-        ))
+        .map(|i| format!("{out_dir_str}/shard_{table_id}_{lsn_tag}_L{level_num}_G{i}.db"))
         .collect();
 
     // `key` is the order-preserving sort key — the guard-routing key (matching
@@ -241,9 +238,7 @@ pub fn merge_and_route(
         if can_tag_pk_unique {
             checkers[gi].observe(pk_bytes, weight);
         }
-        batches[gi].append_row_from_source_bytes(
-            pk_bytes, weight, shard, row, blob_caches[gi].get_mut(),
-        );
+        batches[gi].append_row_from_source_bytes(pk_bytes, weight, shard, row, blob_caches[gi].get_mut());
     })?;
 
     // Validate all output paths fit in GuardResult.filename before writing anything.
@@ -275,7 +270,8 @@ pub fn merge_and_route(
         assert!(
             ri < out_results.len(),
             "merge_and_route: out_results buffer too small ({} slots for {} guards)",
-            out_results.len(), num_guards,
+            out_results.len(),
+            num_guards,
         );
         out_results[ri].guard_key = guard_keys[i];
         let name_bytes = out_filenames[i].as_bytes();

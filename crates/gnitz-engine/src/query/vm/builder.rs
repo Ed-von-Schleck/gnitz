@@ -1,10 +1,10 @@
 //! `ProgramBuilder` — constructs a `Program` via incremental `add_*()` calls.
 
 use super::*;
+use crate::expr::ScalarFuncKind;
+use crate::ops::AggDescriptor;
 use crate::schema::SchemaDescriptor;
 use crate::storage::Table;
-use crate::ops::AggDescriptor;
-use crate::expr::ScalarFuncKind;
 
 // ---------------------------------------------------------------------------
 // ProgramBuilder — constructs a Program via incremental add_*() calls.
@@ -48,7 +48,9 @@ impl ProgramBuilder {
 
     fn func_idx(&mut self, ptr: *const ScalarFuncKind) -> u16 {
         for (i, &f) in self.funcs.iter().enumerate() {
-            if f == ptr { return i as u16; }
+            if f == ptr {
+                return i as u16;
+            }
         }
         let idx = self.funcs.len() as u16;
         self.funcs.push(ptr);
@@ -56,9 +58,13 @@ impl ProgramBuilder {
     }
 
     fn table_idx(&mut self, ptr: *mut Table) -> i32 {
-        if ptr.is_null() { return -1; }
+        if ptr.is_null() {
+            return -1;
+        }
         for (i, &t) in self.tables.iter().enumerate() {
-            if t == ptr { return i as i32; }
+            if t == ptr {
+                return i as i32;
+            }
         }
         let idx = self.tables.len() as i32;
         self.tables.push(ptr);
@@ -75,9 +81,13 @@ impl ProgramBuilder {
     }
 
     fn expr_idx(&mut self, ptr: *const crate::expr::ExprProgram) -> i16 {
-        if ptr.is_null() { return -1; }
+        if ptr.is_null() {
+            return -1;
+        }
         for (i, &e) in self.expr_progs.iter().enumerate() {
-            if e == ptr { return i as i16; }
+            if e == ptr {
+                return i as i16;
+            }
         }
         let idx = self.expr_progs.len() as i16;
         self.expr_progs.push(ptr);
@@ -99,8 +109,11 @@ impl ProgramBuilder {
     fn add_reindex_cols(&mut self, cols: &[u32], target_tcs: &[u8]) -> (u32, u16) {
         let offset = self.reindex_cols.len() as u32;
         // This is the only mutator of either pool, so they enter in lockstep.
-        debug_assert_eq!(self.reindex_target_tcs.len(), offset as usize,
-            "reindex pools must stay in lockstep");
+        debug_assert_eq!(
+            self.reindex_target_tcs.len(),
+            offset as usize,
+            "reindex pools must stay in lockstep"
+        );
         self.reindex_cols.extend_from_slice(cols);
         // Keep the target-tc pool in lockstep with reindex_cols (same offset and
         // count): a shorter or empty `target_tcs` zero-fills (= derive from source),
@@ -125,7 +138,11 @@ impl ProgramBuilder {
     }
 
     pub fn add_scan_trace(&mut self, trace_reg: u16, out_reg: u16, chunk_limit: i32) {
-        self.instructions.push(Instr::ScanTrace { trace_reg, out_reg, chunk_limit });
+        self.instructions.push(Instr::ScanTrace {
+            trace_reg,
+            out_reg,
+            chunk_limit,
+        });
     }
 
     pub fn add_seek_trace(&mut self, trace_reg: u16, key_reg: u16) {
@@ -134,22 +151,37 @@ impl ProgramBuilder {
 
     pub fn add_filter(&mut self, in_reg: u16, out_reg: u16, func_ptr: *const ScalarFuncKind) {
         let func_idx = self.func_idx(func_ptr);
-        self.instructions.push(Instr::Filter { in_reg, out_reg, func_idx });
+        self.instructions.push(Instr::Filter {
+            in_reg,
+            out_reg,
+            func_idx,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn add_map(
-        &mut self, in_reg: u16, out_reg: u16,
-        func_ptr: *const ScalarFuncKind, out_schema: SchemaDescriptor,
-        reindex_cols: &[u32], reindex_target_tcs: &[u8], reindex_hash: bool,
+        &mut self,
+        in_reg: u16,
+        out_reg: u16,
+        func_ptr: *const ScalarFuncKind,
+        out_schema: SchemaDescriptor,
+        reindex_cols: &[u32],
+        reindex_target_tcs: &[u8],
+        reindex_hash: bool,
         branch_id: u8,
     ) {
         let func_idx = self.func_idx(func_ptr);
         let out_schema_idx = self.schema_idx(out_schema);
         let (reindex_off, reindex_cnt) = self.add_reindex_cols(reindex_cols, reindex_target_tcs);
         self.instructions.push(Instr::Map {
-            in_reg, out_reg, func_idx, out_schema_idx,
-            reindex_off, reindex_cnt, reindex_hash, branch_id,
+            in_reg,
+            out_reg,
+            func_idx,
+            out_schema_idx,
+            reindex_off,
+            reindex_cnt,
+            reindex_hash,
+            branch_id,
         });
     }
 
@@ -158,46 +190,90 @@ impl ProgramBuilder {
     }
 
     pub fn add_union(&mut self, in_a: u16, in_b: u16, has_b: bool, out_reg: u16) {
-        self.instructions.push(Instr::Union { in_a, in_b, has_b, out_reg });
+        self.instructions.push(Instr::Union {
+            in_a,
+            in_b,
+            has_b,
+            out_reg,
+        });
     }
 
     pub fn add_distinct(&mut self, in_reg: u16, hist_reg: u16, out_reg: u16, hist_table: *mut Table) {
         let hist_table_idx = self.table_idx(hist_table) as i16;
-        self.instructions.push(Instr::Distinct { in_reg, hist_reg, out_reg, hist_table_idx });
+        self.instructions.push(Instr::Distinct {
+            in_reg,
+            hist_reg,
+            out_reg,
+            hist_table_idx,
+        });
     }
 
     pub fn add_join_dt(&mut self, delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {
         let right_schema_idx = self.schema_idx(right_schema);
-        self.instructions.push(Instr::JoinDT { delta_reg, trace_reg, out_reg, right_schema_idx });
+        self.instructions.push(Instr::JoinDT {
+            delta_reg,
+            trace_reg,
+            out_reg,
+            right_schema_idx,
+        });
     }
 
     pub fn add_join_dd(&mut self, a_reg: u16, b_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {
         let right_schema_idx = self.schema_idx(right_schema);
-        self.instructions.push(Instr::JoinDD { a_reg, b_reg, out_reg, right_schema_idx });
+        self.instructions.push(Instr::JoinDD {
+            a_reg,
+            b_reg,
+            out_reg,
+            right_schema_idx,
+        });
     }
 
     pub fn add_join_dt_outer(&mut self, delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {
         let right_schema_idx = self.schema_idx(right_schema);
-        self.instructions.push(Instr::JoinDTOuter { delta_reg, trace_reg, out_reg, right_schema_idx });
+        self.instructions.push(Instr::JoinDTOuter {
+            delta_reg,
+            trace_reg,
+            out_reg,
+            right_schema_idx,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn add_join_dt_range(
-        &mut self, delta_reg: u16, trace_reg: u16, out_reg: u16,
-        right_schema: SchemaDescriptor, n_eq: u8, rel: gnitz_wire::RangeRel,
+        &mut self,
+        delta_reg: u16,
+        trace_reg: u16,
+        out_reg: u16,
+        right_schema: SchemaDescriptor,
+        n_eq: u8,
+        rel: gnitz_wire::RangeRel,
     ) {
         let right_schema_idx = self.schema_idx(right_schema);
         self.instructions.push(Instr::JoinDTRange {
-            delta_reg, trace_reg, out_reg, right_schema_idx, n_eq, rel,
+            delta_reg,
+            trace_reg,
+            out_reg,
+            right_schema_idx,
+            n_eq,
+            rel,
         });
     }
 
     pub fn add_partition_filter(&mut self, in_reg: u16, out_reg: u16, worker_id: u32, num_workers: u32) {
-        self.instructions.push(Instr::PartitionFilter { in_reg, out_reg, worker_id, num_workers });
+        self.instructions.push(Instr::PartitionFilter {
+            in_reg,
+            out_reg,
+            worker_id,
+            num_workers,
+        });
     }
 
     pub fn add_anti_join_dt(&mut self, delta_reg: u16, trace_reg: u16, out_reg: u16) {
-        self.instructions.push(Instr::AntiJoinDT { delta_reg, trace_reg, out_reg });
+        self.instructions.push(Instr::AntiJoinDT {
+            delta_reg,
+            trace_reg,
+            out_reg,
+        });
     }
 
     pub fn add_anti_join_dd(&mut self, a_reg: u16, b_reg: u16, out_reg: u16) {
@@ -205,7 +281,11 @@ impl ProgramBuilder {
     }
 
     pub fn add_semi_join_dt(&mut self, delta_reg: u16, trace_reg: u16, out_reg: u16) {
-        self.instructions.push(Instr::SemiJoinDT { delta_reg, trace_reg, out_reg });
+        self.instructions.push(Instr::SemiJoinDT {
+            delta_reg,
+            trace_reg,
+            out_reg,
+        });
     }
 
     pub fn add_semi_join_dd(&mut self, a_reg: u16, b_reg: u16, out_reg: u16) {
@@ -214,7 +294,11 @@ impl ProgramBuilder {
 
     pub fn add_null_extend(&mut self, in_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {
         let right_schema_idx = self.schema_idx(right_schema);
-        self.instructions.push(Instr::NullExtend { in_reg, out_reg, right_schema_idx });
+        self.instructions.push(Instr::NullExtend {
+            in_reg,
+            out_reg,
+            right_schema_idx,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -254,7 +338,12 @@ impl ProgramBuilder {
         } else {
             None
         };
-        self.instructions.push(Instr::Integrate { in_reg, table_idx, gi, avi });
+        self.instructions.push(Instr::Integrate {
+            in_reg,
+            table_idx,
+            gi,
+            avi,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -317,13 +406,7 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn add_gather_reduce(
-        &mut self,
-        in_reg: u16,
-        trace_out_reg: u16,
-        out_reg: u16,
-        agg_descs: &[AggDescriptor],
-    ) {
+    pub fn add_gather_reduce(&mut self, in_reg: u16, trace_out_reg: u16, out_reg: u16, agg_descs: &[AggDescriptor]) {
         let (agg_off, agg_cnt) = self.add_agg_descs(agg_descs);
         self.instructions.push(Instr::GatherReduce {
             in_reg,

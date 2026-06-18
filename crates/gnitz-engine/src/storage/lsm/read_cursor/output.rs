@@ -10,12 +10,12 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use super::{ReadCursor, RowComparator};
-use super::source::CursorSource;
-use super::super::batch::{Batch, write_to_batch};
+use super::super::batch::{write_to_batch, Batch};
 use super::super::columnar::with_payload_cmp;
 use super::super::merge::{DirectWriter, MemBatch};
 use super::super::scatter::scatter_unified_sources_with_weights;
+use super::source::CursorSource;
+use super::{ReadCursor, RowComparator};
 
 thread_local! {
     /// Reusable per-thread scratch buffer for `drain_sorted_into`. Each
@@ -53,11 +53,15 @@ impl DrainGuard {
 
 impl std::ops::Deref for DrainGuard {
     type Target = Vec<(u32, u32, i64)>;
-    fn deref(&self) -> &Self::Target { &self.inner }
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl std::ops::DerefMut for DrainGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.inner }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
 
 /// 65 536 × 16 bytes = 1 MB. Caps the retained scratch so a one-off oversized
@@ -72,9 +76,7 @@ impl Drop for DrainGuard {
             // drop a smaller guard after we took the (larger) thread-local;
             // unconditionally writing our own inner back would shrink it.
             let mut cached = b.take();
-            if self.inner.capacity() > cached.capacity()
-                && self.inner.capacity() <= MAX_DRAIN_BUFFER_CAP
-            {
+            if self.inner.capacity() > cached.capacity() && self.inner.capacity() <= MAX_DRAIN_BUFFER_CAP {
                 cached = std::mem::take(&mut self.inner);
             }
             b.set(cached);
@@ -138,12 +140,9 @@ impl ReadCursor {
             return Rc::new(Batch::empty_with_schema(&self.schema));
         }
         let blob_cap = self.total_blob_len();
-        let mut batch = write_to_batch(
-            &self.schema,
-            merge_order.len(),
-            blob_cap,
-            |writer| self.scatter_drained_into(&merge_order, writer),
-        );
+        let mut batch = write_to_batch(&self.schema, merge_order.len(), blob_cap, |writer| {
+            self.scatter_drained_into(&merge_order, writer)
+        });
         // The merge walk emits in (PK, payload) order with consolidated
         // weights; `write_to_batch` doesn't know that, so restore the flags.
         batch.sorted = true;
@@ -192,10 +191,7 @@ impl ReadCursor {
     /// sources with ghosts, signaling the caller to fall back to row-at-a-time.
     ///
     /// `limit == 0` means drain all remaining rows.
-    pub(crate) fn drain_single_source(
-        &mut self,
-        limit: usize,
-    ) -> Option<Batch> {
+    pub(crate) fn drain_single_source(&mut self, limit: usize) -> Option<Batch> {
         if !self.valid || self.sources.len() != 1 {
             return None;
         }
@@ -259,7 +255,11 @@ impl ReadCursor {
     /// no validity / zero-weight filter — a caller scanning under a `valid` guard
     /// tags each row with an external group id and filters weight itself.
     pub(crate) fn current_row_loc(&self) -> (u32, u32, i64) {
-        (self.current_entry_idx as u32, self.current_row as u32, self.current_weight)
+        (
+            self.current_entry_idx as u32,
+            self.current_row as u32,
+            self.current_weight,
+        )
     }
 
     /// Append the cursor's current `(entry_idx, row, weight)` to `buf` if the
@@ -274,11 +274,7 @@ impl ReadCursor {
         if w == 0 {
             return;
         }
-        buf.push((
-            self.current_entry_idx as u32,
-            self.current_row as u32,
-            w,
-        ));
+        buf.push((self.current_entry_idx as u32, self.current_row as u32, w));
     }
 
     /// Walk the merge order and fill `out` with `(entry_idx, row_idx, weight)`
@@ -291,11 +287,7 @@ impl ReadCursor {
     /// Callers needing custom termination (group-bounded iteration, predicate
     /// filters) collect into a local `Vec` instead — this helper only supports
     /// row-count and full-cursor termination.
-    pub(crate) fn drain_sorted_into(
-        &mut self,
-        limit: usize,
-        out: &mut Vec<(u32, u32, i64)>,
-    ) {
+    pub(crate) fn drain_sorted_into(&mut self, limit: usize, out: &mut Vec<(u32, u32, i64)>) {
         if self.is_pk_unique {
             self.drain_sorted_into_pk_unique(limit, out);
         } else {
@@ -304,22 +296,16 @@ impl ReadCursor {
     }
 
     /// Drain for all-PkUnique cursors: advances using `drive_pk_unique`.
-    fn drain_sorted_into_pk_unique(
-        &mut self,
-        limit: usize,
-        out: &mut Vec<(u32, u32, i64)>,
-    ) {
+    fn drain_sorted_into_pk_unique(&mut self, limit: usize, out: &mut Vec<(u32, u32, i64)>) {
         out.clear();
         let mut count = 0usize;
         while self.valid {
-            if limit > 0 && count >= limit { break; }
+            if limit > 0 && count >= limit {
+                break;
+            }
             let w = self.current_weight;
             if w != 0 {
-                out.push((
-                    self.current_entry_idx as u32,
-                    self.current_row as u32,
-                    w,
-                ));
+                out.push((self.current_entry_idx as u32, self.current_row as u32, w));
                 count += 1;
             }
             self.advance_pk_unique();
@@ -343,28 +329,20 @@ impl ReadCursor {
             if w != 0 {
                 // src_idx is u32 because partitioned-table cursors can exceed
                 // 256 entries; a u8 cast would wrap silently.
-                out.push((
-                    self.current_entry_idx as u32,
-                    self.current_row as u32,
-                    w,
-                ));
+                out.push((self.current_entry_idx as u32, self.current_row as u32, w));
                 count += 1;
             }
             self.advance_with(row_cmp);
         }
     }
 
-    pub(crate) fn scatter_drained_into(
-        &self,
-        rows: &[(u32, u32, i64)],
-        writer: &mut DirectWriter<'_>,
-    ) {
-        if rows.is_empty() { return; }
-        let unified = self.unified_sources.get_or_init(|| {
-            self.sources.iter()
-                .map(|s| s.to_unified(&self.schema))
-                .collect()
-        });
+    pub(crate) fn scatter_drained_into(&self, rows: &[(u32, u32, i64)], writer: &mut DirectWriter<'_>) {
+        if rows.is_empty() {
+            return;
+        }
+        let unified = self
+            .unified_sources
+            .get_or_init(|| self.sources.iter().map(|s| s.to_unified(&self.schema)).collect());
         scatter_unified_sources_with_weights(unified, rows, writer);
     }
 }

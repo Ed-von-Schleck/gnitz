@@ -16,26 +16,26 @@
 //! here, so `lsm/` depends only sideways within `storage`.
 
 // Re-exported from storage/mod.rs.
-pub(super) mod table;
+pub(super) mod manifest;
 pub(super) mod partitioned_table;
 pub(super) mod read_cursor;
-pub(super) mod manifest;
+pub(super) mod table;
 
 // `wal` + `shard_file` are reached by the documented `repr::batch_wire → lsm`
 // serialization exception, so they are visible to all of `storage` (incl. repr).
-pub(super) mod wal;
 pub(super) mod shard_file;
+pub(super) mod wal;
 // LSM-internal only.
 mod compact;
-mod shard_reader;
-mod shard_index;
-mod memtable;
 mod layout;
+mod memtable;
+mod shard_index;
+mod shard_reader;
 
 // Aliases so the LSM submodules keep their `super::<mod>` / `super::super::<mod>`
 // paths after the move: the repr (L2) submodules plus the storage-level helpers
 // that stay above `lsm/`. The `with_*` macros and `compare_pk_bytes` are pulled
 // from `columnar`; `error` and `cstr_with_tmp_suffix` from the storage facade.
-use super::repr::{batch, bloom, columnar, heap, merge, scatter, xor8, batch_pool};
-use super::repr::columnar::{with_pk_ord, with_payload_cmp, compare_pk_bytes};
-use super::{error, cstr_with_tmp_suffix};
+use super::repr::columnar::{compare_pk_bytes, with_payload_cmp, with_pk_ord};
+use super::repr::{batch, batch_pool, bloom, columnar, heap, merge, scatter, xor8};
+use super::{cstr_with_tmp_suffix, error};

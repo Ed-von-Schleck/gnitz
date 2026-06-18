@@ -9,7 +9,7 @@ use std::rc::Rc;
 use super::super::error::StorageError;
 use super::super::manifest::{self, ManifestEntryRaw, PkBuf, PreparedManifest};
 use super::super::shard_reader::MappedShard;
-use super::{ShardIndex, ShardEntry, PendingShard, MAX_LEVELS};
+use super::{PendingShard, ShardEntry, ShardIndex, MAX_LEVELS};
 
 impl ShardIndex {
     fn build_manifest_entries(&self) -> Vec<ManifestEntryRaw> {
@@ -20,23 +20,14 @@ impl ShardIndex {
         for (li, level) in self.levels.iter().enumerate() {
             for guard in &level.guards {
                 for e in &guard.entries {
-                    entries.push(self.entry_to_raw(
-                        e,
-                        Self::level_num(li) as u64,
-                        guard.guard_key,
-                    ));
+                    entries.push(self.entry_to_raw(e, Self::level_num(li) as u64, guard.guard_key));
                 }
             }
         }
         entries
     }
 
-    fn entry_to_raw(
-        &self,
-        e: &ShardEntry,
-        level: u64,
-        gk: u128,
-    ) -> ManifestEntryRaw {
+    fn entry_to_raw(&self, e: &ShardEntry, level: u64, gk: u128) -> ManifestEntryRaw {
         let mut raw = ManifestEntryRaw::zeroed();
         raw.table_id = self.table_id as u64;
         raw.pk_min = e.pk_min;
@@ -82,10 +73,7 @@ impl ShardIndex {
                 }
                 let level_num = raw.level as usize;
                 let level = self.get_or_create_level(level_num);
-                level
-                    .get_or_create_guard(raw.guard_key)
-                    .entries
-                    .push(entry);
+                level.get_or_create_guard(raw.guard_key).entries.push(entry);
             }
         }
         self.sort_l0();
@@ -102,11 +90,7 @@ impl ShardIndex {
 
         let live: HashSet<&str> = self
             .all_entries()
-            .filter_map(|e| {
-                std::path::Path::new(&e.filename)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-            })
+            .filter_map(|e| std::path::Path::new(&e.filename).file_name().and_then(|n| n.to_str()))
             .collect();
 
         let mut removed = 0usize;
@@ -125,9 +109,7 @@ impl ShardIndex {
             let Some(name) = name_os.to_str() else {
                 continue;
             };
-            if (name.starts_with(&shard_prefix) || name.starts_with(&hcomp_prefix))
-                && !live.contains(name)
-            {
+            if (name.starts_with(&shard_prefix) || name.starts_with(&hcomp_prefix)) && !live.contains(name) {
                 let _ = std::fs::remove_file(entry.path());
                 removed += 1;
             }
@@ -163,7 +145,14 @@ impl ShardIndex {
             let e = PkBuf::empty(self.schema.pk_stride());
             (e, e)
         };
-        Ok(PendingShard { mapped, final_path, pk_min, pk_max, min_lsn, max_lsn })
+        Ok(PendingShard {
+            mapped,
+            final_path,
+            pk_min,
+            pk_max,
+            min_lsn,
+            max_lsn,
+        })
     }
 
     /// Serialize all current entries plus one pending shard into a manifest

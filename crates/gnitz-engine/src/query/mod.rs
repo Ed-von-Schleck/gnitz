@@ -10,6 +10,4 @@ mod compiler;
 mod dag;
 mod vm;
 
-pub(crate) use dag::{
-    DagEngine, ExchangeCallback, IndexCircuitEntry, RelationKind, StoreHandle, SysTableRefs,
-};
+pub(crate) use dag::{DagEngine, ExchangeCallback, IndexCircuitEntry, RelationKind, StoreHandle, SysTableRefs};

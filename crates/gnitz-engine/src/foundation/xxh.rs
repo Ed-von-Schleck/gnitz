@@ -1,4 +1,4 @@
-use xxhash_rust::xxh3::{xxh3_64, xxh3_128};
+use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
 /// Hash a 128-bit key to a 64-bit hash via XXH3-64.
 #[inline]

@@ -5,17 +5,16 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::foundation::syscall;
+use crate::foundation::codec::{align8, read_u32_raw, read_u64_raw, write_u32_le, write_u32_raw, write_u64_raw};
 use crate::foundation::posix_io;
-use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, DirectWriter, carve_writer_slices, scatter_copy};
-use crate::foundation::codec::{align8, read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw, write_u32_le};
-use crate::runtime::wire::{
-    encode_wire_into, wire_size, STATUS_OK,
-    build_schema_wire_block, encode_ctrl_block_direct, CTRL_BLOCK_SIZE_NO_BLOB,
-    FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED,
-};
+use crate::foundation::syscall;
 use crate::foundation::xxh;
+use crate::runtime::wire::{
+    build_schema_wire_block, encode_ctrl_block_direct, encode_wire_into, wire_size, CTRL_BLOCK_SIZE_NO_BLOB,
+    FLAG_BATCH_CONSOLIDATED, FLAG_BATCH_SORTED, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK,
+};
+use crate::schema::SchemaDescriptor;
+use crate::storage::{carve_writer_slices, scatter_copy, Batch, DirectWriter};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -33,32 +32,32 @@ gnitz_wire::cast_consts! { pub u32;
     FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_PUSH,
     FLAG_HAS_PK, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
 }
-pub const FLAG_EXCHANGE_RELAY: u32      = 512;
-pub const FLAG_PRELOADED_EXCHANGE: u32  = 1024;
-pub const FLAG_BACKFILL: u32            = 2048;
-pub const FLAG_TICK: u32                = 4096;
-pub const FLAG_CHECKPOINT: u32          = 8192;
-pub const FLAG_FLUSH: u32               = 16384;
+pub const FLAG_EXCHANGE_RELAY: u32 = 512;
+pub const FLAG_PRELOADED_EXCHANGE: u32 = 1024;
+pub const FLAG_BACKFILL: u32 = 2048;
+pub const FLAG_TICK: u32 = 4096;
+pub const FLAG_CHECKPOINT: u32 = 8192;
+pub const FLAG_FLUSH: u32 = 16384;
 /// Marks an empty broadcast group as the closing "commit sentinel" of an
 /// atomic zone. All preceding groups at the same LSN belong to the zone;
 /// recovery applies them only when this sentinel is on disk. The flag
 /// rides on top of FLAG_DDL_SYNC for the worker's dispatch loop, which
 /// already no-ops on a DDL_SYNC group with `count == 0`.
-pub const FLAG_TXN_COMMIT: u32          = 32768;
+pub const FLAG_TXN_COMMIT: u32 = 32768;
 /// Batched stored-row gather: scatter a set of PKs to their owning workers,
 /// each worker reads the committed rows for the PKs it owns and replies with
 /// the rows projected to the columns named in the control block's
 /// `seek_col_idx` mask (see `pack_gather_cols`). Distinct from `FLAG_SEEK`
 /// (single key) and `FLAG_HAS_PK` (existence echo of the caller's payload);
 /// the gather returns the *stored* value of columns the caller does not have.
-pub const FLAG_GATHER: u32              = 65536;
+pub const FLAG_GATHER: u32 = 65536;
 /// CREATE UNIQUE INDEX global pre-flight: each worker projects its committed
 /// partition of `target_id` to the OPK leading-key spans of the column list
 /// packed in `seek_col_idx`, sorts them, and streams the SORTED spans back as
 /// continuation frames for the master's k-way merge (see
 /// `validate_unique_index_create_async`). Unicast-shaped like a Scan: every
 /// worker gets its own req_id slot and answers with a frame train.
-pub const FLAG_UNIQUE_PREFLIGHT: u32    = 131072;
+pub const FLAG_UNIQUE_PREFLIGHT: u32 = 131072;
 /// Ordered range scan over a secondary index (master→worker leg). The
 /// `u32`-space dispatch flag for `SalMessageKind::SeekByIndexRange`; bit 18,
 /// the next free SAL group-header bit above `FLAG_UNIQUE_PREFLIGHT` (1<<17).
@@ -111,9 +110,7 @@ pub const BACKFILL_DECISION_CHECKPOINT: u64 = 2;
 /// The single definition shared by the worker's encoder
 /// (`send_unique_preflight_keys`) and the master's merge decoder, so the frame
 /// layout agrees by construction.
-pub(crate) fn unique_preflight_wire_schema(
-    idx_schema: &SchemaDescriptor, n_promoted: usize,
-) -> SchemaDescriptor {
+pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_promoted: usize) -> SchemaDescriptor {
     let cols = &idx_schema.columns[..n_promoted];
     let pks: Vec<u32> = (0..n_promoted as u32).collect();
     SchemaDescriptor::new(cols, &pks)
@@ -125,7 +122,9 @@ pub(crate) fn unique_preflight_wire_schema(
 /// keeps column index 0 representable. Returns `None` if more than 8 distinct
 /// columns must be projected (caller falls back to a wider gather).
 pub(crate) fn pack_gather_cols(cols: &[u8]) -> Option<u64> {
-    if cols.len() > 8 { return None; }
+    if cols.len() > 8 {
+        return None;
+    }
     let mut packed = 0u64;
     for (i, &c) in cols.iter().enumerate() {
         debug_assert!((c as usize) < crate::schema::MAX_COLUMNS);
@@ -192,20 +191,48 @@ impl SalMessageKind {
     /// distinct bit, so the relative order of the disjoint range/point/seek
     /// arms is immaterial; it tracks the worker's if-chain for readability.)
     pub fn classify(flags: u32) -> SalMessageKind {
-        if flags & FLAG_SHUTDOWN != 0           { return SalMessageKind::Shutdown; }
-        if flags & FLAG_FLUSH != 0              { return SalMessageKind::Flush; }
-        if flags & FLAG_DDL_SYNC != 0           { return SalMessageKind::DdlSync; }
-        if flags & FLAG_EXCHANGE_RELAY != 0     { return SalMessageKind::ExchangeRelay; }
-        if flags & FLAG_PRELOADED_EXCHANGE != 0 { return SalMessageKind::PreloadedExchange; }
-        if flags & FLAG_BACKFILL != 0           { return SalMessageKind::Backfill; }
-        if flags & FLAG_HAS_PK != 0             { return SalMessageKind::HasPk; }
-        if flags & FLAG_GATHER != 0             { return SalMessageKind::Gather; }
-        if flags & FLAG_UNIQUE_PREFLIGHT != 0   { return SalMessageKind::UniquePreflight; }
-        if flags & FLAG_PUSH != 0               { return SalMessageKind::Push; }
-        if flags & FLAG_TICK != 0               { return SalMessageKind::Tick; }
-        if flags & FLAG_SEEK_BY_INDEX_RANGE_SAL != 0 { return SalMessageKind::SeekByIndexRange; }
-        if flags & FLAG_SEEK_BY_INDEX != 0      { return SalMessageKind::SeekByIndex; }
-        if flags & FLAG_SEEK != 0               { return SalMessageKind::Seek; }
+        if flags & FLAG_SHUTDOWN != 0 {
+            return SalMessageKind::Shutdown;
+        }
+        if flags & FLAG_FLUSH != 0 {
+            return SalMessageKind::Flush;
+        }
+        if flags & FLAG_DDL_SYNC != 0 {
+            return SalMessageKind::DdlSync;
+        }
+        if flags & FLAG_EXCHANGE_RELAY != 0 {
+            return SalMessageKind::ExchangeRelay;
+        }
+        if flags & FLAG_PRELOADED_EXCHANGE != 0 {
+            return SalMessageKind::PreloadedExchange;
+        }
+        if flags & FLAG_BACKFILL != 0 {
+            return SalMessageKind::Backfill;
+        }
+        if flags & FLAG_HAS_PK != 0 {
+            return SalMessageKind::HasPk;
+        }
+        if flags & FLAG_GATHER != 0 {
+            return SalMessageKind::Gather;
+        }
+        if flags & FLAG_UNIQUE_PREFLIGHT != 0 {
+            return SalMessageKind::UniquePreflight;
+        }
+        if flags & FLAG_PUSH != 0 {
+            return SalMessageKind::Push;
+        }
+        if flags & FLAG_TICK != 0 {
+            return SalMessageKind::Tick;
+        }
+        if flags & FLAG_SEEK_BY_INDEX_RANGE_SAL != 0 {
+            return SalMessageKind::SeekByIndexRange;
+        }
+        if flags & FLAG_SEEK_BY_INDEX != 0 {
+            return SalMessageKind::SeekByIndex;
+        }
+        if flags & FLAG_SEEK != 0 {
+            return SalMessageKind::Seek;
+        }
         SalMessageKind::Scan
     }
 
@@ -356,7 +383,10 @@ pub(crate) struct SalGroup {
 
 impl Drop for SalGroup {
     fn drop(&mut self) {
-        debug_assert!(self.committed, "SalGroup dropped without commit — SAL sentinel never written");
+        debug_assert!(
+            self.committed,
+            "SalGroup dropped without commit — SAL sentinel never written"
+        );
     }
 }
 
@@ -392,16 +422,22 @@ pub(crate) unsafe fn sal_begin_group(
     epoch: u32,
     worker_sizes: &[u32],
 ) -> Option<SalGroup> {
-    if num_workers > MAX_WORKERS { return None; }
+    if num_workers > MAX_WORKERS {
+        return None;
+    }
 
     // payload_size starts as GROUP_HEADER_SIZE (576, a multiple of 8) and grows
     // only by align8(sz) increments, so it is always a multiple of 8.
     let mut payload_size = GROUP_HEADER_SIZE;
     for &sz in &worker_sizes[..num_workers] {
-        if sz > 0 { payload_size += align8(sz as usize); }
+        if sz > 0 {
+            payload_size += align8(sz as usize);
+        }
     }
     let total = 8 + payload_size;
-    if write_cursor + total > mmap_size { return None; }
+    if write_cursor + total > mmap_size {
+        return None;
+    }
 
     let base = write_cursor;
     let hdr_off = base + 8;
@@ -426,7 +462,15 @@ pub(crate) unsafe fn sal_begin_group(
         }
     }
 
-    Some(SalGroup { sal_ptr, hdr_off, base, total, payload_size, mmap_size, committed: false })
+    Some(SalGroup {
+        sal_ptr,
+        hdr_off,
+        base,
+        total,
+        payload_size,
+        mmap_size,
+        committed: false,
+    })
 }
 
 /// Write a message group into the SAL for N workers (test helper).
@@ -451,11 +495,23 @@ pub(crate) unsafe fn sal_write_group(
     }
 
     let group = match sal_begin_group(
-        sal_ptr, write_cursor as usize, mmap_size as usize,
-        nw, target_id, lsn, flags, epoch, &sizes[..nw],
+        sal_ptr,
+        write_cursor as usize,
+        mmap_size as usize,
+        nw,
+        target_id,
+        lsn,
+        flags,
+        epoch,
+        &sizes[..nw],
     ) {
         Some(g) => g,
-        None => return SalWriteResult { status: -1, new_cursor: write_cursor },
+        None => {
+            return SalWriteResult {
+                status: -1,
+                new_cursor: write_cursor,
+            }
+        }
     };
 
     let mut off = GROUP_HEADER_SIZE;
@@ -470,7 +526,10 @@ pub(crate) unsafe fn sal_write_group(
         }
     }
 
-    SalWriteResult { status: 0, new_cursor: group.commit() }
+    SalWriteResult {
+        status: 0,
+        new_cursor: group.commit(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -498,20 +557,23 @@ pub(crate) struct SalReadResult {
 ///
 /// # Safety
 /// `sal_ptr` must be a valid mmap pointer. `read_cursor` must be within bounds.
-pub(crate) unsafe fn sal_read_group_header(
-    sal_ptr: *const u8,
-    read_cursor: u64,
-    worker_id: u32,
-) -> SalReadResult {
+pub(crate) unsafe fn sal_read_group_header(sal_ptr: *const u8, read_cursor: u64, worker_id: u32) -> SalReadResult {
     let rc = read_cursor as usize;
     let wid = worker_id as usize;
 
     let payload_size = atomic_load_u64(sal_ptr.add(rc)) as usize;
     if payload_size == 0 {
         return SalReadResult {
-            status: SAL_STATUS_NO_MESSAGE, advance: 0, lsn: 0, flags: 0,
-            target_id: 0, epoch: 0, _pad: 0,
-            data_ptr: std::ptr::null(), data_size: 0, _pad2: 0,
+            status: SAL_STATUS_NO_MESSAGE,
+            advance: 0,
+            lsn: 0,
+            flags: 0,
+            target_id: 0,
+            epoch: 0,
+            _pad: 0,
+            data_ptr: std::ptr::null(),
+            data_size: 0,
+            _pad2: 0,
         };
     }
 
@@ -530,7 +592,11 @@ pub(crate) unsafe fn sal_read_group_header(
             my_offset + my_size <= payload_size,
             "SAL group header corrupt: my_offset={my_offset} my_size={my_size} payload_size={payload_size}"
         );
-        let data_size = if my_offset + my_size <= payload_size { my_size as u32 } else { 0 };
+        let data_size = if my_offset + my_size <= payload_size {
+            my_size as u32
+        } else {
+            0
+        };
         SalReadResult {
             status: SAL_STATUS_HAS_DATA,
             advance,
@@ -578,7 +644,7 @@ fn write_scattered_data_block(
 
     // Write WAL header (zeroed first; checksum filled in after scatter).
     data_slot[..gnitz_wire::WAL_HEADER_SIZE].fill(0);
-    write_u32_le(data_slot,  8, table_id);
+    write_u32_le(data_slot, 8, table_id);
     write_u32_le(data_slot, 12, count as u32);
     write_u32_le(data_slot, 16, total_size as u32);
     write_u32_le(data_slot, 20, gnitz_wire::WAL_FORMAT_VERSION);
@@ -587,10 +653,10 @@ fn write_scattered_data_block(
 
     // Write directory. All strides % 8 == 0 (schema_wire_safe), so no align8 padding.
     let mut pos = header_dir_size;
-    write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE,     pos as u32);
+    write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE, pos as u32);
     write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 4, (pk_stride * count) as u32);
     pos += pk_stride * count;
-    write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 8,  pos as u32);
+    write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 8, pos as u32);
     write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 12, (8 * count) as u32);
     pos += 8 * count;
     write_u32_le(data_slot, gnitz_wire::WAL_HEADER_SIZE + 16, pos as u32);
@@ -599,12 +665,12 @@ fn write_scattered_data_block(
     for (pi, _ci, col) in schema.payload_columns() {
         let stride = col.size() as usize;
         let dir_off = gnitz_wire::WAL_HEADER_SIZE + (3 + pi) * 8;
-        write_u32_le(data_slot, dir_off,     pos as u32);
+        write_u32_le(data_slot, dir_off, pos as u32);
         write_u32_le(data_slot, dir_off + 4, (stride * count) as u32);
         pos += stride * count;
     }
     let blob_dir_off = gnitz_wire::WAL_HEADER_SIZE + (3 + npc) * 8;
-    write_u32_le(data_slot, blob_dir_off,     pos as u32);
+    write_u32_le(data_slot, blob_dir_off, pos as u32);
     write_u32_le(data_slot, blob_dir_off + 4, 0u32);
 
     // The writer carves `rest` (body after header+directory) into per-region
@@ -616,7 +682,10 @@ fn write_scattered_data_block(
     let mut empty_blob: Vec<u8> = Vec::new();
     let mut writer = DirectWriter::new(pk, weight, null_bmp, col_slices, &mut empty_blob, *schema, 0);
     scatter_copy(batch, indices, &[], &mut writer);
-    debug_assert!(empty_blob.is_empty(), "non-string SAL fast path must not write blob bytes");
+    debug_assert!(
+        empty_blob.is_empty(),
+        "non-string SAL fast path must not write blob bytes"
+    );
 
     // Compute and write the XXH3 checksum over the body (same as wal::encode).
     let cs = xxh::checksum(&data_slot[gnitz_wire::WAL_HEADER_SIZE..total_size]);
@@ -664,16 +733,15 @@ impl SalWriter {
     fn prefault_ahead(&mut self) {
         const PREFAULT_AHEAD: u64 = 2 * 1024 * 1024;
         let target = (self.write_cursor + PREFAULT_AHEAD).min(self.mmap_size);
-        if target <= self.last_prefaulted { return; }
+        if target <= self.last_prefaulted {
+            return;
+        }
         let raw_start = self.last_prefaulted.max(self.write_cursor);
         let start = raw_start & !(PAGE_SIZE - 1);
         let end_raw = (target + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         let end = end_raw.min(self.mmap_size);
         if end > start {
-            posix_io::madvise_willneed(
-                unsafe { self.ptr.add(start as usize) },
-                (end - start) as usize,
-            );
+            posix_io::madvise_willneed(unsafe { self.ptr.add(start as usize) }, (end - start) as usize);
             self.last_prefaulted = target;
         }
     }
@@ -705,9 +773,13 @@ impl SalWriter {
     ) -> Result<(), String> {
         self.prefault_ahead();
         let nw = self.num_workers;
-        assert_eq!(req_ids.len(), nw,
+        assert_eq!(
+            req_ids.len(),
+            nw,
             "write_group_direct: req_ids.len()={} != num_workers={}",
-            req_ids.len(), nw);
+            req_ids.len(),
+            nw
+        );
         debug_assert!(
             prebuilt_schema_block.is_none() || col_names_opt.is_none(),
             "write_group_direct: prebuilt_schema_block and col_names_opt are mutually exclusive",
@@ -715,22 +787,35 @@ impl SalWriter {
 
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
-            if unicast_worker >= 0 && w != unicast_worker as usize { continue; }
+            if unicast_worker >= 0 && w != unicast_worker as usize {
+                continue;
+            }
             let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
             worker_sizes[w] = wire_size(
-                STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
-                prebuilt_schema_block, seek_pk_extra,
+                STATUS_OK,
+                b"",
+                Some(schema),
+                col_names_opt,
+                data_batch.copied(),
+                prebuilt_schema_block,
+                seek_pk_extra,
             ) as u32;
         }
 
         let group = unsafe {
             sal_begin_group(
-                self.ptr, self.write_cursor as usize, self.mmap_size as usize,
-                nw, target_id, lsn, sal_flags, self.epoch, &worker_sizes[..nw],
+                self.ptr,
+                self.write_cursor as usize,
+                self.mmap_size as usize,
+                nw,
+                target_id,
+                lsn,
+                sal_flags,
+                self.epoch,
+                &worker_sizes[..nw],
             )
-        }.ok_or_else(|| format!(
-            "SAL write_group_direct failed (cursor={})", self.write_cursor
-        ))?;
+        }
+        .ok_or_else(|| format!("SAL write_group_direct failed (cursor={})", self.write_cursor))?;
 
         let mut off = GROUP_HEADER_SIZE;
         for w in 0..nw {
@@ -739,10 +824,21 @@ impl SalWriter {
                 let data_batch = worker_batches.get(w).and_then(|opt| opt.as_ref());
                 let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
                 let written = encode_wire_into(
-                    slot, 0, target_id as u64, client_id, wire_flags,
-                    seek_pk, seek_col_idx, req_ids[w],
-                    STATUS_OK, b"", Some(schema), col_names_opt, data_batch.copied(),
-                    prebuilt_schema_block, seek_pk_extra,
+                    slot,
+                    0,
+                    target_id as u64,
+                    client_id,
+                    wire_flags,
+                    seek_pk,
+                    seek_col_idx,
+                    req_ids[w],
+                    STATUS_OK,
+                    b"",
+                    Some(schema),
+                    col_names_opt,
+                    data_batch.copied(),
+                    prebuilt_schema_block,
+                    seek_pk_extra,
                 );
                 debug_assert_eq!(written, wsz);
                 off += align8(wsz);
@@ -788,22 +884,26 @@ impl SalWriter {
     ) -> Result<(), String> {
         self.prefault_ahead();
         let nw = self.num_workers;
-        assert_eq!(req_ids.len(), nw,
+        assert_eq!(
+            req_ids.len(),
+            nw,
             "scatter_wire_group: req_ids.len()={} != num_workers={}",
-            req_ids.len(), nw);
+            req_ids.len(),
+            nw
+        );
         debug_assert!(
             prebuilt_schema_block.is_none() || col_names_opt.is_none(),
             "scatter_wire_group: prebuilt_schema_block and col_names_opt are mutually exclusive",
         );
 
-        let (wire_safe, wire_row_stride) = wire_props
-            .unwrap_or_else(|| compute_wire_props(schema));
+        let (wire_safe, wire_row_stride) = wire_props.unwrap_or_else(|| compute_wire_props(schema));
 
         if !wire_safe {
             // Fallback: reconstruct per-worker Batches and use existing path.
             let npc = schema.num_payload_cols();
             let mb = input_batch.as_mem_batch();
-            let sub_batches: Vec<Batch> = worker_indices.iter()
+            let sub_batches: Vec<Batch> = worker_indices
+                .iter()
                 .map(|indices| {
                     if !indices.is_empty() {
                         Batch::from_indexed_rows(&mb, indices, schema)
@@ -812,13 +912,25 @@ impl SalWriter {
                     }
                 })
                 .collect();
-            let refs: Vec<Option<&Batch>> = sub_batches.iter()
+            let refs: Vec<Option<&Batch>> = sub_batches
+                .iter()
                 .map(|b| if b.count > 0 { Some(b) } else { None })
                 .collect();
             return self.write_group_direct(
-                target_id, lsn, sal_flags, wire_flags, &refs, schema, col_names_opt,
-                seek_pk, seek_col_idx, req_ids, unicast_worker, 0,
-                prebuilt_schema_block, &[],
+                target_id,
+                lsn,
+                sal_flags,
+                wire_flags,
+                &refs,
+                schema,
+                col_names_opt,
+                seek_pk,
+                seek_col_idx,
+                req_ids,
+                unicast_worker,
+                0,
+                prebuilt_schema_block,
+                &[],
             );
         }
 
@@ -840,28 +952,40 @@ impl SalWriter {
 
         let mut worker_sizes = [0u32; MAX_WORKERS];
         for w in 0..nw {
-            if unicast_worker >= 0 && w != unicast_worker as usize { continue; }
+            if unicast_worker >= 0 && w != unicast_worker as usize {
+                continue;
+            }
             let count_w = worker_indices[w].len();
             let data_sz = if count_w > 0 {
                 data_wire_block_size_cached(count_w, npc, wire_row_stride)
-            } else { 0 };
+            } else {
+                0
+            };
             worker_sizes[w] = (ctrl_size + schema_block.len() + data_sz) as u32;
         }
 
         let group = unsafe {
             sal_begin_group(
-                self.ptr, self.write_cursor as usize, self.mmap_size as usize,
-                nw, target_id, lsn, sal_flags, self.epoch, &worker_sizes[..nw],
+                self.ptr,
+                self.write_cursor as usize,
+                self.mmap_size as usize,
+                nw,
+                target_id,
+                lsn,
+                sal_flags,
+                self.epoch,
+                &worker_sizes[..nw],
             )
-        }.ok_or_else(|| format!(
-            "SAL scatter_wire_group failed (cursor={})", self.write_cursor
-        ))?;
+        }
+        .ok_or_else(|| format!("SAL scatter_wire_group failed (cursor={})", self.write_cursor))?;
 
         let mb = input_batch.as_mem_batch();
         let mut off = GROUP_HEADER_SIZE;
         for w in 0..nw {
             let wsz = worker_sizes[w] as usize;
-            if wsz == 0 { continue; }
+            if wsz == 0 {
+                continue;
+            }
 
             let count_w = worker_indices[w].len();
             let slot = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(off), wsz) };
@@ -874,9 +998,7 @@ impl SalWriter {
                 let data_start = ctrl_size + schema_block.len();
                 let data_sz = data_wire_block_size_cached(count_w, npc, wire_row_stride);
                 let data_slot = &mut slot[data_start..data_start + data_sz];
-                write_scattered_data_block(
-                    &mb, &worker_indices[w], schema, count_w, target_id, data_slot,
-                );
+                write_scattered_data_block(&mb, &worker_indices[w], schema, count_w, target_id, data_slot);
             }
 
             // c. Ctrl block last (needs full_wire_flags which depends on count_w).
@@ -884,12 +1006,24 @@ impl SalWriter {
                 | FLAG_HAS_SCHEMA
                 | if count_w > 0 { FLAG_HAS_DATA } else { 0 }
                 | if input_batch.sorted { FLAG_BATCH_SORTED } else { 0 }
-                | if input_batch.consolidated { FLAG_BATCH_CONSOLIDATED } else { 0 };
+                | if input_batch.consolidated {
+                    FLAG_BATCH_CONSOLIDATED
+                } else {
+                    0
+                };
             encode_ctrl_block_direct(
-                slot, 0,
-                target_id as u64, 0, full_wire_flags,
-                seek_pk, seek_col_idx, req_ids[w],
-                STATUS_OK, b"", &[], false,
+                slot,
+                0,
+                target_id as u64,
+                0,
+                full_wire_flags,
+                seek_pk,
+                seek_col_idx,
+                req_ids[w],
+                STATUS_OK,
+                b"",
+                &[],
+                false,
             );
 
             off += align8(wsz);
@@ -928,38 +1062,59 @@ impl SalWriter {
         );
 
         let wsz = wire_size(
-            STATUS_OK, b"", Some(schema), col_names_opt, batch, prebuilt_schema_block, &[],
+            STATUS_OK,
+            b"",
+            Some(schema),
+            col_names_opt,
+            batch,
+            prebuilt_schema_block,
+            &[],
         ) as u32;
         let mut worker_sizes = [0u32; MAX_WORKERS];
-        for item in worker_sizes.iter_mut().take(nw) { *item = wsz; }
+        for item in worker_sizes.iter_mut().take(nw) {
+            *item = wsz;
+        }
 
         let group = unsafe {
             sal_begin_group(
-                self.ptr, self.write_cursor as usize, self.mmap_size as usize,
-                nw, target_id, lsn, sal_flags, self.epoch, &worker_sizes[..nw],
+                self.ptr,
+                self.write_cursor as usize,
+                self.mmap_size as usize,
+                nw,
+                target_id,
+                lsn,
+                sal_flags,
+                self.epoch,
+                &worker_sizes[..nw],
             )
-        }.ok_or_else(|| format!(
-            "SAL write_broadcast_direct failed (cursor={})", self.write_cursor
-        ))?;
+        }
+        .ok_or_else(|| format!("SAL write_broadcast_direct failed (cursor={})", self.write_cursor))?;
 
         if wsz > 0 {
             let wsz = wsz as usize;
             let slot0 = unsafe { std::slice::from_raw_parts_mut(group.data_ptr(GROUP_HEADER_SIZE), wsz) };
             let written = encode_wire_into(
-                slot0, 0, target_id as u64, 0, wire_flags,
-                seek_pk, seek_col_idx, request_id,
-                STATUS_OK, b"", Some(schema), col_names_opt, batch,
-                prebuilt_schema_block, &[],
+                slot0,
+                0,
+                target_id as u64,
+                0,
+                wire_flags,
+                seek_pk,
+                seek_col_idx,
+                request_id,
+                STATUS_OK,
+                b"",
+                Some(schema),
+                col_names_opt,
+                batch,
+                prebuilt_schema_block,
+                &[],
             );
             debug_assert_eq!(written, wsz);
             let mut off = GROUP_HEADER_SIZE + align8(wsz);
             for _ in 1..nw {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        group.data_ptr(GROUP_HEADER_SIZE),
-                        group.data_ptr(off),
-                        wsz,
-                    );
+                    std::ptr::copy_nonoverlapping(group.data_ptr(GROUP_HEADER_SIZE), group.data_ptr(off), wsz);
                 }
                 off += align8(wsz);
             }
@@ -982,13 +1137,18 @@ impl SalWriter {
         let worker_sizes = [0u32; MAX_WORKERS];
         let group = unsafe {
             sal_begin_group(
-                self.ptr, self.write_cursor as usize, self.mmap_size as usize,
-                nw, 0, lsn, FLAG_DDL_SYNC | FLAG_TXN_COMMIT, self.epoch,
+                self.ptr,
+                self.write_cursor as usize,
+                self.mmap_size as usize,
+                nw,
+                0,
+                lsn,
+                FLAG_DDL_SYNC | FLAG_TXN_COMMIT,
+                self.epoch,
                 &worker_sizes[..nw],
             )
-        }.ok_or_else(|| format!(
-            "SAL write_commit_sentinel failed (cursor={})", self.write_cursor
-        ))?;
+        }
+        .ok_or_else(|| format!("SAL write_commit_sentinel failed (cursor={})", self.write_cursor))?;
         self.write_cursor = unsafe { group.commit() };
         Ok(())
     }
@@ -1011,7 +1171,9 @@ impl SalWriter {
         self.epoch += 1;
         self.write_cursor = 0;
         self.last_prefaulted = 0;
-        unsafe { atomic_store_u64(self.ptr, 0); }
+        unsafe {
+            atomic_store_u64(self.ptr, 0);
+        }
     }
 
     pub fn reset(&mut self, cursor: u64, epoch: u32) {
@@ -1019,10 +1181,18 @@ impl SalWriter {
         self.epoch = epoch;
     }
 
-    pub fn cursor(&self) -> u64 { self.write_cursor }
-    pub fn epoch(&self) -> u32 { self.epoch }
-    pub fn mmap_size(&self) -> u64 { self.mmap_size }
-    pub fn sal_fd(&self) -> i32 { self.fd }
+    pub fn cursor(&self) -> u64 {
+        self.write_cursor
+    }
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+    pub fn mmap_size(&self) -> u64 {
+        self.mmap_size
+    }
+    pub fn sal_fd(&self) -> i32 {
+        self.fd
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,7 +1219,11 @@ unsafe impl Send for SalReader {}
 
 impl SalReader {
     pub fn new(ptr: *const u8, worker_id: u32, _mmap_size: usize, m2w_efd: i32) -> Self {
-        SalReader { ptr, worker_id, m2w_efd }
+        SalReader {
+            ptr,
+            worker_id,
+            m2w_efd,
+        }
     }
 
     /// Read next group at `cursor`. Returns None if no message.
@@ -1061,9 +1235,7 @@ impl SalReader {
         }
         let new_cursor = cursor + result.advance;
         let wire_data = if result.status == SAL_STATUS_HAS_DATA && result.data_size > 0 && !result.data_ptr.is_null() {
-            Some(unsafe {
-                std::slice::from_raw_parts(result.data_ptr, result.data_size as usize)
-            })
+            Some(unsafe { std::slice::from_raw_parts(result.data_ptr, result.data_size as usize) })
         } else {
             None
         };

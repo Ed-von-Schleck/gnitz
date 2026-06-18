@@ -6,16 +6,14 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
-use crate::runtime::executor::ServerExecutor;
-use crate::runtime::wire as ipc;
-use crate::runtime::sal::{
-    FLAG_PUSH, FLAG_DDL_SYNC, FLAG_TXN_COMMIT, SAL_MMAP_SIZE, SalWriter, SalReader,
-};
-use crate::runtime::w2m::{W2mWriter, W2mReceiver};
-use crate::foundation::syscall;
 use crate::foundation::posix_io;
+use crate::foundation::syscall;
+use crate::runtime::executor::ServerExecutor;
 use crate::runtime::master::MasterDispatcher;
+use crate::runtime::sal::{SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_PUSH, FLAG_TXN_COMMIT, SAL_MMAP_SIZE};
+use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring::{self, W2M_REGION_SIZE};
+use crate::runtime::wire as ipc;
 use crate::runtime::worker::WorkerProcess;
 
 // ---------------------------------------------------------------------------
@@ -66,7 +64,9 @@ fn collect_committed_lsns(sal_reader: &SalReader) -> HashSet<u64> {
             Some(v) => v,
             None => break,
         };
-        if last_epoch > 0 && msg.epoch < last_epoch { break; }
+        if last_epoch > 0 && msg.epoch < last_epoch {
+            break;
+        }
         last_epoch = msg.epoch;
         offset = new_offset;
         if msg.flags & FLAG_TXN_COMMIT != 0 {
@@ -99,20 +99,29 @@ where
             Some(v) => v,
             None => break,
         };
-        if last_epoch > 0 && msg.epoch < last_epoch { break; }
+        if last_epoch > 0 && msg.epoch < last_epoch {
+            break;
+        }
         last_epoch = msg.epoch;
         offset = new_offset;
 
-        if !committed.contains(&msg.lsn) { continue; }
+        if !committed.contains(&msg.lsn) {
+            continue;
+        }
 
         let tid = msg.target_id as i64;
         let flushed = match family_lsns.get(&tid) {
             Some(&lsn) => lsn,
             None => continue,
         };
-        if msg.lsn <= flushed { continue; }
+        if msg.lsn <= flushed {
+            continue;
+        }
 
-        let data = match msg.wire_data { Some(d) => d, None => continue };
+        let data = match msg.wire_data {
+            Some(d) => d,
+            None => continue,
+        };
         let decoded = match ipc::decode_wire(data) {
             Ok(d) => d,
             Err(_) => continue,
@@ -129,31 +138,30 @@ where
 /// `recover_sal`. The closure ingests every committed FLAG_DDL_SYNC
 /// batch addressed to a system table — orphan COL_TAB rows from a
 /// crashed DDL are skipped because their zone never closed.
-fn recover_system_tables_from_sal(
-    sal_ptr: *const u8,
-    catalog: &mut CatalogEngine,
-) {
+fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngine) {
     let sal_reader = SalReader::new(sal_ptr, 0, SAL_MMAP_SIZE, -1);
     let all_lsns = catalog.collect_all_flushed_lsns();
-    let family_lsns: HashMap<i64, u64> = all_lsns.into_iter()
+    let family_lsns: HashMap<i64, u64> = all_lsns
+        .into_iter()
         .filter(|&(tid, _)| tid > 0 && tid < FIRST_USER_TABLE_ID)
         .collect();
 
-    let replayed = recover_sal(
-        &sal_reader, catalog, &family_lsns,
-        |cat, msg, decoded| {
-            if msg.flags & FLAG_DDL_SYNC == 0 { return false; }
-            let batch = match decoded.data_batch {
-                Some(b) if b.count > 0 => b,
-                _ => return false,
-            };
-            cat.ingest_to_family(msg.target_id as i64, &batch).is_ok()
-        },
-    );
+    let replayed = recover_sal(&sal_reader, catalog, &family_lsns, |cat, msg, decoded| {
+        if msg.flags & FLAG_DDL_SYNC == 0 {
+            return false;
+        }
+        let batch = match decoded.data_batch {
+            Some(b) if b.count > 0 => b,
+            _ => return false,
+        };
+        cat.ingest_to_family(msg.target_id as i64, &batch).is_ok()
+    });
 
     if replayed > 0 {
         let msg = format!("SAL system table recovery: replayed {replayed} entries\n");
-        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        unsafe {
+            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
     }
 }
 
@@ -161,30 +169,29 @@ fn recover_system_tables_from_sal(
 /// already has the worker's per-cursor view; the apply closure decodes
 /// each FLAG_PUSH group's batch and replays it through the unique-pk
 /// path so retractions cancel correctly.
-fn recover_from_sal(
-    sal_reader: &SalReader,
-    catalog: &mut CatalogEngine,
-) {
+fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) {
     let all_lsns = catalog.collect_all_flushed_lsns();
-    let family_lsns: HashMap<i64, u64> = all_lsns.into_iter()
+    let family_lsns: HashMap<i64, u64> = all_lsns
+        .into_iter()
         .filter(|&(tid, _)| tid >= FIRST_USER_TABLE_ID)
         .collect();
 
-    let replayed = recover_sal(
-        sal_reader, catalog, &family_lsns,
-        |cat, msg, decoded| {
-            if msg.flags & FLAG_PUSH == 0 { return false; }
-            let batch = match decoded.data_batch {
-                Some(b) if b.count > 0 => b,
-                _ => return false,
-            };
-            cat.replay_ingest(msg.target_id as i64, batch).is_ok()
-        },
-    );
+    let replayed = recover_sal(sal_reader, catalog, &family_lsns, |cat, msg, decoded| {
+        if msg.flags & FLAG_PUSH == 0 {
+            return false;
+        }
+        let batch = match decoded.data_batch {
+            Some(b) if b.count > 0 => b,
+            _ => return false,
+        };
+        cat.replay_ingest(msg.target_id as i64, batch).is_ok()
+    });
 
     if replayed > 0 {
         let msg = format!("SAL recovery: replayed {replayed} blocks\n");
-        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        unsafe {
+            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
     }
 }
 
@@ -193,10 +200,7 @@ fn recover_from_sal(
 // ---------------------------------------------------------------------------
 
 /// Issue fan_out_backfill for every exchange-requiring view.
-fn backfill_exchange_views(
-    catalog: &mut CatalogEngine,
-    dispatcher: &mut MasterDispatcher,
-) -> Result<(), String> {
+fn backfill_exchange_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispatcher) -> Result<(), String> {
     let table_ids = catalog.iter_user_table_ids();
     for vid in table_ids {
         if !catalog.dag.view_needs_exchange(vid) {
@@ -225,12 +229,7 @@ fn backfill_exchange_views(
 ///    creates dispatcher, runs executor
 ///
 /// Returns 0 on clean exit, non-zero on error.
-pub fn server_main(
-    data_dir: &str,
-    socket_path: &str,
-    num_workers: u32,
-    log_level: u32,
-) -> i32 {
+pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_level: u32) -> i32 {
     // Raise fd limit (partition directories + shard files)
     posix_io::raise_fd_limit(65536);
 
@@ -240,7 +239,9 @@ pub fn server_main(
         Ok(c) => c,
         Err(e) => {
             let msg = format!("Error: failed to open catalog: {e}\n");
-            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
             return 1;
         }
     };
@@ -249,13 +250,13 @@ pub fn server_main(
     let nw = num_workers as usize;
     {
         let msg = format!("Starting {num_workers} workers\n");
-        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
-        let msg = format!(
-            "Worker logs: {}/worker_N.log (N=0..{})\n",
-            data_dir,
-            num_workers - 1
-        );
-        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        unsafe {
+            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
+        let msg = format!("Worker logs: {}/worker_N.log (N=0..{})\n", data_dir, num_workers - 1);
+        unsafe {
+            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
     }
 
     // --- Shared Append-Only Log (file-backed, master→all workers) ---
@@ -269,20 +270,26 @@ pub fn server_main(
     };
     if sal_fd < 0 {
         let msg = b"Error: failed to open SAL file\n";
-        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
         return 1;
     }
     posix_io::try_set_nocow(sal_fd);
     // Check existing size and fallocate if needed
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    unsafe { libc::fstat(sal_fd, &mut stat); }
+    unsafe {
+        libc::fstat(sal_fd, &mut stat);
+    }
     if (stat.st_size as usize) < SAL_MMAP_SIZE {
         posix_io::fallocate(sal_fd, SAL_MMAP_SIZE as i64);
     }
     let sal_ptr = syscall::mmap_shared(sal_fd, SAL_MMAP_SIZE);
     if sal_ptr.is_null() {
         let msg = b"Error: failed to mmap SAL\n";
-        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
         return 1;
     }
     // Pre-fault writable PTEs so the hot write path never page-faults.
@@ -304,11 +311,15 @@ pub fn server_main(
     {
         let v2_marker_path = format!("{data_dir}/wal.sal.v2");
         if !std::path::Path::new(&v2_marker_path).exists() {
-            unsafe { libc::memset(sal_ptr as *mut libc::c_void, 0, SAL_MMAP_SIZE); }
+            unsafe {
+                libc::memset(sal_ptr as *mut libc::c_void, 0, SAL_MMAP_SIZE);
+            }
             posix_io::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
             if let Err(e) = std::fs::File::create(&v2_marker_path) {
                 let msg = format!("Error: failed to create wal.sal.v2 marker: {e}\n");
-                unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+                unsafe {
+                    libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                }
                 return 1;
             }
             gnitz_info!("First boot under V2: pre-V2 SAL discarded, shards are authoritative");
@@ -326,13 +337,17 @@ pub fn server_main(
         // the now-catalog-less entities' flushed shards).
         if let Err(e) = catalog.flush_all_system_tables() {
             let msg = format!("Error: {e}\n");
-            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
             return 1;
         }
         #[cfg(debug_assertions)]
         if std::env::var("GNITZ_INJECT_SYS_FLUSH_ERROR").is_ok() {
             let msg = b"Error: injected system table flush fault\n";
-            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
             return 1;
         }
 
@@ -353,14 +368,18 @@ pub fn server_main(
         let wfd = syscall::memfd_create(name.as_bytes());
         if wfd < 0 {
             let msg = b"Error: memfd_create failed\n";
-            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
             return 1;
         }
         posix_io::ftruncate(wfd, W2M_REGION_SIZE as i64);
         let wptr = syscall::mmap_shared(wfd, W2M_REGION_SIZE);
         if wptr.is_null() {
             let msg = b"Error: mmap W2M failed\n";
-            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
             return 1;
         }
         // Hint THP backing for the W2M region (memfd/shmem backing).
@@ -383,7 +402,9 @@ pub fn server_main(
         let m2w = syscall::eventfd_create();
         if m2w < 0 {
             let msg = b"Error: eventfd_create failed\n";
-            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
             return 1;
         }
         m2w_efds.push(m2w);
@@ -392,13 +413,14 @@ pub fn server_main(
     // Log fd assignments
     {
         let msg = format!("SAL fd={sal_fd}\n");
-        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        unsafe {
+            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
         for w in 0..nw {
-            let msg = format!(
-                "W{} m2w_efd={} w2m_fd={}\n",
-                w, m2w_efds[w], w2m_fds[w]
-            );
-            unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            let msg = format!("W{} m2w_efd={} w2m_fd={}\n", w, m2w_efds[w], w2m_fds[w]);
+            unsafe {
+                libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
         }
     }
 
@@ -410,7 +432,9 @@ pub fn server_main(
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             let msg = b"Error: fork failed\n";
-            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
             return 1;
         }
         if pid == 0 {
@@ -461,16 +485,14 @@ pub fn server_main(
             // empty; FLAG_PUSH replay (below) fills the re-homed store.
             if let Err(e) = catalog.rehome_single_partition_stores(part_start) {
                 let msg = format!("W{w} rehome single-partition stores failed: {e}\n");
-                unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+                unsafe {
+                    libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                }
             }
 
             // Construct channel types for this worker
-            let sal_reader = SalReader::new(
-                sal_ptr as *const u8, w as u32, SAL_MMAP_SIZE, m2w_efds[w],
-            );
-            let w2m_writer = W2mWriter::new(
-                w2m_ptrs[w], W2M_REGION_SIZE as u64,
-            );
+            let sal_reader = SalReader::new(sal_ptr as *const u8, w as u32, SAL_MMAP_SIZE, m2w_efds[w]);
+            let w2m_writer = W2mWriter::new(w2m_ptrs[w], W2M_REGION_SIZE as u64);
 
             // SAL recovery — replay unflushed push data
             recover_from_sal(&sal_reader, catalog);
@@ -490,9 +512,7 @@ pub fn server_main(
                 }
             }
             #[cfg(debug_assertions)]
-            if boot_flush_err.is_none()
-                && std::env::var("GNITZ_INJECT_BOOT_FLUSH_ERROR").is_ok()
-            {
+            if boot_flush_err.is_none() && std::env::var("GNITZ_INJECT_BOOT_FLUSH_ERROR").is_ok() {
                 boot_flush_err = Some("injected boot flush fault".to_string());
             }
             if let Some(e) = &boot_flush_err {
@@ -509,24 +529,21 @@ pub fn server_main(
                 part_start,
                 part_end,
             );
-            unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
+            unsafe {
+                libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
 
             // Re-init logging with worker tag
             let wtag = format!("W{w}");
             crate::foundation::log::init(log_level, wtag.as_bytes());
 
-            let mut worker = WorkerProcess::new(
-                w as u32,
-                nw,
-                master_pid,
-                catalog_ptr,
-                sal_reader,
-                w2m_writer,
-            );
+            let mut worker = WorkerProcess::new(w as u32, nw, master_pid, catalog_ptr, sal_reader, w2m_writer);
             let rc = worker.run(boot_flush_err);
 
             // Defensive — WorkerProcess::run() exits via libc::_exit
-            unsafe { libc::_exit(rc); }
+            unsafe {
+                libc::_exit(rc);
+            }
         }
 
         worker_pids[w] = pid;
@@ -540,20 +557,16 @@ pub fn server_main(
     let sal_writer = SalWriter::new(sal_ptr, sal_fd, SAL_MMAP_SIZE as u64, m2w_efds.clone());
     let w2m_receiver = W2mReceiver::new(w2m_ptrs.clone());
 
-    let dispatcher = MasterDispatcher::new(
-        nw,
-        worker_pids.clone(),
-        catalog_ptr,
-        sal_writer,
-        w2m_receiver,
-    );
+    let dispatcher = MasterDispatcher::new(nw, worker_pids.clone(), catalog_ptr, sal_writer, w2m_receiver);
     let dispatcher_ptr = Box::into_raw(Box::new(dispatcher));
 
     // Wait for all workers to complete recovery and signal readiness
     let dispatcher = unsafe { &mut *dispatcher_ptr };
     if let Err(e) = dispatcher.collect_acks() {
         let msg = format!("Error collecting worker acks: {e}\n");
-        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
         return 1;
     }
 
@@ -568,7 +581,9 @@ pub fn server_main(
     // Backfill exchange views
     if let Err(e) = backfill_exchange_views(catalog, dispatcher) {
         let msg = format!("Error: backfill failed: {e}\n");
-        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
         return 1;
     }
 
@@ -577,11 +592,15 @@ pub fn server_main(
     let server_fd = posix_io::server_create(socket_path);
     if server_fd < 0 {
         let msg = b"Error: failed to create server socket\n";
-        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
         return 1;
     }
     let msg = b"GnitzDB ready\n";
-    unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
+    unsafe {
+        libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+    }
 
     ServerExecutor::run(catalog_ptr, dispatcher_ptr, server_fd)
 }
@@ -594,9 +613,7 @@ pub fn server_main(
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
-    use crate::runtime::sal::{
-        sal_write_group, SalWriter, SalReader, MAX_WORKERS,
-    };
+    use crate::runtime::sal::{sal_write_group, SalReader, SalWriter, MAX_WORKERS};
 
     unsafe fn alloc_mmap(size: usize) -> *mut u8 {
         let ptr = libc::mmap(
@@ -619,15 +636,28 @@ mod recovery_tests {
     /// Write one DDL_SYNC-flagged group with a 1-byte payload per worker.
     /// Returns the new cursor.
     unsafe fn write_ddl_group(
-        ptr: *mut u8, cursor: u64, nw: u32, target_id: u32, lsn: u64,
-        epoch: u32, size: u64,
+        ptr: *mut u8,
+        cursor: u64,
+        nw: u32,
+        target_id: u32,
+        lsn: u64,
+        epoch: u32,
+        size: u64,
     ) -> u64 {
         let payload = [0u8; 64];
         let ptrs: Vec<*const u8> = (0..nw).map(|_| payload.as_ptr()).collect();
         let sizes: Vec<u32> = (0..nw).map(|_| payload.len() as u32).collect();
         let res = sal_write_group(
-            ptr, cursor, nw, target_id, lsn, FLAG_DDL_SYNC, epoch, size,
-            ptrs.as_ptr(), sizes.as_ptr(),
+            ptr,
+            cursor,
+            nw,
+            target_id,
+            lsn,
+            FLAG_DDL_SYNC,
+            epoch,
+            size,
+            ptrs.as_ptr(),
+            sizes.as_ptr(),
         );
         assert_eq!(res.status, 0);
         res.new_cursor
@@ -658,12 +688,12 @@ mod recovery_tests {
 
             let reader = SalReader::new(ptr as *const u8, 0, size, efds[0]);
             let committed = collect_committed_lsns(&reader);
-            assert!(!committed.contains(&5),
-                "lsn=5 has no sentinel and must be uncommitted");
-            assert!(committed.contains(&6),
-                "lsn=6 has a sentinel and must be committed");
+            assert!(!committed.contains(&5), "lsn=5 has no sentinel and must be uncommitted");
+            assert!(committed.contains(&6), "lsn=6 has a sentinel and must be committed");
 
-            for &e in &efds { libc::close(e); }
+            for &e in &efds {
+                libc::close(e);
+            }
             free_mmap(ptr, size);
         }
     }
@@ -689,8 +719,10 @@ mod recovery_tests {
 
             let reader = SalReader::new(ptr as *const u8, 0, size, efds[0]);
             let committed = collect_committed_lsns(&reader);
-            assert!(committed.contains(&9),
-                "committed sentinel at lsn=9 must mark the zone closed");
+            assert!(
+                committed.contains(&9),
+                "committed sentinel at lsn=9 must mark the zone closed"
+            );
 
             // Walk the SAL by hand to count groups at lsn=9 with
             // FLAG_DDL_SYNC and no sentinel — these are the three apply
@@ -699,18 +731,25 @@ mod recovery_tests {
             let mut offset = 0u64;
             while (offset as usize) + 8 < size {
                 let (msg, next) = match reader.try_read(offset) {
-                    Some(v) => v, None => break,
+                    Some(v) => v,
+                    None => break,
                 };
                 offset = next;
-                if msg.lsn != 9 { continue; }
-                if msg.flags & FLAG_TXN_COMMIT != 0 { continue; }
+                if msg.lsn != 9 {
+                    continue;
+                }
+                if msg.flags & FLAG_TXN_COMMIT != 0 {
+                    continue;
+                }
                 if msg.flags & FLAG_DDL_SYNC != 0 && msg.wire_data.is_some() {
                     applied += 1;
                 }
             }
             assert_eq!(applied, 3, "all three committed DDL groups apply");
 
-            for &e in &efds { libc::close(e); }
+            for &e in &efds {
+                libc::close(e);
+            }
             free_mmap(ptr, size);
         }
     }
@@ -730,8 +769,16 @@ mod recovery_tests {
             let ptrs = [payload.as_ptr()];
             let sizes = [payload.len() as u32];
             let res = sal_write_group(
-                ptr, 0, nw, 50, 11, FLAG_PUSH, 1, size as u64,
-                ptrs.as_ptr(), sizes.as_ptr(),
+                ptr,
+                0,
+                nw,
+                50,
+                11,
+                FLAG_PUSH,
+                1,
+                size as u64,
+                ptrs.as_ptr(),
+                sizes.as_ptr(),
             );
             assert_eq!(res.status, 0);
             // No sentinel — zone unclosed.
@@ -739,8 +786,10 @@ mod recovery_tests {
             let efd = syscall::eventfd_create();
             let reader = SalReader::new(ptr as *const u8, 0, size, efd);
             let committed = collect_committed_lsns(&reader);
-            assert!(!committed.contains(&11),
-                "uncommitted push must NOT appear in committed set");
+            assert!(
+                !committed.contains(&11),
+                "uncommitted push must NOT appear in committed set"
+            );
 
             let _ = MAX_WORKERS;
             libc::close(efd);

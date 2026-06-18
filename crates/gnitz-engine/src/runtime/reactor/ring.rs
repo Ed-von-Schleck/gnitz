@@ -40,12 +40,7 @@ pub trait Ring {
     /// # Safety
     /// The caller promises each `FutexWaitV` entry's `uaddr` points to
     /// a live atomic u32 shared with the producer.
-    unsafe fn prep_futex_waitv(
-        &mut self,
-        futexv: *const io_uring::types::FutexWaitV,
-        nr: u32,
-        user_data: u64,
-    );
+    unsafe fn prep_futex_waitv(&mut self, futexv: *const io_uring::types::FutexWaitV, nr: u32, user_data: u64);
 
     /// Submit an `AsyncCancel` op targeting an in-flight SQE identified
     /// by its `target_user_data`. The CQE for the cancelled SQE
@@ -61,11 +56,7 @@ pub trait Ring {
     ///   ≥min_complete CQEs arrive (no timeout bound).
     /// - `min_complete = 0, timeout_ms = 0`: submit only, return immediately.
     ///   When no SQEs are pending, this is a no-op (0 syscalls).
-    fn submit_and_wait_timeout(
-        &mut self,
-        min_complete: u32,
-        timeout_ms: i32,
-    ) -> Result<i32, i32>;
+    fn submit_and_wait_timeout(&mut self, min_complete: u32, timeout_ms: i32) -> Result<i32, i32>;
 
     /// Drain completed CQEs into `out`. Returns number of CQEs written.
     /// This reads from the memory-mapped completion ring — no syscall.

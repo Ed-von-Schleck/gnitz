@@ -6,10 +6,10 @@ use std::cell::RefCell;
 use rustc_hash::FxHashMap;
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, MemBatch, partition_for_key, partition_for_pk_bytes};
+use crate::storage::{partition_for_key, partition_for_pk_bytes, Batch, MemBatch};
 
+use super::super::reindex::{german_string_promote_key, ReindexPacker};
 use super::super::util::extract_group_key;
-use super::super::reindex::{ReindexPacker, german_string_promote_key};
 
 // Thread-local pool: reuse Vec<Vec<u32>> index scratch across calls so
 // steady-state repartition/scatter ops allocate nothing for routing tables.
@@ -37,7 +37,11 @@ fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &Schem
     // 128-bit join-scatter image `german_string_promote_key` produces.
     if gnitz_wire::is_german_string(loc.type_code()) {
         let content = crate::schema::german_string_content(loc.bytes(mb, row), mb.blob);
-        return if content.is_empty() { 0u128 } else { crate::foundation::xxh::checksum(content) as u128 };
+        return if content.is_empty() {
+            0u128
+        } else {
+            crate::foundation::xxh::checksum(content) as u128
+        };
     }
     // PK column → widen its OPK bytes; integer / U128 / UUID payload → OPK-encode
     // then widen. Both agree with `partition_for_pk_bytes` on the PK side
@@ -75,12 +79,7 @@ pub fn worker_for_partition(partition: usize, num_workers: usize) -> usize {
 /// identically to a scattered equi-join trace — no trace replicates, no match
 /// duplicates. Worker identity is a compile-time constant baked into the emitted
 /// instruction; `num_workers <= 1` (single process) keeps every row.
-pub(crate) fn op_partition_filter(
-    batch: &Batch,
-    schema: &SchemaDescriptor,
-    worker_id: u32,
-    num_workers: u32,
-) -> Batch {
+pub(crate) fn op_partition_filter(batch: &Batch, schema: &SchemaDescriptor, worker_id: u32, num_workers: u32) -> Batch {
     let n = batch.count;
     if num_workers <= 1 || n == 0 {
         // Single process owns every partition; degenerate to identity (preserving
@@ -203,12 +202,7 @@ impl PartitionRouter {
 /// where a NULL group and a 0 group must not collide on one PK; scatter routing
 /// has no such requirement — local grouping (`compare_by_group_cols`) still
 /// separates co-located groups.
-fn route_partition_key(
-    mb: &MemBatch,
-    row: usize,
-    cols: &[u32],
-    schema: &SchemaDescriptor,
-) -> u128 {
+fn route_partition_key(mb: &MemBatch, row: usize, cols: &[u32], schema: &SchemaDescriptor) -> u128 {
     if cols.len() == 1 {
         let c_idx = cols[0] as usize;
         let col = &schema.columns[c_idx];
@@ -370,11 +364,7 @@ fn fill_broadcast_indices(batch: &Batch, num_workers: usize, out: &mut Vec<Vec<u
 /// ACK accounting, and the committer's single `fdatasync`), so every worker
 /// holds an identical full copy. Same TLS-pool reuse and borrow contract as
 /// `with_worker_indices`.
-pub fn with_broadcast_indices<F, R>(
-    batch: &Batch,
-    num_workers: usize,
-    f: F,
-) -> R
+pub fn with_broadcast_indices<F, R>(batch: &Batch, num_workers: usize, f: F) -> R
 where
     F: FnOnce(&[Vec<u32>]) -> R,
 {
@@ -410,7 +400,7 @@ pub(crate) fn compute_worker_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD};
     use crate::storage::ConsolidatedBatch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
@@ -423,7 +413,6 @@ mod tests {
         )
     }
 
-
     fn make_schema_u64_string() -> SchemaDescriptor {
         SchemaDescriptor::new(
             &[
@@ -433,7 +422,6 @@ mod tests {
             &[0],
         )
     }
-
 
     fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
         let n = rows.len();
@@ -450,7 +438,6 @@ mod tests {
         b.consolidated = true;
         ConsolidatedBatch::new_unchecked(b)
     }
-
 
     fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> ConsolidatedBatch {
         let n = rows.len();
@@ -496,16 +483,19 @@ mod tests {
         );
         // make_batch_str builds the same German-string encoding for any
         // 16-byte-struct column; long value (> threshold) exercises the blob spill.
-        let cb = make_batch_str(&schema, &[
-            (1, 1, "short"),
-            (2, 1, "a long blob value well beyond the inline threshold"),
-            (3, 1, ""),
-        ]);
+        let cb = make_batch_str(
+            &schema,
+            &[
+                (1, 1, "short"),
+                (2, 1, "a long blob value well beyond the inline threshold"),
+                (3, 1, ""),
+            ],
+        );
         let b = cb.into_inner();
         let mb = b.as_mem_batch();
         // Must not panic and must distinguish the two non-empty values.
         let k_short = extract_col_key(&mb, 0, 1, &schema);
-        let k_long  = extract_col_key(&mb, 1, 1, &schema);
+        let k_long = extract_col_key(&mb, 1, 1, &schema);
         let k_empty = extract_col_key(&mb, 2, 1, &schema);
         assert_ne!(k_short, 0);
         assert_ne!(k_long, 0);
@@ -594,15 +584,7 @@ mod tests {
     fn test_partition_routing_invariance_narrow_pk() {
         use crate::foundation::xxh::hash_u128;
         let num_workers = 4usize;
-        let pks: Vec<u64> = vec![
-            1,
-            42,
-            100,
-            1000,
-            u32::MAX as u64,
-            u32::MAX as u64 + 1,
-            u64::MAX / 2,
-        ];
+        let pks: Vec<u64> = vec![1, 42, 100, 1000, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX / 2];
         for &pk in &pks {
             let pk_u128 = pk as u128;
             let partition = (hash_u128(pk_u128) % num_workers as u64) as usize;
@@ -612,5 +594,4 @@ mod tests {
             );
         }
     }
-
 }

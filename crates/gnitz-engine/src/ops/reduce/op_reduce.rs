@@ -1,22 +1,12 @@
 //! Incremental REDUCE operator: δ_out = Agg(history + δ_in) − Agg(history).
 
 use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
-use crate::storage::{
-    Batch, ConsolidatedBatch, DrainGuard, MemBatch, ReadCursor,
-    scatter_copy,
-};
+use crate::storage::{scatter_copy, Batch, ConsolidatedBatch, DrainGuard, MemBatch, ReadCursor};
 
-use super::super::util::{
-    GroupKeyExtractor, cmp_col_window, extract_group_key, extract_group_key_cursor,
-};
-use super::agg::{
-    Accumulator, AggDescriptor, apply_agg_from_value_index, fold_old_aggs,
-    is_single_col_natural_pk,
-};
+use super::super::util::{cmp_col_window, extract_group_key, extract_group_key_cursor, GroupKeyExtractor};
+use super::agg::{apply_agg_from_value_index, fold_old_aggs, is_single_col_natural_pk, Accumulator, AggDescriptor};
 use super::emit::{emit_finalized_row, emit_reduce_row};
-use super::sort::{
-    SortDesc, argsort_delta, argsort_pk_canonical, build_sort_descs, compare_by_group_cols,
-};
+use super::sort::{argsort_delta, argsort_pk_canonical, build_sort_descs, compare_by_group_cols, SortDesc};
 
 /// `clear()` does not re-zero the data buffer, so the scatter variants used
 /// here must be the unconditional-copy ones — a nullable-skip would leak stale
@@ -100,8 +90,7 @@ pub(super) fn cursor_matches_group(
             let off = desc.pk_off as usize;
             let cs = desc.cs as usize;
             let cursor_bytes = &cursor.current_pk_bytes()[off..off + cs];
-            let exemplar_bytes =
-                &exemplar_mb.get_pk_bytes(exemplar_row)[off..off + cs];
+            let exemplar_bytes = &exemplar_mb.get_pk_bytes(exemplar_row)[off..off + cs];
             if cursor_bytes != exemplar_bytes {
                 return false;
             }
@@ -130,8 +119,13 @@ pub(super) fn cursor_matches_group(
         // Group membership is an equality test, but byte-equality and typed
         // equality coincide for every fixed-width type (and BLOB/STRING must
         // compare by content), so the shared comparator is exactly right here.
-        if cmp_col_window(cursor_bytes, cursor_blob_slice, exemplar_bytes, exemplar_mb.blob, desc.tc)
-            != std::cmp::Ordering::Equal
+        if cmp_col_window(
+            cursor_bytes,
+            cursor_blob_slice,
+            exemplar_bytes,
+            exemplar_mb.blob,
+            desc.tc,
+        ) != std::cmp::Ordering::Equal
         {
             return false;
         }
@@ -165,7 +159,11 @@ pub fn op_reduce(
 
     // Consolidate only for non-linear aggregates; linear aggregates work on raw delta.
     // Fast path (linear or already consolidated): borrow delta directly — no allocation.
-    let cs = if all_linear { None } else { Batch::consolidate_if_needed(delta, input_schema) };
+    let cs = if all_linear {
+        None
+    } else {
+        Batch::consolidate_if_needed(delta, input_schema)
+    };
     let working: &Batch = cs.as_deref().unwrap_or(delta);
 
     let n = working.count;
@@ -191,8 +189,16 @@ pub fn op_reduce(
 
     // Pre-compute sort descriptors for group comparisons (non-pk path).
     let (sort_descs, sort_descs_len) = if group_by_pk {
-        ([SortDesc { pi: 0, cs: 0, tc: TypeCode::U64, c_idx: 0, pk_off: 0 };
-          crate::schema::MAX_COLUMNS], 0)
+        (
+            [SortDesc {
+                pi: 0,
+                cs: 0,
+                tc: TypeCode::U64,
+                c_idx: 0,
+                pk_off: 0,
+            }; crate::schema::MAX_COLUMNS],
+            0,
+        )
     } else {
         build_sort_descs(input_schema, group_by_cols)
     };
@@ -214,13 +220,10 @@ pub fn op_reduce(
     // Output mapping: matches build_reduce_output_schema's logic — must
     // stay in sync. Independent of the stride-gated fast-path eligibility
     // above (compound natural-PK at stride > 16 still emits natural PKs).
-    let use_natural_pk = group_set_eq_pk
-        || is_single_col_natural_pk(input_schema, group_by_cols);
+    let use_natural_pk = group_set_eq_pk || is_single_col_natural_pk(input_schema, group_by_cols);
 
     let mut raw_output = Batch::with_schema(*output_schema, 32);
-    let mut fin_output = finalize_out_schema.map(|fs| {
-        Batch::with_schema(*fs, 32)
-    });
+    let mut fin_output = finalize_out_schema.map(|fs| Batch::with_schema(*fs, 32));
     // One FinalizeContext per finalize program: hoists EvalScratch sizing,
     // out_cols classification, EMIT→register map, and the no_nulls flag out
     // of the (potentially 100k+ iteration) group loop.
@@ -252,8 +255,7 @@ pub fn op_reduce(
     // GI group-column extractor: built once so population and read-back agree
     // on a raw, injective gc. `gi_col_idx` defaults to a valid column index
     // (0) when GI is unused, so building unconditionally is safe.
-    let gc_extractor =
-        super::super::util::IndexColExtractor::new(input_schema, gi_col_idx as usize);
+    let gc_extractor = super::super::util::IndexColExtractor::new(input_schema, gi_col_idx as usize);
 
     // AVI group-key gatherer: built once so the per-group lookup gathers the
     // full byte-form group key (the prefix the AVI cursor seeks on).
@@ -263,8 +265,7 @@ pub fn op_reduce(
 
     // Hoist replay batch outside the group loop: reuse the allocation across groups
     // rather than allocating and dropping once per group (can be 100k+ times per epoch).
-    let mut replay = (!all_linear && avi.is_none())
-        .then(|| Batch::with_schema(*input_schema, 32));
+    let mut replay = (!all_linear && avi.is_none()).then(|| Batch::with_schema(*input_schema, 32));
 
     // Single-scan trace gather for the non-linear, non-PK, no-index fallback.
     // Replaces the per-group full-trace rescan (O(groups × trace)) with one
@@ -272,126 +273,121 @@ pub fn op_reduce(
     // matched_rows is sorted by group so `offsets[g] = (start, len)` slices the
     // rows belonging to group g.
     type FallbackScan = (Vec<(u32, u32, i64)>, Vec<(u32, u32)>);
-    let fallback_state: Option<FallbackScan> =
-        if !all_linear && avi.is_none() && !group_by_pk && gi.is_none() {
-            trace_in.as_deref_mut().map(|ti_cursor| {
-                // Pass 1: one exemplar row per distinct delta group, in group order.
-                let mut group_exemplars = Vec::with_capacity(n);
-                let mut tmp_idx = 0usize;
+    let fallback_state: Option<FallbackScan> = if !all_linear && avi.is_none() && !group_by_pk && gi.is_none() {
+        trace_in.as_deref_mut().map(|ti_cursor| {
+            // Pass 1: one exemplar row per distinct delta group, in group order.
+            let mut group_exemplars = Vec::with_capacity(n);
+            let mut tmp_idx = 0usize;
+            while tmp_idx < n {
+                let exemplar = sorted_indices[tmp_idx] as usize;
+                group_exemplars.push(exemplar);
+                tmp_idx += 1;
                 while tmp_idx < n {
-                    let exemplar = sorted_indices[tmp_idx] as usize;
-                    group_exemplars.push(exemplar);
+                    let curr = sorted_indices[tmp_idx] as usize;
+                    if compare_by_group_cols(&mb, curr, exemplar, group_descs) != std::cmp::Ordering::Equal {
+                        break;
+                    }
                     tmp_idx += 1;
-                    while tmp_idx < n {
-                        let curr = sorted_indices[tmp_idx] as usize;
-                        if compare_by_group_cols(&mb, curr, exemplar, group_descs)
-                            != std::cmp::Ordering::Equal
-                        {
-                            break;
-                        }
-                        tmp_idx += 1;
-                    }
                 }
-                let num_g = group_exemplars.len();
+            }
+            let num_g = group_exemplars.len();
 
-                // Hash index only pays off past a handful of groups; below the
-                // threshold a direct linear probe per trace row is cheaper than
-                // hashing every trace row. Either way the trace is scanned once.
-                //
-                // Sorted Vec<(hash, group_idx)> rather than HashMap<u128, Vec<usize>>:
-                // binary search is O(log num_g) per trace row but avoids per-bucket
-                // heap allocations (one malloc per group in the HashMap). For groups
-                // that share a hash key (u128 collision, astronomically rare),
-                // `cursor_matches_group` still picks the right one via byte compare.
-                const HASH_THRESHOLD: usize = 16;
-                let use_hash = num_g >= HASH_THRESHOLD;
-                let mut hash_groups: Vec<(u128, usize)> = Vec::new(); // (group_key, group_idx)
-                if use_hash {
-                    hash_groups = group_exemplars.iter().enumerate()
-                        .map(|(g, &exemplar)| {
-                            (extract_group_key(&mb, exemplar, input_schema, group_by_cols), g)
-                        })
-                        .collect();
-                    hash_groups.sort_unstable_by_key(|&(h, _)| h);
-                }
+            // Hash index only pays off past a handful of groups; below the
+            // threshold a direct linear probe per trace row is cheaper than
+            // hashing every trace row. Either way the trace is scanned once.
+            //
+            // Sorted Vec<(hash, group_idx)> rather than HashMap<u128, Vec<usize>>:
+            // binary search is O(log num_g) per trace row but avoids per-bucket
+            // heap allocations (one malloc per group in the HashMap). For groups
+            // that share a hash key (u128 collision, astronomically rare),
+            // `cursor_matches_group` still picks the right one via byte compare.
+            const HASH_THRESHOLD: usize = 16;
+            let use_hash = num_g >= HASH_THRESHOLD;
+            let mut hash_groups: Vec<(u128, usize)> = Vec::new(); // (group_key, group_idx)
+            if use_hash {
+                hash_groups = group_exemplars
+                    .iter()
+                    .enumerate()
+                    .map(|(g, &exemplar)| (extract_group_key(&mb, exemplar, input_schema, group_by_cols), g))
+                    .collect();
+                hash_groups.sort_unstable_by_key(|&(h, _)| h);
+            }
 
-                // Pass 2: one full trace scan, route each row to its group.
-                let mut tagged: Vec<(u32, u32, u32, i64)> = Vec::new(); // (g, entry, row, w)
-                ti_cursor.rewind();
-                let mut scanned = 0usize;
-                while ti_cursor.valid {
-                    scanned += 1;
-                    if ti_cursor.current_weight != 0 {
-                        // Disjoint groups: a trace row belongs to at most one, so
-                        // `matched` stops at the first exact match.
-                        let mut matched = None;
-                        if use_hash {
-                            let hash = extract_group_key_cursor(
-                                ti_cursor, input_schema, group_by_cols,
-                            );
-                            let pos = hash_groups.partition_point(|&(h, _)| h < hash);
-                            let mut p = pos;
-                            while p < hash_groups.len() && hash_groups[p].0 == hash {
-                                let g = hash_groups[p].1;
-                                if cursor_matches_group(
-                                    ti_cursor, &mb, group_exemplars[g], group_descs,
-                                ) {
-                                    matched = Some(g);
-                                    break;
-                                }
-                                p += 1;
+            // Pass 2: one full trace scan, route each row to its group.
+            let mut tagged: Vec<(u32, u32, u32, i64)> = Vec::new(); // (g, entry, row, w)
+            ti_cursor.rewind();
+            let mut scanned = 0usize;
+            while ti_cursor.valid {
+                scanned += 1;
+                if ti_cursor.current_weight != 0 {
+                    // Disjoint groups: a trace row belongs to at most one, so
+                    // `matched` stops at the first exact match.
+                    let mut matched = None;
+                    if use_hash {
+                        let hash = extract_group_key_cursor(ti_cursor, input_schema, group_by_cols);
+                        let pos = hash_groups.partition_point(|&(h, _)| h < hash);
+                        let mut p = pos;
+                        while p < hash_groups.len() && hash_groups[p].0 == hash {
+                            let g = hash_groups[p].1;
+                            if cursor_matches_group(ti_cursor, &mb, group_exemplars[g], group_descs) {
+                                matched = Some(g);
+                                break;
                             }
-                        } else {
-                            for (g, &exemplar) in group_exemplars.iter().enumerate() {
-                                if cursor_matches_group(ti_cursor, &mb, exemplar, group_descs) {
-                                    matched = Some(g);
-                                    break;
-                                }
+                            p += 1;
+                        }
+                    } else {
+                        for (g, &exemplar) in group_exemplars.iter().enumerate() {
+                            if cursor_matches_group(ti_cursor, &mb, exemplar, group_descs) {
+                                matched = Some(g);
+                                break;
                             }
                         }
-                        if let Some(g) = matched {
-                            let (entry, row, w) = ti_cursor.current_row_loc();
-                            tagged.push((g as u32, entry, row, w));
-                        }
                     }
-                    ti_cursor.advance();
+                    if let Some(g) = matched {
+                        let (entry, row, w) = ti_cursor.current_row_loc();
+                        tagged.push((g as u32, entry, row, w));
+                    }
                 }
+                ti_cursor.advance();
+            }
 
-                gnitz_debug!(
-                    "op_reduce fallback: 1 trace scan, {} rows, {} groups, {} matched",
-                    scanned, num_g, tagged.len()
-                );
+            gnitz_debug!(
+                "op_reduce fallback: 1 trace scan, {} rows, {} groups, {} matched",
+                scanned,
+                num_g,
+                tagged.len()
+            );
 
-                // Cluster matches by group in O(matched + groups) via counting
-                // sort — group ids are dense `0..num_g`, so a comparison sort is
-                // unnecessary. `offsets[g] = (start, len)` slices group g's rows
-                // in `matched_rows`; empty groups get `(start, 0)`.
-                let mut offsets = vec![(0u32, 0u32); num_g];
-                for &(g, _, _, _) in &tagged {
-                    offsets[g as usize].1 += 1; // pass 1: per-group counts
-                }
-                let mut acc = 0u32; // pass 2: prefix-sum counts into start offsets
-                for off in offsets.iter_mut() {
-                    off.0 = acc;
-                    acc += off.1; // off.1 keeps the count, now the slice len
-                }
-                // Pass 3: scatter each tagged row into its group's slice.
-                // Use offsets[g].0 as the advancing write cursor, then restore
-                // it to the original start (start = cursor - count = .0 - .1).
-                let mut matched_rows = vec![(0u32, 0u32, 0i64); tagged.len()];
-                for &(g, entry, row, w) in &tagged {
-                    let p = offsets[g as usize].0;
-                    matched_rows[p as usize] = (entry, row, w);
-                    offsets[g as usize].0 += 1;
-                }
-                for off in offsets.iter_mut() {
-                    off.0 -= off.1; // restore start from advanced cursor
-                }
-                (matched_rows, offsets)
-            })
-        } else {
-            None
-        };
+            // Cluster matches by group in O(matched + groups) via counting
+            // sort — group ids are dense `0..num_g`, so a comparison sort is
+            // unnecessary. `offsets[g] = (start, len)` slices group g's rows
+            // in `matched_rows`; empty groups get `(start, 0)`.
+            let mut offsets = vec![(0u32, 0u32); num_g];
+            for &(g, _, _, _) in &tagged {
+                offsets[g as usize].1 += 1; // pass 1: per-group counts
+            }
+            let mut acc = 0u32; // pass 2: prefix-sum counts into start offsets
+            for off in offsets.iter_mut() {
+                off.0 = acc;
+                acc += off.1; // off.1 keeps the count, now the slice len
+            }
+            // Pass 3: scatter each tagged row into its group's slice.
+            // Use offsets[g].0 as the advancing write cursor, then restore
+            // it to the original start (start = cursor - count = .0 - .1).
+            let mut matched_rows = vec![(0u32, 0u32, 0i64); tagged.len()];
+            for &(g, entry, row, w) in &tagged {
+                let p = offsets[g as usize].0;
+                matched_rows[p as usize] = (entry, row, w);
+                offsets[g as usize].0 += 1;
+            }
+            for off in offsets.iter_mut() {
+                off.0 -= off.1; // restore start from advanced cursor
+            }
+            (matched_rows, offsets)
+        })
+    } else {
+        None
+    };
 
     let mut idx = 0usize;
     let mut num_groups = 0usize;
@@ -427,9 +423,7 @@ pub fn op_reduce(
                 if mb.get_pk_bytes(curr_idx) != group_pk_bytes {
                     break;
                 }
-            } else if compare_by_group_cols(&mb, curr_idx, group_start_idx, group_descs)
-                != std::cmp::Ordering::Equal
-            {
+            } else if compare_by_group_cols(&mb, curr_idx, group_start_idx, group_descs) != std::cmp::Ordering::Equal {
                 break;
             }
 
@@ -447,8 +441,7 @@ pub fn op_reduce(
         // for natural-PK grouping). `group_pk_bytes` is the input row's PK,
         // which only coincides with the output PK for natural-PK grouping.
         let mut trace_out_key_buf = [0u8; crate::schema::MAX_PK_BYTES];
-        let trace_out_key =
-            trace_out_seek_key(output_schema, group_pk_bytes, group_key, &mut trace_out_key_buf);
+        let trace_out_key = trace_out_seek_key(output_schema, group_pk_bytes, group_key, &mut trace_out_key_buf);
         // Natural-PK grouping visits groups in ascending output-PK order, so the
         // retraction probe is monotone → galloping `advance_to` seeded at the
         // live position. Payload GROUP BY keys on the synthetic `group_key`,
@@ -459,8 +452,7 @@ pub fn op_reduce(
         } else {
             trace_out_cursor.seek_group(trace_out_key);
         }
-        let has_old = trace_out_cursor.valid
-            && trace_out_cursor.current_pk_eq(trace_out_key);
+        let has_old = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(trace_out_key);
 
         if has_old {
             // δ_out's −Agg(history) term IS the stored output row: copy trace_out's
@@ -472,9 +464,15 @@ pub fn op_reduce(
                 (finalize_prog, finalize_out_schema, &mut fin_output, fin_ctx.as_mut())
             {
                 emit_finalized_row(
-                    fin_out, &raw_output, raw_output.count - 1,
-                    group_key, -1,
-                    prog, output_schema, fin_schema, ctx,
+                    fin_out,
+                    &raw_output,
+                    raw_output.count - 1,
+                    group_key,
+                    -1,
+                    prog,
+                    output_schema,
+                    fin_schema,
+                    ctx,
                 );
             }
         }
@@ -490,7 +488,10 @@ pub fn op_reduce(
                 let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
                 extractor.gather(&mb, group_start_idx, &mut gk);
                 apply_agg_from_value_index(
-                    avi_c, &gk[..extractor.stride], avi_for_max, avi_agg_col_type_code,
+                    avi_c,
+                    &gk[..extractor.stride],
+                    avi_for_max,
+                    avi_agg_col_type_code,
                     &mut accs[0],
                 );
             } else {
@@ -545,17 +546,13 @@ pub fn op_reduce(
                         );
                         let (matched_rows, offsets) = fallback_state.as_ref().unwrap();
                         let (start, len) = offsets[num_groups];
-                        for &(entry, row, w) in
-                            &matched_rows[start as usize..(start + len) as usize]
-                        {
+                        for &(entry, row, w) in &matched_rows[start as usize..(start + len) as usize] {
                             trace_rows.push((entry, row, w));
                         }
                     }
                 }
 
-                fill_cleared_batch(
-                    replay, trace_in.as_deref(), &trace_rows, &mb, delta_indices,
-                );
+                fill_cleared_batch(replay, trace_in.as_deref(), &trace_rows, &mb, delta_indices);
 
                 // Consolidate replay and step all accumulators (borrow replay; don't consume it)
                 let merged_cs = Batch::consolidate_if_needed(replay, input_schema);
@@ -579,18 +576,30 @@ pub fn op_reduce(
         let any_nonzero = accs.iter().any(|a| !a.is_zero());
         if any_nonzero {
             emit_reduce_row(
-                &mut raw_output, &mb, group_start_idx,
+                &mut raw_output,
+                &mb,
+                group_start_idx,
                 group_key,
-                &accs, input_schema, output_schema,
-                group_by_cols, use_natural_pk, num_aggs,
+                &accs,
+                input_schema,
+                output_schema,
+                group_by_cols,
+                use_natural_pk,
+                num_aggs,
             );
             if let (Some(prog), Some(fin_schema), Some(ref mut fin_out), Some(ctx)) =
                 (finalize_prog, finalize_out_schema, &mut fin_output, fin_ctx.as_mut())
             {
                 emit_finalized_row(
-                    fin_out, &raw_output, raw_output.count - 1,
-                    group_key, 1,
-                    prog, output_schema, fin_schema, ctx,
+                    fin_out,
+                    &raw_output,
+                    raw_output.count - 1,
+                    group_key,
+                    1,
+                    prog,
+                    output_schema,
+                    fin_schema,
+                    ctx,
                 );
             }
         }
@@ -600,7 +609,9 @@ pub fn op_reduce(
 
     gnitz_debug!(
         "op_reduce: in={} groups={} out={} fin={}",
-        n, num_groups, raw_output.count,
+        n,
+        num_groups,
+        raw_output.count,
         fin_output.as_ref().map_or(0, |b| b.count)
     );
 

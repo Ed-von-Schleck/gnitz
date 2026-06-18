@@ -33,11 +33,14 @@ pub(super) fn compute_co_partitioned(
     //     dim copy, so no exchange is needed on either side (design §4.5). This is
     //     the case hash co-partitioning cannot serve: the fact need not be
     //     distributed by the join key, so one fact can join many replicated dims.
-    let any_replicated = ext_tables.iter()
+    let any_replicated = ext_tables
+        .iter()
         .any(|t| t.schema.replicated() && join_shard_map.contains_key(&t.table_id));
     let mut co_partitioned = HashSet::new();
     for (&tid, cols) in join_shard_map {
-        let Some(ext) = ext_tables.iter().find(|t| t.table_id == tid) else { continue };
+        let Some(ext) = ext_tables.iter().find(|t| t.table_id == tid) else {
+            continue;
+        };
 
         if any_replicated {
             co_partitioned.insert(tid);
@@ -100,7 +103,10 @@ pub(super) fn propagate_distinct(loaded: &LoadedCircuit, ann: &mut Annotation) {
 pub(super) fn annotate(loaded: &LoadedCircuit, ext_tables: &[ExternalTable]) -> Annotation {
     let join_shard_map = compute_join_shard_map(loaded);
     let co_partitioned = compute_co_partitioned(&join_shard_map, ext_tables);
-    let mut ann = Annotation { co_partitioned, is_distinct_at: HashSet::new() };
+    let mut ann = Annotation {
+        co_partitioned,
+        is_distinct_at: HashSet::new(),
+    };
     propagate_distinct(loaded, &mut ann);
     ann
 }
@@ -192,8 +198,9 @@ pub(super) fn opt_fold_reduce_map(
 ) {
     for (&nid, op) in &loaded.nodes {
         let blob = match op {
-            gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression { program, reindex_cols, .. })
-                if reindex_cols.is_empty() => program,
+            gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
+                program, reindex_cols, ..
+            }) if reindex_cols.is_empty() => program,
             _ => continue,
         };
         let in_nids = loaded.incoming.get(&nid).cloned().unwrap_or_default();
@@ -258,9 +265,14 @@ pub(super) fn merge_schemas_for_join_impl(
     right_nullable: bool,
 ) -> SchemaDescriptor {
     let total = left.num_columns() + right.num_payload_cols();
-    assert!(total <= crate::schema::MAX_COLUMNS,
+    assert!(
+        total <= crate::schema::MAX_COLUMNS,
         "join output schema exceeds {}-column limit: {} + payload({}) = {}",
-        crate::schema::MAX_COLUMNS, left.num_columns(), right.num_payload_cols(), total);
+        crate::schema::MAX_COLUMNS,
+        left.num_columns(),
+        right.num_payload_cols(),
+        total
+    );
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
     let pk_len = copy_pk_columns_into(left, &mut cols, &mut pk_idx);
@@ -271,7 +283,9 @@ pub(super) fn merge_schemas_for_join_impl(
     }
     for (_, _, c) in right.payload_columns() {
         let mut c = *c;
-        if right_nullable { c.nullable = 1; }
+        if right_nullable {
+            c.nullable = 1;
+        }
         cols[n] = c;
         n += 1;
     }
@@ -333,8 +347,10 @@ pub(super) fn reindex_output_schema(
         // decode (the catalog trust boundary) already rejects a non-PK-eligible
         // carried tc; this is the engine-internal backstop that a planner/compiler
         // bug cannot stamp a float or other ineligible type into the PK region.
-        debug_assert!(gnitz_wire::is_pk_eligible(out_tc),
-            "reindex output type code {out_tc} is not PK-eligible");
+        debug_assert!(
+            gnitz_wire::is_pk_eligible(out_tc),
+            "reindex output type code {out_tc} is not PK-eligible"
+        );
         cols[i] = SchemaColumn::new(out_tc, 0); // PK region: nullable = 0
     }
     cols[pk_n..pk_n + n].copy_from_slice(&in_schema.columns[..n]);
@@ -364,7 +380,11 @@ pub(super) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u
     match agg_op {
         AggOp::Count | AggOp::CountNonNull | AggOp::Null => type_code::I64,
         AggOp::Sum => {
-            if col_type_code.is_float() { type_code::F64 } else { type_code::I64 }
+            if col_type_code.is_float() {
+                type_code::F64
+            } else {
+                type_code::I64
+            }
         }
         AggOp::Min | AggOp::Max => {
             if col_type_code.is_float() {
@@ -390,8 +410,7 @@ pub(super) fn build_reduce_output_schema(
 
     let group_cols_u32: Vec<u32> = group_cols.iter().map(|&i| i as u32).collect();
     let group_set_eq_pk = input.group_cols_eq_pk(&group_cols_u32);
-    let use_natural_pk = group_set_eq_pk
-        || crate::ops::is_single_col_natural_pk(input, &group_cols_u32);
+    let use_natural_pk = group_set_eq_pk || crate::ops::is_single_col_natural_pk(input, &group_cols_u32);
 
     if use_natural_pk {
         // Output PK region mirrors the source's PK byte layout: walk
@@ -433,7 +452,10 @@ pub(super) fn build_reduce_output_schema(
 }
 
 pub(super) fn agg_value_idx_eligible(tc: TypeCode) -> bool {
-    !matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128)
+    !matches!(
+        tc,
+        TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128
+    )
 }
 
 /// AVI stores the group key as a fixed-width byte prefix. A group key is
@@ -464,4 +486,3 @@ pub(super) fn avi_group_key_eligible(schema: &SchemaDescriptor, gcols: &[u32]) -
     let key_bytes = stride + crate::ops::AVI_AV_BYTES;
     key_bytes <= crate::schema::MAX_PK_BYTES
 }
-

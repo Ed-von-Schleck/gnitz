@@ -40,10 +40,7 @@ pub fn is_info() -> bool {
 /// Format and write a log line to stderr. Called by macros, not directly.
 #[cold]
 pub fn _emit(level_tag: &str, msg: &str) {
-    let mut tv = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
-    };
+    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
     unsafe {
         libc::gettimeofday(&mut tv, core::ptr::null_mut());
     }

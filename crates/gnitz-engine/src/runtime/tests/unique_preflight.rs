@@ -12,17 +12,14 @@ use rustc_hash::FxHashSet;
 
 use crate::catalog::make_index_schema;
 use crate::runtime::master::PreflightAccumulator;
-use crate::runtime::sal::{
-    unique_preflight_wire_schema, SalMessageKind, FLAG_UNIQUE_PREFLIGHT,
-};
+use crate::runtime::sal::{unique_preflight_wire_schema, SalMessageKind, FLAG_UNIQUE_PREFLIGHT};
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring;
 use crate::runtime::wire::{
-    self, peek_control_block, FLAG_CONTINUATION, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
-    SchemaWithVersion,
+    self, peek_control_block, SchemaWithVersion, FLAG_CONTINUATION, FLAG_HAS_SCHEMA, FLAG_SCAN_LAST,
 };
 use crate::runtime::worker::send_unique_preflight_keys;
-use crate::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor, type_code};
+use crate::schema::{type_code, IndexKeySpec, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, PkBuf};
 
 // ---------------------------------------------------------------------------
@@ -62,7 +59,8 @@ fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
             CAP,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1, 0,
+            -1,
+            0,
         ) as *mut u8
     };
     assert!(!region.is_null());
@@ -90,28 +88,31 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
         let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
         assert_eq!(ctrl.status, 0);
         assert_ne!(
-            ctrl.flags & FLAG_CONTINUATION, 0,
+            ctrl.flags & FLAG_CONTINUATION,
+            0,
             "every pre-flight frame carries FLAG_CONTINUATION",
         );
         let last = ctrl.flags & FLAG_SCAN_LAST != 0;
         if frames == 0 {
             assert_ne!(
-                ctrl.flags & FLAG_HAS_SCHEMA, 0,
+                ctrl.flags & FLAG_HAS_SCHEMA,
+                0,
                 "first frame must carry the synthetic schema block",
             );
         } else {
             assert_eq!(
-                ctrl.flags & FLAG_HAS_SCHEMA, 0,
+                ctrl.flags & FLAG_HAS_SCHEMA,
+                0,
                 "continuation frames must not re-send the schema",
             );
         }
         let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
         let ctrl_size = ctrl.block_size;
         let hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
-            descriptor: s, version: *v,
+            descriptor: s,
+            version: *v,
         });
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl_size, ctrl, hint)
-            .expect("frame decodes");
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl_size, ctrl, hint).expect("frame decodes");
         if saved_schema.is_none() {
             let s = zc.schema.expect("first frame schema");
             // The reply schema's PK region IS the OPK leading-key span; every
@@ -128,7 +129,9 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
         frames += 1;
         drop(zc);
         drop(slot);
-        if last { break; }
+        if last {
+            break;
+        }
     }
     keys
 }
@@ -148,7 +151,10 @@ fn preflight_train_multi_frame_key_roundtrip() {
         ((-1i64) as u64) as u128,
         u128::MAX - 1,
         u128::MAX,
-    ].into_iter().map(span_u128).collect();
+    ]
+    .into_iter()
+    .map(span_u128)
+    .collect();
     let frame_schema = u128_frame_schema();
     with_test_ring(|writer, receiver| {
         send_unique_preflight_keys(writer, 77, &keys, &frame_schema, 9001, 4);
@@ -238,10 +244,16 @@ fn project_sorted(batch: &Batch, owner: &SchemaDescriptor, cols: &[u32]) -> Vec<
     let mut keybuf = PkBuf::empty(0);
     for row in 0..batch.count {
         let w = batch.get_weight(row);
-        if w <= 0 { continue; }
-        if !spec.key_bytes(&mb, row, &mut keybuf) { continue; }
+        if w <= 0 {
+            continue;
+        }
+        if !spec.key_bytes(&mb, row, &mut keybuf) {
+            continue;
+        }
         keys.push(keybuf);
-        if w > 1 { keys.push(keybuf); }
+        if w > 1 {
+            keys.push(keybuf);
+        }
     }
     keys.sort_unstable();
     keys
@@ -267,8 +279,8 @@ fn preflight_signed_payload_projection_roundtrip() {
         (1, -5, 1, 0),
         (2, 300, 1, 0),
         (3, -5, 1, 0),
-        (4, 0, 1, 1),   // NULL val: skipped
-        (5, 7, -1, 0),  // retracted: skipped
+        (4, 0, 1, 1),  // NULL val: skipped
+        (5, 7, -1, 0), // retracted: skipped
         (6, i64::MIN, 1, 0),
     ];
     for &(pk, val, weight, null_word) in &rows {
@@ -317,7 +329,7 @@ fn preflight_weight2_row_emits_adjacent_pair() {
     let mut batch = Batch::with_schema(schema, 4);
     let rows: [(u128, i64, i64, u64); 3] = [
         (1, 7, 1, 0),
-        (2, 9, 2, 0),   // consolidated duplicate: weight 2
+        (2, 9, 2, 0), // consolidated duplicate: weight 2
         (3, 11, 1, 0),
     ];
     for &(pk, val, weight, null_word) in &rows {
@@ -327,8 +339,11 @@ fn preflight_weight2_row_emits_adjacent_pair() {
     }
 
     let keys = project_sorted(&batch, &schema, &[1]);
-    assert_eq!(keys, vec![span_i64(7), span_i64(9), span_i64(9), span_i64(11)],
-        "weight-2 row must emit its span twice");
+    assert_eq!(
+        keys,
+        vec![span_i64(7), span_i64(9), span_i64(9), span_i64(11)],
+        "weight-2 row must emit its span twice"
+    );
 
     let mut acc = PreflightAccumulator::new(1000);
     assert!(!offer_all(&mut acc, &keys), "the adjacent pair must flip the verdict");
@@ -343,9 +358,9 @@ fn preflight_weight2_row_emits_adjacent_pair() {
 fn preflight_composite_projection_distinguishes_trailing_column() {
     let schema = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),   // pk
-            SchemaColumn::new(type_code::U64, 1),   // a
-            SchemaColumn::new(type_code::U64, 2),   // b
+            SchemaColumn::new(type_code::U64, 0), // pk
+            SchemaColumn::new(type_code::U64, 1), // a
+            SchemaColumn::new(type_code::U64, 2), // b
         ],
         &[0],
     );
@@ -355,13 +370,22 @@ fn preflight_composite_projection_distinguishes_trailing_column() {
     for &(pk, a, b) in &rows {
         unsafe {
             batch.append_row_simple(
-                pk, 1, 0, &[a as i64, b as i64], &[0, 0],
-                &[std::ptr::null(), std::ptr::null()], &[0, 0]);
+                pk,
+                1,
+                0,
+                &[a as i64, b as i64],
+                &[0, 0],
+                &[std::ptr::null(), std::ptr::null()],
+                &[0, 0],
+            );
         }
     }
     let keys = project_sorted(&batch, &schema, &[1, 2]);
     assert_eq!(keys.len(), 2);
-    assert_ne!(keys[0], keys[1], "rows differing only in the trailing column are distinct");
+    assert_ne!(
+        keys[0], keys[1],
+        "rows differing only in the trailing column are distinct"
+    );
     assert_eq!(keys[0].pk_bytes().len(), 16, "composite span spans both columns");
 
     // No duplicate: the accumulator admits both.
@@ -394,17 +418,18 @@ fn index_key_spec_equals_projected_leading_span() {
     assert_eq!(idx_key_size, 8 + 16, "I64→U64 (8) + U128 (16)");
 
     let mut batch = Batch::with_schema(owner, 4);
-    let rows: [(u128, i64, u128); 3] = [
-        (1, -3, 100),
-        (2, 7, u128::MAX),
-        (3, i64::MIN, 0),
-    ];
+    let rows: [(u128, i64, u128); 3] = [(1, -3, 100), (2, 7, u128::MAX), (3, i64::MIN, 0)];
     for &(id, a, b) in &rows {
         unsafe {
             batch.append_row_simple(
-                id, 1, 0,
-                &[a, b as u64 as i64], &[0, (b >> 64) as u64],
-                &[std::ptr::null(), std::ptr::null()], &[0, 0]);
+                id,
+                1,
+                0,
+                &[a, b as u64 as i64],
+                &[0, (b >> 64) as u64],
+                &[std::ptr::null(), std::ptr::null()],
+                &[0, 0],
+            );
         }
     }
 
@@ -417,7 +442,8 @@ fn index_key_spec_equals_projected_leading_span() {
     for row in 0..batch.count {
         assert!(spec.key_bytes(&mb, row, &mut keybuf));
         assert_eq!(
-            keybuf.pk_bytes(), &projected.get_pk_bytes(row)[..idx_key_size],
+            keybuf.pk_bytes(),
+            &projected.get_pk_bytes(row)[..idx_key_size],
             "key_bytes must equal the projected entry's leading span (row {row})",
         );
     }
@@ -430,8 +456,8 @@ fn index_key_spec_skips_any_null_column() {
     let owner = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 1),   // a: nullable payload
-            SchemaColumn::new(type_code::U64, 1),   // b: nullable payload
+            SchemaColumn::new(type_code::U64, 1), // a: nullable payload
+            SchemaColumn::new(type_code::U64, 1), // b: nullable payload
         ],
         &[0],
     );
@@ -440,25 +466,35 @@ fn index_key_spec_skips_any_null_column() {
     let mut batch = Batch::with_schema(owner, 4);
     // (id, a, b, null_word over payload slots): both present, a NULL, b NULL.
     let rows: [(u128, i64, i64, u64); 3] = [
-        (1, 5, 6, 0b00),   // both present → indexed
-        (2, 5, 6, 0b01),   // a NULL → skipped
-        (3, 5, 6, 0b10),   // b NULL → skipped
+        (1, 5, 6, 0b00), // both present → indexed
+        (2, 5, 6, 0b01), // a NULL → skipped
+        (3, 5, 6, 0b10), // b NULL → skipped
     ];
     for &(id, a, b, null_word) in &rows {
         unsafe {
             batch.append_row_simple(
-                id, 1, null_word, &[a, b], &[0, 0],
-                &[std::ptr::null(), std::ptr::null()], &[0, 0]);
+                id,
+                1,
+                null_word,
+                &[a, b],
+                &[0, 0],
+                &[std::ptr::null(), std::ptr::null()],
+                &[0, 0],
+            );
         }
     }
     let spec = IndexKeySpec::new(&cols, &owner, &idx_schema);
     let mb = batch.as_mem_batch();
     let mut keybuf = PkBuf::empty(0);
     assert!(spec.key_bytes(&mb, 0, &mut keybuf), "both columns present ⇒ indexed");
-    assert!(!spec.key_bytes(&mb, 1, &mut keybuf),
-        "NULL in the first indexed column ⇒ skipped");
-    assert!(!spec.key_bytes(&mb, 2, &mut keybuf),
-        "NULL in the second indexed column ⇒ skipped");
+    assert!(
+        !spec.key_bytes(&mb, 1, &mut keybuf),
+        "NULL in the first indexed column ⇒ skipped"
+    );
+    assert!(
+        !spec.key_bytes(&mb, 2, &mut keybuf),
+        "NULL in the second indexed column ⇒ skipped"
+    );
 }
 
 /// `key_bytes` reuses the caller's `PkBuf` scratch across specs of DIFFERENT
@@ -487,9 +523,14 @@ fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
     let mut batch = Batch::with_schema(owner, 1);
     unsafe {
         batch.append_row_simple(
-            1, 1, 0,
-            &[COL1 as i64, COL2 as i64], &[0, 0],
-            &[std::ptr::null(), std::ptr::null()], &[0, 0]);
+            1,
+            1,
+            0,
+            &[COL1 as i64, COL2 as i64],
+            &[0, 0],
+            &[std::ptr::null(), std::ptr::null()],
+            &[0, 0],
+        );
     }
     let mb = batch.as_mem_batch();
 
@@ -512,21 +553,32 @@ fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
     assert_eq!(keybuf.len, 16);
     // The wide write dirtied the trailing 8 bytes with col2's big-endian image —
     // the precondition that gives the narrowing tail-zero step teeth.
-    assert_eq!(&keybuf.bytes[8..16], &COL2.to_be_bytes(),
-        "wide span packs col2 into bytes[8..16]");
+    assert_eq!(
+        &keybuf.bytes[8..16],
+        &COL2.to_be_bytes(),
+        "wide span packs col2 into bytes[8..16]"
+    );
 
     assert!(narrow.key_bytes(&mb, 0, &mut keybuf), "narrow row is indexed");
     // The narrow span is col2's 8-byte OPK, and ONLY 8 bytes are meaningful.
     assert_eq!(keybuf.len, 8, "narrow span is one U64 ⇒ len == 8");
-    assert_eq!(keybuf.pk_bytes(), &COL2.to_be_bytes(),
-        "narrow span content is col2's big-endian OPK");
+    assert_eq!(
+        keybuf.pk_bytes(),
+        &COL2.to_be_bytes(),
+        "narrow span content is col2's big-endian OPK"
+    );
     // The invariant under test: the tail the wider write left MUST be re-zeroed.
-    assert!(keybuf.bytes[8..].iter().all(|&b| b == 0),
-        "narrowing must re-zero every byte past len — stale wide-write tail leaked");
+    assert!(
+        keybuf.bytes[8..].iter().all(|&b| b == 0),
+        "narrowing must re-zero every byte past len — stale wide-write tail leaked"
+    );
     // ... and `padded(16)` (which the invariant makes sound) reads that tail as
     // zero, so this narrow key widened to a 16-byte stride has a zero suffix.
-    assert_eq!(&keybuf.padded(16)[8..16], &[0u8; 8],
-        "padded(16) suffix of a narrowed key must be zero");
+    assert_eq!(
+        &keybuf.padded(16)[8..16],
+        &[0u8; 8],
+        "padded(16) suffix of a narrowed key must be zero"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +587,9 @@ fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
 
 fn offer_all(acc: &mut PreflightAccumulator, keys: &[PkBuf]) -> bool {
     for &k in keys {
-        if !acc.offer(k) { return false; }
+        if !acc.offer(k) {
+            return false;
+        }
     }
     true
 }
@@ -576,7 +630,10 @@ fn accumulator_seed_over_cap_is_empty_never_truncated() {
     assert!(!acc.duplicate);
     let (seed, capped) = acc.into_seed();
     assert!(seed.is_empty(), "seed must be cleared whole on cap overflow");
-    assert!(capped, "overflow must report capped so the seed publishes a capped filter");
+    assert!(
+        capped,
+        "overflow must report capped so the seed publishes a capped filter"
+    );
 }
 
 #[test]
@@ -593,7 +650,10 @@ fn accumulator_seed_at_exactly_cap_is_complete() {
 #[test]
 fn accumulator_duplicate_after_cap_crossing() {
     let mut acc = PreflightAccumulator::new(2);
-    assert!(offer_all(&mut acc, &[span_u128(1), span_u128(2), span_u128(3), span_u128(4)]));
+    assert!(offer_all(
+        &mut acc,
+        &[span_u128(1), span_u128(2), span_u128(3), span_u128(4)]
+    ));
     assert!(!acc.offer(span_u128(4)));
     assert!(acc.duplicate);
     let (seed, _capped) = acc.into_seed();
@@ -613,8 +673,11 @@ fn pkbuf_byte_order_is_lexicographic() {
     };
     let mut v = vec![span(2, 0), span(1, 9), span(1, 1), span(2, 0)];
     v.sort_unstable();
-    assert_eq!(v, vec![span(1, 1), span(1, 9), span(2, 0), span(2, 0)],
-        "sort is by leading column then trailing — byte-lexicographic");
+    assert_eq!(
+        v,
+        vec![span(1, 1), span(1, 9), span(2, 0), span(2, 0)],
+        "sort is by leading column then trailing — byte-lexicographic"
+    );
     // A narrower span sorts before a wider one sharing its prefix (memcmp over
     // bytes[..len]).
     assert!(PkBuf::from_bytes(&[1u8, 2]) < PkBuf::from_bytes(&[1u8, 2, 0]));

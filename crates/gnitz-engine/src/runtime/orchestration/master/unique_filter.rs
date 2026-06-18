@@ -13,16 +13,16 @@ impl MasterDispatcher {
     /// Collect column-extraction descriptors for every unique index on
     /// `table_id` — the filter-map key plus the span encode plan per unique
     /// circuit, the shape `extract_into_filter` consumes.
-    fn unique_index_descriptors(
-        &mut self, table_id: i64,
-    ) -> Option<(SchemaDescriptor, Vec<UniqueIndexDesc>)> {
+    fn unique_index_descriptors(&mut self, table_id: i64) -> Option<(SchemaDescriptor, Vec<UniqueIndexDesc>)> {
         let cat = unsafe { &mut *self.catalog };
         let schema = cat.get_schema_desc(table_id)?;
         let n_circuits = cat.get_index_circuit_count(table_id);
 
         let mut out: Vec<UniqueIndexDesc> = Vec::new();
         for ci in 0..n_circuits {
-            let Some(cols) = cat.unique_index_circuit_cols(table_id, ci) else { continue };
+            let Some(cols) = cat.unique_index_circuit_cols(table_id, ci) else {
+                continue;
+            };
             let idx_schema = match cat.get_index_circuit_schema(table_id, ci) {
                 Some(s) => s,
                 None => continue,
@@ -32,16 +32,18 @@ impl MasterDispatcher {
                 spec: IndexKeySpec::new(cols, &schema, &idx_schema),
             });
         }
-        if out.is_empty() { None } else { Some((schema, out)) }
+        if out.is_empty() {
+            None
+        } else {
+            Some((schema, out))
+        }
     }
 
     /// True if every key in `keys` is definitely absent from the filter
     /// for `(table_id, packed)`. Returns false if the filter is capped,
     /// not warm (caller is expected to warm it first), or contains any
     /// key. On false, caller must fall through to the Phase 2 broadcast.
-    pub(super) fn unique_filter_all_absent(
-        &self, table_id: i64, packed: u64, keys: &[PkBuf],
-    ) -> bool {
+    pub(super) fn unique_filter_all_absent(&self, table_id: i64, packed: u64, keys: &[PkBuf]) -> bool {
         let filter = match self.unique_filters.get(&(table_id, packed)) {
             Some(f) => f,
             None => return false,
@@ -67,7 +69,9 @@ impl MasterDispatcher {
                 Some(f) => f,
                 None => continue, // not warm — warmup will pick this up
             };
-            if filter.capped { continue; }
+            if filter.capped {
+                continue;
+            }
             extract_into_filter(filter, &mb, &d.spec);
         }
     }
@@ -119,10 +123,13 @@ impl MasterDispatcher {
                 Some(x) => x,
                 None => return Ok(()),
             };
-            let missing: Vec<UniqueIndexDesc> = descs.into_iter()
+            let missing: Vec<UniqueIndexDesc> = descs
+                .into_iter()
                 .filter(|d| !disp.unique_filters.contains_key(&(table_id, d.packed)))
                 .collect();
-            if missing.is_empty() { return Ok(()); }
+            if missing.is_empty() {
+                return Ok(());
+            }
             for d in &missing {
                 disp.unique_filters.insert((table_id, d.packed), UniqueFilter::new());
             }
@@ -144,10 +151,23 @@ impl MasterDispatcher {
             let (schema, col_names) = disp.get_schema_and_names(table_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
-                table_id, lsn, 0, 0, &[], &schema, &col_names,
-                0, 0, req_ids, -1, 0, None, &[],
+                table_id,
+                lsn,
+                0,
+                0,
+                &[],
+                &schema,
+                &col_names,
+                0,
+                0,
+                req_ids,
+                -1,
+                0,
+                None,
+                &[],
             )
-        }).await?;
+        })
+        .await?;
 
         // Drain every worker's continuation-frame train into the cold filters.
         // `drain_index_scan` owns the early-return error contract (the lease
@@ -164,7 +184,8 @@ impl MasterDispatcher {
                 }
             }
             Ok(())
-        }).await;
+        })
+        .await;
 
         // On success the filters are fully populated → mark warm so the
         // broadcast-skip shortcut may trust them. Disarm the guard so the
@@ -197,17 +218,14 @@ impl MasterDispatcher {
     /// always falls through to the broadcast — the same steady state the lazy
     /// warmup converges to, without paying a redundant full-cluster scan on
     /// the first INSERT. Symmetric counterpart of `unique_filter_remove`.
-    pub(crate) fn unique_filter_seed(
-        &mut self, table_id: i64, packed: u64, seen: FxHashSet<PkBuf>, capped: bool,
-    ) {
+    pub(crate) fn unique_filter_seed(&mut self, table_id: i64, packed: u64, seen: FxHashSet<PkBuf>, capped: bool) {
         let mut filter = UniqueFilter::new();
-        filter.warm = true;     // pre-flight scanned every worker under the write lock
+        filter.warm = true; // pre-flight scanned every worker under the write lock
         if capped {
             filter.capped = true;
         } else {
-            filter.values = seen;   // exact distinct set; same type, move not re-hash
+            filter.values = seen; // exact distinct set; same type, move not re-hash
         }
         self.unique_filters.insert((table_id, packed), filter);
     }
-
 }

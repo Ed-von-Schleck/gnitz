@@ -5,9 +5,16 @@
 use super::*;
 
 const SYS_TABLE_IDS: &[i64] = &[
-    SCHEMA_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID, COL_TAB_ID, IDX_TAB_ID,
-    DEP_TAB_ID, SEQ_TAB_ID,
-    CIRCUIT_NODES_TAB_ID, CIRCUIT_EDGES_TAB_ID, CIRCUIT_NODE_COLUMNS_TAB_ID,
+    SCHEMA_TAB_ID,
+    TABLE_TAB_ID,
+    VIEW_TAB_ID,
+    COL_TAB_ID,
+    IDX_TAB_ID,
+    DEP_TAB_ID,
+    SEQ_TAB_ID,
+    CIRCUIT_NODES_TAB_ID,
+    CIRCUIT_EDGES_TAB_ID,
+    CIRCUIT_NODE_COLUMNS_TAB_ID,
 ];
 
 impl CatalogEngine {
@@ -43,7 +50,9 @@ impl CatalogEngine {
     pub fn trim_worker_partitions(&mut self, start: u32, end: u32) {
         for entry in self.dag.tables.values() {
             if let Some(ptable) = entry.handle.as_partitioned_mut() {
-                if ptable.num_partitions() == 1 { continue; }
+                if ptable.num_partitions() == 1 {
+                    continue;
+                }
                 ptable.close_partitions_outside(start, end);
             }
         }
@@ -68,18 +77,32 @@ impl CatalogEngine {
         if part_start == 0 {
             return Ok(());
         }
-        let tids: Vec<i64> = self.dag.tables.iter()
-            .filter(|(_, e)| e.handle.as_partitioned_mut()
-                .map(|p| p.num_partitions() == 1).unwrap_or(false))
+        let tids: Vec<i64> = self
+            .dag
+            .tables
+            .iter()
+            .filter(|(_, e)| {
+                e.handle
+                    .as_partitioned_mut()
+                    .map(|p| p.num_partitions() == 1)
+                    .unwrap_or(false)
+            })
             .map(|(&tid, _)| tid)
             .collect();
         for tid in tids {
             let entry = self.dag.tables.get_mut(&tid).expect("tid taken from iter");
             let pt = PartitionedTable::new(
-                &entry.directory, "", entry.schema, tid as u32,
-                1, entry.kind.persistence(), part_start, part_start + 1,
+                &entry.directory,
+                "",
+                entry.schema,
+                tid as u32,
+                1,
+                entry.kind.persistence(),
+                part_start,
+                part_start + 1,
                 crate::storage::partition_arena_size(1),
-            ).map_err(|e| format!("rehome single-partition store tid={tid}: {e:?}"))?;
+            )
+            .map_err(|e| format!("rehome single-partition store tid={tid}: {e:?}"))?;
             entry.handle = StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt)));
         }
         Ok(())

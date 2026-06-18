@@ -6,14 +6,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::schema::SchemaDescriptor;
 use super::batch::Batch;
+#[cfg(test)] // only the test-only native-u128 has_pk/retract_pk need opk_key
+use super::columnar;
 use super::error::StorageError;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
 use super::table::{self, FlushOutcome, FlushWork, Persistence, Table};
-#[cfg(test)] // only the test-only native-u128 has_pk/retract_pk need opk_key
-use super::columnar;
+use crate::schema::SchemaDescriptor;
 
 thread_local! {
     /// Reused per-partition scatter index buffers for `ingest_owned_batch`.
@@ -194,9 +194,7 @@ impl PartitionedTable {
             all_snapshots.extend(table.in_memory_runs().iter().cloned());
             all_shard_arcs.extend(table.all_shard_arcs());
         }
-        read_cursor::create_cursor_from_snapshots(
-            &all_snapshots, &all_shard_arcs, self.schema,
-        )
+        read_cursor::create_cursor_from_snapshots(&all_snapshots, &all_shard_arcs, self.schema)
     }
 
     /// Open a cursor after running `compact_if_needed` on each partition.
@@ -223,9 +221,7 @@ impl PartitionedTable {
             all_shard_arcs.append(&mut table.all_shard_arcs());
         }
 
-        let handle = read_cursor::create_cursor_from_snapshots(
-            &all_snapshots, &all_shard_arcs, self.schema,
-        );
+        let handle = read_cursor::create_cursor_from_snapshots(&all_snapshots, &all_shard_arcs, self.schema);
         Ok(handle)
     }
 
@@ -332,10 +328,7 @@ impl PartitionedTable {
 
     /// Phase 3: dispatch each FlushWork back to its partition's `flush_commit`.
     /// Returns the dirfds to fsync (one per partition that committed).
-    pub fn flush_commit_batch(
-        &mut self,
-        works: Vec<(usize, FlushWork)>,
-    ) -> Result<Vec<libc::c_int>, StorageError> {
+    pub fn flush_commit_batch(&mut self, works: Vec<(usize, FlushWork)>) -> Result<Vec<libc::c_int>, StorageError> {
         let mut dirfds = Vec::with_capacity(works.len());
         for (idx, w) in works {
             if let Some(fd) = self.tables[idx].flush_commit(w)? {
@@ -368,10 +361,7 @@ impl PartitionedTable {
         // The cached index refers to the old `tables` layout; rebuilding the
         // vector below would leave it dangling.
         self.last_found_partition = None;
-        assert!(
-            start <= end,
-            "close_partitions_outside: start ({start}) > end ({end})",
-        );
+        assert!(start <= end, "close_partitions_outside: start ({start}) > end ({end})",);
         assert!(
             start >= self.part_offset,
             "close_partitions_outside: left-expansion (start={start} < part_offset={}) \
@@ -485,13 +475,15 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
 
     crate::foundation::posix_io::raise_fd_limit_for_tests();
 
-    let schema = || SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    );
+    let schema = || {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    };
     // One-row (pk, weight=1, payload) batch routed by its narrow PK.
     let row = |pk: u64, val: i64| {
         let mut b = Batch::with_schema(schema(), 1);
@@ -508,10 +500,20 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
     let path = tdir.to_str().unwrap().to_owned();
 
     // Two live partitions (0 and 1) of a 256-way durable table.
-    let open = || PartitionedTable::new(
-        &path, "test", schema(), 830, 256, Persistence::Durable, 0, 2,
-        partition_arena_size(256),
-    ).unwrap();
+    let open = || {
+        PartitionedTable::new(
+            &path,
+            "test",
+            schema(),
+            830,
+            256,
+            Persistence::Durable,
+            0,
+            2,
+            partition_arena_size(256),
+        )
+        .unwrap()
+    };
     let mut pt = open();
 
     // PKs that route to live partitions 0 and 1 (narrow PK ⇒ partition_for_key
@@ -524,7 +526,9 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
             1 if p1.is_empty() => p1.push(k),
             _ => {}
         }
-        if p0.len() == 3 && !p1.is_empty() { break; }
+        if p0.len() == 3 && !p1.is_empty() {
+            break;
+        }
     }
     assert_eq!((p0.len(), p1.len()), (3, 1), "need PKs routed to partitions 0 and 1");
 
@@ -537,7 +541,10 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
 
     let lsn_a = pt.tables[0].current_lsn;
     let lsn_b = pt.tables[1].current_lsn;
-    assert!(lsn_a > lsn_b, "partition A must lead before the partial flush ({lsn_a} vs {lsn_b})");
+    assert!(
+        lsn_a > lsn_b,
+        "partition A must lead before the partial flush ({lsn_a} vs {lsn_b})"
+    );
 
     // Partial family flush: only partition A commits a durable shard; B's rows
     // stay in its memtable.
@@ -557,7 +564,12 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
         "unflushed partition B reopens below A ({b_reloaded} vs {a_reloaded})",
     );
 
-    PartialFlushLsn { _dir: dir, pt, recovery_lsn: b_reloaded, current_lsn: a_reloaded }
+    PartialFlushLsn {
+        _dir: dir,
+        pt,
+        recovery_lsn: b_reloaded,
+        current_lsn: a_reloaded,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -568,7 +580,7 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
 mod tests {
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::wide_pk_3xu64_schema;
 
     fn make_schema() -> SchemaDescriptor {
@@ -607,11 +619,20 @@ mod tests {
         let tdir = dir.path().join("sp_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1, Persistence::Ephemeral, 0, 1,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            100,
+            1,
+            Persistence::Ephemeral,
+            0,
+            1,
             partition_arena_size(1),
-        ).unwrap();
+        )
+        .unwrap();
 
-        pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
+        pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)]))
+            .unwrap();
         assert!(pt.has_pk(10));
         assert!(pt.has_pk(20));
         assert!(!pt.has_pk(99));
@@ -626,9 +647,17 @@ mod tests {
         let tdir = dir.path().join("mp_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 200, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            200,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
         let rows: Vec<(u64, i64, i64)> = (0..100).map(|i| (i * 7 + 13, 1, (i * 100) as i64)).collect();
         pt.ingest_owned_batch(make_batch(&rows)).unwrap();
@@ -646,11 +675,20 @@ mod tests {
         let tdir = dir.path().join("mc_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 300, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            300,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
-        pt.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200), (40, 1, 400)])).unwrap();
+        pt.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200), (40, 1, 400)]))
+            .unwrap();
 
         let cursor = pt.open_cursor();
         assert!(cursor.cursor.valid);
@@ -664,11 +702,20 @@ mod tests {
         let tdir = dir.path().join("rt_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 400, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            400,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
-        pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
+        pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)]))
+            .unwrap();
 
         let (w, found) = pt.retract_pk(10);
         assert_eq!(w, 1);
@@ -706,9 +753,17 @@ mod tests {
         assert_eq!(schema.dist_stride(), 8, "CLUSTER BY one U64 column ⇒ 8-byte prefix");
         // All 256 partitions live so any prefix-routed partition exists locally.
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 900, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            900,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
         // OPK bytes for (col0, col1): each column big-endian, tightly packed.
         let pk_bytes = |c0: u64, c1: u64| {
@@ -724,13 +779,13 @@ mod tests {
             .find_map(|c0| {
                 let pp = partition_for_pk_bytes(&c0.to_be_bytes());
                 let (a, b) = (pk_bytes(c0, 1), pk_bytes(c0, 2));
-                (pp != partition_for_pk_bytes(&a) && pp != partition_for_pk_bytes(&b))
-                    .then_some((c0, a, b))
+                (pp != partition_for_pk_bytes(&a) && pp != partition_for_pk_bytes(&b)).then_some((c0, a, b))
             })
             .expect("a prefix routing differently from its full keys exists");
         // Both twins share the distribution prefix ⇒ same prefix partition.
         assert_eq!(
-            partition_for_pk_bytes(&twin_a[..8]), partition_for_pk_bytes(&twin_b[..8]),
+            partition_for_pk_bytes(&twin_a[..8]),
+            partition_for_pk_bytes(&twin_b[..8]),
             "prefix twins co-partition on col0",
         );
 
@@ -761,9 +816,7 @@ mod tests {
         // miss the row entirely.
         let read_found_val = |pt: &PartitionedTable| {
             let fr = pt.found_row().expect("found-row payload available");
-            i64::from_le_bytes(
-                columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap(),
-            )
+            i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap())
         };
         let (wa, fa) = pt.retract_pk_bytes(&twin_a);
         assert_eq!((wa, fa), (1, true), "twin A found in its prefix-partition");
@@ -776,7 +829,10 @@ mod tests {
         // An absent suffix routing to the same populated prefix-partition is not
         // found — confirms the in-partition match keys on the full PK.
         let (_, found_absent) = pt.retract_pk_bytes(&pk_bytes(c0, 999));
-        assert!(!found_absent, "absent suffix in a populated prefix-partition is not found");
+        assert!(
+            !found_absent,
+            "absent suffix in a populated prefix-partition is not found"
+        );
     }
 
     #[test]
@@ -784,8 +840,15 @@ mod tests {
         // For every narrow width, routing the physically-stored OPK
         // (big-endian) bytes must equal partition_for_key of the same value.
         let vals: [u128; 9] = [
-            0, 1, 7, 42, 255, 65537, 0x0123_4567_89ab_cdef,
-            u64::MAX as u128, u128::MAX,
+            0,
+            1,
+            7,
+            42,
+            255,
+            65537,
+            0x0123_4567_89ab_cdef,
+            u64::MAX as u128,
+            u128::MAX,
         ];
         for &v in &vals {
             for &len in &[1usize, 2, 4, 8, 16] {
@@ -836,9 +899,17 @@ mod tests {
         // We feed only PKs that route elsewhere, so this exercises the new
         // wide *routing* loop end-to-end with no downstream Table ingest.
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 700, 256, Persistence::Ephemeral, 0, 1,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            700,
+            256,
+            Persistence::Ephemeral,
+            0,
+            1,
             partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut batch = Batch::with_schema(schema, 256);
         let mut n = 0;
@@ -878,9 +949,17 @@ mod tests {
         let tdir = dir.path().join("cpo_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 500, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            500,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(pt.tables.len(), 256);
         pt.close_partitions_outside(100, 110);
@@ -898,9 +977,17 @@ mod tests {
         let tdir = dir.path().join("cpo_stale_test");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 600, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            600,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Pick a PK whose partition we can exclude from the surviving range.
         let pk = 12345u128;
@@ -948,11 +1035,20 @@ mod tests {
         let tdir = dir.path().join("pt_durable_flush");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 800, 256, Persistence::Durable, 0, 256,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            800,
+            256,
+            Persistence::Durable,
+            0,
+            256,
             partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
-        pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)])).unwrap();
+        pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]))
+            .unwrap();
         let works = pt.flush_prepare().unwrap();
         assert!(!works.is_empty(), "durable table must return Pending work");
         assert!(
@@ -974,18 +1070,26 @@ mod tests {
         let tdir = dir.path().join("pt_nondurable_flush");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 810, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            810,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
-        pt.ingest_owned_batch(
-            make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300), (40, 1, 400)]),
-        ).unwrap();
+        pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300), (40, 1, 400)]))
+            .unwrap();
         let works = pt.flush_prepare().unwrap();
         assert!(works.is_empty(), "non-durable table must return no Pending work");
         assert_eq!(
             count_tree(&tdir, |n| n.starts_with("shard_") || n.starts_with("eph_shard_")),
-            0, "non-durable checkpoint flush must write no shard files",
+            0,
+            "non-durable checkpoint flush must write no shard files",
         );
         assert_eq!(count_tree(&tdir, |n| n == "manifest.bin"), 0);
         for pk in [10u128, 20, 30, 40] {
@@ -1004,9 +1108,17 @@ mod tests {
         let tdir = dir.path().join("pt_ccc_inmem");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 820, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            820,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
         let rows: Vec<(u64, i64, i64)> = (0..50).map(|i| (i * 7 + 3, 1, (i * 10) as i64)).collect();
         pt.ingest_owned_batch(make_batch(&rows)).unwrap();
@@ -1042,12 +1154,14 @@ mod tests {
         // drop its rows. (The StoreHandle dispatch over this same min-vs-max
         // split is pinned by query::dag::tests::store_handle_partitioned_lsn_dispatch.)
         assert_eq!(
-            f.pt.min_flushed_lsn(), f.recovery_lsn,
+            f.pt.min_flushed_lsn(),
+            f.recovery_lsn,
             "recovery watermark is the lagging partition's floor",
         );
         assert!(f.pt.min_flushed_lsn() < f.current_lsn);
         assert_eq!(
-            f.pt.current_lsn(), f.current_lsn,
+            f.pt.current_lsn(),
+            f.current_lsn,
             "current_lsn still reports the max for the allocator",
         );
     }

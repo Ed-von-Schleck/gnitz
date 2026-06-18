@@ -10,8 +10,10 @@ use std::rc::Rc;
 use super::super::compact;
 use super::super::error::StorageError;
 use super::super::shard_reader::MappedShard;
-use super::{ShardIndex, ShardEntry, FLSMLevel, PendingShard, to_cstrings,
-            MAX_LEVELS, L0_COMPACT_THRESHOLD, GUARD_FILE_THRESHOLD, LMAX_FILE_THRESHOLD, L1_TARGET_FILES};
+use super::{
+    to_cstrings, FLSMLevel, PendingShard, ShardEntry, ShardIndex, GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD,
+    L1_TARGET_FILES, LMAX_FILE_THRESHOLD, MAX_LEVELS,
+};
 
 impl ShardIndex {
     /// Enable `SHARD_FLAG_PK_UNIQUE` tagging for compacted shards.
@@ -61,9 +63,7 @@ impl ShardIndex {
     }
 
     pub fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
-        self.all_entries()
-            .map(|e| Rc::clone(&e.shard))
-            .collect()
+        self.all_entries().map(|e| Rc::clone(&e.shard)).collect()
     }
 
     /// Test-only u128 oracle: OPK-encodes a **native** PK value (handling
@@ -140,11 +140,7 @@ impl ShardIndex {
         let l0_filenames: Vec<String> = self.l0.iter().map(|e| e.filename.clone()).collect();
         let l0_max_lsn = self.l0.iter().map(|e| e.max_lsn).max().unwrap_or(0);
 
-        let lsn_tag = if l0_max_lsn > 0 {
-            l0_max_lsn
-        } else {
-            self.compact_seq
-        };
+        let lsn_tag = if l0_max_lsn > 0 { l0_max_lsn } else { self.compact_seq };
 
         let guard_keys = self.l1_guard_keys();
 
@@ -153,8 +149,7 @@ impl ShardIndex {
 
         let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| StorageError::InvalidPath)?;
         let result_cap = guard_keys.len().max(l0_filenames.len());
-        let mut results: Vec<compact::GuardResult> =
-            (0..result_cap).map(|_| compact::GuardResult::zeroed()).collect();
+        let mut results: Vec<compact::GuardResult> = (0..result_cap).map(|_| compact::GuardResult::zeroed()).collect();
 
         let num_results = compact::merge_and_route(
             &l0_cstrs,
@@ -202,11 +197,7 @@ impl ShardIndex {
             // key — so a key inserted after L1 established `guard[0] > 0` would
             // be written during compaction yet invisible on read. Mirrors the
             // fix in `compact_guard_vertical`.
-            let mut keys: Vec<u128> = self.levels[0]
-                .guards
-                .iter()
-                .map(|g| g.guard_key)
-                .collect();
+            let mut keys: Vec<u128> = self.levels[0].guards.iter().map(|g| g.guard_key).collect();
             if keys.first().copied() != Some(0) {
                 keys.insert(0, 0);
             }
@@ -234,18 +225,13 @@ impl ShardIndex {
         }
     }
 
-    fn commit_l0_to_l1(
-        &mut self,
-        guard_outputs: &[(u128, String)],
-        max_lsn: u64,
-    ) -> Result<(), StorageError> {
+    fn commit_l0_to_l1(&mut self, guard_outputs: &[(u128, String)], max_lsn: u64) -> Result<(), StorageError> {
         self.ensure_level(1);
         let schema_copy = self.schema;
 
         // Open all new entries before touching self.l0.
         // If any open fails, l0 is still intact and the caller can retry.
-        let mut new_entries: Vec<(u128, ShardEntry)> =
-            Vec::with_capacity(guard_outputs.len());
+        let mut new_entries: Vec<(u128, ShardEntry)> = Vec::with_capacity(guard_outputs.len());
         for (gk, filename) in guard_outputs {
             let entry = ShardEntry::open(filename, &schema_copy, 0, max_lsn)?;
             new_entries.push((*gk, entry));
@@ -254,10 +240,7 @@ impl ShardIndex {
         // All opens succeeded — safe to mutate state.
         self.l0.clear();
         for (gk, entry) in new_entries {
-            self.levels[0]
-                .get_or_create_guard(gk)
-                .entries
-                .push(entry);
+            self.levels[0].get_or_create_guard(gk).entries.push(entry);
         }
         self.update_flags();
         Ok(())
@@ -295,13 +278,18 @@ impl ShardIndex {
             self.compact_seq,
         );
 
-        let input_filenames: Vec<String> =
-            guard.entries.iter().map(|e| e.filename.clone()).collect();
+        let input_filenames: Vec<String> = guard.entries.iter().map(|e| e.filename.clone()).collect();
         let input_cstrings = to_cstrings(&input_filenames)?;
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
         let out_cstr = CString::new(out_path.as_str()).map_err(|_| StorageError::InvalidPath)?;
 
-        if let Err(e) = compact::compact_shards(&input_cstrs, &out_cstr, &self.schema, self.table_id, self.can_tag_pk_unique) {
+        if let Err(e) = compact::compact_shards(
+            &input_cstrs,
+            &out_cstr,
+            &self.schema,
+            self.table_id,
+            self.can_tag_pk_unique,
+        ) {
             let _ = fs::remove_file(&out_path);
             return Err(e);
         }
@@ -354,8 +342,7 @@ impl ShardIndex {
             .map(|e| e.filename.clone())
             .collect();
 
-        let dest_guard_indices =
-            self.levels[dest_idx].find_guards_for_range(src_guard_key, src_max_bound);
+        let dest_guard_indices = self.levels[dest_idx].find_guards_for_range(src_guard_key, src_max_bound);
         let mut vert_max_lsn = self.levels[src_idx].guards[worst_idx]
             .entries
             .iter()
@@ -400,8 +387,7 @@ impl ShardIndex {
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
         let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| StorageError::InvalidPath)?;
         let result_cap = guard_keys.len().max(1);
-        let mut results: Vec<compact::GuardResult> =
-            (0..result_cap).map(|_| compact::GuardResult::zeroed()).collect();
+        let mut results: Vec<compact::GuardResult> = (0..result_cap).map(|_| compact::GuardResult::zeroed()).collect();
 
         let num_results = compact::merge_and_route(
             &input_cstrs,
@@ -442,10 +428,7 @@ impl ShardIndex {
                 .retain(|g| !guard_keys.contains(&g.guard_key));
         }
         for (gk, entry) in opened {
-            self.levels[dest_idx]
-                .get_or_create_guard(gk)
-                .entries
-                .push(entry);
+            self.levels[dest_idx].get_or_create_guard(gk).entries.push(entry);
         }
 
         self.update_flags();

@@ -50,7 +50,9 @@ impl Future for TimerFuture {
             self.inner.next_timer_id.set(id.wrapping_add(1));
             let ns = self.deadline.duration_since(now).as_nanos() as u64;
             self.inner.ring.borrow_mut().prep_timeout(ns, udata(KIND_TIMEOUT, id));
-            self.inner.timer_wakers.borrow_mut()
+            self.inner
+                .timer_wakers
+                .borrow_mut()
                 .insert(id, (cx.waker().clone(), Rc::clone(&self.cancelled)));
             self.timer_id = Some(id);
         }
@@ -80,7 +82,9 @@ impl Future for ReplyFuture {
         if let Some(decoded) = self.inner.parked_replies.borrow_mut().remove(&self.req_id) {
             return Poll::Ready(decoded);
         }
-        self.inner.reply_wakers.borrow_mut()
+        self.inner
+            .reply_wakers
+            .borrow_mut()
             .insert(self.req_id, cx.waker().clone());
         Poll::Pending
     }
@@ -113,12 +117,16 @@ impl Future for ScanSlotFuture {
             let mut parked = self.inner.scan_parked.borrow_mut();
             if let Some(q) = parked.get_mut(&self.req_id) {
                 if let Some(slot) = q.pop_front() {
-                    if q.is_empty() { parked.remove(&self.req_id); }
+                    if q.is_empty() {
+                        parked.remove(&self.req_id);
+                    }
                     return Poll::Ready(slot);
                 }
             }
         }
-        self.inner.scan_wakers.borrow_mut()
+        self.inner
+            .scan_wakers
+            .borrow_mut()
             .insert(self.req_id, cx.waker().clone());
         Poll::Pending
     }
@@ -155,7 +163,11 @@ impl ScanLease {
         inner.active_scans.borrow_mut().extend(ids.iter().copied());
         let mut buf = [0u32; MAX_WORKERS];
         buf[..ids.len()].copy_from_slice(ids);
-        ScanLease { inner, ids: buf, len: ids.len() as u8 }
+        ScanLease {
+            inner,
+            ids: buf,
+            len: ids.len() as u8,
+        }
     }
 }
 
@@ -201,8 +213,7 @@ impl Future for FsyncFuture {
             self.completed = true;
             return Poll::Ready(rc);
         }
-        self.inner.fsync_wakers.borrow_mut()
-            .insert(self.id, cx.waker().clone());
+        self.inner.fsync_wakers.borrow_mut().insert(self.id, cx.waker().clone());
         Poll::Pending
     }
 }
@@ -297,8 +308,8 @@ impl Clone for SendAlive {
     fn clone(&self) -> Self {
         match self {
             SendAlive::Pooled(rc) => SendAlive::Pooled(Rc::clone(rc)),
-            SendAlive::Slot(rc)   => SendAlive::Slot(Rc::clone(rc)),
-            SendAlive::Static     => SendAlive::Static,
+            SendAlive::Slot(rc) => SendAlive::Slot(Rc::clone(rc)),
+            SendAlive::Static => SendAlive::Static,
         }
     }
 }
@@ -318,8 +329,7 @@ impl Future for SendFuture {
             return Poll::Ready(rc);
         }
         let send_id = self.send_id;
-        self.inner.send_wakers.borrow_mut()
-            .insert(send_id, cx.waker().clone());
+        self.inner.send_wakers.borrow_mut().insert(send_id, cx.waker().clone());
         Poll::Pending
     }
 }
@@ -328,7 +338,13 @@ impl Drop for SendFuture {
     fn drop(&mut self) {
         // CQE already parked a result (and the handler already freed the
         // buffer): reclaim the orphaned result, nothing else to do.
-        if self.inner.parked_send_results.borrow_mut().remove(&self.send_id).is_some() {
+        if self
+            .inner
+            .parked_send_results
+            .borrow_mut()
+            .remove(&self.send_id)
+            .is_some()
+        {
             self._alive.take();
             return;
         }
@@ -337,7 +353,9 @@ impl Drop for SendFuture {
         // (`_alive` is None on the resolved path — poll take()s it — so this arm
         // never fires after a successful send, keeping cancelled_sends bounded.)
         if let Some(alive) = self._alive.take() {
-            self.inner.send_buffers_in_flight.borrow_mut()
+            self.inner
+                .send_buffers_in_flight
+                .borrow_mut()
                 .insert(self.send_id, alive);
             self.inner.send_wakers.borrow_mut().remove(&self.send_id);
             self.inner.cancelled_sends.borrow_mut().insert(self.send_id);
@@ -346,4 +364,3 @@ impl Drop for SendFuture {
 }
 
 // (oneshot, mpsc, AsyncMutex, AsyncRwLock, join2, join_all, select2 live in sync.rs)
-

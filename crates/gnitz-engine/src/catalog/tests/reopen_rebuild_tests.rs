@@ -65,12 +65,18 @@ fn view_and_index_rebuild_once_on_reopen() {
 
     // Single-materialisation reference: the live CREATE backfilled once.
     let view_entry = engine.dag.tables.get(&vid).expect("view registered");
-    assert_eq!(sum_weights(view_entry.handle.open_cursor()), N,
-        "live CREATE VIEW must materialise the base rows exactly once");
+    assert_eq!(
+        sum_weights(view_entry.handle.open_cursor()),
+        N,
+        "live CREATE VIEW must materialise the base rows exactly once"
+    );
     let base_entry = engine.dag.tables.get_mut(&tid).unwrap();
     assert_eq!(base_entry.index_circuits.len(), 1);
-    assert_eq!(sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()), N,
-        "live CREATE INDEX must backfill the base rows exactly once");
+    assert_eq!(
+        sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()),
+        N,
+        "live CREATE INDEX must backfill the base rows exactly once"
+    );
 
     engine.close();
     drop(engine); // release locks before re-open
@@ -81,21 +87,30 @@ fn view_and_index_rebuild_once_on_reopen() {
     // durable shards. Without this guard an empty base would rebuild an empty
     // view and the equality below would pass vacuously.
     let base_entry = engine2.dag.tables.get(&tid).expect("base table replayed");
-    assert_eq!(sum_weights(base_entry.handle.open_cursor()), N,
-        "base table must survive close() → open() from its durable shards");
+    assert_eq!(
+        sum_weights(base_entry.handle.open_cursor()),
+        N,
+        "base table must survive close() → open() from its durable shards"
+    );
 
     // The view's ephemeral storage was erased at open and rebuilt from the
     // base table by backfill_view — exactly once. A doubled total means the
     // rebuild ran against storage that was also loaded from disk.
     let view_entry = engine2.dag.tables.get(&vid).expect("view replayed");
-    assert_eq!(sum_weights(view_entry.handle.open_cursor()), N,
-        "view must rebuild from source exactly once on reopen, not double");
+    assert_eq!(
+        sum_weights(view_entry.handle.open_cursor()),
+        N,
+        "view must rebuild from source exactly once on reopen, not double"
+    );
 
     // Same invariant for the secondary index.
     let base_entry = engine2.dag.tables.get_mut(&tid).unwrap();
     assert_eq!(base_entry.index_circuits.len(), 1, "index circuit replayed");
-    assert_eq!(sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()), N,
-        "index must rebuild from source exactly once on reopen, not double");
+    assert_eq!(
+        sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()),
+        N,
+        "index must rebuild from source exactly once on reopen, not double"
+    );
 
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
@@ -143,8 +158,11 @@ fn view_and_index_rebuild_across_chunk_boundary() {
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
 
     let view_entry = engine.dag.tables.get(&vid).expect("view registered");
-    assert_eq!(sum_weights(view_entry.handle.open_cursor()), n as i64,
-        "live CREATE VIEW must materialise the base rows exactly once");
+    assert_eq!(
+        sum_weights(view_entry.handle.open_cursor()),
+        n as i64,
+        "live CREATE VIEW must materialise the base rows exactly once"
+    );
 
     engine.close();
     drop(engine);
@@ -152,17 +170,26 @@ fn view_and_index_rebuild_across_chunk_boundary() {
     let mut engine2 = CatalogEngine::open(&dir).unwrap();
 
     let base_entry = engine2.dag.tables.get(&tid).expect("base table replayed");
-    assert_eq!(sum_weights(base_entry.handle.open_cursor()), n as i64,
-        "base table must survive close() → open() from its durable shards");
+    assert_eq!(
+        sum_weights(base_entry.handle.open_cursor()),
+        n as i64,
+        "base table must survive close() → open() from its durable shards"
+    );
 
     let view_entry = engine2.dag.tables.get(&vid).expect("view replayed");
-    assert_eq!(sum_weights(view_entry.handle.open_cursor()), n as i64,
-        "view must rebuild across the chunk boundary exactly once");
+    assert_eq!(
+        sum_weights(view_entry.handle.open_cursor()),
+        n as i64,
+        "view must rebuild across the chunk boundary exactly once"
+    );
 
     let base_entry = engine2.dag.tables.get_mut(&tid).unwrap();
     assert_eq!(base_entry.index_circuits.len(), 1, "index circuit replayed");
-    assert_eq!(sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()), n as i64,
-        "index must rebuild across the chunk boundary exactly once");
+    assert_eq!(
+        sum_weights(base_entry.index_circuits[0].table_mut().open_cursor()),
+        n as i64,
+        "index must rebuild across the chunk boundary exactly once"
+    );
 
     engine2.close();
     let _ = fs::remove_dir_all(&dir);

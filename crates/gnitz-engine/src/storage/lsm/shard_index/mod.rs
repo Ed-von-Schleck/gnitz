@@ -12,10 +12,10 @@ use std::rc::Rc;
 
 use super::compare_pk_bytes;
 use super::error::StorageError;
-use crate::schema::SchemaDescriptor;
 use super::manifest::PkBuf;
 use super::shard_reader::MappedShard;
 use super::xor8;
+use crate::schema::SchemaDescriptor;
 
 mod index;
 mod persist;
@@ -75,12 +75,7 @@ impl ShardEntry {
         self.shard.count == 0
     }
 
-    fn open(
-        path: &str,
-        schema: &SchemaDescriptor,
-        min_lsn: u64,
-        max_lsn: u64,
-    ) -> Result<Self, StorageError> {
+    fn open(path: &str, schema: &SchemaDescriptor, min_lsn: u64, max_lsn: u64) -> Result<Self, StorageError> {
         let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
         let shard = Rc::new(MappedShard::open(&cpath, schema, false)?);
         let is_empty = shard.count == 0;
@@ -230,10 +225,10 @@ impl ShardIndex {
 
 #[cfg(test)]
 mod tests {
+    use super::super::shard_file;
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use super::super::shard_file;
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
     fn test_schema() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -285,12 +280,7 @@ mod tests {
     /// Write a shard whose PK region is the OPK concatenation of two
     /// U64 columns (16 bytes/row), with one I64 payload column. Rows
     /// must be passed in compound-sorted order.
-    fn write_compound_shard(
-        dir: &std::path::Path,
-        name: &str,
-        pks: &[(u64, u64)],
-        values: &[i64],
-    ) -> String {
+    fn write_compound_shard(dir: &std::path::Path, name: &str, pks: &[(u64, u64)], values: &[i64]) -> String {
         let n = pks.len();
         // PK region holds OPK (per-column big-endian) bytes at rest.
         let mut pk_bytes: Vec<u8> = Vec::with_capacity(n * 16);
@@ -318,12 +308,7 @@ mod tests {
     }
 
     /// Build and write a shard file with the given PK/value pairs.
-    fn write_test_shard(
-        dir: &std::path::Path,
-        name: &str,
-        pks: &[u64],
-        values: &[i64],
-    ) -> String {
+    fn write_test_shard(dir: &std::path::Path, name: &str, pks: &[u64], values: &[i64]) -> String {
         let n = pks.len();
         // PK region holds OPK (order-preserving big-endian) bytes at rest.
         let pk_bytes: Vec<u8> = pks.iter().flat_map(|&p| p.to_be_bytes()).collect();
@@ -487,12 +472,7 @@ mod tests {
 
         // Build a guard at key 0 with 3 entries (max_lsn=100 → lsn_tag=100)
         for i in 0..3u64 {
-            let path = write_test_shard(
-                dir.path(),
-                &format!("src_{i}.db"),
-                &[i + 1],
-                &[(i as i64 + 1) * 10],
-            );
+            let path = write_test_shard(dir.path(), &format!("src_{i}.db"), &[i + 1], &[(i as i64 + 1) * 10]);
             let e = ShardEntry::open(&path, &schema, 0, 100).unwrap();
             idx.levels[0].get_or_create_guard(0).entries.push(e);
         }
@@ -512,7 +492,11 @@ mod tests {
 
         let result = idx.compact_guard_vertical(1);
         assert!(result.is_err(), "expected Err when output path is blocked");
-        assert_eq!(idx.pending_deletions.len(), 0, "no input files should be queued on failure");
+        assert_eq!(
+            idx.pending_deletions.len(),
+            0,
+            "no input files should be queued on failure"
+        );
         assert_eq!(
             idx.levels[0].guards.len(),
             pre_guard_count,
@@ -542,7 +526,11 @@ mod tests {
         idx.levels[0].get_or_create_guard(100).entries.push(entry);
 
         let keys = idx.l1_guard_keys();
-        assert_eq!(keys.first().copied(), Some(0), "guard space must start at 0, got {keys:?}");
+        assert_eq!(
+            keys.first().copied(),
+            Some(0),
+            "guard space must start at 0, got {keys:?}"
+        );
         assert!(keys.contains(&100), "existing guard key 100 must be preserved");
     }
 
@@ -873,7 +861,10 @@ mod tests {
         // key is pruned. OPK for a U64 PK is the value's big-endian bytes.
         assert!(e_lo.probe_pk_bytes(&10u64.to_be_bytes()).is_some());
         assert!(e_lo.probe_pk_bytes(&20u64.to_be_bytes()).is_some());
-        assert!(e_lo.probe_pk_bytes(&25u64.to_be_bytes()).is_none(), "25 outside [10,20]");
+        assert!(
+            e_lo.probe_pk_bytes(&25u64.to_be_bytes()).is_none(),
+            "25 outside [10,20]"
+        );
         assert!(e_hi.probe_pk_bytes(&5u64.to_be_bytes()).is_none(), "5 below [30,40]");
 
         // L0 sort orders by pk_min, empty entries last (golden order).
@@ -959,12 +950,7 @@ mod tests {
         // the stride assert + pk_in_range wiring).
         let dir = tempfile::tempdir().unwrap();
         raise_fd_limit_for_tests();
-        let p = write_compound_shard(
-            dir.path(),
-            "compound.db",
-            &[(1, 5), (1, 9), (2, 3)],
-            &[10, 20, 30],
-        );
+        let p = write_compound_shard(dir.path(), "compound.db", &[(1, 5), (1, 9), (2, 3)], &[10, 20, 30]);
         let entry = ShardEntry::open(&p, &schema, 0, 1).unwrap();
         assert_eq!(entry.pk_min.pk_bytes(), &opk2(1, 5));
         assert_eq!(entry.pk_max.pk_bytes(), &opk2(2, 3));

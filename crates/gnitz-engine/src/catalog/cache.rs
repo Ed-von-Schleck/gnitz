@@ -8,16 +8,16 @@ use std::collections::hash_map::Entry;
 
 #[derive(Default)]
 pub(crate) struct CatalogCacheSet {
-    pub(crate) schema_by_name:   FxHashMap<String, i64>,
-    pub(crate) schema_by_id:     FxHashMap<i64, String>,
-    pub(crate) entity_by_qname:  FxHashMap<String, i64>,
-    pub(crate) entity_by_id:     FxHashMap<i64, (String, String)>,
-    pub(crate) schema_of:        FxHashMap<i64, i64>,
+    pub(crate) schema_by_name: FxHashMap<String, i64>,
+    pub(crate) schema_by_id: FxHashMap<i64, String>,
+    pub(crate) entity_by_qname: FxHashMap<String, i64>,
+    pub(crate) entity_by_id: FxHashMap<i64, (String, String)>,
+    pub(crate) schema_of: FxHashMap<i64, i64>,
     pub(crate) tables_by_schema: FxHashMap<i64, FxHashSet<i64>>,
-    pub(crate) views_by_schema:  FxHashMap<i64, FxHashSet<i64>>,
-    pub(crate) pk_col_of:        FxHashMap<i64, PkColList>,
-    pub(crate) col_names:        FxHashMap<i64, Vec<String>>,
-    pub(crate) col_names_bytes:  FxHashMap<i64, Rc<Vec<Vec<u8>>>>,
+    pub(crate) views_by_schema: FxHashMap<i64, FxHashSet<i64>>,
+    pub(crate) pk_col_of: FxHashMap<i64, PkColList>,
+    pub(crate) col_names: FxHashMap<i64, Vec<String>>,
+    pub(crate) col_names_bytes: FxHashMap<i64, Rc<Vec<Vec<u8>>>>,
     /// Cached schema wire data per table: (encoded block, wire_safe, wire_row_fixed_stride).
     /// Built from (SchemaDescriptor, col_names) and reused across SEEK/SCAN responses.
     /// `wire_row_fixed_stride` is only meaningful when `wire_safe == true`.
@@ -33,26 +33,34 @@ pub(crate) struct CatalogCacheSet {
     /// counter truncated to 8 bits would both alias distinct values and emit
     /// the reserved `0` sentinel on overflow.
     pub(crate) index_version: FxHashMap<i64, u8>,
-    pub(crate) index_by_name:    FxHashMap<String, i64>,
-    pub(crate) index_by_id:      FxHashMap<i64, String>,
+    pub(crate) index_by_name: FxHashMap<String, i64>,
+    pub(crate) index_by_id: FxHashMap<i64, String>,
     pub(crate) indices_by_owner: FxHashMap<i64, Vec<i64>>,
-    pub(crate) fk_by_child:      FxHashMap<i64, Vec<FkConstraint>>,
-    pub(crate) fk_by_parent:     FxHashMap<i64, Vec<FkParentRef>>,
-    pub(crate) needs_lock:       FxHashSet<i64>,
+    pub(crate) fk_by_child: FxHashMap<i64, Vec<FkConstraint>>,
+    pub(crate) fk_by_parent: FxHashMap<i64, Vec<FkParentRef>>,
+    pub(crate) needs_lock: FxHashSet<i64>,
 }
 
 /// Increment a schema version counter: wraps 65535 → 1, never 0.
 /// 0 is reserved as the client sentinel meaning "no cached schema".
 #[inline]
 fn bump_schema_version(v: u16) -> u16 {
-    if v == u16::MAX { 1 } else { v + 1 }
+    if v == u16::MAX {
+        1
+    } else {
+        v + 1
+    }
 }
 
 /// Increment an index-metadata version counter: wraps 255 → 1, never 0.
 /// 0 is reserved as the client sentinel meaning "no cached index list".
 #[inline]
 fn bump_index_version(v: u8) -> u8 {
-    if v == u8::MAX { 1 } else { v + 1 }
+    if v == u8::MAX {
+        1
+    } else {
+        v + 1
+    }
 }
 
 impl CatalogCacheSet {
@@ -110,7 +118,7 @@ impl CatalogEngine {
             let weight = batch.get_weight(i);
             let sid = batch.get_pk(i) as i64;
             let name = self.read_batch_string(batch, i, 0);
-            
+
             if weight > 0 {
                 self.caches.schema_by_name.insert(name, sid);
             } else {
@@ -124,7 +132,7 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let sid = batch.get_pk(i) as i64;
-            
+
             if weight > 0 {
                 let name = self.read_batch_string(batch, i, 0);
                 self.caches.schema_by_id.insert(sid, name);
@@ -139,7 +147,7 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
-            
+
             if weight > 0 {
                 let sid = self.read_batch_u64(batch, i, 0) as i64;
                 let name = self.read_batch_string(batch, i, 1);
@@ -161,11 +169,15 @@ impl CatalogEngine {
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
-            
+
             if weight > 0 {
                 let sid = self.read_batch_u64(batch, i, 0) as i64;
                 let name = self.read_batch_string(batch, i, 1);
-                let schema_name = self.caches.schema_by_id.get(&sid).map_or_else(String::new, String::clone);
+                let schema_name = self
+                    .caches
+                    .schema_by_id
+                    .get(&sid)
+                    .map_or_else(String::new, String::clone);
                 self.caches.entity_by_id.insert(tid, (schema_name, name));
             } else {
                 // Table dropped: clear per-table cache entries without bumping the
@@ -192,7 +204,7 @@ impl CatalogEngine {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
             let sid = self.read_batch_u64(batch, i, 0) as i64;
-            
+
             if weight > 0 {
                 self.caches.schema_of.insert(tid, sid);
                 if is_table {
@@ -205,11 +217,15 @@ impl CatalogEngine {
                 if is_table {
                     if let Entry::Occupied(mut e) = self.caches.tables_by_schema.entry(sid) {
                         e.get_mut().remove(&tid);
-                        if e.get().is_empty() { e.remove(); }
+                        if e.get().is_empty() {
+                            e.remove();
+                        }
                     }
                 } else if let Entry::Occupied(mut e) = self.caches.views_by_schema.entry(sid) {
                     e.get_mut().remove(&tid);
-                    if e.get().is_empty() { e.remove(); }
+                    if e.get().is_empty() {
+                        e.remove();
+                    }
                 }
             }
         }
@@ -289,7 +305,9 @@ impl CatalogEngine {
                     if let Some(pos) = ids.iter().position(|&id| id == idx_id) {
                         ids.swap_remove(pos);
                     }
-                    if e.get().is_empty() { e.remove(); }
+                    if e.get().is_empty() {
+                        e.remove();
+                    }
                 }
             }
             // Bump unconditionally so DROP-then-recreate on the same column
@@ -313,22 +331,33 @@ impl CatalogEngine {
     pub(crate) fn apply_fk_constraints(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.count {
             let fk_table_id = self.read_batch_u64(batch, i, 6) as i64;
-            if fk_table_id == 0 { continue; }
+            if fk_table_id == 0 {
+                continue;
+            }
 
             let weight = batch.get_weight(i);
             let owner_id = self.read_batch_u64(batch, i, 0) as i64;
-            let col_idx = self.read_batch_u64(batch, i, 2) as usize;        // child col
+            let col_idx = self.read_batch_u64(batch, i, 2) as usize; // child col
             let target_col_idx = self.read_batch_u64(batch, i, 7) as usize; // parent col (COL_TAB col 8)
 
             if weight > 0 {
                 let constraints = self.caches.fk_by_child.entry(owner_id).or_default();
                 if !constraints.iter().any(|c| c.fk_col_idx == col_idx) {
-                    constraints.push(FkConstraint { fk_col_idx: col_idx, target_table_id: fk_table_id, target_col_idx });
+                    constraints.push(FkConstraint {
+                        fk_col_idx: col_idx,
+                        target_table_id: fk_table_id,
+                        target_col_idx,
+                    });
                 }
                 let parents = self.caches.fk_by_parent.entry(fk_table_id).or_default();
-                if !parents.iter().any(|r| r.child_tid == owner_id && r.fk_col_idx == col_idx) {
+                if !parents
+                    .iter()
+                    .any(|r| r.child_tid == owner_id && r.fk_col_idx == col_idx)
+                {
                     parents.push(FkParentRef {
-                        child_tid: owner_id, fk_col_idx: col_idx, parent_col_idx: target_col_idx,
+                        child_tid: owner_id,
+                        fk_col_idx: col_idx,
+                        parent_col_idx: target_col_idx,
                     });
                 }
             } else {
@@ -337,14 +366,21 @@ impl CatalogEngine {
                     if let Some(pos) = constraints.iter().position(|c| c.fk_col_idx == col_idx) {
                         constraints.swap_remove(pos);
                     }
-                    if e.get().is_empty() { e.remove(); }
+                    if e.get().is_empty() {
+                        e.remove();
+                    }
                 }
                 if let Entry::Occupied(mut e) = self.caches.fk_by_parent.entry(fk_table_id) {
                     let parents = e.get_mut();
-                    if let Some(pos) = parents.iter().position(|r| r.child_tid == owner_id && r.fk_col_idx == col_idx) {
+                    if let Some(pos) = parents
+                        .iter()
+                        .position(|r| r.child_tid == owner_id && r.fk_col_idx == col_idx)
+                    {
                         parents.swap_remove(pos);
                     }
-                    if e.get().is_empty() { e.remove(); }
+                    if e.get().is_empty() {
+                        e.remove();
+                    }
                 }
             }
         }
@@ -352,8 +388,10 @@ impl CatalogEngine {
     }
 
     pub(crate) fn apply_needs_lock(&mut self, source_tid: i64, batch: &Batch) -> Result<(), String> {
-        if batch.count == 0 { return Ok(()); }
-        
+        if batch.count == 0 {
+            return Ok(());
+        }
+
         let mut to_recompute = Vec::new();
 
         match source_tid {
@@ -401,9 +439,10 @@ impl CatalogEngine {
     pub(crate) fn recompute_needs_lock(&mut self, tid: i64) {
         let fk_child_count = self.caches.fk_by_child.get(&tid).map_or(0, |v| v.len());
         let fk_parent_count = self.caches.fk_by_parent.get(&tid).map_or(0, |v| v.len());
-        let (has_unique_index, unique_pk) = self.dag.tables.get(&tid)
-            .map_or((false, false), |e| (e.index_circuits.iter().any(|ic| ic.is_unique), e.unique_pk()));
-        
+        let (has_unique_index, unique_pk) = self.dag.tables.get(&tid).map_or((false, false), |e| {
+            (e.index_circuits.iter().any(|ic| ic.is_unique), e.unique_pk())
+        });
+
         let needs = fk_child_count > 0 || fk_parent_count > 0 || has_unique_index || unique_pk;
         if needs {
             self.caches.needs_lock.insert(tid);

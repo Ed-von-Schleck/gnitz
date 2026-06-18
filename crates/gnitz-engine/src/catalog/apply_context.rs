@@ -57,19 +57,40 @@ pub(crate) struct ApplyContext {
 
 impl ApplyContext {
     pub(super) fn new() -> Self {
-        Self { live: false, rollback: false, cascade_drop: false, ddl_zone_lsn: None }
+        Self {
+            live: false,
+            rollback: false,
+            cascade_drop: false,
+            ddl_zone_lsn: None,
+        }
     }
-    #[inline] pub(super) fn is_live(&self) -> bool { self.live }
-    #[inline] pub(super) fn go_live(&mut self) { self.live = true; }
-    #[inline] pub(super) fn in_rollback(&self) -> bool { self.rollback }
-    #[inline] pub(super) fn in_cascade_drop(&self) -> bool { self.cascade_drop }
-    #[inline] pub(super) fn ddl_zone_lsn(&self) -> Option<NonZeroU64> { self.ddl_zone_lsn }
+    #[inline]
+    pub(super) fn is_live(&self) -> bool {
+        self.live
+    }
+    #[inline]
+    pub(super) fn go_live(&mut self) {
+        self.live = true;
+    }
+    #[inline]
+    pub(super) fn in_rollback(&self) -> bool {
+        self.rollback
+    }
+    #[inline]
+    pub(super) fn in_cascade_drop(&self) -> bool {
+        self.cascade_drop
+    }
+    #[inline]
+    pub(super) fn ddl_zone_lsn(&self) -> Option<NonZeroU64> {
+        self.ddl_zone_lsn
+    }
 
     /// Open a DDL zone: pin every system-table write in the current DDL to
     /// `lsn`. The executor calls this before the mutate phase so every
     /// cascading hook sees the same value. Takes `NonZeroU64` so "no zone"
     /// cannot be smuggled in as a 0 sentinel.
-    #[inline] pub(crate) fn open_ddl_zone(&mut self, lsn: NonZeroU64) {
+    #[inline]
+    pub(crate) fn open_ddl_zone(&mut self, lsn: NonZeroU64) {
         self.ddl_zone_lsn = Some(lsn);
     }
 
@@ -80,7 +101,8 @@ impl ApplyContext {
     /// before the next DDL — the zone close is the single point every DDL
     /// (success or compensated failure) passes through. Subsequent non-DDL
     /// ingest paths use the auto-bump.
-    #[inline] pub(crate) fn close_ddl_zone(&mut self) {
+    #[inline]
+    pub(crate) fn close_ddl_zone(&mut self) {
         self.ddl_zone_lsn = None;
         self.cascade_drop = false;
         self.rollback = false;

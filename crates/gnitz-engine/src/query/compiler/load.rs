@@ -83,9 +83,12 @@ pub(super) fn open_system_cursor(table: *mut Table) -> Option<CursorHandle> {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_circuit(
-    sys_nodes: *mut Table, sys_nodes_schema: &SchemaDescriptor,
-    sys_edges: *mut Table, sys_edges_schema: &SchemaDescriptor,
-    sys_node_cols: *mut Table, sys_node_cols_schema: &SchemaDescriptor,
+    sys_nodes: *mut Table,
+    sys_nodes_schema: &SchemaDescriptor,
+    sys_edges: *mut Table,
+    sys_edges_schema: &SchemaDescriptor,
+    sys_node_cols: *mut Table,
+    sys_node_cols_schema: &SchemaDescriptor,
     view_id: u64,
     out_schema: SchemaDescriptor,
 ) -> Option<LoadedCircuit> {
@@ -100,14 +103,20 @@ pub(crate) fn load_circuit(
         let mut ch = open_system_cursor(sys_node_cols)?;
         let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
         while hit {
-            let node_id  = cursor_read_i64(&ch.cursor, NODECOL_COL_NODE_ID,  sys_node_cols_schema) as i32;
-            let kind     = cursor_read_i64(&ch.cursor, NODECOL_COL_KIND,     sys_node_cols_schema) as u64;
+            let node_id = cursor_read_i64(&ch.cursor, NODECOL_COL_NODE_ID, sys_node_cols_schema) as i32;
+            let kind = cursor_read_i64(&ch.cursor, NODECOL_COL_KIND, sys_node_cols_schema) as u64;
             let position = cursor_read_i64(&ch.cursor, NODECOL_COL_POSITION, sys_node_cols_schema) as u16;
-            let v1       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE1,   sys_node_cols_schema) as u64;
-            let v2       = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE2,   sys_node_cols_schema) as u64;
-            cols_by_node.entry(node_id).or_default().push(gnitz_wire::CircuitNodeColumn {
-                kind, position, value1: v1, value2: v2,
-            });
+            let v1 = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE1, sys_node_cols_schema) as u64;
+            let v2 = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE2, sys_node_cols_schema) as u64;
+            cols_by_node
+                .entry(node_id)
+                .or_default()
+                .push(gnitz_wire::CircuitNodeColumn {
+                    kind,
+                    position,
+                    value1: v1,
+                    value2: v2,
+                });
             ch.cursor.advance();
             hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
         }
@@ -124,7 +133,7 @@ pub(crate) fn load_circuit(
         let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
         while hit {
             let node_id = cursor_read_i64(&ch.cursor, NODES_COL_NODE_ID, sys_nodes_schema) as i32;
-            let opcode  = cursor_read_i64(&ch.cursor, NODES_COL_OPCODE_NEW, sys_nodes_schema) as u64;
+            let opcode = cursor_read_i64(&ch.cursor, NODES_COL_OPCODE_NEW, sys_nodes_schema) as u64;
 
             let src_tab: Option<u64> = if cursor_is_null(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) {
                 None
@@ -140,7 +149,11 @@ pub(crate) fn load_circuit(
                 None
             } else {
                 let b = cursor_read_string(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema);
-                if b.is_empty() { None } else { Some(b) }
+                if b.is_empty() {
+                    None
+                } else {
+                    Some(b)
+                }
             };
 
             let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -152,8 +165,10 @@ pub(crate) fn load_circuit(
                 if let Some(c) = cols_by_node.get(&node_id) {
                     // GatherReduce stays on the legacy tuple path (emit_gather_reduce)
                     // until OpNode::GatherReduce gains a typed `agg` field.
-                    gather_reduce_cols.insert(node_id,
-                        c.iter().map(|c| (c.kind, c.position, c.value1, c.value2)).collect());
+                    gather_reduce_cols.insert(
+                        node_id,
+                        c.iter().map(|c| (c.kind, c.position, c.value1, c.value2)).collect(),
+                    );
                 }
             }
             nodes.insert(node_id, op);
@@ -168,9 +183,9 @@ pub(crate) fn load_circuit(
         let mut ch = open_system_cursor(sys_edges)?;
         let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
         while hit {
-            let dst  = cursor_read_i64(&ch.cursor, EDGES_COL_DST_NODE, sys_edges_schema) as i32;
+            let dst = cursor_read_i64(&ch.cursor, EDGES_COL_DST_NODE, sys_edges_schema) as i32;
             let port = cursor_read_i64(&ch.cursor, EDGES_COL_DST_PORT, sys_edges_schema) as i32;
-            let src  = cursor_read_i64(&ch.cursor, EDGES_COL_SRC_NODE, sys_edges_schema) as i32;
+            let src = cursor_read_i64(&ch.cursor, EDGES_COL_SRC_NODE, sys_edges_schema) as i32;
             edges.push((src, dst, port));
             ch.cursor.advance();
             hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
@@ -217,7 +232,9 @@ pub(crate) fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), i32> {
         *in_degree.entry(dst).or_insert(0) += 1;
     }
 
-    let mut init: Vec<i32> = loaded.nodes.keys()
+    let mut init: Vec<i32> = loaded
+        .nodes
+        .keys()
         .filter(|&&nid| *in_degree.get(&nid).unwrap_or(&0) == 0)
         .copied()
         .collect();
@@ -276,16 +293,27 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
     // nullable-key null/not-null sibling reindexes carry the SAME key as the match
     // reindex and remain (deduped). Non-join views (PK-redistribution, GROUP BY) have
     // no join node, so the guard is off and every reindex is collected as before.
-    let is_join_view = loaded.nodes.values().any(|op| matches!(op,
-        gnitz_wire::OpNode::Join(_)
-        | gnitz_wire::OpNode::AntiJoin(_)
-        | gnitz_wire::OpNode::SemiJoin(_)));
-    let feeds_trace_or_join = |nid: i32| loaded.outgoing.get(&nid).is_some_and(|outs|
-        outs.iter().any(|&(d, _)| matches!(loaded.nodes.get(&d),
-            Some(gnitz_wire::OpNode::IntegrateTrace
-               | gnitz_wire::OpNode::Join(_)
-               | gnitz_wire::OpNode::AntiJoin(_)
-               | gnitz_wire::OpNode::SemiJoin(_)))));
+    let is_join_view = loaded.nodes.values().any(|op| {
+        matches!(
+            op,
+            gnitz_wire::OpNode::Join(_) | gnitz_wire::OpNode::AntiJoin(_) | gnitz_wire::OpNode::SemiJoin(_)
+        )
+    });
+    let feeds_trace_or_join = |nid: i32| {
+        loaded.outgoing.get(&nid).is_some_and(|outs| {
+            outs.iter().any(|&(d, _)| {
+                matches!(
+                    loaded.nodes.get(&d),
+                    Some(
+                        gnitz_wire::OpNode::IntegrateTrace
+                            | gnitz_wire::OpNode::Join(_)
+                            | gnitz_wire::OpNode::AntiJoin(_)
+                            | gnitz_wire::OpNode::SemiJoin(_)
+                    )
+                )
+            })
+        })
+    };
 
     let mut queue = VecDeque::from([scan_nid]);
     // `visited` bounds the walk to O(nodes): without it a Filter diamond (two
@@ -299,7 +327,9 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
     // mirrors the trace-side ReindexPacker slot-for-slot.
     let mut seqs: Vec<Vec<(i32, u8)>> = Vec::new();
     while let Some(cur) = queue.pop_front() {
-        if !visited.insert(cur) { continue; }
+        if !visited.insert(cur) {
+            continue;
+        }
         if let Some(outs) = loaded.outgoing.get(&cur) {
             for &(dst, _port) in outs {
                 match loaded.nodes.get(&dst) {
@@ -307,15 +337,18 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
                     // reindex_cols is a plain projection Map — skip it. In a join view
                     // a reindex only defines the scatter key if it feeds the trace/probe.
                     Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
-                        reindex_cols, reindex_target_tcs, ..
-                    })) if !reindex_cols.is_empty()
-                        && (!is_join_view || feeds_trace_or_join(dst)) => {
-                        let seq: Vec<(i32, u8)> = reindex_cols.iter().enumerate()
-                            .map(|(i, &rc)| {
-                                (rc as i32, reindex_target_tcs.get(i).copied().unwrap_or(0))
-                            })
+                        reindex_cols,
+                        reindex_target_tcs,
+                        ..
+                    })) if !reindex_cols.is_empty() && (!is_join_view || feeds_trace_or_join(dst)) => {
+                        let seq: Vec<(i32, u8)> = reindex_cols
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &rc)| (rc as i32, reindex_target_tcs.get(i).copied().unwrap_or(0)))
                             .collect();
-                        if !seqs.contains(&seq) { seqs.push(seq); }
+                        if !seqs.contains(&seq) {
+                            seqs.push(seq);
+                        }
                     }
                     Some(gnitz_wire::OpNode::Filter(_)) => queue.push_back(dst),
                     _ => {}
@@ -345,11 +378,12 @@ pub(crate) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Opt
         // Bail on a fan-in (≠ 1 incoming edge): a multi-input node (Union, set op)
         // draws from more than one source, so no single table's distribution prefix
         // governs the shard key and it can never co-partition. (0 edges = root.)
-        if ins.len() != 1 { return None; }
+        if ins.len() != 1 {
+            return None;
+        }
         let src_nid = ins[0].0;
         match loaded.nodes.get(&src_nid) {
-            Some(gnitz_wire::OpNode::ScanDelta(t))
-            | Some(gnitz_wire::OpNode::ScanTrace(t)) => return Some(*t as i64),
+            Some(gnitz_wire::OpNode::ScanDelta(t)) | Some(gnitz_wire::OpNode::ScanTrace(t)) => return Some(*t as i64),
             Some(gnitz_wire::OpNode::Filter(_)) => cur = src_nid,
             _ => return None,
         }
@@ -376,4 +410,3 @@ pub(crate) fn circuit_range_join_n_eq(loaded: &LoadedCircuit) -> Option<u8> {
         _ => None,
     })
 }
-

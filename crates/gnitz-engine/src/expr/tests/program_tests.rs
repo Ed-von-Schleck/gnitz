@@ -3,10 +3,7 @@
 #![allow(clippy::approx_constant)]
 
 use super::super::program::*;
-use super::{
-    eval_predicate_via_batch as eval_predicate, eval_with_emit_via_batch,
-    float_to_bits, bits_to_float,
-};
+use super::{bits_to_float, eval_predicate_via_batch as eval_predicate, eval_with_emit_via_batch, float_to_bits};
 use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
@@ -34,10 +31,7 @@ fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
     SchemaDescriptor::new(&columns[..col_types.len()], &[pk_index])
 }
 
-fn make_int_batch(
-    schema: &SchemaDescriptor,
-    rows: &[(u64, i64, u64, &[i64])],
-) -> Batch {
+fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -> Batch {
     let mut batch = Batch::with_schema(*schema, rows.len().max(1));
     batch.count = 0;
     for &(pk, weight, null_word, cols) in rows {
@@ -63,32 +57,59 @@ fn test_int_comparisons() {
 
     // r0 = load_col_int(1), r1 = load_const(42), r2 = cmp_eq(r0, r1)
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0, // r0 = col[1]
-        EXPR_LOAD_CONST, 1, 42, 0, // r1 = 42
-        EXPR_CMP_EQ, 2, 0, 1, // r2 = (r0 == r1)
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0, // r0 = col[1]
+        EXPR_LOAD_CONST,
+        1,
+        42,
+        0, // r1 = 42
+        EXPR_CMP_EQ,
+        2,
+        0,
+        1, // r2 = (r0 == r1)
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
     // Test NE
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 42, 0,
-        EXPR_CMP_NE, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        42,
+        0,
+        EXPR_CMP_NE,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // Test GT
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 10, 0,
-        EXPR_CMP_GT, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        10,
+        0,
+        EXPR_CMP_GT,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 }
@@ -101,40 +122,64 @@ fn test_int_arithmetic() {
 
     // ADD: 10 + 3 = 13
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_COL_INT, 1, 2, 0,
-        EXPR_INT_ADD, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_INT,
+        1,
+        2,
+        0,
+        EXPR_INT_ADD,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 13);
 
     // DIV by zero → NULL
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 0, 0,
-        EXPR_INT_DIV, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        0,
+        0,
+        EXPR_INT_DIV,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // MOD by zero → NULL
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 0, 0,
-        EXPR_INT_MOD, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        0,
+        0,
+        EXPR_INT_MOD,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // NEG: -10
-    let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_INT_NEG, 1, 0, 0,
-    ];
-    let prog = make_prog(&schema,code, 2, 1, vec![]);
+    let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_INT_NEG, 1, 0, 0];
+    let prog = make_prog(&schema, code, 2, 1, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, -10);
 }
@@ -150,32 +195,59 @@ fn test_float_arithmetic_and_comparison() {
 
     // FLOAT_ADD: 3.14 + 2.0
     let code = vec![
-        EXPR_LOAD_COL_FLOAT, 0, 1, 0,
-        EXPR_LOAD_COL_FLOAT, 1, 2, 0,
-        EXPR_FLOAT_ADD, 2, 0, 1,
+        EXPR_LOAD_COL_FLOAT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_FLOAT,
+        1,
+        2,
+        0,
+        EXPR_FLOAT_ADD,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     let result = bits_to_float(val);
     assert!((result - 5.14).abs() < 1e-10);
 
     // FLOAT_DIV by zero → NULL
     let code = vec![
-        EXPR_LOAD_COL_FLOAT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 0, 0, // zero bits
-        EXPR_FLOAT_DIV, 2, 0, 1,
+        EXPR_LOAD_COL_FLOAT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        0,
+        0, // zero bits
+        EXPR_FLOAT_DIV,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // FCMP_GT: 3.14 > 2.0
     let code = vec![
-        EXPR_LOAD_COL_FLOAT, 0, 1, 0,
-        EXPR_LOAD_COL_FLOAT, 1, 2, 0,
-        EXPR_FCMP_GT, 2, 0, 1,
+        EXPR_LOAD_COL_FLOAT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_FLOAT,
+        1,
+        2,
+        0,
+        EXPR_FCMP_GT,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 }
@@ -189,11 +261,20 @@ fn test_null_propagation() {
 
     // ADD with one null operand → null
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_COL_INT, 1, 2, 0,
-        EXPR_INT_ADD, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_INT,
+        1,
+        2,
+        0,
+        EXPR_INT_ADD,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 }
@@ -207,21 +288,21 @@ fn test_is_null_is_not_null() {
 
     // IS_NULL(col1) → 1 (always non-null result)
     let code = vec![EXPR_IS_NULL, 0, 1, 0];
-    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let prog = make_prog(&schema, code, 1, 0, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
     // IS_NOT_NULL(col1) → 0
     let code = vec![EXPR_IS_NOT_NULL, 0, 1, 0];
-    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let prog = make_prog(&schema, code, 1, 0, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
     assert!(!is_null);
 
     // IS_NULL(col2) → 0
     let code = vec![EXPR_IS_NULL, 0, 2, 0];
-    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let prog = make_prog(&schema, code, 1, 0, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -234,30 +315,45 @@ fn test_boolean_combinators() {
 
     // AND(1, 0) → 0
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 0, 0,
-        EXPR_BOOL_AND, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        0,
+        0,
+        EXPR_BOOL_AND,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // OR(1, 0) → 1
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 0, 0,
-        EXPR_BOOL_OR, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        0,
+        0,
+        EXPR_BOOL_OR,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // NOT(1) → 0
-    let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_BOOL_NOT, 1, 0, 0,
-    ];
-    let prog = make_prog(&schema,code, 2, 1, vec![]);
+    let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_BOOL_NOT, 1, 0, 0];
+    let prog = make_prog(&schema, code, 2, 1, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -271,7 +367,7 @@ fn test_load_const_encoding() {
     // Test large constant: 0x00000001_00000002 = (1 << 32) | 2 = 4294967298
     // a1 = lo 32 bits = 2, a2 = hi 32 bits = 1
     let code = vec![EXPR_LOAD_CONST, 0, 2, 1];
-    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let prog = make_prog(&schema, code, 1, 0, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(!is_null);
     assert_eq!(val, (1i64 << 32) | 2);
@@ -280,7 +376,7 @@ fn test_load_const_encoding() {
     // As i64: a1 = -1 (sign-extended from 32 bits), a2 = -1
     // Reconstruction: (-1 << 32) | (-1 & 0xFFFFFFFF) = 0xFFFFFFFF_FFFFFFFF = -1
     let code = vec![EXPR_LOAD_CONST, 0, -1, -1];
-    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let prog = make_prog(&schema, code, 1, 0, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, -1);
 }
@@ -305,14 +401,14 @@ fn test_string_eq_const() {
 
     // STR_COL_EQ_CONST(col1, "hello") → 1
     let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
-    let prog = make_prog(&schema,code, 1, 0, vec![b"hello".to_vec()]);
+    let prog = make_prog(&schema, code, 1, 0, vec![b"hello".to_vec()]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(!is_null);
     assert_eq!(val, 1);
 
     // STR_COL_EQ_CONST(col1, "world") → 0
     let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
-    let prog = make_prog(&schema,code, 1, 0, vec![b"world".to_vec()]);
+    let prog = make_prog(&schema, code, 1, 0, vec![b"world".to_vec()]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -323,11 +419,8 @@ fn test_int_to_float() {
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
     let mb = batch.as_mem_batch();
 
-    let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_INT_TO_FLOAT, 1, 0, 0,
-    ];
-    let prog = make_prog(&schema,code, 2, 1, vec![]);
+    let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_INT_TO_FLOAT, 1, 0, 0];
+    let prog = make_prog(&schema, code, 2, 1, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(bits_to_float(val), 42.0);
 }
@@ -353,9 +446,18 @@ fn test_unsigned_opcode_swap_and_eval() {
 
     // (a) col1 > 100  → EXPR_CMP_GT must swap to EXPR_UCMP_GT.
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0, // r0 = col1 (U64)
-        EXPR_LOAD_CONST, 1, 100, 0, // r1 = 100
-        EXPR_CMP_GT, 2, 0, 1,       // r2 = (r0 > r1)
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0, // r0 = col1 (U64)
+        EXPR_LOAD_CONST,
+        1,
+        100,
+        0, // r1 = 100
+        EXPR_CMP_GT,
+        2,
+        0,
+        1, // r2 = (r0 > r1)
     ];
     let prog_gt = make_prog(&schema, code, 3, 2, vec![]);
     // Instruction 2 (offset 8) is the comparison opcode after resolution.
@@ -373,9 +475,18 @@ fn test_unsigned_opcode_swap_and_eval() {
 
     // (b) col1 / 2  → EXPR_INT_DIV must swap to EXPR_UDIV.
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 2, 0,
-        EXPR_INT_DIV, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        2,
+        0,
+        EXPR_INT_DIV,
+        2,
+        0,
+        1,
     ];
     let prog_div = make_prog(&schema, code, 3, 2, vec![]);
     assert_eq!(
@@ -392,9 +503,18 @@ fn test_unsigned_opcode_swap_and_eval() {
 
     // (c) col1 % 2  → EXPR_INT_MOD must swap to EXPR_UMOD.
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 2, 0,
-        EXPR_INT_MOD, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        2,
+        0,
+        EXPR_INT_MOD,
+        2,
+        0,
+        1,
     ];
     let prog_mod = make_prog(&schema, code, 3, 2, vec![]);
     assert_eq!(
@@ -404,15 +524,18 @@ fn test_unsigned_opcode_swap_and_eval() {
     );
     let (val, is_null) = eval_predicate(&prog_mod, &mb, 0);
     assert!(!is_null);
-    assert_eq!(
-        val, 1,
-        "u64::MAX % 2 == 1 (unsigned); signed -1 % 2 would be -1",
-    );
+    assert_eq!(val, 1, "u64::MAX % 2 == 1 (unsigned); signed -1 % 2 would be -1",);
 
     // (d) CAST col1 to float  → EXPR_INT_TO_FLOAT must swap to EXPR_UINT_TO_FLOAT.
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,  // r0 = col1 (U64)
-        EXPR_INT_TO_FLOAT, 1, 0, 0,  // r1 = (f64) r0
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0, // r0 = col1 (U64)
+        EXPR_INT_TO_FLOAT,
+        1,
+        0,
+        0, // r1 = (f64) r0
     ];
     let prog_cast = make_prog(&schema, code, 2, 1, vec![]);
     // Instruction 1 (offset 4) is the cast opcode after resolution.
@@ -425,7 +548,8 @@ fn test_unsigned_opcode_swap_and_eval() {
     assert!(!is_null);
     let f = bits_to_float(val);
     assert_eq!(
-        f, u64::MAX as f64,
+        f,
+        u64::MAX as f64,
         "u64::MAX cast to float is ~1.8e19 (unsigned); signed (-1) would be -1.0",
     );
     assert!(f > 0.0, "unsigned cast of u64::MAX must be a large positive float");
@@ -439,15 +563,26 @@ fn test_emit_with_targets() {
 
     // Compute col1 + col2, EMIT to payload col 0
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_COL_INT, 1, 2, 0,
-        EXPR_INT_ADD, 2, 0, 1,
-        EXPR_EMIT, 0, 2, 0, // emit r2 to payload col 0
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_INT,
+        1,
+        2,
+        0,
+        EXPR_INT_ADD,
+        2,
+        0,
+        1,
+        EXPR_EMIT,
+        0,
+        2,
+        0, // emit r2 to payload col 0
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
 
-    let (val, is_null, mask, emit_vals) =
-        eval_with_emit_via_batch(&prog, &mb, 0);
+    let (val, is_null, mask, emit_vals) = eval_with_emit_via_batch(&prog, &mb, 0);
     assert_eq!(val, 30); // 10 + 20
     assert!(!is_null);
     assert_eq!(mask, 0);
@@ -464,41 +599,77 @@ fn test_div_by_zero_null_semantics() {
 
     // 1. INT_DIV by literal 0 → NULL
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 0, 0,
-        EXPR_INT_DIV, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        0,
+        0,
+        EXPR_INT_DIV,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // 2. INT_MOD by literal 0 → NULL
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 0, 0,
-        EXPR_INT_MOD, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        0,
+        0,
+        EXPR_INT_MOD,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // 3. FLOAT_DIV by 0.0 bits → NULL
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 0, 0,
-        EXPR_FLOAT_DIV, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        0,
+        0,
+        EXPR_FLOAT_DIV,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // 4. INT_DIV by non-null non-zero → correct quotient, not null
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_COL_INT, 1, 2, 0,
-        EXPR_INT_DIV, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_INT,
+        1,
+        2,
+        0,
+        EXPR_INT_DIV,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(!is_null);
     assert_eq!(val, 3); // 10 / 3 = 3
@@ -510,22 +681,43 @@ fn test_div_by_zero_null_semantics() {
     let batch_null_div = make_int_batch(&schema, &[(1, 1, 2, &[10, 3])]);
     let mb_null_div = batch_null_div.as_mem_batch();
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_COL_INT, 1, 2, 0,
-        EXPR_INT_DIV, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_INT,
+        1,
+        2,
+        0,
+        EXPR_INT_DIV,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb_null_div, 0);
     assert!(is_null);
 
     // 6. EMIT of INT_DIV-by-zero result → emit_null_mask bit set, buffer contains 0
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 0, 0,
-        EXPR_INT_DIV, 2, 0, 1,
-        EXPR_EMIT, 0, 2, 0,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        0,
+        0,
+        EXPR_INT_DIV,
+        2,
+        0,
+        1,
+        EXPR_EMIT,
+        0,
+        2,
+        0,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (_, _, mask, emit_vals) = eval_with_emit_via_batch(&prog, &mb, 0);
     assert_eq!(mask & 1, 1); // bit 0 set → null
     assert_eq!(emit_vals[0], 0);
@@ -539,61 +731,115 @@ fn test_cmp_ge_lt_le() {
 
     // GE: 42 >= 42 → 1
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 42, 0,
-        EXPR_CMP_GE, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        42,
+        0,
+        EXPR_CMP_GE,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // GE: 42 >= 43 → 0
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 43, 0,
-        EXPR_CMP_GE, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        43,
+        0,
+        EXPR_CMP_GE,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // LT: 42 < 43 → 1
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 43, 0,
-        EXPR_CMP_LT, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        43,
+        0,
+        EXPR_CMP_LT,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // LT: 42 < 42 → 0
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 42, 0,
-        EXPR_CMP_LT, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        42,
+        0,
+        EXPR_CMP_LT,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // LE: 42 <= 42 → 1
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 42, 0,
-        EXPR_CMP_LE, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        42,
+        0,
+        EXPR_CMP_LE,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // LE: 42 <= 41 → 0
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_CONST, 1, 41, 0,
-        EXPR_CMP_LE, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_CONST,
+        1,
+        41,
+        0,
+        EXPR_CMP_LE,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -608,61 +854,115 @@ fn test_fcmp_eq_ne_lt_le() {
 
     // FCMP_EQ: 3.14 == 3.14 → 1
     let code = vec![
-        EXPR_LOAD_COL_FLOAT, 0, 1, 0,
-        EXPR_LOAD_COL_FLOAT, 1, 1, 0,
-        EXPR_FCMP_EQ, 2, 0, 1,
+        EXPR_LOAD_COL_FLOAT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_FLOAT,
+        1,
+        1,
+        0,
+        EXPR_FCMP_EQ,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_EQ: 3.14 == 2.0 → 0
     let code = vec![
-        EXPR_LOAD_COL_FLOAT, 0, 1, 0,
-        EXPR_LOAD_COL_FLOAT, 1, 2, 0,
-        EXPR_FCMP_EQ, 2, 0, 1,
+        EXPR_LOAD_COL_FLOAT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_FLOAT,
+        1,
+        2,
+        0,
+        EXPR_FCMP_EQ,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // FCMP_NE: 3.14 != 2.0 → 1
     let code = vec![
-        EXPR_LOAD_COL_FLOAT, 0, 1, 0,
-        EXPR_LOAD_COL_FLOAT, 1, 2, 0,
-        EXPR_FCMP_NE, 2, 0, 1,
+        EXPR_LOAD_COL_FLOAT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_FLOAT,
+        1,
+        2,
+        0,
+        EXPR_FCMP_NE,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_LT: 2.0 < 3.14 → 1
     let code = vec![
-        EXPR_LOAD_COL_FLOAT, 0, 2, 0,
-        EXPR_LOAD_COL_FLOAT, 1, 1, 0,
-        EXPR_FCMP_LT, 2, 0, 1,
+        EXPR_LOAD_COL_FLOAT,
+        0,
+        2,
+        0,
+        EXPR_LOAD_COL_FLOAT,
+        1,
+        1,
+        0,
+        EXPR_FCMP_LT,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_LE: 2.0 <= 2.0 → 1
     let code = vec![
-        EXPR_LOAD_COL_FLOAT, 0, 2, 0,
-        EXPR_LOAD_COL_FLOAT, 1, 2, 0,
-        EXPR_FCMP_LE, 2, 0, 1,
+        EXPR_LOAD_COL_FLOAT,
+        0,
+        2,
+        0,
+        EXPR_LOAD_COL_FLOAT,
+        1,
+        2,
+        0,
+        EXPR_FCMP_LE,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_GE: 2.0 >= 3.14 → 0
     let code = vec![
-        EXPR_LOAD_COL_FLOAT, 0, 2, 0,
-        EXPR_LOAD_COL_FLOAT, 1, 1, 0,
-        EXPR_FCMP_GE, 2, 0, 1,
+        EXPR_LOAD_COL_FLOAT,
+        0,
+        2,
+        0,
+        EXPR_LOAD_COL_FLOAT,
+        1,
+        1,
+        0,
+        EXPR_FCMP_GE,
+        2,
+        0,
+        1,
     ];
-    let prog = make_prog(&schema,code, 3, 2, vec![]);
+    let prog = make_prog(&schema, code, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -684,25 +984,25 @@ fn test_string_lt_le_const() {
 
     // STR_COL_LT_CONST: "hello" < "world" → 1
     let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
-    let prog = make_prog(&schema,code, 1, 0, vec![b"world".to_vec()]);
+    let prog = make_prog(&schema, code, 1, 0, vec![b"world".to_vec()]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // STR_COL_LT_CONST: "hello" < "hello" → 0
     let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
-    let prog = make_prog(&schema,code, 1, 0, vec![b"hello".to_vec()]);
+    let prog = make_prog(&schema, code, 1, 0, vec![b"hello".to_vec()]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // STR_COL_LE_CONST: "hello" <= "hello" → 1
     let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
-    let prog = make_prog(&schema,code, 1, 0, vec![b"hello".to_vec()]);
+    let prog = make_prog(&schema, code, 1, 0, vec![b"hello".to_vec()]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // STR_COL_LE_CONST: "hello" <= "hella" → 0
     let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
-    let prog = make_prog(&schema,code, 1, 0, vec![b"hella".to_vec()]);
+    let prog = make_prog(&schema, code, 1, 0, vec![b"hella".to_vec()]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -743,7 +1043,7 @@ fn test_string_col_eq_col() {
 
     // Row 0: col1 == col2 → 1
     let code = vec![EXPR_STR_COL_EQ_COL, 0, 1, 2];
-    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let prog = make_prog(&schema, code, 1, 0, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
@@ -764,19 +1064,52 @@ fn test_complex_predicate() {
     // r0=col1(a), r1=10, r2=(a>10), r3=col2(b), r4=100, r5=(b<100)
     // r6=(r2 AND r5), r7=col3(c), r8=42, r9=(c==42), r10=(r6 OR r9)
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,   // r0 = a = 15
-        EXPR_LOAD_CONST, 1, 10, 0,    // r1 = 10
-        EXPR_CMP_GT, 2, 0, 1,         // r2 = (15 > 10) = 1
-        EXPR_LOAD_COL_INT, 3, 2, 0,   // r3 = b = 50
-        EXPR_LOAD_CONST, 4, 100, 0,   // r4 = 100
-        EXPR_CMP_LT, 5, 3, 4,         // r5 = (50 < 100) = 1
-        EXPR_BOOL_AND, 6, 2, 5,       // r6 = (1 AND 1) = 1
-        EXPR_LOAD_COL_INT, 7, 3, 0,   // r7 = c = 42
-        EXPR_LOAD_CONST, 8, 42, 0,    // r8 = 42
-        EXPR_CMP_EQ, 9, 7, 8,         // r9 = (42 == 42) = 1
-        EXPR_BOOL_OR, 10, 6, 9,       // r10 = (1 OR 1) = 1
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0, // r0 = a = 15
+        EXPR_LOAD_CONST,
+        1,
+        10,
+        0, // r1 = 10
+        EXPR_CMP_GT,
+        2,
+        0,
+        1, // r2 = (15 > 10) = 1
+        EXPR_LOAD_COL_INT,
+        3,
+        2,
+        0, // r3 = b = 50
+        EXPR_LOAD_CONST,
+        4,
+        100,
+        0, // r4 = 100
+        EXPR_CMP_LT,
+        5,
+        3,
+        4, // r5 = (50 < 100) = 1
+        EXPR_BOOL_AND,
+        6,
+        2,
+        5, // r6 = (1 AND 1) = 1
+        EXPR_LOAD_COL_INT,
+        7,
+        3,
+        0, // r7 = c = 42
+        EXPR_LOAD_CONST,
+        8,
+        42,
+        0, // r8 = 42
+        EXPR_CMP_EQ,
+        9,
+        7,
+        8, // r9 = (42 == 42) = 1
+        EXPR_BOOL_OR,
+        10,
+        6,
+        9, // r10 = (1 OR 1) = 1
     ];
-    let prog = make_prog(&schema,code, 11, 10, vec![]);
+    let prog = make_prog(&schema, code, 11, 10, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
@@ -799,10 +1132,16 @@ fn test_emit_null_opcode() {
     // Verify the program still evaluates and the result register holds
     // the loaded value.
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,  // r0 = col1
-        EXPR_EMIT_NULL, 0, 0, 0,     // emit null — batch-level, no-op here
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0, // r0 = col1
+        EXPR_EMIT_NULL,
+        0,
+        0,
+        0, // emit null — batch-level, no-op here
     ];
-    let prog = make_prog(&schema,code, 1, 0, vec![]);
+    let prog = make_prog(&schema, code, 1, 0, vec![]);
 
     let (val, _, mask, _) = eval_with_emit_via_batch(&prog, &mb, 0);
     // No EMIT instructions ⇒ empty emit list, no null mask bits set.
@@ -819,7 +1158,7 @@ fn test_zero_regs_program() {
 
     // One COPY_COL instruction: copy col 1 → payload 0, type I64=9
     let code = vec![EXPR_COPY_COL, 9, 1, 0];
-    let prog = make_prog(&schema,code, 0, 0, vec![]);
+    let prog = make_prog(&schema, code, 0, 0, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     // With num_regs=0, result should be (0, true) — sentinel
     assert_eq!(val, 0);
@@ -925,11 +1264,15 @@ fn test_is_strictly_non_nullable_str_col() {
     ] {
         let code = vec![*op, 0, 1, 0];
         let prog = make_prog(&nullable_schema, code.clone(), 1, 0, vec![b"x".to_vec()]);
-        assert!(!prog.is_strictly_non_nullable(&nullable_schema),
-            "{_name}: nullable col1 must yield no_nulls=false");
+        assert!(
+            !prog.is_strictly_non_nullable(&nullable_schema),
+            "{_name}: nullable col1 must yield no_nulls=false"
+        );
         let prog = make_prog(&nonnull_schema, code, 1, 0, vec![b"x".to_vec()]);
-        assert!(prog.is_strictly_non_nullable(&nonnull_schema),
-            "{_name}: non-nullable col1 must yield no_nulls=true");
+        assert!(
+            prog.is_strictly_non_nullable(&nonnull_schema),
+            "{_name}: non-nullable col1 must yield no_nulls=true"
+        );
     }
 
     // STR_COL_EQ_COL — both operands matter
@@ -940,11 +1283,15 @@ fn test_is_strictly_non_nullable_str_col() {
     ] {
         let code = vec![*op, 0, 1, 2];
         let prog = make_prog(&nullable_schema, code.clone(), 1, 0, vec![]);
-        assert!(!prog.is_strictly_non_nullable(&nullable_schema),
-            "{_name}: nullable operands must yield no_nulls=false");
+        assert!(
+            !prog.is_strictly_non_nullable(&nullable_schema),
+            "{_name}: nullable operands must yield no_nulls=false"
+        );
         let prog = make_prog(&nonnull_schema, code, 1, 0, vec![]);
-        assert!(prog.is_strictly_non_nullable(&nonnull_schema),
-            "{_name}: non-nullable operands must yield no_nulls=true");
+        assert!(
+            prog.is_strictly_non_nullable(&nonnull_schema),
+            "{_name}: non-nullable operands must yield no_nulls=true"
+        );
     }
 }
 
@@ -955,10 +1302,22 @@ fn test_resolve_column_indices_is_idempotent() {
     // One opcode of each remapped class so a second pass would corrupt the
     // bytecode if the resolved flag were not respected.
     let code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_IS_NULL, 1, 2, 0,
-        EXPR_COPY_COL, 9, 1, 0,
-        EXPR_STR_COL_EQ_COL, 2, 2, 2,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_IS_NULL,
+        1,
+        2,
+        0,
+        EXPR_COPY_COL,
+        9,
+        1,
+        0,
+        EXPR_STR_COL_EQ_COL,
+        2,
+        2,
+        2,
     ];
     let mut prog = ExprProgram::new(code, 3, 0, vec![]);
     prog.resolve_column_indices(&schema);
@@ -1000,37 +1359,41 @@ fn test_string_prefix_ordering() {
 
     // (col_string, const_string, expected_lt)
     let cases: &[(&[u8], &[u8], bool)] = &[
-        (b"abc",   b"abd",    true),  // differ at prefix byte 2
-        (b"abd",   b"abc",    false), // reversed
-        (b"a",     b"b",      true),  // single-char, differ at byte 0
-        (b"abcd",  b"abce",   true),  // differ at prefix byte 3 (boundary)
-        (b"abcde", b"abcdf",  true),  // differ at byte 4 (beyond prefix)
-        (b"hello", b"world",  true),  // differ at byte 0
-        (b"he",    b"hello",  true),  // col shorter, same available bytes
-        (b"hello", b"he",     false), // col longer
-        (b"",      b"a",      true),  // empty < non-empty
-        (b"a",     b"",       false), // non-empty > empty
-        (b"abcd",  b"abcd",   false), // equal 4-byte strings, not lt
-        (b"abcde", b"abcde",  false), // equal 5-byte strings, not lt
+        (b"abc", b"abd", true),      // differ at prefix byte 2
+        (b"abd", b"abc", false),     // reversed
+        (b"a", b"b", true),          // single-char, differ at byte 0
+        (b"abcd", b"abce", true),    // differ at prefix byte 3 (boundary)
+        (b"abcde", b"abcdf", true),  // differ at byte 4 (beyond prefix)
+        (b"hello", b"world", true),  // differ at byte 0
+        (b"he", b"hello", true),     // col shorter, same available bytes
+        (b"hello", b"he", false),    // col longer
+        (b"", b"a", true),           // empty < non-empty
+        (b"a", b"", false),          // non-empty > empty
+        (b"abcd", b"abcd", false),   // equal 4-byte strings, not lt
+        (b"abcde", b"abcde", false), // equal 5-byte strings, not lt
         // LE-vs-BE regression: "ba" > "ac" because 'b'>'a' at byte 0.
         // With LE integer comparison, from_le("ba")=0x6162 < from_le("ac")=0x6361,
         // which would wrongly return true. BE comparison gives the correct false.
-        (b"ba",    b"ac",     false),
-        (b"ac",    b"ba",     true),
-        (b"ba",    b"ab",     false), // byte 0 same first char but reversed positions
-        (b"ab",    b"ba",     true),
+        (b"ba", b"ac", false),
+        (b"ac", b"ba", true),
+        (b"ba", b"ab", false), // byte 0 same first char but reversed positions
+        (b"ab", b"ba", true),
     ];
 
     for &(col_s, const_s, expected_lt) in cases {
         let batch = make_single_string_batch(schema, col_s);
         let mb = batch.as_mem_batch();
         let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
-        let prog = make_prog(&schema,code, 1, 0, vec![const_s.to_vec()]);
+        let prog = make_prog(&schema, code, 1, 0, vec![const_s.to_vec()]);
         let (val, _) = eval_predicate(&prog, &mb, 0);
         assert_eq!(
-            val != 0, expected_lt,
+            val != 0,
+            expected_lt,
             "STR_COL_LT_CONST: {:?} < {:?} expected {}, got {}",
-            col_s, const_s, expected_lt, val != 0
+            col_s,
+            const_s,
+            expected_lt,
+            val != 0
         );
     }
 }
@@ -1040,58 +1403,87 @@ fn test_bool_and_or_three_valued_logic() {
     // Schema: pk(U64), col1(I64), col2(I64) — both nullable
     let schema = make_schema(0, &[8, 9, 9]);
     // null_word bits: bit 0 = col1 null, bit 1 = col2 null
-    let batch = make_int_batch(&schema, &[
-        (1, 1, 0, &[1, 0]), // row0: T, F
-        (2, 1, 0, &[0, 1]), // row1: F, T
-        (3, 1, 2, &[1, 0]), // row2: T, NULL
-        (4, 1, 2, &[0, 0]), // row3: F, NULL
-        (5, 1, 1, &[0, 1]), // row4: NULL, T
-        (6, 1, 1, &[0, 0]), // row5: NULL, F
-        (7, 1, 3, &[0, 0]), // row6: NULL, NULL
-    ]);
+    let batch = make_int_batch(
+        &schema,
+        &[
+            (1, 1, 0, &[1, 0]), // row0: T, F
+            (2, 1, 0, &[0, 1]), // row1: F, T
+            (3, 1, 2, &[1, 0]), // row2: T, NULL
+            (4, 1, 2, &[0, 0]), // row3: F, NULL
+            (5, 1, 1, &[0, 1]), // row4: NULL, T
+            (6, 1, 1, &[0, 0]), // row5: NULL, F
+            (7, 1, 3, &[0, 0]), // row6: NULL, NULL
+        ],
+    );
     let mb = batch.as_mem_batch();
 
     let and_code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_COL_INT, 1, 2, 0,
-        EXPR_BOOL_AND, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_INT,
+        1,
+        2,
+        0,
+        EXPR_BOOL_AND,
+        2,
+        0,
+        1,
     ];
-    let and_prog = make_prog(&schema,and_code, 3, 2, vec![]);
+    let and_prog = make_prog(&schema, and_code, 3, 2, vec![]);
 
     let or_code = vec![
-        EXPR_LOAD_COL_INT, 0, 1, 0,
-        EXPR_LOAD_COL_INT, 1, 2, 0,
-        EXPR_BOOL_OR, 2, 0, 1,
+        EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        EXPR_LOAD_COL_INT,
+        1,
+        2,
+        0,
+        EXPR_BOOL_OR,
+        2,
+        0,
+        1,
     ];
-    let or_prog = make_prog(&schema,or_code, 3, 2, vec![]);
+    let or_prog = make_prog(&schema, or_code, 3, 2, vec![]);
 
     // AND cases
     let (v, n) = eval_predicate(&and_prog, &mb, 0);
-    assert_eq!(v, 0, "T AND F = F"); assert!(!n);
+    assert_eq!(v, 0, "T AND F = F");
+    assert!(!n);
     let (v, n) = eval_predicate(&and_prog, &mb, 1);
-    assert_eq!(v, 0, "F AND T = F"); assert!(!n);
+    assert_eq!(v, 0, "F AND T = F");
+    assert!(!n);
     let (_, n) = eval_predicate(&and_prog, &mb, 2);
     assert!(n, "T AND NULL = NULL");
     let (v, n) = eval_predicate(&and_prog, &mb, 3);
-    assert_eq!(v, 0, "F AND NULL = F"); assert!(!n, "F AND NULL must not be null (SQL 3VL)");
+    assert_eq!(v, 0, "F AND NULL = F");
+    assert!(!n, "F AND NULL must not be null (SQL 3VL)");
     let (_, n) = eval_predicate(&and_prog, &mb, 4);
     assert!(n, "NULL AND T = NULL");
     let (v, n) = eval_predicate(&and_prog, &mb, 5);
-    assert_eq!(v, 0, "NULL AND F = F"); assert!(!n, "NULL AND F must not be null (SQL 3VL)");
+    assert_eq!(v, 0, "NULL AND F = F");
+    assert!(!n, "NULL AND F must not be null (SQL 3VL)");
     let (_, n) = eval_predicate(&and_prog, &mb, 6);
     assert!(n, "NULL AND NULL = NULL");
 
     // OR cases
     let (v, n) = eval_predicate(&or_prog, &mb, 0);
-    assert_eq!(v, 1, "T OR F = T"); assert!(!n);
+    assert_eq!(v, 1, "T OR F = T");
+    assert!(!n);
     let (v, n) = eval_predicate(&or_prog, &mb, 1);
-    assert_eq!(v, 1, "F OR T = T"); assert!(!n);
+    assert_eq!(v, 1, "F OR T = T");
+    assert!(!n);
     let (v, n) = eval_predicate(&or_prog, &mb, 2);
-    assert_eq!(v, 1, "T OR NULL = T"); assert!(!n, "T OR NULL must not be null (SQL 3VL)");
+    assert_eq!(v, 1, "T OR NULL = T");
+    assert!(!n, "T OR NULL must not be null (SQL 3VL)");
     let (_, n) = eval_predicate(&or_prog, &mb, 3);
     assert!(n, "F OR NULL = NULL");
     let (v, n) = eval_predicate(&or_prog, &mb, 4);
-    assert_eq!(v, 1, "NULL OR T = T"); assert!(!n, "NULL OR T must not be null (SQL 3VL)");
+    assert_eq!(v, 1, "NULL OR T = T");
+    assert!(!n, "NULL OR T must not be null (SQL 3VL)");
     let (_, n) = eval_predicate(&or_prog, &mb, 5);
     assert!(n, "NULL OR F = NULL");
     let (_, n) = eval_predicate(&or_prog, &mb, 6);
@@ -1104,26 +1496,30 @@ fn test_string_prefix_le_ordering() {
     let schema = make_schema(0, &[8, 11]);
 
     let cases: &[(&[u8], &[u8], bool)] = &[
-        (b"abc",  b"abc",  true),  // equal → le
-        (b"abc",  b"abd",  true),  // less → le
-        (b"abd",  b"abc",  false), // greater → not le
-        (b"abcd", b"abcd", true),  // equal 4-byte (prefix boundary)
-        (b"he",   b"he",   true),  // equal short
+        (b"abc", b"abc", true),   // equal → le
+        (b"abc", b"abd", true),   // less → le
+        (b"abd", b"abc", false),  // greater → not le
+        (b"abcd", b"abcd", true), // equal 4-byte (prefix boundary)
+        (b"he", b"he", true),     // equal short
         // LE-vs-BE regression: "ba" > "ac", so "ba" <= "ac" must be false.
-        (b"ba",   b"ac",   false),
-        (b"ac",   b"ba",   true),
+        (b"ba", b"ac", false),
+        (b"ac", b"ba", true),
     ];
 
     for &(col_s, const_s, expected_le) in cases {
         let batch = make_single_string_batch(schema, col_s);
         let mb = batch.as_mem_batch();
         let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
-        let prog = make_prog(&schema,code, 1, 0, vec![const_s.to_vec()]);
+        let prog = make_prog(&schema, code, 1, 0, vec![const_s.to_vec()]);
         let (val, _) = eval_predicate(&prog, &mb, 0);
         assert_eq!(
-            val != 0, expected_le,
+            val != 0,
+            expected_le,
             "STR_COL_LE_CONST: {:?} <= {:?} expected {}, got {}",
-            col_s, const_s, expected_le, val != 0
+            col_s,
+            const_s,
+            expected_le,
+            val != 0
         );
     }
 }

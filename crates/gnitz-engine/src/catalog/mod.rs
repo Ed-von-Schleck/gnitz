@@ -27,19 +27,19 @@
 //! enforced.
 
 mod apply_context;
+mod bootstrap;
+mod cache;
+mod ddl;
+mod hooks;
+mod metadata;
+mod partition_lsn;
+mod registry;
+mod store_io;
 mod sys_tables;
 mod types;
 mod utils;
-mod cache;
-mod bootstrap;
-mod hooks;
-mod ddl;
 mod validation;
 mod write_path;
-mod store_io;
-mod registry;
-mod metadata;
-mod partition_lsn;
 
 #[cfg(test)]
 mod tests;
@@ -47,14 +47,14 @@ mod tests;
 use std::fs;
 use std::rc::Rc;
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 use crate::query::{DagEngine, RelationKind, StoreHandle};
-use crate::storage::{Batch, PartitionedTable, Persistence, partition_arena_size, CursorHandle, Table};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::storage::{partition_arena_size, Batch, CursorHandle, PartitionedTable, Persistence, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
-pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_INDICES};
-pub(crate) use sys_tables::{TABLE_TAB_ID, IDX_TAB_ID};
-pub(crate) use sys_tables::{IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDXTAB_PAY_IS_UNIQUE};
+pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES};
+pub(crate) use sys_tables::{IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS};
+pub(crate) use sys_tables::{IDX_TAB_ID, TABLE_TAB_ID};
 pub(crate) use types::ColumnDef;
 
 // Import everything from sys_tables for internal use.
@@ -63,31 +63,27 @@ use sys_tables::*;
 // ── Catalog-internal re-exports — no out-of-catalog consumer (W8). These reach
 //    the submodules through their `use super::*` glob, so they stay re-exported
 //    but scoped to the catalog subtree rather than the crate-wide surface. ─────
-pub(in crate::catalog) use sys_tables::{SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID};
-pub(in crate::catalog) use types::{FkConstraint, FkParentRef};
-pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
+pub(in crate::catalog) use apply_context::ApplyContext;
+pub(in crate::catalog) use cache::CatalogCacheSet;
 #[cfg(test)]
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
-pub(in crate::catalog) use utils::{make_fk_index_name, ingest_batch_into,
-                       schema_dir, table_dir, view_dir, index_dir,
-                       is_index_dir_name, is_table_dir_name, subdir_names,
-                       ensure_dir, fsync_dir,
-                       get_index_key_type,
-                       cursor_read_u64, cursor_read_string,
-                       retract_single_row,
-                       retract_rows_by_view,
-                       retract_rows_in_pk_range};
-#[cfg(test)]
-pub(in crate::catalog) use utils::{parse_qualified_name, make_secondary_index_name};
-pub(in crate::catalog) use cache::CatalogCacheSet;
+pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use sys_tables::SysFamily;
+pub(in crate::catalog) use sys_tables::{PUBLIC_SCHEMA_ID, SYSTEM_SCHEMA_ID};
+pub(in crate::catalog) use types::{FkConstraint, FkParentRef};
+pub(in crate::catalog) use utils::{
+    cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, get_index_key_type, index_dir, ingest_batch_into,
+    is_index_dir_name, is_table_dir_name, make_fk_index_name, retract_rows_by_view, retract_rows_in_pk_range,
+    retract_single_row, schema_dir, subdir_names, table_dir, view_dir,
+};
+#[cfg(test)]
+pub(in crate::catalog) use utils::{make_secondary_index_name, parse_qualified_name};
 pub(in crate::catalog) use write_path::CatalogDeltaSink;
-pub(in crate::catalog) use apply_context::ApplyContext;
 // `BatchBuilder` and the schema-shaping free fns hold no catalog state and live
 // in `storage`; re-export them so catalog's ddl/bootstrap/store callers compile
 // unchanged. (`index_meta_schema_desc`/`INDEX_META_COL_NAMES` have no catalog
 // consumer — `runtime::executor` imports those from `storage` directly.)
-pub(crate) use crate::storage::{BatchBuilder, make_index_schema, project_schema};
+pub(crate) use crate::storage::{make_index_schema, project_schema, BatchBuilder};
 
 // ---------------------------------------------------------------------------
 // CatalogEngine
@@ -164,4 +160,3 @@ pub struct CatalogEngine {
     /// exercise chunk boundaries.
     pub(crate) ddl_scan_chunk_rows: usize,
 }
-

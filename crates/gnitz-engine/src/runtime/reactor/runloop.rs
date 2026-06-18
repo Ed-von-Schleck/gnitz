@@ -42,7 +42,9 @@ impl Reactor {
         }
 
         // SAFETY: spawn ran the future to completion, so Some.
-        let v = out.borrow_mut().take()
+        let v = out
+            .borrow_mut()
+            .take()
             .expect("block_on root task did not produce output");
         v
     }
@@ -69,7 +71,10 @@ impl Reactor {
         // Cost: one try_consume call per worker per tick — just two Acquire
         // loads that return None when the ring is empty.
         if self.inner.futex_waitv_armed.get() {
-            let nw = self.inner.w2m.get()
+            let nw = self
+                .inner
+                .w2m
+                .get()
                 .expect("futex_waitv_armed=true but w2m not attached")
                 .num_workers();
             for w in 0..nw {
@@ -98,9 +103,7 @@ impl Reactor {
         // Skip blocking when there is nothing to drive (slab empty) or when
         // a wake fired during this tick (run_queue non-empty); otherwise we
         // would sleep past the natural completion of the loop.
-        let should_block = block
-            && !self.inner.tasks.borrow().is_empty()
-            && self.inner.run_queue.borrow().is_empty();
+        let should_block = block && !self.inner.tasks.borrow().is_empty() && self.inner.run_queue.borrow().is_empty();
         if should_block {
             // Block indefinitely — outstanding timer SQEs guarantee a CQE
             // will arrive when the soonest timer fires.
@@ -126,7 +129,9 @@ impl Reactor {
         let mut cx = Context::from_waker(&waker);
         match task.future.as_mut().poll(&mut cx) {
             Poll::Ready(()) => {}
-            Poll::Pending   => { self.inner.tasks.borrow_mut().insert(key, task); }
+            Poll::Pending => {
+                self.inner.tasks.borrow_mut().insert(key, task);
+            }
         }
     }
 
@@ -139,7 +144,9 @@ impl Reactor {
         let mut buf = [Cqe::default(); 64];
         loop {
             let n = self.inner.ring.borrow_mut().drain_cqes(&mut buf);
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             for cqe in &buf[..n] {
                 self.dispatch_cqe(*cqe);
             }
@@ -156,5 +163,4 @@ impl Reactor {
             }
         }
     }
-
 }

@@ -1,7 +1,7 @@
-use super::super::plan::{ScalarFuncKind, Plan};
-use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, MAX_COLUMNS};
-use crate::storage::Batch;
+use super::super::plan::{Plan, ScalarFuncKind};
 use crate::expr;
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+use crate::storage::Batch;
 
 fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
     let mut columns = [SchemaColumn::new(0, 0); MAX_COLUMNS];
@@ -12,10 +12,7 @@ fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
     SchemaDescriptor::new(&columns[..col_types.len()], &[pk_index])
 }
 
-fn make_int_batch(
-    schema: &SchemaDescriptor,
-    rows: &[(u64, i64, u64, &[i64])],
-) -> Batch {
+fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -> Batch {
     let mut batch = Batch::with_schema(*schema, rows.len().max(1));
     for &(pk, weight, null_word, cols) in rows {
         batch.extend_pk(pk as u128);
@@ -35,10 +32,7 @@ fn make_int_batch(
 fn test_projection_batch() {
     let in_schema = make_schema(0, &[8, 9, 9]);
     let out_schema = make_schema(0, &[8, 9, 9]);
-    let batch = make_int_batch(&in_schema, &[
-        (1, 1, 0, &[10, 20]),
-        (2, 1, 0, &[30, 40]),
-    ]);
+    let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20]), (2, 1, 0, &[30, 40])]);
 
     let func = ScalarFuncKind::Plan(Plan::from_projection(
         &[2, 1],
@@ -60,16 +54,29 @@ fn test_map_copy_and_emit() {
     let in_schema = make_schema(0, &[8, 9, 9]);
     let out_schema = make_schema(0, &[8, 9, 9]);
 
-    let batch = make_int_batch(&in_schema, &[
-        (1, 1, 0, &[10, 20]),
-    ]);
+    let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20])]);
 
     let code = vec![
-        expr::EXPR_COPY_COL, type_code::I64 as i64, 1, 0,
-        expr::EXPR_LOAD_COL_INT, 0, 1, 0,
-        expr::EXPR_LOAD_COL_INT, 1, 2, 0,
-        expr::EXPR_INT_ADD, 2, 0, 1,
-        expr::EXPR_EMIT, 0, 2, 1,
+        expr::EXPR_COPY_COL,
+        type_code::I64 as i64,
+        1,
+        0,
+        expr::EXPR_LOAD_COL_INT,
+        0,
+        1,
+        0,
+        expr::EXPR_LOAD_COL_INT,
+        1,
+        2,
+        0,
+        expr::EXPR_INT_ADD,
+        2,
+        0,
+        1,
+        expr::EXPR_EMIT,
+        0,
+        2,
+        1,
     ];
     let prog = crate::expr::ExprProgram::new(code, 3, 2, vec![]);
 
@@ -88,9 +95,7 @@ fn test_empty_batch() {
     let schema = make_schema(0, &[8, 9]);
     let batch = Batch::empty(1, 16);
 
-    let func = ScalarFuncKind::Plan(Plan::from_projection(
-        &[1], &[type_code::I64], &schema, &schema,
-    ));
+    let func = ScalarFuncKind::Plan(Plan::from_projection(&[1], &[type_code::I64], &schema, &schema));
     let result = func.evaluate_map_batch(&batch, &schema);
     assert_eq!(result.count, 0);
 }

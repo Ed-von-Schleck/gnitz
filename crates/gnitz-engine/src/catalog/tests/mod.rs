@@ -1,16 +1,16 @@
 mod atomicity_tests;
 mod compound_pk_smoke;
 mod ddl_tests;
-mod fk_tests;
-mod uuid_tests;
-mod index_tests;
-mod engine_tests;
-mod wide_pk_validation;
 mod dir_deletion_tests;
+mod engine_tests;
+mod fk_tests;
+mod index_tests;
 mod reopen_rebuild_tests;
+mod uuid_tests;
+mod wide_pk_validation;
 
-use super::*;
 use super::sys_tables::*;
+use super::*;
 
 use std::fs;
 
@@ -27,38 +27,84 @@ fn temp_dir(name: &str) -> String {
     let owner = std::env::var("USER").unwrap_or_else(|_| std::process::id().to_string());
     let path = std::env::temp_dir()
         .join(format!("gnitz_catalog_test_{owner}_{name}"))
-        .to_str().unwrap().to_owned();
+        .to_str()
+        .unwrap()
+        .to_owned();
     let _ = fs::remove_dir_all(&path);
     path
 }
 
 fn u64_col_def(name: &str) -> ColumnDef {
-    ColumnDef { name: name.into(), type_code: type_code::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
+    ColumnDef {
+        name: name.into(),
+        type_code: type_code::U64,
+        is_nullable: false,
+        fk_table_id: 0,
+        fk_col_idx: 0,
+    }
 }
 fn i64_col_def(name: &str) -> ColumnDef {
-    ColumnDef { name: name.into(), type_code: type_code::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
+    ColumnDef {
+        name: name.into(),
+        type_code: type_code::I64,
+        is_nullable: false,
+        fk_table_id: 0,
+        fk_col_idx: 0,
+    }
 }
 fn u8_col_def(name: &str) -> ColumnDef {
-    ColumnDef { name: name.into(), type_code: type_code::U8, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
+    ColumnDef {
+        name: name.into(),
+        type_code: type_code::U8,
+        is_nullable: false,
+        fk_table_id: 0,
+        fk_col_idx: 0,
+    }
 }
 fn u16_col_def(name: &str) -> ColumnDef {
-    ColumnDef { name: name.into(), type_code: type_code::U16, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
+    ColumnDef {
+        name: name.into(),
+        type_code: type_code::U16,
+        is_nullable: false,
+        fk_table_id: 0,
+        fk_col_idx: 0,
+    }
 }
 fn i32_col_def(name: &str) -> ColumnDef {
-    ColumnDef { name: name.into(), type_code: type_code::I32, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
+    ColumnDef {
+        name: name.into(),
+        type_code: type_code::I32,
+        is_nullable: false,
+        fk_table_id: 0,
+        fk_col_idx: 0,
+    }
 }
 fn str_col_def(name: &str) -> ColumnDef {
-    ColumnDef { name: name.into(), type_code: type_code::STRING, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
+    ColumnDef {
+        name: name.into(),
+        type_code: type_code::STRING,
+        is_nullable: false,
+        fk_table_id: 0,
+        fk_col_idx: 0,
+    }
 }
 fn u128_col_def(name: &str) -> ColumnDef {
-    ColumnDef { name: name.into(), type_code: type_code::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 }
+    ColumnDef {
+        name: name.into(),
+        type_code: type_code::U128,
+        is_nullable: false,
+        fk_table_id: 0,
+        fk_col_idx: 0,
+    }
 }
 
 fn count_records(table: &mut Table) -> usize {
     let mut count = 0;
     let mut c = table.open_cursor();
     while c.cursor.valid {
-        if c.cursor.current_weight > 0 { count += 1; }
+        if c.cursor.current_weight > 0 {
+            count += 1;
+        }
         c.cursor.advance();
     }
     count
@@ -93,8 +139,8 @@ fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64) {
     bb.put_u64(0);
     bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
     bb.put_u64(base_tid as u64); // source_table
-    bb.put_null();               // reindex_col
-    bb.put_null();               // expr_program
+    bb.put_null(); // reindex_col
+    bb.put_null(); // expr_program
     bb.end_row();
     // node 1: Integrate (terminal sink — moves the delta into the view store)
     bb.begin_row(pack_view_pk(vid, 1), 1);
@@ -109,9 +155,9 @@ fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64) {
     let edges_schema = sys_tab_schema(CIRCUIT_EDGES_TAB_ID);
     let mut bb = BatchBuilder::new(edges_schema);
     bb.begin_row(pack_view_pk(vid, 0), 1);
-    bb.put_u64(1);                  // dst_node
+    bb.put_u64(1); // dst_node
     bb.put_u64(gnitz_wire::PORT_IN); // dst_port
-    bb.put_u64(0);                  // src_node
+    bb.put_u64(0); // src_node
     bb.end_row();
     engine.ingest_to_family(CIRCUIT_EDGES_TAB_ID, &bb.finish()).unwrap();
 }
@@ -128,9 +174,8 @@ fn build_view_tab_row(vid: i64, view_name: &str, sql: &str) -> Batch {
     bb.put_string(view_name);
     bb.put_string(sql);
     bb.put_string(""); // cache_directory
-    bb.put_u64(0);     // created_lsn
-    bb.put_u64(0);     // pk_col_idx
+    bb.put_u64(0); // created_lsn
+    bb.put_u64(0); // pk_col_idx
     bb.end_row();
     bb.finish()
 }
-

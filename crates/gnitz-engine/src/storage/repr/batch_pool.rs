@@ -24,12 +24,14 @@ thread_local! {
 /// Take a buffer from the pool (retains previous capacity).
 /// Returns `Vec::new()` (0 capacity) when the pool is empty.
 pub(crate) fn acquire_buf() -> Vec<u8> {
-    BUF_POOL.try_with(|p| {
-        let mut pool = p.take();
-        let buf = pool.pop().unwrap_or_default();
-        p.set(pool);
-        buf
-    }).unwrap_or_default()
+    BUF_POOL
+        .try_with(|p| {
+            let mut pool = p.take();
+            let buf = pool.pop().unwrap_or_default();
+            p.set(pool);
+            buf
+        })
+        .unwrap_or_default()
 }
 
 /// Return a buffer to the pool (clears content, retains capacity).
@@ -38,7 +40,9 @@ pub(crate) fn acquire_buf() -> Vec<u8> {
 /// Uses `try_with` to handle thread-local teardown gracefully.
 pub(crate) fn recycle_buf(mut buf: Vec<u8>) {
     let cap = buf.capacity();
-    if cap == 0 || cap > MAX_RECYCLE_CAPACITY { return; }
+    if cap == 0 || cap > MAX_RECYCLE_CAPACITY {
+        return;
+    }
     buf.clear();
     let _ = BUF_POOL.try_with(|p| {
         let mut pool = p.take();
@@ -85,7 +89,10 @@ mod tests {
         drain_pool();
         let v: Vec<u8> = Vec::with_capacity(MAX_RECYCLE_CAPACITY);
         recycle_buf(v);
-        assert!(acquire_buf().capacity() >= MAX_RECYCLE_CAPACITY, "buffer at limit must be pooled");
+        assert!(
+            acquire_buf().capacity() >= MAX_RECYCLE_CAPACITY,
+            "buffer at limit must be pooled"
+        );
     }
 
     #[test]
@@ -120,7 +127,9 @@ mod tests {
             recycle_buf(vec![0u8; 128]);
         }
         let mut count = 0usize;
-        while acquire_buf().capacity() > 0 { count += 1; }
+        while acquire_buf().capacity() > 0 {
+            count += 1;
+        }
         assert_eq!(count, MAX_POOLED);
     }
 }

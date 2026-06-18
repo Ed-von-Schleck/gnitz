@@ -11,12 +11,7 @@ use super::agg::Accumulator;
 /// PK bytes verbatim because the u128 cannot carry a >16-byte PK region
 /// nor reorder columns to match the output's pk_indices layout.
 #[inline]
-fn emit_pk(
-    output: &mut Batch,
-    output_schema: &SchemaDescriptor,
-    src_pk_bytes: &[u8],
-    group_key: u128,
-) {
+fn emit_pk(output: &mut Batch, output_schema: &SchemaDescriptor, src_pk_bytes: &[u8], group_key: u128) {
     if output_schema.pk_indices().len() > 1 {
         output.extend_pk_bytes(src_pk_bytes);
     } else {
@@ -28,13 +23,7 @@ fn emit_pk(
 /// no value, else its value bits truncated to the column width. Shared by
 /// `emit_reduce_row` and `emit_gather_row` so the two emitters cannot drift.
 #[inline]
-fn emit_agg_col(
-    output: &mut Batch,
-    acc: &Accumulator,
-    out_pi: usize,
-    cs: usize,
-    null_word: &mut u64,
-) {
+fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, cs: usize, null_word: &mut u64) {
     if acc.is_zero() {
         *null_word |= 1u64 << out_pi;
         output.fill_col_zero(out_pi, cs);
@@ -89,8 +78,7 @@ pub(super) fn emit_reduce_row(
                         // back to native LE before copying into the payload region
                         // (a raw copy keeps the flipped sign bit / big-endian order
                         // for signed and wide columns).
-                        let le = gnitz_wire::decode_pk_column_owned(
-                            loc.bytes(input_mb, exemplar_row), col.type_code);
+                        let le = gnitz_wire::decode_pk_column_owned(loc.bytes(input_mb, exemplar_row), col.type_code);
                         output.extend_col(out_pi, &le[..cs]);
                     }
                     ColumnLocator::Payload { slot, .. } => {
@@ -98,10 +86,7 @@ pub(super) fn emit_reduce_row(
                             null_word |= 1u64 << out_pi;
                             output.fill_col_zero(out_pi, cs);
                         } else if gnitz_wire::is_german_string(col.type_code) {
-                            write_string_from_batch(
-                                output, out_pi,
-                                input_mb, exemplar_row, slot as usize,
-                            );
+                            write_string_from_batch(output, out_pi, input_mb, exemplar_row, slot as usize);
                         } else {
                             output.extend_col(out_pi, loc.bytes(input_mb, exemplar_row));
                         }
@@ -175,10 +160,7 @@ pub(super) fn emit_finalized_row(
                             fin_null_mask |= 1u64 << fpi;
                             fin_output.fill_col_zero(fpi, cs);
                         } else if gnitz_wire::is_german_string(raw_schema.columns[src_ci].type_code) {
-                            write_string_from_batch(
-                                fin_output, fpi,
-                                &raw_mb, raw_row, src_pi,
-                            );
+                            write_string_from_batch(fin_output, fpi, &raw_mb, raw_row, src_pi);
                         } else {
                             let src = raw_mb.get_col_ptr(raw_row, src_pi, cs);
                             fin_output.extend_col(fpi, src);
@@ -240,10 +222,7 @@ pub(super) fn emit_gather_row(
                 null_word |= 1u64 << out_pi;
                 output.fill_col_zero(out_pi, cs);
             } else if gnitz_wire::is_german_string(col.type_code) {
-                write_string_from_batch(
-                    output, out_pi,
-                    input_mb, exemplar_row, src_pi,
-                );
+                write_string_from_batch(output, out_pi, input_mb, exemplar_row, src_pi);
             } else {
                 let src = input_mb.get_col_ptr(exemplar_row, src_pi, cs);
                 output.extend_col(out_pi, src);

@@ -31,7 +31,11 @@ pub(crate) trait SortedKeyStream {
 impl SortedKeyStream for ReadCursor {
     #[inline]
     fn key(&self) -> Option<&[u8]> {
-        if self.valid { Some(self.current_pk_bytes()) } else { None }
+        if self.valid {
+            Some(self.current_pk_bytes())
+        } else {
+            None
+        }
     }
     #[inline]
     fn advance_to(&mut self, key: &[u8]) {
@@ -311,11 +315,7 @@ mod tests {
 
     /// Run the intersection skeleton over `M`, recording each triple's key, delta
     /// range, and walked match PKs. `step` is the concrete single-step for `M`.
-    fn run_intersection<M: SortedKeyStream>(
-        delta: &Batch,
-        m: &mut M,
-        step: fn(&mut M),
-    ) -> Vec<Triple> {
+    fn run_intersection<M: SortedKeyStream>(delta: &Batch, m: &mut M, step: fn(&mut M)) -> Vec<Triple> {
         let mut out = Vec::new();
         cogroup_intersection(delta, m, |key, range, m| {
             let mut rows = Vec::new();
@@ -327,11 +327,7 @@ mod tests {
         });
         out
     }
-    fn run_left<M: SortedKeyStream>(
-        delta: &Batch,
-        m: &mut M,
-        step: fn(&mut M),
-    ) -> Vec<Triple> {
+    fn run_left<M: SortedKeyStream>(delta: &Batch, m: &mut M, step: fn(&mut M)) -> Vec<Triple> {
         let mut out = Vec::new();
         cogroup_left(delta, m, |key, range, m| {
             let mut rows = Vec::new();
@@ -359,8 +355,8 @@ mod tests {
         let s = schema();
         let cases: &[CoGroupCase] = &[
             // (delta, match)
-            (&[], &[(1, 1, 10)]),                                  // empty delta
-            (&[(1, 1, 10)], &[]),                                  // empty match
+            (&[], &[(1, 1, 10)]),                                   // empty delta
+            (&[(1, 1, 10)], &[]),                                   // empty match
             (&[(1, 1, 10), (3, 1, 30)], &[(2, 1, 20), (4, 1, 40)]), // no shared
             (&[(1, 1, 10), (2, 1, 20)], &[(1, 1, 11), (2, 1, 22)]), // all shared
             // duplicate keys on each side (multiset delta + multi-payload match)
@@ -403,7 +399,7 @@ mod tests {
         let cases: &[CoGroupCase] = &[
             (&[], &[(1, 1, 10)]),
             (&[(1, 1, 10)], &[]),                                   // every delta key, empty match
-            (&[(1, 1, 10), (3, 1, 30)], &[(2, 1, 20)]),            // match absent for delta keys
+            (&[(1, 1, 10), (3, 1, 30)], &[(2, 1, 20)]),             // match absent for delta keys
             (&[(1, 1, 10), (2, 1, 20)], &[(1, 1, 11), (2, 1, 22)]), // all present
             (
                 &[(1, 1, 10), (1, 1, 11), (5, 1, 50)],
@@ -461,7 +457,10 @@ mod tests {
         let mut ch = CursorHandle::from_owned(std::slice::from_ref(&mb), s);
         // Stale-advance the cursor past several keys before co-grouping.
         ch.cursor_mut().advance_to(&(4u128).to_be_bytes()[8..]);
-        assert!(ch.cursor_mut().valid && ch.cursor_mut().current_key == 4, "precondition: stale at pk=4");
+        assert!(
+            ch.cursor_mut().valid && ch.cursor_mut().current_key == 4,
+            "precondition: stale at pk=4"
+        );
 
         let got = strip(&run_intersection(&delta, ch.cursor_mut(), step_rc));
         assert_eq!(got, want, "stale cursor must be reset by self-positioning");
@@ -474,12 +473,15 @@ mod tests {
     #[test]
     fn union_emits_every_row_both_sides() {
         let cases: &[CoGroupCase] = &[
-            (&[(1, 1, 10), (3, 1, 30), (5, 1, 50)], &[(2, 1, 20), (3, 1, 33), (4, 1, 40)]),
+            (
+                &[(1, 1, 10), (3, 1, 30), (5, 1, 50)],
+                &[(2, 1, 20), (3, 1, 33), (4, 1, 40)],
+            ),
             (&[(1, 1, 1)], &[(2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5), (6, 1, 6)]), // tiny ∪ huge
-            (&[(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5)], &[(3, 1, 9)]),  // huge ∪ tiny
-            (&[(7, 1, 70), (7, 1, 71)], &[(7, 1, 72), (7, 1, 73)]),                    // all equal, multi-payload
-            (&[(1, 1, 1), (2, 1, 2)], &[]),                                            // empty b
-            (&[], &[(1, 1, 1), (2, 1, 2)]),                                            // empty a
+            (&[(1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4), (5, 1, 5)], &[(3, 1, 9)]), // huge ∪ tiny
+            (&[(7, 1, 70), (7, 1, 71)], &[(7, 1, 72), (7, 1, 73)]),                   // all equal, multi-payload
+            (&[(1, 1, 1), (2, 1, 2)], &[]),                                           // empty b
+            (&[], &[(1, 1, 1), (2, 1, 2)]),                                           // empty a
         ];
 
         for (ai, bi) in cases {
@@ -496,8 +498,7 @@ mod tests {
                 o.append_batch(&b, rb.start, rb.end);
             });
 
-            let mut emitted: Vec<u64> =
-                (0..out.count).map(|i| pk_of(out.get_pk_bytes(i))).collect();
+            let mut emitted: Vec<u64> = (0..out.count).map(|i| pk_of(out.get_pk_bytes(i))).collect();
             emitted.sort_unstable();
 
             let mut expected: Vec<u64> = (0..a.count)

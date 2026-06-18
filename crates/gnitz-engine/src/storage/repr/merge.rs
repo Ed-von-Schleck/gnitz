@@ -9,14 +9,14 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
-use super::columnar::{ColumnarSource, SortEntry, PkOrd, with_payload_cmp, with_pk_ord};
+use super::columnar::{with_payload_cmp, with_pk_ord, ColumnarSource, PkOrd, SortEntry};
 // `columnar` as a module path is needed only by the test module's
 // `compare_pk_bytes`/`compare_rows` calls; dispatch uses `with_payload_cmp!`.
 #[cfg(test)]
 use super::columnar;
-use crate::schema::{BlobCache, RowView, SchemaDescriptor, MAX_COLUMNS};
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use crate::foundation::codec::read_u64_le;
+use crate::schema::{BlobCache, RowView, SchemaDescriptor, MAX_COLUMNS};
 use gnitz_wire::is_german_string;
 
 // ---------------------------------------------------------------------------
@@ -61,16 +61,20 @@ thread_local! {
 }
 
 fn acquire_blob_cache() -> BlobCache {
-    BLOB_CACHE_POOL.try_with(|p| {
-        let mut pool = p.take();
-        let cache = pool.pop().unwrap_or_default();
-        p.set(pool);
-        cache
-    }).unwrap_or_default()
+    BLOB_CACHE_POOL
+        .try_with(|p| {
+            let mut pool = p.take();
+            let cache = pool.pop().unwrap_or_default();
+            p.set(pool);
+            cache
+        })
+        .unwrap_or_default()
 }
 
 fn recycle_blob_cache(mut cache: BlobCache) {
-    if cache.capacity() > BLOB_CACHE_RECYCLE_CAP { return; }
+    if cache.capacity() > BLOB_CACHE_RECYCLE_CAP {
+        return;
+    }
     cache.clear();
     let _ = BLOB_CACHE_POOL.try_with(|p| {
         let mut pool = p.take();
@@ -85,7 +89,8 @@ pub(crate) struct BlobCacheGuard(Option<BlobCache>);
 
 impl BlobCacheGuard {
     pub(crate) fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
-        let has_strings = schema.payload_columns()
+        let has_strings = schema
+            .payload_columns()
             .any(|(_, _, col)| is_german_string(col.type_code));
         if has_strings {
             let mut cache = acquire_blob_cache();
@@ -134,7 +139,9 @@ impl<'a> SortedMemBatch<'a> {
 
 impl<'a> std::ops::Deref for SortedMemBatch<'a> {
     type Target = MemBatch<'a>;
-    fn deref(&self) -> &MemBatch<'a> { &self.0 }
+    fn deref(&self) -> &MemBatch<'a> {
+        &self.0
+    }
 }
 
 /// Borrowed slice-view of a `Batch`.
@@ -152,7 +159,7 @@ pub struct MemBatch<'a> {
     // `usize` to match `Batch::offsets`: a large batch's cumulative offset can
     // exceed 4 GB. `as_mem_batch` copies the array verbatim.
     pub offsets: [usize; super::batch::MAX_BATCH_REGIONS],
-    pub pk_stride: u8,       // byte width of the PK region per row
+    pub pk_stride: u8, // byte width of the PK region per row
     pub blob: &'a [u8],
     pub count: usize,
 }
@@ -263,10 +270,7 @@ pub(crate) struct MemBatchCursor {
 
 impl MemBatchCursor {
     pub fn new(count: usize) -> Self {
-        MemBatchCursor {
-            position: 0,
-            count,
-        }
+        MemBatchCursor { position: 0, count }
     }
 
     #[inline]
@@ -333,12 +337,7 @@ impl<'a> DirectWriter<'a> {
     // inline this for free; across the module boundary (release builds have no
     // LTO and default codegen-units) the hint restores it.
     #[inline]
-    pub fn write_row(
-        &mut self,
-        batch: &MemBatch,
-        row: usize,
-        weight: i64,
-    ) {
+    pub fn write_row(&mut self, batch: &MemBatch, row: usize, weight: i64) {
         if weight == 0 {
             return;
         }
@@ -380,16 +379,9 @@ impl<'a> DirectWriter<'a> {
     /// `repr::scatter` entry points (a sibling module since the carve). Restores
     /// the cross-module inlining that same-module placement gave for free.
     #[inline]
-    pub(super) fn write_string_cell(
-        &mut self,
-        payload_col: usize,
-        src_struct: &[u8],
-        src_blob: &[u8],
-        out_row: usize,
-    ) {
-        let dest = crate::schema::relocate_german_string_vec(
-            src_struct, src_blob, self.blob, self.blob_cache.get_mut(),
-        );
+    pub(super) fn write_string_cell(&mut self, payload_col: usize, src_struct: &[u8], src_blob: &[u8], out_row: usize) {
+        let dest =
+            crate::schema::relocate_german_string_vec(src_struct, src_blob, self.blob, self.blob_cache.get_mut());
         let off = out_row * 16;
         self.col_bufs[payload_col][off..off + 16].copy_from_slice(&dest);
     }
@@ -423,19 +415,13 @@ pub(crate) use crate::schema::key::{pack_pk_be, pk_sort_key};
 ///
 /// The `SortedMemBatch` parameter enforces at the call site that every input
 /// is certified sorted by (PK, payload).
-pub(crate) fn merge_batches(
-    batches: &[SortedMemBatch],
-    schema: &SchemaDescriptor,
-    writer: &mut DirectWriter,
-) {
+pub(crate) fn merge_batches(batches: &[SortedMemBatch], schema: &SchemaDescriptor, writer: &mut DirectWriter) {
     let n = batches.len();
     if n == 0 {
         return;
     }
 
-    let mut cursors: Vec<MemBatchCursor> = (0..n)
-        .map(|i| MemBatchCursor::new(batches[i].count))
-        .collect();
+    let mut cursors: Vec<MemBatchCursor> = (0..n).map(|i| MemBatchCursor::new(batches[i].count)).collect();
 
     // Dispatch the payload comparator (outer) then the stride comparator (inner),
     // each monomorphizing its own branch-free copy of the merge loop.
@@ -482,8 +468,7 @@ fn merge_run_pk<RowCmp, PK>(
         match pk_ord.cmp(ba.get_pk_bytes(a.row as usize), bb.get_pk_bytes(b.row as usize)) {
             Ordering::Less => true,
             Ordering::Greater => false,
-            Ordering::Equal =>
-                row_cmp(schema, &ba.0, a.row as usize, &bb.0, b.row as usize) == Ordering::Less,
+            Ordering::Equal => row_cmp(schema, &ba.0, a.row as usize, &bb.0, b.row as usize) == Ordering::Less,
         }
     };
     let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
@@ -543,11 +528,7 @@ fn merge_batches_inner<L, SP, EQ>(
 /// Sort a single batch by (PK, payload) and consolidate: sum weights for
 /// identical (PK, payload) rows, drop ghosts (net weight == 0).
 ///
-pub(crate) fn sort_and_consolidate(
-    batch: &MemBatch,
-    schema: &SchemaDescriptor,
-    writer: &mut DirectWriter,
-) {
+pub(crate) fn sort_and_consolidate(batch: &MemBatch, schema: &SchemaDescriptor, writer: &mut DirectWriter) {
     let n = batch.count;
     if n == 0 {
         return;
@@ -570,29 +551,36 @@ fn sort_consolidate_inner<RowCmp>(
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
     let mut entries: Vec<SortEntry> = (0..n as u32)
-        .map(|i| SortEntry { pk: pk_sort_key(batch.get_pk_bytes(i as usize)), idx: i })
+        .map(|i| SortEntry {
+            pk: pk_sort_key(batch.get_pk_bytes(i as usize)),
+            idx: i,
+        })
         .collect();
 
     entries.sort_unstable_by(|a, b| match a.pk.cmp(&b.pk) {
-        Ordering::Equal => match batch.get_pk_bytes(a.idx as usize)
-            .cmp(batch.get_pk_bytes(b.idx as usize)) {
+        Ordering::Equal => match batch
+            .get_pk_bytes(a.idx as usize)
+            .cmp(batch.get_pk_bytes(b.idx as usize))
+        {
             Ordering::Equal => row_cmp(schema, batch, a.idx as usize, batch, b.idx as usize),
             ord => ord,
         },
         ord => ord,
     });
-    drain_groups_into(n, batch, schema, writer, row_cmp,
+    drain_groups_into(
+        n,
+        batch,
+        schema,
+        writer,
+        row_cmp,
         |p, c| batch.get_pk_bytes(p) == batch.get_pk_bytes(c),
-        |pos| (entries[pos].idx as usize, entries[pos].pk));
+        |pos| (entries[pos].idx as usize, entries[pos].pk),
+    );
 }
 
 /// Weight-fold an already-sorted batch: sum weights for identical (PK, payload)
 /// rows and drop ghosts (net weight == 0). Caller must guarantee sorted input.
-pub(crate) fn fold_sorted(
-    batch: &MemBatch,
-    schema: &SchemaDescriptor,
-    writer: &mut DirectWriter,
-) {
+pub(crate) fn fold_sorted(batch: &MemBatch, schema: &SchemaDescriptor, writer: &mut DirectWriter) {
     let n = batch.count;
     if n == 0 {
         return;
@@ -607,18 +595,19 @@ pub(crate) fn fold_sorted(
 /// `fold_sorted` closure dispatcher: forwards to the single generic drain with
 /// the exact OPK-byte `pk_eq` for every width.
 #[inline]
-fn fold_with<RowCmp>(
-    n: usize,
-    batch: &MemBatch,
-    schema: &SchemaDescriptor,
-    writer: &mut DirectWriter,
-    row_cmp: RowCmp,
-) where
+fn fold_with<RowCmp>(n: usize, batch: &MemBatch, schema: &SchemaDescriptor, writer: &mut DirectWriter, row_cmp: RowCmp)
+where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
-    drain_groups_into(n, batch, schema, writer, row_cmp,
+    drain_groups_into(
+        n,
+        batch,
+        schema,
+        writer,
+        row_cmp,
         |p, c| batch.get_pk_bytes(p) == batch.get_pk_bytes(c),
-        |pos| (pos, pack_pk_be(batch.get_pk_bytes(pos))));
+        |pos| (pos, pack_pk_be(batch.get_pk_bytes(pos))),
+    );
 }
 
 /// Shared pending-group drain loop used by `sort_and_consolidate` and `fold_sorted`.
@@ -676,9 +665,9 @@ fn drain_groups_into<RowCmp, PkEq>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::batch::Batch;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use super::*;
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
     fn make_schema_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -721,7 +710,8 @@ mod tests {
     // Takes &[Batch] so test call sites don't need to construct SortedMemBatch.
     fn run_merge(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
         let mem_batches: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-        let sorted: Vec<SortedMemBatch> = mem_batches.iter()
+        let sorted: Vec<SortedMemBatch> = mem_batches
+            .iter()
             .map(|mb| SortedMemBatch::new_unchecked(mb.clone()))
             .collect();
         let total_rows: usize = sorted.iter().map(|b| b.count).sum();
@@ -767,11 +757,7 @@ mod tests {
     #[test]
     fn test_single_batch_passthrough() {
         let schema = make_schema_i64();
-        let batch = make_batch_i64(&[
-            (10, 1, 100),
-            (20, 1, 200),
-            (30, 1, 300),
-        ]);
+        let batch = make_batch_i64(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]);
 
         let result = run_merge(&[batch], &schema);
         assert_eq!(result.len(), 3);
@@ -783,14 +769,8 @@ mod tests {
     #[test]
     fn test_two_batch_interleave() {
         let schema = make_schema_i64();
-        let b1 = make_batch_i64(&[
-            (10, 1, 100),
-            (30, 1, 300),
-        ]);
-        let b2 = make_batch_i64(&[
-            (20, 1, 200),
-            (40, 1, 400),
-        ]);
+        let b1 = make_batch_i64(&[(10, 1, 100), (30, 1, 300)]);
+        let b2 = make_batch_i64(&[(20, 1, 200), (40, 1, 400)]);
 
         let result = run_merge(&[b1, b2], &schema);
         assert_eq!(result.len(), 4);
@@ -895,9 +875,7 @@ mod tests {
     fn test_many_duplicates_accumulate() {
         let schema = make_schema_i64();
         // 5 separate single-row batches, same (PK, payload) → merged weight = 5
-        let batches: Vec<Batch> = (0..5)
-            .map(|_| make_batch_i64(&[(42, 1, 999)]))
-            .collect();
+        let batches: Vec<Batch> = (0..5).map(|_| make_batch_i64(&[(42, 1, 999)])).collect();
         let result = run_merge(&batches, &schema);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (42, 0, 5, 999));
@@ -906,10 +884,7 @@ mod tests {
     #[test]
     fn test_weight_zero_skip() {
         let schema = make_schema_i64();
-        let b = make_batch_i64(&[
-            (10, 0, 100),
-            (20, 1, 200),
-        ]);
+        let b = make_batch_i64(&[(10, 0, 100), (20, 1, 200)]);
 
         let result = run_merge(&[b], &schema);
         // Zero-weight rows just pass through the merge (they don't get consolidated out
@@ -947,11 +922,7 @@ mod tests {
     fn test_within_cursor_duplicates() {
         // Two rows with the same PK within a single sorted batch
         let schema = make_schema_i64();
-        let b = make_batch_i64(&[
-            (10, 1, 100),
-            (10, 1, 100),
-            (20, 1, 200),
-        ]);
+        let b = make_batch_i64(&[(10, 1, 100), (10, 1, 100), (20, 1, 200)]);
 
         let result = run_merge(&[b], &schema);
         assert_eq!(result.len(), 2);
@@ -963,11 +934,7 @@ mod tests {
     fn test_within_cursor_dup_different_payload() {
         // Two rows with same PK but different payload within one batch
         let schema = make_schema_i64();
-        let b = make_batch_i64(&[
-            (10, 1, 100),
-            (10, 1, 200),
-            (20, 1, 300),
-        ]);
+        let b = make_batch_i64(&[(10, 1, 100), (10, 1, 200), (20, 1, 300)]);
 
         let result = run_merge(&[b], &schema);
         assert_eq!(result.len(), 3);
@@ -1043,11 +1010,7 @@ mod tests {
     #[test]
     fn test_consolidate_already_sorted_no_dups() {
         let schema = make_schema_i64();
-        let b = make_batch_i64(&[
-            (1, 1, 10),
-            (2, 1, 20),
-            (3, 1, 30),
-        ]);
+        let b = make_batch_i64(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
 
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 3);
@@ -1059,11 +1022,7 @@ mod tests {
     #[test]
     fn test_consolidate_unsorted_no_dups() {
         let schema = make_schema_i64();
-        let b = make_batch_i64(&[
-            (3, 1, 30),
-            (1, 1, 10),
-            (2, 1, 20),
-        ]);
+        let b = make_batch_i64(&[(3, 1, 30), (1, 1, 10), (2, 1, 20)]);
 
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 3);
@@ -1077,10 +1036,7 @@ mod tests {
     fn test_consolidate_dup_weight_accumulation() {
         let schema = make_schema_i64();
         // Same (PK, payload) with +1 and +1 → merged to +2
-        let b = make_batch_i64(&[
-            (5, 1, 42),
-            (5, 1, 42),
-        ]);
+        let b = make_batch_i64(&[(5, 1, 42), (5, 1, 42)]);
 
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 1);
@@ -1091,10 +1047,7 @@ mod tests {
     fn test_consolidate_ghost_elimination() {
         let schema = make_schema_i64();
         // Same (PK, payload) with +1 and -1 → ghost, eliminated
-        let b = make_batch_i64(&[
-            (5, 1, 42),
-            (5, -1, 42),
-        ]);
+        let b = make_batch_i64(&[(5, 1, 42), (5, -1, 42)]);
 
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 0);
@@ -1104,10 +1057,7 @@ mod tests {
     fn test_consolidate_same_pk_different_payload() {
         let schema = make_schema_i64();
         // Same PK but different payloads → both survive, sorted by payload
-        let b = make_batch_i64(&[
-            (5, 1, 200),
-            (5, 1, 100),
-        ]);
+        let b = make_batch_i64(&[(5, 1, 200), (5, 1, 100)]);
 
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 2);
@@ -1121,10 +1071,10 @@ mod tests {
         let schema = make_schema_i64();
         // Unsorted: insert + retract + different PKs
         let b = make_batch_i64(&[
-            (10, 1, 100),   // insert pk=10 val=100
-            (5, 1, 50),     // insert pk=5 val=50
-            (10, -1, 100),  // retract pk=10 val=100
-            (5, 1, 50),     // duplicate insert pk=5 val=50
+            (10, 1, 100),  // insert pk=10 val=100
+            (5, 1, 50),    // insert pk=5 val=50
+            (10, -1, 100), // retract pk=10 val=100
+            (5, 1, 50),    // duplicate insert pk=5 val=50
         ]);
 
         let result = run_consolidate(&b, &schema);
@@ -1137,12 +1087,7 @@ mod tests {
     #[test]
     fn test_consolidate_all_cancel() {
         let schema = make_schema_i64();
-        let b = make_batch_i64(&[
-            (1, 1, 10),
-            (1, -1, 10),
-            (2, 3, 20),
-            (2, -3, 20),
-        ]);
+        let b = make_batch_i64(&[(1, 1, 10), (1, -1, 10), (2, 3, 20), (2, -3, 20)]);
 
         let result = run_consolidate(&b, &schema);
         assert_eq!(result.len(), 0);
@@ -1208,7 +1153,6 @@ mod tests {
             assert_eq!(mb.get_pk(i), pk as u128, "row {i} u128");
         }
     }
-
 
     // -----------------------------------------------------------------------
     // Narrow-region merge dispatch: signed / narrow-unsigned / compound
@@ -1310,9 +1254,7 @@ mod tests {
         let opk = |v: i128| opk_pk(&le_bytes_i(v, stride), pk_tc);
         // read_pk_packed is widen_pk_be, which yields the *unsigned* reading of
         // the OPK bytes; the oracle is the same widening of the expected OPK.
-        let expect_pk = |v: i128| {
-            gnitz_wire::widen_pk_be(&opk(v), stride)
-        };
+        let expect_pk = |v: i128| gnitz_wire::widen_pk_be(&opk(v), stride);
 
         // merge_batches: one single-row sorted batch per row.
         let batches: Vec<Batch> = order
@@ -1321,23 +1263,26 @@ mod tests {
             .collect();
         let m = run_merge(&batches, &schema);
         assert_eq!(m.len(), n, "tc={pk_tc} merge len");
-        assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={pk_tc} merge signed order");
+        assert_eq!(
+            m.iter().map(|r| r.3).collect::<Vec<_>>(),
+            expect,
+            "tc={pk_tc} merge signed order"
+        );
         for (i, r) in m.iter().enumerate() {
             assert_eq!(packed(r), expect_pk(vals[i]), "tc={pk_tc} merge pk decode row {i}");
         }
 
         // sort_and_consolidate: one unsorted batch.
-        let unsorted: Vec<(Vec<u8>, i64, i64)> = order
-            .iter()
-            .map(|&idx| (opk(vals[idx]), 1, idx as i64))
-            .collect();
+        let unsorted: Vec<(Vec<u8>, i64, i64)> = order.iter().map(|&idx| (opk(vals[idx]), 1, idx as i64)).collect();
         let c = run_consolidate(&make_batch_bytes(&schema, &unsorted), &schema);
-        assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={pk_tc} consolidate");
+        assert_eq!(
+            c.iter().map(|r| r.3).collect::<Vec<_>>(),
+            expect,
+            "tc={pk_tc} consolidate"
+        );
 
         // fold_sorted: pre-sorted (ascending signed) batch.
-        let sorted_rows: Vec<(Vec<u8>, i64, i64)> = (0..n)
-            .map(|idx| (opk(vals[idx]), 1, idx as i64))
-            .collect();
+        let sorted_rows: Vec<(Vec<u8>, i64, i64)> = (0..n).map(|idx| (opk(vals[idx]), 1, idx as i64)).collect();
         let f = run_fold(&make_batch_bytes(&schema, &sorted_rows), &schema);
         assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={pk_tc} fold");
     }
@@ -1376,13 +1321,11 @@ mod tests {
                 assert_eq!(packed(r), vals[i], "tc={tc} pk decode row {i}");
             }
 
-            let uns: Vec<(Vec<u8>, i64, i64)> =
-                order.iter().map(|&idx| (le(idx), 1, idx as i64)).collect();
+            let uns: Vec<(Vec<u8>, i64, i64)> = order.iter().map(|&idx| (le(idx), 1, idx as i64)).collect();
             let c = run_consolidate(&make_batch_bytes(&schema, &uns), &schema);
             assert_eq!(c.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={tc} consolidate");
 
-            let srt: Vec<(Vec<u8>, i64, i64)> =
-                (0..n).map(|idx| (le(idx), 1, idx as i64)).collect();
+            let srt: Vec<(Vec<u8>, i64, i64)> = (0..n).map(|idx| (le(idx), 1, idx as i64)).collect();
             let f = run_fold(&make_batch_bytes(&schema, &srt), &schema);
             assert_eq!(f.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={tc} fold");
         }
@@ -1565,17 +1508,18 @@ mod tests {
     // `MAX_PK_COLUMNS == 5`, so the 64/80-byte strides use U128 PK columns
     // rather than 8/10 U64 columns.
     const WIDE_24: &[u8] = &[type_code::U64, type_code::U64, type_code::U64];
-    const WIDE_64: &[u8] =
-        &[type_code::U128, type_code::U128, type_code::U128, type_code::U128];
+    const WIDE_64: &[u8] = &[type_code::U128, type_code::U128, type_code::U128, type_code::U128];
     const WIDE_80: &[u8] = &[
-        type_code::U128, type_code::U128, type_code::U128,
-        type_code::U128, type_code::U128,
+        type_code::U128,
+        type_code::U128,
+        type_code::U128,
+        type_code::U128,
+        type_code::U128,
     ];
 
     /// Schema with the given PK column type codes + one I64 payload.
     fn pk_payload_schema(tcs: &[u8]) -> SchemaDescriptor {
-        let mut cols: Vec<SchemaColumn> =
-            tcs.iter().map(|&t| SchemaColumn::new(t, 0)).collect();
+        let mut cols: Vec<SchemaColumn> = tcs.iter().map(|&t| SchemaColumn::new(t, 0)).collect();
         cols.push(SchemaColumn::new(type_code::I64, 0));
         let pk: Vec<u32> = (0..tcs.len() as u32).collect();
         SchemaDescriptor::new(&cols, &pk)
@@ -1656,15 +1600,9 @@ mod tests {
             .collect()
     }
 
-    fn run_merge_wide(
-        batches: &[Batch],
-        schema: &SchemaDescriptor,
-    ) -> Vec<(Vec<u8>, i64, i64)> {
+    fn run_merge_wide(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
         let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
-        let sorted: Vec<SortedMemBatch> = mem
-            .iter()
-            .map(|mb| SortedMemBatch::new_unchecked(mb.clone()))
-            .collect();
+        let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
         let total: usize = sorted.iter().map(|b| b.count).sum();
         writer_run(schema, total, |w| {
             merge_batches(&sorted, schema, w);
@@ -1674,10 +1612,7 @@ mod tests {
     /// Byte-form consolidation harness: returns `(pk_bytes, weight, i64_payload)`
     /// per output row. Width-agnostic (sibling of the packed-`u64` `run_consolidate`
     /// above, for PK shapes whose bytes don't fit a single `u64`).
-    fn run_consolidate_bytes(
-        b: &Batch,
-        schema: &SchemaDescriptor,
-    ) -> Vec<(Vec<u8>, i64, i64)> {
+    fn run_consolidate_bytes(b: &Batch, schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
         let mb = b.as_mem_batch();
         let total = mb.count;
         writer_run(schema, total, |w| {
@@ -1685,10 +1620,7 @@ mod tests {
         })
     }
 
-    fn run_fold_wide(
-        b: &Batch,
-        schema: &SchemaDescriptor,
-    ) -> Vec<(Vec<u8>, i64, i64)> {
+    fn run_fold_wide(b: &Batch, schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
         let mb = b.as_mem_batch();
         let total = mb.count;
         writer_run(schema, total, |w| {
@@ -1698,9 +1630,7 @@ mod tests {
 
     #[test]
     fn wide_nway_merge_ordering_low16_collision() {
-        for (tcs, want_stride) in
-            [(WIDE_24, 24usize), (WIDE_64, 64), (WIDE_80, 80)]
-        {
+        for (tcs, want_stride) in [(WIDE_24, 24usize), (WIDE_64, 64), (WIDE_80, 80)] {
             let s = pk_payload_schema(tcs);
             assert_eq!(s.pk_stride() as usize, want_stride);
             // A < B < C < D < E by compare_pk_bytes. B,C,D share col0
@@ -1716,7 +1646,11 @@ mod tests {
             let b2 = make_batch_bytes(&s, &[(b.clone(), 1, 1), (e.clone(), 1, 4)]);
             let b3 = make_batch_bytes(&s, &[(d.clone(), 1, 3)]);
             let out = run_merge_wide(&[b1, b2, b3], &s);
-            assert_eq!(out.len(), 5, "stride={want_stride}: distinct low16-colliding PKs must not fold");
+            assert_eq!(
+                out.len(),
+                5,
+                "stride={want_stride}: distinct low16-colliding PKs must not fold"
+            );
             assert_eq!(
                 out.iter().map(|r| r.2).collect::<Vec<_>>(),
                 vec![0, 1, 2, 3, 4],
@@ -1832,10 +1766,7 @@ mod tests {
         let p0 = wpk(tcs, 1, 0);
         let p1 = wpk(tcs, 1, 1);
         let p2 = wpk(tcs, 1, 2);
-        let b = make_batch_bytes(
-            &s,
-            &[(p0.clone(), 1, 0), (p1.clone(), 1, 0), (p2.clone(), 1, 5)],
-        );
+        let b = make_batch_bytes(&s, &[(p0.clone(), 1, 0), (p1.clone(), 1, 0), (p2.clone(), 1, 5)]);
         let out = run_fold_wide(&b, &s);
         assert_eq!(out.len(), 3, "distinct prefix-colliding PKs must not fold");
         assert_eq!(out[0], (p0, 1, 0));
@@ -1847,7 +1778,12 @@ mod tests {
         let r = wpk(tcs, 3, 3);
         let b2 = make_batch_bytes(
             &s,
-            &[(q.clone(), 1, 7), (q.clone(), 1, 7), (r.clone(), 1, -1), (r.clone(), -1, -1)],
+            &[
+                (q.clone(), 1, 7),
+                (q.clone(), 1, 7),
+                (r.clone(), 1, -1),
+                (r.clone(), -1, -1),
+            ],
         );
         let out2 = run_fold_wide(&b2, &s);
         assert_eq!(out2, vec![(q, 2, 7)]);
@@ -1866,8 +1802,8 @@ mod tests {
             (k2.clone(), 1, 30),
             (k0.clone(), 1, 10),
             (k1.clone(), 1, 20),
-            (k0.clone(), 2, 10),       // consolidates with row 1
-            (k2.clone(), -1, 30),      // ghost-cancels row 0
+            (k0.clone(), 2, 10),  // consolidates with row 1
+            (k2.clone(), -1, 30), // ghost-cancels row 0
         ];
         let out = run_consolidate_bytes(&make_batch_bytes(&s, &rows), &s);
         // (4,4,4) cancels out; (1,1,0) sums to weight 3.
@@ -1904,12 +1840,12 @@ mod tests {
         let mb = b.as_mem_batch();
         let n = mb.count;
         let mut idx: Vec<usize> = (0..n).collect();
-        idx.sort_by(|&x, &y| {
-            match columnar::compare_pk_bytes(mb.get_pk_bytes(x), mb.get_pk_bytes(y)) {
+        idx.sort_by(
+            |&x, &y| match columnar::compare_pk_bytes(mb.get_pk_bytes(x), mb.get_pk_bytes(y)) {
                 Ordering::Equal => columnar::compare_rows(schema, &mb, x, &mb, y),
                 ord => ord,
-            }
-        });
+            },
+        );
         let mut out = Vec::new();
         let mut i = 0;
         while i < n {
@@ -1917,8 +1853,7 @@ mod tests {
             let mut w = mb.get_weight(head);
             i += 1;
             while i < n
-                && columnar::compare_pk_bytes(mb.get_pk_bytes(head), mb.get_pk_bytes(idx[i]))
-                    == Ordering::Equal
+                && columnar::compare_pk_bytes(mb.get_pk_bytes(head), mb.get_pk_bytes(idx[i])) == Ordering::Equal
                 && columnar::compare_rows(schema, &mb, head, &mb, idx[i]) == Ordering::Equal
             {
                 w += mb.get_weight(idx[i]);
@@ -1933,10 +1868,7 @@ mod tests {
         out
     }
 
-    fn assert_consolidate_matches_reference(
-        schema: &SchemaDescriptor,
-        rows: &[(Vec<u8>, i64, i64)],
-    ) {
+    fn assert_consolidate_matches_reference(schema: &SchemaDescriptor, rows: &[(Vec<u8>, i64, i64)]) {
         let b = make_batch_bytes(schema, rows);
         let got = run_consolidate_bytes(&b, schema);
         let want = consolidate_reference(&b, schema);
@@ -1953,7 +1885,9 @@ mod tests {
     }
 
     /// OPK bytes for a single I64 PK column (BE with the sign bit flipped).
-    fn i64_pk(v: i64) -> Vec<u8> { opk_pk(&v.to_le_bytes(), type_code::I64) }
+    fn i64_pk(v: i64) -> Vec<u8> {
+        opk_pk(&v.to_le_bytes(), type_code::I64)
+    }
 
     /// Decode a single-column OPK PK back to its native I64 value.
     fn i64_from_opk(opk: &[u8]) -> i64 {
@@ -1970,10 +1904,10 @@ mod tests {
             (i64_pk(5), 1, 50),
             (i64_pk(-1), 1, 10),
             (i64_pk(i64::MIN), 1, 99),
-            (i64_pk(-1), 2, 10),       // folds with row 1 → weight 3
+            (i64_pk(-1), 2, 10), // folds with row 1 → weight 3
             (i64_pk(i64::MAX), 1, 7),
             (i64_pk(0), 1, 0),
-            (i64_pk(5), -1, 50),       // ghost-cancels row 0
+            (i64_pk(5), -1, 50), // ghost-cancels row 0
             (i64_pk(-100), 1, 3),
         ];
         assert_consolidate_matches_reference(&s, &rows);
@@ -1998,7 +1932,7 @@ mod tests {
         let rows = vec![
             (mk(2, 1), 1, 20),
             (mk(1, u64::MAX), 1, 10),
-            (mk(1, u64::MAX), 1, 10),  // fold → weight 2
+            (mk(1, u64::MAX), 1, 10), // fold → weight 2
             (mk(1, 5), 1, 11),
         ];
         assert_consolidate_matches_reference(&s, &rows);
@@ -2016,10 +1950,10 @@ mod tests {
         };
         let rows = vec![
             (mk(1, 0), 1, 1),
-            (mk(1, -5), 1, 2),         // negative second column sorts before 0
+            (mk(1, -5), 1, 2), // negative second column sorts before 0
             (mk(1, i32::MIN), 1, 3),
             (mk(0, i32::MAX), 1, 4),
-            (mk(1, -5), -1, 2),        // ghost
+            (mk(1, -5), -1, 2), // ghost
         ];
         assert_consolidate_matches_reference(&s, &rows);
     }
@@ -2035,8 +1969,8 @@ mod tests {
             (wpk(tcs, 4, 4), 1, 30),
             (wpk(tcs, 1, 2), 1, 20),
             (wpk(tcs, 1, 0), 1, 10),
-            (wpk(tcs, 1, 0), 2, 10),   // fold
-            (wpk(tcs, 4, 4), -1, 30),  // ghost
+            (wpk(tcs, 1, 0), 2, 10),  // fold
+            (wpk(tcs, 4, 4), -1, 30), // ghost
             (wpk(tcs, 1, 9), 1, 99),
         ];
         assert_consolidate_matches_reference(&s, &rows);

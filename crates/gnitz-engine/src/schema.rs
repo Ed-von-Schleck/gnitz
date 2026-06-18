@@ -7,10 +7,10 @@ use rustc_hash::FxHashMap;
 use crate::foundation::codec::{read_u32_le, read_u64_le};
 
 pub(crate) use gnitz_wire::type_code;
-pub(crate) use gnitz_wire::{is_fixed_int, is_routable_int, is_signed_int};
 pub(crate) use gnitz_wire::TypeCode;
-pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
 pub use gnitz_wire::MAX_COLUMNS;
+pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
+pub(crate) use gnitz_wire::{is_fixed_int, is_routable_int, is_signed_int};
 pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 /// Order-preserving primary-key (OPK) primitives — encode/compare/route/pack
@@ -34,7 +34,12 @@ pub struct SchemaColumn {
 impl SchemaColumn {
     pub const fn new(type_code: u8, nullable: u8) -> Self {
         let is_signed = is_signed_int(type_code) as u8;
-        SchemaColumn { type_code, size: type_size(type_code), nullable, is_signed }
+        SchemaColumn {
+            type_code,
+            size: type_size(type_code),
+            nullable,
+            is_signed,
+        }
     }
 
     /// On-disk byte width of one cell of this column. Derived from `type_code`
@@ -86,9 +91,7 @@ pub(crate) fn assemble_wide_pk(
         ));
     }
     if stride > MAX_PK_BYTES {
-        return Err(format!(
-            "wide PK stride {stride} exceeds MAX_PK_BYTES {MAX_PK_BYTES}"
-        ));
+        return Err(format!("wide PK stride {stride} exceeds MAX_PK_BYTES {MAX_PK_BYTES}"));
     }
     let needed = stride - NARROW_PK_MAX_BYTES;
     if extra.len() < needed {
@@ -195,10 +198,7 @@ pub struct SchemaDescriptor {
     pub columns: [SchemaColumn; MAX_COLUMNS],
 }
 
-const fn compute_mappings(
-    num_columns: usize,
-    pk_indices: &[u32],
-) -> ([u8; MAX_COLUMNS], [u8; MAX_COLUMNS]) {
+const fn compute_mappings(num_columns: usize, pk_indices: &[u32]) -> ([u8; MAX_COLUMNS], [u8; MAX_COLUMNS]) {
     let mut payload_mapping = [PAYLOAD_MAPPING_PK_SENTINEL; MAX_COLUMNS];
     let mut payload_to_ci = [PAYLOAD_MAPPING_PK_SENTINEL; MAX_COLUMNS];
     let mut pi: u8 = 0;
@@ -243,11 +243,7 @@ impl SchemaDescriptor {
     /// every derived schema (join/map/reduce/projection output, built via `new`)
     /// gets the full-PK default and is never table-key-routed.
     #[track_caller]
-    pub const fn new_with_dist(
-        cols: &[SchemaColumn],
-        pk_indices: &[u32],
-        dist_prefix_len: usize,
-    ) -> Self {
+    pub const fn new_with_dist(cols: &[SchemaColumn], pk_indices: &[u32], dist_prefix_len: usize) -> Self {
         assert!(cols.len() <= MAX_COLUMNS, "new: too many columns");
         assert!(
             pk_indices.len() <= MAX_PK_COLUMNS,
@@ -274,20 +270,14 @@ impl SchemaDescriptor {
         let mut dist_stride_acc: u16 = 0;
         let mut k = 0;
         while k < pk_indices.len() {
-            assert!(
-                (pk_indices[k] as usize) < cols.len(),
-                "new: pk index out of range",
-            );
+            assert!((pk_indices[k] as usize) < cols.len(), "new: pk index out of range",);
             // Duplicate-PK guard: a duplicate would desynchronise
             // num_payload_cols (counts the dup twice), pk_columns
             // (yields duplicates), and pk_stride (double-counts).
             // O(pk_count²) over pk_count ≤ MAX_PK_COLUMNS — negligible.
             let mut j = 0;
             while j < k {
-                assert!(
-                    pk_indices[j] != pk_indices[k],
-                    "new: duplicate PK column index",
-                );
+                assert!(pk_indices[j] != pk_indices[k], "new: duplicate PK column index",);
                 j += 1;
             }
             // STRING and BLOB store a German-string struct whose heap_offset
@@ -327,10 +317,7 @@ impl SchemaDescriptor {
             }
             k += 1;
         }
-        assert!(
-            stride_acc <= u8::MAX as u16,
-            "new: pk_stride exceeds u8 width",
-        );
+        assert!(stride_acc <= u8::MAX as u16, "new: pk_stride exceeds u8 width",);
         // `assemble_wide_pk` and other wide-path routines allocate
         // `[0u8; MAX_PK_BYTES]` and index up to `stride`; a stride in
         // (MAX_PK_BYTES, 255] would construct here but panic at runtime.
@@ -339,8 +326,7 @@ impl SchemaDescriptor {
             "new: pk_stride exceeds MAX_PK_BYTES",
         );
         let pk_stride = stride_acc as u8;
-        let (payload_mapping, payload_to_ci) =
-            compute_mappings(cols.len(), pk_indices);
+        let (payload_mapping, payload_to_ci) = compute_mappings(cols.len(), pk_indices);
         let payload_cmp = compute_payload_cmp(cols, &payload_mapping);
         SchemaDescriptor {
             num_columns: cols.len() as u32,
@@ -395,9 +381,11 @@ impl SchemaDescriptor {
     /// schema.pk_columns()` without redefining the iterator shape.
     #[inline]
     pub fn pk_columns(&self) -> impl Iterator<Item = (usize, usize, &SchemaColumn)> {
-        self.pk_indices().iter().copied().enumerate().map(move |(ord, ci)| {
-            (ord, ci as usize, &self.columns[ci as usize])
-        })
+        self.pk_indices()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(move |(ord, ci)| (ord, ci as usize, &self.columns[ci as usize]))
     }
 
     /// Total bytes per row of the PK region. Precomputed in `new()`;
@@ -596,7 +584,9 @@ impl SchemaDescriptor {
         debug_assert!(self.is_pk_col(col_idx), "pk_byte_offset: col_idx must be a pk column");
         let mut off: u16 = 0;
         for (_, pk_ci, c) in self.pk_columns() {
-            if pk_ci == col_idx { return off as u8; }
+            if pk_ci == col_idx {
+                return off as u8;
+            }
             off += c.size() as u16;
         }
         unreachable!("pk_byte_offset: col_idx is a pk column but not found in pk_columns()");
@@ -624,8 +614,16 @@ impl SchemaDescriptor {
         let size = self.columns[col_idx].size();
         let type_code = self.columns[col_idx].type_code;
         match self.try_payload_idx(col_idx) {
-            None => ColumnLocator::Pk { byte_off: self.pk_byte_offset(col_idx), size, type_code },
-            Some(slot) => ColumnLocator::Payload { slot: slot as u8, size, type_code },
+            None => ColumnLocator::Pk {
+                byte_off: self.pk_byte_offset(col_idx),
+                size,
+                type_code,
+            },
+            Some(slot) => ColumnLocator::Payload {
+                slot: slot as u8,
+                size,
+                type_code,
+            },
         }
     }
 }
@@ -674,11 +672,15 @@ const _: () = assert!(
 impl ColumnLocator {
     #[inline]
     pub(crate) fn size(&self) -> usize {
-        match *self { ColumnLocator::Pk { size, .. } | ColumnLocator::Payload { size, .. } => size as usize }
+        match *self {
+            ColumnLocator::Pk { size, .. } | ColumnLocator::Payload { size, .. } => size as usize,
+        }
     }
 
     #[inline]
-    pub(crate) fn is_pk(&self) -> bool { matches!(self, ColumnLocator::Pk { .. }) }
+    pub(crate) fn is_pk(&self) -> bool {
+        matches!(self, ColumnLocator::Pk { .. })
+    }
 
     #[inline]
     pub(crate) fn type_code(&self) -> u8 {
@@ -712,8 +714,7 @@ impl ColumnLocator {
                 let o = byte_off as usize;
                 &mb.get_pk_bytes(row)[o..o + size as usize]
             }
-            ColumnLocator::Payload { slot, size, .. } =>
-                mb.get_col_ptr(row, slot as usize, size as usize),
+            ColumnLocator::Payload { slot, size, .. } => mb.get_col_ptr(row, slot as usize, size as usize),
         }
     }
 
@@ -723,10 +724,17 @@ impl ColumnLocator {
     #[inline]
     pub(crate) fn native_key<'b>(&self, mb: &impl RowView<'b>, row: usize) -> u128 {
         match *self {
-            ColumnLocator::Pk { byte_off, size, type_code } =>
-                pk_native_key(mb.get_pk_bytes(row), byte_off as usize, size as usize, type_code),
-            ColumnLocator::Payload { slot, size, type_code } =>
-                payload_native_key(mb.get_col_ptr(row, slot as usize, size as usize), 0, size as usize, type_code),
+            ColumnLocator::Pk {
+                byte_off,
+                size,
+                type_code,
+            } => pk_native_key(mb.get_pk_bytes(row), byte_off as usize, size as usize, type_code),
+            ColumnLocator::Payload { slot, size, type_code } => payload_native_key(
+                mb.get_col_ptr(row, slot as usize, size as usize),
+                0,
+                size as usize,
+                type_code,
+            ),
         }
     }
 
@@ -741,10 +749,15 @@ impl ColumnLocator {
     #[inline]
     pub(crate) fn route_key<'b>(&self, mb: &impl RowView<'b>, row: usize) -> u128 {
         match *self {
-            ColumnLocator::Pk { byte_off, size, .. } =>
-                pk_route_key(mb.get_pk_bytes(row), byte_off as usize, size as usize),
-            ColumnLocator::Payload { slot, size, type_code } =>
-                payload_route_key(mb.get_col_ptr(row, slot as usize, size as usize), 0, size as usize, type_code),
+            ColumnLocator::Pk { byte_off, size, .. } => {
+                pk_route_key(mb.get_pk_bytes(row), byte_off as usize, size as usize)
+            }
+            ColumnLocator::Payload { slot, size, type_code } => payload_route_key(
+                mb.get_col_ptr(row, slot as usize, size as usize),
+                0,
+                size as usize,
+                type_code,
+            ),
         }
     }
 }
@@ -783,18 +796,23 @@ pub(crate) struct IndexKeySpec {
 impl IndexKeySpec {
     /// `cols` is the circuit's source column list (owner-schema indices);
     /// `idx_schema` supplies the promoted leading columns the span encodes at.
-    pub(crate) fn new(
-        cols: &[u32], owner: &SchemaDescriptor, idx_schema: &SchemaDescriptor,
-    ) -> Self {
+    pub(crate) fn new(cols: &[u32], owner: &SchemaDescriptor, idx_schema: &SchemaDescriptor) -> Self {
         debug_assert!(!cols.is_empty() && cols.len() <= gnitz_wire::PK_LIST_MAX_COLS);
-        let mut locators = [ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 };
-                            gnitz_wire::PK_LIST_MAX_COLS];
+        let mut locators = [ColumnLocator::Pk {
+            byte_off: 0,
+            size: 0,
+            type_code: 0,
+        }; gnitz_wire::PK_LIST_MAX_COLS];
         let mut idx_cols = [SchemaColumn::new(0, 0); gnitz_wire::PK_LIST_MAX_COLS];
         for (i, &c) in cols.iter().enumerate() {
             locators[i] = owner.locate(c as usize);
             idx_cols[i] = idx_schema.columns[i];
         }
-        IndexKeySpec { n: cols.len() as u8, locators, idx_cols }
+        IndexKeySpec {
+            n: cols.len() as u8,
+            locators,
+            idx_cols,
+        }
     }
 
     /// The promoted index columns of the leading span, in index order.
@@ -827,16 +845,21 @@ impl IndexKeySpec {
     pub(crate) fn write_span<'b>(&self, mb: &impl RowView<'b>, row: usize, dst: &mut [u8]) -> bool {
         let mut off = 0;
         for (loc, col) in self.locators[..self.n as usize].iter().zip(self.idx_cols()) {
-            if loc.is_null(mb, row) { return false; }
-            let src_w = loc.size();             // source column width
+            if loc.is_null(mb, row) {
+                return false;
+            }
+            let src_w = loc.size(); // source column width
             let target_w = col.size() as usize; // promoted index column width
             let native = loc.native_key(mb, row); // zero-extended native LE in u128
-            // Sign-extends a signed source / zero-extends an unsigned source from
-            // `src_w`, then OPK-encodes at the promoted target. `src_w == target_w`
-            // (no promotion, e.g. U128) reduces to `encode_pk_column`.
+                                                  // Sign-extends a signed source / zero-extends an unsigned source from
+                                                  // `src_w`, then OPK-encodes at the promoted target. `src_w == target_w`
+                                                  // (no promotion, e.g. U128) reduces to `encode_pk_column`.
             gnitz_wire::encode_pk_column_promoted(
-                &native.to_le_bytes()[..src_w], loc.type_code(), col.type_code,
-                &mut dst[off..off + target_w]);
+                &native.to_le_bytes()[..src_w],
+                loc.type_code(),
+                col.type_code,
+                &mut dst[off..off + target_w],
+            );
             off += target_w;
         }
         true
@@ -849,12 +872,14 @@ impl IndexKeySpec {
     /// reused scratch — free in the common same-circuit loop), so callers may
     /// slice `out.bytes[..stride]` as the span zero-padded to any wider stride.
     /// A NULL-skipped row returns `false` with `out` unchanged in meaning.
-    pub(crate) fn key_bytes<'b>(
-        &self, mb: &impl RowView<'b>, row: usize, out: &mut key::PkBuf,
-    ) -> bool {
-        if !self.write_span(mb, row, &mut out.bytes) { return false; }
+    pub(crate) fn key_bytes<'b>(&self, mb: &impl RowView<'b>, row: usize, out: &mut key::PkBuf) -> bool {
+        if !self.write_span(mb, row, &mut out.bytes) {
+            return false;
+        }
         let len = self.key_size();
-        if (out.len as usize) > len { out.bytes[len..out.len as usize].fill(0); }
+        if (out.len as usize) > len {
+            out.bytes[len..out.len as usize].fill(0);
+        }
         out.len = len as u8;
         true
     }
@@ -868,17 +893,24 @@ impl IndexKeySpec {
     /// by construction. Bytes past the prefix stay zero (the source-PK suffix
     /// is not part of the leading-column prefix).
     pub(crate) fn seek_prefix(&self, natives: &[u128]) -> ([u8; MAX_PK_BYTES], usize) {
-        debug_assert_eq!(natives.len(), self.n as usize,
-            "seek_prefix: one native value per spec column");
+        debug_assert_eq!(
+            natives.len(),
+            self.n as usize,
+            "seek_prefix: one native value per spec column"
+        );
         let mut opk = [0u8; MAX_PK_BYTES];
         let mut off = 0;
-        for (native, (loc, col)) in natives.iter()
+        for (native, (loc, col)) in natives
+            .iter()
             .zip(self.locators[..self.n as usize].iter().zip(self.idx_cols()))
         {
             let size = col.size() as usize;
             gnitz_wire::encode_pk_column_promoted(
-                &native.to_le_bytes()[..loc.size()], loc.type_code(), col.type_code,
-                &mut opk[off..off + size]);
+                &native.to_le_bytes()[..loc.size()],
+                loc.type_code(),
+                col.type_code,
+                &mut opk[off..off + size],
+            );
             off += size;
         }
         (opk, off)
@@ -940,7 +972,12 @@ pub(crate) const fn type_size(tc: u8) -> u8 {
 
 #[inline(always)]
 pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
-    debug_assert!(bytes.len() >= size, "read_signed: buffer too short ({} < {})", bytes.len(), size);
+    debug_assert!(
+        bytes.len() >= size,
+        "read_signed: buffer too short ({} < {})",
+        bytes.len(),
+        size
+    );
     match size {
         1 => bytes[0] as i8 as i64,
         2 => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64,
@@ -952,7 +989,12 @@ pub(crate) fn read_signed(bytes: &[u8], size: usize) -> i64 {
 
 #[inline(always)]
 pub(crate) fn read_unsigned(bytes: &[u8], size: usize) -> u64 {
-    debug_assert!(bytes.len() >= size, "read_unsigned: buffer too short ({} < {})", bytes.len(), size);
+    debug_assert!(
+        bytes.len() >= size,
+        "read_unsigned: buffer too short ({} < {})",
+        bytes.len(),
+        size
+    );
     match size {
         1 => bytes[0] as u64,
         2 => u16::from_le_bytes(bytes[..2].try_into().unwrap()) as u64,
@@ -984,7 +1026,8 @@ pub(crate) fn pk_route_key(pk_bytes: &[u8], offset: usize, col_size: usize) -> u
     debug_assert!(
         pk_bytes.len() >= offset + col_size,
         "pk_route_key: buffer too short ({} < {})",
-        pk_bytes.len(), offset + col_size,
+        pk_bytes.len(),
+        offset + col_size,
     );
     gnitz_wire::widen_pk_be(&pk_bytes[offset..offset + col_size], col_size)
 }
@@ -995,22 +1038,24 @@ pub(crate) fn pk_route_key(pk_bytes: &[u8], offset: usize, col_size: usize) -> u
 /// U128/UUID are unsigned (OPK == native). Float/String/Blob have no PK
 /// counterpart; they keep a zero-extended low-8-byte key.
 #[inline]
-pub(crate) fn payload_route_key(
-    col_data: &[u8],
-    offset: usize,
-    col_size: usize,
-    type_code_val: u8,
-) -> u128 {
+pub(crate) fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
     debug_assert!(
         col_data.len() >= offset + col_size,
         "payload_route_key: buffer too short ({} < {})",
-        col_data.len(), offset + col_size,
+        col_data.len(),
+        offset + col_size,
     );
     let src = &col_data[offset..offset + col_size];
     match TypeCode::from_validated_u8(type_code_val) {
         TypeCode::U128 | TypeCode::UUID => u128::from_le_bytes(src.try_into().unwrap()),
-        TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16
-        | TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64
+        TypeCode::U8
+        | TypeCode::I8
+        | TypeCode::U16
+        | TypeCode::I16
+        | TypeCode::U32
+        | TypeCode::I32
+        | TypeCode::U64
+        | TypeCode::I64
         | TypeCode::I128 => {
             let mut opk = [0u8; 16];
             gnitz_wire::encode_pk_column(src, type_code_val, &mut opk[..col_size]);
@@ -1031,16 +1076,12 @@ pub(crate) fn payload_route_key(
 /// `offset + col_size` must lie within the OPK PK region (`pk_bytes`); a
 /// mismatched `col_size` slices past the column and panics.
 #[inline]
-pub(crate) fn pk_native_key(
-    pk_bytes: &[u8],
-    offset: usize,
-    col_size: usize,
-    type_code_val: u8,
-) -> u128 {
+pub(crate) fn pk_native_key(pk_bytes: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
     debug_assert!(
         pk_bytes.len() >= offset + col_size,
         "pk_native_key: buffer too short ({} < {})",
-        pk_bytes.len(), offset + col_size,
+        pk_bytes.len(),
+        offset + col_size,
     );
     let mut le = [0u8; 16];
     gnitz_wire::decode_pk_column(&pk_bytes[offset..offset + col_size], type_code_val, &mut le[..col_size]);
@@ -1051,16 +1092,12 @@ pub(crate) fn pk_native_key(
 /// zero-extended. U128/UUID read all 16 bytes; narrower types zero-extend the
 /// low ≤8 bytes. Float/String/Blob keep the same zero-extended low-8-byte key.
 #[inline]
-pub(crate) fn payload_native_key(
-    col_data: &[u8],
-    offset: usize,
-    col_size: usize,
-    type_code_val: u8,
-) -> u128 {
+pub(crate) fn payload_native_key(col_data: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
     debug_assert!(
         col_data.len() >= offset + col_size,
         "payload_native_key: buffer too short ({} < {})",
-        col_data.len(), offset + col_size,
+        col_data.len(),
+        offset + col_size,
     );
     match TypeCode::from_validated_u8(type_code_val) {
         TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
@@ -1085,16 +1122,16 @@ pub(crate) fn payload_native_key(
 /// the leading column stay zero (the source-PK suffix is not part of the
 /// leading-column prefix).
 #[inline]
-pub(crate) fn index_opk_prefix(
-    native: u128,
-    src_type: u8,
-    idx_key_type: u8,
-) -> [u8; MAX_PK_BYTES] {
+pub(crate) fn index_opk_prefix(native: u128, src_type: u8, idx_key_type: u8) -> [u8; MAX_PK_BYTES] {
     let mut opk = [0u8; MAX_PK_BYTES];
     let src_w = gnitz_wire::wire_stride(src_type);
     let idx_w = gnitz_wire::wire_stride(idx_key_type);
     gnitz_wire::encode_pk_column_promoted(
-        &native.to_le_bytes()[..src_w], src_type, idx_key_type, &mut opk[..idx_w]);
+        &native.to_le_bytes()[..src_w],
+        src_type,
+        idx_key_type,
+        &mut opk[..idx_w],
+    );
     opk
 }
 
@@ -1105,7 +1142,10 @@ pub(crate) fn index_opk_prefix(
 /// Returns (dest_struct, is_long_string).
 #[inline]
 fn prep_german_string_copy(src: &[u8]) -> ([u8; 16], bool) {
-    debug_assert!(src.len() >= 16, "prep_german_string_copy: src must be a 16-byte German string struct");
+    debug_assert!(
+        src.len() >= 16,
+        "prep_german_string_copy: src must be a 16-byte German string struct"
+    );
     let length = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
     let mut dest = [0u8; 16];
     dest[0..4].copy_from_slice(&src[0..4]);
@@ -1181,8 +1221,8 @@ pub(crate) fn relocate_german_string_vec(
     dest
 }
 
-pub(crate) use gnitz_wire::encode_german_string;
 pub(crate) use gnitz_wire::decode_german_string;
+pub(crate) use gnitz_wire::encode_german_string;
 pub(crate) use gnitz_wire::try_decode_german_string;
 
 /// Bytes `[heap_offset, heap_offset + length)` of a long German string's blob
@@ -1224,9 +1264,7 @@ pub(crate) fn german_string_content<'a>(s: &'a [u8], blob: &'a [u8]) -> &'a [u8]
 /// Long strings: full string is in blob at heap_offset; skip first 4 bytes
 /// (they duplicate the prefix, already compared by the caller).
 #[inline]
-pub(crate) fn german_string_tail<'a>(
-    s: &'a [u8], blob: &'a [u8], length: usize, end: usize,
-) -> &'a [u8] {
+pub(crate) fn german_string_tail<'a>(s: &'a [u8], blob: &'a [u8], length: usize, end: usize) -> &'a [u8] {
     if length <= SHORT_STRING_THRESHOLD {
         debug_assert!(s.len() >= 4 + end, "german_string_tail: short string struct too small");
         &s[8..4 + end]
@@ -1241,15 +1279,16 @@ pub(crate) fn german_string_tail<'a>(
         );
         // `end ≥ min_len > 4` at the one call site (compare_german_strings),
         // so `start < limit`; if `limit ≤ blob.len()` the slice is in bounds.
-        if limit > blob.len() { &[] } else { &blob[start..limit] }
+        if limit > blob.len() {
+            &[]
+        } else {
+            &blob[start..limit]
+        }
     }
 }
 
 #[inline]
-pub(crate) fn compare_german_strings(
-    a: &[u8], blob_a: &[u8],
-    b: &[u8], blob_b: &[u8],
-) -> std::cmp::Ordering {
+pub(crate) fn compare_german_strings(a: &[u8], blob_a: &[u8], b: &[u8], blob_b: &[u8]) -> std::cmp::Ordering {
     let len_a = read_u32_le(a, 0) as usize;
     let len_b = read_u32_le(b, 0) as usize;
     let min_len = len_a.min(len_b);
@@ -1279,19 +1318,19 @@ pub(crate) fn compare_german_strings(
 /// the sender chose (client INSERT frames, worker reply trains) — batch append
 /// helpers do not validate shape, so an unguarded mismatch turns into
 /// misinterpreted bytes handed onward.
-pub(crate) fn validate_schema_match(
-    wire: &SchemaDescriptor, expected: &SchemaDescriptor,
-) -> Result<(), String> {
+pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDescriptor) -> Result<(), String> {
     if wire.num_columns() != expected.num_columns() {
         return Err(format!(
             "Schema mismatch: expected {} columns, got {}",
-            expected.num_columns(), wire.num_columns(),
+            expected.num_columns(),
+            wire.num_columns(),
         ));
     }
     if wire.pk_indices() != expected.pk_indices() {
         return Err(format!(
             "Schema mismatch: expected pk_indices={:?}, got {:?}",
-            expected.pk_indices(), wire.pk_indices(),
+            expected.pk_indices(),
+            wire.pk_indices(),
         ));
     }
     for i in 0..wire.num_columns() {
@@ -1310,7 +1349,6 @@ pub(crate) fn validate_schema_match(
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1339,9 +1377,10 @@ mod tests {
         // all yield dist_stride == pk_stride and dist_prefix_len == pk_count.
         let pk_stride = 4 + 8 + 8; // U32 + U64 + U64
         for s in [
-            three_col_pk_schema(0),               // 0 = persisted default sentinel
-            three_col_pk_schema(3),               // explicit full PK
-            SchemaDescriptor::new(                 // bare `new`
+            three_col_pk_schema(0), // 0 = persisted default sentinel
+            three_col_pk_schema(3), // explicit full PK
+            SchemaDescriptor::new(
+                // bare `new`
                 &[
                     SchemaColumn::new(type_code::U32, 0),
                     SchemaColumn::new(type_code::U64, 0),
@@ -1381,7 +1420,7 @@ mod tests {
     #[test]
     fn shard_cols_match_dist_key_is_exact_prefix() {
         let k1 = three_col_pk_schema(1); // CLUSTER BY col0
-        // Exact prefix at k=1 matches; the full PK and a super-prefix do not.
+                                         // Exact prefix at k=1 matches; the full PK and a super-prefix do not.
         assert!(k1.shard_cols_match_dist_key(&[0]));
         assert!(!k1.shard_cols_match_dist_key(&[0, 1]), "super-prefix must NOT match");
         assert!(!k1.shard_cols_match_dist_key(&[0, 1, 2]));
@@ -1391,7 +1430,10 @@ mod tests {
         // Default (full-PK) schema: dist key is the whole PK, exactly.
         let full = three_col_pk_schema(0);
         assert!(full.shard_cols_match_dist_key(&[0, 1, 2]));
-        assert!(!full.shard_cols_match_dist_key(&[0]), "a single component is not the full key");
+        assert!(
+            !full.shard_cols_match_dist_key(&[0]),
+            "a single component is not the full key"
+        );
         assert!(!full.shard_cols_match_dist_key(&[0, 1]));
 
         // k=2 matches exactly [0,1], not [0] and not [0,1,2].
@@ -1449,7 +1491,7 @@ mod tests {
 
     #[test]
     fn validate_schema_match_rejects_nullable_mismatch() {
-        let wire     = two_col_schema(0); // col1 not-nullable
+        let wire = two_col_schema(0); // col1 not-nullable
         let expected = two_col_schema(1); // col1 nullable
         assert!(validate_schema_match(&wire, &expected).is_err());
     }
@@ -1474,7 +1516,8 @@ mod tests {
         let result = relocate_german_string_vec(&src_cell, &src_blob, &mut dst_blob, None);
 
         assert_eq!(
-            u32::from_le_bytes(result[0..4].try_into().unwrap()), 0,
+            u32::from_le_bytes(result[0..4].try_into().unwrap()),
+            0,
             "fallback must emit length=0",
         );
         assert_eq!(&result[4..8], &[0u8; 4], "fallback must zero the prefix field");
@@ -1565,14 +1608,27 @@ mod tests {
         for tc in [type_code::I8, type_code::I16, type_code::I32, type_code::I64] {
             assert!(SchemaColumn::new(tc, 0).is_signed(), "type_code {tc} must be signed");
             // Nullability does not change signedness.
-            assert!(SchemaColumn::new(tc, 1).is_signed(), "nullable type_code {tc} must be signed");
+            assert!(
+                SchemaColumn::new(tc, 1).is_signed(),
+                "nullable type_code {tc} must be signed"
+            );
         }
         for tc in [
-            type_code::U8, type_code::U16, type_code::U32, type_code::U64,
-            type_code::U128, type_code::UUID, type_code::F32, type_code::F64,
-            type_code::STRING, type_code::BLOB,
+            type_code::U8,
+            type_code::U16,
+            type_code::U32,
+            type_code::U64,
+            type_code::U128,
+            type_code::UUID,
+            type_code::F32,
+            type_code::F64,
+            type_code::STRING,
+            type_code::BLOB,
         ] {
-            assert!(!SchemaColumn::new(tc, 0).is_signed(), "type_code {tc} must not be signed");
+            assert!(
+                !SchemaColumn::new(tc, 0).is_signed(),
+                "type_code {tc} must not be signed"
+            );
         }
     }
 
@@ -1646,15 +1702,27 @@ mod tests {
         );
         assert_eq!(
             s.locate(0),
-            ColumnLocator::Pk { byte_off: 0, size: 4, type_code: type_code::U32 },
+            ColumnLocator::Pk {
+                byte_off: 0,
+                size: 4,
+                type_code: type_code::U32
+            },
         );
         assert_eq!(
             s.locate(1),
-            ColumnLocator::Pk { byte_off: 4, size: 4, type_code: type_code::U32 },
+            ColumnLocator::Pk {
+                byte_off: 4,
+                size: 4,
+                type_code: type_code::U32
+            },
         );
         assert_eq!(
             s.locate(2),
-            ColumnLocator::Payload { slot: 0, size: 8, type_code: type_code::I64 },
+            ColumnLocator::Payload {
+                slot: 0,
+                size: 8,
+                type_code: type_code::I64
+            },
         );
         // Accessors agree with the variant fields.
         assert!(s.locate(0).is_pk());
@@ -1716,10 +1784,7 @@ mod tests {
         );
         assert_eq!(s.num_columns(), 3);
 
-        let s = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::U64, 0); 8],
-            &[0],
-        );
+        let s = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0); 8], &[0]);
         assert_eq!(s.num_columns(), 8);
     }
 
@@ -1731,10 +1796,7 @@ mod tests {
             SchemaColumn::new(type_code::U128, 0),
         ];
         let s = SchemaDescriptor::new(&cols, &[1]);
-        let v: Vec<(usize, usize, u8)> = s
-            .pk_columns()
-            .map(|(ord, ci, c)| (ord, ci, c.type_code))
-            .collect();
+        let v: Vec<(usize, usize, u8)> = s.pk_columns().map(|(ord, ci, c)| (ord, ci, c.type_code)).collect();
         assert_eq!(v, vec![(0, 1, type_code::I64)]);
         assert_eq!(s.pk_indices()[0], 1);
     }
@@ -1743,10 +1805,16 @@ mod tests {
     fn test_pk_stride_matches_single_pk_size() {
         // Floats are excluded: F32/F64 are not PK-eligible (rejected in `new`).
         for tc in [
-            type_code::U8, type_code::I8, type_code::U16, type_code::I16,
-            type_code::U32, type_code::I32,
-            type_code::U64, type_code::I64,
-            type_code::U128, type_code::UUID,
+            type_code::U8,
+            type_code::I8,
+            type_code::U16,
+            type_code::I16,
+            type_code::U32,
+            type_code::I32,
+            type_code::U64,
+            type_code::I64,
+            type_code::U128,
+            type_code::UUID,
         ] {
             let cols = [SchemaColumn::new(tc, 0)];
             let s = SchemaDescriptor::new(&cols, &[0]);
@@ -1796,10 +1864,7 @@ mod tests {
         ];
         let s = SchemaDescriptor::new(&cols, &[0, 1]);
         assert_eq!(s.pk_stride(), 12);
-        let v: Vec<(usize, usize, u8)> = s
-            .pk_columns()
-            .map(|(ord, ci, c)| (ord, ci, c.type_code))
-            .collect();
+        let v: Vec<(usize, usize, u8)> = s.pk_columns().map(|(ord, ci, c)| (ord, ci, c.type_code)).collect();
         assert_eq!(v, vec![(0, 0, type_code::U64), (1, 1, type_code::U32)]);
     }
 
@@ -1811,12 +1876,8 @@ mod tests {
         let pks: Vec<u32> = (0..MAX_PK_COLUMNS as u32).collect();
         let s = SchemaDescriptor::new(&cols, &pks);
         assert_eq!(s.pk_indices().len(), MAX_PK_COLUMNS);
-        let collected: Vec<(usize, usize)> = s
-            .pk_columns()
-            .map(|(ord, ci, _)| (ord, ci))
-            .collect();
-        let expected: Vec<(usize, usize)> =
-            (0..MAX_PK_COLUMNS).map(|k| (k, k)).collect();
+        let collected: Vec<(usize, usize)> = s.pk_columns().map(|(ord, ci, _)| (ord, ci)).collect();
+        let expected: Vec<(usize, usize)> = (0..MAX_PK_COLUMNS).map(|k| (k, k)).collect();
         assert_eq!(collected, expected);
         assert_eq!(s.pk_stride() as usize, MAX_PK_COLUMNS * 8);
     }
@@ -1862,19 +1923,13 @@ mod tests {
         // size 2: 0xFFFE > 0x0001 as unsigned (sign-extension would invert).
         assert_eq!(read_unsigned(&0xFFFEu16.to_le_bytes(), 2), 0xFFFE);
         assert_eq!(read_unsigned(&0x0001u16.to_le_bytes(), 2), 0x0001);
-        assert!(
-            read_unsigned(&0xFFFEu16.to_le_bytes(), 2)
-                > read_unsigned(&0x0001u16.to_le_bytes(), 2),
-        );
+        assert!(read_unsigned(&0xFFFEu16.to_le_bytes(), 2) > read_unsigned(&0x0001u16.to_le_bytes(), 2),);
 
         // size 4.
         let big: u32 = 0xFFFF_FFFE;
         let small: u32 = 0x0000_0001;
         assert_eq!(read_unsigned(&big.to_le_bytes(), 4), big as u64);
-        assert!(
-            read_unsigned(&big.to_le_bytes(), 4)
-                > read_unsigned(&small.to_le_bytes(), 4),
-        );
+        assert!(read_unsigned(&big.to_le_bytes(), 4) > read_unsigned(&small.to_le_bytes(), 4),);
 
         // size 8: full u64 round-trip.
         let v: u64 = 0xDEAD_BEEF_CAFE_BABE;

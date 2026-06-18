@@ -5,12 +5,12 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, ConsolidatedBatch, MemBatch, with_payload_cmp};
 use crate::expr::ScalarFuncKind;
+use crate::schema::{SchemaColumn, SchemaDescriptor};
+use crate::storage::{with_payload_cmp, Batch, ConsolidatedBatch, MemBatch};
 
 use super::cogroup::{cogroup_union, BatchCursor};
-use super::reindex::{ReindexPacker, reindex_hash_row};
+use super::reindex::{reindex_hash_row, ReindexPacker};
 
 // ---------------------------------------------------------------------------
 // Linear operators
@@ -18,11 +18,7 @@ use super::reindex::{ReindexPacker, reindex_hash_row};
 
 /// Filter: retain rows where predicate returns true.
 /// Uses contiguous-range bulk copy for efficiency.
-pub fn op_filter(
-    batch: &Batch,
-    func: &ScalarFuncKind,
-    schema: &SchemaDescriptor,
-) -> Batch {
+pub fn op_filter(batch: &Batch, func: &ScalarFuncKind, schema: &SchemaDescriptor) -> Batch {
     let n = batch.count;
     if n == 0 {
         return Batch::empty_with_schema(schema);
@@ -39,8 +35,8 @@ pub fn op_filter(
     // in their struct and an empty shared blob is a no-op for the absent long
     // strings. Gating on a non-empty blob needlessly dropped all-short-string
     // batches to the slow `relocate_string_cell` path.
-    let blob_passthrough = (0..schema.num_columns())
-        .any(|ci| gnitz_wire::is_german_string(schema.columns[ci].type_code));
+    let blob_passthrough =
+        (0..schema.num_columns()).any(|ci| gnitz_wire::is_german_string(schema.columns[ci].type_code));
     if blob_passthrough {
         output.share_blob_from(batch);
     }
@@ -108,7 +104,12 @@ pub fn op_map(
         reindex_hash_row(out_schema, &mut output, branch_id);
         output.sorted = false;
         output.consolidated = false;
-        gnitz_debug!("op_map: in={} out={} reindex=HASH func={}", batch.count, output.count, func.kind_name());
+        gnitz_debug!(
+            "op_map: in={} out={} reindex=HASH func={}",
+            batch.count,
+            output.count,
+            func.kind_name()
+        );
         return output;
     }
 
@@ -120,7 +121,12 @@ pub fn op_map(
             "MAP output row count must equal input row count",
         );
         result.sorted = batch.sorted;
-        gnitz_debug!("op_map: in={} out={} reindex=none func={}", batch.count, result.count, func.kind_name());
+        gnitz_debug!(
+            "op_map: in={} out={} reindex=none func={}",
+            batch.count,
+            result.count,
+            func.kind_name()
+        );
         return result;
     }
 
@@ -143,7 +149,13 @@ pub fn op_map(
 
     output.sorted = false;
     output.consolidated = false;
-    gnitz_debug!("op_map: in={} out={} reindex={}cols func={}", batch.count, output.count, reindex_cols.len(), func.kind_name());
+    gnitz_debug!(
+        "op_map: in={} out={} reindex={}cols func={}",
+        batch.count,
+        output.count,
+        reindex_cols.len(),
+        func.kind_name()
+    );
     output
 }
 
@@ -172,11 +184,7 @@ pub fn op_negate(batch: &Batch) -> Batch {
 
 /// Union: algebraic addition of two Z-Set streams.
 /// When both inputs are sorted, performs O(N) merge preserving sort order.
-pub fn op_union(
-    batch_a: Batch,
-    batch_b: Option<&Batch>,
-    schema: &SchemaDescriptor,
-) -> Batch {
+pub fn op_union(batch_a: Batch, batch_b: Option<&Batch>, schema: &SchemaDescriptor) -> Batch {
     let b = match batch_b {
         Some(b) if b.count > 0 => b,
         // O(1) pass-through: no allocation, sorted/consolidated preserved.
@@ -199,26 +207,22 @@ pub fn op_union(
     output.append_batch(b, 0, b.count);
     output.sorted = false;
     output.consolidated = false;
-    gnitz_debug!("op_union: a={} b={} out={} concat", batch_a.count, b.count, output.count);
+    gnitz_debug!(
+        "op_union: a={} b={} out={} concat",
+        batch_a.count,
+        b.count,
+        output.count
+    );
     output
 }
 
 /// Sorted merge of two sorted batches with contiguous-run batching.
-fn op_union_merge(
-    batch_a: &Batch,
-    batch_b: &Batch,
-    schema: &SchemaDescriptor,
-) -> Batch {
+fn op_union_merge(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
     with_payload_cmp!(schema, op_union_merge_inner, batch_a, batch_b, schema)
 }
 
 #[inline]
-fn op_union_merge_inner<RowCmp>(
-    batch_a: &Batch,
-    batch_b: &Batch,
-    schema: &SchemaDescriptor,
-    row_cmp: RowCmp,
-) -> Batch
+fn op_union_merge_inner<RowCmp>(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor, row_cmp: RowCmp) -> Batch
 where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
@@ -237,59 +241,60 @@ where
     // groups need the payload merge below, which coalesces contiguous
     // single-source runs into one append each (the row count per group is often
     // single-digit and `append_batch` has fixed per-call offset overhead).
-    cogroup_union(
-        &mut a,
-        &mut b,
-        &mut output,
-        |out, ra, rb| {
-            let (i, i_end) = (ra.start, ra.end);
-            let (j, j_end) = (rb.start, rb.end);
-            let (mut ia, mut jb) = (i, j);
-            if ia < i_end && jb < j_end {
-                let mut prev_a = row_cmp(schema, &mb_a, ia, &mb_b, jb)
-                    != Ordering::Greater;
-                let mut run_start = if prev_a { ia } else { jb };
-                if prev_a { ia += 1; } else { jb += 1; }
-                while ia < i_end && jb < j_end {
-                    let pick_a = row_cmp(schema, &mb_a, ia, &mb_b, jb)
-                        != Ordering::Greater;
-                    if pick_a != prev_a {
-                        if prev_a {
-                            out.append_batch(batch_a, run_start, ia);
-                            run_start = jb;
-                        } else {
-                            out.append_batch(batch_b, run_start, jb);
-                            run_start = ia;
-                        }
-                        prev_a = pick_a;
-                    }
-                    if pick_a { ia += 1; } else { jb += 1; }
-                }
-                // Flush the in-progress run, folding its side's still-unpicked
-                // tail (rows the loop never reached because the *other* side
-                // exhausted first) into the same append. The opposite side then
-                // drains as a separate run.
-                if prev_a {
-                    out.append_batch(batch_a, run_start, i_end);
-                    if jb < j_end {
-                        out.append_batch(batch_b, jb, j_end);
-                    }
-                } else {
-                    out.append_batch(batch_b, run_start, j_end);
-                    if ia < i_end {
-                        out.append_batch(batch_a, ia, i_end);
-                    }
-                }
+    cogroup_union(&mut a, &mut b, &mut output, |out, ra, rb| {
+        let (i, i_end) = (ra.start, ra.end);
+        let (j, j_end) = (rb.start, rb.end);
+        let (mut ia, mut jb) = (i, j);
+        if ia < i_end && jb < j_end {
+            let mut prev_a = row_cmp(schema, &mb_a, ia, &mb_b, jb) != Ordering::Greater;
+            let mut run_start = if prev_a { ia } else { jb };
+            if prev_a {
+                ia += 1;
             } else {
-                if ia < i_end {
-                    out.append_batch(batch_a, ia, i_end);
+                jb += 1;
+            }
+            while ia < i_end && jb < j_end {
+                let pick_a = row_cmp(schema, &mb_a, ia, &mb_b, jb) != Ordering::Greater;
+                if pick_a != prev_a {
+                    if prev_a {
+                        out.append_batch(batch_a, run_start, ia);
+                        run_start = jb;
+                    } else {
+                        out.append_batch(batch_b, run_start, jb);
+                        run_start = ia;
+                    }
+                    prev_a = pick_a;
                 }
+                if pick_a {
+                    ia += 1;
+                } else {
+                    jb += 1;
+                }
+            }
+            // Flush the in-progress run, folding its side's still-unpicked
+            // tail (rows the loop never reached because the *other* side
+            // exhausted first) into the same append. The opposite side then
+            // drains as a separate run.
+            if prev_a {
+                out.append_batch(batch_a, run_start, i_end);
                 if jb < j_end {
                     out.append_batch(batch_b, jb, j_end);
                 }
+            } else {
+                out.append_batch(batch_b, run_start, j_end);
+                if ia < i_end {
+                    out.append_batch(batch_a, ia, i_end);
+                }
             }
-        },
-    );
+        } else {
+            if ia < i_end {
+                out.append_batch(batch_a, ia, i_end);
+            }
+            if jb < j_end {
+                out.append_batch(batch_b, jb, j_end);
+            }
+        }
+    });
 
     output.sorted = true;
     output.consolidated = false;
@@ -300,16 +305,12 @@ where
 /// Null-extend: copy input batch and append N null-filled payload columns.
 /// Used in LEFT JOIN decomposition to convert anti-join output (left-only rows)
 /// into null-filled outer join rows.
-pub fn op_null_extend(
-    batch: &Batch,
-    in_schema: &SchemaDescriptor,
-    right_schema: &SchemaDescriptor,
-) -> Batch {
+pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> Batch {
     assert!(
-        in_schema.num_columns() + right_schema.num_payload_cols()
-            <= crate::schema::MAX_COLUMNS,
+        in_schema.num_columns() + right_schema.num_payload_cols() <= crate::schema::MAX_COLUMNS,
         "op_null_extend: combined column count {} + {} exceeds MAX_COLUMNS={}",
-        in_schema.num_columns(), right_schema.num_payload_cols(),
+        in_schema.num_columns(),
+        right_schema.num_payload_cols(),
         crate::schema::MAX_COLUMNS,
     );
 
@@ -357,7 +358,9 @@ pub fn op_null_extend(
     // Copy input payload columns
     for (pi, _ci, col) in in_schema.payload_columns() {
         let stride = col.size() as usize;
-        output.col_data_mut(pi).copy_from_slice(&batch.col_data(pi)[..n * stride]);
+        output
+            .col_data_mut(pi)
+            .copy_from_slice(&batch.col_data(pi)[..n * stride]);
     }
 
     // Right-side payload columns are already zero-filled by with_schema.
@@ -384,11 +387,11 @@ pub fn op_null_extend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Batch;
     use crate::test_support::{
-        make_batch_i64pk, make_schema_i64pk_i64, make_schema_pk_u64_payload_blob,
-        make_schema_pk_u64_payload_string, make_wide_batch, wide_pk_3xu64_schema,
+        make_batch_i64pk, make_schema_i64pk_i64, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string,
+        make_wide_batch, wide_pk_3xu64_schema,
     };
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
@@ -401,10 +404,7 @@ mod tests {
         )
     }
 
-    fn make_batch(
-        schema: &SchemaDescriptor,
-        rows: &[(u64, i64, i64)],
-    ) -> Batch {
+    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
         for &(pk, w, val) in rows {
@@ -448,19 +448,35 @@ mod tests {
     fn test_union_merge_skewed_interleaved_payloads() {
         let schema = make_schema_u64_i64();
         let a = make_batch(&schema, &[(5, 1, 100), (5, 1, 300)]); // tiny side
-        let b = make_batch(&schema, &[
-            (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40),
-            (5, 1, 200), (5, 1, 400), (6, 1, 60), (7, 1, 70),
-        ]); // huge side; PK=5 interleaves with a
+        let b = make_batch(
+            &schema,
+            &[
+                (1, 1, 10),
+                (2, 1, 20),
+                (3, 1, 30),
+                (4, 1, 40),
+                (5, 1, 200),
+                (5, 1, 400),
+                (6, 1, 60),
+                (7, 1, 70),
+            ],
+        ); // huge side; PK=5 interleaves with a
         let out = op_union(a, Some(&b), &schema);
 
         let got: Vec<(u64, i64)> = (0..out.count)
             .map(|r| (out.get_pk(r) as u64, get_payload_i64(&out, r)))
             .collect();
         let want: Vec<(u64, i64)> = vec![
-            (1, 10), (2, 20), (3, 30), (4, 40),
-            (5, 100), (5, 200), (5, 300), (5, 400),
-            (6, 60), (7, 70),
+            (1, 10),
+            (2, 20),
+            (3, 30),
+            (4, 40),
+            (5, 100),
+            (5, 200),
+            (5, 300),
+            (5, 400),
+            (6, 60),
+            (7, 70),
         ];
         assert_eq!(got, want, "full union, (PK, payload)-sorted");
         assert!(out.sorted);
@@ -610,9 +626,9 @@ mod tests {
         let batch = make_batch(&schema, &[(1, 1, 5), (2, 1, 15), (3, 1, 25)]);
 
         let code = vec![
-            1i64, 0, 1, 0,  // LOAD_COL_INT r0 = col[1]
-            3, 1, 10, 0,    // LOAD_CONST r1 = 10
-            17, 2, 0, 1,    // CMP_GT r2 = (r0 > r1)
+            1i64, 0, 1, 0, // LOAD_COL_INT r0 = col[1]
+            3, 1, 10, 0, // LOAD_CONST r1 = 10
+            17, 2, 0, 1, // CMP_GT r2 = (r0 > r1)
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
         let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, &schema));
@@ -628,7 +644,7 @@ mod tests {
         use crate::expr::{ExprProgram, Plan};
 
         let code = vec![
-            3i64, 0, 1, 0,  // LOAD_CONST r0 = 1 (always true)
+            3i64, 0, 1, 0, // LOAD_CONST r0 = 1 (always true)
         ];
         let prog = ExprProgram::new(code, 1, 0, vec![]);
         let schema = make_schema_u64_i64();
@@ -670,9 +686,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let empty_batch = Batch::empty(1, 16);
 
-        let func = ScalarFuncKind::Plan(Plan::from_projection(
-            &[1], &[type_code::I64], &schema, &schema,
-        ));
+        let func = ScalarFuncKind::Plan(Plan::from_projection(&[1], &[type_code::I64], &schema, &schema));
         let out = op_map(&empty_batch, &func, &schema, &schema, &[], &[], false, 0);
         assert_eq!(out.count, 0);
     }
@@ -890,7 +904,11 @@ mod tests {
         let func = always_true_func(&schema);
         let out = op_filter(&empty, &func, &schema);
         assert_eq!(out.count, 0);
-        assert_eq!(out.pk_stride(), 8, "op_filter empty must use schema stride 8 for U64 PK");
+        assert_eq!(
+            out.pk_stride(),
+            8,
+            "op_filter empty must use schema stride 8 for U64 PK"
+        );
     }
 
     #[test]
@@ -899,7 +917,11 @@ mod tests {
         let empty = make_batch(&schema, &[]);
         let out = op_negate(&empty);
         assert_eq!(out.count, 0);
-        assert_eq!(out.pk_stride(), 8, "op_negate empty must use schema stride 8 for U64 PK");
+        assert_eq!(
+            out.pk_stride(),
+            8,
+            "op_negate empty must use schema stride 8 for U64 PK"
+        );
     }
 
     #[test]
@@ -909,7 +931,11 @@ mod tests {
         let empty = make_batch(&in_schema, &[]);
         let out = op_null_extend(&empty, &in_schema, &right_schema);
         assert_eq!(out.count, 0);
-        assert_eq!(out.pk_stride(), 8, "op_null_extend empty must use combined-schema stride 8");
+        assert_eq!(
+            out.pk_stride(),
+            8,
+            "op_null_extend empty must use combined-schema stride 8"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -977,18 +1003,21 @@ mod tests {
         // Input: PK u64, payload i64. Reindex on the payload (col 1) — the
         // new output PK is each row's payload value.
         let schema = make_schema_u64_i64();
-        let batch = make_batch(&schema, &[
-            (1, 1, 200),
-            (2, 1, 100),
-            (3, 1, 300),
-        ]);
+        let batch = make_batch(&schema, &[(1, 1, 200), (2, 1, 100), (3, 1, 300)]);
 
         // Projection plan: output keeps the same single payload column.
-        let func = ScalarFuncKind::Plan(Plan::from_projection(
-            &[1], &[type_code::I64], &schema, &schema,
-        ));
+        let func = ScalarFuncKind::Plan(Plan::from_projection(&[1], &[type_code::I64], &schema, &schema));
 
-        let out = op_map(&batch, &func, &schema, &schema, /* reindex_cols = */ &[1], &[], false, 0);
+        let out = op_map(
+            &batch,
+            &func,
+            &schema,
+            &schema,
+            /* reindex_cols = */ &[1],
+            &[],
+            false,
+            0,
+        );
         assert_eq!(out.count, 3);
         // Each output row's PK is the sign-aware OPK image of its source payload
         // value (col 1 is I64): `widen_pk_be(encode_pk_column(v))`, i.e. the value
@@ -1020,34 +1049,46 @@ mod tests {
 
         let schema = make_schema_u64_i64();
         // (pk, weight, payload); a row passes iff payload > 10.
-        let batch = make_batch(&schema, &[
-            (1,  1, 5),    // fail
-            (2,  1, 15),   // pass
-            (3,  1, 25),   // pass
-            (4,  1, 10),   // fail (= not >)
-            (5,  1, 20),   // pass
-            (6,  1, 3),    // fail
-            (7,  1, 30),   // pass
-            (8,  1, 10),   // fail
-            (9,  1, 11),   // pass
-            (10, 1, 0),    // fail
-            (11, 1, 50),   // pass
-            (12, 1, 9),    // fail
-            (13, 1, 12),   // pass
-            (14, 1, 8),    // fail
-            (15, 1, 100),  // pass
-            (16, 1, 10),   // fail
-            (17, 1, 1),    // fail
-            (18, 1, 13),   // pass
-            (19, 1, 7),    // fail
-            (20, 1, 22),   // pass
-        ]);
+        let batch = make_batch(
+            &schema,
+            &[
+                (1, 1, 5),    // fail
+                (2, 1, 15),   // pass
+                (3, 1, 25),   // pass
+                (4, 1, 10),   // fail (= not >)
+                (5, 1, 20),   // pass
+                (6, 1, 3),    // fail
+                (7, 1, 30),   // pass
+                (8, 1, 10),   // fail
+                (9, 1, 11),   // pass
+                (10, 1, 0),   // fail
+                (11, 1, 50),  // pass
+                (12, 1, 9),   // fail
+                (13, 1, 12),  // pass
+                (14, 1, 8),   // fail
+                (15, 1, 100), // pass
+                (16, 1, 10),  // fail
+                (17, 1, 1),   // fail
+                (18, 1, 13),  // pass
+                (19, 1, 7),   // fail
+                (20, 1, 22),  // pass
+            ],
+        );
 
         // Predicate: col[1] > 10
         let code = vec![
-            expr::EXPR_LOAD_COL_INT, 0, 1, 0,
-            expr::EXPR_LOAD_CONST, 1, 10, 0,
-            expr::EXPR_CMP_GT, 2, 0, 1,
+            expr::EXPR_LOAD_COL_INT,
+            0,
+            1,
+            0,
+            expr::EXPR_LOAD_CONST,
+            1,
+            10,
+            0,
+            expr::EXPR_CMP_GT,
+            2,
+            0,
+            1,
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
         let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, &schema));

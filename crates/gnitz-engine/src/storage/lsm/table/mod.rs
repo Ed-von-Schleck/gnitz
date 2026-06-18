@@ -6,18 +6,18 @@ use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
 use std::rc::Rc;
 
-use super::columnar;
-use super::error::StorageError;
-use crate::schema::SchemaDescriptor;
-use crate::foundation::posix_io::fsync_eintr;
-use super::memtable::{self, MemTable};
 use super::batch::Batch;
 #[cfg(test)]
 use super::batch::ConsolidatedBatch;
+use super::columnar;
+use super::error::StorageError;
 use super::manifest::PreparedManifest;
+use super::memtable::{self, MemTable};
 use super::read_cursor::{self, CursorHandle};
 use super::shard_index::{PendingShard, ShardIndex};
 use super::shard_reader::MappedShard;
+use crate::foundation::posix_io::fsync_eintr;
+use crate::schema::SchemaDescriptor;
 
 /// Fold `in_memory_l0` once it exceeds this many runs. Mirrors the disk
 /// `L0_COMPACT_THRESHOLD`; keeps cursor source count and per-lookup run scans
@@ -86,16 +86,22 @@ impl FlushWork {
     /// fdatasync batch completes and before renames start.
     pub fn close_fds(&mut self) {
         if let Some(fd) = self.shard_fd.take() {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
         if let Some(m) = &mut self.manifest {
             if let Some(fd) = m.fd.take() {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
             }
         }
     }
 
-    pub fn shard_fd(&self) -> Option<libc::c_int> { self.shard_fd }
+    pub fn shard_fd(&self) -> Option<libc::c_int> {
+        self.shard_fd
+    }
     pub fn manifest_fd(&self) -> Option<libc::c_int> {
         self.manifest.as_ref().and_then(|m| m.fd)
     }
@@ -115,11 +121,12 @@ impl Drop for FlushWork {
             }
         }
         if let Some(m) = self.manifest.take() {
-            unsafe { libc::unlink(m.tmp_path.as_ptr()); }
+            unsafe {
+                libc::unlink(m.tmp_path.as_ptr());
+            }
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // FoundSource — tracks where retract_pk found its row
@@ -200,7 +207,6 @@ pub struct Table {
     #[cfg(test)]
     inmem_ceiling_override: Option<usize>,
 }
-
 
 mod flush;
 
@@ -285,18 +291,18 @@ impl Table {
         self.upsert_owned_and_maybe_flush(batch, true)
     }
 
-    fn upsert_owned_and_maybe_flush(
-        &mut self,
-        batch: Batch,
-        force_ephemeral: bool,
-    ) -> Result<(), StorageError> {
+    fn upsert_owned_and_maybe_flush(&mut self, batch: Batch, force_ephemeral: bool) -> Result<(), StorageError> {
         if batch.count == 0 {
             return Ok(());
         }
         self.found_source = FoundSource::None;
         self.cached_full_scan = None;
 
-        let eff = if force_ephemeral { Persistence::Ephemeral } else { self.persistence };
+        let eff = if force_ephemeral {
+            Persistence::Ephemeral
+        } else {
+            self.persistence
+        };
         if eff == Persistence::Durable {
             self.current_lsn += 1;
         }
@@ -481,12 +487,11 @@ impl Table {
         );
         self.found_source = FoundSource::None;
 
-        let (mt_w, _, mt_row_count) =
-            if self.memtable.may_contain_pk(key) {
-                self.memtable.lookup_pk_bytes(key)
-            } else {
-                (0, false, 0)
-            };
+        let (mt_w, _, mt_row_count) = if self.memtable.may_contain_pk(key) {
+            self.memtable.lookup_pk_bytes(key)
+        } else {
+            (0, false, 0)
+        };
 
         let need_candidates = !(mt_row_count == 1 && mt_w > 0);
         let mut total_w = mt_w;
@@ -540,9 +545,7 @@ impl Table {
         self.shard_index.find_pk_bytes(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
             while idx < shard_rc.count && shard_rc.get_pk_bytes(idx) == key {
-                let ord = columnar::compare_rows(
-                    &self.schema, shard_rc.as_ref(), idx, ref_source, ref_row,
-                );
+                let ord = columnar::compare_rows(&self.schema, shard_rc.as_ref(), idx, ref_source, ref_row);
                 if ord == Ordering::Equal {
                     total_w += shard_rc.get_weight(idx);
                 }
@@ -585,7 +588,9 @@ impl Table {
             // for the table's lifetime.
             let dirfd = self.open_dirfd()?;
             let ok = fsync_eintr(dirfd).is_ok();
-            unsafe { libc::close(dirfd); }
+            unsafe {
+                libc::close(dirfd);
+            }
             if !ok {
                 return Err(StorageError::Io);
             }
@@ -608,11 +613,7 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// Scan shards for a PK by its OPK `key` bytes.
-    fn scan_shards_for_pk_bytes(
-        &self,
-        key: &[u8],
-        need_candidates: bool,
-    ) -> (i64, Vec<(Rc<MappedShard>, usize)>) {
+    fn scan_shards_for_pk_bytes(&self, key: &[u8], need_candidates: bool) -> (i64, Vec<(Rc<MappedShard>, usize)>) {
         let mut total_w: i64 = 0;
         let mut candidates: Vec<(Rc<MappedShard>, usize)> = Vec::new();
 
@@ -676,16 +677,13 @@ fn erase_stale_shards(dir: &str, table_id: u32) {
     // `eph_shard_*` left by a crashed prior process, (b) pre-upgrade
     // `eph_shard_*`/`shard_*` from before in-memory flushes existed, and
     // (c) `hcomp_*` from disk compaction of spilled data — not routine flushes.
-    let eph_prefix   = format!("eph_shard_{table_id}_");
+    let eph_prefix = format!("eph_shard_{table_id}_");
     let shard_prefix = format!("shard_{table_id}_");
     let hcomp_prefix = format!("hcomp_{table_id}_");
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&eph_prefix)
-                    || name.starts_with(&shard_prefix)
-                    || name.starts_with(&hcomp_prefix)
-                {
+                if name.starts_with(&eph_prefix) || name.starts_with(&shard_prefix) || name.starts_with(&hcomp_prefix) {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -700,7 +698,7 @@ fn erase_stale_shards(dir: &str, table_id: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::{opk_pk, wide_pk_3xu64_schema, wide_row};
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
@@ -766,8 +764,14 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            100,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
         assert!(t.memtable_is_empty());
 
@@ -793,8 +797,14 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, Persistence::Durable,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            200,
+            1 << 20,
+            Persistence::Durable,
+        )
+        .unwrap();
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
         t.flush().unwrap();
@@ -804,8 +814,14 @@ mod tests {
 
         // Re-open and recover
         let mut t2 = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, Persistence::Durable,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            200,
+            1 << 20,
+            Persistence::Durable,
+        )
+        .unwrap();
 
         // Data should be in shards via manifest
         assert!(t2.has_pk(10));
@@ -820,10 +836,17 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 300, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            300,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
-        t.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200)])).unwrap();
+        t.ingest_owned_batch(make_batch(&[(30, 1, 300), (10, 1, 100), (20, 1, 200)]))
+            .unwrap();
 
         let cursor = t.open_cursor();
         assert!(cursor.cursor.valid);
@@ -838,8 +861,14 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 400, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            400,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
@@ -866,13 +895,12 @@ mod tests {
         // Durable: each flush writes a real `shard_*` so `run_compact` (L0→L1)
         // is exercised. Under non-durable flush these tiny rows would stay in
         // `in_memory_l0` and never reach the disk compaction path.
-        let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 500, 256, Persistence::Durable,
-        ).unwrap();
+        let mut t = Table::new(tdir.to_str().unwrap(), "test", schema, 500, 256, Persistence::Durable).unwrap();
 
         // Create enough flushes to trigger compaction
         for i in 0..6u64 {
-            t.ingest_owned_batch(make_batch(&[(i * 10, 1, (i * 100) as i64)])).unwrap();
+            t.ingest_owned_batch(make_batch(&[(i * 10, 1, (i * 100) as i64)]))
+                .unwrap();
             t.flush().unwrap();
         }
 
@@ -894,15 +922,22 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 600, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            600,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
         // Batch 1: INSERT (PK=10, weight=+1, val=100)
         t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
 
         // Batch 2: UPDATE delta — retract val=100, insert val=200
         // Rows sorted by (PK, payload): (-1 for val=100) before (+1 for val=200)
-        t.ingest_owned_batch(make_batch(&[(10, -1, 100), (10, 1, 200)])).unwrap();
+        t.ingest_owned_batch(make_batch(&[(10, -1, 100), (10, 1, 200)]))
+            .unwrap();
 
         // Net state: val=100 has weight 0 (cancelled), val=200 has weight 1
         let (w, found) = t.retract_pk(10);
@@ -911,10 +946,11 @@ mod tests {
 
         // The found row must be val=200, not the cancelled val=100
         let fr = t.found_row().expect("retracted row is the found row");
-        let val = i64::from_le_bytes(
-            columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap(),
+        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        assert_eq!(
+            val, 200,
+            "retract_pk must return the live (val=200) row, not the retracted val=100"
         );
-        assert_eq!(val, 200, "retract_pk must return the live (val=200) row, not the retracted val=100");
     }
 
     /// `ingest_owned_batch` must sort the batch before memtable insert, even
@@ -926,8 +962,14 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 700, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            700,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
         // Build a reverse-sorted batch (PK order: 30, 20, 10).
         let batch = make_batch(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
@@ -939,7 +981,10 @@ mod tests {
         // Cursor must yield rows in ascending PK order
         let cursor = t.open_cursor();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key as u64, 10, "cursor should start at PK=10 (smallest)");
+        assert_eq!(
+            cursor.cursor.current_key as u64, 10,
+            "cursor should start at PK=10 (smallest)"
+        );
     }
 
     /// `ingest_owned_batch` must pre-flush when the memtable is already
@@ -954,9 +999,7 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         // Very small arena: 40 bytes. A 3-row batch (~120 bytes) will exceed it.
-        let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 900, 40, Persistence::Ephemeral,
-        ).unwrap();
+        let mut t = Table::new(tdir.to_str().unwrap(), "test", schema, 900, 40, Persistence::Ephemeral).unwrap();
 
         // Directly fill memtable past max_bytes using memtable_upsert_sorted_batch
         // (bypasses auto-flush so runs_bytes exceeds max_bytes).
@@ -969,12 +1012,16 @@ mod tests {
 
         // Ingest a REVERSE-sorted batch. ingest_owned_batch must sort it
         // (via into_consolidated) before insert.
-        t.ingest_owned_batch(make_batch(&[(50, 1, 500), (40, 1, 400), (30, 1, 300)])).unwrap();
+        t.ingest_owned_batch(make_batch(&[(50, 1, 500), (40, 1, 400), (30, 1, 300)]))
+            .unwrap();
 
         // fill batch (1,2,3) is now in shard; sorted (30,40,50) is in memtable.
         let cursor = t.open_cursor();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key as u64, 1, "cursor should start at PK=1 from flushed shard");
+        assert_eq!(
+            cursor.cursor.current_key as u64, 1,
+            "cursor should start at PK=1 from flushed shard"
+        );
     }
 
     /// Two ingest calls that cumulatively cross the 75% threshold must produce
@@ -990,8 +1037,14 @@ mod tests {
         // First call: 2 rows = 64 bytes, below threshold → no flush.
         // Second call: pre-check 64 < 96 → no pre-flush; upsert → 128 > 96 → post-flush.
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 1200, 128, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            1200,
+            128,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
         t.ingest_owned_batch(make_batch(&[(1, 1, 10), (2, 1, 20)])).unwrap();
         assert!(!t.memtable_is_empty(), "two rows must not yet trigger overflow");
@@ -1026,15 +1079,22 @@ mod tests {
         // the flushed rows must land in a real shard for the shard-fallback path
         // under test — not `in_memory_l0` (which a non-durable flush would use).
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 1000, 1 << 20, Persistence::Durable,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            1000,
+            1 << 20,
+            Persistence::Durable,
+        )
+        .unwrap();
 
         // Batch 1: INSERT (PK=10, weight=+1, val=100)
         t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
         t.flush().unwrap();
 
         // Batch 2: UPDATE delta — retract val=100, insert val=200
-        t.ingest_owned_batch(make_batch(&[(10, -1, 100), (10, 1, 200)])).unwrap();
+        t.ingest_owned_batch(make_batch(&[(10, -1, 100), (10, 1, 200)]))
+            .unwrap();
         t.flush().unwrap();
 
         // Both batches are now in shards, memtable is empty.
@@ -1044,10 +1104,11 @@ mod tests {
         assert!(found);
 
         let fr = t.found_row().expect("retracted row is the found row");
-        let val = i64::from_le_bytes(
-            columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap(),
+        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        assert_eq!(
+            val, 200,
+            "shard fallback must pick live payload (val=200), not cancelled (val=100)"
         );
-        assert_eq!(val, 200, "shard fallback must pick live payload (val=200), not cancelled (val=100)");
     }
 
     /// Dropping a `Pending` FlushWork without committing must unlink the
@@ -1060,34 +1121,50 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 1100, 1 << 20, Persistence::Durable,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            1100,
+            1 << 20,
+            Persistence::Durable,
+        )
+        .unwrap();
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
 
         match t.flush_prepare().unwrap() {
             FlushOutcome::Pending(work) => {
-                let dir_entries: Vec<String> = std::fs::read_dir(&tdir).unwrap()
+                let dir_entries: Vec<String> = std::fs::read_dir(&tdir)
+                    .unwrap()
                     .filter_map(|e| e.ok())
                     .filter_map(|e| e.file_name().into_string().ok())
                     .collect();
-                assert!(dir_entries.iter().any(|n| n.ends_with(".tmp")),
-                    ".tmp files must exist before Drop, got {dir_entries:?}");
+                assert!(
+                    dir_entries.iter().any(|n| n.ends_with(".tmp")),
+                    ".tmp files must exist before Drop, got {dir_entries:?}"
+                );
                 drop(work);
             }
-            other => panic!("expected Pending, got non-pending outcome: {}",
-                match other { FlushOutcome::Empty => "Empty",
-                              FlushOutcome::DoneInline => "DoneInline",
-                              _ => "?" }),
+            other => panic!(
+                "expected Pending, got non-pending outcome: {}",
+                match other {
+                    FlushOutcome::Empty => "Empty",
+                    FlushOutcome::DoneInline => "DoneInline",
+                    _ => "?",
+                }
+            ),
         }
 
-        let leftover_tmp: Vec<String> = std::fs::read_dir(&tdir).unwrap()
+        let leftover_tmp: Vec<String> = std::fs::read_dir(&tdir)
+            .unwrap()
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| n.ends_with(".tmp"))
             .collect();
-        assert!(leftover_tmp.is_empty(),
-            "Drop must unlink all .tmp files, found: {leftover_tmp:?}");
+        assert!(
+            leftover_tmp.is_empty(),
+            "Drop must unlink all .tmp files, found: {leftover_tmp:?}"
+        );
     }
 
     /// Table::new on a corrupted manifest must return Err and must not run
@@ -1108,7 +1185,12 @@ mod tests {
         std::fs::write(&stray, b"orphan").unwrap();
 
         let result = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 200, 1 << 20, Persistence::Durable,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            200,
+            1 << 20,
+            Persistence::Durable,
         );
         assert!(result.is_err(), "Table::new must fail on corrupted manifest");
         assert!(stray.exists(), "stray shard must survive when gc_orphans did not run");
@@ -1124,8 +1206,14 @@ mod tests {
         let schema = make_u64_i64_schema();
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 1200, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            1200,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
         match t.flush_prepare().unwrap() {
@@ -1133,9 +1221,15 @@ mod tests {
             FlushOutcome::Empty => panic!("expected DoneInline, got Empty"),
             FlushOutcome::Pending(_) => panic!("expected DoneInline, got Pending"),
         }
-        assert!(t.memtable_is_empty(), "memtable must be reset after non-durable flush_prepare");
+        assert!(
+            t.memtable_is_empty(),
+            "memtable must be reset after non-durable flush_prepare"
+        );
         assert!(!t.in_memory_runs().is_empty(), "snapshot must land in in_memory_l0");
-        assert!(no_eph_shard(&tdir), "non-durable flush must not write an eph_shard file");
+        assert!(
+            no_eph_shard(&tdir),
+            "non-durable flush must not write an eph_shard file"
+        );
         assert!(t.has_pk(10));
         assert!(t.has_pk(20));
     }
@@ -1173,15 +1267,22 @@ mod tests {
         // real shard so the shard scan path is what's tested; a non-durable
         // flush would route the rows into `in_memory_l0` instead.
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 4242, 1 << 20, Persistence::Durable,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            4242,
+            1 << 20,
+            Persistence::Durable,
+        )
+        .unwrap();
 
         // Two prefix-twins (1,1,100)/(1,1,200) and a distinct (2,0,0).
         t.ingest_owned_batch(wide_batch(&[
             (pk3(1, 1, 100), 1, 10),
             (pk3(1, 1, 200), 1, 20),
             (pk3(2, 0, 0), 1, 30),
-        ])).unwrap();
+        ]))
+        .unwrap();
 
         // Memtable lookups.
         assert!(t.has_pk_bytes(&pk3(1, 1, 100)));
@@ -1247,17 +1348,24 @@ mod tests {
         );
 
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 4243, 1 << 20, Persistence::Durable,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            4243,
+            1 << 20,
+            Persistence::Durable,
+        )
+        .unwrap();
 
         // Payload marker == the signed leading value, so scan order is read back
         // without decoding the PK. `w` lets the same builder emit the DBSP -1
         // retraction row below.
         let row = |a: i64, w: i64| wide_row(&schema, &key(a, 0, 0), w, a);
-        for a in [3i64, -5, 0, -1] {                  // scrambled insertion order
+        for a in [3i64, -5, 0, -1] {
+            // scrambled insertion order
             t.ingest_owned_batch(row(a, 1)).unwrap();
         }
-        t.flush().unwrap();                           // Durable: one on-disk shard
+        t.flush().unwrap(); // Durable: one on-disk shard
 
         // Membership at signed width, byte-keyed (both must survive the flush).
         assert!(t.has_pk_bytes(&key(-5, 0, 0)));
@@ -1271,7 +1379,8 @@ mod tests {
             .map(|r| i64::from_le_bytes(scanned.get_col_ptr(r, 0, 8).try_into().unwrap()))
             .collect();
         assert_eq!(
-            payloads, vec![-5, -1, 0, 3],
+            payloads,
+            vec![-5, -1, 0, 3],
             "wide signed compound PK must scan back in typed (sign-flipped) order",
         );
 
@@ -1296,13 +1405,21 @@ mod tests {
         let tdir = dir.path().join("no_file_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            100,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
-        t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)])).unwrap();
+        t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]))
+            .unwrap();
         assert!(matches!(t.flush_prepare().unwrap(), FlushOutcome::DoneInline));
 
-        let shard_files: Vec<String> = std::fs::read_dir(&tdir).unwrap()
+        let shard_files: Vec<String> = std::fs::read_dir(&tdir)
+            .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with("eph_shard_") || n.starts_with("shard_"))
@@ -1326,8 +1443,14 @@ mod tests {
         let tdir = dir.path().join("cross_fold_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            100,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
         // 6 alternating +1 / -1 flushes on (k=7, v=70): each lands in its own
         // run until the threshold folds them. Net weight is 0.
@@ -1354,8 +1477,14 @@ mod tests {
         let tdir = dir.path().join("run_bound_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            100,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
         let n = INMEM_COMPACT_THRESHOLD as u64 + 4;
         for k in 0..n {
@@ -1379,8 +1508,14 @@ mod tests {
         let tdir = dir.path().join("ceiling_spill_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            100,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
         t.set_inmem_ceiling_for_test(100); // < one flush (~10 rows × 32 B)
 
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
@@ -1405,8 +1540,14 @@ mod tests {
         let tdir = dir.path().join("repeated_spill_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            100,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
         t.set_inmem_ceiling_for_test(100);
 
         const ROUNDS: u64 = 20;
@@ -1421,7 +1562,8 @@ mod tests {
             // Raw eph_shards do not accumulate with rounds — disk L0 self-folds.
             assert!(
                 count_eph_shards(&tdir) <= 5,
-                "round {r}: {} eph_shards accumulated", count_eph_shards(&tdir),
+                "round {r}: {} eph_shards accumulated",
+                count_eph_shards(&tdir),
             );
         }
 
@@ -1438,8 +1580,14 @@ mod tests {
         let tdir = dir.path().join("has_pk_inmem_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            100,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
         t.ingest_owned_batch(make_batch(&[(5, 1, 50)])).unwrap();
         assert!(t.flush().unwrap());
@@ -1460,8 +1608,14 @@ mod tests {
         let tdir = dir.path().join("mixed_read_test");
         let schema = make_u64_i64_schema();
         let mut t = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1 << 20, Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            100,
+            1 << 20,
+            Persistence::Ephemeral,
+        )
+        .unwrap();
 
         // Force keys 0..10 to disk.
         t.set_inmem_ceiling_for_test(100);

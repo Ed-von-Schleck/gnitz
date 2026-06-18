@@ -1,8 +1,8 @@
 //! Reactor client-connection framing: accept / register / recv / the
 //! `send_*` family / `close_fd`, plus `handle_recv_cqe` and conn reaping.
 
-use super::*;
 use super::futures::{AcceptFuture, RecvFuture, SendAlive, SendFuture};
+use super::*;
 
 impl Reactor {
     /// Allocate a per-send id distinct from reply / fsync id space.
@@ -34,7 +34,9 @@ impl Reactor {
     /// Future resolving to the next newly-accepted fd. Called by the
     /// accept-loop task.
     pub fn accept(&self) -> AcceptFuture {
-        AcceptFuture { inner: Rc::clone(&self.inner) }
+        AcceptFuture {
+            inner: Rc::clone(&self.inner),
+        }
     }
 
     /// Elevate `fd`'s per-connection payload ceiling. Called after the
@@ -66,7 +68,8 @@ impl Reactor {
                     "reactor: register_conn: {} stale pending_recv entries for fd={} — \
                      reap_closing_conns did not run before fd was reused; \
                      freeing would be a use-after-free if any SQEs are still in flight",
-                    stale.len(), fd,
+                    stale.len(),
+                    fd,
                 );
             }
         }
@@ -81,7 +84,8 @@ impl Reactor {
                 crate::gnitz_error!(
                     "reactor: recv SQE flush failed for fd={} (errno={}); \
                      SQE queued — will submit on next tick",
-                    fd, e,
+                    fd,
+                    e,
                 );
             }
         }
@@ -93,7 +97,10 @@ impl Reactor {
     /// message; the caller is responsible for `libc::free`-ing the
     /// returned ptr.
     pub fn recv(&self, fd: i32) -> RecvFuture {
-        RecvFuture { fd, inner: Rc::clone(&self.inner) }
+        RecvFuture {
+            fd,
+            inner: Rc::clone(&self.inner),
+        }
     }
 
     /// Returns total bytes sent (>= 0) or negative errno. The loop is
@@ -120,11 +127,10 @@ impl Reactor {
     /// const, so no per-connection allocation or liveness tracking is
     /// required.
     pub async fn send_hello_ack(&self, fd: i32) -> i32 {
-        const OK_ACK: [u8; gnitz_wire::HELLO_ACK_FRAME_SIZE] = gnitz_wire::encode_hello_ack(
-            gnitz_wire::HELLO_STATUS_OK,
-            gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32,
-        );
-        self.send_buf_inner(fd, OK_ACK.as_ptr(), OK_ACK.len(), SendAlive::Static).await
+        const OK_ACK: [u8; gnitz_wire::HELLO_ACK_FRAME_SIZE] =
+            gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32);
+        self.send_buf_inner(fd, OK_ACK.as_ptr(), OK_ACK.len(), SendAlive::Static)
+            .await
     }
 
     /// Send a one-shot response buffer, closing `fd` on transport failure.
@@ -132,21 +138,21 @@ impl Reactor {
     /// reply is on the wire there is nothing left to do on the connection, so a
     /// negative send rc (peer gone / write error) simply schedules the close.
     pub async fn send_buffer_or_close(&self, fd: i32, buf: crate::storage::batch_pool::PooledSendBuf) {
-        if self.send_buffer(fd, buf).await < 0 { self.close_fd(fd); }
+        if self.send_buffer(fd, buf).await < 0 {
+            self.close_fd(fd);
+        }
     }
 
     /// `send_slot` counterpart of [`Self::send_buffer_or_close`]: forward a
     /// worker ring slot as the final reply, closing `fd` on transport failure.
     pub async fn send_slot_or_close(&self, fd: i32, slot: W2mSlot) {
-        if self.send_slot(fd, slot).await < 0 { self.close_fd(fd); }
+        if self.send_slot(fd, slot).await < 0 {
+            self.close_fd(fd);
+        }
     }
 
     /// Common send loop. `alive` keeps the backing memory valid until the CQE fires.
-    async fn send_buf_inner(
-        &self, fd: i32,
-        ptr: *const u8, len: usize,
-        alive: SendAlive,
-    ) -> i32 {
+    async fn send_buf_inner(&self, fd: i32, ptr: *const u8, len: usize, alive: SendAlive) -> i32 {
         let mut sent: usize = 0;
         let mut final_rc: i32 = 0;
         while sent < len {
@@ -164,7 +170,8 @@ impl Reactor {
                     crate::gnitz_error!(
                         "reactor: send SQE flush failed for send_id={} (errno={}); \
                          SQE queued — will submit on next tick",
-                        send_id, e,
+                        send_id,
+                        e,
                     );
                 }
             }
@@ -172,12 +179,22 @@ impl Reactor {
                 send_id,
                 _alive: Some(alive.clone()),
                 inner: Rc::clone(&self.inner),
-            }.await;
-            if rc < 0 { final_rc = rc; break; }
-            if rc == 0 { break; }  // connection closed / EOF
+            }
+            .await;
+            if rc < 0 {
+                final_rc = rc;
+                break;
+            }
+            if rc == 0 {
+                break;
+            } // connection closed / EOF
             sent += rc as usize;
         }
-        if final_rc < 0 { final_rc } else { sent as i32 }
+        if final_rc < 0 {
+            final_rc
+        } else {
+            sent as i32
+        }
     }
 
     /// Request the reactor close `fd` once all outstanding SQEs
@@ -211,9 +228,10 @@ impl Reactor {
         match conn.recv_state.advance(res as usize) {
             io::RecvAdvance::NeedMore => {
                 let (buf, len) = conn.recv_state.remaining();
-                self.inner.ring.borrow_mut().prep_recv(
-                    fd, buf, len, udata(KIND_RECV, fd as u32 as u64),
-                );
+                self.inner
+                    .ring
+                    .borrow_mut()
+                    .prep_recv(fd, buf, len, udata(KIND_RECV, fd as u32 as u64));
                 conn.recv_armed = true;
             }
             io::RecvAdvance::HeaderDone => {
@@ -238,23 +256,29 @@ impl Reactor {
                     return;
                 }
                 conn.recv_state.start_payload(pbuf, plen);
-                self.inner.ring.borrow_mut().prep_recv(
-                    fd, pbuf, plen as u32, udata(KIND_RECV, fd as u32 as u64),
-                );
+                self.inner
+                    .ring
+                    .borrow_mut()
+                    .prep_recv(fd, pbuf, plen as u32, udata(KIND_RECV, fd as u32 as u64));
                 conn.recv_armed = true;
             }
             io::RecvAdvance::MessageDone => {
                 let (ptr, len) = conn.recv_state.take_message();
-                self.inner.pending_recv.borrow_mut()
-                    .entry(fd).or_default().push_back((ptr, len));
+                self.inner
+                    .pending_recv
+                    .borrow_mut()
+                    .entry(fd)
+                    .or_default()
+                    .push_back((ptr, len));
                 // Arm next header recv immediately so the kernel can keep
                 // draining the client's send buffer. Per-session FIFO is
                 // preserved by the `VecDeque` order — the handler still
                 // consumes messages in arrival order.
                 let hdr = conn.recv_state.hdr_buf_ptr();
-                self.inner.ring.borrow_mut().prep_recv(
-                    fd, hdr, 4, udata(KIND_RECV, fd as u32 as u64),
-                );
+                self.inner
+                    .ring
+                    .borrow_mut()
+                    .prep_recv(fd, hdr, 4, udata(KIND_RECV, fd as u32 as u64));
                 conn.recv_armed = true;
                 if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
                     w.wake();
@@ -275,7 +299,9 @@ impl Reactor {
     /// Called once per tick. Iterates only `closing_fds` (O(closing)),
     /// not all connections.
     pub(super) fn reap_closing_conns(&self) {
-        if self.inner.closing_fds.borrow().is_empty() { return; }
+        if self.inner.closing_fds.borrow().is_empty() {
+            return;
+        }
         // Take ownership of the scratch (leaves a zero-cap Vec sentinel so
         // the borrow of `closing_scratch` ends immediately) and refill it.
         // The body re-borrows `closing_fds` and `conns`, which would deadlock
@@ -291,21 +317,26 @@ impl Reactor {
                     None => true,
                 }
             };
-            if !ready { continue; }
+            if !ready {
+                continue;
+            }
             self.inner.closing_fds.borrow_mut().remove(&fd);
             self.inner.conns.borrow_mut().remove(&fd);
             self.inner.recv_waiters.borrow_mut().remove(&fd);
             if let Some(queue) = self.inner.pending_recv.borrow_mut().remove(&fd) {
                 for (ptr, _) in queue {
                     if !ptr.is_null() {
-                        unsafe { libc::free(ptr as *mut libc::c_void); }
+                        unsafe {
+                            libc::free(ptr as *mut libc::c_void);
+                        }
                     }
                 }
             }
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
         // Return the scratch Vec to the cell so its capacity is retained.
         *self.inner.closing_scratch.borrow_mut() = closing;
     }
-
 }

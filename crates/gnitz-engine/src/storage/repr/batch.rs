@@ -7,12 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::columnar::ColumnarSource;
 use super::merge::{self, MemBatch};
-use crate::schema::{self, BlobCache, SchemaColumn, SchemaDescriptor, type_code};
 use crate::foundation::codec::{read_i64_le, read_u64_le};
+use crate::schema::{self, type_code, BlobCache, SchemaColumn, SchemaDescriptor};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
 #[inline(always)]
-fn next_blob_id() -> u64 { BLOB_ID_CTR.fetch_add(1, Ordering::Relaxed) }
+fn next_blob_id() -> u64 {
+    BLOB_ID_CTR.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Minimum allocation size to request transparent hugepage backing.
 /// Below this, hugepage promotion is impossible (no full 2MB PMD region).
@@ -64,7 +66,11 @@ fn alloc_large_zeroed(size: usize) -> Vec<u8> {
 /// otherwise misalign the following region. MORSEL=256 batches are already
 /// aligned, but smaller batches are not. Total allocation grows by at most 7
 /// bytes per region boundary.
-pub(in crate::storage) fn compute_offsets(strides: &[u8; MAX_BATCH_REGIONS], num_regions: usize, capacity: usize) -> ([usize; MAX_BATCH_REGIONS], usize) {
+pub(in crate::storage) fn compute_offsets(
+    strides: &[u8; MAX_BATCH_REGIONS],
+    num_regions: usize,
+    capacity: usize,
+) -> ([usize; MAX_BATCH_REGIONS], usize) {
     // Offsets are `usize`, not `u32`: a single large batch (a wide multi-column
     // join, a bulk full-scan/merge) can have a cumulative offset > 4 GB even
     // though each individual region is still capped at 4 GB by the u32 wire
@@ -96,11 +102,7 @@ pub(in crate::storage) fn relocate_string_cell(
 
 /// Append payload strides from `schema` into `strides` starting at `start`.
 /// Returns the next free index (i.e. `start + num_payload_cols`).
-fn fill_payload_strides(
-    schema: &SchemaDescriptor,
-    strides: &mut [u8; MAX_BATCH_REGIONS],
-    start: usize,
-) -> usize {
+fn fill_payload_strides(schema: &SchemaDescriptor, strides: &mut [u8; MAX_BATCH_REGIONS], start: usize) -> usize {
     let mut idx = start;
     for (_, _, col) in schema.payload_columns() {
         // A join carries both sides' payload columns through the intermediate
@@ -265,10 +267,7 @@ impl Batch {
     /// non-PK columns followed by `right_schema`'s non-PK columns.  Used for
     /// join outputs ([left_PK, left_payload..., right_payload...]), which
     /// have no single `SchemaDescriptor` in the engine.
-    pub fn empty_joined(
-        left_schema: &SchemaDescriptor,
-        right_schema: &SchemaDescriptor,
-    ) -> Self {
+    pub fn empty_joined(left_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> Self {
         let mut strides = [0u8; MAX_BATCH_REGIONS];
         strides[REG_PK] = pk_stride(left_schema);
         strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
@@ -312,7 +311,7 @@ impl Batch {
                 buf.resize(total_size, 0);
                 buf
             } else {
-                drop(buf);   // evict the undersized buffer; pool converges to larger sizes
+                drop(buf); // evict the undersized buffer; pool converges to larger sizes
                 vec![0u8; total_size]
             }
         };
@@ -340,12 +339,7 @@ impl Batch {
     /// # Safety
     /// `ptrs[i]` must point to at least `sizes[i]` readable bytes.
     #[allow(clippy::uninit_vec)]
-    pub unsafe fn from_regions(
-        ptrs: &[*const u8],
-        sizes: &[u32],
-        count: usize,
-        num_payload_cols: usize,
-    ) -> Self {
+    pub unsafe fn from_regions(ptrs: &[*const u8], sizes: &[u32], count: usize, num_payload_cols: usize) -> Self {
         if count == 0 {
             return Self::empty(num_payload_cols, 16);
         }
@@ -390,7 +384,9 @@ impl Batch {
             let mut v = super::batch_pool::acquire_buf();
             v.clear();
             v.reserve(blob_sz);
-            unsafe { v.set_len(blob_sz); }
+            unsafe {
+                v.set_len(blob_sz);
+            }
             std::ptr::copy_nonoverlapping(ptrs[blob_idx], v.as_mut_ptr(), blob_sz);
             v
         } else {
@@ -460,10 +456,13 @@ impl Batch {
         // batch's payload-region count must equal the schema's non-PK
         // column count regardless of single-vs-compound PK.
         debug_assert_eq!(
-            self.num_payload_cols(), s.num_payload_cols(),
+            self.num_payload_cols(),
+            s.num_payload_cols(),
             "Batch::set_schema: batch has {} payload cols, schema declares {} payload cols \
              (pk_count={})",
-            self.num_payload_cols(), s.num_payload_cols(), s.pk_indices().len()
+            self.num_payload_cols(),
+            s.num_payload_cols(),
+            s.pk_indices().len()
         );
         self.schema = Some(s);
     }
@@ -542,8 +541,7 @@ impl Batch {
     pub(crate) fn capacity_writer(&mut self) -> merge::DirectWriter<'_> {
         let cap = self.capacity as usize;
         let schema = self.schema.expect("capacity_writer requires schema");
-        let (pk, weight, null_bmp, col_slices) =
-            carve_writer_slices(&mut self.data, &schema, cap);
+        let (pk, weight, null_bmp, col_slices) = carve_writer_slices(&mut self.data, &schema, cap);
         merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut self.blob, schema, cap)
     }
 
@@ -574,7 +572,12 @@ impl Batch {
     /// weight may equal an adjacent row's element weight or zero.
     #[inline]
     pub fn set_weight(&mut self, row: usize, w: i64) {
-        debug_assert!(row < self.count, "set_weight: row {} out of bounds ({})", row, self.count);
+        debug_assert!(
+            row < self.count,
+            "set_weight: row {} out of bounds ({})",
+            row,
+            self.count
+        );
         let off = self.offsets[REG_WEIGHT] + row * 8;
         self.data[off..off + 8].copy_from_slice(&w.to_le_bytes());
         self.consolidated = false;
@@ -599,7 +602,9 @@ impl Batch {
     /// Ensure the data buffer has room for at least `n` more rows beyond `count`.
     #[allow(clippy::uninit_vec, clippy::needless_range_loop)]
     pub(crate) fn reserve_rows(&mut self, n: usize) {
-        if self.count + n <= self.capacity as usize { return; }
+        if self.count + n <= self.capacity as usize {
+            return;
+        }
         let nr = self.num_regions as usize;
         let new_cap = (self.capacity as usize * 2).max(8).max(self.count + n);
         let (new_offsets, new_total) = compute_offsets(&self.strides, nr, new_cap);
@@ -614,25 +619,33 @@ impl Batch {
                 // every live byte, and all accessors are bounded by `count`.
                 // We still want THP backing for large buffers.
                 let mut v = Vec::with_capacity(new_total);
-                unsafe { v.set_len(new_total); }
+                unsafe {
+                    v.set_len(new_total);
+                }
                 crate::foundation::posix_io::madvise_hugepage(v.as_ptr() as *mut u8, new_total);
                 v
             } else {
                 let mut buf = super::batch_pool::acquire_buf();
                 if buf.capacity() >= new_total {
-                    unsafe { buf.set_len(new_total); }
+                    unsafe {
+                        buf.set_len(new_total);
+                    }
                     buf
                 } else {
-                    drop(buf);   // evict the undersized buffer; pool converges to larger sizes
+                    drop(buf); // evict the undersized buffer; pool converges to larger sizes
                     let mut v = Vec::with_capacity(new_total);
-                    unsafe { v.set_len(new_total); }
+                    unsafe {
+                        v.set_len(new_total);
+                    }
                     v
                 }
             };
 
             for i in 0..nr {
                 let len = self.count * self.strides[i] as usize;
-                if len == 0 { continue; }
+                if len == 0 {
+                    continue;
+                }
                 let old_off = self.offsets[i];
                 let new_off = new_offsets[i];
                 unsafe {
@@ -674,9 +687,14 @@ impl Batch {
     /// use `empty_with_schema`, `empty_joined`, or `with_schema`.
     #[inline]
     fn extend_region(&mut self, r: usize, src: &[u8]) {
-        debug_assert_eq!(src.len(), self.strides[r] as usize,
+        debug_assert_eq!(
+            src.len(),
+            self.strides[r] as usize,
             "extend_region: src len {} != stride {} for region {}",
-            src.len(), self.strides[r], r);
+            src.len(),
+            self.strides[r],
+            r
+        );
         if self.count >= self.capacity as usize {
             self.ensure_row_capacity();
         }
@@ -685,11 +703,17 @@ impl Batch {
     }
 
     #[inline]
-    pub fn extend_weight(&mut self, d: &[u8]) { self.extend_region(REG_WEIGHT, d); }
+    pub fn extend_weight(&mut self, d: &[u8]) {
+        self.extend_region(REG_WEIGHT, d);
+    }
     #[inline]
-    pub fn extend_null_bmp(&mut self, d: &[u8]) { self.extend_region(REG_NULL_BMP, d); }
+    pub fn extend_null_bmp(&mut self, d: &[u8]) {
+        self.extend_region(REG_NULL_BMP, d);
+    }
     #[inline]
-    pub fn extend_col(&mut self, pi: usize, d: &[u8]) { self.extend_region(REG_PAYLOAD_START + pi, d); }
+    pub fn extend_col(&mut self, pi: usize, d: &[u8]) {
+        self.extend_region(REG_PAYLOAD_START + pi, d);
+    }
 
     /// Append a 128-bit primary key at the current row position.
     ///
@@ -761,11 +785,7 @@ impl Batch {
     #[inline]
     pub fn set_pk_at_bytes(&mut self, row: usize, bytes: &[u8]) {
         let stride = self.strides[REG_PK] as usize;
-        debug_assert_eq!(
-            bytes.len(),
-            stride,
-            "set_pk_at_bytes: length must equal pk_stride",
-        );
+        debug_assert_eq!(bytes.len(), stride, "set_pk_at_bytes: length must equal pk_stride",);
         let off = self.offsets[REG_PK] + row * stride;
         self.data[off..off + stride].copy_from_slice(bytes);
     }
@@ -795,8 +815,7 @@ impl Batch {
         let n = end - start;
         let dst_off = self.offsets[r] + self.count * stride;
         let src_off = start * stride;
-        self.data[dst_off..dst_off + n * stride]
-            .copy_from_slice(&src_region_data[src_off..src_off + n * stride]);
+        self.data[dst_off..dst_off + n * stride].copy_from_slice(&src_region_data[src_off..src_off + n * stride]);
     }
 
     /// Bulk-copy rows `[start, end)` from a `MemBatch` into `self`.
@@ -819,11 +838,19 @@ impl Batch {
         weight_override: Option<i64>,
     ) {
         assert!(start <= end, "append_mem_batch_range: start ({start}) > end ({end})");
-        assert!(end <= src.count, "append_mem_batch_range: end ({end}) > src.count ({})", src.count);
+        assert!(
+            end <= src.count,
+            "append_mem_batch_range: end ({end}) > src.count ({})",
+            src.count
+        );
         let n = end - start;
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         self.reserve_rows(n);
-        if !src.blob.is_empty() { self.blob.reserve(src.blob.len()); }
+        if !src.blob.is_empty() {
+            self.blob.reserve(src.blob.len());
+        }
         self.bulk_copy_region(REG_PK, src.pk(), start, end);
         match weight_override {
             Some(w) => {
@@ -843,7 +870,9 @@ impl Batch {
         let mut is_string_at = [false; MAX_BATCH_REGIONS];
         if let Some(s) = self.schema {
             for (pi, _ci, col) in s.payload_columns() {
-                if pi >= npc { break; }
+                if pi >= npc {
+                    break;
+                }
                 is_string_at[pi] = gnitz_wire::is_german_string(col.type_code);
             }
         }
@@ -852,10 +881,13 @@ impl Batch {
             if is_str && cs == 16 {
                 for row in start..end {
                     let src_struct = src.get_col_ptr(row, pi, 16);
-                    let dst_off = self.offsets[REG_PAYLOAD_START + pi]
-                        + (self.count + row - start) * 16;
-                    relocate_string_cell(src_struct, src.blob,
-                        &mut self.data[dst_off..dst_off + 16], &mut self.blob);
+                    let dst_off = self.offsets[REG_PAYLOAD_START + pi] + (self.count + row - start) * 16;
+                    relocate_string_cell(
+                        src_struct,
+                        src.blob,
+                        &mut self.data[dst_off..dst_off + 16],
+                        &mut self.blob,
+                    );
                 }
             } else if cs > 0 {
                 self.bulk_copy_region(REG_PAYLOAD_START + pi, src.col_data(pi, cs), start, end);
@@ -900,11 +932,7 @@ impl Batch {
     }
 
     /// Scatter-copy selected rows from a MemBatch into a new Batch.
-    pub fn from_indexed_rows(
-        batch: &MemBatch,
-        indices: &[u32],
-        schema: &SchemaDescriptor,
-    ) -> Self {
+    pub fn from_indexed_rows(batch: &MemBatch, indices: &[u32], schema: &SchemaDescriptor) -> Self {
         if indices.is_empty() {
             return Self::empty_with_schema(schema);
         }
@@ -992,7 +1020,9 @@ impl Batch {
     /// `self` must have strides pre-set (see `empty_with_schema` / `with_schema`).
     pub fn append_batch(&mut self, src: &Batch, start: usize, end: usize) {
         let end = if end > src.count { src.count } else { end };
-        if start >= end { return; }
+        if start >= end {
+            return;
+        }
         self.sorted = false;
         self.consolidated = false;
         self.append_rows_inner(src, start, end, false);
@@ -1001,7 +1031,9 @@ impl Batch {
     /// Bulk-copy rows with negated weights.
     pub fn append_batch_negated(&mut self, src: &Batch, start: usize, end: usize) {
         let end = if end > src.count { src.count } else { end };
-        if start >= end { return; }
+        if start >= end {
+            return;
+        }
         self.sorted = false;
         self.consolidated = false;
         self.append_rows_inner(src, start, end, true);
@@ -1016,7 +1048,9 @@ impl Batch {
     /// because both batches share the same blob content.
     pub fn append_batch_no_blob_reloc(&mut self, src: &Batch, start: usize, end: usize) {
         let end = end.min(src.count);
-        if start >= end { return; }
+        if start >= end {
+            return;
+        }
         // Guard for the precondition: both batches must share the same blob identity,
         // established by calling `share_blob_from` (or `clone_batch`) before this.
         // Matching IDs guarantees identical blob content; same-length-different-content
@@ -1037,7 +1071,12 @@ impl Batch {
         let npc = self.num_payload_cols();
         for pi in 0..npc {
             if self.strides[REG_PAYLOAD_START + pi] > 0 {
-                self.bulk_copy_region(REG_PAYLOAD_START + pi, &src.data[src.offsets[REG_PAYLOAD_START + pi]..], start, end);
+                self.bulk_copy_region(
+                    REG_PAYLOAD_START + pi,
+                    &src.data[src.offsets[REG_PAYLOAD_START + pi]..],
+                    start,
+                    end,
+                );
             }
         }
         self.count += n;
@@ -1073,7 +1112,9 @@ impl Batch {
         let mut is_string_at = [false; MAX_BATCH_REGIONS];
         if let Some(s) = self.schema {
             for (pi, _ci, col) in s.payload_columns() {
-                if pi >= npc { break; }
+                if pi >= npc {
+                    break;
+                }
                 is_string_at[pi] = gnitz_wire::is_german_string(col.type_code);
             }
         }
@@ -1085,10 +1126,20 @@ impl Batch {
                     let src_off = src.offsets[REG_PAYLOAD_START + pi] + row * 16;
                     let src_struct = &src.data[src_off..src_off + 16];
                     let dst_off = self.offsets[REG_PAYLOAD_START + pi] + (self.count + row - start) * 16;
-                    relocate_string_cell(src_struct, &src.blob, &mut self.data[dst_off..dst_off + 16], &mut self.blob);
+                    relocate_string_cell(
+                        src_struct,
+                        &src.blob,
+                        &mut self.data[dst_off..dst_off + 16],
+                        &mut self.blob,
+                    );
                 }
             } else if cs > 0 {
-                self.bulk_copy_region(REG_PAYLOAD_START + pi, &src.data[src.offsets[REG_PAYLOAD_START + pi]..], start, end);
+                self.bulk_copy_region(
+                    REG_PAYLOAD_START + pi,
+                    &src.data[src.offsets[REG_PAYLOAD_START + pi]..],
+                    start,
+                    end,
+                );
             }
         }
 
@@ -1132,10 +1183,8 @@ impl Batch {
         for (pi, (ptr, &sz)) in col_ptrs.iter().zip(col_sizes.iter()).enumerate() {
             let ci = schema.map_or(pi, |s| s.payload_col_idx(pi));
 
-            let is_string = schema.is_some_and(|s| {
-                ci < s.num_columns()
-                    && gnitz_wire::is_german_string(s.columns[ci].type_code)
-            });
+            let is_string =
+                schema.is_some_and(|s| ci < s.num_columns() && gnitz_wire::is_german_string(s.columns[ci].type_code));
             let is_null = (null_word >> pi) & 1 != 0;
             let col_size = sz as usize;
 
@@ -1164,7 +1213,9 @@ impl Batch {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn append_row_simple(
         &mut self,
-        pk: u128, weight: i64, null_word: u64,
+        pk: u128,
+        weight: i64,
+        null_word: u64,
         lo_values: &[i64],
         hi_values: &[u64],
         str_ptrs: &[*const u8],
@@ -1258,7 +1309,10 @@ impl Batch {
         } else if idx == blob_idx {
             self.blob.as_ptr()
         } else {
-            panic!("region_ptr: index {idx} out of range (num_regions_total = {})", blob_idx + 1);
+            panic!(
+                "region_ptr: index {idx} out of range (num_regions_total = {})",
+                blob_idx + 1
+            );
         }
     }
 
@@ -1309,7 +1363,9 @@ impl Batch {
         row: usize,
         blob_cache: Option<&mut BlobCache>,
     ) {
-        if weight == 0 { return; }
+        if weight == 0 {
+            return;
+        }
         self.ensure_row_capacity();
         self.extend_pk(key);
         self.append_row_tail_from_source(weight, source, row, blob_cache);
@@ -1328,7 +1384,9 @@ impl Batch {
         row: usize,
         blob_cache: Option<&mut BlobCache>,
     ) {
-        if weight == 0 { return; }
+        if weight == 0 {
+            return;
+        }
         self.ensure_row_capacity();
         self.extend_pk_bytes(pk_bytes);
         self.append_row_tail_from_source(weight, source, row, blob_cache);
@@ -1362,7 +1420,10 @@ impl Batch {
             } else if gnitz_wire::is_german_string(col.type_code) {
                 let src_struct = source.get_col_ptr(row, pi, cs);
                 let dest = crate::schema::relocate_german_string_vec(
-                    src_struct, src_blob, &mut self.blob, blob_cache.as_deref_mut(),
+                    src_struct,
+                    src_blob,
+                    &mut self.blob,
+                    blob_cache.as_deref_mut(),
                 );
                 self.extend_col(pi, &dest);
             } else {
@@ -1423,10 +1484,16 @@ impl Batch {
     }
 
     #[cfg(test)]
-    pub(crate) fn data_capacity(&self) -> usize { self.data.capacity() }
+    pub(crate) fn data_capacity(&self) -> usize {
+        self.data.capacity()
+    }
 
-    pub fn mark_sorted(&mut self) { self.sorted = true; }
-    pub fn mark_consolidated(&mut self) { self.consolidated = true; }
+    pub fn mark_sorted(&mut self) {
+        self.sorted = true;
+    }
+    pub fn mark_consolidated(&mut self) {
+        self.consolidated = true;
+    }
 }
 
 impl Drop for Batch {
@@ -1437,7 +1504,9 @@ impl Drop for Batch {
 }
 
 impl Clone for Batch {
-    fn clone(&self) -> Self { self.clone_batch() }
+    fn clone(&self) -> Self {
+        self.clone_batch()
+    }
 }
 
 impl ColumnarSource for Batch {
@@ -1450,7 +1519,9 @@ impl ColumnarSource for Batch {
         Batch::get_col_ptr(self, row, payload_col, col_size)
     }
     #[inline]
-    fn blob_slice(&self) -> &[u8] { &self.blob }
+    fn blob_slice(&self) -> &[u8] {
+        &self.blob
+    }
 }
 
 /// Owned `Batch` certified to be consolidated (sorted, no duplicate PKs, weights folded).
@@ -1462,10 +1533,15 @@ pub struct ConsolidatedBatch(Batch);
 impl ConsolidatedBatch {
     pub(crate) fn new_unchecked(batch: Batch) -> Self {
         debug_assert!(batch.sorted || batch.count == 0, "ConsolidatedBatch must be sorted");
-        debug_assert!(batch.consolidated || batch.count == 0, "ConsolidatedBatch must be consolidated");
+        debug_assert!(
+            batch.consolidated || batch.count == 0,
+            "ConsolidatedBatch must be consolidated"
+        );
         ConsolidatedBatch(batch)
     }
-    pub fn into_inner(self) -> Batch { self.0 }
+    pub fn into_inner(self) -> Batch {
+        self.0
+    }
     /// Reinterpret `&Batch` as `&ConsolidatedBatch` when `batch.consolidated` is set.
     /// Empty batches are always considered consolidated.
     // SAFETY: ConsolidatedBatch is #[repr(transparent)] over Batch.
@@ -1477,7 +1553,9 @@ impl ConsolidatedBatch {
 
 impl std::ops::Deref for ConsolidatedBatch {
     type Target = Batch;
-    fn deref(&self) -> &Batch { &self.0 }
+    fn deref(&self) -> &Batch {
+        &self.0
+    }
 }
 
 /// Allocate a single contiguous arena, run a merge/copy operation via
@@ -1507,7 +1585,7 @@ pub fn write_to_batch(
             buf.resize(arena_size, 0);
             buf
         } else {
-            drop(buf);   // evict the undersized buffer; pool converges to larger sizes
+            drop(buf); // evict the undersized buffer; pool converges to larger sizes
             alloc_large_zeroed(arena_size)
         }
     };
@@ -1525,11 +1603,8 @@ pub fn write_to_batch(
 
     let actual_rows;
     {
-        let (pk, weight, null_bmp, col_slices) =
-            carve_writer_slices(&mut data, schema, max_rows);
-        let mut writer = merge::DirectWriter::new(
-            pk, weight, null_bmp, col_slices, &mut blob, *schema, max_rows,
-        );
+        let (pk, weight, null_bmp, col_slices) = carve_writer_slices(&mut data, schema, max_rows);
+        let mut writer = merge::DirectWriter::new(pk, weight, null_bmp, col_slices, &mut blob, *schema, max_rows);
         write_fn(&mut writer);
         actual_rows = writer.row_count();
     }
@@ -1654,7 +1729,10 @@ impl BatchBuilder {
 
     #[cfg(test)]
     fn schema(&self) -> &SchemaDescriptor {
-        self.batch.schema.as_ref().expect("BatchBuilder batch always carries a schema")
+        self.batch
+            .schema
+            .as_ref()
+            .expect("BatchBuilder batch always carries a schema")
     }
 
     #[cfg(test)]
@@ -1691,24 +1769,22 @@ impl BatchBuilder {
 /// persisted row replayed at boot, neither of which goes through the SQL
 /// planner's pre-check. Validating here converts the abort into a clean ingest
 /// `Err` for every path (defence in depth at the catalog trust boundary).
-pub(crate) fn make_index_schema(
-    source_cols: &[u32],
-    source: &SchemaDescriptor,
-) -> Result<SchemaDescriptor, String> {
+pub(crate) fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) -> Result<SchemaDescriptor, String> {
     let mut col_types: Vec<u8> = Vec::with_capacity(source_cols.len());
     for &c in source_cols {
         if c as usize >= source.num_columns() {
             return Err(format!(
                 "Index: column index {} out of bounds (columns={})",
-                c, source.num_columns()));
+                c,
+                source.num_columns()
+            ));
         }
         col_types.push(source.columns[c as usize].type_code);
     }
     let src_pk = source.pk_indices();
     // Shared with the SQL planner's CREATE INDEX pre-check, so the promotion
     // rule and the arity/stride limits can never disagree across the layers.
-    let promoted = gnitz_wire::index_key_types(
-        &col_types, src_pk.len(), source.pk_stride() as usize)?;
+    let promoted = gnitz_wire::index_key_types(&col_types, src_pk.len(), source.pk_stride() as usize)?;
     let n = promoted.len();
     let arity = n + src_pk.len();
     let mut cols: Vec<SchemaColumn> = Vec::with_capacity(arity);
@@ -1730,7 +1806,7 @@ pub(crate) fn make_index_schema(
 /// path; the client decodes against the wire schema and reads columns by position.
 pub(crate) fn index_meta_schema_desc() -> SchemaDescriptor {
     let u64c = SchemaColumn::new(type_code::U64, 0);
-    SchemaDescriptor::new(&[u64c, u64c], &[0])   // [packed_cols (PK), is_unique]
+    SchemaDescriptor::new(&[u64c, u64c], &[0]) // [packed_cols (PK), is_unique]
 }
 pub(crate) const INDEX_META_COL_NAMES: [&[u8]; 2] = [b"cols", b"is_unique"];
 
@@ -1751,8 +1827,10 @@ pub(crate) fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> Schem
         cols.push(*col);
     }
     for &p in project {
-        debug_assert!(!schema.is_pk_col(p as usize),
-            "project_schema: projected column {p} is a PK column");
+        debug_assert!(
+            !schema.is_pk_col(p as usize),
+            "project_schema: projected column {p} is a PK column"
+        );
         cols.push(schema.columns[p as usize]);
     }
     SchemaDescriptor::new(&cols, &pk_idx)
@@ -1761,17 +1839,11 @@ pub(crate) fn project_schema(schema: &SchemaDescriptor, project: &[u8]) -> Schem
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::wide_pk_3xu64_schema;
 
     fn single_col_pk_schema(tc: u8) -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(tc, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
+        SchemaDescriptor::new(&[SchemaColumn::new(tc, 0), SchemaColumn::new(type_code::I64, 0)], &[0])
     }
 
     // Compound-PK regression guard for the precomputed payload→logical
@@ -1842,9 +1914,9 @@ mod tests {
         // extract_pk_value writes for the corresponding PK type.
         let cases: &[(u8, u128)] = &[
             // I8 PK = -1: extract_pk_value writes (-1i8 as u8) as u128 = 0xFF
-            (type_code::I8,  0xFFu128),
+            (type_code::I8, 0xFFu128),
             // U8 PK = 200
-            (type_code::U8,  200u128),
+            (type_code::U8, 200u128),
             // I16 PK = -1: low 2 bytes = 0xFFFF
             (type_code::I16, 0xFFFFu128),
             // U16 PK = u16::MAX
@@ -1863,8 +1935,7 @@ mod tests {
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &0i64.to_le_bytes());
             b.count += 1;
-            assert_eq!(b.get_pk(0), pk,
-                "type_code {tc} narrow-stride round-trip");
+            assert_eq!(b.get_pk(0), pk, "type_code {tc} narrow-stride round-trip");
         }
     }
 
@@ -1905,12 +1976,18 @@ mod tests {
 
             assert_eq!(out.count, rows.len(), "tc={tc} stride={stride}: row count");
             for (i, &(pk, w, v)) in rows.iter().enumerate() {
-                assert_eq!(out.get_pk_bytes(i), &pk.to_be_bytes()[16 - stride..],
-                    "tc={tc} stride={stride}: pk row {i}");
+                assert_eq!(
+                    out.get_pk_bytes(i),
+                    &pk.to_be_bytes()[16 - stride..],
+                    "tc={tc} stride={stride}: pk row {i}"
+                );
                 assert_eq!(out.get_weight(i), w, "tc={tc} stride={stride}: weight row {i}");
                 let col = out.get_col_ptr(i, 0, 8);
-                assert_eq!(i64::from_le_bytes(col.try_into().unwrap()), v,
-                    "tc={tc} stride={stride}: payload row {i}");
+                assert_eq!(
+                    i64::from_le_bytes(col.try_into().unwrap()),
+                    v,
+                    "tc={tc} stride={stride}: payload row {i}"
+                );
             }
         }
     }
@@ -1919,13 +1996,7 @@ mod tests {
     fn extend_pk_roundtrip_across_u64_boundary() {
         let schema = single_col_pk_schema(type_code::U128);
         let mut b = Batch::with_schema(schema, 8);
-        let keys: [u128; 5] = [
-            0,
-            1,
-            u64::MAX as u128,
-            (u64::MAX as u128) + 1,
-            u128::MAX,
-        ];
+        let keys: [u128; 5] = [0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
         for &pk in &keys {
             b.extend_pk(pk);
             b.extend_weight(&1i64.to_le_bytes());
@@ -2049,8 +2120,7 @@ mod tests {
         b.reserve_rows(3);
         let pks: [[u8; 16]; 3] = [
             [
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
             ],
             [0; 16],
             [0xff; 16],
@@ -2080,8 +2150,7 @@ mod tests {
             b.count += 1;
         }
         let new_pk_bytes: [u8; 16] = [
-            0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce,
-            0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78,
+            0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78,
         ];
         b.set_pk_at_bytes(1, &new_pk_bytes);
         assert_eq!(b.get_pk(0), 10);
@@ -2129,9 +2198,7 @@ mod tests {
         }
         for probe in [0u64, 5, 10, 15, 20, 25, 30, 40, 50, 51, u64::MAX] {
             let key = probe.to_be_bytes();
-            let expected = (0..b.count)
-                .find(|&i| b.get_pk_bytes(i) >= &key[..])
-                .unwrap_or(b.count);
+            let expected = (0..b.count).find(|&i| b.get_pk_bytes(i) >= &key[..]).unwrap_or(b.count);
             assert_eq!(b.find_lower_bound_bytes(&key), expected, "probe={probe}");
         }
     }
@@ -2144,9 +2211,11 @@ mod tests {
         let schema = wide_pk_3xu64_schema();
         assert_eq!(schema.pk_stride(), 24);
         let mut b = Batch::empty_with_schema(&schema);
+        // Grouped by 8-byte u64 column boundaries (3xU64 compound PK).
+        // Sorted in compare_pk_bytes order (lexicographic over the
+        // u64 columns: column 0 high priority, then 1, then 2).
+        #[rustfmt::skip]
         let pks: [[u8; 24]; 5] = [
-            // Sorted in compare_pk_bytes order (lexicographic over the
-            // u64 columns: column 0 high priority, then 1, then 2).
             [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
             [1,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
             [1,0,0,0,0,0,0,0,  5,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
@@ -2161,6 +2230,7 @@ mod tests {
             b.extend_col(0, &0i64.to_le_bytes());
             b.count += 1;
         }
+        #[rustfmt::skip]
         let probes: &[[u8; 24]] = &[
             [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
             [0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  1,0,0,0,0,0,0,0],
@@ -2172,10 +2242,9 @@ mod tests {
         ];
         for key in probes {
             // Expected: first row where compare_pk_bytes(row, key) is not Less.
-            let expected = (0..b.count).find(|&i| {
-                super::super::columnar::compare_pk_bytes(b.get_pk_bytes(i), key)
-                    != std::cmp::Ordering::Less
-            }).unwrap_or(b.count);
+            let expected = (0..b.count)
+                .find(|&i| super::super::columnar::compare_pk_bytes(b.get_pk_bytes(i), key) != std::cmp::Ordering::Less)
+                .unwrap_or(b.count);
             let got = b.find_lower_bound_bytes(key);
             assert_eq!(got, expected, "probe={key:?}");
         }
@@ -2198,9 +2267,17 @@ mod tests {
             &[0],
         );
         let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(), "test", schema, 100, 1, crate::storage::Persistence::Ephemeral, 0, 1,
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            100,
+            1,
+            crate::storage::Persistence::Ephemeral,
+            0,
+            1,
             crate::storage::partition_arena_size(1),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Ingest one row so retract_pk can set a found-row.
         let mut src = Batch::with_schema(schema, 1);
@@ -2242,9 +2319,8 @@ mod tests {
         b.reserve_rows(3);
         let pks: [[u8; 24]; 3] = [
             [
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-                0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x21,
+                0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
             ],
             [0u8; 24],
             [0xffu8; 24],
@@ -2330,8 +2406,8 @@ mod tests {
         // heap offset of 0 — but the source blob is empty, so [0, 100) overruns.
         let mut cell = [0u8; 16];
         cell[0..4].copy_from_slice(&100u32.to_le_bytes()); // length
-        cell[4..8].copy_from_slice(b"abcd");               // inline prefix
-        cell[8..16].copy_from_slice(&0u64.to_le_bytes());  // heap offset 0
+        cell[4..8].copy_from_slice(b"abcd"); // inline prefix
+        cell[8..16].copy_from_slice(&0u64.to_le_bytes()); // heap offset 0
         let src_blob: &[u8] = &[]; // empty: any long string overruns
 
         let mut dst_blob: Vec<u8> = Vec::new();

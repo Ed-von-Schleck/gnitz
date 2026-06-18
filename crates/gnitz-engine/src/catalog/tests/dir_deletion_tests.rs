@@ -19,24 +19,34 @@ fn defer_then_drain_gated_deletions() {
 
     // DROP SCHEMA cascade queues the table dir and the schema dir.
     engine.drop_schema("s").unwrap();
-    assert!(!engine.pending_dir_deletions.is_empty(),
-        "DROP must queue dirs for removal");
+    assert!(
+        !engine.pending_dir_deletions.is_empty(),
+        "DROP must queue dirs for removal"
+    );
 
     // The DROP-success path defers instead of removing (workers may still be
     // applying a CREATE of the same entity over the shared on-disk tree).
     engine.defer_pending_dir_deletions();
-    assert!(engine.pending_dir_deletions.is_empty(),
-        "defer must drain the in-flight queue");
-    assert!(!engine.checkpoint_gated_deletions.is_empty(),
-        "defer must populate the gated queue");
-    assert!(Path::new(&tbl_dir).exists(),
-        "dir must survive until the gating checkpoint");
+    assert!(
+        engine.pending_dir_deletions.is_empty(),
+        "defer must drain the in-flight queue"
+    );
+    assert!(
+        !engine.checkpoint_gated_deletions.is_empty(),
+        "defer must populate the gated queue"
+    );
+    assert!(
+        Path::new(&tbl_dir).exists(),
+        "dir must survive until the gating checkpoint"
+    );
 
     // The gating checkpoint fires: now safe to physically remove.
     engine.drain_checkpoint_gated_deletions();
     assert!(engine.checkpoint_gated_deletions.is_empty());
-    assert!(!Path::new(&tbl_dir).exists(),
-        "checkpoint drain must physically remove the gated dir");
+    assert!(
+        !Path::new(&tbl_dir).exists(),
+        "checkpoint drain must physically remove the gated dir"
+    );
 }
 
 // Locks the cancellation contract: a DROP SCHEMA + CREATE SCHEMA with no
@@ -64,8 +74,10 @@ fn drop_then_recreate_schema_survives_gated_drain() {
     engine.drain_checkpoint_gated_deletions();
 
     // RED without the cancel: drain removed <dir>/s recursively, wiping new_dir.
-    assert!(Path::new(&new_dir).exists(),
-        "recreated schema's new table dir must survive the gated drain");
+    assert!(
+        Path::new(&new_dir).exists(),
+        "recreated schema's new table dir must survive the gated drain"
+    );
     assert!(Path::new(&format!("{dir}/s")).exists());
 }
 
@@ -84,7 +96,9 @@ fn gc_reclaims_orphan_table_dir() {
     let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1); bb.put_u64(10); bb.end_row();
+    bb.begin_row(1u128, 1);
+    bb.put_u64(10);
+    bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.flush_family(tid).unwrap();
     let live_dir = format!("{dir}/public/t_{tid}");
@@ -99,8 +113,10 @@ fn gc_reclaims_orphan_table_dir() {
 
     assert!(!Path::new(&ghost).exists(), "orphan table dir must be reclaimed");
     assert!(Path::new(&live_dir).exists(), "live table dir must survive");
-    assert!(engine.seek_family(tid, 1u128).unwrap().is_some(),
-        "live table must still read back after the sweep");
+    assert!(
+        engine.seek_family(tid, 1u128).unwrap().is_some(),
+        "live table must still read back after the sweep"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -169,7 +185,9 @@ fn gc_leaves_live_entities_untouched() {
     let t1 = engine.create_table("public.flushed", &cols, &[0], true).unwrap();
     let schema = engine.get_schema(t1).unwrap();
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1); bb.put_u64(7); bb.end_row();
+    bb.begin_row(1u128, 1);
+    bb.put_u64(7);
+    bb.end_row();
     engine.ingest_to_family(t1, &bb.finish()).unwrap();
     engine.flush_family(t1).unwrap();
     let i1 = engine.create_index("public.flushed", &["val"], false).unwrap();
@@ -185,14 +203,21 @@ fn gc_leaves_live_entities_untouched() {
         format!("{dir}/public/empty_{t2}"),
         format!("{dir}/s2/t_{t3}"),
     ];
-    for d in &dirs { assert!(Path::new(d).exists(), "precondition: {d} exists"); }
+    for d in &dirs {
+        assert!(Path::new(d).exists(), "precondition: {d} exists");
+    }
 
     engine.gc_orphan_directories();
 
-    for d in &dirs { assert!(Path::new(d).exists(), "live dir {d} must survive"); }
+    for d in &dirs {
+        assert!(Path::new(d).exists(), "live dir {d} must survive");
+    }
     assert!(engine.pending_dir_deletions.is_empty());
-    assert_eq!(engine.scan_family(t1).unwrap().count, 1,
-        "flushed table must still read back after the sweep");
+    assert_eq!(
+        engine.scan_family(t1).unwrap().count,
+        1,
+        "flushed table must still read back after the sweep"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -206,7 +231,7 @@ fn gc_skips_non_table_shaped_entries() {
     let cols = vec![u64_col_def("id")];
     engine.create_table("public.t", &cols, &[0], true).unwrap();
 
-    let keep1 = format!("{dir}/public/notatable");     // no underscore
+    let keep1 = format!("{dir}/public/notatable"); // no underscore
     let keep2 = format!("{dir}/public/foo_notanumber"); // non-numeric suffix
     std::fs::create_dir_all(&keep1).unwrap();
     std::fs::create_dir_all(&keep2).unwrap();
@@ -260,8 +285,10 @@ fn gc_drains_sal_replay_queue() {
 
     engine.gc_orphan_directories();
 
-    assert!(!Path::new(&gone_schema).exists(),
-        "replayed DROP SCHEMA subtree must be reclaimed by the drain");
+    assert!(
+        !Path::new(&gone_schema).exists(),
+        "replayed DROP SCHEMA subtree must be reclaimed by the drain"
+    );
     assert!(engine.pending_dir_deletions.is_empty(), "queue must be drained");
 
     engine.close();
@@ -285,9 +312,11 @@ fn gc_recreated_schema_survives_drain() {
     // The replayed CREATE s re-fires hook_schema_dir → cancel_gated_deletion,
     // which must clear the DROP's residue for the path being recreated.
     engine.create_schema("s").unwrap();
-    assert!(!engine.pending_dir_deletions.contains(&schema_path),
+    assert!(
+        !engine.pending_dir_deletions.contains(&schema_path),
         "CREATE SCHEMA must clear the replayed DROP's residue from \
-         pending_dir_deletions (cancel_gated_deletion fix)");
+         pending_dir_deletions (cancel_gated_deletion fix)"
+    );
 
     let cols = vec![u64_col_def("id")];
     let tid = engine.create_table("s.t", &cols, &[0], true).unwrap();
@@ -296,10 +325,14 @@ fn gc_recreated_schema_survives_drain() {
 
     engine.gc_orphan_directories();
 
-    assert!(Path::new(&schema_path).exists(),
-        "recreated schema dir must survive the drain");
-    assert!(Path::new(&tbl).exists(),
-        "table under the recreated schema must survive");
+    assert!(
+        Path::new(&schema_path).exists(),
+        "recreated schema dir must survive the drain"
+    );
+    assert!(
+        Path::new(&tbl).exists(),
+        "table under the recreated schema must survive"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

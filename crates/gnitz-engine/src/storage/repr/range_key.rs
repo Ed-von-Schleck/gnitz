@@ -11,7 +11,7 @@
 //! native-`u128` `Cut` values, so the two derivations are not shared — only the
 //! byte successor is.
 
-use gnitz_wire::{MAX_PK_BYTES, RangeRel};
+use gnitz_wire::{RangeRel, MAX_PK_BYTES};
 
 /// Fixed-width byte-string successor: `p + 1` with carry, in place. Returns
 /// `false` when `p` is all-`0xFF` (or empty) — no successor exists at this width
@@ -20,7 +20,9 @@ use gnitz_wire::{MAX_PK_BYTES, RangeRel};
 pub(crate) fn increment_key_in_place(p: &mut [u8]) -> bool {
     for b in p.iter_mut().rev() {
         *b = b.wrapping_add(1);
-        if *b != 0 { return true; }
+        if *b != 0 {
+            return true;
+        }
     }
     false
 }
@@ -37,7 +39,10 @@ pub(crate) struct CutKey {
 impl CutKey {
     fn zeroed(len: usize) -> Self {
         debug_assert!(len <= MAX_PK_BYTES);
-        CutKey { buf: [0u8; MAX_PK_BYTES], len }
+        CutKey {
+            buf: [0u8; MAX_PK_BYTES],
+            len,
+        }
     }
 
     /// The `stride`-byte key.
@@ -64,11 +69,7 @@ impl CutKey {
 /// | `Ge` | `eq‖d`               | same as `Gt`                              |
 /// | `Lt` | `eq ‖ 0x00*slot`     | `Some(eq‖d)`                              |
 /// | `Le` | `eq ‖ 0x00*slot`     | `succ(eq‖d)`; carry ⇒ end                  |
-pub(crate) fn range_cut_points(
-    eq: &[u8],
-    d: &[u8],
-    rel: RangeRel,
-) -> Option<(CutKey, Option<CutKey>)> {
+pub(crate) fn range_cut_points(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(CutKey, Option<CutKey>)> {
     let eq_size = eq.len();
     let slot_size = d.len();
     let stride = eq_size + slot_size;
@@ -89,9 +90,15 @@ pub(crate) fn range_cut_points(
     // out (the last eq group). The slot bytes stay zero, so `succ` ripples only
     // through the eq prefix sub-slice.
     let next_group = || -> Option<CutKey> {
-        if eq_size == 0 { return None; }
+        if eq_size == 0 {
+            return None;
+        }
         let mut k = eq_low;
-        if increment_key_in_place(&mut k.buf[..eq_size]) { Some(k) } else { None }
+        if increment_key_in_place(&mut k.buf[..eq_size]) {
+            Some(k)
+        } else {
+            None
+        }
     };
 
     match rel {
@@ -177,8 +184,7 @@ mod tests {
     // exact-comparable, plus a 1-eq-slot variant for prefix coverage.
 
     fn cuts(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-        range_cut_points(eq, d, rel)
-            .map(|(s, e)| (s.as_slice().to_vec(), e.map(|e| e.as_slice().to_vec())))
+        range_cut_points(eq, d, rel).map(|(s, e)| (s.as_slice().to_vec(), e.map(|e| e.as_slice().to_vec())))
     }
 
     #[test]
@@ -213,10 +219,22 @@ mod tests {
     fn eq_prefix_interior_value() {
         // eq = 0x07, d = 0x05 (stride = 2). Cut keys stay within / cap at the group.
         let eq = [0x07];
-        assert_eq!(cuts(&eq, &[0x05], RangeRel::Gt), Some((vec![0x07, 0x06], Some(vec![0x08, 0x00]))));
-        assert_eq!(cuts(&eq, &[0x05], RangeRel::Ge), Some((vec![0x07, 0x05], Some(vec![0x08, 0x00]))));
-        assert_eq!(cuts(&eq, &[0x05], RangeRel::Lt), Some((vec![0x07, 0x00], Some(vec![0x07, 0x05]))));
-        assert_eq!(cuts(&eq, &[0x05], RangeRel::Le), Some((vec![0x07, 0x00], Some(vec![0x07, 0x06]))));
+        assert_eq!(
+            cuts(&eq, &[0x05], RangeRel::Gt),
+            Some((vec![0x07, 0x06], Some(vec![0x08, 0x00])))
+        );
+        assert_eq!(
+            cuts(&eq, &[0x05], RangeRel::Ge),
+            Some((vec![0x07, 0x05], Some(vec![0x08, 0x00])))
+        );
+        assert_eq!(
+            cuts(&eq, &[0x05], RangeRel::Lt),
+            Some((vec![0x07, 0x00], Some(vec![0x07, 0x05])))
+        );
+        assert_eq!(
+            cuts(&eq, &[0x05], RangeRel::Le),
+            Some((vec![0x07, 0x00], Some(vec![0x07, 0x06])))
+        );
     }
 
     #[test]
@@ -224,11 +242,20 @@ mod tests {
         // eq = 0x07, d = 0xFF (maximal slot). The Le end and the Gt/Ge end both
         // ripple to the next eq group's first key 0x08‖0x00 — byte-identical.
         let eq = [0x07];
-        assert_eq!(cuts(&eq, &[0xFF], RangeRel::Le), Some((vec![0x07, 0x00], Some(vec![0x08, 0x00]))));
-        assert_eq!(cuts(&eq, &[0xFF], RangeRel::Ge), Some((vec![0x07, 0xFF], Some(vec![0x08, 0x00]))));
+        assert_eq!(
+            cuts(&eq, &[0xFF], RangeRel::Le),
+            Some((vec![0x07, 0x00], Some(vec![0x08, 0x00])))
+        );
+        assert_eq!(
+            cuts(&eq, &[0xFF], RangeRel::Ge),
+            Some((vec![0x07, 0xFF], Some(vec![0x08, 0x00])))
+        );
         // Gt of the maximal slot in a non-maximal group: start == end == next
         // group key (a zero-width, provably-empty interval).
-        assert_eq!(cuts(&eq, &[0xFF], RangeRel::Gt), Some((vec![0x08, 0x00], Some(vec![0x08, 0x00]))));
+        assert_eq!(
+            cuts(&eq, &[0xFF], RangeRel::Gt),
+            Some((vec![0x08, 0x00], Some(vec![0x08, 0x00])))
+        );
     }
 
     #[test]

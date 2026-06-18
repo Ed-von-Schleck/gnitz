@@ -3,7 +3,7 @@
 //! `super::super::test_common::*`.
 
 use crate::foundation::codec::read_i64_le;
-use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, ConsolidatedBatch};
 
 pub(super) fn make_schema_u64_i64() -> SchemaDescriptor {
@@ -16,10 +16,7 @@ pub(super) fn make_schema_u64_i64() -> SchemaDescriptor {
     )
 }
 
-pub(super) fn make_batch(
-    schema: &SchemaDescriptor,
-    rows: &[(u64, i64, i64)],
-) -> ConsolidatedBatch {
+pub(super) fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
     let n = rows.len();
     let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -59,10 +56,7 @@ pub(super) fn compound_pk_bytes(c0: u64, c1: u64) -> [u8; 16] {
     b
 }
 
-pub(super) fn make_compound_batch(
-    schema: &SchemaDescriptor,
-    rows: &[(u64, u64, i64, i64)],
-) -> ConsolidatedBatch {
+pub(super) fn make_compound_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> ConsolidatedBatch {
     let mut b = Batch::with_schema(*schema, rows.len().max(1));
     for &(c0, c1, w, val) in rows {
         b.extend_pk_bytes(&compound_pk_bytes(c0, c1));
@@ -86,10 +80,7 @@ pub(super) fn make_schema_signed() -> SchemaDescriptor {
     )
 }
 
-pub(super) fn make_signed_batch(
-    schema: &SchemaDescriptor,
-    rows: &[(i64, i64, i64)],
-) -> ConsolidatedBatch {
+pub(super) fn make_signed_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> ConsolidatedBatch {
     let mut b = Batch::with_schema(*schema, rows.len().max(1));
     for &(pk, w, val) in rows {
         // Signed PK at rest is OPK (big-endian, sign-bit flipped) so the
@@ -126,4 +117,3 @@ pub(super) fn wide_pk_bytes(schema: &SchemaDescriptor, c0: u64, c1: u64, c2: u64
 // -----------------------------------------------------------------------
 // Wide-PK inner-join multiset-delta tests
 // -----------------------------------------------------------------------
-

@@ -10,8 +10,21 @@ impl WorkerProcess {
         let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
-                buf, 0, target_id, 0, flags,
-                0u128, 0, request_id, STATUS_OK, &[], None, None, None, None, &[],
+                buf,
+                0,
+                target_id,
+                0,
+                flags,
+                0u128,
+                0,
+                request_id,
+                STATUS_OK,
+                &[],
+                None,
+                None,
+                None,
+                None,
+                &[],
             );
         });
     }
@@ -19,14 +32,10 @@ impl WorkerProcess {
     /// Reply schema wire block: the table's cached block for `Table`, a
     /// one-off (never cached) block for `OneOff`. Returns the block and the
     /// table's schema version (`(None, 0)` for `ReplySchema::None`).
-    fn reply_schema_block(&mut self, tid_key: i64, schema: ReplySchema<'_>)
-        -> (Option<Rc<Vec<u8>>>, u16)
-    {
+    fn reply_schema_block(&mut self, tid_key: i64, schema: ReplySchema<'_>) -> (Option<Rc<Vec<u8>>>, u16) {
         let block = match schema {
             ReplySchema::None => return (None, 0),
-            ReplySchema::OneOff(s) => {
-                Rc::new(ipc::build_schema_wire_block(s, &[], tid_key as u32))
-            }
+            ReplySchema::OneOff(s) => Rc::new(ipc::build_schema_wire_block(s, &[], tid_key as u32)),
             ReplySchema::Table(s) => {
                 if let Some(cached) = self.cat().get_cached_schema_wire_block(tid_key) {
                     return (Some(cached.block), cached.version);
@@ -35,7 +44,8 @@ impl WorkerProcess {
                 let (name_refs, n) = ipc::col_names_as_refs(&col_names);
                 let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], tid_key as u32));
                 let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(s);
-                self.cat().set_schema_wire_block(tid_key, block.clone(), wire_safe, wire_row_stride);
+                self.cat()
+                    .set_schema_wire_block(tid_key, block.clone(), wire_safe, wire_row_stride);
                 block
             }
         };
@@ -55,8 +65,15 @@ impl WorkerProcess {
         let prebuilt = prebuilt_rc.as_deref().map(Vec::as_slice);
         let sz = ipc::wire_size(STATUS_OK, &[], schema.descriptor(), None, result, prebuilt, &[]);
         self.send_response_prebuilt(
-            target_id, result, schema.descriptor(), request_id, client_id, seek_pk,
-            prebuilt, server_version, sz,
+            target_id,
+            result,
+            schema.descriptor(),
+            request_id,
+            client_id,
+            seek_pk,
+            prebuilt,
+            server_version,
+            sz,
         );
     }
 
@@ -82,9 +99,21 @@ impl WorkerProcess {
         let flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into(
-                buf, 0, target_id, client_id, flags,
-                seek_pk, 0, request_id, STATUS_OK, &[],
-                schema, None, result, prebuilt, &[],
+                buf,
+                0,
+                target_id,
+                client_id,
+                flags,
+                seek_pk,
+                0,
+                request_id,
+                STATUS_OK,
+                &[],
+                schema,
+                None,
+                result,
+                prebuilt,
+                &[],
             );
         });
     }
@@ -131,19 +160,33 @@ impl WorkerProcess {
         };
         if sz <= frame_cap {
             self.send_response_prebuilt(
-                target_id, Some(&batch), schema.descriptor(), request_id, client_id,
-                seek_pk, prebuilt, server_version, sz);
+                target_id,
+                Some(&batch),
+                schema.descriptor(),
+                request_id,
+                client_id,
+                seek_pk,
+                prebuilt,
+                server_version,
+                sz,
+            );
             return None;
         }
         if !is_wire_safe {
             return Some(format!(
                 "result wire_size={sz} > MAX_W2M_MSG={}; STRING-column chunking not \
                  yet implemented — add a tighter predicate or LIMIT",
-                w2m_ring::MAX_W2M_MSG));
+                w2m_ring::MAX_W2M_MSG
+            ));
         }
         self.pending_streams.push_back(PendingScan {
-            batch: Rc::new(batch), next_row: 0, request_id, client_id, target_id,
-            prebuilt_schema: prebuilt_rc, server_version,
+            batch: Rc::new(batch),
+            next_row: 0,
+            request_id,
+            client_id,
+            target_id,
+            prebuilt_schema: prebuilt_rc,
+            server_version,
         });
         None
     }
@@ -167,16 +210,18 @@ impl WorkerProcess {
         // whether the first frame carries a schema block; server_version is always
         // embedded in wire_flags so the client can cache/verify.
         let (block_rc, server_version) = self.reply_schema_block(tid_key, schema);
-        let prebuilt_rc = block_rc.filter(|_| {
-            gnitz_wire::wire_should_include_schema(client_version, server_version)
-        });
+        let prebuilt_rc = block_rc.filter(|_| gnitz_wire::wire_should_include_schema(client_version, server_version));
         let schema_version_flags = gnitz_wire::wire_flags_set_schema_version(0, server_version);
 
         // When schema omission is in effect (prebuilt_rc=None), pass schema=None to
         // the encode functions so has_schema stays false. Passing schema=Some with
         // prebuilt=None would cause encode_wire_into_range to emit a schema block
         // with empty column names, corrupting the client's schema cache.
-        let schema_for_encode = if prebuilt_rc.is_some() { schema.descriptor() } else { None };
+        let schema_for_encode = if prebuilt_rc.is_some() {
+            schema.descriptor()
+        } else {
+            None
+        };
 
         let is_wire_safe = schema.descriptor().map(schema_wire_safe).unwrap_or(true);
 
@@ -194,9 +239,21 @@ impl WorkerProcess {
             let flags = schema_version_flags | FLAG_CONTINUATION | FLAG_SCAN_LAST;
             self.w2m_writer.send_encoded(wire_sz, request_id as u32, |buf| {
                 ipc::encode_wire_into(
-                    buf, 0, target_id, client_id, flags,
-                    0u128, 0, 0, STATUS_OK, &[],
-                    schema_for_encode, None, Some(&*batch), prebuilt, &[],
+                    buf,
+                    0,
+                    target_id,
+                    client_id,
+                    flags,
+                    0u128,
+                    0,
+                    0,
+                    STATUS_OK,
+                    &[],
+                    schema_for_encode,
+                    None,
+                    Some(&*batch),
+                    prebuilt,
+                    &[],
                 );
             });
             return None;
@@ -217,9 +274,18 @@ impl WorkerProcess {
             let flags = schema_version_flags | FLAG_CONTINUATION | FLAG_SCAN_LAST;
             self.w2m_writer.send_encoded(total_sz, request_id as u32, |buf| {
                 ipc::encode_wire_into_range(
-                    buf, 0, target_id, client_id, flags,
-                    0, STATUS_OK,
-                    schema_for_encode, &batch, 0, total_rows, prebuilt,
+                    buf,
+                    0,
+                    target_id,
+                    client_id,
+                    flags,
+                    0,
+                    STATUS_OK,
+                    schema_for_encode,
+                    &batch,
+                    0,
+                    total_rows,
+                    prebuilt,
                 );
             });
         } else {
@@ -244,10 +310,22 @@ impl WorkerProcess {
         let sz = ipc::wire_size(STATUS_ERROR, msg, None, None, None, None, &[]);
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
-                buf, 0, 0, 0, 0,
-                0u128, 0, request_id, STATUS_ERROR, msg, None, None, None, None, &[],
+                buf,
+                0,
+                0,
+                0,
+                0,
+                0u128,
+                0,
+                request_id,
+                STATUS_ERROR,
+                msg,
+                None,
+                None,
+                None,
+                None,
+                &[],
             );
         });
     }
-
 }

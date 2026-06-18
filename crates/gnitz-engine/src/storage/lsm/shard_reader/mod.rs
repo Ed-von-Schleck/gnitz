@@ -10,14 +10,14 @@ use std::ptr;
 
 use xorf::Xor8;
 
-use crate::foundation::posix_io;
-use super::layout::*;
 use super::error::StorageError;
+use super::layout::*;
 #[cfg(test)]
-use crate::foundation::codec::{read_u64_le, read_i64_le};
+use crate::foundation::codec::{read_i64_le, read_u64_le};
+use crate::foundation::posix_io;
 
-mod open;
 mod access;
+mod open;
 
 /// RAII handle for an mmap'd file region.
 ///
@@ -40,25 +40,22 @@ impl Mmap {
         }
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut st) } < 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(StorageError::Io);
         }
         let len = st.st_size as usize;
         if len < HEADER_SIZE {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(StorageError::Truncated);
         }
-        let raw = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        unsafe { libc::close(fd); }
+        let raw = unsafe { libc::mmap(ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+        unsafe {
+            libc::close(fd);
+        }
         if raw == libc::MAP_FAILED {
             return Err(StorageError::Io);
         }
@@ -88,12 +85,22 @@ impl Drop for Mmap {
 
 #[derive(Clone)]
 pub(crate) enum RegionView {
-    Raw { offset: usize, size: usize },
+    Raw {
+        offset: usize,
+        size: usize,
+    },
     /// All elements identical. `value` holds the element bytes (for fast
     /// accessor reads via `from_le_bytes`). `offset` points into the mmap
     /// so that `col_ptr_by_logical` can return a naturally-aligned pointer.
-    Constant { value: [u8; 16], offset: usize },
-    TwoValue { value_a: i64, value_b: i64, bitvec_off: usize },
+    Constant {
+        value: [u8; 16],
+        offset: usize,
+    },
+    TwoValue {
+        value_a: i64,
+        value_b: i64,
+        bitvec_off: usize,
+    },
 }
 
 pub struct MappedShard {
@@ -132,7 +139,7 @@ pub struct MappedShard {
 mod tests {
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
     /// Build a v6 shard via build_shard_image (uses encoding detection).
     fn build_test_shard(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
@@ -140,9 +147,7 @@ mod tests {
         let count = rows.len() as u32;
 
         // PK region holds OPK (order-preserving big-endian) bytes at rest.
-        let pk_bytes: Vec<u8> = rows.iter()
-            .flat_map(|&(pk, _)| pk.to_be_bytes())
-            .collect();
+        let pk_bytes: Vec<u8> = rows.iter().flat_map(|&(pk, _)| pk.to_be_bytes()).collect();
         let weights: Vec<i64> = rows.iter().map(|_| 1i64).collect();
         let null_bm: Vec<u64> = rows.iter().map(|_| 0u64).collect();
         let col1_data: Vec<i64> = rows.iter().map(|&(_, v)| v).collect();
@@ -162,13 +167,7 @@ mod tests {
     }
 
     /// Build a v6 shard with custom weights.
-    fn build_test_shard_weights(
-        dir: &std::path::Path,
-        name: &str,
-        pks: &[u64],
-        wts: &[i64],
-        vals: &[i64],
-    ) -> String {
+    fn build_test_shard_weights(dir: &std::path::Path, name: &str, pks: &[u64], wts: &[i64], vals: &[i64]) -> String {
         let path = dir.join(name);
         let count = pks.len() as u32;
         // PK region holds OPK (order-preserving big-endian) bytes at rest.
@@ -444,7 +443,10 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         let cpath = std::ffi::CString::new(path).unwrap();
-        assert_eq!(MappedShard::open(&cpath, &schema, false).err(), Some(StorageError::InvalidShard));
+        assert_eq!(
+            MappedShard::open(&cpath, &schema, false).err(),
+            Some(StorageError::InvalidShard)
+        );
     }
 
     #[test]
@@ -462,7 +464,10 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
 
         let cpath = std::ffi::CString::new(path).unwrap();
-        assert_eq!(MappedShard::open(&cpath, &schema, false).err(), Some(StorageError::InvalidShard));
+        assert_eq!(
+            MappedShard::open(&cpath, &schema, false).err(),
+            Some(StorageError::InvalidShard)
+        );
     }
 
     #[test]
@@ -488,7 +493,10 @@ mod tests {
         let orig_size = read_u64_le(&data, weight_entry_off + 8);
         // Only write the two values (16 bytes), drop the bitvec.
         let truncated_size = 16u64;
-        assert!(orig_size > truncated_size, "weight region must be larger than 16 bytes for this test");
+        assert!(
+            orig_size > truncated_size,
+            "weight region must be larger than 16 bytes for this test"
+        );
         // Patch the size field.  Checksum validation is disabled below so the
         // stale checksum doesn't mask the InvalidShard we're expecting.
         crate::foundation::codec::write_u64_le(&mut data, weight_entry_off + 8, truncated_size);
@@ -753,7 +761,10 @@ mod tests {
         let schema = u128_pk_schema();
         let cpath = std::ffi::CString::new(path).unwrap();
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-        assert!(matches!(shard.pk, RegionView::Constant { .. }), "expected Constant PK region");
+        assert!(
+            matches!(shard.pk, RegionView::Constant { .. }),
+            "expected Constant PK region"
+        );
         assert_eq!(shard.pk_stride, 16);
         // PK region is OPK (order-preserving big-endian) at rest.
         let expected = pk_value.to_be_bytes();
@@ -845,8 +856,10 @@ mod tests {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         assert_eq!(shard.pk_stride, 24);
-        assert!(matches!(shard.pk, RegionView::Raw { .. }),
-            "distinct PKs must keep PK region Raw");
+        assert!(
+            matches!(shard.pk, RegionView::Raw { .. }),
+            "distinct PKs must keep PK region Raw"
+        );
 
         // Probe keys covering before, between, and after each row.
         let probes: [[u8; 24]; 5] = [
@@ -857,10 +870,11 @@ mod tests {
             opk3(3, 0, 0),
         ];
         for key in &probes {
-            let expected = (0..shard.count).find(|&i| {
-                super::super::columnar::compare_pk_bytes(shard.get_pk_bytes(i), key)
-                    != std::cmp::Ordering::Less
-            }).unwrap_or(shard.count);
+            let expected = (0..shard.count)
+                .find(|&i| {
+                    super::super::columnar::compare_pk_bytes(shard.get_pk_bytes(i), key) != std::cmp::Ordering::Less
+                })
+                .unwrap_or(shard.count);
             let got = shard.find_lower_bound_bytes(key);
             assert_eq!(got, expected, "probe={key:?}");
         }
@@ -886,6 +900,8 @@ mod tests {
         assert_eq!(schema.pk_stride(), 24);
 
         // Two distinct wide PKs keep the PK region Raw.
+        // Grouped by 8-byte u64 column boundaries (3xU64 compound PK).
+        #[rustfmt::skip]
         let pks: [[u8; 24]; 2] = [
             [1,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],
             [2,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0],

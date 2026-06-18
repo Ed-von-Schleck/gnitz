@@ -72,19 +72,25 @@ impl CatalogEngine {
     /// and tables second (to handle FK chains).
     #[cfg(test)]
     fn collect_schema_members(&mut self, sid: i64) -> (Vec<String>, Vec<String>) {
-        let view_ids: Vec<i64> = self.caches.views_by_schema.get(&sid)
+        let view_ids: Vec<i64> = self
+            .caches
+            .views_by_schema
+            .get(&sid)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default();
-        let table_ids: Vec<i64> = self.caches.tables_by_schema.get(&sid)
+        let table_ids: Vec<i64> = self
+            .caches
+            .tables_by_schema
+            .get(&sid)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default();
-        let views = view_ids.iter()
-            .filter_map(|&id| self.caches.entity_by_id.get(&id)
-                .map(|(sn, en)| format!("{sn}.{en}")))
+        let views = view_ids
+            .iter()
+            .filter_map(|&id| self.caches.entity_by_id.get(&id).map(|(sn, en)| format!("{sn}.{en}")))
             .collect();
-        let tables = table_ids.iter()
-            .filter_map(|&id| self.caches.entity_by_id.get(&id)
-                .map(|(sn, en)| format!("{sn}.{en}")))
+        let tables = table_ids
+            .iter()
+            .filter_map(|&id| self.caches.entity_by_id.get(&id).map(|(sn, en)| format!("{sn}.{en}")))
             .collect();
         (views, tables)
     }
@@ -94,16 +100,15 @@ impl CatalogEngine {
     /// Finishes when the queue is empty or no progress was made in a
     /// full pass (then returns the last error).
     #[cfg(test)]
-    fn drain_drop_targets<F>(
-        &mut self,
-        targets: Vec<String>,
-        mut drop_fn: F,
-    ) -> Result<(), String>
-    where F: FnMut(&mut Self, &str) -> Result<(), String>,
+    fn drain_drop_targets<F>(&mut self, targets: Vec<String>, mut drop_fn: F) -> Result<(), String>
+    where
+        F: FnMut(&mut Self, &str) -> Result<(), String>,
     {
         let mut pending: Vec<String> = targets;
         loop {
-            if pending.is_empty() { return Ok(()); }
+            if pending.is_empty() {
+                return Ok(());
+            }
             let before = pending.len();
             let mut retry: Vec<String> = Vec::new();
             let mut last_err: Option<String> = None;
@@ -212,7 +217,10 @@ impl CatalogEngine {
         validate_user_identifier(table_name)?;
 
         let qualified = format!("{schema_name}.{table_name}");
-        let tid = *self.caches.entity_by_qname.get(&qualified)
+        let tid = *self
+            .caches
+            .entity_by_qname
+            .get(&qualified)
             .ok_or_else(|| format!("Table does not exist: {qualified}"))?;
 
         // Retract only the TABLE_TAB row. Its -1 fires hook_table_register,
@@ -229,7 +237,10 @@ impl CatalogEngine {
     pub(crate) fn drop_view(&mut self, qualified_name: &str) -> Result<(), String> {
         let (schema_name, view_name) = parse_qualified_name(qualified_name, "public");
         let qualified = format!("{schema_name}.{view_name}");
-        let vid = *self.caches.entity_by_qname.get(&qualified)
+        let vid = *self
+            .caches
+            .entity_by_qname
+            .get(&qualified)
             .ok_or_else(|| format!("View does not exist: {qualified}"))?;
 
         self.dag.invalidate(vid);
@@ -258,27 +269,35 @@ impl CatalogEngine {
     ) -> Result<i64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_owner, "public");
         let qualified = format!("{schema_name}.{table_name}");
-        let owner_id = *self.caches.entity_by_qname.get(&qualified)
+        let owner_id = *self
+            .caches
+            .entity_by_qname
+            .get(&qualified)
             .ok_or_else(|| format!("Table does not exist: {qualified}"))?;
 
         // Resolve each column name to its index, in declared order.
         let col_defs = self.read_column_defs(owner_id);
-        let col_indices: Vec<u32> = col_names.iter().map(|name| {
-            col_defs.iter().position(|cd| cd.name == *name)
-                .map(|p| p as u32)
-                .ok_or_else(|| format!("Column not found in owner: {name}"))
-        }).collect::<Result<_, _>>()?;
+        let col_indices: Vec<u32> = col_names
+            .iter()
+            .map(|name| {
+                col_defs
+                    .iter()
+                    .position(|cd| cd.name == *name)
+                    .map(|p| p as u32)
+                    .ok_or_else(|| format!("Column not found in owner: {name}"))
+            })
+            .collect::<Result<_, _>>()?;
 
         // STRING and BLOB values cannot be reduced to a comparable u128 key
         // without collision; the distributed uniqueness-check pipeline would
         // silently bypass or falsely reject rows. (Non-unique FK indices use the
         // xxhash-based extract_col_key path and are unaffected.)
-        if is_unique && col_indices.iter()
-            .any(|&c| gnitz_wire::is_german_string(col_defs[c as usize].type_code))
+        if is_unique
+            && col_indices
+                .iter()
+                .any(|&c| gnitz_wire::is_german_string(col_defs[c as usize].type_code))
         {
-            return Err(
-                "UNIQUE index on STRING or BLOB columns is not supported".into()
-            );
+            return Err("UNIQUE index on STRING or BLOB columns is not supported".into());
         }
 
         let index_name = make_secondary_index_name(schema_name, table_name, &col_names.join("_"));
@@ -345,7 +364,10 @@ impl CatalogEngine {
         if index_name.contains(FK_INDEX_INFIX) {
             return Err("Forbidden: cannot drop internal FK index".into());
         }
-        let idx_id = *self.caches.index_by_name.get(index_name)
+        let idx_id = *self
+            .caches
+            .index_by_name
+            .get(index_name)
             .ok_or_else(|| format!("Index does not exist: {index_name}"))?;
 
         // precheck_sys_ingest enforces the FK-target uniqueness guard on the -1;
@@ -361,10 +383,15 @@ impl CatalogEngine {
         // open). Running it against a durable relation would double-count the
         // shards loaded from its manifest.
         debug_assert!(
-            self.dag.tables.get(&vid).is_none_or(|e| e.kind.persistence() == Persistence::Ephemeral),
+            self.dag
+                .tables
+                .get(&vid)
+                .is_none_or(|e| e.kind.persistence() == Persistence::Ephemeral),
             "backfill_view on durable relation {vid}: would double-count loaded shards",
         );
-        if !self.dag.ensure_compiled(vid) { return; }
+        if !self.dag.ensure_compiled(vid) {
+            return;
+        }
 
         let chunk_rows = self.ddl_scan_chunk_rows;
         let source_ids = self.dag.get_source_ids(vid);
@@ -374,7 +401,9 @@ impl CatalogEngine {
             // result. The cursor owns its sources via `Rc` and stays valid
             // while epochs ingest into the view family; the scanned source
             // itself is never written here.
-            let Some(mut handle) = self.open_store_cursor(source_id) else { continue };
+            let Some(mut handle) = self.open_store_cursor(source_id) else {
+                continue;
+            };
             let mut touched = false;
             while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
                 if let Some(result) = self.dag.execute_epoch(vid, chunk, source_id) {
@@ -384,7 +413,9 @@ impl CatalogEngine {
                     }
                 }
             }
-            if touched { let _ = self.dag.flush(vid); }
+            if touched {
+                let _ = self.dag.flush(vid);
+            }
         }
 
         // execute_epoch clears deltas only at epoch start, so each chunk's
@@ -450,11 +481,14 @@ impl CatalogEngine {
         let check_dups = is_unique && self.ctx.is_live();
         let mut seen: rustc_hash::FxHashSet<PkBuf> = rustc_hash::FxHashSet::default();
 
-        let Some(mut handle) = self.open_store_cursor(owner_id) else { return Ok(()) };
+        let Some(mut handle) = self.open_store_cursor(owner_id) else {
+            return Ok(());
+        };
         while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
-            let projected = DagEngine::batch_project_index(
-                &chunk, col_indices, &owner_schema, idx_schema);
-            if projected.count == 0 { continue; }
+            let projected = DagEngine::batch_project_index(&chunk, col_indices, &owner_schema, idx_schema);
+            if projected.count == 0 {
+                continue;
+            }
             if check_dups && projected_chunk_has_dup_keys(&projected, idx_key_size, &mut seen) {
                 return Err(self.unique_create_dup_err(owner_id, col_indices));
             }
@@ -477,7 +511,11 @@ impl CatalogEngine {
     /// in `hook_cascade_fk`). The flag flip below runs unconditionally.
     pub(crate) fn promote_index_to_unique(&mut self, owner_id: i64, col_indices: &[u32]) -> Result<(), String> {
         if self.ctx.is_live() {
-            let owner_schema = self.dag.tables.get(&owner_id).map(|e| e.schema)
+            let owner_schema = self
+                .dag
+                .tables
+                .get(&owner_id)
+                .map(|e| e.schema)
                 .ok_or_else(|| format!("Index promote: owner table {owner_id} not found"))?;
             let idx_schema = make_index_schema(col_indices, &owner_schema)?;
             self.stream_index_projection(owner_id, col_indices, true, None, &idx_schema)?;
@@ -490,19 +528,28 @@ impl CatalogEngine {
 
     pub(crate) fn create_fk_indices(&mut self, table_id: i64) -> Result<(), String> {
         let col_defs = self.read_column_defs(table_id);
-        let pk_list = self.caches.pk_col_of.get(&table_id)
-            .copied().unwrap_or_else(|| PkColList::single(0));
+        let pk_list = self
+            .caches
+            .pk_col_of
+            .get(&table_id)
+            .copied()
+            .unwrap_or_else(|| PkColList::single(0));
 
-        let (schema_name, table_name) = self.caches.entity_by_id.get(&table_id)
-            .cloned().unwrap_or_default();
+        let (schema_name, table_name) = self.caches.entity_by_id.get(&table_id).cloned().unwrap_or_default();
 
         for (col_idx, cd) in col_defs.iter().enumerate() {
-            if cd.fk_table_id == 0 { continue; }
+            if cd.fk_table_id == 0 {
+                continue;
+            }
             // Skip every PK column: the PK region already stores them, so an
             // FK whose column is part of the PK needs no separate auto-index.
-            if pk_list.as_slice().contains(&(col_idx as u32)) { continue; }
+            if pk_list.as_slice().contains(&(col_idx as u32)) {
+                continue;
+            }
             let index_name = make_fk_index_name(&schema_name, &table_name, &cd.name);
-            if self.caches.index_by_name.contains_key(&index_name) { continue; }
+            if self.caches.index_by_name.contains_key(&index_name) {
+                continue;
+            }
 
             let index_id = self.allocate_index_id();
 
@@ -510,12 +557,12 @@ impl CatalogEngine {
             let idx_schema = idx_tab_schema();
             let mut bb = BatchBuilder::new(idx_schema);
             bb.begin_row(index_id as u128, 1);
-            bb.put_u64(table_id as u64);           // owner_id
-            bb.put_u64(OWNER_KIND_TABLE as u64);   // owner_kind
-            bb.put_u64(gnitz_wire::pack_pk_cols(&[col_idx as u32]));  // source_cols (packed)
-            bb.put_string(&index_name);            // name
-            bb.put_u64(0);                         // is_unique (FK indices are not unique)
-            bb.put_string("");                     // cache_directory
+            bb.put_u64(table_id as u64); // owner_id
+            bb.put_u64(OWNER_KIND_TABLE as u64); // owner_kind
+            bb.put_u64(gnitz_wire::pack_pk_cols(&[col_idx as u32])); // source_cols (packed)
+            bb.put_string(&index_name); // name
+            bb.put_u64(0); // is_unique (FK indices are not unique)
+            bb.put_string(""); // cache_directory
             bb.end_row();
             let batch = bb.finish();
             // hook_cascade_fk fires on master and every worker, so each side
@@ -532,7 +579,7 @@ impl CatalogEngine {
                 ub.begin_row(index_id as u128, -1);
                 ub.put_u64(table_id as u64);
                 ub.put_u64(OWNER_KIND_TABLE as u64);
-                ub.put_u64(gnitz_wire::pack_pk_cols(&[col_idx as u32]));  // source_cols (packed)
+                ub.put_u64(gnitz_wire::pack_pk_cols(&[col_idx as u32])); // source_cols (packed)
                 ub.put_string(&index_name);
                 ub.put_u64(0);
                 ub.put_string("");
@@ -570,7 +617,12 @@ impl CatalogEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn write_column_records(&mut self, owner_id: i64, kind: i64, col_defs: &[ColumnDef]) -> Result<(), String> {
+    pub(crate) fn write_column_records(
+        &mut self,
+        owner_id: i64,
+        kind: i64,
+        col_defs: &[ColumnDef],
+    ) -> Result<(), String> {
         let batch = self.build_col_batch(owner_id, kind, col_defs, 1);
         self.submit(SysFamily::Column, batch)
     }
@@ -591,7 +643,6 @@ impl CatalogEngine {
         }
         Ok(())
     }
-
 }
 
 /// True if a positive-weight row in a projected index chunk shares its leading
@@ -610,21 +661,23 @@ impl CatalogEngine {
 /// are only visible through state carried across calls. Shared by
 /// `backfill_index` (fresh unique index) and `promote_index_to_unique`
 /// (UNIQUE folded into an existing circuit) so both gate on the same predicate.
-fn projected_chunk_has_dup_keys(
-    projected: &Batch,
-    key_size: usize,
-    seen: &mut rustc_hash::FxHashSet<PkBuf>,
-) -> bool {
+fn projected_chunk_has_dup_keys(projected: &Batch, key_size: usize, seen: &mut rustc_hash::FxHashSet<PkBuf>) -> bool {
     for row in 0..projected.count {
         let weight = projected.get_weight(row);
-        if weight <= 0 { continue; }
+        if weight <= 0 {
+            continue;
+        }
         // Base-table scan chunks are consolidated: weight ≥ 2 is the same
         // (PK, payload) row inserted multiple times — that many live
         // instances of the same index key. NULL-valued rows never reach
         // here (batch_project_index skips them).
-        if weight > 1 { return true; }
+        if weight > 1 {
+            return true;
+        }
         let pk_bytes = projected.get_pk_bytes(row);
-        if !seen.insert(PkBuf::from_bytes(&pk_bytes[..key_size])) { return true; }
+        if !seen.insert(PkBuf::from_bytes(&pk_bytes[..key_size])) {
+            return true;
+        }
     }
     false
 }
@@ -632,7 +685,7 @@ fn projected_chunk_has_dup_keys(
 #[cfg(test)]
 mod dup_key_tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
     /// Build a projected-index batch whose PK region is each supplied span
     /// (here the whole index PK; the dedup keys on the leading `key_size`).
@@ -658,7 +711,7 @@ mod dup_key_tests {
     fn dup_keys_over_16_bytes_no_truncation() {
         let span = |tail: u64| {
             let mut s = [0u8; 24];
-            s[..16].copy_from_slice(&[7u8; 16]);   // shared leading 16 bytes
+            s[..16].copy_from_slice(&[7u8; 16]); // shared leading 16 bytes
             s[16..].copy_from_slice(&tail.to_be_bytes());
             s
         };

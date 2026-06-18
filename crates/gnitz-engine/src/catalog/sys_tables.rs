@@ -2,7 +2,7 @@
 //!
 //! Pure data — no state, no CatalogEngine dependency.
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -29,15 +29,15 @@ pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
 pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
 pub(super) const NUM_PARTITIONS: u32 = 256;
 
-pub(super) const SCHEMA_TAB_ID: i64             = gnitz_wire::SCHEMA_TAB as i64;
-pub(crate) const TABLE_TAB_ID: i64              = gnitz_wire::TABLE_TAB as i64;
-pub(super) const VIEW_TAB_ID: i64               = gnitz_wire::VIEW_TAB as i64;
-pub(super) const COL_TAB_ID: i64                = gnitz_wire::COL_TAB as i64;
-pub(crate) const IDX_TAB_ID: i64                = gnitz_wire::IDX_TAB as i64;
-pub(super) const DEP_TAB_ID: i64                = gnitz_wire::DEP_TAB as i64;
-pub(super) const SEQ_TAB_ID: i64                = gnitz_wire::SEQ_TAB as i64;
-pub(super) const CIRCUIT_NODES_TAB_ID: i64        = gnitz_wire::CIRCUIT_NODES_TAB as i64;
-pub(super) const CIRCUIT_EDGES_TAB_ID: i64        = gnitz_wire::CIRCUIT_EDGES_TAB as i64;
+pub(super) const SCHEMA_TAB_ID: i64 = gnitz_wire::SCHEMA_TAB as i64;
+pub(crate) const TABLE_TAB_ID: i64 = gnitz_wire::TABLE_TAB as i64;
+pub(super) const VIEW_TAB_ID: i64 = gnitz_wire::VIEW_TAB as i64;
+pub(super) const COL_TAB_ID: i64 = gnitz_wire::COL_TAB as i64;
+pub(crate) const IDX_TAB_ID: i64 = gnitz_wire::IDX_TAB as i64;
+pub(super) const DEP_TAB_ID: i64 = gnitz_wire::DEP_TAB as i64;
+pub(super) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
+pub(super) const CIRCUIT_NODES_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODES_TAB as i64;
+pub(super) const CIRCUIT_EDGES_TAB_ID: i64 = gnitz_wire::CIRCUIT_EDGES_TAB as i64;
 pub(super) const CIRCUIT_NODE_COLUMNS_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB as i64;
 
 // PK list encoding lives in gnitz-wire so the client and engine cannot
@@ -46,9 +46,9 @@ pub(super) const CIRCUIT_NODE_COLUMNS_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODE_COL
 // The `unused_imports` allow covers two cases: (1) symbols used only by
 // sibling modules via `use sys_tables::*`, and (2) symbols referenced
 // only from the cfg(test) block below.
+pub(crate) use gnitz_wire::PkColList;
 #[allow(unused_imports)]
 pub(super) use gnitz_wire::PK_LIST_PACKED_FLAG;
-pub(crate) use gnitz_wire::PkColList;
 #[allow(unused_imports)]
 pub(super) use gnitz_wire::{pack_pk_cols, unpack_pk_cols, PK_LIST_MAX_COLS};
 
@@ -59,14 +59,13 @@ pub(super) use gnitz_wire::{pack_pk_cols, unpack_pk_cols, PK_LIST_MAX_COLS};
 /// (the raw decoded count, not the clamped slice length) is what gates
 /// `1..=PK_LIST_MAX_COLS`, so a crafted over-range count is rejected rather
 /// than silently truncated.
-pub(super) fn validate_pk_cols(
-    col_defs: &[super::types::ColumnDef],
-    pk: &PkColList,
-) -> Result<(), String> {
+pub(super) fn validate_pk_cols(col_defs: &[super::types::ColumnDef], pk: &PkColList) -> Result<(), String> {
     if !pk.is_well_formed() {
         return Err(format!(
             "Primary Key column count {} out of range 1..={}",
-            pk.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS));
+            pk.decoded_count(),
+            gnitz_wire::PK_LIST_MAX_COLS
+        ));
     }
     let cols = pk.as_slice();
     for (j, &c) in cols.iter().enumerate() {
@@ -97,7 +96,8 @@ pub(super) fn validate_pk_cols(
     // into `TABLE_TAB` whose decoded PK list packs an oversized region.
     // `pk_stride == 0` is unreachable once `is_pk_eligible` passed (every
     // eligible type is ≥ 1 byte) but is rejected explicitly as defence in depth.
-    let pk_stride: usize = cols.iter()
+    let pk_stride: usize = cols
+        .iter()
         .map(|&c| gnitz_wire::wire_stride(col_defs[c as usize].type_code))
         .sum();
     if pk_stride == 0 || pk_stride > gnitz_wire::MAX_PK_BYTES {
@@ -131,15 +131,15 @@ pub(super) const IDXTAB_COL_IS_UNIQUE: usize = 5;
 // `read_batch_u64`/`read_batch_string`, where the single-column PK `index_id`
 // (full-schema column 0) is excluded. Each is the matching IDXTAB_COL_*
 // full-schema index minus one.
-pub(crate) const IDXTAB_PAY_OWNER_ID: usize    = IDXTAB_COL_OWNER_ID - 1;
+pub(crate) const IDXTAB_PAY_OWNER_ID: usize = IDXTAB_COL_OWNER_ID - 1;
 pub(crate) const IDXTAB_PAY_SOURCE_COLS: usize = IDXTAB_COL_SOURCE_COLS - 1;
-pub(crate) const IDXTAB_PAY_NAME: usize        = IDXTAB_COL_NAME - 1;
-pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize   = IDXTAB_COL_IS_UNIQUE - 1;
+pub(crate) const IDXTAB_PAY_NAME: usize = IDXTAB_COL_NAME - 1;
+pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize = IDXTAB_COL_IS_UNIQUE - 1;
 
 pub(super) const SEQTAB_COL_VALUE: usize = 1;
 
 // Default arena sizes for system tables and user tables
-pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024;          // 256 KB
+pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024; // 256 KB
 
 // ---------------------------------------------------------------------------
 // Schema builder helpers
@@ -180,18 +180,64 @@ pub(super) const fn schema_tab_schema() -> SchemaDescriptor {
     make_schema(&[u64_col(), str_col()], 0)
 }
 pub(super) const fn table_tab_schema() -> SchemaDescriptor {
-    make_schema(&[u64_col(), u64_col(), str_col(), str_col(), u64_col(), u64_col(), u64_col()], 0)
+    make_schema(
+        &[
+            u64_col(),
+            u64_col(),
+            str_col(),
+            str_col(),
+            u64_col(),
+            u64_col(),
+            u64_col(),
+        ],
+        0,
+    )
 }
 pub(super) const fn view_tab_schema() -> SchemaDescriptor {
     // Trailing pk_col_idx (U64) carries the packed view-PK column list, mirroring
     // TABLE_TAB. A bare `0` decodes as the single-column PK `[0]`.
-    make_schema(&[u64_col(), u64_col(), str_col(), str_col(), str_col(), u64_col(), u64_col()], 0)
+    make_schema(
+        &[
+            u64_col(),
+            u64_col(),
+            str_col(),
+            str_col(),
+            str_col(),
+            u64_col(),
+            u64_col(),
+        ],
+        0,
+    )
 }
 pub(super) const fn col_tab_schema() -> SchemaDescriptor {
-    make_schema(&[u64_col(), u64_col(), u64_col(), u64_col(), str_col(), u64_col(), u64_col(), u64_col(), u64_col()], 0)
+    make_schema(
+        &[
+            u64_col(),
+            u64_col(),
+            u64_col(),
+            u64_col(),
+            str_col(),
+            u64_col(),
+            u64_col(),
+            u64_col(),
+            u64_col(),
+        ],
+        0,
+    )
 }
 pub(super) const fn idx_tab_schema() -> SchemaDescriptor {
-    make_schema(&[u64_col(), u64_col(), u64_col(), u64_col(), str_col(), u64_col(), str_col()], 0)
+    make_schema(
+        &[
+            u64_col(),
+            u64_col(),
+            u64_col(),
+            u64_col(),
+            str_col(),
+            u64_col(),
+            str_col(),
+        ],
+        0,
+    )
 }
 pub(super) const fn dep_tab_schema() -> SchemaDescriptor {
     // Compound PK (view_id, dep_table_id); dep_view_id is the only payload.
@@ -211,15 +257,15 @@ pub(super) const fn circuit_node_columns_schema() -> SchemaDescriptor {
 }
 
 // Pre-computed statics — initialised once at program start, never reconstructed.
-static S_SCHEMA_TAB:        SchemaDescriptor = schema_tab_schema();
-static S_TABLE_TAB:         SchemaDescriptor = table_tab_schema();
-static S_VIEW_TAB:          SchemaDescriptor = view_tab_schema();
-static S_COL_TAB:           SchemaDescriptor = col_tab_schema();
-static S_IDX_TAB:           SchemaDescriptor = idx_tab_schema();
-static S_DEP_TAB:           SchemaDescriptor = dep_tab_schema();
-static S_SEQ_TAB:           SchemaDescriptor = seq_tab_schema();
-static S_CIRCUIT_NODES:        SchemaDescriptor = circuit_nodes_schema();
-static S_CIRCUIT_EDGES:        SchemaDescriptor = circuit_edges_schema();
+static S_SCHEMA_TAB: SchemaDescriptor = schema_tab_schema();
+static S_TABLE_TAB: SchemaDescriptor = table_tab_schema();
+static S_VIEW_TAB: SchemaDescriptor = view_tab_schema();
+static S_COL_TAB: SchemaDescriptor = col_tab_schema();
+static S_IDX_TAB: SchemaDescriptor = idx_tab_schema();
+static S_DEP_TAB: SchemaDescriptor = dep_tab_schema();
+static S_SEQ_TAB: SchemaDescriptor = seq_tab_schema();
+static S_CIRCUIT_NODES: SchemaDescriptor = circuit_nodes_schema();
+static S_CIRCUIT_EDGES: SchemaDescriptor = circuit_edges_schema();
 static S_CIRCUIT_NODE_COLUMNS: SchemaDescriptor = circuit_node_columns_schema();
 
 // ---------------------------------------------------------------------------
@@ -266,30 +312,70 @@ pub(super) struct SysTabInfo {
 }
 
 pub(super) const SYS_TAB_INFOS: &[SysTabInfo] = &[
-    SysTabInfo { id: SCHEMA_TAB_ID, subdir: "_schemas", name: "_schemas" },
-    SysTabInfo { id: TABLE_TAB_ID, subdir: "_tables", name: "_tables" },
-    SysTabInfo { id: VIEW_TAB_ID, subdir: "_views", name: "_views" },
-    SysTabInfo { id: COL_TAB_ID, subdir: "_columns", name: "_columns" },
-    SysTabInfo { id: IDX_TAB_ID, subdir: "_indices", name: "_indices" },
-    SysTabInfo { id: DEP_TAB_ID, subdir: "_view_deps", name: "_view_deps" },
-    SysTabInfo { id: SEQ_TAB_ID, subdir: "_sequences", name: "_sequences" },
-    SysTabInfo { id: CIRCUIT_NODES_TAB_ID, subdir: "_circuit_nodes", name: "_circuit_nodes" },
-    SysTabInfo { id: CIRCUIT_EDGES_TAB_ID, subdir: "_circuit_edges", name: "_circuit_edges" },
-    SysTabInfo { id: CIRCUIT_NODE_COLUMNS_TAB_ID, subdir: "_circuit_node_columns", name: "_circuit_node_columns" },
+    SysTabInfo {
+        id: SCHEMA_TAB_ID,
+        subdir: "_schemas",
+        name: "_schemas",
+    },
+    SysTabInfo {
+        id: TABLE_TAB_ID,
+        subdir: "_tables",
+        name: "_tables",
+    },
+    SysTabInfo {
+        id: VIEW_TAB_ID,
+        subdir: "_views",
+        name: "_views",
+    },
+    SysTabInfo {
+        id: COL_TAB_ID,
+        subdir: "_columns",
+        name: "_columns",
+    },
+    SysTabInfo {
+        id: IDX_TAB_ID,
+        subdir: "_indices",
+        name: "_indices",
+    },
+    SysTabInfo {
+        id: DEP_TAB_ID,
+        subdir: "_view_deps",
+        name: "_view_deps",
+    },
+    SysTabInfo {
+        id: SEQ_TAB_ID,
+        subdir: "_sequences",
+        name: "_sequences",
+    },
+    SysTabInfo {
+        id: CIRCUIT_NODES_TAB_ID,
+        subdir: "_circuit_nodes",
+        name: "_circuit_nodes",
+    },
+    SysTabInfo {
+        id: CIRCUIT_EDGES_TAB_ID,
+        subdir: "_circuit_edges",
+        name: "_circuit_edges",
+    },
+    SysTabInfo {
+        id: CIRCUIT_NODE_COLUMNS_TAB_ID,
+        subdir: "_circuit_node_columns",
+        name: "_circuit_node_columns",
+    },
 ];
 
 pub(super) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
     match id {
-        SCHEMA_TAB_ID                => S_SCHEMA_TAB,
-        TABLE_TAB_ID                 => S_TABLE_TAB,
-        VIEW_TAB_ID                  => S_VIEW_TAB,
-        COL_TAB_ID                   => S_COL_TAB,
-        IDX_TAB_ID                   => S_IDX_TAB,
-        DEP_TAB_ID                   => S_DEP_TAB,
-        SEQ_TAB_ID                   => S_SEQ_TAB,
-        CIRCUIT_NODES_TAB_ID         => S_CIRCUIT_NODES,
-        CIRCUIT_EDGES_TAB_ID         => S_CIRCUIT_EDGES,
-        CIRCUIT_NODE_COLUMNS_TAB_ID  => S_CIRCUIT_NODE_COLUMNS,
+        SCHEMA_TAB_ID => S_SCHEMA_TAB,
+        TABLE_TAB_ID => S_TABLE_TAB,
+        VIEW_TAB_ID => S_VIEW_TAB,
+        COL_TAB_ID => S_COL_TAB,
+        IDX_TAB_ID => S_IDX_TAB,
+        DEP_TAB_ID => S_DEP_TAB,
+        SEQ_TAB_ID => S_SEQ_TAB,
+        CIRCUIT_NODES_TAB_ID => S_CIRCUIT_NODES,
+        CIRCUIT_EDGES_TAB_ID => S_CIRCUIT_EDGES,
+        CIRCUIT_NODE_COLUMNS_TAB_ID => S_CIRCUIT_NODE_COLUMNS,
         _ => unreachable!("Unknown system table ID: {}", id),
     }
 }
@@ -320,15 +406,15 @@ impl SysFamily {
     /// The `*_TAB_ID` constant for this family.
     pub(crate) const fn id(self) -> i64 {
         match self {
-            SysFamily::Schema             => SCHEMA_TAB_ID,
-            SysFamily::Table              => TABLE_TAB_ID,
-            SysFamily::View               => VIEW_TAB_ID,
-            SysFamily::Column             => COL_TAB_ID,
-            SysFamily::Index              => IDX_TAB_ID,
-            SysFamily::ViewDep            => DEP_TAB_ID,
-            SysFamily::Sequence           => SEQ_TAB_ID,
-            SysFamily::CircuitNodes       => CIRCUIT_NODES_TAB_ID,
-            SysFamily::CircuitEdges       => CIRCUIT_EDGES_TAB_ID,
+            SysFamily::Schema => SCHEMA_TAB_ID,
+            SysFamily::Table => TABLE_TAB_ID,
+            SysFamily::View => VIEW_TAB_ID,
+            SysFamily::Column => COL_TAB_ID,
+            SysFamily::Index => IDX_TAB_ID,
+            SysFamily::ViewDep => DEP_TAB_ID,
+            SysFamily::Sequence => SEQ_TAB_ID,
+            SysFamily::CircuitNodes => CIRCUIT_NODES_TAB_ID,
+            SysFamily::CircuitEdges => CIRCUIT_EDGES_TAB_ID,
             SysFamily::CircuitNodeColumns => CIRCUIT_NODE_COLUMNS_TAB_ID,
         }
     }
@@ -336,16 +422,16 @@ impl SysFamily {
     /// Inverse of [`Self::id`]; `None` for any id that is not a system family.
     pub(crate) const fn from_id(id: i64) -> Option<Self> {
         match id {
-            SCHEMA_TAB_ID                => Some(SysFamily::Schema),
-            TABLE_TAB_ID                 => Some(SysFamily::Table),
-            VIEW_TAB_ID                  => Some(SysFamily::View),
-            COL_TAB_ID                   => Some(SysFamily::Column),
-            IDX_TAB_ID                   => Some(SysFamily::Index),
-            DEP_TAB_ID                   => Some(SysFamily::ViewDep),
-            SEQ_TAB_ID                   => Some(SysFamily::Sequence),
-            CIRCUIT_NODES_TAB_ID         => Some(SysFamily::CircuitNodes),
-            CIRCUIT_EDGES_TAB_ID         => Some(SysFamily::CircuitEdges),
-            CIRCUIT_NODE_COLUMNS_TAB_ID  => Some(SysFamily::CircuitNodeColumns),
+            SCHEMA_TAB_ID => Some(SysFamily::Schema),
+            TABLE_TAB_ID => Some(SysFamily::Table),
+            VIEW_TAB_ID => Some(SysFamily::View),
+            COL_TAB_ID => Some(SysFamily::Column),
+            IDX_TAB_ID => Some(SysFamily::Index),
+            DEP_TAB_ID => Some(SysFamily::ViewDep),
+            SEQ_TAB_ID => Some(SysFamily::Sequence),
+            CIRCUIT_NODES_TAB_ID => Some(SysFamily::CircuitNodes),
+            CIRCUIT_EDGES_TAB_ID => Some(SysFamily::CircuitEdges),
+            CIRCUIT_NODE_COLUMNS_TAB_ID => Some(SysFamily::CircuitNodeColumns),
             _ => None,
         }
     }
@@ -357,12 +443,7 @@ mod tests {
 
     #[test]
     fn test_pk_col_packing() {
-        for case in [
-            vec![0u32],
-            vec![7],
-            vec![0, 1],
-            vec![3, 9, 40, 64],
-        ] {
+        for case in [vec![0u32], vec![7], vec![0, 1], vec![3, 9, 40, 64]] {
             let list = unpack_pk_cols(pack_pk_cols(&case));
             assert_eq!(list.decoded_count(), case.len());
             assert_eq!(list.as_slice(), case.as_slice());
@@ -410,11 +491,13 @@ mod tests {
         let pk = pack_view_pk(0x1122, 0xAABB);
         let at_rest = pk.to_be_bytes();
         assert_eq!(
-            u64::from_be_bytes(at_rest[0..8].try_into().unwrap()), 0x1122,
+            u64::from_be_bytes(at_rest[0..8].try_into().unwrap()),
+            0x1122,
             "view_id (PK col 0) must lead the at-rest OPK region",
         );
         assert_eq!(
-            u64::from_be_bytes(at_rest[8..16].try_into().unwrap()), 0xAABB,
+            u64::from_be_bytes(at_rest[8..16].try_into().unwrap()),
+            0xAABB,
             "sub (PK col 1) follows view_id",
         );
     }

@@ -1,18 +1,17 @@
 //! DagEngine: consolidated plan cache, DAG evaluator, and ingestion pipeline.
 
-use std::cell::UnsafeCell;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::UnsafeCell;
 
-use crate::schema::SchemaDescriptor;
-use gnitz_wire::PkColList;
-use crate::query::compiler::{self, CompileOutput, ExternalTable, SubPlan};
-use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, Persistence, Table, PartitionedTable};
 use crate::ops;
+use crate::query::compiler::{self, CompileOutput, ExternalTable, SubPlan};
 use crate::query::vm;
+use crate::schema::SchemaDescriptor;
+use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, PartitionedTable, Persistence, Table};
+use gnitz_wire::PkColList;
 
 mod store_handle;
 pub(crate) use store_handle::StoreHandle;
-
 
 impl IndexCircuitEntry {
     /// Interior-mutable access to the owned index Table.
@@ -33,7 +32,9 @@ impl IndexCircuitEntry {
     /// the leading-key span encoding and prefix seeks).
     #[inline]
     pub fn unique_cols(&self) -> Option<&[u32]> {
-        if !self.is_unique { return None; }
+        if !self.is_unique {
+            return None;
+        }
         Some(self.col_indices.as_slice())
     }
 }
@@ -181,12 +182,7 @@ impl SysTableRefs {
 /// to the master (via W2M) and receive relayed data (via SAL).
 /// This breaks the circular dependency between worker.rs ↔ dag.rs.
 pub trait ExchangeCallback {
-    fn do_exchange(
-        &mut self,
-        view_id: i64,
-        batch: &Batch,
-        source_id: i64,
-    ) -> Batch;
+    fn do_exchange(&mut self, view_id: i64, batch: &Batch, source_id: i64) -> Batch;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,8 +191,8 @@ pub trait ExchangeCallback {
 
 pub struct DagEngine {
     cache: FxHashMap<i64, CachedPlan>,
-    dep_map: FxHashMap<i64, Vec<i64>>,       // source_table_id → [view_ids]
-    source_map: FxHashMap<i64, Vec<i64>>,    // view_id → [source_table_ids]
+    dep_map: FxHashMap<i64, Vec<i64>>,    // source_table_id → [view_ids]
+    source_map: FxHashMap<i64, Vec<i64>>, // view_id → [source_table_ids]
     dep_map_valid: bool,
     shard_cols_cache: FxHashMap<i64, Vec<i32>>,
     // Each entry is (reindex column, carried promotion target tc) — the carried
@@ -264,21 +260,25 @@ impl DagEngine {
         depth: i32,
         directory: String,
     ) {
-        self.tables.insert(table_id, TableEntry {
-            handle,
-            schema,
-            kind,
-            depth,
-            directory,
-            index_circuits: Vec::new(),
-        });
+        self.tables.insert(
+            table_id,
+            TableEntry {
+                handle,
+                schema,
+                kind,
+                depth,
+                directory,
+                index_circuits: Vec::new(),
+            },
+        );
     }
 
     pub fn unregister_table(&mut self, table_id: i64) {
         self.tables.remove(&table_id);
         self.cache.remove(&table_id);
         self.shard_cols_cache.remove(&table_id);
-        self.join_shard_cols_cache.retain(|&(v, s), _| v != table_id && s != table_id);
+        self.join_shard_cols_cache
+            .retain(|&(v, s), _| v != table_id && s != table_id);
         self.skip_exchange_cache.remove(&table_id);
         self.needs_exchange_cache.remove(&table_id);
         self.range_join_cache.remove(&table_id);
@@ -308,7 +308,9 @@ impl DagEngine {
     pub fn remove_index_circuit(&mut self, table_id: i64, col_indices: &[u32]) {
         if let Some(entry) = self.tables.get_mut(&table_id) {
             // retain() drops non-matching entries, which drops Box<Table> automatically.
-            entry.index_circuits.retain(|ic| ic.col_indices.as_slice() != col_indices);
+            entry
+                .index_circuits
+                .retain(|ic| ic.col_indices.as_slice() != col_indices);
         }
     }
 
@@ -320,7 +322,11 @@ impl DagEngine {
     /// is dropped but another index (e.g. an FK auto-index) still covers it.
     pub fn set_index_circuit_uniqueness(&mut self, table_id: i64, col_indices: &[u32], is_unique: bool) {
         if let Some(entry) = self.tables.get_mut(&table_id) {
-            if let Some(ic) = entry.index_circuits.iter_mut().find(|ic| ic.col_indices.as_slice() == col_indices) {
+            if let Some(ic) = entry
+                .index_circuits
+                .iter_mut()
+                .find(|ic| ic.col_indices.as_slice() == col_indices)
+            {
                 ic.is_unique = is_unique;
             }
         }
@@ -361,15 +367,15 @@ impl DagEngine {
     /// against the deltas the backfill ingests.
     pub fn clear_regfile_deltas_from_source(&mut self, source_id: i64) {
         self.get_dep_map();
-        let mut stack: Vec<i64> =
-            self.dep_map.get(&source_id).cloned().unwrap_or_default();
+        let mut stack: Vec<i64> = self.dep_map.get(&source_id).cloned().unwrap_or_default();
         let mut seen: FxHashSet<i64> = FxHashSet::default();
         while let Some(view_id) = stack.pop() {
             if !seen.insert(view_id) {
                 continue;
             }
             debug_assert!(
-                self.tables.get(&view_id)
+                self.tables
+                    .get(&view_id)
                     .is_none_or(|e| e.kind.persistence() == Persistence::Ephemeral),
                 "distributed backfill into durable relation {view_id}: \
                  would double-count loaded shards",
@@ -463,12 +469,16 @@ impl DagEngine {
     /// compilation: no topo sort, no optimization passes, no code emission.
     fn load_meta_circuit(&self, view_id: i64) -> compiler::LoadedCircuit {
         let mut loaded = compiler::load_circuit(
-            self.sys.nodes, &self.sys.nodes_schema,
-            self.sys.edges, &self.sys.edges_schema,
-            self.sys.node_columns, &self.sys.node_columns_schema,
+            self.sys.nodes,
+            &self.sys.nodes_schema,
+            self.sys.edges,
+            &self.sys.edges_schema,
+            self.sys.node_columns,
+            &self.sys.node_columns_schema,
             view_id as u64,
             SchemaDescriptor::default(),
-        ).unwrap_or_else(compiler::LoadedCircuit::empty);
+        )
+        .unwrap_or_else(compiler::LoadedCircuit::empty);
         // Populate `outgoing`/`incoming` adjacency so annotation helpers like
         // `reindex_cols_through_filters` can traverse the graph. (`load_circuit`
         // returns a circuit with empty adjacency maps; only `compile_view` runs
@@ -489,7 +499,9 @@ impl DagEngine {
             return cols.clone();
         }
         let loaded = self.load_meta_circuit(view_id);
-        let shard_cols = loaded.nodes.values()
+        let shard_cols = loaded
+            .nodes
+            .values()
             .find_map(|op| {
                 if let gnitz_wire::OpNode::ExchangeShard { shard_cols: sc } = op {
                     Some(sc.iter().map(|&c| c as i32).collect::<Vec<_>>())
@@ -540,9 +552,16 @@ impl DagEngine {
                 gnitz_wire::OpNode::ScanTrace(t) | gnitz_wire::OpNode::ScanDelta(t) => t,
                 _ => return None,
             };
-            if *tid as i64 == source_id { Some(nid) } else { None }
+            if *tid as i64 == source_id {
+                Some(nid)
+            } else {
+                None
+            }
         });
-        let scan_nid = match scan_nid { Some(n) => n, None => return Vec::new() };
+        let scan_nid = match scan_nid {
+            Some(n) => n,
+            None => return Vec::new(),
+        };
 
         // Find the downstream Map(Expression { reindex_cols }) node, walking
         // through any intervening Filter nodes (planner emits Filter → Map
@@ -571,10 +590,13 @@ impl DagEngine {
 
         // The view's output ExchangeShard and its shard columns.
         let Some((enid, shard_cols)) = loaded.nodes.iter().find_map(|(&nid, op)| match op {
-            gnitz_wire::OpNode::ExchangeShard { shard_cols } =>
-                Some((nid, shard_cols.iter().map(|&c| c as i32).collect::<Vec<_>>())),
+            gnitz_wire::OpNode::ExchangeShard { shard_cols } => {
+                Some((nid, shard_cols.iter().map(|&c| c as i32).collect::<Vec<_>>()))
+            }
             _ => None,
-        }) else { return false };
+        }) else {
+            return false;
+        };
 
         // Resolve the shard's source table, walking back through any Filter chain
         // (`scan_tid_through_filters`). Skip iff that table's distribution prefix
@@ -587,7 +609,8 @@ impl DagEngine {
         let Some(tid) = crate::query::compiler::scan_tid_through_filters(&loaded, enid) else {
             return false;
         };
-        self.tables.get(&tid)
+        self.tables
+            .get(&tid)
             .is_some_and(|entry| entry.schema.shard_cols_match_dist_key(&shard_cols))
     }
 
@@ -607,8 +630,9 @@ impl DagEngine {
     pub(crate) fn view_all_sources_replicated(&mut self, view_id: i64) -> bool {
         let sources = self.get_source_ids(view_id);
         !sources.is_empty()
-            && sources.iter().all(|tid|
-                self.tables.get(tid).is_some_and(|e| e.schema.replicated()))
+            && sources
+                .iter()
+                .all(|tid| self.tables.get(tid).is_some_and(|e| e.schema.replicated()))
     }
 
     /// Ensure a view's plan is compiled. Returns true if compilation succeeded.
@@ -629,8 +653,7 @@ impl DagEngine {
     /// Returns None if the view has no exchange or isn't compiled.
     pub fn get_exchange_schema(&mut self, view_id: i64) -> Option<SchemaDescriptor> {
         self.ensure_compiled(view_id);
-        self.cache.get(&view_id)
-            .and_then(|p| p.exchange_in_schema)
+        self.cache.get(&view_id).and_then(|p| p.exchange_in_schema)
     }
 
     /// The exchange-input schema for `view_id`, falling back to the view's output
@@ -653,7 +676,9 @@ impl DagEngine {
             return needs;
         }
         let loaded = self.load_meta_circuit(view_id);
-        let needs = loaded.nodes.values()
+        let needs = loaded
+            .nodes
+            .values()
             .any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. }));
         self.needs_exchange_cache.insert(view_id, needs);
         needs
@@ -687,7 +712,9 @@ impl DagEngine {
         let view_dir = entry.directory.clone();
 
         // Build external tables array from registered tables
-        let ext_tables: Vec<ExternalTable> = self.tables.iter()
+        let ext_tables: Vec<ExternalTable> = self
+            .tables
+            .iter()
             .map(|(&tid, te)| ExternalTable {
                 table_id: tid,
                 schema: te.schema,
@@ -697,8 +724,11 @@ impl DagEngine {
         let result = unsafe {
             compiler::compile_view(
                 view_id as u64,
-                self.sys.nodes, self.sys.edges, self.sys.node_columns,
-                &self.sys.nodes_schema, &self.sys.edges_schema,
+                self.sys.nodes,
+                self.sys.edges,
+                self.sys.node_columns,
+                &self.sys.nodes_schema,
+                &self.sys.edges_schema,
                 &self.sys.node_columns_schema,
                 &view_dir,
                 view_id as u32,
@@ -725,12 +755,7 @@ impl DagEngine {
     ///
     /// Refreshes ext cursors, loads input, runs the VM, returns the output batch.
     /// Port of `ExecutablePlan.execute_epoch()`.
-    pub fn execute_epoch(
-        &mut self,
-        view_id: i64,
-        input: Batch,
-        source_id: i64,
-    ) -> Option<Batch> {
+    pub fn execute_epoch(&mut self, view_id: i64, input: Batch, source_id: i64) -> Option<Batch> {
         // We need to compile (or fetch cached plan) then execute.
         // Since we need &mut self for get_program but also need to borrow
         // plan fields, we first ensure compilation, then work with the cached plan.
@@ -755,7 +780,8 @@ impl DagEngine {
         if !self.ensure_compiled(view_id) {
             return false;
         }
-        self.cache.get(&view_id)
+        self.cache
+            .get(&view_id)
             .map(|p| p.co_partitioned.contains(&source_id))
             .unwrap_or(false)
     }
@@ -842,12 +868,10 @@ impl DagEngine {
     /// Project all index batches from `source`, ingest a clone into the store,
     /// then drain the projected index batches into their respective index tables.
     /// Shared by `ingest_by_ref` and `ingest_returning_effective`.
-    fn ingest_store_and_indices(
-        entry: &mut TableEntry,
-        schema: &SchemaDescriptor,
-        source: &Batch,
-    ) {
-        let index_batches: Vec<Batch> = entry.index_circuits.iter()
+    fn ingest_store_and_indices(entry: &mut TableEntry, schema: &SchemaDescriptor, source: &Batch) {
+        let index_batches: Vec<Batch> = entry
+            .index_circuits
+            .iter()
             .map(|ic| Self::batch_project_index(source, ic.col_indices.as_slice(), schema, &ic.index_schema))
             .collect();
         let _ = entry.handle.ingest_owned_batch(source.clone_batch());
@@ -883,15 +907,14 @@ impl DagEngine {
     ///
     /// Index circuits are non-durable, so they execute their inline shard
     /// write here and contribute nothing to the returned Vec.
-    pub fn flush_prepare(
-        &mut self,
-        table_id: i64,
-    ) -> Result<Vec<(usize, FlushWork)>, String> {
+    pub fn flush_prepare(&mut self, table_id: i64) -> Result<Vec<(usize, FlushWork)>, String> {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => return Ok(vec![]),
         };
-        let works = entry.handle.flush_prepare()
+        let works = entry
+            .handle
+            .flush_prepare()
             .map_err(|_| format!("flush_prepare failed for table_id={table_id}"))?;
         for ic in &mut entry.index_circuits {
             // Index tables are created Ephemeral, so this is an inline write
@@ -905,9 +928,7 @@ impl DagEngine {
                     ));
                 }
                 Err(_) => {
-                    return Err(format!(
-                        "index flush_prepare failed for table_id={table_id}"
-                    ));
+                    return Err(format!("index flush_prepare failed for table_id={table_id}"));
                 }
             }
         }
@@ -924,7 +945,9 @@ impl DagEngine {
             Some(e) => e,
             None => return Ok(vec![]),
         };
-        entry.handle.flush_commit_batch(works)
+        entry
+            .handle
+            .flush_commit_batch(works)
             .map_err(|_| format!("flush_commit_batch failed for table_id={table_id}"))
     }
 
@@ -953,7 +976,12 @@ impl DagEngine {
                 } else {
                     delta_opt.as_ref().unwrap().clone_batch()
                 };
-                pending.push(PendingEntry { depth, view_id: vid, source_id, batch: b });
+                pending.push(PendingEntry {
+                    depth,
+                    view_id: vid,
+                    source_id,
+                    batch: b,
+                });
             }
         }
         if let Some(d) = delta_opt {
@@ -991,10 +1019,7 @@ impl DagEngine {
         mut execute: impl FnMut(&mut Self, i64, Batch, i64) -> Option<Batch>,
     ) -> i32 {
         self.get_dep_map();
-        let view_ids: Vec<i64> = self.dep_map
-            .get(&source_id)
-            .cloned()
-            .unwrap_or_default();
+        let view_ids: Vec<i64> = self.dep_map.get(&source_id).cloned().unwrap_or_default();
         if view_ids.is_empty() {
             return 0;
         }
@@ -1066,8 +1091,12 @@ impl DagEngine {
     /// Single-worker DAG evaluation: run each view's epoch directly, with no
     /// exchange IPC. An empty output is dropped — nothing downstream can change.
     pub fn evaluate_dag(&mut self, source_id: i64, delta: Batch) -> i32 {
-        gnitz_debug!("dag: evaluate_dag source_id={} delta_count={} tables={}",
-            source_id, delta.count, self.tables.len());
+        gnitz_debug!(
+            "dag: evaluate_dag source_id={} delta_count={} tables={}",
+            source_id,
+            delta.count,
+            self.tables.len()
+        );
         self.drive_dag(source_id, delta, false, |this, view_id, input, src_id| {
             this.execute_epoch_for_dag(view_id, input, src_id)
         })
@@ -1134,8 +1163,9 @@ impl DagEngine {
         } else if has_exchange && self.view_has_side_b(view_id) {
             // Arm 2 — binary set-op: two HashRow→ExchangeShard sides, each
             // scattered by its hash PK, then combined.
-            self.run_two_sided(view_id, input, src_id,
-                |pre, side_src| exchange.do_exchange(view_id, &pre, side_src))
+            self.run_two_sided(view_id, input, src_id, |pre, side_src| {
+                exchange.do_exchange(view_id, &pre, side_src)
+            })
         } else if has_exchange {
             // Arm 3 — plain exchange: the unary pipeline on the local delta,
             // eliding the output IPC when the shuffle is a proven no-op.
@@ -1164,10 +1194,7 @@ impl DagEngine {
     /// Restore the pending queue's descending-depth order and rebuild the
     /// `(view_id, source_id) → index` lookup. Both DAG drivers call this after
     /// pushing a new entry.
-    fn resort_pending(
-        pending: &mut [PendingEntry],
-        pending_pos: &mut FxHashMap<(i64, i64), usize>,
-    ) {
+    fn resort_pending(pending: &mut [PendingEntry], pending_pos: &mut FxHashMap<(i64, i64), usize>) {
         pending.sort_by_key(|n| std::cmp::Reverse(n.depth));
         pending_pos.clear();
         for (i, pe) in pending.iter().enumerate() {
@@ -1208,10 +1235,8 @@ impl DagEngine {
 
             if let Some(&existing_idx) = pending_pos.get(&(dep_id, view_id)) {
                 if let (true, Some(d)) = (existing_idx < pending.len(), delta) {
-                    let existing = std::mem::replace(
-                        &mut pending[existing_idx].batch,
-                        Batch::empty_with_schema(&src_schema),
-                    );
+                    let existing =
+                        std::mem::replace(&mut pending[existing_idx].batch, Batch::empty_with_schema(&src_schema));
                     let schema = existing.schema.unwrap_or(src_schema);
                     let merged = ops::op_union(existing, Some(d), &schema);
                     pending[existing_idx].batch = merged;
@@ -1283,12 +1308,7 @@ impl DagEngine {
 
     /// Execute epoch for evaluate_dag, handling pre/post plan split for
     /// single-worker (no exchange IPC).
-    fn execute_epoch_for_dag(
-        &mut self,
-        view_id: i64,
-        input: Batch,
-        source_id: i64,
-    ) -> Option<Batch> {
+    fn execute_epoch_for_dag(&mut self, view_id: i64, input: Batch, source_id: i64) -> Option<Batch> {
         if !self.ensure_compiled(view_id) {
             gnitz_warn!("dag: evaluate_dag — no plan for view_id={}", view_id);
             return None;
@@ -1307,7 +1327,8 @@ impl DagEngine {
             // consolidate before the post phase, whose distinct/join operators
             // assume sorted, weight-merged input.
             let exchange_schema = self.exchange_or_view_schema(view_id);
-            let pre_result = self.execute_pre_phase(view_id, input, source_id)
+            let pre_result = self
+                .execute_pre_phase(view_id, input, source_id)
                 .unwrap_or_else(|| Batch::with_schema(exchange_schema, 0));
             let consolidated = Self::consolidate_exchanged(pre_result, &exchange_schema);
             self.execute_post_phase(view_id, consolidated)
@@ -1339,32 +1360,26 @@ impl DagEngine {
             sub.in_reg
         };
         sub.vm.refresh_owned_cursors();
-        Self::vm_epoch_result(view_id, vm::execute_epoch(
-            &sub.vm.program,
-            &mut sub.vm.regfile,
-            input,
-            actual_in_reg,
-            sub.out_reg,
-            &cursor_ptrs,
-            &sub.vm.owned_trace_regs,
-        ))
+        Self::vm_epoch_result(
+            view_id,
+            vm::execute_epoch(
+                &sub.vm.program,
+                &mut sub.vm.regfile,
+                input,
+                actual_in_reg,
+                sub.out_reg,
+                &cursor_ptrs,
+                &sub.vm.owned_trace_regs,
+            ),
+        )
     }
 
-    fn execute_pre_phase(
-        &mut self,
-        view_id: i64,
-        input: Batch,
-        source_id: i64,
-    ) -> Option<Batch> {
+    fn execute_pre_phase(&mut self, view_id: i64, input: Batch, source_id: i64) -> Option<Batch> {
         let plan = self.cache.get_mut(&view_id)?;
         Self::execute_sub_plan(view_id, &mut plan.pre, &self.tables, input, source_id)
     }
 
-    fn execute_post_phase(
-        &mut self,
-        view_id: i64,
-        input: Batch,
-    ) -> Option<Batch> {
+    fn execute_post_phase(&mut self, view_id: i64, input: Batch) -> Option<Batch> {
         let plan = self.cache.get_mut(&view_id)?;
         Self::execute_sub_plan(view_id, plan.post.as_mut().unwrap(), &self.tables, input, 0)
     }
@@ -1377,20 +1392,23 @@ impl DagEngine {
 
     /// Run the post phase seeding several exchange-input registers (one per
     /// set-op side). Used after both sides have been exchanged/consolidated.
-    fn execute_post_multi(
-        &mut self,
-        view_id: i64,
-        inputs: Vec<(u16, Batch)>,
-    ) -> Option<Batch> {
+    fn execute_post_multi(&mut self, view_id: i64, inputs: Vec<(u16, Batch)>) -> Option<Batch> {
         let plan = self.cache.get_mut(&view_id)?;
         let post = plan.post.as_mut()?;
         let (cursor_ptrs, _cursor_storage) =
             Self::build_ext_cursors(&self.tables, &post.ext_trace_regs, post.num_regs as usize);
         post.vm.refresh_owned_cursors();
-        Self::vm_epoch_result(view_id, vm::execute_epoch_multi(
-            &post.vm.program, &mut post.vm.regfile, inputs, post.out_reg,
-            &cursor_ptrs, &post.vm.owned_trace_regs,
-        ))
+        Self::vm_epoch_result(
+            view_id,
+            vm::execute_epoch_multi(
+                &post.vm.program,
+                &mut post.vm.regfile,
+                inputs,
+                post.out_reg,
+                &cursor_ptrs,
+                &post.vm.owned_trace_regs,
+            ),
+        )
     }
 
     /// Force a real sort+weight-merge of a post-exchange batch. The exchange
@@ -1426,21 +1444,21 @@ impl DagEngine {
             Err(code) => gnitz_fatal_abort!(
                 "dag: VM execution error {} for view_id={} — malformed circuit, \
                  cannot continue without producing inconsistent view state",
-                code, view_id,
+                code,
+                view_id,
             ),
         }
     }
 
     /// Per-side exchange metadata snapshot for both sides of a two-sided join.
-    fn two_sided_meta(&self, view_id: i64)
-        -> Option<(ExchangeSideMeta, ExchangeSideMeta)>
-    {
+    fn two_sided_meta(&self, view_id: i64) -> Option<(ExchangeSideMeta, ExchangeSideMeta)> {
         let p = self.cache.get(&view_id)?;
         let sb = p.side_b.as_ref()?;
         // A two-sided plan always records side A's pre-exchange output schema;
         // the view's final (combine-widened) schema is a different width for a
         // JOIN and would mislabel side A's operand batch.
-        let a_schema = p.exchange_in_schema
+        let a_schema = p
+            .exchange_in_schema
             .expect("two-sided plan must carry side A's exchange_in_schema");
         // Each set-op side scans exactly one relation (the planner rejects a
         // JOIN on either side), so both ids are real tables — never
@@ -1496,8 +1514,7 @@ impl DagEngine {
         src_id: i64,
         mut relay: impl FnMut(Batch, i64) -> Batch,
     ) -> Option<Batch> {
-        let ((a_schema, a_source, a_seed), (b_schema, b_source, b_seed)) =
-            self.two_sided_meta(view_id)?;
+        let ((a_schema, a_source, a_seed), (b_schema, b_source, b_seed)) = self.two_sided_meta(view_id)?;
 
         // The delta belongs to whichever side(s) scan its source. An inactive
         // side has no delta this epoch, so its pre-phase (a linear
@@ -1517,9 +1534,9 @@ impl DagEngine {
              side ({a_source}, {b_source})",
         );
         let (a_in, b_in) = match (a_needs, b_needs) {
-            (true, true)  => (Some(input.clone_batch()), Some(input)),
+            (true, true) => (Some(input.clone_batch()), Some(input)),
             (true, false) => (Some(input), None),
-            (false, true)  => (None, Some(input)),
+            (false, true) => (None, Some(input)),
             (false, false) => unreachable!("run_two_sided view {view_id}: source {src_id} matches neither side"),
         };
 
@@ -1527,13 +1544,29 @@ impl DagEngine {
         // overlap with execute_post_multi's borrow via self.
         let cons_a = {
             let plan = self.cache.get_mut(&view_id).unwrap();
-            Self::run_one_side(view_id, &mut plan.pre, &self.tables,
-                               a_in, src_id, a_schema, a_source, &mut relay)
+            Self::run_one_side(
+                view_id,
+                &mut plan.pre,
+                &self.tables,
+                a_in,
+                src_id,
+                a_schema,
+                a_source,
+                &mut relay,
+            )
         };
         let cons_b = {
             let plan = self.cache.get_mut(&view_id).unwrap();
-            Self::run_one_side(view_id, &mut plan.side_b.as_mut().unwrap().plan,
-                               &self.tables, b_in, src_id, b_schema, b_source, &mut relay)
+            Self::run_one_side(
+                view_id,
+                &mut plan.side_b.as_mut().unwrap().plan,
+                &self.tables,
+                b_in,
+                src_id,
+                b_schema,
+                b_source,
+                &mut relay,
+            )
         };
 
         self.execute_post_multi(view_id, vec![(a_seed, cons_a), (b_seed, cons_b)])
@@ -1571,7 +1604,8 @@ impl DagEngine {
         exchange: &mut E,
     ) -> Option<Batch> {
         let exchange_schema = self.exchange_or_view_schema(view_id);
-        let mut pre = self.execute_pre_phase(view_id, pre_input, src_id)
+        let mut pre = self
+            .execute_pre_phase(view_id, pre_input, src_id)
             .unwrap_or_else(|| Batch::with_schema(exchange_schema, 0));
         pre.set_schema(exchange_schema);
         let post_in = if skip_exchange {
@@ -1593,8 +1627,11 @@ impl DagEngine {
     fn normalize_unique_pk_weights(batch: &mut Batch) {
         for row in 0..batch.count {
             let w = batch.get_weight(row);
-            if w > 1 { batch.set_weight(row, 1); }
-            else if w < -1 { batch.set_weight(row, -1); }
+            if w > 1 {
+                batch.set_weight(row, 1);
+            } else if w < -1 {
+                batch.set_weight(row, -1);
+            }
         }
     }
 
@@ -1610,11 +1647,7 @@ impl DagEngine {
     /// (which `opk_key` would re-encode, double-flipping a signed PK's sign bit,
     /// so the probe would match no stored row and the retraction would be
     /// silently dropped).
-    fn enforce_unique_pk(
-        ptable: &mut PartitionedTable,
-        schema: &SchemaDescriptor,
-        mut batch: Batch,
-    ) -> Batch {
+    fn enforce_unique_pk(ptable: &mut PartitionedTable, schema: &SchemaDescriptor, mut batch: Batch) -> Batch {
         // Empty-batch guard: `Batch::with_schema(_, 0)` still allocates (capacity
         // forced to ≥1, plus a pooled data buffer and a blob Vec). Empty batches
         // reach the engine via the `CatalogStore` ingest wrappers, which — unlike
@@ -1629,8 +1662,7 @@ impl DagEngine {
         // batch index (not an effective index): `append_batch_negated` reads from
         // `batch`, and the effective batch carries extra store-retraction rows
         // that break any 1:1 correspondence with `row`.
-        let mut seen: FxHashMap<&[u8], usize> =
-            FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
+        let mut seen: FxHashMap<&[u8], usize> = FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
         // pk set of store rows already retracted in this batch. `retract_pk_bytes`
         // is read-only (it only arms the `found_*` accessors), so emitting the
         // stored-row retraction more than once per PK would drive downstream
@@ -1721,19 +1753,22 @@ impl DagEngine {
 
         for row in 0..src.count {
             let weight = src.get_weight(row);
-            if weight == 0 { continue; }
+            if weight == 0 {
+                continue;
+            }
             // Leading index-key slots: each indexed value re-encoded OPK into
             // its promoted slot. The index table's PK region is
             // order-preserving like any other; seeks (has_pk / seek_by_index)
             // encode the same way. NULL in ANY indexed column ⇒ row not
             // indexed; retractions (weight < 0) DO project, so the index
             // entry retracts with its source row.
-            if !spec.write_span(&mb, row, &mut idx_pk_buf) { continue; }
+            if !spec.write_span(&mb, row, &mut idx_pk_buf) {
+                continue;
+            }
             // The source PK region is laid out in pk_indices order, so the
             // index's trailing PK suffix is byte-identical to the source's PK
             // (already OPK).
-            idx_pk_buf[idx_key_size..idx_key_size + src_pk_stride]
-                .copy_from_slice(src.get_pk_bytes(row));
+            idx_pk_buf[idx_key_size..idx_key_size + src_pk_stride].copy_from_slice(src.get_pk_bytes(row));
             out.extend_pk_bytes(&idx_pk_buf[..idx_stride]);
             out.extend_weight(&weight.to_le_bytes());
             // Index schema has zero payload columns, but the null_bmp region
@@ -1777,7 +1812,9 @@ mod tests {
     fn dag_test_dir(name: &str) -> String {
         std::env::temp_dir()
             .join(format!("gnitz_dag_test_{name}"))
-            .to_str().unwrap().to_owned()
+            .to_str()
+            .unwrap()
+            .to_owned()
     }
 
     fn make_test_table(name: &str) -> Box<Table> {
@@ -1800,7 +1837,14 @@ mod tests {
         let mut dag = DagEngine::new();
         let schema = SchemaDescriptor::default();
         let mut tbl = make_test_table("reg_unreg");
-        dag.register_table(100, StoreHandle::Borrowed(&mut *tbl as *mut Table), schema, RelationKind::BaseTable { unique_pk: false }, 0, String::new());
+        dag.register_table(
+            100,
+            StoreHandle::Borrowed(&mut *tbl as *mut Table),
+            schema,
+            RelationKind::BaseTable { unique_pk: false },
+            0,
+            String::new(),
+        );
         assert!(dag.tables.contains_key(&100));
 
         dag.unregister_table(100);
@@ -1859,7 +1903,14 @@ mod tests {
         let mut dag = DagEngine::new();
         let schema = SchemaDescriptor::default();
         let mut tbl = make_test_table("idx_parent");
-        dag.register_table(50, StoreHandle::Borrowed(&mut *tbl as *mut Table), schema, RelationKind::BaseTable { unique_pk: false }, 0, String::new());
+        dag.register_table(
+            50,
+            StoreHandle::Borrowed(&mut *tbl as *mut Table),
+            schema,
+            RelationKind::BaseTable { unique_pk: false },
+            0,
+            String::new(),
+        );
         let idx_tbl = make_test_table("idx_child");
         dag.add_index_circuit(50, &[2], 999, idx_tbl, schema, false);
         assert_eq!(dag.tables[&50].index_circuits.len(), 1);
@@ -1898,14 +1949,29 @@ mod tests {
         let mut dag = DagEngine::new();
         let parent_schema = SchemaDescriptor::default();
         let mut tbl = make_test_table("flush_ic_parent");
-        dag.register_table(70, StoreHandle::Borrowed(&mut *tbl as *mut Table), parent_schema, RelationKind::BaseTable { unique_pk: false }, 0, String::new());
+        dag.register_table(
+            70,
+            StoreHandle::Borrowed(&mut *tbl as *mut Table),
+            parent_schema,
+            RelationKind::BaseTable { unique_pk: false },
+            0,
+            String::new(),
+        );
 
         // Durable index table: flush writes shard_*.db only if called.
         let idx_schema = crate::schema::SchemaDescriptor::minimal_u64();
         let idx_dir = dag_test_dir("flush_ic_idx");
         let _ = std::fs::remove_dir_all(&idx_dir);
         let idx_tbl = Box::new(
-            Table::new(&idx_dir, "flush_ic_idx", idx_schema, 1, 256 * 1024, Persistence::Durable).unwrap(),
+            Table::new(
+                &idx_dir,
+                "flush_ic_idx",
+                idx_schema,
+                1,
+                256 * 1024,
+                Persistence::Durable,
+            )
+            .unwrap(),
         );
         dag.add_index_circuit(70, &[1], 999, idx_tbl, idx_schema, false);
 
@@ -1942,7 +2008,7 @@ mod tests {
     // was silently dropped. The byte path keys on verbatim OPK and is correct.
     #[test]
     fn test_enforce_unique_pk_signed_negative_retraction() {
-        use crate::schema::{SchemaColumn, type_code};
+        use crate::schema::{type_code, SchemaColumn};
         raise_fd_limit_for_tests();
 
         let schema = SchemaDescriptor::new(
@@ -1955,9 +2021,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_signed");
         let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(), "enforce_signed", schema, 1234, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "enforce_signed",
+            schema,
+            1234,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             crate::storage::partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Seed the store with a negative-PK row (PK=-5, payload=100).
         let mut seed = Batch::with_schema(schema, 1);
@@ -1992,7 +2066,10 @@ mod tests {
         // Re-ingest the effective batch as the DML pipeline does; the stored
         // negative-PK row then nets to zero and is gone.
         pt.ingest_owned_batch(effective).unwrap();
-        assert!(!pt.has_pk_bytes(&opk), "stored negative-PK row must be gone after retraction");
+        assert!(
+            !pt.has_pk_bytes(&opk),
+            "stored negative-PK row must be gone after retraction"
+        );
     }
 
     // unique_pk contract: per-PK accumulated weight ∈ {0, 1}. A pushed row at
@@ -2003,7 +2080,7 @@ mod tests {
     // short-circuit's premise breaks.
     #[test]
     fn test_enforce_unique_pk_weight_normalized() {
-        use crate::schema::{SchemaColumn, type_code};
+        use crate::schema::{type_code, SchemaColumn};
         raise_fd_limit_for_tests();
 
         let schema = SchemaDescriptor::new(
@@ -2016,9 +2093,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_weight_norm");
         let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(), "enforce_weight_norm", schema, 1234, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "enforce_weight_norm",
+            schema,
+            1234,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             crate::storage::partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
         let row_pk1 = |payload: i64, weight: i64| {
             let mut b = Batch::with_schema(schema, 1);
@@ -2052,7 +2137,11 @@ mod tests {
         // store to exactly zero (no ghost weight survives, no negative net).
         let effective = DagEngine::enforce_unique_pk(&mut pt, &schema, row_pk1(200, -3));
         assert_eq!(effective.count, 1, "one net retraction row expected");
-        assert_eq!(effective.get_weight(0), -1, "retraction weight must be normalized to -1");
+        assert_eq!(
+            effective.get_weight(0),
+            -1,
+            "retraction weight must be normalized to -1"
+        );
         pt.ingest_owned_batch(effective).unwrap();
         assert!(!pt.has_pk_bytes(&opk), "row must be fully gone after the delete");
     }
@@ -2063,7 +2152,7 @@ mod tests {
     // `(-1, filler)` row, leaving a base table at net weight -1.
     #[test]
     fn test_enforce_unique_pk_absent_key_drops_phantom() {
-        use crate::schema::{SchemaColumn, type_code};
+        use crate::schema::{type_code, SchemaColumn};
         raise_fd_limit_for_tests();
 
         let schema = SchemaDescriptor::new(
@@ -2076,9 +2165,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_absent");
         let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(), "enforce_absent", schema, 1234, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "enforce_absent",
+            schema,
+            1234,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             crate::storage::partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Seed an unrelated row (PK=-5) so the store is non-empty.
         let mut seed = Batch::with_schema(schema, 1);
@@ -2116,7 +2213,10 @@ mod tests {
         pt.ingest_owned_batch(ins).unwrap();
 
         let eff1 = DagEngine::enforce_unique_pk(&mut pt, &schema, retract_pk7());
-        assert_eq!(eff1.count, 1, "retracting a present key emits the stored-row retraction");
+        assert_eq!(
+            eff1.count, 1,
+            "retracting a present key emits the stored-row retraction"
+        );
         pt.ingest_owned_batch(eff1).unwrap(); // PK=7 now nets to zero (tombstoned)
 
         let eff2 = DagEngine::enforce_unique_pk(&mut pt, &schema, retract_pk7());
@@ -2136,9 +2236,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("enforce_wide");
         let mut pt = crate::storage::PartitionedTable::new(
-            tdir.to_str().unwrap(), "enforce_wide", schema, 555, 256, Persistence::Ephemeral, 0, 256,
+            tdir.to_str().unwrap(),
+            "enforce_wide",
+            schema,
+            555,
+            256,
+            Persistence::Ephemeral,
+            0,
+            256,
             crate::storage::partition_arena_size(256),
-        ).unwrap();
+        )
+        .unwrap();
 
         let pk24 = |a: u64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
 
@@ -2153,7 +2261,11 @@ mod tests {
         let eff = DagEngine::enforce_unique_pk(&mut pt, &schema, wide_row(&schema, &pk24(1, 2, 3), 1, 200));
         assert_eq!(eff.count, 2, "stored-row retraction + new insert");
         assert_eq!(eff.get_weight(0), -1, "stored retraction at -1");
-        assert_eq!(eff.get_pk_bytes(0), &pk24(1, 2, 3)[..], "retraction keys on the full 24-byte PK");
+        assert_eq!(
+            eff.get_pk_bytes(0),
+            &pk24(1, 2, 3)[..],
+            "retraction keys on the full 24-byte PK"
+        );
         assert_eq!(eff.get_weight(1), 1, "new insert at +1");
         pt.ingest_owned_batch(eff).unwrap();
         assert!(pt.has_pk_bytes(&pk24(1, 2, 3)), "row stays live after the upsert");
@@ -2197,7 +2309,9 @@ mod tests {
     // call gnitz_fatal_abort!. The parent asserts exit code 134.
     #[test]
     fn test_vm_epoch_result_abort_internal() {
-        if std::env::var("GNITZ_RUN_ABORT_TEST").is_err() { return; }
+        if std::env::var("GNITZ_RUN_ABORT_TEST").is_err() {
+            return;
+        }
         let r: Result<Option<Batch>, i32> = Err(-10);
         DagEngine::vm_epoch_result(42, r);
         unreachable!("vm_epoch_result must not return on Err");
@@ -2215,10 +2329,16 @@ mod tests {
         let (recovery, current) = (f.recovery_lsn, f.current_lsn);
         assert!(recovery < current, "fixture must have min < max to distinguish the two");
 
-        let handle = StoreHandle::Partitioned(
-            std::cell::UnsafeCell::new(Box::new(f.pt)),
+        let handle = StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(f.pt)));
+        assert_eq!(
+            handle.recovery_lsn(),
+            recovery,
+            "Partitioned recovery_lsn → min_flushed_lsn"
         );
-        assert_eq!(handle.recovery_lsn(), recovery, "Partitioned recovery_lsn → min_flushed_lsn");
-        assert_eq!(handle.current_lsn(), current, "Partitioned current_lsn → max current_lsn");
+        assert_eq!(
+            handle.current_lsn(),
+            current,
+            "Partitioned current_lsn → max current_lsn"
+        );
     }
 }

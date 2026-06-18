@@ -6,16 +6,19 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ConsolidatedBatch, MemBatch, compare_pk_bytes, pk_sort_key, partition_for_key, partition_for_pk_bytes, write_to_batch, scatter_multi_source};
+use crate::storage::{
+    compare_pk_bytes, partition_for_key, partition_for_pk_bytes, pk_sort_key, scatter_multi_source, write_to_batch,
+    Batch, ConsolidatedBatch, MemBatch,
+};
 
-use super::router::{RouteMode, build_w_map, compound_join_packer, hash_row_for_partition, key_is_promoted};
+use super::router::{build_w_map, compound_join_packer, hash_row_for_partition, key_is_promoted, RouteMode};
 // `SCATTER_INDICES` + the `ReindexPacker` are reached only from the `#[cfg(test)]`
 // scatter helpers / co-partition tests below; production relay paths build their
 // own worker-row scratch (`WORKER_ROWS`).
 #[cfg(test)]
-use super::router::{SCATTER_INDICES, compute_worker_indices, worker_for_partition};
-#[cfg(test)]
 use super::super::reindex::ReindexPacker;
+#[cfg(test)]
+use super::router::{compute_worker_indices, worker_for_partition, SCATTER_INDICES};
 
 // Thread-local pool: reuse Vec<Vec<(u8,u32)>> worker-row scratch across calls.
 thread_local! {
@@ -23,7 +26,8 @@ thread_local! {
 }
 
 fn mem_batch_blob_cap(mem_batches: &[Option<MemBatch>]) -> usize {
-    mem_batches.iter()
+    mem_batches
+        .iter()
         .filter_map(|o| o.as_ref())
         .map(|mb| mb.blob.len())
         .sum::<usize>()
@@ -37,14 +41,19 @@ pub(super) fn op_repartition_batch(
     schema: &SchemaDescriptor,
     num_workers: usize,
 ) -> Vec<Batch> {
-    gnitz_debug!("op_repartition_batch: count={} num_workers={}", batch.count, num_workers);
+    gnitz_debug!(
+        "op_repartition_batch: count={} num_workers={}",
+        batch.count,
+        num_workers
+    );
     let worker_indices = compute_worker_indices(batch, col_indices, schema, num_workers);
     let mb = batch.as_mem_batch();
     // Single source by definition; mirror the production single-source rule.
     // `compute_worker_indices` does not return the routing decision, so recompute
     // `is_pk_routing` here (a cheap slice compare).
     let is_pk_routing = col_indices == schema.pk_indices();
-    let mut out: Vec<Batch> = worker_indices.into_iter()
+    let mut out: Vec<Batch> = worker_indices
+        .into_iter()
         .map(|indices| {
             if !indices.is_empty() {
                 Batch::from_indexed_rows(&mb, &indices, schema)
@@ -77,7 +86,11 @@ pub(crate) fn op_repartition_batches_mode(
         sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
         mode,
     );
-    assert!(sources.len() <= 256, "source index must fit in u8 (got {})", sources.len());
+    assert!(
+        sources.len() <= 256,
+        "source index must fit in u8 (got {})",
+        sources.len()
+    );
     let w_map = build_w_map(num_workers);
 
     let mem_batches: Vec<Option<MemBatch>> = sources
@@ -95,7 +108,9 @@ pub(crate) fn op_repartition_batches_mode(
         if worker_rows.len() < num_workers {
             worker_rows.resize_with(num_workers, Vec::new);
         }
-        for w in 0..num_workers { worker_rows[w].clear(); }
+        for w in 0..num_workers {
+            worker_rows[w].clear();
+        }
 
         // Same hoist as `fill_worker_indices`: wide-PK single-column routing
         // and compound-PK routing both go through `partition_for_pk_bytes`
@@ -112,7 +127,10 @@ pub(crate) fn op_repartition_batches_mode(
         let join_packer = compound_join_packer(mode, col_indices, target_tcs, schema);
         let mut pack_buf = [0u8; gnitz_wire::MAX_PK_BYTES];
         for (si, mb_opt) in mem_batches.iter().enumerate() {
-            let mb = match mb_opt { Some(m) => m, None => continue };
+            let mb = match mb_opt {
+                Some(m) => m,
+                None => continue,
+            };
             if is_pk_routing {
                 for i in 0..mb.count {
                     let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
@@ -243,7 +261,11 @@ fn relay_scatter_merge_walk(
     worker_rows: &mut Vec<Vec<(u8, u32)>>,
     mode: RouteMode,
 ) {
-    assert!(mem_batches.len() <= 256, "source index must fit in u8 (got {})", mem_batches.len());
+    assert!(
+        mem_batches.len() <= 256,
+        "source index must fit in u8 (got {})",
+        mem_batches.len()
+    );
     let w_map = build_w_map(num_workers);
     let cursors = [0u32; 256];
     let mut pk_cache = [0u128; 256];
@@ -298,9 +320,7 @@ fn relay_scatter_merge_walk(
     // Route closures — 3-arg form. pk_val is the cached PK in the K-way
     // path and `get_pk(row)` in the bulk-drain (both narrow only).
     let route_pk_narrow = |_mb: &MemBatch, _row: usize, pk_val: u128| partition_for_key(pk_val);
-    let route_pk_wide = |mb: &MemBatch, row: usize, _pk_val: u128| {
-        partition_for_pk_bytes(mb.get_pk_bytes(row))
-    };
+    let route_pk_wide = |mb: &MemBatch, row: usize, _pk_val: u128| partition_for_pk_bytes(mb.get_pk_bytes(row));
     let route_group = |mb: &MemBatch, row: usize, _pk_val: u128| {
         if let Some(p) = &join_packer {
             let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
@@ -314,39 +334,54 @@ fn relay_scatter_merge_walk(
     if !is_wide {
         // Narrow winner-comparator: a raw `u128` compare on the order-preserving
         // key (unsigned/signed/compound alike) — no pk_fast/slow_cmp branch.
-        let select_narrow = move |order_cache: &[u128; 256],
-                                  _cursors: &[u32; 256],
-                                  active: &[u8; 256],
-                                  n: usize|
-              -> usize {
-            let mut best_pos = 0;
-            let mut best_key = order_cache[active[0] as usize];
-            let mut best_si_u8 = active[0];
-            #[allow(clippy::needless_range_loop)]
-            for pos in 1..n {
-                let si = active[pos];
-                let key = order_cache[si as usize];
-                // Source-index tiebreak: swap_remove scrambles active_sources,
-                // so equal-key winners would otherwise be
-                // eviction-history-dependent.
-                if key < best_key || (key == best_key && si < best_si_u8) {
-                    best_key = key;
-                    best_pos = pos;
-                    best_si_u8 = si;
+        let select_narrow =
+            move |order_cache: &[u128; 256], _cursors: &[u32; 256], active: &[u8; 256], n: usize| -> usize {
+                let mut best_pos = 0;
+                let mut best_key = order_cache[active[0] as usize];
+                let mut best_si_u8 = active[0];
+                #[allow(clippy::needless_range_loop)]
+                for pos in 1..n {
+                    let si = active[pos];
+                    let key = order_cache[si as usize];
+                    // Source-index tiebreak: swap_remove scrambles active_sources,
+                    // so equal-key winners would otherwise be
+                    // eviction-history-dependent.
+                    if key < best_key || (key == best_key && si < best_si_u8) {
+                        best_key = key;
+                        best_pos = pos;
+                        best_si_u8 = si;
+                    }
                 }
-            }
-            best_pos
-        };
+                best_pos
+            };
 
         if is_pk_routing {
             relay_walk_inner::<true, _, _>(
-                mem_batches, &w_map, worker_rows, &mut pk_cache, &mut order_cache, schema,
-                cursors, active_sources, num_active, select_narrow, route_pk_narrow,
+                mem_batches,
+                &w_map,
+                worker_rows,
+                &mut pk_cache,
+                &mut order_cache,
+                schema,
+                cursors,
+                active_sources,
+                num_active,
+                select_narrow,
+                route_pk_narrow,
             );
         } else {
             relay_walk_inner::<true, _, _>(
-                mem_batches, &w_map, worker_rows, &mut pk_cache, &mut order_cache, schema,
-                cursors, active_sources, num_active, select_narrow, route_group,
+                mem_batches,
+                &w_map,
+                worker_rows,
+                &mut pk_cache,
+                &mut order_cache,
+                schema,
+                cursors,
+                active_sources,
+                num_active,
+                select_narrow,
+                route_group,
             );
         }
     } else {
@@ -354,11 +389,7 @@ fn relay_scatter_merge_walk(
         // delegate to the column-aware compare_pk_bytes. The winner's bytes
         // are cached across the inner scan to avoid re-unwrap/re-slice on
         // every iteration.
-        let select_wide = |_pk_cache: &[u128; 256],
-                           cursors: &[u32; 256],
-                           active: &[u8; 256],
-                           n: usize|
-              -> usize {
+        let select_wide = |_pk_cache: &[u128; 256], cursors: &[u32; 256], active: &[u8; 256], n: usize| -> usize {
             let mut best_pos = 0;
             let mut best_si_u8 = active[0];
             let mut best_pk_bytes = mem_batches[best_si_u8 as usize]
@@ -385,13 +416,31 @@ fn relay_scatter_merge_walk(
 
         if is_pk_routing {
             relay_walk_inner::<false, _, _>(
-                mem_batches, &w_map, worker_rows, &mut pk_cache, &mut order_cache, schema,
-                cursors, active_sources, num_active, select_wide, route_pk_wide,
+                mem_batches,
+                &w_map,
+                worker_rows,
+                &mut pk_cache,
+                &mut order_cache,
+                schema,
+                cursors,
+                active_sources,
+                num_active,
+                select_wide,
+                route_pk_wide,
             );
         } else {
             relay_walk_inner::<false, _, _>(
-                mem_batches, &w_map, worker_rows, &mut pk_cache, &mut order_cache, schema,
-                cursors, active_sources, num_active, select_wide, route_group,
+                mem_batches,
+                &w_map,
+                worker_rows,
+                &mut pk_cache,
+                &mut order_cache,
+                schema,
+                cursors,
+                active_sources,
+                num_active,
+                select_wide,
+                route_group,
             );
         }
     }
@@ -443,7 +492,15 @@ pub(crate) fn op_relay_scatter_consolidated_mode(
 
     WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
-        relay_scatter_merge_walk(&mem_batches, col_indices, target_tcs, schema, num_workers, &mut worker_rows, mode);
+        relay_scatter_merge_walk(
+            &mem_batches,
+            col_indices,
+            target_tcs,
+            schema,
+            num_workers,
+            &mut worker_rows,
+            mode,
+        );
 
         let total_rows: usize = worker_rows[..num_workers].iter().map(|v| v.len()).sum();
         (0..num_workers)
@@ -535,7 +592,9 @@ pub(super) fn op_multi_scatter(
         if flat_indices.len() < needed {
             flat_indices.resize_with(needed, Vec::new);
         }
-        for slot in flat_indices[..needed].iter_mut() { slot.clear(); }
+        for slot in flat_indices[..needed].iter_mut() {
+            slot.clear();
+        }
 
         for si in 0..n_specs {
             let spec = col_specs[si];
@@ -599,7 +658,7 @@ pub(super) fn op_multi_scatter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD};
     use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
     #[test]
@@ -702,21 +761,30 @@ mod tests {
         // The multi-byte values are LE/BE order inversions — c2 ∈ {1,2,256,257}
         // and c0 ∈ {2,256} — so OPK encoding is load-bearing for the builder's
         // sorted assert (a dropped BE flip sorts 256 before 1/2 and trips it).
-        let b0 = make_wide_batch(&schema, &[
-            (0, 0, 0,   1, 10),
-            (1, 1, 1,   1, 11),
-            (1, 1, 256, 1, 12),   // shares BE(1)++BE(1) prefix with (1,1,1); c2 multi-byte
-        ]);
-        let b1 = make_wide_batch(&schema, &[
-            (1, 1, 257, 1, 20),   // third prefix-twin
-            (2, 2, 2,   1, 21),
-            (256, 0, 0, 1, 22),   // c0 multi-byte: under LE this sorts before (2,2,2)
-        ]);
-        let b2 = make_wide_batch(&schema, &[
-            (1, 1, 2,   1, 30),   // fourth prefix-twin
-            (3, 3, 3,   1, 31),
-            (7, 0, 0,   1, 32),
-        ]);
+        let b0 = make_wide_batch(
+            &schema,
+            &[
+                (0, 0, 0, 1, 10),
+                (1, 1, 1, 1, 11),
+                (1, 1, 256, 1, 12), // shares BE(1)++BE(1) prefix with (1,1,1); c2 multi-byte
+            ],
+        );
+        let b1 = make_wide_batch(
+            &schema,
+            &[
+                (1, 1, 257, 1, 20), // third prefix-twin
+                (2, 2, 2, 1, 21),
+                (256, 0, 0, 1, 22), // c0 multi-byte: under LE this sorts before (2,2,2)
+            ],
+        );
+        let b2 = make_wide_batch(
+            &schema,
+            &[
+                (1, 1, 2, 1, 30), // fourth prefix-twin
+                (3, 3, 3, 1, 31),
+                (7, 0, 0, 1, 32),
+            ],
+        );
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
         let result = op_relay_scatter_consolidated(&sources, schema.pk_indices(), &schema, num_workers);
 
@@ -761,10 +829,7 @@ mod tests {
         ((c1 as u128) << 64) | (c0 as u128)
     }
 
-    fn make_narrow_compound_batch(
-        schema: &SchemaDescriptor,
-        rows: &[(u128, i64, i64)],
-    ) -> ConsolidatedBatch {
+    fn make_narrow_compound_batch(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> ConsolidatedBatch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
             // `mk_compound_pk` packs c0 in the low 8 bytes and c1 in the high 8.
@@ -794,21 +859,30 @@ mod tests {
         assert!(!schema.pk_is_wide(), "pk_stride must be 16 (narrow)");
         assert!(schema.pk_indices().len() > 1, "compound PK must take slow path");
         let num_workers = 4;
-        let b0 = make_narrow_compound_batch(&schema, &[
-            (mk_compound_pk(1, 10), 1, 11),
-            (mk_compound_pk(2, 0),  1, 12),
-            (mk_compound_pk(5, 9),  1, 13),
-        ]);
-        let b1 = make_narrow_compound_batch(&schema, &[
-            (mk_compound_pk(1, 5),  1, 21),
-            (mk_compound_pk(1, 15), 1, 22),
-            (mk_compound_pk(3, 3),  1, 23),
-        ]);
-        let b2 = make_narrow_compound_batch(&schema, &[
-            (mk_compound_pk(1, 7),  1, 31),
-            (mk_compound_pk(2, 2),  1, 32),
-            (mk_compound_pk(7, 0),  1, 33),
-        ]);
+        let b0 = make_narrow_compound_batch(
+            &schema,
+            &[
+                (mk_compound_pk(1, 10), 1, 11),
+                (mk_compound_pk(2, 0), 1, 12),
+                (mk_compound_pk(5, 9), 1, 13),
+            ],
+        );
+        let b1 = make_narrow_compound_batch(
+            &schema,
+            &[
+                (mk_compound_pk(1, 5), 1, 21),
+                (mk_compound_pk(1, 15), 1, 22),
+                (mk_compound_pk(3, 3), 1, 23),
+            ],
+        );
+        let b2 = make_narrow_compound_batch(
+            &schema,
+            &[
+                (mk_compound_pk(1, 7), 1, 31),
+                (mk_compound_pk(2, 2), 1, 32),
+                (mk_compound_pk(7, 0), 1, 33),
+            ],
+        );
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
         // col_indices = [0, 1] is the full PK set: exercises the compound-PK-set
         // is_pk_routing path (route_pk_narrow via partition_for_key on cached u128).
@@ -872,16 +946,8 @@ mod tests {
         let schema = make_schema_i64_i64();
         let num_workers = 4;
         // Each source sorted ascending under signed I64 order.
-        let b0 = make_i64_batch(&schema, &[
-            (-100, 1, 10),
-            (-1,   1, 11),
-            (5,    1, 12),
-        ]);
-        let b1 = make_i64_batch(&schema, &[
-            (-50,  1, 20),
-            (0,    1, 21),
-            (100,  1, 22),
-        ]);
+        let b0 = make_i64_batch(&schema, &[(-100, 1, 10), (-1, 1, 11), (5, 1, 12)]);
+        let b1 = make_i64_batch(&schema, &[(-50, 1, 20), (0, 1, 21), (100, 1, 22)]);
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
 
@@ -890,7 +956,7 @@ mod tests {
             assert!(sb.sorted, "worker {w} output not marked sorted");
             for r in 1..sb.count {
                 let prev = sb.get_pk(r - 1);
-                let cur  = sb.get_pk(r);
+                let cur = sb.get_pk(r);
                 assert_ne!(
                     compare_pk_bytes(sb.get_pk_bytes(r - 1), sb.get_pk_bytes(r)),
                     Ordering::Greater,
@@ -908,12 +974,15 @@ mod tests {
         // One value past 255 (c0 = 256) so the drain routes a realistic wide OPK
         // and the shared builder's sorted assert covers this path, which has no
         // ordering check of its own (under LE, 256 would sort before (7,8,9)).
-        let b0 = make_wide_batch(&schema, &[
-            (1, 2, 3,     1, 1),
-            (4, 5, 6,     1, 2),
-            (7, 8, 9,     1, 3),
-            (256, 11, 12, 1, 4),   // c0 multi-byte: under LE this sorts before (7,8,9)
-        ]);
+        let b0 = make_wide_batch(
+            &schema,
+            &[
+                (1, 2, 3, 1, 1),
+                (4, 5, 6, 1, 2),
+                (7, 8, 9, 1, 3),
+                (256, 11, 12, 1, 4), // c0 multi-byte: under LE this sorts before (7,8,9)
+            ],
+        );
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0)];
         let result = op_relay_scatter_consolidated(&sources, schema.pk_indices(), &schema, num_workers);
 
@@ -947,12 +1016,8 @@ mod tests {
         assert_eq!(total_rows(&sub_batches), pk_vals.len());
 
         for &pk in pk_vals {
-            let expected = worker_for_partition(
-                partition_for_key(pk as u128),
-                num_workers,
-            );
-            let found = (0..sub_batches[expected].count)
-                .any(|r| (sub_batches[expected].get_pk(r) as u64) == pk);
+            let expected = worker_for_partition(partition_for_key(pk as u128), num_workers);
+            let found = (0..sub_batches[expected].count).any(|r| (sub_batches[expected].get_pk(r) as u64) == pk);
             assert!(found, "pk={pk} not found in worker {expected}");
         }
     }
@@ -983,13 +1048,8 @@ mod tests {
         assert_eq!(total_rows(&sub_batches), n);
 
         for &pk in pks {
-            let expected = worker_for_partition(
-                partition_for_key(pk),
-                num_workers,
-            );
-            let found = (0..sub_batches[expected].count).any(|r| {
-                sub_batches[expected].get_pk(r) == pk
-            });
+            let expected = worker_for_partition(partition_for_key(pk), num_workers);
+            let found = (0..sub_batches[expected].count).any(|r| sub_batches[expected].get_pk(r) == pk);
             assert!(found, "pk={pk} not in worker {expected}");
         }
     }
@@ -1129,7 +1189,10 @@ mod tests {
         assert_eq!(total_rows(&result), 6);
         for sb in &result {
             if sb.count > 0 {
-                assert!(!sb.consolidated, "merged path uses PK-only comparison, must not claim consolidated");
+                assert!(
+                    !sb.consolidated,
+                    "merged path uses PK-only comparison, must not claim consolidated"
+                );
                 assert!(sb.sorted, "merged path output must be sorted");
             }
         }
@@ -1158,7 +1221,10 @@ mod tests {
         assert_eq!(total_rows(&result), 2);
         for sb in &result {
             if sb.count > 0 {
-                assert!(!sb.consolidated, "non-consolidated path output must not be consolidated");
+                assert!(
+                    !sb.consolidated,
+                    "non-consolidated path output must not be consolidated"
+                );
             }
         }
     }
@@ -1257,8 +1323,8 @@ mod tests {
 
     #[test]
     fn test_distinct_update_same_pk() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
 
@@ -1271,12 +1337,10 @@ mod tests {
         // Both rows have the same PK but different payloads; sorted by payload ascending.
         let delta = make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]);
 
-        let (out, _consolidated) =
-            crate::ops::op_distinct(delta.into_inner(), cursor_handle.cursor_mut(), &schema);
+        let (out, _consolidated) = crate::ops::op_distinct(delta.into_inner(), cursor_handle.cursor_mut(), &schema);
 
         assert_eq!(
-            out.count,
-            2,
+            out.count, 2,
             "expected 2 output rows after same-PK update, got {}",
             out.count
         );
@@ -1341,19 +1405,26 @@ mod tests {
         // the data lives on.
         let schema = make_narrow_compound_schema();
         let num_workers = 4;
-        let b0 = make_narrow_compound_batch(&schema, &[
-            (mk_compound_pk(1, 10), 1, 11),
-            (mk_compound_pk(2, 0),  1, 12),
-            (mk_compound_pk(5, 9),  1, 13),
-        ]);
-        let b1 = make_narrow_compound_batch(&schema, &[
-            (mk_compound_pk(1, 5),  1, 21),
-            (mk_compound_pk(3, 3),  1, 23),
-            (mk_compound_pk(7, 0),  1, 33),
-        ]);
+        let b0 = make_narrow_compound_batch(
+            &schema,
+            &[
+                (mk_compound_pk(1, 10), 1, 11),
+                (mk_compound_pk(2, 0), 1, 12),
+                (mk_compound_pk(5, 9), 1, 13),
+            ],
+        );
+        let b1 = make_narrow_compound_batch(
+            &schema,
+            &[
+                (mk_compound_pk(1, 5), 1, 21),
+                (mk_compound_pk(3, 3), 1, 23),
+                (mk_compound_pk(7, 0), 1, 33),
+            ],
+        );
         let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         // col_indices = [0, 1] = the full PK set → compound-PK routing.
-        let sub_batches = op_repartition_batches_mode(&sources, &[0u32, 1u32], &[], &schema, num_workers, RouteMode::GroupKey);
+        let sub_batches =
+            op_repartition_batches_mode(&sources, &[0u32, 1u32], &[], &schema, num_workers, RouteMode::GroupKey);
         assert_eq!(total_rows(&sub_batches), 6);
         for (w, sb) in sub_batches.iter().enumerate() {
             for r in 0..sb.count {
@@ -1414,12 +1485,12 @@ mod tests {
         // PK ascending (consolidated invariant). Rows 0 and 3 share the join key
         // (-5, 100) → must land on the same worker.
         let rows: &[(u64, i64, u128)] = &[
-            (1, -5,        100),
-            (2,  7,        100),
-            (3, -5,        100),
-            (4,  i64::MIN, 0),
-            (5,  3,        0xdead_beef_cafe_0001),
-            (6, -1,        1),
+            (1, -5, 100),
+            (2, 7, 100),
+            (3, -5, 100),
+            (4, i64::MIN, 0),
+            (5, 3, 0xdead_beef_cafe_0001),
+            (6, -1, 1),
         ];
         let cb = make_join_key_batch(&schema, rows);
 
@@ -1443,19 +1514,20 @@ mod tests {
             }
             // Rows with pk=1 and pk=3 share the join key (-5, 100): same worker.
             assert_eq!(
-                worker_of_pk.get(&1), worker_of_pk.get(&3),
+                worker_of_pk.get(&1),
+                worker_of_pk.get(&3),
                 "{label}: matching join keys must co-locate",
             );
         };
 
         // (a) Non-consolidated path.
-        let repart = op_repartition_batches_mode(
-            &[Some(&cb)], &cols, &[], &schema, num_workers, RouteMode::JoinPromote);
+        let repart =
+            op_repartition_batches_mode(&[Some(&cb)], &cols, &[], &schema, num_workers, RouteMode::JoinPromote);
         check(&repart, "op_repartition_batches_mode");
 
         // (b) Consolidated merge-walk path (route_group).
-        let consol = op_relay_scatter_consolidated_mode(
-            &[Some(&cb)], &cols, &[], &schema, num_workers, RouteMode::JoinPromote);
+        let consol =
+            op_relay_scatter_consolidated_mode(&[Some(&cb)], &cols, &[], &schema, num_workers, RouteMode::JoinPromote);
         check(&consol, "op_relay_scatter_consolidated_mode");
     }
 
@@ -1471,7 +1543,10 @@ mod tests {
 
         // ---- (1) Payload key: [U64 PK, I32 payload], reindex col1 → I64. ----
         let schema = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I32, 0)],
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I32, 0),
+            ],
             &[0],
         );
         // PK ascending; rows pk=1 and pk=4 share key -5 → must co-locate.
@@ -1484,7 +1559,8 @@ mod tests {
             b.extend_col(0, &key.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true; b.consolidated = true;
+        b.sorted = true;
+        b.consolidated = true;
         let cb = ConsolidatedBatch::new_unchecked(b);
         let cols = [1u32];
         let targets = [type_code::I64];
@@ -1500,25 +1576,46 @@ mod tests {
             let mut worker_of_pk = std::collections::HashMap::new();
             for (w, sb) in result.iter().enumerate() {
                 for r in 0..sb.count {
-                    assert_eq!(expected_worker(sb, r), w,
-                        "{label}: promoted single key routed to wrong worker");
+                    assert_eq!(
+                        expected_worker(sb, r),
+                        w,
+                        "{label}: promoted single key routed to wrong worker"
+                    );
                     worker_of_pk.insert(sb.get_pk(r) as u64, w);
                 }
             }
-            assert_eq!(worker_of_pk.get(&1), worker_of_pk.get(&4),
-                "{label}: equal promoted keys must co-locate");
+            assert_eq!(
+                worker_of_pk.get(&1),
+                worker_of_pk.get(&4),
+                "{label}: equal promoted keys must co-locate"
+            );
         };
         let repart = op_repartition_batches_mode(
-            &[Some(&cb)], &cols, &targets, &schema, num_workers, RouteMode::JoinPromote);
+            &[Some(&cb)],
+            &cols,
+            &targets,
+            &schema,
+            num_workers,
+            RouteMode::JoinPromote,
+        );
         check(&repart, "payload-key op_repartition_batches_mode");
         let consol = op_relay_scatter_consolidated_mode(
-            &[Some(&cb)], &cols, &targets, &schema, num_workers, RouteMode::JoinPromote);
+            &[Some(&cb)],
+            &cols,
+            &targets,
+            &schema,
+            num_workers,
+            RouteMode::JoinPromote,
+        );
         check(&consol, "payload-key op_relay_scatter_consolidated_mode");
 
         // ---- (2) PK key: [I32 PK, U64 payload], reindex col0 → I64. The native
         // PK fast-path must be gated off so routing uses the packed I64 key. ----
         let pk_schema = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::I32, 0), SchemaColumn::new(type_code::U64, 0)],
+            &[
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
             &[0],
         );
         let pk_rows: &[(i32, u64)] = &[(-5, 9), (-1, 9), (3, 9), (i32::MIN, 9)];
@@ -1532,13 +1629,20 @@ mod tests {
             pb.extend_col(0, &v.to_le_bytes());
             pb.count += 1;
         }
-        pb.sorted = true; pb.consolidated = true;
+        pb.sorted = true;
+        pb.consolidated = true;
         let pk_cb = ConsolidatedBatch::new_unchecked(pb);
         let pk_cols = [0u32];
         let pk_targets = [type_code::I64];
         let pk_packer = ReindexPacker::new(&pk_schema, &pk_cols, &pk_targets);
         let pk_repart = op_repartition_batches_mode(
-            &[Some(&pk_cb)], &pk_cols, &pk_targets, &pk_schema, num_workers, RouteMode::JoinPromote);
+            &[Some(&pk_cb)],
+            &pk_cols,
+            &pk_targets,
+            &pk_schema,
+            num_workers,
+            RouteMode::JoinPromote,
+        );
         assert_eq!(total_rows(&pk_repart), pk_rows.len(), "PK-key: no dropped rows");
         for (w, sb) in pk_repart.iter().enumerate() {
             for r in 0..sb.count {
@@ -1546,7 +1650,9 @@ mod tests {
                 pk_packer.pack_into(&mut buf[..pk_packer.out_stride], &sb.as_mem_batch(), r);
                 assert_eq!(
                     worker_for_partition(partition_for_pk_bytes(&buf[..pk_packer.out_stride]), num_workers),
-                    w, "PK-key fast-path must be gated: routed by native PK not packed T");
+                    w,
+                    "PK-key fast-path must be gated: routed by native PK not packed T"
+                );
             }
         }
     }

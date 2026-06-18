@@ -18,20 +18,22 @@ pub use route::{compact_shards, GuardResult};
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::route::find_guard_for_key;
-    use super::super::columnar;
     use super::super::batch::Batch;
+    use super::super::columnar;
     use super::super::shard_reader::MappedShard;
+    use super::route::find_guard_for_key;
+    use super::*;
+    use crate::foundation::codec::{read_i64_le, read_u32_le};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use std::ffi::CStr;
     use std::fs;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
-    use type_code::{I64 as TYPE_I64, U64 as TYPE_U64, STRING as TYPE_STRING};
-    use crate::foundation::codec::{read_i64_le, read_u32_le};
+    use type_code::{I64 as TYPE_I64, STRING as TYPE_STRING, U64 as TYPE_U64};
 
     fn is_null(shard: &MappedShard, row: usize, col_idx: usize, schema: &SchemaDescriptor) -> bool {
         let null_word = shard.get_null_word(row);
-        let pi = schema.try_payload_idx(col_idx).expect("is_null test helper: col_idx is a payload column");
+        let pi = schema
+            .try_payload_idx(col_idx)
+            .expect("is_null test helper: col_idx is a payload column");
         (null_word >> pi) & 1 != 0
     }
 
@@ -59,13 +61,7 @@ mod tests {
     }
 
     fn make_test_schema() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(TYPE_U64, 0),
-                SchemaColumn::new(TYPE_I64, 0),
-            ],
-            &[0],
-        )
+        SchemaDescriptor::new(&[SchemaColumn::new(TYPE_U64, 0), SchemaColumn::new(TYPE_I64, 0)], &[0])
     }
 
     #[test]
@@ -209,8 +205,7 @@ mod tests {
 
     #[test]
     fn test_compact_empty_input() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_empty");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_empty");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -230,8 +225,7 @@ mod tests {
 
     #[test]
     fn test_compact_all_cancel() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_cancel");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_cancel");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -273,8 +267,7 @@ mod tests {
 
     #[test]
     fn test_merge_and_route_basic() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_route");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_route");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -295,15 +288,9 @@ mod tests {
             crate::storage::merge::pk_sort_key(&0u64.to_be_bytes()),
             crate::storage::merge::pk_sort_key(&100u64.to_be_bytes()),
         ];
-        let mut results = [
-            GuardResult::zeroed(),
-            GuardResult::zeroed(),
-        ];
+        let mut results = [GuardResult::zeroed(), GuardResult::zeroed()];
 
-        let n = merge_and_route(
-            &inputs, &cdir, &guards, &schema,
-            0, 1, 99, &mut results, false,
-        ).unwrap();
+        let n = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, &mut results, false).unwrap();
         assert_eq!(n, 2); // both guards should have rows
 
         // Guard 0 should have keys 10, 50
@@ -329,8 +316,7 @@ mod tests {
 
     #[test]
     fn test_merge_and_route_cleanup_on_partial_finalize_failure() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_route_cleanup");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_route_cleanup");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -364,17 +350,13 @@ mod tests {
 
     #[test]
     fn test_compact_string_column() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_string");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_string");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
         // Schema: u64 PK + STRING payload
         let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(TYPE_U64, 0),
-                SchemaColumn::new(TYPE_STRING, 0),
-            ],
+            &[SchemaColumn::new(TYPE_U64, 0), SchemaColumn::new(TYPE_STRING, 0)],
             &[0],
         );
 
@@ -388,7 +370,8 @@ mod tests {
             // Write a short string: "hi" (2 bytes, inline)
             let mut str_struct = [0u8; 16];
             str_struct[0..4].copy_from_slice(&2u32.to_le_bytes()); // length=2
-            str_struct[4] = b'h'; str_struct[5] = b'i'; // prefix
+            str_struct[4] = b'h';
+            str_struct[5] = b'i'; // prefix
             batch.extend_col(0, &str_struct);
             batch.count += 1;
         }
@@ -419,19 +402,12 @@ mod tests {
 
     #[test]
     fn test_compact_nullable_column() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_nullable");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_nullable");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
         // Schema: u64 PK + nullable i64 payload
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(TYPE_U64, 0),
-                SchemaColumn::new(TYPE_I64, 1),
-            ],
-            &[0],
-        );
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(TYPE_U64, 0), SchemaColumn::new(TYPE_I64, 1)], &[0]);
 
         // Build shard: key 1 = non-null (42), key 2 = null
         let mut batch = Batch::with_schema(schema, 2);
@@ -488,11 +464,7 @@ mod tests {
     }
 
     /// Write a shard with 3-column rows: (pk, weight, col1_val, col2_val).
-    fn write_3col_shard(
-        path: &str,
-        rows: &[(u64, i64, i64, i64)],
-        schema: &SchemaDescriptor,
-    ) {
+    fn write_3col_shard(path: &str, rows: &[(u64, i64, i64, i64)], schema: &SchemaDescriptor) {
         let mut batch = Batch::with_schema(*schema, rows.len());
         for &(pk, w, c1, c2) in rows {
             batch.extend_pk(pk as u128);
@@ -526,8 +498,7 @@ mod tests {
     /// with matching insertions from earlier shards.
     #[test]
     fn test_compact_same_pk_different_payload_cancels() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_3col_cancel");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_3col_cancel");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -539,17 +510,11 @@ mod tests {
 
         // Shard 2 (tick 2): retract sum=5000, insert sum=10000
         let s2 = dir.join("s2.db");
-        write_3col_shard(s2.to_str().unwrap(), &[
-            (1, -1, 0, 5000),
-            (1,  1, 0, 10000),
-        ], &schema);
+        write_3col_shard(s2.to_str().unwrap(), &[(1, -1, 0, 5000), (1, 1, 0, 10000)], &schema);
 
         // Shard 3 (tick 3): retract sum=10000, insert sum=15000
         let s3 = dir.join("s3.db");
-        write_3col_shard(s3.to_str().unwrap(), &[
-            (1, -1, 0, 10000),
-            (1,  1, 0, 15000),
-        ], &schema);
+        write_3col_shard(s3.to_str().unwrap(), &[(1, -1, 0, 10000), (1, 1, 0, 15000)], &schema);
 
         let output = dir.join("merged.db");
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
@@ -582,8 +547,7 @@ mod tests {
     /// pair never sums — leaking a spurious row.
     #[test]
     fn test_compact_same_pk_nonadjacent_payload_interleave() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_3col_nonadjacent");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_3col_nonadjacent");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -626,8 +590,7 @@ mod tests {
     /// algorithm handles group boundaries correctly across PKs.
     #[test]
     fn test_compact_multi_group_reduce_pattern() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_3col_multi");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_3col_multi");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -635,22 +598,21 @@ mod tests {
 
         // Group A (pk=1) and Group B (pk=2), 3 ticks each
         let s1 = dir.join("s1.db");
-        write_3col_shard(s1.to_str().unwrap(), &[
-            (1, 1, 0, 100),
-            (2, 1, 1, 200),
-        ], &schema);
+        write_3col_shard(s1.to_str().unwrap(), &[(1, 1, 0, 100), (2, 1, 1, 200)], &schema);
 
         let s2 = dir.join("s2.db");
-        write_3col_shard(s2.to_str().unwrap(), &[
-            (1, -1, 0, 100), (1, 1, 0, 300),
-            (2, -1, 1, 200), (2, 1, 1, 400),
-        ], &schema);
+        write_3col_shard(
+            s2.to_str().unwrap(),
+            &[(1, -1, 0, 100), (1, 1, 0, 300), (2, -1, 1, 200), (2, 1, 1, 400)],
+            &schema,
+        );
 
         let s3 = dir.join("s3.db");
-        write_3col_shard(s3.to_str().unwrap(), &[
-            (1, -1, 0, 300), (1, 1, 0, 600),
-            (2, -1, 1, 400), (2, 1, 1, 800),
-        ], &schema);
+        write_3col_shard(
+            s3.to_str().unwrap(),
+            &[(1, -1, 0, 300), (1, 1, 0, 600), (2, -1, 1, 400), (2, 1, 1, 800)],
+            &schema,
+        );
 
         let output = dir.join("merged.db");
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
@@ -673,8 +635,7 @@ mod tests {
     /// from the test_heavy_agg_500k failure.
     #[test]
     fn test_compact_10_tick_reduce_single_group() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_3col_10tick");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_3col_10tick");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -691,15 +652,17 @@ mod tests {
             let old_sum = (tick - 1) * 5000;
             let new_sum = tick * 5000;
             let p = dir.join(format!("t{tick}.db"));
-            write_3col_shard(p.to_str().unwrap(), &[
-                (1, -1, 0, old_sum as i64),
-                (1,  1, 0, new_sum as i64),
-            ], &schema);
+            write_3col_shard(
+                p.to_str().unwrap(),
+                &[(1, -1, 0, old_sum as i64), (1, 1, 0, new_sum as i64)],
+                &schema,
+            );
             shard_paths.push(p);
         }
 
         let output = dir.join("merged.db");
-        let cstrs: Vec<_> = shard_paths.iter()
+        let cstrs: Vec<_> = shard_paths
+            .iter()
             .map(|p| std::ffi::CString::new(p.to_str().unwrap()).unwrap())
             .collect();
         let inputs: Vec<_> = cstrs.iter().map(|c| c.as_c_str()).collect();
@@ -708,7 +671,12 @@ mod tests {
         compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
 
         let rows = read_3col_shard(output.to_str().unwrap(), &schema);
-        assert_eq!(rows.len(), 1, "expected 1 row after 10-tick consolidation, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected 1 row after 10-tick consolidation, got {}",
+            rows.len()
+        );
         assert_eq!(rows[0], (1, 1, 0, 50000), "expected final sum=50000");
 
         let _ = fs::remove_dir_all(&dir);
@@ -718,24 +686,21 @@ mod tests {
     /// fix applies to the guard-routed path too (shares open_and_merge).
     #[test]
     fn test_merge_and_route_same_pk_different_payload() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_3col_route");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_3col_route");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
         let schema = make_3col_schema();
 
         let s1 = dir.join("s1.db");
-        write_3col_shard(s1.to_str().unwrap(), &[
-            (10, 1, 0, 100),
-            (20, 1, 1, 200),
-        ], &schema);
+        write_3col_shard(s1.to_str().unwrap(), &[(10, 1, 0, 100), (20, 1, 1, 200)], &schema);
 
         let s2 = dir.join("s2.db");
-        write_3col_shard(s2.to_str().unwrap(), &[
-            (10, -1, 0, 100), (10, 1, 0, 300),
-            (20, -1, 1, 200), (20, 1, 1, 400),
-        ], &schema);
+        write_3col_shard(
+            s2.to_str().unwrap(),
+            &[(10, -1, 0, 100), (10, 1, 0, 300), (20, -1, 1, 200), (20, 1, 1, 400)],
+            &schema,
+        );
 
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
@@ -761,8 +726,7 @@ mod tests {
     /// Regression test confirming valid data passes checksum validation.
     #[test]
     fn test_compact_with_checksums_enabled() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_checksums");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_checksums");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -779,7 +743,8 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).expect("compact with checksums enabled must succeed for valid data");
+        compact_shards(&inputs, &cout, &schema, 0, false)
+            .expect("compact with checksums enabled must succeed for valid data");
 
         let merged = MappedShard::open(&cout, &schema, true).unwrap();
         assert_eq!(merged.count, 6);
@@ -791,8 +756,7 @@ mod tests {
     /// write path (write_shard_streaming) under compaction.
     #[test]
     fn test_compact_large_dataset() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_large");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_large");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -837,8 +801,7 @@ mod tests {
     /// and be readable in the output.
     #[test]
     fn test_merge_and_route_keys_below_first_guard() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_test_below_guard");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_below_guard");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -865,7 +828,10 @@ mod tests {
 
         // Verify all keys readable
         for &pk in &[50u64, 100, 150, 250] {
-            assert!(shard.find_row_index(pk as u128).is_some(), "key {pk} not found in output shard");
+            assert!(
+                shard.find_row_index(pk as u128).is_some(),
+                "key {pk} not found in output shard"
+            );
         }
 
         let _ = fs::remove_dir_all(&dir);
@@ -876,11 +842,7 @@ mod tests {
     /// Write a shard from explicit raw-PK-byte rows. `rows` is
     /// `(pk_bytes, weight, payload_i64_vals)`; rows must already be in
     /// `compare_pk_bytes` order (compaction assumes sorted inputs).
-    fn write_bytes_pk_shard(
-        path: &str,
-        schema: &SchemaDescriptor,
-        rows: &[(Vec<u8>, i64, Vec<i64>)],
-    ) {
+    fn write_bytes_pk_shard(path: &str, schema: &SchemaDescriptor, rows: &[(Vec<u8>, i64, Vec<i64>)]) {
         let mut batch = Batch::with_schema(*schema, rows.len().max(1));
         for (pk, w, vals) in rows {
             batch.extend_pk_bytes(pk);
@@ -919,8 +881,7 @@ mod tests {
     /// consolidation.
     #[test]
     fn test_compact_narrow_compound_opk_order() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_compound_opk");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_compound_opk");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
@@ -940,17 +901,22 @@ mod tests {
 
         // Shard 1 (compound-sorted): (1,5) v10, (2,3) v30 weight +1.
         let s1 = dir.join("s1.db");
-        write_bytes_pk_shard(s1.to_str().unwrap(), &schema, &[
-            (pk2(1, 5), 1, vec![10]),
-            (pk2(2, 3), 1, vec![30]),
-        ]);
+        write_bytes_pk_shard(
+            s1.to_str().unwrap(),
+            &schema,
+            &[(pk2(1, 5), 1, vec![10]), (pk2(2, 3), 1, vec![30])],
+        );
         // Shard 2 (compound-sorted): (1,9) v20, (2,3) v30 weight -1, (3,0) v40.
         let s2 = dir.join("s2.db");
-        write_bytes_pk_shard(s2.to_str().unwrap(), &schema, &[
-            (pk2(1, 9), 1, vec![20]),
-            (pk2(2, 3), -1, vec![30]),
-            (pk2(3, 0), 1, vec![40]),
-        ]);
+        write_bytes_pk_shard(
+            s2.to_str().unwrap(),
+            &schema,
+            &[
+                (pk2(1, 9), 1, vec![20]),
+                (pk2(2, 3), -1, vec![30]),
+                (pk2(3, 0), 1, vec![40]),
+            ],
+        );
 
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
@@ -973,19 +939,12 @@ mod tests {
     /// last under raw-LE (zero-extended) but first under `compare_pk_bytes`.
     #[test]
     fn test_compact_narrow_signed_opk_order() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_signed_opk");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_signed_opk");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
         // I64 PK + I64 payload. Single signed column → not pk_is_fast.
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(TYPE_I64, 0),
-                SchemaColumn::new(TYPE_I64, 0),
-            ],
-            &[0],
-        );
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(TYPE_I64, 0), SchemaColumn::new(TYPE_I64, 0)], &[0]);
         // OPK bytes for a single I64 PK column (big-endian, sign bit flipped).
         let k = |v: i64| {
             let mut out = [0u8; 8];
@@ -995,16 +954,18 @@ mod tests {
 
         // Shard 1 (signed order): -5, 3.
         let s1 = dir.join("s1.db");
-        write_bytes_pk_shard(s1.to_str().unwrap(), &schema, &[
-            (k(-5), 1, vec![1]),
-            (k(3), 1, vec![3]),
-        ]);
+        write_bytes_pk_shard(
+            s1.to_str().unwrap(),
+            &schema,
+            &[(k(-5), 1, vec![1]), (k(3), 1, vec![3])],
+        );
         // Shard 2 (signed order): -2, 10.
         let s2 = dir.join("s2.db");
-        write_bytes_pk_shard(s2.to_str().unwrap(), &schema, &[
-            (k(-2), 1, vec![2]),
-            (k(10), 1, vec![4]),
-        ]);
+        write_bytes_pk_shard(
+            s2.to_str().unwrap(),
+            &schema,
+            &[(k(-2), 1, vec![2]), (k(10), 1, vec![4])],
+        );
 
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
@@ -1033,8 +994,7 @@ mod tests {
     /// wide comparator must keep them as two distinct rows (no fold).
     #[test]
     fn test_compact_wide_prefix_collision_no_fold() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tmp/compact_wide_prefix");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_wide_prefix");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 

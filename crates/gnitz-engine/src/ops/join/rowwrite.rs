@@ -3,8 +3,8 @@
 //! §8-cluster-7 "no per-row cross-file call boundary" guarantee.
 
 use crate::schema::SchemaDescriptor;
-use gnitz_wire::is_german_string;
 use crate::storage::{Batch, MemBatch, ReadCursor};
+use gnitz_wire::is_german_string;
 
 use super::super::util::{all_payload_null_mask, merge_null_words, write_string_from_batch};
 
@@ -62,7 +62,7 @@ pub(super) fn write_join_row(
     write_left_payload(output, left_batch, left_row, left_null, left_schema);
 
     // Right payload columns (from cursor public API)
-    let right_blob = right_cursor.blob_slice();  // &[u8], bounds carried
+    let right_blob = right_cursor.blob_slice(); // &[u8], bounds carried
     for (rpi, ci, col) in right_schema.payload_columns() {
         let cs = col.size() as usize;
         let is_null = (right_null >> rpi) & 1 != 0;
@@ -78,9 +78,7 @@ pub(super) fn write_join_row(
                 // 16-byte German-string struct; relocate_german_string_vec
                 // bounds-checks the blob offset against right_blob.
                 let src = unsafe { std::slice::from_raw_parts(ptr, 16) };
-                let dest = crate::schema::relocate_german_string_vec(
-                    src, right_blob, &mut output.blob, None,
-                );
+                let dest = crate::schema::relocate_german_string_vec(src, right_blob, &mut output.blob, None);
                 output.extend_col(out_pi, &dest);
             }
         } else {
@@ -176,9 +174,9 @@ pub(super) fn write_join_row_from_batches(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_common::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use super::*;
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Batch;
 
     #[test]
@@ -253,8 +251,14 @@ mod tests {
 
         let mut output = Batch::with_schema(left_schema, 1); // PK + 64 payload = 65 cols
         write_join_row_from_batches(
-            &mut output, &left.as_mem_batch(), 0, &right.as_mem_batch(), 0,
-            1, &left_schema, &right_schema,
+            &mut output,
+            &left.as_mem_batch(),
+            0,
+            &right.as_mem_batch(),
+            0,
+            1,
+            &left_schema,
+            &right_schema,
         );
         assert_eq!(output.count, 1);
     }
@@ -265,16 +269,14 @@ mod tests {
         let right_schema = pk_only_schema();
         let left = build_wide_left_row(&left_schema, 1);
         let mut output = Batch::with_schema(left_schema, 1);
-        write_join_row_null_right(
-            &mut output, &left.as_mem_batch(), 0, 1, &left_schema, &right_schema,
-        );
+        write_join_row_null_right(&mut output, &left.as_mem_batch(), 0, 1, &left_schema, &right_schema);
         assert_eq!(output.count, 1);
     }
 
     #[test]
     fn test_write_join_row_shift_guard_64() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
         let left_schema = make_wide_left_schema_64();
         let right_schema = pk_only_schema();
         let left = build_wide_left_row(&left_schema, 1);
@@ -293,7 +295,13 @@ mod tests {
 
         let mut output = Batch::with_schema(left_schema, 1);
         write_join_row(
-            &mut output, &left.as_mem_batch(), 0, cursor, 1, &left_schema, &right_schema,
+            &mut output,
+            &left.as_mem_batch(),
+            0,
+            cursor,
+            1,
+            &left_schema,
+            &right_schema,
         );
         assert_eq!(output.count, 1);
     }
@@ -325,5 +333,4 @@ mod tests {
         b.count += 1;
         b
     }
-
 }

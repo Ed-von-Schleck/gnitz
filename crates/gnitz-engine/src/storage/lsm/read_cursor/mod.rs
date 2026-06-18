@@ -10,20 +10,20 @@ use std::rc::Rc;
 
 use super::batch::Batch;
 use super::columnar::{self, PkOrd};
-use super::{with_payload_cmp, with_pk_ord};
-use crate::schema::SchemaDescriptor;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::{pack_pk_be, UnifiedSource};
 use super::shard_reader::MappedShard;
+use super::{with_payload_cmp, with_pk_ord};
+use crate::schema::SchemaDescriptor;
 
-mod source;
-mod output;
 mod handle;
+mod output;
+mod source;
 
-use source::CursorSource;
-pub use handle::CursorHandle;
 pub(crate) use handle::create_cursor_from_snapshots;
+pub use handle::CursorHandle;
 pub(crate) use output::DrainGuard;
+use source::CursorSource;
 
 #[cfg(test)]
 thread_local! {
@@ -133,7 +133,8 @@ pub struct ReadCursor {
 /// Row comparator alias for the monomorphized `_with` variants.  `Copy` lets
 /// callers forward the same comparator down the call chain at zero cost.
 trait RowComparator: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy {}
-impl<F> RowComparator for F where F: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy {}
+impl<F> RowComparator for F where F: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy
+{}
 
 /// The full loser-tree order — the stride-dispatched OPK byte order (`pk_ord`),
 /// then the payload `row_cmp`. The **single** source of truth for "which head
@@ -157,9 +158,7 @@ fn heap_less_with<'a, PK: PkOrd + 'a, RowCmp: RowComparator + 'a>(
         match pk_ord.cmp(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
             Ordering::Less => true,
             Ordering::Greater => false,
-            Ordering::Equal => {
-                row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less
-            }
+            Ordering::Equal => row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less,
         }
     }
 }
@@ -206,7 +205,14 @@ impl ReadCursor {
         // helper inlines them — a direct fn-item reference would fix the
         // source-ref lifetime and conflict with the `_with` HRTB Fn bound.
         if is_pk_unique {
-            with_pk_ord!(schema, Self::build_tree_with, sources, states, schema, |_, _, _, _, _| Ordering::Equal)
+            with_pk_ord!(
+                schema,
+                Self::build_tree_with,
+                sources,
+                states,
+                schema,
+                |_, _, _, _, _| Ordering::Equal
+            )
         } else {
             with_payload_cmp!(schema, Self::build_tree_with_payload, sources, states, schema)
         }
@@ -214,10 +220,11 @@ impl ReadCursor {
 
     fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
         debug_assert_eq!(sources.len(), states.len());
-        let is_pk_unique = !sources.is_empty() && sources.iter().all(|s| match s {
-            CursorSource::Shard(shard) => shard.is_pk_unique,
-            CursorSource::Batch(_)     => false,
-        });
+        let is_pk_unique = !sources.is_empty()
+            && sources.iter().all(|s| match s {
+                CursorSource::Shard(shard) => shard.is_pk_unique,
+                CursorSource::Batch(_) => false,
+            });
         let mode = match sources.len() {
             0 => SourceMode::Empty,
             1 => SourceMode::Single,
@@ -249,9 +256,12 @@ impl ReadCursor {
     /// before the next `drive`.
     fn rebuild_and_drive(&mut self) {
         if let SourceMode::Multi(_) = &self.mode {
-            self.mode = SourceMode::Multi(
-                Self::build_tree(&self.sources, &self.states, &self.schema, self.is_pk_unique),
-            );
+            self.mode = SourceMode::Multi(Self::build_tree(
+                &self.sources,
+                &self.states,
+                &self.schema,
+                self.is_pk_unique,
+            ));
         }
         self.drive();
     }
@@ -311,10 +321,7 @@ impl ReadCursor {
         // backward / exhausted / Single / Empty case — takes the absolute
         // reposition + rebuild below. `self.valid` is checked first so
         // `current_pk_cmp_bytes` never reads an unpositioned cursor.
-        if self.valid
-            && matches!(self.mode, SourceMode::Multi(_))
-            && self.current_pk_cmp_bytes(key) == Ordering::Less
-        {
+        if self.valid && matches!(self.mode, SourceMode::Multi(_)) && self.current_pk_cmp_bytes(key) == Ordering::Less {
             self.seek_forward_multi(key);
             return;
         }
@@ -356,12 +363,7 @@ impl ReadCursor {
     }
 
     #[inline]
-    fn seek_forward_multi_both<RowCmp: RowComparator, PK: PkOrd>(
-        &mut self,
-        key: &[u8],
-        row_cmp: RowCmp,
-        pk_ord: PK,
-    ) {
+    fn seek_forward_multi_both<RowCmp: RowComparator, PK: PkOrd>(&mut self, key: &[u8], row_cmp: RowCmp, pk_ord: PK) {
         self.gallop_heap_forward(key, pk_ord, row_cmp);
         self.drive_with_inner(row_cmp, pk_ord);
     }
@@ -370,12 +372,7 @@ impl ReadCursor {
     /// to `key`, keyed by the shared `heap_less_with(.., pk_ord, row_cmp)` order.
     /// Scoping the heap/sources/states borrows to this call frees `self` for the
     /// caller's following `drive`. Precondition: `matches!(self.mode, SourceMode::Multi)`.
-    fn gallop_heap_forward<PK: PkOrd, RowCmp: RowComparator>(
-        &mut self,
-        key: &[u8],
-        pk_ord: PK,
-        row_cmp: RowCmp,
-    ) {
+    fn gallop_heap_forward<PK: PkOrd, RowCmp: RowComparator>(&mut self, key: &[u8], pk_ord: PK, row_cmp: RowCmp) {
         let heap = match &mut self.mode {
             SourceMode::Multi(h) => h,
             _ => unreachable!("gallop_heap_forward requires SourceMode::Multi"),
@@ -623,7 +620,9 @@ impl ReadCursor {
     }
 
     pub fn advance(&mut self) {
-        if !self.valid { return; }
+        if !self.valid {
+            return;
+        }
         if self.is_pk_unique {
             self.advance_pk_unique();
         } else {
@@ -671,8 +670,14 @@ impl ReadCursor {
     /// `Pair` bypass (PkUnique passes the trivial equal-PK ⇒ same-element cmp).
     #[inline]
     fn drive_small_modes<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) -> bool {
-        if matches!(self.mode, SourceMode::Empty) { self.valid = false; return true; }
-        if matches!(self.mode, SourceMode::Single) { self.drive_single(); return true; }
+        if matches!(self.mode, SourceMode::Empty) {
+            self.valid = false;
+            return true;
+        }
+        if matches!(self.mode, SourceMode::Single) {
+            self.drive_single();
+            return true;
+        }
         if matches!(self.mode, SourceMode::Pair) {
             with_pk_ord!(self.schema, Self::drive_pair_inner, self, row_cmp);
             return true;
@@ -689,7 +694,9 @@ impl ReadCursor {
     fn drive_pk_unique(&mut self) {
         // PkUnique Empty/Single/Pair: equal PK ⇒ same element, so the payload
         // tiebreak is trivial (the Pair fold still sums weights across the heads).
-        if self.drive_small_modes(|_, _, _, _, _| Ordering::Equal) { return; }
+        if self.drive_small_modes(|_, _, _, _, _| Ordering::Equal) {
+            return;
+        }
         with_pk_ord!(self.schema, Self::drive_pk_unique_inner, self);
     }
 
@@ -701,18 +708,20 @@ impl ReadCursor {
             SourceMode::Multi(h) => h,
             _ => unreachable!("drive_pk_unique_inner requires SourceMode::Multi"),
         };
-        let schema  = &self.schema;
+        let schema = &self.schema;
         let sources = &self.sources;
-        let states  = &mut self.states;
+        let states = &mut self.states;
         // `less` is the pure OPK order (no payload term). `same_pk` is the
         // width-agnostic OPK byte equality; matching PK ⇒ same element, so
         // `eq_payload` is trivially true. The debug-assert pins the PkUnique
         // invariant (equal PK ⇒ equal payload), firing only on a real violation.
         let less = |a: &HeapNode, b: &HeapNode| -> bool {
-            pk_ord.cmp(
-                sources[a.source_idx as usize].get_pk_bytes(a.row as usize),
-                sources[b.source_idx as usize].get_pk_bytes(b.row as usize),
-            ).is_lt()
+            pk_ord
+                .cmp(
+                    sources[a.source_idx as usize].get_pk_bytes(a.row as usize),
+                    sources[b.source_idx as usize].get_pk_bytes(b.row as usize),
+                )
+                .is_lt()
         };
         let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
             let eq = sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row);
@@ -792,7 +801,8 @@ impl ReadCursor {
     {
         let mut emitted: Option<(i64, usize, usize)> = None;
         drive_merge(
-            heap, less,
+            heap,
+            less,
             |src| {
                 states[src].advance(&sources[src]);
                 states[src].is_valid().then(|| states[src].position as u32)
@@ -818,7 +828,9 @@ impl ReadCursor {
     /// next group, so the loop naturally walks past them.
     #[inline]
     fn drive_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
-        if self.drive_small_modes(row_cmp) { return; }
+        if self.drive_small_modes(row_cmp) {
+            return;
+        }
         with_pk_ord!(self.schema, Self::drive_with_inner, self, row_cmp);
     }
 
@@ -830,9 +842,9 @@ impl ReadCursor {
             SourceMode::Multi(h) => h,
             _ => unreachable!("drive_with_inner requires SourceMode::Multi"),
         };
-        let schema  = &self.schema;
+        let schema = &self.schema;
         let sources = &self.sources;
-        let states  = &mut self.states;
+        let states = &mut self.states;
         // `drive_inner` returns the emitted group as a tuple rather than writing
         // `self.current_*` directly: its closures already reborrow `&sources` +
         // `&mut states`, so also capturing `&mut self.current_*` would force a
@@ -868,9 +880,9 @@ impl ReadCursor {
     #[inline]
     fn drive_pair_inner<RowCmp: RowComparator, PK: PkOrd>(&mut self, row_cmp: RowCmp, pk_ord: PK) {
         debug_assert!(matches!(self.mode, SourceMode::Pair));
-        let schema  = &self.schema;
+        let schema = &self.schema;
         let sources = &self.sources;
-        let states  = &mut self.states;
+        let states = &mut self.states;
 
         let emitted: Option<(i64, usize, usize)> = loop {
             let v0 = states[0].is_valid();
@@ -897,8 +909,7 @@ impl ReadCursor {
                     Ordering::Less => (0, p0, false),
                     Ordering::Greater => (1, p1, false),
                     Ordering::Equal => {
-                        match row_cmp(schema, &sources[0], states[0].position,
-                                              &sources[1], states[1].position) {
+                        match row_cmp(schema, &sources[0], states[0].position, &sources[1], states[1].position) {
                             Ordering::Greater => (1, p1, false),
                             Ordering::Less => (0, p0, false),
                             Ordering::Equal => (0, p0, true), // identical (PK,payload): fold both
@@ -923,8 +934,7 @@ impl ReadCursor {
                 while states[s].is_valid() {
                     let pos = states[s].position;
                     if sources[s].get_pk_bytes(pos) != ex_pk
-                        || row_cmp(schema, &sources[s], pos, &sources[ex_src], ex_row)
-                            != Ordering::Equal
+                        || row_cmp(schema, &sources[s], pos, &sources[ex_src], ex_row) != Ordering::Equal
                     {
                         break;
                     }
@@ -1001,10 +1011,11 @@ impl ReadCursor {
 
     /// Blob arena slice (bounds-carrying) for the current row's source.
     pub fn blob_slice(&self) -> &[u8] {
-        if !self.valid { return &[]; }
+        if !self.valid {
+            return &[];
+        }
         self.sources[self.current_entry_idx].blob_slice()
     }
-
 }
 
 /// Build a ReadCursor from in-memory batches + shard Rcs.
@@ -1049,7 +1060,7 @@ pub(crate) fn create_read_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::wide_pk_3xu64_schema;
 
     fn make_schema_i64() -> SchemaDescriptor {
@@ -1287,9 +1298,7 @@ mod tests {
         while cursor.valid {
             let p = cursor.col_ptr(1, 8);
             assert!(!p.is_null(), "payload col_ptr null for a valid cursor row");
-            let val = i64::from_le_bytes(
-                unsafe { std::slice::from_raw_parts(p, 8) }.try_into().unwrap(),
-            );
+            let val = i64::from_le_bytes(unsafe { std::slice::from_raw_parts(p, 8) }.try_into().unwrap());
             rows.push((cursor.current_key as u64, cursor.current_weight, val));
             cursor.advance();
         }
@@ -1469,9 +1478,7 @@ mod tests {
         let path = dir.path().join("const_pk.db");
         std::fs::write(&path, &image).unwrap();
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let shard = Rc::new(
-            super::super::shard_reader::MappedShard::open(&cpath, &schema, false).unwrap(),
-        );
+        let shard = Rc::new(super::super::shard_reader::MappedShard::open(&cpath, &schema, false).unwrap());
 
         let cursor = create_read_cursor(&[], &[shard], schema);
         let result = cursor.materialize();
@@ -1517,11 +1524,7 @@ mod tests {
     /// of the current key, or a backward step (both the rebuild fallback). The
     /// reused position must never change the landing — including the emitted
     /// weight, which pins cross-source ghost folding.
-    fn assert_advance_to_matches_seek_oracle(
-        schema: SchemaDescriptor,
-        sources: &[Rc<Batch>],
-        probes: &[u128],
-    ) {
+    fn assert_advance_to_matches_seek_oracle(schema: SchemaDescriptor, sources: &[Rc<Batch>], probes: &[u128]) {
         let n = sources.len();
         let mut adv = create_read_cursor(sources, &[], schema);
         for &key in probes {
@@ -1738,8 +1741,11 @@ mod tests {
 
         cursor.advance();
         assert!(cursor.valid);
-        assert_eq!(cursor.current_pk_bytes(), &pk_c[..],
-            "the third row, distinguished only in its trailing 8 bytes, must follow");
+        assert_eq!(
+            cursor.current_pk_bytes(),
+            &pk_c[..],
+            "the third row, distinguished only in its trailing 8 bytes, must follow"
+        );
     }
 
     /// Two wide PKs that collide on their low-16 prefix `(col_0, col_1)=(1,1)`,
@@ -1793,12 +1799,7 @@ mod tests {
             k
         };
         // Sorted by compare_pk_bytes: col0 asc, col1 signed asc (negatives first).
-        let rows = [
-            (mk(1, -5), 1i64),
-            (mk(1, -1), 1),
-            (mk(1, 3), 1),
-            (mk(2, -9), 1),
-        ];
+        let rows = [(mk(1, -5), 1i64), (mk(1, -1), 1), (mk(1, 3), 1), (mk(2, -9), 1)];
         let mut b = Batch::with_schema(schema, rows.len());
         for (pk, val) in &rows {
             b.extend_pk_bytes(pk);
@@ -1821,7 +1822,9 @@ mod tests {
                 k.copy_from_slice(cursor.current_pk_bytes());
                 found.push(k);
                 cursor.advance();
-                if !cursor.walk_to_positive_with_prefix(&prefix) { break; }
+                if !cursor.walk_to_positive_with_prefix(&prefix) {
+                    break;
+                }
             }
         }
         assert_eq!(found.len(), 3, "negative-suffix rows must not be skipped");
@@ -1840,8 +1843,7 @@ mod tests {
             assert!(chunk.count > 0, "drain_chunk returned an empty Some chunk");
             assert!(chunk.sorted && chunk.consolidated);
             for row in 0..chunk.count {
-                let val = i64::from_le_bytes(
-                    chunk.get_col_ptr(row, 0, 8).try_into().unwrap());
+                let val = i64::from_le_bytes(chunk.get_col_ptr(row, 0, 8).try_into().unwrap());
                 rows.push((chunk.get_pk(row), chunk.get_weight(row), val));
             }
         }
@@ -1854,8 +1856,7 @@ mod tests {
         let batch = cursor.materialize();
         (0..batch.count)
             .map(|row| {
-                let val = i64::from_le_bytes(
-                    batch.get_col_ptr(row, 0, 8).try_into().unwrap());
+                let val = i64::from_le_bytes(batch.get_col_ptr(row, 0, 8).try_into().unwrap());
                 (batch.get_pk(row), batch.get_weight(row), val)
             })
             .collect()
@@ -1865,14 +1866,16 @@ mod tests {
     /// remainder, single oversized chunk — all equal to `materialize`.
     #[test]
     fn drain_chunk_single_source_matches_materialize() {
-        let rows: Vec<(u128, i64, i64)> =
-            (1..=5).map(|i| (i as u128, 1i64, (i * 10) as i64)).collect();
+        let rows: Vec<(u128, i64, i64)> = (1..=5).map(|i| (i as u128, 1i64, (i * 10) as i64)).collect();
         let batch = make_batch(&rows);
         let expected = materialize_rows(&[Rc::clone(&batch)]);
         for chunk_rows in [1, 2, 5, 100] {
             let mut cursor = create_read_cursor(&[Rc::clone(&batch)], &[], make_schema_i64());
-            assert_eq!(drain_chunks(&mut cursor, chunk_rows), expected,
-                "chunk_rows={chunk_rows}");
+            assert_eq!(
+                drain_chunks(&mut cursor, chunk_rows),
+                expected,
+                "chunk_rows={chunk_rows}"
+            );
         }
         // 4 rows / chunk 2: exact multiple (no trailing partial chunk).
         let even = make_batch(&rows[..4]);
@@ -1900,15 +1903,19 @@ mod tests {
         let expected = materialize_rows(&[Rc::clone(&b1), Rc::clone(&b2)]);
         assert_eq!(expected, materialize_rows(&[Rc::clone(&consolidated_equivalent)]));
         for chunk_rows in [1, 2, 100] {
-            let mut multi = create_read_cursor(
-                &[Rc::clone(&b1), Rc::clone(&b2)], &[], make_schema_i64());
-            assert_eq!(drain_chunks(&mut multi, chunk_rows), expected,
-                "merge path, chunk_rows={chunk_rows}");
+            let mut multi = create_read_cursor(&[Rc::clone(&b1), Rc::clone(&b2)], &[], make_schema_i64());
+            assert_eq!(
+                drain_chunks(&mut multi, chunk_rows),
+                expected,
+                "merge path, chunk_rows={chunk_rows}"
+            );
 
-            let mut single = create_read_cursor(
-                &[Rc::clone(&consolidated_equivalent)], &[], make_schema_i64());
-            assert_eq!(drain_chunks(&mut single, chunk_rows), expected,
-                "fast path, chunk_rows={chunk_rows}");
+            let mut single = create_read_cursor(&[Rc::clone(&consolidated_equivalent)], &[], make_schema_i64());
+            assert_eq!(
+                drain_chunks(&mut single, chunk_rows),
+                expected,
+                "fast path, chunk_rows={chunk_rows}"
+            );
         }
     }
 
@@ -1936,8 +1943,10 @@ mod tests {
         // Single source, pre-consolidated: PK=5 payload 100 @ +1, payload 200 @ −1.
         let single = make_batch(&[(5, 1, 100), (5, -1, 200)]);
         let mut c = create_read_cursor(std::slice::from_ref(&single), &[], schema);
-        assert!(c.group_has_positive(&5u128.to_be_bytes()),
-            "Single: the +1 payload is live; a whole-group sum (0) reports absent");
+        assert!(
+            c.group_has_positive(&5u128.to_be_bytes()),
+            "Single: the +1 payload is live; a whole-group sum (0) reports absent"
+        );
 
         // Multi source: the +1 and −1 payloads arrive in different batches, so the
         // heap fold (drive) produces the two sub-groups — the path a "sum the PK
@@ -1945,8 +1954,10 @@ mod tests {
         let b1 = make_batch(&[(5, 1, 100)]);
         let b2 = make_batch(&[(5, -1, 200)]);
         let mut c = create_read_cursor(&[b1, b2], &[], schema);
-        assert!(c.group_has_positive(&5u128.to_be_bytes()),
-            "Multi: per-(PK,payload) fold must keep the +1 payload visible");
+        assert!(
+            c.group_has_positive(&5u128.to_be_bytes()),
+            "Multi: per-(PK,payload) fold must keep the +1 payload visible"
+        );
     }
 
     /// After walking the equal-PK group at `key`, the cursor's committed
@@ -1966,7 +1977,11 @@ mod tests {
         assert_eq!(walked.valid, fresh.valid, "valid after walk(key={key})");
         if walked.valid {
             assert_eq!(walked.current_key, fresh.current_key, "current_key key={key}");
-            assert_eq!(walked.current_pk_bytes(), fresh.current_pk_bytes(), "pk_bytes key={key}");
+            assert_eq!(
+                walked.current_pk_bytes(),
+                fresh.current_pk_bytes(),
+                "pk_bytes key={key}"
+            );
             assert_eq!(walked.current_weight, fresh.current_weight, "weight key={key}");
             assert_eq!(walked.current_null_word, fresh.current_null_word, "null_word key={key}");
         }
@@ -2021,9 +2036,7 @@ mod tests {
             state.position = 0;
             state.skip_ghosts(src);
         }
-        c.mode = SourceMode::Multi(
-            ReadCursor::build_tree(&c.sources, &c.states, &c.schema, c.is_pk_unique),
-        );
+        c.mode = SourceMode::Multi(ReadCursor::build_tree(&c.sources, &c.states, &c.schema, c.is_pk_unique));
         c.drive();
         c
     }
@@ -2047,7 +2060,10 @@ mod tests {
             let srcs = [make_batch(a), make_batch(b)];
 
             let mut pair = create_read_cursor(&srcs, &[], make_schema_i64());
-            assert!(matches!(pair.mode, SourceMode::Pair), "production must pick Pair at len 2");
+            assert!(
+                matches!(pair.mode, SourceMode::Pair),
+                "production must pick Pair at len 2"
+            );
             let mut multi = create_cursor_force_multi(&srcs);
             assert!(matches!(multi.mode, SourceMode::Multi(_)));
             assert_eq!(scan_all(&mut pair), scan_all(&mut multi), "scan a={a:?} b={b:?}");
@@ -2060,8 +2076,15 @@ mod tests {
                 m.advance_to(&key.to_be_bytes());
                 assert_eq!(p.valid, m.valid, "advance_to({key}) valid a={a:?} b={b:?}");
                 if p.valid {
-                    assert_eq!(p.current_pk_bytes(), m.current_pk_bytes(), "advance_to({key}) pk a={a:?} b={b:?}");
-                    assert_eq!(p.current_weight, m.current_weight, "advance_to({key}) weight a={a:?} b={b:?}");
+                    assert_eq!(
+                        p.current_pk_bytes(),
+                        m.current_pk_bytes(),
+                        "advance_to({key}) pk a={a:?} b={b:?}"
+                    );
+                    assert_eq!(
+                        p.current_weight, m.current_weight,
+                        "advance_to({key}) weight a={a:?} b={b:?}"
+                    );
                 }
             }
         }

@@ -40,7 +40,8 @@ impl MasterDispatcher {
 
     pub(super) fn get_schema_and_names(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<Vec<u8>>>) {
         let cat = unsafe { &mut *self.catalog };
-        let schema = cat.get_schema_desc(target_id)
+        let schema = cat
+            .get_schema_desc(target_id)
             .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"));
         let names = cat.get_col_names_bytes(target_id);
         (schema, names)
@@ -53,11 +54,10 @@ impl MasterDispatcher {
     /// the table. Used by SAL write paths (commit/tick/broadcast) to skip
     /// per-call `build_schema_wire_block` allocations and per-column
     /// iteration in `scatter_wire_group`.
-    fn cached_schema_block(&mut self, target_id: i64)
-        -> (SchemaDescriptor, Rc<Vec<u8>>, bool, u32)
-    {
+    fn cached_schema_block(&mut self, target_id: i64) -> (SchemaDescriptor, Rc<Vec<u8>>, bool, u32) {
         let cat = unsafe { &mut *self.catalog };
-        let schema = cat.get_schema_desc(target_id)
+        let schema = cat
+            .get_schema_desc(target_id)
             .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"));
         if let Some(cached) = cat.get_cached_schema_wire_block(target_id) {
             return (schema, cached.block, cached.wire_safe, cached.wire_row_fixed_stride);
@@ -65,7 +65,9 @@ impl MasterDispatcher {
         let names = cat.get_col_names_bytes(target_id);
         let (name_refs, n) = col_names_as_refs(&names);
         let block = Rc::new(crate::runtime::wire::build_schema_wire_block(
-            &schema, &name_refs[..n], target_id as u32,
+            &schema,
+            &name_refs[..n],
+            target_id as u32,
         ));
         let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(&schema);
         cat.set_schema_wire_block(target_id, block.clone(), wire_safe, wire_row_stride);
@@ -103,10 +105,23 @@ impl MasterDispatcher {
     ) -> Result<(), String> {
         let nw = self.num_workers;
         let mut ids = [0u64; crate::runtime::sal::MAX_WORKERS];
-        for item in ids.iter_mut().take(nw) { *item = request_id; }
+        for item in ids.iter_mut().take(nw) {
+            *item = request_id;
+        }
         self.write_group_with_req_ids(
-            target_id, lsn, sal_flags, 0, worker_batches, schema, col_names,
-            seek_pk, seek_col_idx, &ids[..nw], unicast_worker, 0, None,
+            target_id,
+            lsn,
+            sal_flags,
+            0,
+            worker_batches,
+            schema,
+            col_names,
+            seek_pk,
+            seek_col_idx,
+            &ids[..nw],
+            unicast_worker,
+            0,
+            None,
             seek_pk_extra,
         )
     }
@@ -143,10 +158,20 @@ impl MasterDispatcher {
         };
 
         self.sal.write_group_direct(
-            target_id as u32, lsn, sal_flags, wire_flags, worker_batches,
-            schema, col_names_opt,
-            seek_pk, seek_col_idx, req_ids, unicast_worker, client_id,
-            prebuilt_schema_block, seek_pk_extra,
+            target_id as u32,
+            lsn,
+            sal_flags,
+            wire_flags,
+            worker_batches,
+            schema,
+            col_names_opt,
+            seek_pk,
+            seek_col_idx,
+            req_ids,
+            unicast_worker,
+            client_id,
+            prebuilt_schema_block,
+            seek_pk_extra,
         )
     }
 
@@ -177,8 +202,17 @@ impl MasterDispatcher {
         };
 
         self.sal.write_broadcast_direct(
-            target_id as u32, lsn, sal_flags, 0, batch, schema, col_names_opt,
-            seek_pk, seek_col_idx, request_id, prebuilt_schema_block,
+            target_id as u32,
+            lsn,
+            sal_flags,
+            0,
+            batch,
+            schema,
+            col_names_opt,
+            seek_pk,
+            seek_col_idx,
+            request_id,
+            prebuilt_schema_block,
         )
     }
 
@@ -197,17 +231,32 @@ impl MasterDispatcher {
         seek_col_idx: u64,
         request_id: u64,
     ) -> Result<(), String> {
-        self.write_broadcast(target_id, lsn, flags, batch, schema, col_names,
-                            seek_pk, seek_col_idx, request_id, None)?;
+        self.write_broadcast(
+            target_id,
+            lsn,
+            flags,
+            batch,
+            schema,
+            col_names,
+            seek_pk,
+            seek_col_idx,
+            request_id,
+            None,
+        )?;
         self.signal_all();
         Ok(())
     }
 
-    pub(crate) fn signal_all(&self) { self.sal.signal_all(); }
-    fn signal_one(&self, worker: usize) { self.sal.signal_one(worker); }
+    pub(crate) fn signal_all(&self) {
+        self.sal.signal_all();
+    }
+    fn signal_one(&self, worker: usize) {
+        self.sal.signal_one(worker);
+    }
 
-    pub(crate) fn sal_fd(&self) -> i32 { self.sal.sal_fd() }
-
+    pub(crate) fn sal_fd(&self) -> i32 {
+        self.sal.sal_fd()
+    }
 
     /// Write per-worker message group + signal all workers (no fdatasync).
     /// `lsn` is supplied by the caller.
@@ -224,8 +273,19 @@ impl MasterDispatcher {
         seek_col_idx: u64,
         request_id: u64,
     ) -> Result<(), String> {
-        self.write_group(target_id, lsn, flags, worker_batches, schema, col_names,
-                         seek_pk, seek_col_idx, request_id, -1, &[])?;
+        self.write_group(
+            target_id,
+            lsn,
+            flags,
+            worker_batches,
+            schema,
+            col_names,
+            seek_pk,
+            seek_col_idx,
+            request_id,
+            -1,
+            &[],
+        )?;
         self.signal_all();
         Ok(())
     }
@@ -290,7 +350,9 @@ impl MasterDispatcher {
         Ok(())
     }
 
-    pub(crate) fn num_workers(&self) -> usize { self.num_workers }
+    pub(crate) fn num_workers(&self) -> usize {
+        self.num_workers
+    }
 
     /// Collect ACKs from all workers, relaying exchange messages
     /// inline. Bootstrap-only: called by `fan_out_backfill` before the
@@ -314,7 +376,9 @@ impl MasterDispatcher {
             // further SAL writes + replies, so we loop broadly.
             let mut progressed = false;
             for w in 0..nw {
-                if collected[w] { continue; }
+                if collected[w] {
+                    continue;
+                }
                 let Some(decoded) = self.w2m().try_read(w) else {
                     continue;
                 };
@@ -346,9 +410,7 @@ impl MasterDispatcher {
                         // cursor (a single round fits the 1/8 reserve).
                         let decision = if relay.all_pad {
                             BACKFILL_DECISION_STOP
-                        } else if !self.sal_relay_space_ok_raw()
-                            || Self::inject_backfill_reclaim()
-                        {
+                        } else if !self.sal_relay_space_ok_raw() || Self::inject_backfill_reclaim() {
                             pending_reset = true;
                             BACKFILL_DECISION_CHECKPOINT
                         } else {
@@ -408,8 +470,7 @@ impl MasterDispatcher {
 
     #[cfg(debug_assertions)]
     fn seam_armed_epoch() -> &'static std::sync::atomic::AtomicU32 {
-        static ARMED: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(u32::MAX);
+        static ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
         &ARMED
     }
 
@@ -426,8 +487,7 @@ impl MasterDispatcher {
         // round count up — so an uncached read would re-allocate per round.
         use std::sync::OnceLock;
         static ARMED: OnceLock<bool> = OnceLock::new();
-        *ARMED.get_or_init(
-            || std::env::var_os("GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW").is_some())
+        *ARMED.get_or_init(|| std::env::var_os("GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW").is_some())
     }
     #[cfg(not(debug_assertions))]
     fn inject_backfill_reclaim() -> bool {
@@ -449,9 +509,7 @@ impl MasterDispatcher {
     /// reports low until the next checkpoint bumps the SAL epoch.
     pub(crate) fn sal_has_relay_space(&self) -> bool {
         #[cfg(debug_assertions)]
-        if Self::seam_armed_epoch().load(std::sync::atomic::Ordering::Relaxed)
-            == self.sal.epoch()
-        {
+        if Self::seam_armed_epoch().load(std::sync::atomic::Ordering::Relaxed) == self.sal.epoch() {
             return false;
         }
         self.sal_relay_space_ok_raw()
@@ -466,9 +524,11 @@ impl MasterDispatcher {
         #[cfg(debug_assertions)]
         if std::env::var("GNITZ_INJECT_RELAY_SPACE_LOW").is_ok() {
             let _ = Self::seam_armed_epoch().compare_exchange(
-                u32::MAX, self.sal.epoch(),
+                u32::MAX,
+                self.sal.epoch(),
                 std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed);
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         self.sal_has_relay_space()
     }
@@ -481,7 +541,13 @@ impl MasterDispatcher {
     pub(crate) fn prepare_relay(&mut self, relay: PendingRelay) -> Result<RelayPrepared, String> {
         // `all_pad` is the backfill stop signal, read by the caller before
         // `prepare_relay`; the relay scatter itself does not depend on it.
-        let PendingRelay { view_id, payloads, schema, source_id, all_pad: _ } = relay;
+        let PendingRelay {
+            view_id,
+            payloads,
+            schema,
+            source_id,
+            all_pad: _,
+        } = relay;
 
         let cat = unsafe { &mut *self.catalog };
         // A join-shard scatter (cols from a reindex chain) must route by the
@@ -516,7 +582,11 @@ impl MasterDispatcher {
         // trims to its owned slice (PartitionFilter) before integrating. The output
         // relay (source_id == 0) is NOT a join relay (is_join is false there) and
         // keeps the GroupKey scatter.
-        let range_n_eq = if is_join { cat.dag.view_range_join_n_eq(view_id) } else { None };
+        let range_n_eq = if is_join {
+            cat.dag.view_range_join_n_eq(view_id)
+        } else {
+            None
+        };
 
         let dest_batches = if range_n_eq == Some(0) {
             // Pure range join: broadcast the full delta to every worker.
@@ -527,24 +597,36 @@ impl MasterDispatcher {
             // prefix shard_cols[..n_eq]. Equi-join: full shard cols. Both
             // JoinPromote. GROUP BY / set-op: full shard cols, GroupKey.
             let route_len = range_n_eq.map_or(shard_cols.len(), |n_eq| n_eq as usize);
-            debug_assert!(range_n_eq.is_none_or(|n_eq| shard_cols.len() == n_eq as usize + 1),
-                "range-join reindex key = [eq…, range]: len must be n_eq + 1");
+            debug_assert!(
+                range_n_eq.is_none_or(|n_eq| shard_cols.len() == n_eq as usize + 1),
+                "range-join reindex key = [eq…, range]: len must be n_eq + 1"
+            );
             let col_indices: Vec<u32> = shard_cols[..route_len].iter().map(|&c| c as u32).collect();
             // target_tcs is EMPTY for a GroupKey scatter (no promotion) and has
             // length shard_cols.len() for any join; slice it to the routing prefix
             // when promoting, empty otherwise.
             let route_tcs: &[u8] = if is_join { &target_tcs[..route_len] } else { &[] };
-            let mode = if is_join { RouteMode::JoinPromote } else { RouteMode::GroupKey };
-            let consolidated_sources: Option<Vec<Option<&ConsolidatedBatch>>> = payloads.iter()
+            let mode = if is_join {
+                RouteMode::JoinPromote
+            } else {
+                RouteMode::GroupKey
+            };
+            let consolidated_sources: Option<Vec<Option<&ConsolidatedBatch>>> = payloads
+                .iter()
                 .map(|opt| match opt {
                     None => Some(None),
                     Some(b) => ConsolidatedBatch::from_batch_ref(b).map(Some),
                 })
                 .collect();
             match consolidated_sources {
-                Some(sources) => {
-                    op_relay_scatter_consolidated_mode(&sources, &col_indices, route_tcs, &schema, self.num_workers, mode)
-                }
+                Some(sources) => op_relay_scatter_consolidated_mode(
+                    &sources,
+                    &col_indices,
+                    route_tcs,
+                    &schema,
+                    self.num_workers,
+                    mode,
+                ),
                 None => {
                     let sources: Vec<Option<&Batch>> = payloads.iter().map(|o| o.as_ref()).collect();
                     op_repartition_batches_mode(&sources, &col_indices, route_tcs, &schema, self.num_workers, mode)
@@ -554,7 +636,13 @@ impl MasterDispatcher {
 
         let (_, name_bytes) = self.get_schema_and_names(view_id);
 
-        Ok(RelayPrepared { view_id, source_id, dest_batches, schema, name_bytes })
+        Ok(RelayPrepared {
+            view_id,
+            source_id,
+            dest_batches,
+            schema,
+            name_bytes,
+        })
     }
 
     /// Synchronous second half of a steady-state relay: writes the
@@ -571,8 +659,15 @@ impl MasterDispatcher {
     /// backfill collect-loop (`collect_acks_and_relay`) needs the non-CONTINUE
     /// values; the steady-state reactor path goes through `emit_relay`.
     pub(crate) fn emit_relay_with_decision(&mut self, prep: RelayPrepared, decision: u64) -> Result<(), String> {
-        let RelayPrepared { view_id, source_id, dest_batches, schema, name_bytes } = prep;
-        let refs: Vec<Option<&Batch>> = dest_batches.iter()
+        let RelayPrepared {
+            view_id,
+            source_id,
+            dest_batches,
+            schema,
+            name_bytes,
+        } = prep;
+        let refs: Vec<Option<&Batch>> = dest_batches
+            .iter()
             .map(|b| if b.count > 0 { Some(b) } else { None })
             .collect();
         let lsn = self.next_lsn();
@@ -583,8 +678,17 @@ impl MasterDispatcher {
         // columns. `seek_col_idx` carries the backfill round `decision`
         // (BACKFILL_DECISION_*); CONTINUE == 0 is the steady-state value, so a
         // non-backfill relay is byte-identical to before.
-        self.send_to_workers(view_id, lsn, FLAG_EXCHANGE_RELAY, &refs, &schema, &name_bytes,
-                              source_id as u128, decision, 0)
+        self.send_to_workers(
+            view_id,
+            lsn,
+            FLAG_EXCHANGE_RELAY,
+            &refs,
+            &schema,
+            &name_bytes,
+            source_id as u128,
+            decision,
+            0,
+        )
     }
 
     fn record_index_routing(
@@ -596,7 +700,9 @@ impl MasterDispatcher {
     ) {
         let cat = unsafe { &mut *self.catalog };
         let n_idx = cat.get_index_circuit_count(target_id);
-        if n_idx == 0 { return; }
+        if n_idx == 0 {
+            return;
+        }
 
         for ci in 0..n_idx {
             // The routing cache is keyed (table, col, u128); only SINGLE-COLUMN
@@ -612,8 +718,12 @@ impl MasterDispatcher {
             for (w, wi) in worker_indices[..self.num_workers].iter().enumerate() {
                 if !wi.is_empty() {
                     self.router.record_routing_from_source(
-                        source_batch, wi, schema,
-                        target_id as u32, col_idx, w as u32,
+                        source_batch,
+                        wi,
+                        schema,
+                        target_id as u32,
+                        col_idx,
+                        w as u32,
                     );
                 }
             }
@@ -628,8 +738,17 @@ impl MasterDispatcher {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(source_id);
         let lsn = self.next_lsn();
-        self.send_broadcast(source_id, lsn, FLAG_BACKFILL, None, &schema, &col_names,
-                           view_id as u128, 0, 0)?;
+        self.send_broadcast(
+            source_id,
+            lsn,
+            FLAG_BACKFILL,
+            None,
+            &schema,
+            &col_names,
+            view_id as u128,
+            0,
+            0,
+        )?;
         self.collect_acks_and_relay(source_id)
     }
 
@@ -642,11 +761,14 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, pk: u128, seek_pk_extra: &[u8],
+        target_id: i64,
+        pk: u128,
+        seek_pk_extra: &[u8],
     ) -> Result<W2mSlot, String> {
         let num_workers = unsafe { (*disp_ptr).num_workers };
         let schema = unsafe {
-            (*(*disp_ptr).catalog).get_schema_desc(target_id)
+            (*(*disp_ptr).catalog)
+                .get_schema_desc(target_id)
                 .ok_or_else(|| format!("seek: table {target_id} not found"))?
         };
         // `stride` (full PK width) drives `assemble_wide_pk`'s reassembly; the
@@ -666,15 +788,28 @@ impl MasterDispatcher {
             let (opk, _) = crate::storage::opk_key(&schema, pk);
             worker_for_partition(schema.partition_for_pk(&opk), num_workers)
         };
-        single_worker_async(disp_ptr, reactor, sal_excl, target_id, FLAG_SEEK,
-                            worker, pk, 0, "seek", seek_pk_extra).await
+        single_worker_async(
+            disp_ptr,
+            reactor,
+            sal_excl,
+            target_id,
+            FLAG_SEEK,
+            worker,
+            pk,
+            0,
+            "seek",
+            seek_pk_extra,
+        )
+        .await
     }
 
     pub async fn fan_out_seek_by_index_async(
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, col_idx: u32, key: u128,
+        target_id: i64,
+        col_idx: u32,
+        key: u128,
     ) -> Result<W2mSlot, String> {
         // The routing cache is keyed by `extract_col_key` (OPK-widened for
         // integer columns, XXH3 for STRING/BLOB), but `key` is the native seek
@@ -691,9 +826,18 @@ impl MasterDispatcher {
         if cached >= 0 {
             let worker = cached as usize;
             return single_worker_async(
-                disp_ptr, reactor, sal_excl, target_id, FLAG_SEEK_BY_INDEX,
-                worker, key, col_idx as u64, "seek_by_index", &[],
-            ).await;
+                disp_ptr,
+                reactor,
+                sal_excl,
+                target_id,
+                FLAG_SEEK_BY_INDEX,
+                worker,
+                key,
+                col_idx as u64,
+                "seek_by_index",
+                &[],
+            )
+            .await;
         }
 
         // Cache miss: broadcast to all workers with per-worker req_ids and
@@ -705,19 +849,33 @@ impl MasterDispatcher {
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
-                target_id, lsn, FLAG_SEEK_BY_INDEX, 0, &[], &schema, &col_names,
-                key, col_idx as u64, req_ids, -1, 0, None, &[],
+                target_id,
+                lsn,
+                FLAG_SEEK_BY_INDEX,
+                0,
+                &[],
+                &schema,
+                &col_names,
+                key,
+                col_idx as u64,
+                req_ids,
+                -1,
+                0,
+                None,
+                &[],
             )
-        }).await?;
+        })
+        .await?;
 
         let mut data_idx = None;
         for (w, slot) in slots.iter().enumerate() {
-            let ctrl = peek_control_block(slot.bytes())
-                .map_err(|e| format!("seek_by_index: worker {w}: {e}"))?;
+            let ctrl = peek_control_block(slot.bytes()).map_err(|e| format!("seek_by_index: worker {w}: {e}"))?;
             if ctrl.status != 0 {
                 return Err(format!(
                     "worker {}: seek_by_index: {}",
-                    w, String::from_utf8_lossy(&ctrl.error_msg)));
+                    w,
+                    String::from_utf8_lossy(&ctrl.error_msg)
+                ));
             }
             // This path inspects-and-forwards exactly one slot per worker; a
             // chunked train here would be forwarded truncated, its remainder
@@ -727,7 +885,8 @@ impl MasterDispatcher {
             if ctrl.flags & FLAG_CONTINUATION != 0 {
                 return Err(format!(
                     "worker {w}: seek_by_index: unexpected chunked reply on a \
-                     single-frame path"));
+                     single-frame path"
+                ));
             }
             if ctrl.flags & FLAG_HAS_DATA != 0 {
                 data_idx = Some(w);
@@ -748,12 +907,23 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, seek_col_idx: u64, seek_pk: u128, seek_pk_extra: &[u8],
+        target_id: i64,
+        seek_col_idx: u64,
+        seek_pk: u128,
+        seek_pk_extra: &[u8],
     ) -> Result<Option<Batch>, String> {
         Self::fan_out_index_collect_common(
-            disp_ptr, reactor, sal_excl, target_id,
-            FLAG_SEEK_BY_INDEX, seek_pk, seek_col_idx, seek_pk_extra, "seek_by_index",
-        ).await
+            disp_ptr,
+            reactor,
+            sal_excl,
+            target_id,
+            FLAG_SEEK_BY_INDEX,
+            seek_pk,
+            seek_col_idx,
+            seek_pk_extra,
+            "seek_by_index",
+        )
+        .await
     }
 
     /// SELECT-path ordered range scan over a secondary index: broadcast the range
@@ -771,12 +941,22 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, seek_col_idx: u64, seek_pk_extra: &[u8],
+        target_id: i64,
+        seek_col_idx: u64,
+        seek_pk_extra: &[u8],
     ) -> Result<Option<Batch>, String> {
         Self::fan_out_index_collect_common(
-            disp_ptr, reactor, sal_excl, target_id,
-            FLAG_SEEK_BY_INDEX_RANGE_SAL, 0, seek_col_idx, seek_pk_extra, "seek_by_index_range",
-        ).await
+            disp_ptr,
+            reactor,
+            sal_excl,
+            target_id,
+            FLAG_SEEK_BY_INDEX_RANGE_SAL,
+            0,
+            seek_col_idx,
+            seek_pk_extra,
+            "seek_by_index_range",
+        )
+        .await
     }
 
     /// Shared skeleton of the two broadcast-and-merge index seeks above:
@@ -797,8 +977,12 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, sal_flag: u32, seek_pk: u128,
-        seek_col_idx: u64, seek_pk_extra: &[u8], op: &str,
+        target_id: i64,
+        sal_flag: u32,
+        seek_pk: u128,
+        seek_col_idx: u64,
+        seek_pk_extra: &[u8],
+        op: &str,
     ) -> Result<Option<Batch>, String> {
         // `expected` is captured inside the fan-out closure so the reply
         // guard is definitionally the schema the request was built from; a
@@ -810,10 +994,23 @@ impl MasterDispatcher {
             let lsn = disp.next_lsn();
             expected = Some(schema);
             disp.write_group_with_req_ids(
-                target_id, lsn, sal_flag, 0, &[], &schema, &col_names,
-                seek_pk, seek_col_idx, req_ids, -1, 0, None, seek_pk_extra,
+                target_id,
+                lsn,
+                sal_flag,
+                0,
+                &[],
+                &schema,
+                &col_names,
+                seek_pk,
+                seek_col_idx,
+                req_ids,
+                -1,
+                0,
+                None,
+                seek_pk_extra,
             )
-        }).await?;
+        })
+        .await?;
         let expected = expected.expect("fan-out closure ran");
 
         let mut acc: Option<Batch> = None;
@@ -828,12 +1025,14 @@ impl MasterDispatcher {
                 return Err(format!(
                     "{op}: result exceeds the {} MiB reply cap; add a tighter \
                      predicate or LIMIT",
-                    gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT >> 20));
+                    gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT >> 20
+                ));
             }
             let a = acc.get_or_insert_with(|| Batch::with_schema(expected, mb.count));
             a.append_mem_batch_range(mb, 0, mb.count, None);
             Ok(())
-        }).await?;
+        })
+        .await?;
         // The sink runs only for non-empty frames, so `Some` implies rows.
         Ok(acc)
     }
@@ -864,13 +1063,17 @@ impl MasterDispatcher {
         let cols = col_indices.as_slice();
         if cols.len() == 1 {
             // single-column unique: unicast to the one owning worker (routing cache).
-            let slot = Self::fan_out_seek_by_index_async(
-                disp_ptr, reactor, sal_excl, target_id, cols[0], natives[0]).await?;
+            let slot =
+                Self::fan_out_seek_by_index_async(disp_ptr, reactor, sal_excl, target_id, cols[0], natives[0]).await?;
             let ctrl = peek_control_block(slot.bytes()).map_err(|e| e.to_string())?;
-            if ctrl.flags & FLAG_HAS_DATA == 0 { return Ok(None); }
-            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
-                slot.bytes(), ctrl.block_size, ctrl, None).map_err(|e| e.to_string())?;
-            Ok(zc.data_batch.filter(|b| b.count > 0)
+            if ctrl.flags & FLAG_HAS_DATA == 0 {
+                return Ok(None);
+            }
+            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl.block_size, ctrl, None)
+                .map_err(|e| e.to_string())?;
+            Ok(zc
+                .data_batch
+                .filter(|b| b.count > 0)
                 .map(|b| PkBuf::from_bytes(b.get_pk_bytes(0))))
         } else {
             // composite unique: broadcast-and-merge. natives[0] → seek_pk;
@@ -880,9 +1083,15 @@ impl MasterDispatcher {
                 slot.copy_from_slice(&v.to_le_bytes());
             }
             let batch = Self::fan_out_seek_by_index_collect_async(
-                disp_ptr, reactor, sal_excl, target_id,
-                gnitz_wire::pack_pk_cols(cols), natives[0],
-                &extra[..(cols.len() - 1) * 16]).await?;
+                disp_ptr,
+                reactor,
+                sal_excl,
+                target_id,
+                gnitz_wire::pack_pk_cols(cols),
+                natives[0],
+                &extra[..(cols.len() - 1) * 16],
+            )
+            .await?;
             Ok(batch.map(|b| PkBuf::from_bytes(b.get_pk_bytes(0))))
         }
     }
@@ -914,10 +1123,23 @@ impl MasterDispatcher {
             // decide whether to include the schema block in their response.
             let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, client_version);
             disp.write_group_with_req_ids(
-                target_id, lsn, 0, wire_flags, &[], &schema, &col_names,
-                0, 0, req_ids, -1, client_id, None, &[],
+                target_id,
+                lsn,
+                0,
+                wire_flags,
+                &[],
+                &schema,
+                &col_names,
+                0,
+                0,
+                req_ids,
+                -1,
+                client_id,
+                None,
+                &[],
             )
-        }).await?;
+        })
+        .await?;
 
         // Return on the FIRST worker fault, decode error, or client
         // disconnect: `_lease` drops on return and `route_scan_slot` discards
@@ -965,8 +1187,20 @@ impl MasterDispatcher {
                 // only `worker`'s slot is written and replies, all on this req_id.
                 let ids = [req_id; crate::runtime::sal::MAX_WORKERS];
                 disp.write_group_with_req_ids(
-                    target_id, lsn, 0, wire_flags, &[], &schema, &col_names,
-                    0, 0, &ids[..nw], worker as i32, client_id, None, &[],
+                    target_id,
+                    lsn,
+                    0,
+                    wire_flags,
+                    &[],
+                    &schema,
+                    &col_names,
+                    0,
+                    0,
+                    &ids[..nw],
+                    worker as i32,
+                    client_id,
+                    None,
+                    &[],
                 )?;
                 disp.signal_one(worker);
                 req_id
@@ -1012,9 +1246,20 @@ impl MasterDispatcher {
                         CheckPayload::Broadcast(batch) => {
                             let refs: Vec<Option<&Batch>> = (0..nw).map(|_| Some(batch)).collect();
                             disp.write_group_with_req_ids(
-                                check.target_id, lsn, check.flags, 0, &refs,
-                                &check.schema, &[], 0, check.col_hint,
-                                req_slice, -1, 0, None, &[],
+                                check.target_id,
+                                lsn,
+                                check.flags,
+                                0,
+                                &refs,
+                                &check.schema,
+                                &[],
+                                0,
+                                check.col_hint,
+                                req_slice,
+                                -1,
+                                0,
+                                None,
+                                &[],
                             )?;
                         }
                         CheckPayload::ScatterSource { source } => {
@@ -1025,9 +1270,20 @@ impl MasterDispatcher {
                             let pk_cols = check.schema.pk_indices();
                             with_worker_indices(source, pk_cols, &check.schema, nw, |worker_indices| {
                                 disp.sal.scatter_wire_group(
-                                    source, worker_indices, &check.schema, None,
-                                    check.target_id as u32, lsn, check.flags, 0,
-                                    0, check.col_hint, req_slice, -1, None, None,
+                                    source,
+                                    worker_indices,
+                                    &check.schema,
+                                    None,
+                                    check.target_id as u32,
+                                    lsn,
+                                    check.flags,
+                                    0,
+                                    0,
+                                    check.col_hint,
+                                    req_slice,
+                                    -1,
+                                    None,
+                                    None,
                                 )
                             })?;
                         }
@@ -1038,17 +1294,19 @@ impl MasterDispatcher {
             }
         };
 
-        let decoded_vec: Vec<DecodedWire> = crate::runtime::reactor::join_all_unpin(
-            all_req_ids.iter().map(|&id| reactor.await_reply(id))
-        ).await;
+        let decoded_vec: Vec<DecodedWire> =
+            crate::runtime::reactor::join_all_unpin(all_req_ids.iter().map(|&id| reactor.await_reply(id))).await;
 
-        let mut results: Vec<FxHashSet<PkBuf>> = checks.iter().map(|check| {
-            let cap = match check.payload.as_ref().expect("payload consumed") {
-                CheckPayload::Broadcast(b) => b.count,
-                CheckPayload::ScatterSource { source } => source.count,
-            };
-            FxHashSet::with_capacity_and_hasher(cap, Default::default())
-        }).collect();
+        let mut results: Vec<FxHashSet<PkBuf>> = checks
+            .iter()
+            .map(|check| {
+                let cap = match check.payload.as_ref().expect("payload consumed") {
+                    CheckPayload::Broadcast(b) => b.count,
+                    CheckPayload::ScatterSource { source } => source.count,
+                };
+                FxHashSet::with_capacity_and_hasher(cap, Default::default())
+            })
+            .collect();
 
         if let Some(err) = first_worker_error("pipeline", &decoded_vec) {
             return Err(err);
@@ -1105,11 +1363,11 @@ impl MasterDispatcher {
         // order) and `scatter_wire_group` preserves per-worker relative order,
         // so a globally sorted input yields per-worker-sorted sublists.
         pks.sort_unstable_by(|a, b| a.pk_bytes().cmp(b.pk_bytes()));
-        let col_mask = pack_gather_cols(project)
-            .ok_or("gather: more than 8 projected columns")?;
+        let col_mask = pack_gather_cols(project).ok_or("gather: more than 8 projected columns")?;
 
         let parent_schema = unsafe {
-            (&*(*disp_ptr).catalog).get_schema_desc(target_id)
+            (&*(*disp_ptr).catalog)
+                .get_schema_desc(target_id)
                 .ok_or_else(|| format!("gather: no schema for table {target_id}"))?
         };
         // The exact constructor the worker uses for its reply schema, so a
@@ -1125,24 +1383,38 @@ impl MasterDispatcher {
             let lsn = disp.next_lsn();
             with_worker_indices(&batch, pk_cols, &parent_schema, nw, |worker_indices| {
                 disp.sal.scatter_wire_group(
-                    &batch, worker_indices, &parent_schema, None,
-                    target_id as u32, lsn, FLAG_GATHER,
-                    /* wire_flags */ 0, /* seek_pk */ 0, /* seek_col_idx */ col_mask,
-                    rids, /* unicast_worker */ -1, None, None,
+                    &batch,
+                    worker_indices,
+                    &parent_schema,
+                    None,
+                    target_id as u32,
+                    lsn,
+                    FLAG_GATHER,
+                    /* wire_flags */ 0,
+                    /* seek_pk */ 0,
+                    /* seek_col_idx */ col_mask,
+                    rids,
+                    /* unicast_worker */ -1,
+                    None,
+                    None,
                 )
             })?;
             // The scatter batch is fully consumed by the synchronous
             // scatter_wire_group above; return it to the pool.
             recycle_check_batch(disp, target_id, batch);
             Ok(())
-        }).await?;
+        })
+        .await?;
 
         // Precompute (type_code, col_size) per projected column from the parent
         // schema; the reply's projected payload index k corresponds to project[k].
-        let proj_meta: Vec<(u8, usize)> = project.iter().map(|&p| {
-            let col = parent_schema.columns[p as usize];
-            (col.type_code, col.size() as usize)
-        }).collect();
+        let proj_meta: Vec<(u8, usize)> = project
+            .iter()
+            .map(|&p| {
+                let col = parent_schema.columns[p as usize];
+                (col.type_code, col.size() as usize)
+            })
+            .collect();
 
         let mut out = GatherMap::new(proj_meta.len());
         drain_index_scan(slots, &req_ids, reactor, "gather", &expected, |b, _| {
@@ -1161,14 +1433,14 @@ impl MasterDispatcher {
                         if null_word & (1u64 << k) != 0 {
                             None
                         } else {
-                            Some(payload_native_key(
-                                col_slices[k], j * col_size, col_size, col_type))
+                            Some(payload_native_key(col_slices[k], j * col_size, col_size, col_type))
                         }
                     }),
                 );
             }
             Ok(())
-        }).await?;
+        })
+        .await?;
         Ok(out)
     }
 
@@ -1177,8 +1449,18 @@ impl MasterDispatcher {
     /// so recovery can group them as an atomic zone.
     pub fn broadcast_ddl(&mut self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), String> {
         let (schema, schema_block, _safe, _stride) = self.cached_schema_block(target_id);
-        self.write_broadcast(target_id, lsn, FLAG_DDL_SYNC, Some(batch), &schema, &[],
-                            0, 0, 0, Some(schema_block.as_slice()))?;
+        self.write_broadcast(
+            target_id,
+            lsn,
+            FLAG_DDL_SYNC,
+            Some(batch),
+            &schema,
+            &[],
+            0,
+            0,
+            0,
+            Some(schema_block.as_slice()),
+        )?;
         self.signal_all();
         gnitz_debug!("broadcast_ddl tid={} rows={} lsn={}", target_id, batch.count, lsn);
         Ok(())
@@ -1204,13 +1486,23 @@ impl MasterDispatcher {
     /// encoder reuses `write_group_with_req_ids`; per-worker slots all
     /// carry the corresponding req_id from `req_ids[w]`. `lsn` is
     /// supplied by the caller.
-    pub(crate) fn write_tick_group(
-        &mut self, tid: i64, lsn: u64, req_ids: &[u64],
-    ) -> Result<(), String> {
+    pub(crate) fn write_tick_group(&mut self, tid: i64, lsn: u64, req_ids: &[u64]) -> Result<(), String> {
         let (schema, schema_block, _safe, _stride) = self.cached_schema_block(tid);
         self.write_group_with_req_ids(
-            tid, lsn, FLAG_TICK, 0, &[], &schema, &[],
-            0, 0, req_ids, -1, 0, Some(schema_block.as_slice()), &[],
+            tid,
+            lsn,
+            FLAG_TICK,
+            0,
+            &[],
+            &schema,
+            &[],
+            0,
+            0,
+            req_ids,
+            -1,
+            0,
+            Some(schema_block.as_slice()),
+            &[],
         )
     }
 
@@ -1227,27 +1519,29 @@ impl MasterDispatcher {
         // ever added. It also names the exact dead worker for the error/log.
         for w in 0..self.num_workers {
             let pid = self.worker_pids[w];
-            if pid <= 0 { continue; }
+            if pid <= 0 {
+                continue;
+            }
             let mut status: i32 = 0;
             loop {
                 let rpid = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
                 if rpid > 0 {
-                    self.worker_pids[w] = 0;        // reaped — never waitpid it again
+                    self.worker_pids[w] = 0; // reaped — never waitpid it again
                     return w as i32;
                 }
                 if rpid == 0 {
-                    break;                          // still running
+                    break; // still running
                 }
                 // rpid == -1
                 let err = crate::foundation::syscall::errno();
                 if err == libc::EINTR {
-                    continue;                       // signal, not death — retry
+                    continue; // signal, not death — retry
                 }
                 if err == libc::ECHILD {
-                    self.worker_pids[w] = 0;        // already gone
+                    self.worker_pids[w] = 0; // already gone
                     return w as i32;
                 }
-                break;                              // unexpected errno: treat as alive
+                break; // unexpected errno: treat as alive
             }
         }
         -1
@@ -1261,7 +1555,9 @@ impl MasterDispatcher {
             let pid = self.worker_pids[w];
             if pid > 0 {
                 let mut status: i32 = 0;
-                unsafe { libc::waitpid(pid, &mut status, 0); }
+                unsafe {
+                    libc::waitpid(pid, &mut status, 0);
+                }
             }
         }
         // All workers reaped: no process can race a removal. Reclaim any dirs
@@ -1275,11 +1571,13 @@ impl MasterDispatcher {
     /// `join!` them. `lsn` is supplied by the caller.
     pub(crate) fn write_commit_group(
         &mut self,
-        target_id: i64, lsn: u64, batch: &Batch, mode: WireConflictMode,
+        target_id: i64,
+        lsn: u64,
+        batch: &Batch,
+        mode: WireConflictMode,
         req_ids: &[u64],
     ) -> Result<(), String> {
-        let (schema, schema_block, wire_safe, wire_row_stride) =
-            self.cached_schema_block(target_id);
+        let (schema, schema_block, wire_safe, wire_row_stride) = self.cached_schema_block(target_id);
         let nw = self.num_workers;
         let pk_col = schema.pk_indices();
         let wire_flags = wire_flags_set_conflict_mode(0, mode);
@@ -1290,10 +1588,18 @@ impl MasterDispatcher {
         let scatter = |worker_indices: &[Vec<u32>]| {
             self.record_index_routing(target_id, &schema, batch, worker_indices);
             self.sal.scatter_wire_group(
-                batch, worker_indices, &schema, None,
-                target_id as u32, lsn, FLAG_PUSH,
+                batch,
+                worker_indices,
+                &schema,
+                None,
+                target_id as u32,
+                lsn,
+                FLAG_PUSH,
                 wire_flags,
-                0, 0, req_ids, -1,
+                0,
+                0,
+                req_ids,
+                -1,
                 Some(schema_block.as_slice()),
                 Some((wire_safe, wire_row_stride)),
             )
@@ -1311,15 +1617,26 @@ impl MasterDispatcher {
     /// Write a FLAG_FLUSH checkpoint group with per-worker req_ids.
     /// Does NOT sync/signal. Caller signals + awaits replies. `lsn` is
     /// supplied by the caller.
-    pub(crate) fn write_checkpoint_group(
-        &mut self, lsn: u64, req_ids: &[u64],
-    ) -> Result<(), String> {
+    pub(crate) fn write_checkpoint_group(&mut self, lsn: u64, req_ids: &[u64]) -> Result<(), String> {
         let schema = SchemaDescriptor::minimal_u64();
         // One "slot" per worker with empty batch — each worker replies
         // after flushing its system tables and advancing its epoch.
         let refs: Vec<Option<&Batch>> = (0..self.num_workers).map(|_| None).collect();
         self.write_group_with_req_ids(
-            0, lsn, FLAG_FLUSH, 0, &refs, &schema, &[], 0, 0, req_ids, -1, 0, None, &[],
+            0,
+            lsn,
+            FLAG_FLUSH,
+            0,
+            &refs,
+            &schema,
+            &[],
+            0,
+            0,
+            req_ids,
+            -1,
+            0,
+            None,
+            &[],
         )
     }
 
@@ -1372,7 +1689,6 @@ impl MasterDispatcher {
             .map(|(s, t)| (s.to_string(), t.to_string()))
             .unwrap_or_default()
     }
-
 }
 
 /// Forward one worker's SCAN continuation train to the client: send each frame
@@ -1392,8 +1708,12 @@ async fn drain_scan_train(
     loop {
         let (_, has_more) = parse_train_header(&slot, worker, "scan")?;
         let rc = reactor.send_slot(fd, slot).await;
-        if rc < 0 { return Ok(false); }
-        if !has_more { break; }
+        if rc < 0 {
+            return Ok(false);
+        }
+        if !has_more {
+            break;
+        }
         slot = reactor.await_scan_slot(req_id).await;
     }
     Ok(true)
@@ -1416,7 +1736,8 @@ async fn single_worker_async(
     target_id: i64,
     flags: u32,
     worker: usize,
-    seek_pk: u128, seek_col_idx: u64,
+    seek_pk: u128,
+    seek_col_idx: u64,
     op_name: &'static str,
     seek_pk_extra: &[u8],
 ) -> Result<W2mSlot, String> {
@@ -1427,8 +1748,19 @@ async fn single_worker_async(
             let (schema, col_names) = disp.get_schema_and_names(target_id);
             let req_id = reactor.alloc_scan_request_id();
             let lsn = disp.next_lsn();
-            disp.write_group(target_id, lsn, flags, &[], &schema, &col_names,
-                             seek_pk, seek_col_idx, req_id, worker as i32, seek_pk_extra)?;
+            disp.write_group(
+                target_id,
+                lsn,
+                flags,
+                &[],
+                &schema,
+                &col_names,
+                seek_pk,
+                seek_col_idx,
+                req_id,
+                worker as i32,
+                seek_pk_extra,
+            )?;
             disp.signal_one(worker);
             req_id
         }
@@ -1439,8 +1771,7 @@ async fn single_worker_async(
     // slot). One frame, no continuation train, so the lease lives in this body.
     let _lease = reactor.scan_lease(&[req_id as u32]);
     let slot = reactor.await_scan_slot(req_id as u32).await;
-    let ctrl = peek_control_block(slot.bytes())
-        .expect("W2M ctrl corrupt in single_worker_async");
+    let ctrl = peek_control_block(slot.bytes()).expect("W2M ctrl corrupt in single_worker_async");
     if ctrl.status != 0 {
         let msg = String::from_utf8_lossy(&ctrl.error_msg);
         return Err(format!("worker {worker}: {op_name}: {msg}"));
@@ -1453,11 +1784,11 @@ async fn single_worker_async(
     if ctrl.flags & FLAG_CONTINUATION != 0 {
         return Err(format!(
             "worker {worker}: {op_name}: unexpected chunked reply on a \
-             single-frame path"));
+             single-frame path"
+        ));
     }
     Ok(slot)
 }
-
 
 #[cfg(test)]
 mod worker_liveness_tests {
@@ -1480,9 +1811,12 @@ mod worker_liveness_tests {
         for _ in 0..nw {
             let p = unsafe {
                 let p = libc::mmap(
-                    std::ptr::null_mut(), RING_CAP,
+                    std::ptr::null_mut(),
+                    RING_CAP,
                     libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0,
+                    libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                    -1,
+                    0,
                 ) as *mut u8;
                 assert!(!p.is_null(), "mmap failed");
                 std::ptr::write_bytes(p, 0, RING_CAP);
@@ -1503,7 +1837,9 @@ mod worker_liveness_tests {
 
     fn free_rings(ptrs: &[*mut u8]) {
         for &p in ptrs {
-            unsafe { libc::munmap(p as *mut libc::c_void, RING_CAP); }
+            unsafe {
+                libc::munmap(p as *mut libc::c_void, RING_CAP);
+            }
         }
     }
 
@@ -1581,7 +1917,10 @@ mod worker_liveness_tests {
         let (mut disp, ptrs) = probe_dispatcher(vec![dead]);
         let err = disp.collect_acks().expect_err("a dead worker must fail ack collection");
         assert!(err.contains("worker 0"), "error names the dead worker: {err}");
-        assert!(err.contains("recovery sync"), "error identifies the recovery path: {err}");
+        assert!(
+            err.contains("recovery sync"),
+            "error identifies the recovery path: {err}"
+        );
         drop(disp);
         free_rings(&ptrs);
     }
@@ -1593,10 +1932,14 @@ mod worker_liveness_tests {
         // dead worker.
         let dead = spawn_and_reap_dead();
         let (mut disp, ptrs) = probe_dispatcher(vec![dead]);
-        let err = disp.collect_acks_and_relay(0)
+        let err = disp
+            .collect_acks_and_relay(0)
             .expect_err("a dead worker must fail the backfill relay");
         assert!(err.contains("worker 0"), "error names the dead worker: {err}");
-        assert!(err.contains("backfill relay"), "error identifies the backfill path: {err}");
+        assert!(
+            err.contains("backfill relay"),
+            "error identifies the backfill path: {err}"
+        );
         drop(disp);
         free_rings(&ptrs);
     }

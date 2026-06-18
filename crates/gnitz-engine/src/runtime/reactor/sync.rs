@@ -37,12 +37,19 @@ pub mod oneshot {
         receiver_alive: bool,
     }
 
-    pub struct Sender<T> { inner: Rc<RefCell<State<T>>> }
-    pub struct Receiver<T> { inner: Rc<RefCell<State<T>>> }
+    pub struct Sender<T> {
+        inner: Rc<RefCell<State<T>>>,
+    }
+    pub struct Receiver<T> {
+        inner: Rc<RefCell<State<T>>>,
+    }
 
     pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         let s = Rc::new(RefCell::new(State {
-            value: None, waker: None, sender_alive: true, receiver_alive: true,
+            value: None,
+            waker: None,
+            sender_alive: true,
+            receiver_alive: true,
         }));
         (Sender { inner: Rc::clone(&s) }, Receiver { inner: s })
     }
@@ -56,7 +63,9 @@ pub mod oneshot {
                 return Err(v);
             }
             s.value = Some(v);
-            if let Some(w) = s.waker.take() { w.wake(); }
+            if let Some(w) = s.waker.take() {
+                w.wake();
+            }
             Ok(())
         }
     }
@@ -65,7 +74,9 @@ pub mod oneshot {
         fn drop(&mut self) {
             let mut s = self.inner.borrow_mut();
             s.sender_alive = false;
-            if let Some(w) = s.waker.take() { w.wake(); }
+            if let Some(w) = s.waker.take() {
+                w.wake();
+            }
         }
     }
 
@@ -107,12 +118,18 @@ pub mod mpsc {
         senders: usize,
     }
 
-    pub struct Sender<T> { inner: Rc<RefCell<State<T>>> }
-    pub struct Receiver<T> { inner: Rc<RefCell<State<T>>> }
+    pub struct Sender<T> {
+        inner: Rc<RefCell<State<T>>>,
+    }
+    pub struct Receiver<T> {
+        inner: Rc<RefCell<State<T>>>,
+    }
 
     pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
         let s = Rc::new(RefCell::new(State {
-            queue: VecDeque::new(), waker: None, senders: 1,
+            queue: VecDeque::new(),
+            waker: None,
+            senders: 1,
         }));
         (Sender { inner: Rc::clone(&s) }, Receiver { inner: s })
     }
@@ -120,7 +137,9 @@ pub mod mpsc {
     impl<T> Clone for Sender<T> {
         fn clone(&self) -> Self {
             self.inner.borrow_mut().senders += 1;
-            Sender { inner: Rc::clone(&self.inner) }
+            Sender {
+                inner: Rc::clone(&self.inner),
+            }
         }
     }
 
@@ -128,7 +147,9 @@ pub mod mpsc {
         pub fn send(&self, v: T) {
             let mut s = self.inner.borrow_mut();
             s.queue.push_back(v);
-            if let Some(w) = s.waker.take() { w.wake(); }
+            if let Some(w) = s.waker.take() {
+                w.wake();
+            }
         }
     }
 
@@ -137,7 +158,9 @@ pub mod mpsc {
             let mut s = self.inner.borrow_mut();
             s.senders -= 1;
             if s.senders == 0 {
-                if let Some(w) = s.waker.take() { w.wake(); }
+                if let Some(w) = s.waker.take() {
+                    w.wake();
+                }
             }
         }
     }
@@ -196,7 +219,10 @@ impl<T> AsyncMutex<T> {
     }
 
     pub fn lock<'a>(self: &'a Rc<Self>) -> LockFuture<'a, T> {
-        LockFuture { mutex: Rc::clone(self), _p: std::marker::PhantomData }
+        LockFuture {
+            mutex: Rc::clone(self),
+            _p: std::marker::PhantomData,
+        }
     }
 
     fn release(&self) {
@@ -207,7 +233,9 @@ impl<T> AsyncMutex<T> {
         // On a single-threaded executor the thundering-herd cost is free:
         // only the first task to poll acquires the lock; the rest re-park.
         let waiters = std::mem::take(&mut *self.waiters.borrow_mut());
-        for w in waiters { w.wake(); }
+        for w in waiters {
+            w.wake();
+        }
     }
 }
 
@@ -221,7 +249,9 @@ impl<'a, T: 'a> Future for LockFuture<'a, T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<LockGuard<T>> {
         if !self.mutex.locked.get() {
             self.mutex.locked.set(true);
-            return Poll::Ready(LockGuard { mutex: Rc::clone(&self.mutex) });
+            return Poll::Ready(LockGuard {
+                mutex: Rc::clone(&self.mutex),
+            });
         }
         push_unique_waker(&mut self.mutex.waiters.borrow_mut(), cx.waker());
         Poll::Pending
@@ -234,11 +264,15 @@ pub struct LockGuard<T> {
 
 impl<T> std::ops::Deref for LockGuard<T> {
     type Target = RefCell<T>;
-    fn deref(&self) -> &Self::Target { &self.mutex.value }
+    fn deref(&self) -> &Self::Target {
+        &self.mutex.value
+    }
 }
 
 impl<T> Drop for LockGuard<T> {
-    fn drop(&mut self) { self.mutex.release(); }
+    fn drop(&mut self) {
+        self.mutex.release();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +300,9 @@ impl AsyncRwLock {
     pub fn new() -> Self {
         AsyncRwLock {
             inner: RefCell::new(RwLockInner {
-                readers: 0, has_writer: false, writers_waiting: 0,
+                readers: 0,
+                has_writer: false,
+                writers_waiting: 0,
                 read_waiters: VecDeque::new(),
                 write_waiters: VecDeque::new(),
             }),
@@ -274,11 +310,18 @@ impl AsyncRwLock {
     }
 
     pub fn read<'a>(self: &'a Rc<Self>) -> ReadFuture<'a> {
-        ReadFuture { lock: Rc::clone(self), _p: std::marker::PhantomData }
+        ReadFuture {
+            lock: Rc::clone(self),
+            _p: std::marker::PhantomData,
+        }
     }
 
     pub fn write<'a>(self: &'a Rc<Self>) -> WriteFuture<'a> {
-        WriteFuture { lock: Rc::clone(self), parked: false, _p: std::marker::PhantomData }
+        WriteFuture {
+            lock: Rc::clone(self),
+            parked: false,
+            _p: std::marker::PhantomData,
+        }
     }
 
     fn release_read(&self) {
@@ -290,7 +333,9 @@ impl AsyncRwLock {
             // every live write waiter permanently blocked.
             let writers = std::mem::take(&mut s.write_waiters);
             drop(s);
-            for w in writers { w.wake(); }
+            for w in writers {
+                w.wake();
+            }
         }
     }
 
@@ -303,18 +348,24 @@ impl AsyncRwLock {
         let writers = std::mem::take(&mut s.write_waiters);
         if !writers.is_empty() {
             drop(s);
-            for w in writers { w.wake(); }
+            for w in writers {
+                w.wake();
+            }
             return;
         }
         // No queued writer — wake all parked readers.
         let readers = std::mem::take(&mut s.read_waiters);
         drop(s);
-        for w in readers { w.wake(); }
+        for w in readers {
+            w.wake();
+        }
     }
 }
 
 impl Default for AsyncRwLock {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct ReadFuture<'a> {
@@ -328,7 +379,9 @@ impl<'a> Future for ReadFuture<'a> {
         let mut s = self.lock.inner.borrow_mut();
         if !s.has_writer && s.writers_waiting == 0 {
             s.readers += 1;
-            return Poll::Ready(ReadGuard { lock: Rc::clone(&self.lock) });
+            return Poll::Ready(ReadGuard {
+                lock: Rc::clone(&self.lock),
+            });
         }
         push_unique_waker(&mut s.read_waiters, cx.waker());
         Poll::Pending
@@ -340,7 +393,9 @@ pub struct ReadGuard {
 }
 
 impl Drop for ReadGuard {
-    fn drop(&mut self) { self.lock.release_read(); }
+    fn drop(&mut self) {
+        self.lock.release_read();
+    }
 }
 
 pub struct WriteFuture<'a> {
@@ -362,14 +417,15 @@ impl<'a> Future for WriteFuture<'a> {
                 drop(s);
                 self.parked = false;
             }
-            return Poll::Ready(WriteGuard { lock: Rc::clone(&self.lock) });
+            return Poll::Ready(WriteGuard {
+                lock: Rc::clone(&self.lock),
+            });
         }
         if !was_parked {
             s.writers_waiting += 1;
             drop(s);
             self.parked = true;
-            push_unique_waker(
-                &mut lock.inner.borrow_mut().write_waiters, cx.waker());
+            push_unique_waker(&mut lock.inner.borrow_mut().write_waiters, cx.waker());
         } else {
             push_unique_waker(&mut s.write_waiters, cx.waker());
         }
@@ -394,18 +450,24 @@ impl<'a> Drop for WriteFuture<'a> {
                 let writers = std::mem::take(&mut s.write_waiters);
                 if !writers.is_empty() {
                     drop(s);
-                    for w in writers { w.wake(); }
+                    for w in writers {
+                        w.wake();
+                    }
                     return;
                 }
                 let readers = std::mem::take(&mut s.read_waiters);
                 drop(s);
-                for w in readers { w.wake(); }
+                for w in readers {
+                    w.wake();
+                }
             } else if s.writers_waiting == 0 {
                 // Readers hold the lock; this was the last live write waiter.
                 // Readers blocked by `writers_waiting > 0` can now enter.
                 let readers = std::mem::take(&mut s.read_waiters);
                 drop(s);
-                for w in readers { w.wake(); }
+                for w in readers {
+                    w.wake();
+                }
             }
         }
     }
@@ -416,7 +478,9 @@ pub struct WriteGuard {
 }
 
 impl Drop for WriteGuard {
-    fn drop(&mut self) { self.lock.release_write(); }
+    fn drop(&mut self) {
+        self.lock.release_write();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,17 +499,22 @@ where
     let mut b_out: Option<B::Output> = None;
     std::future::poll_fn(move |cx| {
         if a_out.is_none() {
-            if let Poll::Ready(v) = a.as_mut().poll(cx) { a_out = Some(v); }
+            if let Poll::Ready(v) = a.as_mut().poll(cx) {
+                a_out = Some(v);
+            }
         }
         if b_out.is_none() {
-            if let Poll::Ready(v) = b.as_mut().poll(cx) { b_out = Some(v); }
+            if let Poll::Ready(v) = b.as_mut().poll(cx) {
+                b_out = Some(v);
+            }
         }
         if a_out.is_some() && b_out.is_some() {
             Poll::Ready((a_out.take().unwrap(), b_out.take().unwrap()))
         } else {
             Poll::Pending
         }
-    }).await
+    })
+    .await
 }
 
 /// Future driving `futs` to completion, writing values in input order
@@ -468,23 +537,30 @@ impl<'a, F: Future<Output = T> + Unpin, T> Future for JoinInto<'a, F, T> {
         let n = this.futs.len();
         let mut remaining = 0;
         for i in 0..n {
-            if this.out[i].is_some() { continue; }
+            if this.out[i].is_some() {
+                continue;
+            }
             match Pin::new(&mut this.futs[i]).poll(cx) {
-                Poll::Ready(v) => { this.out[i] = Some(v); }
-                Poll::Pending => { remaining += 1; }
+                Poll::Ready(v) => {
+                    this.out[i] = Some(v);
+                }
+                Poll::Pending => {
+                    remaining += 1;
+                }
             }
         }
-        if remaining == 0 { Poll::Ready(()) } else { Poll::Pending }
+        if remaining == 0 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 }
 
 /// Drive every future in `futs` to completion, writing each result into
 /// the same index in `out`. `out` is cleared and resized to `futs.len()`
 /// on entry; allocation only happens when its capacity is too small.
-pub fn join_into<'a, F, T>(
-    futs: &'a mut Vec<F>,
-    out: &'a mut Vec<Option<T>>,
-) -> JoinInto<'a, F, T>
+pub fn join_into<'a, F, T>(futs: &'a mut Vec<F>, out: &'a mut Vec<Option<T>>) -> JoinInto<'a, F, T>
 where
     F: Future<Output = T> + Unpin,
 {
@@ -538,5 +614,6 @@ where
             return Poll::Ready(Either::B(v));
         }
         Poll::Pending
-    }).await
+    })
+    .await
 }

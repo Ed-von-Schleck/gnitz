@@ -1,7 +1,6 @@
 //! io_uring batched fdatasync helpers: `dedup_dirfds` and the
 //! `uring_batch_fdatasync` durability primitive.
 
-
 /// Deduplicate a list of (dev, ino, fd) triples by (dev, ino), returning one fd per
 /// unique directory inode. Both fields are u64 to handle varying ino_t/dev_t widths.
 pub(crate) fn dedup_dirfds(mut inodes: Vec<(u64, u64, libc::c_int)>) -> Vec<libc::c_int> {
@@ -17,10 +16,7 @@ pub(crate) fn dedup_dirfds(mut inodes: Vec<(u64, u64, libc::c_int)>) -> Vec<libc
 /// Submit one FSYNC(DATASYNC) SQE per fd and await completion of all of them.
 /// Drains the SQ when full so a chunk of more than `sq_entries` fds requires
 /// multiple `submit_and_wait` calls.
-pub(crate) fn uring_batch_fdatasync(
-    ring: &mut io_uring::IoUring,
-    fds: &[libc::c_int],
-) -> Result<(), String> {
+pub(crate) fn uring_batch_fdatasync(ring: &mut io_uring::IoUring, fds: &[libc::c_int]) -> Result<(), String> {
     uring_batch_fdatasync_with(ring, fds, |r, want| r.submit_and_wait(want))
 }
 
@@ -29,13 +25,17 @@ fn uring_batch_fdatasync_with(
     fds: &[libc::c_int],
     mut submit: impl FnMut(&mut io_uring::IoUring, usize) -> std::io::Result<usize>,
 ) -> Result<(), String> {
-    if fds.is_empty() { return Ok(()); }
+    if fds.is_empty() {
+        return Ok(());
+    }
     let sq_capacity = ring.params().sq_entries() as usize;
     let mut completed = 0usize;
     let mut pushed = 0usize;
     while completed < fds.len() {
         while pushed < fds.len() {
-            if ring.submission().len() >= sq_capacity { break; }
+            if ring.submission().len() >= sq_capacity {
+                break;
+            }
             let sqe = io_uring::opcode::Fsync::new(io_uring::types::Fd(fds[pushed]))
                 .flags(io_uring::types::FsyncFlags::DATASYNC)
                 .build();
@@ -69,7 +69,6 @@ fn uring_batch_fdatasync_with(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,9 +79,9 @@ mod tests {
         // duplicates it drops (the caller closes every collected fd).
         let inodes = vec![
             (1u64, 10u64, 3i32),
-            (1u64, 10u64, 7i32),  // duplicate of (1,10)
+            (1u64, 10u64, 7i32), // duplicate of (1,10)
             (1u64, 20u64, 5i32),
-            (2u64, 10u64, 9i32),  // same ino, different dev — not a duplicate
+            (2u64, 10u64, 9i32), // same ino, different dev — not a duplicate
         ];
         let mut result = dedup_dirfds(inodes);
         result.sort_unstable();
@@ -112,9 +111,12 @@ mod tests {
     fn try_new_ring(entries: u32) -> Option<io_uring::IoUring> {
         match io_uring::IoUring::new(entries) {
             Ok(r) => Some(r),
-            Err(e) if e.raw_os_error().is_some_and(|c| {
-                c == libc::ENOSYS || c == libc::EPERM || c == libc::EACCES
-            }) => None,
+            Err(e)
+                if e.raw_os_error()
+                    .is_some_and(|c| c == libc::ENOSYS || c == libc::EPERM || c == libc::EACCES) =>
+            {
+                None
+            }
             Err(e) => panic!("io_uring::new: {e}"),
         }
     }
@@ -150,7 +152,9 @@ mod tests {
         uring_batch_fdatasync(&mut ring, &fds).expect("batch fdatasync");
 
         for fd in fds {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
 
@@ -171,9 +175,7 @@ mod tests {
         for i in 0..3 {
             let path = dir.path().join(format!("eintr_{i}.bin"));
             let path_c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-            let fd = unsafe {
-                libc::open(path_c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644)
-            };
+            let fd = unsafe { libc::open(path_c.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644) };
             assert!(fd >= 0);
             let buf = b"x";
             unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 1) };
@@ -196,8 +198,9 @@ mod tests {
         assert_eq!(call_count, 2, "exactly one EINTR then one successful submit expected");
 
         for fd in fds {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
-
 }

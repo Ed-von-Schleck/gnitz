@@ -205,13 +205,7 @@ mod tests {
 
     #[test]
     fn build_crossing_u64_boundary() {
-        let pks: [u128; 5] = [
-            0,
-            1,
-            u64::MAX as u128,
-            (u64::MAX as u128) + 1,
-            u128::MAX,
-        ];
+        let pks: [u128; 5] = [0, 1, u64::MAX as u128, (u64::MAX as u128) + 1, u128::MAX];
         let filter = build(&pks).unwrap();
         for &pk in &pks {
             assert!(may_contain(&filter, pk), "false negative for pk {pk:#034x}");

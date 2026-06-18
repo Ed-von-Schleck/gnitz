@@ -11,12 +11,14 @@
 use std::ffi::CString;
 use std::rc::Rc;
 
-use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 use super::super::error::StorageError;
 use super::super::memtable;
 use super::super::shard_file::{self, PkUniqueChecker};
-use super::{Table, FlushOutcome, FlushWork, Persistence, ShardRename, FoundSource,
-            INMEM_COMPACT_THRESHOLD, EPHEMERAL_INMEM_CEILING};
+use super::{
+    FlushOutcome, FlushWork, FoundSource, Persistence, ShardRename, Table, EPHEMERAL_INMEM_CEILING,
+    INMEM_COMPACT_THRESHOLD,
+};
+use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 
 impl Table {
     /// Flush memtable to shard.  Persistent tables also update manifest.
@@ -38,11 +40,8 @@ impl Table {
     /// (which exhausted the default `ulimit -n` after a handful of tables).
     /// The caller owns the returned fd and must close it.
     pub(super) fn open_dirfd(&self) -> Result<libc::c_int, StorageError> {
-        let dir_c = CString::new(self.directory.as_str())
-            .map_err(|_| StorageError::InvalidPath)?;
-        let fd = unsafe {
-            libc::open(dir_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-        };
+        let dir_c = CString::new(self.directory.as_str()).map_err(|_| StorageError::InvalidPath)?;
+        let fd = unsafe { libc::open(dir_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
         if fd < 0 {
             return Err(StorageError::Io);
         }
@@ -123,11 +122,18 @@ impl Table {
         let dirfd = self.open_dirfd()?;
 
         let prepared = match shard_file::write_shard_streaming_prepare(
-            dirfd, &name_c, self.table_id, snapshot.count as u32, &regions, flush_flags,
+            dirfd,
+            &name_c,
+            self.table_id,
+            snapshot.count as u32,
+            &regions,
+            flush_flags,
         ) {
             Ok(p) => p,
             Err(e) => {
-                unsafe { libc::close(dirfd); }
+                unsafe {
+                    libc::close(dirfd);
+                }
                 return Err(e);
             }
         };
@@ -146,21 +152,23 @@ impl Table {
         };
 
         let tmp_full_c = CString::new(format!(
-            "{}/{}", self.directory,
+            "{}/{}",
+            self.directory,
             tmp_name.to_str().map_err(|_| StorageError::InvalidPath)?,
-        )).map_err(|_| StorageError::InvalidPath)?;
+        ))
+        .map_err(|_| StorageError::InvalidPath)?;
         let final_full = format!("{}/{}", self.directory, shard_name);
 
-        let pending = self.shard_index.open_shard_for_pending(
-            &tmp_full_c, final_full, 0, lsn_max,
-        )?;
+        let pending = self
+            .shard_index
+            .open_shard_for_pending(&tmp_full_c, final_full, 0, lsn_max)?;
 
-        let manifest_path = self.manifest_path.as_ref()
+        let manifest_path = self
+            .manifest_path
+            .as_ref()
             .expect("durable table must have manifest_path");
-        let manifest_c = CString::new(manifest_path.as_str())
-            .map_err(|_| StorageError::InvalidPath)?;
-        work.manifest = Some(self.shard_index
-            .prepare_manifest_with_pending(&manifest_c, &pending)?);
+        let manifest_c = CString::new(manifest_path.as_str()).map_err(|_| StorageError::InvalidPath)?;
+        work.manifest = Some(self.shard_index.prepare_manifest_with_pending(&manifest_c, &pending)?);
         work.pending_shard = Some(pending);
 
         Ok(FlushOutcome::Pending(Box::new(work)))
@@ -178,8 +186,10 @@ impl Table {
         let dirfd = if let Some(rename) = work.shard_rename.take() {
             let rc = unsafe {
                 libc::renameat(
-                    rename.dirfd, rename.tmp_name.as_ptr(),
-                    rename.dirfd, rename.final_name.as_ptr(),
+                    rename.dirfd,
+                    rename.tmp_name.as_ptr(),
+                    rename.dirfd,
+                    rename.final_name.as_ptr(),
                 )
             };
             if rc < 0 {
@@ -201,7 +211,11 @@ impl Table {
                 // Restore so Drop unlinks the manifest .tmp. The shard is
                 // already at its final path and will be collected by orphan GC.
                 work.manifest = Some(m);
-                if let Some(fd) = dirfd { unsafe { libc::close(fd); } }
+                if let Some(fd) = dirfd {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
                 return Err(StorageError::Io);
             }
         }
@@ -209,7 +223,11 @@ impl Table {
         // Publish the pending shard into the index.
         if let Some(pending) = work.pending_shard.take() {
             if let Err(e) = self.shard_index.add_opened_shard(pending) {
-                if let Some(fd) = dirfd { unsafe { libc::close(fd); } }
+                if let Some(fd) = dirfd {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
                 return Err(e);
             }
         }
@@ -239,12 +257,10 @@ impl Table {
                 // for the table's lifetime.
                 let dirfd = self.flush_commit(*work)?;
                 if let Some(fd) = dirfd {
-                    let ok = if sync_dir {
-                        fsync_eintr(fd).is_ok()
-                    } else {
-                        true
-                    };
-                    unsafe { libc::close(fd); }
+                    let ok = if sync_dir { fsync_eintr(fd).is_ok() } else { true };
+                    unsafe {
+                        libc::close(fd);
+                    }
                     if !ok {
                         return Err(StorageError::Io);
                     }
@@ -355,9 +371,17 @@ impl Table {
 
         let dirfd = self.open_dirfd()?;
         let res = shard_file::write_shard_streaming(
-            dirfd, &name_c, self.table_id, run.count as u32, &run.regions(), false, 0,
+            dirfd,
+            &name_c,
+            self.table_id,
+            run.count as u32,
+            &run.regions(),
+            false,
+            0,
         );
-        unsafe { libc::close(dirfd); }
+        unsafe {
+            libc::close(dirfd);
+        }
         res?; // Write failed: heap still owns `run`; no on-disk residue.
 
         let final_full = format!("{}/{}", self.directory, shard_name);

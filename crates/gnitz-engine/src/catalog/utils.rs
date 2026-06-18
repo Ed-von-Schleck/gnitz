@@ -92,7 +92,9 @@ fn has_numeric_id(s: &str) -> bool {
 /// unreadable — both mean "nothing to scan" for the orphan sweep. Non-directory
 /// entries are skipped.
 pub(crate) fn subdir_names(path: &str) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(path) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Vec::new();
+    };
     entries
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
@@ -105,7 +107,9 @@ pub(crate) fn subdir_names(path: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ingest_batch_into(table: &mut Table, batch: &Batch) {
-    if batch.count == 0 { return; }
+    if batch.count == 0 {
+        return;
+    }
     let _ = table.ingest_owned_batch(batch.clone_batch());
 }
 
@@ -116,7 +120,9 @@ pub(crate) fn ingest_batch_into(table: &mut Table, batch: &Batch) {
 /// Read a u64 from a cursor column. `logical_col` is the schema column index.
 pub(crate) fn cursor_read_u64(cursor: &CursorHandle, logical_col: usize) -> u64 {
     let ptr = cursor.cursor.col_ptr(logical_col, 8);
-    if ptr.is_null() { return 0; }
+    if ptr.is_null() {
+        return 0;
+    }
     let slice = unsafe { std::slice::from_raw_parts(ptr, 8) };
     u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]))
 }
@@ -124,9 +130,12 @@ pub(crate) fn cursor_read_u64(cursor: &CursorHandle, logical_col: usize) -> u64 
 /// Read a German string from a cursor column. `logical_col` is the schema column index.
 pub(crate) fn cursor_read_string(cursor: &CursorHandle, logical_col: usize) -> String {
     let ptr = cursor.cursor.col_ptr(logical_col, 16);
-    if ptr.is_null() { return String::new(); }
+    if ptr.is_null() {
+        return String::new();
+    }
     let st: [u8; 16] = unsafe { std::slice::from_raw_parts(ptr, 16) }
-        .try_into().unwrap_or([0; 16]);
+        .try_into()
+        .unwrap_or([0; 16]);
     // For out-of-line strings, build a blob slice from the cursor's blob pointer
     let blob_ptr = cursor.cursor.blob_ptr();
     let blob_slice = if !blob_ptr.is_null() {
@@ -182,12 +191,7 @@ pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u
 /// row in the range. Used for U64-PK system tables where rows belonging to one
 /// owner share a packed PK prefix (e.g. `sys_columns` keyed by
 /// `pack_column_id(owner, col)`).
-pub(crate) fn retract_rows_in_pk_range(
-    table: &Table,
-    schema: &SchemaDescriptor,
-    start: u128,
-    pk_end: u128,
-) -> Batch {
+pub(crate) fn retract_rows_in_pk_range(table: &Table, schema: &SchemaDescriptor, start: u128, pk_end: u128) -> Batch {
     let mut batch = Batch::with_schema(*schema, 8);
     let mut cursor = table.open_cursor();
     // U64-PK system table: OPK == big-endian; the native-value range
@@ -206,7 +210,9 @@ pub(crate) fn retract_rows_in_pk_range(
 
     // Row-at-a-time fallback for multi-source cursors.
     while cursor.cursor.valid {
-        if cursor.cursor.current_key >= pk_end { break; }
+        if cursor.cursor.current_key >= pk_end {
+            break;
+        }
         if cursor.cursor.current_weight > 0 {
             cursor.cursor.copy_current_row_into(&mut batch, -1);
         }
@@ -234,4 +240,3 @@ pub(crate) fn retract_rows_by_view(table: &Table, schema: &SchemaDescriptor, vie
     }
     batch
 }
-

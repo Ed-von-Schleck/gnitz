@@ -8,8 +8,8 @@ use std::cmp::Ordering;
 
 use proptest::prelude::*;
 
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::schema::key::{compare_pk_bytes, encode_order_preserving_pk};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, ConsolidatedBatch};
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
@@ -30,8 +30,7 @@ pub(crate) fn wide_pk_3xu64_schema() -> SchemaDescriptor {
 /// column (`pk_indices = 0..n`) and no payload — the generic PK-shape builder
 /// for the OPK encode/compare/route tests.
 pub(crate) fn pk_only_schema(types: &[u8]) -> SchemaDescriptor {
-    let cols: Vec<SchemaColumn> =
-        types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
+    let cols: Vec<SchemaColumn> = types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
     let pk: Vec<u32> = (0..types.len() as u32).collect();
     SchemaDescriptor::new(&cols, &pk)
 }
@@ -67,10 +66,7 @@ pub(crate) fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
 /// scattering scrambled bytes past a test's self-referential checks. Equal PKs
 /// with differing payloads are allowed (multiset deltas), so only a strictly
 /// *decreasing* PK is rejected.
-pub(crate) fn make_wide_batch(
-    schema: &SchemaDescriptor,
-    rows: &[(u64, u64, u64, i64, i64)],
-) -> ConsolidatedBatch {
+pub(crate) fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i64)]) -> ConsolidatedBatch {
     let mut b = Batch::with_schema(*schema, rows.len().max(1));
     for &(c0, c1, c2, w, val) in rows {
         b.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
@@ -188,7 +184,5 @@ pub(crate) fn arb_type_code() -> impl Strategy<Value = u8> {
 /// integer scalars: U8..U64, I8..I64, U128, I128, UUID — STRING / BLOB / float
 /// are rejected by `SchemaDescriptor::new`).
 pub(crate) fn arb_pk_type() -> impl Strategy<Value = u8> {
-    arb_type_code().prop_filter("type code must be PK-eligible", |&tc| {
-        gnitz_wire::is_pk_eligible(tc)
-    })
+    arb_type_code().prop_filter("type code must be PK-eligible", |&tc| gnitz_wire::is_pk_eligible(tc))
 }

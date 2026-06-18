@@ -40,7 +40,10 @@ pub(crate) struct HeapNode {
 /// field is unused for sentinels — discrimination is on `source_idx` alone.
 const SENTINEL: u32 = u32::MAX;
 
-const SENTINEL_NODE: HeapNode = HeapNode { source_idx: SENTINEL, row: 0 };
+const SENTINEL_NODE: HeapNode = HeapNode {
+    source_idx: SENTINEL,
+    row: 0,
+};
 
 pub(crate) struct LoserTree {
     /// `tree[0]` is the overall champion. `tree[1..tree.len()]` hold the
@@ -82,7 +85,10 @@ impl LoserTree {
         let mut winners = vec![SENTINEL_NODE; 2 * n_pad];
         for i in 0..n {
             if let Some(row) = init_fn(i) {
-                winners[n_pad + i] = HeapNode { source_idx: i as u32, row };
+                winners[n_pad + i] = HeapNode {
+                    source_idx: i as u32,
+                    row,
+                };
             }
         }
 
@@ -96,7 +102,11 @@ impl LoserTree {
                 (true, _) => (b, a),
                 (_, true) => (a, b),
                 (false, false) => {
-                    if less(&a, &b) { (a, b) } else { (b, a) }
+                    if less(&a, &b) {
+                        (a, b)
+                    } else {
+                        (b, a)
+                    }
                 }
             };
             winners[idx] = winner;
@@ -131,12 +141,7 @@ impl LoserTree {
     /// `inline(always)` so the closure flattens into the public-API
     /// callers; a hot path with one cmp per level cannot afford a call.
     #[inline(always)]
-    fn walk_up(
-        &mut self,
-        mut cur: HeapNode,
-        mut idx: usize,
-        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
-    ) -> HeapNode {
+    fn walk_up(&mut self, mut cur: HeapNode, mut idx: usize, less: &impl Fn(&HeapNode, &HeapNode) -> bool) -> HeapNode {
         while idx > 0 {
             // SAFETY: idx < tree.len() on entry from every caller
             // (`(tree.len() + s) >> 1` with `s < n ≤ tree.len()`,
@@ -154,14 +159,13 @@ impl LoserTree {
     /// larger or smaller than the prior one; the loser tree handles either
     /// correctly (no monotonicity precondition) since `less` re-reads the bytes.
     #[inline]
-    pub fn replace_top(
-        &mut self,
-        new_row: u32,
-        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
-    ) {
+    pub fn replace_top(&mut self, new_row: u32, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
         debug_assert!(!self.is_empty(), "replace_top on empty tree");
         let source_idx = self.tree[0].source_idx;
-        let cur = HeapNode { source_idx, row: new_row };
+        let cur = HeapNode {
+            source_idx,
+            row: new_row,
+        };
         let idx = (self.tree.len() + source_idx as usize) >> 1;
         self.tree[0] = self.walk_up(cur, idx, less);
     }
@@ -170,10 +174,7 @@ impl LoserTree {
     /// new champion (if any) is at `tree[0]`; otherwise `is_empty()`
     /// returns true.
     #[inline]
-    pub fn pop_top(
-        &mut self,
-        less: &impl Fn(&HeapNode, &HeapNode) -> bool,
-    ) {
+    pub fn pop_top(&mut self, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
         debug_assert!(!self.is_empty(), "pop_top on empty tree");
         let source_idx = self.tree[0].source_idx;
         let mut cur = SENTINEL_NODE;
@@ -236,8 +237,7 @@ pub(crate) fn drive_merge<ADV, SP, EQ, W, EM>(
     mut eq_payload: EQ,
     mut weight: W,
     mut emit: EM,
-)
-where
+) where
     ADV: FnMut(usize) -> Option<u32>,
     SP: FnMut(usize, usize, usize, usize) -> bool,
     EQ: FnMut(usize, usize, usize, usize) -> bool,
@@ -261,7 +261,9 @@ where
     }
 
     loop {
-        if heap.is_empty() { return; }
+        if heap.is_empty() {
+            return;
+        }
 
         let (group_src, group_row) = {
             let top = heap.peek();
@@ -285,18 +287,14 @@ where
                 let top = heap.peek();
                 (top.source_idx as usize, top.row as usize)
             };
-            if !same_pk(group_src, group_row, cur_src, cur_row)
-                || !eq_payload(group_src, group_row, cur_src, cur_row)
-            {
+            if !same_pk(group_src, group_row, cur_src, cur_row) || !eq_payload(group_src, group_row, cur_src, cur_row) {
                 break;
             }
             net_weight += weight(cur_src, cur_row);
             step(heap, &less, cur_src, &mut advance);
         }
 
-        if net_weight != 0
-            && emit(group_src, group_row, net_weight).is_break()
-        {
+        if net_weight != 0 && emit(group_src, group_row, net_weight).is_break() {
             return;
         }
     }
@@ -335,7 +333,10 @@ mod tests {
         let less = run_less(runs);
         let mut out = Vec::new();
         while !t.is_empty() {
-            let (src, row) = { let n = t.peek(); (n.source_idx as usize, n.row as usize) };
+            let (src, row) = {
+                let n = t.peek();
+                (n.source_idx as usize, n.row as usize)
+            };
             out.push(runs[src][row]);
             if row + 1 < runs[src].len() {
                 t.replace_top((row + 1) as u32, &less);
@@ -560,7 +561,7 @@ mod tests {
             vec![1, 4, 7, 10, 13],
             vec![2, 5, 8, 11, 14],
             vec![3, 6, 9, 12, 15],
-            vec![],                // exhausted source
+            vec![], // exhausted source
             vec![0, 100, 200],
         ];
         let mut expected: Vec<u128> = runs.iter().flatten().copied().collect();
@@ -600,7 +601,8 @@ mod tests {
                 let mut expected: Vec<u128> = runs.iter().flatten().copied().collect();
                 expected.sort();
                 assert_eq!(
-                    drain_keys(&runs, build_runs(&runs)), expected,
+                    drain_keys(&runs, build_runs(&runs)),
+                    expected,
                     "k={k}, seed={seed}, runs={runs:?}"
                 );
             }
@@ -617,8 +619,20 @@ mod tests {
         // Two 24-byte keys sharing their low-16 (1,1) prefix, differing past
         // byte 16. The node `row` indexes this table (one row per source).
         let full: [[u8; 24]; 2] = [
-            { let mut k = [0u8; 24]; k[0] = 1; k[8] = 1; k[16] = 100; k },
-            { let mut k = [0u8; 24]; k[0] = 1; k[8] = 1; k[16] = 200; k },
+            {
+                let mut k = [0u8; 24];
+                k[0] = 1;
+                k[8] = 1;
+                k[16] = 100;
+                k
+            },
+            {
+                let mut k = [0u8; 24];
+                k[0] = 1;
+                k[8] = 1;
+                k[16] = 200;
+                k
+            },
         ];
         let byte_less = |a: &HeapNode, b: &HeapNode| {
             full[a.row as usize][..].cmp(&full[b.row as usize][..]) == std::cmp::Ordering::Less
@@ -630,8 +644,11 @@ mod tests {
             order.push(t.peek().row);
             t.pop_top(&byte_less);
         }
-        assert_eq!(order, vec![0, 1],
-            "prefix-colliding wide PKs must order by full bytes via `less`");
+        assert_eq!(
+            order,
+            vec![0, 1],
+            "prefix-colliding wide PKs must order by full bytes via `less`"
+        );
     }
 
     /// A real `u128::MAX` key is a value, not the exhausted-source sentinel —

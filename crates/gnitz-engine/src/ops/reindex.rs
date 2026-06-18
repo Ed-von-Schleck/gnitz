@@ -6,9 +6,9 @@
 //! arity and width. `ReindexPacker` / `german_string_promote_key` are per-row;
 //! they stay `#[inline]` and monomorphic so producer and consumer keys agree.
 
-use crate::schema::{ColumnLocator, SchemaDescriptor, type_code};
-use crate::storage::{Batch, MemBatch};
 use crate::foundation::xxh;
+use crate::schema::{type_code, ColumnLocator, SchemaDescriptor};
+use crate::storage::{Batch, MemBatch};
 
 /// Set every row's PK to a hash of its full payload content. Identical row
 /// content (including null pattern and string/blob bytes) yields an identical
@@ -45,7 +45,9 @@ pub(super) fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch
             for (pi, _ci, col) in out_schema.payload_columns() {
                 let is_null = (null_word >> pi) & 1 != 0;
                 hasher.update(&[is_null as u8]);
-                if is_null { continue; }
+                if is_null {
+                    continue;
+                }
                 if gnitz_wire::is_german_string(col.type_code) {
                     let sb = mb.get_col_ptr(row, pi, 16);
                     super::util::hash_german_string_content(&mut hasher, sb, mb.blob);
@@ -77,7 +79,7 @@ pub(super) fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch
 pub(super) fn german_string_promote_key(struct_bytes: &[u8], blob: &[u8]) -> u128 {
     let content = crate::schema::german_string_content(struct_bytes, blob);
     if content.is_empty() {
-        return 0;                 // NULL / empty-string sentinel
+        return 0; // NULL / empty-string sentinel
     }
     // A true 128-bit content hash: both the trace side (PkPromoter::read_string)
     // and the delta scatter (route_partition_key) call this, so they agree by
@@ -120,8 +122,15 @@ enum PromoteKind {
 impl PkPromoter {
     pub(super) fn new(schema: &SchemaDescriptor, col_idx: usize) -> Self {
         let kind = match schema.locate(col_idx) {
-            ColumnLocator::Pk { byte_off, size, type_code } =>
-                PromoteKind::Pk { off: byte_off as usize, cs: size as usize, tc: type_code },
+            ColumnLocator::Pk {
+                byte_off,
+                size,
+                type_code,
+            } => PromoteKind::Pk {
+                off: byte_off as usize,
+                cs: size as usize,
+                tc: type_code,
+            },
             ColumnLocator::Payload { slot, size, type_code } => {
                 let pi = slot as usize;
                 match type_code {
@@ -134,7 +143,11 @@ impl PkPromoter {
                     // value (sign-flip for signed integers), matching
                     // extract_col_key's payload arm. Float bit patterns OPK-encode
                     // as their unsigned image.
-                    _ => PromoteKind::Narrow { pi, cs: size as usize, tc: type_code },
+                    _ => PromoteKind::Narrow {
+                        pi,
+                        cs: size as usize,
+                        tc: type_code,
+                    },
                 }
             }
         };
@@ -161,10 +174,10 @@ impl PkPromoter {
     #[inline]
     pub(super) fn promote(&self, batch: &MemBatch, row: usize) -> u128 {
         match self.kind {
-            PromoteKind::Pk { off, cs, .. } =>
-                crate::schema::pk_route_key(batch.get_pk_bytes(row), off, cs),
-            PromoteKind::Narrow { pi, cs, tc } =>
-                crate::schema::payload_route_key(batch.get_col_ptr(row, pi, cs), 0, cs, tc),
+            PromoteKind::Pk { off, cs, .. } => crate::schema::pk_route_key(batch.get_pk_bytes(row), off, cs),
+            PromoteKind::Narrow { pi, cs, tc } => {
+                crate::schema::payload_route_key(batch.get_col_ptr(row, pi, cs), 0, cs, tc)
+            }
             PromoteKind::Wide { pi } => Self::read_wide(batch, pi, row),
             PromoteKind::String { pi } => Self::read_string(batch, pi, row),
         }
@@ -243,8 +256,12 @@ struct ColPromoter {
 }
 
 impl ColPromoter {
-    const PLACEHOLDER: ColPromoter =
-        ColPromoter { out_off: 0, out_size: 0, target_tc: 0, kind: PromoteKind::Wide { pi: 0 } };
+    const PLACEHOLDER: ColPromoter = ColPromoter {
+        out_off: 0,
+        out_size: 0,
+        target_tc: 0,
+        kind: PromoteKind::Wide { pi: 0 },
+    };
 
     /// Write this column's `out_size` OPK bytes into `dst` (len == out_size).
     #[inline]
@@ -274,16 +291,13 @@ impl ColPromoter {
                     dst[..pad].fill(0);
                     gnitz_wire::encode_pk_column(batch.get_col_ptr(row, pi, cs), tc, &mut dst[pad..]);
                 } else {
-                    gnitz_wire::encode_pk_column_promoted(
-                        batch.get_col_ptr(row, pi, cs), tc, self.target_tc, dst);
+                    gnitz_wire::encode_pk_column_promoted(batch.get_col_ptr(row, pi, cs), tc, self.target_tc, dst);
                 }
             }
             // U128/UUID are unsigned: OPK == big-endian (out_size == 16).
-            PromoteKind::Wide { pi } =>
-                dst.copy_from_slice(&PkPromoter::read_wide(batch, pi, row).to_be_bytes()),
+            PromoteKind::Wide { pi } => dst.copy_from_slice(&PkPromoter::read_wide(batch, pi, row).to_be_bytes()),
             // Synthetic XXH3 content hash (unsigned U128): OPK == big-endian.
-            PromoteKind::String { pi } =>
-                dst.copy_from_slice(&PkPromoter::read_string(batch, pi, row).to_be_bytes()),
+            PromoteKind::String { pi } => dst.copy_from_slice(&PkPromoter::read_string(batch, pi, row).to_be_bytes()),
         }
     }
 }
@@ -311,8 +325,11 @@ impl ReindexPacker {
         // (exchange.rs) is not covered by `emit_node`'s compile-time guard, so
         // these bounds must hold in release too. Each runs once per packer (out
         // of any row loop) — negligible cost.
-        assert!(reindex_cols.len() <= gnitz_wire::MAX_PK_COLUMNS,
-            "ReindexPacker: {} reindex columns exceed MAX_PK_COLUMNS", reindex_cols.len());
+        assert!(
+            reindex_cols.len() <= gnitz_wire::MAX_PK_COLUMNS,
+            "ReindexPacker: {} reindex columns exceed MAX_PK_COLUMNS",
+            reindex_cols.len()
+        );
         let mut cols = [ColPromoter::PLACEHOLDER; gnitz_wire::MAX_PK_COLUMNS];
         let mut out_off = 0usize;
         for (i, &c) in reindex_cols.iter().enumerate() {
@@ -321,9 +338,12 @@ impl ReindexPacker {
             // fixed `columns` array, so in release it would silently read a zeroed
             // schema slot (wrong key bytes) rather than panic. Hard-assert so a
             // hand-assembled circuit that skips `emit_node`'s guard fails loudly.
-            assert!(col_idx < schema.num_columns(),
-                "ReindexPacker: column index {col_idx} >= num_columns {}", schema.num_columns());
-            let kind = PkPromoter::new(schema, col_idx).kind;       // carries source tc on Pk/Narrow
+            assert!(
+                col_idx < schema.num_columns(),
+                "ReindexPacker: column index {col_idx} >= num_columns {}",
+                schema.num_columns()
+            );
+            let kind = PkPromoter::new(schema, col_idx).kind; // carries source tc on Pk/Narrow
             let src_tc = schema.columns[col_idx].type_code;
             // Carried promotion target (`0` = self-derive); the slot type and width
             // follow `resolve_reindex_type` so the scatter packer and the trace-side
@@ -336,14 +356,26 @@ impl ReindexPacker {
             // slot, so assert the invariant the encoders rely on. (Internal
             // type-system invariant, fully determined by `resolve_reindex_type`
             // — not input-driven, so debug-only is enough.)
-            debug_assert!(out_size >= crate::schema::type_size(src_tc) as usize
-                || !matches!(kind, PromoteKind::Narrow { .. }));
-            cols[i] = ColPromoter { out_off, out_size, target_tc: carried, kind };
+            debug_assert!(
+                out_size >= crate::schema::type_size(src_tc) as usize || !matches!(kind, PromoteKind::Narrow { .. })
+            );
+            cols[i] = ColPromoter {
+                out_off,
+                out_size,
+                target_tc: carried,
+                kind,
+            };
             out_off += out_size;
         }
-        assert!(out_off <= gnitz_wire::MAX_PK_BYTES,
-            "ReindexPacker: packed stride {out_off} exceeds MAX_PK_BYTES");
-        ReindexPacker { cols, num_cols: reindex_cols.len(), out_stride: out_off }
+        assert!(
+            out_off <= gnitz_wire::MAX_PK_BYTES,
+            "ReindexPacker: packed stride {out_off} exceeds MAX_PK_BYTES"
+        );
+        ReindexPacker {
+            cols,
+            num_cols: reindex_cols.len(),
+            out_stride: out_off,
+        }
     }
 
     /// Pack the full `_join_pk` (out_stride OPK bytes) for `row` into `dst`.
@@ -375,11 +407,11 @@ impl ReindexPacker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Batch;
     use crate::test_support::{
-        make_batch_i64pk, make_schema_i64pk_i64, make_schema_pk_u64_payload_blob,
-        make_schema_pk_u64_payload_string, opk_pk,
+        make_batch_i64pk, make_schema_i64pk_i64, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string,
+        opk_pk,
     };
 
     // -----------------------------------------------------------------------
@@ -440,7 +472,11 @@ mod tests {
         let promoter = PkPromoter::new(&schema, 1);
 
         assert_eq!(promoter.promote(&mb, 0), 100u128, "row 0 U32 promote");
-        assert_eq!(promoter.promote(&mb, 1), 200u128, "row 1 U32 promote — wrong col_size corrupts this");
+        assert_eq!(
+            promoter.promote(&mb, 1),
+            200u128,
+            "row 1 U32 promote — wrong col_size corrupts this"
+        );
         assert_eq!(promoter.promote(&mb, 2), 300u128, "row 2 U32 promote");
     }
 
@@ -454,8 +490,16 @@ mod tests {
         let mb = batch.as_mem_batch();
         let promoter = PkPromoter::new(&schema, 1);
 
-        assert_eq!(promoter.promote(&mb, 0), uuid_a, "row 0 UUID promote must keep all 128 bits");
-        assert_eq!(promoter.promote(&mb, 1), uuid_b, "row 1 UUID promote must keep all 128 bits");
+        assert_eq!(
+            promoter.promote(&mb, 0),
+            uuid_a,
+            "row 0 UUID promote must keep all 128 bits"
+        );
+        assert_eq!(
+            promoter.promote(&mb, 1),
+            uuid_b,
+            "row 1 UUID promote must keep all 128 bits"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -508,7 +552,11 @@ mod tests {
         assert_ne!(pk_short, 0);
         assert_ne!(pk_long, 0);
         assert_ne!(pk_short, pk_long);
-        assert_ne!(pk_short >> 64, 0, "short string PK must populate high half via xxh3_128");
+        assert_ne!(
+            pk_short >> 64,
+            0,
+            "short string PK must populate high half via xxh3_128"
+        );
         assert_ne!(pk_long >> 64, 0, "long string PK must populate high half via xxh3_128");
     }
 
@@ -576,8 +624,7 @@ mod tests {
         // (route_key helpers), so promote_into must produce OPK-encoded bytes for
         // both the PK-column (Pk) and payload-column (Narrow) arms.
         let s_schema = make_schema_i64pk_i64();
-        let s_rows: Vec<(i64, i64, i64)> =
-            (-500..500).map(|i| (i, 1, (i * 3 - 7))).collect();
+        let s_rows: Vec<(i64, i64, i64)> = (-500..500).map(|i| (i, 1, (i * 3 - 7))).collect();
         let s_batch = make_batch_i64pk(&s_schema, &s_rows);
         let s_mb = s_batch.as_mem_batch();
 
@@ -585,7 +632,11 @@ mod tests {
         let mut s_out = s_batch.clone_batch();
         s_narrow.promote_into(&s_mb, &mut s_out);
         for row in 0..s_batch.count {
-            assert_eq!(s_out.get_pk(row), s_narrow.promote(&s_mb, row), "row {row} signed narrow");
+            assert_eq!(
+                s_out.get_pk(row),
+                s_narrow.promote(&s_mb, row),
+                "row {row} signed narrow"
+            );
         }
 
         let s_pk = PkPromoter::new(&s_schema, 0);
@@ -607,15 +658,18 @@ mod tests {
         let batch = make_batch_i64pk(&schema, &[(1, 1, -3), (2, 1, 5), (3, 1, -1)]);
         let mb = batch.as_mem_batch();
         let promoter = PkPromoter::new(&schema, 1); // payload col → Narrow arm
-        // Output PK stride is 8 here (single I64 PK), so the synthetic key is the
-        // 8-byte OPK image directly (right-aligned into stride 8 == verbatim).
+                                                    // Output PK stride is 8 here (single I64 PK), so the synthetic key is the
+                                                    // 8-byte OPK image directly (right-aligned into stride 8 == verbatim).
         let mut out = batch.clone_batch();
         promoter.promote_into(&mb, &mut out);
 
         let mut opk = [0u8; 8];
         gnitz_wire::encode_pk_column(&(-3i64).to_le_bytes(), type_code::I64, &mut opk);
         assert_eq!(out.get_pk_bytes(0), &opk[..], "synthetic key must be sign-aware OPK");
-        assert_eq!(opk[0], 0x7F, "OPK leading byte of -3:I64 is 0x7F (sign-flipped), not 0xFF");
+        assert_eq!(
+            opk[0], 0x7F,
+            "OPK leading byte of -3:I64 is 0x7F (sign-flipped), not 0xFF"
+        );
 
         for row in 0..batch.count {
             assert_eq!(out.get_pk(row), promoter.promote(&mb, row), "row {row} narrow signed");
@@ -636,8 +690,8 @@ mod tests {
         let batch = make_batch_i64pk(&schema, &rows);
         let mb = batch.as_mem_batch();
 
-        let promoter_pk = PkPromoter::new(&schema, 0);     // PK column → Pk arm
-        let promoter_narrow = PkPromoter::new(&schema, 1);  // payload column → Narrow arm
+        let promoter_pk = PkPromoter::new(&schema, 0); // PK column → Pk arm
+        let promoter_narrow = PkPromoter::new(&schema, 1); // payload column → Narrow arm
         let mut out_pk = batch.clone_batch();
         let mut out_narrow = batch.clone_batch();
         promoter_pk.promote_into(&mb, &mut out_pk);
@@ -648,14 +702,15 @@ mod tests {
         #[allow(clippy::needless_range_loop)]
         for row in 0..batch.count {
             assert_eq!(
-                out_pk.get_pk_bytes(row), out_narrow.get_pk_bytes(row),
+                out_pk.get_pk_bytes(row),
+                out_narrow.get_pk_bytes(row),
                 "row {}: Pk-arm and Narrow-arm synthetic bytes must match for V={}",
-                row, vals[row],
+                row,
+                vals[row],
             );
             // widen_pk_be of the synthetic bytes equals the sign-aware routing key
             // (what extract_col_key returns for this value).
-            let expect =
-                crate::schema::payload_route_key(&vals[row].to_le_bytes(), 0, 8, type_code::I64);
+            let expect = crate::schema::payload_route_key(&vals[row].to_le_bytes(), 0, 8, type_code::I64);
             assert_eq!(out_pk.get_pk(row), expect, "row {row}: routing key mismatch");
         }
     }
@@ -738,9 +793,9 @@ mod tests {
         b.extend_pk_opk(&schema, &[pk0 as u128, pk1 as u128]);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &iv.to_le_bytes());   // I32 payload (pi 0)
-        b.extend_col(1, &uv.to_le_bytes());   // U128 payload (pi 1)
-        b.extend_col(2, &fv.to_le_bytes());   // F64 payload (pi 2)
+        b.extend_col(0, &iv.to_le_bytes()); // I32 payload (pi 0)
+        b.extend_col(1, &uv.to_le_bytes()); // U128 payload (pi 1)
+        b.extend_col(2, &fv.to_le_bytes()); // F64 payload (pi 2)
         b.count += 1;
         let mb = b.as_mem_batch();
 
@@ -753,15 +808,15 @@ mod tests {
 
         // Expected: each column's OPK bytes concatenated at its offset.
         let mut want = Vec::new();
-        want.extend_from_slice(&pk1.to_be_bytes());          // col1 Pk: BE(pk1) verbatim
+        want.extend_from_slice(&pk1.to_be_bytes()); // col1 Pk: BE(pk1) verbatim
         let mut i32_opk = [0u8; 4];
         gnitz_wire::encode_pk_column(&iv.to_le_bytes(), type_code::I32, &mut i32_opk);
-        want.extend_from_slice(&i32_opk);                    // col2 Narrow: sign-aware OPK
+        want.extend_from_slice(&i32_opk); // col2 Narrow: sign-aware OPK
         assert_eq!(i32_opk[0], 0x7F, "I32 -3 OPK leading byte is sign-flipped (0x7F)");
-        want.extend_from_slice(&uv.to_be_bytes());           // col3 Wide: BE(u128)
+        want.extend_from_slice(&uv.to_be_bytes()); // col3 Wide: BE(u128)
         let mut f64_slot = [0u8; 16];
         f64_slot[8..].copy_from_slice(&fv.to_bits().to_be_bytes()); // high 8 zero-pad, low 8 = BE(bits)
-        want.extend_from_slice(&f64_slot);                   // col4 Narrow float
+        want.extend_from_slice(&f64_slot); // col4 Narrow float
         assert_eq!(&buf[..packer.out_stride], &want[..], "packed compound key bytes");
         // Float slot high pad is zeroed.
         assert_eq!(&buf[28..36], &[0u8; 8], "F64 slot high pad zeroed");
@@ -816,7 +871,8 @@ mod tests {
 
             for row in 0..3 {
                 assert_eq!(
-                    packer_out.get_pk_bytes(row), oracle_out.get_pk_bytes(row),
+                    packer_out.get_pk_bytes(row),
+                    oracle_out.get_pk_bytes(row),
                     "arity-1 col {col} row {row}: packer must byte-match the oracle",
                 );
             }
@@ -828,7 +884,10 @@ mod tests {
         // The float arity-1 case (out_size 16 > cs 8) separately: the packed slot
         // is 8 zero bytes ++ BE(bits), and must byte-match the oracle.
         let schema = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::F64, 0)],
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::F64, 0),
+            ],
             &[0],
         );
         let mut b = Batch::with_schema(schema, 1);
@@ -848,7 +907,11 @@ mod tests {
 
         let mut want = [0u8; 16];
         want[8..].copy_from_slice(&fv.to_bits().to_be_bytes());
-        assert_eq!(packer_out.get_pk_bytes(0), &want[..], "float slot = zero-pad ++ BE(bits)");
+        assert_eq!(
+            packer_out.get_pk_bytes(0),
+            &want[..],
+            "float slot = zero-pad ++ BE(bits)"
+        );
 
         let oracle = PkPromoter::new(&schema, 1);
         let mut oracle_out = make_zeroed_batch(&out_schema, 1);
@@ -873,7 +936,7 @@ mod tests {
         let cols = [2u32, 1u32];
         let rows: &[(u64, i32, u64)] = &[
             (1, -5, 100),
-            (2, 7, 100),       // same col2 as row 0, different col1
+            (2, 7, 100), // same col2 as row 0, different col1
             (3, -5, 200),
             (4, i32::MIN, 0),
         ];
@@ -940,11 +1003,7 @@ mod tests {
         );
         // Non-trivial, high-entropy column values (so a forked hash seed/shift in
         // the wide arm lands on a different bucket with overwhelming probability).
-        let key: [u64; 3] = [
-            0x0102_0304_0506_0708,
-            0xA0B0_C0D0_E0F0_0102,
-            0xdead_beef_cafe_1234,
-        ];
+        let key: [u64; 3] = [0x0102_0304_0506_0708, 0xA0B0_C0D0_E0F0_0102, 0xdead_beef_cafe_1234];
         let mut b = Batch::with_schema(schema, 1);
         b.extend_pk(42u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -1067,11 +1126,7 @@ mod tests {
             ],
             &[0],
         );
-        let rows: &[(i32, i32, u32)] = &[
-            (-5, -5, 7),
-            (i32::MIN, 1, u32::MAX),
-            (42, -1, 0),
-        ];
+        let rows: &[(i32, i32, u32)] = &[(-5, -5, 7), (i32::MIN, 1, u32::MAX), (42, -1, 0)];
         let mut b = Batch::with_schema(schema, rows.len());
         for &(pk, c1, c2) in rows {
             // PK is OPK at rest: encode the I32 PK value.
@@ -1091,7 +1146,10 @@ mod tests {
         let targets = [type_code::I64, type_code::U64];
         let packer = ReindexPacker::new(&schema, &cols, &targets);
         let out_schema = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::I64, 0), SchemaColumn::new(type_code::U64, 0)],
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
             &[0, 1],
         );
         assert_eq!(packer.out_stride, 8 + 8);
@@ -1102,11 +1160,19 @@ mod tests {
             // Slot 0: I32 PK value sign-extended to I64, OPK-encoded.
             let mut want0 = [0u8; 8];
             gnitz_wire::encode_pk_column_promoted(
-                &(pk as i64).to_le_bytes(), type_code::I32, type_code::I64, &mut want0);
+                &(pk as i64).to_le_bytes(),
+                type_code::I32,
+                type_code::I64,
+                &mut want0,
+            );
             // Slot 1: U32 payload zero-extended to U64, OPK-encoded.
             let mut want1 = [0u8; 8];
             gnitz_wire::encode_pk_column_promoted(
-                &(c2 as u64).to_le_bytes()[..4], type_code::U32, type_code::U64, &mut want1);
+                &(c2 as u64).to_le_bytes()[..4],
+                type_code::U32,
+                type_code::U64,
+                &mut want1,
+            );
             let got = out.get_pk_bytes(row);
             assert_eq!(&got[..8], &want0, "row {row} promoted Pk slot (I32→I64)");
             assert_eq!(&got[8..16], &want1, "row {row} promoted Narrow slot (U32→U64)");

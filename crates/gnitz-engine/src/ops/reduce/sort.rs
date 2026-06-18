@@ -3,11 +3,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
-use crate::storage::{
-    Batch, MemBatch,
-    compare_pk_bytes, pk_sort_key, with_payload_cmp,
-    scatter_copy, write_to_batch,
-};
+use crate::storage::{compare_pk_bytes, pk_sort_key, scatter_copy, with_payload_cmp, write_to_batch, Batch, MemBatch};
 
 use super::super::util::cmp_col_window;
 
@@ -27,12 +23,7 @@ pub(super) struct SortDesc {
 }
 
 /// Compare two rows by group columns using pre-computed SortDesc array.
-pub(super) fn compare_by_group_cols(
-    mb: &MemBatch,
-    row_a: usize,
-    row_b: usize,
-    descs: &[SortDesc],
-) -> Ordering {
+pub(super) fn compare_by_group_cols(mb: &MemBatch, row_a: usize, row_b: usize, descs: &[SortDesc]) -> Ordering {
     let a_null_word = mb.get_null_word(row_a);
     let b_null_word = mb.get_null_word(row_b);
 
@@ -91,7 +82,11 @@ pub(super) fn build_sort_descs(
     group_by_cols: &[u32],
 ) -> ([SortDesc; crate::schema::MAX_COLUMNS], usize) {
     let mut arr = [SortDesc {
-        pi: 0, cs: 0, tc: TypeCode::U64, c_idx: 0, pk_off: 0,
+        pi: 0,
+        cs: 0,
+        tc: TypeCode::U64,
+        c_idx: 0,
+        pk_off: 0,
     }; crate::schema::MAX_COLUMNS];
     for (i, &c_idx_u32) in group_by_cols.iter().enumerate() {
         let c_idx = c_idx_u32 as usize;
@@ -102,17 +97,19 @@ pub(super) fn build_sort_descs(
         } else {
             0
         };
-        arr[i] = SortDesc { pi, cs: tc.stride(), tc, c_idx: c_idx as u8, pk_off };
+        arr[i] = SortDesc {
+            pi,
+            cs: tc.stride(),
+            tc,
+            c_idx: c_idx as u8,
+            pk_off,
+        };
     }
     (arr, group_by_cols.len())
 }
 
 /// Argsort delta batch by group columns.
-pub(super) fn argsort_delta(
-    batch: &Batch,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-) -> Vec<u32> {
+pub(super) fn argsort_delta(batch: &Batch, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Vec<u32> {
     let mb = batch.as_mem_batch();
     let n = batch.count;
     if n <= 1 {
@@ -130,7 +127,8 @@ pub(super) fn argsort_delta(
     {
         let ci = group_by_cols[0] as usize;
         let tc = TypeCode::from_validated_u8(schema.columns[ci].type_code);
-        let pi = schema.try_payload_idx(ci)
+        let pi = schema
+            .try_payload_idx(ci)
             .expect("non-PK: guarded by !is_pk_col on the fast-path entry above");
         macro_rules! packed_sort {
             ($T:ty, $stride:expr) => {{
@@ -157,9 +155,7 @@ pub(super) fn argsort_delta(
     let mut indices: Vec<u32> = (0..n as u32).collect();
     let (sort_descs, len) = build_sort_descs(schema, group_by_cols);
     let descs = &sort_descs[..len];
-    indices.sort_unstable_by(|&a, &b| {
-        compare_by_group_cols(&mb, a as usize, b as usize, descs)
-    });
+    indices.sort_unstable_by(|&a, &b| compare_by_group_cols(&mb, a as usize, b as usize, descs));
     indices
 }
 
@@ -176,9 +172,7 @@ pub(super) fn argsort_pk_canonical(mb: &MemBatch) -> Vec<u32> {
     if mb.pk_stride as usize > 16 {
         // pk_sort_key is only a 16-byte prefix here; settle prefix collisions
         // (and order col-major compound keys) with the authoritative walk.
-        idx.sort_unstable_by(|&a, &b| {
-            compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize))
-        });
+        idx.sort_unstable_by(|&a, &b| compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)));
     } else {
         // Order-preserving narrow key: raw `u128` ascending == canonical PK
         // order for unsigned, signed, and compound alike.
@@ -191,12 +185,8 @@ pub(super) fn argsort_pk_canonical(mb: &MemBatch) -> Vec<u32> {
 /// Sort `indices` by `pk_cmp(pks[i], pks[j])`, tie-breaking on `row_cmp`.
 /// Generic over both closure types so the comparator monomorphises and
 /// inlines through `sort_unstable_by` — load-bearing for sort speed.
-fn sort_indices_by_pk_then_row<PkCmp, RowCmp>(
-    indices: &mut [u32],
-    pks: &[u128],
-    pk_cmp: PkCmp,
-    row_cmp: RowCmp,
-) where
+fn sort_indices_by_pk_then_row<PkCmp, RowCmp>(indices: &mut [u32], pks: &[u128], pk_cmp: PkCmp, row_cmp: RowCmp)
+where
     PkCmp: Fn(u128, u128) -> Ordering + Copy,
     RowCmp: Fn(usize, usize) -> Ordering + Copy,
 {
@@ -209,22 +199,18 @@ fn sort_indices_by_pk_then_row<PkCmp, RowCmp>(
 /// Sort `indices` into (PK, payload) order. PK width chooses the primary axis;
 /// `row_cmp` is the payload tiebreak supplied by `with_payload_cmp!`, adapted
 /// here to the 2-arg form the sort helpers expect.
-fn sort_owned_indices<RowCmp>(
-    schema: &SchemaDescriptor,
-    mb: &MemBatch,
-    n: usize,
-    indices: &mut [u32],
-    row_cmp: RowCmp,
-) where
+fn sort_owned_indices<RowCmp>(schema: &SchemaDescriptor, mb: &MemBatch, n: usize, indices: &mut [u32], row_cmp: RowCmp)
+where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
     let row_cmp = |a: usize, b: usize| row_cmp(schema, mb, a, mb, b);
     if schema.pk_is_wide() {
         // Wide: authoritative column walk primary, payload tiebreak.
-        indices.sort_unstable_by(|&a, &b| match compare_pk_bytes(
-            mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
-            Ordering::Equal => row_cmp(a as usize, b as usize),
-            ord => ord,
+        indices.sort_unstable_by(|&a, &b| {
+            match compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
+                Ordering::Equal => row_cmp(a as usize, b as usize),
+                ord => ord,
+            }
         });
     } else {
         // Narrow: order-preserving raw-`u128` key (unsigned/signed/compound),

@@ -1,8 +1,7 @@
 //! Scan trace operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ConsolidatedBatch, DrainGuard, ReadCursor, write_to_batch};
-
+use crate::storage::{write_to_batch, Batch, ConsolidatedBatch, DrainGuard, ReadCursor};
 
 // ---------------------------------------------------------------------------
 // Scan trace (source operator)
@@ -15,11 +14,7 @@ use crate::storage::{Batch, ConsolidatedBatch, DrainGuard, ReadCursor, write_to_
 /// The cursor is left at the next unscanned position.
 ///
 /// `chunk_limit <= 0` means scan everything until cursor exhaustion.
-pub fn op_scan_trace(
-    cursor: &mut ReadCursor,
-    schema: &SchemaDescriptor,
-    chunk_limit: i32,
-) -> ConsolidatedBatch {
+pub fn op_scan_trace(cursor: &mut ReadCursor, schema: &SchemaDescriptor, chunk_limit: i32) -> ConsolidatedBatch {
     let limit = if chunk_limit > 0 { chunk_limit as usize } else { 0 };
     if let Some(batch) = cursor.drain_single_source(limit) {
         return ConsolidatedBatch::new_unchecked(batch);
@@ -49,7 +44,7 @@ pub fn op_scan_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Batch;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
@@ -62,10 +57,7 @@ mod tests {
         )
     }
 
-    fn make_batch(
-        schema: &SchemaDescriptor,
-        rows: &[(u64, i64, i64)],
-    ) -> Batch {
+    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
         for &(pk, w, val) in rows {
@@ -82,14 +74,15 @@ mod tests {
 
     #[test]
     fn test_op_scan_trace_chunked() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
         // 5 rows in trace
-        let trace = Rc::new(make_batch(&schema, &[
-            (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50),
-        ]));
+        let trace = Rc::new(make_batch(
+            &schema,
+            &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 1, 50)],
+        ));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // First scan: chunk_limit=3 → get 3 rows
@@ -109,8 +102,8 @@ mod tests {
 
     #[test]
     fn test_op_scan_trace_empty() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
         let empty = Rc::new(Batch::empty(1, 16));

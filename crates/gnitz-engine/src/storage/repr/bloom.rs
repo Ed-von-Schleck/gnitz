@@ -125,10 +125,7 @@ mod tests {
             bf.add(base | i as u128);
         }
         for i in 0u64..100 {
-            assert!(
-                bf.may_contain(base | i as u128),
-                "false negative for high-bit key {i}"
-            );
+            assert!(bf.may_contain(base | i as u128), "false negative for high-bit key {i}");
         }
     }
 
@@ -162,7 +159,10 @@ mod tests {
             bf.add(i as u128);
         }
         for i in 100u64..110 {
-            assert!(bf.may_contain(i as u128), "false negative after reset+readd for key {i}");
+            assert!(
+                bf.may_contain(i as u128),
+                "false negative after reset+readd for key {i}"
+            );
         }
         // Original keys must not reliably appear (zero bits, near-zero FPR expected).
         let mut fp = 0u32;

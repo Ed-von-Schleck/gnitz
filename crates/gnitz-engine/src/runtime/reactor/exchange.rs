@@ -27,34 +27,40 @@ pub struct ExchangeAccumulator {
 
 struct ExchangeRound {
     payloads: [Option<Batch>; MAX_WORKERS],
-    count:    usize,
-    schema:   Option<SchemaDescriptor>,
+    count: usize,
+    schema: Option<SchemaDescriptor>,
     /// AND of every worker's per-chunk backfill pad bit (`seek_col_idx &
     /// BACKFILL_PAD_BIT`). Starts `true`; a single non-pad worker clears it.
     /// True once the round completes ⇒ every worker is exhausted and this is the
     /// final (all-pad) round. Always `false` for steady-state exchanges (their
     /// `seek_col_idx` is 0); the reactor relay path ignores it.
-    all_pad:  bool,
+    all_pad: bool,
 }
 
 /// One completed exchange ready for relay.  The relay task owns this:
 /// it acquires the catalog read lock + SAL-writer mutex, calls
 /// `MasterDispatcher::relay_exchange`, then releases both.
 pub struct PendingRelay {
-    pub view_id:   i64,
-    pub payloads:  Vec<Option<Batch>>,
-    pub schema:    SchemaDescriptor,
+    pub view_id: i64,
+    pub payloads: Vec<Option<Batch>>,
+    pub schema: SchemaDescriptor,
     pub source_id: i64,
     /// True iff every worker reported a backfill pad for this round (the final,
     /// all-pad round). The boot backfill relay (`collect_acks_and_relay`) reads
     /// this to decide the stop signal; the steady-state relay path ignores it.
-    pub all_pad:   bool,
+    pub all_pad: bool,
 }
 
 impl ExchangeAccumulator {
     pub fn new(nw: usize) -> Self {
-        debug_assert!(nw <= MAX_WORKERS, "ExchangeAccumulator: nw={nw} exceeds MAX_WORKERS={MAX_WORKERS}");
-        ExchangeAccumulator { rounds: FxHashMap::default(), nw }
+        debug_assert!(
+            nw <= MAX_WORKERS,
+            "ExchangeAccumulator: nw={nw} exceeds MAX_WORKERS={MAX_WORKERS}"
+        );
+        ExchangeAccumulator {
+            rounds: FxHashMap::default(),
+            nw,
+        }
     }
 
     /// Accept one FLAG_EXCHANGE reply.  Returns `Some(PendingRelay)` once
@@ -70,9 +76,9 @@ impl ExchangeAccumulator {
 
         let round = self.rounds.entry(key).or_insert_with(|| ExchangeRound {
             payloads: [const { None }; MAX_WORKERS],
-            count:    0,
-            schema:   None,
-            all_pad:  true,
+            count: 0,
+            schema: None,
+            all_pad: true,
         });
 
         round.payloads[w] = decoded.data_batch;
@@ -89,13 +95,22 @@ impl ExchangeAccumulator {
             let schema = match round.schema {
                 Some(s) => s,
                 None => {
-                    crate::gnitz_warn!("exchange: no schema received for (view_id={}, source_id={})",
-                        vid, source_id);
+                    crate::gnitz_warn!(
+                        "exchange: no schema received for (view_id={}, source_id={})",
+                        vid,
+                        source_id
+                    );
                     return None;
                 }
             };
             let payloads: Vec<Option<Batch>> = round.payloads.into_iter().take(nw).collect();
-            Some(PendingRelay { view_id: vid, payloads, schema, source_id, all_pad: round.all_pad })
+            Some(PendingRelay {
+                view_id: vid,
+                payloads,
+                schema,
+                source_id,
+                all_pad: round.all_pad,
+            })
         } else {
             None
         }
@@ -105,8 +120,8 @@ impl ExchangeAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::wire::{DecodedWire, DecodedControl};
     use crate::runtime::sal::FLAG_EXCHANGE;
+    use crate::runtime::wire::{DecodedControl, DecodedWire};
     use crate::schema::SchemaDescriptor;
 
     fn make_wire(view_id: i64, source_id: i64, with_schema: bool) -> DecodedWire {
@@ -123,7 +138,11 @@ mod tests {
                 seek_pk_extra: Vec::new(),
                 block_size: 0,
             },
-            schema: if with_schema { Some(SchemaDescriptor::minimal_u64()) } else { None },
+            schema: if with_schema {
+                Some(SchemaDescriptor::minimal_u64())
+            } else {
+                None
+            },
             data_batch: None,
         }
     }
@@ -141,7 +160,8 @@ mod tests {
     fn complete_round_returns_relay_with_correct_ids() {
         let mut acc = ExchangeAccumulator::new(2);
         assert!(acc.process(0, make_wire(7, 3, true)).is_none());
-        let relay = acc.process(1, make_wire(7, 3, false))
+        let relay = acc
+            .process(1, make_wire(7, 3, false))
             .expect("complete round must return PendingRelay");
         assert_eq!(relay.view_id, 7);
         assert_eq!(relay.source_id, 3);
@@ -170,22 +190,23 @@ mod tests {
         // Every worker padded ⇒ the round is the final all-pad round.
         let mut acc = ExchangeAccumulator::new(2);
         assert!(acc.process(0, make_wire_pad(1, 0, true, true)).is_none());
-        let relay = acc.process(1, make_wire_pad(1, 0, true, false))
+        let relay = acc
+            .process(1, make_wire_pad(1, 0, true, false))
             .expect("round completes");
         assert!(relay.all_pad, "all workers padded ⇒ all_pad");
 
         // A single non-pad worker clears all_pad (backfill must continue).
         let mut acc = ExchangeAccumulator::new(2);
         assert!(acc.process(0, make_wire_pad(2, 0, true, true)).is_none());
-        let relay = acc.process(1, make_wire_pad(2, 0, false, false))
+        let relay = acc
+            .process(1, make_wire_pad(2, 0, false, false))
             .expect("round completes");
         assert!(!relay.all_pad, "a non-pad worker clears all_pad");
 
         // Steady-state exchanges pass seek_col_idx == 0 ⇒ all_pad false.
         let mut acc = ExchangeAccumulator::new(2);
         assert!(acc.process(0, make_wire(3, 0, true)).is_none());
-        let relay = acc.process(1, make_wire(3, 0, false))
-            .expect("round completes");
+        let relay = acc.process(1, make_wire(3, 0, false)).expect("round completes");
         assert!(!relay.all_pad, "steady-state (seek_col_idx==0) ⇒ all_pad false");
     }
 }

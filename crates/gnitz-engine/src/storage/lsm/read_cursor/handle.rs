@@ -2,9 +2,9 @@
 
 use std::rc::Rc;
 
-use super::{create_read_cursor, ReadCursor};
 use super::super::batch::Batch;
 use super::super::shard_reader::MappedShard;
+use super::{create_read_cursor, ReadCursor};
 use crate::schema::SchemaDescriptor;
 
 /// Owns a `ReadCursor`.  Since the cursor now owns its data via `Rc`s in
@@ -20,10 +20,7 @@ impl CursorHandle {
     ///
     /// Convenience wrapper used by test code.
     #[cfg(test)]
-    pub(crate) fn from_owned(
-        snapshots: &[Rc<Batch>],
-        schema: crate::schema::SchemaDescriptor,
-    ) -> CursorHandle {
+    pub(crate) fn from_owned(snapshots: &[Rc<Batch>], schema: crate::schema::SchemaDescriptor) -> CursorHandle {
         create_cursor_from_snapshots(snapshots, &[], schema)
     }
 

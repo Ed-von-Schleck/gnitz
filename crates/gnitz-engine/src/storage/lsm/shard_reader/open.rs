@@ -4,12 +4,12 @@
 
 use std::ffi::CStr;
 
-use crate::foundation::codec::{read_u64_le, read_i64_le};
-use crate::foundation::xxh;
-use super::super::layout::*;
 use super::super::error::StorageError;
+use super::super::layout::*;
 use super::super::xor8;
 use super::{MappedShard, Mmap, RegionView};
+use crate::foundation::codec::{read_i64_le, read_u64_le};
+use crate::foundation::xxh;
 
 impl MappedShard {
     pub fn open(
@@ -76,7 +76,12 @@ impl MappedShard {
             if r_off.saturating_add(r_sz) > file_size {
                 return Err(StorageError::InvalidShard);
             }
-            entries.push(DirEntry { offset: r_off, size: r_sz, checksum: r_cs, encoding });
+            entries.push(DirEntry {
+                offset: r_off,
+                size: r_sz,
+                checksum: r_cs,
+                encoding,
+            });
         }
 
         // Validate checksums
@@ -97,7 +102,10 @@ impl MappedShard {
                         let copy_len = e.size.min(16);
                         value[..copy_len].copy_from_slice(&data[e.offset..e.offset + copy_len]);
                     }
-                    Ok(RegionView::Constant { value, offset: e.offset })
+                    Ok(RegionView::Constant {
+                        value,
+                        offset: e.offset,
+                    })
                 }
                 ENCODING_TWO_VALUE => {
                     let expected_bitvec = count.div_ceil(8);
@@ -107,11 +115,16 @@ impl MappedShard {
                     let value_a = read_i64_le(data, e.offset);
                     let value_b = read_i64_le(data, e.offset + 8);
                     let bitvec_off = e.offset + 16;
-                    Ok(RegionView::TwoValue { value_a, value_b, bitvec_off })
+                    Ok(RegionView::TwoValue {
+                        value_a,
+                        value_b,
+                        bitvec_off,
+                    })
                 }
-                _ => {
-                    Ok(RegionView::Raw { offset: e.offset, size: e.size })
-                }
+                _ => Ok(RegionView::Raw {
+                    offset: e.offset,
+                    size: e.size,
+                }),
             }
         };
 
@@ -128,21 +141,25 @@ impl MappedShard {
         // writer never emits Constant for a wide PK (wide strides stay Raw by
         // construction), so this is defense-in-depth against a corrupt or
         // forged file.
-        if pk_stride as usize > crate::schema::NARROW_PK_MAX_BYTES
-            && !matches!(pk, RegionView::Raw { .. })
-        {
+        if pk_stride as usize > crate::schema::NARROW_PK_MAX_BYTES && !matches!(pk, RegionView::Raw { .. }) {
             return Err(StorageError::InvalidShard);
         }
         // Validate Raw region sizes before the has_ghosts scan (which reads
         // count*8 bytes from the weight region and would panic on undersize).
         if let RegionView::Raw { size, .. } = &weight {
-            if *size < count * 8 { return Err(StorageError::InvalidShard); }
+            if *size < count * 8 {
+                return Err(StorageError::InvalidShard);
+            }
         }
         if let RegionView::Raw { size, .. } = &pk {
-            if *size < count * pk_stride as usize { return Err(StorageError::InvalidShard); }
+            if *size < count * pk_stride as usize {
+                return Err(StorageError::InvalidShard);
+            }
         }
         if let RegionView::Raw { size, .. } = &null_bmp {
-            if *size < count * 8 { return Err(StorageError::InvalidShard); }
+            if *size < count * 8 {
+                return Err(StorageError::InvalidShard);
+            }
         }
 
         // has_ghosts: true only if at least one row actually has weight == 0.
@@ -152,15 +169,9 @@ impl MappedShard {
         // before scatter), so the conservative `Raw => true` caused skip_ghosts
         // to do a full linear scan on every advance for ghost-free shards.
         let has_ghosts = match &weight {
-            RegionView::Raw { offset, .. } => {
-                (0..count).any(|i| read_i64_le(data, offset + i * 8) == 0)
-            }
-            RegionView::Constant { value, .. } => {
-                i64::from_le_bytes(value[..8].try_into().unwrap()) == 0
-            }
-            RegionView::TwoValue { value_a, value_b, .. } => {
-                *value_a == 0 || *value_b == 0
-            }
+            RegionView::Raw { offset, .. } => (0..count).any(|i| read_i64_le(data, offset + i * 8) == 0),
+            RegionView::Constant { value, .. } => i64::from_le_bytes(value[..8].try_into().unwrap()) == 0,
+            RegionView::TwoValue { value_a, value_b, .. } => *value_a == 0 || *value_b == 0,
         };
 
         let mut col_to_payload = Vec::with_capacity(num_cols);
@@ -201,8 +212,7 @@ impl MappedShard {
         // Read the flags byte written at OFF_FLAGS (byte 56). Old v7 shards that
         // predate this field have 0 there (written by vec![0u8; total_size]), so
         // they are conservatively treated as ZSet (not PkUnique).
-        let is_pk_unique = file_size > OFF_FLAGS
-            && (data[OFF_FLAGS] & SHARD_FLAG_PK_UNIQUE != 0);
+        let is_pk_unique = file_size > OFF_FLAGS && (data[OFF_FLAGS] & SHARD_FLAG_PK_UNIQUE != 0);
 
         Ok(MappedShard {
             mmap,

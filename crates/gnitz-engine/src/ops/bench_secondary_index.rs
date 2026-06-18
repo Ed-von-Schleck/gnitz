@@ -22,9 +22,9 @@
 
 use std::time::{Duration, Instant};
 
-use super::index::{AviDesc, GiDesc, GI_GC_BYTES, make_avi_schema, make_gi_schema, op_integrate_with_indexes};
-use super::util::{AVI_AV_BYTES, GroupKeyExtractor, IndexColExtractor, encode_ordered};
-use crate::schema::{MAX_PK_BYTES, SchemaColumn, SchemaDescriptor, TypeCode, type_code};
+use super::index::{make_avi_schema, make_gi_schema, op_integrate_with_indexes, AviDesc, GiDesc, GI_GC_BYTES};
+use super::util::{encode_ordered, GroupKeyExtractor, IndexColExtractor, AVI_AV_BYTES};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::storage::{Batch, Persistence, Table};
 
 const N_ROWS: usize = 500_000;
@@ -85,27 +85,50 @@ fn time<F: FnMut()>(mut f: F) -> Duration {
 }
 
 fn report(index: &str, compose: Duration, build: Duration, sort: Duration, upsert: Duration) {
-    let (c, b, s, u) =
-        (ns_per_row(compose), ns_per_row(build), ns_per_row(sort), ns_per_row(upsert));
+    let (c, b, s, u) = (
+        ns_per_row(compose),
+        ns_per_row(build),
+        ns_per_row(sort),
+        ns_per_row(upsert),
+    );
     let assembly = b - c;
     let total = c + assembly + s + u;
     println!("\n{index} population — per-row cost decomposition ({ITERS}x{N_ROWS} rows):");
     println!("  compose (key only)       {c:7.2} ns/row   {:5.1}%", 100.0 * c / total);
-    println!("  assembly (extend_*)      {assembly:7.2} ns/row   {:5.1}%", 100.0 * assembly / total);
+    println!(
+        "  assembly (extend_*)      {assembly:7.2} ns/row   {:5.1}%",
+        100.0 * assembly / total
+    );
     println!("  sort (into_consolidated) {s:7.2} ns/row   {:5.1}%", 100.0 * s / total);
     println!("  upsert (memtable+bloom)  {u:7.2} ns/row   {:5.1}%", 100.0 * u / total);
     println!("  -----");
-    println!("  sum                      {total:7.2} ns/row   ({:.2} Mrows/s)", 1000.0 / total);
+    println!(
+        "  sum                      {total:7.2} ns/row   ({:.2} Mrows/s)",
+        1000.0 / total
+    );
 }
 
 /// Time `ingest_owned_batch_memonly` alone: rebuild + pre-consolidate the index
 /// batch *outside* the timed region (so `into_consolidated` short-circuits
 /// inside ingest), and create the destination table outside it too.
-fn time_upsert(tmp: &std::path::Path, schema: SchemaDescriptor, base_id: u32, mut build_pre: impl FnMut() -> Batch) -> Duration {
+fn time_upsert(
+    tmp: &std::path::Path,
+    schema: SchemaDescriptor,
+    base_id: u32,
+    mut build_pre: impl FnMut() -> Batch,
+) -> Duration {
     let mut total = Duration::ZERO;
     for i in 0..=ITERS as u32 {
         let pre = build_pre();
-        let mut t = Table::new(tmp.to_str().unwrap(), "u", schema, base_id + i, arena(), Persistence::Ephemeral).unwrap();
+        let mut t = Table::new(
+            tmp.to_str().unwrap(),
+            "u",
+            schema,
+            base_id + i,
+            arena(),
+            Persistence::Ephemeral,
+        )
+        .unwrap();
         let start = Instant::now();
         t.ingest_owned_batch_memonly(pre).unwrap();
         if i > 0 {
@@ -169,9 +192,20 @@ fn secondary_index_bench_gi_decomposition() {
     // Cross-check the layered sum against the real public entry point.
     let mut id = 1000u32;
     let full = time(|| {
-        let mut t = Table::new(tmp.path().to_str().unwrap(), "gi", gi_schema, id, arena(), Persistence::Ephemeral).unwrap();
+        let mut t = Table::new(
+            tmp.path().to_str().unwrap(),
+            "gi",
+            gi_schema,
+            id,
+            arena(),
+            Persistence::Ephemeral,
+        )
+        .unwrap();
         id += 1;
-        let gi = GiDesc { table: &mut t as *mut Table, col_idx: 1 };
+        let gi = GiDesc {
+            table: &mut t as *mut Table,
+            col_idx: 1,
+        };
         op_integrate_with_indexes(&input, None, &schema, Some(&gi), None).unwrap();
         std::hint::black_box(&t);
     });
@@ -201,8 +235,15 @@ fn secondary_index_bench_gi_incremental() {
     let schema = src_schema();
     let gi_schema = make_gi_schema(&schema);
     let tmp = tempfile::tempdir().unwrap();
-    let mut t =
-        Table::new(tmp.path().to_str().unwrap(), "gi_inc", gi_schema, 0, arena(), Persistence::Ephemeral).unwrap();
+    let mut t = Table::new(
+        tmp.path().to_str().unwrap(),
+        "gi_inc",
+        gi_schema,
+        0,
+        arena(),
+        Persistence::Ephemeral,
+    )
+    .unwrap();
 
     let mut pk: u64 = 0;
     let mut write_t = Duration::ZERO;
@@ -226,7 +267,10 @@ fn secondary_index_bench_gi_incremental() {
             pk += 1;
         }
 
-        let gi = GiDesc { table: &mut t as *mut Table, col_idx: 1 };
+        let gi = GiDesc {
+            table: &mut t as *mut Table,
+            col_idx: 1,
+        };
         let w0 = Instant::now();
         op_integrate_with_indexes(&batch, None, &schema, Some(&gi), None).unwrap();
         write_t += w0.elapsed();
@@ -267,9 +311,21 @@ fn secondary_index_bench_gi_incremental() {
     );
     let pct = |d: Duration| 100.0 * d.as_secs_f64() / elapsed.as_secs_f64();
     let nspr = |d: Duration| d.as_nanos() as f64 / rows;
-    println!("    write (integrate)   {:7.1} ns/row   {:5.1}%", nspr(write_t), pct(write_t));
-    println!("    read: cursor open   {:7.1} ns/row   {:5.1}%", nspr(open_t), pct(open_t));
-    println!("    read: prefix seeks  {:7.1} ns/row   {:5.1}%", nspr(seek_t), pct(seek_t));
+    println!(
+        "    write (integrate)   {:7.1} ns/row   {:5.1}%",
+        nspr(write_t),
+        pct(write_t)
+    );
+    println!(
+        "    read: cursor open   {:7.1} ns/row   {:5.1}%",
+        nspr(open_t),
+        pct(open_t)
+    );
+    println!(
+        "    read: prefix seeks  {:7.1} ns/row   {:5.1}%",
+        nspr(seek_t),
+        pct(seek_t)
+    );
 }
 
 #[test]
@@ -283,7 +339,9 @@ fn secondary_index_bench_avi_decomposition() {
     let tmp = tempfile::tempdir().unwrap();
     let extractor = GroupKeyExtractor::new(&schema, &group_by_cols);
     let n = extractor.stride;
-    let avi_pi = schema.try_payload_idx(2).expect("AVI agg col is a payload column by construction");
+    let avi_pi = schema
+        .try_payload_idx(2)
+        .expect("AVI agg col is a payload column by construction");
     let tc = type_code::I64;
 
     // AVI key = group_key_bytes ++ av_encoded(8).
@@ -329,7 +387,15 @@ fn secondary_index_bench_avi_decomposition() {
 
     let mut id = 2000u32;
     let full = time(|| {
-        let mut t = Table::new(tmp.path().to_str().unwrap(), "avi", avi_schema, id, arena(), Persistence::Ephemeral).unwrap();
+        let mut t = Table::new(
+            tmp.path().to_str().unwrap(),
+            "avi",
+            avi_schema,
+            id,
+            arena(),
+            Persistence::Ephemeral,
+        )
+        .unwrap();
         id += 1;
         let avi = AviDesc {
             table: &mut t as *mut Table,
@@ -350,11 +416,7 @@ fn secondary_index_bench_avi_decomposition() {
 /// (`[pk, I64 val]`). `pk_bytes_for(row)` yields the 8-byte LE PK; payload is a
 /// scrambled I64 so the payload tiebreak is exercised. Hashed PKs keep the input
 /// unsorted (real sort work) with occasional folds.
-fn bench_single_pk_sort(
-    label: &str,
-    pk_schema: SchemaDescriptor,
-    pk_bytes_for: impl Fn(usize) -> [u8; 8],
-) {
+fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: impl Fn(usize) -> [u8; 8]) {
     let build = || {
         let mut out = Batch::with_schema(pk_schema, N_ROWS);
         out.sorted = false;
@@ -385,7 +447,10 @@ fn bench_single_pk_sort(
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn secondary_index_bench_single_u64_pk_sort() {
     let schema = SchemaDescriptor::new(
-        &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::I64, 0)],
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
         &[0],
     );
     bench_single_pk_sort("single-U64 PK (fast path)", schema, |row| {
@@ -400,7 +465,10 @@ fn secondary_index_bench_single_u64_pk_sort() {
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn secondary_index_bench_single_i64_pk_sort() {
     let schema = SchemaDescriptor::new(
-        &[SchemaColumn::new(type_code::I64, 0), SchemaColumn::new(type_code::I64, 0)],
+        &[
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
         &[0],
     );
     bench_single_pk_sort("single-I64 PK (OPK path)", schema, |row| {

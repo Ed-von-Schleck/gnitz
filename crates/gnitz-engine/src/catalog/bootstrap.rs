@@ -16,10 +16,16 @@ impl CatalogEngine {
         let create_sys_table = |info: &SysTabInfo| -> Result<Box<Table>, String> {
             let dir = format!("{}/{}", sys_dir, info.subdir);
             let schema = sys_tab_schema(info.id);
-            Table::new(&dir, info.name, schema, info.id as u32, SYS_TABLE_ARENA,
-                       RelationKind::SystemCatalog.persistence())
-                .map(Box::new)
-                .map_err(|e| format!("Failed to create system table '{}': error {}", info.name, e))
+            Table::new(
+                &dir,
+                info.name,
+                schema,
+                info.id as u32,
+                SYS_TABLE_ARENA,
+                RelationKind::SystemCatalog.persistence(),
+            )
+            .map(Box::new)
+            .map_err(|e| format!("Failed to create system table '{}': error {}", info.name, e))
         };
 
         let sys_schemas = create_sys_table(&SYS_TAB_INFOS[0])?;
@@ -124,12 +130,12 @@ impl CatalogEngine {
             for info in SYS_TAB_INFOS {
                 let dir = format!("{}/{}", sys_dir, info.subdir);
                 bb.begin_row(info.id as u128, 1);
-                bb.put_u64(SYSTEM_SCHEMA_ID as u64);  // schema_id
-                bb.put_string(info.name);               // name
-                bb.put_string(&dir);                    // directory
-                bb.put_u64(0);                          // pk_col_idx
-                bb.put_u64(0);                          // created_lsn
-                bb.put_u64(0);                          // flags
+                bb.put_u64(SYSTEM_SCHEMA_ID as u64); // schema_id
+                bb.put_string(info.name); // name
+                bb.put_string(&dir); // directory
+                bb.put_u64(0); // pk_col_idx
+                bb.put_u64(0); // created_lsn
+                bb.put_u64(0); // flags
                 bb.end_row();
             }
             let batch = bb.finish();
@@ -143,76 +149,127 @@ impl CatalogEngine {
 
             // Each entry: (name, type_code, is_nullable).
             #[allow(clippy::type_complexity)]
-            let system_cols: &[(i64, &[(& str, u8, u64)])] = &[
-                (SCHEMA_TAB_ID, &[("schema_id", type_code::U64, 0), ("name", type_code::STRING, 0)]),
-                (TABLE_TAB_ID, &[
-                    ("table_id", type_code::U64, 0), ("schema_id", type_code::U64, 0),
-                    ("name", type_code::STRING, 0), ("directory", type_code::STRING, 0),
-                    ("pk_col_idx", type_code::U64, 0), ("created_lsn", type_code::U64, 0),
-                    ("flags", type_code::U64, 0),
-                ]),
-                (VIEW_TAB_ID, &[
-                    ("view_id", type_code::U64, 0), ("schema_id", type_code::U64, 0),
-                    ("name", type_code::STRING, 0), ("sql_definition", type_code::STRING, 0),
-                    ("cache_directory", type_code::STRING, 0), ("created_lsn", type_code::U64, 0),
-                    ("pk_col_idx", type_code::U64, 0),
-                ]),
-                (COL_TAB_ID, &[
-                    ("column_id", type_code::U64, 0), ("owner_id", type_code::U64, 0),
-                    ("owner_kind", type_code::U64, 0), ("col_idx", type_code::U64, 0),
-                    ("name", type_code::STRING, 0), ("type_code", type_code::U64, 0),
-                    ("is_nullable", type_code::U64, 0), ("fk_table_id", type_code::U64, 0),
-                    ("fk_col_idx", type_code::U64, 0),
-                ]),
-                (IDX_TAB_ID, &[
-                    ("index_id", type_code::U64, 0), ("owner_id", type_code::U64, 0),
-                    ("owner_kind", type_code::U64, 0), ("source_col_idx", type_code::U64, 0),
-                    ("name", type_code::STRING, 0), ("is_unique", type_code::U64, 0),
-                    ("cache_directory", type_code::STRING, 0),
-                ]),
+            let system_cols: &[(i64, &[(&str, u8, u64)])] = &[
+                (
+                    SCHEMA_TAB_ID,
+                    &[("schema_id", type_code::U64, 0), ("name", type_code::STRING, 0)],
+                ),
+                (
+                    TABLE_TAB_ID,
+                    &[
+                        ("table_id", type_code::U64, 0),
+                        ("schema_id", type_code::U64, 0),
+                        ("name", type_code::STRING, 0),
+                        ("directory", type_code::STRING, 0),
+                        ("pk_col_idx", type_code::U64, 0),
+                        ("created_lsn", type_code::U64, 0),
+                        ("flags", type_code::U64, 0),
+                    ],
+                ),
+                (
+                    VIEW_TAB_ID,
+                    &[
+                        ("view_id", type_code::U64, 0),
+                        ("schema_id", type_code::U64, 0),
+                        ("name", type_code::STRING, 0),
+                        ("sql_definition", type_code::STRING, 0),
+                        ("cache_directory", type_code::STRING, 0),
+                        ("created_lsn", type_code::U64, 0),
+                        ("pk_col_idx", type_code::U64, 0),
+                    ],
+                ),
+                (
+                    COL_TAB_ID,
+                    &[
+                        ("column_id", type_code::U64, 0),
+                        ("owner_id", type_code::U64, 0),
+                        ("owner_kind", type_code::U64, 0),
+                        ("col_idx", type_code::U64, 0),
+                        ("name", type_code::STRING, 0),
+                        ("type_code", type_code::U64, 0),
+                        ("is_nullable", type_code::U64, 0),
+                        ("fk_table_id", type_code::U64, 0),
+                        ("fk_col_idx", type_code::U64, 0),
+                    ],
+                ),
+                (
+                    IDX_TAB_ID,
+                    &[
+                        ("index_id", type_code::U64, 0),
+                        ("owner_id", type_code::U64, 0),
+                        ("owner_kind", type_code::U64, 0),
+                        ("source_col_idx", type_code::U64, 0),
+                        ("name", type_code::STRING, 0),
+                        ("is_unique", type_code::U64, 0),
+                        ("cache_directory", type_code::STRING, 0),
+                    ],
+                ),
                 // _view_deps: compound PK (view_id, dep_table_id) at cols [0, 1];
                 // dep_view_id is the only payload. All three columns are
                 // non-nullable U64.
-                (DEP_TAB_ID, &[
-                    ("view_id",      type_code::U64, 0),
-                    ("dep_table_id", type_code::U64, 0),
-                    ("dep_view_id",  type_code::U64, 0),
-                ]),
-                (SEQ_TAB_ID, &[("seq_id", type_code::U64, 0), ("next_val", type_code::U64, 0)]),
+                (
+                    DEP_TAB_ID,
+                    &[
+                        ("view_id", type_code::U64, 0),
+                        ("dep_table_id", type_code::U64, 0),
+                        ("dep_view_id", type_code::U64, 0),
+                    ],
+                ),
+                (
+                    SEQ_TAB_ID,
+                    &[("seq_id", type_code::U64, 0), ("next_val", type_code::U64, 0)],
+                ),
                 // Circuit tables use a real compound PK (view_id: U64, sub: U64)
                 // at cols [0, 1] — two U64 fields, NOT a single synthetic U128 —
                 // matching the actual wire schemas (CIRCUIT_*_COLS in gnitz-wire).
-                (CIRCUIT_NODES_TAB_ID, &[
-                    ("view_id",      type_code::U64,  0), ("sub",          type_code::U64,  0),
-                    ("node_id",      type_code::U64,  0), ("opcode",       type_code::U64,  0),
-                    ("source_table", type_code::U64,  1), ("reindex_col",  type_code::U64,  1),
-                    ("expr_program", type_code::BLOB, 1),
-                ]),
-                (CIRCUIT_EDGES_TAB_ID, &[
-                    ("view_id",  type_code::U64, 0), ("sub",      type_code::U64, 0),
-                    ("dst_node", type_code::U64, 0), ("dst_port", type_code::U64, 0),
-                    ("src_node", type_code::U64, 0),
-                ]),
-                (CIRCUIT_NODE_COLUMNS_TAB_ID, &[
-                    ("view_id",  type_code::U64, 0), ("sub",      type_code::U64, 0),
-                    ("node_id",  type_code::U64, 0), ("kind",     type_code::U64, 0),
-                    ("position", type_code::U64, 0), ("value1",   type_code::U64, 0),
-                    ("value2",   type_code::U64, 0),
-                ]),
+                (
+                    CIRCUIT_NODES_TAB_ID,
+                    &[
+                        ("view_id", type_code::U64, 0),
+                        ("sub", type_code::U64, 0),
+                        ("node_id", type_code::U64, 0),
+                        ("opcode", type_code::U64, 0),
+                        ("source_table", type_code::U64, 1),
+                        ("reindex_col", type_code::U64, 1),
+                        ("expr_program", type_code::BLOB, 1),
+                    ],
+                ),
+                (
+                    CIRCUIT_EDGES_TAB_ID,
+                    &[
+                        ("view_id", type_code::U64, 0),
+                        ("sub", type_code::U64, 0),
+                        ("dst_node", type_code::U64, 0),
+                        ("dst_port", type_code::U64, 0),
+                        ("src_node", type_code::U64, 0),
+                    ],
+                ),
+                (
+                    CIRCUIT_NODE_COLUMNS_TAB_ID,
+                    &[
+                        ("view_id", type_code::U64, 0),
+                        ("sub", type_code::U64, 0),
+                        ("node_id", type_code::U64, 0),
+                        ("kind", type_code::U64, 0),
+                        ("position", type_code::U64, 0),
+                        ("value1", type_code::U64, 0),
+                        ("value2", type_code::U64, 0),
+                    ],
+                ),
             ];
 
             for &(tid, cols) in system_cols {
                 for (i, &(name, tcode, nullable)) in cols.iter().enumerate() {
                     let pk = pack_column_id(tid, i as i64);
                     bb.begin_row(pk as u128, 1);
-                    bb.put_u64(tid as u64);          // owner_id
+                    bb.put_u64(tid as u64); // owner_id
                     bb.put_u64(OWNER_KIND_TABLE as u64); // owner_kind
-                    bb.put_u64(i as u64);            // col_idx
-                    bb.put_string(name);             // name
-                    bb.put_u64(tcode as u64);        // type_code
-                    bb.put_u64(nullable);            // is_nullable
-                    bb.put_u64(0);                   // fk_table_id
-                    bb.put_u64(0);                   // fk_col_idx
+                    bb.put_u64(i as u64); // col_idx
+                    bb.put_string(name); // name
+                    bb.put_u64(tcode as u64); // type_code
+                    bb.put_u64(nullable); // is_nullable
+                    bb.put_u64(0); // fk_table_id
+                    bb.put_u64(0); // fk_col_idx
                     bb.end_row();
                 }
             }
@@ -260,19 +317,27 @@ impl CatalogEngine {
                 match seq_id {
                     SEQ_ID_SCHEMAS => {
                         let next = val + 1;
-                        if next > self.next_schema_id { self.next_schema_id = next; }
+                        if next > self.next_schema_id {
+                            self.next_schema_id = next;
+                        }
                     }
                     SEQ_ID_TABLES => {
                         let next = val + 1;
-                        if next > self.next_table_id { self.next_table_id = next; }
+                        if next > self.next_table_id {
+                            self.next_table_id = next;
+                        }
                     }
                     SEQ_ID_INDICES => {
                         let next = val + 1;
-                        if next > self.next_index_id { self.next_index_id = next; }
+                        if next > self.next_index_id {
+                            self.next_index_id = next;
+                        }
                     }
                     SEQ_ID_PROGRAMS => {
                         let next = val + 1;
-                        if next > self.next_table_id { self.next_table_id = next; }
+                        if next > self.next_table_id {
+                            self.next_table_id = next;
+                        }
                     }
                     _ => {}
                 }
@@ -307,7 +372,9 @@ impl CatalogEngine {
             let dir = format!("{}/{}", sys_dir, info.subdir);
             let qualified = format!("_system.{}", info.name);
             self.caches.entity_by_qname.insert(qualified, info.id);
-            self.caches.entity_by_id.insert(info.id, ("_system".into(), info.name.into()));
+            self.caches
+                .entity_by_id
+                .insert(info.id, ("_system".into(), info.name.into()));
             self.caches.schema_of.insert(info.id, SYSTEM_SCHEMA_ID);
             self.caches.pk_col_of.insert(info.id, PkColList::single(0));
             let schema = sys_tab_schema(info.id);
@@ -343,7 +410,7 @@ impl CatalogEngine {
         self.replay_system_table(SCHEMA_TAB_ID)?;
         self.replay_system_table(TABLE_TAB_ID)?;
         self.replay_system_table(VIEW_TAB_ID)?;
-        self.replay_system_table(COL_TAB_ID)?;   // FK wiring + col_names invalidation
+        self.replay_system_table(COL_TAB_ID)?; // FK wiring + col_names invalidation
         self.replay_system_table(IDX_TAB_ID)?;
         Ok(())
     }
@@ -355,9 +422,9 @@ impl CatalogEngine {
             SCHEMA_TAB_ID | TABLE_TAB_ID | VIEW_TAB_ID | COL_TAB_ID | IDX_TAB_ID => {}
             _ => return Ok(()),
         }
-        let family = SysFamily::from_id(sys_table_id)
-            .expect("from_id covers the match arms above");
-        let table = self.sys_table_mut(sys_table_id)
+        let family = SysFamily::from_id(sys_table_id).expect("from_id covers the match arms above");
+        let table = self
+            .sys_table_mut(sys_table_id)
             .expect("sys_table_mut covers the match arms above");
         let arc = table.full_scan();
         if arc.count > 0 {
@@ -366,11 +433,7 @@ impl CatalogEngine {
         Ok(())
     }
 
-    pub(crate) fn copy_cursor_row_to_batch(
-        &self,
-        cursor: &CursorHandle,
-        batch: &mut Batch,
-    ) {
+    pub(crate) fn copy_cursor_row_to_batch(&self, cursor: &CursorHandle, batch: &mut Batch) {
         cursor.cursor.copy_current_row_into(batch, cursor.cursor.current_weight);
     }
 
@@ -383,9 +446,9 @@ impl CatalogEngine {
     pub fn flush_all_system_tables(&mut self) -> Result<(), String> {
         for info in SYS_TAB_INFOS {
             if let Some(table) = self.sys_table_mut(info.id) {
-                table.flush_durable().map_err(|e| {
-                    format!("boot flush of system table {} failed: {}", info.id, e)
-                })?;
+                table
+                    .flush_durable()
+                    .map_err(|e| format!("boot flush of system table {} failed: {}", info.id, e))?;
             }
         }
         Ok(())

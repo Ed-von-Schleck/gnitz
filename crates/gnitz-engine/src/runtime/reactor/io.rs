@@ -28,21 +28,30 @@ pub(super) struct RecvState {
 
 impl RecvState {
     pub(super) fn new() -> Self {
-        RecvState { hdr_buf: [0; 4], phase: RecvPhase::Header { pos: 0 } }
+        RecvState {
+            hdr_buf: [0; 4],
+            phase: RecvPhase::Header { pos: 0 },
+        }
     }
 
     pub(super) fn advance(&mut self, bytes_received: usize) -> RecvAdvance {
         match &mut self.phase {
             RecvPhase::Header { pos } => {
                 *pos += bytes_received;
-                if *pos < 4 { return RecvAdvance::NeedMore; }
+                if *pos < 4 {
+                    return RecvAdvance::NeedMore;
+                }
                 let payload_len = u32::from_le_bytes(self.hdr_buf) as usize;
-                if payload_len == 0 { return RecvAdvance::Disconnect; }
+                if payload_len == 0 {
+                    return RecvAdvance::Disconnect;
+                }
                 RecvAdvance::HeaderDone
             }
             RecvPhase::Payload { pos, len, .. } => {
                 *pos += bytes_received;
-                if *pos < *len { return RecvAdvance::NeedMore; }
+                if *pos < *len {
+                    return RecvAdvance::NeedMore;
+                }
                 RecvAdvance::MessageDone
             }
         }
@@ -87,7 +96,9 @@ impl RecvState {
     pub(super) fn free_payload(&mut self) {
         if let RecvPhase::Payload { buf, .. } = self.phase {
             if !buf.is_null() {
-                unsafe { libc::free(buf as *mut libc::c_void); }
+                unsafe {
+                    libc::free(buf as *mut libc::c_void);
+                }
             }
             self.phase = RecvPhase::Header { pos: 0 };
         }
@@ -124,5 +135,7 @@ impl Conn {
 }
 
 impl Drop for Conn {
-    fn drop(&mut self) { self.recv_state.free_payload(); }
+    fn drop(&mut self) {
+        self.recv_state.free_payload();
+    }
 }

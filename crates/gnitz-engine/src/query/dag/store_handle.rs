@@ -2,8 +2,8 @@
 //! single inbound target catalog reaches for. The Owned variant drops the
 //! underlying storage on Drop; Borrowed/Partitioned hold non-owning handles.
 
+use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, PartitionedTable, StorageError, Table};
 use std::cell::UnsafeCell;
-use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, Table, PartitionedTable, StorageError};
 
 /// Storage handle of a registered relation. The owned variant drops the
 /// underlying storage on Drop; the Borrowed variant holds a non-owning
@@ -78,7 +78,11 @@ impl StoreHandle {
     pub fn has_pk(&self, key: u128) -> bool {
         let tptr = self.table_ptr();
         unsafe {
-            if !tptr.is_null() { (*tptr).has_pk(key) } else { (*self.ptable_ptr()).has_pk(key) }
+            if !tptr.is_null() {
+                (*tptr).has_pk(key)
+            } else {
+                (*self.ptable_ptr()).has_pk(key)
+            }
         }
     }
 
@@ -164,17 +168,16 @@ impl StoreHandle {
 
     /// Dispatched Phase 3 across all variants. Returns one dirfd per
     /// committed partition.
-    pub fn flush_commit_batch(
-        &mut self,
-        works: Vec<(usize, FlushWork)>,
-    ) -> Result<Vec<libc::c_int>, StorageError> {
+    pub fn flush_commit_batch(&mut self, works: Vec<(usize, FlushWork)>) -> Result<Vec<libc::c_int>, StorageError> {
         let t: &mut Table = match self {
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr },
             StoreHandle::Partitioned(cell) => return cell.get_mut().flush_commit_batch(works),
         };
         let mut out = Vec::with_capacity(works.len());
         for (_, w) in works {
-            if let Some(fd) = t.flush_commit(w)? { out.push(fd); }
+            if let Some(fd) = t.flush_commit(w)? {
+                out.push(fd);
+            }
         }
         Ok(out)
     }

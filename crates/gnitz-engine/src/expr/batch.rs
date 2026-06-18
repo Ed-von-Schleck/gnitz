@@ -8,26 +8,19 @@
 use std::cmp::Ordering;
 
 use super::program::{
-    ExprProgram,
-    EXPR_LOAD_CONST, EXPR_LOAD_PAYLOAD_INT, EXPR_LOAD_PAYLOAD_FLOAT,
-    EXPR_LOAD_PK_UNSIGNED_INT, EXPR_LOAD_PK_SIGNED_INT,
-    EXPR_INT_ADD, EXPR_INT_SUB, EXPR_INT_MUL, EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_NEG,
-    EXPR_UDIV, EXPR_UMOD,
-    EXPR_FLOAT_ADD, EXPR_FLOAT_SUB, EXPR_FLOAT_MUL, EXPR_FLOAT_DIV, EXPR_FLOAT_NEG,
-    EXPR_CMP_EQ, EXPR_CMP_NE, EXPR_CMP_GT, EXPR_CMP_GE, EXPR_CMP_LT, EXPR_CMP_LE,
-    EXPR_UCMP_GT, EXPR_UCMP_GE, EXPR_UCMP_LT, EXPR_UCMP_LE,
-    EXPR_FCMP_EQ, EXPR_FCMP_NE, EXPR_FCMP_GT, EXPR_FCMP_GE, EXPR_FCMP_LT, EXPR_FCMP_LE,
-    EXPR_BOOL_AND, EXPR_BOOL_OR, EXPR_BOOL_NOT,
-    EXPR_IS_NULL, EXPR_IS_NOT_NULL,
-    EXPR_INT_TO_FLOAT, EXPR_UINT_TO_FLOAT,
-    EXPR_COPY_COL, EXPR_EMIT_NULL, EXPR_EMIT,
-    EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LT_CONST, EXPR_STR_COL_LE_CONST,
-    EXPR_STR_COL_EQ_COL, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LE_COL,
-    compare_col_string_vs_const,
+    compare_col_string_vs_const, ExprProgram, EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE,
+    EXPR_CMP_GT, EXPR_CMP_LE, EXPR_CMP_LT, EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_EMIT_NULL, EXPR_FCMP_EQ,
+    EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE, EXPR_FCMP_LT, EXPR_FCMP_NE, EXPR_FLOAT_ADD, EXPR_FLOAT_DIV,
+    EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_SUB, EXPR_INT_ADD, EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_MUL,
+    EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT, EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_CONST,
+    EXPR_LOAD_PAYLOAD_FLOAT, EXPR_LOAD_PAYLOAD_INT, EXPR_LOAD_PK_SIGNED_INT, EXPR_LOAD_PK_UNSIGNED_INT,
+    EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST, EXPR_STR_COL_LT_COL,
+    EXPR_STR_COL_LT_CONST, EXPR_UCMP_GE, EXPR_UCMP_GT, EXPR_UCMP_LE, EXPR_UCMP_LT, EXPR_UDIV, EXPR_UINT_TO_FLOAT,
+    EXPR_UMOD,
 };
-use crate::storage::MemBatch;
-use crate::schema::{compare_german_strings, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::foundation::codec::read_u64_le;
+use crate::schema::{compare_german_strings, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::storage::MemBatch;
 
 pub(in crate::expr) const MORSEL: usize = 256;
 pub(in crate::expr) const NULL_WORDS_PER_REG: usize = MORSEL / 64; // 4
@@ -91,9 +84,7 @@ impl EvalScratch {
 
     /// Split borrows: two shared sources + one mutable destination.
     /// Safety: SSA guarantees d != a and d != b (the debug_assert enforces this).
-    pub(in crate::expr) fn reg3(&mut self, a: usize, b: usize, d: usize, m: usize)
-        -> (&[i64], &[i64], &mut [i64])
-    {
+    pub(in crate::expr) fn reg3(&mut self, a: usize, b: usize, d: usize, m: usize) -> (&[i64], &[i64], &mut [i64]) {
         debug_assert!(d != a && d != b, "reg3: dst aliases src register");
         unsafe {
             let ptr = self.regs.as_mut_ptr();
@@ -106,9 +97,13 @@ impl EvalScratch {
 
     /// Split borrows for null bit words.
     /// Safety: SSA guarantees d != a and d != b.
-    pub(in crate::expr) fn null_words3(&mut self, a: usize, b: usize, d: usize, words: usize)
-        -> (&[u64], &[u64], &mut [u64])
-    {
+    pub(in crate::expr) fn null_words3(
+        &mut self,
+        a: usize,
+        b: usize,
+        d: usize,
+        words: usize,
+    ) -> (&[u64], &[u64], &mut [u64]) {
         debug_assert!(d != a && d != b, "null_words3: dst aliases src register");
         unsafe {
             let ptr = self.null_bits.as_mut_ptr();
@@ -121,10 +116,14 @@ impl EvalScratch {
 
     /// Zero the null bits for one register's morsel region.
     pub(in crate::expr) fn clear_null_reg(&mut self, reg: usize, m: usize) {
-        if self.no_nulls { return; }
+        if self.no_nulls {
+            return;
+        }
         let words = m.div_ceil(64);
         let base = reg * NULL_WORDS_PER_REG;
-        for w in 0..words { self.null_bits[base + w] = 0; }
+        for w in 0..words {
+            self.null_bits[base + w] = 0;
+        }
     }
 }
 
@@ -134,16 +133,24 @@ impl EvalScratch {
 
 /// Propagate binary null: dst_null = a_null | b_null (word-at-a-time).
 fn null_or2(s: &mut EvalScratch, dst: usize, a: usize, b: usize, m: usize) {
-    if s.no_nulls { return; }
+    if s.no_nulls {
+        return;
+    }
     let words = m.div_ceil(64);
     let (na, nb, nd) = s.null_words3(a, b, dst, words);
-    for w in 0..words { nd[w] = na[w] | nb[w]; }
+    for w in 0..words {
+        nd[w] = na[w] | nb[w];
+    }
 }
 
 /// Propagate unary null: dst_null = src_null (word-at-a-time).
 fn null_or1(s: &mut EvalScratch, dst: usize, src: usize, m: usize) {
-    if s.no_nulls { return; }
-    if dst == src { return; }
+    if s.no_nulls {
+        return;
+    }
+    if dst == src {
+        return;
+    }
     let words = m.div_ceil(64);
     let base_s = src * NULL_WORDS_PER_REG;
     let base_d = dst * NULL_WORDS_PER_REG;
@@ -153,15 +160,10 @@ fn null_or1(s: &mut EvalScratch, dst: usize, src: usize, m: usize) {
 }
 
 /// Fill null bits for a physical payload column `pi` into register `di`.
-fn fill_null_bits_pi(
-    s: &mut EvalScratch,
-    di: usize,
-    null_bmp: &[u8],
-    morsel_start: usize,
-    m: usize,
-    pi: usize,
-) {
-    if s.no_nulls { return; }
+fn fill_null_bits_pi(s: &mut EvalScratch, di: usize, null_bmp: &[u8], morsel_start: usize, m: usize, pi: usize) {
+    if s.no_nulls {
+        return;
+    }
     let words = m.div_ceil(64);
     let base = di * NULL_WORDS_PER_REG;
     for w in 0..words {
@@ -187,7 +189,9 @@ fn fill_null_bits_for_resolved(
     m: usize,
     pi_byte: u8,
 ) {
-    if s.no_nulls { return; }
+    if s.no_nulls {
+        return;
+    }
     if pi_byte == PAYLOAD_MAPPING_PK_SENTINEL {
         s.clear_null_reg(di, m);
         return;
@@ -198,14 +202,7 @@ fn fill_null_bits_for_resolved(
 /// Shared BOOL_AND / BOOL_OR word-level 3VL kernel (nullable arm).
 /// `va`/`vb` come from `bool_bits`; `na`/`nb` from `null_bits`.
 /// Writes `bool_bits[dst]` and `null_bits[dst]` at word granularity.
-fn bool_and_or_word_loop(
-    scratch: &mut EvalScratch,
-    dst: usize,
-    ai: usize,
-    bi: usize,
-    m: usize,
-    is_or: bool,
-) {
+fn bool_and_or_word_loop(scratch: &mut EvalScratch, dst: usize, ai: usize, bi: usize, m: usize, is_or: bool) {
     let words = m.div_ceil(64);
     let base_a_n = ai * NULL_WORDS_PER_REG;
     let base_b_n = bi * NULL_WORDS_PER_REG;
@@ -270,7 +267,9 @@ fn pack_to_bool_bits(scratch: &mut EvalScratch, dst: usize, m: usize) {
 /// a BOOL consumer through this path without restructuring their inner loop.
 #[inline]
 fn maybe_pack_bool_bits(scratch: &mut EvalScratch, prog: &ExprProgram, dst: usize, m: usize) {
-    if scratch.no_nulls { return; }
+    if scratch.no_nulls {
+        return;
+    }
     if prog.needs_bool_pack(dst) {
         pack_to_bool_bits(scratch, dst, m);
     }
@@ -280,7 +279,9 @@ fn maybe_pack_bool_bits(scratch: &mut EvalScratch, prog: &ExprProgram, dst: usiz
 /// the string-comparison helpers, which compute results unconditionally for
 /// vectorization and then clear null rows in a post-pass.
 fn zero_null_rows(scratch: &mut EvalScratch, dst: usize, m: usize) {
-    if scratch.no_nulls { return; }
+    if scratch.no_nulls {
+        return;
+    }
     let base_d = dst * MORSEL;
     let base_null = dst * NULL_WORDS_PER_REG;
     let words = m.div_ceil(64);
@@ -328,8 +329,13 @@ fn eval_str_col_vs_const(
     for i in 0..m {
         let off = (morsel_start + i) * 16;
         let s = &col_data[off..off + 16];
-        scratch.regs[base_d + i] =
-            pred(compare_col_string_vs_const(s, blob, const_bytes, const_prefix, const_len)) as i64;
+        scratch.regs[base_d + i] = pred(compare_col_string_vs_const(
+            s,
+            blob,
+            const_bytes,
+            const_prefix,
+            const_len,
+        )) as i64;
     }
     zero_null_rows(scratch, dst, m);
     maybe_pack_bool_bits(scratch, prog, dst, m);
@@ -348,8 +354,7 @@ fn eval_str_col_vs_col(
     pred: impl Fn(Ordering) -> bool,
 ) {
     debug_assert!(
-        pi_byte_a != PAYLOAD_MAPPING_PK_SENTINEL
-            && pi_byte_b != PAYLOAD_MAPPING_PK_SENTINEL,
+        pi_byte_a != PAYLOAD_MAPPING_PK_SENTINEL && pi_byte_b != PAYLOAD_MAPPING_PK_SENTINEL,
         "eval_str_col_vs_col: PK column is never a string",
     );
     fill_null_bits_for_resolved(scratch, dst, mb.null_bmp(), morsel_start, m, pi_byte_a);
@@ -362,7 +367,9 @@ fn eval_str_col_vs_col(
             let mut extra: u64 = 0;
             for i in lo..hi {
                 let row_null = read_u64_le(mb.null_bmp(), (morsel_start + i) * 8);
-                if (row_null >> pi_b) & 1 != 0 { extra |= 1u64 << (i - lo); }
+                if (row_null >> pi_b) & 1 != 0 {
+                    extra |= 1u64 << (i - lo);
+                }
             }
             scratch.null_bits[dst * NULL_WORDS_PER_REG + w] |= extra;
         }
@@ -410,10 +417,13 @@ pub(in crate::expr) fn eval_batch(
     // additionally merge a zero-divisor mask into the destination null word.
     macro_rules! bin_int {
         ($a:expr, $b:expr, $d:expr, $op:ident) => {{
-            let ai = $a as usize; let bi = $b as usize;
+            let ai = $a as usize;
+            let bi = $b as usize;
             {
                 let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
-                for i in 0..m { rd[i] = ra[i].$op(rb[i]); }
+                for i in 0..m {
+                    rd[i] = ra[i].$op(rb[i]);
+                }
             }
             null_or2(scratch, $d, ai, bi, m);
             maybe_pack_bool_bits(scratch, prog, $d, m);
@@ -478,7 +488,8 @@ pub(in crate::expr) fn eval_batch(
     // `body(a, b)` must return `(result: i64, is_zero: bool)`.
     macro_rules! div_like {
         ($a:expr, $b:expr, $d:expr, |$a_i:ident, $b_i:ident| $body:expr) => {{
-            let ai = $a as usize; let bi = $b as usize;
+            let ai = $a as usize;
+            let bi = $b as usize;
             let mut zero_mask = [0u64; NULL_WORDS_PER_REG];
             {
                 let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
@@ -487,24 +498,28 @@ pub(in crate::expr) fn eval_batch(
                     let $b_i = rb[i];
                     let (val, is_zero): (i64, bool) = $body;
                     rd[i] = val;
-                    if is_zero { zero_mask[i / 64] |= 1u64 << (i % 64); }
+                    if is_zero {
+                        zero_mask[i / 64] |= 1u64 << (i % 64);
+                    }
                 }
             }
             null_or2(scratch, $d, ai, bi, m);
             if !scratch.no_nulls {
                 let base_null_d = $d * NULL_WORDS_PER_REG;
                 let words = m.div_ceil(64);
-                for w in 0..words { scratch.null_bits[base_null_d + w] |= zero_mask[w]; }
+                for w in 0..words {
+                    scratch.null_bits[base_null_d + w] |= zero_mask[w];
+                }
             }
             maybe_pack_bool_bits(scratch, prog, $d, m);
         }};
     }
 
     for instr in prog.code.chunks_exact(4) {
-        let op  = instr[0];
+        let op = instr[0];
         let dst = instr[1] as usize;
-        let a1  = instr[2];
-        let a2  = instr[3];
+        let a1 = instr[2];
+        let a2 = instr[3];
 
         match op {
             // ----------------------------------------------------------------
@@ -641,7 +656,9 @@ pub(in crate::expr) fn eval_batch(
             EXPR_LOAD_CONST => {
                 let val: i64 = (a2 << 32) | (a1 & 0xFFFF_FFFF);
                 let base_d = dst * MORSEL;
-                for i in 0..m { scratch.regs[base_d + i] = val; }
+                for i in 0..m {
+                    scratch.regs[base_d + i] = val;
+                }
                 scratch.clear_null_reg(dst, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
@@ -815,7 +832,9 @@ pub(in crate::expr) fn eval_batch(
                 scratch.clear_null_reg(dst, m);
                 let base_d = dst * MORSEL;
                 if pi_byte == PAYLOAD_MAPPING_PK_SENTINEL {
-                    for i in 0..m { scratch.regs[base_d + i] = 0; }
+                    for i in 0..m {
+                        scratch.regs[base_d + i] = 0;
+                    }
                 } else {
                     let pi = pi_byte as usize;
                     let null_bmp = mb.null_bmp();
@@ -831,7 +850,9 @@ pub(in crate::expr) fn eval_batch(
                 scratch.clear_null_reg(dst, m);
                 let base_d = dst * MORSEL;
                 if pi_byte == PAYLOAD_MAPPING_PK_SENTINEL {
-                    for i in 0..m { scratch.regs[base_d + i] = 1; }
+                    for i in 0..m {
+                        scratch.regs[base_d + i] = 1;
+                    }
                 } else {
                     let pi = pi_byte as usize;
                     let null_bmp = mb.null_bmp();
@@ -851,8 +872,7 @@ pub(in crate::expr) fn eval_batch(
                 let base_a = ai * MORSEL;
                 let base_d = dst * MORSEL;
                 for i in 0..m {
-                    scratch.regs[base_d + i] =
-                        f64::to_bits(scratch.regs[base_a + i] as f64) as i64;
+                    scratch.regs[base_d + i] = f64::to_bits(scratch.regs[base_a + i] as f64) as i64;
                 }
                 null_or1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
@@ -864,8 +884,7 @@ pub(in crate::expr) fn eval_batch(
                 let base_a = ai * MORSEL;
                 let base_d = dst * MORSEL;
                 for i in 0..m {
-                    scratch.regs[base_d + i] =
-                        f64::to_bits(scratch.regs[base_a + i] as u64 as f64) as i64;
+                    scratch.regs[base_d + i] = f64::to_bits(scratch.regs[base_a + i] as u64 as f64) as i64;
                 }
                 null_or1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
@@ -874,34 +893,40 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // String comparisons (column vs constant)
             // ----------------------------------------------------------------
-            EXPR_STR_COL_EQ_CONST => eval_str_col_vs_const(
-                scratch, mb, prog, dst, morsel_start, m,
-                a1 as u8, a2 as usize, |o| o == Ordering::Equal,
-            ),
-            EXPR_STR_COL_LT_CONST => eval_str_col_vs_const(
-                scratch, mb, prog, dst, morsel_start, m,
-                a1 as u8, a2 as usize, |o| o == Ordering::Less,
-            ),
-            EXPR_STR_COL_LE_CONST => eval_str_col_vs_const(
-                scratch, mb, prog, dst, morsel_start, m,
-                a1 as u8, a2 as usize, |o| o != Ordering::Greater,
-            ),
+            EXPR_STR_COL_EQ_CONST => {
+                eval_str_col_vs_const(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as usize, |o| {
+                    o == Ordering::Equal
+                })
+            }
+            EXPR_STR_COL_LT_CONST => {
+                eval_str_col_vs_const(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as usize, |o| {
+                    o == Ordering::Less
+                })
+            }
+            EXPR_STR_COL_LE_CONST => {
+                eval_str_col_vs_const(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as usize, |o| {
+                    o != Ordering::Greater
+                })
+            }
 
             // ----------------------------------------------------------------
             // String comparisons (column vs column)
             // ----------------------------------------------------------------
-            EXPR_STR_COL_EQ_COL => eval_str_col_vs_col(
-                scratch, mb, prog, dst, morsel_start, m,
-                a1 as u8, a2 as u8, |o| o == Ordering::Equal,
-            ),
-            EXPR_STR_COL_LT_COL => eval_str_col_vs_col(
-                scratch, mb, prog, dst, morsel_start, m,
-                a1 as u8, a2 as u8, |o| o == Ordering::Less,
-            ),
-            EXPR_STR_COL_LE_COL => eval_str_col_vs_col(
-                scratch, mb, prog, dst, morsel_start, m,
-                a1 as u8, a2 as u8, |o| o != Ordering::Greater,
-            ),
+            EXPR_STR_COL_EQ_COL => {
+                eval_str_col_vs_col(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as u8, |o| {
+                    o == Ordering::Equal
+                })
+            }
+            EXPR_STR_COL_LT_COL => {
+                eval_str_col_vs_col(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as u8, |o| {
+                    o == Ordering::Less
+                })
+            }
+            EXPR_STR_COL_LE_COL => {
+                eval_str_col_vs_col(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as u8, |o| {
+                    o != Ordering::Greater
+                })
+            }
 
             _ => {}
         }

@@ -4,7 +4,7 @@
 //! co-group on the join key. Output schema: `[left_PK, left_payload…, right_payload…]`.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ConsolidatedBatch, ReadCursor, scatter_copy, write_to_batch};
+use crate::storage::{scatter_copy, write_to_batch, Batch, ConsolidatedBatch, ReadCursor};
 
 use super::super::cogroup::{cogroup_intersection, cogroup_left};
 use super::rowwrite::{write_join_row, write_join_row_null_right};
@@ -45,7 +45,9 @@ pub fn op_anti_join_delta_trace(
 
         cogroup_left(consolidated, cursor, |key, range, m| {
             if !m.group_has_positive(key) {
-                for i in range { emit_indices.push(i as u32); }
+                for i in range {
+                    emit_indices.push(i as u32);
+                }
             }
         });
 
@@ -55,10 +57,9 @@ pub fn op_anti_join_delta_trace(
 
         let mb = consolidated.as_mem_batch();
         let blob_cap = mb.blob.len().max(1);
-        let mut output =
-            write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
-                scatter_copy(&mb, &emit_indices, &[], writer);
-            });
+        let mut output = write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
+            scatter_copy(&mb, &emit_indices, &[], writer);
+        });
         // emit_indices ascend (groups visited in key order, ranges ascending),
         // so rows come out in consolidated-delta order: (PK, payload)-sorted.
         output.sorted = true;
@@ -95,7 +96,9 @@ pub fn op_semi_join_delta_trace(
 
         cogroup_intersection(consolidated, cursor, |key, range, m| {
             if m.group_has_positive(key) {
-                for i in range { emit_indices.push(i as u32); }
+                for i in range {
+                    emit_indices.push(i as u32);
+                }
             }
         });
 
@@ -105,10 +108,9 @@ pub fn op_semi_join_delta_trace(
 
         let mb = consolidated.as_mem_batch();
         let blob_cap = mb.blob.len().max(1);
-        let mut output =
-            write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
-                scatter_copy(&mb, &emit_indices, &[], writer);
-            });
+        let mut output = write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
+            scatter_copy(&mb, &emit_indices, &[], writer);
+        });
         output.sorted = true;
         output.consolidated = true;
         ConsolidatedBatch::new_unchecked(output)
@@ -150,10 +152,7 @@ pub fn op_join_delta_trace(
             for i in range.clone() {
                 let w_out = consolidated.get_weight(i).wrapping_mul(w_trace);
                 if w_out != 0 {
-                    write_join_row(
-                        &mut output, &delta_mb, i, c, w_out,
-                        left_schema, right_schema,
-                    );
+                    write_join_row(&mut output, &delta_mb, i, c, w_out, left_schema, right_schema);
                 }
             }
         });
@@ -199,22 +198,25 @@ pub fn op_join_delta_trace_outer(
         let mut matched = false;
         m.for_each_pk_group_row(key, |c| {
             let w_trace = c.current_weight;
-            if w_trace > 0 { matched = true; }
+            if w_trace > 0 {
+                matched = true;
+            }
             for i in range.clone() {
                 let w_out = consolidated.get_weight(i).wrapping_mul(w_trace);
                 if w_out != 0 {
-                    write_join_row(
-                        &mut output, &delta_mb, i, c, w_out,
-                        left_schema, right_schema,
-                    );
+                    write_join_row(&mut output, &delta_mb, i, c, w_out, left_schema, right_schema);
                 }
             }
         });
         if !matched {
             for i in range {
                 write_join_row_null_right(
-                    &mut output, &delta_mb, i, consolidated.get_weight(i),
-                    left_schema, right_schema,
+                    &mut output,
+                    &delta_mb,
+                    i,
+                    consolidated.get_weight(i),
+                    left_schema,
+                    right_schema,
                 );
             }
         }
@@ -230,17 +232,17 @@ pub fn op_join_delta_trace_outer(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_common::*;
+    use super::*;
     use crate::foundation::codec::read_i64_le;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::{Batch, ConsolidatedBatch};
     use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
     #[test]
     fn test_anti_join_dt_basic() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
 
@@ -261,8 +263,8 @@ mod tests {
 
     #[test]
     fn test_semi_join_dt_basic() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
 
@@ -271,9 +273,7 @@ mod tests {
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: pk=1,2,3,4
-        let delta = make_batch(&schema, &[
-            (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40),
-        ]);
+        let delta = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
 
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Only pk=2 and pk=3 have trace matches
@@ -287,8 +287,8 @@ mod tests {
     /// or the scan mislocates and matches/anti-matches are wrong.
     #[test]
     fn test_semi_anti_join_dt_compound_pk() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_compound();
         // Trace (storage order): (1,5) and (2,3).
@@ -313,8 +313,8 @@ mod tests {
     /// u128, so the advance loop must use `current_pk_cmp`.
     #[test]
     fn test_semi_anti_join_dt_signed_pk() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_signed();
         // Trace (signed order): -3, -1.
@@ -337,8 +337,8 @@ mod tests {
 
     #[test]
     fn test_semi_join_dt_nonconsolidated() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
 
@@ -371,8 +371,8 @@ mod tests {
 
     #[test]
     fn test_outer_join_null_fill() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let left_schema = make_schema_u64_i64();
         let right_schema = make_schema_u64_i64();
@@ -394,9 +394,12 @@ mod tests {
         // pk=2: no match, left payload=20, right columns null-filled
         assert_eq!((out.get_pk(1) as u64), 2);
         assert_eq!(get_payload_i64(&out, 1), 20); // left val
-        // Right column (payload col 1) should be null
+                                                  // Right column (payload col 1) should be null
         let null_word = u64::from_le_bytes(out.null_bmp_data()[8..16].try_into().unwrap());
-        assert!(null_word & 2 != 0, "right payload column (bit 1) should be null for non-matching row");
+        assert!(
+            null_word & 2 != 0,
+            "right payload column (bit 1) should be null for non-matching row"
+        );
     }
 
     /// Inner join delta×trace on a narrow (I32, 4-byte) signed PK. Every delta
@@ -404,8 +407,8 @@ mod tests {
     /// (regression guard for the byte-seek path at sub-8-byte stride).
     #[test]
     fn test_join_dt_i32_key_all_match() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let left_schema = make_schema_i32();
         let right_schema = make_schema_i32();
@@ -442,10 +445,7 @@ mod tests {
         // col 0 = left payload, col 1 = right payload (all PKs equal). The sorted
         // flag may be true ONLY if the rows are actually in (left, right) order.
         let pairs: Vec<(i64, i64)> = (0..out.count)
-            .map(|r| (
-                read_i64_le(out.col_data(0), r * 8),
-                read_i64_le(out.col_data(1), r * 8),
-            ))
+            .map(|r| (read_i64_le(out.col_data(0), r * 8), read_i64_le(out.col_data(1), r * 8)))
             .collect();
         let actually_sorted = pairs.windows(2).all(|w| w[0] <= w[1]);
         assert!(
@@ -460,8 +460,8 @@ mod tests {
 
     #[test]
     fn test_anti_join_dt_same_pk_different_payload() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
 
@@ -479,8 +479,8 @@ mod tests {
 
     #[test]
     fn test_semi_join_dt_same_pk_different_payload() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
 
@@ -502,8 +502,8 @@ mod tests {
 
     #[test]
     fn test_semi_join_dt_large_delta_max_pk() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
 
@@ -527,16 +527,14 @@ mod tests {
 
     #[test]
     fn test_semi_join_dt_no_weight_inflation() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
 
         // Trace: 3 entries for PK=1 with different payloads
         // This triggers the trace-has-many scenario
-        let trace = Rc::new(make_batch(&schema, &[
-            (1, 1, 100), (1, 1, 200), (1, 1, 300),
-        ]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100), (1, 1, 200), (1, 1, 300)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: 25 rows — a large delta against a 3-row (same-PK) trace
@@ -546,7 +544,10 @@ mod tests {
 
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Only PK=1 from delta matches — should emit exactly 1 row, not 3
-        assert_eq!(out.count, 1, "PK=1 should appear once, not inflated by trace duplicates");
+        assert_eq!(
+            out.count, 1,
+            "PK=1 should appear once, not inflated by trace duplicates"
+        );
         assert_eq!((out.get_pk(0) as u64), 1);
     }
 
@@ -556,8 +557,8 @@ mod tests {
 
     #[test]
     fn test_anti_join_dt_uncompacted_tombstone_then_live() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
         let schema = make_schema_u64_i64();
         // Trace for PK=1 has two entries (sorted by payload): a tombstone
         // (payload 100, w=-1) then a live row (payload 200, w=+1). Net: PK=1
@@ -571,8 +572,8 @@ mod tests {
 
     #[test]
     fn test_semi_join_dt_uncompacted_tombstone_then_live() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
         let schema = make_schema_u64_i64();
         let trace = Rc::new(make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace], schema);
@@ -583,8 +584,8 @@ mod tests {
 
     #[test]
     fn test_anti_join_dt_duplicate_pk_group() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
         let schema = make_schema_u64_i64();
         // Trace: PK=1 present (positive).
         let trace = Rc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
@@ -601,8 +602,8 @@ mod tests {
 
     #[test]
     fn test_outer_join_uncompacted_no_positive_entry() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
         let left_schema = make_schema_u64_i64();
         let right_schema = make_schema_u64_i64();
         // Trace has a single tombstone entry for PK=1 (w=-1). No positive
@@ -612,7 +613,10 @@ mod tests {
         let delta = make_batch(&left_schema, &[(1, 1, 10)]);
         let out = op_join_delta_trace_outer(&delta, ch.cursor_mut(), &left_schema, &right_schema);
         // Expect: one inner row (w = 1 * -1 = -1) AND one null-extended row (w=+1).
-        assert_eq!(out.count, 2, "inner row for the tombstone + null-fill (no positive match)");
+        assert_eq!(
+            out.count, 2,
+            "inner row for the tombstone + null-fill (no positive match)"
+        );
         let mut weights: Vec<i64> = (0..out.count).map(|i| out.get_weight(i)).collect();
         weights.sort();
         assert_eq!(weights, vec![-1, 1]);
@@ -626,8 +630,8 @@ mod tests {
 
     #[test]
     fn test_outer_join_uncompacted_positive_entry_no_null_fill() {
-        use std::rc::Rc;
         use crate::storage::CursorHandle;
+        use std::rc::Rc;
         let left_schema = make_schema_u64_i64();
         let right_schema = make_schema_u64_i64();
         // Trace for PK=1: a live entry (w=+1) and a tombstone (w=-1). The key
@@ -699,10 +703,13 @@ mod tests {
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 2, 1, 100)]).into_inner());
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
-        let delta_cb = make_wide_batch(&schema, &[
-            (1, 1, 2, 1, 200), // matches trace pk
-            (1, 1, 9, 1, 300), // different pk — must NOT match
-        ]);
+        let delta_cb = make_wide_batch(
+            &schema,
+            &[
+                (1, 1, 2, 1, 200), // matches trace pk
+                (1, 1, 9, 1, 300), // different pk — must NOT match
+            ],
+        );
         let delta = delta_cb.into_inner();
 
         let out = op_join_delta_trace(&delta, ch.cursor_mut(), &schema, &schema);
@@ -804,11 +811,14 @@ mod tests {
 
         // Large c2 differs starting at byte 17 of the OPK key.
         let c2_large = 1u64 << 56;
-        let delta_cb = make_wide_batch(&schema, &[
-            (1, 1, 0,        1, 10),
-            (1, 1, c2_large, 1, 20),
-            (2, 0, 0,        1, 30), // extra row so the delta outnumbers the 1-row trace
-        ]);
+        let delta_cb = make_wide_batch(
+            &schema,
+            &[
+                (1, 1, 0, 1, 10),
+                (1, 1, c2_large, 1, 20),
+                (2, 0, 0, 1, 30), // extra row so the delta outnumbers the 1-row trace
+            ],
+        );
         let delta = delta_cb.into_inner();
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Only (1,1,0) matches the trace.
@@ -826,10 +836,7 @@ mod tests {
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
         // Large delta vs a 1-row trace.
-        let delta_cb = make_wide_batch(&schema, &[
-            (5, 5, 5, 1, 10),
-            (6, 6, 6, 1, 20),
-        ]);
+        let delta_cb = make_wide_batch(&schema, &[(5, 5, 5, 1, 10), (6, 6, 6, 1, 20)]);
         let delta = delta_cb.into_inner();
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Negative-weight trace row must not produce any output.
@@ -863,5 +870,4 @@ mod tests {
         b.consolidated = true;
         ConsolidatedBatch::new_unchecked(b)
     }
-
 }

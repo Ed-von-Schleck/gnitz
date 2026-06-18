@@ -17,27 +17,27 @@ thread_local! {
 
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
-use crate::schema::{pk_native_key, payload_native_key, IndexKeySpec, SchemaColumn};
+use crate::schema::{payload_native_key, pk_native_key, IndexKeySpec, SchemaColumn};
 use gnitz_wire::PkColList;
 
-use crate::runtime::sal::{
-    FLAG_SHUTDOWN, FLAG_DDL_SYNC, FLAG_EXCHANGE, FLAG_EXCHANGE_RELAY, FLAG_PUSH, FLAG_HAS_PK,
-    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE_SAL, FLAG_BACKFILL, FLAG_GATHER,
-    FLAG_UNIQUE_PREFLIGHT, FLAG_TICK, FLAG_FLUSH, SalWriter, pack_gather_cols,
-    unique_preflight_wire_schema,
-    BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, BACKFILL_DECISION_CHECKPOINT,
-};
-use crate::runtime::wire::{self, FLAG_HAS_DATA, FLAG_CONTINUATION, FLAG_SCAN_LAST, WireConflictMode, SchemaWithVersion, DecodedWire, col_names_as_refs, peek_control_block};
-use gnitz_wire::wire_flags_set_conflict_mode;
-use crate::runtime::w2m::{W2mReceiver, W2mSlot};
-use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
-use crate::storage::{Batch, ConsolidatedBatch, PkBuf};
 use crate::ops::{
-    PartitionRouter, RouteMode, op_relay_broadcast,
-    op_repartition_batches_mode, op_relay_scatter_consolidated_mode,
-    worker_for_partition, with_worker_indices, with_broadcast_indices,
+    op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, with_broadcast_indices,
+    with_worker_indices, worker_for_partition, PartitionRouter, RouteMode,
 };
-
+use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
+use crate::runtime::sal::{
+    pack_gather_cols, unique_preflight_wire_schema, SalWriter, BACKFILL_DECISION_CHECKPOINT,
+    BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, FLAG_BACKFILL, FLAG_DDL_SYNC, FLAG_EXCHANGE,
+    FLAG_EXCHANGE_RELAY, FLAG_FLUSH, FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+    FLAG_SEEK_BY_INDEX_RANGE_SAL, FLAG_SHUTDOWN, FLAG_TICK, FLAG_UNIQUE_PREFLIGHT,
+};
+use crate::runtime::w2m::{W2mReceiver, W2mSlot};
+use crate::runtime::wire::{
+    self, col_names_as_refs, peek_control_block, DecodedWire, SchemaWithVersion, WireConflictMode, FLAG_CONTINUATION,
+    FLAG_HAS_DATA, FLAG_SCAN_LAST,
+};
+use crate::storage::{Batch, ConsolidatedBatch, PkBuf};
+use gnitz_wire::wire_flags_set_conflict_mode;
 
 // ---------------------------------------------------------------------------
 // Pipelined validation checks
@@ -74,7 +74,10 @@ struct PipelinedCheck {
 enum P1Label {
     /// FK parent existence. `expected_count` is the number of distinct
     /// non-null parent keys; anything less in the result set is a violation.
-    FkParent { parent_table_id: i64, expected_count: usize },
+    FkParent {
+        parent_table_id: i64,
+        expected_count: usize,
+    },
     /// FK child restrict: a non-empty result set is a violation.
     FkRestrict { child_tid: i64 },
     /// UPSERT PK identification; the result set is captured as the
@@ -180,13 +183,20 @@ impl UniqueFilter {
     }
 
     fn with_cap(cap: usize) -> Self {
-        UniqueFilter { values: FxHashSet::default(), cap, capped: false, warm: false }
+        UniqueFilter {
+            values: FxHashSet::default(),
+            cap,
+            capped: false,
+            warm: false,
+        }
     }
 
     /// On overflow the set is cleared WHOLE, never truncated: a partial set
     /// would prove "absent" for a present key — a uniqueness hole.
     fn insert(&mut self, key: PkBuf) {
-        if self.capped { return; }
+        if self.capped {
+            return;
+        }
         self.values.insert(key);
         if self.values.len() > self.cap {
             self.values = FxHashSet::default();
@@ -241,17 +251,19 @@ struct UniqueIndexDesc {
 /// state by stopping the walk once the filter caps. A row with a NULL in any
 /// indexed column is skipped (`key_bytes` → false), sharing the NULL-distinct
 /// key contract with the CREATE-time validator and the projection.
-fn extract_into_filter(
-    filter: &mut UniqueFilter,
-    batch: &crate::storage::MemBatch<'_>,
-    spec: &IndexKeySpec,
-) {
+fn extract_into_filter(filter: &mut UniqueFilter, batch: &crate::storage::MemBatch<'_>, spec: &IndexKeySpec) {
     let mut keybuf = PkBuf::empty(0);
     for row in 0..batch.count {
-        if batch.get_weight(row) <= 0 { continue; }
-        if !spec.key_bytes(batch, row, &mut keybuf) { continue; }
+        if batch.get_weight(row) <= 0 {
+            continue;
+        }
+        if !spec.key_bytes(batch, row, &mut keybuf) {
+            continue;
+        }
         filter.insert(keybuf);
-        if filter.capped { return; } // stop walking once the filter caps
+        if filter.capped {
+            return;
+        } // stop walking once the filter caps
     }
 }
 
@@ -305,7 +317,6 @@ pub struct MasterDispatcher {
 // Safety: MasterDispatcher is single-threaded (master process event loop).
 unsafe impl Send for MasterDispatcher {}
 
-
 mod dispatch;
 mod preflight;
 mod unique_filter;
@@ -320,30 +331,24 @@ pub(crate) use preflight::PreflightAccumulator;
 /// Return the first `worker N: <op>: <msg>` error in `decoded` (worker-index
 /// order), or `None` if every reply has status 0. Shared by every fan-out
 /// site that emits per-worker req_ids and decodes their replies in order.
-pub(crate) fn first_worker_error(op: &str, decoded: &[DecodedWire])
-    -> Option<String>
-{
+pub(crate) fn first_worker_error(op: &str, decoded: &[DecodedWire]) -> Option<String> {
     worker_error_scan(op, decoded.iter().enumerate())
 }
 
 /// Variant of `first_worker_error` for the `Vec<Option<DecodedWire>>` slot
 /// shape produced by `join_into`. Slots are guaranteed `Some` after the
 /// future resolves; an unfilled slot indicates a bug in the join driver.
-pub(crate) fn first_worker_error_opt(op: &str, decoded: &[Option<DecodedWire>])
-    -> Option<String>
-{
+pub(crate) fn first_worker_error_opt(op: &str, decoded: &[Option<DecodedWire>]) -> Option<String> {
     worker_error_scan(
         op,
-        decoded.iter().enumerate().map(|(w, d)| {
-            (w, d.as_ref().expect("join_into left a None slot — logic bug"))
-        }),
+        decoded
+            .iter()
+            .enumerate()
+            .map(|(w, d)| (w, d.as_ref().expect("join_into left a None slot — logic bug"))),
     )
 }
 
-fn worker_error_scan<'a>(
-    op: &str,
-    it: impl Iterator<Item = (usize, &'a DecodedWire)>,
-) -> Option<String> {
+fn worker_error_scan<'a>(op: &str, it: impl Iterator<Item = (usize, &'a DecodedWire)>) -> Option<String> {
     for (w, d) in it {
         if d.control.status != 0 {
             let msg = String::from_utf8_lossy(&d.control.error_msg);
@@ -388,7 +393,9 @@ where
     // drain scope (never a bare `_`, which would drop it immediately and
     // re-open the wedge).
     let mut scan_ids = [0u32; crate::runtime::sal::MAX_WORKERS];
-    for (d, &s) in scan_ids[..nw].iter_mut().zip(&req_ids[..nw]) { *d = s as u32; }
+    for (d, &s) in scan_ids[..nw].iter_mut().zip(&req_ids[..nw]) {
+        *d = s as u32;
+    }
     let lease = reactor.scan_lease(&scan_ids[..nw]);
 
     {
@@ -399,9 +406,9 @@ where
             disp.signal_all();
         }
     }
-    let slots = crate::runtime::reactor::join_all_unpin(
-        req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32))
-    ).await;
+    let slots =
+        crate::runtime::reactor::join_all_unpin(req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32)))
+            .await;
     Ok((slots, req_ids, lease))
 }
 
@@ -428,20 +435,17 @@ where
 /// `FLAG_SCAN_LAST` on the terminal one. This is the single definition of
 /// that train contract, shared by every train consumer (`fan_out_scan_async`,
 /// `drain_index_scan`, the pre-flight merge).
-fn parse_train_header(
-    slot: &W2mSlot,
-    w: usize,
-    what: &str,
-) -> Result<(wire::DecodedControl, bool), String> {
-    let ctrl = peek_control_block(slot.bytes())
-        .map_err(|e| scan_decode_err(w, e))?;
+fn parse_train_header(slot: &W2mSlot, w: usize, what: &str) -> Result<(wire::DecodedControl, bool), String> {
+    let ctrl = peek_control_block(slot.bytes()).map_err(|e| scan_decode_err(w, e))?;
     if ctrl.status != 0 {
         return Err(format!(
             "worker {}: {}: {}",
-            w, what, String::from_utf8_lossy(&ctrl.error_msg)));
+            w,
+            what,
+            String::from_utf8_lossy(&ctrl.error_msg)
+        ));
     }
-    let has_more = ctrl.flags & FLAG_SCAN_LAST == 0
-        && ctrl.flags & FLAG_CONTINUATION != 0;
+    let has_more = ctrl.flags & FLAG_SCAN_LAST == 0 && ctrl.flags & FLAG_CONTINUATION != 0;
     Ok((ctrl, has_more))
 }
 
@@ -484,11 +488,12 @@ async fn drain_index_scan(
             let (ctrl, has_more) = parse_train_header(&slot, w, what)?;
             let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
             let frame_len = slot.bytes().len();
-            let schema_hint = saved_schema.as_ref()
-                .map(|(s, v)| SchemaWithVersion { descriptor: s, version: *v });
-            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(
-                slot.bytes(), ctrl.block_size, ctrl, schema_hint,
-            ).map_err(|e| scan_decode_err(w, e))?;
+            let schema_hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
+                descriptor: s,
+                version: *v,
+            });
+            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl.block_size, ctrl, schema_hint)
+                .map_err(|e| scan_decode_err(w, e))?;
             if saved_schema.is_none() {
                 if let Some(ref s) = zc.schema {
                     crate::schema::validate_schema_match(s, expected)
@@ -497,11 +502,15 @@ async fn drain_index_scan(
                 }
             }
             if let Some(ref mb) = zc.data_batch {
-                if mb.count > 0 { on_batch(mb, frame_len)?; }
+                if mb.count > 0 {
+                    on_batch(mb, frame_len)?;
+                }
             }
             drop(zc); // borrows slot
             drop(slot);
-            if !has_more { break; }
+            if !has_more {
+                break;
+            }
             slot = reactor.await_scan_slot(req_ids[w] as u32).await;
         }
     }
@@ -521,14 +530,19 @@ struct GatherMap {
 
 impl GatherMap {
     fn new(stride: usize) -> Self {
-        GatherMap { stride, ..Default::default() }
+        GatherMap {
+            stride,
+            ..Default::default()
+        }
     }
 
     fn push_row(&mut self, pk: PkBuf, row: impl Iterator<Item = Option<u128>>) {
         let idx = (self.vals.len() / self.stride) as u32;
         self.vals.extend(row);
-        debug_assert!(self.vals.len() == (idx as usize + 1) * self.stride,
-            "gather row arity must equal the projection stride");
+        debug_assert!(
+            self.vals.len() == (idx as usize + 1) * self.stride,
+            "gather row arity must equal the projection stride"
+        );
         self.index.insert(pk, idx);
     }
 
@@ -544,12 +558,14 @@ impl GatherMap {
 }
 
 fn format_uuid_hyphenated(v: u128) -> String {
-    format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
         (v >> 96) as u32,
         (v >> 80) as u16,
         (v >> 64) as u16,
         (v >> 48) as u16,
-        v & 0x0000_ffff_ffff_ffff)
+        v & 0x0000_ffff_ffff_ffff
+    )
 }
 
 /// Render a PK from its raw OPK byte form for error messages.
@@ -573,10 +589,10 @@ fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) -> String {
         let s = match col.type_code {
             crate::schema::type_code::U128 => format!("{v}"),
             crate::schema::type_code::UUID => format_uuid_hyphenated(v),
-            crate::schema::type_code::I64  => format!("{}", v as u64 as i64),
-            crate::schema::type_code::I32  => format!("{}", v as u64 as i32),
-            crate::schema::type_code::I16  => format!("{}", v as u64 as i16),
-            crate::schema::type_code::I8   => format!("{}", v as u64 as i8),
+            crate::schema::type_code::I64 => format!("{}", v as u64 as i64),
+            crate::schema::type_code::I32 => format!("{}", v as u64 as i32),
+            crate::schema::type_code::I16 => format!("{}", v as u64 as i16),
+            crate::schema::type_code::I8 => format!("{}", v as u64 as i8),
             _ => format!("{}", v as u64),
         };
         parts.push(s);
@@ -641,12 +657,7 @@ fn build_check_batch_with<K>(
 /// write-side `IndexKeySpec::write_span`. For a base-table schema (the FK parent
 /// fast-path) the key column does not promote, so `src_type == idx_key_type` and
 /// the encode is the identity path.
-fn build_check_batch(
-    schema: &SchemaDescriptor,
-    keys: &[u128],
-    src_type: u8,
-    pooled: Option<Batch>,
-) -> Batch {
+fn build_check_batch(schema: &SchemaDescriptor, keys: &[u128], src_type: u8, pooled: Option<Batch>) -> Batch {
     // The index PK composite is `(indexed-value, src_pk_cols)` and is OPK-at-
     // rest. `keys` carry the indexed value (native u128); OPK-encode it into the
     // leading promoted key column and leave the source-PK suffix zero — only the
@@ -694,11 +705,7 @@ fn index_route_key(schema: &SchemaDescriptor, col_idx: u32, native: u128) -> Opt
 /// because the `pk_lo_hi` → UPSERT PK-check path can have up to
 /// `batch.count` entries and must not pay per-entry `PkBuf` construction;
 /// the gather inputs are bounded by distinct changed rows.
-fn build_check_batch_pkbuf(
-    schema: &SchemaDescriptor,
-    keys: &[PkBuf],
-    pooled: Option<Batch>,
-) -> Batch {
+fn build_check_batch_pkbuf(schema: &SchemaDescriptor, keys: &[PkBuf], pooled: Option<Batch>) -> Batch {
     build_check_batch_with(schema, keys, pooled, |b, k| b.extend_pk_bytes(k.pk_bytes()))
 }
 
@@ -709,7 +716,7 @@ fn recycle_check_batch(disp: &mut MasterDispatcher, target_id: i64, batch: Batch
     // A single large validation batch (bulk load, large FK check) would pin its
     // allocation in the pool indefinitely — Batch::clear() doesn't shrink.
     if batch.total_bytes() > MAX_RETAIN_BYTES {
-        return;  // let the allocator reclaim the oversized buffer
+        return; // let the allocator reclaim the oversized buffer
     }
     let pool = disp.check_batch_pool.entry(target_id).or_default();
     pool.push(batch);
@@ -733,11 +740,10 @@ fn reclaim_check_batches(disp: &mut MasterDispatcher, checks: &mut [PipelinedChe
     }
 }
 
-
 #[cfg(test)]
 mod unique_filter_tests {
     use super::*;
-    use crate::schema::{SchemaColumn, type_code};
+    use crate::schema::{type_code, SchemaColumn};
 
     fn u64_schema() -> SchemaDescriptor {
         // Single U64 PK column.
@@ -824,8 +830,11 @@ mod unique_filter_tests {
         // The parent stores id=42 as `encode_pk_column(42, U64)` = 42u64.to_be_bytes().
         let mut expected = [0u8; 8];
         gnitz_wire::encode_pk_column(&42u64.to_le_bytes(), type_code::U64, &mut expected);
-        assert_eq!(batch.get_pk_bytes(0), &expected[..],
-            "probe key must equal the stored OPK PK for a non-leading PK column");
+        assert_eq!(
+            batch.get_pk_bytes(0),
+            &expected[..],
+            "probe key must equal the stored OPK PK for a non-leading PK column"
+        );
     }
 
     #[test]
@@ -845,7 +854,9 @@ mod unique_filter_tests {
         let mut f = UniqueFilter::with_cap(8);
         for k in 0..10u64 {
             f.insert(span_u64(k));
-            if f.capped { break; }
+            if f.capped {
+                break;
+            }
         }
         assert!(f.capped, "filter should be capped after exceeding the limit");
         assert!(f.values.is_empty(), "values cleared once capped");
@@ -858,11 +869,14 @@ mod unique_filter_tests {
     fn extract_into_filter_pk_col() {
         // Schema: PK-only U64. Test that the PK-column locator extracts PKs.
         let schema = u64_schema();
-        let batch = make_row_batch(schema, &[
-            (10, 1, 0, 0),
-            (20, 1, 0, 0),
-            (30, -1, 0, 0),  // delete row — should be skipped
-        ]);
+        let batch = make_row_batch(
+            schema,
+            &[
+                (10, 1, 0, 0),
+                (20, 1, 0, 0),
+                (30, -1, 0, 0), // delete row — should be skipped
+            ],
+        );
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
         assert!(filter.values.contains(&span_u64(10)));
@@ -893,15 +907,21 @@ mod unique_filter_tests {
         // sign flip) is a DIFFERENT, non-order-preserving span the extractor must
         // NOT hold.
         let unsigned_span = PkBuf::from_bytes(&((-5i64) as u64).to_be_bytes());
-        assert_ne!(promoted_span, unsigned_span,
-            "signed I64 OPK (sign-flipped) differs from the unsigned image");
+        assert_ne!(
+            promoted_span, unsigned_span,
+            "signed I64 OPK (sign-flipped) differs from the unsigned image"
+        );
 
         let mut filter = UniqueFilter::new();
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
-        assert!(filter.values.contains(&promoted_span),
-            "filter holds the I64-promoted native span");
-        assert!(!filter.values.contains(&unsigned_span),
-            "must not hold the non-order-preserving unsigned image");
+        assert!(
+            filter.values.contains(&promoted_span),
+            "filter holds the I64-promoted native span"
+        );
+        assert!(
+            !filter.values.contains(&unsigned_span),
+            "must not hold the non-order-preserving unsigned image"
+        );
     }
 
     #[test]
@@ -930,11 +950,14 @@ mod unique_filter_tests {
     fn extract_into_filter_payload_col_skips_nulls() {
         // Schema: PK U64, payload U64 (nullable). Test extraction by col 1.
         let schema = two_col_schema();
-        let batch = make_row_batch(schema, &[
-            (1, 1, 0, 100),  // payload=100, not null
-            (2, 1, 1, 200),  // null bit set → should be skipped
-            (3, 1, 0, 300),
-        ]);
+        let batch = make_row_batch(
+            schema,
+            &[
+                (1, 1, 0, 100), // payload=100, not null
+                (2, 1, 1, 200), // null bit set → should be skipped
+                (3, 1, 0, 300),
+            ],
+        );
         let mut filter = UniqueFilter::new();
         // Single payload column promoted to a U64 index column (8-byte span).
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[1], &schema));
@@ -947,10 +970,7 @@ mod unique_filter_tests {
     #[test]
     fn extract_into_filter_respects_capped() {
         let schema = u64_schema();
-        let batch = make_row_batch(schema, &[
-            (10, 1, 0, 0),
-            (20, 1, 0, 0),
-        ]);
+        let batch = make_row_batch(schema, &[(10, 1, 0, 0), (20, 1, 0, 0)]);
         let mut filter = UniqueFilter::new();
         filter.capped = true;
         extract_into_filter(&mut filter, &batch.as_mem_batch(), &test_spec(&[0], &schema));
@@ -1002,8 +1022,14 @@ mod unique_filter_tests {
         assert!(!capped, "exactly cap distinct keys must keep the full seed");
         let mut disp = filter_dispatcher();
         disp.unique_filter_seed(7, 0, seed, capped);
-        assert!(disp.unique_filter_all_absent(7, 0, &[span_u64(40)]), "fresh key is provably absent");
-        assert!(!disp.unique_filter_all_absent(7, 0, &[span_u64(20)]), "seeded key falls through");
+        assert!(
+            disp.unique_filter_all_absent(7, 0, &[span_u64(40)]),
+            "fresh key is provably absent"
+        );
+        assert!(
+            !disp.unique_filter_all_absent(7, 0, &[span_u64(20)]),
+            "seeded key falls through"
+        );
     }
 
     /// A capped seed publishes a warm+capped filter whose entry exists in
@@ -1046,9 +1072,12 @@ mod unique_filter_tests {
             for _ in 0..n_workers {
                 let ptr = unsafe {
                     let p = libc::mmap(
-                        std::ptr::null_mut(), DRAIN_RING_CAPACITY,
+                        std::ptr::null_mut(),
+                        DRAIN_RING_CAPACITY,
                         libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0,
+                        libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                        -1,
+                        0,
                     ) as *mut u8;
                     assert!(!p.is_null(), "mmap failed");
                     std::ptr::write_bytes(p, 0, DRAIN_RING_CAPACITY);
@@ -1064,7 +1093,15 @@ mod unique_filter_tests {
                 *id = reactor.alloc_scan_request_id();
             }
             let receiver = W2mReceiver::new(ptrs.clone());
-            (DrainFixture { ptrs, reactor, receiver, req_ids }, writers)
+            (
+                DrainFixture {
+                    ptrs,
+                    reactor,
+                    receiver,
+                    req_ids,
+                },
+                writers,
+            )
         }
 
         /// Hand the first frame of every worker to the caller (what
@@ -1090,7 +1127,9 @@ mod unique_filter_tests {
             drop(self.reactor);
             drop(self.receiver);
             for ptr in self.ptrs {
-                unsafe { libc::munmap(ptr as *mut libc::c_void, DRAIN_RING_CAPACITY); }
+                unsafe {
+                    libc::munmap(ptr as *mut libc::c_void, DRAIN_RING_CAPACITY);
+                }
             }
         }
     }
@@ -1110,8 +1149,21 @@ mod unique_filter_tests {
         let sz = ipc::wire_size(status, error_msg, schema, None, batch, None, &[]);
         writer.send_encoded(sz, req, |buf| {
             ipc::encode_wire_into_ipc(
-                buf, 0, 1, 0, flags, 0u128, 0, 0, status, error_msg,
-                schema, None, batch, None, &[],
+                buf,
+                0,
+                1,
+                0,
+                flags,
+                0u128,
+                0,
+                0,
+                status,
+                error_msg,
+                schema,
+                None,
+                batch,
+                None,
+                &[],
             );
         });
     }
@@ -1129,10 +1181,12 @@ mod unique_filter_tests {
 
     /// Drive a future to completion in exactly one poll, panicking on Pending.
     fn poll_once<T>(fut: impl std::future::Future<Output = T>) -> T {
-        try_poll_once(fut).unwrap_or_else(|| panic!(
-            "future did not complete in one poll: the drain awaited a \
+        try_poll_once(fut).unwrap_or_else(|| {
+            panic!(
+                "future did not complete in one poll: the drain awaited a \
              frame that is not (and will never be) parked"
-        ))
+            )
+        })
     }
 
     /// A frame must still be parked for `req`: the drain returned without
@@ -1161,7 +1215,7 @@ mod unique_filter_tests {
     ///    still-parked assert.
     #[test]
     fn drain_index_scan_errs_immediately_on_fault_frame() {
-        use crate::runtime::wire::{STATUS_OK, STATUS_ERROR};
+        use crate::runtime::wire::{STATUS_ERROR, STATUS_OK};
 
         let (fx, writers) = DrainFixture::new(2);
         let w0_req = fx.req_ids[0] as u32;
@@ -1169,15 +1223,27 @@ mod unique_filter_tests {
 
         write_test_frame(&writers[0], w0_req, 0, STATUS_ERROR, b"boom", None, None);
         write_test_frame(&writers[1], w1_req, FLAG_CONTINUATION, STATUS_OK, b"", None, None);
-        write_test_frame(&writers[1], w1_req, FLAG_CONTINUATION | FLAG_SCAN_LAST,
-                         STATUS_OK, b"", None, None);
+        write_test_frame(
+            &writers[1],
+            w1_req,
+            FLAG_CONTINUATION | FLAG_SCAN_LAST,
+            STATUS_OK,
+            b"",
+            None,
+            None,
+        );
 
         let lease = fx.reactor.scan_lease(&[w0_req, w1_req]);
         let slots = fx.initial_slots();
 
         // The frames carry no schema block, so `expected` is never consulted.
         let result = poll_once(drain_index_scan(
-            slots, &fx.req_ids, &fx.reactor, "scan", &two_col_schema(), |_, _| Ok(()),
+            slots,
+            &fx.req_ids,
+            &fx.reactor,
+            "scan",
+            &two_col_schema(),
+            |_, _| Ok(()),
         ));
         let err = result.expect_err("worker fault must surface as Err");
         assert!(err.contains("worker 0"), "error names the faulted worker: {err}");
@@ -1209,20 +1275,37 @@ mod unique_filter_tests {
         let w1_req = fx.req_ids[1] as u32;
 
         // Worker 0: chunked train — schema on the first frame only.
-        write_test_frame(&writers[0], w0_req, FLAG_CONTINUATION, STATUS_OK, b"",
-                         Some(&schema), Some(&chunk_a));
-        write_test_frame(&writers[0], w0_req, FLAG_CONTINUATION | FLAG_SCAN_LAST,
-                         STATUS_OK, b"", None, Some(&chunk_b));
+        write_test_frame(
+            &writers[0],
+            w0_req,
+            FLAG_CONTINUATION,
+            STATUS_OK,
+            b"",
+            Some(&schema),
+            Some(&chunk_a),
+        );
+        write_test_frame(
+            &writers[0],
+            w0_req,
+            FLAG_CONTINUATION | FLAG_SCAN_LAST,
+            STATUS_OK,
+            b"",
+            None,
+            Some(&chunk_b),
+        );
         // Worker 1: single-frame reply, no train flags (send_response shape).
-        write_test_frame(&writers[1], w1_req, 0, STATUS_OK, b"",
-                         Some(&schema), Some(&single));
+        write_test_frame(&writers[1], w1_req, 0, STATUS_OK, b"", Some(&schema), Some(&single));
 
         let lease = fx.reactor.scan_lease(&[w0_req, w1_req]);
         let slots = fx.initial_slots();
 
         let mut rows: Vec<(u128, i64)> = Vec::new();
         let result = poll_once(drain_index_scan(
-            slots, &fx.req_ids, &fx.reactor, "seek_by_index", &schema,
+            slots,
+            &fx.req_ids,
+            &fx.reactor,
+            "seek_by_index",
+            &schema,
             |mb, frame_len| {
                 assert!(frame_len > 0, "sink receives the raw frame byte length");
                 for i in 0..mb.count {
@@ -1254,16 +1337,22 @@ mod unique_filter_tests {
 
         let (fx, writers) = DrainFixture::new(1);
         let w0_req = fx.req_ids[0] as u32;
-        write_test_frame(&writers[0], w0_req, 0, STATUS_OK, b"",
-                         Some(&wire_schema), Some(&batch));
+        write_test_frame(&writers[0], w0_req, 0, STATUS_OK, b"", Some(&wire_schema), Some(&batch));
 
         let lease = fx.reactor.scan_lease(&[w0_req]);
         let slots = fx.initial_slots();
 
         let mut sink_calls = 0usize;
         let result = poll_once(drain_index_scan(
-            slots, &fx.req_ids, &fx.reactor, "gather", &expected,
-            |_, _| { sink_calls += 1; Ok(()) },
+            slots,
+            &fx.req_ids,
+            &fx.reactor,
+            "gather",
+            &expected,
+            |_, _| {
+                sink_calls += 1;
+                Ok(())
+            },
         ));
         let err = result.expect_err("schema mismatch must surface as Err");
         assert!(err.contains("Schema mismatch"), "error names the mismatch: {err}");
@@ -1285,16 +1374,34 @@ mod unique_filter_tests {
 
         let (fx, writers) = DrainFixture::new(1);
         let w0_req = fx.req_ids[0] as u32;
-        write_test_frame(&writers[0], w0_req, FLAG_CONTINUATION, STATUS_OK, b"",
-                         Some(&schema), Some(&chunk));
-        write_test_frame(&writers[0], w0_req, FLAG_CONTINUATION | FLAG_SCAN_LAST,
-                         STATUS_OK, b"", None, Some(&chunk));
+        write_test_frame(
+            &writers[0],
+            w0_req,
+            FLAG_CONTINUATION,
+            STATUS_OK,
+            b"",
+            Some(&schema),
+            Some(&chunk),
+        );
+        write_test_frame(
+            &writers[0],
+            w0_req,
+            FLAG_CONTINUATION | FLAG_SCAN_LAST,
+            STATUS_OK,
+            b"",
+            None,
+            Some(&chunk),
+        );
 
         let lease = fx.reactor.scan_lease(&[w0_req]);
         let slots = fx.initial_slots();
 
         let result = poll_once(drain_index_scan(
-            slots, &fx.req_ids, &fx.reactor, "seek_by_index", &schema,
+            slots,
+            &fx.req_ids,
+            &fx.reactor,
+            "seek_by_index",
+            &schema,
             |_, _| Err("seek_by_index: result exceeds the reply cap".to_string()),
         ));
         let err = result.expect_err("sink error must abort the drain");
@@ -1335,7 +1442,9 @@ mod unique_filter_tests {
 
     fn compound_pk_bytes(parts: &[&[u8]]) -> PkBuf {
         let mut v = Vec::new();
-        for p in parts { v.extend_from_slice(p); }
+        for p in parts {
+            v.extend_from_slice(p);
+        }
         PkBuf::from_bytes(&v)
     }
 
@@ -1344,10 +1453,13 @@ mod unique_filter_tests {
         // (I32, U32) compound PK: A=-5, B=42. The renderer consumes OPK bytes,
         // so build the fixture as OPK (per-column encode, then widen for the
         // u128 arg). Reading raw native LE would mangle the signed column.
-        let schema = SchemaDescriptor::new(&[
-            SchemaColumn::new(type_code::I32, 0),
-            SchemaColumn::new(type_code::U32, 0),
-        ], &[0, 1]);
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::U32, 0),
+            ],
+            &[0, 1],
+        );
         assert!(!schema.pk_is_wide());
         let mut opk = [0u8; 8];
         gnitz_wire::encode_pk_column(&(-5i32).to_le_bytes(), type_code::I32, &mut opk[0..4]);
@@ -1363,15 +1475,16 @@ mod unique_filter_tests {
         // Three U64 columns = 24-byte PK: too wide for a u128, exercising the
         // byte-form renderer where the old format_pk_value would truncate.
         // OPK for unsigned U64 is big-endian.
-        let schema = SchemaDescriptor::new(&[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-        ], &[0, 1, 2]);
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0, 1, 2],
+        );
         assert!(schema.pk_is_wide());
-        let pk = compound_pk_bytes(&[
-            &7u64.to_be_bytes(), &8u64.to_be_bytes(), &9u64.to_be_bytes(),
-        ]);
+        let pk = compound_pk_bytes(&[&7u64.to_be_bytes(), &8u64.to_be_bytes(), &9u64.to_be_bytes()]);
         assert_eq!(format_pk_value_bytes(pk.pk_bytes(), &schema), "7, 8, 9");
     }
 
@@ -1380,10 +1493,13 @@ mod unique_filter_tests {
         // (A U32, B U32) both PK, unique index on A. Two rows share A=5 but
         // differ in B. Pre-fix get_pk(i) returned the packed (A,B) key, so the
         // filter held two distinct values; the fix slices out A only.
-        let schema = SchemaDescriptor::new(&[
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::U32, 0),
-        ], &[0, 1]);
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(type_code::U32, 0),
+            ],
+            &[0, 1],
+        );
         assert_eq!(schema.pk_stride(), 8);
         // PK region is OPK; for unsigned U32 that is big-endian. extract_into_filter
         // decodes OPK→native via pk_native_key, so the fixture must be OPK.
@@ -1403,10 +1519,13 @@ mod unique_filter_tests {
     fn extract_into_filter_compound_pk_second_column_offset() {
         // Unique index on B (the second PK column at byte offset 4). Confirms
         // the locator slices the right column out of the packed key.
-        let schema = SchemaDescriptor::new(&[
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::U32, 0),
-        ], &[0, 1]);
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(type_code::U32, 0),
+            ],
+            &[0, 1],
+        );
         // OPK PK region: unsigned U32 columns are stored big-endian.
         let keys = [
             compound_pk_bytes(&[&5u32.to_be_bytes(), &11u32.to_be_bytes()]),
@@ -1420,4 +1539,3 @@ mod unique_filter_tests {
         assert_eq!(filter.values.len(), 2);
     }
 }
-

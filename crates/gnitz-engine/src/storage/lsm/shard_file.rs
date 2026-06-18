@@ -9,15 +9,15 @@ use std::ptr;
 
 use libc::c_int;
 
-use super::layout::*;
-use crate::foundation::codec::write_u64_le;
 use super::error::StorageError;
-use super::xor8;
-use xorf::Xor8;
-use crate::foundation::xxh;
+use super::layout::*;
 use super::merge::pack_pk_be;
-use crate::schema::MAX_PK_BYTES;
+use super::xor8;
+use crate::foundation::codec::write_u64_le;
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
+use crate::foundation::xxh;
+use crate::schema::MAX_PK_BYTES;
+use xorf::Xor8;
 
 fn align64(val: usize) -> usize {
     (val + ALIGNMENT - 1) & !(ALIGNMENT - 1)
@@ -56,7 +56,9 @@ impl PkUniqueChecker {
     /// Observe one output row. `pk_bytes` is the OPK-encoded key slice (sorted).
     /// `weight` is the net row weight after consolidation.
     pub fn observe(&mut self, pk_bytes: &[u8], weight: i64) {
-        if !self.qualifies { return; }
+        if !self.qualifies {
+            return;
+        }
         if weight < 0 {
             self.qualifies = false;
             return;
@@ -69,9 +71,8 @@ impl PkUniqueChecker {
         // a prefix tie is only confirmed by the full byte compare. The has_last
         // guard keeps the first row — or a genuine all-zero key, which aliases
         // the zero-initialised last_prefix/last_pk — from reading as a duplicate.
-        let is_duplicate = self.has_last
-            && prefix == self.last_prefix
-            && (n <= 16 || self.last_pk[..n] == pk_bytes[..n]);
+        let is_duplicate =
+            self.has_last && prefix == self.last_prefix && (n <= 16 || self.last_pk[..n] == pk_bytes[..n]);
         if is_duplicate {
             self.qualifies = false;
             return;
@@ -89,7 +90,11 @@ impl PkUniqueChecker {
     /// was unique, otherwise 0. Convenience for flush and compaction callers.
     pub fn flags_if(&self, enabled: bool) -> u8 {
         use super::layout::SHARD_FLAG_PK_UNIQUE;
-        if enabled && self.qualifies { SHARD_FLAG_PK_UNIQUE } else { 0 }
+        if enabled && self.qualifies {
+            SHARD_FLAG_PK_UNIQUE
+        } else {
+            0
+        }
     }
 }
 
@@ -100,8 +105,14 @@ impl PkUniqueChecker {
 #[allow(dead_code)]
 enum RegionEncoding {
     Raw,
-    Constant { value: [u8; 16] },
-    TwoValue { value_a: i64, value_b: i64, bitvec: Vec<u8> },
+    Constant {
+        value: [u8; 16],
+    },
+    TwoValue {
+        value_a: i64,
+        value_b: i64,
+        bitvec: Vec<u8>,
+    },
 }
 
 /// Detect whether a fixed-width region is all-constant.
@@ -198,11 +209,7 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Optio
 ///
 /// Returns the complete file image ready for writing.
 #[cfg(test)]
-pub(crate) fn build_shard_image(
-    table_id: u32,
-    row_count: u32,
-    regions: &[(*const u8, usize)],
-) -> Vec<u8> {
+pub(crate) fn build_shard_image(table_id: u32, row_count: u32, regions: &[(*const u8, usize)]) -> Vec<u8> {
     let num_regions = regions.len();
     let n = row_count as usize;
     let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
@@ -263,11 +270,7 @@ pub(crate) fn build_shard_image(
     };
 
     let xor8_data = xor8_filter.as_ref().map(xor8::serialize);
-    let xor8_offset = if xor8_data.is_some() {
-        align64(data_end)
-    } else {
-        0
-    };
+    let xor8_offset = if xor8_data.is_some() { align64(data_end) } else { 0 };
     let xor8_size = xor8_data.as_ref().map_or(0, |d| d.len());
     let total_size = if xor8_data.is_some() {
         xor8_offset + xor8_size
@@ -297,7 +300,11 @@ pub(crate) fn build_shard_image(
                     ptr::copy_nonoverlapping(src_ptr, image[r_off..].as_mut_ptr(), elem_width);
                 }
             }
-            RegionEncoding::TwoValue { value_a, value_b, bitvec } => {
+            RegionEncoding::TwoValue {
+                value_a,
+                value_b,
+                bitvec,
+            } => {
                 image[r_off..r_off + 8].copy_from_slice(&value_a.to_le_bytes());
                 image[r_off + 8..r_off + 16].copy_from_slice(&value_b.to_le_bytes());
                 image[r_off + 16..r_off + 16 + bitvec.len()].copy_from_slice(bitvec);
@@ -408,7 +415,9 @@ pub fn write_shard_streaming(
         }
         return Err(StorageError::Io);
     }
-    unsafe { libc::close(prepared.fd); }
+    unsafe {
+        libc::close(prepared.fd);
+    }
     unsafe {
         if libc::renameat(dirfd, prepared.tmp_name.as_ptr(), dirfd, basename.as_ptr()) < 0 {
             libc::unlinkat(dirfd, prepared.tmp_name.as_ptr(), 0);
@@ -523,7 +532,11 @@ fn write_shard_streaming_inner(
                 let elem_width = actual_sizes[i];
                 xxh::checksum(unsafe { std::slice::from_raw_parts(src_ptr, elem_width) })
             }
-            RegionEncoding::TwoValue { value_a, value_b, bitvec } => {
+            RegionEncoding::TwoValue {
+                value_a,
+                value_b,
+                bitvec,
+            } => {
                 let mut buf = Vec::with_capacity(16 + bitvec.len());
                 buf.extend_from_slice(&value_a.to_le_bytes());
                 buf.extend_from_slice(&value_b.to_le_bytes());
@@ -604,8 +617,7 @@ fn write_shard_streaming_inner(
         }
 
         if let Some(ref data) = xor8_data {
-            pwrite_all(fd, data, xor8_offset as libc::off_t)
-                .map_err(|_| abort(fd, tmp_name.as_ptr()))?;
+            pwrite_all(fd, data, xor8_offset as libc::off_t).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
         }
 
         Ok((fd, tmp_name))
@@ -658,9 +670,9 @@ pub(crate) fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durabl
 
 #[cfg(test)]
 mod tests {
+    use super::super::shard_reader::MappedShard;
     use super::*;
     use crate::foundation::codec::read_u64_le;
-    use super::super::shard_reader::MappedShard;
     use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 
     fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
@@ -697,14 +709,8 @@ mod tests {
 
         let image = build_shard_image(42, row_count, &regions);
 
-        assert_eq!(
-            read_u64_le(&image, OFF_MAGIC),
-            SHARD_MAGIC
-        );
-        assert_eq!(
-            read_u64_le(&image, OFF_VERSION),
-            SHARD_VERSION
-        );
+        assert_eq!(read_u64_le(&image, OFF_MAGIC), SHARD_MAGIC);
+        assert_eq!(read_u64_le(&image, OFF_VERSION), SHARD_VERSION);
         assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), 3);
         assert_eq!(read_u64_le(&image, OFF_TABLE_ID), 42);
         assert!(read_u64_le(&image, OFF_XOR8_OFFSET) > 0);
@@ -715,8 +721,7 @@ mod tests {
     fn write_and_read_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let shard_path = dir.path().join("test.db");
-        let path_cstr =
-            std::ffi::CString::new(shard_path.to_str().unwrap()).unwrap();
+        let path_cstr = std::ffi::CString::new(shard_path.to_str().unwrap()).unwrap();
 
         let row_count = 2u32;
         let pks: Vec<u64> = vec![1, 2];
@@ -797,9 +802,7 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        write_shard_streaming(
-            libc::AT_FDCWD, &cpath, 42, row_count, &regions, true, 0,
-        ).unwrap();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 42, row_count, &regions, true, 0).unwrap();
 
         let schema = make_schema_desc(2, 0);
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
@@ -841,11 +844,7 @@ mod tests {
         ];
 
         let image = build_shard_image(99, n, &regions);
-        assert_eq!(
-            read_u64_le(&image, OFF_VERSION),
-            SHARD_VERSION,
-            "must write V6"
-        );
+        assert_eq!(read_u64_le(&image, OFF_VERSION), SHARD_VERSION, "must write V6");
         write_shard_at(libc::AT_FDCWD, &cpath, &image, false).unwrap();
 
         let schema = make_schema_desc(2, 0);
@@ -890,7 +889,11 @@ mod tests {
         assert_eq!(pk_region_sz, 8, "Constant PK region must store a single 8B value");
 
         // Verify encoding byte is ENCODING_CONSTANT.
-        assert_eq!(image[dir_off + 24], ENCODING_CONSTANT, "PK region must use Constant encoding");
+        assert_eq!(
+            image[dir_off + 24],
+            ENCODING_CONSTANT,
+            "PK region must use Constant encoding"
+        );
     }
 
     /// Bug 3: streaming write with regions that trigger Constant encoding.
@@ -903,9 +906,9 @@ mod tests {
         let row_count = 4u32;
         let pks: Vec<u64> = vec![1, 2, 3, 4];
         let weights: Vec<i64> = vec![1, 1, 1, 1]; // all-same → Constant encoding
-        let nulls: Vec<u64> = vec![0, 0, 0, 0];   // all-zero → Constant encoding
+        let nulls: Vec<u64> = vec![0, 0, 0, 0]; // all-zero → Constant encoding
         let vals: Vec<i64> = vec![42, 42, 42, 42]; // all-same → Constant encoding
-        // PK region is OPK (big-endian) at rest; U64 OPK == BE.
+                                                   // PK region is OPK (big-endian) at rest; U64 OPK == BE.
         let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
         let blob: Vec<u8> = vec![];
 
@@ -917,9 +920,7 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        write_shard_streaming(
-            libc::AT_FDCWD, &cpath, 7, row_count, &regions, true, 0,
-        ).unwrap();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 7, row_count, &regions, true, 0).unwrap();
 
         let schema = make_schema_desc(2, 0);
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
@@ -937,9 +938,8 @@ mod tests {
             .map(|r| (0..stride).map(|b| r.wrapping_add(b as u8)).collect())
             .collect();
         let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
-        let f =
-            build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), rows.len())
-                .expect("wide compound region must build a filter");
+        let f = build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), rows.len())
+            .expect("wide compound region must build a filter");
         for row in &rows {
             assert!(
                 xor8::may_contain(&f, crate::foundation::xxh::checksum(row) as u128),
@@ -955,9 +955,8 @@ mod tests {
             .map(|r| (0..stride).map(|b| r.wrapping_mul(7).wrapping_add(b as u8)).collect())
             .collect();
         let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
-        let f =
-            build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), rows.len())
-                .expect("narrow compound region must build a filter");
+        let f = build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), rows.len())
+            .expect("narrow compound region must build a filter");
         for row in &rows {
             // Builder fingerprint for stride <= 16 is widen_pk_be(OPK bytes);
             // the probe must derive the same value.
@@ -973,8 +972,8 @@ mod tests {
         let pks64: Vec<u64> = vec![10, 20, 30, 40];
         // OPK at rest: U64 region is big-endian.
         let b64: Vec<u8> = pks64.iter().flat_map(|p| p.to_be_bytes()).collect();
-        let f64 = build_xor8_from_pk_region(b64.as_ptr(), b64.len(), pks64.len())
-            .expect("8-byte region must build a filter");
+        let f64 =
+            build_xor8_from_pk_region(b64.as_ptr(), b64.len(), pks64.len()).expect("8-byte region must build a filter");
         for p in &pks64 {
             assert!(xor8::may_contain(&f64, *p as u128));
         }
@@ -1039,11 +1038,19 @@ mod tests {
         b[..16].copy_from_slice(&[7u8; 16]);
         a[16] = 1;
         b[16] = 2;
-        assert_eq!(tag(&[(&a, 1), (&b, 1)]), FLAG, "wide prefix-twins, distinct tails qualify");
+        assert_eq!(
+            tag(&[(&a, 1), (&b, 1)]),
+            FLAG,
+            "wide prefix-twins, distinct tails qualify"
+        );
         assert_eq!(tag(&[(&a, 1), (&a, 1)]), 0, "identical wide keys disqualify");
         // Interleaving a distinct-prefix row must not lose the wide last_pk.
         let c = [9u8; 24];
-        assert_eq!(tag(&[(&a, 1), (&c, 1), (&a, 1)]), FLAG, "non-adjacent wide repeats qualify");
+        assert_eq!(
+            tag(&[(&a, 1), (&c, 1), (&a, 1)]),
+            FLAG,
+            "non-adjacent wide repeats qualify"
+        );
     }
 
     #[test]

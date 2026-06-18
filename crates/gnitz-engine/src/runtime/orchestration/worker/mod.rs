@@ -8,19 +8,17 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
-use crate::schema::SchemaDescriptor;
 use crate::query::ExchangeCallback;
-use crate::storage::{BlobCacheGuard, FlushWork, PkBuf};
-use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, FLAG_CONTINUATION, FLAG_SCAN_LAST};
 use crate::runtime::sal::{
-    SAL_MMAP_SIZE, FLAG_EXCHANGE, FLAG_CHECKPOINT,
-    SalReader, SalMessageKind,
-    schema_wire_safe,
-    BACKFILL_PAD_BIT, BACKFILL_DECISION_STOP, BACKFILL_DECISION_CHECKPOINT,
+    schema_wire_safe, SalMessageKind, SalReader, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP,
+    BACKFILL_PAD_BIT, FLAG_CHECKPOINT, FLAG_EXCHANGE, SAL_MMAP_SIZE,
 };
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::w2m_ring;
+use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_SCAN_LAST, STATUS_ERROR, STATUS_OK};
+use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
+use crate::storage::{BlobCacheGuard, FlushWork, PkBuf};
 
 // ---------------------------------------------------------------------------
 // PendingScan
@@ -104,7 +102,10 @@ enum DispatchContext {
     /// EXCHANGE_RELAY whose `(view_id, source_id)` matches `want_key`.
     /// `schema` is the outgoing batch's schema; used to fabricate an
     /// empty relay payload if the master sends a header-only relay.
-    InsideExchangeWait { want_key: (i64, i64), schema: Option<SchemaDescriptor> },
+    InsideExchangeWait {
+        want_key: (i64, i64),
+        schema: Option<SchemaDescriptor>,
+    },
 }
 
 /// Result of a single `dispatch` call.
@@ -192,13 +193,9 @@ struct WorkerExchangeCtx<'a> {
 }
 
 impl<'a> ExchangeCallback for WorkerExchangeCtx<'a> {
-    fn do_exchange(
-        &mut self,
-        view_id: i64,
-        batch: &Batch,
-        source_id: i64,
-    ) -> Batch {
-        self.worker.do_exchange_wait(view_id, batch, source_id, self.tick_request_id)
+    fn do_exchange(&mut self, view_id: i64, batch: &Batch, source_id: i64) -> Batch {
+        self.worker
+            .do_exchange_wait(view_id, batch, source_id, self.tick_request_id)
     }
 }
 
@@ -261,7 +258,6 @@ pub struct WorkerProcess {
     read_cursor: u64,
     expected_epoch: u32,
 }
-
 
 mod exchange;
 mod fsync;
@@ -381,12 +377,14 @@ impl WorkerProcess {
     /// every column against the table's schema before touching the catalog.
     /// Shared by the SeekByIndex and SeekByIndexRange arms.
     fn validated_index_cols(
-        &mut self, target_id: i64, seek_col_idx: u64, op: &str,
+        &mut self,
+        target_id: i64,
+        seek_col_idx: u64,
+        op: &str,
     ) -> Result<gnitz_wire::PkColList, String> {
         let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
         match self.cat().get_schema_desc(target_id).map(|s| s.num_columns()) {
-            Some(nc) if cols.is_well_formed()
-                && cols.as_slice().iter().all(|&c| (c as usize) < nc) => Ok(cols),
+            Some(nc) if cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < nc) => Ok(cols),
             _ => Err(format!("{op}: invalid column list for table {target_id}")),
         }
     }
@@ -520,16 +518,24 @@ impl WorkerProcess {
         let sz = sz_0 + per_row * max_rows;
         self.w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_range(
-                buf, 0, target_id, client_id, flags,
-                0, STATUS_OK, // request_id=0 in payload; ring prefix carries the req_id
-                None, &batch,
-                next_row, max_rows,
+                buf,
+                0,
+                target_id,
+                client_id,
+                flags,
+                0,
+                STATUS_OK, // request_id=0 in payload; ring prefix carries the req_id
+                None,
+                &batch,
+                next_row,
+                max_rows,
                 prebuilt_opt,
             );
         });
 
         if has_more {
-            self.pending_streams.front_mut()
+            self.pending_streams
+                .front_mut()
                 .expect("emit_pending_scan_chunk: front train vanished mid-emit")
                 .next_row = next_row + max_rows;
         } else {
@@ -545,9 +551,7 @@ impl WorkerProcess {
     /// at an unchanged cursor). The cursor is advanced *only* on a
     /// successful epoch match — a post-epoch group remains parked at the
     /// cursor until the cursor is reset by checkpoint.
-    fn next_sal_message(&mut self)
-        -> Option<(SalMessageKind, i64, Option<&'static [u8]>)>
-    {
+    fn next_sal_message(&mut self) -> Option<(SalMessageKind, i64, Option<&'static [u8]>)> {
         if self.read_cursor + 8 >= SAL_MMAP_SIZE as u64 {
             return None;
         }
@@ -556,11 +560,7 @@ impl WorkerProcess {
             return None;
         }
         self.read_cursor = new_cursor;
-        Some((
-            msg.kind,
-            msg.target_id as i64,
-            msg.wire_data,
-        ))
+        Some((msg.kind, msg.target_id as i64, msg.wire_data))
     }
 
     /// Dispatch a SAL message at the top level — drains any preloaded
@@ -579,7 +579,11 @@ impl WorkerProcess {
         while kind == SalMessageKind::PreloadedExchange {
             let _ = self.dispatch(DispatchContext::TopLevel, kind, target_id, wire);
             match self.next_sal_message() {
-                Some((k, t, w)) => { kind = k; target_id = t; wire = w; }
+                Some((k, t, w)) => {
+                    kind = k;
+                    target_id = t;
+                    wire = w;
+                }
                 None => return DispatchOutcome::Continue,
             }
         }
@@ -671,9 +675,7 @@ impl WorkerProcess {
 
         match (ctx, kind) {
             // ── Tick: inline at top-level, defer inside exchange wait ──
-            (DispatchContext::TopLevel, SalMessageKind::Tick) => {
-                self.run_via_dispatch_inner(kind, target_id, wire)
-            }
+            (DispatchContext::TopLevel, SalMessageKind::Tick) => self.run_via_dispatch_inner(kind, target_id, wire),
             (DispatchContext::InsideExchangeWait { .. }, SalMessageKind::Tick) => {
                 let req_id = wire
                     .and_then(|d| ipc::decode_wire(d).ok())
@@ -684,9 +686,7 @@ impl WorkerProcess {
             }
 
             // ── DdlSync: apply at top-level, defer inside ──────────────
-            (DispatchContext::TopLevel, SalMessageKind::DdlSync) => {
-                self.run_via_dispatch_inner(kind, target_id, wire)
-            }
+            (DispatchContext::TopLevel, SalMessageKind::DdlSync) => self.run_via_dispatch_inner(kind, target_id, wire),
             (DispatchContext::InsideExchangeWait { .. }, SalMessageKind::DdlSync) => {
                 if let Some(data) = wire {
                     match ipc::decode_wire(data) {
@@ -701,10 +701,12 @@ impl WorkerProcess {
                             // Shut down rather than continue with a stale catalog.
                             gnitz_warn!(
                                 "W{} FATAL: failed to decode deferred DDL for tid={}: {}",
-                                self.worker_id, target_id, e,
+                                self.worker_id,
+                                target_id,
+                                e,
                             );
-                            self.shutdown();  // calls libc::_exit — does not return
-                            return DispatchOutcome::Shutdown;  // unreachable; satisfies type
+                            self.shutdown(); // calls libc::_exit — does not return
+                            return DispatchOutcome::Shutdown; // unreachable; satisfies type
                         }
                     }
                 }
@@ -715,28 +717,22 @@ impl WorkerProcess {
             (DispatchContext::TopLevel, SalMessageKind::ExchangeRelay) => {
                 gnitz_warn!(
                     "W{} unexpected ExchangeRelay at top-level dispatch tid={}",
-                    self.worker_id, target_id,
+                    self.worker_id,
+                    target_id,
                 );
                 DispatchOutcome::Continue
             }
-            (DispatchContext::InsideExchangeWait { want_key, schema },
-                SalMessageKind::ExchangeRelay) => {
+            (DispatchContext::InsideExchangeWait { want_key, schema }, SalMessageKind::ExchangeRelay) => {
                 // source_id is echoed back via seek_pk; the backfill round
                 // decision rides in seek_col_idx. Decode both before taking the
                 // batch out.
                 let decoded = wire.and_then(|d| ipc::decode_wire(d).ok());
-                let relay_source_id = decoded.as_ref()
-                    .map(|d| d.control.seek_pk as i64)
-                    .unwrap_or(0);
-                let relay_decision = decoded.as_ref()
-                    .map(|d| d.control.seek_col_idx)
-                    .unwrap_or(0);
-                let relay_batch = decoded
-                    .and_then(|d| d.data_batch)
-                    .unwrap_or_else(|| {
-                        let empty_schema = schema.unwrap_or_default();
-                        Batch::with_schema(empty_schema, 0)
-                    });
+                let relay_source_id = decoded.as_ref().map(|d| d.control.seek_pk as i64).unwrap_or(0);
+                let relay_decision = decoded.as_ref().map(|d| d.control.seek_col_idx).unwrap_or(0);
+                let relay_batch = decoded.and_then(|d| d.data_batch).unwrap_or_else(|| {
+                    let empty_schema = schema.unwrap_or_default();
+                    Batch::with_schema(empty_schema, 0)
+                });
                 let relay_key = (target_id, relay_source_id);
                 if relay_key == want_key {
                     // Consumed for the active wait: act on the decision (record
@@ -748,7 +744,9 @@ impl WorkerProcess {
                 // a later wait. During backfill the cluster runs in lockstep and
                 // this never fires, but carrying the decision keeps it correct if
                 // it ever does.
-                self.exchange.pending_relays.insert(relay_key, (relay_batch, relay_decision));
+                self.exchange
+                    .pending_relays
+                    .insert(relay_key, (relay_batch, relay_decision));
                 DispatchOutcome::Continue
             }
 
@@ -781,9 +779,7 @@ impl WorkerProcess {
             | (_, SalMessageKind::SeekByIndex)
             | (_, SalMessageKind::SeekByIndexRange)
             | (_, SalMessageKind::Seek)
-            | (_, SalMessageKind::Scan) => {
-                self.run_via_dispatch_inner(kind, target_id, wire)
-            }
+            | (_, SalMessageKind::Scan) => self.run_via_dispatch_inner(kind, target_id, wire),
         }
     }
 
@@ -810,10 +806,12 @@ impl WorkerProcess {
                     // this worker with a permanently stale catalog.
                     gnitz_warn!(
                         "W{} FATAL: DdlSync application failed for tid={}: {}. Shutting down.",
-                        self.worker_id, target_id, msg,
+                        self.worker_id,
+                        target_id,
+                        msg,
                     );
-                    self.shutdown();  // calls libc::_exit — does not return
-                    return DispatchOutcome::Shutdown;  // unreachable; satisfies type
+                    self.shutdown(); // calls libc::_exit — does not return
+                    return DispatchOutcome::Shutdown; // unreachable; satisfies type
                 }
                 DispatchOutcome::Continue
             }
@@ -836,7 +834,8 @@ impl WorkerProcess {
         let client_version = gnitz_wire::wire_flags_get_schema_version(ctrl_wire_flags);
         // Wide-PK seek key tail (bytes 16..stride); empty for narrow PKs. Must be
         // extracted before `decoded` is consumed by the `data_batch` take below.
-        let seek_pk_extra: Vec<u8> = decoded.as_ref()
+        let seek_pk_extra: Vec<u8> = decoded
+            .as_ref()
             .map(|d| d.control.seek_pk_extra.clone())
             .unwrap_or_default();
 
@@ -897,8 +896,7 @@ impl WorkerProcess {
                 // sublist still replies — the master joins one reply per
                 // worker). PKs come pre-sorted from the master's global sort
                 // (scatter preserves per-worker order), aiding the cursor.
-                let project: Vec<u8> =
-                    crate::runtime::sal::unpack_gather_cols(seek_col_idx).collect();
+                let project: Vec<u8> = crate::runtime::sal::unpack_gather_cols(seek_col_idx).collect();
                 // The batch PK region holds verbatim OPK bytes (the master packs
                 // them via `extend_pk_bytes`), so seek them directly with
                 // `gather_family_bytes` for every PK width. Round-tripping a
@@ -917,9 +915,12 @@ impl WorkerProcess {
                         // table's cached block.
                         let schema = result.schema;
                         if let Some(err) = self.stream_batch_response(
-                            target_id as u64, Some(result),
+                            target_id as u64,
+                            Some(result),
                             schema.as_ref().map_or(ReplySchema::None, ReplySchema::OneOff),
-                            request_id, client_id, 0,
+                            request_id,
+                            client_id,
+                            0,
                         ) {
                             return DispatchResult::Error(err);
                         }
@@ -960,26 +961,31 @@ impl WorkerProcess {
                 // the trust boundary rather than silently dropping trailing bytes.
                 if !seek_pk_extra.len().is_multiple_of(16) {
                     return DispatchResult::Error(
-                        "seek_by_index: seek_pk_extra length is not a multiple of 16".to_string());
+                        "seek_by_index: seek_pk_extra length is not a multiple of 16".to_string(),
+                    );
                 }
                 let k = 1 + seek_pk_extra.len() / 16;
                 if k > cols.as_slice().len() {
                     return DispatchResult::Error(format!(
                         "seek_by_index: {k} key values exceed index arity {}",
-                        cols.as_slice().len()));
+                        cols.as_slice().len()
+                    ));
                 }
                 let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
                 natives[0] = seek_pk;
                 for i in 1..k {
-                    natives[i] = u128::from_le_bytes(
-                        seek_pk_extra[(i - 1) * 16..i * 16].try_into().unwrap());
+                    natives[i] = u128::from_le_bytes(seek_pk_extra[(i - 1) * 16..i * 16].try_into().unwrap());
                 }
                 match self.cat().seek_by_index(target_id, cols.as_slice(), &natives[..k]) {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
                         if let Some(err) = self.stream_batch_response(
-                            target_id as u64, result, ReplySchema::table(schema.as_ref()),
-                            request_id, client_id, seek_pk,
+                            target_id as u64,
+                            result,
+                            ReplySchema::table(schema.as_ref()),
+                            request_id,
+                            client_id,
+                            seek_pk,
                         ) {
                             return DispatchResult::Error(err);
                         }
@@ -1008,8 +1014,12 @@ impl WorkerProcess {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
                         if let Some(err) = self.stream_batch_response(
-                            target_id as u64, result, ReplySchema::table(schema.as_ref()),
-                            request_id, client_id, 0,
+                            target_id as u64,
+                            result,
+                            ReplySchema::table(schema.as_ref()),
+                            request_id,
+                            client_id,
+                            0,
                         ) {
                             return DispatchResult::Error(err);
                         }
@@ -1043,8 +1053,13 @@ impl WorkerProcess {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
                         self.send_response(
-                            target_id as u64, result.as_ref(), ReplySchema::table(schema.as_ref()),
-                            request_id, client_id, seek_pk);
+                            target_id as u64,
+                            result.as_ref(),
+                            ReplySchema::table(schema.as_ref()),
+                            request_id,
+                            client_id,
+                            seek_pk,
+                        );
                     }
                     Err(msg) => return DispatchResult::Error(msg),
                 }
@@ -1056,8 +1071,12 @@ impl WorkerProcess {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);
                         if let Some(err) = self.send_scan_response(
-                            target_id as u64, result, ReplySchema::table(schema.as_ref()),
-                            request_id, client_id, client_version,
+                            target_id as u64,
+                            result,
+                            ReplySchema::table(schema.as_ref()),
+                            request_id,
+                            client_id,
+                            client_version,
                         ) {
                             return DispatchResult::Error(err);
                         }
@@ -1077,7 +1096,8 @@ impl WorkerProcess {
                 let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
                 if !cols.is_well_formed() {
                     return DispatchResult::Error(format!(
-                        "unique pre-flight: invalid column list for table {target_id}"));
+                        "unique pre-flight: invalid column list for table {target_id}"
+                    ));
                 }
                 if let Err(msg) = self.handle_unique_preflight(target_id, cols.as_slice(), request_id) {
                     return DispatchResult::Error(msg);
@@ -1093,7 +1113,9 @@ impl WorkerProcess {
             SalMessageKind::ExchangeRelay | SalMessageKind::PreloadedExchange => {
                 gnitz_warn!(
                     "W{} unexpected {:?} at top-level dispatch_inner tid={}",
-                    self.worker_id, kind, target_id,
+                    self.worker_id,
+                    kind,
+                    target_id,
                 );
                 DispatchResult::Continue
             }
@@ -1102,9 +1124,7 @@ impl WorkerProcess {
 
     // ── Request handlers ───────────────────────────────────────────────
 
-    fn handle_push(
-        &mut self, target_id: i64, batch: Batch, _request_id: u64,
-    ) -> Result<(), String> {
+    fn handle_push(&mut self, target_id: i64, batch: Batch, _request_id: u64) -> Result<(), String> {
         // Master pre-partitions FLAG_PUSH rows in `scatter_wire_group`,
         // so every slot already contains only this worker's rows. A second
         // partition-hash filter here would be pure overhead.
@@ -1139,7 +1159,9 @@ impl WorkerProcess {
             if !self.cat().has_id(target_id) {
                 return Ok(());
             }
-            let schema = self.cat().get_schema_desc(target_id)
+            let schema = self
+                .cat()
+                .get_schema_desc(target_id)
                 .ok_or_else(|| format!("no schema for tid={target_id}"))?;
             Batch::with_schema(schema, 0)
         };
@@ -1168,9 +1190,15 @@ impl WorkerProcess {
         let chunk_rows = self.cat().ddl_scan_chunk_rows;
         let has = self.cat().has_id(source_tid);
         // Needed to synthesize empty pad chunks. A missing source still pads.
-        let schema = self.cat().get_schema_desc(source_tid)
+        let schema = self
+            .cat()
+            .get_schema_desc(source_tid)
             .ok_or_else(|| format!("backfill: no schema for source {source_tid}"))?;
-        let mut handle = if has { self.cat().open_store_cursor(source_tid) } else { None };
+        let mut handle = if has {
+            self.cat().open_store_cursor(source_tid)
+        } else {
+            None
+        };
 
         loop {
             // `None` ⇒ partition exhausted (or absent): this round is an empty
@@ -1253,9 +1281,7 @@ impl WorkerProcess {
     /// the master sends this command inside the DDL critical section
     /// (committer barrier drained, catalog write lock held), before the
     /// IDX_TAB +1 broadcast, so no concurrent INSERT can interleave.
-    fn handle_unique_preflight(
-        &mut self, owner_id: i64, col_indices: &[u32], request_id: u64,
-    ) -> Result<(), String> {
+    fn handle_unique_preflight(&mut self, owner_id: i64, col_indices: &[u32], request_id: u64) -> Result<(), String> {
         // Crash-injection seam: fail the pre-flight on every worker so tests
         // can assert the master surfaces the fault, drains the fan-out, and
         // leaves the catalog and unique-filter state untouched.
@@ -1263,9 +1289,10 @@ impl WorkerProcess {
         if std::env::var("GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR").is_ok() {
             return Err("injected unique pre-flight fault".to_string());
         }
-        let schema = self.cat().get_schema_desc(owner_id).ok_or_else(|| {
-            format!("unique pre-flight: no schema for table {owner_id}")
-        })?;
+        let schema = self
+            .cat()
+            .get_schema_desc(owner_id)
+            .ok_or_else(|| format!("unique pre-flight: no schema for table {owner_id}"))?;
         // The index circuit is not registered until this pre-flight succeeds, so
         // build its schema from the owner schema + column list — identical inputs
         // to the master's own build, so the reply frame layout agrees by
@@ -1274,8 +1301,7 @@ impl WorkerProcess {
         // promoted per-column types/sizes for the span.
         let idx_schema = crate::catalog::make_index_schema(col_indices, &schema)?;
         let spec = crate::schema::IndexKeySpec::new(col_indices, &schema, &idx_schema);
-        let frame_schema = crate::runtime::sal::unique_preflight_wire_schema(
-            &idx_schema, col_indices.len());
+        let frame_schema = crate::runtime::sal::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
         // Stream the partition chunk-wise and project each chunk to spans —
         // peak memory beyond one chunk is the span Vec. `key_bytes` keeps the
@@ -1290,20 +1316,30 @@ impl WorkerProcess {
                 keys.reserve(chunk.count);
                 for row in 0..chunk.count {
                     let w = chunk.get_weight(row);
-                    if w <= 0 { continue; }
-                    if !spec.key_bytes(&mb, row, &mut keybuf) { continue; }
+                    if w <= 0 {
+                        continue;
+                    }
+                    if !spec.key_bytes(&mb, row, &mut keybuf) {
+                        continue;
+                    }
                     keys.push(keybuf);
                     // Chunks are consolidated: weight ≥ 2 is the same row w
                     // times; one extra copy suffices to put an adjacent equal
                     // pair in the sorted stream for the master's merge.
-                    if w > 1 { keys.push(keybuf); }
+                    if w > 1 {
+                        keys.push(keybuf);
+                    }
                 }
             }
         }
         keys.sort_unstable();
 
         send_unique_preflight_keys(
-            &self.w2m_writer, owner_id as u64, &keys, &frame_schema, request_id,
+            &self.w2m_writer,
+            owner_id as u64,
+            &keys,
+            &frame_schema,
+            request_id,
             unique_preflight_keys_per_frame(),
         );
         Ok(())
@@ -1325,7 +1361,9 @@ impl WorkerProcess {
                 let index_handle = self.cat().get_index_store_handle(target_id, cols.as_slice());
                 if index_handle.is_null() {
                     return Err(format!(
-                        "No unique index on columns {:?} for table {}", cols.as_slice(), target_id
+                        "No unique index on columns {:?} for table {}",
+                        cols.as_slice(),
+                        target_id
                     ));
                 }
                 // The check target is the unique INDEX table, whose schema is
@@ -1335,7 +1373,8 @@ impl WorkerProcess {
                 // wrong prefix width. The broadcast always carries the index
                 // schema today, so the fallback is currently unreachable, but
                 // `get_index_schema_by_cols` keeps it type-correct.
-                let schema = batch.as_ref()
+                let schema = batch
+                    .as_ref()
                     .and_then(|b| b.schema)
                     .or_else(|| self.cat().get_index_schema_by_cols(target_id, cols.as_slice()))
                     .ok_or_else(|| format!("no index schema for tid={} cols={:?}", target_id, cols.as_slice()))?;
@@ -1357,11 +1396,19 @@ impl WorkerProcess {
                     cursor.cursor.seek_first_positive_with_prefix(&pkb[..idx_key_size])
                 });
                 // The index schema is not table `target_id`'s own — one-off block.
-                self.send_response(target_id as u64, Some(&result), ReplySchema::OneOff(&schema),
-                                   request_id, client_id, seek_pk);
+                self.send_response(
+                    target_id as u64,
+                    Some(&result),
+                    ReplySchema::OneOff(&schema),
+                    request_id,
+                    client_id,
+                    seek_pk,
+                );
             }
             HasPkLookup::PrimaryKey => {
-                let schema = self.cat().get_schema_desc(target_id)
+                let schema = self
+                    .cat()
+                    .get_schema_desc(target_id)
                     .ok_or_else(|| format!("no schema for tid={target_id}"))?;
                 let ptable_handle = self.cat().get_ptable_handle(target_id);
                 // Route on verbatim OPK bytes for every PK width. The old narrow
@@ -1370,8 +1417,14 @@ impl WorkerProcess {
                 let result = filter_by_pk_bytes(&batch, schema, n, |pkb| {
                     ptable_handle.is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk_bytes(pkb))
                 });
-                self.send_response(target_id as u64, Some(&result), ReplySchema::Table(&schema),
-                                   request_id, client_id, seek_pk);
+                self.send_response(
+                    target_id as u64,
+                    Some(&result),
+                    ReplySchema::Table(&schema),
+                    request_id,
+                    client_id,
+                    seek_pk,
+                );
             }
         }
         Ok(())
@@ -1382,20 +1435,23 @@ impl WorkerProcess {
         let ids = self.cat().iter_user_table_ids();
         let mut dir_inodes: Vec<(u64, u64, libc::c_int)> = Vec::new();
 
-        let mut ring = io_uring::IoUring::new(256)
-            .map_err(|e| format!("io_uring::new failed: {e}"))?;
+        let mut ring = io_uring::IoUring::new(256).map_err(|e| format!("io_uring::new failed: {e}"))?;
 
         const FD_CHUNK_THRESHOLD: usize = 256;
         let mut pending: Vec<(i64, Vec<(usize, FlushWork)>)> = Vec::new();
         let mut pending_fds = 0usize;
 
         for tid in ids {
-            let works = self.cat().flush_family_prepare(tid)
+            let works = self
+                .cat()
+                .flush_family_prepare(tid)
                 .map_err(|e| format!("flush_prepare tid={tid}: {e}"))?;
-            if works.is_empty() { continue; }
-            let added_fds: usize = works.iter()
-                .map(|(_, w)| w.shard_fd().is_some() as usize
-                    + w.manifest_fd().is_some() as usize)
+            if works.is_empty() {
+                continue;
+            }
+            let added_fds: usize = works
+                .iter()
+                .map(|(_, w)| w.shard_fd().is_some() as usize + w.manifest_fd().is_some() as usize)
                 .sum();
             pending.push((tid, works));
             pending_fds += added_fds;
@@ -1409,8 +1465,7 @@ impl WorkerProcess {
         // The fds are per-flush dir fds, owned by this batch (opened in
         // `flush_prepare`, returned by `flush_commit`). Fsync one fd per unique
         // directory inode, then close every fd so the flush leaks none.
-        let all_fds: Vec<libc::c_int> =
-            dir_inodes.iter().map(|&(_, _, fd)| fd).collect();
+        let all_fds: Vec<libc::c_int> = dir_inodes.iter().map(|&(_, _, fd)| fd).collect();
         let mut fsync_err = None;
         for fd in dedup_dirfds(dir_inodes) {
             if let Err(e) = crate::foundation::posix_io::fsync_eintr(fd) {
@@ -1419,7 +1474,9 @@ impl WorkerProcess {
             }
         }
         for fd in all_fds {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
         if let Some(err) = fsync_err {
             return Err(format!("dir fsync failed: {err}"));
@@ -1433,20 +1490,27 @@ impl WorkerProcess {
         pending: &mut Vec<(i64, Vec<(usize, FlushWork)>)>,
         dir_inodes: &mut Vec<(u64, u64, libc::c_int)>,
     ) -> Result<(), String> {
-        if pending.is_empty() { return Ok(()); }
+        if pending.is_empty() {
+            return Ok(());
+        }
 
-        let fds: Vec<libc::c_int> = pending.iter()
+        let fds: Vec<libc::c_int> = pending
+            .iter()
             .flat_map(|(_, ws)| ws.iter())
             .flat_map(|(_, w)| w.shard_fd().into_iter().chain(w.manifest_fd()))
             .collect();
         uring_batch_fdatasync(ring, &fds)?;
 
         for (_, ws) in pending.iter_mut() {
-            for (_, w) in ws { w.close_fds(); }
+            for (_, w) in ws {
+                w.close_fds();
+            }
         }
 
         for (tid, works) in pending.drain(..) {
-            let dirfds = self.cat().flush_family_commit_batch(tid, works)
+            let dirfds = self
+                .cat()
+                .flush_family_commit_batch(tid, works)
                 .map_err(|e| format!("flush_commit tid={tid}: {e}"))?;
             for dirfd in dirfds {
                 let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -1478,7 +1542,9 @@ impl WorkerProcess {
 
     fn shutdown(&mut self) {
         let _ = self.handle_flush_all();
-        unsafe { libc::_exit(0); }
+        unsafe {
+            libc::_exit(0);
+        }
     }
 }
 
@@ -1585,21 +1651,29 @@ pub(crate) fn send_unique_preflight_keys(
         let prebuilt: Option<&[u8]> = if is_first { Some(&schema_block) } else { None };
         let schema_for_encode = if is_first { Some(frame_schema) } else { None };
         let flags = FLAG_CONTINUATION | if is_last { FLAG_SCAN_LAST } else { 0 };
-        let sz = ipc::wire_size_range(
-            STATUS_OK, &[], schema_for_encode, None, &chunk, chunk.count, prebuilt,
-        );
+        let sz = ipc::wire_size_range(STATUS_OK, &[], schema_for_encode, None, &chunk, chunk.count, prebuilt);
         w2m_writer.send_encoded(sz, request_id as u32, |buf| {
             ipc::encode_wire_into_range(
-                buf, 0, target_id, 0, flags,
-                0, STATUS_OK, // request_id 0 in payload; ring prefix carries the req_id
-                schema_for_encode, &chunk, 0, chunk.count, prebuilt,
+                buf,
+                0,
+                target_id,
+                0,
+                flags,
+                0,
+                STATUS_OK, // request_id 0 in payload; ring prefix carries the req_id
+                schema_for_encode,
+                &chunk,
+                0,
+                chunk.count,
+                prebuilt,
             );
         });
-        if is_last { break; }
+        if is_last {
+            break;
+        }
         start = end;
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1607,7 +1681,7 @@ mod tests {
     use crate::schema::SchemaDescriptor;
 
     fn test_schema() -> SchemaDescriptor {
-        use crate::schema::{SchemaColumn, type_code};
+        use crate::schema::{type_code, SchemaColumn};
         SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0),
@@ -1731,8 +1805,10 @@ mod tests {
         // Retrieving one does NOT retrieve the other.
         let (a, _) = h.pending_relays.remove(&(100, 10)).expect("(100,10) queued");
         assert_eq!(a.count, 3);
-        assert!(h.pending_relays.contains_key(&(100, 20)),
-            "retrieving (100,10) must leave (100,20) in place");
+        assert!(
+            h.pending_relays.contains_key(&(100, 20)),
+            "retrieving (100,10) must leave (100,20) in place"
+        );
         let (b, _) = h.pending_relays.remove(&(100, 20)).expect("(100,20) queued");
         assert_eq!(b.count, 11);
     }
@@ -1745,8 +1821,8 @@ mod tests {
     /// assert the ids round-trip.
     #[test]
     fn test_send_helpers_echo_request_id() {
-        use crate::runtime::wire as ipc;
         use crate::runtime::w2m_ring;
+        use crate::runtime::wire as ipc;
         // Use the production-sized region — the mmap reservation is
         // lazy-populated, so the 1 GiB backing is cheap.
         let region_size = w2m_ring::W2M_REGION_SIZE;
@@ -1756,12 +1832,15 @@ mod tests {
                 region_size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-                -1, 0,
+                -1,
+                0,
             )
         };
         assert_ne!(region_ptr, libc::MAP_FAILED);
         let region_ptr = region_ptr as *mut u8;
-        unsafe { w2m_ring::init_region(region_ptr, region_size as u64); }
+        unsafe {
+            w2m_ring::init_region(region_ptr, region_size as u64);
+        }
 
         let w2m_writer = W2mWriter::new(region_ptr, region_size as u64);
 
@@ -1782,10 +1861,8 @@ mod tests {
         let mut rc = w2m_ring::W2M_HEADER_SIZE as u64;
         let mut decoded_ids = Vec::new();
         for _ in 0..3 {
-            let (data_ptr, sz, new_rc, _req_id) = unsafe {
-                w2m_ring::try_consume(hdr, region_ptr as *const u8, rc)
-                    .expect("expected a message")
-            };
+            let (data_ptr, sz, new_rc, _req_id) =
+                unsafe { w2m_ring::try_consume(hdr, region_ptr as *const u8, rc).expect("expected a message") };
             let data = unsafe { std::slice::from_raw_parts(data_ptr, sz as usize) };
             let decoded = ipc::decode_wire(data).expect("decode_wire");
             decoded_ids.push(decoded.control.request_id);
@@ -1821,8 +1898,10 @@ mod tests {
         // A packed single-column list always sets the flag bit, so it never
         // collides with the PK sentinel (0).
         assert!(gnitz_wire::pack_pk_cols(&[0]) != 0);
-        assert!(matches!(HasPkLookup::from_wire(gnitz_wire::pack_pk_cols(&[0])),
-                         HasPkLookup::UniqueIndex(_)));
+        assert!(matches!(
+            HasPkLookup::from_wire(gnitz_wire::pack_pk_cols(&[0])),
+            HasPkLookup::UniqueIndex(_)
+        ));
     }
 
     // -- Walk-the-matrix dispatch tests ---------------------------------------
@@ -1872,8 +1951,10 @@ mod tests {
         let outcome = wp.dispatch(ctx, SalMessageKind::Tick, 999, None);
         assert!(matches!(outcome, DispatchOutcome::Continue));
         assert_eq!(wp.exchange.deferred_ticks.len(), 1);
-        assert_eq!(wp.exchange.deferred_ticks[0].0, 999,
-            "Tick target_id must be carried into deferred_ticks");
+        assert_eq!(
+            wp.exchange.deferred_ticks[0].0, 999,
+            "Tick target_id must be carried into deferred_ticks"
+        );
     }
 
     /// ExchangeRelay inside an exchange wait whose `(view_id, source_id)`
@@ -1885,19 +1966,26 @@ mod tests {
         let mut wp = make_worker_for_matrix();
         let schema = test_schema();
         let want_key = (100, 0);
-        let ctx = DispatchContext::InsideExchangeWait { want_key, schema: Some(schema) };
+        let ctx = DispatchContext::InsideExchangeWait {
+            want_key,
+            schema: Some(schema),
+        };
 
         // Mismatched view: parked.
         let empty: &'static [u8] = &[];
         let outcome = wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 200, Some(empty));
         assert!(matches!(outcome, DispatchOutcome::Continue));
-        assert!(wp.exchange.pending_relays.contains_key(&(200, 0)),
-            "non-matching relay must be parked in pending_relays");
+        assert!(
+            wp.exchange.pending_relays.contains_key(&(200, 0)),
+            "non-matching relay must be parked in pending_relays"
+        );
 
         // Matching key: returned via RelayMatched.
         let outcome = wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 100, Some(empty));
-        assert!(matches!(outcome, DispatchOutcome::RelayMatched(_)),
-            "key-matching relay must short-circuit with RelayMatched");
+        assert!(
+            matches!(outcome, DispatchOutcome::RelayMatched(_)),
+            "key-matching relay must short-circuit with RelayMatched"
+        );
     }
 
     /// ExchangeRelay at TopLevel is a protocol bug — it can only arrive
@@ -1914,8 +2002,10 @@ mod tests {
             Some(empty),
         );
         assert!(matches!(outcome, DispatchOutcome::Continue));
-        assert!(wp.exchange.pending_relays.is_empty(),
-            "TopLevel must NOT park relays — they belong to do_exchange_wait");
+        assert!(
+            wp.exchange.pending_relays.is_empty(),
+            "TopLevel must NOT park relays — they belong to do_exchange_wait"
+        );
     }
 
     /// PreloadedExchange returns Continue in both contexts and
@@ -1957,7 +2047,9 @@ mod tests {
         // The rest go through dispatch_inner inline.
 
         for kind in SalMessageKind::ALL {
-            if !must_defer.contains(&kind) { continue; }
+            if !must_defer.contains(&kind) {
+                continue;
+            }
 
             let mut wp = make_worker_for_matrix();
             let ctx = DispatchContext::InsideExchangeWait {
@@ -1973,10 +2065,12 @@ mod tests {
 
             match kind {
                 SalMessageKind::Tick => {
-                    assert_eq!(after_ticks, before_ticks + 1,
-                        "Tick must defer to deferred_ticks inside exchange wait");
-                    assert_eq!(after_ddl, before_ddl,
-                        "Tick must NOT touch the deferred (DDL) queue");
+                    assert_eq!(
+                        after_ticks,
+                        before_ticks + 1,
+                        "Tick must defer to deferred_ticks inside exchange wait"
+                    );
+                    assert_eq!(after_ddl, before_ddl, "Tick must NOT touch the deferred (DDL) queue");
                 }
                 SalMessageKind::DdlSync => {
                     // DdlSync requires a decodable wire to actually defer
@@ -1986,8 +2080,10 @@ mod tests {
                     // it returns Continue and doesn't panic, and that the
                     // deferred queue did not gain a synthetic entry
                     // (None wire ⇒ no data_batch ⇒ no push).
-                    assert_eq!(after_ddl, before_ddl,
-                        "DdlSync with no wire data must not synthesize a deferred entry");
+                    assert_eq!(
+                        after_ddl, before_ddl,
+                        "DdlSync with no wire data must not synthesize a deferred entry"
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -2008,9 +2104,7 @@ mod tests {
     ///    consumable one without rewinding the cursor.
     #[test]
     fn test_next_sal_message_epoch_gating() {
-        use crate::runtime::sal::{
-            sal_write_group, SalReader, FLAG_PUSH, FLAG_DDL_SYNC,
-        };
+        use crate::runtime::sal::{sal_write_group, SalReader, FLAG_DDL_SYNC, FLAG_PUSH};
 
         const SAL_SIZE: usize = 1 << 20;
         let sal_ptr = unsafe {
@@ -2019,12 +2113,15 @@ mod tests {
                 SAL_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-                -1, 0,
+                -1,
+                0,
             )
         };
         assert_ne!(sal_ptr, libc::MAP_FAILED);
         let sal_ptr = sal_ptr as *mut u8;
-        unsafe { std::ptr::write_bytes(sal_ptr, 0, SAL_SIZE); }
+        unsafe {
+            std::ptr::write_bytes(sal_ptr, 0, SAL_SIZE);
+        }
 
         // Single worker; each group puts a one-byte payload at slot 0.
         let nw = 1u32;
@@ -2035,24 +2132,48 @@ mod tests {
         // Group 1: epoch=1, FLAG_PUSH, target=42
         let r1 = unsafe {
             sal_write_group(
-                sal_ptr, 0, nw, 42, 100, FLAG_PUSH, 1, SAL_SIZE as u64,
-                ptrs.as_ptr(), sizes.as_ptr(),
+                sal_ptr,
+                0,
+                nw,
+                42,
+                100,
+                FLAG_PUSH,
+                1,
+                SAL_SIZE as u64,
+                ptrs.as_ptr(),
+                sizes.as_ptr(),
             )
         };
         assert_eq!(r1.status, 0);
         // Group 2: epoch=1, FLAG_DDL_SYNC, target=43
         let r2 = unsafe {
             sal_write_group(
-                sal_ptr, r1.new_cursor, nw, 43, 101, FLAG_DDL_SYNC, 1, SAL_SIZE as u64,
-                ptrs.as_ptr(), sizes.as_ptr(),
+                sal_ptr,
+                r1.new_cursor,
+                nw,
+                43,
+                101,
+                FLAG_DDL_SYNC,
+                1,
+                SAL_SIZE as u64,
+                ptrs.as_ptr(),
+                sizes.as_ptr(),
             )
         };
         assert_eq!(r2.status, 0);
         // Group 3: epoch=2 — must be skipped while expected_epoch==1.
         let r3 = unsafe {
             sal_write_group(
-                sal_ptr, r2.new_cursor, nw, 44, 102, FLAG_PUSH, 2, SAL_SIZE as u64,
-                ptrs.as_ptr(), sizes.as_ptr(),
+                sal_ptr,
+                r2.new_cursor,
+                nw,
+                44,
+                102,
+                FLAG_PUSH,
+                2,
+                SAL_SIZE as u64,
+                ptrs.as_ptr(),
+                sizes.as_ptr(),
             )
         };
         assert_eq!(r3.status, 0);
@@ -2077,17 +2198,22 @@ mod tests {
         // Third call: epoch 2 group 3 — REJECTED while expected_epoch==1.
         // Must return None and leave the cursor untouched.
         let cursor_at_epoch_fence = wp.read_cursor;
-        assert!(wp.next_sal_message().is_none(),
-            "epoch-mismatched group must be rejected");
-        assert_eq!(wp.read_cursor, cursor_at_epoch_fence,
-            "cursor must NOT advance on epoch mismatch (group remains parked)");
+        assert!(
+            wp.next_sal_message().is_none(),
+            "epoch-mismatched group must be rejected"
+        );
+        assert_eq!(
+            wp.read_cursor, cursor_at_epoch_fence,
+            "cursor must NOT advance on epoch mismatch (group remains parked)"
+        );
 
         // Bumping expected_epoch makes the same group consumable on the
         // next call — this is the load-bearing invariant cited by the
         // doc comment in `next_sal_message`. (Cursor was unchanged, so
         // we re-read the same group.)
         wp.expected_epoch = 2;
-        let (kind, target_id, _wire) = wp.next_sal_message()
+        let (kind, target_id, _wire) = wp
+            .next_sal_message()
             .expect("group 3 should be consumable after epoch bump");
         assert_eq!(kind, SalMessageKind::Push);
         assert_eq!(target_id, 44);
@@ -2096,7 +2222,9 @@ mod tests {
         // No more groups.
         assert!(wp.next_sal_message().is_none());
 
-        unsafe { libc::munmap(sal_ptr as *mut libc::c_void, SAL_SIZE); }
+        unsafe {
+            libc::munmap(sal_ptr as *mut libc::c_void, SAL_SIZE);
+        }
     }
 
     // -- pending stream chunking tests -----------------------------------------------
@@ -2105,14 +2233,18 @@ mod tests {
         let size = w2m_ring::W2M_REGION_SIZE;
         let ptr = unsafe {
             libc::mmap(
-                std::ptr::null_mut(), size,
+                std::ptr::null_mut(),
+                size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-                -1, 0,
+                -1,
+                0,
             ) as *mut u8
         };
         assert_ne!(ptr, libc::MAP_FAILED as *mut u8);
-        unsafe { w2m_ring::init_region(ptr, size as u64); }
+        unsafe {
+            w2m_ring::init_region(ptr, size as u64);
+        }
         (ptr, W2mWriter::new(ptr, size as u64))
     }
 
@@ -2129,8 +2261,7 @@ mod tests {
     }
 
     fn consume_one(ptr: *mut u8) -> Vec<u8> {
-        let (_, frame) = walk_frames(ptr).into_iter().next()
-            .expect("expected one ring message");
+        let (_, frame) = walk_frames(ptr).into_iter().next().expect("expected one ring message");
         frame
     }
 
@@ -2155,22 +2286,33 @@ mod tests {
         });
 
         wp.emit_pending_scan_chunk();
-        assert!(wp.pending_streams.is_empty(),
-            "10 rows fit in one chunk; the train must pop off the queue");
+        assert!(
+            wp.pending_streams.is_empty(),
+            "10 rows fit in one chunk; the train must pop off the queue"
+        );
 
         let data = consume_one(ptr);
-        let decoded = ipc::decode_wire_ipc(&data)
-            .expect("first chunk must decode without schema hint");
+        let decoded = ipc::decode_wire_ipc(&data).expect("first chunk must decode without schema hint");
         assert!(decoded.schema.is_some(), "first chunk must carry schema block");
         let b = decoded.data_batch.expect("first chunk must carry data");
         assert_eq!(b.count, 10);
-        for i in 0..10usize { assert_eq!(b.get_pk(i), i as u128); }
-        assert_ne!(decoded.control.flags & FLAG_SCAN_LAST, 0,
-            "FLAG_SCAN_LAST must be set on the only chunk");
-        assert_ne!(decoded.control.flags & FLAG_CONTINUATION, 0,
-            "FLAG_CONTINUATION must always be set on worker scan frames");
+        for i in 0..10usize {
+            assert_eq!(b.get_pk(i), i as u128);
+        }
+        assert_ne!(
+            decoded.control.flags & FLAG_SCAN_LAST,
+            0,
+            "FLAG_SCAN_LAST must be set on the only chunk"
+        );
+        assert_ne!(
+            decoded.control.flags & FLAG_CONTINUATION,
+            0,
+            "FLAG_CONTINUATION must always be set on worker scan frames"
+        );
 
-        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
+        }
     }
 
     /// Continuation chunk — next_row > 0, prebuilt_schema == None. The frame carries
@@ -2201,17 +2343,27 @@ mod tests {
             ipc::decode_wire_ipc(&data).is_err(),
             "continuation frame without schema must fail decode_wire_ipc"
         );
-        let hint = ipc::SchemaWithVersion { descriptor: &schema, version: 0 };
+        let hint = ipc::SchemaWithVersion {
+            descriptor: &schema,
+            version: 0,
+        };
         let decoded = ipc::decode_wire_ipc_with_schema(&data, hint)
             .expect("decode_wire_ipc_with_schema must succeed for continuation frame");
         let b = decoded.data_batch.expect("continuation chunk must carry data");
         assert_eq!(b.count, 5);
-        for i in 0..5usize { assert_eq!(b.get_pk(i), (i + 5) as u128); }
-        assert_ne!(decoded.control.flags & FLAG_SCAN_LAST, 0,
-            "FLAG_SCAN_LAST must be set on the last chunk");
+        for i in 0..5usize {
+            assert_eq!(b.get_pk(i), (i + 5) as u128);
+        }
+        assert_ne!(
+            decoded.control.flags & FLAG_SCAN_LAST,
+            0,
+            "FLAG_SCAN_LAST must be set on the last chunk"
+        );
         assert_ne!(decoded.control.flags & FLAG_CONTINUATION, 0);
 
-        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
+        }
     }
 
     /// send_scan_response with schema=None (avoids catalog) emits a single ring
@@ -2227,23 +2379,35 @@ mod tests {
 
         let err = wp.send_scan_response(1, Rc::new(batch), ReplySchema::None, 3, 0, 0);
         assert!(err.is_none(), "small wire-safe batch must not error");
-        assert!(wp.pending_streams.is_empty(),
-            "batch fits in one frame; send_scan_response must not enqueue a train");
+        assert!(
+            wp.pending_streams.is_empty(),
+            "batch fits in one frame; send_scan_response must not enqueue a train"
+        );
 
         let data = consume_one(ptr);
         let ctrl = ipc::peek_control_block(&data).expect("peek_control_block");
         assert_eq!(ctrl.status, STATUS_OK);
-        assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0, "single-frame response must set FLAG_SCAN_LAST");
+        assert_ne!(
+            ctrl.flags & FLAG_SCAN_LAST,
+            0,
+            "single-frame response must set FLAG_SCAN_LAST"
+        );
         assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
 
-        let hint = ipc::SchemaWithVersion { descriptor: &schema, version: 0 };
-        let decoded = ipc::decode_wire_ipc_with_schema(&data, hint)
-            .expect("decode with schema hint");
+        let hint = ipc::SchemaWithVersion {
+            descriptor: &schema,
+            version: 0,
+        };
+        let decoded = ipc::decode_wire_ipc_with_schema(&data, hint).expect("decode with schema hint");
         let b = decoded.data_batch.expect("data block");
         assert_eq!(b.count, 5);
-        for i in 0..5usize { assert_eq!(b.get_pk(i), i as u128); }
+        for i in 0..5usize {
+            assert_eq!(b.get_pk(i), i as u128);
+        }
 
-        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
+        }
     }
 
     /// STRING-column schemas are not wire-safe: send_scan_response sends them as a
@@ -2252,15 +2416,22 @@ mod tests {
     /// batch; this test verifies the predicate that gates that branch.
     #[test]
     fn test_string_schema_not_wire_safe() {
-        use crate::schema::{SchemaColumn, type_code};
+        use crate::schema::{type_code, SchemaColumn};
         let sd = SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(type_code::STRING, 0)],
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
             &[0],
         );
-        assert!(!schema_wire_safe(&sd),
-            "STRING-column schema must not be wire-safe (no chunking)");
-        assert!(schema_wire_safe(&test_schema()),
-            "U64-only schema must be wire-safe (chunking enabled)");
+        assert!(
+            !schema_wire_safe(&sd),
+            "STRING-column schema must not be wire-safe (no chunking)"
+        );
+        assert!(
+            schema_wire_safe(&test_schema()),
+            "U64-only schema must be wire-safe (chunking enabled)"
+        );
     }
 
     // -- stream_batch_response / pending_streams FIFO tests --------------------
@@ -2271,9 +2442,7 @@ mod tests {
         let hdr = unsafe { w2m_ring::W2mRingHeader::from_raw(ptr as *const u8) };
         let mut rc = w2m_ring::W2M_HEADER_SIZE as u64;
         let mut out = Vec::new();
-        while let Some((data_ptr, sz, new_rc, req_id)) = unsafe {
-            w2m_ring::try_consume(hdr, ptr as *const u8, rc)
-        } {
+        while let Some((data_ptr, sz, new_rc, req_id)) = unsafe { w2m_ring::try_consume(hdr, ptr as *const u8, rc) } {
             let data = unsafe { std::slice::from_raw_parts(data_ptr, sz as usize) };
             out.push((req_id, data.to_vec()));
             rc = new_rc;
@@ -2295,7 +2464,7 @@ mod tests {
     /// first chunk carries B's own schema block.
     #[test]
     fn test_pending_streams_fifo_two_trains() {
-        use crate::schema::{SchemaColumn, type_code};
+        use crate::schema::{type_code, SchemaColumn};
 
         let schema_a = test_schema();
         // B's schema has 3 columns so its frames are distinguishable from A's.
@@ -2314,21 +2483,29 @@ mod tests {
 
         // Budget: first chunk (with A's schema block) carries ~4 rows, so
         // train A spans at least two frames.
-        let sz_0 = ipc::wire_size_range(
-            STATUS_OK, &[], None, None, &batch_a, 0, Some(block_a.as_slice()));
-        let sz_1 = ipc::wire_size_range(
-            STATUS_OK, &[], None, None, &batch_a, 1, Some(block_a.as_slice()));
+        let sz_0 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch_a, 0, Some(block_a.as_slice()));
+        let sz_1 = ipc::wire_size_range(STATUS_OK, &[], None, None, &batch_a, 1, Some(block_a.as_slice()));
         let budget = sz_0 + (sz_1 - sz_0) * 4;
 
         let (ptr, writer) = make_ring();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
         wp.pending_streams.push_back(PendingScan {
-            batch: Rc::new(batch_a), next_row: 0, request_id: 11, client_id: 0,
-            target_id: 1, prebuilt_schema: Some(block_a), server_version: 0,
+            batch: Rc::new(batch_a),
+            next_row: 0,
+            request_id: 11,
+            client_id: 0,
+            target_id: 1,
+            prebuilt_schema: Some(block_a),
+            server_version: 0,
         });
         wp.pending_streams.push_back(PendingScan {
-            batch: Rc::new(batch_b), next_row: 0, request_id: 22, client_id: 0,
-            target_id: 2, prebuilt_schema: Some(block_b), server_version: 0,
+            batch: Rc::new(batch_b),
+            next_row: 0,
+            request_id: 22,
+            client_id: 0,
+            target_id: 2,
+            prebuilt_schema: Some(block_b),
+            server_version: 0,
         });
 
         // One chunk per pass, as drain_sal drives it.
@@ -2353,26 +2530,30 @@ mod tests {
         // the chunks cover every row exactly once, and the FIRST chunk carries
         // that train's own schema block (decodes standalone with its column
         // count; continuations decode only against the train's schema hint).
-        for (req, schema, ncols, total_rows) in [
-            (11u32, &schema_a, 2usize, 10usize),
-            (22u32, &schema_b, 3usize, 5usize),
-        ] {
+        for (req, schema, ncols, total_rows) in
+            [(11u32, &schema_a, 2usize, 10usize), (22u32, &schema_b, 3usize, 5usize)]
+        {
             let train: Vec<_> = frames.iter().filter(|(r, _)| *r == req).collect();
             let mut rows = 0usize;
             for (i, (_, bytes)) in train.iter().enumerate() {
                 let ctrl = ipc::peek_control_block(bytes).expect("ctrl");
                 assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
                 let is_last = i == train.len() - 1;
-                assert_eq!(ctrl.flags & FLAG_SCAN_LAST != 0, is_last,
-                    "FLAG_SCAN_LAST only on the train's terminal chunk");
+                assert_eq!(
+                    ctrl.flags & FLAG_SCAN_LAST != 0,
+                    is_last,
+                    "FLAG_SCAN_LAST only on the train's terminal chunk"
+                );
                 if i == 0 {
-                    let decoded = ipc::decode_wire_ipc(bytes)
-                        .expect("first chunk must decode standalone");
+                    let decoded = ipc::decode_wire_ipc(bytes).expect("first chunk must decode standalone");
                     let s = decoded.schema.expect("first chunk carries a schema block");
                     assert_eq!(s.num_columns(), ncols, "the block is this train's schema");
                     rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
                 } else {
-                    let hint = ipc::SchemaWithVersion { descriptor: schema, version: 0 };
+                    let hint = ipc::SchemaWithVersion {
+                        descriptor: schema,
+                        version: 0,
+                    };
                     let decoded = ipc::decode_wire_ipc_with_schema(bytes, hint)
                         .expect("continuation decodes against the schema hint");
                     rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
@@ -2381,7 +2562,9 @@ mod tests {
             assert_eq!(rows, total_rows, "the train's chunks cover all rows exactly once");
         }
 
-        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
+        }
     }
 
     /// A fitting result through `stream_batch_response` must be byte-identical
@@ -2404,16 +2587,21 @@ mod tests {
         wp_ref.send_response(8, Some(&batch), ReplySchema::None, req, client, pk);
         wp_ref.send_response(8, None, ReplySchema::None, req + 1, client, 0);
 
-        assert!(wp_new.stream_batch_response(
-            8, Some(batch.clone()), ReplySchema::None, req, client, pk).is_none());
-        assert!(wp_new.stream_batch_response(8, None, ReplySchema::None, req + 1, client, 0).is_none());
+        assert!(wp_new
+            .stream_batch_response(8, Some(batch.clone()), ReplySchema::None, req, client, pk)
+            .is_none());
+        assert!(wp_new
+            .stream_batch_response(8, None, ReplySchema::None, req + 1, client, 0)
+            .is_none());
         assert!(wp_new.pending_streams.is_empty(), "fitting results never enqueue");
 
         let ref_frames = walk_frames(ptr_ref);
         let new_frames = walk_frames(ptr_new);
         assert_eq!(ref_frames.len(), 2);
-        assert_eq!(ref_frames, new_frames,
-            "single-frame stream_batch_response must be byte-identical to send_response");
+        assert_eq!(
+            ref_frames, new_frames,
+            "single-frame stream_batch_response must be byte-identical to send_response"
+        );
 
         unsafe {
             libc::munmap(ptr_ref as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
@@ -2438,17 +2626,23 @@ mod tests {
         assert_eq!(ps.next_row, 0);
         assert_eq!(ps.request_id, 5);
         assert_eq!(ps.client_id, 9);
-        assert!(walk_frames(ptr).is_empty(),
-            "the train's first chunk is emitted by drain_sal, not at enqueue time");
+        assert!(
+            walk_frames(ptr).is_empty(),
+            "the train's first chunk is emitted by drain_sal, not at enqueue time"
+        );
 
-        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
+        }
     }
 
     fn worker_temp_dir(name: &str) -> String {
         crate::foundation::posix_io::raise_fd_limit_for_tests();
         let path = std::env::temp_dir()
             .join(format!("gnitz_worker_test_{name}"))
-            .to_str().unwrap().to_owned();
+            .to_str()
+            .unwrap()
+            .to_owned();
         let _ = std::fs::remove_dir_all(&path);
         path
     }
@@ -2463,10 +2657,20 @@ mod tests {
         let dir = worker_temp_dir("string_oversized");
         let mut engine = CatalogEngine::open(&dir).unwrap();
         let cols = vec![
-            ColumnDef { name: "id".into(), type_code: type_code::U64,
-                        is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "s".into(), type_code: type_code::STRING,
-                        is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef {
+                name: "id".into(),
+                type_code: type_code::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "s".into(),
+                type_code: type_code::STRING,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
         ];
         let tid = engine.create_table("public.tstr", &cols, &[0], true).unwrap();
         let schema = engine.get_schema_desc(tid).unwrap();
@@ -2478,15 +2682,20 @@ mod tests {
 
         let (ptr, writer) = make_ring();
         let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
-        let err = wp.stream_batch_response(
-            tid as u64, Some(batch), ReplySchema::Table(&schema), 5, 0, 0,
-        ).expect("oversized STRING result must surface the clean error");
-        assert!(err.contains("STRING-column chunking"), "error names the limitation: {err}");
+        let err = wp
+            .stream_batch_response(tid as u64, Some(batch), ReplySchema::Table(&schema), 5, 0, 0)
+            .expect("oversized STRING result must surface the clean error");
+        assert!(
+            err.contains("STRING-column chunking"),
+            "error names the limitation: {err}"
+        );
         assert!(wp.pending_streams.is_empty(), "non-wire-safe results never enqueue");
 
         engine.close();
         let _ = std::fs::remove_dir_all(&dir);
-        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
+        }
     }
 
     /// A projected (gather) reply schema must ride a ONE-OFF wire block: the
@@ -2501,8 +2710,11 @@ mod tests {
         let dir = worker_temp_dir("projected_one_off");
         let mut engine = CatalogEngine::open(&dir).unwrap();
         let mk = |name: &str| ColumnDef {
-            name: name.into(), type_code: type_code::U64,
-            is_nullable: false, fk_table_id: 0, fk_col_idx: 0,
+            name: name.into(),
+            type_code: type_code::U64,
+            is_nullable: false,
+            fk_table_id: 0,
+            fk_col_idx: 0,
         };
         let cols = vec![mk("id"), mk("a"), mk("b")];
         let tid = engine.create_table("public.tproj", &cols, &[0], true).unwrap();
@@ -2515,19 +2727,23 @@ mod tests {
 
         // Fitting projected reply: one frame carrying the projected schema.
         let small = zero_batch(projected, 2);
-        assert!(wp.stream_batch_response(
-            tid as u64, Some(small), ReplySchema::OneOff(&projected), 5, 0, 0).is_none());
+        assert!(wp
+            .stream_batch_response(tid as u64, Some(small), ReplySchema::OneOff(&projected), 5, 0, 0)
+            .is_none());
         let frames = walk_frames(ptr);
         assert_eq!(frames.len(), 1);
         let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("decode projected reply");
-        assert_eq!(decoded.schema.expect("schema block present").num_columns(),
-                   projected.num_columns());
+        assert_eq!(
+            decoded.schema.expect("schema block present").num_columns(),
+            projected.num_columns()
+        );
 
         // Oversized projected reply: the queued train holds the one-off block.
         let rows = (w2m_ring::MAX_W2M_MSG as usize / 32) + 4096;
         let big = zero_batch(projected, rows);
-        assert!(wp.stream_batch_response(
-            tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0).is_none());
+        assert!(wp
+            .stream_batch_response(tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0)
+            .is_none());
         assert_eq!(wp.pending_streams.len(), 1);
         let expected_block = ipc::build_schema_wire_block(&projected, &[], tid as u32);
         let ps = wp.pending_streams.front().unwrap();
@@ -2538,11 +2754,15 @@ mod tests {
         );
 
         // Both paths left the table's cached wire block untouched.
-        assert!(engine.get_cached_schema_wire_block(tid).is_none(),
-            "a projected reply must never populate the table's schema-block cache");
+        assert!(
+            engine.get_cached_schema_wire_block(tid).is_none(),
+            "a projected reply must never populate the table's schema-block cache"
+        );
 
         engine.close();
         let _ = std::fs::remove_dir_all(&dir);
-        unsafe { libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, w2m_ring::W2M_REGION_SIZE);
+        }
     }
 }

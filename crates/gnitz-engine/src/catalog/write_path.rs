@@ -111,7 +111,8 @@ impl CatalogEngine {
     /// allocated zone LSN. Does NOT broadcast.
     fn apply_local(&mut self, family: SysFamily, batch: &mut Batch, pin_lsn: Option<NonZeroU64>) -> Result<(), String> {
         let id = family.id();
-        let table = self.sys_table_mut(id)
+        let table = self
+            .sys_table_mut(id)
             .expect("SysFamily::id() maps to a known sys table");
         ingest_batch_into(table, batch);
         if let Some(lsn) = pin_lsn {
@@ -131,8 +132,7 @@ impl CatalogEngine {
     /// an owned batch to skip the clone.
     pub fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
         if table_id < FIRST_USER_TABLE_ID {
-            let family = SysFamily::from_id(table_id)
-                .ok_or_else(|| format!("Unknown system family {table_id}"))?;
+            let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
             self.submit(family, batch.clone())
         } else {
             let rc = self.dag.ingest_by_ref(table_id, batch);
@@ -159,7 +159,8 @@ impl CatalogEngine {
     pub(crate) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
         let schema = sys_tab_schema(family.id());
         let batch = {
-            let table = self.sys_table(family.id())
+            let table = self
+                .sys_table(family.id())
                 .expect("SysFamily::id() maps to a known sys table");
             retract_single_row(table, &schema, pk)
         };
@@ -174,7 +175,10 @@ impl CatalogEngine {
     /// allowed; only a genuinely different entity under that name is rejected.
     /// Also resolves `sid`, erroring if the schema does not exist.
     fn precheck_qname_unique(&self, sid: i64, name: &str, self_id: i64) -> Result<(), String> {
-        let schema_name = self.caches.schema_by_id.get(&sid)
+        let schema_name = self
+            .caches
+            .schema_by_id
+            .get(&sid)
             .ok_or_else(|| format!("Schema with ID {sid} does not exist"))?;
         let qualified = format!("{schema_name}.{name}");
         if let Some(&existing) = self.caches.entity_by_qname.get(&qualified) {
@@ -194,17 +198,14 @@ impl CatalogEngine {
     /// form), so decode it via `unpack_pk_cols` and compare ordered lists — a
     /// bare compare would never match a packed row. Rows that have already netted
     /// to zero weight are skipped by the cursor.
-    pub(crate) fn for_each_index_on_cols(
-        &self, owner_id: i64, cols: &[u32], mut f: impl FnMut(i64, bool),
-    ) {
+    pub(crate) fn for_each_index_on_cols(&self, owner_id: i64, cols: &[u32], mut f: impl FnMut(i64, bool)) {
         let mut cursor = self.sys_indices.open_cursor();
         while cursor.cursor.valid {
             if cursor.cursor.current_weight > 0 {
                 let row_owner = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
-                let row_cols  = gnitz_wire::unpack_pk_cols(
-                    cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COLS));
+                let row_cols = gnitz_wire::unpack_pk_cols(cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COLS));
                 if row_owner == owner_id && row_cols.as_slice() == cols {
-                    let row_id  = cursor.cursor.current_key as u64 as i64;
+                    let row_id = cursor.cursor.current_key as u64 as i64;
                     let is_uniq = cursor_read_u64(&cursor, IDXTAB_COL_IS_UNIQUE) != 0;
                     f(row_id, is_uniq);
                 }
@@ -217,17 +218,15 @@ impl CatalogEngine {
     /// Covers both positive-weight (CREATE) invariants and negative-weight (DROP)
     /// integrity guards so that no invalid state is ever written.
     fn precheck_sys_ingest(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        if table_id != SCHEMA_TAB_ID
-            && table_id != TABLE_TAB_ID
-            && table_id != VIEW_TAB_ID
-            && table_id != IDX_TAB_ID
-        {
+        if table_id != SCHEMA_TAB_ID && table_id != TABLE_TAB_ID && table_id != VIEW_TAB_ID && table_id != IDX_TAB_ID {
             return Ok(());
         }
 
         // -- Positive-weight (CREATE) checks ----------------------------------
         for i in 0..batch.count {
-            if batch.get_weight(i) <= 0 { continue; }
+            if batch.get_weight(i) <= 0 {
+                continue;
+            }
 
             match table_id {
                 SCHEMA_TAB_ID => {
@@ -250,13 +249,18 @@ impl CatalogEngine {
                         return Err(format!(
                             "catalog invariant violated: table '{name}' (tid={tid}) registered \
                              before its column records. COL_TAB writes must precede \
-                             TABLE_TAB writes (see hooks.rs dispatch doc)."));
+                             TABLE_TAB writes (see hooks.rs dispatch doc)."
+                        ));
                     }
                     validate_pk_cols(&col_defs, &pk)?;
                     if col_defs.len() > crate::schema::MAX_COLUMNS {
                         return Err(format!(
                             "table '{}' (tid={}) has {} columns (max {})",
-                            name, tid, col_defs.len(), crate::schema::MAX_COLUMNS));
+                            name,
+                            tid,
+                            col_defs.len(),
+                            crate::schema::MAX_COLUMNS
+                        ));
                     }
 
                     let first_pk = pk.as_slice()[0];
@@ -281,7 +285,8 @@ impl CatalogEngine {
                         return Err(format!(
                             "catalog invariant violated: view '{name}' (vid={vid}) registered \
                              before its column records. COL_TAB writes must precede \
-                             VIEW_TAB writes (see hooks.rs dispatch doc)."));
+                             VIEW_TAB writes (see hooks.rs dispatch doc)."
+                        ));
                     }
                     // Reject an over-wide view here — before apply_entity_by_qname
                     // mutates the caches — so a rejected DDL leaves clean state,
@@ -291,7 +296,11 @@ impl CatalogEngine {
                     if col_count > crate::schema::MAX_COLUMNS {
                         return Err(format!(
                             "view '{}' (vid={}) has {} columns (max {})",
-                            name, vid, col_count, crate::schema::MAX_COLUMNS));
+                            name,
+                            vid,
+                            col_count,
+                            crate::schema::MAX_COLUMNS
+                        ));
                     }
                     self.precheck_qname_unique(sid, &name, vid)?;
                 }
@@ -305,10 +314,15 @@ impl CatalogEngine {
                     if !cols.is_well_formed() {
                         return Err(format!(
                             "Index: column list count {} out of range 1..={}",
-                            cols.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS));
+                            cols.decoded_count(),
+                            gnitz_wire::PK_LIST_MAX_COLS
+                        ));
                     }
 
-                    let entry = self.dag.tables.get(&owner_id)
+                    let entry = self
+                        .dag
+                        .tables
+                        .get(&owner_id)
                         .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
 
                     // Only base tables can own a secondary index: index
@@ -332,9 +346,13 @@ impl CatalogEngine {
                         format!(
                             "{} for table '{}' (tid={})",
                             e,
-                            self.caches.entity_by_id.get(&owner_id)
-                                .map(|(_, n)| n.as_str()).unwrap_or("?"),
-                            owner_id)
+                            self.caches
+                                .entity_by_id
+                                .get(&owner_id)
+                                .map(|(_, n)| n.as_str())
+                                .unwrap_or("?"),
+                            owner_id
+                        )
                     })?;
 
                     let idx_id = batch.get_pk(i) as i64;
@@ -376,8 +394,7 @@ impl CatalogEngine {
             for &sid in &drop_ids {
                 let n = self.schema_member_count(sid);
                 if n > 0 {
-                    return Err(format!(
-                        "Schema not empty: {n} relation(s) remain; drop them first"));
+                    return Err(format!("Schema not empty: {n} relation(s) remain; drop them first"));
                 }
             }
             return Ok(());
@@ -404,15 +421,23 @@ impl CatalogEngine {
                     if !cursor.cursor.valid || cursor.cursor.current_key as u64 != idx_id as u64 {
                         continue;
                     }
-                    (cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64,
-                     gnitz_wire::unpack_pk_cols(cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COLS)))
+                    (
+                        cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64,
+                        gnitz_wire::unpack_pk_cols(cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COLS)),
+                    )
                 };
                 // FK backing is single-column: a composite index never satisfies
                 // a single-column FK/uniqueness requirement, so dropping
                 // one is never blocked by the FK-target guard.
-                if cols.as_slice().len() != 1 { continue; }
+                if cols.as_slice().len() != 1 {
+                    continue;
+                }
                 let src_col = cols.as_slice()[0] as usize;
-                if self.fk_children_of(owner_id).iter().any(|r| r.parent_col_idx == src_col) {
+                if self
+                    .fk_children_of(owner_id)
+                    .iter()
+                    .any(|r| r.parent_col_idx == src_col)
+                {
                     // The FK target column must retain uniqueness for FK child
                     // inserts to validate. The drop is allowed when uniqueness is
                     // structurally preserved: the column is the lone PK (the PK
@@ -433,11 +458,11 @@ impl CatalogEngine {
                             }
                         });
                         if !unique_remains {
-                            let (sn, tn) = self.caches.entity_by_id.get(&owner_id)
-                                .cloned().unwrap_or_default();
+                            let (sn, tn) = self.caches.entity_by_id.get(&owner_id).cloned().unwrap_or_default();
                             return Err(format!(
                                 "Integrity violation: index on '{sn}.{tn}' is referenced by a \
-                                 foreign key and no unique index would remain on the column"));
+                                 foreign key and no unique index would remain on the column"
+                            ));
                         }
                     }
                 }
@@ -450,15 +475,13 @@ impl CatalogEngine {
                 // A FK child being co-dropped in this same batch is
                 // self-resolving — only a child *outside* the batch blocks the
                 // drop. Mirrors the view-dependency binary_search filter below.
-                let blocking = self.fk_children_of(tid)
+                let blocking = self
+                    .fk_children_of(tid)
                     .iter()
                     .find(|r| drop_ids.binary_search(&r.child_tid).is_err());
                 if let Some(r) = blocking {
-                    let (sn, tn) = self.caches.entity_by_id.get(&r.child_tid)
-                        .cloned().unwrap_or_default();
-                    return Err(format!(
-                        "Integrity violation: table referenced by '{sn}.{tn}'"
-                    ));
+                    let (sn, tn) = self.caches.entity_by_id.get(&r.child_tid).cloned().unwrap_or_default();
+                    return Err(format!("Integrity violation: table referenced by '{sn}.{tn}'"));
                 }
             }
         }
@@ -480,11 +503,11 @@ impl CatalogEngine {
                     // batch is self-resolving — only an *outside* dependent
                     // blocks the drop. drop_ids is sorted+deduped above, so
                     // binary_search is O(N log M) vs the O(N·M) of `contains`.
-                    let still_active = dependents.iter()
+                    let still_active = dependents
+                        .iter()
                         .any(|&dep_id| drop_ids.binary_search(&dep_id).is_err());
                     if still_active {
-                        let (sn, tn) = self.caches.entity_by_id.get(&id)
-                            .cloned().unwrap_or_default();
+                        let (sn, tn) = self.caches.entity_by_id.get(&id).cloned().unwrap_or_default();
                         return Err(format!("View dependency: entity '{sn}.{tn}'"));
                     }
                 }
@@ -530,8 +553,7 @@ impl CatalogEngine {
     /// `checkpoint_gated_deletions`. Used on the DROP-success path where worker
     /// processes may still be applying the entity's CREATE.
     pub fn defer_pending_dir_deletions(&mut self) {
-        self.checkpoint_gated_deletions
-            .append(&mut self.pending_dir_deletions);
+        self.checkpoint_gated_deletions.append(&mut self.pending_dir_deletions);
     }
 
     /// Physically remove every checkpoint-gated directory. SAFE only at a
@@ -591,8 +613,7 @@ impl CatalogEngine {
     /// same-name schema whose live path SAL replay left in the queue.
     pub(crate) fn gc_orphan_directories(&mut self) {
         // Full on-disk path of every live table/view (user + system).
-        let live_tables: rustc_hash::FxHashSet<&str> =
-            self.dag.tables.values().map(|e| e.directory.as_str()).collect();
+        let live_tables: rustc_hash::FxHashSet<&str> = self.dag.tables.values().map(|e| e.directory.as_str()).collect();
 
         // Full on-disk path of every live index: `<owner_dir>/idx_<idx_id>`.
         let mut live_indices: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
@@ -674,16 +695,16 @@ impl CatalogEngine {
     /// distinct for TABLE_TAB and VIEW_TAB so the relative order is stable.
     fn rollback_topo_priority(tid: i64) -> u8 {
         match tid {
-            SCHEMA_TAB_ID                => 0,
-            COL_TAB_ID                   => 1,
-            DEP_TAB_ID                   => 2,
-            CIRCUIT_NODES_TAB_ID         => 3,
-            CIRCUIT_EDGES_TAB_ID         => 4,
-            CIRCUIT_NODE_COLUMNS_TAB_ID  => 5,
-            TABLE_TAB_ID                 => 6,
-            VIEW_TAB_ID                  => 7,
-            IDX_TAB_ID                   => 8,
-            _                            => 99,
+            SCHEMA_TAB_ID => 0,
+            COL_TAB_ID => 1,
+            DEP_TAB_ID => 2,
+            CIRCUIT_NODES_TAB_ID => 3,
+            CIRCUIT_EDGES_TAB_ID => 4,
+            CIRCUIT_NODE_COLUMNS_TAB_ID => 5,
+            TABLE_TAB_ID => 6,
+            VIEW_TAB_ID => 7,
+            IDX_TAB_ID => 8,
+            _ => 99,
         }
     }
 
@@ -702,11 +723,7 @@ impl CatalogEngine {
     ///
     /// Called from the executor's Stage-A error arm. `original_batch` is the
     /// batch that was passed to `ingest_to_family` before the failure.
-    pub(crate) fn compensate_stage_a(
-        &mut self,
-        target_id: i64,
-        original_batch: &Batch,
-    ) {
+    pub(crate) fn compensate_stage_a(&mut self, target_id: i64, original_batch: &Batch) {
         let mut rollback_list = self.drain_pending_broadcasts();
 
         // pending_broadcasts is children-before-parents: the top-level batch is
@@ -720,8 +737,7 @@ impl CatalogEngine {
             rollback_list.push((target_id, b));
         }
 
-        let is_create = (0..original_batch.count)
-            .any(|i| original_batch.get_weight(i) > 0);
+        let is_create = (0..original_batch.count).any(|i| original_batch.get_weight(i) > 0);
 
         debug_assert!(
             original_batch.count == 0
@@ -747,8 +763,7 @@ impl CatalogEngine {
         let result = self.with_rollback_compensation(|s| -> Result<(), String> {
             for (tid, mut batch) in rollback_list {
                 Self::negate_batch_in_place(&mut batch);
-                let family = SysFamily::from_id(tid)
-                    .ok_or_else(|| format!("rollback: unknown system family {tid}"))?;
+                let family = SysFamily::from_id(tid).ok_or_else(|| format!("rollback: unknown system family {tid}"))?;
                 s.submit_local(family, batch)?;
             }
             Ok(())
@@ -765,7 +780,8 @@ impl CatalogEngine {
         result.unwrap_or_else(|e| {
             gnitz_fatal_abort!(
                 "Stage-A DDL compensation failed — catalog cannot be restored; \
-                 aborting to prevent serving a diverged catalog. Cause: {}", e
+                 aborting to prevent serving a diverged catalog. Cause: {}",
+                e
             );
         });
     }

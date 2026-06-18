@@ -1,16 +1,15 @@
 //! DBSP VM: executes compiled circuit programs entirely in Rust.
 
+use crate::expr::ScalarFuncKind;
+use crate::ops::AggDescriptor;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, CursorHandle, Table};
-use crate::ops::AggDescriptor;
-use crate::expr::ScalarFuncKind;
 
 mod builder;
 mod exec;
 
 pub(crate) use builder::ProgramBuilder;
 pub(crate) use exec::{execute_epoch, execute_epoch_multi};
-
 
 // ---------------------------------------------------------------------------
 // Instruction set
@@ -20,59 +19,137 @@ pub(crate) use exec::{execute_epoch, execute_epoch_multi};
 pub(crate) enum Instr {
     Halt,
     ClearDeltas,
-    Delay { src: u16, state_reg: u16, dst: u16 },
-    ScanTrace { trace_reg: u16, out_reg: u16, chunk_limit: i32 },
-    SeekTrace { trace_reg: u16, key_reg: u16 },
-    Filter { in_reg: u16, out_reg: u16, func_idx: u16 },
+    Delay {
+        src: u16,
+        state_reg: u16,
+        dst: u16,
+    },
+    ScanTrace {
+        trace_reg: u16,
+        out_reg: u16,
+        chunk_limit: i32,
+    },
+    SeekTrace {
+        trace_reg: u16,
+        key_reg: u16,
+    },
+    Filter {
+        in_reg: u16,
+        out_reg: u16,
+        func_idx: u16,
+    },
     Map {
-        in_reg: u16, out_reg: u16, func_idx: u16, out_schema_idx: u16,
-        reindex_off: u32, reindex_cnt: u16, reindex_hash: bool, branch_id: u8,
+        in_reg: u16,
+        out_reg: u16,
+        func_idx: u16,
+        out_schema_idx: u16,
+        reindex_off: u32,
+        reindex_cnt: u16,
+        reindex_hash: bool,
+        branch_id: u8,
     },
-    Negate { in_reg: u16, out_reg: u16 },
-    Union { in_a: u16, in_b: u16, has_b: bool, out_reg: u16 },
-    Distinct { in_reg: u16, hist_reg: u16, out_reg: u16, hist_table_idx: i16 },
-    JoinDT { delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema_idx: u16 },
-    JoinDD { a_reg: u16, b_reg: u16, out_reg: u16, right_schema_idx: u16 },
-    JoinDTOuter { delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema_idx: u16 },
+    Negate {
+        in_reg: u16,
+        out_reg: u16,
+    },
+    Union {
+        in_a: u16,
+        in_b: u16,
+        has_b: bool,
+        out_reg: u16,
+    },
+    Distinct {
+        in_reg: u16,
+        hist_reg: u16,
+        out_reg: u16,
+        hist_table_idx: i16,
+    },
+    JoinDT {
+        delta_reg: u16,
+        trace_reg: u16,
+        out_reg: u16,
+        right_schema_idx: u16,
+    },
+    JoinDD {
+        a_reg: u16,
+        b_reg: u16,
+        out_reg: u16,
+        right_schema_idx: u16,
+    },
+    JoinDTOuter {
+        delta_reg: u16,
+        trace_reg: u16,
+        out_reg: u16,
+        right_schema_idx: u16,
+    },
     JoinDTRange {
-        delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema_idx: u16,
-        n_eq: u8, rel: gnitz_wire::RangeRel,
+        delta_reg: u16,
+        trace_reg: u16,
+        out_reg: u16,
+        right_schema_idx: u16,
+        n_eq: u8,
+        rel: gnitz_wire::RangeRel,
     },
-    PartitionFilter { in_reg: u16, out_reg: u16, worker_id: u32, num_workers: u32 },
-    AntiJoinDT { delta_reg: u16, trace_reg: u16, out_reg: u16 },
-    AntiJoinDD { a_reg: u16, b_reg: u16, out_reg: u16 },
-    SemiJoinDT { delta_reg: u16, trace_reg: u16, out_reg: u16 },
-    SemiJoinDD { a_reg: u16, b_reg: u16, out_reg: u16 },
-    NullExtend { in_reg: u16, out_reg: u16, right_schema_idx: u16 },
+    PartitionFilter {
+        in_reg: u16,
+        out_reg: u16,
+        worker_id: u32,
+        num_workers: u32,
+    },
+    AntiJoinDT {
+        delta_reg: u16,
+        trace_reg: u16,
+        out_reg: u16,
+    },
+    AntiJoinDD {
+        a_reg: u16,
+        b_reg: u16,
+        out_reg: u16,
+    },
+    SemiJoinDT {
+        delta_reg: u16,
+        trace_reg: u16,
+        out_reg: u16,
+    },
+    SemiJoinDD {
+        a_reg: u16,
+        b_reg: u16,
+        out_reg: u16,
+    },
+    NullExtend {
+        in_reg: u16,
+        out_reg: u16,
+        right_schema_idx: u16,
+    },
     Integrate {
         in_reg: u16,
-        table_idx: i32,       // index into Program::tables, -1 = no target (sink)
+        table_idx: i32, // index into Program::tables, -1 = no target (sink)
         gi: Option<IntegrateGi>,
         avi: Option<IntegrateAvi>,
     },
     Reduce {
         in_reg: u16,
-        trace_in_reg: i16,    // -1 = no trace_in
+        trace_in_reg: i16, // -1 = no trace_in
         trace_out_reg: u16,
         out_reg: u16,
-        fin_out_reg: i16,     // -1 = no finalize output
+        fin_out_reg: i16, // -1 = no finalize output
         agg_descs_offset: u32,
         agg_descs_count: u16,
         group_cols_offset: u32,
         group_cols_count: u16,
         output_schema_idx: u16,
         // AVI params — AVI cursor is created fresh from the AVI table each tick
-        avi_table_idx: i16,   // -1 = no AVI; index into Program::tables
+        avi_table_idx: i16, // -1 = no AVI; index into Program::tables
         avi_for_max: bool,
         avi_agg_col_type_code: u8,
         #[allow(dead_code)]
         avi_agg_col_idx: u32,
         // GI params — GI cursor is created fresh from the GI table each tick
-        gi_table_idx: i16,    // -1 = no GI; index into Program::tables
+        gi_table_idx: i16, // -1 = no GI; index into Program::tables
         gi_col_idx: u32,
         // Finalize
-        finalize_func_idx: i16,  // -1 = no finalize program
-        finalize_schema_idx: i16,  // -1 = no finalize schema
+        finalize_func_idx: i16,   // -1 = no finalize program
+        finalize_schema_idx: i16, // -1 = no finalize schema
     },
     GatherReduce {
         in_reg: u16,
@@ -98,7 +175,6 @@ pub(crate) struct IntegrateAvi {
     pub group_cols_count: u16,
     pub agg_col_idx: u32,
 }
-
 
 /// Opaque handle owning a compiled program and its register file.
 ///
@@ -141,7 +217,8 @@ const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset
 const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_funcs));
 const _: () = assert!(std::mem::offset_of!(VmHandle, program) < std::mem::offset_of!(VmHandle, owned_expr_progs));
 // Cursor destructors dereference their owning `Table`; cursors MUST drop first.
-const _: () = assert!(std::mem::offset_of!(VmHandle, owned_cursor_handles) < std::mem::offset_of!(VmHandle, owned_tables));
+const _: () =
+    assert!(std::mem::offset_of!(VmHandle, owned_cursor_handles) < std::mem::offset_of!(VmHandle, owned_tables));
 
 impl VmHandle {
     /// Compact owned tables and create fresh cursors for owned trace registers.
@@ -149,10 +226,14 @@ impl VmHandle {
     /// The cursor handles are stored in `owned_cursor_handles` and their
     /// raw pointers bound into the register file.
     pub fn refresh_owned_cursors(&mut self) {
-        gnitz_debug!("vm: refresh_owned_cursors, {} owned trace regs", self.owned_trace_regs.len());
+        gnitz_debug!(
+            "vm: refresh_owned_cursors, {} owned trace regs",
+            self.owned_trace_regs.len()
+        );
         // Resize storage if needed
         if self.owned_cursor_handles.len() < self.owned_trace_regs.len() {
-            self.owned_cursor_handles.resize_with(self.owned_trace_regs.len(), || None);
+            self.owned_cursor_handles
+                .resize_with(self.owned_trace_regs.len(), || None);
         }
         for (slot, &(reg_id, table_idx)) in self.owned_trace_regs.iter().enumerate() {
             // Drop previous cursor before creating new one (releases shard refs etc.)
@@ -175,8 +256,7 @@ impl VmHandle {
                     // move raises Stacked Borrows aliasing questions even
                     // though the heap address is stable across the move.
                     self.owned_cursor_handles[slot] = Some(Box::new(ch));
-                    let ptr = self.owned_cursor_handles[slot].as_mut().unwrap()
-                        .as_mut() as *mut CursorHandle;
+                    let ptr = self.owned_cursor_handles[slot].as_mut().unwrap().as_mut() as *mut CursorHandle;
                     self.regfile.registers[reg_id as usize].cursor_ptr = ptr;
                 }
                 Err(_) => {
@@ -280,11 +360,7 @@ impl RegisterFile {
     /// `refresh_owned_cursors`) are skipped entirely. External trace registers
     /// are always written from `handles` — stale pointers from prior epochs are
     /// never preserved.
-    pub fn bind_cursors(
-        &mut self,
-        handles: &[*mut libc::c_void],
-        owned_trace_reg_ids: &[(u16, usize)],
-    ) {
+    pub fn bind_cursors(&mut self, handles: &[*mut libc::c_void], owned_trace_reg_ids: &[(u16, usize)]) {
         for (i, reg) in self.registers.iter_mut().enumerate() {
             if reg.kind == RegisterKind::Trace {
                 let is_owned = owned_trace_reg_ids.iter().any(|&(rid, _)| rid as usize == i);
@@ -311,7 +387,6 @@ impl RegisterFile {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -319,8 +394,8 @@ impl RegisterFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, TypeCode, type_code};
     use crate::ops::{AggDescriptor, AggOp};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 
     #[test]
     fn test_clear_delta_batches_clears_only_delta_registers() {
@@ -344,8 +419,18 @@ mod tests {
 
         let mut rf = RegisterFile {
             registers: vec![
-                Register { kind: RegisterKind::Delta, schema, batch: delta_batch, cursor_ptr: std::ptr::null_mut() },
-                Register { kind: RegisterKind::Trace, schema, batch: trace_batch, cursor_ptr: std::ptr::null_mut() },
+                Register {
+                    kind: RegisterKind::Delta,
+                    schema,
+                    batch: delta_batch,
+                    cursor_ptr: std::ptr::null_mut(),
+                },
+                Register {
+                    kind: RegisterKind::Trace,
+                    schema,
+                    batch: trace_batch,
+                    cursor_ptr: std::ptr::null_mut(),
+                },
             ],
         };
         assert_eq!(rf.registers[0].batch.count, 1);
@@ -410,8 +495,8 @@ mod tests {
         let mut rows = Vec::new();
         for i in 0..b.count {
             let pk = b.get_pk(i) as u64;
-            let w = i64::from_le_bytes(b.weight_data()[i*8..(i+1)*8].try_into().unwrap());
-            let c0 = i64::from_le_bytes(b.col_data(0)[i*8..(i+1)*8].try_into().unwrap());
+            let w = i64::from_le_bytes(b.weight_data()[i * 8..(i + 1) * 8].try_into().unwrap());
+            let c0 = i64::from_le_bytes(b.col_data(0)[i * 8..(i + 1) * 8].try_into().unwrap());
             rows.push((pk, w, c0));
         }
         rows
@@ -429,14 +514,23 @@ mod tests {
 
         // Predicate: col[1] > 0  (col[1] is the I64 payload at logical index 1)
         let pred_code = vec![
-            crate::expr::EXPR_LOAD_COL_INT, 0, 1, 0,  // r0 = col[1]
-            crate::expr::EXPR_LOAD_CONST, 1, 0, 0,    // r1 = 0
-            crate::expr::EXPR_CMP_GT, 2, 0, 1,        // r2 = r0 > r1
+            crate::expr::EXPR_LOAD_COL_INT,
+            0,
+            1,
+            0, // r0 = col[1]
+            crate::expr::EXPR_LOAD_CONST,
+            1,
+            0,
+            0, // r1 = 0
+            crate::expr::EXPR_CMP_GT,
+            2,
+            0,
+            1, // r2 = r0 > r1
         ];
         let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
-        let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_predicate(pred_prog, &schema),
-        ));
+        let func = Box::new(ScalarFuncKind::Plan(crate::expr::Plan::from_predicate(
+            pred_prog, &schema,
+        )));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(3);
@@ -444,19 +538,15 @@ mod tests {
         builder.add_negate(1, 2);
         builder.add_halt();
 
-        let input = make_batch(schema, &[
-            (1u128, 1, 10),
-            (2u128, 1, -5),
-            (3u128, 1, 20),
-        ]);
+        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, -5), (3u128, 1, 20)]);
 
         let reg_schemas = [schema; 3];
         let reg_kinds = [0u8; 3]; // all delta
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
@@ -464,7 +554,9 @@ mod tests {
         assert_eq!(rows[1], (3, -1, 20));
 
         // Cleanup
-        unsafe { drop(Box::from_raw(func_ptr as *mut ScalarFuncKind)); }
+        unsafe {
+            drop(Box::from_raw(func_ptr as *mut ScalarFuncKind));
+        }
     }
 
     #[test]
@@ -484,9 +576,7 @@ mod tests {
         let reg_kinds = [0u8; 2];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
-        ).unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[]).unwrap();
 
         assert!(result.is_none());
     }
@@ -505,9 +595,7 @@ mod tests {
         let reg_kinds = [0u8; 2];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
-        ).unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[]).unwrap();
 
         assert!(result.is_none());
     }
@@ -541,13 +629,17 @@ mod tests {
 
         // Tick 1: output = tick 0's input
         let input1 = make_batch(schema, &[(2u128, 1, 20)]);
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors, &[]).unwrap().unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
         let rows1 = extract_rows(&r1);
         assert_eq!(rows1, vec![(1, 1, 10)]);
 
         // Tick 2: output = tick 1's input
         let input2 = make_batch(schema, &[(3u128, 1, 30)]);
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors, &[]).unwrap().unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
         let rows2 = extract_rows(&r2);
         assert_eq!(rows2, vec![(2, 1, 20)]);
     }
@@ -585,19 +677,57 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 3];
 
         // Tick 0: non-empty input → None
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1u128, 1, 10)]), 0, 2, &cursors, &[]).unwrap();
+        let r0 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[(1u128, 1, 10)]),
+            0,
+            2,
+            &cursors,
+            &[],
+        )
+        .unwrap();
         assert!(r0.is_none());
 
         // Tick 1: empty input → tick 0's input replayed
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors, &[]).unwrap().unwrap();
+        let r1 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[]),
+            0,
+            2,
+            &cursors,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(extract_rows(&r1), vec![(1, 1, 10)]);
 
         // Tick 2: non-empty input → empty (tick 1's empty was stored)
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(2u128, 1, 20)]), 0, 2, &cursors, &[]).unwrap();
+        let r2 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[(2u128, 1, 20)]),
+            0,
+            2,
+            &cursors,
+            &[],
+        )
+        .unwrap();
         assert!(r2.is_none(), "tick 2 output should be empty (tick 1 input was empty)");
 
         // Tick 3: empty input → tick 2's input replayed
-        let r3 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors, &[]).unwrap().unwrap();
+        let r3 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[]),
+            0,
+            2,
+            &cursors,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(extract_rows(&r3), vec![(2, 1, 20)]);
     }
 
@@ -615,15 +745,44 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 3];
 
         // Tick 0: insertion → None
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1u128, 1, 10)]), 0, 2, &cursors, &[]).unwrap();
+        let r0 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[(1u128, 1, 10)]),
+            0,
+            2,
+            &cursors,
+            &[],
+        )
+        .unwrap();
         assert!(r0.is_none());
 
         // Tick 1: retraction → tick 0's insertion replayed
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1u128, -1, 10)]), 0, 2, &cursors, &[]).unwrap().unwrap();
+        let r1 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[(1u128, -1, 10)]),
+            0,
+            2,
+            &cursors,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(extract_rows(&r1), vec![(1, 1, 10)]);
 
         // Tick 2: empty → tick 1's retraction replayed
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 2, &cursors, &[]).unwrap().unwrap();
+        let r2 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[]),
+            0,
+            2,
+            &cursors,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(extract_rows(&r2), vec![(1, -1, 10)]);
     }
 
@@ -651,19 +810,57 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(); 5];
 
         // Tick 0: no output yet
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(1u128, 1, 10)]), 0, 4, &cursors, &[]).unwrap();
+        let r0 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[(1u128, 1, 10)]),
+            0,
+            4,
+            &cursors,
+            &[],
+        )
+        .unwrap();
         assert!(r0.is_none());
 
         // Tick 1: still no output (need 2 ticks of delay)
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(2u128, 1, 20)]), 0, 4, &cursors, &[]).unwrap();
+        let r1 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[(2u128, 1, 20)]),
+            0,
+            4,
+            &cursors,
+            &[],
+        )
+        .unwrap();
         assert!(r1.is_none());
 
         // Tick 2: tick 0's input arrives
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[(3u128, 1, 30)]), 0, 4, &cursors, &[]).unwrap().unwrap();
+        let r2 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[(3u128, 1, 30)]),
+            0,
+            4,
+            &cursors,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(extract_rows(&r2), vec![(1, 1, 10)]);
 
         // Tick 3: empty input → tick 1's input arrives
-        let r3 = execute_epoch(&vm.program, &mut vm.regfile, make_batch(schema, &[]), 0, 4, &cursors, &[]).unwrap().unwrap();
+        let r3 = execute_epoch(
+            &vm.program,
+            &mut vm.regfile,
+            make_batch(schema, &[]),
+            0,
+            4,
+            &cursors,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(extract_rows(&r3), vec![(2, 1, 20)]);
     }
 
@@ -684,11 +881,17 @@ mod tests {
 
         let input0 = make_batch(schema, &[(1u128, 1, 10)]);
         execute_epoch(&vm.program, &mut vm.regfile, input0, 0, 2, &cursors, &[]).unwrap();
-        assert_eq!(vm.regfile.registers[1].batch.count, 1, "state_reg must hold tick 0's input");
+        assert_eq!(
+            vm.regfile.registers[1].batch.count, 1,
+            "state_reg must hold tick 0's input"
+        );
 
         let input1 = make_batch(schema, &[(2u128, 1, 20), (3u128, 1, 30)]);
         execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors, &[]).unwrap();
-        assert_eq!(vm.regfile.registers[1].batch.count, 2, "state_reg must hold tick 1's input");
+        assert_eq!(
+            vm.regfile.registers[1].batch.count, 2,
+            "state_reg must hold tick 1's input"
+        );
     }
 
     #[test]
@@ -709,9 +912,9 @@ mod tests {
         let reg_kinds = [0u8; 2];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.count, 2);
     }
@@ -730,9 +933,9 @@ mod tests {
         let reg_kinds = [0u8; 2];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[])
+            .unwrap()
+            .unwrap();
         let rows = extract_rows(&result);
         assert_eq!(
             rows,
@@ -757,9 +960,9 @@ mod tests {
         let reg_kinds = [0u8; 3];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
         assert!(
             result.consolidated,
             "absent-trace outer-join output must be consolidated",
@@ -781,9 +984,9 @@ mod tests {
         let reg_kinds = [0u8; 3];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
         assert!(
             result.consolidated,
             "absent-trace anti-join output must be consolidated",
@@ -799,18 +1002,15 @@ mod tests {
         builder.add_filter(0, 1, std::ptr::null());
         builder.add_halt();
 
-        let input = make_batch(schema, &[
-            (1u128, 1, 10),
-            (2u128, 1, 20),
-        ]);
+        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20)]);
 
         let reg_schemas = [schema; 2];
         let reg_kinds = [0u8; 2];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
@@ -834,16 +1034,16 @@ mod tests {
 
         // Tick 1
         let input1 = make_batch(schema, &[(1u128, 1, 10)]);
-        let r1 = execute_epoch(
-            &vm.program, &mut vm.regfile, input1, 0, 1, &cursors, &[],
-        ).unwrap().unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 1, &cursors, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(r1.count, 1);
 
         // Tick 2 with different data
         let input2 = make_batch(schema, &[(2u128, 1, 20), (3u128, 1, 30)]);
-        let r2 = execute_epoch(
-            &vm.program, &mut vm.regfile, input2, 0, 1, &cursors, &[],
-        ).unwrap().unwrap();
+        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 1, &cursors, &[])
+            .unwrap()
+            .unwrap();
         // Should have exactly 2 rows from tick 2, not 3 (no bleed from tick 1)
         assert_eq!(r2.count, 2);
         let rows = extract_rows(&r2);
@@ -858,27 +1058,27 @@ mod tests {
         let out_schema = make_schema(&[type_code::I64]);
 
         // MAP with Plan projection: reorder/select columns.
-        let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_projection(&[2], &[type_code::I64], &in_schema, &out_schema),
-        ));
+        let func = Box::new(ScalarFuncKind::Plan(crate::expr::Plan::from_projection(
+            &[2],
+            &[type_code::I64],
+            &in_schema,
+            &out_schema,
+        )));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(2);
         builder.add_map(0, 1, func_ptr, out_schema, &[], &[], false, 0);
         builder.add_halt();
 
-        let input = make_batch_2col(in_schema, &[
-            (1u128, 1, 10, 100),
-            (2u128, 1, 20, 200),
-        ]);
+        let input = make_batch_2col(in_schema, &[(1u128, 1, 10, 100), (2u128, 1, 20, 200)]);
 
         let reg_schemas = [in_schema, out_schema];
         let reg_kinds = [0u8; 2];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
@@ -886,7 +1086,9 @@ mod tests {
         assert_eq!(rows[0].2, 100);
         assert_eq!(rows[1].2, 200);
 
-        unsafe { drop(Box::from_raw(func_ptr as *mut ScalarFuncKind)); }
+        unsafe {
+            drop(Box::from_raw(func_ptr as *mut ScalarFuncKind));
+        }
     }
 
     #[test]
@@ -898,8 +1100,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("dist_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "hist", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "hist",
+            schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
 
         let table_ptr = &mut table as *mut Table;
 
@@ -920,15 +1128,17 @@ mod tests {
         let ch1 = Box::into_raw(Box::new(cursor1)) as *mut libc::c_void;
         let cursors1 = vec![std::ptr::null_mut(), ch1, std::ptr::null_mut()];
 
-        let r1 = execute_epoch(
-            &vm.program, &mut vm.regfile, input1, 0, 2, &cursors1, &[],
-        ).unwrap().unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors1, &[])
+            .unwrap()
+            .unwrap();
 
         let rows1 = extract_rows(&r1);
         assert_eq!(rows1.len(), 1);
         assert_eq!(rows1[0], (1, 1, 42)); // clamped to +1
 
-        unsafe { drop(Box::from_raw(ch1 as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(ch1 as *mut CursorHandle));
+        }
 
         // Tick 2: delta w=-1, integral before tick = +3, after = +2 (still positive).
         // No boundary crossing → output should be empty.
@@ -938,7 +1148,9 @@ mod tests {
         let input2 = make_batch(schema, &[(1u128, -1, 42)]);
         let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors2, &[]).unwrap();
         assert!(r2.is_none(), "no boundary crossing: output should be empty");
-        unsafe { drop(Box::from_raw(ch2 as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(ch2 as *mut CursorHandle));
+        }
 
         // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
         // Positive→non-positive boundary crossed → retraction: output pk=1 w=-1.
@@ -952,7 +1164,9 @@ mod tests {
         let rows3 = extract_rows(&r3);
         assert_eq!(rows3.len(), 1);
         assert_eq!(rows3[0], (1, -1, 42)); // retraction
-        unsafe { drop(Box::from_raw(ch3 as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(ch3 as *mut CursorHandle));
+        }
 
         table.close();
     }
@@ -970,8 +1184,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("join_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", right_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "trace",
+            right_schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
 
         // Ingest trace data
         let trace_batch = make_batch(right_schema, &[(10u128, 1, 200)]);
@@ -992,9 +1212,9 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
 
         let input = make_batch(left_schema, &[(10u128, 1, 100)]);
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.count, 1);
         // Weight should be product: 1*1 = 1
@@ -1006,7 +1226,9 @@ mod tests {
         assert_eq!(c0, 100);
         assert_eq!(c1, 200);
 
-        unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(ch as *mut CursorHandle));
+        }
         table.close();
     }
 
@@ -1020,15 +1242,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("join_multi_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", right_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "trace",
+            right_schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
 
         // Ingest 3 trace rows with same PK but different payloads
-        let trace_batch = make_batch(right_schema, &[
-            (10u128, 1, 100),
-            (10u128, 1, 200),
-            (10u128, 1, 300),
-        ]);
+        let trace_batch = make_batch(right_schema, &[(10u128, 1, 100), (10u128, 1, 200), (10u128, 1, 300)]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
         let cursor = table.open_cursor();
@@ -1044,19 +1268,21 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
 
         let input = make_batch(left_schema, &[(10u128, 2, 50)]); // weight=2
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         // Should produce 3 output rows (1 delta × 3 trace)
         assert_eq!(result.count, 3);
         // Each output weight = 2 * 1 = 2
         for i in 0..3 {
-            let w = i64::from_le_bytes(result.weight_data()[i*8..(i+1)*8].try_into().unwrap());
+            let w = i64::from_le_bytes(result.weight_data()[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(w, 2);
         }
 
-        unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(ch as *mut CursorHandle));
+        }
         table.close();
     }
 
@@ -1068,14 +1294,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cursor_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "test", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "test",
+            schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
 
-        let batch = make_batch(schema, &[
-            (1u128, 1, 10),
-            (2u128, 1, 20),
-            (3u128, 1, 30),
-        ]);
+        let batch = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30)]);
         table.ingest_owned_batch(batch).unwrap();
 
         let mut ch = table.open_cursor();
@@ -1109,9 +1337,9 @@ mod tests {
         let reg_kinds = [0u8; 2];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 1);
@@ -1126,14 +1354,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("antijoin_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "trace",
+            schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
 
         // Trace has pk=1 and pk=3
-        let trace_batch = make_batch(schema, &[
-            (1u128, 1, 100),
-            (3u128, 1, 300),
-        ]);
+        let trace_batch = make_batch(schema, &[(1u128, 1, 100), (3u128, 1, 300)]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
         let cursor = table.open_cursor();
@@ -1149,20 +1380,18 @@ mod tests {
         let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
 
         // Delta has pk=1, pk=2, pk=3. Only pk=2 should survive anti-join.
-        let input = make_batch(schema, &[
-            (1u128, 1, 10),
-            (2u128, 1, 20),
-            (3u128, 1, 30),
-        ]);
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
-        ).unwrap().unwrap();
+        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30)]);
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, 2); // only pk=2 survives
 
-        unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(ch as *mut CursorHandle));
+        }
         table.close();
     }
 
@@ -1174,13 +1403,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("semijoin_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "trace",
+            schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
 
-        let trace_batch = make_batch(schema, &[
-            (1u128, 1, 100),
-            (3u128, 1, 300),
-        ]);
+        let trace_batch = make_batch(schema, &[(1u128, 1, 100), (3u128, 1, 300)]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
         let cursor = table.open_cursor();
@@ -1195,21 +1427,19 @@ mod tests {
         let mut vm = *builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
 
-        let input = make_batch(schema, &[
-            (1u128, 1, 10),
-            (2u128, 1, 20),
-            (3u128, 1, 30),
-        ]);
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
-        ).unwrap().unwrap();
+        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30)]);
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 1); // pk=1 matches trace
         assert_eq!(rows[1].0, 3); // pk=3 matches trace
 
-        unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(ch as *mut CursorHandle));
+        }
         table.close();
     }
 
@@ -1218,8 +1448,8 @@ mod tests {
         // REDUCE with SUM aggregation over a group column.
         // Uses real tables for trace_out and trace_in.
         let in_schema = make_schema(&[
-            type_code::I64,  // group col (payload col 0)
-            type_code::I64,  // agg col (payload col 1)
+            type_code::I64, // group col (payload col 0)
+            type_code::I64, // agg col (payload col 1)
         ]);
 
         // Output schema: [U128 PK, I64 group_col, I64 sum_col]
@@ -1230,16 +1460,28 @@ mod tests {
         // trace_out table
         let tout_dir = dir.path().join("tr_out");
         let mut trace_out_table = Table::new(
-            tout_dir.to_str().unwrap(), "tr_out", out_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tout_dir.to_str().unwrap(),
+            "tr_out",
+            out_schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
 
         let trace_out_ptr = &mut trace_out_table as *mut Table;
 
         // trace_in table (for non-linear agg, but SUM is linear — still test the path)
         let tin_dir = dir.path().join("tr_in");
         let mut trace_in_table = Table::new(
-            tin_dir.to_str().unwrap(), "tr_in", in_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tin_dir.to_str().unwrap(),
+            "tr_in",
+            in_schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
 
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
@@ -1261,36 +1503,48 @@ mod tests {
 
         // REDUCE: reads from reg 0, trace_in=reg 3, trace_out=reg 1, output=reg 2
         builder.add_reduce(
-            0,            // in_reg
-            3,            // trace_in_reg
-            1,            // trace_out_reg
-            2,            // out_reg
-            -1,           // fin_out_reg (no finalize)
+            0,  // in_reg
+            3,  // trace_in_reg
+            1,  // trace_out_reg
+            2,  // out_reg
+            -1, // fin_out_reg (no finalize)
             &agg_descs,
             &group_cols,
             out_schema,
             std::ptr::null_mut(), // avi_table
-            false, 0, 0,
+            false,
+            0,
+            0,
             std::ptr::null_mut(), // gi_table
             0,
-            std::ptr::null(),     // finalize_prog
-            std::ptr::null(),     // finalize_schema
+            std::ptr::null(), // finalize_prog
+            std::ptr::null(), // finalize_schema
         );
 
         // INTEGRATE raw_delta → trace_out
         builder.add_integrate(
-            2,                    // in_reg (raw_delta)
-            trace_out_ptr,        // target table
-            std::ptr::null_mut(), 0,   // no GI
-            std::ptr::null_mut(), false, 0, &[], 0, // no AVI
+            2,             // in_reg (raw_delta)
+            trace_out_ptr, // target table
+            std::ptr::null_mut(),
+            0, // no GI
+            std::ptr::null_mut(),
+            false,
+            0,
+            &[],
+            0, // no AVI
         );
 
         // INTEGRATE input → trace_in
         builder.add_integrate(
-            0,                    // in_reg
-            trace_in_ptr,         // target table
-            std::ptr::null_mut(), 0,
-            std::ptr::null_mut(), false, 0, &[], 0,
+            0,            // in_reg
+            trace_in_ptr, // target table
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            false,
+            0,
+            &[],
+            0,
         );
 
         builder.add_halt();
@@ -1301,10 +1555,13 @@ mod tests {
         let mut vm = *builder.build(&reg_schemas, &reg_kinds);
 
         // Tick 1: Insert group=1 with values 10, 20
-        let input1 = make_batch_2col(in_schema, &[
-            (1u128, 1, 1, 10),  // pk=1, group=1, val=10
-            (2u128, 1, 1, 20),  // pk=2, group=1, val=20
-        ]);
+        let input1 = make_batch_2col(
+            in_schema,
+            &[
+                (1u128, 1, 1, 10), // pk=1, group=1, val=10
+                (2u128, 1, 1, 20), // pk=2, group=1, val=20
+            ],
+        );
 
         // Create cursors for trace registers
         let tr_out_cursor = trace_out_table.open_cursor();
@@ -1320,9 +1577,9 @@ mod tests {
             std::ptr::null_mut(), // reg 4
         ];
 
-        let r1 = execute_epoch(
-            &vm.program, &mut vm.regfile, input1, 0, 2, &cursors1, &[],
-        ).unwrap().unwrap();
+        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors1, &[])
+            .unwrap()
+            .unwrap();
 
         // SUM of group=1: 10+20 = 30. Output should be one row with sum=30.
         assert_eq!(r1.count, 1, "one group → one output row");
@@ -1330,8 +1587,12 @@ mod tests {
         assert_eq!(sum_val, 30, "SUM(10+20) must be 30");
 
         // Cleanup
-        unsafe { drop(Box::from_raw(tr_out_ch as *mut CursorHandle)); }
-        unsafe { drop(Box::from_raw(tr_in_ch as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(tr_out_ch as *mut CursorHandle));
+        }
+        unsafe {
+            drop(Box::from_raw(tr_in_ch as *mut CursorHandle));
+        }
 
         trace_out_table.close();
         trace_in_table.close();
@@ -1355,17 +1616,22 @@ mod tests {
 
         let mut builder = ProgramBuilder::new(4);
         builder.add_reduce(
-            0,            // in_reg
-            3,            // trace_in_reg (set, but its cursor will be null)
-            1,            // trace_out_reg
-            2,            // out_reg
-            -1,           // fin_out_reg
+            0,  // in_reg
+            3,  // trace_in_reg (set, but its cursor will be null)
+            1,  // trace_out_reg
+            2,  // out_reg
+            -1, // fin_out_reg
             &agg_descs,
             &group_cols,
             out_schema,
-            std::ptr::null_mut(), false, 0, 0,
-            std::ptr::null_mut(), 0,
-            std::ptr::null(), std::ptr::null(),
+            std::ptr::null_mut(),
+            false,
+            0,
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
         );
         builder.add_halt();
 
@@ -1376,9 +1642,7 @@ mod tests {
         let input = make_batch_2col(in_schema, &[(1u128, 1, 1, 10)]);
         // All cursors null ⟹ trace_in cursor is null with trace_in_reg >= 0.
         let cursors = vec![std::ptr::null_mut(); 4];
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
-        );
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[]);
         assert!(
             matches!(result, Err(-11)),
             "null trace_in cursor must abort Reduce with Err(-11)",
@@ -1402,17 +1666,22 @@ mod tests {
 
         let mut builder = ProgramBuilder::new(3);
         builder.add_reduce(
-            0,            // in_reg
-            -1,           // trace_in_reg disabled — avoids Err(-11) check
-            1,            // trace_out_reg (cursor will be null → Err(-10))
-            2,            // out_reg
-            -1,           // fin_out_reg
+            0,  // in_reg
+            -1, // trace_in_reg disabled — avoids Err(-11) check
+            1,  // trace_out_reg (cursor will be null → Err(-10))
+            2,  // out_reg
+            -1, // fin_out_reg
             &agg_descs,
             &group_cols,
             out_schema,
-            std::ptr::null_mut(), false, 0, 0,
-            std::ptr::null_mut(), 0,
-            std::ptr::null(), std::ptr::null(),
+            std::ptr::null_mut(),
+            false,
+            0,
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
         );
         builder.add_halt();
 
@@ -1422,9 +1691,7 @@ mod tests {
 
         let input = make_batch_2col(in_schema, &[(1u128, 1, 1, 10)]);
         let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
-        );
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[]);
         assert!(
             matches!(result, Err(-10)),
             "null trace_out cursor must abort Reduce with Err(-10)",
@@ -1439,14 +1706,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("seek_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "trace",
+            schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
 
-        let trace_batch = make_batch(schema, &[
-            (1u128, 1, 10),
-            (5u128, 1, 50),
-            (10u128, 1, 100),
-        ]);
+        let trace_batch = make_batch(schema, &[(1u128, 1, 10), (5u128, 1, 50), (10u128, 1, 100)]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
         let cursor = table.open_cursor();
@@ -1454,8 +1723,8 @@ mod tests {
 
         // Build: reg0=key input, reg1=trace, reg2=scan output
         let mut builder = ProgramBuilder::new(3);
-        builder.add_seek_trace(1, 0);       // Seek trace to key from reg 0
-        builder.add_scan_trace(1, 2, 100);  // Scan from trace into reg 2
+        builder.add_seek_trace(1, 0); // Seek trace to key from reg 0
+        builder.add_scan_trace(1, 2, 100); // Scan from trace into reg 2
         builder.add_halt();
 
         let reg_schemas = [schema, schema, schema];
@@ -1465,16 +1734,18 @@ mod tests {
 
         // Input: a batch with pk=5 (used as seek key)
         let input = make_batch(schema, &[(5u128, 1, 0)]);
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         // After seeking to pk=5, scan should find pk=5 and pk=10 (2 rows from pk=5 onwards)
         assert!(result.count >= 2);
         let pk0 = result.get_pk(0) as u64;
         assert_eq!(pk0, 5);
 
-        unsafe { drop(Box::from_raw(ch as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(ch as *mut CursorHandle));
+        }
         table.close();
     }
 
@@ -1499,9 +1770,9 @@ mod tests {
         let reg_kinds = [0u8; 4];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 4];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 3, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 3, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         assert_eq!(result.count, 1);
         let w = i64::from_le_bytes(result.weight_data()[0..8].try_into().unwrap());
@@ -1518,14 +1789,23 @@ mod tests {
         let schema = schema_1i64();
 
         let pred_code = vec![
-            crate::expr::EXPR_LOAD_COL_INT, 0, 1, 0,
-            crate::expr::EXPR_LOAD_CONST, 1, 0, 0,
-            crate::expr::EXPR_CMP_GT, 2, 0, 1,
+            crate::expr::EXPR_LOAD_COL_INT,
+            0,
+            1,
+            0,
+            crate::expr::EXPR_LOAD_CONST,
+            1,
+            0,
+            0,
+            crate::expr::EXPR_CMP_GT,
+            2,
+            0,
+            1,
         ];
         let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
-        let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_predicate(pred_prog, &schema),
-        ));
+        let func = Box::new(ScalarFuncKind::Plan(crate::expr::Plan::from_predicate(
+            pred_prog, &schema,
+        )));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(4);
@@ -1549,7 +1829,9 @@ mod tests {
             _ => panic!("expected Filter"),
         }
 
-        unsafe { drop(Box::from_raw(func_ptr as *mut ScalarFuncKind)); }
+        unsafe {
+            drop(Box::from_raw(func_ptr as *mut ScalarFuncKind));
+        }
     }
 
     /// Anti-join + semi-join should partition the input: |anti| + |semi| == |input|.
@@ -1560,15 +1842,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("complement_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "trace", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tdir.to_str().unwrap(),
+            "trace",
+            schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
 
         // Trace has pk=1, pk=3, pk=5
-        let trace_batch = make_batch(schema, &[
-            (1u128, 1, 100),
-            (3u128, 1, 300),
-            (5u128, 1, 500),
-        ]);
+        let trace_batch = make_batch(schema, &[(1u128, 1, 100), (3u128, 1, 300), (5u128, 1, 500)]);
         table.ingest_owned_batch(trace_batch).unwrap();
 
         // Anti-join pipeline: reg 0 -> anti_join(reg 0, reg 1) -> reg 2
@@ -1585,13 +1869,19 @@ mod tests {
         let cursors_aj = vec![std::ptr::null_mut(), ch_aj, std::ptr::null_mut()];
 
         // Delta has pk=1,2,3,4,5
-        let input_aj = make_batch(schema, &[
-            (1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30),
-            (4u128, 1, 40), (5u128, 1, 50),
-        ]);
-        let r_aj = execute_epoch(
-            &vm_aj.program, &mut vm_aj.regfile, input_aj, 0, 2, &cursors_aj, &[],
-        ).unwrap().unwrap();
+        let input_aj = make_batch(
+            schema,
+            &[
+                (1u128, 1, 10),
+                (2u128, 1, 20),
+                (3u128, 1, 30),
+                (4u128, 1, 40),
+                (5u128, 1, 50),
+            ],
+        );
+        let r_aj = execute_epoch(&vm_aj.program, &mut vm_aj.regfile, input_aj, 0, 2, &cursors_aj, &[])
+            .unwrap()
+            .unwrap();
 
         // Semi-join pipeline
         let cursor_sj = table.open_cursor();
@@ -1604,65 +1894,88 @@ mod tests {
         let mut vm_sj = *builder_sj.build(&reg_schemas, &reg_kinds);
         let cursors_sj = vec![std::ptr::null_mut(), ch_sj, std::ptr::null_mut()];
 
-        let input_sj = make_batch(schema, &[
-            (1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30),
-            (4u128, 1, 40), (5u128, 1, 50),
-        ]);
-        let r_sj = execute_epoch(
-            &vm_sj.program, &mut vm_sj.regfile, input_sj, 0, 2, &cursors_sj, &[],
-        ).unwrap().unwrap();
+        let input_sj = make_batch(
+            schema,
+            &[
+                (1u128, 1, 10),
+                (2u128, 1, 20),
+                (3u128, 1, 30),
+                (4u128, 1, 40),
+                (5u128, 1, 50),
+            ],
+        );
+        let r_sj = execute_epoch(&vm_sj.program, &mut vm_sj.regfile, input_sj, 0, 2, &cursors_sj, &[])
+            .unwrap()
+            .unwrap();
 
         // Anti should get pk=2,4 (no match); semi should get pk=1,3,5 (match)
         assert_eq!(r_aj.count, 2, "anti-join should keep 2 non-matching rows");
         assert_eq!(r_sj.count, 3, "semi-join should keep 3 matching rows");
-        assert_eq!(r_aj.count + r_sj.count, 5,
-                   "anti + semi must equal input count (complement property)");
+        assert_eq!(
+            r_aj.count + r_sj.count,
+            5,
+            "anti + semi must equal input count (complement property)"
+        );
 
-        unsafe { drop(Box::from_raw(ch_aj as *mut CursorHandle)); }
-        unsafe { drop(Box::from_raw(ch_sj as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(ch_aj as *mut CursorHandle));
+        }
+        unsafe {
+            drop(Box::from_raw(ch_sj as *mut CursorHandle));
+        }
         table.close();
     }
 
     /// Filter with expression bytecode: col1 > 25 keeps rows with val 30, 40, 50.
     #[test]
     fn test_filter_with_expr() {
-        use crate::expr::{ExprProgram, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_CMP_GT};
+        use crate::expr::{ExprProgram, EXPR_CMP_GT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
 
         let schema = schema_1i64();
 
         // Build expression: col1 > 25
         // col1 is schema column index 1 (the I64 payload column)
         let code = vec![
-            EXPR_LOAD_COL_INT, 0, 1, 0,  // r0 = col[1]
-            EXPR_LOAD_CONST, 1, 25, 0,   // r1 = 25
-            EXPR_CMP_GT, 2, 0, 1,        // r2 = (r0 > r1)
+            EXPR_LOAD_COL_INT,
+            0,
+            1,
+            0, // r0 = col[1]
+            EXPR_LOAD_CONST,
+            1,
+            25,
+            0, // r1 = 25
+            EXPR_CMP_GT,
+            2,
+            0,
+            1, // r2 = (r0 > r1)
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
 
-        let func = Box::new(ScalarFuncKind::Plan(
-            crate::expr::Plan::from_predicate(prog, &schema),
-        ));
+        let func = Box::new(ScalarFuncKind::Plan(crate::expr::Plan::from_predicate(prog, &schema)));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
         let mut builder = ProgramBuilder::new(2);
         builder.add_filter(0, 1, func_ptr);
         builder.add_halt();
 
-        let input = make_batch(schema, &[
-            (1u128, 1, 10),
-            (2u128, 1, 20),
-            (3u128, 1, 30),
-            (4u128, 1, 40),
-            (5u128, 1, 50),
-        ]);
+        let input = make_batch(
+            schema,
+            &[
+                (1u128, 1, 10),
+                (2u128, 1, 20),
+                (3u128, 1, 30),
+                (4u128, 1, 40),
+                (5u128, 1, 50),
+            ],
+        );
 
         let reg_schemas = [schema; 2];
         let reg_kinds = [0u8; 2];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 3, "filter col1>25 should keep 3 rows (30,40,50)");
@@ -1670,7 +1983,9 @@ mod tests {
         assert_eq!(rows[1].0, 4); // pk=4, val=40
         assert_eq!(rows[2].0, 5); // pk=5, val=50
 
-        unsafe { drop(Box::from_raw(func_ptr as *mut ScalarFuncKind)); }
+        unsafe {
+            drop(Box::from_raw(func_ptr as *mut ScalarFuncKind));
+        }
     }
 
     /// Multi-agg reduce: COUNT + SUM on same column in one pass.
@@ -1682,34 +1997,46 @@ mod tests {
 
         // Output: pk(U64), count(I64), sum(I64) — GROUP BY pk → natural PK
         let out_schema = make_schema(&[
-            type_code::I64,  // count
-            type_code::I64,  // sum
+            type_code::I64, // count
+            type_code::I64, // sum
         ]);
 
         let dir = tempfile::tempdir().unwrap();
 
         let tout_dir = dir.path().join("ma_tr_out");
         let mut trace_out_table = Table::new(
-            tout_dir.to_str().unwrap(), "ma_tr_out", out_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tout_dir.to_str().unwrap(),
+            "ma_tr_out",
+            out_schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
         let trace_out_ptr = &mut trace_out_table as *mut Table;
 
         let tin_dir = dir.path().join("ma_tr_in");
         let mut trace_in_table = Table::new(
-            tin_dir.to_str().unwrap(), "ma_tr_in", in_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tin_dir.to_str().unwrap(),
+            "ma_tr_in",
+            in_schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
         // Two agg descriptors: COUNT(col=1) and SUM(col=1)
         let agg_descs = [
             AggDescriptor {
-                col_idx: 1,           // schema col index for the val column
+                col_idx: 1, // schema col index for the val column
                 agg_op: AggOp::Count,
                 col_type_code: TypeCode::I64,
                 _pad: [0; 2],
             },
             AggDescriptor {
-                col_idx: 1,           // schema col index for the val column
+                col_idx: 1, // schema col index for the val column
                 agg_op: AggOp::Sum,
                 col_type_code: TypeCode::I64,
                 _pad: [0; 2],
@@ -1722,21 +2049,44 @@ mod tests {
         // reg 0 = input delta, reg 1 = trace_out, reg 2 = output,
         // reg 3 = trace_in, reg 4 = unused
         builder.add_reduce(
-            0, 3, 1, 2, -1,
-            &agg_descs, &group_cols, out_schema,
-            std::ptr::null_mut(), false, 0, 0,
-            std::ptr::null_mut(), 0,
-            std::ptr::null(), std::ptr::null(),
+            0,
+            3,
+            1,
+            2,
+            -1,
+            &agg_descs,
+            &group_cols,
+            out_schema,
+            std::ptr::null_mut(),
+            false,
+            0,
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
         );
         builder.add_integrate(
-            2, trace_out_ptr,
-            std::ptr::null_mut(), 0,
-            std::ptr::null_mut(), false, 0, &[], 0,
+            2,
+            trace_out_ptr,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            false,
+            0,
+            &[],
+            0,
         );
         builder.add_integrate(
-            0, trace_in_ptr,
-            std::ptr::null_mut(), 0,
-            std::ptr::null_mut(), false, 0, &[], 0,
+            0,
+            trace_in_ptr,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            false,
+            0,
+            &[],
+            0,
         );
         builder.add_halt();
 
@@ -1745,11 +2095,7 @@ mod tests {
         let mut vm = *builder.build(&reg_schemas, &reg_kinds);
 
         // Input: 3 rows all with pk=1, vals 10, 20, 30
-        let input = make_batch(in_schema, &[
-            (1u128, 1, 10),
-            (1u128, 1, 20),
-            (1u128, 1, 30),
-        ]);
+        let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
 
         let tr_out_cursor = trace_out_table.open_cursor();
         let tr_out_ch = Box::into_raw(Box::new(tr_out_cursor)) as *mut libc::c_void;
@@ -1757,25 +2103,30 @@ mod tests {
         let tr_in_ch = Box::into_raw(Box::new(tr_in_cursor)) as *mut libc::c_void;
 
         let cursors = vec![
-            std::ptr::null_mut(), tr_out_ch, std::ptr::null_mut(),
-            tr_in_ch, std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            tr_out_ch,
+            std::ptr::null_mut(),
+            tr_in_ch,
+            std::ptr::null_mut(),
         ];
 
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
-        ).unwrap().unwrap();
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         // Should produce 1 row: pk=1, count=3, sum=60
         assert_eq!(result.count, 1, "multi-agg should produce 1 group");
-        let count_val = i64::from_le_bytes(
-            result.col_data(0)[0..8].try_into().unwrap());
-        let sum_val = i64::from_le_bytes(
-            result.col_data(1)[0..8].try_into().unwrap());
+        let count_val = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
+        let sum_val = i64::from_le_bytes(result.col_data(1)[0..8].try_into().unwrap());
         assert_eq!(count_val, 3, "COUNT should be 3");
         assert_eq!(sum_val, 60, "SUM should be 60");
 
-        unsafe { drop(Box::from_raw(tr_out_ch as *mut CursorHandle)); }
-        unsafe { drop(Box::from_raw(tr_in_ch as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(tr_out_ch as *mut CursorHandle));
+        }
+        unsafe {
+            drop(Box::from_raw(tr_in_ch as *mut CursorHandle));
+        }
         trace_out_table.close();
         trace_in_table.close();
     }
@@ -1798,11 +2149,9 @@ mod tests {
         let reg_kinds = [0u8; 2];
         let vm = builder.build(&reg_schemas, &reg_kinds);
         let cursors = vec![std::ptr::null_mut(); 2];
-        let result = execute_epoch(
-            &vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[],
-        )
-        .unwrap()
-        .unwrap();
+        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 1, &cursors, &[])
+            .unwrap()
+            .unwrap();
 
         let rows = extract_rows(&result);
         assert_eq!(rows.len(), 2);
@@ -1832,18 +2181,15 @@ mod tests {
         // an empty table that could not produce a cursor handle.
         let cursors = vec![std::ptr::null_mut(); 3];
 
-        let input = make_batch(schema, &[
-            (1u128, 1, 10),
-            (2u128, 1, 20),
-            (3u128, 1, 30),
-        ]);
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
-        ).unwrap();
+        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30)]);
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[]).unwrap();
 
         // With no trace to exclude against, all 3 delta rows must survive.
         let result = result.expect("anti-join with null trace must pass all delta rows");
-        assert_eq!(result.count, 3, "all delta rows should survive when trace cursor is null");
+        assert_eq!(
+            result.count, 3,
+            "all delta rows should survive when trace cursor is null"
+        );
     }
 
     /// JoinDTOuter semantics: if the trace is absent (null cursor), every delta
@@ -1868,17 +2214,15 @@ mod tests {
 
         let cursors = vec![std::ptr::null_mut(); 3];
 
-        let input = make_batch(left_schema, &[
-            (1u128, 1, 10),
-            (2u128, 1, 20),
-        ]);
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[],
-        ).unwrap();
+        let input = make_batch(left_schema, &[(1u128, 1, 10), (2u128, 1, 20)]);
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[]).unwrap();
 
         // With no trace, outer join must null-extend all 2 delta rows.
         let result = result.expect("outer join with null trace must null-extend all delta rows");
-        assert_eq!(result.count, 2, "all delta rows should be null-extended when trace cursor is null");
+        assert_eq!(
+            result.count, 2,
+            "all delta rows should be null-extended when trace cursor is null"
+        );
     }
 
     /// Proper SUM test: use agg_op=2 (AGG_SUM) and verify the actual aggregate
@@ -1892,14 +2236,26 @@ mod tests {
 
         let tout_dir = dir.path().join("sv_tr_out");
         let mut trace_out_table = Table::new(
-            tout_dir.to_str().unwrap(), "sv_tr_out", out_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tout_dir.to_str().unwrap(),
+            "sv_tr_out",
+            out_schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
         let trace_out_ptr = &mut trace_out_table as *mut Table;
 
         let tin_dir = dir.path().join("sv_tr_in");
         let mut trace_in_table = Table::new(
-            tin_dir.to_str().unwrap(), "sv_tr_in", in_schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
-        ).unwrap();
+            tin_dir.to_str().unwrap(),
+            "sv_tr_in",
+            in_schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
+        )
+        .unwrap();
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
         // SUM of col 1 (agg_op=2 = AGG_SUM, not AGG_COUNT)
@@ -1914,18 +2270,45 @@ mod tests {
 
         let mut builder = ProgramBuilder::new(4);
         builder.add_reduce(
-            0, 2, 1, 3, -1,
-            &agg_descs, &group_cols, out_schema,
-            std::ptr::null_mut(), false, 0, 0,
-            std::ptr::null_mut(), 0,
-            std::ptr::null(), std::ptr::null(),
+            0,
+            2,
+            1,
+            3,
+            -1,
+            &agg_descs,
+            &group_cols,
+            out_schema,
+            std::ptr::null_mut(),
+            false,
+            0,
+            0,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
         );
-        builder.add_integrate(3, trace_out_ptr,
-            std::ptr::null_mut(), 0,
-            std::ptr::null_mut(), false, 0, &[], 0);
-        builder.add_integrate(0, trace_in_ptr,
-            std::ptr::null_mut(), 0,
-            std::ptr::null_mut(), false, 0, &[], 0);
+        builder.add_integrate(
+            3,
+            trace_out_ptr,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            false,
+            0,
+            &[],
+            0,
+        );
+        builder.add_integrate(
+            0,
+            trace_in_ptr,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            false,
+            0,
+            &[],
+            0,
+        );
         builder.add_halt();
 
         let reg_schemas = [in_schema, out_schema, in_schema, out_schema];
@@ -1933,26 +2316,26 @@ mod tests {
         let mut vm = *builder.build(&reg_schemas, &reg_kinds);
 
         // Three rows all in the same group (same pk), values 10, 20, 30 → SUM=60
-        let input = make_batch(in_schema, &[
-            (1u128, 1, 10),
-            (1u128, 1, 20),
-            (1u128, 1, 30),
-        ]);
+        let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
 
         let tr_out_ch = Box::into_raw(Box::new(trace_out_table.open_cursor())) as *mut libc::c_void;
-        let tr_in_ch  = Box::into_raw(Box::new(trace_in_table.open_cursor()))  as *mut libc::c_void;
+        let tr_in_ch = Box::into_raw(Box::new(trace_in_table.open_cursor())) as *mut libc::c_void;
         let cursors = vec![std::ptr::null_mut(), tr_out_ch, tr_in_ch, std::ptr::null_mut()];
 
-        let result = execute_epoch(
-            &vm.program, &mut vm.regfile, input, 0, 3, &cursors, &[],
-        ).unwrap().expect("SUM reduce must produce output");
+        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 3, &cursors, &[])
+            .unwrap()
+            .expect("SUM reduce must produce output");
 
         assert_eq!(result.count, 1, "one group → one output row");
         let sum_val = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
         assert_eq!(sum_val, 60, "SUM(10+20+30) must be 60");
 
-        unsafe { drop(Box::from_raw(tr_out_ch as *mut CursorHandle)); }
-        unsafe { drop(Box::from_raw(tr_in_ch  as *mut CursorHandle)); }
+        unsafe {
+            drop(Box::from_raw(tr_out_ch as *mut CursorHandle));
+        }
+        unsafe {
+            drop(Box::from_raw(tr_in_ch as *mut CursorHandle));
+        }
         trace_out_table.close();
         trace_in_table.close();
     }
@@ -1970,7 +2353,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("stale_cursor_test");
         let mut table = Table::new(
-            tdir.to_str().unwrap(), "ext", schema, 0, 1 << 20, crate::storage::Persistence::Ephemeral,
+            tdir.to_str().unwrap(),
+            "ext",
+            schema,
+            0,
+            1 << 20,
+            crate::storage::Persistence::Ephemeral,
         )
         .unwrap();
 

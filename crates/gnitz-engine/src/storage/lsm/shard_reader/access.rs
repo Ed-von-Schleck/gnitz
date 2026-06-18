@@ -6,9 +6,9 @@
 
 use std::ptr;
 
-use crate::foundation::codec::{read_i64_le, read_u64_le};
 use super::super::xor8;
 use super::{MappedShard, RegionView};
+use crate::foundation::codec::{read_i64_le, read_u64_le};
 
 impl MappedShard {
     #[inline]
@@ -41,10 +41,7 @@ impl MappedShard {
         let stride = self.pk_stride as usize;
         let data = self.data();
         match &self.pk {
-            RegionView::Raw { offset, .. } => {
-                &data[offset + row * stride
-                    ..offset + row * stride + stride]
-            }
+            RegionView::Raw { offset, .. } => &data[offset + row * stride..offset + row * stride + stride],
             // value is [u8; 16]; stride <= 16 is guaranteed by the constructor.
             // When RegionView::Constant is widened to hold larger values,
             // this arm must be updated alongside it.
@@ -58,9 +55,17 @@ impl MappedShard {
         match &self.weight {
             RegionView::Raw { offset, .. } => read_i64_le(self.data(), offset + row * 8),
             RegionView::Constant { value, .. } => i64::from_le_bytes(value[..8].try_into().unwrap()),
-            RegionView::TwoValue { value_a, value_b, bitvec_off } => {
+            RegionView::TwoValue {
+                value_a,
+                value_b,
+                bitvec_off,
+            } => {
                 let byte = self.data()[bitvec_off + row / 8];
-                if (byte >> (row % 8)) & 1 == 0 { *value_a } else { *value_b }
+                if (byte >> (row % 8)) & 1 == 0 {
+                    *value_a
+                } else {
+                    *value_b
+                }
             }
         }
     }
@@ -96,7 +101,10 @@ impl MappedShard {
                 assert!(
                     start + col_size <= offset + size,
                     "get_col_ptr out of bounds: row={} payload_col={} col_size={} region_end={}",
-                    row, payload_col_idx, col_size, offset + size,
+                    row,
+                    payload_col_idx,
+                    col_size,
+                    offset + size,
                 );
                 &self.data()[start..start + col_size]
             }
@@ -143,9 +151,7 @@ impl MappedShard {
                 }
                 unsafe { base.add(off) }
             }
-            RegionView::Constant { offset, .. } => {
-                unsafe { base.add(*offset) }
-            }
+            RegionView::Constant { offset, .. } => unsafe { base.add(*offset) },
             RegionView::TwoValue { .. } => unreachable!(),
         }
     }
@@ -246,26 +252,32 @@ impl MappedShard {
         unsafe { data.set_len(total_size) };
 
         // Write each region directly into its final slice — no intermediate buffers.
-        let expand_into = |region: &RegionView, stride: usize, dst: &mut [u8]| {
-            match region {
-                RegionView::Raw { offset, .. } => {
-                    let begin = offset + start * stride;
-                    dst.copy_from_slice(&shard[begin..begin + row_count * stride]);
+        let expand_into = |region: &RegionView, stride: usize, dst: &mut [u8]| match region {
+            RegionView::Raw { offset, .. } => {
+                let begin = offset + start * stride;
+                dst.copy_from_slice(&shard[begin..begin + row_count * stride]);
+            }
+            RegionView::Constant { value, .. } => {
+                for chunk in dst.chunks_exact_mut(stride) {
+                    chunk.copy_from_slice(&value[..stride]);
                 }
-                RegionView::Constant { value, .. } => {
-                    for chunk in dst.chunks_exact_mut(stride) {
-                        chunk.copy_from_slice(&value[..stride]);
-                    }
-                }
-                RegionView::TwoValue { value_a, value_b, bitvec_off } => {
-                    let a_bytes = value_a.to_le_bytes();
-                    let b_bytes = value_b.to_le_bytes();
-                    for i in 0..row_count {
-                        let row = start + i;
-                        let bit = (shard[bitvec_off + row / 8] >> (row % 8)) & 1;
-                        let src = if bit == 0 { &a_bytes[..stride] } else { &b_bytes[..stride] };
-                        dst[i * stride..(i + 1) * stride].copy_from_slice(src);
-                    }
+            }
+            RegionView::TwoValue {
+                value_a,
+                value_b,
+                bitvec_off,
+            } => {
+                let a_bytes = value_a.to_le_bytes();
+                let b_bytes = value_b.to_le_bytes();
+                for i in 0..row_count {
+                    let row = start + i;
+                    let bit = (shard[bitvec_off + row / 8] >> (row % 8)) & 1;
+                    let src = if bit == 0 {
+                        &a_bytes[..stride]
+                    } else {
+                        &b_bytes[..stride]
+                    };
+                    dst[i * stride..(i + 1) * stride].copy_from_slice(src);
                 }
             }
         };
@@ -273,8 +285,8 @@ impl MappedShard {
         let pk_stride = self.pk_stride as usize;
         let sz8 = row_count * 8;
         expand_into(&self.pk, pk_stride, &mut data[offsets[0]..][..row_count * pk_stride]);
-        expand_into(&self.weight,   8,  &mut data[offsets[1]..][..sz8]);
-        expand_into(&self.null_bmp, 8,  &mut data[offsets[2]..][..sz8]);
+        expand_into(&self.weight, 8, &mut data[offsets[1]..][..sz8]);
+        expand_into(&self.null_bmp, 8, &mut data[offsets[2]..][..sz8]);
 
         for (pi, _ci, col) in schema.payload_columns() {
             let stride = col.size() as usize;
@@ -296,9 +308,7 @@ impl MappedShard {
             Vec::new()
         };
 
-        let mut batch = unsafe {
-            Batch::from_prebuilt(data, blob, strides, offsets, num_regions_u8, row_count)
-        };
+        let mut batch = unsafe { Batch::from_prebuilt(data, blob, strides, offsets, num_regions_u8, row_count) };
         batch.sorted = true;
         batch.consolidated = true;
         batch.set_schema(*schema);
@@ -306,10 +316,7 @@ impl MappedShard {
     }
 
     /// Bulk-copy all rows into an Batch.
-    pub(crate) fn to_owned_batch(
-        &self,
-        schema: &crate::schema::SchemaDescriptor,
-    ) -> super::super::batch::Batch {
+    pub(crate) fn to_owned_batch(&self, schema: &crate::schema::SchemaDescriptor) -> super::super::batch::Batch {
         self.slice_to_owned_batch(0, self.count, schema)
     }
 }

@@ -16,11 +16,11 @@ use crate::storage::{MemBatch, ReadCursor};
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AggOp {
-    Null         = 0,
-    Count        = 1,
-    Sum          = 2,
-    Min          = 3,
-    Max          = 4,
+    Null = 0,
+    Count = 1,
+    Sum = 2,
+    Min = 3,
+    Max = 4,
     CountNonNull = 5,
 }
 
@@ -42,10 +42,10 @@ impl TryFrom<u8> for AggOp {
 impl From<gnitz_wire::AggFunc> for AggOp {
     fn from(f: gnitz_wire::AggFunc) -> Self {
         match f {
-            gnitz_wire::AggFunc::Count        => AggOp::Count,
-            gnitz_wire::AggFunc::Sum          => AggOp::Sum,
-            gnitz_wire::AggFunc::Min          => AggOp::Min,
-            gnitz_wire::AggFunc::Max          => AggOp::Max,
+            gnitz_wire::AggFunc::Count => AggOp::Count,
+            gnitz_wire::AggFunc::Sum => AggOp::Sum,
+            gnitz_wire::AggFunc::Min => AggOp::Min,
+            gnitz_wire::AggFunc::Max => AggOp::Max,
             gnitz_wire::AggFunc::CountNonNull => AggOp::CountNonNull,
         }
     }
@@ -71,7 +71,6 @@ const _: () = assert!(std::mem::size_of::<AggOp>() == 1);
 const _: () = assert!(std::mem::size_of::<TypeCode>() == 1);
 const _: () = assert!(std::mem::size_of::<AggDescriptor>() == 8);
 const _: () = assert!(std::mem::align_of::<AggDescriptor>() == 4);
-
 
 /// Accumulator: internal state for one aggregate column.
 ///
@@ -124,12 +123,7 @@ impl Accumulator {
     }
 
     /// Step: incorporate one input row into the accumulator.
-    pub(super) fn step_from_batch(
-        &mut self,
-        mb: &MemBatch,
-        row: usize,
-        weight: i64,
-    ) {
+    pub(super) fn step_from_batch(&mut self, mb: &MemBatch, row: usize, weight: i64) {
         // COUNT is value-independent: count the row and return before any column
         // read, so a wide PK column (cs = 16) never reaches the ≤8-byte value path.
         if self.agg_op == AggOp::Count {
@@ -202,8 +196,14 @@ impl Accumulator {
                     // U64 comparison must be unsigned: `decode_signed` returns the
                     // bit pattern verbatim, so high-bit-set values look negative
                     // under signed `<`.
-                    let replaces = if tc == TypeCode::U64 { (v as u64) < (self.acc as u64) } else { v < self.acc };
-                    if first || replaces { self.acc = v; }
+                    let replaces = if tc == TypeCode::U64 {
+                        (v as u64) < (self.acc as u64)
+                    } else {
+                        v < self.acc
+                    };
+                    if first || replaces {
+                        self.acc = v;
+                    }
                 }
             }
             AggOp::Max => {
@@ -214,8 +214,14 @@ impl Accumulator {
                     }
                 } else {
                     let v = decode_signed(bytes, tc);
-                    let replaces = if tc == TypeCode::U64 { (v as u64) > (self.acc as u64) } else { v > self.acc };
-                    if first || replaces { self.acc = v; }
+                    let replaces = if tc == TypeCode::U64 {
+                        (v as u64) > (self.acc as u64)
+                    } else {
+                        v > self.acc
+                    };
+                    if first || replaces {
+                        self.acc = v;
+                    }
                 }
             }
             // Count and CountNonNull return early above; Null is a no-op sentinel.
@@ -343,19 +349,17 @@ impl Accumulator {
 #[inline]
 fn decode_signed(bytes: &[u8], tc: TypeCode) -> i64 {
     match tc {
-        TypeCode::I8  => bytes[0] as i8 as i64,
-        TypeCode::U8  => bytes[0] as i64,
+        TypeCode::I8 => bytes[0] as i8 as i64,
+        TypeCode::U8 => bytes[0] as i64,
         TypeCode::I16 => i16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64,
         TypeCode::U16 => u16::from_le_bytes(bytes[..2].try_into().unwrap()) as i64,
         TypeCode::I32 => i32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64,
         TypeCode::U32 => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64,
-        TypeCode::I64 | TypeCode::U64 =>
-            i64::from_le_bytes(bytes[..8].try_into().unwrap()),
-        TypeCode::String =>
-            i64::from_le_bytes(bytes[..8].try_into().unwrap()),
-        TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob
-        | TypeCode::I128 =>
-            unreachable!("decode_signed: non-integer/string type"),
+        TypeCode::I64 | TypeCode::U64 => i64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        TypeCode::String => i64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob | TypeCode::I128 => {
+            unreachable!("decode_signed: non-integer/string type")
+        }
     }
 }
 
@@ -363,15 +367,21 @@ fn decode_signed(bytes: &[u8], tc: TypeCode) -> i64 {
 #[inline]
 fn decode_float(bytes: &[u8], tc: TypeCode) -> f64 {
     match tc {
-        TypeCode::F32 =>
-            f32::from_bits(u32::from_le_bytes(bytes[..4].try_into().unwrap())) as f64,
-        TypeCode::F64 =>
-            f64::from_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
-        TypeCode::U8 | TypeCode::I8 | TypeCode::U16 | TypeCode::I16 |
-        TypeCode::U32 | TypeCode::I32 | TypeCode::U64 | TypeCode::I64 |
-        TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob |
-        TypeCode::I128 =>
-            unreachable!("decode_float: non-float type"),
+        TypeCode::F32 => f32::from_bits(u32::from_le_bytes(bytes[..4].try_into().unwrap())) as f64,
+        TypeCode::F64 => f64::from_bits(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
+        TypeCode::U8
+        | TypeCode::I8
+        | TypeCode::U16
+        | TypeCode::I16
+        | TypeCode::U32
+        | TypeCode::I32
+        | TypeCode::U64
+        | TypeCode::I64
+        | TypeCode::U128
+        | TypeCode::UUID
+        | TypeCode::String
+        | TypeCode::Blob
+        | TypeCode::I128 => unreachable!("decode_float: non-float type"),
     }
 }
 
@@ -469,7 +479,8 @@ pub(super) fn apply_agg_from_value_index(
         // out as group_stride + AVI_AV_BYTES (av_encoded), so the trailing bytes
         // are always in bounds for a group_key of length group_stride.
         debug_assert_eq!(
-            k.len(), group_key.len() + AVI_AV_BYTES,
+            k.len(),
+            group_key.len() + AVI_AV_BYTES,
             "AVI key = group_stride + AVI_AV_BYTES",
         );
         let av_start = group_key.len();
@@ -484,7 +495,7 @@ pub(super) fn apply_agg_from_value_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Batch;
 
     // Item 5: a nullable single group column must NOT be promoted to the

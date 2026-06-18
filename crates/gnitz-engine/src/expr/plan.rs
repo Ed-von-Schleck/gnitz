@@ -7,10 +7,10 @@
 
 use std::cell::RefCell;
 
-use crate::schema::{SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
+use super::batch::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
 use super::program::{self as expr, ExprProgram, OutputColKind};
+use crate::schema::{SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{Batch, MemBatch};
-use super::batch::{EvalScratch, MORSEL, NULL_WORDS_PER_REG, eval_batch};
 
 // ---------------------------------------------------------------------------
 // ScalarFuncKind enum
@@ -39,22 +39,13 @@ impl ScalarFuncKind {
     /// Run the filter over all `n` rows, invoking `append_range(start, end)`
     /// for each contiguous run of passing rows. The closure must not touch
     /// the `Plan` (a `RefCell` borrow on `scratch` is held while it runs).
-    pub fn run_filter<F: FnMut(usize, usize)>(
-        &self,
-        mb: &MemBatch,
-        n: usize,
-        append_range: F,
-    ) {
+    pub fn run_filter<F: FnMut(usize, usize)>(&self, mb: &MemBatch, n: usize, append_range: F) {
         let ScalarFuncKind::Plan(p) = self;
         p.run_filter(mb, n, append_range);
     }
 
     /// Batch-level map: populate output batch from input batch.
-    pub fn evaluate_map_batch(
-        &self,
-        in_batch: &Batch,
-        out_schema: &SchemaDescriptor,
-    ) -> Batch {
+    pub fn evaluate_map_batch(&self, in_batch: &Batch, out_schema: &SchemaDescriptor) -> Batch {
         let ScalarFuncKind::Plan(p) = self;
         p.execute_map(in_batch, out_schema)
     }
@@ -90,11 +81,7 @@ fn copy_column(
         let mut le = [0u8; crate::schema::MAX_PK_BYTES];
         for row in 0..n {
             let opk = in_batch.get_pk_bytes(row);
-            gnitz_wire::decode_pk_column(
-                &opk[pk_off..pk_off + stride],
-                cm.type_code,
-                &mut le[..stride],
-            );
+            gnitz_wire::decode_pk_column(&opk[pk_off..pk_off + stride], cm.type_code, &mut le[..stride]);
             dst[row * stride..row * stride + stride].copy_from_slice(&le[..stride]);
         }
     } else if gnitz_wire::is_german_string(cm.type_code) {
@@ -108,7 +95,9 @@ fn copy_column(
         for row in 0..n {
             let off = row * stride;
             let cell = crate::schema::relocate_german_string_vec(
-                &src_col[off..off + stride], &in_batch.blob, &mut output.blob,
+                &src_col[off..off + stride],
+                &in_batch.blob,
+                &mut output.blob,
                 blob_cache.as_deref_mut(),
             );
             output.col_data_mut(cm.dst_payload)[off..off + 16].copy_from_slice(&cell);
@@ -119,10 +108,17 @@ fn copy_column(
             n * stride <= in_batch.col_data(in_pi).len(),
             "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
              (batch count={}, payload cols={})",
-            n, stride, n * stride, in_pi, in_batch.col_data(in_pi).len(),
-            in_batch.count, in_batch.num_payload_cols(),
+            n,
+            stride,
+            n * stride,
+            in_pi,
+            in_batch.col_data(in_pi).len(),
+            in_batch.count,
+            in_batch.num_payload_cols(),
         );
-        output.col_data_mut(cm.dst_payload).copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
+        output
+            .col_data_mut(cm.dst_payload)
+            .copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
     }
 }
 
@@ -242,7 +238,10 @@ fn filter_only(filter: FilterKernel) -> Plan {
     Plan {
         filter,
         col_moves: Vec::new(),
-        null_perm: NullPerm { pairs: Vec::new(), constant: 0 },
+        null_perm: NullPerm {
+            pairs: Vec::new(),
+            constant: 0,
+        },
         compute: ComputeKernel::None,
         scratch: RefCell::new(EvalScratch::new()),
     }
@@ -256,12 +255,7 @@ fn filter_only(filter: FilterKernel) -> Plan {
 /// places the same type in the output payload, so the stride from `out_schema`
 /// is always identical to the source OPK column's byte width. Reading more
 /// bytes than the OPK column occupies would alias the next PK column.
-fn col_move_stride(
-    src_pi: u8,
-    dst_payload: usize,
-    in_schema: &SchemaDescriptor,
-    out_schema: &SchemaDescriptor,
-) -> u8 {
+fn col_move_stride(src_pi: u8, dst_payload: usize, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> u8 {
     if src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
         let out_ci = out_schema.payload_col_idx(dst_payload);
         out_schema.columns[out_ci].size()
@@ -322,11 +316,7 @@ impl Plan {
     }
 
     /// Map plan from ExprProgram bytecode.
-    pub fn from_map(
-        mut prog: ExprProgram,
-        in_schema: &SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
-    ) -> Self {
+    pub fn from_map(mut prog: ExprProgram, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
         prog.resolve_column_indices(in_schema);
         // After resolve_column_indices, EXPR_COPY_COL.a1 already holds the
         // resolved payload byte (SENTINEL for PK, dense payload index otherwise).
@@ -383,11 +373,7 @@ impl Plan {
             })
             .collect();
 
-        let null_perm = NullPerm::from_col_pairs(
-            &copy_src_pi_bytes,
-            &copy_out_payloads,
-            &null_payloads,
-        );
+        let null_perm = NullPerm::from_col_pairs(&copy_src_pi_bytes, &copy_out_payloads, &null_payloads);
 
         let compute = if has_compute {
             let emit_strides: Vec<u8> = emit_payloads
@@ -400,7 +386,13 @@ impl Plan {
             debug_assert_eq!(emit_strides.len(), emit_regs.len());
             debug_assert_eq!(emit_strides.len(), emit_payloads.len());
             let no_nulls = prog.is_strictly_non_nullable(in_schema);
-            ComputeKernel::Interpreted { prog, emit_payloads, emit_regs, emit_strides, no_nulls }
+            ComputeKernel::Interpreted {
+                prog,
+                emit_payloads,
+                emit_regs,
+                emit_strides,
+                no_nulls,
+            }
         } else {
             ComputeKernel::None
         };
@@ -420,8 +412,9 @@ impl Plan {
     /// since the unpack to `regs` is skipped in that case).
     #[cfg(test)]
     pub(crate) fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
-        let FilterKernel::Interpreted { prog, no_nulls } = &self.filter
-            else { return true };
+        let FilterKernel::Interpreted { prog, no_nulls } = &self.filter else {
+            return true;
+        };
         let mut scratch = self.scratch.borrow_mut();
         scratch.ensure_capacity(prog.num_regs as usize, *no_nulls, 1);
         eval_batch(prog, batch, row, 1, &mut scratch);
@@ -429,9 +422,10 @@ impl Plan {
             return false;
         }
         let r = prog.result_reg as usize;
-        let is_null = !*no_nulls
-            && (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
-        if is_null { return false; }
+        let is_null = !*no_nulls && (scratch.null_bits[r * NULL_WORDS_PER_REG] & 1) != 0;
+        if is_null {
+            return false;
+        }
         if !*no_nulls && prog.is_bit_only(r) {
             (scratch.bool_bits[r * NULL_WORDS_PER_REG] & 1) != 0
         } else {
@@ -443,14 +437,11 @@ impl Plan {
     /// each maximal contiguous run of passing rows. PassAll passes the whole
     /// range in one call. The bitmap stays inside `scratch` — no per-call
     /// `Vec<u64>` allocation.
-    pub fn run_filter<F: FnMut(usize, usize)>(
-        &self,
-        mb: &MemBatch,
-        n: usize,
-        mut append_range: F,
-    ) {
+    pub fn run_filter<F: FnMut(usize, usize)>(&self, mb: &MemBatch, n: usize, mut append_range: F) {
         let FilterKernel::Interpreted { prog, no_nulls } = &self.filter else {
-            if n > 0 { append_range(0, n); }
+            if n > 0 {
+                append_range(0, n);
+            }
             return;
         };
         let no_nulls = *no_nulls;
@@ -510,8 +501,7 @@ impl Plan {
                 let base_null = result_reg * NULL_WORDS_PER_REG;
                 for i in 0..m {
                     let abs = morsel_start + i;
-                    let is_null = !no_nulls
-                        && (scratch.null_bits[base_null + i / 64] >> (i % 64)) & 1 != 0;
+                    let is_null = !no_nulls && (scratch.null_bits[base_null + i / 64] >> (i % 64)) & 1 != 0;
                     if !is_null && scratch.regs[base_r + i] != 0 {
                         scratch.filter_bits[abs / 64] |= 1u64 << (abs % 64);
                     }
@@ -568,8 +558,13 @@ impl Plan {
 
         // Compute kernel
         if let ComputeKernel::Interpreted {
-            prog, emit_payloads, emit_regs, emit_strides, no_nulls,
-        } = &self.compute {
+            prog,
+            emit_payloads,
+            emit_regs,
+            emit_strides,
+            no_nulls,
+        } = &self.compute
+        {
             let no_nulls = *no_nulls;
             let num_regs = prog.num_regs as usize;
 
@@ -593,11 +588,9 @@ impl Plan {
                     let base_null_r = reg * NULL_WORDS_PER_REG;
                     for i in 0..m {
                         let row = morsel_start + i;
-                        let is_null = !no_nulls &&
-                            (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
+                        let is_null = !no_nulls && (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
                         let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
-                        dst8[row * stride..(row + 1) * stride]
-                            .copy_from_slice(&val.to_le_bytes()[..stride]);
+                        dst8[row * stride..(row + 1) * stride].copy_from_slice(&val.to_le_bytes()[..stride]);
 
                         // Merge null bit into row-major output null bitmap
                         if is_null {
@@ -650,11 +643,18 @@ impl FinalizeContext {
             .map(|i| i[2] as usize)
             .collect();
         let out_cols = prog.classify_output_cols();
-        FinalizeContext { scratch, no_nulls, emit_regs, out_cols }
+        FinalizeContext {
+            scratch,
+            no_nulls,
+            emit_regs,
+            out_cols,
+        }
     }
 
     /// Classification of each output-producing instruction (in program order).
-    pub fn out_cols(&self) -> &[OutputColKind] { &self.out_cols }
+    pub fn out_cols(&self) -> &[OutputColKind] {
+        &self.out_cols
+    }
 
     /// Evaluate `prog` over a single row of `mb` into the cached scratch.
     /// The result of each EMIT can subsequently be read with `read_emit`.
@@ -667,8 +667,7 @@ impl FinalizeContext {
     pub fn read_emit(&self, eidx: usize) -> (i64, bool) {
         let reg = self.emit_regs[eidx];
         let val = self.scratch.regs[reg * MORSEL];
-        let is_null = !self.no_nulls
-            && (self.scratch.null_bits[reg * NULL_WORDS_PER_REG] & 1) != 0;
+        let is_null = !self.no_nulls && (self.scratch.null_bits[reg * NULL_WORDS_PER_REG] & 1) != 0;
         (val, is_null)
     }
 }
@@ -696,7 +695,9 @@ fn scan_filter_bits<F: FnMut(usize, usize)>(bits: &[u64], n: usize, append_range
                 let passes = (word >> i) & 1 != 0;
                 let abs = row_base + i;
                 if passes {
-                    if range_start < 0 { range_start = abs as isize; }
+                    if range_start < 0 {
+                        range_start = abs as isize;
+                    }
                 } else if range_start >= 0 {
                     append_range(range_start as usize, abs);
                     range_start = -1;

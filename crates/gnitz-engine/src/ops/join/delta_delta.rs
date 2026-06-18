@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ConsolidatedBatch, MemBatch, with_payload_cmp};
+use crate::storage::{with_payload_cmp, Batch, ConsolidatedBatch, MemBatch};
 
 use super::super::cogroup::{cogroup_intersection, cogroup_left, BatchCursor};
 use super::rowwrite::write_join_row_from_batches;
@@ -17,20 +17,12 @@ use super::rowwrite::write_join_row_from_batches;
 
 /// Emit batch_a rows whose (PK, payload) has NO positive-weight match in batch_b.
 /// For SQL EXCEPT: a row is excluded only if B has a matching (PK, payload), not just PK.
-pub fn op_anti_join_delta_delta(
-    batch_a: &Batch,
-    batch_b: &Batch,
-    schema: &SchemaDescriptor,
-) -> ConsolidatedBatch {
+pub fn op_anti_join_delta_delta(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> ConsolidatedBatch {
     ConsolidatedBatch::new_unchecked(filter_join_dd_with_payload(batch_a, batch_b, schema))
 }
 
 /// Emit batch_a rows whose PK HAS a positive-weight match in batch_b.
-pub fn op_semi_join_delta_delta(
-    batch_a: &Batch,
-    batch_b: &Batch,
-    schema: &SchemaDescriptor,
-) -> ConsolidatedBatch {
+pub fn op_semi_join_delta_delta(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> ConsolidatedBatch {
     ConsolidatedBatch::new_unchecked(semi_join_dd(batch_a, batch_b, schema))
 }
 
@@ -39,11 +31,7 @@ pub fn op_semi_join_delta_delta(
 /// PKs (galloping past the gaps — the skewed tiny ΔB ⋈ huge ΔA case gets the same
 /// speedup the delta-trace joins do), and the callback brackets B's equal-PK
 /// group by index to test presence.
-fn semi_join_dd(
-    batch_a: &Batch,
-    batch_b: &Batch,
-    schema: &SchemaDescriptor,
-) -> Batch {
+fn semi_join_dd(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
     let npc = schema.num_payload_cols();
     let cs_a = Batch::consolidate_if_needed(batch_a, schema);
     let cs_b = Batch::consolidate_if_needed(batch_b, schema);
@@ -75,11 +63,7 @@ fn semi_join_dd(
 
 /// Payload-aware anti-join DD: excludes A rows only when B has a matching
 /// (PK, payload) with positive weight. Used for SQL EXCEPT.
-fn filter_join_dd_with_payload(
-    batch_a: &Batch,
-    batch_b: &Batch,
-    schema: &SchemaDescriptor,
-) -> Batch {
+fn filter_join_dd_with_payload(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
     let cs_a = Batch::consolidate_if_needed(batch_a, schema);
     let cs_b = Batch::consolidate_if_needed(batch_b, schema);
     let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
@@ -119,11 +103,7 @@ where
         // B's equal-PK group, or an empty range when B lacks the key (cogroup_left
         // lands m at lower_bound(key), which may be a later key's row).
         let has_b = m.pos < cb.count && cb.get_pk_bytes(m.pos) == key;
-        let (b_start, b_end) = if has_b {
-            (m.pos, m.group_end())
-        } else {
-            (m.pos, m.pos)
-        };
+        let (b_start, b_end) = if has_b { (m.pos, m.group_end()) } else { (m.pos, m.pos) };
         let mut scan_b = b_start;
         let mut unmatched_start: Option<usize> = None;
         for idx_a_row in a_range.clone() {
@@ -138,9 +118,7 @@ where
                 }
                 scan_b += 1;
             }
-            let matched = scan_b < b_end
-                && ord == Ordering::Equal
-                && cb.get_weight(scan_b) > 0;
+            let matched = scan_b < b_end && ord == Ordering::Equal && cb.get_weight(scan_b) > 0;
             if !matched {
                 if unmatched_start.is_none() {
                     unmatched_start = Some(idx_a_row);
@@ -212,12 +190,7 @@ pub fn op_join_delta_delta(
                 let wb = cb.get_weight(j);
                 let w_out = wa.wrapping_mul(wb);
                 if w_out != 0 {
-                    write_join_row_from_batches(
-                        &mut output,
-                        &mb_a, i, &mb_b, j,
-                        w_out,
-                        left_schema, right_schema,
-                    );
+                    write_join_row_from_batches(&mut output, &mb_a, i, &mb_b, j, w_out, left_schema, right_schema);
                 }
             }
         }
@@ -235,9 +208,9 @@ pub fn op_join_delta_delta(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_common::*;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, SHORT_STRING_THRESHOLD};
+    use super::*;
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD};
     use crate::storage::{Batch, ConsolidatedBatch};
     use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
@@ -332,7 +305,8 @@ mod tests {
         assert_eq!(out.get_pk(0) as u64, 1);
         // The surviving row is "keep" — "drop" matched B and was excluded.
         assert_eq!(
-            read_str_payload(&out, 0, 0), "keep",
+            read_str_payload(&out, 0, 0),
+            "keep",
             "generic string compare must keep \"keep\" and drop \"drop\"",
         );
     }
@@ -596,14 +570,8 @@ mod tests {
     fn test_join_dd_wide_pk_cartesian() {
         // Two wide-PK batches with two matching PKs.
         let schema = wide_pk_3xu64_schema();
-        let a = make_wide_batch(&schema, &[
-            (1, 0, 0, 1, 10),
-            (2, 0, 0, 1, 20),
-        ]);
-        let b = make_wide_batch(&schema, &[
-            (1, 0, 0, 1, 100),
-            (2, 0, 0, 1, 200),
-        ]);
+        let a = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (2, 0, 0, 1, 20)]);
+        let b = make_wide_batch(&schema, &[(1, 0, 0, 1, 100), (2, 0, 0, 1, 200)]);
         let out = op_join_delta_delta(&a, &b, &schema, &schema);
         // Both PKs match: (1,0,0)×(1,0,0) and (2,0,0)×(2,0,0) → 2 output rows.
         assert_eq!(out.count, 2);
@@ -631,7 +599,7 @@ mod tests {
         // Output: only (3,0,0) from A (the (1,0,0) row is excluded by exact match).
         let schema = wide_pk_3xu64_schema();
         let a = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (3, 0, 0, 1, 30)]);
-        let b = make_wide_batch(&schema, &[(1, 0, 0, 1, 10)]);  // same payload as A's first row
+        let b = make_wide_batch(&schema, &[(1, 0, 0, 1, 10)]); // same payload as A's first row
         let out = op_anti_join_delta_delta(&a, &b, &schema);
         assert_eq!(out.count, 1);
         assert_eq!(out.get_pk_bytes(0), wide_pk_bytes(&schema, 3, 0, 0).as_slice());
@@ -677,10 +645,7 @@ mod tests {
         let b = make_batch(&schema, &b_rows);
         let out = op_anti_join_delta_delta(&a, &b, &schema);
         // Reference: A payload p survives iff p not in B (multiples of 4).
-        let expected: Vec<i64> = (0..50)
-            .map(|k| (k * 2) as i64)
-            .filter(|p| p % 4 != 0)
-            .collect();
+        let expected: Vec<i64> = (0..50).map(|k| (k * 2) as i64).filter(|p| p % 4 != 0).collect();
         assert_eq!(out.count, expected.len());
         for (i, &p) in expected.iter().enumerate() {
             assert_eq!(get_payload_i64(&out, i), p, "row {i}");
@@ -696,10 +661,7 @@ mod tests {
         )
     }
 
-    fn make_batch_str(
-        schema: &SchemaDescriptor,
-        rows: &[(u64, i64, &str)],
-    ) -> ConsolidatedBatch {
+    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> ConsolidatedBatch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -778,5 +740,4 @@ mod tests {
         b.consolidated = true;
         ConsolidatedBatch::new_unchecked(b)
     }
-
 }

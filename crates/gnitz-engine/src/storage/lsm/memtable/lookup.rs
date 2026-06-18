@@ -86,9 +86,7 @@ impl MemTable {
 
         for run in &self.runs {
             for lo in run_pk_match_rows(run, key) {
-                let ord = columnar::compare_rows(
-                    &self.schema, run.as_ref(), lo, ref_source, ref_row,
-                );
+                let ord = columnar::compare_rows(&self.schema, run.as_ref(), lo, ref_source, ref_row);
                 if ord == Ordering::Equal {
                     total_w += run.get_weight(lo);
                 }
@@ -144,9 +142,8 @@ impl MemTable {
             let (ri, row, w0) = self.cand_scratch[i];
             // Skip a payload already evaluated by an earlier candidate.
             let already_grouped = self.cand_scratch[..i].iter().any(|&(rj, rowj, _)| {
-                columnar::compare_rows(
-                    &self.schema, self.runs[ri].as_ref(), row, self.runs[rj].as_ref(), rowj,
-                ) == Ordering::Equal
+                columnar::compare_rows(&self.schema, self.runs[ri].as_ref(), row, self.runs[rj].as_ref(), rowj)
+                    == Ordering::Equal
             });
             if already_grouped {
                 continue;
@@ -154,9 +151,8 @@ impl MemTable {
             let mut net = w0;
             for k in i + 1..self.cand_scratch.len() {
                 let (rk, rowk, wk) = self.cand_scratch[k];
-                if columnar::compare_rows(
-                    &self.schema, self.runs[ri].as_ref(), row, self.runs[rk].as_ref(), rowk,
-                ) == Ordering::Equal
+                if columnar::compare_rows(&self.schema, self.runs[ri].as_ref(), row, self.runs[rk].as_ref(), rowk)
+                    == Ordering::Equal
                 {
                     net += wk;
                 }

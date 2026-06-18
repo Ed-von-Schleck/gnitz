@@ -1,6 +1,6 @@
 //! Secondary index integration: GiDesc, AviDesc, op_integrate_with_indexes.
 
-use crate::schema::{SchemaDescriptor, SchemaColumn, type_code};
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
 
 // ---------------------------------------------------------------------------
@@ -44,20 +44,22 @@ pub(crate) fn make_gi_schema(src: &SchemaDescriptor) -> SchemaDescriptor {
         src.pk_indices().len() < crate::schema::MAX_PK_COLUMNS,
         "make_gi_schema: source PK column count {} leaves no room for the gc \
          prefix within MAX_PK_COLUMNS={}",
-        src.pk_indices().len(), crate::schema::MAX_PK_COLUMNS,
+        src.pk_indices().len(),
+        crate::schema::MAX_PK_COLUMNS,
     );
     // gc + source pk_stride must fit MAX_PK_BYTES.
     assert!(
         GI_GC_BYTES + src.pk_stride() as usize <= crate::schema::MAX_PK_BYTES,
         "make_gi_schema: gc({GI_GC_BYTES}) + source pk_stride {} exceeds MAX_PK_BYTES={}",
-        src.pk_stride(), crate::schema::MAX_PK_BYTES,
+        src.pk_stride(),
+        crate::schema::MAX_PK_BYTES,
     );
     let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
     let mut pk = vec![0u32];
     for (ord, _ci, col) in src.pk_columns() {
         let mut c = *col;
         c.type_code = match col.type_code {
-            type_code::I8  => type_code::U8,
+            type_code::I8 => type_code::U8,
             type_code::I16 => type_code::U16,
             type_code::I32 => type_code::U32,
             type_code::I64 => type_code::U64,
@@ -193,9 +195,7 @@ pub fn op_integrate_with_indexes(
 
             extractor.gather(&mb, row, &mut key);
             let av_bytes = avi_loc.bytes(&mb, row);
-            let av_u64 = super::util::encode_ordered(
-                av_bytes, avi_desc.agg_col_type_code, avi_desc.for_max,
-            );
+            let av_u64 = super::util::encode_ordered(av_bytes, avi_desc.agg_col_type_code, avi_desc.for_max);
             // Serialise the order-encoded value big-endian: the index orders
             // entries by raw lexicographic byte comparison, so big-endian bytes
             // make lexicographic order match the encoded value's numeric order.
@@ -218,7 +218,7 @@ pub fn op_integrate_with_indexes(
 
 #[cfg(test)]
 mod avi_encode_tests {
-    use super::super::util::{encode_ordered, decode_ordered};
+    use super::super::util::{decode_ordered, encode_ordered};
     use crate::schema::{type_code, TypeCode};
 
     fn decode_i32(enc: u64, for_max: bool) -> i32 {

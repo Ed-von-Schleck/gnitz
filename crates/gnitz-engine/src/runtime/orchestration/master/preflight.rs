@@ -41,11 +41,7 @@ impl PreflightKeyStream {
     /// Install `slot` as the current frame, decoding its keys zero-copy.
     /// A fault/corrupt/undecodable frame is an immediate `Err` — the caller
     /// unwinds to the `ScanLease` drop, which discards the undrained trains.
-    fn attach_frame(
-        &mut self,
-        slot: W2mSlot,
-        frame_schema: &SchemaDescriptor,
-    ) -> Result<(), String> {
+    fn attach_frame(&mut self, slot: W2mSlot, frame_schema: &SchemaDescriptor) -> Result<(), String> {
         // The view must die before its backing slot.
         self.mb = None;
         self.slot = None;
@@ -57,7 +53,10 @@ impl PreflightKeyStream {
         // construction (`send_unique_preflight_keys`), and continuation
         // frames carry no schema and resolve through the hint.
         let ctrl_size = ctrl.block_size;
-        let schema_hint = Some(SchemaWithVersion { descriptor: frame_schema, version: 0 });
+        let schema_hint = Some(SchemaWithVersion {
+            descriptor: frame_schema,
+            version: 0,
+        });
         // SAFETY: the slice points into the W2M ring slot that `slot` pins
         // until dropped. `self.mb` borrows it, and every path that drops or
         // replaces `self.slot` clears `self.mb` first (top of this fn and
@@ -132,7 +131,9 @@ impl PreflightAccumulator {
     /// stops merging useful spans (but still drains every worker's train).
     /// Span equality (byte-equal ⟺ value-equal) replaces the old `u128` equality.
     pub(crate) fn offer(&mut self, key: PkBuf) -> bool {
-        if self.duplicate { return false; }
+        if self.duplicate {
+            return false;
+        }
         if self.prev == Some(key) {
             self.duplicate = true;
             return false;
@@ -202,7 +203,9 @@ async fn merge_index_scan(
 
     let mut acc = PreflightAccumulator::new(UNIQUE_FILTER_CAP);
     while let Some(Reverse((key, w))) = heap.pop() {
-        if !acc.offer(key) { break; } // first duplicate is conclusive
+        if !acc.offer(key) {
+            break;
+        } // first duplicate is conclusive
         if let Some(next) = streams[w].next_key(frame_schema, reactor).await? {
             heap.push(Reverse((next, w)));
         }
@@ -229,8 +232,7 @@ fn span_to_natives(span: &PkBuf, idx_cols: &[SchemaColumn]) -> [u128; gnitz_wire
     let mut off = 0;
     for (native, col) in natives.iter_mut().zip(idx_cols) {
         let sz = col.size() as usize;
-        let le = gnitz_wire::decode_pk_column_owned(
-            &span.pk_bytes()[off..off + sz], col.type_code);
+        let le = gnitz_wire::decode_pk_column_owned(&span.pk_bytes()[off..off + sz], col.type_code);
         *native = u128::from_le_bytes(le);
         off += sz;
     }
@@ -250,9 +252,7 @@ fn collect_fk_projection(
     let mut project: Vec<u8> = Vec::new();
     for ci in 0..n_children {
         if let Some((_, _, parent_col_idx)) = cat.get_fk_child_info(target_id, ci) {
-            if !source_schema.is_pk_col(parent_col_idx)
-                && !project.contains(&(parent_col_idx as u8))
-            {
+            if !source_schema.is_pk_col(parent_col_idx) && !project.contains(&(parent_col_idx as u8)) {
                 project.push(parent_col_idx as u8);
             }
         }
@@ -275,7 +275,6 @@ impl MasterDispatcher {
     // at most 2 rounds: Phase 1 is fully independent; Phase 2 depends
     // on Phase 1's UPSERT-identification result.
 
-
     /// Async equivalent of `validate_all_distributed`. Identical semantics;
     /// uses `execute_pipeline_async` + `fan_out_seek_by_index_async` so it
     /// runs without blocking the reactor.
@@ -283,7 +282,9 @@ impl MasterDispatcher {
         disp_ptr: *mut MasterDispatcher,
         reactor: &crate::runtime::reactor::Reactor,
         sal_excl: &Rc<AsyncMutex<()>>,
-        target_id: i64, batch: &Batch, mode: WireConflictMode,
+        target_id: i64,
+        batch: &Batch,
+        mode: WireConflictMode,
     ) -> Result<(), String> {
         let (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema) = unsafe {
             let disp = &mut *disp_ptr;
@@ -293,9 +294,9 @@ impl MasterDispatcher {
             let n_circuits = cat.get_index_circuit_count(target_id);
             let has_unique = cat.has_any_unique_index(target_id);
             let unique_pk = cat.table_has_unique_pk(target_id);
-            let source_schema = cat.get_schema_desc(target_id)
-                .ok_or_else(|| format!(
-                    "validate_all_distributed: no schema for table {target_id}"))?;
+            let source_schema = cat
+                .get_schema_desc(target_id)
+                .ok_or_else(|| format!("validate_all_distributed: no schema for table {target_id}"))?;
             (n_fk, n_children, n_circuits, has_unique, unique_pk, source_schema)
         };
 
@@ -334,12 +335,16 @@ impl MasterDispatcher {
                     m.reserve(batch.count);
                     for i in 0..batch.count {
                         let w = batch.get_weight(i);
-                        if w == 0 { continue; }
+                        if w == 0 {
+                            continue;
+                        }
                         let entry = m.entry(batch.get_pk(i)).or_insert((0, 0));
                         entry.0 += w;
                         // A +w row is w insertions of the PK; Error mode must
                         // reject it like the w separate +1 rows it encodes.
-                        if w > 0 { entry.1 += if w > 1 { 2 } else { 1 }; }
+                        if w > 0 {
+                            entry.1 += if w > 1 { 2 } else { 1 };
+                        }
                     }
                     if needs_pk_rejection {
                         for (&pk, &(_, pos_count)) in m.iter() {
@@ -353,7 +358,9 @@ impl MasterDispatcher {
                     }
                     let mut keys: Vec<u128> = Vec::with_capacity(m.len());
                     for (&pk, &(net_weight, _)) in m.iter() {
-                        if net_weight <= 0 { continue; }
+                        if net_weight <= 0 {
+                            continue;
+                        }
                         keys.push(pk);
                     }
                     Ok(Some(keys))
@@ -363,26 +370,30 @@ impl MasterDispatcher {
                     FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
                 for i in 0..batch.count {
                     let w = batch.get_weight(i);
-                    if w == 0 { continue; }
+                    if w == 0 {
+                        continue;
+                    }
                     let entry = m.entry(PkBuf::from_bytes(batch.get_pk_bytes(i))).or_insert((0, 0));
                     entry.0 += w;
                     // A +w row is w insertions of the PK; Error mode must
                     // reject it like the w separate +1 rows it encodes.
-                    if w > 0 { entry.1 += if w > 1 { 2 } else { 1 }; }
+                    if w > 0 {
+                        entry.1 += if w > 1 { 2 } else { 1 };
+                    }
                 }
                 if needs_pk_rejection {
                     for (pk, &(_, pos_count)) in m.iter() {
                         if pos_count > 1 {
                             let key_str = format_pk_value_bytes(pk.pk_bytes(), &source_schema);
-                            return Err(unsafe {
-                                (*disp_ptr).batch_dup_pk_err(target_id, &source_schema, &key_str)
-                            });
+                            return Err(unsafe { (*disp_ptr).batch_dup_pk_err(target_id, &source_schema, &key_str) });
                         }
                     }
                 }
                 let mut keys: Vec<PkBuf> = Vec::with_capacity(m.len());
                 for (pk, &(net_weight, _)) in m.iter() {
-                    if net_weight <= 0 { continue; }
+                    if net_weight <= 0 {
+                        continue;
+                    }
                     keys.push(*pk);
                 }
                 pk_lo_hi_wide = Some(keys);
@@ -401,9 +412,9 @@ impl MasterDispatcher {
                     Some(c) => c,
                     None => continue,
                 };
-                let parent_schema = cat.get_schema_desc(parent_table_id)
-                    .ok_or_else(|| format!(
-                        "FK parent table {parent_table_id} schema not found"))?;
+                let parent_schema = cat
+                    .get_schema_desc(parent_table_id)
+                    .ok_or_else(|| format!("FK parent table {parent_table_id} schema not found"))?;
                 (fk_col_idx, parent_table_id, parent_col_idx, parent_schema)
             };
 
@@ -417,15 +428,21 @@ impl MasterDispatcher {
             let mut keys: Vec<u128> = Vec::new();
 
             for i in 0..batch.count {
-                if batch.get_weight(i) <= 0 { continue; }
-                if loc.is_null(&mb, i) { continue; }
+                if batch.get_weight(i) <= 0 {
+                    continue;
+                }
+                if loc.is_null(&mb, i) {
+                    continue;
+                }
                 let fk_key = loc.native_key(&mb, i);
                 if seen.insert(fk_key) {
                     keys.push(fk_key);
                 }
             }
 
-            if keys.is_empty() { continue; }
+            if keys.is_empty() {
+                continue;
+            }
             let expected_count = keys.len();
 
             // PK fast-path only when the referenced column *is* the parent's
@@ -440,7 +457,10 @@ impl MasterDispatcher {
                 let src_type = parent_schema.columns[parent_col_idx].type_code;
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
                 let check_batch = build_check_batch(&parent_schema, &keys, src_type, pooled);
-                p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
+                p1_labels.push(P1Label::FkParent {
+                    parent_table_id,
+                    expected_count,
+                });
                 p1_checks.push(PipelinedCheck {
                     target_id: parent_table_id,
                     flags: FLAG_HAS_PK,
@@ -452,14 +472,18 @@ impl MasterDispatcher {
                 let idx_schema = unsafe {
                     let cat = &mut *(*disp_ptr).catalog;
                     cat.get_index_schema_by_cols(parent_table_id, &[parent_col_idx as u32])
-                        .ok_or_else(|| format!(
-                            "FK check: no unique index on parent table {parent_table_id} col {parent_col_idx}"))?
+                        .ok_or_else(|| {
+                            format!("FK check: no unique index on parent table {parent_table_id} col {parent_col_idx}")
+                        })?
                 };
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(parent_table_id) };
                 // `loc` is the child FK column; its type drives the sign-extension
                 // into the parent index's promoted leading key.
                 let check_batch = build_check_batch(&idx_schema, &keys, loc.type_code(), pooled);
-                p1_labels.push(P1Label::FkParent { parent_table_id, expected_count });
+                p1_labels.push(P1Label::FkParent {
+                    parent_table_id,
+                    expected_count,
+                });
                 p1_checks.push(PipelinedCheck {
                     target_id: parent_table_id,
                     flags: FLAG_HAS_PK,
@@ -483,17 +507,24 @@ impl MasterDispatcher {
                 let mut net_pk: FxHashMap<u128, i64> = FxHashMap::default();
                 for i in 0..batch.count {
                     let w = batch.get_weight(i);
-                    if w == 0 { continue; }
+                    if w == 0 {
+                        continue;
+                    }
                     *net_pk.entry(batch.get_pk(i)).or_insert(0) += w;
                 }
                 let stride = source_schema.pk_stride();
-                net_pk.into_iter().filter(|&(_, w)| w < 0)
-                    .map(|(k, _)| u128_to_pkbuf(k, stride)).collect()
+                net_pk
+                    .into_iter()
+                    .filter(|&(_, w)| w < 0)
+                    .map(|(k, _)| u128_to_pkbuf(k, stride))
+                    .collect()
             } else {
                 let mut net_pk: FxHashMap<PkBuf, i64> = FxHashMap::default();
                 for i in 0..batch.count {
                     let w = batch.get_weight(i);
-                    if w == 0 { continue; }
+                    if w == 0 {
+                        continue;
+                    }
                     *net_pk.entry(PkBuf::from_bytes(batch.get_pk_bytes(i))).or_insert(0) += w;
                 }
                 net_pk.into_iter().filter(|&(_, w)| w < 0).map(|(k, _)| k).collect()
@@ -502,17 +533,13 @@ impl MasterDispatcher {
             if !removed_pks.is_empty() {
                 // Resolve every non-PK referenced parent column in ONE batched
                 // gather instead of one serial seek per (removed PK × child).
-                let project = unsafe {
-                    collect_fk_projection(
-                        &*(*disp_ptr).catalog, target_id, n_children, &source_schema)
-                };
+                let project =
+                    unsafe { collect_fk_projection(&*(*disp_ptr).catalog, target_id, n_children, &source_schema) };
                 let gathered = if project.is_empty() {
                     GatherMap::default()
                 } else {
-                    Self::execute_gather_async(
-                        disp_ptr, reactor, sal_excl, target_id,
-                        removed_pks.clone(), &project,
-                    ).await?
+                    Self::execute_gather_async(disp_ptr, reactor, sal_excl, target_id, removed_pks.clone(), &project)
+                        .await?
                 };
 
                 for ci in 0..n_children {
@@ -522,9 +549,12 @@ impl MasterDispatcher {
                             Some(info) => info,
                             None => continue,
                         };
-                        let idx_schema = cat.get_index_schema_by_cols(child_tid, &[fk_col_idx as u32])
-                            .ok_or_else(|| format!(
-                                "FK RESTRICT check failed: no index on child table {child_tid} col {fk_col_idx}"))?;
+                        let idx_schema =
+                            cat.get_index_schema_by_cols(child_tid, &[fk_col_idx as u32])
+                                .ok_or_else(|| {
+                                    format!(
+                                "FK RESTRICT check failed: no index on child table {child_tid} col {fk_col_idx}")
+                                })?;
                         (child_tid, fk_col_idx, parent_col_idx, idx_schema)
                     };
 
@@ -538,11 +568,13 @@ impl MasterDispatcher {
                         let col_type = source_schema.columns[parent_col_idx].type_code;
                         let col_size = source_schema.columns[parent_col_idx].size() as usize;
                         let pk_field_off = source_schema.pk_byte_offset(parent_col_idx) as usize;
-                        removed_pks.iter().map(|pk| {
-                            pk_native_key(pk.pk_bytes(), pk_field_off, col_size, col_type)
-                        }).collect()
+                        removed_pks
+                            .iter()
+                            .map(|pk| pk_native_key(pk.pk_bytes(), pk_field_off, col_size, col_type))
+                            .collect()
                     } else {
-                        let proj_pos = project.iter()
+                        let proj_pos = project
+                            .iter()
                             .position(|&c| c == parent_col_idx as u8)
                             .expect("non-PK referenced column missing from gather projection");
                         let mut vals: Vec<u128> = Vec::with_capacity(removed_pks.len());
@@ -556,7 +588,9 @@ impl MasterDispatcher {
                         }
                         vals
                     };
-                    if keys.is_empty() { continue; }
+                    if keys.is_empty() {
+                        continue;
+                    }
 
                     // The keys are the referenced parent column's values; its type
                     // drives the sign-extension into the child index's promoted
@@ -589,7 +623,9 @@ impl MasterDispatcher {
                 // signed) and zero the compound suffix, mangling the main-table PK
                 // probe. This branch is narrow-only (`pk_lo_hi` is Some only when
                 // `!source_schema.pk_is_wide()`), so `extend_pk` is valid.
-                Some(build_check_batch_with(&source_schema, keys, pooled, |b, &k| b.extend_pk(k)))
+                Some(build_check_batch_with(&source_schema, keys, pooled, |b, &k| {
+                    b.extend_pk(k)
+                }))
             }
             (_, Some(keys)) if !keys.is_empty() => {
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
@@ -612,11 +648,16 @@ impl MasterDispatcher {
         let mut existing_pks: FxHashSet<PkBuf> = FxHashSet::default();
         if !p1_checks.is_empty() {
             let mut p1_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, &mut p1_checks).await?;
-            unsafe { reclaim_check_batches(&mut *disp_ptr, &mut p1_checks); }
+            unsafe {
+                reclaim_check_batches(&mut *disp_ptr, &mut p1_checks);
+            }
 
             for (idx, label) in p1_labels.iter().enumerate() {
                 match label {
-                    P1Label::FkParent { parent_table_id, expected_count } => {
+                    P1Label::FkParent {
+                        parent_table_id,
+                        expected_count,
+                    } => {
                         if p1_results[idx].len() < *expected_count {
                             let (sn, tn, tsn, ttn) = unsafe {
                                 let disp = &mut *disp_ptr;
@@ -644,13 +685,10 @@ impl MasterDispatcher {
                     }
                     P1Label::UpsertPkId => {
                         existing_pks = std::mem::take(&mut p1_results[idx]);
-                        if matches!(mode, WireConflictMode::Error)
-                            && !existing_pks.is_empty()
-                        {
+                        if matches!(mode, WireConflictMode::Error) && !existing_pks.is_empty() {
                             let conflict_pk = existing_pks.iter().next().unwrap();
-                            let (pk_names, sn, tn) = unsafe {
-                                (*disp_ptr).pk_violation_context(target_id, &source_schema)
-                            };
+                            let (pk_names, sn, tn) =
+                                unsafe { (*disp_ptr).pk_violation_context(target_id, &source_schema) };
                             let key_str = format_pk_value_bytes(conflict_pk.pk_bytes(), &source_schema);
                             return Err(format!(
                                 "duplicate key value violates unique constraint \"{sn}_{tn}_pkey\": Key ({pk_names})=({key_str}) already exists",
@@ -678,10 +716,8 @@ impl MasterDispatcher {
             // batched gather, rather than one serial seek per (updated PK ×
             // child). UPDATE cannot change PK columns, so only non-PK
             // referenced columns participate.
-            let project = unsafe {
-                collect_fk_projection(
-                    &*(*disp_ptr).catalog, target_id, n_children, &source_schema)
-            };
+            let project =
+                unsafe { collect_fk_projection(&*(*disp_ptr).catalog, target_id, n_children, &source_schema) };
 
             if !project.is_empty() {
                 // Batch rows that are UPDATEs: positive weight and a PK that
@@ -689,23 +725,23 @@ impl MasterDispatcher {
                 // once; the per-child loop below indexes into this instead of
                 // re-walking the whole batch and re-checking `existing_pks`.
                 let update_rows: Vec<usize> = (0..batch.count)
-                    .filter(|&i| batch.get_weight(i) > 0
-                        && existing_pks.contains(batch.get_pk_bytes(i)))
+                    .filter(|&i| batch.get_weight(i) > 0 && existing_pks.contains(batch.get_pk_bytes(i)))
                     .collect();
 
                 let mut updated: Vec<PkBuf> = Vec::new();
                 let mut seen: FxHashSet<PkBuf> = FxHashSet::default();
                 for &i in &update_rows {
                     let pk = PkBuf::from_bytes(batch.get_pk_bytes(i));
-                    if seen.insert(pk) { updated.push(pk); }
+                    if seen.insert(pk) {
+                        updated.push(pk);
+                    }
                 }
 
                 // Old values come from committed storage (validation is
                 // pre-commit, under the FK table locks held by the executor,
                 // so the committed parent state is static across the gather).
-                let gathered = Self::execute_gather_async(
-                    disp_ptr, reactor, sal_excl, target_id, updated, &project,
-                ).await?;
+                let gathered =
+                    Self::execute_gather_async(disp_ptr, reactor, sal_excl, target_id, updated, &project).await?;
 
                 for ci in 0..n_children {
                     let (child_tid, fk_col_idx, parent_col_idx, idx_schema) = unsafe {
@@ -715,7 +751,9 @@ impl MasterDispatcher {
                             None => continue,
                         };
                         // PK columns are immutable under UPDATE — nothing to enforce.
-                        if source_schema.is_pk_col(parent_col_idx) { continue; }
+                        if source_schema.is_pk_col(parent_col_idx) {
+                            continue;
+                        }
                         let idx_schema = match cat.get_index_schema_by_cols(child_tid, &[fk_col_idx as u32]) {
                             Some(s) => s,
                             None => continue,
@@ -726,7 +764,8 @@ impl MasterDispatcher {
                     // PK columns are skipped above (immutable under UPDATE), so
                     // this referenced column is always a payload column.
                     let loc = source_schema.locate(parent_col_idx);
-                    let proj_pos = project.iter()
+                    let proj_pos = project
+                        .iter()
                         .position(|&c| c == parent_col_idx as u8)
                         .expect("non-PK referenced column missing from gather projection");
 
@@ -748,14 +787,15 @@ impl MasterDispatcher {
 
                         // Only a changed, non-null old value can orphan child rows.
                         if old_val != new_val {
-                            if let Some(v) = old_val { retired.push(v); }
+                            if let Some(v) = old_val {
+                                retired.push(v);
+                            }
                         }
                     }
                     if !retired.is_empty() {
                         // `loc` is the referenced parent (payload) column; its
                         // type drives the sign-extension at the seek encode.
-                        p2_restrict.push((
-                            child_tid, fk_col_idx as u32, idx_schema, loc.type_code(), retired));
+                        p2_restrict.push((child_tid, fk_col_idx as u32, idx_schema, loc.type_code(), retired));
                     }
                 }
             }
@@ -814,8 +854,7 @@ impl MasterDispatcher {
             // (empty on an insert-only batch).
             let mut upsert_keys: Vec<(PkBuf, bool)> = Vec::new();
             let mut check_keys: Vec<PkBuf> = Vec::with_capacity(batch.count);
-            let mut seen: FxHashSet<PkBuf> =
-                FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
+            let mut seen: FxHashSet<PkBuf> = FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
 
             // `retracted_vals` routes a fresh-PK insertion of a retracted value
             // into the verify path (where the holder is discovered);
@@ -830,8 +869,12 @@ impl MasterDispatcher {
             };
             if has_retractions {
                 for i in 0..batch.count {
-                    if batch.get_weight(i) >= 0 { continue; }
-                    if !spec.key_bytes(&mb, i, &mut keybuf) { continue; }
+                    if batch.get_weight(i) >= 0 {
+                        continue;
+                    }
+                    if !spec.key_bytes(&mb, i, &mut keybuf) {
+                        continue;
+                    }
                     retracted_vals.insert(keybuf);
                     retracted_pairs.insert((PkBuf::from_bytes(batch.get_pk_bytes(i)), keybuf));
                 }
@@ -839,19 +882,21 @@ impl MasterDispatcher {
 
             for i in 0..batch.count {
                 let w = batch.get_weight(i);
-                if w <= 0 { continue; }
+                if w <= 0 {
+                    continue;
+                }
 
                 // A row NULL in any indexed column is not indexed (NULL-distinct).
-                if !spec.key_bytes(&mb, i, &mut keybuf) { continue; }
+                if !spec.key_bytes(&mb, i, &mut keybuf) {
+                    continue;
+                }
 
                 // One row at weight w is the value w times. On a non-unique_pk
                 // table that is w live instances (enforce_unique_pk collapses
                 // it to one on unique_pk tables) — the same violation as w
                 // separate +1 rows, which `seen` below rejects.
                 if !unique_pk && w > 1 {
-                    return Err(unsafe {
-                        (*disp_ptr).unique_violation_err(target_id, cols, true)
-                    });
+                    return Err(unsafe { (*disp_ptr).unique_violation_err(target_id, cols, true) });
                 }
 
                 // In-batch duplicate detection runs for ALL positive-weight
@@ -859,9 +904,7 @@ impl MasterDispatcher {
                 // value in one transaction is a violation regardless of whether
                 // their PKs already exist.
                 if !seen.insert(keybuf) {
-                    return Err(unsafe {
-                        (*disp_ptr).unique_violation_err(target_id, cols, true)
-                    });
+                    return Err(unsafe { (*disp_ptr).unique_violation_err(target_id, cols, true) });
                 }
 
                 // UPSERT (committed PK on a unique_pk table — enforce_unique_pk
@@ -889,15 +932,13 @@ impl MasterDispatcher {
             let stride = idx_schema.pk_stride() as usize;
 
             if !check_keys.is_empty() {
-                let skip_broadcast = unsafe {
-                    (*disp_ptr).unique_filter_all_absent(target_id, packed, &check_keys)
-                };
+                let skip_broadcast = unsafe { (*disp_ptr).unique_filter_all_absent(target_id, packed, &check_keys) };
 
                 if !skip_broadcast {
                     let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
-                    let chk_batch = build_check_batch_with(
-                        &idx_schema, &check_keys, pooled,
-                        |b, k| b.extend_pk_bytes(k.padded(stride)));
+                    let chk_batch = build_check_batch_with(&idx_schema, &check_keys, pooled, |b, k| {
+                        b.extend_pk_bytes(k.padded(stride))
+                    });
                     p2_labels.push(P2Label::NonUpsert { col_indices });
                     p2_checks.push(PipelinedCheck {
                         target_id,
@@ -911,11 +952,13 @@ impl MasterDispatcher {
 
             if !upsert_keys.is_empty() {
                 let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
-                let u_batch = build_check_batch_with(
-                    &idx_schema, &upsert_keys, pooled,
-                    |b, (k, _)| b.extend_pk_bytes(k.padded(stride)));
+                let u_batch = build_check_batch_with(&idx_schema, &upsert_keys, pooled, |b, (k, _)| {
+                    b.extend_pk_bytes(k.padded(stride))
+                });
                 p2_labels.push(P2Label::Upsert {
-                    col_indices, upsert_keys, retracted_pairs,
+                    col_indices,
+                    upsert_keys,
+                    retracted_pairs,
                 });
                 p2_checks.push(PipelinedCheck {
                     target_id,
@@ -946,7 +989,9 @@ impl MasterDispatcher {
         }
 
         let p2_results = Self::execute_pipeline_async(disp_ptr, reactor, sal_excl, &mut p2_checks).await?;
-        unsafe { reclaim_check_batches(&mut *disp_ptr, &mut p2_checks); }
+        unsafe {
+            reclaim_check_batches(&mut *disp_ptr, &mut p2_checks);
+        }
 
         for (idx, label) in p2_labels.iter().enumerate() {
             match label {
@@ -970,7 +1015,11 @@ impl MasterDispatcher {
                         ));
                     }
                 }
-                P2Label::Upsert { col_indices, upsert_keys, retracted_pairs } => {
+                P2Label::Upsert {
+                    col_indices,
+                    upsert_keys,
+                    retracted_pairs,
+                } => {
                     // Fan out all seeks before collecting: sal_excl is released
                     // before each reply wait, so the seek futures run
                     // concurrently rather than serializing one RTT per key.
@@ -990,14 +1039,20 @@ impl MasterDispatcher {
                         // (the probe wrote the OPK span padded to the stride).
                         // `key_pk` is already that OPK span — pad to the stride and
                         // test directly; do NOT re-OPK-encode an encoded span.
-                        if !occupied.contains(key_pk.padded(stride)) { continue; }
+                        if !occupied.contains(key_pk.padded(stride)) {
+                            continue;
+                        }
                         pending.push((key_pk, is_upsert));
                         // async fn futures are !Unpin; box-pin for join_all_unpin.
                         // One homogeneous future type (all inputs Copy, no `dyn`):
                         // `seek_unique_holder` gates arity internally.
                         futs.push(Box::pin(Self::seek_unique_holder(
-                            disp_ptr, reactor, sal_excl, target_id,
-                            *col_indices, span_to_natives(&key_pk, idx_cols),
+                            disp_ptr,
+                            reactor,
+                            sal_excl,
+                            target_id,
+                            *col_indices,
+                            span_to_natives(&key_pk, idx_cols),
                         )));
                     }
                     let holders = crate::runtime::reactor::join_all_unpin(futs).await;
@@ -1093,8 +1148,10 @@ impl MasterDispatcher {
             // promoted per-column widths. Identical inputs to each worker's own
             // build, so the frame schema agrees by construction. `packed` is
             // the column list the worker resolves the seek by.
-            (crate::catalog::make_index_schema(col_indices, &owner_schema)?,
-             gnitz_wire::pack_pk_cols(col_indices))
+            (
+                crate::catalog::make_index_schema(col_indices, &owner_schema)?,
+                gnitz_wire::pack_pk_cols(col_indices),
+            )
         };
         let frame_schema = unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
@@ -1107,17 +1164,27 @@ impl MasterDispatcher {
             let (schema, col_names) = disp.get_schema_and_names(owner_id);
             let lsn = disp.next_lsn();
             disp.write_group_with_req_ids(
-                owner_id, lsn, FLAG_UNIQUE_PREFLIGHT, 0, &[], &schema, &col_names,
-                0, packed, req_ids, -1, 0, None, &[],
+                owner_id,
+                lsn,
+                FLAG_UNIQUE_PREFLIGHT,
+                0,
+                &[],
+                &schema,
+                &col_names,
+                0,
+                packed,
+                req_ids,
+                -1,
+                0,
+                None,
+                &[],
             )
         })
         .await?;
 
         let merged = merge_index_scan(slots, &req_ids, reactor, &frame_schema).await?;
         if merged.duplicate {
-            return Err(unsafe {
-                (*disp_ptr).unique_create_dup_err(owner_id, col_indices)
-            });
+            return Err(unsafe { (*disp_ptr).unique_create_dup_err(owner_id, col_indices) });
         }
         Ok(merged.into_seed())
     }
@@ -1138,10 +1205,10 @@ impl MasterDispatcher {
     /// in PG-style "violates unique constraint \"{sn}_{tn}_pkey\": ... key
     /// ({pk_names_joined})=(...)" error messages. Compound PKs join column
     /// names with commas in declaration order.
-    fn pk_violation_context(
-        &mut self, target_id: i64, schema: &SchemaDescriptor,
-    ) -> (String, String, String) {
-        let names: Vec<String> = schema.pk_indices().iter()
+    fn pk_violation_context(&mut self, target_id: i64, schema: &SchemaDescriptor) -> (String, String, String) {
+        let names: Vec<String> = schema
+            .pk_indices()
+            .iter()
             .map(|&ci| self.get_col_name(target_id, ci as usize))
             .collect();
         let (sn, tn) = self.get_qualified_name_owned(target_id);
@@ -1150,9 +1217,7 @@ impl MasterDispatcher {
 
     /// Format the "two rows in one batch share a PK" rejection message.
     /// `key_str` is the already-rendered offending key (narrow or wide).
-    fn batch_dup_pk_err(
-        &mut self, target_id: i64, schema: &SchemaDescriptor, key_str: &str,
-    ) -> String {
+    fn batch_dup_pk_err(&mut self, target_id: i64, schema: &SchemaDescriptor, key_str: &str) -> String {
         let (pk_names, sn, tn) = self.pk_violation_context(target_id, schema);
         format!(
             "duplicate key value violates unique constraint \"{sn}_{tn}_pkey\": Batch contains multiple rows with key ({pk_names})=({key_str})",

@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 
 use gnitz_wire::encode_pk_column;
 
-use crate::schema::{MAX_PK_BYTES, SchemaDescriptor};
+use crate::schema::{SchemaDescriptor, MAX_PK_BYTES};
 
 // ---------------------------------------------------------------------------
 // Column-aware PK byte-region comparator
@@ -45,11 +45,7 @@ pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
 /// `a == b` byte-for-byte, because each column's transform is a bijection on its
 /// byte range. Consolidation grouping relies on this — an OPK equality test is
 /// exactly a PK-byte equality test.
-pub(crate) fn encode_order_preserving_pk(
-    schema: &SchemaDescriptor,
-    pk_bytes: &[u8],
-    out: &mut [u8],
-) {
+pub(crate) fn encode_order_preserving_pk(schema: &SchemaDescriptor, pk_bytes: &[u8], out: &mut [u8]) {
     let mut off = 0usize;
     for (_ord, _ci, col) in schema.pk_columns() {
         let cs = col.size() as usize;
@@ -64,10 +60,7 @@ pub(crate) fn encode_order_preserving_pk(
 /// runs the universal OPK lookup. Wide PKs (`pk_stride > 16`) cannot fit a
 /// `u128` and must take the byte path directly.
 #[inline]
-pub(crate) fn opk_key(
-    schema: &SchemaDescriptor,
-    key: u128,
-) -> ([u8; crate::schema::MAX_PK_BYTES], usize) {
+pub(crate) fn opk_key(schema: &SchemaDescriptor, key: u128) -> ([u8; crate::schema::MAX_PK_BYTES], usize) {
     let stride = schema.pk_stride() as usize;
     debug_assert!(stride <= 16, "opk_key: wide PK (stride {stride}); use the byte path");
     let mut opk = [0u8; crate::schema::MAX_PK_BYTES];
@@ -87,8 +80,7 @@ pub(crate) fn opk_key(
 fn mix(pk: u128) -> usize {
     let lo = pk as u64;
     let hi = (pk >> 64) as u64;
-    let h = lo.wrapping_mul(0x9e3779b97f4a7c15_u64)
-             ^ hi.wrapping_mul(0x6c62272e07bb0142_u64);
+    let h = lo.wrapping_mul(0x9e3779b97f4a7c15_u64) ^ hi.wrapping_mul(0x6c62272e07bb0142_u64);
     (h >> 56) as usize
 }
 
@@ -174,8 +166,7 @@ impl std::fmt::Debug for PkBuf {
 // touches pk_stride bytes per key rather than the full 80-byte array.
 impl PartialEq for PkBuf {
     fn eq(&self, other: &Self) -> bool {
-        self.len == other.len
-            && self.bytes[..self.len as usize] == other.bytes[..other.len as usize]
+        self.len == other.len && self.bytes[..self.len as usize] == other.bytes[..other.len as usize]
     }
 }
 impl Eq for PkBuf {}
@@ -218,7 +209,10 @@ impl PkBuf {
     /// empty-shard form.
     pub fn empty(stride: u8) -> Self {
         debug_assert!(stride as usize <= MAX_PK_BYTES);
-        PkBuf { bytes: [0u8; MAX_PK_BYTES], len: stride }
+        PkBuf {
+            bytes: [0u8; MAX_PK_BYTES],
+            len: stride,
+        }
     }
 
     /// `len = slice.len()`, `bytes[..len]` copied from `slice`, tail
@@ -229,7 +223,10 @@ impl PkBuf {
         debug_assert!(slice.len() <= MAX_PK_BYTES);
         let mut bytes = [0u8; MAX_PK_BYTES];
         bytes[..slice.len()].copy_from_slice(slice);
-        PkBuf { bytes, len: slice.len() as u8 }
+        PkBuf {
+            bytes,
+            len: slice.len() as u8,
+        }
     }
 
     /// `&self.bytes[..len]` — the OPK bytes of this bound. After the
@@ -286,7 +283,9 @@ mod tests {
                 }
                 _ => read_signed(&a[off..], cs).cmp(&read_signed(&b[off..], cs)),
             };
-            if ord != Ordering::Equal { return ord; }
+            if ord != Ordering::Equal {
+                return ord;
+            }
             off += cs;
         }
         Ordering::Equal
@@ -342,9 +341,7 @@ mod tests {
     #[test]
     fn compare_pk_bytes_single_i128() {
         let s = pk_only_schema(&[type_code::I128]);
-        let vals: [i128; 7] = [
-            i128::MIN, -1, 0, 1, 1i128 << 63, 1i128 << 64, i128::MAX,
-        ];
+        let vals: [i128; 7] = [i128::MIN, -1, 0, 1, 1i128 << 63, 1i128 << 64, i128::MAX];
         for i in 0..vals.len() {
             for j in 0..vals.len() {
                 let a = vals[i].to_le_bytes();
@@ -364,18 +361,9 @@ mod tests {
         let s = pk_only_schema(&[type_code::U128]);
         let lo = u64::MAX as u128;
         let hi = lo + 1;
-        assert_eq!(
-            cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
-            Ordering::Less,
-        );
-        assert_eq!(
-            cmp_pk_le(&s, &hi.to_le_bytes(), &lo.to_le_bytes()),
-            Ordering::Greater,
-        );
-        assert_eq!(
-            cmp_pk_le(&s, &lo.to_le_bytes(), &lo.to_le_bytes()),
-            Ordering::Equal,
-        );
+        assert_eq!(cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()), Ordering::Less,);
+        assert_eq!(cmp_pk_le(&s, &hi.to_le_bytes(), &lo.to_le_bytes()), Ordering::Greater,);
+        assert_eq!(cmp_pk_le(&s, &lo.to_le_bytes(), &lo.to_le_bytes()), Ordering::Equal,);
         assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
         assert_opk_equivalence(&s, &hi.to_le_bytes(), &lo.to_le_bytes());
     }
@@ -386,10 +374,7 @@ mod tests {
         let low: u128 = 0x0000_0000_0000_0001;
         let high: u128 = 0x8000_0000_0000_0000_0000_0000_0000_0000;
         // High-bit-set sorts above small value (u128 LE numerical order).
-        assert_eq!(
-            cmp_pk_le(&s, &low.to_le_bytes(), &high.to_le_bytes()),
-            Ordering::Less,
-        );
+        assert_eq!(cmp_pk_le(&s, &low.to_le_bytes(), &high.to_le_bytes()), Ordering::Less,);
         assert_opk_equivalence(&s, &low.to_le_bytes(), &high.to_le_bytes());
     }
 
@@ -483,10 +468,7 @@ mod tests {
         let lo: u16 = 0x0001;
         let hi: u16 = 0xFFFE;
         // Zero-extension: hi > lo. Sign-extension would invert.
-        assert_eq!(
-            cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
-            Ordering::Less,
-        );
+        assert_eq!(cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()), Ordering::Less,);
         assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
     }
 
@@ -495,10 +477,7 @@ mod tests {
         let s = pk_only_schema(&[type_code::U32]);
         let lo: u32 = 1;
         let hi: u32 = 0xFFFF_FFFE;
-        assert_eq!(
-            cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()),
-            Ordering::Less,
-        );
+        assert_eq!(cmp_pk_le(&s, &lo.to_le_bytes(), &hi.to_le_bytes()), Ordering::Less,);
         assert_opk_equivalence(&s, &lo.to_le_bytes(), &hi.to_le_bytes());
     }
 
@@ -568,9 +547,16 @@ mod tests {
     #[test]
     fn compare_pk_bytes_equal_returns_equal() {
         for tc in [
-            type_code::U8, type_code::I8, type_code::U16, type_code::I16,
-            type_code::U32, type_code::I32, type_code::U64, type_code::I64,
-            type_code::U128, type_code::UUID,
+            type_code::U8,
+            type_code::I8,
+            type_code::U16,
+            type_code::I16,
+            type_code::U32,
+            type_code::I32,
+            type_code::U64,
+            type_code::I64,
+            type_code::U128,
+            type_code::UUID,
         ] {
             let s = pk_only_schema(&[tc]);
             let stride = s.pk_stride() as usize;
@@ -594,8 +580,8 @@ mod tests {
 
     mod opk_proptest {
         use super::*;
-        use proptest::prelude::*;
         use crate::test_support::arb_pk_type;
+        use proptest::prelude::*;
 
         fn tc_size(tc: u8) -> usize {
             SchemaColumn::new(tc, 0).size() as usize

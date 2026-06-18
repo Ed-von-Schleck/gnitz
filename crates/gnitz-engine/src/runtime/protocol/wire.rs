@@ -1,20 +1,18 @@
 //! Wire protocol: IPC message codec, schema conversion, encode/decode.
 
-use crate::schema::{SchemaColumn, SchemaDescriptor, type_code, encode_german_string, try_decode_german_string};
-use crate::storage::{Batch, MemBatch};
 use crate::foundation::codec::align8;
+use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
+use crate::storage::{Batch, MemBatch};
 
 // ---------------------------------------------------------------------------
 // Constants re-exported from gnitz_wire
 // ---------------------------------------------------------------------------
 
 pub use gnitz_wire::{
-    FLAG_HAS_SCHEMA, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_CONTINUATION, FLAG_GET_INDICES, IPC_CONTROL_TID,
-    STATUS_OK, STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, META_FLAG_NULLABLE, META_FLAG_IS_PK,
-    WireConflictMode,
-    wire_flags_get_conflict_mode,
-    wire_flags_set_schema_version, wire_flags_get_schema_version,
-    wire_flags_set_index_version, wire_flags_get_index_version,
+    wire_flags_get_conflict_mode, wire_flags_get_index_version, wire_flags_get_schema_version,
+    wire_flags_set_index_version, wire_flags_set_schema_version, WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE,
+    FLAG_GET_INDICES, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, IPC_CONTROL_TID, META_FLAG_IS_PK, META_FLAG_NULLABLE,
+    STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
 
 pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
@@ -28,10 +26,10 @@ pub(crate) const FLAG_SCAN_LAST: u64 = 1 << 53;
 
 // WAL block header field offsets (matches storage/lsm/wal.rs; duplicated here to
 // avoid cross-module coupling between runtime and storage internals).
-const WAL_OFF_COUNT:       usize = 12;
+const WAL_OFF_COUNT: usize = 12;
 pub(crate) const WAL_OFF_SIZE: usize = 16;
-const WAL_OFF_VERSION:     usize = 20;
-const WAL_OFF_CHECKSUM:    usize = 24;
+const WAL_OFF_VERSION: usize = 20;
+const WAL_OFF_CHECKSUM: usize = 24;
 const WAL_OFF_NUM_REGIONS: usize = 32;
 
 // ---------------------------------------------------------------------------
@@ -100,11 +98,7 @@ fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size:
 /// `encode_wire_into` would embed. Callers cache this per table and pass it
 /// as `prebuilt_schema_block` to `wire_size` / `encode_wire_into` to skip the
 /// `Batch` allocation on every SEEK/SCAN response.
-pub fn build_schema_wire_block(
-    schema: &SchemaDescriptor,
-    col_names: &[&[u8]],
-    target_tid: u32,
-) -> Vec<u8> {
+pub fn build_schema_wire_block(schema: &SchemaDescriptor, col_names: &[&[u8]], target_tid: u32) -> Vec<u8> {
     let schema_batch = schema_to_batch(schema, col_names);
     let sz = schema_batch.wire_byte_size(target_tid);
     let mut block = vec![0u8; sz];
@@ -131,7 +125,9 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) ->
     for ci in 0..ncols {
         let col = &schema.columns[ci];
         let mut flags: u64 = 0;
-        if col.nullable != 0 { flags |= META_FLAG_NULLABLE; }
+        if col.nullable != 0 {
+            flags |= META_FLAG_NULLABLE;
+        }
         // For compound PKs the position within `schema.pk_indices()` is
         // what determines decode order — column order ≠ PK order in
         // general (e.g. `PRIMARY KEY (b, a)`). Encode the position so
@@ -160,20 +156,20 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) ->
 
 #[cfg(test)]
 pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Vec<u8>>), &'static str> {
-    if batch.count == 0 { return Err("empty schema batch"); }
-    if batch.count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
+    if batch.count == 0 {
+        return Err("empty schema batch");
+    }
+    if batch.count > crate::schema::MAX_COLUMNS {
+        return Err("schema exceeds column limit");
+    }
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let mut names = Vec::with_capacity(batch.count);
     let mut pk_pairs: [(u8, u32); gnitz_wire::MAX_PK_COLUMNS] = [(0, 0); gnitz_wire::MAX_PK_COLUMNS];
     let mut pk_count: usize = 0;
     for (i, col) in cols.iter_mut().enumerate().take(batch.count) {
         let off8 = i * 8;
-        let type_code_val = u64::from_le_bytes(
-            batch.col_data(0)[off8..off8 + 8].try_into().unwrap()
-        ) as u8;
-        let flags_val = u64::from_le_bytes(
-            batch.col_data(1)[off8..off8 + 8].try_into().unwrap()
-        );
+        let type_code_val = u64::from_le_bytes(batch.col_data(0)[off8..off8 + 8].try_into().unwrap()) as u8;
+        let flags_val = u64::from_le_bytes(batch.col_data(1)[off8..off8 + 8].try_into().unwrap());
         let off16 = i * 16;
         let mut st = [0u8; 16];
         st.copy_from_slice(&batch.col_data(2)[off16..off16 + 16]);
@@ -185,13 +181,14 @@ pub(crate) fn batch_to_schema(batch: &Batch) -> Result<(SchemaDescriptor, Vec<Ve
             if pk_count >= gnitz_wire::MAX_PK_COLUMNS {
                 return Err("too many PK columns");
             }
-            let pos = ((flags_val & gnitz_wire::META_FLAG_PK_POS_MASK)
-                       >> gnitz_wire::META_FLAG_PK_POS_SHIFT) as u8;
+            let pos = ((flags_val & gnitz_wire::META_FLAG_PK_POS_MASK) >> gnitz_wire::META_FLAG_PK_POS_SHIFT) as u8;
             pk_pairs[pk_count] = (pos, i as u32);
             pk_count += 1;
         }
     }
-    if pk_count == 0 { return Err("no PK column"); }
+    if pk_count == 0 {
+        return Err("no PK column");
+    }
     pk_pairs[..pk_count].sort_by_key(|(p, _)| *p);
     let mut pk_indices: [u32; gnitz_wire::MAX_PK_COLUMNS] = [0; gnitz_wire::MAX_PK_COLUMNS];
     for (k, (_, ci)) in pk_pairs[..pk_count].iter().enumerate() {
@@ -231,17 +228,21 @@ pub(crate) fn encode_ctrl_block_ipc(
     let has_error = !error_msg.is_empty();
     let has_seek_extra = !seek_pk_extra.is_empty();
     let null_word: u64 = (if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG })
-        | (if has_seek_extra { 0 } else { ctrl::NULL_BIT_SEEK_PK_EXTRA });
+        | (if has_seek_extra {
+            0
+        } else {
+            ctrl::NULL_BIT_SEEK_PK_EXTRA
+        });
     b.extend_pk(0u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&null_word.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_STATUS,       &(status as u64).to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_CLIENT_ID,    &client_id.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_TARGET_ID,    &target_id.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_FLAGS,        &wire_flags.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_SEEK_PK,      &seek_pk.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_STATUS, &(status as u64).to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_CLIENT_ID, &client_id.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_TARGET_ID, &target_id.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_FLAGS, &wire_flags.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_SEEK_PK, &seek_pk.to_le_bytes());
     b.extend_col(ctrl::PAYLOAD_SEEK_COL_IDX, &seek_col_idx.to_le_bytes());
-    b.extend_col(ctrl::PAYLOAD_REQUEST_ID,   &request_id.to_le_bytes());
+    b.extend_col(ctrl::PAYLOAD_REQUEST_ID, &request_id.to_le_bytes());
     let error_st = if has_error {
         encode_german_string(error_msg, &mut b.blob)
     } else {
@@ -274,49 +275,51 @@ const fn ctrl_region_offset(target_region: usize) -> usize {
     let pk_idx = schema.pk_index_single() as usize;
 
     let mut sizes = [0usize; NUM_REGIONS];
-    sizes[0] = schema.pk_stride() as usize;                   // pk
-    sizes[1] = 8;                                             // weight
-    sizes[2] = 8;                                             // null_bmp
+    sizes[0] = schema.pk_stride() as usize; // pk
+    sizes[1] = 8; // weight
+    sizes[2] = 8; // null_bmp
     let mut pi = 0usize;
     let mut ci = 0usize;
     while ci < schema.num_columns() {
-        if ci == pk_idx { ci += 1; continue; }
+        if ci == pk_idx {
+            ci += 1;
+            continue;
+        }
         sizes[3 + pi] = schema.columns[ci].size() as usize;
         pi += 1;
         ci += 1;
     }
-    sizes[NUM_REGIONS - 1] = 0;                               // blob (no-blob path)
+    sizes[NUM_REGIONS - 1] = 0; // blob (no-blob path)
 
     let mut pos = gnitz_wire::WAL_HEADER_SIZE + NUM_REGIONS * 8;
     let mut r = 0;
     while r < target_region {
-        assert!(sizes[r] % 8 == 0,
-            "ctrl_region_offset assumes every region size is 8-aligned");
+        assert!(
+            sizes[r] % 8 == 0,
+            "ctrl_region_offset assumes every region size is 8-aligned"
+        );
         pos += sizes[r];
         r += 1;
     }
     pos
 }
 
-pub(crate) const CTRL_BLOCK_SIZE_NO_BLOB: usize =
-    ctrl_region_offset(gnitz_wire::control::NUM_REGIONS);
+pub(crate) const CTRL_BLOCK_SIZE_NO_BLOB: usize = ctrl_region_offset(gnitz_wire::control::NUM_REGIONS);
 
-const OFF_STATUS:       usize = ctrl_region_offset(gnitz_wire::control::REGION_STATUS);
-const OFF_CLIENT_ID:    usize = ctrl_region_offset(gnitz_wire::control::REGION_CLIENT_ID);
-const OFF_TARGET_ID:    usize = ctrl_region_offset(gnitz_wire::control::REGION_TARGET_ID);
-const OFF_FLAGS:        usize = ctrl_region_offset(gnitz_wire::control::REGION_FLAGS);
-const OFF_SEEK_PK:      usize = ctrl_region_offset(gnitz_wire::control::REGION_SEEK_PK);
+const OFF_STATUS: usize = ctrl_region_offset(gnitz_wire::control::REGION_STATUS);
+const OFF_CLIENT_ID: usize = ctrl_region_offset(gnitz_wire::control::REGION_CLIENT_ID);
+const OFF_TARGET_ID: usize = ctrl_region_offset(gnitz_wire::control::REGION_TARGET_ID);
+const OFF_FLAGS: usize = ctrl_region_offset(gnitz_wire::control::REGION_FLAGS);
+const OFF_SEEK_PK: usize = ctrl_region_offset(gnitz_wire::control::REGION_SEEK_PK);
 const OFF_SEEK_COL_IDX: usize = ctrl_region_offset(gnitz_wire::control::REGION_SEEK_COL_IDX);
-const OFF_REQUEST_ID:   usize = ctrl_region_offset(gnitz_wire::control::REGION_REQUEST_ID);
+const OFF_REQUEST_ID: usize = ctrl_region_offset(gnitz_wire::control::REGION_REQUEST_ID);
 
-static CTRL_BLOCK_TEMPLATE: std::sync::LazyLock<[u8; CTRL_BLOCK_SIZE_NO_BLOB]> =
-    std::sync::LazyLock::new(|| {
-        let mut arr = [0u8; CTRL_BLOCK_SIZE_NO_BLOB];
-        let n = encode_ctrl_block_ipc(&mut arr, 0, 0, 0, 0, 0, 0, 0, 0, b"", b"", false);
-        assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB,
-            "ctrl block template size mismatch");
-        arr
-    });
+static CTRL_BLOCK_TEMPLATE: std::sync::LazyLock<[u8; CTRL_BLOCK_SIZE_NO_BLOB]> = std::sync::LazyLock::new(|| {
+    let mut arr = [0u8; CTRL_BLOCK_SIZE_NO_BLOB];
+    let n = encode_ctrl_block_ipc(&mut arr, 0, 0, 0, 0, 0, 0, 0, 0, b"", b"", false);
+    assert_eq!(n, CTRL_BLOCK_SIZE_NO_BLOB, "ctrl block template size mismatch");
+    arr
+});
 
 /// Direct ctrl-block encoder. On the no-error fast path
 /// (`error_msg.is_empty()`), copies the pre-encoded template and patches the 7
@@ -342,8 +345,18 @@ pub(crate) fn encode_ctrl_block_direct(
 ) -> usize {
     if !error_msg.is_empty() || !seek_pk_extra.is_empty() {
         return encode_ctrl_block_ipc(
-            out, offset, target_id, client_id, wire_flags,
-            seek_pk, seek_col_idx, request_id, status, error_msg, seek_pk_extra, checksum,
+            out,
+            offset,
+            target_id,
+            client_id,
+            wire_flags,
+            seek_pk,
+            seek_col_idx,
+            request_id,
+            status,
+            error_msg,
+            seek_pk_extra,
+            checksum,
         );
     }
     let buf = &mut out[offset..offset + CTRL_BLOCK_SIZE_NO_BLOB];
@@ -392,10 +405,14 @@ pub fn wire_size(
 
     let err_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
         error_msg.len()
-    } else { 0 };
+    } else {
+        0
+    };
     let pk_extra_blob = if seek_pk_extra.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
         seek_pk_extra.len()
-    } else { 0 };
+    } else {
+        0
+    };
     let ctrl_blob = err_blob + pk_extra_blob;
     let mut total = if ctrl_blob == 0 {
         CTRL_BLOCK_SIZE_NO_BLOB
@@ -410,8 +427,16 @@ pub fn wire_size(
             let s = schema.unwrap();
             let names = col_names.unwrap_or(&[]);
             let ncols = s.num_columns();
-            let schema_blob: usize = names.iter().take(ncols)
-                .map(|n| if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD { n.len() } else { 0 })
+            let schema_blob: usize = names
+                .iter()
+                .take(ncols)
+                .map(|n| {
+                    if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
+                        n.len()
+                    } else {
+                        0
+                    }
+                })
                 .sum();
             total += schema_wal_block_size(&META_SCHEMA_DESC, ncols, schema_blob);
         }
@@ -442,9 +467,21 @@ pub(crate) fn encode_wire(
     let sz = wire_size(status, error_msg, schema, col_names, data_batch, None, &[]);
     let mut buf = vec![0u8; sz];
     encode_wire_into(
-        &mut buf, 0, target_id, client_id, flags,
-        seek_pk, seek_col_idx, request_id,
-        status, error_msg, schema, col_names, data_batch, None, &[],
+        &mut buf,
+        0,
+        target_id,
+        client_id,
+        flags,
+        seek_pk,
+        seek_col_idx,
+        request_id,
+        status,
+        error_msg,
+        schema,
+        col_names,
+        data_batch,
+        None,
+        &[],
     );
     buf
 }
@@ -476,9 +513,22 @@ pub fn encode_wire_into(
     seek_pk_extra: &[u8],
 ) -> usize {
     encode_wire_into_impl(
-        out, offset, target_id, client_id, flags, seek_pk, seek_col_idx,
-        request_id, status, error_msg, schema, col_names, data_batch,
-        prebuilt_schema_block, seek_pk_extra, true,
+        out,
+        offset,
+        target_id,
+        client_id,
+        flags,
+        seek_pk,
+        seek_col_idx,
+        request_id,
+        status,
+        error_msg,
+        schema,
+        col_names,
+        data_batch,
+        prebuilt_schema_block,
+        seek_pk_extra,
+        true,
     )
 }
 
@@ -504,12 +554,24 @@ pub fn encode_wire_into_ipc(
     seek_pk_extra: &[u8],
 ) -> usize {
     encode_wire_into_impl(
-        out, offset, target_id, client_id, flags, seek_pk, seek_col_idx,
-        request_id, status, error_msg, schema, col_names, data_batch,
-        prebuilt_schema_block, seek_pk_extra, false,
+        out,
+        offset,
+        target_id,
+        client_id,
+        flags,
+        seek_pk,
+        seek_col_idx,
+        request_id,
+        status,
+        error_msg,
+        schema,
+        col_names,
+        data_batch,
+        prebuilt_schema_block,
+        seek_pk_extra,
+        false,
     )
 }
-
 
 /// Compute total encoded wire size for `count` rows of `data_batch`.
 ///
@@ -530,7 +592,9 @@ pub fn wire_size_range(
 
     let ctrl_blob = if error_msg.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
         error_msg.len()
-    } else { 0 };
+    } else {
+        0
+    };
     let mut total = if ctrl_blob == 0 {
         CTRL_BLOCK_SIZE_NO_BLOB
     } else {
@@ -543,8 +607,17 @@ pub fn wire_size_range(
         } else {
             let s = schema.unwrap();
             let ncols = s.num_columns();
-            let schema_blob: usize = col_names.unwrap_or(&[]).iter().take(ncols)
-                .map(|n| if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD { n.len() } else { 0 })
+            let schema_blob: usize = col_names
+                .unwrap_or(&[])
+                .iter()
+                .take(ncols)
+                .map(|n| {
+                    if n.len() > gnitz_wire::SHORT_STRING_THRESHOLD {
+                        n.len()
+                    } else {
+                        0
+                    }
+                })
                 .sum();
             total += schema_wal_block_size(&META_SCHEMA_DESC, ncols, schema_blob);
         }
@@ -579,16 +652,32 @@ pub fn encode_wire_into_range(
     let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
     let mut wire_flags = flags;
-    if has_schema { wire_flags |= FLAG_HAS_SCHEMA; }
+    if has_schema {
+        wire_flags |= FLAG_HAS_SCHEMA;
+    }
     if has_data {
         wire_flags |= FLAG_HAS_DATA;
-        if data_batch.sorted      { wire_flags |= FLAG_BATCH_SORTED; }
-        if data_batch.consolidated { wire_flags |= FLAG_BATCH_CONSOLIDATED; }
+        if data_batch.sorted {
+            wire_flags |= FLAG_BATCH_SORTED;
+        }
+        if data_batch.consolidated {
+            wire_flags |= FLAG_BATCH_CONSOLIDATED;
+        }
     }
 
     let written = encode_ctrl_block_direct(
-        out, offset, target_id, client_id, wire_flags,
-        0u128, 0, request_id, status, &[], &[], false,
+        out,
+        offset,
+        target_id,
+        client_id,
+        wire_flags,
+        0u128,
+        0,
+        request_id,
+        status,
+        &[],
+        &[],
+        false,
     );
     let mut pos = offset + written;
 
@@ -635,16 +724,34 @@ fn encode_wire_into_impl(
     let has_schema = should_include_schema(schema, prebuilt_schema_block, has_data, status);
 
     let mut wire_flags = flags;
-    if has_schema { wire_flags |= FLAG_HAS_SCHEMA; }
+    if has_schema {
+        wire_flags |= FLAG_HAS_SCHEMA;
+    }
     if has_data {
         wire_flags |= FLAG_HAS_DATA;
         let b = data_batch.unwrap();
-        if b.sorted { wire_flags |= FLAG_BATCH_SORTED; }
-        if b.consolidated { wire_flags |= FLAG_BATCH_CONSOLIDATED; }
+        if b.sorted {
+            wire_flags |= FLAG_BATCH_SORTED;
+        }
+        if b.consolidated {
+            wire_flags |= FLAG_BATCH_CONSOLIDATED;
+        }
     }
 
-    let written = encode_ctrl_block_direct(out, offset, target_id, client_id, wire_flags,
-                                           seek_pk, seek_col_idx, request_id, status, error_msg, seek_pk_extra, checksum);
+    let written = encode_ctrl_block_direct(
+        out,
+        offset,
+        target_id,
+        client_id,
+        wire_flags,
+        seek_pk,
+        seek_col_idx,
+        request_id,
+        status,
+        error_msg,
+        seek_pk_extra,
+        checksum,
+    );
     let mut pos = offset + written;
 
     if has_schema {
@@ -715,7 +822,7 @@ pub struct DecodedWireZeroCopy<'a> {
 /// against what the sender embedded in `wire_flags`.
 pub struct SchemaWithVersion<'a> {
     pub descriptor: &'a SchemaDescriptor,
-    pub version:    u16,
+    pub version: u16,
 }
 
 /// Read the (data_offset, data_size) directory entry for region `r` from a
@@ -726,8 +833,8 @@ fn wal_dir_entry(data: &[u8], r: usize) -> (usize, usize) {
     const HEADER: usize = gnitz_wire::WAL_HEADER_SIZE;
     const DIR_ENTRY: usize = 8;
     let base = HEADER + r * DIR_ENTRY;
-    let off = u32::from_le_bytes(data[base    ..base + 4].try_into().unwrap()) as usize;
-    let sz  = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
+    let off = u32::from_le_bytes(data[base..base + 4].try_into().unwrap()) as usize;
+    let sz = u32::from_le_bytes(data[base + 4..base + 8].try_into().unwrap()) as usize;
     (off, sz)
 }
 
@@ -771,14 +878,14 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         Ok(u128::from_le_bytes(data[off..off + 16].try_into().unwrap()))
     };
 
-    let null_bmp     = read_u64(ctrl::REGION_NULL_BMP)?;
-    let status       = read_u64(ctrl::REGION_STATUS)? as u32;
-    let client_id    = read_u64(ctrl::REGION_CLIENT_ID)?;
-    let target_id    = read_u64(ctrl::REGION_TARGET_ID)?;
-    let flags        = read_u64(ctrl::REGION_FLAGS)?;
-    let seek_pk      = read_u128(ctrl::REGION_SEEK_PK)?;
+    let null_bmp = read_u64(ctrl::REGION_NULL_BMP)?;
+    let status = read_u64(ctrl::REGION_STATUS)? as u32;
+    let client_id = read_u64(ctrl::REGION_CLIENT_ID)?;
+    let target_id = read_u64(ctrl::REGION_TARGET_ID)?;
+    let flags = read_u64(ctrl::REGION_FLAGS)?;
+    let seek_pk = read_u128(ctrl::REGION_SEEK_PK)?;
     let seek_col_idx = read_u64(ctrl::REGION_SEEK_COL_IDX)?;
-    let request_id   = read_u64(ctrl::REGION_REQUEST_ID)?;
+    let request_id = read_u64(ctrl::REGION_REQUEST_ID)?;
 
     let error_is_null = (null_bmp & ctrl::NULL_BIT_ERROR_MSG) != 0;
     let seek_extra_is_null = (null_bmp & ctrl::NULL_BIT_SEEK_PK_EXTRA) != 0;
@@ -808,8 +915,7 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         }
         let mut st = [0u8; 16];
         st.copy_from_slice(&data[err_off..err_off + 16]);
-        try_decode_german_string(&st, blob)
-            .ok_or("error_msg string offset out of bounds")?
+        try_decode_german_string(&st, blob).ok_or("error_msg string offset out of bounds")?
     };
 
     let seek_pk_extra = if seek_extra_is_null {
@@ -821,14 +927,19 @@ pub fn peek_control_block(data: &[u8]) -> Result<DecodedControl, &'static str> {
         }
         let mut st = [0u8; 16];
         st.copy_from_slice(&data[sx_off..sx_off + 16]);
-        try_decode_german_string(&st, blob)
-            .ok_or("seek_pk_extra string offset out of bounds")?
+        try_decode_german_string(&st, blob).ok_or("seek_pk_extra string offset out of bounds")?
     };
 
     let block_size = u32::from_le_bytes(data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
     Ok(DecodedControl {
-        status, client_id, target_id, flags,
-        seek_pk, seek_col_idx, request_id, error_msg,
+        status,
+        client_id,
+        target_id,
+        flags,
+        seek_pk,
+        seek_col_idx,
+        request_id,
+        error_msg,
         seek_pk_extra,
         block_size,
     })
@@ -840,27 +951,40 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     //   type_code/U64(3), flags/U64(4), name/STR(5), blob(6).
     const HEADER: usize = gnitz_wire::WAL_HEADER_SIZE;
 
-    if data.len() < HEADER { return Err("schema block too small"); }
+    if data.len() < HEADER {
+        return Err("schema block too small");
+    }
 
     let version = u32::from_le_bytes(data[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].try_into().unwrap());
     if version != gnitz_wire::WAL_FORMAT_VERSION {
         return Err("schema block wrong version");
     }
     let total_size = u32::from_le_bytes(data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
-    if total_size > data.len() { return Err("schema block truncated"); }
+    if total_size > data.len() {
+        return Err("schema block truncated");
+    }
 
     if verify_checksum && total_size > HEADER {
         let expected = u64::from_le_bytes(data[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].try_into().unwrap());
         let actual = crate::foundation::xxh::checksum(&data[HEADER..total_size]);
-        if actual != expected { return Err("schema block checksum mismatch"); }
+        if actual != expected {
+            return Err("schema block checksum mismatch");
+        }
     }
 
     let count = u32::from_le_bytes(data[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].try_into().unwrap()) as usize;
-    let num_regions = u32::from_le_bytes(data[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].try_into().unwrap()) as usize;
+    let num_regions =
+        u32::from_le_bytes(data[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].try_into().unwrap()) as usize;
 
-    if count == 0 { return Err("empty schema block"); }
-    if count > crate::schema::MAX_COLUMNS { return Err("schema exceeds column limit"); }
-    if num_regions < 5 { return Err("schema block region count mismatch"); }
+    if count == 0 {
+        return Err("empty schema block");
+    }
+    if count > crate::schema::MAX_COLUMNS {
+        return Err("schema exceeds column limit");
+    }
+    if num_regions < 5 {
+        return Err("schema block region count mismatch");
+    }
 
     // The directory table is `num_regions` × 8 bytes immediately after the
     // header; every `wal_dir_entry` call below indexes into it. Reject any
@@ -877,7 +1001,9 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     // an unsigned U64 PK column stored OPK (big-endian) at rest, so decode
     // it big-endian to recover the native index.
     let (pk_off, pk_sz) = wal_dir_entry(data, 0);
-    if pk_sz < count * 8 || pk_off.saturating_add(pk_sz) > data.len() { return Err("schema col_idx region OOB"); }
+    if pk_sz < count * 8 || pk_off.saturating_add(pk_sz) > data.len() {
+        return Err("schema col_idx region OOB");
+    }
     let pk_data = &data[pk_off..pk_off + count * 8];
     for i in 0..count {
         let v = u64::from_be_bytes(pk_data[i * 8..(i + 1) * 8].try_into().unwrap());
@@ -889,10 +1015,14 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
     let (tc_off, tc_sz) = wal_dir_entry(data, 3);
     let (fl_off, fl_sz) = wal_dir_entry(data, 4);
 
-    if tc_sz < count * 8 || tc_off.saturating_add(tc_sz) > data.len() { return Err("schema type_code region OOB"); }
-    if fl_sz < count * 8 || fl_off.saturating_add(fl_sz) > data.len() { return Err("schema flags region OOB"); }
+    if tc_sz < count * 8 || tc_off.saturating_add(tc_sz) > data.len() {
+        return Err("schema type_code region OOB");
+    }
+    if fl_sz < count * 8 || fl_off.saturating_add(fl_sz) > data.len() {
+        return Err("schema flags region OOB");
+    }
 
-    let type_data  = &data[tc_off..tc_off + count * 8];
+    let type_data = &data[tc_off..tc_off + count * 8];
     let flags_data = &data[fl_off..fl_off + count * 8];
 
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
@@ -904,15 +1034,15 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
 
     for (i, col) in cols[..count].iter_mut().enumerate() {
         let off8 = i * 8;
-        let tc = u64::from_le_bytes(type_data[off8..off8+8].try_into().unwrap()) as u8;
-        let fl = u64::from_le_bytes(flags_data[off8..off8+8].try_into().unwrap());
+        let tc = u64::from_le_bytes(type_data[off8..off8 + 8].try_into().unwrap()) as u8;
+        let fl = u64::from_le_bytes(flags_data[off8..off8 + 8].try_into().unwrap());
         // Reject unknown type codes here so a crafted wire schema cannot
         // smuggle in a type_code the downstream cursors can't decode.
         if gnitz_wire::TypeCode::try_from_u8(tc).is_none() {
             return Err("schema: invalid type code");
         }
         let is_nullable = (fl & META_FLAG_NULLABLE) != 0;
-        let is_pk       = (fl & META_FLAG_IS_PK)       != 0;
+        let is_pk = (fl & META_FLAG_IS_PK) != 0;
         *col = SchemaColumn::new(tc, if is_nullable { 1 } else { 0 });
         if is_pk {
             // Reject malformed PK columns here rather than letting them reach
@@ -928,13 +1058,14 @@ fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaDescr
             if pk_count >= gnitz_wire::MAX_PK_COLUMNS {
                 return Err("too many PK columns");
             }
-            let pos = ((fl & gnitz_wire::META_FLAG_PK_POS_MASK)
-                       >> gnitz_wire::META_FLAG_PK_POS_SHIFT) as u8;
+            let pos = ((fl & gnitz_wire::META_FLAG_PK_POS_MASK) >> gnitz_wire::META_FLAG_PK_POS_SHIFT) as u8;
             pk_pairs[pk_count] = (pos, i as u32);
             pk_count += 1;
         }
     }
-    if pk_count == 0 { return Err("no PK column"); }
+    if pk_count == 0 {
+        return Err("no PK column");
+    }
     // Sort by position; single-PK schemas all carry position 0 so this
     // is a no-op for the common path.
     pk_pairs[..pk_count].sort_by_key(|(p, _)| *p);
@@ -1004,7 +1135,9 @@ fn decode_wire_impl(
         return Err("IPC payload too small");
     }
     let ctrl_size = u32::from_le_bytes(
-        data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad control size")?
+        data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4]
+            .try_into()
+            .map_err(|_| "bad control size")?,
     ) as usize;
     if ctrl_size > data.len() {
         return Err("control block truncated");
@@ -1066,7 +1199,7 @@ fn decode_wire_body(
 ) -> Result<DecodedWire, &'static str> {
     let flags = control.flags;
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
-    let has_data   = (flags & FLAG_HAS_DATA)   != 0;
+    let has_data = (flags & FLAG_HAS_DATA) != 0;
 
     let mut off = ctrl_size;
     let mut wire_schema: Option<SchemaDescriptor> = None;
@@ -1085,7 +1218,9 @@ fn decode_wire_body(
             return Err("schema block truncated");
         }
         let schema_size = u32::from_le_bytes(
-            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad schema size")?
+            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4]
+                .try_into()
+                .map_err(|_| "bad schema size")?,
         ) as usize;
         if off + schema_size > data.len() {
             return Err("schema block truncated");
@@ -1109,20 +1244,30 @@ fn decode_wire_body(
             return Err("data block truncated");
         }
         let data_size = u32::from_le_bytes(
-            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad data size")?
+            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4]
+                .try_into()
+                .map_err(|_| "bad data size")?,
         ) as usize;
         if off + data_size > data.len() {
             return Err("data block truncated");
         }
         let (mut batch, _) = Batch::decode_from_wal_block(&data[off..off + data_size], eff_schema, verify_checksum)?;
-        if (flags & FLAG_BATCH_SORTED) != 0 { batch.mark_sorted(); }
-        if (flags & FLAG_BATCH_CONSOLIDATED) != 0 { batch.mark_consolidated(); }
+        if (flags & FLAG_BATCH_SORTED) != 0 {
+            batch.mark_sorted();
+        }
+        if (flags & FLAG_BATCH_CONSOLIDATED) != 0 {
+            batch.mark_consolidated();
+        }
         Some(batch)
     } else {
         None
     };
 
-    Ok(DecodedWire { control, schema: wire_schema, data_batch })
+    Ok(DecodedWire {
+        control,
+        schema: wire_schema,
+        data_batch,
+    })
 }
 
 /// Decode a W2M IPC message without copying data: schema is parsed from the
@@ -1141,7 +1286,7 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
 ) -> Result<DecodedWireZeroCopy<'a>, &'static str> {
     let flags = control.flags;
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
-    let has_data   = (flags & FLAG_HAS_DATA)   != 0;
+    let has_data = (flags & FLAG_HAS_DATA) != 0;
 
     let mut off = ctrl_size;
     let mut wire_schema: Option<SchemaDescriptor> = None;
@@ -1155,7 +1300,9 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
             return Err("schema block truncated");
         }
         let schema_size = u32::from_le_bytes(
-            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad schema size")?
+            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4]
+                .try_into()
+                .map_err(|_| "bad schema size")?,
         ) as usize;
         if off + schema_size > data.len() {
             return Err("schema block truncated");
@@ -1170,31 +1317,35 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
             return Err("data block truncated");
         }
         let data_size = u32::from_le_bytes(
-            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4].try_into().map_err(|_| "bad data size")?
+            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4]
+                .try_into()
+                .map_err(|_| "bad data size")?,
         ) as usize;
         if off + data_size > data.len() {
             return Err("data block truncated");
         }
-        let mb = crate::storage::decode_mem_batch_from_wal_block(
-            &data[off..off + data_size], eff_schema,
-        )?;
+        let mb = crate::storage::decode_mem_batch_from_wal_block(&data[off..off + data_size], eff_schema)?;
         Some(mb)
     } else {
         None
     };
 
-    Ok(DecodedWireZeroCopy { control, schema: wire_schema, data_batch })
+    Ok(DecodedWireZeroCopy {
+        control,
+        schema: wire_schema,
+        data_batch,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
-    use proptest::collection::vec;
-    use proptest::test_runner::TestCaseError;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::arb_type_code;
     use gnitz_wire::{is_pk_eligible, MAX_PK_COLUMNS};
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
 
     /// `max_pk` bounds the generated PK arity: the engine codec supports up to
     /// `MAX_PK_COLUMNS` (5, the secondary-index schema width), but the persisted
@@ -1202,62 +1353,69 @@ mod tests {
     /// client (`batch_to_schema` → `Schema::validate_pk_cols`) must stay within it.
     fn arb_schema(max_pk: usize) -> impl Strategy<Value = SchemaDescriptor> {
         // n_cols ≥ 1, so `1..=n_cols.min(max_pk)` is never empty.
-        (1usize..=8).prop_flat_map(move |n_cols| {
-            (
-                Just(n_cols),
-                vec(arb_type_code(), n_cols),     // column types
-                vec(any::<bool>(), n_cols),       // nullability
-                vec(any::<u32>(), n_cols),        // permutation weights
-                1usize..=n_cols.min(max_pk),      // PK arity
-            )
-        })
-        .prop_map(|(n_cols, types, nullables, weights, k)| {
-            // PK index set = first `k` columns ordered by their weight.
-            // The order is the "declared" PK order the encoder must preserve.
-            let mut idx: Vec<u32> = (0..n_cols as u32).collect();
-            idx.sort_by_key(|&i| weights[i as usize]);
-            let pk_indices: Vec<u32> = idx[..k].to_vec();
+        (1usize..=8)
+            .prop_flat_map(move |n_cols| {
+                (
+                    Just(n_cols),
+                    vec(arb_type_code(), n_cols), // column types
+                    vec(any::<bool>(), n_cols),   // nullability
+                    vec(any::<u32>(), n_cols),    // permutation weights
+                    1usize..=n_cols.min(max_pk),  // PK arity
+                )
+            })
+            .prop_map(|(n_cols, types, nullables, weights, k)| {
+                // PK index set = first `k` columns ordered by their weight.
+                // The order is the "declared" PK order the encoder must preserve.
+                let mut idx: Vec<u32> = (0..n_cols as u32).collect();
+                idx.sort_by_key(|&i| weights[i as usize]);
+                let pk_indices: Vec<u32> = idx[..k].to_vec();
 
-            let cols: Vec<SchemaColumn> = (0..n_cols)
-                .map(|i| {
-                    let is_pk = pk_indices.contains(&(i as u32));
-                    // PK columns must be PK-eligible and non-nullable; remap
-                    // ineligible draws to U64 so `new()` accepts the schema.
-                    let tc = if is_pk && !is_pk_eligible(types[i]) {
-                        type_code::U64
-                    } else {
-                        types[i]
-                    };
-                    let nullable = if is_pk { 0 } else { nullables[i] as u8 };
-                    SchemaColumn::new(tc, nullable)
-                })
-                .collect();
+                let cols: Vec<SchemaColumn> = (0..n_cols)
+                    .map(|i| {
+                        let is_pk = pk_indices.contains(&(i as u32));
+                        // PK columns must be PK-eligible and non-nullable; remap
+                        // ineligible draws to U64 so `new()` accepts the schema.
+                        let tc = if is_pk && !is_pk_eligible(types[i]) {
+                            type_code::U64
+                        } else {
+                            types[i]
+                        };
+                        let nullable = if is_pk { 0 } else { nullables[i] as u8 };
+                        SchemaColumn::new(tc, nullable)
+                    })
+                    .collect();
 
-            SchemaDescriptor::new(&cols, &pk_indices)
-        })
+                SchemaDescriptor::new(&cols, &pk_indices)
+            })
     }
 
-    fn assert_descriptor_eq(
-        a: &SchemaDescriptor, b: &SchemaDescriptor,
-    ) -> Result<(), TestCaseError> {
-        prop_assert_eq!(a.pk_indices(), b.pk_indices(),
-            "pk_indices (declared order) changed on round-trip");
-        prop_assert_eq!(a.num_columns(), b.num_columns(),
-            "column count changed on round-trip");
+    fn assert_descriptor_eq(a: &SchemaDescriptor, b: &SchemaDescriptor) -> Result<(), TestCaseError> {
+        prop_assert_eq!(
+            a.pk_indices(),
+            b.pk_indices(),
+            "pk_indices (declared order) changed on round-trip"
+        );
+        prop_assert_eq!(a.num_columns(), b.num_columns(), "column count changed on round-trip");
         for i in 0..a.num_columns() {
-            prop_assert_eq!(a.columns[i].type_code, b.columns[i].type_code,
-                "type_code at col {} changed", i);
-            prop_assert_eq!(a.columns[i].nullable, b.columns[i].nullable,
-                "nullable at col {} changed", i);
+            prop_assert_eq!(
+                a.columns[i].type_code,
+                b.columns[i].type_code,
+                "type_code at col {} changed",
+                i
+            );
+            prop_assert_eq!(
+                a.columns[i].nullable,
+                b.columns[i].nullable,
+                "nullable at col {} changed",
+                i
+            );
         }
         Ok(())
     }
 
     /// SchemaDescriptor → owned client Schema, with synthetic `c{i}` names.
-    fn descriptor_to_client_schema(
-        sd: &SchemaDescriptor,
-    ) -> gnitz_core::protocol::types::Schema {
-        use gnitz_core::protocol::types::{Schema, ColumnDef, TypeCode};
+    fn descriptor_to_client_schema(sd: &SchemaDescriptor) -> gnitz_core::protocol::types::Schema {
+        use gnitz_core::protocol::types::{ColumnDef, Schema, TypeCode};
         let columns = (0..sd.num_columns())
             .map(|i| {
                 let col = &sd.columns[i];
@@ -1385,8 +1543,7 @@ mod tests {
         let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0);
         // Region 4 is the flags column; OR in NULLABLE on the PK (col 0).
         let (fl_off, _) = wal_dir_entry(&wire, 4);
-        let f = u64::from_le_bytes(wire[fl_off..fl_off + 8].try_into().unwrap())
-            | META_FLAG_NULLABLE;
+        let f = u64::from_le_bytes(wire[fl_off..fl_off + 8].try_into().unwrap()) | META_FLAG_NULLABLE;
         wire[fl_off..fl_off + 8].copy_from_slice(&f.to_le_bytes());
         // verify_checksum=false: the flags region is inside the checksummed body.
         match decode_schema_block(&wire, false) {
@@ -1405,8 +1562,7 @@ mod tests {
         let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0);
         // num_regions lives in the header (outside the checksummed body), so a
         // huge value still passes the checksum and trips the directory guard.
-        wire[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4]
-            .copy_from_slice(&100_000u32.to_le_bytes());
+        wire[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].copy_from_slice(&100_000u32.to_le_bytes());
         match decode_schema_block(&wire, true) {
             Err("schema block directory overflows buffer") => {}
             Err(other) => panic!("wrong error: {other}"),
@@ -1421,9 +1577,7 @@ mod tests {
         use gnitz_wire::control as ctrl;
         let long_msg = b"this error message exceeds twelve bytes so it spills into the blob";
         let mut buf = vec![0u8; 512];
-        let written = encode_ctrl_block_ipc(
-            &mut buf, 0, 1, 2, 0, 0, 0, 0, 1, long_msg, b"", true,
-        );
+        let written = encode_ctrl_block_ipc(&mut buf, 0, 1, 2, 0, 0, 0, 0, 1, long_msg, b"", true);
         buf.truncate(written);
         // Corrupt the long-string blob offset (struct bytes [8..16]) to overflow.
         let (err_off, _) = wal_dir_entry(&buf, ctrl::REGION_ERROR_MSG);
@@ -1450,22 +1604,54 @@ mod tests {
         let cases: &[(u32, u64, u64, u64, u128, u64, u64, &str)] = &[
             // status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id, error_msg
             (0, 0, 0, 0, 0, 0, 0, ""),
-            (1, 0xDEAD_BEEF_1234_5678, 0xCAFE_BABE_0000_0001, 0xFFFF, 42u128 | (99u128 << 64), 7, 0xCAFE_BABE_DEAD_F00D, ""),
+            (
+                1,
+                0xDEAD_BEEF_1234_5678,
+                0xCAFE_BABE_0000_0001,
+                0xFFFF,
+                42u128 | (99u128 << 64),
+                7,
+                0xCAFE_BABE_DEAD_F00D,
+                "",
+            ),
             (2, 1, 2, 3, u128::MAX, u64::MAX, u64::MAX, "something went wrong"),
-            (0, 0, 0, 0, 0, 0, 0, "a longer error message that exceeds the German string inline threshold of twelve bytes"),
+            (
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                "a longer error message that exceeds the German string inline threshold of twelve bytes",
+            ),
         ];
 
         for &(status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id, error_msg) in cases {
-            let header = Header { status, target_id, client_id, flags, seek_pk, seek_col_idx, request_id };
-            let client_bytes = encode_control_block(&header, error_msg, &[])
-                .expect("encode_control_block failed");
+            let header = Header {
+                status,
+                target_id,
+                client_id,
+                flags,
+                seek_pk,
+                seek_col_idx,
+                request_id,
+            };
+            let client_bytes = encode_control_block(&header, error_msg, &[]).expect("encode_control_block failed");
 
             let mut engine_buf = vec![0u8; client_bytes.len() + 64];
             let written = encode_ctrl_block_ipc(
-                &mut engine_buf, 0,
-                target_id, client_id, flags,
-                seek_pk, seek_col_idx, request_id,
-                status, error_msg.as_bytes(), b"",
+                &mut engine_buf,
+                0,
+                target_id,
+                client_id,
+                flags,
+                seek_pk,
+                seek_col_idx,
+                request_id,
+                status,
+                error_msg.as_bytes(),
+                b"",
                 true, // checksum, matching encode_wal_block's unconditional checksum
             );
 

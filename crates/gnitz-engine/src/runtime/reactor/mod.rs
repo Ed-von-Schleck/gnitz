@@ -37,11 +37,13 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use self::ring::{Cqe, Ring, CQE_F_MORE};
 use self::uring::IoUringRing;
 
-use crate::runtime::wire::{self, DecodedWire, FLAG_HAS_DATA, FLAG_EXCHANGE, FLAG_BATCH_SORTED, FLAG_BATCH_CONSOLIDATED};
-use crate::runtime::w2m::{W2mReceiver, W2mSlot};
-use crate::runtime::sal::MAX_WORKERS;
 use crate::foundation::syscall::FUTEX2_SIZE_U32;
+use crate::runtime::sal::MAX_WORKERS;
+use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
+use crate::runtime::wire::{
+    self, DecodedWire, FLAG_BATCH_CONSOLIDATED, FLAG_BATCH_SORTED, FLAG_EXCHANGE, FLAG_HAS_DATA,
+};
 
 /// High bit of `internal_req_id` (u32) marks scan-allocated request IDs.
 /// Regular IDs stay in [1, MAX_REGULAR_REQ_ID] (bit 31 clear).
@@ -50,48 +52,44 @@ use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
 /// HashMap overhead on the push/seek hot path.
 pub(crate) const SCAN_REQ_ID_FLAG: u32 = 1 << 31;
 const MAX_REGULAR_REQ_ID: u64 = (SCAN_REQ_ID_FLAG - 1) as u64; // 0x7FFFFFFF
-const SCAN_REQ_ID_BASE: u32 = SCAN_REQ_ID_FLAG | 1;             // 0x80000001
+const SCAN_REQ_ID_BASE: u32 = SCAN_REQ_ID_FLAG | 1; // 0x80000001
 
 use io_uring::types::FutexWaitV;
 
-
+mod conn;
+mod exchange;
+mod futures;
 pub mod io;
 mod ring;
-mod uring;
-mod exchange;
-pub mod sync;
-mod conn;
-mod futures;
 mod runloop;
+pub mod sync;
+mod uring;
 
-pub(crate) use futures::{ReplyFuture, ScanLease};
-use futures::{FsyncFuture, ScanSlotFuture, SendAlive, TimerFuture};
 #[cfg(test)]
 use futures::SendFuture;
+use futures::{FsyncFuture, ScanSlotFuture, SendAlive, TimerFuture};
+pub(crate) use futures::{ReplyFuture, ScanLease};
 
 pub use exchange::{ExchangeAccumulator, PendingRelay};
-pub use sync::{
-    AsyncMutex, AsyncRwLock, Either, join_all_unpin, join_into,
-    oneshot, mpsc, select2,
-};
 #[cfg(test)]
 pub use sync::join2;
+pub use sync::{join_all_unpin, join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either};
 
 // ---------------------------------------------------------------------------
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)
 // ---------------------------------------------------------------------------
 
-pub const KIND_REPLY:        u64 = 1;
-pub const KIND_TIMEOUT:      u64 = 2;
-pub const KIND_FSYNC:        u64 = 3;
-pub const KIND_FUTEX_WAITV:  u64 = 4;
-pub const KIND_ACCEPT:       u64 = 5;
-pub const KIND_RECV:         u64 = 6;
-pub const KIND_SEND:         u64 = 7;
+pub const KIND_REPLY: u64 = 1;
+pub const KIND_TIMEOUT: u64 = 2;
+pub const KIND_FSYNC: u64 = 3;
+pub const KIND_FUTEX_WAITV: u64 = 4;
+pub const KIND_ACCEPT: u64 = 5;
+pub const KIND_RECV: u64 = 6;
+pub const KIND_SEND: u64 = 7;
 pub const KIND_FUTEX_CANCEL: u64 = 8;
 
 const KIND_SHIFT: u64 = 56;
-const ID_MASK:    u64 = 0x00FF_FFFF_FFFF_FFFF;
+const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 
 #[inline]
 pub const fn udata(kind: u64, id: u64) -> u64 {
@@ -99,10 +97,14 @@ pub const fn udata(kind: u64, id: u64) -> u64 {
 }
 
 #[inline]
-pub const fn udata_kind(u: u64) -> u64 { u >> KIND_SHIFT }
+pub const fn udata_kind(u: u64) -> u64 {
+    u >> KIND_SHIFT
+}
 
 #[inline]
-pub const fn udata_id(u: u64) -> u64 { u & ID_MASK }
+pub const fn udata_id(u: u64) -> u64 {
+    u & ID_MASK
+}
 
 // ---------------------------------------------------------------------------
 // Reactor
@@ -276,26 +278,20 @@ fn probe_futex_waitv_support() {
 }
 
 fn probe_futex_waitv_support_inner() {
-    use std::sync::atomic::AtomicU32;
     use io_uring::{opcode, IoUring};
+    use std::sync::atomic::AtomicU32;
 
     let atomic = Box::new(AtomicU32::new(42));
-    let futexv: Box<[FutexWaitV; 1]> = Box::new([
-        FutexWaitV::new()
-            .val(0)
-            .uaddr(&*atomic as *const AtomicU32 as u64)
-            .flags(FUTEX2_SIZE_U32),
-    ]);
+    let futexv: Box<[FutexWaitV; 1]> = Box::new([FutexWaitV::new()
+        .val(0)
+        .uaddr(&*atomic as *const AtomicU32 as u64)
+        .flags(FUTEX2_SIZE_U32)]);
 
     let mut ring = match IoUring::new(8) {
         Ok(r) => r,
-        Err(e) => crate::gnitz_fatal_abort!(
-            "reactor: probe io_uring init failed: {}", e,
-        ),
+        Err(e) => crate::gnitz_fatal_abort!("reactor: probe io_uring init failed: {}", e,),
     };
-    let entry = opcode::FutexWaitV::new(futexv.as_ptr(), 1)
-        .build()
-        .user_data(0xFEEDu64);
+    let entry = opcode::FutexWaitV::new(futexv.as_ptr(), 1).build().user_data(0xFEEDu64);
     if unsafe { ring.submission().push(&entry) }.is_err() {
         crate::gnitz_fatal_abort!("reactor: probe SQE push failed");
     }
@@ -433,8 +429,7 @@ impl Reactor {
             if !self.inner.futex_waitv_armed.get() && self.inner.futex_waitv_cancelled.get() {
                 break;
             }
-            let _ = self.inner.ring.borrow_mut()
-                .submit_and_wait_timeout(1, 100);
+            let _ = self.inner.ring.borrow_mut().submit_and_wait_timeout(1, 100);
         }
         if self.inner.futex_waitv_armed.get() || !self.inner.futex_waitv_cancelled.get() {
             crate::gnitz_fatal_abort!(
@@ -556,7 +551,9 @@ impl Reactor {
         let udata_val = udata(KIND_FUTEX_WAITV, 0);
         {
             let mut ring = self.inner.ring.borrow_mut();
-            unsafe { ring.prep_futex_waitv(ptr, nr, udata_val); }
+            unsafe {
+                ring.prep_futex_waitv(ptr, nr, udata_val);
+            }
             if let Err(e) = ring.submit_and_wait_timeout(0, 0) {
                 crate::gnitz_error!(
                     "reactor: FUTEX_WAITV SQE flush failed (errno={}); \
@@ -584,8 +581,12 @@ impl Reactor {
     /// `write_cursor != read_cursor` check.
     fn refresh_futex_waitv_vals(&self) -> bool {
         let mut storage = self.inner.futex_waitv_storage.borrow_mut();
-        let Some(boxed) = storage.as_mut() else { return false; };
-        let Some(w2m) = self.inner.w2m.get() else { return false; };
+        let Some(boxed) = storage.as_mut() else {
+            return false;
+        };
+        let Some(w2m) = self.inner.w2m.get() else {
+            return false;
+        };
         let mut pending = false;
         for (w, entry) in boxed.iter_mut().enumerate() {
             let hdr = unsafe { w2m.header(w) };
@@ -596,13 +597,10 @@ impl Reactor {
             // and runs before `attach_w2m`), so after the first
             // iteration the bit is already set: load first and skip the
             // RMW when it's a no-op.
-            let flags_now = hdr.waiter_flags()
-                .load(std::sync::atomic::Ordering::Acquire);
+            let flags_now = hdr.waiter_flags().load(std::sync::atomic::Ordering::Acquire);
             if flags_now & FLAG_MASTER_PARKED == 0 {
-                hdr.waiter_flags().fetch_or(
-                    FLAG_MASTER_PARKED,
-                    std::sync::atomic::Ordering::AcqRel,
-                );
+                hdr.waiter_flags()
+                    .fetch_or(FLAG_MASTER_PARKED, std::sync::atomic::Ordering::AcqRel);
             }
             // Order witness (test-only): records that the flag publish
             // precedes the reader_seq snapshot. Swapping these two
@@ -616,8 +614,7 @@ impl Reactor {
             // `write_cursor != read_cursor` check below catches it.
             #[cfg(test)]
             test_refresh_hooks::record_reader_seq_snapshot();
-            let expected = hdr.reader_seq()
-                .load(std::sync::atomic::Ordering::Acquire);
+            let expected = hdr.reader_seq().load(std::sync::atomic::Ordering::Acquire);
             let uaddr = hdr.reader_seq() as *const std::sync::atomic::AtomicU32 as u64;
             *entry = FutexWaitV::new()
                 .val(expected as u64)
@@ -632,10 +629,8 @@ impl Reactor {
             // Unread-data check: if write_cursor has advanced past
             // read_cursor, a publish is pending that we haven't
             // drained. Signal the caller to drain before arming.
-            let wc = hdr.write_cursor()
-                .load(std::sync::atomic::Ordering::Acquire);
-            let rc = hdr.read_cursor()
-                .load(std::sync::atomic::Ordering::Acquire);
+            let wc = hdr.write_cursor().load(std::sync::atomic::Ordering::Acquire);
+            let rc = hdr.read_cursor().load(std::sync::atomic::Ordering::Acquire);
             if wc != rc {
                 pending = true;
             }
@@ -669,7 +664,11 @@ impl Reactor {
     /// (0 on success, negative errno on failure).
     pub fn fsync(&self, fd: i32) -> FsyncFuture {
         let id = self.submit_fsync(fd);
-        FsyncFuture { id, completed: false, inner: Rc::clone(&self.inner) }
+        FsyncFuture {
+            id,
+            completed: false,
+            inner: Rc::clone(&self.inner),
+        }
     }
 
     #[cfg(test)]
@@ -728,7 +727,9 @@ impl Reactor {
             }
             KIND_TIMEOUT => {
                 if let Some((w, cancelled)) = self.inner.timer_wakers.borrow_mut().remove(&id) {
-                    if !cancelled.get() { w.wake(); }
+                    if !cancelled.get() {
+                        w.wake();
+                    }
                 }
             }
             KIND_FUTEX_WAITV => {
@@ -742,7 +743,10 @@ impl Reactor {
                 // already-stale expected value.
                 self.inner.futex_waitv_armed.set(false);
                 if !self.inner.shutdown.get() {
-                    let nw = self.inner.w2m.get()
+                    let nw = self
+                        .inner
+                        .w2m
+                        .get()
                         .expect("KIND_FUTEX_WAITV fired but w2m not attached")
                         .num_workers();
                     loop {
@@ -860,7 +864,10 @@ impl Reactor {
     /// The RAII `W2mSlot` advances `consume_cursor` on drop so the worker
     /// can reuse the ring space immediately after decoding completes.
     fn drain_w2m_for_worker(&self, w: usize) {
-        let w2m = self.inner.w2m.get()
+        let w2m = self
+            .inner
+            .w2m
+            .get()
             .expect("drain_w2m_for_worker called before attach_w2m");
         while let Some(slot) = w2m.try_read_slot(w) {
             // Scan-slot intercept: bit 31 of internal_req_id is set for
@@ -870,8 +877,7 @@ impl Reactor {
                 self.route_scan_slot(slot);
                 continue;
             }
-            let ctrl = wire::peek_control_block(slot.bytes())
-                .expect("W2M control block corrupt — ring corrupt");
+            let ctrl = wire::peek_control_block(slot.bytes()).expect("W2M control block corrupt — ring corrupt");
             let flags = ctrl.flags;
             if flags & FLAG_HAS_DATA != 0 && flags & FLAG_EXCHANGE == 0 {
                 self.ingest_from_slot(w, slot, ctrl);
@@ -907,7 +913,8 @@ impl Reactor {
         debug_assert!(
             q.len() < crate::runtime::w2m::W2M_MAX_IN_FLIGHT,
             "scan queue depth {} for req_id {} — W2M in-flight would overflow",
-            q.len(), req_id,
+            q.len(),
+            req_id,
         );
         q.push_back(slot);
         if let Some(waker) = self.inner.scan_wakers.borrow_mut().remove(&req_id) {
@@ -926,16 +933,29 @@ impl Reactor {
             .expect("W2M zero-copy decode failed — ring corrupt");
         let flags = zc.control.flags;
         let schema = zc.schema;
-        let mb = zc.data_batch.expect("FLAG_HAS_DATA set but no data batch — ring corrupt");
+        let mb = zc
+            .data_batch
+            .expect("FLAG_HAS_DATA set but no data batch — ring corrupt");
         let sch = schema.as_ref().expect("FLAG_HAS_DATA set but no schema — ring corrupt");
         let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
         owned.append_mem_batch_range(&mb, 0, mb.count, None);
-        if flags & FLAG_BATCH_SORTED      != 0 { owned.mark_sorted(); }
-        if flags & FLAG_BATCH_CONSOLIDATED != 0 { owned.mark_consolidated(); }
+        if flags & FLAG_BATCH_SORTED != 0 {
+            owned.mark_sorted();
+        }
+        if flags & FLAG_BATCH_CONSOLIDATED != 0 {
+            owned.mark_consolidated();
+        }
         let control = zc.control;
         let _ = mb; // release borrows from slot before dropping the slot
         drop(slot); // RAII: advance consume_cursor before waking awaiter
-        self.route_reply(w, DecodedWire { control, schema, data_batch: Some(owned) });
+        self.route_reply(
+            w,
+            DecodedWire {
+                control,
+                schema,
+                data_batch: Some(owned),
+            },
+        );
     }
 
     /// Zero-copy decode path for FLAG_EXCHANGE slots: mirrors `ingest_from_slot`
@@ -948,12 +968,17 @@ impl Reactor {
         let control = zc.control;
         let schema = zc.schema;
         let data_batch = if let Some(mb) = zc.data_batch {
-            let sch = schema.as_ref()
+            let sch = schema
+                .as_ref()
                 .expect("exchange FLAG_HAS_DATA without schema — ring corrupt");
             let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
             owned.append_mem_batch_range(&mb, 0, mb.count, None);
-            if flags & FLAG_BATCH_SORTED      != 0 { owned.mark_sorted(); }
-            if flags & FLAG_BATCH_CONSOLIDATED != 0 { owned.mark_consolidated(); }
+            if flags & FLAG_BATCH_SORTED != 0 {
+                owned.mark_sorted();
+            }
+            if flags & FLAG_BATCH_CONSOLIDATED != 0 {
+                owned.mark_consolidated();
+            }
             let _ = mb; // release borrow from slot bytes before dropping slot
             Some(owned)
         } else {
@@ -961,7 +986,12 @@ impl Reactor {
         };
         drop(slot); // advance consume_cursor before processing relay
         let pending = self.inner.exchange_acc.borrow_mut().process(
-            w, DecodedWire { control, schema, data_batch },
+            w,
+            DecodedWire {
+                control,
+                schema,
+                data_batch,
+            },
         );
         self.dispatch_relay(pending);
     }
@@ -1011,10 +1041,7 @@ impl Reactor {
                 waker.wake();
             }
             None => {
-                crate::gnitz_warn!(
-                    "reactor: unrouted W2M reply worker={} req_id={}",
-                    w, req_id,
-                );
+                crate::gnitz_warn!("reactor: unrouted W2M reply worker={} req_id={}", w, req_id,);
             }
         }
     }
@@ -1085,7 +1112,9 @@ struct RunQueue {
 
 impl RunQueue {
     fn new() -> Self {
-        Self { queue: Vec::with_capacity(16) }
+        Self {
+            queue: Vec::with_capacity(16),
+        }
     }
 
     /// Enqueue `key` unless it is already pending. Idempotent: N wakes
@@ -1149,19 +1178,21 @@ unsafe fn waker_wake(data: *const ()) {
         // SAFETY: invariant: the reactor that published this pointer is
         // still alive (cleared in `Drop for Reactor`). RefCell enforces
         // borrow rules, so a double-borrow panics rather than UB.
-        unsafe { (*ptr).borrow_mut().push(key); }
+        unsafe {
+            (*ptr).borrow_mut().push(key);
+        }
     });
 }
 
 unsafe fn waker_wake_by_ref(data: *const ()) {
-    unsafe { waker_wake(data); }
+    unsafe {
+        waker_wake(data);
+    }
 }
 
 unsafe fn waker_drop(_data: *const ()) {}
 
-const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    waker_clone, waker_wake, waker_wake_by_ref, waker_drop,
-);
+const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(waker_clone, waker_wake, waker_wake_by_ref, waker_drop);
 
 pub(super) fn make_waker(key: usize) -> Waker {
     let raw = RawWaker::new(key as *const (), &WAKER_VTABLE);
@@ -1181,8 +1212,8 @@ pub(super) fn make_waker(key: usize) -> Waker {
 pub(crate) mod test_refresh_hooks {
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
 
     /// Shared state between the reactor thread (which runs the refresh)
     /// and the test's helper thread (which publishes into the ring).
@@ -1255,9 +1286,9 @@ pub(crate) mod test_refresh_hooks {
     /// the probe was armed with `wait_for_publish`).
     pub(crate) fn await_helper_publish() {
         let flag = PROBE.with(|p| {
-            p.borrow().as_ref().and_then(|probe| {
-                probe.wait_for_publish.then(|| Arc::clone(&probe.helper_published))
-            })
+            p.borrow()
+                .as_ref()
+                .and_then(|probe| probe.wait_for_publish.then(|| Arc::clone(&probe.helper_published)))
         });
         if let Some(flag) = flag {
             while !flag.load(Ordering::Acquire) {
@@ -1274,9 +1305,9 @@ pub(crate) mod test_refresh_hooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::SchemaDescriptor;
     use std::cell::Cell as StdCell;
     use std::time::Duration;
-    use crate::schema::SchemaDescriptor;
 
     fn make_reactor() -> Reactor {
         Reactor::new(16).expect("reactor")
@@ -1321,16 +1352,17 @@ mod tests {
         let inner = Rc::clone(&r.inner);
         let start = Instant::now();
         r.block_on(async move {
-            TimerFuture::new(
-                Instant::now() + Duration::from_millis(50),
-                inner,
-            ).await;
+            TimerFuture::new(Instant::now() + Duration::from_millis(50), inner).await;
         });
         let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(50),
-            "timer fired too early: {elapsed:?}");
-        assert!(elapsed < Duration::from_millis(500),
-            "timer fired too late: {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "timer fired too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "timer fired too late: {elapsed:?}"
+        );
     }
 
     /// Earlier timer must resolve before a later timer.
@@ -1345,18 +1377,12 @@ mod tests {
         let order2 = Rc::clone(&order);
 
         r.spawn(async move {
-            TimerFuture::new(
-                Instant::now() + Duration::from_millis(100),
-                inner2,
-            ).await;
+            TimerFuture::new(Instant::now() + Duration::from_millis(100), inner2).await;
             order2.borrow_mut().push(2);
         });
 
         r.block_on(async move {
-            TimerFuture::new(
-                Instant::now() + Duration::from_millis(20),
-                inner1,
-            ).await;
+            TimerFuture::new(Instant::now() + Duration::from_millis(20), inner1).await;
             order1.borrow_mut().push(1);
         });
 
@@ -1395,10 +1421,7 @@ mod tests {
         let timer_inner = Rc::clone(&r.inner);
         let reply_fut = r.await_reply(7);
         r.block_on(async move {
-            let timer = TimerFuture::new(
-                Instant::now() + Duration::from_millis(50),
-                timer_inner,
-            );
+            let timer = TimerFuture::new(Instant::now() + Duration::from_millis(50), timer_inner);
             select_reply_or_timer(timer, reply_fut, &r2).await;
         });
         assert!(!resolved.get(), "reply for req_id=8 must not wake req_id=7 awaiter");
@@ -1427,7 +1450,10 @@ mod tests {
         let r = make_reactor();
         let polls: Rc<StdCell<u32>> = Rc::new(StdCell::new(0));
         let polls2 = polls.clone();
-        r.block_on(DoublyWaking { polls: polls2, polled: 0 });
+        r.block_on(DoublyWaking {
+            polls: polls2,
+            polled: 0,
+        });
         // Doubly waking polls itself N times before completing; the
         // exact value isn't load-bearing, just that we eventually finish.
         assert!(polls.get() >= 1);
@@ -1455,13 +1481,12 @@ mod tests {
         let inner = Rc::clone(&r.inner);
         let start = Instant::now();
         r.block_on(async move {
-            TimerFuture::new(
-                Instant::now() - Duration::from_secs(1),
-                inner,
-            ).await;
+            TimerFuture::new(Instant::now() - Duration::from_secs(1), inner).await;
         });
-        assert!(start.elapsed() < Duration::from_millis(100),
-            "past-deadline timer must not block");
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "past-deadline timer must not block"
+        );
     }
 
     /// Cloning a waker, dropping the original, then waking the clone
@@ -1633,10 +1658,8 @@ mod tests {
         });
 
         r.block_until_idle();
-        assert!(relay_done.get(),
-            "concurrent task must have acquired the mutex");
-        assert!(commit_done.get(),
-            "committer must complete after its ACK is delivered");
+        assert!(relay_done.get(), "concurrent task must have acquired the mutex");
+        assert!(commit_done.get(), "committer must complete after its ACK is delivered");
     }
 
     /// Structural regression: the relay loop acquires `sal_writer_excl` for a
@@ -1685,10 +1708,11 @@ mod tests {
         drop(commit_rx);
 
         r.block_until_idle();
-        assert!(commit_done.get(),
-            "committer must have acquired the mutex while relay was parked");
-        assert!(relay_done.get(),
-            "relay must complete after being unblocked");
+        assert!(
+            commit_done.get(),
+            "committer must have acquired the mutex while relay was parked"
+        );
+        assert!(relay_done.get(), "relay must complete after being unblocked");
     }
 
     #[test]
@@ -1704,7 +1728,9 @@ mod tests {
             r.spawn(async move {
                 let _g = l.read().await;
                 a.set(a.get() + 1);
-                if a.get() > m.get() { m.set(a.get()); }
+                if a.get() > m.get() {
+                    m.set(a.get());
+                }
                 // Yield once to let other tasks acquire too.
                 YieldOnce::new().await;
                 a.set(a.get() - 1);
@@ -1776,9 +1802,13 @@ mod tests {
             d.set(true);
         });
 
-        for _ in 0..20 { r.tick(false); }
-        assert!(done.get(),
-            "task C must acquire the mutex after task B's cancelled waiter");
+        for _ in 0..20 {
+            r.tick(false);
+        }
+        assert!(
+            done.get(),
+            "task C must acquire the mutex after task B's cancelled waiter"
+        );
     }
 
     /// A `WriteFuture` dropped while parked leaves a stale waker in
@@ -1815,9 +1845,13 @@ mod tests {
             d.set(true);
         });
 
-        for _ in 0..20 { r.tick(false); }
-        assert!(done.get(),
-            "task C must acquire the write lock after task B's cancelled waiter");
+        for _ in 0..20 {
+            r.tick(false);
+        }
+        assert!(
+            done.get(),
+            "task C must acquire the write lock after task B's cancelled waiter"
+        );
     }
 
     #[test]
@@ -1844,7 +1878,9 @@ mod tests {
         r.block_on(async move {
             rc2.set(fsync.await);
         });
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         assert_eq!(rc.get(), 0);
     }
 
@@ -1854,7 +1890,7 @@ mod tests {
     #[test]
     fn register_reply_waker_replaces() {
         let r = make_reactor();
-        
+
         let w1 = make_waker(99);
         let w2 = make_waker(100);
         r.register_reply_waker(42, w1);
@@ -1869,8 +1905,14 @@ mod tests {
     // -- helper futures used by the tests above --
 
     /// Future that returns Pending exactly once, then Ready.
-    struct YieldOnce { yielded: bool }
-    impl YieldOnce { fn new() -> Self { YieldOnce { yielded: false } } }
+    struct YieldOnce {
+        yielded: bool,
+    }
+    impl YieldOnce {
+        fn new() -> Self {
+            YieldOnce { yielded: false }
+        }
+    }
     impl Future for YieldOnce {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -1886,13 +1928,18 @@ mod tests {
 
     /// Wakes itself a few times, then completes. Mirrors a tight async
     /// loop that would burn the reactor if double-polled per wake.
-    struct DoublyWaking { polls: Rc<StdCell<u32>>, polled: u32 }
+    struct DoublyWaking {
+        polls: Rc<StdCell<u32>>,
+        polled: u32,
+    }
     impl Future for DoublyWaking {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             let n = self.polled;
             self.polls.set(self.polls.get() + 1);
-            if n >= 3 { return Poll::Ready(()); }
+            if n >= 3 {
+                return Poll::Ready(());
+            }
             self.polled = n + 1;
             // Wake twice before returning Pending: must not get polled
             // twice in the same tick, only once on the next tick.
@@ -1905,9 +1952,7 @@ mod tests {
     /// Race a timer and a reply future. Sets `flag` to true if the reply
     /// resolved first, leaves it false if the timer won. Polls both each
     /// tick; the first to return Ready wins.
-    async fn select_reply_or_timer<'a, T, R>(
-        timer: T, reply: R, flag: &'a Rc<StdCell<bool>>,
-    )
+    async fn select_reply_or_timer<'a, T, R>(timer: T, reply: R, flag: &'a Rc<StdCell<bool>>)
     where
         T: Future<Output = ()> + 'a,
         R: Future<Output = DecodedWire> + 'a,
@@ -1923,7 +1968,8 @@ mod tests {
                 return Poll::Ready(());
             }
             Poll::Pending
-        }).await
+        })
+        .await
     }
 
     /// Build a minimal `DecodedWire` for tests — only `request_id` is
@@ -1992,8 +2038,10 @@ mod tests {
 
         r.test_route_reply(0, synthetic_decoded_wire(7));
 
-        assert!(r.inner.parked_replies.borrow().is_empty(),
-            "unrouted replies must not leak into parked_replies");
+        assert!(
+            r.inner.parked_replies.borrow().is_empty(),
+            "unrouted replies must not leak into parked_replies"
+        );
     }
 
     /// Dispatching a KIND_FSYNC CQE parks the CQE `res` verbatim under
@@ -2019,10 +2067,14 @@ mod tests {
         let fd = crate::foundation::syscall::memfd_create(b"reactor_fsync_ok");
         let id = r.submit_fsync(fd);
         let rc = r.block_on_fsync(id);
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         assert_eq!(rc, 0, "fdatasync on a fresh memfd should succeed");
-        assert!(r.inner.parked_fsync_results.borrow().is_empty(),
-            "block_on_fsync must remove the parked result");
+        assert!(
+            r.inner.parked_fsync_results.borrow().is_empty(),
+            "block_on_fsync must remove the parked result"
+        );
     }
 
     /// Submitting fdatasync on an fd that is not in the process's fd
@@ -2063,10 +2115,15 @@ mod tests {
                 break;
             }
         }
-        unsafe { libc::close(fd); }
-        assert_eq!(got, Some(0),
+        unsafe {
+            libc::close(fd);
+        }
+        assert_eq!(
+            got,
+            Some(0),
             "fsync CQE must be available without driving another tick — \
-             submit_fsync should flush the SQE eagerly");
+             submit_fsync should flush the SQE eagerly"
+        );
     }
 
     /// The KIND_REPLY / KIND_FSYNC tags in `user_data` are what keep
@@ -2085,13 +2142,20 @@ mod tests {
         r.drain_injected_cqes();
 
         let q: Vec<usize> = r.inner.run_queue.borrow().queue.to_vec();
-        assert!(q.contains(&7),
-            "KIND_REPLY dispatch must wake the reply waker for id=42");
-        assert!(!r.inner.reply_wakers.borrow().contains_key(&42),
-            "reply waker must be consumed by KIND_REPLY dispatch");
+        assert!(
+            q.contains(&7),
+            "KIND_REPLY dispatch must wake the reply waker for id=42"
+        );
+        assert!(
+            !r.inner.reply_wakers.borrow().contains_key(&42),
+            "reply waker must be consumed by KIND_REPLY dispatch"
+        );
         let fsync_rc = r.inner.parked_fsync_results.borrow_mut().remove(&42);
-        assert_eq!(fsync_rc, Some(-11),
-            "KIND_FSYNC dispatch must park its own rc under the same id");
+        assert_eq!(
+            fsync_rc,
+            Some(-11),
+            "KIND_FSYNC dispatch must park its own rc under the same id"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -2115,10 +2179,15 @@ mod tests {
         r.drain_injected_cqes();
 
         let parked = r.inner.parked_send_results.borrow_mut().remove(&55);
-        assert_eq!(parked, Some(1234),
-            "KIND_SEND must park the CQE rc verbatim so SendFuture sees it");
-        assert!(!r.inner.send_wakers.borrow().contains_key(&55),
-            "KIND_SEND must consume the waker entry");
+        assert_eq!(
+            parked,
+            Some(1234),
+            "KIND_SEND must park the CQE rc verbatim so SendFuture sees it"
+        );
+        assert!(
+            !r.inner.send_wakers.borrow().contains_key(&55),
+            "KIND_SEND must consume the waker entry"
+        );
         let q: Vec<usize> = r.inner.run_queue.borrow().queue.to_vec();
         assert!(q.contains(&11), "KIND_SEND must wake the send future");
     }
@@ -2127,8 +2196,10 @@ mod tests {
     fn send_cqe_removes_parked_buffer_and_decrements_conn_inflight() {
         let r = make_reactor();
         // Pre-populate an in-flight buffer and a conn with send_inflight=1.
-        r.inner.send_buffers_in_flight.borrow_mut()
-            .insert(77, SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(vec![0u8; 16]))));
+        r.inner.send_buffers_in_flight.borrow_mut().insert(
+            77,
+            SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(vec![0u8; 16]))),
+        );
         r.inner.send_fd_for_id.borrow_mut().insert(77, 42);
         r.inner.conns.borrow_mut().insert(42, Box::new(io::Conn::new()));
         if let Some(c) = r.inner.conns.borrow_mut().get_mut(&42) {
@@ -2138,15 +2209,21 @@ mod tests {
         r.inject_cqe(KIND_SEND, 77, 16);
         r.drain_injected_cqes();
 
-        assert!(!r.inner.send_buffers_in_flight.borrow().contains_key(&77),
+        assert!(
+            !r.inner.send_buffers_in_flight.borrow().contains_key(&77),
             "KIND_SEND must drop the parked buffer — leaks linearly with \
-             the number of cancelled SendFutures otherwise");
-        assert!(!r.inner.send_fd_for_id.borrow().contains_key(&77),
+             the number of cancelled SendFutures otherwise"
+        );
+        assert!(
+            !r.inner.send_fd_for_id.borrow().contains_key(&77),
             "KIND_SEND must clear send_fd_for_id so the fd entry does not \
-             grow unboundedly");
+             grow unboundedly"
+        );
         let inflight = r.inner.conns.borrow().get(&42).unwrap().send_inflight;
-        assert_eq!(inflight, 0,
-            "KIND_SEND must decrement conn.send_inflight (gates close_fd)");
+        assert_eq!(
+            inflight, 0,
+            "KIND_SEND must decrement conn.send_inflight (gates close_fd)"
+        );
     }
 
     /// A dropped SendFuture with an in-flight SQE MUST hand the buffer
@@ -2161,13 +2238,17 @@ mod tests {
             // Build and drop a SendFuture without it ever becoming Ready.
             let _fut = SendFuture {
                 send_id: 88,
-                _alive: Some(SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(buf.clone())))),
+                _alive: Some(SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(
+                    buf.clone(),
+                )))),
                 inner: Rc::clone(&r.inner),
             };
         }
         let parked = r.inner.send_buffers_in_flight.borrow();
         let stored = parked.get(&88).expect("drop must park keep-alive");
-        let SendAlive::Pooled(stored_rc) = stored else { panic!("expected Pooled variant") };
+        let SendAlive::Pooled(stored_rc) = stored else {
+            panic!("expected Pooled variant")
+        };
         assert_eq!(stored_rc.0.as_slice(), &buf[..]);
     }
 
@@ -2202,9 +2283,11 @@ mod tests {
 
             r.register_conn(read_end);
 
-            assert!(!r.inner.recv_closed.borrow().contains_key(&read_end),
+            assert!(
+                !r.inner.recv_closed.borrow().contains_key(&read_end),
                 "register_conn must clear stale recv_closed so a new \
-                 connection on a reused fd doesn't see phantom EOF");
+                 connection on a reused fd doesn't see phantom EOF"
+            );
             assert!(r.inner.conns.borrow().contains_key(&read_end));
 
             libc::close(read_end);
@@ -2225,15 +2308,19 @@ mod tests {
             // Seed pending_recv with an empty queue (the hot path — a
             // full queue with non-empty buffers would also trip
             // debug_assert, which we can't catch cleanly in a test).
-            r.inner.pending_recv.borrow_mut()
+            r.inner
+                .pending_recv
+                .borrow_mut()
                 .insert(read_end, std::collections::VecDeque::new());
 
             r.register_conn(read_end);
 
             let pr = r.inner.pending_recv.borrow();
-            assert!(pr.get(&read_end).map(|q| q.is_empty()).unwrap_or(true),
+            assert!(
+                pr.get(&read_end).map(|q| q.is_empty()).unwrap_or(true),
                 "register_conn must leave pending_recv empty for the \
-                 new incarnation, even if an entry existed");
+                 new incarnation, even if an entry existed"
+            );
 
             libc::close(read_end);
             libc::close(write_end);
@@ -2249,19 +2336,26 @@ mod tests {
     fn send_buffer_loops_until_full_payload_sent_over_socketpair() {
         unsafe {
             let mut fds = [0i32; 2];
-            let rc = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM,
-                0, fds.as_mut_ptr());
+            let rc = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
             assert_eq!(rc, 0, "socketpair");
             let (sender, receiver) = (fds[0], fds[1]);
             // Shrink both buffers to ~8 KB so a 200 KB payload is
             // guaranteed to split across multiple OP_SEND CQEs.
             let bufsz: i32 = 8 * 1024;
-            libc::setsockopt(sender, libc::SOL_SOCKET, libc::SO_SNDBUF,
+            libc::setsockopt(
+                sender,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
                 &bufsz as *const _ as *const libc::c_void,
-                std::mem::size_of::<i32>() as u32);
-            libc::setsockopt(receiver, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                std::mem::size_of::<i32>() as u32,
+            );
+            libc::setsockopt(
+                receiver,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
                 &bufsz as *const _ as *const libc::c_void,
-                std::mem::size_of::<i32>() as u32);
+                std::mem::size_of::<i32>() as u32,
+            );
 
             let r: Rc<Reactor> = Rc::new(make_reactor());
             // Register the sender in conns so send_inflight accounting
@@ -2281,10 +2375,10 @@ mod tests {
                 let mut total = 0usize;
                 let mut scratch = vec![0u8; 32 * 1024];
                 while total < payload_len {
-                    let n = libc::read(receiver,
-                        scratch.as_mut_ptr() as *mut libc::c_void,
-                        scratch.len());
-                    if n <= 0 { break; }
+                    let n = libc::read(receiver, scratch.as_mut_ptr() as *mut libc::c_void, scratch.len());
+                    if n <= 0 {
+                        break;
+                    }
                     total += n as usize;
                 }
                 libc::close(receiver);
@@ -2293,18 +2387,23 @@ mod tests {
 
             let r2 = Rc::clone(&r);
             let sent = r.block_on(async move {
-                r2.send_buffer(sender_fd, crate::storage::batch_pool::PooledSendBuf(payload)).await
+                r2.send_buffer(sender_fd, crate::storage::batch_pool::PooledSendBuf(payload))
+                    .await
             });
             let received = drain_t.join().expect("drain thread");
 
             libc::close(sender);
-            assert_eq!(sent as usize, payload_len,
+            assert_eq!(
+                sent as usize, payload_len,
                 "send_buffer must loop on partial CQEs until the full \
-                 payload is sent (got rc={sent}, expected {payload_len})");
-            assert_eq!(received, payload_len,
+                 payload is sent (got rc={sent}, expected {payload_len})"
+            );
+            assert_eq!(
+                received, payload_len,
                 "receiver must observe every byte — a truncated send_buffer \
                  would leave the client blocked waiting for bytes that never \
-                 arrive");
+                 arrive"
+            );
         }
     }
 
@@ -2353,10 +2452,14 @@ mod tests {
         let exch = synthetic_exchange_wire(/*view_id*/ 100, /*req_id*/ 42);
         r.test_route_reply(0, exch);
 
-        assert!(r.inner.reply_wakers.borrow().contains_key(&42),
-            "FLAG_EXCHANGE must NOT consume the tick waker");
-        assert!(r.inner.parked_replies.borrow().is_empty(),
-            "FLAG_EXCHANGE must NOT park the wire for await_reply");
+        assert!(
+            r.inner.reply_wakers.borrow().contains_key(&42),
+            "FLAG_EXCHANGE must NOT consume the tick waker"
+        );
+        assert!(
+            r.inner.parked_replies.borrow().is_empty(),
+            "FLAG_EXCHANGE must NOT park the wire for await_reply"
+        );
     }
 
     /// Once every worker has reported FLAG_EXCHANGE for the same
@@ -2375,8 +2478,10 @@ mod tests {
         r.register_reply_waker(11, w1);
 
         r.test_route_reply(0, synthetic_exchange_wire(99, 10));
-        assert!(rx.try_recv().is_none(),
-            "single-worker FLAG_EXCHANGE must not produce a relay");
+        assert!(
+            rx.try_recv().is_none(),
+            "single-worker FLAG_EXCHANGE must not produce a relay"
+        );
         r.test_route_reply(1, synthetic_exchange_wire(99, 11));
         let relay = rx.try_recv().expect("complete view must produce a relay");
         assert_eq!(relay.view_id, 99);
@@ -2450,10 +2555,7 @@ mod tests {
         let v2 = Rc::clone(&v);
         r.block_on(async move {
             let ready = async { 7u32 };
-            let never = TimerFuture::new(
-                Instant::now() + Duration::from_secs(60),
-                inner,
-            );
+            let never = TimerFuture::new(Instant::now() + Duration::from_secs(60), inner);
             match select2(ready, never).await {
                 Either::A(x) => v2.set(x),
                 Either::B(()) => panic!("timer should not have fired"),
@@ -2473,10 +2575,7 @@ mod tests {
         let inner = Rc::clone(&r.inner);
         let waker = make_waker(999);
         // Build a TimerFuture, poll once to register, then drop it.
-        let mut tf = TimerFuture::new(
-            Instant::now() + Duration::from_millis(10),
-            inner,
-        );
+        let mut tf = TimerFuture::new(Instant::now() + Duration::from_millis(10), inner);
         let mut cx = Context::from_waker(&waker);
         let pinned = Pin::new(&mut tf);
         let _ = pinned.poll(&mut cx);
@@ -2485,10 +2584,11 @@ mod tests {
         // Drive ticks past the deadline; the cancelled CQE must be
         // discarded without waking key=999.
         std::thread::sleep(Duration::from_millis(20));
-        for _ in 0..4 { r.tick(false); }
+        for _ in 0..4 {
+            r.tick(false);
+        }
         let q: Vec<usize> = r.inner.run_queue.borrow().queue.to_vec();
-        assert!(!q.contains(&999),
-            "cancelled timer must not wake its original waker");
+        assert!(!q.contains(&999), "cancelled timer must not wake its original waker");
     }
 
     /// AsyncMutex serialises tasks: even when several tasks race on
@@ -2538,12 +2638,12 @@ mod tests {
     /// between `spawn` and `attach_w2m` exists for this reason.
     #[test]
     fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
-        use std::time::Duration;
-        use crate::runtime::wire as ipc;
-        use crate::runtime::wire::STATUS_OK;
+        use crate::runtime::reactor::{join_all_unpin, select2, Either};
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
-        use crate::runtime::reactor::{join_all_unpin, select2, Either};
+        use crate::runtime::wire as ipc;
+        use crate::runtime::wire::STATUS_OK;
+        use std::time::Duration;
 
         const CAPACITY: usize = 64 * 1024;
         const N_MESSAGES: u64 = 500;
@@ -2554,7 +2654,9 @@ mod tests {
         assert_eq!(crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64), 0);
         let ptr = crate::foundation::syscall::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null(), "mmap_shared failed");
-        unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
+        unsafe {
+            w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
+        }
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
@@ -2568,28 +2670,39 @@ mod tests {
             for req_id in 1..=N_MESSAGES {
                 writer.send_encoded(sz, req_id as u32, |buf| {
                     ipc::encode_wire_into(
-                        buf, 0, 0, 0, 0,
-                         0u128, 0, req_id, STATUS_OK, &[], None, None, None, None, &[],
+                        buf,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0u128,
+                        0,
+                        req_id,
+                        STATUS_OK,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
                     );
                 });
             }
-            unsafe { libc::_exit(0); }
+            unsafe {
+                libc::_exit(0);
+            }
         }
 
         // Parent: drain via the reactor's FUTEX_WAITV + W2mReceiver path.
         let reactor = Reactor::new(16).expect("reactor");
 
         let received: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
-        let reply_futs: Vec<_> = (1..=N_MESSAGES)
-            .map(|i| reactor.await_reply(i))
-            .collect();
+        let reply_futs: Vec<_> = (1..=N_MESSAGES).map(|i| reactor.await_reply(i)).collect();
         {
             let received = Rc::clone(&received);
             reactor.spawn(async move {
                 let replies = join_all_unpin(reply_futs).await;
-                *received.borrow_mut() = replies.into_iter()
-                    .map(|r| r.control.request_id)
-                    .collect();
+                *received.borrow_mut() = replies.into_iter().map(|r| r.control.request_id).collect();
             });
         }
         // One tick polls the spawned task, which walks join_all_unpin and
@@ -2601,10 +2714,7 @@ mod tests {
         let inner = Rc::clone(&reactor.inner);
         let received_check = Rc::clone(&received);
         let outcome = reactor.block_on(async move {
-            let timeout = TimerFuture::new(
-                Instant::now() + Duration::from_secs(TIMEOUT_SECS),
-                inner,
-            );
+            let timeout = TimerFuture::new(Instant::now() + Duration::from_secs(TIMEOUT_SECS), inner);
             let watch = async move {
                 while received_check.borrow().is_empty() {
                     YieldOnce::new().await;
@@ -2613,7 +2723,9 @@ mod tests {
             select2(watch, timeout).await
         });
         if let Either::B(()) = outcome {
-            unsafe { libc::kill(pid, libc::SIGKILL); }
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
             panic!(
                 "reactor stalled with {} replies received after {}s — \
                  lost-wake symptom",
@@ -2629,7 +2741,9 @@ mod tests {
         assert_eq!(ids, expected, "every published req_id must round-trip");
 
         let mut status: i32 = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0); }
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
 
         // AsyncCancel the in-flight FUTEX_WAITV before the storage drops.
         reactor.request_shutdown();
@@ -2647,12 +2761,12 @@ mod tests {
     /// scale.
     #[test]
     fn w2m_cross_process_stress_high_volume() {
-        use std::time::Duration;
-        use crate::runtime::wire as ipc;
-        use crate::runtime::wire::STATUS_OK;
+        use crate::runtime::reactor::{join_all_unpin, select2, Either};
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
-        use crate::runtime::reactor::{join_all_unpin, select2, Either};
+        use crate::runtime::wire as ipc;
+        use crate::runtime::wire::STATUS_OK;
+        use std::time::Duration;
 
         const CAPACITY: usize = 64 * 1024;
         const N_MESSAGES: u64 = 5_000;
@@ -2663,7 +2777,9 @@ mod tests {
         assert_eq!(crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64), 0);
         let ptr = crate::foundation::syscall::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null());
-        unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
+        unsafe {
+            w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
+        }
 
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
@@ -2673,26 +2789,37 @@ mod tests {
             for req_id in 1..=N_MESSAGES {
                 writer.send_encoded(sz, req_id as u32, |buf| {
                     ipc::encode_wire_into(
-                        buf, 0, 0, 0, 0,
-                         0u128, 0, req_id, STATUS_OK, &[], None, None, None, None, &[],
+                        buf,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0u128,
+                        0,
+                        req_id,
+                        STATUS_OK,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
                     );
                 });
             }
-            unsafe { libc::_exit(0); }
+            unsafe {
+                libc::_exit(0);
+            }
         }
 
         let reactor = Reactor::new(16).expect("reactor");
         let received: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
-        let reply_futs: Vec<_> = (1..=N_MESSAGES)
-            .map(|i| reactor.await_reply(i))
-            .collect();
+        let reply_futs: Vec<_> = (1..=N_MESSAGES).map(|i| reactor.await_reply(i)).collect();
         {
             let received = Rc::clone(&received);
             reactor.spawn(async move {
                 let replies = join_all_unpin(reply_futs).await;
-                *received.borrow_mut() = replies.into_iter()
-                    .map(|r| r.control.request_id)
-                    .collect();
+                *received.borrow_mut() = replies.into_iter().map(|r| r.control.request_id).collect();
             });
         }
         reactor.poll_nonblocking();
@@ -2702,10 +2829,7 @@ mod tests {
         let inner = Rc::clone(&reactor.inner);
         let received_check = Rc::clone(&received);
         let outcome = reactor.block_on(async move {
-            let timeout = TimerFuture::new(
-                Instant::now() + Duration::from_secs(TIMEOUT_SECS),
-                inner,
-            );
+            let timeout = TimerFuture::new(Instant::now() + Duration::from_secs(TIMEOUT_SECS), inner);
             let watch = async move {
                 while received_check.borrow().is_empty() {
                     YieldOnce::new().await;
@@ -2714,10 +2838,13 @@ mod tests {
             select2(watch, timeout).await
         });
         if let Either::B(()) = outcome {
-            unsafe { libc::kill(pid, libc::SIGKILL); }
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
             panic!(
                 "reactor stalled with {} replies after {}s",
-                received.borrow().len(), TIMEOUT_SECS,
+                received.borrow().len(),
+                TIMEOUT_SECS,
             );
         }
 
@@ -2728,7 +2855,9 @@ mod tests {
         assert_eq!(ids, expected);
 
         let mut status: i32 = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0); }
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
 
         reactor.request_shutdown();
         unsafe {
@@ -2764,12 +2893,12 @@ mod tests {
     /// flips the order stamps, failing assertion (2).
     #[test]
     fn refresh_publishes_flag_before_snapshotting_reader_seq() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
         use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring::{self, W2mRingHeader, FLAG_MASTER_PARKED};
         use crate::runtime::wire as ipc;
         use crate::runtime::wire::STATUS_OK;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         const CAPACITY: usize = 64 * 1024;
         const TIMEOUT: Duration = Duration::from_secs(10);
@@ -2781,7 +2910,9 @@ mod tests {
         assert_eq!(crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64), 0);
         let ptr = crate::foundation::syscall::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null(), "mmap_shared failed");
-        unsafe { w2m_ring::init_region_for_tests(ptr, CAPACITY as u64); }
+        unsafe {
+            w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
+        }
 
         // Arm the order-witness probe on this (reactor) thread. The
         // `wait_for_publish` barrier makes the helper's publish visible to
@@ -2823,8 +2954,21 @@ mod tests {
             let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
             writer.send_encoded(sz, 1u32, |buf| {
                 ipc::encode_wire_into(
-                    buf, 0, 0, 0, 0,
-                    0u128, 0, 1u64, STATUS_OK, &[], None, None, None, None, &[],
+                    buf,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0u128,
+                    0,
+                    1u64,
+                    STATUS_OK,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
                 );
             });
             helper_published_thread.store(true, Ordering::Release);
@@ -2842,13 +2986,13 @@ mod tests {
         // (w2m receiver + the FutexWaitV storage slot) — deliberately NOT
         // calling attach_w2m, so no drain loop, no SQE arm, no tick().
         let reactor = Reactor::new(16).expect("reactor");
-        reactor.inner
+        reactor
+            .inner
             .w2m
             .set(W2mReceiver::new(vec![ptr]))
             .ok()
             .expect("w2m set");
-        *reactor.inner.futex_waitv_storage.borrow_mut() =
-            Some(vec![FutexWaitV::new()].into_boxed_slice());
+        *reactor.inner.futex_waitv_storage.borrow_mut() = Some(vec![FutexWaitV::new()].into_boxed_slice());
 
         // Drive the isolated refresh exactly once. Internally it publishes
         // the flag, the helper observes it and publishes, the refresh's
@@ -2906,10 +3050,14 @@ mod tests {
         r.inject_cqe(KIND_RECV, 55, -1);
         r.drain_injected_cqes();
 
-        assert!(r.inner.closing_fds.borrow().contains(&55),
-            "res<=0 recv CQE must insert fd into closing_fds");
-        assert!(r.inner.recv_closed.borrow().get(&55).copied().unwrap_or(false),
-            "res<=0 recv CQE must set recv_closed sentinel");
+        assert!(
+            r.inner.closing_fds.borrow().contains(&55),
+            "res<=0 recv CQE must insert fd into closing_fds"
+        );
+        assert!(
+            r.inner.recv_closed.borrow().get(&55).copied().unwrap_or(false),
+            "res<=0 recv CQE must set recv_closed sentinel"
+        );
     }
 
     #[test]
@@ -2931,10 +3079,14 @@ mod tests {
 
             r.reap_closing_conns();
 
-            assert!(!r.inner.conns.borrow().contains_key(&read_end),
-                "idle closing conn must be removed from conns");
-            assert!(!r.inner.closing_fds.borrow().contains(&read_end),
-                "reaped fd must be removed from closing_fds");
+            assert!(
+                !r.inner.conns.borrow().contains_key(&read_end),
+                "idle closing conn must be removed from conns"
+            );
+            assert!(
+                !r.inner.closing_fds.borrow().contains(&read_end),
+                "reaped fd must be removed from closing_fds"
+            );
 
             libc::close(write_end);
         }
@@ -2951,10 +3103,14 @@ mod tests {
 
         r.reap_closing_conns();
 
-        assert!(r.inner.conns.borrow().contains_key(&77),
-            "conn with outstanding send must NOT be reaped yet");
-        assert!(r.inner.closing_fds.borrow().contains(&77),
-            "conn deferred by outstanding send must stay in closing_fds");
+        assert!(
+            r.inner.conns.borrow().contains_key(&77),
+            "conn with outstanding send must NOT be reaped yet"
+        );
+        assert!(
+            r.inner.closing_fds.borrow().contains(&77),
+            "conn deferred by outstanding send must stay in closing_fds"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -3003,7 +3159,9 @@ mod tests {
         let (_, rem) = rs.remaining();
         assert_eq!(rem, 4, "take_message must reset to header phase");
 
-        unsafe { libc::free(buf as *mut libc::c_void); }
+        unsafe {
+            libc::free(buf as *mut libc::c_void);
+        }
     }
 
     #[test]
@@ -3058,10 +3216,12 @@ mod tests {
 
         r.block_until_idle();
         let o = order.borrow().clone();
-        let w_pos  = o.iter().position(|&s| s == "W").expect("W not seen");
+        let w_pos = o.iter().position(|&s| s == "W").expect("W not seen");
         let r2_pos = o.iter().position(|&s| s == "R2").expect("R2 not seen");
-        assert!(w_pos < r2_pos,
-            "writer-preference violated: W must precede R2, got {o:?}");
+        assert!(
+            w_pos < r2_pos,
+            "writer-preference violated: W must precede R2, got {o:?}"
+        );
     }
 
     /// WriteFuture::Drop path 3: readers hold the lock, the dropped
@@ -3080,7 +3240,9 @@ mod tests {
         let l_a = Rc::clone(&lock);
         r.spawn(async move {
             let _g = l_a.read().await;
-            for _ in 0..10 { YieldOnce::new().await; }
+            for _ in 0..10 {
+                YieldOnce::new().await;
+            }
         });
 
         // Task B: races write acquisition vs cancel_rx. WriteFuture parks
@@ -3099,15 +3261,17 @@ mod tests {
         });
 
         // Let A, B, C all park (A acquires read, B parks write, C parks read).
-        for _ in 0..5 { r.tick(false); }
-        assert!(!done.get(),
-            "C must be blocked while write waiter B is alive");
+        for _ in 0..5 {
+            r.tick(false);
+        }
+        assert!(!done.get(), "C must be blocked while write waiter B is alive");
 
         // Cancel B: WriteFuture::Drop path 3 must wake C.
         drop(cancel_tx);
-        for _ in 0..5 { r.tick(false); }
-        assert!(done.get(),
-            "C must unblock when the last write waiter (B) is cancelled");
+        for _ in 0..5 {
+            r.tick(false);
+        }
+        assert!(done.get(), "C must unblock when the last write waiter (B) is cancelled");
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -3135,8 +3299,10 @@ mod tests {
 
         let q: Vec<usize> = r.inner.run_queue.borrow().queue.clone();
         assert!(q.contains(&42), "KIND_ACCEPT must wake the registered accept_waker");
-        assert!(r.inner.accept_waker.borrow().is_none(),
-            "KIND_ACCEPT must consume (take) the accept_waker");
+        assert!(
+            r.inner.accept_waker.borrow().is_none(),
+            "KIND_ACCEPT must consume (take) the accept_waker"
+        );
     }
 
     #[test]
@@ -3144,8 +3310,10 @@ mod tests {
         let r = make_reactor();
         r.inject_cqe(KIND_ACCEPT, 0, -libc::ECONNABORTED);
         r.drain_injected_cqes();
-        assert!(r.inner.accept_queue.borrow().is_empty(),
-            "KIND_ACCEPT with res<0 must not push to accept_queue");
+        assert!(
+            r.inner.accept_queue.borrow().is_empty(),
+            "KIND_ACCEPT with res<0 must not push to accept_queue"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -3155,18 +3323,17 @@ mod tests {
     #[test]
     fn join_all_unpin_empty_returns_empty_vec() {
         let r = make_reactor();
-        let result = r.block_on(async {
-            join_all_unpin(std::iter::empty::<std::future::Ready<i32>>()).await
-        });
-        assert!(result.is_empty(), "join_all_unpin on empty iterator must return empty vec");
+        let result = r.block_on(async { join_all_unpin(std::iter::empty::<std::future::Ready<i32>>()).await });
+        assert!(
+            result.is_empty(),
+            "join_all_unpin on empty iterator must return empty vec"
+        );
     }
 
     #[test]
     fn join_all_unpin_single_future_completes() {
         let r = make_reactor();
-        let result = r.block_on(async {
-            join_all_unpin(std::iter::once(std::future::ready(99u32))).await
-        });
+        let result = r.block_on(async { join_all_unpin(std::iter::once(std::future::ready(99u32))).await });
         assert_eq!(result, vec![99u32]);
     }
 
@@ -3216,11 +3383,12 @@ mod tests {
     #[test]
     fn regular_and_scan_ids_never_collide() {
         let r = make_reactor();
-        let regular_ids: std::collections::HashSet<u64> =
-            (0..10000).map(|_| r.alloc_request_id()).collect();
-        let scan_ids: std::collections::HashSet<u64> =
-            (0..10000).map(|_| r.alloc_scan_request_id()).collect();
-        assert!(regular_ids.is_disjoint(&scan_ids), "regular and scan IDs must not overlap");
+        let regular_ids: std::collections::HashSet<u64> = (0..10000).map(|_| r.alloc_request_id()).collect();
+        let scan_ids: std::collections::HashSet<u64> = (0..10000).map(|_| r.alloc_scan_request_id()).collect();
+        assert!(
+            regular_ids.is_disjoint(&scan_ids),
+            "regular and scan IDs must not overlap"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -3237,28 +3405,52 @@ mod tests {
     /// The returned `W2mReceiver` owns the `InFlightState` that the slot's Drop
     /// references — it must be kept alive until after the slot is dropped.
     /// Caller must munmap the returned pointer after both receiver and slot drop.
-    unsafe fn make_scan_slot(req_id: u32)
-        -> (crate::runtime::w2m::W2mSlot, crate::runtime::w2m::W2mReceiver, *mut u8, usize)
-    {
-        use crate::runtime::w2m::{W2mWriter, W2mReceiver};
+    unsafe fn make_scan_slot(
+        req_id: u32,
+    ) -> (
+        crate::runtime::w2m::W2mSlot,
+        crate::runtime::w2m::W2mReceiver,
+        *mut u8,
+        usize,
+    ) {
+        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
         use crate::runtime::wire::{self as ipc, STATUS_OK};
 
         const CAPACITY: usize = 4096;
         let ptr = libc::mmap(
-            std::ptr::null_mut(), CAPACITY,
+            std::ptr::null_mut(),
+            CAPACITY,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0,
+            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+            -1,
+            0,
         ) as *mut u8;
         assert!(!ptr.is_null());
         std::ptr::write_bytes(ptr, 0, CAPACITY);
         w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
 
-        let writer   = W2mWriter::new(ptr, CAPACITY as u64);
+        let writer = W2mWriter::new(ptr, CAPACITY as u64);
         let receiver = W2mReceiver::new(vec![ptr]);
         let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
         writer.send_encoded(sz, req_id, |buf| {
-            ipc::encode_wire_into(buf, 0, 0, 0, 0, 0u128, 0, 0, STATUS_OK, &[], None, None, None, None, &[]);
+            ipc::encode_wire_into(
+                buf,
+                0,
+                0,
+                0,
+                0,
+                0u128,
+                0,
+                0,
+                STATUS_OK,
+                &[],
+                None,
+                None,
+                None,
+                None,
+                &[],
+            );
         });
         let slot = receiver.try_read_slot(0).expect("scan slot");
         (slot, receiver, ptr, CAPACITY)
@@ -3276,15 +3468,24 @@ mod tests {
         let _lease = r.scan_lease(&[req_id]);
         r.test_route_scan_slot(slot);
 
-        assert!(r.inner.scan_parked.borrow().contains_key(&req_id),
-            "slot must be queued when no waker is registered for an active scan");
-        assert_eq!(r.inner.scan_parked.borrow().get(&req_id).map(|q| q.len()), Some(1),
-            "exactly one frame queued");
-        assert!(r.inner.scan_wakers.borrow().is_empty(),
-            "no waker should have been inserted");
+        assert!(
+            r.inner.scan_parked.borrow().contains_key(&req_id),
+            "slot must be queued when no waker is registered for an active scan"
+        );
+        assert_eq!(
+            r.inner.scan_parked.borrow().get(&req_id).map(|q| q.len()),
+            Some(1),
+            "exactly one frame queued"
+        );
+        assert!(
+            r.inner.scan_wakers.borrow().is_empty(),
+            "no waker should have been inserted"
+        );
 
         r.inner.scan_parked.borrow_mut().remove(&req_id); // drop slot, advance consume_cursor
-        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, size);
+        }
     }
 
     #[test]
@@ -3300,11 +3501,15 @@ mod tests {
 
         let fut = r.await_scan_slot(req_id);
         let result = r.block_on(fut);
-        assert_eq!(result.internal_req_id, req_id,
-            "first poll must return the pre-parked slot");
+        assert_eq!(
+            result.internal_req_id, req_id,
+            "first poll must return the pre-parked slot"
+        );
 
         drop(result); // advance consume_cursor before munmap
-        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, size);
+        }
     }
 
     #[test]
@@ -3326,15 +3531,19 @@ mod tests {
         });
 
         r.poll_nonblocking(); // poll task → Poll::Pending, waker registered
-        assert!(r.inner.scan_wakers.borrow().contains_key(&req_id),
-            "waker must be registered after first poll");
+        assert!(
+            r.inner.scan_wakers.borrow().contains_key(&req_id),
+            "waker must be registered after first poll"
+        );
         assert!(!delivered.get(), "must not be delivered yet");
 
         r.test_route_scan_slot(slot); // park + wake
-        r.poll_nonblocking();         // task woken → Poll::Ready
+        r.poll_nonblocking(); // task woken → Poll::Ready
 
         assert!(delivered.get(), "slot must be delivered after route_scan_slot");
-        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, size);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -3348,30 +3557,47 @@ mod tests {
     /// `InFlightState` the slots reference; caller reads frames via
     /// `receiver.try_read_slot(0)` and munmaps the pointer after both receiver
     /// and all slots drop.
-    unsafe fn make_scan_ring(internal_req_id: u32, n: usize)
-        -> (crate::runtime::w2m::W2mReceiver, *mut u8, usize)
-    {
-        use crate::runtime::w2m::{W2mWriter, W2mReceiver};
+    unsafe fn make_scan_ring(internal_req_id: u32, n: usize) -> (crate::runtime::w2m::W2mReceiver, *mut u8, usize) {
+        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring;
         use crate::runtime::wire::{self as ipc, STATUS_OK};
 
         const CAPACITY: usize = 64 * 1024;
         let ptr = libc::mmap(
-            std::ptr::null_mut(), CAPACITY,
+            std::ptr::null_mut(),
+            CAPACITY,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0,
+            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+            -1,
+            0,
         ) as *mut u8;
         assert!(!ptr.is_null());
         std::ptr::write_bytes(ptr, 0, CAPACITY);
         w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
 
-        let writer   = W2mWriter::new(ptr, CAPACITY as u64);
+        let writer = W2mWriter::new(ptr, CAPACITY as u64);
         let receiver = W2mReceiver::new(vec![ptr]);
         let sz = ipc::wire_size(STATUS_OK, &[], None, None, None, None, &[]);
         for i in 0..n {
             let wire_req = 100u64 + i as u64;
             writer.send_encoded(sz, internal_req_id, |buf| {
-                ipc::encode_wire_into(buf, 0, 0, 0, 0, 0u128, 0, wire_req, STATUS_OK, &[], None, None, None, None, &[]);
+                ipc::encode_wire_into(
+                    buf,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0u128,
+                    0,
+                    wire_req,
+                    STATUS_OK,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                );
             });
         }
         (receiver, ptr, CAPACITY)
@@ -3393,8 +3619,10 @@ mod tests {
         r.test_route_scan_slot(s0);
         r.test_route_scan_slot(s1);
         assert_eq!(
-            r.inner.scan_parked.borrow().get(&req_id).map(|q| q.len()), Some(2),
-            "both frames must be queued, not overwritten");
+            r.inner.scan_parked.borrow().get(&req_id).map(|q| q.len()),
+            Some(2),
+            "both frames must be queued, not overwritten"
+        );
 
         // await twice → frames returned in arrival order (100 then 101).
         let f0 = r.block_on(r.await_scan_slot(req_id));
@@ -3403,14 +3631,21 @@ mod tests {
         let f1 = r.block_on(r.await_scan_slot(req_id));
         let rid1 = wire::peek_control_block(f1.bytes()).unwrap().request_id;
         drop(f1);
-        assert_eq!((rid0, rid1), (100, 101),
-            "queued continuation frames must be returned in arrival order");
-        assert!(r.inner.scan_parked.borrow().is_empty(),
-            "queue emptied after both frames consumed");
+        assert_eq!(
+            (rid0, rid1),
+            (100, 101),
+            "queued continuation frames must be returned in arrival order"
+        );
+        assert!(
+            r.inner.scan_parked.borrow().is_empty(),
+            "queue emptied after both frames consumed"
+        );
 
         drop(_lease);
         drop(recv);
-        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, size);
+        }
     }
 
     /// Dropping the `ScanLease` purges the parked queue (dropping each queued
@@ -3429,14 +3664,22 @@ mod tests {
 
         let cc_before = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
         drop(lease); // purge parked queue → drop queued slot → advance consume_cursor
-        assert!(r.inner.scan_parked.borrow().is_empty(), "lease drop purges parked queue");
+        assert!(
+            r.inner.scan_parked.borrow().is_empty(),
+            "lease drop purges parked queue"
+        );
         assert!(r.inner.scan_wakers.borrow().is_empty(), "lease drop purges wakers");
-        assert!(r.inner.active_scans.borrow().is_empty(), "lease drop deregisters active scan");
+        assert!(
+            r.inner.active_scans.borrow().is_empty(),
+            "lease drop deregisters active scan"
+        );
         let cc_after = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
         assert!(cc_after > cc_before, "dropped queued slot must advance consume_cursor");
 
         drop(recv);
-        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, size);
+        }
     }
 
     /// Failure mode 1: a frame whose scan has no live lease is discarded
@@ -3453,13 +3696,20 @@ mod tests {
         let s0 = recv.try_read_slot(0).expect("frame 0");
         let cc_before = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
         r.test_route_scan_slot(s0); // dropped here (inactive)
-        assert!(r.inner.scan_parked.borrow().is_empty(),
-            "abandoned-scan frame must be discarded, not parked");
+        assert!(
+            r.inner.scan_parked.borrow().is_empty(),
+            "abandoned-scan frame must be discarded, not parked"
+        );
         let cc_after = unsafe { recv.header(0) }.consume_cursor().load(Ordering::Acquire);
-        assert!(cc_after > cc_before, "discarded slot must advance consume_cursor (ring freed)");
+        assert!(
+            cc_after > cc_before,
+            "discarded slot must advance consume_cursor (ring freed)"
+        );
 
         drop(recv);
-        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, size);
+        }
     }
 
     /// End-to-end Failure mode 1 guard: a worker streams more frames than the
@@ -3469,12 +3719,12 @@ mod tests {
     /// writes instead of wedging in `send_encoded`.
     #[test]
     fn dropped_scan_lease_unblocks_streaming_writer() {
-        use std::sync::atomic::Ordering;
-        use std::time::{Duration, Instant};
-        use crate::runtime::w2m::{W2mWriter, W2mReceiver};
+        use crate::foundation::codec::align8;
+        use crate::runtime::w2m::{W2mReceiver, W2mWriter};
         use crate::runtime::w2m_ring::{self, W2M_HEADER_SIZE};
         use crate::runtime::wire::{self as ipc, STATUS_OK};
-        use crate::foundation::codec::align8;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
 
         const TOTAL: usize = 8;
 
@@ -3485,9 +3735,12 @@ mod tests {
         let size = capacity as usize;
         let ptr = unsafe {
             let p = libc::mmap(
-                std::ptr::null_mut(), size,
+                std::ptr::null_mut(),
+                size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_SHARED, -1, 0,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1,
+                0,
             ) as *mut u8;
             assert!(!p.is_null());
             std::ptr::write_bytes(p, 0, size);
@@ -3504,7 +3757,23 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for _ in 0..TOTAL {
                 writer.send_encoded(sz, req_id, |buf| {
-                    ipc::encode_wire_into(buf, 0, 0, 0, 0, 0u128, 0, 0, STATUS_OK, &[], None, None, None, None, &[]);
+                    ipc::encode_wire_into(
+                        buf,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0u128,
+                        0,
+                        0,
+                        STATUS_OK,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                    );
                 });
             }
             let _ = done_tx.send(());
@@ -3541,7 +3810,8 @@ mod tests {
             }
         }
 
-        done_rx.recv_timeout(Duration::from_secs(5))
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
             .expect("writer thread must finish — never wedge on a full ring");
         handle.join().expect("writer thread panicked");
 
@@ -3553,7 +3823,9 @@ mod tests {
         );
 
         drop(receiver);
-        unsafe { libc::munmap(ptr as *mut libc::c_void, size); }
+        unsafe {
+            libc::munmap(ptr as *mut libc::c_void, size);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -3572,16 +3844,22 @@ mod tests {
             let w = make_waker(1);
             let mut cx = Context::from_waker(&w);
             assert!(fut.as_mut().poll(&mut cx).is_pending(), "no reply parked yet");
-            assert!(r.inner.reply_wakers.borrow().contains_key(&req_id),
-                "poll must register the reply waker");
+            assert!(
+                r.inner.reply_wakers.borrow().contains_key(&req_id),
+                "poll must register the reply waker"
+            );
         } // fut dropped → Drop withdraws the waker
-        assert!(!r.inner.reply_wakers.borrow().contains_key(&req_id),
-            "drop must withdraw the reply waker");
+        assert!(
+            !r.inner.reply_wakers.borrow().contains_key(&req_id),
+            "drop must withdraw the reply waker"
+        );
 
         // A reply arriving after the drop hits the None arm and is dropped.
         r.test_route_reply(0, synthetic_decoded_wire(req_id));
-        assert!(!r.inner.parked_replies.borrow().contains_key(&req_id),
-            "late reply for a dropped future must not be parked");
+        assert!(
+            !r.inner.parked_replies.borrow().contains_key(&req_id),
+            "late reply for a dropped future must not be parked"
+        );
         assert!(r.inner.reply_wakers.borrow().is_empty());
     }
 
@@ -3606,25 +3884,37 @@ mod tests {
         let r = make_reactor();
         let id = 7001u64;
         {
-            let mut fut = Box::pin(FsyncFuture { id, completed: false, inner: Rc::clone(&r.inner) });
+            let mut fut = Box::pin(FsyncFuture {
+                id,
+                completed: false,
+                inner: Rc::clone(&r.inner),
+            });
             let w = make_waker(1);
             let mut cx = Context::from_waker(&w);
             assert!(fut.as_mut().poll(&mut cx).is_pending(), "no result yet");
             assert!(r.inner.fsync_wakers.borrow().contains_key(&id));
         } // drop while pending → tombstone
-        assert!(r.inner.cancelled_fsyncs.borrow().contains(&id),
-            "drop while pending must tombstone the id");
-        assert!(!r.inner.fsync_wakers.borrow().contains_key(&id),
-            "drop must withdraw the waker");
+        assert!(
+            r.inner.cancelled_fsyncs.borrow().contains(&id),
+            "drop while pending must tombstone the id"
+        );
+        assert!(
+            !r.inner.fsync_wakers.borrow().contains_key(&id),
+            "drop must withdraw the waker"
+        );
 
         // Late CQE: handler consumes the tombstone, parks nothing.
         r.inject_cqe(KIND_FSYNC, id, 0);
         r.drain_injected_cqes();
-        assert!(r.inner.parked_fsync_results.borrow().is_empty(),
-            "cancelled fsync's late result must not be parked");
+        assert!(
+            r.inner.parked_fsync_results.borrow().is_empty(),
+            "cancelled fsync's late result must not be parked"
+        );
         assert!(r.inner.fsync_wakers.borrow().is_empty());
-        assert!(r.inner.cancelled_fsyncs.borrow().is_empty(),
-            "the late CQE must consume the tombstone");
+        assert!(
+            r.inner.cancelled_fsyncs.borrow().is_empty(),
+            "the late CQE must consume the tombstone"
+        );
     }
 
     /// Fix C: a CQE arriving before the drop is reclaimed by `Drop`, with no
@@ -3633,7 +3923,11 @@ mod tests {
     fn dropped_fsync_future_reclaims_parked_result() {
         let r = make_reactor();
         let id = 7002u64;
-        let mut fut = Box::pin(FsyncFuture { id, completed: false, inner: Rc::clone(&r.inner) });
+        let mut fut = Box::pin(FsyncFuture {
+            id,
+            completed: false,
+            inner: Rc::clone(&r.inner),
+        });
         let w = make_waker(1);
         let mut cx = Context::from_waker(&w);
         assert!(fut.as_mut().poll(&mut cx).is_pending());
@@ -3643,10 +3937,14 @@ mod tests {
         assert!(r.inner.parked_fsync_results.borrow().contains_key(&id));
 
         drop(fut); // not resolved → Drop reclaims the orphaned parked result
-        assert!(r.inner.parked_fsync_results.borrow().is_empty(),
-            "drop must reclaim the orphaned parked result");
-        assert!(r.inner.cancelled_fsyncs.borrow().is_empty(),
-            "no tombstone when the result was already parked");
+        assert!(
+            r.inner.parked_fsync_results.borrow().is_empty(),
+            "drop must reclaim the orphaned parked result"
+        );
+        assert!(
+            r.inner.cancelled_fsyncs.borrow().is_empty(),
+            "no tombstone when the result was already parked"
+        );
     }
 
     /// Fix C regression guard: the success path must NOT tombstone — otherwise
@@ -3655,7 +3953,11 @@ mod tests {
     fn resolved_fsync_future_adds_no_tombstone() {
         let r = make_reactor();
         let id = 7003u64;
-        let mut fut = Box::pin(FsyncFuture { id, completed: false, inner: Rc::clone(&r.inner) });
+        let mut fut = Box::pin(FsyncFuture {
+            id,
+            completed: false,
+            inner: Rc::clone(&r.inner),
+        });
         let w = make_waker(1);
         let mut cx = Context::from_waker(&w);
 
@@ -3666,8 +3968,10 @@ mod tests {
             Poll::Pending => panic!("must resolve from the parked result"),
         }
         drop(fut); // completed=true → Drop is a no-op
-        assert!(r.inner.cancelled_fsyncs.borrow().is_empty(),
-            "success path must not tombstone — else cancelled_fsyncs leaks per commit");
+        assert!(
+            r.inner.cancelled_fsyncs.borrow().is_empty(),
+            "success path must not tombstone — else cancelled_fsyncs leaks per commit"
+        );
     }
 
     /// Fix D: a `SendFuture` dropped while pending must park its buffer
@@ -3685,28 +3989,45 @@ mod tests {
         {
             let _fut = SendFuture {
                 send_id,
-                _alive: Some(SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(vec![0u8; 16])))),
+                _alive: Some(SendAlive::Pooled(Rc::new(crate::storage::batch_pool::PooledSendBuf(
+                    vec![0u8; 16],
+                )))),
                 inner: Rc::clone(&r.inner),
             };
         } // drop while pending → buffer parked, waker withdrawn, tombstone set
-        assert!(r.inner.send_buffers_in_flight.borrow().contains_key(&send_id),
-            "drop must park the buffer keep-alive");
-        assert!(r.inner.cancelled_sends.borrow().contains(&send_id),
-            "drop while pending must tombstone the send id");
-        assert!(!r.inner.send_wakers.borrow().contains_key(&send_id),
-            "drop must withdraw the send waker");
+        assert!(
+            r.inner.send_buffers_in_flight.borrow().contains_key(&send_id),
+            "drop must park the buffer keep-alive"
+        );
+        assert!(
+            r.inner.cancelled_sends.borrow().contains(&send_id),
+            "drop while pending must tombstone the send id"
+        );
+        assert!(
+            !r.inner.send_wakers.borrow().contains_key(&send_id),
+            "drop must withdraw the send waker"
+        );
 
         // Late CQE: buffer + inflight cleanup unconditional, result dropped.
         r.inject_cqe(KIND_SEND, send_id, 16);
         r.drain_injected_cqes();
-        assert!(r.inner.parked_send_results.borrow().is_empty(),
-            "cancelled send's late result must not be parked");
-        assert!(r.inner.send_buffers_in_flight.borrow().is_empty(),
-            "handler must free the parked buffer");
+        assert!(
+            r.inner.parked_send_results.borrow().is_empty(),
+            "cancelled send's late result must not be parked"
+        );
+        assert!(
+            r.inner.send_buffers_in_flight.borrow().is_empty(),
+            "handler must free the parked buffer"
+        );
         assert!(r.inner.send_wakers.borrow().is_empty());
-        assert!(r.inner.cancelled_sends.borrow().is_empty(),
-            "the late CQE must consume the tombstone");
-        assert_eq!(r.inner.conns.borrow().get(&fd).unwrap().send_inflight, 0,
-            "handler must decrement send_inflight");
+        assert!(
+            r.inner.cancelled_sends.borrow().is_empty(),
+            "the late CQE must consume the tombstone"
+        );
+        assert_eq!(
+            r.inner.conns.borrow().get(&fd).unwrap().send_inflight,
+            0,
+            "handler must decrement send_inflight"
+        );
     }
 }

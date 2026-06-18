@@ -40,9 +40,7 @@ impl IoUringRing {
 impl Ring for IoUringRing {
     fn prep_recv(&mut self, fd: i32, buf: *mut u8, len: u32, user_data: u64) {
         self.ensure_sq_room();
-        let entry = opcode::Recv::new(types::Fd(fd), buf, len)
-            .build()
-            .user_data(user_data);
+        let entry = opcode::Recv::new(types::Fd(fd), buf, len).build().user_data(user_data);
         unsafe {
             self.ring.submission().push(&entry).unwrap();
         }
@@ -50,9 +48,7 @@ impl Ring for IoUringRing {
 
     fn prep_send(&mut self, fd: i32, buf: *const u8, len: u32, user_data: u64) {
         self.ensure_sq_room();
-        let entry = opcode::Send::new(types::Fd(fd), buf, len)
-            .build()
-            .user_data(user_data);
+        let entry = opcode::Send::new(types::Fd(fd), buf, len).build().user_data(user_data);
         unsafe {
             self.ring.submission().push(&entry).unwrap();
         }
@@ -60,9 +56,7 @@ impl Ring for IoUringRing {
 
     fn prep_accept(&mut self, fd: i32, user_data: u64) {
         self.ensure_sq_room();
-        let entry = opcode::AcceptMulti::new(types::Fd(fd))
-            .build()
-            .user_data(user_data);
+        let entry = opcode::AcceptMulti::new(types::Fd(fd)).build().user_data(user_data);
         unsafe {
             self.ring.submission().push(&entry).unwrap();
         }
@@ -88,42 +82,27 @@ impl Ring for IoUringRing {
         );
         let ts_ptr: *const types::Timespec = &*ts;
         self.timer_specs.insert(user_data, ts);
-        let entry = opcode::Timeout::new(ts_ptr)
-            .build()
-            .user_data(user_data);
+        let entry = opcode::Timeout::new(ts_ptr).build().user_data(user_data);
         unsafe {
             self.ring.submission().push(&entry).unwrap();
         }
     }
 
-    unsafe fn prep_futex_waitv(
-        &mut self,
-        futexv: *const types::FutexWaitV,
-        nr: u32,
-        user_data: u64,
-    ) {
+    unsafe fn prep_futex_waitv(&mut self, futexv: *const types::FutexWaitV, nr: u32, user_data: u64) {
         self.ensure_sq_room();
-        let entry = opcode::FutexWaitV::new(futexv, nr)
-            .build()
-            .user_data(user_data);
+        let entry = opcode::FutexWaitV::new(futexv, nr).build().user_data(user_data);
         self.ring.submission().push(&entry).unwrap();
     }
 
     fn prep_async_cancel(&mut self, target_user_data: u64, user_data: u64) {
         self.ensure_sq_room();
-        let entry = opcode::AsyncCancel::new(target_user_data)
-            .build()
-            .user_data(user_data);
+        let entry = opcode::AsyncCancel::new(target_user_data).build().user_data(user_data);
         unsafe {
             self.ring.submission().push(&entry).unwrap();
         }
     }
 
-    fn submit_and_wait_timeout(
-        &mut self,
-        min_complete: u32,
-        timeout_ms: i32,
-    ) -> Result<i32, i32> {
+    fn submit_and_wait_timeout(&mut self, min_complete: u32, timeout_ms: i32) -> Result<i32, i32> {
         let pending = self.ring.submission().len();
 
         if min_complete == 0 && pending == 0 {
@@ -149,11 +128,7 @@ impl Ring for IoUringRing {
                 .sec((timeout_ms / 1000) as u64)
                 .nsec(((timeout_ms % 1000) as u32) * 1_000_000);
             let args = types::SubmitArgs::new().timespec(&ts);
-            match self
-                .ring
-                .submitter()
-                .submit_with_args(min_complete as usize, &args)
-            {
+            match self.ring.submitter().submit_with_args(min_complete as usize, &args) {
                 Ok(n) => Ok(n as i32),
                 Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
                 Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => Ok(0),
@@ -173,7 +148,9 @@ impl Ring for IoUringRing {
             // no need to pre-check membership.
             let cq = self.ring.completion();
             for cqe in cq {
-                if count >= out.len() { break; }
+                if count >= out.len() {
+                    break;
+                }
                 out[count] = Cqe {
                     user_data: cqe.user_data(),
                     res: cqe.result(),

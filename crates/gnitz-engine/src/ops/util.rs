@@ -2,7 +2,7 @@
 
 use xxhash_rust::xxh3::Xxh3Default;
 
-use crate::schema::{ColumnLocator, SchemaDescriptor, TypeCode, type_code};
+use crate::schema::{type_code, ColumnLocator, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, MemBatch, ReadCursor};
 
 /// Compare two equal-length LE byte windows of a fixed-width column under
@@ -14,23 +14,23 @@ use crate::storage::{Batch, MemBatch, ReadCursor};
 pub(super) fn cmp_typed_le(a: &[u8], b: &[u8], tc: TypeCode) -> std::cmp::Ordering {
     debug_assert_eq!(a.len(), b.len(), "cmp_typed_le: windows must be equal length");
     match tc {
-        TypeCode::U128 | TypeCode::UUID => u128::from_le_bytes(a.try_into().unwrap())
-            .cmp(&u128::from_le_bytes(b.try_into().unwrap())),
+        TypeCode::U128 | TypeCode::UUID => {
+            u128::from_le_bytes(a.try_into().unwrap()).cmp(&u128::from_le_bytes(b.try_into().unwrap()))
+        }
         // I128 payload (a cross-sign `_join_pk` surfaced into a payload slot) is
         // stored native-LE and compares as a signed two's-complement value.
-        TypeCode::I128 => i128::from_le_bytes(a.try_into().unwrap())
-            .cmp(&i128::from_le_bytes(b.try_into().unwrap())),
-        TypeCode::F64 => f64::from_le_bytes(a.try_into().unwrap())
-            .total_cmp(&f64::from_le_bytes(b.try_into().unwrap())),
-        TypeCode::F32 => f32::from_le_bytes(a.try_into().unwrap())
-            .total_cmp(&f32::from_le_bytes(b.try_into().unwrap())),
+        TypeCode::I128 => i128::from_le_bytes(a.try_into().unwrap()).cmp(&i128::from_le_bytes(b.try_into().unwrap())),
+        TypeCode::F64 => {
+            f64::from_le_bytes(a.try_into().unwrap()).total_cmp(&f64::from_le_bytes(b.try_into().unwrap()))
+        }
+        TypeCode::F32 => {
+            f32::from_le_bytes(a.try_into().unwrap()).total_cmp(&f32::from_le_bytes(b.try_into().unwrap()))
+        }
         TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-            crate::schema::read_signed(a, a.len())
-                .cmp(&crate::schema::read_signed(b, b.len()))
+            crate::schema::read_signed(a, a.len()).cmp(&crate::schema::read_signed(b, b.len()))
         }
         TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => {
-            crate::schema::read_unsigned(a, a.len())
-                .cmp(&crate::schema::read_unsigned(b, b.len()))
+            crate::schema::read_unsigned(a, a.len()).cmp(&crate::schema::read_unsigned(b, b.len()))
         }
         TypeCode::String | TypeCode::Blob => {
             unreachable!("cmp_typed_le: caller must dispatch String/Blob separately")
@@ -48,11 +48,7 @@ pub(super) fn cmp_typed_le(a: &[u8], b: &[u8], tc: TypeCode) -> std::cmp::Orderi
 /// the group-by and payload comparators all route through here rather than
 /// re-spelling the dispatch (a missed site panics the engine on a BLOB key).
 #[inline]
-pub(super) fn cmp_col_window(
-    a: &[u8], a_blob: &[u8],
-    b: &[u8], b_blob: &[u8],
-    tc: TypeCode,
-) -> std::cmp::Ordering {
+pub(super) fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: TypeCode) -> std::cmp::Ordering {
     if tc.is_german_string() {
         crate::schema::compare_german_strings(a, a_blob, b, b_blob)
     } else {
@@ -84,7 +80,13 @@ pub(super) fn write_string_from_batch(
 
 #[inline]
 pub(super) fn signum(x: i64) -> i64 {
-    if x > 0 { 1 } else if x < 0 { -1 } else { 0 }
+    if x > 0 {
+        1
+    } else if x < 0 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// Merge a right-side null bitmap into a left-side bitmap for a composite output
@@ -107,9 +109,12 @@ pub(super) fn merge_null_words(left: u64, right: u64, left_npc: usize) -> u64 {
 /// that boundary returns all-ones directly.
 #[inline]
 pub(crate) fn all_payload_null_mask(npc: usize) -> u64 {
-    if npc < 64 { (1u64 << npc) - 1 } else { u64::MAX }
+    if npc < 64 {
+        (1u64 << npc) - 1
+    } else {
+        u64::MAX
+    }
 }
-
 
 /// Compare a cursor's current payload to a batch row's payload, returning their ordering.
 ///
@@ -145,8 +150,10 @@ pub(super) fn compare_cursor_payload_to_batch_row(
                 let c_bytes = unsafe { std::slice::from_raw_parts(c_ptr, cs) };
                 let b_bytes = batch.get_col_ptr(row, pi, cs);
                 cmp_col_window(
-                    c_bytes, cursor_blob_slice,
-                    b_bytes, batch.blob,
+                    c_bytes,
+                    cursor_blob_slice,
+                    b_bytes,
+                    batch.blob,
                     TypeCode::from_validated_u8(col.type_code),
                 )
             }
@@ -178,7 +185,9 @@ pub(super) struct IndexColExtractor {
 
 impl IndexColExtractor {
     pub(super) fn new(schema: &SchemaDescriptor, col_idx: usize) -> Self {
-        Self { loc: schema.locate(col_idx) }
+        Self {
+            loc: schema.locate(col_idx),
+        }
     }
 
     #[inline]
@@ -285,14 +294,22 @@ fn ieee_order_bits_reverse(encoded: u64) -> u64 {
 /// Checks the F32 sign bit (bit 31), not bit 63.
 #[inline]
 pub(super) fn ieee_order_bits_f32(raw_bits: u32) -> u64 {
-    (if raw_bits >> 31 != 0 { !raw_bits } else { raw_bits ^ (1u32 << 31) }) as u64
+    (if raw_bits >> 31 != 0 {
+        !raw_bits
+    } else {
+        raw_bits ^ (1u32 << 31)
+    }) as u64
 }
 
 /// Reverse of [`ieee_order_bits_f32`].
 #[inline]
 pub(super) fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
     let e = encoded as u32;
-    if e >> 31 != 0 { e ^ (1u32 << 31) } else { !e }
+    if e >> 31 != 0 {
+        e ^ (1u32 << 31)
+    } else {
+        !e
+    }
 }
 
 /// Order-preserving u64 encoding of a fixed-width aggregate value held in
@@ -314,7 +331,11 @@ pub(super) fn encode_ordered(bytes: &[u8], col_type_code: u8, for_max: bool) -> 
         }
         other => unreachable!("AVI agg type {other} is not order-encodable (gated by agg_value_idx_eligible)"),
     };
-    if for_max { !val } else { val }
+    if for_max {
+        !val
+    } else {
+        val
+    }
 }
 
 /// Inverse of [`encode_ordered`]: recover the original value's raw little-endian
@@ -323,9 +344,7 @@ pub(super) fn encode_ordered(bytes: &[u8], col_type_code: u8, for_max: bool) -> 
 pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: bool) -> u64 {
     let e = if for_max { !encoded } else { encoded };
     match col_type_code {
-        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-            (e as i64).wrapping_sub(1i64 << 63) as u64
-        }
+        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => (e as i64).wrapping_sub(1i64 << 63) as u64,
         TypeCode::F64 => ieee_order_bits_reverse(e),
         TypeCode::F32 => {
             // The accumulator and the reduce output column are F64; promote the
@@ -334,12 +353,18 @@ pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: boo
             let f32_bits = ieee_order_bits_f32_reverse(e);
             f64::to_bits(f32::from_bits(f32_bits) as f64)
         }
-        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64
-        | TypeCode::U128 | TypeCode::UUID | TypeCode::String => e,
+        TypeCode::U8
+        | TypeCode::U16
+        | TypeCode::U32
+        | TypeCode::U64
+        | TypeCode::U128
+        | TypeCode::UUID
+        | TypeCode::String => e,
         TypeCode::Blob => unreachable!("BLOB columns are not valid aggregate inputs"),
         TypeCode::I128 => unreachable!(
             "I128 is excluded from the AVI by agg_value_idx_eligible (16-byte value \
-             cannot order-encode into the 8-byte slot)"),
+             cannot order-encode into the 8-byte slot)"
+        ),
     }
 }
 
@@ -389,25 +414,37 @@ struct BatchRow<'a, 'b> {
 
 impl GroupKeyRow for BatchRow<'_, '_> {
     #[inline]
-    fn pk_bytes(&self) -> &[u8] { self.mb.get_pk_bytes(self.row) }
+    fn pk_bytes(&self) -> &[u8] {
+        self.mb.get_pk_bytes(self.row)
+    }
     #[inline]
-    fn null_word(&self) -> u64 { self.mb.get_null_word(self.row) }
+    fn null_word(&self) -> u64 {
+        self.mb.get_null_word(self.row)
+    }
     #[inline]
     fn payload_bytes(&self, schema: &SchemaDescriptor, c_idx: usize, cs: usize) -> Option<&[u8]> {
         // MemBatch get_col_ptr is infallible (panics OOB) — always Some, so the
         // batch path keeps its original non-null assumption and behaviour.
-        let pi = schema.try_payload_idx(c_idx).expect("group-key column is non-PK by construction");
+        let pi = schema
+            .try_payload_idx(c_idx)
+            .expect("group-key column is non-PK by construction");
         Some(self.mb.get_col_ptr(self.row, pi, cs))
     }
     #[inline]
-    fn blob(&self) -> &[u8] { self.mb.blob }
+    fn blob(&self) -> &[u8] {
+        self.mb.blob
+    }
 }
 
 impl GroupKeyRow for ReadCursor {
     #[inline]
-    fn pk_bytes(&self) -> &[u8] { self.current_pk_bytes() }
+    fn pk_bytes(&self) -> &[u8] {
+        self.current_pk_bytes()
+    }
     #[inline]
-    fn null_word(&self) -> u64 { self.current_null_word }
+    fn null_word(&self) -> u64 {
+        self.current_null_word
+    }
     #[inline]
     fn payload_bytes(&self, _schema: &SchemaDescriptor, c_idx: usize, cs: usize) -> Option<&[u8]> {
         // col_ptr maps logical→payload internally and returns null for PK /
@@ -415,20 +452,21 @@ impl GroupKeyRow for ReadCursor {
         // scans only under `valid`, so null is an invariant violation — treat it
         // as an absent value rather than dereferencing it (UB).
         let p = self.col_ptr(c_idx, cs);
-        if p.is_null() { None } else { Some(unsafe { std::slice::from_raw_parts(p, cs) }) }
+        if p.is_null() {
+            None
+        } else {
+            Some(unsafe { std::slice::from_raw_parts(p, cs) })
+        }
     }
     #[inline]
-    fn blob(&self) -> &[u8] { self.blob_slice() }
+    fn blob(&self) -> &[u8] {
+        self.blob_slice()
+    }
 }
 
 /// Extract 128-bit group key from a batch row.
 #[inline]
-pub(super) fn extract_group_key(
-    mb: &MemBatch,
-    row: usize,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-) -> u128 {
+pub(super) fn extract_group_key(mb: &MemBatch, row: usize, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> u128 {
     extract_group_key_row(&BatchRow { mb, row }, schema, group_by_cols)
 }
 
@@ -436,20 +474,12 @@ pub(super) fn extract_group_key(
 /// byte-identically to [`extract_group_key`] for the same logical row, so a
 /// trace row routes to the delta group it belongs to.
 #[inline]
-pub(super) fn extract_group_key_cursor(
-    cursor: &ReadCursor,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-) -> u128 {
+pub(super) fn extract_group_key_cursor(cursor: &ReadCursor, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> u128 {
     extract_group_key_row(cursor, schema, group_by_cols)
 }
 
 #[inline]
-fn extract_group_key_row<R: GroupKeyRow>(
-    row: &R,
-    schema: &SchemaDescriptor,
-    group_by_cols: &[u32],
-) -> u128 {
+fn extract_group_key_row<R: GroupKeyRow>(row: &R, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> u128 {
     // Single PK group column: the addressed column's canonical key (native for
     // unsigned, sign-flipped for signed) via `pk_route_key` — identical to
     // `partition_for_pk_bytes` and `mb.get_pk(row)`, so a join key routes the
@@ -507,7 +537,9 @@ fn extract_group_key_row<R: GroupKeyRow>(
             hasher.update(&key.to_le_bytes());
             continue;
         }
-        let pi = schema.try_payload_idx(c_idx).expect("non-PK: PK columns handled in the branch above");
+        let pi = schema
+            .try_payload_idx(c_idx)
+            .expect("non-PK: PK columns handled in the branch above");
         let is_null = schema.columns[c_idx].nullable != 0 && (null_word >> pi) & 1 != 0;
         // `size()` is already 16 for STRING/BLOB/U128/UUID (all share the wide
         // 16-byte layout), so no per-type width fixup is needed here.
@@ -515,8 +547,15 @@ fn extract_group_key_row<R: GroupKeyRow>(
         // A null payload bit OR a missing backing slot (cursor invariant
         // violation, never on the batch path) both hash as a bare NULL marker
         // — no deref.
-        let bytes = if is_null { None } else { row.payload_bytes(schema, c_idx, cs) };
-        let Some(b) = bytes else { hasher.update(&[0u8]); continue }; // null marker
+        let bytes = if is_null {
+            None
+        } else {
+            row.payload_bytes(schema, c_idx, cs)
+        };
+        let Some(b) = bytes else {
+            hasher.update(&[0u8]);
+            continue;
+        }; // null marker
         hasher.update(&[1u8]); // non-null marker
         if gnitz_wire::is_german_string(tc) {
             // STRING and BLOB both hash length-prefixed content via the shared
@@ -538,7 +577,7 @@ fn extract_group_key_row<R: GroupKeyRow>(
 #[cfg(test)]
 mod index_col_extractor_tests {
     use super::IndexColExtractor;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Batch;
 
     // Compound narrow PK (U32, U32), stride 8: the addressed column must be
@@ -567,7 +606,11 @@ mod index_col_extractor_tests {
         let ex0 = IndexColExtractor::new(&schema, 0);
         let ex1 = IndexColExtractor::new(&schema, 1);
         assert_eq!(ex0.extract(&mb, 0), c0 as u64, "col 0 must be the low U32 only");
-        assert_eq!(ex1.extract(&mb, 0), c1 as u64, "col 1 must be the high U32, not the whole slot");
+        assert_eq!(
+            ex1.extract(&mb, 0),
+            c1 as u64,
+            "col 1 must be the high U32, not the whole slot"
+        );
     }
 
     // Single U64 PK spanning the whole slot: extractor reduces to the old
@@ -625,10 +668,7 @@ mod index_col_extractor_tests {
         // Group key for `le` (native LE bytes) stored as a payload column at
         // idx 1 (U64 PK + tested column), routed by col 1.
         let key_as_payload = |tc: u8, le: &[u8]| -> u128 {
-            let schema = SchemaDescriptor::new(
-                &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)],
-                &[0],
-            );
+            let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0]);
             let pi = schema.try_payload_idx(1).unwrap();
             let mut b = B::with_schema(schema, 1);
             b.extend_pk(0u128);

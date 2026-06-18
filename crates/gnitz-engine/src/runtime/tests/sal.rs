@@ -1,9 +1,8 @@
-use crate::runtime::sal::{
-    sal_write_group, sal_read_group_header, sal_begin_group, SalReader, SalWriter,
-    MAX_WORKERS, FLAG_DDL_SYNC, FLAG_TXN_COMMIT,
-    SAL_STATUS_HAS_DATA, SAL_STATUS_NO_DATA_FOR_WORKER, SAL_STATUS_NO_MESSAGE,
-};
 use crate::foundation::syscall;
+use crate::runtime::sal::{
+    sal_begin_group, sal_read_group_header, sal_write_group, SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_TXN_COMMIT,
+    MAX_WORKERS, SAL_STATUS_HAS_DATA, SAL_STATUS_NO_DATA_FOR_WORKER, SAL_STATUS_NO_MESSAGE,
+};
 
 unsafe fn alloc_mmap(size: usize) -> *mut u8 {
     let ptr = libc::mmap(
@@ -53,10 +52,7 @@ fn test_sal_round_trip() {
             }
         }
 
-        let res = sal_write_group(
-            ptr, 0, nw, 42, 100, 0, 1, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
-        );
+        let res = sal_write_group(ptr, 0, nw, 42, 100, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
         assert_eq!(res.status, 0);
         assert!(res.new_cursor > 0);
 
@@ -71,9 +67,7 @@ fn test_sal_round_trip() {
                 assert_eq!(rr.status, SAL_STATUS_NO_DATA_FOR_WORKER);
             } else {
                 assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
-                let data = std::slice::from_raw_parts(
-                    rr.data_ptr, rr.data_size as usize
-                );
+                let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
                 assert_eq!(data, bufs[w as usize].as_slice());
             }
         }
@@ -95,10 +89,7 @@ fn test_sal_unicast_isolation() {
         ptrs[2] = buf.as_ptr();
         sizes[2] = buf.len() as u32;
 
-        let res = sal_write_group(
-            ptr, 0, nw, 10, 1, 0, 1, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
-        );
+        let res = sal_write_group(ptr, 0, nw, 10, 1, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
         assert_eq!(res.status, 0);
 
         for w in [0u32, 1, 3] {
@@ -129,8 +120,16 @@ fn test_sal_multiple_groups() {
             let sizes = [buf.len() as u32, 0u32];
 
             let res = sal_write_group(
-                ptr, cursor, nw, g as u32, g * 10, 0, 1, size as u64,
-                ptrs.as_ptr(), sizes.as_ptr(),
+                ptr,
+                cursor,
+                nw,
+                g as u32,
+                g * 10,
+                0,
+                1,
+                size as u64,
+                ptrs.as_ptr(),
+                sizes.as_ptr(),
             );
             assert_eq!(res.status, 0);
             cursor = res.new_cursor;
@@ -163,10 +162,7 @@ fn test_sal_epoch_write_read() {
         let ptrs = [buf.as_ptr()];
         let sizes = [buf.len() as u32];
 
-        let res = sal_write_group(
-            ptr, 0, 1, 0, 0, 0, 42, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
-        );
+        let res = sal_write_group(ptr, 0, 1, 0, 0, 0, 42, size as u64, ptrs.as_ptr(), sizes.as_ptr());
         assert_eq!(res.status, 0);
 
         let rr = sal_read_group_header(ptr, 0, 0);
@@ -186,10 +182,7 @@ fn test_sal_full_error() {
         let ptrs = [buf.as_ptr()];
         let sizes = [buf.len() as u32];
 
-        let res = sal_write_group(
-            ptr, 0, 1, 0, 0, 0, 1, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
-        );
+        let res = sal_write_group(ptr, 0, 1, 0, 0, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
         assert_eq!(res.status, -1);
 
         free_mmap(ptr, size);
@@ -209,10 +202,7 @@ fn test_sal_cross_process() {
             let buf = make_test_data(0x77, 128);
             let ptrs = [buf.as_ptr()];
             let sizes = [buf.len() as u32];
-            sal_write_group(
-                ptr, 0, 1, 99, 555, 0, 1, size as u64,
-                ptrs.as_ptr(), sizes.as_ptr(),
-            );
+            sal_write_group(ptr, 0, 1, 99, 555, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
             syscall::eventfd_signal(efd);
             libc::_exit(0);
         }
@@ -243,20 +233,14 @@ fn test_sal_checkpoint_reset() {
         let buf1 = make_test_data(0x11, 32);
         let ptrs = [buf1.as_ptr()];
         let sizes = [buf1.len() as u32];
-        let res = sal_write_group(
-            ptr, 0, 1, 0, 0, 0, 1, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
-        );
+        let res = sal_write_group(ptr, 0, 1, 0, 0, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
         assert_eq!(res.status, 0);
 
         std::ptr::write_bytes(ptr, 0, size);
         let buf2 = make_test_data(0x22, 32);
         let ptrs2 = [buf2.as_ptr()];
         let sizes2 = [buf2.len() as u32];
-        let res2 = sal_write_group(
-            ptr, 0, 1, 0, 0, 0, 2, size as u64,
-            ptrs2.as_ptr(), sizes2.as_ptr(),
-        );
+        let res2 = sal_write_group(ptr, 0, 1, 0, 0, 0, 2, size as u64, ptrs2.as_ptr(), sizes2.as_ptr());
         assert_eq!(res2.status, 0);
 
         let rr = sal_read_group_header(ptr, 0, 0);
@@ -275,12 +259,11 @@ fn sal_begin_group_rejects_too_many_workers() {
         let ptr = alloc_mmap(size);
         let sizes = [0u32; MAX_WORKERS + 1];
         // num_workers = MAX_WORKERS + 1 must return None.
-        let result = sal_begin_group(
-            ptr, 0, size,
-            MAX_WORKERS + 1, 0, 0, 0, 1,
-            &sizes[..MAX_WORKERS + 1],
+        let result = sal_begin_group(ptr, 0, size, MAX_WORKERS + 1, 0, 0, 0, 1, &sizes[..MAX_WORKERS + 1]);
+        assert!(
+            result.is_none(),
+            "sal_begin_group must reject num_workers > MAX_WORKERS"
         );
-        assert!(result.is_none(), "sal_begin_group must reject num_workers > MAX_WORKERS");
         free_mmap(ptr, size);
     }
 }
@@ -292,12 +275,11 @@ fn sal_begin_group_rejects_cursor_overflow() {
         let ptr = alloc_mmap(size);
         // Push the cursor so close to the end that the group header won't fit.
         let sizes = [0u32; 1];
-        let result = sal_begin_group(
-            ptr, size - 1, size,
-            1, 0, 0, 0, 1,
-            &sizes[..1],
+        let result = sal_begin_group(ptr, size - 1, size, 1, 0, 0, 0, 1, &sizes[..1]);
+        assert!(
+            result.is_none(),
+            "sal_begin_group must reject when cursor + total > mmap_size"
         );
-        assert!(result.is_none(), "sal_begin_group must reject when cursor + total > mmap_size");
         free_mmap(ptr, size);
     }
 }
@@ -312,13 +294,18 @@ fn test_sal_epoch_fence() {
         let ptrs = [buf.as_ptr()];
         let sizes = [buf.len() as u32];
 
-        let res1 = sal_write_group(
-            ptr, 0, 1, 0, 0, 0, 5, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
-        );
+        let res1 = sal_write_group(ptr, 0, 1, 0, 0, 0, 5, size as u64, ptrs.as_ptr(), sizes.as_ptr());
         let res2 = sal_write_group(
-            ptr, res1.new_cursor, 1, 0, 0, 0, 6, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
+            ptr,
+            res1.new_cursor,
+            1,
+            0,
+            0,
+            0,
+            6,
+            size as u64,
+            ptrs.as_ptr(),
+            sizes.as_ptr(),
         );
         assert_eq!(res2.status, 0);
 
@@ -345,14 +332,19 @@ fn test_commit_sentinel_round_trip() {
         let buf = make_test_data(0xAA, 32);
         let ptrs = [buf.as_ptr(), buf.as_ptr()];
         let sizes = [buf.len() as u32, buf.len() as u32];
-        let r1 = sal_write_group(
-            ptr, 0, nw, 100, 7, 0, 1, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
-        );
+        let r1 = sal_write_group(ptr, 0, nw, 100, 7, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
         assert_eq!(r1.status, 0);
         let r2 = sal_write_group(
-            ptr, r1.new_cursor, nw, 101, 7, 0, 1, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
+            ptr,
+            r1.new_cursor,
+            nw,
+            101,
+            7,
+            0,
+            1,
+            size as u64,
+            ptrs.as_ptr(),
+            sizes.as_ptr(),
         );
         assert_eq!(r2.status, 0);
 
@@ -368,8 +360,16 @@ fn test_commit_sentinel_round_trip() {
 
         // Trailing group at the next LSN.
         let r4 = sal_write_group(
-            ptr, writer.cursor(), nw, 102, 8, 0, 1, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
+            ptr,
+            writer.cursor(),
+            nw,
+            102,
+            8,
+            0,
+            1,
+            size as u64,
+            ptrs.as_ptr(),
+            sizes.as_ptr(),
         );
         assert_eq!(r4.status, 0);
 
@@ -378,7 +378,7 @@ fn test_commit_sentinel_round_trip() {
         let (m1, c1) = reader.try_read(0).unwrap();
         let (m2, c2) = reader.try_read(c1).unwrap();
         let (m3, c3) = reader.try_read(c2).unwrap();
-        let (m4, _)  = reader.try_read(c3).unwrap();
+        let (m4, _) = reader.try_read(c3).unwrap();
 
         assert_eq!(m1.lsn, 7);
         assert_eq!(m2.lsn, 7);
@@ -417,8 +417,10 @@ fn test_commit_sentinel_zero_payload() {
             let reader = SalReader::new(ptr as *const u8, w, size, efd1);
             let (msg, _) = reader.try_read(0).unwrap();
             assert_eq!(msg.lsn, 123);
-            assert!(msg.wire_data.is_none(),
-                "sentinel must carry no per-worker payload for worker {w}");
+            assert!(
+                msg.wire_data.is_none(),
+                "sentinel must carry no per-worker payload for worker {w}"
+            );
         }
 
         libc::close(efd1);
@@ -446,13 +448,29 @@ fn test_batched_push_shares_zone_lsn() {
         let sizes: Vec<u32> = (0..nw).map(|_| payload.len() as u32).collect();
         // Two push groups at the same LSN.
         let r1 = sal_write_group(
-            ptr, 0, nw, 1000, zone_lsn, FLAG_PUSH, 1, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
+            ptr,
+            0,
+            nw,
+            1000,
+            zone_lsn,
+            FLAG_PUSH,
+            1,
+            size as u64,
+            ptrs.as_ptr(),
+            sizes.as_ptr(),
         );
         assert_eq!(r1.status, 0);
         let r2 = sal_write_group(
-            ptr, r1.new_cursor, nw, 1001, zone_lsn, FLAG_PUSH, 1, size as u64,
-            ptrs.as_ptr(), sizes.as_ptr(),
+            ptr,
+            r1.new_cursor,
+            nw,
+            1001,
+            zone_lsn,
+            FLAG_PUSH,
+            1,
+            size as u64,
+            ptrs.as_ptr(),
+            sizes.as_ptr(),
         );
         assert_eq!(r2.status, 0);
 
@@ -465,7 +483,7 @@ fn test_batched_push_shares_zone_lsn() {
         let reader = SalReader::new(ptr as *const u8, 0, size, efds[0]);
         let (m1, c1) = reader.try_read(0).unwrap();
         let (m2, c2) = reader.try_read(c1).unwrap();
-        let (m3, _)  = reader.try_read(c2).unwrap();
+        let (m3, _) = reader.try_read(c2).unwrap();
         assert_eq!(m1.lsn, zone_lsn);
         assert_eq!(m2.lsn, zone_lsn);
         assert_eq!(m3.lsn, zone_lsn);
@@ -479,17 +497,21 @@ fn test_batched_push_shares_zone_lsn() {
             let mut off = 0u64;
             while (off as usize) + 8 < size {
                 let (msg, next) = match reader.try_read(off) {
-                    Some(v) => v, None => break,
+                    Some(v) => v,
+                    None => break,
                 };
                 off = next;
-                if msg.flags & FLAG_TXN_COMMIT != 0 { set.insert(msg.lsn); }
+                if msg.flags & FLAG_TXN_COMMIT != 0 {
+                    set.insert(msg.lsn);
+                }
             }
             set
         };
-        assert!(committed.contains(&zone_lsn),
-            "sentinel must commit the push zone");
+        assert!(committed.contains(&zone_lsn), "sentinel must commit the push zone");
 
-        for &e in &efds { libc::close(e); }
+        for &e in &efds {
+            libc::close(e);
+        }
         free_mmap(ptr, size);
     }
 }
@@ -513,8 +535,16 @@ fn test_zone_two_groups_one_sentinel() {
         let ptrs_col: Vec<*const u8> = (0..nw).map(|_| buf_col.as_ptr()).collect();
         let sizes_col: Vec<u32> = (0..nw).map(|_| buf_col.len() as u32).collect();
         let r1 = sal_write_group(
-            ptr, 0, nw, 200, zone_lsn, 0, 1, size as u64,
-            ptrs_col.as_ptr(), sizes_col.as_ptr(),
+            ptr,
+            0,
+            nw,
+            200,
+            zone_lsn,
+            0,
+            1,
+            size as u64,
+            ptrs_col.as_ptr(),
+            sizes_col.as_ptr(),
         );
         assert_eq!(r1.status, 0);
 
@@ -522,14 +552,24 @@ fn test_zone_two_groups_one_sentinel() {
         let ptrs_tab: Vec<*const u8> = (0..nw).map(|_| buf_tab.as_ptr()).collect();
         let sizes_tab: Vec<u32> = (0..nw).map(|_| buf_tab.len() as u32).collect();
         let r2 = sal_write_group(
-            ptr, r1.new_cursor, nw, 201, zone_lsn, 0, 1, size as u64,
-            ptrs_tab.as_ptr(), sizes_tab.as_ptr(),
+            ptr,
+            r1.new_cursor,
+            nw,
+            201,
+            zone_lsn,
+            0,
+            1,
+            size as u64,
+            ptrs_tab.as_ptr(),
+            sizes_tab.as_ptr(),
         );
         assert_eq!(r2.status, 0);
 
         // Sentinel.
         let efds: Vec<i32> = (0..nw).map(|_| syscall::eventfd_create()).collect();
-        for &e in &efds { assert!(e >= 0); }
+        for &e in &efds {
+            assert!(e >= 0);
+        }
         let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
         writer.reset(r2.new_cursor, 1);
         writer.write_commit_sentinel(zone_lsn).unwrap();
@@ -539,7 +579,7 @@ fn test_zone_two_groups_one_sentinel() {
             let reader = SalReader::new(ptr as *const u8, w, size, efds[w as usize]);
             let (m1, c1) = reader.try_read(0).unwrap();
             let (m2, c2) = reader.try_read(c1).unwrap();
-            let (m3, _)  = reader.try_read(c2).unwrap();
+            let (m3, _) = reader.try_read(c2).unwrap();
             assert_eq!(m1.lsn, zone_lsn);
             assert_eq!(m2.lsn, zone_lsn);
             assert_eq!(m3.lsn, zone_lsn);
@@ -551,7 +591,9 @@ fn test_zone_two_groups_one_sentinel() {
             assert!(m3.wire_data.is_none(), "sentinel carries no data");
         }
 
-        for &e in &efds { libc::close(e); }
+        for &e in &efds {
+            libc::close(e);
+        }
         free_mmap(ptr, size);
     }
 }
@@ -570,18 +612,23 @@ fn test_two_groups_same_lsn() {
         let buf1 = make_test_data(0x10, 32);
         let ptrs1 = [buf1.as_ptr()];
         let sizes1 = [buf1.len() as u32];
-        let res1 = sal_write_group(
-            ptr, 0, nw, 7, 42, 0, 1, size as u64,
-            ptrs1.as_ptr(), sizes1.as_ptr(),
-        );
+        let res1 = sal_write_group(ptr, 0, nw, 7, 42, 0, 1, size as u64, ptrs1.as_ptr(), sizes1.as_ptr());
         assert_eq!(res1.status, 0);
 
         let buf2 = make_test_data(0x20, 32);
         let ptrs2 = [buf2.as_ptr()];
         let sizes2 = [buf2.len() as u32];
         let res2 = sal_write_group(
-            ptr, res1.new_cursor, nw, 8, 42, 0, 1, size as u64,
-            ptrs2.as_ptr(), sizes2.as_ptr(),
+            ptr,
+            res1.new_cursor,
+            nw,
+            8,
+            42,
+            0,
+            1,
+            size as u64,
+            ptrs2.as_ptr(),
+            sizes2.as_ptr(),
         );
         assert_eq!(res2.status, 0);
 
@@ -610,10 +657,7 @@ fn test_sal_cross_process_checkpoint() {
             let buf = make_test_data(0xAA, 64);
             let ptrs = [buf.as_ptr()];
             let sizes = [buf.len() as u32];
-            sal_write_group(
-                ptr, 0, 1, 0, 10, 0, 1, size as u64,
-                ptrs.as_ptr(), sizes.as_ptr(),
-            );
+            sal_write_group(ptr, 0, 1, 0, 10, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
             syscall::eventfd_signal(efd);
 
             syscall::eventfd_wait(efd2, 5000);
@@ -622,10 +666,7 @@ fn test_sal_cross_process_checkpoint() {
             let buf2 = make_test_data(0xBB, 64);
             let ptrs2 = [buf2.as_ptr()];
             let sizes2 = [buf2.len() as u32];
-            sal_write_group(
-                ptr, 0, 1, 0, 20, 0, 2, size as u64,
-                ptrs2.as_ptr(), sizes2.as_ptr(),
-            );
+            sal_write_group(ptr, 0, 1, 0, 20, 0, 2, size as u64, ptrs2.as_ptr(), sizes2.as_ptr());
             syscall::eventfd_signal(efd);
             libc::_exit(0);
         }

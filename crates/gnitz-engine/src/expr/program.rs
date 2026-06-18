@@ -2,10 +2,8 @@
 //!
 //! Evaluates compiled expression programs against columnar batch rows.
 
-use crate::schema::{
-    german_string_tail, SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL,
-};
 use crate::foundation::codec::read_u32_le;
+use crate::schema::{german_string_tail, SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
 
 gnitz_wire::cast_consts! { pub(crate) i64;
     EXPR_LOAD_COL_INT, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_CONST,
@@ -61,12 +59,7 @@ pub struct ExprProgram {
 }
 
 impl ExprProgram {
-    pub fn new(
-        code: Vec<i64>,
-        num_regs: u32,
-        result_reg: u32,
-        const_strings: Vec<Vec<u8>>,
-    ) -> Self {
+    pub fn new(code: Vec<i64>, num_regs: u32, result_reg: u32, const_strings: Vec<Vec<u8>>) -> Self {
         assert_eq!(
             code.len() % 4,
             0,
@@ -91,7 +84,12 @@ impl ExprProgram {
             const_prefixes.push(compute_prefix(s));
             const_lengths.push(s.len() as u32);
         }
-        gnitz_debug!("expr_program: instrs={} regs={} consts={}", num_instrs, num_regs, const_strings.len());
+        gnitz_debug!(
+            "expr_program: instrs={} regs={} consts={}",
+            num_instrs,
+            num_regs,
+            const_strings.len()
+        );
         let prog = ExprProgram {
             code,
             num_regs,
@@ -122,16 +120,22 @@ impl ExprProgram {
             // payloads) are not register indices and are excluded via the
             // `op_*` predicates.
             if op_writes_dst_reg(op) {
-                assert!(dst >= 0 && dst < nr,
-                    "ExprProgram: dst register {dst} out of range (num_regs={num_regs}) op={op}");
+                assert!(
+                    dst >= 0 && dst < nr,
+                    "ExprProgram: dst register {dst} out of range (num_regs={num_regs}) op={op}"
+                );
             }
             if op_reads_a1(op) {
-                assert!(a1 >= 0 && a1 < nr,
-                    "ExprProgram: a1 register {a1} out of range (num_regs={num_regs}) op={op}");
+                assert!(
+                    a1 >= 0 && a1 < nr,
+                    "ExprProgram: a1 register {a1} out of range (num_regs={num_regs}) op={op}"
+                );
             }
             if op_reads_a2(op) {
-                assert!(a2 >= 0 && a2 < nr,
-                    "ExprProgram: a2 register {a2} out of range (num_regs={num_regs}) op={op}");
+                assert!(
+                    a2 >= 0 && a2 < nr,
+                    "ExprProgram: a2 register {a2} out of range (num_regs={num_regs}) op={op}"
+                );
             }
         }
         prog
@@ -145,8 +149,7 @@ impl ExprProgram {
     /// otherwise dense payload index 0..N-1).
     pub(in crate::expr) fn is_strictly_non_nullable(&self, schema: &crate::schema::SchemaDescriptor) -> bool {
         let nullable_payload = |a: usize| -> bool {
-            a < schema.num_payload_cols()
-                && schema.columns[schema.payload_col_idx(a)].nullable != 0
+            a < schema.num_payload_cols() && schema.columns[schema.payload_col_idx(a)].nullable != 0
         };
         for instr in self.code.chunks_exact(4) {
             let op = instr[0];
@@ -160,11 +163,20 @@ impl ExprProgram {
                 // Column reads: null if the underlying column is nullable.
                 // STR_COL_*_CONST and one-side of STR_COL_*_COL use a1 as the
                 // resolved payload byte; STR_COL_*_COL also uses a2.
-                EXPR_LOAD_PAYLOAD_INT | EXPR_LOAD_PAYLOAD_FLOAT
-                | EXPR_STR_COL_EQ_CONST | EXPR_STR_COL_LT_CONST | EXPR_STR_COL_LE_CONST
-                    if nullable_payload(a1) => return false,
+                EXPR_LOAD_PAYLOAD_INT
+                | EXPR_LOAD_PAYLOAD_FLOAT
+                | EXPR_STR_COL_EQ_CONST
+                | EXPR_STR_COL_LT_CONST
+                | EXPR_STR_COL_LE_CONST
+                    if nullable_payload(a1) =>
+                {
+                    return false
+                }
                 EXPR_STR_COL_EQ_COL | EXPR_STR_COL_LT_COL | EXPR_STR_COL_LE_COL
-                    if nullable_payload(a1) || nullable_payload(a2) => return false,
+                    if nullable_payload(a1) || nullable_payload(a2) =>
+                {
+                    return false
+                }
                 _ => {}
             }
         }
@@ -194,9 +206,13 @@ impl ExprProgram {
         let ok = self.code.chunks_exact(4).enumerate().all(|(i, instr)| {
             instr[0] == EXPR_COPY_COL
                 && instr[2] == base + i as i64   // sources base, base+1, …
-                && instr[3] == i as i64          // destinations 0, 1, 2, …
+                && instr[3] == i as i64 // destinations 0, 1, 2, …
         });
-        if ok { Some(base as usize) } else { None }
+        if ok {
+            Some(base as usize)
+        } else {
+            None
+        }
     }
 
     /// Classify each output-producing instruction in bytecode order.
@@ -225,7 +241,6 @@ impl ExprProgram {
         }
         out_cols
     }
-
 }
 
 /// Classify each output-producing instruction.
@@ -234,20 +249,46 @@ pub(crate) enum OutputColKind {
     /// index, or `PAYLOAD_MAPPING_PK_SENTINEL` when the source is the PK
     /// region — in which case `pk_off` is the byte offset of the addressed
     /// column within the (compound) OPK PK region.
-    CopyCol { src_pi: u8, pk_off: u8 },
+    CopyCol {
+        src_pi: u8,
+        pk_off: u8,
+    },
     Emit(usize),
     EmitNull,
 }
 
 fn is_binary_alu_op(op: i64) -> bool {
-    matches!(op,
-        EXPR_INT_ADD | EXPR_INT_SUB | EXPR_INT_MUL | EXPR_INT_DIV | EXPR_INT_MOD |
-        EXPR_UDIV | EXPR_UMOD |
-        EXPR_FLOAT_ADD | EXPR_FLOAT_SUB | EXPR_FLOAT_MUL | EXPR_FLOAT_DIV |
-        EXPR_CMP_EQ | EXPR_CMP_NE | EXPR_CMP_GT | EXPR_CMP_GE | EXPR_CMP_LT | EXPR_CMP_LE |
-        EXPR_UCMP_GT | EXPR_UCMP_GE | EXPR_UCMP_LT | EXPR_UCMP_LE |
-        EXPR_FCMP_EQ | EXPR_FCMP_NE | EXPR_FCMP_GT | EXPR_FCMP_GE | EXPR_FCMP_LT | EXPR_FCMP_LE |
-        EXPR_BOOL_AND | EXPR_BOOL_OR
+    matches!(
+        op,
+        EXPR_INT_ADD
+            | EXPR_INT_SUB
+            | EXPR_INT_MUL
+            | EXPR_INT_DIV
+            | EXPR_INT_MOD
+            | EXPR_UDIV
+            | EXPR_UMOD
+            | EXPR_FLOAT_ADD
+            | EXPR_FLOAT_SUB
+            | EXPR_FLOAT_MUL
+            | EXPR_FLOAT_DIV
+            | EXPR_CMP_EQ
+            | EXPR_CMP_NE
+            | EXPR_CMP_GT
+            | EXPR_CMP_GE
+            | EXPR_CMP_LT
+            | EXPR_CMP_LE
+            | EXPR_UCMP_GT
+            | EXPR_UCMP_GE
+            | EXPR_UCMP_LT
+            | EXPR_UCMP_LE
+            | EXPR_FCMP_EQ
+            | EXPR_FCMP_NE
+            | EXPR_FCMP_GT
+            | EXPR_FCMP_GE
+            | EXPR_FCMP_LT
+            | EXPR_FCMP_LE
+            | EXPR_BOOL_AND
+            | EXPR_BOOL_OR
     )
 }
 
@@ -306,7 +347,11 @@ impl ExprProgram {
                     let tc = schema.columns[logical_idx].type_code;
                     if schema.is_pk_col(logical_idx) {
                         let signed = crate::schema::is_signed_int(tc);
-                        instr[0] = if signed { EXPR_LOAD_PK_SIGNED_INT } else { EXPR_LOAD_PK_UNSIGNED_INT };
+                        instr[0] = if signed {
+                            EXPR_LOAD_PK_SIGNED_INT
+                        } else {
+                            EXPR_LOAD_PK_UNSIGNED_INT
+                        };
                         let offset = schema.pk_byte_offset(logical_idx) as u64;
                         let size = schema.columns[logical_idx].size() as u64;
                         instr[2] = ((offset << 16) | (size << 8) | tc as u64) as i64;
@@ -341,8 +386,11 @@ impl ExprProgram {
                         instr[2] = schema.payload_mapping_byte(logical_idx) as i64;
                     }
                 }
-                EXPR_IS_NULL | EXPR_IS_NOT_NULL
-                | EXPR_STR_COL_EQ_CONST | EXPR_STR_COL_LT_CONST | EXPR_STR_COL_LE_CONST => {
+                EXPR_IS_NULL
+                | EXPR_IS_NOT_NULL
+                | EXPR_STR_COL_EQ_CONST
+                | EXPR_STR_COL_LT_CONST
+                | EXPR_STR_COL_LE_CONST => {
                     instr[2] = schema.payload_mapping_byte(instr[2] as usize) as i64;
                 }
                 EXPR_STR_COL_EQ_COL | EXPR_STR_COL_LT_COL | EXPR_STR_COL_LE_COL => {
@@ -391,9 +439,8 @@ impl ExprProgram {
             }
         }
         self.payload_col_info.clear();
-        self.payload_col_info.extend(
-            schema.payload_columns().map(|(_, _, col)| (col.size(), col.type_code))
-        );
+        self.payload_col_info
+            .extend(schema.payload_columns().map(|(_, _, col)| (col.size(), col.type_code)));
         self.resolved = true;
         // Default to map-context masks. The bool-bits reads in the BOOL_AND/OR
         // nullable arms require `bool_input_mask` to be populated by the
@@ -478,14 +525,36 @@ impl ExprProgram {
 
 #[inline]
 fn is_bool_producer(op: i64) -> bool {
-    matches!(op,
-        EXPR_CMP_EQ | EXPR_CMP_NE | EXPR_CMP_GT | EXPR_CMP_GE | EXPR_CMP_LT | EXPR_CMP_LE |
-        EXPR_UCMP_GT | EXPR_UCMP_GE | EXPR_UCMP_LT | EXPR_UCMP_LE |
-        EXPR_FCMP_EQ | EXPR_FCMP_NE | EXPR_FCMP_GT | EXPR_FCMP_GE | EXPR_FCMP_LT | EXPR_FCMP_LE |
-        EXPR_STR_COL_EQ_CONST | EXPR_STR_COL_LT_CONST | EXPR_STR_COL_LE_CONST |
-        EXPR_STR_COL_EQ_COL | EXPR_STR_COL_LT_COL | EXPR_STR_COL_LE_COL |
-        EXPR_IS_NULL | EXPR_IS_NOT_NULL |
-        EXPR_BOOL_AND | EXPR_BOOL_OR | EXPR_BOOL_NOT)
+    matches!(
+        op,
+        EXPR_CMP_EQ
+            | EXPR_CMP_NE
+            | EXPR_CMP_GT
+            | EXPR_CMP_GE
+            | EXPR_CMP_LT
+            | EXPR_CMP_LE
+            | EXPR_UCMP_GT
+            | EXPR_UCMP_GE
+            | EXPR_UCMP_LT
+            | EXPR_UCMP_LE
+            | EXPR_FCMP_EQ
+            | EXPR_FCMP_NE
+            | EXPR_FCMP_GT
+            | EXPR_FCMP_GE
+            | EXPR_FCMP_LT
+            | EXPR_FCMP_LE
+            | EXPR_STR_COL_EQ_CONST
+            | EXPR_STR_COL_LT_CONST
+            | EXPR_STR_COL_LE_CONST
+            | EXPR_STR_COL_EQ_COL
+            | EXPR_STR_COL_LT_COL
+            | EXPR_STR_COL_LE_COL
+            | EXPR_IS_NULL
+            | EXPR_IS_NOT_NULL
+            | EXPR_BOOL_AND
+            | EXPR_BOOL_OR
+            | EXPR_BOOL_NOT
+    )
 }
 
 #[inline]
@@ -500,18 +569,44 @@ fn is_binary_bool_consumer(op: i64) -> bool {
 
 #[inline]
 fn is_binary_reg_reader(op: i64) -> bool {
-    matches!(op,
-        EXPR_INT_ADD | EXPR_INT_SUB | EXPR_INT_MUL | EXPR_INT_DIV | EXPR_INT_MOD |
-        EXPR_UDIV | EXPR_UMOD |
-        EXPR_FLOAT_ADD | EXPR_FLOAT_SUB | EXPR_FLOAT_MUL | EXPR_FLOAT_DIV |
-        EXPR_CMP_EQ | EXPR_CMP_NE | EXPR_CMP_GT | EXPR_CMP_GE | EXPR_CMP_LT | EXPR_CMP_LE |
-        EXPR_UCMP_GT | EXPR_UCMP_GE | EXPR_UCMP_LT | EXPR_UCMP_LE |
-        EXPR_FCMP_EQ | EXPR_FCMP_NE | EXPR_FCMP_GT | EXPR_FCMP_GE | EXPR_FCMP_LT | EXPR_FCMP_LE)
+    matches!(
+        op,
+        EXPR_INT_ADD
+            | EXPR_INT_SUB
+            | EXPR_INT_MUL
+            | EXPR_INT_DIV
+            | EXPR_INT_MOD
+            | EXPR_UDIV
+            | EXPR_UMOD
+            | EXPR_FLOAT_ADD
+            | EXPR_FLOAT_SUB
+            | EXPR_FLOAT_MUL
+            | EXPR_FLOAT_DIV
+            | EXPR_CMP_EQ
+            | EXPR_CMP_NE
+            | EXPR_CMP_GT
+            | EXPR_CMP_GE
+            | EXPR_CMP_LT
+            | EXPR_CMP_LE
+            | EXPR_UCMP_GT
+            | EXPR_UCMP_GE
+            | EXPR_UCMP_LT
+            | EXPR_UCMP_LE
+            | EXPR_FCMP_EQ
+            | EXPR_FCMP_NE
+            | EXPR_FCMP_GT
+            | EXPR_FCMP_GE
+            | EXPR_FCMP_LT
+            | EXPR_FCMP_LE
+    )
 }
 
 #[inline]
 fn is_unary_reg_reader(op: i64) -> bool {
-    matches!(op, EXPR_INT_NEG | EXPR_FLOAT_NEG | EXPR_INT_TO_FLOAT | EXPR_UINT_TO_FLOAT | EXPR_EMIT)
+    matches!(
+        op,
+        EXPR_INT_NEG | EXPR_FLOAT_NEG | EXPR_INT_TO_FLOAT | EXPR_UINT_TO_FLOAT | EXPR_EMIT
+    )
 }
 
 /// True iff `instr[1]` (dst) is a register index. COPY_COL/EMIT/EMIT_NULL put

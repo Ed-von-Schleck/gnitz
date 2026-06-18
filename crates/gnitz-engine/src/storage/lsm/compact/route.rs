@@ -4,12 +4,12 @@
 
 use std::ffi::CStr;
 
-use super::super::error::StorageError;
 use super::super::batch::Batch;
+use super::super::error::StorageError;
 use super::super::merge::BlobCacheGuard;
 use super::super::shard_file::PkUniqueChecker;
-use crate::schema::SchemaDescriptor;
 use super::merge::open_and_merge;
+use crate::schema::SchemaDescriptor;
 
 // ---------------------------------------------------------------------------
 // Guard output result (returned from merge_and_route)
@@ -59,9 +59,7 @@ pub fn compact_shards(
         if can_tag_pk_unique {
             checker.observe(pk_bytes, weight);
         }
-        batch.append_row_from_source_bytes(
-            pk_bytes, weight, shard, row, blob_cache.get_mut(),
-        );
+        batch.append_row_from_source_bytes(pk_bytes, weight, shard, row, blob_cache.get_mut());
     })?;
     batch.write_as_shard_with_flags(output_file, table_id, checker.flags_if(can_tag_pk_unique))
 }

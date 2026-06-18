@@ -86,10 +86,8 @@ impl CatalogEngine {
             // No cache/side-effect reactions: sequences are master-only
             // bookkeeping, and the circuit graph is loaded by `load_circuit`,
             // not by hooks.
-            SysFamily::Sequence
-            | SysFamily::CircuitNodes
-            | SysFamily::CircuitEdges
-            | SysFamily::CircuitNodeColumns => {}
+            SysFamily::Sequence | SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => {
+            }
         }
         Ok(())
     }
@@ -177,10 +175,17 @@ impl CatalogEngine {
             (NUM_PARTITIONS, self.active_part_end)
         };
         let mut pt = PartitionedTable::new(
-            directory, name, schema, id as u32, num_parts,
-            kind.persistence(), part_start, part_end,
+            directory,
+            name,
+            schema,
+            id as u32,
+            num_parts,
+            kind.persistence(),
+            part_start,
+            part_end,
             partition_arena_size(num_parts),
-        ).map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))?;
+        )
+        .map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))?;
         if kind.is_base_table() {
             // Tag base-table shards as PkUnique so the read cursor can skip
             // payload comparison on a cross-source PK tie. Every base table
@@ -201,7 +206,9 @@ impl CatalogEngine {
                 // System tables are pre-registered by `register_system_table_families`
                 // before `replay_catalog` fires hooks, so their rows show up here
                 // with the DAG already populated. Skip to avoid double-registration.
-                if self.dag.tables.contains_key(&tid) { continue; }
+                if self.dag.tables.contains_key(&tid) {
+                    continue;
+                }
 
                 let sid = self.read_batch_u64(batch, i, 0) as i64;
                 let name = self.read_batch_string(batch, i, 1);
@@ -247,7 +254,10 @@ impl CatalogEngine {
                     return Err(format!(
                         "catalog invariant violated: table '{}' (tid={}) has {} column defs (max {}); \
                          type_codes={:?}",
-                        name, tid, col_defs.len(), crate::schema::MAX_COLUMNS,
+                        name,
+                        tid,
+                        col_defs.len(),
+                        crate::schema::MAX_COLUMNS,
                         col_defs.iter().map(|c| c.type_code).collect::<Vec<_>>(),
                     ));
                 }
@@ -261,19 +271,33 @@ impl CatalogEngine {
                 // One kind drives the whole property bundle: durability and
                 // Pk-unique tagging.
                 let kind = RelationKind::BaseTable { unique_pk: is_unique };
-                gnitz_debug!("catalog: creating table dir={} name={} tid={} parts={}", directory, name, tid, NUM_PARTITIONS);
+                gnitz_debug!(
+                    "catalog: creating table dir={} name={} tid={} parts={}",
+                    directory,
+                    name,
+                    tid,
+                    NUM_PARTITIONS
+                );
                 // Pre-stage for cleanup so that if Stage-A fails after the table
                 // directory is created, compensate_stage_a's drain removes it.
                 let cleanup_idx = self.pending_dir_deletions.len();
                 self.pending_dir_deletions.push(directory.clone());
-                let pt = self.build_partitioned_storage(
-                    kind, &directory, &name, tid, tbl_schema, is_replicated)?;
+                let pt = self.build_partitioned_storage(kind, &directory, &name, tid, tbl_schema, is_replicated)?;
                 // Success: remove the pre-staged entry.
                 self.pending_dir_deletions.truncate(cleanup_idx);
 
                 fsync_dir(&schema_dir(&self.base_dir, &schema_name));
-                self.dag.register_table(tid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))), tbl_schema, kind, 0, directory);
-                if tid + 1 > self.next_table_id { self.next_table_id = tid + 1; }
+                self.dag.register_table(
+                    tid,
+                    StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt))),
+                    tbl_schema,
+                    kind,
+                    0,
+                    directory,
+                );
+                if tid + 1 > self.next_table_id {
+                    self.next_table_id = tid + 1;
+                }
             } else if let Some(directory) = self.dag.tables.get(&tid).map(|e| e.directory.clone()) {
                 // Safe to cascade unconditionally: precheck_sys_ingest rejects
                 // FK/view-dep-blocked drops before the -1 row reaches the WAL.
@@ -323,7 +347,8 @@ impl CatalogEngine {
     fn cascade_retract_columns(&mut self, owner_id: i64) -> Result<(), String> {
         let schema = sys_tab_schema(COL_TAB_ID);
         let batch = retract_rows_in_pk_range(
-            &self.sys_columns, &schema,
+            &self.sys_columns,
+            &schema,
             pack_column_id(owner_id, 0) as u128,
             pack_column_id(owner_id + 1, 0) as u128,
         );
@@ -341,7 +366,9 @@ impl CatalogEngine {
             if weight > 0 {
                 // See hook_table_register: system tables are pre-registered, user
                 // views are not, so this only skips re-registration on replay.
-                if self.dag.tables.contains_key(&vid) { continue; }
+                if self.dag.tables.contains_key(&vid) {
+                    continue;
+                }
 
                 let sid = self.read_batch_u64(batch, i, 0) as i64;
                 let name = self.read_batch_string(batch, i, 1);
@@ -371,16 +398,19 @@ impl CatalogEngine {
                     return Err(format!(
                         "catalog invariant violated: view '{}' (vid={}) has {} column defs (max {}); \
                          type_codes={:?}",
-                        name, vid, col_defs.len(), crate::schema::MAX_COLUMNS,
-                        col_defs.iter().map(|c| c.type_code).collect::<Vec<_>>()));
+                        name,
+                        vid,
+                        col_defs.len(),
+                        crate::schema::MAX_COLUMNS,
+                        col_defs.iter().map(|c| c.type_code).collect::<Vec<_>>()
+                    ));
                 }
 
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let directory = view_dir(&self.base_dir, &schema_name, &name, vid);
                 // Views are not distributed by a chosen key (§2): `0` is the
                 // full-PK default sentinel every non-CLUSTER BY caller passes.
-                let view_schema =
-                    self.build_schema_from_col_defs(&col_defs, pk.as_slice(), 0);
+                let view_schema = self.build_schema_from_col_defs(&col_defs, pk.as_slice(), 0);
 
                 // See hook_table_register: one kind drives the bundle.
                 let kind = RelationKind::View;
@@ -396,22 +426,33 @@ impl CatalogEngine {
                 // circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
                 // so `get_source_ids` resolves here.
                 let source_ids = self.dag.get_source_ids(vid);
-                let has_replicated_source = source_ids.iter()
+                let has_replicated_source = source_ids
+                    .iter()
                     .any(|id| self.dag.tables.get(id).is_some_and(|e| e.schema.replicated()));
                 let cleanup_idx = self.pending_dir_deletions.len();
                 self.pending_dir_deletions.push(directory.clone());
-                let et = self.build_partitioned_storage(
-                    kind, &directory, &name, vid, view_schema, has_replicated_source)?;
+                let et =
+                    self.build_partitioned_storage(kind, &directory, &name, vid, view_schema, has_replicated_source)?;
                 self.pending_dir_deletions.truncate(cleanup_idx);
 
-                let max_depth = source_ids.iter()
+                let max_depth = source_ids
+                    .iter()
                     .filter_map(|id| self.dag.tables.get(id))
                     .map(|e| e.depth + 1)
                     .max()
                     .unwrap_or(0);
 
-                self.dag.register_table(vid, StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(et))), view_schema, kind, max_depth, directory);
-                if vid + 1 > self.next_table_id { self.next_table_id = vid + 1; }
+                self.dag.register_table(
+                    vid,
+                    StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(et))),
+                    view_schema,
+                    kind,
+                    max_depth,
+                    directory,
+                );
+                if vid + 1 > self.next_table_id {
+                    self.next_table_id = vid + 1;
+                }
 
                 // During DROP VIEW rollback the partition files are intact; re-pushing
                 // source rows through the circuit would double every aggregation.
@@ -476,7 +517,9 @@ impl CatalogEngine {
             if !cols.is_well_formed() {
                 return Err(format!(
                     "Index: column list count {} out of range 1..={}",
-                    cols.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS));
+                    cols.decoded_count(),
+                    gnitz_wire::PK_LIST_MAX_COLS
+                ));
             }
             let is_unique = self.read_batch_u64(batch, i, 4) != 0;
 
@@ -494,8 +537,15 @@ impl CatalogEngine {
                 // is order-independent (the circuit is unique iff ANY index on the
                 // column list is unique), so replay reconstructs an identical
                 // result regardless of index_id ordering.
-                let incumbent_unique = self.dag.tables.get(&owner_id)
-                    .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols.as_slice()))
+                let incumbent_unique = self
+                    .dag
+                    .tables
+                    .get(&owner_id)
+                    .and_then(|e| {
+                        e.index_circuits
+                            .iter()
+                            .find(|ic| ic.col_indices.as_slice() == cols.as_slice())
+                    })
                     .map(|ic| ic.is_unique);
                 if let Some(was_unique) = incumbent_unique {
                     if is_unique && !was_unique {
@@ -504,7 +554,10 @@ impl CatalogEngine {
                     continue;
                 }
 
-                let entry = self.dag.tables.get(&owner_id)
+                let entry = self
+                    .dag
+                    .tables
+                    .get(&owner_id)
                     .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
                 // Boot replay and worker ddl_sync reach this hook without
                 // precheck_sys_ingest, so re-reject a non-base-table owner
@@ -521,8 +574,12 @@ impl CatalogEngine {
                 // row could name an out-of-range or ineligible column).
                 let idx_schema = make_index_schema(cols.as_slice(), &owner_schema)?;
 
-                let owner_dir = self.dag.tables.get(&owner_id)
-                    .map(|e| e.directory.clone()).unwrap_or_default();
+                let owner_dir = self
+                    .dag
+                    .tables
+                    .get(&owner_id)
+                    .map(|e| e.directory.clone())
+                    .unwrap_or_default();
                 let idx_dir = index_dir(&owner_dir, idx_id);
 
                 // Pre-stage before Table::new so that if backfill_index fails the
@@ -532,16 +589,22 @@ impl CatalogEngine {
                 self.pending_dir_deletions.push(idx_dir.clone());
 
                 let idx_table = Table::new(
-                    &idx_dir, &format!("_idx_{idx_id}"), idx_schema, idx_id as u32,
-                    SYS_TABLE_ARENA, Persistence::Ephemeral,
-                ).map_err(|e| format!("Failed to create index table: error {e}"))?;
+                    &idx_dir,
+                    &format!("_idx_{idx_id}"),
+                    idx_schema,
+                    idx_id as u32,
+                    SYS_TABLE_ARENA,
+                    Persistence::Ephemeral,
+                )
+                .map_err(|e| format!("Failed to create index table: error {e}"))?;
 
                 let mut idx_table_box = Box::new(idx_table);
                 let idx_table_ptr = &mut *idx_table_box as *mut Table;
                 if !self.ctx.in_rollback() {
                     self.backfill_index(owner_id, cols.as_slice(), is_unique, idx_table_ptr, &idx_schema)?;
                 }
-                self.dag.add_index_circuit(owner_id, cols.as_slice(), idx_id, idx_table_box, idx_schema, is_unique);
+                self.dag
+                    .add_index_circuit(owner_id, cols.as_slice(), idx_id, idx_table_box, idx_schema, is_unique);
 
                 // Only truncate after all fallible steps succeed.
                 self.pending_dir_deletions.truncate(cleanup_idx);
@@ -550,17 +613,18 @@ impl CatalogEngine {
                 // sys_indices (the -1 row has already been applied to sys_indices
                 // by ingest_to_family before fire_hooks runs, so its net weight is
                 // 0 and the scan skips it).
-                let (has_any, remains_unique) =
-                    self.check_remaining_index_uniqueness(owner_id, cols.as_slice());
+                let (has_any, remains_unique) = self.check_remaining_index_uniqueness(owner_id, cols.as_slice());
                 if has_any {
                     // Another index (e.g. the FK auto-index) still covers this
                     // column list. Demote the circuit rather than destroying it.
-                    self.dag.set_index_circuit_uniqueness(owner_id, cols.as_slice(), remains_unique);
-                } else if let Some((owner_dir, creating_idx_id)) = self.dag.tables.get(&owner_id)
-                    .and_then(|e| e.index_circuits.iter()
+                    self.dag
+                        .set_index_circuit_uniqueness(owner_id, cols.as_slice(), remains_unique);
+                } else if let Some((owner_dir, creating_idx_id)) = self.dag.tables.get(&owner_id).and_then(|e| {
+                    e.index_circuits
+                        .iter()
                         .find(|ic| ic.col_indices.as_slice() == cols.as_slice())
-                        .map(|ic| (e.directory.clone(), ic.index_id)))
-                {
+                        .map(|ic| (e.directory.clone(), ic.index_id))
+                }) {
                     // No index remains on the column list — drop the circuit. Use
                     // the creating index_id for the directory path, not the dropped
                     // index_id: when a second index promoted an incumbent circuit,
@@ -577,9 +641,7 @@ impl CatalogEngine {
     /// ingest_to_family before fire_hooks runs) to find any remaining index rows
     /// on `owner_id` / `col_idx`. Returns `(has_any, remains_unique)` to drive
     /// circuit demotion or deletion in `hook_index_register`'s retraction branch.
-    fn check_remaining_index_uniqueness(
-        &self, owner_id: i64, cols: &[u32],
-    ) -> (bool, bool) {
+    fn check_remaining_index_uniqueness(&self, owner_id: i64, cols: &[u32]) -> (bool, bool) {
         let mut has_any = false;
         let mut remains_unique = false;
         self.for_each_index_on_cols(owner_id, cols, |_row_id, is_uniq| {
@@ -594,10 +656,14 @@ impl CatalogEngine {
         // table; running hook_cascade_fk here would allocate new index IDs for FK
         // indices that conflict with the IDX +1 rows the topological replay
         // restores a moment later.
-        if self.ctx.in_rollback() { return Ok(()); }
+        if self.ctx.in_rollback() {
+            return Ok(());
+        }
         for i in 0..batch.count {
             let weight = batch.get_weight(i);
-            if weight <= 0 { continue; }
+            if weight <= 0 {
+                continue;
+            }
             let tid = batch.get_pk(i) as i64;
             if self.ctx.is_live() && self.dag.tables.contains_key(&tid) {
                 self.create_fk_indices(tid)?;

@@ -42,8 +42,7 @@ fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
     (pk, payload)
         // (type_code, nullable, is_pk); PK columns are non-nullable.
         .prop_map(|(pk_types, payloads)| {
-            let mut specs: Vec<(u8, u8, bool)> =
-                pk_types.into_iter().map(|tc| (tc, 0u8, true)).collect();
+            let mut specs: Vec<(u8, u8, bool)> = pk_types.into_iter().map(|tc| (tc, 0u8, true)).collect();
             specs.extend(payloads.into_iter().map(|(tc, n)| (tc, n, false)));
             specs
         })
@@ -88,8 +87,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
     // (= row ordinal). That keeps PKs distinct (the ordinal `< n ≤ 64 < 256 ≤
     // 2^(8·width)` of the narrowest column, so no truncation collision) and,
     // for wide PKs, makes every row share a `≥ 16`-byte OPK prefix.
-    let leading: Vec<u128> =
-        (0..pk_count.saturating_sub(1)).map(|_| rng.gen_u128()).collect();
+    let leading: Vec<u128> = (0..pk_count.saturating_sub(1)).map(|_| rng.gen_u128()).collect();
 
     for i in 0..n {
         // PK: fixed leading columns + trailing ordinal. extend_pk_opk OPK-encodes
@@ -204,7 +202,11 @@ fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
 // on ingest) and all_shard_arcs returns `Vec<Rc<MappedShard>>` (single-threaded
 // — Rc, not Arc), so every test binds `let mut table`.
 fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> Table {
-    let p = if durable { Persistence::Durable } else { Persistence::Ephemeral };
+    let p = if durable {
+        Persistence::Durable
+    } else {
+        Persistence::Ephemeral
+    };
     Table::new(dir.to_str().unwrap(), "t", schema, 1, 1 << 20, p).unwrap()
 }
 

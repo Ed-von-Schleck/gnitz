@@ -9,7 +9,7 @@ mod sort;
 #[cfg(test)]
 mod tests;
 
-pub use agg::{AggDescriptor, AggOp};
 pub(crate) use agg::is_single_col_natural_pk;
+pub use agg::{AggDescriptor, AggOp};
 pub use op_gather::op_gather_reduce;
 pub use op_reduce::op_reduce;

@@ -10,9 +10,7 @@ impl CatalogEngine {
     /// dedup).  Used by multi-worker push where the worker needs the effective
     /// batch for later DAG evaluation but does NOT evaluate immediately.
     /// System tables are NOT supported (use `ingest_to_family` for those).
-    pub fn ingest_returning_effective(
-        &mut self, table_id: i64, batch: Batch,
-    ) -> Result<Batch, String> {
+    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> Result<Batch, String> {
         if table_id < FIRST_USER_TABLE_ID {
             return Err("ingest_returning_effective not supported for system tables".to_string());
         }
@@ -31,7 +29,9 @@ impl CatalogEngine {
         let schema = if table_id < FIRST_USER_TABLE_ID {
             sys_tab_schema(table_id)
         } else {
-            self.dag.tables.get(&table_id)
+            self.dag
+                .tables
+                .get(&table_id)
                 .map(|e| e.schema)
                 .ok_or_else(|| format!("Unknown table_id {table_id}"))?
         };
@@ -48,7 +48,9 @@ impl CatalogEngine {
         let schema = if table_id < FIRST_USER_TABLE_ID {
             sys_tab_schema(table_id)
         } else {
-            self.dag.tables.get(&table_id)
+            self.dag
+                .tables
+                .get(&table_id)
                 .map(|e| e.schema)
                 .ok_or_else(|| format!("Unknown table_id {table_id}"))?
         };
@@ -67,7 +69,9 @@ impl CatalogEngine {
         };
 
         let (opk, stride) = crate::storage::opk_key(&schema, pk);
-        if !cursor.cursor.seek_exact_live(&opk[..stride]) { return Ok(None); }
+        if !cursor.cursor.seek_exact_live(&opk[..stride]) {
+            return Ok(None);
+        }
 
         let mut batch = Batch::with_schema(schema, 1);
         self.copy_cursor_row_to_batch(&cursor, &mut batch);
@@ -82,7 +86,9 @@ impl CatalogEngine {
         let schema = if table_id < FIRST_USER_TABLE_ID {
             sys_tab_schema(table_id)
         } else {
-            self.dag.tables.get(&table_id)
+            self.dag
+                .tables
+                .get(&table_id)
                 .map(|e| e.schema)
                 .ok_or_else(|| format!("Unknown table_id {table_id}"))?
         };
@@ -96,7 +102,9 @@ impl CatalogEngine {
             self.dag.tables.get(&table_id).unwrap().handle.open_cursor()
         };
 
-        if !cursor.cursor.seek_exact_live(pk) { return Ok(None); }
+        if !cursor.cursor.seek_exact_live(pk) {
+            return Ok(None);
+        }
 
         let mut batch = Batch::with_schema(schema, 1);
         self.copy_cursor_row_to_batch(&cursor, &mut batch);
@@ -125,7 +133,10 @@ impl CatalogEngine {
         pks: &[crate::storage::PkBuf],
         project: &[u8],
     ) -> Result<Batch, String> {
-        let schema = self.dag.tables.get(&table_id)
+        let schema = self
+            .dag
+            .tables
+            .get(&table_id)
             .map(|e| e.schema)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
         let result_schema = project_schema(&schema, project);
@@ -153,13 +164,21 @@ impl CatalogEngine {
     /// whose trailing indexed columns are all non-NULL — the SQL planner must
     /// not serve a prefix predicate from an index whose uncovered trailing
     /// columns are nullable.
-    pub fn seek_by_index(&mut self, table_id: i64, col_indices: &[u32], natives: &[u128])
-        -> Result<Option<Batch>, String>
-    {
-        let entry = self.dag.tables.get(&table_id)
+    pub fn seek_by_index(
+        &mut self,
+        table_id: i64,
+        col_indices: &[u32],
+        natives: &[u128],
+    ) -> Result<Option<Batch>, String> {
+        let entry = self
+            .dag
+            .tables
+            .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
 
-        let ic = entry.index_circuits.iter()
+        let ic = entry
+            .index_circuits
+            .iter()
             .find(|ic| ic.col_indices.as_slice() == col_indices)
             .ok_or_else(|| format!("No index on cols {col_indices:?} for table {table_id}"))?;
 
@@ -172,8 +191,7 @@ impl CatalogEngine {
         // index column; the index PK region is OPK-at-rest, so the prefix is
         // order-preserving and matches stored entries (`batch_project_index`
         // encodes through the same spec).
-        let spec = crate::schema::IndexKeySpec::new(
-            &col_indices[..natives.len()], &src_schema, &ic.index_schema);
+        let spec = crate::schema::IndexKeySpec::new(&col_indices[..natives.len()], &src_schema, &ic.index_schema);
         let (opk, prefix_len) = spec.seek_prefix(natives);
         let opk_prefix = &opk[..prefix_len];
 
@@ -200,7 +218,8 @@ impl CatalogEngine {
         while hit {
             let cur_pk = idx_cursor.cursor.current_pk_bytes();
             pks.push(crate::storage::PkBuf::from_bytes(
-                &cur_pk[idx_key_size..idx_key_size + src_pk_stride]));
+                &cur_pk[idx_key_size..idx_key_size + src_pk_stride],
+            ));
             idx_cursor.cursor.advance();
             hit = idx_cursor.cursor.walk_to_positive_with_prefix(opk_prefix);
         }
@@ -241,7 +260,8 @@ impl CatalogEngine {
     ) -> Option<Batch> {
         debug_assert!(
             pks.windows(2).all(|w| w[0] <= w[1]),
-            "resolve_source_pks requires ascending PKs for the monotone sweep");
+            "resolve_source_pks requires ascending PKs for the monotone sweep"
+        );
         if pks.is_empty() {
             return None;
         }
@@ -296,9 +316,14 @@ impl CatalogEngine {
     ) -> Result<Option<Batch>, String> {
         use gnitz_wire::Cut;
 
-        let entry = self.dag.tables.get(&table_id)
+        let entry = self
+            .dag
+            .tables
+            .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
-        let ic = entry.index_circuits.iter()
+        let ic = entry
+            .index_circuits
+            .iter()
             .find(|ic| ic.col_indices.as_slice() == col_indices)
             .ok_or_else(|| format!("No index on cols {col_indices:?} for table {table_id}"))?;
 
@@ -315,14 +340,16 @@ impl CatalogEngine {
         if n_eq >= col_indices.len() {
             return Err(format!(
                 "seek_by_index_range: n_eq {n_eq} has no range column within index \
-                 arity {} on cols {col_indices:?}", col_indices.len()));
+                 arity {} on cols {col_indices:?}",
+                col_indices.len()
+            ));
         }
 
-        let src_schema    = entry.schema;
+        let src_schema = entry.schema;
         let src_pk_stride = src_schema.pk_stride() as usize;
-        let idx_pk_stride = ic.index_schema.pk_stride() as usize;       // leading + source PK
-        let idx_key_size  = ic.index_schema.leading_key_size(col_indices.len());
-        let prefix_len    = ic.index_schema.leading_key_size(n_eq + 1); // eq prefix + range slot
+        let idx_pk_stride = ic.index_schema.pk_stride() as usize; // leading + source PK
+        let idx_key_size = ic.index_schema.leading_key_size(col_indices.len());
+        let prefix_len = ic.index_schema.leading_key_size(n_eq + 1); // eq prefix + range slot
 
         // Every cut key is `pad(group(v))` or its successor for a full
         // (n_eq + 1)-column group key, so one IndexKeySpec over the equality
@@ -332,8 +359,7 @@ impl CatalogEngine {
         // bounds every index schema's pk_stride (asserted in
         // SchemaDescriptor::new), and `seek_prefix` leaves the bytes past
         // `prefix_len` zero, so `group(v)` IS `pad(group(v))`.
-        let spec = crate::schema::IndexKeySpec::new(
-            &col_indices[..=n_eq], &src_schema, &ic.index_schema);
+        let spec = crate::schema::IndexKeySpec::new(&col_indices[..=n_eq], &src_schema, &ic.index_schema);
         let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
         natives[..n_eq].copy_from_slice(eq_natives);
         // Cut → byte key, `None` = `+∞`. `After` steps to the byte successor of
@@ -346,7 +372,7 @@ impl CatalogEngine {
             let mut k = spec.seek_prefix(&natives[..=n_eq]).0;
             match c {
                 Cut::Before(_) => Some(k),
-                Cut::After(_)  => crate::storage::increment_key_in_place(&mut k[..prefix_len]).then_some(k),
+                Cut::After(_) => crate::storage::increment_key_in_place(&mut k[..prefix_len]).then_some(k),
             }
         };
         let (start, end) = (cut_key(range.start), cut_key(range.end));
@@ -368,10 +394,13 @@ impl CatalogEngine {
         idx_cursor.cursor.seek_bytes(&start[..idx_pk_stride]);
         while idx_cursor.cursor.valid {
             let cur_pk = idx_cursor.cursor.current_pk_bytes();
-            if end.is_some_and(|e| cur_pk >= e) { break; }
+            if end.is_some_and(|e| cur_pk >= e) {
+                break;
+            }
             if idx_cursor.cursor.current_weight > 0 {
                 pks.push(crate::storage::PkBuf::from_bytes(
-                    &cur_pk[idx_key_size..idx_key_size + src_pk_stride]));
+                    &cur_pk[idx_key_size..idx_key_size + src_pk_stride],
+                ));
             }
             idx_cursor.cursor.advance();
         }
@@ -394,7 +423,9 @@ impl CatalogEngine {
                 // Compact so L0 shards don't accumulate without bound across
                 // DDL-heavy sessions (system catalog tables are scanned on every
                 // boot and DDL op).
-                table.compact_if_needed().map_err(|e| format!("compaction error: {e:?}"))?;
+                table
+                    .compact_if_needed()
+                    .map_err(|e| format!("compaction error: {e:?}"))?;
             }
             Ok(())
         } else {
@@ -409,14 +440,13 @@ impl CatalogEngine {
 
     /// Phase 1 across a table family. System tables flush inline (legacy
     /// path; they checkpoint during DDL, not at `flush_all`).
-    pub fn flush_family_prepare(
-        &mut self,
-        table_id: i64,
-    ) -> Result<Vec<(usize, crate::storage::FlushWork)>, String> {
+    pub fn flush_family_prepare(&mut self, table_id: i64) -> Result<Vec<(usize, crate::storage::FlushWork)>, String> {
         if table_id < FIRST_USER_TABLE_ID {
             if let Some(table) = self.sys_table_mut(table_id) {
                 table.flush().map_err(|e| format!("flush error: {e}"))?;
-                table.compact_if_needed().map_err(|e| format!("compaction error: {e:?}"))?;
+                table
+                    .compact_if_needed()
+                    .map_err(|e| format!("compaction error: {e:?}"))?;
             }
             Ok(Vec::new())
         } else {
@@ -443,12 +473,12 @@ impl CatalogEngine {
     /// Workers receive DDL deltas from master and need to update their registry
     /// without writing to WAL (master owns durability).
     pub fn ddl_sync(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
-        let family = SysFamily::from_id(table_id)
-            .ok_or_else(|| "ddl_sync only for system tables".to_string())?;
+        let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
         // Fire hooks first (borrow only); the ingest below moves `batch`.
         // Hooks have no observable ordering dependency on the storage write.
         self.fire_hooks(family, &batch)?;
-        let table = self.sys_table_mut(table_id)
+        let table = self
+            .sys_table_mut(table_id)
             .ok_or_else(|| format!("Unknown system table_id {table_id}"))?;
         let _ = table.ingest_owned_batch_memonly(batch);
         Ok(())
@@ -456,7 +486,10 @@ impl CatalogEngine {
 
     /// Raw store ingest: SAL recovery path — no unique_pk, no hooks, no index projection.
     pub(crate) fn raw_store_ingest(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
-        let entry = self.dag.tables.get(&table_id)
+        let entry = self
+            .dag
+            .tables
+            .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
         let _ = entry.handle.ingest_owned_batch(batch);
         Ok(())
@@ -514,12 +547,7 @@ impl CatalogEngine {
 /// at position `k` corresponds to source column `project[k]`; the projected
 /// null bit `k` mirrors the source row's null bit for that column. Projected
 /// columns are scalar, so no blob relocation is required.
-fn copy_cursor_cols_to_batch(
-    cursor: &CursorHandle,
-    out: &mut Batch,
-    src_schema: &SchemaDescriptor,
-    project: &[u8],
-) {
+fn copy_cursor_cols_to_batch(cursor: &CursorHandle, out: &mut Batch, src_schema: &SchemaDescriptor, project: &[u8]) {
     // `current_pk_bytes()` is the verbatim OPK PK region for any width, and the
     // read cursor always tracks it regardless of stride. For narrow PKs it is
     // byte-identical to the old `extend_pk(current_key)` round-trip
@@ -533,7 +561,8 @@ fn copy_cursor_cols_to_batch(
         // The projection is master-built and excludes PK columns
         // (`collect_fk_projection` skips `is_pk_col`; `project_schema` asserts
         // it one frame up), so every projected column has a payload slot.
-        let pi = src_schema.try_payload_idx(p as usize)
+        let pi = src_schema
+            .try_payload_idx(p as usize)
             .expect("FK projection excludes PK columns");
         if src_null & (1u64 << pi) != 0 {
             proj_null |= 1u64 << k;

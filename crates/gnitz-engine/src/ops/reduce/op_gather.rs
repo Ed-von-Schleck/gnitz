@@ -3,7 +3,7 @@
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, ReadCursor};
 
-use super::agg::{Accumulator, AggDescriptor, fold_old_aggs, readback_agg_bits};
+use super::agg::{fold_old_aggs, readback_agg_bits, Accumulator, AggDescriptor};
 use super::emit::emit_gather_row;
 use super::sort::sort_owned;
 
@@ -59,8 +59,7 @@ pub fn op_gather_reduce(
         // Accumulate all partial deltas for this group; a NULL partial
         // contributes nothing (combining its zero bytes would corrupt MIN/MAX —
         // e.g. global MIN(5, 0) = 0 — and saturate has_value for SUM).
-        while idx < n && smb.get_pk_bytes(idx) == group_pk_bytes
-        {
+        while idx < n && smb.get_pk_bytes(idx) == group_pk_bytes {
             let w = smb.get_weight(idx);
             let in_null_word = smb.get_null_word(idx);
             for k in 0..num_aggs {
@@ -68,10 +67,7 @@ pub fn op_gather_reduce(
                 if (in_null_word >> pi) & 1 != 0 {
                     continue;
                 }
-                let bits = readback_agg_bits(
-                    smb.get_col_ptr(idx, pi, agg_col_widths[k]),
-                    agg_descs[k].col_type_code,
-                );
+                let bits = readback_agg_bits(smb.get_col_ptr(idx, pi, agg_col_widths[k]), agg_descs[k].col_type_code);
                 if w > 0 {
                     accs[k].combine(bits);
                 } else if w < 0 && accs[k].is_linear() {
@@ -85,14 +81,17 @@ pub fn op_gather_reduce(
         // is consumed only by the narrow seek/equality (via `seek_group`/
         // `current_pk_eq`) and by `emit_gather_row`, which re-derives compound
         // PKs from the exemplar row's bytes and ignores it.
-        let group_pk: u128 = if partial_schema.pk_is_wide() { 0 } else { smb.get_pk(exemplar_row) };
+        let group_pk: u128 = if partial_schema.pk_is_wide() {
+            0
+        } else {
+            smb.get_pk(exemplar_row)
+        };
 
         // Read old global from trace_out, keyed by the group's OPK bytes. The
         // partial batch is sorted in output-PK order, so the per-group probe is
         // monotone → galloping `advance_to` seeded at the live position.
         trace_out_cursor.advance_to(group_pk_bytes);
-        let has_old = trace_out_cursor.valid
-            && trace_out_cursor.current_pk_eq(group_pk_bytes);
+        let has_old = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(group_pk_bytes);
 
         if has_old {
             // δ_out's −Agg(history) term IS the stored global row: copy trace_out's
@@ -108,9 +107,13 @@ pub fn op_gather_reduce(
         let any_nonzero = accs.iter().any(|a| !a.is_zero());
         if any_nonzero {
             emit_gather_row(
-                &mut output, &smb, exemplar_row,
+                &mut output,
+                &smb,
+                exemplar_row,
                 group_pk,
-                &accs, partial_schema, num_aggs,
+                &accs,
+                partial_schema,
+                num_aggs,
             );
         }
     }

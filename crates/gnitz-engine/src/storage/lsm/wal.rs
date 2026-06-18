@@ -1,8 +1,8 @@
 use std::ptr;
 
+use super::error::StorageError;
 use crate::foundation::codec::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use crate::foundation::xxh;
-use super::error::StorageError;
 
 //  WAL block header layout (48 bytes):
 //  [0,8)   LSN        u64
@@ -77,7 +77,10 @@ pub fn encode(
 
     // Phase 1: compute per-region start positions and write directory.
     // 72 slots — larger than the maximum 69 (68 payload columns + pk/weight/null_bmp + blob).
-    debug_assert!(num_regions <= 72, "num_regions={num_regions} exceeds positions array capacity");
+    debug_assert!(
+        num_regions <= 72,
+        "num_regions={num_regions} exceeds positions array capacity"
+    );
     let mut positions = [0usize; 72];
     let mut pos = HEADER_SIZE + dir_size;
     for i in 0..num_regions {
@@ -114,11 +117,17 @@ pub fn encode(
         let mut j = i + 1;
         while j < num_regions {
             let sz_j = region_sizes[j] as usize;
-            if sz_j == 0 || region_ptrs[j].is_null() { break; }
+            if sz_j == 0 || region_ptrs[j].is_null() {
+                break;
+            }
             // Source must be adjacent to previous region's end.
-            if unsafe { region_ptrs[j] != region_ptrs[j - 1].add(region_sizes[j - 1] as usize) } { break; }
+            if unsafe { region_ptrs[j] != region_ptrs[j - 1].add(region_sizes[j - 1] as usize) } {
+                break;
+            }
             // Destination must be gap-free (only holds when previous size is 8-aligned).
-            if positions[j] != positions[j - 1] + region_sizes[j - 1] as usize { break; }
+            if positions[j] != positions[j - 1] + region_sizes[j - 1] as usize {
+                break;
+            }
             run_len += sz_j;
             j += 1;
         }
@@ -253,9 +262,17 @@ mod tests {
 
         validate_and_parse(
             &buf[..block_len],
-            &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut offsets, &mut rsizes, 16, true,
-        ).unwrap();
+            &mut lsn,
+            &mut tid,
+            &mut count,
+            &mut num_regions,
+            &mut blob_size,
+            &mut offsets,
+            &mut rsizes,
+            16,
+            true,
+        )
+        .unwrap();
         assert_eq!(lsn, 42);
         assert_eq!(tid, 7);
         assert_eq!(count, 2);
@@ -292,17 +309,33 @@ mod tests {
 
         validate_and_parse(
             &buf[..off1],
-            &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut offsets, &mut rsizes, 16, true,
-        ).unwrap();
+            &mut lsn,
+            &mut tid,
+            &mut count,
+            &mut num_regions,
+            &mut blob_size,
+            &mut offsets,
+            &mut rsizes,
+            16,
+            true,
+        )
+        .unwrap();
         assert_eq!(lsn, 1);
         assert_eq!(tid, 10);
 
         validate_and_parse(
             &buf[off1..off2],
-            &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut offsets, &mut rsizes, 16, true,
-        ).unwrap();
+            &mut lsn,
+            &mut tid,
+            &mut count,
+            &mut num_regions,
+            &mut blob_size,
+            &mut offsets,
+            &mut rsizes,
+            16,
+            true,
+        )
+        .unwrap();
         assert_eq!(lsn, 2);
         assert_eq!(tid, 20);
     }
@@ -328,9 +361,17 @@ mod tests {
 
         validate_and_parse(
             &buf[..new_offset],
-            &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut offsets, &mut rsizes, 16, true,
-        ).unwrap();
+            &mut lsn,
+            &mut tid,
+            &mut count,
+            &mut num_regions,
+            &mut blob_size,
+            &mut offsets,
+            &mut rsizes,
+            16,
+            true,
+        )
+        .unwrap();
 
         // Second region offset must be 8-byte aligned
         assert_eq!(offsets[1] % 8, 0, "region 1 not 8-byte aligned: {}", offsets[1]);
@@ -349,8 +390,16 @@ mod tests {
         let mut blob_size = 0u64;
 
         let rc = validate_and_parse(
-            &buf, &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut [], &mut [], 0, true,
+            &buf,
+            &mut lsn,
+            &mut tid,
+            &mut count,
+            &mut num_regions,
+            &mut blob_size,
+            &mut [],
+            &mut [],
+            0,
+            true,
         );
         assert_eq!(rc, Err(StorageError::InvalidVersion));
     }
@@ -372,8 +421,15 @@ mod tests {
 
         let rc = validate_and_parse(
             &buf[..new_offset],
-            &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut [], &mut [], 0, true,
+            &mut lsn,
+            &mut tid,
+            &mut count,
+            &mut num_regions,
+            &mut blob_size,
+            &mut [],
+            &mut [],
+            0,
+            true,
         );
         assert_eq!(rc, Err(StorageError::ChecksumMismatch));
     }
@@ -389,8 +445,15 @@ mod tests {
         // Too short for header
         let rc = validate_and_parse(
             &[0u8; 10],
-            &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut [], &mut [], 0, true,
+            &mut lsn,
+            &mut tid,
+            &mut count,
+            &mut num_regions,
+            &mut blob_size,
+            &mut [],
+            &mut [],
+            0,
+            true,
         );
         assert_eq!(rc, Err(StorageError::Truncated));
     }
@@ -409,9 +472,17 @@ mod tests {
 
         validate_and_parse(
             &buf[..new_offset],
-            &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut [], &mut [], 0, true,
-        ).unwrap();
+            &mut lsn,
+            &mut tid,
+            &mut count,
+            &mut num_regions,
+            &mut blob_size,
+            &mut [],
+            &mut [],
+            0,
+            true,
+        )
+        .unwrap();
         assert_eq!(num_regions, 0);
     }
 
@@ -438,8 +509,15 @@ mod tests {
 
         let rc = validate_and_parse(
             &buf[..block_len],
-            &mut lsn, &mut tid, &mut count, &mut num_regions, &mut blob_size,
-            &mut offsets, &mut rsizes, 16, false,
+            &mut lsn,
+            &mut tid,
+            &mut count,
+            &mut num_regions,
+            &mut blob_size,
+            &mut offsets,
+            &mut rsizes,
+            16,
+            false,
         );
         assert_eq!(rc, Err(StorageError::Truncated));
     }

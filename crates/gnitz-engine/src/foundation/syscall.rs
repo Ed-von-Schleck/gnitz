@@ -16,9 +16,7 @@ pub fn eventfd_create() -> i32 {
 pub fn eventfd_signal(efd: i32) -> i32 {
     let v: u64 = 1;
     loop {
-        let n = unsafe {
-            libc::write(efd, &v as *const u64 as *const libc::c_void, 8)
-        };
+        let n = unsafe { libc::write(efd, &v as *const u64 as *const libc::c_void, 8) };
         if n == 8 {
             return 0;
         }
@@ -83,11 +81,7 @@ pub fn futex_wait_u32(ptr: *const AtomicU32, expected: u32, timeout_ms: i32) -> 
         tv_sec: (timeout_ms as i64) / 1000,
         tv_nsec: ((timeout_ms as i64) % 1000) * 1_000_000,
     };
-    let ts_ptr: *const libc::timespec = if timeout_ms < 0 {
-        std::ptr::null()
-    } else {
-        &ts
-    };
+    let ts_ptr: *const libc::timespec = if timeout_ms < 0 { std::ptr::null() } else { &ts };
     unsafe {
         libc::syscall(
             libc::SYS_futex,
@@ -156,7 +150,9 @@ mod tests {
     fn test_eventfd_create_close() {
         let fd = eventfd_create();
         assert!(fd >= 0, "eventfd_create failed: {fd}");
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
 
     #[test]
@@ -166,7 +162,9 @@ mod tests {
         assert_eq!(eventfd_signal(fd), 0);
         let r = eventfd_wait(fd, 1000);
         assert!(r > 0, "expected >0, got {r}");
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
 
     #[test]
@@ -175,7 +173,9 @@ mod tests {
         assert!(fd >= 0);
         let r = eventfd_wait(fd, 10);
         assert_eq!(r, 0, "expected 0 (timeout), got {r}");
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
 
     #[test]
@@ -183,16 +183,19 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         // Create shared mmap region
-        let fd = unsafe {
-            libc::memfd_create(c"test".as_ptr(), 0)
-        };
+        let fd = unsafe { libc::memfd_create(c"test".as_ptr(), 0) };
         assert!(fd >= 0);
-        unsafe { libc::ftruncate(fd, 4096); }
+        unsafe {
+            libc::ftruncate(fd, 4096);
+        }
         let ptr = unsafe {
             libc::mmap(
-                std::ptr::null_mut(), 4096,
+                std::ptr::null_mut(),
+                4096,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED, fd, 0,
+                libc::MAP_SHARED,
+                fd,
+                0,
             )
         };
         assert_ne!(ptr, libc::MAP_FAILED);
@@ -206,7 +209,9 @@ mod tests {
             let atomic = unsafe { &*(ptr as *const AtomicU64) };
             atomic.store(0xDEADBEEF, Ordering::Release);
             eventfd_signal(efd);
-            unsafe { libc::_exit(0); }
+            unsafe {
+                libc::_exit(0);
+            }
         }
 
         // Parent: wait for child signal, read atomic
@@ -240,14 +245,20 @@ mod tests {
         assert!(!ptr.is_null());
 
         let atomic_ptr = ptr as *mut AtomicU32;
-        unsafe { (*atomic_ptr).store(7, Ordering::Release); }
+        unsafe {
+            (*atomic_ptr).store(7, Ordering::Release);
+        }
 
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             // Child: bump the atomic, then wake the parent.
-            unsafe { (*atomic_ptr).store(8, Ordering::Release); }
+            unsafe {
+                (*atomic_ptr).store(8, Ordering::Release);
+            }
             let _ = futex_wake_u32(atomic_ptr as *const AtomicU32, 1);
-            unsafe { libc::_exit(0); }
+            unsafe {
+                libc::_exit(0);
+            }
         }
 
         // Parent: wait on atomic=7 with a 5-second timeout. Return <=0 via
@@ -277,8 +288,8 @@ mod tests {
     /// in the parent. Smoke test for the reactor's new FUTEX_WAITV wiring.
     #[test]
     fn test_futex_waitv_via_io_uring() {
-        use std::sync::atomic::Ordering;
         use io_uring::{opcode, types, IoUring};
+        use std::sync::atomic::Ordering;
 
         let fd = memfd_create(b"test_futex_waitv");
         assert!(fd >= 0);
@@ -287,7 +298,9 @@ mod tests {
         assert!(!ptr.is_null());
 
         let atomic_ptr = ptr as *mut AtomicU32;
-        unsafe { (*atomic_ptr).store(0, Ordering::Release); }
+        unsafe {
+            (*atomic_ptr).store(0, Ordering::Release);
+        }
 
         let mut ring = match IoUring::new(8) {
             Ok(r) => r,
@@ -295,12 +308,10 @@ mod tests {
         };
 
         // One-entry FutexWaitV array (heap-stable), waiting for value 0.
-        let futexv: Box<[types::FutexWaitV; 1]> = Box::new([
-            types::FutexWaitV::new()
-                .val(0)
-                .uaddr(atomic_ptr as u64)
-                .flags(FUTEX2_SIZE_U32),
-        ]);
+        let futexv: Box<[types::FutexWaitV; 1]> = Box::new([types::FutexWaitV::new()
+            .val(0)
+            .uaddr(atomic_ptr as u64)
+            .flags(FUTEX2_SIZE_U32)]);
 
         let entry = opcode::FutexWaitV::new(futexv.as_ptr(), 1)
             .build()
@@ -314,18 +325,26 @@ mod tests {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             // Child: brief delay so the parent has time to park, then wake.
-            unsafe { libc::usleep(50_000); }
-            unsafe { (*atomic_ptr).store(1, Ordering::Release); }
+            unsafe {
+                libc::usleep(50_000);
+            }
+            unsafe {
+                (*atomic_ptr).store(1, Ordering::Release);
+            }
             let _ = futex_wake_u32(atomic_ptr as *const AtomicU32, 1);
-            unsafe { libc::_exit(0); }
+            unsafe {
+                libc::_exit(0);
+            }
         }
 
         // Parent: block until at least one CQE arrives.
         ring.submitter().submit_and_wait(1).expect("submit_and_wait");
         let cqe = ring.completion().next().expect("cqe");
         assert_eq!(
-            cqe.user_data(), 0xAABBCCDD,
-            "user_data must round-trip; got 0x{:X}", cqe.user_data(),
+            cqe.user_data(),
+            0xAABBCCDD,
+            "user_data must round-trip; got 0x{:X}",
+            cqe.user_data(),
         );
         // Unsupported opcode → -EINVAL or -ENOSYS. Success → 0 or >0.
         // Val mismatch → -EAGAIN (would happen if the child raced ahead).
@@ -352,9 +371,13 @@ mod tests {
         assert_eq!(crate::foundation::posix_io::ftruncate(fd, 4096), 0);
         // Verify size
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        unsafe { libc::fstat(fd, &mut stat); }
+        unsafe {
+            libc::fstat(fd, &mut stat);
+        }
         assert_eq!(stat.st_size, 4096);
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
 
     #[test]

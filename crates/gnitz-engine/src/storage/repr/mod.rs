@@ -13,12 +13,12 @@
 //! repr→lsm serialization exception); it reaches those siblings via `super::super::`.
 
 pub(super) mod batch;
-pub(super) mod batch_wire;
 pub(crate) mod batch_pool;
+pub(super) mod batch_wire;
 pub(super) mod bloom;
 pub(super) mod columnar;
 pub(super) mod heap;
 pub(super) mod merge;
-pub(super) mod scatter;
 pub(super) mod range_key;
+pub(super) mod scatter;
 pub(super) mod xor8;

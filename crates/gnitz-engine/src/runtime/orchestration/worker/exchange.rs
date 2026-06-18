@@ -36,13 +36,29 @@ impl WorkerProcess {
         // During a backfill, stamp this chunk's pad bit onto the FLAG_EXCHANGE so
         // the master can AND it across workers and decide termination. Outside a
         // backfill (backfill_pad == None) the field stays 0, exactly as before.
-        let pad_bit = if self.exchange.backfill_pad == Some(true) { BACKFILL_PAD_BIT } else { 0 };
+        let pad_bit = if self.exchange.backfill_pad == Some(true) {
+            BACKFILL_PAD_BIT
+        } else {
+            0
+        };
         let sz = ipc::wire_size(STATUS_OK, &[], schema.as_ref(), None, Some(batch), None, &[]);
         self.w2m_writer.send_encoded(sz, tick_request_id as u32, |buf| {
             ipc::encode_wire_into_ipc(
-                buf, 0, view_id as u64, 0, FLAG_EXCHANGE as u64,
-                source_id as u128, pad_bit, tick_request_id, STATUS_OK, &[],
-                schema.as_ref(), None, Some(batch), None, &[],
+                buf,
+                0,
+                view_id as u64,
+                0,
+                FLAG_EXCHANGE as u64,
+                source_id as u128,
+                pad_bit,
+                tick_request_id,
+                STATUS_OK,
+                &[],
+                schema.as_ref(),
+                None,
+                Some(batch),
+                None,
+                &[],
             );
         });
 
@@ -61,7 +77,9 @@ impl WorkerProcess {
             // If the master died (killed or gnitz_fatal_abort) while we
             // were waiting, exit like the main run loop does.
             if master_pid != 0 && unsafe { libc::getppid() } != master_pid {
-                unsafe { libc::_exit(0); }
+                unsafe {
+                    libc::_exit(0);
+                }
             }
 
             loop {
@@ -81,9 +99,7 @@ impl WorkerProcess {
                     DispatchOutcome::Shutdown => {
                         // dispatch_inner's Shutdown arm already called
                         // libc::_exit — unreachable in practice.
-                        return Batch::with_schema(
-                            schema.unwrap_or_default(), 0,
-                        );
+                        return Batch::with_schema(schema.unwrap_or_default(), 0);
                     }
                 }
             }
@@ -97,8 +113,7 @@ impl WorkerProcess {
     /// empty.
     pub(super) fn replay_deferred_ticks(&mut self) {
         while !self.exchange.deferred_ticks.is_empty() {
-            let ticks: Vec<(i64, u64)> =
-                std::mem::take(&mut self.exchange.deferred_ticks);
+            let ticks: Vec<(i64, u64)> = std::mem::take(&mut self.exchange.deferred_ticks);
             for (target_id, req_id) in ticks {
                 match self.handle_tick(target_id, req_id) {
                     Ok(()) => self.send_ack(target_id as u64, 0, req_id),
@@ -107,6 +122,4 @@ impl WorkerProcess {
             }
         }
     }
-
-
 }

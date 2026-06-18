@@ -1,6 +1,6 @@
 use super::*;
-use rustc_hash::{FxHashSet, FxHashMap};
 use crate::storage::PkBuf;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 impl CatalogEngine {
     // -- FK column validation (pre-create) ---------------------------------
@@ -13,7 +13,9 @@ impl CatalogEngine {
         self_pk_index: u32,
         self_pk_type: u8,
     ) -> Result<(), String> {
-        if col.fk_table_id == 0 { return Ok(()); }
+        if col.fk_table_id == 0 {
+            return Ok(());
+        }
 
         // `col.fk_col_idx` here is the PARENT's referenced column index (the
         // planner sets the child column's fk_col_idx to it). The target is a
@@ -26,7 +28,10 @@ impl CatalogEngine {
             }
             self_pk_type
         } else {
-            let entry = self.dag.tables.get(&col.fk_table_id)
+            let entry = self
+                .dag
+                .tables
+                .get(&col.fk_table_id)
                 .ok_or_else(|| format!("FK references unknown table_id {}", col.fk_table_id))?;
             let pk = entry.schema.pk_indices();
             let is_lone_pk = pk.len() == 1 && pk[0] == col.fk_col_idx;
@@ -34,12 +39,12 @@ impl CatalogEngine {
                 // A composite index does not satisfy a single-column FK: a
                 // unique (a, b) does not guarantee uniqueness of `a` alone, so
                 // match only a single-column unique index on the referenced col.
-                let has_unique = entry.index_circuits.iter()
+                let has_unique = entry
+                    .index_circuits
+                    .iter()
                     .any(|ic| ic.unique_cols() == Some(&[col.fk_col_idx][..]));
                 if !has_unique {
-                    return Err(
-                        "FK must reference the primary key or a UNIQUE-indexed column".into()
-                    );
+                    return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
                 }
             }
             entry.schema.columns[col.fk_col_idx as usize].type_code
@@ -73,7 +78,10 @@ impl CatalogEngine {
             _ => return Ok(()),
         };
 
-        let entry = self.dag.tables.get(&table_id)
+        let entry = self
+            .dag
+            .tables
+            .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
         let schema = entry.schema;
         let mb = batch.as_mem_batch();
@@ -83,7 +91,10 @@ impl CatalogEngine {
             let target_id = constraint.target_table_id;
             let target_col_idx = constraint.target_col_idx;
 
-            let target_entry = self.dag.tables.get(&target_id)
+            let target_entry = self
+                .dag
+                .tables
+                .get(&target_id)
                 .ok_or_else(|| format!("FK target table {target_id} not found"))?;
 
             // Probe the parent PK when the referenced column is the lone PK;
@@ -95,10 +106,13 @@ impl CatalogEngine {
             } else {
                 // A composite index does not satisfy a single-column FK:
                 // match a single-column unique circuit exactly.
-                Some(target_entry.index_circuits.iter()
-                    .find(|ic| ic.unique_cols() == Some(&[target_col_idx as u32][..]))
-                    .ok_or_else(|| format!(
-                        "FK target {target_id} col {target_col_idx} has no UNIQUE index"))?)
+                Some(
+                    target_entry
+                        .index_circuits
+                        .iter()
+                        .find(|ic| ic.unique_cols() == Some(&[target_col_idx as u32][..]))
+                        .ok_or_else(|| format!("FK target {target_id} col {target_col_idx} has no UNIQUE index"))?,
+                )
             };
             let idx_key_size = idx_ic.map(|ic| ic.index_schema.columns[0].size() as usize);
             let idx_key_type = idx_ic.map(|ic| ic.index_schema.columns[0].type_code);
@@ -116,8 +130,12 @@ impl CatalogEngine {
             let mut idx_cursor = idx_ic.map(|ic| ic.table_mut().open_cursor());
 
             for row in 0..batch.count {
-                if batch.get_weight(row) <= 0 { continue; }
-                if loc.is_null(&mb, row) { continue; } // PK never null; payload checks its bit
+                if batch.get_weight(row) <= 0 {
+                    continue;
+                }
+                if loc.is_null(&mb, row) {
+                    continue;
+                } // PK never null; payload checks its bit
                 let fk_key = loc.native_key(&mb, row);
 
                 let found = if is_lone_pk {
@@ -129,16 +147,16 @@ impl CatalogEngine {
                     // the index PK is OPK-at-rest, so prefix-match the whole
                     // leading column (idx_key_size), not a source-width LE
                     // prefix.
-                    let opk = crate::schema::index_opk_prefix(
-                        fk_key, loc.type_code(), idx_key_type.unwrap());
-                    idx_cursor.as_mut().unwrap().cursor
+                    let opk = crate::schema::index_opk_prefix(fk_key, loc.type_code(), idx_key_type.unwrap());
+                    idx_cursor
+                        .as_mut()
+                        .unwrap()
+                        .cursor
                         .seek_first_positive_with_prefix(&opk[..ks])
                 };
                 if !found {
-                    let (sn, tn) = self.caches.entity_by_id.get(&table_id)
-                        .cloned().unwrap_or_default();
-                    let (tsn, ttn) = self.caches.entity_by_id.get(&target_id)
-                        .cloned().unwrap_or_default();
+                    let (sn, tn) = self.caches.entity_by_id.get(&table_id).cloned().unwrap_or_default();
+                    let (tsn, ttn) = self.caches.entity_by_id.get(&target_id).cloned().unwrap_or_default();
                     return Err(format!(
                         "Foreign Key violation in '{sn}.{tn}': value not found in target '{tsn}.{ttn}'"
                     ));
@@ -156,12 +174,17 @@ impl CatalogEngine {
     /// handling: the old index entry will be retracted by enforce_unique_pk,
     /// so we only reject if the NEW value collides with a DIFFERENT row's entry.
     pub(crate) fn validate_unique_indices(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        let entry = self.dag.tables.get(&table_id)
+        let entry = self
+            .dag
+            .tables
+            .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
 
         // Quick check: any unique index circuits?
         let has_unique = entry.index_circuits.iter().any(|ic| ic.is_unique);
-        if !has_unique { return Ok(()); }
+        if !has_unique {
+            return Ok(());
+        }
 
         let schema = entry.schema;
         let unique_pk = entry.unique_pk();
@@ -195,18 +218,17 @@ impl CatalogEngine {
                     FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
                 for r in 0..batch.count {
                     let w = batch.get_weight(r);
-                    if w == 0 { continue; }
-                    *net.entry(PkBuf::from_bytes(batch.get_pk_bytes(r)))
-                        .or_insert(0) += w;
+                    if w == 0 {
+                        continue;
+                    }
+                    *net.entry(PkBuf::from_bytes(batch.get_pk_bytes(r))).or_insert(0) += w;
                 }
-                upserted_pks =
-                    net.into_iter().filter(|&(_, w)| w > 0).map(|(pk, _)| pk).collect();
+                upserted_pks = net.into_iter().filter(|&(_, w)| w > 0).map(|(pk, _)| pk).collect();
             } else {
                 upserted_pks.reserve(batch.count);
                 for r in 0..batch.count {
                     if batch.get_weight(r) > 0 {
-                        upserted_pks.insert(
-                            PkBuf::from_bytes(batch.get_pk_bytes(r)));
+                        upserted_pks.insert(PkBuf::from_bytes(batch.get_pk_bytes(r)));
                     }
                 }
             }
@@ -225,8 +247,7 @@ impl CatalogEngine {
         // at any width (byte-equal ⟺ value-equal). Scratch `keybuf` is the
         // reused destination `IndexKeySpec::key_bytes` writes each row's span
         // into — no per-row allocation.
-        let mut seen: FxHashSet<PkBuf> =
-            FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
+        let mut seen: FxHashSet<PkBuf> = FxHashSet::with_capacity_and_hasher(batch.count, Default::default());
         let mut keybuf = PkBuf::empty(0);
 
         for ic in &entry.index_circuits {
@@ -256,19 +277,26 @@ impl CatalogEngine {
             retracted.clear();
             if has_retractions {
                 for row in 0..batch.count {
-                    if batch.get_weight(row) >= 0 { continue; }
-                    if !spec.key_bytes(&mb, row, &mut keybuf) { continue; }
-                    retracted.insert((
-                        PkBuf::from_bytes(batch.get_pk_bytes(row)), keybuf));
+                    if batch.get_weight(row) >= 0 {
+                        continue;
+                    }
+                    if !spec.key_bytes(&mb, row, &mut keybuf) {
+                        continue;
+                    }
+                    retracted.insert((PkBuf::from_bytes(batch.get_pk_bytes(row)), keybuf));
                 }
             }
 
             for row in 0..batch.count {
                 let w = batch.get_weight(row);
-                if w <= 0 { continue; }
+                if w <= 0 {
+                    continue;
+                }
                 // PK columns are non-nullable; a row NULL in any indexed column
                 // is skipped (NULL-distinct).
-                if !spec.key_bytes(&mb, row, &mut keybuf) { continue; }
+                if !spec.key_bytes(&mb, row, &mut keybuf) {
+                    continue;
+                }
 
                 // One row at weight w is the value w times. On a non-unique_pk
                 // table that is w live instances (enforce_unique_pk collapses
@@ -326,14 +354,16 @@ impl CatalogEngine {
                 // the holder is also an upserted PK, so enforce_unique_pk frees
                 // the value at apply. The `upserted_pks` membership test subsumes
                 // the same-PK upsert case (the row's own PK is a positive PK).
-                if retracted.contains(
-                    &(PkBuf::from_bytes(existing_src_pk), keybuf)) { continue; }
-                if is_upsert && upserted_pks.contains(existing_src_pk) { continue; }
+                if retracted.contains(&(PkBuf::from_bytes(existing_src_pk), keybuf)) {
+                    continue;
+                }
+                if is_upsert && upserted_pks.contains(existing_src_pk) {
+                    continue;
+                }
 
                 return Err(self.unique_violation_err(table_id, cols, false));
             }
         }
         Ok(())
     }
-
 }

@@ -18,12 +18,7 @@ fn build_idx_tab_row(idx_id: i64, owner_id: i64, source_col_idx: u64, name: &str
     bb.finish()
 }
 
-fn write_col_at_index(
-    engine: &mut CatalogEngine,
-    owner_id: i64,
-    col_idx: i64,
-    cd: &ColumnDef,
-) -> Result<(), String> {
+fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, cd: &ColumnDef) -> Result<(), String> {
     let schema = col_tab_schema();
     let mut bb = BatchBuilder::new(schema);
     let pk = pack_column_id(owner_id, col_idx);
@@ -62,18 +57,26 @@ fn test_table_tab_no_cols_leaves_clean_state() {
     // No column records written — TABLE_TAB ingestion must fail.
     let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "badtable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
-    assert!(result.is_err(),
-        "expected error for TABLE_TAB with no column records");
+    assert!(result.is_err(), "expected error for TABLE_TAB with no column records");
 
     // All catalog state must be exactly as before the failed DDL.
-    assert!(!engine.caches.entity_by_qname.contains_key("public.badtable"),
-        "entity_by_qname must not contain bad table after rejected DDL (dirty before fix)");
-    assert!(!engine.caches.entity_by_id.contains_key(&tid),
-        "entity_by_id must not contain bad table after rejected DDL");
-    assert!(!engine.dag.tables.contains_key(&tid),
-        "dag.tables must not contain bad table after rejected DDL");
-    assert_eq!(count_records(&mut engine.sys_tables), init_rows,
-        "sys_tables memtable must have no orphaned row (dirty before fix)");
+    assert!(
+        !engine.caches.entity_by_qname.contains_key("public.badtable"),
+        "entity_by_qname must not contain bad table after rejected DDL (dirty before fix)"
+    );
+    assert!(
+        !engine.caches.entity_by_id.contains_key(&tid),
+        "entity_by_id must not contain bad table after rejected DDL"
+    );
+    assert!(
+        !engine.dag.tables.contains_key(&tid),
+        "dag.tables must not contain bad table after rejected DDL"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_tables),
+        init_rows,
+        "sys_tables memtable must have no orphaned row (dirty before fix)"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -95,17 +98,28 @@ fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
 
     let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "badpktable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
-    assert!(result.is_err(),
-        "expected error for TABLE_TAB with non-pk-eligible PK column");
+    assert!(
+        result.is_err(),
+        "expected error for TABLE_TAB with non-pk-eligible PK column"
+    );
 
-    assert!(!engine.caches.entity_by_qname.contains_key("public.badpktable"),
-        "entity_by_qname must not contain bad table after rejected DDL (dirty before fix)");
-    assert!(!engine.caches.entity_by_id.contains_key(&tid),
-        "entity_by_id must not contain bad table after rejected DDL");
-    assert!(!engine.dag.tables.contains_key(&tid),
-        "dag.tables must not contain bad table after rejected DDL");
-    assert_eq!(count_records(&mut engine.sys_tables), init_rows,
-        "sys_tables memtable must have no orphaned row (dirty before fix)");
+    assert!(
+        !engine.caches.entity_by_qname.contains_key("public.badpktable"),
+        "entity_by_qname must not contain bad table after rejected DDL (dirty before fix)"
+    );
+    assert!(
+        !engine.caches.entity_by_id.contains_key(&tid),
+        "entity_by_id must not contain bad table after rejected DDL"
+    );
+    assert!(
+        !engine.dag.tables.contains_key(&tid),
+        "dag.tables must not contain bad table after rejected DDL"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_tables),
+        init_rows,
+        "sys_tables memtable must have no orphaned row (dirty before fix)"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -129,18 +143,25 @@ fn test_table_tab_dup_name_leaves_clean_state() {
 
     let batch = build_table_tab_row(&dir, new_tid, pack_pk_cols(&[0]), "dupname");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
-    assert!(result.is_err(),
-        "expected error: qualified name 'public.dupname' already exists");
+    assert!(
+        result.is_err(),
+        "expected error: qualified name 'public.dupname' already exists"
+    );
 
     assert_eq!(
         engine.caches.entity_by_qname.get("public.dupname").copied(),
         Some(orig_tid),
         "entity_by_qname must still point to the original table after rejected duplicate"
     );
-    assert!(!engine.dag.tables.contains_key(&new_tid),
-        "new_tid must not appear in dag.tables");
-    assert_eq!(count_records(&mut engine.sys_tables), init_rows,
-        "sys_tables must have no extra orphaned row (dirty before fix)");
+    assert!(
+        !engine.dag.tables.contains_key(&new_tid),
+        "new_tid must not appear in dag.tables"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_tables),
+        init_rows,
+        "sys_tables must have no extra orphaned row (dirty before fix)"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -164,15 +185,24 @@ fn test_table_tab_col_contiguity_gap_rejected() {
 
     let batch = build_table_tab_row(&dir, tid, pack_pk_cols(&[0]), "gaptable");
     let result = engine.ingest_to_family(TABLE_TAB_ID, &batch);
-    assert!(result.is_err(),
-        "expected error for TABLE_TAB with non-contiguous column indices (no error before fix)");
+    assert!(
+        result.is_err(),
+        "expected error for TABLE_TAB with non-contiguous column indices (no error before fix)"
+    );
 
-    assert!(!engine.caches.entity_by_qname.contains_key("public.gaptable"),
-        "entity_by_qname must not contain bad table after rejected DDL");
-    assert!(!engine.dag.tables.contains_key(&tid),
-        "dag.tables must not contain bad table after rejected DDL");
-    assert_eq!(count_records(&mut engine.sys_tables), init_rows,
-        "sys_tables memtable must have no orphaned row");
+    assert!(
+        !engine.caches.entity_by_qname.contains_key("public.gaptable"),
+        "entity_by_qname must not contain bad table after rejected DDL"
+    );
+    assert!(
+        !engine.dag.tables.contains_key(&tid),
+        "dag.tables must not contain bad table after rejected DDL"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_tables),
+        init_rows,
+        "sys_tables memtable must have no orphaned row"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -191,17 +221,25 @@ fn test_view_tab_no_cols_leaves_clean_state() {
     // No column records for vid.
     let batch = build_view_tab_row(vid, "badview", "");
     let result = engine.ingest_to_family(VIEW_TAB_ID, &batch);
-    assert!(result.is_err(),
-        "expected error for VIEW_TAB with no column records");
+    assert!(result.is_err(), "expected error for VIEW_TAB with no column records");
 
-    assert!(!engine.caches.entity_by_qname.contains_key("public.badview"),
-        "entity_by_qname must not contain bad view after rejected DDL (dirty before fix)");
-    assert!(!engine.caches.entity_by_id.contains_key(&vid),
-        "entity_by_id must not contain bad view after rejected DDL");
-    assert!(!engine.dag.tables.contains_key(&vid),
-        "dag.tables must not contain bad view after rejected DDL");
-    assert_eq!(count_records(&mut engine.sys_views), init_rows,
-        "sys_views memtable must have no orphaned row (dirty before fix)");
+    assert!(
+        !engine.caches.entity_by_qname.contains_key("public.badview"),
+        "entity_by_qname must not contain bad view after rejected DDL (dirty before fix)"
+    );
+    assert!(
+        !engine.caches.entity_by_id.contains_key(&vid),
+        "entity_by_id must not contain bad view after rejected DDL"
+    );
+    assert!(
+        !engine.dag.tables.contains_key(&vid),
+        "dag.tables must not contain bad view after rejected DDL"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_views),
+        init_rows,
+        "sys_views memtable must have no orphaned row (dirty before fix)"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -226,17 +264,27 @@ fn test_view_tab_too_many_cols_rejected() {
         write_col_at_index(&mut engine, vid, i, &u64_col_def(&format!("c{i}"))).unwrap();
     }
     let batch = build_view_tab_row(vid, "wideview", "");
-    let err = engine.ingest_to_family(VIEW_TAB_ID, &batch)
+    let err = engine
+        .ingest_to_family(VIEW_TAB_ID, &batch)
         .expect_err("expected error for over-wide view");
-    assert!(err.contains("columns") && err.contains("max"),
-        "expected the column-count guard message, got: {err}");
+    assert!(
+        err.contains("columns") && err.contains("max"),
+        "expected the column-count guard message, got: {err}"
+    );
 
-    assert!(!engine.caches.entity_by_qname.contains_key("public.wideview"),
-        "entity_by_qname must not contain the rejected view");
-    assert!(!engine.dag.tables.contains_key(&vid),
-        "dag.tables must not contain the rejected view");
-    assert_eq!(count_records(&mut engine.sys_views), init_rows,
-        "sys_views memtable must have no orphaned row");
+    assert!(
+        !engine.caches.entity_by_qname.contains_key("public.wideview"),
+        "entity_by_qname must not contain the rejected view"
+    );
+    assert!(
+        !engine.dag.tables.contains_key(&vid),
+        "dag.tables must not contain the rejected view"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_views),
+        init_rows,
+        "sys_views memtable must have no orphaned row"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -253,18 +301,23 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
 
     let nonexistent_owner = engine.allocate_table_id();
     let idx_id = engine.allocate_index_id();
-    let batch = build_idx_tab_row(idx_id, nonexistent_owner, 0,
-                                  "bad_owner_idx", false);
+    let batch = build_idx_tab_row(idx_id, nonexistent_owner, 0, "bad_owner_idx", false);
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
-    assert!(result.is_err(),
-        "expected error for IDX_TAB with non-existent owner");
+    assert!(result.is_err(), "expected error for IDX_TAB with non-existent owner");
 
-    assert!(!engine.caches.index_by_name.contains_key("bad_owner_idx"),
-        "index_by_name must not contain bad index after rejected DDL (dirty before fix)");
-    assert!(!engine.caches.index_by_id.contains_key(&idx_id),
-        "index_by_id must not contain bad index after rejected DDL");
-    assert_eq!(count_records(&mut engine.sys_indices), init_rows,
-        "sys_indices memtable must have no orphaned row (dirty before fix)");
+    assert!(
+        !engine.caches.index_by_name.contains_key("bad_owner_idx"),
+        "index_by_name must not contain bad index after rejected DDL (dirty before fix)"
+    );
+    assert!(
+        !engine.caches.index_by_id.contains_key(&idx_id),
+        "index_by_id must not contain bad index after rejected DDL"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_indices),
+        init_rows,
+        "sys_indices memtable must have no orphaned row (dirty before fix)"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -281,12 +334,16 @@ fn test_idx_tab_view_owner_rejected() {
     let dir = temp_dir("atomicity_idx_view_owner");
     let mut engine = CatalogEngine::open(&dir).unwrap();
 
-    engine.create_table("public.base", &[u64_col_def("id")], &[0], true).unwrap();
+    engine
+        .create_table("public.base", &[u64_col_def("id")], &[0], true)
+        .unwrap();
 
     // Register a view via the raw system-table path (no circuit needed — the
     // precheck must fire before any backfill).
     let vid = engine.allocate_table_id();
-    engine.write_column_records(vid, OWNER_KIND_VIEW, &[u64_col_def("id")]).unwrap();
+    engine
+        .write_column_records(vid, OWNER_KIND_VIEW, &[u64_col_def("id")])
+        .unwrap();
     let batch = build_view_tab_row(vid, "vowner", "");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
     assert!(engine.dag.tables.contains_key(&vid), "view registered");
@@ -294,19 +351,31 @@ fn test_idx_tab_view_owner_rejected() {
     let init_rows = count_records(&mut engine.sys_indices);
     let idx_id = engine.allocate_index_id();
     let batch = build_idx_tab_row(idx_id, vid, 0, "idx_on_view", false);
-    let err = engine.ingest_to_family(IDX_TAB_ID, &batch)
+    let err = engine
+        .ingest_to_family(IDX_TAB_ID, &batch)
         .expect_err("IDX_TAB row naming a view owner must be rejected");
-    assert!(err.contains("not a base table"),
-        "expected the owner-kind guard message, got: {err}");
+    assert!(
+        err.contains("not a base table"),
+        "expected the owner-kind guard message, got: {err}"
+    );
 
-    assert!(!engine.caches.index_by_name.contains_key("idx_on_view"),
-        "index_by_name must not contain the rejected index");
-    assert!(!engine.caches.index_by_id.contains_key(&idx_id),
-        "index_by_id must not contain the rejected index");
-    assert_eq!(count_records(&mut engine.sys_indices), init_rows,
-        "sys_indices must have no orphaned row");
-    assert!(engine.dag.tables.get(&vid).unwrap().index_circuits.is_empty(),
-        "the view must not gain an index circuit");
+    assert!(
+        !engine.caches.index_by_name.contains_key("idx_on_view"),
+        "index_by_name must not contain the rejected index"
+    );
+    assert!(
+        !engine.caches.index_by_id.contains_key(&idx_id),
+        "index_by_id must not contain the rejected index"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_indices),
+        init_rows,
+        "sys_indices must have no orphaned row"
+    );
+    assert!(
+        engine.dag.tables.get(&vid).unwrap().index_circuits.is_empty(),
+        "the view must not gain an index circuit"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -330,18 +399,25 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     // Same name, different col (ts at index 2) — bypasses create_index dup check.
     let batch = build_idx_tab_row(new_idx_id, tid, 2, orig_name, false);
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
-    assert!(result.is_err(),
-        "expected error: index name '{orig_name}' already exists");
+    assert!(
+        result.is_err(),
+        "expected error: index name '{orig_name}' already exists"
+    );
 
     assert_eq!(
         engine.caches.index_by_name.get(orig_name).copied(),
         Some(orig_idx_id),
         "index_by_name must still point to original index (overwritten before fix)"
     );
-    assert!(!engine.caches.index_by_id.contains_key(&new_idx_id),
-        "new_idx_id must not appear in index_by_id");
-    assert_eq!(count_records(&mut engine.sys_indices), init_rows,
-        "sys_indices must have no extra orphaned row (dirty before fix)");
+    assert!(
+        !engine.caches.index_by_id.contains_key(&new_idx_id),
+        "new_idx_id must not appear in index_by_id"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_indices),
+        init_rows,
+        "sys_indices must have no extra orphaned row (dirty before fix)"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -369,8 +445,12 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
 
     // Ingest two rows that share the same 'val' — unique index backfill must fail.
     let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1); bb.put_u64(42u64); bb.end_row();
-    bb.begin_row(2u128, 1); bb.put_u64(42u64); bb.end_row();
+    bb.begin_row(1u128, 1);
+    bb.put_u64(42u64);
+    bb.end_row();
+    bb.begin_row(2u128, 1);
+    bb.put_u64(42u64);
+    bb.end_row();
     engine.dag.ingest_to_family(tid, bb.finish());
     let _ = engine.dag.flush(tid);
 
@@ -391,7 +471,12 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
         "index directory must not leak after failed backfill: {idx_dir} (not cleaned up before fix)"
     );
     assert!(
-        engine.dag.tables.get(&tid).map(|e| e.index_circuits.is_empty()).unwrap_or(true),
+        engine
+            .dag
+            .tables
+            .get(&tid)
+            .map(|e| e.index_circuits.is_empty())
+            .unwrap_or(true),
         "no index circuit must be registered after failed CREATE INDEX"
     );
 
@@ -417,8 +502,7 @@ fn test_next_index_id_advances_on_index_register() {
     // Register an index with an idx_id far ahead of the current counter,
     // simulating a worker receiving a broadcast for a master-allocated ID.
     let large_idx_id = engine.next_index_id + 500;
-    let batch = build_idx_tab_row(large_idx_id, tid, 1,
-                                  "public__seqsync__idx_val_sync", false);
+    let batch = build_idx_tab_row(large_idx_id, tid, 1, "public__seqsync__idx_val_sync", false);
     engine.ingest_to_family(IDX_TAB_ID, &batch).unwrap();
 
     // next_index_id must now be > large_idx_id so that a local
@@ -427,7 +511,8 @@ fn test_next_index_id_advances_on_index_register() {
         engine.next_index_id > large_idx_id,
         "next_index_id ({}) must exceed the registered idx_id ({}) after \
          hook_index_register (not advanced before fix)",
-        engine.next_index_id, large_idx_id
+        engine.next_index_id,
+        large_idx_id
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -451,12 +536,16 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 
     // Table T (in schema `owner`) with a dependent view V → dep_map[T] = [V].
     engine.create_schema("owner").unwrap();
-    let tid = engine.create_table("owner.t", &[u64_col_def("id")], &[0], true).unwrap();
+    let tid = engine
+        .create_table("owner.t", &[u64_col_def("id")], &[0], true)
+        .unwrap();
     let vid = engine.allocate_table_id();
     engine.write_view_deps(vid, &[tid]).unwrap();
     assert_eq!(
-        engine.dag.get_dep_map().get(&tid), Some(&vec![vid]),
-        "precondition: dependency edge T -> V must be present");
+        engine.dag.get_dep_map().get(&tid),
+        Some(&vec![vid]),
+        "precondition: dependency edge T -> V must be present"
+    );
 
     // Allocate filler schemas until the next schema id collides with `tid`,
     // then create the victim schema so that get_schema_id("victim") == tid.
@@ -464,17 +553,24 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
         let name = format!("filler_{}", engine.next_schema_id);
         engine.create_schema(&name).unwrap();
     }
-    assert_eq!(engine.next_schema_id, tid,
-        "test setup: next schema id must land exactly on tid");
+    assert_eq!(
+        engine.next_schema_id, tid,
+        "test setup: next schema id must land exactly on tid"
+    );
     engine.create_schema("victim").unwrap();
-    assert_eq!(engine.get_schema_id("victim"), tid,
-        "test setup: victim schema id must collide with tid");
+    assert_eq!(
+        engine.get_schema_id("victim"),
+        tid,
+        "test setup: victim schema id must collide with tid"
+    );
 
     // The victim schema is empty and unrelated to T/V. Dropping it must
     // succeed despite its id colliding with a table that has a dependent view.
     engine.drop_schema("victim").unwrap();
-    assert!(!engine.caches.schema_by_name.contains_key("victim"),
-        "victim schema must be gone after a successful DROP SCHEMA");
+    assert!(
+        !engine.caches.schema_by_name.contains_key("victim"),
+        "victim schema must be gone after a successful DROP SCHEMA"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
