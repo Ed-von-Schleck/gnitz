@@ -6,6 +6,12 @@ Use `semble search` (the semble MCP server is installed) to find code by describ
 
 gnitz is **pre-alpha** and not used in production anywhere because it has not been released, so there are **never** any compatibility concerns and there should **never** be legacy code remaining.
 
+**Plans (`plans/`):**
+- Never cite a plan path/filename in code, tests, or comments.
+- Not ground truth: validate against source/tests/git; only edit the plan named for the task.
+- Authoring: state one committed design — no history, no optional/either-or, no "follow-on/future-work" (fold in, spin out a new plan, or drop); include validated snippets; never cross-link plans (state needed facts inline); out-of-scope bugs get their own plan.
+- Don't write memories about a specific plan (they're transient).
+
 GnitzDB-specific development guidelines are in the **GnitzDB Developer Guide**
 section at the end of this file.
 
