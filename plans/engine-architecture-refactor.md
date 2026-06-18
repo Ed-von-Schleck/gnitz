@@ -579,7 +579,21 @@ splits its god-files and moves the residual files into the §2 tree.
   `cfg(test)` `close` reaches it (caught by `clippy --all-targets`, not `cargo build`).
   `clippy.toml` disallowed-method path `dag::`→`query::dag::`. Gates green: build, clippy
   `--all-targets`, `make test` (1303, parity 112), `make e2e` (1043).
-- **W13 (catalog, L):** `store.rs` four-file carve + `write_path.rs`. Depends on W8.
+- **W13 (catalog, L) — ✅ DONE.** `store.rs` (a single `impl CatalogEngine`)
+  dissolved **byte-identically** into five flat `use super::*` siblings of
+  `catalog/mod.rs` — the type lives up in `mod.rs`, so each is just an `impl
+  CatalogEngine` block (no subdir / `mod.rs` residual; every `super::` path
+  unchanged): `write_path` (§8 cluster-8 spine WHOLE — `CatalogDeltaSink` +
+  `submit`/`apply_local`/`precheck_sys_ingest` + broadcast & dir-deletion queues +
+  Stage-A rollback), `store_io` (ingest/scan/seek/flush/replay), `metadata`
+  (FK/index queries + handle accessors + `CachedSchemaWire` + unique-violation
+  formatting), `registry` (id alloc/lookup + `sys_columns` readers + sequences),
+  `partition_lsn` (fork/trim/rehome + flushed-LSN). **Zero visibility bumps** (each
+  private item lands with its only callers — §7-rule-2); no tests moved.
+  `SysFamily`/`ApplyContext`/`fire_hooks` stay in their own files. Sole external
+  edge: `mod.rs`'s `CatalogDeltaSink` re-export repointed to `write_path`. Gates
+  green: build, clippy `--all-targets`, `make test` (1303, parity), `make e2e`
+  (1043).
 - **W14 (runtime, XL):** create `runtime/{orchestration,protocol,reactor}/`, split
   `master`, `worker`, `reactor`. Depends on W8; gate on `make e2e`.
 
@@ -782,7 +796,7 @@ Stage A (P0, structural)    W1 ─┬─ W2            break C1 (key seam ✅ + 
                             W4  │                BatchBuilder → storage (auto-fixes C2 test edge) ✅
                             W5 ─┘                test-edge cleanup (C3/C4/E5) → cfg(test) acyclicity ✅
 Stage B (P1, edges+surface) W6 ─ W7   W8         batch_wire + 3rd edge ✅ · ops::reindex ✅ · surface sweep ✅
-Stage C (P2, splits+regroup) W9 ✅ W10 ✅ W11 ✅ W12 ✅ W13 W14   god-file carves into the layer tree (gated on W6/W7/W8)
+Stage C (P2, splits+regroup) W9 ✅ W10 ✅ W11 ✅ W12 ✅ W13 ✅ W14   god-file carves into the layer tree (gated on W6/W7/W8)
 ```
 
 W1–W8 are small, independent (except W5→W4; W2 was prototyped standalone, so it does

@@ -35,7 +35,11 @@ mod bootstrap;
 mod hooks;
 mod ddl;
 mod validation;
-mod store;
+mod write_path;
+mod store_io;
+mod registry;
+mod metadata;
+mod partition_lsn;
 
 #[cfg(test)]
 mod tests;
@@ -77,7 +81,7 @@ pub(in crate::catalog) use utils::{make_fk_index_name, ingest_batch_into,
 pub(in crate::catalog) use utils::{parse_qualified_name, make_secondary_index_name};
 pub(in crate::catalog) use cache::CatalogCacheSet;
 pub(in crate::catalog) use sys_tables::SysFamily;
-pub(in crate::catalog) use store::CatalogDeltaSink;
+pub(in crate::catalog) use write_path::CatalogDeltaSink;
 pub(in crate::catalog) use apply_context::ApplyContext;
 // `BatchBuilder` and the schema-shaping free fns hold no catalog state and live
 // in `storage`; re-export them so catalog's ddl/bootstrap/store callers compile
