@@ -5,19 +5,21 @@
 // internals are reachable within runtime (cross-submodule refs via
 // `crate::runtime::X::…` / `super::X::…` still resolve — descendants can name a
 // private sibling module) but not from any other subsystem.
-mod w2m_ring;
-mod wire;
-mod sal;
-mod w2m;
-mod reactor;
-mod master;
-mod worker;
-mod committer;
-mod executor;
+//
+// `orchestration` (master/worker/executor/committer) and `protocol`
+// (wire/sal/w2m/w2m_ring) are internal layer groupings, not facades: their
+// submodules are aliased below so the historical `crate::runtime::<mod>` paths
+// keep resolving for siblings (`bootstrap`, `reactor`) and the test dir.
 mod bootstrap;
+mod orchestration;
+mod protocol;
+mod reactor;
+
+use orchestration::{committer, executor, master, worker};
+use protocol::{sal, w2m, w2m_ring, wire};
 
 pub use bootstrap::server_main;
-pub(crate) use sal::MAX_WORKERS;
+pub(crate) use protocol::sal::MAX_WORKERS;
 
 #[cfg(test)]
 mod tests;

@@ -594,8 +594,24 @@ splits its god-files and moves the residual files into the §2 tree.
   edge: `mod.rs`'s `CatalogDeltaSink` re-export repointed to `write_path`. Gates
   green: build, clippy `--all-targets`, `make test` (1303, parity), `make e2e`
   (1043).
-- **W14 (runtime, XL):** create `runtime/{orchestration,protocol,reactor}/`, split
-  `master`, `worker`, `reactor`. Depends on W8; gate on `make e2e`.
+- **W14 (runtime, XL) — ✅ DONE.** Regrouped the flat runtime modules into the §2 tree:
+  `orchestration/` (executor·committer·master·worker), `protocol/` (wire·sal·w2m·w2m_ring),
+  `reactor/` (unchanged dir); `runtime/mod.rs` aliases the grouped submodules (`use
+  orchestration::{…}` / `use protocol::{…}`) so every historical `crate::runtime::<mod>` path
+  keeps resolving across the subsystem + test dir, and only `server_main` + `MAX_WORKERS`
+  escape. Three god-files carved **byte-identically** — shared type/const defs + the
+  cross-cluster-shared free fns stay in the parent `mod.rs` (reachable by every sub-file via
+  `use super::*`), method clusters move out, the §8 cluster-6 ordering (`do_exchange_wait`
+  defer/replay, the w2m `FLAG_MASTER_PARKED`-before-`reader_seq` snapshot,
+  no-aliasing-across-`await`) moved whole: master → `{dispatch, unique_filter, preflight}`,
+  worker → `{reply, exchange, fsync}`, reactor → `{runloop, conn, futures}` with
+  `ReactorShared`/`Reactor`/`RunQueue` + all 82 tests kept inline in `mod.rs` (§7 — the
+  sub-files are descendants of the state owner, so private fields need **no** bump; only
+  cross-file *methods* + the six literal-built future structs' fields go `pub(super)`).
+  Production-mandated `pub(super)` only — no test-driven widening; tests follow their subject
+  (`worker_liveness_tests`→dispatch, worker fsync tests→fsync, the rest stay in `mod.rs`).
+  Gates green: build, clippy `--all-targets`, `make test` (1303, parity), `make e2e`
+  (GNITZ_WORKERS=4, 1043).
 
 Two test files are oversized — `ops/reduce/tests.rs` (5450) and
 `catalog/tests/index_tests.rs` (2857) — and remain **deferred** (§7): they carry no
@@ -796,7 +812,7 @@ Stage A (P0, structural)    W1 ─┬─ W2            break C1 (key seam ✅ + 
                             W4  │                BatchBuilder → storage (auto-fixes C2 test edge) ✅
                             W5 ─┘                test-edge cleanup (C3/C4/E5) → cfg(test) acyclicity ✅
 Stage B (P1, edges+surface) W6 ─ W7   W8         batch_wire + 3rd edge ✅ · ops::reindex ✅ · surface sweep ✅
-Stage C (P2, splits+regroup) W9 ✅ W10 ✅ W11 ✅ W12 ✅ W13 ✅ W14   god-file carves into the layer tree (gated on W6/W7/W8)
+Stage C (P2, splits+regroup) W9 ✅ W10 ✅ W11 ✅ W12 ✅ W13 ✅ W14 ✅  god-file carves into the layer tree (gated on W6/W7/W8)
 ```
 
 W1–W8 are small, independent (except W5→W4; W2 was prototyped standalone, so it does
