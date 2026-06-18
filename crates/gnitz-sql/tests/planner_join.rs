@@ -1,10 +1,9 @@
 #![cfg(feature = "integration")]
 
 use gnitz_core::{
-    OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_DELAY, OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD,
-    OPCODE_INTEGRATE_TRACE, OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_OUTER,
-    OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR, OPCODE_MAP_PROJ, OPCODE_NEGATE,
-    OPCODE_NULL_EXTEND, OPCODE_PARTITION_FILTER, OPCODE_REDUCE, OPCODE_SCAN_DELTA,
+    OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_DELAY, OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_INTEGRATE_TRACE,
+    OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_OUTER, OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR,
+    OPCODE_MAP_PROJ, OPCODE_NEGATE, OPCODE_NULL_EXTEND, OPCODE_PARTITION_FILTER, OPCODE_REDUCE, OPCODE_SCAN_DELTA,
     OPCODE_SEMI_JOIN_DELTA_TRACE, OPCODE_UNION,
 };
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
@@ -25,25 +24,17 @@ fn test_join_select_qualified_alias() {
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
 
-    p.execute(
-        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, v BIGINT NOT NULL)",
-    )
-    .unwrap();
-    p.execute(
-        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, w BIGINT NOT NULL)",
-    )
-    .unwrap();
+    p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, v BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, w BIGINT NOT NULL)")
+        .unwrap();
 
     let r = p.execute(
         "CREATE VIEW v AS \
          SELECT a.id AS aid, b.id AS bid, a.v AS aval, b.w AS bval \
          FROM a JOIN b ON a.fk = b.fk",
     );
-    assert!(
-        r.is_ok(),
-        "qualified alias in JOIN SELECT failed: {:?}",
-        r.err()
-    );
+    assert!(r.is_ok(), "qualified alias in JOIN SELECT failed: {:?}", r.err());
 }
 
 /// Unqualified alias: `col AS alias`.
@@ -56,22 +47,13 @@ fn test_join_select_unqualified_alias() {
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
 
-    p.execute(
-        "CREATE TABLE x (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, xv BIGINT NOT NULL)",
-    )
-    .unwrap();
-    p.execute(
-        "CREATE TABLE y (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, yv BIGINT NOT NULL)",
-    )
-    .unwrap();
+    p.execute("CREATE TABLE x (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, xv BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE y (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, yv BIGINT NOT NULL)")
+        .unwrap();
 
-    let r =
-        p.execute("CREATE VIEW v AS SELECT xv AS xcol, yv AS ycol FROM x JOIN y ON x.fk = y.fk");
-    assert!(
-        r.is_ok(),
-        "unqualified alias in JOIN SELECT failed: {:?}",
-        r.err()
-    );
+    let r = p.execute("CREATE VIEW v AS SELECT xv AS xcol, yv AS ycol FROM x JOIN y ON x.fk = y.fk");
+    assert!(r.is_ok(), "unqualified alias in JOIN SELECT failed: {:?}", r.err());
 }
 
 /// No aliases — table-qualified column refs.
@@ -86,17 +68,11 @@ fn test_join_select_no_alias() {
 
     p.execute("CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)")
         .unwrap();
-    p.execute(
-        "CREATE TABLE q (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, qv BIGINT NOT NULL)",
-    )
-    .unwrap();
+    p.execute("CREATE TABLE q (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, qv BIGINT NOT NULL)")
+        .unwrap();
 
     let r = p.execute("CREATE VIEW v AS SELECT p.id, q.qv FROM p JOIN q ON p.fk = q.fk");
-    assert!(
-        r.is_ok(),
-        "qualified refs without alias failed: {:?}",
-        r.err()
-    );
+    assert!(r.is_ok(), "qualified refs without alias failed: {:?}", r.err());
 }
 
 /// Wildcard SELECT *.
@@ -128,21 +104,13 @@ fn test_join_select_mixed_alias_and_bare() {
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
 
-    p.execute(
-        "CREATE TABLE m (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, mv BIGINT NOT NULL)",
-    )
-    .unwrap();
-    p.execute(
-        "CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, nv BIGINT NOT NULL)",
-    )
-    .unwrap();
+    p.execute("CREATE TABLE m (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, mv BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE n (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, nv BIGINT NOT NULL)")
+        .unwrap();
 
     let r = p.execute("CREATE VIEW v AS SELECT m.id AS mid, n.nv FROM m JOIN n ON m.fk = n.fk");
-    assert!(
-        r.is_ok(),
-        "mixed alias/bare in JOIN SELECT failed: {:?}",
-        r.err()
-    );
+    assert!(r.is_ok(), "mixed alias/bare in JOIN SELECT failed: {:?}", r.err());
 }
 
 // ── Composite (multi-column) equijoin keys ───────────────────────────────────
@@ -165,11 +133,7 @@ fn test_join_paren_single_pair_accepted() {
         .unwrap();
 
     let r = p.execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON (a.fk = b.fk)");
-    assert!(
-        r.is_ok(),
-        "parenthesized single-pair ON failed: {:?}",
-        r.err()
-    );
+    assert!(r.is_ok(), "parenthesized single-pair ON failed: {:?}", r.err());
 }
 
 /// Planner rejection: a float join key. Fires from validate_join_key_pair inside
@@ -351,14 +315,10 @@ fn test_join_reject_arity_cap() {
         .map(|i| format!("c{i} BIGINT NOT NULL"))
         .collect::<Vec<_>>()
         .join(", ");
-    p.execute(&format!(
-        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, {key_cols})"
-    ))
-    .unwrap();
-    p.execute(&format!(
-        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, {key_cols})"
-    ))
-    .unwrap();
+    p.execute(&format!("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, {key_cols})"))
+        .unwrap();
+    p.execute(&format!("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, {key_cols})"))
+        .unwrap();
 
     let on = (0..n)
         .map(|i| format!("a.c{i} = b.c{i}"))
@@ -394,14 +354,10 @@ fn test_join_max_arity_accepted() {
             .map(|i| format!("c{i} BIGINT NOT NULL"))
             .collect::<Vec<_>>()
             .join(", ");
-        p.execute(&format!(
-            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, {key_cols})"
-        ))
-        .unwrap();
-        p.execute(&format!(
-            "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, {key_cols})"
-        ))
-        .unwrap();
+        p.execute(&format!("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, {key_cols})"))
+            .unwrap();
+        p.execute(&format!("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, {key_cols})"))
+            .unwrap();
         let on = (0..k)
             .map(|i| format!("a.c{i} = b.c{i}"))
             .collect::<Vec<_>>()
@@ -427,10 +383,16 @@ fn test_join_composite_two_pair_inner_data() {
         None => return,
     };
     let (mut client, sn) = make_planner(&srv);
-    exec(&mut client, &sn,
-        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL, av BIGINT NOT NULL)");
-    exec(&mut client, &sn,
-        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL, bv BIGINT NOT NULL)");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL, av BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL, bv BIGINT NOT NULL)",
+    );
     exec(
         &mut client,
         &sn,
@@ -439,11 +401,7 @@ fn test_join_composite_two_pair_inner_data() {
 
     // The view PK is the 2 synthetic join-key columns.
     let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
-    assert_eq!(
-        s.pk_indices(),
-        &[0, 1],
-        "k=2 join PK is the two _join_pk columns"
-    );
+    assert_eq!(s.pk_indices(), &[0, 1], "k=2 join PK is the two _join_pk columns");
 
     // (x,y) matches: (10,100) a1·b1, (30,300) a3·b3. (20,*) differs in y → no match.
     exec(
@@ -463,18 +421,10 @@ fn test_join_composite_two_pair_inner_data() {
     );
 
     // Incremental: a later b row that completes the (20,200) pair must join in.
-    exec(
-        &mut client,
-        &sn,
-        "INSERT INTO b (id, x, y, bv) VALUES (4, 20, 200, 44)",
-    );
+    exec(&mut client, &sn, "INSERT INTO b (id, x, y, bv) VALUES (4, 20, 200, 44)");
     assert_eq!(
         payload_rows(&mut client, &sn, "v", &["x", "y", "av", "bv"]),
-        vec![
-            vec![10, 100, 1, 11],
-            vec![20, 200, 2, 44],
-            vec![30, 300, 3, 33]
-        ],
+        vec![vec![10, 100, 1, 11], vec![20, 200, 2, 44], vec![30, 300, 3, 33]],
         "incremental INNER join admits the newly-completed composite-key pair"
     );
 }
@@ -619,11 +569,7 @@ fn test_join_compound_pk_source_left_outer() {
         &sn,
         "INSERT INTO a (k1, k2, fk, av) VALUES (1, 100, 7, 11), (2, 200, 9, 22)",
     );
-    exec(
-        &mut client,
-        &sn,
-        "INSERT INTO b (id, fk, bv) VALUES (1, 7, 70)",
-    );
+    exec(&mut client, &sn, "INSERT INTO b (id, fk, bv) VALUES (1, 7, 70)");
 
     let (schema, batch) = read_view(&mut client, &sn, "v");
     assert_eq!(batch.len(), 2);
@@ -635,11 +581,7 @@ fn test_join_compound_pk_source_left_outer() {
     // bv_payload_idx: schema [_join_pk(pk), k1, k2, av, bv]; 1 PK col; bv payload = bv_ci - 1
     let bv_payload_idx = bv_ci - schema.pk_cols.len();
 
-    let (r_matched, r_unmatched) = if i64_at(&batch, k1_ci, 0) == 1 {
-        (0, 1)
-    } else {
-        (1, 0)
-    };
+    let (r_matched, r_unmatched) = if i64_at(&batch, k1_ci, 0) == 1 { (0, 1) } else { (1, 0) };
 
     // Matched row (fk=7)
     assert!(!is_null_at(&batch, bv_payload_idx, r_matched));
@@ -691,11 +633,7 @@ fn test_join_compound_pk_source_wide_tiebreak() {
         &sn,
         "INSERT INTO a (k1, k2, k3, fk, av) VALUES (1, 1, 1, 7, 11), (1, 1, 2, 7, 22)",
     );
-    exec(
-        &mut client,
-        &sn,
-        "INSERT INTO b (id, fk, bv) VALUES (1, 7, 70)",
-    );
+    exec(&mut client, &sn, "INSERT INTO b (id, fk, bv) VALUES (1, 7, 70)");
 
     assert_eq!(
         payload_rows(&mut client, &sn, "v", &["k1", "k2", "k3", "av", "bv"]),
@@ -741,11 +679,7 @@ fn test_join_compound_pk_source_update_delete() {
     );
 
     // UPDATE a source payload column: retract+insert reflected on next read.
-    exec(
-        &mut client,
-        &sn,
-        "UPDATE a SET av = 111 WHERE k1 = 1 AND k2 = 100",
-    );
+    exec(&mut client, &sn, "UPDATE a SET av = 111 WHERE k1 = 1 AND k2 = 100");
     assert_eq!(
         payload_rows(&mut client, &sn, "v", &["k1", "k2", "av", "bv"]),
         vec![vec![1, 100, 111, 70], vec![2, 200, 22, 90]],
@@ -817,18 +751,12 @@ fn test_range_join_accepts_band() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    p.execute(
-        "CREATE TABLE bj_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
-    )
-    .unwrap();
-    p.execute(
-        "CREATE TABLE bj_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
-    )
-    .unwrap();
-    p.execute(
-        "CREATE VIEW bj_v AS SELECT * FROM bj_a JOIN bj_b ON bj_a.k = bj_b.k AND bj_a.lo <= bj_b.t",
-    )
-    .unwrap();
+    p.execute("CREATE TABLE bj_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE bj_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE VIEW bj_v AS SELECT * FROM bj_a JOIN bj_b ON bj_a.k = bj_b.k AND bj_a.lo <= bj_b.t")
+        .unwrap();
     assert!(
         client.resolve_table_or_view_id(&sn, "bj_v").is_ok(),
         "band-join view should register"
@@ -845,14 +773,10 @@ fn test_band_left_join_accepts() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    p.execute(
-        "CREATE TABLE bl_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
-    )
-    .unwrap();
-    p.execute(
-        "CREATE TABLE bl_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
-    )
-    .unwrap();
+    p.execute("CREATE TABLE bl_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE bl_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)")
+        .unwrap();
     p.execute(
         "CREATE VIEW bl_v AS SELECT bl_a.id AS aid, bl_b.id AS bid \
                FROM bl_a LEFT JOIN bl_b ON bl_a.k = bl_b.k AND bl_a.lo <= bl_b.t",
@@ -965,9 +889,7 @@ fn test_pure_range_left_join_accepts_narrow_int() {
     }
     for (i, ty) in types.iter().enumerate() {
         assert!(
-            client
-                .resolve_table_or_view_id(&sn, &format!("nv_{i}"))
-                .is_ok(),
+            client.resolve_table_or_view_id(&sn, &format!("nv_{i}")).is_ok(),
             "narrow-int pure-range LEFT view ({ty}) should register"
         );
     }
@@ -1028,8 +950,10 @@ fn test_band_left_join_accepts_wide_range_column() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    p.execute("CREATE TABLE bw_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo DECIMAL(38,0) NOT NULL)").unwrap();
-    p.execute("CREATE TABLE bw_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t DECIMAL(38,0) NOT NULL)").unwrap();
+    p.execute("CREATE TABLE bw_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo DECIMAL(38,0) NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE bw_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t DECIMAL(38,0) NOT NULL)")
+        .unwrap();
     assert!(
         p.execute(
             "CREATE VIEW bw_v AS SELECT bw_a.id AS aid, bw_b.id AS bid \
@@ -1120,27 +1044,15 @@ fn test_pure_range_left_join_circuit_shape() {
 
     // The INLINE threshold reduce: one shard-free REDUCE (emitting the threshold
     // already typed as the compare type, so no relabel), absent from the INNER view.
-    assert_eq!(
-        n_left(OPCODE_REDUCE),
-        1,
-        "v_left carries the inline MIN/MAX reduce"
-    );
+    assert_eq!(n_left(OPCODE_REDUCE), 1, "v_left carries the inline MIN/MAX reduce");
     assert_eq!(n_inner(OPCODE_REDUCE), 0, "INNER pure-range has no reduce");
 
     // The `A − matched` subtraction: one negate + one extra union beyond the inner's
     // single merge union (the matched-union and the (A − matched) union). NOT band's
     // distinct.
     assert_eq!(n_left(OPCODE_DISTINCT), 0, "threshold form has no distinct");
-    assert_eq!(
-        n_inner(OPCODE_DISTINCT),
-        0,
-        "INNER pure-range has no distinct"
-    );
-    assert_eq!(
-        n_left(OPCODE_NEGATE),
-        1,
-        "subtraction form: one negate (A − matched)"
-    );
+    assert_eq!(n_inner(OPCODE_DISTINCT), 0, "INNER pure-range has no distinct");
+    assert_eq!(n_left(OPCODE_NEGATE), 1, "subtraction form: one negate (A − matched)");
     assert_eq!(
         n_left(OPCODE_UNION) - n_inner(OPCODE_UNION),
         3,
@@ -1167,32 +1079,20 @@ fn test_pure_range_left_join_circuit_shape() {
     );
 
     // No outer/anti/semi/equi join machinery, no Delay.
-    assert_eq!(
-        n_left(OPCODE_JOIN_DELTA_TRACE_OUTER),
-        0,
-        "no outer-join operator"
-    );
+    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_OUTER), 0, "no outer-join operator");
     assert_eq!(n_left(OPCODE_ANTI_JOIN_DELTA_TRACE), 0, "no anti-join");
     assert_eq!(n_left(OPCODE_SEMI_JOIN_DELTA_TRACE), 0, "no semi-join");
-    assert_eq!(
-        n_left(OPCODE_JOIN_DELTA_TRACE),
-        0,
-        "no equi delta-trace join"
-    );
+    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
     assert_eq!(n_left(OPCODE_DELAY), 0, "no Delay node");
 
     // No per-view catalog helpers are created (the user-surface leak this redesign
     // removes): neither the old `__m` aggregate view nor the `__sent` sentinel table.
     assert!(
-        client
-            .resolve_table_or_view_id(&sn, "__pls_left__m")
-            .is_err(),
+        client.resolve_table_or_view_id(&sn, "__pls_left__m").is_err(),
         "no internal __m aggregate view should be registered"
     );
     assert!(
-        client
-            .resolve_table_or_view_id(&sn, "__pls_left__sent")
-            .is_err(),
+        client.resolve_table_or_view_id(&sn, "__pls_left__sent").is_err(),
         "no internal __sent sentinel table should be registered"
     );
 }
@@ -1207,18 +1107,12 @@ fn test_range_join_two_range_conjuncts_registers() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    p.execute(
-        "CREATE TABLE r2_a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, w BIGINT NOT NULL)",
-    )
-    .unwrap();
-    p.execute(
-        "CREATE TABLE r2_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL, z BIGINT NOT NULL)",
-    )
-    .unwrap();
-    p.execute(
-        "CREATE VIEW r2_v AS SELECT * FROM r2_a JOIN r2_b ON r2_a.x < r2_b.y AND r2_a.w > r2_b.z",
-    )
-    .unwrap();
+    p.execute("CREATE TABLE r2_a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, w BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE r2_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL, z BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE VIEW r2_v AS SELECT * FROM r2_a JOIN r2_b ON r2_a.x < r2_b.y AND r2_a.w > r2_b.z")
+        .unwrap();
     assert!(
         client.resolve_table_or_view_id(&sn, "r2_v").is_ok(),
         "first range physical, second range residual — view should register"
@@ -1239,8 +1133,7 @@ fn test_range_join_reject_string_range_pair() {
         .unwrap();
     p.execute("CREATE TABLE rs_b (id BIGINT NOT NULL PRIMARY KEY, s VARCHAR NOT NULL)")
         .unwrap();
-    let err =
-        must_err(p.execute("CREATE VIEW rs_v AS SELECT * FROM rs_a JOIN rs_b ON rs_a.s < rs_b.s"));
+    let err = must_err(p.execute("CREATE VIEW rs_v AS SELECT * FROM rs_a JOIN rs_b ON rs_a.s < rs_b.s"));
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.contains("order-preserving"), "got: {s}"),
         e => panic!("expected Unsupported, got {:?}", e),
@@ -1256,13 +1149,9 @@ fn test_range_join_reject_self_join() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    p.execute(
-        "CREATE TABLE rself (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)",
-    )
-    .unwrap();
-    let err = must_err(
-        p.execute("CREATE VIEW rself_v AS SELECT * FROM rself a JOIN rself b ON a.x < b.y"),
-    );
+    p.execute("CREATE TABLE rself (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)")
+        .unwrap();
+    let err = must_err(p.execute("CREATE VIEW rself_v AS SELECT * FROM rself a JOIN rself b ON a.x < b.y"));
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "expected Unsupported, got {:?}",
@@ -1281,8 +1170,10 @@ fn test_range_join_pair_pk_at_cap() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    p.execute("CREATE TABLE rp_a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, x BIGINT NOT NULL, PRIMARY KEY (k1, k2))").unwrap();
-    p.execute("CREATE TABLE rp_b (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, y BIGINT NOT NULL, PRIMARY KEY (k1, k2))").unwrap();
+    p.execute("CREATE TABLE rp_a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, x BIGINT NOT NULL, PRIMARY KEY (k1, k2))")
+        .unwrap();
+    p.execute("CREATE TABLE rp_b (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, y BIGINT NOT NULL, PRIMARY KEY (k1, k2))")
+        .unwrap();
     p.execute("CREATE VIEW rp_v AS SELECT rp_a.x, rp_b.y FROM rp_a JOIN rp_b ON rp_a.x < rp_b.y")
         .unwrap();
     assert!(
@@ -1308,8 +1199,10 @@ fn test_range_join_partition_filter_circuit_shape() {
     let (mut client, sn) = make_planner(&srv);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE cs_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)").unwrap();
-        p.execute("CREATE TABLE cs_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE TABLE cs_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE cs_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)")
+            .unwrap();
         // Band join (one eq conjunct + one range conjunct).
         p.execute(
             "CREATE VIEW cs_band AS SELECT cs_a.id AS aid, cs_b.id AS bid \
@@ -1374,8 +1267,10 @@ fn test_band_left_join_circuit_shape() {
     let (mut client, sn) = make_planner(&srv);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE bls_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)").unwrap();
-        p.execute("CREATE TABLE bls_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE TABLE bls_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE bls_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)")
+            .unwrap();
         // INNER and LEFT band views over identical tables and ON clause.
         p.execute(
             "CREATE VIEW bls_inner AS SELECT bls_a.id AS aid, bls_b.id AS bid \
@@ -1412,11 +1307,7 @@ fn test_band_left_join_circuit_shape() {
         1,
         "one distinct(π_A(inner))"
     );
-    assert_eq!(
-        n_left(OPCODE_NEGATE) - n_inner(OPCODE_NEGATE),
-        1,
-        "negate(D) for A − D"
-    );
+    assert_eq!(n_left(OPCODE_NEGATE) - n_inner(OPCODE_NEGATE), 1, "negate(D) for A − D");
     assert_eq!(
         n_left(OPCODE_UNION) - n_inner(OPCODE_UNION),
         2,
@@ -1457,16 +1348,8 @@ fn test_band_left_join_circuit_shape() {
         "set-difference form uses no anti-join"
     );
     assert_eq!(n_left(OPCODE_SEMI_JOIN_DELTA_TRACE), 0, "no semi-join");
-    assert_eq!(
-        n_left(OPCODE_JOIN_DELTA_TRACE),
-        0,
-        "no equi delta-trace join"
-    );
-    assert_eq!(
-        n_left(OPCODE_JOIN_DELTA_TRACE_OUTER),
-        0,
-        "no outer-join operator"
-    );
+    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
+    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_OUTER), 0, "no outer-join operator");
 
     // Exactly one distinct, and the INNER view is shape-unchanged by the LEFT path.
     assert_eq!(
@@ -1474,16 +1357,8 @@ fn test_band_left_join_circuit_shape() {
         1,
         "exactly one distinct in the band LEFT circuit"
     );
-    assert_eq!(
-        n_inner(OPCODE_DISTINCT),
-        0,
-        "INNER band view has no distinct"
-    );
-    assert_eq!(
-        n_inner(OPCODE_NULL_EXTEND),
-        0,
-        "INNER band view has no null_extend"
-    );
+    assert_eq!(n_inner(OPCODE_DISTINCT), 0, "INNER band view has no distinct");
+    assert_eq!(n_inner(OPCODE_NULL_EXTEND), 0, "INNER band view has no null_extend");
     assert_eq!(n_inner(OPCODE_NEGATE), 0, "INNER band view has no negate");
 }
 
@@ -1514,23 +1389,19 @@ fn test_residual_equi_plus_inequality() {
         &sn,
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
     );
-    exec(&mut client, &sn, "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.t <> b.t");
-    let (vid, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
-    assert_eq!(
-        s.pk_indices(),
-        &[0],
-        "single equi key → one _join_pk PK column"
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.t <> b.t",
     );
+    let (vid, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert_eq!(s.pk_indices(), &[0], "single equi key → one _join_pk PK column");
     assert!(
         s.columns.iter().any(|c| c.name == "aid") && s.columns.iter().any(|c| c.name == "bid"),
         "projected user columns present: {:?}",
         s.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
     );
-    assert_eq!(
-        filter_node_count(&mut client, vid),
-        1,
-        "exactly the residual Filter"
-    );
+    assert_eq!(filter_node_count(&mut client, vid), 1, "exactly the residual Filter");
 }
 
 /// Control: the same join WITHOUT a residual has no Filter node — confirms the
@@ -1558,11 +1429,7 @@ fn test_residual_absent_no_filter() {
         "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k",
     );
     let (vid, _) = client.resolve_table_or_view_id(&sn, "v").unwrap();
-    assert_eq!(
-        filter_node_count(&mut client, vid),
-        0,
-        "no residual ⇒ no Filter"
-    );
+    assert_eq!(filter_node_count(&mut client, vid), 0, "no residual ⇒ no Filter");
 }
 
 /// Equijoin + column-vs-literal residual (`a.r = 5`).
@@ -1589,11 +1456,7 @@ fn test_residual_equi_plus_literal() {
         "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.k = b.k AND a.r = 5",
     );
     let (vid, _) = client.resolve_table_or_view_id(&sn, "v").unwrap();
-    assert_eq!(
-        filter_node_count(&mut client, vid),
-        1,
-        "residual Filter spliced"
-    );
+    assert_eq!(filter_node_count(&mut client, vid), 1, "residual Filter spliced");
 }
 
 /// Equijoin + residual referencing an arithmetic expression (`a.lo + 1 < b.hi`).
@@ -1694,9 +1557,21 @@ fn test_residual_band_plus_second_range() {
         None => return,
     };
     let (mut client, sn) = make_planner(&srv);
-    exec(&mut client, &sn, "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL, x BIGINT NOT NULL)");
-    exec(&mut client, &sn, "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, hi BIGINT NOT NULL, y BIGINT NOT NULL)");
-    exec(&mut client, &sn, "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.lo < b.hi AND a.x > b.y");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL, x BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, hi BIGINT NOT NULL, y BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.k = b.k AND a.lo < b.hi AND a.x > b.y",
+    );
     let (vid, _) = client.resolve_table_or_view_id(&sn, "v").unwrap();
     assert_eq!(
         filter_node_count(&mut client, vid),
@@ -1723,7 +1598,11 @@ fn test_residual_pure_range() {
         &sn,
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL, s BIGINT NOT NULL)",
     );
-    exec(&mut client, &sn, "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.x < b.y AND a.r <> b.s");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.x < b.y AND a.r <> b.s",
+    );
     let (vid, _) = client.resolve_table_or_view_id(&sn, "v").unwrap();
     assert_eq!(
         filter_node_count(&mut client, vid),

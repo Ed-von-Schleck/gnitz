@@ -12,15 +12,20 @@ use common::*;
 /// epochs (the correct incremental-view test shape).
 fn setup_views(client: &mut GnitzClient, sn: &str) {
     let mut p = SqlPlanner::new(client, sn);
-    p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, val BIGINT NOT NULL)").unwrap();
-    p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, val BIGINT NOT NULL)").unwrap();
-    p.execute("CREATE VIEW ve AS SELECT * FROM a EXCEPT SELECT * FROM b").unwrap();
-    p.execute("CREATE VIEW vi AS SELECT * FROM a INTERSECT SELECT * FROM b").unwrap();
+    p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, val BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, val BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE VIEW ve AS SELECT * FROM a EXCEPT SELECT * FROM b")
+        .unwrap();
+    p.execute("CREATE VIEW vi AS SELECT * FROM a INTERSECT SELECT * FROM b")
+        .unwrap();
 }
 
 fn insert(client: &mut GnitzClient, sn: &str, tbl: &str, id: i64, val: i64) {
     let mut p = SqlPlanner::new(client, sn);
-    p.execute(&format!("INSERT INTO {} (id, val) VALUES ({}, {})", tbl, id, val)).unwrap();
+    p.execute(&format!("INSERT INTO {} (id, val) VALUES ({}, {})", tbl, id, val))
+        .unwrap();
 }
 
 // ── Set operations over compound-PK sources ──────────────────────────
@@ -29,19 +34,30 @@ fn insert(client: &mut GnitzClient, sn: &str, tbl: &str, id: i64, val: i64) {
 
 #[test]
 fn test_set_ops_compound_pk() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE t1 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))").unwrap();
-        p.execute("CREATE TABLE t2 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))").unwrap();
-        p.execute("CREATE VIEW v_union AS SELECT val FROM t1 UNION SELECT val FROM t2").unwrap();
-        p.execute("CREATE VIEW v_union_all AS SELECT val FROM t1 UNION ALL SELECT val FROM t2").unwrap();
-        p.execute("CREATE VIEW v_except AS SELECT val FROM t1 EXCEPT SELECT val FROM t2").unwrap();
-        p.execute("CREATE VIEW v_intersect AS SELECT val FROM t1 INTERSECT SELECT val FROM t2").unwrap();
+        p.execute("CREATE TABLE t1 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))")
+            .unwrap();
+        p.execute("CREATE TABLE t2 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))")
+            .unwrap();
+        p.execute("CREATE VIEW v_union AS SELECT val FROM t1 UNION SELECT val FROM t2")
+            .unwrap();
+        p.execute("CREATE VIEW v_union_all AS SELECT val FROM t1 UNION ALL SELECT val FROM t2")
+            .unwrap();
+        p.execute("CREATE VIEW v_except AS SELECT val FROM t1 EXCEPT SELECT val FROM t2")
+            .unwrap();
+        p.execute("CREATE VIEW v_intersect AS SELECT val FROM t1 INTERSECT SELECT val FROM t2")
+            .unwrap();
 
-        p.execute("INSERT INTO t1 (a, b, val) VALUES (1, 1, 100), (1, 2, 200), (2, 1, 300)").unwrap();
-        p.execute("INSERT INTO t2 (a, b, val) VALUES (1, 1, 200), (2, 2, 400)").unwrap();
+        p.execute("INSERT INTO t1 (a, b, val) VALUES (1, 1, 100), (1, 2, 200), (2, 1, 300)")
+            .unwrap();
+        p.execute("INSERT INTO t2 (a, b, val) VALUES (1, 1, 200), (2, 2, 400)")
+            .unwrap();
     }
 
     // UNION (distinct): 200 appears on both sides but collapses to one row.
@@ -74,15 +90,22 @@ fn test_set_ops_compound_pk() {
 
 #[test]
 fn test_set_ops_incrementality_compound_pk() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE t1 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))").unwrap();
-        p.execute("CREATE TABLE t2 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))").unwrap();
-        p.execute("CREATE VIEW v_except AS SELECT val FROM t1 EXCEPT SELECT val FROM t2").unwrap();
+        p.execute("CREATE TABLE t1 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))")
+            .unwrap();
+        p.execute("CREATE TABLE t2 (a BIGINT, b BIGINT, val BIGINT NOT NULL, PRIMARY KEY (a, b))")
+            .unwrap();
+        p.execute("CREATE VIEW v_except AS SELECT val FROM t1 EXCEPT SELECT val FROM t2")
+            .unwrap();
 
-        p.execute("INSERT INTO t1 (a, b, val) VALUES (1, 1, 100), (1, 2, 200)").unwrap();
+        p.execute("INSERT INTO t1 (a, b, val) VALUES (1, 1, 100), (1, 2, 200)")
+            .unwrap();
     }
     let (schema, batch) = read_view(&mut client, &sn, "v_except");
     let val_idx = col_idx(&schema, "val");
@@ -109,13 +132,19 @@ fn test_set_ops_incrementality_compound_pk() {
 
 #[test]
 fn test_set_ops_wide_pk_regression() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE t1 (id DECIMAL(38, 0) PRIMARY KEY, val BIGINT NOT NULL)").unwrap();
-        p.execute("CREATE TABLE t2 (id DECIMAL(38, 0) PRIMARY KEY, val BIGINT NOT NULL)").unwrap();
-        p.execute("CREATE VIEW v AS SELECT val FROM t1 UNION SELECT val FROM t2").unwrap();
+        p.execute("CREATE TABLE t1 (id DECIMAL(38, 0) PRIMARY KEY, val BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE t2 (id DECIMAL(38, 0) PRIMARY KEY, val BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE VIEW v AS SELECT val FROM t1 UNION SELECT val FROM t2")
+            .unwrap();
 
         p.execute("INSERT INTO t1 (id, val) VALUES (1, 100)").unwrap();
         p.execute("INSERT INTO t2 (id, val) VALUES (1, 200)").unwrap();
@@ -131,7 +160,10 @@ fn test_set_ops_wide_pk_regression() {
 
 #[test]
 fn test_except_full_row_identity() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     setup_views(&mut client, &sn);
     // A=(1,100), B=(1,200): same PK=1, different payload. EXCEPT keeps (1,100)
@@ -146,7 +178,10 @@ fn test_except_full_row_identity() {
 
 #[test]
 fn test_intersect_full_row_identity() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     setup_views(&mut client, &sn);
     // A=(1,100), B=(1,200): no identical full row → INTERSECT empty. The old
@@ -161,7 +196,10 @@ fn test_intersect_full_row_identity() {
 
 #[test]
 fn test_set_ops_identical_rows_match() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     setup_views(&mut client, &sn);
     // A=(1,100), B=(1,100): identical full row (separate epochs).
@@ -181,23 +219,31 @@ fn test_set_ops_identical_rows_match() {
 
 #[test]
 fn test_union_projection_applied() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, name BIGINT NOT NULL)").unwrap();
-        p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, name BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, name BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, name BIGINT NOT NULL)")
+            .unwrap();
         // Project only `name`; `id` must NOT leak into the view schema.
-        p.execute("CREATE VIEW v AS SELECT name FROM a UNION SELECT name FROM b").unwrap();
+        p.execute("CREATE VIEW v AS SELECT name FROM a UNION SELECT name FROM b")
+            .unwrap();
         p.execute("INSERT INTO a (id, name) VALUES (1, 100)").unwrap();
         p.execute("INSERT INTO b (id, name) VALUES (2, 100)").unwrap();
     }
     let (schema, batch) = read_view(&mut client, &sn, "v");
     // schema is [_set_pk, name] — exactly one projected payload column.
     assert!(schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case("name")));
-    assert!(!schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case("id")),
+    assert!(
+        !schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case("id")),
         "projected-out column `id` must not appear, got {:?}",
-        schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>());
+        schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
     assert_eq!(schema.columns.len(), 2, "exactly _set_pk + name");
     // UNION distinct: both sides have name=100 → one row.
     assert_eq!(batch.len(), 1, "UNION distinct over identical projected value → 1 row");
@@ -212,13 +258,19 @@ fn test_union_projection_applied() {
 
 #[test]
 fn test_except_distinct_lifting_no_underflow() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, name BIGINT NOT NULL)").unwrap();
-        p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, name BIGINT NOT NULL)").unwrap();
-        p.execute("CREATE VIEW v AS SELECT name FROM a EXCEPT SELECT name FROM b").unwrap();
+        p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, name BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, name BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE VIEW v AS SELECT name FROM a EXCEPT SELECT name FROM b")
+            .unwrap();
         // A has name=100. B gains two rows, both name=100 (distinct PKs).
         p.execute("INSERT INTO a (id, name) VALUES (1, 100)").unwrap();
         p.execute("INSERT INTO b (id, name) VALUES (1, 100)").unwrap();
@@ -227,8 +279,11 @@ fn test_except_distinct_lifting_no_underflow() {
     let (_schema, batch) = read_view(&mut client, &sn, "v");
     // name=100 is in both A and B → excluded. The second identical-content B
     // insert must not push the weight to -1 (which would surface as a row).
-    assert_eq!(batch.len(), 0,
-        "EXCEPT must stay empty; the duplicate projected B row must not underflow the weight");
+    assert_eq!(
+        batch.len(),
+        0,
+        "EXCEPT must stay empty; the duplicate projected B row must not underflow the weight"
+    );
 }
 
 // ── same-source INTERSECT/EXCEPT rejection (mirror of the self-join guard) ──
@@ -242,13 +297,17 @@ fn test_except_distinct_lifting_no_underflow() {
 
 fn make_t_with_c(client: &mut GnitzClient, sn: &str) {
     let mut p = SqlPlanner::new(client, sn);
-    p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)")
+        .unwrap();
 }
 
 /// Create table `t(id, c)`, run any `extra_setup` statements, then assert
 /// `view_sql` is rejected by the same-source guard's "same relation" error.
 fn assert_same_relation_rejected(extra_setup: &[&str], view_sql: &str) {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     make_t_with_c(&mut client, &sn);
     if !extra_setup.is_empty() {
@@ -268,14 +327,16 @@ fn assert_same_relation_rejected(extra_setup: &[&str], view_sql: &str) {
 fn test_same_table_except_rejected() {
     assert_same_relation_rejected(
         &[],
-        "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 EXCEPT SELECT c FROM t WHERE c < 10");
+        "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 EXCEPT SELECT c FROM t WHERE c < 10",
+    );
 }
 
 #[test]
 fn test_same_table_intersect_rejected() {
     assert_same_relation_rejected(
         &[],
-        "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 INTERSECT SELECT c FROM t WHERE c < 10");
+        "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 INTERSECT SELECT c FROM t WHERE c < 10",
+    );
 }
 
 #[test]
@@ -283,14 +344,16 @@ fn test_same_view_except_rejected() {
     // Both branches read the same view → same source id → rejected.
     assert_same_relation_rejected(
         &["CREATE VIEW vt AS SELECT id, c FROM t WHERE c > 0"],
-        "CREATE VIEW v AS SELECT c FROM vt EXCEPT SELECT c FROM vt");
+        "CREATE VIEW v AS SELECT c FROM vt EXCEPT SELECT c FROM vt",
+    );
 }
 
 #[test]
 fn test_same_view_intersect_rejected() {
     assert_same_relation_rejected(
         &["CREATE VIEW vt AS SELECT id, c FROM t WHERE c > 0"],
-        "CREATE VIEW v AS SELECT c FROM vt INTERSECT SELECT c FROM vt");
+        "CREATE VIEW v AS SELECT c FROM vt INTERSECT SELECT c FROM vt",
+    );
 }
 
 // ── non-over-rejection: two DIFFERENT views over the same base, accepted ────
@@ -300,15 +363,20 @@ fn test_same_view_intersect_rejected() {
 
 #[test]
 fn test_two_views_same_base_except_accepted_and_correct() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     make_t_with_c(&mut client, &sn);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
         p.execute("CREATE VIEW vt1 AS SELECT id, c FROM t WHERE c > 0").unwrap();
-        p.execute("CREATE VIEW vt2 AS SELECT id, c FROM t WHERE c > 50").unwrap();
+        p.execute("CREATE VIEW vt2 AS SELECT id, c FROM t WHERE c > 50")
+            .unwrap();
         // Must NOT raise: vt1 and vt2 have distinct source ids.
-        p.execute("CREATE VIEW v AS SELECT c FROM vt1 EXCEPT SELECT c FROM vt2").unwrap();
+        p.execute("CREATE VIEW v AS SELECT c FROM vt1 EXCEPT SELECT c FROM vt2")
+            .unwrap();
         p.execute("INSERT INTO t (id, c) VALUES (1, 10), (2, 60)").unwrap();
     }
     // vt1 = {10, 60}, vt2 = {60}; EXCEPT = {10}.
@@ -319,14 +387,19 @@ fn test_two_views_same_base_except_accepted_and_correct() {
 
 #[test]
 fn test_two_views_same_base_intersect_accepted_and_correct() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     make_t_with_c(&mut client, &sn);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
         p.execute("CREATE VIEW vt1 AS SELECT id, c FROM t WHERE c > 0").unwrap();
-        p.execute("CREATE VIEW vt2 AS SELECT id, c FROM t WHERE c > 50").unwrap();
-        p.execute("CREATE VIEW v AS SELECT c FROM vt1 INTERSECT SELECT c FROM vt2").unwrap();
+        p.execute("CREATE VIEW vt2 AS SELECT id, c FROM t WHERE c > 50")
+            .unwrap();
+        p.execute("CREATE VIEW v AS SELECT c FROM vt1 INTERSECT SELECT c FROM vt2")
+            .unwrap();
         p.execute("INSERT INTO t (id, c) VALUES (1, 10), (2, 60)").unwrap();
     }
     // vt1 = {10, 60}, vt2 = {60}; INTERSECT = {60}.
@@ -339,34 +412,39 @@ fn test_two_views_same_base_intersect_accepted_and_correct() {
 
 #[test]
 fn test_same_table_union_distinct_accepted_and_correct() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     make_t_with_c(&mut client, &sn);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute(
-            "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 UNION SELECT c FROM t WHERE c < 100"
-        ).unwrap();
+        p.execute("CREATE VIEW v AS SELECT c FROM t WHERE c > 0 UNION SELECT c FROM t WHERE c < 100")
+            .unwrap();
         p.execute("INSERT INTO t (id, c) VALUES (1, 50), (2, 150)").unwrap();
     }
     // left {50,150}, right {50}; UNION distinct = {50, 150}.
     let (schema, batch) = read_view(&mut client, &sn, "v");
     let mut vals: Vec<i64> = (0..batch.len())
-        .map(|r| i64_at(&batch, col_idx(&schema, "c"), r)).collect();
+        .map(|r| i64_at(&batch, col_idx(&schema, "c"), r))
+        .collect();
     vals.sort();
     assert_eq!(vals, vec![50, 150]);
 }
 
 #[test]
 fn test_same_table_union_all_accepted_and_correct() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     make_t_with_c(&mut client, &sn);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute(
-            "CREATE VIEW v AS SELECT c FROM t WHERE c > 0 UNION ALL SELECT c FROM t WHERE c < 100"
-        ).unwrap();
+        p.execute("CREATE VIEW v AS SELECT c FROM t WHERE c > 0 UNION ALL SELECT c FROM t WHERE c < 100")
+            .unwrap();
         p.execute("INSERT INTO t (id, c) VALUES (1, 50), (2, 150)").unwrap();
     }
     // c=50 matches both branches → weight 2; c=150 matches only the first.
@@ -390,17 +468,22 @@ fn test_same_table_union_all_accepted_and_correct() {
 
 #[test]
 fn test_transitive_self_join_accepted_and_correct() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL)")
+            .unwrap();
         // vt is a view over t; the join names t and vt → two dependency edges.
-        p.execute("CREATE VIEW vt AS SELECT id, k, v FROM t WHERE v > 0").unwrap();
-        p.execute(
-            "CREATE VIEW j AS SELECT t.id AS lid, vt.id AS rid FROM t JOIN vt ON t.k = vt.k"
-        ).unwrap();
-        p.execute("INSERT INTO t (id, k, v) VALUES (1, 5, 10), (2, 5, 20)").unwrap();
+        p.execute("CREATE VIEW vt AS SELECT id, k, v FROM t WHERE v > 0")
+            .unwrap();
+        p.execute("CREATE VIEW j AS SELECT t.id AS lid, vt.id AS rid FROM t JOIN vt ON t.k = vt.k")
+            .unwrap();
+        p.execute("INSERT INTO t (id, k, v) VALUES (1, 5, 10), (2, 5, 20)")
+            .unwrap();
     }
     // Both rows have v>0 → vt has both; join on k=5 → 2×2 = 4 product rows.
     let (_schema, batch) = read_view(&mut client, &sn, "j");
@@ -418,13 +501,19 @@ fn test_transitive_self_join_accepted_and_correct() {
 
 #[test]
 fn test_except_left_duplicate_projected_weight_one() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)").unwrap();
-        p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)").unwrap();
-        p.execute("CREATE VIEW v AS SELECT c FROM a EXCEPT SELECT c FROM b").unwrap();
+        p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE VIEW v AS SELECT c FROM a EXCEPT SELECT c FROM b")
+            .unwrap();
         // Two left rows projecting to c=5; right side still empty.
         p.execute("INSERT INTO a (id, c) VALUES (1, 5), (2, 5)").unwrap();
     }
@@ -436,14 +525,20 @@ fn test_except_left_duplicate_projected_weight_one() {
             .map(|r| batch.weights[r])
             .sum()
     };
-    assert_eq!(weight_of_5(&mut client), 1,
-        "EXCEPT must lift the left branch through distinct: c=5 carried by two source rows → weight 1, not 2");
+    assert_eq!(
+        weight_of_5(&mut client),
+        1,
+        "EXCEPT must lift the left branch through distinct: c=5 carried by two source rows → weight 1, not 2"
+    );
 
     // Right side now covers c=5 → the difference nets to 0 (a raw weight-2 left
     // would leave it surviving at weight 1).
     insert(&mut client, &sn, "b", 1, 5);
-    assert_eq!(weight_of_5(&mut client), 0,
-        "once the right side covers c=5 the EXCEPT must net to 0");
+    assert_eq!(
+        weight_of_5(&mut client),
+        0,
+        "once the right side covers c=5 the EXCEPT must net to 0"
+    );
 }
 
 // ── §7: per-operator output nullability ─────────────────────────────────────
@@ -463,75 +558,102 @@ fn view_col_nullable(client: &mut GnitzClient, sn: &str, view: &str, col: &str) 
 /// one NOT NULL, one nullable — so each operator's bound can be observed.
 fn setup_nullability_tables(client: &mut GnitzClient, sn: &str) {
     let mut p = SqlPlanner::new(client, sn);
-    p.execute("CREATE TABLE nn (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE nn (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)")
+        .unwrap();
     p.execute("CREATE TABLE nl (id BIGINT PRIMARY KEY, v BIGINT)").unwrap();
 }
 
 #[test]
 fn test_intersect_nullability_is_and() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     setup_nullability_tables(&mut client, &sn);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
         // NOT NULL ∩ nullable → AND → NOT NULL.
-        p.execute("CREATE VIEW v AS SELECT v FROM nn INTERSECT SELECT v FROM nl").unwrap();
+        p.execute("CREATE VIEW v AS SELECT v FROM nn INTERSECT SELECT v FROM nl")
+            .unwrap();
     }
-    assert!(!view_col_nullable(&mut client, &sn, "v", "v"),
-        "INTERSECT column is nullable only if BOTH sides are; here the left is NOT NULL");
+    assert!(
+        !view_col_nullable(&mut client, &sn, "v", "v"),
+        "INTERSECT column is nullable only if BOTH sides are; here the left is NOT NULL"
+    );
 }
 
 #[test]
 fn test_except_nullability_equals_left() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     setup_nullability_tables(&mut client, &sn);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
         // left NOT NULL, right nullable → output NOT NULL (the right is ignored).
-        p.execute("CREATE VIEW v_nn AS SELECT v FROM nn EXCEPT SELECT v FROM nl").unwrap();
+        p.execute("CREATE VIEW v_nn AS SELECT v FROM nn EXCEPT SELECT v FROM nl")
+            .unwrap();
         // left nullable, right NOT NULL → output nullable (equals the left).
-        p.execute("CREATE VIEW v_nl AS SELECT v FROM nl EXCEPT SELECT v FROM nn").unwrap();
+        p.execute("CREATE VIEW v_nl AS SELECT v FROM nl EXCEPT SELECT v FROM nn")
+            .unwrap();
     }
-    assert!(!view_col_nullable(&mut client, &sn, "v_nn", "v"),
-        "EXCEPT nullability equals the LEFT input's; NOT NULL left → NOT NULL output");
-    assert!(view_col_nullable(&mut client, &sn, "v_nl", "v"),
-        "EXCEPT nullability equals the LEFT input's, independent of the right; nullable left → nullable output");
+    assert!(
+        !view_col_nullable(&mut client, &sn, "v_nn", "v"),
+        "EXCEPT nullability equals the LEFT input's; NOT NULL left → NOT NULL output"
+    );
+    assert!(
+        view_col_nullable(&mut client, &sn, "v_nl", "v"),
+        "EXCEPT nullability equals the LEFT input's, independent of the right; nullable left → nullable output"
+    );
 }
 
 #[test]
 fn test_union_nullability_is_or() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     setup_nullability_tables(&mut client, &sn);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
         // A union tuple may originate from either side → OR retained → nullable.
-        p.execute("CREATE VIEW v_u AS SELECT v FROM nn UNION SELECT v FROM nl").unwrap();
-        p.execute("CREATE VIEW v_ua AS SELECT v FROM nn UNION ALL SELECT v FROM nl").unwrap();
+        p.execute("CREATE VIEW v_u AS SELECT v FROM nn UNION SELECT v FROM nl")
+            .unwrap();
+        p.execute("CREATE VIEW v_ua AS SELECT v FROM nn UNION ALL SELECT v FROM nl")
+            .unwrap();
     }
-    assert!(view_col_nullable(&mut client, &sn, "v_u", "v"),
-        "UNION keeps the OR: a nullable side makes the output nullable");
-    assert!(view_col_nullable(&mut client, &sn, "v_ua", "v"),
-        "UNION ALL keeps the OR: a nullable side makes the output nullable");
+    assert!(
+        view_col_nullable(&mut client, &sn, "v_u", "v"),
+        "UNION keeps the OR: a nullable side makes the output nullable"
+    );
+    assert!(
+        view_col_nullable(&mut client, &sn, "v_ua", "v"),
+        "UNION ALL keeps the OR: a nullable side makes the output nullable"
+    );
 }
 
 #[test]
 fn test_direct_self_join_still_rejected() {
     // Mirror of planner_view_validation.rs:81; kept here so the set-op scope
     // boundary is documented in one place.
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     {
         let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL)").unwrap();
+        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL)")
+            .unwrap();
     }
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute(
-        "CREATE VIEW j AS SELECT a.id FROM t AS a JOIN t AS b ON a.k = b.k"));
+    let err = must_err(p.execute("CREATE VIEW j AS SELECT a.id FROM t AS a JOIN t AS b ON a.k = b.k"));
     match err {
-        GnitzSqlError::Unsupported(s) => assert!(
-            s.to_lowercase().contains("self-join"), "got: {}", s),
+        GnitzSqlError::Unsupported(s) => assert!(s.to_lowercase().contains("self-join"), "got: {}", s),
         e => panic!("expected Unsupported, got {:?}", e),
     }
 }
@@ -545,37 +667,47 @@ fn test_direct_self_join_still_rejected() {
 
 #[test]
 fn test_set_op_float_column_rejected() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, d DOUBLE NOT NULL, g BIGINT NOT NULL)").unwrap();
-    p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, d DOUBLE NOT NULL, g BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, d DOUBLE NOT NULL, g BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, d DOUBLE NOT NULL, g BIGINT NOT NULL)")
+        .unwrap();
 
     for op in ["UNION", "EXCEPT", "INTERSECT"] {
-        let err = must_err(p.execute(&format!(
-            "CREATE VIEW vbad AS SELECT d FROM a {op} SELECT d FROM b"
-        )));
+        let err = must_err(p.execute(&format!("CREATE VIEW vbad AS SELECT d FROM a {op} SELECT d FROM b")));
         assert!(
             matches!(&err, GnitzSqlError::Unsupported(s) if s.contains("float")),
-            "expected float-identity Unsupported for {op}, got {:?}", err,
+            "expected float-identity Unsupported for {op}, got {:?}",
+            err,
         );
     }
 
     // A non-float set-op still succeeds.
-    p.execute("CREATE VIEW vg AS SELECT g FROM a UNION SELECT g FROM b").unwrap();
+    p.execute("CREATE VIEW vg AS SELECT g FROM a UNION SELECT g FROM b")
+        .unwrap();
 }
 
 // ── Duplicate output column names rejected (set-op view) ──────────────
 
 #[test]
 fn test_set_op_duplicate_output_columns_rejected() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    p.execute("CREATE TABLE so_dup (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)").unwrap();
+    p.execute("CREATE TABLE so_dup (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)")
+        .unwrap();
     let err = must_err(p.execute(
         "CREATE VIEW v_so_dup AS SELECT a AS x, b AS x FROM so_dup \
-         UNION SELECT a AS x, b AS x FROM so_dup"));
+         UNION SELECT a AS x, b AS x FROM so_dup",
+    ));
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("duplicate column"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),

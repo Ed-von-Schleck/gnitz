@@ -20,7 +20,10 @@ fn or_with_null_lhs_uses_true_rhs() {
     //   id=1 → NULL OR TRUE  = TRUE  → deleted
     //   id=2 → NULL OR FALSE = NULL  → kept
     // The eager-NULL bug returns NULL for both and deletes nothing.
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT)");
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, NULL)");
@@ -39,7 +42,10 @@ fn or_with_null_lhs_uses_true_rhs() {
 fn or_with_null_rhs_uses_true_lhs() {
     // `id = 1 OR val = 5` for row (1, NULL): TRUE OR NULL = TRUE → deleted.
     // The eager-NULL bug evaluates the NULL RHS and returns NULL → not deleted.
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, val BIGINT)");
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, NULL)");
@@ -57,9 +63,16 @@ fn false_and_null_is_false_under_not() {
     // Row (1, a=0, b=NULL). `NOT (a = 5 AND b = 10)`:
     //   a=5 → FALSE, b=10 → NULL.  FALSE AND NULL = FALSE; NOT FALSE = TRUE → deleted.
     // The eager-NULL bug makes the inner AND = NULL, so NOT NULL = NULL → not deleted.
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
-    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
+    );
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, 0, NULL)");
 
     let n = affected(&mut client, &sn, "DELETE FROM t WHERE NOT (a = 5 AND b = 10)");
@@ -74,9 +87,16 @@ fn false_and_null_is_false_under_not() {
 fn null_and_true_is_null_excludes_row() {
     // Row (1, a=NULL, b=1). `a = 5 AND b = 1`: NULL AND TRUE = NULL → not deleted.
     // (Both pre- and post-fix exclude the row; this guards the NULL→excluded path.)
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
-    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
+    );
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, NULL, 1)");
 
     let n = affected(&mut client, &sn, "DELETE FROM t WHERE a = 5 AND b = 1");

@@ -13,7 +13,10 @@ use gnitz_test_harness::ServerHandle;
 
 #[test]
 fn delete_in_list_absent_key_is_noop() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, 10)");
@@ -36,7 +39,10 @@ fn delete_in_list_absent_key_is_noop() {
 
 #[test]
 fn delete_in_list_counts_distinct_existing_only() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, 10)");
@@ -53,7 +59,10 @@ fn delete_in_list_counts_distinct_existing_only() {
 
 #[test]
 fn delete_in_list_duplicate_existing_is_idempotent() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, 10)");

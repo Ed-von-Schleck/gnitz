@@ -1,10 +1,10 @@
-mod error;
-mod types;
-mod logical_plan;
 mod binder;
-mod expr;
 pub mod dml;
+mod error;
+mod expr;
+mod logical_plan;
 pub mod planner;
+mod types;
 
 pub use error::GnitzSqlError;
 
@@ -15,23 +15,26 @@ use sqlparser::parser::Parser;
 
 /// Result of executing a single SQL statement.
 pub enum SqlResult {
-    TableCreated  { table_id:  u64 },
-    ViewCreated   { view_id:   u64 },
-    IndexCreated  { index_id:  u64 },
+    TableCreated { table_id: u64 },
+    ViewCreated { view_id: u64 },
+    IndexCreated { index_id: u64 },
     Dropped,
-    RowsAffected  { count: usize },
-    Rows          { schema: Schema, batch: ZSetBatch },
+    RowsAffected { count: usize },
+    Rows { schema: Schema, batch: ZSetBatch },
 }
 
 /// High-level SQL execution planner.
 pub struct SqlPlanner<'a> {
-    client:      &'a mut GnitzClient,
+    client: &'a mut GnitzClient,
     schema_name: String,
 }
 
 impl<'a> SqlPlanner<'a> {
     pub fn new(client: &'a mut GnitzClient, schema_name: impl Into<String>) -> Self {
-        SqlPlanner { client, schema_name: schema_name.into() }
+        SqlPlanner {
+            client,
+            schema_name: schema_name.into(),
+        }
     }
 
     /// Parse `sql` and execute each statement, returning one `SqlResult` per statement.

@@ -1,6 +1,6 @@
 use crate::binder::{
-    bind_structural, find_unique_column, fold_null_test, resolve_qualified_column,
-    resolve_unqualified_column, Binder, LeafBinder,
+    bind_structural, find_unique_column, fold_null_test, resolve_qualified_column, resolve_unqualified_column, Binder,
+    LeafBinder,
 };
 use crate::dml;
 use crate::error::{extract_name, extract_table_factor_name, GnitzSqlError};
@@ -9,15 +9,14 @@ use crate::logical_plan::{AggFunc, BinOp, BoundExpr};
 use crate::types::sql_type_to_typecode;
 use crate::SqlResult;
 use gnitz_core::{
-    CircuitBuilder, ExprBuilder, GnitzClient, IndexMeta, RangeRel, AGG_COUNT, AGG_COUNT_NON_NULL,
-    AGG_MAX, AGG_MIN, AGG_SUM,
+    CircuitBuilder, ExprBuilder, GnitzClient, IndexMeta, RangeRel, AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX, AGG_MIN,
+    AGG_SUM,
 };
 use gnitz_core::{ColumnDef, FixedInt, Schema, TypeCode};
 use sqlparser::ast::{
-    BinaryOperator, ColumnOption, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, JoinConstraint, JoinOperator, ObjectType, Query, SelectItem, SetExpr, SetOperator,
-    SetQuantifier, SqlOption, Statement, TableConstraint, TableFactor, Value, ValueWithSpan,
-    WrappedCollection,
+    BinaryOperator, ColumnOption, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
+    JoinOperator, ObjectType, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, SqlOption, Statement,
+    TableConstraint, TableFactor, Value, ValueWithSpan, WrappedCollection,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -30,12 +29,8 @@ pub fn execute_statement(
     let mut binder = Binder::new(schema_name);
 
     match stmt {
-        Statement::CreateTable(create) => {
-            execute_create_table(client, schema_name, create, &mut binder)
-        }
-        Statement::Drop {
-            object_type, names, ..
-        } => execute_drop(client, schema_name, object_type, names),
+        Statement::CreateTable(create) => execute_create_table(client, schema_name, create, &mut binder),
+        Statement::Drop { object_type, names, .. } => execute_drop(client, schema_name, object_type, names),
         Statement::CreateView { name, query, .. } => {
             execute_create_view(client, schema_name, name, query, stmt, &mut binder)
         }
@@ -144,13 +139,7 @@ fn resolve_fk_target(
     // Self-referencing FK: the table being created is not yet in the catalog,
     // so resolve the referenced column against the in-flight column list.
     if ref_table.eq_ignore_ascii_case(current_table_name) {
-        return resolve_fk_target_inline(
-            current_cols,
-            current_pk_cols,
-            &ref_table,
-            referred_columns,
-            fk_col_type,
-        );
+        return resolve_fk_target_inline(current_cols, current_pk_cols, &ref_table, referred_columns, fk_col_type);
     }
 
     let (ref_tid, ref_schema) = client
@@ -193,9 +182,7 @@ fn resolve_fk_target(
             .index_for_column(ref_tid, ref_col_idx)
             .map_err(GnitzSqlError::Exec)?
         {
-            Some(IndexMeta {
-                is_unique: true, ..
-            }) => {}
+            Some(IndexMeta { is_unique: true, .. }) => {}
             _ => {
                 return Err(GnitzSqlError::Unsupported(format!(
                     "FK against table '{}' must reference the primary key or a column \
@@ -227,10 +214,7 @@ fn resolve_fk_target(
 /// name->index lookup silently binds to the first match, so a duplicate would
 /// bind ambiguously for any downstream query. `context` names the DDL surface
 /// for the error message (e.g. "table definition", "CREATE VIEW projection").
-fn reject_duplicate_column_names<'a>(
-    names: impl Iterator<Item = &'a str>,
-    context: &str,
-) -> Result<(), GnitzSqlError> {
+fn reject_duplicate_column_names<'a>(names: impl Iterator<Item = &'a str>, context: &str) -> Result<(), GnitzSqlError> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for name in names {
         if !seen.insert(name.to_lowercase()) {
@@ -303,10 +287,7 @@ fn execute_create_table(
     let sql_cols = &create.columns;
 
     // Reject duplicate column names up front, before the PK binder runs.
-    reject_duplicate_column_names(
-        sql_cols.iter().map(|c| c.name.value.as_str()),
-        "table definition",
-    )?;
+    reject_duplicate_column_names(sql_cols.iter().map(|c| c.name.value.as_str()), "table definition")?;
 
     // Phase 1 — build column defs (name, type, nullability only).
     let mut cols: Vec<ColumnDef> = Vec::with_capacity(sql_cols.len());
@@ -314,10 +295,7 @@ fn execute_create_table(
         cols.push(ColumnDef {
             name: col.name.value.clone(),
             type_code: sql_type_to_typecode(&col.data_type)?,
-            is_nullable: !col
-                .options
-                .iter()
-                .any(|o| matches!(o.option, ColumnOption::NotNull)),
+            is_nullable: !col.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull)),
             fk_table_id: 0,
             fk_col_idx: 0,
         });
@@ -341,10 +319,7 @@ fn execute_create_table(
     // unknown column name produces a Bind error rather than being eclipsed
     // by a duplicate-PK error from a separate inline `PRIMARY KEY` clause.
     for constraint in &create.constraints {
-        if let TableConstraint::PrimaryKey {
-            columns: pk_cols, ..
-        } = constraint
-        {
+        if let TableConstraint::PrimaryKey { columns: pk_cols, .. } = constraint {
             if pk_decl_seen {
                 return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
             }
@@ -354,10 +329,7 @@ fn execute_create_table(
                     .iter()
                     .position(|c| c.name.value.eq_ignore_ascii_case(&col_ident.value))
                     .ok_or_else(|| {
-                        GnitzSqlError::Bind(format!(
-                            "PRIMARY KEY column '{}' not found",
-                            col_ident.value
-                        ))
+                        GnitzSqlError::Bind(format!("PRIMARY KEY column '{}' not found", col_ident.value))
                     })?;
                 if pk_indices.contains(&(idx as u32)) {
                     return Err(GnitzSqlError::Plan(format!(
@@ -376,10 +348,7 @@ fn execute_create_table(
     // see an empty `pk_indices` and fail spuriously.
     for (i, col) in sql_cols.iter().enumerate() {
         for opt in &col.options {
-            if let ColumnOption::Unique {
-                is_primary: true, ..
-            } = &opt.option
-            {
+            if let ColumnOption::Unique { is_primary: true, .. } = &opt.option {
                 if pk_decl_seen {
                     return Err(GnitzSqlError::Plan("Multiple PRIMARY KEYs defined".into()));
                 }
@@ -412,9 +381,9 @@ fn execute_create_table(
                     cols[i].fk_col_idx = idx;
                     cols[i].type_code = parent_pk_type;
                 }
-                ColumnOption::Unique {
-                    is_primary: false, ..
-                } if !unique_cols.iter().any(|(c, _)| c.as_slice() == [i as u32]) => {
+                ColumnOption::Unique { is_primary: false, .. }
+                    if !unique_cols.iter().any(|(c, _)| c.as_slice() == [i as u32]) =>
+                {
                     unique_cols.push((vec![i as u32], None));
                 }
                 _ => {}
@@ -473,9 +442,7 @@ fn execute_create_table(
         } = constraint
         {
             if columns.is_empty() {
-                return Err(GnitzSqlError::Plan(
-                    "UNIQUE constraint cannot be empty".into(),
-                ));
+                return Err(GnitzSqlError::Plan("UNIQUE constraint cannot be empty".into()));
             }
             let mut col_indices: Vec<u32> = Vec::with_capacity(columns.len());
             for col_ident in columns {
@@ -484,9 +451,7 @@ fn execute_create_table(
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| {
-                        GnitzSqlError::Bind(format!(
-                            "UNIQUE column '{col_name}' not found in table definition"
-                        ))
+                        GnitzSqlError::Bind(format!("UNIQUE column '{col_name}' not found in table definition"))
                     })?;
                 if col_indices.contains(&(idx as u32)) {
                     return Err(GnitzSqlError::Plan(format!(
@@ -495,17 +460,10 @@ fn execute_create_table(
                 }
                 col_indices.push(idx as u32);
             }
-            if unique_cols
-                .iter()
-                .any(|(c, _)| c.as_slice() == col_indices.as_slice())
-            {
+            if unique_cols.iter().any(|(c, _)| c.as_slice() == col_indices.as_slice()) {
                 return Err(GnitzSqlError::Plan(format!(
                     "duplicate UNIQUE constraint on column(s) ({})",
-                    columns
-                        .iter()
-                        .map(|c| c.value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    columns.iter().map(|c| c.value.as_str()).collect::<Vec<_>>().join(", ")
                 )));
             }
             let constraint_name = name_ident.as_ref().map(|n| n.value.clone());
@@ -573,11 +531,7 @@ fn execute_create_table(
     // single-element lone PK, so both are kept (the engine supports unique
     // indices on PK columns, and the engine's trivial-uniqueness short-circuit
     // skips the pre-flight scan for a composite UNIQUE equal to a compound PK).
-    let lone_pk: &[u32] = if pk_indices.len() == 1 {
-        &pk_indices
-    } else {
-        &[]
-    };
+    let lone_pk: &[u32] = if pk_indices.len() == 1 { &pk_indices } else { &[] };
     unique_cols.retain(|(c, _)| c.as_slice() != lone_pk);
 
     // Pre-validate index-eligibility BEFORE create_table: DDL is not
@@ -605,17 +559,14 @@ fn execute_create_table(
     // No clause ⇒ `k = 0` ⇒ default full-PK distribution (byte-identical to before
     // this feature). `GenericDialect` parses `CLUSTER BY a, b` into `cluster_by`.
     let dist_prefix_len = if let Some(cluster) = &create.cluster_by {
-        let (WrappedCollection::NoWrapping(idents) | WrappedCollection::Parentheses(idents)) =
-            cluster;
+        let (WrappedCollection::NoWrapping(idents) | WrappedCollection::Parentheses(idents)) = cluster;
         let mut cluster_indices: Vec<u32> = Vec::with_capacity(idents.len());
         for col_ident in idents {
-            let idx = find_unique_column(&cols, &col_ident.value)?.ok_or_else(|| {
-                GnitzSqlError::Bind(format!("CLUSTER BY column '{}' not found", col_ident.value))
-            })?;
+            let idx = find_unique_column(&cols, &col_ident.value)?
+                .ok_or_else(|| GnitzSqlError::Bind(format!("CLUSTER BY column '{}' not found", col_ident.value)))?;
             cluster_indices.push(idx as u32);
         }
-        gnitz_core::validate_dist_prefix(&pk_indices, &cluster_indices)
-            .map_err(GnitzSqlError::Plan)?
+        gnitz_core::validate_dist_prefix(&pk_indices, &cluster_indices).map_err(GnitzSqlError::Plan)?
     } else {
         0
     };
@@ -653,15 +604,9 @@ fn execute_create_table(
     // avoid an orphaned table with missing constraints (DDL is not
     // transactional across the create_table / create_index boundary).
     for (col_indices, constraint_name) in &unique_cols {
-        let col_types: Vec<TypeCode> = col_indices
-            .iter()
-            .map(|&c| cols[c as usize].type_code)
-            .collect();
+        let col_types: Vec<TypeCode> = col_indices.iter().map(|&c| cols[c as usize].type_code).collect();
         let index_name = constraint_name.clone().unwrap_or_else(|| {
-            let col_names: Vec<&str> = col_indices
-                .iter()
-                .map(|&c| cols[c as usize].name.as_str())
-                .collect();
+            let col_names: Vec<&str> = col_indices.iter().map(|&c| cols[c as usize].name.as_str()).collect();
             default_index_name(schema_name, &table_name, &col_names)
         });
         if let Err(e) = client.create_index(tid, col_indices, &col_types, &index_name, true) {
@@ -684,19 +629,13 @@ fn execute_drop(
 
         match object_type {
             ObjectType::Table => {
-                client
-                    .drop_table(schema_name, &name)
-                    .map_err(GnitzSqlError::Exec)?;
+                client.drop_table(schema_name, &name).map_err(GnitzSqlError::Exec)?;
             }
             ObjectType::View => {
-                client
-                    .drop_view(schema_name, &name)
-                    .map_err(GnitzSqlError::Exec)?;
+                client.drop_view(schema_name, &name).map_err(GnitzSqlError::Exec)?;
             }
             ObjectType::Index => {
-                client
-                    .drop_index_by_name(&name)
-                    .map_err(GnitzSqlError::Exec)?;
+                client.drop_index_by_name(&name).map_err(GnitzSqlError::Exec)?;
             }
             _ => {
                 return Err(GnitzSqlError::Unsupported(format!(
@@ -719,9 +658,7 @@ fn execute_create_view(
     let view_name = extract_name(view_name_obj, "CREATE VIEW")?;
 
     if query.order_by.is_some() {
-        return Err(GnitzSqlError::Unsupported(
-            "ORDER BY not supported".to_string(),
-        ));
+        return Err(GnitzSqlError::Unsupported("ORDER BY not supported".to_string()));
     }
     // An incremental circuit has no meaningful LIMIT/OFFSET semantics; a silently
     // ignored LIMIT would stream the full table.
@@ -736,9 +673,7 @@ fn execute_create_view(
     // Process CTEs (WITH clause) — inline them into the binder cache
     if let Some(with) = &query.with {
         if with.recursive {
-            return Err(GnitzSqlError::Unsupported(
-                "recursive CTEs not supported".to_string(),
-            ));
+            return Err(GnitzSqlError::Unsupported("recursive CTEs not supported".to_string()));
         }
         for cte in &with.cte_tables {
             let cte_name = cte.alias.name.value.clone();
@@ -756,10 +691,7 @@ fn execute_create_view(
                     "CTE '{cte_name}': only single table without JOINs"
                 )));
             }
-            let cte_table_name = extract_table_factor_name(
-                &cte_select.from[0].relation,
-                &format!("CTE '{cte_name}'"),
-            )?;
+            let cte_table_name = extract_table_factor_name(&cte_select.from[0].relation, &format!("CTE '{cte_name}'"))?;
             // Resolve the CTE's source table and cache the CTE name as an alias.
             let (cte_tid, cte_schema) = binder.resolve(client, &cte_table_name)?;
             // A CTE is inlined only as a plain column pass-through of its source
@@ -782,12 +714,8 @@ fn execute_create_view(
                     && cte_select.projection.iter().enumerate().all(|(i, item)| {
                         let want = &cte_schema.columns[i].name;
                         match item {
-                            SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
-                                id.value.eq_ignore_ascii_case(want)
-                            }
-                            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts))
-                                if parts.len() == 2 =>
-                            {
+                            SelectItem::UnnamedExpr(Expr::Identifier(id)) => id.value.eq_ignore_ascii_case(want),
+                            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
                                 parts[1].value.eq_ignore_ascii_case(want)
                             }
                             _ => false,
@@ -868,14 +796,7 @@ fn execute_create_view(
 
     // Handle SELECT DISTINCT
     if select.distinct.is_some() {
-        return execute_create_distinct_view(
-            client,
-            schema_name,
-            &view_name,
-            &sql_text,
-            select,
-            binder,
-        );
+        return execute_create_distinct_view(client, schema_name, &view_name, &sql_text, select, binder);
     }
 
     if select.from.len() != 1 {
@@ -885,15 +806,7 @@ fn execute_create_view(
     }
     // Delegate to join handler if JOINs present
     if !select.from[0].joins.is_empty() {
-        return execute_create_join_view(
-            client,
-            schema_name,
-            &view_name,
-            &sql_text,
-            select,
-            binder,
-            query,
-        );
+        return execute_create_join_view(client, schema_name, &view_name, &sql_text, select, binder, query);
     }
 
     // Check for GROUP BY and delegate
@@ -902,14 +815,7 @@ fn execute_create_view(
         _ => false,
     };
     if has_group_by {
-        return execute_create_group_by_view(
-            client,
-            schema_name,
-            &view_name,
-            &sql_text,
-            select,
-            binder,
-        );
+        return execute_create_group_by_view(client, schema_name, &view_name, &sql_text, select, binder);
     }
 
     let table_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW")?;
@@ -927,10 +833,7 @@ fn execute_create_view(
     };
 
     // Build projection column list
-    let is_wildcard = select
-        .projection
-        .iter()
-        .all(|p| matches!(p, SelectItem::Wildcard(_)));
+    let is_wildcard = select.projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_)));
     let (items, out_cols) = build_projection(&select.projection, &source_schema, binder)?;
 
     // The pass-through generalization can now emit the same name twice (SELECT
@@ -944,10 +847,7 @@ fn execute_create_view(
     // `!is_wildcard` so only an *explicit* projection that produces a duplicate
     // (`SELECT name, name`) errors.
     if !is_wildcard {
-        reject_duplicate_column_names(
-            out_cols.iter().map(|c| c.name.as_str()),
-            "CREATE VIEW projection",
-        )?;
+        reject_duplicate_column_names(out_cols.iter().map(|c| c.name.as_str()), "CREATE VIEW projection")?;
     }
 
     // Slots 0..k are the view's physical PK (carried verbatim by commit_row). A
@@ -1028,14 +928,7 @@ fn execute_create_view(
     // through in pk_indices() order). Persist exactly that.
     let view_pk: Vec<u32> = (0..k as u32).collect();
     client
-        .create_view_with_circuit(
-            schema_name,
-            &view_name,
-            &sql_text,
-            circuit,
-            &out_cols,
-            &view_pk,
-        )
+        .create_view_with_circuit(schema_name, &view_name, &sql_text, circuit, &out_cols, &view_pk)
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -1061,11 +954,7 @@ fn execute_create_index(
     // A user-supplied index name flows through to the IDX_TAB row so
     // `DROP INDEX <name>` resolves it. Validate it before anything else: a
     // malformed or `__fk_`-infixed name would persist and be undroppable.
-    let explicit_name = ci
-        .name
-        .as_ref()
-        .map(|n| extract_name(n, "CREATE INDEX"))
-        .transpose()?;
+    let explicit_name = ci.name.as_ref().map(|n| extract_name(n, "CREATE INDEX")).transpose()?;
     if let Some(ref name) = explicit_name {
         validate_user_index_name(name)?;
     }
@@ -1134,13 +1023,8 @@ fn execute_create_index(
 }
 
 enum ProjectionItem {
-    PassThrough {
-        src_col: usize,
-    },
-    Computed {
-        bound_expr: BoundExpr,
-        _out_type: TypeCode,
-    },
+    PassThrough { src_col: usize },
+    Computed { bound_expr: BoundExpr, _out_type: TypeCode },
 }
 
 fn build_projection(
@@ -1155,9 +1039,7 @@ fn build_projection(
         match item {
             SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
                 let col_idx = find_unique_column(&source_schema.columns, &ident.value)?
-                    .ok_or_else(|| {
-                        GnitzSqlError::Bind(format!("column '{}' not found", ident.value))
-                    })?;
+                    .ok_or_else(|| GnitzSqlError::Bind(format!("column '{}' not found", ident.value)))?;
                 items.push(ProjectionItem::PassThrough { src_col: col_idx });
                 out_cols.push(source_schema.columns[col_idx].clone());
             }
@@ -1317,10 +1199,10 @@ fn execute_create_join_view(
 
     // Determine join type
     let (on_expr, is_left_join) = match &join.join_operator {
-        JoinOperator::Inner(JoinConstraint::On(expr))
-        | JoinOperator::Join(JoinConstraint::On(expr)) => (expr, false),
-        JoinOperator::LeftOuter(JoinConstraint::On(expr))
-        | JoinOperator::Left(JoinConstraint::On(expr)) => (expr, true),
+        JoinOperator::Inner(JoinConstraint::On(expr)) | JoinOperator::Join(JoinConstraint::On(expr)) => (expr, false),
+        JoinOperator::LeftOuter(JoinConstraint::On(expr)) | JoinOperator::Left(JoinConstraint::On(expr)) => {
+            (expr, true)
+        }
         _ => {
             return Err(GnitzSqlError::Unsupported(
                 "CREATE VIEW: only INNER JOIN / LEFT JOIN ... ON supported".to_string(),
@@ -1344,17 +1226,10 @@ fn execute_create_join_view(
 
     // Build alias map for qualified column resolution
     let mut alias_map: JoinAliasMap = HashMap::new();
-    alias_map.insert(
-        left_alias.to_lowercase(),
-        (left_tid, Rc::clone(&left_schema), 0),
-    );
+    alias_map.insert(left_alias.to_lowercase(), (left_tid, Rc::clone(&left_schema), 0));
     alias_map.insert(
         right_alias.to_lowercase(),
-        (
-            right_tid,
-            Rc::clone(&right_schema),
-            left_schema.columns.len(),
-        ),
+        (right_tid, Rc::clone(&right_schema), left_schema.columns.len()),
     );
 
     // Classify the ON clause: equality prefix pairs, an optional range conjunct,
@@ -1448,11 +1323,7 @@ fn execute_create_join_view(
     let right_n = right_schema.columns.len();
 
     // Right-side type codes for null-extend (used by LEFT-join null fills).
-    let right_col_tcs: Vec<u64> = right_schema
-        .columns
-        .iter()
-        .map(|c| c.type_code as u64)
-        .collect();
+    let right_col_tcs: Vec<u64> = right_schema.columns.iter().map(|c| c.type_code as u64).collect();
 
     // A NULL equi-join key must match nothing (SQL 3VL: NULL = anything, including
     // NULL = NULL, is unknown). map_reindex would promote a NULL integer key to
@@ -1460,12 +1331,8 @@ fn execute_create_join_view(
     // a real 0/"" key and with every other NULL. Gate NULL keys out of the match.
     // A NOT NULL key leaves its side untouched (no filter node) — byte-identical to
     // the original plan, so the common case has zero overhead.
-    let left_key_nullable = left_join_cols
-        .iter()
-        .any(|&c| left_schema.columns[c].is_nullable);
-    let right_key_nullable = right_join_cols
-        .iter()
-        .any(|&c| right_schema.columns[c].is_nullable);
+    let left_key_nullable = left_join_cols.iter().any(|&c| left_schema.columns[c].is_nullable);
+    let right_key_nullable = right_join_cols.iter().any(|&c| right_schema.columns[c].is_nullable);
 
     let mut cb = CircuitBuilder::new(view_id, 0); // no single primary source
     let input_a = cb.input_delta_tagged(left_tid);
@@ -1475,21 +1342,12 @@ fn execute_create_join_view(
     let input_b = if right_key_nullable {
         cb.filter(
             input_b,
-            Some(multi_null_filter_prog(
-                &right_join_cols,
-                &right_schema,
-                false,
-            )?),
+            Some(multi_null_filter_prog(&right_join_cols, &right_schema, false)?),
         )
     } else {
         input_b
     };
-    let reindex_b = cb.map_reindex(
-        input_b,
-        &right_join_cols,
-        &right_target_tcs,
-        right_reindex_prog,
-    );
+    let reindex_b = cb.map_reindex(input_b, &right_join_cols, &right_target_tcs, right_reindex_prog);
 
     // Preserved (left) side.
     //   INNER join: a left row with any NULL key component matches nothing — drop it.
@@ -1509,11 +1367,7 @@ fn execute_create_join_view(
     } else {
         let left_not_null = cb.filter(
             input_a,
-            Some(multi_null_filter_prog(
-                &left_join_cols,
-                &left_schema,
-                false,
-            )?),
+            Some(multi_null_filter_prog(&left_join_cols, &left_schema, false)?),
         );
         if !is_left_join {
             (left_not_null, None)
@@ -1531,18 +1385,10 @@ fn execute_create_join_view(
                 &left_target_tcs,
                 build_reindex_program(&left_schema),
             );
-            (
-                left_not_null,
-                Some(cb.null_extend(left_null_ri, &right_col_tcs)),
-            )
+            (left_not_null, Some(cb.null_extend(left_null_ri, &right_col_tcs)))
         }
     };
-    let reindex_a = cb.map_reindex(
-        input_a_match,
-        &left_join_cols,
-        &left_target_tcs,
-        left_reindex_prog,
-    );
+    let reindex_a = cb.map_reindex(input_a_match, &left_join_cols, &left_target_tcs, left_reindex_prog);
 
     let trace_a = cb.integrate_trace(reindex_a);
     let trace_b = cb.integrate_trace(reindex_b);
@@ -1661,10 +1507,7 @@ fn execute_create_join_view(
     // Compute the user projection + view schema via the shared join-projection
     // helper. A lone `SELECT *` flows through its Wildcard arm and stays identity
     // (the projection map is then skipped below), so no wildcard fast path here.
-    let is_wildcard = select
-        .projection
-        .iter()
-        .all(|p| matches!(p, SelectItem::Wildcard(_)));
+    let is_wildcard = select.projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_)));
     let (final_cols, final_projection) = build_join_view_projection(
         &select.projection,
         &alias_map,
@@ -1677,11 +1520,8 @@ fn execute_create_join_view(
 
     // Apply final column projection before sink when not identity.
     // Identity = selecting all left+right cols in canonical order [k..k+left_n+right_n].
-    let is_identity = final_projection.len() == left_n + right_n
-        && final_projection
-            .iter()
-            .enumerate()
-            .all(|(i, &p)| p == i + k);
+    let is_identity =
+        final_projection.len() == left_n + right_n && final_projection.iter().enumerate().all(|(i, &p)| p == i + k);
     let sink_input = if is_identity {
         merged
     } else {
@@ -1702,14 +1542,7 @@ fn execute_create_join_view(
         reject_duplicate_column_names(final_cols.iter().map(|c| c.name.as_str()), "join view")?;
     }
     client
-        .create_view_with_circuit(
-            schema_name,
-            view_name,
-            sql_text,
-            circuit,
-            &final_cols,
-            &view_pk,
-        )
+        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols, &view_pk)
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -1803,11 +1636,7 @@ fn build_range_join_view(
         .copied()
         .chain(std::iter::once(range.right_col))
         .collect();
-    let all_tcs: Vec<u8> = eq_tcs
-        .iter()
-        .copied()
-        .chain(std::iter::once(range.tc))
-        .collect();
+    let all_tcs: Vec<u8> = eq_tcs.iter().copied().chain(std::iter::once(range.tc)).collect();
 
     // Per-side carried target tc per slot (0 = self-derive); see the equi path.
     let side_tcs = |cols: &[usize], schema: &Schema| -> Vec<u8> {
@@ -1857,20 +1686,12 @@ fn build_range_join_view(
     // left row with a NULL eq/range column (never an inner match, never in `D`) is
     // still null-filled (§4). `input_b` keeps its plain filter — an unmatched B row
     // never reaches the inner output, hence never `D`.
-    let left_key_nullable = left_reindex_cols
-        .iter()
-        .any(|&c| left_schema.columns[c].is_nullable);
-    let right_key_nullable = right_reindex_cols
-        .iter()
-        .any(|&c| right_schema.columns[c].is_nullable);
+    let left_key_nullable = left_reindex_cols.iter().any(|&c| left_schema.columns[c].is_nullable);
+    let right_key_nullable = right_reindex_cols.iter().any(|&c| right_schema.columns[c].is_nullable);
     let input_a = if left_key_nullable {
         cb.filter(
             input_a_raw,
-            Some(multi_null_filter_prog(
-                &left_reindex_cols,
-                left_schema,
-                false,
-            )?),
+            Some(multi_null_filter_prog(&left_reindex_cols, left_schema, false)?),
         )
     } else {
         input_a_raw
@@ -1878,11 +1699,7 @@ fn build_range_join_view(
     let input_b = if right_key_nullable {
         cb.filter(
             input_b,
-            Some(multi_null_filter_prog(
-                &right_reindex_cols,
-                right_schema,
-                false,
-            )?),
+            Some(multi_null_filter_prog(&right_reindex_cols, right_schema, false)?),
         )
     } else {
         input_b
@@ -1909,10 +1726,7 @@ fn build_range_join_view(
     // duplicate. The join terms probe the UNFILTERED reindex either way — for a
     // band join that reindex IS the worker's scattered eq-prefix slice.
     let (int_a, int_b) = if n_eq == 0 {
-        (
-            cb.partition_filter(reindex_a),
-            cb.partition_filter(reindex_b),
-        )
+        (cb.partition_filter(reindex_a), cb.partition_filter(reindex_b))
     } else {
         (reindex_a, reindex_b)
     };
@@ -1980,12 +1794,7 @@ fn build_range_join_view(
         pair_pk_cols.push(k + left_n + b_pk);
     }
     let zero_tcs = vec![0u8; pair_pk];
-    let rekey = cb.map_reindex(
-        merged,
-        &pair_pk_cols,
-        &zero_tcs,
-        build_reindex_program(&union_schema),
-    );
+    let rekey = cb.map_reindex(merged, &pair_pk_cols, &zero_tcs, build_reindex_program(&union_schema));
 
     // Re-key output layout: `[_pair_pk × pair_pk (PK), _join_pk × k, A cols, B cols]`.
     // The user projection drops the k `_join_pk` slots (they DIFFER per term and
@@ -2027,10 +1836,7 @@ fn build_range_join_view(
     // User projection via the shared helper. Always applied (it must drop the
     // `_join_pk` slots, which DIFFER per term); keeps the pair-PK region and
     // selects user columns from A/B as the payload.
-    let is_wildcard = select
-        .projection
-        .iter()
-        .all(|p| matches!(p, SelectItem::Wildcard(_)));
+    let is_wildcard = select.projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_)));
     let (final_cols, final_projection) = build_join_view_projection(
         &select.projection,
         alias_map,
@@ -2089,8 +1895,7 @@ fn build_range_join_view(
             let mbh = cb.map_hash_row(reindex_b, &[0], 0);
             let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)]); // [_group_pk:U128, m:Tc]
             let carried_m = range_tc.carried_reindex_tc(range_tc);
-            let reindex_m =
-                cb.map_reindex(red, &[1], &[carried_m], build_reindex_program(&m_schema));
+            let reindex_m = cb.map_reindex(red, &[1], &[carried_m], build_reindex_program(&m_schema));
             let trace_m = cb.integrate_trace(reindex_m);
 
             // The two `matched` terms carry the MATCH op (= the inner op), mirroring
@@ -2110,10 +1915,7 @@ fn build_range_join_view(
             // `j_ma`: A is the trace payload, after Δm's payload (`m`'s 2 columns).
             let m_payload = m_schema.columns.len(); // m's output arity ([_group_pk, m])
             let m_am = cb.map(j_am, &(k..k + left_n).collect::<Vec<_>>());
-            let m_ma = cb.map(
-                j_ma,
-                &(k + m_payload..k + m_payload + left_n).collect::<Vec<_>>(),
-            );
+            let m_ma = cb.map(j_ma, &(k + m_payload..k + m_payload + left_n).collect::<Vec<_>>());
             let matched_raw = cb.union(m_am, m_ma); // [_join_pk(PK), A]
 
             // Both `matched_raw` and the bare `int_a` passthrough are `[Tc PK, A]`
@@ -2135,9 +1937,7 @@ fn build_range_join_view(
                 fk_col_idx: 0,
             };
             let nf_raw_schema = Schema {
-                columns: std::iter::once(jp)
-                    .chain(left_schema.columns.iter().cloned())
-                    .collect(),
+                columns: std::iter::once(jp).chain(left_schema.columns.iter().cloned()).collect(),
                 pk_cols: vec![0],
             };
             let a_pk_in_raw: Vec<usize> = left_schema.pk_cols.iter().map(|&p| 1 + p).collect();
@@ -2163,18 +1963,10 @@ fn build_range_join_view(
             if left_key_nullable {
                 let anull = cb.filter(
                     input_a_raw,
-                    Some(multi_null_filter_prog(
-                        &left_reindex_cols,
-                        left_schema,
-                        true,
-                    )?),
+                    Some(multi_null_filter_prog(&left_reindex_cols, left_schema, true)?),
                 );
-                let anull_keyed = cb.map_reindex(
-                    anull,
-                    &left_schema.pk_cols,
-                    &zero_a,
-                    build_reindex_program(left_schema),
-                );
+                let anull_keyed =
+                    cb.map_reindex(anull, &left_schema.pk_cols, &zero_a, build_reindex_program(left_schema));
                 let anull_owned = cb.partition_filter(anull_keyed);
                 cb.union(nf_match, anull_owned)
             } else {
@@ -2216,11 +2008,7 @@ fn build_range_join_view(
         };
 
         // Shared tail: attach the NULL B columns, then re-key onto the pair-PK.
-        let right_col_tcs: Vec<u64> = right_schema
-            .columns
-            .iter()
-            .map(|c| c.type_code as u64)
-            .collect();
+        let right_col_tcs: Vec<u64> = right_schema.columns.iter().map(|c| c.type_code as u64).collect();
         let nullfill = cb.null_extend(nf_keyed, &right_col_tcs); // [a.pk×pa, A, NULL B]
 
         // Re-key nullfill ([a.pk×pa (PK), A, B]) onto the pair-PK. a.pk from the PK
@@ -2263,20 +2051,10 @@ fn build_range_join_view(
         "range join: ExchangeShard cols must equal view_pk in strict order"
     );
     if !is_wildcard {
-        reject_duplicate_column_names(
-            final_cols.iter().map(|c| c.name.as_str()),
-            "range join view",
-        )?;
+        reject_duplicate_column_names(final_cols.iter().map(|c| c.name.as_str()), "range join view")?;
     }
     client
-        .create_view_with_circuit(
-            schema_name,
-            view_name,
-            sql_text,
-            circuit,
-            &final_cols,
-            &view_pk,
-        )
+        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols, &view_pk)
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -2392,11 +2170,7 @@ fn multi_null_filter_prog(
         .copied()
         .filter(|&c| schema.columns[c].is_nullable)
         .collect();
-    let cols = if nullable.is_empty() {
-        cols
-    } else {
-        &nullable[..]
-    };
+    let cols = if nullable.is_empty() { cols } else { &nullable[..] };
 
     let leaf = |c: usize| {
         if want_null {
@@ -2588,13 +2362,7 @@ struct RangeConjunct {
 /// — every other ON conjunct (a second range, `<>`, a column-vs-literal test, a
 /// same-table or arithmetic comparison, an OR/IS NULL group), evaluated as a
 /// linear post-join `Filter` for INNER joins (§6).
-type JoinPredicates = (
-    Vec<usize>,
-    Vec<usize>,
-    Vec<u8>,
-    Option<RangeConjunct>,
-    Vec<Expr>,
-);
+type JoinPredicates = (Vec<usize>, Vec<usize>, Vec<u8>, Option<RangeConjunct>, Vec<Expr>);
 
 /// Alias map for JOIN column resolution: alias/name → (table_id, schema,
 /// global column offset). `Rc<Schema>` so the per-side schemas resolved by the
@@ -2751,10 +2519,7 @@ fn collect_join_predicates(
                         }
                         // Push T only on the same path that pushes (li, ri) — after
                         // the dup early-return — so the three vectors stay parallel.
-                        let t = validate_join_key_pair(
-                            &left_schema.columns[li],
-                            &right_schema.columns[ri],
-                        )?;
+                        let t = validate_join_key_pair(&left_schema.columns[li], &right_schema.columns[ri])?;
                         left_cols.push(li);
                         right_cols.push(ri);
                         target_tcs.push(t);
@@ -2766,15 +2531,10 @@ fn collect_join_predicates(
                     // validate_range_join_key_pair — it never silently becomes a
                     // residual. A *second* ordering comparison (range already set)
                     // fails this guard and falls through to the residual.
-                    (_, Some((li, ri, swapped)))
-                        if sql_binop_to_range_rel(op).is_some() && range.is_none() =>
-                    {
+                    (_, Some((li, ri, swapped))) if sql_binop_to_range_rel(op).is_some() && range.is_none() => {
                         let rel = sql_binop_to_range_rel(op).expect("range rel present");
                         let canon_op = if swapped { converse_rel(rel) } else { rel };
-                        let t = validate_range_join_key_pair(
-                            &left_schema.columns[li],
-                            &right_schema.columns[ri],
-                        )?;
+                        let t = validate_range_join_key_pair(&left_schema.columns[li], &right_schema.columns[ri])?;
                         *range = Some(RangeConjunct {
                             left_col: li,
                             right_col: ri,
@@ -2987,10 +2747,7 @@ fn group_col_reduce_pos(
     } else if single_col_natural_pk {
         0
     } else {
-        1 + group_col_indices
-            .iter()
-            .position(|&gi| gi == src_col)
-            .unwrap()
+        1 + group_col_indices.iter().position(|&gi| gi == src_col).unwrap()
     }
 }
 
@@ -3012,9 +2769,7 @@ fn execute_create_group_by_view(
     // every worker), so the engine single-sources its read. Views resolve to
     // non-replicated (the MVP user surface is base-table dimensions; circuit-level
     // distribution propagation through nested views is a later superset).
-    let source_replicated = client
-        .table_replicated(source_tid)
-        .map_err(GnitzSqlError::Exec)?;
+    let source_replicated = client.table_replicated(source_tid).map_err(GnitzSqlError::Exec)?;
     // The compound-PK source guard is intentionally NOT applied here: the engine
     // reduce output already emits a full compound natural-PK region
     // (`build_reduce_output_schema` walks `pk_columns()` for `group_set_eq_pk`),
@@ -3035,10 +2790,8 @@ fn execute_create_group_by_view(
     for ge in group_exprs {
         match ge {
             Expr::Identifier(id) => {
-                let idx =
-                    find_unique_column(&source_schema.columns, &id.value)?.ok_or_else(|| {
-                        GnitzSqlError::Bind(format!("GROUP BY column '{}' not found", id.value))
-                    })?;
+                let idx = find_unique_column(&source_schema.columns, &id.value)?
+                    .ok_or_else(|| GnitzSqlError::Bind(format!("GROUP BY column '{}' not found", id.value)))?;
                 reject_float_key(&source_schema.columns[idx], "GROUP BY")?;
                 group_col_indices.push(idx);
             }
@@ -3107,11 +2860,7 @@ fn execute_create_group_by_view(
                             // them unreachable. CountNonNull only counts
                             // presence, so it accepts any type.
                             if matches!(func, AggFunc::Sum | AggFunc::Avg)
-                                && (!is_numeric
-                                    || matches!(
-                                        tc,
-                                        TypeCode::U128 | TypeCode::UUID | TypeCode::I128
-                                    ))
+                                && (!is_numeric || matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::I128))
                             {
                                 return Err(GnitzSqlError::Bind(format!(
                                     "{:?} is not supported on column type {:?} ('{}')",
@@ -3122,11 +2871,7 @@ fn execute_create_group_by_view(
                         AggFunc::Min | AggFunc::Max => {
                             if matches!(
                                 tc,
-                                TypeCode::String
-                                    | TypeCode::Blob
-                                    | TypeCode::U128
-                                    | TypeCode::UUID
-                                    | TypeCode::I128
+                                TypeCode::String | TypeCode::Blob | TypeCode::U128 | TypeCode::UUID | TypeCode::I128
                             ) {
                                 return Err(GnitzSqlError::Bind(format!(
                                     "{:?} is not supported on column type {:?} ('{}')",
@@ -3175,12 +2920,7 @@ fn execute_create_group_by_view(
     //     agg_spec and a reduce-output column even when the SELECT list omits
     //     it. Done before reduce_schema is built so the new columns are included.
     if let Some(having_expr) = &select.having {
-        collect_having_aggs(
-            having_expr,
-            &source_schema,
-            &mut agg_specs,
-            &mut agg_mappings,
-        )?;
+        collect_having_aggs(having_expr, &source_schema, &mut agg_specs, &mut agg_mappings)?;
     }
 
     // 4. Determine reduce output schema layout.
@@ -3309,11 +3049,7 @@ fn execute_create_group_by_view(
     // the full source PK in source-PK order for a compound natural PK; the lone
     // leading column for the single-natural / synthetic paths. `reduce_schema.pk_cols`
     // is dense (`0..pk_count`), so the leading columns are exactly the PK region.
-    out_cols.extend(
-        reduce_schema.columns[..reduce_schema.pk_cols.len()]
-            .iter()
-            .cloned(),
-    );
+    out_cols.extend(reduce_schema.columns[..reduce_schema.pk_cols.len()].iter().cloned());
 
     // Tracks which PK slots a natural-PK group col has already renamed in place,
     // so a group column selected twice with a different alias falls back to a
@@ -3450,10 +3186,7 @@ fn execute_create_group_by_view(
                             // NULL inputs). COUNT/COUNT_NON_NULL always return an integer
                             // (0, never NULL). Match emit.rs so a schema-driven decoder
                             // reads NULL instead of raw zero bytes.
-                            is_nullable: matches!(
-                                m.agg_func,
-                                AggFunc::Sum | AggFunc::Min | AggFunc::Max
-                            ),
+                            is_nullable: matches!(m.agg_func, AggFunc::Sum | AggFunc::Min | AggFunc::Max),
                             fk_table_id: 0,
                             fk_col_idx: 0,
                         });
@@ -3509,14 +3242,7 @@ fn execute_create_group_by_view(
     // column. `reduce_schema.pk_cols` is dense (`0..pk_count`).
     let view_pk: Vec<u32> = (0..reduce_schema.pk_cols.len() as u32).collect();
     client
-        .create_view_with_circuit(
-            schema_name,
-            view_name,
-            sql_text,
-            circuit,
-            &out_cols,
-            &view_pk,
-        )
+        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols, &view_pk)
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -3679,10 +3405,7 @@ fn collect_having_aggs(
     match expr {
         Expr::Function(func) => {
             let (agg_func, arg_col) = having_agg_func(func, source_schema)?;
-            if !agg_mappings
-                .iter()
-                .any(|m| agg_mapping_matches(m, agg_func, arg_col))
-            {
+            if !agg_mappings.iter().any(|m| agg_mapping_matches(m, agg_func, arg_col)) {
                 append_having_agg(agg_func, arg_col, source_schema, agg_specs, agg_mappings)?;
             }
             Ok(())
@@ -3691,9 +3414,7 @@ fn collect_having_aggs(
             collect_having_aggs(left, source_schema, agg_specs, agg_mappings)?;
             collect_having_aggs(right, source_schema, agg_specs, agg_mappings)
         }
-        Expr::UnaryOp { expr, .. } => {
-            collect_having_aggs(expr, source_schema, agg_specs, agg_mappings)
-        }
+        Expr::UnaryOp { expr, .. } => collect_having_aggs(expr, source_schema, agg_specs, agg_mappings),
         // `<agg> IS [NOT] NULL` materialises its aggregate (and, for a nullable
         // SUM, the companion COUNT_NON_NULL `bind_having_null_test` reads) even
         // when the SELECT list omits it.
@@ -3704,9 +3425,7 @@ fn collect_having_aggs(
         // Lockstep with the binder: `bind_structural` now reaches `BETWEEN`, so the
         // agg-collection node set must too — else `HAVING agg BETWEEN lo AND hi` binds
         // an aggregate that was never materialised and `resolve_having_mapping` fails.
-        Expr::Between {
-            expr, low, high, ..
-        } => {
+        Expr::Between { expr, low, high, .. } => {
             collect_having_aggs(expr, source_schema, agg_specs, agg_mappings)?;
             collect_having_aggs(low, source_schema, agg_specs, agg_mappings)?;
             collect_having_aggs(high, source_schema, agg_specs, agg_mappings)
@@ -3746,9 +3465,7 @@ fn resolve_having_mapping<'a>(
             GnitzSqlError::Bind(format!(
                 "HAVING: aggregate {:?}({}) could not be resolved",
                 agg_func,
-                arg_col.map_or("*".to_string(), |c| ctx.source_schema.columns[c]
-                    .name
-                    .clone()),
+                arg_col.map_or("*".to_string(), |c| ctx.source_schema.columns[c].name.clone()),
             ))
         })
 }
@@ -3877,25 +3594,20 @@ impl LeafBinder for Having<'_> {
                 }
             }
             _ => Err(GnitzSqlError::Unsupported(
-                "HAVING: IS [NOT] NULL is only supported on nullable SUM/AVG aggregates"
-                    .to_string(),
+                "HAVING: IS [NOT] NULL is only supported on nullable SUM/AVG aggregates".to_string(),
             )),
         }
     }
 }
 
 /// Extract the column index from a function argument (for HAVING binding).
-fn extract_func_arg_col(
-    func: &sqlparser::ast::Function,
-    schema: &Schema,
-) -> Result<Option<usize>, GnitzSqlError> {
+fn extract_func_arg_col(func: &sqlparser::ast::Function, schema: &Schema) -> Result<Option<usize>, GnitzSqlError> {
     match &func.args {
         FunctionArguments::List(list) if list.args.len() == 1 => match &list.args[0] {
             FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Ok(None),
             FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
-                let idx = find_unique_column(&schema.columns, &id.value)?.ok_or_else(|| {
-                    GnitzSqlError::Bind(format!("column '{}' not found", id.value))
-                })?;
+                let idx = find_unique_column(&schema.columns, &id.value)?
+                    .ok_or_else(|| GnitzSqlError::Bind(format!("column '{}' not found", id.value)))?;
                 Ok(Some(idx))
             }
             _ => Err(GnitzSqlError::Unsupported(
@@ -3943,8 +3655,7 @@ fn compile_set_op_side(
     // Resolve the projection to a set of source column indices (in SELECT
     // order). Unlike `build_projection`, the source PK is NOT force-included:
     // set membership is over exactly the projected columns.
-    let (proj_indices, out_cols) =
-        resolve_set_projection(&select.projection, &source_schema, binder)?;
+    let (proj_indices, out_cols) = resolve_set_projection(&select.projection, &source_schema, binder)?;
 
     // Reindex by a hash of the projected columns, so set membership
     // (EXCEPT/INTERSECT/UNION-distinct) is decided by the projected row content,
@@ -3971,10 +3682,7 @@ fn resolve_set_projection(
     source_schema: &Schema,
     binder: &Binder<'_>,
 ) -> Result<(Vec<usize>, Vec<ColumnDef>), GnitzSqlError> {
-    if projection
-        .iter()
-        .all(|p| matches!(p, SelectItem::Wildcard(_)))
-    {
+    if projection.iter().all(|p| matches!(p, SelectItem::Wildcard(_))) {
         let indices: Vec<usize> = (0..source_schema.columns.len()).collect();
         reject_float_keys(source_schema, &indices)?;
         return Ok((indices, source_schema.columns.clone()));
@@ -3989,32 +3697,30 @@ fn resolve_set_projection(
                     out_cols.push(source_schema.columns[i].clone());
                 }
             }
-            SelectItem::UnnamedExpr(expr) => {
-                match binder.bind_expr(expr, source_schema)? {
-                    BoundExpr::ColRef(ci) => {
-                        indices.push(ci);
-                        out_cols.push(source_schema.columns[ci].clone());
-                    }
-                    _ => return Err(GnitzSqlError::Unsupported(
-                        "set operation: computed expressions in a SELECT side are not supported"
-                            .into(),
-                    )),
+            SelectItem::UnnamedExpr(expr) => match binder.bind_expr(expr, source_schema)? {
+                BoundExpr::ColRef(ci) => {
+                    indices.push(ci);
+                    out_cols.push(source_schema.columns[ci].clone());
                 }
-            }
-            SelectItem::ExprWithAlias { expr, alias } => {
-                match binder.bind_expr(expr, source_schema)? {
-                    BoundExpr::ColRef(ci) => {
-                        indices.push(ci);
-                        let mut col = source_schema.columns[ci].clone();
-                        col.name = alias.value.clone();
-                        out_cols.push(col);
-                    }
-                    _ => return Err(GnitzSqlError::Unsupported(
-                        "set operation: computed expressions in a SELECT side are not supported"
-                            .into(),
-                    )),
+                _ => {
+                    return Err(GnitzSqlError::Unsupported(
+                        "set operation: computed expressions in a SELECT side are not supported".into(),
+                    ))
                 }
-            }
+            },
+            SelectItem::ExprWithAlias { expr, alias } => match binder.bind_expr(expr, source_schema)? {
+                BoundExpr::ColRef(ci) => {
+                    indices.push(ci);
+                    let mut col = source_schema.columns[ci].clone();
+                    col.name = alias.value.clone();
+                    out_cols.push(col);
+                }
+                _ => {
+                    return Err(GnitzSqlError::Unsupported(
+                        "set operation: computed expressions in a SELECT side are not supported".into(),
+                    ))
+                }
+            },
             _ => {
                 return Err(GnitzSqlError::Unsupported(
                     "set operation: unsupported SELECT item".into(),
@@ -4033,10 +3739,7 @@ fn resolve_set_projection(
 /// [`reject_float_key`] for why floats break set/DISTINCT membership.
 fn reject_float_keys(source_schema: &Schema, indices: &[usize]) -> Result<(), GnitzSqlError> {
     for &ci in indices {
-        reject_float_key(
-            &source_schema.columns[ci],
-            "SELECT DISTINCT / set operation",
-        )?;
+        reject_float_key(&source_schema.columns[ci], "SELECT DISTINCT / set operation")?;
     }
     Ok(())
 }
@@ -4078,13 +3781,9 @@ fn execute_create_set_op_view(
     // branches must hash to distinct PKs — give the right side branch_id = 1.
     // Deduplicating set-ops (UNION/EXCEPT/INTERSECT) intentionally coalesce
     // identical rows, so both sides use branch_id = 0.
-    let right_branch_id = matches!(
-        (op, set_quantifier),
-        (SetOperator::Union, SetQuantifier::All)
-    ) as u8;
+    let right_branch_id = matches!((op, set_quantifier), (SetOperator::Union, SetQuantifier::All)) as u8;
 
-    let (left_node, left_cols, left_tid) =
-        compile_set_op_side(client, left_select, binder, &mut cb, 0)?;
+    let (left_node, left_cols, left_tid) = compile_set_op_side(client, left_select, binder, &mut cb, 0)?;
     let (right_node, right_cols, right_tid) =
         compile_set_op_side(client, right_select, binder, &mut cb, right_branch_id)?;
 
@@ -4207,21 +3906,11 @@ fn execute_create_set_op_view(
         };
         out_cols_final.push(col);
     }
-    reject_duplicate_column_names(
-        out_cols_final.iter().map(|c| c.name.as_str()),
-        "set operation view",
-    )?;
+    reject_duplicate_column_names(out_cols_final.iter().map(|c| c.name.as_str()), "set operation view")?;
 
     // Set-op views emit a synthetic single-column content-hash PK at slot 0.
     client
-        .create_view_with_circuit(
-            schema_name,
-            view_name,
-            sql_text,
-            circuit,
-            &out_cols_final,
-            &[0],
-        )
+        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols_final, &[0])
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::ViewCreated { view_id })
@@ -4266,8 +3955,7 @@ fn execute_create_distinct_view(
     // columns so `distinct` deduplicates on the projected content. Without the
     // projection, reindexing by the source PK (unique by definition) makes
     // `distinct` a no-op and leaks the unselected columns.
-    let (proj_indices, proj_cols) =
-        resolve_set_projection(&select.projection, &source_schema, binder)?;
+    let (proj_indices, proj_cols) = resolve_set_projection(&select.projection, &source_schema, binder)?;
     let reindexed = cb.map_hash_row(filtered, &proj_indices, 0);
     // Repartition by the synthetic hash PK so `distinct` deduplicates across
     // workers: every copy of a projected row must land on the same worker.
@@ -4287,10 +3975,7 @@ fn execute_create_distinct_view(
         fk_col_idx: 0,
     });
     out_cols.extend(proj_cols);
-    reject_duplicate_column_names(
-        out_cols.iter().map(|c| c.name.as_str()),
-        "SELECT DISTINCT view",
-    )?;
+    reject_duplicate_column_names(out_cols.iter().map(|c| c.name.as_str()), "SELECT DISTINCT view")?;
 
     // DISTINCT views emit a synthetic single-column content-hash PK at slot 0.
     client
@@ -4345,14 +4030,8 @@ mod tests {
             pk_cols: vec![0],
         };
         let mut am = HashMap::new();
-        am.insert(
-            "a".to_string(),
-            (1u64, Rc::new(left_schema.clone()), 0usize),
-        );
-        am.insert(
-            "b".to_string(),
-            (2u64, Rc::new(right_schema.clone()), left_n),
-        );
+        am.insert("a".to_string(), (1u64, Rc::new(left_schema.clone()), 0usize));
+        am.insert("b".to_string(), (2u64, Rc::new(right_schema.clone()), left_n));
         (left_schema, right_schema, am)
     }
 
@@ -4371,11 +4050,7 @@ mod tests {
 
     /// Like `extract` but also returns the per-pair common reindex output type
     /// `T`, for cross-width promotion assertions. Asserts no range conjunct.
-    fn extract_with_tcs(
-        on: &str,
-        left: Vec<ColumnDef>,
-        right: Vec<ColumnDef>,
-    ) -> Result<EquiKeys, GnitzSqlError> {
+    fn extract_with_tcs(on: &str, left: Vec<ColumnDef>, right: Vec<ColumnDef>) -> Result<EquiKeys, GnitzSqlError> {
         let (ls, rs, am) = join_ctx(left, right);
         extract_join_predicates(&parse_on(on), &ls, &rs, &am).map(|(l, r, t, range, _)| {
             assert!(range.is_none(), "expected no range conjunct");
@@ -4384,20 +4059,13 @@ mod tests {
     }
 
     /// Full classification including the optional range conjunct.
-    fn extract_full(
-        on: &str,
-        left: Vec<ColumnDef>,
-        right: Vec<ColumnDef>,
-    ) -> Result<JoinPredicates, GnitzSqlError> {
+    fn extract_full(on: &str, left: Vec<ColumnDef>, right: Vec<ColumnDef>) -> Result<JoinPredicates, GnitzSqlError> {
         let (ls, rs, am) = join_ctx(left, right);
         extract_join_predicates(&parse_on(on), &ls, &rs, &am)
     }
 
     fn two_u64() -> Vec<ColumnDef> {
-        vec![
-            col("x", TypeCode::U64, false),
-            col("y", TypeCode::U64, false),
-        ]
+        vec![col("x", TypeCode::U64, false), col("y", TypeCode::U64, false)]
     }
 
     #[test]
@@ -4448,19 +4116,13 @@ mod tests {
 
     #[test]
     fn extract_keys_single_pair() {
-        assert_eq!(
-            extract("a.x = b.y", two_u64(), two_u64()).unwrap(),
-            (vec![0], vec![1])
-        );
+        assert_eq!(extract("a.x = b.y", two_u64(), two_u64()).unwrap(), (vec![0], vec![1]));
     }
 
     #[test]
     fn extract_keys_rejections() {
         // Float key → Unsupported (from validate_join_key_pair).
-        let fl = vec![
-            col("x", TypeCode::F64, false),
-            col("y", TypeCode::U64, false),
-        ];
+        let fl = vec![col("x", TypeCode::F64, false), col("y", TypeCode::U64, false)];
         assert!(matches!(
             extract("a.x = b.x", fl.clone(), fl).unwrap_err(),
             GnitzSqlError::Unsupported(_)
@@ -4477,9 +4139,7 @@ mod tests {
         // One past the codec cap → Unsupported (arity cap). Built relative to
         // PK_LIST_MAX_COLS so a future bump doesn't silently slacken the test.
         let n = gnitz_core::PK_LIST_MAX_COLS + 1;
-        let wide: Vec<ColumnDef> = (0..n)
-            .map(|i| col(&format!("c{i}"), TypeCode::U64, false))
-            .collect();
+        let wide: Vec<ColumnDef> = (0..n).map(|i| col(&format!("c{i}"), TypeCode::U64, false)).collect();
         let on_wide = (0..n)
             .map(|i| format!("a.c{i}=b.c{i}"))
             .collect::<Vec<_>>()
@@ -4510,115 +4170,59 @@ mod tests {
     fn validate_pair_accepts_compatible() {
         // Same-type pairs: T == the source reindex output type.
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U64, false),
-                &col("b", TypeCode::U64, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U64, false), &col("b", TypeCode::U64, false)).unwrap(),
             TypeCode::U64 as u8
         );
-        validate_join_key_pair(
-            &col("a", TypeCode::String, false),
-            &col("b", TypeCode::String, false),
-        )
-        .unwrap();
-        validate_join_key_pair(
-            &col("a", TypeCode::String, false),
-            &col("b", TypeCode::Blob, false),
-        )
-        .unwrap();
+        validate_join_key_pair(&col("a", TypeCode::String, false), &col("b", TypeCode::String, false)).unwrap();
+        validate_join_key_pair(&col("a", TypeCode::String, false), &col("b", TypeCode::Blob, false)).unwrap();
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U128, false),
-                &col("b", TypeCode::UUID, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U128, false), &col("b", TypeCode::UUID, false)).unwrap(),
             TypeCode::U128 as u8
         );
         // Cross-width same-sign pairs promote to the wider type.
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::I32, false),
-                &col("b", TypeCode::I64, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::I32, false), &col("b", TypeCode::I64, false)).unwrap(),
             TypeCode::I64 as u8
         );
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U32, false),
-                &col("b", TypeCode::U64, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U32, false), &col("b", TypeCode::U64, false)).unwrap(),
             TypeCode::U64 as u8
         );
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U8, false),
-                &col("b", TypeCode::U64, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U8, false), &col("b", TypeCode::U64, false)).unwrap(),
             TypeCode::U64 as u8
         );
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U32, false),
-                &col("b", TypeCode::U128, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U32, false), &col("b", TypeCode::U128, false)).unwrap(),
             TypeCode::U128 as u8
         );
         // Cross-sign pairs whose unsigned side is ≤ 8 bytes (U64) promote to the
         // narrowest signed type holding both ranges.
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U32, false),
-                &col("b", TypeCode::I64, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U32, false), &col("b", TypeCode::I64, false)).unwrap(),
             TypeCode::I64 as u8
         );
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U8, false),
-                &col("b", TypeCode::I16, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U8, false), &col("b", TypeCode::I16, false)).unwrap(),
             TypeCode::I16 as u8
         );
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U16, false),
-                &col("b", TypeCode::I32, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U16, false), &col("b", TypeCode::I32, false)).unwrap(),
             TypeCode::I32 as u8
         );
         // U32 = I32 needs the wider I64 (a signed type of equal width cannot hold
         // U32's full range).
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U32, false),
-                &col("b", TypeCode::I32, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U32, false), &col("b", TypeCode::I32, false)).unwrap(),
             TypeCode::I64 as u8
         );
         // U64 cross-sign with any signed integer ⇒ the signed-128 common type.
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U64, false),
-                &col("b", TypeCode::I64, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U64, false), &col("b", TypeCode::I64, false)).unwrap(),
             TypeCode::I128 as u8
         );
         assert_eq!(
-            validate_join_key_pair(
-                &col("a", TypeCode::U64, false),
-                &col("b", TypeCode::I8, false)
-            )
-            .unwrap(),
+            validate_join_key_pair(&col("a", TypeCode::U64, false), &col("b", TypeCode::I8, false)).unwrap(),
             TypeCode::I128 as u8
         );
     }
@@ -4626,35 +4230,15 @@ mod tests {
     #[test]
     fn validate_pair_rejects_incompatible() {
         // Float column.
-        assert!(validate_join_key_pair(
-            &col("a", TypeCode::F64, false),
-            &col("b", TypeCode::U64, false)
-        )
-        .is_err());
+        assert!(validate_join_key_pair(&col("a", TypeCode::F64, false), &col("b", TypeCode::U64, false)).is_err());
         // Cross-sign pair whose unsigned side is 128-bit (would need a signed-256
         // type that does not exist). (U64 = I64 now promotes to I128.)
-        assert!(validate_join_key_pair(
-            &col("a", TypeCode::U128, false),
-            &col("b", TypeCode::I64, false)
-        )
-        .is_err());
-        assert!(validate_join_key_pair(
-            &col("a", TypeCode::UUID, false),
-            &col("b", TypeCode::I64, false)
-        )
-        .is_err());
+        assert!(validate_join_key_pair(&col("a", TypeCode::U128, false), &col("b", TypeCode::I64, false)).is_err());
+        assert!(validate_join_key_pair(&col("a", TypeCode::UUID, false), &col("b", TypeCode::I64, false)).is_err());
         // Mixed string/native — STRING = U128 both reindex to U128, so this is
         // caught *only* by the german-string check, not the common-type check.
-        assert!(validate_join_key_pair(
-            &col("a", TypeCode::String, false),
-            &col("b", TypeCode::U128, false)
-        )
-        .is_err());
-        assert!(validate_join_key_pair(
-            &col("a", TypeCode::String, false),
-            &col("b", TypeCode::I64, false)
-        )
-        .is_err());
+        assert!(validate_join_key_pair(&col("a", TypeCode::String, false), &col("b", TypeCode::U128, false)).is_err());
+        assert!(validate_join_key_pair(&col("a", TypeCode::String, false), &col("b", TypeCode::I64, false)).is_err());
     }
 
     /// Cross-width promotion threads `T` into both per-side carried tcs and the
@@ -4690,11 +4274,7 @@ mod tests {
             let r = vec![col("x", signed, false)];
             let (lc, rc, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
             assert_eq!((lc, rc), (vec![0], vec![0]));
-            assert_eq!(
-                tcs,
-                vec![TypeCode::I128 as u8],
-                "U64 = {signed:?} must promote to I128"
-            );
+            assert_eq!(tcs, vec![TypeCode::I128 as u8], "U64 = {signed:?} must promote to I128");
         }
     }
 
@@ -4722,8 +4302,7 @@ mod tests {
     /// equi path is byte-identical because nothing about its inputs changed).
     #[test]
     fn extract_equi_only_has_no_range() {
-        let (_, _, _, range, _) =
-            extract_full("a.x = b.x AND a.y = b.y", two_u64(), two_u64()).unwrap();
+        let (_, _, _, range, _) = extract_full("a.x = b.x AND a.y = b.y", two_u64(), two_u64()).unwrap();
         assert!(range.is_none());
     }
 
@@ -4749,11 +4328,7 @@ mod tests {
             assert!(eq_l.is_empty(), "{on}: pure range join has no eq prefix");
             let rc = range.unwrap_or_else(|| panic!("{on}: expected a range conjunct"));
             assert_eq!(rc.op, *want_op, "{on}");
-            assert_eq!(
-                (rc.left_col, rc.right_col),
-                (0, 1),
-                "{on}: canonicalized to a.x / b.y"
-            );
+            assert_eq!((rc.left_col, rc.right_col), (0, 1), "{on}: canonicalized to a.x / b.y");
         }
     }
 
@@ -4762,8 +4337,7 @@ mod tests {
     #[test]
     fn extract_band_join_eq_prefix_plus_range() {
         // a.k = b.k AND a.lo <= b.t. cols: a=[k=0, lo=1], b=[k=0, t=1].
-        let (eq_l, eq_r, eq_tcs, range, _) =
-            extract_full("a.x = b.x AND a.y <= b.y", two_u64(), two_u64()).unwrap();
+        let (eq_l, eq_r, eq_tcs, range, _) = extract_full("a.x = b.x AND a.y <= b.y", two_u64(), two_u64()).unwrap();
         assert_eq!((eq_l, eq_r), (vec![0], vec![0]));
         assert_eq!(eq_tcs, vec![TypeCode::U64 as u8]);
         let rc = range.expect("range conjunct");
@@ -4777,33 +4351,23 @@ mod tests {
     fn range_extraction_rejections() {
         // A second range conjunct is now accepted: the first is the physical range,
         // the second a residual filter.
-        let (_, _, _, range, residual) =
-            extract_full("a.x < b.x AND a.y < b.y", two_u64(), two_u64()).unwrap();
+        let (_, _, _, range, residual) = extract_full("a.x < b.x AND a.y < b.y", two_u64(), two_u64()).unwrap();
         assert!(range.is_some(), "first range conjunct is physical");
         assert_eq!(residual.len(), 1, "second range conjunct is a residual");
         // String range pair → Unsupported (not order-preserving).
-        let s = vec![
-            col("x", TypeCode::String, false),
-            col("y", TypeCode::String, false),
-        ];
+        let s = vec![col("x", TypeCode::String, false), col("y", TypeCode::String, false)];
         assert!(matches!(
             extract_full("a.x < b.x", s.clone(), s).unwrap_err(),
             GnitzSqlError::Unsupported(_)
         ));
         // BLOB range pair → Unsupported.
-        let bl = vec![
-            col("x", TypeCode::Blob, false),
-            col("y", TypeCode::Blob, false),
-        ];
+        let bl = vec![col("x", TypeCode::Blob, false), col("y", TypeCode::Blob, false)];
         assert!(matches!(
             extract_full("a.x > b.x", bl.clone(), bl).unwrap_err(),
             GnitzSqlError::Unsupported(_)
         ));
         // Float range pair → Unsupported (via validate_join_key_pair).
-        let f = vec![
-            col("x", TypeCode::F64, false),
-            col("y", TypeCode::F64, false),
-        ];
+        let f = vec![col("x", TypeCode::F64, false), col("y", TypeCode::F64, false)];
         assert!(matches!(
             extract_full("a.x < b.x", f.clone(), f).unwrap_err(),
             GnitzSqlError::Unsupported(_)
@@ -4820,32 +4384,25 @@ mod tests {
     #[test]
     fn extract_collects_residual_conjuncts() {
         // Equijoin + inequality: one equi pair, no range, the `<>` is a residual.
-        let (eq_l, eq_r, _, range, residual) =
-            extract_full("a.x = b.x AND a.y <> b.y", two_u64(), two_u64()).unwrap();
+        let (eq_l, eq_r, _, range, residual) = extract_full("a.x = b.x AND a.y <> b.y", two_u64(), two_u64()).unwrap();
         assert_eq!((eq_l, eq_r), (vec![0], vec![0]));
         assert!(range.is_none());
         assert_eq!(residual.len(), 1);
 
         // Band + second range: the eq pair and first range anchor; the second range
         // conjunct falls through to the residual.
-        let (eq_l, _, _, range, residual) = extract_full(
-            "a.x = b.x AND a.y < b.y AND a.y > b.x",
-            two_u64(),
-            two_u64(),
-        )
-        .unwrap();
+        let (eq_l, _, _, range, residual) =
+            extract_full("a.x = b.x AND a.y < b.y AND a.y > b.x", two_u64(), two_u64()).unwrap();
         assert_eq!(eq_l, vec![0]);
         assert!(range.is_some());
         assert_eq!(residual.len(), 1);
 
         // Equijoin + column-vs-literal: the literal comparison is a residual.
-        let (_, _, _, _, residual) =
-            extract_full("a.x = b.x AND a.y = 5", two_u64(), two_u64()).unwrap();
+        let (_, _, _, _, residual) = extract_full("a.x = b.x AND a.y = 5", two_u64(), two_u64()).unwrap();
         assert_eq!(residual.len(), 1);
 
         // OR-group behind an equijoin anchor: the whole OR is one residual conjunct.
-        let (_, _, _, _, residual) =
-            extract_full("a.x = b.x AND (a.y > 5 OR b.y < 3)", two_u64(), two_u64()).unwrap();
+        let (_, _, _, _, residual) = extract_full("a.x = b.x AND (a.y > 5 OR b.y < 3)", two_u64(), two_u64()).unwrap();
         assert_eq!(residual.len(), 1);
     }
 
@@ -4853,14 +4410,8 @@ mod tests {
     /// (U32 vs I64 → I64), the same ladder the equi path uses.
     #[test]
     fn range_pair_cross_sign_promotes() {
-        let l = vec![
-            col("id", TypeCode::U64, false),
-            col("x", TypeCode::U32, false),
-        ];
-        let r = vec![
-            col("id", TypeCode::U64, false),
-            col("y", TypeCode::I64, false),
-        ];
+        let l = vec![col("id", TypeCode::U64, false), col("x", TypeCode::U32, false)];
+        let r = vec![col("id", TypeCode::U64, false), col("y", TypeCode::I64, false)];
         let (_, _, _, range, _) = extract_full("a.x < b.y", l, r).unwrap();
         assert_eq!(range.unwrap().tc, TypeCode::I64 as u8);
     }

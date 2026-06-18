@@ -3,8 +3,7 @@ use crate::logical_plan::{AggFunc, BinOp, BoundExpr, UnaryOp};
 use gnitz_core::GnitzClient;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator,
-    Value,
+    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -20,10 +19,7 @@ use std::rc::Rc;
 ///
 /// Single home for the name→index lookup that was previously
 /// `columns.iter().position(...)` (first-match) at every call site.
-pub fn find_unique_column(
-    columns: &[ColumnDef],
-    col_name: &str,
-) -> Result<Option<usize>, GnitzSqlError> {
+pub fn find_unique_column(columns: &[ColumnDef], col_name: &str) -> Result<Option<usize>, GnitzSqlError> {
     let mut found: Option<usize> = None;
     for (i, c) in columns.iter().enumerate() {
         if c.name.eq_ignore_ascii_case(col_name) {
@@ -48,11 +44,8 @@ pub fn resolve_qualified_column(
     let (_, schema, offset) = tables
         .get(table_alias)
         .ok_or_else(|| GnitzSqlError::Bind(format!("table alias '{table_alias}' not found")))?;
-    let idx = find_unique_column(&schema.columns, col_name)?.ok_or_else(|| {
-        GnitzSqlError::Bind(format!(
-            "column '{col_name}' not found in table '{table_alias}'"
-        ))
-    })?;
+    let idx = find_unique_column(&schema.columns, col_name)?
+        .ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in table '{table_alias}'")))?;
     Ok(offset + idx)
 }
 
@@ -92,11 +85,7 @@ impl<'a> Binder<'a> {
         }
     }
 
-    pub fn resolve(
-        &mut self,
-        client: &mut GnitzClient,
-        name: &str,
-    ) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
+    pub fn resolve(&mut self, client: &mut GnitzClient, name: &str) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
         if let Some(entry) = self.cache.get(name) {
             return Ok((entry.0, Rc::clone(&entry.1)));
         }
@@ -178,10 +167,7 @@ pub(crate) trait LeafBinder {
 /// The one structural recursion. Needs no schema — every schema-aware decision
 /// is a leaf method. Generic over `L` (static dispatch) so a leaf's
 /// `bind_function` can recurse via `bind_structural(arg, self)`.
-pub(crate) fn bind_structural<L: LeafBinder>(
-    expr: &Expr,
-    leaf: &L,
-) -> Result<BoundExpr, GnitzSqlError> {
+pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<BoundExpr, GnitzSqlError> {
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => leaf.bind_column(expr),
         Expr::Function(f) => leaf.bind_function(f),
@@ -272,9 +258,7 @@ pub(crate) fn bind_literal(v: &Value) -> Result<BoundExpr, GnitzSqlError> {
             .map(BoundExpr::LitInt)
             .or_else(|_| n.parse::<f64>().map(BoundExpr::LitFloat))
             .map_err(|_| GnitzSqlError::Bind(format!("invalid number literal: {n}"))),
-        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
-            Ok(BoundExpr::LitStr(s.clone()))
-        }
+        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Ok(BoundExpr::LitStr(s.clone())),
         _ => Err(GnitzSqlError::Unsupported(format!(
             "value type not supported in expressions: {v:?}"
         ))),
@@ -309,11 +293,7 @@ impl SingleTable<'_> {
         let name = match e {
             Expr::Identifier(id) => &id.value,
             Expr::CompoundIdentifier(p) if p.len() == 2 => &p[1].value,
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "expected a column reference".into(),
-                ))
-            }
+            _ => return Err(GnitzSqlError::Unsupported("expected a column reference".into())),
         };
         find_unique_column(&self.schema.columns, name)?
             .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found")))
@@ -399,9 +379,7 @@ impl LeafBinder for SingleTable<'_> {
                     "{name}: requires exactly one column argument"
                 )))
             }
-            _ => Err(GnitzSqlError::Unsupported(format!(
-                "function '{name}' not supported"
-            ))),
+            _ => Err(GnitzSqlError::Unsupported(format!("function '{name}' not supported"))),
         }
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
@@ -435,11 +413,7 @@ mod tests {
 
     fn parse(src: &str) -> Expr {
         let dialect = GenericDialect {};
-        Parser::new(&dialect)
-            .try_with_sql(src)
-            .unwrap()
-            .parse_expr()
-            .unwrap()
+        Parser::new(&dialect).try_with_sql(src).unwrap().parse_expr().unwrap()
     }
 
     fn assert_unsupported(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
@@ -484,10 +458,7 @@ mod tests {
         let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
                                                      // `c BETWEEN 1 AND 9` ≡ `c >= 1 AND c <= 9` — a residual BETWEEN now binds
                                                      // (regression guard for the new Expr::Between arm) instead of Unsupported.
-        match binder
-            .bind_expr(&parse("c BETWEEN 1 AND 9"), &schema)
-            .unwrap()
-        {
+        match binder.bind_expr(&parse("c BETWEEN 1 AND 9"), &schema).unwrap() {
             BoundExpr::BinOp(l, BinOp::And, r) => {
                 assert!(matches!(*l, BoundExpr::BinOp(_, BinOp::Ge, _)));
                 assert!(matches!(*r, BoundExpr::BinOp(_, BinOp::Le, _)));
@@ -495,10 +466,7 @@ mod tests {
             other => panic!("expected And(Ge, Le), got {other:?}"),
         }
         // `c NOT BETWEEN 1 AND 9` ≡ NOT(c >= 1 AND c <= 9).
-        match binder
-            .bind_expr(&parse("c NOT BETWEEN 1 AND 9"), &schema)
-            .unwrap()
-        {
+        match binder.bind_expr(&parse("c NOT BETWEEN 1 AND 9"), &schema).unwrap() {
             BoundExpr::UnaryOp(UnaryOp::Not, inner) => {
                 assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::And, _)))
             }
@@ -548,13 +516,7 @@ mod tests {
             for fname in &["MIN", "MAX"] {
                 let expr = parse(&format!("{fname}(c)"));
                 let r = binder.bind_expr(&expr, &schema);
-                assert!(
-                    r.is_ok(),
-                    "expected {}({:?}) to bind, got {:?}",
-                    fname,
-                    tc,
-                    r.err()
-                );
+                assert!(r.is_ok(), "expected {}({:?}) to bind, got {:?}", fname, tc, r.err());
             }
         }
     }
@@ -595,9 +557,7 @@ mod tests {
             BoundExpr::IsNull(1)
         ));
         assert!(matches!(
-            binder
-                .bind_expr(&parse("t.c IS NOT NULL"), &nullable)
-                .unwrap(),
+            binder.bind_expr(&parse("t.c IS NOT NULL"), &nullable).unwrap(),
             BoundExpr::IsNotNull(1)
         ));
     }

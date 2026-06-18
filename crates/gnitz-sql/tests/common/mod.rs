@@ -40,11 +40,7 @@ pub fn exec(client: &mut GnitzClient, sn: &str, sql: &str) {
 
 /// Plan and execute a statement, returning the planner result so a test can
 /// assert it errors (`.is_err()`) or inspect the variant.
-pub fn try_exec(
-    client: &mut GnitzClient,
-    sn: &str,
-    sql: &str,
-) -> Result<Vec<SqlResult>, GnitzSqlError> {
+pub fn try_exec(client: &mut GnitzClient, sn: &str, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
     let mut p = SqlPlanner::new(client, sn);
     p.execute(sql)
 }
@@ -70,14 +66,22 @@ pub fn read_view(client: &mut GnitzClient, sn: &str, view: &str) -> (Schema, ZSe
 }
 
 pub fn col_idx(schema: &Schema, name: &str) -> usize {
-    schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))
-        .unwrap_or_else(|| panic!("column '{}' not in view schema {:?}",
-            name, schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>()))
+    schema
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(name))
+        .unwrap_or_else(|| {
+            panic!(
+                "column '{}' not in view schema {:?}",
+                name,
+                schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+            )
+        })
 }
 
 pub fn i64_at(batch: &ZSetBatch, col: usize, row: usize) -> i64 {
     match &batch.columns[col] {
-        ColData::Fixed(b) => i64::from_le_bytes(b[row*8..row*8+8].try_into().unwrap()),
+        ColData::Fixed(b) => i64::from_le_bytes(b[row * 8..row * 8 + 8].try_into().unwrap()),
         other => panic!("expected Fixed col, got {:?}", std::mem::discriminant(other)),
     }
 }
@@ -89,7 +93,7 @@ pub fn i64_at(batch: &ZSetBatch, col: usize, row: usize) -> i64 {
 /// compound PKs arrive as `Bytes` (native-LE, tightly packed in pk-column order).
 pub fn pk_i64_at(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i64 {
     match &batch.pks {
-        PkColumn::U64s(v)  => v[row] as i64,
+        PkColumn::U64s(v) => v[row] as i64,
         PkColumn::U128s(v) => v[row] as i64,
         PkColumn::Bytes { stride, buf } => {
             let off = row * *stride as usize + schema.pk_byte_offset(ci);
@@ -107,10 +111,17 @@ pub fn payload_rows(client: &mut GnitzClient, sn: &str, view: &str, cols: &[&str
     let (schema, batch) = read_view(client, sn, view);
     let idxs: Vec<usize> = cols.iter().map(|c| col_idx(&schema, c)).collect();
     let mut rows: Vec<Vec<i64>> = (0..batch.len())
-        .map(|r| idxs.iter().map(|&ci| {
-            if schema.is_pk_col(ci) { pk_i64_at(&schema, &batch, ci, r) }
-            else { i64_at(&batch, ci, r) }
-        }).collect())
+        .map(|r| {
+            idxs.iter()
+                .map(|&ci| {
+                    if schema.is_pk_col(ci) {
+                        pk_i64_at(&schema, &batch, ci, r)
+                    } else {
+                        i64_at(&batch, ci, r)
+                    }
+                })
+                .collect()
+        })
         .collect();
     rows.sort();
     rows
@@ -118,7 +129,7 @@ pub fn payload_rows(client: &mut GnitzClient, sn: &str, view: &str, cols: &[&str
 
 pub fn f64_at(batch: &ZSetBatch, col: usize, row: usize) -> f64 {
     match &batch.columns[col] {
-        ColData::Fixed(b) => f64::from_le_bytes(b[row*8..row*8+8].try_into().unwrap()),
+        ColData::Fixed(b) => f64::from_le_bytes(b[row * 8..row * 8 + 8].try_into().unwrap()),
         other => panic!("expected Fixed col, got {:?}", std::mem::discriminant(other)),
     }
 }
@@ -141,19 +152,24 @@ pub fn scan_circuit_nodes(client: &mut GnitzClient) -> Option<ZSetBatch> {
 /// 16 bytes (view_id in the low 8); a scan returns the full schema order, so the
 /// opcode is column index 3 (Fixed u64-LE, non-PK).
 pub fn opcode_node_count(batch: Option<&ZSetBatch>, vid: u64, op: u64) -> usize {
-    let batch = match batch { Some(b) => b, None => return 0 };
+    let batch = match batch {
+        Some(b) => b,
+        None => return 0,
+    };
     let opcodes = match &batch.columns[3] {
         ColData::Fixed(buf) => buf,
         other => panic!("opcode column not Fixed: {other:?}"),
     };
-    (0..batch.len()).filter(|&i| {
-        let pk = match &batch.pks {
-            PkColumn::Bytes { .. } => batch.pks.get_bytes(i),
-            other => panic!("circuit nodes PK not wide bytes: {other:?}"),
-        };
-        u64::from_le_bytes(pk[0..8].try_into().unwrap()) == vid
-            && u64::from_le_bytes(opcodes[i * 8..i * 8 + 8].try_into().unwrap()) == op
-    }).count()
+    (0..batch.len())
+        .filter(|&i| {
+            let pk = match &batch.pks {
+                PkColumn::Bytes { .. } => batch.pks.get_bytes(i),
+                other => panic!("circuit nodes PK not wide bytes: {other:?}"),
+            };
+            u64::from_le_bytes(pk[0..8].try_into().unwrap()) == vid
+                && u64::from_le_bytes(opcodes[i * 8..i * 8 + 8].try_into().unwrap()) == op
+        })
+        .count()
 }
 
 /// Count Filter nodes for `vid` (scans the nodes table). Thin wrapper over

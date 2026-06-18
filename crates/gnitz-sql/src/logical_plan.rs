@@ -1,7 +1,14 @@
 use gnitz_core::{Schema, TypeCode};
 
 #[derive(Clone, Debug, Copy, PartialEq)]
-pub enum AggFunc { Count, CountNonNull, Sum, Min, Max, Avg }
+pub enum AggFunc {
+    Count,
+    CountNonNull,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
 
 #[derive(Clone, Debug)]
 pub enum BoundExpr {
@@ -27,11 +34,16 @@ impl BoundExpr {
                 let lt = l.infer_type(schema);
                 let rt = r.infer_type(schema);
                 match op {
-                    BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Ge |
-                    BinOp::Lt | BinOp::Le | BinOp::And | BinOp::Or => TypeCode::I64,
-                    _ => if matches!(lt, TypeCode::F32 | TypeCode::F64)
-                         || matches!(rt, TypeCode::F32 | TypeCode::F64)
-                         { TypeCode::F64 } else { TypeCode::I64 },
+                    BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Ge | BinOp::Lt | BinOp::Le | BinOp::And | BinOp::Or => {
+                        TypeCode::I64
+                    }
+                    _ => {
+                        if matches!(lt, TypeCode::F32 | TypeCode::F64) || matches!(rt, TypeCode::F32 | TypeCode::F64) {
+                            TypeCode::F64
+                        } else {
+                            TypeCode::I64
+                        }
+                    }
                 }
             }
             BoundExpr::UnaryOp(UnaryOp::Neg, inner) => inner.infer_type(schema),
@@ -53,7 +65,24 @@ impl BoundExpr {
 }
 
 #[derive(Clone, Debug, Copy)]
-pub enum BinOp { Add, Sub, Mul, Div, Mod, Eq, Ne, Gt, Ge, Lt, Le, And, Or }
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    And,
+    Or,
+}
 
 #[derive(Clone, Debug, Copy)]
-pub enum UnaryOp { Neg, Not }
+pub enum UnaryOp {
+    Neg,
+    Not,
+}

@@ -68,9 +68,7 @@ fn try_compile_string_cmp(
     }
     // ColRef(string/blob) op ColRef(string/blob)
     if let (BoundExpr::ColRef(a), BoundExpr::ColRef(b)) = (left, right) {
-        if schema.columns[*a].type_code.is_german_string()
-            && schema.columns[*b].type_code.is_german_string()
-        {
+        if schema.columns[*a].type_code.is_german_string() && schema.columns[*b].type_code.is_german_string() {
             let reg = match op {
                 BinOp::Eq => eb.str_col_eq_col(*a, *b),
                 BinOp::Ne => {
@@ -113,13 +111,11 @@ pub fn compile_bound_expr(
             // comparison (`a.s > b.int`) and must error, not load garbage.
             let tc = schema.columns[*idx].type_code;
             match tc {
-                TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => {
-                    Err(GnitzSqlError::Unsupported(format!(
-                        "column {:?} is {tc:?}; 128-bit columns cannot be used in view \
+                TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => Err(GnitzSqlError::Unsupported(format!(
+                    "column {:?} is {tc:?}; 128-bit columns cannot be used in view \
                      expressions (use a primary-key seek or CREATE INDEX instead)",
-                        schema.columns[*idx].name,
-                    )))
-                }
+                    schema.columns[*idx].name,
+                ))),
                 TypeCode::String | TypeCode::Blob => Err(GnitzSqlError::Unsupported(format!(
                     "column {:?} is {tc:?}; string/blob columns support only =, <>, <, <=, \
                      >, >= against another string/blob column or a string literal — not \
@@ -173,9 +169,7 @@ pub fn compile_bound_expr(
                 (BinOp::Div, false) => Ok((eb.div(l, r), false)),
                 (BinOp::Div, true) => Ok((eb.float_div(l, r), true)),
                 (BinOp::Mod, false) => Ok((eb.modulo(l, r), false)),
-                (BinOp::Mod, true) => Err(GnitzSqlError::Unsupported(
-                    "float modulo not supported".to_string(),
-                )),
+                (BinOp::Mod, true) => Err(GnitzSqlError::Unsupported("float modulo not supported".to_string())),
                 // Comparisons — result is always int (0/1)
                 (BinOp::Eq, false) => Ok((eb.cmp_eq(l, r), false)),
                 (BinOp::Eq, true) => Ok((eb.fcmp_eq(l, r), false)),
@@ -319,14 +313,7 @@ mod tests {
         let col1 = BoundExpr::ColRef(1);
         let col2 = BoundExpr::ColRef(2);
         let lit = BoundExpr::LitStr("x".to_string());
-        for op in [
-            BinOp::Eq,
-            BinOp::Ne,
-            BinOp::Lt,
-            BinOp::Le,
-            BinOp::Gt,
-            BinOp::Ge,
-        ] {
+        for op in [BinOp::Eq, BinOp::Ne, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge] {
             assert_eq!(
                 compile(&col1, op, &col2, &bs),
                 compile(&col1, op, &col2, &ss),
@@ -365,8 +352,7 @@ mod tests {
             Box::new(BoundExpr::ColRef(2)),
         );
         let mut eb = ExprBuilder::new();
-        let err =
-            compile_bound_expr(&expr, &schema, &mut eb).expect_err("string > int must not compile");
+        let err = compile_bound_expr(&expr, &schema, &mut eb).expect_err("string > int must not compile");
         assert!(
             matches!(err, GnitzSqlError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
@@ -384,8 +370,7 @@ mod tests {
             Box::new(BoundExpr::LitInt(1)),
         );
         let mut eb = ExprBuilder::new();
-        let err =
-            compile_bound_expr(&expr, &schema, &mut eb).expect_err("string + 1 must not compile");
+        let err = compile_bound_expr(&expr, &schema, &mut eb).expect_err("string + 1 must not compile");
         assert!(
             matches!(err, GnitzSqlError::Unsupported(_)),
             "expected Unsupported, got {err:?}"

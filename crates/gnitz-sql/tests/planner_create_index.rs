@@ -11,10 +11,13 @@ use gnitz_test_harness::ServerHandle;
 
 #[test]
 fn create_index_duplicate_name_is_rejected() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
-    exec(&mut client, &sn, "CREATE INDEX ON t(v)");          // first: ok
+    exec(&mut client, &sn, "CREATE INDEX ON t(v)"); // first: ok
     let result = try_exec(&mut client, &sn, "CREATE INDEX ON t(v)"); // second: same auto-name
     assert!(
         result.is_err(),
@@ -24,9 +27,16 @@ fn create_index_duplicate_name_is_rejected() {
 
 #[test]
 fn create_index_explicit_duplicate_name_is_rejected() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
-    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT, w BIGINT)");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT, w BIGINT)",
+    );
     exec(&mut client, &sn, "CREATE INDEX my_idx ON t(v)");
     let result = try_exec(&mut client, &sn, "CREATE INDEX my_idx ON t(w)");
     assert!(result.is_err(), "explicit duplicate index name must be rejected");
@@ -34,9 +44,16 @@ fn create_index_explicit_duplicate_name_is_rejected() {
 
 #[test]
 fn create_index_distinct_names_succeed() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (mut client, sn) = make_planner(&srv);
-    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT, w BIGINT)");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT, w BIGINT)",
+    );
     exec(&mut client, &sn, "CREATE INDEX iv ON t(v)");
     // A distinct name on a different column must still be accepted.
     exec(&mut client, &sn, "CREATE INDEX iw ON t(w)");
