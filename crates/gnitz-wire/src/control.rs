@@ -25,16 +25,56 @@
 use crate::{TypeCode, WireSysCol};
 
 pub const CONTROL_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "msg_idx",      type_code: TypeCode::U64,    nullable: false },
-    WireSysCol { name: "status",       type_code: TypeCode::U64,    nullable: false },
-    WireSysCol { name: "client_id",    type_code: TypeCode::U64,    nullable: false },
-    WireSysCol { name: "target_id",    type_code: TypeCode::U64,    nullable: false },
-    WireSysCol { name: "flags",        type_code: TypeCode::U64,    nullable: false },
-    WireSysCol { name: "seek_pk",      type_code: TypeCode::U128,   nullable: false },
-    WireSysCol { name: "seek_col_idx", type_code: TypeCode::U64,    nullable: false },
-    WireSysCol { name: "request_id",   type_code: TypeCode::U64,    nullable: false },
-    WireSysCol { name: "error_msg",    type_code: TypeCode::String, nullable: true  },
-    WireSysCol { name: "seek_pk_extra", type_code: TypeCode::Blob,   nullable: true  },
+    WireSysCol {
+        name: "msg_idx",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "status",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "client_id",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "target_id",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "flags",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "seek_pk",
+        type_code: TypeCode::U128,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "seek_col_idx",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "request_id",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "error_msg",
+        type_code: TypeCode::String,
+        nullable: true,
+    },
+    WireSysCol {
+        name: "seek_pk_extra",
+        type_code: TypeCode::Blob,
+        nullable: true,
+    },
 ];
 
 pub const NUM_COLUMNS: usize = CONTROL_COLS.len();
@@ -48,25 +88,30 @@ pub const fn col_index(name: &str) -> usize {
             let mut j = 0;
             let mut matched = true;
             while j < a.len() {
-                if a[j] != b[j] { matched = false; break; }
+                if a[j] != b[j] {
+                    matched = false;
+                    break;
+                }
                 j += 1;
             }
-            if matched { return i; }
+            if matched {
+                return i;
+            }
         }
         i += 1;
     }
     panic!("Column not found in CONTROL_COLS")
 }
 
-pub const COL_MSG_IDX:      usize = col_index("msg_idx");
-pub const COL_STATUS:       usize = col_index("status");
-pub const COL_CLIENT_ID:    usize = col_index("client_id");
-pub const COL_TARGET_ID:    usize = col_index("target_id");
-pub const COL_FLAGS:        usize = col_index("flags");
-pub const COL_SEEK_PK:      usize = col_index("seek_pk");
+pub const COL_MSG_IDX: usize = col_index("msg_idx");
+pub const COL_STATUS: usize = col_index("status");
+pub const COL_CLIENT_ID: usize = col_index("client_id");
+pub const COL_TARGET_ID: usize = col_index("target_id");
+pub const COL_FLAGS: usize = col_index("flags");
+pub const COL_SEEK_PK: usize = col_index("seek_pk");
 pub const COL_SEEK_COL_IDX: usize = col_index("seek_col_idx");
-pub const COL_REQUEST_ID:   usize = col_index("request_id");
-pub const COL_ERROR_MSG:    usize = col_index("error_msg");
+pub const COL_REQUEST_ID: usize = col_index("request_id");
+pub const COL_ERROR_MSG: usize = col_index("error_msg");
 pub const COL_SEEK_PK_EXTRA: usize = col_index("seek_pk_extra");
 
 const fn payload_index(col_idx: usize) -> usize {
@@ -75,14 +120,14 @@ const fn payload_index(col_idx: usize) -> usize {
     col_idx - 1
 }
 
-pub const PAYLOAD_STATUS:       usize = payload_index(COL_STATUS);
-pub const PAYLOAD_CLIENT_ID:    usize = payload_index(COL_CLIENT_ID);
-pub const PAYLOAD_TARGET_ID:    usize = payload_index(COL_TARGET_ID);
-pub const PAYLOAD_FLAGS:        usize = payload_index(COL_FLAGS);
-pub const PAYLOAD_SEEK_PK:      usize = payload_index(COL_SEEK_PK);
+pub const PAYLOAD_STATUS: usize = payload_index(COL_STATUS);
+pub const PAYLOAD_CLIENT_ID: usize = payload_index(COL_CLIENT_ID);
+pub const PAYLOAD_TARGET_ID: usize = payload_index(COL_TARGET_ID);
+pub const PAYLOAD_FLAGS: usize = payload_index(COL_FLAGS);
+pub const PAYLOAD_SEEK_PK: usize = payload_index(COL_SEEK_PK);
 pub const PAYLOAD_SEEK_COL_IDX: usize = payload_index(COL_SEEK_COL_IDX);
-pub const PAYLOAD_REQUEST_ID:   usize = payload_index(COL_REQUEST_ID);
-pub const PAYLOAD_ERROR_MSG:    usize = payload_index(COL_ERROR_MSG);
+pub const PAYLOAD_REQUEST_ID: usize = payload_index(COL_REQUEST_ID);
+pub const PAYLOAD_ERROR_MSG: usize = payload_index(COL_ERROR_MSG);
 pub const PAYLOAD_SEEK_PK_EXTRA: usize = payload_index(COL_SEEK_PK_EXTRA);
 
 /// Null-bit position for `error_msg` in the row null bitmap.
@@ -100,16 +145,16 @@ pub const NUM_REGIONS: usize = 3 + (NUM_COLUMNS - 1) + 1;
 
 // Region indices. V3 format: 3 system regions (pk=0, weight=1, null_bmp=2)
 // followed by payload columns in schema order, then blob last.
-pub const REGION_PK:           usize = 0;
-pub const REGION_WEIGHT:       usize = 1;
-pub const REGION_NULL_BMP:     usize = 2;
-pub const REGION_STATUS:       usize = 3 + PAYLOAD_STATUS;
-pub const REGION_CLIENT_ID:    usize = 3 + PAYLOAD_CLIENT_ID;
-pub const REGION_TARGET_ID:    usize = 3 + PAYLOAD_TARGET_ID;
-pub const REGION_FLAGS:        usize = 3 + PAYLOAD_FLAGS;
-pub const REGION_SEEK_PK:      usize = 3 + PAYLOAD_SEEK_PK;
+pub const REGION_PK: usize = 0;
+pub const REGION_WEIGHT: usize = 1;
+pub const REGION_NULL_BMP: usize = 2;
+pub const REGION_STATUS: usize = 3 + PAYLOAD_STATUS;
+pub const REGION_CLIENT_ID: usize = 3 + PAYLOAD_CLIENT_ID;
+pub const REGION_TARGET_ID: usize = 3 + PAYLOAD_TARGET_ID;
+pub const REGION_FLAGS: usize = 3 + PAYLOAD_FLAGS;
+pub const REGION_SEEK_PK: usize = 3 + PAYLOAD_SEEK_PK;
 pub const REGION_SEEK_COL_IDX: usize = 3 + PAYLOAD_SEEK_COL_IDX;
-pub const REGION_REQUEST_ID:   usize = 3 + PAYLOAD_REQUEST_ID;
-pub const REGION_ERROR_MSG:    usize = 3 + PAYLOAD_ERROR_MSG;
+pub const REGION_REQUEST_ID: usize = 3 + PAYLOAD_REQUEST_ID;
+pub const REGION_ERROR_MSG: usize = 3 + PAYLOAD_ERROR_MSG;
 pub const REGION_SEEK_PK_EXTRA: usize = 3 + PAYLOAD_SEEK_PK_EXTRA;
-pub const REGION_BLOB:         usize = NUM_REGIONS - 1;
+pub const REGION_BLOB: usize = NUM_REGIONS - 1;

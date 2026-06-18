@@ -2,21 +2,21 @@
 
 #[allow(dead_code)]
 pub mod type_code {
-    pub const U8:     u8 = 1;
-    pub const I8:     u8 = 2;
-    pub const U16:    u8 = 3;
-    pub const I16:    u8 = 4;
-    pub const U32:    u8 = 5;
-    pub const I32:    u8 = 6;
-    pub const F32:    u8 = 7;
-    pub const U64:    u8 = 8;
-    pub const I64:    u8 = 9;
-    pub const F64:    u8 = 10;
+    pub const U8: u8 = 1;
+    pub const I8: u8 = 2;
+    pub const U16: u8 = 3;
+    pub const I16: u8 = 4;
+    pub const U32: u8 = 5;
+    pub const I32: u8 = 6;
+    pub const F32: u8 = 7;
+    pub const U64: u8 = 8;
+    pub const I64: u8 = 9;
+    pub const F64: u8 = 10;
     pub const STRING: u8 = 11;
-    pub const U128:   u8 = 12;
-    pub const UUID:   u8 = 13;
-    pub const BLOB:   u8 = 14;
-    pub const I128:   u8 = 15;
+    pub const U128: u8 = 12;
+    pub const UUID: u8 = 13;
+    pub const BLOB: u8 = 14;
+    pub const I128: u8 = 15;
 }
 
 /// Typed column type code enum, mirroring the `type_code::*` constants.
@@ -27,29 +27,28 @@ pub mod type_code {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TypeCode {
-    U8     = type_code::U8,
-    I8     = type_code::I8,
-    U16    = type_code::U16,
-    I16    = type_code::I16,
-    U32    = type_code::U32,
-    I32    = type_code::I32,
-    F32    = type_code::F32,
-    U64    = type_code::U64,
-    I64    = type_code::I64,
-    F64    = type_code::F64,
+    U8 = type_code::U8,
+    I8 = type_code::I8,
+    U16 = type_code::U16,
+    I16 = type_code::I16,
+    U32 = type_code::U32,
+    I32 = type_code::I32,
+    F32 = type_code::F32,
+    U64 = type_code::U64,
+    I64 = type_code::I64,
+    F64 = type_code::F64,
     String = type_code::STRING,
-    U128   = type_code::U128,
-    UUID   = type_code::UUID,
-    Blob   = type_code::BLOB,
-    I128   = type_code::I128,
+    U128 = type_code::U128,
+    UUID = type_code::UUID,
+    Blob = type_code::BLOB,
+    I128 = type_code::I128,
 }
 
 impl TypeCode {
     /// Convert a wire u8 that has already passed DDL validation. Panics on unknown codes.
     #[inline]
     pub fn from_validated_u8(v: u8) -> Self {
-        Self::try_from_u8(v)
-            .unwrap_or_else(|| panic!("invalid type_code {v} in validated schema"))
+        Self::try_from_u8(v).unwrap_or_else(|| panic!("invalid type_code {v} in validated schema"))
     }
 
     /// Convert a raw u8 wire value. Returns `None` for unknown codes.
@@ -57,29 +56,29 @@ impl TypeCode {
     pub fn try_from_u8(v: u8) -> Option<Self> {
         use type_code as tc;
         match v {
-            tc::U8     => Some(TypeCode::U8),
-            tc::I8     => Some(TypeCode::I8),
-            tc::U16    => Some(TypeCode::U16),
-            tc::I16    => Some(TypeCode::I16),
-            tc::U32    => Some(TypeCode::U32),
-            tc::I32    => Some(TypeCode::I32),
-            tc::F32    => Some(TypeCode::F32),
-            tc::U64    => Some(TypeCode::U64),
-            tc::I64    => Some(TypeCode::I64),
-            tc::F64    => Some(TypeCode::F64),
+            tc::U8 => Some(TypeCode::U8),
+            tc::I8 => Some(TypeCode::I8),
+            tc::U16 => Some(TypeCode::U16),
+            tc::I16 => Some(TypeCode::I16),
+            tc::U32 => Some(TypeCode::U32),
+            tc::I32 => Some(TypeCode::I32),
+            tc::F32 => Some(TypeCode::F32),
+            tc::U64 => Some(TypeCode::U64),
+            tc::I64 => Some(TypeCode::I64),
+            tc::F64 => Some(TypeCode::F64),
             tc::STRING => Some(TypeCode::String),
-            tc::U128   => Some(TypeCode::U128),
-            tc::UUID   => Some(TypeCode::UUID),
-            tc::BLOB   => Some(TypeCode::Blob),
-            tc::I128   => Some(TypeCode::I128),
-            _          => None,
+            tc::U128 => Some(TypeCode::U128),
+            tc::UUID => Some(TypeCode::UUID),
+            tc::BLOB => Some(TypeCode::Blob),
+            tc::I128 => Some(TypeCode::I128),
+            _ => None,
         }
     }
 
     /// Byte stride of this type in a column payload.
     pub const fn stride(&self) -> u8 {
         match self {
-            TypeCode::U8  | TypeCode::I8  => 1,
+            TypeCode::U8 | TypeCode::I8 => 1,
             TypeCode::U16 | TypeCode::I16 => 2,
             TypeCode::F32 | TypeCode::U32 | TypeCode::I32 => 4,
             TypeCode::F64 | TypeCode::U64 | TypeCode::I64 => 8,
@@ -113,9 +112,16 @@ impl TypeCode {
     pub const fn is_pk_eligible(&self) -> bool {
         matches!(
             self,
-            TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64
-                | TypeCode::U128 | TypeCode::UUID
-                | TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64
+            TypeCode::U8
+                | TypeCode::U16
+                | TypeCode::U32
+                | TypeCode::U64
+                | TypeCode::U128
+                | TypeCode::UUID
+                | TypeCode::I8
+                | TypeCode::I16
+                | TypeCode::I32
+                | TypeCode::I64
                 | TypeCode::I128,
         )
     }
@@ -183,9 +189,9 @@ pub fn index_key_type(field_type_code: u8) -> Result<u8, String> {
         tc::UUID => Ok(tc::UUID),
         tc::U64 | tc::U32 | tc::U16 | tc::U8 => Ok(tc::U64),
         tc::I64 | tc::I32 | tc::I16 | tc::I8 => Ok(tc::I64),
-        tc::F32 | tc::F64 | tc::STRING | tc::BLOB => {
-            Err(format!("Secondary index on column type {field_type_code} not supported"))
-        }
+        tc::F32 | tc::F64 | tc::STRING | tc::BLOB => Err(format!(
+            "Secondary index on column type {field_type_code} not supported"
+        )),
         _ => Err(format!("Unknown column type code: {field_type_code}")),
     }
 }
@@ -199,12 +205,8 @@ pub fn index_key_type(field_type_code: u8) -> Result<u8, String> {
 /// shared by the SQL planner's CREATE INDEX pre-check and the engine's
 /// `make_index_schema`, so the friendly planner error and the engine backstop
 /// can never disagree on a column's promoted width or the limits.
-pub fn index_key_types(
-    col_types: &[u8], src_pk_count: usize, src_pk_stride: usize,
-) -> Result<Vec<u8>, String> {
-    let promoted: Vec<u8> = col_types.iter()
-        .map(|&t| index_key_type(t))
-        .collect::<Result<_, _>>()?;
+pub fn index_key_types(col_types: &[u8], src_pk_count: usize, src_pk_stride: usize) -> Result<Vec<u8>, String> {
+    let promoted: Vec<u8> = col_types.iter().map(|&t| index_key_type(t)).collect::<Result<_, _>>()?;
     let n = promoted.len();
     if n + src_pk_count > crate::MAX_PK_COLUMNS {
         return Err(format!(
@@ -212,8 +214,7 @@ pub fn index_key_types(
             crate::MAX_PK_COLUMNS,
         ));
     }
-    let stride: usize =
-        promoted.iter().map(|&t| wire_stride(t)).sum::<usize>() + src_pk_stride;
+    let stride: usize = promoted.iter().map(|&t| wire_stride(t)).sum::<usize>() + src_pk_stride;
     if stride > crate::MAX_PK_BYTES {
         return Err(format!(
             "index record stride {stride} exceeds the limit of {} bytes",
@@ -237,7 +238,10 @@ pub fn is_german_string(tc: u8) -> bool {
 /// sign bit for these so two's-complement negatives sort below non-negatives.
 /// Unsigned, float, string, and unknown codes are not signed.
 pub const fn is_signed_int(tc: u8) -> bool {
-    matches!(tc, type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 | type_code::I128)
+    matches!(
+        tc,
+        type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 | type_code::I128
+    )
 }
 
 /// Whether a raw wire type code is a fixed-width integer of ≤ 8 bytes
@@ -247,8 +251,14 @@ pub const fn is_signed_int(tc: u8) -> bool {
 pub const fn is_fixed_int(tc: u8) -> bool {
     matches!(
         tc,
-        type_code::U8 | type_code::I8 | type_code::U16 | type_code::I16
-            | type_code::U32 | type_code::I32 | type_code::U64 | type_code::I64
+        type_code::U8
+            | type_code::I8
+            | type_code::U16
+            | type_code::I16
+            | type_code::U32
+            | type_code::I32
+            | type_code::U64
+            | type_code::I64
     )
 }
 
@@ -257,26 +267,44 @@ pub const fn is_fixed_int(tc: u8) -> bool {
 /// `from_type_code`; *holding* a `FixedInt` is proof the column is a narrow
 /// integer, so `decode_le_i64` needs no wildcard and cannot panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FixedInt { U8, I8, U16, I16, U32, I32, U64, I64 }
+pub enum FixedInt {
+    U8,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+    U64,
+    I64,
+}
 
 impl FixedInt {
     /// Exhaustive over `TypeCode` (no `_` arm): a new `TypeCode` variant is a
     /// compile error here until someone decides whether it is a narrow integer.
     pub const fn from_type_code(tc: TypeCode) -> Option<Self> {
         match tc {
-            TypeCode::U8  => Some(Self::U8),  TypeCode::I8  => Some(Self::I8),
-            TypeCode::U16 => Some(Self::U16), TypeCode::I16 => Some(Self::I16),
-            TypeCode::U32 => Some(Self::U32), TypeCode::I32 => Some(Self::I32),
-            TypeCode::U64 => Some(Self::U64), TypeCode::I64 => Some(Self::I64),
-            TypeCode::F32 | TypeCode::F64 | TypeCode::U128 | TypeCode::UUID
-            | TypeCode::String | TypeCode::Blob | TypeCode::I128 => None,
+            TypeCode::U8 => Some(Self::U8),
+            TypeCode::I8 => Some(Self::I8),
+            TypeCode::U16 => Some(Self::U16),
+            TypeCode::I16 => Some(Self::I16),
+            TypeCode::U32 => Some(Self::U32),
+            TypeCode::I32 => Some(Self::I32),
+            TypeCode::U64 => Some(Self::U64),
+            TypeCode::I64 => Some(Self::I64),
+            TypeCode::F32
+            | TypeCode::F64
+            | TypeCode::U128
+            | TypeCode::UUID
+            | TypeCode::String
+            | TypeCode::Blob
+            | TypeCode::I128 => None,
         }
     }
 
     /// Byte width (1/2/4/8).
     pub const fn width(self) -> usize {
         match self {
-            Self::U8 | Self::I8   => 1,
+            Self::U8 | Self::I8 => 1,
             Self::U16 | Self::I16 => 2,
             Self::U32 | Self::I32 => 4,
             Self::U64 | Self::I64 => 8,
@@ -291,8 +319,8 @@ impl FixedInt {
     /// different in-range value.
     pub const fn range(self) -> (i128, i128) {
         match self {
-            Self::U8  => (0, u8::MAX as i128),
-            Self::I8  => (i8::MIN as i128, i8::MAX as i128),
+            Self::U8 => (0, u8::MAX as i128),
+            Self::I8 => (i8::MIN as i128, i8::MAX as i128),
             Self::U16 => (0, u16::MAX as i128),
             Self::I16 => (i16::MIN as i128, i16::MAX as i128),
             Self::U32 => (0, u32::MAX as i128),
@@ -319,8 +347,8 @@ impl FixedInt {
     pub fn decode_le_i64(self, b: &[u8]) -> i64 {
         debug_assert!(b.len() >= self.width());
         match self {
-            Self::U8  => b[0] as i64,
-            Self::I8  => b[0] as i8 as i64,
+            Self::U8 => b[0] as i64,
+            Self::I8 => b[0] as i8 as i64,
             Self::U16 => u16::from_le_bytes(b[..2].try_into().unwrap()) as i64,
             Self::I16 => i16::from_le_bytes(b[..2].try_into().unwrap()) as i64,
             Self::U32 => u32::from_le_bytes(b[..4].try_into().unwrap()) as i64,
@@ -338,8 +366,11 @@ pub const fn reindex_output_type_code(tc: u8) -> u8 {
     // ≤8-byte ints and the signed-128 join key keep their own width-and-sign slot;
     // every other wide/non-int type (U128/UUID, the STRING/BLOB hash, floats)
     // collapses to the unsigned 16-byte U128 key.
-    if is_fixed_int(tc) || tc == type_code::I128 { tc }
-    else { type_code::U128 }
+    if is_fixed_int(tc) || tc == type_code::I128 {
+        tc
+    } else {
+        type_code::U128
+    }
 }
 
 /// Common reindex output type code for an equijoin key pair, or `None` if the
@@ -371,7 +402,11 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
     let is_unsigned_int = |tc: u8| is_routable_int(tc) && !is_signed_int(tc);
     if is_unsigned_int(l) && is_unsigned_int(r) {
         let wider = if wire_stride(l) >= wire_stride(r) { l } else { r };
-        return Some(if wire_stride(wider) == 16 { type_code::U128 } else { wider });
+        return Some(if wire_stride(wider) == 16 {
+            type_code::U128
+        } else {
+            wider
+        });
     }
     // Cross-sign integer keys: one side signed, the other unsigned. (Equal,
     // both-signed, and both-unsigned pairs all returned above, so any remaining
@@ -387,12 +422,12 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
         let (s, u) = if is_signed_int(l) { (l, r) } else { (r, l) };
         let common_w = (wire_stride(u) * 2).max(wire_stride(s));
         return match common_w {
-            2  => Some(type_code::I16),
-            4  => Some(type_code::I32),
-            8  => Some(type_code::I64),
+            2 => Some(type_code::I16),
+            4 => Some(type_code::I32),
+            8 => Some(type_code::I64),
             16 => Some(type_code::I128),
             // wu == 16 (U128/UUID) ⇒ common_w == 32: a signed-256 type, none exists.
-            _  => None,
+            _ => None,
         };
     }
     None
@@ -404,7 +439,11 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
 /// `ReindexPacker` cannot derive divergent slot widths.
 #[inline]
 pub const fn resolve_reindex_type(src_tc: u8, carried_tc: u8) -> u8 {
-    if carried_tc != 0 { carried_tc } else { reindex_output_type_code(src_tc) }
+    if carried_tc != 0 {
+        carried_tc
+    } else {
+        reindex_output_type_code(src_tc)
+    }
 }
 
 /// Inverse of [`resolve_reindex_type`]: the per-slot carried target tc to PERSIST
@@ -418,7 +457,11 @@ pub const fn resolve_reindex_type(src_tc: u8, carried_tc: u8) -> u8 {
 /// of `src` can be promoted to (see the round-trip test).
 #[inline]
 pub const fn carried_reindex_tc(src_tc: u8, common_tc: u8) -> u8 {
-    if reindex_output_type_code(src_tc) != common_tc { common_tc } else { 0 }
+    if reindex_output_type_code(src_tc) != common_tc {
+        common_tc
+    } else {
+        0
+    }
 }
 
 /// Whether a raw wire type code is any integer-valued fixed-width type that
@@ -434,12 +477,12 @@ pub const fn is_routable_int(tc: u8) -> bool {
 /// Returns 8 for unknown codes (engine compare_rows depends on this default).
 pub const fn wire_stride(tc: u8) -> usize {
     match tc {
-        1 | 2           => 1,   // U8, I8
-        3 | 4           => 2,   // U16, I16
-        5..=7           => 4,   // U32, I32, F32
-        8..=10          => 8,   // U64, I64, F64
-        11..=15           => 16,  // STRING, U128, UUID, BLOB, I128
-        _                 => 8,
+        1 | 2 => 1,    // U8, I8
+        3 | 4 => 2,    // U16, I16
+        5..=7 => 4,    // U32, I32, F32
+        8..=10 => 8,   // U64, I64, F64
+        11..=15 => 16, // STRING, U128, UUID, BLOB, I128
+        _ => 8,
     }
 }
 
@@ -459,8 +502,11 @@ mod tests {
         }
         for t in [tc::I8, tc::I16, tc::I32, tc::I64] {
             assert_eq!(index_key_type(t).unwrap(), tc::I64, "{t} must promote to I64");
-            assert_eq!(wire_stride(index_key_type(t).unwrap()), wire_stride(tc::U64),
-                "signed promotion must keep the 8-byte width");
+            assert_eq!(
+                wire_stride(index_key_type(t).unwrap()),
+                wire_stride(tc::U64),
+                "signed promotion must keep the 8-byte width"
+            );
         }
         assert_eq!(index_key_type(tc::U128).unwrap(), tc::U128);
         assert_eq!(index_key_type(tc::UUID).unwrap(), tc::UUID);
@@ -476,16 +522,26 @@ mod tests {
     #[test]
     fn reindex_output_type_policy() {
         let narrow = [
-            TypeCode::U8, TypeCode::I8, TypeCode::U16, TypeCode::I16,
-            TypeCode::U32, TypeCode::I32, TypeCode::U64, TypeCode::I64,
+            TypeCode::U8,
+            TypeCode::I8,
+            TypeCode::U16,
+            TypeCode::I16,
+            TypeCode::U32,
+            TypeCode::I32,
+            TypeCode::U64,
+            TypeCode::I64,
         ];
         for tc in narrow {
             assert_eq!(tc.reindex_output_type(), tc, "{tc:?} keeps native width");
             assert_eq!(reindex_output_type_code(tc as u8), tc as u8);
         }
         let wide = [
-            TypeCode::U128, TypeCode::UUID, TypeCode::String,
-            TypeCode::Blob, TypeCode::F32, TypeCode::F64,
+            TypeCode::U128,
+            TypeCode::UUID,
+            TypeCode::String,
+            TypeCode::Blob,
+            TypeCode::F32,
+            TypeCode::F64,
         ];
         for tc in wide {
             assert_eq!(tc.reindex_output_type(), TypeCode::U128, "{tc:?} collapses to U128");
@@ -504,27 +560,41 @@ mod tests {
         use type_code::*;
         let cases: &[(u8, u8, u8)] = &[
             // signed ladder → wider signed
-            (I8, I16, I16), (I8, I32, I32), (I8, I64, I64),
-            (I16, I32, I32), (I16, I64, I64), (I32, I64, I64),
+            (I8, I16, I16),
+            (I8, I32, I32),
+            (I8, I64, I64),
+            (I16, I32, I32),
+            (I16, I64, I64),
+            (I32, I64, I64),
             // signed ladder reaching the new 16-byte signed type
-            (I8, I128, I128), (I64, I128, I128), (I128, I128, I128),
+            (I8, I128, I128),
+            (I64, I128, I128),
+            (I128, I128, I128),
             // unsigned ladder → wider unsigned
-            (U8, U16, U16), (U8, U32, U32), (U8, U64, U64),
-            (U16, U32, U32), (U16, U64, U64), (U32, U64, U64),
+            (U8, U16, U16),
+            (U8, U32, U32),
+            (U8, U64, U64),
+            (U16, U32, U32),
+            (U16, U64, U64),
+            (U32, U64, U64),
             // unsigned with a 16-byte operand → U128
-            (U32, U128, U128), (U64, U128, U128), (U32, UUID, U128),
+            (U32, U128, U128),
+            (U64, U128, U128),
+            (U32, UUID, U128),
             (U8, U128, U128),
             // same type → identity (fixed ints) / U128 (16-byte / string)
-            (I32, I32, I32), (U64, U64, U64), (U128, U128, U128),
-            (UUID, UUID, U128), (STRING, STRING, U128), (BLOB, BLOB, U128),
+            (I32, I32, I32),
+            (U64, U64, U64),
+            (U128, U128, U128),
+            (UUID, UUID, U128),
+            (STRING, STRING, U128),
+            (BLOB, BLOB, U128),
             // both german strings (different variants) → U128 content hash
             (STRING, BLOB, U128),
         ];
         for &(l, r, t) in cases {
-            assert_eq!(join_key_common_type(l, r), Some(t),
-                "common({l},{r}) should be {t}");
-            assert_eq!(join_key_common_type(r, l), Some(t),
-                "common is symmetric for ({l},{r})");
+            assert_eq!(join_key_common_type(l, r), Some(t), "common({l},{r}) should be {t}");
+            assert_eq!(join_key_common_type(r, l), Some(t), "common is symmetric for ({l},{r})");
         }
     }
 
@@ -536,17 +606,35 @@ mod tests {
     fn join_key_common_type_accepts_cross_sign() {
         use type_code::*;
         let cases: &[(u8, u8, u8)] = &[
-            (U8, I8, I16), (U8, I16, I16), (U8, I32, I32), (U8, I64, I64),
-            (U16, I8, I32), (U16, I16, I32), (U16, I32, I32), (U16, I64, I64),
-            (U32, I8, I64), (U32, I16, I64), (U32, I32, I64), (U32, I64, I64),
+            (U8, I8, I16),
+            (U8, I16, I16),
+            (U8, I32, I32),
+            (U8, I64, I64),
+            (U16, I8, I32),
+            (U16, I16, I32),
+            (U16, I32, I32),
+            (U16, I64, I64),
+            (U32, I8, I64),
+            (U32, I16, I64),
+            (U32, I32, I64),
+            (U32, I64, I64),
             // U64 unsigned side ⇒ the signed-128 common type.
-            (U64, I8, I128), (U64, I16, I128), (U64, I32, I128), (U64, I64, I128),
+            (U64, I8, I128),
+            (U64, I16, I128),
+            (U64, I32, I128),
+            (U64, I64, I128),
         ];
         for &(u, s, t) in cases {
-            assert_eq!(join_key_common_type(u, s), Some(t),
-                "cross-sign common({u},{s}) should be {t}");
-            assert_eq!(join_key_common_type(s, u), Some(t),
-                "cross-sign common is symmetric for ({u},{s})");
+            assert_eq!(
+                join_key_common_type(u, s),
+                Some(t),
+                "cross-sign common({u},{s}) should be {t}"
+            );
+            assert_eq!(
+                join_key_common_type(s, u),
+                Some(t),
+                "cross-sign common is symmetric for ({u},{s})"
+            );
         }
     }
 
@@ -559,10 +647,14 @@ mod tests {
     fn join_key_common_type_rejects_wide_unsigned_cross_sign() {
         use type_code::*;
         let reject: &[(u8, u8)] = &[
-            (U128, I8), (U128, I64), (UUID, I32), (UUID, I64),
+            (U128, I8),
+            (U128, I64),
+            (UUID, I32),
+            (UUID, I64),
             // a 128-bit unsigned side paired with the signed-128 type still has no
             // faithful (signed-256) common type.
-            (U128, I128), (UUID, I128),
+            (U128, I128),
+            (UUID, I128),
         ];
         for &(l, r) in reject {
             assert_eq!(join_key_common_type(l, r), None, "({l},{r}) must reject");
@@ -605,16 +697,34 @@ mod tests {
         // signed type (e.g. the unsigned U8/U16/U32 sides and a same-sign signed
         // side both landing on a signed T).
         for &(src, t) in &[
-            (I8, I64), (I32, I32), (I32, I64), (U8, U64), (U32, U64),
-            (U32, U128), (U64, U64), (STRING, U128), (U128, U128), (UUID, U128),
-            (U8, I16), (U16, I32), (U32, I64), (I32, I64),
+            (I8, I64),
+            (I32, I32),
+            (I32, I64),
+            (U8, U64),
+            (U32, U64),
+            (U32, U128),
+            (U64, U64),
+            (STRING, U128),
+            (U128, U128),
+            (UUID, U128),
+            (U8, I16),
+            (U16, I32),
+            (U32, I64),
+            (I32, I64),
             // cross-sign and same-sign promotions reaching the signed-128 slot:
             // the unsigned U64 side and every signed side land on I128.
-            (U64, I128), (I8, I128), (I16, I128), (I32, I128), (I64, I128),
+            (U64, I128),
+            (I8, I128),
+            (I16, I128),
+            (I32, I128),
+            (I64, I128),
         ] {
             let carried = carried_reindex_tc(src, t);
-            assert_eq!(resolve_reindex_type(src, carried), t,
-                "round-trip failed for src={src} T={t}");
+            assert_eq!(
+                resolve_reindex_type(src, carried),
+                t,
+                "round-trip failed for src={src} T={t}"
+            );
             // Idempotency of promotion: a *carried* (non-zero) target re-derives to
             // itself through join_key_common_type. The engine compiler relies on
             // exactly this to validate a carried `_join_pk` slot against the planner
@@ -622,9 +732,12 @@ mod tests {
             // every promotion a source can carry. (Self-deriving slots carry 0 and
             // are validated by the per-column default policy, not this rule.)
             if carried != 0 {
-                assert_eq!(join_key_common_type(src, t), Some(t),
+                assert_eq!(
+                    join_key_common_type(src, t),
+                    Some(t),
                     "promotion not idempotent for src={src} T={t}: \
-                     compiler carried-slot guard would diverge from the planner");
+                     compiler carried-slot guard would diverge from the planner"
+                );
             }
         }
     }
@@ -632,10 +745,14 @@ mod tests {
     #[test]
     fn fixed_int_predicate_matches_witness() {
         use TypeCode::*;
-        for tc in [U8, I8, U16, I16, U32, I32, F32, U64, I64, F64,
-                   String, U128, UUID, Blob, I128] {
-            assert_eq!(is_fixed_int(tc as u8), FixedInt::from_type_code(tc).is_some(),
-                "mismatch for {tc:?}");
+        for tc in [
+            U8, I8, U16, I16, U32, I32, F32, U64, I64, F64, String, U128, UUID, Blob, I128,
+        ] {
+            assert_eq!(
+                is_fixed_int(tc as u8),
+                FixedInt::from_type_code(tc).is_some(),
+                "mismatch for {tc:?}"
+            );
         }
     }
 
@@ -649,8 +766,15 @@ mod tests {
         assert!(FixedInt::from_type_code(TypeCode::I32).is_some());
         assert!(FixedInt::from_type_code(TypeCode::U64).is_some());
         assert!(FixedInt::from_type_code(TypeCode::I64).is_some());
-        for tc in [TypeCode::F32, TypeCode::F64, TypeCode::U128, TypeCode::UUID,
-                   TypeCode::String, TypeCode::Blob, TypeCode::I128] {
+        for tc in [
+            TypeCode::F32,
+            TypeCode::F64,
+            TypeCode::U128,
+            TypeCode::UUID,
+            TypeCode::String,
+            TypeCode::Blob,
+            TypeCode::I128,
+        ] {
             assert!(FixedInt::from_type_code(tc).is_none(), "{tc:?} should be None");
         }
     }

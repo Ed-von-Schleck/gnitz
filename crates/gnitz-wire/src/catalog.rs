@@ -9,9 +9,9 @@ use crate::TypeCode;
 // ---------------------------------------------------------------------------
 
 pub struct WireSysCol {
-    pub name:      &'static str,
+    pub name: &'static str,
     pub type_code: TypeCode,
-    pub nullable:  bool,
+    pub nullable: bool,
 }
 
 // Circuit catalog tables use a real compound primary key `(view_id, sub)`
@@ -21,55 +21,131 @@ pub struct WireSysCol {
 // decoded fields as payload so the engine's logical-column readers are
 // unchanged. PK = columns [0, 1].
 pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "view_id",      type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "sub",          type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "node_id",      type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "opcode",       type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "source_table", type_code: TypeCode::U64,  nullable: true  },
-    WireSysCol { name: "reindex_col",  type_code: TypeCode::U64,  nullable: true  },
-    WireSysCol { name: "expr_program", type_code: TypeCode::Blob, nullable: true  },
+    WireSysCol {
+        name: "view_id",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "sub",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "node_id",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "opcode",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "source_table",
+        type_code: TypeCode::U64,
+        nullable: true,
+    },
+    WireSysCol {
+        name: "reindex_col",
+        type_code: TypeCode::U64,
+        nullable: true,
+    },
+    WireSysCol {
+        name: "expr_program",
+        type_code: TypeCode::Blob,
+        nullable: true,
+    },
 ];
 
 pub const CIRCUIT_EDGES_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "view_id",  type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "sub",      type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "dst_node", type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "dst_port", type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "src_node", type_code: TypeCode::U64,  nullable: false },
+    WireSysCol {
+        name: "view_id",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "sub",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "dst_node",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "dst_port",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "src_node",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
 ];
 
 pub const CIRCUIT_NODE_COLUMNS_COLS: &[WireSysCol] = &[
-    WireSysCol { name: "view_id",     type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "sub",         type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "node_id",     type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "kind",        type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "position",    type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "value1",      type_code: TypeCode::U64,  nullable: false },
-    WireSysCol { name: "value2",      type_code: TypeCode::U64,  nullable: false },
+    WireSysCol {
+        name: "view_id",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "sub",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "node_id",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "kind",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "position",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "value1",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
+    WireSysCol {
+        name: "value2",
+        type_code: TypeCode::U64,
+        nullable: false,
+    },
 ];
 
 // ---------------------------------------------------------------------------
 // System table IDs
 // ---------------------------------------------------------------------------
 
-pub const SCHEMA_TAB:           u64 = 1;
-pub const TABLE_TAB:            u64 = 2;
-pub const VIEW_TAB:             u64 = 3;
-pub const COL_TAB:              u64 = 4;
-pub const IDX_TAB:              u64 = 5;
-pub const DEP_TAB:              u64 = 6;
-pub const SEQ_TAB:              u64 = 7;
-pub const CIRCUIT_NODES_TAB:        u64 = 11;
-pub const CIRCUIT_EDGES_TAB:        u64 = 12;
+pub const SCHEMA_TAB: u64 = 1;
+pub const TABLE_TAB: u64 = 2;
+pub const VIEW_TAB: u64 = 3;
+pub const COL_TAB: u64 = 4;
+pub const IDX_TAB: u64 = 5;
+pub const DEP_TAB: u64 = 6;
+pub const SEQ_TAB: u64 = 7;
+pub const CIRCUIT_NODES_TAB: u64 = 11;
+pub const CIRCUIT_EDGES_TAB: u64 = 12;
 pub const CIRCUIT_NODE_COLUMNS_TAB: u64 = 13;
 // IDs 14 and 15 were previously CIRCUIT_PARAMS_TAB and CIRCUIT_GROUP_COLS_TAB,
 // now folded into CircuitNodes / CircuitNodeColumns.
 
-pub const FIRST_USER_TABLE_ID:  u64 = 16;
+pub const FIRST_USER_TABLE_ID: u64 = 16;
 pub const FIRST_USER_SCHEMA_ID: u64 = 3;
 
 pub const OWNER_KIND_TABLE: u64 = 0;
-pub const OWNER_KIND_VIEW:  u64 = 1;
+pub const OWNER_KIND_VIEW: u64 = 1;
 
 // ---------------------------------------------------------------------------
 // Identifier validation (shared between the SQL planner and the engine)
@@ -91,7 +167,8 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
     }
     if name.as_bytes()[0] == b'_' {
         return Err(format!(
-            "User identifiers cannot start with '_' (reserved for system prefix): {name}"));
+            "User identifiers cannot start with '_' (reserved for system prefix): {name}"
+        ));
     }
     for &ch in name.as_bytes() {
         if !is_valid_ident_char(ch) {
@@ -159,12 +236,18 @@ pub const PK_LIST_MAX_COLS: usize = 4;
 // (or the index-prefix reservation) can hold fails to build instead of
 // silently corrupting the catalog word.
 const _: () = assert!(PK_LIST_MAX_COLS >= 1);
-const _: () = assert!(PK_LIST_MAX_COLS <= 0xf,                 // count field is 4 bits
-    "PK_LIST_MAX_COLS overflows the 4-bit packed count field");
-const _: () = assert!(4 + 7 * PK_LIST_MAX_COLS <= 63,         // column fields clear the flag bit
-    "PK_LIST_MAX_COLS overflows the packed u64 column region");
-const _: () = assert!(PK_LIST_MAX_COLS < MAX_PK_COLUMNS,      // leave the index-prefix slot
-    "PK_LIST_MAX_COLS leaves no MAX_PK_COLUMNS slot for the secondary-index prefix");
+const _: () = assert!(
+    PK_LIST_MAX_COLS <= 0xf, // count field is 4 bits
+    "PK_LIST_MAX_COLS overflows the 4-bit packed count field"
+);
+const _: () = assert!(
+    4 + 7 * PK_LIST_MAX_COLS <= 63, // column fields clear the flag bit
+    "PK_LIST_MAX_COLS overflows the packed u64 column region"
+);
+const _: () = assert!(
+    PK_LIST_MAX_COLS < MAX_PK_COLUMNS, // leave the index-prefix slot
+    "PK_LIST_MAX_COLS leaves no MAX_PK_COLUMNS slot for the secondary-index prefix"
+);
 
 pub const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
 
@@ -199,14 +282,19 @@ impl PkColList {
         );
         let mut arr = [0u32; PK_LIST_MAX_COLS];
         arr[..cols.len()].copy_from_slice(cols);
-        PkColList { cols: arr, len: cols.len() }
+        PkColList {
+            cols: arr,
+            len: cols.len(),
+        }
     }
     /// The count exactly as decoded from the wire. May be 0 or larger than
     /// `PK_LIST_MAX_COLS` for a malformed/crafted packed value — deliberately
     /// NOT clamped, because `is_well_formed` gates on this raw value to
     /// reject out-of-range counts. Not a safe slice length: iterate
     /// `as_slice()` instead.
-    pub fn decoded_count(&self) -> usize { self.len }
+    pub fn decoded_count(&self) -> usize {
+        self.len
+    }
     /// True iff the decoded count is a valid list length
     /// (`1..=PK_LIST_MAX_COLS`). Every consumer of a wire-decoded list must
     /// gate on this before trusting `as_slice()`: a crafted packed value can
@@ -220,7 +308,9 @@ impl PkColList {
     /// backing array even when the decoded count is out of range. A crafted
     /// over-range wire count must NOT panic here — it has to survive long
     /// enough to reach `validate_pk_cols` and be returned as `Err`.
-    pub fn as_slice(&self) -> &[u32] { &self.cols[..self.len.min(PK_LIST_MAX_COLS)] }
+    pub fn as_slice(&self) -> &[u32] {
+        &self.cols[..self.len.min(PK_LIST_MAX_COLS)]
+    }
 }
 
 /// The `Err`-returning form of [`pack_pk_cols`]' panicking contract, plus the
@@ -231,7 +321,9 @@ impl PkColList {
 pub fn validate_pk_col_list(cols: &[u32]) -> Result<(), String> {
     if !(1..=PK_LIST_MAX_COLS).contains(&cols.len()) {
         return Err(format!(
-            "column count {} out of range 1..={PK_LIST_MAX_COLS}", cols.len()));
+            "column count {} out of range 1..={PK_LIST_MAX_COLS}",
+            cols.len()
+        ));
     }
     for (i, &c) in cols.iter().enumerate() {
         if c >= 128 {
@@ -256,11 +348,14 @@ pub fn validate_dist_prefix(pk: &[u32], cols: &[u32]) -> Result<usize, String> {
     if cols.is_empty() || cols.len() > pk.len() {
         return Err(format!(
             "CLUSTER BY expects 1..={} leading PRIMARY KEY columns, got {}",
-            pk.len(), cols.len()));
+            pk.len(),
+            cols.len()
+        ));
     }
     if cols != &pk[..cols.len()] {
         return Err("CLUSTER BY columns must be a leading prefix of the PRIMARY KEY, \
-                    in PK order; reorder the PK so the distribution column(s) lead".into());
+                    in PK order; reorder the PK so the distribution column(s) lead"
+            .into());
     }
     Ok(cols.len())
 }
@@ -272,9 +367,10 @@ pub fn validate_dist_prefix(pk: &[u32], cols: &[u32]) -> Result<usize, String> {
 pub fn pack_pk_cols(pk_cols: &[u32]) -> u64 {
     assert!(
         (1..=PK_LIST_MAX_COLS).contains(&pk_cols.len()),
-        "pack_pk_cols: count {} out of range 1..={PK_LIST_MAX_COLS}", pk_cols.len(),
+        "pack_pk_cols: count {} out of range 1..={PK_LIST_MAX_COLS}",
+        pk_cols.len(),
     );
-    let mut v = pk_cols.len() as u64;            // bits [0..4)
+    let mut v = pk_cols.len() as u64; // bits [0..4)
     for (i, &c) in pk_cols.iter().enumerate() {
         assert!(c < 128, "pack_pk_cols: column index {c} exceeds 7-bit field");
         v |= (c as u64 & 0x7f) << (4 + 7 * i);
@@ -292,7 +388,7 @@ pub fn unpack_pk_cols(packed: u64) -> PkColList {
         // engine-written system-table row (always bare `0`).
         return PkColList::single(packed as u32);
     }
-    let n = (packed & 0xf) as usize;             // 0..=15, validated later
+    let n = (packed & 0xf) as usize; // 0..=15, validated later
     let mut cols = [0u32; PK_LIST_MAX_COLS];
     for (i, slot) in cols.iter_mut().enumerate().take(n.min(PK_LIST_MAX_COLS)) {
         *slot = ((packed >> (4 + 7 * i)) & 0x7f) as u32;
@@ -434,6 +530,10 @@ mod tests {
         // `replicated` is bit 1; reserved bits [2..8) stay clear of the k byte.
         assert_eq!(pack_table_flags(true, true, 0) & 0xFF, 0b11);
         assert_eq!(pack_table_flags(true, true, 2) >> TABLE_FLAG_DIST_SHIFT, 2);
-        assert_eq!(pack_table_flags(true, true, 2) & 0xFC, 0, "reserved bits [2..8) are free");
+        assert_eq!(
+            pack_table_flags(true, true, 2) & 0xFC,
+            0,
+            "reserved bits [2..8) are free"
+        );
     }
 }

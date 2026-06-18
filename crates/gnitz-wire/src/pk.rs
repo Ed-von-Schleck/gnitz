@@ -50,11 +50,23 @@ pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
         dst[0] ^= 0x80;
     }
     match dst.len() {
-        16 => { let v = u128::from_be_bytes(dst.try_into().unwrap()); dst.copy_from_slice(&v.to_le_bytes()); }
-        8  => { let v = u64::from_be_bytes(dst.try_into().unwrap());  dst.copy_from_slice(&v.to_le_bytes()); }
-        4  => { let v = u32::from_be_bytes(dst.try_into().unwrap());  dst.copy_from_slice(&v.to_le_bytes()); }
-        2  => { let v = u16::from_be_bytes(dst.try_into().unwrap());  dst.copy_from_slice(&v.to_le_bytes()); }
-        1  => {}
+        16 => {
+            let v = u128::from_be_bytes(dst.try_into().unwrap());
+            dst.copy_from_slice(&v.to_le_bytes());
+        }
+        8 => {
+            let v = u64::from_be_bytes(dst.try_into().unwrap());
+            dst.copy_from_slice(&v.to_le_bytes());
+        }
+        4 => {
+            let v = u32::from_be_bytes(dst.try_into().unwrap());
+            dst.copy_from_slice(&v.to_le_bytes());
+        }
+        2 => {
+            let v = u16::from_be_bytes(dst.try_into().unwrap());
+            dst.copy_from_slice(&v.to_le_bytes());
+        }
+        1 => {}
         other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
     }
 }
@@ -68,7 +80,11 @@ pub fn decode_pk_column_owned(src: &[u8], tc: u8) -> [u8; 16] {
     // `src.len()` is a schema-derived column stride and never exceeds 16; the
     // `buf[..src.len()]` slice below already panics past 16, so document the
     // contract loudly (the promoted ColPromoter Pk arm newly leans on this).
-    debug_assert!(src.len() <= 16, "decode_pk_column_owned: column stride {} > 16", src.len());
+    debug_assert!(
+        src.len() <= 16,
+        "decode_pk_column_owned: column stride {} > 16",
+        src.len()
+    );
     let mut buf = [0u8; 16];
     decode_pk_column(src, tc, &mut buf[..src.len()]);
     buf
@@ -143,8 +159,10 @@ mod tests {
     #[test]
     fn decode_pk_column_roundtrips_signed() {
         for &(tc, sz) in &[
-            (type_code::I8, 1usize), (type_code::I16, 2),
-            (type_code::I32, 4), (type_code::I64, 8),
+            (type_code::I8, 1usize),
+            (type_code::I16, 2),
+            (type_code::I32, 4),
+            (type_code::I64, 8),
         ] {
             for v in [i64::MIN >> (64 - sz * 8), -1, 0, 1, i64::MAX >> (64 - sz * 8)] {
                 roundtrip(tc, &v.to_le_bytes()[..sz]);
@@ -155,8 +173,10 @@ mod tests {
     #[test]
     fn decode_pk_column_roundtrips_unsigned() {
         for &(tc, sz) in &[
-            (type_code::U8, 1usize), (type_code::U16, 2),
-            (type_code::U32, 4), (type_code::U64, 8),
+            (type_code::U8, 1usize),
+            (type_code::U16, 2),
+            (type_code::U32, 4),
+            (type_code::U64, 8),
         ] {
             for v in [0u64, 1, 42, u64::MAX >> (64 - sz * 8)] {
                 roundtrip(tc, &v.to_le_bytes()[..sz]);
@@ -172,14 +192,22 @@ mod tests {
     #[test]
     fn opk_order_equiv_signed_i64() {
         // -3 < -1 < 2 must hold byte-lexicographically after encoding.
-        let mk = |v: i64| { let mut o = [0u8; 8]; encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut o); o };
+        let mk = |v: i64| {
+            let mut o = [0u8; 8];
+            encode_pk_column(&v.to_le_bytes(), type_code::I64, &mut o);
+            o
+        };
         assert!(mk(-3) < mk(-1));
         assert!(mk(-1) < mk(2));
     }
 
     #[test]
     fn opk_order_equiv_unsigned_u64() {
-        let mk = |v: u64| { let mut o = [0u8; 8]; encode_pk_column(&v.to_le_bytes(), type_code::U64, &mut o); o };
+        let mk = |v: u64| {
+            let mut o = [0u8; 8];
+            encode_pk_column(&v.to_le_bytes(), type_code::U64, &mut o);
+            o
+        };
         assert!(mk(1) < mk(256));
         assert!(mk(256) < mk(u64::MAX));
     }
@@ -190,8 +218,15 @@ mod tests {
         // must survive encode→decode, and the 2^63/2^64 boundaries that
         // distinguish a U64 image from an I64 image round-trip too.
         for v in [
-            i128::MIN, -1i128, 0, 1, i128::MAX,
-            1i128 << 63, (1i128 << 63) - 1, 1i128 << 64, (1i128 << 64) - 1,
+            i128::MIN,
+            -1i128,
+            0,
+            1,
+            i128::MAX,
+            1i128 << 63,
+            (1i128 << 63) - 1,
+            1i128 << 64,
+            (1i128 << 64) - 1,
         ] {
             roundtrip(type_code::I128, &v.to_le_bytes());
         }
@@ -216,9 +251,15 @@ mod tests {
     #[test]
     fn promoted_identity_matches_encode_pk_column() {
         for &(tc, sz) in &[
-            (type_code::I8, 1usize), (type_code::I16, 2), (type_code::I32, 4),
-            (type_code::I64, 8), (type_code::U8, 1), (type_code::U16, 2),
-            (type_code::U32, 4), (type_code::U64, 8), (type_code::U128, 16),
+            (type_code::I8, 1usize),
+            (type_code::I16, 2),
+            (type_code::I32, 4),
+            (type_code::I64, 8),
+            (type_code::U8, 1),
+            (type_code::U16, 2),
+            (type_code::U32, 4),
+            (type_code::U64, 8),
+            (type_code::U128, 16),
             (type_code::I128, 16),
         ] {
             for v in [0i128, 1, -1, 127, -128, i64::MIN as i128, i64::MAX as i128] {
@@ -240,8 +281,12 @@ mod tests {
     fn promote(v: i128, tc: u8, target: u8) -> [u8; 16] {
         let le = v.to_le_bytes();
         let mut out = [0u8; 16];
-        encode_pk_column_promoted(&le[..crate::wire_stride(tc)], tc, target,
-            &mut out[..crate::wire_stride(target)]);
+        encode_pk_column_promoted(
+            &le[..crate::wire_stride(tc)],
+            tc,
+            target,
+            &mut out[..crate::wire_stride(target)],
+        );
         out
     }
 
@@ -249,20 +294,41 @@ mod tests {
         let tw = crate::wire_stride(t);
         let (bl, br) = (promote(v, l, t), promote(v, r, t));
         assert_eq!(&bl[..tw], &br[..tw], "byte-identity failed: v={v} L={l} R={r} T={t}");
-        assert_eq!(widen_pk_be(&bl[..tw], tw), widen_pk_be(&br[..tw], tw),
-            "widen_pk_be disagreement: v={v} T={t}");
+        assert_eq!(
+            widen_pk_be(&bl[..tw], tw),
+            widen_pk_be(&br[..tw], tw),
+            "widen_pk_be disagreement: v={v} T={t}"
+        );
     }
 
-    fn s_min(tc: u8) -> i128 { -(1i128 << (crate::wire_stride(tc) * 8 - 1)) }
-    fn s_max(tc: u8) -> i128 { (1i128 << (crate::wire_stride(tc) * 8 - 1)) - 1 }
-    fn u_max(tc: u8) -> i128 { (1i128 << (crate::wire_stride(tc) * 8)) - 1 }
-    fn narrower(l: u8, r: u8) -> u8 { if crate::wire_stride(l) <= crate::wire_stride(r) { l } else { r } }
+    fn s_min(tc: u8) -> i128 {
+        -(1i128 << (crate::wire_stride(tc) * 8 - 1))
+    }
+    fn s_max(tc: u8) -> i128 {
+        (1i128 << (crate::wire_stride(tc) * 8 - 1)) - 1
+    }
+    fn u_max(tc: u8) -> i128 {
+        (1i128 << (crate::wire_stride(tc) * 8)) - 1
+    }
+    fn narrower(l: u8, r: u8) -> u8 {
+        if crate::wire_stride(l) <= crate::wire_stride(r) {
+            l
+        } else {
+            r
+        }
+    }
 
     #[test]
     fn signed_ladder_copartitions() {
-        use type_code::{I8, I16, I32, I64};
-        for (l, r, t) in [(I8,I16,I16),(I8,I32,I32),(I8,I64,I64),
-                          (I16,I32,I32),(I16,I64,I64),(I32,I64,I64)] {
+        use type_code::{I16, I32, I64, I8};
+        for (l, r, t) in [
+            (I8, I16, I16),
+            (I8, I32, I32),
+            (I8, I64, I64),
+            (I16, I32, I32),
+            (I16, I64, I64),
+            (I32, I64, I64),
+        ] {
             let n = narrower(l, r);
             for v in [0, 1, -1, s_min(n), s_max(n), s_min(n) + 1, s_max(n) - 1] {
                 assert_copartition(v, l, r, t);
@@ -272,10 +338,18 @@ mod tests {
 
     #[test]
     fn unsigned_ladder_copartitions() {
-        use type_code::{U8, U16, U32, U64, U128, UUID};
-        for (l, r, t) in [(U8,U16,U16),(U8,U32,U32),(U8,U64,U64),
-                          (U16,U32,U32),(U16,U64,U64),(U32,U64,U64),
-                          (U32,U128,U128),(U64,U128,U128),(U32,UUID,U128)] {
+        use type_code::{U128, U16, U32, U64, U8, UUID};
+        for (l, r, t) in [
+            (U8, U16, U16),
+            (U8, U32, U32),
+            (U8, U64, U64),
+            (U16, U32, U32),
+            (U16, U64, U64),
+            (U32, U64, U64),
+            (U32, U128, U128),
+            (U64, U128, U128),
+            (U32, UUID, U128),
+        ] {
             let n = narrower(l, r);
             for v in [0, 1, 127, u_max(n), u_max(n) - 1] {
                 assert_copartition(v, l, r, t);
@@ -285,14 +359,26 @@ mod tests {
 
     #[test]
     fn cross_sign_copartitions() {
-        use type_code::{I8, I16, I32, I64, I128, U8, U16, U32, U64};
+        use type_code::{I128, I16, I32, I64, I8, U16, U32, U64, U8};
         // (unsigned ≤8B, signed, promoted T) — the full in-scope acceptance table.
         // The U64 rows exercise the new signed-128 target at 16-byte width.
         let cases = [
-            (U8, I8, I16), (U8, I16, I16), (U8, I32, I32), (U8, I64, I64),
-            (U16, I8, I32), (U16, I16, I32), (U16, I32, I32), (U16, I64, I64),
-            (U32, I8, I64), (U32, I16, I64), (U32, I32, I64), (U32, I64, I64),
-            (U64, I8, I128), (U64, I16, I128), (U64, I32, I128), (U64, I64, I128),
+            (U8, I8, I16),
+            (U8, I16, I16),
+            (U8, I32, I32),
+            (U8, I64, I64),
+            (U16, I8, I32),
+            (U16, I16, I32),
+            (U16, I32, I32),
+            (U16, I64, I64),
+            (U32, I8, I64),
+            (U32, I16, I64),
+            (U32, I32, I64),
+            (U32, I64, I64),
+            (U64, I8, I128),
+            (U64, I16, I128),
+            (U64, I32, I128),
+            (U64, I64, I128),
         ];
         for (u, s, t) in cases {
             // Equal logical values representable on BOTH sides (the overlap
@@ -309,17 +395,31 @@ mod tests {
             // values ever collide; no equal values ever diverge.
             let tw = crate::wire_stride(t);
             let probes: &[(i128, u8)] = &[
-                (0, u), (1, u), (127, u), (128, u), (200, u),
-                (u_max(u) - 1, u), (u_max(u), u),
-                (s_min(s), s), (-56, s), (-1, s), (0, s), (1, s), (127, s), (s_max(s), s),
+                (0, u),
+                (1, u),
+                (127, u),
+                (128, u),
+                (200, u),
+                (u_max(u) - 1, u),
+                (u_max(u), u),
+                (s_min(s), s),
+                (-56, s),
+                (-1, s),
+                (0, s),
+                (1, s),
+                (127, s),
+                (s_max(s), s),
             ];
             let mut seen: Vec<(i128, [u8; 16])> = Vec::new();
             for &(val, tc) in probes {
                 let key = promote(val, tc, t);
                 for &(pv, pk) in &seen {
-                    assert_eq!(pk[..tw] == key[..tw], pv == val,
+                    assert_eq!(
+                        pk[..tw] == key[..tw],
+                        pv == val,
                         "cross-sign T-key equal IFF value equal failed: \
-                         {val} vs {pv} (u={u} s={s} t={t})");
+                         {val} vs {pv} (u={u} s={s} t={t})"
+                    );
                 }
                 seen.push((val, key));
             }

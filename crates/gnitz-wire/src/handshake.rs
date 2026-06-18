@@ -7,7 +7,7 @@
 /// Maximum frame payload the server will accept from a client.
 /// Tighter than the client limit: protects the master process from a
 /// misbehaving or malicious peer before any allocation occurs.
-pub const MAX_FRAME_PAYLOAD_SERVER: usize = 64 * 1024 * 1024;  // 64 MB
+pub const MAX_FRAME_PAYLOAD_SERVER: usize = 64 * 1024 * 1024; // 64 MB
 
 /// Maximum frame payload the client library will accept from the server.
 /// Larger than the server limit: a legitimate batch push can be hundreds
@@ -51,7 +51,7 @@ pub const HELLO_FRAME_SIZE: usize = 4 + HELLO_PAYLOAD_LEN as usize;
 pub const HELLO_ACK_FRAME_SIZE: usize = 4 + HELLO_ACK_PAYLOAD_LEN as usize;
 
 /// Status field in the ACK frame.
-pub const HELLO_STATUS_OK:    u16 = 0;
+pub const HELLO_STATUS_OK: u16 = 0;
 pub const HELLO_STATUS_ERROR: u16 = 1;
 
 /// Build a HELLO frame ready to ship over the wire (length prefix + payload).
@@ -61,10 +61,7 @@ pub const fn encode_hello_frame(version: u16, flags: u16) -> [u8; HELLO_FRAME_SI
     let ver = version.to_le_bytes();
     let flg = flags.to_le_bytes();
     [
-        len[0], len[1], len[2], len[3],
-        mag[0], mag[1], mag[2], mag[3],
-        ver[0], ver[1],
-        flg[0], flg[1],
+        len[0], len[1], len[2], len[3], mag[0], mag[1], mag[2], mag[3], ver[0], ver[1], flg[0], flg[1],
     ]
 }
 
@@ -92,13 +89,10 @@ pub fn decode_hello_payload(payload: &[u8]) -> Result<HelloHeader, &'static str>
 pub const fn encode_hello_ack(status: u16, limit_bytes: u32) -> [u8; HELLO_ACK_FRAME_SIZE] {
     let len = HELLO_ACK_PAYLOAD_LEN.to_le_bytes();
     let mag = HELLO_MAGIC.to_le_bytes();
-    let st  = status.to_le_bytes();
+    let st = status.to_le_bytes();
     let lim = limit_bytes.to_le_bytes();
     [
-        len[0], len[1], len[2], len[3],
-        mag[0], mag[1], mag[2], mag[3],
-        st[0],  st[1],
-        0,      0, // _pad
+        len[0], len[1], len[2], len[3], mag[0], mag[1], mag[2], mag[3], st[0], st[1], 0, 0, // _pad
         lim[0], lim[1], lim[2], lim[3],
     ]
 }
@@ -121,7 +115,11 @@ pub fn decode_hello_ack(payload: &[u8]) -> Result<HelloAck, &'static str> {
     let status = u16::from_le_bytes(payload[4..6].try_into().unwrap());
     // bytes [6..8] are reserved padding
     let limit_bytes = u32::from_le_bytes(payload[8..12].try_into().unwrap());
-    Ok(HelloAck { magic, status, limit_bytes })
+    Ok(HelloAck {
+        magic,
+        status,
+        limit_bytes,
+    })
 }
 
 #[cfg(test)]

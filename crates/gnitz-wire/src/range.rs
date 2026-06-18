@@ -12,7 +12,7 @@ use crate::catalog::PK_LIST_MAX_COLS;
 use crate::types::{FixedInt, TypeCode};
 
 const START_AFTER: u8 = 1 << 0;
-const END_AFTER:   u8 = 1 << 1;
+const END_AFTER: u8 = 1 << 1;
 
 /// A cut point in an index's group-key space: `Before(v)` falls below every
 /// index entry whose range column equals `v` (and above every smaller group),
@@ -38,7 +38,11 @@ impl Cut {
     /// `After(v)` when `after`, else `Before(v)` — the constructor dual of
     /// [`Self::is_after`], for callers holding the wire bit.
     pub const fn new(after: bool, v: u128) -> Cut {
-        if after { Cut::After(v) } else { Cut::Before(v) }
+        if after {
+            Cut::After(v)
+        } else {
+            Cut::Before(v)
+        }
     }
 
     /// Whether this cut falls above its group — `After`'s wire flag bit.
@@ -48,7 +52,9 @@ impl Cut {
 
     /// The cut's group value, native-packed.
     pub const fn value(self) -> u128 {
-        match self { Cut::Before(v) | Cut::After(v) => v }
+        match self {
+            Cut::Before(v) | Cut::After(v) => v,
+        }
     }
 
     /// The cuts at a column type's representable edges — what an unconstrained
@@ -61,7 +67,9 @@ impl Cut {
         if matches!(tc, TypeCode::U128) {
             return Some((Cut::Before(0), Cut::After(u128::MAX)));
         }
-        let Some(fi) = FixedInt::from_type_code(tc) else { return None };
+        let Some(fi) = FixedInt::from_type_code(tc) else {
+            return None;
+        };
         let (min, max) = fi.range();
         Some((Cut::Before(fi.pack(min)), Cut::After(fi.pack(max))))
     }
@@ -88,10 +96,10 @@ impl Cut {
 /// control-block blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeDescriptor {
-    eq:   [u128; PK_LIST_MAX_COLS],
+    eq: [u128; PK_LIST_MAX_COLS],
     n_eq: usize,
     pub start: Cut,
-    pub end:   Cut,
+    pub end: Cut,
 }
 
 impl RangeDescriptor {
@@ -104,23 +112,35 @@ impl RangeDescriptor {
         assert!(
             eq_vals.len() < PK_LIST_MAX_COLS,
             "RangeDescriptor: {} equality values leave no range column within \
-             the {PK_LIST_MAX_COLS}-column arity cap", eq_vals.len(),
+             the {PK_LIST_MAX_COLS}-column arity cap",
+            eq_vals.len(),
         );
         let mut eq = [0u128; PK_LIST_MAX_COLS];
         eq[..eq_vals.len()].copy_from_slice(eq_vals);
-        RangeDescriptor { eq, n_eq: eq_vals.len(), start, end }
+        RangeDescriptor {
+            eq,
+            n_eq: eq_vals.len(),
+            start,
+            end,
+        }
     }
 
     /// The equality-pinned leading values; the range column sits right after
     /// them at index position `eq_vals().len()`.
-    pub fn eq_vals(&self) -> &[u128] { &self.eq[..self.n_eq] }
+    pub fn eq_vals(&self) -> &[u128] {
+        &self.eq[..self.n_eq]
+    }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(2 + 16 * (self.n_eq + 2));
         out.push(self.n_eq as u8);
         let mut flags = 0u8;
-        if self.start.is_after() { flags |= START_AFTER; }
-        if self.end.is_after()   { flags |= END_AFTER; }
+        if self.start.is_after() {
+            flags |= START_AFTER;
+        }
+        if self.end.is_after() {
+            flags |= END_AFTER;
+        }
         out.push(flags);
         for v in self.eq_vals() {
             out.extend_from_slice(&v.to_le_bytes());
@@ -145,15 +165,15 @@ impl RangeDescriptor {
         if n_eq >= PK_LIST_MAX_COLS {
             return Err(format!(
                 "range descriptor n_eq {n_eq} leaves no range column within \
-                 the {PK_LIST_MAX_COLS}-column arity cap"));
+                 the {PK_LIST_MAX_COLS}-column arity cap"
+            ));
         }
         if flags & !(START_AFTER | END_AFTER) != 0 {
             return Err(format!("range descriptor has unknown flag bits {flags:#04x}"));
         }
         let expected = 2 + 16 * (n_eq + 2);
         if buf.len() != expected {
-            return Err(format!(
-                "range descriptor length {} != expected {expected}", buf.len()));
+            return Err(format!("range descriptor length {} != expected {expected}", buf.len()));
         }
         let mut off = 2;
         let mut next = || {
@@ -162,26 +182,28 @@ impl RangeDescriptor {
             v
         };
         let mut eq = [0u128; PK_LIST_MAX_COLS];
-        for slot in eq.iter_mut().take(n_eq) { *slot = next(); }
+        for slot in eq.iter_mut().take(n_eq) {
+            *slot = next();
+        }
         let start = Cut::new(flags & START_AFTER != 0, next());
-        let end   = Cut::new(flags & END_AFTER != 0, next());
+        let end = Cut::new(flags & END_AFTER != 0, next());
         Ok(RangeDescriptor { eq, n_eq, start, end })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::Cut::{After, Before};
+    use super::*;
 
     #[test]
     fn roundtrips_every_shape() {
         let shapes: [(&[u128], Cut, Cut); 5] = [
-            (&[], After(10), After(u64::MAX as u128)),       // pure x > 10
-            (&[], Before(0), After(20)),                     // pure x <= 20
-            (&[7], Before(1), Before(u128::MAX)),            // a = 7 AND 1 <= b < MAX
-            (&[1, 2, 3], After(10), Before(50)),             // max arity, 82 bytes
-            (&[], After(5), After(5)),                       // zero-width (empty)
+            (&[], After(10), After(u64::MAX as u128)), // pure x > 10
+            (&[], Before(0), After(20)),               // pure x <= 20
+            (&[7], Before(1), Before(u128::MAX)),      // a = 7 AND 1 <= b < MAX
+            (&[1, 2, 3], After(10), Before(50)),       // max arity, 82 bytes
+            (&[], After(5), After(5)),                 // zero-width (empty)
         ];
         for (eq, start, end) in shapes {
             let d = RangeDescriptor::new(eq, start, end);

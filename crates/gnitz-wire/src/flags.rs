@@ -10,19 +10,19 @@
 /// schema version) that are encoded by the sender and decoded by the receiver.
 pub const SAL_FLAGS_MASK: u64 = 0x0000_FFFF;
 
-pub const FLAG_SHUTDOWN:       u64 = 4;
-pub const FLAG_DDL_SYNC:       u64 = 8;
-pub const FLAG_EXCHANGE:       u64 = 16;
-pub const FLAG_PUSH:           u64 = 32;
-pub const FLAG_HAS_PK:         u64 = 64;
-pub const FLAG_SEEK:           u64 = 128;
-pub const FLAG_SEEK_BY_INDEX:  u64 = 256;
-pub const FLAG_HAS_SCHEMA:     u64 = 1 << 48;
-pub const FLAG_HAS_DATA:       u64 = 1 << 49;
+pub const FLAG_SHUTDOWN: u64 = 4;
+pub const FLAG_DDL_SYNC: u64 = 8;
+pub const FLAG_EXCHANGE: u64 = 16;
+pub const FLAG_PUSH: u64 = 32;
+pub const FLAG_HAS_PK: u64 = 64;
+pub const FLAG_SEEK: u64 = 128;
+pub const FLAG_SEEK_BY_INDEX: u64 = 256;
+pub const FLAG_HAS_SCHEMA: u64 = 1 << 48;
+pub const FLAG_HAS_DATA: u64 = 1 << 49;
 /// Set on every per-worker scan response frame. Absent on the terminal
 /// frame sent by the master after all worker frames. Clients loop on
 /// `recv_message` until they see a frame without this bit.
-pub const FLAG_CONTINUATION:   u64 = 1 << 52;
+pub const FLAG_CONTINUATION: u64 = 1 << 52;
 
 /// GET_INDICES request flag. Client-only and never written to SAL, so it sits
 /// above the SAL mirror (bits 0-15) and the wire packed fields rather than in
@@ -48,13 +48,13 @@ pub const FLAG_SEEK_BY_INDEX_RANGE: u64 = 1 << 55;
 
 /// Bits 16-23: conflict mode (8 bits). Value 0 = Update (default).
 pub const WIRE_CONFLICT_MODE_SHIFT: u32 = 16;
-pub const WIRE_CONFLICT_MODE_MASK:  u64 = 0xFF_u64 << WIRE_CONFLICT_MODE_SHIFT;
+pub const WIRE_CONFLICT_MODE_MASK: u64 = 0xFF_u64 << WIRE_CONFLICT_MODE_SHIFT;
 /// Bits 24-39: schema version (16 bits). Value 0 = client has no cached schema.
 pub const WIRE_SCHEMA_VERSION_SHIFT: u32 = 24;
-pub const WIRE_SCHEMA_VERSION_MASK:  u64 = 0xFFFF_u64 << WIRE_SCHEMA_VERSION_SHIFT;
+pub const WIRE_SCHEMA_VERSION_MASK: u64 = 0xFFFF_u64 << WIRE_SCHEMA_VERSION_SHIFT;
 /// Bits 40-47: index-metadata version (8 bits). 0 = client has no cached list.
 pub const WIRE_INDEX_VERSION_SHIFT: u32 = 40;
-pub const WIRE_INDEX_VERSION_MASK:  u64 = 0xFF_u64 << WIRE_INDEX_VERSION_SHIFT;
+pub const WIRE_INDEX_VERSION_MASK: u64 = 0xFF_u64 << WIRE_INDEX_VERSION_SHIFT;
 
 // Compile-time guard: SAL flags (bits 0-15) must stay clear of the wire-level
 // packed fields, those fields must not overlap each other, the packed fields
@@ -67,10 +67,12 @@ const _: () = {
     assert!(WIRE_CONFLICT_MODE_MASK & WIRE_SCHEMA_VERSION_MASK == 0);
     assert!(WIRE_SCHEMA_VERSION_MASK & WIRE_INDEX_VERSION_MASK == 0);
     assert!(packed & (FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION) == 0);
-    assert!(FLAG_GET_INDICES & (SAL_FLAGS_MASK | packed
-            | FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION) == 0);
-    assert!(FLAG_SEEK_BY_INDEX_RANGE & (SAL_FLAGS_MASK | packed
-            | FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION | FLAG_GET_INDICES) == 0);
+    assert!(FLAG_GET_INDICES & (SAL_FLAGS_MASK | packed | FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION) == 0);
+    assert!(
+        FLAG_SEEK_BY_INDEX_RANGE
+            & (SAL_FLAGS_MASK | packed | FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION | FLAG_GET_INDICES)
+            == 0
+    );
 };
 
 #[inline]
@@ -129,7 +131,9 @@ pub enum WireConflictMode {
 
 impl WireConflictMode {
     #[inline]
-    pub const fn as_u8(self) -> u8 { self as u8 }
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
 
     /// Unknown bytes decode as `Update` so forward-compatible decoders
     /// still see last-write-wins semantics.
@@ -142,8 +146,8 @@ impl WireConflictMode {
     }
 }
 
-pub const STATUS_OK:             u32 = 0;
-pub const STATUS_ERROR:          u32 = 1;
+pub const STATUS_OK: u32 = 0;
+pub const STATUS_ERROR: u32 = 1;
 /// Server-side version mismatch on schema-less PUSH: client must evict its
 /// schema cache entry for the target table and retry with the full schema.
 pub const STATUS_SCHEMA_MISMATCH: u32 = 2;
@@ -153,7 +157,7 @@ pub const STATUS_SCHEMA_MISMATCH: u32 = 2;
 pub const STATUS_NO_INDEX: u32 = 3;
 
 pub const META_FLAG_NULLABLE: u64 = 1;
-pub const META_FLAG_IS_PK:    u64 = 2;
+pub const META_FLAG_IS_PK: u64 = 2;
 
 /// PK position (0-indexed) within the PK tuple for the column carrying
 /// `META_FLAG_IS_PK`. Bits 8..16 of the per-column flags word. Single-PK
@@ -162,4 +166,4 @@ pub const META_FLAG_IS_PK:    u64 = 2;
 /// order rather than column-position order (e.g. `PRIMARY KEY (b, a)`
 /// with `a` at column 1 and `b` at column 2 must decode to `[2, 1]`).
 pub const META_FLAG_PK_POS_SHIFT: u32 = 8;
-pub const META_FLAG_PK_POS_MASK:  u64 = 0xFF << META_FLAG_PK_POS_SHIFT;
+pub const META_FLAG_PK_POS_MASK: u64 = 0xFF << META_FLAG_PK_POS_SHIFT;

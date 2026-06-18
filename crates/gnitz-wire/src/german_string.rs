@@ -16,8 +16,10 @@ pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     // The 4-byte length field caps a string at u32::MAX bytes. Silently
     // truncating `len as u32` would corrupt this persisted format, so reject
     // an over-long string outright (a release-build assert, not debug-only).
-    assert!(len <= u32::MAX as usize,
-        "encode_german_string: length {len} exceeds u32::MAX");
+    assert!(
+        len <= u32::MAX as usize,
+        "encode_german_string: length {len} exceeds u32::MAX"
+    );
     let mut st = [0u8; 16];
     st[0..4].copy_from_slice(&(len as u32).to_le_bytes());
     if len == 0 {
@@ -71,8 +73,7 @@ pub fn try_decode_german_string(st: &[u8; 16], blob: &[u8]) -> Option<Vec<u8>> {
 /// `blob` is the shared blob arena. Panics if a long string's offset/length
 /// overruns `blob`; use `try_decode_german_string` on untrusted input.
 pub fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
-    try_decode_german_string(st, blob)
-        .expect("decode_german_string: blob offset/length out of bounds")
+    try_decode_german_string(st, blob).expect("decode_german_string: blob offset/length out of bounds")
 }
 
 #[cfg(test)]
@@ -88,18 +89,23 @@ mod german_string_tests {
             "try_decode roundtrip failed for len {}",
             s.len(),
         );
-        assert_eq!(decode_german_string(&st, &blob), s, "decode roundtrip failed for len {}", s.len());
+        assert_eq!(
+            decode_german_string(&st, &blob),
+            s,
+            "decode roundtrip failed for len {}",
+            s.len()
+        );
     }
 
     #[test]
     fn roundtrip_across_length_boundaries() {
-        roundtrip(b"");                            // empty
-        roundtrip(b"a");                           // 1 (prefix only)
-        roundtrip(b"abcd");                         // 4 (prefix exactly full)
-        roundtrip(b"abcde");                        // 5 (prefix + 1 suffix byte)
-        roundtrip(b"abcdefghijkl");                 // 12 == SHORT_STRING_THRESHOLD (fully inline)
-        roundtrip(b"abcdefghijklm");                // 13 (first length that spills to blob)
-        roundtrip(&vec![0xABu8; 1000]);             // long blob string
+        roundtrip(b""); // empty
+        roundtrip(b"a"); // 1 (prefix only)
+        roundtrip(b"abcd"); // 4 (prefix exactly full)
+        roundtrip(b"abcde"); // 5 (prefix + 1 suffix byte)
+        roundtrip(b"abcdefghijkl"); // 12 == SHORT_STRING_THRESHOLD (fully inline)
+        roundtrip(b"abcdefghijklm"); // 13 (first length that spills to blob)
+        roundtrip(&vec![0xABu8; 1000]); // long blob string
     }
 
     #[test]
