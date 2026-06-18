@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::schema::SchemaDescriptor;
-use crate::dag::ExchangeCallback;
+use crate::query::ExchangeCallback;
 use crate::storage::{BlobCacheGuard, FlushWork, PkBuf};
 use crate::runtime::wire::{self as ipc, STATUS_OK, STATUS_ERROR, FLAG_CONTINUATION, FLAG_SCAN_LAST};
 use crate::runtime::sal::{

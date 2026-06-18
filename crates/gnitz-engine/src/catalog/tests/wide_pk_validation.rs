@@ -6,7 +6,7 @@
 //! `seek_family_bytes` on the wide path.
 
 use super::*;
-use crate::dag::{DagEngine, RelationKind, StoreHandle};
+use crate::query::{DagEngine, RelationKind, StoreHandle};
 use crate::schema::{SchemaColumn, SchemaDescriptor, type_code};
 use crate::storage::{Batch, Persistence, Table};
 

@@ -204,7 +204,7 @@ impl IndexColExtractor {
 
 /// Precomputed gatherer for the byte-form AVI composite group key. Resolves
 /// each group column's layout once; `gather` then concatenates raw bytes per
-/// row. Callers must have passed `compiler::avi_group_key_eligible`
+/// row. Callers must have passed `query::compiler::avi_group_key_eligible`
 /// (fixed-width, non-nullable columns), so it never sees STRING/BLOB or a NULL.
 pub(super) struct GroupKeyExtractor {
     cols: Vec<ColumnLocator>,

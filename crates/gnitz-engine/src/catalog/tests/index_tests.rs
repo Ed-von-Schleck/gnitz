@@ -2047,7 +2047,7 @@ fn test_seek_prefix_matches_projection() {
     // Project one row (id=1, a=-5, b=42) and read back its leading-key bytes.
     let mut bb = BatchBuilder::new(src);
     bb.begin_row(1u128, 1); bb.put_u32((-5i32) as u32); bb.put_u64(42); bb.end_row();
-    let projected = crate::dag::DagEngine::batch_project_index(&bb.finish(), &[1, 2], &src, &idx);
+    let projected = crate::query::DagEngine::batch_project_index(&bb.finish(), &[1, 2], &src, &idx);
     assert_eq!(projected.count, 1);
 
     let key_size: usize = (0..2).map(|i| idx.columns[i].size() as usize).sum();
@@ -2085,7 +2085,7 @@ fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u
         sz => unreachable!("unexpected column width {sz}"),
     }
     bb.end_row();
-    let projected = crate::dag::DagEngine::batch_project_index(&bb.finish(), &[1], &src, idx);
+    let projected = crate::query::DagEngine::batch_project_index(&bb.finish(), &[1], &src, idx);
     let key_size = idx.columns[0].size() as usize;
     projected.get_pk_bytes(0)[..key_size].to_vec()
 }
@@ -2174,7 +2174,7 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
         bb.begin_row((i as u128) + 1, 1);
         bb.put_u32(a as u32); bb.put_u64(b);
         bb.end_row();
-        let projected = crate::dag::DagEngine::batch_project_index(&bb.finish(), &[1, 2], &src, &idx);
+        let projected = crate::query::DagEngine::batch_project_index(&bb.finish(), &[1, 2], &src, &idx);
         spans.push(projected.get_pk_bytes(0)[..key_size].to_vec());
     }
     for w in spans.windows(2) {
@@ -2741,7 +2741,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // index circuit directly (as `wide_pk_validation.rs` does). The leading PK
     // column is distinct per row: the base flush orders the shard by the wide PK,
     // which the resolve's binary-search seek relies on.
-    use crate::dag::{DagEngine, RelationKind, StoreHandle};
+    use crate::query::{DagEngine, RelationKind, StoreHandle};
     use crate::schema::{SchemaColumn, SchemaDescriptor};
     use crate::storage::{Persistence, Table};
 

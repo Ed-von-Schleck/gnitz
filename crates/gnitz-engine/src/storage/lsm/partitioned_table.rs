@@ -1040,7 +1040,7 @@ mod tests {
         // The fix: recovery aggregates with min, so the lagging partition's
         // still-in-SAL zones replay. The max (current_lsn) would skip them and
         // drop its rows. (The StoreHandle dispatch over this same min-vs-max
-        // split is pinned by dag::tests::store_handle_partitioned_lsn_dispatch.)
+        // split is pinned by query::dag::tests::store_handle_partitioned_lsn_dispatch.)
         assert_eq!(
             f.pt.min_flushed_lsn(), f.recovery_lsn,
             "recovery watermark is the lagging partition's floor",

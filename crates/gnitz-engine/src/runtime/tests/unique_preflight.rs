@@ -376,7 +376,7 @@ fn preflight_composite_projection_distinguishes_trailing_column() {
 /// signed / unsigned / U128 column mix.
 #[test]
 fn index_key_spec_equals_projected_leading_span() {
-    use crate::dag::DagEngine;
+    use crate::query::DagEngine;
     // Owner: PK id U64; a I64 (signed payload), b U128 (payload).
     let owner = SchemaDescriptor::new(
         &[

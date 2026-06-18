@@ -325,7 +325,7 @@ impl CatalogEngine {
     // -- Setup DagEngine system table references ---------------------------
 
     fn setup_dag_sys_tables(&mut self) {
-        use crate::dag::SysTableRefs;
+        use crate::query::SysTableRefs;
         self.dag.set_sys_tables(SysTableRefs {
             nodes: &mut *self.sys_circuit_nodes as *mut Table,
             edges: &mut *self.sys_circuit_edges as *mut Table,

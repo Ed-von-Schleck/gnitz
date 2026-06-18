@@ -430,7 +430,7 @@ pub(super) fn fold_old_aggs(
 
 /// True iff `group_cols` is a single column whose type permits using
 /// the source column directly as the output PK (vs. a synthetic U128).
-/// Shared between `compiler::build_reduce_output_schema` and
+/// Shared between `query::compiler::build_reduce_output_schema` and
 /// `op_reduce` to keep schema construction and execution in lockstep.
 pub(crate) fn is_single_col_natural_pk(schema: &SchemaDescriptor, group_cols: &[u32]) -> bool {
     if group_cols.len() != 1 {

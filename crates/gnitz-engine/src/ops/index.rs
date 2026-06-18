@@ -72,7 +72,7 @@ pub(crate) fn make_gi_schema(src: &SchemaDescriptor) -> SchemaDescriptor {
 /// AVI index schema: the group-by columns (native fixed-width types, in GROUP
 /// BY order) followed by the order-encoded aggregate value (U64). All columns
 /// are PK; there is no payload. Built only for byte-form-eligible group keys
-/// (see `compiler::avi_group_key_eligible`).
+/// (see `query::compiler::avi_group_key_eligible`).
 pub(crate) fn make_avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescriptor {
     let mut cols = Vec::with_capacity(group_by_cols.len() + 1);
     let mut pk = Vec::with_capacity(group_by_cols.len() + 1);

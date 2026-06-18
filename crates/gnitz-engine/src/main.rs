@@ -7,9 +7,7 @@ mod schema;
 mod storage;
 mod expr;
 mod ops;
-mod vm;
-mod compiler;
-mod dag;
+mod query;
 mod catalog;
 mod runtime;
 

@@ -561,8 +561,24 @@ splits its god-files and moves the residual files into the §2 tree.
   shared builders duplicated router-side per the W7 precedent — no exchange `test_common`).
   Gates green: build, clippy `--all-targets`, `make test` (1303, parity), `make e2e`
   (GNITZ_WORKERS=4).
-- **W12 (query-core, L):** create `query/`, move+split `compiler`, `vm`, `dag`.
-  Depends on W3, W8.
+- **W12 (query-core, L) — ✅ DONE.** Created `query/`; moved `compiler`/`vm`/`dag` under
+  it behind the `query/mod.rs` facade (`pub(crate) use dag::{DagEngine, ExchangeCallback,
+  IndexCircuitEntry, RelationKind, StoreHandle, SysTableRefs}`) — `compiler`+`vm` are
+  query-internal (`dag` is the sole inbound target; catalog+runtime repoint `crate::dag::`
+  → `crate::query::`). God-files split **byte-identically** along the §6 seams (every
+  `#[inline]`/const-generic carried): `vm` → `mod` (shared `Instr`/`Program`/`RegisterFile`
+  + tests) + `builder` (`ProgramBuilder`) + `exec` (the opcode match WHOLE — §8 cluster 4);
+  `dag` → `mod` (`DagEngine` scheduler, `evaluate_dag` snapshot/scheduling untouched — §8
+  cluster 5) + `store_handle` (`StoreHandle`); `compiler` → `mod` (`compile_view` + shared
+  type/const defs incl. `decode_expr_blob`/`PlanBuildResult` + tests) + `load` + `optimize`
+  (the schema-construction helpers travel here) + `emit` (incl. `EmitState`). Carved free
+  fns bumped private→`pub(super)` (§7-rule-3, restoring module scope); sub-files reach
+  types/consts via `use super::*`, cross-cluster fns via mod's `use {optimize,emit}::*`. One
+  relocation bump: `DagEngine::close` (`cfg(test)`) `pub(super)`→`pub(crate)` — `pub(super)`
+  was crate-wide at the old root but is query-wide one level deeper, and catalog's
+  `cfg(test)` `close` reaches it (caught by `clippy --all-targets`, not `cargo build`).
+  `clippy.toml` disallowed-method path `dag::`→`query::dag::`. Gates green: build, clippy
+  `--all-targets`, `make test` (1303, parity 112), `make e2e` (1043).
 - **W13 (catalog, L):** `store.rs` four-file carve + `write_path.rs`. Depends on W8.
 - **W14 (runtime, XL):** create `runtime/{orchestration,protocol,reactor}/`, split
   `master`, `worker`, `reactor`. Depends on W8; gate on `make e2e`.
@@ -766,7 +782,7 @@ Stage A (P0, structural)    W1 ─┬─ W2            break C1 (key seam ✅ + 
                             W4  │                BatchBuilder → storage (auto-fixes C2 test edge) ✅
                             W5 ─┘                test-edge cleanup (C3/C4/E5) → cfg(test) acyclicity ✅
 Stage B (P1, edges+surface) W6 ─ W7   W8         batch_wire + 3rd edge ✅ · ops::reindex ✅ · surface sweep ✅
-Stage C (P2, splits+regroup) W9 ✅ W10 ✅ W11 ✅ W12 W13 W14   god-file carves into the layer tree (gated on W6/W7/W8)
+Stage C (P2, splits+regroup) W9 ✅ W10 ✅ W11 ✅ W12 ✅ W13 W14   god-file carves into the layer tree (gated on W6/W7/W8)
 ```
 
 W1–W8 are small, independent (except W5→W4; W2 was prototyped standalone, so it does

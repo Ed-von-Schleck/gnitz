@@ -1408,7 +1408,7 @@ impl CatalogEngine {
     /// list once and cannot ask whether a non-existent index is unique.
     pub fn index_circuit_for_cols(
         &self, table_id: i64, cols: &[u32],
-    ) -> Option<&crate::dag::IndexCircuitEntry> {
+    ) -> Option<&crate::query::IndexCircuitEntry> {
         self.dag.tables.get(&table_id)
             .and_then(|e| e.index_circuits.iter().find(|ic| ic.col_indices.as_slice() == cols))
     }
