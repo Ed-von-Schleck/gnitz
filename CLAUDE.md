@@ -6,7 +6,8 @@ Use `semble search` (the semble MCP server is installed) to find code by describ
 
 gnitz is **pre-alpha** and not used in production anywhere because it has not been released, so there are **never** any compatibility concerns and there should **never** be legacy code remaining.
 
-Read dev-guide.md for GnitzDB-specific development guidelines.
+GnitzDB-specific development guidelines are in the **GnitzDB Developer Guide**
+section at the end of this file.
 
 ---
 
@@ -368,3 +369,215 @@ the inverse in `payload_to_ci[pi]`. For a **single-PK** schema this reduces to
 the closed form `payload_idx = ci if ci < pk_index else ci - 1`; with a
 **compound PK** the columns are renumbered around *every* PK position, so the
 closed form does not hold — read `payload_mapping`, never `ci - 1`.
+
+---
+
+# GnitzDB Developer Guide
+
+## Prerequisites
+
+Linux with an io_uring kernel (≥ 5.x); stable Rust; `uv` (drives Python + `maturin`). Nothing is version-pinned.
+
+## Build targets
+
+| What | Command | Rebuilds |
+|------|---------|----------|
+| Unit tests | `make test` | all workspace crates except `gnitz-py` |
+| Server binary | `make server` | gnitz-engine |
+| Python extension | `make pyext` | gnitz-sql, gnitz-core, gnitz-py |
+| E2E tests | `make e2e` | server + pyext, then runs pytest |
+| Release binary | `make release-server` | gnitz-engine (release) |
+
+`make e2e` rebuilds both the server binary and the Python extension
+(which contains the SQL planner). Maturin is a no-op when nothing
+changed, so there's no cost.
+
+**Pre-commit gate (no CI):** `make verify` = `fmt-check` + `clippy` (warnings are errors) + `test`. Also `make fmt`, `make check`.
+
+## Project structure
+
+Two sides that meet only at the wire protocol: the **SQL/client side** (a library,
+also exposed as C and Python bindings) plans and drives queries; the **engine**
+executes them as a multi-process server.
+
+### Workspace crates
+
+| Crate | Role | Depends on |
+|-------|------|------------|
+| `gnitz-wire` | Wire-protocol constants + codecs — the one definition client and engine must agree on | — |
+| `gnitz-core` | Client core: connection, protocol, and the logical type / expression / circuit model | `wire` |
+| `gnitz-sql` | SQL front end: parser, binder, query planner | `core` |
+| `gnitz-capi` | C ABI bindings over the client core + planner | `core`, `sql` |
+| `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `sql` |
+| `gnitz-engine` | The DBSP execution engine and `gnitz-server` binary | `wire` |
+| `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests | — |
+
+The SQL side compiles a query and ships it to the engine over `gnitz-wire`; the
+engine never links the planner.
+
+### The engine (`gnitz-engine`)
+
+Strictly layered — every module depends only on those beneath it (and all of them
+on `foundation`):
+
+```
+runtime (L7)   → catalog, query, ops, storage, schema    orchestration · protocol · reactor
+catalog        → query, ops, storage, schema
+query (L5)     → ops, expr, storage, schema               compiler · vm · dag
+ops            → expr, storage, schema                    join · reduce · exchange · …
+expr           → storage, schema
+storage        → schema                                   repr (L2) · lsm (L3)
+schema         → foundation
+foundation (L0)  — independent leaves; depends on nothing
+```
+
+- **`foundation`** (L0) — unrelated leaves grouped only for layering: `log` (the `gnitz_*` macros), `codec` (LE pack/unpack), `xxh` (XXH3), `posix_io` (fd I/O, fsync, sockets), `syscall` (eventfd/futex/memfd/mmap), `worker_ctx` (worker rank/count).
+- **`schema`** — SQL type constants, schema descriptors, row-format helpers, and the order-preserving-key cluster (`key`). Shared by the storage, IPC, and query layers.
+- **`storage`** — the WAL/shard/MemTable stack behind one curated facade, in two sub-layers:
+  - `repr` (L2) — the in-memory batch and the kernels over it: `batch` (region layout), `batch_wire` (wire/shard serde), `batch_pool` (buffer recycling), `columnar` (comparators), `merge` (sort-merge consolidation), `scatter` (exchange repartition), `heap` (k-way merge), `bloom`/`xor8` (PK-probe filters).
+  - `lsm` (L3) — the on-disk half: `wal`, `shard_file`/`shard_reader`/`shard_index`, `compact` (N-way compaction), `memtable`, `read_cursor`, and the `Table`/`PartitionedTable` facades.
+- **`expr`** — compiled expression programs evaluated over batches (`program`, `batch`, `plan`).
+- **`ops`** — the DBSP operators: `join` (inner/outer/anti/semi, split by Δ⋈trace, Δ⋈Δ, and range), `reduce` (aggregation), `exchange` (repartition: `router` + `relay`), `distinct`, `linear` (filter/map/negate/union), `scan`, `reindex` (re-key for join/group), `cogroup`, `index` (secondary indexes).
+- **`query`** (L5) — the circuit layer behind the `dag` facade: `compiler` (view → DBSP circuit → VM program), `vm` (executes the program), `dag` (`DagEngine`: plan cache, epoch evaluator, ingestion). `catalog` and `runtime` reach this layer only through `dag`.
+- **`catalog`** — the DDL/metadata engine wrapping `DagEngine`: `ddl`, `sys_tables`, `hooks`, `registry`, `metadata`, `validation`, `write_path`, persistence (`store_io`, `partition_lsn`), `cache`, `bootstrap`.
+- **`runtime`** (L7) — the multi-process server (`main.rs` builds `gnitz-server`):
+  - `orchestration` — `master` (SAL dispatcher: fans push/scan out to workers, collects via W2M), `worker` (event loop owning a partition subset), `executor` (single-threaded server executor), `committer` (durable-commit batcher).
+  - `protocol` — `wire` (IPC message format), `sal` (shared append-only log), `w2m`/`w2m_ring` (lock-free worker→master ring).
+  - `reactor` — the single-threaded io_uring reactor (`block_on`/`spawn`/`timer`/reply routing).
+
+Test scaffolding lives in `test_support` / `test_rng` and per-module `tests/`.
+
+## Running E2E tests
+
+**Always run E2E with multiple workers.** Single-worker mode skips
+exchange/fanout paths and will miss distributed bugs.
+
+```bash
+make e2e                       # rebuilds server, GNITZ_WORKERS=4
+make e2e K='joins' WORKERS=1   # pytest -k filter; override worker count
+make test T=name               # one Rust test (make rust-engine-test = engine only)
+```
+
+## Environment variables
+
+| Var | Effect |
+|-----|--------|
+| `GNITZ_WORKERS` | Worker count (Makefile/tests → server `--workers`) |
+| `GNITZ_LOG_LEVEL` | `quiet` / `normal` / `verbose` (`debug` = alias) |
+| `GNITZ_SERVER_BIN` | Override server binary (e.g. aim E2E at the release build) |
+| `GNITZ_CHECKPOINT_BYTES` | SAL checkpoint threshold (default 75% of SAL) |
+
+## Debug logging
+
+```bash
+cd crates/gnitz-py && GNITZ_WORKERS=4 GNITZ_LOG_LEVEL=debug uv run pytest -x <test-file>
+```
+
+Log format: `<epoch>.<ms> <tag> <level> <message>` — tags: `M` (master), `W0`–`WN`.
+
+For temporary logging: `gnitz_debug!` / `gnitz_info!` macros. Remove before committing.
+
+### Where test logs go
+
+Server stderr (master process): always written to `~/git/gnitz/tmp/server_debug.log`.
+Pytest's `-s` flag does NOT capture this — it lives on disk regardless of
+pytest's stdout/stderr capture mode.
+
+Worker logs: workers write to `<data_dir>/worker_<N>.log` inside the per-test
+tmpdir. The conftest copies them to `~/git/gnitz/tmp/last_worker_N.log` on
+session teardown — those are the canonical post-mortem files.
+
+Live tail (during a long-running test): `tail -f ~/git/gnitz/tmp/gnitz_data_*/data/worker_*.log`
+
+Pre-existing logs from the previous session are overwritten on the next test
+run, so save copies before re-running if you need them.
+
+### Using tests for debugging
+
+1. **Reproduce the failure on a single test** with `pytest <test-file>::<test> -v`.
+   Always pass `GNITZ_WORKERS=4` — multi-worker bugs hide at W=1.
+2. **Re-run a few times** to check determinism. Flaky failures often point to
+   a race that the deterministic single-test run will mask.
+3. **Read both logs side-by-side** — the master log shows what was
+   dispatched; the worker log shows what was processed. Discrepancies in
+   ordering between them are usually the smoking gun.
+4. **Add temporary `gnitz_info!` lines** at the suspected boundary
+   (handler entry, SAL emit, ACK reply). `make server pyext` then re-run.
+   Strip them before committing.
+5. **Use the debug binary** (the default `make server` output). Release
+   builds clamp corrupt values silently and hide the real failure mode.
+6. **Test logs survive the session**, code state does NOT — if you want
+   to attach a log to a bug report, copy it out of `~/git/gnitz/tmp/`
+   before the next test run overwrites it.
+
+## SAL durability contract
+
+**Rule: an ACK to a client implies fdatasync iff the operation upserted data.**
+
+The SAL (Shared Append-Only Log) carries both data writes and ephemeral
+commands on the same mmap'd fd. Workers see all SAL entries immediately
+via Acquire/Release atomics on the size prefix — fdatasync is irrelevant
+for cross-process visibility. It exists solely for crash recovery.
+
+Durable operations are atomic: crash recovery applies an operation in full
+or not at all, so a crash never leaves a half-written DDL or push behind.
+Operations that upsert table data fdatasync before the ACK; command-only
+operations — view ticks, scans, seeks, backfills, validation queries —
+wake the workers without it, since a lost command needs no recovery
+(base-table data is intact and views are re-derived).
+
+## Benchmarking
+
+```bash
+make bench                          # quick mode, 1 worker
+make bench-full                     # full mode, 4 workers
+make bench-sweep                    # sweep workers=1,2,4 × clients=1,2,4
+make bench-perf                     # full + perf record + perf stat
+
+# Knobs: WORKERS, CLIENTS, FULL=1, PERF=1
+make bench WORKERS=4 PERF=1        # quick, 4 workers, perf
+```
+
+Results: `benchmarks/results/` (gitignored). The runner rotates old results (keeps 10).
+
+Workflow: `make bench` → change → commit → `make bench` → compare `summary.json`.
+
+### Rust micro-benchmarks
+
+`make bench` is end-to-end (full server + IPC), so it can't isolate a tight
+in-process loop. For that, the engine carries `#[ignore]`d timing tests that
+print throughput and must be run in `--release`:
+
+```bash
+cd crates && cargo test -p gnitz-engine --release <name>_bench \
+    -- --ignored --nocapture --test-threads=1
+```
+
+Add one alongside the others: name the test `*_bench`, mark it `#[ignore]`,
+time only the hot region with `std::time::Instant`, and `std::hint::black_box`
+anything the optimizer could elide.
+
+## Debugging failures
+
+1. **Log first, never guess.** Rebuilds are expensive. One well-instrumented
+   run reveals more than ten speculative attempts.
+   - `gnitz_debug!` / `gnitz_info!` for structured logging
+   - `GNITZ_LOG_LEVEL=debug` to enable debug-level messages
+   - `RUST_BACKTRACE=1` for panic backtraces
+2. **Use the debug binary for crashes.** Release builds silently clamp
+   corrupt values.
+3. **Isolate with 1 worker first.** Pass with W=1 but fail with W=4 →
+   bug is in exchange/fanout, not computation.
+4. **Bisect by sub-path.** Disable the new fast-path to confirm the bug
+   is in the new code.
+5. **Verify your fix is in the binary.** `make e2e` rebuilds both the
+   server and the Python extension before running tests.
+
+## See also
+
+- `CLAUDE.md` — DBSP / Z-Set theory and consolidation / merge invariants.
+- `async-invariants.md` — runtime & reactor: kernel coordination, scheduling, known latent issues.
+
+## GIT Branches
+
+All development happens on main for now; never branch off.
