@@ -1,25 +1,19 @@
-use std::os::fd::{OwnedFd, FromRawFd, AsRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use lru::LruCache;
-use crate::protocol::{
-    Message, Schema, ZSetBatch, PkTuple,
-    STATUS_ERROR, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
-    FLAG_SEEK_BY_INDEX_RANGE,
-    FLAG_ALLOCATE_TABLE_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_INDEX_ID, FLAG_GET_INDICES,
-    FLAG_CONTINUATION, WireConflictMode,
-    wire_flags_set_conflict_mode, wire_flags_set_schema_version, wire_flags_get_schema_version,
-    wire_flags_set_index_version, wire_flags_get_index_version,
-    send_message, send_message_noschema, send_message_with_extra, recv_message,
-    connect as proto_connect,
-    hello_handshake,
-};
 use crate::error::ClientError;
+use crate::protocol::{
+    connect as proto_connect, hello_handshake, recv_message, send_message, send_message_noschema,
+    send_message_with_extra, wire_flags_get_index_version, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
+    wire_flags_set_index_version, wire_flags_set_schema_version, Message, PkTuple, Schema, WireConflictMode, ZSetBatch,
+    FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES,
+    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
+};
+use lru::LruCache;
 
 pub use gnitz_wire::{
-    SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB, DEP_TAB, SEQ_TAB,
-    FIRST_USER_TABLE_ID, FIRST_USER_SCHEMA_ID,
+    COL_TAB, DEP_TAB, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB, VIEW_TAB,
 };
 
 /// `(schema, data_batch, lsn)` returned by a `scan`/`seek`/`seek_by_index`:
@@ -50,7 +44,8 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
         // a STATUS_ERROR with Some("") would otherwise surface as a blank
         // ServerError. This matters because the warm-push guard converts
         // silent corruption into a surfaced error, which must be legible.
-        let text = msg.error_text
+        let text = msg
+            .error_text
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "unknown server error".into());
         return Err(ClientError::ServerError(text));
@@ -59,7 +54,7 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
 }
 
 pub struct Connection {
-    sock:          OwnedFd,
+    sock: OwnedFd,
     pub client_id: u64,
     /// Server-negotiated per-connection frame payload ceiling. Set during
     /// `connect()` from the HELLO ACK; subsequent `recv_message` calls
@@ -108,9 +103,9 @@ impl Connection {
     pub fn push(
         &mut self,
         target_id: u64,
-        schema:    &Schema,
-        batch:     &ZSetBatch,
-        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
+        schema: &Schema,
+        batch: &ZSetBatch,
+        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<u64, ClientError> {
         self.push_with_mode(target_id, schema, batch, WireConflictMode::Update, cache)
     }
@@ -118,28 +113,33 @@ impl Connection {
     pub fn push_with_mode(
         &mut self,
         target_id: u64,
-        schema:    &Schema,
-        batch:     &ZSetBatch,
-        mode:      WireConflictMode,
-        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
+        schema: &Schema,
+        batch: &ZSetBatch,
+        mode: WireConflictMode,
+        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<u64, ClientError> {
         batch.validate(schema).map_err(ClientError::ServerError)?;
         let msg = self.roundtrip_push(target_id, schema, batch, mode, cache)?;
         Ok(msg.seek_pk as u64)
     }
 
-    pub fn scan(
-        &mut self,
-        target_id: u64,
-        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> ScanResult {
+    pub fn scan(&mut self, target_id: u64, cache: &mut LruCache<u64, (Arc<Schema>, u16)>) -> ScanResult {
         let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
         let flags = wire_flags_set_schema_version(0, cached_version);
         // Send the scan request then collect streaming worker frames
         // (each tagged FLAG_CONTINUATION) until the terminal frame arrives.
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, &PkTuple::EMPTY, 0, None, None)?;
+        send_message(
+            self.sock.as_raw_fd(),
+            target_id,
+            self.client_id,
+            flags,
+            &PkTuple::EMPTY,
+            0,
+            None,
+            None,
+        )?;
         let mut schema: Option<Arc<Schema>> = None;
-        let mut data:   Option<ZSetBatch> = None;
+        let mut data: Option<ZSetBatch> = None;
         let lsn: u64 = loop {
             let msg = check_response(self.recv_message_cached_inner(target_id, cache)?)?;
             let is_continuation = (msg.flags & FLAG_CONTINUATION) != 0;
@@ -161,26 +161,27 @@ impl Connection {
         Ok((schema, data, lsn))
     }
 
-    pub fn seek(
-        &mut self,
-        target_id: u64,
-        pk:        &PkTuple,
-        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
-    ) -> ScanResult {
+    pub fn seek(&mut self, target_id: u64, pk: &PkTuple, cache: &mut LruCache<u64, (Arc<Schema>, u16)>) -> ScanResult {
         let msg = self.roundtrip_seek(target_id, pk, cache)?;
-        let schema = msg.schema.map(Arc::new).or_else(|| cache.get(&target_id).map(|(s, _)| Arc::clone(s)));
+        let schema = msg
+            .schema
+            .map(Arc::new)
+            .or_else(|| cache.get(&target_id).map(|(s, _)| Arc::clone(s)));
         Ok((schema, msg.data_batch, msg.seek_pk as u64))
     }
 
     pub fn seek_by_index(
         &mut self,
-        table_id:    u64,
+        table_id: u64,
         col_indices: &[u32],
-        key_vals:    &[u128],
-        cache:       &mut LruCache<u64, (Arc<Schema>, u16)>,
+        key_vals: &[u128],
+        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> ScanResult {
         let msg = self.roundtrip_seek_by_index(table_id, col_indices, key_vals, cache)?;
-        let schema = msg.schema.map(Arc::new).or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
+        let schema = msg
+            .schema
+            .map(Arc::new)
+            .or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
         Ok((schema, msg.data_batch, msg.seek_pk as u64))
     }
 
@@ -190,13 +191,16 @@ impl Connection {
     /// `GnitzClient::seek_by_index_range`, the single choke point.
     pub fn seek_by_index_range(
         &mut self,
-        table_id:    u64,
+        table_id: u64,
         col_indices: &[u32],
-        desc:        &gnitz_wire::RangeDescriptor,
-        cache:       &mut LruCache<u64, (Arc<Schema>, u16)>,
+        desc: &gnitz_wire::RangeDescriptor,
+        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> ScanResult {
         let msg = self.roundtrip_seek_by_index_range(table_id, col_indices, desc, cache)?;
-        let schema = msg.schema.map(Arc::new).or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
+        let schema = msg
+            .schema
+            .map(Arc::new)
+            .or_else(|| cache.get(&table_id).map(|(s, _)| Arc::clone(s)));
         Ok((schema, msg.data_batch, msg.seek_pk as u64))
     }
 
@@ -207,12 +211,22 @@ impl Connection {
     /// "unchanged" reply carries no data and needs no schema. Returns the raw
     /// `(data_batch, server_epoch)` and leaves the `IndexMeta` decode to
     /// `GnitzClient`, where the `col_u64` helper lives.
-    pub(crate) fn fetch_indices(&mut self, table_id: u64, cached_epoch: u8)
-        -> Result<(Option<ZSetBatch>, u8), ClientError>
-    {
+    pub(crate) fn fetch_indices(
+        &mut self,
+        table_id: u64,
+        cached_epoch: u8,
+    ) -> Result<(Option<ZSetBatch>, u8), ClientError> {
         let flags = wire_flags_set_index_version(FLAG_GET_INDICES, cached_epoch);
-        send_message(self.sock.as_raw_fd(), table_id, self.client_id, flags,
-                     &PkTuple::EMPTY, 0, None, None)?;
+        send_message(
+            self.sock.as_raw_fd(),
+            table_id,
+            self.client_id,
+            flags,
+            &PkTuple::EMPTY,
+            0,
+            None,
+            None,
+        )?;
         let msg = check_response(recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?)?;
         Ok((msg.data_batch, wire_flags_get_index_version(msg.flags)))
     }
@@ -222,7 +236,7 @@ impl Connection {
     fn recv_message_cached_inner(
         &mut self,
         target_id: u64,
-        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
+        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         let msg = {
             // `get` (not `peek`) so a frequently-accessed schema refreshes its
@@ -243,11 +257,20 @@ impl Connection {
     fn roundtrip(
         &mut self,
         target_id: u64,
-        flags:     u64,
-        schema:    Option<&Schema>,
-        data:      Option<&ZSetBatch>,
+        flags: u64,
+        schema: Option<&Schema>,
+        data: Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, &PkTuple::EMPTY, 0, schema, data)?;
+        send_message(
+            self.sock.as_raw_fd(),
+            target_id,
+            self.client_id,
+            flags,
+            &PkTuple::EMPTY,
+            0,
+            schema,
+            data,
+        )?;
         // Alloc roundtrips carry no schema blocks; recv_message without a hint is sufficient.
         let msg = recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?;
         check_response(msg)
@@ -271,10 +294,10 @@ impl Connection {
     fn roundtrip_push(
         &mut self,
         target_id: u64,
-        schema:    &Schema,
-        batch:     &ZSetBatch,
-        mode:      WireConflictMode,
-        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
+        schema: &Schema,
+        batch: &ZSetBatch,
+        mode: WireConflictMode,
+        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         let base_flags = wire_flags_set_conflict_mode(0, mode);
         let warm_version: Option<u16> = match cache.peek(&target_id) {
@@ -287,17 +310,35 @@ impl Connection {
             send_message_noschema(self.sock.as_raw_fd(), target_id, self.client_id, flags, schema, batch)?;
         } else {
             // Cold path: include schema block, version = 0.
-            send_message(self.sock.as_raw_fd(), target_id, self.client_id, base_flags, &PkTuple::EMPTY, 0, Some(schema), Some(batch))?;
+            send_message(
+                self.sock.as_raw_fd(),
+                target_id,
+                self.client_id,
+                base_flags,
+                &PkTuple::EMPTY,
+                0,
+                Some(schema),
+                Some(batch),
+            )?;
         }
         let ack = match check_response(self.recv_message_cached_inner(target_id, cache)?) {
             Err(ClientError::SchemaMismatch) => {
                 // Stale cache: evict and retry with full schema.
                 cache.pop(&target_id);
-                send_message(self.sock.as_raw_fd(), target_id, self.client_id, base_flags, &PkTuple::EMPTY, 0, Some(schema), Some(batch))?;
+                send_message(
+                    self.sock.as_raw_fd(),
+                    target_id,
+                    self.client_id,
+                    base_flags,
+                    &PkTuple::EMPTY,
+                    0,
+                    Some(schema),
+                    Some(batch),
+                )?;
                 check_response(self.recv_message_cached_inner(target_id, cache)?)?
             }
             Ok(msg) => msg,
-            Err(e)  => return Err(e),
+            Err(e) => return Err(e),
         };
         // No manual cache write here. Whenever the server changed the schema
         // version it also included the schema block in the ACK
@@ -312,10 +353,10 @@ impl Connection {
 
     fn roundtrip_seek_by_index(
         &mut self,
-        table_id:    u64,
+        table_id: u64,
         col_indices: &[u32],
-        key_vals:    &[u128],
-        cache:       &mut LruCache<u64, (Arc<Schema>, u16)>,
+        key_vals: &[u128],
+        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         // Embed the cached schema version so the server can omit the schema
         // block on a warm-cache hit (matching roundtrip_push/scan).
@@ -333,7 +374,16 @@ impl Connection {
         }
         let pk = PkTuple::from_bytes(&buf[..key_vals.len() * 16]);
         let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
-        send_message(self.sock.as_raw_fd(), table_id, self.client_id, flags, &pk, seek_col_idx, None, None)?;
+        send_message(
+            self.sock.as_raw_fd(),
+            table_id,
+            self.client_id,
+            flags,
+            &pk,
+            seek_col_idx,
+            None,
+            None,
+        )?;
         let msg = self.recv_message_cached_inner(table_id, cache)?;
         check_response(msg)
     }
@@ -345,17 +395,22 @@ impl Connection {
     /// verbatim; the worker is the sole OPK encoder.
     fn roundtrip_seek_by_index_range(
         &mut self,
-        table_id:    u64,
+        table_id: u64,
         col_indices: &[u32],
-        desc:        &gnitz_wire::RangeDescriptor,
-        cache:       &mut LruCache<u64, (Arc<Schema>, u16)>,
+        desc: &gnitz_wire::RangeDescriptor,
+        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         let cached_version = cache.peek(&table_id).map(|(_, v)| *v).unwrap_or(0);
         let flags = wire_flags_set_schema_version(FLAG_SEEK_BY_INDEX_RANGE, cached_version);
         let seek_col_idx = gnitz_wire::pack_pk_cols(col_indices);
         send_message_with_extra(
-            self.sock.as_raw_fd(), table_id, self.client_id, flags, seek_col_idx,
-            &desc.encode())?;
+            self.sock.as_raw_fd(),
+            table_id,
+            self.client_id,
+            flags,
+            seek_col_idx,
+            &desc.encode(),
+        )?;
         let msg = self.recv_message_cached_inner(table_id, cache)?;
         check_response(msg)
     }
@@ -363,12 +418,21 @@ impl Connection {
     fn roundtrip_seek(
         &mut self,
         target_id: u64,
-        pk:        &PkTuple,
-        cache:     &mut LruCache<u64, (Arc<Schema>, u16)>,
+        pk: &PkTuple,
+        cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
         let cached_version = cache.peek(&target_id).map(|(_, v)| *v).unwrap_or(0);
         let flags = wire_flags_set_schema_version(FLAG_SEEK, cached_version);
-        send_message(self.sock.as_raw_fd(), target_id, self.client_id, flags, pk, 0, None, None)?;
+        send_message(
+            self.sock.as_raw_fd(),
+            target_id,
+            self.client_id,
+            flags,
+            pk,
+            0,
+            None,
+            None,
+        )?;
         let msg = self.recv_message_cached_inner(target_id, cache)?;
         check_response(msg)
     }
@@ -376,19 +440,21 @@ impl Connection {
 
 #[cfg(test)]
 mod cache_tests {
-    use std::sync::Arc;
+    use crate::protocol::{ColumnDef, Schema, TypeCode};
     use lru::LruCache;
-    use crate::protocol::{Schema, ColumnDef, TypeCode};
+    use std::sync::Arc;
 
     #[test]
     fn schema_cache_arc_not_clone() {
-        let mut cache: LruCache<u64, (Arc<Schema>, u16)> =
-            LruCache::new(std::num::NonZeroUsize::new(4).unwrap());
+        let mut cache: LruCache<u64, (Arc<Schema>, u16)> = LruCache::new(std::num::NonZeroUsize::new(4).unwrap());
         let schema = Arc::new(Schema {
-            columns: vec![
-                ColumnDef { name: "id".into(), type_code: TypeCode::I64,
-                             is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                type_code: TypeCode::I64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         });
         cache.put(42, (Arc::clone(&schema), 1));
@@ -408,9 +474,15 @@ mod tests {
     fn error_msg(error_text: Option<String>) -> Message {
         Message {
             status: STATUS_ERROR,
-            target_id: 0, client_id: 0, flags: 0, seek_pk: 0,
-            seek_col_idx: 0, request_id: 0,
-            schema: None, schema_batch: None, data_batch: None,
+            target_id: 0,
+            client_id: 0,
+            flags: 0,
+            seek_pk: 0,
+            seek_col_idx: 0,
+            request_id: 0,
+            schema: None,
+            schema_batch: None,
+            data_batch: None,
             error_text,
         }
     }
@@ -429,7 +501,10 @@ mod tests {
     fn check_response_empty_error_text_falls_back_to_default() {
         // A STATUS_ERROR with Some("") must surface the default text, not a
         // blank ServerError — the warm-push guard's rejection must be legible.
-        assert_eq!(server_error_text(error_msg(Some(String::new()))), "unknown server error");
+        assert_eq!(
+            server_error_text(error_msg(Some(String::new()))),
+            "unknown server error"
+        );
     }
 
     #[test]

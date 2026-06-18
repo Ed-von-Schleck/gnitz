@@ -1,20 +1,20 @@
-use std::sync::Arc;
-use lru::LruCache;
-use gnitz_wire::RangeDescriptor;
-use crate::protocol::{Schema, ColumnDef, TypeCode, ZSetBatch, ColData, BatchAppender, PkColumn, PkTuple, WireConflictMode};
-use crate::protocol::types::type_code_from_u64;
-use crate::connection::{Connection, ScanResult, SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, DEP_TAB, IDX_TAB};
+use crate::connection::{Connection, ScanResult, COL_TAB, DEP_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB};
 use crate::error::ClientError;
+use crate::protocol::types::type_code_from_u64;
+use crate::protocol::{
+    BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, WireConflictMode, ZSetBatch,
+};
+use gnitz_wire::RangeDescriptor;
+use lru::LruCache;
+use std::sync::Arc;
 
 const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
-use crate::types::{
-    CIRCUIT_NODES_TAB, CIRCUIT_EDGES_TAB, CIRCUIT_NODE_COLUMNS_TAB,
-    OWNER_KIND_TABLE, OWNER_KIND_VIEW,
-    schema_tab_schema, table_tab_schema, col_tab_schema, view_tab_schema,
-    dep_tab_schema, idx_tab_schema, circuit_nodes_schema, circuit_edges_schema,
-    circuit_node_columns_schema,
-};
 use crate::circuit::Circuit;
+use crate::types::{
+    circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, dep_tab_schema,
+    idx_tab_schema, schema_tab_schema, table_tab_schema, view_tab_schema, CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB,
+    CIRCUIT_NODE_COLUMNS_TAB, OWNER_KIND_TABLE, OWNER_KIND_VIEW,
+};
 
 // --- Module-private helpers ---
 
@@ -23,8 +23,11 @@ fn col_u64(col: &ColData, i: usize) -> Result<u64, ClientError> {
         ColData::Fixed(bytes) => {
             let off = i * 8;
             if off + 8 > bytes.len() {
-                return Err(ClientError::ServerError(
-                    format!("col_u64: row {} out of bounds (len {})", i, bytes.len())));
+                return Err(ClientError::ServerError(format!(
+                    "col_u64: row {} out of bounds (len {})",
+                    i,
+                    bytes.len()
+                )));
             }
             Ok(u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()))
         }
@@ -36,8 +39,11 @@ fn col_str(col: &ColData, i: usize) -> Result<Option<&str>, ClientError> {
     match col {
         ColData::Strings(v) => {
             if i >= v.len() {
-                return Err(ClientError::ServerError(
-                    format!("col_str: row {} out of bounds (len {})", i, v.len())));
+                return Err(ClientError::ServerError(format!(
+                    "col_str: row {} out of bounds (len {})",
+                    i,
+                    v.len()
+                )));
             }
             Ok(v[i].as_deref())
         }
@@ -71,7 +77,8 @@ fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
     if !pkl.is_well_formed() {
         return Err(ClientError::ServerError(format!(
             "PK column count {} out of range 1..={}",
-            pkl.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS
+            pkl.decoded_count(),
+            gnitz_wire::PK_LIST_MAX_COLS
         )));
     }
     Ok(pkl.as_slice().iter().map(|&c| c as usize).collect())
@@ -79,12 +86,14 @@ fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
 
 fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
     if col_idx >= 512 {
-        return Err(ClientError::ServerError(
-            format!("column index {col_idx} exceeds maximum 511")));
+        return Err(ClientError::ServerError(format!(
+            "column index {col_idx} exceeds maximum 511"
+        )));
     }
     if owner_id > (u64::MAX >> 9) {
-        return Err(ClientError::ServerError(
-            format!("owner_id {owner_id} exceeds 55-bit maximum for column ID packing")));
+        return Err(ClientError::ServerError(format!(
+            "owner_id {owner_id} exceeds 55-bit maximum for column ID packing"
+        )));
     }
     Ok((owner_id << 9) | col_idx as u64)
 }
@@ -92,23 +101,23 @@ fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
 // --- Internal record types ---
 
 struct TableRecord {
-    tid:         u64,
-    schema_id:   u64,
-    name:        String,
-    directory:   String,
-    pk_col_idx:  u64,
+    tid: u64,
+    schema_id: u64,
+    name: String,
+    directory: String,
+    pk_col_idx: u64,
     created_lsn: u64,
-    flags:       u64,
+    flags: u64,
 }
 
 struct ViewRecord {
-    vid:             u64,
-    schema_id:       u64,
-    name:            String,
-    sql_definition:  String,
+    vid: u64,
+    schema_id: u64,
+    name: String,
+    sql_definition: String,
     cache_directory: String,
-    created_lsn:     u64,
-    pk_col_idx:      u64,
+    created_lsn: u64,
+    pk_col_idx: u64,
 }
 
 // --- GnitzClient ---
@@ -119,20 +128,23 @@ struct ViewRecord {
 /// operative uniqueness truth. `PkColList` is `Copy`, so `IndexMeta` stays
 /// `Copy` (no `.cloned()` churn at its consumers).
 #[derive(Clone, Copy, Debug)]
-pub struct IndexMeta { pub cols: gnitz_wire::PkColList, pub is_unique: bool }
+pub struct IndexMeta {
+    pub cols: gnitz_wire::PkColList,
+    pub is_unique: bool,
+}
 
 pub struct GnitzClient {
-    conn:         Connection,
+    conn: Connection,
     schema_cache: LruCache<u64, (Arc<Schema>, u16)>,
-    index_cache:  LruCache<u64, (Arc<Vec<IndexMeta>>, u8)>,
+    index_cache: LruCache<u64, (Arc<Vec<IndexMeta>>, u8)>,
 }
 
 impl GnitzClient {
     pub fn connect(socket_path: &str) -> Result<Self, ClientError> {
         Ok(GnitzClient {
-            conn:         Connection::connect(socket_path)?,
+            conn: Connection::connect(socket_path)?,
             schema_cache: LruCache::new(SCHEMA_CACHE_CAP),
-            index_cache:  LruCache::new(SCHEMA_CACHE_CAP),
+            index_cache: LruCache::new(SCHEMA_CACHE_CAP),
         })
     }
 
@@ -163,21 +175,21 @@ impl GnitzClient {
     /// callers pass `Update` (or use the plain `push` which defaults
     /// to `Update` for backward compatibility).
     pub fn push_with_mode(
-        &mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch,
+        &mut self,
+        table_id: u64,
+        schema: &Schema,
+        batch: &ZSetBatch,
         mode: WireConflictMode,
     ) -> Result<u64, ClientError> {
-        self.conn.push_with_mode(table_id, schema, batch, mode, &mut self.schema_cache)
+        self.conn
+            .push_with_mode(table_id, schema, batch, mode, &mut self.schema_cache)
     }
 
     pub fn scan(&mut self, table_id: u64) -> ScanResult {
         self.conn.scan(table_id, &mut self.schema_cache)
     }
 
-    pub fn seek(
-        &mut self,
-        table_id: u64,
-        pk:       &PkTuple,
-    ) -> ScanResult {
+    pub fn seek(&mut self, table_id: u64, pk: &PkTuple) -> ScanResult {
         self.conn.seek(table_id, pk, &mut self.schema_cache)
     }
 
@@ -188,9 +200,7 @@ impl GnitzClient {
     /// planner and every binding; the two arity guards below are load-bearing,
     /// not cosmetic — they prevent a `pack_pk_cols` panic and a silently-misread
     /// frame (the worker derives the value count from the wire byte length).
-    pub fn seek_by_index(
-        &mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128],
-    ) -> ScanResult {
+    pub fn seek_by_index(&mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128]) -> ScanResult {
         // pack_pk_cols asserts its contract — reject here, never panic.
         gnitz_wire::validate_pk_col_list(col_indices)
             .map_err(|e| ClientError::ServerError(format!("seek_by_index: {e}")))?;
@@ -201,9 +211,12 @@ impl GnitzClient {
         if key_vals.is_empty() || key_vals.len() > col_indices.len() {
             return Err(ClientError::ServerError(format!(
                 "seek_by_index: key value count {} must be in 1..={}",
-                key_vals.len(), col_indices.len())));
+                key_vals.len(),
+                col_indices.len()
+            )));
         }
-        self.conn.seek_by_index(table_id, col_indices, key_vals, &mut self.schema_cache)
+        self.conn
+            .seek_by_index(table_id, col_indices, key_vals, &mut self.schema_cache)
     }
 
     /// Ordered range scan over a secondary index: the leading
@@ -220,12 +233,7 @@ impl GnitzClient {
     /// column), and a column-NULL row is absent from the index, matching SQL
     /// range NULL-exclusion. A zero-width or inverted interval is equally
     /// legitimate: the engine detects it byte-wise and returns nothing.
-    pub fn seek_by_index_range(
-        &mut self,
-        table_id:    u64,
-        col_indices: &[u32],
-        desc:        &RangeDescriptor,
-    ) -> ScanResult {
+    pub fn seek_by_index_range(&mut self, table_id: u64, col_indices: &[u32], desc: &RangeDescriptor) -> ScanResult {
         gnitz_wire::validate_pk_col_list(col_indices)
             .map_err(|e| ClientError::ServerError(format!("seek_by_index_range: {e}")))?;
         // The range column sits right after the equality prefix, so the prefix
@@ -234,9 +242,13 @@ impl GnitzClient {
         if desc.eq_vals().len() >= col_indices.len() {
             return Err(ClientError::ServerError(format!(
                 "seek_by_index_range: {} equality values leave no range column \
-                 within index arity {}", desc.eq_vals().len(), col_indices.len())));
+                 within index arity {}",
+                desc.eq_vals().len(),
+                col_indices.len()
+            )));
         }
-        self.conn.seek_by_index_range(table_id, col_indices, desc, &mut self.schema_cache)
+        self.conn
+            .seek_by_index_range(table_id, col_indices, desc, &mut self.schema_cache)
     }
 
     /// The secondary-index descriptor for `col_idx` of `table_id`, served from a
@@ -252,9 +264,7 @@ impl GnitzClient {
     /// server would reject, nor reject one it would accept. (The old IDX_TAB
     /// scan could diverge by reporting a phantom unique index masked by the
     /// circuit dedup; the circuit list does not.)
-    pub fn index_for_column(
-        &mut self, table_id: u64, col_idx: usize,
-    ) -> Result<Option<IndexMeta>, ClientError> {
+    pub fn index_for_column(&mut self, table_id: u64, col_idx: usize) -> Result<Option<IndexMeta>, ClientError> {
         let list = self.refresh_indices(table_id)?;
         // Exact single-element match: a composite index does NOT answer a
         // single-column FK/uniqueness query (a `(a, b)` index does not guarantee
@@ -267,9 +277,7 @@ impl GnitzClient {
     /// round-trip, no extra wire traffic). Used by the SQL point-lookup planner,
     /// which must see every index's full declared column list to plan a
     /// leading-prefix seek.
-    pub fn table_indexes(
-        &mut self, table_id: u64,
-    ) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
+    pub fn table_indexes(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
         self.refresh_indices(table_id)
     }
 
@@ -281,9 +289,7 @@ impl GnitzClient {
     /// `is_well_formed` guard `decode_pk_cols` uses (reading `pks.get(i) as u32`
     /// would truncate the packed `u64`'s high columns and drop the
     /// `PK_LIST_PACKED_FLAG` at bit 63).
-    fn refresh_indices(
-        &mut self, table_id: u64,
-    ) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
+    fn refresh_indices(&mut self, table_id: u64) -> Result<Arc<Vec<IndexMeta>>, ClientError> {
         let cached_epoch = self.index_cache.peek(&table_id).map(|(_, e)| *e).unwrap_or(0);
         let (batch, epoch) = self.conn.fetch_indices(table_id, cached_epoch)?;
         if epoch == cached_epoch && cached_epoch != 0 {
@@ -292,13 +298,16 @@ impl GnitzClient {
             return Ok(self.index_cache.get(&table_id).map(|(l, _)| Arc::clone(l)).unwrap());
         }
         let mut fresh = Vec::new();
-        if let Some(b) = batch {                 // None ⇒ changed-to-empty list
+        if let Some(b) = batch {
+            // None ⇒ changed-to-empty list
             for i in b.live_rows() {
                 let cols = gnitz_wire::unpack_pk_cols(b.pks.get(i) as u64);
                 if !cols.is_well_formed() {
                     return Err(ClientError::ServerError(format!(
                         "index column count {} out of range 1..={}",
-                        cols.decoded_count(), gnitz_wire::PK_LIST_MAX_COLS)));
+                        cols.decoded_count(),
+                        gnitz_wire::PK_LIST_MAX_COLS
+                    )));
                 }
                 fresh.push(IndexMeta {
                     cols,
@@ -323,8 +332,12 @@ impl GnitzClient {
     /// that `DROP INDEX` resolves against. A 1-element list is the single-column
     /// case; the persisted `source_cols` slot always carries `pack_pk_cols`.
     pub fn create_index(
-        &mut self, table_id: u64, col_indices: &[u32], col_types: &[TypeCode],
-        index_name: &str, is_unique: bool,
+        &mut self,
+        table_id: u64,
+        col_indices: &[u32],
+        col_types: &[TypeCode],
+        index_name: &str,
+        is_unique: bool,
     ) -> Result<u64, ClientError> {
         // Arity, 7-bit column range, duplicates — the Err form of the
         // pack_pk_cols contract, so the pack below can never panic.
@@ -332,7 +345,8 @@ impl GnitzClient {
             .map_err(|e| ClientError::ServerError(format!("create_index: {e}")))?;
         if col_types.len() != col_indices.len() {
             return Err(ClientError::ServerError(
-                "create_index: col_indices and col_types length mismatch".to_string()));
+                "create_index: col_indices and col_types length mismatch".to_string(),
+            ));
         }
         for &ct in col_types {
             validate_index_col_type(ct)?;
@@ -348,9 +362,7 @@ impl GnitzClient {
             for i in idx_batch.live_rows() {
                 let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
                 if name == index_name {
-                    return Err(ClientError::ServerError(format!(
-                        "index '{index_name}' already exists"
-                    )));
+                    return Err(ClientError::ServerError(format!("index '{index_name}' already exists")));
                 }
             }
         }
@@ -374,19 +386,19 @@ impl GnitzClient {
 
     pub fn drop_index_by_name(&mut self, index_name: &str) -> Result<(), ClientError> {
         let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
-        let idx_batch = idx_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("index '{index_name}' not found"))
-        })?;
+        let idx_batch = idx_batch.ok_or_else(|| ClientError::ServerError(format!("index '{index_name}' not found")))?;
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
-            if name != index_name { continue; }
+            if name != index_name {
+                continue;
+            }
 
-            let index_id   = idx_batch.pks.get(i) as u64;
-            let owner_id   = col_u64(&idx_batch.columns[1], i)?;
+            let index_id = idx_batch.pks.get(i) as u64;
+            let owner_id = col_u64(&idx_batch.columns[1], i)?;
             let owner_kind = col_u64(&idx_batch.columns[2], i)?;
-            let src_col    = col_u64(&idx_batch.columns[3], i)?;
-            let is_unique  = col_u64(&idx_batch.columns[5], i)?;
-            let cache_dir  = col_str(&idx_batch.columns[6], i)?.unwrap_or("").to_string();
+            let src_col = col_u64(&idx_batch.columns[3], i)?;
+            let is_unique = col_u64(&idx_batch.columns[5], i)?;
+            let cache_dir = col_str(&idx_batch.columns[6], i)?.unwrap_or("").to_string();
 
             let idx_schema = idx_tab_schema();
             let mut batch = ZSetBatch::new(idx_schema);
@@ -404,47 +416,49 @@ impl GnitzClient {
         Err(ClientError::ServerError(format!("index '{index_name}' not found")))
     }
 
-    pub fn delete(
-        &mut self,
-        table_id: u64,
-        schema:   &Schema,
-        pks:      PkColumn,
-    ) -> Result<(), ClientError> {
+    pub fn delete(&mut self, table_id: u64, schema: &Schema, pks: PkColumn) -> Result<(), ClientError> {
         let count = pks.len();
-        if count == 0 { return Ok(()); }
+        if count == 0 {
+            return Ok(());
+        }
         // Bulk-fill payload columns directly. BatchAppender is single-PK only
         // (its cursor mapping calls `pk_index_single`), so the delete path
         // bypasses it. The server's `retract_pk` matches by PK alone, so the
         // payload bytes are inert filler.
-        let columns: Vec<ColData> = schema.columns.iter().enumerate().map(|(ci, col)| {
-            if schema.is_pk_col(ci) {
-                ColData::Fixed(vec![])
-            } else {
-                match col.type_code {
-                    TypeCode::String => {
-                        if col.is_nullable {
-                            ColData::Strings(vec![None; count])
-                        } else {
-                            ColData::Strings(vec![Some(String::new()); count])
+        let columns: Vec<ColData> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ci, col)| {
+                if schema.is_pk_col(ci) {
+                    ColData::Fixed(vec![])
+                } else {
+                    match col.type_code {
+                        TypeCode::String => {
+                            if col.is_nullable {
+                                ColData::Strings(vec![None; count])
+                            } else {
+                                ColData::Strings(vec![Some(String::new()); count])
+                            }
                         }
-                    }
-                    TypeCode::Blob => {
-                        if col.is_nullable {
-                            ColData::Bytes(vec![None; count])
-                        } else {
-                            ColData::Bytes(vec![Some(Vec::new()); count])
+                        TypeCode::Blob => {
+                            if col.is_nullable {
+                                ColData::Bytes(vec![None; count])
+                            } else {
+                                ColData::Bytes(vec![Some(Vec::new()); count])
+                            }
                         }
+                        TypeCode::U128 | TypeCode::UUID => ColData::U128s(vec![0u128; count]),
+                        _ => ColData::Fixed(vec![0u8; count * col.type_code.wire_stride()]),
                     }
-                    TypeCode::U128 | TypeCode::UUID => ColData::U128s(vec![0u128; count]),
-                    _ => ColData::Fixed(vec![0u8; count * col.type_code.wire_stride()]),
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         let batch = ZSetBatch {
             pks,
             weights: vec![-1; count],
-            nulls:   vec![0;  count],
+            nulls: vec![0; count],
             columns,
         };
         self.conn.push(table_id, schema, &batch, &mut self.schema_cache)?;
@@ -513,9 +527,7 @@ impl GnitzClient {
     /// the `SCHEMA_TAB` row are never retracted, so no orphan results.
     pub fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
         let (_, sdata, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let sdata = sdata.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{name}' not found"))
-        })?;
+        let sdata = sdata.ok_or_else(|| ClientError::ServerError(format!("Schema '{name}' not found")))?;
         let schema_id = find_schema_id(&sdata, name)?;
 
         // Views first — a view may read a member table; the drain retries to
@@ -558,16 +570,16 @@ impl GnitzClient {
         if !(1..=gnitz_wire::PK_LIST_MAX_COLS).contains(&pk_cols.len()) {
             return Err(ClientError::ServerError(format!(
                 "create_table: PK column count {} out of range 1..={}",
-                pk_cols.len(), gnitz_wire::PK_LIST_MAX_COLS,
+                pk_cols.len(),
+                gnitz_wire::PK_LIST_MAX_COLS,
             )));
         }
 
         let new_tid = self.conn.alloc_table_id()?;
 
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
-        })?;
+        let schema_batch =
+            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         // Encode the PK list using the shared wire packer so the engine
@@ -597,15 +609,13 @@ impl GnitzClient {
 
     pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> Result<(), ClientError> {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
-        })?;
+        let schema_batch =
+            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
-        let tbl_batch = tbl_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found"))
-        })?;
+        let tbl_batch = tbl_batch
+            .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
         let record = find_table_record(&tbl_batch, schema_id, table_name)?;
 
         let tbl_schema = table_tab_schema();
@@ -686,7 +696,7 @@ impl GnitzClient {
         // inconsistent. Validate every PK slot, not just the first.
         if output_columns.is_empty() {
             return Err(ClientError::ServerError(
-                "View must have at least one output column".into()
+                "View must have at least one output column".into(),
             ));
         }
         // Single choke point every view kind passes through: surface an over-wide
@@ -697,26 +707,31 @@ impl GnitzClient {
         if output_columns.len() > gnitz_wire::MAX_COLUMNS {
             return Err(ClientError::ServerError(format!(
                 "View has {} output columns, exceeding the {}-column limit",
-                output_columns.len(), gnitz_wire::MAX_COLUMNS
+                output_columns.len(),
+                gnitz_wire::MAX_COLUMNS
             )));
         }
         for &p in pk_cols {
             match output_columns.get(p as usize) {
                 Some(c) if !c.is_nullable => {}
-                Some(_) => return Err(ClientError::ServerError(
-                    "View Primary Key column must not be nullable".into()
-                )),
-                None => return Err(ClientError::ServerError(format!(
-                    "View PK column index {} out of range ({} output columns)",
-                    p, output_columns.len()
-                ))),
+                Some(_) => {
+                    return Err(ClientError::ServerError(
+                        "View Primary Key column must not be nullable".into(),
+                    ))
+                }
+                None => {
+                    return Err(ClientError::ServerError(format!(
+                        "View PK column index {} out of range ({} output columns)",
+                        p,
+                        output_columns.len()
+                    )))
+                }
             }
         }
 
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
-        })?;
+        let schema_batch =
+            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         // 1. Column records
@@ -748,8 +763,7 @@ impl GnitzClient {
                     // moves `sub` into the leading at-rest bytes and breaks every
                     // view-load prefix seek.
                     let pk = (vid as u128) | ((dep_tid as u128) << 64);
-                    a.add_row(pk, 1)
-                        .u64_val(0); // dep_view_id
+                    a.add_row(pk, 1).u64_val(0); // dep_view_id
                 }
             }
             self.conn.push(DEP_TAB, dep_s, &dep, &mut self.schema_cache)?;
@@ -771,22 +785,44 @@ impl GnitzClient {
                     let mut null_mask: u64 = 0;
                     // Payload columns: node_id=0, opcode=1, source_table=2,
                     // reindex_col=3, expr_program=4.
-                    if src_tab.is_none()  { null_mask |= 1u64 << 2; }
-                    if reindex.is_none()  { null_mask |= 1u64 << 3; }
-                    if expr_blob.is_none() { null_mask |= 1u64 << 4; }
-                    a.add_row(pk, 1)
-                        .null_mask(null_mask)
-                        .u64_val(*node_id)
-                        .u64_val(*opcode);
-                    match src_tab { Some(t) => { a.u64_val(*t); }, None => { a.u64_val(0); } }
-                    match reindex { Some(r) => { a.u64_val(*r as u64); }, None => { a.u64_val(0); } }
+                    if src_tab.is_none() {
+                        null_mask |= 1u64 << 2;
+                    }
+                    if reindex.is_none() {
+                        null_mask |= 1u64 << 3;
+                    }
+                    if expr_blob.is_none() {
+                        null_mask |= 1u64 << 4;
+                    }
+                    a.add_row(pk, 1).null_mask(null_mask).u64_val(*node_id).u64_val(*opcode);
+                    match src_tab {
+                        Some(t) => {
+                            a.u64_val(*t);
+                        }
+                        None => {
+                            a.u64_val(0);
+                        }
+                    }
+                    match reindex {
+                        Some(r) => {
+                            a.u64_val(*r as u64);
+                        }
+                        None => {
+                            a.u64_val(0);
+                        }
+                    }
                     match expr_blob {
-                        Some(b) => { a.bytes_val(b); }
-                        None    => { a.bytes_null(); }
+                        Some(b) => {
+                            a.bytes_val(b);
+                        }
+                        None => {
+                            a.bytes_null();
+                        }
                     }
                 }
             }
-            self.conn.push(CIRCUIT_NODES_TAB, nodes_s, &nodes, &mut self.schema_cache)?;
+            self.conn
+                .push(CIRCUIT_NODES_TAB, nodes_s, &nodes, &mut self.schema_cache)?;
         }
 
         // 4. CircuitEdges (natural-key PK — no synthetic edge_id).
@@ -806,7 +842,8 @@ impl GnitzClient {
                         .u64_val(*src_node);
                 }
             }
-            self.conn.push(CIRCUIT_EDGES_TAB, edges_s, &edges, &mut self.schema_cache)?;
+            self.conn
+                .push(CIRCUIT_EDGES_TAB, edges_s, &edges, &mut self.schema_cache)?;
         }
 
         // 5. CircuitNodeColumns (replaces group_cols + the four PARAM_BASE ranges).
@@ -820,9 +857,7 @@ impl GnitzClient {
                     debug_assert!((*kind) <= 0xFF);
                     debug_assert!((*node_id) <= 0x00FF_FFFF_FFFF);
                     // Compound PK (view_id, sub): sub packs (node_id, kind, position).
-                    let sub = ((*node_id as u128) << 24)
-                        | ((*kind as u128) << 16)
-                        | (*position as u128);
+                    let sub = ((*node_id as u128) << 24) | ((*kind as u128) << 16) | (*position as u128);
                     let pk = (vid as u128) | (sub << 64);
                     a.add_row(pk, 1)
                         .u64_val(*node_id)
@@ -832,7 +867,8 @@ impl GnitzClient {
                         .u64_val(*v2);
                 }
             }
-            self.conn.push(CIRCUIT_NODE_COLUMNS_TAB, s, &nc, &mut self.schema_cache)?;
+            self.conn
+                .push(CIRCUIT_NODE_COLUMNS_TAB, s, &nc, &mut self.schema_cache)?;
         }
 
         // 6. View record — must be last (triggers server-side hook + circuit
@@ -846,15 +882,13 @@ impl GnitzClient {
 
     pub fn drop_view(&mut self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
-        })?;
+        let schema_batch =
+            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
-        let view_batch = view_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found"))
-        })?;
+        let view_batch = view_batch
+            .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found")))?;
         let vr = find_view_record(&view_batch, schema_id, view_name)?;
 
         let view_s = view_tab_schema();
@@ -872,71 +906,71 @@ impl GnitzClient {
         Ok(())
     }
 
-    pub fn resolve_table_id(
-        &mut self,
-        schema_name: &str,
-        table_name: &str,
-    ) -> Result<(u64, Schema), ClientError> {
+    pub fn resolve_table_id(&mut self, schema_name: &str, table_name: &str) -> Result<(u64, Schema), ClientError> {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
-        })?;
+        let schema_batch =
+            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
-        let tbl_batch = tbl_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found"))
-        })?;
+        let tbl_batch = tbl_batch
+            .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
         let record = find_table_record(&tbl_batch, schema_id, table_name)?;
 
         let (_, col_batch, _) = self.conn.scan(COL_TAB, &mut self.schema_cache)?;
-        let col_batch = col_batch.ok_or_else(|| {
-            ClientError::ServerError("COL_TAB is empty".to_string())
-        })?;
+        let col_batch = col_batch.ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
 
         let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-        Ok((record.tid, Schema { columns, pk_cols: decode_pk_cols(record.pk_col_idx)? }))
+        Ok((
+            record.tid,
+            Schema {
+                columns,
+                pk_cols: decode_pk_cols(record.pk_col_idx)?,
+            },
+        ))
     }
 
-    pub fn resolve_table_or_view_id(
-        &mut self,
-        schema_name: &str,
-        name: &str,
-    ) -> Result<(u64, Schema), ClientError> {
+    pub fn resolve_table_or_view_id(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema), ClientError> {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch = schema_batch.ok_or_else(|| {
-            ClientError::ServerError(format!("Schema '{schema_name}' not found"))
-        })?;
+        let schema_batch =
+            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
         // Scan COL_TAB once — shared by both the table and view branches below
         let (_, col_batch, _) = self.conn.scan(COL_TAB, &mut self.schema_cache)?;
-        let col_batch = col_batch.ok_or_else(|| {
-            ClientError::ServerError("COL_TAB is empty".to_string())
-        })?;
+        let col_batch = col_batch.ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
 
         // Try TABLE_TAB first (most common path)
         let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         if let Some(ref tbl_batch) = tbl_batch {
             if let Ok(record) = find_table_record(tbl_batch, schema_id, name) {
                 let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-                return Ok((record.tid, Schema { columns, pk_cols: decode_pk_cols(record.pk_col_idx)? }));
+                return Ok((
+                    record.tid,
+                    Schema {
+                        columns,
+                        pk_cols: decode_pk_cols(record.pk_col_idx)?,
+                    },
+                ));
             }
         }
 
         // Fall back to VIEW_TAB
         let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
-        let view_batch = view_batch.ok_or_else(|| {
-            ClientError::ServerError(
-                format!("Table or view '{schema_name}.{name}' not found")
-            )
-        })?;
+        let view_batch = view_batch
+            .ok_or_else(|| ClientError::ServerError(format!("Table or view '{schema_name}.{name}' not found")))?;
         let record = find_view_record(&view_batch, schema_id, name)?;
         let columns = extract_col_entries(&col_batch, record.vid, OWNER_KIND_VIEW)?;
         // The view PK is the persisted leading-k column list: a single synthetic
         // hash column for join/set-op/distinct views, or the source PK passed
         // through (0..k) for a plain projection over a compound-PK table.
-        Ok((record.vid, Schema { columns, pk_cols: decode_pk_cols(record.pk_col_idx)? }))
+        Ok((
+            record.vid,
+            Schema {
+                columns,
+                pk_cols: decode_pk_cols(record.pk_col_idx)?,
+            },
+        ))
     }
 
     /// True iff base table `tid` is REPLICATED (decoded from `TABLE_TAB.flags`).
@@ -948,9 +982,13 @@ impl GnitzClient {
     /// N-fold-multiply the aggregate — see the replicated-tables design).
     pub fn table_replicated(&mut self, tid: u64) -> Result<bool, ClientError> {
         let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
-        let Some(tbl_batch) = tbl_batch else { return Ok(false); };
+        let Some(tbl_batch) = tbl_batch else {
+            return Ok(false);
+        };
         for i in tbl_batch.live_rows() {
-            if tbl_batch.pks.get(i) as u64 != tid { continue; }
+            if tbl_batch.pks.get(i) as u64 != tid {
+                continue;
+            }
             return Ok(gnitz_wire::table_flags_replicated(col_u64(&tbl_batch.columns[6], i)?));
         }
         Ok(false)
@@ -959,30 +997,35 @@ impl GnitzClient {
     // --- Private helpers (delegating to module-level functions) ---
 }
 
-fn extract_col_entries(
-    col_batch:  &ZSetBatch,
-    owner_id:   u64,
-    owner_kind: u64,
-) -> Result<Vec<ColumnDef>, ClientError> {
+fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) -> Result<Vec<ColumnDef>, ClientError> {
     let mut col_entries: Vec<(u64, String, TypeCode, bool, u64, u64)> = Vec::new();
     for i in col_batch.live_rows() {
-        let row_owner_id   = col_u64(&col_batch.columns[1], i)?;
+        let row_owner_id = col_u64(&col_batch.columns[1], i)?;
         let row_owner_kind = col_u64(&col_batch.columns[2], i)?;
-        if row_owner_id != owner_id || row_owner_kind != owner_kind { continue; }
+        if row_owner_id != owner_id || row_owner_kind != owner_kind {
+            continue;
+        }
 
-        let col_idx     = col_u64(&col_batch.columns[3], i)?;
-        let name        = col_str(&col_batch.columns[4], i)?.unwrap_or("").to_string();
-        let tc_val      = col_u64(&col_batch.columns[5], i)?;
-        let type_code   = type_code_from_u64(tc_val).map_err(ClientError::Protocol)?;
+        let col_idx = col_u64(&col_batch.columns[3], i)?;
+        let name = col_str(&col_batch.columns[4], i)?.unwrap_or("").to_string();
+        let tc_val = col_u64(&col_batch.columns[5], i)?;
+        let type_code = type_code_from_u64(tc_val).map_err(ClientError::Protocol)?;
         let is_nullable = col_u64(&col_batch.columns[6], i)? != 0;
         let fk_table_id = col_u64(&col_batch.columns[7], i)?;
-        let fk_col_idx  = col_u64(&col_batch.columns[8], i)?;
+        let fk_col_idx = col_u64(&col_batch.columns[8], i)?;
         col_entries.push((col_idx, name, type_code, is_nullable, fk_table_id, fk_col_idx));
     }
     col_entries.sort_by_key(|e| e.0);
-    Ok(col_entries.into_iter().map(|(_, name, type_code, is_nullable, fk_table_id, fk_col_idx)| {
-        ColumnDef { name, type_code, is_nullable, fk_table_id, fk_col_idx }
-    }).collect())
+    Ok(col_entries
+        .into_iter()
+        .map(|(_, name, type_code, is_nullable, fk_table_id, fk_col_idx)| ColumnDef {
+            name,
+            type_code,
+            is_nullable,
+            fk_table_id,
+            fk_col_idx,
+        })
+        .collect())
 }
 
 fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
@@ -994,43 +1037,43 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
     Err(ClientError::ServerError(format!("Schema '{name}' not found")))
 }
 
-fn find_table_record(
-    batch: &ZSetBatch,
-    schema_id: u64,
-    table_name: &str,
-) -> Result<TableRecord, ClientError> {
+fn find_table_record(batch: &ZSetBatch, schema_id: u64, table_name: &str) -> Result<TableRecord, ClientError> {
     for i in batch.live_rows() {
-        if col_u64(&batch.columns[1], i)? != schema_id { continue; }
-        if col_str(&batch.columns[2], i)? != Some(table_name) { continue; }
+        if col_u64(&batch.columns[1], i)? != schema_id {
+            continue;
+        }
+        if col_str(&batch.columns[2], i)? != Some(table_name) {
+            continue;
+        }
         return Ok(TableRecord {
-            tid:         batch.pks.get(i) as u64,
+            tid: batch.pks.get(i) as u64,
             schema_id,
-            name:        table_name.to_string(),
-            directory:   col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
-            pk_col_idx:  col_u64(&batch.columns[4], i)?,
+            name: table_name.to_string(),
+            directory: col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
+            pk_col_idx: col_u64(&batch.columns[4], i)?,
             created_lsn: col_u64(&batch.columns[5], i)?,
-            flags:       col_u64(&batch.columns[6], i)?,
+            flags: col_u64(&batch.columns[6], i)?,
         });
     }
     Err(ClientError::ServerError(format!("Table '{table_name}' not found")))
 }
 
-fn find_view_record(
-    batch: &ZSetBatch,
-    schema_id: u64,
-    view_name: &str,
-) -> Result<ViewRecord, ClientError> {
+fn find_view_record(batch: &ZSetBatch, schema_id: u64, view_name: &str) -> Result<ViewRecord, ClientError> {
     for i in batch.live_rows() {
-        if col_u64(&batch.columns[1], i)? != schema_id { continue; }
-        if col_str(&batch.columns[2], i)? != Some(view_name) { continue; }
+        if col_u64(&batch.columns[1], i)? != schema_id {
+            continue;
+        }
+        if col_str(&batch.columns[2], i)? != Some(view_name) {
+            continue;
+        }
         return Ok(ViewRecord {
-            vid:             batch.pks.get(i) as u64,
+            vid: batch.pks.get(i) as u64,
             schema_id,
-            name:            view_name.to_string(),
-            sql_definition:  col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
+            name: view_name.to_string(),
+            sql_definition: col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
             cache_directory: col_str(&batch.columns[4], i)?.unwrap_or("").to_string(),
-            created_lsn:     col_u64(&batch.columns[5], i)?,
-            pk_col_idx:      col_u64(&batch.columns[6], i)?,
+            created_lsn: col_u64(&batch.columns[5], i)?,
+            pk_col_idx: col_u64(&batch.columns[6], i)?,
         });
     }
     Err(ClientError::ServerError(format!("View '{view_name}' not found")))
@@ -1041,13 +1084,12 @@ fn find_view_record(
 /// and the entity name at column 2, so this mirrors `find_table_record` /
 /// `find_view_record`'s scan minus the name filter — keeping the whole set rather
 /// than one row. Drives the `drop_schema` member cascade.
-fn collect_schema_member_names(
-    batch: &ZSetBatch,
-    schema_id: u64,
-) -> Result<Vec<String>, ClientError> {
+fn collect_schema_member_names(batch: &ZSetBatch, schema_id: u64) -> Result<Vec<String>, ClientError> {
     let mut out = Vec::new();
     for i in batch.live_rows() {
-        if col_u64(&batch.columns[1], i)? != schema_id { continue; }
+        if col_u64(&batch.columns[1], i)? != schema_id {
+            continue;
+        }
         if let Some(name) = col_str(&batch.columns[2], i)? {
             out.push(name.to_string());
         }
@@ -1083,7 +1125,12 @@ impl GnitzClient {
     }
 
     fn push_view_record(
-        &mut self, vid: u64, schema_id: u64, view_name: &str, sql_text: &str, pk_packed: u64,
+        &mut self,
+        vid: u64,
+        schema_id: u64,
+        view_name: &str,
+        sql_text: &str,
+        pk_packed: u64,
     ) -> Result<(), ClientError> {
         let view_s = view_tab_schema();
         let mut vb = ZSetBatch::new(view_s);
@@ -1133,8 +1180,14 @@ mod tests {
             assert!(validate_index_col_type(tc).is_err(), "{tc:?} must be rejected");
         }
         // Integer scalars (+ U128/UUID) remain index-eligible.
-        for tc in [TypeCode::U64, TypeCode::I64, TypeCode::U32, TypeCode::I8,
-                   TypeCode::U128, TypeCode::UUID] {
+        for tc in [
+            TypeCode::U64,
+            TypeCode::I64,
+            TypeCode::U32,
+            TypeCode::I8,
+            TypeCode::U128,
+            TypeCode::UUID,
+        ] {
             assert!(validate_index_col_type(tc).is_ok(), "{tc:?} must be accepted");
         }
     }
@@ -1160,12 +1213,12 @@ mod tests {
         // the client must surface it as an error instead of silently truncating.
         let bad_count = gnitz_wire::PK_LIST_MAX_COLS + 1;
         let bad = gnitz_wire::PK_LIST_PACKED_FLAG | bad_count as u64;
-        let err = decode_pk_cols(bad)
-            .expect_err(&format!("expected error on count={bad_count}"));
+        let err = decode_pk_cols(bad).expect_err(&format!("expected error on count={bad_count}"));
         match err {
             ClientError::ServerError(s) => assert!(
                 s.contains(&bad_count.to_string()),
-                "expected '{bad_count}' in message, got: {s}"),
+                "expected '{bad_count}' in message, got: {s}"
+            ),
             other => panic!("expected ServerError, got {other:?}"),
         }
     }

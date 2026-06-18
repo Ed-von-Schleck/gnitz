@@ -1,28 +1,30 @@
 use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
 
+use super::codec::{batch_to_schema, schema_to_batch};
 use super::error::ProtocolError;
-use super::header::{Header, STATUS_ERROR, STATUS_OK, STATUS_SCHEMA_MISMATCH, STATUS_NO_INDEX,
-    FLAG_HAS_SCHEMA, FLAG_HAS_DATA, wire_flags_get_schema_version};
-use super::types::{ColData, PkColumn, PkTuple, Schema, ZSetBatch, meta_schema};
-use crate::types::schema_from_wire_cols;
-use super::codec::{schema_to_batch, batch_to_schema};
+use super::header::{
+    wire_flags_get_schema_version, Header, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK,
+    STATUS_SCHEMA_MISMATCH,
+};
 use super::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
-use super::wal_block::{encode_wal_block, decode_wal_block, VerifyChecksum};
-use super::transport::{send_framed, recv_framed};
+use super::transport::{recv_framed, send_framed};
+use super::types::{meta_schema, ColData, PkColumn, PkTuple, Schema, ZSetBatch};
+use super::wal_block::{decode_wal_block, encode_wal_block, VerifyChecksum};
+use crate::types::schema_from_wire_cols;
 
 pub struct Message {
-    pub status:       u32,
-    pub target_id:    u64,
-    pub client_id:    u64,
-    pub flags:        u64,
-    pub seek_pk:      u128,
+    pub status: u32,
+    pub target_id: u64,
+    pub client_id: u64,
+    pub flags: u64,
+    pub seek_pk: u128,
     pub seek_col_idx: u64,
-    pub request_id:   u64,
-    pub schema:       Option<Schema>,     // derived from schema_batch or hint (avoids re-deriving)
-    pub schema_batch: Option<ZSetBatch>,  // Some only when schema block was physically in frame
-    pub data_batch:   Option<ZSetBatch>,
-    pub error_text:   Option<String>,     // Some(_) when status == STATUS_ERROR
+    pub request_id: u64,
+    pub schema: Option<Schema>, // derived from schema_batch or hint (avoids re-deriving)
+    pub schema_batch: Option<ZSetBatch>, // Some only when schema block was physically in frame
+    pub data_batch: Option<ZSetBatch>,
+    pub error_text: Option<String>, // Some(_) when status == STATUS_ERROR
 }
 
 // ── CONTROL_SCHEMA ────────────────────────────────────────────────────────────
@@ -34,50 +36,52 @@ pub struct Message {
 
 fn control_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
-    INSTANCE.get_or_init(|| {
-        schema_from_wire_cols(gnitz_wire::control::CONTROL_COLS, &[gnitz_wire::control::COL_MSG_IDX])
-    })
+    INSTANCE
+        .get_or_init(|| schema_from_wire_cols(gnitz_wire::control::CONTROL_COLS, &[gnitz_wire::control::COL_MSG_IDX]))
 }
 
 /// Encode a `Header` + optional error message + optional wide-PK extra bytes
 /// into a control WAL block. When `error_msg` is empty the error_msg column
 /// is NULL; when `seek_pk_extra` is empty the seek_pk_extra column is NULL
 /// (byte-identical to today's frame).
-pub fn encode_control_block(
-    header:        &Header,
-    error_msg:     &str,
-    seek_pk_extra: &[u8],
-) -> Result<Vec<u8>, ProtocolError> {
+pub fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u8]) -> Result<Vec<u8>, ProtocolError> {
     use gnitz_wire::control as ctrl;
     let cs = control_schema();
 
     let has_error = !error_msg.is_empty();
     let has_seek_extra = !seek_pk_extra.is_empty();
-    let nulls_val: u64 =
-          (if has_error      { 0 } else { ctrl::NULL_BIT_ERROR_MSG })
-        | (if has_seek_extra { 0 } else { ctrl::NULL_BIT_SEEK_PK_EXTRA });
+    let nulls_val: u64 = (if has_error { 0 } else { ctrl::NULL_BIT_ERROR_MSG })
+        | (if has_seek_extra {
+            0
+        } else {
+            ctrl::NULL_BIT_SEEK_PK_EXTRA
+        });
 
     let mut columns: [Option<ColData>; ctrl::NUM_COLUMNS] = std::array::from_fn(|_| None);
-    columns[ctrl::COL_MSG_IDX]      = Some(ColData::Fixed(vec![]));
-    columns[ctrl::COL_STATUS]       = Some(ColData::Fixed((header.status as u64).to_le_bytes().to_vec()));
-    columns[ctrl::COL_CLIENT_ID]    = Some(ColData::Fixed(header.client_id.to_le_bytes().to_vec()));
-    columns[ctrl::COL_TARGET_ID]    = Some(ColData::Fixed(header.target_id.to_le_bytes().to_vec()));
-    columns[ctrl::COL_FLAGS]        = Some(ColData::Fixed(header.flags.to_le_bytes().to_vec()));
-    columns[ctrl::COL_SEEK_PK]      = Some(ColData::U128s(vec![header.seek_pk]));
+    columns[ctrl::COL_MSG_IDX] = Some(ColData::Fixed(vec![]));
+    columns[ctrl::COL_STATUS] = Some(ColData::Fixed((header.status as u64).to_le_bytes().to_vec()));
+    columns[ctrl::COL_CLIENT_ID] = Some(ColData::Fixed(header.client_id.to_le_bytes().to_vec()));
+    columns[ctrl::COL_TARGET_ID] = Some(ColData::Fixed(header.target_id.to_le_bytes().to_vec()));
+    columns[ctrl::COL_FLAGS] = Some(ColData::Fixed(header.flags.to_le_bytes().to_vec()));
+    columns[ctrl::COL_SEEK_PK] = Some(ColData::U128s(vec![header.seek_pk]));
     columns[ctrl::COL_SEEK_COL_IDX] = Some(ColData::Fixed(header.seek_col_idx.to_le_bytes().to_vec()));
-    columns[ctrl::COL_REQUEST_ID]   = Some(ColData::Fixed(header.request_id.to_le_bytes().to_vec()));
-    columns[ctrl::COL_ERROR_MSG]    = Some(ColData::Strings(vec![
-        if has_error { Some(error_msg.to_string()) } else { None }
-    ]));
-    columns[ctrl::COL_SEEK_PK_EXTRA] = Some(ColData::Bytes(vec![
-        if has_seek_extra { Some(seek_pk_extra.to_vec()) } else { None }
-    ]));
+    columns[ctrl::COL_REQUEST_ID] = Some(ColData::Fixed(header.request_id.to_le_bytes().to_vec()));
+    columns[ctrl::COL_ERROR_MSG] = Some(ColData::Strings(vec![if has_error {
+        Some(error_msg.to_string())
+    } else {
+        None
+    }]));
+    columns[ctrl::COL_SEEK_PK_EXTRA] = Some(ColData::Bytes(vec![if has_seek_extra {
+        Some(seek_pk_extra.to_vec())
+    } else {
+        None
+    }]));
     let columns: Vec<ColData> = columns.into_iter().map(|c| c.unwrap()).collect();
 
     let batch = ZSetBatch {
-        pks:     PkColumn::U64s(vec![0u64]),
+        pks: PkColumn::U64s(vec![0u64]),
         weights: vec![1i64],
-        nulls:   vec![nulls_val],
+        nulls: vec![nulls_val],
         columns,
     };
 
@@ -99,17 +103,18 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
     }
     if batch.len() != 1 {
         return Err(ProtocolError::DecodeError(format!(
-            "control block must have 1 row, got {}", batch.len()
+            "control block must have 1 row, got {}",
+            batch.len()
         )));
     }
 
     fn read_u64_col(batch: &ZSetBatch, ci: usize) -> Result<u64, ProtocolError> {
         match &batch.columns[ci] {
-            ColData::Fixed(v) if v.len() == 8 => {
-                Ok(u64::from_le_bytes(v[0..8].try_into().unwrap()))
-            }
+            ColData::Fixed(v) if v.len() == 8 => Ok(u64::from_le_bytes(v[0..8].try_into().unwrap())),
             ColData::Fixed(v) => Err(ProtocolError::DecodeError(format!(
-                "control block col {} Fixed len {} != 8", ci, v.len()
+                "control block col {} Fixed len {} != 8",
+                ci,
+                v.len()
             ))),
             _ => Err(ProtocolError::DecodeError(format!(
                 "control block col {ci} is not Fixed"
@@ -121,7 +126,9 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
         match &batch.columns[ci] {
             ColData::U128s(v) if v.len() == 1 => Ok(v[0]),
             ColData::U128s(v) => Err(ProtocolError::DecodeError(format!(
-                "control block col {} U128s len {} != 1", ci, v.len()
+                "control block col {} U128s len {} != 1",
+                ci,
+                v.len()
             ))),
             _ => Err(ProtocolError::DecodeError(format!(
                 "control block col {ci} is not U128s"
@@ -129,13 +136,13 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
         }
     }
 
-    let status       = read_u64_col(&batch, ctrl::COL_STATUS)? as u32;
-    let client_id    = read_u64_col(&batch, ctrl::COL_CLIENT_ID)?;
-    let target_id    = read_u64_col(&batch, ctrl::COL_TARGET_ID)?;
-    let flags        = read_u64_col(&batch, ctrl::COL_FLAGS)?;
-    let seek_pk      = read_u128_col(&batch, ctrl::COL_SEEK_PK)?;
+    let status = read_u64_col(&batch, ctrl::COL_STATUS)? as u32;
+    let client_id = read_u64_col(&batch, ctrl::COL_CLIENT_ID)?;
+    let target_id = read_u64_col(&batch, ctrl::COL_TARGET_ID)?;
+    let flags = read_u64_col(&batch, ctrl::COL_FLAGS)?;
+    let seek_pk = read_u128_col(&batch, ctrl::COL_SEEK_PK)?;
     let seek_col_idx = read_u64_col(&batch, ctrl::COL_SEEK_COL_IDX)?;
-    let request_id   = read_u64_col(&batch, ctrl::COL_REQUEST_ID)?;
+    let request_id = read_u64_col(&batch, ctrl::COL_REQUEST_ID)?;
 
     let is_null = (batch.nulls[0] & ctrl::NULL_BIT_ERROR_MSG) != 0;
     let error_msg = if is_null {
@@ -146,9 +153,11 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
                 Some(Some(s)) => s.clone(),
                 _ => String::new(),
             },
-            _ => return Err(ProtocolError::DecodeError(
-                "control block error_msg column is not Strings".into()
-            )),
+            _ => {
+                return Err(ProtocolError::DecodeError(
+                    "control block error_msg column is not Strings".into(),
+                ))
+            }
         }
     };
 
@@ -158,15 +167,22 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
     } else {
         match &batch.columns[ctrl::COL_SEEK_PK_EXTRA] {
             ColData::Bytes(v) => v.first().cloned().flatten().unwrap_or_default(),
-            _ => return Err(ProtocolError::DecodeError(
-                "control block seek_pk_extra column is not Bytes".into()
-            )),
+            _ => {
+                return Err(ProtocolError::DecodeError(
+                    "control block seek_pk_extra column is not Bytes".into(),
+                ))
+            }
         }
     };
 
     let header = Header {
-        status, target_id, client_id, flags,
-        seek_pk, seek_col_idx, request_id,
+        status,
+        target_id,
+        client_id,
+        flags,
+        seek_pk,
+        seek_col_idx,
+        request_id,
     };
     Ok((header, error_msg, seek_pk_extra))
 }
@@ -181,25 +197,33 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
 /// `PkTuple::split_wire`, so callers never handle it.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_message(
-    target_id:    u64,
-    client_id:    u64,
-    flags:        u64,
-    seek_pk:      &PkTuple,
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    seek_pk: &PkTuple,
     seek_col_idx: u64,
-    schema:       Option<&Schema>,
-    data_batch:   Option<&ZSetBatch>,
+    schema: Option<&Schema>,
+    data_batch: Option<&ZSetBatch>,
 ) -> Result<Vec<u8>, ProtocolError> {
-    let has_data   = data_batch.map(|b| !b.is_empty()).unwrap_or(false);
+    let has_data = data_batch.map(|b| !b.is_empty()).unwrap_or(false);
     let has_schema = schema.is_some();
 
     let mut flags_out = flags;
-    if has_schema { flags_out |= FLAG_HAS_SCHEMA; }
-    if has_data   { flags_out |= FLAG_HAS_DATA;   }
+    if has_schema {
+        flags_out |= FLAG_HAS_SCHEMA;
+    }
+    if has_data {
+        flags_out |= FLAG_HAS_DATA;
+    }
 
     let (seek_pk_lo, seek_pk_extra) = seek_pk.split_wire();
     let ctrl_hdr = Header {
-        status: STATUS_OK, target_id, client_id, flags: flags_out,
-        seek_pk: seek_pk_lo, seek_col_idx,
+        status: STATUS_OK,
+        target_id,
+        client_id,
+        flags: flags_out,
+        seek_pk: seek_pk_lo,
+        seek_col_idx,
         request_id: 0,
     };
     let ctrl_block = encode_control_block(&ctrl_hdr, "", seek_pk_extra)?;
@@ -211,33 +235,33 @@ pub fn encode_message(
         None
     };
     let data_block = if has_data {
-        Some(encode_wal_block(
-            schema.unwrap(), target_id as u32, data_batch.unwrap()
-        ))
+        Some(encode_wal_block(schema.unwrap(), target_id as u32, data_batch.unwrap()))
     } else {
         None
     };
 
     let mut out = ctrl_block;
-    if let Some(sb) = schema_block { out.extend_from_slice(&sb); }
-    if let Some(db) = data_block { out.extend_from_slice(&db); }
+    if let Some(sb) = schema_block {
+        out.extend_from_slice(&sb);
+    }
+    if let Some(db) = data_block {
+        out.extend_from_slice(&db);
+    }
     Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn send_message(
-    sock_fd:      RawFd,
-    target_id:    u64,
-    client_id:    u64,
-    flags:        u64,
-    seek_pk:      &PkTuple,
+    sock_fd: RawFd,
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    seek_pk: &PkTuple,
     seek_col_idx: u64,
-    schema:       Option<&Schema>,
-    data_batch:   Option<&ZSetBatch>,
+    schema: Option<&Schema>,
+    data_batch: Option<&ZSetBatch>,
 ) -> Result<(), ProtocolError> {
-    let payload = encode_message(
-        target_id, client_id, flags, seek_pk, seek_col_idx, schema, data_batch,
-    )?;
+    let payload = encode_message(target_id, client_id, flags, seek_pk, seek_col_idx, schema, data_batch)?;
     send_framed(sock_fd, &payload)
 }
 
@@ -250,16 +274,20 @@ pub fn send_message(
 /// `encode_control_block`, whose BLOB column is already arbitrary-length.
 /// `seek_pk` is fixed at 0 (unused by the range seek). No schema/data block.
 pub fn send_message_with_extra(
-    sock_fd:       RawFd,
-    target_id:     u64,
-    client_id:     u64,
-    flags:         u64,
-    seek_col_idx:  u64,
+    sock_fd: RawFd,
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    seek_col_idx: u64,
     seek_pk_extra: &[u8],
 ) -> Result<(), ProtocolError> {
     let ctrl_hdr = Header {
-        status: STATUS_OK, target_id, client_id, flags,
-        seek_pk: 0, seek_col_idx,
+        status: STATUS_OK,
+        target_id,
+        client_id,
+        flags,
+        seek_pk: 0,
+        seek_col_idx,
         request_id: 0,
     };
     let payload = encode_control_block(&ctrl_hdr, "", seek_pk_extra)?;
@@ -272,19 +300,26 @@ pub fn send_message_with_extra(
 /// `flags`). Used by warm-cache PUSH paths where the server already knows the
 /// schema (version embedded in `flags` bits 24-39).
 pub fn send_message_noschema(
-    sock_fd:      RawFd,
-    target_id:    u64,
-    client_id:    u64,
-    flags:        u64,
-    data_schema:  &Schema,
-    data_batch:   &ZSetBatch,
+    sock_fd: RawFd,
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+    data_schema: &Schema,
+    data_batch: &ZSetBatch,
 ) -> Result<(), ProtocolError> {
     let has_data = !data_batch.is_empty();
     let mut flags_out = flags;
-    if has_data { flags_out |= FLAG_HAS_DATA; }
+    if has_data {
+        flags_out |= FLAG_HAS_DATA;
+    }
     let ctrl_hdr = Header {
-        status: STATUS_OK, target_id, client_id, flags: flags_out,
-        seek_pk: 0, seek_col_idx: 0, request_id: 0,
+        status: STATUS_OK,
+        target_id,
+        client_id,
+        flags: flags_out,
+        seek_pk: 0,
+        seek_col_idx: 0,
+        request_id: 0,
     };
     let ctrl_block = encode_control_block(&ctrl_hdr, "", &[])?;
     let data_block = if has_data {
@@ -293,7 +328,9 @@ pub fn send_message_noschema(
         None
     };
     let mut out = ctrl_block;
-    if let Some(db) = data_block { out.extend_from_slice(&db); }
+    if let Some(db) = data_block {
+        out.extend_from_slice(&db);
+    }
     send_framed(sock_fd, &out)
 }
 
@@ -317,12 +354,12 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
 
     let (ctrl_header, error_msg, _seek_pk_extra) = decode_control_block(&buf[..ctrl_size])?;
 
-    let flags      = ctrl_header.flags;
+    let flags = ctrl_header.flags;
     let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
-    let has_data   = (flags & FLAG_HAS_DATA)   != 0;
+    let has_data = (flags & FLAG_HAS_DATA) != 0;
 
     let mut off = ctrl_size;
-    let mut wire_schema: Option<Schema>     = None;
+    let mut wire_schema: Option<Schema> = None;
     let mut schema_batch: Option<ZSetBatch> = None;
 
     if has_schema {
@@ -335,14 +372,16 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         }
         let ms = meta_schema();
         let (sbatch, _, _) = decode_wal_block(&buf[off..off + sz], ms, VerifyChecksum::No)?;
-        wire_schema  = Some(batch_to_schema(&sbatch)?);
+        wire_schema = Some(batch_to_schema(&sbatch)?);
         schema_batch = Some(sbatch);
         off += sz;
     } else if has_data {
         match schema_hint {
-            None => return Err(ProtocolError::DecodeError(
-                "FLAG_HAS_DATA without FLAG_HAS_SCHEMA and no cached schema".into()
-            )),
+            None => {
+                return Err(ProtocolError::DecodeError(
+                    "FLAG_HAS_DATA without FLAG_HAS_SCHEMA and no cached schema".into(),
+                ))
+            }
             Some((_hint_schema, cached_version)) => {
                 let server_version = wire_flags_get_schema_version(flags);
                 if server_version != cached_version {
@@ -358,9 +397,9 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
     let data_batch = if has_data {
         let eff: &Schema = match wire_schema.as_ref() {
             Some(s) => s,
-            None => schema_hint.map(|(s, _)| s).ok_or_else(|| {
-                ProtocolError::DecodeError("no schema for data block".into())
-            })?,
+            None => schema_hint
+                .map(|(s, _)| s)
+                .ok_or_else(|| ProtocolError::DecodeError("no schema for data block".into()))?,
         };
         if off + WAL_BLOCK_HEADER_SIZE > buf.len() {
             return Err(ProtocolError::DecodeError("data block header truncated".into()));
@@ -377,8 +416,7 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
 
     let (schema, schema_batch, data_batch, error_text) = if ctrl_header.status == STATUS_ERROR {
         (None, None, None, Some(error_msg))
-    } else if ctrl_header.status == STATUS_SCHEMA_MISMATCH
-           || ctrl_header.status == STATUS_NO_INDEX {
+    } else if ctrl_header.status == STATUS_SCHEMA_MISMATCH || ctrl_header.status == STATUS_NO_INDEX {
         // Control-only frame: no schema, no data, no error text.
         (None, None, None, None)
     } else {
@@ -386,13 +424,13 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
     };
 
     Ok(Message {
-        status:       ctrl_header.status,
-        target_id:    ctrl_header.target_id,
-        client_id:    ctrl_header.client_id,
-        flags:        ctrl_header.flags,
-        seek_pk:      ctrl_header.seek_pk,
+        status: ctrl_header.status,
+        target_id: ctrl_header.target_id,
+        client_id: ctrl_header.client_id,
+        flags: ctrl_header.flags,
+        seek_pk: ctrl_header.seek_pk,
         seek_col_idx: ctrl_header.seek_col_idx,
-        request_id:   ctrl_header.request_id,
+        request_id: ctrl_header.request_id,
         schema,
         schema_batch,
         data_batch,
@@ -401,8 +439,8 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
 }
 
 pub fn recv_message(
-    sock_fd:         RawFd,
-    schema_hint:     Option<(&Schema, u16)>,
+    sock_fd: RawFd,
+    schema_hint: Option<(&Schema, u16)>,
     max_payload_len: usize,
 ) -> Result<Message, ProtocolError> {
     let buf = recv_framed(sock_fd, max_payload_len)?;
@@ -412,14 +450,16 @@ pub fn recv_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::io::RawFd;
-    use crate::protocol::types::{ColData, PkColumn, ColumnDef, PkTuple, Schema, TypeCode, ZSetBatch};
-    use crate::protocol::header::{Header, FLAG_PUSH, FLAG_SEEK, STATUS_ERROR};
     use crate::protocol::header::wire_flags_set_schema_version;
+    use crate::protocol::header::{Header, FLAG_PUSH, FLAG_SEEK, STATUS_ERROR};
+    use crate::protocol::types::{ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, ZSetBatch};
+    use std::os::unix::io::RawFd;
 
     fn make_socketpair() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];
-        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()); }
+        unsafe {
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
+        }
         (fds[0], fds[1])
     }
 
@@ -428,11 +468,11 @@ mod tests {
     #[test]
     fn test_message_control_schema_roundtrip() {
         let h = Header {
-            status:     0,
-            target_id:  0x1234_5678_9ABC_DEF0,
-            client_id:  0xDEAD_BEEF_0000_0001,
-            flags:      FLAG_PUSH | FLAG_HAS_SCHEMA,
-            seek_pk:    42u128 | (99u128 << 64),
+            status: 0,
+            target_id: 0x1234_5678_9ABC_DEF0,
+            client_id: 0xDEAD_BEEF_0000_0001,
+            flags: FLAG_PUSH | FLAG_HAS_SCHEMA,
+            seek_pk: 42u128 | (99u128 << 64),
             seek_col_idx: 7,
             request_id: 0xCAFE_BABE_DEAD_F00D,
         };
@@ -440,11 +480,11 @@ mod tests {
         let encoded = encode_control_block(&h, "test error", &[]).unwrap();
         let (decoded, err, _) = decode_control_block(&encoded).unwrap();
 
-        assert_eq!(decoded.status,     h.status);
-        assert_eq!(decoded.target_id,  h.target_id);
-        assert_eq!(decoded.client_id,  h.client_id);
-        assert_eq!(decoded.flags,      h.flags);
-        assert_eq!(decoded.seek_pk,    h.seek_pk);
+        assert_eq!(decoded.status, h.status);
+        assert_eq!(decoded.target_id, h.target_id);
+        assert_eq!(decoded.client_id, h.client_id);
+        assert_eq!(decoded.flags, h.flags);
+        assert_eq!(decoded.seek_pk, h.seek_pk);
         assert_eq!(decoded.seek_col_idx, h.seek_col_idx);
         assert_eq!(decoded.request_id, h.request_id);
         assert_eq!(err, "test error");
@@ -483,7 +523,10 @@ mod tests {
     #[test]
     fn test_request_id_roundtrip_reserved_values() {
         for &req_id in &[0u64, u64::MAX, 0x1234_5678_DEAD_BEEFu64] {
-            let h = Header { request_id: req_id, ..Header::default() };
+            let h = Header {
+                request_id: req_id,
+                ..Header::default()
+            };
             let encoded = encode_control_block(&h, "", &[]).unwrap();
             let (decoded, _, _) = decode_control_block(&encoded).unwrap();
             assert_eq!(decoded.request_id, req_id);
@@ -497,46 +540,93 @@ mod tests {
         // Empty batch → FLAG_HAS_SCHEMA but not FLAG_HAS_DATA
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "val".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
 
         let empty_batch = ZSetBatch::new(&schema);
         let (a, b) = make_socketpair();
-        send_message(a, 0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some(&schema), Some(&empty_batch)).unwrap();
+        send_message(
+            a,
+            0,
+            0,
+            FLAG_PUSH,
+            &PkTuple::EMPTY,
+            0,
+            Some(&schema),
+            Some(&empty_batch),
+        )
+        .unwrap();
         let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         // Schema was sent, data was not (empty batch)
         assert!(msg.schema_batch.is_some());
         assert!(msg.data_batch.is_none());
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
     fn test_message_roundtrip_data() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "i64".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "f64".into(), type_code: TypeCode::F64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "i64".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "f64".into(),
+                    type_code: TypeCode::F64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
 
         let n = 100usize;
-        let pks: Vec<u128>    = (0..n as u128).collect();
+        let pks: Vec<u128> = (0..n as u128).collect();
         let weights: Vec<i64> = vec![1; n];
-        let nulls: Vec<u64>   = vec![0; n];
+        let nulls: Vec<u64> = vec![0; n];
 
         let i64_vals: Vec<i64> = (0..n as i64).map(|x| x * -7).collect();
         let f64_vals: Vec<f64> = (0..n).map(|x| x as f64 * 1.5).collect();
 
         let mut i64_bytes = Vec::with_capacity(n * 8);
-        for &v in &i64_vals { i64_bytes.extend_from_slice(&v.to_le_bytes()); }
+        for &v in &i64_vals {
+            i64_bytes.extend_from_slice(&v.to_le_bytes());
+        }
         let mut f64_bytes = Vec::with_capacity(n * 8);
-        for &v in &f64_vals { f64_bytes.extend_from_slice(&v.to_le_bytes()); }
+        for &v in &f64_vals {
+            f64_bytes.extend_from_slice(&v.to_le_bytes());
+        }
 
         let batch = ZSetBatch {
             pks: PkColumn::U64s(pks.iter().map(|&x| x as u64).collect()),
@@ -554,7 +644,7 @@ mod tests {
         let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
 
         let data = msg.data_batch.unwrap();
-        assert_eq!(data.pks,     pks);
+        assert_eq!(data.pks, pks);
         assert_eq!(data.weights, weights);
 
         match &data.columns[1] {
@@ -566,29 +656,56 @@ mod tests {
             _ => panic!("expected Fixed at col 2"),
         }
 
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
     fn test_message_roundtrip_strings() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "s1".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "s2".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "s1".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "s2".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
 
         let n = 50usize;
-        let pks: Vec<u128>    = (0..n as u128).collect();
+        let pks: Vec<u128> = (0..n as u128).collect();
         let weights: Vec<i64> = vec![1; n];
         // Every 3rd row: s1 is null → payload bit 0 set
-        let nulls: Vec<u64>   = (0..n).map(|i| if i % 3 == 0 { 1u64 } else { 0u64 }).collect();
+        let nulls: Vec<u64> = (0..n).map(|i| if i % 3 == 0 { 1u64 } else { 0u64 }).collect();
 
-        let col1: Vec<Option<String>> = (0..n).map(|i| {
-            if i % 3 == 0 { None } else { Some(format!("nullable_{i}")) }
-        }).collect();
+        let col1: Vec<Option<String>> = (0..n)
+            .map(|i| {
+                if i % 3 == 0 {
+                    None
+                } else {
+                    Some(format!("nullable_{i}"))
+                }
+            })
+            .collect();
         let col2: Vec<Option<String>> = (0..n).map(|i| Some(format!("nonnull_{i}"))).collect();
 
         let batch = ZSetBatch {
@@ -618,7 +735,10 @@ mod tests {
             _ => panic!("expected Strings at col 2"),
         }
 
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -629,7 +749,10 @@ mod tests {
         let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert!(msg.schema_batch.is_none());
         assert!(msg.data_batch.is_none());
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -641,33 +764,43 @@ mod tests {
         let (a, b) = make_socketpair();
         send_message(
             a,
-            0xDEAD_BEEF_1234_5678,  // target_id
-            0xCAFE_BABE_0000_0001,  // client_id
-            FLAG_PUSH,              // flags
+            0xDEAD_BEEF_1234_5678, // target_id
+            0xCAFE_BABE_0000_0001, // client_id
+            FLAG_PUSH,             // flags
             &PkTuple::from_u128_narrow(seek_pk),
-            7,                      // seek_col_idx
+            7, // seek_col_idx
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
-        assert_eq!(msg.target_id,    0xDEAD_BEEF_1234_5678);
-        assert_eq!(msg.client_id,    0xCAFE_BABE_0000_0001);
-        assert_eq!(msg.seek_pk,      seek_pk);
+        assert_eq!(msg.target_id, 0xDEAD_BEEF_1234_5678);
+        assert_eq!(msg.client_id, 0xCAFE_BABE_0000_0001);
+        assert_eq!(msg.seek_pk, seek_pk);
         assert_eq!(msg.seek_col_idx, 7);
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
     fn test_message_error_response() {
         // STATUS_ERROR response: schema and data should be None; error_text populated
         let (a, b) = make_socketpair();
-        let err_hdr = Header { status: STATUS_ERROR, ..Header::default() };
+        let err_hdr = Header {
+            status: STATUS_ERROR,
+            ..Header::default()
+        };
         let encoded = encode_control_block(&err_hdr, "something broke", &[]).unwrap();
         crate::protocol::transport::send_framed(a, &encoded).unwrap();
         let msg = recv_message(b, None, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT).unwrap();
         assert_eq!(msg.status, STATUS_ERROR);
         assert!(msg.error_text.is_some());
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     // ── encode_message + parse_response roundtrips (no sockets) ─────────
@@ -676,14 +809,19 @@ mod tests {
     fn test_encode_parse_control_only() {
         let seek_pk = 42u128 | (99u128 << 64);
         let payload = encode_message(
-            0xDEAD, 0xBEEF, FLAG_PUSH,
-            &PkTuple::from_u128_narrow(seek_pk), 7,
-            None, None,
-        ).unwrap();
+            0xDEAD,
+            0xBEEF,
+            FLAG_PUSH,
+            &PkTuple::from_u128_narrow(seek_pk),
+            7,
+            None,
+            None,
+        )
+        .unwrap();
         let msg = parse_response(&payload, None).unwrap();
-        assert_eq!(msg.target_id,    0xDEAD);
-        assert_eq!(msg.client_id,    0xBEEF);
-        assert_eq!(msg.seek_pk,      seek_pk);
+        assert_eq!(msg.target_id, 0xDEAD);
+        assert_eq!(msg.client_id, 0xBEEF);
+        assert_eq!(msg.seek_pk, seek_pk);
         assert_eq!(msg.seek_col_idx, 7);
         assert!(msg.schema.is_none());
         assert!(msg.data_batch.is_none());
@@ -693,8 +831,20 @@ mod tests {
     fn test_encode_parse_with_data() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "val".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -704,19 +854,13 @@ mod tests {
             val_bytes.extend_from_slice(&v.to_le_bytes());
         }
         let batch = ZSetBatch {
-            pks:     PkColumn::U64s(vec![1u64, 2u64, 3u64]),
+            pks: PkColumn::U64s(vec![1u64, 2u64, 3u64]),
             weights: vec![1, 1, 1],
-            nulls:   vec![0, 0, 0],
-            columns: vec![
-                ColData::Fixed(vec![]),
-                ColData::Fixed(val_bytes),
-            ],
+            nulls: vec![0, 0, 0],
+            columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],
         };
 
-        let payload = encode_message(
-            42, 1, 0, &PkTuple::EMPTY, 0,
-            Some(&schema), Some(&batch),
-        ).unwrap();
+        let payload = encode_message(42, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&batch)).unwrap();
         let msg = parse_response(&payload, None).unwrap();
         assert_eq!(msg.target_id, 42);
         assert!(msg.schema.is_some());
@@ -728,17 +872,18 @@ mod tests {
     #[test]
     fn test_encode_parse_empty_batch() {
         let schema = Schema {
-            columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         };
         let empty = ZSetBatch::new(&schema);
 
-        let payload = encode_message(
-            10, 1, 0, &PkTuple::EMPTY, 0,
-            Some(&schema), Some(&empty),
-        ).unwrap();
+        let payload = encode_message(10, 1, 0, &PkTuple::EMPTY, 0, Some(&schema), Some(&empty)).unwrap();
         let msg = parse_response(&payload, None).unwrap();
         // Schema sent, but no data (empty batch)
         assert!(msg.schema.is_some());
@@ -759,7 +904,7 @@ mod tests {
 
         let (want_lo, want_extra) = pk.split_wire();
         assert_eq!(hdr.seek_pk, want_lo);
-        assert_eq!(extra, want_extra);          // bytes 16..24
+        assert_eq!(extra, want_extra); // bytes 16..24
         assert_eq!(hdr.flags & FLAG_SEEK, FLAG_SEEK);
     }
 
@@ -771,17 +916,29 @@ mod tests {
     fn hint_only_frame_returns_data_schema_none() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "val".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
         let mut val_bytes = Vec::new();
         val_bytes.extend_from_slice(&42i64.to_le_bytes());
         let batch = ZSetBatch {
-            pks:     PkColumn::U64s(vec![1u64]),
+            pks: PkColumn::U64s(vec![1u64]),
             weights: vec![1],
-            nulls:   vec![0],
+            nulls: vec![0],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],
         };
 
@@ -800,6 +957,9 @@ mod tests {
         assert_eq!(data.pks, vec![1u128]);
         assert_eq!(data.weights, vec![1i64]);
 
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 }

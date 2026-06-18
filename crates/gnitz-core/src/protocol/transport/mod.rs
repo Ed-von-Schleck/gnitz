@@ -41,13 +41,16 @@ fn recv_exact_uninit(sock_fd: RawFd, buf: &mut [MaybeUninit<u8>]) -> Result<(), 
         };
         if n < 0 {
             let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             return Err(ProtocolError::IoError(e));
         }
         if n == 0 {
-            return Err(ProtocolError::IoError(
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed"),
-            ));
+            return Err(ProtocolError::IoError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed",
+            )));
         }
         got += n as usize;
     }
@@ -58,9 +61,7 @@ fn recv_exact(sock_fd: RawFd, buf: &mut [u8]) -> Result<(), ProtocolError> {
     // SAFETY: `&mut [u8]` and `&mut [MaybeUninit<u8>]` have identical
     // layout; the bytes are already initialised, so re-narrowing them to
     // `MaybeUninit` and then back is sound.
-    let uninit = unsafe {
-        std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len())
-    };
+    let uninit = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut MaybeUninit<u8>, buf.len()) };
     recv_exact_uninit(sock_fd, uninit)
 }
 
@@ -88,13 +89,16 @@ fn send_all_bytes(sock_fd: RawFd, data: &[u8]) -> Result<(), ProtocolError> {
         };
         if n < 0 {
             let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             return Err(ProtocolError::IoError(e));
         }
         if n == 0 {
-            return Err(ProtocolError::IoError(
-                std::io::Error::new(std::io::ErrorKind::WriteZero, "send returned 0"),
-            ));
+            return Err(ProtocolError::IoError(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "send returned 0",
+            )));
         }
         sent += n as usize;
     }
@@ -139,8 +143,12 @@ fn writev_all(sock_fd: RawFd, iovecs: &mut [libc::iovec]) -> Result<(), Protocol
         // sum to zero makes writev return 0, which we'd misread as a closed
         // peer — empty payload slices (e.g. send_framed_iov(&[&[], data]))
         // and trailing empties after the cursor advances both hit this.
-        while off < total && iovecs[off].iov_len == 0 { off += 1; }
-        if off >= total { break; }
+        while off < total && iovecs[off].iov_len == 0 {
+            off += 1;
+        }
+        if off >= total {
+            break;
+        }
 
         // saturating_add guards 32-bit targets: iov_max is clamped to
         // i32::MAX (~2 GiB), and a `total` near usize::MAX would otherwise
@@ -151,18 +159,19 @@ fn writev_all(sock_fd: RawFd, iovecs: &mut [libc::iovec]) -> Result<(), Protocol
 
         // SAFETY: every iov_base references caller-owned memory that
         // outlives the call; iov_len matches the backing allocation.
-        let n = unsafe {
-            libc::writev(sock_fd, chunk.as_ptr(), chunk.len() as libc::c_int)
-        };
+        let n = unsafe { libc::writev(sock_fd, chunk.as_ptr(), chunk.len() as libc::c_int) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             return Err(ProtocolError::IoError(e));
         }
         if n == 0 {
-            return Err(ProtocolError::IoError(
-                std::io::Error::new(std::io::ErrorKind::WriteZero, "writev returned 0"),
-            ));
+            return Err(ProtocolError::IoError(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "writev returned 0",
+            )));
         }
 
         let mut remaining = n as usize;
@@ -174,9 +183,8 @@ fn writev_all(sock_fd: RawFd, iovecs: &mut [libc::iovec]) -> Result<(), Protocol
             } else {
                 // SAFETY: iov_base + remaining stays within the
                 // caller-provided buffer (remaining < cur ≤ iov_len).
-                iovecs[off].iov_base = unsafe {
-                    (iovecs[off].iov_base as *const u8).add(remaining) as *mut libc::c_void
-                };
+                iovecs[off].iov_base =
+                    unsafe { (iovecs[off].iov_base as *const u8).add(remaining) as *mut libc::c_void };
                 iovecs[off].iov_len -= remaining;
                 remaining = 0;
             }
@@ -220,17 +228,18 @@ pub fn send_framed_iov(sock_fd: RawFd, bufs: &[&[u8]]) -> Result<(), ProtocolErr
     assert!(
         bufs.len() <= MAX_PAYLOAD_SLICES,
         "send_framed_iov: {} payload slices exceeds the {}-slot stack iovec array",
-        bufs.len(), MAX_PAYLOAD_SLICES,
+        bufs.len(),
+        MAX_PAYLOAD_SLICES,
     );
 
     let total: usize = bufs.iter().map(|b| b.len()).sum();
     let hdr = frame_len_prefix(total)?;
 
     // Slot 0: length prefix.  Slots 1..=bufs.len(): payload slices.
-    let mut iovecs: [libc::iovec; MAX_PAYLOAD_SLICES + 1] = [
-        libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 };
-        MAX_PAYLOAD_SLICES + 1
-    ];
+    let mut iovecs: [libc::iovec; MAX_PAYLOAD_SLICES + 1] = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; MAX_PAYLOAD_SLICES + 1];
     iovecs[0] = libc::iovec {
         iov_base: hdr.as_ptr() as *mut libc::c_void,
         iov_len: hdr.len(),
@@ -258,8 +267,8 @@ thread_local! {
 /// while still bounding the worst-case footprint after a one-off large
 /// batch. `lens` holds 4 bytes per frame (4 KiB at the cap); `iovs` holds
 /// `libc::iovec` — 16 bytes on 64-bit Unix (32 KiB at the cap).
-const SCRATCH_LENS_CAP: usize = 4 * 1024;  // 1024 frames × 4 bytes
-const SCRATCH_IOVS_CAP: usize = 2 * 1024;  // 1024 frames × 2 iovecs
+const SCRATCH_LENS_CAP: usize = 4 * 1024; // 1024 frames × 4 bytes
+const SCRATCH_IOVS_CAP: usize = 2 * 1024; // 1024 frames × 2 iovecs
 
 /// Reclaim scratch capacity that overshot `cap` after a one-off large
 /// batch, leaving steady-state buffers (within the working set) untouched
@@ -277,11 +286,10 @@ fn shrink_to_cap<T>(v: &mut Vec<T>, cap: usize) {
 /// Empty frames are rejected (would collide with the protocol close
 /// sentinel). Frames whose length does not fit in `u32` are rejected
 /// (would silently truncate the wire prefix).
-pub fn send_framed_batch<F: AsRef<[u8]>>(
-    sock_fd: RawFd,
-    frames: &[F],
-) -> Result<(), ProtocolError> {
-    if frames.is_empty() { return Ok(()); }
+pub fn send_framed_batch<F: AsRef<[u8]>>(sock_fd: RawFd, frames: &[F]) -> Result<(), ProtocolError> {
+    if frames.is_empty() {
+        return Ok(());
+    }
 
     SCRATCH.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -341,9 +349,10 @@ pub fn recv_framed(sock_fd: RawFd, max_payload_len: usize) -> Result<Vec<u8>, Pr
     recv_exact(sock_fd, &mut hdr)?;
     let payload_len = u32::from_le_bytes(hdr) as usize;
     if payload_len == 0 {
-        return Err(ProtocolError::IoError(
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "zero-length close sentinel"),
-        ));
+        return Err(ProtocolError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "zero-length close sentinel",
+        )));
     }
     if payload_len > max_payload_len {
         return Err(ProtocolError::DecodeError(format!(
@@ -357,12 +366,16 @@ pub fn recv_framed(sock_fd: RawFd, max_payload_len: usize) -> Result<Vec<u8>, Pr
     }
     // SAFETY: recv_exact_uninit wrote exactly `payload_len` bytes into
     // the spare capacity. Declaring those bytes initialised is sound.
-    unsafe { buf.set_len(payload_len); }
+    unsafe {
+        buf.set_len(payload_len);
+    }
     Ok(buf)
 }
 
 pub fn close_fd(fd: RawFd) {
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
 }
 
 /// Send the HELLO frame and parse the server's ACK. Returns the
@@ -384,22 +397,23 @@ pub fn hello_handshake(sock_fd: RawFd) -> Result<u32, ProtocolError> {
     recv_exact(sock_fd, &mut hdr)?;
     let payload_len = u32::from_le_bytes(hdr) as usize;
     if payload_len == 0 {
-        return Err(ProtocolError::IoError(
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "server closed mid-handshake"),
-        ));
+        return Err(ProtocolError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "server closed mid-handshake",
+        )));
     }
 
     if payload_len == gnitz_wire::HELLO_ACK_PAYLOAD_LEN as usize {
         let mut buf = [0u8; gnitz_wire::HELLO_ACK_PAYLOAD_LEN as usize];
         recv_exact(sock_fd, &mut buf)?;
-        let ack = gnitz_wire::decode_hello_ack(&buf)
-            .map_err(|e| ProtocolError::DecodeError(e.into()))?;
+        let ack = gnitz_wire::decode_hello_ack(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
         if ack.magic != gnitz_wire::HELLO_MAGIC {
             return Err(ProtocolError::DecodeError("HELLO ACK magic mismatch".into()));
         }
         if ack.status != gnitz_wire::HELLO_STATUS_OK {
             return Err(ProtocolError::DecodeError(format!(
-                "HELLO ACK reported status={}", ack.status,
+                "HELLO ACK reported status={}",
+                ack.status,
             )));
         }
         // Clamp the server-supplied limit to the client's hard ceiling. The
@@ -415,7 +429,8 @@ pub fn hello_handshake(sock_fd: RawFd) -> Result<u32, ProtocolError> {
     if payload_len > gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT {
         return Err(ProtocolError::DecodeError(format!(
             "HELLO error frame payload {} exceeds client max {}",
-            payload_len, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT,
+            payload_len,
+            gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT,
         )));
     }
     let mut buf: Vec<u8> = Vec::with_capacity(payload_len);
@@ -424,7 +439,9 @@ pub fn hello_handshake(sock_fd: RawFd) -> Result<u32, ProtocolError> {
         recv_exact_uninit(sock_fd, &mut spare[..payload_len])?;
     }
     // SAFETY: recv_exact_uninit wrote exactly `payload_len` bytes.
-    unsafe { buf.set_len(payload_len); }
+    unsafe {
+        buf.set_len(payload_len);
+    }
     let msg = super::message::parse_response(&buf, None)?;
     let err = msg.error_text.unwrap_or_else(|| "HELLO rejected".into());
     Err(ProtocolError::DecodeError(err))
@@ -437,7 +454,9 @@ mod tests {
 
     fn make_socketpair() -> (RawFd, RawFd) {
         let mut fds = [0i32; 2];
-        unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()); }
+        unsafe {
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
+        }
         (fds[0], fds[1])
     }
 
@@ -450,7 +469,10 @@ mod tests {
         send_framed(a, &data).unwrap();
         let received = recv_framed(b, TEST_LIMIT).unwrap();
         assert_eq!(&received[..], &data[..]);
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -460,7 +482,10 @@ mod tests {
         send_framed(a, &data).unwrap();
         let received = recv_framed(b, TEST_LIMIT).unwrap();
         assert_eq!(&received[..], &data[..]);
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -470,7 +495,10 @@ mod tests {
         send_framed_iov(a, &[&data]).unwrap();
         let received = recv_framed(b, TEST_LIMIT).unwrap();
         assert_eq!(&received[..], &data[..]);
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -486,7 +514,10 @@ mod tests {
         expected.extend_from_slice(part2);
         expected.extend_from_slice(&part3);
         assert_eq!(received, expected);
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -496,7 +527,10 @@ mod tests {
         send_framed_iov(a, &[&[], &data[..], &[]]).unwrap();
         let received = recv_framed(b, TEST_LIMIT).unwrap();
         assert_eq!(&received[..], &data[..]);
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -504,10 +538,15 @@ mod tests {
         let (a, b) = make_socketpair();
         let huge: u32 = (TEST_LIMIT + 1) as u32;
         let hdr = huge.to_le_bytes();
-        unsafe { libc::send(a, hdr.as_ptr() as *const libc::c_void, 4, 0); }
+        unsafe {
+            libc::send(a, hdr.as_ptr() as *const libc::c_void, 4, 0);
+        }
         let result = recv_framed(b, TEST_LIMIT);
         assert!(matches!(result, Err(ProtocolError::DecodeError(ref s)) if s.contains("exceeds maximum")));
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -518,10 +557,15 @@ mod tests {
         let small_limit = 1024usize;
         let just_over: u32 = (small_limit + 1) as u32;
         let hdr = just_over.to_le_bytes();
-        unsafe { libc::send(a, hdr.as_ptr() as *const libc::c_void, 4, 0); }
+        unsafe {
+            libc::send(a, hdr.as_ptr() as *const libc::c_void, 4, 0);
+        }
         let result = recv_framed(b, small_limit);
         assert!(matches!(result, Err(ProtocolError::DecodeError(ref s)) if s.contains("exceeds maximum")));
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -531,7 +575,10 @@ mod tests {
         send_framed(a, &data).unwrap();
         let received = recv_framed(b, TEST_LIMIT).unwrap();
         assert_eq!(received, data);
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -543,7 +590,10 @@ mod tests {
             let _ = send_framed_iov(a, &bufs);
         });
         assert!(r.is_err(), "send_framed_iov must assert on slice overflow");
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     /// Spawn a reader thread that pulls exactly `count` frames off `fd`,
@@ -554,7 +604,9 @@ mod tests {
             for _ in 0..count {
                 out.push(recv_framed(fd, TEST_LIMIT).unwrap());
             }
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             out
         })
     }
@@ -568,7 +620,10 @@ mod tests {
         let r1 = send_framed_iov(a, &[&[][..], &[][..]]);
         assert!(matches!(r0, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput));
         assert!(matches!(r1, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput));
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -578,7 +633,10 @@ mod tests {
         let (a, b) = make_socketpair();
         let r = send_framed(a, &[]);
         assert!(matches!(r, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput));
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -605,8 +663,7 @@ mod tests {
         // bytes are never dereferenced (only len/is_empty are read before
         // the rejection), so the dangling base is never accessed.
         let oversized: &[u8] = unsafe {
-            std::slice::from_raw_parts(std::ptr::NonNull::<u8>::dangling().as_ptr(),
-                                       (u32::MAX as usize) + 1)
+            std::slice::from_raw_parts(std::ptr::NonNull::<u8>::dangling().as_ptr(), (u32::MAX as usize) + 1)
         };
         let frames = [oversized];
         let r = send_framed_batch(-1, &frames);
@@ -619,7 +676,9 @@ mod tests {
         let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
         let reader = spawn_reader(b, 1);
         send_framed_batch(a, &[&data]).unwrap();
-        unsafe { libc::close(a); }
+        unsafe {
+            libc::close(a);
+        }
         let frames = reader.join().unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0], data);
@@ -629,11 +688,12 @@ mod tests {
     fn test_send_framed_batch_many_small_frames_in_order() {
         let (a, b) = make_socketpair();
         let n = 200usize;
-        let expected: Vec<Vec<u8>> =
-            (0..n).map(|i| format!("frame-{i}").into_bytes()).collect();
+        let expected: Vec<Vec<u8>> = (0..n).map(|i| format!("frame-{i}").into_bytes()).collect();
         let reader = spawn_reader(b, n);
         send_framed_batch(a, &expected).unwrap();
-        unsafe { libc::close(a); }
+        unsafe {
+            libc::close(a);
+        }
         let got = reader.join().unwrap();
         assert_eq!(got, expected);
     }
@@ -645,11 +705,12 @@ mod tests {
         // intact and in order.
         let (a, b) = make_socketpair();
         let n = iov_max() / 2 + 50;
-        let expected: Vec<Vec<u8>> =
-            (0..n).map(|i| format!("f{i:04}").into_bytes()).collect();
+        let expected: Vec<Vec<u8>> = (0..n).map(|i| format!("f{i:04}").into_bytes()).collect();
         let reader = spawn_reader(b, n);
         send_framed_batch(a, &expected).unwrap();
-        unsafe { libc::close(a); }
+        unsafe {
+            libc::close(a);
+        }
         let got = reader.join().unwrap();
         assert_eq!(got, expected);
     }
@@ -667,7 +728,10 @@ mod tests {
         }
         let limit = hello_handshake(a).unwrap();
         assert_eq!(limit as usize, gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -681,7 +745,10 @@ mod tests {
         }
         let limit = hello_handshake(a).unwrap();
         assert_eq!(limit, small);
-        unsafe { libc::close(a); libc::close(b); }
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 
     #[test]
@@ -692,9 +759,13 @@ mod tests {
         let (a, b) = make_socketpair();
         let small: libc::c_int = 4096;
         unsafe {
-            libc::setsockopt(a, libc::SOL_SOCKET, libc::SO_SNDBUF,
+            libc::setsockopt(
+                a,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
                 &small as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
         }
         let n = 500usize;
         // ~256 bytes/frame × 500 ≫ the 4 KiB send buffer.
@@ -707,7 +778,9 @@ mod tests {
             .collect();
         let reader = spawn_reader(b, n);
         send_framed_batch(a, &expected).unwrap();
-        unsafe { libc::close(a); }
+        unsafe {
+            libc::close(a);
+        }
         let got = reader.join().unwrap();
         assert_eq!(got, expected);
     }

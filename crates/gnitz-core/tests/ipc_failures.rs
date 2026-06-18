@@ -9,18 +9,12 @@
 
 use std::os::unix::io::RawFd;
 
-use gnitz_core::{GnitzClient, SCHEMA_TAB};
 use gnitz_core::{
-    Header,
-    FLAG_HAS_SCHEMA, FLAG_HAS_DATA,
-    STATUS_OK, STATUS_ERROR,
-    TypeCode, ColumnDef, Schema, ZSetBatch, ColData,
-    encode_wal_block,
-    encode_control_block, decode_control_block,
-    schema_to_batch, meta_schema,
-    connect, hello_handshake, send_framed, recv_framed, close_fd,
-    WAL_BLOCK_HEADER_SIZE,
+    close_fd, connect, decode_control_block, encode_control_block, encode_wal_block, hello_handshake, meta_schema,
+    recv_framed, schema_to_batch, send_framed, ColData, ColumnDef, Header, Schema, TypeCode, ZSetBatch, FLAG_HAS_DATA,
+    FLAG_HAS_SCHEMA, STATUS_ERROR, STATUS_OK, WAL_BLOCK_HEADER_SIZE,
 };
+use gnitz_core::{GnitzClient, SCHEMA_TAB};
 use gnitz_test_harness::ServerHandle;
 
 // ── RawClient ─────────────────────────────────────────────────────────────────
@@ -59,16 +53,22 @@ impl RawClient {
 }
 
 impl Drop for RawClient {
-    fn drop(&mut self) { close_fd(self.fd); }
+    fn drop(&mut self) {
+        close_fd(self.fd);
+    }
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
 /// Decode the control-block Header from a raw response buffer.
 fn resp_header(buf: &[u8]) -> Header {
-    if buf.len() < WAL_BLOCK_HEADER_SIZE { return Header::default(); }
+    if buf.len() < WAL_BLOCK_HEADER_SIZE {
+        return Header::default();
+    }
     let ctrl_size = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
-    if ctrl_size > buf.len() { return Header::default(); }
+    if ctrl_size > buf.len() {
+        return Header::default();
+    }
     decode_control_block(&buf[..ctrl_size])
         .map(|(h, _, _)| h)
         .unwrap_or_default()
@@ -76,17 +76,22 @@ fn resp_header(buf: &[u8]) -> Header {
 
 /// Minimal control-only scan message for `target_id`.
 fn scan_msg(target_id: u64) -> Vec<u8> {
-    let h = Header { target_id, ..Header::default() };
+    let h = Header {
+        target_id,
+        ..Header::default()
+    };
     encode_control_block(&h, "", &[]).expect("encode_control_block")
 }
 
 fn assert_err(status: u32, err: &str, words: &[&str]) {
     let lc = err.to_lowercase();
-    assert_eq!(status, STATUS_ERROR,
-        "expected STATUS_ERROR; got status={}; err={:?}", status, err);
+    assert_eq!(
+        status, STATUS_ERROR,
+        "expected STATUS_ERROR; got status={}; err={:?}",
+        status, err
+    );
     for w in words {
-        assert!(lc.contains(w),
-            "expected {:?} in error {:?}", w, lc);
+        assert!(lc.contains(w), "expected {:?} in error {:?}", w, lc);
     }
 }
 
@@ -105,7 +110,8 @@ fn make_schema_block(schema: &Schema) -> Vec<u8> {
 fn make_schema_block_bad_type(schema: &Schema, col_idx: usize, bad_tc: u64) -> Vec<u8> {
     let ms = meta_schema();
     let mut sbatch = schema_to_batch(schema);
-    if let ColData::Fixed(ref mut v) = sbatch.columns[1] {  // col 1 = type_code
+    if let ColData::Fixed(ref mut v) = sbatch.columns[1] {
+        // col 1 = type_code
         let s = col_idx * 8;
         v[s..s + 8].copy_from_slice(&bad_tc.to_le_bytes());
     }
@@ -116,8 +122,11 @@ fn make_schema_block_bad_type(schema: &Schema, col_idx: usize, bad_tc: u64) -> V
 fn make_schema_block_no_pk(schema: &Schema) -> Vec<u8> {
     let ms = meta_schema();
     let mut sbatch = schema_to_batch(schema);
-    if let ColData::Fixed(ref mut v) = sbatch.columns[2] {  // col 2 = flags
-        for b in v.iter_mut() { *b = 0; }
+    if let ColData::Fixed(ref mut v) = sbatch.columns[2] {
+        // col 2 = flags
+        for b in v.iter_mut() {
+            *b = 0;
+        }
     }
     encode_wal_block(ms, 0, &sbatch)
 }
@@ -132,30 +141,50 @@ fn make_schema_block_bad_col_idx(schema: &Schema, row: usize, bad_idx: u64) -> V
 
 /// Assemble a complete IPC message from optional pre-built WAL blocks.
 /// Sets FLAG_HAS_SCHEMA / FLAG_HAS_DATA in the control block as appropriate.
-fn assemble(
-    target_id:    u64,
-    schema_block: Option<Vec<u8>>,
-    data_block:   Option<Vec<u8>>,
-) -> Vec<u8> {
+fn assemble(target_id: u64, schema_block: Option<Vec<u8>>, data_block: Option<Vec<u8>>) -> Vec<u8> {
     let has_schema = schema_block.is_some();
-    let has_data   = data_block.is_some();
+    let has_data = data_block.is_some();
     let mut flags = 0u64;
-    if has_schema { flags |= FLAG_HAS_SCHEMA; }
-    if has_data   { flags |= FLAG_HAS_DATA;   }
+    if has_schema {
+        flags |= FLAG_HAS_SCHEMA;
+    }
+    if has_data {
+        flags |= FLAG_HAS_DATA;
+    }
 
-    let h = Header { target_id, flags, ..Default::default() };
+    let h = Header {
+        target_id,
+        flags,
+        ..Default::default()
+    };
 
     let mut buf = encode_control_block(&h, "", &[]).unwrap();
-    if let Some(sb) = schema_block { buf.extend_from_slice(&sb); }
-    if let Some(db) = data_block   { buf.extend_from_slice(&db); }
+    if let Some(sb) = schema_block {
+        buf.extend_from_slice(&sb);
+    }
+    if let Some(db) = data_block {
+        buf.extend_from_slice(&db);
+    }
     buf
 }
 
 fn two_col() -> Schema {
     Schema {
         columns: vec![
-            ColumnDef { name: "pk".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "val".into(),
+                type_code: TypeCode::I64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
         ],
         pk_cols: vec![0],
     }
@@ -164,9 +193,27 @@ fn two_col() -> Schema {
 fn three_col() -> Schema {
     Schema {
         columns: vec![
-            ColumnDef { name: "pk".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "val".into(),  type_code: TypeCode::I64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "val".into(),
+                type_code: TypeCode::I64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "name".into(),
+                type_code: TypeCode::String,
+                is_nullable: true,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
         ],
         pk_cols: vec![0],
     }
@@ -188,8 +235,11 @@ fn setup_test_table(sock_path: &str) -> (GnitzClient, u64, Schema) {
     let mut client = GnitzClient::connect(sock_path).unwrap();
     client.create_schema("ipctest").unwrap();
     let cols = three_col().columns;
-    let tid  = client.create_table("ipctest", "t1", &cols, &[0u32], true, 0).unwrap();
-    let schema = Schema { columns: cols, pk_cols: vec![0] };
+    let tid = client.create_table("ipctest", "t1", &cols, &[0u32], true, 0).unwrap();
+    let schema = Schema {
+        columns: cols,
+        pk_cols: vec![0],
+    };
     (client, tid, schema)
 }
 
@@ -199,7 +249,10 @@ fn setup_test_table(sock_path: &str) -> (GnitzClient, u64, Schema) {
 
 #[test]
 fn test_too_small_1_byte() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let (status, err, _) = raw.send_recv(&[0x47u8]);
     assert_err(status, &err, &["too small"]);
@@ -207,7 +260,10 @@ fn test_too_small_1_byte() {
 
 #[test]
 fn test_too_small_47_bytes() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let (status, err, _) = raw.send_recv(&[0u8; 47]);
     assert_err(status, &err, &["too small"]);
@@ -215,7 +271,10 @@ fn test_too_small_47_bytes() {
 
 #[test]
 fn test_bad_format_version() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
 
     let h = Header::default();
@@ -229,7 +288,10 @@ fn test_bad_format_version() {
 
 #[test]
 fn test_bad_checksum() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
 
     let h = Header::default();
@@ -246,11 +308,18 @@ fn test_bad_checksum() {
 
 #[test]
 fn test_has_data_without_has_schema() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
 
     // FLAG_HAS_DATA without FLAG_HAS_SCHEMA is a protocol violation
-    let h = Header { target_id: SCHEMA_TAB, flags: FLAG_HAS_DATA, ..Default::default() };
+    let h = Header {
+        target_id: SCHEMA_TAB,
+        flags: FLAG_HAS_DATA,
+        ..Default::default()
+    };
     let ctrl = encode_control_block(&h, "", &[]).unwrap();
     let (status, _, _) = raw.send_recv(&ctrl);
     assert_eq!(status, STATUS_ERROR);
@@ -262,7 +331,10 @@ fn test_has_data_without_has_schema() {
 
 #[test]
 fn test_schema_invalid_type_code_255() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
     let sb = make_schema_block_bad_type(&schema, 1, 255);
@@ -273,7 +345,10 @@ fn test_schema_invalid_type_code_255() {
 
 #[test]
 fn test_schema_invalid_type_code_zero() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
     let sb = make_schema_block_bad_type(&schema, 1, 0);
@@ -288,7 +363,10 @@ fn test_schema_invalid_type_code_16() {
     // sentinel. The target keeps moving as new types are added: 13 became UUID,
     // then 15 became I128 (gnitz-wire `type_code`), so 16 is now the first
     // unassigned code after I128 (15). Bump it when a 16th type is defined.
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
     let sb = make_schema_block_bad_type(&schema, 1, 16);
@@ -299,7 +377,10 @@ fn test_schema_invalid_type_code_16() {
 
 #[test]
 fn test_schema_no_pk_flag() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
     let sb = make_schema_block_no_pk(&schema);
@@ -314,7 +395,10 @@ fn test_schema_multiple_pk_flags_overflows_max() {
     // columns" rejection is replaced by an "exceeds MAX_PK_COLUMNS"
     // rejection. Build a schema with one more PK column than the cap to
     // trigger it.
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let mut cols = Vec::new();
     for i in 0..gnitz_core::MAX_PK_COLUMNS + 1 {
@@ -322,7 +406,8 @@ fn test_schema_multiple_pk_flags_overflows_max() {
             name: format!("c{}", i),
             type_code: TypeCode::U8,
             is_nullable: false,
-            fk_table_id: 0, fk_col_idx: 0,
+            fk_table_id: 0,
+            fk_col_idx: 0,
         });
     }
     let schema = Schema {
@@ -337,7 +422,10 @@ fn test_schema_multiple_pk_flags_overflows_max() {
 
 #[test]
 fn test_schema_col_idx_out_of_order() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
     // col_idx [1, 0] instead of [0, 1]
@@ -353,10 +441,13 @@ fn test_schema_col_idx_out_of_order() {
 
 #[test]
 fn test_schema_col_idx_gap() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
-    let sb = make_schema_block_bad_col_idx(&schema, 1, 2);  // [0, 2] — gap
+    let sb = make_schema_block_bad_col_idx(&schema, 1, 2); // [0, 2] — gap
     let msg = assemble(SCHEMA_TAB, Some(sb), None);
     let (status, err, _) = raw.send_recv(&msg);
     assert_err(status, &err, &["col_idx"]);
@@ -364,10 +455,13 @@ fn test_schema_col_idx_gap() {
 
 #[test]
 fn test_schema_col_idx_duplicate() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
-    let sb = make_schema_block_bad_col_idx(&schema, 1, 0);  // [0, 0] — duplicate
+    let sb = make_schema_block_bad_col_idx(&schema, 1, 0); // [0, 0] — duplicate
     let msg = assemble(SCHEMA_TAB, Some(sb), None);
     let (status, err, _) = raw.send_recv(&msg);
     assert_err(status, &err, &["col_idx"]);
@@ -377,7 +471,10 @@ fn test_schema_col_idx_duplicate() {
 
 #[test]
 fn test_schema_block_bad_checksum() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
     let mut sb = make_schema_block(&schema);
@@ -394,13 +491,20 @@ fn test_schema_block_bad_checksum() {
 
 #[test]
 fn test_data_section_truncated() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, schema) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
 
     let schema_block = make_schema_block(&schema);
     // Send FLAG_HAS_DATA but don't include the data WAL block at all
-    let h = Header { target_id: tid, flags: FLAG_HAS_SCHEMA | FLAG_HAS_DATA, ..Default::default() };
+    let h = Header {
+        target_id: tid,
+        flags: FLAG_HAS_SCHEMA | FLAG_HAS_DATA,
+        ..Default::default()
+    };
     let mut msg = encode_control_block(&h, "", &[]).unwrap();
     msg.extend_from_slice(&schema_block);
     // data block absent
@@ -411,7 +515,10 @@ fn test_data_section_truncated() {
 
 #[test]
 fn test_data_block_bad_checksum() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, schema) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
 
@@ -419,7 +526,8 @@ fn test_data_block_bad_checksum() {
     // data col: need the string column too for three_col schema
     let mut full_batch = ZSetBatch::new(&schema);
     full_batch.pks.push_u128(1u128);
-    full_batch.weights.push(1); full_batch.nulls.push(0);
+    full_batch.weights.push(1);
+    full_batch.nulls.push(0);
     if let ColData::Fixed(ref mut v) = full_batch.columns[1] {
         v.extend_from_slice(&42i64.to_le_bytes());
     }
@@ -427,7 +535,7 @@ fn test_data_block_bad_checksum() {
         v.push(Some("hello".into()));
     }
     let mut data_block = encode_wal_block(&schema, tid as u32, &full_batch);
-    data_block[WAL_BLOCK_HEADER_SIZE] ^= 0xFF;  // corrupt body
+    data_block[WAL_BLOCK_HEADER_SIZE] ^= 0xFF; // corrupt body
 
     let msg = assemble(tid, Some(schema_block), Some(data_block));
     let (status, _, _) = raw.send_recv(&msg);
@@ -440,7 +548,10 @@ fn test_data_block_bad_checksum() {
 
 #[test]
 fn test_schema_mismatch_wrong_column_count_fewer() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, _) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
 
@@ -454,22 +565,51 @@ fn test_schema_mismatch_wrong_column_count_fewer() {
 
 #[test]
 fn test_schema_mismatch_wrong_column_count_more() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, _) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
 
     let wrong = Schema {
         columns: vec![
-            ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "a".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "b".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "c".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "a".into(),
+                type_code: TypeCode::I64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "b".into(),
+                type_code: TypeCode::I64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "c".into(),
+                type_code: TypeCode::I64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
         ],
         pk_cols: vec![0],
     };
     let sb = make_schema_block(&wrong);
     let mut batch = ZSetBatch::new(&wrong);
-    batch.pks.push_u128(1u128); batch.weights.push(1); batch.nulls.push(0);
+    batch.pks.push_u128(1u128);
+    batch.weights.push(1);
+    batch.nulls.push(0);
     for ci in 1..4usize {
         if let ColData::Fixed(ref mut v) = batch.columns[ci] {
             v.extend_from_slice(&1i64.to_le_bytes());
@@ -483,24 +623,51 @@ fn test_schema_mismatch_wrong_column_count_more() {
 
 #[test]
 fn test_schema_mismatch_wrong_column_type() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, _) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
 
     // Push schema where column 2 is I64 instead of STRING
     let wrong = Schema {
         columns: vec![
-            ColumnDef { name: "pk".into(),   type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "val".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "name".into(), type_code: TypeCode::I64, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "val".into(),
+                type_code: TypeCode::I64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "name".into(),
+                type_code: TypeCode::I64,
+                is_nullable: true,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
         ],
         pk_cols: vec![0],
     };
     let sb = make_schema_block(&wrong);
     let mut batch = ZSetBatch::new(&wrong);
-    batch.pks.push_u128(1u128); batch.weights.push(1); batch.nulls.push(0);
-    if let ColData::Fixed(ref mut v) = batch.columns[1] { v.extend_from_slice(&42i64.to_le_bytes()); }
-    if let ColData::Fixed(ref mut v) = batch.columns[2] { v.extend_from_slice(&999i64.to_le_bytes()); }
+    batch.pks.push_u128(1u128);
+    batch.weights.push(1);
+    batch.nulls.push(0);
+    if let ColData::Fixed(ref mut v) = batch.columns[1] {
+        v.extend_from_slice(&42i64.to_le_bytes());
+    }
+    if let ColData::Fixed(ref mut v) = batch.columns[2] {
+        v.extend_from_slice(&999i64.to_le_bytes());
+    }
     let db = encode_wal_block(&wrong, tid as u32, &batch);
     let msg = assemble(tid, Some(sb), Some(db));
     let (status, err, _) = raw.send_recv(&msg);
@@ -509,24 +676,51 @@ fn test_schema_mismatch_wrong_column_type() {
 
 #[test]
 fn test_schema_mismatch_wrong_pk_index() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, _) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
 
     // Push with pk_index=1 to a table with pk_index=0
     let wrong = Schema {
         columns: vec![
-            ColumnDef { name: "val".into(),  type_code: TypeCode::I64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "pk".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef {
+                name: "val".into(),
+                type_code: TypeCode::I64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "name".into(),
+                type_code: TypeCode::String,
+                is_nullable: true,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
         ],
         pk_cols: vec![1],
     };
     let sb = make_schema_block(&wrong);
     let mut batch = ZSetBatch::new(&wrong);
-    batch.pks.push_u128(1u128); batch.weights.push(1); batch.nulls.push(0);
-    if let ColData::Fixed(ref mut v) = batch.columns[0] { v.extend_from_slice(&99i64.to_le_bytes()); }
-    if let ColData::Strings(ref mut v) = batch.columns[2] { v.push(Some("x".into())); }
+    batch.pks.push_u128(1u128);
+    batch.weights.push(1);
+    batch.nulls.push(0);
+    if let ColData::Fixed(ref mut v) = batch.columns[0] {
+        v.extend_from_slice(&99i64.to_le_bytes());
+    }
+    if let ColData::Strings(ref mut v) = batch.columns[2] {
+        v.push(Some("x".into()));
+    }
     let db = encode_wal_block(&wrong, tid as u32, &batch);
     let msg = assemble(tid, Some(sb), Some(db));
     let (status, err, _) = raw.send_recv(&msg);
@@ -542,7 +736,10 @@ fn test_schema_mismatch_wrong_pk_index() {
 
 #[test]
 fn test_target_id_nonexistent() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let (status, err, _) = raw.send_recv(&scan_msg(99_999));
     // The server returns `table N not found` for unknown user tables;
@@ -554,7 +751,10 @@ fn test_target_id_nonexistent() {
 
 #[test]
 fn test_target_id_zero() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let (status, err, _) = raw.send_recv(&scan_msg(0));
     // target_id=0 is the catalog's sentinel for "no table"; the
@@ -566,18 +766,28 @@ fn test_target_id_zero() {
 
 #[test]
 fn test_target_id_max_u64() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let (status, err, _) = raw.send_recv(&scan_msg(u64::MAX));
     // u64::MAX is reserved for the control TID (`IPC_CONTROL_TID`); the
     // dispatcher rejects it via the panic guard. Like target_id=0, the
     // assertion is just "STATUS_ERROR, no process crash".
-    assert_eq!(status, STATUS_ERROR, "expected STATUS_ERROR for tid=u64::MAX; err={:?}", err);
+    assert_eq!(
+        status, STATUS_ERROR,
+        "expected STATUS_ERROR for tid=u64::MAX; err={:?}",
+        err
+    );
 }
 
 #[test]
 fn test_push_to_nonexistent_with_valid_schema() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
     let sb = make_schema_block(&schema);
@@ -596,7 +806,10 @@ fn test_push_to_nonexistent_with_valid_schema() {
 
 #[test]
 fn test_scan_system_table_schema_tab() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let (status, _, resp) = raw.send_recv(&scan_msg(SCHEMA_TAB));
     assert_ok(status);
@@ -608,7 +821,10 @@ fn test_scan_system_table_schema_tab() {
 #[test]
 fn test_scan_with_schema_but_no_data_is_scan() {
     // Sending FLAG_HAS_SCHEMA but no FLAG_HAS_DATA to a table is a scan
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
     let schema = two_col();
     let sb = make_schema_block(&schema);
@@ -619,9 +835,16 @@ fn test_scan_with_schema_but_no_data_is_scan() {
 
 #[test]
 fn test_scan_echoes_client_id() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
-    let h = Header { target_id: SCHEMA_TAB, client_id: 123_456_789, ..Default::default() };
+    let h = Header {
+        target_id: SCHEMA_TAB,
+        client_id: 123_456_789,
+        ..Default::default()
+    };
     let msg = encode_control_block(&h, "", &[]).unwrap();
     let (status, _, resp) = raw.send_recv(&msg);
     assert_ok(status);
@@ -636,7 +859,10 @@ fn test_scan_echoes_client_id() {
 fn test_empty_payload_too_small() {
     // Send a payload that's too small to contain a valid WAL block header.
     // Server should respond with STATUS_ERROR or drop the connection.
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let sock_fd = connect(&srv.sock_path).expect("connect");
     // Complete the HELLO handshake — the server stalls on raw bytes
     // otherwise and `recv_framed` would block indefinitely.
@@ -669,7 +895,10 @@ fn test_empty_payload_too_small() {
 
 #[test]
 fn test_error_then_valid_same_connection() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
 
     // Bad WAL format version → error (control blocks no longer verify
@@ -690,7 +919,10 @@ fn test_error_then_valid_same_connection() {
 
 #[test]
 fn test_multiple_errors_then_valid() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
 
     // Too small
@@ -715,7 +947,10 @@ fn test_multiple_errors_then_valid() {
 
 #[test]
 fn test_new_connection_after_error() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
 
     let c1 = RawClient::connect(&srv.sock_path);
     let (s, _, _) = c1.send_recv(&[0u8; 10]);
@@ -729,7 +964,10 @@ fn test_new_connection_after_error() {
 
 #[test]
 fn test_rapid_reconnect() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     for _ in 0..10 {
         let c = RawClient::connect(&srv.sock_path);
         let (s, _, _) = c.send_recv(&scan_msg(SCHEMA_TAB));
@@ -739,7 +977,10 @@ fn test_rapid_reconnect() {
 
 #[test]
 fn test_error_recovery_after_schema_parse_error() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let raw = RawClient::connect(&srv.sock_path);
 
     // Schema error: bad type code
@@ -760,15 +1001,24 @@ fn test_error_recovery_after_schema_parse_error() {
 
 #[test]
 fn test_push_valid_data_to_real_table() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, schema) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
 
     let sb = make_schema_block(&schema);
     let mut batch = ZSetBatch::new(&schema);
-    batch.pks.push_u128(9000u128); batch.weights.push(1); batch.nulls.push(0);
-    if let ColData::Fixed(ref mut v) = batch.columns[1] { v.extend_from_slice(&77i64.to_le_bytes()); }
-    if let ColData::Strings(ref mut v) = batch.columns[2] { v.push(Some("raw_push".into())); }
+    batch.pks.push_u128(9000u128);
+    batch.weights.push(1);
+    batch.nulls.push(0);
+    if let ColData::Fixed(ref mut v) = batch.columns[1] {
+        v.extend_from_slice(&77i64.to_le_bytes());
+    }
+    if let ColData::Strings(ref mut v) = batch.columns[2] {
+        v.push(Some("raw_push".into()));
+    }
     let db = encode_wal_block(&schema, tid as u32, &batch);
     let msg = assemble(tid, Some(sb), Some(db));
     let (status, _, _) = raw.send_recv(&msg);
@@ -777,15 +1027,24 @@ fn test_push_valid_data_to_real_table() {
 
 #[test]
 fn test_push_retraction_weight_minus_one() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, schema) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
 
     let sb = make_schema_block(&schema);
     let mut batch = ZSetBatch::new(&schema);
-    batch.pks.push_u128(9000u128); batch.weights.push(-1); batch.nulls.push(0);
-    if let ColData::Fixed(ref mut v) = batch.columns[1] { v.extend_from_slice(&77i64.to_le_bytes()); }
-    if let ColData::Strings(ref mut v) = batch.columns[2] { v.push(Some("retract".into())); }
+    batch.pks.push_u128(9000u128);
+    batch.weights.push(-1);
+    batch.nulls.push(0);
+    if let ColData::Fixed(ref mut v) = batch.columns[1] {
+        v.extend_from_slice(&77i64.to_le_bytes());
+    }
+    if let ColData::Strings(ref mut v) = batch.columns[2] {
+        v.push(Some("retract".into()));
+    }
     let db = encode_wal_block(&schema, tid as u32, &batch);
     let msg = assemble(tid, Some(sb), Some(db));
     let (status, _, _) = raw.send_recv(&msg);
@@ -794,15 +1053,24 @@ fn test_push_retraction_weight_minus_one() {
 
 #[test]
 fn test_push_with_empty_string() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, schema) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
 
     let sb = make_schema_block(&schema);
     let mut batch = ZSetBatch::new(&schema);
-    batch.pks.push_u128(9100u128); batch.weights.push(1); batch.nulls.push(0);
-    if let ColData::Fixed(ref mut v) = batch.columns[1] { v.extend_from_slice(&1i64.to_le_bytes()); }
-    if let ColData::Strings(ref mut v) = batch.columns[2] { v.push(Some("".into())); }
+    batch.pks.push_u128(9100u128);
+    batch.weights.push(1);
+    batch.nulls.push(0);
+    if let ColData::Fixed(ref mut v) = batch.columns[1] {
+        v.extend_from_slice(&1i64.to_le_bytes());
+    }
+    if let ColData::Strings(ref mut v) = batch.columns[2] {
+        v.push(Some("".into()));
+    }
     let db = encode_wal_block(&schema, tid as u32, &batch);
     let msg = assemble(tid, Some(sb), Some(db));
     let (status, _, _) = raw.send_recv(&msg);
@@ -811,7 +1079,10 @@ fn test_push_with_empty_string() {
 
 #[test]
 fn test_push_multiple_rows() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, schema) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
 
@@ -819,9 +1090,14 @@ fn test_push_multiple_rows() {
     let mut batch = ZSetBatch::new(&schema);
     for &(pk, val, name) in &[(9001u64, 1i64, "alpha"), (9002, 2, "beta"), (9003, 3, "gamma")] {
         batch.pks.push_u128(pk as u128);
-        batch.weights.push(1); batch.nulls.push(0);
-        if let ColData::Fixed(ref mut v) = batch.columns[1] { v.extend_from_slice(&val.to_le_bytes()); }
-        if let ColData::Strings(ref mut v) = batch.columns[2] { v.push(Some(name.into())); }
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(ref mut v) = batch.columns[1] {
+            v.extend_from_slice(&val.to_le_bytes());
+        }
+        if let ColData::Strings(ref mut v) = batch.columns[2] {
+            v.push(Some(name.into()));
+        }
     }
     let db = encode_wal_block(&schema, tid as u32, &batch);
     let msg = assemble(tid, Some(sb), Some(db));
@@ -831,7 +1107,10 @@ fn test_push_multiple_rows() {
 
 #[test]
 fn test_scan_after_push_returns_data() {
-    let srv = match ServerHandle::start() { Some(s) => s, None => return };
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
     let (_client, tid, _) = setup_test_table(&srv.sock_path);
     let raw = RawClient::connect(&srv.sock_path);
     let (status, _, resp) = raw.send_recv(&scan_msg(tid));

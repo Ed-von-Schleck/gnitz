@@ -1,11 +1,7 @@
 use super::error::ProtocolError;
-use super::header::{
-    META_FLAG_NULLABLE, META_FLAG_IS_PK,
-    META_FLAG_PK_POS_SHIFT, META_FLAG_PK_POS_MASK,
-};
+use super::header::{META_FLAG_IS_PK, META_FLAG_NULLABLE, META_FLAG_PK_POS_MASK, META_FLAG_PK_POS_SHIFT};
 use super::types::{
-    BatchAppender, ColData, ColumnDef, Schema, ZSetBatch, meta_schema,
-    type_code_from_u64, MAX_COLUMNS,
+    meta_schema, type_code_from_u64, BatchAppender, ColData, ColumnDef, Schema, ZSetBatch, MAX_COLUMNS,
 };
 
 /// Convert a Schema to a META_SCHEMA-shaped ZSetBatch (one row per column).
@@ -21,14 +17,17 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
         let mut appender = BatchAppender::new(&mut batch, ms);
         for (ci, col) in schema.columns.iter().enumerate() {
             let mut flags: u64 = 0;
-            if col.is_nullable { flags |= META_FLAG_NULLABLE; }
+            if col.is_nullable {
+                flags |= META_FLAG_NULLABLE;
+            }
             // Encode position-in-PK-tuple so compound `PRIMARY KEY (b, a)`
             // decodes back to the user-declared order.
             if let Some(pos) = schema.pk_cols.iter().position(|&p| p == ci) {
                 flags |= META_FLAG_IS_PK;
                 flags |= (pos as u64) << META_FLAG_PK_POS_SHIFT;
             }
-            appender.add_row(ci as u128, 1)
+            appender
+                .add_row(ci as u128, 1)
                 .u64_val(col.type_code as u64)
                 .u64_val(flags)
                 .str_val(&col.name);
@@ -72,12 +71,8 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
             )));
         }
 
-        let type_code_raw = u64::from_le_bytes(
-            type_code_fixed[i * 8..(i + 1) * 8].try_into().unwrap()
-        );
-        let flags = u64::from_le_bytes(
-            flags_fixed[i * 8..(i + 1) * 8].try_into().unwrap()
-        );
+        let type_code_raw = u64::from_le_bytes(type_code_fixed[i * 8..(i + 1) * 8].try_into().unwrap());
+        let flags = u64::from_le_bytes(flags_fixed[i * 8..(i + 1) * 8].try_into().unwrap());
         let name = match &names_col[i] {
             Some(s) => s.clone(),
             None => return Err(ProtocolError::DecodeError(format!("null name at col {i}"))),
@@ -85,21 +80,26 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
 
         let tc = type_code_from_u64(type_code_raw)?;
         let is_nullable = (flags & META_FLAG_NULLABLE) != 0;
-        let is_pk       = (flags & META_FLAG_IS_PK)    != 0;
+        let is_pk = (flags & META_FLAG_IS_PK) != 0;
 
         if is_pk {
             let pos = ((flags & META_FLAG_PK_POS_MASK) >> META_FLAG_PK_POS_SHIFT) as u8;
             pk_pairs.push((pos, i));
         }
 
-        columns.push(ColumnDef { name, type_code: tc, is_nullable, fk_table_id: 0, fk_col_idx: 0 });
+        columns.push(ColumnDef {
+            name,
+            type_code: tc,
+            is_nullable,
+            fk_table_id: 0,
+            fk_col_idx: 0,
+        });
     }
 
     pk_pairs.sort_by_key(|(p, _)| *p);
     let pk_cols: Vec<usize> = pk_pairs.into_iter().map(|(_, i)| i).collect();
 
-    Schema::validate_pk_cols(&pk_cols, columns.len())
-        .map_err(|e| ProtocolError::DecodeError(e.into()))?;
+    Schema::validate_pk_cols(&pk_cols, columns.len()).map_err(|e| ProtocolError::DecodeError(e.into()))?;
     // PK columns must additionally be non-nullable and PK-eligible — the same
     // invariants the engine's SchemaDescriptor::new hard-asserts.
     for &pk in &pk_cols {
@@ -117,8 +117,8 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::types::{ColData, Schema, ColumnDef, TypeCode, ZSetBatch, meta_schema};
-    use crate::protocol::wal_block::{encode_wal_block, decode_wal_block, VerifyChecksum};
+    use crate::protocol::types::{meta_schema, ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+    use crate::protocol::wal_block::{decode_wal_block, encode_wal_block, VerifyChecksum};
 
     // ── type_code_from_u64 error paths ──────────────────────────────────────
 
@@ -134,14 +134,20 @@ mod tests {
         // 16 is the first unassigned type-code value after I128 (15).
         use crate::protocol::error::ProtocolError;
         use crate::protocol::types::type_code_from_u64;
-        assert!(matches!(type_code_from_u64(16), Err(ProtocolError::UnknownTypeCode(16))));
+        assert!(matches!(
+            type_code_from_u64(16),
+            Err(ProtocolError::UnknownTypeCode(16))
+        ));
     }
 
     #[test]
     fn test_unknown_type_code_max() {
         use crate::protocol::error::ProtocolError;
         use crate::protocol::types::type_code_from_u64;
-        assert!(matches!(type_code_from_u64(u64::MAX), Err(ProtocolError::UnknownTypeCode(_))));
+        assert!(matches!(
+            type_code_from_u64(u64::MAX),
+            Err(ProtocolError::UnknownTypeCode(_))
+        ));
     }
 
     // ── batch_to_schema error paths ──────────────────────────────────────────
@@ -152,13 +158,15 @@ mod tests {
     /// returned batch to exercise `batch_to_schema`'s validation.
     fn make_meta_batch(ncols: usize) -> ZSetBatch {
         let schema = Schema {
-            columns: (0..ncols).map(|i| ColumnDef {
-                name:        format!("col{i}"),
-                type_code:   TypeCode::U64,
-                is_nullable: false,
-                fk_table_id: 0,
-                fk_col_idx:  0,
-            }).collect(),
+            columns: (0..ncols)
+                .map(|i| ColumnDef {
+                    name: format!("col{i}"),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                })
+                .collect(),
             pk_cols: vec![0],
         };
         schema_to_batch(&schema)
@@ -170,7 +178,9 @@ mod tests {
         let mut batch = make_meta_batch(2);
         // Clear all IS_PK flags
         if let ColData::Fixed(ref mut v) = batch.columns[2] {
-            for b in v.iter_mut() { *b = 0; }
+            for b in v.iter_mut() {
+                *b = 0;
+            }
         }
         let res = batch_to_schema(&batch);
         assert!(matches!(res, Err(ProtocolError::DecodeError(_))));
@@ -258,11 +268,41 @@ mod tests {
     fn test_schema_meta_roundtrip() {
         let original = Schema {
             columns: vec![
-                ColumnDef { name: "id".into(),    type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "name".into(),  type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "score".into(), type_code: TypeCode::F64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "tag".into(),   type_code: TypeCode::I32,    is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "uuid".into(),  type_code: TypeCode::U128,   is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "id".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "score".into(),
+                    type_code: TypeCode::F64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "tag".into(),
+                    type_code: TypeCode::I32,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "uuid".into(),
+                    type_code: TypeCode::U128,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };

@@ -2,8 +2,8 @@ use crate::expr::ExprProgram;
 
 pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel};
 
-pub type NodeId  = u64;
-pub type Port    = u8;
+pub type NodeId = u64;
+pub type Port = u8;
 pub type TableId = u64;
 
 /// In-memory circuit graph: typed `OpNode` per node + (dst,port) → src edges.
@@ -37,9 +37,9 @@ pub struct CircuitRows {
     /// `reindex_col` is now always `None` for `Map` nodes; the reindex column list
     /// is stored in `node_columns` under `NODE_COL_KIND_REINDEX`;
     /// `expr_program` is `None` outside `Filter`/`MapKind::Expression`.
-    pub nodes:        Vec<NodeRow>,
+    pub nodes: Vec<NodeRow>,
     /// `(dst_node, dst_port, src_node)`. View id is implicit at the call site.
-    pub edges:        Vec<(NodeId, Port, NodeId)>,
+    pub edges: Vec<(NodeId, Port, NodeId)>,
     /// `(node_id, kind, position, value1, value2)`.
     pub node_columns: Vec<(NodeId, u64, u16, u64, u64)>,
 }
@@ -57,7 +57,9 @@ impl Circuit {
         let mut deps: Vec<TableId> = Vec::new();
         for op in self.nodes.values() {
             if let OpNode::ScanDelta(tid) = op {
-                if !deps.contains(tid) { deps.push(*tid); }
+                if !deps.contains(tid) {
+                    deps.push(*tid);
+                }
             }
         }
         deps
@@ -89,7 +91,10 @@ impl Circuit {
         let mut per_node: BTreeMap<NodeId, Vec<gnitz_wire::CircuitNodeColumn>> = BTreeMap::new();
         for (nid, kind, pos, v1, v2) in rows.node_columns {
             per_node.entry(nid).or_default().push(gnitz_wire::CircuitNodeColumn {
-                kind, position: pos, value1: v1, value2: v2,
+                kind,
+                position: pos,
+                value1: v1,
+                value2: v2,
             });
         }
         // Sort each group by (kind, position) so the typed payloads come out
@@ -118,7 +123,8 @@ where
     I: IntoIterator<Item = T>,
     T: Into<u64>,
 {
-    iter.into_iter().enumerate()
+    iter.into_iter()
+        .enumerate()
         .map(|(i, v)| (kind, i as u16, v.into(), 0u64))
         .collect()
 }
@@ -128,11 +134,16 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
     match op {
         OpNode::ScanDelta(tid) => ((OPCODE_SCAN_DELTA, Some(tid), None, None), Vec::new()),
         OpNode::ScanTrace(tid) => ((OPCODE_SCAN_TRACE_TABLE, Some(tid), None, None), Vec::new()),
-        OpNode::Filter(blob)   => ((OPCODE_FILTER, None, None, blob), Vec::new()),
-        OpNode::Map(MapKind::Projection(cols)) => {
-            ((OPCODE_MAP_PROJ, None, None, None), encode_col_list(NODE_COL_KIND_PROJ, cols))
-        }
-        OpNode::Map(MapKind::Expression { program, reindex_cols, reindex_target_tcs }) => {
+        OpNode::Filter(blob) => ((OPCODE_FILTER, None, None, blob), Vec::new()),
+        OpNode::Map(MapKind::Projection(cols)) => (
+            (OPCODE_MAP_PROJ, None, None, None),
+            encode_col_list(NODE_COL_KIND_PROJ, cols),
+        ),
+        OpNode::Map(MapKind::Expression {
+            program,
+            reindex_cols,
+            reindex_target_tcs,
+        }) => {
             // Reindex columns now live in CircuitNodeColumns; the legacy single-cell
             // `reindex` slot stays None (the physical column persists for back-compat
             // but is no longer written).
@@ -142,7 +153,9 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             // PROJ/HashRow helper stays a pure index list; the planner writes 0 on a
             // side already at T, keeping same-type / U128-vs-UUID / string circuits
             // byte-identical.
-            let kind_rows: Vec<(u64, u16, u64, u64)> = reindex_cols.iter().enumerate()
+            let kind_rows: Vec<(u64, u16, u64, u64)> = reindex_cols
+                .iter()
+                .enumerate()
                 .map(|(i, &col)| {
                     let v2 = reindex_target_tcs.get(i).copied().unwrap_or(0) as u64;
                     (NODE_COL_KIND_REINDEX, i as u16, col as u64, v2)
@@ -156,10 +169,10 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             kind_rows.push((NODE_COL_KIND_BRANCH_ID, 0, branch_id as u64, 0));
             ((OPCODE_MAP_HASH_ROW, None, None, None), kind_rows)
         }
-        OpNode::Negate         => ((OPCODE_NEGATE, None, None, None), Vec::new()),
-        OpNode::Union          => ((OPCODE_UNION, None, None, None), Vec::new()),
-        OpNode::Delay          => ((OPCODE_DELAY, None, None, None), Vec::new()),
-        OpNode::Distinct       => ((OPCODE_DISTINCT, None, None, None), Vec::new()),
+        OpNode::Negate => ((OPCODE_NEGATE, None, None, None), Vec::new()),
+        OpNode::Union => ((OPCODE_UNION, None, None, None), Vec::new()),
+        OpNode::Delay => ((OPCODE_DELAY, None, None, None), Vec::new()),
+        OpNode::Distinct => ((OPCODE_DISTINCT, None, None, None), Vec::new()),
         OpNode::Reduce { group_cols, agg } => {
             let mut kind_rows = Vec::with_capacity(group_cols.len() + 4);
             for (i, c) in group_cols.iter().enumerate() {
@@ -172,33 +185,43 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             }
             ((OPCODE_REDUCE, None, None, None), kind_rows)
         }
-        OpNode::Join(JoinKind::DeltaTrace)         => ((OPCODE_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
-        OpNode::Join(JoinKind::DeltaTraceOuter)    => ((OPCODE_JOIN_DELTA_TRACE_OUTER, None, None, None), Vec::new()),
-        OpNode::Join(JoinKind::DeltaDelta)         => ((OPCODE_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::Join(JoinKind::DeltaTrace) => ((OPCODE_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
+        OpNode::Join(JoinKind::DeltaTraceOuter) => ((OPCODE_JOIN_DELTA_TRACE_OUTER, None, None, None), Vec::new()),
+        OpNode::Join(JoinKind::DeltaDelta) => ((OPCODE_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
         OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }) => (
             (OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, None),
             vec![(NODE_COL_KIND_RANGE_JOIN, 0, n_eq as u64, rel.as_u64())],
         ),
-        OpNode::AntiJoin(JoinKind::DeltaTrace)      => ((OPCODE_ANTI_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
-        OpNode::AntiJoin(JoinKind::DeltaTraceOuter) => unreachable!("no wire opcode for anti-join outer; no builder creates this variant"),
-        OpNode::AntiJoin(JoinKind::DeltaDelta)      => ((OPCODE_ANTI_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
-        OpNode::AntiJoin(JoinKind::DeltaTraceRange { .. }) => unreachable!("no wire opcode for anti-join range; no builder creates this variant"),
-        OpNode::SemiJoin(JoinKind::DeltaTrace)      => ((OPCODE_SEMI_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
-        OpNode::SemiJoin(JoinKind::DeltaTraceOuter) => unreachable!("no wire opcode for semi-join outer; no builder creates this variant"),
-        OpNode::SemiJoin(JoinKind::DeltaDelta)      => ((OPCODE_SEMI_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
-        OpNode::SemiJoin(JoinKind::DeltaTraceRange { .. }) => unreachable!("no wire opcode for semi-join range; no builder creates this variant"),
-        OpNode::IntegrateSink  => ((OPCODE_INTEGRATE, None, None, None), Vec::new()),
+        OpNode::AntiJoin(JoinKind::DeltaTrace) => ((OPCODE_ANTI_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
+        OpNode::AntiJoin(JoinKind::DeltaTraceOuter) => {
+            unreachable!("no wire opcode for anti-join outer; no builder creates this variant")
+        }
+        OpNode::AntiJoin(JoinKind::DeltaDelta) => ((OPCODE_ANTI_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::AntiJoin(JoinKind::DeltaTraceRange { .. }) => {
+            unreachable!("no wire opcode for anti-join range; no builder creates this variant")
+        }
+        OpNode::SemiJoin(JoinKind::DeltaTrace) => ((OPCODE_SEMI_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
+        OpNode::SemiJoin(JoinKind::DeltaTraceOuter) => {
+            unreachable!("no wire opcode for semi-join outer; no builder creates this variant")
+        }
+        OpNode::SemiJoin(JoinKind::DeltaDelta) => ((OPCODE_SEMI_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::SemiJoin(JoinKind::DeltaTraceRange { .. }) => {
+            unreachable!("no wire opcode for semi-join range; no builder creates this variant")
+        }
+        OpNode::IntegrateSink => ((OPCODE_INTEGRATE, None, None, None), Vec::new()),
         OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None, None), Vec::new()),
-        OpNode::ExchangeShard { shard_cols } => {
-            ((OPCODE_EXCHANGE_SHARD, None, None, None), encode_col_list(NODE_COL_KIND_SHARD, shard_cols))
-        }
+        OpNode::ExchangeShard { shard_cols } => (
+            (OPCODE_EXCHANGE_SHARD, None, None, None),
+            encode_col_list(NODE_COL_KIND_SHARD, shard_cols),
+        ),
         OpNode::ExchangeGather => ((OPCODE_EXCHANGE_GATHER, None, None, None), Vec::new()),
-        OpNode::NullExtend { type_codes } => {
-            ((OPCODE_NULL_EXTEND, None, None, None), encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes))
-        }
-        OpNode::GatherReduce  => ((OPCODE_GATHER_REDUCE, None, None, None), Vec::new()),
-        OpNode::SeekTrace     => ((OPCODE_SEEK_TRACE, None, None, None), Vec::new()),
-        OpNode::ClearDeltas   => ((OPCODE_CLEAR_DELTAS, None, None, None), Vec::new()),
+        OpNode::NullExtend { type_codes } => (
+            (OPCODE_NULL_EXTEND, None, None, None),
+            encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes),
+        ),
+        OpNode::GatherReduce => ((OPCODE_GATHER_REDUCE, None, None, None), Vec::new()),
+        OpNode::SeekTrace => ((OPCODE_SEEK_TRACE, None, None, None), Vec::new()),
+        OpNode::ClearDeltas => ((OPCODE_CLEAR_DELTAS, None, None, None), Vec::new()),
         OpNode::PartitionFilter => ((OPCODE_PARTITION_FILTER, None, None, None), Vec::new()),
     }
 }
@@ -211,9 +234,9 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
 /// `input_delta()` call so legacy callers don't have to thread it through
 /// every method invocation.
 pub struct CircuitBuilder {
-    view_id:           u64,
+    view_id: u64,
     primary_source_id: u64,
-    next_node_id:      u64,
+    next_node_id: u64,
     nodes: std::collections::BTreeMap<NodeId, OpNode>,
     edges: std::collections::BTreeMap<(NodeId, Port), NodeId>,
 }
@@ -269,7 +292,9 @@ impl CircuitBuilder {
     pub fn map_expr(&mut self, input: NodeId, program: ExprProgram) -> NodeId {
         let blob = program.encode();
         let nid = self.alloc_node(OpNode::Map(MapKind::Expression {
-            program: blob, reindex_cols: Vec::new(), reindex_target_tcs: Vec::new(),
+            program: blob,
+            reindex_cols: Vec::new(),
+            reindex_target_tcs: Vec::new(),
         }));
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
@@ -389,9 +414,7 @@ impl CircuitBuilder {
     /// are equality-pinned (the band-join prefix); `rel` is the relation the trace
     /// slot must satisfy versus the delta slot. Mirrors `join_with_trace_node` but
     /// for `JoinKind::DeltaTraceRange`.
-    pub fn join_with_trace_range_node(
-        &mut self, delta: NodeId, trace_node: NodeId, n_eq: u8, rel: RangeRel,
-    ) -> NodeId {
+    pub fn join_with_trace_range_node(&mut self, delta: NodeId, trace_node: NodeId, n_eq: u8, rel: RangeRel) -> NodeId {
         self.binary_join(OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }), delta, trace_node)
     }
 
@@ -427,47 +450,38 @@ impl CircuitBuilder {
     /// partitioning of `input` — `reduce`/`reduce_multi` shard first;
     /// `reduce_multi_local` passes a deliberately pre-replicated input straight
     /// through. Empty `agg_specs` ⇒ `AggKind::Null` (group-only distinct-reduce).
-    fn reduce_node(
-        &mut self,
-        input: NodeId,
-        group_cols: &[usize],
-        agg_specs: &[(u64, usize)],
-    ) -> NodeId {
+    fn reduce_node(&mut self, input: NodeId, group_cols: &[usize], agg_specs: &[(u64, usize)]) -> NodeId {
         let group: Vec<u16> = group_cols.iter().map(|&c| c as u16).collect();
-        let specs: Vec<(AggFunc, u16)> = agg_specs.iter()
-            .map(|&(func_id, col)| (
-                AggFunc::from_wire(func_id).unwrap_or_else(|| panic!("unknown agg func id {func_id}")),
-                col as u16,
-            ))
+        let specs: Vec<(AggFunc, u16)> = agg_specs
+            .iter()
+            .map(|&(func_id, col)| {
+                (
+                    AggFunc::from_wire(func_id).unwrap_or_else(|| panic!("unknown agg func id {func_id}")),
+                    col as u16,
+                )
+            })
             .collect();
         let nid = self.alloc_node(OpNode::Reduce {
             group_cols: group,
-            agg: if specs.is_empty() { AggKind::Null } else { AggKind::Specs(specs) },
+            agg: if specs.is_empty() {
+                AggKind::Null
+            } else {
+                AggKind::Specs(specs)
+            },
         });
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }
 
     /// Reduce with automatic shard insertion (required for multi-worker correctness).
-    pub fn reduce(
-        &mut self,
-        input: NodeId,
-        group_cols: &[usize],
-        agg_func_id: u64,
-        agg_col_idx: usize,
-    ) -> NodeId {
+    pub fn reduce(&mut self, input: NodeId, group_cols: &[usize], agg_func_id: u64, agg_col_idx: usize) -> NodeId {
         let sharded = self.shard(input, group_cols);
         self.reduce_node(sharded, group_cols, &[(agg_func_id, agg_col_idx)])
     }
 
     /// Multi-aggregate reduce with automatic shard insertion (required for
     /// multi-worker correctness). `agg_specs`: list of (agg_func_id, col_idx).
-    pub fn reduce_multi(
-        &mut self,
-        input: NodeId,
-        group_cols: &[usize],
-        agg_specs: &[(u64, usize)],
-    ) -> NodeId {
+    pub fn reduce_multi(&mut self, input: NodeId, group_cols: &[usize], agg_specs: &[(u64, usize)]) -> NodeId {
         let sharded = self.shard(input, group_cols);
         self.reduce_node(sharded, group_cols, agg_specs)
     }
@@ -479,12 +493,7 @@ impl CircuitBuilder {
     /// `input` must already be replicated/broadcast (byte-identical *contents* per
     /// worker), so each worker's local reduce computes the SAME global aggregate.
     /// Misused on a partitioned input it silently computes per-worker partials.
-    pub fn reduce_multi_local(
-        &mut self,
-        input: NodeId,
-        group_cols: &[usize],
-        agg_specs: &[(u64, usize)],
-    ) -> NodeId {
+    pub fn reduce_multi_local(&mut self, input: NodeId, group_cols: &[usize], agg_specs: &[(u64, usize)]) -> NodeId {
         self.reduce_node(input, group_cols, agg_specs)
     }
 
@@ -536,7 +545,11 @@ impl CircuitBuilder {
 
     /// Finalises the circuit.
     pub fn build(self) -> Circuit {
-        Circuit { view_id: self.view_id, nodes: self.nodes, edges: self.edges }
+        Circuit {
+            view_id: self.view_id,
+            nodes: self.nodes,
+            edges: self.edges,
+        }
     }
 }
 
@@ -546,7 +559,12 @@ mod tests {
     use gnitz_wire::NODE_COL_KIND_REINDEX;
 
     fn empty_prog() -> ExprProgram {
-        ExprProgram { num_regs: 0, result_reg: 0, code: Vec::new(), const_strings: Vec::new() }
+        ExprProgram {
+            num_regs: 0,
+            result_reg: 0,
+            code: Vec::new(),
+            const_strings: Vec::new(),
+        }
     }
 
     /// A compound (2-column) reindex descriptor must survive into_rows → from_rows
@@ -567,7 +585,9 @@ mod tests {
         assert_eq!(node_row.3, None, "legacy reindex cell must be None for new circuits");
 
         // Exactly two NODE_COL_KIND_REINDEX rows, position-ordered, value1 = column.
-        let mut reindex_rows: Vec<_> = rows.node_columns.iter()
+        let mut reindex_rows: Vec<_> = rows
+            .node_columns
+            .iter()
             .filter(|(nid, kind, _, _, _)| *nid == map_nid && *kind == NODE_COL_KIND_REINDEX)
             .map(|&(_, _, pos, v1, v2)| (pos, v1, v2))
             .collect();
@@ -597,17 +617,22 @@ mod tests {
         let map_nid = cb.map_reindex(input, &[3, 3], &[0, type_code::I64], empty_prog());
         let rows = cb.build().into_rows();
 
-        let mut reindex_rows: Vec<_> = rows.node_columns.iter()
+        let mut reindex_rows: Vec<_> = rows
+            .node_columns
+            .iter()
             .filter(|(nid, kind, _, _, _)| *nid == map_nid && *kind == NODE_COL_KIND_REINDEX)
             .map(|&(_, _, pos, v1, v2)| (pos, v1, v2))
             .collect();
         reindex_rows.sort_by_key(|&(pos, _, _)| pos);
-        assert_eq!(reindex_rows,
-            vec![(0, 3, 0), (1, 3, type_code::I64 as u64)]);
+        assert_eq!(reindex_rows, vec![(0, 3, 0), (1, 3, type_code::I64 as u64)]);
 
         let decoded = Circuit::from_rows(7, rows).expect("from_rows");
         match decoded.nodes.get(&map_nid) {
-            Some(OpNode::Map(MapKind::Expression { reindex_cols, reindex_target_tcs, .. })) => {
+            Some(OpNode::Map(MapKind::Expression {
+                reindex_cols,
+                reindex_target_tcs,
+                ..
+            })) => {
                 assert_eq!(*reindex_cols, vec![3, 3]);
                 assert_eq!(*reindex_target_tcs, vec![0, type_code::I64]);
             }
@@ -632,7 +657,9 @@ mod tests {
         let rows = cb.build().into_rows();
 
         // Exactly one range-join param row: (n_eq=1, rel=Le).
-        let rj: Vec<_> = rows.node_columns.iter()
+        let rj: Vec<_> = rows
+            .node_columns
+            .iter()
             .filter(|(_, kind, ..)| *kind == NODE_COL_KIND_RANGE_JOIN)
             .map(|&(_, _, pos, v1, v2)| (pos, v1, v2))
             .collect();
@@ -640,8 +667,13 @@ mod tests {
 
         let decoded = Circuit::from_rows(9, rows).expect("from_rows");
         assert!(decoded.nodes.values().any(|n| matches!(n, OpNode::PartitionFilter)));
-        assert!(decoded.nodes.values().any(|n|
-            matches!(n, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 1, rel: RangeRel::Le }))));
+        assert!(decoded.nodes.values().any(|n| matches!(
+            n,
+            OpNode::Join(JoinKind::DeltaTraceRange {
+                n_eq: 1,
+                rel: RangeRel::Le
+            })
+        )));
     }
 
     /// Every `RangeRel` survives the wire round-trip with the right discriminant.
@@ -654,9 +686,13 @@ mod tests {
             let join = cb.join_with_trace_range_node(a, trace, 0, rel);
             cb.sink(join);
             let decoded = Circuit::from_rows(1, cb.build().into_rows()).expect("from_rows");
-            assert!(decoded.nodes.values().any(|n|
-                matches!(n, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 0, rel: r }) if *r == rel)),
-                "rel {rel:?} did not round-trip");
+            assert!(
+                decoded
+                    .nodes
+                    .values()
+                    .any(|n| matches!(n, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 0, rel: r }) if *r == rel)),
+                "rel {rel:?} did not round-trip"
+            );
         }
     }
 
@@ -668,12 +704,13 @@ mod tests {
         let input = cb.input_delta();
         let map_nid = cb.map_expr(input, empty_prog());
         let rows = cb.build().into_rows();
-        assert!(rows.node_columns.iter()
+        assert!(rows
+            .node_columns
+            .iter()
             .all(|(nid, kind, ..)| !(*nid == map_nid && *kind == NODE_COL_KIND_REINDEX)));
         let decoded = Circuit::from_rows(1, rows).expect("from_rows");
         match decoded.nodes.get(&map_nid) {
-            Some(OpNode::Map(MapKind::Expression { reindex_cols, .. })) =>
-                assert!(reindex_cols.is_empty()),
+            Some(OpNode::Map(MapKind::Expression { reindex_cols, .. })) => assert!(reindex_cols.is_empty()),
             other => panic!("expected Map(Expression), got {other:?}"),
         }
     }

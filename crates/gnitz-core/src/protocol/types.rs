@@ -1,7 +1,7 @@
-use std::sync::OnceLock;
 use super::error::ProtocolError;
+use std::sync::OnceLock;
 
-pub use gnitz_wire::{TypeCode, FixedInt};
+pub use gnitz_wire::{FixedInt, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS};
 
 /// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
@@ -15,18 +15,18 @@ pub fn type_code_from_u64(v: u64) -> Result<TypeCode, ProtocolError> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDef {
-    pub name:        std::string::String,
-    pub type_code:   TypeCode,
+    pub name: std::string::String,
+    pub type_code: TypeCode,
     pub is_nullable: bool,
     pub fk_table_id: u64,
-    pub fk_col_idx:  u64,
+    pub fk_col_idx: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
-    pub columns:  Vec<ColumnDef>,
+    pub columns: Vec<ColumnDef>,
     /// PK column indices in compound-key order; length >= 1.
-    pub pk_cols:  Vec<usize>,
+    pub pk_cols: Vec<usize>,
 }
 
 impl Schema {
@@ -57,7 +57,10 @@ impl Schema {
     /// unchanged.
     #[inline]
     pub fn pk_stride(&self) -> usize {
-        self.pk_cols.iter().map(|&ci| self.columns[ci].type_code.wire_stride()).sum()
+        self.pk_cols
+            .iter()
+            .map(|&ci| self.columns[ci].type_code.wire_stride())
+            .sum()
     }
 
     /// The single PK column index. Use only at boundaries that have not yet
@@ -147,15 +150,21 @@ impl Schema {
     /// secondary-index schema that uses the extra `MAX_PK_COLUMNS` slot, so a
     /// PK they accept must round-trip through the codec.
     pub fn validate_pk_cols(pk_cols: &[usize], ncols: usize) -> Result<(), &'static str> {
-        if pk_cols.is_empty()                 { return Err("pk_cols must not be empty"); }
-        if pk_cols.len() > PK_LIST_MAX_COLS   { return Err("pk_cols exceeds PK_LIST_MAX_COLS"); }
+        if pk_cols.is_empty() {
+            return Err("pk_cols must not be empty");
+        }
+        if pk_cols.len() > PK_LIST_MAX_COLS {
+            return Err("pk_cols exceeds PK_LIST_MAX_COLS");
+        }
         if pk_cols.iter().any(|&c| c >= ncols) {
             return Err("pk_cols index out of range");
         }
         // O(n²) is faster than HashSet for n ≤ 5.
         for i in 0..pk_cols.len() {
             for j in i + 1..pk_cols.len() {
-                if pk_cols[i] == pk_cols[j] { return Err("pk_cols contains duplicates"); }
+                if pk_cols[i] == pk_cols[j] {
+                    return Err("pk_cols contains duplicates");
+                }
             }
         }
         Ok(())
@@ -183,9 +192,11 @@ impl Schema {
     pub fn types_match(&self, other: &Schema) -> bool {
         self.columns.len() == other.columns.len()
             && self.pk_cols == other.pk_cols
-            && self.columns.iter().zip(&other.columns).all(|(a, b)| {
-                a.type_code == b.type_code && a.is_nullable == b.is_nullable
-            })
+            && self
+                .columns
+                .iter()
+                .zip(&other.columns)
+                .all(|(a, b)| a.type_code == b.type_code && a.is_nullable == b.is_nullable)
     }
 }
 
@@ -194,10 +205,34 @@ pub fn meta_schema() -> &'static Schema {
     static INSTANCE: OnceLock<Schema> = OnceLock::new();
     INSTANCE.get_or_init(|| Schema {
         columns: vec![
-            ColumnDef { name: "col_idx".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "type_code".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "flags".into(),     type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ColumnDef { name: "name".into(),      type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+            ColumnDef {
+                name: "col_idx".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "type_code".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "flags".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
+            ColumnDef {
+                name: "name".into(),
+                type_code: TypeCode::String,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            },
         ],
         pk_cols: vec![0],
     })
@@ -213,7 +248,10 @@ pub enum PkColumn {
     /// the numeric path is reachable from SQL/binding callers, but the SQL
     /// planner still rejects compound PRIMARY KEY, so no such batch reaches
     /// them today.
-    Bytes { stride: u8, buf: Vec<u8> },
+    Bytes {
+        stride: u8,
+        buf: Vec<u8>,
+    },
 }
 
 impl PkColumn {
@@ -234,7 +272,9 @@ impl PkColumn {
             PkColumn::Bytes { stride, buf } => buf.len() / *stride as usize,
         }
     }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     pub fn get(&self, i: usize) -> u128 {
         match self {
             PkColumn::U64s(v) => v[i] as u128,
@@ -293,7 +333,9 @@ impl PkColumn {
             PkColumn::U64s(v) => v.swap(i, j),
             PkColumn::U128s(v) => v.swap(i, j),
             PkColumn::Bytes { stride, buf } => {
-                if i == j { return; }
+                if i == j {
+                    return;
+                }
                 let s = *stride as usize;
                 let (lo, hi) = if i < j { (i, j) } else { (j, i) };
                 let (left, right) = buf.split_at_mut(hi * s);
@@ -328,7 +370,10 @@ impl PkColumn {
     /// and the SQL DML helpers all route through this.
     pub fn empty_for_schema(schema: &Schema) -> Self {
         if schema.pk_count() >= 2 {
-            PkColumn::Bytes { stride: schema.pk_stride() as u8, buf: vec![] }
+            PkColumn::Bytes {
+                stride: schema.pk_stride() as u8,
+                buf: vec![],
+            }
         } else {
             PkColumn::for_type(schema.columns[schema.pk_indices()[0]].type_code)
         }
@@ -354,10 +399,7 @@ impl PkColumn {
         match (self, src) {
             (PkColumn::U64s(d), PkColumn::U64s(s)) => d.push(s[i]),
             (PkColumn::U128s(d), PkColumn::U128s(s)) => d.push(s[i]),
-            (
-                PkColumn::Bytes { stride: sd, buf: d },
-                PkColumn::Bytes { stride: ss, buf: s },
-            ) => {
+            (PkColumn::Bytes { stride: sd, buf: d }, PkColumn::Bytes { stride: ss, buf: s }) => {
                 debug_assert_eq!(*sd, *ss);
                 let w = *sd as usize;
                 d.extend_from_slice(&s[i * w..(i + 1) * w]);
@@ -405,18 +447,24 @@ impl PkColumn {
 #[derive(Clone, Copy)]
 pub struct PkTuple {
     pub stride: u8,
-    pub buf:    [u8; MAX_PK_BYTES],
+    pub buf: [u8; MAX_PK_BYTES],
 }
 
 impl PkTuple {
     /// The "no seek" PK tuple: stride 0, splitting to the inert wire pair
     /// `(0u128, &[])`. Passed by non-seek frames (push / scan / alloc) so the
     /// call layer never hand-writes the wire split.
-    pub const EMPTY: PkTuple = PkTuple { stride: 0, buf: [0u8; MAX_PK_BYTES] };
+    pub const EMPTY: PkTuple = PkTuple {
+        stride: 0,
+        buf: [0u8; MAX_PK_BYTES],
+    };
 
     pub fn new(stride: u8) -> Self {
         debug_assert!(stride as usize <= MAX_PK_BYTES);
-        Self { stride, buf: [0u8; MAX_PK_BYTES] }
+        Self {
+            stride,
+            buf: [0u8; MAX_PK_BYTES],
+        }
     }
 
     /// Construct from a u128 whose low `stride` bytes carry the column's
@@ -457,7 +505,9 @@ impl PkTuple {
     }
 
     /// On-wire PK region bytes 0..stride.
-    pub fn as_bytes(&self) -> &[u8] { &self.buf[..self.stride as usize] }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.stride as usize]
+    }
 
     /// The PK's value as a `u128`, or `None` for a wide PK (stride > 16) that
     /// has no scalar projection and must use the byte path (`split_wire`).
@@ -508,7 +558,9 @@ impl std::fmt::Debug for PkTuple {
 
 impl PartialEq<Vec<u128>> for PkColumn {
     fn eq(&self, other: &Vec<u128>) -> bool {
-        if self.len() != other.len() { return false; }
+        if self.len() != other.len() {
+            return false;
+        }
         match self {
             PkColumn::U64s(v) => v.iter().zip(other).all(|(&a, &b)| a as u128 == b),
             PkColumn::U128s(v) => v.as_slice() == other.as_slice(),
@@ -571,27 +623,32 @@ fn variant_mismatch() -> ! {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZSetBatch {
-    pub pks:     PkColumn,
+    pub pks: PkColumn,
     pub weights: Vec<i64>,
-    pub nulls:   Vec<u64>,
+    pub nulls: Vec<u64>,
     /// One entry per schema column. Entry at pk_index is a placeholder (Fixed(vec![])).
     pub columns: Vec<ColData>,
 }
 
 impl ZSetBatch {
     pub fn new(schema: &Schema) -> Self {
-        let columns = schema.columns.iter().enumerate().map(|(ci, col)| {
-            if schema.is_pk_col(ci) {
-                ColData::Fixed(vec![])
-            } else {
-                match col.type_code {
-                    TypeCode::String => ColData::Strings(vec![]),
-                    TypeCode::Blob => ColData::Bytes(vec![]),
-                    TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => ColData::U128s(vec![]),
-                    _                => ColData::Fixed(vec![]),
+        let columns = schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ci, col)| {
+                if schema.is_pk_col(ci) {
+                    ColData::Fixed(vec![])
+                } else {
+                    match col.type_code {
+                        TypeCode::String => ColData::Strings(vec![]),
+                        TypeCode::Blob => ColData::Bytes(vec![]),
+                        TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => ColData::U128s(vec![]),
+                        _ => ColData::Fixed(vec![]),
+                    }
                 }
-            }
-        }).collect();
+            })
+            .collect();
         ZSetBatch {
             pks: PkColumn::empty_for_schema(schema),
             weights: vec![],
@@ -618,9 +675,11 @@ impl ZSetBatch {
     /// Append all rows from `other` into `self`. Panics if column layouts differ.
     pub fn extend_from(&mut self, other: &ZSetBatch) {
         assert_eq!(
-            self.columns.len(), other.columns.len(),
+            self.columns.len(),
+            other.columns.len(),
             "extend_from: column count mismatch (self {}, other {})",
-            self.columns.len(), other.columns.len(),
+            self.columns.len(),
+            other.columns.len(),
         );
         match (&mut self.pks, &other.pks) {
             (PkColumn::U64s(a), PkColumn::U64s(b)) => a.extend_from_slice(b),
@@ -649,7 +708,8 @@ impl ZSetBatch {
     /// allocation for string/bytes content. Used in scan continuation loops.
     pub fn extend_from_owned(&mut self, mut other: ZSetBatch) {
         assert_eq!(
-            self.columns.len(), other.columns.len(),
+            self.columns.len(),
+            other.columns.len(),
             "extend_from_owned: column count mismatch",
         );
         match (&mut self.pks, &mut other.pks) {
@@ -682,15 +742,17 @@ impl ZSetBatch {
         self.weights.truncate(n);
         self.nulls.truncate(n);
         for ci in 0..self.columns.len() {
-            if schema.is_pk_col(ci) { continue; }
+            if schema.is_pk_col(ci) {
+                continue;
+            }
             match &mut self.columns[ci] {
                 ColData::Fixed(buf) => {
                     let stride = schema.columns[ci].type_code.wire_stride();
                     buf.truncate(n * stride);
                 }
                 ColData::Strings(v) => v.truncate(n),
-                ColData::Bytes(v)   => v.truncate(n),
-                ColData::U128s(v)   => v.truncate(n),
+                ColData::Bytes(v) => v.truncate(n),
+                ColData::U128s(v) => v.truncate(n),
             }
         }
     }
@@ -705,10 +767,12 @@ impl ZSetBatch {
         // Without it a scalar/compound mismatch passes the stride check below
         // and only surfaces as a deep panic in sort-merge/consolidation.
         match &self.pks {
-            PkColumn::Bytes { .. } if schema.pk_count() < 2 =>
-                return Err("batch carries a wide PK buffer but schema PK is scalar".into()),
-            PkColumn::U64s(_) | PkColumn::U128s(_) if schema.pk_count() >= 2 =>
-                return Err("batch carries a scalar PK but schema PK is compound".into()),
+            PkColumn::Bytes { .. } if schema.pk_count() < 2 => {
+                return Err("batch carries a wide PK buffer but schema PK is scalar".into())
+            }
+            PkColumn::U64s(_) | PkColumn::U128s(_) if schema.pk_count() >= 2 => {
+                return Err("batch carries a scalar PK but schema PK is compound".into())
+            }
             _ => {}
         }
         if let PkColumn::Bytes { stride, buf } = &self.pks {
@@ -718,13 +782,15 @@ impl ZSetBatch {
             if *stride as usize != schema.pk_stride() {
                 return Err(format!(
                     "mismatched PK stride: expected {}, got {}",
-                    schema.pk_stride(), stride
+                    schema.pk_stride(),
+                    stride
                 ));
             }
             if buf.len() % (*stride as usize) != 0 {
                 return Err(format!(
                     "wide PK buffer length {} is not a multiple of stride {}",
-                    buf.len(), stride
+                    buf.len(),
+                    stride
                 ));
             }
         }
@@ -738,7 +804,8 @@ impl ZSetBatch {
         if self.columns.len() != schema.num_columns() {
             return Err(format!(
                 "column count {} != schema column count {}",
-                self.columns.len(), schema.num_columns()
+                self.columns.len(),
+                schema.num_columns()
             ));
         }
         for (_pi, ci, col_def) in schema.payload_columns() {
@@ -749,32 +816,25 @@ impl ZSetBatch {
                     if bytes.len() != expected {
                         return Err(format!(
                             "column {} Fixed byte length {} != expected {}",
-                            ci, bytes.len(), expected
+                            ci,
+                            bytes.len(),
+                            expected
                         ));
                     }
                 }
                 ColData::Strings(v) => {
                     if v.len() != n {
-                        return Err(format!(
-                            "column {} Strings length {} != row count {}",
-                            ci, v.len(), n
-                        ));
+                        return Err(format!("column {} Strings length {} != row count {}", ci, v.len(), n));
                     }
                 }
                 ColData::Bytes(v) => {
                     if v.len() != n {
-                        return Err(format!(
-                            "column {} Bytes length {} != row count {}",
-                            ci, v.len(), n
-                        ));
+                        return Err(format!("column {} Bytes length {} != row count {}", ci, v.len(), n));
                     }
                 }
                 ColData::U128s(v) => {
                     if v.len() != n {
-                        return Err(format!(
-                            "column {} U128s length {} != row count {}",
-                            ci, v.len(), n
-                        ));
+                        return Err(format!("column {} U128s length {} != row count {}", ci, v.len(), n));
                     }
                 }
             }
@@ -806,15 +866,20 @@ impl ZSetBatch {
 /// Columns are appended in non-PK order: the cursor automatically skips the PK
 /// column index, so callers supply only payload values.
 pub struct BatchAppender<'a> {
-    batch:      &'a mut ZSetBatch,
-    schema:     &'a Schema,
-    cursor:     usize,
+    batch: &'a mut ZSetBatch,
+    schema: &'a Schema,
+    cursor: usize,
     row_active: bool,
 }
 
 impl<'a> BatchAppender<'a> {
     pub fn new(batch: &'a mut ZSetBatch, schema: &'a Schema) -> Self {
-        BatchAppender { batch, schema, cursor: 0, row_active: false }
+        BatchAppender {
+            batch,
+            schema,
+            cursor: 0,
+            row_active: false,
+        }
     }
 
     /// Start a new row with the given primary key and weight.
@@ -830,7 +895,8 @@ impl<'a> BatchAppender<'a> {
         debug_assert!(
             !self.row_active || self.cursor == self.schema.num_payload_cols(),
             "BatchAppender::add_row: previous row got {} of {} payload columns",
-            self.cursor, self.schema.num_payload_cols(),
+            self.cursor,
+            self.schema.num_payload_cols(),
         );
         self.batch.pks.push_u128(pk);
         self.batch.weights.push(weight);
@@ -891,7 +957,10 @@ impl<'a> BatchAppender<'a> {
     /// self-sufficient — no out-of-band `null_mask` call required.
     fn mark_current_null(&mut self, ci: usize) {
         let pi = self.schema.payload_idx(ci);
-        *self.batch.nulls.last_mut()
+        *self
+            .batch
+            .nulls
+            .last_mut()
             .expect("BatchAppender: mark_current_null called before add_row") |= 1u64 << pi;
     }
 
@@ -975,7 +1044,8 @@ impl<'a> BatchAppender<'a> {
         assert!(
             self.cursor < self.schema.num_payload_cols(),
             "BatchAppender: payload cursor {} exceeds {} payload columns",
-            self.cursor, self.schema.num_payload_cols(),
+            self.cursor,
+            self.schema.num_payload_cols(),
         );
         let pk_cols = self.schema.pk_indices();
         let mut seen_payload = 0;
@@ -1000,8 +1070,20 @@ mod tests {
         // 2-column schema → 1 payload column.
         let s = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1010,10 +1092,34 @@ mod tests {
         // pk_index not at column 0 → same answer (columns.len() - pk_indices().len()).
         let s = Schema {
             columns: vec![
-                ColumnDef { name: "a".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "b".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "c".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "a".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "c".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![2],
         };
@@ -1023,18 +1129,40 @@ mod tests {
     #[test]
     fn test_num_columns() {
         let s = Schema {
-            columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         };
         assert_eq!(s.num_columns(), 1);
 
         let s = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(),  type_code: TypeCode::I64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "s".into(),  type_code: TypeCode::String, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "s".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1043,22 +1171,25 @@ mod tests {
 
     #[test]
     fn test_wire_stride_string() {
-        assert_eq!(TypeCode::String.wire_stride(), 16,
-            "String wire stride must be 16 (German String struct: 4B len + 4B prefix + 8B ptr/inline)");
+        assert_eq!(
+            TypeCode::String.wire_stride(),
+            16,
+            "String wire stride must be 16 (German String struct: 4B len + 4B prefix + 8B ptr/inline)"
+        );
     }
 
     #[test]
     fn test_wire_stride_all() {
-        assert_eq!(TypeCode::U8.wire_stride(),   1);
-        assert_eq!(TypeCode::I8.wire_stride(),   1);
-        assert_eq!(TypeCode::U16.wire_stride(),  2);
-        assert_eq!(TypeCode::I16.wire_stride(),  2);
-        assert_eq!(TypeCode::U32.wire_stride(),  4);
-        assert_eq!(TypeCode::I32.wire_stride(),  4);
-        assert_eq!(TypeCode::F32.wire_stride(),  4);
-        assert_eq!(TypeCode::U64.wire_stride(),  8);
-        assert_eq!(TypeCode::I64.wire_stride(),  8);
-        assert_eq!(TypeCode::F64.wire_stride(),  8);
+        assert_eq!(TypeCode::U8.wire_stride(), 1);
+        assert_eq!(TypeCode::I8.wire_stride(), 1);
+        assert_eq!(TypeCode::U16.wire_stride(), 2);
+        assert_eq!(TypeCode::I16.wire_stride(), 2);
+        assert_eq!(TypeCode::U32.wire_stride(), 4);
+        assert_eq!(TypeCode::I32.wire_stride(), 4);
+        assert_eq!(TypeCode::F32.wire_stride(), 4);
+        assert_eq!(TypeCode::U64.wire_stride(), 8);
+        assert_eq!(TypeCode::I64.wire_stride(), 8);
+        assert_eq!(TypeCode::F64.wire_stride(), 8);
         assert_eq!(TypeCode::String.wire_stride(), 16);
         assert_eq!(TypeCode::U128.wire_stride(), 16);
     }
@@ -1069,8 +1200,20 @@ mod tests {
     fn test_schema_eq() {
         let a = Schema {
             columns: vec![
-                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "id".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1081,15 +1224,23 @@ mod tests {
     #[test]
     fn test_schema_ne_col_name() {
         let a = Schema {
-            columns: vec![
-                ColumnDef { name: "id".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         };
         let b = Schema {
-            columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         };
         assert_ne!(a, b);
@@ -1099,15 +1250,39 @@ mod tests {
     fn test_schema_ne_pk_index() {
         let a = Schema {
             columns: vec![
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "a".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
         let b = Schema {
             columns: vec![
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "a".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![1],
         };
@@ -1117,15 +1292,23 @@ mod tests {
     #[test]
     fn test_schema_ne_type_code() {
         let a = Schema {
-            columns: vec![
-                ColumnDef { name: "x".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "x".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         };
         let b = Schema {
-            columns: vec![
-                ColumnDef { name: "x".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "x".into(),
+                type_code: TypeCode::I64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         };
         assert_ne!(a, b);
@@ -1135,9 +1318,13 @@ mod tests {
 
     fn one_col(name: &str, tc: TypeCode, nullable: bool) -> Schema {
         Schema {
-            columns: vec![
-                ColumnDef { name: name.into(), type_code: tc, is_nullable: nullable, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: name.into(),
+                type_code: tc,
+                is_nullable: nullable,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         }
     }
@@ -1171,8 +1358,20 @@ mod tests {
     fn types_match_false_on_pk_cols() {
         let a = Schema {
             columns: vec![
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "a".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1186,8 +1385,20 @@ mod tests {
         let a = one_col("pk", TypeCode::U64, false);
         let b = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(),  type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1200,8 +1411,20 @@ mod tests {
     fn test_validate_empty_batch() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "val".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1213,9 +1436,27 @@ mod tests {
     fn test_validate_valid_batch() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "val".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "name".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "val".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1232,9 +1473,13 @@ mod tests {
     #[test]
     fn test_validate_mismatched_weights() {
         let schema = Schema {
-            columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
@@ -1248,8 +1493,20 @@ mod tests {
     fn test_validate_mismatched_strings() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "s".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1266,8 +1523,20 @@ mod tests {
     fn test_validate_mismatched_fixed() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1286,8 +1555,20 @@ mod tests {
         // validation would skip the value while decoders read it as live data.
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(),  type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1308,8 +1589,20 @@ mod tests {
         // The same null bit on a NULLABLE payload column is fine.
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(),  type_code: TypeCode::I64, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1319,8 +1612,10 @@ mod tests {
             a.add_row(1u128, 1).i64_val(10);
         }
         batch.nulls[0] |= 1 << 0;
-        assert!(batch.validate(&schema).is_ok(),
-            "a null bit on a nullable column must be accepted");
+        assert!(
+            batch.validate(&schema).is_ok(),
+            "a null bit on a nullable column must be accepted"
+        );
     }
 
     /// A two-column wide-PK schema whose `Bytes` PK buffer is not a whole
@@ -1328,8 +1623,20 @@ mod tests {
     fn wide_pk_schema() -> Schema {
         Schema {
             columns: vec![
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "a".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0, 1],
         }
@@ -1342,7 +1649,10 @@ mod tests {
         // Keep weights/nulls consistent with the truncated row count (1) so
         // only the stride-divisibility check can trip.
         let batch = ZSetBatch {
-            pks: PkColumn::Bytes { stride: 16, buf: vec![0u8; 20] },
+            pks: PkColumn::Bytes {
+                stride: 16,
+                buf: vec![0u8; 20],
+            },
             weights: vec![1],
             nulls: vec![0],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
@@ -1357,7 +1667,10 @@ mod tests {
         // A zero stride would panic the `len()`/modulo divides; validate must
         // reject it as the malformed-input gate.
         let batch = ZSetBatch {
-            pks: PkColumn::Bytes { stride: 0, buf: vec![0u8; 16] },
+            pks: PkColumn::Bytes {
+                stride: 0,
+                buf: vec![0u8; 16],
+            },
             weights: vec![],
             nulls: vec![],
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
@@ -1371,15 +1684,31 @@ mod tests {
     fn test_extend_from_column_count_mismatch_panics() {
         let schema2 = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
         let schema1 = Schema {
-            columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         };
         let mut a = ZSetBatch::new(&schema1);
@@ -1393,9 +1722,27 @@ mod tests {
     fn test_extend_from_owned_matches_extend_from() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "b".into(), type_code: TypeCode::Blob, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "s".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_code: TypeCode::Blob,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1403,7 +1750,9 @@ mod tests {
             let mut z = ZSetBatch::new(&schema);
             {
                 let mut a = BatchAppender::new(&mut z, &schema);
-                a.add_row(base, 1).str_val("hello world is long enough").bytes_val(&[1, 2, 3, 4, 5]);
+                a.add_row(base, 1)
+                    .str_val("hello world is long enough")
+                    .bytes_val(&[1, 2, 3, 4, 5]);
                 a.add_row(base + 1, -1).str_val("short").bytes_val(&[9, 9]);
             }
             z
@@ -1425,15 +1774,31 @@ mod tests {
     fn test_validate_wrong_column_count() {
         let schema2 = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
         let schema1 = Schema {
-            columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "pk".into(),
+                type_code: TypeCode::U64,
+                is_nullable: false,
+                fk_table_id: 0,
+                fk_col_idx: 0,
+            }],
             pk_cols: vec![0],
         };
         let batch = ZSetBatch::new(&schema1);
@@ -1447,9 +1812,27 @@ mod tests {
     fn test_appender_single_row() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "a".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1463,18 +1846,34 @@ mod tests {
         assert_eq!(batch.weights[0], 1);
         if let ColData::Fixed(buf) = &batch.columns[1] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 100);
-        } else { panic!("expected Fixed"); }
+        } else {
+            panic!("expected Fixed");
+        }
         if let ColData::Fixed(buf) = &batch.columns[2] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 200);
-        } else { panic!("expected Fixed"); }
+        } else {
+            panic!("expected Fixed");
+        }
     }
 
     #[test]
     fn test_appender_multi_row() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1493,16 +1892,36 @@ mod tests {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 10);
             assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 20);
             assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), 30);
-        } else { panic!("expected Fixed"); }
+        } else {
+            panic!("expected Fixed");
+        }
     }
 
     #[test]
     fn test_appender_string_col() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "s".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1514,15 +1933,29 @@ mod tests {
         assert_eq!(batch.len(), 1);
         if let ColData::Strings(v) = &batch.columns[2] {
             assert_eq!(v[0], Some("hello".to_string()));
-        } else { panic!("expected Strings"); }
+        } else {
+            panic!("expected Strings");
+        }
     }
 
     #[test]
     fn test_appender_null_mask() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1538,8 +1971,20 @@ mod tests {
     fn test_appender_u128_col() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "big".into(), type_code: TypeCode::U128, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "big".into(),
+                    type_code: TypeCode::U128,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1549,7 +1994,9 @@ mod tests {
             .u128_val(((0xBEEF_u128) << 64) | 0xDEAD);
         if let ColData::U128s(v) = &batch.columns[1] {
             assert_eq!(v[0], ((0xBEEF_u128) << 64) | 0xDEAD);
-        } else { panic!("expected U128s"); }
+        } else {
+            panic!("expected U128s");
+        }
     }
 
     #[test]
@@ -1557,11 +2004,41 @@ mod tests {
         // pk(0) + U64 + String + I64 + String
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "b".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "c".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "d".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "a".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "c".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "d".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1575,16 +2052,24 @@ mod tests {
         assert_eq!(batch.len(), 1);
         if let ColData::Fixed(buf) = &batch.columns[1] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 100);
-        } else { panic!("expected Fixed for col 1"); }
+        } else {
+            panic!("expected Fixed for col 1");
+        }
         if let ColData::Strings(v) = &batch.columns[2] {
             assert_eq!(v[0], Some("hello".to_string()));
-        } else { panic!("expected Strings for col 2"); }
+        } else {
+            panic!("expected Strings for col 2");
+        }
         if let ColData::Fixed(buf) = &batch.columns[3] {
             assert_eq!(i64::from_le_bytes(buf[0..8].try_into().unwrap()), -5);
-        } else { panic!("expected Fixed for col 3"); }
+        } else {
+            panic!("expected Fixed for col 3");
+        }
         if let ColData::Strings(v) = &batch.columns[4] {
             assert_eq!(v[0], Some("world".to_string()));
-        } else { panic!("expected Strings for col 4"); }
+        } else {
+            panic!("expected Strings for col 4");
+        }
     }
 
     #[test]
@@ -1592,33 +2077,63 @@ mod tests {
         // pk_index=2: columns [A(0), B(1), PK(2), C(3)]
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "a".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "b".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "c".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "a".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "c".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![2],
         };
         let mut batch = ZSetBatch::new(&schema);
         BatchAppender::new(&mut batch, &schema)
             .add_row(99u128, 1)
-            .u64_val(10)   // cursor 0 -> ci 0 (A)
-            .u64_val(20)   // cursor 1 -> ci 1 (B)
-            .u64_val(30);  // cursor 2 -> ci 3 (C), skips pk_index=2
+            .u64_val(10) // cursor 0 -> ci 0 (A)
+            .u64_val(20) // cursor 1 -> ci 1 (B)
+            .u64_val(30); // cursor 2 -> ci 3 (C), skips pk_index=2
 
         assert_eq!(batch.pks.get(0), 99);
         if let ColData::Fixed(buf) = &batch.columns[0] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 10);
-        } else { panic!("expected Fixed for col 0"); }
+        } else {
+            panic!("expected Fixed for col 0");
+        }
         if let ColData::Fixed(buf) = &batch.columns[1] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 20);
-        } else { panic!("expected Fixed for col 1"); }
+        } else {
+            panic!("expected Fixed for col 1");
+        }
         if let ColData::Fixed(buf) = &batch.columns[2] {
             assert!(buf.is_empty(), "PK column should be empty placeholder");
         }
         if let ColData::Fixed(buf) = &batch.columns[3] {
             assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 30);
-        } else { panic!("expected Fixed for col 3"); }
+        } else {
+            panic!("expected Fixed for col 3");
+        }
     }
 
     // --- Step 4: Type-mismatch panics ---
@@ -1628,8 +2143,20 @@ mod tests {
     fn test_appender_type_mismatch_u64_on_string() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "s".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1642,8 +2169,20 @@ mod tests {
     fn test_appender_type_mismatch_i64_on_string() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "s".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1656,13 +2195,27 @@ mod tests {
     fn test_appender_type_mismatch_str_on_fixed() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
         let mut batch = ZSetBatch::new(&schema);
-        BatchAppender::new(&mut batch, &schema).add_row(1u128, 1).str_val("oops");
+        BatchAppender::new(&mut batch, &schema)
+            .add_row(1u128, 1)
+            .str_val("oops");
     }
 
     #[test]
@@ -1670,8 +2223,20 @@ mod tests {
     fn test_appender_type_mismatch_str_null_on_fixed() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1684,8 +2249,20 @@ mod tests {
     fn test_appender_type_mismatch_u128_on_fixed() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1697,9 +2274,27 @@ mod tests {
     fn test_appender_then_validate() {
         let schema = Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(), type_code: TypeCode::U64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "v".into(), type_code: TypeCode::I64, is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "s".into(), type_code: TypeCode::String, is_nullable: true, fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "v".into(),
+                    type_code: TypeCode::I64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "s".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         };
@@ -1717,8 +2312,7 @@ mod tests {
     #[test]
     fn pk_tuple_to_u128_narrow() {
         let uuid_bytes: [u8; 16] = [
-            0x00, 0x44, 0x44, 0x55, 0x16, 0xa7, 0xd4, 0x41,
-            0x9b, 0xe2, 0x00, 0x84, 0x0e, 0x55, 0x0e, 0x55,
+            0x00, 0x44, 0x44, 0x55, 0x16, 0xa7, 0xd4, 0x41, 0x9b, 0xe2, 0x00, 0x84, 0x0e, 0x55, 0x0e, 0x55,
         ];
         let t = PkTuple::from_bytes(&uuid_bytes);
         assert_eq!(t.to_u128(), Some(u128::from_le_bytes(uuid_bytes)));
@@ -1751,9 +2345,27 @@ mod tests {
     fn nullable_str_blob_schema() -> Schema {
         Schema {
             columns: vec![
-                ColumnDef { name: "pk".into(),   type_code: TypeCode::U64,    is_nullable: false, fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "s".into(),    type_code: TypeCode::String, is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
-                ColumnDef { name: "b".into(),    type_code: TypeCode::Blob,   is_nullable: true,  fk_table_id: 0, fk_col_idx: 0 },
+                ColumnDef {
+                    name: "pk".into(),
+                    type_code: TypeCode::U64,
+                    is_nullable: false,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "s".into(),
+                    type_code: TypeCode::String,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    type_code: TypeCode::Blob,
+                    is_nullable: true,
+                    fk_table_id: 0,
+                    fk_col_idx: 0,
+                },
             ],
             pk_cols: vec![0],
         }
@@ -1763,7 +2375,7 @@ mod tests {
     fn str_null_sets_null_bit() {
         let schema = nullable_str_blob_schema();
         // payload_idx(col 1 = String) = 0 → bit 0; payload_idx(col 2 = Blob) = 1 → bit 1
-        let str_bit  = 1u64 << schema.payload_idx(1);
+        let str_bit = 1u64 << schema.payload_idx(1);
         let blob_bit = 1u64 << schema.payload_idx(2);
         let mut batch = ZSetBatch::new(&schema);
         {
@@ -1776,7 +2388,7 @@ mod tests {
 
     #[test]
     fn str_null_self_sufficiency_round_trips_as_null() {
-        use crate::protocol::wal_block::{encode_wal_block, decode_wal_block, VerifyChecksum};
+        use crate::protocol::wal_block::{decode_wal_block, encode_wal_block, VerifyChecksum};
         let schema = nullable_str_blob_schema();
         let mut batch = ZSetBatch::new(&schema);
         {
@@ -1788,8 +2400,16 @@ mod tests {
         let (decoded, _, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(decoded.nulls[0], batch.nulls[0], "null bitmap round-trips");
         // The read side gates on the bitmap, so both columns must decode as NULL.
-        assert_eq!(&decoded.columns[1], &ColData::Strings(vec![None]), "String must decode as NULL");
-        assert_eq!(&decoded.columns[2], &ColData::Bytes(vec![None]),   "Blob must decode as NULL");
+        assert_eq!(
+            &decoded.columns[1],
+            &ColData::Strings(vec![None]),
+            "String must decode as NULL"
+        );
+        assert_eq!(
+            &decoded.columns[2],
+            &ColData::Bytes(vec![None]),
+            "Blob must decode as NULL"
+        );
     }
 
     // --- §5.2: add_row under-push tripwire ---
@@ -1802,7 +2422,7 @@ mod tests {
         let mut batch = ZSetBatch::new(&schema);
         let mut a = BatchAppender::new(&mut batch, &schema);
         a.add_row(1, 1).str_null(); // only 1 of 2 payload cols pushed
-        a.add_row(2, 1);            // should panic: previous row incomplete
+        a.add_row(2, 1); // should panic: previous row incomplete
     }
 
     #[test]
