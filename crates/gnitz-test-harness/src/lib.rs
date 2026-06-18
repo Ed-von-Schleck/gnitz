@@ -16,10 +16,10 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_MAX: Duration = Duration::from_millis(50);
 
 pub struct ServerHandle {
-    process:       Child,
+    process: Child,
     pub sock_path: String,
-    stderr_path:   PathBuf,
-    tmpdir:        Option<TempDir>,
+    stderr_path: PathBuf,
+    tmpdir: Option<TempDir>,
 }
 
 impl ServerHandle {
@@ -28,9 +28,8 @@ impl ServerHandle {
     }
 
     pub fn start_n(workers: usize) -> Option<Self> {
-        let bin = env::var("GNITZ_SERVER_BIN").unwrap_or_else(|_| {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string()
-        });
+        let bin = env::var("GNITZ_SERVER_BIN")
+            .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
         if !PathBuf::from(&bin).is_file() {
             return None;
         }
@@ -39,16 +38,16 @@ impl ServerHandle {
             .prefix("gnitz_test_")
             .tempdir()
             .expect("failed to create tempdir");
-        let data_dir    = tmpdir.path().join("data");
-        let sock_path   = tmpdir.path().join("gnitz.sock");
+        let data_dir = tmpdir.path().join("data");
+        let sock_path = tmpdir.path().join("gnitz.sock");
         let stderr_path = tmpdir.path().join("server_stderr.log");
-        let stderr_file = fs::File::create(&stderr_path)
-            .expect("failed to create server stderr log file");
+        let stderr_file = fs::File::create(&stderr_path).expect("failed to create server stderr log file");
 
         let mut cmd = Command::new(&bin);
-        cmd.arg(&data_dir).arg(&sock_path)
-           .stdout(Stdio::null())
-           .stderr(Stdio::from(stderr_file)); // captured for post-mortem
+        cmd.arg(&data_dir)
+            .arg(&sock_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file)); // captured for post-mortem
         if workers > 1 {
             cmd.arg(format!("--workers={workers}"));
         }
@@ -63,8 +62,10 @@ impl ServerHandle {
             if let Ok(Some(status)) = proc.try_wait() {
                 let tail = read_stderr_tail(&stderr_path);
                 let kept = tmpdir.keep();
-                panic!("server exited early ({status})\nstderr tail:\n{tail}\nartifacts preserved at: {}",
-                    kept.display());
+                panic!(
+                    "server exited early ({status})\nstderr tail:\n{tail}\nartifacts preserved at: {}",
+                    kept.display()
+                );
             }
             if Instant::now() >= deadline {
                 proc.kill().ok();
