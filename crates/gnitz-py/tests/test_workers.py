@@ -1826,10 +1826,10 @@ class TestRangeJoin:
                 "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL, "
                 "z BIGINT NOT NULL, s VARCHAR(20) NOT NULL, fy DOUBLE NOT NULL)", schema_name=sn)
             rejected = {
-                # Band LEFT (with an eq conjunct) and PURE-range LEFT (no eq conjunct,
-                # via the MAX/MIN threshold null-fill) are BOTH supported now; only
-                # RIGHT/FULL outer and the genuinely-unsupported shapes are rejected.
-                "two_range":   "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.x < b.y AND a.w > b.z",
+                # A non-order-preserving range pair (string / float content hash) and
+                # a range self-join remain rejected. A *second* range conjunct is no
+                # longer rejected — it becomes a residual post-join filter (asserted
+                # below).
                 "string_pair": "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.s < b.s",
                 "float_pair":  "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fx < b.fy",
                 "self_join":   "CREATE VIEW v AS SELECT * FROM a a1 JOIN a a2 ON a1.x < a2.x",
@@ -1840,8 +1840,14 @@ class TestRangeJoin:
                 # No view should have been registered by a rejected CREATE.
                 with pytest.raises(Exception):
                     client.resolve_table(sn, "v")
+            # Two range conjuncts now register: the first is the physical range, the
+            # second a residual post-join filter (INNER).
+            client.execute_sql(
+                "CREATE VIEW two_range_v AS SELECT * FROM a JOIN b ON a.x < b.y AND a.w > b.z",
+                schema_name=sn)
+            client.resolve_table(sn, "two_range_v")  # registered (raises if absent)
         finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+            _drop_all(client, sn, views=["v", "two_range_v"], tables=["a", "b"])
 
     # ── Band LEFT OUTER (eq prefix + range): the null-fill set-difference ──────
     #

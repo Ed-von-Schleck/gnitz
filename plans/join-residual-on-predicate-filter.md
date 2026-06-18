@@ -78,7 +78,21 @@ These are part of the design, enforced by explicit planner errors:
   (`a.s = b.n`, `a.u128 = b.i64`) still errors via `validate_join_key_pair`; it is
   **not** silently demoted to a residual equality filter. This keeps every
   existing equijoin-rejection test green and preserves the by-design key-type
-  boundaries (CLAUDE.md / `wide-pk-incremental-views.md` §2).
+  boundaries (CLAUDE.md §1).
+
+- **A cross-table column ordering comparison (`<`, `<=`, `>`, `>=`) is claimed by
+  the range classifier before it can be a residual.** The *first* cross-table
+  ordering conjunct is consumed as the one physical range (validated by
+  `validate_range_join_key_pair`); only a *second* one falls through to the
+  residual. A non-order-preserving pair (string/blob/float) presented as that
+  first range-shaped conjunct is rejected at CREATE by
+  `validate_range_join_key_pair` — it never silently becomes a residual (the
+  surviving `test_range_join_reject_string_range_pair` boundary). So a cross-table
+  string/blob col-vs-col ordering comparison reaches the residual only *behind* a
+  physical range; `<>` and any comparison against a **literal** are never claimed
+  by the classifier and always reach the residual. Routing non-order-preserving
+  ordering comparisons to the residual instead (unlocking float/string col-vs-col
+  ordering residuals, removing the first-vs-second asymmetry) is a separate plan.
 
 - **LEFT/OUTER + residual is rejected.** For an outer join the ON predicate is
   part of the *match* condition: a preserved-side row whose only physical matches
@@ -111,14 +125,19 @@ These are part of the design, enforced by explicit planner errors:
   `bind_structural` does — there is no separate surface to keep in sync.
 
 - **String/blob residuals compare by content; mixed string↔non-string is
-  rejected.** A residual comparing two German-string columns (`STRING` or `BLOB`,
-  either combination) — or a German-string column against a string literal —
-  lowers to the engine's content-comparison opcodes (`str_col_*`). Any other use
-  of a string/blob column in a residual (arithmetic, or a comparison whose other
-  operand is a non-string column) is rejected at CREATE by the hardened
-  `compile_bound_expr` (§6.6) with an `Unsupported` error — never silently
-  miscompiled. This boundary is enforced in the shared expression compiler, so it
-  also closes the same latent hole for WHERE / computed-projection expressions.
+  rejected.** The string/blob comparisons that reach the residual are a `<>`
+  between two German-string columns (`STRING` or `BLOB`, either combination) and
+  any comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`) between a German-string column
+  and a **string literal**; these lower to the engine's content-comparison
+  opcodes (`str_col_*`). A cross-table German-string **col-vs-col ordering**
+  comparison is instead governed by the range-classifier boundary above (rejected
+  as the first range-shaped conjunct; residual only behind a physical range). Any
+  other use of a string/blob column in a residual (arithmetic, or a comparison
+  whose other operand is a non-string column) is rejected at CREATE by the
+  hardened `compile_bound_expr` (§6.6) with an `Unsupported` error — never
+  silently miscompiled. This boundary is enforced in the shared expression
+  compiler, so it also closes the same latent hole for WHERE / computed-projection
+  expressions.
 
 ---
 
@@ -221,7 +240,8 @@ are orientation hints as of writing — anchor on the named items.
 - **Placement vs. exchange.** Equi INNER has no output exchange (already
   `_join_pk`-co-partitioned) — the filter is partition-local. Range INNER filters
   `merged` *before* the source-PK re-key + `cb.shard`; filtering before a linear
-  exchange is order-immaterial and correct.
+  exchange is order-immaterial and correct, and is also a throughput win — rows
+  the residual drops are never serialized or shipped across workers.
 
 ---
 
@@ -434,7 +454,11 @@ fn fold_null_test(schema: &Schema, idx: usize, want_null: bool) -> BoundExpr {
 
 **Leaf 1 — `SingleTable` (WHERE, projections, set-ops, DML).** `Binder::bind_expr`
 becomes a one-line wrapper; the moved aggregate body and column lookup are
-verbatim, so every existing WHERE/projection caller is byte-for-byte unchanged.
+verbatim, so every existing WHERE/projection caller is behaviorally unchanged
+**except** the one intended widening noted below — `IS [NOT] NULL` on a qualified
+column (`t.x IS NULL`), which the old bare-`Identifier`-only arm rejected, now
+binds like the unqualified form in *every* `bind_expr` context (WHERE, projection,
+DML), not only in residuals/HAVING.
 
 ```rust
 struct SingleTable<'a> { schema: &'a Schema }
@@ -504,7 +528,8 @@ impl LeafBinder for Having<'_> {
         // rejecting a non-grouped column (CompoundIdentifier resolves the bare name the same way).
     }
     fn bind_function(&self, f: &Function) -> Result<BoundExpr, GnitzSqlError> {
-        // current bind_having_expr Function arm: resolve_having_mapping → Avg / NullfillSum / Direct.
+        // current bind_having_expr Function arm: resolve_having_mapping → &AggMapping,
+        // then dispatch on its AggShape (Avg / NullfillSum / Direct).
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
         // current bind_having_null_test body (Nested unwrap, companion cnt==0, else reject).
@@ -576,9 +601,11 @@ in planner.rs beside their resolution context (`resolve_join_col_ref`/
 leaf's `bind_function` recurses via `bind_structural(arg, self)`, so the core
 must be generic over `L: LeafBinder` (static dispatch), not `&dyn LeafBinder`.
 
-Imports: add `UnaryOperator` and `Function` to the `sqlparser::ast` use-list in
-binder.rs; `UnaryOp` is already imported there. (`Expr`, `Value`,
-`BinaryOperator`, `BoundExpr`, `BinOp`, `find_unique_column` are already in scope.)
+Imports: add only `Function` to the `sqlparser::ast` use-list in binder.rs (the
+new leaf signatures name the bare `Function` type). `UnaryOperator` is **already**
+imported there — the existing `Expr::UnaryOp` arm uses it — as is `UnaryOp`; so
+are `Expr`, `Value`, `BinaryOperator`, `BoundExpr`, `BinOp`, and
+`find_unique_column`.
 
 ### 6.3 Reject LEFT/OUTER + residual
 
@@ -652,14 +679,19 @@ way to reach them. Both are closed here, in the shared compiler, so WHERE and
 projection expressions benefit too.
 
 **Root cause.** A `STRING`/`BLOB` value is a 16-byte German-string descriptor.
-`compile_bound_expr`'s `ColRef` arm lowers any non-float, non-128-bit column with
-`eb.load_col_int`, and the engine's `EXPR_LOAD_PAYLOAD_INT` handler has arms only
-for 1/2/4/8-byte columns (`match col_size { … _ => {} }`, `expr/batch.rs`): a
+`compile_bound_expr`'s `ColRef` arm lowers any non-float, non-`U128`/`UUID` column
+with `eb.load_col_int`, and the engine's `EXPR_LOAD_PAYLOAD_INT` handler has arms
+only for 1/2/4/8-byte columns (`match col_size { … _ => {} }`, `expr/batch.rs`): a
 16-byte column hits the no-op arm and leaves the destination register holding
 **stale scratch bytes**, which the following compare reads — silent,
-nondeterministic corruption, no error, no panic. (The row-at-a-time interpreter
-in `dml.rs` already rejects string/blob/U128 residual columns; only the
-view-circuit compiler is exposed.)
+nondeterministic corruption, no error, no panic. Every 16-byte type
+(`wire_stride == 16`) is exposed: `U128`/`UUID` are already rejected by the
+`ColRef` arm, but `STRING`, `BLOB`, **and `I128`** all fall to the int path today.
+(`I128` is never DDL-creatable — it arises only as a synthetic cross-sign
+`_join_pk`, which the user projection never surfaces — so it is currently
+unreachable, but it belongs in the same guard as a safety net.) The row-at-a-time
+interpreter in `dml.rs` (`eval_expr`/`eval_pred_row`) already rejects
+string/blob/U128 residual columns; only the view-circuit compiler is exposed.
 
 **6.6a — route blob comparisons through the German-string opcodes.**
 `try_compile_string_cmp` recognizes a comparison only when the column is
@@ -682,18 +714,24 @@ content comparison. The existing `_ => Err("… not supported for strings")` arm
 and the original-`op`-in-message behavior are unchanged (broaden the wording to
 "strings/blobs").
 
-**6.6b — reject a string/blob column reaching the integer path.** Every *valid*
-string/blob use is the six comparisons, which `try_compile_string_cmp` intercepts
-before any recursion into `compile_bound_expr`. So a `STRING`/`BLOB` reaching the
-`ColRef` arm means it is being used in arithmetic or a mixed-type comparison
-(`a.s > b.int`): reject it instead of emitting a garbage int load. Add the arm
-alongside the existing `U128`/`UUID` rejection:
+**6.6b — reject a string/blob (or any 16-byte) column reaching the integer
+path.** Every *valid* string/blob use is the six comparisons, which
+`try_compile_string_cmp` intercepts before any recursion into
+`compile_bound_expr`. So a `STRING`/`BLOB` reaching the `ColRef` arm means it is
+being used in arithmetic or a mixed-type comparison (`a.s > b.int`): reject it
+instead of emitting a garbage int load. Fold `I128` into the existing wide-int
+rejection at the same time (same 16-byte no-op hazard), so the arm covers every
+16-byte type:
 
 ```rust
 BoundExpr::ColRef(idx) => {
     let tc = schema.columns[*idx].type_code;
     match tc {
-        TypeCode::U128 | TypeCode::UUID => Err(/* unchanged */),
+        // 16-byte wide ints — extend the existing U128/UUID reject to I128.
+        TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => Err(GnitzSqlError::Unsupported(format!(
+            "column {:?} is {tc:?}; 128-bit columns cannot be used in view \
+             expressions (use a primary-key seek or CREATE INDEX instead)",
+            schema.columns[*idx].name))),
         TypeCode::String | TypeCode::Blob => Err(GnitzSqlError::Unsupported(format!(
             "column {:?} is {tc:?}; string/blob columns support only =, <>, <, <=, \
              >, >= against another string/blob column or a string literal — not \
@@ -731,15 +769,28 @@ arm).
 it (mechanical, no behavior change):
 - `extract` and `extract_with_tcs`: extend the `.map(|(l, r, …)| …)` closures with
   one trailing `_` (`|(l, r, _, _, _)|`, `|(l, r, t, range, _)|`).
-- `extract_full` returns the full `JoinPredicates`; its four `(_, _, _, range)`
-  call sites (`extract_equi_only_has_no_range`, the band/eq-prefix tests,
-  `range_pair_cross_sign_promotes`) each gain a trailing `_`.
+- `extract_full` returns the full `JoinPredicates`; its four destructuring call
+  sites (`extract_equi_only_has_no_range`, `range_rel_mapping_both_operand_orders`,
+  `extract_band_join_eq_prefix_plus_range`, `range_pair_cross_sign_promotes`) each
+  gain a trailing `_` in the `(_, _, _, range)` pattern. The `.unwrap_err()` sites
+  in the rejection tests don't destructure the tuple, so they are untouched.
 - **`range_extraction_rejections`:** drop the first assertion — `a.x < b.x AND
-  a.y < b.y` is no longer `Unsupported`; the first range is physical, the second a
-  residual. Keep the single-conjunct string/blob/float-range and same-table
-  rejections (unchanged). Add a sibling assertion that a second range conjunct
-  lands in `residual` (extract via a helper returning the full tuple, assert
-  `residual.len() == 1`).
+  a.y < b.y` is no longer `Unsupported` (it would now succeed, so `unwrap_err`
+  panics); the first range is physical, the second a residual. Keep the
+  single-conjunct string/blob/float-range rejections (still `Unsupported` — the
+  range classifier claims the lone range and `validate_range_join_key_pair`
+  rejects the non-order-preserving pair) and the same-table rejection (still
+  `Bind`, now via the anchor guard rather than the "different table" range error).
+  Add a sibling assertion that a second range conjunct lands in `residual` (extract
+  via the full tuple, assert `residual.len() == 1`).
+- **`extract_keys_rejections`:** two assertions flip from `Unsupported` to `Bind`,
+  because each conjunct now becomes a residual that the anchor guard (no
+  equijoin/range) rejects: `a.x <> b.x` and `a.x = b.x OR a.y = b.y` are both
+  residual-only ONs → `GnitzSqlError::Bind(_)`. Update those two `matches!` to
+  `Bind(_)`. The same-table `a.x = a.y` assertion already expects `Bind` and stays
+  green (now reached via the anchor guard, not the Eq-arm "different table" error).
+  The float-equi, cross-sign-equi, and arity-cap assertions are unchanged
+  (`=` is still validated as an equijoin key pair before any residual fallthrough).
 - **Add** positive extraction tests: an equijoin + inequality (`a.k=b.k AND
   a.t<>b.t`) classifies as one equi pair, no range, `residual.len() == 1`; a
   band + second-range residual yields `range.is_some()` and `residual.len() == 1`.
@@ -794,6 +845,8 @@ except for the intended widenings. Guard both:
   - band + second-range residual: `ON a.k = b.k AND a.lo < b.hi AND a.x > b.y`;
   - pure-range + residual: `ON a.x < b.y AND a.r <> b.s`;
   - residual referencing an arithmetic expr: `ON a.k = b.k AND a.lo + 1 < b.hi`;
+  - OR-group residual: `ON a.k = b.k AND (a.x > 5 OR b.y < 3)` (the catch-all now
+    collects a non-`AND` group as one residual conjunct);
   - string residual: `ON a.k = b.k AND a.s1 <> b.s2` (both `VARCHAR`);
   - blob residual: `ON a.k = b.k AND a.b1 <> b.b2` (both `BLOB`);
   - `BETWEEN` residual: `ON a.k = b.k AND a.v BETWEEN 1 AND 10`.
@@ -855,15 +908,21 @@ is exercised on both `range_per_row_seek` and `range_merge_walk` outputs.
   unsigned vs signed): handled by `compile_bound_expr`'s existing per-column-type
   opcode selection — identical machinery to WHERE-clause comparisons, not new
   here. Tests should include a same-width signed pair and an int-vs-literal case.
-- **String/blob residuals** (`a.s <> b.s`, `a.b1 < b.b2`): `try_compile_string_cmp`
-  handles the col-vs-col and col-vs-literal paths for both `STRING` and `BLOB`
-  (§6.6a); `<>` lowers to `NOT (eq)`. Comparison is by content, so a test must
-  cover values sharing a 4-byte prefix but differing in the heap tail.
-- **String/blob × non-string residual** (`a.s > b.n`, `a.s + 1`): rejected at
-  CREATE by the §6.6b `ColRef` guard with `Unsupported` — **not** silently
-  miscompiled into an integer load. This is the corruption case the audit
-  surfaced; §6.6 closes it in the shared compiler (so WHERE / projections gain
-  the same guard).
+- **String/blob residuals** (`a.s <> b.s`, `a.b1 <> b.b2`, `a.s < 'lit'`):
+  `try_compile_string_cmp` handles the col-vs-col `<>`/`=` paths and the
+  col-vs-literal path (all six comparisons) for both `STRING` and `BLOB` (§6.6a);
+  `<>` lowers to `NOT (eq)`. Comparison is by content, so a test must cover values
+  sharing a 4-byte prefix but differing in the heap tail. A cross-table
+  **col-vs-col ordering** comparison (`a.b1 < b.b2`) does **not** reach the
+  residual unless behind a physical range — the range classifier claims it first
+  and rejects the non-order-preserving pair (§3); use `<>` or a literal for an
+  unanchored string/blob comparison.
+- **String/blob/I128 × non-string residual** (`a.s > b.n`, `a.s + 1`, an `I128`
+  `_join_pk` in an enclosing-view expression): rejected at CREATE by the §6.6b
+  `ColRef` guard with `Unsupported` — **not** silently miscompiled into an integer
+  load. This is the corruption case the audit surfaced (any 16-byte type hitting
+  `load_col_int`); §6.6 closes it in the shared compiler (so WHERE / projections
+  gain the same guard).
 - **`out_cols.clone()` in the equi path** is a one-time `Vec<ColumnDef>` clone at
   CREATE (cold path), not per-row — negligible.
 - **No new circuit node types, wire opcodes, or catalog schema**: `OpNode::Filter`
@@ -879,9 +938,9 @@ is exercised on both `range_per_row_seek` and `range_merge_walk` outputs.
 
 | File | Change |
 |------|--------|
-| `crates/gnitz-sql/src/binder.rs` | §6.2: new `LeafBinder` trait + `bind_structural` core + `map_binop`/`bind_literal`/`fold_null_test` helpers (the existing `bind_expr` body, hoisted); `SingleTable` leaf; `Binder::bind_expr` → one-line wrapper; `UnaryOperator`/`Function` imports; add compound-ident null-test test |
-| `crates/gnitz-sql/src/planner.rs` | `JoinPredicates` +residual; `extract_join_predicates`/`collect_join_predicates` collect instead of reject; `cross_table_pair`, `JoinResidual` leaf, `build_residual_filter_prog`; LEFT+residual guard; filter splice in the equi path and in `build_range_join_view` (+`residual` param); `bind_having_expr`/`bind_having_null_test` → `Having` leaf; `collect_having_aggs` gains the `BETWEEN` arm (lockstep); extraction-test helper/`range_extraction_rejections` updates |
-| `crates/gnitz-sql/src/expr.rs` | §6.6: `try_compile_string_cmp` widens the two type guards to `.is_german_string()` (STRING+BLOB content comparison); `compile_bound_expr` `ColRef` arm rejects `STRING`/`BLOB` reaching the integer-load path; add blob-comparison + mixed-type-rejection unit tests |
+| `crates/gnitz-sql/src/binder.rs` | §6.2: new `LeafBinder` trait + `bind_structural` core + `map_binop`/`bind_literal`/`fold_null_test` helpers (the existing `bind_expr` body, hoisted); `SingleTable` leaf; `Binder::bind_expr` → one-line wrapper; add the `Function` import (`UnaryOperator` already imported); add compound-ident null-test test |
+| `crates/gnitz-sql/src/planner.rs` | `JoinPredicates` +residual; `extract_join_predicates`/`collect_join_predicates` collect instead of reject; `cross_table_pair`, `JoinResidual` leaf, `build_residual_filter_prog`; LEFT+residual guard; filter splice in the equi path and in `build_range_join_view` (+`residual` param); `bind_having_expr`/`bind_having_null_test` → `Having` leaf; `collect_having_aggs` gains the `BETWEEN` arm (lockstep); extraction-test helper / `range_extraction_rejections` / `extract_keys_rejections` updates |
+| `crates/gnitz-sql/src/expr.rs` | §6.6: `try_compile_string_cmp` widens the two type guards to `.is_german_string()` (STRING+BLOB content comparison); `compile_bound_expr` `ColRef` arm rejects `STRING`/`BLOB` (and folds `I128` into the `U128`/`UUID` wide reject) reaching the integer-load path; add blob-comparison + mixed-type-rejection unit tests |
 | `crates/gnitz-sql/tests/planner_join.rs` | Flip `test_range_join_reject_two_range_conjuncts`; add positive (string/blob/BETWEEN/arith) + negative (LEFT, residual-only, LIKE, mixed string↔int) residual tests |
 | `crates/gnitz-py/tests/test_join_residual.py` | New: INNER residual correctness + incremental + 3VL + string/blob content + IS NULL fold + mixed-type CREATE rejection, `WORKERS=4` |
 | `crates/gnitz-py/tests/` (HAVING) | New cases: `HAVING` with `*`/`BETWEEN`/`NOT`/arithmetic now compute (drift retired); existing HAVING cases stay green |

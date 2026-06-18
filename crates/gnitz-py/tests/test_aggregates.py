@@ -453,6 +453,89 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_having_sum_times_two(self, client):
+        """HAVING SUM(amount) * 2 > 10 — the `Mul` operator the old HAVING binder
+        lacked now binds via the unified structural core. SUM appears only in
+        HAVING (materialised by collect_having_aggs)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT category FROM orders "
+                "GROUP BY category HAVING SUM(amount) * 2 > 10",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # cat 10: SUM=8 → *2=16 > 10 PASS (SUM=8 alone would fail > 10, so the
+            #         `* 2` is load-bearing); cat 20: SUM=2 → *2=4 < 10 FAIL.
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 10, 4, 0), (2, 10, 4, 0), (3, 20, 2, 0)",
+                schema_name=sn,
+            )
+            cats = sorted(r["category"] for r in client.scan(vid))
+            assert cats == [10], f"only category 10 (SUM*2=16>10) passes, got {cats}"
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE orders", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_not_count(self, client):
+        """HAVING NOT (COUNT(*) = 1) — the `UnaryOp` (NOT) the old HAVING binder
+        lacked now binds via the unified core."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt FROM orders "
+                "GROUP BY category HAVING NOT (COUNT(*) = 1)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # cat 10: 2 rows → NOT(2=1)=true PASS; cat 20: 1 row → NOT(1=1)=false
+            #         FAIL; cat 30: 3 rows → PASS.
+            client.execute_sql(
+                "INSERT INTO orders VALUES "
+                "(1, 10, 1, 0), (2, 10, 1, 0), (3, 20, 1, 0), "
+                "(4, 30, 1, 0), (5, 30, 1, 0), (6, 30, 1, 0)",
+                schema_name=sn,
+            )
+            cats = sorted(r["category"] for r in client.scan(vid))
+            assert cats == [10, 30], f"categories with COUNT != 1, got {cats}"
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE orders", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_sum_between(self, client):
+        """HAVING SUM(amount) BETWEEN 5 AND 20 — the `BETWEEN` desugar the old
+        HAVING binder lacked, AND the collect_having_aggs lockstep: the aggregate
+        inside BETWEEN must be materialised or binding fails to resolve it."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT category FROM orders "
+                "GROUP BY category HAVING SUM(amount) BETWEEN 5 AND 20",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # cat 10: SUM=8 in [5,20] PASS; cat 20: SUM=2 < 5 FAIL;
+            # cat 30: SUM=100 > 20 FAIL.
+            client.execute_sql(
+                "INSERT INTO orders VALUES "
+                "(1, 10, 4, 0), (2, 10, 4, 0), (3, 20, 2, 0), (4, 30, 100, 0)",
+                schema_name=sn,
+            )
+            cats = sorted(r["category"] for r in client.scan(vid))
+            assert cats == [10], f"only category 10 (SUM=8 in [5,20]) passes, got {cats}"
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE orders", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_avg(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
