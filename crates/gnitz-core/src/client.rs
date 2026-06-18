@@ -293,8 +293,7 @@ impl GnitzClient {
         }
         let mut fresh = Vec::new();
         if let Some(b) = batch {                 // None ⇒ changed-to-empty list
-            for i in 0..b.len() {
-                if b.weights[i] <= 0 { continue; }
+            for i in b.live_rows() {
                 let cols = gnitz_wire::unpack_pk_cols(b.pks.get(i) as u64);
                 if !cols.is_well_formed() {
                     return Err(ClientError::ServerError(format!(
@@ -346,8 +345,7 @@ impl GnitzClient {
         // client push otherwise bypasses.
         let (_, existing, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
         if let Some(idx_batch) = existing {
-            for i in 0..idx_batch.len() {
-                if idx_batch.weights[i] <= 0 { continue; }
+            for i in idx_batch.live_rows() {
                 let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
                 if name == index_name {
                     return Err(ClientError::ServerError(format!(
@@ -379,8 +377,7 @@ impl GnitzClient {
         let idx_batch = idx_batch.ok_or_else(|| {
             ClientError::ServerError(format!("index '{index_name}' not found"))
         })?;
-        for i in 0..idx_batch.len() {
-            if idx_batch.weights[i] <= 0 { continue; }
+        for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
             if name != index_name { continue; }
 
@@ -467,13 +464,72 @@ impl GnitzClient {
         Ok(new_sid)
     }
 
+    /// Retry-until-stable drain: each pass attempts every remaining target,
+    /// requeues any that fail, and stops when the queue empties (success) or a
+    /// full pass makes no progress (return the last error). The client-side
+    /// analog of the engine's `drain_drop_targets`. It requeues on **any** `Err`,
+    /// not just a dependency error: `ClientError` collapses every engine precheck
+    /// rejection into `ServerError(String)` with no structured dependency
+    /// variant, so progress — not error-string matching — is the robust
+    /// termination signal. Convergence holds because every target is being
+    /// dropped: leaves succeed first and unblock their parents.
+    fn drain_drops<F>(&mut self, targets: Vec<String>, mut drop_one: F) -> Result<(), ClientError>
+    where
+        F: FnMut(&mut Self, &str) -> Result<(), ClientError>,
+    {
+        let mut pending = targets;
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut retry = Vec::new();
+            let mut last_err = None;
+            for name in std::mem::take(&mut pending) {
+                if let Err(e) = drop_one(self, &name) {
+                    last_err = Some(e);
+                    retry.push(name);
+                }
+            }
+            if retry.len() == before {
+                return Err(last_err.expect("a non-empty no-progress pass recorded an error"));
+            }
+            pending = retry;
+        }
+        Ok(())
+    }
+
+    /// Drop a schema and every table and view it contains, then retire the schema
+    /// row — PostgreSQL `DROP SCHEMA ... CASCADE` semantics. Members are dropped
+    /// first (views before tables, since a view may read a member table), each as
+    /// an ordinary `drop_view`/`drop_table` RPC whose member `±1` delta fires the
+    /// per-member engine hooks (columns / indices / circuit + dir teardown).
+    /// Every `conn.push` is synchronous and fully committed before the next, so
+    /// each member retraction is reflected in master's caches before the final
+    /// `SCHEMA_TAB -1` — which the engine's member-count guard (`precheck_sys_ingest`)
+    /// then accepts because the schema is empty.
+    ///
+    /// RESTRICT on external dependents: a member referenced from *outside* the
+    /// schema (a cross-schema FK child or view-on-view) stays blocked by the
+    /// engine precheck; the drain makes no progress and returns that error.
+    /// Already-dropped leaves stay dropped, but the still-referenced member and
+    /// the `SCHEMA_TAB` row are never retracted, so no orphan results.
     pub fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
-        let (_, data, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let data = data.ok_or_else(|| {
+        let (_, sdata, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
+        let sdata = sdata.ok_or_else(|| {
             ClientError::ServerError(format!("Schema '{name}' not found"))
         })?;
-        let schema_id = find_schema_id(&data, name)?;
+        let schema_id = find_schema_id(&sdata, name)?;
 
+        // Views first — a view may read a member table; the drain retries to
+        // resolve intra-schema view-on-view chains across passes.
+        let (_, vdata, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
+        let views = vdata.map_or(Ok(Vec::new()), |b| collect_schema_member_names(&b, schema_id))?;
+        self.drain_drops(views, |c, m| c.drop_view(name, m))?;
+
+        // Then tables — the drain retries to resolve intra-schema FK chains.
+        let (_, tdata, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
+        let tables = tdata.map_or(Ok(Vec::new()), |b| collect_schema_member_names(&b, schema_id))?;
+        self.drain_drops(tables, |c, m| c.drop_table(name, m))?;
+
+        // Schema now empty; the engine member-count guard accepts this row.
         let schema = schema_tab_schema();
         let mut batch = ZSetBatch::new(schema);
         BatchAppender::new(&mut batch, schema)
@@ -893,8 +949,7 @@ impl GnitzClient {
     pub fn table_replicated(&mut self, tid: u64) -> Result<bool, ClientError> {
         let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         let Some(tbl_batch) = tbl_batch else { return Ok(false); };
-        for i in 0..tbl_batch.len() {
-            if tbl_batch.weights[i] <= 0 { continue; }
+        for i in tbl_batch.live_rows() {
             if tbl_batch.pks.get(i) as u64 != tid { continue; }
             return Ok(gnitz_wire::table_flags_replicated(col_u64(&tbl_batch.columns[6], i)?));
         }
@@ -910,8 +965,7 @@ fn extract_col_entries(
     owner_kind: u64,
 ) -> Result<Vec<ColumnDef>, ClientError> {
     let mut col_entries: Vec<(u64, String, TypeCode, bool, u64, u64)> = Vec::new();
-    for i in 0..col_batch.len() {
-        if col_batch.weights[i] <= 0 { continue; }
+    for i in col_batch.live_rows() {
         let row_owner_id   = col_u64(&col_batch.columns[1], i)?;
         let row_owner_kind = col_u64(&col_batch.columns[2], i)?;
         if row_owner_id != owner_id || row_owner_kind != owner_kind { continue; }
@@ -932,8 +986,7 @@ fn extract_col_entries(
 }
 
 fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
-    for i in 0..batch.len() {
-        if batch.weights[i] <= 0 { continue; }
+    for i in batch.live_rows() {
         if col_str(&batch.columns[1], i)? == Some(name) {
             return Ok(batch.pks.get(i) as u64);
         }
@@ -946,8 +999,7 @@ fn find_table_record(
     schema_id: u64,
     table_name: &str,
 ) -> Result<TableRecord, ClientError> {
-    for i in 0..batch.len() {
-        if batch.weights[i] <= 0 { continue; }
+    for i in batch.live_rows() {
         if col_u64(&batch.columns[1], i)? != schema_id { continue; }
         if col_str(&batch.columns[2], i)? != Some(table_name) { continue; }
         return Ok(TableRecord {
@@ -968,8 +1020,7 @@ fn find_view_record(
     schema_id: u64,
     view_name: &str,
 ) -> Result<ViewRecord, ClientError> {
-    for i in 0..batch.len() {
-        if batch.weights[i] <= 0 { continue; }
+    for i in batch.live_rows() {
         if col_u64(&batch.columns[1], i)? != schema_id { continue; }
         if col_str(&batch.columns[2], i)? != Some(view_name) { continue; }
         return Ok(ViewRecord {
@@ -983,6 +1034,25 @@ fn find_view_record(
         });
     }
     Err(ClientError::ServerError(format!("View '{view_name}' not found")))
+}
+
+/// Collect the entity names of every live row in a `TABLE_TAB`/`VIEW_TAB` batch
+/// whose `schema_id` column matches. Both families carry `schema_id` at column 1
+/// and the entity name at column 2, so this mirrors `find_table_record` /
+/// `find_view_record`'s scan minus the name filter — keeping the whole set rather
+/// than one row. Drives the `drop_schema` member cascade.
+fn collect_schema_member_names(
+    batch: &ZSetBatch,
+    schema_id: u64,
+) -> Result<Vec<String>, ClientError> {
+    let mut out = Vec::new();
+    for i in batch.live_rows() {
+        if col_u64(&batch.columns[1], i)? != schema_id { continue; }
+        if let Some(name) = col_str(&batch.columns[2], i)? {
+            out.push(name.to_string());
+        }
+    }
+    Ok(out)
 }
 
 impl GnitzClient {

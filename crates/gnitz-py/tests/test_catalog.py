@@ -45,18 +45,36 @@ class TestSchemaDDL:
 
     def test_drop_nonempty_schema_cascades(self, client):
         """Dropping a non-empty schema cascades (PostgreSQL DROP SCHEMA ... CASCADE
-        semantics): every contained table, view, and index is dropped first, then
-        the schema itself."""
+        semantics): every contained table, secondary index, view, and view-on-view
+        is dropped first, then the schema itself. Crucially the members are
+        *removed*, not orphaned — proven by recreating the same schema.table /
+        schema.view afterwards (pre-fix this raised "Table or view already exists"
+        because the orphaned rows kept entity_by_qname["sn.mt"])."""
         sn = "s" + _uid()
         client.create_schema(sn)
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-        tn = "t" + _uid()
-        client.create_table(sn, tn, cols)
-        # Cascade: this succeeds without an explicit drop_table first.
+        # A table, a secondary index on it, a view over it, and a view-on-view.
+        # The cascade must drop views before tables and retry across the
+        # view-on-view chain; the table drop cascade-removes the index.
+        client.execute_sql(
+            "CREATE TABLE mt (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn)
+        client.execute_sql("CREATE INDEX ON mt (val)", schema_name=sn)
+        client.execute_sql("CREATE VIEW v1 AS SELECT * FROM mt WHERE val > 0",
+                           schema_name=sn)
+        client.execute_sql("CREATE VIEW v2 AS SELECT * FROM v1 WHERE val > 10",
+                           schema_name=sn)
+
+        # Cascade: succeeds without dropping any member explicitly first.
         client.drop_schema(sn)
-        # Re-creating the same name must now work cleanly.
+
+        # The members are gone, not orphaned: recreate the schema and the SAME
+        # schema.table + schema.view names. Both must succeed cleanly.
         client.create_schema(sn)
+        client.execute_sql(
+            "CREATE TABLE mt (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn)
+        client.execute_sql("CREATE VIEW v1 AS SELECT * FROM mt WHERE val > 0",
+                           schema_name=sn)
         client.drop_schema(sn)
 
     def test_drop_and_recreate_schema(self, client):
@@ -67,6 +85,36 @@ class TestSchemaDDL:
         s2 = client.create_schema(sn)
         assert s2 > s1
         client.drop_schema(sn)
+
+    def test_drop_schema_restrict_external_dependent(self, client):
+        """A member referenced from OUTSIDE the schema blocks the cascade
+        (RESTRICT): drop_schema errors, the still-referenced member and the s1
+        schema row stay intact, and the external dependent view is untouched."""
+        s1 = "s" + _uid()
+        s2 = "s" + _uid()
+        client.create_schema(s1)
+        client.create_schema(s2)
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+        tid = client.create_table(s1, "t", cols)
+        # A view in s2 reading s1.t (by tid) — a cross-schema dependent. This
+        # writes a DEP_TAB edge keyed by s1.t's tid, so dropping s1.t is blocked.
+        client.create_view(s2, "v", tid, gnitz.Schema(cols))
+
+        # The cascade tries to drop s1.t, which the engine precheck blocks
+        # because s2.v depends on it; the drain makes no progress and errors.
+        with pytest.raises(gnitz.GnitzError):
+            client.drop_schema(s1)
+
+        # s1.t survives (member intact), s1 still exists, and s2.v is untouched.
+        rtid, _ = client.resolve_table_id(s1, "t")
+        assert rtid == tid
+        client.resolve_table_id(s2, "v")
+
+        # Clean up in dependency order: external view first, then both schemas.
+        client.drop_view(s2, "v")
+        client.drop_schema(s1)
+        client.drop_schema(s2)
 
 
 # ===========================================================================

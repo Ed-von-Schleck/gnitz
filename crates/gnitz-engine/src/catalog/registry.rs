@@ -133,15 +133,23 @@ impl CatalogEngine {
         self.caches.schema_by_name.get(name).copied().unwrap_or(-1)
     }
 
+    /// Number of live member relations (tables + views) in schema `sid`.
+    /// Reads the per-schema caches `apply_schema_of` maintains in production
+    /// (`tables_by_schema` / `views_by_schema`), each of which drops its set once
+    /// it empties — so this returns 0 exactly when no member remains. The
+    /// engine-side non-empty-schema DROP guard (`precheck_sys_ingest`) and the
+    /// `#[cfg(test)]` `schema_is_empty` share this one probe.
+    pub(crate) fn schema_member_count(&self, sid: i64) -> usize {
+        self.caches.tables_by_schema.get(&sid).map_or(0, |s| s.len())
+            + self.caches.views_by_schema.get(&sid).map_or(0, |s| s.len())
+    }
+
     #[cfg(test)]
     pub(crate) fn schema_is_empty(&self, schema_name: &str) -> bool {
-        let sid = match self.caches.schema_by_name.get(schema_name) {
-            Some(&sid) => sid,
-            None => return true,
-        };
-        let t_empty = self.caches.tables_by_schema.get(&sid).map(|s| s.is_empty()).unwrap_or(true);
-        let v_empty = self.caches.views_by_schema.get(&sid).map(|s| s.is_empty()).unwrap_or(true);
-        t_empty && v_empty
+        match self.caches.schema_by_name.get(schema_name) {
+            Some(&sid) => self.schema_member_count(sid) == 0,
+            None => true,
+        }
     }
 
     pub fn allocate_schema_id(&mut self) -> i64 {

@@ -199,6 +199,47 @@ fn test_edge_cases() {
 // removed alongside the circuit-graph schema redesign. Equivalent end-to-end
 // coverage runs through the wire path in the Python E2E suite.
 
+// ── test_nonempty_schema_drop_rejected ───────────────────────────────────
+// The engine-side guard in precheck_sys_ingest rejects a raw SCHEMA_TAB -1 on a
+// non-empty schema BEFORE any WAL write, so a member is never orphaned. Both the
+// production client cascade and the #[cfg(test)] engine cascade empty a schema
+// first, so this bare guard is reachable only by a direct retraction — driven
+// here to prove the rejection is loud and leaves nothing orphaned.
+
+#[test]
+fn test_nonempty_schema_drop_rejected() {
+    let dir = temp_dir("nonempty_schema_drop_rejected");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    engine.create_schema("s").unwrap();
+    let tid = engine.create_table("s.t", &[u64_col_def("id")], &[0], true).unwrap();
+    let sid = engine.get_schema_id("s");
+    assert!(!engine.schema_is_empty("s"), "precondition: schema has a member");
+    assert!(engine.pending_dir_deletions.is_empty(), "precondition: no dir queued");
+
+    // A direct SCHEMA_TAB -1 (bypassing any cascade) is rejected by the guard.
+    let err = engine
+        .submit_retraction(SysFamily::Schema, sid as u128)
+        .unwrap_err();
+    assert!(err.contains("Schema not empty"),
+        "expected a non-empty-schema rejection, got: {err}");
+
+    // Nothing was orphaned: the schema, its member, and the caches all survive,
+    // and the rejected drop (running before any write) queued no dir deletion.
+    assert!(engine.has_schema("s"), "schema must survive a rejected drop");
+    assert_eq!(engine.get_by_name("s", "t"), Some(tid),
+        "member row + caches must survive a rejected drop");
+    assert!(engine.pending_dir_deletions.is_empty(),
+        "a rejected non-empty drop must queue no directory deletion");
+
+    // Emptying the schema first lets the same drop succeed (guard now passes).
+    engine.drop_table("s.t").unwrap();
+    engine.drop_schema("s").unwrap();
+    assert!(!engine.has_schema("s"), "schema gone after dropping its member first");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── test_unique_pk_metadata ──────────────────────────────────────────
 
 #[test]

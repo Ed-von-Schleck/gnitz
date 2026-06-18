@@ -361,6 +361,28 @@ impl CatalogEngine {
         drop_ids.sort_unstable();
         drop_ids.dedup();
 
+        // First DROP arm: reject a SCHEMA_TAB -1 on a non-empty schema. This is
+        // the engine-side, caller-agnostic half of the DROP SCHEMA member
+        // cascade — it runs before any WAL write, so a rejected non-empty drop
+        // queues no dir deletion and retracts no rows, converting the silent
+        // member-orphan into a loud error. The production client cascade
+        // (`GnitzClient::drop_schema`) and the `#[cfg(test)]` engine cascade both
+        // drop every member as prior, separate submissions, so by the time the
+        // schema row reaches here its member caches for that sid are empty and
+        // the guard passes. No cascade exemption is needed (unlike the IDX_TAB
+        // guard below): a SCHEMA_TAB -1 is never submitted from inside an engine
+        // cascade.
+        if table_id == SCHEMA_TAB_ID {
+            for &sid in &drop_ids {
+                let n = self.schema_member_count(sid);
+                if n > 0 {
+                    return Err(format!(
+                        "Schema not empty: {n} relation(s) remain; drop them first"));
+                }
+            }
+            return Ok(());
+        }
+
         // A UNIQUE index referenced by a FK, and any internal `__fk_` index the
         // RESTRICT seek depends on, are load-bearing — block their drop. A
         // DROP TABLE cascade legitimately retracts the owner's own indices, so
@@ -441,15 +463,15 @@ impl CatalogEngine {
             }
         }
 
-        // The view-dependency guard applies only to TABLE/VIEW drops. A
-        // SCHEMA_TAB drop carries the schema id, and schema ids (allocated from
+        // The view-dependency guard applies only to TABLE/VIEW drops, never to a
+        // SCHEMA_TAB drop. A schema drop is gated separately by the member-count
+        // arm at the top of this section (which returns before reaching here); it
+        // must not be dep-probed, because schema ids (allocated from
         // FIRST_USER_SCHEMA_ID = 3) share an i64 space with table ids (from
-        // FIRST_USER_TABLE_ID = 16): as both counters climb, a schema id
-        // eventually equals an earlier table id. dep_map is keyed by *table*
-        // id, so probing it with a schema id would spuriously match an
-        // unrelated table's dependents. A schema's own members were already
-        // dropped (and individually dep-checked) by the drop_schema cascade
-        // before this row is emitted, so the schema row itself needs no guard.
+        // FIRST_USER_TABLE_ID = 16) — as both counters climb, a schema id
+        // eventually equals an earlier table id, so probing the table-keyed
+        // dep_map with a schema id would spuriously match an unrelated table's
+        // dependents.
         if table_id == TABLE_TAB_ID || table_id == VIEW_TAB_ID {
             let dep_map = self.dag.get_dep_map();
             for &id in &drop_ids {

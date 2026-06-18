@@ -608,6 +608,13 @@ impl ZSetBatch {
         self.pks.is_empty()
     }
 
+    /// Indices of the live rows — those with positive weight. A `ZSetBatch`
+    /// row with weight ≤ 0 is a retraction/ghost, not a present element, so a
+    /// catalog scan over a batch iterates only its live rows.
+    pub fn live_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).filter(move |&i| self.weights[i] > 0)
+    }
+
     /// Append all rows from `other` into `self`. Panics if column layouts differ.
     pub fn extend_from(&mut self, other: &ZSetBatch) {
         assert_eq!(
