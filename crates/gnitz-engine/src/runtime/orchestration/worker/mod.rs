@@ -875,7 +875,9 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Backfill => {
-                if let Err(msg) = self.handle_backfill(target_id, request_id) {
+                // `target_id` is the source table; `seek_pk` carries the view to
+                // drive (0 = boot's whole-closure mode, see `handle_backfill`).
+                if let Err(msg) = self.handle_backfill(target_id, seek_pk as i64, request_id) {
                     return DispatchResult::Error(msg);
                 }
                 self.send_ack(target_id as u64, 0, request_id);
@@ -1186,7 +1188,15 @@ impl WorkerProcess {
     /// A source feeding NO exchange view has no barrier: no relay arrives, the
     /// slot stays `None`, and the worker self-terminates on local drain
     /// exhaustion.
-    fn handle_backfill(&mut self, source_tid: i64, request_id: u64) -> Result<(), String> {
+    ///
+    /// **Scope (`view_id`).** `view_id == 0` is boot's *closure* mode: drive
+    /// `source_tid`'s whole dependent closure (`evaluate_dag`), correct because
+    /// every view starts empty at boot. A nonzero `view_id` is the live
+    /// CREATE-VIEW *view-scoped* mode: drive ONLY that new view
+    /// (`backfill_view_step`). The source already has populated existing
+    /// dependents that a closure re-drive would double-count — view-scoping is
+    /// what keeps a live CREATE over a source with prior views correct.
+    fn handle_backfill(&mut self, source_tid: i64, view_id: i64, request_id: u64) -> Result<(), String> {
         let chunk_rows = self.cat().ddl_scan_chunk_rows;
         let has = self.cat().has_id(source_tid);
         // Needed to synthesize empty pad chunks. A missing source still pads.
@@ -1199,6 +1209,7 @@ impl WorkerProcess {
         } else {
             None
         };
+        let mut produced_any = false;
 
         loop {
             // `None` ⇒ partition exhausted (or absent): this round is an empty
@@ -1208,7 +1219,11 @@ impl WorkerProcess {
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
             self.exchange.backfill_pad = Some(pad);
-            self.evaluate_dag(source_tid, chunk, request_id);
+            if view_id == 0 {
+                self.evaluate_dag(source_tid, chunk, request_id);
+            } else {
+                produced_any |= self.backfill_view_step(view_id, source_tid, chunk, request_id);
+            }
             // do_exchange_wait applied any inline CHECKPOINT per relay and folded
             // it into Continue; the slot now holds the chunk's stop/continue
             // verdict, or `None` if this chunk issued no exchange (a non-barrier
@@ -1226,7 +1241,32 @@ impl WorkerProcess {
         // chunk's pinned delta registers across the source's dependent closure
         // (and assert each backfilled view is ephemeral).
         self.cat().dag.clear_regfile_deltas_from_source(source_tid);
+        // View-scoped: the closure driver (`drive_dag`) flushes each dirty view
+        // itself, but `backfill_view_step` bypasses it, so flush the new view's
+        // output trace once after the final chunk. Only when it produced rows
+        // (the first source of a join produces none — it just fills its trace).
+        if view_id != 0 && produced_any {
+            self.cat().dag.flush(view_id);
+        }
         Ok(())
+    }
+
+    /// View-scoped backfill of one chunk: run only `view_id`'s epoch over a
+    /// chunk of `source_id` (through the exchange ctx, so its scatter/relay
+    /// round runs across the worker barrier) and ingest the output. Returns
+    /// whether the view produced rows. The worker analogue of `evaluate_dag`
+    /// but for a single view rather than the source's whole closure.
+    fn backfill_view_step(&mut self, view_id: i64, source_id: i64, delta: Batch, request_id: u64) -> bool {
+        let dag = self.cat().get_dag_ptr();
+        let mut ctx = WorkerExchangeCtx {
+            worker: self,
+            tick_request_id: request_id,
+        };
+        let produced = unsafe { &mut *dag }.backfill_view_step_multi_worker(view_id, source_id, delta, &mut ctx);
+        // Apply DDL_SYNC messages deferred during exchange waits (mirrors
+        // `evaluate_dag`).
+        self.dispatch_deferred();
+        produced
     }
 
     /// Reset the SAL read side — rewind the read cursor and advance the expected

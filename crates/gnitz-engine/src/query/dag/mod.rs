@@ -725,12 +725,22 @@ impl DagEngine {
             .into_iter()
             .filter(|&t| self.view_seeds_exchange_backfill(t))
             .collect();
+        self.base_tables_reachable_from(seed_views)
+    }
 
+    /// Transitive base-table sources of `seeds` (views), deduplicated and
+    /// sorted: walk each seed's source chain — recursing through view sources —
+    /// down to the base tables. The live CREATE-VIEW drain ticks exactly these
+    /// (so every base feeding the new view, directly or through an existing view
+    /// source, has its `pending_deltas` delivered to its existing dependents
+    /// before the new view backfills); boot's `exchange_base_tables` drives them
+    /// through `fan_out_backfill`. Sorted for a reproducible drive order.
+    pub fn base_tables_reachable_from(&mut self, seeds: Vec<i64>) -> Vec<i64> {
         let mut bases: FxHashSet<i64> = FxHashSet::default();
-        // `visited` (seeded with the seed views) collapses shared sub-graphs
+        // `visited` (seeded with the input views) collapses shared sub-graphs
         // so each view is walked once.
-        let mut visited: FxHashSet<i64> = seed_views.iter().copied().collect();
-        let mut stack = seed_views;
+        let mut visited: FxHashSet<i64> = seeds.iter().copied().collect();
+        let mut stack = seeds;
         while let Some(node) = stack.pop() {
             for s in self.get_source_ids(node) {
                 match self.tables.get(&s).map(|e| e.kind) {
@@ -791,7 +801,13 @@ impl DagEngine {
     /// Loads the meta circuit once and reuses it to warm `needs_exchange_cache`
     /// for the boot `view_needs_exchange` sweep that runs right after
     /// `exchange_base_tables` over these same views.
-    fn view_seeds_exchange_backfill(&mut self, view_id: i64) -> bool {
+    ///
+    /// `pub` so the live CREATE-VIEW path can classify too: the catalog hook
+    /// gates its inline single-process `backfill_view` on
+    /// `!view_seeds_exchange_backfill` (plain projections/filters only), and the
+    /// executor drives every seeding view through the distributed backfill
+    /// (`fan_out_backfill`) instead — the same split boot uses.
+    pub fn view_seeds_exchange_backfill(&mut self, view_id: i64) -> bool {
         let loaded = self.load_meta_circuit(view_id);
         let needs_exchange = loaded
             .nodes
@@ -1288,6 +1304,41 @@ impl DagEngine {
         } else {
             // Arm 5 — no exchange: single-phase execute.
             self.execute_pre_phase(view_id, input, src_id)
+        }
+    }
+
+    /// Drive ONE view's epoch for a distributed-backfill chunk and ingest its
+    /// output into the view's family. Returns true iff the view produced rows
+    /// (the caller flushes the view once after the final chunk).
+    ///
+    /// This is the **view-scoped** analogue of `evaluate_dag_multi_worker`,
+    /// which drives `source_id`'s *whole* dependent closure. A live CREATE VIEW
+    /// must drive only the new view: the source already has populated existing
+    /// dependents that a closure re-drive would double-count. Boot has no such
+    /// dependents (every view starts empty), so it keeps the closure driver.
+    /// The new view has no dependents of its own yet, so there is nothing to
+    /// fan downstream — just run its step and ingest.
+    pub fn backfill_view_step_multi_worker<E: ExchangeCallback>(
+        &mut self,
+        view_id: i64,
+        source_id: i64,
+        delta: Batch,
+        exchange: &mut E,
+    ) -> bool {
+        if !self.tables.contains_key(&view_id) {
+            crate::storage::batch_pool::recycle(delta);
+            return false;
+        }
+        match self.execute_multi_worker_step(view_id, delta, source_id, exchange) {
+            Some(out) if out.count > 0 => {
+                self.ingest_to_family(view_id, out);
+                true
+            }
+            Some(out) => {
+                crate::storage::batch_pool::recycle(out);
+                false
+            }
+            None => false,
         }
     }
 

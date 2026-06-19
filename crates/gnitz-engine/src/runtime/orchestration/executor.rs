@@ -23,7 +23,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::catalog::{
     CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
-    SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, TABLE_TAB_ID,
+    SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, TABLE_TAB_ID, VIEW_TAB_ID,
 };
 use crate::foundation::posix_io::guard_panic;
 use crate::runtime::committer::{self, CommitRequest};
@@ -56,6 +56,29 @@ pub enum TickTrigger {
     /// Explicit drain requested by SCAN: forces the listed tids to tick
     /// even if their `tick_rows` counter is empty, then signals `done`.
     Drain { tids: Vec<i64>, done: oneshot::Sender<()> },
+    /// Pause the tick subsystem for a stop-the-world CREATE-VIEW DDL. On
+    /// dequeue the tick loop signals `acked` — proving no tick is in flight
+    /// (the loop is serial, so the prior tick has returned) and none will
+    /// start — then blocks on `release` until the DDL hands the gate back.
+    /// This drains any in-flight steady-state exchange tick before the DDL
+    /// parks the reactor; see `handle_system_dml`.
+    Quiesce {
+        acked: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    },
+}
+
+/// Releases the tick-subsystem quiesce gate when dropped, so a CREATE-VIEW
+/// stop-the-world window ends on every exit path of `handle_system_dml`
+/// (success or early-return error). Sending wakes the parked `tick_loop_async`,
+/// which resumes dequeuing ticks. `None` for non-view DDL (no gate taken).
+struct TickGate(Option<oneshot::Sender<()>>);
+impl Drop for TickGate {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 /// Shared executor state held by every task.
@@ -172,6 +195,10 @@ impl ServerExecutor {
         let num_workers = unsafe { &*dispatcher }.num_workers();
 
         reactor.attach_w2m(unsafe { &mut *dispatcher }.take_w2m());
+        // After handoff, point the dispatcher at the reactor-owned receiver so
+        // the reactor-parked CREATE-VIEW backfill can drive a synchronous
+        // collect (the reactor's `OnceCell` slot is stable for its lifetime).
+        unsafe { &mut *dispatcher }.set_w2m_receiver_ptr(reactor.w2m_receiver());
         reactor.attach_server_fd(server_fd);
 
         let sal_writer_excl = Rc::new(AsyncMutex::new(()));
@@ -413,22 +440,41 @@ async fn tick_loop_async(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>
         // fresh TimerFuture per iteration and submitted a new SQE every
         // time `rx.recv()` resolved Pending-then-Ready, which was
         // unnecessary kernel churn.
-        let has_drain = triggers.iter().any(|t| matches!(t, TickTrigger::Drain { .. }));
-        if !has_drain && !shared.any_threshold_crossed() {
+        // A Quiesce is as urgent as a Drain: skip the coalesce window (the DDL
+        // awaits its ack) and break the window if one arrives mid-coalesce.
+        let urgent = |t: &TickTrigger| matches!(t, TickTrigger::Drain { .. } | TickTrigger::Quiesce { .. });
+        let has_urgent = triggers.iter().any(urgent);
+        if !has_urgent && !shared.any_threshold_crossed() {
             let deadline = Instant::now() + Duration::from_millis(TICK_DEADLINE_MS);
             let mut timer = Box::pin(shared.reactor.timer(deadline));
             loop {
                 match select2(rx.recv(), timer.as_mut()).await {
                     Either::A(Some(more)) => {
-                        let was_drain = matches!(more, TickTrigger::Drain { .. });
+                        let was_urgent = urgent(&more);
                         triggers.push(more);
-                        if was_drain || shared.any_threshold_crossed() {
+                        if was_urgent || shared.any_threshold_crossed() {
                             break;
                         }
                     }
                     Either::A(None) => return, // channel closed mid-coalesce
                     Either::B(()) => break,    // deadline elapsed
                 }
+            }
+        }
+
+        // Process Quiesce markers before ticking: ack each (no tick is in
+        // flight — the loop is serial) and block until the DDL releases the
+        // gate, so no tick runs (and no exchange tick is in flight) while the
+        // DDL holds the catalog write lock and parks the reactor. Remaining
+        // Auto/Drain triggers in this batch run after release. No new triggers
+        // arrive meanwhile: the DDL's write lock blocks every push, so the
+        // committer fires no Auto.
+        for trigger in std::mem::take(&mut triggers) {
+            if let TickTrigger::Quiesce { acked, release } = trigger {
+                let _ = acked.send(());
+                let _ = release.await;
+            } else {
+                triggers.push(trigger);
             }
         }
 
@@ -1305,10 +1351,77 @@ async fn handle_system_dml(
     shared.committer_tx.send(CommitRequest::Barrier { done: tx });
     let _ = rx.await;
     let t_after_barrier = Instant::now();
+
+    // A CREATE VIEW over data-bearing sources is a stop-the-world operation: it
+    // drains the new view's sources and drives the view through the distributed
+    // backfill, both inline with the reactor parked (further below). The +1
+    // (create) rows are the new views; collect their ids before the write lock
+    // (the batch is not mutated before its post-lock unwrap) and use the list
+    // both to gate the quiesce here and to drive the drain/backfill below. A
+    // DROP-only VIEW batch yields none and every non-VIEW DDL is excluded — both
+    // keep the plain path. Quiesce the tick subsystem FIRST, while the reactor
+    // still runs: an in-flight steady-state exchange tick's relays are delivered
+    // by relay_loop (a reactor task), so it must finish before we park the
+    // reactor. Quiescing must precede the write lock — run_tick/relay_loop both
+    // take the read lock, so a write-lock-held quiesce would deadlock. `TickGate`
+    // releases the gate on every exit path.
+    let new_view_ids: Vec<i64> = if target_id == VIEW_TAB_ID {
+        batch.as_ref().map_or_else(Vec::new, |b| {
+            (0..b.count)
+                .filter(|&i| b.get_weight(i) > 0)
+                .map(|i| b.get_pk(i) as i64)
+                .collect()
+        })
+    } else {
+        Vec::new()
+    };
+    let view_create = !new_view_ids.is_empty();
+    let _tick_gate = if view_create {
+        let (acked_tx, acked_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        shared.tick_tx.send(TickTrigger::Quiesce {
+            acked: acked_tx,
+            release: release_rx,
+        });
+        let _ = acked_rx.await;
+        TickGate(Some(release_tx))
+    } else {
+        TickGate(None)
+    };
+
     let _write = shared.catalog_rwlock.write().await;
     let t_after_write = Instant::now();
 
     let batch = batch.unwrap();
+
+    let t_drain_start = Instant::now();
+    if !new_view_ids.is_empty() {
+        // Lock-held committer barrier: a push could have committed between the
+        // pre-lock barrier and the write lock; flush it so every straggler is
+        // resident in pending_deltas before we drain. The committer stays idle
+        // for the rest of the handler (the write lock blocks new pushes).
+        let (tx, rx) = oneshot::channel::<()>();
+        shared.committer_tx.send(CommitRequest::Barrier { done: tx });
+        let _ = rx.await;
+
+        // Drain every base table reachable from the new views — directly or
+        // through an existing view source — so its pending_deltas reaches its
+        // existing dependents exactly once and its committed store is current
+        // before the view backfills. The source set comes from the durable
+        // circuit (persisted before this VIEW_TAB row). One source per drain,
+        // each a synchronous FLAG_TICK + inline collect with the reactor parked.
+        let sources = unsafe { (*shared.catalog).dag.base_tables_reachable_from(new_view_ids.clone()) };
+        for src in sources {
+            if let Err(e) = guard_panic("view-drain", || shared.disp().drain_tick_blocking(src)) {
+                // The view is not registered yet and no zone is open, so surface
+                // the error and bail; TickGate's drop releases the gate and the
+                // write lock drops on return.
+                send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
+                return;
+            }
+        }
+    }
+    let t_drain_done = Instant::now();
     let t_mut_start = Instant::now();
 
     let cat_ptr_raw = shared.catalog;
@@ -1527,19 +1640,63 @@ async fn handle_system_dml(
         }
     }
 
+    // View-scoped distributed backfill. The view is now registered on every
+    // worker (the FLAG_DDL_SYNC broadcast above; workers apply it before the
+    // FLAG_BACKFILL below in SAL order) and the CREATE is durable. Drive each
+    // exchange / equi-join view (`view_seeds_exchange_backfill`) through the boot
+    // backfill machinery — once per source. Plain projection/filter views were
+    // already filled inline by the workers' ddl_sync hook over the (now drained)
+    // committed sources. Synchronous, reactor parked. A post-fsync Err cannot be
+    // rolled back (the CREATE is durable), so abort — restart's boot backfill
+    // rebuilds the view.
+    let t_backfill_start = Instant::now();
+    for &vid in &new_view_ids {
+        if unsafe { (*cat_ptr_raw).dag.view_seeds_exchange_backfill(vid) } {
+            // A multi-source equi-join iterates both sources: backfilling the
+            // first fills its trace (join against the empty other trace → no
+            // output), then the second produces the full join against it — the
+            // two-sided trace fill is intrinsic to the bilinear join.
+            let sources = unsafe { (*cat_ptr_raw).dag.get_source_ids(vid) };
+            for src in sources {
+                if let Err(e) = guard_panic("view-backfill", || shared.disp().fan_out_backfill(vid, src)) {
+                    gnitz_fatal_abort!(
+                        "live CREATE VIEW backfill failed after the CREATE was made durable \
+                         (view={}, source={}): {}",
+                        vid,
+                        src,
+                        e
+                    );
+                }
+            }
+        }
+    }
+    let t_backfill_done = Instant::now();
+    if !new_view_ids.is_empty() {
+        gnitz_info!(
+            "live CREATE VIEW backfill: {} view(s), drain={:?}, backfill={:?}, parked={:?}",
+            new_view_ids.len(),
+            t_drain_done.duration_since(t_drain_start),
+            t_backfill_done.duration_since(t_backfill_start),
+            t_backfill_done.duration_since(t_drain_start),
+        );
+    }
+
     send_ok_response(shared, fd, target_id, None, client_id, zone_lsn as u128, client_version).await;
     let t_ddl_done = Instant::now();
     let total = t_ddl_done.duration_since(t_ddl_start);
     if total > Duration::from_millis(20) {
         gnitz_debug!(
-            "DDL tid={} SLOW total={:?} barrier={:?} write_acq={:?} mutate={:?} broadcast={:?} fsync={:?} send={:?}",
+            "DDL tid={} SLOW total={:?} barrier={:?} write_acq={:?} drain={:?} mutate={:?} broadcast={:?} \
+             fsync={:?} backfill={:?} send={:?}",
             target_id,
             total,
             t_after_barrier.duration_since(t_ddl_start),
             t_after_write.duration_since(t_after_barrier),
+            t_drain_done.duration_since(t_drain_start),
             t_mut_done.duration_since(t_mut_start),
             t_bcast_done.duration_since(t_mut_done),
             t_fsync_done.duration_since(t_bcast_done),
+            t_backfill_done.duration_since(t_backfill_start),
             t_ddl_done.duration_since(t_fsync_done),
         );
     }

@@ -378,6 +378,16 @@ impl Reactor {
         *self.inner.relay_tx.borrow_mut() = Some(tx);
     }
 
+    /// Borrow the attached `W2mReceiver`. Valid only after `attach_w2m`.
+    /// The cursors live in shared memory and every receiver method takes
+    /// `&self`, so this shared borrow is the same access shape the reactor's
+    /// own drain uses. The reactor-parked CREATE-VIEW backfill borrows it to
+    /// drive a synchronous collect while the reactor (the only other reader)
+    /// is parked deep in that same call — sole accessor for the window.
+    pub fn w2m_receiver(&self) -> &W2mReceiver {
+        self.inner.w2m.get().expect("w2m_receiver called before attach_w2m")
+    }
+
     /// Request reactor shutdown — the next `block_until_shutdown` tick
     /// exits cleanly. Also cancels the outstanding `FUTEX_WAITV` SQE
     /// (if any) so its `FutexWaitV` array storage can be dropped

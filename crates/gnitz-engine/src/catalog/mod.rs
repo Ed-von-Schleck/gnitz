@@ -54,7 +54,7 @@ use crate::storage::{partition_arena_size, Batch, CursorHandle, PartitionedTable
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES};
 pub(crate) use sys_tables::{IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS};
-pub(crate) use sys_tables::{IDX_TAB_ID, TABLE_TAB_ID};
+pub(crate) use sys_tables::{IDX_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID};
 pub(crate) use types::ColumnDef;
 
 // Import everything from sys_tables for internal use.

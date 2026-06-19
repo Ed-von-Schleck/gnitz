@@ -291,6 +291,12 @@ pub struct MasterDispatcher {
     worker_pids: Vec<i32>,
     sal: SalWriter,
     w2m: Option<W2mReceiver>,
+    /// Set after `take_w2m` hands the receiver to the reactor: a pointer to the
+    /// reactor's stable `OnceCell` slot so `w2m()` keeps working for the one
+    /// post-handoff caller — the reactor-parked stop-the-world CREATE-VIEW
+    /// backfill. Null during boot (the receiver lives in `w2m` then). See
+    /// `set_w2m_receiver_ptr` / `w2m`.
+    w2m_ptr: *const W2mReceiver,
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
     router: PartitionRouter,

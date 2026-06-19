@@ -460,12 +460,23 @@ impl CatalogEngine {
                 // unflushed base rows (bypassing view derivation), then the worker
                 // post-recovery pass rebuilds cascade-unreachable non-exchange views
                 // and the master's backfill_exchange_views cascade re-derives the rest.
-                // Only a live CREATE backfills inline here.
+                //
+                // For a live CREATE, only a PLAIN single-source view (no exchange
+                // round, no join-shard scatter) is backfilled inline here — the
+                // single-process `backfill_view` is the right driver for it. Every
+                // exchange view AND every equi-join (`view_seeds_exchange_backfill`)
+                // is left empty here and driven by the live DDL handler's
+                // distributed, view-scoped `fan_out_backfill` (and at boot by
+                // `backfill_exchange_views`): the single-process driver under-fills
+                // them (an exchange view gets no shuffle; a multi-worker equi-join
+                // joins only each worker's local shard). The handler drains the new
+                // view's base sources before this runs, so the inline scan sees
+                // committed data and no deferred tick double-drives it.
                 if !self.ctx.in_rollback()
                     && self.ctx.is_live()
                     && self.active_part_start != self.active_part_end
                     && self.dag.ensure_compiled(vid)
-                    && !self.dag.view_needs_exchange(vid)
+                    && !self.dag.view_seeds_exchange_backfill(vid)
                 {
                     self.backfill_view(vid);
                 }

@@ -207,7 +207,9 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) {
 /// intermediate views without re-driving any shared closure.
 fn backfill_exchange_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispatcher) -> Result<(), String> {
     for base in catalog.dag.exchange_base_tables() {
-        dispatcher.fan_out_backfill(base)?;
+        // view_id = 0: boot's whole-closure mode — drive every view above
+        // `base` once (each starts empty at boot).
+        dispatcher.fan_out_backfill(0, base)?;
     }
     Ok(())
 }

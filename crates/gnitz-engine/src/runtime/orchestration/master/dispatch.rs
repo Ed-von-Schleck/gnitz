@@ -4,6 +4,22 @@
 
 use super::*;
 
+/// Timeout for the synchronous `W2mReceiver::wait_for` fallback in the two
+/// reactor-driven-but-sometimes-parked collect loops below.
+///
+/// `wait_for` returns the instant a worker bumps `reader_seq` *as long as the
+/// futex wake reaches it*. At boot (no reactor) and in the steady state nothing
+/// competes for that wake, so the loop is woken promptly and this value is just
+/// an unhit ceiling. But the reactor-parked CREATE-VIEW backfill runs these
+/// loops while the reactor's `FUTEX_WAITV` SQE is still armed on the same
+/// `reader_seq` words: the kernel can deliver a worker's wake to that op (whose
+/// CQE then sits unprocessed — the reactor is parked here) instead of to this
+/// `futex_wait`, which would otherwise sleep the full timeout while the reply
+/// already sits in the ring. A short timeout caps that stolen-wake stall (the
+/// loop re-`try_read`s every iteration and finds the reply) at a few ms instead
+/// of ~1 s, with negligible extra polling on the never-stalled paths.
+const W2M_SYNC_WAIT_MS: i32 = 10;
+
 impl MasterDispatcher {
     pub fn new(
         num_workers: usize,
@@ -17,6 +33,7 @@ impl MasterDispatcher {
             worker_pids,
             sal,
             w2m: Some(w2m),
+            w2m_ptr: std::ptr::null(),
             catalog,
             router: PartitionRouter::new(),
             unique_filters: FxHashMap::default(),
@@ -296,7 +313,22 @@ impl MasterDispatcher {
         self.w2m.take().expect("take_w2m called twice")
     }
 
+    /// Record a pointer to the reactor-owned receiver (a stable `OnceCell` slot
+    /// for the reactor's lifetime). After this, `w2m()` resolves through the
+    /// pointer, keeping the synchronous collect helpers usable by the
+    /// reactor-parked stop-the-world CREATE-VIEW backfill — the sole post-handoff
+    /// reader, running while the reactor (the only other reader) is parked in
+    /// that same call. Called once by the executor right after `take_w2m`.
+    pub fn set_w2m_receiver_ptr(&mut self, p: *const W2mReceiver) {
+        self.w2m_ptr = p;
+    }
+
     fn w2m(&self) -> &W2mReceiver {
+        // After handoff the receiver lives in the reactor; borrow it via the
+        // recorded pointer. Before handoff (boot) the dispatcher owns it.
+        if !self.w2m_ptr.is_null() {
+            return unsafe { &*self.w2m_ptr };
+        }
         self.w2m.as_ref().expect("W2mReceiver already handed off to reactor")
     }
 
@@ -337,7 +369,7 @@ impl MasterDispatcher {
                     }
                     None => {
                         self.fail_if_worker_dead("before completing recovery sync")?;
-                        let _ = self.w2m().wait_for(w, 1000);
+                        let _ = self.w2m().wait_for(w, W2M_SYNC_WAIT_MS);
                     }
                 }
             }
@@ -354,13 +386,24 @@ impl MasterDispatcher {
         self.num_workers
     }
 
-    /// Collect ACKs from all workers, relaying exchange messages
-    /// inline. Bootstrap-only: called by `fan_out_backfill` before the
-    /// reactor is up, so we walk each ring serially with
-    /// `W2mReceiver::wait_for`. Maintains its own ExchangeAccumulator
-    /// since the reactor's is not yet wired.
+    /// Collect ACKs from all workers, relaying exchange messages inline by
+    /// walking each ring serially with `W2mReceiver::wait_for` and a private
+    /// `ExchangeAccumulator`. Two callers, both holding SAL-writer exclusivity
+    /// with no concurrent relay to service:
+    /// - **Boot** (`fan_out_backfill`), before the reactor is up.
+    /// - **Live CREATE VIEW**, the reactor-parked stop-the-world DDL window:
+    ///   `handle_system_dml` holds the catalog write lock (so the async
+    ///   `relay_loop`, which would take the read lock, cannot run and cannot
+    ///   deadlock) and drives the backfill/drain inline. `w2m()` resolves
+    ///   through the reactor's receiver there (see `set_w2m_receiver_ptr`).
+    ///
+    /// `checkpoint_allowed`: a backfill may stamp CHECKPOINT to reclaim SAL
+    /// space mid-stream (workers re-epoch inline). A drain TICK must NOT —
+    /// it carries no backfill pad, so a CHECKPOINT would advance the master
+    /// epoch while workers stay on the old one and wedge the cluster; pass
+    /// `false` to force CONTINUE.
     #[allow(clippy::needless_range_loop)]
-    fn collect_acks_and_relay(&mut self, _target_id: i64) -> Result<(), String> {
+    fn collect_acks_and_relay(&mut self, checkpoint_allowed: bool) -> Result<(), String> {
         let nw = self.num_workers;
         let mut collected = vec![false; nw];
         let mut remaining = nw;
@@ -410,7 +453,9 @@ impl MasterDispatcher {
                         // cursor (a single round fits the 1/8 reserve).
                         let decision = if relay.all_pad {
                             BACKFILL_DECISION_STOP
-                        } else if !self.sal_relay_space_ok_raw() || Self::inject_backfill_reclaim() {
+                        } else if checkpoint_allowed
+                            && (!self.sal_relay_space_ok_raw() || Self::inject_backfill_reclaim())
+                        {
                             pending_reset = true;
                             BACKFILL_DECISION_CHECKPOINT
                         } else {
@@ -432,7 +477,7 @@ impl MasterDispatcher {
                 self.fail_if_worker_dead("during backfill relay")?;
                 // Wait for the first still-active worker to publish.
                 if let Some(next) = (0..nw).find(|&w| !collected[w]) {
-                    let _ = self.w2m().wait_for(next, 1000);
+                    let _ = self.w2m().wait_for(next, W2M_SYNC_WAIT_MS);
                 }
             }
         }
@@ -444,11 +489,14 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     /// Invariant: callers must live on a path that owns SAL checkpoint
-    /// exclusivity. Today that is the bootstrap backfill and the
-    /// committer task. Async fan-out / tick / DDL paths must NOT call
-    /// this — a concurrent FLAG_FLUSH races the committer's own and
-    /// orphans SAL writes straddling `sal.checkpoint_reset`. See
-    /// async-invariants.md §III.3a.
+    /// exclusivity. Today that is the bootstrap backfill, the committer task,
+    /// and the reactor-parked stop-the-world CREATE-VIEW backfill
+    /// (`handle_system_dml` holds the catalog write lock with the committer
+    /// proven idle and the reactor parked, so no other SAL writer exists —
+    /// the same exclusivity boot has). The *async* fan-out / tick / steady-state
+    /// DDL paths must NOT call this — a concurrent FLAG_FLUSH races the
+    /// committer's own and orphans SAL writes straddling `sal.checkpoint_reset`.
+    /// See async-invariants.md §III.3a.
     pub(crate) fn maybe_checkpoint(&mut self) -> Result<(), String> {
         if !self.sal.needs_checkpoint() {
             return Ok(());
@@ -734,15 +782,54 @@ impl MasterDispatcher {
     // Fan-out operations
     // -----------------------------------------------------------------------
 
-    /// Re-derive the whole dependent closure of one base table. The broadcast
-    /// targets `source_id`; the worker drives `source_id`'s closure off that
-    /// alone, so the frame's `seek_pk` is unused here and left zero.
-    pub fn fan_out_backfill(&mut self, source_id: i64) -> Result<(), String> {
+    /// Distributed backfill from `source_id`. `view_id` selects the scope,
+    /// carried to the worker in the frame's `seek_pk`:
+    /// - `view_id == 0` — boot mode: drive `source_id`'s whole dependent
+    ///   closure (every view starts empty at boot, so this is correct and
+    ///   re-derives each view once).
+    /// - `view_id != 0` — live CREATE-VIEW mode: drive ONLY that view. The
+    ///   source already has populated existing dependents that a closure
+    ///   re-drive would double-count.
+    ///
+    /// May `maybe_checkpoint` to reclaim SAL space before a large source; the
+    /// collect loop may further CHECKPOINT mid-stream. Both are safe on the
+    /// SAL-exclusive, no-concurrent-relay paths this runs on (boot; the
+    /// reactor-parked DDL window).
+    pub fn fan_out_backfill(&mut self, view_id: i64, source_id: i64) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(source_id);
         let lsn = self.next_lsn();
-        self.send_broadcast(source_id, lsn, FLAG_BACKFILL, None, &schema, &col_names, 0, 0, 0)?;
-        self.collect_acks_and_relay(source_id)
+        self.send_broadcast(
+            source_id,
+            lsn,
+            FLAG_BACKFILL,
+            None,
+            &schema,
+            &col_names,
+            view_id as u128,
+            0,
+            0,
+        )?;
+        self.collect_acks_and_relay(true)
+    }
+
+    /// Synchronously drain one source's pending ticks during the reactor-parked
+    /// CREATE-VIEW window: emit a FLAG_TICK, signal, and collect each worker's
+    /// ACK while relaying its exchange dependents inline. The `handle_system_dml`
+    /// caller holds the catalog write lock and the tick gate with the committer
+    /// idle, so the async `relay_loop` cannot run (no deadlock) and no other tick
+    /// races this. Checkpointing is forced off: a tick carries no backfill pad,
+    /// so a CHECKPOINT verdict would advance only the master's epoch and wedge
+    /// the cluster (see `collect_acks_and_relay`).
+    pub(crate) fn drain_tick_blocking(&mut self, source_id: i64) -> Result<(), String> {
+        let nw = self.num_workers;
+        // The synchronous collect reads W2M rings directly and routes neither by
+        // req_id; any value works. (Boot's `fan_out_backfill` likewise passes 0.)
+        let req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
+        let lsn = self.next_lsn();
+        self.write_tick_group(source_id, lsn, &req_ids[..nw])?;
+        self.signal_all();
+        self.collect_acks_and_relay(false)
     }
 
     // Async fan-outs take `*mut Self` instead of `&mut self` because the
@@ -1926,7 +2013,7 @@ mod worker_liveness_tests {
         let dead = spawn_and_reap_dead();
         let (mut disp, ptrs) = probe_dispatcher(vec![dead]);
         let err = disp
-            .collect_acks_and_relay(0)
+            .collect_acks_and_relay(true)
             .expect_err("a dead worker must fail the backfill relay");
         assert!(err.contains("worker 0"), "error names the dead worker: {err}");
         assert!(
