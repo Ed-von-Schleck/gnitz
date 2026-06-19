@@ -1,8 +1,9 @@
 use crate::ast_util::{extract_name, extract_table_factor_name};
-use crate::binder::{
-    bind_structural, find_unique_column, fold_null_test, resolve_qualified_column, resolve_unqualified_column, Binder,
-    LeafBinder,
+use crate::bind::{
+    bind_structural, find_unique_column, fold_null_test, resolve_qualified_column, resolve_unqualified_column,
+    AliasMap, Binder, LeafBinder, ResolvedRelation,
 };
+use crate::codec::project_schema::{build_projection, ProjItem};
 use crate::dml;
 use crate::error::GnitzSqlError;
 use crate::expr::compile_bound_expr;
@@ -859,8 +860,8 @@ fn execute_create_view(
     // a PK value requested as a payload column.
     let k = source_schema.pk_count();
     let needs_expr_map = items[k..].iter().any(|item| match item {
-        ProjectionItem::Computed { .. } => true,
-        ProjectionItem::PassThrough { src_col } => source_schema.is_pk_col(*src_col),
+        ProjItem::Computed { .. } => true,
+        ProjItem::PassThrough { src_col } => source_schema.is_pk_col(*src_col),
     });
 
     // Allocate view_id
@@ -882,11 +883,11 @@ fn execute_create_view(
         for (payload_idx, item) in items[k..].iter().enumerate() {
             let payload_idx = payload_idx as u32;
             match item {
-                ProjectionItem::PassThrough { src_col } => {
+                ProjItem::PassThrough { src_col } => {
                     let tc = source_schema.columns[*src_col].type_code as u32;
                     eb.copy_col(tc, *src_col as u32, payload_idx);
                 }
-                ProjectionItem::Computed { bound_expr, .. } => {
+                ProjItem::Computed { bound_expr, .. } => {
                     let (reg, _) = compile_bound_expr(bound_expr, &source_schema, &mut eb)?;
                     // EMIT writes the raw register bits via append_int — correct for float.
                     eb.emit_col(reg, payload_idx);
@@ -897,7 +898,7 @@ fn execute_create_view(
         cb.map_expr(filtered, program)
     } else if items.len() < source_schema.columns.len()
         || items.iter().enumerate().any(|(i, item)| match item {
-            ProjectionItem::PassThrough { src_col } => *src_col != i,
+            ProjItem::PassThrough { src_col } => *src_col != i,
             _ => false,
         })
     {
@@ -912,7 +913,7 @@ fn execute_create_view(
         let cols: Vec<usize> = items[k..]
             .iter()
             .filter_map(|i| match i {
-                ProjectionItem::PassThrough { src_col } => Some(*src_col),
+                ProjItem::PassThrough { src_col } => Some(*src_col),
                 _ => None,
             })
             .collect();
@@ -1023,131 +1024,6 @@ fn execute_create_index(
     Ok(SqlResult::IndexCreated { index_id })
 }
 
-enum ProjectionItem {
-    PassThrough { src_col: usize },
-    Computed { bound_expr: BoundExpr, _out_type: TypeCode },
-}
-
-fn build_projection(
-    projection: &[SelectItem],
-    source_schema: &Schema,
-    binder: &Binder<'_>,
-) -> Result<(Vec<ProjectionItem>, Vec<ColumnDef>), GnitzSqlError> {
-    let mut items: Vec<ProjectionItem> = Vec::new();
-    let mut out_cols: Vec<ColumnDef> = Vec::new();
-
-    for (idx, item) in projection.iter().enumerate() {
-        match item {
-            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                let col_idx = find_unique_column(&source_schema.columns, &ident.value)?
-                    .ok_or_else(|| GnitzSqlError::Bind(format!("column '{}' not found", ident.value)))?;
-                items.push(ProjectionItem::PassThrough { src_col: col_idx });
-                out_cols.push(source_schema.columns[col_idx].clone());
-            }
-            SelectItem::Wildcard(_) => {
-                // No early return: `SELECT *` expands here and then flows through
-                // the PK-placement loop below, so the source PK is pinned to slots
-                // 0..k even when it is not the table's leading column. A PK already
-                // at the front degenerates to the verbatim identity order.
-                for i in 0..source_schema.columns.len() {
-                    items.push(ProjectionItem::PassThrough { src_col: i });
-                    out_cols.push(source_schema.columns[i].clone());
-                }
-            }
-            SelectItem::ExprWithAlias { expr, alias } => {
-                let bound = binder.bind_expr(expr, source_schema)?;
-                // A direct column reference with an alias is a PassThrough with a
-                // renamed output column, not a computation — so an aliased PK
-                // column is found by the placement scan and moved like any other.
-                if let BoundExpr::ColRef(ci) = bound {
-                    items.push(ProjectionItem::PassThrough { src_col: ci });
-                    let mut col = source_schema.columns[ci].clone();
-                    col.name = alias.value.clone();
-                    out_cols.push(col);
-                } else {
-                    let out_type = bound.infer_type(source_schema);
-                    items.push(ProjectionItem::Computed {
-                        bound_expr: bound,
-                        _out_type: out_type,
-                    });
-                    out_cols.push(ColumnDef {
-                        name: alias.value.clone(),
-                        type_code: out_type,
-                        is_nullable: true,
-                        fk_table_id: 0,
-                        fk_col_idx: 0,
-                    });
-                }
-            }
-            SelectItem::UnnamedExpr(expr) => {
-                let bound = binder.bind_expr(expr, source_schema)?;
-                // A qualified (t.col) or parenthesized ((col)) reference binds to
-                // a bare ColRef — a verbatim pass-through, like the aliased arm.
-                // Without this, a qualified PK column would be wrapped as Computed
-                // (and formerly rejected), and a qualified non-PK column would be
-                // renamed to _exprN and needlessly recomputed.
-                if let BoundExpr::ColRef(ci) = bound {
-                    items.push(ProjectionItem::PassThrough { src_col: ci });
-                    out_cols.push(source_schema.columns[ci].clone());
-                } else {
-                    let out_type = bound.infer_type(source_schema);
-                    items.push(ProjectionItem::Computed {
-                        bound_expr: bound,
-                        _out_type: out_type,
-                    });
-                    out_cols.push(ColumnDef {
-                        name: format!("_expr{idx}"),
-                        type_code: out_type,
-                        is_nullable: true,
-                        fk_table_id: 0,
-                        fk_col_idx: 0,
-                    });
-                }
-            }
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "unsupported SELECT item in CREATE VIEW projection".to_string(),
-                ))
-            }
-        }
-    }
-
-    // Pass the full source PK through to the view output: every source PK column
-    // occupies output slots 0..k in pk_indices() order, matching the engine's
-    // build_map_output_schema (which copies all PK columns to the front via
-    // copy_pk_columns_into). One loop serves every PK arity — k == 1 reduces to a
-    // single-column move-to-front.
-    for (target, &pk) in source_schema.pk_indices().iter().enumerate() {
-        // First occurrence is the canonical physical-PK slot; any later duplicate
-        // (SELECT pk, pk AS x) stays in the payload region and is materialized by
-        // the expr-map COPY_COL path.
-        let cur = items
-            .iter()
-            .position(|i| matches!(i, ProjectionItem::PassThrough { src_col } if *src_col == pk));
-        match cur {
-            Some(pos) if pos == target => { /* already in place */ }
-            Some(pos) => {
-                // pos > target here (slots 0..target already hold earlier PK
-                // columns); remove+insert shifts the spanned non-PK columns right
-                // by one and preserves their relative order — a swap would not.
-                let it = items.remove(pos);
-                let col = out_cols.remove(pos);
-                items.insert(target, it);
-                out_cols.insert(target, col);
-            }
-            None => {
-                // The projection omits this PK column, or references it only
-                // through a computed expression (SELECT pk + 1). Either way the
-                // view carries the full source PK verbatim: auto-prepend it.
-                items.insert(target, ProjectionItem::PassThrough { src_col: pk });
-                out_cols.insert(target, source_schema.columns[pk].clone());
-            }
-        }
-    }
-
-    Ok((items, out_cols))
-}
-
 // ---------------------------------------------------------------------------
 // Equijoin support
 // ---------------------------------------------------------------------------
@@ -1211,11 +1087,22 @@ fn execute_create_join_view(
     }
 
     // Build alias map for qualified column resolution
-    let mut alias_map: JoinAliasMap = HashMap::new();
-    alias_map.insert(left_alias.to_lowercase(), (left_tid, Rc::clone(&left_schema), 0));
+    let mut alias_map: AliasMap = HashMap::new();
+    alias_map.insert(
+        left_alias.to_lowercase(),
+        ResolvedRelation {
+            table_id: left_tid,
+            schema: Rc::clone(&left_schema),
+            col_offset: 0,
+        },
+    );
     alias_map.insert(
         right_alias.to_lowercase(),
-        (right_tid, Rc::clone(&right_schema), left_schema.columns.len()),
+        ResolvedRelation {
+            table_id: right_tid,
+            schema: Rc::clone(&right_schema),
+            col_offset: left_schema.columns.len(),
+        },
     );
 
     // Classify the ON clause: equality prefix pairs, an optional range conjunct,
@@ -1566,7 +1453,7 @@ fn build_range_join_view(
     view_name: &str,
     sql_text: &str,
     select: &sqlparser::ast::Select,
-    alias_map: &JoinAliasMap,
+    alias_map: &AliasMap,
     left_tid: u64,
     right_tid: u64,
     left_schema: &Schema,
@@ -2062,7 +1949,7 @@ fn build_range_join_view(
 /// separate wildcard fast path. `label` names the view kind in error messages.
 fn build_join_view_projection(
     projection: &[SelectItem],
-    alias_map: &JoinAliasMap,
+    alias_map: &AliasMap,
     leading_cols: &[ColumnDef],
     n_combined: usize,
     payload_offset: usize,
@@ -2350,11 +2237,6 @@ struct RangeConjunct {
 /// linear post-join `Filter` for INNER joins (§6).
 type JoinPredicates = (Vec<usize>, Vec<usize>, Vec<u8>, Option<RangeConjunct>, Vec<Expr>);
 
-/// Alias map for JOIN column resolution: alias/name → (table_id, schema,
-/// global column offset). `Rc<Schema>` so the per-side schemas resolved by the
-/// binder are shared, not deep-cloned, into the map.
-type JoinAliasMap = HashMap<String, (u64, Rc<Schema>, usize)>;
-
 /// Classify a JOIN ON clause into its equality-prefix pairs and an optional
 /// single range conjunct. A pure superset of the old equi-only extraction: with
 /// zero range conjuncts the equality pairs (and therefore the equi circuit and
@@ -2364,7 +2246,7 @@ fn extract_join_predicates(
     on_expr: &Expr,
     left_schema: &Schema,
     right_schema: &Schema,
-    alias_map: &JoinAliasMap,
+    alias_map: &AliasMap,
 ) -> Result<JoinPredicates, GnitzSqlError> {
     let mut left_cols = Vec::new();
     let mut right_cols = Vec::new();
@@ -2420,7 +2302,7 @@ fn collect_join_predicates(
     expr: &Expr,
     left_schema: &Schema,
     right_schema: &Schema,
-    alias_map: &JoinAliasMap,
+    alias_map: &AliasMap,
     left_cols: &mut Vec<usize>,
     right_cols: &mut Vec<usize>,
     target_tcs: &mut Vec<u8>,
@@ -2542,7 +2424,7 @@ fn collect_join_predicates(
 }
 
 /// Resolve a column reference in a JOIN ON clause to a global column index.
-fn resolve_join_col_ref(expr: &Expr, alias_map: &JoinAliasMap) -> Result<usize, GnitzSqlError> {
+fn resolve_join_col_ref(expr: &Expr, alias_map: &AliasMap) -> Result<usize, GnitzSqlError> {
     match expr {
         Expr::Nested(inner) => resolve_join_col_ref(inner, alias_map),
         Expr::Identifier(ident) => resolve_unqualified_column(&ident.value, alias_map),
@@ -2562,7 +2444,7 @@ fn resolve_join_col_ref(expr: &Expr, alias_map: &JoinAliasMap) -> Result<usize, 
 /// INNER join (the equi `out_cols` / range `union_cols` clone the source
 /// `ColumnDef`s). Aggregates in ON are rejected outright.
 struct JoinResidual<'a> {
-    alias_map: &'a JoinAliasMap,
+    alias_map: &'a AliasMap,
     merged: &'a Schema,
     base: usize,
 }
@@ -2594,7 +2476,7 @@ impl LeafBinder for JoinResidual<'_> {
 /// immaterial to the result.
 fn build_residual_filter_prog(
     residual: &[Expr],
-    alias_map: &JoinAliasMap,
+    alias_map: &AliasMap,
     merged_schema: &Schema,
     payload_base: usize,
 ) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
@@ -4005,7 +3887,7 @@ mod tests {
 
     /// Build the (left_schema, right_schema, alias_map) trio the way
     /// `execute_create_join_view` does, for aliases `a` (left) / `b` (right).
-    fn join_ctx(left: Vec<ColumnDef>, right: Vec<ColumnDef>) -> (Schema, Schema, JoinAliasMap) {
+    fn join_ctx(left: Vec<ColumnDef>, right: Vec<ColumnDef>) -> (Schema, Schema, AliasMap) {
         let left_n = left.len();
         let left_schema = Schema {
             columns: left,
@@ -4016,8 +3898,22 @@ mod tests {
             pk_cols: vec![0],
         };
         let mut am = HashMap::new();
-        am.insert("a".to_string(), (1u64, Rc::new(left_schema.clone()), 0usize));
-        am.insert("b".to_string(), (2u64, Rc::new(right_schema.clone()), left_n));
+        am.insert(
+            "a".to_string(),
+            ResolvedRelation {
+                table_id: 1,
+                schema: Rc::new(left_schema.clone()),
+                col_offset: 0,
+            },
+        );
+        am.insert(
+            "b".to_string(),
+            ResolvedRelation {
+                table_id: 2,
+                schema: Rc::new(right_schema.clone()),
+                col_offset: left_n,
+            },
+        );
         (left_schema, right_schema, am)
     }
 

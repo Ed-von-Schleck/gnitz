@@ -1,137 +1,12 @@
+use super::resolve::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr, UnaryOp};
-use gnitz_core::GnitzClient;
-use gnitz_core::{ColumnDef, Schema, TypeCode};
+use gnitz_core::{Schema, TypeCode};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
 };
-use std::collections::HashMap;
-use std::rc::Rc;
 
-/// Find the column named `col_name` in `columns`, case-insensitively.
-///
-/// - `Ok(Some(idx))` — exactly one column matches.
-/// - `Ok(None)` — no column matches (callers attach their own "not found" text).
-/// - `Err(Bind)` — more than one column matches. A `SELECT *` join view carries
-///   same-named columns from both sides; an unqualified reference to such a name
-///   is ambiguous (standard SQL) and must be rejected, not silently bound to the
-///   first match.
-///
-/// Single home for the name→index lookup that was previously
-/// `columns.iter().position(...)` (first-match) at every call site.
-pub(crate) fn find_unique_column(columns: &[ColumnDef], col_name: &str) -> Result<Option<usize>, GnitzSqlError> {
-    let mut found: Option<usize> = None;
-    for (i, c) in columns.iter().enumerate() {
-        if c.name.eq_ignore_ascii_case(col_name) {
-            if found.is_some() {
-                return Err(GnitzSqlError::Bind(format!(
-                    "column reference '{col_name}' is ambiguous"
-                )));
-            }
-            found = Some(i);
-        }
-    }
-    Ok(found)
-}
-
-/// Resolves a column in a multi-table context (for joins).
-/// `tables` maps alias/name → (table_id, Schema, column_offset).
-pub(crate) fn resolve_qualified_column(
-    table_alias: &str,
-    col_name: &str,
-    tables: &HashMap<String, (u64, Rc<Schema>, usize)>,
-) -> Result<usize, GnitzSqlError> {
-    let (_, schema, offset) = tables
-        .get(table_alias)
-        .ok_or_else(|| GnitzSqlError::Bind(format!("table alias '{table_alias}' not found")))?;
-    let idx = find_unique_column(&schema.columns, col_name)?
-        .ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in table '{table_alias}'")))?;
-    Ok(offset + idx)
-}
-
-/// Resolves an unqualified column in a multi-table context.
-/// Tries each table in order; errors on ambiguity.
-pub(crate) fn resolve_unqualified_column(
-    col_name: &str,
-    tables: &HashMap<String, (u64, Rc<Schema>, usize)>,
-) -> Result<usize, GnitzSqlError> {
-    let mut found: Option<usize> = None;
-    for (_, schema, offset) in tables.values() {
-        // The `?` rejects a name duplicated *within* one source relation (joining
-        // a dup-named `SELECT *` view); the `found.is_some()` check below rejects a
-        // name that appears across two source relations.
-        if let Some(idx) = find_unique_column(&schema.columns, col_name)? {
-            if found.is_some() {
-                return Err(GnitzSqlError::Bind(format!(
-                    "ambiguous column '{col_name}' — qualify with table alias"
-                )));
-            }
-            found = Some(offset + idx);
-        }
-    }
-    found.ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in any table")))
-}
-
-pub(crate) struct Binder<'a> {
-    schema_name: &'a str,
-    cache: HashMap<String, (u64, Rc<Schema>)>,
-}
-
-impl<'a> Binder<'a> {
-    pub(crate) fn new(schema_name: &'a str) -> Self {
-        Binder {
-            schema_name,
-            cache: HashMap::new(),
-        }
-    }
-
-    pub(crate) fn resolve(&mut self, client: &mut GnitzClient, name: &str) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
-        if let Some(entry) = self.cache.get(name) {
-            return Ok((entry.0, Rc::clone(&entry.1)));
-        }
-        let (tid, schema) = client
-            .resolve_table_or_view_id(self.schema_name, name)
-            .map_err(GnitzSqlError::Exec)?;
-        let rc = Rc::new(schema);
-        self.cache.insert(name.to_string(), (tid, Rc::clone(&rc)));
-        Ok((tid, rc))
-    }
-
-    /// Resolve a write/index target that must be a base table. INSERT, UPDATE,
-    /// DELETE and CREATE INDEX may only act on base tables: a view is a read-only
-    /// derived relation whose store is maintained solely by its circuit, so
-    /// writing to it or indexing it corrupts that state. `resolve` (used by
-    /// SELECT and view definitions) still accepts views; this is the
-    /// writable-target variant.
-    pub(crate) fn resolve_base_table(
-        &mut self,
-        client: &mut GnitzClient,
-        name: &str,
-    ) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
-        // `resolve_table_id` consults TABLE_TAB only, so a view name misses it.
-        match client.resolve_table_id(self.schema_name, name) {
-            Ok((tid, schema)) => {
-                let rc = Rc::new(schema);
-                self.cache.insert(name.to_string(), (tid, Rc::clone(&rc)));
-                Ok((tid, rc))
-            }
-            // Miss: re-probe including views to tell "is a view" (reject as
-            // read-only) from "does not exist" (propagate the original error).
-            Err(not_found) => match client.resolve_table_or_view_id(self.schema_name, name) {
-                Ok(_) => Err(GnitzSqlError::Unsupported(format!(
-                    "'{name}' is a view; INSERT, UPDATE, DELETE and CREATE INDEX \
-                     require a base table"
-                ))),
-                Err(_) => Err(GnitzSqlError::Exec(not_found)),
-            },
-        }
-    }
-
-    /// Cache a CTE or alias name as resolving to the given (table_id, schema).
-    pub(crate) fn cache_alias(&mut self, name: String, resolved: (u64, Rc<Schema>)) {
-        self.cache.insert(name, resolved);
-    }
-
+impl Binder<'_> {
     /// Bind an expression against a single-relation schema (WHERE, projections,
     /// set-op branches, DML). The structural recursion lives in `bind_structural`;
     /// the `SingleTable` leaf supplies the three schema-aware decisions (column
@@ -226,7 +101,7 @@ pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<Bo
 }
 
 /// sqlparser binary op → `BinOp` (the single, complete map).
-pub(crate) fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
+fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
     Ok(match op {
         BinaryOperator::Plus => BinOp::Add,
         BinaryOperator::Minus => BinOp::Sub,
@@ -250,7 +125,7 @@ pub(crate) fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
 }
 
 /// Number/string literal → `BoundExpr`.
-pub(crate) fn bind_literal(v: &Value) -> Result<BoundExpr, GnitzSqlError> {
+fn bind_literal(v: &Value) -> Result<BoundExpr, GnitzSqlError> {
     match v {
         // Try integer first, then float.
         Value::Number(n, _) => n
@@ -425,29 +300,6 @@ mod tests {
                 );
             }
             e => panic!("expected Unsupported, got {e:?}"),
-        }
-    }
-
-    #[test]
-    fn test_find_unique_column_unique() {
-        let cols = vec![col("a", TypeCode::U64), col("b", TypeCode::I64)];
-        assert_eq!(find_unique_column(&cols, "a").unwrap(), Some(0));
-        assert_eq!(find_unique_column(&cols, "B").unwrap(), Some(1)); // case-insensitive
-    }
-
-    #[test]
-    fn test_find_unique_column_absent() {
-        let cols = vec![col("a", TypeCode::U64)];
-        assert_eq!(find_unique_column(&cols, "missing").unwrap(), None);
-    }
-
-    #[test]
-    fn test_find_unique_column_duplicate_is_ambiguous() {
-        // Two case-insensitively equal names (as a `SELECT *` join view produces).
-        let cols = vec![col("Id", TypeCode::U64), col("ID", TypeCode::U64)];
-        match find_unique_column(&cols, "id") {
-            Err(GnitzSqlError::Bind(s)) => assert!(s.contains("ambiguous"), "got: {s}"),
-            other => panic!("expected Bind(ambiguous), got {other:?}"),
         }
     }
 

@@ -1,5 +1,6 @@
 mod ast_util;
-mod binder;
+mod bind;
+mod codec;
 mod dml;
 mod error;
 mod expr;

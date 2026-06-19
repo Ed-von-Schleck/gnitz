@@ -1,5 +1,11 @@
 use crate::ast_util::{extract_name, extract_table_factor_name};
-use crate::binder::{find_unique_column, Binder};
+use crate::bind::{find_unique_column, Binder};
+use crate::codec::colwrite::{append_column_value, append_value_to_col, ColumnValue};
+use crate::codec::nullmap::{null_word_get, null_word_set};
+use crate::codec::pk_codec::{
+    extract_pk_value, extract_sql_literal, is_null_expr, parse_literal_i128, parse_pk_literal_packed, parse_uuid_str,
+    SqlLiteral,
+};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::SqlResult;
@@ -10,7 +16,7 @@ use gnitz_core::{
 };
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Expr, FromTable, OnConflict, OnConflictAction,
-    OnInsert, Query, SelectItem, SetExpr, Statement, TableObject, UnaryOperator, Value, Values,
+    OnInsert, Query, SelectItem, SetExpr, Statement, TableObject, Value, Values,
 };
 use std::sync::Arc;
 
@@ -158,7 +164,7 @@ pub(crate) fn execute_insert(
             let val_expr = &row[ci];
             // Check if this value is NULL and set the null bitmap
             if is_null_expr(val_expr) {
-                null_bits |= 1u64 << payload_idx;
+                null_word_set(&mut null_bits, payload_idx, true);
             }
             append_value_to_col(&mut batch.columns[ci], col_def.type_code, val_expr)?;
         }
@@ -346,11 +352,7 @@ fn client_side_merge_do_update(
                 for (payload_idx, ci, col_def) in schema.payload_columns() {
                     if let Some(rhs) = asn_by_col[ci] {
                         let cv = eval_do_update_rhs(rhs, &existing_batch, batch, i, schema)?;
-                        if matches!(cv, ColumnValue::Null) {
-                            null_bits |= 1u64 << payload_idx;
-                        } else {
-                            null_bits &= !(1u64 << payload_idx);
-                        }
+                        null_word_set(&mut null_bits, payload_idx, matches!(cv, ColumnValue::Null));
                         append_column_value(&mut out.columns[ci], cv, col_def.type_code)?;
                     } else {
                         let stride = col_def.type_code.wire_stride();
@@ -410,311 +412,6 @@ fn extract_values_rows(query: &Query) -> Result<&[Vec<Expr>], GnitzSqlError> {
         _ => Err(GnitzSqlError::Unsupported(
             "INSERT only supports VALUES (not INSERT INTO ... SELECT)".to_string(),
         )),
-    }
-}
-
-fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
-    let s = s.trim();
-    let hex: String = if s.len() == 36
-        && s.as_bytes()[8] == b'-'
-        && s.as_bytes()[13] == b'-'
-        && s.as_bytes()[18] == b'-'
-        && s.as_bytes()[23] == b'-'
-    {
-        format!("{}{}{}{}{}", &s[..8], &s[9..13], &s[14..18], &s[19..23], &s[24..])
-    } else if s.len() == 32 {
-        s.to_string()
-    } else {
-        return Err(GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")));
-    };
-    u128::from_str_radix(&hex, 16).map_err(|_| GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")))
-}
-
-/// Parse a numeric SQL literal as `i128`, applying `negated` (the literal sat
-/// under `Expr::UnaryOp(Minus, _)`) by prepending `-` to the digit string
-/// before parsing — that rule accepts a type minimum's own digit string
-/// (e.g. `i64::MIN`'s), which a parse-then-negate would overflow. `i128`
-/// covers every ≤8-byte type with room to spare, so an out-of-type-range
-/// literal is *representable* — callers classify it against
-/// `FixedInt::range` and decline or saturate, never wrap.
-fn parse_literal_i128(n_str: &str, negated: bool) -> Option<i128> {
-    let s_owned;
-    let s: &str = if negated {
-        s_owned = format!("-{n_str}");
-        &s_owned
-    } else {
-        n_str
-    };
-    s.parse::<i128>().ok()
-}
-
-/// Parse a numeric SQL literal into its packed-u128 PK form: the low
-/// `wire_stride` bytes carry the column's native LE encoding
-/// (`FixedInt::pack` — e.g. `-1_i8` → `0xFF`, not `0xFFFF_FFFF_FFFF_FFFF`),
-/// the rest stay zero. An out-of-type-range literal declines (`None`) instead
-/// of wrapping: without the `FixedInt::range` check, `x = 3000000000` on an
-/// I32 column would cast to `-1294967296` and seek the wrong value (silent
-/// wrong rows — the cff7c58-class trap).
-///
-/// This helper is the single source of truth for INSERT/SEEK PK routing —
-/// `extract_pk_value`, `try_col_eq_literal`, and `try_extract_pk_in` all
-/// dispatch through it so the master cannot send INSERT and DELETE for the
-/// same key to different workers.
-fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u128> {
-    match tc {
-        // 16-byte types are their own packed form. U128/UUID take the full
-        // unsigned range; I128 (the internal join-key promotion type) is
-        // two's complement at 16 bytes, exactly `as u128`.
-        TypeCode::U128 | TypeCode::UUID => {
-            if negated {
-                return None;
-            }
-            n_str.parse::<u128>().ok()
-        }
-        TypeCode::I128 => parse_literal_i128(n_str, negated).map(|v| v as u128),
-        _ => {
-            let fi = FixedInt::from_type_code(tc)?;
-            let (min, max) = fi.range();
-            let v = parse_literal_i128(n_str, negated)?;
-            (min <= v && v <= max).then(|| fi.pack(v))
-        }
-    }
-}
-
-/// A SQL literal extracted from an `Expr` for PK/seek routing. `Number`'s
-/// second field is `negated` (the literal sat under `UnaryOp(Minus, _)`);
-/// `Str` carries the unescaped single-quoted contents.
-enum SqlLiteral<'a> {
-    Number(&'a str, bool),
-    Str(&'a str),
-    Null,
-}
-
-/// Centralizes the `Expr::Value` / `UnaryOp(Minus, Number)` unwrap shared by
-/// the SEEK/INSERT parse sites (`parse_one_pk_literal`, `try_col_eq_literal`,
-/// `try_extract_pk_in`).
-///
-/// Matches `SingleQuotedString` only — NOT `DoubleQuotedString`: in
-/// `GenericDialect` a double-quoted token is an identifier, so treating
-/// `col = "x"` as a UUID seek literal would silently change which queries
-/// take the index fast path.
-fn extract_sql_literal(expr: &Expr) -> Option<SqlLiteral<'_>> {
-    match expr {
-        Expr::Value(vws) => match &vws.value {
-            Value::Null => Some(SqlLiteral::Null),
-            Value::Number(n, _) => Some(SqlLiteral::Number(n, false)),
-            Value::SingleQuotedString(s) => Some(SqlLiteral::Str(s)),
-            _ => None,
-        },
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus,
-            expr,
-        } => match expr.as_ref() {
-            Expr::Value(vws) => match &vws.value {
-                Value::Number(n, _) => Some(SqlLiteral::Number(n, true)),
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Parse one PK column literal at `pk_expr` into its packed u128 form.
-/// Routes through `parse_pk_literal_packed` (numerics) or `parse_uuid_str`
-/// (UUID); the returned u128's low `wire_stride` bytes carry the column's
-/// native LE bytes.
-fn parse_one_pk_literal(pk_expr: &Expr, tc: TypeCode, col_name: &str) -> Result<u128, GnitzSqlError> {
-    match extract_sql_literal(pk_expr) {
-        Some(SqlLiteral::Number(n, negated)) => parse_pk_literal_packed(tc, n, negated).ok_or_else(|| {
-            if negated
-                && matches!(
-                    tc,
-                    TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 | TypeCode::U128 | TypeCode::UUID
-                )
-            {
-                GnitzSqlError::Bind(format!(
-                    "PK column '{col_name}' of type {tc:?} does not accept negative literals"
-                ))
-            } else {
-                let s_disp = if negated { format!("-{n}") } else { n.to_string() };
-                GnitzSqlError::Bind(format!("PK column '{col_name}' value is not a valid {tc:?}: {s_disp}"))
-            }
-        }),
-        // UUID accepts a single-quoted UUID string; non-UUID PKs are numeric only.
-        Some(SqlLiteral::Str(s)) if tc == TypeCode::UUID => parse_uuid_str(s),
-        _ => Err(GnitzSqlError::Bind(format!(
-            "PK column '{col_name}' value must be a numeric literal"
-        ))),
-    }
-}
-
-/// Extract the primary key from a VALUES row as a `PkTuple`. Walks the PK
-/// columns in pk-list order, dispatches each through `parse_one_pk_literal`,
-/// and copies the column's native LE bytes into the tuple buffer.
-fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<PkTuple, GnitzSqlError> {
-    let stride = schema.pk_stride() as u8;
-    let mut tuple = PkTuple::new(stride);
-    let mut off = 0usize;
-    for &pi in schema.pk_indices() {
-        let pk_expr = row.get(pi).ok_or_else(|| {
-            GnitzSqlError::Bind(format!(
-                "PK column '{}' missing from INSERT row",
-                schema.columns[pi].name
-            ))
-        })?;
-        let tc = schema.columns[pi].type_code;
-        let v = parse_one_pk_literal(pk_expr, tc, &schema.columns[pi].name)?;
-        let w = tc.wire_stride();
-        tuple.buf[off..off + w].copy_from_slice(&v.to_le_bytes()[..w]);
-        off += w;
-    }
-    debug_assert_eq!(off, stride as usize);
-    Ok(tuple)
-}
-
-fn is_null_expr(expr: &Expr) -> bool {
-    matches!(expr, Expr::Value(vws) if matches!(vws.value, Value::Null))
-}
-
-/// Append a NULL for column `col` of wire type `tc`. The NULL encoding is
-/// uniform across all four `ColData` variants, so INSERT and UPDATE share it.
-fn append_null(col: &mut ColData, tc: TypeCode) {
-    match col {
-        ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
-        ColData::Strings(v) => v.push(None),
-        ColData::Bytes(v) => v.push(None),
-        ColData::U128s(v) => v.push(0u128),
-    }
-}
-
-fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Expr) -> Result<(), GnitzSqlError> {
-    // sqlparser parses negative number literals as UnaryOp(Minus, Number(...)).
-    // Unwrap here so the rest of the function sees a plain Value::Number.
-    let (val_expr, negated) = match val_expr {
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus,
-            expr,
-        } => (expr.as_ref(), true),
-        e => (e, false),
-    };
-
-    match val_expr {
-        Expr::Value(vws) => match &vws.value {
-            Value::Null => {
-                append_null(col, tc);
-                Ok(())
-            }
-            Value::Number(n, _) => {
-                // Build the effective numeric string with optional leading minus.
-                let neg_buf;
-                let n: &str = if negated {
-                    neg_buf = format!("-{n}");
-                    &neg_buf
-                } else {
-                    n.as_str()
-                };
-                match col {
-                    ColData::Fixed(buf) => {
-                        match tc {
-                            TypeCode::U8 => {
-                                let v = n
-                                    .parse::<u8>()
-                                    .map_err(|_| GnitzSqlError::Bind(format!("invalid u8: {n}")))?;
-                                buf.push(v);
-                            }
-                            TypeCode::I8 => {
-                                let v = n
-                                    .parse::<i8>()
-                                    .map_err(|_| GnitzSqlError::Bind(format!("invalid i8: {n}")))?;
-                                buf.push(v as u8);
-                            }
-                            TypeCode::U16 => {
-                                let v = n
-                                    .parse::<u16>()
-                                    .map_err(|_| GnitzSqlError::Bind(format!("invalid u16: {n}")))?;
-                                buf.extend_from_slice(&v.to_le_bytes());
-                            }
-                            TypeCode::I16 => {
-                                let v = n
-                                    .parse::<i16>()
-                                    .map_err(|_| GnitzSqlError::Bind(format!("invalid i16: {n}")))?;
-                                buf.extend_from_slice(&v.to_le_bytes());
-                            }
-                            TypeCode::U32 => {
-                                let v = n
-                                    .parse::<u32>()
-                                    .map_err(|_| GnitzSqlError::Bind(format!("invalid u32: {n}")))?;
-                                buf.extend_from_slice(&v.to_le_bytes());
-                            }
-                            TypeCode::I32 => {
-                                let v = n
-                                    .parse::<i32>()
-                                    .map_err(|_| GnitzSqlError::Bind(format!("invalid i32: {n}")))?;
-                                buf.extend_from_slice(&v.to_le_bytes());
-                            }
-                            TypeCode::U64 => {
-                                let v = n
-                                    .parse::<u64>()
-                                    .map_err(|_| GnitzSqlError::Bind(format!("invalid u64: {n}")))?;
-                                buf.extend_from_slice(&v.to_le_bytes());
-                            }
-                            TypeCode::I64 => {
-                                let v = n
-                                    .parse::<i64>()
-                                    .map_err(|_| GnitzSqlError::Bind(format!("invalid i64: {n}")))?;
-                                buf.extend_from_slice(&v.to_le_bytes());
-                            }
-                            TypeCode::F32 => {
-                                let v = n
-                                    .parse::<f32>()
-                                    .map_err(|_| GnitzSqlError::Bind(format!("invalid f32: {n}")))?;
-                                buf.extend_from_slice(&v.to_le_bytes());
-                            }
-                            TypeCode::F64 => {
-                                let v = n
-                                    .parse::<f64>()
-                                    .map_err(|_| GnitzSqlError::Bind(format!("invalid f64: {n}")))?;
-                                buf.extend_from_slice(&v.to_le_bytes());
-                            }
-                            _ => {
-                                return Err(GnitzSqlError::Bind(format!(
-                                    "unexpected type {tc:?} for number literal"
-                                )))
-                            }
-                        }
-                        Ok(())
-                    }
-                    ColData::U128s(v) => {
-                        let val = n
-                            .parse::<u128>()
-                            .map_err(|_| GnitzSqlError::Bind(format!("invalid u128: {n}")))?;
-                        v.push(val);
-                        Ok(())
-                    }
-                    ColData::Strings(_) => Err(GnitzSqlError::Bind("number literal for string column".to_string())),
-                    ColData::Bytes(_) => Err(GnitzSqlError::Bind("number literal for blob column".to_string())),
-                }
-            }
-            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => match col {
-                ColData::Strings(v) => {
-                    v.push(Some(s.clone()));
-                    Ok(())
-                }
-                ColData::U128s(v) if tc == TypeCode::UUID => {
-                    v.push(parse_uuid_str(s)?);
-                    Ok(())
-                }
-                _ => Err(GnitzSqlError::Bind("string literal for non-string column".to_string())),
-            },
-            _ => Err(GnitzSqlError::Unsupported(format!(
-                "unsupported value in INSERT: {:?}",
-                vws.value
-            ))),
-        },
-        _ => Err(GnitzSqlError::Unsupported(format!(
-            "unsupported value expression in INSERT: {val_expr:?}"
-        ))),
     }
 }
 
@@ -940,7 +637,7 @@ fn try_extract_pk_seek_residual<'e>(expr: &'e Expr, schema: &Schema) -> Option<(
 }
 
 /// Extracts (col_idx, key) from `col = literal`. Does NOT check index existence.
-fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
+pub(crate) fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize, u128)> {
     let Expr::BinaryOp {
         left,
         op: BinaryOperator::Eq,
@@ -1447,12 +1144,6 @@ fn apply_residual_filter(
     Ok((schema_opt, Some(new_batch)))
 }
 
-enum ColumnValue {
-    Int(i64),
-    Str(String),
-    Null,
-}
-
 /// Decode the native LE bytes of a PK column into an i64. U128/UUID don't fit
 /// through the i64 return shape and are rejected.
 fn decode_pk_bytes_to_i64(tc: TypeCode, slice: &[u8]) -> Result<i64, GnitzSqlError> {
@@ -1503,7 +1194,7 @@ fn eval_expr(expr: &BoundExpr, batch: &ZSetBatch, i: usize, schema: &Schema) -> 
             }
             // Payload column: check the null bitmap first.
             let payload_idx = schema.payload_idx(*c);
-            if (batch.nulls[i] & (1u64 << payload_idx)) != 0 {
+            if null_word_get(batch.nulls[i], payload_idx) {
                 return Ok(None);
             }
             match &batch.columns[*c] {
@@ -1626,7 +1317,7 @@ fn eval_expr(expr: &BoundExpr, batch: &ZSetBatch, i: usize, schema: &Schema) -> 
                 return Ok(Some(0)); // PK is never null → IS NULL is always false
             }
             let payload_idx = schema.payload_idx(*c);
-            let is_null = (batch.nulls[i] & (1u64 << payload_idx)) != 0;
+            let is_null = null_word_get(batch.nulls[i], payload_idx);
             Ok(Some(is_null as i64))
         }
         BoundExpr::IsNotNull(c) => {
@@ -1634,7 +1325,7 @@ fn eval_expr(expr: &BoundExpr, batch: &ZSetBatch, i: usize, schema: &Schema) -> 
                 return Ok(Some(1)); // PK is never null → IS NOT NULL is always true
             }
             let payload_idx = schema.payload_idx(*c);
-            let is_null = (batch.nulls[i] & (1u64 << payload_idx)) != 0;
+            let is_null = null_word_get(batch.nulls[i], payload_idx);
             Ok(Some(!is_null as i64))
         }
         BoundExpr::AggCall { .. } => Err(GnitzSqlError::Unsupported(
@@ -1828,8 +1519,8 @@ fn apply_projection(
         for &old_word in &src_nulls {
             let mut new_word = 0u64;
             for &(new_pi, old_pi) in &pi_mappings {
-                if (old_word >> old_pi) & 1 == 1 {
-                    new_word |= 1u64 << new_pi;
+                if null_word_get(old_word, old_pi) {
+                    null_word_set(&mut new_word, new_pi, true);
                 }
             }
             new_batch.nulls.push(new_word);
@@ -1914,31 +1605,6 @@ fn eval_set_expr(
     }
 }
 
-fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Result<(), GnitzSqlError> {
-    match cv {
-        ColumnValue::Null => append_null(col, tc),
-        ColumnValue::Int(i) => match col {
-            ColData::Fixed(buf) => match tc {
-                TypeCode::U8 => buf.push(i as u8),
-                TypeCode::I8 => buf.push(i as u8),
-                TypeCode::U16 => buf.extend_from_slice(&(i as u16).to_le_bytes()),
-                TypeCode::I16 => buf.extend_from_slice(&(i as i16).to_le_bytes()),
-                TypeCode::U32 => buf.extend_from_slice(&(i as u32).to_le_bytes()),
-                TypeCode::I32 => buf.extend_from_slice(&(i as i32).to_le_bytes()),
-                TypeCode::U64 => buf.extend_from_slice(&(i as u64).to_le_bytes()),
-                TypeCode::I64 => buf.extend_from_slice(&i.to_le_bytes()),
-                _ => return Err(GnitzSqlError::Bind(format!("cannot assign Int to {tc:?}"))),
-            },
-            _ => return Err(GnitzSqlError::Bind("Int value for non-numeric column".to_string())),
-        },
-        ColumnValue::Str(s) => match col {
-            ColData::Strings(v) => v.push(Some(s)),
-            _ => return Err(GnitzSqlError::Bind("String value for non-string column".to_string())),
-        },
-    }
-    Ok(())
-}
-
 fn extract_assignment_col_name(assignment: &Assignment, clause: &str) -> Result<String, GnitzSqlError> {
     match &assignment.target {
         AssignmentTarget::ColumnName(obj_name) => extract_name(obj_name, clause),
@@ -1996,11 +1662,7 @@ fn write_set_columns(
     for (payload_idx, ci, col_def) in schema.payload_columns() {
         if let Some((_, expr)) = assignments.iter().find(|(idx, _)| *idx == ci) {
             let cv = eval_set_expr(expr, current, row_idx, schema)?;
-            if matches!(cv, ColumnValue::Null) {
-                null_bits |= 1u64 << payload_idx;
-            } else {
-                null_bits &= !(1u64 << payload_idx);
-            }
+            null_word_set(&mut null_bits, payload_idx, matches!(cv, ColumnValue::Null));
             append_column_value(&mut dst.columns[ci], cv, col_def.type_code)?;
         } else {
             let stride = col_def.type_code.wire_stride();
@@ -2011,7 +1673,7 @@ fn write_set_columns(
     Ok(())
 }
 
-fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
+pub(crate) fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
     // Compound PK has no IN-list fast path; fall back to a full delta scan.
     if schema.pk_count() != 1 {
         return None;
@@ -2336,6 +1998,7 @@ mod tests {
     use super::*;
     use crate::ir::{BinOp, BoundExpr};
     use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+    use sqlparser::ast::UnaryOperator;
 
     fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
         ColumnDef {
@@ -2563,29 +2226,6 @@ mod tests {
         assert_ne!(dst.nulls[0] & 0b10, 0, "b must remain null (unassigned)");
     }
 
-    // ------------------------------------------------------------------
-    // UUID parse_uuid_str
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn test_parse_uuid_str_standard_format() {
-        let v = super::parse_uuid_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        assert_eq!(v, 0x550e8400_e29b_41d4_a716_446655440000_u128);
-    }
-
-    #[test]
-    fn test_parse_uuid_str_no_hyphens() {
-        let v = super::parse_uuid_str("550e8400e29b41d4a716446655440000").unwrap();
-        assert_eq!(v, 0x550e8400_e29b_41d4_a716_446655440000_u128);
-    }
-
-    #[test]
-    fn test_parse_uuid_str_invalid_rejected() {
-        assert!(super::parse_uuid_str("not-a-uuid").is_err());
-        assert!(super::parse_uuid_str("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz").is_err());
-        assert!(super::parse_uuid_str("").is_err());
-    }
-
     fn uuid_schema_pk() -> Schema {
         Schema {
             columns: vec![col_def("id", TypeCode::UUID, false)],
@@ -2615,15 +2255,6 @@ mod tests {
             value: Value::Number(n.into(), false),
             span: sqlparser::tokenizer::Span::empty(),
         })
-    }
-
-    #[test]
-    fn test_uuid_pk_string_literal_accepted() {
-        let schema = uuid_schema_pk();
-        let row = vec![uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")];
-        let pk = super::extract_pk_value(&row, &schema).unwrap();
-        // UUID PK has stride 16; the parsed u128 lives in the low 16 bytes.
-        assert_eq!(pk.to_u128().unwrap(), 0x550e8400_e29b_41d4_a716_446655440000_u128);
     }
 
     #[test]
@@ -2766,12 +2397,6 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    // ------------------------------------------------------------------
-    // Native-PK literal parsing: extract_pk_value / try_col_eq_literal
-    // / try_extract_pk_in must produce the SAME u128 for the same
-    // (type, literal) pair. Master partition routing depends on this.
-    // ------------------------------------------------------------------
-
     fn pk_schema(pk_tc: TypeCode) -> Schema {
         Schema {
             columns: vec![col_def("id", pk_tc, false), col_def("v", TypeCode::I64, false)],
@@ -2785,95 +2410,6 @@ mod tests {
             list: items,
             negated: false,
         }
-    }
-
-    /// All three parser entry points must agree byte-for-byte on the u128
-    /// produced by a given (PK type, literal) pair. Master routes SEEK via
-    /// `partition_for_key(pk)`; drift between any pair sends INSERT and
-    /// DELETE to different workers.
-    fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
-        let schema = pk_schema(pk_tc);
-
-        // 1. extract_pk_value (INSERT row).
-        let row = vec![literal.clone(), num_expr("0")];
-        let got_insert =
-            super::extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
-        assert_eq!(got_insert.to_u128().unwrap(), expected, "extract_pk_value");
-
-        // 2. try_col_eq_literal (WHERE pk = literal).
-        let where_expr = eq_expr("id", literal.clone());
-        let got_eq = super::try_col_eq_literal(&where_expr, &schema).expect("try_col_eq_literal returned None");
-        assert_eq!(got_eq, (0, expected), "try_col_eq_literal");
-
-        // 3. try_extract_pk_in (WHERE pk IN (literal)).
-        let in_expr = in_list_expr("id", vec![literal]);
-        let got_in = super::try_extract_pk_in(&in_expr, &schema).expect("try_extract_pk_in returned None");
-        assert_eq!(got_in, vec![expected], "try_extract_pk_in");
-    }
-
-    #[test]
-    fn pk_parity_i8_neg1() {
-        check_pk_parity(TypeCode::I8, neg_num_expr("1"), (-1i8 as u8) as u128);
-    }
-
-    #[test]
-    fn pk_parity_i16_neg1() {
-        check_pk_parity(TypeCode::I16, neg_num_expr("1"), (-1i16 as u16) as u128);
-    }
-
-    #[test]
-    fn pk_parity_i32_neg1() {
-        check_pk_parity(TypeCode::I32, neg_num_expr("1"), (-1i32 as u32) as u128);
-    }
-
-    #[test]
-    fn pk_parity_i64_neg1() {
-        check_pk_parity(TypeCode::I64, neg_num_expr("1"), ((-1i64) as u64) as u128);
-    }
-
-    #[test]
-    fn pk_parity_i64_min() {
-        // Regression for the prepend-`-` parse rule: `(i64::MIN as u64) as u128`.
-        check_pk_parity(
-            TypeCode::I64,
-            neg_num_expr("9223372036854775808"),
-            (i64::MIN as u64) as u128,
-        );
-    }
-
-    #[test]
-    fn pk_parity_u16_max() {
-        check_pk_parity(TypeCode::U16, num_expr("65535"), 65535u128);
-    }
-
-    #[test]
-    fn pk_parity_u32_max() {
-        check_pk_parity(TypeCode::U32, num_expr("4294967295"), 4294967295u128);
-    }
-
-    #[test]
-    fn extract_pk_value_u64_rejects_negative() {
-        let schema = pk_schema(TypeCode::U64);
-        let row = vec![neg_num_expr("1"), num_expr("0")];
-        let err = super::extract_pk_value(&row, &schema).expect_err("U64 PK must reject negative literal");
-        assert!(err.to_string().contains("negative"), "error: {err}");
-    }
-
-    #[test]
-    fn extract_pk_value_u128_rejects_negative() {
-        let schema = pk_schema(TypeCode::U128);
-        let row = vec![neg_num_expr("1"), num_expr("0")];
-        assert!(super::extract_pk_value(&row, &schema).is_err());
-    }
-
-    #[test]
-    fn try_extract_pk_in_negative_i32_list() {
-        // Today's u64-only body returned None for negative items, falling
-        // through to the slow full-scan path. Native-PK fast path must hit.
-        let schema = pk_schema(TypeCode::I32);
-        let expr = in_list_expr("id", vec![neg_num_expr("1"), neg_num_expr("2")]);
-        let got = super::try_extract_pk_in(&expr, &schema).expect("should match fast path");
-        assert_eq!(got, vec![(-1i32 as u32) as u128, (-2i32 as u32) as u128]);
     }
 
     // ------------------------------------------------------------------
@@ -3265,18 +2801,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_double_quoted_pk_value_rejected() {
-        // INSERT path: a double-quoted value in a UUID PK slot is not a literal.
-        let err = super::parse_one_pk_literal(
-            &dquote_expr("550e8400-e29b-41d4-a716-446655440000"),
-            TypeCode::UUID,
-            "id",
-        )
-        .expect_err("double-quoted UUID PK literal must be rejected");
-        assert!(err.to_string().contains("numeric literal"), "error: {err}");
-    }
-
     // ------------------------------------------------------------------
     // eval_expr — Site A: F32/F64 payload returns Err(Unsupported);
     // U64 high-bit regression.
@@ -3364,39 +2888,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // append_null: INSERT and UPDATE produce the byte-identical NULL
-    // encoding across every ColData variant.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn test_null_append_insert_update_identical_all_variants() {
-        let null_expr = Expr::Value(sqlparser::ast::ValueWithSpan {
-            value: Value::Null,
-            span: sqlparser::tokenizer::Span::empty(),
-        });
-        // (fresh empty ColData, wire type, expected NULL encoding) per variant.
-        let cases: [(ColData, TypeCode, ColData); 4] = [
-            (ColData::Fixed(Vec::new()), TypeCode::U32, ColData::Fixed(vec![0u8; 4])),
-            (
-                ColData::Strings(Vec::new()),
-                TypeCode::String,
-                ColData::Strings(vec![None]),
-            ),
-            (ColData::Bytes(Vec::new()), TypeCode::Blob, ColData::Bytes(vec![None])),
-            (ColData::U128s(Vec::new()), TypeCode::UUID, ColData::U128s(vec![0u128])),
-        ];
-        for (empty, tc, expected) in cases {
-            let mut via_insert = empty.clone();
-            append_value_to_col(&mut via_insert, tc, &null_expr).unwrap();
-            let mut via_update = empty.clone();
-            append_column_value(&mut via_update, ColumnValue::Null, tc).unwrap();
-            assert_eq!(via_insert, expected, "INSERT NULL encoding for {tc:?}");
-            assert_eq!(via_update, expected, "UPDATE NULL encoding for {tc:?}");
-            assert_eq!(via_insert, via_update, "INSERT vs UPDATE NULL must match for {tc:?}");
-        }
-    }
-
-    // ------------------------------------------------------------------
     // Ordered range-scan extraction
     // ------------------------------------------------------------------
 
@@ -3420,27 +2911,6 @@ mod tests {
                 })
                 .collect(),
         )
-    }
-
-    #[test]
-    fn parse_pk_literal_packed_rejects_out_of_range() {
-        // The regression guard for the truncation fix: an I32 literal above the
-        // type max declines (None) instead of wrapping to -1294967296.
-        assert_eq!(super::parse_pk_literal_packed(TypeCode::I32, "3000000000", false), None);
-        assert_eq!(super::parse_pk_literal_packed(TypeCode::I32, "100", false), Some(100));
-        assert_eq!(
-            super::parse_pk_literal_packed(TypeCode::I32, "5", true),
-            Some((-5i32 as u32) as u128)
-        );
-        // Unsigned ≤8B range-checks too.
-        assert_eq!(super::parse_pk_literal_packed(TypeCode::U8, "300", false), None);
-        assert_eq!(super::parse_pk_literal_packed(TypeCode::U8, "255", false), Some(255));
-        // I128 (the internal join-key type): full-width two's complement,
-        // negatives included.
-        assert_eq!(
-            super::parse_pk_literal_packed(TypeCode::I128, "5", true),
-            Some((-5i128) as u128)
-        );
     }
 
     #[test]
