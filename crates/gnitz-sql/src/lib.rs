@@ -1,11 +1,13 @@
 mod ast_util;
 mod bind;
 mod codec;
+mod dispatch;
 mod dml;
 mod error;
-mod expr;
+mod exec;
 mod ir;
-mod planner;
+mod lower;
+mod plan;
 mod types;
 
 pub use error::GnitzSqlError;
@@ -46,7 +48,7 @@ impl<'a> SqlPlanner<'a> {
         let stmts = Parser::parse_sql(&dialect, sql)?;
         let mut results = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
-            let r = planner::execute_statement(self.client, &self.schema_name, stmt)?;
+            let r = dispatch::execute_statement(self.client, &self.schema_name, stmt)?;
             results.push(r);
         }
         Ok(results)

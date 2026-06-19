@@ -3,8 +3,8 @@
 //! `resolve_proj_col` resolves one SELECT item (column lookup + alias rename +
 //! computed-expr typing) and `place_pk_front` pins the source PK to the leading
 //! output slots; `build_projection` composes them into the single-table view's
-//! output layout. `build_projection` is the sole caller, in `planner.rs`'s
-//! CREATE VIEW path — the join and SET projections have their own
+//! output layout. `build_projection`'s sole caller is the simple CREATE VIEW
+//! builder (`plan::view::simple`) — the join and SET projections have their own
 //! leading-column contracts and build their layouts separately.
 
 use crate::bind::Binder;

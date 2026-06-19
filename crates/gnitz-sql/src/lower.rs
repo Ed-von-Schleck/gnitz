@@ -1,7 +1,51 @@
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, UnaryOp};
+use crate::types::is_wide_int;
 use gnitz_core::ExprBuilder;
-use gnitz_core::{Schema, TypeCode};
+use gnitz_core::Schema;
+
+/// One structural walk of [`BoundExpr`], parameterized by what each node
+/// *produces*. The single `match` in [`lower_bound_expr`] is the sole walk of
+/// the enum: adding a `BoundExpr` variant makes it non-exhaustive, failing
+/// *every* backend to compile (variant-coverage parity). A backend that cannot
+/// represent a node returns a typed `Unsupported` arm — never a panic.
+///
+/// `binop`/`unop` receive their operands *unevaluated* (`&BoundExpr`) and drive
+/// the recursion themselves via [`lower_bound_expr`]; this is load-bearing — the
+/// opcode backend intercepts string comparisons before recursing into a string
+/// literal, and the interpreter short-circuits `AND`/`OR` to avoid evaluating an
+/// operand whose error would otherwise leak.
+pub(crate) trait BoundExprBackend {
+    type Out;
+    fn col_ref(&mut self, col: usize) -> Result<Self::Out, GnitzSqlError>;
+    fn lit_int(&mut self, v: i64) -> Result<Self::Out, GnitzSqlError>;
+    fn lit_float(&mut self, v: f64) -> Result<Self::Out, GnitzSqlError>;
+    fn lit_str(&mut self, s: &str) -> Result<Self::Out, GnitzSqlError>;
+    fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<Self::Out, GnitzSqlError>;
+    fn unop(&mut self, op: UnaryOp, inner: &BoundExpr) -> Result<Self::Out, GnitzSqlError>;
+    /// `IS NULL` (`want_null = true`) and `IS NOT NULL` (`want_null = false`).
+    fn null_test(&mut self, col: usize, want_null: bool) -> Result<Self::Out, GnitzSqlError>;
+    fn agg_call(&mut self) -> Result<Self::Out, GnitzSqlError>;
+}
+
+/// Dispatch a single `BoundExpr` node to the backend. The lone `match` over the
+/// enum — every backend funnels through it.
+pub(crate) fn lower_bound_expr<B: BoundExprBackend>(
+    expr: &BoundExpr,
+    backend: &mut B,
+) -> Result<B::Out, GnitzSqlError> {
+    match expr {
+        BoundExpr::ColRef(c) => backend.col_ref(*c),
+        BoundExpr::LitInt(v) => backend.lit_int(*v),
+        BoundExpr::LitFloat(v) => backend.lit_float(*v),
+        BoundExpr::LitStr(s) => backend.lit_str(s),
+        BoundExpr::BinOp(l, op, r) => backend.binop(l, *op, r),
+        BoundExpr::UnaryOp(op, inner) => backend.unop(*op, inner),
+        BoundExpr::IsNull(c) => backend.null_test(*c, true),
+        BoundExpr::IsNotNull(c) => backend.null_test(*c, false),
+        BoundExpr::AggCall { .. } => backend.agg_call(),
+    }
+}
 
 /// Try to compile a string comparison (col vs const, const vs col, col vs col).
 /// Returns Some((reg, false)) if this is a string comparison, None otherwise.
@@ -91,6 +135,149 @@ fn try_compile_string_cmp(
     Ok(None)
 }
 
+/// Lowers a `BoundExpr` to `ExprProgram` opcodes for the server-side circuit.
+/// `Out = (result_reg, is_float)`, where `is_float` indicates the register holds
+/// an f64 bit-pattern rather than a plain i64.
+pub(crate) struct OpcodeBackend<'a> {
+    schema: &'a Schema,
+    eb: &'a mut ExprBuilder,
+}
+
+impl BoundExprBackend for OpcodeBackend<'_> {
+    type Out = (u32, bool);
+
+    fn col_ref(&mut self, idx: usize) -> Result<Self::Out, GnitzSqlError> {
+        // Every 16-byte column must be rejected here: the engine's
+        // `EXPR_LOAD_PAYLOAD_INT` handler has arms only for 1/2/4/8-byte columns,
+        // so a 16-byte column hits its no-op arm and the following op reads stale
+        // scratch bytes — silent corruption, no error. A *valid* string/blob use
+        // is one of the six comparisons, which `binop` intercepts via
+        // `try_compile_string_cmp` before any recursion reaches this arm; so a
+        // STRING/BLOB landing here is arithmetic or a mixed-type comparison
+        // (`a.s > b.int`) and must error, not load garbage.
+        let tc = self.schema.columns[idx].type_code;
+        if is_wide_int(tc) {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "column {:?} is {tc:?}; 128-bit columns cannot be used in view \
+                 expressions (use a primary-key seek or CREATE INDEX instead)",
+                self.schema.columns[idx].name,
+            )));
+        }
+        if tc.is_german_string() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "column {:?} is {tc:?}; string/blob columns support only =, <>, <, <=, \
+                 >, >= against another string/blob column or a string literal — not \
+                 arithmetic or comparison with a non-string column",
+                self.schema.columns[idx].name,
+            )));
+        }
+        if tc.is_float() {
+            return Ok((self.eb.load_col_float(idx), true));
+        }
+        Ok((self.eb.load_col_int(idx), false))
+    }
+
+    fn lit_int(&mut self, v: i64) -> Result<Self::Out, GnitzSqlError> {
+        Ok((self.eb.load_const(v), false))
+    }
+
+    fn lit_float(&mut self, v: f64) -> Result<Self::Out, GnitzSqlError> {
+        Ok((self.eb.load_const(v.to_bits() as i64), true))
+    }
+
+    fn lit_str(&mut self, _s: &str) -> Result<Self::Out, GnitzSqlError> {
+        Err(GnitzSqlError::Unsupported(
+            "string literals not supported in view expressions".to_string(),
+        ))
+    }
+
+    fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<Self::Out, GnitzSqlError> {
+        // String comparison detection — intercept before recursing into operands
+        // (a bare string literal/column would otherwise error in `lit_str`/`col_ref`).
+        if let Some(result) = try_compile_string_cmp(left, &op, right, self.schema, self.eb)? {
+            return Ok(result);
+        }
+
+        let (mut l, l_float) = lower_bound_expr(left, self)?;
+        let (mut r, r_float) = lower_bound_expr(right, self)?;
+
+        // Boolean ops never need float cast
+        if matches!(op, BinOp::And) {
+            return Ok((self.eb.bool_and(l, r), false));
+        }
+        if matches!(op, BinOp::Or) {
+            return Ok((self.eb.bool_or(l, r), false));
+        }
+
+        let is_float = l_float || r_float;
+
+        // Cast int operand to float if mixed
+        if is_float && !l_float {
+            l = self.eb.int_to_float(l);
+        }
+        if is_float && !r_float {
+            r = self.eb.int_to_float(r);
+        }
+
+        match (op, is_float) {
+            // Arithmetic
+            (BinOp::Add, false) => Ok((self.eb.add(l, r), false)),
+            (BinOp::Add, true) => Ok((self.eb.float_add(l, r), true)),
+            (BinOp::Sub, false) => Ok((self.eb.sub(l, r), false)),
+            (BinOp::Sub, true) => Ok((self.eb.float_sub(l, r), true)),
+            (BinOp::Mul, false) => Ok((self.eb.mul(l, r), false)),
+            (BinOp::Mul, true) => Ok((self.eb.float_mul(l, r), true)),
+            (BinOp::Div, false) => Ok((self.eb.div(l, r), false)),
+            (BinOp::Div, true) => Ok((self.eb.float_div(l, r), true)),
+            (BinOp::Mod, false) => Ok((self.eb.modulo(l, r), false)),
+            (BinOp::Mod, true) => Err(GnitzSqlError::Unsupported("float modulo not supported".to_string())),
+            // Comparisons — result is always int (0/1)
+            (BinOp::Eq, false) => Ok((self.eb.cmp_eq(l, r), false)),
+            (BinOp::Eq, true) => Ok((self.eb.fcmp_eq(l, r), false)),
+            (BinOp::Ne, false) => Ok((self.eb.cmp_ne(l, r), false)),
+            (BinOp::Ne, true) => Ok((self.eb.fcmp_ne(l, r), false)),
+            (BinOp::Gt, false) => Ok((self.eb.cmp_gt(l, r), false)),
+            (BinOp::Gt, true) => Ok((self.eb.fcmp_gt(l, r), false)),
+            (BinOp::Ge, false) => Ok((self.eb.cmp_ge(l, r), false)),
+            (BinOp::Ge, true) => Ok((self.eb.fcmp_ge(l, r), false)),
+            (BinOp::Lt, false) => Ok((self.eb.cmp_lt(l, r), false)),
+            (BinOp::Lt, true) => Ok((self.eb.fcmp_lt(l, r), false)),
+            (BinOp::Le, false) => Ok((self.eb.cmp_le(l, r), false)),
+            (BinOp::Le, true) => Ok((self.eb.fcmp_le(l, r), false)),
+            // And/Or handled above
+            (BinOp::And, _) | (BinOp::Or, _) => unreachable!(),
+        }
+    }
+
+    fn unop(&mut self, op: UnaryOp, inner: &BoundExpr) -> Result<Self::Out, GnitzSqlError> {
+        let (a, a_float) = lower_bound_expr(inner, self)?;
+        match op {
+            UnaryOp::Neg => {
+                if a_float {
+                    Ok((self.eb.float_neg(a), true))
+                } else {
+                    Ok((self.eb.neg_int(a), false))
+                }
+            }
+            UnaryOp::Not => Ok((self.eb.bool_not(a), false)),
+        }
+    }
+
+    fn null_test(&mut self, col: usize, want_null: bool) -> Result<Self::Out, GnitzSqlError> {
+        if want_null {
+            Ok((self.eb.is_null(col), false))
+        } else {
+            Ok((self.eb.is_not_null(col), false))
+        }
+    }
+
+    fn agg_call(&mut self) -> Result<Self::Out, GnitzSqlError> {
+        Err(GnitzSqlError::Unsupported(
+            "aggregate function not allowed in expression context".to_string(),
+        ))
+    }
+}
+
 /// Compile a BoundExpr to ExprBuilder opcodes.
 /// Returns `(result_reg, is_float)` where `is_float` indicates the register
 /// holds f64 bit-pattern rather than a plain i64.
@@ -99,119 +286,14 @@ pub(crate) fn compile_bound_expr(
     schema: &Schema,
     eb: &mut ExprBuilder,
 ) -> Result<(u32, bool), GnitzSqlError> {
-    match expr {
-        BoundExpr::ColRef(idx) => {
-            // Every 16-byte column (`wire_stride == 16`) must be rejected here: the
-            // engine's `EXPR_LOAD_PAYLOAD_INT` handler has arms only for 1/2/4/8-byte
-            // columns, so a 16-byte column hits its no-op arm and the following op
-            // reads stale scratch bytes — silent corruption, no error. A *valid*
-            // string/blob use is one of the six comparisons, which
-            // `try_compile_string_cmp` intercepts before any recursion reaches this
-            // arm; so a STRING/BLOB landing here is arithmetic or a mixed-type
-            // comparison (`a.s > b.int`) and must error, not load garbage.
-            let tc = schema.columns[*idx].type_code;
-            match tc {
-                TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => Err(GnitzSqlError::Unsupported(format!(
-                    "column {:?} is {tc:?}; 128-bit columns cannot be used in view \
-                     expressions (use a primary-key seek or CREATE INDEX instead)",
-                    schema.columns[*idx].name,
-                ))),
-                TypeCode::String | TypeCode::Blob => Err(GnitzSqlError::Unsupported(format!(
-                    "column {:?} is {tc:?}; string/blob columns support only =, <>, <, <=, \
-                     >, >= against another string/blob column or a string literal — not \
-                     arithmetic or comparison with a non-string column",
-                    schema.columns[*idx].name,
-                ))),
-                TypeCode::F32 | TypeCode::F64 => Ok((eb.load_col_float(*idx), true)),
-                _ => Ok((eb.load_col_int(*idx), false)),
-            }
-        }
-        BoundExpr::LitInt(v) => Ok((eb.load_const(*v), false)),
-        BoundExpr::LitFloat(v) => Ok((eb.load_const(v.to_bits() as i64), true)),
-        BoundExpr::LitStr(_) => Err(GnitzSqlError::Unsupported(
-            "string literals not supported in view expressions".to_string(),
-        )),
-        BoundExpr::BinOp(left, op, right) => {
-            // String comparison detection
-            if let Some(result) = try_compile_string_cmp(left, op, right, schema, eb)? {
-                return Ok(result);
-            }
-
-            let (mut l, l_float) = compile_bound_expr(left, schema, eb)?;
-            let (mut r, r_float) = compile_bound_expr(right, schema, eb)?;
-
-            // Boolean ops never need float cast
-            if matches!(op, BinOp::And) {
-                return Ok((eb.bool_and(l, r), false));
-            }
-            if matches!(op, BinOp::Or) {
-                return Ok((eb.bool_or(l, r), false));
-            }
-
-            let is_float = l_float || r_float;
-
-            // Cast int operand to float if mixed
-            if is_float && !l_float {
-                l = eb.int_to_float(l);
-            }
-            if is_float && !r_float {
-                r = eb.int_to_float(r);
-            }
-
-            match (op, is_float) {
-                // Arithmetic
-                (BinOp::Add, false) => Ok((eb.add(l, r), false)),
-                (BinOp::Add, true) => Ok((eb.float_add(l, r), true)),
-                (BinOp::Sub, false) => Ok((eb.sub(l, r), false)),
-                (BinOp::Sub, true) => Ok((eb.float_sub(l, r), true)),
-                (BinOp::Mul, false) => Ok((eb.mul(l, r), false)),
-                (BinOp::Mul, true) => Ok((eb.float_mul(l, r), true)),
-                (BinOp::Div, false) => Ok((eb.div(l, r), false)),
-                (BinOp::Div, true) => Ok((eb.float_div(l, r), true)),
-                (BinOp::Mod, false) => Ok((eb.modulo(l, r), false)),
-                (BinOp::Mod, true) => Err(GnitzSqlError::Unsupported("float modulo not supported".to_string())),
-                // Comparisons — result is always int (0/1)
-                (BinOp::Eq, false) => Ok((eb.cmp_eq(l, r), false)),
-                (BinOp::Eq, true) => Ok((eb.fcmp_eq(l, r), false)),
-                (BinOp::Ne, false) => Ok((eb.cmp_ne(l, r), false)),
-                (BinOp::Ne, true) => Ok((eb.fcmp_ne(l, r), false)),
-                (BinOp::Gt, false) => Ok((eb.cmp_gt(l, r), false)),
-                (BinOp::Gt, true) => Ok((eb.fcmp_gt(l, r), false)),
-                (BinOp::Ge, false) => Ok((eb.cmp_ge(l, r), false)),
-                (BinOp::Ge, true) => Ok((eb.fcmp_ge(l, r), false)),
-                (BinOp::Lt, false) => Ok((eb.cmp_lt(l, r), false)),
-                (BinOp::Lt, true) => Ok((eb.fcmp_lt(l, r), false)),
-                (BinOp::Le, false) => Ok((eb.cmp_le(l, r), false)),
-                (BinOp::Le, true) => Ok((eb.fcmp_le(l, r), false)),
-                // And/Or handled above
-                (BinOp::And, _) | (BinOp::Or, _) => unreachable!(),
-            }
-        }
-        BoundExpr::UnaryOp(op, inner) => {
-            let (a, a_float) = compile_bound_expr(inner, schema, eb)?;
-            match op {
-                UnaryOp::Neg => {
-                    if a_float {
-                        Ok((eb.float_neg(a), true))
-                    } else {
-                        Ok((eb.neg_int(a), false))
-                    }
-                }
-                UnaryOp::Not => Ok((eb.bool_not(a), false)),
-            }
-        }
-        BoundExpr::IsNull(idx) => Ok((eb.is_null(*idx), false)),
-        BoundExpr::IsNotNull(idx) => Ok((eb.is_not_null(*idx), false)),
-        BoundExpr::AggCall { .. } => Err(GnitzSqlError::Unsupported(
-            "aggregate function not allowed in expression context".to_string(),
-        )),
-    }
+    let mut backend = OpcodeBackend { schema, eb };
+    lower_bound_expr(expr, &mut backend)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gnitz_core::{ColumnDef, ExprProgram, Schema};
+    use gnitz_core::{ColumnDef, ExprProgram, Schema, TypeCode};
 
     fn col(name: &str, tc: TypeCode) -> ColumnDef {
         ColumnDef {

@@ -1,7 +1,8 @@
 use super::resolve::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr, UnaryOp};
-use gnitz_core::{Schema, TypeCode};
+use crate::types::is_min_max_orderable;
+use gnitz_core::Schema;
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
 };
@@ -228,14 +229,7 @@ impl LeafBinder for SingleTable<'_> {
                             // correctly.
                             if matches!(agg_func, AggFunc::Min | AggFunc::Max) {
                                 let arg_ty = bound.infer_type(self.schema);
-                                if matches!(
-                                    arg_ty,
-                                    TypeCode::U128
-                                        | TypeCode::UUID
-                                        | TypeCode::Blob
-                                        | TypeCode::String
-                                        | TypeCode::I128
-                                ) {
+                                if !is_min_max_orderable(arg_ty) {
                                     return Err(GnitzSqlError::Unsupported(format!(
                                         "{}: not supported on {:?} columns",
                                         name.to_uppercase(),

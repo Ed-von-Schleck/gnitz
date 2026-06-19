@@ -32,6 +32,50 @@ pub(crate) fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlEr
     }
 }
 
+// ---------------------------------------------------------------------------
+// TypeCode capability predicates
+//
+// One home for the type-membership tests that the binder (MIN/MAX rejection),
+// the lowerer (ColRef rejection), and DDL (FK numeric compatibility) all query.
+// gnitz_core already owns `is_float` / `is_german_string`; these add the sets
+// it does not.
+// ---------------------------------------------------------------------------
+
+/// Integer column types — signed/unsigned at every width, including the 128-bit
+/// pair. Used for FK compatibility (an integer child column widens to an integer
+/// parent) and the numeric-aggregate check.
+pub(crate) fn is_integer_type(tc: TypeCode) -> bool {
+    matches!(
+        tc,
+        TypeCode::I8
+            | TypeCode::I16
+            | TypeCode::I32
+            | TypeCode::I64
+            | TypeCode::U8
+            | TypeCode::U16
+            | TypeCode::U32
+            | TypeCode::U64
+            | TypeCode::U128
+            | TypeCode::I128
+    )
+}
+
+/// The 16-byte integer-ish types (U128, UUID, I128) that have no i64 slot: the
+/// engine's `EXPR_LOAD_PAYLOAD_INT` handler has arms only for 1/2/4/8-byte
+/// columns, so the lowerer must reject these in arithmetic/comparison contexts.
+pub(crate) fn is_wide_int(tc: TypeCode) -> bool {
+    matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::I128)
+}
+
+/// Whether MIN/MAX has a correct accumulator path for this column type. Wide
+/// integer-ish types (U128/UUID/I128) have no i64 slot, and STRING/BLOB have no
+/// usable ordering in the i64 comparator (`decode_signed` reads the descriptor
+/// prefix as a garbage signed int). Everything else — narrow and 64-bit ints,
+/// and floats — orders correctly.
+pub(crate) fn is_min_max_orderable(tc: TypeCode) -> bool {
+    !is_wide_int(tc) && !tc.is_german_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
