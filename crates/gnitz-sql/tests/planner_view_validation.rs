@@ -17,7 +17,7 @@ fn test_view_limit_rejected() {
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)").unwrap();
-    let err = must_err(p.execute("CREATE VIEW v AS SELECT * FROM t LIMIT 10"));
+    let err = p.execute("CREATE VIEW v AS SELECT * FROM t LIMIT 10").unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.to_uppercase().contains("LIMIT"), "got: {}", s),
         e => panic!("expected Unsupported, got {:?}", e),
@@ -41,7 +41,9 @@ fn test_set_op_type_mismatch_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, val BIGINT)").unwrap();
     p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, val TEXT)").unwrap();
-    let err = must_err(p.execute("CREATE VIEW v AS SELECT * FROM a UNION ALL SELECT * FROM b"));
+    let err = p
+        .execute("CREATE VIEW v AS SELECT * FROM a UNION ALL SELECT * FROM b")
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("type mismatch"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -58,7 +60,9 @@ fn test_duplicate_column_name_rejected() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE TABLE dup (a BIGINT, a BIGINT, PRIMARY KEY(a))"));
+    let err = p
+        .execute("CREATE TABLE dup (a BIGINT, a BIGINT, PRIMARY KEY(a))")
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.to_lowercase().contains("duplicate column"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -81,7 +85,9 @@ fn test_self_join_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, fk BIGINT NOT NULL)")
         .unwrap();
-    let err = must_err(p.execute("CREATE VIEW v AS SELECT t1.id FROM t AS t1 JOIN t AS t2 ON t1.fk = t2.fk"));
+    let err = p
+        .execute("CREATE VIEW v AS SELECT t1.id FROM t AS t1 JOIN t AS t2 ON t1.fk = t2.fk")
+        .unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.to_lowercase().contains("self-join"), "got: {}", s),
         e => panic!("expected Unsupported, got {:?}", e),
@@ -132,7 +138,9 @@ fn test_wide_join_column_count_rejected() {
     };
     p.execute(&mk("wl")).unwrap();
     p.execute(&mk("wr")).unwrap();
-    let err = must_err(p.execute("CREATE VIEW v AS SELECT * FROM wl JOIN wr ON wl.fk = wr.fk"));
+    let err = p
+        .execute("CREATE VIEW v AS SELECT * FROM wl JOIN wr ON wl.fk = wr.fk")
+        .unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.contains("column") || s.contains("MAX_COLUMNS"), "got: {}", s),
         e => panic!("expected Unsupported, got {:?}", e),

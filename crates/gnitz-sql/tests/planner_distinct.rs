@@ -174,7 +174,7 @@ fn test_select_distinct_float_column_rejected() {
         .unwrap();
 
     // Explicit float projection.
-    let err = must_err(p.execute("CREATE VIEW v AS SELECT DISTINCT d FROM t"));
+    let err = p.execute("CREATE VIEW v AS SELECT DISTINCT d FROM t").unwrap_err();
     assert!(
         matches!(&err, GnitzSqlError::Unsupported(s) if s.contains("float")),
         "expected float-identity Unsupported, got {:?}",
@@ -183,7 +183,7 @@ fn test_select_distinct_float_column_rejected() {
 
     // `SELECT DISTINCT *` over a table with a float column hits the all-* early
     // return, which must also be guarded.
-    let err2 = must_err(p.execute("CREATE VIEW v2 AS SELECT DISTINCT * FROM t"));
+    let err2 = p.execute("CREATE VIEW v2 AS SELECT DISTINCT * FROM t").unwrap_err();
     assert!(
         matches!(&err2, GnitzSqlError::Unsupported(s) if s.contains("float")),
         "expected float-identity Unsupported for DISTINCT *, got {:?}",
@@ -206,7 +206,9 @@ fn test_distinct_duplicate_output_columns_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE di_dup (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)")
         .unwrap();
-    let err = must_err(p.execute("CREATE VIEW v_di_dup AS SELECT DISTINCT a AS x, b AS x FROM di_dup"));
+    let err = p
+        .execute("CREATE VIEW v_di_dup AS SELECT DISTINCT a AS x, b AS x FROM di_dup")
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("duplicate column"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),

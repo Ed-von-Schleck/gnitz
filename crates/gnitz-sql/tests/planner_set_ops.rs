@@ -317,7 +317,7 @@ fn assert_same_relation_rejected(extra_setup: &[&str], view_sql: &str) {
         }
     }
     let mut p = SqlPlanner::new(&mut client, &sn);
-    match must_err(p.execute(view_sql)) {
+    match p.execute(view_sql).unwrap_err() {
         GnitzSqlError::Unsupported(s) => assert!(s.contains("same relation"), "got: {}", s),
         e => panic!("expected Unsupported, got {:?}", e),
     }
@@ -651,7 +651,9 @@ fn test_direct_self_join_still_rejected() {
             .unwrap();
     }
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE VIEW j AS SELECT a.id FROM t AS a JOIN t AS b ON a.k = b.k"));
+    let err = p
+        .execute("CREATE VIEW j AS SELECT a.id FROM t AS a JOIN t AS b ON a.k = b.k")
+        .unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.to_lowercase().contains("self-join"), "got: {}", s),
         e => panic!("expected Unsupported, got {:?}", e),
@@ -679,7 +681,9 @@ fn test_set_op_float_column_rejected() {
         .unwrap();
 
     for op in ["UNION", "EXCEPT", "INTERSECT"] {
-        let err = must_err(p.execute(&format!("CREATE VIEW vbad AS SELECT d FROM a {op} SELECT d FROM b")));
+        let err = p
+            .execute(&format!("CREATE VIEW vbad AS SELECT d FROM a {op} SELECT d FROM b"))
+            .unwrap_err();
         assert!(
             matches!(&err, GnitzSqlError::Unsupported(s) if s.contains("float")),
             "expected float-identity Unsupported for {op}, got {:?}",
@@ -704,10 +708,12 @@ fn test_set_op_duplicate_output_columns_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE so_dup (id BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)")
         .unwrap();
-    let err = must_err(p.execute(
-        "CREATE VIEW v_so_dup AS SELECT a AS x, b AS x FROM so_dup \
+    let err = p
+        .execute(
+            "CREATE VIEW v_so_dup AS SELECT a AS x, b AS x FROM so_dup \
          UNION SELECT a AS x, b AS x FROM so_dup",
-    ));
+        )
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("duplicate column"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),

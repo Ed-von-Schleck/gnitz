@@ -1,5 +1,5 @@
 use crate::error::GnitzSqlError;
-use crate::logical_plan::{BinOp, BoundExpr, UnaryOp};
+use crate::ir::{BinOp, BoundExpr, UnaryOp};
 use gnitz_core::ExprBuilder;
 use gnitz_core::{Schema, TypeCode};
 
@@ -94,7 +94,7 @@ fn try_compile_string_cmp(
 /// Compile a BoundExpr to ExprBuilder opcodes.
 /// Returns `(result_reg, is_float)` where `is_float` indicates the register
 /// holds f64 bit-pattern rather than a plain i64.
-pub fn compile_bound_expr(
+pub(crate) fn compile_bound_expr(
     expr: &BoundExpr,
     schema: &Schema,
     eb: &mut ExprBuilder,

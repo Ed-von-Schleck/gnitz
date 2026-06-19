@@ -27,7 +27,7 @@ fn setup_dup_view(client: &mut gnitz_core::GnitzClient, sn: &str) {
 
 /// Assert `r` is a `Bind` error whose message reports an ambiguous column.
 fn assert_ambiguous(r: Result<Vec<gnitz_sql::SqlResult>, GnitzSqlError>) {
-    match must_err(r) {
+    match r.unwrap_err() {
         GnitzSqlError::Bind(s) => assert!(s.contains("ambiguous"), "expected an 'ambiguous' Bind error, got: {s}"),
         e => panic!("expected Bind(ambiguous), got {:?}", e),
     }
@@ -225,7 +225,7 @@ fn test_unique_name_in_dup_view_resolves() {
 
 /// Assert `r` is an `Unsupported` error reporting a view target.
 fn assert_is_view(r: Result<Vec<gnitz_sql::SqlResult>, GnitzSqlError>) {
-    match must_err(r) {
+    match r.unwrap_err() {
         GnitzSqlError::Unsupported(s) => assert!(
             s.contains("is a view"),
             "expected an 'is a view' Unsupported error, got: {s}"

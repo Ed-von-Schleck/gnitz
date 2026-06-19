@@ -1,5 +1,5 @@
 use crate::error::GnitzSqlError;
-use crate::logical_plan::{AggFunc, BinOp, BoundExpr, UnaryOp};
+use crate::ir::{AggFunc, BinOp, BoundExpr, UnaryOp};
 use gnitz_core::GnitzClient;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 use sqlparser::ast::{
@@ -19,7 +19,7 @@ use std::rc::Rc;
 ///
 /// Single home for the name→index lookup that was previously
 /// `columns.iter().position(...)` (first-match) at every call site.
-pub fn find_unique_column(columns: &[ColumnDef], col_name: &str) -> Result<Option<usize>, GnitzSqlError> {
+pub(crate) fn find_unique_column(columns: &[ColumnDef], col_name: &str) -> Result<Option<usize>, GnitzSqlError> {
     let mut found: Option<usize> = None;
     for (i, c) in columns.iter().enumerate() {
         if c.name.eq_ignore_ascii_case(col_name) {
@@ -36,7 +36,7 @@ pub fn find_unique_column(columns: &[ColumnDef], col_name: &str) -> Result<Optio
 
 /// Resolves a column in a multi-table context (for joins).
 /// `tables` maps alias/name → (table_id, Schema, column_offset).
-pub fn resolve_qualified_column(
+pub(crate) fn resolve_qualified_column(
     table_alias: &str,
     col_name: &str,
     tables: &HashMap<String, (u64, Rc<Schema>, usize)>,
@@ -51,7 +51,7 @@ pub fn resolve_qualified_column(
 
 /// Resolves an unqualified column in a multi-table context.
 /// Tries each table in order; errors on ambiguity.
-pub fn resolve_unqualified_column(
+pub(crate) fn resolve_unqualified_column(
     col_name: &str,
     tables: &HashMap<String, (u64, Rc<Schema>, usize)>,
 ) -> Result<usize, GnitzSqlError> {
@@ -72,20 +72,20 @@ pub fn resolve_unqualified_column(
     found.ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in any table")))
 }
 
-pub struct Binder<'a> {
+pub(crate) struct Binder<'a> {
     schema_name: &'a str,
     cache: HashMap<String, (u64, Rc<Schema>)>,
 }
 
 impl<'a> Binder<'a> {
-    pub fn new(schema_name: &'a str) -> Self {
+    pub(crate) fn new(schema_name: &'a str) -> Self {
         Binder {
             schema_name,
             cache: HashMap::new(),
         }
     }
 
-    pub fn resolve(&mut self, client: &mut GnitzClient, name: &str) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
+    pub(crate) fn resolve(&mut self, client: &mut GnitzClient, name: &str) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
         if let Some(entry) = self.cache.get(name) {
             return Ok((entry.0, Rc::clone(&entry.1)));
         }
@@ -103,7 +103,7 @@ impl<'a> Binder<'a> {
     /// writing to it or indexing it corrupts that state. `resolve` (used by
     /// SELECT and view definitions) still accepts views; this is the
     /// writable-target variant.
-    pub fn resolve_base_table(
+    pub(crate) fn resolve_base_table(
         &mut self,
         client: &mut GnitzClient,
         name: &str,
@@ -128,7 +128,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Cache a CTE or alias name as resolving to the given (table_id, schema).
-    pub fn cache_alias(&mut self, name: String, resolved: (u64, Rc<Schema>)) {
+    pub(crate) fn cache_alias(&mut self, name: String, resolved: (u64, Rc<Schema>)) {
         self.cache.insert(name, resolved);
     }
 
@@ -137,7 +137,7 @@ impl<'a> Binder<'a> {
     /// the `SingleTable` leaf supplies the three schema-aware decisions (column
     /// lookup, aggregate calls, `IS [NOT] NULL`). `&self` is retained for API
     /// symmetry and future binding state, though the recursion no longer threads it.
-    pub fn bind_expr(&self, expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
+    pub(crate) fn bind_expr(&self, expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
         bind_structural(expr, &SingleTable { schema })
     }
 }
@@ -417,15 +417,14 @@ mod tests {
     }
 
     fn assert_unsupported(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
-        match r {
-            Err(GnitzSqlError::Unsupported(msg)) => {
+        match r.unwrap_err() {
+            GnitzSqlError::Unsupported(msg) => {
                 assert!(
                     msg.contains(want_substr),
                     "got Unsupported({msg:?}), expected to contain {want_substr:?}"
                 );
             }
-            Err(e) => panic!("expected Unsupported, got {e:?}"),
-            Ok(_) => panic!("expected Unsupported, got Ok"),
+            e => panic!("expected Unsupported, got {e:?}"),
         }
     }
 

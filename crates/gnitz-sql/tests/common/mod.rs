@@ -11,15 +11,6 @@ use gnitz_core::{ColData, GnitzClient, PkColumn, Schema, ZSetBatch, CIRCUIT_NODE
 use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
 use gnitz_test_harness::ServerHandle;
 
-/// Local replacement for `Result::unwrap_err` — `SqlResult` doesn't impl `Debug`,
-/// so the stdlib version doesn't compile.
-pub fn must_err(r: Result<Vec<SqlResult>, GnitzSqlError>) -> GnitzSqlError {
-    match r {
-        Ok(_) => panic!("expected error, got Ok"),
-        Err(e) => e,
-    }
-}
-
 /// Returns (client, schema_name) with a unique schema already created.
 /// The schema name is unique per call so parallel tests don't collide.
 pub fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
@@ -31,8 +22,7 @@ pub fn make_planner(srv: &ServerHandle) -> (GnitzClient, String) {
     (client, sn)
 }
 
-/// Plan and execute a statement, asserting it succeeds. (`SqlResult` has no
-/// `Debug`, so the result Vec is simply unwrapped.)
+/// Plan and execute a statement, asserting it succeeds.
 pub fn exec(client: &mut GnitzClient, sn: &str, sql: &str) {
     let mut p = SqlPlanner::new(client, sn);
     p.execute(sql).unwrap();

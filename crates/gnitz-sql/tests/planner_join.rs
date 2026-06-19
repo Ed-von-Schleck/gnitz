@@ -152,7 +152,9 @@ fn test_join_reject_float_key() {
     p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk DOUBLE NOT NULL)")
         .unwrap();
 
-    let err = must_err(p.execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fk = b.fk"));
+    let err = p
+        .execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fk = b.fk")
+        .unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "expected Unsupported, got {:?}",
@@ -258,7 +260,9 @@ fn test_join_reject_cross_sign() {
     p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)")
         .unwrap();
 
-    let err = must_err(p.execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fk = b.fk"));
+    let err = p
+        .execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fk = b.fk")
+        .unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "expected Unsupported, got {:?}",
@@ -286,7 +290,9 @@ fn test_join_reject_mixed_string_native() {
     p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, n DECIMAL(38,0) NOT NULL)")
         .unwrap();
 
-    let err = must_err(p.execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.s = b.n"));
+    let err = p
+        .execute("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.s = b.n")
+        .unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "expected Unsupported, got {:?}",
@@ -324,7 +330,9 @@ fn test_join_reject_arity_cap() {
         .map(|i| format!("a.c{i} = b.c{i}"))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let err = must_err(p.execute(&format!("CREATE VIEW v AS SELECT * FROM a JOIN b ON {on}")));
+    let err = p
+        .execute(&format!("CREATE VIEW v AS SELECT * FROM a JOIN b ON {on}"))
+        .unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => assert!(
             s.contains("equijoin key columns") && s.contains(&n.to_string()),
@@ -709,10 +717,12 @@ fn test_join_duplicate_output_columns_rejected() {
         .unwrap();
     p.execute("CREATE TABLE jr_dup (id BIGINT PRIMARY KEY, b BIGINT NOT NULL)")
         .unwrap();
-    let err = must_err(p.execute(
-        "CREATE VIEW v_jn_dup AS SELECT jl_dup.a AS x, jr_dup.b AS x \
+    let err = p
+        .execute(
+            "CREATE VIEW v_jn_dup AS SELECT jl_dup.a AS x, jr_dup.b AS x \
          FROM jl_dup JOIN jr_dup ON jl_dup.id = jr_dup.id",
-    ));
+        )
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("duplicate column"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -839,10 +849,12 @@ fn test_pure_range_left_join_rejects_wide_compare_type() {
         .unwrap();
     p.execute("CREATE TABLE rlw_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)")
         .unwrap();
-    let err = must_err(p.execute(
-        "CREATE VIEW rlw_v AS SELECT rlw_a.id AS aid, rlw_b.id AS bid \
+    let err = p
+        .execute(
+            "CREATE VIEW rlw_v AS SELECT rlw_a.id AS aid, rlw_b.id AS bid \
          FROM rlw_a LEFT JOIN rlw_b ON rlw_a.x < rlw_b.y",
-    ));
+        )
+        .unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.contains("16-byte accumulator"), "got: {s}"),
         e => panic!("expected Unsupported, got {:?}", e),
@@ -912,10 +924,12 @@ fn test_pure_range_left_join_rejects_wide_int_range_column() {
             .unwrap();
         p.execute("CREATE TABLE wr_b (id BIGINT NOT NULL PRIMARY KEY, y DECIMAL(38,0) NOT NULL)")
             .unwrap();
-        let err = must_err(p.execute(
-            "CREATE VIEW wr_left AS SELECT wr_a.id AS aid, wr_b.id AS bid \
+        let err = p
+            .execute(
+                "CREATE VIEW wr_left AS SELECT wr_a.id AS aid, wr_b.id AS bid \
              FROM wr_a LEFT JOIN wr_b ON wr_a.x < wr_b.y",
-        ));
+            )
+            .unwrap_err();
         match err {
             GnitzSqlError::Unsupported(s) => assert!(s.contains("16-byte accumulator"), "got: {s}"),
             e => panic!("expected Unsupported, got {:?}", e),
@@ -1133,7 +1147,9 @@ fn test_range_join_reject_string_range_pair() {
         .unwrap();
     p.execute("CREATE TABLE rs_b (id BIGINT NOT NULL PRIMARY KEY, s VARCHAR NOT NULL)")
         .unwrap();
-    let err = must_err(p.execute("CREATE VIEW rs_v AS SELECT * FROM rs_a JOIN rs_b ON rs_a.s < rs_b.s"));
+    let err = p
+        .execute("CREATE VIEW rs_v AS SELECT * FROM rs_a JOIN rs_b ON rs_a.s < rs_b.s")
+        .unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.contains("order-preserving"), "got: {s}"),
         e => panic!("expected Unsupported, got {:?}", e),
@@ -1151,7 +1167,9 @@ fn test_range_join_reject_self_join() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE rself (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)")
         .unwrap();
-    let err = must_err(p.execute("CREATE VIEW rself_v AS SELECT * FROM rself a JOIN rself b ON a.x < b.y"));
+    let err = p
+        .execute("CREATE VIEW rself_v AS SELECT * FROM rself a JOIN rself b ON a.x < b.y")
+        .unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "expected Unsupported, got {:?}",
@@ -1665,11 +1683,12 @@ fn test_residual_left_join_rejected() {
         &sn,
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
     );
-    let err = must_err(try_exec(
+    let err = try_exec(
         &mut client,
         &sn,
         "CREATE VIEW v AS SELECT * FROM a LEFT JOIN b ON a.k = b.k AND a.t <> b.t",
-    ));
+    )
+    .unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "expected Unsupported, got {:?}",
@@ -1700,11 +1719,12 @@ fn test_residual_only_on_rejected() {
         &sn,
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, t BIGINT NOT NULL)",
     );
-    let err = must_err(try_exec(
+    let err = try_exec(
         &mut client,
         &sn,
         "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.t <> b.t",
-    ));
+    )
+    .unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Bind(_)),
         "expected Bind (no anchor), got {:?}",
@@ -1735,11 +1755,12 @@ fn test_residual_like_rejected() {
         &sn,
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t VARCHAR NOT NULL)",
     );
-    let err = must_err(try_exec(
+    let err = try_exec(
         &mut client,
         &sn,
         "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.k = b.k AND a.t LIKE b.t",
-    ));
+    )
+    .unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "expected Unsupported, got {:?}",
@@ -1770,11 +1791,12 @@ fn test_residual_mixed_string_int_rejected() {
         &sn,
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, n BIGINT NOT NULL)",
     );
-    let err = must_err(try_exec(
+    let err = try_exec(
         &mut client,
         &sn,
         "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.k = b.k AND a.s <> b.n",
-    ));
+    )
+    .unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "expected Unsupported, got {:?}",

@@ -45,7 +45,9 @@ fn test_cte_alias_count_mismatch_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT NOT NULL)")
         .unwrap();
-    let err = must_err(p.execute("CREATE VIEW v AS WITH cte(x, y, z) AS (SELECT a, b FROM t) SELECT x FROM cte"));
+    let err = p
+        .execute("CREATE VIEW v AS WITH cte(x, y, z) AS (SELECT a, b FROM t) SELECT x FROM cte")
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("alias"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -69,7 +71,9 @@ fn test_cte_with_where_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT NOT NULL)")
         .unwrap();
-    let err = must_err(p.execute("CREATE VIEW v AS WITH cte AS (SELECT * FROM t WHERE b > 5) SELECT a FROM cte"));
+    let err = p
+        .execute("CREATE VIEW v AS WITH cte AS (SELECT * FROM t WHERE b > 5) SELECT a FROM cte")
+        .unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "CTE with WHERE must be rejected (not silently discarded), got {:?}",
@@ -92,7 +96,9 @@ fn test_cte_subset_projection_rejected() {
     p.execute("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT NOT NULL)")
         .unwrap();
     // Projection drops column b — not an identity pass-through.
-    let err = must_err(p.execute("CREATE VIEW v AS WITH cte AS (SELECT a FROM t) SELECT a FROM cte"));
+    let err = p
+        .execute("CREATE VIEW v AS WITH cte AS (SELECT a FROM t) SELECT a FROM cte")
+        .unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "CTE with a subset projection must be rejected, got {:?}",

@@ -124,7 +124,9 @@ fn test_sum_string_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT UNSIGNED NOT NULL, s TEXT)")
         .unwrap();
-    let err = must_err(p.execute("CREATE VIEW v AS SELECT g, SUM(s) AS x FROM t GROUP BY g"));
+    let err = p
+        .execute("CREATE VIEW v AS SELECT g, SUM(s) AS x FROM t GROUP BY g")
+        .unwrap_err();
     assert!(matches!(err, GnitzSqlError::Bind(_)), "expected Bind, got {:?}", err);
 }
 
@@ -142,9 +144,11 @@ fn test_sum_avg_u128_rejected() {
     p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT UNSIGNED NOT NULL, big DECIMAL(38,0) NOT NULL)")
         .unwrap();
     for func in ["SUM", "AVG"] {
-        let err = must_err(p.execute(&format!(
-            "CREATE VIEW v AS SELECT g, {func}(big) AS x FROM t GROUP BY g"
-        )));
+        let err = p
+            .execute(&format!(
+                "CREATE VIEW v AS SELECT g, {func}(big) AS x FROM t GROUP BY g"
+            ))
+            .unwrap_err();
         assert!(
             matches!(err, GnitzSqlError::Bind(_)),
             "expected Bind for {func}(u128), got {:?}",
@@ -163,7 +167,9 @@ fn test_min_uuid_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT UNSIGNED NOT NULL, u UUID)")
         .unwrap();
-    let err = must_err(p.execute("CREATE VIEW v AS SELECT g, MIN(u) AS x FROM t GROUP BY g"));
+    let err = p
+        .execute("CREATE VIEW v AS SELECT g, MIN(u) AS x FROM t GROUP BY g")
+        .unwrap_err();
     // A clean rejection (not a server panic) — the binder may reject MIN(uuid)
     // as Unsupported before the planner's numeric/orderable guard is reached.
     assert!(
@@ -194,9 +200,11 @@ fn test_agg_i128_join_pk_rejected() {
     p.execute("CREATE VIEW jv AS SELECT a.id AS aid, b.id AS bid FROM a JOIN b ON a.fk = b.fk")
         .unwrap();
     for func in ["MIN", "MAX", "SUM", "AVG"] {
-        let err = must_err(p.execute(&format!(
-            "CREATE VIEW v_{func} AS SELECT aid, {func}(_join_pk) AS x FROM jv GROUP BY aid"
-        )));
+        let err = p
+            .execute(&format!(
+                "CREATE VIEW v_{func} AS SELECT aid, {func}(_join_pk) AS x FROM jv GROUP BY aid"
+            ))
+            .unwrap_err();
         assert!(
             matches!(err, GnitzSqlError::Bind(_) | GnitzSqlError::Unsupported(_)),
             "expected clean rejection for {func}(_join_pk:I128), got {:?}",
@@ -566,9 +574,11 @@ fn test_group_by_float_key_rejected() {
     p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, f FLOAT NOT NULL, d DOUBLE NOT NULL, v BIGINT NOT NULL)")
         .unwrap();
     for col in ["f", "d"] {
-        let err = must_err(p.execute(&format!(
-            "CREATE VIEW vbad AS SELECT {col}, COUNT(*) AS n FROM t GROUP BY {col}"
-        )));
+        let err = p
+            .execute(&format!(
+                "CREATE VIEW vbad AS SELECT {col}, COUNT(*) AS n FROM t GROUP BY {col}"
+            ))
+            .unwrap_err();
         assert!(
             matches!(&err, GnitzSqlError::Unsupported(s) if s.contains("float")),
             "expected float-key Unsupported for GROUP BY {col}, got {:?}",

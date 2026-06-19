@@ -1,9 +1,10 @@
+mod ast_util;
 mod binder;
-pub mod dml;
+mod dml;
 mod error;
 mod expr;
-mod logical_plan;
-pub mod planner;
+mod ir;
+mod planner;
 mod types;
 
 pub use error::GnitzSqlError;
@@ -14,6 +15,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 /// Result of executing a single SQL statement.
+#[derive(Debug)]
 pub enum SqlResult {
     TableCreated { table_id: u64 },
     ViewCreated { view_id: u64 },

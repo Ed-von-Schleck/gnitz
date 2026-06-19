@@ -171,7 +171,7 @@ fn test_projection_duplicate_output_name_rejected() {
         let mut p = SqlPlanner::new(&mut client, &sn);
         p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)").unwrap();
         // Two columns both named `name` → ambiguous downstream.
-        let err = must_err(p.execute("CREATE VIEW vbad AS SELECT name, name FROM t"));
+        let err = p.execute("CREATE VIEW vbad AS SELECT name, name FROM t").unwrap_err();
         assert!(
             matches!(err, GnitzSqlError::Plan(_)),
             "duplicate output name must be a Plan error, got {err:?}"

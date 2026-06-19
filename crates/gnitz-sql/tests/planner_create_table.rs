@@ -61,7 +61,7 @@ fn test_no_primary_key_errors() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE TABLE no_pk (id INT)"));
+    let err = p.execute("CREATE TABLE no_pk (id INT)").unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("PRIMARY KEY"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -76,7 +76,7 @@ fn test_empty_column_list_errors() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE TABLE empty_cols ()"));
+    let err = p.execute("CREATE TABLE empty_cols ()").unwrap_err();
     // Either a parse error from sqlparser, or a Plan error from the missing-PK
     // guard — both are acceptable; what matters is "no panic".
     match err {
@@ -163,9 +163,9 @@ fn test_compound_pk_mixed_inline_and_table_level_rejected() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(
-        p.execute("CREATE TABLE mixed_pk (a BIGINT UNSIGNED PRIMARY KEY, b BIGINT UNSIGNED, PRIMARY KEY (a, b))"),
-    );
+    let err = p
+        .execute("CREATE TABLE mixed_pk (a BIGINT UNSIGNED PRIMARY KEY, b BIGINT UNSIGNED, PRIMARY KEY (a, b))")
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("Multiple PRIMARY KEY"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -180,7 +180,9 @@ fn test_compound_pk_duplicate_column_rejected() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE TABLE dup_pk (a BIGINT UNSIGNED, b BIGINT UNSIGNED, PRIMARY KEY (a, a))"));
+    let err = p
+        .execute("CREATE TABLE dup_pk (a BIGINT UNSIGNED, b BIGINT UNSIGNED, PRIMARY KEY (a, a))")
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("Duplicate"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -195,10 +197,12 @@ fn test_compound_pk_five_columns_rejected() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute(
-        "CREATE TABLE pk5 (a TINYINT UNSIGNED, b TINYINT UNSIGNED, c TINYINT UNSIGNED, \
+    let err = p
+        .execute(
+            "CREATE TABLE pk5 (a TINYINT UNSIGNED, b TINYINT UNSIGNED, c TINYINT UNSIGNED, \
          d TINYINT UNSIGNED, e TINYINT UNSIGNED, PRIMARY KEY (a, b, c, d, e))",
-    ));
+        )
+        .unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.contains("at most 4"), "got: {}", s),
         e => panic!("expected Unsupported, got {:?}", e),
@@ -279,7 +283,9 @@ fn test_compound_pk_string_column_rejected() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE TABLE pk_str (a TEXT, b INT UNSIGNED, PRIMARY KEY (a, b))"));
+    let err = p
+        .execute("CREATE TABLE pk_str (a TEXT, b INT UNSIGNED, PRIMARY KEY (a, b))")
+        .unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => {
             assert!(s.contains("String"), "expected String/Blob hint, got: {}", s);
@@ -300,7 +306,7 @@ fn test_pk_float_column_rejected() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE TABLE pk_f32 (id REAL PRIMARY KEY)"));
+    let err = p.execute("CREATE TABLE pk_f32 (id REAL PRIMARY KEY)").unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => {
             assert!(s.contains("float"), "expected float hint, got: {}", s);
@@ -312,7 +318,7 @@ fn test_pk_float_column_rejected() {
         }
         e => panic!("expected Unsupported, got {:?}", e),
     }
-    let err = must_err(p.execute("CREATE TABLE pk_f64 (id DOUBLE PRIMARY KEY)"));
+    let err = p.execute("CREATE TABLE pk_f64 (id DOUBLE PRIMARY KEY)").unwrap_err();
     assert!(
         matches!(err, GnitzSqlError::Unsupported(_)),
         "expected Unsupported for DOUBLE PK, got {:?}",
@@ -330,7 +336,9 @@ fn test_table_level_pk_typo_bind_error() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     // Table-level PK with unknown column must surface as a bind error,
     // even when an inline PRIMARY KEY exists on a real column.
-    let err = must_err(p.execute("CREATE TABLE pk_typo (id BIGINT PRIMARY KEY, PRIMARY KEY (typo))"));
+    let err = p
+        .execute("CREATE TABLE pk_typo (id BIGINT PRIMARY KEY, PRIMARY KEY (typo))")
+        .unwrap_err();
     match err {
         GnitzSqlError::Bind(s) => assert!(s.contains("typo"), "got: {}", s),
         e => panic!("expected Bind, got {:?}", e),
@@ -345,7 +353,9 @@ fn test_two_inline_primary_keys_errors() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE TABLE two_pk (id BIGINT PRIMARY KEY, name TEXT PRIMARY KEY)"));
+    let err = p
+        .execute("CREATE TABLE two_pk (id BIGINT PRIMARY KEY, name TEXT PRIMARY KEY)")
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("Multiple PRIMARY KEY"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -626,7 +636,9 @@ fn test_view_over_compound_pk_too_wide_rejected() {
     }
     let mut p = SqlPlanner::new(&mut client, &sn);
     // SELECT * (64) + the two PK columns re-emitted under new names = 66 > 65.
-    let err = must_err(p.execute("CREATE VIEW wv AS SELECT *, a AS da, b AS db FROM wide"));
+    let err = p
+        .execute("CREATE VIEW wv AS SELECT *, a AS da, b AS db FROM wide")
+        .unwrap_err();
     match err {
         GnitzSqlError::Exec(e) => {
             let s = format!("{:?}", e);
@@ -679,9 +691,9 @@ fn test_fk_references_compound_pk_rejected() {
     let (mut client, sn) = make_planner(&srv);
     create_compound_pk_table(&mut client, &sn, "fk_parent");
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(
-        p.execute("CREATE TABLE fk_child (cid BIGINT PRIMARY KEY, ref_a BIGINT UNSIGNED REFERENCES fk_parent(a))"),
-    );
+    let err = p
+        .execute("CREATE TABLE fk_child (cid BIGINT PRIMARY KEY, ref_a BIGINT UNSIGNED REFERENCES fk_parent(a))")
+        .unwrap_err();
     // A compound-PK parent has no lone PK column, so a member column qualifies
     // as an FK target only via its own UNIQUE index; column 'a' has none.
     match err {
@@ -701,7 +713,9 @@ fn test_on_conflict_target_column_rejected_on_compound_pk() {
     let (mut client, sn) = make_planner(&srv);
     create_compound_pk_table(&mut client, &sn, "conf_t");
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("INSERT INTO conf_t (a, b, payload) VALUES (1, 2, 3) ON CONFLICT (a) DO NOTHING"));
+    let err = p
+        .execute("INSERT INTO conf_t (a, b, payload) VALUES (1, 2, 3) ON CONFLICT (a) DO NOTHING")
+        .unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.contains("compound"), "got: {}", s),
         e => panic!("expected Unsupported, got {:?}", e),
@@ -821,7 +835,9 @@ fn test_duplicate_unique_constraint_rejected() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE TABLE ud (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE(a), UNIQUE(a))"));
+    let err = p
+        .execute("CREATE TABLE ud (id BIGINT PRIMARY KEY, a BIGINT, UNIQUE(a), UNIQUE(a))")
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("duplicate UNIQUE"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -836,7 +852,9 @@ fn test_unique_text_column_rejected_no_orphan() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE TABLE ux (id BIGINT PRIMARY KEY, name TEXT UNIQUE)"));
+    let err = p
+        .execute("CREATE TABLE ux (id BIGINT PRIMARY KEY, name TEXT UNIQUE)")
+        .unwrap_err();
     match err {
         GnitzSqlError::Unsupported(s) => assert!(s.contains("'name'"), "got: {}", s),
         e => panic!("expected Unsupported, got {:?}", e),
@@ -932,8 +950,9 @@ fn test_reserved_fk_infix_constraint_name_rejected() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err =
-        must_err(p.execute("CREATE TABLE ur (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT my__fk_thing UNIQUE(a))"));
+    let err = p
+        .execute("CREATE TABLE ur (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT my__fk_thing UNIQUE(a))")
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("reserved '__fk_' infix"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -948,7 +967,9 @@ fn test_invalid_identifier_constraint_name_rejected() {
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE TABLE ui (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT _my_idx UNIQUE(a))"));
+    let err = p
+        .execute("CREATE TABLE ui (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT _my_idx UNIQUE(a))")
+        .unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("cannot start with '_'"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -993,7 +1014,7 @@ fn test_create_index_named_droppable_by_name() {
     {
         // The auto-generated name does not exist; only the user name resolves.
         let mut p = SqlPlanner::new(&mut client, &sn);
-        let err = must_err(p.execute(&format!("DROP INDEX {sn}__ni__idx_col")));
+        let err = p.execute(&format!("DROP INDEX {sn}__ni__idx_col")).unwrap_err();
         assert!(
             matches!(err, GnitzSqlError::Exec(_)),
             "auto-name must not resolve, got {:?}",
@@ -1032,7 +1053,7 @@ fn test_create_index_reserved_infix_rejected() {
             .unwrap();
     }
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE INDEX my__fk_thing ON ri(col)"));
+    let err = p.execute("CREATE INDEX my__fk_thing ON ri(col)").unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("reserved '__fk_' infix"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
@@ -1052,7 +1073,7 @@ fn test_create_index_invalid_identifier_rejected() {
             .unwrap();
     }
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = must_err(p.execute("CREATE INDEX _bad ON ii(col)"));
+    let err = p.execute("CREATE INDEX _bad ON ii(col)").unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("cannot start with '_'"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),

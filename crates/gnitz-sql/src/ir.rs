@@ -1,7 +1,7 @@
 use gnitz_core::{Schema, TypeCode};
 
 #[derive(Clone, Debug, Copy, PartialEq)]
-pub enum AggFunc {
+pub(crate) enum AggFunc {
     Count,
     CountNonNull,
     Sum,
@@ -11,7 +11,7 @@ pub enum AggFunc {
 }
 
 #[derive(Clone, Debug)]
-pub enum BoundExpr {
+pub(crate) enum BoundExpr {
     ColRef(usize),
     LitInt(i64),
     LitFloat(f64),
@@ -24,7 +24,7 @@ pub enum BoundExpr {
 }
 
 impl BoundExpr {
-    pub fn infer_type(&self, schema: &Schema) -> TypeCode {
+    pub(crate) fn infer_type(&self, schema: &Schema) -> TypeCode {
         match self {
             BoundExpr::ColRef(idx) => schema.columns[*idx].type_code,
             BoundExpr::LitInt(_) => TypeCode::I64,
@@ -65,7 +65,7 @@ impl BoundExpr {
 }
 
 #[derive(Clone, Debug, Copy)]
-pub enum BinOp {
+pub(crate) enum BinOp {
     Add,
     Sub,
     Mul,
@@ -82,7 +82,7 @@ pub enum BinOp {
 }
 
 #[derive(Clone, Debug, Copy)]
-pub enum UnaryOp {
+pub(crate) enum UnaryOp {
     Neg,
     Not,
 }

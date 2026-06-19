@@ -2,7 +2,7 @@ use crate::error::GnitzSqlError;
 use gnitz_core::TypeCode;
 use sqlparser::ast::{DataType, ExactNumberInfo};
 
-pub fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlError> {
+pub(crate) fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlError> {
     match dt {
         DataType::BigInt(_) => Ok(TypeCode::I64),
         DataType::Int(_) | DataType::Integer(_) => Ok(TypeCode::I32),

@@ -1,11 +1,12 @@
+use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::binder::{
     bind_structural, find_unique_column, fold_null_test, resolve_qualified_column, resolve_unqualified_column, Binder,
     LeafBinder,
 };
 use crate::dml;
-use crate::error::{extract_name, extract_table_factor_name, GnitzSqlError};
+use crate::error::GnitzSqlError;
 use crate::expr::compile_bound_expr;
-use crate::logical_plan::{AggFunc, BinOp, BoundExpr};
+use crate::ir::{AggFunc, BinOp, BoundExpr};
 use crate::types::sql_type_to_typecode;
 use crate::SqlResult;
 use gnitz_core::{
@@ -21,7 +22,7 @@ use sqlparser::ast::{
 use std::collections::HashMap;
 use std::rc::Rc;
 
-pub fn execute_statement(
+pub(crate) fn execute_statement(
     client: &mut GnitzClient,
     schema_name: &str,
     stmt: &Statement,
@@ -1176,25 +1177,10 @@ fn execute_create_join_view(
     let join = &select.from[0].joins[0];
 
     // Extract right table
-    let (right_name, right_alias) = match &join.relation {
-        TableFactor::Table { name, alias, .. } => {
-            let n = name
-                .0
-                .last()
-                .and_then(|p| p.as_ident())
-                .map(|i| i.value.clone())
-                .ok_or_else(|| GnitzSqlError::Bind("empty right table name".to_string()))?;
-            let a = alias
-                .as_ref()
-                .map(|al| al.name.value.clone())
-                .unwrap_or_else(|| n.clone());
-            (n, a)
-        }
-        _ => {
-            return Err(GnitzSqlError::Unsupported(
-                "CREATE VIEW JOIN: only simple table reference".to_string(),
-            ))
-        }
+    let right_name = extract_table_factor_name(&join.relation, "CREATE VIEW JOIN")?;
+    let right_alias = match &join.relation {
+        TableFactor::Table { alias: Some(a), .. } => a.name.value.clone(),
+        _ => right_name.clone(),
     };
 
     // Determine join type

@@ -1,6 +1,7 @@
+use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::binder::{find_unique_column, Binder};
-use crate::error::{extract_name, extract_table_factor_name, GnitzSqlError};
-use crate::logical_plan::BoundExpr;
+use crate::error::GnitzSqlError;
+use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::GnitzClient;
 use gnitz_core::{
@@ -84,7 +85,7 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
     }
 }
 
-pub fn execute_insert(
+pub(crate) fn execute_insert(
     client: &mut GnitzClient,
     _schema_name: &str,
     stmt: &Statement,
@@ -721,7 +722,7 @@ fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Expr) -> Resu
 // SELECT
 // ---------------------------------------------------------------------------
 
-pub fn execute_select(
+pub(crate) fn execute_select(
     client: &mut GnitzClient,
     _schema_name: &str,
     query: &Query,
@@ -1476,7 +1477,7 @@ fn eval_pred_row(pred: &BoundExpr, batch: &ZSetBatch, i: usize, schema: &Schema)
 /// through all arithmetic and comparison operators. Callers that need a boolean
 /// predicate should treat `None` as `false` (UNKNOWN → row excluded).
 fn eval_expr(expr: &BoundExpr, batch: &ZSetBatch, i: usize, schema: &Schema) -> Result<Option<i64>, GnitzSqlError> {
-    use crate::logical_plan::BinOp;
+    use crate::ir::BinOp;
     match expr {
         BoundExpr::ColRef(c) => {
             let col_def = &schema.columns[*c];
@@ -1614,7 +1615,7 @@ fn eval_expr(expr: &BoundExpr, batch: &ZSetBatch, i: usize, schema: &Schema) -> 
                 None => return Ok(None),
                 Some(v) => v,
             };
-            use crate::logical_plan::UnaryOp;
+            use crate::ir::UnaryOp;
             Ok(Some(match op {
                 UnaryOp::Neg => v.wrapping_neg(),
                 UnaryOp::Not => (v == 0) as i64,
@@ -2056,7 +2057,7 @@ fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
 // UPDATE
 // ---------------------------------------------------------------------------
 
-pub fn execute_update(
+pub(crate) fn execute_update(
     client: &mut GnitzClient,
     _schema_name: &str,
     stmt: &Statement,
@@ -2182,7 +2183,7 @@ pub fn execute_update(
 // DELETE
 // ---------------------------------------------------------------------------
 
-pub fn execute_delete(
+pub(crate) fn execute_delete(
     client: &mut GnitzClient,
     _schema_name: &str,
     stmt: &Statement,
@@ -2333,7 +2334,7 @@ pub fn execute_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logical_plan::{BinOp, BoundExpr};
+    use crate::ir::{BinOp, BoundExpr};
     use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 
     fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
