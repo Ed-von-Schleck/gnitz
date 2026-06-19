@@ -565,18 +565,28 @@ anything the optimizer could elide.
 
 ## Debugging failures
 
-1. **Log first, never guess.** Rebuilds are expensive. One well-instrumented
+1. **Confirm the suspected path actually runs before debugging why it
+   misbehaves.** A plausible plan or prior model can frame the whole hunt around
+   code that never executes; when hypotheses keep diverging or contradicting a
+   confirmed symptom, suspect the framing, not the bug's subtlety.
+2. **A passing check only rules out the failure it was built to detect.** When
+   concluding "correct" / "no bug," verify the property the domain *defines* as
+   correctness — in a Z-set engine that is weights, not row presence — and ask what
+   a *different kind* of failure would look like; a clean result on the wrong
+   observable closes the case silently. A flagged-but-unverified "probably fine" is
+   unverified — run the cheap disconfirming test instead of narrating the doubt.
+3. **Log first, never guess.** Rebuilds are expensive. One well-instrumented
    run reveals more than ten speculative attempts.
    - `gnitz_debug!` / `gnitz_info!` for structured logging
    - `GNITZ_LOG_LEVEL=debug` to enable debug-level messages
    - `RUST_BACKTRACE=1` for panic backtraces
-2. **Use the debug binary for crashes.** Release builds silently clamp
+4. **Use the debug binary for crashes.** Release builds silently clamp
    corrupt values.
-3. **Isolate with 1 worker first.** Pass with W=1 but fail with W=4 →
+5. **Isolate with 1 worker first.** Pass with W=1 but fail with W=4 →
    bug is in exchange/fanout, not computation.
-4. **Bisect by sub-path.** Disable the new fast-path to confirm the bug
+6. **Bisect by sub-path.** Disable the new fast-path to confirm the bug
    is in the new code.
-5. **Verify your fix is in the binary.** `make e2e` rebuilds both the
+7. **Verify your fix is in the binary.** `make e2e` rebuilds both the
    server and the Python extension before running tests.
 
 ## See also
