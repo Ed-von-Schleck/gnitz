@@ -4,23 +4,16 @@
 
 Each item below is an independent, unimplemented future change.
 
-- **Range / non-equi join — remaining extensions.** INNER and LEFT OUTER range /
-  band joins exist: a `DeltaTraceRange` operator with a symmetric source-PK re-key
-  + output exchange; band joins (`n_eq ≥ 1`) scatter the input delta by the
-  equality prefix, pure range joins (`n_eq == 0`) broadcast it. Open extensions:
-  - **Pure-range distribution beyond broadcast** (`n_eq == 0`): a range-aware
-    (order-preserving) exchange that range-partitions both sides so a probe
-    touches only boundary-overlapping workers, and/or a write-once broadcast SAL
-    group read by all workers instead of `num_workers` cloned batches. The general
-    fix for broadcast cost at large `W`; needs partition-boundary metadata +
-    rebalancing.
-  - **Multiple range conjuncts / residual ON predicates**: a post-join `Filter`
-    over the normalized output (the operator exists; the 3VL bookkeeping and
-    planning surface do not).
-- **Python / C binding surface for compound-PK *result* rows** — views whose
-  *output* PK is itself compound. (A join view's source PK rides as payload, so
-  join/GROUP-BY result rows are unaffected; this is only about views that persist a
-  multi-column output PK.)
+- **Python `create_table` compound-PK surface.** Compound *output* PK result rows
+  already decode end to end — the row builder walks PK columns by OPK byte offset
+  (arity-general), `Client::delete` accepts a `PkColumn::Bytes` compound key, and
+  GROUP-BY / join views construct and persist multi-column output PKs (covered by
+  tests). The remaining gap is purely the convenience surface: the Python
+  `create_table` binding takes a single `pk_col_idx`, so a compound-PK *base table*
+  can only be made via SQL DDL (`CREATE TABLE … PRIMARY KEY (a, b)`). Widen the
+  binding to accept a PK column list (the shared client signature already takes a
+  slice). `ON CONFLICT`-with-target on compound-PK tables and the single-PK
+  `pk_index_single` system-table/FK canaries stay rejected by design.
 - **`map_reindex` elision for PK-aligned joins** — when the join key equals the
   source PK, the `ReindexPacker::promote_into` PK rewrite re-copies OPK bytes the
   `execute_map` bulk PK copy already wrote. The dominant costs (batch allocation,
