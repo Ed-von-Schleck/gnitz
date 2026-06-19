@@ -177,82 +177,20 @@ pub(crate) fn is_null_expr(expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `try_col_eq_literal` / `try_extract_pk_in` live in the WHERE planner
-    // (`dml`); the parity test below pins all three routing entry points to the
-    // same packed u128.
-    use crate::dml::{try_col_eq_literal, try_extract_pk_in};
-    use gnitz_core::ColumnDef;
-    use sqlparser::ast::{BinaryOperator, ValueWithSpan};
-    use sqlparser::tokenizer::Span;
+    use crate::test_support::{
+        col_def, compound_schema_u64_u64, dquote_expr, neg_num_expr, num_expr, pk_schema, uuid_schema_pk, uuid_str_expr,
+    };
+    use gnitz_core::ZSetBatch;
 
-    fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
-        ColumnDef {
-            name: name.into(),
-            type_code: tc,
-            is_nullable: nullable,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        }
-    }
-
-    fn pk_schema(pk_tc: TypeCode) -> Schema {
+    fn compound_schema_u64_u64_u128() -> Schema {
         Schema {
-            columns: vec![col_def("id", pk_tc, false), col_def("v", TypeCode::I64, false)],
-            pk_cols: vec![0],
-        }
-    }
-
-    fn uuid_schema_pk() -> Schema {
-        Schema {
-            columns: vec![col_def("id", TypeCode::UUID, false)],
-            pk_cols: vec![0],
-        }
-    }
-
-    fn num_expr(n: &str) -> Expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::Number(n.into(), false),
-            span: Span::empty(),
-        })
-    }
-
-    fn neg_num_expr(n: &str) -> Expr {
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus,
-            expr: Box::new(Expr::Value(ValueWithSpan {
-                value: Value::Number(n.into(), false),
-                span: Span::empty(),
-            })),
-        }
-    }
-
-    fn uuid_str_expr(s: &str) -> Expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(s.into()),
-            span: Span::empty(),
-        })
-    }
-
-    fn dquote_expr(s: &str) -> Expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::DoubleQuotedString(s.into()),
-            span: Span::empty(),
-        })
-    }
-
-    fn eq_expr(col: &str, rhs: Expr) -> Expr {
-        Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(sqlparser::ast::Ident::new(col))),
-            op: BinaryOperator::Eq,
-            right: Box::new(rhs),
-        }
-    }
-
-    fn in_list_expr(col: &str, items: Vec<Expr>) -> Expr {
-        Expr::InList {
-            expr: Box::new(Expr::Identifier(sqlparser::ast::Ident::new(col))),
-            list: items,
-            negated: false,
+            columns: vec![
+                col_def("a", TypeCode::U64, false),
+                col_def("b", TypeCode::U64, false),
+                col_def("c", TypeCode::U128, false),
+                col_def("v", TypeCode::I64, true),
+            ],
+            pk_cols: vec![0, 1, 2],
         }
     }
 
@@ -284,67 +222,43 @@ mod tests {
         assert_eq!(pk.to_u128().unwrap(), 0x550e8400_e29b_41d4_a716_446655440000_u128);
     }
 
-    /// All three parser entry points must agree byte-for-byte on the u128
-    /// produced by a given (PK type, literal) pair. Master routes SEEK via
-    /// `partition_for_key(pk)`; drift between any pair sends INSERT and
-    /// DELETE to different workers.
-    fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
-        let schema = pk_schema(pk_tc);
-
-        // 1. extract_pk_value (INSERT row).
-        let row = vec![literal.clone(), num_expr("0")];
-        let got_insert = extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
-        assert_eq!(got_insert.to_u128().unwrap(), expected, "extract_pk_value");
-
-        // 2. try_col_eq_literal (WHERE pk = literal).
-        let where_expr = eq_expr("id", literal.clone());
-        let got_eq = try_col_eq_literal(&where_expr, &schema).expect("try_col_eq_literal returned None");
-        assert_eq!(got_eq, (0, expected), "try_col_eq_literal");
-
-        // 3. try_extract_pk_in (WHERE pk IN (literal)).
-        let in_expr = in_list_expr("id", vec![literal]);
-        let got_in = try_extract_pk_in(&in_expr, &schema).expect("try_extract_pk_in returned None");
-        assert_eq!(got_in, vec![expected], "try_extract_pk_in");
+    #[test]
+    fn compound_pk_extract_pk_value_packs_le_bytes() {
+        let schema = compound_schema_u64_u64();
+        let row = vec![num_expr("1"), num_expr("2"), num_expr("99")];
+        let pk = extract_pk_value(&row, &schema).unwrap();
+        assert_eq!(pk.stride, 16);
+        let mut expect = [0u8; 16];
+        expect[0..8].copy_from_slice(&1u64.to_le_bytes());
+        expect[8..16].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(pk.as_bytes(), &expect[..]);
     }
 
     #[test]
-    fn pk_parity_i8_neg1() {
-        check_pk_parity(TypeCode::I8, neg_num_expr("1"), (-1i8 as u8) as u128);
+    fn compound_pk_extract_pk_value_wide_region() {
+        let schema = compound_schema_u64_u64_u128();
+        let row = vec![num_expr("1"), num_expr("2"), num_expr("3"), num_expr("99")];
+        let pk = extract_pk_value(&row, &schema).unwrap();
+        // pk_stride = 8 + 8 + 16 = 32 → wide-region path.
+        assert_eq!(pk.stride, 32);
+        let mut expect = [0u8; 32];
+        expect[0..8].copy_from_slice(&1u64.to_le_bytes());
+        expect[8..16].copy_from_slice(&2u64.to_le_bytes());
+        expect[16..32].copy_from_slice(&3u128.to_le_bytes());
+        assert_eq!(pk.as_bytes(), &expect[..]);
     }
 
     #[test]
-    fn pk_parity_i16_neg1() {
-        check_pk_parity(TypeCode::I16, neg_num_expr("1"), (-1i16 as u16) as u128);
-    }
-
-    #[test]
-    fn pk_parity_i32_neg1() {
-        check_pk_parity(TypeCode::I32, neg_num_expr("1"), (-1i32 as u32) as u128);
-    }
-
-    #[test]
-    fn pk_parity_i64_neg1() {
-        check_pk_parity(TypeCode::I64, neg_num_expr("1"), ((-1i64) as u64) as u128);
-    }
-
-    #[test]
-    fn pk_parity_i64_min() {
-        // Regression for the prepend-`-` parse rule: `(i64::MIN as u64) as u128`.
-        check_pk_parity(
-            TypeCode::I64,
-            neg_num_expr("9223372036854775808"),
-            (i64::MIN as u64) as u128,
-        );
-    }
-
-    #[test]
-    fn pk_parity_u16_max() {
-        check_pk_parity(TypeCode::U16, num_expr("65535"), 65535u128);
-    }
-
-    #[test]
-    fn pk_parity_u32_max() {
-        check_pk_parity(TypeCode::U32, num_expr("4294967295"), 4294967295u128);
+    fn compound_pk_zset_batch_new_uses_bytes_variant() {
+        let schema = compound_schema_u64_u64();
+        let batch = ZSetBatch::new(&schema);
+        match &batch.pks {
+            gnitz_core::PkColumn::Bytes { stride, buf } => {
+                assert_eq!(*stride, 16);
+                assert!(buf.is_empty());
+            }
+            other => panic!("expected PkColumn::Bytes, got {other:?}"),
+        }
     }
 
     #[test]
@@ -360,16 +274,6 @@ mod tests {
         let schema = pk_schema(TypeCode::U128);
         let row = vec![neg_num_expr("1"), num_expr("0")];
         assert!(extract_pk_value(&row, &schema).is_err());
-    }
-
-    #[test]
-    fn try_extract_pk_in_negative_i32_list() {
-        // Today's u64-only body returned None for negative items, falling
-        // through to the slow full-scan path. Native-PK fast path must hit.
-        let schema = pk_schema(TypeCode::I32);
-        let expr = in_list_expr("id", vec![neg_num_expr("1"), neg_num_expr("2")]);
-        let got = try_extract_pk_in(&expr, &schema).expect("should match fast path");
-        assert_eq!(got, vec![(-1i32 as u32) as u128, (-2i32 as u32) as u128]);
     }
 
     #[test]

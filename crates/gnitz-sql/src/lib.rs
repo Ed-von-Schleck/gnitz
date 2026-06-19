@@ -8,6 +8,8 @@ mod exec;
 mod ir;
 mod lower;
 mod plan;
+#[cfg(test)]
+mod test_support;
 mod types;
 
 pub use error::GnitzSqlError;

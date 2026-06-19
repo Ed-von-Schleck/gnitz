@@ -160,6 +160,7 @@ pub(crate) fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{num_expr, uuid_schema_payload, uuid_str_expr};
 
     #[test]
     fn test_null_append_insert_update_identical_all_variants() {
@@ -260,5 +261,41 @@ mod tests {
         assert!(encoded(TypeCode::I8, &num("128")).is_err());
         assert!(encoded(TypeCode::U8, &neg("1")).is_err());
         assert!(encoded(TypeCode::I32, &num("3000000000")).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // append_value_to_col — UUID column accepts both a single-quoted UUID
+    // string and a decimal u128 literal.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_uuid_non_pk_string_literal_accepted() {
+        let schema = uuid_schema_payload();
+        let mut batch = gnitz_core::ZSetBatch::new(&schema);
+        // col 1 is UUID
+        append_value_to_col(
+            &mut batch.columns[1],
+            TypeCode::UUID,
+            &uuid_str_expr("550e8400-e29b-41d4-a716-446655440000"),
+        )
+        .unwrap();
+        if let ColData::U128s(v) = &batch.columns[1] {
+            assert_eq!(v[0], 0x550e8400_e29b_41d4_a716_446655440000_u128);
+        } else {
+            panic!("expected U128s");
+        }
+    }
+
+    #[test]
+    fn test_uuid_decimal_literal_still_accepted() {
+        let schema = uuid_schema_payload();
+        let mut batch = gnitz_core::ZSetBatch::new(&schema);
+        let big_val: u128 = 0x550e8400_e29b_41d4_a716_446655440000_u128;
+        append_value_to_col(&mut batch.columns[1], TypeCode::UUID, &num_expr(&big_val.to_string())).unwrap();
+        if let ColData::U128s(v) = &batch.columns[1] {
+            assert_eq!(v[0], big_val);
+        } else {
+            panic!("expected U128s");
+        }
     }
 }

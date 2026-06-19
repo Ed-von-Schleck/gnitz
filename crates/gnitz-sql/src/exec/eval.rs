@@ -230,38 +230,8 @@ pub(crate) fn eval_pred_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
-
-    fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
-        ColumnDef {
-            name: name.into(),
-            type_code: tc,
-            is_nullable: nullable,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        }
-    }
-
-    /// Two-column schema: pk (U64, pk_index=0) + val (nullable).
-    fn two_col(val_tc: TypeCode) -> Schema {
-        Schema {
-            columns: vec![col_def("pk", TypeCode::U64, false), col_def("val", val_tc, true)],
-            pk_cols: vec![0],
-        }
-    }
-
-    /// Single-row batch for a two-column schema (pk + one payload column).
-    fn batch_2col(val_bytes: Vec<u8>, val_tc: TypeCode, null_bits: u64) -> ZSetBatch {
-        let schema = two_col(val_tc);
-        let mut b = ZSetBatch::new(&schema);
-        b.pks.push_u128(1u128);
-        b.weights.push(1);
-        b.nulls.push(null_bits);
-        if let ColData::Fixed(ref mut buf) = b.columns[1] {
-            buf.extend(val_bytes);
-        }
-        b
-    }
+    use crate::test_support::{batch_2col, col_def, compound_schema_u64_u64, pk_schema, two_col, uuid_schema_payload};
+    use gnitz_core::{ColData, Schema, TypeCode, ZSetBatch};
 
     // ------------------------------------------------------------------
     // Bug #4 — unsigned integers must not be sign-extended
@@ -366,5 +336,144 @@ mod tests {
             Box::new(BoundExpr::LitInt(-1)),
         );
         assert!(eval_expr(&expr, &batch, 0, &schema).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // eval_expr — reading PK / payload columns of various widths
+    // ------------------------------------------------------------------
+
+    fn float_col_schema(tc: TypeCode) -> Schema {
+        Schema {
+            columns: vec![col_def("pk", TypeCode::U64, false), col_def("v", tc, false)],
+            pk_cols: vec![0],
+        }
+    }
+
+    #[test]
+    fn test_uuid_residual_filter_error_names_uuid() {
+        let schema = uuid_schema_payload();
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::U128s(v) = &mut batch.columns[1] {
+            v.push(0);
+        }
+        let pred = BoundExpr::ColRef(1);
+        let err = eval_expr(&pred, &batch, 0, &schema).unwrap_err();
+        assert!(err.to_string().contains("UUID"), "error should mention UUID: {err}");
+    }
+
+    #[test]
+    fn eval_expr_pk_i64_negative() {
+        let schema = pk_schema(TypeCode::I64);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(((-1i64) as u64) as u128);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&0i64.to_le_bytes());
+        }
+        let got = eval_expr(&BoundExpr::ColRef(0), &batch, 0, &schema).unwrap();
+        assert_eq!(got, Some(-1i64));
+    }
+
+    #[test]
+    fn eval_expr_pk_u32_max() {
+        // U32 PK = u32::MAX; zero-extended into u128 by extract_pk_value.
+        let schema = pk_schema(TypeCode::U32);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(u32::MAX as u128);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&0i64.to_le_bytes());
+        }
+        let got = eval_expr(&BoundExpr::ColRef(0), &batch, 0, &schema).unwrap();
+        assert_eq!(got, Some(u32::MAX as i64));
+    }
+
+    #[test]
+    fn eval_expr_pk_u128_unsupported() {
+        // U128 PK doesn't fit through eval_expr's i64 projection; must error,
+        // not panic.
+        let schema = pk_schema(TypeCode::U128);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(u128::MAX);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&0i64.to_le_bytes());
+        }
+        let err = eval_expr(&BoundExpr::ColRef(0), &batch, 0, &schema).expect_err("U128 PK must return Unsupported");
+        assert!(err.to_string().contains("residual filter on PK"), "error: {err}");
+    }
+
+    #[test]
+    fn compound_pk_eval_expr_pk_colref_reads_byte_region() {
+        let schema = compound_schema_u64_u64();
+        // Build a one-row Bytes batch: pk = (a=7, b=9), v = 42.
+        let mut batch = ZSetBatch::new(&schema);
+        let mut pk_bytes = [0u8; 16];
+        pk_bytes[..8].copy_from_slice(&7u64.to_le_bytes());
+        pk_bytes[8..16].copy_from_slice(&9u64.to_le_bytes());
+        batch.pks.push_bytes(&pk_bytes);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[2] {
+            buf.extend_from_slice(&42i64.to_le_bytes());
+        }
+        // Read column 0 (a) and column 1 (b) through eval_expr.
+        let a = eval_expr(&BoundExpr::ColRef(0), &batch, 0, &schema).unwrap();
+        assert_eq!(a, Some(7));
+        let b = eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap();
+        assert_eq!(b, Some(9));
+        // Payload column still works.
+        let v = eval_expr(&BoundExpr::ColRef(2), &batch, 0, &schema).unwrap();
+        assert_eq!(v, Some(42));
+    }
+
+    #[test]
+    fn eval_expr_f32_payload_returns_unsupported() {
+        let schema = float_col_schema(TypeCode::F32);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&1.0f32.to_le_bytes());
+        }
+        let err = eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn eval_expr_f64_payload_returns_unsupported() {
+        let schema = float_col_schema(TypeCode::F64);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&1.0f64.to_le_bytes());
+        }
+        let err = eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn eval_expr_u64_high_bit_decodes_correctly() {
+        // U64 with the high bit set: the new path must produce the same bitcast
+        // as the old path. In i64, this is -1.
+        let schema = float_col_schema(TypeCode::U64);
+        let mut batch = ZSetBatch::new(&schema);
+        batch.pks.push_u128(1);
+        batch.weights.push(1);
+        batch.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut batch.columns[1] {
+            buf.extend_from_slice(&u64::MAX.to_le_bytes());
+        }
+        let got = eval_expr(&BoundExpr::ColRef(1), &batch, 0, &schema).unwrap();
+        assert_eq!(got, Some(-1i64), "U64::MAX must bitcast to -1i64 via new path");
     }
 }
