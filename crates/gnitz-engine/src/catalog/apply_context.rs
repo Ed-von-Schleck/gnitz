@@ -29,9 +29,11 @@ pub(crate) struct ApplyContext {
     /// the uniqueness flag is still flipped, outside the gate). SAL
     /// system-table recovery runs after `go_live()`, so both ops can fire
     /// there, kept idempotent by the `index_by_name` skip and the per-family
-    /// LSN watermark, not the phase. Distinct from rebuild-at-boot
-    /// (backfill_index / backfill_view), which *must* run during replay and
-    /// is gated on rollback, not on this.
+    /// LSN watermark, not the phase. `backfill_index` is likewise rebuild-at-boot
+    /// — it *must* run during replay and is gated on rollback, not on this.
+    /// `backfill_view`, by contrast, no longer runs during boot replay at all:
+    /// its non-exchange rebuild is split between the post-recovery worker pass and
+    /// the master's exchange cascade, so its inline hook is now gated live-only.
     live: bool,
     /// True while `compensate_stage_a` replays compensating deltas: `submit`
     /// is redirected to the no-broadcast path and backfill/cascade re-issue

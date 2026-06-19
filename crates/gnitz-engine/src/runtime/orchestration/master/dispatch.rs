@@ -734,21 +734,14 @@ impl MasterDispatcher {
     // Fan-out operations
     // -----------------------------------------------------------------------
 
-    pub fn fan_out_backfill(&mut self, view_id: i64, source_id: i64) -> Result<(), String> {
+    /// Re-derive the whole dependent closure of one base table. The broadcast
+    /// targets `source_id`; the worker drives `source_id`'s closure off that
+    /// alone, so the frame's `seek_pk` is unused here and left zero.
+    pub fn fan_out_backfill(&mut self, source_id: i64) -> Result<(), String> {
         self.maybe_checkpoint()?;
         let (schema, col_names) = self.get_schema_and_names(source_id);
         let lsn = self.next_lsn();
-        self.send_broadcast(
-            source_id,
-            lsn,
-            FLAG_BACKFILL,
-            None,
-            &schema,
-            &col_names,
-            view_id as u128,
-            0,
-            0,
-        )?;
+        self.send_broadcast(source_id, lsn, FLAG_BACKFILL, None, &schema, &col_names, 0, 0, 0)?;
         self.collect_acks_and_relay(source_id)
     }
 

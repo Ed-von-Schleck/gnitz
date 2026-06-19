@@ -236,20 +236,13 @@ def test_view_survives_restart():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Non-exchange views are inline-backfilled from durable shards at "
-    "catalog open, before recover_from_sal replays committed-but-unflushed base "
-    "rows; that replay bypasses view derivation and is never re-run for "
-    "non-exchange views, so the view permanently drops every base row written "
-    "since the last checkpoint after a crash.",
-)
 def test_nonexchange_view_retains_unflushed_data_after_restart():
     """A non-exchange (projection) view must reflect ACKed-but-unflushed base
     rows after a crash restart. The INSERT is fdatasync'd to the SAL but never
     checkpointed to a shard, so recovery replays it from the SAL — and the view
     must be rebuilt to include it, exactly as an exchange view (JOIN/GROUP BY)
-    would be."""
+    would be. The worker post-recovery pass rebuilds this cascade-unreachable
+    non-exchange view from the recovered base store."""
     tmpdir = tempfile.mkdtemp(
         dir=os.path.expanduser("~/git/gnitz/tmp"),
         prefix="gnitz_persist_nxv_",
@@ -259,7 +252,7 @@ def test_nonexchange_view_retains_unflushed_data_after_restart():
 
     try:
         # --- Phase 1: create non-exchange view, insert (no explicit flush) ---
-        proc = _start_server(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
 
         conn.create_schema("nxv")
@@ -283,7 +276,7 @@ def test_nonexchange_view_retains_unflushed_data_after_restart():
             os.unlink(sock_path)
 
         # --- Phase 2: restart; the unflushed row must survive in the view ---
-        proc = _start_server(data_dir, sock_path)
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
 
         vid2, _ = conn.resolve_table("nxv", "v")
@@ -293,6 +286,214 @@ def test_nonexchange_view_retains_unflushed_data_after_restart():
             f"post-restart: expected plus1=71, got {rows[7]['plus1']}"
         )
 
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _weights_by(rows, key):
+    """Sum scan-row weights per `key` value (robust to consolidation form)."""
+    out = {}
+    for r in rows:
+        out[r[key]] = out.get(r[key], 0) + r.weight
+    return out
+
+
+# Flushes the base table to shards before the crash: a small SAL checkpoint
+# threshold makes the bulk INSERT's committer cycle run a checkpoint.
+_FLUSH_ENV = {"GNITZ_CHECKPOINT_BYTES": "1024"}
+
+
+def test_nonexchange_view_flushed_data_after_restart():
+    """Flushed-data control for the non-exchange-view rebuild: with the base
+    already on shards, the projection view must come back with every row exactly
+    once (weight 1) — guarding that removing the inline open-time backfill did
+    not regress the already-checkpointed path."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_persist_nxvf_",
+    )
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS,
+                             extra_env=_FLUSH_ENV)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("nxvf")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name="nxvf",
+        )
+        conn.execute_sql(
+            "CREATE VIEW v AS SELECT pk, val + 1 AS plus1 FROM t",
+            schema_name="nxvf",
+        )
+        vals = ", ".join(f"({pk}, {pk * 10})" for pk in range(200))
+        conn.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name="nxvf")
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS,
+                                  extra_env=_FLUSH_ENV)
+        conn = gnitz.connect(sock_path)
+        vid, _ = conn.resolve_table("nxvf", "v")
+        w = _weights_by(conn.scan(vid), "pk")
+        assert len(w) == 200, f"expected 200 view rows, got {len(w)}"
+        assert all(x == 1 for x in w.values()), \
+            f"flushed rows double-counted: weights {sorted(set(w.values()))}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_nested_nonexchange_views_after_restart():
+    """Two stacked non-exchange views over one base, no exchange view anywhere —
+    both are cascade-unreachable and rebuilt by the worker post-recovery pass.
+    The depth sort must fill the inner view first so the outer view's backfill
+    reads a populated source. Unflushed data, so the rows live only in the SAL at
+    crash time."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_persist_nest_",
+    )
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("nest")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name="nest",
+        )
+        conn.execute_sql(
+            "CREATE VIEW v1 AS SELECT pk, val + 1 AS a FROM t",
+            schema_name="nest",
+        )
+        conn.execute_sql(
+            "CREATE VIEW v2 AS SELECT pk, a + 1 AS b FROM v1",
+            schema_name="nest",
+        )
+        conn.execute_sql("INSERT INTO t VALUES (3, 30), (4, 40)", schema_name="nest")
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        v1, _ = conn.resolve_table("nest", "v1")
+        v2, _ = conn.resolve_table("nest", "v2")
+        r1 = {r["pk"]: r for r in conn.scan(v1) if r.weight > 0}
+        r2 = {r["pk"]: r for r in conn.scan(v2) if r.weight > 0}
+        assert _weights_by(conn.scan(v1), "pk") == {3: 1, 4: 1}, "v1 not single-counted"
+        assert _weights_by(conn.scan(v2), "pk") == {3: 1, 4: 1}, "v2 not single-counted"
+        assert r1[3]["a"] == 31 and r1[4]["a"] == 41, f"v1 wrong: {r1}"
+        assert r2[3]["b"] == 32 and r2[4]["b"] == 42, f"v2 wrong: {r2}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_nonexchange_sibling_of_exchange_view_single_counted():
+    """Defect-2 regression: a non-exchange view (`vn`) sharing a base with an
+    exchange view (`vx`) must be filled exactly once. The exchange cascade drives
+    the shared base and re-derives `vn`, so the worker pass must skip it — before
+    the fix the flushed rows carried weight 2 (inline open-time backfill plus the
+    cascade). Flushed data, asserted at weight 1."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_persist_sib_",
+    )
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS,
+                             extra_env=_FLUSH_ENV)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("sib")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "g BIGINT NOT NULL, val BIGINT NOT NULL)",
+            schema_name="sib",
+        )
+        conn.execute_sql(
+            "CREATE VIEW vn AS SELECT pk, val + 1 AS plus1 FROM t",
+            schema_name="sib",
+        )
+        conn.execute_sql(
+            "CREATE VIEW vx AS SELECT g, SUM(val) AS s FROM t GROUP BY g",
+            schema_name="sib",
+        )
+        rows = [(pk, pk % 4, pk) for pk in range(200)]
+        vals = ", ".join(f"({pk}, {g}, {val})" for pk, g, val in rows)
+        conn.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name="sib")
+
+        exp_vx = {}
+        for pk, g, val in rows:
+            exp_vx[g] = exp_vx.get(g, 0) + val
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS,
+                                  extra_env=_FLUSH_ENV)
+        conn = gnitz.connect(sock_path)
+        vn, _ = conn.resolve_table("sib", "vn")
+        vx, _ = conn.resolve_table("sib", "vx")
+
+        w = _weights_by(conn.scan(vn), "pk")
+        assert len(w) == 200, f"vn missing rows: {len(w)}/200"
+        assert all(x == 1 for x in w.values()), \
+            f"vn double-counted: weights {sorted(set(w.values()))}"
+
+        got_vx = {r["g"]: r["s"] for r in conn.scan(vx) if r.weight > 0}
+        assert got_vx == exp_vx, f"vx wrong: got {got_vx}, want {exp_vx}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_nonexchange_view_over_exchange_view_after_restart():
+    """A non-exchange view layered over an exchange view (`vn` over `vx`) is
+    cascade-reachable (the cascade traverses base → vx → vn), so the worker pass
+    must skip it and the master cascade fills it exactly once. Unflushed data:
+    the rows must reach `vn` through the rebuilt `vx`."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_persist_nxoe_",
+    )
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("nxoe")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "g BIGINT NOT NULL, val BIGINT NOT NULL)",
+            schema_name="nxoe",
+        )
+        conn.execute_sql(
+            "CREATE VIEW vx AS SELECT g, SUM(val) AS s FROM t GROUP BY g",
+            schema_name="nxoe",
+        )
+        conn.execute_sql(
+            "CREATE VIEW vn AS SELECT g, s + 1 AS s1 FROM vx",
+            schema_name="nxoe",
+        )
+        rows = [(pk, pk % 3, pk + 1) for pk in range(30)]
+        vals = ", ".join(f"({pk}, {g}, {val})" for pk, g, val in rows)
+        conn.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name="nxoe")
+
+        exp = {}
+        for pk, g, val in rows:
+            exp[g] = exp.get(g, 0) + val
+        exp_vn = {g: s + 1 for g, s in exp.items()}
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vn, _ = conn.resolve_table("nxoe", "vn")
+        got = {r["g"]: r["s1"] for r in conn.scan(vn) if r.weight > 0}
+        assert got == exp_vn, f"vn wrong after restart: got {got}, want {exp_vn}"
+        # Each group is one row, exactly once.
+        assert _weights_by(conn.scan(vn), "g") == {g: 1 for g in exp_vn}, \
+            "vn group rows not single-counted"
         conn.close()
         _stop_server(proc)
     finally:

@@ -354,25 +354,39 @@ impl DagEngine {
         }
     }
 
+    /// Transitive dependent closure of `seeds` over the view dependency map:
+    /// every view reachable by following `source → dependents` edges, with the
+    /// seeds themselves excluded. Shared by the boot exchange-backfill
+    /// reachability check and the post-backfill regfile-delta release.
+    pub fn dependent_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
+        self.get_dep_map();
+        let mut reachable: FxHashSet<i64> = FxHashSet::default();
+        let mut stack = seeds;
+        while let Some(id) = stack.pop() {
+            if let Some(deps) = self.dep_map.get(&id) {
+                for &d in deps {
+                    if reachable.insert(d) {
+                        stack.push(d);
+                    }
+                }
+            }
+        }
+        reachable
+    }
+
     /// Distributed-backfill analogue of `backfill_view`'s post-loop
     /// `clear_view_regfile_deltas` (catalog/ddl.rs). A worker's
     /// `handle_backfill(source_id)` drives `evaluate_dag_multi_worker`, which
     /// evaluates the whole transitive dependent closure of `source_id`; the last
     /// chunk's input + intermediate delta registers stay pinned in every touched
-    /// view's regfile after the loop. Walk that closure and release them, so peak
+    /// view's regfile after the loop. Release them across that closure, so peak
     /// resident memory falls back to ~O(chunk) once the backfill drains.
     ///
     /// Also carries `backfill_view`'s Ephemeral guard: every view backfilled this
     /// way must be ephemeral, else its manifest-loaded shards would double-count
     /// against the deltas the backfill ingests.
     pub fn clear_regfile_deltas_from_source(&mut self, source_id: i64) {
-        self.get_dep_map();
-        let mut stack: Vec<i64> = self.dep_map.get(&source_id).cloned().unwrap_or_default();
-        let mut seen: FxHashSet<i64> = FxHashSet::default();
-        while let Some(view_id) = stack.pop() {
-            if !seen.insert(view_id) {
-                continue;
-            }
+        for view_id in self.dependent_closure(vec![source_id]) {
             debug_assert!(
                 self.tables
                     .get(&view_id)
@@ -381,9 +395,6 @@ impl DagEngine {
                  would double-count loaded shards",
             );
             self.clear_view_regfile_deltas(view_id);
-            if let Some(deps) = self.dep_map.get(&view_id) {
-                stack.extend(deps.iter().copied());
-            }
         }
     }
 
@@ -682,6 +693,61 @@ impl DagEngine {
             .any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. }));
         self.needs_exchange_cache.insert(view_id, needs);
         needs
+    }
+
+    /// Base tables that root at least one exchange view, deduplicated: a base
+    /// feeding several exchange views appears once. Walks every exchange view's
+    /// source chain — recursing through view sources, exchange or not — down to
+    /// the base tables. The boot backfill drives `fan_out_backfill` once per
+    /// returned base; `drive_dag(base)` then re-derives that base's whole
+    /// dependent closure — every view above it — once.
+    pub fn exchange_base_tables(&mut self) -> Vec<i64> {
+        // Collect the candidate view ids first: view_needs_exchange /
+        // get_source_ids take &mut self, so no self.tables borrow can be held
+        // across them. Filtering to views here (off the in-memory `kind`) also
+        // keeps view_needs_exchange — a meta-circuit load on a cold cache — off
+        // base tables, which never need exchange and have no circuit to load.
+        // Qualify the wire const: the catalog's i64 FIRST_USER_TABLE_ID alias is
+        // above the query layer, so importing it would invert layering.
+        let first_user = gnitz_wire::FIRST_USER_TABLE_ID as i64;
+        let candidate_views: Vec<i64> = self
+            .tables
+            .iter()
+            .filter(|(&t, e)| t >= first_user && e.kind == RelationKind::View)
+            .map(|(&t, _)| t)
+            .collect();
+        let exchange_views: Vec<i64> = candidate_views
+            .into_iter()
+            .filter(|&t| self.view_needs_exchange(t))
+            .collect();
+
+        let mut bases: FxHashSet<i64> = FxHashSet::default();
+        // `visited` (seeded with the exchange views) collapses shared sub-graphs
+        // so each view is walked once.
+        let mut visited: FxHashSet<i64> = exchange_views.iter().copied().collect();
+        let mut stack = exchange_views;
+        while let Some(node) = stack.pop() {
+            for s in self.get_source_ids(node) {
+                match self.tables.get(&s).map(|e| e.kind) {
+                    Some(RelationKind::BaseTable { .. }) => {
+                        bases.insert(s);
+                    }
+                    Some(RelationKind::View) if visited.insert(s) => stack.push(s),
+                    _ => {} // unregistered / system source, or already-visited view
+                }
+            }
+        }
+        bases.into_iter().collect()
+    }
+
+    /// The views the master's boot exchange-backfill cascade re-derives: the
+    /// transitive dependent closure of every base table that roots an exchange
+    /// view (driving a base re-derives its whole closure). The single source of
+    /// truth for "what the cascade fills", so the master driver and the worker's
+    /// complementary non-exchange rebuild cannot drift.
+    pub fn exchange_cascade_filled_views(&mut self) -> FxHashSet<i64> {
+        let bases = self.exchange_base_tables();
+        self.dependent_closure(bases)
     }
 
     /// The equality-conjunct count of a non-equi (range / band) join view, or

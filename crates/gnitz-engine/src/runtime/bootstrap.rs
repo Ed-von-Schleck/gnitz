@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::foundation::posix_io;
 use crate::foundation::syscall;
+use crate::query::RelationKind;
 use crate::runtime::executor::ServerExecutor;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::sal::{SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_PUSH, FLAG_TXN_COMMIT, SAL_MMAP_SIZE};
@@ -199,20 +200,14 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) {
 // Backfill exchange views
 // ---------------------------------------------------------------------------
 
-/// Issue fan_out_backfill for every exchange-requiring view.
+/// Issue fan_out_backfill once per base table that roots an exchange view.
+///
+/// `drive_dag(base)` re-derives that base's whole closure (every view above it)
+/// exactly once, so one backfill per base fills all of its exchange and
+/// intermediate views without re-driving any shared closure.
 fn backfill_exchange_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispatcher) -> Result<(), String> {
-    let table_ids = catalog.iter_user_table_ids();
-    for vid in table_ids {
-        if !catalog.dag.view_needs_exchange(vid) {
-            continue;
-        }
-        let source_ids = catalog.dag.get_source_ids(vid);
-        for source_id in source_ids {
-            if !catalog.dag.tables.contains_key(&source_id) {
-                continue;
-            }
-            dispatcher.fan_out_backfill(vid, source_id)?;
-        }
+    for base in catalog.dag.exchange_base_tables() {
+        dispatcher.fan_out_backfill(base)?;
     }
     Ok(())
 }
@@ -521,6 +516,36 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             }
 
             catalog.invalidate_all_plans();
+
+            // Rebuild the non-exchange views the master's post-ACK exchange
+            // backfill does not reach. recover_from_sal restored unflushed base
+            // rows but bypassed view derivation, and the inline open-time backfill
+            // is now live-only. The cascade re-derives the full dependent closure
+            // of every base feeding an exchange view; fill only the non-exchange
+            // views OUTSIDE that closure here, so neither pass double-counts and no
+            // view is missed. Backfill sources before dependents (depth order) so a
+            // view over another non-exchange view reads a populated source. Skip on
+            // a doomed boot — worker.run will abort.
+            if boot_flush_err.is_none() {
+                let filled = catalog.dag.exchange_cascade_filled_views();
+                let mut nx_views: Vec<i64> = catalog
+                    .iter_user_table_ids()
+                    .into_iter()
+                    .filter(|&vid| {
+                        !filled.contains(&vid)
+                            && catalog
+                                .dag
+                                .tables
+                                .get(&vid)
+                                .is_some_and(|e| e.kind == RelationKind::View)
+                            && !catalog.dag.view_needs_exchange(vid)
+                    })
+                    .collect();
+                nx_views.sort_by_key(|&vid| catalog.dag.tables.get(&vid).map(|e| e.depth).unwrap_or(0));
+                for vid in nx_views {
+                    catalog.backfill_view(vid);
+                }
+            }
 
             let msg = format!(
                 "Worker {} (pid {}) partitions [{}, {})\n",

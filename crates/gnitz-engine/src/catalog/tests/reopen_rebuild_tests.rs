@@ -1,11 +1,20 @@
-//! Reopen-rebuild idempotency: ephemeral relations (views, secondary indices)
-//! must be repopulated from their sources exactly once when the engine
-//! reopens. Their storage is erased at open (`Persistence::Ephemeral`) so the
-//! backfill is the *sole* population — if that storage were durable, the
+//! Reopen-rebuild idempotency for ephemeral relations.
+//!
+//! Secondary indices are repopulated from their sources exactly once when the
+//! engine reopens: their storage is erased at open (`Persistence::Ephemeral`)
+//! so the backfill is the *sole* population — if that storage were durable, the
 //! loaded shards plus the backfill recompute would sum and every weight would
 //! double. These tests are the regression guard for that invariant, which is
-//! structural since `RelationKind` derives durability and the rebuild
-//! decision from one value.
+//! structural since `RelationKind` derives durability and the rebuild decision
+//! from one value.
+//!
+//! Views are *not* rebuilt at catalog open. The inline open-time `backfill_view`
+//! is gated live-only, so a `CatalogEngine::open` in isolation reopens views
+//! **empty**; the boot view rebuild moved to the runtime layer — the per-worker
+//! post-recovery pass (cascade-unreachable non-exchange views) and the master's
+//! `backfill_exchange_views` cascade — and is exercised by the E2E suite, not
+//! this single-process catalog test. These tests assert the catalog-layer
+//! contract: index rebuilds once, view defers (comes back empty).
 
 use super::*;
 
@@ -21,19 +30,22 @@ fn sum_weights(mut c: CursorHandle) -> i64 {
     sum
 }
 
-// ── view_and_index_rebuild_once_on_reopen ───────────────────────────────
+// ── index_rebuilds_once_view_defers_on_reopen ───────────────────────────
 // Create a base table with N rows, a secondary index, and an identity view
 // over it; close; reopen. The base table must come back from its durable
-// shards (non-empty — otherwise the view rebuilding to an empty result would
-// pass the equality vacuously), and the view and index must hold exactly the
-// single-materialisation weights, not doubled.
+// shards (non-empty — otherwise the index rebuilding to an empty result would
+// pass the equality vacuously), the secondary index must hold exactly the
+// single-materialisation weights (not doubled), and the view must come back
+// **empty** — its rebuild is deferred to the runtime layer (worker pass +
+// master cascade), not the catalog open.
 //
-// This single-process path exercises `backfill_view`/`backfill_index` only
-// (the view is non-exchange). The multi-worker exchange-view rebuild
-// (`backfill_exchange_views`) is covered by the E2E suite.
+// This single-process path exercises `backfill_index` (still inline at open)
+// and the live CREATE VIEW backfill (is_live during the test's CREATE). The
+// boot view rebuild (`backfill_exchange_views` + the worker non-exchange pass)
+// is covered by the E2E suite.
 
 #[test]
-fn view_and_index_rebuild_once_on_reopen() {
+fn index_rebuilds_once_view_defers_on_reopen() {
     const N: i64 = 7;
     let dir = temp_dir("reopen_rebuild_once");
 
@@ -85,7 +97,7 @@ fn view_and_index_rebuild_once_on_reopen() {
 
     // The base table must be non-empty after reopen: it came back from its
     // durable shards. Without this guard an empty base would rebuild an empty
-    // view and the equality below would pass vacuously.
+    // index and the equality below would pass vacuously.
     let base_entry = engine2.dag.tables.get(&tid).expect("base table replayed");
     assert_eq!(
         sum_weights(base_entry.handle.open_cursor()),
@@ -93,14 +105,14 @@ fn view_and_index_rebuild_once_on_reopen() {
         "base table must survive close() → open() from its durable shards"
     );
 
-    // The view's ephemeral storage was erased at open and rebuilt from the
-    // base table by backfill_view — exactly once. A doubled total means the
-    // rebuild ran against storage that was also loaded from disk.
+    // The view's ephemeral storage was erased at open and is NOT rebuilt at the
+    // catalog layer: the inline open-time backfill is gated live-only, and boot
+    // view rebuild moved to the runtime worker pass + master cascade (E2E).
     let view_entry = engine2.dag.tables.get(&vid).expect("view replayed");
     assert_eq!(
         sum_weights(view_entry.handle.open_cursor()),
-        N,
-        "view must rebuild from source exactly once on reopen, not double"
+        0,
+        "view must come back empty at catalog open — rebuild deferred to runtime"
     );
 
     // Same invariant for the secondary index.
@@ -116,16 +128,18 @@ fn view_and_index_rebuild_once_on_reopen() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── view_and_index_rebuild_across_chunk_boundary ─────────────────────────
+// ── index_rebuilds_across_chunk_boundary_view_defers ─────────────────────
 // Boot backfills stream the source in DDL_SCAN_CHUNK_ROWS-sized chunks. The
 // chunk size cannot be shrunk before open() (the backfill runs during shard
 // replay, before any test code can touch the engine), so exercise the real
-// boundary with a base table one chunk plus a remainder wide. Also covers
-// the boot path with the unique duplicate check gated off (replay is not
-// live), since the rebuild itself must still ingest every chunk.
+// boundary with a base table one chunk plus a remainder wide. The secondary
+// index must rebuild across that boundary exactly once; the view defers to the
+// runtime layer and comes back empty. Also covers the boot index path with the
+// unique duplicate check gated off (replay is not live), since the rebuild
+// itself must still ingest every chunk.
 
 #[test]
-fn view_and_index_rebuild_across_chunk_boundary() {
+fn index_rebuilds_across_chunk_boundary_view_defers() {
     let n: usize = crate::storage::DDL_SCAN_CHUNK_ROWS + 3;
     let dir = temp_dir("reopen_rebuild_chunked");
 
@@ -176,11 +190,14 @@ fn view_and_index_rebuild_across_chunk_boundary() {
         "base table must survive close() → open() from its durable shards"
     );
 
+    // View is not rebuilt at the catalog layer (deferred to the runtime worker
+    // pass + master cascade); the index below is what exercises the chunk
+    // boundary at open.
     let view_entry = engine2.dag.tables.get(&vid).expect("view replayed");
     assert_eq!(
         sum_weights(view_entry.handle.open_cursor()),
-        n as i64,
-        "view must rebuild across the chunk boundary exactly once"
+        0,
+        "view must come back empty at catalog open — rebuild deferred to runtime"
     );
 
     let base_entry = engine2.dag.tables.get_mut(&tid).unwrap();
