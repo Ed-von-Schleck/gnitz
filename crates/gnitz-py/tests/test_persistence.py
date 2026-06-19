@@ -236,6 +236,69 @@ def test_view_survives_restart():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="Non-exchange views are inline-backfilled from durable shards at "
+    "catalog open, before recover_from_sal replays committed-but-unflushed base "
+    "rows; that replay bypasses view derivation and is never re-run for "
+    "non-exchange views, so the view permanently drops every base row written "
+    "since the last checkpoint after a crash.",
+)
+def test_nonexchange_view_retains_unflushed_data_after_restart():
+    """A non-exchange (projection) view must reflect ACKed-but-unflushed base
+    rows after a crash restart. The INSERT is fdatasync'd to the SAL but never
+    checkpointed to a shard, so recovery replays it from the SAL — and the view
+    must be rebuilt to include it, exactly as an exchange view (JOIN/GROUP BY)
+    would be."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"),
+        prefix="gnitz_persist_nxv_",
+    )
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+
+    try:
+        # --- Phase 1: create non-exchange view, insert (no explicit flush) ---
+        proc = _start_server(data_dir, sock_path)
+        conn = gnitz.connect(sock_path)
+
+        conn.create_schema("nxv")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name="nxv",
+        )
+        conn.execute_sql(
+            "CREATE VIEW v AS SELECT pk, val + 1 AS plus1 FROM t",
+            schema_name="nxv",
+        )
+        vid, _ = conn.resolve_table("nxv", "v")
+        conn.execute_sql("INSERT INTO t VALUES (7, 70)", schema_name="nxv")
+
+        rows = {r["pk"]: r for r in conn.scan(vid) if r.weight > 0}
+        assert rows[7]["plus1"] == 71, "pre-restart: view should reflect the insert"
+
+        conn.close()
+        _stop_server(proc)  # SIGKILL — the insert is in the SAL, not a shard
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # --- Phase 2: restart; the unflushed row must survive in the view ---
+        proc = _start_server(data_dir, sock_path)
+        conn = gnitz.connect(sock_path)
+
+        vid2, _ = conn.resolve_table("nxv", "v")
+        rows = {r["pk"]: r for r in conn.scan(vid2) if r.weight > 0}
+        assert 7 in rows, f"post-restart: pk=7 missing from view, got {rows}"
+        assert rows[7]["plus1"] == 71, (
+            f"post-restart: expected plus1=71, got {rows[7]['plus1']}"
+        )
+
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Durability tests: ACKed operations survive SIGKILL
 # ---------------------------------------------------------------------------
