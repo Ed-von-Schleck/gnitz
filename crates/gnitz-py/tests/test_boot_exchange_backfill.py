@@ -6,6 +6,16 @@ dependent closure). The previous loop drove once per (exchange view, immediate
 source) pair, which re-derived shared closures N times (F1) and drove intermediate
 views as sources (F2), over-counting a view's ephemeral state.
 
+The backfill must also reach views the master classifies by node shape. An
+equi-join carries no `ExchangeShard` node — it scatters its inputs through the
+runtime join-shard path — so the `ExchangeShard`-only classifier used to exclude
+it from the backfill base set. A two-base equi-join whose bases root no other
+exchange view (`x = a JOIN b`) was then driven by neither backfill path and came
+back a deterministic per-key prefix at W>1 (e.g. 9 of 30 rows). The fix seeds the
+base walk with equi-join views too; these tests pin restart-equivalence for the
+join shapes (bare, shared-base) and keep the single-pass-join and range-join
+controls green.
+
 These tests crash-restart a populated server and assert each derived view comes
 back with its pre-restart value, not a multiple. Run at GNITZ_WORKERS=4 (the
 exchange/fanout paths only engage with multiple workers).
@@ -277,22 +287,16 @@ def test_exchange_over_nonexchange_after_restart():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-@pytest.mark.xfail(
-    _NUM_WORKERS > 1,
-    strict=True,
-    reason="Pre-existing (not the de-dup change): a join over two base tables is "
-    "under-filled by the boot backfill at W>1 — the two trace sides are driven in "
-    "separate passes and the second-driven side joins against a only-partially-built "
-    "cross-worker trace, so most rows are silently dropped (e.g. 9 of 30). Correct "
-    "at W=1 and for single-pass joins (a JOIN v1 over one base).",
-)
 def test_join_sharing_a_base_after_restart():
     """Two joins sharing a base: `x = a JOIN b`, `y = a JOIN c`. The shared base
     `a` must be driven once; the old loop drove it once per listing view, duplicating
     every join output row. Assert both joins match a brute-force join with weight 1.
 
-    Currently xfail at W>1: exposes a pre-existing two-base-join boot-backfill
-    under-fill orthogonal to the de-dup fix under test.
+    These are two-base equi-joins: neither carries an `ExchangeShard` node, so the
+    `ExchangeShard`-only classifier left them out of the backfill base set entirely
+    and both came back a deterministic per-key prefix at W>1 (e.g. 9 of 30). Seeding
+    `exchange_base_tables` with equi-join views drives `a`, `b`, `c`, filling both
+    joins completely.
     """
     tmpdir, data_dir, sock_path = _make_env("gnitz_joinshare_")
     try:
@@ -406,6 +410,112 @@ def test_diamond_single_counted_after_restart():
             x_w[key] = x_w.get(key, 0) + r.weight
         assert all(w == 1 for w in x_w.values()), f"x duplicated: {sorted(x_w.items())}"
         assert set(x_w.keys()) == exp_x, f"x wrong: got {set(x_w.keys())} want {exp_x}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_bare_two_base_join_after_restart():
+    """Bare two-base equi-join `x = a JOIN b`, the minimal repro. Neither base
+    roots any other exchange view, so the `ExchangeShard`-only classifier returned
+    an empty base set and the boot backfill drove nothing for `x` — it came back a
+    deterministic per-key prefix at W>1 (e.g. 9 of 30). With equi-join views seeding
+    the base walk, the backfill drives both `a` and `b` and `x` recovers in full.
+
+    Isolates the two-base equi-join under-fill from any shared-base / drive-once
+    concern. Asserts restart-equivalence (set-equality vs. brute force, weight 1),
+    never the W-dependent surviving subset.
+    """
+    tmpdir, data_dir, sock_path = _make_env("gnitz_barejoin_")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("bj")
+        conn.execute_sql(
+            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
+            schema_name="bj",
+        )
+        conn.execute_sql(
+            "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)",
+            schema_name="bj",
+        )
+        conn.execute_sql(
+            "CREATE VIEW x AS SELECT a.id AS aid, a.av AS av, b.bv AS bv "
+            "FROM a JOIN b ON a.k = b.id",
+            schema_name="bj",
+        )
+        a_rows = [(i, i % 5, i * 10) for i in range(30)]  # k in {0..4}, every row matches
+        b_rows = [(k, k * 100) for k in range(5)]
+        conn.execute_sql(f"INSERT INTO a VALUES {_values(a_rows)}", schema_name="bj")
+        conn.execute_sql(f"INSERT INTO b VALUES {_values(b_rows)}", schema_name="bj")
+
+        bmap = {bid: bv for bid, bv in b_rows}
+        exp_x = {(aid, av, bmap[k]) for (aid, k, av) in a_rows}
+
+        conn.close()
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+
+        xid, _ = conn.resolve_table("bj", "x")
+        x_w = {}
+        for r in conn.scan(xid):
+            key = (r["aid"], r["av"], r["bv"])
+            x_w[key] = x_w.get(key, 0) + r.weight
+        assert all(w == 1 for w in x_w.values()), f"x duplicated: {x_w}"
+        assert set(x_w.keys()) == exp_x, \
+            f"x under-filled: got {len(x_w)} of {len(exp_x)} rows"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_range_two_base_join_after_restart():
+    """Range two-base join `r = ra JOIN rb ON ra.x < rb.y`. A range/band join
+    carries an output `ExchangeShard` node, so `view_needs_exchange` already
+    classifies it and the equi-join seed predicate (`DeltaTraceRange` is excluded)
+    never touches it. Regression guard that the `ExchangeShard` classification path
+    keeps recovering two-base joins correctly — this shape was never the bug.
+    """
+    tmpdir, data_dir, sock_path = _make_env("gnitz_rangejoin_")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("rj")
+        conn.execute_sql(
+            "CREATE TABLE ra (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+            schema_name="rj",
+        )
+        conn.execute_sql(
+            "CREATE TABLE rb (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)",
+            schema_name="rj",
+        )
+        conn.execute_sql(
+            "CREATE VIEW r AS SELECT ra.x AS x, rb.y AS y FROM ra JOIN rb ON ra.x < rb.y",
+            schema_name="rj",
+        )
+        ra_rows = [(i, i) for i in range(10)]   # (id, x)
+        rb_rows = [(j, j) for j in range(10)]   # (id, y)
+        conn.execute_sql(f"INSERT INTO ra VALUES {_values(ra_rows)}", schema_name="rj")
+        conn.execute_sql(f"INSERT INTO rb VALUES {_values(rb_rows)}", schema_name="rj")
+
+        # The view's pair-PK columns (r[0], r[1]) = (ra.id, rb.id).
+        exp_pairs = {(ai, bi) for (ai, ax) in ra_rows for (bi, by) in rb_rows if ax < by}
+        assert exp_pairs, "range join data must produce some matches"
+
+        conn.close()
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+
+        rid, _ = conn.resolve_table("rj", "r")
+        p_w = {}
+        for row in conn.scan(rid):
+            key = (row[0], row[1])
+            p_w[key] = p_w.get(key, 0) + row.weight
+        assert all(w == 1 for w in p_w.values()), f"range join duplicated: {p_w}"
+        assert set(p_w.keys()) == exp_pairs, \
+            f"range join wrong after restart: got {len(p_w)} of {len(exp_pairs)} pairs"
         conn.close()
         _stop_server(proc)
     finally:

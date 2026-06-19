@@ -695,20 +695,25 @@ impl DagEngine {
         needs
     }
 
-    /// Base tables that root at least one exchange view, deduplicated: a base
-    /// feeding several exchange views appears once. Walks every exchange view's
-    /// source chain — recursing through view sources, exchange or not — down to
-    /// the base tables. The boot backfill drives `fan_out_backfill` once per
-    /// returned base; `drive_dag(base)` then re-derives that base's whole
-    /// dependent closure — every view above it — once.
+    /// Base tables whose dependent closure the boot backfill must drive,
+    /// deduplicated: a base feeding several seed views appears once. A view is a
+    /// seed if `view_seeds_exchange_backfill` holds — it does a cross-worker
+    /// repartition (an `ExchangeShard` node or any `Join`) that the worker-local
+    /// rebuild pass cannot do. An equi-join over bases that root no other such
+    /// view would otherwise reach neither backfill path and under-fill at W>1.
+    /// Walks each seed view's source chain — recursing through view sources —
+    /// down to the base tables. The boot backfill drives `fan_out_backfill` once
+    /// per returned base; `drive_dag(base)` then re-derives that base's whole
+    /// dependent closure — every view above it — once. The result is sorted so
+    /// boot backfill drives bases in a reproducible order.
     pub fn exchange_base_tables(&mut self) -> Vec<i64> {
-        // Collect the candidate view ids first: view_needs_exchange /
+        // Collect the candidate view ids first: view_seeds_exchange_backfill and
         // get_source_ids take &mut self, so no self.tables borrow can be held
         // across them. Filtering to views here (off the in-memory `kind`) also
-        // keeps view_needs_exchange — a meta-circuit load on a cold cache — off
-        // base tables, which never need exchange and have no circuit to load.
-        // Qualify the wire const: the catalog's i64 FIRST_USER_TABLE_ID alias is
-        // above the query layer, so importing it would invert layering.
+        // keeps the meta-circuit loads off base tables, which never seed and have
+        // no circuit to load. Qualify the wire const: the catalog's i64
+        // FIRST_USER_TABLE_ID alias is above the query layer, so importing it
+        // would invert layering.
         let first_user = gnitz_wire::FIRST_USER_TABLE_ID as i64;
         let candidate_views: Vec<i64> = self
             .tables
@@ -716,16 +721,16 @@ impl DagEngine {
             .filter(|(&t, e)| t >= first_user && e.kind == RelationKind::View)
             .map(|(&t, _)| t)
             .collect();
-        let exchange_views: Vec<i64> = candidate_views
+        let seed_views: Vec<i64> = candidate_views
             .into_iter()
-            .filter(|&t| self.view_needs_exchange(t))
+            .filter(|&t| self.view_seeds_exchange_backfill(t))
             .collect();
 
         let mut bases: FxHashSet<i64> = FxHashSet::default();
-        // `visited` (seeded with the exchange views) collapses shared sub-graphs
+        // `visited` (seeded with the seed views) collapses shared sub-graphs
         // so each view is walked once.
-        let mut visited: FxHashSet<i64> = exchange_views.iter().copied().collect();
-        let mut stack = exchange_views;
+        let mut visited: FxHashSet<i64> = seed_views.iter().copied().collect();
+        let mut stack = seed_views;
         while let Some(node) = stack.pop() {
             for s in self.get_source_ids(node) {
                 match self.tables.get(&s).map(|e| e.kind) {
@@ -737,7 +742,9 @@ impl DagEngine {
                 }
             }
         }
-        bases.into_iter().collect()
+        let mut bases: Vec<i64> = bases.into_iter().collect();
+        bases.sort_unstable();
+        bases
     }
 
     /// The views the master's boot exchange-backfill cascade re-derives: the
@@ -767,6 +774,35 @@ impl DagEngine {
         let n_eq = crate::query::compiler::circuit_range_join_n_eq(&loaded);
         self.range_join_cache.insert(view_id, n_eq);
         n_eq
+    }
+
+    /// True iff the boot backfill must drive this view's bases: the view's
+    /// circuit carries an `ExchangeShard` node (GROUP BY / reduce / set-op /
+    /// range-join all do) or any `Join` node. The `Join` arm is load-bearing —
+    /// an equi-join (`DeltaTrace` / `DeltaTraceOuter` / `DeltaDelta`)
+    /// repartitions its inputs at runtime through the join-shard scatter (arm 4
+    /// of the multi-worker step) and carries **no** `ExchangeShard`, so nothing
+    /// else catches it. Matching any `Join` rather than the equi `JoinKind`s is
+    /// exact and leaves no variant list to drift: the only other kind, a
+    /// range/band join (`DeltaTraceRange`), always also carries an `ExchangeShard`
+    /// and so is already covered by the first arm. (Set-ops are `AntiJoin` /
+    /// `SemiJoin`, not `Join`, and likewise carry an `ExchangeShard`.)
+    ///
+    /// Loads the meta circuit once and reuses it to warm `needs_exchange_cache`
+    /// for the boot `view_needs_exchange` sweep that runs right after
+    /// `exchange_base_tables` over these same views.
+    fn view_seeds_exchange_backfill(&mut self, view_id: i64) -> bool {
+        let loaded = self.load_meta_circuit(view_id);
+        let needs_exchange = loaded
+            .nodes
+            .values()
+            .any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. }));
+        self.needs_exchange_cache.insert(view_id, needs_exchange);
+        needs_exchange
+            || loaded
+                .nodes
+                .values()
+                .any(|op| matches!(op, gnitz_wire::OpNode::Join(_)))
     }
 
     // ── Compilation ─────────────────────────────────────────────────────
