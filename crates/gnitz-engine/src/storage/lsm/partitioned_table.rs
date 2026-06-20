@@ -165,16 +165,13 @@ impl PartitionedTable {
                 part_indices[self.schema.partition_for_pk(mb.get_pk_bytes(i))].push(i as u32);
             }
 
-            let offset = self.part_offset as usize;
-            let num_live = self.tables.len();
             for p in 0..np {
                 if part_indices[p].is_empty() {
                     continue;
                 }
-                let local = p.wrapping_sub(offset);
-                if local >= num_live {
+                let Some(local) = self.local_slot(p) else {
                     continue;
-                }
+                };
                 let sub_batch = Batch::from_indexed_rows(&mb, &part_indices[p], &self.schema);
                 self.tables[local].ingest_owned_batch(sub_batch)?;
             }
@@ -188,6 +185,23 @@ impl PartitionedTable {
     // Cursor
     // ------------------------------------------------------------------
 
+    /// Gather every live partition's read sources — memtable `snapshot_runs`,
+    /// non-durable `in_memory_runs`, and `all_shard_arcs` — into one
+    /// (snapshots, shards) pair for `create_cursor_from_snapshots`. The single
+    /// owner of the per-partition gather shared by `open_cursor` and
+    /// `create_cursor_compacting`; takes `&[Table]` (never compacts), so the
+    /// `&self`/`&mut self` split stays at the call sites.
+    fn gather_runs(tables: &[Table]) -> (Vec<Rc<Batch>>, Vec<Rc<MappedShard>>) {
+        let mut snapshots: Vec<Rc<Batch>> = Vec::new();
+        let mut shards: Vec<Rc<MappedShard>> = Vec::new();
+        for table in tables {
+            snapshots.extend(table.snapshot_runs().iter().cloned());
+            snapshots.extend(table.in_memory_runs().iter().cloned());
+            shards.extend(table.all_shard_arcs());
+        }
+        (snapshots, shards)
+    }
+
     /// Open a read-only cursor over every partition (memtable runs + shards).
     /// Infallible, non-mutating — the recommended default. See
     /// `Table::open_cursor`.
@@ -198,14 +212,8 @@ impl PartitionedTable {
         if self.is_replicated() {
             return self.tables[0].open_cursor();
         }
-        let mut all_snapshots: Vec<Rc<Batch>> = Vec::new();
-        let mut all_shard_arcs: Vec<Rc<MappedShard>> = Vec::new();
-        for table in &self.tables {
-            all_snapshots.extend(table.snapshot_runs().iter().cloned());
-            all_snapshots.extend(table.in_memory_runs().iter().cloned());
-            all_shard_arcs.extend(table.all_shard_arcs());
-        }
-        read_cursor::create_cursor_from_snapshots(&all_snapshots, &all_shard_arcs, self.schema)
+        let (snaps, shards) = Self::gather_runs(&self.tables);
+        read_cursor::create_cursor_from_snapshots(&snaps, &shards, self.schema)
     }
 
     /// Open a cursor after running `compact_if_needed` on each partition.
@@ -222,18 +230,12 @@ impl PartitionedTable {
             return self.tables[0].create_cursor_compacting();
         }
 
-        let mut all_snapshots: Vec<Rc<Batch>> = Vec::new();
-        let mut all_shard_arcs: Vec<Rc<MappedShard>> = Vec::new();
-
         for table in &mut self.tables {
             table.compact_if_needed()?;
-            all_snapshots.extend(table.snapshot_runs().iter().cloned());
-            all_snapshots.extend(table.in_memory_runs().iter().cloned());
-            all_shard_arcs.append(&mut table.all_shard_arcs());
         }
 
-        let handle = read_cursor::create_cursor_from_snapshots(&all_snapshots, &all_shard_arcs, self.schema);
-        Ok(handle)
+        let (snaps, shards) = Self::gather_runs(&self.tables);
+        Ok(read_cursor::create_cursor_from_snapshots(&snaps, &shards, self.schema))
     }
 
     // ------------------------------------------------------------------
@@ -406,6 +408,16 @@ impl PartitionedTable {
     // Internal
     // ------------------------------------------------------------------
 
+    /// Maps a global partition id to this worker's local `tables` slot, or
+    /// `None` when the partition is not held locally. Single source of the
+    /// global→local translation for both the ingest scatter and the PK probe.
+    /// A partition below `part_offset` underflows the `wrapping_sub` to a value
+    /// past `tables.len()`, which the bound check maps to `None`.
+    fn local_slot(&self, p: usize) -> Option<usize> {
+        let local = p.wrapping_sub(self.part_offset as usize);
+        (local < self.tables.len()).then_some(local)
+    }
+
     /// Maps a full OPK PK key to this worker's local partition slot. The sole
     /// router now that the native `u128` path routes through `opk_key` → these
     /// bytes; `partition_for_pk_bytes` is bit-identical to `partition_for_key`
@@ -417,13 +429,7 @@ impl PartitionedTable {
     /// routed to. The in-partition match then keys on the full `key`, so
     /// prefix-twins coexist in one partition, distinguished by their full PK.
     fn local_index_bytes(&self, key: &[u8]) -> Option<usize> {
-        let p = self.schema.partition_for_pk(key) as u32;
-        let local = p.wrapping_sub(self.part_offset) as usize;
-        if local < self.tables.len() {
-            Some(local)
-        } else {
-            None
-        }
+        self.local_slot(self.schema.partition_for_pk(key))
     }
 }
 

@@ -11,8 +11,8 @@ use super::super::compact;
 use super::super::error::StorageError;
 use super::super::shard_reader::MappedShard;
 use super::{
-    to_cstrings, FLSMLevel, PendingShard, ShardEntry, ShardIndex, GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD,
-    L1_TARGET_FILES, LMAX_FILE_THRESHOLD, MAX_LEVELS,
+    to_cstrings, FLSMLevel, ShardEntry, ShardIndex, GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD, L1_TARGET_FILES,
+    LMAX_FILE_THRESHOLD, MAX_LEVELS,
 };
 
 impl ShardIndex {
@@ -36,9 +36,7 @@ impl ShardIndex {
 
     pub fn add_shard(&mut self, path: &str, min_lsn: u64, max_lsn: u64) -> Result<(), StorageError> {
         let entry = ShardEntry::open(path, &self.schema, min_lsn, max_lsn)?;
-        self.l0.push(entry);
-        self.sort_l0();
-        self.update_flags();
+        self.add_opened_shard(entry);
         Ok(())
     }
 
@@ -101,22 +99,13 @@ impl ShardIndex {
         self.all_entries().map(|e| e.max_lsn).max().unwrap_or(0)
     }
 
-    /// Insert an already-mmap'd PendingShard into L0. Caller must have
-    /// renamed the underlying .tmp into `pending.final_path` already; Linux
-    /// rename(2) does not invalidate existing mmaps.
-    pub fn add_opened_shard(&mut self, pending: PendingShard) -> Result<(), StorageError> {
-        let entry = ShardEntry {
-            shard: pending.mapped,
-            filename: pending.final_path,
-            min_lsn: pending.min_lsn,
-            max_lsn: pending.max_lsn,
-            pk_min: pending.pk_min,
-            pk_max: pending.pk_max,
-        };
+    /// Insert an already-mmap'd, not-yet-indexed `ShardEntry` into L0. Caller
+    /// must have renamed the underlying .tmp into `entry.filename` already;
+    /// Linux rename(2) does not invalidate existing mmaps. Infallible.
+    pub fn add_opened_shard(&mut self, entry: ShardEntry) {
         self.l0.push(entry);
         self.sort_l0();
         self.update_flags();
-        Ok(())
     }
 
     pub(super) fn get_or_create_level(&mut self, level_num: usize) -> &mut FLSMLevel {
@@ -191,17 +180,10 @@ impl ShardIndex {
         // This restores O(log N) wide-PK L1+ point lookups that previously
         // collapsed all wide compaction to a single guard 0 (O(N) reads).
         if !self.levels.is_empty() && !self.levels[0].guards.is_empty() {
-            // Always anchor the guard space at 0. `find_guard_for_key` routes a
-            // key below the first guard to guard[0] via `saturating_sub(1)`, but
-            // `find_guard_idx` returns `None` for keys below the first guard
-            // key — so a key inserted after L1 established `guard[0] > 0` would
-            // be written during compaction yet invisible on read. Mirrors the
-            // fix in `compact_guard_vertical`.
-            let mut keys: Vec<u128> = self.levels[0].guards.iter().map(|g| g.guard_key).collect();
-            if keys.first().copied() != Some(0) {
-                keys.insert(0, 0);
-            }
-            keys
+            // Below-first-guard keys saturate to bucket 0 on both routing paths
+            // (`find_guard_for_key` write, `find_guard_idx` read), so the raw
+            // guard keys need no 0-anchor.
+            self.levels[0].guards.iter().map(|g| g.guard_key).collect()
         } else {
             // The guard space is the order-preserving `pk_sort_key`
             // (= `pack_pk_be` of the OPK pk_min bytes), the same key the read
@@ -218,8 +200,10 @@ impl ShardIndex {
                     keys.push(pk);
                 }
             }
-            if keys.is_empty() || keys[0] != 0 {
-                keys.insert(0, 0);
+            // merge_and_route rejects an empty guard list; an empty table still
+            // needs one bucket.
+            if keys.is_empty() {
+                keys.push(0);
             }
             keys
         }
@@ -253,13 +237,22 @@ impl ShardIndex {
             } else {
                 GUARD_FILE_THRESHOLD
             };
-            let mut gi = 0;
-            while gi < self.levels[li].guards.len() {
-                if self.levels[li].guards[gi].entries.len() > threshold {
-                    self.compact_one_guard(li, gi)?;
-                }
-                gi += 1;
+            self.compact_overfull_guards(li, threshold)?;
+        }
+        Ok(())
+    }
+
+    /// Fold every guard in `level_idx` whose file count exceeds `threshold` down
+    /// to one file via `compact_one_guard`. Index-based walk because
+    /// `compact_one_guard` replaces a guard's `entries` in place (guard count is
+    /// stable across the loop).
+    fn compact_overfull_guards(&mut self, level_idx: usize, threshold: usize) -> Result<(), StorageError> {
+        let mut gi = 0;
+        while gi < self.levels[level_idx].guards.len() {
+            if self.levels[level_idx].guards[gi].entries.len() > threshold {
+                self.compact_one_guard(level_idx, gi)?;
             }
+            gi += 1;
         }
         Ok(())
     }
@@ -366,7 +359,7 @@ impl ShardIndex {
             self.compact_seq
         };
 
-        let mut guard_keys: Vec<u128> = if !dest_guard_indices.is_empty() {
+        let guard_keys: Vec<u128> = if !dest_guard_indices.is_empty() {
             dest_guard_indices
                 .iter()
                 .map(|&di| self.levels[dest_idx].guards[di].guard_key)
@@ -374,14 +367,6 @@ impl ShardIndex {
         } else {
             vec![self.levels[src_idx].guards[worst_idx].guard_key]
         };
-
-        // Ensure guard_keys covers the source range's lower bound.
-        // Without this, keys below the lowest destination guard are routed
-        // to that guard (via find_guard_for_key → index 0), but find_guard_idx
-        // on the read path returns None for keys below the guard key.
-        if !guard_keys.is_empty() && guard_keys[0] > src_guard_key {
-            guard_keys.insert(0, self.levels[src_idx].guards[worst_idx].guard_key);
-        }
 
         let input_cstrings = to_cstrings(&all_input_files)?;
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
@@ -434,13 +419,7 @@ impl ShardIndex {
         self.update_flags();
 
         if Self::level_num(dest_idx) == MAX_LEVELS - 1 {
-            let mut gi = 0;
-            while gi < self.levels[dest_idx].guards.len() {
-                if self.levels[dest_idx].guards[gi].entries.len() > LMAX_FILE_THRESHOLD {
-                    self.compact_one_guard(dest_idx, gi)?;
-                }
-                gi += 1;
-            }
+            self.compact_overfull_guards(dest_idx, LMAX_FILE_THRESHOLD)?;
         }
 
         Ok(())

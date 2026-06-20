@@ -9,6 +9,7 @@ use std::ptr;
 use super::super::xor8;
 use super::{MappedShard, ScalarRegion, WeightRegion};
 use crate::foundation::codec::{read_i64_le, read_u64_le};
+use crate::schema::key::PkBuf;
 
 impl MappedShard {
     #[inline]
@@ -45,6 +46,23 @@ impl MappedShard {
             // When ScalarRegion::Constant is widened to hold larger values,
             // this arm must be updated alongside it.
             ScalarRegion::Constant { value, .. } => &value[..stride],
+        }
+    }
+
+    /// `(pk_min, pk_max)` OPK bounds for this shard, in `self.pk_stride`-wide
+    /// `PkBuf`s. Derived from `count`, never serialized. An empty shard
+    /// (`count == 0`) has no row to read `get_pk_bytes` from, so it returns
+    /// zero-key bounds; an empty shard is never probed, so these bounds are
+    /// only a defensive backstop.
+    pub fn pk_bounds(&self) -> (PkBuf, PkBuf) {
+        if self.count > 0 {
+            (
+                PkBuf::from_bytes(self.get_pk_bytes(0)),
+                PkBuf::from_bytes(self.get_pk_bytes(self.count - 1)),
+            )
+        } else {
+            let e = PkBuf::empty(self.pk_stride);
+            (e, e)
         }
     }
 

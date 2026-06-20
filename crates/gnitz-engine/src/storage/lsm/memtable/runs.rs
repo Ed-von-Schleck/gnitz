@@ -45,6 +45,19 @@ pub(crate) fn consolidate_runs(runs: &[Rc<Batch>], schema: &SchemaDescriptor) ->
 }
 
 impl MemTable {
+    /// Insert every row's PK into the bloom, keyed by its leading ≤16 OPK bytes
+    /// via `pack_pk_be` — the same derivation `may_contain_pk` probes with,
+    /// consistent for signed PKs (whose sign-flipped `get_pk` value would not
+    /// be). `pack_pk_be` truncates to the leading 16 OPK bytes, so wide PKs
+    /// (`pk_stride > 16`) hash their prefix: add and probe pack identically, so
+    /// there is no false negative; two wide PKs sharing a 16-byte prefix collide
+    /// to one slot, a tolerated false positive resolved by the run scan.
+    fn bloom_add_batch(&mut self, batch: &Batch) {
+        for i in 0..batch.count {
+            self.bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
+        }
+    }
+
     /// Append a consolidated batch as a new run.
     pub fn upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
         let batch = batch.into_inner();
@@ -52,16 +65,7 @@ impl MemTable {
             return Ok(());
         }
         self.check_capacity()?;
-        // The bloom is keyed by the OPK bytes (via `pack_pk_be`), the same
-        // derivation `may_contain_pk` uses — consistent for signed PKs, whose
-        // sign-flipped `get_pk` value would not be. `pack_pk_be` truncates to
-        // the leading 16 OPK bytes, so wide PKs (`pk_stride > 16`) hash their
-        // prefix: add and probe pack identically, so there is no false
-        // negative; two wide PKs sharing a 16-byte prefix collide to one slot,
-        // a tolerated false positive resolved by the run scan.
-        for i in 0..batch.count {
-            self.bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
-        }
+        self.bloom_add_batch(&batch);
         self.total_row_count += batch.count;
         self.runs_bytes += batch.total_bytes();
         self.runs.push(Rc::new(batch));
@@ -112,11 +116,7 @@ impl MemTable {
         // weight-cancelled rows are cleared here, reducing false-positive rate.
         self.bloom.reset();
         if merged.count > 0 {
-            // pack_pk_be takes the leading min(len,16) OPK bytes, which is exactly
-            // what the probe side hashes for both narrow and wide PKs.
-            for i in 0..merged.count {
-                self.bloom.add(pack_pk_be(merged.get_pk_bytes(i)));
-            }
+            self.bloom_add_batch(&merged);
             self.runs.push(Rc::new(merged));
         }
         self.found = None;

@@ -1479,10 +1479,9 @@ mod tests {
             (col_data.as_ptr() as *const u8, col_data.len() * 8),
             (blob.as_ptr(), blob.len()),
         ];
-        let image = super::super::shard_file::build_shard_image(0, 1, &regions);
         let path = dir.path().join("const_pk.db");
-        std::fs::write(&path, &image).unwrap();
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, 1, &regions, false, 0).unwrap();
         let shard = Rc::new(super::super::shard_reader::MappedShard::open(&cpath, &schema, false).unwrap());
 
         let cursor = create_read_cursor(&[], &[shard], schema);

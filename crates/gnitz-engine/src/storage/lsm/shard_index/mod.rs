@@ -2,7 +2,7 @@
 //!
 //! Split into the in-memory index + compaction trigger ([`index`]) and the
 //! manifest serialize/load/recover path ([`persist`]). The shared types
-//! (`ShardEntry`, `LevelGuard`, `FLSMLevel`, `PendingShard`, `ShardIndex`), the
+//! (`ShardEntry`, `LevelGuard`, `FLSMLevel`, `ShardIndex`), the
 //! range/cstring helpers, the level constants, and the constructor live here so
 //! both sub-modules read the (private) fields and helpers directly.
 
@@ -30,18 +30,6 @@ fn pk_in_range(min: &PkBuf, max: &PkBuf, key: &[u8]) -> bool {
         && compare_pk_bytes(key, max.pk_bytes()) != Ordering::Greater
 }
 
-/// A shard that has been written and mmap'd at its `.tmp` path but not yet
-/// inserted into the index. Held by `Table::flush_prepare` until the worker
-/// completes Phase 2 and `flush_commit` renames the .tmp into place.
-pub struct PendingShard {
-    pub(crate) mapped: Rc<MappedShard>,
-    pub(crate) final_path: String,
-    pub(crate) pk_min: PkBuf,
-    pub(crate) pk_max: PkBuf,
-    pub(crate) min_lsn: u64,
-    pub(crate) max_lsn: u64,
-}
-
 const MAX_LEVELS: usize = 3;
 const L0_COMPACT_THRESHOLD: usize = 4;
 const GUARD_FILE_THRESHOLD: usize = 4;
@@ -55,7 +43,7 @@ fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, StorageError> {
         .collect()
 }
 
-struct ShardEntry {
+pub struct ShardEntry {
     shard: Rc<MappedShard>,
     filename: String,
     min_lsn: u64,
@@ -75,29 +63,26 @@ impl ShardEntry {
         self.shard.count == 0
     }
 
-    fn open(path: &str, schema: &SchemaDescriptor, min_lsn: u64, max_lsn: u64) -> Result<Self, StorageError> {
-        let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
-        let shard = Rc::new(MappedShard::open(&cpath, schema, false)?);
-        let is_empty = shard.count == 0;
-        let (pk_min, pk_max) = if !is_empty {
-            (
-                PkBuf::from_bytes(shard.get_pk_bytes(0)),
-                PkBuf::from_bytes(shard.get_pk_bytes(shard.count - 1)),
-            )
-        } else {
-            // Valid in-bounds zero key; get_pk_bytes must not be called
-            // on a count == 0 shard.
-            let e = PkBuf::empty(schema.pk_stride());
-            (e, e)
-        };
-        Ok(ShardEntry {
+    /// Build an entry from an already-mmap'd shard, deriving its PK bounds via
+    /// `MappedShard::pk_bounds`. `filename` is where the shard lives now
+    /// (`open`) or will live after the pending rename
+    /// (`open_shard_for_pending`).
+    fn from_mapped(shard: Rc<MappedShard>, filename: String, min_lsn: u64, max_lsn: u64) -> Self {
+        let (pk_min, pk_max) = shard.pk_bounds();
+        ShardEntry {
             shard,
-            filename: path.to_string(),
+            filename,
             min_lsn,
             max_lsn,
             pk_min,
             pk_max,
-        })
+        }
+    }
+
+    fn open(path: &str, schema: &SchemaDescriptor, min_lsn: u64, max_lsn: u64) -> Result<Self, StorageError> {
+        let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
+        let shard = Rc::new(MappedShard::open(&cpath, schema, false)?);
+        Ok(Self::from_mapped(shard, path.to_string(), min_lsn, max_lsn))
     }
 
     /// Probe this shard for a PK by its OPK `key` bytes (exactly `pk_stride`
@@ -147,17 +132,14 @@ impl FLSMLevel {
     }
 
     fn find_guard_idx(&self, key: u128) -> Option<usize> {
-        match self.guards.partition_point(|g| g.guard_key <= key) {
-            0 => None,
-            n => Some(n - 1),
-        }
+        // Saturate below-first-guard keys to bucket 0, matching the writer's
+        // `compact::find_guard_for_key` — a key written to bucket 0 is read from
+        // bucket 0. Empty level → `None` (skip this level).
+        (!self.guards.is_empty()).then(|| self.guards.partition_point(|g| g.guard_key <= key).saturating_sub(1))
     }
 
     fn find_guards_for_range(&self, range_min: u128, range_max: u128) -> Vec<usize> {
-        let start = match self.guards.partition_point(|g| g.guard_key <= range_min) {
-            0 => 0,
-            n => n - 1,
-        };
+        let start = self.find_guard_idx(range_min).unwrap_or(0);
         let mut result = Vec::new();
         for i in start..self.guards.len() {
             let gk = self.guards[i].guard_key;
@@ -300,10 +282,9 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        let image = shard_file::build_shard_image(42, n as u32, &regions);
         let path = dir.join(name);
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        shard_file::write_shard_at(libc::AT_FDCWD, &cpath, &image, false).unwrap();
+        shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 42, n as u32, &regions, false, 0).unwrap();
         path.to_str().unwrap().to_string()
     }
 
@@ -324,10 +305,9 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        let image = shard_file::build_shard_image(42, n as u32, &regions);
         let path = dir.join(name);
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        shard_file::write_shard_at(libc::AT_FDCWD, &cpath, &image, false).unwrap();
+        shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 42, n as u32, &regions, false, 0).unwrap();
         path.to_str().unwrap().to_string()
     }
 
@@ -507,31 +487,6 @@ mod tests {
             pre_entries,
             "src entries must be unchanged on failure"
         );
-    }
-
-    #[test]
-    fn test_l1_guard_keys_anchored_at_zero() {
-        // Regression: when L1's first guard key is > 0, l1_guard_keys must
-        // still anchor the guard space at 0 so keys below the first guard are
-        // routable and readable.
-        raise_fd_limit_for_tests();
-        let dir = tempfile::tempdir().unwrap();
-        let schema = test_schema();
-        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
-
-        // Establish L1 with a single guard whose key is 100.
-        idx.ensure_level(1);
-        let path = write_test_shard(dir.path(), "l1_g100.db", &[100, 200], &[1000, 2000]);
-        let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
-        idx.levels[0].get_or_create_guard(100).entries.push(entry);
-
-        let keys = idx.l1_guard_keys();
-        assert_eq!(
-            keys.first().copied(),
-            Some(0),
-            "guard space must start at 0, got {keys:?}"
-        );
-        assert!(keys.contains(&100), "existing guard key 100 must be preserved");
     }
 
     #[test]
@@ -753,6 +708,66 @@ mod tests {
         let mut found_250 = false;
         idx.find_pk(250, &mut |_, _| found_250 = true);
         assert!(found_250, "destination key 250 lost after vertical compaction");
+    }
+
+    /// L2→L3 vertical compaction (the deepest vertical path under MAX_LEVELS=3)
+    /// must keep below-destination-first-guard keys findable through the unified
+    /// saturating reader — the same routing-gap guarantee as L1→L2, one level
+    /// down, where it previously had no coverage.
+    #[test]
+    fn test_compact_guard_vertical_routing_gap_l2_to_l3() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        // L1/L2/L3 = levels[0]/[1]/[2].
+        idx.ensure_level(3);
+
+        // L2 guard at key=100: 5 shards (worst guard — worst_count > 1) with keys
+        // in [100, 180].
+        let src_pks: Vec<u64> = vec![100, 120, 140, 160, 180];
+        for (i, &pk) in src_pks.iter().enumerate() {
+            let name = format!("l2_src_{i}.db");
+            let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
+            let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
+            idx.levels[1].get_or_create_guard(100).entries.push(entry);
+        }
+
+        // L2 guard at key=500: 1 shard (so worst_guard picks key=100).
+        {
+            let path = write_test_shard(dir.path(), "l2_high.db", &[500], &[5000]);
+            let entry = ShardEntry::open(&path, &schema, 0, 50).unwrap();
+            idx.levels[1].get_or_create_guard(500).entries.push(entry);
+        }
+
+        // L3 guard at key=200: 1 shard with key=250. Its first guard is above the
+        // source range, so the source keys land below it.
+        {
+            let path = write_test_shard(dir.path(), "l3_dest.db", &[250], &[2500]);
+            let entry = ShardEntry::open(&path, &schema, 0, 80).unwrap();
+            idx.levels[2].get_or_create_guard(200).entries.push(entry);
+        }
+
+        idx.compact_guard_vertical(2).unwrap();
+
+        // The compaction actually ran (worst guard moved out of L2).
+        assert!(
+            !idx.levels[1].guards.iter().any(|g| g.guard_key == 100),
+            "L2 worst guard should be compacted into L3"
+        );
+
+        // Every source key (below L3's first guard 200) stays findable.
+        for &pk in &src_pks {
+            let mut found = false;
+            idx.find_pk(pk as u128, &mut |_, _| found = true);
+            assert!(found, "key {pk} lost after L2->L3 vertical compaction (routing gap)");
+        }
+
+        // The destination key 250 is also still present.
+        let mut found_250 = false;
+        idx.find_pk(250, &mut |_, _| found_250 = true);
+        assert!(found_250, "destination key 250 lost after L2->L3 vertical compaction");
     }
 
     #[test]

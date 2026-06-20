@@ -4,8 +4,6 @@
 //! (`memtable.rs`).
 
 use std::ffi::CStr;
-#[cfg(test)]
-use std::ptr;
 
 use libc::c_int;
 
@@ -99,7 +97,7 @@ impl PkUniqueChecker {
 }
 
 // ---------------------------------------------------------------------------
-// Per-region encoding detection (internal to build_shard_image)
+// Per-region encoding detection (used by the streaming shard writer)
 // ---------------------------------------------------------------------------
 
 enum RegionEncoding {
@@ -189,156 +187,6 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Optio
     // adjacent identical fingerprints; dedup collapses them in O(n).
     pks.dedup();
     xor8::build(&pks)
-}
-
-/// Build a complete shard file image from pre-built region buffers.
-///
-/// `regions` is an array of (pointer, size) pairs in the canonical order:
-///   pk (pk_stride bytes/row), weight, null_bitmap, [non-PK columns...], blob_arena.
-///
-/// The XOR8 filter is built internally from region[0] (pk) when `row_count > 0`.
-///
-/// Returns the complete file image ready for writing.
-#[cfg(test)]
-pub(crate) fn build_shard_image(table_id: u32, row_count: u32, regions: &[(*const u8, usize)]) -> Vec<u8> {
-    let num_regions = regions.len();
-    let n = row_count as usize;
-    let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
-
-    // --- Phase 1: detect encodings and compute actual sizes ---
-
-    let mut encodings: Vec<RegionEncoding> = Vec::with_capacity(num_regions);
-    let mut actual_sizes: Vec<usize> = Vec::with_capacity(num_regions);
-
-    for (i, &(src_ptr, orig_sz)) in regions.iter().enumerate().take(num_regions) {
-        if n == 0 || i == last_region || orig_sz == 0 || src_ptr.is_null() {
-            // Empty region, blob arena (last), or zero rows -> Raw passthrough
-            encodings.push(RegionEncoding::Raw);
-            actual_sizes.push(orig_sz);
-        } else {
-            let elem_width = orig_sz / n;
-            let src = unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) };
-            let enc = if i == 1 {
-                // weight region
-                detect_weight_encoding(src)
-            } else {
-                detect_encoding(src, elem_width)
-            };
-            let actual = match &enc {
-                RegionEncoding::Raw => orig_sz,
-                RegionEncoding::Constant => elem_width,
-                RegionEncoding::TwoValue { bitvec, .. } => 16 + bitvec.len(),
-            };
-            encodings.push(enc);
-            actual_sizes.push(actual);
-        }
-    }
-
-    // --- XOR8 filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
-
-    let xor8_filter = if row_count > 0 && num_regions >= 1 {
-        let (pk_ptr, pk_sz) = regions[0];
-        build_xor8_from_pk_region(pk_ptr, pk_sz, n)
-    } else {
-        None
-    };
-
-    // --- Phase 2: compute offsets, allocate, and write ---
-
-    let dir_size = num_regions * DIR_ENTRY_SIZE;
-    let dir_offset = HEADER_SIZE;
-
-    let mut pos = align64(dir_offset + dir_size);
-    let mut region_offsets = Vec::with_capacity(num_regions);
-    for &actual_sz in actual_sizes.iter().take(num_regions) {
-        region_offsets.push(pos);
-        pos = align64(pos + actual_sz);
-    }
-    let data_end = if num_regions == 0 {
-        HEADER_SIZE
-    } else {
-        region_offsets[num_regions - 1] + actual_sizes[num_regions - 1]
-    };
-
-    let xor8_data = xor8_filter.as_ref().map(xor8::serialize);
-    let xor8_offset = if xor8_data.is_some() { align64(data_end) } else { 0 };
-    let xor8_size = xor8_data.as_ref().map_or(0, |d| d.len());
-    let total_size = if xor8_data.is_some() {
-        xor8_offset + xor8_size
-    } else {
-        data_end
-    };
-
-    let mut image = vec![0u8; total_size];
-
-    // Write region data
-    for i in 0..num_regions {
-        let r_off = region_offsets[i];
-        let (src_ptr, orig_sz) = regions[i];
-
-        match &encodings[i] {
-            RegionEncoding::Raw => {
-                if orig_sz > 0 && !src_ptr.is_null() {
-                    unsafe {
-                        ptr::copy_nonoverlapping(src_ptr, image[r_off..].as_mut_ptr(), orig_sz);
-                    }
-                }
-            }
-            RegionEncoding::Constant => {
-                // Copy first elem_width bytes from source
-                let elem_width = actual_sizes[i];
-                unsafe {
-                    ptr::copy_nonoverlapping(src_ptr, image[r_off..].as_mut_ptr(), elem_width);
-                }
-            }
-            RegionEncoding::TwoValue {
-                value_a,
-                value_b,
-                bitvec,
-            } => {
-                image[r_off..r_off + 8].copy_from_slice(&value_a.to_le_bytes());
-                image[r_off + 8..r_off + 16].copy_from_slice(&value_b.to_le_bytes());
-                image[r_off + 16..r_off + 16 + bitvec.len()].copy_from_slice(bitvec);
-            }
-        }
-
-        // Checksum over what was actually written
-        let a_sz = actual_sizes[i];
-        let cs = if a_sz > 0 {
-            xxh::checksum(&image[r_off..r_off + a_sz])
-        } else {
-            0
-        };
-
-        // Write 32-byte directory entry
-        let d = dir_offset + i * DIR_ENTRY_SIZE;
-        write_u64_le(&mut image, d, r_off as u64);
-        write_u64_le(&mut image, d + 8, a_sz as u64);
-        write_u64_le(&mut image, d + 16, cs);
-        let encoding_byte = match &encodings[i] {
-            RegionEncoding::Raw => ENCODING_RAW,
-            RegionEncoding::Constant => ENCODING_CONSTANT,
-            RegionEncoding::TwoValue { .. } => ENCODING_TWO_VALUE,
-        };
-        image[d + 24] = encoding_byte;
-        // bytes [d+25..d+32] are already zero (reserved)
-    }
-
-    // Header
-    write_u64_le(&mut image, OFF_MAGIC, SHARD_MAGIC);
-    write_u64_le(&mut image, OFF_VERSION, SHARD_VERSION);
-    write_u64_le(&mut image, OFF_ROW_COUNT, row_count as u64);
-    write_u64_le(&mut image, OFF_DIR_OFFSET, dir_offset as u64);
-    write_u64_le(&mut image, OFF_TABLE_ID, table_id as u64);
-    write_u64_le(&mut image, OFF_XOR8_OFFSET, xor8_offset as u64);
-    write_u64_le(&mut image, OFF_XOR8_SIZE, xor8_size as u64);
-
-    // XOR8 filter data
-    if let Some(ref data) = xor8_data {
-        image[xor8_offset..xor8_offset + data.len()].copy_from_slice(data);
-    }
-
-    image
 }
 
 /// pwrite loop that handles short writes and EINTR.
@@ -615,50 +463,6 @@ fn write_shard_streaming_inner(
     }
 }
 
-/// Write `image` atomically using openat/fdatasync/renameat.
-///
-/// `dirfd`: directory fd for openat/renameat.  Use `libc::AT_FDCWD` (-100)
-/// for absolute paths.
-#[cfg(test)]
-pub(crate) fn write_shard_at(dirfd: c_int, basename: &CStr, image: &[u8], durable: bool) -> Result<(), StorageError> {
-    let tmp_name = super::cstr_with_tmp_suffix(basename)?;
-
-    unsafe {
-        let fd = libc::openat(
-            dirfd,
-            tmp_name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-            0o644,
-        );
-        if fd < 0 {
-            return Err(StorageError::Io);
-        }
-
-        let abort = |fd: c_int, tmp_ptr: *const libc::c_char| -> StorageError {
-            libc::close(fd);
-            libc::unlinkat(dirfd, tmp_ptr, 0);
-            StorageError::Io
-        };
-
-        if crate::foundation::posix_io::write_all_fd(fd, image) < 0 {
-            return Err(abort(fd, tmp_name.as_ptr()));
-        }
-
-        if durable && fdatasync_eintr(fd).is_err() {
-            return Err(abort(fd, tmp_name.as_ptr()));
-        }
-
-        libc::close(fd);
-
-        if libc::renameat(dirfd, tmp_name.as_ptr(), dirfd, basename.as_ptr()) < 0 {
-            libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
-            return Err(StorageError::Io);
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::shard_reader::MappedShard;
@@ -698,7 +502,11 @@ mod tests {
             (blob.as_ptr(), blob.len()),
         ];
 
-        let image = build_shard_image(42, row_count, &regions);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("build_image.db");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 42, row_count, &regions, false, 0).unwrap();
+        let image = std::fs::read(&path).unwrap();
 
         assert_eq!(read_u64_le(&image, OFF_MAGIC), SHARD_MAGIC);
         assert_eq!(read_u64_le(&image, OFF_VERSION), SHARD_VERSION);
@@ -706,45 +514,6 @@ mod tests {
         assert_eq!(read_u64_le(&image, OFF_TABLE_ID), 42);
         assert!(read_u64_le(&image, OFF_XOR8_OFFSET) > 0);
         assert!(read_u64_le(&image, OFF_XOR8_SIZE) > 0);
-    }
-
-    #[test]
-    fn write_and_read_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let shard_path = dir.path().join("test.db");
-        let path_cstr = std::ffi::CString::new(shard_path.to_str().unwrap()).unwrap();
-
-        let row_count = 2u32;
-        let pks: Vec<u64> = vec![1, 2];
-        let weights: Vec<i64> = vec![1, 1];
-        let nulls: Vec<u64> = vec![0, 0];
-        let vals: Vec<i64> = vec![42, 99];
-        // PK region is OPK (big-endian) at rest; U64 OPK == BE.
-        let pk_bytes: Vec<u8> = pks.iter().flat_map(|p| p.to_be_bytes()).collect();
-        let blob: Vec<u8> = vec![];
-
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, weights.len() * 8),
-            (nulls.as_ptr() as *const u8, nulls.len() * 8),
-            (vals.as_ptr() as *const u8, vals.len() * 8),
-            (blob.as_ptr(), 0),
-        ];
-
-        let image = build_shard_image(7, row_count, &regions);
-        write_shard_at(libc::AT_FDCWD, &path_cstr, &image, true).unwrap();
-        assert!(shard_path.exists());
-
-        let schema = make_schema_desc(2, 0);
-        let shard = MappedShard::open(&path_cstr, &schema, true).unwrap();
-        assert_eq!(shard.count, 2);
-        assert_eq!(shard.get_pk(0), 1);
-        assert_eq!(shard.get_pk(1), 2);
-        assert_eq!(shard.get_weight(0), 1);
-        assert_eq!(shard.get_weight(1), 1);
-        assert!(shard.has_xor8());
-        assert!(shard.xor8_may_contain(1));
-        assert!(shard.xor8_may_contain(2));
     }
 
     #[test]
@@ -760,8 +529,7 @@ mod tests {
             (std::ptr::null(), 0),
         ];
 
-        let image = build_shard_image(1, 0, &regions);
-        write_shard_at(libc::AT_FDCWD, &cpath, &image, false).unwrap();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 1, 0, &regions, false, 0).unwrap();
 
         let schema = make_schema_desc(1, 0);
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
@@ -769,7 +537,7 @@ mod tests {
         assert!(!shard.has_xor8());
     }
 
-    /// Bug 3: write_shard_streaming roundtrip — multiple column types including STRING.
+    /// write_shard_streaming roundtrip — PK + weight + null_bmp + i64 value regions.
     #[test]
     fn test_write_shard_streaming_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -834,9 +602,9 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        let image = build_shard_image(99, n, &regions);
-        assert_eq!(read_u64_le(&image, OFF_VERSION), SHARD_VERSION, "must write V6");
-        write_shard_at(libc::AT_FDCWD, &cpath, &image, false).unwrap();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 99, n, &regions, false, 0).unwrap();
+        let image = std::fs::read(&path).unwrap();
+        assert_eq!(read_u64_le(&image, OFF_VERSION), SHARD_VERSION, "must write V7");
 
         let schema = make_schema_desc(2, 0);
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
@@ -872,7 +640,11 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        let image = build_shard_image(1, n, &regions);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("u64_const.db");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 1, n, &regions, false, 0).unwrap();
+        let image = std::fs::read(&path).unwrap();
 
         // PK region should be Constant-encoded → directory entry size == 8 (one elem).
         let dir_off = read_u64_le(&image, OFF_DIR_OFFSET) as usize;

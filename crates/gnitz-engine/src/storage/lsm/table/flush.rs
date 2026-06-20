@@ -220,16 +220,9 @@ impl Table {
             }
         }
 
-        // Publish the pending shard into the index.
+        // Publish the pending shard into the index (infallible).
         if let Some(pending) = work.pending_shard.take() {
-            if let Err(e) = self.shard_index.add_opened_shard(pending) {
-                if let Some(fd) = dirfd {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                }
-                return Err(e);
-            }
+            self.shard_index.add_opened_shard(pending);
         }
 
         self.memtable.reset();

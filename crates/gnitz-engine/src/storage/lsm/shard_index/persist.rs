@@ -7,9 +7,9 @@ use std::ffi::{CStr, CString};
 use std::rc::Rc;
 
 use super::super::error::StorageError;
-use super::super::manifest::{self, ManifestEntryRaw, PkBuf, PreparedManifest};
+use super::super::manifest::{self, ManifestEntryRaw, PreparedManifest};
 use super::super::shard_reader::MappedShard;
-use super::{PendingShard, ShardEntry, ShardIndex, MAX_LEVELS};
+use super::{ShardEntry, ShardIndex, MAX_LEVELS};
 
 impl ShardIndex {
     fn build_manifest_entries(&self) -> Vec<ManifestEntryRaw> {
@@ -124,57 +124,32 @@ impl ShardIndex {
         manifest::write_file(&cpath, &entries, global_lsn)
     }
 
-    /// Open a shard mmap from `tmp_path` and return a PendingShard recording
-    /// the metadata needed to publish it later. The index is NOT mutated.
-    /// `final_path` is the full filesystem path the shard will live at after
-    /// the rename (matches existing `ShardEntry::filename`).
+    /// Open a shard mmap from `tmp_path` and return a not-yet-indexed
+    /// `ShardEntry` recording the metadata needed to publish it later. The index
+    /// is NOT mutated. `final_path` is the full filesystem path the shard will
+    /// live at after the rename (recorded as the entry's `filename`).
     pub fn open_shard_for_pending(
         &self,
         tmp_path: &CStr,
         final_path: String,
         min_lsn: u64,
         max_lsn: u64,
-    ) -> Result<PendingShard, StorageError> {
+    ) -> Result<ShardEntry, StorageError> {
         let mapped = Rc::new(MappedShard::open(tmp_path, &self.schema, false)?);
-        let (pk_min, pk_max) = if mapped.count > 0 {
-            (
-                PkBuf::from_bytes(mapped.get_pk_bytes(0)),
-                PkBuf::from_bytes(mapped.get_pk_bytes(mapped.count - 1)),
-            )
-        } else {
-            let e = PkBuf::empty(self.schema.pk_stride());
-            (e, e)
-        };
-        Ok(PendingShard {
-            mapped,
-            final_path,
-            pk_min,
-            pk_max,
-            min_lsn,
-            max_lsn,
-        })
+        Ok(ShardEntry::from_mapped(mapped, final_path, min_lsn, max_lsn))
     }
 
-    /// Serialize all current entries plus one pending shard into a manifest
-    /// `.tmp`. Returns the prepared manifest (fd + paths) without modifying
-    /// any index state.
+    /// Serialize all current entries plus one pending (not-yet-indexed)
+    /// `ShardEntry` into a manifest `.tmp`. Returns the prepared manifest
+    /// (fd + paths) without modifying any index state. `entry_to_raw` reads only
+    /// the entry's metadata fields — it never dereferences `shard`.
     pub fn prepare_manifest_with_pending(
         &self,
         manifest_path: &CStr,
-        pending: &PendingShard,
+        pending: &ShardEntry,
     ) -> Result<PreparedManifest, StorageError> {
         let mut entries = self.build_manifest_entries();
-        // Temporary ShardEntry so we can reuse entry_to_raw (which only reads
-        // metadata fields — it never dereferences shard).
-        let tmp = ShardEntry {
-            shard: Rc::clone(&pending.mapped),
-            filename: pending.final_path.clone(),
-            min_lsn: pending.min_lsn,
-            max_lsn: pending.max_lsn,
-            pk_min: pending.pk_min,
-            pk_max: pending.pk_max,
-        };
-        entries.push(self.entry_to_raw(&tmp, 0, 0));
+        entries.push(self.entry_to_raw(pending, 0, 0));
 
         let global_lsn = self.max_lsn().max(pending.max_lsn);
         manifest::prepare_file(manifest_path, &entries, global_lsn)

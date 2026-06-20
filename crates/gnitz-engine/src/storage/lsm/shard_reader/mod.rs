@@ -158,7 +158,7 @@ mod tests {
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
-    /// Build a v6 shard via build_shard_image (uses encoding detection).
+    /// Build a shard via write_shard_streaming (uses encoding detection).
     fn build_test_shard(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
         let path = dir.join("test.db");
         let count = rows.len() as u32;
@@ -178,12 +178,12 @@ mod tests {
             (blob.as_ptr(), blob.len()),
         ];
 
-        let image = super::super::shard_file::build_shard_image(0, count, &regions);
-        std::fs::write(&path, &image).unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, false, 0).unwrap();
         path.to_str().unwrap().to_string()
     }
 
-    /// Build a v6 shard with custom weights.
+    /// Build a shard with custom weights via write_shard_streaming.
     fn build_test_shard_weights(dir: &std::path::Path, name: &str, pks: &[u64], wts: &[i64], vals: &[i64]) -> String {
         let path = dir.join(name);
         let count = pks.len() as u32;
@@ -200,8 +200,8 @@ mod tests {
             (blob.as_ptr(), blob.len()),
         ];
 
-        let image = super::super::shard_file::build_shard_image(0, count, &regions);
-        std::fs::write(&path, &image).unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, false, 0).unwrap();
         path.to_str().unwrap().to_string()
     }
 
@@ -748,8 +748,8 @@ mod tests {
             (blob.as_ptr(), blob.len()),
         ];
 
-        let image = super::super::shard_file::build_shard_image(0, count, &regions);
-        std::fs::write(&path, &image).unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, false, 0).unwrap();
         path.to_str().unwrap().to_string()
     }
 
@@ -896,10 +896,9 @@ mod tests {
             (empty.as_ptr(), 0),
             (empty.as_ptr(), 0),
         ];
-        let image = super::super::shard_file::build_shard_image(0, count, &regions);
         let path = dir.path().join("wide_pk.db");
-        std::fs::write(&path, &image).unwrap();
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, false, 0).unwrap();
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         assert_eq!(shard.pk_stride, 24);
         assert!(
@@ -965,12 +964,11 @@ mod tests {
             (empty.as_ptr(), 0),
             (empty.as_ptr(), 0),
         ];
-        let image = super::super::shard_file::build_shard_image(0, count, &regions);
         let path = dir.path().join("wide_const.db");
-        std::fs::write(&path, &image).unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, false, 0).unwrap();
 
         // Sanity: unpatched shard opens fine with a Raw PK region.
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         assert!(MappedShard::open(&cpath, &schema, false).is_ok());
 
         // Patch the PK directory entry (index 0) encoding byte to CONSTANT.

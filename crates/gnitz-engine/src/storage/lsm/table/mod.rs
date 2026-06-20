@@ -14,7 +14,7 @@ use super::error::StorageError;
 use super::manifest::PreparedManifest;
 use super::memtable::{self, MemTable};
 use super::read_cursor::{self, CursorHandle};
-use super::shard_index::{PendingShard, ShardIndex};
+use super::shard_index::{ShardEntry, ShardIndex};
 use super::shard_reader::MappedShard;
 use crate::foundation::posix_io::fsync_eintr;
 use crate::schema::SchemaDescriptor;
@@ -72,7 +72,10 @@ pub struct FlushWork {
     shard_fd: Option<libc::c_int>,
     shard_rename: Option<ShardRename>,
     manifest: Option<PreparedManifest>,
-    pending_shard: Option<PendingShard>,
+    /// The flush's shard, written and mmap'd at its `.tmp` path but not yet
+    /// inserted into the index — held here from `flush_prepare` until
+    /// `flush_commit` renames the `.tmp` into place and inserts it.
+    pending_shard: Option<ShardEntry>,
 }
 
 pub struct ShardRename {
