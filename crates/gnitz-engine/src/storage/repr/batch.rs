@@ -1511,6 +1511,14 @@ impl Clone for Batch {
 
 impl ColumnarSource for Batch {
     #[inline]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        Batch::get_pk_bytes(self, row)
+    }
+    #[inline]
+    fn get_weight(&self, row: usize) -> i64 {
+        Batch::get_weight(self, row)
+    }
+    #[inline]
     fn get_null_word(&self, row: usize) -> u64 {
         Batch::get_null_word(self, row)
     }

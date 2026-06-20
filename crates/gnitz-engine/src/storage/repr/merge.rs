@@ -144,6 +144,59 @@ impl<'a> std::ops::Deref for SortedMemBatch<'a> {
     }
 }
 
+/// `run_merge` is generic over `S: ColumnarSource`, and inside a generic body
+/// method resolution goes through the trait bound (Deref does not apply to an
+/// opaque type parameter), so the flush input must impl `ColumnarSource`
+/// directly. Forward each accessor to the inner `MemBatch`; `#[repr(transparent)]`
+/// makes every forward zero-cost.
+impl<'a> ColumnarSource for SortedMemBatch<'a> {
+    #[inline]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        self.0.get_pk_bytes(row)
+    }
+    #[inline]
+    fn get_weight(&self, row: usize) -> i64 {
+        self.0.get_weight(row)
+    }
+    #[inline]
+    fn get_null_word(&self, row: usize) -> u64 {
+        self.0.get_null_word(row)
+    }
+    #[inline]
+    fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
+        self.0.get_col_ptr(row, payload_col, col_size)
+    }
+    #[inline]
+    fn blob_slice(&self) -> &[u8] {
+        self.0.blob
+    }
+}
+
+/// The extra shape the N-way merge needs from a row source beyond
+/// [`ColumnarSource`]'s column reads: the row count and the per-source ghost
+/// skip. Implemented only by the two types that flow through [`run_merge`] —
+/// `SortedMemBatch` (consolidated, no ghosts) and `MappedShard` (may carry
+/// weight-0 ghosts). `run_merge` builds every cursor from `&[S]` alone using
+/// these two methods, keeping all ghost logic in one place.
+pub(crate) trait MergeSource {
+    /// Total rows in this source (the cursor's exclusive upper bound).
+    fn row_count(&self) -> usize;
+    /// First live (weight ≠ 0) row at or after `pos`, or `row_count()` if none.
+    /// Pre-consolidated batches have no ghosts — the default no-op — so the
+    /// advance lowers to `pos`; shards override to skip weight-0 rows.
+    #[inline]
+    fn next_non_ghost(&self, pos: usize) -> usize {
+        pos
+    }
+}
+
+impl<'a> MergeSource for SortedMemBatch<'a> {
+    #[inline]
+    fn row_count(&self) -> usize {
+        self.0.count
+    }
+}
+
 /// Borrowed slice-view of a `Batch`.
 ///
 /// The full data buffer is referenced as `data: &[u8]`, with `offsets` recording
@@ -246,6 +299,14 @@ impl<'b> RowView<'b> for MemBatch<'b> {
 
 impl<'a> ColumnarSource for MemBatch<'a> {
     #[inline]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        MemBatch::get_pk_bytes(self, row)
+    }
+    #[inline]
+    fn get_weight(&self, row: usize) -> i64 {
+        MemBatch::get_weight(self, row)
+    }
+    #[inline]
     fn get_null_word(&self, row: usize) -> u64 {
         self.get_null_word(row)
     }
@@ -260,29 +321,22 @@ impl<'a> ColumnarSource for MemBatch<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// MemBatchCursor: position within a MemBatch
+// PosCursor: one source's position within the N-way merge
 // ---------------------------------------------------------------------------
 
-pub(crate) struct MemBatchCursor {
-    pub position: usize,
-    pub count: usize,
+/// One source's merge position. Replaces the former `MemBatchCursor` /
+/// `ShardCursor` (both an identical `{position, count}`); the ghost skip that
+/// distinguished them now lives in [`MergeSource::next_non_ghost`], called by
+/// [`run_merge`] for both the initial seat and each advance.
+struct PosCursor {
+    position: usize,
+    count: usize,
 }
 
-impl MemBatchCursor {
-    pub fn new(count: usize) -> Self {
-        MemBatchCursor { position: 0, count }
-    }
-
+impl PosCursor {
     #[inline]
-    pub fn is_valid(&self) -> bool {
+    fn is_valid(&self) -> bool {
         self.position < self.count
-    }
-
-    #[inline]
-    pub fn advance(&mut self) {
-        if self.position < self.count {
-            self.position += 1;
-        }
     }
 }
 
@@ -401,104 +455,100 @@ impl<'a> DirectWriter<'a> {
 pub(crate) use crate::schema::key::{pack_pk_be, pk_sort_key};
 
 // ---------------------------------------------------------------------------
-// merge_batches: the main entry point
+// run_merge: the generic N-way (PK, payload) merge + consolidation
 // ---------------------------------------------------------------------------
 
-/// Perform N-way merge + consolidation of **sorted** `MemBatch` slices.
+/// N-way (PK, payload) merge + consolidation over any sorted columnar sources —
+/// the single owner of the merge that flush ([`merge_batches`]) and shard
+/// compaction (`compact::open_and_merge`) share.
 ///
 /// Rows with the same (PK, payload) have their weights summed; zero-weight
-/// (PK, payload) groups are dropped.  The payload-aware heap ordering ensures
-/// equal (PK, payload) entries appear consecutively at the root, so the
-/// single-level pending-group drain below handles both intra-cursor
-/// duplicates (consecutive matching rows inside one sorted batch) and
-/// cross-cursor duplicates (matching rows in different batches) in one pass.
+/// (PK, payload) groups are dropped. The payload-aware heap ordering puts equal
+/// (PK, payload) entries consecutively at the root, so the single pending-group
+/// drain in `drive_merge` folds both intra-source duplicates (consecutive
+/// matching rows inside one sorted source) and cross-source duplicates in one
+/// pass.
 ///
-/// The `SortedMemBatch` parameter enforces at the call site that every input
-/// is certified sorted by (PK, payload).
-pub(crate) fn merge_batches(batches: &[SortedMemBatch], schema: &SchemaDescriptor, writer: &mut DirectWriter) {
-    let n = batches.len();
-    if n == 0 {
+/// Builds the payload (outer) → stride (inner) comparator tower once via
+/// `with_payload_cmp!` / `with_pk_ord!`, seats one [`PosCursor`] per source
+/// (skipping leading ghosts via [`MergeSource::next_non_ghost`]), and drives
+/// `drive_merge`. `emit(group_src, group_row, net_weight)` fires once per
+/// surviving (net ≠ 0) group; the caller turns `(src, row)` into its output (a
+/// `DirectWriter` row for flush, a guard-routed shard append for compaction).
+pub(crate) fn run_merge<S: ColumnarSource + MergeSource>(
+    sources: &[S],
+    schema: &SchemaDescriptor,
+    emit: impl FnMut(usize, usize, i64),
+) {
+    if sources.is_empty() {
         return;
     }
-
-    let mut cursors: Vec<MemBatchCursor> = (0..n).map(|i| MemBatchCursor::new(batches[i].count)).collect();
+    let mut cursors: Vec<PosCursor> = sources
+        .iter()
+        .map(|s| PosCursor {
+            position: s.next_non_ghost(0),
+            count: s.row_count(),
+        })
+        .collect();
 
     // Dispatch the payload comparator (outer) then the stride comparator (inner),
     // each monomorphizing its own branch-free copy of the merge loop.
-    with_payload_cmp!(schema, merge_run, &mut cursors, batches, schema, writer)
+    with_payload_cmp!(schema, run_merge_payload, sources, &mut cursors, schema, emit)
 }
 
-/// Payload-dispatch layer; defers to the stride dispatch in `merge_run_pk`.
+/// Payload-dispatch layer; defers to the stride dispatch in `run_merge_pk`.
 #[inline]
-fn merge_run<RowCmp>(
-    cursors: &mut [MemBatchCursor],
-    batches: &[SortedMemBatch],
+fn run_merge_payload<S, RowCmp>(
+    sources: &[S],
+    cursors: &mut [PosCursor],
     schema: &SchemaDescriptor,
-    writer: &mut DirectWriter,
+    emit: impl FnMut(usize, usize, i64),
     row_cmp: RowCmp,
 ) where
-    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+    S: ColumnarSource + MergeSource,
+    RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy,
 {
-    with_pk_ord!(schema, merge_run_pk, cursors, batches, schema, writer, row_cmp)
+    with_pk_ord!(schema, run_merge_pk, sources, cursors, schema, emit, row_cmp)
 }
 
-/// N-way merge closure builder. The keyless heap reads each player's OPK bytes
-/// through `(source_idx, row)`: the stride-dispatched `pk_ord` settles the PK
-/// axis, then the payload `row_cmp`. `same_pk` is the width-agnostic OPK byte
-/// equality (so two distinct wide PKs sharing a 16-byte prefix never fold);
-/// `eq_payload` is the payload term.
+/// N-way merge closure builder + driver. The keyless heap reads each player's
+/// OPK bytes through `(source_idx, row)`: the stride-dispatched `pk_ord` settles
+/// the PK axis, then the payload `row_cmp`. `same_pk` is the width-agnostic OPK
+/// byte equality (so two distinct wide PKs sharing a 16-byte prefix never fold);
+/// `eq_payload` is the payload term. Monomorphised per (source, payload, stride)
+/// so `drive_merge`'s hot loop stays branch-free; the no-op `next_non_ghost` on a
+/// ghost-free source inlines the advance to `position + 1`.
 #[inline]
-fn merge_run_pk<RowCmp, PK>(
-    cursors: &mut [MemBatchCursor],
-    batches: &[SortedMemBatch],
+fn run_merge_pk<S, RowCmp, PK>(
+    sources: &[S],
+    cursors: &mut [PosCursor],
     schema: &SchemaDescriptor,
-    writer: &mut DirectWriter,
+    mut emit: impl FnMut(usize, usize, i64),
     row_cmp: RowCmp,
     pk_ord: PK,
 ) where
-    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
+    S: ColumnarSource + MergeSource,
+    RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy,
     PK: PkOrd,
 {
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
-    // by `advance`.  `source_idx` doubles as the batch index here.
+    // by `advance`.  `source_idx` doubles as the source index here.
     let less = |a: &HeapNode, b: &HeapNode| -> bool {
-        let ba = &batches[a.source_idx as usize];
-        let bb = &batches[b.source_idx as usize];
-        match pk_ord.cmp(ba.get_pk_bytes(a.row as usize), bb.get_pk_bytes(b.row as usize)) {
+        let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
+        let (b_src, b_row) = (b.source_idx as usize, b.row as usize);
+        match pk_ord.cmp(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
             Ordering::Less => true,
             Ordering::Greater => false,
-            Ordering::Equal => row_cmp(schema, &ba.0, a.row as usize, &bb.0, b.row as usize) == Ordering::Less,
+            Ordering::Equal => row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less,
         }
     };
     let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-        batches[a_src].get_pk_bytes(a_row) == batches[b_src].get_pk_bytes(b_row)
+        sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
     };
     let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-        row_cmp(schema, &batches[a_src].0, a_row, &batches[b_src].0, b_row) == Ordering::Equal
+        row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
     };
-    merge_batches_inner(cursors, batches, writer, less, same_pk, eq_payload);
-}
-
-/// Single generic N-way merge driver body. Monomorphised on the `less` /
-/// `same_pk` / `eq_payload` closures its caller selects per stride and payload —
-/// each combination compiles to its own branch-free copy of the hot loop. The
-/// keyless node carries only the row; `less`/`same_pk` read the OPK bytes through
-/// `(source_idx, row)`, and the output PK is re-derived from `(src, row)` in the
-/// emit (`write_row` reads `get_pk_bytes`).
-#[inline]
-fn merge_batches_inner<L, SP, EQ>(
-    cursors: &mut [MemBatchCursor],
-    batches: &[SortedMemBatch],
-    writer: &mut DirectWriter,
-    less: L,
-    same_pk: SP,
-    eq_payload: EQ,
-) where
-    L: Fn(&HeapNode, &HeapNode) -> bool + Copy,
-    SP: Fn(usize, usize, usize, usize) -> bool,
-    EQ: Fn(usize, usize, usize, usize) -> bool,
-{
     let mut tree = LoserTree::build(
         cursors.len(),
         |i| cursors[i].is_valid().then(|| cursors[i].position as u32),
@@ -508,17 +558,30 @@ fn merge_batches_inner<L, SP, EQ>(
         &mut tree,
         less,
         |src| {
-            cursors[src].advance();
+            // Skip ghosts (a no-op for consolidated batches) then report validity.
+            cursors[src].position = sources[src].next_non_ghost(cursors[src].position + 1);
             cursors[src].is_valid().then(|| cursors[src].position as u32)
         },
         same_pk,
         eq_payload,
-        |src, row| batches[src].get_weight(row),
+        |src, row| sources[src].get_weight(row),
         |group_src, group_row, w| {
-            writer.write_row(&batches[group_src], group_row, w);
+            emit(group_src, group_row, w);
             std::ops::ControlFlow::Continue(())
         },
     );
+}
+
+// ---------------------------------------------------------------------------
+// merge_batches: the flush-path entry point (MemTable run consolidation)
+// ---------------------------------------------------------------------------
+
+/// N-way merge + consolidation of **sorted** `MemBatch` slices into `writer` — a
+/// thin wrapper over [`run_merge`]. The `SortedMemBatch` parameter enforces at
+/// the call site that every input is certified sorted by (PK, payload).
+/// (`&SortedMemBatch` deref-coerces to the `&MemBatch` `write_row` expects.)
+pub(crate) fn merge_batches(batches: &[SortedMemBatch], schema: &SchemaDescriptor, writer: &mut DirectWriter) {
+    run_merge(batches, schema, |src, row, w| writer.write_row(&batches[src], row, w));
 }
 
 // ---------------------------------------------------------------------------
@@ -708,7 +771,7 @@ mod tests {
     }
 
     // Takes &[Batch] so test call sites don't need to construct SortedMemBatch.
-    fn run_merge(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
+    fn merge_to_rows(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
         let mem_batches: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
         let sorted: Vec<SortedMemBatch> = mem_batches
             .iter()
@@ -759,7 +822,7 @@ mod tests {
         let schema = make_schema_i64();
         let batch = make_batch_i64(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]);
 
-        let result = run_merge(&[batch], &schema);
+        let result = merge_to_rows(&[batch], &schema);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], (10, 0, 1, 100));
         assert_eq!(result[1], (20, 0, 1, 200));
@@ -772,7 +835,7 @@ mod tests {
         let b1 = make_batch_i64(&[(10, 1, 100), (30, 1, 300)]);
         let b2 = make_batch_i64(&[(20, 1, 200), (40, 1, 400)]);
 
-        let result = run_merge(&[b1, b2], &schema);
+        let result = merge_to_rows(&[b1, b2], &schema);
         assert_eq!(result.len(), 4);
         assert_eq!(result[0], (10, 0, 1, 100));
         assert_eq!(result[1], (20, 0, 1, 200));
@@ -786,7 +849,7 @@ mod tests {
         let b1 = make_batch_i64(&[(10, 1, 100)]);
         let b2 = make_batch_i64(&[(10, 2, 100)]);
 
-        let result = run_merge(&[b1, b2], &schema);
+        let result = merge_to_rows(&[b1, b2], &schema);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (10, 0, 3, 100));
     }
@@ -797,7 +860,7 @@ mod tests {
         let b1 = make_batch_i64(&[(10, 1, 100)]);
         let b2 = make_batch_i64(&[(10, -1, 100)]);
 
-        let result = run_merge(&[b1, b2], &schema);
+        let result = merge_to_rows(&[b1, b2], &schema);
         assert_eq!(result.len(), 0);
     }
 
@@ -807,7 +870,7 @@ mod tests {
         let b1 = make_batch_i64(&[(10, 1, 100)]);
         let b2 = make_batch_i64(&[(10, 1, 200)]);
 
-        let result = run_merge(&[b1, b2], &schema);
+        let result = merge_to_rows(&[b1, b2], &schema);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, 10);
         assert_eq!(result[1].0, 10);
@@ -820,7 +883,7 @@ mod tests {
         let b2 = make_batch_i64(&[(20, 1, 200), (50, 1, 500)]);
         let b3 = make_batch_i64(&[(30, 1, 300), (60, 1, 600)]);
 
-        let result = run_merge(&[b1, b2, b3], &schema);
+        let result = merge_to_rows(&[b1, b2, b3], &schema);
         assert_eq!(result.len(), 6);
         let pks: Vec<u64> = result.iter().map(|r| r.0).collect();
         assert_eq!(pks, vec![10, 20, 30, 40, 50, 60]);
@@ -829,7 +892,7 @@ mod tests {
     #[test]
     fn test_empty_batches() {
         let schema = make_schema_i64();
-        let result = run_merge(&[], &schema);
+        let result = merge_to_rows(&[], &schema);
         assert_eq!(result.len(), 0);
     }
 
@@ -839,7 +902,7 @@ mod tests {
         let empty = empty_batch_i64();
         let b = make_batch_i64(&[(10, 1, 100)]);
 
-        let result = run_merge(&[empty, b], &schema);
+        let result = merge_to_rows(&[empty, b], &schema);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (10, 0, 1, 100));
     }
@@ -853,7 +916,7 @@ mod tests {
         let b2 = make_batch_i64(&[(10, -1, 100)]);
         // Insert PK=30 w=+1
         let b3 = make_batch_i64(&[(30, 1, 300)]);
-        let result = run_merge(&[b1, b2, b3], &schema);
+        let result = merge_to_rows(&[b1, b2, b3], &schema);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (20, 0, 1, 200));
         assert_eq!(result[1], (30, 0, 1, 300));
@@ -865,7 +928,7 @@ mod tests {
         let b1 = make_batch_i64(&[(10, 1, 100)]);
         let b2 = make_batch_i64(&[((1u128 << 64) | 10, 1, 200)]);
 
-        let result = run_merge(&[b1, b2], &schema);
+        let result = merge_to_rows(&[b1, b2], &schema);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (10, 0, 1, 100));
         assert_eq!(result[1], (10, 1, 1, 200));
@@ -876,7 +939,7 @@ mod tests {
         let schema = make_schema_i64();
         // 5 separate single-row batches, same (PK, payload) → merged weight = 5
         let batches: Vec<Batch> = (0..5).map(|_| make_batch_i64(&[(42, 1, 999)])).collect();
-        let result = run_merge(&batches, &schema);
+        let result = merge_to_rows(&batches, &schema);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (42, 0, 5, 999));
     }
@@ -886,7 +949,7 @@ mod tests {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[(10, 0, 100), (20, 1, 200)]);
 
-        let result = run_merge(&[b], &schema);
+        let result = merge_to_rows(&[b], &schema);
         // Zero-weight rows just pass through the merge (they don't get consolidated out
         // unless they cancel with another row). A single zero-weight row is still zero.
         // Actually: our merge always outputs pending_weight != 0 check, so zero-weight
@@ -911,7 +974,7 @@ mod tests {
             rows.sort_by_key(|r| r.0);
             batches.push(make_batch_i64(&rows));
         }
-        let result = run_merge(&batches, &schema);
+        let result = merge_to_rows(&batches, &schema);
         assert_eq!(result.len(), 100);
         for (i, row) in result.iter().enumerate() {
             assert_eq!(row.0, i as u64);
@@ -924,7 +987,7 @@ mod tests {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[(10, 1, 100), (10, 1, 100), (20, 1, 200)]);
 
-        let result = run_merge(&[b], &schema);
+        let result = merge_to_rows(&[b], &schema);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (10, 0, 2, 100));
         assert_eq!(result[1], (20, 0, 1, 200));
@@ -936,7 +999,7 @@ mod tests {
         let schema = make_schema_i64();
         let b = make_batch_i64(&[(10, 1, 100), (10, 1, 200), (20, 1, 300)]);
 
-        let result = run_merge(&[b], &schema);
+        let result = merge_to_rows(&[b], &schema);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], (10, 0, 1, 100));
         assert_eq!(result[1], (10, 0, 1, 200));
@@ -1261,7 +1324,7 @@ mod tests {
             .iter()
             .map(|&idx| make_batch_bytes(&schema, &[(opk(vals[idx]), 1, idx as i64)]))
             .collect();
-        let m = run_merge(&batches, &schema);
+        let m = merge_to_rows(&batches, &schema);
         assert_eq!(m.len(), n, "tc={pk_tc} merge len");
         assert_eq!(
             m.iter().map(|r| r.3).collect::<Vec<_>>(),
@@ -1315,7 +1378,7 @@ mod tests {
                 .iter()
                 .map(|&idx| make_batch_bytes(&schema, &[(le(idx), 1, idx as i64)]))
                 .collect();
-            let m = run_merge(&batches, &schema);
+            let m = merge_to_rows(&batches, &schema);
             assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), expect, "tc={tc} merge");
             for (i, r) in m.iter().enumerate() {
                 assert_eq!(packed(r), vals[i], "tc={tc} pk decode row {i}");
@@ -1367,14 +1430,14 @@ mod tests {
         let b1 = make_batch_bytes(&schema, &[(mkpk(1, 256), 1, 10), (mkpk(256, 1), 1, 30)]);
         let b2 = make_batch_bytes(&schema, &[(mkpk(1, 257), 1, 20)]);
         let b3 = make_batch_bytes(&schema, &[(mkpk(256, 2), 1, 40)]);
-        let m = run_merge(&[b1, b2, b3], &schema);
+        let m = merge_to_rows(&[b1, b2, b3], &schema);
         assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), vec![10, 20, 30, 40]);
 
         // Same (PK, payload) across cursors consolidate; net-zero dropped.
         let d1 = make_batch_bytes(&schema, &[(mkpk(5, 7), 1, 99)]);
         let d2 = make_batch_bytes(&schema, &[(mkpk(5, 7), 2, 99)]);
         let d3 = make_batch_bytes(&schema, &[(mkpk(5, 7), -3, 99)]);
-        assert_eq!(run_merge(&[d1, d2, d3], &schema).len(), 0);
+        assert_eq!(merge_to_rows(&[d1, d2, d3], &schema).len(), 0);
 
         // Same PK, different payload → ordered by payload on PK tie.
         let e = run_consolidate(
@@ -1491,7 +1554,7 @@ mod tests {
             let m1 = make_batch_bytes(&s, &[(pk(1, 0, 5), 1, 0), (pk(1, 0, 6), 1, 1)]);
             let m2 = make_batch_bytes(&s, &[(pk(1, 1, 0), 1, 2)]);
             let m3 = make_batch_bytes(&s, &[(pk(2, 0, 0), 1, 3)]);
-            let m = run_merge(&[m1, m2, m3], &s);
+            let m = merge_to_rows(&[m1, m2, m3], &s);
             assert_eq!(m.iter().map(|r| r.3).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
         }
     }
@@ -1600,7 +1663,7 @@ mod tests {
             .collect()
     }
 
-    fn run_merge_wide(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
+    fn merge_to_rows_wide(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(Vec<u8>, i64, i64)> {
         let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
         let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
         let total: usize = sorted.iter().map(|b| b.count).sum();
@@ -1645,7 +1708,7 @@ mod tests {
             let b1 = make_batch_bytes(&s, &[(a.clone(), 1, 0), (c.clone(), 1, 2)]);
             let b2 = make_batch_bytes(&s, &[(b.clone(), 1, 1), (e.clone(), 1, 4)]);
             let b3 = make_batch_bytes(&s, &[(d.clone(), 1, 3)]);
-            let out = run_merge_wide(&[b1, b2, b3], &s);
+            let out = merge_to_rows_wide(&[b1, b2, b3], &s);
             assert_eq!(
                 out.len(),
                 5,
@@ -1683,7 +1746,7 @@ mod tests {
         let p2 = wpk(tcs, 7, 1);
         let b1 = make_batch_bytes(&s, &[(p1.clone(), 1, 42)]);
         let b2 = make_batch_bytes(&s, &[(p2.clone(), 1, 42)]);
-        let out = run_merge_wide(&[b1, b2], &s);
+        let out = merge_to_rows_wide(&[b1, b2], &s);
         assert_eq!(out.len(), 2, "prefix-colliding distinct PKs must stay separate");
         assert_eq!(out[0], (p1, 1, 42));
         assert_eq!(out[1], (p2, 1, 42));
@@ -1696,7 +1759,7 @@ mod tests {
         let p = wpk(tcs, 5, 5);
 
         // Same PK + same payload across two batches → weights sum.
-        let sum = run_merge_wide(
+        let sum = merge_to_rows_wide(
             &[
                 make_batch_bytes(&s, &[(p.clone(), 1, 9)]),
                 make_batch_bytes(&s, &[(p.clone(), 2, 9)]),
@@ -1706,7 +1769,7 @@ mod tests {
         assert_eq!(sum, vec![(p.clone(), 3, 9)]);
 
         // Net-zero (ghost) dropped.
-        let ghost = run_merge_wide(
+        let ghost = merge_to_rows_wide(
             &[
                 make_batch_bytes(&s, &[(p.clone(), 1, 9)]),
                 make_batch_bytes(&s, &[(p.clone(), -1, 9)]),
@@ -1716,7 +1779,7 @@ mod tests {
         assert_eq!(ghost.len(), 0);
 
         // Same PK, different payload → two rows in payload order.
-        let two = run_merge_wide(
+        let two = merge_to_rows_wide(
             &[
                 make_batch_bytes(&s, &[(p.clone(), 1, 200)]),
                 make_batch_bytes(&s, &[(p.clone(), 1, 100)]),
@@ -1747,7 +1810,7 @@ mod tests {
         let b2 = make_batch_i64(&[(5, 1, 200)]);
         let b3 = make_batch_i64(&[(5, -1, 100)]);
 
-        let result = run_merge(&[b1, b2, b3], &schema);
+        let result = merge_to_rows(&[b1, b2, b3], &schema);
         assert_eq!(
             result.len(),
             1,
@@ -1820,7 +1883,7 @@ mod tests {
             (k2.clone(), 1, 30),
             (k2.clone(), -1, 30),
         ];
-        let via_merge = run_merge_wide(&[make_batch_bytes(&s, &sorted_rows)], &s);
+        let via_merge = merge_to_rows_wide(&[make_batch_bytes(&s, &sorted_rows)], &s);
         assert_eq!(via_merge, out);
     }
 

@@ -323,6 +323,14 @@ impl MappedShard {
 
 impl super::super::columnar::ColumnarSource for MappedShard {
     #[inline]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        MappedShard::get_pk_bytes(self, row)
+    }
+    #[inline]
+    fn get_weight(&self, row: usize) -> i64 {
+        MappedShard::get_weight(self, row)
+    }
+    #[inline]
     fn get_null_word(&self, row: usize) -> u64 {
         self.get_null_word(row)
     }
@@ -333,5 +341,16 @@ impl super::super::columnar::ColumnarSource for MappedShard {
     #[inline]
     fn blob_slice(&self) -> &[u8] {
         self.blob_slice()
+    }
+}
+
+impl super::super::merge::MergeSource for MappedShard {
+    #[inline]
+    fn row_count(&self) -> usize {
+        self.count
+    }
+    #[inline]
+    fn next_non_ghost(&self, pos: usize) -> usize {
+        MappedShard::next_non_ghost(self, pos)
     }
 }

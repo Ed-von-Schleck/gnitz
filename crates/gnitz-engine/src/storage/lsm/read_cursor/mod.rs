@@ -779,7 +779,7 @@ impl ReadCursor {
     }
 
     /// Shared N-way merge driver body for the `Multi` drives. Mirrors storage's
-    /// `merge_batches_inner`: the caller selects `less` / `same_pk` / `eq_payload`
+    /// `run_merge`: the caller selects `less` / `same_pk` / `eq_payload`
     /// (per stride and payload), and monomorphization compiles each combination to
     /// its own branch-free copy of the (selector-independent) advance/weight/emit
     /// hot loop. Returns the emitted group as `(weight, source_idx, row)`, or

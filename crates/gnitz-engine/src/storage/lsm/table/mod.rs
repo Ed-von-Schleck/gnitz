@@ -151,6 +151,18 @@ pub(crate) enum FoundRow<'a> {
 }
 
 impl columnar::ColumnarSource for FoundRow<'_> {
+    fn get_pk_bytes(&self, _row: usize) -> &[u8] {
+        match *self {
+            FoundRow::Mem(b, r) => columnar::ColumnarSource::get_pk_bytes(b, r),
+            FoundRow::Shard(s, r) => columnar::ColumnarSource::get_pk_bytes(s, r),
+        }
+    }
+    fn get_weight(&self, _row: usize) -> i64 {
+        match *self {
+            FoundRow::Mem(b, r) => columnar::ColumnarSource::get_weight(b, r),
+            FoundRow::Shard(s, r) => columnar::ColumnarSource::get_weight(s, r),
+        }
+    }
     fn get_null_word(&self, _row: usize) -> u64 {
         match *self {
             FoundRow::Mem(b, r) => columnar::ColumnarSource::get_null_word(b, r),

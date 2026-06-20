@@ -20,6 +20,10 @@ use crate::schema::{
 // ---------------------------------------------------------------------------
 
 pub(crate) trait ColumnarSource {
+    /// The row's packed OPK PK-region bytes (`pk_stride` wide, region[0]).
+    fn get_pk_bytes(&self, row: usize) -> &[u8];
+    /// The row's signed Z-set weight / multiplicity (region[1]).
+    fn get_weight(&self, row: usize) -> i64;
     fn get_null_word(&self, row: usize) -> u64;
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8];
     fn blob_slice(&self) -> &[u8];
@@ -400,6 +404,13 @@ mod tests {
     }
 
     impl ColumnarSource for TestBatch {
+        // TestBatch models payload-only comparison; PK/weight are never read through it.
+        fn get_pk_bytes(&self, _row: usize) -> &[u8] {
+            &[]
+        }
+        fn get_weight(&self, _row: usize) -> i64 {
+            1
+        }
         fn get_null_word(&self, row: usize) -> u64 {
             read_u64_le(&self.null_bmp, row * 8)
         }

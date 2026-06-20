@@ -198,6 +198,14 @@ impl CursorSource {
 
 impl ColumnarSource for CursorSource {
     #[inline]
+    fn get_pk_bytes(&self, row: usize) -> &[u8] {
+        CursorSource::get_pk_bytes(self, row)
+    }
+    #[inline]
+    fn get_weight(&self, row: usize) -> i64 {
+        CursorSource::get_weight(self, row)
+    }
+    #[inline]
     fn get_null_word(&self, row: usize) -> u64 {
         CursorSource::get_null_word(self, row)
     }
