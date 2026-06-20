@@ -102,12 +102,9 @@ impl PkUniqueChecker {
 // Per-region encoding detection (internal to build_shard_image)
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 enum RegionEncoding {
     Raw,
-    Constant {
-        value: [u8; 16],
-    },
+    Constant,
     TwoValue {
         value_a: i64,
         value_b: i64,
@@ -132,9 +129,7 @@ fn detect_encoding(data: &[u8], element_width: usize) -> RegionEncoding {
             return RegionEncoding::Raw;
         }
     }
-    let mut value = [0u8; 16];
-    value[..element_width].copy_from_slice(first);
-    RegionEncoding::Constant { value }
+    RegionEncoding::Constant
 }
 
 /// Detect weight encoding: constant, two-value (bitvec), or raw.
@@ -159,11 +154,7 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
     }
 
     match second {
-        None => {
-            let mut value = [0u8; 16];
-            value[..8].copy_from_slice(&first.to_le_bytes());
-            RegionEncoding::Constant { value }
-        }
+        None => RegionEncoding::Constant,
         Some(second_val) => {
             // Pass 2: exactly 2 distinct values — build the bitvec now.
             let bitvec_len = n.div_ceil(8);
@@ -235,7 +226,7 @@ pub(crate) fn build_shard_image(table_id: u32, row_count: u32, regions: &[(*cons
             };
             let actual = match &enc {
                 RegionEncoding::Raw => orig_sz,
-                RegionEncoding::Constant { .. } => elem_width,
+                RegionEncoding::Constant => elem_width,
                 RegionEncoding::TwoValue { bitvec, .. } => 16 + bitvec.len(),
             };
             encodings.push(enc);
@@ -293,7 +284,7 @@ pub(crate) fn build_shard_image(table_id: u32, row_count: u32, regions: &[(*cons
                     }
                 }
             }
-            RegionEncoding::Constant { .. } => {
+            RegionEncoding::Constant => {
                 // Copy first elem_width bytes from source
                 let elem_width = actual_sizes[i];
                 unsafe {
@@ -326,7 +317,7 @@ pub(crate) fn build_shard_image(table_id: u32, row_count: u32, regions: &[(*cons
         write_u64_le(&mut image, d + 16, cs);
         let encoding_byte = match &encodings[i] {
             RegionEncoding::Raw => ENCODING_RAW,
-            RegionEncoding::Constant { .. } => ENCODING_CONSTANT,
+            RegionEncoding::Constant => ENCODING_CONSTANT,
             RegionEncoding::TwoValue { .. } => ENCODING_TWO_VALUE,
         };
         image[d + 24] = encoding_byte;
@@ -469,7 +460,7 @@ fn write_shard_streaming_inner(
             };
             let actual = match &enc {
                 RegionEncoding::Raw => orig_sz,
-                RegionEncoding::Constant { .. } => elem_width,
+                RegionEncoding::Constant => elem_width,
                 RegionEncoding::TwoValue { bitvec, .. } => 16 + bitvec.len(),
             };
             encodings.push(enc);
@@ -528,7 +519,7 @@ fn write_shard_streaming_inner(
                     0
                 }
             }
-            RegionEncoding::Constant { .. } => {
+            RegionEncoding::Constant => {
                 let elem_width = actual_sizes[i];
                 xxh::checksum(unsafe { std::slice::from_raw_parts(src_ptr, elem_width) })
             }
@@ -553,7 +544,7 @@ fn write_shard_streaming_inner(
         write_u64_le(&mut hdr_buf, d + 16, cs);
         let encoding_byte = match &encodings[i] {
             RegionEncoding::Raw => ENCODING_RAW,
-            RegionEncoding::Constant { .. } => ENCODING_CONSTANT,
+            RegionEncoding::Constant => ENCODING_CONSTANT,
             RegionEncoding::TwoValue { .. } => ENCODING_TWO_VALUE,
         };
         hdr_buf[d + 24] = encoding_byte;
@@ -604,7 +595,7 @@ fn write_shard_streaming_inner(
                         pwrite_all(fd, src, r_off).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
                     }
                 }
-                RegionEncoding::Constant { .. } => {
+                RegionEncoding::Constant => {
                     let elem_width = actual_sizes[i];
                     let src = std::slice::from_raw_parts(src_ptr, elem_width);
                     pwrite_all(fd, src, r_off).map_err(|_| abort(fd, tmp_name.as_ptr()))?;

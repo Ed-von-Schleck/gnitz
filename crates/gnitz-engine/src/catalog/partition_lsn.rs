@@ -39,7 +39,7 @@ impl CatalogEngine {
     /// Trim worker partitions to assigned range. System tables hold Borrowed
     /// (non-partitioned) handles, so the filter is the handle.
     ///
-    /// **Single-partition stores are exempt.** A `num_partitions == 1` store
+    /// **Single-partition stores are exempt.** A `Routing::Replicated` store
     /// (a replicated base table's full copy, or a replicated-derived view's local
     /// slice) holds its whole local dataset at partition 0, built across the fork
     /// at `[0, 1)`. A worker whose range excludes 0 (every worker but worker 0)
@@ -50,7 +50,7 @@ impl CatalogEngine {
     pub fn trim_worker_partitions(&mut self, start: u32, end: u32) {
         for entry in self.dag.tables.values() {
             if let Some(ptable) = entry.handle.as_partitioned_mut() {
-                if ptable.num_partitions() == 1 {
+                if ptable.is_replicated() {
                     continue;
                 }
                 ptable.close_partitions_outside(start, end);
@@ -84,7 +84,7 @@ impl CatalogEngine {
             .filter(|(_, e)| {
                 e.handle
                     .as_partitioned_mut()
-                    .map(|p| p.num_partitions() == 1)
+                    .map(|p| p.is_replicated())
                     .unwrap_or(false)
             })
             .map(|(&tid, _)| tid)
@@ -96,11 +96,10 @@ impl CatalogEngine {
                 "",
                 entry.schema,
                 tid as u32,
-                1,
+                Routing::Replicated,
                 entry.kind.persistence(),
                 part_start,
                 part_start + 1,
-                crate::storage::partition_arena_size(1),
             )
             .map_err(|e| format!("rehome single-partition store tid={tid}: {e:?}"))?;
             entry.handle = StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt)));

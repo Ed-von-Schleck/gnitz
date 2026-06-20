@@ -1,5 +1,5 @@
 //! Hot per-row accessors for [`MappedShard`]: the self-describing
-//! [`RegionView`] reads (`get_pk_bytes`, `get_weight`, `get_null_word`,
+//! [`ScalarRegion`] / [`WeightRegion`] reads (`get_pk_bytes`, `get_weight`, `get_null_word`,
 //! `get_col_ptr`, …), the XOR8 probe, the OPK binary-search helpers, and the
 //! bulk `*_owned_batch` materializers. All `#[inline]`; the comparators read
 //! every stride/offset straight off the mapped regions.
@@ -7,7 +7,7 @@
 use std::ptr;
 
 use super::super::xor8;
-use super::{MappedShard, RegionView};
+use super::{MappedShard, ScalarRegion, WeightRegion};
 use crate::foundation::codec::{read_i64_le, read_u64_le};
 
 impl MappedShard {
@@ -24,15 +24,14 @@ impl MappedShard {
         let stride = self.pk_stride as usize;
         let data = self.data();
         match &self.pk {
-            RegionView::Raw { offset, .. } => {
+            ScalarRegion::Raw { offset, .. } => {
                 let src = &data[offset + row * stride..offset + row * stride + stride];
                 gnitz_wire::widen_pk_be(src, stride)
             }
             // The Constant region stores the OPK bytes left-aligned at
             // `value[..stride]`. `widen_pk_be` right-aligns the active bytes,
             // recovering the native unsigned value (sign-flipped for signed).
-            RegionView::Constant { value, .. } => gnitz_wire::widen_pk_be(&value[..stride], stride),
-            RegionView::TwoValue { .. } => unreachable!(),
+            ScalarRegion::Constant { value, .. } => gnitz_wire::widen_pk_be(&value[..stride], stride),
         }
     }
 
@@ -41,21 +40,20 @@ impl MappedShard {
         let stride = self.pk_stride as usize;
         let data = self.data();
         match &self.pk {
-            RegionView::Raw { offset, .. } => &data[offset + row * stride..offset + row * stride + stride],
+            ScalarRegion::Raw { offset, .. } => &data[offset + row * stride..offset + row * stride + stride],
             // value is [u8; 16]; stride <= 16 is guaranteed by the constructor.
-            // When RegionView::Constant is widened to hold larger values,
+            // When ScalarRegion::Constant is widened to hold larger values,
             // this arm must be updated alongside it.
-            RegionView::Constant { value, .. } => &value[..stride],
-            RegionView::TwoValue { .. } => unreachable!(),
+            ScalarRegion::Constant { value, .. } => &value[..stride],
         }
     }
 
     #[inline]
     pub fn get_weight(&self, row: usize) -> i64 {
         match &self.weight {
-            RegionView::Raw { offset, .. } => read_i64_le(self.data(), offset + row * 8),
-            RegionView::Constant { value, .. } => i64::from_le_bytes(value[..8].try_into().unwrap()),
-            RegionView::TwoValue {
+            WeightRegion::Raw { offset, .. } => read_i64_le(self.data(), offset + row * 8),
+            WeightRegion::Constant { value } => i64::from_le_bytes(value[..8].try_into().unwrap()),
+            WeightRegion::TwoValue {
                 value_a,
                 value_b,
                 bitvec_off,
@@ -87,16 +85,15 @@ impl MappedShard {
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
         match &self.null_bmp {
-            RegionView::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
-            RegionView::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
-            RegionView::TwoValue { .. } => unreachable!(),
+            ScalarRegion::Raw { offset, .. } => read_u64_le(self.data(), offset + row * 8),
+            ScalarRegion::Constant { value, .. } => u64::from_le_bytes(value[..8].try_into().unwrap()),
         }
     }
 
     #[inline]
     pub fn get_col_ptr(&self, row: usize, payload_col_idx: usize, col_size: usize) -> &[u8] {
         match &self.col_regions[payload_col_idx] {
-            RegionView::Raw { offset, size } => {
+            ScalarRegion::Raw { offset, size } => {
                 let start = offset + row * col_size;
                 assert!(
                     start + col_size <= offset + size,
@@ -108,8 +105,7 @@ impl MappedShard {
                 );
                 &self.data()[start..start + col_size]
             }
-            RegionView::Constant { value, .. } => &value[..col_size],
-            RegionView::TwoValue { .. } => unreachable!(),
+            ScalarRegion::Constant { value, .. } => &value[..col_size],
         }
     }
 
@@ -126,7 +122,7 @@ impl MappedShard {
         if payload_idx == usize::MAX {
             // PK column (pk_stride bytes)
             match &self.pk {
-                RegionView::Raw { offset, .. } => {
+                ScalarRegion::Raw { offset, .. } => {
                     let stride = self.pk_stride as usize;
                     let off = offset + row * stride;
                     if off + stride > self.mmap.len {
@@ -134,25 +130,23 @@ impl MappedShard {
                     }
                     return unsafe { base.add(off) };
                 }
-                RegionView::Constant { offset, .. } => {
+                ScalarRegion::Constant { offset, .. } => {
                     return unsafe { base.add(*offset) };
                 }
-                RegionView::TwoValue { .. } => unreachable!(),
             }
         }
         if payload_idx >= self.col_regions.len() {
             return ptr::null();
         }
         match &self.col_regions[payload_idx] {
-            RegionView::Raw { offset, size } => {
+            ScalarRegion::Raw { offset, size } => {
                 let off = offset + row * col_size;
                 if off + col_size > offset + size {
                     return ptr::null();
                 }
                 unsafe { base.add(off) }
             }
-            RegionView::Constant { offset, .. } => unsafe { base.add(*offset) },
-            RegionView::TwoValue { .. } => unreachable!(),
+            ScalarRegion::Constant { offset, .. } => unsafe { base.add(*offset) },
         }
     }
 
@@ -251,18 +245,26 @@ impl MappedShard {
         data.reserve(total_size);
         unsafe { data.set_len(total_size) };
 
-        // Write each region directly into its final slice — no intermediate buffers.
-        let expand_into = |region: &RegionView, stride: usize, dst: &mut [u8]| match region {
-            RegionView::Raw { offset, .. } => {
-                let begin = offset + start * stride;
-                dst.copy_from_slice(&shard[begin..begin + row_count * stride]);
+        // Write each region directly into its final slice — no intermediate
+        // buffers. The Raw/Constant fill is shared by both expanders; only the
+        // weight region can carry the TwoValue bitvec form.
+        let copy_raw = |offset: usize, stride: usize, dst: &mut [u8]| {
+            let begin = offset + start * stride;
+            dst.copy_from_slice(&shard[begin..begin + row_count * stride]);
+        };
+        let fill_const = |value: &[u8; 16], stride: usize, dst: &mut [u8]| {
+            for chunk in dst.chunks_exact_mut(stride) {
+                chunk.copy_from_slice(&value[..stride]);
             }
-            RegionView::Constant { value, .. } => {
-                for chunk in dst.chunks_exact_mut(stride) {
-                    chunk.copy_from_slice(&value[..stride]);
-                }
-            }
-            RegionView::TwoValue {
+        };
+        let expand_scalar = |region: &ScalarRegion, stride: usize, dst: &mut [u8]| match region {
+            ScalarRegion::Raw { offset, .. } => copy_raw(*offset, stride, dst),
+            ScalarRegion::Constant { value, .. } => fill_const(value, stride, dst),
+        };
+        let expand_weight = |region: &WeightRegion, dst: &mut [u8]| match region {
+            WeightRegion::Raw { offset, .. } => copy_raw(*offset, 8, dst),
+            WeightRegion::Constant { value } => fill_const(value, 8, dst),
+            WeightRegion::TwoValue {
                 value_a,
                 value_b,
                 bitvec_off,
@@ -272,27 +274,23 @@ impl MappedShard {
                 for i in 0..row_count {
                     let row = start + i;
                     let bit = (shard[bitvec_off + row / 8] >> (row % 8)) & 1;
-                    let src = if bit == 0 {
-                        &a_bytes[..stride]
-                    } else {
-                        &b_bytes[..stride]
-                    };
-                    dst[i * stride..(i + 1) * stride].copy_from_slice(src);
+                    let src = if bit == 0 { &a_bytes[..] } else { &b_bytes[..] };
+                    dst[i * 8..(i + 1) * 8].copy_from_slice(src);
                 }
             }
         };
 
         let pk_stride = self.pk_stride as usize;
         let sz8 = row_count * 8;
-        expand_into(&self.pk, pk_stride, &mut data[offsets[0]..][..row_count * pk_stride]);
-        expand_into(&self.weight, 8, &mut data[offsets[1]..][..sz8]);
-        expand_into(&self.null_bmp, 8, &mut data[offsets[2]..][..sz8]);
+        expand_scalar(&self.pk, pk_stride, &mut data[offsets[0]..][..row_count * pk_stride]);
+        expand_weight(&self.weight, &mut data[offsets[1]..][..sz8]);
+        expand_scalar(&self.null_bmp, 8, &mut data[offsets[2]..][..sz8]);
 
         for (pi, _ci, col) in schema.payload_columns() {
             let stride = col.size() as usize;
             let off = offsets[3 + pi];
             let sz = row_count * stride;
-            expand_into(&self.col_regions[pi], stride, &mut data[off..][..sz]);
+            expand_scalar(&self.col_regions[pi], stride, &mut data[off..][..sz]);
         }
 
         // Blob: one allocation, copy entire blob region (string offsets stay valid).

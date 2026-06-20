@@ -1,8 +1,7 @@
 //! Wire protocol: IPC message codec, schema conversion, encode/decode.
 
-use crate::foundation::codec::align8;
 use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, MemBatch};
+use crate::storage::{wal_block_size, Batch, MemBatch, MAX_WIRE_REGIONS};
 
 // ---------------------------------------------------------------------------
 // Constants re-exported from gnitz_wire
@@ -60,24 +59,15 @@ pub(crate) const CONTROL_SCHEMA_DESC: SchemaDescriptor = {
 };
 
 // ---------------------------------------------------------------------------
-// Private WAL-sizing helpers (replaces wal::block_size / schema_wal_block_size)
+// WAL block sizing (block framing arithmetic is single-homed in `wal::block_size`)
 // ---------------------------------------------------------------------------
-
-fn wal_block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
-    let mut pos = gnitz_wire::WAL_HEADER_SIZE + num_regions * 8;
-    for &sz in region_sizes.iter().take(num_regions) {
-        pos = align8(pos);
-        pos += sz as usize;
-    }
-    pos
-}
 
 fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size: usize) -> usize {
     let pk_stride = schema.pk_stride() as usize;
     let num_payload = schema.num_payload_cols();
     // V4 wire format: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + payload + blob
     let num_regions = 3 + num_payload + 1;
-    let mut sizes = [0u32; 128];
+    let mut sizes = [0u32; MAX_WIRE_REGIONS];
     sizes[0] = (pk_stride * row_count) as u32; // pk: pk_stride bytes per row
     sizes[1] = (8 * row_count) as u32; // weight
     sizes[2] = (8 * row_count) as u32; // null_bmp
@@ -85,7 +75,7 @@ fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size:
         sizes[3 + pi] = (col.size() as usize * row_count) as u32;
     }
     sizes[3 + num_payload] = blob_size as u32;
-    wal_block_size(num_regions, &sizes[..num_regions])
+    wal_block_size(&sizes[..num_regions])
 }
 
 // ---------------------------------------------------------------------------

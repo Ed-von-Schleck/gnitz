@@ -1,5 +1,6 @@
 use std::ptr;
 
+use super::batch::MAX_WIRE_REGIONS;
 use super::error::StorageError;
 use crate::foundation::codec::{read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use crate::foundation::xxh;
@@ -30,11 +31,12 @@ const OFF_BLOB_SIZE: usize = 40;
 use crate::foundation::codec::align8;
 
 /// Compute the total byte size of a WAL block with the given regions.
-pub(crate) fn block_size(num_regions: usize, region_sizes: &[u32]) -> usize {
-    let mut pos = HEADER_SIZE + num_regions * 8;
-    for sz in region_sizes.iter().take(num_regions) {
+/// The region count is `region_sizes.len()` — no separate count param.
+pub(crate) fn block_size(region_sizes: &[u32]) -> usize {
+    let mut pos = HEADER_SIZE + region_sizes.len() * 8;
+    for &sz in region_sizes {
         pos = align8(pos);
-        pos += *sz as usize;
+        pos += sz as usize;
     }
     pos
 }
@@ -64,9 +66,10 @@ pub fn encode(
     blob_size: u64,
     checksum: bool,
 ) -> Result<usize, StorageError> {
-    let num_regions = region_ptrs.len().min(region_sizes.len());
+    debug_assert_eq!(region_ptrs.len(), region_sizes.len());
+    let num_regions = region_sizes.len();
     let dir_size = num_regions * 8;
-    let total_size = block_size(num_regions, region_sizes);
+    let total_size = block_size(region_sizes);
 
     if out_offset + total_size > out_buf.len() {
         return Err(StorageError::BufferTooSmall);
@@ -76,12 +79,13 @@ pub fn encode(
     block[..HEADER_SIZE].fill(0);
 
     // Phase 1: compute per-region start positions and write directory.
-    // 72 slots — larger than the maximum 69 (68 payload columns + pk/weight/null_bmp + blob).
+    // Sized to MAX_WIRE_REGIONS (= MAX_BATCH_REGIONS + 1) — the max region count
+    // including the trailing blob region (pk/weight/null_bmp + payload + blob).
     debug_assert!(
-        num_regions <= 72,
+        num_regions <= MAX_WIRE_REGIONS,
         "num_regions={num_regions} exceeds positions array capacity"
     );
-    let mut positions = [0usize; 72];
+    let mut positions = [0usize; MAX_WIRE_REGIONS];
     let mut pos = HEADER_SIZE + dir_size;
     for i in 0..num_regions {
         let aligned = align8(pos);

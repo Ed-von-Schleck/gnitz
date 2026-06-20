@@ -22,7 +22,7 @@ use gnitz_wire::is_german_string;
 // ---------------------------------------------------------------------------
 // ColPtr / UnifiedSource: type-erased column accessors that work uniformly
 // for in-memory `MemBatch` regions (always Raw, base = data + offset) and
-// shard `RegionView::{Raw, Constant}` regions (Raw via mmap offset, Constant
+// shard `ScalarRegion::{Raw, Constant}` regions (Raw via mmap offset, Constant
 // via inline `value` buffer with stride 0). Stride 0 makes
 // `base.add(ri * stride) == base` for every row, so a Constant region reads
 // the same bytes for every output row without any branch in the hot loop.

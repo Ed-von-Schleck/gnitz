@@ -11,7 +11,7 @@ use std::rc::Rc;
 use super::batch::Batch;
 use super::columnar::{self, PkOrd};
 use super::heap::{drive_merge, HeapNode, LoserTree};
-use super::merge::{pack_pk_be, UnifiedSource};
+use super::merge::UnifiedSource;
 use super::shard_reader::MappedShard;
 use super::{with_payload_cmp, with_pk_ord};
 use crate::schema::SchemaDescriptor;
@@ -120,10 +120,10 @@ pub struct ReadCursor {
     is_pk_unique: bool,
     // Current row state
     pub valid: bool,
-    /// The current row's PK as a u128: the full PK for `pk_stride ≤ 16`, the
-    /// low-16 LE prefix for wide PKs (non-authoritative — wide consumers must
-    /// read `current_pk_bytes()` and compare via `compare_pk_bytes`).
-    pub current_key: u128,
+    /// The current row's PK as a native `u128`, populated only for narrow PKs
+    /// (`pk_stride ≤ 16`); `None` for wide PKs, whose consumers read
+    /// `current_pk_bytes()` and compare via `compare_pk_bytes`.
+    pub current_key: Option<u128>,
     pub current_weight: i64,
     pub current_null_word: u64,
     current_entry_idx: usize,
@@ -239,7 +239,7 @@ impl ReadCursor {
             schema,
             is_pk_unique,
             valid: false,
-            current_key: 0,
+            current_key: None,
             current_weight: 0,
             current_null_word: 0,
             current_entry_idx: 0,
@@ -453,6 +453,14 @@ impl ReadCursor {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }
 
+    /// The current row's PK as a native value. Only narrow (`pk_stride ≤ 16`)
+    /// relations populate `current_key`; panics on a wide-PK cursor (whose
+    /// consumers must read `current_pk_bytes()` instead).
+    #[inline]
+    pub fn current_key_narrow(&self) -> u128 {
+        self.current_key.expect("narrow PK cursor")
+    }
+
     /// Seek to a group's PK by its OPK `key_bytes` (the bytes from
     /// `get_pk_bytes`/`current_pk_bytes`, already order-preserving at rest).
     /// Correct at every PK width and PK signedness.
@@ -567,16 +575,13 @@ impl ReadCursor {
 
     /// Compute the `current_key` field from a row's OPK bytes. Narrow PKs
     /// (`stride ≤ 16`) recover the native (unsigned) value via right-aligned BE
-    /// — the form catalog readers expect (`current_key as u64`). Wide PKs
-    /// (`stride > 16`) get a non-authoritative left-aligned OPK prefix; wide
-    /// consumers must read `current_pk_bytes()` instead.
+    /// — the form catalog readers expect (`current_key_narrow() as u64`). Wide
+    /// PKs (`stride > 16`) have no scalar key (`None`); their consumers read
+    /// `current_pk_bytes()` instead. `bytes.len()` is the row's `pk_stride`, so
+    /// `≤ 16` is exactly `!pk_is_wide()`.
     #[inline]
-    fn current_key_from_bytes(bytes: &[u8]) -> u128 {
-        if bytes.len() <= 16 {
-            gnitz_wire::widen_pk_be(bytes, bytes.len())
-        } else {
-            pack_pk_be(bytes)
-        }
+    fn current_key_from_bytes(bytes: &[u8]) -> Option<u128> {
+        (bytes.len() <= 16).then(|| gnitz_wire::widen_pk_be(bytes, bytes.len()))
     }
 
     /// Position the cursor at the first row whose PK begins with `prefix` and
@@ -766,8 +771,8 @@ impl ReadCursor {
             let src = &self.sources[0];
             self.valid = true;
             // current_key carries the native value for narrow PKs (the form
-            // catalog readers and op_distinct expect); a non-authoritative OPK
-            // prefix for wide (wide consumers read current_pk_bytes()).
+            // catalog readers and op_distinct expect) and `None` for wide PKs
+            // (wide consumers read current_pk_bytes()).
             self.current_key = Self::current_key_from_bytes(src.get_pk_bytes(pos));
             self.current_weight = src.get_weight(pos);
             self.current_null_word = src.get_null_word(pos);
@@ -1095,8 +1100,8 @@ mod tests {
         let mut rows = Vec::new();
         while cursor.valid {
             rows.push((
-                cursor.current_key as u64,
-                (cursor.current_key >> 64) as u64,
+                cursor.current_key_narrow() as u64,
+                (cursor.current_key_narrow() >> 64) as u64,
                 cursor.current_weight,
             ));
             cursor.advance();
@@ -1160,12 +1165,12 @@ mod tests {
         // Seek to pk >= 5. OPK for a U128 PK is the value's big-endian bytes.
         cursor.seek_bytes(&5u128.to_be_bytes());
         assert!(cursor.valid);
-        assert_eq!(cursor.current_key, 5);
+        assert_eq!(cursor.current_key_narrow(), 5);
 
         // Seek to pk >= 7 → lands on 10
         cursor.seek_bytes(&7u128.to_be_bytes());
         assert!(cursor.valid);
-        assert_eq!(cursor.current_key, 10);
+        assert_eq!(cursor.current_key_narrow(), 10);
 
         // Seek past end
         cursor.seek_bytes(&100u128.to_be_bytes());
@@ -1299,7 +1304,7 @@ mod tests {
             let p = cursor.col_ptr(1, 8);
             assert!(!p.is_null(), "payload col_ptr null for a valid cursor row");
             let val = i64::from_le_bytes(unsafe { std::slice::from_raw_parts(p, 8) }.try_into().unwrap());
-            rows.push((cursor.current_key as u64, cursor.current_weight, val));
+            rows.push((cursor.current_key_narrow() as u64, cursor.current_weight, val));
             cursor.advance();
         }
         rows
@@ -1449,7 +1454,7 @@ mod tests {
         let batch = make_batch(&[(expected, 1, 0)]);
         let cursor = create_read_cursor(&[batch], &[], schema);
         assert!(cursor.valid);
-        assert_eq!(cursor.current_key, expected);
+        assert_eq!(cursor.current_key_narrow(), expected);
     }
 
     /// Cursor backed by a shard whose PK region is Constant-encoded (single-row
@@ -1508,7 +1513,7 @@ mod tests {
             match expected {
                 Some(k) => {
                     assert!(c.valid, "key={key} should land on {k}");
-                    assert_eq!(c.current_key, k, "key={key}");
+                    assert_eq!(c.current_key_narrow(), k, "key={key}");
                     // current_pk_bytes is OPK (BE) of the native value.
                     assert_eq!(c.current_pk_bytes(), &k.to_be_bytes()[..], "key={key}");
                 }
@@ -1600,7 +1605,11 @@ mod tests {
         let mut adv = create_read_cursor(&[Rc::clone(&b_a), Rc::clone(&b_b)], &[], schema);
         adv.advance_to(&(150u128).to_be_bytes());
         assert!(adv.valid, "must land on a live row past the ghost");
-        assert_eq!(adv.current_key, 400, "ghost 200 must be folded; first live row is 400");
+        assert_eq!(
+            adv.current_key_narrow(),
+            400,
+            "ghost 200 must be folded; first live row is 400"
+        );
         assert_eq!(adv.current_weight, 1, "landed row's net weight");
         // The same landing also matches the from-scratch oracle.
         assert_advance_to_matches_seek_oracle(schema, &[b_a, b_b], &[150]);
@@ -1685,8 +1694,8 @@ mod tests {
         // BE reading places col_A in the high 64 bits and col_B in the low.
         let mut emitted = Vec::new();
         while cursor.valid {
-            let a = (cursor.current_key >> 64) as u64;
-            let b = cursor.current_key as u64;
+            let a = (cursor.current_key_narrow() >> 64) as u64;
+            let b = cursor.current_key_narrow() as u64;
             emitted.push((a, b));
             cursor.advance();
         }
@@ -2014,13 +2023,13 @@ mod tests {
 
         let mut seen: Vec<(u64, i64)> = Vec::new();
         c.for_each_pk_group_row(&5u128.to_be_bytes(), |cur| {
-            seen.push((cur.current_key as u64, cur.current_weight));
+            seen.push((cur.current_key_narrow() as u64, cur.current_weight));
         });
         // Two sub-groups at PK=5: payload 100 @ +1, payload 200 @ +3 (payload-sorted).
         assert_eq!(seen, vec![(5, 1), (5, 3)]);
         // Exit: positioned at PK=10, fully committed.
         assert!(c.valid);
-        assert_eq!(c.current_key, 10);
+        assert_eq!(c.current_key_narrow(), 10);
         assert_eq!(c.current_weight, 1);
     }
 

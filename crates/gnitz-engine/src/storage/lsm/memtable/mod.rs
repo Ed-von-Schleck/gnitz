@@ -27,10 +27,8 @@ pub struct MemTable {
     max_bytes: usize,
     total_row_count: usize,
     runs_bytes: usize,
-    // Last lookup result (set by lookup_pk, read by found_* accessors)
-    found_run: usize,
-    found_row: usize,
-    has_found: bool,
+    // Last lookup result (set by lookup_pk, read by found_entry); None = unarmed.
+    found: Option<(usize, usize)>,
     // Reused (run, row, weight) scratch for `find_positive_payload_row_bytes`;
     // cleared per call and kept across calls so that path never allocates.
     cand_scratch: Vec<(usize, usize, i64)>,
@@ -46,9 +44,7 @@ impl MemTable {
             max_bytes,
             total_row_count: 0,
             runs_bytes: 0,
-            found_run: 0,
-            found_row: 0,
-            has_found: false,
+            found: None,
             cand_scratch: Vec::new(),
         }
     }
@@ -57,11 +53,12 @@ impl MemTable {
     /// retract probe, as `(run, row)`, or `None` when nothing is armed. The
     /// `Table` layer wraps this in a `FoundRow` `ColumnarSource` view.
     pub(super) fn found_entry(&self) -> Option<(&Batch, usize)> {
-        if self.has_found && self.found_run < self.runs.len() {
-            Some((self.runs[self.found_run].as_ref(), self.found_row))
-        } else {
-            None
-        }
+        self.found.map(|(r, row)| {
+            // The indices address `runs`; every runs-shrinking path clears
+            // `found` to `None`, so a stale index is a bug, not a valid state.
+            debug_assert!(r < self.runs.len(), "found index must address a live run");
+            (self.runs[r].as_ref(), row)
+        })
     }
 }
 
@@ -704,7 +701,7 @@ mod tests {
         // OPK bytes for a U64 PK are the value's big-endian bytes.
         let found = mt.find_positive_payload_row_bytes(&10u64.to_be_bytes());
         assert!(found, "should find a live row");
-        assert!(mt.has_found);
+        assert!(mt.found.is_some());
 
         // The found row should have payload = 200
         let (run, row) = mt.found_entry().expect("a live row was found");
@@ -717,7 +714,7 @@ mod tests {
         // PK with no rows at all → not found
         let found2 = mt.find_positive_payload_row_bytes(&99u64.to_be_bytes());
         assert!(!found2);
-        assert!(!mt.has_found);
+        assert!(mt.found.is_none());
     }
 
     /// PK matches exist but every payload group nets to zero across runs.
@@ -734,7 +731,7 @@ mod tests {
         mt.upsert_sorted_batch(make_batch(&schema, &[(42, -1, 200)])).unwrap();
 
         assert!(!mt.find_positive_payload_row_bytes(&42u64.to_be_bytes()));
-        assert!(!mt.has_found);
+        assert!(mt.found.is_none());
     }
 
     /// One payload for a PK spread across three runs as (+1), (-1), (+1) —
@@ -762,7 +759,7 @@ mod tests {
         let pk10 = 10u64.to_be_bytes();
         let found = mt.find_positive_payload_row_bytes(&pk10);
         assert!(found, "payload 100 nets +1 across the three runs");
-        assert!(mt.has_found);
+        assert!(mt.found.is_some());
 
         // Found row decodes the live payload (100).
         let (run, row) = mt.found_entry().expect("a live row was found");
@@ -771,17 +768,17 @@ mod tests {
 
         // Cross-check: PK 10 has a single payload, so its PK aggregate equals
         // the winning group's net weight (+1). (Call after the found-row reads,
-        // since lookup_pk_bytes also mutates found_run/found_row.)
+        // since lookup_pk_bytes also mutates found.)
         let (w, agg_found, row_count) = mt.lookup_pk_bytes(&pk10);
         assert_eq!(w, 1, "PK aggregate matches the winning group's net (+1)");
         assert!(agg_found);
         assert_eq!(row_count, 3, "three rows across runs match PK 10");
     }
 
-    /// Found-index contract: after a hit, the `found_run`/`found_row` indices
+    /// Found-index contract: after a hit, the `found` (run, row) indices
     /// must address the row of the winning group — even when an *earlier* run
     /// holds a fully-cancelled payload, so the winning group's first member is
-    /// in a later run (found_run != 0). Guards that `found_entry` addresses the
+    /// in a later run (found.0 != 0). Guards that `found_entry` addresses the
     /// live row, not the cancelled one.
     #[test]
     fn test_find_positive_payload_row_found_index_validity() {
@@ -797,9 +794,11 @@ mod tests {
 
         let pk10 = 10u64.to_be_bytes();
         assert!(mt.find_positive_payload_row_bytes(&pk10));
-        assert!(mt.has_found);
-        assert_eq!(mt.found_run, 2, "winning group's first member is in run 2");
-        assert_eq!(mt.found_row, 0);
+        assert_eq!(
+            mt.found,
+            Some((2, 0)),
+            "winning group's first member is in run 2 at row 0"
+        );
 
         // Payload column is non-null in the fixture, so the null word is 0 and
         // the decoded value is the live payload (200), not the cancelled 100.
@@ -827,7 +826,7 @@ mod tests {
 
         let pk10 = 10u64.to_be_bytes();
         assert!(mt.find_positive_payload_row_bytes(&pk10));
-        assert!(mt.has_found);
+        assert!(mt.found.is_some());
 
         // Returned row decodes one of the two positive payloads...
         let (run, row) = mt.found_entry().expect("a live row was found");
@@ -1115,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inline_consolidate_has_found_cleared() {
+    fn test_inline_consolidate_found_cleared() {
         let schema = make_u64_i64_schema();
         let mut mt = MemTable::new(schema, 1 << 20);
 
@@ -1123,16 +1122,16 @@ mod tests {
             let b = make_batch(&schema, &[(i + 1, 1, (i + 1) as i64 * 100)]);
             mt.upsert_sorted_batch(b).unwrap();
         }
-        // lookup_pk_bytes sets has_found
+        // lookup_pk_bytes sets found
         let (w, found, _) = mt.lookup_pk_bytes(&5u64.to_be_bytes());
         assert_eq!(w, 1);
         assert!(found);
-        assert!(mt.has_found);
+        assert!(mt.found.is_some());
 
-        // 16th batch triggers consolidation → has_found cleared
+        // 16th batch triggers consolidation → found cleared
         let b16 = make_batch(&schema, &[(16, 1, 1600)]);
         mt.upsert_sorted_batch(b16).unwrap();
-        assert!(!mt.has_found);
+        assert!(mt.found.is_none());
     }
 
     /// Bug 5: relocate_string_cell must not panic when blob offset is past end.

@@ -35,7 +35,7 @@ impl CatalogEngine {
         let mut defs = Vec::new();
         let mut expected: i64 = 0;
         while cursor.cursor.valid {
-            let pk = cursor.cursor.current_key as u64;
+            let pk = cursor.cursor.current_key_narrow() as u64;
             if pk >= end_pk {
                 break;
             }

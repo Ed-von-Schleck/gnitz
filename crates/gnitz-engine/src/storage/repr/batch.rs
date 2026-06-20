@@ -21,11 +21,20 @@ fn next_blob_id() -> u64 {
 const HUGEPAGE_THRESHOLD: usize = 2 * 1024 * 1024;
 
 /// Maximum regions tracked in the `offsets`/`strides` arrays:
-/// 3 fixed (pk, weight, null_bmp) + up to 63 payload columns
-/// (schema max is 64 total columns, 1 is the PK).  The blob is not in this
-/// array; it lives in `self.blob` and is accounted for separately.
-/// 3 + 63 = 66, rounded up to 68 to keep the array size as a multiple of 4.
+/// 3 fixed (pk, weight, null_bmp) + up to 64 payload columns
+/// (schema max is `MAX_COLUMNS` = 65 total columns, 1 is the PK).  The blob is
+/// not in this array; it lives in `self.blob` and is accounted for separately.
+/// 3 + 64 = 67, rounded up to 68 to keep the array size as a multiple of 4.
 pub(crate) const MAX_BATCH_REGIONS: usize = 68;
+
+/// Max regions **including** the trailing blob region — the bound for the
+/// WAL/wire region-directory arrays (ptrs / sizes / offsets / positions).
+/// `MAX_BATCH_REGIONS` is the in-memory offsets/strides capacity (pk, weight,
+/// null_bmp, payload; no blob); the wire encoders enumerate one more region
+/// (the blob heap), so the directory needs one extra slot.  `+ 1` (rather than
+/// the tight wire max of 68) keeps the round-to-4 padding already baked into
+/// `MAX_BATCH_REGIONS`.
+pub(crate) const MAX_WIRE_REGIONS: usize = MAX_BATCH_REGIONS + 1; // = 69
 
 // ── Region indices into `offsets` / `strides` ───────────────────────────────
 //
@@ -39,6 +48,16 @@ pub(in crate::storage) const REG_PAYLOAD_START: usize = 3;
 /// Stride (in bytes) of the weight and null_bmp fixed regions.
 const FIXED_REGION_STRIDE: u8 = 8;
 pub(in crate::storage) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as usize;
+
+/// How `append_mem_batch_range` writes the weight column (region[1]).
+pub(crate) enum WeightFill {
+    /// Copy per-row weights verbatim from `src`.
+    Copy,
+    /// Broadcast one constant weight into every copied row.
+    Const(i64),
+    /// Write `-src` weight per row.
+    Negate,
+}
 
 /// Allocate a zeroed buffer and request hugepage backing for large allocations.
 ///
@@ -820,23 +839,18 @@ impl Batch {
 
     /// Bulk-copy rows `[start, end)` from a `MemBatch` into `self`.
     ///
-    /// `weight_override`:
-    /// - `Some(w)`: broadcast `w` into every copied row's weight column.
-    /// - `None`: copy per-row weights verbatim from `src`.
+    /// `fill` selects how the weight column is written (see [`WeightFill`]).
     ///
     /// Non-STRING payload columns: one `copy_from_slice` per region.
     /// STRING payload columns: per-row blob relocation via `relocate_string_cell`.
     ///
+    /// Leaves `sorted`/`consolidated` untouched (callers that need them cleared
+    /// — e.g. the `append_batch` wrappers — do so themselves).
+    ///
     /// Preconditions:
     /// - `start <= end <= src.count`
     /// - `self` has the same schema (column count and strides) as `src`
-    pub(crate) fn append_mem_batch_range(
-        &mut self,
-        src: &MemBatch<'_>,
-        start: usize,
-        end: usize,
-        weight_override: Option<i64>,
-    ) {
+    pub(crate) fn append_mem_batch_range(&mut self, src: &MemBatch<'_>, start: usize, end: usize, fill: WeightFill) {
         assert!(start <= end, "append_mem_batch_range: start ({start}) > end ({end})");
         assert!(
             end <= src.count,
@@ -852,8 +866,11 @@ impl Batch {
             self.blob.reserve(src.blob.len());
         }
         self.bulk_copy_region(REG_PK, src.pk(), start, end);
-        match weight_override {
-            Some(w) => {
+        match fill {
+            WeightFill::Copy => {
+                self.bulk_copy_region(REG_WEIGHT, src.weight(), start, end);
+            }
+            WeightFill::Const(w) => {
                 let dst_off = self.offsets[REG_WEIGHT] + self.count * 8;
                 let w_bytes = w.to_le_bytes();
                 let dest = &mut self.data[dst_off..dst_off + n * 8];
@@ -861,8 +878,12 @@ impl Batch {
                     chunk.copy_from_slice(&w_bytes);
                 }
             }
-            None => {
-                self.bulk_copy_region(REG_WEIGHT, src.weight(), start, end);
+            WeightFill::Negate => {
+                let dst_off = self.offsets[REG_WEIGHT] + self.count * 8;
+                let dest = &mut self.data[dst_off..dst_off + n * 8];
+                for (i, chunk) in dest.chunks_exact_mut(8).enumerate() {
+                    chunk.copy_from_slice(&(-src.get_weight(start + i)).to_le_bytes());
+                }
             }
         }
         self.bulk_copy_region(REG_NULL_BMP, src.null_bmp(), start, end);
@@ -1019,24 +1040,24 @@ impl Batch {
     ///
     /// `self` must have strides pre-set (see `empty_with_schema` / `with_schema`).
     pub fn append_batch(&mut self, src: &Batch, start: usize, end: usize) {
-        let end = if end > src.count { src.count } else { end };
+        let end = end.min(src.count);
         if start >= end {
             return;
         }
+        self.append_mem_batch_range(&src.as_mem_batch(), start, end, WeightFill::Copy);
         self.sorted = false;
         self.consolidated = false;
-        self.append_rows_inner(src, start, end, false);
     }
 
     /// Bulk-copy rows with negated weights.
     pub fn append_batch_negated(&mut self, src: &Batch, start: usize, end: usize) {
-        let end = if end > src.count { src.count } else { end };
+        let end = end.min(src.count);
         if start >= end {
             return;
         }
+        self.append_mem_batch_range(&src.as_mem_batch(), start, end, WeightFill::Negate);
         self.sorted = false;
         self.consolidated = false;
-        self.append_rows_inner(src, start, end, true);
     }
 
     /// Bulk-copy rows [start, end) verbatim — no string blob relocation.
@@ -1079,70 +1100,6 @@ impl Batch {
                 );
             }
         }
-        self.count += n;
-        self.sorted = false;
-        self.consolidated = false;
-    }
-
-    #[allow(clippy::needless_range_loop)]
-    fn append_rows_inner(&mut self, src: &Batch, start: usize, end: usize, negate: bool) {
-        let n = end - start;
-        self.reserve_rows(n);
-
-        // Fixed columns: bulk copy from src's data buffer.
-        self.bulk_copy_region(REG_PK, &src.data[src.offsets[REG_PK]..], start, end);
-        if negate {
-            let w_off = self.offsets[REG_WEIGHT];
-            for i in start..end {
-                let dst = w_off + (self.count + i - start) * 8;
-                self.data[dst..dst + 8].copy_from_slice(&(-src.get_weight(i)).to_le_bytes());
-            }
-        } else {
-            self.bulk_copy_region(REG_WEIGHT, &src.data[src.offsets[REG_WEIGHT]..], start, end);
-        }
-        self.bulk_copy_region(REG_NULL_BMP, &src.data[src.offsets[REG_NULL_BMP]..], start, end);
-
-        // Payload columns.  When the schema is installed, we need to know
-        // which payload positions hold STRING values so the blob can be
-        // relocated; without a schema, treat all payload columns as opaque
-        // bytes (no blob relocation is possible without type info anyway).
-        //
-        // `is_string_at[pi]` is true iff payload column `pi` is a STRING.
-        let npc = self.num_payload_cols();
-        let mut is_string_at = [false; MAX_BATCH_REGIONS];
-        if let Some(s) = self.schema {
-            for (pi, _ci, col) in s.payload_columns() {
-                if pi >= npc {
-                    break;
-                }
-                is_string_at[pi] = gnitz_wire::is_german_string(col.type_code);
-            }
-        }
-
-        for pi in 0..npc {
-            let cs = self.strides[REG_PAYLOAD_START + pi] as usize;
-            if is_string_at[pi] && cs == 16 {
-                for row in start..end {
-                    let src_off = src.offsets[REG_PAYLOAD_START + pi] + row * 16;
-                    let src_struct = &src.data[src_off..src_off + 16];
-                    let dst_off = self.offsets[REG_PAYLOAD_START + pi] + (self.count + row - start) * 16;
-                    relocate_string_cell(
-                        src_struct,
-                        &src.blob,
-                        &mut self.data[dst_off..dst_off + 16],
-                        &mut self.blob,
-                    );
-                }
-            } else if cs > 0 {
-                self.bulk_copy_region(
-                    REG_PAYLOAD_START + pi,
-                    &src.data[src.offsets[REG_PAYLOAD_START + pi]..],
-                    start,
-                    end,
-                );
-            }
-        }
-
         self.count += n;
         self.sorted = false;
         self.consolidated = false;
@@ -2279,11 +2236,10 @@ mod tests {
             "test",
             schema,
             100,
-            1,
+            crate::storage::Routing::Replicated,
             crate::storage::Persistence::Ephemeral,
             0,
             1,
-            crate::storage::partition_arena_size(1),
         )
         .unwrap();
 

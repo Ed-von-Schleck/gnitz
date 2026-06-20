@@ -312,7 +312,7 @@ impl CatalogEngine {
         let mut cursor = self.sys_sequences.open_cursor();
         while cursor.cursor.valid {
             if cursor.cursor.current_weight > 0 {
-                let seq_id = cursor.cursor.current_key as u64 as i64;
+                let seq_id = cursor.cursor.current_key_narrow() as u64 as i64;
                 let val = cursor_read_u64(&cursor, SEQTAB_COL_VALUE) as i64;
                 match seq_id {
                     SEQ_ID_SCHEMAS => {

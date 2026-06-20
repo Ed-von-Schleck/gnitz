@@ -7,7 +7,7 @@ use std::ffi::CStr;
 use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::xor8;
-use super::{MappedShard, Mmap, RegionView};
+use super::{MappedShard, Mmap, ScalarRegion, WeightRegion};
 use crate::foundation::codec::{read_i64_le, read_u64_le};
 use crate::foundation::xxh;
 
@@ -93,70 +93,79 @@ impl MappedShard {
             }
         }
 
-        // Build RegionViews
-        let build_region_view = |e: &DirEntry| -> Result<RegionView, StorageError> {
+        // Decode each region. Only the weight region may use the TwoValue
+        // encoding, so a forged TwoValue on a scalar region (pk / null_bmp /
+        // payload) is rejected at its decode site (`build_scalar_region`)
+        // instead of being asserted-against at every per-row accessor.
+        let read_const_value = |e: &DirEntry| -> [u8; 16] {
+            let mut value = [0u8; 16];
+            if e.size > 0 {
+                let copy_len = e.size.min(16);
+                value[..copy_len].copy_from_slice(&data[e.offset..e.offset + copy_len]);
+            }
+            value
+        };
+        let build_scalar_region = |e: &DirEntry| -> Result<ScalarRegion, StorageError> {
             match e.encoding {
-                ENCODING_CONSTANT => {
-                    let mut value = [0u8; 16];
-                    if e.size > 0 {
-                        let copy_len = e.size.min(16);
-                        value[..copy_len].copy_from_slice(&data[e.offset..e.offset + copy_len]);
-                    }
-                    Ok(RegionView::Constant {
-                        value,
-                        offset: e.offset,
-                    })
-                }
+                ENCODING_CONSTANT => Ok(ScalarRegion::Constant {
+                    value: read_const_value(e),
+                    offset: e.offset,
+                }),
+                ENCODING_TWO_VALUE => Err(StorageError::InvalidShard),
+                _ => Ok(ScalarRegion::Raw {
+                    offset: e.offset,
+                    size: e.size,
+                }),
+            }
+        };
+        let build_weight_region = |e: &DirEntry| -> Result<WeightRegion, StorageError> {
+            match e.encoding {
+                ENCODING_CONSTANT => Ok(WeightRegion::Constant {
+                    value: read_const_value(e),
+                }),
                 ENCODING_TWO_VALUE => {
                     let expected_bitvec = count.div_ceil(8);
                     if e.size < 16 + expected_bitvec {
                         return Err(StorageError::InvalidShard);
                     }
-                    let value_a = read_i64_le(data, e.offset);
-                    let value_b = read_i64_le(data, e.offset + 8);
-                    let bitvec_off = e.offset + 16;
-                    Ok(RegionView::TwoValue {
-                        value_a,
-                        value_b,
-                        bitvec_off,
+                    Ok(WeightRegion::TwoValue {
+                        value_a: read_i64_le(data, e.offset),
+                        value_b: read_i64_le(data, e.offset + 8),
+                        bitvec_off: e.offset + 16,
                     })
                 }
-                _ => Ok(RegionView::Raw {
+                _ => Ok(WeightRegion::Raw {
                     offset: e.offset,
                     size: e.size,
                 }),
             }
         };
 
-        let pk = build_region_view(&entries[0])?;
-        let weight = build_region_view(&entries[1])?;
-        let null_bmp = build_region_view(&entries[2])?;
+        let pk = build_scalar_region(&entries[0])?;
+        let weight = build_weight_region(&entries[1])?;
+        let null_bmp = build_scalar_region(&entries[2])?;
 
-        // Reject TwoValue for pk/null_bmp: encoder never emits this.
-        if matches!(pk, RegionView::TwoValue { .. }) || matches!(null_bmp, RegionView::TwoValue { .. }) {
-            return Err(StorageError::InvalidShard);
-        }
         // Wide PK must be Raw: a Constant region holds only a 16-byte `value`,
         // so `get_pk_bytes` would slice `&value[..stride]` out of bounds. The
         // writer never emits Constant for a wide PK (wide strides stay Raw by
         // construction), so this is defense-in-depth against a corrupt or
         // forged file.
-        if pk_stride as usize > crate::schema::NARROW_PK_MAX_BYTES && !matches!(pk, RegionView::Raw { .. }) {
+        if pk_stride as usize > crate::schema::NARROW_PK_MAX_BYTES && !matches!(pk, ScalarRegion::Raw { .. }) {
             return Err(StorageError::InvalidShard);
         }
         // Validate Raw region sizes before the has_ghosts scan (which reads
         // count*8 bytes from the weight region and would panic on undersize).
-        if let RegionView::Raw { size, .. } = &weight {
+        if let WeightRegion::Raw { size, .. } = &weight {
             if *size < count * 8 {
                 return Err(StorageError::InvalidShard);
             }
         }
-        if let RegionView::Raw { size, .. } = &pk {
+        if let ScalarRegion::Raw { size, .. } = &pk {
             if *size < count * pk_stride as usize {
                 return Err(StorageError::InvalidShard);
             }
         }
-        if let RegionView::Raw { size, .. } = &null_bmp {
+        if let ScalarRegion::Raw { size, .. } = &null_bmp {
             if *size < count * 8 {
                 return Err(StorageError::InvalidShard);
             }
@@ -169,9 +178,9 @@ impl MappedShard {
         // before scatter), so the conservative `Raw => true` caused skip_ghosts
         // to do a full linear scan on every advance for ghost-free shards.
         let has_ghosts = match &weight {
-            RegionView::Raw { offset, .. } => (0..count).any(|i| read_i64_le(data, offset + i * 8) == 0),
-            RegionView::Constant { value, .. } => i64::from_le_bytes(value[..8].try_into().unwrap()) == 0,
-            RegionView::TwoValue { value_a, value_b, .. } => *value_a == 0 || *value_b == 0,
+            WeightRegion::Raw { offset, .. } => (0..count).any(|i| read_i64_le(data, offset + i * 8) == 0),
+            WeightRegion::Constant { value } => i64::from_le_bytes(value[..8].try_into().unwrap()) == 0,
+            WeightRegion::TwoValue { value_a, value_b, .. } => *value_a == 0 || *value_b == 0,
         };
 
         let mut col_to_payload = Vec::with_capacity(num_cols);
@@ -182,19 +191,17 @@ impl MappedShard {
                 col_to_payload.push(usize::MAX);
             } else {
                 col_to_payload.push(col_regions.len());
-                col_regions.push(build_region_view(&entries[reg_idx])?);
+                col_regions.push(build_scalar_region(&entries[reg_idx])?);
                 reg_idx += 1;
             }
         }
-        // Reject TwoValue for payload columns (encoder never emits this) and
-        // validate Raw sizes so to_unified can be infallible.
+        // Validate Raw payload sizes so to_unified can be infallible. (TwoValue
+        // on a payload column was already rejected by build_scalar_region.)
         for (pi, _ci, col) in schema.payload_columns() {
-            match &col_regions[pi] {
-                RegionView::TwoValue { .. } => return Err(StorageError::InvalidShard),
-                RegionView::Raw { size, .. } if *size < count * col.size() as usize => {
+            if let ScalarRegion::Raw { size, .. } = &col_regions[pi] {
+                if *size < count * col.size() as usize {
                     return Err(StorageError::InvalidShard);
                 }
-                _ => {}
             }
         }
 

@@ -14,7 +14,9 @@ use std::ffi::CStr;
 use super::super::error::StorageError;
 use super::super::lsm::shard_file;
 use super::super::lsm::wal;
-use super::batch::{pk_stride, Batch, MAX_BATCH_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::batch::{
+    pk_stride, Batch, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
+};
 use super::merge::MemBatch;
 use crate::schema::SchemaDescriptor;
 
@@ -38,11 +40,11 @@ impl Batch {
     /// Byte count of the WAL-block encoding for this batch.
     pub fn wire_byte_size(&self, _table_id: u32) -> usize {
         let nr_wire = self.num_regions_total();
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        let mut sizes = [0u32; MAX_WIRE_REGIONS];
         for (i, size) in sizes[..nr_wire].iter_mut().enumerate() {
             *size = self.region_size(i) as u32;
         }
-        wal::block_size(nr_wire, &sizes[..nr_wire])
+        wal::block_size(&sizes[..nr_wire])
     }
 
     /// Byte count of the WAL-block encoding for `count` rows from this batch.
@@ -51,13 +53,13 @@ impl Batch {
     pub fn wire_byte_size_range(&self, count: usize) -> usize {
         let nr_wire = self.num_regions_total();
         let blob_idx = nr_wire - 1;
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        let mut sizes = [0u32; MAX_WIRE_REGIONS];
         for (i, size) in sizes[..blob_idx].iter_mut().enumerate() {
             *size = (count * self.region_stride(i) as usize) as u32;
         }
         // blob is always empty for wire-safe schemas
         sizes[blob_idx] = 0;
-        wal::block_size(nr_wire, &sizes[..nr_wire])
+        wal::block_size(&sizes[..nr_wire])
     }
 
     /// Encode rows `[start_row, start_row + count)` into WAL V4 wire format at
@@ -98,8 +100,8 @@ impl Batch {
         );
         let nr_wire = self.num_regions_total();
         let blob_idx = nr_wire - 1;
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_WIRE_REGIONS];
+        let mut sizes = [0u32; MAX_WIRE_REGIONS];
         for i in 0..blob_idx {
             let stride = self.region_stride(i) as usize;
             // SAFETY: start_row * stride is within the allocated region (the
@@ -128,8 +130,8 @@ impl Batch {
     /// Encode self into WAL V4 wire format at out[offset..]. Returns bytes written.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize, checksum: bool) -> usize {
         let nr_wire = self.num_regions_total();
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
-        let mut sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_WIRE_REGIONS];
+        let mut sizes = [0u32; MAX_WIRE_REGIONS];
         for i in 0..nr_wire {
             ptrs[i] = self.region_ptr(i);
             sizes[i] = self.region_size(i) as u32;
@@ -167,8 +169,8 @@ impl Batch {
         let mut count = 0u32;
         let mut num_regions = 0u32;
         let mut blob_size = 0u64;
-        let mut offsets = [0u64; 128];
-        let mut sizes = [0u32; 128];
+        let mut offsets = [0u64; MAX_WIRE_REGIONS];
+        let mut sizes = [0u32; MAX_WIRE_REGIONS];
 
         if wal::validate_and_parse(
             data,
@@ -179,7 +181,7 @@ impl Batch {
             &mut blob_size,
             &mut offsets,
             &mut sizes,
-            128,
+            MAX_WIRE_REGIONS as u32,
             verify_checksum,
         )
         .is_err()
@@ -225,8 +227,8 @@ impl Batch {
         }
 
         let nr_mem = expected_regions;
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_BATCH_REGIONS + 1];
-        let mut region_sizes = [0u32; MAX_BATCH_REGIONS + 1];
+        let mut ptrs = [std::ptr::null::<u8>(); MAX_WIRE_REGIONS];
+        let mut region_sizes = [0u32; MAX_WIRE_REGIONS];
 
         // `validate_and_parse` guaranteed every region's `[off, off + sz)` lies
         // within the block, so each pointer is in-bounds; a zero-size region
@@ -266,8 +268,8 @@ pub fn decode_mem_batch_from_wal_block<'a>(
     let mut count = 0u32;
     let mut num_regions = 0u32;
     let mut _blob_size = 0u64;
-    let mut wal_offsets = [0u64; MAX_BATCH_REGIONS];
-    let mut sizes = [0u32; MAX_BATCH_REGIONS];
+    let mut wal_offsets = [0u64; MAX_WIRE_REGIONS];
+    let mut sizes = [0u32; MAX_WIRE_REGIONS];
 
     wal::validate_and_parse(
         data,
@@ -278,7 +280,7 @@ pub fn decode_mem_batch_from_wal_block<'a>(
         &mut _blob_size,
         &mut wal_offsets,
         &mut sizes,
-        MAX_BATCH_REGIONS as u32,
+        MAX_WIRE_REGIONS as u32,
         false,
     )
     .map_err(|_| "data WAL block invalid")?;

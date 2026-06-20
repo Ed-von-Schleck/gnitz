@@ -96,7 +96,7 @@ impl MemTable {
     }
 
     /// Collapse runs into one merged run in-place.
-    /// `has_found` is dropped because run/row indices change.
+    /// `found` is dropped because run/row indices change.
     fn force_consolidate(&mut self) {
         if self.runs.len() <= 1 {
             return;
@@ -119,7 +119,7 @@ impl MemTable {
             }
             self.runs.push(Rc::new(merged));
         }
-        self.has_found = false;
+        self.found = None;
     }
 
     /// Consolidate runs and return an `Rc<Batch>` of the merged result.
@@ -138,7 +138,7 @@ impl MemTable {
         self.runs.clear();
         self.runs_bytes = 0;
         self.total_row_count = 0;
-        self.has_found = false;
+        self.found = None;
         self.bloom.reset();
     }
 

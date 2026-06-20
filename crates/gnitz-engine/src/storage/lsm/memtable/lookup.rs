@@ -49,30 +49,28 @@ impl MemTable {
     }
     /// Look up a PK across all sorted runs.
     ///
-    /// Returns `(net_weight, has_found, row_count)` where `row_count` is the
+    /// Returns `(net_weight, found, row_count)` where `row_count` is the
     /// number of memtable rows matching `key` (across all runs).
     /// Look up a PK across all sorted runs by its OPK `key` bytes. Returns
-    /// `(net_weight, has_found, row_count)`. The universal lookup at every PK
+    /// `(net_weight, found, row_count)`. The universal lookup at every PK
     /// width — `find_lower_bound_bytes` is a raw memcmp search on the OPK
     /// regions. `key` is exactly `pk_stride` OPK bytes.
     pub fn lookup_pk_bytes(&mut self, key: &[u8]) -> (i64, bool, usize) {
         let mut total_w: i64 = 0;
         let mut row_count: usize = 0;
-        self.has_found = false;
+        self.found = None;
 
         for (ri, run) in self.runs.iter().enumerate() {
             for lo in run_pk_match_rows(run, key) {
                 total_w += run.get_weight(lo);
-                if !self.has_found {
-                    self.found_run = ri;
-                    self.found_row = lo;
-                    self.has_found = true;
+                if self.found.is_none() {
+                    self.found = Some((ri, lo));
                 }
                 row_count += 1;
             }
         }
 
-        (total_w, self.has_found, row_count)
+        (total_w, self.found.is_some(), row_count)
     }
     /// Find the net weight for rows matching both PK (OPK `key` bytes) and
     /// full payload. `key` is exactly `pk_stride` OPK bytes.
@@ -97,7 +95,7 @@ impl MemTable {
     }
 
     /// Find the first memtable row whose (PK, payload) has positive net weight
-    /// across all runs.  Sets `found_run`/`found_row`/`has_found` on success.
+    /// across all runs.  Sets `found` on success.
     /// Returns true if such a row was found, false otherwise.
     ///
     /// Used by `Table::retract_pk` to locate the live row for an UPDATE+DELETE
@@ -105,9 +103,9 @@ impl MemTable {
     /// is still positive.
     /// Find the first memtable row whose (PK, payload) has positive net weight
     /// across all runs, keyed by OPK `key` bytes. Sets
-    /// `found_run`/`found_row`/`has_found` on success.
+    /// `found` on success.
     pub fn find_positive_payload_row_bytes(&mut self, key: &[u8]) -> bool {
-        self.has_found = false;
+        self.found = None;
 
         // Pass 1 — one binary search per run; collect every (run, row, weight)
         // whose PK matches into `cand_scratch`. This is the only scan of the
@@ -158,9 +156,7 @@ impl MemTable {
                 }
             }
             if net > 0 {
-                self.found_run = ri;
-                self.found_row = row;
-                self.has_found = true;
+                self.found = Some((ri, row));
                 return true;
             }
         }
@@ -178,14 +174,12 @@ impl MemTable {
             for lo in run_pk_match_rows(run, key) {
                 let net_w = self.find_weight_for_row_bytes(key, run.as_ref(), lo);
                 if net_w > 0 {
-                    self.found_run = ri;
-                    self.found_row = lo;
-                    self.has_found = true;
+                    self.found = Some((ri, lo));
                     return true;
                 }
             }
         }
-        self.has_found = false;
+        self.found = None;
         false
     }
 }

@@ -1890,8 +1890,9 @@ fn gi_synthetic_out_schema() -> SchemaDescriptor {
 /// lands on the first entry of the `gc` group instead of sorting the negative
 /// keys before it and skipping them; the per-hit trace re-seek uses
 /// `seek_group`/`current_pk_eq`, which compare PK *bytes* for a signed column
-/// rather than the raw `current_key`. Before the byte-form change the negative
-/// source rows were dropped and the MIN reflected only the delta.
+/// rather than the scalar `current_key` (narrow-PK-only). Before the byte-form
+/// change the negative source rows were dropped and the MIN reflected only the
+/// delta.
 #[test]
 fn test_reduce_gi_signed_source_pk_negative() {
     use crate::storage::CursorHandle;

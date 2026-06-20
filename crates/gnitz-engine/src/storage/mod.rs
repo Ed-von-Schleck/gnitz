@@ -23,7 +23,7 @@ mod data_roundtrip_proptest;
 pub use batch::{write_to_batch, Batch, ConsolidatedBatch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
-pub use lsm::partitioned_table::{partition_arena_size, partition_for_key, partition_for_pk_bytes, PartitionedTable};
+pub use lsm::partitioned_table::{partition_for_key, partition_for_pk_bytes, PartitionedTable, Routing};
 pub use lsm::read_cursor::CursorHandle;
 pub use lsm::table::{FlushOutcome, FlushWork, Persistence, Table};
 pub use merge::MemBatch;
@@ -31,7 +31,10 @@ pub use scatter::{scatter_copy, scatter_multi_source};
 
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use batch::carve_writer_slices;
-pub(crate) use batch::{index_meta_schema_desc, make_index_schema, project_schema, BatchBuilder, INDEX_META_COL_NAMES};
+pub(crate) use batch::{
+    index_meta_schema_desc, make_index_schema, project_schema, BatchBuilder, WeightFill, INDEX_META_COL_NAMES,
+    MAX_WIRE_REGIONS,
+};
 pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_fixedint_nonnull, opk_key, with_payload_cmp};
 pub(crate) use lsm::manifest::PkBuf;
 #[cfg(test)]
@@ -39,6 +42,7 @@ pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
 #[cfg(test)]
 pub(crate) use lsm::read_cursor::REWIND_CALLS;
 pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
+pub(crate) use lsm::wal::block_size as wal_block_size;
 pub(crate) use merge::{pk_sort_key, BlobCacheGuard, DirectWriter};
 pub(crate) use range_key::{increment_key_in_place, range_cut_points, range_group_cut_points};
 

@@ -205,7 +205,7 @@ impl CatalogEngine {
                 let row_owner = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
                 let row_cols = gnitz_wire::unpack_pk_cols(cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COLS));
                 if row_owner == owner_id && row_cols.as_slice() == cols {
-                    let row_id = cursor.cursor.current_key as u64 as i64;
+                    let row_id = cursor.cursor.current_key_narrow() as u64 as i64;
                     let is_uniq = cursor_read_u64(&cursor, IDXTAB_COL_IS_UNIQUE) != 0;
                     f(row_id, is_uniq);
                 }
@@ -418,7 +418,7 @@ impl CatalogEngine {
                     let mut cursor = self.sys_indices.open_cursor();
                     // sys_indices has a single U64 PK; OPK == big-endian.
                     cursor.cursor.seek_bytes(&(idx_id as u64).to_be_bytes());
-                    if !cursor.cursor.valid || cursor.cursor.current_key as u64 != idx_id as u64 {
+                    if !cursor.cursor.valid || cursor.cursor.current_key_narrow() as u64 != idx_id as u64 {
                         continue;
                     }
                     (

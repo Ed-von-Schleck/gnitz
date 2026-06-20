@@ -1,7 +1,8 @@
 //! Partitioned table: hash-routes rows across N child Table handles.
 //!
-//! User tables have 256 partitions; system tables have 1.  The partition
-//! index is `xxh3(pk_lo, pk_hi) & 0xFF`.
+//! User tables hash-route across 256 partitions; replicated (system or
+//! replicated-derived) tables hold one. The 256-bucket index is the Fibonacci
+//! `mix(pk) >> 56` (see `schema::key`), not `xxh3 & 0xFF`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,9 +27,22 @@ thread_local! {
 // PartitionedTable
 // ---------------------------------------------------------------------------
 
+/// How a table distributes its rows across child `Table` handles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Routing {
+    /// One child holding the whole local dataset, unhashed — replicated base
+    /// tables and replicated-derived views.
+    Replicated,
+    /// 256-way hash scatter by `mix(pk) >> 56`.
+    Hashed,
+}
+
+/// Scatter bucket count for `Routing::Hashed`; `mix` takes `(h >> 56)` ∈ 0..256.
+const NUM_PARTITIONS: usize = 256;
+
 pub struct PartitionedTable {
     tables: Vec<Table>,
-    num_partitions: u32,
+    routing: Routing,
     part_offset: u32,
     schema: SchemaDescriptor,
     last_found_partition: Option<usize>,
@@ -41,26 +55,24 @@ impl PartitionedTable {
         name: &str,
         schema: SchemaDescriptor,
         table_id: u32,
-        num_partitions: u32,
+        routing: Routing,
         persistence: Persistence,
         part_start: u32,
         part_end: u32,
-        arena_size: u64,
     ) -> Result<Self, StorageError> {
-        // `mix` is hardcoded to 256 buckets (`(h >> 56) as usize`); any other
-        // partition count makes `part_indices[p]` index out of bounds in
-        // `ingest_owned_batch`. Programming invariant — must fire in release.
-        assert!(
-            num_partitions == 1 || num_partitions == 256,
-            "PartitionedTable supports only 1 or 256 partitions, got {num_partitions}",
-        );
+        // Per-partition arena: a replicated store holds the whole dataset in one
+        // child (1 MiB); a hashed store spreads it over 256 (256 KiB each).
+        let arena_size: u64 = match routing {
+            Routing::Replicated => 1 << 20,
+            Routing::Hashed => 256 << 10,
+        };
         table::ensure_dir(dir)?;
 
         // Test seam: widen the window where the table dir exists but its
         // partition subdirs do not, so a concurrent master remove_dir_all
         // (DROP) deterministically races this create. User tables only.
         #[cfg(debug_assertions)]
-        if num_partitions == 256 {
+        if routing == Routing::Hashed {
             if let Some(ms) = std::env::var("GNITZ_INJECT_TABLE_CREATE_DELAY_MS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -78,8 +90,8 @@ impl PartitionedTable {
         // would collide (every worker flushing the same files). The master's
         // pre-fork copy is built at `[0, 1)`, i.e. `part_0`, and a worker that
         // inherits it across the fork re-homes it to its own `part_{part_start}`
-        // (`rehome_single_partition_stores`) before any flush. `num_partitions ==
-        // 1` is always built with exactly one partition.
+        // (`rehome_single_partition_stores`) before any flush. `Routing::Replicated`
+        // is always built with exactly one partition.
         let mut tables = Vec::with_capacity((part_end - part_start) as usize);
         for p in part_start..part_end {
             let part_dir = format!("{dir}/part_{p}");
@@ -89,7 +101,7 @@ impl PartitionedTable {
 
         Ok(PartitionedTable {
             tables,
-            num_partitions,
+            routing,
             part_offset: part_start,
             schema,
             last_found_partition: None,
@@ -104,13 +116,12 @@ impl PartitionedTable {
         }
     }
 
-    /// Configured partition count (1 or 256). A single-partition store holds its
-    /// whole local dataset at partition 0 — either a replicated base table (full
-    /// copy on every worker) or a replicated-derived view (the local slice each
-    /// worker produces). The bootstrap trim exempts these so partition 0 is never
-    /// dropped on a worker whose range excludes it.
-    pub fn num_partitions(&self) -> u32 {
-        self.num_partitions
+    /// True for a replicated store — one child holding the whole local dataset
+    /// at partition 0 (a replicated base table or replicated-derived view). The
+    /// bootstrap trim exempts these so partition 0 is never dropped on a worker
+    /// whose range excludes it.
+    pub(crate) fn is_replicated(&self) -> bool {
+        self.routing == Routing::Replicated
     }
 
     // ------------------------------------------------------------------
@@ -126,12 +137,12 @@ impl PartitionedTable {
             return Ok(());
         }
 
-        if self.num_partitions == 1 {
+        if self.is_replicated() {
             return self.tables[0].ingest_owned_batch(batch);
         }
 
         let mb = batch.as_mem_batch();
-        let np = self.num_partitions as usize;
+        let np = NUM_PARTITIONS;
 
         // Thread-local per-partition index pool, mirroring exchange.rs's
         // SCATTER_INDICES / WORKER_ROWS: clears (retaining capacity) per call
@@ -184,7 +195,7 @@ impl PartitionedTable {
         if self.tables.is_empty() {
             return read_cursor::create_cursor_from_snapshots(&[], &[], self.schema);
         }
-        if self.num_partitions == 1 {
+        if self.is_replicated() {
             return self.tables[0].open_cursor();
         }
         let mut all_snapshots: Vec<Rc<Batch>> = Vec::new();
@@ -207,7 +218,7 @@ impl PartitionedTable {
             return Ok(read_cursor::create_cursor_from_snapshots(&[], &[], self.schema));
         }
 
-        if self.num_partitions == 1 {
+        if self.is_replicated() {
             return self.tables[0].create_cursor_compacting();
         }
 
@@ -252,7 +263,7 @@ impl PartitionedTable {
         if self.tables.is_empty() {
             return false;
         }
-        if self.num_partitions == 1 {
+        if self.is_replicated() {
             return self.tables[0].has_pk_bytes(key);
         }
         match self.local_index_bytes(key) {
@@ -267,7 +278,7 @@ impl PartitionedTable {
         if self.tables.is_empty() {
             return (0, false);
         }
-        let local = if self.num_partitions == 1 {
+        let local = if self.is_replicated() {
             0
         } else {
             match self.local_index_bytes(key) {
@@ -431,14 +442,6 @@ impl Drop for PartitionedTable {
 // `crate::storage::*` routing call sites are unchanged.
 pub use crate::schema::key::{partition_for_key, partition_for_pk_bytes};
 
-pub fn partition_arena_size(num_partitions: u32) -> u64 {
-    if num_partitions <= 1 {
-        1024 * 1024
-    } else {
-        256 * 1024
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Shared test fixture
 // ---------------------------------------------------------------------------
@@ -506,11 +509,10 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
             "test",
             schema(),
             830,
-            256,
+            Routing::Hashed,
             Persistence::Durable,
             0,
             2,
-            partition_arena_size(256),
         )
         .unwrap()
     };
@@ -623,11 +625,10 @@ mod tests {
             "test",
             schema,
             100,
-            1,
+            Routing::Replicated,
             Persistence::Ephemeral,
             0,
             1,
-            partition_arena_size(1),
         )
         .unwrap();
 
@@ -651,11 +652,10 @@ mod tests {
             "test",
             schema,
             200,
-            256,
+            Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            partition_arena_size(256),
         )
         .unwrap();
 
@@ -679,11 +679,10 @@ mod tests {
             "test",
             schema,
             300,
-            256,
+            Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            partition_arena_size(256),
         )
         .unwrap();
 
@@ -692,7 +691,7 @@ mod tests {
 
         let cursor = pt.open_cursor();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key as u64, 10);
+        assert_eq!(cursor.cursor.current_key_narrow() as u64, 10);
     }
 
     #[test]
@@ -706,11 +705,10 @@ mod tests {
             "test",
             schema,
             400,
-            256,
+            Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            partition_arena_size(256),
         )
         .unwrap();
 
@@ -757,11 +755,10 @@ mod tests {
             "test",
             schema,
             900,
-            256,
+            Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            partition_arena_size(256),
         )
         .unwrap();
 
@@ -903,11 +900,10 @@ mod tests {
             "test",
             schema,
             700,
-            256,
+            Routing::Hashed,
             Persistence::Ephemeral,
             0,
             1,
-            partition_arena_size(256),
         )
         .unwrap();
 
@@ -953,11 +949,10 @@ mod tests {
             "test",
             schema,
             500,
-            256,
+            Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            partition_arena_size(256),
         )
         .unwrap();
 
@@ -981,11 +976,10 @@ mod tests {
             "test",
             schema,
             600,
-            256,
+            Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            partition_arena_size(256),
         )
         .unwrap();
 
@@ -1039,11 +1033,10 @@ mod tests {
             "test",
             schema,
             800,
-            256,
+            Routing::Hashed,
             Persistence::Durable,
             0,
             256,
-            partition_arena_size(256),
         )
         .unwrap();
 
@@ -1074,11 +1067,10 @@ mod tests {
             "test",
             schema,
             810,
-            256,
+            Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            partition_arena_size(256),
         )
         .unwrap();
 
@@ -1112,11 +1104,10 @@ mod tests {
             "test",
             schema,
             820,
-            256,
+            Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            partition_arena_size(256),
         )
         .unwrap();
 

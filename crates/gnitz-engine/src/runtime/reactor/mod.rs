@@ -948,7 +948,7 @@ impl Reactor {
             .expect("FLAG_HAS_DATA set but no data batch — ring corrupt");
         let sch = schema.as_ref().expect("FLAG_HAS_DATA set but no schema — ring corrupt");
         let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
-        owned.append_mem_batch_range(&mb, 0, mb.count, None);
+        owned.append_mem_batch_range(&mb, 0, mb.count, crate::storage::WeightFill::Copy);
         if flags & FLAG_BATCH_SORTED != 0 {
             owned.mark_sorted();
         }
@@ -982,7 +982,7 @@ impl Reactor {
                 .as_ref()
                 .expect("exchange FLAG_HAS_DATA without schema — ring corrupt");
             let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
-            owned.append_mem_batch_range(&mb, 0, mb.count, None);
+            owned.append_mem_batch_range(&mb, 0, mb.count, crate::storage::WeightFill::Copy);
             if flags & FLAG_BATCH_SORTED != 0 {
                 owned.mark_sorted();
             }

@@ -862,7 +862,7 @@ mod tests {
 
         let cursor = t.open_cursor();
         assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key as u64, 10);
+        assert_eq!(cursor.cursor.current_key_narrow() as u64, 10);
         // Don't need to iterate further — cursor creation works
     }
 
@@ -994,7 +994,8 @@ mod tests {
         let cursor = t.open_cursor();
         assert!(cursor.cursor.valid);
         assert_eq!(
-            cursor.cursor.current_key as u64, 10,
+            cursor.cursor.current_key_narrow() as u64,
+            10,
             "cursor should start at PK=10 (smallest)"
         );
     }
@@ -1031,7 +1032,8 @@ mod tests {
         let cursor = t.open_cursor();
         assert!(cursor.cursor.valid);
         assert_eq!(
-            cursor.cursor.current_key as u64, 1,
+            cursor.cursor.current_key_narrow() as u64,
+            1,
             "cursor should start at PK=1 from flushed shard"
         );
     }

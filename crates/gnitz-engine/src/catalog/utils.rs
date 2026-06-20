@@ -195,7 +195,7 @@ pub(crate) fn retract_rows_in_pk_range(table: &Table, schema: &SchemaDescriptor,
     let mut batch = Batch::with_schema(*schema, 8);
     let mut cursor = table.open_cursor();
     // U64-PK system table: OPK == big-endian; the native-value range
-    // comparisons below (`current_key`/`get_pk` vs `pk_end`) stay valid.
+    // comparisons below (`current_key_narrow()`/`get_pk` vs `pk_end`) stay valid.
     cursor.cursor.seek_bytes(&(start as u64).to_be_bytes());
 
     // Bulk path: single consolidated MemBatch source.
@@ -204,13 +204,13 @@ pub(crate) fn retract_rows_in_pk_range(table: &Table, schema: &SchemaDescriptor,
         while end < src.count && src.get_pk(end) < pk_end {
             end += 1;
         }
-        batch.append_mem_batch_range(&src, start_idx, end, Some(-1));
+        batch.append_mem_batch_range(&src, start_idx, end, crate::storage::WeightFill::Const(-1));
         return batch;
     }
 
     // Row-at-a-time fallback for multi-source cursors.
     while cursor.cursor.valid {
-        if cursor.cursor.current_key >= pk_end {
+        if cursor.cursor.current_key_narrow() >= pk_end {
             break;
         }
         if cursor.cursor.current_weight > 0 {

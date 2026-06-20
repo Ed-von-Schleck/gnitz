@@ -80,11 +80,14 @@ impl Drop for Mmap {
 }
 
 // ---------------------------------------------------------------------------
-// RegionView — self-describing region accessor
+// ScalarRegion / WeightRegion — self-describing region accessors
 // ---------------------------------------------------------------------------
 
+/// A pk / null-bitmap / payload-column region. These never carry the
+/// `TwoValue` encoding (only the weight region does), so the variant is
+/// unrepresentable here rather than rejected-then-asserted at every accessor.
 #[derive(Clone)]
-pub(crate) enum RegionView {
+pub(crate) enum ScalarRegion {
     Raw {
         offset: usize,
         size: usize,
@@ -96,6 +99,20 @@ pub(crate) enum RegionView {
         value: [u8; 16],
         offset: usize,
     },
+}
+
+/// The weight region — the only region that may use the two-value encoding.
+#[derive(Clone)]
+pub(crate) enum WeightRegion {
+    Raw {
+        offset: usize,
+        size: usize,
+    },
+    /// All weights identical; `value` holds the i64 bytes.
+    Constant {
+        value: [u8; 16],
+    },
+    /// Exactly two distinct weights, selected per row by `bitvec_off`.
     TwoValue {
         value_a: i64,
         value_b: i64,
@@ -109,11 +126,11 @@ pub struct MappedShard {
     /// of the `MappedShard`.
     mmap: Mmap,
     pub(crate) count: usize,
-    pub(crate) pk: RegionView,
-    pub(crate) weight: RegionView,
-    pub(crate) null_bmp: RegionView,
+    pub(crate) pk: ScalarRegion,
+    pub(crate) weight: WeightRegion,
+    pub(crate) null_bmp: ScalarRegion,
     /// Non-PK column regions indexed by payload position.
-    pub(crate) col_regions: Vec<RegionView>,
+    pub(crate) col_regions: Vec<ScalarRegion>,
     pub(crate) blob_off: usize,
     pub(crate) blob_len: usize,
     /// Column index mapping: logical col_idx -> payload col index.
@@ -512,6 +529,35 @@ mod tests {
     }
 
     #[test]
+    fn two_value_pk_region_rejected() {
+        // TwoValue is valid only for the weight region. Forge it onto the pk
+        // region (dir entry 0) and confirm open rejects the shard — `ScalarRegion`
+        // has no TwoValue variant, so `build_scalar_region` returns InvalidShard.
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let n = 8usize;
+        let pks: Vec<u64> = (1..=n as u64).collect();
+        let wts: Vec<i64> = vec![1; n];
+        let vals: Vec<i64> = (0..n).map(|i| i as i64).collect();
+        let path = build_test_shard_weights(dir.path(), "twoval_pk.db", &pks, &wts, &vals);
+        let schema = test_schema();
+
+        // Patch the pk directory entry's encoding byte (entry 0, offset +24) to
+        // ENCODING_TWO_VALUE. Checksums off so the stale checksum doesn't mask it.
+        let mut data = std::fs::read(&path).unwrap();
+        let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
+        data[dir_off + 24] = ENCODING_TWO_VALUE;
+        std::fs::write(&path, &data).unwrap();
+
+        let cpath = std::ffi::CString::new(path).unwrap();
+        assert_eq!(
+            MappedShard::open(&cpath, &schema, false).err(),
+            Some(StorageError::InvalidShard),
+            "TwoValue on the pk region must be rejected at open time"
+        );
+    }
+
+    #[test]
     fn single_row_shard() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
@@ -716,7 +762,7 @@ mod tests {
         let schema = test_schema();
         let cpath = std::ffi::CString::new(path).unwrap();
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
-        assert!(matches!(shard.pk, RegionView::Raw { .. }), "expected Raw PK region");
+        assert!(matches!(shard.pk, ScalarRegion::Raw { .. }), "expected Raw PK region");
         assert_eq!(shard.pk_stride, 8);
         for i in 0..rows.len() {
             let bytes = shard.get_pk_bytes(i);
@@ -737,7 +783,7 @@ mod tests {
         let schema = u128_pk_schema();
         let cpath = std::ffi::CString::new(path).unwrap();
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-        assert!(matches!(shard.pk, RegionView::Raw { .. }), "expected Raw PK region");
+        assert!(matches!(shard.pk, ScalarRegion::Raw { .. }), "expected Raw PK region");
         assert_eq!(shard.pk_stride, 16);
         for (i, &pk) in pks.iter().enumerate() {
             let bytes = shard.get_pk_bytes(i);
@@ -762,7 +808,7 @@ mod tests {
         let cpath = std::ffi::CString::new(path).unwrap();
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert!(
-            matches!(shard.pk, RegionView::Constant { .. }),
+            matches!(shard.pk, ScalarRegion::Constant { .. }),
             "expected Constant PK region"
         );
         assert_eq!(shard.pk_stride, 16);
@@ -794,7 +840,7 @@ mod tests {
     #[test]
     fn find_lower_bound_bytes_wide_pk_distinct() {
         // Wide PK (3xU64 all-PK, stride 24). Distinct PKs keep the shard PK
-        // region as Raw (RegionView::Constant's get_pk_bytes returns
+        // region as Raw (ScalarRegion::Constant's get_pk_bytes returns
         // &value[..stride] from a 16-byte buffer and would panic for stride
         // 24 — see §6 caveat).
         //
@@ -857,7 +903,7 @@ mod tests {
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         assert_eq!(shard.pk_stride, 24);
         assert!(
-            matches!(shard.pk, RegionView::Raw { .. }),
+            matches!(shard.pk, ScalarRegion::Raw { .. }),
             "distinct PKs must keep PK region Raw"
         );
 

@@ -144,8 +144,8 @@ impl CatalogEngine {
         schema: SchemaDescriptor,
         single_partition: bool,
     ) -> Result<PartitionedTable, String> {
-        // A `single_partition` relation is a single-partition (`num_partitions =
-        // 1`) store on every node with a non-empty active range. It is either a
+        // A `single_partition` relation is a `Routing::Replicated` store on every
+        // node with a non-empty active range. It is either a
         // replicated base table (full copy on every worker) or a replicated-derived
         // view (the local slice each worker produces from a join/reduce against a
         // replicated source — the output is keyed by the join/group key but produced
@@ -169,21 +169,20 @@ impl CatalogEngine {
         // inert via the `tables.is_empty()` guards.
         let part_start = self.active_part_start;
         let active_nonempty = self.active_part_end > part_start;
-        let (num_parts, part_end) = if single_partition && active_nonempty {
-            (1u32, part_start + 1)
+        let (routing, part_end) = if single_partition && active_nonempty {
+            (Routing::Replicated, part_start + 1)
         } else {
-            (NUM_PARTITIONS, self.active_part_end)
+            (Routing::Hashed, self.active_part_end)
         };
         let mut pt = PartitionedTable::new(
             directory,
             name,
             schema,
             id as u32,
-            num_parts,
+            routing,
             kind.persistence(),
             part_start,
             part_end,
-            partition_arena_size(num_parts),
         )
         .map_err(|e| format!("Failed to create '{name}': error {e} (dir={directory})"))?;
         if kind.is_base_table() {

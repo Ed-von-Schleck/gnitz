@@ -458,7 +458,7 @@ mod tests {
         // Stale-advance the cursor past several keys before co-grouping.
         ch.cursor_mut().advance_to(&(4u128).to_be_bytes()[8..]);
         assert!(
-            ch.cursor_mut().valid && ch.cursor_mut().current_key == 4,
+            ch.cursor_mut().valid && ch.cursor_mut().current_key_narrow() == 4,
             "precondition: stale at pk=4"
         );
 

@@ -1109,7 +1109,7 @@ impl MasterDispatcher {
                 ));
             }
             let a = acc.get_or_insert_with(|| Batch::with_schema(expected, mb.count));
-            a.append_mem_batch_range(mb, 0, mb.count, None);
+            a.append_mem_batch_range(mb, 0, mb.count, crate::storage::WeightFill::Copy);
             Ok(())
         })
         .await?;

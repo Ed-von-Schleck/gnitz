@@ -2178,11 +2178,10 @@ mod tests {
             "enforce_signed",
             schema,
             1234,
-            256,
+            crate::storage::Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            crate::storage::partition_arena_size(256),
         )
         .unwrap();
 
@@ -2250,11 +2249,10 @@ mod tests {
             "enforce_weight_norm",
             schema,
             1234,
-            256,
+            crate::storage::Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            crate::storage::partition_arena_size(256),
         )
         .unwrap();
 
@@ -2322,11 +2320,10 @@ mod tests {
             "enforce_absent",
             schema,
             1234,
-            256,
+            crate::storage::Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            crate::storage::partition_arena_size(256),
         )
         .unwrap();
 
@@ -2393,11 +2390,10 @@ mod tests {
             "enforce_wide",
             schema,
             555,
-            256,
+            crate::storage::Routing::Hashed,
             Persistence::Ephemeral,
             0,
             256,
-            crate::storage::partition_arena_size(256),
         )
         .unwrap();
 
