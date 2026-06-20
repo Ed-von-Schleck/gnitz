@@ -324,14 +324,14 @@ impl Table {
 
         let consolidated = batch.into_consolidated(&self.schema);
         if self.memtable.should_flush() {
-            self.flush_inner(eff, true)?;
+            self.flush_inner(eff)?;
         }
         // The should_flush() pre-check above ensures runs_bytes is either 0
         // (post-flush) or <= 75% of max_bytes, so check_capacity() inside
         // upsert_sorted_batch (which fires at 100%) cannot return ERR_CAPACITY.
         self.memtable.upsert_sorted_batch(consolidated)?;
         if self.memtable.should_flush() {
-            self.flush_inner(eff, true)?;
+            self.flush_inner(eff)?;
         }
         Ok(())
     }
@@ -545,7 +545,7 @@ impl Table {
 
     /// Net weight for a specific (PK, payload) row, keyed by OPK `key` bytes.
     /// The OPK-keyed memtable bloom gates the run scan at every PK width.
-    pub fn get_weight_for_row_bytes<S: columnar::ColumnarSource>(
+    fn get_weight_for_row_bytes<S: columnar::ColumnarSource>(
         &mut self,
         key: &[u8],
         ref_source: &S,

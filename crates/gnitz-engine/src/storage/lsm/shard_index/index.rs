@@ -137,10 +137,8 @@ impl ShardIndex {
         let l0_cstrs: Vec<&CStr> = l0_cstrings.iter().map(|c| c.as_c_str()).collect();
 
         let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| StorageError::InvalidPath)?;
-        let result_cap = guard_keys.len().max(l0_filenames.len());
-        let mut results: Vec<compact::GuardResult> = (0..result_cap).map(|_| compact::GuardResult::zeroed()).collect();
 
-        let num_results = compact::merge_and_route(
+        let guard_outputs = compact::merge_and_route(
             &l0_cstrs,
             &out_dir,
             &guard_keys,
@@ -148,14 +146,8 @@ impl ShardIndex {
             self.table_id,
             1,
             lsn_tag,
-            &mut results,
             self.can_tag_pk_unique,
         )?;
-
-        let guard_outputs: Vec<(u128, String)> = results[..num_results]
-            .iter()
-            .map(|r| (r.guard_key, r.filename_str().to_string()))
-            .collect();
 
         self.commit_l0_to_l1(&guard_outputs, l0_max_lsn)?;
 
@@ -371,10 +363,8 @@ impl ShardIndex {
         let input_cstrings = to_cstrings(&all_input_files)?;
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
         let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| StorageError::InvalidPath)?;
-        let result_cap = guard_keys.len().max(1);
-        let mut results: Vec<compact::GuardResult> = (0..result_cap).map(|_| compact::GuardResult::zeroed()).collect();
 
-        let num_results = compact::merge_and_route(
+        let guard_outputs = compact::merge_and_route(
             &input_cstrs,
             &out_dir,
             &guard_keys,
@@ -382,14 +372,8 @@ impl ShardIndex {
             self.table_id,
             src_level_num as u32 + 1,
             lsn_tag,
-            &mut results,
             self.can_tag_pk_unique,
         )?;
-
-        let guard_outputs: Vec<(u128, String)> = results[..num_results]
-            .iter()
-            .map(|r| (r.guard_key, r.filename_str().to_string()))
-            .collect();
 
         let schema_copy = self.schema;
         let mut opened: Vec<(u128, ShardEntry)> = Vec::with_capacity(guard_outputs.len());

@@ -15,7 +15,7 @@ use super::super::error::StorageError;
 use super::super::merge::{pack_pk_be, run_merge, BlobCacheGuard};
 use super::super::shard_file::PkUniqueChecker;
 use super::super::shard_reader::MappedShard;
-use super::route::{find_guard_for_key, GuardResult};
+use super::route::find_guard_for_key;
 use crate::schema::SchemaDescriptor;
 
 // ---------------------------------------------------------------------------
@@ -60,9 +60,8 @@ pub fn merge_and_route(
     table_id: u32,
     level_num: u32,
     lsn_tag: u64,
-    out_results: &mut [GuardResult],
     can_tag_pk_unique: bool,
-) -> Result<usize, StorageError> {
+) -> Result<Vec<(u128, String)>, StorageError> {
     // Empty guard_keys would make find_guard_for_key return 0 (via
     // saturating_sub(1)) and then index batches[0] out of bounds. Callers
     // always pass a non-empty list, but don't rely on that silently.
@@ -91,45 +90,33 @@ pub fn merge_and_route(
         batches[gi].append_row_from_source_bytes(pk_bytes, weight, shard, row, blob_caches[gi].get_mut());
     })?;
 
-    // Validate all output paths fit in GuardResult.filename before writing anything.
+    // Reject overlong output paths before writing any shard, so a compaction that
+    // can't finalize leaves L0 intact rather than a half-written level.
     for i in 0..num_guards {
         if batches[i].count > 0 && out_filenames[i].len() >= 256 {
             return Err(StorageError::InvalidPath);
         }
     }
 
-    let mut result_count: usize = 0;
-    for i in 0..num_guards {
+    let mut out: Vec<(u128, String)> = Vec::with_capacity(num_guards);
+    for (i, filename) in out_filenames.into_iter().enumerate() {
         if batches[i].count == 0 {
             continue;
         }
-        let cpath = std::ffi::CString::new(out_filenames[i].as_str()).unwrap();
+        let cpath = std::ffi::CString::new(filename.as_str()).unwrap();
         let flags = checkers[i].flags_if(can_tag_pk_unique);
         if let Err(e) = batches[i].write_as_shard_with_flags(&cpath, table_id, flags) {
-            // Only guards with rows were written (the loop `continue`s on empty
-            // shards), so only those filenames exist on disk. Removing a path for
-            // an empty guard could `unlink` an unrelated file sharing the name.
-            for (j, fname) in out_filenames.iter().enumerate().take(i) {
-                if batches[j].count > 0 {
-                    let _ = std::fs::remove_file(fname);
-                }
+            // Roll back every shard already written this compaction so a failed
+            // merge leaves L0 intact rather than a half-written level. `out` holds
+            // exactly those (empty guards were `continue`d, never written, never
+            // pushed), so a path for an empty guard is never `unlink`ed.
+            for (_, written) in &out {
+                let _ = std::fs::remove_file(written);
             }
             return Err(e);
         }
-        let ri = result_count;
-        assert!(
-            ri < out_results.len(),
-            "merge_and_route: out_results buffer too small ({} slots for {} guards)",
-            out_results.len(),
-            num_guards,
-        );
-        out_results[ri].guard_key = guard_keys[i];
-        let name_bytes = out_filenames[i].as_bytes();
-        let len = name_bytes.len().min(255);
-        out_results[ri].filename[..len].copy_from_slice(&name_bytes[..len]);
-        out_results[ri].filename[len] = 0;
-        result_count += 1;
+        out.push((guard_keys[i], filename));
     }
 
-    Ok(result_count)
+    Ok(out)
 }

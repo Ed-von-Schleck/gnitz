@@ -5,9 +5,8 @@
 
 use std::cmp::Ordering;
 
-use crate::foundation::codec::{read_u32_le, read_u64_le};
 use crate::schema::{
-    compare_german_strings, read_signed,
+    compare_german_strings, read_signed, read_unsigned,
     type_code::{
         BLOB as TYPE_BLOB, F32 as TYPE_F32, F64 as TYPE_F64, I128 as TYPE_I128, STRING as TYPE_STRING,
         U128 as TYPE_U128, U16 as TYPE_U16, U32 as TYPE_U32, U64 as TYPE_U64, U8 as TYPE_U8, UUID as TYPE_UUID,
@@ -61,68 +60,14 @@ pub(crate) fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
             return Ordering::Greater;
         }
 
-        let col_size = col.size() as usize;
-
-        let ord = match col.type_code {
-            TYPE_STRING | TYPE_BLOB => {
-                let ptr_a = src_a.get_col_ptr(row_a, payload_col, 16);
-                let ptr_b = src_b.get_col_ptr(row_b, payload_col, 16);
-                compare_german_strings(ptr_a, src_a.blob_slice(), ptr_b, src_b.blob_slice())
-            }
-            TYPE_U128 | TYPE_UUID => {
-                let ba = src_a.get_col_ptr(row_a, payload_col, 16);
-                let bb = src_b.get_col_ptr(row_b, payload_col, 16);
-                let va = ((read_u64_le(ba, 8) as u128) << 64) | (read_u64_le(ba, 0) as u128);
-                let vb = ((read_u64_le(bb, 8) as u128) << 64) | (read_u64_le(bb, 0) as u128);
-                va.cmp(&vb)
-            }
-            TYPE_I128 => {
-                // A cross-sign `_join_pk` surfaced into a payload slot. Stored
-                // native-LE like U128, but ordered as a signed two's-complement
-                // value — reuse the U128 double-load idiom, then compare as i128.
-                let ba = src_a.get_col_ptr(row_a, payload_col, 16);
-                let bb = src_b.get_col_ptr(row_b, payload_col, 16);
-                let va = (((read_u64_le(ba, 8) as u128) << 64) | (read_u64_le(ba, 0) as u128)) as i128;
-                let vb = (((read_u64_le(bb, 8) as u128) << 64) | (read_u64_le(bb, 0) as u128)) as i128;
-                va.cmp(&vb)
-            }
-            TYPE_U64 => {
-                let ba = src_a.get_col_ptr(row_a, payload_col, 8);
-                let bb = src_b.get_col_ptr(row_b, payload_col, 8);
-                read_u64_le(ba, 0).cmp(&read_u64_le(bb, 0))
-            }
-            TYPE_U32 | TYPE_U16 | TYPE_U8 => {
-                let raw_a = src_a.get_col_ptr(row_a, payload_col, col_size);
-                let raw_b = src_b.get_col_ptr(row_b, payload_col, col_size);
-                // Zero-extend little-endian bytes to u64 for unsigned comparison.
-                let mut buf_a = [0u8; 8];
-                let mut buf_b = [0u8; 8];
-                buf_a[..col_size].copy_from_slice(raw_a);
-                buf_b[..col_size].copy_from_slice(raw_b);
-                u64::from_le_bytes(buf_a).cmp(&u64::from_le_bytes(buf_b))
-            }
-            TYPE_F64 => {
-                let ba = src_a.get_col_ptr(row_a, payload_col, 8);
-                let bb = src_b.get_col_ptr(row_b, payload_col, 8);
-                let va = f64::from_bits(read_u64_le(ba, 0));
-                let vb = f64::from_bits(read_u64_le(bb, 0));
-                va.total_cmp(&vb)
-            }
-            TYPE_F32 => {
-                let ba = src_a.get_col_ptr(row_a, payload_col, 4);
-                let bb = src_b.get_col_ptr(row_b, payload_col, 4);
-                let va = f32::from_bits(read_u32_le(ba, 0));
-                let vb = f32::from_bits(read_u32_le(bb, 0));
-                va.total_cmp(&vb)
-            }
-            _ => {
-                let raw_a = src_a.get_col_ptr(row_a, payload_col, col_size);
-                let raw_b = src_b.get_col_ptr(row_b, payload_col, col_size);
-                let va = read_signed(raw_a, col_size);
-                let vb = read_signed(raw_b, col_size);
-                va.cmp(&vb)
-            }
-        };
+        let cs = col.size() as usize;
+        let ord = cmp_col_window(
+            src_a.get_col_ptr(row_a, payload_col, cs),
+            src_a.blob_slice(),
+            src_b.get_col_ptr(row_b, payload_col, cs),
+            src_b.blob_slice(),
+            col.type_code,
+        );
 
         if ord != Ordering::Equal {
             return ord;
@@ -130,6 +75,47 @@ pub(crate) fn compare_rows<A: ColumnarSource, B: ColumnarSource>(
     }
 
     Ordering::Equal
+}
+
+/// Compare two equal-length little-endian byte windows of a fixed-width column
+/// under the given raw `u8` type code. STRING/BLOB are not handled here — callers
+/// requiring them must dispatch German strings first (see [`cmp_col_window`]); a
+/// mis-routed 16-byte string window hits `read_signed`'s `unreachable!` rather than
+/// silently mis-comparing.
+#[inline]
+fn cmp_typed_le(a: &[u8], b: &[u8], type_code: u8) -> Ordering {
+    debug_assert_eq!(a.len(), b.len(), "cmp_typed_le: windows must be equal length");
+    match type_code {
+        TYPE_U128 | TYPE_UUID => {
+            u128::from_le_bytes(a.try_into().unwrap()).cmp(&u128::from_le_bytes(b.try_into().unwrap()))
+        }
+        // I128 payload (a cross-sign `_join_pk` surfaced into a payload slot) is
+        // stored native-LE and compares as a signed two's-complement value.
+        TYPE_I128 => i128::from_le_bytes(a.try_into().unwrap()).cmp(&i128::from_le_bytes(b.try_into().unwrap())),
+        TYPE_F64 => f64::from_le_bytes(a.try_into().unwrap()).total_cmp(&f64::from_le_bytes(b.try_into().unwrap())),
+        TYPE_F32 => f32::from_le_bytes(a.try_into().unwrap()).total_cmp(&f32::from_le_bytes(b.try_into().unwrap())),
+        TYPE_U8 | TYPE_U16 | TYPE_U32 | TYPE_U64 => read_unsigned(a, a.len()).cmp(&read_unsigned(b, b.len())),
+        _ => read_signed(a, a.len()).cmp(&read_signed(b, b.len())), // I8/I16/I32/I64
+    }
+}
+
+/// Compare two equal-width column windows of the given raw `u8` type code,
+/// dispatching German strings (STRING/BLOB) to content comparison through their
+/// backing blob arenas and every fixed-width type to [`cmp_typed_le`]. The blob
+/// slices back each side's German-string heap tail (ignored for non-string columns).
+///
+/// This is the single home for the "STRING and BLOB share the 16-byte layout, so
+/// they must be compared by content before the fixed-width dispatch" rule:
+/// `compare_rows` and the group-by / payload comparators in `ops` all route through
+/// here rather than re-spelling the per-type dispatch (a missed site would mis-order
+/// a BLOB key).
+#[inline]
+pub(crate) fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], type_code: u8) -> Ordering {
+    if type_code == TYPE_STRING || type_code == TYPE_BLOB {
+        compare_german_strings(a, a_blob, b, b_blob)
+    } else {
+        cmp_typed_le(a, b, type_code)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +398,7 @@ mod tests {
             1
         }
         fn get_null_word(&self, row: usize) -> u64 {
-            read_u64_le(&self.null_bmp, row * 8)
+            crate::foundation::codec::read_u64_le(&self.null_bmp, row * 8)
         }
         fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
             let off = row * col_size;

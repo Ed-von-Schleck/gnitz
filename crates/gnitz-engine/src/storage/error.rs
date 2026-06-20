@@ -52,5 +52,3 @@ impl fmt::Display for StorageError {
         f.write_str(s)
     }
 }
-
-impl std::error::Error for StorageError {}

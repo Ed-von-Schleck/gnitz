@@ -35,7 +35,9 @@ pub(crate) use batch::{
     index_meta_schema_desc, make_index_schema, project_schema, BatchBuilder, WeightFill, INDEX_META_COL_NAMES,
     MAX_WIRE_REGIONS,
 };
-pub(crate) use columnar::{compare_pk_bytes, compare_rows, compare_rows_fixedint_nonnull, opk_key, with_payload_cmp};
+pub(crate) use columnar::{
+    cmp_col_window, compare_pk_bytes, compare_rows, compare_rows_fixedint_nonnull, opk_key, with_payload_cmp,
+};
 pub(crate) use lsm::manifest::PkBuf;
 #[cfg(test)]
 pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
@@ -44,7 +46,7 @@ pub(crate) use lsm::read_cursor::REWIND_CALLS;
 pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
 pub(crate) use lsm::wal::block_size as wal_block_size;
 pub(crate) use merge::{pk_sort_key, BlobCacheGuard, DirectWriter};
-pub(crate) use range_key::{increment_key_in_place, range_cut_points, range_group_cut_points};
+pub(crate) use range_key::{increment_key_in_place, range_cut_points};
 
 /// Append the `.tmp` suffix to a CStr basename and return a new CString.
 pub(super) fn cstr_with_tmp_suffix(base: &std::ffi::CStr) -> Result<std::ffi::CString, error::StorageError> {

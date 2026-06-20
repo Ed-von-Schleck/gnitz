@@ -23,7 +23,7 @@ use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 impl Table {
     /// Flush memtable to shard.  Persistent tables also update manifest.
     pub fn flush(&mut self) -> Result<bool, StorageError> {
-        self.flush_inner(self.persistence, true)
+        self.flush_inner(self.persistence)
     }
 
     /// Flush with durable shard naming and manifest update, regardless of
@@ -31,7 +31,7 @@ impl Table {
     /// provides durability) but still need manifest-tracked shards so
     /// the data survives restart.
     pub fn flush_durable(&mut self) -> Result<bool, StorageError> {
-        self.flush_inner(Persistence::Durable, true)
+        self.flush_inner(Persistence::Durable)
     }
 
     /// Open the partition directory fd on demand (`O_RDONLY|O_DIRECTORY`).
@@ -181,7 +181,7 @@ impl Table {
     /// worker batch and then **close**. On any error path the fd is closed
     /// here (or by `FlushWork`'s Drop, when `shard_rename` is restored) so a
     /// failed commit does not leak it.
-    pub fn flush_commit(&mut self, mut work: FlushWork) -> Result<Option<libc::c_int>, StorageError> {
+    pub(crate) fn flush_commit(&mut self, mut work: FlushWork) -> Result<Option<libc::c_int>, StorageError> {
         // Rename shard .tmp → final.
         let dirfd = if let Some(rename) = work.shard_rename.take() {
             let rc = unsafe {
@@ -229,7 +229,7 @@ impl Table {
         Ok(dirfd)
     }
 
-    pub(super) fn flush_inner(&mut self, persistence: Persistence, sync_dir: bool) -> Result<bool, StorageError> {
+    pub(super) fn flush_inner(&mut self, persistence: Persistence) -> Result<bool, StorageError> {
         match self.flush_prepare_with(persistence)? {
             FlushOutcome::Empty => Ok(false),
             FlushOutcome::DoneInline => Ok(true),
@@ -246,11 +246,10 @@ impl Table {
                 }
                 work.close_fds();
                 // `flush_commit` returns the owned per-flush dir fd; fsync it
-                // (when durability is requested) then close it — it is not held
-                // for the table's lifetime.
+                // then close it — it is not held for the table's lifetime.
                 let dirfd = self.flush_commit(*work)?;
                 if let Some(fd) = dirfd {
-                    let ok = if sync_dir { fsync_eintr(fd).is_ok() } else { true };
+                    let ok = fsync_eintr(fd).is_ok();
                     unsafe {
                         libc::close(fd);
                     }

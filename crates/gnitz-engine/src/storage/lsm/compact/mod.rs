@@ -1,8 +1,8 @@
 //! Self-contained shard compaction: N-way merge of sorted shard files.
 //!
 //! Carved along the merge/route seam: the N-way (PK, payload) merge kernel and
-//! the routing-aware `merge_and_route` live in [`merge`]; the guard lookup,
-//! [`GuardResult`], and the `compact_shards` orchestration live in [`route`].
+//! the routing-aware `merge_and_route` live in [`merge`]; the guard lookup and
+//! the `compact_shards` orchestration live in [`route`].
 //! This module re-exports the public entry points and hosts the shared tests,
 //! which exercise both halves through the public surface.
 
@@ -10,7 +10,7 @@ mod merge;
 mod route;
 
 pub use merge::merge_and_route;
-pub use route::{compact_shards, GuardResult};
+pub use route::compact_shards;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -260,8 +260,7 @@ mod tests {
         let schema = make_test_schema();
         let cdir = std::ffi::CString::new("/tmp").unwrap();
         let guards: [u128; 0] = [];
-        let mut results: [GuardResult; 0] = [];
-        let r = merge_and_route(&[], &cdir, &guards, &schema, 0, 1, 0, &mut results, false);
+        let r = merge_and_route(&[], &cdir, &guards, &schema, 0, 1, 0, false);
         assert!(r.is_err(), "empty guard_keys must return Err, not panic");
     }
 
@@ -288,24 +287,18 @@ mod tests {
             crate::storage::merge::pk_sort_key(&0u64.to_be_bytes()),
             crate::storage::merge::pk_sort_key(&100u64.to_be_bytes()),
         ];
-        let mut results = [GuardResult::zeroed(), GuardResult::zeroed()];
-
-        let n = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, &mut results, false).unwrap();
-        assert_eq!(n, 2); // both guards should have rows
+        let guard_outputs = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, false).unwrap();
+        assert_eq!(guard_outputs.len(), 2); // both guards should have rows
 
         // Guard 0 should have keys 10, 50
-        let fn0_end = results[0].filename.iter().position(|&b| b == 0).unwrap_or(256);
-        let fn0 = std::str::from_utf8(&results[0].filename[..fn0_end]).unwrap();
-        let cfn0 = std::ffi::CString::new(fn0).unwrap();
+        let cfn0 = std::ffi::CString::new(guard_outputs[0].1.as_str()).unwrap();
         let g0 = MappedShard::open(&cfn0, &schema, false).unwrap();
         assert_eq!(g0.count, 2);
         assert_eq!(g0.get_pk(0), 10);
         assert_eq!(g0.get_pk(1), 50);
 
         // Guard 1 should have keys 150, 250
-        let fn1_end = results[1].filename.iter().position(|&b| b == 0).unwrap_or(256);
-        let fn1 = std::str::from_utf8(&results[1].filename[..fn1_end]).unwrap();
-        let cfn1 = std::ffi::CString::new(fn1).unwrap();
+        let cfn1 = std::ffi::CString::new(guard_outputs[1].1.as_str()).unwrap();
         let g1 = MappedShard::open(&cfn1, &schema, false).unwrap();
         assert_eq!(g1.count, 2);
         assert_eq!(g1.get_pk(0), 150);
@@ -338,8 +331,7 @@ mod tests {
         fs::create_dir_all(&blocker).unwrap();
 
         let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
-        let mut results = [GuardResult::zeroed(), GuardResult::zeroed()];
-        let rc = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, &mut results, false);
+        let rc = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, false);
 
         assert!(rc.is_err(), "expected failure, got {rc:?}");
         let guard0_file = dir.join("shard_0_99_L1_G0.db");
@@ -708,13 +700,10 @@ mod tests {
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
 
         let guard_keys: Vec<u128> = vec![0]; // single guard
-        let mut results = vec![GuardResult::zeroed()];
+        let guard_outputs = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 99, 1, 1, false).unwrap();
+        assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
 
-        let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 99, 1, 1, &mut results, false).unwrap();
-        assert!(n > 0, "merge_and_route should produce output");
-
-        let fn0 = crate::foundation::codec::cstr_from_buf(&results[0].filename);
-        let rows = read_3col_shard(fn0, &schema);
+        let rows = read_3col_shard(&guard_outputs[0].1, &schema);
         assert_eq!(rows.len(), 2, "expected 2 rows, got {rows:?}");
         assert_eq!(rows[0], (10, 1, 0, 300));
         assert_eq!(rows[1], (20, 1, 1, 400));
@@ -816,13 +805,10 @@ mod tests {
         let inputs = [cs1.as_c_str()];
 
         let guard_keys: Vec<u128> = vec![200]; // single guard at key 200
-        let mut results = vec![GuardResult::zeroed()];
+        let guard_outputs = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 42, 2, 1, false).unwrap();
+        assert!(!guard_outputs.is_empty(), "merge_and_route should produce output");
 
-        let n = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 42, 2, 1, &mut results, false).unwrap();
-        assert!(n > 0, "merge_and_route should produce output");
-
-        let fn0 = crate::foundation::codec::cstr_from_buf(&results[0].filename);
-        let cpath = std::ffi::CString::new(fn0).unwrap();
+        let cpath = std::ffi::CString::new(guard_outputs[0].1.as_str()).unwrap();
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 4, "all 4 keys must be present in output");
 

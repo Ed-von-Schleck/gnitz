@@ -124,27 +124,6 @@ pub(crate) fn range_cut_points(eq: &[u8], d: &[u8], rel: RangeRel) -> Option<(Cu
     }
 }
 
-/// Half-open `[start, end)` cut covering a whole delta eq-group's range probes in
-/// one interval. The group shares the eq prefix `eq`; its rows' range slots span
-/// `[d_lo, d_hi]` (sorted ascending). The union of the group's per-row intervals
-/// collapses to a *single* [`range_cut_points`] cut on the group's extreme value:
-/// `d_hi` for `Lt`/`Le` (the open `end` grows with `d`), `d_lo` for `Gt`/`Ge`
-/// (the open `start` shrinks with `d`). Seeking to `start` and stopping at `end`
-/// thus covers exactly the trace rows some group row matches — no dead head/tail.
-/// `None` ⇒ the whole group is provably empty (e.g. `Gt` of an all-maximal slot).
-pub(crate) fn range_group_cut_points(
-    eq: &[u8],
-    d_lo: &[u8],
-    d_hi: &[u8],
-    rel: RangeRel,
-) -> Option<(CutKey, Option<CutKey>)> {
-    let extreme = match rel {
-        RangeRel::Lt | RangeRel::Le => d_hi,
-        RangeRel::Gt | RangeRel::Ge => d_lo,
-    };
-    range_cut_points(eq, extreme, rel)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 //! Non-equi (range / band) join delta-trace.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{range_cut_points, range_group_cut_points, Batch, MemBatch, ReadCursor};
+use crate::storage::{range_cut_points, Batch, MemBatch, ReadCursor};
 use gnitz_wire::RangeRel;
 
 use super::rowwrite::write_join_row;
@@ -127,9 +127,10 @@ fn range_per_row_seek(
 }
 
 /// Strategy 2 — trace-driven eq-group merge walk (`|delta| > |trace|`). Per delta
-/// eq-group, `range_group_cut_points` gives the one `[start, end)` span covering
-/// the whole group; seek to `start` and sweep only that span with a monotone
-/// delta pointer, emitting the matching contiguous delta sub-range per trace row.
+/// eq-group, a single `range_cut_points` cut on the group's extreme slot gives the
+/// one `[start, end)` span covering the whole group; seek to `start` and sweep only
+/// that span with a monotone delta pointer, emitting the matching contiguous delta
+/// sub-range per trace row.
 /// The seek skips untouched trace groups *and* the intra-group dead head/tail, so
 /// every walked trace row matches some delta row — none is walked redundantly.
 /// Structurally a sort-merge band join: `O(g·log r + covered + m + output)`,
@@ -159,11 +160,18 @@ fn range_merge_walk(
             hi += 1;
         }
 
-        // One cut spanning the whole group. `None` ⇒ provably-empty group (e.g.
-        // Gt of an all-maximal slot) — skip it.
+        // One cut spanning the whole eq-group. The union of the group's per-row
+        // intervals collapses to a single range_cut_points cut on the group's extreme
+        // value: d_hi for Lt/Le (the open `end` grows with d), d_lo for Gt/Ge (the
+        // open `start` shrinks with d). `None` ⇒ provably-empty group (e.g. Gt of an
+        // all-maximal slot) — skip it.
         let d_lo = &delta_mb.get_pk_bytes(lo)[eq_size..];
         let d_hi = &delta_mb.get_pk_bytes(hi - 1)[eq_size..];
-        let Some((start, end)) = range_group_cut_points(e, d_lo, d_hi, rel) else {
+        let d = match rel {
+            RangeRel::Lt | RangeRel::Le => d_hi,
+            RangeRel::Gt | RangeRel::Ge => d_lo,
+        };
+        let Some((start, end)) = range_cut_points(e, d, rel) else {
             lo = hi;
             continue;
         };

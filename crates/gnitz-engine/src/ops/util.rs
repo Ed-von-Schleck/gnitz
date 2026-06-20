@@ -5,55 +5,15 @@ use xxhash_rust::xxh3::Xxh3Default;
 use crate::schema::{type_code, ColumnLocator, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, MemBatch, ReadCursor};
 
-/// Compare two equal-length LE byte windows of a fixed-width column under
-/// the given `TypeCode`. Unifies the per-TypeCode dispatch used by reduce's
-/// PK-sentinel and payload arms and by `compare_cursor_payload_to_batch_row`.
-/// String and Blob are not handled here — callers requiring them must
-/// dispatch on String before delegating.
-#[inline]
-pub(super) fn cmp_typed_le(a: &[u8], b: &[u8], tc: TypeCode) -> std::cmp::Ordering {
-    debug_assert_eq!(a.len(), b.len(), "cmp_typed_le: windows must be equal length");
-    match tc {
-        TypeCode::U128 | TypeCode::UUID => {
-            u128::from_le_bytes(a.try_into().unwrap()).cmp(&u128::from_le_bytes(b.try_into().unwrap()))
-        }
-        // I128 payload (a cross-sign `_join_pk` surfaced into a payload slot) is
-        // stored native-LE and compares as a signed two's-complement value.
-        TypeCode::I128 => i128::from_le_bytes(a.try_into().unwrap()).cmp(&i128::from_le_bytes(b.try_into().unwrap())),
-        TypeCode::F64 => {
-            f64::from_le_bytes(a.try_into().unwrap()).total_cmp(&f64::from_le_bytes(b.try_into().unwrap()))
-        }
-        TypeCode::F32 => {
-            f32::from_le_bytes(a.try_into().unwrap()).total_cmp(&f32::from_le_bytes(b.try_into().unwrap()))
-        }
-        TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 => {
-            crate::schema::read_signed(a, a.len()).cmp(&crate::schema::read_signed(b, b.len()))
-        }
-        TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 => {
-            crate::schema::read_unsigned(a, a.len()).cmp(&crate::schema::read_unsigned(b, b.len()))
-        }
-        TypeCode::String | TypeCode::Blob => {
-            unreachable!("cmp_typed_le: caller must dispatch String/Blob separately")
-        }
-    }
-}
-
-/// Compare two equal-width column windows of type `tc`, dispatching German
-/// strings (STRING/BLOB) to content comparison through their backing blob
-/// arenas and every fixed-width type to [`cmp_typed_le`]. The blob slices back
-/// each side's German-string heap tail (ignored for non-string columns).
-///
-/// This is the single home for the "STRING and BLOB share the 16-byte layout,
-/// so `cmp_typed_le` panics on them and they must be compared by content" rule;
-/// the group-by and payload comparators all route through here rather than
-/// re-spelling the dispatch (a missed site panics the engine on a BLOB key).
+/// Compare two equal-width column windows of type `tc` — the `ops`-side adapter over
+/// storage's single-homed [`crate::storage::cmp_col_window`], which dispatches German
+/// strings (STRING/BLOB) to content comparison and every fixed-width type to its
+/// little-endian comparator. `tc as u8` is the raw type code (`TypeCode` is
+/// `#[repr(u8)]`); the group-by and payload comparators route through here so the
+/// `ops` side keeps thinking in `TypeCode`.
 #[inline]
 pub(super) fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], tc: TypeCode) -> std::cmp::Ordering {
-    if tc.is_german_string() {
-        crate::schema::compare_german_strings(a, a_blob, b, b_blob)
-    } else {
-        cmp_typed_le(a, b, tc)
-    }
+    crate::storage::cmp_col_window(a, a_blob, b, b_blob, tc as u8)
 }
 
 // ---------------------------------------------------------------------------

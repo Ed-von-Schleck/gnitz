@@ -1,6 +1,5 @@
-//! Guard routing for shard compaction: the per-bucket guard-key lookup, the
-//! per-bucket output descriptor (`GuardResult`), and the `compact_shards`
-//! orchestration that merges N inputs into a single output shard.
+//! Guard routing for shard compaction: the per-bucket guard-key lookup and the
+//! `compact_shards` orchestration that merges N inputs into a single output shard.
 
 use std::ffi::CStr;
 
@@ -10,28 +9,6 @@ use super::super::merge::BlobCacheGuard;
 use super::super::shard_file::PkUniqueChecker;
 use super::merge::open_and_merge;
 use crate::schema::SchemaDescriptor;
-
-// ---------------------------------------------------------------------------
-// Guard output result (returned from merge_and_route)
-// ---------------------------------------------------------------------------
-
-pub struct GuardResult {
-    pub guard_key: u128,
-    pub filename: [u8; 256], // null-terminated
-}
-
-impl GuardResult {
-    pub fn zeroed() -> Self {
-        GuardResult {
-            guard_key: 0,
-            filename: [0u8; 256],
-        }
-    }
-
-    pub fn filename_str(&self) -> &str {
-        crate::foundation::codec::cstr_from_buf(&self.filename)
-    }
-}
 
 pub(super) fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
     guard_keys.partition_point(|&g| g <= key).saturating_sub(1)

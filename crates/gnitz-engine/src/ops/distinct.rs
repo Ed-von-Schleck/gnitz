@@ -313,9 +313,10 @@ mod tests {
     }
 
     /// Regression: a non-null BLOB payload column previously panicked. The
-    /// (non-null, non-null) payload-compare arm routed BLOB to `cmp_typed_le`,
-    /// whose Blob arm is `unreachable!`. BLOB shares the German-string layout
-    /// and must dispatch through `compare_german_strings` like STRING.
+    /// (non-null, non-null) payload-compare arm routed BLOB to the fixed-width
+    /// comparator (`cmp_typed_le`), which `unreachable!`s on the 16-byte string
+    /// width. BLOB shares the German-string layout and must dispatch through
+    /// `compare_german_strings` like STRING.
     #[test]
     fn test_distinct_blob_payload_no_panic() {
         use crate::storage::CursorHandle;
