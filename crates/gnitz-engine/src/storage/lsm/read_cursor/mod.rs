@@ -9,11 +9,11 @@ use std::ptr;
 use std::rc::Rc;
 
 use super::batch::Batch;
-use super::columnar::{self, PkOrd};
+use super::columnar::PkOrd;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::UnifiedSource;
 use super::shard_reader::MappedShard;
-use super::{with_payload_cmp, with_pk_ord};
+use super::{with_pk_ord, with_row_cmp};
 use crate::schema::SchemaDescriptor;
 
 mod handle;
@@ -180,9 +180,9 @@ impl ReadCursor {
         LoserTree::build(sources.len(), init, heap_less_with(schema, sources, pk_ord, row_cmp))
     }
 
-    /// Non-PkUnique payload-dispatch layer; defers to the stride dispatch in
-    /// `build_tree_with`. Split so `with_payload_cmp!` can hand it the
-    /// monomorphized `row_cmp`, which it then threads through `with_pk_ord!`.
+    /// The stride-dispatch layer: threads the selected `row_cmp` through
+    /// `with_pk_ord!` into `build_tree_with`. Split out so the comparator macros
+    /// (`with_row_cmp!` / `with_payload_cmp!`) can hand it a monomorphized `row_cmp`.
     #[inline]
     fn build_tree_with_payload<RowCmp: RowComparator>(
         sources: &[CursorSource],
@@ -199,23 +199,16 @@ impl ReadCursor {
         schema: &SchemaDescriptor,
         is_pk_unique: bool,
     ) -> LoserTree {
-        // PkUnique skips the payload tiebreak (a PK tie ⇒ same element) and
-        // dispatches only the stride; non-PkUnique dispatches payload (outer) then
-        // stride (inner). Each arm passes non-capturing closures so the inner
-        // helper inlines them — a direct fn-item reference would fix the
-        // source-ref lifetime and conflict with the `_with` HRTB Fn bound.
-        if is_pk_unique {
-            with_pk_ord!(
-                schema,
-                Self::build_tree_with,
-                sources,
-                states,
-                schema,
-                |_, _, _, _, _| Ordering::Equal
-            )
-        } else {
-            with_payload_cmp!(schema, Self::build_tree_with_payload, sources, states, schema)
-        }
+        // `with_row_cmp!` selects the comparator; `build_tree_with_payload` then
+        // dispatches the stride.
+        with_row_cmp!(
+            schema,
+            is_pk_unique,
+            Self::build_tree_with_payload,
+            sources,
+            states,
+            schema
+        )
     }
 
     fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
@@ -283,7 +276,8 @@ impl ReadCursor {
     }
 
     /// Byte-addressed sibling of [`seek`]. `key` must be exactly `pk_stride`
-    /// bytes. Correct at every PK width: the inner `drive`/`build_tree` key the
+    /// OPK bytes (the bytes from `get_pk_bytes`/`current_pk_bytes`). Correct at
+    /// every PK width and signedness: the inner `drive`/`build_tree` key the
     /// heap via the stride-dispatched `pk_ord` over the full OPK bytes, so this
     /// survives `pk_stride > 16` where the u128 `seek` cannot.
     pub fn seek_bytes(&mut self, key: &[u8]) {
@@ -333,30 +327,15 @@ impl ReadCursor {
 
     /// Gallop the `Multi` loser tree forward to the first head `>= key`, then
     /// drive the first live group. The gallop keys the heap through the shared
-    /// `heap_less_with` order, so an all-PkUnique cursor passes the trivial
-    /// payload tiebreak while everything else routes the live comparator through
-    /// `with_payload_cmp!`. Precondition (enforced by [`advance_to`]'s dispatch):
+    /// `heap_less_with` order, with the comparator selected by `with_row_cmp!`.
+    /// Precondition (enforced by [`advance_to`]'s dispatch):
     /// `matches!(self.mode, SourceMode::Multi)` and `key` > the current emitted PK.
     fn seek_forward_multi(&mut self, key: &[u8]) {
-        if self.is_pk_unique {
-            with_pk_ord!(self.schema, Self::seek_forward_multi_pk_unique, self, key);
-        } else {
-            with_payload_cmp!(self.schema, Self::seek_forward_multi_with, self, key);
-        }
+        with_row_cmp!(self.schema, self.is_pk_unique, Self::seek_forward_multi_with, self, key);
     }
 
-    /// All-PkUnique forward seek: gallop with the trivial payload tiebreak (a PK
-    /// tie ⇒ the same Z-set element), then drive. `pk_ord` is reused for the
-    /// gallop and the drive, so the stride is dispatched once for both.
-    #[inline]
-    fn seek_forward_multi_pk_unique<PK: PkOrd>(&mut self, key: &[u8], pk_ord: PK) {
-        self.gallop_heap_forward(key, pk_ord, |_, _, _, _, _| Ordering::Equal);
-        self.drive_pk_unique_inner(pk_ord);
-    }
-
-    /// Non-PkUnique forward seek: gallop with the live payload comparator, then
-    /// drive. Split so `with_payload_cmp!` hands it the monomorphized `row_cmp`,
-    /// which it threads through `with_pk_ord!` for the stride dispatch.
+    /// Gallop the heads forward with the selected `row_cmp`, then drive; threads
+    /// `row_cmp` through `with_pk_ord!` for the stride dispatch.
     #[inline]
     fn seek_forward_multi_with<RowCmp: RowComparator>(&mut self, key: &[u8], row_cmp: RowCmp) {
         with_pk_ord!(self.schema, Self::seek_forward_multi_both, self, key, row_cmp);
@@ -461,13 +440,6 @@ impl ReadCursor {
         self.current_key.expect("narrow PK cursor")
     }
 
-    /// Seek to a group's PK by its OPK `key_bytes` (the bytes from
-    /// `get_pk_bytes`/`current_pk_bytes`, already order-preserving at rest).
-    /// Correct at every PK width and PK signedness.
-    pub fn seek_group(&mut self, key_bytes: &[u8]) {
-        self.seek_bytes(key_bytes);
-    }
-
     /// Whether the current row's PK equals the group's OPK `key_bytes`. Callers
     /// must gate on `valid` first — this reads the current row's bytes, which is
     /// undefined on an unpositioned cursor.
@@ -528,30 +500,24 @@ impl ReadCursor {
     /// the callback can read the current trace row's columns / weight (e.g.
     /// `write_join_row`, `push_current_row`). Unlike [`walk_pk_group`] this commits
     /// `current_*` per row (the callback reads through it), but hoists the
-    /// `is_pk_unique` + `with_payload_cmp!` dispatch out of the loop. `f` must not
+    /// `with_row_cmp!` dispatch out of the loop. `f` must not
     /// re-enter the cursor. Same exit postcondition and `(PK, payload)`-sub-group
     /// granularity as [`walk_pk_group`]; same group-walk contract as the
     /// `while current_pk_eq { advance }` loops it replaces.
     pub(crate) fn for_each_pk_group_row<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], f: F) {
-        if self.is_pk_unique {
-            self.for_each_pk_group_row_pk_unique(key, f);
-        } else {
-            with_payload_cmp!(self.schema, Self::for_each_pk_group_row_with, self, key, f);
-        }
+        with_row_cmp!(
+            self.schema,
+            self.is_pk_unique,
+            Self::for_each_pk_group_row_with,
+            self,
+            key,
+            f
+        );
     }
 
-    /// All-PkUnique specialization of [`for_each_pk_group_row`]: advances via the
-    /// payload-comparator-free `advance_pk_unique`.
-    fn for_each_pk_group_row_pk_unique<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], mut f: F) {
-        while self.valid && self.current_pk_eq(key) {
-            f(&*self);
-            self.advance_pk_unique();
-        }
-    }
-
-    /// Non-PkUnique specialization of [`for_each_pk_group_row`]: the monomorphized
-    /// `row_cmp` (selected once by `with_payload_cmp!`) is threaded through each
-    /// `advance_with`, so the per-row advance never re-selects the comparator.
+    /// Walks the equal-PK group, invoking `f` at each emitted row. The monomorphized
+    /// `row_cmp` is threaded through each `advance_with`, so the per-row advance never
+    /// re-selects the comparator.
     #[inline]
     fn for_each_pk_group_row_with<RowCmp: RowComparator, F: FnMut(&ReadCursor)>(
         &mut self,
@@ -628,11 +594,7 @@ impl ReadCursor {
         if !self.valid {
             return;
         }
-        if self.is_pk_unique {
-            self.advance_pk_unique();
-        } else {
-            with_payload_cmp!(self.schema, Self::advance_with, self);
-        }
+        with_row_cmp!(self.schema, self.is_pk_unique, Self::advance_with, self);
     }
 
     /// Step past the previously-emitted row before a re-drive. Only `Single`
@@ -648,12 +610,6 @@ impl ReadCursor {
     }
 
     #[inline]
-    fn advance_pk_unique(&mut self) {
-        self.pre_step_single();
-        self.drive_pk_unique();
-    }
-
-    #[inline]
     fn advance_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         self.pre_step_single();
         self.drive_with(row_cmp);
@@ -661,90 +617,13 @@ impl ReadCursor {
 
     #[inline]
     fn drive(&mut self) {
-        if self.is_pk_unique {
-            self.drive_pk_unique();
-        } else {
-            with_payload_cmp!(self.schema, Self::drive_with, self);
-        }
+        with_row_cmp!(self.schema, self.is_pk_unique, Self::drive_with, self);
     }
 
-    /// Drive the non-`Multi` modes, returning `true` if one handled the step;
-    /// `Multi` returns `false` so the caller dispatches its own monomorphized
-    /// `*_inner`. Shared by `drive_pk_unique` and `drive_with` so the
-    /// Empty/Single/Pair ladder lives in one place. `row_cmp` reaches only the
-    /// `Pair` bypass (PkUnique passes the trivial equal-PK ⇒ same-element cmp).
-    #[inline]
-    fn drive_small_modes<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) -> bool {
-        if matches!(self.mode, SourceMode::Empty) {
-            self.valid = false;
-            return true;
-        }
-        if matches!(self.mode, SourceMode::Single) {
-            self.drive_single();
-            return true;
-        }
-        if matches!(self.mode, SourceMode::Pair) {
-            with_pk_ord!(self.schema, Self::drive_pair_inner, self, row_cmp);
-            return true;
-        }
-        false
-    }
-
-    /// N-way merge driver for all-PkUnique cursors. Skips payload comparison: a
-    /// cross-source PK tie implies the same Z-set element (no retractions exist in
-    /// any source). The narrow/wide fork is gone — the stride-dispatched `pk_ord`
-    /// compares the full OPK bytes at every width, so a wide prefix collision can
-    /// no longer false-merge two distinct PKs.
-    #[inline]
-    fn drive_pk_unique(&mut self) {
-        // PkUnique Empty/Single/Pair: equal PK ⇒ same element, so the payload
-        // tiebreak is trivial (the Pair fold still sums weights across the heads).
-        if self.drive_small_modes(|_, _, _, _, _| Ordering::Equal) {
-            return;
-        }
-        with_pk_ord!(self.schema, Self::drive_pk_unique_inner, self);
-    }
-
-    /// `Multi` PkUnique drive, monomorphized on the stride comparator `pk_ord`.
-    /// Precondition: `matches!(self.mode, SourceMode::Multi)`.
-    #[inline]
-    fn drive_pk_unique_inner<PK: PkOrd>(&mut self, pk_ord: PK) {
-        let heap = match &mut self.mode {
-            SourceMode::Multi(h) => h,
-            _ => unreachable!("drive_pk_unique_inner requires SourceMode::Multi"),
-        };
-        let schema = &self.schema;
-        let sources = &self.sources;
-        let states = &mut self.states;
-        // `less` is the pure OPK order (no payload term). `same_pk` is the
-        // width-agnostic OPK byte equality; matching PK ⇒ same element, so
-        // `eq_payload` is trivially true. The debug-assert pins the PkUnique
-        // invariant (equal PK ⇒ equal payload), firing only on a real violation.
-        let less = |a: &HeapNode, b: &HeapNode| -> bool {
-            pk_ord
-                .cmp(
-                    sources[a.source_idx as usize].get_pk_bytes(a.row as usize),
-                    sources[b.source_idx as usize].get_pk_bytes(b.row as usize),
-                )
-                .is_lt()
-        };
-        let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-            let eq = sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row);
-            debug_assert!(
-                !eq || columnar::compare_rows(schema, &sources[a_src], a_row, &sources[b_src], b_row)
-                    == Ordering::Equal,
-                "PkUnique shard has a PK tie with different payloads — corrupted data or wrong flag",
-            );
-            eq
-        };
-        let eq_payload = |_, _, _, _| true;
-        let emitted = Self::drive_inner(heap, sources, states, less, same_pk, eq_payload);
-        self.commit_emitted(emitted);
-    }
-
-    /// Commit (or invalidate from) the `(net_weight, source_idx, row)` a `Multi`
-    /// drive emitted. `current_key` is recomputed from the row's PK bytes here
-    /// (off the comparator) to honour its native-value / wide-prefix contract.
+    /// Commit (or invalidate from) the `(net_weight, source_idx, row)` a drive
+    /// emitted (the `Single` bypass and every `Multi`/`Pair` driver route here).
+    /// `current_key` is recomputed from the row's PK bytes here (off the
+    /// comparator) to honour its native-value / wide-prefix contract.
     #[inline]
     fn commit_emitted(&mut self, emitted: Option<(i64, usize, usize)>) {
         if let Some((weight, idx, row)) = emitted {
@@ -759,28 +638,19 @@ impl ReadCursor {
         }
     }
 
-    /// Single-source bypass: no heap, no ghost filter.
-    /// `Batch` inputs are pre-consolidated and `CursorState::advance`
-    /// already calls `skip_ghosts` for shard sources, so the state's
-    /// current position is either valid emit-ready or past-end.
+    /// Single-source bypass: no heap, no ghost filter. `Batch` inputs are
+    /// pre-consolidated and `CursorState::advance` already calls `skip_ghosts`
+    /// for shard sources, so the state's current position is either valid
+    /// emit-ready or past-end. Routes through `commit_emitted` so every mode
+    /// materializes `current_*` (and the `current_key_from_bytes` narrow/wide
+    /// contract) in one place.
     #[inline]
     fn drive_single(&mut self) {
-        let state = &self.states[0];
-        if state.is_valid() {
-            let pos = state.position;
-            let src = &self.sources[0];
-            self.valid = true;
-            // current_key carries the native value for narrow PKs (the form
-            // catalog readers and op_distinct expect) and `None` for wide PKs
-            // (wide consumers read current_pk_bytes()).
-            self.current_key = Self::current_key_from_bytes(src.get_pk_bytes(pos));
-            self.current_weight = src.get_weight(pos);
-            self.current_null_word = src.get_null_word(pos);
-            self.current_entry_idx = 0;
-            self.current_row = pos;
-        } else {
-            self.valid = false;
-        }
+        let s = &self.states[0];
+        let emitted = s
+            .is_valid()
+            .then(|| (self.sources[0].get_weight(s.position), 0, s.position));
+        self.commit_emitted(emitted);
     }
 
     /// Shared N-way merge driver body for the `Multi` drives. Mirrors storage's
@@ -823,9 +693,9 @@ impl ReadCursor {
         emitted
     }
 
-    /// Drive to the next group with the live payload comparator. Empty/Single/Pair
-    /// go through `drive_small_modes`; the `Multi` heap path dispatches the stride
-    /// comparator (`with_pk_ord!`) into `drive_with_inner`.
+    /// Drive to the next group with the selected `row_cmp`. The single mode
+    /// dispatch: Empty invalidates, Single/Pair take their bypass, and `Multi`
+    /// dispatches the stride (`with_pk_ord!`) into `drive_with_inner`.
     ///
     /// On the heap path `drive_merge` folds tied rows for us; we hand it `Break`
     /// from `emit` the first time we see a non-ghost group to return immediately.
@@ -833,10 +703,12 @@ impl ReadCursor {
     /// next group, so the loop naturally walks past them.
     #[inline]
     fn drive_with<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
-        if self.drive_small_modes(row_cmp) {
-            return;
+        match self.mode {
+            SourceMode::Empty => self.valid = false,
+            SourceMode::Single => self.drive_single(),
+            SourceMode::Pair => with_pk_ord!(self.schema, Self::drive_pair_inner, self, row_cmp),
+            SourceMode::Multi(_) => with_pk_ord!(self.schema, Self::drive_with_inner, self, row_cmp),
         }
-        with_pk_ord!(self.schema, Self::drive_with_inner, self, row_cmp);
     }
 
     /// `Multi` non-PkUnique drive, monomorphized on payload (`row_cmp`) and stride
@@ -1466,24 +1338,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = make_schema_i64();
 
-        // PK region holds OPK (order-preserving big-endian) bytes at rest.
-        let pk_bytes: Vec<u8> = 42u128.to_be_bytes().to_vec();
-        let weights: Vec<i64> = vec![1i64];
-        let null_bm: Vec<u64> = vec![0u64];
-        let col_data: Vec<i64> = vec![999i64];
-        let blob: Vec<u8> = Vec::new();
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, weights.len() * 8),
-            (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
-            (col_data.as_ptr() as *const u8, col_data.len() * 8),
-            (blob.as_ptr(), blob.len()),
-        ];
-        let path = dir.path().join("const_pk.db");
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, 1, &regions, false, 0).unwrap();
-        let shard = Rc::new(super::super::shard_reader::MappedShard::open(&cpath, &schema, false).unwrap());
-
+        // A single-row shard Constant-encodes its PK region at rest, which used to
+        // fall back to the row-major scatter; the column-major path now handles it.
+        let shard = write_test_shard(&dir, &schema, 0, &[(42, 1, 999)], 0);
         let cursor = create_read_cursor(&[], &[shard], schema);
         let result = cursor.materialize();
 
@@ -2096,5 +1953,168 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Write `rows` (each `(pk, weight, val)`) to a freshly-streamed `(U128 PK |
+    /// I64 payload)` shard tagged with `flag` (`SHARD_FLAG_PK_UNIQUE` ⇒ the opened
+    /// shard reports `is_pk_unique`, `0` ⇒ it does not). `rows` must be PK-ascending.
+    fn write_test_shard(
+        dir: &tempfile::TempDir,
+        schema: &SchemaDescriptor,
+        idx: usize,
+        rows: &[(u128, i64, i64)],
+        flag: u8,
+    ) -> Rc<MappedShard> {
+        let pks: Vec<u8> = rows.iter().flat_map(|&(pk, _, _)| pk.to_be_bytes()).collect();
+        let weights: Vec<i64> = rows.iter().map(|&(_, w, _)| w).collect();
+        let nulls = vec![0u64; rows.len()];
+        let vals: Vec<i64> = rows.iter().map(|&(_, _, v)| v).collect();
+        let blob: Vec<u8> = Vec::new();
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pks.as_ptr(), pks.len()),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (nulls.as_ptr() as *const u8, nulls.len() * 8),
+            (vals.as_ptr() as *const u8, vals.len() * 8),
+            (blob.as_ptr(), blob.len()),
+        ];
+        let path = dir.path().join(format!("rc_{flag}_{idx}.db"));
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        super::super::shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            0,
+            rows.len() as u32,
+            &regions,
+            false,
+            flag,
+        )
+        .unwrap();
+        Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
+    }
+
+    /// The PkUnique drive path (all sources flagged `is_pk_unique`, payload
+    /// comparison skipped) and the payload path (same bytes, flag cleared) must
+    /// produce identical output on contract-satisfying unique-PK data. Only the
+    /// shard flag differs, so this isolates the comparator-path choice that
+    /// `with_row_cmp!` unifies. Cross-source PK 1 (shards A+C) and PK 7 (A+B)
+    /// repeat with identical payloads, so both paths must fold their weights.
+    #[test]
+    fn pk_unique_and_payload_paths_agree() {
+        crate::foundation::posix_io::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_i64();
+        let shard_rows: [&[(u128, i64, i64)]; 3] = [
+            &[(1, 1, 100), (4, 1, 400), (7, 1, 700)],
+            &[(2, 1, 200), (5, 1, 500), (7, 1, 700)],
+            &[(1, 1, 100), (3, 1, 300), (6, 1, 600)],
+        ];
+        let build = |flag: u8| -> Vec<Rc<MappedShard>> {
+            shard_rows
+                .iter()
+                .enumerate()
+                .map(|(i, rows)| write_test_shard(&dir, &schema, i, rows, flag))
+                .collect()
+        };
+        let pku = build(super::super::layout::SHARD_FLAG_PK_UNIQUE);
+        let plain = build(0);
+
+        let mut pku_cursor = create_read_cursor(&[], &pku, schema);
+        let mut plain_cursor = create_read_cursor(&[], &plain, schema);
+        assert!(pku_cursor.is_pk_unique, "flag=PK_UNIQUE ⇒ PkUnique path");
+        assert!(!plain_cursor.is_pk_unique, "flag=0 ⇒ payload path");
+
+        let got = scan_all(&mut pku_cursor);
+        assert_eq!(
+            got,
+            scan_all(&mut plain_cursor),
+            "PkUnique path must equal payload path"
+        );
+        // Independent oracle: cross-source same-(PK,payload) rows fold their weights.
+        assert_eq!(
+            got,
+            vec![
+                (1, 0, 2),
+                (2, 0, 1),
+                (3, 0, 1),
+                (4, 0, 1),
+                (5, 0, 1),
+                (6, 0, 1),
+                (7, 0, 2)
+            ],
+            "merge must fold PK 1 and PK 7 across sources",
+        );
+    }
+
+    /// The relocated PkUnique debug-assert must still fire when a flag-tagged
+    /// (PkUnique) source set VIOLATES the contract (same PK, different payloads) —
+    /// the only direct probe of the comparator's invariant now that it lives in
+    /// `with_row_cmp!`. Debug-only (the assert is compiled out in release).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "PK tie with differing payloads")]
+    fn pk_unique_flag_with_conflicting_payloads_panics() {
+        crate::foundation::posix_io::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_i64();
+        let flag = super::super::layout::SHARD_FLAG_PK_UNIQUE;
+        // Three "PkUnique" shards sharing PK 5 with DIFFERENT payloads — illegal.
+        // Three sources force `Multi`; comparing the tied heads (tree build or
+        // drive) trips the relocated debug_assert.
+        let a = write_test_shard(&dir, &schema, 0, &[(5, 1, 100)], flag);
+        let b = write_test_shard(&dir, &schema, 1, &[(5, 1, 200)], flag);
+        let c = write_test_shard(&dir, &schema, 2, &[(5, 1, 300)], flag);
+        let mut cursor = create_read_cursor(&[], &[a, b, c], schema);
+        while cursor.valid {
+            cursor.advance();
+        }
+    }
+
+    /// Throughput of the all-PkUnique `Multi` drive (the path now collapsed onto
+    /// `drive_with_inner`). Parity gate: the rows/s must not regress after the
+    /// collapse — in `--release` the relocated `debug_assert!` vanishes and the
+    /// PkUnique comparator is codegen-identical to a bare trivial one.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+    fn read_cursor_drive_pk_unique_multi_bench() {
+        use std::time::Instant;
+        crate::foundation::posix_io::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_i64(); // U128 PK (stride 16) | I64 payload
+
+        // 4 shards, interleaved unique PKs (round-robin) so the Multi merge does
+        // real cross-source work; flags = SHARD_FLAG_PK_UNIQUE so the opened
+        // shards report `is_pk_unique` and the cursor drives the PkUnique path.
+        const N_SHARDS: usize = 4;
+        const PER_SHARD: u128 = 200_000;
+        let flag = super::super::layout::SHARD_FLAG_PK_UNIQUE;
+        let shards: Vec<Rc<MappedShard>> = (0..N_SHARDS as u128)
+            .map(|s| {
+                let rows: Vec<(u128, i64, i64)> = (0..PER_SHARD).map(|i| (i * N_SHARDS as u128 + s, 1, 7)).collect();
+                write_test_shard(&dir, &schema, s as usize, &rows, flag)
+            })
+            .collect();
+
+        // Build the cursor ONCE (construction stays outside the timed region — the
+        // measurement is drive-only) and confirm we exercise the all-PkUnique
+        // Multi path. `rewind()` re-drives from row 0 each iteration.
+        let mut c = create_read_cursor(&[], &shards, schema);
+        assert!(c.is_pk_unique, "bench must drive the all-PkUnique path");
+        assert!(matches!(c.mode, SourceMode::Multi(_)), "bench must drive Multi");
+
+        const ITERS: usize = 20;
+        let total_rows = N_SHARDS as u128 * PER_SHARD;
+        let mut sink = 0i64;
+        let t = Instant::now();
+        for _ in 0..ITERS {
+            c.rewind();
+            while c.valid {
+                sink = sink.wrapping_add(std::hint::black_box(c.current_weight));
+                c.advance();
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        std::hint::black_box(sink);
+        let rps = (ITERS as u128 * total_rows) as f64 / secs;
+        println!("drive_pk_unique_multi: {total_rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
     }
 }

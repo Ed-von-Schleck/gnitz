@@ -408,7 +408,7 @@ pub fn op_reduce(
             extract_group_key(&mb, group_start_idx, input_schema, group_by_cols)
         };
         // Byte-form group key for the wide-PK (`pk_stride > 16`) trace seeks
-        // below; `seek_group`/`current_pk_eq` ignore it on the narrow path.
+        // below; `seek_bytes`/`current_pk_eq` ignore it on the narrow path.
         let group_pk_bytes = mb.get_pk_bytes(group_start_idx);
 
         // Step linear accumulators over delta rows in this group
@@ -446,11 +446,11 @@ pub fn op_reduce(
         // retraction probe is monotone → galloping `advance_to` seeded at the
         // live position. Payload GROUP BY keys on the synthetic `group_key`,
         // whose order need not match trace_out storage order, so it keeps the
-        // absolute `seek_group` (correct for a non-monotone probe).
+        // absolute `seek_bytes` (correct for a non-monotone probe).
         if group_by_pk {
             trace_out_cursor.advance_to(trace_out_key);
         } else {
-            trace_out_cursor.seek_group(trace_out_key);
+            trace_out_cursor.seek_bytes(trace_out_key);
         }
         let has_old = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(trace_out_key);
 
@@ -525,9 +525,9 @@ pub fn op_reduce(
                             let k = gi_c.current_pk_bytes();
                             let src_pk_bytes = &k[crate::ops::index::GI_GC_BYTES..];
                             // ti_cursor traversal is non-monotonic across GI
-                            // entries; `seek_group` is an absolute binary search
+                            // entries; `seek_bytes` is an absolute binary search
                             // so a backward re-seek is O(log N) and correct.
-                            ti_cursor.seek_group(src_pk_bytes);
+                            ti_cursor.seek_bytes(src_pk_bytes);
                             ti_cursor.for_each_pk_group_row(src_pk_bytes, |c| {
                                 c.push_current_row(&mut trace_rows);
                             });

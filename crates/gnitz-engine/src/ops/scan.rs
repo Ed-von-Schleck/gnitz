@@ -1,7 +1,7 @@
 //! Scan trace operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{write_to_batch, Batch, ConsolidatedBatch, DrainGuard, ReadCursor};
+use crate::storage::{Batch, ConsolidatedBatch, ReadCursor};
 
 // ---------------------------------------------------------------------------
 // Scan trace (source operator)
@@ -16,25 +16,10 @@ use crate::storage::{write_to_batch, Batch, ConsolidatedBatch, DrainGuard, ReadC
 /// `chunk_limit <= 0` means scan everything until cursor exhaustion.
 pub fn op_scan_trace(cursor: &mut ReadCursor, schema: &SchemaDescriptor, chunk_limit: i32) -> ConsolidatedBatch {
     let limit = if chunk_limit > 0 { chunk_limit as usize } else { 0 };
-    if let Some(batch) = cursor.drain_single_source(limit) {
-        return ConsolidatedBatch::new_unchecked(batch);
-    }
-
-    let mut rows = DrainGuard::new();
-    cursor.drain_sorted_into(limit, &mut rows);
-    if rows.is_empty() {
-        return ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema));
-    }
-    // For full drains the entry sum is a tight upper bound; for chunked
-    // drains it can be orders of magnitude too large. Pass 0 there and
-    // let `extend_from_slice` grow the blob on demand.
-    let blob_cap = if limit > 0 { 0 } else { cursor.total_blob_len() };
-    let mut b = write_to_batch(schema, rows.len(), blob_cap, |writer| {
-        cursor.scatter_drained_into(&rows, writer);
-    });
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    cursor
+        .drain_to_batch(limit)
+        .map(ConsolidatedBatch::new_unchecked)
+        .unwrap_or_else(|| ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema)))
 }
 
 // ---------------------------------------------------------------------------

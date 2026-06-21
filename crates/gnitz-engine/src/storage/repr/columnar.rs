@@ -359,6 +359,35 @@ macro_rules! with_payload_cmp {
 }
 pub(crate) use with_payload_cmp;
 
+/// Choose the loser-tree payload comparator from a cursor's PkUnique flag and
+/// hand it to a generic `_with` helper — the PkUnique analogue of
+/// [`with_payload_cmp!`]. An all-PkUnique cursor passes the equal-PK-⇒-same-element
+/// comparator: a non-capturing closure that returns `Equal` and (in debug only)
+/// asserts the PkUnique invariant (equal PK ⇒ equal payload). Everything else
+/// routes the live payload comparator through [`with_payload_cmp!`]. In release the
+/// `debug_assert!` vanishes, so the PkUnique closure ignores its operands and is
+/// codegen-identical to a bare `|_, _, _, _, _| Ordering::Equal` — the consumer's
+/// `heap_less_with` tiebreak and `eq_payload` term then DCE to pure OPK order.
+macro_rules! with_row_cmp {
+    ($schema:expr, $is_pk_unique:expr, $f:path $(, $arg:expr)* $(,)?) => {
+        if $is_pk_unique {
+            $f(
+                $($arg,)*
+                |_s, _a, _ai, _b, _bi| {
+                    debug_assert!(
+                        $crate::storage::compare_rows(_s, _a, _ai, _b, _bi) == ::std::cmp::Ordering::Equal,
+                        "PkUnique cursor: PK tie with differing payloads (corrupt data or wrong flag)",
+                    );
+                    ::std::cmp::Ordering::Equal
+                },
+            )
+        } else {
+            $crate::storage::columnar::with_payload_cmp!($schema, $f $(, $arg)*)
+        }
+    };
+}
+pub(crate) use with_row_cmp;
+
 // ---------------------------------------------------------------------------
 // Sort helpers
 // ---------------------------------------------------------------------------

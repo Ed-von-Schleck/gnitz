@@ -78,7 +78,7 @@ pub fn op_gather_reduce(
         }
 
         // `get_pk` panics for wide PKs (stride > 16); leave the u128 0 there. It
-        // is consumed only by the narrow seek/equality (via `seek_group`/
+        // is consumed only by the narrow seek/equality (via `seek_bytes`/
         // `current_pk_eq`) and by `emit_gather_row`, which re-derives compound
         // PKs from the exemplar row's bytes and ignores it.
         let group_pk: u128 = if partial_schema.pk_is_wide() {

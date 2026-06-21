@@ -36,6 +36,6 @@ mod shard_reader;
 // paths after the move: the repr (L2) submodules plus the storage-level helpers
 // that stay above `lsm/`. The `with_*` macros and `compare_pk_bytes` are pulled
 // from `columnar`; `error` and `cstr_with_tmp_suffix` from the storage facade.
-use super::repr::columnar::{compare_pk_bytes, with_payload_cmp, with_pk_ord};
+use super::repr::columnar::{compare_pk_bytes, with_pk_ord, with_row_cmp};
 use super::repr::{batch, batch_pool, bloom, columnar, heap, merge, scatter, xor8};
 use super::{cstr_with_tmp_suffix, error};

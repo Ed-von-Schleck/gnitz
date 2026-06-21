@@ -1889,7 +1889,7 @@ fn gi_synthetic_out_schema() -> SchemaDescriptor {
 /// remaps the signed source-PK column to unsigned so a zero-padded prefix seek
 /// lands on the first entry of the `gc` group instead of sorting the negative
 /// keys before it and skipping them; the per-hit trace re-seek uses
-/// `seek_group`/`current_pk_eq`, which compare PK *bytes* for a signed column
+/// `seek_bytes`/`current_pk_eq`, which compare PK *bytes* for a signed column
 /// rather than the scalar `current_key` (narrow-PK-only). Before the byte-form
 /// change the negative source rows were dropped and the MIN reflected only the
 /// delta.
