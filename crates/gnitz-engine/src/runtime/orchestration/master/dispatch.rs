@@ -475,9 +475,19 @@ impl MasterDispatcher {
             }
             if !progressed {
                 self.fail_if_worker_dead("during backfill relay")?;
-                // Wait for the first still-active worker to publish.
-                if let Some(next) = (0..nw).find(|&w| !collected[w]) {
-                    let _ = self.w2m().wait_for(next, W2M_SYNC_WAIT_MS);
+                // Wait on ALL still-active workers at once: any could be the next to
+                // publish, and a single-word wait would miss a wake on a different
+                // worker's reader_seq.
+                let mut pending = [0usize; crate::runtime::sal::MAX_WORKERS];
+                let mut np = 0;
+                for w in 0..nw {
+                    if !collected[w] {
+                        pending[np] = w;
+                        np += 1;
+                    }
+                }
+                if np > 0 {
+                    let _ = self.w2m().wait_any(&pending[..np], W2M_SYNC_WAIT_MS);
                 }
             }
         }

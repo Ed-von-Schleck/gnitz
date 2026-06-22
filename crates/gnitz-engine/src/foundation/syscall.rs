@@ -112,6 +112,84 @@ pub fn futex_wake_u32(ptr: *const AtomicU32, n_waiters: u32) -> i32 {
     }
 }
 
+/// Kernel ABI `struct futex_waitv` (`futex_waitv(2)`, Linux 5.16+).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FutexWaitvRaw {
+    val: u64,
+    uaddr: u64,
+    flags: u32,
+    __reserved: u32,
+}
+
+/// Kernel `FUTEX_WAITV_MAX` — the hard cap on words per `futex_waitv` call.
+/// `foundation` (L0) may not name `runtime::sal::MAX_WORKERS` (layering), so the
+/// wrapper carries its own bound; `w2m.rs` statically asserts `MAX_WORKERS <=`
+/// this, which is the only call site that builds the word list.
+pub(crate) const MAX_FUTEX_WAITV: usize = 128;
+
+/// Synchronously wait on MULTIPLE futex words at once (`SYS_futex_waitv`),
+/// returning when ANY differs from its expected value or is woken — the
+/// synchronous analogue of the reactor's `IORING_OP_FUTEX_WAITV`. The master
+/// must wait on every still-pending worker's `reader_seq`, since a publish by
+/// ANY worker wakes only that worker's word and a single-word `futex_wait` would
+/// miss it. `ptrs[i]` pairs with `expected[i]`.
+///
+/// `timeout_ms` becomes an ABSOLUTE `CLOCK_MONOTONIC` deadline — `futex_waitv`
+/// requires absolute timeouts, unlike the relative `futex_wait_u32` above; do
+/// not "harmonize" the two. `< 0` blocks forever. Returns the woken index
+/// (`>= 0`), or `-1` on timeout/error; callers re-read the rings rather than
+/// trust the return (the ring data is authoritative, as in `futex_wait_u32`), so
+/// any failed syscall degrades to one extra poll rather than a hang.
+pub fn futex_waitv_u32(ptrs: &[*const AtomicU32], expected: &[u32], timeout_ms: i32) -> i32 {
+    let n = ptrs.len();
+    debug_assert_eq!(n, expected.len());
+    if n == 0 || n > MAX_FUTEX_WAITV {
+        return -1; // unreachable given the w2m.rs assert; defensive.
+    }
+    let mut waiters = [FutexWaitvRaw {
+        val: 0,
+        uaddr: 0,
+        flags: 0,
+        __reserved: 0,
+    }; MAX_FUTEX_WAITV];
+    for i in 0..n {
+        waiters[i] = FutexWaitvRaw {
+            val: expected[i] as u64,
+            uaddr: ptrs[i] as u64,
+            flags: FUTEX2_SIZE_U32,
+            __reserved: 0,
+        };
+    }
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let ts_ptr: *const libc::timespec = if timeout_ms < 0 {
+        std::ptr::null()
+    } else {
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        }
+        ts.tv_sec += (timeout_ms as i64) / 1000;
+        ts.tv_nsec += ((timeout_ms as i64) % 1000) * 1_000_000;
+        if ts.tv_nsec >= 1_000_000_000 {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1_000_000_000;
+        }
+        &ts
+    };
+    // libc 0.2.186 exposes `SYS_futex_waitv` per-arch (449 on x86_64/aarch64),
+    // matching how `futex_wait_u32` uses `libc::SYS_futex`.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex_waitv,
+            waiters.as_ptr(),
+            n as libc::c_uint,
+            0u32, // flags
+            ts_ptr,
+            libc::CLOCK_MONOTONIC,
+        ) as i32
+    }
+}
+
 /// Return the errno of the most recent failed syscall.
 #[inline]
 pub fn errno() -> i32 {
@@ -362,6 +440,52 @@ mod tests {
             libc::close(fd);
         }
         drop(futexv);
+    }
+
+    /// The raw multi-word wrapper, mirroring `test_futex_waitv_via_io_uring`:
+    /// a wake on a NON-FIRST word wakes the multi-word wait; no-wake times out
+    /// to -1; a value mismatch fast-returns. Timing assertions, robust to the
+    /// return-code convention.
+    #[test]
+    fn test_futex_waitv_u32_wakes_on_any_word() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        let fd = memfd_create(b"test_waitv_u32");
+        assert_eq!(crate::foundation::posix_io::ftruncate(fd, 4096), 0);
+        let ptr = mmap_shared(fd, 4096);
+        let w0 = ptr as *const AtomicU32;
+        let w1 = unsafe { ptr.add(64) } as *const AtomicU32;
+        unsafe {
+            (*w0).store(0, Ordering::Release);
+            (*w1).store(0, Ordering::Release);
+        }
+
+        let t = Instant::now(); // value mismatch → must not block
+        let _ = futex_waitv_u32(&[w0, w1], &[0, 999], 2000);
+        assert!(t.elapsed().as_millis() < 500);
+
+        let t = Instant::now(); // no wake → -1 near the 200 ms deadline
+        assert_eq!(futex_waitv_u32(&[w0, w1], &[0, 0], 200), -1);
+        assert!((150..1000).contains(&t.elapsed().as_millis()));
+
+        let pid = unsafe { libc::fork() }; // wake on the NON-FIRST word
+        if pid == 0 {
+            unsafe {
+                libc::usleep(50_000);
+                (*w1).fetch_add(1, Ordering::Release);
+            }
+            let _ = futex_wake_u32(w1, 1);
+            unsafe { libc::_exit(0) };
+        }
+        let t = Instant::now();
+        let _ = futex_waitv_u32(&[w0, w1], &[0, 0], 5000);
+        assert!(t.elapsed().as_millis() < 2000, "non-first-word wake must wake promptly");
+        unsafe {
+            let mut s = 0;
+            libc::waitpid(pid, &mut s, 0);
+            libc::munmap(ptr as *mut libc::c_void, 4096);
+            libc::close(fd);
+        }
     }
 
     #[test]

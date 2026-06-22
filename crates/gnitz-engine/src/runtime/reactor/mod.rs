@@ -589,6 +589,13 @@ impl Reactor {
     /// observe the flag and issue `FUTEX_WAKE`. Workers that advanced
     /// BEFORE our fetch_or are caught by the post-snapshot
     /// `write_cursor != read_cursor` check.
+    ///
+    /// This is the same protocol as the sync `W2mRingHeader::arm_master_park`
+    /// (used by `wait_for`/`wait_any`), inlined here rather than shared: this
+    /// async variant must interleave the `#[cfg(test)]` order-witness hooks
+    /// between the sub-steps, skips the no-op RMW once the flag is set (the
+    /// reactor never clears it after attach), and writes an io_uring
+    /// `FutexWaitV` instead of returning a snapshot.
     fn refresh_futex_waitv_vals(&self) -> bool {
         let mut storage = self.inner.futex_waitv_storage.borrow_mut();
         let Some(boxed) = storage.as_mut() else {

@@ -200,6 +200,31 @@ impl W2mRingHeader {
     pub fn capacity(&self) -> u64 {
         self.capacity
     }
+
+    /// Arm the master-park protocol on this ring and snapshot its wait word.
+    ///
+    /// Returns `(expected_reader_seq, has_unread)`: pass `expected_reader_seq`
+    /// as the futex `expected` value, and if `has_unread` is true the caller
+    /// MUST NOT park — a publish already landed, so parking would wait for a
+    /// wake that already happened (classic lost-wake race); re-read instead.
+    /// Does NOT clear `FLAG_MASTER_PARKED`; callers that need it cleared (e.g.
+    /// `W2mReceiver::wait_for`) do so themselves.
+    ///
+    /// Store order is load-bearing: publish `FLAG_MASTER_PARKED` (AcqRel)
+    /// BEFORE snapshotting `reader_seq` (Acquire), and run the unread-data
+    /// check (`write_cursor != read_cursor`) AFTER the snapshot. A worker that
+    /// advances `reader_seq` after our flag publish is guaranteed to observe
+    /// the flag and issue a wake; one that published before the snapshot is
+    /// caught by the unread-data check. Snapshotting before the flag publish,
+    /// or checking unread data before the snapshot, opens a lost-wake window.
+    #[inline]
+    pub fn arm_master_park(&self) -> (u32, bool) {
+        self.waiter_flags().fetch_or(FLAG_MASTER_PARKED, Ordering::AcqRel);
+        let expected = self.reader_seq().load(Ordering::Acquire);
+        let has_unread = self.write_cursor().load(Ordering::Acquire) != self.read_cursor().load(Ordering::Acquire);
+        (expected, has_unread)
+    }
+
     #[cfg(test)]
     #[inline]
     pub(crate) fn writer_wrap_count(&self) -> u64 {

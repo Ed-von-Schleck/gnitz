@@ -7,6 +7,12 @@ use crate::foundation::syscall;
 use crate::runtime::w2m_ring::{self, TryReserve, W2mRingHeader, FLAG_MASTER_PARKED, FLAG_WRITER_PARKED};
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire};
 
+// `wait_any` builds a `futex_waitv` word list of at most `num_workers` entries,
+// and `num_workers <= MAX_WORKERS`. Pin `MAX_WORKERS <= MAX_FUTEX_WAITV` here —
+// the one site that names both constants — so a future `MAX_WORKERS` bump that
+// outgrows the syscall cap is a build error, not a silent truncation.
+const _: () = assert!(crate::runtime::sal::MAX_WORKERS <= crate::foundation::syscall::MAX_FUTEX_WAITV);
+
 /// Worker's write side of a single W2M ring.
 pub struct W2mWriter {
     region_ptr: *mut u8,
@@ -290,17 +296,54 @@ impl W2mReceiver {
 
     pub fn wait_for(&self, worker: usize, timeout_ms: i32) -> i32 {
         let hdr = unsafe { self.header(worker) };
-        hdr.waiter_flags().fetch_or(FLAG_MASTER_PARKED, Ordering::AcqRel);
-        let expected = hdr.reader_seq().load(Ordering::Acquire);
-        let wc = hdr.write_cursor().load(Ordering::Acquire);
-        let rc_cur = hdr.read_cursor().load(Ordering::Acquire);
-        let rc = if wc != rc_cur {
+        let (expected, has_unread) = hdr.arm_master_park();
+        let rc = if has_unread {
             0
         } else {
             syscall::futex_wait_u32(hdr.reader_seq() as *const AtomicU32, expected, timeout_ms)
         };
         hdr.waiter_flags().fetch_and(!FLAG_MASTER_PARKED, Ordering::AcqRel);
         rc
+    }
+
+    /// Wait until ANY of `workers` publishes (its `reader_seq` advances) or
+    /// `timeout_ms` elapses — the synchronous analogue of the reactor's FUTEX_WAITV.
+    /// A single-word `wait_for` only catches a wake on the one worker it parks on;
+    /// when a DIFFERENT worker is next to publish, its wake hits a different word and
+    /// the call sleeps to the timeout. Waiting on all pending workers' words at once
+    /// fixes that. Returns immediately if any worker already has unread data.
+    ///
+    /// Each ring is armed via `W2mRingHeader::arm_master_park`, which owns the
+    /// load-bearing flag-publish → `reader_seq`-snapshot → unread-data-check order.
+    /// A worker that bumps `reader_seq` after our snapshot trips `futex_waitv`'s
+    /// value-mismatch fast return; one that published before is caught by the
+    /// unread-data check (we re-read instead of parking).
+    ///
+    /// Does not clear `FLAG_MASTER_PARKED` on return (unlike `wait_for`).
+    /// Correctness rests on `futex_waitv`'s value-compare against the snapshot, not
+    /// on the flag — the flag only gates whether a worker bothers to issue a (cheap)
+    /// wake syscall. Leaving it set costs at most a few no-op wakes against unparked
+    /// words; once the reactor resumes it re-establishes the flag via
+    /// `refresh_futex_waitv_vals`, so there is nothing to restore.
+    pub fn wait_any(&self, workers: &[usize], timeout_ms: i32) -> i32 {
+        let mut ptrs = [std::ptr::null::<AtomicU32>(); crate::runtime::sal::MAX_WORKERS];
+        let mut expected = [0u32; crate::runtime::sal::MAX_WORKERS];
+        let mut n = 0;
+        for &w in workers {
+            let hdr = unsafe { self.header(w) };
+            let (exp, has_unread) = hdr.arm_master_park();
+            // Already-published worker: don't park, let the caller re-read.
+            if has_unread {
+                return 0;
+            }
+            ptrs[n] = hdr.reader_seq() as *const AtomicU32;
+            expected[n] = exp;
+            n += 1;
+        }
+        if n == 0 {
+            return 0;
+        }
+        syscall::futex_waitv_u32(&ptrs[..n], &expected[..n], timeout_ms)
     }
 
     pub fn num_workers(&self) -> usize {
@@ -530,6 +573,83 @@ mod tests {
             );
 
             free_region(ptr, size);
+        }
+    }
+
+    /// BUG: a single-word `wait_for` misses a wake on another ring. `wait_for(0)`
+    /// arms `FLAG_MASTER_PARKED` on ring 0 only, so a publish to ring 3 (flag
+    /// clear) issues no wake and ring 0's word never changes — the wait sleeps the
+    /// full ceiling even though ring 3 carried the round.
+    #[test]
+    fn test_wait_for_misses_publish_on_other_ring() {
+        unsafe {
+            let rings: Vec<(*mut u8, usize, u64)> = (0..4).map(|_| make_ring(64, 4)).collect();
+            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0).collect());
+            let (pub_ptr, pub_cap) = (rings[3].0 as usize, rings[3].2);
+            let handle = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                W2mWriter::new(pub_ptr as *mut u8, pub_cap).send_encoded(64, 0, |s| s[0] = 7);
+            });
+            let start = std::time::Instant::now();
+            let _ = receiver.wait_for(0, 300); // parks on ring 0; ring 3's wake can't reach it
+            let elapsed = start.elapsed().as_millis();
+            handle.join().unwrap();
+            assert!(
+                elapsed >= 250,
+                "wait_for(0) must sleep the full ceiling, slept {elapsed}ms"
+            );
+            assert!(receiver.try_read_slot(3).is_some(), "ring 3 really did publish");
+            for (ptr, size, _) in rings {
+                free_region(ptr, size);
+            }
+        }
+    }
+
+    /// FIX: the same setup, but `wait_any([0,1,2,3])` arms `FLAG_MASTER_PARKED` on
+    /// ring 3 too, so the publish wakes the multi-word wait well before the ceiling.
+    #[test]
+    fn test_wait_any_woken_by_publish_on_other_ring() {
+        unsafe {
+            let rings: Vec<(*mut u8, usize, u64)> = (0..4).map(|_| make_ring(64, 4)).collect();
+            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0).collect());
+            let (pub_ptr, pub_cap) = (rings[3].0 as usize, rings[3].2);
+            let handle = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                W2mWriter::new(pub_ptr as *mut u8, pub_cap).send_encoded(64, 0, |s| s[0] = 7);
+            });
+            let start = std::time::Instant::now();
+            let _ = receiver.wait_any(&[0, 1, 2, 3], 5000); // any ring's wake reaches it
+            let elapsed = start.elapsed().as_millis();
+            handle.join().unwrap();
+            assert!(
+                elapsed < 2000,
+                "wait_any must be woken by ring 3's publish, slept {elapsed}ms"
+            );
+            assert!(receiver.try_read_slot(3).is_some(), "ring 3 really did publish");
+            for (ptr, size, _) in rings {
+                free_region(ptr, size);
+            }
+        }
+    }
+
+    /// NEGATIVE: with no publisher, `wait_any` sleeps to the deadline and returns
+    /// -1 (the timeout/error convention callers degrade to one extra poll on).
+    #[test]
+    fn test_wait_any_times_out_with_no_publisher() {
+        unsafe {
+            let rings: Vec<(*mut u8, usize, u64)> = (0..1).map(|_| make_ring(64, 4)).collect();
+            let receiver = W2mReceiver::new(rings.iter().map(|r| r.0).collect());
+            let start = std::time::Instant::now();
+            let rc = receiver.wait_any(&[0], 200);
+            let elapsed = start.elapsed().as_millis();
+            assert_eq!(rc, -1, "no publisher → timeout returns -1");
+            assert!(
+                (150..1000).contains(&elapsed),
+                "wait_any should sleep ~200ms, slept {elapsed}ms"
+            );
+            for (ptr, size, _) in rings {
+                free_region(ptr, size);
+            }
         }
     }
 }
