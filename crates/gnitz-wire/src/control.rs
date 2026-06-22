@@ -80,27 +80,7 @@ pub const CONTROL_COLS: &[WireSysCol] = &[
 pub const NUM_COLUMNS: usize = CONTROL_COLS.len();
 
 pub const fn col_index(name: &str) -> usize {
-    let mut i = 0;
-    while i < CONTROL_COLS.len() {
-        let a = CONTROL_COLS[i].name.as_bytes();
-        let b = name.as_bytes();
-        if a.len() == b.len() {
-            let mut j = 0;
-            let mut matched = true;
-            while j < a.len() {
-                if a[j] != b[j] {
-                    matched = false;
-                    break;
-                }
-                j += 1;
-            }
-            if matched {
-                return i;
-            }
-        }
-        i += 1;
-    }
-    panic!("Column not found in CONTROL_COLS")
+    crate::col_index_in(CONTROL_COLS, name)
 }
 
 pub const COL_MSG_IDX: usize = col_index("msg_idx");

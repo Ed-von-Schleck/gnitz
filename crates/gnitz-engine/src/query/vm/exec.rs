@@ -494,11 +494,8 @@ pub(crate) fn execute_epoch_multi(
                 group_cols_offset,
                 group_cols_count,
                 output_schema_idx,
-                avi_table_idx,
-                avi_for_max,
-                avi_agg_col_type_code,
-                gi_table_idx,
-                gi_col_idx,
+                gi,
+                avi,
                 finalize_func_idx,
                 finalize_schema_idx,
             } => {
@@ -510,8 +507,8 @@ pub(crate) fn execute_epoch_multi(
                     [*group_cols_offset as usize..(*group_cols_offset as usize + *group_cols_count as usize)];
 
                 // trace_in cursor (from register file)
-                let ti_cursor_ptr: *mut ReadCursor = if *trace_in_reg >= 0 {
-                    let ptr = cursor_mut!(*trace_in_reg)
+                let ti_cursor_ptr: *mut ReadCursor = if let Some(tr) = trace_in_reg {
+                    let ptr = cursor_mut!(*tr)
                         .map(|c| c as *mut ReadCursor)
                         .unwrap_or(std::ptr::null_mut());
                     if ptr.is_null() {
@@ -534,8 +531,8 @@ pub(crate) fn execute_epoch_multi(
                 // Must be created AFTER INTEGRATE populates the AVI table.
                 // Operator-state read; keep compacting (see refresh_owned_cursors).
                 #[allow(clippy::disallowed_methods)] // explicit maintenance: REDUCE AVI operator state
-                let mut avi_cursor_handle: Option<Box<CursorHandle>> = if *avi_table_idx >= 0 {
-                    let avi_ptr = program.tables[*avi_table_idx as usize];
+                let mut avi_cursor_handle: Option<Box<CursorHandle>> = if let Some(avi) = avi {
+                    let avi_ptr = program.tables[avi.table_idx as usize];
                     let avi_table = unsafe { &mut *avi_ptr };
                     avi_table.create_cursor_compacting().ok().map(Box::new)
                 } else {
@@ -545,8 +542,8 @@ pub(crate) fn execute_epoch_multi(
                 // GI cursor — created fresh from the GI table (not a register)
                 // Operator-state read; keep compacting (see refresh_owned_cursors).
                 #[allow(clippy::disallowed_methods)] // explicit maintenance: REDUCE GI operator state
-                let mut gi_cursor_handle: Option<Box<CursorHandle>> = if *gi_table_idx >= 0 {
-                    let gi_ptr = program.tables[*gi_table_idx as usize];
+                let mut gi_cursor_handle: Option<Box<CursorHandle>> = if let Some(gi) = gi {
+                    let gi_ptr = program.tables[gi.table_idx as usize];
                     let gi_table = unsafe { &mut *gi_ptr };
                     gi_table.create_cursor_compacting().ok().map(Box::new)
                 } else {
@@ -562,16 +559,10 @@ pub(crate) fn execute_epoch_multi(
                     aggs.len()
                 );
 
-                let fin_prog = if *finalize_func_idx >= 0 {
-                    Some(unsafe { &*program.expr_progs[*finalize_func_idx as usize] })
-                } else {
-                    None
-                };
-                let fin_schema = if *finalize_schema_idx >= 0 {
-                    Some(&program.schemas[*finalize_schema_idx as usize])
-                } else {
-                    None
-                };
+                let fin_prog = finalize_func_idx
+                    .as_ref()
+                    .map(|idx| unsafe { &*program.expr_progs[*idx as usize] });
+                let fin_schema = finalize_schema_idx.as_ref().map(|idx| &program.schemas[*idx as usize]);
 
                 let ti_opt: Option<&mut ReadCursor> = if !ti_cursor_ptr.is_null() {
                     Some(unsafe { &mut *ti_cursor_ptr })
@@ -581,11 +572,17 @@ pub(crate) fn execute_epoch_multi(
                 let avi_opt: Option<&mut ReadCursor> = avi_cursor_handle.as_deref_mut().map(|ch| ch.cursor_mut());
                 let gi_opt: Option<&mut ReadCursor> = gi_cursor_handle.as_deref_mut().map(|ch| ch.cursor_mut());
 
-                let avi_tc = if avi_opt.is_some() {
-                    crate::schema::TypeCode::from_validated_u8(*avi_agg_col_type_code)
-                } else {
-                    crate::schema::TypeCode::U64
+                // AVI type code: real code only when the AVI cursor was actually
+                // created (preserves the prior `avi_opt.is_some()` gate); else U64.
+                let avi_tc = match avi {
+                    Some(a) if avi_opt.is_some() => crate::schema::TypeCode::from_validated_u8(a.agg_col_type_code),
+                    _ => crate::schema::TypeCode::U64,
                 };
+                // None -> false (unused by op_reduce when the AVI cursor is None).
+                let avi_for_max = avi.as_ref().is_some_and(|a| a.for_max);
+                // None -> 0 (a valid col idx; op_reduce builds the GI extractor
+                // unconditionally).
+                let gi_col_idx = gi.as_ref().map_or(0, |g| g.col_idx);
 
                 let (raw_out, fin_out) = ops::op_reduce(
                     &reg!(*in_reg).batch,
@@ -596,10 +593,10 @@ pub(crate) fn execute_epoch_multi(
                     gcols,
                     aggs,
                     avi_opt,
-                    *avi_for_max,
+                    avi_for_max,
                     avi_tc,
                     gi_opt,
-                    *gi_col_idx,
+                    gi_col_idx,
                     fin_prog,
                     fin_schema,
                 );
@@ -610,8 +607,8 @@ pub(crate) fn execute_epoch_multi(
 
                 reg_mut!(*out_reg).batch = raw_out;
                 if let Some(fin_batch) = fin_out {
-                    if *fin_out_reg >= 0 {
-                        reg_mut!(*fin_out_reg).batch = fin_batch;
+                    if let Some(fr) = fin_out_reg {
+                        reg_mut!(*fr).batch = fin_batch;
                     }
                 }
             }

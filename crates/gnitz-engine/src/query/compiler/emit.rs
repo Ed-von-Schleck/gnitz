@@ -142,8 +142,7 @@ pub(super) fn emit_node(
     builder: &mut ProgramBuilder,
     state: &mut EmitState,
     out_reg_of: &mut HashMap<i32, i32>,
-    reg_schemas: &mut Vec<SchemaDescriptor>,
-    reg_kinds: &mut Vec<u8>,
+    reg_meta: &mut Vec<RegisterMeta>,
     // Owned resources
     owned_tables: &mut Vec<Box<Table>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
@@ -167,16 +166,14 @@ pub(super) fn emit_node(
     match op {
         gnitz_wire::OpNode::ScanDelta(tid) => {
             if let Some(ext) = ext_tables.iter().find(|t| t.table_id == *tid as i64) {
-                reg_schemas[reg_id as usize] = ext.schema;
-                reg_kinds[reg_id as usize] = 0;
+                reg_meta[reg_id as usize] = RegisterMeta::delta(ext.schema);
                 source_reg_map.insert(*tid as i64, reg_id);
             }
         }
 
         gnitz_wire::OpNode::ScanTrace(tid) => {
             if let Some(ext) = ext_tables.iter().find(|t| t.table_id == *tid as i64) {
-                reg_schemas[reg_id as usize] = ext.schema;
-                reg_kinds[reg_id as usize] = 1;
+                reg_meta[reg_id as usize] = RegisterMeta::trace(ext.schema);
                 ext_trace_regs.push((reg_id as u16, *tid as i64));
 
                 if !is_join_trace_side(loaded, nid) {
@@ -208,8 +205,7 @@ pub(super) fn emit_node(
                     );
                     let out_delta_id = state.next_extra_reg;
                     state.next_extra_reg += 1;
-                    reg_schemas[out_delta_id as usize] = ext.schema;
-                    reg_kinds[out_delta_id as usize] = 0;
+                    reg_meta[out_delta_id as usize] = RegisterMeta::delta(ext.schema);
                     out_reg_of.insert(nid, out_delta_id);
                     builder.add_scan_trace(reg_id as u16, out_delta_id as u16, 0);
                 }
@@ -218,9 +214,8 @@ pub(super) fn emit_node(
 
         gnitz_wire::OpNode::Filter(blob) => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            let in_schema = reg_schemas[in_reg as usize];
-            reg_schemas[reg_id as usize] = in_schema;
-            reg_kinds[reg_id as usize] = 0;
+            let in_schema = reg_meta[in_reg as usize].schema;
+            reg_meta[reg_id as usize] = RegisterMeta::delta(in_schema);
             let func_ptr = if let Some(blob) = blob {
                 match decode_expr_blob(blob) {
                     Some(dep) => {
@@ -251,7 +246,7 @@ pub(super) fn emit_node(
 
         gnitz_wire::OpNode::Map(mk) => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            let in_reg_schema = reg_schemas[in_reg as usize];
+            let in_reg_schema = reg_meta[in_reg as usize].schema;
             match mk {
                 gnitz_wire::MapKind::Expression {
                     program,
@@ -345,8 +340,7 @@ pub(super) fn emit_node(
                         &node_schema,
                         owned_funcs,
                     );
-                    reg_schemas[reg_id as usize] = node_schema;
-                    reg_kinds[reg_id as usize] = 0;
+                    reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
                     let cols_u32: Vec<u32> = reindex_cols.iter().map(|&c| c as u32).collect();
                     builder.add_map(
                         in_reg as u16,
@@ -382,8 +376,7 @@ pub(super) fn emit_node(
                         &node_schema,
                         owned_funcs,
                     );
-                    reg_schemas[reg_id as usize] = node_schema;
-                    reg_kinds[reg_id as usize] = 0;
+                    reg_meta[reg_id as usize] = RegisterMeta::delta(node_schema);
                     builder.add_map(
                         in_reg as u16,
                         reg_id as u16,
@@ -405,8 +398,7 @@ pub(super) fn emit_node(
                     let schema = build_map_output_schema(&in_reg_schema, &src_indices);
                     let fp =
                         create_universal_projection(&src_indices, &src_types, &in_reg_schema, &schema, owned_funcs);
-                    reg_schemas[reg_id as usize] = schema;
-                    reg_kinds[reg_id as usize] = 0;
+                    reg_meta[reg_id as usize] = RegisterMeta::delta(schema);
                     builder.add_map(in_reg as u16, reg_id as u16, fp, schema, &[], &[], false, 0);
                 }
 
@@ -416,8 +408,7 @@ pub(super) fn emit_node(
                     let pk_len = copy_pk_columns_into(&in_reg_schema, &mut cols, &mut pk_idx);
                     let s = SchemaDescriptor::new(&cols[..pk_len], &pk_idx[..pk_len]);
                     let fp = create_universal_projection(&[], &[], &in_reg_schema, &s, owned_funcs);
-                    reg_schemas[reg_id as usize] = s;
-                    reg_kinds[reg_id as usize] = 0;
+                    reg_meta[reg_id as usize] = RegisterMeta::delta(s);
                     builder.add_map(in_reg as u16, reg_id as u16, fp, s, &[], &[], false, 0);
                 }
             }
@@ -425,15 +416,13 @@ pub(super) fn emit_node(
 
         gnitz_wire::OpNode::Negate => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            reg_schemas[reg_id as usize] = reg_schemas[in_reg as usize];
-            reg_kinds[reg_id as usize] = 0;
+            reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[in_reg as usize].schema);
             builder.add_negate(in_reg as u16, reg_id as u16);
         }
 
         gnitz_wire::OpNode::Union => {
             let in_a = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
-            reg_schemas[reg_id as usize] = reg_schemas[in_a as usize];
-            reg_kinds[reg_id as usize] = 0;
+            reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[in_a as usize].schema);
             let has_b = in_regs.contains_key(&PORT_IN_B);
             let in_b = in_regs.get(&PORT_IN_B).copied().unwrap_or(0);
             builder.add_union(in_a as u16, in_b as u16, has_b, reg_id as u16);
@@ -443,17 +432,15 @@ pub(super) fn emit_node(
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let state_reg = state.next_extra_reg;
             state.next_extra_reg += 1;
-            let in_schema = reg_schemas[in_reg as usize];
-            reg_schemas[state_reg as usize] = in_schema;
-            reg_kinds[state_reg as usize] = 2;
-            reg_schemas[reg_id as usize] = in_schema;
-            reg_kinds[reg_id as usize] = 0;
+            let in_schema = reg_meta[in_reg as usize].schema;
+            reg_meta[state_reg as usize] = RegisterMeta::delay_state(in_schema);
+            reg_meta[reg_id as usize] = RegisterMeta::delta(in_schema);
             builder.add_delay(in_reg as u16, state_reg as u16, reg_id as u16);
         }
 
         gnitz_wire::OpNode::Distinct => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            let in_reg_schema = reg_schemas[in_reg as usize];
+            let in_reg_schema = reg_meta[in_reg as usize].schema;
             if rw.skip_nodes.contains(&nid) {
                 out_reg_of.insert(nid, in_reg);
                 return;
@@ -469,13 +456,11 @@ pub(super) fn emit_node(
             let table_idx = owned_tables.len();
             owned_tables.push(Box::new(hist_table));
             let hist_table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
-            reg_schemas[reg_id as usize] = in_reg_schema;
-            reg_kinds[reg_id as usize] = 1;
+            reg_meta[reg_id as usize] = RegisterMeta::trace(in_reg_schema);
             owned_trace_regs.push((reg_id as u16, table_idx));
             let out_delta_id = state.next_extra_reg;
             state.next_extra_reg += 1;
-            reg_schemas[out_delta_id as usize] = in_reg_schema;
-            reg_kinds[out_delta_id as usize] = 0;
+            reg_meta[out_delta_id as usize] = RegisterMeta::delta(in_reg_schema);
             out_reg_of.insert(nid, out_delta_id);
             builder.add_distinct(in_reg as u16, reg_id as u16, out_delta_id as u16, hist_table_ptr);
         }
@@ -492,8 +477,7 @@ pub(super) fn emit_node(
                 builder,
                 state,
                 out_reg_of,
-                reg_schemas,
-                reg_kinds,
+                reg_meta,
                 owned_tables,
                 owned_expr_progs,
                 owned_trace_regs,
@@ -507,28 +491,33 @@ pub(super) fn emit_node(
             // PORT_IN_A == 0 (delta side); PORT_TRACE == PORT_IN_B == 1 (trace/right side).
             let a_reg = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
             let b_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
-            let a_schema = reg_schemas[a_reg as usize];
-            let b_schema = reg_schemas[b_reg as usize];
-            reg_kinds[reg_id as usize] = 0;
+            let a_schema = reg_meta[a_reg as usize].schema;
+            let b_schema = reg_meta[b_reg as usize].schema;
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace => {
-                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None);
+                    reg_meta[reg_id as usize] =
+                        RegisterMeta::delta(merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None));
                     builder.add_join_dt(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
                 gnitz_wire::JoinKind::DeltaTraceOuter => {
-                    reg_schemas[reg_id as usize] =
-                        merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::RightNullable);
+                    reg_meta[reg_id as usize] = RegisterMeta::delta(merge_schemas_for_join(
+                        &a_schema,
+                        &b_schema,
+                        JoinNullFill::RightNullable,
+                    ));
                     builder.add_join_dt_outer(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
                 gnitz_wire::JoinKind::DeltaDelta => {
-                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None);
+                    reg_meta[reg_id as usize] =
+                        RegisterMeta::delta(merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None));
                     builder.add_join_dd(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
                 gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => {
                     // Same output layout as the equi delta-trace join; only the
                     // probe differs. `n_eq`/`rel` ride to the op so it can derive
                     // the eq-prefix / range-slot split and the cut direction.
-                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None);
+                    reg_meta[reg_id as usize] =
+                        RegisterMeta::delta(merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None));
                     builder.add_join_dt_range(a_reg as u16, b_reg as u16, reg_id as u16, b_schema, *n_eq, *rel);
                 }
             }
@@ -537,8 +526,7 @@ pub(super) fn emit_node(
         gnitz_wire::OpNode::AntiJoin(kind) => {
             let a_reg = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
             let b_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
-            reg_schemas[reg_id as usize] = reg_schemas[a_reg as usize];
-            reg_kinds[reg_id as usize] = 0;
+            reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[a_reg as usize].schema);
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace | gnitz_wire::JoinKind::DeltaTraceOuter => {
                     builder.add_anti_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
@@ -555,8 +543,7 @@ pub(super) fn emit_node(
         gnitz_wire::OpNode::SemiJoin(kind) => {
             let a_reg = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
             let b_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
-            reg_schemas[reg_id as usize] = reg_schemas[a_reg as usize];
-            reg_kinds[reg_id as usize] = 0;
+            reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[a_reg as usize].schema);
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace | gnitz_wire::JoinKind::DeltaTraceOuter => {
                     builder.add_semi_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
@@ -578,15 +565,14 @@ pub(super) fn emit_node(
 
         gnitz_wire::OpNode::IntegrateTrace => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            let in_reg_schema = reg_schemas[in_reg as usize];
+            let in_reg_schema = reg_meta[in_reg as usize].schema;
             let child_name = format!("_int_{view_id}_{nid}");
             match create_child_table(state, view_dir, &child_name, in_reg_schema, view_table_id) {
                 Ok(t) => {
                     let table_idx = owned_tables.len();
                     owned_tables.push(Box::new(t));
                     let table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
-                    reg_schemas[reg_id as usize] = in_reg_schema;
-                    reg_kinds[reg_id as usize] = 1;
+                    reg_meta[reg_id as usize] = RegisterMeta::trace(in_reg_schema);
                     owned_trace_regs.push((reg_id as u16, table_idx));
                     emit_simple_integrate(builder, in_reg as u16, table_ptr);
                 }
@@ -607,15 +593,13 @@ pub(super) fn emit_node(
             // `(worker_rank, num_workers)` of this process (default `(0, 1)` =
             // keep-all for single-process / unit tests).
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            reg_schemas[reg_id as usize] = reg_schemas[in_reg as usize];
-            reg_kinds[reg_id as usize] = 0;
+            reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[in_reg as usize].schema);
             builder.add_partition_filter(in_reg as u16, reg_id as u16, worker_rank(), num_workers());
         }
 
         gnitz_wire::OpNode::ExchangeGather => {
             if let Some(&in_reg) = in_regs.get(&PORT_IN) {
-                reg_schemas[reg_id as usize] = reg_schemas[in_reg as usize];
-                reg_kinds[reg_id as usize] = reg_kinds[in_reg as usize];
+                reg_meta[reg_id as usize] = reg_meta[in_reg as usize];
                 // ExchangeGather is a logical passthrough: the exchange mechanism
                 // injects gathered data directly into the exchange-input register.
                 // Redirect downstream reads to that register; reg_id is never written.
@@ -625,7 +609,7 @@ pub(super) fn emit_node(
 
         gnitz_wire::OpNode::NullExtend { type_codes } => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            let in_schema = reg_schemas[in_reg as usize];
+            let in_schema = reg_meta[in_reg as usize].schema;
             assert!(
                 type_codes.len() < crate::schema::MAX_COLUMNS,
                 "NULL_EXTEND n_cols={} would overflow schema array (max {})",
@@ -639,8 +623,7 @@ pub(super) fn emit_node(
             }
             let right = SchemaDescriptor::new(&cols[..type_codes.len() + 1], &[0]);
             let out_schema = merge_schemas_for_join(&in_schema, &right, JoinNullFill::RightNullable);
-            reg_schemas[reg_id as usize] = out_schema;
-            reg_kinds[reg_id as usize] = 0;
+            reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
             builder.add_null_extend(in_reg as u16, reg_id as u16, right);
         }
 
@@ -654,8 +637,7 @@ pub(super) fn emit_node(
                 builder,
                 state,
                 out_reg_of,
-                reg_schemas,
-                reg_kinds,
+                reg_meta,
                 owned_tables,
                 owned_trace_regs,
                 view_dir,
@@ -718,8 +700,7 @@ pub(super) fn emit_reduce(
     builder: &mut ProgramBuilder,
     state: &mut EmitState,
     out_reg_of: &mut HashMap<i32, i32>,
-    reg_schemas: &mut Vec<SchemaDescriptor>,
-    reg_kinds: &mut Vec<u8>,
+    reg_meta: &mut Vec<RegisterMeta>,
     owned_tables: &mut Vec<Box<Table>>,
     owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_trace_regs: &mut Vec<(u16, usize)>,
@@ -728,7 +709,7 @@ pub(super) fn emit_reduce(
     view_id: u64,
 ) {
     let in_reg_id = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-    let in_reg_schema = reg_schemas[in_reg_id as usize];
+    let in_reg_schema = reg_meta[in_reg_id as usize].schema;
 
     let gcols: Vec<i32> = group_cols.iter().map(|&c| c as i32).collect();
     let gcols_u32: Vec<u32> = group_cols.iter().map(|&c| c as u32).collect();
@@ -783,22 +764,19 @@ pub(super) fn emit_reduce(
     owned_tables.push(Box::new(trace_table));
     let trace_table_ptr = &*owned_tables[trace_table_idx] as *const Table as *mut Table;
 
-    reg_schemas[reg_id as usize] = reduce_out_schema;
-    reg_kinds[reg_id as usize] = 1;
+    reg_meta[reg_id as usize] = RegisterMeta::trace(reduce_out_schema);
     owned_trace_regs.push((reg_id as u16, trace_table_idx));
 
     let raw_delta_id = state.next_extra_reg;
     state.next_extra_reg += 1;
-    reg_schemas[raw_delta_id as usize] = reduce_out_schema;
-    reg_kinds[raw_delta_id as usize] = 0;
+    reg_meta[raw_delta_id as usize] = RegisterMeta::delta(reduce_out_schema);
 
     let finalize_prog_idx = rw.fold_finalize.get(&nid).copied();
     let mut fin_delta_id: i32 = -1;
     if finalize_prog_idx.is_some() {
         fin_delta_id = state.next_extra_reg;
         state.next_extra_reg += 1;
-        reg_schemas[fin_delta_id as usize] = loaded.out_schema;
-        reg_kinds[fin_delta_id as usize] = 0;
+        reg_meta[fin_delta_id as usize] = RegisterMeta::delta(loaded.out_schema);
         out_reg_of.insert(nid, fin_delta_id);
     } else {
         out_reg_of.insert(nid, raw_delta_id);
@@ -843,8 +821,7 @@ pub(super) fn emit_reduce(
 
         tr_in_reg_id = state.next_extra_reg;
         state.next_extra_reg += 1;
-        reg_schemas[tr_in_reg_id as usize] = in_reg_schema;
-        reg_kinds[tr_in_reg_id as usize] = 1;
+        reg_meta[tr_in_reg_id as usize] = RegisterMeta::trace(in_reg_schema);
         owned_trace_regs.push((tr_in_reg_id as u16, idx));
     }
 
@@ -937,10 +914,10 @@ pub(super) fn emit_reduce(
 
     builder.add_reduce(
         in_reg_id as u16,
-        tr_in_reg_id as i16,
+        (tr_in_reg_id >= 0).then_some(tr_in_reg_id as u16),
         reg_id as u16,
         raw_delta_id as u16,
-        fin_delta_id as i16,
+        (fin_delta_id >= 0).then_some(fin_delta_id as u16),
         &agg_descs,
         &gcols_u32,
         reduce_out_schema,
@@ -1030,8 +1007,7 @@ pub(super) fn emit_gather_reduce(
     builder: &mut ProgramBuilder,
     state: &mut EmitState,
     out_reg_of: &mut HashMap<i32, i32>,
-    reg_schemas: &mut Vec<SchemaDescriptor>,
-    reg_kinds: &mut Vec<u8>,
+    reg_meta: &mut Vec<RegisterMeta>,
     owned_tables: &mut Vec<Box<Table>>,
     owned_trace_regs: &mut Vec<(u16, usize)>,
     view_dir: &str,
@@ -1039,7 +1015,7 @@ pub(super) fn emit_gather_reduce(
     view_id: u64,
 ) {
     let in_reg_id = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-    let partial_schema = reg_schemas[in_reg_id as usize];
+    let partial_schema = reg_meta[in_reg_id as usize].schema;
 
     let agg_specs: Vec<(u64, u64)> = raw_cols
         .iter()
@@ -1065,14 +1041,12 @@ pub(super) fn emit_gather_reduce(
     owned_tables.push(Box::new(trace_table));
     let trace_table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
 
-    reg_schemas[reg_id as usize] = partial_schema;
-    reg_kinds[reg_id as usize] = 1;
+    reg_meta[reg_id as usize] = RegisterMeta::trace(partial_schema);
     owned_trace_regs.push((reg_id as u16, table_idx));
 
     let raw_delta_id = state.next_extra_reg;
     state.next_extra_reg += 1;
-    reg_schemas[raw_delta_id as usize] = partial_schema;
-    reg_kinds[raw_delta_id as usize] = 0;
+    reg_meta[raw_delta_id as usize] = RegisterMeta::delta(partial_schema);
     out_reg_of.insert(nid, raw_delta_id);
 
     builder.add_gather_reduce(in_reg_id as u16, reg_id as u16, raw_delta_id as u16, &agg_descs);
@@ -1199,13 +1173,11 @@ pub(super) fn build_plan(
     if num_regs > u16::MAX as usize {
         return None;
     }
-    let mut reg_schemas = vec![SchemaDescriptor::default(); num_regs];
-    let mut reg_kinds = vec![0u8; num_regs];
+    let mut reg_meta = vec![RegisterMeta::delta(SchemaDescriptor::default()); num_regs];
 
     for ((ex_nid, ex_schema), &(_, reg)) in exchange_inputs.iter().zip(&exchange_input_regs) {
         out_reg_of.insert(*ex_nid, reg);
-        reg_schemas[reg as usize] = *ex_schema;
-        reg_kinds[reg as usize] = 0;
+        reg_meta[reg as usize] = RegisterMeta::delta(*ex_schema);
     }
 
     let mut owned_tables: Vec<Box<Table>> = Vec::new();
@@ -1237,8 +1209,7 @@ pub(super) fn build_plan(
             &mut builder,
             &mut state,
             &mut out_reg_of,
-            &mut reg_schemas,
-            &mut reg_kinds,
+            &mut reg_meta,
             &mut owned_tables,
             &mut owned_funcs,
             &mut owned_expr_progs,
@@ -1292,7 +1263,7 @@ pub(super) fn build_plan(
     }
 
     if output_node_id.is_none() && sink_reg >= 0 {
-        let sink_schema = &reg_schemas[sink_reg as usize];
+        let sink_schema = &reg_meta[sink_reg as usize].schema;
         let out_schema = &loaded.out_schema;
         // A column-count match is not enough: two schemas with equal column
         // counts but mismatched types (e.g. I64 vs German-string) let the client
@@ -1303,14 +1274,7 @@ pub(super) fn build_plan(
         }
     }
 
-    let vm = builder.build_with_owned(
-        &reg_schemas,
-        &reg_kinds,
-        owned_tables,
-        owned_funcs,
-        owned_expr_progs,
-        owned_trace_regs,
-    );
+    let vm = builder.build_with_owned(reg_meta, owned_tables, owned_funcs, owned_expr_progs, owned_trace_regs);
 
     Some(PlanBuildResult {
         vm,

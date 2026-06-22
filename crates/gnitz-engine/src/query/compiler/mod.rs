@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::expr::{ExprProgram, Plan, ScalarFuncKind};
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{AggDescriptor, AggOp};
-use crate::query::vm::{ProgramBuilder, VmHandle};
+use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{is_fixed_int, type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{CursorHandle, Persistence, ReadCursor, Table};
 
@@ -234,26 +234,6 @@ fn decode_expr_blob(blob: &[u8]) -> Option<DecodedExprProgram> {
         const_strings,
     })
 }
-
-// New CircuitNodes columns (PK is col 0; view_id at col 1 is denormalised
-// and not read here — the cursor is already seeked by view_id range).
-const NODES_COL_NODE_ID: usize = 2;
-const NODES_COL_OPCODE_NEW: usize = 3;
-const NODES_COL_SOURCE_TABLE: usize = 4;
-const NODES_COL_REINDEX_COL: usize = 5;
-const NODES_COL_EXPR_PROGRAM: usize = 6;
-
-// New CircuitEdges columns (PK is col 0).
-const EDGES_COL_DST_NODE: usize = 2;
-const EDGES_COL_DST_PORT: usize = 3;
-const EDGES_COL_SRC_NODE: usize = 4;
-
-// New CircuitNodeColumns columns (PK is col 0).
-const NODECOL_COL_NODE_ID: usize = 2;
-const NODECOL_COL_KIND: usize = 3;
-const NODECOL_COL_POSITION: usize = 4;
-const NODECOL_COL_VALUE1: usize = 5;
-const NODECOL_COL_VALUE2: usize = 6;
 
 // ---------------------------------------------------------------------------
 // Build a single plan (pre or post exchange)

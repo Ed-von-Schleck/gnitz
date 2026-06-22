@@ -80,18 +80,28 @@ impl ProgramBuilder {
         idx
     }
 
-    fn expr_idx(&mut self, ptr: *const crate::expr::ExprProgram) -> i16 {
+    fn expr_idx(&mut self, ptr: *const crate::expr::ExprProgram) -> Option<u16> {
         if ptr.is_null() {
-            return -1;
+            return None;
         }
         for (i, &e) in self.expr_progs.iter().enumerate() {
             if e == ptr {
-                return i as i16;
+                return Some(i as u16);
             }
         }
-        let idx = self.expr_progs.len() as i16;
+        let idx = self.expr_progs.len() as u16;
         self.expr_progs.push(ptr);
-        idx
+        Some(idx)
+    }
+
+    /// Build an optional GI descriptor: intern `gi_table` and pair it with
+    /// `col_idx`, or `None` when there is no GI table. Shared by `add_integrate`
+    /// and `add_reduce`.
+    fn gi_desc(&mut self, gi_table: *mut Table, col_idx: u32) -> Option<Gi> {
+        (!gi_table.is_null()).then(|| Gi {
+            table_idx: self.table_idx(gi_table) as u16,
+            col_idx,
+        })
     }
 
     fn add_agg_descs(&mut self, descs: &[AggDescriptor]) -> (u32, u16) {
@@ -317,14 +327,7 @@ impl ProgramBuilder {
         avi_agg_col_idx: u32,
     ) {
         let table_idx = self.table_idx(target_table);
-        let gi = if !gi_table.is_null() {
-            Some(IntegrateGi {
-                table_idx: self.table_idx(gi_table) as u16,
-                col_idx: gi_col_idx,
-            })
-        } else {
-            None
-        };
+        let gi = self.gi_desc(gi_table, gi_col_idx);
         let avi = if !avi_table.is_null() {
             let (gc_off, gc_cnt) = self.add_group_cols(avi_group_cols);
             Some(IntegrateAvi {
@@ -350,10 +353,10 @@ impl ProgramBuilder {
     pub fn add_reduce(
         &mut self,
         in_reg: u16,
-        trace_in_reg: i16,
+        trace_in_reg: Option<u16>,
         trace_out_reg: u16,
         out_reg: u16,
-        fin_out_reg: i16,
+        fin_out_reg: Option<u16>,
         agg_descs: &[AggDescriptor],
         group_cols: &[u32],
         output_schema: SchemaDescriptor,
@@ -372,15 +375,22 @@ impl ProgramBuilder {
         let (gc_off, gc_cnt) = self.add_group_cols(group_cols);
         let output_schema_idx = self.schema_idx(output_schema);
 
-        let avi_table_idx = self.table_idx(avi_table) as i16;
-
-        let gi_table_idx = self.table_idx(gi_table) as i16;
+        let gi = self.gi_desc(gi_table, gi_col_idx);
+        let avi = if !avi_table.is_null() {
+            Some(ReduceAvi {
+                table_idx: self.table_idx(avi_table) as u16,
+                for_max: avi_for_max,
+                agg_col_type_code: avi_agg_col_type_code,
+            })
+        } else {
+            None
+        };
 
         let finalize_func_idx = self.expr_idx(finalize_prog);
         let finalize_schema_idx = if !finalize_schema.is_null() {
-            self.schema_idx(unsafe { *finalize_schema }) as i16
+            Some(self.schema_idx(unsafe { *finalize_schema }))
         } else {
-            -1
+            None
         };
 
         self.instructions.push(Instr::Reduce {
@@ -394,11 +404,8 @@ impl ProgramBuilder {
             group_cols_offset: gc_off,
             group_cols_count: gc_cnt,
             output_schema_idx,
-            avi_table_idx,
-            avi_for_max,
-            avi_agg_col_type_code,
-            gi_table_idx,
-            gi_col_idx,
+            gi,
+            avi,
             finalize_func_idx,
             finalize_schema_idx,
         });
@@ -421,46 +428,8 @@ impl ProgramBuilder {
     ///
     /// Used by test code — production code uses `build_with_owned`.
     #[cfg(test)]
-    pub(crate) fn build(self, reg_schemas: &[SchemaDescriptor], reg_kinds: &[u8]) -> Box<VmHandle> {
-        assert_eq!(reg_schemas.len(), self.num_registers as usize);
-        assert_eq!(reg_kinds.len(), self.num_registers as usize);
-
-        let mut reg_meta = Vec::with_capacity(self.num_registers as usize);
-        for i in 0..self.num_registers as usize {
-            reg_meta.push(RegisterMeta {
-                schema: reg_schemas[i],
-                kind: match reg_kinds[i] {
-                    1 => RegisterKind::Trace,
-                    2 => RegisterKind::DelayState,
-                    _ => RegisterKind::Delta,
-                },
-            });
-        }
-
-        let regfile = RegisterFile::new(&reg_meta);
-
-        let program = Program {
-            instructions: self.instructions,
-            reg_meta,
-            funcs: self.funcs,
-            tables: self.tables,
-            schemas: self.schemas,
-            agg_descs: self.agg_descs,
-            group_cols: self.group_cols,
-            reindex_cols: self.reindex_cols,
-            reindex_target_tcs: self.reindex_target_tcs,
-            expr_progs: self.expr_progs,
-        };
-
-        Box::new(VmHandle {
-            program,
-            regfile,
-            owned_tables: Vec::new(),
-            owned_funcs: Vec::new(),
-            owned_expr_progs: Vec::new(),
-            owned_trace_regs: Vec::new(),
-            owned_cursor_handles: Vec::new(),
-        })
+    pub(crate) fn build(self, reg_meta: &[RegisterMeta]) -> Box<VmHandle> {
+        self.build_with_owned(reg_meta.to_vec(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
     }
 
     /// Consume the builder, producing a VmHandle that owns child tables,
@@ -468,27 +437,13 @@ impl ProgramBuilder {
     #[allow(clippy::vec_box)]
     pub fn build_with_owned(
         self,
-        reg_schemas: &[SchemaDescriptor],
-        reg_kinds: &[u8],
+        reg_meta: Vec<RegisterMeta>,
         owned_tables: Vec<Box<Table>>,
         owned_funcs: Vec<Box<ScalarFuncKind>>,
         owned_expr_progs: Vec<Box<crate::expr::ExprProgram>>,
         owned_trace_regs: Vec<(u16, usize)>,
     ) -> Box<VmHandle> {
-        assert_eq!(reg_schemas.len(), self.num_registers as usize);
-        assert_eq!(reg_kinds.len(), self.num_registers as usize);
-
-        let mut reg_meta = Vec::with_capacity(self.num_registers as usize);
-        for i in 0..self.num_registers as usize {
-            reg_meta.push(RegisterMeta {
-                schema: reg_schemas[i],
-                kind: match reg_kinds[i] {
-                    1 => RegisterKind::Trace,
-                    2 => RegisterKind::DelayState,
-                    _ => RegisterKind::Delta,
-                },
-            });
-        }
+        assert_eq!(reg_meta.len(), self.num_registers as usize);
 
         let regfile = RegisterFile::new(&reg_meta);
 

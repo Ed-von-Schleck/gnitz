@@ -14,6 +14,34 @@ pub struct WireSysCol {
     pub nullable: bool,
 }
 
+/// Index of the column named `name` in `cols`, resolved at compile time.
+/// Panics (const-eval failure) if absent, so a renamed/removed column fails the
+/// build rather than silently mis-indexing. `==` on `&str` is not const-stable,
+/// hence the manual byte compare.
+pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
+    let mut i = 0;
+    while i < cols.len() {
+        let a = cols[i].name.as_bytes();
+        let b = name.as_bytes();
+        if a.len() == b.len() {
+            let mut j = 0;
+            let mut matched = true;
+            while j < a.len() {
+                if a[j] != b[j] {
+                    matched = false;
+                    break;
+                }
+                j += 1;
+            }
+            if matched {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    panic!("column not found")
+}
+
 // Circuit catalog tables use a real compound primary key `(view_id, sub)`
 // instead of hand-packing both halves into one U128 column. `sub` is the
 // per-view secondary key (node_id, an (dst_node,dst_port) pack, or a

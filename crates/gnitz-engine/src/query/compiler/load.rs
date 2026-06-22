@@ -2,68 +2,67 @@
 //! and the scan/reindex/range-key circuit queries the DAG consults at runtime.
 
 use super::*;
+use gnitz_wire::col_index_in as cidx;
 
 // ---------------------------------------------------------------------------
 // System table reading
 // ---------------------------------------------------------------------------
 
-/// Read an i64 value from a cursor's current row at the given column index.
-pub(crate) fn cursor_read_i64(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> i64 {
-    let col_size = schema.columns[col_idx].size() as usize;
-    let ptr = cursor.col_ptr(col_idx, col_size);
-    if ptr.is_null() {
-        return 0;
-    }
-    match col_size {
-        8 => i64::from_le_bytes(unsafe { *(ptr as *const [u8; 8]) }),
-        4 => i32::from_le_bytes(unsafe { *(ptr as *const [u8; 4]) }) as i64,
-        2 => i16::from_le_bytes(unsafe { *(ptr as *const [u8; 2]) }) as i64,
-        1 => (unsafe { *ptr }) as i8 as i64,
-        _ => 0,
-    }
+// Circuit sys-table column offsets, derived by name from the canonical wire
+// arrays (`gnitz_wire::CIRCUIT_*_COLS`) — the same arrays `from_wire_cols` uses
+// to build the schemas — so there is one source of truth. PK is columns [0, 1]
+// (view_id, sub); the denormalised data columns follow. A renamed/reordered wire
+// column shifts these automatically or fails `col_index_in`'s const `panic!`.
+const NODES_COL_NODE_ID: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "node_id");
+const NODES_COL_OPCODE_NEW: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "opcode");
+const NODES_COL_SOURCE_TABLE: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "source_table");
+const NODES_COL_REINDEX_COL: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "reindex_col");
+const NODES_COL_EXPR_PROGRAM: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "expr_program");
+const EDGES_COL_DST_NODE: usize = cidx(gnitz_wire::CIRCUIT_EDGES_COLS, "dst_node");
+const EDGES_COL_DST_PORT: usize = cidx(gnitz_wire::CIRCUIT_EDGES_COLS, "dst_port");
+const EDGES_COL_SRC_NODE: usize = cidx(gnitz_wire::CIRCUIT_EDGES_COLS, "src_node");
+const NODECOL_COL_NODE_ID: usize = cidx(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, "node_id");
+const NODECOL_COL_KIND: usize = cidx(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, "kind");
+const NODECOL_COL_POSITION: usize = cidx(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, "position");
+const NODECOL_COL_VALUE1: usize = cidx(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, "value1");
+const NODECOL_COL_VALUE2: usize = cidx(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, "value2");
+
+/// Read an i64 from a cursor's current row at the given column index. Circuit
+/// system-table columns are all U64 (8-byte), and the nullable ones are read only
+/// behind a `cursor_is_null` guard, so this is a fixed 8-byte load; the asserts
+/// trip on a schema change or an unexpected null instead of silently returning 0.
+fn cursor_read_i64(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> i64 {
+    debug_assert_eq!(
+        schema.columns[col_idx].size() as usize,
+        8,
+        "circuit columns are all U64"
+    );
+    let ptr = cursor.col_ptr(col_idx, 8);
+    debug_assert!(!ptr.is_null(), "non-nullable circuit column read returned null");
+    i64::from_le_bytes(unsafe { *(ptr as *const [u8; 8]) })
 }
 
-/// Read a German String from cursor column. Returns bytes (may be empty).
-pub(super) fn cursor_read_string(cursor: &ReadCursor, col_idx: usize, _schema: &SchemaDescriptor) -> Vec<u8> {
-    use crate::schema::SHORT_STRING_THRESHOLD;
-
+/// Read a German String from a cursor column as raw bytes (may be empty).
+/// Delegates to the canonical decoder so the German-string format has one
+/// implementation; the bytes are returned verbatim (the `expr_program` blob is
+/// binary, not UTF-8).
+fn cursor_read_string(cursor: &ReadCursor, col_idx: usize) -> Vec<u8> {
     let ptr = cursor.col_ptr(col_idx, 16);
     if ptr.is_null() {
         return Vec::new();
     }
-
-    // German string layout: [length:u32][prefix:4bytes][payload:8bytes]
-    // If length <= 12: inline (prefix + first 8 bytes of payload)
-    // If length > 12: prefix + offset(u64) into blob arena
-    let length = u32::from_le_bytes(unsafe { *(ptr as *const [u8; 4]) }) as usize;
-    if length == 0 {
-        return Vec::new();
-    }
-
-    if length <= SHORT_STRING_THRESHOLD {
-        // Inline: bytes are at ptr+4
-        let data_ptr = unsafe { ptr.add(4) };
-        let mut buf = vec![0u8; length];
-        unsafe { std::ptr::copy_nonoverlapping(data_ptr, buf.as_mut_ptr(), length) };
-        buf
+    let st: [u8; 16] = unsafe { *(ptr as *const [u8; 16]) };
+    let blob_ptr = cursor.blob_ptr();
+    let blob: &[u8] = if blob_ptr.is_null() {
+        &[]
     } else {
-        // Long string: 4 bytes prefix at ptr+4, then blob offset (u64) at ptr+8
-        let blob_offset = u64::from_le_bytes(unsafe { *(ptr.add(8) as *const [u8; 8]) }) as usize;
-        let blob_ptr = cursor.blob_ptr();
-        let blob_len = cursor.blob_len();
-        if blob_ptr.is_null() || blob_offset.checked_add(length).is_none_or(|end| end > blob_len) {
-            return Vec::new();
-        }
-        let mut buf = vec![0u8; length];
-        unsafe {
-            std::ptr::copy_nonoverlapping(blob_ptr.add(blob_offset), buf.as_mut_ptr(), length);
-        }
-        buf
-    }
+        unsafe { std::slice::from_raw_parts(blob_ptr, cursor.blob_len()) }
+    };
+    crate::schema::try_decode_german_string(&st, blob).unwrap_or_default()
 }
 
 /// Check if a column is NULL in the current cursor row.
-pub(crate) fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> bool {
+fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> bool {
     let Some(payload_idx) = schema.try_payload_idx(col_idx) else {
         return false; // PK is never null
     };
@@ -73,7 +72,7 @@ pub(crate) fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &Schem
 /// Open a cursor for a system table. Returns None if the table handle is null.
 /// Positioning is done by the caller via `seek_first_positive_with_prefix` on
 /// the `view_id` prefix (the circuit tables use a compound `(view_id, sub)` PK).
-pub(super) fn open_system_cursor(table: *mut Table) -> Option<CursorHandle> {
+fn open_system_cursor(table: *mut Table) -> Option<CursorHandle> {
     if table.is_null() {
         return None;
     }
@@ -148,7 +147,7 @@ pub(crate) fn load_circuit(
             let expr_blob: Option<Vec<u8>> = if cursor_is_null(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema) {
                 None
             } else {
-                let b = cursor_read_string(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema);
+                let b = cursor_read_string(&ch.cursor, NODES_COL_EXPR_PROGRAM);
                 if b.is_empty() {
                     None
                 } else {
