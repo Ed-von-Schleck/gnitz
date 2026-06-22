@@ -1450,12 +1450,12 @@ impl WorkerProcess {
                     .cat()
                     .get_schema_desc(target_id)
                     .ok_or_else(|| format!("no schema for tid={target_id}"))?;
-                let ptable_handle = self.cat().get_ptable_handle(target_id);
+                let mut ptable = self.cat().get_ptable_handle(target_id);
                 // Route on verbatim OPK bytes for every PK width. The old narrow
                 // arm fed `get_pk` (OPK-widened) to `has_pk(u128)`, which
                 // re-OPK-encodes it — a double sign-flip that misses signed PKs.
                 let result = filter_by_pk_bytes(&batch, schema, n, |pkb| {
-                    ptable_handle.is_some_and(|pt_ptr| unsafe { &mut *pt_ptr }.has_pk_bytes(pkb))
+                    ptable.as_mut().is_some_and(|pt| pt.has_pk_bytes(pkb))
                 });
                 self.send_response(
                     target_id as u64,

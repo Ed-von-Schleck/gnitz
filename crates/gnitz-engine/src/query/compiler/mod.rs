@@ -27,6 +27,28 @@ const PORT_IN_A: i32 = gnitz_wire::PORT_IN_A as i32;
 const PORT_IN_B: i32 = gnitz_wire::PORT_IN_B as i32;
 const PORT_TRACE: i32 = gnitz_wire::PORT_TRACE as i32;
 
+/// Why `compile_view` failed to turn a stored view circuit into a runnable plan.
+/// The sole caller logs the variant and maps every error to `None`.
+#[derive(Debug)]
+pub(crate) enum CompileError {
+    /// `load_circuit` could not read the circuit's system tables.
+    LoadFailed,
+    /// The circuit has no nodes.
+    EmptyCircuit,
+    /// The circuit graph contains a cycle (`topo_sort` failed).
+    Cycle,
+    /// `build_plan` returned `None` for the single, unexchanged pipeline.
+    NoExchangeBuildFailed,
+    /// `build_plan` returned `None` for an exchange sub-phase (pre / post / side).
+    PlanBuildFailed,
+    /// A sub-plan's output register is negative or past `reg_meta`'s length.
+    OutRegOutOfBounds,
+    /// A binary set-op side has no `ExchangeShard` input node (malformed circuit).
+    MissingExchangeInput,
+    /// More than two exchange boundaries — not produced by any planner path.
+    TooManyExchanges,
+}
+
 // ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
@@ -271,7 +293,7 @@ pub(crate) unsafe fn compile_view(
     view_table_id: u32,
     view_schema: &SchemaDescriptor,
     ext_tables: &[ExternalTable],
-) -> Result<CompileOutput, i32> {
+) -> Result<CompileOutput, CompileError> {
     let mut loaded = load_circuit(
         sys_nodes,
         sys_nodes_schema,
@@ -282,13 +304,11 @@ pub(crate) unsafe fn compile_view(
         view_id,
         *view_schema,
     )
-    .ok_or(-1)?;
+    .ok_or(CompileError::LoadFailed)?;
     if loaded.nodes.is_empty() {
-        return Err(-1);
+        return Err(CompileError::EmptyCircuit);
     }
-    if topo_sort(&mut loaded).is_err() {
-        return Err(-2);
-    }
+    topo_sort(&mut loaded)?;
 
     let ann = annotate(&loaded, ext_tables);
 
@@ -332,7 +352,7 @@ pub(crate) unsafe fn compile_view(
                 &[],
                 owned_expr_progs_for_rw,
             )
-            .ok_or(-5)?;
+            .ok_or(CompileError::NoExchangeBuildFailed)?;
 
             let source_reg_map = source_reg_map_u16(&plan.source_reg_map);
 
@@ -382,21 +402,17 @@ pub(crate) unsafe fn compile_view(
                 view_dir,
                 view_table_id,
                 view_id,
-                if exchange_input_nid >= 0 {
-                    Some(exchange_input_nid)
-                } else {
-                    None
-                },
+                exchange_input_nid,
                 &[],
                 pre_progs,
             )
-            .ok_or(-3)?;
+            .ok_or(CompileError::PlanBuildFailed)?;
 
             if pre.out_reg < 0 || pre.out_reg as usize >= pre.vm.program.reg_meta.len() {
                 for d in &pre.scratch_dirs {
                     let _ = std::fs::remove_dir_all(d);
                 }
-                return Err(-3);
+                return Err(CompileError::OutRegOutOfBounds);
             }
             let exchange_schema = pre.vm.program.reg_meta[pre.out_reg as usize].schema;
             let side_a_source_id = single_source(&pre.source_reg_map);
@@ -418,7 +434,7 @@ pub(crate) unsafe fn compile_view(
                     for d in &pre.scratch_dirs {
                         let _ = std::fs::remove_dir_all(d);
                     }
-                    return Err(-4);
+                    return Err(CompileError::PlanBuildFailed);
                 }
             };
 
@@ -455,11 +471,8 @@ pub(crate) unsafe fn compile_view(
             // phase.
             let ea = exchange_nids[0];
             let eb = exchange_nids[1];
-            let ea_in = exchange_input_node(&loaded, ea);
-            let eb_in = exchange_input_node(&loaded, eb);
-            if ea_in < 0 || eb_in < 0 {
-                return Err(-3);
-            }
+            let ea_in = exchange_input_node(&loaded, ea).ok_or(CompileError::MissingExchangeInput)?;
+            let eb_in = exchange_input_node(&loaded, eb).ok_or(CompileError::MissingExchangeInput)?;
 
             let side_a_set = ancestors_inclusive(&loaded, ea_in);
             let side_b_set = ancestors_inclusive(&loaded, eb_in);
@@ -506,10 +519,10 @@ pub(crate) unsafe fn compile_view(
                 &[],
                 Vec::new(),
             )
-            .ok_or(-3)?;
+            .ok_or(CompileError::PlanBuildFailed)?;
             if side_a.out_reg < 0 || side_a.out_reg as usize >= side_a.vm.program.reg_meta.len() {
                 cleanup(&side_a.scratch_dirs);
-                return Err(-3);
+                return Err(CompileError::OutRegOutOfBounds);
             }
             let schema_a = side_a.vm.program.reg_meta[side_a.out_reg as usize].schema;
             let side_a_source_id = single_source(&side_a.source_reg_map);
@@ -529,13 +542,13 @@ pub(crate) unsafe fn compile_view(
                 Some(p) => p,
                 None => {
                     cleanup(&side_a.scratch_dirs);
-                    return Err(-3);
+                    return Err(CompileError::PlanBuildFailed);
                 }
             };
             if side_b.out_reg < 0 || side_b.out_reg as usize >= side_b.vm.program.reg_meta.len() {
                 cleanup(&side_a.scratch_dirs);
                 cleanup(&side_b.scratch_dirs);
-                return Err(-3);
+                return Err(CompileError::OutRegOutOfBounds);
             }
             let schema_b = side_b.vm.program.reg_meta[side_b.out_reg as usize].schema;
             let side_b_source_id = single_source(&side_b.source_reg_map);
@@ -556,7 +569,7 @@ pub(crate) unsafe fn compile_view(
                 None => {
                     cleanup(&side_a.scratch_dirs);
                     cleanup(&side_b.scratch_dirs);
-                    return Err(-4);
+                    return Err(CompileError::PlanBuildFailed);
                 }
             };
 
@@ -620,7 +633,7 @@ pub(crate) unsafe fn compile_view(
                 view_id,
                 exchange_nids.len()
             );
-            Err(-6)
+            Err(CompileError::TooManyExchanges)
         }
     }
 }
@@ -837,7 +850,7 @@ mod tests {
             ],
             &[0],
         );
-        let joined = merge_schemas_for_join(&left, &right);
+        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::None);
         assert_eq!(joined.num_columns(), 3); // PK + left_I64 + right_STRING
         assert_eq!(joined.columns[0].type_code, type_code::U128);
         assert_eq!(joined.columns[1].type_code, type_code::I64);
@@ -860,7 +873,7 @@ mod tests {
             ],
             &[0],
         );
-        let joined = merge_schemas_for_join_outer(&left, &right);
+        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::RightNullable);
         assert_eq!(joined.num_columns(), 3);
         assert_eq!(joined.columns[2].nullable, 1); // right side nullable
     }
@@ -884,7 +897,7 @@ mod tests {
             ],
             &[0],
         );
-        let joined = merge_schemas_for_join_impl(&left, &right, false);
+        let joined = merge_schemas_for_join(&left, &right, JoinNullFill::None);
         // Two PK columns up front, then left payload (2), then right payload (1) = 5.
         assert_eq!(joined.num_columns(), 5);
         assert_eq!(joined.pk_indices(), &[0, 1]);
@@ -899,7 +912,7 @@ mod tests {
             ],
             &[0],
         );
-        let joined_single = merge_schemas_for_join_impl(&left_single, &right, false);
+        let joined_single = merge_schemas_for_join(&left_single, &right, JoinNullFill::None);
         assert_eq!(joined_single.pk_indices(), &[0]);
     }
 
@@ -993,7 +1006,7 @@ mod tests {
             ],
             &[0],
         );
-        assert!(schemas_physically_identical(&a, &b));
+        assert!(a.same_physical_layout(&b));
 
         let c = SchemaDescriptor::new(
             &[
@@ -1002,7 +1015,7 @@ mod tests {
             ],
             &[0],
         );
-        assert!(!schemas_physically_identical(&a, &c));
+        assert!(!a.same_physical_layout(&c));
     }
 
     #[test]
@@ -1842,7 +1855,7 @@ mod tests {
             }
             SchemaDescriptor::new(&cols[..n], &[0])
         };
-        merge_schemas_for_join(&make(half), &make(half));
+        merge_schemas_for_join(&make(half), &make(half), JoinNullFill::None);
     }
 
     // ── helpers shared by join tests ─────────────────────────────────────

@@ -142,8 +142,6 @@ pub(crate) enum Instr {
         avi_table_idx: i16, // -1 = no AVI; index into Program::tables
         avi_for_max: bool,
         avi_agg_col_type_code: u8,
-        #[allow(dead_code)]
-        avi_agg_col_idx: u32,
         // GI params — GI cursor is created fresh from the GI table each tick
         gi_table_idx: i16, // -1 = no GI; index into Program::tables
         gi_col_idx: u32,
@@ -348,12 +346,6 @@ impl RegisterFile {
         RegisterFile { registers }
     }
 
-    /// Clear all delta batches.  Cursor refresh is done by the caller before
-    /// entering the Rust VM (it knows about Table vs PartitionedTable).
-    pub fn clear_delta_batches(&mut self) {
-        self.clear_deltas();
-    }
-
     /// Bind cursor handles into trace registers.
     /// Each non-null handle is borrowed for the duration of the epoch.
     /// Owned trace registers (listed in `owned_trace_reg_ids`, already set by
@@ -398,8 +390,8 @@ mod tests {
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 
     #[test]
-    fn test_clear_delta_batches_clears_only_delta_registers() {
-        // clear_delta_batches (used by DagEngine::clear_view_regfile_deltas
+    fn test_clear_deltas_clears_only_delta_registers() {
+        // clear_deltas (used by DagEngine::clear_view_regfile_deltas
         // after backfill) must empty Delta registers while leaving Trace
         // registers untouched.
         let schema = schema_1i64();
@@ -434,7 +426,7 @@ mod tests {
             ],
         };
         assert_eq!(rf.registers[0].batch.count, 1);
-        rf.clear_delta_batches();
+        rf.clear_deltas();
         assert_eq!(rf.registers[0].batch.count, 0, "Delta register must be cleared");
         assert_eq!(rf.registers[1].batch.count, 1, "Trace register must be preserved");
     }
@@ -1514,7 +1506,6 @@ mod tests {
             std::ptr::null_mut(), // avi_table
             false,
             0,
-            0,
             std::ptr::null_mut(), // gi_table
             0,
             std::ptr::null(), // finalize_prog
@@ -1627,7 +1618,6 @@ mod tests {
             std::ptr::null_mut(),
             false,
             0,
-            0,
             std::ptr::null_mut(),
             0,
             std::ptr::null(),
@@ -1676,7 +1666,6 @@ mod tests {
             out_schema,
             std::ptr::null_mut(),
             false,
-            0,
             0,
             std::ptr::null_mut(),
             0,
@@ -2060,7 +2049,6 @@ mod tests {
             std::ptr::null_mut(),
             false,
             0,
-            0,
             std::ptr::null_mut(),
             0,
             std::ptr::null(),
@@ -2280,7 +2268,6 @@ mod tests {
             out_schema,
             std::ptr::null_mut(),
             false,
-            0,
             0,
             std::ptr::null_mut(),
             0,

@@ -374,6 +374,27 @@ impl SchemaDescriptor {
         &self.pk_indices[..self.pk_count as usize]
     }
 
+    /// Same column count, PK indices, and per-column `type_code`.
+    ///
+    /// Deliberately ignores per-column `nullable` (and `size`/`is_signed`, which
+    /// are derived from `type_code`) — this is **weaker** than the `PartialEq`
+    /// impl below, which compares the full column bytes including `nullable`.
+    /// Used for identity-MAP elision and sink type-safety, both of which must
+    /// treat a nullability-only difference as "same layout". Do not "simplify"
+    /// to `self == other`: that would compare `nullable` and change elision
+    /// semantics.
+    pub fn same_physical_layout(&self, other: &SchemaDescriptor) -> bool {
+        if self.num_columns() != other.num_columns() || self.pk_indices() != other.pk_indices() {
+            return false;
+        }
+        for i in 0..self.num_columns() {
+            if self.columns[i].type_code != other.columns[i].type_code {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Iterate over PK columns in pk-list order. Mirror of
     /// `payload_columns()`. Yields `(pk_ord, col_idx, &SchemaColumn)`.
     /// No non-test caller today; introduced preemptively so future

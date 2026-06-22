@@ -40,7 +40,7 @@ pub(crate) fn execute_epoch(
 ///
 /// Used by the multi-exchange dispatch: a set-op post phase reads one
 /// exchange-relayed batch per side (left, right), so more than one register must
-/// be loaded after `clear_delta_batches` wipes the delta registers. Each
+/// be loaded after `clear_deltas` wipes the delta registers. Each
 /// `(reg, batch)` is moved into place; later seeds win on a duplicate register.
 /// Takes an iterator so the single-input `execute_epoch` (the hot per-epoch
 /// entry) seeds via `iter::once` with no heap allocation.
@@ -59,7 +59,7 @@ pub(crate) fn execute_epoch_multi(
     );
 
     // 1. Clear delta batches (cursor refresh already done by caller)
-    regfile.clear_delta_batches();
+    regfile.clear_deltas();
 
     // 2. Bind cursors and seed input batches
     regfile.bind_cursors(cursor_handles, owned_trace_reg_ids);
@@ -497,7 +497,6 @@ pub(crate) fn execute_epoch_multi(
                 avi_table_idx,
                 avi_for_max,
                 avi_agg_col_type_code,
-                avi_agg_col_idx: _,
                 gi_table_idx,
                 gi_col_idx,
                 finalize_func_idx,

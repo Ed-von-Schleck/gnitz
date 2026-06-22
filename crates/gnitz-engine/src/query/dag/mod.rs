@@ -340,16 +340,16 @@ impl DagEngine {
     /// a post-VM that also accumulates delta registers during backfill).
     pub fn clear_view_regfile_deltas(&mut self, view_id: i64) {
         if let Some(plan) = self.cache.get_mut(&view_id) {
-            plan.pre.vm.regfile.clear_delta_batches();
+            plan.pre.vm.regfile.clear_deltas();
             if let Some(post) = plan.post.as_mut() {
-                post.vm.regfile.clear_delta_batches();
+                post.vm.regfile.clear_deltas();
             }
             // Binary set-op views (UNION ALL / EXCEPT / INTERSECT) compile the
             // right-hand side into `side_b`, which owns its own VM regfile; its
             // delta batches stay pinned (pooled batches leaked) until the view is
             // invalidated unless cleared here too.
             if let Some(sb) = plan.side_b.as_mut() {
-                sb.plan.vm.regfile.clear_delta_batches();
+                sb.plan.vm.regfile.clear_deltas();
             }
         }
     }
@@ -860,8 +860,8 @@ impl DagEngine {
                 gnitz_debug!("dag: compiled view_id={}, pre_regs={}", view_id, output.pre.num_regs);
                 Some(output)
             }
-            Err(code) => {
-                gnitz_warn!("dag: compile_view returned error {} for view_id={}", code, view_id);
+            Err(err) => {
+                gnitz_warn!("dag: compile_view returned error {:?} for view_id={}", err, view_id);
                 None
             }
         }
@@ -953,21 +953,20 @@ impl DagEngine {
 
         let schema = entry.schema;
         let unique_pk = entry.unique_pk();
-        let ptbl_ptr = entry.handle.ptable_ptr();
-
         // unique_pk ⟹ Partitioned: every SQL-created base table is registered
         // Partitioned; system tables (the only Borrowed handles) are never
-        // unique_pk, so a unique_pk relation always has a non-null ptable. The
-        // debug_assert turns any future stray Borrowed+unique_pk registration into
-        // a loud failure in debug; a release build passes the batch through
-        // unenforced rather than dereferencing a null pointer.
-        debug_assert!(
-            !(unique_pk && ptbl_ptr.is_null()),
-            "unique_pk relation {table_id} must be a PartitionedTable",
-        );
-        let effective_batch = if unique_pk && !ptbl_ptr.is_null() {
-            let ptable = unsafe { &mut *ptbl_ptr };
-            Self::enforce_unique_pk(ptable, &schema, batch)
+        // unique_pk, so a unique_pk relation always resolves to a PartitionedTable.
+        // The debug_assert turns any future stray Borrowed+unique_pk registration
+        // into a loud failure in debug; a release build passes the batch through
+        // unenforced rather than skipping enforcement on a missing partitioned store.
+        let effective_batch = if unique_pk {
+            match entry.handle.as_partitioned_mut() {
+                Some(ptable) => Self::enforce_unique_pk(ptable, &schema, batch),
+                None => {
+                    debug_assert!(false, "unique_pk relation {table_id} must be a PartitionedTable");
+                    batch
+                }
+            }
         } else {
             batch
         };

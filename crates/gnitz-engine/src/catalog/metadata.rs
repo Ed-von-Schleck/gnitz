@@ -229,12 +229,18 @@ impl CatalogEngine {
 
     // -- Store handle accessors -----------------------------------------------
 
-    /// Get raw PartitionedTable handle for a user table.
-    pub(crate) fn get_ptable_handle(&self, table_id: i64) -> Option<*mut PartitionedTable> {
-        self.dag.tables.get(&table_id).and_then(|e| match &e.handle {
-            StoreHandle::Partitioned(cell) => Some(unsafe { &mut **cell.get() as *mut PartitionedTable }),
-            _ => None,
-        })
+    /// Get a `&mut PartitionedTable` for a user table, or `None` if the table is
+    /// absent or not partitioned (e.g. a `Borrowed` system table).
+    ///
+    /// SAFETY: hands out `&mut` from `&self` through the same `UnsafeCell`
+    /// contract as [`StoreHandle::as_partitioned_mut`] — no aliasing `&mut` into
+    /// the same store may be live across the call.
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) fn get_ptable_handle(&self, table_id: i64) -> Option<&mut PartitionedTable> {
+        self.dag
+            .tables
+            .get(&table_id)
+            .and_then(|e| e.handle.as_partitioned_mut())
     }
 
     /// Get schema descriptor for a table.

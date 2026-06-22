@@ -216,7 +216,7 @@ pub(crate) fn load_circuit(
 // Topological sort (Kahn's algorithm)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), i32> {
+pub(crate) fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), CompileError> {
     let mut in_degree: HashMap<i32, i32> = HashMap::new();
     for &nid in loaded.nodes.keys() {
         in_degree.insert(nid, 0);
@@ -259,7 +259,7 @@ pub(crate) fn topo_sort(loaded: &mut LoadedCircuit) -> Result<(), i32> {
     }
 
     if ordered.len() != loaded.nodes.len() {
-        return Err(-1); // cycle detected
+        return Err(CompileError::Cycle);
     }
     loaded.ordered = ordered;
     Ok(())

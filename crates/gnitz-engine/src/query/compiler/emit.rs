@@ -7,14 +7,13 @@ use super::*;
 // Expression + scalar function construction helpers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
+#[allow(clippy::vec_box, clippy::ptr_arg)]
 pub(super) fn create_expr_predicate(
     code: Vec<i64>,
     num_regs: u32,
     result_reg: u32,
     const_strings: Vec<Vec<u8>>,
     schema: &SchemaDescriptor,
-    _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
     let prog = ExprProgram::new(code, num_regs, result_reg, const_strings);
@@ -24,14 +23,13 @@ pub(super) fn create_expr_predicate(
     ptr
 }
 
-#[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
+#[allow(clippy::vec_box, clippy::ptr_arg)]
 pub(super) fn create_expr_map(
     code: Vec<i64>,
     num_regs: u32,
     const_strings: Vec<Vec<u8>>,
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
-    _owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
 ) -> *const ScalarFuncKind {
     let prog = ExprProgram::new(code, num_regs, 0, const_strings);
@@ -233,7 +231,6 @@ pub(super) fn emit_node(
                             dep.result_reg,
                             dep.const_strings,
                             &in_schema,
-                            owned_expr_progs,
                             owned_funcs,
                         )
                     }
@@ -272,7 +269,7 @@ pub(super) fn emit_node(
                         }
                     };
                     // Identity MAP: if no reindex and schemas match, skip if sequential copy.
-                    if reindex_cols.is_empty() && schemas_physically_identical(&in_reg_schema, &loaded.out_schema) {
+                    if reindex_cols.is_empty() && in_reg_schema.same_physical_layout(&loaded.out_schema) {
                         let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
                         let prog = ExprProgram::new(code, dep.num_regs, 0, Vec::new());
                         // Elide only when the block copy skips exactly the inherited
@@ -346,7 +343,6 @@ pub(super) fn emit_node(
                         dep.const_strings,
                         &in_reg_schema,
                         &node_schema,
-                        owned_expr_progs,
                         owned_funcs,
                     );
                     reg_schemas[reg_id as usize] = node_schema;
@@ -499,7 +495,6 @@ pub(super) fn emit_node(
                 reg_schemas,
                 reg_kinds,
                 owned_tables,
-                owned_funcs,
                 owned_expr_progs,
                 owned_trace_regs,
                 view_dir,
@@ -517,22 +512,23 @@ pub(super) fn emit_node(
             reg_kinds[reg_id as usize] = 0;
             match kind {
                 gnitz_wire::JoinKind::DeltaTrace => {
-                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema);
+                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None);
                     builder.add_join_dt(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
                 gnitz_wire::JoinKind::DeltaTraceOuter => {
-                    reg_schemas[reg_id as usize] = merge_schemas_for_join_outer(&a_schema, &b_schema);
+                    reg_schemas[reg_id as usize] =
+                        merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::RightNullable);
                     builder.add_join_dt_outer(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
                 gnitz_wire::JoinKind::DeltaDelta => {
-                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema);
+                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None);
                     builder.add_join_dd(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
                 gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => {
                     // Same output layout as the equi delta-trace join; only the
                     // probe differs. `n_eq`/`rel` ride to the op so it can derive
                     // the eq-prefix / range-slot split and the cut direction.
-                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema);
+                    reg_schemas[reg_id as usize] = merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None);
                     builder.add_join_dt_range(a_reg as u16, b_reg as u16, reg_id as u16, b_schema, *n_eq, *rel);
                 }
             }
@@ -642,7 +638,7 @@ pub(super) fn emit_node(
                 cols[i + 1] = SchemaColumn::new(tc, 1);
             }
             let right = SchemaDescriptor::new(&cols[..type_codes.len() + 1], &[0]);
-            let out_schema = merge_schemas_for_join_outer(&in_schema, &right);
+            let out_schema = merge_schemas_for_join(&in_schema, &right, JoinNullFill::RightNullable);
             reg_schemas[reg_id as usize] = out_schema;
             reg_kinds[reg_id as usize] = 0;
             builder.add_null_extend(in_reg as u16, reg_id as u16, right);
@@ -725,7 +721,6 @@ pub(super) fn emit_reduce(
     reg_schemas: &mut Vec<SchemaDescriptor>,
     reg_kinds: &mut Vec<u8>,
     owned_tables: &mut Vec<Box<Table>>,
-    _owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
     owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_trace_regs: &mut Vec<(u16, usize)>,
     view_dir: &str,
@@ -859,25 +854,12 @@ pub(super) fn emit_reduce(
     if tr_in_table_idx.is_some() && gcols.len() == 1 {
         let gc_col_idx = gcols[0] as usize;
         let gc_raw = in_reg_schema.columns[gc_col_idx].type_code;
-        let gc_tc = TypeCode::from_validated_u8(gc_raw);
         // A nullable group column makes the GI unsound: NULL rows are skipped at
         // population, but the reduce GI path extracts gc=0 from a NULL group's
         // zero-filled slot and would collide it with a real group 0. Fall back to
         // the predicate-filtered full trace scan, which distinguishes NULL from 0.
         let gc_nullable = in_reg_schema.columns[gc_col_idx].nullable != 0;
-        if !gc_nullable
-            && matches!(
-                gc_tc,
-                TypeCode::U8
-                    | TypeCode::I8
-                    | TypeCode::U16
-                    | TypeCode::I16
-                    | TypeCode::U32
-                    | TypeCode::I32
-                    | TypeCode::U64
-                    | TypeCode::I64
-            )
-        {
+        if !gc_nullable && is_fixed_int(gc_raw) {
             // Nest the GI under the trace-input table's own scratch dir, built
             // from the same `child_scratch_dir` convention so the rank stamp can
             // never drift between the two. Nesting folds the GI into the parent's
@@ -965,7 +947,6 @@ pub(super) fn emit_reduce(
         avi_table_ptr,
         avi_for_max,
         avi_agg_col_type_code,
-        avi_agg_col_idx,
         gi_table_ptr,
         gi_col_idx,
         fin_prog_ptr,
@@ -1316,7 +1297,7 @@ pub(super) fn build_plan(
         // A column-count match is not enough: two schemas with equal column
         // counts but mismatched types (e.g. I64 vs German-string) let the client
         // read a 16-byte string descriptor out of 8-byte integer storage.
-        if sink_schema.num_columns() > 0 && !schemas_physically_identical(sink_schema, out_schema) {
+        if sink_schema.num_columns() > 0 && !sink_schema.same_physical_layout(out_schema) {
             cleanup(&state.scratch_dirs);
             return None;
         }
@@ -1366,14 +1347,14 @@ pub(super) fn ancestors_inclusive(loaded: &LoadedCircuit, start: i32) -> HashSet
     set
 }
 
-/// The node feeding an `ExchangeShard` on `PORT_IN` (the value to repartition).
-pub(super) fn exchange_input_node(loaded: &LoadedCircuit, ex_nid: i32) -> i32 {
+/// The node feeding an `ExchangeShard` on `PORT_IN` (the value to repartition),
+/// or `None` if the exchange has no such input edge (a malformed circuit).
+pub(super) fn exchange_input_node(loaded: &LoadedCircuit, ex_nid: i32) -> Option<i32> {
     loaded
         .incoming
         .get(&ex_nid)
         .and_then(|ins| ins.iter().find(|&&(_, port)| port == PORT_IN))
         .map(|&(src, _)| src)
-        .unwrap_or(-1)
 }
 
 /// `Rewrites` restricted to the nodes of one plan phase. Set-op / distinct

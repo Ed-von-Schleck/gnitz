@@ -1,13 +1,16 @@
 //! `StoreHandle` — the storage adapter for a registered relation, and the
-//! single inbound target catalog reaches for. The Owned variant drops the
-//! underlying storage on Drop; Borrowed/Partitioned hold non-owning handles.
+//! single inbound target catalog reaches for. `Partitioned` owns its boxed
+//! `PartitionedTable`; `Borrowed` is a non-owning pointer to a system table
+//! owned by `CatalogEngine`. There is no custom `Drop`: the `Partitioned`
+//! box is freed by the default drop glue when its registry entry is removed.
 
 use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, PartitionedTable, StorageError, Table};
 use std::cell::UnsafeCell;
 
-/// Storage handle of a registered relation. The owned variant drops the
-/// underlying storage on Drop; the Borrowed variant holds a non-owning
-/// pointer for system tables owned by CatalogEngine directly.
+/// Storage handle of a registered relation. `Partitioned` owns its boxed
+/// `PartitionedTable` (freed by default drop glue when its registry entry is
+/// removed); `Borrowed` is a non-owning `*mut Table` to a system table owned
+/// by `CatalogEngine`.
 pub enum StoreHandle {
     /// Owned PartitionedTable — used by base tables and views. Wrapped in
     /// `UnsafeCell` so the interior-mutable accessors can hand out `&mut`
@@ -24,25 +27,6 @@ pub enum StoreHandle {
 unsafe impl Send for StoreHandle {}
 
 impl StoreHandle {
-    /// Get a raw pointer to the Table (Borrowed), or null for Partitioned.
-    /// SAFETY: the owner keeps the Table alive across any synchronous call
-    /// using the pointer. The caller must ensure no aliasing &mut references
-    /// exist.
-    pub fn table_ptr(&self) -> *mut Table {
-        match self {
-            StoreHandle::Borrowed(ptr) => *ptr,
-            StoreHandle::Partitioned(_) => std::ptr::null_mut(),
-        }
-    }
-
-    /// Get a raw pointer to the PartitionedTable, or null if not Partitioned.
-    pub fn ptable_ptr(&self) -> *mut PartitionedTable {
-        match self {
-            StoreHandle::Partitioned(cell) => unsafe { &mut **cell.get() as *mut PartitionedTable },
-            _ => std::ptr::null_mut(),
-        }
-    }
-
     // ------------------------------------------------------------------
     // Interior-mutable accessors
     //
@@ -76,13 +60,9 @@ impl StoreHandle {
     /// (OPK-widened) — use [`has_pk_bytes`] for verbatim OPK bytes.
     #[cfg(test)] // sole caller is the test-only inline FK check (validate_fk_inline)
     pub fn has_pk(&self, key: u128) -> bool {
-        let tptr = self.table_ptr();
-        unsafe {
-            if !tptr.is_null() {
-                (*tptr).has_pk(key)
-            } else {
-                (*self.ptable_ptr()).has_pk(key)
-            }
+        match self {
+            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).has_pk(key) },
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).has_pk(key) },
         }
     }
 
@@ -90,13 +70,9 @@ impl StoreHandle {
     /// every PK width; takes the bytes `Batch::get_pk_bytes` produces, with no
     /// native round-trip (and thus no double-encode for signed/compound PKs).
     pub fn has_pk_bytes(&self, key: &[u8]) -> bool {
-        let tptr = self.table_ptr();
-        unsafe {
-            if !tptr.is_null() {
-                (*tptr).has_pk_bytes(key)
-            } else {
-                (*self.ptable_ptr()).has_pk_bytes(key)
-            }
+        match self {
+            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).has_pk_bytes(key) },
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).has_pk_bytes(key) },
         }
     }
 
@@ -104,13 +80,9 @@ impl StoreHandle {
     /// Infallible, non-mutating — the recommended default. See
     /// `Table::open_cursor`.
     pub fn open_cursor(&self) -> CursorHandle {
-        let tptr = self.table_ptr();
-        unsafe {
-            if !tptr.is_null() {
-                (*tptr).open_cursor()
-            } else {
-                (*self.ptable_ptr()).open_cursor()
-            }
+        match self {
+            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).open_cursor() },
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).open_cursor() },
         }
     }
 
@@ -119,13 +91,9 @@ impl StoreHandle {
     /// name surfaces. The lint guards external callers, not this dispatch.
     #[allow(clippy::disallowed_methods)]
     pub fn create_cursor_compacting(&self) -> Result<CursorHandle, StorageError> {
-        let tptr = self.table_ptr();
-        unsafe {
-            if !tptr.is_null() {
-                (*tptr).create_cursor_compacting()
-            } else {
-                (*self.ptable_ptr()).create_cursor_compacting()
-            }
+        match self {
+            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).create_cursor_compacting() },
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).create_cursor_compacting() },
         }
     }
 
@@ -134,13 +102,9 @@ impl StoreHandle {
     /// storage layer (zero-copy for single-partition stores; one
     /// MemBatch-borrowed scatter for multi-partition).
     pub fn ingest_owned_batch(&self, batch: Batch) -> Result<(), StorageError> {
-        let tptr = self.table_ptr();
-        unsafe {
-            if !tptr.is_null() {
-                (*tptr).ingest_owned_batch(batch)
-            } else {
-                (*self.ptable_ptr()).ingest_owned_batch(batch)
-            }
+        match self {
+            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).ingest_owned_batch(batch) },
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).ingest_owned_batch(batch) },
         }
     }
 

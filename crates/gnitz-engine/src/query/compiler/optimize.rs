@@ -115,18 +115,6 @@ pub(super) fn annotate(loaded: &LoadedCircuit, ext_tables: &[ExternalTable]) -> 
 // Optimization passes
 // ---------------------------------------------------------------------------
 
-pub(super) fn schemas_physically_identical(a: &SchemaDescriptor, b: &SchemaDescriptor) -> bool {
-    if a.num_columns() != b.num_columns() || a.pk_indices() != b.pk_indices() {
-        return false;
-    }
-    for i in 0..a.num_columns() {
-        if a.columns[i].type_code != b.columns[i].type_code {
-            return false;
-        }
-    }
-    true
-}
-
 /// Split fold programs and rewrite state between pre- and post-exchange plans.
 ///
 /// `opt_fold_reduce_map` records programs for ALL REDUCE nodes in the graph.
@@ -259,10 +247,18 @@ pub(super) fn copy_pk_columns_into(
     k
 }
 
-pub(super) fn merge_schemas_for_join_impl(
+/// Whether a join merges the right side's payload columns as-is or marks them
+/// nullable (outer-join null-fill).
+#[derive(Clone, Copy)]
+pub(super) enum JoinNullFill {
+    None,
+    RightNullable,
+}
+
+pub(super) fn merge_schemas_for_join(
     left: &SchemaDescriptor,
     right: &SchemaDescriptor,
-    right_nullable: bool,
+    fill: JoinNullFill,
 ) -> SchemaDescriptor {
     let total = left.num_columns() + right.num_payload_cols();
     assert!(
@@ -283,21 +279,13 @@ pub(super) fn merge_schemas_for_join_impl(
     }
     for (_, _, c) in right.payload_columns() {
         let mut c = *c;
-        if right_nullable {
+        if matches!(fill, JoinNullFill::RightNullable) {
             c.nullable = 1;
         }
         cols[n] = c;
         n += 1;
     }
     SchemaDescriptor::new(&cols[..n], &pk_idx[..pk_len])
-}
-
-pub(super) fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
-    merge_schemas_for_join_impl(left, right, false)
-}
-
-pub(super) fn merge_schemas_for_join_outer(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
-    merge_schemas_for_join_impl(left, right, true)
 }
 
 pub(super) fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i32]) -> SchemaDescriptor {
@@ -419,12 +407,9 @@ pub(super) fn build_reduce_output_schema(
         // a U64 payload column), `pk_columns()` would name the wrong
         // column, so fall back to copying that one group column.
         if group_set_eq_pk {
-            for (_, _, c) in input.pk_columns() {
-                cols[n] = *c;
-                pk_idx[pk_len] = n as u32;
-                pk_len += 1;
-                n += 1;
-            }
+            let k = copy_pk_columns_into(input, &mut cols, &mut pk_idx);
+            n = k;
+            pk_len = k;
         } else {
             cols[n] = input.columns[group_cols[0] as usize];
             pk_idx[pk_len] = n as u32;
@@ -452,10 +437,14 @@ pub(super) fn build_reduce_output_schema(
 }
 
 pub(super) fn agg_value_idx_eligible(tc: TypeCode) -> bool {
-    !matches!(
-        tc,
-        TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128
-    )
+    // The exact order-encodable AVI value set: a narrow (<=8B) fixed int or float.
+    // Reuse the canonical predicates instead of a negative variant allow-list, so a
+    // future TypeCode is AVI-ineligible by default until explicitly classified.
+    // Load-bearing: the excluded types are exactly what keep the `unreachable!` arms
+    // of `encode_ordered`/`decode_ordered` (ops/util.rs) unreachable — change the
+    // *form* of this predicate freely, but never widen its accepted set without
+    // updating those arms.
+    is_fixed_int(tc as u8) || tc.is_float()
 }
 
 /// AVI stores the group key as a fixed-width byte prefix. A group key is

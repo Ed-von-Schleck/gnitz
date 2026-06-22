@@ -361,7 +361,6 @@ impl ProgramBuilder {
         avi_table: *mut Table,
         avi_for_max: bool,
         avi_agg_col_type_code: u8,
-        avi_agg_col_idx: u32,
         // GI params
         gi_table: *mut Table,
         gi_col_idx: u32,
@@ -398,7 +397,6 @@ impl ProgramBuilder {
             avi_table_idx,
             avi_for_max,
             avi_agg_col_type_code,
-            avi_agg_col_idx,
             gi_table_idx,
             gi_col_idx,
             finalize_func_idx,
