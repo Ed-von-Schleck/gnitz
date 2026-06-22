@@ -189,26 +189,106 @@ pub trait ExchangeCallback {
 // DagEngine
 // ---------------------------------------------------------------------------
 
-pub struct DagEngine {
-    cache: FxHashMap<i64, CachedPlan>,
-    dep_map: FxHashMap<i64, Vec<i64>>,    // source_table_id → [view_ids]
-    source_map: FxHashMap<i64, Vec<i64>>, // view_id → [source_table_ids]
-    dep_map_valid: bool,
-    shard_cols_cache: FxHashMap<i64, Vec<i32>>,
+/// The per-view exchange-routing metadata caches, grouped so their eviction can
+/// never drift from the field set. `clear` (`*self = default`) auto-covers any
+/// field added later; `evict` drops every entry mentioning an id and is used for
+/// both table and view drops.
+#[derive(Default)]
+struct ViewPropCache {
+    shard_cols: FxHashMap<i64, Vec<i32>>,
     // Each entry is (reindex column, carried promotion target tc) — the carried
     // tc is non-zero for a cross-width join key and threads to the scatter packer.
-    join_shard_cols_cache: FxHashMap<(i64, i64), Vec<(i32, u8)>>,
+    join_shard: FxHashMap<(i64, i64), Vec<(i32, u8)>>,
     // Whether a view's output ExchangeShard is a no-op (every row already on its
-    // PK-owner) and the IPC shuffle can be skipped. Memoized per view_id; evicted
-    // in lockstep with the sibling view caches.
-    skip_exchange_cache: FxHashMap<i64, bool>,
-    // Whether a view has an ExchangeShard node at all. Memoized per view_id;
-    // evicted in lockstep with the sibling view caches.
-    needs_exchange_cache: FxHashMap<i64, bool>,
+    // PK-owner) and the IPC shuffle can be skipped. Memoized per view_id.
+    skip_exchange: FxHashMap<i64, bool>,
+    // Whether a view has an ExchangeShard node at all. Memoized per view_id.
+    needs_exchange: FxHashMap<i64, bool>,
     // Whether a view is a non-equi (range) join — its input relay broadcasts and
-    // its driver branch double-exchanges. Memoized per view_id; evicted in
-    // lockstep with the sibling view-keyed caches.
-    range_join_cache: FxHashMap<i64, Option<u8>>,
+    // its driver branch double-exchanges. Memoized per view_id.
+    range_join: FxHashMap<i64, Option<u8>>,
+}
+
+impl ViewPropCache {
+    /// Drop every memoized entry mentioning `id` — keyed by it as the owning
+    /// view/table, or with it as a join source. Used for dropping either a table
+    /// or a view: production routes both through here (`unregister_table`), and a
+    /// dropped view can itself be a join source. Over-eviction is always safe
+    /// (entries are recomputed on miss), so the broad join_shard retain (matching
+    /// `id` as view OR source) is correct for every drop.
+    fn evict(&mut self, id: i64) {
+        self.shard_cols.remove(&id);
+        self.join_shard.retain(|&(v, s), _| v != id && s != id);
+        self.skip_exchange.remove(&id);
+        self.needs_exchange.remove(&id);
+        self.range_join.remove(&id);
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// The bidirectional view-dependency index with its validity flag bundled in, so
+/// "valid but stale" is unreachable: only `get_or_rebuild` sets `valid` (after
+/// repopulating both maps), and only `invalidate` clears it.
+#[derive(Default)]
+struct DepMap {
+    forward: FxHashMap<i64, Vec<i64>>, // source_table_id → [view_ids]
+    reverse: FxHashMap<i64, Vec<i64>>, // view_id → [source_table_ids]
+    valid: bool,
+}
+
+impl DepMap {
+    fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    /// Rebuild both maps from the DepTab system table if stale and return the
+    /// forward (source → views) map. `dep_tab` is passed in (a Copy raw pointer)
+    /// because the table lives on `DagEngine`; reading it through `self` here would
+    /// double-borrow against the `&mut self.dep`.
+    fn get_or_rebuild(&mut self, dep_tab: *mut Table) -> &FxHashMap<i64, Vec<i64>> {
+        if self.valid {
+            return &self.forward;
+        }
+        self.forward.clear();
+        self.reverse.clear();
+        if !dep_tab.is_null() {
+            let t = unsafe { &*dep_tab };
+            let mut ch = t.open_cursor();
+            while ch.cursor.valid {
+                let w = ch.cursor.current_weight;
+                if w > 0 {
+                    // DepTab compound PK = (view_id, dep_table_id); both live in
+                    // the 16-byte PK region as OPK (big-endian for these unsigned
+                    // columns): view_id_BE in bytes 0..8, dep_BE in 8..16.
+                    let pk = ch.cursor.current_pk_bytes();
+                    let v_id = u64::from_be_bytes(pk[0..8].try_into().unwrap()) as i64;
+                    let dep_tid = u64::from_be_bytes(pk[8..16].try_into().unwrap()) as i64;
+                    if dep_tid > 0 {
+                        let views = self.forward.entry(dep_tid).or_default();
+                        if !views.contains(&v_id) {
+                            views.push(v_id);
+                        }
+                        let sources = self.reverse.entry(v_id).or_default();
+                        if !sources.contains(&dep_tid) {
+                            sources.push(dep_tid);
+                        }
+                    }
+                }
+                ch.cursor.advance();
+            }
+        }
+        self.valid = true;
+        &self.forward
+    }
+}
+
+pub struct DagEngine {
+    cache: FxHashMap<i64, CachedPlan>,
+    dep: DepMap,
+    view_props: ViewPropCache,
     pub(crate) tables: FxHashMap<i64, TableEntry>,
     sys: SysTableRefs,
 }
@@ -230,14 +310,8 @@ impl DagEngine {
     pub fn new() -> Self {
         DagEngine {
             cache: FxHashMap::default(),
-            dep_map: FxHashMap::default(),
-            source_map: FxHashMap::default(),
-            dep_map_valid: false,
-            shard_cols_cache: FxHashMap::default(),
-            join_shard_cols_cache: FxHashMap::default(),
-            skip_exchange_cache: FxHashMap::default(),
-            needs_exchange_cache: FxHashMap::default(),
-            range_join_cache: FxHashMap::default(),
+            dep: DepMap::default(),
+            view_props: ViewPropCache::default(),
             tables: FxHashMap::default(),
             sys: SysTableRefs::null(),
         }
@@ -276,13 +350,8 @@ impl DagEngine {
     pub fn unregister_table(&mut self, table_id: i64) {
         self.tables.remove(&table_id);
         self.cache.remove(&table_id);
-        self.shard_cols_cache.remove(&table_id);
-        self.join_shard_cols_cache
-            .retain(|&(v, s), _| v != table_id && s != table_id);
-        self.skip_exchange_cache.remove(&table_id);
-        self.needs_exchange_cache.remove(&table_id);
-        self.range_join_cache.remove(&table_id);
-        self.dep_map_valid = false;
+        self.view_props.evict(table_id);
+        self.dep.invalidate();
     }
 
     pub fn add_index_circuit(
@@ -363,7 +432,7 @@ impl DagEngine {
         let mut reachable: FxHashSet<i64> = FxHashSet::default();
         let mut stack = seeds;
         while let Some(id) = stack.pop() {
-            if let Some(deps) = self.dep_map.get(&id) {
+            if let Some(deps) = self.dep.forward.get(&id) {
                 for &d in deps {
                     if reachable.insert(d) {
                         stack.push(d);
@@ -403,75 +472,32 @@ impl DagEngine {
     #[cfg(test)] // sole callers are the test-only drop_view path and the dag tests
     pub fn invalidate(&mut self, view_id: i64) {
         self.cache.remove(&view_id);
-        self.shard_cols_cache.remove(&view_id);
-        self.join_shard_cols_cache.retain(|&(v, _), _| v != view_id);
-        self.skip_exchange_cache.remove(&view_id);
-        self.needs_exchange_cache.remove(&view_id);
-        self.range_join_cache.remove(&view_id);
-        self.dep_map_valid = false;
+        self.view_props.evict(view_id);
+        self.dep.invalidate();
     }
 
     pub fn invalidate_all(&mut self) {
         self.cache.clear();
-        self.shard_cols_cache.clear();
-        self.join_shard_cols_cache.clear();
-        self.skip_exchange_cache.clear();
-        self.needs_exchange_cache.clear();
-        self.range_join_cache.clear();
-        self.dep_map_valid = false;
+        self.view_props.clear();
+        self.dep.invalidate();
     }
 
     pub fn invalidate_dep_map(&mut self) {
-        self.dep_map_valid = false;
+        self.dep.invalidate();
     }
 
     // ── Dependency map ──────────────────────────────────────────────────
 
-    /// Rebuild the dep_map and source_map from the DepTab system table.
-    /// Port of `ProgramCache.get_dep_map()`.
+    /// Rebuild the dependency maps from the DepTab system table if stale and
+    /// return the forward (source → views) map.
     pub fn get_dep_map(&mut self) -> &FxHashMap<i64, Vec<i64>> {
-        if self.dep_map_valid {
-            return &self.dep_map;
-        }
-        self.dep_map.clear();
-        self.source_map.clear();
-
-        if !self.sys.dep_tab.is_null() {
-            let t = unsafe { &*self.sys.dep_tab };
-            {
-                let mut ch = t.open_cursor();
-                while ch.cursor.valid {
-                    let w = ch.cursor.current_weight;
-                    if w > 0 {
-                        // DepTab compound PK = (view_id, dep_table_id); both live
-                        // in the 16-byte PK region as OPK (big-endian for these
-                        // unsigned columns): view_id_BE in bytes 0..8, dep_BE in 8..16.
-                        let pk = ch.cursor.current_pk_bytes();
-                        let v_id = u64::from_be_bytes(pk[0..8].try_into().unwrap()) as i64;
-                        let dep_tid = u64::from_be_bytes(pk[8..16].try_into().unwrap()) as i64;
-                        if dep_tid > 0 {
-                            let views = self.dep_map.entry(dep_tid).or_default();
-                            if !views.contains(&v_id) {
-                                views.push(v_id);
-                            }
-                            let sources = self.source_map.entry(v_id).or_default();
-                            if !sources.contains(&dep_tid) {
-                                sources.push(dep_tid);
-                            }
-                        }
-                    }
-                    ch.cursor.advance();
-                }
-            }
-        }
-        self.dep_map_valid = true;
-        &self.dep_map
+        self.dep.get_or_rebuild(self.sys.dep_tab)
     }
 
     /// Return all direct source table IDs for a view.
     pub fn get_source_ids(&mut self, view_id: i64) -> Vec<i64> {
         self.get_dep_map();
-        self.source_map.get(&view_id).cloned().unwrap_or_default()
+        self.dep.reverse.get(&view_id).cloned().unwrap_or_default()
     }
 
     // ── Metadata queries (lightweight, no compilation) ──────────────────
@@ -506,7 +532,7 @@ impl DagEngine {
 
     /// Extract shard columns for a view without full compilation.
     pub fn get_shard_cols(&mut self, view_id: i64) -> Vec<i32> {
-        if let Some(cols) = self.shard_cols_cache.get(&view_id) {
+        if let Some(cols) = self.view_props.shard_cols.get(&view_id) {
             return cols.clone();
         }
         let loaded = self.load_meta_circuit(view_id);
@@ -521,7 +547,7 @@ impl DagEngine {
                 }
             })
             .unwrap_or_default();
-        self.shard_cols_cache.insert(view_id, shard_cols.clone());
+        self.view_props.shard_cols.insert(view_id, shard_cols.clone());
         shard_cols
     }
 
@@ -532,23 +558,23 @@ impl DagEngine {
         // Called once per join source per tick on the master's serialized
         // exchange-relay path; cache the result so the hot path skips the
         // full load_circuit + topo_sort (O(V+E) with several allocations).
-        if let Some(cols) = self.join_shard_cols_cache.get(&(view_id, source_id)) {
+        if let Some(cols) = self.view_props.join_shard.get(&(view_id, source_id)) {
             return cols.clone();
         }
         let cols = self.compute_join_shard_cols(view_id, source_id);
-        self.join_shard_cols_cache.insert((view_id, source_id), cols.clone());
+        self.view_props.join_shard.insert((view_id, source_id), cols.clone());
         cols
     }
 
     /// Whether `get_join_shard_cols` would be empty, without cloning the cached
     /// Vec — the hot-path arm in `evaluate_dag_multi_worker` tests only emptiness.
     fn join_shard_cols_is_empty(&mut self, view_id: i64, source_id: i64) -> bool {
-        if let Some(cols) = self.join_shard_cols_cache.get(&(view_id, source_id)) {
+        if let Some(cols) = self.view_props.join_shard.get(&(view_id, source_id)) {
             return cols.is_empty();
         }
         let cols = self.compute_join_shard_cols(view_id, source_id);
         let empty = cols.is_empty();
-        self.join_shard_cols_cache.insert((view_id, source_id), cols);
+        self.view_props.join_shard.insert((view_id, source_id), cols);
         empty
     }
 
@@ -588,11 +614,11 @@ impl DagEngine {
     /// bit they encoded, making the impossible `{ is_trivial: false,
     /// is_co_partitioned: true }` state unrepresentable.
     fn view_skips_exchange(&mut self, view_id: i64) -> bool {
-        if let Some(&skip) = self.skip_exchange_cache.get(&view_id) {
+        if let Some(&skip) = self.view_props.skip_exchange.get(&view_id) {
             return skip;
         }
         let skip = self.compute_view_skips_exchange(view_id);
-        self.skip_exchange_cache.insert(view_id, skip);
+        self.view_props.skip_exchange.insert(view_id, skip);
         skip
     }
 
@@ -635,7 +661,7 @@ impl DagEngine {
     /// non-replicated here, so nested-over-replicated views are conservatively
     /// treated as partitioned — the MVP surface is base-table dimensions.
     ///
-    /// Sources come from the cached `source_map` (`get_source_ids`), which records
+    /// Sources come from the cached reverse dependency map (`get_source_ids`), which records
     /// exactly `circuit.dependencies()` — the deduped `ScanDelta` source set — so
     /// this answers the question off the dependency map with no circuit load.
     pub(crate) fn view_all_sources_replicated(&mut self, view_id: i64) -> bool {
@@ -683,7 +709,7 @@ impl DagEngine {
     /// circuit (system tables), not `self.cache`, so it is correct for uncompiled
     /// views — the startup `backfill_exchange_views` path relies on that.
     pub fn view_needs_exchange(&mut self, view_id: i64) -> bool {
-        if let Some(&needs) = self.needs_exchange_cache.get(&view_id) {
+        if let Some(&needs) = self.view_props.needs_exchange.get(&view_id) {
             return needs;
         }
         let loaded = self.load_meta_circuit(view_id);
@@ -691,7 +717,7 @@ impl DagEngine {
             .nodes
             .values()
             .any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. }));
-        self.needs_exchange_cache.insert(view_id, needs);
+        self.view_props.needs_exchange.insert(view_id, needs);
         needs
     }
 
@@ -775,14 +801,14 @@ impl DagEngine {
     /// `has_join_shard && has_exchange`: that predicate is also true for every
     /// GROUP BY / reduce / single-sided set-op view (a group reindex matches
     /// `reindex_cols_through_filters`), which must keep the plain `has_exchange`
-    /// arm. Memoized in `range_join_cache`, evicted with the sibling view caches.
+    /// arm. Memoized in `view_props.range_join`, evicted with the sibling view caches.
     pub fn view_range_join_n_eq(&mut self, view_id: i64) -> Option<u8> {
-        if let Some(&v) = self.range_join_cache.get(&view_id) {
+        if let Some(&v) = self.view_props.range_join.get(&view_id) {
             return v;
         }
         let loaded = self.load_meta_circuit(view_id);
         let n_eq = crate::query::compiler::circuit_range_join_n_eq(&loaded);
-        self.range_join_cache.insert(view_id, n_eq);
+        self.view_props.range_join.insert(view_id, n_eq);
         n_eq
     }
 
@@ -798,7 +824,7 @@ impl DagEngine {
     /// and so is already covered by the first arm. (Set-ops are `AntiJoin` /
     /// `SemiJoin`, not `Join`, and likewise carry an `ExchangeShard`.)
     ///
-    /// Loads the meta circuit once and reuses it to warm `needs_exchange_cache`
+    /// Loads the meta circuit once and reuses it to warm `view_props.needs_exchange`
     /// for the boot `view_needs_exchange` sweep that runs right after
     /// `exchange_base_tables` over these same views.
     ///
@@ -813,7 +839,7 @@ impl DagEngine {
             .nodes
             .values()
             .any(|op| matches!(op, gnitz_wire::OpNode::ExchangeShard { .. }));
-        self.needs_exchange_cache.insert(view_id, needs_exchange);
+        self.view_props.needs_exchange.insert(view_id, needs_exchange);
         needs_exchange
             || loaded
                 .nodes
@@ -1136,7 +1162,7 @@ impl DagEngine {
         mut execute: impl FnMut(&mut Self, i64, Batch, i64) -> Option<Batch>,
     ) -> i32 {
         self.get_dep_map();
-        let view_ids: Vec<i64> = self.dep_map.get(&source_id).cloned().unwrap_or_default();
+        let view_ids: Vec<i64> = self.dep.forward.get(&source_id).cloned().unwrap_or_default();
         if view_ids.is_empty() {
             return 0;
         }
@@ -1161,7 +1187,7 @@ impl DagEngine {
 
             if has_output {
                 dirty_views.insert(view_id);
-                if self.dep_map.get(&view_id).is_none_or(|d| d.is_empty()) {
+                if self.dep.forward.get(&view_id).is_none_or(|d| d.is_empty()) {
                     // Terminal view: move the batch into its family (no clone for
                     // unique_pk) — there is nothing downstream to fan onto.
                     self.ingest_to_family(view_id, out_delta.unwrap());
@@ -1182,7 +1208,7 @@ impl DagEngine {
             // for a view with no dependents, which queue_dependents no-ops.
             let src_schema = self.tables[&view_id].schema;
             let delta = if has_output { out_delta.as_ref() } else { None };
-            let dep_view_ids = self.dep_map.get(&view_id).map_or(&[][..], Vec::as_slice);
+            let dep_view_ids = self.dep.forward.get(&view_id).map_or(&[][..], Vec::as_slice);
             Self::queue_dependents(
                 &mut pending,
                 &mut pending_pos,
@@ -1942,13 +1968,8 @@ impl DagEngine {
     pub(crate) fn close(&mut self) {
         self.cache.clear();
         self.tables.clear();
-        self.shard_cols_cache.clear();
-        self.join_shard_cols_cache.clear();
-        self.skip_exchange_cache.clear();
-        self.needs_exchange_cache.clear();
-        self.range_join_cache.clear();
-        self.dep_map.clear();
-        self.source_map.clear();
+        self.view_props.clear();
+        self.dep = DepMap::default();
     }
 }
 
@@ -2007,47 +2028,74 @@ mod tests {
     #[test]
     fn test_invalidation() {
         let mut dag = DagEngine::new();
-        dag.shard_cols_cache.insert(42, vec![0]);
-        dag.skip_exchange_cache.insert(42, true);
-        dag.needs_exchange_cache.insert(42, true);
-        dag.dep_map_valid = true;
+        dag.view_props.shard_cols.insert(42, vec![0]);
+        dag.view_props.skip_exchange.insert(42, true);
+        dag.view_props.needs_exchange.insert(42, true);
+        dag.dep.valid = true;
 
         dag.invalidate(42);
-        assert!(!dag.shard_cols_cache.contains_key(&42));
-        assert!(!dag.skip_exchange_cache.contains_key(&42));
-        assert!(!dag.needs_exchange_cache.contains_key(&42));
-        assert!(!dag.dep_map_valid);
+        assert!(!dag.view_props.shard_cols.contains_key(&42));
+        assert!(!dag.view_props.skip_exchange.contains_key(&42));
+        assert!(!dag.view_props.needs_exchange.contains_key(&42));
+        assert!(!dag.dep.valid);
 
-        dag.dep_map_valid = true;
+        dag.dep.valid = true;
         dag.invalidate_dep_map();
-        assert!(!dag.dep_map_valid);
+        assert!(!dag.dep.valid);
 
-        dag.shard_cols_cache.insert(99, vec![1]);
+        dag.view_props.shard_cols.insert(99, vec![1]);
         dag.invalidate_all();
-        assert!(dag.shard_cols_cache.is_empty());
+        assert!(dag.view_props.shard_cols.is_empty());
     }
 
-    /// `range_join_cache` must be evicted in lockstep with the sibling view-keyed
-    /// caches at every invalidation site, or it drifts (a dropped view's stale
-    /// `Some(n_eq)`/`None` survives, and the cache disagrees with the live circuit).
+    /// `ViewPropCache::evict` and `clear` must touch every field in lockstep — a
+    /// field either method forgets would let a dropped view/table's stale entry
+    /// survive and disagree with the live circuit. `evict` drops join_shard
+    /// entries that mention the id as view OR source (over-eviction is safe).
     #[test]
-    fn test_range_join_cache_eviction() {
+    fn test_view_prop_cache_eviction() {
+        let populate = || {
+            let mut c = ViewPropCache::default();
+            c.shard_cols.insert(42, vec![0]);
+            c.join_shard.insert((42, 7), vec![]); // 42 as the view
+            c.join_shard.insert((7, 42), vec![]); // 42 as a join source
+            c.skip_exchange.insert(42, true);
+            c.needs_exchange.insert(42, true);
+            c.range_join.insert(42, Some(1));
+            c
+        };
+
+        // evict(42): every field keyed by 42 goes, including both join_shard
+        // entries — matching 42 as the view (42, 7) and as a source (7, 42).
+        let mut ce = populate();
+        ce.evict(42);
+        assert!(!ce.shard_cols.contains_key(&42));
+        assert!(!ce.join_shard.contains_key(&(42, 7)));
+        assert!(
+            !ce.join_shard.contains_key(&(7, 42)),
+            "evict must drop source-keyed join entry"
+        );
+        assert!(!ce.skip_exchange.contains_key(&42));
+        assert!(!ce.needs_exchange.contains_key(&42));
+        assert!(!ce.range_join.contains_key(&42));
+
+        // clear(): empties every field (auto-covers any future field via Default).
+        let mut cc = populate();
+        cc.clear();
+        assert!(cc.shard_cols.is_empty());
+        assert!(cc.join_shard.is_empty());
+        assert!(cc.skip_exchange.is_empty());
+        assert!(cc.needs_exchange.is_empty());
+        assert!(cc.range_join.is_empty());
+
+        // Wiring: the production table/view-drop path routes through evict.
         let mut dag = DagEngine::new();
-
-        // invalidate(view_id) drops the per-view entry.
-        dag.range_join_cache.insert(42, Some(1));
-        dag.invalidate(42);
-        assert!(!dag.range_join_cache.contains_key(&42), "invalidate must evict");
-
-        // unregister_table(table_id) drops it (the production view-drop path).
-        dag.range_join_cache.insert(43, Some(0));
+        dag.view_props.range_join.insert(43, Some(0));
         dag.unregister_table(43);
-        assert!(!dag.range_join_cache.contains_key(&43), "unregister_table must evict");
-
-        // invalidate_all() clears it (the production bulk flush).
-        dag.range_join_cache.insert(44, None);
-        dag.invalidate_all();
-        assert!(dag.range_join_cache.is_empty(), "invalidate_all must clear");
+        assert!(
+            !dag.view_props.range_join.contains_key(&43),
+            "unregister_table must evict"
+        );
     }
 
     #[test]
@@ -2086,8 +2134,8 @@ mod tests {
     fn test_dep_map_empty() {
         let mut dag = DagEngine::new();
         dag.get_dep_map();
-        assert!(dag.dep_map.is_empty());
-        assert!(dag.dep_map_valid);
+        assert!(dag.dep.forward.is_empty());
+        assert!(dag.dep.valid);
     }
 
     #[test]

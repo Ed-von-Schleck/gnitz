@@ -552,7 +552,7 @@ mod tests {
         )));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, func_ptr);
         builder.add_negate(1, 2);
         builder.add_halt();
@@ -583,7 +583,7 @@ mod tests {
         // We pre-consolidate manually (input is consolidated before sending to VM).
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(2);
+        let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, std::ptr::null());
         builder.add_halt();
 
@@ -602,7 +602,7 @@ mod tests {
     fn test_empty_input() {
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(2);
+        let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, std::ptr::null());
         builder.add_halt();
 
@@ -628,7 +628,7 @@ mod tests {
         // At tick t, output must be the input from tick t-1 (z⁻¹ semantics).
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_delay(0, 1, 2);
         builder.add_halt();
 
@@ -666,7 +666,7 @@ mod tests {
     fn test_delay_empty_first_tick() {
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_delay(0, 1, 2);
         builder.add_halt();
 
@@ -688,7 +688,7 @@ mod tests {
         // An empty input is stored and replayed correctly.
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_delay(0, 1, 2);
         builder.add_halt();
 
@@ -759,7 +759,7 @@ mod tests {
     fn test_delay_preserves_negative_weights() {
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_delay(0, 1, 2);
         builder.add_halt();
 
@@ -826,7 +826,7 @@ mod tests {
         //   reg 4: Delta      (output)
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(5);
+        let mut builder = ProgramBuilder::new();
         builder.add_delay(0, 1, 2);
         builder.add_delay(2, 3, 4);
         builder.add_halt();
@@ -902,7 +902,7 @@ mod tests {
         // the input; after tick 1, it holds the new input.
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_delay(0, 1, 2);
         builder.add_halt();
 
@@ -936,7 +936,7 @@ mod tests {
         // Simpler: just union reg 0 with has_b=false (single input mode).
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(2);
+        let mut builder = ProgramBuilder::new();
         // Union with has_b=false: effectively a pass-through (copies batch_a only)
         builder.add_union(0, 0, false, 1);
         builder.add_halt();
@@ -959,7 +959,7 @@ mod tests {
     #[test]
     fn test_self_union_doubles_weights() {
         let schema = schema_1i64();
-        let mut builder = ProgramBuilder::new(2);
+        let mut builder = ProgramBuilder::new();
         builder.add_union(0, 0, true, 1);
         builder.add_halt();
         let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 3, 20)]);
@@ -986,7 +986,7 @@ mod tests {
         let mut input = make_batch(schema, &[(2u128, 1, 20), (2u128, 1, 20)]);
         input.sorted = false;
         input.consolidated = false;
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_join_dt_outer(0, 1, 2, schema);
         builder.add_halt();
         let reg_meta = [RegisterMeta::delta(schema); 3];
@@ -1009,7 +1009,7 @@ mod tests {
         let mut input = make_batch(schema, &[(2u128, 1, 20), (2u128, 1, 20)]);
         input.sorted = false;
         input.consolidated = false;
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_anti_join_dt(0, 1, 2);
         builder.add_halt();
         let reg_meta = [RegisterMeta::delta(schema); 3];
@@ -1029,7 +1029,7 @@ mod tests {
         // Pre-consolidated input should not cause extra work.
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(2);
+        let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, std::ptr::null());
         builder.add_halt();
 
@@ -1053,7 +1053,7 @@ mod tests {
         // Two execute_epoch calls: second tick should not see first tick's data.
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(2);
+        let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, std::ptr::null());
         builder.add_halt();
 
@@ -1095,7 +1095,7 @@ mod tests {
         )));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
-        let mut builder = ProgramBuilder::new(2);
+        let mut builder = ProgramBuilder::new();
         builder.add_map(0, 1, func_ptr, out_schema, &[], &[], false, 0);
         builder.add_halt();
 
@@ -1139,7 +1139,7 @@ mod tests {
 
         let table_ptr = &mut table as *mut Table;
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         // reg 0 = input delta, reg 1 = history trace, reg 2 = output delta
         builder.add_distinct(0, 1, 2, table_ptr);
         builder.add_halt();
@@ -1231,7 +1231,7 @@ mod tests {
         let cursor = table.open_cursor();
         let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         // reg 0 = left delta, reg 1 = right trace, reg 2 = output
         builder.add_join_dt(0, 1, 2, right_schema);
         builder.add_halt();
@@ -1292,7 +1292,7 @@ mod tests {
         let cursor = table.open_cursor();
         let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_join_dt(0, 1, 2, right_schema);
         builder.add_halt();
 
@@ -1363,7 +1363,7 @@ mod tests {
         // Input is consolidated before sending to the VM, so we simulate that here.
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(2);
+        let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, std::ptr::null());
         builder.add_halt();
 
@@ -1406,7 +1406,7 @@ mod tests {
         let cursor = table.open_cursor();
         let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_anti_join_dt(0, 1, 2);
         builder.add_halt();
 
@@ -1457,7 +1457,7 @@ mod tests {
         let cursor = table.open_cursor();
         let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_semi_join_dt(0, 1, 2);
         builder.add_halt();
 
@@ -1536,7 +1536,7 @@ mod tests {
         }];
         let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
 
-        let mut builder = ProgramBuilder::new(5);
+        let mut builder = ProgramBuilder::new();
         // reg 0 = input delta
         // reg 1 = trace_out (trace register for output)
         // reg 2 = raw_delta output
@@ -1660,7 +1660,7 @@ mod tests {
         }];
         let group_cols = [1u32];
 
-        let mut builder = ProgramBuilder::new(4);
+        let mut builder = ProgramBuilder::new();
         builder.add_reduce(
             0,       // in_reg
             Some(3), // trace_in_reg (set, but its cursor will be null)
@@ -1713,7 +1713,7 @@ mod tests {
         }];
         let group_cols = [1u32];
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_reduce(
             0,    // in_reg
             None, // trace_in_reg disabled — avoids Err(-11) check
@@ -1773,7 +1773,7 @@ mod tests {
         let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
 
         // Build: reg0=key input, reg1=trace, reg2=scan output
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_seek_trace(1, 0); // Seek trace to key from reg 0
         builder.add_scan_trace(1, 2, 100); // Scan from trace into reg 2
         builder.add_halt();
@@ -1810,7 +1810,7 @@ mod tests {
         let schema = schema_1i64();
         let join_schema = make_schema(&[type_code::I64, type_code::I64]);
 
-        let mut builder = ProgramBuilder::new(4);
+        let mut builder = ProgramBuilder::new();
         // Copy input (reg 0) into reg 1 and reg 2 via null filters
         builder.add_filter(0, 1, std::ptr::null());
         builder.add_filter(0, 2, std::ptr::null());
@@ -1866,7 +1866,7 @@ mod tests {
         )));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
-        let mut builder = ProgramBuilder::new(4);
+        let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, func_ptr);
         builder.add_filter(1, 2, func_ptr); // same func — should reuse index
         builder.add_halt();
@@ -1916,7 +1916,7 @@ mod tests {
         let cursor_aj = table.open_cursor();
         let ch_aj = Box::into_raw(Box::new(cursor_aj)) as *mut libc::c_void;
 
-        let mut builder_aj = ProgramBuilder::new(3);
+        let mut builder_aj = ProgramBuilder::new();
         builder_aj.add_anti_join_dt(0, 1, 2);
         builder_aj.add_halt();
 
@@ -1947,7 +1947,7 @@ mod tests {
         let cursor_sj = table.open_cursor();
         let ch_sj = Box::into_raw(Box::new(cursor_sj)) as *mut libc::c_void;
 
-        let mut builder_sj = ProgramBuilder::new(3);
+        let mut builder_sj = ProgramBuilder::new();
         builder_sj.add_semi_join_dt(0, 1, 2);
         builder_sj.add_halt();
 
@@ -2014,7 +2014,7 @@ mod tests {
         let func = Box::new(ScalarFuncKind::Plan(crate::expr::Plan::from_predicate(prog, &schema)));
         let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
 
-        let mut builder = ProgramBuilder::new(2);
+        let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, func_ptr);
         builder.add_halt();
 
@@ -2104,7 +2104,7 @@ mod tests {
         // GROUP BY col 0 (= pk, schema col index 0)
         let group_cols = [0u32];
 
-        let mut builder = ProgramBuilder::new(5);
+        let mut builder = ProgramBuilder::new();
         // reg 0 = input delta, reg 1 = trace_out, reg 2 = output,
         // reg 3 = trace_in, reg 4 = unused
         builder.add_reduce(
@@ -2202,7 +2202,7 @@ mod tests {
         // must clone the batch without dereferencing the null pointer.
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(2);
+        let mut builder = ProgramBuilder::new();
         builder.add_map(0, 1, std::ptr::null(), schema, &[], &[], false, 0);
         builder.add_halt();
 
@@ -2230,7 +2230,7 @@ mod tests {
     fn test_anti_join_dt_null_cursor() {
         let schema = schema_1i64();
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         // reg 0 = delta, reg 1 = trace (null cursor), reg 2 = output
         builder.add_anti_join_dt(0, 1, 2);
         builder.add_halt();
@@ -2268,7 +2268,7 @@ mod tests {
         // outer join output: left col + right col (right cols will be null)
         let out_schema = make_schema(&[type_code::I64, type_code::I64]);
 
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         // reg 0 = delta, reg 1 = trace (null cursor), reg 2 = output
         builder.add_join_dt_outer(0, 1, 2, right_schema);
         builder.add_halt();
@@ -2336,7 +2336,7 @@ mod tests {
         // GROUP BY col 0 (pk)
         let group_cols = [0u32];
 
-        let mut builder = ProgramBuilder::new(4);
+        let mut builder = ProgramBuilder::new();
         builder.add_reduce(
             0,
             Some(2),
@@ -2434,7 +2434,7 @@ mod tests {
         .unwrap();
 
         // reg 0 = input delta (kind 0), reg 1 = external trace (kind 1), reg 2 = output delta
-        let mut builder = ProgramBuilder::new(3);
+        let mut builder = ProgramBuilder::new();
         builder.add_distinct(0, 1, 2, std::ptr::null_mut()); // hist_table_idx = -1 (no ingest)
         builder.add_halt();
 

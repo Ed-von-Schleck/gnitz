@@ -122,7 +122,6 @@ pub(super) fn is_join_trace_side(loaded: &LoadedCircuit, nid: i32) -> bool {
 }
 
 pub(super) struct EmitState {
-    next_extra_reg: i32,
     sink_reg_id: i32,
     input_delta_reg_id: i32,
     emit_failed: bool,
@@ -203,9 +202,8 @@ pub(super) fn emit_node(
                         "ScanTrace node {nid} has mixed consumers: a PORT_TRACE join consumer would \
                          misroute to the cursorless delta register"
                     );
-                    let out_delta_id = state.next_extra_reg;
-                    state.next_extra_reg += 1;
-                    reg_meta[out_delta_id as usize] = RegisterMeta::delta(ext.schema);
+                    let out_delta_id = reg_meta.len() as i32;
+                    reg_meta.push(RegisterMeta::delta(ext.schema));
                     out_reg_of.insert(nid, out_delta_id);
                     builder.add_scan_trace(reg_id as u16, out_delta_id as u16, 0);
                 }
@@ -430,10 +428,9 @@ pub(super) fn emit_node(
 
         gnitz_wire::OpNode::Delay => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            let state_reg = state.next_extra_reg;
-            state.next_extra_reg += 1;
             let in_schema = reg_meta[in_reg as usize].schema;
-            reg_meta[state_reg as usize] = RegisterMeta::delay_state(in_schema);
+            let state_reg = reg_meta.len() as i32;
+            reg_meta.push(RegisterMeta::delay_state(in_schema));
             reg_meta[reg_id as usize] = RegisterMeta::delta(in_schema);
             builder.add_delay(in_reg as u16, state_reg as u16, reg_id as u16);
         }
@@ -458,9 +455,8 @@ pub(super) fn emit_node(
             let hist_table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
             reg_meta[reg_id as usize] = RegisterMeta::trace(in_reg_schema);
             owned_trace_regs.push((reg_id as u16, table_idx));
-            let out_delta_id = state.next_extra_reg;
-            state.next_extra_reg += 1;
-            reg_meta[out_delta_id as usize] = RegisterMeta::delta(in_reg_schema);
+            let out_delta_id = reg_meta.len() as i32;
+            reg_meta.push(RegisterMeta::delta(in_reg_schema));
             out_reg_of.insert(nid, out_delta_id);
             builder.add_distinct(in_reg as u16, reg_id as u16, out_delta_id as u16, hist_table_ptr);
         }
@@ -767,16 +763,14 @@ pub(super) fn emit_reduce(
     reg_meta[reg_id as usize] = RegisterMeta::trace(reduce_out_schema);
     owned_trace_regs.push((reg_id as u16, trace_table_idx));
 
-    let raw_delta_id = state.next_extra_reg;
-    state.next_extra_reg += 1;
-    reg_meta[raw_delta_id as usize] = RegisterMeta::delta(reduce_out_schema);
+    let raw_delta_id = reg_meta.len() as i32;
+    reg_meta.push(RegisterMeta::delta(reduce_out_schema));
 
     let finalize_prog_idx = rw.fold_finalize.get(&nid).copied();
     let mut fin_delta_id: i32 = -1;
     if finalize_prog_idx.is_some() {
-        fin_delta_id = state.next_extra_reg;
-        state.next_extra_reg += 1;
-        reg_meta[fin_delta_id as usize] = RegisterMeta::delta(loaded.out_schema);
+        fin_delta_id = reg_meta.len() as i32;
+        reg_meta.push(RegisterMeta::delta(loaded.out_schema));
         out_reg_of.insert(nid, fin_delta_id);
     } else {
         out_reg_of.insert(nid, raw_delta_id);
@@ -819,9 +813,8 @@ pub(super) fn emit_reduce(
         tr_in_table_ptr = &*owned_tables[idx] as *const Table as *mut Table;
         tr_in_table_idx = Some(idx);
 
-        tr_in_reg_id = state.next_extra_reg;
-        state.next_extra_reg += 1;
-        reg_meta[tr_in_reg_id as usize] = RegisterMeta::trace(in_reg_schema);
+        tr_in_reg_id = reg_meta.len() as i32;
+        reg_meta.push(RegisterMeta::trace(in_reg_schema));
         owned_trace_regs.push((tr_in_reg_id as u16, idx));
     }
 
@@ -1044,9 +1037,8 @@ pub(super) fn emit_gather_reduce(
     reg_meta[reg_id as usize] = RegisterMeta::trace(partial_schema);
     owned_trace_regs.push((reg_id as u16, table_idx));
 
-    let raw_delta_id = state.next_extra_reg;
-    state.next_extra_reg += 1;
-    reg_meta[raw_delta_id as usize] = RegisterMeta::delta(partial_schema);
+    let raw_delta_id = reg_meta.len() as i32;
+    reg_meta.push(RegisterMeta::delta(partial_schema));
     out_reg_of.insert(nid, raw_delta_id);
 
     builder.add_gather_reduce(in_reg_id as u16, reg_id as u16, raw_delta_id as u16, &agg_descs);
@@ -1136,27 +1128,6 @@ pub(super) fn build_plan(
         }
     }
 
-    let mut extra_regs = 0;
-    for &nid in ordered {
-        let op = loaded.nodes.get(&nid);
-        if matches!(op, Some(gnitz_wire::OpNode::Distinct)) && !rw.skip_nodes.contains(&nid) {
-            extra_regs += 1;
-        } else if matches!(op, Some(gnitz_wire::OpNode::Reduce { .. })) {
-            extra_regs += 2; // raw_delta + optional tr_in (safe to over-allocate)
-            if rw.fold_finalize.contains_key(&nid) {
-                extra_regs += 1;
-            }
-        } else if matches!(op, Some(gnitz_wire::OpNode::GatherReduce)) {
-            extra_regs += 1;
-        } else if matches!(op, Some(gnitz_wire::OpNode::ScanTrace(_))) {
-            if !is_join_trace_side(loaded, nid) {
-                extra_regs += 1;
-            }
-        } else if matches!(op, Some(gnitz_wire::OpNode::Delay)) {
-            extra_regs += 1;
-        }
-    }
-
     // One seed register per exchange input (the post phase of an exchange view
     // reads each side's relayed batch from its own register).
     let mut exchange_input_regs: Vec<(i32, i32)> = Vec::with_capacity(exchange_inputs.len());
@@ -1166,14 +1137,20 @@ pub(super) fn build_plan(
         next_reg += 1;
     }
 
-    let num_regs = (next_reg + extra_regs) as usize;
-    // ProgramBuilder addresses registers with u16. A view complex enough to
-    // need > 65535 registers would wrap the cast and fire a hard assert in
-    // ProgramBuilder::build; reject it as a clean compile failure instead.
-    if num_regs > u16::MAX as usize {
+    // Register ids are u16 instruction fields. `reg_meta` is sized to the base
+    // register per node plus the exchange seeds here; the emitters push the extras
+    // on demand — ScanTrace/Distinct/Delay/GatherReduce push 1, Reduce up to 3
+    // (raw_delta + finalize + trace-in). Each node pushes at most 3, so reserving
+    // `next_reg + 3 * ordered.len()` holds the whole program in a single
+    // allocation, and that same bound — rejected here before the emit loop creates
+    // any scratch tables — guarantees the final `reg_meta.len()` can never exceed
+    // u16, so no register id truncates when cast.
+    let reg_cap = next_reg as usize + 3 * ordered.len();
+    if reg_cap > u16::MAX as usize {
         return None;
     }
-    let mut reg_meta = vec![RegisterMeta::delta(SchemaDescriptor::default()); num_regs];
+    let mut reg_meta = Vec::with_capacity(reg_cap);
+    reg_meta.resize(next_reg as usize, RegisterMeta::delta(SchemaDescriptor::default()));
 
     for ((ex_nid, ex_schema), &(_, reg)) in exchange_inputs.iter().zip(&exchange_input_regs) {
         out_reg_of.insert(*ex_nid, reg);
@@ -1187,9 +1164,8 @@ pub(super) fn build_plan(
     let mut ext_trace_regs: Vec<(u16, i64)> = Vec::new();
     let mut source_reg_map: HashMap<i64, i32> = HashMap::new();
 
-    let mut builder = ProgramBuilder::new(num_regs as u16);
+    let mut builder = ProgramBuilder::new();
     let mut state = EmitState {
-        next_extra_reg: next_reg,
         sink_reg_id: -1,
         input_delta_reg_id: first_exchange_input_reg_id,
         emit_failed: false,
@@ -1273,6 +1249,12 @@ pub(super) fn build_plan(
             return None;
         }
     }
+
+    // Final register count, now that the emitters have pushed every extra. The
+    // pre-loop bound already guaranteed `reg_meta.len()` could not exceed u16
+    // during emission. `reg_meta` is moved into `build_with_owned` below.
+    let num_regs = reg_meta.len();
+    debug_assert!(num_regs <= u16::MAX as usize);
 
     let vm = builder.build_with_owned(reg_meta, owned_tables, owned_funcs, owned_expr_progs, owned_trace_regs);
 

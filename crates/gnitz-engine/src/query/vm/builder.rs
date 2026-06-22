@@ -11,7 +11,6 @@ use crate::storage::Table;
 // ---------------------------------------------------------------------------
 
 pub(crate) struct ProgramBuilder {
-    num_registers: u16,
     instructions: Vec<Instr>,
     funcs: Vec<*const ScalarFuncKind>,
     tables: Vec<*mut Table>,
@@ -29,9 +28,8 @@ pub(crate) struct ProgramBuilder {
 unsafe impl Send for ProgramBuilder {}
 
 impl ProgramBuilder {
-    pub fn new(num_registers: u16) -> Self {
+    pub fn new() -> Self {
         ProgramBuilder {
-            num_registers,
             instructions: Vec::with_capacity(16),
             funcs: Vec::new(),
             tables: Vec::new(),
@@ -443,8 +441,6 @@ impl ProgramBuilder {
         owned_expr_progs: Vec<Box<crate::expr::ExprProgram>>,
         owned_trace_regs: Vec<(u16, usize)>,
     ) -> Box<VmHandle> {
-        assert_eq!(reg_meta.len(), self.num_registers as usize);
-
         let regfile = RegisterFile::new(&reg_meta);
 
         let program = Program {
