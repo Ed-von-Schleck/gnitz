@@ -140,19 +140,17 @@ pub(crate) type CachedPlan = CompileOutput;
 // System table references
 // ---------------------------------------------------------------------------
 
-/// Handles + schemas for the four system tables that the compiler reads:
-/// CircuitNodes, CircuitEdges, CircuitNodeColumns, and DepTab.
+/// Handles for the four system tables that the compiler reads: CircuitNodes,
+/// CircuitEdges, CircuitNodeColumns, and DepTab. No schemas are threaded — the
+/// compiler's cursor readers source each table's schema from the cursor itself
+/// (`ReadCursor::schema`), and `get_dep_map` reads DepTab's compound PK directly
+/// from the cursor's PK bytes.
 pub struct SysTableRefs {
     // Table handles (DagEngine borrows them).
     pub nodes: *mut Table,
     pub edges: *mut Table,
     pub node_columns: *mut Table,
     pub dep_tab: *mut Table,
-    // Schemas. (dep_tab needs none: get_dep_map reads its compound PK directly
-    // from the cursor's PK bytes.)
-    pub nodes_schema: SchemaDescriptor,
-    pub edges_schema: SchemaDescriptor,
-    pub node_columns_schema: SchemaDescriptor,
 }
 
 // SAFETY: same single-thread guarantee.
@@ -165,9 +163,6 @@ impl SysTableRefs {
             edges: std::ptr::null_mut(),
             node_columns: std::ptr::null_mut(),
             dep_tab: std::ptr::null_mut(),
-            nodes_schema: SchemaDescriptor::default(),
-            edges_schema: SchemaDescriptor::default(),
-            node_columns_schema: SchemaDescriptor::default(),
         }
     }
 }
@@ -507,11 +502,8 @@ impl DagEngine {
     fn load_meta_circuit(&self, view_id: i64) -> compiler::LoadedCircuit {
         let mut loaded = compiler::load_circuit(
             self.sys.nodes,
-            &self.sys.nodes_schema,
             self.sys.edges,
-            &self.sys.edges_schema,
             self.sys.node_columns,
-            &self.sys.node_columns_schema,
             view_id as u64,
             SchemaDescriptor::default(),
         )
@@ -871,9 +863,6 @@ impl DagEngine {
                 self.sys.nodes,
                 self.sys.edges,
                 self.sys.node_columns,
-                &self.sys.nodes_schema,
-                &self.sys.edges_schema,
-                &self.sys.node_columns_schema,
                 &view_dir,
                 view_id as u32,
                 view_schema,

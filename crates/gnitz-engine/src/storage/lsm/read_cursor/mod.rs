@@ -893,6 +893,52 @@ impl ReadCursor {
         }
         self.sources[self.current_entry_idx].blob_slice()
     }
+
+    /// Decode the German string at logical column `col` of the current row into raw
+    /// bytes (STRING and BLOB share the 16-byte layout). Returns empty when the column
+    /// pointer is null or a long-string offset overruns the blob; the bounds check is
+    /// part of the decode. A malformed blob offset is reachable only via corrupt wire
+    /// input (the ingest path does not validate per-string offsets), so this degrades
+    /// to empty rather than aborting. There is deliberately NO debug_assert on the
+    /// `None` case: that case is exactly the condition being hardened, and a
+    /// debug_assert would re-introduce the dev-time abort and make the empty-on-overrun
+    /// contract untestable in the default (debug) test profile.
+    pub(crate) fn read_german_bytes(&self, col: usize) -> Vec<u8> {
+        let ptr = self.col_ptr(col, 16);
+        if ptr.is_null() {
+            return Vec::new();
+        }
+        let st: [u8; 16] = unsafe { *(ptr as *const [u8; 16]) };
+        crate::schema::try_decode_german_string(&st, self.blob_slice()).unwrap_or_default()
+    }
+
+    /// Read a fixed 8-byte little-endian integer at logical column `col` of the current
+    /// row. Every system/circuit column read this way is 8-byte; the `debug_assert`
+    /// catches schema drift in dev. A null column pointer (invalid cursor, PK, or
+    /// out-of-range column — `col_ptr` never consults the null bitmap, so a NULL *value*
+    /// still yields a valid pointer) degrades to 0 rather than dereferencing null, the
+    /// same degrade-don't-abort contract as `read_german_bytes`.
+    pub(crate) fn read_i64(&self, col: usize) -> i64 {
+        debug_assert_eq!(
+            self.schema.columns[col].size() as usize,
+            8,
+            "read_i64: column not 8-byte"
+        );
+        let ptr = self.col_ptr(col, 8);
+        if ptr.is_null() {
+            return 0;
+        }
+        i64::from_le_bytes(unsafe { *(ptr as *const [u8; 8]) })
+    }
+
+    /// True iff logical column `col` is NULL in the current row. PK columns are never
+    /// null (`try_payload_idx` returns `None` for them).
+    pub(crate) fn col_is_null(&self, col: usize) -> bool {
+        match self.schema.try_payload_idx(col) {
+            Some(pi) => (self.current_null_word >> pi) & 1 != 0,
+            None => false,
+        }
+    }
 }
 
 /// Build a ReadCursor from in-memory batches + shard Rcs.
@@ -2116,5 +2162,40 @@ mod tests {
         std::hint::black_box(sink);
         let rps = (ITERS as u128 * total_rows) as f64 / secs;
         println!("drive_pk_unique_multi: {total_rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
+    }
+
+    /// A long-string struct (len > 12) whose blob offset overruns the (empty) blob
+    /// must read back empty rather than abort: the offset bounds check is part of
+    /// `read_german_bytes`' decode. This is the engine-side hardening the panicking
+    /// decoder lacked, and it runs under the default debug profile — there is
+    /// deliberately no `debug_assert` on the overrun case.
+    #[test]
+    fn test_read_german_bytes_out_of_bounds_offset_returns_empty() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::STRING, 0),
+            ],
+            &[0],
+        );
+        let mut b = Batch::with_schema(schema, 1);
+        b.extend_pk(1);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        // len = 100 (> 12 → reads blob), offset 0 into an empty blob → out of bounds.
+        let mut st = [0u8; 16];
+        st[0..4].copy_from_slice(&100u32.to_le_bytes());
+        st[8..16].copy_from_slice(&0u64.to_le_bytes());
+        b.extend_col(0, &st);
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        let cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
+        assert!(cursor.valid, "cursor must position on the single row");
+        assert_eq!(
+            cursor.read_german_bytes(1),
+            Vec::<u8>::new(),
+            "out-of-bounds long-string offset must decode to empty, not panic"
+        );
     }
 }

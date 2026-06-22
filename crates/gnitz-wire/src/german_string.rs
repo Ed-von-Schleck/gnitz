@@ -69,13 +69,6 @@ pub fn try_decode_german_string(st: &[u8; 16], blob: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Decode a 16-byte German String struct into raw bytes.
-/// `blob` is the shared blob arena. Panics if a long string's offset/length
-/// overruns `blob`; use `try_decode_german_string` on untrusted input.
-pub fn decode_german_string(st: &[u8; 16], blob: &[u8]) -> Vec<u8> {
-    try_decode_german_string(st, blob).expect("decode_german_string: blob offset/length out of bounds")
-}
-
 #[cfg(test)]
 mod german_string_tests {
     use super::*;
@@ -88,12 +81,6 @@ mod german_string_tests {
             Some(s),
             "try_decode roundtrip failed for len {}",
             s.len(),
-        );
-        assert_eq!(
-            decode_german_string(&st, &blob),
-            s,
-            "decode roundtrip failed for len {}",
-            s.len()
         );
     }
 
@@ -155,14 +142,5 @@ mod german_string_tests {
         let st = encode_german_string(&payload, &mut blob);
         assert_eq!(blob.len(), 30, "exact-fit precondition");
         assert_eq!(try_decode_german_string(&st, &blob).as_deref(), Some(&payload[..]));
-    }
-
-    #[test]
-    #[should_panic(expected = "out of bounds")]
-    fn decode_panics_on_out_of_bounds() {
-        let mut st = [0u8; 16];
-        st[0..4].copy_from_slice(&100u32.to_le_bytes());
-        let blob = vec![0u8; 10];
-        let _ = decode_german_string(&st, &blob);
     }
 }

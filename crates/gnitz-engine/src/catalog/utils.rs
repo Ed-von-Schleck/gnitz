@@ -118,34 +118,14 @@ pub(crate) fn ingest_batch_into(table: &mut Table, batch: &Batch) {
 // ---------------------------------------------------------------------------
 
 /// Read a u64 from a cursor column. `logical_col` is the schema column index.
+/// `read_i64(col) as u64` is bit-for-bit `u64::from_le_bytes` of the same 8 bytes.
 pub(crate) fn cursor_read_u64(cursor: &CursorHandle, logical_col: usize) -> u64 {
-    let ptr = cursor.cursor.col_ptr(logical_col, 8);
-    if ptr.is_null() {
-        return 0;
-    }
-    let slice = unsafe { std::slice::from_raw_parts(ptr, 8) };
-    u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]))
+    cursor.cursor.read_i64(logical_col) as u64
 }
 
 /// Read a German string from a cursor column. `logical_col` is the schema column index.
 pub(crate) fn cursor_read_string(cursor: &CursorHandle, logical_col: usize) -> String {
-    let ptr = cursor.cursor.col_ptr(logical_col, 16);
-    if ptr.is_null() {
-        return String::new();
-    }
-    let st: [u8; 16] = unsafe { std::slice::from_raw_parts(ptr, 16) }
-        .try_into()
-        .unwrap_or([0; 16]);
-    // For out-of-line strings, build a blob slice from the cursor's blob pointer
-    let blob_ptr = cursor.cursor.blob_ptr();
-    let blob_slice = if !blob_ptr.is_null() {
-        let blob_len = cursor.cursor.blob_len();
-        unsafe { std::slice::from_raw_parts(blob_ptr, blob_len) }
-    } else {
-        &[]
-    };
-    let bytes = crate::schema::decode_german_string(&st, blob_slice);
-    String::from_utf8(bytes).unwrap_or_default()
+    String::from_utf8(cursor.cursor.read_german_bytes(logical_col)).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

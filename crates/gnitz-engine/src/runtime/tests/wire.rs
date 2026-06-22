@@ -3,7 +3,7 @@ use crate::runtime::wire::{
     encode_wire, encode_wire_into, peek_control_block, peek_routing_header, schema_to_batch, wire_size,
     CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
 };
-use crate::schema::{decode_german_string, encode_german_string, type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, ConsolidatedBatch};
 
 fn simple_schema() -> SchemaDescriptor {
@@ -325,12 +325,12 @@ fn test_encode_decode_string_column() {
 
     let mut s1 = [0u8; 16];
     s1.copy_from_slice(&db.col_data(1)[0..16]);
-    let str1 = decode_german_string(&s1, &db.blob);
+    let str1 = try_decode_german_string(&s1, &db.blob).unwrap();
     assert_eq!(str1, b"hello");
 
     let mut s2 = [0u8; 16];
     s2.copy_from_slice(&db.col_data(1)[16..32]);
-    let str2 = decode_german_string(&s2, &db.blob);
+    let str2 = try_decode_german_string(&s2, &db.blob).unwrap();
     assert_eq!(str2, long_str);
 }
 

@@ -398,9 +398,6 @@ impl CatalogEngine {
             edges: &mut *self.sys_circuit_edges as *mut Table,
             node_columns: &mut *self.sys_circuit_node_columns as *mut Table,
             dep_tab: &mut *self.sys_view_deps as *mut Table,
-            nodes_schema: circuit_nodes_schema(),
-            edges_schema: circuit_edges_schema(),
-            node_columns_schema: circuit_node_columns_schema(),
         });
     }
 

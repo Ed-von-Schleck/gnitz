@@ -1242,7 +1242,6 @@ pub(crate) fn relocate_german_string_vec(
     dest
 }
 
-pub(crate) use gnitz_wire::decode_german_string;
 pub(crate) use gnitz_wire::encode_german_string;
 pub(crate) use gnitz_wire::try_decode_german_string;
 

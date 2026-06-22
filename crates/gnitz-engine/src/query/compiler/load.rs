@@ -27,48 +27,6 @@ const NODECOL_COL_POSITION: usize = cidx(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, 
 const NODECOL_COL_VALUE1: usize = cidx(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, "value1");
 const NODECOL_COL_VALUE2: usize = cidx(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, "value2");
 
-/// Read an i64 from a cursor's current row at the given column index. Circuit
-/// system-table columns are all U64 (8-byte), and the nullable ones are read only
-/// behind a `cursor_is_null` guard, so this is a fixed 8-byte load; the asserts
-/// trip on a schema change or an unexpected null instead of silently returning 0.
-fn cursor_read_i64(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> i64 {
-    debug_assert_eq!(
-        schema.columns[col_idx].size() as usize,
-        8,
-        "circuit columns are all U64"
-    );
-    let ptr = cursor.col_ptr(col_idx, 8);
-    debug_assert!(!ptr.is_null(), "non-nullable circuit column read returned null");
-    i64::from_le_bytes(unsafe { *(ptr as *const [u8; 8]) })
-}
-
-/// Read a German String from a cursor column as raw bytes (may be empty).
-/// Delegates to the canonical decoder so the German-string format has one
-/// implementation; the bytes are returned verbatim (the `expr_program` blob is
-/// binary, not UTF-8).
-fn cursor_read_string(cursor: &ReadCursor, col_idx: usize) -> Vec<u8> {
-    let ptr = cursor.col_ptr(col_idx, 16);
-    if ptr.is_null() {
-        return Vec::new();
-    }
-    let st: [u8; 16] = unsafe { *(ptr as *const [u8; 16]) };
-    let blob_ptr = cursor.blob_ptr();
-    let blob: &[u8] = if blob_ptr.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(blob_ptr, cursor.blob_len()) }
-    };
-    crate::schema::try_decode_german_string(&st, blob).unwrap_or_default()
-}
-
-/// Check if a column is NULL in the current cursor row.
-fn cursor_is_null(cursor: &ReadCursor, col_idx: usize, schema: &SchemaDescriptor) -> bool {
-    let Some(payload_idx) = schema.try_payload_idx(col_idx) else {
-        return false; // PK is never null
-    };
-    (cursor.current_null_word >> payload_idx) & 1 != 0
-}
-
 /// Open a cursor for a system table. Returns None if the table handle is null.
 /// Positioning is done by the caller via `seek_first_positive_with_prefix` on
 /// the `view_id` prefix (the circuit tables use a compound `(view_id, sub)` PK).
@@ -80,14 +38,10 @@ fn open_system_cursor(table: *mut Table) -> Option<CursorHandle> {
     Some(t.open_cursor())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_circuit(
     sys_nodes: *mut Table,
-    sys_nodes_schema: &SchemaDescriptor,
     sys_edges: *mut Table,
-    sys_edges_schema: &SchemaDescriptor,
     sys_node_cols: *mut Table,
-    sys_node_cols_schema: &SchemaDescriptor,
     view_id: u64,
     out_schema: SchemaDescriptor,
 ) -> Option<LoadedCircuit> {
@@ -102,11 +56,11 @@ pub(crate) fn load_circuit(
         let mut ch = open_system_cursor(sys_node_cols)?;
         let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
         while hit {
-            let node_id = cursor_read_i64(&ch.cursor, NODECOL_COL_NODE_ID, sys_node_cols_schema) as i32;
-            let kind = cursor_read_i64(&ch.cursor, NODECOL_COL_KIND, sys_node_cols_schema) as u64;
-            let position = cursor_read_i64(&ch.cursor, NODECOL_COL_POSITION, sys_node_cols_schema) as u16;
-            let v1 = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE1, sys_node_cols_schema) as u64;
-            let v2 = cursor_read_i64(&ch.cursor, NODECOL_COL_VALUE2, sys_node_cols_schema) as u64;
+            let node_id = ch.cursor.read_i64(NODECOL_COL_NODE_ID) as i32;
+            let kind = ch.cursor.read_i64(NODECOL_COL_KIND) as u64;
+            let position = ch.cursor.read_i64(NODECOL_COL_POSITION) as u16;
+            let v1 = ch.cursor.read_i64(NODECOL_COL_VALUE1) as u64;
+            let v2 = ch.cursor.read_i64(NODECOL_COL_VALUE2) as u64;
             cols_by_node
                 .entry(node_id)
                 .or_default()
@@ -131,23 +85,23 @@ pub(crate) fn load_circuit(
         let mut ch = open_system_cursor(sys_nodes)?;
         let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
         while hit {
-            let node_id = cursor_read_i64(&ch.cursor, NODES_COL_NODE_ID, sys_nodes_schema) as i32;
-            let opcode = cursor_read_i64(&ch.cursor, NODES_COL_OPCODE_NEW, sys_nodes_schema) as u64;
+            let node_id = ch.cursor.read_i64(NODES_COL_NODE_ID) as i32;
+            let opcode = ch.cursor.read_i64(NODES_COL_OPCODE_NEW) as u64;
 
-            let src_tab: Option<u64> = if cursor_is_null(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) {
+            let src_tab: Option<u64> = if ch.cursor.col_is_null(NODES_COL_SOURCE_TABLE) {
                 None
             } else {
-                Some(cursor_read_i64(&ch.cursor, NODES_COL_SOURCE_TABLE, sys_nodes_schema) as u64)
+                Some(ch.cursor.read_i64(NODES_COL_SOURCE_TABLE) as u64)
             };
-            let reindex: Option<u16> = if cursor_is_null(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema) {
+            let reindex: Option<u16> = if ch.cursor.col_is_null(NODES_COL_REINDEX_COL) {
                 None
             } else {
-                Some(cursor_read_i64(&ch.cursor, NODES_COL_REINDEX_COL, sys_nodes_schema) as u16)
+                Some(ch.cursor.read_i64(NODES_COL_REINDEX_COL) as u16)
             };
-            let expr_blob: Option<Vec<u8>> = if cursor_is_null(&ch.cursor, NODES_COL_EXPR_PROGRAM, sys_nodes_schema) {
+            let expr_blob: Option<Vec<u8>> = if ch.cursor.col_is_null(NODES_COL_EXPR_PROGRAM) {
                 None
             } else {
-                let b = cursor_read_string(&ch.cursor, NODES_COL_EXPR_PROGRAM);
+                let b = ch.cursor.read_german_bytes(NODES_COL_EXPR_PROGRAM);
                 if b.is_empty() {
                     None
                 } else {
@@ -182,9 +136,9 @@ pub(crate) fn load_circuit(
         let mut ch = open_system_cursor(sys_edges)?;
         let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
         while hit {
-            let dst = cursor_read_i64(&ch.cursor, EDGES_COL_DST_NODE, sys_edges_schema) as i32;
-            let port = cursor_read_i64(&ch.cursor, EDGES_COL_DST_PORT, sys_edges_schema) as i32;
-            let src = cursor_read_i64(&ch.cursor, EDGES_COL_SRC_NODE, sys_edges_schema) as i32;
+            let dst = ch.cursor.read_i64(EDGES_COL_DST_NODE) as i32;
+            let port = ch.cursor.read_i64(EDGES_COL_DST_PORT) as i32;
+            let src = ch.cursor.read_i64(EDGES_COL_SRC_NODE) as i32;
             edges.push((src, dst, port));
             ch.cursor.advance();
             hit = ch.cursor.walk_to_positive_with_prefix(&prefix);

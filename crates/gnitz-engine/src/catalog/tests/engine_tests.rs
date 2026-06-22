@@ -534,3 +534,36 @@ fn test_circuit_table_surface_introspectable() {
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_read_batch_string_out_of_bounds_offset_returns_empty() {
+    // A registry batch whose STRING struct is a long string (len > 12) with a blob
+    // offset past the (empty) arena must read back empty, not abort: read_batch_string
+    // disposes of the decoder's None via unwrap_or_default. Reachable only via corrupt
+    // wire input — a correct client never emits an out-of-bounds offset.
+    let dir = temp_dir("read_batch_oob");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::STRING, 0),
+        ],
+        &[0],
+    );
+    let mut batch = Batch::with_schema(schema, 1);
+    batch.extend_pk(1);
+    batch.extend_weight(&1i64.to_le_bytes());
+    batch.extend_null_bmp(&0u64.to_le_bytes());
+    let mut st = [0u8; 16];
+    st[0..4].copy_from_slice(&100u32.to_le_bytes()); // len 100 (> 12 → reads blob)
+    st[8..16].copy_from_slice(&0u64.to_le_bytes()); // offset 0 into empty blob
+    batch.extend_col(0, &st);
+    batch.count += 1;
+
+    // payload_col 0 is the STRING column; the corrupt offset must decode to "".
+    assert_eq!(engine.read_batch_string(&batch, 0, 0), String::new());
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

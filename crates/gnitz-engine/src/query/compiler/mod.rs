@@ -8,7 +8,7 @@ use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{AggDescriptor, AggOp};
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{is_fixed_int, type_code, SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{CursorHandle, Persistence, ReadCursor, Table};
+use crate::storage::{CursorHandle, Persistence, Table};
 
 mod emit;
 mod load;
@@ -266,25 +266,13 @@ pub(crate) unsafe fn compile_view(
     sys_nodes: *mut Table,
     sys_edges: *mut Table,
     sys_node_cols: *mut Table,
-    sys_nodes_schema: &SchemaDescriptor,
-    sys_edges_schema: &SchemaDescriptor,
-    sys_node_cols_schema: &SchemaDescriptor,
     view_dir: &str,
     view_table_id: u32,
     view_schema: &SchemaDescriptor,
     ext_tables: &[ExternalTable],
 ) -> Result<CompileOutput, CompileError> {
-    let mut loaded = load_circuit(
-        sys_nodes,
-        sys_nodes_schema,
-        sys_edges,
-        sys_edges_schema,
-        sys_node_cols,
-        sys_node_cols_schema,
-        view_id,
-        *view_schema,
-    )
-    .ok_or(CompileError::LoadFailed)?;
+    let mut loaded =
+        load_circuit(sys_nodes, sys_edges, sys_node_cols, view_id, *view_schema).ok_or(CompileError::LoadFailed)?;
     if loaded.nodes.is_empty() {
         return Err(CompileError::EmptyCircuit);
     }
@@ -1719,11 +1707,8 @@ mod tests {
 
         let result = load_circuit(
             &mut nodes_tab,
-            &nodes_schema,
             &mut edges_tab,
-            &edges_schema,
             &mut cols_tab,
-            &cols_schema,
             view_id,
             SchemaDescriptor::default(),
         );
@@ -1807,11 +1792,8 @@ mod tests {
 
         let result = load_circuit(
             &mut nodes_tab,
-            &nodes_schema,
             &mut edges_tab,
-            &edges_schema,
             &mut cols_tab,
-            &cols_schema,
             view_id,
             SchemaDescriptor::default(),
         );
@@ -2962,11 +2944,8 @@ mod tests {
     fn test_load_circuit_returns_none_for_null_system_tables() {
         let result = load_circuit(
             std::ptr::null_mut(),
-            &SchemaDescriptor::default(),
             std::ptr::null_mut(),
-            &SchemaDescriptor::default(),
             std::ptr::null_mut(),
-            &SchemaDescriptor::default(),
             0,
             SchemaDescriptor::default(),
         );

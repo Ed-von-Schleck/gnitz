@@ -13,7 +13,7 @@ pub enum VerifyChecksum {
     No,
 }
 
-use gnitz_wire::{align8, SHORT_STRING_THRESHOLD, WAL_FORMAT_VERSION, WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE};
+use gnitz_wire::{align8, WAL_FORMAT_VERSION, WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -117,26 +117,8 @@ fn encode_german_string(s: &str, blob: &mut Vec<u8>) -> [u8; 16] {
 }
 
 fn decode_german_string(st: [u8; 16], blob: &[u8]) -> Result<String, ProtocolError> {
-    let length = u32::from_le_bytes(st[0..4].try_into().unwrap()) as usize;
-    if length == 0 {
-        return Ok(String::new());
-    }
-    // Bounds-check before delegating to wire (which would panic).
-    if length > SHORT_STRING_THRESHOLD {
-        let offset = u64::from_le_bytes(st[8..16].try_into().unwrap()) as usize;
-        let end = offset
-            .checked_add(length)
-            .ok_or_else(|| ProtocolError::DecodeError("German String blob offset overflow".into()))?;
-        if end > blob.len() {
-            return Err(ProtocolError::DecodeError(format!(
-                "German String blob arena out of bounds: offset={}, length={}, blob.len()={}",
-                offset,
-                length,
-                blob.len()
-            )));
-        }
-    }
-    let bytes = gnitz_wire::decode_german_string(&st, blob);
+    let bytes = gnitz_wire::try_decode_german_string(&st, blob)
+        .ok_or_else(|| ProtocolError::DecodeError("German String blob arena out of bounds".into()))?;
     String::from_utf8(bytes).map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {e}")))
 }
 
@@ -549,22 +531,9 @@ pub fn decode_wal_block(
                     }
                     let mut st = [0u8; 16];
                     st.copy_from_slice(&data[struct_start..struct_start + 16]);
-                    let length = u32::from_le_bytes(st[0..4].try_into().unwrap()) as usize;
-                    if length > SHORT_STRING_THRESHOLD {
-                        let offset = u64::from_le_bytes(st[8..16].try_into().unwrap()) as usize;
-                        let end = offset
-                            .checked_add(length)
-                            .ok_or_else(|| ProtocolError::DecodeError("BLOB blob offset overflow".into()))?;
-                        if end > blob.len() {
-                            return Err(ProtocolError::DecodeError(format!(
-                                "BLOB blob arena out of bounds: offset={}, length={}, blob.len()={}",
-                                offset,
-                                length,
-                                blob.len()
-                            )));
-                        }
-                    }
-                    vals.push(Some(gnitz_wire::decode_german_string(&st, blob)));
+                    vals.push(Some(gnitz_wire::try_decode_german_string(&st, blob).ok_or_else(
+                        || ProtocolError::DecodeError("BLOB blob arena out of bounds".into()),
+                    )?));
                 }
                 columns.push(ColData::Bytes(vals));
             }
@@ -778,6 +747,23 @@ mod tests {
         let st13 = encode_german_string(s13, &mut blob13);
         assert_eq!(blob13.len(), 13);
         assert_eq!(decode_german_string(st13, &blob13).unwrap(), s13);
+    }
+
+    #[test]
+    fn test_german_string_out_of_bounds_offset_errors() {
+        // A long-string struct (len > 12) whose blob offset overruns the arena must
+        // decode to a DecodeError, not panic: the offset bounds check now lives
+        // entirely in the wire `try_decode_german_string`. Match the variant, not
+        // the message text.
+        let mut st = [0u8; 16];
+        st[0..4].copy_from_slice(&100u32.to_le_bytes()); // len = 100 (> 12 → reads blob)
+        st[8..16].copy_from_slice(&0u64.to_le_bytes()); // offset 0
+        let blob = vec![0u8; 50]; // shorter than len → out of bounds
+        let result = decode_german_string(st, &blob);
+        assert!(
+            matches!(result, Err(ProtocolError::DecodeError(_))),
+            "out-of-bounds long-string offset must return DecodeError, got {result:?}"
+        );
     }
 
     // ── encode/decode roundtrips ──────────────────────────────────────────

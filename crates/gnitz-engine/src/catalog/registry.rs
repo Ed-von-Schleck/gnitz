@@ -109,7 +109,7 @@ impl CatalogEngine {
             return String::new();
         }
         let st: [u8; 16] = data[off..off + 16].try_into().unwrap_or([0; 16]);
-        let bytes = crate::schema::decode_german_string(&st, &batch.blob);
+        let bytes = crate::schema::try_decode_german_string(&st, &batch.blob).unwrap_or_default();
         String::from_utf8(bytes).unwrap_or_default()
     }
 
