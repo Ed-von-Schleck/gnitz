@@ -180,23 +180,33 @@ fn fill_null_bits_pi(s: &mut EvalScratch, di: usize, null_bmp: &[u8], morsel_sta
     }
 }
 
-/// Fill null bits for a resolved payload byte (handles PK SENTINEL: always non-null).
-fn fill_null_bits_for_resolved(
-    s: &mut EvalScratch,
-    di: usize,
-    null_bmp: &[u8],
+/// IS [NOT] NULL: read payload column `pi`'s null bit per row, optionally invert
+/// (`invert = 1` for IS NOT NULL), and write the boolean into register `dst`. The result
+/// register is always non-null (`clear_null_reg`).
+#[allow(clippy::too_many_arguments)]
+fn eval_is_null(
+    scratch: &mut EvalScratch,
+    mb: &MemBatch,
+    prog: &ExprProgram,
+    dst: usize,
     morsel_start: usize,
     m: usize,
-    pi_byte: u8,
+    pi: usize,
+    invert: u64,
 ) {
-    if s.no_nulls {
-        return;
+    debug_assert_ne!(
+        pi, PAYLOAD_MAPPING_PK_SENTINEL as usize,
+        "IS [NOT] NULL operand resolved to a PK column; the binder must const-fold \
+         null tests on non-nullable (incl. PK) columns",
+    );
+    scratch.clear_null_reg(dst, m);
+    let base_d = dst * MORSEL;
+    let null_bmp = mb.null_bmp();
+    for i in 0..m {
+        let row_null = read_u64_le(null_bmp, (morsel_start + i) * 8);
+        scratch.regs[base_d + i] = (((row_null >> pi) & 1) ^ invert) as i64;
     }
-    if pi_byte == PAYLOAD_MAPPING_PK_SENTINEL {
-        s.clear_null_reg(di, m);
-        return;
-    }
-    fill_null_bits_pi(s, di, null_bmp, morsel_start, m, pi_byte as usize);
+    maybe_pack_bool_bits(scratch, prog, dst, m);
 }
 
 /// Shared BOOL_AND / BOOL_OR word-level 3VL kernel (nullable arm).
@@ -317,7 +327,7 @@ fn eval_str_col_vs_const(
         "eval_str_col_vs_const: PK column is never a string",
     );
     let pi = pi_byte as usize;
-    fill_null_bits_for_resolved(scratch, dst, mb.null_bmp(), morsel_start, m, pi_byte);
+    fill_null_bits_pi(scratch, dst, mb.null_bmp(), morsel_start, m, pi);
     let col_data = mb.col_data(pi, 16);
     let blob = mb.blob;
     let const_bytes = &prog.const_strings[const_idx];
@@ -357,25 +367,27 @@ fn eval_str_col_vs_col(
         pi_byte_a != PAYLOAD_MAPPING_PK_SENTINEL && pi_byte_b != PAYLOAD_MAPPING_PK_SENTINEL,
         "eval_str_col_vs_col: PK column is never a string",
     );
-    fill_null_bits_for_resolved(scratch, dst, mb.null_bmp(), morsel_start, m, pi_byte_a);
+    // Result is null where either operand column is null; fold both columns'
+    // null bits into dst in one pass over the null bitmap.
+    let pi_a = pi_byte_a as usize;
+    let pi_b = pi_byte_b as usize;
     if !scratch.no_nulls {
         let words = m.div_ceil(64);
-        let pi_b = pi_byte_b as usize;
+        let base = dst * NULL_WORDS_PER_REG;
+        let null_bmp = mb.null_bmp();
         for w in 0..words {
             let lo = w * 64;
             let hi = (lo + 64).min(m);
-            let mut extra: u64 = 0;
+            let mut word: u64 = 0;
             for i in lo..hi {
-                let row_null = read_u64_le(mb.null_bmp(), (morsel_start + i) * 8);
-                if (row_null >> pi_b) & 1 != 0 {
-                    extra |= 1u64 << (i - lo);
+                let row_null = read_u64_le(null_bmp, (morsel_start + i) * 8);
+                if ((row_null >> pi_a) | (row_null >> pi_b)) & 1 != 0 {
+                    word |= 1u64 << (i - lo);
                 }
             }
-            scratch.null_bits[dst * NULL_WORDS_PER_REG + w] |= extra;
+            scratch.null_bits[base + w] = word;
         }
     }
-    let pi_a = pi_byte_a as usize;
-    let pi_b = pi_byte_b as usize;
     let col_a = mb.col_data(pi_a, 16);
     let col_b = mb.col_data(pi_b, 16);
     let blob = mb.blob;
@@ -389,6 +401,18 @@ fn eval_str_col_vs_col(
     }
     zero_null_rows(scratch, dst, m);
     maybe_pack_bool_bits(scratch, prog, dst, m);
+}
+
+/// Reinterpret a register's raw i64 bits as the `f64` they encode, and back.
+/// `#[inline(always)]` so each use folds into its per-row loop with no call,
+/// keeping every float arm branch-free and vectorizable.
+#[inline(always)]
+fn decode_f64(bits: i64) -> f64 {
+    f64::from_bits(bits as u64)
+}
+#[inline(always)]
+fn encode_f64(f: f64) -> i64 {
+    f64::to_bits(f) as i64
 }
 
 // ---------------------------------------------------------------------------
@@ -412,71 +436,23 @@ pub(in crate::expr) fn eval_batch(
         "eval_batch: program must be resolved via resolve_column_indices",
     );
 
-    // Four opcode families share one shape each; these macros collapse them
-    // to one line per opcode. `int_div_like!` covers DIV/MOD/FLOAT_DIV which
-    // additionally merge a zero-divisor mask into the destination null word.
-    macro_rules! bin_int {
-        ($a:expr, $b:expr, $d:expr, $op:ident) => {{
+    // Every binary arithmetic/comparison opcode shares one shape: read two source
+    // registers, write one, OR the source null words, repack bool bits. `bin_op!`
+    // collapses them to one line each — the per-row `|x, y| body` is spliced inline
+    // (not a closure), so each arm vectorizes exactly as the hand-written loop did.
+    // Bodies must stay branch-free; float ops reinterpret register bits via
+    // `decode_f64`/`encode_f64`. `div_like!` stays separate: it additionally merges
+    // a zero-divisor mask into the destination null word.
+    macro_rules! bin_op {
+        ($a:expr, $b:expr, $d:expr, |$x:ident, $y:ident| $body:expr) => {{
             let ai = $a as usize;
             let bi = $b as usize;
             {
                 let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
                 for i in 0..m {
-                    rd[i] = ra[i].$op(rb[i]);
-                }
-            }
-            null_or2(scratch, $d, ai, bi, m);
-            maybe_pack_bool_bits(scratch, prog, $d, m);
-        }};
-    }
-    macro_rules! cmp_int {
-        ($a:expr, $b:expr, $d:expr, $op:tt) => {{
-            let ai = $a as usize; let bi = $b as usize;
-            {
-                let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
-                for i in 0..m { rd[i] = (ra[i] $op rb[i]) as i64; }
-            }
-            null_or2(scratch, $d, ai, bi, m);
-            maybe_pack_bool_bits(scratch, prog, $d, m);
-        }};
-    }
-    // Unsigned variant of cmp_int: reinterpret the i64 register bit pattern as
-    // u64 so values >= 2^63 compare as the large positives they represent.
-    macro_rules! cmp_uint {
-        ($a:expr, $b:expr, $d:expr, $op:tt) => {{
-            let ai = $a as usize; let bi = $b as usize;
-            {
-                let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
-                for i in 0..m { rd[i] = ((ra[i] as u64) $op (rb[i] as u64)) as i64; }
-            }
-            null_or2(scratch, $d, ai, bi, m);
-            maybe_pack_bool_bits(scratch, prog, $d, m);
-        }};
-    }
-    macro_rules! bin_float {
-        ($a:expr, $b:expr, $d:expr, $op:tt) => {{
-            let ai = $a as usize; let bi = $b as usize;
-            {
-                let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
-                for i in 0..m {
-                    let fa = f64::from_bits(ra[i] as u64);
-                    let fb = f64::from_bits(rb[i] as u64);
-                    rd[i] = f64::to_bits(fa $op fb) as i64;
-                }
-            }
-            null_or2(scratch, $d, ai, bi, m);
-            maybe_pack_bool_bits(scratch, prog, $d, m);
-        }};
-    }
-    macro_rules! cmp_float {
-        ($a:expr, $b:expr, $d:expr, $op:tt) => {{
-            let ai = $a as usize; let bi = $b as usize;
-            {
-                let (ra, rb, rd) = scratch.reg3(ai, bi, $d, m);
-                for i in 0..m {
-                    let fa = f64::from_bits(ra[i] as u64);
-                    let fb = f64::from_bits(rb[i] as u64);
-                    rd[i] = (fa $op fb) as i64;
+                    let $x = ra[i];
+                    let $y = rb[i];
+                    rd[i] = $body;
                 }
             }
             null_or2(scratch, $d, ai, bi, m);
@@ -537,49 +513,34 @@ pub(in crate::expr) fn eval_batch(
                 let is_signed = crate::schema::is_signed_int(col_tc);
                 let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
-                match col_size {
-                    8 => {
+                // Widen `m` rows of a `SZ`-byte little-endian column into i64 registers.
+                // `SZ` is a compile-time constant per instantiation, so each expansion is
+                // monomorphic and vectorizes like the hand-written loop did.
+                macro_rules! load_int {
+                    ($ty:ty) => {{
+                        const SZ: usize = std::mem::size_of::<$ty>();
+                        let b = &col_data[morsel_start * SZ..(morsel_start + m) * SZ];
+                        for (i, c) in b.chunks_exact(SZ).enumerate() {
+                            dst_reg[i] = <$ty>::from_le_bytes(c.try_into().unwrap()) as i64;
+                        }
+                    }};
+                }
+                match (col_size, is_signed) {
+                    // 8-byte: the one width with no widening and no signed/unsigned split —
+                    // the i64 register IS the storage type, a bare bit-reinterpret. Kept inline
+                    // so `load_int!` (which appends `as i64`) never emits a vacuous `i64 as i64`.
+                    (8, _) => {
                         let b = &col_data[morsel_start * 8..(morsel_start + m) * 8];
                         for (i, c) in b.chunks_exact(8).enumerate() {
                             dst_reg[i] = i64::from_le_bytes(c.try_into().unwrap());
                         }
                     }
-                    4 => {
-                        let b = &col_data[morsel_start * 4..(morsel_start + m) * 4];
-                        if is_signed {
-                            for (i, c) in b.chunks_exact(4).enumerate() {
-                                dst_reg[i] = i32::from_le_bytes(c.try_into().unwrap()) as i64;
-                            }
-                        } else {
-                            for (i, c) in b.chunks_exact(4).enumerate() {
-                                dst_reg[i] = u32::from_le_bytes(c.try_into().unwrap()) as i64;
-                            }
-                        }
-                    }
-                    2 => {
-                        let b = &col_data[morsel_start * 2..(morsel_start + m) * 2];
-                        if is_signed {
-                            for (i, c) in b.chunks_exact(2).enumerate() {
-                                dst_reg[i] = i16::from_le_bytes(c.try_into().unwrap()) as i64;
-                            }
-                        } else {
-                            for (i, c) in b.chunks_exact(2).enumerate() {
-                                dst_reg[i] = u16::from_le_bytes(c.try_into().unwrap()) as i64;
-                            }
-                        }
-                    }
-                    1 => {
-                        let b = &col_data[morsel_start..morsel_start + m];
-                        if is_signed {
-                            for (i, &byte) in b.iter().enumerate() {
-                                dst_reg[i] = byte as i8 as i64;
-                            }
-                        } else {
-                            for (i, &byte) in b.iter().enumerate() {
-                                dst_reg[i] = byte as i64;
-                            }
-                        }
-                    }
+                    (4, true) => load_int!(i32),
+                    (4, false) => load_int!(u32),
+                    (2, true) => load_int!(i16),
+                    (2, false) => load_int!(u16),
+                    (1, true) => load_int!(i8),
+                    (1, false) => load_int!(u8),
                     _ => {}
                 }
                 fill_null_bits_pi(scratch, dst, mb.null_bmp(), morsel_start, m, pi);
@@ -595,7 +556,7 @@ pub(in crate::expr) fn eval_batch(
                     let b = &col_data[morsel_start * 4..(morsel_start + m) * 4];
                     for (i, c) in b.chunks_exact(4).enumerate() {
                         let bits = u32::from_le_bytes(c.try_into().unwrap());
-                        dst_reg[i] = f64::to_bits(f32::from_bits(bits) as f64) as i64;
+                        dst_reg[i] = encode_f64(f32::from_bits(bits) as f64);
                     }
                 } else {
                     let b = &col_data[morsel_start * 8..(morsel_start + m) * 8];
@@ -666,9 +627,9 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer arithmetic
             // ----------------------------------------------------------------
-            EXPR_INT_ADD => bin_int!(a1, a2, dst, wrapping_add),
-            EXPR_INT_SUB => bin_int!(a1, a2, dst, wrapping_sub),
-            EXPR_INT_MUL => bin_int!(a1, a2, dst, wrapping_mul),
+            EXPR_INT_ADD => bin_op!(a1, a2, dst, |x, y| x.wrapping_add(y)),
+            EXPR_INT_SUB => bin_op!(a1, a2, dst, |x, y| x.wrapping_sub(y)),
+            EXPR_INT_MUL => bin_op!(a1, a2, dst, |x, y| x.wrapping_mul(y)),
             EXPR_INT_DIV => div_like!(a1, a2, dst, |a, b| {
                 let is_zero = b == 0;
                 let d = if is_zero { 1 } else { b };
@@ -706,23 +667,22 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Float arithmetic
             // ----------------------------------------------------------------
-            EXPR_FLOAT_ADD => bin_float!(a1, a2, dst, +),
-            EXPR_FLOAT_SUB => bin_float!(a1, a2, dst, -),
-            EXPR_FLOAT_MUL => bin_float!(a1, a2, dst, *),
+            EXPR_FLOAT_ADD => bin_op!(a1, a2, dst, |x, y| encode_f64(decode_f64(x) + decode_f64(y))),
+            EXPR_FLOAT_SUB => bin_op!(a1, a2, dst, |x, y| encode_f64(decode_f64(x) - decode_f64(y))),
+            EXPR_FLOAT_MUL => bin_op!(a1, a2, dst, |x, y| encode_f64(decode_f64(x) * decode_f64(y))),
             EXPR_FLOAT_DIV => div_like!(a1, a2, dst, |a, b| {
-                let fa = f64::from_bits(a as u64);
-                let fb = f64::from_bits(b as u64);
+                let fa = decode_f64(a);
+                let fb = decode_f64(b);
                 let is_zero = fb == 0.0;
                 let fb_safe = if is_zero { 1.0 } else { fb };
-                (f64::to_bits(fa / fb_safe) as i64, is_zero)
+                (encode_f64(fa / fb_safe), is_zero)
             }),
             EXPR_FLOAT_NEG => {
                 let ai = a1 as usize;
                 let base_a = ai * MORSEL;
                 let base_d = dst * MORSEL;
                 for i in 0..m {
-                    let fa = f64::from_bits(scratch.regs[base_a + i] as u64);
-                    scratch.regs[base_d + i] = f64::to_bits(-fa) as i64;
+                    scratch.regs[base_d + i] = encode_f64(-decode_f64(scratch.regs[base_a + i]));
                 }
                 null_or1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
@@ -731,28 +691,28 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer comparisons
             // ----------------------------------------------------------------
-            EXPR_CMP_EQ => cmp_int!(a1, a2, dst, ==),
-            EXPR_CMP_NE => cmp_int!(a1, a2, dst, !=),
-            EXPR_CMP_GT => cmp_int!(a1, a2, dst, >),
-            EXPR_CMP_GE => cmp_int!(a1, a2, dst, >=),
-            EXPR_CMP_LT => cmp_int!(a1, a2, dst, <),
-            EXPR_CMP_LE => cmp_int!(a1, a2, dst, <=),
+            EXPR_CMP_EQ => bin_op!(a1, a2, dst, |x, y| (x == y) as i64),
+            EXPR_CMP_NE => bin_op!(a1, a2, dst, |x, y| (x != y) as i64),
+            EXPR_CMP_GT => bin_op!(a1, a2, dst, |x, y| (x > y) as i64),
+            EXPR_CMP_GE => bin_op!(a1, a2, dst, |x, y| (x >= y) as i64),
+            EXPR_CMP_LT => bin_op!(a1, a2, dst, |x, y| (x < y) as i64),
+            EXPR_CMP_LE => bin_op!(a1, a2, dst, |x, y| (x <= y) as i64),
 
             // Unsigned (U64) integer comparisons
-            EXPR_UCMP_GT => cmp_uint!(a1, a2, dst, >),
-            EXPR_UCMP_GE => cmp_uint!(a1, a2, dst, >=),
-            EXPR_UCMP_LT => cmp_uint!(a1, a2, dst, <),
-            EXPR_UCMP_LE => cmp_uint!(a1, a2, dst, <=),
+            EXPR_UCMP_GT => bin_op!(a1, a2, dst, |x, y| ((x as u64) > (y as u64)) as i64),
+            EXPR_UCMP_GE => bin_op!(a1, a2, dst, |x, y| ((x as u64) >= (y as u64)) as i64),
+            EXPR_UCMP_LT => bin_op!(a1, a2, dst, |x, y| ((x as u64) < (y as u64)) as i64),
+            EXPR_UCMP_LE => bin_op!(a1, a2, dst, |x, y| ((x as u64) <= (y as u64)) as i64),
 
             // ----------------------------------------------------------------
             // Float comparisons
             // ----------------------------------------------------------------
-            EXPR_FCMP_EQ => cmp_float!(a1, a2, dst, ==),
-            EXPR_FCMP_NE => cmp_float!(a1, a2, dst, !=),
-            EXPR_FCMP_GT => cmp_float!(a1, a2, dst, >),
-            EXPR_FCMP_GE => cmp_float!(a1, a2, dst, >=),
-            EXPR_FCMP_LT => cmp_float!(a1, a2, dst, <),
-            EXPR_FCMP_LE => cmp_float!(a1, a2, dst, <=),
+            EXPR_FCMP_EQ => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) == decode_f64(y)) as i64),
+            EXPR_FCMP_NE => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) != decode_f64(y)) as i64),
+            EXPR_FCMP_GT => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) > decode_f64(y)) as i64),
+            EXPR_FCMP_GE => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) >= decode_f64(y)) as i64),
+            EXPR_FCMP_LT => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) < decode_f64(y)) as i64),
+            EXPR_FCMP_LE => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) <= decode_f64(y)) as i64),
 
             // ----------------------------------------------------------------
             // Boolean 3VL
@@ -827,42 +787,8 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // IS NULL / IS NOT NULL
             // ----------------------------------------------------------------
-            EXPR_IS_NULL => {
-                let pi_byte = a1 as u8;
-                scratch.clear_null_reg(dst, m);
-                let base_d = dst * MORSEL;
-                if pi_byte == PAYLOAD_MAPPING_PK_SENTINEL {
-                    for i in 0..m {
-                        scratch.regs[base_d + i] = 0;
-                    }
-                } else {
-                    let pi = pi_byte as usize;
-                    let null_bmp = mb.null_bmp();
-                    for i in 0..m {
-                        let row_null = read_u64_le(null_bmp, (morsel_start + i) * 8);
-                        scratch.regs[base_d + i] = ((row_null >> pi) & 1) as i64;
-                    }
-                }
-                maybe_pack_bool_bits(scratch, prog, dst, m);
-            }
-            EXPR_IS_NOT_NULL => {
-                let pi_byte = a1 as u8;
-                scratch.clear_null_reg(dst, m);
-                let base_d = dst * MORSEL;
-                if pi_byte == PAYLOAD_MAPPING_PK_SENTINEL {
-                    for i in 0..m {
-                        scratch.regs[base_d + i] = 1;
-                    }
-                } else {
-                    let pi = pi_byte as usize;
-                    let null_bmp = mb.null_bmp();
-                    for i in 0..m {
-                        let row_null = read_u64_le(null_bmp, (morsel_start + i) * 8);
-                        scratch.regs[base_d + i] = (((row_null >> pi) & 1) ^ 1) as i64;
-                    }
-                }
-                maybe_pack_bool_bits(scratch, prog, dst, m);
-            }
+            EXPR_IS_NULL => eval_is_null(scratch, mb, prog, dst, morsel_start, m, a1 as usize, 0),
+            EXPR_IS_NOT_NULL => eval_is_null(scratch, mb, prog, dst, morsel_start, m, a1 as usize, 1),
 
             // ----------------------------------------------------------------
             // Type cast
@@ -872,7 +798,7 @@ pub(in crate::expr) fn eval_batch(
                 let base_a = ai * MORSEL;
                 let base_d = dst * MORSEL;
                 for i in 0..m {
-                    scratch.regs[base_d + i] = f64::to_bits(scratch.regs[base_a + i] as f64) as i64;
+                    scratch.regs[base_d + i] = encode_f64(scratch.regs[base_a + i] as f64);
                 }
                 null_or1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
@@ -884,7 +810,7 @@ pub(in crate::expr) fn eval_batch(
                 let base_a = ai * MORSEL;
                 let base_d = dst * MORSEL;
                 for i in 0..m {
-                    scratch.regs[base_d + i] = f64::to_bits(scratch.regs[base_a + i] as u64 as f64) as i64;
+                    scratch.regs[base_d + i] = encode_f64(scratch.regs[base_a + i] as u64 as f64);
                 }
                 null_or1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
