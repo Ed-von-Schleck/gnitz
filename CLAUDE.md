@@ -591,9 +591,13 @@ anything the optimizer could elide.
 
 ## See also
 
-- `CLAUDE.md` — DBSP / Z-Set theory and consolidation / merge invariants.
 - `async-invariants.md` — runtime & reactor: kernel coordination, scheduling, known latent issues.
 
 ## GIT Branches
 
 All development happens on main for now; never branch off.
+
+## Compat / Legacy code
+
+Gnitz is pre-alpha, there are no production uses of this software. Keeping legacy code in
+the codebase is strictly not allowed.
