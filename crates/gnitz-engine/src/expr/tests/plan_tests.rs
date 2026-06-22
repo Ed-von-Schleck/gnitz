@@ -1,4 +1,4 @@
-use super::super::plan::{Plan, ScalarFuncKind};
+use super::super::plan::ScalarFunc;
 use crate::expr;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
@@ -34,12 +34,7 @@ fn test_projection_batch() {
     let out_schema = make_schema(0, &[8, 9, 9]);
     let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20]), (2, 1, 0, &[30, 40])]);
 
-    let func = ScalarFuncKind::Plan(Plan::from_projection(
-        &[2, 1],
-        &[type_code::I64, type_code::I64],
-        &in_schema,
-        &out_schema,
-    ));
+    let func = ScalarFunc::from_projection(&[2, 1], &[type_code::I64, type_code::I64], &in_schema, &out_schema);
     let result = func.evaluate_map_batch(&batch, &out_schema);
     assert_eq!(result.count, 2);
 
@@ -80,7 +75,7 @@ fn test_map_copy_and_emit() {
     ];
     let prog = crate::expr::ExprProgram::new(code, 3, 2, vec![]);
 
-    let func = ScalarFuncKind::Plan(Plan::from_map(prog, &in_schema, &out_schema));
+    let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
     let result = func.evaluate_map_batch(&batch, &out_schema);
     assert_eq!(result.count, 1);
 
@@ -95,7 +90,7 @@ fn test_empty_batch() {
     let schema = make_schema(0, &[8, 9]);
     let batch = Batch::empty(1, 16);
 
-    let func = ScalarFuncKind::Plan(Plan::from_projection(&[1], &[type_code::I64], &schema, &schema));
+    let func = ScalarFunc::from_projection(&[1], &[type_code::I64], &schema, &schema);
     let result = func.evaluate_map_batch(&batch, &schema);
     assert_eq!(result.count, 0);
 }

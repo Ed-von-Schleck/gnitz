@@ -1,7 +1,7 @@
 //! `ProgramBuilder` — constructs a `Program` via incremental `add_*()` calls.
 
 use super::*;
-use crate::expr::ScalarFuncKind;
+use crate::expr::ScalarFunc;
 use crate::ops::AggDescriptor;
 use crate::schema::SchemaDescriptor;
 use crate::storage::Table;
@@ -12,7 +12,7 @@ use crate::storage::Table;
 
 pub(crate) struct ProgramBuilder {
     instructions: Vec<Instr>,
-    funcs: Vec<*const ScalarFuncKind>,
+    funcs: Vec<*const ScalarFunc>,
     tables: Vec<*mut Table>,
     schemas: Vec<SchemaDescriptor>,
     agg_descs: Vec<AggDescriptor>,
@@ -44,7 +44,7 @@ impl ProgramBuilder {
 
     // ── Resource dedup (linear scan, small N) ────────────────────────────
 
-    fn func_idx(&mut self, ptr: *const ScalarFuncKind) -> u16 {
+    fn func_idx(&mut self, ptr: *const ScalarFunc) -> u16 {
         for (i, &f) in self.funcs.iter().enumerate() {
             if f == ptr {
                 return i as u16;
@@ -157,7 +157,7 @@ impl ProgramBuilder {
         self.instructions.push(Instr::SeekTrace { trace_reg, key_reg });
     }
 
-    pub fn add_filter(&mut self, in_reg: u16, out_reg: u16, func_ptr: *const ScalarFuncKind) {
+    pub fn add_filter(&mut self, in_reg: u16, out_reg: u16, func_ptr: *const ScalarFunc) {
         let func_idx = self.func_idx(func_ptr);
         self.instructions.push(Instr::Filter {
             in_reg,
@@ -171,7 +171,7 @@ impl ProgramBuilder {
         &mut self,
         in_reg: u16,
         out_reg: u16,
-        func_ptr: *const ScalarFuncKind,
+        func_ptr: *const ScalarFunc,
         out_schema: SchemaDescriptor,
         reindex_cols: &[u32],
         reindex_target_tcs: &[u8],
@@ -437,7 +437,7 @@ impl ProgramBuilder {
         self,
         reg_meta: Vec<RegisterMeta>,
         owned_tables: Vec<Box<Table>>,
-        owned_funcs: Vec<Box<ScalarFuncKind>>,
+        owned_funcs: Vec<Box<ScalarFunc>>,
         owned_expr_progs: Vec<Box<crate::expr::ExprProgram>>,
         owned_trace_regs: Vec<(u16, usize)>,
     ) -> Box<VmHandle> {

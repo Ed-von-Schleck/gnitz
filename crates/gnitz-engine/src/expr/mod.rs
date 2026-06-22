@@ -6,10 +6,10 @@ mod program;
 mod tests;
 
 // External (pub): appear in compiler.rs/vm.rs pub interfaces
-pub use plan::ScalarFuncKind;
+pub use plan::ScalarFunc;
 pub use program::ExprProgram;
 
-pub(crate) use plan::{FinalizeContext, Plan};
+pub(crate) use plan::FinalizeContext;
 pub(crate) use program::OutputColKind;
 
 // Opcode constants — consumed by hand-written test bytecode in vm.rs,

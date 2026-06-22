@@ -14,11 +14,11 @@ pub(super) fn create_expr_predicate(
     result_reg: u32,
     const_strings: Vec<Vec<u8>>,
     schema: &SchemaDescriptor,
-    owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
-) -> *const ScalarFuncKind {
+    owned_funcs: &mut Vec<Box<ScalarFunc>>,
+) -> *const ScalarFunc {
     let prog = ExprProgram::new(code, num_regs, result_reg, const_strings);
-    let func = Box::new(ScalarFuncKind::Plan(Plan::from_predicate(prog, schema)));
-    let ptr = &*func as *const ScalarFuncKind;
+    let func = Box::new(ScalarFunc::from_predicate(prog, schema));
+    let ptr = &*func as *const ScalarFunc;
     owned_funcs.push(func);
     ptr
 }
@@ -30,11 +30,11 @@ pub(super) fn create_expr_map(
     const_strings: Vec<Vec<u8>>,
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
-    owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
-) -> *const ScalarFuncKind {
+    owned_funcs: &mut Vec<Box<ScalarFunc>>,
+) -> *const ScalarFunc {
     let prog = ExprProgram::new(code, num_regs, 0, const_strings);
-    let func = Box::new(ScalarFuncKind::Plan(Plan::from_map(prog, in_schema, out_schema)));
-    let ptr = &*func as *const ScalarFuncKind;
+    let func = Box::new(ScalarFunc::from_map(prog, in_schema, out_schema));
+    let ptr = &*func as *const ScalarFunc;
     owned_funcs.push(func);
     ptr
 }
@@ -45,18 +45,16 @@ pub(super) fn create_universal_projection(
     src_types: &[u8],
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
-    owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
-) -> *const ScalarFuncKind {
+    owned_funcs: &mut Vec<Box<ScalarFunc>>,
+) -> *const ScalarFunc {
     let indices: Vec<u32> = src_indices.iter().map(|&i| i as u32).collect();
-    let func = Box::new(ScalarFuncKind::Plan(Plan::from_projection(
-        &indices, src_types, in_schema, out_schema,
-    )));
-    let ptr = &*func as *const ScalarFuncKind;
+    let func = Box::new(ScalarFunc::from_projection(&indices, src_types, in_schema, out_schema));
+    let ptr = &*func as *const ScalarFunc;
     owned_funcs.push(func);
     ptr
 }
 
-pub(super) fn null_func_ptr() -> *const ScalarFuncKind {
+pub(super) fn null_func_ptr() -> *const ScalarFunc {
     std::ptr::null()
 }
 
@@ -144,7 +142,7 @@ pub(super) fn emit_node(
     reg_meta: &mut Vec<RegisterMeta>,
     // Owned resources
     owned_tables: &mut Vec<Box<Table>>,
-    owned_funcs: &mut Vec<Box<ScalarFuncKind>>,
+    owned_funcs: &mut Vec<Box<ScalarFunc>>,
     owned_expr_progs: &mut Vec<Box<ExprProgram>>,
     owned_trace_regs: &mut Vec<(u16, usize)>,
     // External tables
@@ -1158,7 +1156,7 @@ pub(super) fn build_plan(
     }
 
     let mut owned_tables: Vec<Box<Table>> = Vec::new();
-    let mut owned_funcs: Vec<Box<ScalarFuncKind>> = Vec::new();
+    let mut owned_funcs: Vec<Box<ScalarFunc>> = Vec::new();
     let mut owned_expr_progs: Vec<Box<ExprProgram>> = pre_built_expr_progs;
     let mut owned_trace_regs: Vec<(u16, usize)> = Vec::new();
     let mut ext_trace_regs: Vec<(u16, i64)> = Vec::new();

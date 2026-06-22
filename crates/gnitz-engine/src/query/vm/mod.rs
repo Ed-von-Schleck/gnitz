@@ -1,6 +1,6 @@
 //! DBSP VM: executes compiled circuit programs entirely in Rust.
 
-use crate::expr::ScalarFuncKind;
+use crate::expr::ScalarFunc;
 use crate::ops::AggDescriptor;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, CursorHandle, Table};
@@ -205,7 +205,7 @@ pub(crate) struct VmHandle {
     /// Scalar functions created during compilation.
     /// `program.funcs` may point into these.  Dropped AFTER `program`.
     #[allow(dead_code)]
-    pub owned_funcs: Vec<Box<ScalarFuncKind>>,
+    pub owned_funcs: Vec<Box<ScalarFunc>>,
     /// Expression programs created during compilation.
     /// `program.expr_progs` may point into these.  Dropped AFTER `program`.
     #[allow(dead_code)]
@@ -317,7 +317,7 @@ pub(crate) struct Program {
     pub instructions: Vec<Instr>,
     pub reg_meta: Vec<RegisterMeta>,
     /// Shared resource arrays — referenced by index from instructions.
-    pub funcs: Vec<*const ScalarFuncKind>,
+    pub funcs: Vec<*const ScalarFunc>,
     pub tables: Vec<*mut Table>,
     pub schemas: Vec<SchemaDescriptor>,
     pub agg_descs: Vec<AggDescriptor>,
@@ -330,7 +330,7 @@ pub(crate) struct Program {
 }
 
 // SAFETY: Program is only accessed from a single thread (the worker thread
-// that owns the plan).  Raw pointers into ScalarFuncKind,
+// that owns the plan).  Raw pointers into ScalarFunc,
 // Table, and ExprProgram are stable for the lifetime of the plan.
 unsafe impl Send for Program {}
 
@@ -547,10 +547,8 @@ mod tests {
             1, // r2 = r0 > r1
         ];
         let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
-        let func = Box::new(ScalarFuncKind::Plan(crate::expr::Plan::from_predicate(
-            pred_prog, &schema,
-        )));
-        let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
+        let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema));
+        let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
         let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, func_ptr);
@@ -573,7 +571,7 @@ mod tests {
 
         // Cleanup
         unsafe {
-            drop(Box::from_raw(func_ptr as *mut ScalarFuncKind));
+            drop(Box::from_raw(func_ptr as *mut ScalarFunc));
         }
     }
 
@@ -1082,18 +1080,18 @@ mod tests {
 
     #[test]
     fn test_map_operator() {
-        // MAP with Plan projection: reorder/select columns.
+        // MAP with ScalarFunc projection: reorder/select columns.
         let in_schema = make_schema(&[type_code::I64, type_code::I64]);
         let out_schema = make_schema(&[type_code::I64]);
 
-        // MAP with Plan projection: reorder/select columns.
-        let func = Box::new(ScalarFuncKind::Plan(crate::expr::Plan::from_projection(
+        // MAP with ScalarFunc projection: reorder/select columns.
+        let func = Box::new(crate::expr::ScalarFunc::from_projection(
             &[2],
             &[type_code::I64],
             &in_schema,
             &out_schema,
-        )));
-        let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
+        ));
+        let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
         let mut builder = ProgramBuilder::new();
         builder.add_map(0, 1, func_ptr, out_schema, &[], &[], false, 0);
@@ -1115,7 +1113,7 @@ mod tests {
         assert_eq!(rows[1].2, 200);
 
         unsafe {
-            drop(Box::from_raw(func_ptr as *mut ScalarFuncKind));
+            drop(Box::from_raw(func_ptr as *mut ScalarFunc));
         }
     }
 
@@ -1861,10 +1859,8 @@ mod tests {
             1,
         ];
         let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
-        let func = Box::new(ScalarFuncKind::Plan(crate::expr::Plan::from_predicate(
-            pred_prog, &schema,
-        )));
-        let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
+        let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema));
+        let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
         let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, func_ptr);
@@ -1887,7 +1883,7 @@ mod tests {
         }
 
         unsafe {
-            drop(Box::from_raw(func_ptr as *mut ScalarFuncKind));
+            drop(Box::from_raw(func_ptr as *mut ScalarFunc));
         }
     }
 
@@ -2011,8 +2007,8 @@ mod tests {
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
 
-        let func = Box::new(ScalarFuncKind::Plan(crate::expr::Plan::from_predicate(prog, &schema)));
-        let func_ptr = Box::into_raw(func) as *const ScalarFuncKind;
+        let func = Box::new(crate::expr::ScalarFunc::from_predicate(prog, &schema));
+        let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
         let mut builder = ProgramBuilder::new();
         builder.add_filter(0, 1, func_ptr);
@@ -2043,7 +2039,7 @@ mod tests {
         assert_eq!(rows[2].0, 5); // pk=5, val=50
 
         unsafe {
-            drop(Box::from_raw(func_ptr as *mut ScalarFuncKind));
+            drop(Box::from_raw(func_ptr as *mut ScalarFunc));
         }
     }
 

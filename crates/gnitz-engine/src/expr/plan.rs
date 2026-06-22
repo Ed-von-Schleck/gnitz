@@ -1,9 +1,9 @@
 //! Scalar function types for DBSP filter and map operators.
 //!
-//! A `Plan` cleanly separates columnar operations (column moves, null
-//! permutation) from per-row operations (expression interpreter).
-//! `ScalarFuncKind` wraps Plan behind a single enum so that the VM
-//! passes one opaque handle for any function type.
+//! `ScalarFunc` cleanly separates columnar operations (column moves, null
+//! permutation) from per-row operations (the expression interpreter). The VM
+//! passes one opaque `*const ScalarFunc` handle for any filter / map /
+//! projection.
 
 use std::cell::RefCell;
 
@@ -13,45 +13,6 @@ use crate::schema::{SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{Batch, MemBatch};
 
 // ---------------------------------------------------------------------------
-// ScalarFuncKind enum
-// ---------------------------------------------------------------------------
-
-#[allow(private_interfaces)]
-pub enum ScalarFuncKind {
-    Plan(Plan),
-}
-
-impl ScalarFuncKind {
-    pub fn kind_name(&self) -> &'static str {
-        let ScalarFuncKind::Plan(_) = self;
-        "plan"
-    }
-
-    /// Filter predicate: returns true if row passes. Test-only helper used by
-    /// the batch evaluator's regression tests at m=1; the production path
-    /// always goes through `run_filter`.
-    #[cfg(test)]
-    pub(crate) fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
-        let ScalarFuncKind::Plan(p) = self;
-        p.evaluate_predicate(batch, row)
-    }
-
-    /// Run the filter over all `n` rows, invoking `append_range(start, end)`
-    /// for each contiguous run of passing rows. The closure must not touch
-    /// the `Plan` (a `RefCell` borrow on `scratch` is held while it runs).
-    pub fn run_filter<F: FnMut(usize, usize)>(&self, mb: &MemBatch, n: usize, append_range: F) {
-        let ScalarFuncKind::Plan(p) = self;
-        p.run_filter(mb, n, append_range);
-    }
-
-    /// Batch-level map: populate output batch from input batch.
-    pub fn evaluate_map_batch(&self, in_batch: &Batch, out_schema: &SchemaDescriptor) -> Batch {
-        let ScalarFuncKind::Plan(p) = self;
-        p.execute_map(in_batch, out_schema)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -59,7 +20,7 @@ impl ScalarFuncKind {
 /// resolved payload byte: `SENTINEL` indicates the PK column, otherwise it is
 /// the dense payload index in the input batch. `cm.stride` is precomputed at
 /// construction time — the byte width of the destination column. `blob_cache` is
-/// shared across all ColMoves of one `execute_map` (and pooled across ticks via
+/// shared across all ColMoves of one `evaluate_map_batch` (and pooled across ticks via
 /// `BlobCacheGuard`) so identical STRING/BLOB heap spans are appended to the
 /// output blob at most once. It is `None` only when the output schema has no
 /// German-string column, in which case the STRING/BLOB branch is never reached.
@@ -126,6 +87,7 @@ fn copy_column(
 // NullPerm — columnar null bitmap permutation
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct NullPerm {
     pairs: Vec<(u8, u8)>,
     /// Bitmask of always-null payload positions (from EMIT_NULL).
@@ -180,7 +142,7 @@ impl NullPerm {
 }
 
 // ---------------------------------------------------------------------------
-// Plan — unified representation for filter and map operations
+// ScalarFunc — unified representation for filter and map operations
 // ---------------------------------------------------------------------------
 
 struct ColMove {
@@ -203,48 +165,28 @@ struct ColMove {
     pk_byte_offset: u8,
 }
 
-enum FilterKernel {
-    PassAll,
-    Interpreted {
-        prog: ExprProgram,
-        /// Precomputed `prog.is_strictly_non_nullable(in_schema)`.
-        no_nulls: bool,
-    },
+struct InterpretedFilter {
+    prog: ExprProgram,
+    /// Precomputed `prog.is_strictly_non_nullable(in_schema)`.
+    no_nulls: bool,
 }
 
-#[allow(clippy::large_enum_variant)]
-enum ComputeKernel {
-    None,
-    Interpreted {
-        prog: ExprProgram,
-        emit_payloads: Vec<usize>,
-        emit_regs: Vec<usize>,
-        /// Output byte width per EMIT target, parallel to `emit_payloads`.
-        emit_strides: Vec<u8>,
-        /// Precomputed `prog.is_strictly_non_nullable(in_schema)`.
-        no_nulls: bool,
-    },
+struct InterpretedCompute {
+    prog: ExprProgram,
+    emit_payloads: Vec<usize>,
+    emit_regs: Vec<usize>,
+    /// Output byte width per EMIT target, parallel to `emit_payloads`.
+    emit_strides: Vec<u8>,
+    /// Precomputed `prog.is_strictly_non_nullable(in_schema)`.
+    no_nulls: bool,
 }
 
-pub(crate) struct Plan {
-    filter: FilterKernel,
+pub struct ScalarFunc {
+    filter: Option<InterpretedFilter>,
     col_moves: Vec<ColMove>,
     null_perm: NullPerm,
-    compute: ComputeKernel,
+    compute: Option<InterpretedCompute>,
     scratch: RefCell<EvalScratch>,
-}
-
-fn filter_only(filter: FilterKernel) -> Plan {
-    Plan {
-        filter,
-        col_moves: Vec::new(),
-        null_perm: NullPerm {
-            pairs: Vec::new(),
-            constant: 0,
-        },
-        compute: ComputeKernel::None,
-        scratch: RefCell::new(EvalScratch::new()),
-    }
 }
 
 /// Stride for a single ColMove. For non-PK copies (`src_pi != SENTINEL`),
@@ -265,13 +207,19 @@ fn col_move_stride(src_pi: u8, dst_payload: usize, in_schema: &SchemaDescriptor,
     }
 }
 
-impl Plan {
+impl ScalarFunc {
     /// Filter via interpreted expression.
     pub fn from_predicate(mut prog: ExprProgram, schema: &SchemaDescriptor) -> Self {
         prog.resolve_column_indices(schema);
         prog.classify(true);
         let no_nulls = prog.is_strictly_non_nullable(schema);
-        filter_only(FilterKernel::Interpreted { prog, no_nulls })
+        ScalarFunc {
+            filter: Some(InterpretedFilter { prog, no_nulls }),
+            col_moves: Vec::new(),
+            null_perm: NullPerm::default(),
+            compute: None,
+            scratch: RefCell::new(EvalScratch::new()),
+        }
     }
 
     /// Projection plan from source indices.
@@ -306,11 +254,11 @@ impl Plan {
             })
             .collect();
         let null_perm = NullPerm::from_projection(&src_pi_bytes);
-        Plan {
-            filter: FilterKernel::PassAll,
+        ScalarFunc {
+            filter: None,
             col_moves,
             null_perm,
-            compute: ComputeKernel::None,
+            compute: None,
             scratch: RefCell::new(EvalScratch::new()),
         }
     }
@@ -386,19 +334,19 @@ impl Plan {
             debug_assert_eq!(emit_strides.len(), emit_regs.len());
             debug_assert_eq!(emit_strides.len(), emit_payloads.len());
             let no_nulls = prog.is_strictly_non_nullable(in_schema);
-            ComputeKernel::Interpreted {
+            Some(InterpretedCompute {
                 prog,
                 emit_payloads,
                 emit_regs,
                 emit_strides,
                 no_nulls,
-            }
+            })
         } else {
-            ComputeKernel::None
+            None
         };
 
-        Plan {
-            filter: FilterKernel::PassAll,
+        ScalarFunc {
+            filter: None,
             col_moves,
             null_perm,
             compute,
@@ -412,7 +360,7 @@ impl Plan {
     /// since the unpack to `regs` is skipped in that case).
     #[cfg(test)]
     pub(crate) fn evaluate_predicate(&self, batch: &MemBatch, row: usize) -> bool {
-        let FilterKernel::Interpreted { prog, no_nulls } = &self.filter else {
+        let Some(InterpretedFilter { prog, no_nulls }) = &self.filter else {
             return true;
         };
         let mut scratch = self.scratch.borrow_mut();
@@ -434,11 +382,11 @@ impl Plan {
     }
 
     /// Run the filter over all `n` rows of `mb`, invoking `append_range` for
-    /// each maximal contiguous run of passing rows. PassAll passes the whole
-    /// range in one call. The bitmap stays inside `scratch` — no per-call
-    /// `Vec<u64>` allocation.
+    /// each maximal contiguous run of passing rows. The no-filter case passes
+    /// the whole range in one call. The bitmap stays inside `scratch` — no
+    /// per-call `Vec<u64>` allocation.
     pub fn run_filter<F: FnMut(usize, usize)>(&self, mb: &MemBatch, n: usize, mut append_range: F) {
-        let FilterKernel::Interpreted { prog, no_nulls } = &self.filter else {
+        let Some(InterpretedFilter { prog, no_nulls }) = &self.filter else {
             if n > 0 {
                 append_range(0, n);
             }
@@ -515,8 +463,8 @@ impl Plan {
     /// Execute map: system column clone → col_moves → NullPerm → compute.
     /// `out_schema` is still required here because constructing the output
     /// batch (`Batch::with_schema`) needs the full schema. All per-column
-    /// stride information is baked into the Plan.
-    pub fn execute_map(&self, in_batch: &Batch, out_schema: &SchemaDescriptor) -> Batch {
+    /// stride information is baked into the `ScalarFunc`.
+    pub fn evaluate_map_batch(&self, in_batch: &Batch, out_schema: &SchemaDescriptor) -> Batch {
         let n = in_batch.count;
         if n == 0 {
             return Batch::empty_with_schema(out_schema);
@@ -557,13 +505,13 @@ impl Plan {
         }
 
         // Compute kernel
-        if let ComputeKernel::Interpreted {
+        if let Some(InterpretedCompute {
             prog,
             emit_payloads,
             emit_regs,
             emit_strides,
             no_nulls,
-        } = &self.compute
+        }) = &self.compute
         {
             let no_nulls = *no_nulls;
             let num_regs = prog.num_regs as usize;

@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 
-use crate::expr::ScalarFuncKind;
+use crate::expr::ScalarFunc;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{with_payload_cmp, Batch, ConsolidatedBatch, MemBatch};
 
@@ -18,7 +18,7 @@ use super::reindex::{reindex_hash_row, ReindexPacker};
 
 /// Filter: retain rows where predicate returns true.
 /// Uses contiguous-range bulk copy for efficiency.
-pub fn op_filter(batch: &Batch, func: &ScalarFuncKind, schema: &SchemaDescriptor) -> Batch {
+pub fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) -> Batch {
     let n = batch.count;
     if n == 0 {
         return Batch::empty_with_schema(schema);
@@ -58,7 +58,7 @@ pub fn op_filter(batch: &Batch, func: &ScalarFuncKind, schema: &SchemaDescriptor
         output.consolidated = false;
     }
 
-    gnitz_debug!("op_filter: in={} out={} func={}", n, output.count, func.kind_name());
+    gnitz_debug!("op_filter: in={} out={}", n, output.count);
     output
 }
 
@@ -75,7 +75,7 @@ pub fn op_filter(batch: &Batch, func: &ScalarFuncKind, schema: &SchemaDescriptor
 #[allow(clippy::too_many_arguments)]
 pub fn op_map(
     batch: &Batch,
-    func: &ScalarFuncKind,
+    func: &ScalarFunc,
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
     reindex_cols: &[u32],
@@ -104,12 +104,7 @@ pub fn op_map(
         reindex_hash_row(out_schema, &mut output, branch_id);
         output.sorted = false;
         output.consolidated = false;
-        gnitz_debug!(
-            "op_map: in={} out={} reindex=HASH func={}",
-            batch.count,
-            output.count,
-            func.kind_name()
-        );
+        gnitz_debug!("op_map: in={} out={} reindex=HASH", batch.count, output.count);
         return output;
     }
 
@@ -121,12 +116,7 @@ pub fn op_map(
             "MAP output row count must equal input row count",
         );
         result.sorted = batch.sorted;
-        gnitz_debug!(
-            "op_map: in={} out={} reindex=none func={}",
-            batch.count,
-            result.count,
-            func.kind_name()
-        );
+        gnitz_debug!("op_map: in={} out={} reindex=none", batch.count, result.count);
         return result;
     }
 
@@ -150,11 +140,10 @@ pub fn op_map(
     output.sorted = false;
     output.consolidated = false;
     gnitz_debug!(
-        "op_map: in={} out={} reindex={}cols func={}",
+        "op_map: in={} out={} reindex={}cols",
         batch.count,
         output.count,
-        reindex_cols.len(),
-        func.kind_name()
+        reindex_cols.len()
     );
     output
 }
@@ -620,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_op_filter_basic() {
-        use crate::expr::{ExprProgram, Plan};
+        use crate::expr::ExprProgram;
 
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 5), (2, 1, 15), (3, 1, 25)]);
@@ -631,7 +620,7 @@ mod tests {
             17, 2, 0, 1, // CMP_GT r2 = (r0 > r1)
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, &schema));
+        let func = ScalarFunc::from_predicate(prog, &schema);
 
         let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2, "only pk=2 and pk=3 pass val>10");
@@ -641,14 +630,14 @@ mod tests {
 
     #[test]
     fn test_op_filter_consolidated_flag() {
-        use crate::expr::{ExprProgram, Plan};
+        use crate::expr::ExprProgram;
 
         let code = vec![
             3i64, 0, 1, 0, // LOAD_CONST r0 = 1 (always true)
         ];
         let prog = ExprProgram::new(code, 1, 0, vec![]);
         let schema = make_schema_u64_i64();
-        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, &schema));
+        let func = ScalarFunc::from_predicate(prog, &schema);
 
         let mut batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
         batch.consolidated = true;
@@ -682,11 +671,10 @@ mod tests {
 
     #[test]
     fn test_op_map_empty_batch() {
-        use crate::expr::Plan;
         let schema = make_schema_u64_i64();
         let empty_batch = Batch::empty(1, 16);
 
-        let func = ScalarFuncKind::Plan(Plan::from_projection(&[1], &[type_code::I64], &schema, &schema));
+        let func = ScalarFunc::from_projection(&[1], &[type_code::I64], &schema, &schema);
         let out = op_map(&empty_batch, &func, &schema, &schema, &[], &[], false, 0);
         assert_eq!(out.count, 0);
     }
@@ -887,11 +875,11 @@ mod tests {
     // Stride consistency on early-exit empty batches (item 3)
     // -----------------------------------------------------------------------
 
-    fn always_true_func(schema: &SchemaDescriptor) -> ScalarFuncKind {
-        use crate::expr::{ExprProgram, Plan};
+    fn always_true_func(schema: &SchemaDescriptor) -> ScalarFunc {
+        use crate::expr::ExprProgram;
         let code = vec![3i64, 0, 1, 0]; // LOAD_CONST r0 = 1
         let prog = ExprProgram::new(code, 1, 0, vec![]);
-        ScalarFuncKind::Plan(Plan::from_predicate(prog, schema))
+        ScalarFunc::from_predicate(prog, schema)
     }
 
     #[test]
@@ -998,7 +986,6 @@ mod tests {
         // output PK matches the source column value, (2) the resulting
         // batch is correctly marked unsorted/unconsolidated (sort order on
         // the new PK is not preserved by the row-by-row promote).
-        use crate::expr::Plan;
 
         // Input: PK u64, payload i64. Reindex on the payload (col 1) — the
         // new output PK is each row's payload value.
@@ -1006,7 +993,7 @@ mod tests {
         let batch = make_batch(&schema, &[(1, 1, 200), (2, 1, 100), (3, 1, 300)]);
 
         // Projection plan: output keeps the same single payload column.
-        let func = ScalarFuncKind::Plan(Plan::from_projection(&[1], &[type_code::I64], &schema, &schema));
+        let func = ScalarFunc::from_projection(&[1], &[type_code::I64], &schema, &schema);
 
         let out = op_map(
             &batch,
@@ -1045,7 +1032,7 @@ mod tests {
     /// must keep exactly the rows whose payload exceeds 10, in input PK order.
     #[test]
     fn test_filter_batch_matches_per_row() {
-        use crate::expr::{self, ExprProgram, Plan, ScalarFuncKind};
+        use crate::expr::{self, ExprProgram, ScalarFunc};
 
         let schema = make_schema_u64_i64();
         // (pk, weight, payload); a row passes iff payload > 10.
@@ -1091,7 +1078,7 @@ mod tests {
             1,
         ];
         let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let func = ScalarFuncKind::Plan(Plan::from_predicate(prog, &schema));
+        let func = ScalarFunc::from_predicate(prog, &schema);
 
         let out = op_filter(&batch, &func, &schema);
         // pk=2(15), 3(25), 5(20), 7(30), 9(11), 11(50), 13(12), 15(100), 18(13), 20(22)

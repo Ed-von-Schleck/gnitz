@@ -45,7 +45,7 @@ pub struct ExprProgram {
     pub(in crate::expr) payload_col_info: Vec<(u8, u8)>,
     /// True once `resolve_column_indices` has rewritten every column-bearing
     /// opcode's operand byte into payload-index-or-SENTINEL form. Eval entry
-    /// points debug-assert this; a Plan-bypass caller that forgets to resolve
+    /// points debug-assert this; a `ScalarFunc`-bypass caller that forgets to resolve
     /// gets a clear assertion rather than silent miscompute.
     pub(in crate::expr) resolved: bool,
     /// Bit `r` set iff register `r` is only consumed by boolean ops, so
@@ -326,7 +326,7 @@ impl ExprProgram {
     /// Idempotent: a second call is a no-op (gated by `self.resolved`).
     /// Must be called once per program, before the first call to
     /// `eval_predicate` / `eval_with_emit` / `eval_batch`. Called
-    /// automatically by `Plan::from_predicate` and `Plan::from_map`.
+    /// automatically by `ScalarFunc::from_predicate` and `ScalarFunc::from_map`.
     pub fn resolve_column_indices(&mut self, schema: &SchemaDescriptor) {
         if self.resolved {
             return;
@@ -446,7 +446,7 @@ impl ExprProgram {
         // nullable arms require `bool_input_mask` to be populated by the
         // producers of their source registers, so classification is mandatory
         // for any program that may execute on the nullable path.
-        // `Plan::from_predicate` overrides with `is_filter = true` to keep
+        // `ScalarFunc::from_predicate` overrides with `is_filter = true` to keep
         // `result_reg` eligible for bit_only.
         self.classify(false);
     }

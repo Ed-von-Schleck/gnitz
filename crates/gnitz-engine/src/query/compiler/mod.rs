@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::expr::{ExprProgram, Plan, ScalarFuncKind};
+use crate::expr::{ExprProgram, ScalarFunc};
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{AggDescriptor, AggOp};
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};

@@ -39,7 +39,7 @@ pub(in crate::expr) struct EvalScratch {
     /// consumers on the nullable arm without per-row repack from `regs`.
     /// Empty (capacity 0) when `no_nulls` is true.
     pub(in crate::expr) bool_bits: Vec<u64>,
-    /// Per-row filter bitmask; set by filter_batch, ignored by execute_map.
+    /// Per-row filter bitmask; set by run_filter, ignored by evaluate_map_batch.
     pub(in crate::expr) filter_bits: Vec<u64>,
     pub(in crate::expr) no_nulls: bool,
 }

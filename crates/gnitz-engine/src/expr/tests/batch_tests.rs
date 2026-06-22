@@ -153,7 +153,7 @@ fn test_eval_batch_matches_eval_predicate() {
 /// per-row interpreter row-for-row on mixed null/non-null inputs.
 #[test]
 fn test_str_col_eq_const_nullable_column_matches_per_row() {
-    use crate::expr::{Plan, ScalarFuncKind, EXPR_STR_COL_EQ_CONST};
+    use crate::expr::{ScalarFunc, EXPR_STR_COL_EQ_CONST};
 
     // Schema: pk(U64) + nullable STRING.
     let schema = SchemaDescriptor::new(
@@ -187,8 +187,7 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
     // Predicate: col1 = 'foo'. result_reg = 0.
     let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
     let prog = ExprProgram::new(code, 1, 0, vec![b"foo".to_vec()]);
-    let plan = Plan::from_predicate(prog, &schema);
-    let kind = ScalarFuncKind::Plan(plan);
+    let kind = ScalarFunc::from_predicate(prog, &schema);
 
     // Drive the (multi-morsel) batch path through run_filter and compare to
     // the m=1 wrapper.
@@ -213,7 +212,7 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
 // These pin the points where the m=1 path through eval_batch could most
 // plausibly diverge from the historical per-row interpreter. They each set up
 // a one-row input and assert against a manually computed expected value via
-// the single-path `Plan::evaluate_predicate` wrapper or a direct eval_batch.
+// the single-path `ScalarFunc::evaluate_predicate` wrapper or a direct eval_batch.
 // ---------------------------------------------------------------------------
 
 /// Build a 1-row batch with one nullable I64 column. `null` toggles the
@@ -241,7 +240,7 @@ fn schema_pk_int_nullable() -> SchemaDescriptor {
 
 #[test]
 fn golden_load_payload_null_row() {
-    use crate::expr::{Plan, ScalarFuncKind};
+    use crate::expr::ScalarFunc;
     let schema = schema_pk_int_nullable();
     let batch = make_int_row(&schema, 42, true);
     let mb = batch.as_mem_batch();
@@ -262,7 +261,7 @@ fn golden_load_payload_null_row() {
         1,
     ];
     let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let kind = ScalarFuncKind::Plan(Plan::from_predicate(prog, &schema));
+    let kind = ScalarFunc::from_predicate(prog, &schema);
     assert!(!kind.evaluate_predicate(&mb, 0));
 }
 
@@ -493,7 +492,7 @@ fn golden_bool_not_null_source_single_row() {
 
 #[test]
 fn golden_str_col_eq_const_null_row() {
-    use crate::expr::{Plan, ScalarFuncKind, EXPR_STR_COL_EQ_CONST};
+    use crate::expr::{ScalarFunc, EXPR_STR_COL_EQ_CONST};
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -514,7 +513,7 @@ fn golden_str_col_eq_const_null_row() {
 
     let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
     let prog = ExprProgram::new(code, 1, 0, vec![b"foo".to_vec()]);
-    let kind = ScalarFuncKind::Plan(Plan::from_predicate(prog, &schema));
+    let kind = ScalarFunc::from_predicate(prog, &schema);
     assert!(
         !kind.evaluate_predicate(&mb, 0),
         "STR_COL_EQ_CONST on NULL row must not pass",
@@ -523,39 +522,27 @@ fn golden_str_col_eq_const_null_row() {
 
 #[test]
 fn golden_is_null_and_is_not_null_single_row() {
-    use crate::expr::{Plan, ScalarFuncKind};
+    use crate::expr::ScalarFunc;
     let schema = schema_pk_int_nullable();
 
     // Null row: IS NULL → true, IS NOT NULL → false.
     let batch = make_int_row(&schema, 0, true);
     let mb = batch.as_mem_batch();
     let code_is_null = vec![crate::expr::EXPR_IS_NULL, 0, 1, 0];
-    let kind = ScalarFuncKind::Plan(Plan::from_predicate(
-        ExprProgram::new(code_is_null, 1, 0, vec![]),
-        &schema,
-    ));
+    let kind = ScalarFunc::from_predicate(ExprProgram::new(code_is_null, 1, 0, vec![]), &schema);
     assert!(kind.evaluate_predicate(&mb, 0));
     let code_is_not_null = vec![crate::expr::EXPR_IS_NOT_NULL, 0, 1, 0];
-    let kind = ScalarFuncKind::Plan(Plan::from_predicate(
-        ExprProgram::new(code_is_not_null, 1, 0, vec![]),
-        &schema,
-    ));
+    let kind = ScalarFunc::from_predicate(ExprProgram::new(code_is_not_null, 1, 0, vec![]), &schema);
     assert!(!kind.evaluate_predicate(&mb, 0));
 
     // Non-null row: opposite.
     let batch = make_int_row(&schema, 7, false);
     let mb = batch.as_mem_batch();
     let code_is_null = vec![crate::expr::EXPR_IS_NULL, 0, 1, 0];
-    let kind = ScalarFuncKind::Plan(Plan::from_predicate(
-        ExprProgram::new(code_is_null, 1, 0, vec![]),
-        &schema,
-    ));
+    let kind = ScalarFunc::from_predicate(ExprProgram::new(code_is_null, 1, 0, vec![]), &schema);
     assert!(!kind.evaluate_predicate(&mb, 0));
     let code_is_not_null = vec![crate::expr::EXPR_IS_NOT_NULL, 0, 1, 0];
-    let kind = ScalarFuncKind::Plan(Plan::from_predicate(
-        ExprProgram::new(code_is_not_null, 1, 0, vec![]),
-        &schema,
-    ));
+    let kind = ScalarFunc::from_predicate(ExprProgram::new(code_is_not_null, 1, 0, vec![]), &schema);
     assert!(kind.evaluate_predicate(&mb, 0));
 }
 
@@ -618,7 +605,7 @@ fn ref_and(a: Option<bool>, b: Option<bool>) -> (bool, bool) {
 /// reference computed from the column values.
 #[test]
 fn bit_only_three_and_chain_boundary_sweep() {
-    use crate::expr::{Plan, ScalarFuncKind, EXPR_BOOL_AND, EXPR_CMP_GT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
+    use crate::expr::{ScalarFunc, EXPR_BOOL_AND, EXPR_CMP_GT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
 
     let schema = schema_pk_three_ints_nullable();
 
@@ -679,8 +666,7 @@ fn bit_only_three_and_chain_boundary_sweep() {
         );
         let mb = batch.as_mem_batch();
 
-        let plan = Plan::from_predicate(ExprProgram::new(code.clone(), 9, 8, vec![]), &schema);
-        let kind = ScalarFuncKind::Plan(plan);
+        let kind = ScalarFunc::from_predicate(ExprProgram::new(code.clone(), 9, 8, vec![]), &schema);
 
         let mut passed = vec![false; n];
         kind.run_filter(&mb, n, |s, e| {
@@ -715,7 +701,7 @@ fn bit_only_three_and_chain_boundary_sweep() {
 /// reads `bool_bits[result_reg]` and must honor 3VL (NOT NULL = NULL = fail).
 #[test]
 fn bit_only_not_3vl_truth_table() {
-    use crate::expr::{Plan, ScalarFuncKind, EXPR_BOOL_NOT, EXPR_CMP_NE, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
+    use crate::expr::{ScalarFunc, EXPR_BOOL_NOT, EXPR_CMP_NE, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
 
     let schema = schema_pk_int_nullable();
 
@@ -745,8 +731,7 @@ fn bit_only_not_3vl_truth_table() {
             2,
             0, // r3 = NOT r2
         ];
-        let plan = Plan::from_predicate(ExprProgram::new(code, 4, 3, vec![]), &schema);
-        let kind = ScalarFuncKind::Plan(plan);
+        let kind = ScalarFunc::from_predicate(ExprProgram::new(code, 4, 3, vec![]), &schema);
         let mut passed = false;
         kind.run_filter(&mb, 1, |_, _| {
             passed = true;
@@ -884,12 +869,11 @@ fn classifier_pure_conjunction_filter() {
 /// must therefore fall back to the per-row scan over `regs`.
 #[test]
 fn classifier_filter_result_reg_non_bool_falls_back() {
-    use crate::expr::{Plan, ScalarFuncKind, EXPR_LOAD_COL_INT};
+    use crate::expr::{ScalarFunc, EXPR_LOAD_COL_INT};
     let schema = schema_pk_int_nullable();
     // Predicate: WHERE col1 (treat int as truthy).
     let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0];
-    let plan = Plan::from_predicate(ExprProgram::new(code, 1, 0, vec![]), &schema);
-    let kind = ScalarFuncKind::Plan(plan);
+    let kind = ScalarFunc::from_predicate(ExprProgram::new(code, 1, 0, vec![]), &schema);
 
     // Build 4 rows: non-null 1, non-null 0, null, non-null -5.
     let mut b = Batch::with_schema(schema, 4);
@@ -920,7 +904,7 @@ fn classifier_filter_result_reg_non_bool_falls_back() {
 /// row, matching the historical 3VL behavior.
 #[test]
 fn bit_only_all_null_word_and() {
-    use crate::expr::{Plan, ScalarFuncKind, EXPR_BOOL_AND, EXPR_CMP_NE, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
+    use crate::expr::{ScalarFunc, EXPR_BOOL_AND, EXPR_CMP_NE, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
     let schema = schema_pk_two_ints_nullable();
 
     let n = 64;
@@ -961,8 +945,7 @@ fn bit_only_all_null_word_and() {
         2,
         4,
     ];
-    let plan = Plan::from_predicate(ExprProgram::new(code, 6, 5, vec![]), &schema);
-    let kind = ScalarFuncKind::Plan(plan);
+    let kind = ScalarFunc::from_predicate(ExprProgram::new(code, 6, 5, vec![]), &schema);
 
     let mut passed = vec![false; n];
     kind.run_filter(&mb, n, |s, e| {
@@ -977,7 +960,7 @@ fn bit_only_all_null_word_and() {
 /// bits become false-positive passing rows.
 #[test]
 fn bit_only_is_not_null_tail_mask() {
-    use crate::expr::{Plan, ScalarFuncKind, EXPR_BOOL_AND, EXPR_IS_NOT_NULL};
+    use crate::expr::{ScalarFunc, EXPR_BOOL_AND, EXPR_IS_NOT_NULL};
 
     let schema = schema_pk_two_ints_nullable();
     // 65 rows — straddles the 64-bit word boundary so tail handling matters.
@@ -1016,8 +999,7 @@ fn bit_only_is_not_null_tail_mask() {
         0,
         1,
     ];
-    let plan = Plan::from_predicate(ExprProgram::new(code, 3, 2, vec![]), &schema);
-    let kind = ScalarFuncKind::Plan(plan);
+    let kind = ScalarFunc::from_predicate(ExprProgram::new(code, 3, 2, vec![]), &schema);
 
     let mut passed = vec![false; n];
     kind.run_filter(&mb, n, |s, e| {
