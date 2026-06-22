@@ -25,6 +25,38 @@ Each item below is an independent, unimplemented future change.
 - **Monolithic physical-plan serialization in the Views catalog** — separate
   architectural project.
 
+## 1a. Shelved — pure-range order-preserving exchange (WONTDO)
+
+Replacing the pure-range INNER join's **broadcast** input relay with an
+order-preserving range exchange — range-partition both sides' traces by `W-1` shared
+OPK split keys and route each delta row only to the contiguous worker interval its
+predicate can match — was evaluated and **will not be built**. It optimizes only
+*input movement* and probe fan-out; the dominant cost, producing the half-space match
+output, is already W-way distributed by the pair-PK output exchange and stays
+untouched.
+
+Measured by a routing simulation over the real OPK comparator and hash router:
+
+- **Input-movement saving is capped at ~2× (`2W/(W+1)`)**, the same across every data
+  regime — the symmetric two-term incremental join always pairs ΔA's shrinking suffix
+  with ΔB's complementary growing prefix, so it never approaches the `W×` a one-sided
+  route would imply.
+- For the common **broad** range predicate the match output dwarfs input movement
+  (~600×: ≈20M matches vs ≈32K input rows for `a.x < b.y` over uniform data), so even
+  the 2× is a **sub-1% end-to-end** effect.
+- The bottleneck worker improves **only on balanced data**. Under skew, a narrow live
+  band, or drift, a static range partition concentrates both trace and output onto one
+  worker — **1.3×–W× worse per worker than today's even hash spread** (vs hash, which
+  stays at imbalance ≈1.0). An append-mostly key (timestamp / sequence), the most
+  common range-join workload, is the worst case: it drifts to single-worker.
+
+Making the bounds track the live distribution (an online quantile reseal plus a
+cross-worker trace shuffle) only restores *balance* — back to parity with the
+broadcast path — without changing that sub-1%-of-cost ceiling, so it does not rescue
+the verdict. If range-join performance is ever a measured bottleneck the target is the
+output exchange (already distributed) or general skew rebalancing, not static
+range-partitioning of the join input.
+
 ## 2. By-design boundaries (not future work)
 
 - **Equi-joins do not use secondary indexes.** `map_reindex` repartitions both
