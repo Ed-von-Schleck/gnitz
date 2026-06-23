@@ -724,7 +724,7 @@ fn reduce_trace_seek_wide_pk() {
         ],
         &[0, 1, 2],
     );
-    assert!(in_schema.pk_is_wide(), "test invariant: stride 24 is wide");
+    assert!(in_schema.pk_stride() > 16, "test invariant: stride 24 is wide");
 
     let pk = |a: u64, b: u64, c: u64| opk_pk(&in_schema, &[a as u128, b as u128, c as u128]);
 
@@ -843,7 +843,7 @@ fn reduce_trace_seek_compound_pk() {
         &[0, 1],
     );
     assert!(in_schema.pk_indices().len() > 1, "test invariant: compound PK");
-    assert!(!in_schema.pk_is_wide(), "test invariant: stride 16 is narrow");
+    assert!(in_schema.pk_stride() <= 16, "test invariant: stride 16 is narrow");
 
     let pk = |a: u64, b: u64| opk_pk(&in_schema, &[a as u128, b as u128]);
     let agg = AggDescriptor {
@@ -1984,7 +1984,7 @@ fn test_reduce_gi_wide_source_pk_stride24() {
         ],
         &[0, 1, 2],
     );
-    assert!(in_schema.pk_is_wide(), "source PK must be wide (stride 24)");
+    assert!(in_schema.pk_stride() > 16, "source PK must be wide (stride 24)");
     let out_schema = gi_synthetic_out_schema();
     let gi_schema = crate::ops::index::make_gi_schema(&in_schema);
     assert_eq!(gi_schema.pk_stride(), 32, "GI key = gc(8) + 24-byte source PK");

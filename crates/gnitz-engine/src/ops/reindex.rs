@@ -1030,7 +1030,7 @@ mod tests {
             ],
             &[0, 1, 2],
         );
-        assert!(out_schema.pk_is_wide(), "test invariant: 24-byte key is wide");
+        assert!(out_schema.pk_stride() > 16, "test invariant: 24-byte key is wide");
 
         // PATH 1 — trace store: promote_into stamps the `_join_pk`; read it back.
         let mut out = make_zeroed_batch(&out_schema, 1);

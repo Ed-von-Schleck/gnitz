@@ -480,7 +480,6 @@ mod tests {
         ] {
             assert_eq!(schema.pk_indices(), &[0, 1], "circuit/dep PK must be (col0, col1)");
             assert_eq!(schema.pk_stride(), 16, "two U64 PK columns pack to 16 bytes");
-            assert!(!schema.pk_is_wide(), "stride 16 must stay narrow");
         }
     }
 

@@ -213,16 +213,6 @@ async fn merge_index_scan(
     Ok(acc)
 }
 
-/// Convert a narrow-PK `get_pk` (OPK-widened) value to its byte-form `PkBuf`.
-/// `pk`'s OPK bytes at rest are the trailing `pk_stride` bytes of its big-endian
-/// image (exactly what `extend_pk` writes); `to_le_bytes` would reverse them and
-/// probe a key matching no stored row. Used at gather call sites to feed the
-/// unified `Vec<PkBuf>` input once per call (not per incoming batch row).
-#[inline]
-fn u128_to_pkbuf(pk: u128, pk_stride: u8) -> PkBuf {
-    PkBuf::from_bytes(&pk.to_be_bytes()[16 - pk_stride as usize..])
-}
-
 /// Decode an OPK leading-key span back to its native per-column values — the
 /// inverse of `IndexKeySpec::write_span`, so the master stays the OPK *decoder*
 /// and the worker the sole OPK *encoder*. `idx_cols` are the span's promoted
@@ -306,98 +296,48 @@ impl MasterDispatcher {
             return Ok(());
         }
 
-        // Wide PKs (pk_stride > 16) cannot pack into a u128 word; their
-        // aggregation/identification paths key on byte-form `PkBuf` instead.
-        // Narrow paths stay verbatim on u128 to avoid the per-row PkBuf init
-        // cost on the common (large-INSERT) path.
-        let wide = source_schema.pk_is_wide();
-
         // Borrowed view for the per-column locator reads (FK insert / unique
         // enforcement); zero-allocation over `batch`'s pages.
         let mb = batch.as_mem_batch();
 
-        // Build PK aggregation. Narrow path uses the pooled u128 map and yields
-        // `pk_lo_hi`; the wide path uses a local PkBuf-keyed map and yields
-        // `pk_lo_hi_wide`. Both feed the UPSERT PK-identification check below.
-        let mut pk_lo_hi: Option<Vec<u128>> = None;
-        let mut pk_lo_hi_wide: Option<Vec<PkBuf>> = None;
+        // PK net-weight aggregation, width-universal: one map keyed by each
+        // row's OPK bytes borrowed from the batch PK region — a 16-byte fat
+        // pointer at any stride, constructing nothing per row. Sized to
+        // `batch.count` and dropped at the end of this block, so the borrow
+        // never escapes the synchronous prelude (the first `.await` is well
+        // past it). Mirrors `enforce_unique_pk`'s in-batch `&[u8]` maps. The
+        // collected net-positive byte spans feed the UPSERT PK-identification
+        // check below.
+        let mut pk_keys: Vec<PkBuf> = Vec::new();
         if has_unique || needs_pk_rejection {
-            if !wide {
-                pk_lo_hi = PK_AGG_POOL.with(|cell| -> Result<Option<Vec<u128>>, String> {
-                    let mut m = cell.borrow_mut();
-                    // Reclaim capacity after an unusually large batch to prevent
-                    // the thread-local from growing without bound.
-                    if m.capacity() > 65_536 {
-                        *m = FxHashMap::default();
-                    } else {
-                        m.clear();
-                    }
-                    m.reserve(batch.count);
-                    for i in 0..batch.count {
-                        let w = batch.get_weight(i);
-                        if w == 0 {
-                            continue;
-                        }
-                        let entry = m.entry(batch.get_pk(i)).or_insert((0, 0));
-                        entry.0 += w;
-                        // A +w row is w insertions of the PK; Error mode must
-                        // reject it like the w separate +1 rows it encodes.
-                        if w > 0 {
-                            entry.1 += if w > 1 { 2 } else { 1 };
-                        }
-                    }
-                    if needs_pk_rejection {
-                        for (&pk, &(_, pos_count)) in m.iter() {
-                            if pos_count > 1 {
-                                let key_str = format_pk_value(pk, &source_schema);
-                                return Err(unsafe {
-                                    (*disp_ptr).batch_dup_pk_err(target_id, &source_schema, &key_str)
-                                });
-                            }
-                        }
-                    }
-                    let mut keys: Vec<u128> = Vec::with_capacity(m.len());
-                    for (&pk, &(net_weight, _)) in m.iter() {
-                        if net_weight <= 0 {
-                            continue;
-                        }
-                        keys.push(pk);
-                    }
-                    Ok(Some(keys))
-                })?;
-            } else {
-                let mut m: FxHashMap<PkBuf, (i64, u32)> =
-                    FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
-                for i in 0..batch.count {
-                    let w = batch.get_weight(i);
-                    if w == 0 {
-                        continue;
-                    }
-                    let entry = m.entry(PkBuf::from_bytes(batch.get_pk_bytes(i))).or_insert((0, 0));
-                    entry.0 += w;
-                    // A +w row is w insertions of the PK; Error mode must
-                    // reject it like the w separate +1 rows it encodes.
-                    if w > 0 {
-                        entry.1 += if w > 1 { 2 } else { 1 };
-                    }
+            let mut net: FxHashMap<&[u8], (i64, u32)> =
+                FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
+            for i in 0..batch.count {
+                let w = batch.get_weight(i);
+                if w == 0 {
+                    continue;
                 }
-                if needs_pk_rejection {
-                    for (pk, &(_, pos_count)) in m.iter() {
-                        if pos_count > 1 {
-                            let key_str = format_pk_value_bytes(pk.pk_bytes(), &source_schema);
-                            return Err(unsafe { (*disp_ptr).batch_dup_pk_err(target_id, &source_schema, &key_str) });
-                        }
-                    }
+                let e = net.entry(batch.get_pk_bytes(i)).or_insert((0, 0));
+                e.0 += w;
+                // A +w row is w insertions of the PK; Error mode must reject it
+                // like the w separate +1 rows it encodes.
+                if w > 0 {
+                    e.1 += if w > 1 { 2 } else { 1 };
                 }
-                let mut keys: Vec<PkBuf> = Vec::with_capacity(m.len());
-                for (pk, &(net_weight, _)) in m.iter() {
-                    if net_weight <= 0 {
-                        continue;
-                    }
-                    keys.push(*pk);
-                }
-                pk_lo_hi_wide = Some(keys);
             }
+            if needs_pk_rejection {
+                for (&pk, &(_, pos_count)) in net.iter() {
+                    if pos_count > 1 {
+                        let key_str = format_pk_value_bytes(pk, &source_schema);
+                        return Err(unsafe { (*disp_ptr).batch_dup_pk_err(target_id, &source_schema, &key_str) });
+                    }
+                }
+            }
+            pk_keys = net
+                .iter()
+                .filter(|(_, &(nw, _))| nw > 0)
+                .map(|(&pk, _)| PkBuf::from_bytes(pk))
+                .collect();
         }
 
         // ----- Phase 1 plan -----------------------------------------------
@@ -499,35 +439,23 @@ impl MasterDispatcher {
         // the *referenced parent column's* values of the removed rows, which
         // differ per child (different children may reference different columns).
         if n_children > 0 {
-            // net_pk aggregation runs at batch.count scale: stay on u128 for
-            // the narrow path; the wide path keys on byte-form PkBuf. The
-            // *distinct* removed PKs are few, so both produce a uniform
-            // `Vec<PkBuf>` consumed by the gather and per-child key building.
-            let removed_pks: Vec<PkBuf> = if !wide {
-                let mut net_pk: FxHashMap<u128, i64> = FxHashMap::default();
+            // net_pk aggregation at batch.count scale on one map keyed by the
+            // borrowed OPK bytes. The *distinct* removed PKs are few, so the map
+            // stays local and unpooled; `into_iter` drops it before the owned
+            // `removed_pks` leaves the block, releasing the batch borrow.
+            let removed_pks: Vec<PkBuf> = {
+                let mut net: FxHashMap<&[u8], i64> = FxHashMap::default();
                 for i in 0..batch.count {
                     let w = batch.get_weight(i);
                     if w == 0 {
                         continue;
                     }
-                    *net_pk.entry(batch.get_pk(i)).or_insert(0) += w;
+                    *net.entry(batch.get_pk_bytes(i)).or_insert(0) += w;
                 }
-                let stride = source_schema.pk_stride();
-                net_pk
-                    .into_iter()
+                net.into_iter()
                     .filter(|&(_, w)| w < 0)
-                    .map(|(k, _)| u128_to_pkbuf(k, stride))
+                    .map(|(k, _)| PkBuf::from_bytes(k))
                     .collect()
-            } else {
-                let mut net_pk: FxHashMap<PkBuf, i64> = FxHashMap::default();
-                for i in 0..batch.count {
-                    let w = batch.get_weight(i);
-                    if w == 0 {
-                        continue;
-                    }
-                    *net_pk.entry(PkBuf::from_bytes(batch.get_pk_bytes(i))).or_insert(0) += w;
-                }
-                net_pk.into_iter().filter(|&(_, w)| w < 0).map(|(k, _)| k).collect()
             };
 
             if !removed_pks.is_empty() {
@@ -613,25 +541,12 @@ impl MasterDispatcher {
 
         // UPSERT PK identification: which incoming PKs already exist in storage.
         // Routing is computed inside execute_pipeline_async; here we only build
-        // the check batch (narrow u128 keys, or byte-form for wide PKs).
-        let upsert_pk_batch: Option<Batch> = match (&pk_lo_hi, &pk_lo_hi_wide) {
-            (Some(keys), _) if !keys.is_empty() => {
-                let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
-                // `keys` are get_pk (OPK-widened) main-table PK values — write
-                // their OPK bytes verbatim. `build_check_batch` is the *index*
-                // builder: it would re-OPK-encode column 0 (double sign-flip for
-                // signed) and zero the compound suffix, mangling the main-table PK
-                // probe. This branch is narrow-only (`pk_lo_hi` is Some only when
-                // `!source_schema.pk_is_wide()`), so `extend_pk` is valid.
-                Some(build_check_batch_with(&source_schema, keys, pooled, |b, &k| {
-                    b.extend_pk(k)
-                }))
-            }
-            (_, Some(keys)) if !keys.is_empty() => {
-                let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
-                Some(build_check_batch_pkbuf(&source_schema, keys, pooled))
-            }
-            _ => None,
+        // the check batch from the collected net-positive PK byte spans.
+        let upsert_pk_batch: Option<Batch> = if pk_keys.is_empty() {
+            None
+        } else {
+            let pooled = unsafe { (*disp_ptr).pool_pop_batch(target_id) };
+            Some(build_check_batch_pkbuf(&source_schema, &pk_keys, pooled))
         };
         if let Some(check_batch) = upsert_pk_batch {
             p1_labels.push(P1Label::UpsertPkId);

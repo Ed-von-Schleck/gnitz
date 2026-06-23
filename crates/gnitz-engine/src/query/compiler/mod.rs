@@ -1229,7 +1229,7 @@ mod tests {
     }
 
     fn wide_pk_schema() -> SchemaDescriptor {
-        // 3 × U64 = 24-byte PK (pk_is_wide).
+        // 3 × U64 = 24-byte PK (wide, stride 24).
         SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U64, 0),

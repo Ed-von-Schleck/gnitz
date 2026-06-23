@@ -1351,7 +1351,6 @@ mod tests {
             &[0, 1, 2],
         );
         assert_eq!(schema.pk_stride(), 24);
-        assert!(schema.pk_is_wide());
 
         let key = |a: i64, b: u64, c: u64| opk_pk(&schema, &[a as u128, b as u128, c as u128]);
 

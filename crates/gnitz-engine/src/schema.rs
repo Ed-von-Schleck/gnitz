@@ -59,10 +59,12 @@ impl SchemaColumn {
     }
 }
 
-/// Widest PK region that still fits in a packed `u128` word. At or below
-/// this width the order-agnostic byte paths keep the PK in a `u128`
-/// (`get_pk`/`partition_for_key`); above it the region is "wide" and must
-/// be handled via the raw-bytes accessors and `compare_pk_bytes`.
+/// Widest PK region that still fits in a packed `u128` word (16 bytes), the
+/// boundary where a key stops fitting one `u128`. At or below it `get_pk`
+/// returns the exact key as a `u128` (wider regions must read `get_pk_bytes`)
+/// and the seek wire image splits into a low-16 word plus a `> 16` suffix
+/// (`seek_opk_bytes`); above it a shard's PK region must be stored `Raw`
+/// (a `Constant` region holds only 16 bytes) and is ordered via `compare_pk_bytes`.
 pub(crate) const NARROW_PK_MAX_BYTES: usize = 16;
 
 /// Reassemble the native seek image from the wire pair `(low, extra)` — the
@@ -449,15 +451,6 @@ impl SchemaDescriptor {
     #[inline]
     pub const fn replicated(&self) -> bool {
         self.replicated
-    }
-
-    /// True iff the PK region is too wide to pack into a `u128` word
-    /// (`pk_stride > NARROW_PK_MAX_BYTES`). Wide PKs cannot use the
-    /// `get_pk`/`partition_for_key` fast paths and must go through the
-    /// raw-bytes accessors and `compare_pk_bytes`.
-    #[inline]
-    pub const fn pk_is_wide(&self) -> bool {
-        self.pk_stride as usize > NARROW_PK_MAX_BYTES
     }
 
     /// True iff the PK is a single signed column (I8/I16/I32/I64). Its OPK

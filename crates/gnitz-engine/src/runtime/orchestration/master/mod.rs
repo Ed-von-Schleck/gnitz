@@ -2,18 +2,9 @@
 //! via the shared append-only log (SAL) and collects responses via per-worker
 //! W2M regions. Eventfds provide cross-process signaling.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-
-thread_local! {
-    /// Pooled aggregation map for PK net-weight + positive-count tracking,
-    /// reused across `validate_all_distributed_async` calls. Cleared (capacity
-    /// retained) on entry; never held across `.await`.
-    static PK_AGG_POOL: RefCell<FxHashMap<u128, (i64, u32)>> =
-        RefCell::new(FxHashMap::default());
-}
 
 use crate::catalog::CatalogEngine;
 use crate::schema::SchemaDescriptor;
@@ -607,15 +598,6 @@ fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) -> String {
     parts.join(", ")
 }
 
-/// Narrow-PK convenience over `format_pk_value_bytes`. `pk` is a `get_pk`
-/// (OPK-widened) value, whose OPK bytes at rest are the trailing `pk_stride`
-/// bytes of its big-endian image.
-fn format_pk_value(pk: u128, schema: &SchemaDescriptor) -> String {
-    let stride = schema.pk_stride() as usize;
-    let be = pk.to_be_bytes();
-    format_pk_value_bytes(&be[16 - stride..], schema)
-}
-
 /// Shared scaffold for the check-batch builders: pool-reuse with a schema
 /// staleness guard, then one zero-payload row per key.
 ///
@@ -706,11 +688,11 @@ fn index_route_key(schema: &SchemaDescriptor, col_idx: u32, native: u128) -> Opt
     }
 }
 
-/// Byte-form sibling of `build_check_batch`, taking `&[PkBuf]` keys. Kept
-/// as a distinct `&[PkBuf]` entry point (rather than converting to `u128`)
-/// because the `pk_lo_hi` → UPSERT PK-check path can have up to
-/// `batch.count` entries and must not pay per-entry `PkBuf` construction;
-/// the gather inputs are bounded by distinct changed rows.
+/// Build the UPSERT PK-identification check batch from `keys`, the distinct
+/// net-positive PK byte spans collected by the preflight aggregation. Writes
+/// each `PkBuf`'s OPK bytes verbatim into the PK region: the spans are already
+/// main-table PKs, so unlike the index builder `build_check_batch` no column-0
+/// re-encoding is applied. The sole PK (rather than index) check-batch builder.
 fn build_check_batch_pkbuf(schema: &SchemaDescriptor, keys: &[PkBuf], pooled: Option<Batch>) -> Batch {
     build_check_batch_with(schema, keys, pooled, |b, k| b.extend_pk_bytes(k.pk_bytes()))
 }
@@ -1426,7 +1408,7 @@ mod unique_filter_tests {
         let uuid: u128 = 0x550e8400_e29b_41d4_a716_446655440000u128;
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::UUID, 0)], &[0]);
 
-        let s = format_pk_value(uuid, &schema);
+        let s = format_pk_value_bytes(&uuid.to_be_bytes(), &schema);
         // Must not be the lower-64 truncation (11975073520896 or similar).
         let truncated = format!("{}", uuid as u64);
         assert_ne!(s, truncated, "UUID must not be formatted as truncated u64");
@@ -1441,8 +1423,8 @@ mod unique_filter_tests {
         let uuid_b: u128 = 0x22222222_0000_0000_0000_000000000001u128;
         let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::UUID, 0)], &[0]);
 
-        let sa = format_pk_value(uuid_a, &schema);
-        let sb = format_pk_value(uuid_b, &schema);
+        let sa = format_pk_value_bytes(&uuid_a.to_be_bytes(), &schema);
+        let sb = format_pk_value_bytes(&uuid_b.to_be_bytes(), &schema);
         assert_ne!(sa, sb, "UUIDs differing in high bits must format differently");
     }
 
@@ -1455,31 +1437,9 @@ mod unique_filter_tests {
     }
 
     #[test]
-    fn format_pk_value_narrow_compound_agrees_with_bytes() {
-        // (I32, U32) compound PK: A=-5, B=42. The renderer consumes OPK bytes,
-        // so build the fixture as OPK (per-column encode, then widen for the
-        // u128 arg). Reading raw native LE would mangle the signed column.
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::I32, 0),
-                SchemaColumn::new(type_code::U32, 0),
-            ],
-            &[0, 1],
-        );
-        assert!(!schema.pk_is_wide());
-        let mut opk = [0u8; 8];
-        gnitz_wire::encode_pk_column(&(-5i32).to_le_bytes(), type_code::I32, &mut opk[0..4]);
-        gnitz_wire::encode_pk_column(&42u32.to_le_bytes(), type_code::U32, &mut opk[4..8]);
-        let widened = gnitz_wire::widen_pk_be(&opk, 8);
-        assert_eq!(format_pk_value(widened, &schema), "-5, 42");
-        // The bytes renderer agrees with the (delegating) u128 renderer.
-        assert_eq!(format_pk_value_bytes(&opk, &schema), "-5, 42");
-    }
-
-    #[test]
     fn format_pk_value_bytes_wide_compound_u64x3() {
         // Three U64 columns = 24-byte PK: too wide for a u128, exercising the
-        // byte-form renderer where the old format_pk_value would truncate.
+        // byte-form renderer where a u128 key would truncate.
         // OPK for unsigned U64 is big-endian.
         let schema = SchemaDescriptor::new(
             &[
@@ -1489,7 +1449,7 @@ mod unique_filter_tests {
             ],
             &[0, 1, 2],
         );
-        assert!(schema.pk_is_wide());
+        assert!(schema.pk_stride() > 16);
         let pk = compound_pk_bytes(&[&7u64.to_be_bytes(), &8u64.to_be_bytes(), &9u64.to_be_bytes()]);
         assert_eq!(format_pk_value_bytes(pk.pk_bytes(), &schema), "7, 8, 9");
     }

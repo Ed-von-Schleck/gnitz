@@ -804,7 +804,7 @@ mod tests {
         let schema = make_narrow_compound_schema();
         // A 16-byte key: the cached `pk_sort_key` is the whole PK, so the comparator
         // decides on the register compare alone and never runs the byte tiebreak.
-        assert!(!schema.pk_is_wide(), "pk_stride must be 16 (narrow)");
+        assert!(schema.pk_stride() <= 16, "pk_stride must be 16 (narrow)");
         assert!(schema.pk_indices().len() > 1, "fixture is a compound (multi-column) PK");
         let num_workers = 4;
         let b0 = make_narrow_compound_batch(

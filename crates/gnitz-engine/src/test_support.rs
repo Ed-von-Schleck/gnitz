@@ -13,7 +13,7 @@ use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, ConsolidatedBatch};
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
-/// (`pk_stride = 24`, so `pk_is_wide()`) with a single I64 payload column.
+/// (`pk_stride = 24`, wide) with a single I64 payload column.
 pub(crate) fn wide_pk_3xu64_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[

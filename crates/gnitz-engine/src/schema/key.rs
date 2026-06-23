@@ -39,7 +39,7 @@ pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
 /// already a byte-equal PK — the byte
 /// compare is skipped (it would be a guaranteed-`Equal` `memcmp`). Only `len > 16`
 /// can tie on the 16-byte prefix while differing later, so the full-byte
-/// `compare_pk_bytes` tiebreak runs only there. No stride / `pk_is_wide` dispatch.
+/// `compare_pk_bytes` tiebreak runs only there. No stride / width-class dispatch.
 #[inline(always)]
 pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
     debug_assert_eq!(a.len(), b.len(), "compare_pk_ordering on unequal PK widths");
