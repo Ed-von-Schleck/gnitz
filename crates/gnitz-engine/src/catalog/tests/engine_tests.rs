@@ -193,15 +193,47 @@ fn test_ingest_scan_seek_family() {
     assert_eq!(scan_batch.count, 3);
 
     // Seek existing
-    let found = engine.seek_family(tid, 2u128).unwrap();
+    let found = engine.seek_family(tid, 2u128, &[]).unwrap();
     assert!(found.is_some());
     let row = found.unwrap();
     assert_eq!(row.count, 1);
     assert_eq!(row.get_pk(0), 2);
 
     // Seek missing
-    let not_found = engine.seek_family(tid, 99u128).unwrap();
+    let not_found = engine.seek_family(tid, 99u128, &[]).unwrap();
     assert!(not_found.is_none());
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ── seek_family resolves a system-table row (post-collapse) ───────────
+
+/// After the FLAG_SEEK collapse there is no system-table fast path: a
+/// `table_id < FIRST_USER_TABLE_ID` seek flows through the same
+/// `seek_family → seek_opk_bytes → seek_family_bytes` chain as user tables,
+/// resolving its schema via `sys_tab_schema`. `create_table` writes a TABLE_TAB
+/// row keyed by the new table-id — a single narrow U64 PK, stride 8 — so seeking
+/// TABLE_TAB by that id drives the empty-`extra` narrow path end to end through
+/// the system-table schema resolver.
+#[test]
+fn seek_family_resolves_system_table_row() {
+    let dir = temp_dir("catalog_seek_system_table");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], true).unwrap();
+
+    // System-table point seek (narrow stride 8, empty extra).
+    let found = engine.seek_family(TABLE_TAB_ID, tid as u128, &[]).unwrap();
+    assert!(
+        found.is_some(),
+        "seek_family must resolve the TABLE_TAB row for the created table",
+    );
+    assert_eq!(found.unwrap().count, 1);
+
+    // A missing system-table key returns None — not an error, not a panic.
+    let missing = engine.seek_family(TABLE_TAB_ID, 9_999_999u128, &[]).unwrap();
+    assert!(missing.is_none(), "absent system-table key seeks to None");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

@@ -65,47 +65,37 @@ impl SchemaColumn {
 /// be handled via the raw-bytes accessors and `compare_pk_bytes`.
 pub(crate) const NARROW_PK_MAX_BYTES: usize = 16;
 
-/// Reassemble a wide PK's full byte image from its wire split: the low
-/// `NARROW_PK_MAX_BYTES` carried as a `u128` plus the `extra` tail (PK bytes
-/// `16..stride`). This is the inverse of `PkTuple::split_wire` and the single
-/// home for the seek-path join contract shared by the master partition router
-/// and the worker SEEK handler. The client transmits seek keys as native LE
-/// column bytes (the seek frame bypasses `append_pk_region`, so unlike the DML
-/// path the bytes are not yet OPK), so this reassembles the native image and
-/// then OPK-encodes it — the returned `..stride` is the OPK key that
-/// `seek_bytes`/`partition_for_pk_bytes` compare against OPK storage. Errors if
-/// `extra` is shorter than the wide suffix `stride - 16`. Callers must only
-/// invoke this for wide PKs (`pk_is_wide()`, `stride > 16`).
-pub(crate) fn assemble_wide_pk(
+/// Reassemble the native seek image from the wire pair `(low, extra)` — the
+/// inverse of `PkTuple::split_wire` — and OPK-encode it via [`key::opk_key`].
+/// The shared seek-key encoder for the master partition router
+/// (`fan_out_seek_async`) and the worker SEEK handler (`seek_family`) at every
+/// PK width. The seek frame carries the key as native LE column bytes (it
+/// bypasses `append_pk_region`, so the bytes are not yet OPK): the low ≤16 ride
+/// in `low`, a wide PK's `16..stride` suffix in `extra` (empty for narrow PKs).
+/// Errors if `extra` is shorter than the wide suffix `stride - 16`.
+pub(crate) fn seek_opk_bytes(
     schema: &SchemaDescriptor,
     low: u128,
     extra: &[u8],
-    stride: usize,
-) -> Result<[u8; MAX_PK_BYTES], String> {
-    // Public fn: enforce the wide-stride contract at runtime, not just via
-    // debug_assert. A narrow stride would underflow `stride - NARROW_PK_MAX_BYTES`
-    // and panic in release; return a clean error instead.
-    if stride <= NARROW_PK_MAX_BYTES {
-        return Err(format!(
-            "assemble_wide_pk: narrow stride {stride} (expected > {NARROW_PK_MAX_BYTES})"
-        ));
-    }
+) -> Result<([u8; MAX_PK_BYTES], usize), String> {
+    let stride = schema.pk_stride() as usize;
     if stride > MAX_PK_BYTES {
-        return Err(format!("wide PK stride {stride} exceeds MAX_PK_BYTES {MAX_PK_BYTES}"));
+        return Err(format!("PK stride {stride} exceeds MAX_PK_BYTES {MAX_PK_BYTES}"));
     }
-    let needed = stride - NARROW_PK_MAX_BYTES;
+    let needed = stride.saturating_sub(NARROW_PK_MAX_BYTES);
     if extra.len() < needed {
         return Err(format!(
-            "wide PK stride {stride} requires {needed} extra bytes, got {}",
+            "PK stride {stride} requires {needed} extra bytes, got {}",
             extra.len()
         ));
     }
+    // Native image = `low`'s 16 LE bytes, then the wide suffix. The upper bound
+    // is `16 + needed` (not `stride`): for a narrow PK `needed == 0` makes it the
+    // empty copy `le[16..16]` rather than the inverted range `le[16..stride]`.
     let mut le = [0u8; MAX_PK_BYTES];
     le[..NARROW_PK_MAX_BYTES].copy_from_slice(&low.to_le_bytes());
-    le[NARROW_PK_MAX_BYTES..stride].copy_from_slice(&extra[..needed]);
-    let mut opk = [0u8; MAX_PK_BYTES];
-    key::encode_order_preserving_pk(schema, &le[..stride], &mut opk[..stride]);
-    Ok(opk)
+    le[NARROW_PK_MAX_BYTES..NARROW_PK_MAX_BYTES + needed].copy_from_slice(&extra[..needed]);
+    Ok(key::opk_key(schema, &le[..stride]))
 }
 
 /// Sentinel for any dense payload-index slot (e.g. `SortDesc::pi`,
@@ -318,7 +308,7 @@ impl SchemaDescriptor {
             k += 1;
         }
         assert!(stride_acc <= u8::MAX as u16, "new: pk_stride exceeds u8 width",);
-        // `assemble_wide_pk` and other wide-path routines allocate
+        // `seek_opk_bytes` and other wide-path routines allocate
         // `[0u8; MAX_PK_BYTES]` and index up to `stride`; a stride in
         // (MAX_PK_BYTES, 255] would construct here but panic at runtime.
         assert!(
@@ -1373,6 +1363,7 @@ pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::pk_only_schema;
 
     // ── Distribution prefix (CLUSTER BY) ────────────────────────────────────
 
@@ -1931,6 +1922,102 @@ mod tests {
         ];
         let s = SchemaDescriptor::new(&cols, &[0, 1]);
         let _ = s.pk_index_single();
+    }
+
+    // ── seek_opk_bytes: the width-universal seek-key encoder ─────────────────
+
+    #[test]
+    fn seek_opk_bytes_narrow_matches_opk_key() {
+        // For every narrow stride (≤ 16) the wire pair degenerates to `(low, &[])`,
+        // so `seek_opk_bytes` must be byte-identical to a direct `opk_key` of the
+        // native value — both buffer and stride.
+        let cases = [
+            pk_only_schema(&[type_code::U8]),  // stride 1
+            pk_only_schema(&[type_code::U32]), // stride 4
+            pk_only_schema(&[type_code::U64]), // stride 8
+            pk_only_schema(&[type_code::I64]), // stride 8, signed → OPK flips the sign bit
+            // Compound (U32, U32) with a *permuted* PK list [1, 0]: stride 8,
+            // exercises the multi-column pk-list walk in the encoder.
+            SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(type_code::U32, 0),
+                    SchemaColumn::new(type_code::U32, 0),
+                ],
+                &[1, 0],
+            ),
+        ];
+        // Values spanning zero, small, mixed, and a sign-bit-set word (negative
+        // for the I64 case) so the sign-flip and byte order are exercised. Both
+        // encoders truncate to `stride`, so an over-wide value is a valid probe.
+        for s in cases {
+            for v in [0u128, 1, 0x0123_4567_89AB_CDEF, 0x8000_0000_0000_0000, u64::MAX as u128] {
+                let (want_opk, want_stride) = key::opk_key(&s, &v.to_le_bytes());
+                let (got_opk, got_stride) = seek_opk_bytes(&s, v, &[]).expect("narrow seek encodes");
+                assert_eq!(got_stride, want_stride, "stride mismatch for {s:?} v={v:#x}");
+                assert_eq!(
+                    got_opk[..got_stride],
+                    want_opk[..want_stride],
+                    "OPK bytes mismatch for {s:?} v={v:#x}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seek_opk_bytes_wide_reproduces_hand_built_opk() {
+        // (U64, U64, U64) = stride 24, wide. The wire pair carries the first 16
+        // native bytes in `low` and the trailing U64 in `extra`, exactly as
+        // `PkTuple::split_wire` packs them. All-unsigned ⇒ OPK is each column's
+        // big-endian image, so the expected key is built by hand.
+        let s = pk_only_schema(&[type_code::U64; 3]);
+        assert_eq!(s.pk_stride(), 24);
+        let (a, b, c): (u64, u64, u64) = (0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00, 0x0102_0304_0506_0708);
+        // Native LE image = [a_LE, b_LE, c_LE]; split_wire's `low` is the first 16
+        // bytes (a in the low half, b in the high half), `extra` is c's 8 bytes.
+        let low = (a as u128) | ((b as u128) << 64);
+        let (opk, stride) = seek_opk_bytes(&s, low, &c.to_le_bytes()).expect("wide seek encodes");
+        assert_eq!(stride, 24);
+        let want: Vec<u8> = a
+            .to_be_bytes()
+            .into_iter()
+            .chain(b.to_be_bytes())
+            .chain(c.to_be_bytes())
+            .collect();
+        assert_eq!(&opk[..stride], want.as_slice());
+    }
+
+    #[test]
+    fn seek_opk_bytes_missing_extra_errs_not_panics() {
+        // A wide stride needs `stride - 16` extra bytes; too few must return Err,
+        // never panic — the runtime guard the two dispatch sites rely on.
+        let s = pk_only_schema(&[type_code::U64; 3]);
+        assert!(seek_opk_bytes(&s, 0, &[]).is_err(), "stride 24 with no extra must Err");
+        assert!(seek_opk_bytes(&s, 0, &[0u8; 7]).is_err(), "7 < 8 extra bytes must Err");
+        assert!(
+            seek_opk_bytes(&s, 0, &[0u8; 8]).is_ok(),
+            "exactly 8 extra bytes is enough"
+        );
+    }
+
+    #[test]
+    fn seek_opk_bytes_four_u128_ceiling() {
+        // The widest SQL-reachable PK is 4 columns (PK_LIST_MAX_COLS); 4×U128 =
+        // stride 64 exercises the `le[16..16 + needed]` copy at its ceiling
+        // (`needed == 48`). All-unsigned ⇒ OPK is each column's BE image.
+        // Column 0 rides in `low`; columns 1..4 (48 bytes) in `extra`.
+        let s = pk_only_schema(&[type_code::U128; 4]);
+        assert_eq!(s.pk_stride(), 64);
+        let vals: [u128; 4] = [
+            0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
+            0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20,
+            0x2122_2324_2526_2728_292A_2B2C_2D2E_2F30,
+            0x3132_3334_3536_3738_393A_3B3C_3D3E_3F40,
+        ];
+        let extra: Vec<u8> = vals[1..].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (opk, stride) = seek_opk_bytes(&s, vals[0], &extra).expect("4×U128 encodes");
+        assert_eq!(stride, 64);
+        let want: Vec<u8> = vals.iter().flat_map(|v| v.to_be_bytes()).collect();
+        assert_eq!(&opk[..stride], want.as_slice());
     }
 
     #[test]

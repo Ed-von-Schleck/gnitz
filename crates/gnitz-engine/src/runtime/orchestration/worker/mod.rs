@@ -1032,25 +1032,11 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Seek => {
-                // User tables may have a wide PK (stride > 16) whose full key
-                // arrives as seek_pk (low 16 bytes) + seek_pk_extra (16..stride).
-                // System tables (target_id < FIRST_USER_TABLE_ID) always have a
-                // narrow PK, so they stay on the u128 seek_family path.
-                let wide_schema = if target_id >= FIRST_USER_TABLE_ID {
-                    self.cat().get_schema_desc(target_id).filter(|s| s.pk_is_wide())
-                } else {
-                    None
-                };
-                let result = if let Some(s) = wide_schema {
-                    let stride = s.pk_stride() as usize;
-                    let buf = match crate::schema::assemble_wide_pk(&s, seek_pk, &seek_pk_extra, stride) {
-                        Ok(buf) => buf,
-                        Err(e) => return DispatchResult::Error(format!("seek: {e}")),
-                    };
-                    self.cat().seek_family_bytes(target_id, &buf[..stride])
-                } else {
-                    self.cat().seek_family(target_id, seek_pk)
-                };
+                // The full seek key arrives as the wire pair seek_pk (low ≤16
+                // native bytes) + seek_pk_extra (the 16..stride suffix, empty for
+                // narrow PKs). `seek_family` decodes it through `seek_opk_bytes`
+                // at every width — user and system tables alike, no width fork.
+                let result = self.cat().seek_family(target_id, seek_pk, &seek_pk_extra);
                 match result {
                     Ok(result) => {
                         let schema = self.cat().get_schema_desc(target_id);

@@ -26,15 +26,9 @@ impl CatalogEngine {
 
     /// Scan all positive-weight rows from a table.
     pub fn scan_family(&mut self, table_id: i64) -> Result<Rc<Batch>, String> {
-        let schema = if table_id < FIRST_USER_TABLE_ID {
-            sys_tab_schema(table_id)
-        } else {
-            self.dag
-                .tables
-                .get(&table_id)
-                .map(|e| e.schema)
-                .ok_or_else(|| format!("Unknown table_id {table_id}"))?
-        };
+        let schema = self
+            .get_schema_desc(table_id)
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
         // The CIRCUIT_* tables are now SQL-introspectable: every operator's
         // parameter shape is expressible in catalog schema.
         if let Some(table) = self.sys_table_mut(table_id) {
@@ -43,55 +37,25 @@ impl CatalogEngine {
         Ok(self.scan_store(table_id, &schema))
     }
 
-    /// Point lookup by PK. Returns a single-row batch if found, None otherwise.
-    pub fn seek_family(&mut self, table_id: i64, pk: u128) -> Result<Option<Batch>, String> {
-        let schema = if table_id < FIRST_USER_TABLE_ID {
-            sys_tab_schema(table_id)
-        } else {
-            self.dag
-                .tables
-                .get(&table_id)
-                .map(|e| e.schema)
-                .ok_or_else(|| format!("Unknown table_id {table_id}"))?
-        };
-
-        // Create cursor and seek. The new CircuitNodes/CircuitEdges/
-        // CircuitNodeColumns layout is SQL-introspectable; only unrecognised
-        // system table IDs return None.
-        let mut cursor = if table_id < FIRST_USER_TABLE_ID {
-            if let Some(table) = self.sys_table_mut(table_id) {
-                table.open_cursor()
-            } else {
-                return Ok(None);
-            }
-        } else {
-            self.dag.tables.get(&table_id).unwrap().handle.open_cursor()
-        };
-
-        let (opk, stride) = crate::storage::opk_key(&schema, pk);
-        if !cursor.cursor.seek_exact_live(&opk[..stride]) {
-            return Ok(None);
-        }
-
-        let mut batch = Batch::with_schema(schema, 1);
-        self.copy_cursor_row_to_batch(&cursor, &mut batch);
-        Ok(Some(batch))
+    /// Point lookup by the wire seek pair. Decodes `(seek_pk, seek_pk_extra)` to
+    /// the OPK key at any PK width via `seek_opk_bytes`, then delegates to
+    /// [`seek_family_bytes`].
+    pub fn seek_family(&mut self, table_id: i64, seek_pk: u128, seek_pk_extra: &[u8]) -> Result<Option<Batch>, String> {
+        let schema = self
+            .get_schema_desc(table_id)
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
+        let (opk, stride) = crate::schema::seek_opk_bytes(&schema, seek_pk, seek_pk_extra)?;
+        self.seek_family_bytes(table_id, &opk[..stride])
     }
 
-    /// Byte-keyed sibling of [`seek_family`]: point lookup by full PK bytes,
-    /// correct for `pk_stride > 16` where a `u128` key cannot encode the PK.
-    /// Mirrors `seek_family` exactly — open the merged cursor and
-    /// `seek_exact_live`.
+    /// The seek+materialise primitive: open the merged cursor, `seek_exact_live`
+    /// the OPK `pk` bytes, copy the row. Correct at any PK width — the delegate
+    /// target of [`seek_family`] (which encodes the wire pair to these bytes) and
+    /// the byte-keyed entry the wide-PK tests seek through directly.
     pub fn seek_family_bytes(&mut self, table_id: i64, pk: &[u8]) -> Result<Option<Batch>, String> {
-        let schema = if table_id < FIRST_USER_TABLE_ID {
-            sys_tab_schema(table_id)
-        } else {
-            self.dag
-                .tables
-                .get(&table_id)
-                .map(|e| e.schema)
-                .ok_or_else(|| format!("Unknown table_id {table_id}"))?
-        };
+        let schema = self
+            .get_schema_desc(table_id)
+            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
 
         let mut cursor = if table_id < FIRST_USER_TABLE_ID {
             match self.sys_table_mut(table_id) {

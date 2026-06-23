@@ -72,17 +72,22 @@ pub(crate) fn encode_order_preserving_pk(schema: &SchemaDescriptor, pk_bytes: &[
     }
 }
 
-/// OPK-encode a **native** PK value `key` (handling signed/compound columns)
-/// into a stack buffer, returning the buffer and its `pk_stride`. The narrow-PK
-/// entry points encode once here and delegate to a byte-addressed sibling that
-/// runs the universal OPK lookup. Wide PKs (`pk_stride > 16`) cannot fit a
-/// `u128` and must take the byte path directly.
+/// OPK-encode a PK from its **native LE** bytes into a stack buffer, returning
+/// the buffer and its `pk_stride`. `native_le` must hold at least `pk_stride`
+/// bytes (in pk-list column order); any trailing bytes are ignored. This is the
+/// single native→OPK encoder for **every** PK width — a caller holding a narrow
+/// value passes `&value.to_le_bytes()`; the seek path passes the reassembled
+/// wire image via [`crate::schema::seek_opk_bytes`].
 #[inline]
-pub(crate) fn opk_key(schema: &SchemaDescriptor, key: u128) -> ([u8; crate::schema::MAX_PK_BYTES], usize) {
+pub(crate) fn opk_key(schema: &SchemaDescriptor, native_le: &[u8]) -> ([u8; crate::schema::MAX_PK_BYTES], usize) {
     let stride = schema.pk_stride() as usize;
-    debug_assert!(stride <= 16, "opk_key: wide PK (stride {stride}); use the byte path");
+    debug_assert!(
+        native_le.len() >= stride,
+        "opk_key: native_le ({}) shorter than pk_stride ({stride})",
+        native_le.len(),
+    );
     let mut opk = [0u8; crate::schema::MAX_PK_BYTES];
-    encode_order_preserving_pk(schema, &key.to_le_bytes()[..stride], &mut opk[..stride]);
+    encode_order_preserving_pk(schema, &native_le[..stride], &mut opk[..stride]);
     (opk, stride)
 }
 

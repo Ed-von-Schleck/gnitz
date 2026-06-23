@@ -160,7 +160,7 @@ pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u
     let mut batch = Batch::with_schema(*schema, 1);
     let mut cursor = table.open_cursor();
     // OPK-encode the native PK; correct for single-column and compound system PKs.
-    let (opk, stride) = crate::storage::opk_key(schema, pk);
+    let (opk, stride) = crate::storage::opk_key(schema, &pk.to_le_bytes());
     if cursor.cursor.seek_exact_live(&opk[..stride]) {
         cursor.cursor.copy_current_row_into(&mut batch, -1);
     }

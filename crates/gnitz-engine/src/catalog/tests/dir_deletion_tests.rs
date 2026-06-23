@@ -114,7 +114,7 @@ fn gc_reclaims_orphan_table_dir() {
     assert!(!Path::new(&ghost).exists(), "orphan table dir must be reclaimed");
     assert!(Path::new(&live_dir).exists(), "live table dir must survive");
     assert!(
-        engine.seek_family(tid, 1u128).unwrap().is_some(),
+        engine.seek_family(tid, 1u128, &[]).unwrap().is_some(),
         "live table must still read back after the sweep"
     );
 

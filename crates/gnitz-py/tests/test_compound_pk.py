@@ -200,6 +200,90 @@ def test_compound_pk_stride_24_accepted_round_trip(client):
         _cleanup(client, sn, "t")
 
 
+# ---------------------------------------------------------------------------
+# Point lookup (FLAG_SEEK): a full-compound-PK equality SELECT binds every PK
+# column, so the planner extracts a complete PkTuple and issues a point seek
+# (`try_extract_pk_seek_residual` → `client.seek`), not a scan+filter. These pin
+# the unified width-universal seek path (`seek_opk_bytes`) end to end — routing
+# (`fan_out_seek_async` → `partition_for_pk`) and `seek_exact_live`'s exact-row
+# tie-break — at both a wide stride-24 PK and a narrow U64 PK.
+# ---------------------------------------------------------------------------
+
+
+def test_compound_pk_stride24_point_seek_colliding_prefix(client):
+    """Stride-24 (U64,U64,U64) point seek where two rows share their first 16 OPK
+    bytes (a, b) = (1, 1) and differ only in the trailing U64 c. The seek routes
+    on the FULL OPK (`partition_for_pk_bytes` hashes all 24 bytes, len > 16), and
+    `seek_exact_live`'s past-byte-16 tie-break must return the exact row, never
+    the colliding-prefix sibling — under 4 workers the two siblings can land on
+    different workers, so a misroute would return empty."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, "
+            "payload BIGINT, PRIMARY KEY (a, b, c))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t (a, b, c, payload) VALUES "
+            "(1, 1, 1, 111), (1, 1, 2, 112), (1, 2, 1, 121), (2, 1, 1, 211)",
+            schema_name=sn,
+        )
+
+        def seek(a, b, c):
+            results = client.execute_sql(
+                f"SELECT * FROM t WHERE a = {a} AND b = {b} AND c = {c}",
+                schema_name=sn,
+            )
+            rows_result = next(r for r in results if r["type"] == "Rows")
+            return sorted(
+                (row.a, row.b, row.c, row.payload) for row in rows_result["rows"]
+            )
+
+        # Each colliding-prefix sibling resolves to its OWN row, not the other.
+        assert seek(1, 1, 2) == [(1, 1, 2, 112)]
+        assert seek(1, 1, 1) == [(1, 1, 1, 111)]
+        # The other distinct PKs round-trip through the same seek path.
+        assert seek(1, 2, 1) == [(1, 2, 1, 121)]
+        assert seek(2, 1, 1) == [(2, 1, 1, 211)]
+        # A key sharing the 16-byte (a, b) prefix but absent in c returns nothing —
+        # not the sibling that shares the prefix.
+        assert seek(1, 1, 99) == []
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_compound_pk_narrow_point_seek(client):
+    """Narrow companion: a single-U64-PK equality SELECT takes the same FLAG_SEEK
+    path at stride 8 with an empty `seek_pk_extra`, pinning that the collapsed
+    `seek_family` still serves narrow PKs through `seek_opk_bytes`."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT UNSIGNED PRIMARY KEY, payload BIGINT)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t (id, payload) VALUES (1, 10), (2, 20), (3, 30)",
+            schema_name=sn,
+        )
+
+        def seek(id_):
+            results = client.execute_sql(
+                f"SELECT * FROM t WHERE id = {id_}", schema_name=sn,
+            )
+            rows_result = next(r for r in results if r["type"] == "Rows")
+            return sorted((row.id, row.payload) for row in rows_result["rows"])
+
+        assert seek(2) == [(2, 20)]
+        assert seek(1) == [(1, 10)]
+        assert seek(99) == []
+    finally:
+        _cleanup(client, sn, "t")
+
+
 def test_compound_pk_string_column_rejected(client):
     sn = "cpk" + _uid()
     client.create_schema(sn)

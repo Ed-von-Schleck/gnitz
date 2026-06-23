@@ -951,7 +951,7 @@ async fn handle_seek(
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }
     } else {
-        match unsafe { (*shared.catalog).seek_family(target_id, pk) } {
+        match unsafe { (*shared.catalog).seek_family(target_id, pk, seek_pk_extra) } {
             Ok(batch) => send_ok_response(shared, fd, target_id, batch.as_ref(), client_id, pk, client_version).await,
             Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
         }

@@ -250,13 +250,13 @@ impl PartitionedTable {
     /// check (passes a native value); all DML retraction routes through `_bytes`.
     #[cfg(test)]
     pub(crate) fn has_pk(&mut self, key: u128) -> bool {
-        let (opk, n) = columnar::opk_key(&self.schema, key);
+        let (opk, n) = columnar::opk_key(&self.schema, &key.to_le_bytes());
         self.has_pk_bytes(&opk[..n])
     }
 
     #[cfg(test)] // no production caller after the §4 DML/UPSERT byte-path fixes
     pub fn retract_pk(&mut self, key: u128) -> (i64, bool) {
-        let (opk, n) = columnar::opk_key(&self.schema, key);
+        let (opk, n) = columnar::opk_key(&self.schema, &key.to_le_bytes());
         self.retract_pk_bytes(&opk[..n])
     }
 
