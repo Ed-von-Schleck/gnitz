@@ -6,19 +6,6 @@ use crate::storage::{Batch, MemBatch};
 use super::super::util::write_string_from_batch;
 use super::agg::Accumulator;
 
-/// Write the row's PK to `output`. For arity-1 PKs the synthetic u128
-/// `group_key` is sufficient; compound PKs must copy the source row's
-/// PK bytes verbatim because the u128 cannot carry a >16-byte PK region
-/// nor reorder columns to match the output's pk_indices layout.
-#[inline]
-fn emit_pk(output: &mut Batch, output_schema: &SchemaDescriptor, src_pk_bytes: &[u8], group_key: u128) {
-    if output_schema.pk_indices().len() > 1 {
-        output.extend_pk_bytes(src_pk_bytes);
-    } else {
-        output.extend_pk(group_key);
-    }
-}
-
 /// Emit one aggregate column: NULL (and zero-filled) when the accumulator holds
 /// no value, else its value bits truncated to the column width. Shared by
 /// `emit_reduce_row` and `emit_gather_row` so the two emitters cannot drift.
@@ -39,7 +26,7 @@ pub(super) fn emit_reduce_row(
     output: &mut Batch,
     input_mb: &MemBatch,
     exemplar_row: usize,
-    group_key: u128,
+    out_pk_bytes: &[u8],
     accs: &[Accumulator],
     input_schema: &SchemaDescriptor,
     output_schema: &SchemaDescriptor,
@@ -49,7 +36,9 @@ pub(super) fn emit_reduce_row(
 ) {
     let num_out_cols = output_schema.num_columns();
 
-    emit_pk(output, output_schema, input_mb.get_pk_bytes(exemplar_row), group_key);
+    // The caller materialised the group's output PK bytes once (verbatim source
+    // PK for natural-PK grouping, the synthetic group key otherwise); copy them.
+    output.extend_pk_bytes(out_pk_bytes);
     output.extend_weight(&1i64.to_le_bytes());
 
     // Build null word and payload columns
@@ -113,7 +102,6 @@ pub(super) fn emit_finalized_row(
     fin_output: &mut Batch,
     raw_output: &Batch,
     raw_row: usize,
-    group_key: u128,
     weight: i64,
     prog: &crate::expr::ResolvedProgram,
     raw_schema: &SchemaDescriptor,
@@ -128,7 +116,9 @@ pub(super) fn emit_finalized_row(
     ctx.eval_row(prog, &raw_mb, raw_row);
     let out_cols = ctx.out_cols();
 
-    emit_pk(fin_output, fin_schema, raw_mb.get_pk_bytes(raw_row), group_key);
+    // The raw reduce-output PK is already materialised and the finalize output
+    // carries it verbatim (same PK columns/stride), so copy its OPK bytes directly.
+    fin_output.extend_pk_bytes(raw_mb.get_pk_bytes(raw_row));
     fin_output.extend_weight(&weight.to_le_bytes());
 
     let mut fin_null_mask: u64 = 0;
@@ -203,7 +193,6 @@ pub(super) fn emit_gather_row(
     output: &mut Batch,
     input_mb: &MemBatch,
     exemplar_row: usize,
-    group_key: u128,
     accs: &[Accumulator],
     schema: &SchemaDescriptor,
     num_aggs: usize,
@@ -211,7 +200,9 @@ pub(super) fn emit_gather_row(
     let num_cols = schema.num_columns();
     let agg_base = num_cols - num_aggs;
 
-    emit_pk(output, schema, input_mb.get_pk_bytes(exemplar_row), group_key);
+    // The gather partial's PK region IS the materialised group key — copy the
+    // exemplar row's OPK bytes verbatim (correct at every arity and width).
+    output.extend_pk_bytes(input_mb.get_pk_bytes(exemplar_row));
     output.extend_weight(&1i64.to_le_bytes());
 
     let mut null_word: u64 = 0;

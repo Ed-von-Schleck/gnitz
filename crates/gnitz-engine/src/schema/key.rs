@@ -167,6 +167,53 @@ pub(crate) fn pk_sort_key(pk_bytes: &[u8]) -> u128 {
     pack_pk_be(pk_bytes)
 }
 
+/// A fixed-width order-preserving sort key built by left-aligning a row's
+/// `pk_stride` OPK bytes big-endian. The OPK bytes are order-preserving, and every
+/// row in one batch shares a single `pk_stride` (hence identical zero padding past
+/// `opk.len()`), so for two equal-length OPK slices that fit in `size_of::<K>()`
+/// bytes `K::from_opk(a).cmp(&K::from_opk(b)) == compare_pk_bytes(a, b)`. The key
+/// is the *whole* PK image (not a 16-byte prefix), so a key sort is exact with no
+/// PK-byte tiebreak. Used by the reduce sort to width-match the key to `pk_stride`
+/// (`u64`/`u128`/`[u128; 2]` for strides ≤8/≤16/≤32; wider PKs byte-walk directly).
+pub(crate) trait PkSortKey: Ord + Copy {
+    fn from_opk(opk: &[u8]) -> Self;
+}
+
+impl PkSortKey for u64 {
+    #[inline(always)]
+    fn from_opk(opk: &[u8]) -> u64 {
+        // Left-align at the MSB end (low bytes pad to zero), so a raw `u64` compare
+        // is the OPK byte order. Dispatched only for strides ≤ 8.
+        let mut x = [0u8; 8];
+        x[..opk.len()].copy_from_slice(opk);
+        u64::from_be_bytes(x)
+    }
+}
+
+impl PkSortKey for u128 {
+    #[inline(always)]
+    fn from_opk(opk: &[u8]) -> u128 {
+        // Identical left-align to `u64`, one width up; `pack_pk_be` is the canonical
+        // left-align-to-`u128`, reused here. Dispatched only for strides ≤ 16.
+        pack_pk_be(opk)
+    }
+}
+
+impl PkSortKey for [u128; 2] {
+    #[inline(always)]
+    fn from_opk(opk: &[u8]) -> [u128; 2] {
+        // Dispatched only for 17..=32-byte strides: hi = the full leading 16 bytes,
+        // lo = the remaining 1..=16 bytes left-aligned. Array `Ord` is lexicographic
+        // (hi then lo), so the second limb settles a leading-16-byte collision a bare
+        // `u128` prefix would tie on.
+        let mut hi = [0u8; 16];
+        let mut lo = [0u8; 16];
+        hi.copy_from_slice(&opk[..16]);
+        lo[..opk.len() - 16].copy_from_slice(&opk[16..]);
+        [u128::from_be_bytes(hi), u128::from_be_bytes(lo)]
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Width-tagged PK byte buffer
 // ---------------------------------------------------------------------------

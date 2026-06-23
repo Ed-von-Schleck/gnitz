@@ -41,29 +41,6 @@ fn fill_cleared_batch(
     batch.consolidated = false;
 }
 
-/// Byte key to seek `trace_out` for a group, reproducing the PK that
-/// [`emit_reduce_row`]'s `emit_pk` writes. Compound output PKs are the verbatim
-/// source PK bytes; single output PKs are the OPK encoding of `group_key`
-/// (`extend_pk` writes `group_key.to_be_bytes()[16 - stride..]`). The retraction
-/// read must seek by the *output* PK, not the input row's PK — for payload
-/// GROUP BY they differ (the output PK is the synthetic group key).
-#[inline]
-fn trace_out_seek_key<'a>(
-    output_schema: &SchemaDescriptor,
-    src_pk_bytes: &'a [u8],
-    group_key: u128,
-    buf: &'a mut [u8; crate::schema::MAX_PK_BYTES],
-) -> &'a [u8] {
-    if output_schema.pk_indices().len() > 1 {
-        src_pk_bytes
-    } else {
-        let stride = output_schema.pk_stride() as usize;
-        let be = group_key.to_be_bytes();
-        buf[..stride].copy_from_slice(&be[16 - stride..]);
-        &buf[..stride]
-    }
-}
-
 /// Check if a cursor's current row matches the group columns of an exemplar row.
 pub(super) fn cursor_matches_group(
     cursor: &ReadCursor,
@@ -174,9 +151,9 @@ pub fn op_reduce(
 
     // group_set_eq_pk: GROUP BY is a permutation of the source PK columns.
     // Group membership is tested on the full PK byte window (get_pk_bytes),
-    // exact at every width, and argsort_pk_canonical orders wide PKs via the
-    // authoritative compare_pk_bytes walk — so no narrow-stride restriction is
-    // needed.
+    // exact at every width, and argsort_pk_canonical orders every PK width
+    // correctly (a width-matched key, or the compare_pk_bytes walk above 32
+    // bytes) — so no narrow-stride restriction is needed.
     // The fast path's group-detection loop walks rows in iteration order
     // and breaks on PK mismatch — sound iff iteration order is canonical
     // PK order. When `working.sorted` is set the input is already in that
@@ -206,9 +183,8 @@ pub fn op_reduce(
 
     let mb = working.as_mem_batch();
 
-    // Argsort. group_by_pk keeps `group_key = mb.get_pk(...)` and the
-    // sorted/consolidated output mark; only the iteration order changes
-    // when the input is unsorted.
+    // Argsort. group_by_pk keeps the sorted/consolidated output mark; only the
+    // iteration order changes when the input is unsorted.
     let sorted_indices: Vec<u32> = if group_by_pk && working.sorted {
         (0..n as u32).collect()
     } else if group_by_pk {
@@ -395,21 +371,31 @@ pub fn op_reduce(
         let group_start_pos = idx;
         let group_start_idx = sorted_indices[group_start_pos] as usize;
 
-        let group_key: u128 = if group_by_pk {
-            // Only a single-column output PK consumes group_key (extend_pk); a
-            // compound PK emits the verbatim source bytes, so a meaningless
-            // wide-PK u128 is unused.
-            if output_schema.pk_indices().len() == 1 {
+        // The input row's PK bytes: keys the MIN/MAX history (trace_in) seeks,
+        // which read by the *source* PK, and the group-membership compare.
+        let group_pk_bytes = mb.get_pk_bytes(group_start_idx);
+
+        // The group's *output* PK bytes, materialised once for both the trace_out
+        // retraction seek and the emitted row (so the two can never drift). A
+        // compound natural PK's output region mirrors the source PK byte-for-byte
+        // → verbatim. Every single-column output PK is the OPK encoding of the
+        // group key at the output stride: the source PK value (`get_pk`) for
+        // natural-PK grouping, the synthetic `extract_group_key` for payload GROUP
+        // BY (which differs from the input row's PK). The single-column branch
+        // owns the only width ≤ 16, so `get_pk`/`[16 - stride..]` never overrun.
+        let mut out_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
+        let out_pk_bytes: &[u8] = if group_by_pk && output_schema.pk_indices().len() > 1 {
+            group_pk_bytes
+        } else {
+            let stride = output_schema.pk_stride() as usize;
+            let key = if group_by_pk {
                 mb.get_pk(group_start_idx)
             } else {
-                0
-            }
-        } else {
-            extract_group_key(&mb, group_start_idx, input_schema, group_by_cols)
+                extract_group_key(&mb, group_start_idx, input_schema, group_by_cols)
+            };
+            out_pk_buf[..stride].copy_from_slice(&key.to_be_bytes()[16 - stride..]);
+            &out_pk_buf[..stride]
         };
-        // Byte-form group key for the wide-PK (`pk_stride > 16`) trace seeks
-        // below; `seek_bytes`/`current_pk_eq` ignore it on the narrow path.
-        let group_pk_bytes = mb.get_pk_bytes(group_start_idx);
 
         // Step linear accumulators over delta rows in this group
         for acc in accs.iter_mut() {
@@ -436,23 +422,18 @@ pub fn op_reduce(
             idx += 1;
         }
 
-        // Retraction: read old value from trace_out, keyed by the group's
-        // *output* PK (synthetic group key for payload GROUP BY, source PK
-        // for natural-PK grouping). `group_pk_bytes` is the input row's PK,
-        // which only coincides with the output PK for natural-PK grouping.
-        let mut trace_out_key_buf = [0u8; crate::schema::MAX_PK_BYTES];
-        let trace_out_key = trace_out_seek_key(output_schema, group_pk_bytes, group_key, &mut trace_out_key_buf);
-        // Natural-PK grouping visits groups in ascending output-PK order, so the
-        // retraction probe is monotone → galloping `advance_to` seeded at the
-        // live position. Payload GROUP BY keys on the synthetic `group_key`,
-        // whose order need not match trace_out storage order, so it keeps the
-        // absolute `seek_bytes` (correct for a non-monotone probe).
+        // Retraction: read old value from trace_out, keyed by the group's output
+        // PK (`out_pk_bytes`). Natural-PK grouping visits groups in ascending
+        // output-PK order, so the probe is monotone → galloping `advance_to`
+        // seeded at the live position. Payload GROUP BY keys on the synthetic
+        // group key, whose order need not match trace_out storage order, so it
+        // keeps the absolute `seek_bytes` (correct for a non-monotone probe).
         if group_by_pk {
-            trace_out_cursor.advance_to(trace_out_key);
+            trace_out_cursor.advance_to(out_pk_bytes);
         } else {
-            trace_out_cursor.seek_bytes(trace_out_key);
+            trace_out_cursor.seek_bytes(out_pk_bytes);
         }
-        let has_old = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(trace_out_key);
+        let has_old = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(out_pk_bytes);
 
         if has_old {
             // δ_out's −Agg(history) term IS the stored output row: copy trace_out's
@@ -467,7 +448,6 @@ pub fn op_reduce(
                     fin_out,
                     &raw_output,
                     raw_output.count - 1,
-                    group_key,
                     -1,
                     prog,
                     output_schema,
@@ -579,7 +559,7 @@ pub fn op_reduce(
                 &mut raw_output,
                 &mb,
                 group_start_idx,
-                group_key,
+                out_pk_bytes,
                 &accs,
                 input_schema,
                 output_schema,
@@ -594,7 +574,6 @@ pub fn op_reduce(
                     fin_out,
                     &raw_output,
                     raw_output.count - 1,
-                    group_key,
                     1,
                     prog,
                     output_schema,

@@ -2452,7 +2452,6 @@ fn test_emit_finalized_row_u128_pk_copy_col() {
         &mut fin_output,
         &raw_output,
         0,
-        pk,
         1,
         &prog,
         &raw_schema,
@@ -2533,12 +2532,12 @@ fn test_emit_reduce_row_compound_pk_bytes() {
         _pad: [0; 2],
     };
     let accs: Vec<Accumulator> = vec![Accumulator::new(&agg, &in_schema)];
-    // Synthetic group_key is irrelevant on the byte path; pass arbitrary value.
+    // Natural-PK grouping passes the source row's PK bytes; they're copied verbatim.
     emit_reduce_row(
         &mut output,
         &mb,
         0,
-        0u128,
+        mb.get_pk_bytes(0),
         &accs,
         &in_schema,
         &out_schema,

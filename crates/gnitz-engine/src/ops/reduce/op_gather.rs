@@ -77,16 +77,6 @@ pub fn op_gather_reduce(
             idx += 1;
         }
 
-        // `get_pk` panics for wide PKs (stride > 16); leave the u128 0 there. It
-        // is consumed only by the narrow seek/equality (via `seek_bytes`/
-        // `current_pk_eq`) and by `emit_gather_row`, which re-derives compound
-        // PKs from the exemplar row's bytes and ignores it.
-        let group_pk: u128 = if partial_schema.pk_is_wide() {
-            0
-        } else {
-            smb.get_pk(exemplar_row)
-        };
-
         // Read old global from trace_out, keyed by the group's OPK bytes. The
         // partial batch is sorted in output-PK order, so the per-group probe is
         // monotone → galloping `advance_to` seeded at the live position.
@@ -106,15 +96,7 @@ pub fn op_gather_reduce(
         // Emit new global if non-zero
         let any_nonzero = accs.iter().any(|a| !a.is_zero());
         if any_nonzero {
-            emit_gather_row(
-                &mut output,
-                &smb,
-                exemplar_row,
-                group_pk,
-                &accs,
-                partial_schema,
-                num_aggs,
-            );
+            emit_gather_row(&mut output, &smb, exemplar_row, &accs, partial_schema, num_aggs);
         }
     }
 

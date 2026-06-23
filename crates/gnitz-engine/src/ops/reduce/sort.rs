@@ -2,8 +2,8 @@
 
 use std::cmp::Ordering;
 
-use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
-use crate::storage::{compare_pk_bytes, pk_sort_key, scatter_copy, with_payload_cmp, write_to_batch, Batch, MemBatch};
+use crate::schema::{key::PkSortKey, SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::storage::{compare_pk_bytes, scatter_copy, with_payload_cmp, write_to_batch, Batch, MemBatch};
 
 use super::super::util::cmp_col_window;
 
@@ -159,65 +159,55 @@ pub(super) fn argsort_delta(batch: &Batch, schema: &SchemaDescriptor, group_by_c
     indices
 }
 
-/// Argsort indices into canonical PK order (`pk_indices` order as defined by
-/// `compare_pk_bytes`). Narrow PKs (`pk_stride ≤ 16`) materialise an order-
-/// preserving `pk_sort_key` (`pack_pk_be`) once and sort by a raw `u128`
-/// compare — ascending `u128` equals canonical PK order for unsigned, signed,
-/// and compound alike. Wide PKs sort off the authoritative `compare_pk_bytes`
-/// byte walk, since `pk_sort_key` is only a non-authoritative 16-byte prefix
-/// there and this argsort has no payload tiebreak.
-pub(super) fn argsort_pk_canonical(mb: &MemBatch) -> Vec<u32> {
-    let n = mb.count;
-    let mut idx: Vec<u32> = (0..n as u32).collect();
-    if mb.pk_stride as usize > 16 {
-        // pk_sort_key is only a 16-byte prefix here; settle prefix collisions
-        // (and order col-major compound keys) with the authoritative walk.
-        idx.sort_unstable_by(|&a, &b| compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)));
-    } else {
-        // Order-preserving narrow key: raw `u128` ascending == canonical PK
-        // order for unsigned, signed, and compound alike.
-        let pks: Vec<u128> = (0..n).map(|i| pk_sort_key(mb.get_pk_bytes(i))).collect();
-        idx.sort_unstable_by_key(|&i| pks[i as usize]);
-    }
-    idx
-}
-
-/// Sort `indices` by `pk_cmp(pks[i], pks[j])`, tie-breaking on `row_cmp`.
-/// Generic over both closure types so the comparator monomorphises and
-/// inlines through `sort_unstable_by` — load-bearing for sort speed.
-fn sort_indices_by_pk_then_row<PkCmp, RowCmp>(indices: &mut [u32], pks: &[u128], pk_cmp: PkCmp, row_cmp: RowCmp)
-where
-    PkCmp: Fn(u128, u128) -> Ordering + Copy,
-    RowCmp: Fn(usize, usize) -> Ordering + Copy,
-{
-    indices.sort_unstable_by(|&a, &b| match pk_cmp(pks[a as usize], pks[b as usize]) {
-        Ordering::Equal => row_cmp(a as usize, b as usize),
-        ord => ord,
+/// Sort `indices` by a width-matched `PkSortKey` (materialised once per row), then
+/// `tiebreak` on a full-key tie. The key is the whole OPK image, so `tiebreak`
+/// fires only on a true PK duplicate — never as an intervening PK-byte compare.
+/// Keys are read by reference (not `sort_unstable_by_key`, which would re-copy the
+/// 32-byte `[u128; 2]` key per comparison).
+fn sort_indices_keyed<K: PkSortKey, F: Fn(usize, usize) -> Ordering>(mb: &MemBatch, indices: &mut [u32], tiebreak: F) {
+    let keys: Vec<K> = (0..mb.count).map(|i| K::from_opk(mb.get_pk_bytes(i))).collect();
+    indices.sort_unstable_by(|&a, &b| {
+        keys[a as usize]
+            .cmp(&keys[b as usize])
+            .then_with(|| tiebreak(a as usize, b as usize))
     });
 }
 
-/// Sort `indices` into (PK, payload) order. PK width chooses the primary axis;
-/// `row_cmp` is the payload tiebreak supplied by `with_payload_cmp!`, adapted
-/// here to the 2-arg form the sort helpers expect.
-fn sort_owned_indices<RowCmp>(schema: &SchemaDescriptor, mb: &MemBatch, n: usize, indices: &mut [u32], row_cmp: RowCmp)
+/// Sort `indices` into canonical (PK, tiebreak) order. `pk_stride` selects the
+/// width-matched key — `u64`/`u128`/`[u128; 2]` for strides ≤8/≤16/≤32 (the cutoffs
+/// are the key widths) — each the full OPK image, so a plain key compare is exact
+/// for unsigned, signed, and compound PKs alike. PKs too wide to pack (`> 32` B —
+/// exotic 3–5 wide-column composites) byte-walk the OPK regions via
+/// `compare_pk_bytes`. `tiebreak` settles full-key ties: a payload compare for
+/// `sort_owned`, a no-op for a pure-PK argsort (the latter folds away in codegen).
+fn sort_indices_by_pk<F: Fn(usize, usize) -> Ordering + Copy>(mb: &MemBatch, indices: &mut [u32], tiebreak: F) {
+    match mb.pk_stride as usize {
+        0..=8 => sort_indices_keyed::<u64, _>(mb, indices, tiebreak),
+        9..=16 => sort_indices_keyed::<u128, _>(mb, indices, tiebreak),
+        17..=32 => sort_indices_keyed::<[u128; 2], _>(mb, indices, tiebreak),
+        _ => indices.sort_unstable_by(|&a, &b| {
+            compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize))
+                .then_with(|| tiebreak(a as usize, b as usize))
+        }),
+    }
+}
+
+/// Argsort indices into canonical PK order (`compare_pk_bytes` order). No payload
+/// tiebreak — rows sharing a PK keep arbitrary relative order (reduce groups them
+/// regardless of order within a PK).
+pub(super) fn argsort_pk_canonical(mb: &MemBatch) -> Vec<u32> {
+    let mut idx: Vec<u32> = (0..mb.count as u32).collect();
+    sort_indices_by_pk(mb, &mut idx, |_, _| Ordering::Equal);
+    idx
+}
+
+/// `with_payload_cmp!` target: adapt the 5-arg payload comparator to the 2-arg
+/// full-key tiebreak `sort_indices_by_pk` wants, fixing `schema`/`mb`.
+fn sort_owned_indices<RowCmp>(schema: &SchemaDescriptor, mb: &MemBatch, indices: &mut [u32], row_cmp: RowCmp)
 where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
-    let row_cmp = |a: usize, b: usize| row_cmp(schema, mb, a, mb, b);
-    if schema.pk_is_wide() {
-        // Wide: authoritative column walk primary, payload tiebreak.
-        indices.sort_unstable_by(|&a, &b| {
-            match compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize)) {
-                Ordering::Equal => row_cmp(a as usize, b as usize),
-                ord => ord,
-            }
-        });
-    } else {
-        // Narrow: order-preserving raw-`u128` key (unsigned/signed/compound),
-        // payload tiebreak. The PK axis is a single primitive compare.
-        let pks: Vec<u128> = (0..n).map(|i| pk_sort_key(mb.get_pk_bytes(i))).collect();
-        sort_indices_by_pk_then_row(indices, &pks, |a, b| a.cmp(&b), row_cmp);
-    }
+    sort_indices_by_pk(mb, indices, |a, b| row_cmp(schema, mb, a, mb, b));
 }
 
 /// Sort batch by (PK, payload) without consolidation.
@@ -232,9 +222,9 @@ pub(super) fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
 
     let mut indices: Vec<u32> = (0..n as u32).collect();
 
-    // Select the payload comparator once on the outside, branch on PK width
-    // inside `sort_owned_indices` — the inverse nesting of the old 2×N match.
-    with_payload_cmp!(schema, sort_owned_indices, schema, &mb, n, &mut indices);
+    // Select the payload comparator once on the outside; `sort_owned_indices`
+    // branches on PK width inside and uses it as the full-key tiebreak.
+    with_payload_cmp!(schema, sort_owned_indices, schema, &mb, &mut indices);
 
     let blob_cap = mb.blob.len().max(1);
     let mut output = write_to_batch(schema, n, blob_cap, |writer| {
@@ -242,4 +232,181 @@ pub(super) fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
     });
     output.sorted = true;
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{argsort_pk_canonical, sort_owned};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+    use crate::storage::{compare_pk_bytes, Batch};
+
+    /// One batch row per supplied OPK byte vector (each must be `pk_stride` bytes),
+    /// weight 1, null word 0, one zeroed I64 payload column — all the PK-sort paths
+    /// need (they read only `pk_stride` + `get_pk_bytes`). Shared by the tests and
+    /// the bench.
+    fn build_pk_batch(schema: &SchemaDescriptor, pk_rows: &[Vec<u8>]) -> Batch {
+        let mut b = Batch::with_schema(*schema, pk_rows.len().max(1));
+        for pk in pk_rows {
+            b.extend_pk_bytes(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    fn schema_single_pk(pk_tc: u8) -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[SchemaColumn::new(pk_tc, 0), SchemaColumn::new(type_code::I64, 0)],
+            &[0],
+        )
+    }
+
+    fn schema_3xu64_pk() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0, 1, 2],
+        )
+    }
+
+    /// Both PK-sort entry points must reproduce the authoritative `compare_pk_bytes`
+    /// order. PKs are distinct, so the (unstable) sort yields a unique order and the
+    /// ordered key bytes compare exactly; `sort_owned`'s payload tiebreak stays inert.
+    fn assert_canonical_order(schema: &SchemaDescriptor, pk_rows: &[Vec<u8>]) {
+        let mut want: Vec<u32> = (0..pk_rows.len() as u32).collect();
+        want.sort_by(|&a, &b| compare_pk_bytes(&pk_rows[a as usize], &pk_rows[b as usize]));
+        let want_keys: Vec<&[u8]> = want.iter().map(|&i| pk_rows[i as usize].as_slice()).collect();
+
+        let batch = build_pk_batch(schema, pk_rows);
+        let mb = batch.as_mem_batch();
+        let got = argsort_pk_canonical(&mb);
+        let got_keys: Vec<&[u8]> = got.iter().map(|&i| mb.get_pk_bytes(i as usize)).collect();
+        assert_eq!(got_keys, want_keys, "argsort_pk_canonical order mismatch");
+
+        let mut unsorted = build_pk_batch(schema, pk_rows);
+        unsorted.sorted = false;
+        let sorted = sort_owned(&unsorted, schema);
+        let smb = sorted.as_mem_batch();
+        let so_keys: Vec<&[u8]> = (0..sorted.count).map(|i| smb.get_pk_bytes(i)).collect();
+        assert_eq!(so_keys, want_keys, "sort_owned order mismatch");
+    }
+
+    #[test]
+    fn argsort_u64_arm_full_and_subwidth() {
+        // stride 8 (u64 arm): high-bit / signed-OPK byte shapes must order by raw
+        // unsigned byte compare (the OPK sign-flip lives in the bytes).
+        assert_canonical_order(
+            &schema_single_pk(type_code::U64),
+            &[
+                vec![0x80, 0, 0, 0, 0, 0, 0, 1],
+                vec![0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd],
+                vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                vec![0, 0, 0, 0, 0, 0, 0, 5],
+                vec![0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ],
+        );
+        // stride 4 (u64 arm, sub-width): left-align into the high bytes preserves order.
+        assert_canonical_order(
+            &schema_single_pk(type_code::U32),
+            &[
+                vec![0xff, 0, 0, 1],
+                vec![0, 0, 0, 9],
+                vec![0x80, 0, 0, 0],
+                vec![0, 0, 0, 1],
+            ],
+        );
+    }
+
+    #[test]
+    fn argsort_u128_arm() {
+        let mk = |hi: u8, lo: u8| {
+            let mut v = vec![0u8; 16];
+            v[0] = hi;
+            v[15] = lo;
+            v
+        };
+        assert_canonical_order(
+            &schema_single_pk(type_code::U128),
+            &[mk(0xff, 2), mk(0, 9), mk(0x80, 1), mk(0, 1), mk(0xff, 1)],
+        );
+    }
+
+    #[test]
+    fn argsort_u128x2_arm_with_leading16_collision() {
+        // stride 24 ([u128;2] arm). Rows sharing their leading 16 bytes and differing
+        // only in the tail MUST be ordered by the second limb — a bare u128 prefix
+        // would tie them and risk mis-merging distinct compound PKs (weight corruption).
+        let shared = [0xab_u8; 16];
+        let mk_tail = |tail: u64| {
+            let mut v = Vec::with_capacity(24);
+            v.extend_from_slice(&shared);
+            v.extend_from_slice(&tail.to_be_bytes());
+            v
+        };
+        let mk = |a: u64, b: u64, c: u64| {
+            let mut v = Vec::with_capacity(24);
+            v.extend_from_slice(&a.to_be_bytes());
+            v.extend_from_slice(&b.to_be_bytes());
+            v.extend_from_slice(&c.to_be_bytes());
+            v
+        };
+        assert_canonical_order(
+            &schema_3xu64_pk(),
+            &[
+                mk_tail(7),
+                mk(0, 0, 0),
+                mk_tail(2),
+                mk(0xffff_ffff_ffff_ffff, 0, 0),
+                mk_tail(5),
+            ],
+        );
+    }
+
+    /// Regression guard — time `argsort_pk_canonical` over a shuffled ~1M-row batch
+    /// at each keyed arm. `#[ignore]`; run release:
+    ///   cargo test -p gnitz-engine --release reduce_sort -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore]
+    fn reduce_sort_argsort_bench() {
+        let n = 1_000_000usize;
+        for &stride in &[8usize, 16, 24] {
+            let schema = match stride {
+                8 => schema_single_pk(type_code::U64),
+                16 => schema_single_pk(type_code::U128),
+                _ => schema_3xu64_pk(),
+            };
+            let rows: Vec<Vec<u8>> = (0..n)
+                .map(|i| {
+                    let mut v = vec![0u8; stride];
+                    let mut chunk = 0usize;
+                    while chunk * 8 < stride {
+                        let seed = (i as u64)
+                            .wrapping_add((chunk as u64).wrapping_mul(0x1000))
+                            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        let start = chunk * 8;
+                        let end = (start + 8).min(stride);
+                        v[start..end].copy_from_slice(&seed.to_be_bytes()[..end - start]);
+                        chunk += 1;
+                    }
+                    v
+                })
+                .collect();
+            let batch = build_pk_batch(&schema, &rows);
+            let mb = batch.as_mem_batch();
+
+            let t = std::time::Instant::now();
+            let idx = argsort_pk_canonical(&mb);
+            let dt = t.elapsed();
+            std::hint::black_box(&idx);
+
+            let mrps = n as f64 / dt.as_secs_f64() / 1e6;
+            println!("argsort stride {stride}: {n} rows in {dt:?} = {mrps:.1} M rows/s");
+        }
+    }
 }
