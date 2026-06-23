@@ -36,7 +36,8 @@ pub(crate) use batch::{
     MAX_WIRE_REGIONS,
 };
 pub(crate) use columnar::{
-    cmp_col_window, compare_pk_bytes, compare_rows, compare_rows_fixedint_nonnull, opk_key, with_payload_cmp,
+    cmp_col_window, compare_pk_bytes, compare_pk_ordering, compare_rows, compare_rows_fixedint_nonnull, opk_key,
+    with_payload_cmp,
 };
 pub(crate) use lsm::manifest::PkBuf;
 #[cfg(test)]

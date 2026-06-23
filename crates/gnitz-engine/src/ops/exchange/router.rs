@@ -284,6 +284,32 @@ pub(super) fn compound_join_packer(
         .then(|| ReindexPacker::new(schema, col_indices, target_tcs))
 }
 
+/// Route one non-PK-keyed scatter row to its partition. When `join_packer` is
+/// `Some` (a promoted/compound JoinPromote key) the row packs to the SAME
+/// `_join_pk` OPK bytes the reindex Map writes and routes by `partition_for_pk_bytes`,
+/// so the delta scatter and the reindexed trace co-partition byte-for-byte; every
+/// other non-PK key hashes via `hash_row_for_partition`. The caller hoists
+/// `pack_buf` (one `MAX_PK_BYTES` scratch reused across rows — `pack_into` fully
+/// overwrites the `out_stride` prefix it reads). The single home of the pack-or-hash
+/// decision, shared by `op_repartition_batches_mode` and `relay_scatter_merge_walk`
+/// so the two scatter paths cannot drift.
+pub(super) fn route_nonpk_row(
+    mb: &MemBatch,
+    row: usize,
+    join_packer: &Option<ReindexPacker>,
+    pack_buf: &mut [u8],
+    col_indices: &[u32],
+    schema: &SchemaDescriptor,
+    mode: RouteMode,
+) -> usize {
+    if let Some(p) = join_packer {
+        p.pack_into(pack_buf, mb, row);
+        partition_for_pk_bytes(&pack_buf[..p.out_stride])
+    } else {
+        hash_row_for_partition(mb, row, col_indices, schema, mode)
+    }
+}
+
 fn fill_worker_indices(
     batch: &Batch,
     col_indices: &[u32],

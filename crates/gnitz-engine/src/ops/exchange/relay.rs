@@ -7,18 +7,23 @@ use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::{
-    compare_pk_bytes, partition_for_key, partition_for_pk_bytes, pk_sort_key, scatter_multi_source, write_to_batch,
-    Batch, ConsolidatedBatch, MemBatch,
+    compare_pk_ordering, partition_for_pk_bytes, pk_sort_key, scatter_multi_source, write_to_batch, Batch,
+    ConsolidatedBatch, MemBatch,
 };
 
-use super::router::{build_w_map, compound_join_packer, hash_row_for_partition, key_is_promoted, RouteMode};
-// `SCATTER_INDICES` + the `ReindexPacker` are reached only from the `#[cfg(test)]`
-// scatter helpers / co-partition tests below; production relay paths build their
-// own worker-row scratch (`WORKER_ROWS`).
+use super::router::{build_w_map, compound_join_packer, key_is_promoted, route_nonpk_row, RouteMode};
+// `SCATTER_INDICES` + the `ReindexPacker`, plus `hash_row_for_partition`,
+// `partition_for_key`, and `compare_pk_bytes`, are reached only from the
+// `#[cfg(test)]` scatter helpers / co-partition tests below; production relay paths
+// build their own worker-row scratch (`WORKER_ROWS`), route through
+// `route_nonpk_row` / `partition_for_pk_bytes`, and settle PK ties with the
+// canonical `compare_pk_ordering`.
 #[cfg(test)]
 use super::super::reindex::ReindexPacker;
 #[cfg(test)]
-use super::router::{compute_worker_indices, worker_for_partition, SCATTER_INDICES};
+use super::router::{compute_worker_indices, hash_row_for_partition, worker_for_partition, SCATTER_INDICES};
+#[cfg(test)]
+use crate::storage::{compare_pk_bytes, partition_for_key};
 
 // Thread-local pool: reuse Vec<Vec<(u8,u32)>> worker-row scratch across calls.
 thread_local! {
@@ -136,15 +141,9 @@ pub(crate) fn op_repartition_batches_mode(
                     let partition = partition_for_pk_bytes(mb.get_pk_bytes(i));
                     worker_rows[w_map[partition]].push((si as u8, i as u32));
                 }
-            } else if let Some(p) = &join_packer {
-                for i in 0..mb.count {
-                    p.pack_into(&mut pack_buf, mb, i);
-                    let partition = partition_for_pk_bytes(&pack_buf[..p.out_stride]);
-                    worker_rows[w_map[partition]].push((si as u8, i as u32));
-                }
             } else {
                 for i in 0..mb.count {
-                    let partition = hash_row_for_partition(mb, i, col_indices, schema, mode);
+                    let partition = route_nonpk_row(mb, i, &join_packer, &mut pack_buf, col_indices, schema, mode);
                     worker_rows[w_map[partition]].push((si as u8, i as u32));
                 }
             }
@@ -183,37 +182,32 @@ pub(crate) fn op_repartition_batches_mode(
     })
 }
 
-/// Unified merge-walk skeleton. One body owns the determinism-critical logic
-/// (bulk-drain, source-index tiebreak, swap_remove). `DO_REFILL` const-gates
-/// the narrow-only cache refill so the wide path never calls `get_pk`
-/// (which would panic for `pk_stride > 16`). The `pk_val` argument to `route`
-/// must also be gated: function arguments are eagerly evaluated, so reading
-/// `mb.get_pk(row)` unconditionally would panic on wide-PK batches even
-/// though the wide route closure ignores the value.
-///
-/// Two parallel caches with disjoint roles: `pk_cache` holds the raw routing
-/// value (`get_pk`, feeds `partition_for_key` — order-irrelevant, must stay
-/// consistent with every partitioner); `order_cache` holds the order-preserving
-/// `pk_sort_key`, read only by `select_min` for the winner pick. Decoupling
-/// them lets the winner pick use a raw `u128` compare without disturbing
-/// routing.
+/// Unified K-way merge-walk skeleton — one body, one comparator, every PK width.
+/// `order_cache[si]` holds each active source's order-preserving `pk_sort_key`
+/// (the leading-≤16 OPK bytes packed big-endian: the whole key for `pk_stride ≤ 16`,
+/// the order-preserving prefix for `> 16`; `pk_sort_key` never panics, unlike
+/// `get_pk`, which debug_asserts `stride ≤ 16`). The winner each step is the source
+/// whose cached key is smallest — the register compare is the common fast path, and
+/// a key tie defers to the canonical `compare_pk_ordering` on the live OPK bytes,
+/// whose own `len > 16` guard no-ops a `≤ 16` tie (the cached key is then the whole
+/// PK, so equal keys are byte-equal) and reserves the byte tiebreak for a `> 16`
+/// prefix collision — then on ascending source index (deterministic under
+/// `swap_remove`'s scramble of `active_sources`). `route` partitions each emitted
+/// row through `partition_for_pk_bytes` (or the group/packer path) — byte-correct at
+/// any width. No width fork, no `get_pk`, no `pk_cache`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn relay_walk_inner<'a, const DO_REFILL: bool, Sel, Route>(
+fn relay_walk_inner<'a, Route>(
     mem_batches: &[Option<MemBatch<'a>>],
     w_map: &[usize; 256],
     worker_rows: &mut [Vec<(u8, u32)>],
-    pk_cache: &mut [u128; 256],
     order_cache: &mut [u128; 256],
-    _schema: &SchemaDescriptor,
     mut cursors: [u32; 256],
     mut active_sources: [u8; 256],
     mut num_active: usize,
-    select_min: Sel,
-    route: Route,
+    mut route: Route,
 ) where
-    Sel: Fn(&[u128; 256], &[u32; 256], &[u8; 256], usize) -> usize + Copy,
-    Route: Fn(&MemBatch<'a>, usize, u128) -> usize + Copy,
+    Route: FnMut(&MemBatch<'a>, usize) -> usize,
 {
     while num_active > 0 {
         if num_active == 1 {
@@ -221,29 +215,56 @@ fn relay_walk_inner<'a, const DO_REFILL: bool, Sel, Route>(
             let si = active_sources[0] as usize;
             let mb = mem_batches[si].as_ref().unwrap();
             for row in cursors[si] as usize..mb.count {
-                let pk_val = if DO_REFILL { mb.get_pk(row) } else { 0u128 };
-                worker_rows[w_map[route(mb, row, pk_val)]].push((si as u8, row as u32));
+                worker_rows[w_map[route(mb, row)]].push((si as u8, row as u32));
             }
             return;
         }
 
-        let best_pos = select_min(&*order_cache, &cursors, &active_sources, num_active);
-        let best_si = active_sources[best_pos] as usize;
+        // Winner = smallest cached `pk_sort_key`, a cache tie settled by the
+        // comparator below, then by ascending source index.
+        let mut best_pos = 0usize;
+        let mut best_si = active_sources[0];
+        let mut best_key = order_cache[best_si as usize];
+        #[allow(clippy::needless_range_loop)]
+        for pos in 1..num_active {
+            let si = active_sources[pos];
+            let key = order_cache[si as usize];
+            let ord = match key.cmp(&best_key) {
+                // Cached-key tie: settle on the live OPK bytes through the canonical
+                // comparator. Its `len > 16` guard no-ops a `≤ 16` tie (the cached
+                // key is the whole PK, so equal keys are byte-equal) and runs the
+                // memcmp only on a `> 16` prefix collision.
+                Ordering::Equal => compare_pk_ordering(
+                    mem_batches[si as usize]
+                        .as_ref()
+                        .unwrap()
+                        .get_pk_bytes(cursors[si as usize] as usize),
+                    mem_batches[best_si as usize]
+                        .as_ref()
+                        .unwrap()
+                        .get_pk_bytes(cursors[best_si as usize] as usize),
+                ),
+                other => other,
+            };
+            if ord == Ordering::Less || (ord == Ordering::Equal && si < best_si) {
+                best_pos = pos;
+                best_si = si;
+                best_key = key;
+            }
+        }
+
+        let best_si = best_si as usize;
         let row = cursors[best_si] as usize;
         cursors[best_si] += 1;
         let mb = mem_batches[best_si].as_ref().unwrap();
-        // K-way path: pass the already-cached PK to `route` so narrow PK
-        // routing reuses the loaded value instead of re-reading from `mb`.
-        let pk_val = if DO_REFILL { pk_cache[best_si] } else { 0u128 };
-        worker_rows[w_map[route(mb, row, pk_val)]].push((best_si as u8, row as u32));
+        worker_rows[w_map[route(mb, row)]].push((best_si as u8, row as u32));
 
         let new_cur = cursors[best_si] as usize;
         if new_cur == mb.count {
             // Swap-remove the exhausted source in O(1).
             num_active -= 1;
             active_sources[best_pos] = active_sources[num_active];
-        } else if DO_REFILL {
-            pk_cache[best_si] = mb.get_pk(new_cur);
+        } else {
             order_cache[best_si] = pk_sort_key(mb.get_pk_bytes(new_cur));
         }
     }
@@ -268,9 +289,6 @@ fn relay_scatter_merge_walk(
     );
     let w_map = build_w_map(num_workers);
     let cursors = [0u32; 256];
-    let mut pk_cache = [0u128; 256];
-    // Parallel order-preserving key cache for the winner pick (narrow only);
-    // pk_cache keeps the raw routing value. +4 KiB stack, only active slots read.
     let mut order_cache = [0u128; 256];
     let mut active_sources = [0u8; 256];
     let mut num_active: usize = 0;
@@ -280,17 +298,14 @@ fn relay_scatter_merge_walk(
     }
     worker_rows[..num_workers].iter_mut().for_each(Vec::clear);
 
-    // pk_cache (raw routing value) and order_cache (order-preserving winner key)
-    // are filled for narrow regions only; wide PKs (pk_stride > 16) cannot pack
-    // into u128 and would panic in get_pk — the wide path reads PK bytes direct.
-    let is_wide = schema.pk_is_wide();
+    // One order-preserving winner key per active source, valid at every PK width:
+    // `pk_sort_key` packs the leading ≤16 OPK bytes big-endian — the whole key for
+    // stride ≤ 16, the order-preserving prefix for > 16. Never panics (unlike
+    // `get_pk`, which debug_asserts stride ≤ 16).
     for (si, mb_opt) in mem_batches.iter().enumerate() {
         if let Some(mb) = mb_opt {
             if mb.count > 0 {
-                if !is_wide {
-                    pk_cache[si] = mb.get_pk(0);
-                    order_cache[si] = pk_sort_key(mb.get_pk_bytes(0));
-                }
+                order_cache[si] = pk_sort_key(mb.get_pk_bytes(0));
                 active_sources[num_active] = si as u8;
                 num_active += 1;
             }
@@ -299,10 +314,7 @@ fn relay_scatter_merge_walk(
 
     // Strict sequence equality (see `fill_worker_indices`): set equality would
     // route a permuted compound PK to a different worker than the schema-order
-    // `partition_for_pk_bytes` on the other join side. For narrow PKs,
-    // `partition_for_key(get_pk value)` equals `partition_for_pk_bytes(OPK)`
-    // (both reduce to `partition_for_key(widen_pk_be)`), so the value-cache
-    // route path stays consistent.
+    // `partition_for_pk_bytes` on the other join side.
     // A promoted join key must not take the native-PK fast-path (its source PK is
     // at the narrow width, the trace `_join_pk` is `T`-wide); route it through the
     // packer so the two sides co-partition.
@@ -310,139 +322,42 @@ fn relay_scatter_merge_walk(
 
     // Compound/promoted JoinPromote routes by the packed `_join_pk` (see
     // `compound_join_packer`) — the consolidated join path, exactly where
-    // co-partition must hold. The packer is captured by shared ref so the
-    // `route_group` closure stays `Copy` (`&T` is `Copy`), satisfying the
-    // `Route: Fn + Copy` bound on `relay_walk_inner`; the per-row scratch buffer
-    // therefore lives INSIDE the closure (a captured `&mut buf` would make it
-    // non-`Copy`).
+    // co-partition must hold.
     let join_packer = compound_join_packer(mode, col_indices, target_tcs, schema);
 
-    // Route closures — 3-arg form. pk_val is the cached PK in the K-way
-    // path and `get_pk(row)` in the bulk-drain (both narrow only).
-    let route_pk_narrow = |_mb: &MemBatch, _row: usize, pk_val: u128| partition_for_key(pk_val);
-    let route_pk_wide = |mb: &MemBatch, row: usize, _pk_val: u128| partition_for_pk_bytes(mb.get_pk_bytes(row));
-    let route_group = |mb: &MemBatch, row: usize, _pk_val: u128| {
-        if let Some(p) = &join_packer {
-            let mut buf = [0u8; gnitz_wire::MAX_PK_BYTES];
-            p.pack_into(&mut buf, mb, row);
-            partition_for_pk_bytes(&buf[..p.out_stride])
-        } else {
-            hash_row_for_partition(mb, row, col_indices, schema, mode)
-        }
-    };
-
-    if !is_wide {
-        // Narrow winner-comparator: a raw `u128` compare on the order-preserving
-        // key (unsigned/signed/compound alike) — no pk_fast/slow_cmp branch.
-        let select_narrow =
-            move |order_cache: &[u128; 256], _cursors: &[u32; 256], active: &[u8; 256], n: usize| -> usize {
-                let mut best_pos = 0;
-                let mut best_key = order_cache[active[0] as usize];
-                let mut best_si_u8 = active[0];
-                #[allow(clippy::needless_range_loop)]
-                for pos in 1..n {
-                    let si = active[pos];
-                    let key = order_cache[si as usize];
-                    // Source-index tiebreak: swap_remove scrambles active_sources,
-                    // so equal-key winners would otherwise be
-                    // eviction-history-dependent.
-                    if key < best_key || (key == best_key && si < best_si_u8) {
-                        best_key = key;
-                        best_pos = pos;
-                        best_si_u8 = si;
-                    }
-                }
-                best_pos
-            };
-
-        if is_pk_routing {
-            relay_walk_inner::<true, _, _>(
-                mem_batches,
-                &w_map,
-                worker_rows,
-                &mut pk_cache,
-                &mut order_cache,
-                schema,
-                cursors,
-                active_sources,
-                num_active,
-                select_narrow,
-                route_pk_narrow,
-            );
-        } else {
-            relay_walk_inner::<true, _, _>(
-                mem_batches,
-                &w_map,
-                worker_rows,
-                &mut pk_cache,
-                &mut order_cache,
-                schema,
-                cursors,
-                active_sources,
-                num_active,
-                select_narrow,
-                route_group,
-            );
-        }
+    // Two routes, picked once (never per row): the PK fast path is a bare
+    // `partition_for_pk_bytes` over the OPK bytes — byte-identical to the old narrow
+    // `partition_for_key(get_pk)` route (both reduce to `mix(widen_pk_be(bytes))`)
+    // and the old wide route. The non-PK path defers to the shared `route_nonpk_row`
+    // (the pack-or-hash decision), reusing one hoisted `pack_buf` across rows; the
+    // `&mut pack_buf` capture is why `relay_walk_inner` takes `FnMut`, not `Fn`.
+    if is_pk_routing {
+        let route_pk = |mb: &MemBatch, row: usize| partition_for_pk_bytes(mb.get_pk_bytes(row));
+        relay_walk_inner(
+            mem_batches,
+            &w_map,
+            worker_rows,
+            &mut order_cache,
+            cursors,
+            active_sources,
+            num_active,
+            route_pk,
+        );
     } else {
-        // Wide winner-comparator: read raw PK bytes per source on demand and
-        // delegate to the column-aware compare_pk_bytes. The winner's bytes
-        // are cached across the inner scan to avoid re-unwrap/re-slice on
-        // every iteration.
-        let select_wide = |_pk_cache: &[u128; 256], cursors: &[u32; 256], active: &[u8; 256], n: usize| -> usize {
-            let mut best_pos = 0;
-            let mut best_si_u8 = active[0];
-            let mut best_pk_bytes = mem_batches[best_si_u8 as usize]
-                .as_ref()
-                .unwrap()
-                .get_pk_bytes(cursors[best_si_u8 as usize] as usize);
-            #[allow(clippy::needless_range_loop)]
-            for pos in 1..n {
-                let si = active[pos];
-                let si_idx = si as usize;
-                let pk = mem_batches[si_idx]
-                    .as_ref()
-                    .unwrap()
-                    .get_pk_bytes(cursors[si_idx] as usize);
-                let ord = compare_pk_bytes(pk, best_pk_bytes);
-                if ord == Ordering::Less || (ord == Ordering::Equal && si < best_si_u8) {
-                    best_pos = pos;
-                    best_si_u8 = si;
-                    best_pk_bytes = pk;
-                }
-            }
-            best_pos
+        let mut pack_buf = [0u8; gnitz_wire::MAX_PK_BYTES];
+        let route_group = |mb: &MemBatch, row: usize| {
+            route_nonpk_row(mb, row, &join_packer, &mut pack_buf, col_indices, schema, mode)
         };
-
-        if is_pk_routing {
-            relay_walk_inner::<false, _, _>(
-                mem_batches,
-                &w_map,
-                worker_rows,
-                &mut pk_cache,
-                &mut order_cache,
-                schema,
-                cursors,
-                active_sources,
-                num_active,
-                select_wide,
-                route_pk_wide,
-            );
-        } else {
-            relay_walk_inner::<false, _, _>(
-                mem_batches,
-                &w_map,
-                worker_rows,
-                &mut pk_cache,
-                &mut order_cache,
-                schema,
-                cursors,
-                active_sources,
-                num_active,
-                select_wide,
-                route_group,
-            );
-        }
+        relay_walk_inner(
+            mem_batches,
+            &w_map,
+            worker_rows,
+            &mut order_cache,
+            cursors,
+            active_sources,
+            num_active,
+            route_group,
+        );
     }
 }
 
@@ -659,7 +574,7 @@ pub(super) fn op_multi_scatter(
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD};
-    use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
+    use crate::test_support::{make_wide_batch, opk_pk, wide_pk_3xu64_schema};
 
     #[test]
     #[should_panic(expected = "source index must fit in u8")]
@@ -757,10 +672,15 @@ mod tests {
         let num_workers = 4;
         // (1,1,*) prefix-twins span the three sources: they share the leading
         // BE(1)++BE(1) 16-byte OPK prefix and differ only in the trailing column,
-        // so the scatter's wide comparator (`select_wide`) must walk past byte 16.
+        // so the unified `relay_walk_inner` comparator must fall through its cached
+        // 16-byte-prefix register compare to the `compare_pk_bytes` byte tiebreak
+        // (the twins are byte-distinct, so that fallback is decisive — never Equal).
         // The multi-byte values are LE/BE order inversions — c2 ∈ {1,2,256,257}
         // and c0 ∈ {2,256} — so OPK encoding is load-bearing for the builder's
         // sorted assert (a dropped BE flip sorts 256 before 1/2 and trips it).
+        // Additionally, b1 and b2 both carry PK (3,3,3) with DISTINCT payloads
+        // (99 vs 31): a byte-EQUAL wide PK whose `compare_pk_bytes` fallback returns
+        // Equal, exercising the source-index tiebreak at wide width.
         let b0 = make_wide_batch(
             &schema,
             &[
@@ -774,6 +694,7 @@ mod tests {
             &[
                 (1, 1, 257, 1, 20), // third prefix-twin
                 (2, 2, 2, 1, 21),
+                (3, 3, 3, 1, 99),   // byte-equal twin of b2's (3,3,3); distinct payload 99
                 (256, 0, 0, 1, 22), // c0 multi-byte: under LE this sorts before (2,2,2)
             ],
         );
@@ -781,14 +702,16 @@ mod tests {
             &schema,
             &[
                 (1, 1, 2, 1, 30), // fourth prefix-twin
-                (3, 3, 3, 1, 31),
+                (3, 3, 3, 1, 31), // byte-equal twin of b1's (3,3,3); distinct payload 31
                 (7, 0, 0, 1, 32),
             ],
         );
+        // sources[1] = b1 (si=1), sources[2] = b2 (si=2): the tiebreak must emit
+        // b1's (3,3,3) copy before b2's.
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
         let result = op_relay_scatter_consolidated(&sources, schema.pk_indices(), &schema, num_workers);
 
-        assert_eq!(total_rows(&result), 9);
+        assert_eq!(total_rows(&result), 10);
         for (w, sb) in result.iter().enumerate() {
             // (a) Non-decreasing under the column-aware comparator.
             for r in 1..sb.count {
@@ -807,11 +730,34 @@ mod tests {
                 assert_eq!(expected, w, "wide PK routed to wrong worker");
             }
         }
+
+        // (c) Byte-equal wide-PK source-index tiebreak. b1 (si=1) and b2 (si=2)
+        // both carry PK (3,3,3): equal cached prefix AND equal full OPK bytes, so
+        // the comparator's `compare_pk_bytes` fallback returns Equal and the
+        // ascending-source-index tiebreak decides. Both copies co-locate (equal PK
+        // → equal partition) and emit adjacently in merge order, so collecting the
+        // (3,3,3) payloads across workers yields b1's 99 before b2's 31.
+        let pk_333 = opk_pk(&schema, &[3, 3, 3]);
+        let mut payloads_333 = Vec::new();
+        for sb in &result {
+            for r in 0..sb.count {
+                if sb.get_pk_bytes(r) == pk_333.as_slice() {
+                    payloads_333.push(i64::from_le_bytes(sb.col_data(0)[r * 8..r * 8 + 8].try_into().unwrap()));
+                }
+            }
+        }
+        assert_eq!(
+            payloads_333,
+            vec![99, 31],
+            "byte-equal wide PK (3,3,3) must emit b1's si=1 copy (payload 99) before b2's si=2 copy (payload 31)",
+        );
     }
 
     /// Compound (U64, U64) PK schema: pk_stride = 16 (narrow), pk_count = 2.
-    /// Forces the narrow-slow closure set: a packed-u128 `<` would put the
-    /// trailing column in the high bits and reverse column priority.
+    /// Exercises the column-aware cached-key comparator: a raw packed-u128 `<` over
+    /// the wrong byte order would put the trailing column in the high bits and
+    /// reverse column priority — but `order_cache` packs the OPK image, so it does
+    /// not.
     fn make_narrow_compound_schema() -> SchemaDescriptor {
         SchemaDescriptor::new(
             &[
@@ -856,8 +802,10 @@ mod tests {
         // `<` would order (2, 0) before (1, 10), but lexicographic order says
         // (1, 10) < (2, 0). Likewise (1, 5) < (1, 10) < (1, 15) lexicographically.
         let schema = make_narrow_compound_schema();
+        // A 16-byte key: the cached `pk_sort_key` is the whole PK, so the comparator
+        // decides on the register compare alone and never runs the byte tiebreak.
         assert!(!schema.pk_is_wide(), "pk_stride must be 16 (narrow)");
-        assert!(schema.pk_indices().len() > 1, "compound PK must take slow path");
+        assert!(schema.pk_indices().len() > 1, "fixture is a compound (multi-column) PK");
         let num_workers = 4;
         let b0 = make_narrow_compound_batch(
             &schema,
@@ -885,7 +833,7 @@ mod tests {
         );
         let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
         // col_indices = [0, 1] is the full PK set: exercises the compound-PK-set
-        // is_pk_routing path (route_pk_narrow via partition_for_key on cached u128).
+        // is_pk_routing path (route_pk via partition_for_pk_bytes over the OPK bytes).
         let result = op_relay_scatter_consolidated(&sources, &[0u32, 1u32], &schema, num_workers);
 
         assert_eq!(total_rows(&result), 9);
@@ -1476,7 +1424,9 @@ mod tests {
         // `extract_group_key`. Exercised through BOTH production scatter
         // functions: the non-consolidated row loop in `op_repartition_batches_mode`
         // and the consolidated merge-walk's `route_group` in
-        // `op_relay_scatter_consolidated_mode`. Covers signed-negative and
+        // `op_relay_scatter_consolidated_mode` — the latter through both the
+        // single-source bulk-drain AND the multi-source K-way winner-select loop
+        // (the merge body the unified walk rewrites). Covers signed-negative and
         // >16-byte composite keys, including a duplicate join key that must
         // co-locate (the no-dropped-rows / matching-keys-together guarantee).
         let schema = make_join_key_schema();
@@ -1525,10 +1475,30 @@ mod tests {
             op_repartition_batches_mode(&[Some(&cb)], &cols, &[], &schema, num_workers, RouteMode::JoinPromote);
         check(&repart, "op_repartition_batches_mode");
 
-        // (b) Consolidated merge-walk path (route_group).
+        // (b) Consolidated merge-walk path, single source → bulk-drain `route_group`.
         let consol =
             op_relay_scatter_consolidated_mode(&[Some(&cb)], &cols, &[], &schema, num_workers, RouteMode::JoinPromote);
         check(&consol, "op_relay_scatter_consolidated_mode");
+
+        // (c) Consolidated merge-walk path, TWO sources → the K-way winner-select
+        // loop drives `route_group` (the body the unified walk rewrites). Split the
+        // PK-ascending rows by parity into two sorted, consolidated sources so the
+        // walk genuinely interleaves them; pk=1 and pk=3 (join key (-5,100)) both
+        // live in the odd source yet must still co-locate by packed `_join_pk`.
+        let cb_odd = make_join_key_batch(&schema, &[rows[0], rows[2], rows[4]]); // pk 1,3,5
+        let cb_even = make_join_key_batch(&schema, &[rows[1], rows[3], rows[5]]); // pk 2,4,6
+        let consol_multi = op_relay_scatter_consolidated_mode(
+            &[Some(&cb_odd), Some(&cb_even)],
+            &cols,
+            &[],
+            &schema,
+            num_workers,
+            RouteMode::JoinPromote,
+        );
+        check(
+            &consol_multi,
+            "op_relay_scatter_consolidated_mode (2 sources, K-way route_group)",
+        );
     }
 
     /// A SINGLE promoted join key (arity 1, carried `T != 0`) must also route
@@ -1655,5 +1625,198 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression-guard microbench for the retained `order_cache`
+    // -----------------------------------------------------------------------
+
+    /// The cache-FREE merge walk: the alternative the relay would collapse to if
+    /// `order_cache` were dropped — one body, but the winner scan calls the
+    /// canonical `compare_pk_ordering` on live OPK bytes every comparison (exactly
+    /// what the sibling loser-tree merges in `repr/merge.rs` / `repr/heap.rs` /
+    /// `read_cursor` do), instead of a register compare of a precomputed key.
+    /// Byte-for-byte the same output as `relay_walk_inner`; it exists only so
+    /// `relay_scatter_merge_walk_bench` can measure what the cache buys on the
+    /// relay's O(K) linear winner-scan.
+    fn relay_walk_cachefree(
+        mem_batches: &[Option<MemBatch<'_>>],
+        w_map: &[usize; 256],
+        worker_rows: &mut [Vec<(u8, u32)>],
+        mut cursors: [u32; 256],
+        mut active_sources: [u8; 256],
+        mut num_active: usize,
+    ) {
+        while num_active > 0 {
+            if num_active == 1 {
+                let si = active_sources[0] as usize;
+                let mb = mem_batches[si].as_ref().unwrap();
+                for row in cursors[si] as usize..mb.count {
+                    worker_rows[w_map[partition_for_pk_bytes(mb.get_pk_bytes(row))]].push((si as u8, row as u32));
+                }
+                return;
+            }
+            let mut best_pos = 0usize;
+            let mut best_si = active_sources[0];
+            let mut best_bytes = mem_batches[best_si as usize]
+                .as_ref()
+                .unwrap()
+                .get_pk_bytes(cursors[best_si as usize] as usize);
+            #[allow(clippy::needless_range_loop)]
+            for pos in 1..num_active {
+                let si = active_sources[pos];
+                let bytes = mem_batches[si as usize]
+                    .as_ref()
+                    .unwrap()
+                    .get_pk_bytes(cursors[si as usize] as usize);
+                let ord = compare_pk_ordering(bytes, best_bytes);
+                if ord == Ordering::Less || (ord == Ordering::Equal && si < best_si) {
+                    best_pos = pos;
+                    best_si = si;
+                    best_bytes = bytes;
+                }
+            }
+            let best_si = best_si as usize;
+            let row = cursors[best_si] as usize;
+            cursors[best_si] += 1;
+            let mb = mem_batches[best_si].as_ref().unwrap();
+            worker_rows[w_map[partition_for_pk_bytes(mb.get_pk_bytes(row))]].push((best_si as u8, row as u32));
+            let new_cur = cursors[best_si] as usize;
+            if new_cur == mb.count {
+                num_active -= 1;
+                active_sources[best_pos] = active_sources[num_active];
+            }
+        }
+    }
+
+    /// Isolated merge-walk bench: K=8 interleaved pre-consolidated sources, timing
+    /// ONLY the winner-scan + route + index push (no `write_to_batch` /
+    /// `scatter_multi_source` row copy, which otherwise dominates and masks the
+    /// walk). Reports cached (`relay_walk_inner`) vs cache-free
+    /// (`relay_walk_cachefree`) rows/s per stride. This is what justifies keeping
+    /// `order_cache`: the cached register-compare must beat re-packing the OPK key
+    /// every comparison. Last measured ~1.6x at stride 8/16 and ~3.3x at stride 24
+    /// (where cache-free pays the full 16-byte prefix pack on every pairwise
+    /// compare), so dropping the cache to match the loser-tree siblings would
+    /// regress this O(K) linear winner-scan substantially.
+    /// `cd crates && cargo test -p gnitz-engine --release relay_scatter_merge_walk_bench -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn relay_scatter_merge_walk_bench() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const K: usize = 8;
+        const N: usize = 100_016; // divisible by K
+        const ITERS: usize = 40;
+        let num_workers = 4;
+        let per_src = N / K;
+
+        // Run both walk variants over the same K sources, assert identical output,
+        // and time each. `build` keeps the three stride builders' batches alive.
+        let bench = |label: &str, cbs: &[ConsolidatedBatch]| {
+            let mem_batches: Vec<Option<MemBatch>> = cbs.iter().map(|cb| Some(cb.as_mem_batch())).collect();
+            let total: usize = mem_batches.iter().flatten().map(|m| m.count).sum();
+            let w_map = build_w_map(num_workers);
+            let cursors = [0u32; 256];
+            let mut active_sources = [0u8; 256];
+            let mut num_active = 0usize;
+            for (si, mb) in mem_batches.iter().enumerate() {
+                if mb.as_ref().is_some_and(|m| m.count > 0) {
+                    active_sources[num_active] = si as u8;
+                    num_active += 1;
+                }
+            }
+            let route_pk = |mb: &MemBatch, row: usize| partition_for_pk_bytes(mb.get_pk_bytes(row));
+            let mut order_cache = [0u128; 256];
+            let reset_cache = |oc: &mut [u128; 256]| {
+                for &s8 in active_sources.iter().take(num_active) {
+                    let s = s8 as usize;
+                    oc[s] = pk_sort_key(mem_batches[s].as_ref().unwrap().get_pk_bytes(0));
+                }
+            };
+            let mut wr_a: Vec<Vec<(u8, u32)>> = (0..num_workers).map(|_| Vec::with_capacity(total)).collect();
+            let mut wr_b: Vec<Vec<(u8, u32)>> = (0..num_workers).map(|_| Vec::with_capacity(total)).collect();
+
+            // Correctness: cached and cache-free must agree byte-for-byte.
+            reset_cache(&mut order_cache);
+            relay_walk_inner(
+                &mem_batches,
+                &w_map,
+                &mut wr_a,
+                &mut order_cache,
+                cursors,
+                active_sources,
+                num_active,
+                route_pk,
+            );
+            relay_walk_cachefree(&mem_batches, &w_map, &mut wr_b, cursors, active_sources, num_active);
+            assert_eq!(wr_a, wr_b, "{label}: cached vs cache-free walk diverged");
+
+            let mut dur_a = Duration::ZERO;
+            let mut dur_b = Duration::ZERO;
+            for _ in 0..ITERS {
+                wr_a.iter_mut().for_each(Vec::clear);
+                reset_cache(&mut order_cache);
+                let t = Instant::now();
+                relay_walk_inner(
+                    &mem_batches,
+                    &w_map,
+                    &mut wr_a,
+                    &mut order_cache,
+                    cursors,
+                    active_sources,
+                    num_active,
+                    route_pk,
+                );
+                dur_a += t.elapsed();
+                black_box(&wr_a);
+
+                wr_b.iter_mut().for_each(Vec::clear);
+                let t = Instant::now();
+                relay_walk_cachefree(&mem_batches, &w_map, &mut wr_b, cursors, active_sources, num_active);
+                dur_b += t.elapsed();
+                black_box(&wr_b);
+            }
+            let rps = |d: Duration| (total * ITERS) as f64 / d.as_secs_f64() / 1e6;
+            println!(
+                "{label:>10}: cached {:6.1} Mrows/s   cache-free {:6.1} Mrows/s   cached/cache-free {:.2}x",
+                rps(dur_a),
+                rps(dur_b),
+                rps(dur_a) / rps(dur_b),
+            );
+        };
+
+        // stride 8 — single U64 PK.
+        let s8 = make_schema_u64_i64();
+        let b8: Vec<ConsolidatedBatch> = (0..K)
+            .map(|s| {
+                let rows: Vec<(u64, i64, i64)> = (0..per_src).map(|j| ((s + K * j) as u64, 1, j as i64)).collect();
+                make_batch(&s8, &rows)
+            })
+            .collect();
+        bench("stride 8", &b8);
+
+        // stride 16 — (U64, U64) compound PK. c0 = global index (ascending), c1 = 0;
+        // `make_narrow_compound_batch` reads the low 64 bits as c0 (see `mk_compound_pk`).
+        let s16 = make_narrow_compound_schema();
+        let b16: Vec<ConsolidatedBatch> = (0..K)
+            .map(|s| {
+                let rows: Vec<(u128, i64, i64)> = (0..per_src).map(|j| ((s + K * j) as u128, 1, j as i64)).collect();
+                make_narrow_compound_batch(&s16, &rows)
+            })
+            .collect();
+        bench("stride 16", &b16);
+
+        // stride 24 — (U64, U64, U64) wide PK. c0 = global index (ascending), c1=c2=0.
+        let s24 = wide_pk_3xu64_schema();
+        let b24: Vec<ConsolidatedBatch> = (0..K)
+            .map(|s| {
+                let rows: Vec<(u64, u64, u64, i64, i64)> =
+                    (0..per_src).map(|j| ((s + K * j) as u64, 0, 0, 1, j as i64)).collect();
+                make_wide_batch(&s24, &rows)
+            })
+            .collect();
+        bench("stride 24", &b24);
     }
 }
