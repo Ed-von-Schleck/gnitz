@@ -605,8 +605,8 @@ pub(in crate::expr) fn eval_batch(
             Instr::IntAdd { dst, a, b } => bin_op!(a, b, dst as usize, |x, y| x.wrapping_add(y)),
             Instr::IntSub { dst, a, b } => bin_op!(a, b, dst as usize, |x, y| x.wrapping_sub(y)),
             Instr::IntMul { dst, a, b } => bin_op!(a, b, dst as usize, |x, y| x.wrapping_mul(y)),
-            // `signed: false` is the old UDIV — reinterpret operands as u64 so the
-            // quotient is correct for dividends >= 2^63. Zero divisor marks NULL.
+            // `signed: false` reinterprets operands as u64 so the quotient is
+            // correct for dividends >= 2^63. Zero divisor marks NULL.
             Instr::IntDiv { dst, a, b, signed } => {
                 let d = dst as usize;
                 if signed {
@@ -685,9 +685,8 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer comparisons
             // ----------------------------------------------------------------
-            // `signed: false` is the old UCMP_* arm — compare the raw bits as u64
-            // so values >= 2^63 order correctly. Branch on op/signed outside the
-            // per-row loop; each `bin_op!` body is byte-identical to before.
+            // `signed: false` compares the raw bits as u64 so values >= 2^63 order
+            // correctly. Branch on op/signed outside the per-row loop.
             Instr::Cmp { op, dst, a, b, signed } => {
                 let d = dst as usize;
                 match op {

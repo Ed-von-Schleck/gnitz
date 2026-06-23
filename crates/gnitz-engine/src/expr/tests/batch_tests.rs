@@ -73,7 +73,7 @@ fn test_eval_batch_add() {
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let mb = batch.as_mem_batch();
 
-    // r0 = pk (LoadColInt col 0 → resolves to LOAD_PK_*_INT), r1 = col[1]
+    // r0 = pk (LoadColInt col 0 → resolves to Instr::LoadPk), r1 = col[1]
     // (the first payload), r2 = r0 + r1
     let instrs = vec![
         LogicalInstr::LoadColInt { dst: 0, col: 0 },
@@ -765,7 +765,7 @@ fn classifier_pure_conjunction_filter() {
     assert_eq!(bool_input, (1 << 2) | (1 << 4));
 }
 
-/// Classifier: a filter whose `result_reg` is produced by LOAD_PAYLOAD_INT
+/// Classifier: a filter whose `result_reg` is produced by `Instr::LoadPayloadInt`
 /// (not a bool producer) must NOT be in `bit_only_mask`. The fast-path
 /// must therefore fall back to the per-row scan over `regs`.
 #[test]

@@ -200,8 +200,8 @@ pub(crate) enum LogicalInstr {
 // ---------------------------------------------------------------------------
 
 /// One resolved, evaluable instruction. `signed` flags carry the result of the
-/// per-register U64 type tracking (`signed: false` == the old unsigned opcode
-/// variants UCMP_*/UDIV/UMOD/UINT_TO_FLOAT).
+/// per-register U64 type tracking: `signed: false` selects the unsigned path on
+/// `Cmp`/`IntDiv`/`IntMod`/`IntToFloat`, reinterpreting the i64 register as u64.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Instr {
     LoadPayloadInt {

@@ -387,7 +387,7 @@ impl ScalarFunc {
         // boolean op so `bool_bits[result_reg]` is fresh) AND we must be on
         // the nullable arm (in `no_nulls` mode bool_bits is unallocated).
         // Predicates like `WHERE int_col` produce result_reg from
-        // LOAD_PAYLOAD_INT — not a bool producer — so the per-row scan over
+        // `Instr::LoadPayloadInt` — not a bool producer — so the per-row scan over
         // `regs` is the only correct path for them.
         let use_fast_path = !no_nulls && prog.is_bit_only(result_reg);
 
