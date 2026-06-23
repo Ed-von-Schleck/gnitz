@@ -609,18 +609,22 @@ mod tests {
 
     #[test]
     fn test_op_filter_basic() {
-        use crate::expr::ExprProgram;
+        use crate::expr::{CmpOp, LogicalInstr, LogicalProgram};
 
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 5), (2, 1, 15), (3, 1, 25)]);
 
-        let code = vec![
-            1i64, 0, 1, 0, // LOAD_COL_INT r0 = col[1]
-            3, 1, 10, 0, // LOAD_CONST r1 = 10
-            17, 2, 0, 1, // CMP_GT r2 = (r0 > r1)
+        let instrs = vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1]
+            LogicalInstr::LoadConst { dst: 1, val: 10 }, // r1 = 10
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            }, // r2 = (r0 > r1)
         ];
-        let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let func = ScalarFunc::from_predicate(prog, &schema);
+        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema);
 
         let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2, "only pk=2 and pk=3 pass val>10");
@@ -630,14 +634,13 @@ mod tests {
 
     #[test]
     fn test_op_filter_consolidated_flag() {
-        use crate::expr::ExprProgram;
+        use crate::expr::{LogicalInstr, LogicalProgram};
 
-        let code = vec![
-            3i64, 0, 1, 0, // LOAD_CONST r0 = 1 (always true)
+        let instrs = vec![
+            LogicalInstr::LoadConst { dst: 0, val: 1 }, // always true
         ];
-        let prog = ExprProgram::new(code, 1, 0, vec![]);
         let schema = make_schema_u64_i64();
-        let func = ScalarFunc::from_predicate(prog, &schema);
+        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), &schema);
 
         let mut batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
         batch.consolidated = true;
@@ -876,10 +879,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn always_true_func(schema: &SchemaDescriptor) -> ScalarFunc {
-        use crate::expr::ExprProgram;
-        let code = vec![3i64, 0, 1, 0]; // LOAD_CONST r0 = 1
-        let prog = ExprProgram::new(code, 1, 0, vec![]);
-        ScalarFunc::from_predicate(prog, schema)
+        use crate::expr::{LogicalInstr, LogicalProgram};
+        let instrs = vec![LogicalInstr::LoadConst { dst: 0, val: 1 }]; // always true
+        ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), schema)
     }
 
     #[test]
@@ -1032,7 +1034,7 @@ mod tests {
     /// must keep exactly the rows whose payload exceeds 10, in input PK order.
     #[test]
     fn test_filter_batch_matches_per_row() {
-        use crate::expr::{self, ExprProgram, ScalarFunc};
+        use crate::expr::{CmpOp, LogicalInstr, LogicalProgram, ScalarFunc};
 
         let schema = make_schema_u64_i64();
         // (pk, weight, payload); a row passes iff payload > 10.
@@ -1063,22 +1065,17 @@ mod tests {
         );
 
         // Predicate: col[1] > 10
-        let code = vec![
-            expr::EXPR_LOAD_COL_INT,
-            0,
-            1,
-            0,
-            expr::EXPR_LOAD_CONST,
-            1,
-            10,
-            0,
-            expr::EXPR_CMP_GT,
-            2,
-            0,
-            1,
+        let instrs = vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 },
+            LogicalInstr::LoadConst { dst: 1, val: 10 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
         ];
-        let prog = ExprProgram::new(code, 3, 2, vec![]);
-        let func = ScalarFunc::from_predicate(prog, &schema);
+        let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema);
 
         let out = op_filter(&batch, &func, &schema);
         // pk=2(15), 3(25), 5(20), 7(30), 9(11), 11(50), 13(12), 15(100), 18(13), 20(22)

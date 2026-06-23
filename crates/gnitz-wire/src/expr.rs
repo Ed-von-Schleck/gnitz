@@ -41,22 +41,3 @@ pub const EXPR_STR_COL_EQ_COL: u32 = 43;
 pub const EXPR_STR_COL_LT_COL: u32 = 44;
 pub const EXPR_STR_COL_LE_COL: u32 = 45;
 pub const EXPR_EMIT_NULL: u32 = 46;
-// Resolved-column opcodes: emitted by ExprProgram::resolve_column_indices.
-// LOAD_COL_INT/FLOAT use logical (schema) indices; these use physical payload
-// indices (pk_index already stripped) so the interpreter inner loop is branch-free.
-pub const EXPR_LOAD_PAYLOAD_INT: u32 = 47;
-pub const EXPR_LOAD_PAYLOAD_FLOAT: u32 = 48;
-// PK-region integer loads. a1 packs (pk_byte_offset << 16) | (col_size << 8)
-// | type_code so a single column of a compound OPK PK can be addressed.
-pub const EXPR_LOAD_PK_UNSIGNED_INT: u32 = 49;
-pub const EXPR_LOAD_PK_SIGNED_INT: u32 = 50;
-// Unsigned (U64) comparison/arithmetic/cast forms. The i64 register holds the
-// raw u64 bit pattern, so these reinterpret operands as u64 for correctness
-// when the value is >= 2^63.
-pub const EXPR_UCMP_GT: u32 = 51;
-pub const EXPR_UCMP_GE: u32 = 52;
-pub const EXPR_UCMP_LT: u32 = 53;
-pub const EXPR_UCMP_LE: u32 = 54;
-pub const EXPR_UDIV: u32 = 55;
-pub const EXPR_UMOD: u32 = 56;
-pub const EXPR_UINT_TO_FLOAT: u32 = 57;

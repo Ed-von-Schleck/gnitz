@@ -7,32 +7,32 @@ use super::*;
 // Expression + scalar function construction helpers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::vec_box, clippy::ptr_arg)]
+#[allow(clippy::vec_box)]
 pub(super) fn create_expr_predicate(
-    code: Vec<i64>,
+    code: &[u32],
     num_regs: u32,
     result_reg: u32,
     const_strings: Vec<Vec<u8>>,
     schema: &SchemaDescriptor,
     owned_funcs: &mut Vec<Box<ScalarFunc>>,
 ) -> *const ScalarFunc {
-    let prog = ExprProgram::new(code, num_regs, result_reg, const_strings);
+    let prog = LogicalProgram::from_wire(code, num_regs, result_reg, const_strings);
     let func = Box::new(ScalarFunc::from_predicate(prog, schema));
     let ptr = &*func as *const ScalarFunc;
     owned_funcs.push(func);
     ptr
 }
 
-#[allow(clippy::vec_box, clippy::ptr_arg)]
+#[allow(clippy::vec_box)]
 pub(super) fn create_expr_map(
-    code: Vec<i64>,
+    code: &[u32],
     num_regs: u32,
     const_strings: Vec<Vec<u8>>,
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
     owned_funcs: &mut Vec<Box<ScalarFunc>>,
 ) -> *const ScalarFunc {
-    let prog = ExprProgram::new(code, num_regs, 0, const_strings);
+    let prog = LogicalProgram::from_wire(code, num_regs, 0, const_strings);
     let func = Box::new(ScalarFunc::from_map(prog, in_schema, out_schema));
     let ptr = &*func as *const ScalarFunc;
     owned_funcs.push(func);
@@ -56,6 +56,21 @@ pub(super) fn create_universal_projection(
 
 pub(super) fn null_func_ptr() -> *const ScalarFunc {
     std::ptr::null()
+}
+
+/// Folded-finalize programs threaded through plan emission. `logical` holds the
+/// unresolved programs indexed by `fold_finalize` idx — each is `.take()`n and
+/// resolved exactly once against its reduce node's output schema. `resolved` is
+/// the kept-alive store the reduce ops hold raw `*const ResolvedProgram` into;
+/// it is moved into the VM at the end of `build_plan`.
+// `Box` is load-bearing, not incidental: the reduce ops hold raw
+// `*const ResolvedProgram` into `resolved`, so each program's heap address must
+// stay stable as the vec grows (a bare `Vec<ResolvedProgram>` would move
+// elements on reallocation and dangle those pointers).
+#[allow(clippy::vec_box)]
+pub(super) struct FinalizePrograms {
+    pub(super) logical: Vec<Option<Box<LogicalProgram>>>,
+    pub(super) resolved: Vec<Box<ResolvedProgram>>,
 }
 
 /// Path of a per-worker scratch directory under `view_dir`. Rank-stamped because
@@ -143,7 +158,7 @@ pub(super) fn emit_node(
     // Owned resources
     owned_tables: &mut Vec<Box<Table>>,
     owned_funcs: &mut Vec<Box<ScalarFunc>>,
-    owned_expr_progs: &mut Vec<Box<ExprProgram>>,
+    fin_progs: &mut FinalizePrograms,
     owned_trace_regs: &mut Vec<(u16, usize)>,
     // External tables
     ext_tables: &[ExternalTable],
@@ -214,17 +229,14 @@ pub(super) fn emit_node(
             reg_meta[reg_id as usize] = RegisterMeta::delta(in_schema);
             let func_ptr = if let Some(blob) = blob {
                 match decode_expr_blob(blob) {
-                    Some(dep) => {
-                        let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
-                        create_expr_predicate(
-                            code,
-                            dep.num_regs,
-                            dep.result_reg,
-                            dep.const_strings,
-                            &in_schema,
-                            owned_funcs,
-                        )
-                    }
+                    Some(dep) => create_expr_predicate(
+                        &dep.code,
+                        dep.num_regs,
+                        dep.result_reg,
+                        dep.const_strings,
+                        &in_schema,
+                        owned_funcs,
+                    ),
                     // A present-but-corrupt blob is catalog corruption. Falling
                     // back to null_func_ptr (pass-all) would silently turn a
                     // WHERE into WHERE TRUE; abort the compile instead.
@@ -261,8 +273,7 @@ pub(super) fn emit_node(
                     };
                     // Identity MAP: if no reindex and schemas match, skip if sequential copy.
                     if reindex_cols.is_empty() && in_reg_schema.same_physical_layout(&loaded.out_schema) {
-                        let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
-                        let prog = ExprProgram::new(code, dep.num_regs, 0, Vec::new());
+                        let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, Vec::new());
                         // Elide only when the block copy skips exactly the inherited
                         // PK region (`base == pk_count`): the MAP carries the PK
                         // region verbatim and copies payload columns 1:1.
@@ -322,14 +333,13 @@ pub(super) fn emit_node(
                         state.emit_failed = true;
                         return;
                     }
-                    let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
                     let node_schema = if !reindex_cols.is_empty() {
                         reindex_output_schema(&in_reg_schema, reindex_cols, reindex_target_tcs)
                     } else {
                         loaded.out_schema
                     };
                     let fp = create_expr_map(
-                        code,
+                        &dep.code,
                         dep.num_regs,
                         dep.const_strings,
                         &in_reg_schema,
@@ -473,7 +483,7 @@ pub(super) fn emit_node(
                 out_reg_of,
                 reg_meta,
                 owned_tables,
-                owned_expr_progs,
+                fin_progs,
                 owned_trace_regs,
                 view_dir,
                 view_table_id,
@@ -696,7 +706,7 @@ pub(super) fn emit_reduce(
     out_reg_of: &mut HashMap<i32, i32>,
     reg_meta: &mut Vec<RegisterMeta>,
     owned_tables: &mut Vec<Box<Table>>,
-    owned_expr_progs: &mut Vec<Box<ExprProgram>>,
+    fin_progs: &mut FinalizePrograms,
     owned_trace_regs: &mut Vec<(u16, usize)>,
     view_dir: &str,
     view_table_id: u32,
@@ -889,11 +899,18 @@ pub(super) fn emit_reduce(
         );
     }
 
-    let fin_prog_ptr: *const ExprProgram = if let Some(idx) = finalize_prog_idx {
-        // Finalize prog reads from the raw reduce output, so resolve its
-        // column operands against reduce_out_schema. Idempotent.
-        owned_expr_progs[idx].resolve_column_indices(&reduce_out_schema);
-        &*owned_expr_progs[idx] as *const ExprProgram
+    let fin_prog_ptr: *const ResolvedProgram = if let Some(idx) = finalize_prog_idx {
+        // Finalize prog reads from the raw reduce output: take the unresolved
+        // logical program (each idx is resolved exactly once) and resolve its
+        // column operands against reduce_out_schema in map context. The resolved
+        // program is kept alive in `fin_progs.resolved` for the reduce op's
+        // raw pointer.
+        let logical = fin_progs.logical[idx]
+            .take()
+            .expect("finalize prog resolved exactly once");
+        let resolved = logical.resolve(&reduce_out_schema, /* is_filter = */ false);
+        fin_progs.resolved.push(Box::new(resolved));
+        &**fin_progs.resolved.last().unwrap() as *const ResolvedProgram
     } else {
         std::ptr::null()
     };
@@ -1054,7 +1071,7 @@ pub(super) fn build_plan(
     view_id: u64,
     output_node_id: Option<i32>,
     exchange_inputs: &[(i32, SchemaDescriptor)],
-    pre_built_expr_progs: Vec<Box<ExprProgram>>,
+    pre_built_expr_progs: Vec<Box<LogicalProgram>>,
 ) -> Option<PlanBuildResult> {
     let mut out_reg_of: HashMap<i32, i32> = HashMap::new();
     let mut next_reg: i32 = 0;
@@ -1157,7 +1174,13 @@ pub(super) fn build_plan(
 
     let mut owned_tables: Vec<Box<Table>> = Vec::new();
     let mut owned_funcs: Vec<Box<ScalarFunc>> = Vec::new();
-    let mut owned_expr_progs: Vec<Box<ExprProgram>> = pre_built_expr_progs;
+    // Folded-finalize programs: the pre-built logical programs go in `logical`
+    // (taken + resolved once each during emission); `resolved` is filled as the
+    // reduce nodes are emitted and handed to the VM to keep alive.
+    let mut fin_progs = FinalizePrograms {
+        logical: pre_built_expr_progs.into_iter().map(Some).collect(),
+        resolved: Vec::new(),
+    };
     let mut owned_trace_regs: Vec<(u16, usize)> = Vec::new();
     let mut ext_trace_regs: Vec<(u16, i64)> = Vec::new();
     let mut source_reg_map: HashMap<i64, i32> = HashMap::new();
@@ -1186,7 +1209,7 @@ pub(super) fn build_plan(
             &mut reg_meta,
             &mut owned_tables,
             &mut owned_funcs,
-            &mut owned_expr_progs,
+            &mut fin_progs,
             &mut owned_trace_regs,
             ext_tables,
             &mut ext_trace_regs,
@@ -1254,7 +1277,13 @@ pub(super) fn build_plan(
     let num_regs = reg_meta.len();
     debug_assert!(num_regs <= u16::MAX as usize);
 
-    let vm = builder.build_with_owned(reg_meta, owned_tables, owned_funcs, owned_expr_progs, owned_trace_regs);
+    let vm = builder.build_with_owned(
+        reg_meta,
+        owned_tables,
+        owned_funcs,
+        fin_progs.resolved,
+        owned_trace_regs,
+    );
 
     Some(PlanBuildResult {
         vm,

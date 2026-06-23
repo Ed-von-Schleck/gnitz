@@ -61,8 +61,8 @@ pub(crate) fn is_integer_type(tc: TypeCode) -> bool {
 }
 
 /// The 16-byte integer-ish types (U128, UUID, I128) that have no i64 slot: the
-/// engine's `EXPR_LOAD_PAYLOAD_INT` handler has arms only for 1/2/4/8-byte
-/// columns, so the lowerer must reject these in arithmetic/comparison contexts.
+/// engine's payload integer load handles only 1/2/4/8-byte columns, so the
+/// lowerer must reject these in arithmetic/comparison contexts.
 pub(crate) fn is_wide_int(tc: TypeCode) -> bool {
     matches!(tc, TypeCode::U128 | TypeCode::UUID | TypeCode::I128)
 }

@@ -1,5 +1,4 @@
 use super::super::plan::ScalarFunc;
-use crate::expr;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
@@ -51,29 +50,19 @@ fn test_map_copy_and_emit() {
 
     let batch = make_int_batch(&in_schema, &[(1, 1, 0, &[10, 20])]);
 
-    let code = vec![
-        expr::EXPR_COPY_COL,
-        type_code::I64 as i64,
-        1,
-        0,
-        expr::EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        expr::EXPR_LOAD_COL_INT,
-        1,
-        2,
-        0,
-        expr::EXPR_INT_ADD,
-        2,
-        0,
-        1,
-        expr::EXPR_EMIT,
-        0,
-        2,
-        1,
+    use crate::expr::LogicalInstr;
+    let instrs = vec![
+        LogicalInstr::CopyCol {
+            src_col: 1,
+            out: 0,
+            tc: type_code::I64,
+        },
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
+        LogicalInstr::Emit { src: 2, out: 1 },
     ];
-    let prog = crate::expr::ExprProgram::new(code, 3, 2, vec![]);
+    let prog = crate::expr::LogicalProgram::new(instrs, 3, 2, vec![]);
 
     let func = ScalarFunc::from_map(prog, &in_schema, &out_schema);
     let result = func.evaluate_map_batch(&batch, &out_schema);

@@ -7,17 +7,7 @@
 
 use std::cmp::Ordering;
 
-use super::program::{
-    compare_col_string_vs_const, ExprProgram, EXPR_BOOL_AND, EXPR_BOOL_NOT, EXPR_BOOL_OR, EXPR_CMP_EQ, EXPR_CMP_GE,
-    EXPR_CMP_GT, EXPR_CMP_LE, EXPR_CMP_LT, EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_EMIT_NULL, EXPR_FCMP_EQ,
-    EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE, EXPR_FCMP_LT, EXPR_FCMP_NE, EXPR_FLOAT_ADD, EXPR_FLOAT_DIV,
-    EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_SUB, EXPR_INT_ADD, EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_MUL,
-    EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT, EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_CONST,
-    EXPR_LOAD_PAYLOAD_FLOAT, EXPR_LOAD_PAYLOAD_INT, EXPR_LOAD_PK_SIGNED_INT, EXPR_LOAD_PK_UNSIGNED_INT,
-    EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST, EXPR_STR_COL_LT_COL,
-    EXPR_STR_COL_LT_CONST, EXPR_UCMP_GE, EXPR_UCMP_GT, EXPR_UCMP_LE, EXPR_UCMP_LT, EXPR_UDIV, EXPR_UINT_TO_FLOAT,
-    EXPR_UMOD,
-};
+use super::program::{compare_col_string_vs_const, CmpOp, Instr, ResolvedProgram, StrOp};
 use crate::foundation::codec::read_u64_le;
 use crate::schema::{compare_german_strings, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::MemBatch;
@@ -187,7 +177,7 @@ fn fill_null_bits_pi(s: &mut EvalScratch, di: usize, null_bmp: &[u8], morsel_sta
 fn eval_is_null(
     scratch: &mut EvalScratch,
     mb: &MemBatch,
-    prog: &ExprProgram,
+    prog: &ResolvedProgram,
     dst: usize,
     morsel_start: usize,
     m: usize,
@@ -276,7 +266,7 @@ fn pack_to_bool_bits(scratch: &mut EvalScratch, dst: usize, m: usize) {
 /// consumer (or, for filters, a bit_only result_reg). Non-bool producers reach
 /// a BOOL consumer through this path without restructuring their inner loop.
 #[inline]
-fn maybe_pack_bool_bits(scratch: &mut EvalScratch, prog: &ExprProgram, dst: usize, m: usize) {
+fn maybe_pack_bool_bits(scratch: &mut EvalScratch, prog: &ResolvedProgram, dst: usize, m: usize) {
     if scratch.no_nulls {
         return;
     }
@@ -314,7 +304,7 @@ fn zero_null_rows(scratch: &mut EvalScratch, dst: usize, m: usize) {
 fn eval_str_col_vs_const(
     scratch: &mut EvalScratch,
     mb: &MemBatch,
-    prog: &ExprProgram,
+    prog: &ResolvedProgram,
     dst: usize,
     morsel_start: usize,
     m: usize,
@@ -355,7 +345,7 @@ fn eval_str_col_vs_const(
 fn eval_str_col_vs_col(
     scratch: &mut EvalScratch,
     mb: &MemBatch,
-    prog: &ExprProgram,
+    prog: &ResolvedProgram,
     dst: usize,
     morsel_start: usize,
     m: usize,
@@ -425,17 +415,12 @@ fn encode_f64(f: f64) -> i64 {
 /// Callers loop over morsels and call this function once per morsel.
 #[allow(clippy::needless_range_loop)]
 pub(in crate::expr) fn eval_batch(
-    prog: &ExprProgram,
+    prog: &ResolvedProgram,
     mb: &MemBatch,
     morsel_start: usize,
     m: usize,
     scratch: &mut EvalScratch,
 ) {
-    debug_assert!(
-        prog.resolved,
-        "eval_batch: program must be resolved via resolve_column_indices",
-    );
-
     // Every binary arithmetic/comparison opcode shares one shape: read two source
     // registers, write one, OR the source null words, repack bool bits. `bin_op!`
     // collapses them to one line each — the per-row `|x, y| body` is spliced inline
@@ -491,23 +476,19 @@ pub(in crate::expr) fn eval_batch(
         }};
     }
 
-    for instr in prog.code.chunks_exact(4) {
-        let op = instr[0];
-        let dst = instr[1] as usize;
-        let a1 = instr[2];
-        let a2 = instr[3];
-
-        match op {
+    for instr in &prog.instrs {
+        match *instr {
             // ----------------------------------------------------------------
-            // Handled at batch level — skip in inner loop
+            // Output instructions — materialized at batch level, not here
             // ----------------------------------------------------------------
-            EXPR_COPY_COL | EXPR_EMIT_NULL | EXPR_EMIT => {}
+            Instr::CopyCol { .. } | Instr::EmitNull { .. } | Instr::Emit { .. } => {}
 
             // ----------------------------------------------------------------
             // Load operations
             // ----------------------------------------------------------------
-            EXPR_LOAD_PAYLOAD_INT => {
-                let pi = a1 as usize;
+            Instr::LoadPayloadInt { dst, pi } => {
+                let dst = dst as usize;
+                let pi = pi as usize;
                 let (size_u8, col_tc) = prog.payload_col_info[pi];
                 let col_size = size_u8 as usize;
                 let is_signed = crate::schema::is_signed_int(col_tc);
@@ -547,8 +528,9 @@ pub(in crate::expr) fn eval_batch(
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
-            EXPR_LOAD_PAYLOAD_FLOAT => {
-                let pi = a1 as usize;
+            Instr::LoadPayloadFloat { dst, pi } => {
+                let dst = dst as usize;
+                let pi = pi as usize;
                 let col_size = prog.payload_col_info[pi].0 as usize;
                 let col_data = mb.col_data(pi, col_size);
                 let dst_reg = scratch.reg_mut(dst, m);
@@ -568,54 +550,47 @@ pub(in crate::expr) fn eval_batch(
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
-            // a1 packs (pk_byte_offset << 16) | (col_size << 8) | type_code.
-            // Unsigned: the addressed OPK column is big-endian, so right-align
-            // into a 16-byte buffer and from_be_bytes recovers the native value.
-            EXPR_LOAD_PK_UNSIGNED_INT => {
-                let packed = a1 as u64;
-                let byte_offset = (packed >> 16) as usize;
-                let col_size = ((packed >> 8) & 0xFF) as usize;
+            // PK-region integer load. `signed` selects the decode; the unsigned
+            // and signed branches delegate to `widen_pk_be` / `read_signed`.
+            Instr::LoadPk {
+                dst,
+                off,
+                size,
+                tc,
+                signed,
+            } => {
+                let dst = dst as usize;
+                let byte_offset = off as usize;
+                let col_size = size as usize;
                 let base_d = dst * MORSEL;
-                for i in 0..m {
-                    let opk = mb.get_pk_bytes(morsel_start + i);
-                    let mut buf = [0u8; 16];
-                    buf[16 - col_size..].copy_from_slice(&opk[byte_offset..byte_offset + col_size]);
-                    scratch.regs[base_d + i] = u128::from_be_bytes(buf) as i64;
-                }
-                scratch.clear_null_reg(dst, m);
-                maybe_pack_bool_bits(scratch, prog, dst, m);
-            }
-            // Signed: decode the OPK column back to native LE (un-flips the sign
-            // bit), then sign-extend to i64 at the exact column width. Padding a
-            // narrow type before from_le_bytes would destroy sign extension.
-            EXPR_LOAD_PK_SIGNED_INT => {
-                let packed = a1 as u64;
-                let byte_offset = (packed >> 16) as usize;
-                let col_size = ((packed >> 8) & 0xFF) as usize;
-                let type_code = (packed & 0xFF) as u8;
-                let base_d = dst * MORSEL;
-                for i in 0..m {
-                    let opk = mb.get_pk_bytes(morsel_start + i);
-                    let mut le = [0u8; 8];
-                    gnitz_wire::decode_pk_column(
-                        &opk[byte_offset..byte_offset + col_size],
-                        type_code,
-                        &mut le[..col_size],
-                    );
-                    scratch.regs[base_d + i] = match col_size {
-                        8 => i64::from_le_bytes(le),
-                        4 => i32::from_le_bytes(le[..4].try_into().unwrap()) as i64,
-                        2 => i16::from_le_bytes(le[..2].try_into().unwrap()) as i64,
-                        1 => le[0] as i8 as i64,
-                        _ => unreachable!("signed PK column size {col_size}"),
-                    };
+                if signed {
+                    // Decode the OPK column back to native LE (un-flips the sign
+                    // bit), then sign-extend to i64 at the exact column width.
+                    for i in 0..m {
+                        let opk = mb.get_pk_bytes(morsel_start + i);
+                        let mut le = [0u8; 8];
+                        gnitz_wire::decode_pk_column(
+                            &opk[byte_offset..byte_offset + col_size],
+                            tc,
+                            &mut le[..col_size],
+                        );
+                        scratch.regs[base_d + i] = crate::schema::read_signed(&le, col_size);
+                    }
+                } else {
+                    // The addressed OPK column is big-endian; `widen_pk_be` right-
+                    // aligns it into a u128, recovering the native value.
+                    for i in 0..m {
+                        let opk = mb.get_pk_bytes(morsel_start + i);
+                        scratch.regs[base_d + i] =
+                            gnitz_wire::widen_pk_be(&opk[byte_offset..byte_offset + col_size], col_size) as i64;
+                    }
                 }
                 scratch.clear_null_reg(dst, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
 
-            EXPR_LOAD_CONST => {
-                let val: i64 = (a2 << 32) | (a1 & 0xFFFF_FFFF);
+            Instr::LoadConst { dst, val } => {
+                let dst = dst as usize;
                 let base_d = dst * MORSEL;
                 for i in 0..m {
                     scratch.regs[base_d + i] = val;
@@ -627,34 +602,46 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer arithmetic
             // ----------------------------------------------------------------
-            EXPR_INT_ADD => bin_op!(a1, a2, dst, |x, y| x.wrapping_add(y)),
-            EXPR_INT_SUB => bin_op!(a1, a2, dst, |x, y| x.wrapping_sub(y)),
-            EXPR_INT_MUL => bin_op!(a1, a2, dst, |x, y| x.wrapping_mul(y)),
-            EXPR_INT_DIV => div_like!(a1, a2, dst, |a, b| {
-                let is_zero = b == 0;
-                let d = if is_zero { 1 } else { b };
-                (a.wrapping_div(d), is_zero)
-            }),
-            EXPR_INT_MOD => div_like!(a1, a2, dst, |a, b| {
-                let is_zero = b == 0;
-                let d = if is_zero { 1 } else { b };
-                (a.wrapping_rem(d), is_zero)
-            }),
-            // Unsigned (U64) division/modulo: reinterpret operands as u64 so the
-            // quotient/remainder is correct for dividends >= 2^63. Zero divisor
-            // marks the row NULL, matching the signed INT_DIV/INT_MOD path.
-            EXPR_UDIV => div_like!(a1, a2, dst, |a, b| {
-                let is_zero = b == 0;
-                let d = if is_zero { 1u64 } else { b as u64 };
-                (((a as u64) / d) as i64, is_zero)
-            }),
-            EXPR_UMOD => div_like!(a1, a2, dst, |a, b| {
-                let is_zero = b == 0;
-                let d = if is_zero { 1u64 } else { b as u64 };
-                (((a as u64) % d) as i64, is_zero)
-            }),
-            EXPR_INT_NEG => {
-                let ai = a1 as usize;
+            Instr::IntAdd { dst, a, b } => bin_op!(a, b, dst as usize, |x, y| x.wrapping_add(y)),
+            Instr::IntSub { dst, a, b } => bin_op!(a, b, dst as usize, |x, y| x.wrapping_sub(y)),
+            Instr::IntMul { dst, a, b } => bin_op!(a, b, dst as usize, |x, y| x.wrapping_mul(y)),
+            // `signed: false` is the old UDIV — reinterpret operands as u64 so the
+            // quotient is correct for dividends >= 2^63. Zero divisor marks NULL.
+            Instr::IntDiv { dst, a, b, signed } => {
+                let d = dst as usize;
+                if signed {
+                    div_like!(a, b, d, |a, b| {
+                        let is_zero = b == 0;
+                        let dd = if is_zero { 1 } else { b };
+                        (a.wrapping_div(dd), is_zero)
+                    })
+                } else {
+                    div_like!(a, b, d, |a, b| {
+                        let is_zero = b == 0;
+                        let dd = if is_zero { 1u64 } else { b as u64 };
+                        (((a as u64) / dd) as i64, is_zero)
+                    })
+                }
+            }
+            Instr::IntMod { dst, a, b, signed } => {
+                let d = dst as usize;
+                if signed {
+                    div_like!(a, b, d, |a, b| {
+                        let is_zero = b == 0;
+                        let dd = if is_zero { 1 } else { b };
+                        (a.wrapping_rem(dd), is_zero)
+                    })
+                } else {
+                    div_like!(a, b, d, |a, b| {
+                        let is_zero = b == 0;
+                        let dd = if is_zero { 1u64 } else { b as u64 };
+                        (((a as u64) % dd) as i64, is_zero)
+                    })
+                }
+            }
+            Instr::IntNeg { dst, a } => {
+                let dst = dst as usize;
+                let ai = a as usize;
                 let base_a = ai * MORSEL;
                 let base_d = dst * MORSEL;
                 for i in 0..m {
@@ -667,18 +654,25 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Float arithmetic
             // ----------------------------------------------------------------
-            EXPR_FLOAT_ADD => bin_op!(a1, a2, dst, |x, y| encode_f64(decode_f64(x) + decode_f64(y))),
-            EXPR_FLOAT_SUB => bin_op!(a1, a2, dst, |x, y| encode_f64(decode_f64(x) - decode_f64(y))),
-            EXPR_FLOAT_MUL => bin_op!(a1, a2, dst, |x, y| encode_f64(decode_f64(x) * decode_f64(y))),
-            EXPR_FLOAT_DIV => div_like!(a1, a2, dst, |a, b| {
+            Instr::FloatAdd { dst, a, b } => {
+                bin_op!(a, b, dst as usize, |x, y| encode_f64(decode_f64(x) + decode_f64(y)))
+            }
+            Instr::FloatSub { dst, a, b } => {
+                bin_op!(a, b, dst as usize, |x, y| encode_f64(decode_f64(x) - decode_f64(y)))
+            }
+            Instr::FloatMul { dst, a, b } => {
+                bin_op!(a, b, dst as usize, |x, y| encode_f64(decode_f64(x) * decode_f64(y)))
+            }
+            Instr::FloatDiv { dst, a, b } => div_like!(a, b, dst as usize, |a, b| {
                 let fa = decode_f64(a);
                 let fb = decode_f64(b);
                 let is_zero = fb == 0.0;
                 let fb_safe = if is_zero { 1.0 } else { fb };
                 (encode_f64(fa / fb_safe), is_zero)
             }),
-            EXPR_FLOAT_NEG => {
-                let ai = a1 as usize;
+            Instr::FloatNeg { dst, a } => {
+                let dst = dst as usize;
+                let ai = a as usize;
                 let base_a = ai * MORSEL;
                 let base_d = dst * MORSEL;
                 for i in 0..m {
@@ -691,35 +685,47 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // Integer comparisons
             // ----------------------------------------------------------------
-            EXPR_CMP_EQ => bin_op!(a1, a2, dst, |x, y| (x == y) as i64),
-            EXPR_CMP_NE => bin_op!(a1, a2, dst, |x, y| (x != y) as i64),
-            EXPR_CMP_GT => bin_op!(a1, a2, dst, |x, y| (x > y) as i64),
-            EXPR_CMP_GE => bin_op!(a1, a2, dst, |x, y| (x >= y) as i64),
-            EXPR_CMP_LT => bin_op!(a1, a2, dst, |x, y| (x < y) as i64),
-            EXPR_CMP_LE => bin_op!(a1, a2, dst, |x, y| (x <= y) as i64),
-
-            // Unsigned (U64) integer comparisons
-            EXPR_UCMP_GT => bin_op!(a1, a2, dst, |x, y| ((x as u64) > (y as u64)) as i64),
-            EXPR_UCMP_GE => bin_op!(a1, a2, dst, |x, y| ((x as u64) >= (y as u64)) as i64),
-            EXPR_UCMP_LT => bin_op!(a1, a2, dst, |x, y| ((x as u64) < (y as u64)) as i64),
-            EXPR_UCMP_LE => bin_op!(a1, a2, dst, |x, y| ((x as u64) <= (y as u64)) as i64),
+            // `signed: false` is the old UCMP_* arm — compare the raw bits as u64
+            // so values >= 2^63 order correctly. Branch on op/signed outside the
+            // per-row loop; each `bin_op!` body is byte-identical to before.
+            Instr::Cmp { op, dst, a, b, signed } => {
+                let d = dst as usize;
+                match op {
+                    CmpOp::Eq => bin_op!(a, b, d, |x, y| (x == y) as i64),
+                    CmpOp::Ne => bin_op!(a, b, d, |x, y| (x != y) as i64),
+                    CmpOp::Gt if signed => bin_op!(a, b, d, |x, y| (x > y) as i64),
+                    CmpOp::Gt => bin_op!(a, b, d, |x, y| ((x as u64) > (y as u64)) as i64),
+                    CmpOp::Ge if signed => bin_op!(a, b, d, |x, y| (x >= y) as i64),
+                    CmpOp::Ge => bin_op!(a, b, d, |x, y| ((x as u64) >= (y as u64)) as i64),
+                    CmpOp::Lt if signed => bin_op!(a, b, d, |x, y| (x < y) as i64),
+                    CmpOp::Lt => bin_op!(a, b, d, |x, y| ((x as u64) < (y as u64)) as i64),
+                    CmpOp::Le if signed => bin_op!(a, b, d, |x, y| (x <= y) as i64),
+                    CmpOp::Le => bin_op!(a, b, d, |x, y| ((x as u64) <= (y as u64)) as i64),
+                }
+            }
 
             // ----------------------------------------------------------------
             // Float comparisons
             // ----------------------------------------------------------------
-            EXPR_FCMP_EQ => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) == decode_f64(y)) as i64),
-            EXPR_FCMP_NE => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) != decode_f64(y)) as i64),
-            EXPR_FCMP_GT => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) > decode_f64(y)) as i64),
-            EXPR_FCMP_GE => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) >= decode_f64(y)) as i64),
-            EXPR_FCMP_LT => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) < decode_f64(y)) as i64),
-            EXPR_FCMP_LE => bin_op!(a1, a2, dst, |x, y| (decode_f64(x) <= decode_f64(y)) as i64),
+            Instr::FCmp { op, dst, a, b } => {
+                let d = dst as usize;
+                match op {
+                    CmpOp::Eq => bin_op!(a, b, d, |x, y| (decode_f64(x) == decode_f64(y)) as i64),
+                    CmpOp::Ne => bin_op!(a, b, d, |x, y| (decode_f64(x) != decode_f64(y)) as i64),
+                    CmpOp::Gt => bin_op!(a, b, d, |x, y| (decode_f64(x) > decode_f64(y)) as i64),
+                    CmpOp::Ge => bin_op!(a, b, d, |x, y| (decode_f64(x) >= decode_f64(y)) as i64),
+                    CmpOp::Lt => bin_op!(a, b, d, |x, y| (decode_f64(x) < decode_f64(y)) as i64),
+                    CmpOp::Le => bin_op!(a, b, d, |x, y| (decode_f64(x) <= decode_f64(y)) as i64),
+                }
+            }
 
             // ----------------------------------------------------------------
             // Boolean 3VL
             // ----------------------------------------------------------------
-            EXPR_BOOL_AND => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
+            Instr::BoolAnd { dst, a, b } => {
+                let dst = dst as usize;
+                let ai = a as usize;
+                let bi = b as usize;
                 if scratch.no_nulls {
                     let base_a = ai * MORSEL;
                     let base_b = bi * MORSEL;
@@ -739,9 +745,10 @@ pub(in crate::expr) fn eval_batch(
                     }
                 }
             }
-            EXPR_BOOL_OR => {
-                let ai = a1 as usize;
-                let bi = a2 as usize;
+            Instr::BoolOr { dst, a, b } => {
+                let dst = dst as usize;
+                let ai = a as usize;
+                let bi = b as usize;
                 if scratch.no_nulls {
                     let base_a = ai * MORSEL;
                     let base_b = bi * MORSEL;
@@ -757,8 +764,9 @@ pub(in crate::expr) fn eval_batch(
                     }
                 }
             }
-            EXPR_BOOL_NOT => {
-                let ai = a1 as usize;
+            Instr::BoolNot { dst, a } => {
+                let dst = dst as usize;
+                let ai = a as usize;
                 if scratch.no_nulls {
                     let base_a = ai * MORSEL;
                     let base_d = dst * MORSEL;
@@ -787,74 +795,65 @@ pub(in crate::expr) fn eval_batch(
             // ----------------------------------------------------------------
             // IS NULL / IS NOT NULL
             // ----------------------------------------------------------------
-            EXPR_IS_NULL => eval_is_null(scratch, mb, prog, dst, morsel_start, m, a1 as usize, 0),
-            EXPR_IS_NOT_NULL => eval_is_null(scratch, mb, prog, dst, morsel_start, m, a1 as usize, 1),
+            Instr::IsNull { dst, pi } => eval_is_null(scratch, mb, prog, dst as usize, morsel_start, m, pi as usize, 0),
+            Instr::IsNotNull { dst, pi } => {
+                eval_is_null(scratch, mb, prog, dst as usize, morsel_start, m, pi as usize, 1)
+            }
 
             // ----------------------------------------------------------------
-            // Type cast
+            // Type cast. `signed: false` reinterprets the register as u64 first
+            // so values >= 2^63 cast to the correct large positive float.
             // ----------------------------------------------------------------
-            EXPR_INT_TO_FLOAT => {
-                let ai = a1 as usize;
+            Instr::IntToFloat { dst, a, signed } => {
+                let dst = dst as usize;
+                let ai = a as usize;
                 let base_a = ai * MORSEL;
                 let base_d = dst * MORSEL;
-                for i in 0..m {
-                    scratch.regs[base_d + i] = encode_f64(scratch.regs[base_a + i] as f64);
+                if signed {
+                    for i in 0..m {
+                        scratch.regs[base_d + i] = encode_f64(scratch.regs[base_a + i] as f64);
+                    }
+                } else {
+                    for i in 0..m {
+                        scratch.regs[base_d + i] = encode_f64(scratch.regs[base_a + i] as u64 as f64);
+                    }
                 }
                 null_or1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
             }
-            // Unsigned (U64) → float: reinterpret the register as u64 first so
-            // values >= 2^63 cast to the correct large positive float.
-            EXPR_UINT_TO_FLOAT => {
-                let ai = a1 as usize;
-                let base_a = ai * MORSEL;
-                let base_d = dst * MORSEL;
-                for i in 0..m {
-                    scratch.regs[base_d + i] = encode_f64(scratch.regs[base_a + i] as u64 as f64);
+
+            // ----------------------------------------------------------------
+            // String comparisons (column vs constant / column vs column)
+            // ----------------------------------------------------------------
+            Instr::StrColConst { op, dst, pi, const_idx } => {
+                let d = dst as usize;
+                let ci = const_idx as usize;
+                match op {
+                    StrOp::Eq => {
+                        eval_str_col_vs_const(scratch, mb, prog, d, morsel_start, m, pi, ci, |o| o == Ordering::Equal)
+                    }
+                    StrOp::Lt => {
+                        eval_str_col_vs_const(scratch, mb, prog, d, morsel_start, m, pi, ci, |o| o == Ordering::Less)
+                    }
+                    StrOp::Le => eval_str_col_vs_const(scratch, mb, prog, d, morsel_start, m, pi, ci, |o| {
+                        o != Ordering::Greater
+                    }),
                 }
-                null_or1(scratch, dst, ai, m);
-                maybe_pack_bool_bits(scratch, prog, dst, m);
             }
-
-            // ----------------------------------------------------------------
-            // String comparisons (column vs constant)
-            // ----------------------------------------------------------------
-            EXPR_STR_COL_EQ_CONST => {
-                eval_str_col_vs_const(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as usize, |o| {
-                    o == Ordering::Equal
-                })
+            Instr::StrColCol { op, dst, pi_a, pi_b } => {
+                let d = dst as usize;
+                match op {
+                    StrOp::Eq => eval_str_col_vs_col(scratch, mb, prog, d, morsel_start, m, pi_a, pi_b, |o| {
+                        o == Ordering::Equal
+                    }),
+                    StrOp::Lt => eval_str_col_vs_col(scratch, mb, prog, d, morsel_start, m, pi_a, pi_b, |o| {
+                        o == Ordering::Less
+                    }),
+                    StrOp::Le => eval_str_col_vs_col(scratch, mb, prog, d, morsel_start, m, pi_a, pi_b, |o| {
+                        o != Ordering::Greater
+                    }),
+                }
             }
-            EXPR_STR_COL_LT_CONST => {
-                eval_str_col_vs_const(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as usize, |o| {
-                    o == Ordering::Less
-                })
-            }
-            EXPR_STR_COL_LE_CONST => {
-                eval_str_col_vs_const(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as usize, |o| {
-                    o != Ordering::Greater
-                })
-            }
-
-            // ----------------------------------------------------------------
-            // String comparisons (column vs column)
-            // ----------------------------------------------------------------
-            EXPR_STR_COL_EQ_COL => {
-                eval_str_col_vs_col(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as u8, |o| {
-                    o == Ordering::Equal
-                })
-            }
-            EXPR_STR_COL_LT_COL => {
-                eval_str_col_vs_col(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as u8, |o| {
-                    o == Ordering::Less
-                })
-            }
-            EXPR_STR_COL_LE_COL => {
-                eval_str_col_vs_col(scratch, mb, prog, dst, morsel_start, m, a1 as u8, a2 as u8, |o| {
-                    o != Ordering::Greater
-                })
-            }
-
-            _ => {}
         }
     }
 }

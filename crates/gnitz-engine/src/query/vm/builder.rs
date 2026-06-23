@@ -21,7 +21,7 @@ pub(crate) struct ProgramBuilder {
     /// Parallel to `reindex_cols`: per-column carried promotion target tc
     /// (`0` = derive from source). Sliced alongside `reindex_cols` for `op_map`.
     reindex_target_tcs: Vec<u8>,
-    expr_progs: Vec<*const crate::expr::ExprProgram>,
+    expr_progs: Vec<*const crate::expr::ResolvedProgram>,
 }
 
 // SAFETY: Same justification as Program — single-thread access, stable pointers.
@@ -78,7 +78,7 @@ impl ProgramBuilder {
         idx
     }
 
-    fn expr_idx(&mut self, ptr: *const crate::expr::ExprProgram) -> Option<u16> {
+    fn expr_idx(&mut self, ptr: *const crate::expr::ResolvedProgram) -> Option<u16> {
         if ptr.is_null() {
             return None;
         }
@@ -366,7 +366,7 @@ impl ProgramBuilder {
         gi_table: *mut Table,
         gi_col_idx: u32,
         // Finalize
-        finalize_prog: *const crate::expr::ExprProgram,
+        finalize_prog: *const crate::expr::ResolvedProgram,
         finalize_schema: *const SchemaDescriptor,
     ) {
         let (agg_off, agg_cnt) = self.add_agg_descs(agg_descs);
@@ -438,7 +438,7 @@ impl ProgramBuilder {
         reg_meta: Vec<RegisterMeta>,
         owned_tables: Vec<Box<Table>>,
         owned_funcs: Vec<Box<ScalarFunc>>,
-        owned_expr_progs: Vec<Box<crate::expr::ExprProgram>>,
+        owned_expr_progs: Vec<Box<crate::expr::ResolvedProgram>>,
         owned_trace_regs: Vec<(u16, usize)>,
     ) -> Box<VmHandle> {
         let regfile = RegisterFile::new(&reg_meta);

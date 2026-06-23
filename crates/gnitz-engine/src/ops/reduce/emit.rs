@@ -1,6 +1,6 @@
 //! Output row emitters: raw reduce rows, finalized rows, gather-reduce rows.
 
-use crate::schema::{ColumnLocator, SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
 
 use super::super::util::write_string_from_batch;
@@ -115,12 +115,12 @@ pub(super) fn emit_finalized_row(
     raw_row: usize,
     group_key: u128,
     weight: i64,
-    prog: &crate::expr::ExprProgram,
+    prog: &crate::expr::ResolvedProgram,
     raw_schema: &SchemaDescriptor,
     fin_schema: &SchemaDescriptor,
     ctx: &mut crate::expr::FinalizeContext,
 ) {
-    use crate::expr::OutputColKind;
+    use crate::expr::{ColSrc, OutputColKind};
 
     let raw_mb = raw_output.as_mem_batch();
     let null_word = raw_mb.get_null_word(raw_row);
@@ -137,24 +137,31 @@ pub(super) fn emit_finalized_row(
         let cs = col.size() as usize;
 
         if fpi < out_cols.len() {
-            match out_cols[fpi] {
-                OutputColKind::CopyCol { src_pi, pk_off } => {
-                    // After resolve_column_indices, COPY_COL addresses either a
-                    // dense payload index or (SENTINEL) a PK column at byte
-                    // offset `pk_off` within the OPK PK region.
-                    if src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
-                        // PK source: decode the addressed OPK column back to
-                        // native LE (raw copy is wrong for signed / big-endian
-                        // columns). The fin column type equals the source PK
-                        // column type for a verbatim copy.
+            let kind = out_cols[fpi];
+            // The finalize program emits in dense destination order, so the
+            // bytecode-order `out_cols[fpi]` is the instruction producing payload
+            // column `fpi`. `out_payload` is therefore redundant here (we index by
+            // `fpi`); this assert pins that load-bearing invariant once.
+            debug_assert_eq!(
+                kind.out_payload(),
+                fpi,
+                "finalize out_cols not in dense destination order"
+            );
+            match kind {
+                OutputColKind::CopyCol { src, .. } => match src {
+                    ColSrc::Pk { off } => {
+                        // PK source: decode the addressed OPK column back to native
+                        // LE (raw copy is wrong for signed / big-endian columns).
+                        // The fin column type equals the source PK column type for a
+                        // verbatim copy. A single PK column is decoded, never the
+                        // whole compound region.
                         let opk = raw_mb.get_pk_bytes(raw_row);
-                        let off = pk_off as usize;
-                        // A single PK column is decoded here, never the whole
-                        // compound region; 16 bytes (widest scalar PK) suffices.
+                        let off = off as usize;
                         let le = gnitz_wire::decode_pk_column_owned(&opk[off..off + cs], col.type_code);
                         fin_output.extend_col(fpi, &le[..cs]);
-                    } else {
-                        let src_pi = src_pi as usize;
+                    }
+                    ColSrc::Payload(pi) => {
+                        let src_pi = pi as usize;
                         let src_ci = raw_schema.payload_col_idx(src_pi);
                         if (null_word >> src_pi) & 1 != 0 {
                             fin_null_mask |= 1u64 << fpi;
@@ -166,9 +173,9 @@ pub(super) fn emit_finalized_row(
                             fin_output.extend_col(fpi, src);
                         }
                     }
-                }
-                OutputColKind::Emit(eidx) => {
-                    let (val, is_null) = ctx.read_emit(eidx);
+                },
+                OutputColKind::Emit { reg, .. } => {
+                    let (val, is_null) = ctx.read_emit(reg);
                     if is_null {
                         fin_null_mask |= 1u64 << fpi;
                         fin_output.fill_col_zero(fpi, cs);
@@ -176,7 +183,7 @@ pub(super) fn emit_finalized_row(
                         fin_output.extend_col(fpi, &val.to_le_bytes()[..cs]);
                     }
                 }
-                OutputColKind::EmitNull => {
+                OutputColKind::EmitNull { .. } => {
                     fin_null_mask |= 1u64 << fpi;
                     fin_output.fill_col_zero(fpi, cs);
                 }

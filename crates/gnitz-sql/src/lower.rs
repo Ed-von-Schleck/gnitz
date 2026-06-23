@@ -147,10 +147,10 @@ impl BoundExprBackend for OpcodeBackend<'_> {
     type Out = (u32, bool);
 
     fn col_ref(&mut self, idx: usize) -> Result<Self::Out, GnitzSqlError> {
-        // Every 16-byte column must be rejected here: the engine's
-        // `EXPR_LOAD_PAYLOAD_INT` handler has arms only for 1/2/4/8-byte columns,
-        // so a 16-byte column hits its no-op arm and the following op reads stale
-        // scratch bytes — silent corruption, no error. A *valid* string/blob use
+        // Every 16-byte column must be rejected here: the engine's payload integer
+        // load handler has arms only for 1/2/4/8-byte columns, so a 16-byte column
+        // hits its no-op arm and the following op reads stale scratch bytes —
+        // silent corruption, no error. A *valid* string/blob use
         // is one of the six comparisons, which `binop` intercepts via
         // `try_compile_string_cmp` before any recursion reaches this arm; so a
         // STRING/BLOB landing here is arithmetic or a mixed-type comparison

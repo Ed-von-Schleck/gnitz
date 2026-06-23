@@ -209,7 +209,7 @@ pub(crate) struct VmHandle {
     /// Expression programs created during compilation.
     /// `program.expr_progs` may point into these.  Dropped AFTER `program`.
     #[allow(dead_code)]
-    pub owned_expr_progs: Vec<Box<crate::expr::ExprProgram>>,
+    pub owned_expr_progs: Vec<Box<crate::expr::ResolvedProgram>>,
     /// Trace registers backed by owned tables: `(reg_id, index into owned_tables)`.
     /// `execute_epoch` creates cursors from these before dispatch.
     pub owned_trace_regs: Vec<(u16, usize)>,
@@ -326,7 +326,7 @@ pub(crate) struct Program {
     /// Parallel to `reindex_cols` (same offsets): per-column carried promotion
     /// target tc (`0` = derive from source).
     pub reindex_target_tcs: Vec<u8>,
-    pub expr_progs: Vec<*const crate::expr::ExprProgram>,
+    pub expr_progs: Vec<*const crate::expr::ResolvedProgram>,
 }
 
 // SAFETY: Program is only accessed from a single thread (the worker thread
@@ -532,21 +532,17 @@ mod tests {
         let schema = schema_1i64();
 
         // Predicate: col[1] > 0  (col[1] is the I64 payload at logical index 1)
-        let pred_code = vec![
-            crate::expr::EXPR_LOAD_COL_INT,
-            0,
-            1,
-            0, // r0 = col[1]
-            crate::expr::EXPR_LOAD_CONST,
-            1,
-            0,
-            0, // r1 = 0
-            crate::expr::EXPR_CMP_GT,
-            2,
-            0,
-            1, // r2 = r0 > r1
+        let pred_instrs = vec![
+            crate::expr::LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1]
+            crate::expr::LogicalInstr::LoadConst { dst: 1, val: 0 },  // r1 = 0
+            crate::expr::LogicalInstr::Cmp {
+                op: crate::expr::CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            }, // r2 = r0 > r1
         ];
-        let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
+        let pred_prog = crate::expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
         let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema));
         let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
@@ -1844,21 +1840,17 @@ mod tests {
         // Verify that adding the same func/table pointer twice reuses the same index.
         let schema = schema_1i64();
 
-        let pred_code = vec![
-            crate::expr::EXPR_LOAD_COL_INT,
-            0,
-            1,
-            0,
-            crate::expr::EXPR_LOAD_CONST,
-            1,
-            0,
-            0,
-            crate::expr::EXPR_CMP_GT,
-            2,
-            0,
-            1,
+        let pred_instrs = vec![
+            crate::expr::LogicalInstr::LoadColInt { dst: 0, col: 1 },
+            crate::expr::LogicalInstr::LoadConst { dst: 1, val: 0 },
+            crate::expr::LogicalInstr::Cmp {
+                op: crate::expr::CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
         ];
-        let pred_prog = crate::expr::ExprProgram::new(pred_code, 3, 2, vec![]);
+        let pred_prog = crate::expr::LogicalProgram::new(pred_instrs, 3, 2, vec![]);
         let func = Box::new(crate::expr::ScalarFunc::from_predicate(pred_prog, &schema));
         let func_ptr = Box::into_raw(func) as *const ScalarFunc;
 
@@ -1985,27 +1977,23 @@ mod tests {
     /// Filter with expression bytecode: col1 > 25 keeps rows with val 30, 40, 50.
     #[test]
     fn test_filter_with_expr() {
-        use crate::expr::{ExprProgram, EXPR_CMP_GT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
+        use crate::expr::{CmpOp, LogicalInstr, LogicalProgram};
 
         let schema = schema_1i64();
 
         // Build expression: col1 > 25
         // col1 is schema column index 1 (the I64 payload column)
-        let code = vec![
-            EXPR_LOAD_COL_INT,
-            0,
-            1,
-            0, // r0 = col[1]
-            EXPR_LOAD_CONST,
-            1,
-            25,
-            0, // r1 = 25
-            EXPR_CMP_GT,
-            2,
-            0,
-            1, // r2 = (r0 > r1)
+        let instrs = vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1]
+            LogicalInstr::LoadConst { dst: 1, val: 25 }, // r1 = 25
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            }, // r2 = (r0 > r1)
         ];
-        let prog = ExprProgram::new(code, 3, 2, vec![]);
+        let prog = LogicalProgram::new(instrs, 3, 2, vec![]);
 
         let func = Box::new(crate::expr::ScalarFunc::from_predicate(prog, &schema));
         let func_ptr = Box::into_raw(func) as *const ScalarFunc;

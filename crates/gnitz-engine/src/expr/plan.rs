@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 
 use super::batch::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
-use super::program::{self as expr, ExprProgram, OutputColKind};
+use super::program::{ColSrc, LogicalProgram, OutputColKind, ResolvedProgram};
 use crate::schema::{SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{Batch, MemBatch};
 
@@ -166,13 +166,13 @@ struct ColMove {
 }
 
 struct InterpretedFilter {
-    prog: ExprProgram,
+    prog: ResolvedProgram,
     /// Precomputed `prog.is_strictly_non_nullable(in_schema)`.
     no_nulls: bool,
 }
 
 struct InterpretedCompute {
-    prog: ExprProgram,
+    prog: ResolvedProgram,
     emit_payloads: Vec<usize>,
     emit_regs: Vec<usize>,
     /// Output byte width per EMIT target, parallel to `emit_payloads`.
@@ -209,9 +209,8 @@ fn col_move_stride(src_pi: u8, dst_payload: usize, in_schema: &SchemaDescriptor,
 
 impl ScalarFunc {
     /// Filter via interpreted expression.
-    pub fn from_predicate(mut prog: ExprProgram, schema: &SchemaDescriptor) -> Self {
-        prog.resolve_column_indices(schema);
-        prog.classify(true);
+    pub fn from_predicate(logical: LogicalProgram, schema: &SchemaDescriptor) -> Self {
+        let prog = logical.resolve(schema, /* is_filter = */ true);
         let no_nulls = prog.is_strictly_non_nullable(schema);
         ScalarFunc {
             filter: Some(InterpretedFilter { prog, no_nulls }),
@@ -263,67 +262,52 @@ impl ScalarFunc {
         }
     }
 
-    /// Map plan from ExprProgram bytecode.
-    pub fn from_map(mut prog: ExprProgram, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
-        prog.resolve_column_indices(in_schema);
-        // After resolve_column_indices, EXPR_COPY_COL.a1 already holds the
-        // resolved payload byte (SENTINEL for PK, dense payload index otherwise).
-        let mut copy_src_pi_bytes: Vec<u8> = Vec::new();
-        let mut copy_pk_byte_offsets: Vec<u8> = Vec::new();
-        let mut copy_out_payloads: Vec<u32> = Vec::new();
-        let mut copy_type_codes: Vec<u8> = Vec::new();
+    /// Map plan from a logical expression program.
+    pub fn from_map(logical: LogicalProgram, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
+        let prog = logical.resolve(in_schema, /* is_filter = */ false);
+        // One pass over the typed output classification — `ColSrc` carries the
+        // PK-vs-payload distinction, so there is no negative-sentinel decode and
+        // no parallel-`Vec` bytecode re-walk.
+        let out_cols = prog.classify_output_cols();
+        let mut col_moves: Vec<ColMove> = Vec::new();
         let mut null_payloads: Vec<u32> = Vec::new();
         let mut emit_payloads: Vec<usize> = Vec::new();
         let mut emit_regs: Vec<usize> = Vec::new();
-        let mut has_compute = false;
-
-        for i in 0..prog.num_instrs as usize {
-            let base = i * 4;
-            let op = prog.code[base];
-            let dst = prog.code[base + 1];
-            let a1 = prog.code[base + 2];
-            let a2 = prog.code[base + 3];
-
-            if op == expr::EXPR_COPY_COL {
-                // After resolve, a1 is a payload index (>= 0) or, for a PK
-                // source column, `-(pk_byte_offset) - 1` (negative sentinel).
-                let (src_pi, pk_off) = if a1 < 0 {
-                    (PAYLOAD_MAPPING_PK_SENTINEL, (-a1 - 1) as u8)
-                } else {
-                    (a1 as u8, 0u8)
-                };
-                copy_src_pi_bytes.push(src_pi);
-                copy_pk_byte_offsets.push(pk_off);
-                copy_out_payloads.push(a2 as u32);
-                copy_type_codes.push(dst as u8);
-            } else if op == expr::EXPR_EMIT_NULL {
-                null_payloads.push(a1 as u32);
-            } else {
-                has_compute = true;
-                if op == expr::EXPR_EMIT {
-                    emit_regs.push(a1 as usize);
-                    emit_payloads.push(a2 as usize);
+        for k in &out_cols {
+            match *k {
+                OutputColKind::CopyCol { src, out_payload, tc } => {
+                    let (src_pi, pk_byte_offset) = match src {
+                        ColSrc::Pk { off } => (PAYLOAD_MAPPING_PK_SENTINEL, off),
+                        ColSrc::Payload(pi) => (pi, 0u8),
+                    };
+                    col_moves.push(ColMove {
+                        src_pi,
+                        dst_payload: out_payload as usize,
+                        type_code: tc,
+                        stride: col_move_stride(src_pi, out_payload as usize, in_schema, out_schema),
+                        pk_byte_offset,
+                    });
                 }
+                OutputColKind::Emit { reg, out_payload } => {
+                    emit_regs.push(reg);
+                    emit_payloads.push(out_payload);
+                }
+                OutputColKind::EmitNull { out_payload } => null_payloads.push(out_payload),
             }
         }
 
-        let col_moves: Vec<ColMove> = copy_src_pi_bytes
-            .iter()
-            .zip(copy_out_payloads.iter())
-            .zip(copy_type_codes.iter())
-            .zip(copy_pk_byte_offsets.iter())
-            .map(|(((&src, &dst), &tc), &pk_off)| ColMove {
-                src_pi: src,
-                dst_payload: dst as usize,
-                type_code: tc,
-                stride: col_move_stride(src, dst as usize, in_schema, out_schema),
-                pk_byte_offset: pk_off,
-            })
-            .collect();
+        // Null permutation: copied columns carry their source null bit (PK
+        // sentinels are skipped inside `from_col_pairs`); EMIT_NULL columns are
+        // unconditionally null. Both derive from the same walk.
+        let null_src: Vec<u8> = col_moves.iter().map(|c| c.src_pi).collect();
+        let null_dst: Vec<u32> = col_moves.iter().map(|c| c.dst_payload as u32).collect();
+        let null_perm = NullPerm::from_col_pairs(&null_src, &null_dst, &null_payloads);
 
-        let null_perm = NullPerm::from_col_pairs(&copy_src_pi_bytes, &copy_out_payloads, &null_payloads);
-
-        let compute = if has_compute {
+        // Compute is needed iff the program emits a computed register: every
+        // compute instruction exists only to feed an EMIT.
+        let compute = if emit_regs.is_empty() {
+            None
+        } else {
             let emit_strides: Vec<u8> = emit_payloads
                 .iter()
                 .map(|&p| {
@@ -341,8 +325,6 @@ impl ScalarFunc {
                 emit_strides,
                 no_nulls,
             })
-        } else {
-            None
         };
 
         ScalarFunc {
@@ -571,30 +553,20 @@ impl ScalarFunc {
 pub(crate) struct FinalizeContext {
     scratch: EvalScratch,
     no_nulls: bool,
-    /// One entry per `EXPR_EMIT` instruction (in program order): the source
-    /// register that EMIT reads.
-    emit_regs: Vec<usize>,
     /// Classification of every output-producing instruction in program order.
     /// Indexed by destination payload column at the call site.
     out_cols: Vec<OutputColKind>,
 }
 
 impl FinalizeContext {
-    pub fn new(prog: &ExprProgram, in_schema: &SchemaDescriptor) -> Self {
+    pub fn new(prog: &ResolvedProgram, in_schema: &SchemaDescriptor) -> Self {
         let no_nulls = prog.is_strictly_non_nullable(in_schema);
         let mut scratch = EvalScratch::new();
         scratch.ensure_capacity(prog.num_regs as usize, no_nulls, 1);
-        let emit_regs: Vec<usize> = prog
-            .code
-            .chunks_exact(4)
-            .filter(|i| i[0] == expr::EXPR_EMIT)
-            .map(|i| i[2] as usize)
-            .collect();
         let out_cols = prog.classify_output_cols();
         FinalizeContext {
             scratch,
             no_nulls,
-            emit_regs,
             out_cols,
         }
     }
@@ -606,14 +578,13 @@ impl FinalizeContext {
 
     /// Evaluate `prog` over a single row of `mb` into the cached scratch.
     /// The result of each EMIT can subsequently be read with `read_emit`.
-    pub fn eval_row(&mut self, prog: &ExprProgram, mb: &MemBatch, row: usize) {
+    pub fn eval_row(&mut self, prog: &ResolvedProgram, mb: &MemBatch, row: usize) {
         eval_batch(prog, mb, row, 1, &mut self.scratch);
     }
 
-    /// Read the value and null flag for the `eidx`-th EMIT instruction.
+    /// Read the value and null flag for the EMIT whose source is register `reg`.
     /// Must be called after `eval_row`.
-    pub fn read_emit(&self, eidx: usize) -> (i64, bool) {
-        let reg = self.emit_regs[eidx];
+    pub fn read_emit(&self, reg: usize) -> (i64, bool) {
         let val = self.scratch.regs[reg * MORSEL];
         let is_null = !self.no_nulls && (self.scratch.null_bits[reg * NULL_WORDS_PER_REG] & 1) != 0;
         (val, is_null)

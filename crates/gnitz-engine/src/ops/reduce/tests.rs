@@ -265,9 +265,7 @@ fn test_reduce_sum_retraction() {
 /// is exactly the defect the companion fixes.
 #[test]
 fn test_reduce_nullable_sum_retraction_becomes_null() {
-    use crate::expr::{
-        ExprProgram, EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_INT_DIV, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST,
-    };
+    use crate::expr::{CmpOp, LogicalInstr, LogicalProgram};
     use crate::schema::{type_code, SchemaColumn};
     use crate::storage::CursorHandle;
     use std::rc::Rc;
@@ -310,43 +308,31 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     //   copy grp(col 1) → fin payload 0, count(col 2) → fin payload 1,
     //   emit sum-gate = sum(col 3) / (cnn(col 4) != 0) → fin payload 2.
     // div-by-zero (cnn == 0) marks the SUM NULL; div-by-1 (cnn > 0) is exact.
-    let i64_tc = type_code::I64 as i64;
-    let code: Vec<i64> = vec![
-        EXPR_COPY_COL,
-        i64_tc,
-        1,
-        0, // grp   → fin payload 0
-        EXPR_COPY_COL,
-        i64_tc,
-        2,
-        1, // count → fin payload 1
-        EXPR_LOAD_COL_INT,
-        0,
-        4,
-        0, // r0 = cnn (col 4)
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0, // r1 = 0
-        EXPR_CMP_NE,
-        2,
-        0,
-        1, // r2 = (cnn != 0) → 1/0
-        EXPR_LOAD_COL_INT,
-        3,
-        3,
-        0, // r3 = sum (col 3)
-        EXPR_INT_DIV,
-        4,
-        3,
-        2, // r4 = sum / gate (NULL when gate == 0)
-        EXPR_EMIT,
-        0,
-        4,
-        2, // emit r4 → fin payload 2 (sum)
+    let i64_tc = type_code::I64;
+    let instrs = vec![
+        LogicalInstr::CopyCol {
+            src_col: 1,
+            out: 0,
+            tc: i64_tc,
+        }, // grp   → fin payload 0
+        LogicalInstr::CopyCol {
+            src_col: 2,
+            out: 1,
+            tc: i64_tc,
+        }, // count → fin payload 1
+        LogicalInstr::LoadColInt { dst: 0, col: 4 }, // r0 = cnn (col 4)
+        LogicalInstr::LoadConst { dst: 1, val: 0 },  // r1 = 0
+        LogicalInstr::Cmp {
+            op: CmpOp::Ne,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = (cnn != 0) → 1/0
+        LogicalInstr::LoadColInt { dst: 3, col: 3 }, // r3 = sum (col 3)
+        LogicalInstr::IntDiv { dst: 4, a: 3, b: 2 }, // r4 = sum / gate (NULL when gate == 0)
+        LogicalInstr::Emit { src: 4, out: 2 },       // emit r4 → fin payload 2 (sum)
     ];
-    let mut fin_prog = ExprProgram::new(code, 5, 0, vec![]);
-    fin_prog.resolve_column_indices(&out_schema);
+    let fin_prog = LogicalProgram::new(instrs, 5, 0, vec![]).resolve(&out_schema, false);
 
     let aggs = [
         AggDescriptor {
@@ -2411,7 +2397,7 @@ fn test_argsort_delta_nullable_no_packed_sort() {
 
 #[test]
 fn test_emit_finalized_row_u128_pk_copy_col() {
-    use crate::expr::{ExprProgram, EXPR_COPY_COL};
+    use crate::expr::{LogicalInstr, LogicalProgram};
 
     // Raw output schema: U128 pk | I64 cnt
     let raw_schema = SchemaDescriptor::new(
@@ -2432,21 +2418,22 @@ fn test_emit_finalized_row_u128_pk_copy_col() {
         &[0],
     );
 
-    // Two COPY_COL instructions: copy col 0 (PK) and col 1 (cnt).
-    // Layout per instruction: [op, dst, a1=src_col, a2]. classify_output_cols
-    // reads src_col from a1 (instr[base + 2]).
-    let code: Vec<i64> = vec![
-        EXPR_COPY_COL,
-        0,
-        0,
-        0, // copy raw col 0 (PK) → fin col 1
-        EXPR_COPY_COL,
-        0,
-        1,
-        0, // copy raw col 1 (cnt) → fin col 2
+    // Two COPY_COL instructions: copy col 0 (PK) and col 1 (cnt). `out` is the
+    // dense finalized payload index (PK copy → payload 0 = fin col 1, cnt →
+    // payload 1 = fin col 2); classify_output_cols carries it through verbatim.
+    let instrs = vec![
+        LogicalInstr::CopyCol {
+            src_col: 0,
+            out: 0,
+            tc: 0,
+        }, // copy raw col 0 (PK) → fin col 1
+        LogicalInstr::CopyCol {
+            src_col: 1,
+            out: 1,
+            tc: 0,
+        }, // copy raw col 1 (cnt) → fin col 2
     ];
-    let mut prog = ExprProgram::new(code, 0, 0, vec![]);
-    prog.resolve_column_indices(&raw_schema);
+    let prog = LogicalProgram::new(instrs, 0, 0, vec![]).resolve(&raw_schema, false);
 
     // Build raw_output with one row: pk = a wide U128, cnt = 42
     let pk: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128;

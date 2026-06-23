@@ -7,19 +7,17 @@ use super::{bits_to_float, eval_predicate_via_batch as eval_predicate, eval_with
 use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use crate::storage::Batch;
 
-/// Build and resolve an `ExprProgram` in one step. Eval entry points
-/// `debug_assert!(prog.resolved)`, so every test prog must be resolved
-/// before being passed to `eval_predicate`/`eval_with_emit`.
+/// Build a `LogicalProgram` from typed instructions and resolve it against the
+/// schema in one step. Eval entry points take `&ResolvedProgram`, so every test
+/// prog must be resolved before being passed to `eval_predicate`/`eval_with_emit`.
 fn make_prog(
     schema: &SchemaDescriptor,
-    code: Vec<i64>,
+    instrs: Vec<LogicalInstr>,
     num_regs: u32,
     result_reg: u32,
     const_strings: Vec<Vec<u8>>,
-) -> ExprProgram {
-    let mut prog = ExprProgram::new(code, num_regs, result_reg, const_strings);
-    prog.resolve_column_indices(schema);
-    prog
+) -> ResolvedProgram {
+    LogicalProgram::new(instrs, num_regs, result_reg, const_strings).resolve(schema, /* is_filter = */ false)
 }
 
 fn make_schema(pk_index: u32, col_types: &[u8]) -> SchemaDescriptor {
@@ -56,60 +54,48 @@ fn test_int_comparisons() {
     let mb = batch.as_mem_batch();
 
     // r0 = load_col_int(1), r1 = load_const(42), r2 = cmp_eq(r0, r1)
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0, // r0 = col[1]
-        EXPR_LOAD_CONST,
-        1,
-        42,
-        0, // r1 = 42
-        EXPR_CMP_EQ,
-        2,
-        0,
-        1, // r2 = (r0 == r1)
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1]
+        LogicalInstr::LoadConst { dst: 1, val: 42 }, // r1 = 42
+        LogicalInstr::Cmp {
+            op: CmpOp::Eq,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = (r0 == r1)
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
     // Test NE
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        42,
-        0,
-        EXPR_CMP_NE,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 42 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Ne,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // Test GT
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        10,
-        0,
-        EXPR_CMP_GT,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 10 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 }
@@ -121,65 +107,41 @@ fn test_int_arithmetic() {
     let mb = batch.as_mem_batch();
 
     // ADD: 10 + 3 = 13
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_INT,
-        1,
-        2,
-        0,
-        EXPR_INT_ADD,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 13);
 
     // DIV by zero → NULL
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        EXPR_INT_DIV,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // MOD by zero → NULL
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        EXPR_INT_MOD,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::IntMod { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // NEG: -10
-    let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_INT_NEG, 1, 0, 0];
-    let prog = make_prog(&schema, code, 2, 1, vec![]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::IntNeg { dst: 1, a: 0 },
+    ];
+    let prog = make_prog(&schema, instrs, 2, 1, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, -10);
 }
@@ -194,60 +156,38 @@ fn test_float_arithmetic_and_comparison() {
     let mb = batch.as_mem_batch();
 
     // FLOAT_ADD: 3.14 + 2.0
-    let code = vec![
-        EXPR_LOAD_COL_FLOAT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_FLOAT,
-        1,
-        2,
-        0,
-        EXPR_FLOAT_ADD,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 1 },
+        LogicalInstr::LoadColFloat { dst: 1, col: 2 },
+        LogicalInstr::FloatAdd { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     let result = bits_to_float(val);
     assert!((result - 5.14).abs() < 1e-10);
 
     // FLOAT_DIV by zero → NULL
-    let code = vec![
-        EXPR_LOAD_COL_FLOAT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0, // zero bits
-        EXPR_FLOAT_DIV,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 }, // zero bits
+        LogicalInstr::FloatDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // FCMP_GT: 3.14 > 2.0
-    let code = vec![
-        EXPR_LOAD_COL_FLOAT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_FLOAT,
-        1,
-        2,
-        0,
-        EXPR_FCMP_GT,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 1 },
+        LogicalInstr::LoadColFloat { dst: 1, col: 2 },
+        LogicalInstr::FCmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 }
@@ -260,21 +200,12 @@ fn test_null_propagation() {
     let mb = batch.as_mem_batch();
 
     // ADD with one null operand → null
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_INT,
-        1,
-        2,
-        0,
-        EXPR_INT_ADD,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 }
@@ -287,22 +218,22 @@ fn test_is_null_is_not_null() {
     let mb = batch.as_mem_batch();
 
     // IS_NULL(col1) → 1 (always non-null result)
-    let code = vec![EXPR_IS_NULL, 0, 1, 0];
-    let prog = make_prog(&schema, code, 1, 0, vec![]);
+    let instrs = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
 
     // IS_NOT_NULL(col1) → 0
-    let code = vec![EXPR_IS_NOT_NULL, 0, 1, 0];
-    let prog = make_prog(&schema, code, 1, 0, vec![]);
+    let instrs = vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
     assert!(!is_null);
 
     // IS_NULL(col2) → 0
-    let code = vec![EXPR_IS_NULL, 0, 2, 0];
-    let prog = make_prog(&schema, code, 1, 0, vec![]);
+    let instrs = vec![LogicalInstr::IsNull { dst: 0, col: 2 }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -314,46 +245,31 @@ fn test_boolean_combinators() {
     let mb = batch.as_mem_batch();
 
     // AND(1, 0) → 0
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        EXPR_BOOL_AND,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // OR(1, 0) → 1
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        EXPR_BOOL_OR,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::BoolOr { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // NOT(1) → 0
-    let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_BOOL_NOT, 1, 0, 0];
-    let prog = make_prog(&schema, code, 2, 1, vec![]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::BoolNot { dst: 1, a: 0 },
+    ];
+    let prog = make_prog(&schema, instrs, 2, 1, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -365,18 +281,20 @@ fn test_load_const_encoding() {
     let mb = batch.as_mem_batch();
 
     // Test large constant: 0x00000001_00000002 = (1 << 32) | 2 = 4294967298
-    // a1 = lo 32 bits = 2, a2 = hi 32 bits = 1
-    let code = vec![EXPR_LOAD_CONST, 0, 2, 1];
-    let prog = make_prog(&schema, code, 1, 0, vec![]);
+    // Wire form: lo 32 bits = 2, hi 32 bits = 1.
+    let instrs = vec![LogicalInstr::LoadConst {
+        dst: 0,
+        val: ((1i64) << 32) | (2i64 & 0xFFFF_FFFF),
+    }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(!is_null);
     assert_eq!(val, (1i64 << 32) | 2);
 
-    // Test negative constant: -1 → lo=0xFFFFFFFF, hi=0xFFFFFFFF
-    // As i64: a1 = -1 (sign-extended from 32 bits), a2 = -1
-    // Reconstruction: (-1 << 32) | (-1 & 0xFFFFFFFF) = 0xFFFFFFFF_FFFFFFFF = -1
-    let code = vec![EXPR_LOAD_CONST, 0, -1, -1];
-    let prog = make_prog(&schema, code, 1, 0, vec![]);
+    // Test negative constant: -1 (the wire low/high split is reconstructed by
+    // `from_wire`; the typed instruction carries the full i64 value directly).
+    let instrs = vec![LogicalInstr::LoadConst { dst: 0, val: -1 }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, -1);
 }
@@ -400,15 +318,25 @@ fn test_string_eq_const() {
     let mb = batch.as_mem_batch();
 
     // STR_COL_EQ_CONST(col1, "hello") → 1
-    let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
-    let prog = make_prog(&schema, code, 1, 0, vec![b"hello".to_vec()]);
+    let instrs = vec![LogicalInstr::StrColConst {
+        op: StrOp::Eq,
+        dst: 0,
+        col: 1,
+        const_idx: 0,
+    }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(!is_null);
     assert_eq!(val, 1);
 
     // STR_COL_EQ_CONST(col1, "world") → 0
-    let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
-    let prog = make_prog(&schema, code, 1, 0, vec![b"world".to_vec()]);
+    let instrs = vec![LogicalInstr::StrColConst {
+        op: StrOp::Eq,
+        dst: 0,
+        col: 1,
+        const_idx: 0,
+    }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![b"world".to_vec()]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -419,22 +347,24 @@ fn test_int_to_float() {
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[42])]);
     let mb = batch.as_mem_batch();
 
-    let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0, EXPR_INT_TO_FLOAT, 1, 0, 0];
-    let prog = make_prog(&schema, code, 2, 1, vec![]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::IntToFloat { dst: 1, a: 0 },
+    ];
+    let prog = make_prog(&schema, instrs, 2, 1, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(bits_to_float(val), 42.0);
 }
 
 #[test]
 fn test_unsigned_opcode_swap_and_eval() {
-    // U64-typed schema: pk=col0(U64), payload=col1(U64). resolve_column_indices
-    // tracks col1's register as U64 and must swap the signed comparison /
-    // division / cast opcodes to their unsigned forms (EXPR_UCMP_GT / EXPR_UDIV
-    // / EXPR_UMOD / EXPR_UINT_TO_FLOAT). eval_batch ends in `_ => {}`, so a
-    // mis-routed or removed U-arm is silent for values >= 2^63 — this pin makes
-    // it loud by both (1) asserting the swap fired in prog.code and (2) running
-    // eval on v=u64::MAX and asserting the UNSIGNED result, which diverges from
-    // the signed interpretation that all other tests (BIGINT < 2^63) exercise.
+    // U64-typed schema: pk=col0(U64), payload=col1(U64). `resolve` tracks col1's
+    // register as U64 and must select the unsigned form of the comparison /
+    // division / cast instructions (`signed: false`). A mis-routed or missing
+    // unsigned arm is silent for values >= 2^63 — this pin makes it loud by both
+    // (1) asserting the resolved instruction carries `signed: false` and (2)
+    // running eval on v=u64::MAX and asserting the UNSIGNED result, which diverges
+    // from the signed interpretation that all other tests (BIGINT < 2^63) exercise.
     let schema = make_schema(0, &[8, 8]);
 
     // v = u64::MAX (bit pattern 0xFFFF...FF, i.e. -1 as i64); divisor const = 2.
@@ -444,27 +374,30 @@ fn test_unsigned_opcode_swap_and_eval() {
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[v_bits])]);
     let mb = batch.as_mem_batch();
 
-    // (a) col1 > 100  → EXPR_CMP_GT must swap to EXPR_UCMP_GT.
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0, // r0 = col1 (U64)
-        EXPR_LOAD_CONST,
-        1,
-        100,
-        0, // r1 = 100
-        EXPR_CMP_GT,
-        2,
-        0,
-        1, // r2 = (r0 > r1)
+    // (a) col1 > 100  → the Gt compare must resolve to the unsigned form.
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },  // r0 = col1 (U64)
+        LogicalInstr::LoadConst { dst: 1, val: 100 }, // r1 = 100
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = (r0 > r1)
     ];
-    let prog_gt = make_prog(&schema, code, 3, 2, vec![]);
-    // Instruction 2 (offset 8) is the comparison opcode after resolution.
-    assert_eq!(
-        prog_gt.code[8], EXPR_UCMP_GT,
-        "U64 operand must swap CMP_GT → UCMP_GT (got opcode {})",
-        prog_gt.code[8],
+    let prog_gt = make_prog(&schema, instrs, 3, 2, vec![]);
+    // Instruction 2 is the comparison after resolution; the U64 operand must
+    // select the unsigned form.
+    assert!(
+        matches!(
+            prog_gt.instrs[2],
+            Instr::Cmp {
+                op: CmpOp::Gt,
+                signed: false,
+                ..
+            }
+        ),
+        "U64 operand must select unsigned CMP_GT"
     );
     let (val, is_null) = eval_predicate(&prog_gt, &mb, 0);
     assert!(!is_null);
@@ -473,26 +406,16 @@ fn test_unsigned_opcode_swap_and_eval() {
         "u64::MAX > 100 is TRUE under unsigned compare; signed (-1 > 100) is false",
     );
 
-    // (b) col1 / 2  → EXPR_INT_DIV must swap to EXPR_UDIV.
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        2,
-        0,
-        EXPR_INT_DIV,
-        2,
-        0,
-        1,
+    // (b) col1 / 2  → IntDiv must resolve to the unsigned form.
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 2 },
+        LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog_div = make_prog(&schema, code, 3, 2, vec![]);
-    assert_eq!(
-        prog_div.code[8], EXPR_UDIV,
-        "U64 operand must swap INT_DIV → UDIV (got opcode {})",
-        prog_div.code[8],
+    let prog_div = make_prog(&schema, instrs, 3, 2, vec![]);
+    assert!(
+        matches!(prog_div.instrs[2], Instr::IntDiv { signed: false, .. }),
+        "U64 operand must select unsigned IntDiv"
     );
     let (val, is_null) = eval_predicate(&prog_div, &mb, 0);
     assert!(!is_null);
@@ -501,48 +424,32 @@ fn test_unsigned_opcode_swap_and_eval() {
         "u64::MAX / 2 == 9223372036854775807 (unsigned); signed -1/2 would be 0",
     );
 
-    // (c) col1 % 2  → EXPR_INT_MOD must swap to EXPR_UMOD.
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        2,
-        0,
-        EXPR_INT_MOD,
-        2,
-        0,
-        1,
+    // (c) col1 % 2  → IntMod must resolve to the unsigned form.
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 2 },
+        LogicalInstr::IntMod { dst: 2, a: 0, b: 1 },
     ];
-    let prog_mod = make_prog(&schema, code, 3, 2, vec![]);
-    assert_eq!(
-        prog_mod.code[8], EXPR_UMOD,
-        "U64 operand must swap INT_MOD → UMOD (got opcode {})",
-        prog_mod.code[8],
+    let prog_mod = make_prog(&schema, instrs, 3, 2, vec![]);
+    assert!(
+        matches!(prog_mod.instrs[2], Instr::IntMod { signed: false, .. }),
+        "U64 operand must select unsigned IntMod"
     );
     let (val, is_null) = eval_predicate(&prog_mod, &mb, 0);
     assert!(!is_null);
     assert_eq!(val, 1, "u64::MAX % 2 == 1 (unsigned); signed -1 % 2 would be -1",);
 
-    // (d) CAST col1 to float  → EXPR_INT_TO_FLOAT must swap to EXPR_UINT_TO_FLOAT.
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0, // r0 = col1 (U64)
-        EXPR_INT_TO_FLOAT,
-        1,
-        0,
-        0, // r1 = (f64) r0
+    // (d) CAST col1 to float  → IntToFloat must resolve to the unsigned form.
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col1 (U64)
+        LogicalInstr::IntToFloat { dst: 1, a: 0 },   // r1 = (f64) r0
     ];
-    let prog_cast = make_prog(&schema, code, 2, 1, vec![]);
-    // Instruction 1 (offset 4) is the cast opcode after resolution.
-    assert_eq!(
-        prog_cast.code[4], EXPR_UINT_TO_FLOAT,
-        "U64 operand must swap INT_TO_FLOAT → UINT_TO_FLOAT (got opcode {})",
-        prog_cast.code[4],
+    let prog_cast = make_prog(&schema, instrs, 2, 1, vec![]);
+    // Instruction 1 is the cast after resolution; the U64 operand must select
+    // the unsigned form.
+    assert!(
+        matches!(prog_cast.instrs[1], Instr::IntToFloat { signed: false, .. }),
+        "U64 operand must select unsigned IntToFloat"
     );
     let (val, is_null) = eval_predicate(&prog_cast, &mb, 0);
     assert!(!is_null);
@@ -562,25 +469,13 @@ fn test_emit_with_targets() {
     let mb = batch.as_mem_batch();
 
     // Compute col1 + col2, EMIT to payload col 0
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_INT,
-        1,
-        2,
-        0,
-        EXPR_INT_ADD,
-        2,
-        0,
-        1,
-        EXPR_EMIT,
-        0,
-        2,
-        0, // emit r2 to payload col 0
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
+        LogicalInstr::Emit { src: 2, out: 0 }, // emit r2 to payload col 0
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
 
     let (val, is_null, mask, emit_vals) = eval_with_emit_via_batch(&prog, &mb, 0);
     assert_eq!(val, 30); // 10 + 20
@@ -598,78 +493,42 @@ fn test_div_by_zero_null_semantics() {
     let mb = batch.as_mem_batch();
 
     // 1. INT_DIV by literal 0 → NULL
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        EXPR_INT_DIV,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // 2. INT_MOD by literal 0 → NULL
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        EXPR_INT_MOD,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::IntMod { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // 3. FLOAT_DIV by 0.0 bits → NULL
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        EXPR_FLOAT_DIV,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::FloatDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(is_null);
 
     // 4. INT_DIV by non-null non-zero → correct quotient, not null
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_INT,
-        1,
-        2,
-        0,
-        EXPR_INT_DIV,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert!(!is_null);
     assert_eq!(val, 3); // 10 / 3 = 3
@@ -680,44 +539,23 @@ fn test_div_by_zero_null_semantics() {
     // Build a row where col2 is null (null_word bit 1 set)
     let batch_null_div = make_int_batch(&schema, &[(1, 1, 2, &[10, 3])]);
     let mb_null_div = batch_null_div.as_mem_batch();
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_INT,
-        1,
-        2,
-        0,
-        EXPR_INT_DIV,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (_, is_null) = eval_predicate(&prog, &mb_null_div, 0);
     assert!(is_null);
 
     // 6. EMIT of INT_DIV-by-zero result → emit_null_mask bit set, buffer contains 0
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        EXPR_INT_DIV,
-        2,
-        0,
-        1,
-        EXPR_EMIT,
-        0,
-        2,
-        0,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
+        LogicalInstr::Emit { src: 2, out: 0 },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (_, _, mask, emit_vals) = eval_with_emit_via_batch(&prog, &mb, 0);
     assert_eq!(mask & 1, 1); // bit 0 set → null
     assert_eq!(emit_vals[0], 0);
@@ -730,116 +568,92 @@ fn test_cmp_ge_lt_le() {
     let mb = batch.as_mem_batch();
 
     // GE: 42 >= 42 → 1
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        42,
-        0,
-        EXPR_CMP_GE,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 42 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Ge,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // GE: 42 >= 43 → 0
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        43,
-        0,
-        EXPR_CMP_GE,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 43 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Ge,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // LT: 42 < 43 → 1
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        43,
-        0,
-        EXPR_CMP_LT,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 43 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Lt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // LT: 42 < 42 → 0
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        42,
-        0,
-        EXPR_CMP_LT,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 42 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Lt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // LE: 42 <= 42 → 1
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        42,
-        0,
-        EXPR_CMP_LE,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 42 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Le,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // LE: 42 <= 41 → 0
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        41,
-        0,
-        EXPR_CMP_LE,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 41 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Le,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -853,116 +667,92 @@ fn test_fcmp_eq_ne_lt_le() {
     let mb = batch.as_mem_batch();
 
     // FCMP_EQ: 3.14 == 3.14 → 1
-    let code = vec![
-        EXPR_LOAD_COL_FLOAT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_FLOAT,
-        1,
-        1,
-        0,
-        EXPR_FCMP_EQ,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 1 },
+        LogicalInstr::LoadColFloat { dst: 1, col: 1 },
+        LogicalInstr::FCmp {
+            op: CmpOp::Eq,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_EQ: 3.14 == 2.0 → 0
-    let code = vec![
-        EXPR_LOAD_COL_FLOAT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_FLOAT,
-        1,
-        2,
-        0,
-        EXPR_FCMP_EQ,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 1 },
+        LogicalInstr::LoadColFloat { dst: 1, col: 2 },
+        LogicalInstr::FCmp {
+            op: CmpOp::Eq,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // FCMP_NE: 3.14 != 2.0 → 1
-    let code = vec![
-        EXPR_LOAD_COL_FLOAT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_FLOAT,
-        1,
-        2,
-        0,
-        EXPR_FCMP_NE,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 1 },
+        LogicalInstr::LoadColFloat { dst: 1, col: 2 },
+        LogicalInstr::FCmp {
+            op: CmpOp::Ne,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_LT: 2.0 < 3.14 → 1
-    let code = vec![
-        EXPR_LOAD_COL_FLOAT,
-        0,
-        2,
-        0,
-        EXPR_LOAD_COL_FLOAT,
-        1,
-        1,
-        0,
-        EXPR_FCMP_LT,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 2 },
+        LogicalInstr::LoadColFloat { dst: 1, col: 1 },
+        LogicalInstr::FCmp {
+            op: CmpOp::Lt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_LE: 2.0 <= 2.0 → 1
-    let code = vec![
-        EXPR_LOAD_COL_FLOAT,
-        0,
-        2,
-        0,
-        EXPR_LOAD_COL_FLOAT,
-        1,
-        2,
-        0,
-        EXPR_FCMP_LE,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 2 },
+        LogicalInstr::LoadColFloat { dst: 1, col: 2 },
+        LogicalInstr::FCmp {
+            op: CmpOp::Le,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // FCMP_GE: 2.0 >= 3.14 → 0
-    let code = vec![
-        EXPR_LOAD_COL_FLOAT,
-        0,
-        2,
-        0,
-        EXPR_LOAD_COL_FLOAT,
-        1,
-        1,
-        0,
-        EXPR_FCMP_GE,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 2 },
+        LogicalInstr::LoadColFloat { dst: 1, col: 1 },
+        LogicalInstr::FCmp {
+            op: CmpOp::Ge,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = make_prog(&schema, code, 3, 2, vec![]);
+    let prog = make_prog(&schema, instrs, 3, 2, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -983,26 +773,46 @@ fn test_string_lt_le_const() {
     let mb = batch.as_mem_batch();
 
     // STR_COL_LT_CONST: "hello" < "world" → 1
-    let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
-    let prog = make_prog(&schema, code, 1, 0, vec![b"world".to_vec()]);
+    let instrs = vec![LogicalInstr::StrColConst {
+        op: StrOp::Lt,
+        dst: 0,
+        col: 1,
+        const_idx: 0,
+    }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![b"world".to_vec()]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // STR_COL_LT_CONST: "hello" < "hello" → 0
-    let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
-    let prog = make_prog(&schema, code, 1, 0, vec![b"hello".to_vec()]);
+    let instrs = vec![LogicalInstr::StrColConst {
+        op: StrOp::Lt,
+        dst: 0,
+        col: 1,
+        const_idx: 0,
+    }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 
     // STR_COL_LE_CONST: "hello" <= "hello" → 1
-    let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
-    let prog = make_prog(&schema, code, 1, 0, vec![b"hello".to_vec()]);
+    let instrs = vec![LogicalInstr::StrColConst {
+        op: StrOp::Le,
+        dst: 0,
+        col: 1,
+        const_idx: 0,
+    }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![b"hello".to_vec()]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
     // STR_COL_LE_CONST: "hello" <= "hella" → 0
-    let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
-    let prog = make_prog(&schema, code, 1, 0, vec![b"hella".to_vec()]);
+    let instrs = vec![LogicalInstr::StrColConst {
+        op: StrOp::Le,
+        dst: 0,
+        col: 1,
+        const_idx: 0,
+    }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![b"hella".to_vec()]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 0);
 }
@@ -1042,8 +852,13 @@ fn test_string_col_eq_col() {
     let mb = batch.as_mem_batch();
 
     // Row 0: col1 == col2 → 1
-    let code = vec![EXPR_STR_COL_EQ_COL, 0, 1, 2];
-    let prog = make_prog(&schema, code, 1, 0, vec![]);
+    let instrs = vec![LogicalInstr::StrColCol {
+        op: StrOp::Eq,
+        dst: 0,
+        col_a: 1,
+        col_b: 2,
+    }];
+    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
 
@@ -1063,53 +878,35 @@ fn test_complex_predicate() {
     // (a > 10 AND b < 100) OR c == 42
     // r0=col1(a), r1=10, r2=(a>10), r3=col2(b), r4=100, r5=(b<100)
     // r6=(r2 AND r5), r7=col3(c), r8=42, r9=(c==42), r10=(r6 OR r9)
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0, // r0 = a = 15
-        EXPR_LOAD_CONST,
-        1,
-        10,
-        0, // r1 = 10
-        EXPR_CMP_GT,
-        2,
-        0,
-        1, // r2 = (15 > 10) = 1
-        EXPR_LOAD_COL_INT,
-        3,
-        2,
-        0, // r3 = b = 50
-        EXPR_LOAD_CONST,
-        4,
-        100,
-        0, // r4 = 100
-        EXPR_CMP_LT,
-        5,
-        3,
-        4, // r5 = (50 < 100) = 1
-        EXPR_BOOL_AND,
-        6,
-        2,
-        5, // r6 = (1 AND 1) = 1
-        EXPR_LOAD_COL_INT,
-        7,
-        3,
-        0, // r7 = c = 42
-        EXPR_LOAD_CONST,
-        8,
-        42,
-        0, // r8 = 42
-        EXPR_CMP_EQ,
-        9,
-        7,
-        8, // r9 = (42 == 42) = 1
-        EXPR_BOOL_OR,
-        10,
-        6,
-        9, // r10 = (1 OR 1) = 1
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = a = 15
+        LogicalInstr::LoadConst { dst: 1, val: 10 }, // r1 = 10
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = (15 > 10) = 1
+        LogicalInstr::LoadColInt { dst: 3, col: 2 }, // r3 = b = 50
+        LogicalInstr::LoadConst { dst: 4, val: 100 }, // r4 = 100
+        LogicalInstr::Cmp {
+            op: CmpOp::Lt,
+            dst: 5,
+            a: 3,
+            b: 4,
+        }, // r5 = (50 < 100) = 1
+        LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 }, // r6 = (1 AND 1) = 1
+        LogicalInstr::LoadColInt { dst: 7, col: 3 }, // r7 = c = 42
+        LogicalInstr::LoadConst { dst: 8, val: 42 }, // r8 = 42
+        LogicalInstr::Cmp {
+            op: CmpOp::Eq,
+            dst: 9,
+            a: 7,
+            b: 8,
+        }, // r9 = (42 == 42) = 1
+        LogicalInstr::BoolOr { dst: 10, a: 6, b: 9 }, // r10 = (1 OR 1) = 1
     ];
-    let prog = make_prog(&schema, code, 11, 10, vec![]);
+    let prog = make_prog(&schema, instrs, 11, 10, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 1);
     assert!(!is_null);
@@ -1131,17 +928,11 @@ fn test_emit_null_opcode() {
     // EMIT_NULL is handled at batch level, skipped by eval_batch.
     // Verify the program still evaluates and the result register holds
     // the loaded value.
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0, // r0 = col1
-        EXPR_EMIT_NULL,
-        0,
-        0,
-        0, // emit null — batch-level, no-op here
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col1
+        LogicalInstr::EmitNull { out: 0 },           // emit null — batch-level, no-op here
     ];
-    let prog = make_prog(&schema, code, 1, 0, vec![]);
+    let prog = make_prog(&schema, instrs, 1, 0, vec![]);
 
     let (val, _, mask, _) = eval_with_emit_via_batch(&prog, &mb, 0);
     // No EMIT instructions ⇒ empty emit list, no null mask bits set.
@@ -1151,14 +942,18 @@ fn test_emit_null_opcode() {
 
 #[test]
 fn test_zero_regs_program() {
-    // ExprProgram with num_regs=0 (pure COPY_COL) must not crash.
+    // A program with num_regs=0 (pure COPY_COL) must not crash.
     let schema = make_schema(0, &[8, 9]);
     let batch = make_int_batch(&schema, &[(1, 1, 0, &[100])]);
     let mb = batch.as_mem_batch();
 
     // One COPY_COL instruction: copy col 1 → payload 0, type I64=9
-    let code = vec![EXPR_COPY_COL, 9, 1, 0];
-    let prog = make_prog(&schema, code, 0, 0, vec![]);
+    let instrs = vec![LogicalInstr::CopyCol {
+        src_col: 1,
+        out: 0,
+        tc: 9,
+    }];
+    let prog = make_prog(&schema, instrs, 0, 0, vec![]);
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     // With num_regs=0, result should be (0, true) — sentinel
     assert_eq!(val, 0);
@@ -1172,29 +967,25 @@ fn test_resolve_column_indices_pk_at_col0() {
     let batch = make_int_batch(&schema, &[(42, 1, 0, &[10, 20])]);
     let mb = batch.as_mem_batch();
 
-    // LOAD_COL_INT of pk column → LOAD_PK_INT
-    let code = vec![EXPR_LOAD_COL_INT, 0, 0, 0]; // col 0 = pk
-    let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(&schema);
-    assert_eq!(prog.code[0], EXPR_LOAD_PK_UNSIGNED_INT);
+    // LOAD_COL_INT of pk column → LoadPk
+    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }]; // col 0 = pk
+    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
+    assert!(matches!(prog.instrs[0], Instr::LoadPk { .. }));
     let (val, is_null) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 42);
     assert!(!is_null);
 
-    // LOAD_COL_INT of col1 (logical 1) → LOAD_PAYLOAD_INT, physical 0
-    let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0];
-    let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(&schema);
-    assert_eq!(prog.code[0], EXPR_LOAD_PAYLOAD_INT);
-    assert_eq!(prog.code[2], 0); // physical payload index
+    // LOAD_COL_INT of col1 (logical 1) → LoadPayloadInt, physical 0
+    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
+    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
+    assert!(matches!(prog.instrs[0], Instr::LoadPayloadInt { pi: 0, .. }));
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 10);
 
-    // LOAD_COL_INT of col2 (logical 2) → LOAD_PAYLOAD_INT, physical 1
-    let code = vec![EXPR_LOAD_COL_INT, 0, 2, 0];
-    let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(&schema);
-    assert_eq!(prog.code[2], 1);
+    // LOAD_COL_INT of col2 (logical 2) → LoadPayloadInt, physical 1
+    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 2 }];
+    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
+    assert!(matches!(prog.instrs[0], Instr::LoadPayloadInt { pi: 1, .. }));
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 20);
 }
@@ -1207,29 +998,24 @@ fn test_resolve_column_indices_pk_at_middle() {
     let batch = make_int_batch(&schema, &[(99, 1, 0, &[5, 7])]);
     let mb = batch.as_mem_batch();
 
-    // col0 (logical 0, before pk) → physical 0
-    let code = vec![EXPR_LOAD_COL_INT, 0, 0, 0];
-    let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(&schema);
-    assert_eq!(prog.code[0], EXPR_LOAD_PAYLOAD_INT);
-    assert_eq!(prog.code[2], 0);
+    // col0 (logical 0, before pk) → LoadPayloadInt, physical 0
+    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 0 }];
+    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
+    assert!(matches!(prog.instrs[0], Instr::LoadPayloadInt { pi: 0, .. }));
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 5);
 
-    // col1 (logical 1 = pk) → LOAD_PK_INT
-    let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0];
-    let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(&schema);
-    assert_eq!(prog.code[0], EXPR_LOAD_PK_UNSIGNED_INT);
+    // col1 (logical 1 = pk) → LoadPk
+    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
+    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
+    assert!(matches!(prog.instrs[0], Instr::LoadPk { .. }));
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 99);
 
-    // col2 (logical 2, after pk) → physical 1
-    let code = vec![EXPR_LOAD_COL_INT, 0, 2, 0];
-    let mut prog = ExprProgram::new(code, 1, 0, vec![]);
-    prog.resolve_column_indices(&schema);
-    assert_eq!(prog.code[0], EXPR_LOAD_PAYLOAD_INT);
-    assert_eq!(prog.code[2], 1);
+    // col2 (logical 2, after pk) → LoadPayloadInt, physical 1
+    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 2 }];
+    let prog = LogicalProgram::new(instrs, 1, 0, vec![]).resolve(&schema, false);
+    assert!(matches!(prog.instrs[0], Instr::LoadPayloadInt { pi: 1, .. }));
     let (val, _) = eval_predicate(&prog, &mb, 0);
     assert_eq!(val, 7);
 }
@@ -1256,74 +1042,49 @@ fn test_is_strictly_non_nullable_str_col() {
         SchemaDescriptor::new(&cols, &[0])
     };
 
-    // STR_COL_EQ_CONST on col1
+    // STR_COL_*_CONST on col1
     for (op, _name) in &[
-        (EXPR_STR_COL_EQ_CONST, "EQ_CONST"),
-        (EXPR_STR_COL_LT_CONST, "LT_CONST"),
-        (EXPR_STR_COL_LE_CONST, "LE_CONST"),
+        (StrOp::Eq, "EQ_CONST"),
+        (StrOp::Lt, "LT_CONST"),
+        (StrOp::Le, "LE_CONST"),
     ] {
-        let code = vec![*op, 0, 1, 0];
-        let prog = make_prog(&nullable_schema, code.clone(), 1, 0, vec![b"x".to_vec()]);
+        let instrs = vec![LogicalInstr::StrColConst {
+            op: *op,
+            dst: 0,
+            col: 1,
+            const_idx: 0,
+        }];
+        let prog = make_prog(&nullable_schema, instrs.clone(), 1, 0, vec![b"x".to_vec()]);
         assert!(
             !prog.is_strictly_non_nullable(&nullable_schema),
             "{_name}: nullable col1 must yield no_nulls=false"
         );
-        let prog = make_prog(&nonnull_schema, code, 1, 0, vec![b"x".to_vec()]);
+        let prog = make_prog(&nonnull_schema, instrs, 1, 0, vec![b"x".to_vec()]);
         assert!(
             prog.is_strictly_non_nullable(&nonnull_schema),
             "{_name}: non-nullable col1 must yield no_nulls=true"
         );
     }
 
-    // STR_COL_EQ_COL — both operands matter
-    for (op, _name) in &[
-        (EXPR_STR_COL_EQ_COL, "EQ_COL"),
-        (EXPR_STR_COL_LT_COL, "LT_COL"),
-        (EXPR_STR_COL_LE_COL, "LE_COL"),
-    ] {
-        let code = vec![*op, 0, 1, 2];
-        let prog = make_prog(&nullable_schema, code.clone(), 1, 0, vec![]);
+    // STR_COL_*_COL — both operands matter
+    for (op, _name) in &[(StrOp::Eq, "EQ_COL"), (StrOp::Lt, "LT_COL"), (StrOp::Le, "LE_COL")] {
+        let instrs = vec![LogicalInstr::StrColCol {
+            op: *op,
+            dst: 0,
+            col_a: 1,
+            col_b: 2,
+        }];
+        let prog = make_prog(&nullable_schema, instrs.clone(), 1, 0, vec![]);
         assert!(
             !prog.is_strictly_non_nullable(&nullable_schema),
             "{_name}: nullable operands must yield no_nulls=false"
         );
-        let prog = make_prog(&nonnull_schema, code, 1, 0, vec![]);
+        let prog = make_prog(&nonnull_schema, instrs, 1, 0, vec![]);
         assert!(
             prog.is_strictly_non_nullable(&nonnull_schema),
             "{_name}: non-nullable operands must yield no_nulls=true"
         );
     }
-}
-
-#[test]
-fn test_resolve_column_indices_is_idempotent() {
-    // Schema: pk=col0(U64), col1=I64, col2=STRING
-    let schema = make_schema(0, &[8, 9, 11]);
-    // One opcode of each remapped class so a second pass would corrupt the
-    // bytecode if the resolved flag were not respected.
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_IS_NULL,
-        1,
-        2,
-        0,
-        EXPR_COPY_COL,
-        9,
-        1,
-        0,
-        EXPR_STR_COL_EQ_COL,
-        2,
-        2,
-        2,
-    ];
-    let mut prog = ExprProgram::new(code, 3, 0, vec![]);
-    prog.resolve_column_indices(&schema);
-    let first = prog.code.clone();
-    prog.resolve_column_indices(&schema);
-    assert_eq!(prog.code, first, "resolve_column_indices must be idempotent");
 }
 
 /// Build a 16-byte inline German String struct for use in test batches.
@@ -1383,8 +1144,13 @@ fn test_string_prefix_ordering() {
     for &(col_s, const_s, expected_lt) in cases {
         let batch = make_single_string_batch(schema, col_s);
         let mb = batch.as_mem_batch();
-        let code = vec![EXPR_STR_COL_LT_CONST, 0, 1, 0];
-        let prog = make_prog(&schema, code, 1, 0, vec![const_s.to_vec()]);
+        let instrs = vec![LogicalInstr::StrColConst {
+            op: StrOp::Lt,
+            dst: 0,
+            col: 1,
+            const_idx: 0,
+        }];
+        let prog = make_prog(&schema, instrs, 1, 0, vec![const_s.to_vec()]);
         let (val, _) = eval_predicate(&prog, &mb, 0);
         assert_eq!(
             val != 0,
@@ -1417,37 +1183,19 @@ fn test_bool_and_or_three_valued_logic() {
     );
     let mb = batch.as_mem_batch();
 
-    let and_code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_INT,
-        1,
-        2,
-        0,
-        EXPR_BOOL_AND,
-        2,
-        0,
-        1,
+    let and_instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
     ];
-    let and_prog = make_prog(&schema, and_code, 3, 2, vec![]);
+    let and_prog = make_prog(&schema, and_instrs, 3, 2, vec![]);
 
-    let or_code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_COL_INT,
-        1,
-        2,
-        0,
-        EXPR_BOOL_OR,
-        2,
-        0,
-        1,
+    let or_instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::BoolOr { dst: 2, a: 0, b: 1 },
     ];
-    let or_prog = make_prog(&schema, or_code, 3, 2, vec![]);
+    let or_prog = make_prog(&schema, or_instrs, 3, 2, vec![]);
 
     // AND cases
     let (v, n) = eval_predicate(&and_prog, &mb, 0);
@@ -1509,8 +1257,13 @@ fn test_string_prefix_le_ordering() {
     for &(col_s, const_s, expected_le) in cases {
         let batch = make_single_string_batch(schema, col_s);
         let mb = batch.as_mem_batch();
-        let code = vec![EXPR_STR_COL_LE_CONST, 0, 1, 0];
-        let prog = make_prog(&schema, code, 1, 0, vec![const_s.to_vec()]);
+        let instrs = vec![LogicalInstr::StrColConst {
+            op: StrOp::Le,
+            dst: 0,
+            col: 1,
+            const_idx: 0,
+        }];
+        let prog = make_prog(&schema, instrs, 1, 0, vec![const_s.to_vec()]);
         let (val, _) = eval_predicate(&prog, &mb, 0);
         assert_eq!(
             val != 0,

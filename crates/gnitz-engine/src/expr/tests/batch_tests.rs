@@ -4,7 +4,7 @@
 #![allow(clippy::erasing_op, clippy::identity_op)]
 
 use super::super::batch::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
-use super::super::program::ExprProgram;
+use super::super::program::{LogicalInstr, LogicalProgram};
 use super::eval_predicate_via_batch as eval_predicate;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
@@ -69,29 +69,18 @@ fn test_scratch_null_words3() {
 
 #[test]
 fn test_eval_batch_add() {
-    use crate::expr;
     let schema = make_schema_2col();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let mb = batch.as_mem_batch();
 
-    // r0 = pk (LOAD_COL_INT col 0 → resolves to LOAD_PK_*_INT), r1 = col[1]
-    // (LOAD_PAYLOAD_INT), r2 = r0 + r1
-    let code = vec![
-        expr::EXPR_LOAD_COL_INT,
-        0,
-        0,
-        0,
-        expr::EXPR_LOAD_PAYLOAD_INT,
-        1,
-        0,
-        0, // pi=0 (first payload)
-        expr::EXPR_INT_ADD,
-        2,
-        0,
-        1,
+    // r0 = pk (LoadColInt col 0 → resolves to LOAD_PK_*_INT), r1 = col[1]
+    // (the first payload), r2 = r0 + r1
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 0 },
+        LogicalInstr::LoadColInt { dst: 1, col: 1 },
+        LogicalInstr::IntAdd { dst: 2, a: 0, b: 1 },
     ];
-    let mut prog = ExprProgram::new(code, 3, 2, vec![]);
-    prog.resolve_column_indices(&schema);
+    let prog = LogicalProgram::new(instrs, 3, 2, vec![]).resolve(&schema, false);
     let mut scratch = EvalScratch::new();
     scratch.ensure_capacity(3, true, 3);
     eval_batch(&prog, &mb, 0, 3, &mut scratch);
@@ -106,26 +95,21 @@ fn test_eval_batch_add() {
 
 #[test]
 fn test_eval_batch_matches_eval_predicate() {
-    use crate::expr;
+    use crate::expr::CmpOp;
 
     let schema = make_schema_2col();
     // Build a predicate: col[1] > 15
-    let code = vec![
-        expr::EXPR_LOAD_PAYLOAD_INT,
-        0,
-        0,
-        0, // r0 = payload[0]
-        expr::EXPR_LOAD_CONST,
-        1,
-        15,
-        0, // r1 = 15
-        expr::EXPR_CMP_GT,
-        2,
-        0,
-        1, // r2 = r0 > r1
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col[1] (payload[0])
+        LogicalInstr::LoadConst { dst: 1, val: 15 }, // r1 = 15
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = r0 > r1
     ];
-    let mut prog = ExprProgram::new(code, 3, 2, vec![]);
-    prog.resolve_column_indices(&schema);
+    let prog = LogicalProgram::new(instrs, 3, 2, vec![]).resolve(&schema, false);
 
     let rows: &[(u64, i64, i64)] = &[(1, 1, 5), (2, 1, 15), (3, 1, 25), (4, 1, 0)];
     let batch = make_batch(&schema, rows);
@@ -153,7 +137,7 @@ fn test_eval_batch_matches_eval_predicate() {
 /// per-row interpreter row-for-row on mixed null/non-null inputs.
 #[test]
 fn test_str_col_eq_const_nullable_column_matches_per_row() {
-    use crate::expr::{ScalarFunc, EXPR_STR_COL_EQ_CONST};
+    use crate::expr::{ScalarFunc, StrOp};
 
     // Schema: pk(U64) + nullable STRING.
     let schema = SchemaDescriptor::new(
@@ -185,9 +169,13 @@ fn test_str_col_eq_const_nullable_column_matches_per_row() {
     let mb = batch.as_mem_batch();
 
     // Predicate: col1 = 'foo'. result_reg = 0.
-    let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![b"foo".to_vec()]);
-    let kind = ScalarFunc::from_predicate(prog, &schema);
+    let instrs = vec![LogicalInstr::StrColConst {
+        op: StrOp::Eq,
+        dst: 0,
+        col: 1,
+        const_idx: 0,
+    }];
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![b"foo".to_vec()]), &schema);
 
     // Drive the (multi-morsel) batch path through run_filter and compare to
     // the m=1 wrapper.
@@ -240,28 +228,23 @@ fn schema_pk_int_nullable() -> SchemaDescriptor {
 
 #[test]
 fn golden_load_payload_null_row() {
-    use crate::expr::ScalarFunc;
+    use crate::expr::{CmpOp, ScalarFunc};
     let schema = schema_pk_int_nullable();
     let batch = make_int_row(&schema, 42, true);
     let mb = batch.as_mem_batch();
 
     // Predicate: col1 > 0. With col1 null, result must be null → predicate fails.
-    let code = vec![
-        crate::expr::EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        crate::expr::EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        crate::expr::EXPR_CMP_GT,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
     ];
-    let prog = ExprProgram::new(code, 3, 2, vec![]);
-    let kind = ScalarFunc::from_predicate(prog, &schema);
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema);
     assert!(!kind.evaluate_predicate(&mb, 0));
 }
 
@@ -272,22 +255,12 @@ fn golden_int_div_zero_divisor_single_row() {
     let mb = batch.as_mem_batch();
 
     // r0 = col1 = 10, r1 = 0, r2 = r0 / r1 → null
-    let code = vec![
-        crate::expr::EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        crate::expr::EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        crate::expr::EXPR_INT_DIV,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::IntDiv { dst: 2, a: 0, b: 1 },
     ];
-    let mut prog = ExprProgram::new(code, 3, 2, vec![]);
-    prog.resolve_column_indices(&schema);
+    let prog = LogicalProgram::new(instrs, 3, 2, vec![]).resolve(&schema, false);
 
     let mut scratch = EvalScratch::new();
     scratch.ensure_capacity(3, false, 1);
@@ -322,22 +295,12 @@ fn golden_float_div_zero_divisor_single_row() {
     let mb = b.as_mem_batch();
 
     // r0 = col1 (f64), r1 = 0.0 bits, r2 = r0 / r1 → null
-    let code = vec![
-        crate::expr::EXPR_LOAD_COL_FLOAT,
-        0,
-        1,
-        0,
-        crate::expr::EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        crate::expr::EXPR_FLOAT_DIV,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::LoadColFloat { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::FloatDiv { dst: 2, a: 0, b: 1 },
     ];
-    let mut prog = ExprProgram::new(code, 3, 2, vec![]);
-    prog.resolve_column_indices(&schema);
+    let prog = LogicalProgram::new(instrs, 3, 2, vec![]).resolve(&schema, false);
 
     let mut scratch = EvalScratch::new();
     scratch.ensure_capacity(3, false, 1);
@@ -374,23 +337,13 @@ fn schema_pk_two_ints_nullable() -> SchemaDescriptor {
     )
 }
 
-fn run_bool_combinator(schema: &SchemaDescriptor, batch: &Batch, op: i64) -> (i64, bool) {
-    let code = vec![
-        crate::expr::EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        crate::expr::EXPR_LOAD_COL_INT,
-        1,
-        2,
-        0,
-        op,
-        2,
-        0,
-        1,
+fn run_bool_combinator(schema: &SchemaDescriptor, batch: &Batch, op: fn(u16, u16, u16) -> LogicalInstr) -> (i64, bool) {
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        op(2, 0, 1),
     ];
-    let mut prog = ExprProgram::new(code, 3, 2, vec![]);
-    prog.resolve_column_indices(schema);
+    let prog = LogicalProgram::new(instrs, 3, 2, vec![]).resolve(schema, false);
     let mb = batch.as_mem_batch();
     let mut scratch = EvalScratch::new();
     scratch.ensure_capacity(3, false, 1);
@@ -412,12 +365,12 @@ fn golden_bool_and_3vl_single_row() {
     let schema = schema_pk_two_ints_nullable();
     // TRUE AND NULL = NULL: col1=1, col2=null (bit 1 set in null word)
     let b = make_two_int_row(&schema, 1, 0, 1u64 << 1);
-    let (_, n) = run_bool_combinator(&schema, &b, crate::expr::EXPR_BOOL_AND);
+    let (_, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolAnd { dst, a, b });
     assert!(n, "TRUE AND NULL must be NULL at m=1");
 
     // FALSE AND NULL = FALSE: col1=0, col2=null
     let b = make_two_int_row(&schema, 0, 0, 1u64 << 1);
-    let (v, n) = run_bool_combinator(&schema, &b, crate::expr::EXPR_BOOL_AND);
+    let (v, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolAnd { dst, a, b });
     assert!(!n, "FALSE AND NULL must not be NULL at m=1");
     assert_eq!(v, 0, "FALSE AND NULL must be FALSE at m=1");
 }
@@ -427,13 +380,13 @@ fn golden_bool_or_3vl_single_row() {
     let schema = schema_pk_two_ints_nullable();
     // NULL OR TRUE = TRUE: col1=null (bit 0), col2=1
     let b = make_two_int_row(&schema, 0, 1, 1u64 << 0);
-    let (v, n) = run_bool_combinator(&schema, &b, crate::expr::EXPR_BOOL_OR);
+    let (v, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolOr { dst, a, b });
     assert!(!n, "NULL OR TRUE must not be NULL at m=1");
     assert_eq!(v, 1, "NULL OR TRUE must be TRUE at m=1");
 
     // NULL OR FALSE = NULL: col1=null, col2=0
     let b = make_two_int_row(&schema, 0, 0, 1u64 << 0);
-    let (_, n) = run_bool_combinator(&schema, &b, crate::expr::EXPR_BOOL_OR);
+    let (_, n) = run_bool_combinator(&schema, &b, |dst, a, b| LogicalInstr::BoolOr { dst, a, b });
     assert!(n, "NULL OR FALSE must be NULL at m=1");
 }
 
@@ -443,18 +396,11 @@ fn golden_int_neg_null_source_single_row() {
     // col1 null → INT_NEG result null. null_or1 at m=1.
     let batch = make_int_row(&schema, 0, true);
     let mb = batch.as_mem_batch();
-    let code = vec![
-        crate::expr::EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        crate::expr::EXPR_INT_NEG,
-        1,
-        0,
-        0,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::IntNeg { dst: 1, a: 0 },
     ];
-    let mut prog = ExprProgram::new(code, 2, 1, vec![]);
-    prog.resolve_column_indices(&schema);
+    let prog = LogicalProgram::new(instrs, 2, 1, vec![]).resolve(&schema, false);
     let mut scratch = EvalScratch::new();
     scratch.ensure_capacity(2, false, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
@@ -469,18 +415,11 @@ fn golden_bool_not_null_source_single_row() {
     let schema = schema_pk_int_nullable();
     let batch = make_int_row(&schema, 0, true);
     let mb = batch.as_mem_batch();
-    let code = vec![
-        crate::expr::EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        crate::expr::EXPR_BOOL_NOT,
-        1,
-        0,
-        0,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::BoolNot { dst: 1, a: 0 },
     ];
-    let mut prog = ExprProgram::new(code, 2, 1, vec![]);
-    prog.resolve_column_indices(&schema);
+    let prog = LogicalProgram::new(instrs, 2, 1, vec![]).resolve(&schema, false);
     let mut scratch = EvalScratch::new();
     scratch.ensure_capacity(2, false, 1);
     eval_batch(&prog, &mb, 0, 1, &mut scratch);
@@ -492,7 +431,7 @@ fn golden_bool_not_null_source_single_row() {
 
 #[test]
 fn golden_str_col_eq_const_null_row() {
-    use crate::expr::{ScalarFunc, EXPR_STR_COL_EQ_CONST};
+    use crate::expr::{ScalarFunc, StrOp};
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -511,9 +450,13 @@ fn golden_str_col_eq_const_null_row() {
     b.count = 1;
     let mb = b.as_mem_batch();
 
-    let code = vec![EXPR_STR_COL_EQ_CONST, 0, 1, 0];
-    let prog = ExprProgram::new(code, 1, 0, vec![b"foo".to_vec()]);
-    let kind = ScalarFunc::from_predicate(prog, &schema);
+    let instrs = vec![LogicalInstr::StrColConst {
+        op: StrOp::Eq,
+        dst: 0,
+        col: 1,
+        const_idx: 0,
+    }];
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![b"foo".to_vec()]), &schema);
     assert!(
         !kind.evaluate_predicate(&mb, 0),
         "STR_COL_EQ_CONST on NULL row must not pass",
@@ -528,21 +471,21 @@ fn golden_is_null_and_is_not_null_single_row() {
     // Null row: IS NULL → true, IS NOT NULL → false.
     let batch = make_int_row(&schema, 0, true);
     let mb = batch.as_mem_batch();
-    let code_is_null = vec![crate::expr::EXPR_IS_NULL, 0, 1, 0];
-    let kind = ScalarFunc::from_predicate(ExprProgram::new(code_is_null, 1, 0, vec![]), &schema);
+    let instrs_is_null = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs_is_null, 1, 0, vec![]), &schema);
     assert!(kind.evaluate_predicate(&mb, 0));
-    let code_is_not_null = vec![crate::expr::EXPR_IS_NOT_NULL, 0, 1, 0];
-    let kind = ScalarFunc::from_predicate(ExprProgram::new(code_is_not_null, 1, 0, vec![]), &schema);
+    let instrs_is_not_null = vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }];
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs_is_not_null, 1, 0, vec![]), &schema);
     assert!(!kind.evaluate_predicate(&mb, 0));
 
     // Non-null row: opposite.
     let batch = make_int_row(&schema, 7, false);
     let mb = batch.as_mem_batch();
-    let code_is_null = vec![crate::expr::EXPR_IS_NULL, 0, 1, 0];
-    let kind = ScalarFunc::from_predicate(ExprProgram::new(code_is_null, 1, 0, vec![]), &schema);
+    let instrs_is_null = vec![LogicalInstr::IsNull { dst: 0, col: 1 }];
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs_is_null, 1, 0, vec![]), &schema);
     assert!(!kind.evaluate_predicate(&mb, 0));
-    let code_is_not_null = vec![crate::expr::EXPR_IS_NOT_NULL, 0, 1, 0];
-    let kind = ScalarFunc::from_predicate(ExprProgram::new(code_is_not_null, 1, 0, vec![]), &schema);
+    let instrs_is_not_null = vec![LogicalInstr::IsNotNull { dst: 0, col: 1 }];
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs_is_not_null, 1, 0, vec![]), &schema);
     assert!(kind.evaluate_predicate(&mb, 0));
 }
 
@@ -605,48 +548,36 @@ fn ref_and(a: Option<bool>, b: Option<bool>) -> (bool, bool) {
 /// reference computed from the column values.
 #[test]
 fn bit_only_three_and_chain_boundary_sweep() {
-    use crate::expr::{ScalarFunc, EXPR_BOOL_AND, EXPR_CMP_GT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
+    use crate::expr::{CmpOp, ScalarFunc};
 
     let schema = schema_pk_three_ints_nullable();
 
     // (col0 > 1) AND (col1 > 1) AND (col2 > 1)
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0, // r0 = col0
-        EXPR_LOAD_CONST,
-        1,
-        1,
-        0, // r1 = 1
-        EXPR_CMP_GT,
-        2,
-        0,
-        1, // r2 = r0 > 1
-        EXPR_LOAD_COL_INT,
-        3,
-        2,
-        0, // r3 = col1
-        EXPR_CMP_GT,
-        4,
-        3,
-        1, // r4 = r3 > 1
-        EXPR_BOOL_AND,
-        5,
-        2,
-        4, // r5 = r2 AND r4
-        EXPR_LOAD_COL_INT,
-        6,
-        3,
-        0, // r6 = col2
-        EXPR_CMP_GT,
-        7,
-        6,
-        1, // r7 = r6 > 1
-        EXPR_BOOL_AND,
-        8,
-        5,
-        7, // r8 = r5 AND r7  (result_reg)
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col0
+        LogicalInstr::LoadConst { dst: 1, val: 1 },  // r1 = 1
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = r0 > 1
+        LogicalInstr::LoadColInt { dst: 3, col: 2 }, // r3 = col1
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        }, // r4 = r3 > 1
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 }, // r5 = r2 AND r4
+        LogicalInstr::LoadColInt { dst: 6, col: 3 }, // r6 = col2
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 7,
+            a: 6,
+            b: 1,
+        }, // r7 = r6 > 1
+        LogicalInstr::BoolAnd { dst: 8, a: 5, b: 7 }, // r8 = r5 AND r7  (result_reg)
     ];
 
     // Test sizes that cover: m < 64, m = 64 exactly, m crossing 64, the full
@@ -666,7 +597,7 @@ fn bit_only_three_and_chain_boundary_sweep() {
         );
         let mb = batch.as_mem_batch();
 
-        let kind = ScalarFunc::from_predicate(ExprProgram::new(code.clone(), 9, 8, vec![]), &schema);
+        let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs.clone(), 9, 8, vec![]), &schema);
 
         let mut passed = vec![false; n];
         kind.run_filter(&mb, n, |s, e| {
@@ -701,7 +632,7 @@ fn bit_only_three_and_chain_boundary_sweep() {
 /// reads `bool_bits[result_reg]` and must honor 3VL (NOT NULL = NULL = fail).
 #[test]
 fn bit_only_not_3vl_truth_table() {
-    use crate::expr::{ScalarFunc, EXPR_BOOL_NOT, EXPR_CMP_NE, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
+    use crate::expr::{CmpOp, ScalarFunc};
 
     let schema = schema_pk_int_nullable();
 
@@ -713,25 +644,18 @@ fn bit_only_not_3vl_truth_table() {
         let mb = batch.as_mem_batch();
 
         // Filter: NOT(col1 != 0). result_reg = NOT result (bit_only eligible).
-        let code = vec![
-            EXPR_LOAD_COL_INT,
-            0,
-            1,
-            0, // r0 = col1
-            EXPR_LOAD_CONST,
-            1,
-            0,
-            0, // r1 = 0
-            EXPR_CMP_NE,
-            2,
-            0,
-            1, // r2 = bool(col1)
-            EXPR_BOOL_NOT,
-            3,
-            2,
-            0, // r3 = NOT r2
+        let instrs = vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col1
+            LogicalInstr::LoadConst { dst: 1, val: 0 },  // r1 = 0
+            LogicalInstr::Cmp {
+                op: CmpOp::Ne,
+                dst: 2,
+                a: 0,
+                b: 1,
+            }, // r2 = bool(col1)
+            LogicalInstr::BoolNot { dst: 3, a: 2 },      // r3 = NOT r2
         ];
-        let kind = ScalarFunc::from_predicate(ExprProgram::new(code, 4, 3, vec![]), &schema);
+        let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 4, 3, vec![]), &schema);
         let mut passed = false;
         kind.run_filter(&mb, 1, |_, _| {
             passed = true;
@@ -750,49 +674,34 @@ fn bit_only_not_3vl_truth_table() {
 /// downstream add.
 #[test]
 fn bit_only_demotion_when_bool_feeds_arithmetic() {
-    use crate::expr::{EXPR_BOOL_AND, EXPR_CMP_GT, EXPR_INT_ADD, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
+    use crate::expr::CmpOp;
 
     let schema = schema_pk_two_ints_nullable();
     // col1=2, col2=3, no nulls. Both > 1, so AND = 1. Add 0 → result = 1.
     let batch = make_two_int_row(&schema, 2, 3, 0);
     let mb = batch.as_mem_batch();
 
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0, // r0 = col1
-        EXPR_LOAD_CONST,
-        1,
-        1,
-        0, // r1 = 1
-        EXPR_CMP_GT,
-        2,
-        0,
-        1, // r2 = col1 > 1
-        EXPR_LOAD_COL_INT,
-        3,
-        2,
-        0, // r3 = col2
-        EXPR_CMP_GT,
-        4,
-        3,
-        1, // r4 = col2 > 1
-        EXPR_BOOL_AND,
-        5,
-        2,
-        4, // r5 = r2 AND r4    (consumed by ADD → not bit_only)
-        EXPR_LOAD_CONST,
-        6,
-        0,
-        0, // r6 = 0
-        EXPR_INT_ADD,
-        7,
-        5,
-        6, // r7 = r5 + 0 = bool-as-int
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // r0 = col1
+        LogicalInstr::LoadConst { dst: 1, val: 1 },  // r1 = 1
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = col1 > 1
+        LogicalInstr::LoadColInt { dst: 3, col: 2 }, // r3 = col2
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        }, // r4 = col2 > 1
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 }, // r5 = r2 AND r4    (consumed by ADD → not bit_only)
+        LogicalInstr::LoadConst { dst: 6, val: 0 },  // r6 = 0
+        LogicalInstr::IntAdd { dst: 7, a: 5, b: 6 }, // r7 = r5 + 0 = bool-as-int
     ];
-    let mut prog = ExprProgram::new(code, 8, 7, vec![]);
-    prog.resolve_column_indices(&schema);
+    let prog = LogicalProgram::new(instrs, 8, 7, vec![]).resolve(&schema, false);
     // r5 is bool-produced but consumed by INT_ADD (non-bool). Must be demoted.
     assert!(
         (prog.bit_only_mask & (1u64 << 5)) == 0,
@@ -815,41 +724,33 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
 /// (with `is_filter=true`); result_reg stays bit_only.
 #[test]
 fn classifier_pure_conjunction_filter() {
-    use crate::expr::{EXPR_BOOL_AND, EXPR_CMP_GT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
+    use crate::expr::CmpOp;
 
     let schema = schema_pk_two_ints_nullable();
-    let mut prog = ExprProgram::new(
+    let prog = LogicalProgram::new(
         vec![
-            EXPR_LOAD_COL_INT,
-            0,
-            1,
-            0,
-            EXPR_LOAD_CONST,
-            1,
-            1,
-            0,
-            EXPR_CMP_GT,
-            2,
-            0,
-            1,
-            EXPR_LOAD_COL_INT,
-            3,
-            2,
-            0,
-            EXPR_CMP_GT,
-            4,
-            3,
-            1,
-            EXPR_BOOL_AND,
-            5,
-            2,
-            4,
+            LogicalInstr::LoadColInt { dst: 0, col: 1 },
+            LogicalInstr::LoadConst { dst: 1, val: 1 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+            LogicalInstr::LoadColInt { dst: 3, col: 2 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 4,
+                a: 3,
+                b: 1,
+            },
+            LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
         ],
         6,
         5,
         vec![],
-    );
-    prog.resolve_column_indices(&schema);
+    )
+    .resolve(&schema, false);
     let (bit_only, bool_input) = prog.classify_registers(true);
     // Bool producers: r2 (CMP_GT), r4 (CMP_GT), r5 (BOOL_AND).
     // Non-bool readers consume r0/r1/r3 (CMPs read them as i64), so those
@@ -869,11 +770,11 @@ fn classifier_pure_conjunction_filter() {
 /// must therefore fall back to the per-row scan over `regs`.
 #[test]
 fn classifier_filter_result_reg_non_bool_falls_back() {
-    use crate::expr::{ScalarFunc, EXPR_LOAD_COL_INT};
+    use crate::expr::ScalarFunc;
     let schema = schema_pk_int_nullable();
     // Predicate: WHERE col1 (treat int as truthy).
-    let code = vec![EXPR_LOAD_COL_INT, 0, 1, 0];
-    let kind = ScalarFunc::from_predicate(ExprProgram::new(code, 1, 0, vec![]), &schema);
+    let instrs = vec![LogicalInstr::LoadColInt { dst: 0, col: 1 }];
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), &schema);
 
     // Build 4 rows: non-null 1, non-null 0, null, non-null -5.
     let mut b = Batch::with_schema(schema, 4);
@@ -904,7 +805,7 @@ fn classifier_filter_result_reg_non_bool_falls_back() {
 /// row, matching the historical 3VL behavior.
 #[test]
 fn bit_only_all_null_word_and() {
-    use crate::expr::{ScalarFunc, EXPR_BOOL_AND, EXPR_CMP_NE, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST};
+    use crate::expr::{CmpOp, ScalarFunc};
     let schema = schema_pk_two_ints_nullable();
 
     let n = 64;
@@ -919,33 +820,25 @@ fn bit_only_all_null_word_and() {
     }
     let mb = b.as_mem_batch();
 
-    let code = vec![
-        EXPR_LOAD_COL_INT,
-        0,
-        1,
-        0,
-        EXPR_LOAD_CONST,
-        1,
-        0,
-        0,
-        EXPR_CMP_NE,
-        2,
-        0,
-        1, // r2 = bool(col1)
-        EXPR_LOAD_COL_INT,
-        3,
-        2,
-        0,
-        EXPR_CMP_NE,
-        4,
-        3,
-        1, // r4 = bool(col2)
-        EXPR_BOOL_AND,
-        5,
-        2,
-        4,
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Ne,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = bool(col1)
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Ne,
+            dst: 4,
+            a: 3,
+            b: 1,
+        }, // r4 = bool(col2)
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
     ];
-    let kind = ScalarFunc::from_predicate(ExprProgram::new(code, 6, 5, vec![]), &schema);
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 6, 5, vec![]), &schema);
 
     let mut passed = vec![false; n];
     kind.run_filter(&mb, n, |s, e| {
@@ -960,7 +853,7 @@ fn bit_only_all_null_word_and() {
 /// bits become false-positive passing rows.
 #[test]
 fn bit_only_is_not_null_tail_mask() {
-    use crate::expr::{ScalarFunc, EXPR_BOOL_AND, EXPR_IS_NOT_NULL};
+    use crate::expr::ScalarFunc;
 
     let schema = schema_pk_two_ints_nullable();
     // 65 rows — straddles the 64-bit word boundary so tail handling matters.
@@ -985,21 +878,12 @@ fn bit_only_is_not_null_tail_mask() {
     let mb = b.as_mem_batch();
 
     // WHERE col1 IS NOT NULL AND col2 IS NOT NULL
-    let code = vec![
-        EXPR_IS_NOT_NULL,
-        0,
-        1,
-        0,
-        EXPR_IS_NOT_NULL,
-        1,
-        2,
-        0,
-        EXPR_BOOL_AND,
-        2,
-        0,
-        1,
+    let instrs = vec![
+        LogicalInstr::IsNotNull { dst: 0, col: 1 },
+        LogicalInstr::IsNotNull { dst: 1, col: 2 },
+        LogicalInstr::BoolAnd { dst: 2, a: 0, b: 1 },
     ];
-    let kind = ScalarFunc::from_predicate(ExprProgram::new(code, 3, 2, vec![]), &schema);
+    let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 3, 2, vec![]), &schema);
 
     let mut passed = vec![false; n];
     kind.run_filter(&mb, n, |s, e| {

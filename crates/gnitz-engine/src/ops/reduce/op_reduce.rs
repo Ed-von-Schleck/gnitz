@@ -148,7 +148,7 @@ pub fn op_reduce(
     avi_agg_col_type_code: TypeCode,
     gi_cursor: Option<&mut ReadCursor>,
     gi_col_idx: u32,
-    finalize_prog: Option<&crate::expr::ExprProgram>,
+    finalize_prog: Option<&crate::expr::ResolvedProgram>,
     finalize_out_schema: Option<&SchemaDescriptor>,
 ) -> (Batch, Option<Batch>) {
     let num_aggs = agg_descs.len();

@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::expr::{ExprProgram, ScalarFunc};
+use crate::expr::{LogicalProgram, ResolvedProgram, ScalarFunc};
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{AggDescriptor, AggOp};
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
@@ -280,7 +280,7 @@ pub(crate) unsafe fn compile_view(
 
     let ann = annotate(&loaded, ext_tables);
 
-    let mut owned_expr_progs_for_rw: Vec<Box<ExprProgram>> = Vec::new();
+    let mut owned_expr_progs_for_rw: Vec<Box<LogicalProgram>> = Vec::new();
     let mut rw = Rewrites {
         skip_nodes: HashSet::new(),
         fold_finalize: HashMap::new(),
@@ -942,20 +942,26 @@ mod tests {
 
     #[test]
     fn test_sequential_copy_projection() {
-        use crate::expr::ExprProgram;
+        use crate::expr::{LogicalInstr, LogicalProgram};
         // num_regs covers the largest register index in the synthetic programs
-        // below (9) so ExprProgram::new's register-bounds assert passes; this
-        // test exercises sequential_copy_base, not register limits.
-        let make = |code: Vec<i64>| ExprProgram::new(code, 16, 0, vec![]);
-        // COPY_COL has opcode 34.
-        assert_eq!(make(vec![34, 9, 1, 0, 34, 9, 2, 1]).sequential_copy_base(), Some(1));
-        assert_eq!(make(vec![34, 9, 2, 0, 34, 9, 1, 1]).sequential_copy_base(), None); // sources not sequential
-        assert_eq!(make(vec![34, 9, 1, 0, 35, 9, 2, 1]).sequential_copy_base(), None); // wrong opcode
+        // below so LogicalProgram::new's register-bounds assert passes; this test
+        // exercises sequential_copy_base, not register limits.
+        let make = |instrs: Vec<LogicalInstr>| LogicalProgram::new(instrs, 16, 0, vec![]);
+        let copy = |src_col: u32, out: u32| LogicalInstr::CopyCol { src_col, out, tc: 9 };
+        // src 1,2 → dst 0,1: base = 1.
+        assert_eq!(make(vec![copy(1, 0), copy(2, 1)]).sequential_copy_base(), Some(1));
+        // sources not sequential (2, then 1)
+        assert_eq!(make(vec![copy(2, 0), copy(1, 1)]).sequential_copy_base(), None);
+        // a non-COPY_COL instruction breaks the block copy
+        assert_eq!(
+            make(vec![copy(1, 0), LogicalInstr::LoadColInt { dst: 9, col: 2 }]).sequential_copy_base(),
+            None
+        );
         assert_eq!(make(vec![]).sequential_copy_base(), None); // empty
                                                                // Sequential sources but destinations swapped (1, 0) — a permutation, not an identity.
-        assert_eq!(make(vec![34, 9, 1, 1, 34, 9, 2, 0]).sequential_copy_base(), None);
+        assert_eq!(make(vec![copy(1, 1), copy(2, 0)]).sequential_copy_base(), None);
         // Compound PK (k = 2): finalize copies columns 2, 3 → destinations 0, 1.
-        assert_eq!(make(vec![34, 9, 2, 0, 34, 9, 3, 1]).sequential_copy_base(), Some(2));
+        assert_eq!(make(vec![copy(2, 0), copy(3, 1)]).sequential_copy_base(), Some(2));
     }
 
     #[test]
@@ -1086,9 +1092,9 @@ mod tests {
 
     #[test]
     fn test_split_fold_programs_routes_to_pre() {
-        let code = vec![0i64; 4];
-        let prog = ExprProgram::new(code, 1, 0, Vec::new());
-        let progs: Vec<Box<ExprProgram>> = vec![Box::new(prog)];
+        use crate::expr::LogicalInstr;
+        let prog = LogicalProgram::new(vec![LogicalInstr::LoadConst { dst: 0, val: 0 }], 1, 0, Vec::new());
+        let progs: Vec<Box<LogicalProgram>> = vec![Box::new(prog)];
 
         let mut fold_finalize = HashMap::new();
         fold_finalize.insert(1i32, 0usize);

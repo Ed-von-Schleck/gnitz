@@ -1,14 +1,20 @@
-//! Expression bytecode interpreter for SQL scalar functions.
+//! Compiled scalar-expression programs.
 //!
-//! Evaluates compiled expression programs against columnar batch rows.
+//! Two typed forms: `LogicalProgram` (`LogicalInstr`, logical column indices —
+//! the shape the wire blob lowers into) and `ResolvedProgram` (`Instr`, resolved
+//! payload/PK indices — the evaluable form). `LogicalProgram::resolve` consumes
+//! the former and produces the latter. Instruction meaning is carried by the
+//! type: a missing or mis-routed opcode is a compile error, not a silent
+//! miscompute.
 
 use crate::foundation::codec::read_u32_le;
-use crate::schema::{german_string_tail, SchemaDescriptor, PAYLOAD_MAPPING_PK_SENTINEL};
-
-gnitz_wire::cast_consts! { pub(crate) i64;
+use crate::schema::{german_string_tail, SchemaDescriptor};
+// Wire opcodes (1–46) the client emits, brought in as engine-local `u32`
+// constants for the `from_wire` lowering match. gnitz-wire exposes its raw opcode
+// constants only through `cast_consts!`, so this is the single access point.
+gnitz_wire::cast_consts! { u32;
     EXPR_LOAD_COL_INT, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_CONST,
-    EXPR_INT_ADD, EXPR_INT_SUB, EXPR_INT_MUL, EXPR_INT_DIV,
-    EXPR_INT_MOD, EXPR_INT_NEG,
+    EXPR_INT_ADD, EXPR_INT_SUB, EXPR_INT_MUL, EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_NEG,
     EXPR_FLOAT_ADD, EXPR_FLOAT_SUB, EXPR_FLOAT_MUL, EXPR_FLOAT_DIV, EXPR_FLOAT_NEG,
     EXPR_CMP_EQ, EXPR_CMP_NE, EXPR_CMP_GT, EXPR_CMP_GE, EXPR_CMP_LT, EXPR_CMP_LE,
     EXPR_FCMP_EQ, EXPR_FCMP_NE, EXPR_FCMP_GT, EXPR_FCMP_GE, EXPR_FCMP_LT, EXPR_FCMP_LE,
@@ -18,624 +24,965 @@ gnitz_wire::cast_consts! { pub(crate) i64;
     EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LT_CONST, EXPR_STR_COL_LE_CONST,
     EXPR_STR_COL_EQ_COL, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LE_COL,
     EXPR_EMIT_NULL,
-    EXPR_LOAD_PAYLOAD_INT, EXPR_LOAD_PAYLOAD_FLOAT,
-    // PK-region integer loads. a1 packs (pk_byte_offset << 16) | (col_size << 8)
-    // | type_code so a single column of a compound OPK PK can be addressed.
-    EXPR_LOAD_PK_UNSIGNED_INT, EXPR_LOAD_PK_SIGNED_INT,
-    // Unsigned (U64) comparison/arithmetic/cast: the i64 register holds the raw
-    // u64 bit pattern, so signed ops misbehave for values >= 2^63.
-    EXPR_UCMP_GT, EXPR_UCMP_GE, EXPR_UCMP_LT, EXPR_UCMP_LE,
-    EXPR_UDIV, EXPR_UMOD, EXPR_UINT_TO_FLOAT,
 }
 
 // ---------------------------------------------------------------------------
-// ExprProgram — immutable bytecode container
+// Typed instruction operands
 // ---------------------------------------------------------------------------
 
-pub struct ExprProgram {
-    pub code: Vec<i64>,
-    pub num_regs: u32,
-    pub result_reg: u32,
-    pub num_instrs: u32,
-    pub const_strings: Vec<Vec<u8>>,
-    pub const_prefixes: Vec<u32>,
-    pub const_lengths: Vec<u32>,
-    /// (size, type_code) for each physical payload column. Populated by
-    /// `resolve_column_indices`; empty until then.
-    pub(in crate::expr) payload_col_info: Vec<(u8, u8)>,
-    /// True once `resolve_column_indices` has rewritten every column-bearing
-    /// opcode's operand byte into payload-index-or-SENTINEL form. Eval entry
-    /// points debug-assert this; a `ScalarFunc`-bypass caller that forgets to resolve
-    /// gets a clear assertion rather than silent miscompute.
-    pub(in crate::expr) resolved: bool,
-    /// Bit `r` set iff register `r` is only consumed by boolean ops, so
-    /// producers can skip the i64 unpack into `regs[r]` and downstream BOOL
-    /// reads `bool_bits[r]` directly. Default 0 means no demotion — behaves
-    /// like the pre-mask code path.
-    pub(in crate::expr) bit_only_mask: u64,
-    /// Bit `r` set iff register `r` is read by a boolean consumer; the
-    /// producer must populate `bool_bits[r]`.
-    pub(in crate::expr) bool_input_mask: u64,
+/// Comparison operator, shared by integer (`Cmp`) and float (`FCmp`) compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CmpOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
 }
 
-impl ExprProgram {
-    pub fn new(code: Vec<i64>, num_regs: u32, result_reg: u32, const_strings: Vec<Vec<u8>>) -> Self {
-        assert_eq!(
-            code.len() % 4,
-            0,
-            "ExprProgram: code length {} is not a multiple of 4",
-            code.len()
-        );
-        let num_instrs = code.len() as u32 / 4;
-        // The BOOL_AND/BOOL_OR 3VL paths and null-bit propagation in
-        // `eval_batch` operate on `u64` words indexed by register, so the
-        // register file is capped at 64.
+/// German-string comparison operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrOp {
+    Eq,
+    Lt,
+    Le,
+}
+
+/// Source of a `CopyCol`: a dense payload column, or a single column within the
+/// OPK PK region addressed by its byte offset. Replaces the old negative
+/// `-(off)-1` sentinel packed into the operand slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColSrc {
+    Payload(u8),
+    Pk { off: u8 },
+}
+
+// ---------------------------------------------------------------------------
+// LogicalInstr — the wire-mirroring form (logical column indices)
+// ---------------------------------------------------------------------------
+
+/// One instruction with logical (schema) column indices, mirroring the wire
+/// opcodes the client emits. `LogicalProgram::resolve` lowers each into `Instr`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogicalInstr {
+    LoadColInt {
+        dst: u16,
+        col: u32,
+    },
+    LoadColFloat {
+        dst: u16,
+        col: u32,
+    },
+    LoadConst {
+        dst: u16,
+        val: i64,
+    },
+    IntAdd {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    IntSub {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    IntMul {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    IntDiv {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    IntMod {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    IntNeg {
+        dst: u16,
+        a: u16,
+    },
+    FloatAdd {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    FloatSub {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    FloatMul {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    FloatDiv {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    FloatNeg {
+        dst: u16,
+        a: u16,
+    },
+    Cmp {
+        op: CmpOp,
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    FCmp {
+        op: CmpOp,
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    IntToFloat {
+        dst: u16,
+        a: u16,
+    },
+    BoolAnd {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    BoolOr {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    BoolNot {
+        dst: u16,
+        a: u16,
+    },
+    IsNull {
+        dst: u16,
+        col: u32,
+    },
+    IsNotNull {
+        dst: u16,
+        col: u32,
+    },
+    StrColConst {
+        op: StrOp,
+        dst: u16,
+        col: u32,
+        const_idx: u32,
+    },
+    StrColCol {
+        op: StrOp,
+        dst: u16,
+        col_a: u32,
+        col_b: u32,
+    },
+    CopyCol {
+        src_col: u32,
+        out: u32,
+        tc: u8,
+    },
+    Emit {
+        src: u16,
+        out: u32,
+    },
+    EmitNull {
+        out: u32,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Instr — the resolved/evaluable form (physical payload/PK indices)
+// ---------------------------------------------------------------------------
+
+/// One resolved, evaluable instruction. `signed` flags carry the result of the
+/// per-register U64 type tracking (`signed: false` == the old unsigned opcode
+/// variants UCMP_*/UDIV/UMOD/UINT_TO_FLOAT).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Instr {
+    LoadPayloadInt {
+        dst: u16,
+        pi: u8,
+    },
+    LoadPayloadFloat {
+        dst: u16,
+        pi: u8,
+    },
+    /// PK-region integer load: the addressed OPK column at byte `off`, width
+    /// `size`; `signed` selects the sign-flip decode, `tc` drives it.
+    LoadPk {
+        dst: u16,
+        off: u8,
+        size: u8,
+        tc: u8,
+        signed: bool,
+    },
+    LoadConst {
+        dst: u16,
+        val: i64,
+    },
+    IntAdd {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    IntSub {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    IntMul {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    IntDiv {
+        dst: u16,
+        a: u16,
+        b: u16,
+        signed: bool,
+    },
+    IntMod {
+        dst: u16,
+        a: u16,
+        b: u16,
+        signed: bool,
+    },
+    Cmp {
+        op: CmpOp,
+        dst: u16,
+        a: u16,
+        b: u16,
+        signed: bool,
+    },
+    FCmp {
+        op: CmpOp,
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    FloatAdd {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    FloatSub {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    FloatMul {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    FloatDiv {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    IntNeg {
+        dst: u16,
+        a: u16,
+    },
+    FloatNeg {
+        dst: u16,
+        a: u16,
+    },
+    IntToFloat {
+        dst: u16,
+        a: u16,
+        signed: bool,
+    },
+    BoolAnd {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    BoolOr {
+        dst: u16,
+        a: u16,
+        b: u16,
+    },
+    BoolNot {
+        dst: u16,
+        a: u16,
+    },
+    IsNull {
+        dst: u16,
+        pi: u8,
+    },
+    IsNotNull {
+        dst: u16,
+        pi: u8,
+    },
+    StrColConst {
+        op: StrOp,
+        dst: u16,
+        pi: u8,
+        const_idx: u32,
+    },
+    StrColCol {
+        op: StrOp,
+        dst: u16,
+        pi_a: u8,
+        pi_b: u8,
+    },
+    CopyCol {
+        out: u32,
+        src: ColSrc,
+        tc: u8,
+    },
+    Emit {
+        src: u16,
+        out: u32,
+    },
+    EmitNull {
+        out: u32,
+    },
+}
+
+/// Classification of each output-producing instruction, in program order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputColKind {
+    /// Column copied verbatim from the input batch.
+    CopyCol { src: ColSrc, out_payload: u32, tc: u8 },
+    /// Computed register written to an output payload column.
+    Emit { reg: usize, out_payload: usize },
+    /// Always-NULL output column.
+    EmitNull { out_payload: u32 },
+}
+
+impl OutputColKind {
+    /// Destination payload column this instruction writes. For the finalize path
+    /// it equals the dense output position; for the general MAP path it is the
+    /// authoritative scatter target.
+    pub(crate) fn out_payload(&self) -> usize {
+        match *self {
+            OutputColKind::CopyCol { out_payload, .. } | OutputColKind::EmitNull { out_payload } => {
+                out_payload as usize
+            }
+            OutputColKind::Emit { out_payload, .. } => out_payload,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LogicalProgram — pre-resolve container
+// ---------------------------------------------------------------------------
+
+pub struct LogicalProgram {
+    instrs: Vec<LogicalInstr>,
+    num_regs: u32,
+    result_reg: u32,
+    const_strings: Vec<Vec<u8>>,
+}
+
+impl LogicalProgram {
+    /// Build from typed instructions, validating the construction-time
+    /// invariants. Used by `from_wire` and the test builders.
+    pub(crate) fn new(instrs: Vec<LogicalInstr>, num_regs: u32, result_reg: u32, const_strings: Vec<Vec<u8>>) -> Self {
+        // The BOOL_AND/BOOL_OR 3VL paths and null-bit propagation operate on
+        // `u64` words indexed by register, so the register file is capped at 64.
         assert!(
             num_regs <= 64,
-            "ExprProgram: num_regs={num_regs} exceeds the 64-register limit",
+            "LogicalProgram: num_regs={num_regs} exceeds the 64-register limit"
         );
         assert!(
             num_regs == 0 || result_reg < num_regs,
-            "ExprProgram: result_reg={result_reg} >= num_regs={num_regs}"
+            "LogicalProgram: result_reg={result_reg} >= num_regs={num_regs}"
         );
-        let mut const_prefixes = Vec::with_capacity(const_strings.len());
-        let mut const_lengths = Vec::with_capacity(const_strings.len());
-        for s in &const_strings {
-            const_prefixes.push(compute_prefix(s));
-            const_lengths.push(s.len() as u32);
-        }
         gnitz_debug!(
             "expr_program: instrs={} regs={} consts={}",
-            num_instrs,
+            instrs.len(),
             num_regs,
             const_strings.len()
         );
-        let prog = ExprProgram {
-            code,
+        use LogicalInstr as L;
+        for instr in &instrs {
+            match *instr {
+                // Binary ALU: SSA (dst must not alias a source — `reg3` borrows
+                // three distinct register slots) + bounds on dst, a, b.
+                L::IntAdd { dst, a, b }
+                | L::IntSub { dst, a, b }
+                | L::IntMul { dst, a, b }
+                | L::IntDiv { dst, a, b }
+                | L::IntMod { dst, a, b }
+                | L::FloatAdd { dst, a, b }
+                | L::FloatSub { dst, a, b }
+                | L::FloatMul { dst, a, b }
+                | L::FloatDiv { dst, a, b }
+                | L::Cmp { dst, a, b, .. }
+                | L::FCmp { dst, a, b, .. }
+                | L::BoolAnd { dst, a, b }
+                | L::BoolOr { dst, a, b } => {
+                    assert!(
+                        dst != a && dst != b,
+                        "LogicalProgram: register aliasing dst={dst} a={a} b={b}"
+                    );
+                    assert_reg(dst, num_regs);
+                    assert_reg(a, num_regs);
+                    assert_reg(b, num_regs);
+                }
+                // Unary register readers that write dst: bounds dst, a.
+                L::IntNeg { dst, a } | L::FloatNeg { dst, a } | L::IntToFloat { dst, a } | L::BoolNot { dst, a } => {
+                    assert_reg(dst, num_regs);
+                    assert_reg(a, num_regs);
+                }
+                // EMIT reads a source register; no dst register.
+                L::Emit { src, .. } => assert_reg(src, num_regs),
+                // dst-writers whose other operands are column / const indices.
+                L::LoadColInt { dst, .. }
+                | L::LoadColFloat { dst, .. }
+                | L::LoadConst { dst, .. }
+                | L::IsNull { dst, .. }
+                | L::IsNotNull { dst, .. }
+                | L::StrColConst { dst, .. }
+                | L::StrColCol { dst, .. } => assert_reg(dst, num_regs),
+                // No register operands.
+                L::CopyCol { .. } | L::EmitNull { .. } => {}
+            }
+        }
+        LogicalProgram {
+            instrs,
             num_regs,
             result_reg,
-            num_instrs,
             const_strings,
+        }
+    }
+
+    /// Lower a wire expr blob (flat u32 quads `[op, dst, a1, a2]`) into the
+    /// typed logical form. The single point that knows the wire encoding.
+    pub(crate) fn from_wire(code: &[u32], num_regs: u32, result_reg: u32, const_strings: Vec<Vec<u8>>) -> Self {
+        assert_eq!(
+            code.len() % 4,
+            0,
+            "from_wire: code length {} is not a multiple of 4",
+            code.len()
+        );
+        let mut instrs = Vec::with_capacity(code.len() / 4);
+        for q in code.chunks_exact(4) {
+            let op = q[0];
+            let dst = q[1] as u16;
+            let a = q[2] as u16;
+            let b = q[3] as u16;
+            // Map a wire compare opcode to its operator; both closures capture this
+            // instruction's dst/a/b so the per-opcode arms below stay one-liners.
+            let cmp = |op| LogicalInstr::Cmp { op, dst, a, b };
+            let fcmp = |op| LogicalInstr::FCmp { op, dst, a, b };
+            instrs.push(match op {
+                EXPR_LOAD_COL_INT => LogicalInstr::LoadColInt { dst, col: q[2] },
+                EXPR_LOAD_COL_FLOAT => LogicalInstr::LoadColFloat { dst, col: q[2] },
+                // 64-bit constant split low/high across the two operand words.
+                EXPR_LOAD_CONST => LogicalInstr::LoadConst {
+                    dst,
+                    val: ((q[3] as i64) << 32) | (q[2] as i64 & 0xFFFF_FFFF),
+                },
+                EXPR_INT_ADD => LogicalInstr::IntAdd { dst, a, b },
+                EXPR_INT_SUB => LogicalInstr::IntSub { dst, a, b },
+                EXPR_INT_MUL => LogicalInstr::IntMul { dst, a, b },
+                EXPR_INT_DIV => LogicalInstr::IntDiv { dst, a, b },
+                EXPR_INT_MOD => LogicalInstr::IntMod { dst, a, b },
+                EXPR_INT_NEG => LogicalInstr::IntNeg { dst, a },
+                EXPR_FLOAT_ADD => LogicalInstr::FloatAdd { dst, a, b },
+                EXPR_FLOAT_SUB => LogicalInstr::FloatSub { dst, a, b },
+                EXPR_FLOAT_MUL => LogicalInstr::FloatMul { dst, a, b },
+                EXPR_FLOAT_DIV => LogicalInstr::FloatDiv { dst, a, b },
+                EXPR_FLOAT_NEG => LogicalInstr::FloatNeg { dst, a },
+                EXPR_CMP_EQ => cmp(CmpOp::Eq),
+                EXPR_CMP_NE => cmp(CmpOp::Ne),
+                EXPR_CMP_GT => cmp(CmpOp::Gt),
+                EXPR_CMP_GE => cmp(CmpOp::Ge),
+                EXPR_CMP_LT => cmp(CmpOp::Lt),
+                EXPR_CMP_LE => cmp(CmpOp::Le),
+                EXPR_FCMP_EQ => fcmp(CmpOp::Eq),
+                EXPR_FCMP_NE => fcmp(CmpOp::Ne),
+                EXPR_FCMP_GT => fcmp(CmpOp::Gt),
+                EXPR_FCMP_GE => fcmp(CmpOp::Ge),
+                EXPR_FCMP_LT => fcmp(CmpOp::Lt),
+                EXPR_FCMP_LE => fcmp(CmpOp::Le),
+                EXPR_BOOL_AND => LogicalInstr::BoolAnd { dst, a, b },
+                EXPR_BOOL_OR => LogicalInstr::BoolOr { dst, a, b },
+                EXPR_BOOL_NOT => LogicalInstr::BoolNot { dst, a },
+                EXPR_IS_NULL => LogicalInstr::IsNull { dst, col: q[2] },
+                EXPR_IS_NOT_NULL => LogicalInstr::IsNotNull { dst, col: q[2] },
+                EXPR_EMIT => LogicalInstr::Emit { src: a, out: q[3] },
+                EXPR_INT_TO_FLOAT => LogicalInstr::IntToFloat { dst, a },
+                EXPR_COPY_COL => LogicalInstr::CopyCol {
+                    src_col: q[2],
+                    out: q[3],
+                    tc: q[1] as u8,
+                },
+                EXPR_STR_COL_EQ_CONST => LogicalInstr::StrColConst {
+                    op: StrOp::Eq,
+                    dst,
+                    col: q[2],
+                    const_idx: q[3],
+                },
+                EXPR_STR_COL_LT_CONST => LogicalInstr::StrColConst {
+                    op: StrOp::Lt,
+                    dst,
+                    col: q[2],
+                    const_idx: q[3],
+                },
+                EXPR_STR_COL_LE_CONST => LogicalInstr::StrColConst {
+                    op: StrOp::Le,
+                    dst,
+                    col: q[2],
+                    const_idx: q[3],
+                },
+                EXPR_STR_COL_EQ_COL => LogicalInstr::StrColCol {
+                    op: StrOp::Eq,
+                    dst,
+                    col_a: q[2],
+                    col_b: q[3],
+                },
+                EXPR_STR_COL_LT_COL => LogicalInstr::StrColCol {
+                    op: StrOp::Lt,
+                    dst,
+                    col_a: q[2],
+                    col_b: q[3],
+                },
+                EXPR_STR_COL_LE_COL => LogicalInstr::StrColCol {
+                    op: StrOp::Le,
+                    dst,
+                    col_a: q[2],
+                    col_b: q[3],
+                },
+                EXPR_EMIT_NULL => LogicalInstr::EmitNull { out: q[2] },
+                _ => panic!("from_wire: unknown expr opcode {op}"),
+            });
+        }
+        LogicalProgram::new(instrs, num_regs, result_reg, const_strings)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.instrs.len()
+    }
+
+    /// If every instruction is `CopyCol` forming one contiguous block copy
+    /// `src = [base, base+1, …]` → `out = [0, 1, 2, …]`, return `Some(base)`:
+    /// the count of leading columns the program skips (the PK region a finalize
+    /// / identity MAP inherits verbatim rather than copying). Otherwise `None`.
+    ///
+    /// Both checks are load-bearing — sequential sources AND dense destinations;
+    /// a permuted-destination program is a real permutation, not an identity.
+    pub(crate) fn sequential_copy_base(&self) -> Option<usize> {
+        let LogicalInstr::CopyCol { src_col: base, .. } = *self.instrs.first()? else {
+            return None;
+        };
+        let ok = self.instrs.iter().enumerate().all(|(i, instr)| {
+            matches!(*instr, LogicalInstr::CopyCol { src_col, out, .. } if src_col == base + i as u32 && out == i as u32)
+        });
+        ok.then_some(base as usize)
+    }
+
+    /// Lower to the resolved form and classify register roles for the given
+    /// context (`is_filter = true` keeps `result_reg` eligible for bit_only).
+    /// Consuming: a `Vec<LogicalInstr>` cannot be mutated in place into a
+    /// `Vec<Instr>`. Preserves the per-register U64 signed→unsigned tracking.
+    pub(crate) fn resolve(self, schema: &SchemaDescriptor, is_filter: bool) -> ResolvedProgram {
+        use crate::schema::type_code;
+        use Instr as I;
+        use LogicalInstr as L;
+        // Per-register type code of the most recently produced integer value.
+        // Drives the signed→unsigned variant for U64 operands, whose i64 bit
+        // pattern is negative for values >= 2^63. 0 = unknown (treated signed).
+        let mut reg_tc = [0u8; 64];
+        let is_u64 = |tc: u8| tc == type_code::U64;
+        let mut instrs = Vec::with_capacity(self.instrs.len());
+        for li in self.instrs {
+            match li {
+                L::LoadColInt { dst, col } => {
+                    let ci = col as usize;
+                    let tc = schema.columns[ci].type_code;
+                    if schema.is_pk_col(ci) {
+                        instrs.push(I::LoadPk {
+                            dst,
+                            off: schema.pk_byte_offset(ci),
+                            size: schema.columns[ci].size(),
+                            tc,
+                            signed: crate::schema::is_signed_int(tc),
+                        });
+                    } else {
+                        instrs.push(I::LoadPayloadInt {
+                            dst,
+                            pi: schema.payload_mapping_byte(ci),
+                        });
+                    }
+                    reg_tc[dst as usize] = tc;
+                }
+                L::LoadColFloat { dst, col } => {
+                    let ci = col as usize;
+                    debug_assert!(
+                        !schema.is_pk_col(ci),
+                        "resolve: LOAD_COL_FLOAT references PK column {ci} (PK is never float)"
+                    );
+                    instrs.push(I::LoadPayloadFloat {
+                        dst,
+                        pi: schema.payload_mapping_byte(ci),
+                    });
+                    reg_tc[dst as usize] = 0;
+                }
+                L::LoadConst { dst, val } => {
+                    instrs.push(I::LoadConst { dst, val });
+                    reg_tc[dst as usize] = 0;
+                }
+                L::IntAdd { dst, a, b } => {
+                    instrs.push(I::IntAdd { dst, a, b });
+                    reg_tc[dst as usize] = propagate_u64(&reg_tc, a, b);
+                }
+                L::IntSub { dst, a, b } => {
+                    instrs.push(I::IntSub { dst, a, b });
+                    reg_tc[dst as usize] = propagate_u64(&reg_tc, a, b);
+                }
+                L::IntMul { dst, a, b } => {
+                    instrs.push(I::IntMul { dst, a, b });
+                    reg_tc[dst as usize] = propagate_u64(&reg_tc, a, b);
+                }
+                L::IntDiv { dst, a, b } => {
+                    let u = any_u64(&reg_tc, a, b);
+                    instrs.push(I::IntDiv { dst, a, b, signed: !u });
+                    reg_tc[dst as usize] = if u { type_code::U64 } else { 0 };
+                }
+                L::IntMod { dst, a, b } => {
+                    let u = any_u64(&reg_tc, a, b);
+                    instrs.push(I::IntMod { dst, a, b, signed: !u });
+                    reg_tc[dst as usize] = if u { type_code::U64 } else { 0 };
+                }
+                L::IntNeg { dst, a } => {
+                    instrs.push(I::IntNeg { dst, a });
+                    reg_tc[dst as usize] = reg_tc[a as usize];
+                }
+                L::FloatAdd { dst, a, b } => instrs.push(I::FloatAdd { dst, a, b }),
+                L::FloatSub { dst, a, b } => instrs.push(I::FloatSub { dst, a, b }),
+                L::FloatMul { dst, a, b } => instrs.push(I::FloatMul { dst, a, b }),
+                L::FloatDiv { dst, a, b } => instrs.push(I::FloatDiv { dst, a, b }),
+                L::FloatNeg { dst, a } => instrs.push(I::FloatNeg { dst, a }),
+                L::Cmp { op, dst, a, b } => {
+                    // EQ/NE are bit-identical signed/unsigned; ordered compares
+                    // pick the unsigned form when either operand is U64.
+                    let signed = matches!(op, CmpOp::Eq | CmpOp::Ne) || !any_u64(&reg_tc, a, b);
+                    instrs.push(I::Cmp { op, dst, a, b, signed });
+                    reg_tc[dst as usize] = 0;
+                }
+                L::FCmp { op, dst, a, b } => instrs.push(I::FCmp { op, dst, a, b }),
+                L::IntToFloat { dst, a } => {
+                    let signed = !is_u64(reg_tc[a as usize]);
+                    instrs.push(I::IntToFloat { dst, a, signed });
+                    reg_tc[dst as usize] = 0;
+                }
+                L::BoolAnd { dst, a, b } => instrs.push(I::BoolAnd { dst, a, b }),
+                L::BoolOr { dst, a, b } => instrs.push(I::BoolOr { dst, a, b }),
+                L::BoolNot { dst, a } => instrs.push(I::BoolNot { dst, a }),
+                L::IsNull { dst, col } => instrs.push(I::IsNull {
+                    dst,
+                    pi: schema.payload_mapping_byte(col as usize),
+                }),
+                L::IsNotNull { dst, col } => instrs.push(I::IsNotNull {
+                    dst,
+                    pi: schema.payload_mapping_byte(col as usize),
+                }),
+                L::StrColConst {
+                    op,
+                    dst,
+                    col,
+                    const_idx,
+                } => {
+                    instrs.push(I::StrColConst {
+                        op,
+                        dst,
+                        pi: schema.payload_mapping_byte(col as usize),
+                        const_idx,
+                    });
+                }
+                L::StrColCol { op, dst, col_a, col_b } => {
+                    instrs.push(I::StrColCol {
+                        op,
+                        dst,
+                        pi_a: schema.payload_mapping_byte(col_a as usize),
+                        pi_b: schema.payload_mapping_byte(col_b as usize),
+                    });
+                }
+                L::CopyCol { src_col, out, tc } => {
+                    let ci = src_col as usize;
+                    let src = if schema.is_pk_col(ci) {
+                        ColSrc::Pk {
+                            off: schema.pk_byte_offset(ci),
+                        }
+                    } else {
+                        ColSrc::Payload(schema.payload_mapping_byte(ci))
+                    };
+                    instrs.push(I::CopyCol { out, src, tc });
+                }
+                L::Emit { src, out } => instrs.push(I::Emit { src, out }),
+                L::EmitNull { out } => instrs.push(I::EmitNull { out }),
+            }
+        }
+        let payload_col_info: Vec<(u8, u8)> = schema
+            .payload_columns()
+            .map(|(_, _, col)| (col.size(), col.type_code))
+            .collect();
+        // Precompute each string constant's compare key once (see field docs).
+        let const_prefixes: Vec<u32> = self.const_strings.iter().map(|s| compute_prefix(s)).collect();
+        let const_lengths: Vec<u32> = self.const_strings.iter().map(|s| s.len() as u32).collect();
+        let mut prog = ResolvedProgram {
+            instrs,
+            num_regs: self.num_regs,
+            result_reg: self.result_reg,
+            const_strings: self.const_strings,
             const_prefixes,
             const_lengths,
-            payload_col_info: Vec::new(),
-            resolved: false,
+            payload_col_info,
             bit_only_mask: 0,
             bool_input_mask: 0,
         };
-        // SSA assert: binary ALU ops must not alias dst with either source.
-        // Hard assert (not debug-only): fires at compile time for compiler bugs.
-        let nr = num_regs as i64;
-        for instr in prog.code.chunks_exact(4) {
-            let (op, dst, a1, a2) = (instr[0], instr[1], instr[2], instr[3]);
-            if is_binary_alu_op(op) {
-                assert!(
-                    dst != a1 && dst != a2,
-                    "ExprProgram: register aliasing dst={dst} a1={a1} a2={a2} op={op}",
-                );
-            }
-            // Register-operand bounds: an out-of-range index would slice
-            // arbitrary heap memory in `reg3` / `reg_mut`. Column- and
-            // payload-bearing operands (loads, COPY_COL, STR_COL_*, EMIT
-            // payloads) are not register indices and are excluded via the
-            // `op_*` predicates.
-            if op_writes_dst_reg(op) {
-                assert!(
-                    dst >= 0 && dst < nr,
-                    "ExprProgram: dst register {dst} out of range (num_regs={num_regs}) op={op}"
-                );
-            }
-            if op_reads_a1(op) {
-                assert!(
-                    a1 >= 0 && a1 < nr,
-                    "ExprProgram: a1 register {a1} out of range (num_regs={num_regs}) op={op}"
-                );
-            }
-            if op_reads_a2(op) {
-                assert!(
-                    a2 >= 0 && a2 < nr,
-                    "ExprProgram: a2 register {a2} out of range (num_regs={num_regs}) op={op}"
-                );
-            }
-        }
+        prog.classify(is_filter);
         prog
     }
+}
 
-    /// Returns true if no opcode in this program can produce a NULL result.
-    /// Used by the batch evaluator to skip null-bit tracking entirely.
-    ///
-    /// Must be called after `resolve_column_indices`: column-bearing operands
-    /// are read as resolved payload bytes (SENTINEL → PK, never nullable;
-    /// otherwise dense payload index 0..N-1).
-    pub(in crate::expr) fn is_strictly_non_nullable(&self, schema: &crate::schema::SchemaDescriptor) -> bool {
-        let nullable_payload = |a: usize| -> bool {
-            a < schema.num_payload_cols() && schema.columns[schema.payload_col_idx(a)].nullable != 0
-        };
-        for instr in self.code.chunks_exact(4) {
-            let op = instr[0];
-            let a1 = instr[2] as usize;
-            let a2 = instr[3] as usize;
-            match op {
-                // Division/modulo produce NULL on zero divisor
-                EXPR_INT_DIV | EXPR_INT_MOD | EXPR_UDIV | EXPR_UMOD | EXPR_FLOAT_DIV => return false,
-                // IS_NULL / IS_NOT_NULL read null bits from the batch
-                EXPR_IS_NULL | EXPR_IS_NOT_NULL => return false,
-                // Column reads: null if the underlying column is nullable.
-                // STR_COL_*_CONST and one-side of STR_COL_*_COL use a1 as the
-                // resolved payload byte; STR_COL_*_COL also uses a2.
-                EXPR_LOAD_PAYLOAD_INT
-                | EXPR_LOAD_PAYLOAD_FLOAT
-                | EXPR_STR_COL_EQ_CONST
-                | EXPR_STR_COL_LT_CONST
-                | EXPR_STR_COL_LE_CONST
-                    if nullable_payload(a1) =>
-                {
-                    return false
-                }
-                EXPR_STR_COL_EQ_COL | EXPR_STR_COL_LT_COL | EXPR_STR_COL_LE_COL
-                    if nullable_payload(a1) || nullable_payload(a2) =>
-                {
-                    return false
-                }
-                _ => {}
-            }
-        }
-        true
-    }
+#[inline]
+fn assert_reg(r: u16, num_regs: u32) {
+    assert!(
+        (r as u32) < num_regs,
+        "LogicalProgram: register {r} out of range (num_regs={num_regs})"
+    );
+}
 
-    /// If every instruction is `COPY_COL` forming one contiguous block copy
-    /// `src = [base, base+1, …]` → `dst = [0, 1, 2, …]`, return `Some(base)`: the
-    /// source offset, i.e. the count of leading columns the program skips (the PK
-    /// region a finalize / identity MAP inherits verbatim rather than copying).
-    /// Otherwise `None`.
-    ///
-    /// Both checks are load-bearing. Sources must ascend from a single `base`
-    /// (`instr[2] == base + i`) AND destinations must be the dense `0, 1, 2, …`
-    /// (`instr[3] == i`): a program with sequential sources but permuted
-    /// destinations is a real permutation, not an identity, and eliding it would
-    /// silently scramble the column layout. Evaluated on the unresolved program,
-    /// so for a true finalize / identity MAP `base` equals the input register's PK
-    /// count (logical payload columns begin right after the PK region).
-    pub(crate) fn sequential_copy_base(&self) -> Option<usize> {
-        let base = self.code.chunks_exact(4).next()?[2];
-        if base < 0 {
-            // A negative `instr[2]` is the post-resolve PK sentinel; this helper
-            // only classifies pre-resolve logical-index programs.
-            return None;
-        }
-        let ok = self.code.chunks_exact(4).enumerate().all(|(i, instr)| {
-            instr[0] == EXPR_COPY_COL
-                && instr[2] == base + i as i64   // sources base, base+1, …
-                && instr[3] == i as i64 // destinations 0, 1, 2, …
-        });
-        if ok {
-            Some(base as usize)
-        } else {
-            None
-        }
-    }
+/// True iff either operand register currently holds a U64 value — the single
+/// rule that drives every signed→unsigned variant selection in `resolve`.
+#[inline]
+fn any_u64(reg_tc: &[u8; 64], a: u16, b: u16) -> bool {
+    let u64_tc = crate::schema::type_code::U64;
+    reg_tc[a as usize] == u64_tc || reg_tc[b as usize] == u64_tc
+}
 
-    /// Classify each output-producing instruction in bytecode order.
-    pub(crate) fn classify_output_cols(&self) -> Vec<OutputColKind> {
-        let mut out_cols = Vec::new();
-        let mut emit_count = 0usize;
-        for i in 0..self.num_instrs as usize {
-            let base = i * 4;
-            let op = self.code[base];
-            if op == EXPR_COPY_COL {
-                // a1 is either a payload index (>= 0) or, for a PK source
-                // column, `-(pk_byte_offset) - 1` (always negative).
-                let raw = self.code[base + 2];
-                let (src_pi, pk_off) = if raw < 0 {
-                    (PAYLOAD_MAPPING_PK_SENTINEL, (-raw - 1) as u8)
-                } else {
-                    (raw as u8, 0u8)
-                };
-                out_cols.push(OutputColKind::CopyCol { src_pi, pk_off });
-            } else if op == EXPR_EMIT {
-                out_cols.push(OutputColKind::Emit(emit_count));
-                emit_count += 1;
-            } else if op == EXPR_EMIT_NULL {
-                out_cols.push(OutputColKind::EmitNull);
-            }
-        }
-        out_cols
+#[inline]
+fn propagate_u64(reg_tc: &[u8; 64], a: u16, b: u16) -> u8 {
+    if any_u64(reg_tc, a, b) {
+        crate::schema::type_code::U64
+    } else {
+        0
     }
 }
 
-/// Classify each output-producing instruction.
-pub(crate) enum OutputColKind {
-    /// A column copied verbatim from the input. `src_pi` is the dense payload
-    /// index, or `PAYLOAD_MAPPING_PK_SENTINEL` when the source is the PK
-    /// region — in which case `pk_off` is the byte offset of the addressed
-    /// column within the (compound) OPK PK region.
-    CopyCol {
-        src_pi: u8,
-        pk_off: u8,
-    },
-    Emit(usize),
-    EmitNull,
+// ---------------------------------------------------------------------------
+// ResolvedProgram — the evaluable form
+// ---------------------------------------------------------------------------
+
+pub struct ResolvedProgram {
+    pub(in crate::expr) instrs: Vec<Instr>,
+    pub(in crate::expr) num_regs: u32,
+    pub(in crate::expr) result_reg: u32,
+    pub(in crate::expr) const_strings: Vec<Vec<u8>>,
+    /// Per-constant precomputed 4-byte BE prefix and byte length, indexed by
+    /// `const_idx` — hoisted out of the per-morsel `col <op> 'const'` compare loop.
+    pub(in crate::expr) const_prefixes: Vec<u32>,
+    pub(in crate::expr) const_lengths: Vec<u32>,
+    /// (size, type_code) for each physical payload column, in payload order.
+    pub(in crate::expr) payload_col_info: Vec<(u8, u8)>,
+    /// Bit `r` set iff register `r` is only consumed by boolean ops, so its
+    /// producer can skip the i64 unpack into `regs[r]`.
+    pub(in crate::expr) bit_only_mask: u64,
+    /// Bit `r` set iff register `r` is read by a boolean consumer; the producer
+    /// must populate `bool_bits[r]`.
+    pub(in crate::expr) bool_input_mask: u64,
 }
 
-fn is_binary_alu_op(op: i64) -> bool {
-    matches!(
-        op,
-        EXPR_INT_ADD
-            | EXPR_INT_SUB
-            | EXPR_INT_MUL
-            | EXPR_INT_DIV
-            | EXPR_INT_MOD
-            | EXPR_UDIV
-            | EXPR_UMOD
-            | EXPR_FLOAT_ADD
-            | EXPR_FLOAT_SUB
-            | EXPR_FLOAT_MUL
-            | EXPR_FLOAT_DIV
-            | EXPR_CMP_EQ
-            | EXPR_CMP_NE
-            | EXPR_CMP_GT
-            | EXPR_CMP_GE
-            | EXPR_CMP_LT
-            | EXPR_CMP_LE
-            | EXPR_UCMP_GT
-            | EXPR_UCMP_GE
-            | EXPR_UCMP_LT
-            | EXPR_UCMP_LE
-            | EXPR_FCMP_EQ
-            | EXPR_FCMP_NE
-            | EXPR_FCMP_GT
-            | EXPR_FCMP_GE
-            | EXPR_FCMP_LT
-            | EXPR_FCMP_LE
-            | EXPR_BOOL_AND
-            | EXPR_BOOL_OR
-    )
-}
-
-/// 4-byte prefix of `s` as big-endian u32 for ordered comparison.
-/// Short strings zero-pad on the right so that integer `<`/`>` matches
-/// lexicographic byte order against any other zero-padded 4-byte prefix.
-fn compute_prefix(s: &[u8]) -> u32 {
-    let mut buf = [0u8; 4];
-    let n = s.len().min(4);
-    buf[..n].copy_from_slice(&s[..n]);
-    u32::from_be_bytes(buf)
-}
-
-impl ExprProgram {
-    /// Rewrite every column-bearing opcode's operand byte from a logical
-    /// column index into either a dense payload index (0..N-1) or the
-    /// `PAYLOAD_MAPPING_PK_SENTINEL` byte. After this pass eval handlers
-    /// branch on `a1 == SENTINEL` instead of `ci == pki`, and the
-    /// pk_index/payload arithmetic disappears from the inner loop.
-    ///
-    /// Opcode rewrites:
-    /// - `LOAD_COL_INT` for PK → `LOAD_PK_{UNSIGNED,SIGNED}_INT` with a1 packed
-    ///   as `(pk_byte_offset << 16) | (col_size << 8) | type_code`; otherwise
-    ///   `LOAD_PAYLOAD_INT` with a1 ← `payload_mapping_byte(ci)`
-    /// - `LOAD_COL_FLOAT` → `LOAD_PAYLOAD_FLOAT` (PK is never float)
-    /// - `COPY_COL`: a1 ← `payload_mapping_byte(ci)` for payload columns, or
-    ///   `-(pk_byte_offset) - 1` (negative sentinel) for PK columns
-    /// - `IS_NULL`, `IS_NOT_NULL`, `STR_COL_{EQ,LT,LE}_CONST`:
-    ///   a1 ← `payload_mapping_byte(ci)` (opcode unchanged)
-    /// - `STR_COL_{EQ,LT,LE}_COL`: a1 AND a2 ← `payload_mapping_byte(ci)`
-    /// - `CMP_{GT,GE,LT,LE}`, `INT_DIV`, `INT_MOD`, `INT_TO_FLOAT` → their
-    ///   `UCMP_*` / `UDIV` / `UMOD` / `UINT_TO_FLOAT` unsigned forms when a U64
-    ///   operand is detected via per-register type tracking.
-    ///
-    /// Idempotent: a second call is a no-op (gated by `self.resolved`).
-    /// Must be called once per program, before the first call to
-    /// `eval_predicate` / `eval_with_emit` / `eval_batch`. Called
-    /// automatically by `ScalarFunc::from_predicate` and `ScalarFunc::from_map`.
-    pub fn resolve_column_indices(&mut self, schema: &SchemaDescriptor) {
-        if self.resolved {
-            return;
-        }
-        use crate::schema::type_code;
-        // Per-register type code of the most recently produced integer value.
-        // Drives the signed→unsigned opcode swap for U64 operands, whose i64
-        // register bit pattern is negative for values >= 2^63. 0 = unknown
-        // (treated as signed). num_regs <= 64 is asserted in `new`.
-        let mut reg_tc = [0u8; 64];
-        let is_u64 = |tc: u8| tc == type_code::U64;
-        for instr in self.code.chunks_exact_mut(4) {
-            let op = instr[0];
-            let dst = instr[1] as usize;
-            match op {
-                EXPR_LOAD_COL_INT => {
-                    let logical_idx = instr[2] as usize;
-                    let tc = schema.columns[logical_idx].type_code;
-                    if schema.is_pk_col(logical_idx) {
-                        let signed = crate::schema::is_signed_int(tc);
-                        instr[0] = if signed {
-                            EXPR_LOAD_PK_SIGNED_INT
-                        } else {
-                            EXPR_LOAD_PK_UNSIGNED_INT
-                        };
-                        let offset = schema.pk_byte_offset(logical_idx) as u64;
-                        let size = schema.columns[logical_idx].size() as u64;
-                        instr[2] = ((offset << 16) | (size << 8) | tc as u64) as i64;
-                    } else {
-                        instr[0] = EXPR_LOAD_PAYLOAD_INT;
-                        instr[2] = schema.payload_mapping_byte(logical_idx) as i64;
-                    }
-                    reg_tc[dst] = tc;
-                }
-                EXPR_LOAD_COL_FLOAT => {
-                    let ci = instr[2] as usize;
-                    debug_assert!(
-                        !schema.is_pk_col(ci),
-                        "resolve_column_indices: LOAD_COL_FLOAT references PK column {ci} (PK is never float)",
-                    );
-                    instr[0] = EXPR_LOAD_PAYLOAD_FLOAT;
-                    instr[2] = schema.payload_mapping_byte(ci) as i64;
-                    reg_tc[dst] = 0;
-                }
-                EXPR_LOAD_CONST => {
-                    reg_tc[dst] = 0;
-                }
-                EXPR_COPY_COL => {
-                    // PK columns encode their OPK byte offset as a negative
-                    // sentinel (always distinct from a payload index >= 0) so
-                    // `from_map` / `classify_output_cols` can address the exact
-                    // column within a compound PK region.
-                    let logical_idx = instr[2] as usize;
-                    if schema.is_pk_col(logical_idx) {
-                        instr[2] = -(schema.pk_byte_offset(logical_idx) as i64) - 1;
-                    } else {
-                        instr[2] = schema.payload_mapping_byte(logical_idx) as i64;
-                    }
-                }
-                EXPR_IS_NULL
-                | EXPR_IS_NOT_NULL
-                | EXPR_STR_COL_EQ_CONST
-                | EXPR_STR_COL_LT_CONST
-                | EXPR_STR_COL_LE_CONST => {
-                    instr[2] = schema.payload_mapping_byte(instr[2] as usize) as i64;
-                }
-                EXPR_STR_COL_EQ_COL | EXPR_STR_COL_LT_COL | EXPR_STR_COL_LE_COL => {
-                    instr[2] = schema.payload_mapping_byte(instr[2] as usize) as i64;
-                    instr[3] = schema.payload_mapping_byte(instr[3] as usize) as i64;
-                }
-                EXPR_CMP_GT | EXPR_CMP_GE | EXPR_CMP_LT | EXPR_CMP_LE => {
-                    if is_u64(reg_tc[instr[2] as usize]) || is_u64(reg_tc[instr[3] as usize]) {
-                        instr[0] = match op {
-                            EXPR_CMP_GT => EXPR_UCMP_GT,
-                            EXPR_CMP_GE => EXPR_UCMP_GE,
-                            EXPR_CMP_LT => EXPR_UCMP_LT,
-                            _ => EXPR_UCMP_LE,
-                        };
-                    }
-                    reg_tc[dst] = 0;
-                }
-                EXPR_CMP_EQ | EXPR_CMP_NE => {
-                    // EQ/NE are bit-identical signed/unsigned; no swap needed.
-                    reg_tc[dst] = 0;
-                }
-                EXPR_INT_DIV | EXPR_INT_MOD => {
-                    let u = is_u64(reg_tc[instr[2] as usize]) || is_u64(reg_tc[instr[3] as usize]);
-                    if u {
-                        instr[0] = if op == EXPR_INT_DIV { EXPR_UDIV } else { EXPR_UMOD };
-                    }
-                    reg_tc[dst] = if u { type_code::U64 } else { 0 };
-                }
-                EXPR_INT_ADD | EXPR_INT_SUB | EXPR_INT_MUL => {
-                    reg_tc[dst] = if is_u64(reg_tc[instr[2] as usize]) || is_u64(reg_tc[instr[3] as usize]) {
-                        type_code::U64
-                    } else {
-                        0
-                    };
-                }
-                EXPR_INT_NEG => {
-                    reg_tc[dst] = reg_tc[instr[2] as usize];
-                }
-                EXPR_INT_TO_FLOAT => {
-                    if is_u64(reg_tc[instr[2] as usize]) {
-                        instr[0] = EXPR_UINT_TO_FLOAT;
-                    }
-                    reg_tc[dst] = 0;
-                }
-                _ => {}
-            }
-        }
-        self.payload_col_info.clear();
-        self.payload_col_info
-            .extend(schema.payload_columns().map(|(_, _, col)| (col.size(), col.type_code)));
-        self.resolved = true;
-        // Default to map-context masks. The bool-bits reads in the BOOL_AND/OR
-        // nullable arms require `bool_input_mask` to be populated by the
-        // producers of their source registers, so classification is mandatory
-        // for any program that may execute on the nullable path.
-        // `ScalarFunc::from_predicate` overrides with `is_filter = true` to keep
-        // `result_reg` eligible for bit_only.
-        self.classify(false);
+impl ResolvedProgram {
+    #[inline]
+    pub(in crate::expr) fn is_bit_only(&self, reg: usize) -> bool {
+        (self.bit_only_mask >> reg) & 1 != 0
     }
 
-    /// Populate `bit_only_mask` / `bool_input_mask` from the resolved bytecode.
+    /// True iff `reg`'s producer must write `bool_bits[reg]` — either because a
+    /// downstream BOOL consumer reads it, or because `reg` is bit_only and
+    /// `run_filter` reads `bool_bits[result_reg]` directly.
+    #[inline]
+    pub(in crate::expr) fn needs_bool_pack(&self, reg: usize) -> bool {
+        ((self.bit_only_mask | self.bool_input_mask) >> reg) & 1 != 0
+    }
+
+    /// Populate `bit_only_mask` / `bool_input_mask` from the resolved program.
     pub(in crate::expr) fn classify(&mut self, is_filter: bool) {
         let (bit_only, bool_input) = self.classify_registers(is_filter);
         self.bit_only_mask = bit_only;
         self.bool_input_mask = bool_input;
     }
 
-    #[inline]
-    pub(in crate::expr) fn is_bit_only(&self, reg: usize) -> bool {
-        (self.bit_only_mask >> reg) & 1 != 0
-    }
-
-    /// True iff `reg`'s producer must write `bool_bits[reg]` — either because
-    /// a downstream BOOL consumer reads it, or because `reg` is bit_only and
-    /// run_filter reads `bool_bits[result_reg]` directly.
-    #[inline]
-    pub(in crate::expr) fn needs_bool_pack(&self, reg: usize) -> bool {
-        ((self.bit_only_mask | self.bool_input_mask) >> reg) & 1 != 0
-    }
-
     /// Classify each register's role on the nullable-arm hot path. Returns
-    /// `(bit_only_mask, bool_input_mask)`.
-    ///
-    /// `is_filter = true` keeps `result_reg` eligible for `bit_only` (the
-    /// `run_filter` fast path reads `bool_bits[result_reg]` directly). For
-    /// maps, `result_reg` is demoted: EMIT already drags its source register
-    /// through `is_unary_reg_reader`, but `result_reg` carries no map-side
-    /// semantics and demoting it keeps any stray `regs[result_reg]` read live.
-    ///
-    /// Operand-shape note: `a1`/`a2` are register indices only for opcodes
-    /// in `is_*_reg_reader` / `is_bool_consumer`; other opcodes pack constant
-    /// bits, payload byte indices, or type codes into those slots, so the
-    /// classifier enumerates opcode shapes rather than blindly indexing.
+    /// `(bit_only_mask, bool_input_mask)`. `is_filter = true` keeps `result_reg`
+    /// eligible for bit_only (the `run_filter` fast path reads `bool_bits` of it
+    /// directly); for maps it is demoted to keep any stray `regs[result_reg]`
+    /// read live.
     pub(in crate::expr) fn classify_registers(&self, is_filter: bool) -> (u64, u64) {
+        use Instr::*;
         let mut bool_produced: u64 = 0;
         let mut non_bool_read: u64 = 0;
         let mut bool_input: u64 = 0;
-
-        for instr in self.code.chunks_exact(4) {
-            let op = instr[0];
-            let dst = instr[1] as usize;
-            let a1 = instr[2] as usize;
-            let a2 = instr[3] as usize;
-
-            if is_bool_producer(op) {
-                debug_assert!(dst < 64, "classify_registers: dst {dst} ≥ 64");
-                bool_produced |= 1u64 << dst;
-            }
-            if is_bool_consumer(op) {
-                debug_assert!(a1 < 64, "classify_registers: BOOL src a1={a1} ≥ 64");
-                bool_input |= 1u64 << a1;
-                if is_binary_bool_consumer(op) {
-                    debug_assert!(a2 < 64, "classify_registers: BOOL src a2={a2} ≥ 64");
-                    bool_input |= 1u64 << a2;
+        for instr in &self.instrs {
+            match *instr {
+                // Bool producers that are also binary register readers.
+                Cmp { dst, a, b, .. } | FCmp { dst, a, b, .. } => {
+                    debug_assert!((dst as usize) < 64, "classify: dst {dst} >= 64");
+                    debug_assert!((a as usize) < 64 && (b as usize) < 64, "classify: src {a}/{b} >= 64");
+                    bool_produced |= 1u64 << dst;
+                    non_bool_read |= (1u64 << a) | (1u64 << b);
                 }
-                continue;
-            }
-            if is_binary_reg_reader(op) {
-                non_bool_read |= (1u64 << a1) | (1u64 << a2);
-            } else if is_unary_reg_reader(op) {
-                non_bool_read |= 1u64 << a1;
+                // Binary register readers (non-bool-producing).
+                IntAdd { a, b, .. }
+                | IntSub { a, b, .. }
+                | IntMul { a, b, .. }
+                | IntDiv { a, b, .. }
+                | IntMod { a, b, .. }
+                | FloatAdd { a, b, .. }
+                | FloatSub { a, b, .. }
+                | FloatMul { a, b, .. }
+                | FloatDiv { a, b, .. } => {
+                    debug_assert!((a as usize) < 64 && (b as usize) < 64, "classify: src {a}/{b} >= 64");
+                    non_bool_read |= (1u64 << a) | (1u64 << b);
+                }
+                // Bool producers whose operands are payload columns, not regs.
+                StrColConst { dst, .. } | StrColCol { dst, .. } | IsNull { dst, .. } | IsNotNull { dst, .. } => {
+                    debug_assert!((dst as usize) < 64, "classify: dst {dst} >= 64");
+                    bool_produced |= 1u64 << dst;
+                }
+                // Binary bool consumers: producer + bool_input (not non_bool_read).
+                BoolAnd { dst, a, b } | BoolOr { dst, a, b } => {
+                    debug_assert!((dst as usize) < 64, "classify: dst {dst} >= 64");
+                    debug_assert!(
+                        (a as usize) < 64 && (b as usize) < 64,
+                        "classify: BOOL src {a}/{b} >= 64"
+                    );
+                    bool_produced |= 1u64 << dst;
+                    bool_input |= (1u64 << a) | (1u64 << b);
+                }
+                // Unary bool consumer.
+                BoolNot { dst, a } => {
+                    debug_assert!((dst as usize) < 64, "classify: dst {dst} >= 64");
+                    debug_assert!((a as usize) < 64, "classify: BOOL src {a} >= 64");
+                    bool_produced |= 1u64 << dst;
+                    bool_input |= 1u64 << a;
+                }
+                // Unary register readers (non-bool).
+                IntNeg { a, .. } | FloatNeg { a, .. } | IntToFloat { a, .. } => {
+                    debug_assert!((a as usize) < 64, "classify: src {a} >= 64");
+                    non_bool_read |= 1u64 << a;
+                }
+                Emit { src, .. } => {
+                    debug_assert!((src as usize) < 64, "classify: EMIT src {src} >= 64");
+                    non_bool_read |= 1u64 << src;
+                }
+                // No register reads / not bool.
+                LoadPayloadInt { .. }
+                | LoadPayloadFloat { .. }
+                | LoadPk { .. }
+                | LoadConst { .. }
+                | CopyCol { .. }
+                | EmitNull { .. } => {}
             }
         }
-
         let mut bit_only = bool_produced & !non_bool_read;
         if !is_filter && self.num_regs > 0 {
             bit_only &= !(1u64 << self.result_reg as usize);
         }
         (bit_only, bool_input)
     }
-}
 
-#[inline]
-fn is_bool_producer(op: i64) -> bool {
-    matches!(
-        op,
-        EXPR_CMP_EQ
-            | EXPR_CMP_NE
-            | EXPR_CMP_GT
-            | EXPR_CMP_GE
-            | EXPR_CMP_LT
-            | EXPR_CMP_LE
-            | EXPR_UCMP_GT
-            | EXPR_UCMP_GE
-            | EXPR_UCMP_LT
-            | EXPR_UCMP_LE
-            | EXPR_FCMP_EQ
-            | EXPR_FCMP_NE
-            | EXPR_FCMP_GT
-            | EXPR_FCMP_GE
-            | EXPR_FCMP_LT
-            | EXPR_FCMP_LE
-            | EXPR_STR_COL_EQ_CONST
-            | EXPR_STR_COL_LT_CONST
-            | EXPR_STR_COL_LE_CONST
-            | EXPR_STR_COL_EQ_COL
-            | EXPR_STR_COL_LT_COL
-            | EXPR_STR_COL_LE_COL
-            | EXPR_IS_NULL
-            | EXPR_IS_NOT_NULL
-            | EXPR_BOOL_AND
-            | EXPR_BOOL_OR
-            | EXPR_BOOL_NOT
-    )
-}
+    /// Classify each output-producing instruction, in program order.
+    pub(in crate::expr) fn classify_output_cols(&self) -> Vec<OutputColKind> {
+        use Instr::*;
+        let mut out_cols = Vec::new();
+        for instr in &self.instrs {
+            match *instr {
+                CopyCol { src, out, tc } => out_cols.push(OutputColKind::CopyCol {
+                    src,
+                    out_payload: out,
+                    tc,
+                }),
+                Emit { src, out } => out_cols.push(OutputColKind::Emit {
+                    reg: src as usize,
+                    out_payload: out as usize,
+                }),
+                EmitNull { out } => out_cols.push(OutputColKind::EmitNull { out_payload: out }),
+                // Subset-select: only the three output variants matter here.
+                _ => {}
+            }
+        }
+        out_cols
+    }
 
-#[inline]
-fn is_bool_consumer(op: i64) -> bool {
-    matches!(op, EXPR_BOOL_AND | EXPR_BOOL_OR | EXPR_BOOL_NOT)
-}
-
-#[inline]
-fn is_binary_bool_consumer(op: i64) -> bool {
-    matches!(op, EXPR_BOOL_AND | EXPR_BOOL_OR)
-}
-
-#[inline]
-fn is_binary_reg_reader(op: i64) -> bool {
-    matches!(
-        op,
-        EXPR_INT_ADD
-            | EXPR_INT_SUB
-            | EXPR_INT_MUL
-            | EXPR_INT_DIV
-            | EXPR_INT_MOD
-            | EXPR_UDIV
-            | EXPR_UMOD
-            | EXPR_FLOAT_ADD
-            | EXPR_FLOAT_SUB
-            | EXPR_FLOAT_MUL
-            | EXPR_FLOAT_DIV
-            | EXPR_CMP_EQ
-            | EXPR_CMP_NE
-            | EXPR_CMP_GT
-            | EXPR_CMP_GE
-            | EXPR_CMP_LT
-            | EXPR_CMP_LE
-            | EXPR_UCMP_GT
-            | EXPR_UCMP_GE
-            | EXPR_UCMP_LT
-            | EXPR_UCMP_LE
-            | EXPR_FCMP_EQ
-            | EXPR_FCMP_NE
-            | EXPR_FCMP_GT
-            | EXPR_FCMP_GE
-            | EXPR_FCMP_LT
-            | EXPR_FCMP_LE
-    )
-}
-
-#[inline]
-fn is_unary_reg_reader(op: i64) -> bool {
-    matches!(
-        op,
-        EXPR_INT_NEG | EXPR_FLOAT_NEG | EXPR_INT_TO_FLOAT | EXPR_UINT_TO_FLOAT | EXPR_EMIT
-    )
-}
-
-/// True iff `instr[1]` (dst) is a register index. COPY_COL/EMIT/EMIT_NULL put
-/// a type code or payload index there, not a register, so they are excluded.
-#[inline]
-fn op_writes_dst_reg(op: i64) -> bool {
-    !matches!(op, EXPR_COPY_COL | EXPR_EMIT | EXPR_EMIT_NULL)
-}
-
-/// True iff `instr[2]` (a1) is a register index. Binary ALU, unary readers and
-/// BOOL_NOT read a1 from a register; loads/COPY_COL/STR_COL_*/IS_NULL carry a
-/// column or payload index there instead.
-#[inline]
-fn op_reads_a1(op: i64) -> bool {
-    is_binary_alu_op(op) || is_unary_reg_reader(op) || op == EXPR_BOOL_NOT
-}
-
-/// True iff `instr[3]` (a2) is a register index — only the binary ALU ops.
-#[inline]
-fn op_reads_a2(op: i64) -> bool {
-    is_binary_alu_op(op)
+    /// Returns true if no instruction in this program can produce a NULL result
+    /// (so the evaluator can skip null-bit tracking entirely).
+    pub(in crate::expr) fn is_strictly_non_nullable(&self, schema: &SchemaDescriptor) -> bool {
+        use Instr::*;
+        let nullable_payload = |pi: u8| -> bool {
+            let a = pi as usize;
+            a < schema.num_payload_cols() && schema.columns[schema.payload_col_idx(a)].nullable != 0
+        };
+        for instr in &self.instrs {
+            match *instr {
+                // Division/modulo produce NULL on a zero divisor.
+                IntDiv { .. } | IntMod { .. } | FloatDiv { .. } => return false,
+                // IS_NULL / IS_NOT_NULL read the batch null bits.
+                IsNull { .. } | IsNotNull { .. } => return false,
+                // Column reads: null when the underlying column is nullable.
+                LoadPayloadInt { pi, .. } | LoadPayloadFloat { pi, .. } | StrColConst { pi, .. }
+                    if nullable_payload(pi) =>
+                {
+                    return false
+                }
+                StrColCol { pi_a, pi_b, .. } if nullable_payload(pi_a) || nullable_payload(pi_b) => return false,
+                // Exhaustive remainder (no `_` wildcard): a future null-producing
+                // variant must be classified here, not silently treated as safe.
+                LoadPayloadInt { .. }
+                | LoadPayloadFloat { .. }
+                | StrColConst { .. }
+                | StrColCol { .. }
+                | LoadPk { .. }
+                | LoadConst { .. }
+                | IntAdd { .. }
+                | IntSub { .. }
+                | IntMul { .. }
+                | IntNeg { .. }
+                | FloatAdd { .. }
+                | FloatSub { .. }
+                | FloatMul { .. }
+                | FloatNeg { .. }
+                | Cmp { .. }
+                | FCmp { .. }
+                | IntToFloat { .. }
+                | BoolAnd { .. }
+                | BoolOr { .. }
+                | BoolNot { .. }
+                | CopyCol { .. }
+                | Emit { .. }
+                | EmitNull { .. } => {}
+            }
+        }
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
 // String comparison helpers (column vs constant)
 // ---------------------------------------------------------------------------
 
+/// 4-byte prefix of `s` as big-endian u32 for ordered comparison. Short strings
+/// zero-pad on the right so integer `<`/`>` matches lexicographic byte order.
+pub(in crate::expr) fn compute_prefix(s: &[u8]) -> u32 {
+    let mut buf = [0u8; 4];
+    let n = s.len().min(4);
+    buf[..n].copy_from_slice(&s[..n]);
+    u32::from_be_bytes(buf)
+}
+
 /// Compare a German String column value against a constant byte string.
-/// Returns Ordering.
 pub(in crate::expr) fn compare_col_string_vs_const(
     struct_bytes: &[u8],
     blob: &[u8],
@@ -647,11 +994,8 @@ pub(in crate::expr) fn compare_col_string_vs_const(
     let c_len = const_len as usize;
     let min_len = col_len.min(c_len);
 
-    // Single big-endian integer comparison of the 4-byte prefix.
-    // Both sides zero-pad bytes beyond their actual length, so no masking
-    // is needed: short strings naturally sort below longer ones with the
-    // same prefix, and the zero padding never causes false equality when
-    // lengths differ (the trailing length comparison resolves that).
+    // Single big-endian integer comparison of the 4-byte prefix. Both sides
+    // zero-pad bytes beyond their length, so no masking is needed.
     let col_pfx = u32::from_be_bytes(struct_bytes[4..8].try_into().unwrap());
     if col_pfx != const_prefix {
         return col_pfx.cmp(&const_prefix);

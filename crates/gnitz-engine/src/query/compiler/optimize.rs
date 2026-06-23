@@ -125,17 +125,17 @@ pub(super) fn annotate(loaded: &LoadedCircuit, ext_tables: &[ExternalTable]) -> 
 #[allow(clippy::vec_box)]
 pub(super) fn split_fold_programs(
     rw: Rewrites,
-    progs: Vec<Box<ExprProgram>>,
+    progs: Vec<Box<LogicalProgram>>,
     pre_nids: &HashSet<i32>,
-) -> (Rewrites, Vec<Box<ExprProgram>>, Rewrites, Vec<Box<ExprProgram>>) {
+) -> (Rewrites, Vec<Box<LogicalProgram>>, Rewrites, Vec<Box<LogicalProgram>>) {
     // Invert fold_finalize: old program index → reduce_nid
     let mut idx_to_nid: HashMap<usize, i32> = HashMap::new();
     for (&nid, &idx) in &rw.fold_finalize {
         idx_to_nid.insert(idx, nid);
     }
 
-    let mut pre_progs: Vec<Box<ExprProgram>> = Vec::new();
-    let mut post_progs: Vec<Box<ExprProgram>> = Vec::new();
+    let mut pre_progs: Vec<Box<LogicalProgram>> = Vec::new();
+    let mut post_progs: Vec<Box<LogicalProgram>> = Vec::new();
     let mut pre_fold: HashMap<i32, usize> = HashMap::new();
     let mut post_fold: HashMap<i32, usize> = HashMap::new();
 
@@ -178,11 +178,16 @@ pub(super) fn opt_distinct(loaded: &LoadedCircuit, ann: &Annotation, rw: &mut Re
     }
 }
 
+/// Fold budget: inline a finalize MAP into its reduce node only when its program
+/// is at most this many instructions; larger finalize MAPs stay a separate node
+/// so a reduce op never carries an unbounded inline program.
+const MAX_FOLD_FINALIZE_INSTRS: usize = 15;
+
 #[allow(clippy::vec_box, clippy::ptr_arg)]
 pub(super) fn opt_fold_reduce_map(
     loaded: &LoadedCircuit,
     rw: &mut Rewrites,
-    owned_expr_progs: &mut Vec<Box<ExprProgram>>,
+    owned_expr_progs: &mut Vec<Box<LogicalProgram>>,
 ) {
     for (&nid, op) in &loaded.nodes {
         let blob = match op {
@@ -207,8 +212,7 @@ pub(super) fn opt_fold_reduce_map(
             Some(d) => d,
             None => continue,
         };
-        let code: Vec<i64> = dep.code.iter().map(|&w| w as i64).collect();
-        let prog = ExprProgram::new(code, dep.num_regs, 0, Vec::new());
+        let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, Vec::new());
         // Skip folding any clean block copy regardless of offset; the
         // authoritative identity-MAP elision below (with the schema-checked PK
         // offset) handles it. No register schema exists in this early pass, so we
@@ -216,7 +220,7 @@ pub(super) fn opt_fold_reduce_map(
         if prog.sequential_copy_base().is_some() {
             continue;
         }
-        if prog.code.len() <= 63 {
+        if prog.len() <= MAX_FOLD_FINALIZE_INSTRS {
             let idx = owned_expr_progs.len();
             owned_expr_progs.push(Box::new(prog));
             rw.fold_finalize.insert(reduce_nid, idx);
