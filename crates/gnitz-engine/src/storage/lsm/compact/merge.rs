@@ -2,9 +2,9 @@
 //!
 //! Opens the input shards, builds per-shard cursors + the keyless loser tree,
 //! and runs the fused merge + inline consolidation loop through `drive_merge`
-//! (§8 cluster-1 — the sole pending-group drain owner). The
-//! `with_payload_cmp!` / `with_pk_ord!` dispatch selects the payload comparator
-//! then the stride once each, never per comparison, so the inner loop is fully
+//! (§8 cluster-1 — the sole pending-group drain owner). The `with_payload_cmp!`
+//! dispatch selects the payload comparator once, never per comparison, and
+//! `compare_pk_ordering` settles the PK axis, so the inner loop is fully
 //! monomorphised. `merge_and_route` is the routing-aware merge that splits the
 //! consolidated stream across the guard buckets.
 

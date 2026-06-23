@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
-use super::columnar::{with_payload_cmp, with_pk_ord, ColumnarSource, PkOrd, SortEntry};
+use super::columnar::{compare_pk_ordering, with_payload_cmp, ColumnarSource, SortEntry};
 // `columnar` as a module path is needed only by the test module's
 // `compare_pk_bytes`/`compare_rows` calls; dispatch uses `with_payload_cmp!`.
 #[cfg(test)]
@@ -469,12 +469,13 @@ pub(crate) use crate::schema::key::{pack_pk_be, pk_sort_key};
 /// matching rows inside one sorted source) and cross-source duplicates in one
 /// pass.
 ///
-/// Builds the payload (outer) → stride (inner) comparator tower once via
-/// `with_payload_cmp!` / `with_pk_ord!`, seats one [`PosCursor`] per source
-/// (skipping leading ghosts via [`MergeSource::next_non_ghost`]), and drives
-/// `drive_merge`. `emit(group_src, group_row, net_weight)` fires once per
-/// surviving (net ≠ 0) group; the caller turns `(src, row)` into its output (a
-/// `DirectWriter` row for flush, a guard-routed shard append for compaction).
+/// Builds the payload comparator once via `with_payload_cmp!`, seats one
+/// [`PosCursor`] per source (skipping leading ghosts via
+/// [`MergeSource::next_non_ghost`]), and drives `drive_merge`; the PK axis is
+/// settled by `compare_pk_ordering` (one byte comparator at every width).
+/// `emit(group_src, group_row, net_weight)` fires once per surviving (net ≠ 0)
+/// group; the caller turns `(src, row)` into its output (a `DirectWriter` row for
+/// flush, a guard-routed shard append for compaction).
 pub(crate) fn run_merge<S: ColumnarSource + MergeSource>(
     sources: &[S],
     schema: &SchemaDescriptor,
@@ -491,45 +492,29 @@ pub(crate) fn run_merge<S: ColumnarSource + MergeSource>(
         })
         .collect();
 
-    // Dispatch the payload comparator (outer) then the stride comparator (inner),
-    // each monomorphizing its own branch-free copy of the merge loop.
-    with_payload_cmp!(schema, run_merge_payload, sources, &mut cursors, schema, emit)
-}
-
-/// Payload-dispatch layer; defers to the stride dispatch in `run_merge_pk`.
-#[inline]
-fn run_merge_payload<S, RowCmp>(
-    sources: &[S],
-    cursors: &mut [PosCursor],
-    schema: &SchemaDescriptor,
-    emit: impl FnMut(usize, usize, i64),
-    row_cmp: RowCmp,
-) where
-    S: ColumnarSource + MergeSource,
-    RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy,
-{
-    with_pk_ord!(schema, run_merge_pk, sources, cursors, schema, emit, row_cmp)
+    // Dispatch the payload comparator, monomorphizing one branch-free copy of the
+    // merge loop; the PK axis is `compare_pk_ordering` (no stride dispatch).
+    with_payload_cmp!(schema, run_merge_body, sources, &mut cursors, schema, emit)
 }
 
 /// N-way merge closure builder + driver. The keyless heap reads each player's
-/// OPK bytes through `(source_idx, row)`: the stride-dispatched `pk_ord` settles
-/// the PK axis, then the payload `row_cmp`. `same_pk` is the width-agnostic OPK
-/// byte equality (so two distinct wide PKs sharing a 16-byte prefix never fold);
-/// `eq_payload` is the payload term. Monomorphised per (source, payload, stride)
-/// so `drive_merge`'s hot loop stays branch-free; the no-op `next_non_ghost` on a
-/// ghost-free source inlines the advance to `position + 1`.
+/// OPK bytes through `(source_idx, row)`: `compare_pk_ordering` settles the PK
+/// axis (one byte comparator at every width), then the payload `row_cmp`.
+/// `same_pk` is the width-agnostic OPK byte equality (so two distinct wide PKs
+/// sharing a 16-byte prefix never fold); `eq_payload` is the payload term.
+/// Monomorphised per (source, payload) so `drive_merge`'s hot loop stays
+/// branch-free; the no-op `next_non_ghost` on a ghost-free source inlines the
+/// advance to `position + 1`.
 #[inline]
-fn run_merge_pk<S, RowCmp, PK>(
+fn run_merge_body<S, RowCmp>(
     sources: &[S],
     cursors: &mut [PosCursor],
     schema: &SchemaDescriptor,
     mut emit: impl FnMut(usize, usize, i64),
     row_cmp: RowCmp,
-    pk_ord: PK,
 ) where
     S: ColumnarSource + MergeSource,
     RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy,
-    PK: PkOrd,
 {
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
@@ -537,7 +522,7 @@ fn run_merge_pk<S, RowCmp, PK>(
     let less = |a: &HeapNode, b: &HeapNode| -> bool {
         let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
         let (b_src, b_row) = (b.source_idx as usize, b.row as usize);
-        match pk_ord.cmp(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
+        match compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
             Ordering::Less => true,
             Ordering::Greater => false,
             Ordering::Equal => row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less,
@@ -768,6 +753,62 @@ mod tests {
         // PK region is OPK (order-preserving big-endian); widen_pk_be recovers
         // the native unsigned value from the right-aligned BE bytes.
         gnitz_wire::widen_pk_be(&out_pk[i * stride..(i + 1) * stride], stride)
+    }
+
+    /// Build a large sorted `(PK | I64)` batch with a high duplicate-PK rate:
+    /// `dup` consecutive rows share a PK (distinct ascending payloads), so the
+    /// merge's equal-PK tiebreak (`compare_pk_bytes` after the `pack_pk_be` prefix
+    /// ties) and per-compare length branch are on the measured path. The schema's
+    /// `pk_stride` selects the width.
+    fn bench_sorted_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -> Batch {
+        let mut b = Batch::with_schema(*schema, n.max(1));
+        for i in 0..n {
+            b.extend_pk((i / dup) as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &(i as i64).to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    /// Throughput of `run_merge`'s comparator-driven N-way merge at stride 8 and
+    /// 16 with a high duplicate-PK rate, using a cheap emit (no `write_row`) so the
+    /// measured cost is the loser-tree compare loop, not row materialization. A
+    /// regression guard for `compare_pk_ordering` (the merge has no `current_key`,
+    /// so this is the comparator change undiluted).
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+    fn run_merge_dup_pk_bench() {
+        use std::time::Instant;
+        const K: usize = 4;
+        const N: usize = 200_000;
+        const DUP: usize = 8;
+        const ITERS: usize = 20;
+        let s8 = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        for (label, schema) in [("stride8", s8), ("stride16", make_schema_i64())] {
+            let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_batch(&schema, N, DUP)).collect();
+            let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
+            let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
+            let mut sink = 0i64;
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                run_merge(&sorted, &schema, |_s, _r, w| {
+                    sink = sink.wrapping_add(std::hint::black_box(w));
+                });
+            }
+            let secs = t.elapsed().as_secs_f64();
+            std::hint::black_box(sink);
+            let rows = K * N;
+            let rps = (ITERS as f64 * rows as f64) / secs;
+            println!("run_merge_{label}: {rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
+        }
     }
 
     // Takes &[Batch] so test call sites don't need to construct SortedMemBatch.

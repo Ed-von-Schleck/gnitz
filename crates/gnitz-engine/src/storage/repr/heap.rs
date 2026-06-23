@@ -18,8 +18,8 @@
 //! `(source_idx, row)` (and tie-breaks on payload from the same pair), so the
 //! comparator captures only immutable references and never collides with a
 //! `&mut cursors` borrow held elsewhere in the merge driver. There is no cached
-//! sort key: OPK byte order *is* the order at every PK width, and the comparator
-//! loads those bytes register-cheap via the caller's stride dispatch.
+//! sort key: OPK byte order *is* the order at every PK width, so the comparator
+//! (`compare_pk_ordering`) reads each player's bytes straight from its source.
 //!
 //! No `pos_map`. No caller advances a non-root entry: ReadCursor folds
 //! tied rows by repeatedly popping/replacing the root; merge_batches

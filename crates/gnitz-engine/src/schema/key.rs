@@ -31,6 +31,24 @@ pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
 }
 
+/// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
+/// comparator the N-way merge and the read-cursor loser tree read through their
+/// sources. Returns the same `Ordering` as `compare_pk_bytes` at every width,
+/// settling the common case on the leading-16 `pack_pk_be` image. For `len ≤ 16`
+/// that image is the *whole* PK and is injective, so a `pack_pk_be` tie is
+/// already a byte-equal PK — the byte
+/// compare is skipped (it would be a guaranteed-`Equal` `memcmp`). Only `len > 16`
+/// can tie on the 16-byte prefix while differing later, so the full-byte
+/// `compare_pk_bytes` tiebreak runs only there. No stride / `pk_is_wide` dispatch.
+#[inline(always)]
+pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
+    debug_assert_eq!(a.len(), b.len(), "compare_pk_ordering on unequal PK widths");
+    match pack_pk_be(a).cmp(&pack_pk_be(b)) {
+        Ordering::Equal if a.len() > 16 => compare_pk_bytes(a, b),
+        ord => ord,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Order-preserving PK encoder
 // ---------------------------------------------------------------------------
@@ -117,15 +135,26 @@ pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
 /// the order-preserving leading-16 prefix (authoritative whenever two prefixes
 /// differ; a prefix collision needs a `compare_pk_bytes` tiebreak).
 ///
+/// The `{8, 16}` arms load the dominant `U64`/`U128` widths straight into a
+/// register, value-equal to the pad-and-copy (8 bytes occupy the high 64 bits,
+/// low 64 zero) — pinned by `pack_pk_be_specialization_matches_naive`. The
+/// wildcard arm covers 1/2/4-byte scalars and wide prefixes.
+///
 /// NOT a value accessor — for a U64 OPK value 1 (`[0,…,0,1]` at `[..8]`) this
 /// packs as `1·2^64`, not 1. Sibling of `pack_pk_le`, opposite alignment from
 /// `gnitz_wire::widen_pk_be` (right-aligned value recovery); never conflate them.
 #[inline(always)]
 pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
-    let take = pk_bytes.len().min(16);
-    let mut buf = [0u8; 16];
-    buf[..take].copy_from_slice(&pk_bytes[..take]);
-    u128::from_be_bytes(buf)
+    match pk_bytes.len() {
+        8 => (u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128) << 64,
+        16 => u128::from_be_bytes(pk_bytes[..16].try_into().unwrap()),
+        len => {
+            let take = len.min(16);
+            let mut buf = [0u8; 16];
+            buf[..take].copy_from_slice(&pk_bytes[..take]);
+            u128::from_be_bytes(buf)
+        }
+    }
 }
 
 /// Order-preserving sort key for a PK region. After the OPK-at-rest flip the PK
@@ -572,6 +601,28 @@ mod tests {
         let buf = vec![0x7Fu8; 16];
         assert_eq!(cmp_pk_le(&s, &buf, &buf), Ordering::Equal);
         assert_opk_equivalence(&s, &buf, &buf);
+    }
+
+    /// The specialized `{8, 16}` register-load arms of `pack_pk_be` must be
+    /// byte-value-identical to the generic pad-and-copy at every width — a
+    /// changed value would silently corrupt every `pack_pk_be` consumer (the
+    /// cached sort keys, the route/guard keys, the bloom probes).
+    #[test]
+    fn pack_pk_be_specialization_matches_naive() {
+        fn naive(pk: &[u8]) -> u128 {
+            let take = pk.len().min(16);
+            let mut buf = [0u8; 16];
+            buf[..take].copy_from_slice(&pk[..take]);
+            u128::from_be_bytes(buf)
+        }
+        for width in [1usize, 2, 4, 8, 16, 24, 80] {
+            for seed in 0u32..256 {
+                let bytes: Vec<u8> = (0..width)
+                    .map(|i| seed.wrapping_mul(31).wrapping_add(i as u32) as u8)
+                    .collect();
+                assert_eq!(pack_pk_be(&bytes), naive(&bytes), "width {width} seed {seed}");
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

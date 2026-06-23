@@ -10,7 +10,7 @@ mod lsm;
 
 // L2 representation lives under `repr/`. It has no facade of its own; the leaf
 // items are re-exported below and the submodules aliased here so the LSM siblings
-// keep their `super::<mod>` paths and the in-storage `with_pk_ord!` /
+// keep their `super::<mod>` paths and the in-storage `with_payload_cmp!` /
 // `crate::storage::batch_pool` paths resolve without touching the moved bodies.
 mod repr;
 pub(crate) use repr::batch_pool;

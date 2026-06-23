@@ -9,11 +9,11 @@ use std::ptr;
 use std::rc::Rc;
 
 use super::batch::Batch;
-use super::columnar::PkOrd;
+use super::columnar::compare_pk_ordering;
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::UnifiedSource;
 use super::shard_reader::MappedShard;
-use super::{with_pk_ord, with_row_cmp};
+use super::with_row_cmp;
 use crate::schema::SchemaDescriptor;
 
 mod handle;
@@ -120,10 +120,6 @@ pub struct ReadCursor {
     is_pk_unique: bool,
     // Current row state
     pub valid: bool,
-    /// The current row's PK as a native `u128`, populated only for narrow PKs
-    /// (`pk_stride ≤ 16`); `None` for wide PKs, whose consumers read
-    /// `current_pk_bytes()` and compare via `compare_pk_bytes`.
-    pub current_key: Option<u128>,
     pub current_weight: i64,
     pub current_null_word: u64,
     current_entry_idx: usize,
@@ -136,26 +132,24 @@ trait RowComparator: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, 
 impl<F> RowComparator for F where F: Fn(&SchemaDescriptor, &CursorSource, usize, &CursorSource, usize) -> Ordering + Copy
 {}
 
-/// The full loser-tree order — the stride-dispatched OPK byte order (`pk_ord`),
-/// then the payload `row_cmp`. The **single** source of truth for "which head
-/// sorts first": the tree build, every `drive`, and the forward-seek fast path
-/// all key the heap through it, so a tree maintained in place can never order
-/// rows differently from how it was built. `pk_ord.cmp` on each player's full OPK
-/// bytes (read straight from its source via `(source_idx, row)`) is exact at
-/// every width — no cached key, no wide-prefix tie-break. All-PkUnique callers
-/// pass a trivial `|_, _, _, _, _| Ordering::Equal` (a PK tie ⇒ the same Z-set
-/// element).
+/// The full loser-tree order — the OPK byte order (`compare_pk_ordering`), then
+/// the payload `row_cmp`. The **single** source of truth for "which head sorts
+/// first": the tree build, every `drive`, and the forward-seek fast path all key
+/// the heap through it, so a tree maintained in place can never order rows
+/// differently from how it was built. `compare_pk_ordering` on each player's full
+/// OPK bytes (read straight from its source via `(source_idx, row)`) is exact at
+/// every width — no cached key, no stride dispatch. All-PkUnique callers pass a
+/// trivial `|_, _, _, _, _| Ordering::Equal` (a PK tie ⇒ the same Z-set element).
 #[inline]
-fn heap_less_with<'a, PK: PkOrd + 'a, RowCmp: RowComparator + 'a>(
+fn heap_less_with<'a, RowCmp: RowComparator + 'a>(
     schema: &'a SchemaDescriptor,
     sources: &'a [CursorSource],
-    pk_ord: PK,
     row_cmp: RowCmp,
 ) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a {
     move |a, b| {
         let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
         let (b_src, b_row) = (b.source_idx as usize, b.row as usize);
-        match pk_ord.cmp(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
+        match compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
             Ordering::Less => true,
             Ordering::Greater => false,
             Ordering::Equal => row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less,
@@ -164,33 +158,20 @@ fn heap_less_with<'a, PK: PkOrd + 'a, RowCmp: RowComparator + 'a>(
 }
 
 impl ReadCursor {
+    /// Builds the loser tree under the selected `row_cmp` (the `with_row_cmp!`
+    /// layer hands it a monomorphized comparator). Keyless leaf: it carries only
+    /// the row index; the comparator reads each player's OPK bytes through
+    /// `(source_idx, row)` — `compare_pk_ordering`, then the payload tiebreak — the
+    /// shared `heap_less_with` order the drive and forward-seek paths reuse.
     #[inline]
-    fn build_tree_with<RowCmp: RowComparator, PK: PkOrd>(
+    fn build_tree_with<RowCmp: RowComparator>(
         sources: &[CursorSource],
         states: &[CursorState],
         schema: &SchemaDescriptor,
         row_cmp: RowCmp,
-        pk_ord: PK,
     ) -> LoserTree {
-        // Keyless leaf: it carries only the row index. The comparator reads each
-        // player's OPK bytes through `(source_idx, row)` — the stride-dispatched
-        // `pk_ord`, then the payload tiebreak — the shared `heap_less_with` order
-        // the drive and forward-seek paths reuse.
         let init = |i: usize| states[i].is_valid().then(|| states[i].position as u32);
-        LoserTree::build(sources.len(), init, heap_less_with(schema, sources, pk_ord, row_cmp))
-    }
-
-    /// The stride-dispatch layer: threads the selected `row_cmp` through
-    /// `with_pk_ord!` into `build_tree_with`. Split out so the comparator macros
-    /// (`with_row_cmp!` / `with_payload_cmp!`) can hand it a monomorphized `row_cmp`.
-    #[inline]
-    fn build_tree_with_payload<RowCmp: RowComparator>(
-        sources: &[CursorSource],
-        states: &[CursorState],
-        schema: &SchemaDescriptor,
-        row_cmp: RowCmp,
-    ) -> LoserTree {
-        with_pk_ord!(schema, Self::build_tree_with, sources, states, schema, row_cmp)
+        LoserTree::build(sources.len(), init, heap_less_with(schema, sources, row_cmp))
     }
 
     fn build_tree(
@@ -199,16 +180,9 @@ impl ReadCursor {
         schema: &SchemaDescriptor,
         is_pk_unique: bool,
     ) -> LoserTree {
-        // `with_row_cmp!` selects the comparator; `build_tree_with_payload` then
-        // dispatches the stride.
-        with_row_cmp!(
-            schema,
-            is_pk_unique,
-            Self::build_tree_with_payload,
-            sources,
-            states,
-            schema
-        )
+        // `with_row_cmp!` selects the payload comparator; the PK axis is
+        // `compare_pk_ordering` (no stride dispatch).
+        with_row_cmp!(schema, is_pk_unique, Self::build_tree_with, sources, states, schema)
     }
 
     fn new(sources: Vec<CursorSource>, states: Vec<CursorState>, schema: SchemaDescriptor) -> Self {
@@ -232,7 +206,6 @@ impl ReadCursor {
             schema,
             is_pk_unique,
             valid: false,
-            current_key: None,
             current_weight: 0,
             current_null_word: 0,
             current_entry_idx: 0,
@@ -278,7 +251,7 @@ impl ReadCursor {
     /// Byte-addressed sibling of [`seek`]. `key` must be exactly `pk_stride`
     /// OPK bytes (the bytes from `get_pk_bytes`/`current_pk_bytes`). Correct at
     /// every PK width and signedness: the inner `drive`/`build_tree` key the
-    /// heap via the stride-dispatched `pk_ord` over the full OPK bytes, so this
+    /// heap via `compare_pk_ordering` over the full OPK bytes, so this
     /// survives `pk_stride > 16` where the u128 `seek` cannot.
     pub fn seek_bytes(&mut self, key: &[u8]) {
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
@@ -334,30 +307,25 @@ impl ReadCursor {
         with_row_cmp!(self.schema, self.is_pk_unique, Self::seek_forward_multi_with, self, key);
     }
 
-    /// Gallop the heads forward with the selected `row_cmp`, then drive; threads
-    /// `row_cmp` through `with_pk_ord!` for the stride dispatch.
+    /// Gallop the heads forward with the selected `row_cmp`, then drive. The PK
+    /// axis is `compare_pk_ordering` (no stride dispatch).
     #[inline]
     fn seek_forward_multi_with<RowCmp: RowComparator>(&mut self, key: &[u8], row_cmp: RowCmp) {
-        with_pk_ord!(self.schema, Self::seek_forward_multi_both, self, key, row_cmp);
-    }
-
-    #[inline]
-    fn seek_forward_multi_both<RowCmp: RowComparator, PK: PkOrd>(&mut self, key: &[u8], row_cmp: RowCmp, pk_ord: PK) {
-        self.gallop_heap_forward(key, pk_ord, row_cmp);
-        self.drive_with_inner(row_cmp, pk_ord);
+        self.gallop_heap_forward(key, row_cmp);
+        self.drive_with_inner(row_cmp);
     }
 
     /// Maintain the `Multi` loser tree in place while galloping its heads forward
-    /// to `key`, keyed by the shared `heap_less_with(.., pk_ord, row_cmp)` order.
-    /// Scoping the heap/sources/states borrows to this call frees `self` for the
-    /// caller's following `drive`. Precondition: `matches!(self.mode, SourceMode::Multi)`.
-    fn gallop_heap_forward<PK: PkOrd, RowCmp: RowComparator>(&mut self, key: &[u8], pk_ord: PK, row_cmp: RowCmp) {
+    /// to `key`, keyed by the shared `heap_less_with(.., row_cmp)` order. Scoping
+    /// the heap/sources/states borrows to this call frees `self` for the caller's
+    /// following `drive`. Precondition: `matches!(self.mode, SourceMode::Multi)`.
+    fn gallop_heap_forward<RowCmp: RowComparator>(&mut self, key: &[u8], row_cmp: RowCmp) {
         let heap = match &mut self.mode {
             SourceMode::Multi(h) => h,
             _ => unreachable!("gallop_heap_forward requires SourceMode::Multi"),
         };
-        let less = heap_less_with(&self.schema, &self.sources, pk_ord, row_cmp);
-        Self::seek_phase(heap, &self.sources, &mut self.states, key, pk_ord, &less);
+        let less = heap_less_with(&self.schema, &self.sources, row_cmp);
+        Self::seek_phase(heap, &self.sources, &mut self.states, key, &less);
     }
 
     /// Advance every laggard head (OPK `< key`) to its own `lower_bound(key)`,
@@ -367,24 +335,22 @@ impl ReadCursor {
     /// the loop touches at most `num_sources` leaves and always terminates. On
     /// return every head is `>= key`, leaving the tree positioned exactly as a
     /// from-scratch rebuild at `key` would; the caller's `drive` then folds the
-    /// first live group. `key` is exactly `pk_stride` OPK bytes; `pk_ord` is the
-    /// stride-dispatched OPK comparator.
-    fn seek_phase<PK: PkOrd>(
+    /// first live group. `key` is exactly `pk_stride` OPK bytes; the PK axis is
+    /// `compare_pk_ordering`.
+    fn seek_phase(
         heap: &mut LoserTree,
         sources: &[CursorSource],
         states: &mut [CursorState],
         key: &[u8],
-        pk_ord: PK,
         less: &impl Fn(&HeapNode, &HeapNode) -> bool,
     ) {
         while !heap.is_empty() {
             let HeapNode { source_idx: src, row } = *heap.peek();
             let (src, row) = (src as usize, row as usize);
             // The root is the global min, so once its OPK bytes reach `key` every
-            // head has. `pk_ord.cmp` compares the full stride bytes — exact at
-            // every width, so no wide-prefix recheck. Otherwise the root lags;
-            // gallop it forward.
-            if pk_ord.cmp(sources[src].get_pk_bytes(row), key) != Ordering::Less {
+            // head has. `compare_pk_ordering` compares the full stride bytes —
+            // exact at every width. Otherwise the root lags; gallop it forward.
+            if compare_pk_ordering(sources[src].get_pk_bytes(row), key) != Ordering::Less {
                 break;
             }
             states[src].advance_to(&sources[src], key); // gallop this laggard
@@ -426,18 +392,23 @@ impl ReadCursor {
         self.valid && self.current_pk_eq(key) && self.current_weight > 0
     }
 
-    /// PK region of the current row as raw bytes, without copying. Byte-addressed
-    /// sibling of the `current_key` field; correct for compound/wide PKs.
+    /// PK region of the current row as raw bytes, without copying. The single PK
+    /// accessor for any width — correct for compound/wide PKs.
     pub fn current_pk_bytes(&self) -> &[u8] {
         self.sources[self.current_entry_idx].get_pk_bytes(self.current_row)
     }
 
-    /// The current row's PK as a native value. Only narrow (`pk_stride ≤ 16`)
-    /// relations populate `current_key`; panics on a wide-PK cursor (whose
-    /// consumers must read `current_pk_bytes()` instead).
+    /// The current row's PK as its native scalar value (right-aligned BE via
+    /// `widen_pk_be`). Only narrow (`pk_stride ≤ 16`) relations have a scalar PK;
+    /// the catalog sys-table readers (all narrow) call this. Decoded on demand
+    /// from the current row's OPK bytes — the cursor caches no scalar key. Gate on
+    /// `valid` first.
     #[inline]
     pub fn current_key_narrow(&self) -> u128 {
-        self.current_key.expect("narrow PK cursor")
+        debug_assert!(self.valid, "current_key_narrow on an invalid cursor");
+        let bytes = self.current_pk_bytes();
+        assert!(bytes.len() <= 16, "narrow PK cursor");
+        gnitz_wire::widen_pk_be(bytes, bytes.len())
     }
 
     /// Whether the current row's PK equals the group's OPK `key_bytes`. Callers
@@ -474,7 +445,7 @@ impl ReadCursor {
     fn walk_pk_group<F: FnMut(i64)>(&mut self, key: &[u8], mut f: F) {
         // Single bypass: a tight position scan reading only `get_weight` /
         // `get_pk_bytes` (the cursor-free floor's cost), skipping the per-row
-        // `current_*` materialization (`current_key` recompute, null word, …).
+        // `current_*` materialization (null word, entry idx, …).
         // The terminating `drive_single` commits the exit row so the
         // postcondition holds. This is the cogroup-benchmark's hot path.
         if matches!(self.mode, SourceMode::Single) {
@@ -537,17 +508,6 @@ impl ReadCursor {
     #[inline]
     pub fn current_pk_cmp_bytes(&self, key: &[u8]) -> Ordering {
         self.current_pk_bytes().cmp(key)
-    }
-
-    /// Compute the `current_key` field from a row's OPK bytes. Narrow PKs
-    /// (`stride ≤ 16`) recover the native (unsigned) value via right-aligned BE
-    /// — the form catalog readers expect (`current_key_narrow() as u64`). Wide
-    /// PKs (`stride > 16`) have no scalar key (`None`); their consumers read
-    /// `current_pk_bytes()` instead. `bytes.len()` is the row's `pk_stride`, so
-    /// `≤ 16` is exactly `!pk_is_wide()`.
-    #[inline]
-    fn current_key_from_bytes(bytes: &[u8]) -> Option<u128> {
-        (bytes.len() <= 16).then(|| gnitz_wire::widen_pk_be(bytes, bytes.len()))
     }
 
     /// Position the cursor at the first row whose PK begins with `prefix` and
@@ -622,13 +582,12 @@ impl ReadCursor {
 
     /// Commit (or invalidate from) the `(net_weight, source_idx, row)` a drive
     /// emitted (the `Single` bypass and every `Multi`/`Pair` driver route here).
-    /// `current_key` is recomputed from the row's PK bytes here (off the
-    /// comparator) to honour its native-value / wide-prefix contract.
+    /// The PK is tracked as `(current_entry_idx, current_row)`; `current_pk_bytes`
+    /// / `current_key_narrow` decode it on demand.
     #[inline]
     fn commit_emitted(&mut self, emitted: Option<(i64, usize, usize)>) {
         if let Some((weight, idx, row)) = emitted {
             self.valid = true;
-            self.current_key = Self::current_key_from_bytes(self.sources[idx].get_pk_bytes(row));
             self.current_weight = weight;
             self.current_entry_idx = idx;
             self.current_row = row;
@@ -642,8 +601,7 @@ impl ReadCursor {
     /// pre-consolidated and `CursorState::advance` already calls `skip_ghosts`
     /// for shard sources, so the state's current position is either valid
     /// emit-ready or past-end. Routes through `commit_emitted` so every mode
-    /// materializes `current_*` (and the `current_key_from_bytes` narrow/wide
-    /// contract) in one place.
+    /// materializes `current_*` in one place.
     #[inline]
     fn drive_single(&mut self) {
         let s = &self.states[0];
@@ -658,8 +616,7 @@ impl ReadCursor {
     /// (per stride and payload), and monomorphization compiles each combination to
     /// its own branch-free copy of the (selector-independent) advance/weight/emit
     /// hot loop. Returns the emitted group as `(weight, source_idx, row)`, or
-    /// `None` if drained — `current_key` is recomputed from PK bytes at the commit
-    /// point (`commit_emitted`), off the comparator.
+    /// `None` if drained.
     #[inline]
     fn drive_inner<L, SP, EQ>(
         heap: &mut LoserTree,
@@ -695,7 +652,8 @@ impl ReadCursor {
 
     /// Drive to the next group with the selected `row_cmp`. The single mode
     /// dispatch: Empty invalidates, Single/Pair take their bypass, and `Multi`
-    /// dispatches the stride (`with_pk_ord!`) into `drive_with_inner`.
+    /// drives the loser tree via `drive_with_inner`. The PK axis is
+    /// `compare_pk_ordering` (no stride dispatch).
     ///
     /// On the heap path `drive_merge` folds tied rows for us; we hand it `Break`
     /// from `emit` the first time we see a non-ghost group to return immediately.
@@ -706,15 +664,15 @@ impl ReadCursor {
         match self.mode {
             SourceMode::Empty => self.valid = false,
             SourceMode::Single => self.drive_single(),
-            SourceMode::Pair => with_pk_ord!(self.schema, Self::drive_pair_inner, self, row_cmp),
-            SourceMode::Multi(_) => with_pk_ord!(self.schema, Self::drive_with_inner, self, row_cmp),
+            SourceMode::Pair => self.drive_pair_inner(row_cmp),
+            SourceMode::Multi(_) => self.drive_with_inner(row_cmp),
         }
     }
 
-    /// `Multi` non-PkUnique drive, monomorphized on payload (`row_cmp`) and stride
-    /// (`pk_ord`). Precondition: `matches!(self.mode, SourceMode::Multi)`.
+    /// `Multi` non-PkUnique drive, monomorphized on payload (`row_cmp`).
+    /// Precondition: `matches!(self.mode, SourceMode::Multi)`.
     #[inline]
-    fn drive_with_inner<RowCmp: RowComparator, PK: PkOrd>(&mut self, row_cmp: RowCmp, pk_ord: PK) {
+    fn drive_with_inner<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         let heap = match &mut self.mode {
             SourceMode::Multi(h) => h,
             _ => unreachable!("drive_with_inner requires SourceMode::Multi"),
@@ -727,12 +685,12 @@ impl ReadCursor {
         // `&mut states`, so also capturing `&mut self.current_*` would force a
         // whole-`self` borrow. `commit_emitted` writes the tuple after it returns.
         //
-        // `less` is the shared `heap_less_with` order: the stride-dispatched OPK
-        // compare settles the PK axis, then the payload `row_cmp`. `same_pk` is the
+        // `less` is the shared `heap_less_with` order: `compare_pk_ordering`
+        // settles the PK axis, then the payload `row_cmp`. `same_pk` is the
         // width-agnostic OPK byte equality (so two distinct wide PKs sharing a
         // prefix never fold); `eq_payload` is now payload-only (the PK term is
         // `same_pk`).
-        let less = heap_less_with(schema, sources, pk_ord, row_cmp);
+        let less = heap_less_with(schema, sources, row_cmp);
         let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
             sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
         };
@@ -746,16 +704,16 @@ impl ReadCursor {
     /// Two-head merge bypass for `SourceMode::Pair` — the heap-free analogue of
     /// `drive_single`. Reads the two heads straight from `states[0]`/`states[1]`
     /// (no cached head positions, so the seek/rewind paths re-drive a Pair with no
-    /// special handling), merges by one stride-dispatched PK compare (`pk_ord`)
-    /// plus the payload `row_cmp` on a PK tie, folds equal `(PK, payload)` across
-    /// both heads, and skips ghost groups — committing the first live group's
-    /// exemplar. Consumes the emitted group (advances both heads past it), so the
-    /// next call opens the next group — the same postcondition `drive_with_inner`'s
-    /// heap fold leaves, which is why `advance` must NOT pre-step for a Pair.
-    /// Monomorphized on payload (`row_cmp`) and stride (`pk_ord`); PkUnique passes
-    /// the trivial `row_cmp` (equal PK ⇒ same element).
+    /// special handling), merges by one PK compare (`compare_pk_ordering`) plus the
+    /// payload `row_cmp` on a PK tie, folds equal `(PK, payload)` across both heads,
+    /// and skips ghost groups — committing the first live group's exemplar.
+    /// Consumes the emitted group (advances both heads past it), so the next call
+    /// opens the next group — the same postcondition `drive_with_inner`'s heap fold
+    /// leaves, which is why `advance` must NOT pre-step for a Pair. Monomorphized on
+    /// payload (`row_cmp`); PkUnique passes the trivial `row_cmp` (equal PK ⇒ same
+    /// element).
     #[inline]
-    fn drive_pair_inner<RowCmp: RowComparator, PK: PkOrd>(&mut self, row_cmp: RowCmp, pk_ord: PK) {
+    fn drive_pair_inner<RowCmp: RowComparator>(&mut self, row_cmp: RowCmp) {
         debug_assert!(matches!(self.mode, SourceMode::Pair));
         let schema = &self.schema;
         let sources = &self.sources;
@@ -782,7 +740,7 @@ impl ReadCursor {
             } else {
                 let p0 = sources[0].get_pk_bytes(states[0].position);
                 let p1 = sources[1].get_pk_bytes(states[1].position);
-                match pk_ord.cmp(p0, p1) {
+                match compare_pk_ordering(p0, p1) {
                     Ordering::Less => (0, p0, false),
                     Ordering::Greater => (1, p1, false),
                     Ordering::Equal => {
@@ -839,7 +797,8 @@ impl ReadCursor {
 
     /// Raw column pointer for the current row, indexed by LOGICAL column index.
     ///
-    /// Returns null for the PK column — use `current_key` instead.
+    /// Returns null for the PK column — use `current_key_narrow()` /
+    /// `current_pk_bytes()` instead.
     /// Returning only `pk_lo` for a 16-byte PK would silently truncate the
     /// high half regardless of backing source.
     pub fn col_ptr(&self, col_idx: usize, col_size: usize) -> *const u8 {
@@ -990,6 +949,19 @@ mod tests {
         SchemaDescriptor::new(
             &[
                 SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    /// `(U64 PK | I64 payload)` — stride-8, the dominant single-PK table shape.
+    /// Used by the stride-8 drive bench, which exercises `pack_pk_be`'s 8-byte
+    /// register arm and the u128-vs-u64 compare in `compare_pk_ordering`.
+    fn make_schema_u64() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
                 SchemaColumn::new(type_code::I64, 0),
             ],
             &[0],
@@ -1319,7 +1291,7 @@ mod tests {
     #[test]
     fn test_col_ptr_pk_returns_null() {
         // PK (logical col 0, pk_index=0) must always return null — callers read
-        // the PK through current_key instead.
+        // the PK through current_key_narrow()/current_pk_bytes() instead.
         let schema = make_schema_i64();
         let batch = make_batch(&[(42, 1, 99)]);
         let cursor = create_read_cursor(&[batch], &[], schema);
@@ -1440,7 +1412,6 @@ mod tests {
             fresh.seek_bytes(&key.to_be_bytes());
             assert_eq!(adv.valid, fresh.valid, "n_src={n} key={key}");
             if adv.valid {
-                assert_eq!(adv.current_key, fresh.current_key, "n_src={n} key={key}");
                 assert_eq!(adv.current_pk_bytes(), fresh.current_pk_bytes(), "n_src={n} key={key}");
                 assert_eq!(adv.current_weight, fresh.current_weight, "n_src={n} key={key}");
             }
@@ -1592,7 +1563,7 @@ mod tests {
         let b2 = make(2, 1, 200);
         let mut cursor = create_read_cursor(&[b1, b2], &[], schema);
 
-        // current_key for a stride-16 PK is widen_pk_be of the OPK bytes: the
+        // current_key_narrow() for a stride-16 PK is widen_pk_be of the OPK bytes: the
         // BE reading places col_A in the high 64 bits and col_B in the low.
         let mut emitted = Vec::new();
         while cursor.valid {
@@ -1887,7 +1858,6 @@ mod tests {
 
         assert_eq!(walked.valid, fresh.valid, "valid after walk(key={key})");
         if walked.valid {
-            assert_eq!(walked.current_key, fresh.current_key, "current_key key={key}");
             assert_eq!(
                 walked.current_pk_bytes(),
                 fresh.current_pk_bytes(),
@@ -2038,6 +2008,43 @@ mod tests {
         Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
     }
 
+    /// Stride-8 sibling of `write_test_shard`: `(U64 PK | I64 payload)`, 8-byte
+    /// big-endian PKs. A separate fn (not a stride param on `write_test_shard`)
+    /// so its 6 existing callers are untouched.
+    fn write_test_shard_u64(
+        dir: &tempfile::TempDir,
+        schema: &SchemaDescriptor,
+        idx: usize,
+        rows: &[(u64, i64, i64)],
+        flag: u8,
+    ) -> Rc<MappedShard> {
+        let pks: Vec<u8> = rows.iter().flat_map(|&(pk, _, _)| pk.to_be_bytes()).collect();
+        let weights: Vec<i64> = rows.iter().map(|&(_, w, _)| w).collect();
+        let nulls = vec![0u64; rows.len()];
+        let vals: Vec<i64> = rows.iter().map(|&(_, _, v)| v).collect();
+        let blob: Vec<u8> = Vec::new();
+        let regions: Vec<(*const u8, usize)> = vec![
+            (pks.as_ptr(), pks.len()),
+            (weights.as_ptr() as *const u8, weights.len() * 8),
+            (nulls.as_ptr() as *const u8, nulls.len() * 8),
+            (vals.as_ptr() as *const u8, vals.len() * 8),
+            (blob.as_ptr(), blob.len()),
+        ];
+        let path = dir.path().join(format!("rc8_{flag}_{idx}.db"));
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        super::super::shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            0,
+            rows.len() as u32,
+            &regions,
+            false,
+            flag,
+        )
+        .unwrap();
+        Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
+    }
+
     /// The PkUnique drive path (all sources flagged `is_pk_unique`, payload
     /// comparison skipped) and the payload path (same bytes, flag cleared) must
     /// produce identical output on contract-satisfying unique-PK data. Only the
@@ -2162,6 +2169,49 @@ mod tests {
         std::hint::black_box(sink);
         let rps = (ITERS as u128 * total_rows) as f64 / secs;
         println!("drive_pk_unique_multi: {total_rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
+    }
+
+    /// Stride-8 sibling of `read_cursor_drive_pk_unique_multi_bench` — the worst
+    /// case for `compare_pk_ordering` (the 8-byte `pack_pk_be` arm + the
+    /// u128-vs-u64 compare). Single `U64`/`I64` PKs are the dominant table shape;
+    /// this is the regression guard for the common-width loser-tree drive.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+    fn read_cursor_drive_pk_unique_multi_u64_bench() {
+        use std::time::Instant;
+        crate::foundation::posix_io::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64(); // U64 PK (stride 8) | I64 payload
+
+        const N_SHARDS: usize = 4;
+        const PER_SHARD: u64 = 200_000;
+        let flag = super::super::layout::SHARD_FLAG_PK_UNIQUE;
+        let shards: Vec<Rc<MappedShard>> = (0..N_SHARDS as u64)
+            .map(|s| {
+                let rows: Vec<(u64, i64, i64)> = (0..PER_SHARD).map(|i| (i * N_SHARDS as u64 + s, 1, 7)).collect();
+                write_test_shard_u64(&dir, &schema, s as usize, &rows, flag)
+            })
+            .collect();
+
+        let mut c = create_read_cursor(&[], &shards, schema);
+        assert!(c.is_pk_unique, "bench must drive the all-PkUnique path");
+        assert!(matches!(c.mode, SourceMode::Multi(_)), "bench must drive Multi");
+
+        const ITERS: usize = 20;
+        let total_rows = N_SHARDS as u64 * PER_SHARD;
+        let mut sink = 0i64;
+        let t = Instant::now();
+        for _ in 0..ITERS {
+            c.rewind();
+            while c.valid {
+                sink = sink.wrapping_add(std::hint::black_box(c.current_weight));
+                c.advance();
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        std::hint::black_box(sink);
+        let rps = (ITERS as u64 * total_rows) as f64 / secs;
+        println!("drive_pk_unique_multi_u64: {total_rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
     }
 
     /// A long-string struct (len > 12) whose blob offset overruns the (empty) blob

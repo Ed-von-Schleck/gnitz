@@ -550,8 +550,8 @@ impl CatalogEngine {
 fn copy_cursor_cols_to_batch(cursor: &CursorHandle, out: &mut Batch, src_schema: &SchemaDescriptor, project: &[u8]) {
     // `current_pk_bytes()` is the verbatim OPK PK region for any width, and the
     // read cursor always tracks it regardless of stride. For narrow PKs it
-    // equals `widen_pk_be(current_pk_bytes) == current_key.unwrap()`; for wide
-    // PKs (`current_key == None`) it is the only PK form, so one path serves both.
+    // equals `widen_pk_be(current_pk_bytes) == current_key_narrow()`; for wide
+    // PKs it is the only PK form, so one path serves both.
     out.extend_pk_bytes(cursor.cursor.current_pk_bytes());
     out.extend_weight(&1i64.to_le_bytes());
 
