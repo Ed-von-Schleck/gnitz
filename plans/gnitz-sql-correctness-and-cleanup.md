@@ -1,10 +1,10 @@
 # gnitz-sql correctness and cleanup
 
 A code-quality pass over `crates/gnitz-sql/src` (the SQL front end: parse → bind →
-plan/lower for views, or → execute for DML). The behavioural fixes that change query
-results or accepted DDL have shipped — the four correctness fixes C1–C4 and the two
-Theme A fixes A1–A2 (see the "— DONE" sections below); the nineteen remaining changes are
-ordered by leverage (impact × confidence ÷ effort) and grouped into themes — duplication,
+plan/lower for views, or → execute for DML). Shipped so far — the four correctness
+fixes C1–C4, the two Theme A fixes A1–A2, and the three Theme B view/binder refactors
+B2–B4 (see the "— DONE" sections below); the twelve remaining changes are ordered by
+leverage (impact × confidence ÷ effort) and grouped into themes — duplication,
 type-safety, and hygiene with no behavioural change unless noted.
 
 Every item names exact `file:line` anchors, the change (with code), the invariants
@@ -60,150 +60,37 @@ tests (`cargo test -p gnitz-sql --features integration`).
 
 ---
 
-## Theme B — Shared view-compile and predicate helpers
+## Theme B (B2–B4) — DONE
 
-Pure-DRY refactors in the view and binder clusters; generated programs are
-byte-identical unless noted.
+Shipped. Three pure-DRY refactors in the view-compile and binder clusters; circuits
+and `ExprProgram`s are byte-identical. Validated by `make verify`, the gated
+`cargo test -p gnitz-sql --features integration` planner suite (all suites green),
+and the W=4 `make e2e` distinct/set-op tests.
 
-### B1 — Extract the optional-WHERE-filter block (3 identical sites)
+- **B2** — `compile_bound_expr` (`lower.rs`) narrowed to return `u32`; the dead
+  `is_float` bit every external caller discarded is gone. New
+  `compile_bound_expr_to_program` collapses the fresh-builder "compile one BoundExpr
+  to a finished program" idiom at every WHERE/HAVING/residual site (`predicates`,
+  `simple`, `group_by`, `set_op`). The lone register-form caller (the `simple.rs`
+  projection-EMIT loop) keeps `compile_bound_expr`, detupled.
+- **B3** — `single_relation_col_name` (`ast_util.rs`) shares the single-relation
+  column-name AST match (`Identifier` | two-part `CompoundIdentifier`) between
+  `SingleTable::idx` (`bind/structural.rs`) and `Having::bind_column`
+  (`plan/view/group_by.rs`); each caller keeps its own error string and tail.
+- **B4** — `execute_create_distinct_view` (`plan/view/set_op.rs`) reuses
+  `compile_set_op_side`, deleting a ~30-line copy of the
+  resolve→WHERE→hash-reindex→shard pipeline. Circuit byte-identical: the reused path
+  uses `input_delta_tagged`, so `CircuitBuilder::new(view_id, 0)` is inert
+  (`primary_source_id` never enters the built `Circuit`; `dependencies()` derives
+  from `ScanDelta` nodes), exactly as the set-op view builder already does. To keep
+  per-caller error context, `compile_set_op_side` / `resolve_set_projection` gained a
+  `context: &str` arg (`"set operation"` vs `"SELECT DISTINCT"`), unifying the
+  FROM-shape / projection rejection messages.
 
-- **Files:** `plan/view/set_op.rs:33-41, 318-326`; `plan/view/group_by.rs:369-377`.
-  Leave `simple.rs:27-34`.
-- **Problem:** Three single-source view builders open-code a byte-identical block:
-  `bind_expr → new ExprBuilder → compile_bound_expr → eb.build(reg) → cb.filter(inp,
-  Some(prog)) else inp`. Any change to WHERE-filter lowering must edit three sites.
-- **Change:** Add a shared helper in a new `plan/view/common.rs` (`mod common;` in
-  `plan/view/mod.rs`):
-
-  ```rust
-  pub(crate) fn build_optional_filter(
-      binder: &mut Binder<'_>,
-      cb: &mut CircuitBuilder,
-      inp: gnitz_core::NodeId,
-      selection: Option<&sqlparser::ast::Expr>,
-      schema: &gnitz_core::Schema,
-  ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
-      let Some(where_expr) = selection else { return Ok(inp) };
-      let bound = binder.bind_expr(where_expr, schema)?;
-      Ok(cb.filter(inp, Some(compile_bound_expr_to_program(&bound, schema)?)))
-  }
-  ```
-
-  (uses B2's `compile_bound_expr_to_program`). Replace the three blocks with one
-  call each.
-- **Invariants:** Do not fold in `simple.rs:27-34` — it returns `Option<ExprProgram>`
-  and defers `cb.filter` because projection analysis and node ordering interpose. Do
-  not touch `group_by.rs:597-598` (post-reduce HAVING filter on `reduced`) or the
-  join filters.
-- **Effort:** S. **Value:** Low — the most-repeated exact block in the view cluster.
-- **Verify:** `make verify`; programs identical, no test change.
-
-### B2 — Add `compile_bound_expr_to_program` and narrow `compile_bound_expr` to `u32`
-
-Merges two findings at one boundary so the call sites are touched once.
-
-- **Files:** `lower.rs:281-291`; call sites `predicates.rs:78-80, 498-500`,
-  `simple.rs:29-31`, `group_by.rs:371-373, 595-597`, `set_op.rs:35-37, 320-322`.
-- **Problem:** (a) A 3-line "compile one BoundExpr to a finished `ExprProgram`,
-  discard `is_float`" idiom repeats verbatim at the single-expression sites. (b) The
-  public `compile_bound_expr` returns `Result<(u32, bool), _>`, exposing an
-  `is_float` bit meaningful only inside `OpcodeBackend`'s recursion; every external
-  caller discards it via `(reg, _)`. The internal `lower_bound_expr` walk — which
-  actually consumes float-ness — does not go through the public wrapper, so
-  narrowing it cannot affect float-cast logic.
-- **Change:** Narrow the wrapper and add the program helper:
-
-  ```rust
-  pub(crate) fn compile_bound_expr(
-      expr: &BoundExpr, schema: &Schema, eb: &mut ExprBuilder,
-  ) -> Result<u32, GnitzSqlError> {
-      let mut backend = OpcodeBackend { schema, eb };
-      lower_bound_expr(expr, &mut backend).map(|(reg, _)| reg)
-  }
-
-  pub(crate) fn compile_bound_expr_to_program(
-      expr: &BoundExpr, schema: &Schema,
-  ) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
-      let mut eb = ExprBuilder::new();
-      let reg = compile_bound_expr(expr, schema, &mut eb)?;
-      Ok(eb.build(reg))
-  }
-  ```
-
-  Replace the single-expression dances with `compile_bound_expr_to_program(…)`.
-  Multi-instruction register-form callers (projection EMIT at simple.rs:90,
-  post-reduce map at group_by.rs:418, copy_col reindex at join.rs:883 /
-  predicates.rs:89) keep `compile_bound_expr` and bind `let reg = …?;` (no longer a
-  tuple). Drop the `is_float` clause from the lower.rs:281-283 doc.
-- **Invariants:** Do not touch the internal `lower_bound_expr` recursion or
-  `binop`/`unop` float handling (`Out = (u32, bool)`). The BoundExprBackend
-  coverage-parity invariant is untouched. The simple.rs:90 EMIT path writes raw
-  register bits and needs no float bit (its line-91 comment).
-- **Effort:** S. **Value:** Low — DRY + API hygiene, zero behavioural change.
-- **Verify:** `make verify` (clippy is warnings-as-errors); programs identical.
-
-### B3 — Extract single-relation column-name extraction (WHERE/residual ∥ HAVING)
-
-- **Files:** `bind/structural.rs:168-176`; `plan/view/group_by.rs:865-880`.
-- **Problem:** The AST-shape extraction `Identifier(id) => &id.value` | 2-part
-  `CompoundIdentifier(p) => &p[1].value`, else error, is duplicated verbatim between
-  `SingleTable::idx` (structural.rs:169-173) and `Having::bind_column`
-  (group_by.rs:870-878). Both encode the same single-relation rule and feed
-  `find_unique_column`; only the error string and post-lookup handling
-  (Having's GROUP-BY membership + reduce-position remap) legitimately differ.
-- **Change:** Add a shared extractor (in `ast_util.rs`, or next to `SingleTable`)
-  returning only the bare name:
-
-  ```rust
-  /// Bare column name of a single-relation reference: a plain `Identifier`, or a
-  /// two-part `CompoundIdentifier` whose qualifier adds no disambiguation over a
-  /// single grouped/base relation. `None` for any other shape, so each caller can
-  /// raise its own context-specific error.
-  pub(crate) fn single_relation_col_name(e: &Expr) -> Option<&str> {
-      match e {
-          Expr::Identifier(id) => Some(&id.value),
-          Expr::CompoundIdentifier(p) if p.len() == 2 => Some(&p[1].value),
-          _ => None,
-      }
-  }
-  ```
-
-  Both sites call it via `.ok_or_else(|| <their own error>)?`, keeping their
-  distinct error strings and (for Having) the membership/remap tail.
-- **Invariants:** Do not fold in the `Expr::Identifier`-only `find_unique_column`
-  callers (dml/plan.rs:164/451/495, exec/batch.rs:35, ddl.rs:480/608,
-  group_by.rs:176/983) — they don't handle the compound case; a distinct simpler
-  fragment.
-- **Effort:** S. **Value:** Low — two-site DRY of an AST-shape rule that slipped past
-  the LeafBinder abstraction.
-- **Verify:** Existing WHERE/residual and HAVING binder tests pass; both shapes still
-  accepted.
-
-### B4 — Have `execute_create_distinct_view` reuse `compile_set_op_side`
-
-- **Files:** `plan/view/set_op.rs:297-360` (vs `15-61`).
-- **Problem:** `execute_create_distinct_view` (set_op.rs:297-360) duplicates the full
-  body of `compile_set_op_side` (15-61): the single-table/no-JOIN guard, `resolve`,
-  input-delta, optional WHERE filter, `resolve_set_projection`, `map_hash_row`, and
-  `shard([0])`; it then just appends `cb.distinct(sharded)`. The two differ only in
-  `CircuitBuilder::new(view_id, source_tid) + input_delta()` vs
-  `new(view_id, 0) + input_delta_tagged(source_tid)` — and these produce the
-  identical `ScanDelta(source_tid)` node (in gnitz-core, `primary_source_id` is
-  merely the implicit source for `input_delta()`; both emit `OPCODE_SCAN_DELTA` with
-  the source in the node row). Two copies of the hash-reindex-and-shard pipeline mean
-  a fix to one can miss the other.
-- **Change:** Build `cb` as `CircuitBuilder::new(view_id, 0)`, call
-  `compile_set_op_side(client, select, binder, &mut cb, 0)` for
-  `(sharded, proj_cols, _tid)`, then `cb.distinct(sharded)`, sink, and emit the
-  `_distinct_pk` U128 + `proj_cols` output schema as today.
-- **Invariants:** Circuit equivalence rests on the set-op path already using
-  `new(view_id, 0)` + `input_delta_tagged` for structurally-identical single-table
-  sides — `primary_source_id` is consumed only by `input_delta()`, which the reused
-  path does not call. The synthetic `_distinct_pk` name and the `&[0]` PK stay.
-- **Effort:** S. **Value:** Medium — removes a second copy of the
-  reindex-and-shard pipeline that can drift.
-- **Verify:** `make e2e K='distinct'` and the set-op E2E suite — both views still
-  compile and dedup correctly (multi-worker, to exercise the shard/exchange).
+**B1 was dropped** (extract the WHERE-filter block into a new `plan/view/common.rs`):
+after B2 each WHERE site is a 7-line `if-let-else`, so B1 would add a new file +
+module to dedup just two sites — not net-simpler, an additive wrapper the codebase
+avoids. The two inline WHERE blocks stay.
 
 ---
 
@@ -622,18 +509,15 @@ fixed once.
 
 ## Sequencing
 
-- **C1–C4** (correctness) — DONE; shipped independently of each other.
-- **B2** adds `compile_bound_expr_to_program` and narrows `compile_bound_expr`'s
-  return; **B1**'s `build_optional_filter` uses it — land B2 then B1.
-- **B4** depends on nothing else but exercises the shard path; run its E2E
-  multi-worker.
+- **C1–C4** (correctness) and **B2–B4** (view/binder DRY) — DONE; **B1 dropped**.
 - **D1** (TypeCode) and **D3** (`ColumnDef::new`) both touch join.rs:349-357 — land D1
   first so the column construction uses the typed `t` before D3 wraps it in
   `ColumnDef::new`.
 - **D2** (coordinate newtypes) is the largest item; land it after D1 so the join-key
   type plumbing is already simplified.
-- **F4** must follow **B1** and **C-DML-1** (both call `binder.bind_expr`), or update
-  those calls in the F4 edit.
+- **F4** (drop `&self` on `bind_expr`) must update every `binder.bind_expr` call site
+  in the same edit — the inline WHERE filters in the view builders (`set_op`,
+  `group_by`, `simple`) and **C-DML-1**'s usage.
 
 ---
 
