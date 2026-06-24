@@ -5,7 +5,7 @@
 //! clean error, not a table scan.
 
 use crate::ast_util::extract_table_factor_name;
-use crate::bind::Binder;
+use crate::bind::{bind_single_table, Binder};
 use crate::dml::plan::{
     collect_index_range_candidates, collect_index_seek_candidates, extract_limit, try_extract_pk_seek_residual,
 };
@@ -57,7 +57,7 @@ pub(crate) fn execute_select(
     let (schema_out, batch_opt, _) = if let Some(where_expr) = &select.selection {
         if let Some((pk, residual)) = try_extract_pk_seek_residual(where_expr, &schema) {
             let res = client.seek(tid, &pk)?;
-            residual_filtered(binder, &schema, res, &residual)?
+            residual_filtered(&schema, res, &residual)?
         } else {
             // Order: PK equality (above) → range index → equality index → error.
             // Try RANGE candidates first so a composite `a = 5 AND b > 10` uses the
@@ -81,7 +81,7 @@ pub(crate) fn execute_select(
             for cand in range_cands {
                 match client.seek_by_index_range(tid, cand.idx_cols.as_slice(), &cand.desc) {
                     Ok(res) => {
-                        hit = Some(residual_filtered(binder, &schema, res, &cand.residual)?);
+                        hit = Some(residual_filtered(&schema, res, &cand.residual)?);
                         break;
                     }
                     Err(ClientError::NoIndex) => continue,
@@ -98,7 +98,7 @@ pub(crate) fn execute_select(
                 for (col_indices, key_vals, residual) in candidates {
                     match client.seek_by_index(tid, col_indices.as_slice(), &key_vals) {
                         Ok(res) => {
-                            hit = Some(residual_filtered(binder, &schema, res, &residual)?);
+                            hit = Some(residual_filtered(&schema, res, &residual)?);
                             break;
                         }
                         Err(ClientError::NoIndex) => continue,
@@ -115,7 +115,7 @@ pub(crate) fn execute_select(
                     // view can carry two same-named columns) instead of the generic
                     // "non-indexed" message. Direct SELECT — unlike UPDATE/DELETE —
                     // has no predicate full-scan fallback that would bind it.
-                    binder.bind_expr(where_expr, &schema)?;
+                    bind_single_table(where_expr, &schema)?;
                     return Err(GnitzSqlError::Unsupported(
                         "WHERE on non-indexed column not supported in direct SELECT; \
                          use CREATE INDEX first, or CREATE VIEW for server-side filtering"

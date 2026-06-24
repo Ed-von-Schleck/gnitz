@@ -1699,20 +1699,8 @@ mod tests {
         // U8 column with value 200 must return 200, not -56 (sign-extension bug).
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "v".into(),
-                    type_code: TypeCode::U8,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("v", TypeCode::U8, false),
             ],
             pk_cols: vec![0],
         };
@@ -1735,20 +1723,8 @@ mod tests {
     fn batch_get_i64_signed_negative_i8() {
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "v".into(),
-                    type_code: TypeCode::I8,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("v", TypeCode::I8, false),
             ],
             pk_cols: vec![0],
         };
@@ -1902,20 +1878,8 @@ mod tests {
     fn test_get_string_interior_null_error() {
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "name".into(),
-                    type_code: TypeCode::String,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("name", TypeCode::String, false),
             ],
             pk_cols: vec![0],
         };
@@ -2091,20 +2055,8 @@ mod tests {
     fn test_batch_get_f64_reads_f32_col() {
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "v".into(),
-                    type_code: TypeCode::F32,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("v", TypeCode::F32, false),
             ],
             pk_cols: vec![0],
         };
@@ -2130,20 +2082,8 @@ mod tests {
     fn test_batch_get_f64_reads_f64_col() {
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "v".into(),
-                    type_code: TypeCode::F64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("v", TypeCode::F64, false),
             ],
             pk_cols: vec![0],
         };
@@ -2168,20 +2108,8 @@ mod tests {
     fn test_batch_get_f64_type_mismatch() {
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "v".into(),
-                    type_code: TypeCode::I64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("v", TypeCode::I64, false),
             ],
             pk_cols: vec![0],
         };

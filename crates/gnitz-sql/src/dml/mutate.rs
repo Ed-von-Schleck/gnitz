@@ -6,7 +6,7 @@
 //! `ON CONFLICT DO UPDATE`.
 
 use crate::ast_util::{extract_name, extract_table_factor_name};
-use crate::bind::Binder;
+use crate::bind::{bind_single_table, Binder};
 use crate::codec::colwrite::{append_column_value, ColumnValue};
 use crate::codec::nullmap::null_word_set;
 use crate::dml::plan::{classify_access, collect_index_seek_candidates, try_extract_pk_in, AccessPath};
@@ -185,7 +185,6 @@ fn resolve_where_rows(
     table_id: u64,
     schema: &Schema,
     selection: Option<&Expr>,
-    binder: &Binder<'_>,
 ) -> Result<ResolvedRows, GnitzSqlError> {
     match classify_access(selection, schema) {
         AccessPath::ScanAll => {
@@ -199,7 +198,7 @@ fn resolve_where_rows(
         }
         AccessPath::PkSeek { pk, residual } => {
             let (schema_opt, batch_opt, _) = client.seek(table_id, &pk)?;
-            resolve_residual_rows(binder, schema, schema_opt, batch_opt, &residual)
+            resolve_residual_rows(schema, schema_opt, batch_opt, &residual)
         }
         AccessPath::Filtered { where_expr } => {
             // Secondary-index equality seek: the first index that exists serves
@@ -210,7 +209,7 @@ fn resolve_where_rows(
             for (col_indices, key_vals, residual) in candidates {
                 match client.seek_by_index(table_id, col_indices.as_slice(), &key_vals) {
                     Ok((schema_opt, batch_opt, _)) => {
-                        return resolve_residual_rows(binder, schema, schema_opt, batch_opt, &residual);
+                        return resolve_residual_rows(schema, schema_opt, batch_opt, &residual);
                     }
                     Err(ClientError::NoIndex) => continue,
                     Err(e) => return Err(GnitzSqlError::Exec(e)),
@@ -220,7 +219,7 @@ fn resolve_where_rows(
             // Predicate full scan: no index served the WHERE. Bind the whole
             // predicate as a one-element residual and filter the scan through it.
             let (schema_opt, batch_opt, _) = client.scan(table_id)?;
-            resolve_residual_rows(binder, schema, schema_opt, batch_opt, &[where_expr])
+            resolve_residual_rows(schema, schema_opt, batch_opt, &[where_expr])
         }
     }
 }
@@ -229,14 +228,13 @@ fn resolve_where_rows(
 /// seek batch against the reply schema, and return the passing indices. An empty
 /// residual passes every row; an absent batch matches nothing.
 fn resolve_residual_rows(
-    binder: &Binder<'_>,
     schema: &Schema,
     schema_opt: Option<Arc<Schema>>,
     batch_opt: Option<ZSetBatch>,
     residual: &[&Expr],
 ) -> Result<ResolvedRows, GnitzSqlError> {
     let actual_schema = schema_opt.as_deref().unwrap_or(schema);
-    let preds = bind_residuals(binder, residual, schema)?;
+    let preds = bind_residuals(residual, schema)?;
     let matched = match &batch_opt {
         Some(batch) => matching_indices(&preds, batch, actual_schema)?,
         None => Vec::new(),
@@ -277,11 +275,11 @@ pub(crate) fn execute_update(
     let mut seen: Vec<usize> = Vec::with_capacity(assignments_raw.len());
     for assignment in assignments_raw {
         let col_idx = resolve_set_target(assignment, &schema, &mut seen, "UPDATE SET")?;
-        let bound_val = binder.bind_expr(&assignment.value, &schema)?;
+        let bound_val = bind_single_table(&assignment.value, &schema)?;
         assignments.push((col_idx, bound_val));
     }
 
-    let resolved = resolve_where_rows(client, table_id, &schema, selection.as_ref(), binder)?;
+    let resolved = resolve_where_rows(client, table_id, &schema, selection.as_ref())?;
     let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
     let count = resolved.matched.len();
     if let Some(batch) = &resolved.batch {
@@ -351,7 +349,7 @@ pub(crate) fn execute_delete(
         }
     }
 
-    let resolved = resolve_where_rows(client, table_id, &schema, del.selection.as_ref(), binder)?;
+    let resolved = resolve_where_rows(client, table_id, &schema, del.selection.as_ref())?;
     let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);
     let count = resolved.matched.len();
     if count > 0 {

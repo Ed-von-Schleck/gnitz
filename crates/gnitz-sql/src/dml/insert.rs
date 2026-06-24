@@ -5,7 +5,7 @@
 //! `DO UPDATE SET` assignment behaves exactly like an `UPDATE ... SET`.
 
 use crate::ast_util::extract_name;
-use crate::bind::Binder;
+use crate::bind::{bind_single_table, Binder};
 use crate::codec::colwrite::{append_value_to_col, ColumnValue};
 use crate::codec::nullmap::null_word_set;
 use crate::codec::pk_codec::{extract_pk_value, is_null_expr};
@@ -125,7 +125,7 @@ pub(crate) fn execute_insert(
                             "ON CONFLICT ... DO UPDATE WHERE not supported".to_string(),
                         ));
                     }
-                    let assignments = bind_do_update_assignments(&do_update.assignments, &schema, binder)?;
+                    let assignments = bind_do_update_assignments(&do_update.assignments, &schema)?;
                     ConflictPlan::DoUpdatePk { assignments }
                 }
             }
@@ -207,7 +207,6 @@ pub(crate) fn execute_insert(
 fn bind_do_update_assignments(
     raw: &[Assignment],
     schema: &Schema,
-    binder: &mut Binder<'_>,
 ) -> Result<Vec<(usize, BoundUpdateExpr)>, GnitzSqlError> {
     let mut out = Vec::with_capacity(raw.len());
     let mut seen: Vec<usize> = Vec::with_capacity(raw.len());
@@ -215,13 +214,13 @@ fn bind_do_update_assignments(
         let col_idx = resolve_set_target(assignment, schema, &mut seen, "ON CONFLICT DO UPDATE SET")?;
         // Recognize EXCLUDED.col as a special form. sqlparser parses it
         // as a CompoundIdentifier: `EXCLUDED`.`col`.
-        let value = bind_do_update_rhs(&assignment.value, schema, binder)?;
+        let value = bind_do_update_rhs(&assignment.value, schema)?;
         out.push((col_idx, value));
     }
     Ok(out)
 }
 
-fn bind_do_update_rhs(expr: &Expr, schema: &Schema, binder: &mut Binder<'_>) -> Result<BoundUpdateExpr, GnitzSqlError> {
+fn bind_do_update_rhs(expr: &Expr, schema: &Schema) -> Result<BoundUpdateExpr, GnitzSqlError> {
     // `EXCLUDED.col` — sqlparser produces `CompoundIdentifier`.
     if let Expr::CompoundIdentifier(parts) = expr {
         if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED") {
@@ -245,7 +244,7 @@ fn bind_do_update_rhs(expr: &Expr, schema: &Schema, binder: &mut Binder<'_>) -> 
                 .to_string(),
         ));
     }
-    let bound = binder.bind_expr(expr, schema)?;
+    let bound = bind_single_table(expr, schema)?;
     Ok(BoundUpdateExpr::Existing(bound))
 }
 

@@ -1,4 +1,4 @@
-use super::resolve::{find_unique_column, Binder};
+use super::resolve::find_unique_column;
 use crate::ast_util::single_relation_col_name;
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr, UnaryOp};
@@ -8,15 +8,13 @@ use sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
 };
 
-impl Binder<'_> {
-    /// Bind an expression against a single-relation schema (WHERE, projections,
-    /// set-op branches, DML). The structural recursion lives in `bind_structural`;
-    /// the `SingleTable` leaf supplies the three schema-aware decisions (column
-    /// lookup, aggregate calls, `IS [NOT] NULL`). `&self` is retained for API
-    /// symmetry and future binding state, though the recursion no longer threads it.
-    pub(crate) fn bind_expr(&self, expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
-        bind_structural(expr, &SingleTable { schema })
-    }
+/// Bind an expression against a single-relation schema (WHERE, projections,
+/// set-op branches, DML). The structural recursion lives in `bind_structural`;
+/// the `SingleTable` leaf supplies the three schema-aware decisions (column
+/// lookup, aggregate calls, `IS [NOT] NULL`). Context is fully determined by
+/// `(expr, schema)` — no binder state is involved.
+pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
+    bind_structural(expr, &SingleTable { schema })
 }
 
 // ---------------------------------------------------------------------------
@@ -321,11 +319,10 @@ mod tests {
 
     #[test]
     fn test_bind_between_desugars_to_comparison_tree() {
-        let binder = Binder::new("s");
         let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
                                                      // `c BETWEEN 1 AND 9` ≡ `c >= 1 AND c <= 9` — a residual BETWEEN now binds
                                                      // (regression guard for the new Expr::Between arm) instead of Unsupported.
-        match binder.bind_expr(&parse("c BETWEEN 1 AND 9"), &schema).unwrap() {
+        match bind_single_table(&parse("c BETWEEN 1 AND 9"), &schema).unwrap() {
             BoundExpr::BinOp(l, BinOp::And, r) => {
                 assert!(matches!(*l, BoundExpr::BinOp(_, BinOp::Ge, _)));
                 assert!(matches!(*r, BoundExpr::BinOp(_, BinOp::Le, _)));
@@ -333,7 +330,7 @@ mod tests {
             other => panic!("expected And(Ge, Le), got {other:?}"),
         }
         // `c NOT BETWEEN 1 AND 9` ≡ NOT(c >= 1 AND c <= 9).
-        match binder.bind_expr(&parse("c NOT BETWEEN 1 AND 9"), &schema).unwrap() {
+        match bind_single_table(&parse("c NOT BETWEEN 1 AND 9"), &schema).unwrap() {
             BoundExpr::UnaryOp(UnaryOp::Not, inner) => {
                 assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::And, _)))
             }
@@ -343,7 +340,6 @@ mod tests {
 
     #[test]
     fn test_binder_rejects_min_max_unsupported_types() {
-        let binder = Binder::new("s");
         for &tc in &[
             TypeCode::U128,
             TypeCode::UUID,
@@ -354,7 +350,7 @@ mod tests {
             let schema = schema_with_val(tc);
             for fname in &["MIN", "MAX"] {
                 let expr = parse(&format!("{fname}(c)"));
-                let r = binder.bind_expr(&expr, &schema);
+                let r = bind_single_table(&expr, &schema);
                 assert_unsupported(r, fname);
             }
         }
@@ -362,7 +358,6 @@ mod tests {
 
     #[test]
     fn test_binder_accepts_min_max_orderable_types() {
-        let binder = Binder::new("s");
         // Types the operator can compare correctly:
         // narrow unsigned + zero-extend, signed, U64 (with the unsigned fix),
         // and floats.
@@ -382,7 +377,7 @@ mod tests {
             let schema = schema_with_val(tc);
             for fname in &["MIN", "MAX"] {
                 let expr = parse(&format!("{fname}(c)"));
-                let r = binder.bind_expr(&expr, &schema);
+                let r = bind_single_table(&expr, &schema);
                 assert!(r.is_ok(), "expected {}({:?}) to bind, got {:?}", fname, tc, r.err());
             }
         }
@@ -394,15 +389,14 @@ mod tests {
     /// rejected with "IS NULL on non-column expression".
     #[test]
     fn test_compound_identifier_null_test_binds() {
-        let binder = Binder::new("s");
         // Non-nullable column: folds to the constant (0 for IS NULL, 1 for IS NOT NULL).
         let nn = schema_with_val(TypeCode::I64); // (pk U64 NOT NULL, c I64 NOT NULL)
         assert!(matches!(
-            binder.bind_expr(&parse("t.c IS NULL"), &nn).unwrap(),
+            bind_single_table(&parse("t.c IS NULL"), &nn).unwrap(),
             BoundExpr::LitInt(0)
         ));
         assert!(matches!(
-            binder.bind_expr(&parse("t.c IS NOT NULL"), &nn).unwrap(),
+            bind_single_table(&parse("t.c IS NOT NULL"), &nn).unwrap(),
             BoundExpr::LitInt(1)
         ));
         // Nullable column: binds to the IsNull / IsNotNull opcode at the column index.
@@ -411,11 +405,11 @@ mod tests {
             pk_cols: vec![0],
         };
         assert!(matches!(
-            binder.bind_expr(&parse("t.c IS NULL"), &nullable).unwrap(),
+            bind_single_table(&parse("t.c IS NULL"), &nullable).unwrap(),
             BoundExpr::IsNull(1)
         ));
         assert!(matches!(
-            binder.bind_expr(&parse("t.c IS NOT NULL"), &nullable).unwrap(),
+            bind_single_table(&parse("t.c IS NOT NULL"), &nullable).unwrap(),
             BoundExpr::IsNotNull(1)
         ));
     }

@@ -3,7 +3,7 @@
 //! duplicates a PK column).
 
 use crate::ast_util::{extract_table_factor_name, is_wildcard_projection};
-use crate::bind::Binder;
+use crate::bind::{bind_single_table, Binder};
 use crate::codec::project_schema::{build_projection, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::lower::{compile_bound_expr, compile_bound_expr_to_program};
@@ -25,7 +25,7 @@ pub(crate) fn execute_create_simple_view(
 
     // Build filter expression (if any)
     let expr_prog = if let Some(where_expr) = &select.selection {
-        let bound = binder.bind_expr(where_expr, &source_schema)?;
+        let bound = bind_single_table(where_expr, &source_schema)?;
         Some(compile_bound_expr_to_program(&bound, &source_schema)?)
     } else {
         None
@@ -33,7 +33,7 @@ pub(crate) fn execute_create_simple_view(
 
     // Build projection column list
     let is_wildcard = is_wildcard_projection(&select.projection);
-    let (items, out_cols) = build_projection(&select.projection, &source_schema, binder)?;
+    let (items, out_cols) = build_projection(&select.projection, &source_schema)?;
 
     // The pass-through generalization can now emit the same name twice (SELECT
     // name, name; or an alias landing on the auto-prepended PK). This keys on

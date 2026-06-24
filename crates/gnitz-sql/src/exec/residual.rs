@@ -1,18 +1,14 @@
 use super::batch::copy_batch_row;
 use super::eval::eval_pred_row;
-use crate::bind::Binder;
+use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{Schema, ZSetBatch};
 use sqlparser::ast::Expr;
 use std::sync::Arc;
 
-pub(crate) fn bind_residuals(
-    binder: &Binder<'_>,
-    residual: &[&Expr],
-    schema: &Schema,
-) -> Result<Vec<BoundExpr>, GnitzSqlError> {
-    residual.iter().map(|&e| binder.bind_expr(e, schema)).collect()
+pub(crate) fn bind_residuals(residual: &[&Expr], schema: &Schema) -> Result<Vec<BoundExpr>, GnitzSqlError> {
+    residual.iter().map(|&e| bind_single_table(e, schema)).collect()
 }
 
 /// A successful seek/scan reply: `(schema, batch, lsn)` — the `Ok` shape of
@@ -23,12 +19,11 @@ type ScanReply = (Option<Arc<Schema>>, Option<ZSetBatch>, u64);
 /// through them — the shared success path of every WHERE-serving plan in
 /// `execute_select` (PK seek, range scan, equality seek).
 pub(crate) fn residual_filtered(
-    binder: &Binder<'_>,
     schema: &Schema,
     (s, b, lsn): ScanReply,
     residual: &[&Expr],
 ) -> Result<ScanReply, GnitzSqlError> {
-    let preds = bind_residuals(binder, residual, schema)?;
+    let preds = bind_residuals(residual, schema)?;
     let (s2, b2) = apply_residual_filter((s, b), &preds, schema)?;
     Ok((s2, b2, lsn))
 }

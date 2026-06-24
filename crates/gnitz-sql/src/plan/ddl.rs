@@ -4,7 +4,9 @@
 use crate::ast_util::extract_name;
 use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
-use crate::plan::validate::{default_index_name, reject_duplicate_column_names, validate_user_index_name};
+use crate::plan::validate::{
+    default_index_name, reject_duplicate_column_names, reject_non_key_eligible, validate_user_index_name,
+};
 use crate::types::{int_domain_fits, is_integer_type, sql_type_to_typecode};
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, TypeCode};
@@ -197,13 +199,13 @@ pub(crate) fn execute_create_table(
     client: &mut GnitzClient,
     schema_name: &str,
     create: &sqlparser::ast::CreateTable,
-    _binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     let table_name = extract_name(&create.name, "CREATE TABLE")?;
 
     let sql_cols = &create.columns;
 
-    // Reject duplicate column names up front, before the PK binder runs.
+    // Reject duplicate column names up front: the PK/UNIQUE column lookups
+    // below resolve by name and would silently bind to the first match.
     reject_duplicate_column_names(sql_cols.iter().map(|c| c.name.value.as_str()), "table definition")?;
 
     // Phase 1 — build column defs (name, type, nullability only).
@@ -403,19 +405,12 @@ pub(crate) fn execute_create_table(
             gnitz_core::PK_LIST_MAX_COLS
         )));
     }
+    // Pre-check before the DDL reaches the engine (which re-validates via
+    // `validate_pk_cols`); naming the offending column here gives a clearer
+    // error. Same eligibility rule, shared via `TypeCode::is_pk_eligible`.
     for &i in &pk_indices {
         let tc = cols[i as usize].type_code;
-        // Pre-check before the DDL reaches the engine (which re-validates via
-        // `validate_pk_cols`); naming the offending column here gives a clearer
-        // error. Same eligibility rule, shared via `TypeCode::is_pk_eligible`.
-        if !tc.is_pk_eligible() {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "PRIMARY KEY column '{}' of type {:?} is not supported \
-                 (PK must be a fixed-width integer, U128, or UUID column; \
-                 String, Blob, and float columns cannot be PK)",
-                cols[i as usize].name, tc,
-            )));
-        }
+        reject_non_key_eligible(&cols[i as usize].name, tc, "PRIMARY KEY")?;
     }
     // The PK region must fit MAX_PK_BYTES. Strides ≤ 16 widen to a `u128` fast
     // key; wider compound PKs (stride > 16, e.g. three `U64`s = 24) route
@@ -457,14 +452,7 @@ pub(crate) fn execute_create_table(
     for (col_indices, _) in &unique_cols {
         for &c in col_indices {
             let tc = cols[c as usize].type_code;
-            if !tc.is_pk_eligible() {
-                return Err(GnitzSqlError::Unsupported(format!(
-                    "UNIQUE column '{}' of type {:?} is not supported \
-                     (UNIQUE requires a fixed-width integer, U128, or UUID column; \
-                     String, Blob, and float columns cannot carry a UNIQUE index)",
-                    cols[c as usize].name, tc
-                )));
-            }
+            reject_non_key_eligible(&cols[c as usize].name, tc, "UNIQUE")?;
         }
     }
 

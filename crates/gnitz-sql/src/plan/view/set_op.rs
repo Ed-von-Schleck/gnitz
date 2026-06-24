@@ -3,7 +3,7 @@
 //! semi-/anti-joined per operator.
 
 use crate::ast_util::{extract_table_factor_name, is_wildcard_projection};
-use crate::bind::Binder;
+use crate::bind::{bind_single_table, Binder};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::lower::compile_bound_expr_to_program;
@@ -32,7 +32,7 @@ fn compile_set_op_side(
 
     // Optional WHERE
     let filtered = if let Some(where_expr) = &select.selection {
-        let bound = binder.bind_expr(where_expr, &source_schema)?;
+        let bound = bind_single_table(where_expr, &source_schema)?;
         cb.filter(inp, Some(compile_bound_expr_to_program(&bound, &source_schema)?))
     } else {
         inp
@@ -41,7 +41,7 @@ fn compile_set_op_side(
     // Resolve the projection to a set of source column indices (in SELECT
     // order). Unlike `build_projection`, the source PK is NOT force-included:
     // set membership is over exactly the projected columns.
-    let (proj_indices, out_cols) = resolve_set_projection(&select.projection, &source_schema, binder, context)?;
+    let (proj_indices, out_cols) = resolve_set_projection(&select.projection, &source_schema, context)?;
 
     // Reindex by a hash of the projected columns, so set membership
     // (EXCEPT/INTERSECT/UNION-distinct) is decided by the projected row content,
@@ -66,7 +66,6 @@ fn compile_set_op_side(
 fn resolve_set_projection(
     projection: &[SelectItem],
     source_schema: &Schema,
-    binder: &Binder<'_>,
     context: &str,
 ) -> Result<(Vec<usize>, Vec<ColumnDef>), GnitzSqlError> {
     if is_wildcard_projection(projection) {
@@ -84,7 +83,7 @@ fn resolve_set_projection(
                     out_cols.push(source_schema.columns[i].clone());
                 }
             }
-            SelectItem::UnnamedExpr(expr) => match binder.bind_expr(expr, source_schema)? {
+            SelectItem::UnnamedExpr(expr) => match bind_single_table(expr, source_schema)? {
                 BoundExpr::ColRef(ci) => {
                     indices.push(ci);
                     out_cols.push(source_schema.columns[ci].clone());
@@ -95,7 +94,7 @@ fn resolve_set_projection(
                     )))
                 }
             },
-            SelectItem::ExprWithAlias { expr, alias } => match binder.bind_expr(expr, source_schema)? {
+            SelectItem::ExprWithAlias { expr, alias } => match bind_single_table(expr, source_schema)? {
                 BoundExpr::ColRef(ci) => {
                     indices.push(ci);
                     let mut col = source_schema.columns[ci].clone();

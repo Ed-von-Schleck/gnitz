@@ -7,7 +7,7 @@
 //! builder (`plan::view::simple`) — the join and SET projections have their own
 //! leading-column contracts and build their layouts separately.
 
-use crate::bind::Binder;
+use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use gnitz_core::{ColumnDef, Schema};
@@ -33,7 +33,6 @@ fn resolve_proj_col(
     item: &SelectItem,
     idx: usize,
     source_schema: &Schema,
-    binder: &Binder<'_>,
 ) -> Result<(ProjItem, ColumnDef), GnitzSqlError> {
     let (expr, alias) = match item {
         SelectItem::UnnamedExpr(expr) => (expr, None),
@@ -44,7 +43,7 @@ fn resolve_proj_col(
             ))
         }
     };
-    let bound = binder.bind_expr(expr, source_schema)?;
+    let bound = bind_single_table(expr, source_schema)?;
     // A (possibly aliased / qualified / parenthesized) bare column reference is a
     // pass-through; an alias only renames the output column. Anything else is a
     // computed column, typed by `infer_type` and named by its alias or `_expr{idx}`.
@@ -102,7 +101,6 @@ fn place_pk_front(items: &mut Vec<ProjItem>, out_cols: &mut Vec<ColumnDef>, sour
 pub(crate) fn build_projection(
     projection: &[SelectItem],
     source_schema: &Schema,
-    binder: &Binder<'_>,
 ) -> Result<(Vec<ProjItem>, Vec<ColumnDef>), GnitzSqlError> {
     let mut items: Vec<ProjItem> = Vec::new();
     let mut out_cols: Vec<ColumnDef> = Vec::new();
@@ -118,7 +116,7 @@ pub(crate) fn build_projection(
                 out_cols.push(source_schema.columns[i].clone());
             }
         } else {
-            let (it, col) = resolve_proj_col(item, idx, source_schema, binder)?;
+            let (it, col) = resolve_proj_col(item, idx, source_schema)?;
             items.push(it);
             out_cols.push(col);
         }

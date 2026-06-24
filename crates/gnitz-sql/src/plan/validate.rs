@@ -3,7 +3,7 @@
 //! by `ddl` and every view builder.
 
 use crate::error::GnitzSqlError;
-use gnitz_core::{ColumnDef, Schema};
+use gnitz_core::{ColumnDef, Schema, TypeCode};
 
 /// Reject an output column list that names the same column twice. The binder's
 /// name->index lookup silently binds to the first match, so a duplicate would
@@ -72,6 +72,20 @@ pub(crate) fn reject_float_key(col: &ColumnDef, role: &str) -> Result<(), GnitzS
 pub(crate) fn reject_float_keys(source_schema: &Schema, indices: &[usize]) -> Result<(), GnitzSqlError> {
     for &ci in indices {
         reject_float_key(&source_schema.columns[ci], "SELECT DISTINCT / set operation")?;
+    }
+    Ok(())
+}
+
+/// Reject a column type that cannot back a hashed key (PRIMARY KEY or UNIQUE
+/// index). `role` names the clause for the message. `is_pk_eligible` is the
+/// shared allow-list (fixed-width integer, U128, UUID).
+pub(crate) fn reject_non_key_eligible(name: &str, tc: TypeCode, role: &str) -> Result<(), GnitzSqlError> {
+    if !tc.is_pk_eligible() {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{role} column '{name}' of type {tc:?} is not supported \
+             ({role} must be a fixed-width integer, U128, or UUID column; \
+             String, Blob, and float columns cannot be a {role} key)"
+        )));
     }
     Ok(())
 }

@@ -7,7 +7,7 @@
 //! SET *wraps* (two's-complement cast) — so the shared mechanic
 //! (`encode_numeric`) is the byte emission, not the accept/reject decision.
 
-use crate::codec::pk_codec::parse_uuid_str;
+use crate::codec::pk_codec::{parse_pk_literal_packed, parse_uuid_str};
 use crate::error::GnitzSqlError;
 use gnitz_core::{ColData, FixedInt, TypeCode};
 use sqlparser::ast::{Expr, UnaryOperator, Value};
@@ -84,20 +84,17 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
                                         .map_err(|_| GnitzSqlError::Bind(format!("invalid f64: {n}")))?;
                                     buf.extend_from_slice(&v.to_le_bytes());
                                 }
-                                // Integer columns (U8..I64); the sign is already folded into `n`.
-                                // One parse + range-check + pack via `FixedInt`, matching the
-                                // accept/reject set of the PK-literal path (`parse_pk_literal_packed`).
-                                // `from_type_code` is `None` only for the non-integer fixed types
-                                // that never back a `ColData::Fixed` column.
+                                // Integer columns (U8..I64); the sign is already folded into `n`,
+                                // so negated = false. Route through the single source of truth for
+                                // narrow-int literal acceptance (`pk_codec`) so the INSERT-value path
+                                // and PK-seek routing accept/reject identically. F32/F64 are handled
+                                // above; U128/UUID/I128 never back a `ColData::Fixed` column, so this
+                                // arm only ever sees a narrow int (`width() == wire_stride()`).
                                 _ => {
-                                    let fi = FixedInt::from_type_code(tc).ok_or_else(|| {
-                                        GnitzSqlError::Bind(format!("unexpected type {tc:?} for number literal"))
+                                    let packed = parse_pk_literal_packed(tc, n, false).ok_or_else(|| {
+                                        GnitzSqlError::Bind(format!("{tc:?} value out of range: {n}"))
                                     })?;
-                                    let (min, max) = fi.range();
-                                    let v = n.parse::<i128>().ok().filter(|v| (min..=max).contains(v)).ok_or_else(
-                                        || GnitzSqlError::Bind(format!("{tc:?} value out of range: {n}")),
-                                    )?;
-                                    buf.extend_from_slice(&fi.pack(v).to_le_bytes()[..fi.width()]);
+                                    buf.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
                                 }
                             }
                             Ok(())

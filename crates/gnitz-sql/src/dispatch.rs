@@ -17,7 +17,7 @@ pub(crate) fn execute_statement(
     let mut binder = Binder::new(schema_name);
 
     match stmt {
-        Statement::CreateTable(create) => plan::execute_create_table(client, schema_name, create, &mut binder),
+        Statement::CreateTable(create) => plan::execute_create_table(client, schema_name, create),
         Statement::Drop { object_type, names, .. } => plan::execute_drop(client, schema_name, object_type, names),
         Statement::CreateView { name, query, .. } => {
             plan::execute_create_view(client, schema_name, name, query, stmt, &mut binder)

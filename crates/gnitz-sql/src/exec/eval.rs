@@ -19,9 +19,13 @@ fn decode_pk_bytes_to_i64(tc: TypeCode, slice: &[u8]) -> Result<i64, GnitzSqlErr
 
 /// Client-side interpreter backend: evaluates a single batch row into an
 /// `Option<i64>` (`None` = SQL NULL). The structural walk is shared with the
-/// opcode lowerer via [`BoundExprBackend`]; this backend reproduces the legacy
-/// `eval_expr` semantics verbatim, including the signed-`i64` decode of unsigned
-/// columns (a separate, tracked defect — confined here to a single site).
+/// opcode lowerer via [`BoundExprBackend`]. Integer columns decode through
+/// `FixedInt::decode_le_i64`: narrow unsigned columns (U8/U16/U32) are
+/// zero-extended (`200u8` → `200`, never a sign-extended negative); a full-width
+/// U64 is bit-reinterpreted (`U64::MAX` → `-1i64`); and every non-≤8-byte-integer
+/// type (U128, UUID, I128, F32/F64, STRING, BLOB) is rejected via
+/// `from_type_code → None` rather than mis-decoded. See the `*_not_sign_extended`
+/// and `eval_expr_u64_high_bit_decodes_correctly` tests.
 struct InterpBackend<'a> {
     batch: &'a ZSetBatch,
     row: usize,

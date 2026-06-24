@@ -4,7 +4,7 @@
 //! `Having` leaf binder over the grouped relation).
 
 use crate::ast_util::{extract_table_factor_name, single_relation_col_name};
-use crate::bind::{bind_structural, find_unique_column, Binder, LeafBinder};
+use crate::bind::{bind_single_table, bind_structural, find_unique_column, Binder, LeafBinder};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr};
 use crate::lower::compile_bound_expr_to_program;
@@ -202,7 +202,7 @@ pub(crate) fn execute_create_group_by_view(
             }
         };
 
-        let bound = binder.bind_expr(expr, &source_schema)?;
+        let bound = bind_single_table(expr, &source_schema)?;
         match &bound {
             BoundExpr::ColRef(col_idx) => {
                 if !group_col_indices.contains(col_idx) {
@@ -327,7 +327,7 @@ pub(crate) fn execute_create_group_by_view(
 
     // Optional WHERE filter
     let filtered = if let Some(where_expr) = &select.selection {
-        let bound = binder.bind_expr(where_expr, &source_schema)?;
+        let bound = bind_single_table(where_expr, &source_schema)?;
         cb.filter(inp, Some(compile_bound_expr_to_program(&bound, &source_schema)?))
     } else {
         inp
