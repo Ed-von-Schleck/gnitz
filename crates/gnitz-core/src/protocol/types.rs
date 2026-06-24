@@ -928,6 +928,21 @@ impl<'a> BatchAppender<'a> {
         self
     }
 
+    /// Append a SQL NULL to the next Fixed (U64) column: writes a zero filler and
+    /// marks the column NULL in the row bitmap. The Fixed-column sibling of
+    /// `str_null`/`bytes_null` — self-sufficient, so a nullable U64 needs no
+    /// out-of-band `null_mask` call.
+    pub fn u64_null(&mut self) -> &mut Self {
+        let ci = self.col_index();
+        match &mut self.batch.columns[ci] {
+            ColData::Fixed(buf) => buf.extend_from_slice(&0u64.to_le_bytes()),
+            _ => panic!("BatchAppender: u64_null called on non-Fixed column at schema index {ci}"),
+        }
+        self.mark_current_null(ci);
+        self.cursor += 1;
+        self
+    }
+
     /// Append an i64 value to the next Fixed column.
     pub fn i64_val(&mut self, v: i64) -> &mut Self {
         let ci = self.col_index();

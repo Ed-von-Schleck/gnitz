@@ -535,8 +535,7 @@ fn test_circuit_table_surface_introspectable() {
 
     // Inject a row directly into CIRCUIT_NODES so the store is non-empty.
     // Compound-PK layout: (view_id U64, sub U64) primary key, then payload
-    // node_id U64, opcode U64, source_table U64?, reindex_col U64?,
-    // expr_program BLOB?.
+    // node_id U64, opcode U64, source_table U64?, expr_program BLOB?.
     let schema = circuit_nodes_schema();
     let mut bb = BatchBuilder::new(schema);
     let pk = pack_view_pk(0, 42); // view_id=0, sub=node_id=42
@@ -544,7 +543,6 @@ fn test_circuit_table_surface_introspectable() {
     bb.put_u64(42); // node_id
     bb.put_u64(11); // opcode
     bb.put_null(); // source_table (NULL)
-    bb.put_null(); // reindex_col (NULL)
     bb.put_null(); // expr_program (NULL)
     bb.end_row();
     engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();

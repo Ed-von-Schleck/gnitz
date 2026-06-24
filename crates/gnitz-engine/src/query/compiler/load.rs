@@ -16,7 +16,6 @@ use gnitz_wire::col_index_in as cidx;
 const NODES_COL_NODE_ID: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "node_id");
 const NODES_COL_OPCODE_NEW: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "opcode");
 const NODES_COL_SOURCE_TABLE: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "source_table");
-const NODES_COL_REINDEX_COL: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "reindex_col");
 const NODES_COL_EXPR_PROGRAM: usize = cidx(gnitz_wire::CIRCUIT_NODES_COLS, "expr_program");
 const EDGES_COL_DST_NODE: usize = cidx(gnitz_wire::CIRCUIT_EDGES_COLS, "dst_node");
 const EDGES_COL_DST_PORT: usize = cidx(gnitz_wire::CIRCUIT_EDGES_COLS, "dst_port");
@@ -93,11 +92,6 @@ pub(crate) fn load_circuit(
             } else {
                 Some(ch.cursor.read_i64(NODES_COL_SOURCE_TABLE) as u64)
             };
-            let reindex: Option<u16> = if ch.cursor.col_is_null(NODES_COL_REINDEX_COL) {
-                None
-            } else {
-                Some(ch.cursor.read_i64(NODES_COL_REINDEX_COL) as u16)
-            };
             let expr_blob: Option<Vec<u8>> = if ch.cursor.col_is_null(NODES_COL_EXPR_PROGRAM) {
                 None
             } else {
@@ -113,7 +107,7 @@ pub(crate) fn load_circuit(
             // A node that fails to decode must abort the whole load: silently
             // skipping it leaves any edge referencing it dangling, which yields
             // an invalid topological order or silent output corruption.
-            let op = gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, cols).ok()?;
+            let op = gnitz_wire::decode_op_node(opcode, src_tab, expr_blob, cols).ok()?;
             if matches!(op, gnitz_wire::OpNode::GatherReduce) {
                 if let Some(c) = cols_by_node.get(&node_id) {
                     // GatherReduce stays on the legacy tuple path (emit_gather_reduce)

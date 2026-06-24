@@ -1685,7 +1685,6 @@ mod tests {
             bb.put_u64(1); // node_id
             bb.put_u64(9999); // opcode — unknown → decode_op_node Err
             bb.put_null(); // source_table
-            bb.put_null(); // reindex_col
             bb.put_null(); // expr_program
             bb.end_row();
             nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
@@ -1753,16 +1752,14 @@ mod tests {
             bb.put_u64(0);
             bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
             bb.put_u64(99); // source_table
-            bb.put_null();
-            bb.put_null();
+            bb.put_null(); // expr_program
             bb.end_row();
             // node 1: IntegrateSink
             bb.begin_row(pk(1), 1);
             bb.put_u64(1);
             bb.put_u64(gnitz_wire::OPCODE_INTEGRATE);
-            bb.put_null();
-            bb.put_null();
-            bb.put_null();
+            bb.put_null(); // source_table
+            bb.put_null(); // expr_program
             bb.end_row();
             nodes_tab.ingest_owned_batch(bb.finish()).unwrap();
         }

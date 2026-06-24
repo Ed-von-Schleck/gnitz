@@ -778,47 +778,21 @@ impl GnitzClient {
             let mut nodes = ZSetBatch::new(nodes_s);
             {
                 let mut a = BatchAppender::new(&mut nodes, nodes_s);
-                for (node_id, opcode, src_tab, reindex, expr_blob) in &rows.nodes {
+                for (node_id, opcode, src_tab, expr_blob) in &rows.nodes {
                     // Compound PK (view_id, sub=node_id): low 8 bytes = view_id,
                     // high 8 bytes = node_id.
                     let pk = (vid as u128) | ((*node_id as u128) << 64);
-                    let mut null_mask: u64 = 0;
-                    // Payload columns: node_id=0, opcode=1, source_table=2,
-                    // reindex_col=3, expr_program=4.
-                    if src_tab.is_none() {
-                        null_mask |= 1u64 << 2;
-                    }
-                    if reindex.is_none() {
-                        null_mask |= 1u64 << 3;
-                    }
-                    if expr_blob.is_none() {
-                        null_mask |= 1u64 << 4;
-                    }
-                    a.add_row(pk, 1).null_mask(null_mask).u64_val(*node_id).u64_val(*opcode);
+                    a.add_row(pk, 1).u64_val(*node_id).u64_val(*opcode);
+                    // source_table and expr_program are nullable; the `*_null`
+                    // writers set the row bitmap themselves, so no `null_mask`.
                     match src_tab {
-                        Some(t) => {
-                            a.u64_val(*t);
-                        }
-                        None => {
-                            a.u64_val(0);
-                        }
-                    }
-                    match reindex {
-                        Some(r) => {
-                            a.u64_val(*r as u64);
-                        }
-                        None => {
-                            a.u64_val(0);
-                        }
-                    }
+                        Some(t) => a.u64_val(*t),
+                        None => a.u64_null(),
+                    };
                     match expr_blob {
-                        Some(b) => {
-                            a.bytes_val(b);
-                        }
-                        None => {
-                            a.bytes_null();
-                        }
-                    }
+                        Some(b) => a.bytes_val(b),
+                        None => a.bytes_null(),
+                    };
                 }
             }
             self.conn

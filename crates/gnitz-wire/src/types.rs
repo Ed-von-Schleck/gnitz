@@ -53,7 +53,7 @@ impl TypeCode {
 
     /// Convert a raw u8 wire value. Returns `None` for unknown codes.
     #[inline]
-    pub fn try_from_u8(v: u8) -> Option<Self> {
+    pub const fn try_from_u8(v: u8) -> Option<Self> {
         use type_code as tc;
         match v {
             tc::U8 => Some(TypeCode::U8),
@@ -481,18 +481,36 @@ pub const fn is_routable_int(tc: u8) -> bool {
     is_fixed_int(tc) || matches!(tc, type_code::U128 | type_code::UUID | type_code::I128)
 }
 
-/// Wire stride (byte width) for a column type code.
-/// Returns 8 for unknown codes (engine compare_rows depends on this default).
+/// Wire stride (byte width) for a column type code. Delegates to the single
+/// width source [`TypeCode::stride`]; unknown codes return 8 (load-bearing —
+/// engine `compare_rows` and the trailing-slot fill depend on it).
 pub const fn wire_stride(tc: u8) -> usize {
-    match tc {
-        1 | 2 => 1,    // U8, I8
-        3 | 4 => 2,    // U16, I16
-        5..=7 => 4,    // U32, I32, F32
-        8..=10 => 8,   // U64, I64, F64
-        11..=15 => 16, // STRING, U128, UUID, BLOB, I128
-        _ => 8,
+    match TypeCode::try_from_u8(tc) {
+        Some(t) => t.stride() as usize,
+        None => 8,
     }
 }
+
+// Pin the discriminant↔code round-trip so a `try_from_u8` typo (e.g. mapping a
+// code to the wrong-discriminant variant) can no longer silently mis-stride a
+// column via `wire_stride`. Width can no longer drift from `stride()` because
+// that match is now the only width table.
+const _: () = {
+    let mut v: u16 = 0; // u16 so `v += 1` cannot overflow at 255
+    while v <= 255 {
+        if let Some(t) = TypeCode::try_from_u8(v as u8) {
+            assert!(
+                t as u8 == v as u8,
+                "TypeCode discriminant must round-trip through try_from_u8"
+            );
+        }
+        v += 1;
+    }
+    assert!(
+        wire_stride(0) == 8 && wire_stride(16) == 8,
+        "unknown-code default must be 8"
+    );
+};
 
 #[cfg(test)]
 mod tests {

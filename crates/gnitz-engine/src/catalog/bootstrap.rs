@@ -230,7 +230,6 @@ impl CatalogEngine {
                         ("node_id", type_code::U64, 0),
                         ("opcode", type_code::U64, 0),
                         ("source_table", type_code::U64, 1),
-                        ("reindex_col", type_code::U64, 1),
                         ("expr_program", type_code::BLOB, 1),
                     ],
                 ),

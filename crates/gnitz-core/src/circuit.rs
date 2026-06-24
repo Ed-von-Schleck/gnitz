@@ -14,16 +14,14 @@ pub struct Circuit {
     pub edges: std::collections::BTreeMap<(NodeId, Port), NodeId>,
 }
 
-/// `(opcode, source_table, reindex_col, expr_program_blob)` — the fields of
-/// a `nodes` system-table row excluding the node id (which is added by the
-/// caller). Reused by both `CircuitRows::nodes` and `encode_op_node`. The
-/// physical `reindex_col` cell is now permanently `None` for `Map` nodes; the
-/// live reindex column list is stored in `CircuitNodeColumns` under
-/// `NODE_COL_KIND_REINDEX`.
-pub type NodeFields = (u64, Option<TableId>, Option<u16>, Option<Vec<u8>>);
+/// `(opcode, source_table, expr_program_blob)` — the fields of a `nodes`
+/// system-table row excluding the node id (which is added by the caller).
+/// Reused by both `CircuitRows::nodes` and `encode_op_node`. The reindex column
+/// list is stored in `CircuitNodeColumns` under `NODE_COL_KIND_REINDEX`.
+pub type NodeFields = (u64, Option<TableId>, Option<Vec<u8>>);
 
 /// One full row of the `nodes` system table: node id + [`NodeFields`].
-pub type NodeRow = (NodeId, u64, Option<TableId>, Option<u16>, Option<Vec<u8>>);
+pub type NodeRow = (NodeId, u64, Option<TableId>, Option<Vec<u8>>);
 
 /// One row of the `node_columns` system table:
 /// `(kind, position, value1, value2)` — the node_id is prepended by the caller.
@@ -33,9 +31,8 @@ pub type NodeColumnPayload = (u64, u16, u64, u64);
 /// write. Each `Vec` is one logical row in the corresponding system table.
 #[derive(Clone, Debug, Default)]
 pub struct CircuitRows {
-    /// `source_table` is `None` for nodes that don't carry one;
-    /// `reindex_col` is now always `None` for `Map` nodes; the reindex column list
-    /// is stored in `node_columns` under `NODE_COL_KIND_REINDEX`;
+    /// `source_table` is `None` for nodes that don't carry one; the reindex column
+    /// list is stored in `node_columns` under `NODE_COL_KIND_REINDEX`;
     /// `expr_program` is `None` outside `Filter`/`MapKind::Expression`.
     pub nodes: Vec<NodeRow>,
     /// `(dst_node, dst_port, src_node)`. View id is implicit at the call site.
@@ -70,8 +67,8 @@ impl Circuit {
     pub fn into_rows(self) -> CircuitRows {
         let mut rows = CircuitRows::default();
         for (nid, op) in self.nodes {
-            let ((opcode, src_tab, reindex, expr_blob), kind_rows) = encode_op_node(op);
-            rows.nodes.push((nid, opcode, src_tab, reindex, expr_blob));
+            let ((opcode, src_tab, expr_blob), kind_rows) = encode_op_node(op);
+            rows.nodes.push((nid, opcode, src_tab, expr_blob));
             for (kind, pos, v1, v2) in kind_rows {
                 rows.node_columns.push((nid, kind, pos, v1, v2));
             }
@@ -105,9 +102,9 @@ impl Circuit {
         }
 
         let mut nodes = BTreeMap::new();
-        for (nid, opcode, src_tab, reindex, expr_blob) in rows.nodes {
+        for (nid, opcode, src_tab, expr_blob) in rows.nodes {
             let cols: Vec<gnitz_wire::CircuitNodeColumn> = per_node.remove(&nid).unwrap_or_default();
-            let op = gnitz_wire::decode_op_node(opcode, src_tab, reindex, expr_blob, &cols)?;
+            let op = gnitz_wire::decode_op_node(opcode, src_tab, expr_blob, &cols)?;
             nodes.insert(nid, op);
         }
         let mut edges = BTreeMap::new();
@@ -132,22 +129,17 @@ where
 fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
     use gnitz_wire::*;
     match op {
-        OpNode::ScanDelta(tid) => ((OPCODE_SCAN_DELTA, Some(tid), None, None), Vec::new()),
-        OpNode::ScanTrace(tid) => ((OPCODE_SCAN_TRACE_TABLE, Some(tid), None, None), Vec::new()),
-        OpNode::Filter(blob) => ((OPCODE_FILTER, None, None, blob), Vec::new()),
-        OpNode::Map(MapKind::Projection(cols)) => (
-            (OPCODE_MAP_PROJ, None, None, None),
-            encode_col_list(NODE_COL_KIND_PROJ, cols),
-        ),
+        OpNode::ScanDelta(tid) => ((OPCODE_SCAN_DELTA, Some(tid), None), Vec::new()),
+        OpNode::ScanTrace(tid) => ((OPCODE_SCAN_TRACE_TABLE, Some(tid), None), Vec::new()),
+        OpNode::Filter(blob) => ((OPCODE_FILTER, None, blob), Vec::new()),
+        OpNode::Map(MapKind::Projection(cols)) => {
+            ((OPCODE_MAP_PROJ, None, None), encode_col_list(NODE_COL_KIND_PROJ, cols))
+        }
         OpNode::Map(MapKind::Expression {
             program,
             reindex_cols,
             reindex_target_tcs,
         }) => {
-            // Reindex columns now live in CircuitNodeColumns; the legacy single-cell
-            // `reindex` slot stays None (the physical column persists for back-compat
-            // but is no longer written).
-            //
             // value1 = column index, value2 = promoted target type code (0 = derive
             // from source). Hand-rolled (not encode_col_list) so the shared
             // PROJ/HashRow helper stays a pure index list; the planner writes 0 on a
@@ -161,18 +153,18 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
                     (NODE_COL_KIND_REINDEX, i as u16, col as u64, v2)
                 })
                 .collect();
-            ((OPCODE_MAP_EXPR, None, None, Some(program)), kind_rows)
+            ((OPCODE_MAP_EXPR, None, Some(program)), kind_rows)
         }
-        OpNode::Map(MapKind::KeyOnly) => ((OPCODE_MAP_KEY_ONLY, None, None, None), Vec::new()),
+        OpNode::Map(MapKind::KeyOnly) => ((OPCODE_MAP_KEY_ONLY, None, None), Vec::new()),
         OpNode::Map(MapKind::HashRow(cols, branch_id)) => {
             let mut kind_rows = encode_col_list(NODE_COL_KIND_PROJ, cols);
             kind_rows.push((NODE_COL_KIND_BRANCH_ID, 0, branch_id as u64, 0));
-            ((OPCODE_MAP_HASH_ROW, None, None, None), kind_rows)
+            ((OPCODE_MAP_HASH_ROW, None, None), kind_rows)
         }
-        OpNode::Negate => ((OPCODE_NEGATE, None, None, None), Vec::new()),
-        OpNode::Union => ((OPCODE_UNION, None, None, None), Vec::new()),
-        OpNode::Delay => ((OPCODE_DELAY, None, None, None), Vec::new()),
-        OpNode::Distinct => ((OPCODE_DISTINCT, None, None, None), Vec::new()),
+        OpNode::Negate => ((OPCODE_NEGATE, None, None), Vec::new()),
+        OpNode::Union => ((OPCODE_UNION, None, None), Vec::new()),
+        OpNode::Delay => ((OPCODE_DELAY, None, None), Vec::new()),
+        OpNode::Distinct => ((OPCODE_DISTINCT, None, None), Vec::new()),
         OpNode::Reduce { group_cols, agg } => {
             let mut kind_rows = Vec::with_capacity(group_cols.len() + 4);
             for (i, c) in group_cols.iter().enumerate() {
@@ -183,46 +175,46 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
                     kind_rows.push((NODE_COL_KIND_AGG_SPEC, i as u16, func.as_u64(), col as u64));
                 }
             }
-            ((OPCODE_REDUCE, None, None, None), kind_rows)
+            ((OPCODE_REDUCE, None, None), kind_rows)
         }
-        OpNode::Join(JoinKind::DeltaTrace) => ((OPCODE_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
-        OpNode::Join(JoinKind::DeltaTraceOuter) => ((OPCODE_JOIN_DELTA_TRACE_OUTER, None, None, None), Vec::new()),
-        OpNode::Join(JoinKind::DeltaDelta) => ((OPCODE_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::Join(JoinKind::DeltaTrace) => ((OPCODE_JOIN_DELTA_TRACE, None, None), Vec::new()),
+        OpNode::Join(JoinKind::DeltaTraceOuter) => ((OPCODE_JOIN_DELTA_TRACE_OUTER, None, None), Vec::new()),
+        OpNode::Join(JoinKind::DeltaDelta) => ((OPCODE_JOIN_DELTA_DELTA, None, None), Vec::new()),
         OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }) => (
-            (OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, None),
+            (OPCODE_JOIN_DELTA_TRACE_RANGE, None, None),
             vec![(NODE_COL_KIND_RANGE_JOIN, 0, n_eq as u64, rel.as_u64())],
         ),
-        OpNode::AntiJoin(JoinKind::DeltaTrace) => ((OPCODE_ANTI_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
+        OpNode::AntiJoin(JoinKind::DeltaTrace) => ((OPCODE_ANTI_JOIN_DELTA_TRACE, None, None), Vec::new()),
         OpNode::AntiJoin(JoinKind::DeltaTraceOuter) => {
             unreachable!("no wire opcode for anti-join outer; no builder creates this variant")
         }
-        OpNode::AntiJoin(JoinKind::DeltaDelta) => ((OPCODE_ANTI_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::AntiJoin(JoinKind::DeltaDelta) => ((OPCODE_ANTI_JOIN_DELTA_DELTA, None, None), Vec::new()),
         OpNode::AntiJoin(JoinKind::DeltaTraceRange { .. }) => {
             unreachable!("no wire opcode for anti-join range; no builder creates this variant")
         }
-        OpNode::SemiJoin(JoinKind::DeltaTrace) => ((OPCODE_SEMI_JOIN_DELTA_TRACE, None, None, None), Vec::new()),
+        OpNode::SemiJoin(JoinKind::DeltaTrace) => ((OPCODE_SEMI_JOIN_DELTA_TRACE, None, None), Vec::new()),
         OpNode::SemiJoin(JoinKind::DeltaTraceOuter) => {
             unreachable!("no wire opcode for semi-join outer; no builder creates this variant")
         }
-        OpNode::SemiJoin(JoinKind::DeltaDelta) => ((OPCODE_SEMI_JOIN_DELTA_DELTA, None, None, None), Vec::new()),
+        OpNode::SemiJoin(JoinKind::DeltaDelta) => ((OPCODE_SEMI_JOIN_DELTA_DELTA, None, None), Vec::new()),
         OpNode::SemiJoin(JoinKind::DeltaTraceRange { .. }) => {
             unreachable!("no wire opcode for semi-join range; no builder creates this variant")
         }
-        OpNode::IntegrateSink => ((OPCODE_INTEGRATE, None, None, None), Vec::new()),
-        OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None, None), Vec::new()),
+        OpNode::IntegrateSink => ((OPCODE_INTEGRATE, None, None), Vec::new()),
+        OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None), Vec::new()),
         OpNode::ExchangeShard { shard_cols } => (
-            (OPCODE_EXCHANGE_SHARD, None, None, None),
+            (OPCODE_EXCHANGE_SHARD, None, None),
             encode_col_list(NODE_COL_KIND_SHARD, shard_cols),
         ),
-        OpNode::ExchangeGather => ((OPCODE_EXCHANGE_GATHER, None, None, None), Vec::new()),
+        OpNode::ExchangeGather => ((OPCODE_EXCHANGE_GATHER, None, None), Vec::new()),
         OpNode::NullExtend { type_codes } => (
-            (OPCODE_NULL_EXTEND, None, None, None),
+            (OPCODE_NULL_EXTEND, None, None),
             encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes),
         ),
-        OpNode::GatherReduce => ((OPCODE_GATHER_REDUCE, None, None, None), Vec::new()),
-        OpNode::SeekTrace => ((OPCODE_SEEK_TRACE, None, None, None), Vec::new()),
-        OpNode::ClearDeltas => ((OPCODE_CLEAR_DELTAS, None, None, None), Vec::new()),
-        OpNode::PartitionFilter => ((OPCODE_PARTITION_FILTER, None, None, None), Vec::new()),
+        OpNode::GatherReduce => ((OPCODE_GATHER_REDUCE, None, None), Vec::new()),
+        OpNode::SeekTrace => ((OPCODE_SEEK_TRACE, None, None), Vec::new()),
+        OpNode::ClearDeltas => ((OPCODE_CLEAR_DELTAS, None, None), Vec::new()),
+        OpNode::PartitionFilter => ((OPCODE_PARTITION_FILTER, None, None), Vec::new()),
     }
 }
 
@@ -569,7 +561,7 @@ mod tests {
 
     /// A compound (2-column) reindex descriptor must survive into_rows → from_rows
     /// with its column *order* preserved, stored under NODE_COL_KIND_REINDEX with
-    /// position = key order, and the legacy single-cell `reindex` slot left None.
+    /// position = key order.
     #[test]
     fn reindex_cols_roundtrip_ordered() {
         let (c1, c2) = (2usize, 5usize);
@@ -579,10 +571,6 @@ mod tests {
         let circuit = cb.build();
 
         let rows = circuit.into_rows();
-
-        // The legacy reindex cell is None for the Map node.
-        let node_row = rows.nodes.iter().find(|r| r.0 == map_nid).expect("map node row");
-        assert_eq!(node_row.3, None, "legacy reindex cell must be None for new circuits");
 
         // Exactly two NODE_COL_KIND_REINDEX rows, position-ordered, value1 = column.
         let mut reindex_rows: Vec<_> = rows

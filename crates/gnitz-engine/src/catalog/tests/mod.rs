@@ -139,16 +139,14 @@ fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64) {
     bb.put_u64(0);
     bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
     bb.put_u64(base_tid as u64); // source_table
-    bb.put_null(); // reindex_col
     bb.put_null(); // expr_program
     bb.end_row();
     // node 1: Integrate (terminal sink — moves the delta into the view store)
     bb.begin_row(pack_view_pk(vid, 1), 1);
     bb.put_u64(1);
     bb.put_u64(gnitz_wire::OPCODE_INTEGRATE);
-    bb.put_null();
-    bb.put_null();
-    bb.put_null();
+    bb.put_null(); // source_table
+    bb.put_null(); // expr_program
     bb.end_row();
     engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();
 

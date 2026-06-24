@@ -184,12 +184,12 @@ pub enum MapKind {
     /// source columns, in key order, that become the synthetic PK for equijoin
     /// pre-indexing (empty for a plain compute map).
     ///
-    /// `reindex_target_tcs` is parallel to `reindex_cols`: entry `i` is the
-    /// promoted key type code `T` for slot `i` of a cross-width equijoin key, or
-    /// `0` meaning "derive the slot type from the source column" (the legacy /
-    /// same-type path, byte-identical to pre-promotion circuits). It is empty for
-    /// a plain compute map and may be shorter than `reindex_cols` for legacy
-    /// circuits, where the missing entries default to `0`.
+    /// `reindex_target_tcs` is parallel to `reindex_cols` — a decoded
+    /// `Expression` always has `reindex_target_tcs.len() == reindex_cols.len()`.
+    /// Entry `i` is the promoted key type code `T` for slot `i` of a cross-width
+    /// equijoin key, or `0` meaning "derive the slot type from the source column"
+    /// (the same-type path, byte-identical to non-promoted circuits). Both are
+    /// empty for a plain compute map.
     Expression {
         program: Vec<u8>,
         reindex_cols: Vec<u16>,
@@ -278,7 +278,6 @@ pub struct CircuitNodeColumn {
 pub fn decode_op_node(
     opcode: u64,
     src_tab: Option<TableId>,
-    reindex: Option<u16>,
     expr_blob: Option<Vec<u8>>,
     cols: &[CircuitNodeColumn],
 ) -> Result<OpNode, String> {
@@ -301,11 +300,17 @@ pub fn decode_op_node(
             .collect()
     };
     Ok(match opcode {
-        x if x == OPCODE_SCAN_DELTA => OpNode::ScanDelta(src_tab.unwrap_or(0)),
-        x if x == OPCODE_SCAN_TRACE_TABLE => OpNode::ScanTrace(src_tab.unwrap_or(0)),
-        x if x == OPCODE_FILTER => OpNode::Filter(expr_blob),
-        x if x == OPCODE_MAP_PROJ => OpNode::Map(MapKind::Projection(collect_cols(NODE_COL_KIND_PROJ))),
-        x if x == OPCODE_MAP_EXPR => {
+        OPCODE_SCAN_DELTA => {
+            let tid = src_tab.ok_or_else(|| "SCAN_DELTA missing source_table".to_string())?;
+            OpNode::ScanDelta(tid)
+        }
+        OPCODE_SCAN_TRACE_TABLE => {
+            let tid = src_tab.ok_or_else(|| "SCAN_TRACE missing source_table".to_string())?;
+            OpNode::ScanTrace(tid)
+        }
+        OPCODE_FILTER => OpNode::Filter(expr_blob),
+        OPCODE_MAP_PROJ => OpNode::Map(MapKind::Projection(collect_cols(NODE_COL_KIND_PROJ))),
+        OPCODE_MAP_EXPR => {
             let program = expr_blob.ok_or_else(|| "MAP_EXPR missing expr_program blob".to_string())?;
             // Reindex columns live in CircuitNodeColumns (NODE_COL_KIND_REINDEX),
             // position-ordered so a compound key's column order is preserved.
@@ -327,21 +332,14 @@ pub fn decode_op_node(
                     reindex_target_tcs.push(tc);
                 }
             }
-            // Legacy single `reindex` cell (circuits persisted before the
-            // column-list migration wrote no kind rows): target tc derives from
-            // source (`0`).
-            if reindex_cols.is_empty() {
-                reindex_cols.extend(reindex);
-                reindex_target_tcs.resize(reindex_cols.len(), 0);
-            }
             OpNode::Map(MapKind::Expression {
                 program,
                 reindex_cols,
                 reindex_target_tcs,
             })
         }
-        x if x == OPCODE_MAP_KEY_ONLY => OpNode::Map(MapKind::KeyOnly),
-        x if x == OPCODE_MAP_HASH_ROW => {
+        OPCODE_MAP_KEY_ONLY => OpNode::Map(MapKind::KeyOnly),
+        OPCODE_MAP_HASH_ROW => {
             let branch_id = cols
                 .iter()
                 .find(|c| c.kind == NODE_COL_KIND_BRANCH_ID)
@@ -349,11 +347,11 @@ pub fn decode_op_node(
                 .unwrap_or(0);
             OpNode::Map(MapKind::HashRow(collect_cols(NODE_COL_KIND_PROJ), branch_id))
         }
-        x if x == OPCODE_NEGATE => OpNode::Negate,
-        x if x == OPCODE_UNION => OpNode::Union,
-        x if x == OPCODE_DELAY => OpNode::Delay,
-        x if x == OPCODE_DISTINCT => OpNode::Distinct,
-        x if x == OPCODE_REDUCE => {
+        OPCODE_NEGATE => OpNode::Negate,
+        OPCODE_UNION => OpNode::Union,
+        OPCODE_DELAY => OpNode::Delay,
+        OPCODE_DISTINCT => OpNode::Distinct,
+        OPCODE_REDUCE => {
             let group_cols = collect_cols(NODE_COL_KIND_GROUP);
             let specs = collect_aggs()?;
             let agg = if specs.is_empty() {
@@ -363,10 +361,10 @@ pub fn decode_op_node(
             };
             OpNode::Reduce { group_cols, agg }
         }
-        x if x == OPCODE_JOIN_DELTA_TRACE => OpNode::Join(JoinKind::DeltaTrace),
-        x if x == OPCODE_JOIN_DELTA_TRACE_OUTER => OpNode::Join(JoinKind::DeltaTraceOuter),
-        x if x == OPCODE_JOIN_DELTA_DELTA => OpNode::Join(JoinKind::DeltaDelta),
-        x if x == OPCODE_JOIN_DELTA_TRACE_RANGE => {
+        OPCODE_JOIN_DELTA_TRACE => OpNode::Join(JoinKind::DeltaTrace),
+        OPCODE_JOIN_DELTA_TRACE_OUTER => OpNode::Join(JoinKind::DeltaTraceOuter),
+        OPCODE_JOIN_DELTA_DELTA => OpNode::Join(JoinKind::DeltaDelta),
+        OPCODE_JOIN_DELTA_TRACE_RANGE => {
             // n_eq + rel ride in a single NODE_COL_KIND_RANGE_JOIN row. Reject a
             // missing row or an unknown rel at this decode trust boundary rather
             // than letting a bogus probe shape survive downstream.
@@ -379,23 +377,23 @@ pub fn decode_op_node(
                 .ok_or_else(|| format!("JOIN_DELTA_TRACE_RANGE unknown rel {}", row.value2))?;
             OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel })
         }
-        x if x == OPCODE_ANTI_JOIN_DELTA_TRACE => OpNode::AntiJoin(JoinKind::DeltaTrace),
-        x if x == OPCODE_ANTI_JOIN_DELTA_DELTA => OpNode::AntiJoin(JoinKind::DeltaDelta),
-        x if x == OPCODE_SEMI_JOIN_DELTA_TRACE => OpNode::SemiJoin(JoinKind::DeltaTrace),
-        x if x == OPCODE_SEMI_JOIN_DELTA_DELTA => OpNode::SemiJoin(JoinKind::DeltaDelta),
-        x if x == OPCODE_INTEGRATE => OpNode::IntegrateSink,
-        x if x == OPCODE_INTEGRATE_TRACE => OpNode::IntegrateTrace,
-        x if x == OPCODE_EXCHANGE_SHARD => OpNode::ExchangeShard {
+        OPCODE_ANTI_JOIN_DELTA_TRACE => OpNode::AntiJoin(JoinKind::DeltaTrace),
+        OPCODE_ANTI_JOIN_DELTA_DELTA => OpNode::AntiJoin(JoinKind::DeltaDelta),
+        OPCODE_SEMI_JOIN_DELTA_TRACE => OpNode::SemiJoin(JoinKind::DeltaTrace),
+        OPCODE_SEMI_JOIN_DELTA_DELTA => OpNode::SemiJoin(JoinKind::DeltaDelta),
+        OPCODE_INTEGRATE => OpNode::IntegrateSink,
+        OPCODE_INTEGRATE_TRACE => OpNode::IntegrateTrace,
+        OPCODE_EXCHANGE_SHARD => OpNode::ExchangeShard {
             shard_cols: collect_cols(NODE_COL_KIND_SHARD),
         },
-        x if x == OPCODE_EXCHANGE_GATHER => OpNode::ExchangeGather,
-        x if x == OPCODE_NULL_EXTEND => OpNode::NullExtend {
+        OPCODE_EXCHANGE_GATHER => OpNode::ExchangeGather,
+        OPCODE_NULL_EXTEND => OpNode::NullExtend {
             type_codes: collect_typecodes(NODE_COL_KIND_NULL_EXT),
         },
-        x if x == OPCODE_GATHER_REDUCE => OpNode::GatherReduce,
-        x if x == OPCODE_SEEK_TRACE => OpNode::SeekTrace,
-        x if x == OPCODE_CLEAR_DELTAS => OpNode::ClearDeltas,
-        x if x == OPCODE_PARTITION_FILTER => OpNode::PartitionFilter,
+        OPCODE_GATHER_REDUCE => OpNode::GatherReduce,
+        OPCODE_SEEK_TRACE => OpNode::SeekTrace,
+        OPCODE_CLEAR_DELTAS => OpNode::ClearDeltas,
+        OPCODE_PARTITION_FILTER => OpNode::PartitionFilter,
         _ => return Err(format!("unknown opcode {opcode}")),
     })
 }
@@ -440,30 +438,8 @@ mod tests {
                 value2: 0,
             },
         ];
-        let node = decode_op_node(OPCODE_MAP_EXPR, None, None, Some(vec![1, 2, 3]), &cols).unwrap();
+        let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1, 2, 3]), &cols).unwrap();
         assert_eq!(reindex_cols_of(node), vec![3, 9]);
-    }
-
-    /// Circuits persisted before the column-list migration carry the reindex in
-    /// the legacy single cell and no kind rows; that cell is the fallback.
-    #[test]
-    fn decode_reindex_cols_legacy_cell_fallback() {
-        let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(7), Some(vec![1, 2, 3]), &[]).unwrap();
-        assert_eq!(reindex_cols_of(node), vec![7]);
-    }
-
-    /// When both the legacy cell and kind rows are present, the kind rows win
-    /// (the cell is only consulted when no kind rows exist).
-    #[test]
-    fn decode_reindex_cols_kind_rows_win_over_cell() {
-        let cols = [CircuitNodeColumn {
-            kind: NODE_COL_KIND_REINDEX,
-            position: 0,
-            value1: 4,
-            value2: 0,
-        }];
-        let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(7), Some(vec![1, 2, 3]), &cols).unwrap();
-        assert_eq!(reindex_cols_of(node), vec![4]);
     }
 
     /// A non-zero `value2` is the promoted key type code `T`, decoded parallel to
@@ -484,15 +460,8 @@ mod tests {
                 value2: crate::type_code::I64 as u64,
             }, // T = I64
         ];
-        let node = decode_op_node(OPCODE_MAP_EXPR, None, None, Some(vec![1, 2, 3]), &cols).unwrap();
+        let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1, 2, 3]), &cols).unwrap();
         assert_eq!(reindex_of(node), (vec![3, 3], vec![0, crate::type_code::I64]));
-    }
-
-    /// The legacy single-cell fallback yields all-zero target tcs.
-    #[test]
-    fn decode_legacy_cell_yields_zero_target_tcs() {
-        let node = decode_op_node(OPCODE_MAP_EXPR, None, Some(7), Some(vec![1, 2, 3]), &[]).unwrap();
-        assert_eq!(reindex_of(node), (vec![7], vec![0]));
     }
 
     /// A range-join node decodes its `(n_eq, rel)` from the NODE_COL_KIND_RANGE_JOIN
@@ -505,7 +474,7 @@ mod tests {
             value1: 2,
             value2: RangeRel::Gt.as_u64(),
         }];
-        let node = decode_op_node(OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, None, &cols).unwrap();
+        let node = decode_op_node(OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, &cols).unwrap();
         assert_eq!(
             node,
             OpNode::Join(JoinKind::DeltaTraceRange {
@@ -519,7 +488,7 @@ mod tests {
     /// boundary rather than defaulting to a bogus probe shape.
     #[test]
     fn decode_range_join_rejects_missing_param_row() {
-        let err = decode_op_node(OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, None, &[]).unwrap_err();
+        let err = decode_op_node(OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, &[]).unwrap_err();
         assert!(err.contains("missing range-join param row"), "got: {err}");
     }
 
@@ -532,14 +501,14 @@ mod tests {
             value1: 0,
             value2: 99,
         }];
-        let err = decode_op_node(OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, None, &cols).unwrap_err();
+        let err = decode_op_node(OPCODE_JOIN_DELTA_TRACE_RANGE, None, None, &cols).unwrap_err();
         assert!(err.contains("unknown rel"), "got: {err}");
     }
 
     /// The partition-filter opcode decodes to the payload-free node.
     #[test]
     fn decode_partition_filter() {
-        let node = decode_op_node(OPCODE_PARTITION_FILTER, None, None, None, &[]).unwrap();
+        let node = decode_op_node(OPCODE_PARTITION_FILTER, None, None, &[]).unwrap();
         assert_eq!(node, OpNode::PartitionFilter);
     }
 
@@ -553,7 +522,19 @@ mod tests {
             value1: 3,
             value2: crate::type_code::F64 as u64,
         }];
-        let err = decode_op_node(OPCODE_MAP_EXPR, None, None, Some(vec![1, 2, 3]), &cols).unwrap_err();
+        let err = decode_op_node(OPCODE_MAP_EXPR, None, Some(vec![1, 2, 3]), &cols).unwrap_err();
         assert!(err.contains("not PK-eligible"), "got: {err}");
+    }
+
+    /// A SCAN node with a NULL `source_table` cell is a corrupt circuit: reject it at
+    /// the decode trust boundary rather than coercing to the (invalid) table id 0.
+    #[test]
+    fn decode_rejects_scan_missing_source_table() {
+        assert!(decode_op_node(OPCODE_SCAN_DELTA, None, None, &[])
+            .unwrap_err()
+            .contains("source_table"));
+        assert!(decode_op_node(OPCODE_SCAN_TRACE_TABLE, None, None, &[])
+            .unwrap_err()
+            .contains("source_table"));
     }
 }

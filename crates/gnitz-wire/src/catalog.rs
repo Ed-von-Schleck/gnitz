@@ -75,11 +75,6 @@ pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
         nullable: true,
     },
     WireSysCol {
-        name: "reindex_col",
-        type_code: TypeCode::U64,
-        nullable: true,
-    },
-    WireSysCol {
         name: "expr_program",
         type_code: TypeCode::Blob,
         nullable: true,
