@@ -1807,3 +1807,87 @@ fn test_residual_mixed_string_int_rejected() {
         "no view should be registered"
     );
 }
+
+// ── Case-insensitive qualified alias (A1) ────────────────────────────────────
+
+/// The join `AliasMap` is keyed by lowercased aliases, but the case-preserving
+/// dialect hands the ON clause the raw spelling. An uppercase `A` referencing
+/// alias `a` must still resolve (SQL identifiers are case-insensitive). Bug path:
+/// `ON A.x` routes through resolve_join_col_ref -> resolve_qualified_column("A", ...).
+#[test]
+fn test_join_uppercase_alias_in_on_clause() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+
+    p.execute("CREATE TABLE t (x BIGINT NOT NULL PRIMARY KEY, p BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE u (y BIGINT NOT NULL PRIMARY KEY, q BIGINT NOT NULL)")
+        .unwrap();
+
+    let r = p.execute("CREATE VIEW v AS SELECT a.p AS ap, b.q AS bq FROM t a JOIN u b ON A.x = b.y");
+    assert!(r.is_ok(), "uppercase alias in ON clause failed: {:?}", r.err());
+}
+
+// ── Band LEFT JOIN over a non-base-table preserved side (A2) ─────────────────
+
+/// A band (equi + range) LEFT JOIN builds its null-fill as
+/// `a_all − distinct(π_A(inner))`, which clamps matched multiplicity to 1 and is
+/// weight-exact only for a unique-PK (base-table) preserved side. A view can be
+/// bag-valued (a UNION ALL that drops the PK collapses duplicate projected content
+/// to one `_set_pk` identity of weight >= 2), so the shape is rejected. A base-table
+/// left side still compiles.
+#[test]
+fn test_band_left_join_rejects_view_preserved_side() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+
+    p.execute("CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE inr (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE lt (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)")
+        .unwrap();
+    // Genuinely bag-valued: the projection DROPS the PK (`id`), so two source rows
+    // sharing (k, lo) collapse to one _set_pk identity of weight 2. uv: [_set_pk, k, lo].
+    p.execute("CREATE VIEW uv AS SELECT k, lo FROM t1 UNION ALL SELECT k, lo FROM t2")
+        .unwrap();
+
+    // Same band LEFT over a base table on the left still compiles (positive control).
+    let ok = p.execute(
+        "CREATE VIEW good AS SELECT lt.id AS a, inr.id AS b \
+         FROM lt LEFT JOIN inr ON lt.k = inr.k AND lt.lo <= inr.t",
+    );
+    assert!(
+        ok.is_ok(),
+        "band LEFT over a base table must still compile: {:?}",
+        ok.err()
+    );
+
+    // Band LEFT (k equi + lo<=t range) over the bag-valued view -> rejected, not registered.
+    let err = p
+        .execute(
+            "CREATE VIEW bad AS SELECT uv.k AS a, inr.id AS b \
+             FROM uv LEFT JOIN inr ON uv.k = inr.k AND uv.lo <= inr.t",
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, GnitzSqlError::Unsupported(_)),
+        "expected Unsupported, got {:?}",
+        err
+    );
+    // `p`'s &mut client borrow ends above (no further `p` use), so the direct probe is ok.
+    assert!(
+        client.resolve_table_or_view_id(&sn, "bad").is_err(),
+        "rejected view must not register"
+    );
+}

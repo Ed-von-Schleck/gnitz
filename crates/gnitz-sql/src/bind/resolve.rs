@@ -45,14 +45,16 @@ pub(crate) fn find_unique_column(columns: &[ColumnDef], col_name: &str) -> Resul
 }
 
 /// Resolves a column in a multi-table context (for joins).
-/// `tables` maps alias/name → `ResolvedRelation`.
+/// `tables` is keyed by lowercased aliases, so the `table_alias` probe is lowercased
+/// to match — SQL identifiers are case-insensitive, but the case-preserving dialect
+/// hands us the raw spelling (e.g. `A` for alias `a`).
 pub(crate) fn resolve_qualified_column(
     table_alias: &str,
     col_name: &str,
     tables: &AliasMap,
 ) -> Result<usize, GnitzSqlError> {
     let rel = tables
-        .get(table_alias)
+        .get(&table_alias.to_lowercase())
         .ok_or_else(|| GnitzSqlError::Bind(format!("table alias '{table_alias}' not found")))?;
     let idx = find_unique_column(&rel.schema.columns, col_name)?
         .ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in table '{table_alias}'")))?;
@@ -190,5 +192,28 @@ mod tests {
             Err(GnitzSqlError::Bind(s)) => assert!(s.contains("ambiguous"), "got: {s}"),
             other => panic!("expected Bind(ambiguous), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_resolve_qualified_column_case_insensitive_alias() {
+        // The AliasMap is keyed by lowercased aliases (join.rs builds it with
+        // `.to_lowercase()`); under the case-preserving GenericDialect a reference
+        // like `ON A.x = ...` arrives as raw "A". The probe must lowercase to hit,
+        // and `col_offset` must still be added through.
+        let mut map: AliasMap = HashMap::new();
+        map.insert(
+            "a".to_string(),
+            ResolvedRelation {
+                table_id: 1,
+                schema: Rc::new(Schema {
+                    columns: vec![col("x", TypeCode::I64), col("y", TypeCode::I64)],
+                    pk_cols: vec![0],
+                }),
+                col_offset: 10,
+            },
+        );
+        assert_eq!(resolve_qualified_column("A", "x", &map).unwrap(), 10);
+        assert_eq!(resolve_qualified_column("A", "y", &map).unwrap(), 11);
+        assert_eq!(resolve_qualified_column("a", "x", &map).unwrap(), 10); // lower still works
     }
 }

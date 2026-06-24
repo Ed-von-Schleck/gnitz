@@ -168,6 +168,22 @@ pub(crate) fn execute_create_join_view(
     // Range (band) join: one range conjunct (optionally behind equality
     // conjuncts) routes to the broadcast / re-key / output-exchange circuit.
     if let Some(range) = range_conjunct {
+        // Band (n_eq >= 1) LEFT null-fill is `A − distinct(π_A(inner))`; `distinct` clamps
+        // each matched left identity to weight 1, so it is weight-exact only when the
+        // preserved (left) side's identities are unique — true for a unique_pk base table,
+        // but a view can be bag-valued (e.g. a UNION ALL dropping the PK), leaking a spurious
+        // null-fill. `resolve_table_id` hits TABLE_TAB only, so a view/CTE misses it (the same
+        // discriminator `resolve_base_table` uses). Pure-range LEFT (n_eq == 0) is unaffected.
+        let n_eq = left_join_cols.len();
+        if is_left_join && n_eq >= 1 && client.resolve_table_id(schema_name, &left_name).is_err() {
+            return Err(GnitzSqlError::Unsupported(
+                "band LEFT JOIN does not currently support a non-base-table preserved \
+                 (left) side (e.g. a view); its null-fill clamps matched multiplicity to \
+                 1, over-filling a bag-valued input — use INNER JOIN or a base table on \
+                 the left"
+                    .into(),
+            ));
+        }
         return build_range_join_view(
             client,
             schema_name,
