@@ -9,7 +9,7 @@ use crate::bind::{
 };
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr};
-use crate::lower::compile_bound_expr;
+use crate::lower::compile_bound_expr_to_program;
 use crate::plan::validate::reject_float_key;
 use gnitz_core::{ColumnDef, ExprBuilder, RangeRel, Schema, TypeCode};
 use sqlparser::ast::{BinaryOperator, Expr};
@@ -75,9 +75,7 @@ pub(crate) fn multi_null_filter_prog(
     for &c in &cols[1..] {
         expr = BoundExpr::BinOp(Box::new(expr), op, Box::new(leaf(c)));
     }
-    let mut eb = ExprBuilder::new();
-    let (r, _) = compile_bound_expr(&expr, schema, &mut eb)?;
-    Ok(eb.build(r))
+    compile_bound_expr_to_program(&expr, schema)
 }
 
 /// Build a reindex ExprProgram that copies all columns as payload. Arity-
@@ -495,9 +493,7 @@ pub(crate) fn build_residual_filter_prog(
             Some(a) => BoundExpr::BinOp(Box::new(a), BinOp::And, Box::new(b)),
         });
     }
-    let mut eb = ExprBuilder::new();
-    let (r, _) = compile_bound_expr(&acc.expect("non-empty residual"), merged_schema, &mut eb)?;
-    Ok(eb.build(r))
+    compile_bound_expr_to_program(&acc.expect("non-empty residual"), merged_schema)
 }
 
 #[cfg(test)]

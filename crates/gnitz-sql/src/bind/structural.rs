@@ -1,4 +1,5 @@
 use super::resolve::{find_unique_column, Binder};
+use crate::ast_util::single_relation_col_name;
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr, UnaryOp};
 use crate::types::is_min_max_orderable;
@@ -175,11 +176,8 @@ impl SingleTable<'_> {
     /// (it carries no disambiguating information — a duplicated name is ambiguous
     /// even when qualified).
     fn idx(&self, e: &Expr) -> Result<usize, GnitzSqlError> {
-        let name = match e {
-            Expr::Identifier(id) => &id.value,
-            Expr::CompoundIdentifier(p) if p.len() == 2 => &p[1].value,
-            _ => return Err(GnitzSqlError::Unsupported("expected a column reference".into())),
-        };
+        let name = single_relation_col_name(e)
+            .ok_or_else(|| GnitzSqlError::Unsupported("expected a column reference".into()))?;
         find_unique_column(&self.schema.columns, name)?
             .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found")))
     }

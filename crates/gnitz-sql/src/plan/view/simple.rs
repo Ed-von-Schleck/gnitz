@@ -6,7 +6,7 @@ use crate::ast_util::{extract_table_factor_name, is_wildcard_projection};
 use crate::bind::Binder;
 use crate::codec::project_schema::{build_projection, ProjItem};
 use crate::error::GnitzSqlError;
-use crate::lower::compile_bound_expr;
+use crate::lower::{compile_bound_expr, compile_bound_expr_to_program};
 use crate::plan::validate::reject_duplicate_column_names;
 use crate::SqlResult;
 use gnitz_core::{CircuitBuilder, ExprBuilder, GnitzClient};
@@ -26,9 +26,7 @@ pub(crate) fn execute_create_simple_view(
     // Build filter expression (if any)
     let expr_prog = if let Some(where_expr) = &select.selection {
         let bound = binder.bind_expr(where_expr, &source_schema)?;
-        let mut eb = ExprBuilder::new();
-        let (result_reg, _) = compile_bound_expr(&bound, &source_schema, &mut eb)?;
-        Some(eb.build(result_reg))
+        Some(compile_bound_expr_to_program(&bound, &source_schema)?)
     } else {
         None
     };
@@ -87,7 +85,7 @@ pub(crate) fn execute_create_simple_view(
                     eb.copy_col(tc, *src_col as u32, payload_idx);
                 }
                 ProjItem::Computed { bound_expr, .. } => {
-                    let (reg, _) = compile_bound_expr(bound_expr, &source_schema, &mut eb)?;
+                    let reg = compile_bound_expr(bound_expr, &source_schema, &mut eb)?;
                     // EMIT writes the raw register bits via append_int — correct for float.
                     eb.emit_col(reg, payload_idx);
                 }

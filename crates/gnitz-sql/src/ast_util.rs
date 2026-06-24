@@ -29,3 +29,16 @@ pub(crate) fn extract_table_factor_name(
         ))),
     }
 }
+
+/// Bare column name of a single-relation reference: a plain `Identifier`, or a
+/// two-part `CompoundIdentifier` whose qualifier adds no disambiguation over a
+/// single grouped/base relation. `None` for any other shape, so each caller
+/// raises its own context-specific error.
+pub(crate) fn single_relation_col_name(e: &sqlparser::ast::Expr) -> Option<&str> {
+    use sqlparser::ast::Expr;
+    match e {
+        Expr::Identifier(id) => Some(&id.value),
+        Expr::CompoundIdentifier(p) if p.len() == 2 => Some(&p[1].value),
+        _ => None,
+    }
+}

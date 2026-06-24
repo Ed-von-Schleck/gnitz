@@ -6,10 +6,10 @@ use crate::ast_util::{extract_table_factor_name, is_wildcard_projection};
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use crate::lower::compile_bound_expr;
+use crate::lower::compile_bound_expr_to_program;
 use crate::plan::validate::{reject_duplicate_column_names, reject_float_keys};
 use crate::SqlResult;
-use gnitz_core::{CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, Schema, TypeCode};
+use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, Schema, TypeCode};
 use sqlparser::ast::{SelectItem, SetExpr, SetOperator, SetQuantifier};
 
 fn compile_set_op_side(
@@ -18,13 +18,14 @@ fn compile_set_op_side(
     binder: &mut Binder<'_>,
     cb: &mut CircuitBuilder,
     branch_id: u8,
+    context: &str,
 ) -> Result<(gnitz_core::NodeId, Vec<ColumnDef>, u64), GnitzSqlError> {
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-        return Err(GnitzSqlError::Unsupported(
-            "set operation: each side must be a simple SELECT from one table".to_string(),
-        ));
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{context}: only a single table without JOINs is supported"
+        )));
     }
-    let table_name = extract_table_factor_name(&select.from[0].relation, "set operation")?;
+    let table_name = extract_table_factor_name(&select.from[0].relation, context)?;
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
 
     let inp = cb.input_delta_tagged(source_tid);
@@ -32,10 +33,7 @@ fn compile_set_op_side(
     // Optional WHERE
     let filtered = if let Some(where_expr) = &select.selection {
         let bound = binder.bind_expr(where_expr, &source_schema)?;
-        let mut eb = ExprBuilder::new();
-        let (result_reg, _) = compile_bound_expr(&bound, &source_schema, &mut eb)?;
-        let prog = eb.build(result_reg);
-        cb.filter(inp, Some(prog))
+        cb.filter(inp, Some(compile_bound_expr_to_program(&bound, &source_schema)?))
     } else {
         inp
     };
@@ -43,7 +41,7 @@ fn compile_set_op_side(
     // Resolve the projection to a set of source column indices (in SELECT
     // order). Unlike `build_projection`, the source PK is NOT force-included:
     // set membership is over exactly the projected columns.
-    let (proj_indices, out_cols) = resolve_set_projection(&select.projection, &source_schema, binder)?;
+    let (proj_indices, out_cols) = resolve_set_projection(&select.projection, &source_schema, binder, context)?;
 
     // Reindex by a hash of the projected columns, so set membership
     // (EXCEPT/INTERSECT/UNION-distinct) is decided by the projected row content,
@@ -69,6 +67,7 @@ fn resolve_set_projection(
     projection: &[SelectItem],
     source_schema: &Schema,
     binder: &Binder<'_>,
+    context: &str,
 ) -> Result<(Vec<usize>, Vec<ColumnDef>), GnitzSqlError> {
     if is_wildcard_projection(projection) {
         let indices: Vec<usize> = (0..source_schema.columns.len()).collect();
@@ -91,9 +90,9 @@ fn resolve_set_projection(
                     out_cols.push(source_schema.columns[ci].clone());
                 }
                 _ => {
-                    return Err(GnitzSqlError::Unsupported(
-                        "set operation: computed expressions in a SELECT side are not supported".into(),
-                    ))
+                    return Err(GnitzSqlError::Unsupported(format!(
+                        "{context}: computed expressions are not supported"
+                    )))
                 }
             },
             SelectItem::ExprWithAlias { expr, alias } => match binder.bind_expr(expr, source_schema)? {
@@ -104,15 +103,15 @@ fn resolve_set_projection(
                     out_cols.push(col);
                 }
                 _ => {
-                    return Err(GnitzSqlError::Unsupported(
-                        "set operation: computed expressions in a SELECT side are not supported".into(),
-                    ))
+                    return Err(GnitzSqlError::Unsupported(format!(
+                        "{context}: computed expressions are not supported"
+                    )))
                 }
             },
             _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "set operation: unsupported SELECT item".into(),
-                ))
+                return Err(GnitzSqlError::Unsupported(format!(
+                    "{context}: unsupported SELECT item"
+                )))
             }
         }
     }
@@ -161,9 +160,10 @@ pub(crate) fn execute_create_set_op_view(
     // identical rows, so both sides use branch_id = 0.
     let right_branch_id = matches!((op, set_quantifier), (SetOperator::Union, SetQuantifier::All)) as u8;
 
-    let (left_node, left_cols, left_tid) = compile_set_op_side(client, left_select, binder, &mut cb, 0)?;
+    let (left_node, left_cols, left_tid) =
+        compile_set_op_side(client, left_select, binder, &mut cb, 0, "set operation")?;
     let (right_node, right_cols, right_tid) =
-        compile_set_op_side(client, right_select, binder, &mut cb, right_branch_id)?;
+        compile_set_op_side(client, right_select, binder, &mut cb, right_branch_id, "set operation")?;
 
     // INTERSECT/EXCEPT inline both branches and semi/anti-join each against the
     // other's delayed trace with no same-epoch cross-correction. When both
@@ -302,38 +302,14 @@ pub(crate) fn execute_create_distinct_view(
     select: &sqlparser::ast::Select,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-        return Err(GnitzSqlError::Unsupported(
-            "SELECT DISTINCT: only single table without JOINs".to_string(),
-        ));
-    }
-    let table_name = extract_table_factor_name(&select.from[0].relation, "SELECT DISTINCT")?;
-    let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
-
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
-    let mut cb = CircuitBuilder::new(view_id, source_tid);
-    let inp = cb.input_delta();
-
-    // Optional WHERE
-    let filtered = if let Some(where_expr) = &select.selection {
-        let bound = binder.bind_expr(where_expr, &source_schema)?;
-        let mut eb = ExprBuilder::new();
-        let (result_reg, _) = compile_bound_expr(&bound, &source_schema, &mut eb)?;
-        let prog = eb.build(result_reg);
-        cb.filter(inp, Some(prog))
-    } else {
-        inp
-    };
-
-    // Project the requested columns, then reindex by a hash of just those
-    // columns so `distinct` deduplicates on the projected content. Without the
-    // projection, reindexing by the source PK (unique by definition) makes
-    // `distinct` a no-op and leaks the unselected columns.
-    let (proj_indices, proj_cols) = resolve_set_projection(&select.projection, &source_schema, binder)?;
-    let reindexed = cb.map_hash_row(filtered, &proj_indices, 0);
-    // Repartition by the synthetic hash PK so `distinct` deduplicates across
-    // workers: every copy of a projected row must land on the same worker.
-    let sharded = cb.shard(reindexed, &[0]);
+    let mut cb = CircuitBuilder::new(view_id, 0);
+    // Reuse the set-op side pipeline (validate FROM, resolve, input delta,
+    // optional WHERE, project, hash-reindex by the projected content, and shard)
+    // under the "SELECT DISTINCT" error context. `distinct` then dedups on that
+    // hash-of-projection PK; keying by the source PK (unique) would make it a
+    // no-op and leak the unprojected columns.
+    let (sharded, proj_cols, _) = compile_set_op_side(client, select, binder, &mut cb, 0, "SELECT DISTINCT")?;
     let distinct_node = cb.distinct(sharded);
 
     cb.sink(distinct_node);

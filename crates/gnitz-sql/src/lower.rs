@@ -278,16 +278,29 @@ impl BoundExprBackend for OpcodeBackend<'_> {
     }
 }
 
-/// Compile a BoundExpr to ExprBuilder opcodes.
-/// Returns `(result_reg, is_float)` where `is_float` indicates the register
-/// holds f64 bit-pattern rather than a plain i64.
+/// Compile a BoundExpr to ExprBuilder opcodes, returning the result register.
+/// The internal `is_float` bit that drives float-cast lowering is consumed only
+/// inside the `OpcodeBackend` recursion and never escapes here.
 pub(crate) fn compile_bound_expr(
     expr: &BoundExpr,
     schema: &Schema,
     eb: &mut ExprBuilder,
-) -> Result<(u32, bool), GnitzSqlError> {
+) -> Result<u32, GnitzSqlError> {
     let mut backend = OpcodeBackend { schema, eb };
-    lower_bound_expr(expr, &mut backend)
+    lower_bound_expr(expr, &mut backend).map(|(reg, _)| reg)
+}
+
+/// Compile a standalone BoundExpr into a finished `ExprProgram` (fresh
+/// `ExprBuilder`, result register wired up). The one-shot form behind every
+/// WHERE/HAVING/residual filter that needs a whole program rather than a
+/// register threaded into a larger one.
+pub(crate) fn compile_bound_expr_to_program(
+    expr: &BoundExpr,
+    schema: &Schema,
+) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
+    let mut eb = ExprBuilder::new();
+    let reg = compile_bound_expr(expr, schema, &mut eb)?;
+    Ok(eb.build(reg))
 }
 
 #[cfg(test)]

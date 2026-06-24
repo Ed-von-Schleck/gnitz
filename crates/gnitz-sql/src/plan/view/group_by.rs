@@ -3,11 +3,11 @@
 //! post-reduce projection, and the HAVING cluster (collection, binding, and the
 //! `Having` leaf binder over the grouped relation).
 
-use crate::ast_util::extract_table_factor_name;
+use crate::ast_util::{extract_table_factor_name, single_relation_col_name};
 use crate::bind::{bind_structural, find_unique_column, Binder, LeafBinder};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr};
-use crate::lower::compile_bound_expr;
+use crate::lower::compile_bound_expr_to_program;
 use crate::plan::validate::{reject_duplicate_column_names, reject_float_key};
 use crate::types::{is_integer_type, is_min_max_orderable, is_wide_int};
 use crate::SqlResult;
@@ -340,10 +340,7 @@ pub(crate) fn execute_create_group_by_view(
     // Optional WHERE filter
     let filtered = if let Some(where_expr) = &select.selection {
         let bound = binder.bind_expr(where_expr, &source_schema)?;
-        let mut eb = ExprBuilder::new();
-        let (result_reg, _) = compile_bound_expr(&bound, &source_schema, &mut eb)?;
-        let prog = eb.build(result_reg);
-        cb.filter(inp, Some(prog))
+        cb.filter(inp, Some(compile_bound_expr_to_program(&bound, &source_schema)?))
     } else {
         inp
     };
@@ -564,10 +561,7 @@ pub(crate) fn execute_create_group_by_view(
                 agg_col_offset,
             },
         )?;
-        let mut heb = ExprBuilder::new();
-        let (result_reg, _) = compile_bound_expr(&bound, &reduce_schema, &mut heb)?;
-        let prog = heb.build(result_reg);
-        cb.filter(reduced, Some(prog))
+        cb.filter(reduced, Some(compile_bound_expr_to_program(&bound, &reduce_schema)?))
     } else {
         reduced
     };
@@ -865,15 +859,8 @@ impl LeafBinder for Having<'_> {
         // HAVING references the grouped relation by source column name. A qualified
         // ref (`t.g`) resolves the bare name the same way — the qualifier carries no
         // disambiguating information over a single grouped relation.
-        let col_name = match e {
-            Expr::Identifier(id) => &id.value,
-            Expr::CompoundIdentifier(p) if p.len() == 2 => &p[1].value,
-            _ => {
-                return Err(GnitzSqlError::Unsupported(format!(
-                    "HAVING: unsupported column reference {e:?}"
-                )))
-            }
-        };
+        let col_name = single_relation_col_name(e)
+            .ok_or_else(|| GnitzSqlError::Unsupported(format!("HAVING: unsupported column reference {e:?}")))?;
         let src = find_unique_column(&ctx.source_schema.columns, col_name)?
             .ok_or_else(|| GnitzSqlError::Bind(format!("HAVING: column '{col_name}' not found")))?;
         // HAVING may only reference grouped columns.
