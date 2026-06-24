@@ -1,11 +1,11 @@
 # gnitz-sql correctness and cleanup
 
 A code-quality pass over `crates/gnitz-sql/src` (the SQL front end: parse → bind →
-plan/lower for views, or → execute for DML). The four correctness fixes (C1–C4) that
-change query results or accepted DDL have shipped (see "Correctness fixes (C1–C4) —
-DONE" below); the twenty-one remaining changes are ordered by leverage
-(impact × confidence ÷ effort) and grouped into themes — duplication, type-safety, and
-hygiene with no behavioural change unless noted.
+plan/lower for views, or → execute for DML). The behavioural fixes that change query
+results or accepted DDL have shipped — the four correctness fixes C1–C4 and the two
+Theme A fixes A1–A2 (see the "— DONE" sections below); the nineteen remaining changes are
+ordered by leverage (impact × confidence ÷ effort) and grouped into themes — duplication,
+type-safety, and hygiene with no behavioural change unless noted.
 
 Every item names exact `file:line` anchors, the change (with code), the invariants
 it must not break, effort (S/M/L), value, and how to verify. Line numbers are from
@@ -35,82 +35,28 @@ tests (`cargo test -p gnitz-sql --features integration`).
 
 ---
 
-## Theme A — Resolution and join null-fill robustness
+## Theme A (A1–A2) — DONE
 
-### A1 — Case-insensitive qualified-column alias lookup
+Shipped. Two behavioural fixes that turn a silent wrong outcome into correct behaviour.
+Validated by a pure unit test (run under `make verify`) plus feature-gated integration
+tests (`cargo test -p gnitz-sql --features integration`).
 
-- **Files:** `bind/resolve.rs:49-60`
-- **Problem:** `resolve_qualified_column` probes `tables.get(table_alias)` with the
-  raw AST identifier, but every join `AliasMap` is keyed by lowercased aliases
-  (join.rs inserts `left_alias.to_lowercase()` / `right_alias.to_lowercase()`).
-  Under `GenericDialect` (case-preserving), `ON A.x = b.y` against `FROM t a` misses
-  the map and errors "table alias 'A' not found" — while the *column* half of the
-  same reference resolves case-insensitively via `find_unique_column`'s
-  `eq_ignore_ascii_case`. This is the lone case-sensitive lookup in the resolver.
-- **Change:** Lowercase only the probe key, leaving `table_alias` in the message:
-
-  ```rust
-  let rel = tables
-      .get(&table_alias.to_ascii_lowercase())
-      .ok_or_else(|| GnitzSqlError::Bind(format!("table alias '{table_alias}' not found")))?;
-  ```
-
-- **Invariants:** `resolve_qualified_column` is the join-only multi-table resolver
-  (its doc says so); every `AliasMap` reaching it is built with lowercased keys, so
-  lowercasing the probe is safe for all of them. The `Binder.cache` (raw-keyed) is
-  never passed here. Keep `find_unique_column` case-insensitive.
-- **Effort:** S. **Value:** Medium — internally inconsistent and SQL-incorrect;
-  one-line fix.
-- **Verify:** Unit test: `AliasMap` keyed `"a"`, `resolve_qualified_column("A", …)`
-  resolves. E2E: `CREATE VIEW v AS SELECT * FROM t a JOIN u b ON A.x = b.y` binds.
-
-### A2 — Reject band LEFT JOIN over a non-base-table (bag-valued) preserved side
-
-- **Files:** `plan/view/join.rs` — band-LEFT path in `build_range_join_view`
-  (~join.rs:537, the existing `n_eq == 0` range-type guard).
-- **Problem:** A band (n_eq ≥ 1) LEFT-outer null-fill is built as
-  `a_all − distinct(π_A(inner))`. `distinct` clamps each matched preserved-row
-  identity to weight 1 while `a_all` retains its true weight `w`. This is
-  weight-exact only when preserved-side identities are unique. A `UNION ALL` view
-  carries a single synthetic hashed `_set_pk` U128 (set_op.rs:262-268), so two
-  source rows whose projected payload collides within a branch produce one identity
-  of weight 2 — a genuine bag. A matched weight-`w` left row then leaks a spurious
-  weight-`(w−1)` null-fill row. The binder accepts views as the preserved side, and
-  `build_range_join_view` has no unique-PK guard. The sibling pure-range (threshold)
-  and equi (anti-join) null-fill paths are already weight-exact; band is the lone
-  outlier.
-- **Change:** Reject the unsupported shape with a clear error. Classify the preserved
-  (left) source as a base table with a table-only probe — `client.resolve_table_id`
-  consults `TABLE_TAB` only, so a view name misses it (the same discriminator
-  `resolve_base_table` already uses). At the band-LEFT branch:
-
-  ```rust
-  if is_left_join && n_eq >= 1 {
-      // A view's preserved side may be bag-valued (e.g. UNION ALL's synthetic
-      // content-hash PK can collide), and the band null-fill `a_all − distinct(...)`
-      // clamps matched multiplicity to 1, over-filling such a side. Only base
-      // tables are unique_pk-guaranteed.
-      if client.resolve_table_id(schema_name, left_table_name).is_err() {
-          return Err(GnitzSqlError::Unsupported(
-              "band LEFT JOIN requires a base table on the preserved (left) side; \
-               its null-fill clamps matched multiplicity to 1, over-filling a \
-               bag-valued (view) input — use INNER JOIN or a base-table left side".into(),
-          ));
-      }
-  }
-  ```
-
-  This stays entirely within gnitz-sql (one compile-time probe on a rare shape) and
-  newly rejects a currently-miscomputing query — a strict improvement.
-- **Invariants:** Z-set weight-exactness. The load-bearing comment at join.rs:840
-  (`a.pk unique → never spans workers`) is a *partitioning* claim, not a
-  multiplicity claim — do not conflate. The conservative rejection of *any* view
-  (even a simple unique-PK-preserving one) is acceptable: band LEFT JOIN over a view
-  is exotic, and correctness beats permissiveness here.
-- **Effort:** M. **Value:** Medium — closes a silent wrong-weight result.
-- **Verify:** E2E: band LEFT JOIN with a `UNION ALL` view on the preserved side now
-  returns `Unsupported`; band LEFT JOIN over a base table still compiles and
-  produces correct weights.
+- **A1** — qualified-column alias lookup in joins is now case-insensitive.
+  `resolve_qualified_column` (`bind/resolve.rs`) lowercases its probe key (`to_lowercase`,
+  matching the lowercased join `AliasMap` keys) so `ON A.x = b.y` against `FROM t a` binds
+  under the case-preserving `GenericDialect`. One-line fix at the single resolver chokepoint.
+- **A2** — a band (equi + range, n_eq ≥ 1) LEFT JOIN over a non-base-table preserved side is
+  rejected with `Unsupported`, via a caller-side `client.resolve_table_id` base-table probe
+  in `execute_create_join_view` (`plan/view/join.rs`) — *not* inside `build_range_join_view`,
+  which has no relation-name parameter. The band null-fill `a_all − distinct(π_A(inner))`
+  clamps matched multiplicity to 1, silently over-filling a bag-valued left input (e.g. a
+  UNION ALL view whose projection drops the PK, collapsing duplicate projected content to one
+  weight-≥2 `_set_pk` identity). Conservatively rejects *all* non-base-table left sides
+  (views, CTEs) — an accepted over-approximation. Pure-range (n_eq == 0) and equi LEFT remain
+  weight-exact and are unaffected. The weight-exact real fix — replacing the band `distinct`
+  with a threshold-witness anti-join (CLAUDE.md "Weight-exactness") — is a known, deferred
+  *gnitz-engine* change (out of scope for this gnitz-sql pass); a future pass can lift the
+  rejection.
 
 ---
 

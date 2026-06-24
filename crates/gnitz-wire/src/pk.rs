@@ -94,7 +94,7 @@ pub fn decode_pk_column_owned(src: &[u8], tc: u8) -> [u8; 16] {
 /// `dst.len() == wire_stride(target_tc) >= src.len()`. Sign-extends (signed src)
 /// or zero-extends (unsigned src) the native value to the target width, then
 /// [`encode_pk_column`]s at `target_tc`. When `src_tc == target_tc` this is
-/// exactly `encode_pk_column` (no widening) — the back-compat / identity path.
+/// exactly `encode_pk_column` (no widening) — the no-widening fast path.
 ///
 /// Both the trace-side reindex Map and the delta-scatter routing key go through
 /// this single primitive, so equal numeric values from either side of a
@@ -247,7 +247,7 @@ mod tests {
     }
 
     /// `encode_pk_column_promoted` with `src_tc == target_tc` is exactly
-    /// `encode_pk_column` — the identity / back-compat path.
+    /// `encode_pk_column` — the no-widening fast path.
     #[test]
     fn promoted_identity_matches_encode_pk_column() {
         for &(tc, sz) in &[
@@ -268,7 +268,7 @@ mod tests {
                 encode_pk_column(&le[..sz], tc, &mut expect);
                 let mut got = vec![0u8; sz];
                 encode_pk_column_promoted(&le[..sz], tc, tc, &mut got);
-                assert_eq!(got, expect, "identity path differs for tc={tc} v={v}");
+                assert_eq!(got, expect, "no-widening fast path differs for tc={tc} v={v}");
             }
         }
     }

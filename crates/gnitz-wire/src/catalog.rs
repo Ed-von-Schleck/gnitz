@@ -14,6 +14,18 @@ pub struct WireSysCol {
     pub nullable: bool,
 }
 
+/// Terse `WireSysCol` constructor so the column tables read as one line per
+/// column. `pub(crate)` — internal to the wire crate (also used by `control.rs`);
+/// not part of the public surface. `const` so it is callable in the `pub const`
+/// table initializers (visibility does not affect const-eval).
+pub(crate) const fn col(name: &'static str, type_code: TypeCode, nullable: bool) -> WireSysCol {
+    WireSysCol {
+        name,
+        type_code,
+        nullable,
+    }
+}
+
 /// Index of the column named `name` in `cols`, resolved at compile time.
 /// Panics (const-eval failure) if absent, so a renamed/removed column fails the
 /// build rather than silently mis-indexing. `==` on `&str` is not const-stable,
@@ -49,102 +61,30 @@ pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
 // decoded fields as payload so the engine's logical-column readers are
 // unchanged. PK = columns [0, 1].
 pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
-    WireSysCol {
-        name: "view_id",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "sub",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "node_id",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "opcode",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "source_table",
-        type_code: TypeCode::U64,
-        nullable: true,
-    },
-    WireSysCol {
-        name: "expr_program",
-        type_code: TypeCode::Blob,
-        nullable: true,
-    },
+    col("view_id", TypeCode::U64, false),
+    col("sub", TypeCode::U64, false),
+    col("node_id", TypeCode::U64, false),
+    col("opcode", TypeCode::U64, false),
+    col("source_table", TypeCode::U64, true),
+    col("expr_program", TypeCode::Blob, true),
 ];
 
 pub const CIRCUIT_EDGES_COLS: &[WireSysCol] = &[
-    WireSysCol {
-        name: "view_id",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "sub",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "dst_node",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "dst_port",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "src_node",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
+    col("view_id", TypeCode::U64, false),
+    col("sub", TypeCode::U64, false),
+    col("dst_node", TypeCode::U64, false),
+    col("dst_port", TypeCode::U64, false),
+    col("src_node", TypeCode::U64, false),
 ];
 
 pub const CIRCUIT_NODE_COLUMNS_COLS: &[WireSysCol] = &[
-    WireSysCol {
-        name: "view_id",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "sub",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "node_id",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "kind",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "position",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "value1",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "value2",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
+    col("view_id", TypeCode::U64, false),
+    col("sub", TypeCode::U64, false),
+    col("node_id", TypeCode::U64, false),
+    col("kind", TypeCode::U64, false),
+    col("position", TypeCode::U64, false),
+    col("value1", TypeCode::U64, false),
+    col("value2", TypeCode::U64, false),
 ];
 
 // ---------------------------------------------------------------------------
@@ -219,7 +159,7 @@ pub const MAX_PK_COLUMNS: usize = 5;
 
 /// Maximum byte width of a PK region per row. Product of `MAX_PK_COLUMNS`
 /// and the per-column ceiling (16 == max wire stride of any type valid as a
-/// PK column — U128, UUID; STRING and BLOB are rejected by schema
+/// PK column — U128, UUID, I128; STRING and BLOB are rejected by schema
 /// validation). Auto-tracks growth of `MAX_PK_COLUMNS`.
 pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
 

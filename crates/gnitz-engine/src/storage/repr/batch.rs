@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::columnar::ColumnarSource;
 use super::merge::{self, MemBatch};
-use crate::foundation::codec::{read_i64_le, read_u64_le};
+use crate::foundation::codec::{align8, read_i64_le, read_u64_le};
 use crate::schema::{self, type_code, BlobCache, SchemaColumn, SchemaDescriptor};
 
 static BLOB_ID_CTR: AtomicU64 = AtomicU64::new(1);
@@ -100,7 +100,7 @@ pub(in crate::storage) fn compute_offsets(
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
     let mut off = 0usize;
     for i in 0..num_regions {
-        off = (off + 7) & !7;
+        off = align8(off);
         offsets[i] = off;
         off += capacity * strides[i] as usize;
     }

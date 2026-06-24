@@ -532,14 +532,11 @@ pub(super) fn emit_node(
             let b_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
             reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[a_reg as usize].schema);
             match kind {
-                gnitz_wire::JoinKind::DeltaTrace | gnitz_wire::JoinKind::DeltaTraceOuter => {
+                gnitz_wire::SetJoinKind::DeltaTrace => {
                     builder.add_anti_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
-                gnitz_wire::JoinKind::DeltaDelta => {
+                gnitz_wire::SetJoinKind::DeltaDelta => {
                     builder.add_anti_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
-                }
-                gnitz_wire::JoinKind::DeltaTraceRange { .. } => {
-                    unreachable!("no anti-join range variant; planner rejects LEFT/anti + range")
                 }
             }
         }
@@ -549,14 +546,11 @@ pub(super) fn emit_node(
             let b_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
             reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[a_reg as usize].schema);
             match kind {
-                gnitz_wire::JoinKind::DeltaTrace | gnitz_wire::JoinKind::DeltaTraceOuter => {
+                gnitz_wire::SetJoinKind::DeltaTrace => {
                     builder.add_semi_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
-                gnitz_wire::JoinKind::DeltaDelta => {
+                gnitz_wire::SetJoinKind::DeltaDelta => {
                     builder.add_semi_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
-                }
-                gnitz_wire::JoinKind::DeltaTraceRange { .. } => {
-                    unreachable!("no semi-join range variant; planner rejects semi + range")
                 }
             }
         }
@@ -1110,7 +1104,7 @@ pub(super) fn build_plan(
             Some(gnitz_wire::OpNode::Distinct) | Some(gnitz_wire::OpNode::Union) | Some(gnitz_wire::OpNode::Delay) => {
                 Some(PORT_IN)
             }
-            Some(gnitz_wire::OpNode::AntiJoin(gnitz_wire::JoinKind::DeltaTrace)) => Some(PORT_IN_A),
+            Some(gnitz_wire::OpNode::AntiJoin(gnitz_wire::SetJoinKind::DeltaTrace)) => Some(PORT_IN_A),
             _ => None,
         };
         let Some(port) = dtor_port else { continue };

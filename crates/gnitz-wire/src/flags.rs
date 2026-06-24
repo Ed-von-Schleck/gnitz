@@ -8,7 +8,7 @@
 /// Bits 0-15 are the SAL-level flags carried verbatim from the on-disk log
 /// into every control block.  Bits 16+ are wire-level fields (conflict mode,
 /// schema version) that are encoded by the sender and decoded by the receiver.
-pub const SAL_FLAGS_MASK: u64 = 0x0000_FFFF;
+const SAL_FLAGS_MASK: u64 = 0x0000_FFFF;
 
 pub const FLAG_SHUTDOWN: u64 = 4;
 pub const FLAG_DDL_SYNC: u64 = 8;
@@ -47,14 +47,14 @@ pub const FLAG_SEEK_BY_INDEX_RANGE: u64 = 1 << 55;
 // ---------------------------------------------------------------------------
 
 /// Bits 16-23: conflict mode (8 bits). Value 0 = Update (default).
-pub const WIRE_CONFLICT_MODE_SHIFT: u32 = 16;
-pub const WIRE_CONFLICT_MODE_MASK: u64 = 0xFF_u64 << WIRE_CONFLICT_MODE_SHIFT;
+const WIRE_CONFLICT_MODE_SHIFT: u32 = 16;
+const WIRE_CONFLICT_MODE_MASK: u64 = 0xFF_u64 << WIRE_CONFLICT_MODE_SHIFT;
 /// Bits 24-39: schema version (16 bits). Value 0 = client has no cached schema.
-pub const WIRE_SCHEMA_VERSION_SHIFT: u32 = 24;
-pub const WIRE_SCHEMA_VERSION_MASK: u64 = 0xFFFF_u64 << WIRE_SCHEMA_VERSION_SHIFT;
+const WIRE_SCHEMA_VERSION_SHIFT: u32 = 24;
+const WIRE_SCHEMA_VERSION_MASK: u64 = 0xFFFF_u64 << WIRE_SCHEMA_VERSION_SHIFT;
 /// Bits 40-47: index-metadata version (8 bits). 0 = client has no cached list.
-pub const WIRE_INDEX_VERSION_SHIFT: u32 = 40;
-pub const WIRE_INDEX_VERSION_MASK: u64 = 0xFF_u64 << WIRE_INDEX_VERSION_SHIFT;
+const WIRE_INDEX_VERSION_SHIFT: u32 = 40;
+const WIRE_INDEX_VERSION_MASK: u64 = 0xFF_u64 << WIRE_INDEX_VERSION_SHIFT;
 
 // Compile-time guard: SAL flags (bits 0-15) must stay clear of the wire-level
 // packed fields, those fields must not overlap each other, the packed fields

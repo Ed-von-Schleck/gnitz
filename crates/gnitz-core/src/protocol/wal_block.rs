@@ -1,4 +1,4 @@
-// gnitz-protocol/src/wal_block.rs — WAL-block encode/decode (Python wal_columnar.py port)
+// gnitz-core/src/protocol/wal_block.rs — WAL-block encode/decode (Python wal_columnar.py port)
 
 use super::error::ProtocolError;
 use super::types::{ColData, PkColumn, Schema, TypeCode, ZSetBatch};

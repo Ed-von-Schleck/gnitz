@@ -2,7 +2,7 @@ Never check if failures are pre-existing; as a rule, all tests are green at the 
 
 Never check or confirm that compilation warnings or Clippy errors/warnings are caused by the current session, always directly fix them.
 
-Use `semble search` (the semble MCP server is installed) to find code by describing what it does or naming a symbol/identifier instead of grep. There are other useful semble commands as well. Prefer it over grep + read every time.
+Use `semble search` (the semble MCP server is installed) to find code by describing what it does or naming a symbol/identifier instead of grep. There are other useful semble commands as well. Prefer it over grep + read every time. Use `semble clear all` to clear a stale index.
 
 gnitz is **pre-alpha** and not used in production anywhere because it has not been released, so there are **never** any compatibility concerns and there should **never** be legacy code remaining.
 
@@ -14,6 +14,10 @@ gnitz is **pre-alpha** and not used in production anywhere because it has not be
 
 GnitzDB-specific development guidelines are in the **GnitzDB Developer Guide**
 section at the end of this file.
+
+# Over-arching Design Rules
+
+The fundamental mottos are "ZSets all the way down" and "ZSets over the wire". Never go against these ideas.
 
 ---
 

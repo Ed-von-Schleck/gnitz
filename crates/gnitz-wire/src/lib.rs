@@ -1,7 +1,7 @@
 //! Shared wire-protocol definitions for GnitzDB.
 //!
 //! Single source of truth for constants and codecs that both the client
-//! (gnitz-protocol, gnitz-core) and server (gnitz-engine) must agree on.
+//! (gnitz-core) and server (gnitz-engine) must agree on.
 //!
 //! The crate is organized into topic modules, but every item is re-exported
 //! flat at the crate root (`gnitz_wire::FOO`) so callers need not track which

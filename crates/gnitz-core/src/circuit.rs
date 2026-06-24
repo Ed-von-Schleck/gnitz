@@ -1,6 +1,6 @@
 use crate::expr::ExprProgram;
 
-pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel};
+pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel, SetJoinKind};
 
 pub type NodeId = u64;
 pub type Port = u8;
@@ -184,22 +184,10 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             (OPCODE_JOIN_DELTA_TRACE_RANGE, None, None),
             vec![(NODE_COL_KIND_RANGE_JOIN, 0, n_eq as u64, rel.as_u64())],
         ),
-        OpNode::AntiJoin(JoinKind::DeltaTrace) => ((OPCODE_ANTI_JOIN_DELTA_TRACE, None, None), Vec::new()),
-        OpNode::AntiJoin(JoinKind::DeltaTraceOuter) => {
-            unreachable!("no wire opcode for anti-join outer; no builder creates this variant")
-        }
-        OpNode::AntiJoin(JoinKind::DeltaDelta) => ((OPCODE_ANTI_JOIN_DELTA_DELTA, None, None), Vec::new()),
-        OpNode::AntiJoin(JoinKind::DeltaTraceRange { .. }) => {
-            unreachable!("no wire opcode for anti-join range; no builder creates this variant")
-        }
-        OpNode::SemiJoin(JoinKind::DeltaTrace) => ((OPCODE_SEMI_JOIN_DELTA_TRACE, None, None), Vec::new()),
-        OpNode::SemiJoin(JoinKind::DeltaTraceOuter) => {
-            unreachable!("no wire opcode for semi-join outer; no builder creates this variant")
-        }
-        OpNode::SemiJoin(JoinKind::DeltaDelta) => ((OPCODE_SEMI_JOIN_DELTA_DELTA, None, None), Vec::new()),
-        OpNode::SemiJoin(JoinKind::DeltaTraceRange { .. }) => {
-            unreachable!("no wire opcode for semi-join range; no builder creates this variant")
-        }
+        OpNode::AntiJoin(SetJoinKind::DeltaTrace) => ((OPCODE_ANTI_JOIN_DELTA_TRACE, None, None), Vec::new()),
+        OpNode::AntiJoin(SetJoinKind::DeltaDelta) => ((OPCODE_ANTI_JOIN_DELTA_DELTA, None, None), Vec::new()),
+        OpNode::SemiJoin(SetJoinKind::DeltaTrace) => ((OPCODE_SEMI_JOIN_DELTA_TRACE, None, None), Vec::new()),
+        OpNode::SemiJoin(SetJoinKind::DeltaDelta) => ((OPCODE_SEMI_JOIN_DELTA_DELTA, None, None), Vec::new()),
         OpNode::IntegrateSink => ((OPCODE_INTEGRATE, None, None), Vec::new()),
         OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None), Vec::new()),
         OpNode::ExchangeShard { shard_cols } => (
@@ -390,11 +378,11 @@ impl CircuitBuilder {
     }
 
     pub fn anti_join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
-        self.binary_join_scan(OpNode::AntiJoin(JoinKind::DeltaTrace), delta, trace_table_id)
+        self.binary_join_scan(OpNode::AntiJoin(SetJoinKind::DeltaTrace), delta, trace_table_id)
     }
 
     pub fn semi_join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
-        self.binary_join_scan(OpNode::SemiJoin(JoinKind::DeltaTrace), delta, trace_table_id)
+        self.binary_join_scan(OpNode::SemiJoin(SetJoinKind::DeltaTrace), delta, trace_table_id)
     }
 
     pub fn join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
@@ -422,7 +410,7 @@ impl CircuitBuilder {
     }
 
     pub fn anti_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        self.binary_join(OpNode::AntiJoin(JoinKind::DeltaTrace), delta, trace_node)
+        self.binary_join(OpNode::AntiJoin(SetJoinKind::DeltaTrace), delta, trace_node)
     }
 
     pub fn left_join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
@@ -434,7 +422,7 @@ impl CircuitBuilder {
     }
 
     pub fn semi_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        self.binary_join(OpNode::SemiJoin(JoinKind::DeltaTrace), delta, trace_node)
+        self.binary_join(OpNode::SemiJoin(SetJoinKind::DeltaTrace), delta, trace_node)
     }
 
     /// Shared `Reduce`-node construction: map the group cols + agg specs, alloc

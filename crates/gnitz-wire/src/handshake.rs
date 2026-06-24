@@ -28,14 +28,14 @@ pub const MAX_FRAME_PAYLOAD_CLIENT: usize = 256 * 1024 * 1024; // 256 MB
 //     [limit_bytes: u32 LE]
 //
 // On version mismatch / auth failure the server replies with a standard
-// length-prefixed STATUS_ERROR control block (>= 248 bytes) and closes
-// the fd. The length prefix alone discriminates: 8 ⇒ HELLO, 12 ⇒ ACK,
-// anything else ⇒ control block. Magic checks remain as defence-in-depth.
+// length-prefixed STATUS_ERROR control block and closes the fd. The length
+// prefix alone discriminates: 8 ⇒ HELLO, 12 ⇒ ACK, anything else ⇒ control
+// block. Magic checks remain as defence-in-depth.
 
 /// Magic value carried in HELLO and ACK frames. ASCII "GNTZ" interpreted
 /// as a little-endian u32. Defence-in-depth on top of the length-prefix
-/// discriminant; a legacy peer cannot collide because the smallest legacy
-/// frame (a control WAL block) is at least `CTRL_BLOCK_SIZE_NO_BLOB` bytes.
+/// discriminant; a peer sending a control block first cannot collide because
+/// such a block is far larger than the 8/12-byte HELLO/ACK frames.
 pub const HELLO_MAGIC: u32 = u32::from_le_bytes(*b"GNTZ");
 
 /// HELLO payload length in bytes (excluding the 4-byte length prefix).
@@ -50,9 +50,9 @@ pub const HELLO_FRAME_SIZE: usize = 4 + HELLO_PAYLOAD_LEN as usize;
 /// Total wire size of an ACK frame (length prefix + payload).
 pub const HELLO_ACK_FRAME_SIZE: usize = 4 + HELLO_ACK_PAYLOAD_LEN as usize;
 
-/// Status field in the ACK frame.
+/// Status field in the ACK frame. Success is the only value the ACK carries —
+/// version/auth failures use a `STATUS_ERROR` control block, not the ACK.
 pub const HELLO_STATUS_OK: u16 = 0;
-pub const HELLO_STATUS_ERROR: u16 = 1;
 
 /// Build a HELLO frame ready to ship over the wire (length prefix + payload).
 pub const fn encode_hello_frame(version: u16, flags: u16) -> [u8; HELLO_FRAME_SIZE] {
@@ -186,17 +186,19 @@ mod hello_tests {
 
     #[test]
     fn ack_decode_roundtrip() {
-        let ack = encode_hello_ack(HELLO_STATUS_ERROR, 64 * 1024 * 1024);
+        // Raw non-zero status (not HELLO_STATUS_OK=0) so the round-trip proves
+        // status is read from its own offset, distinct from the zero `_pad`.
+        let ack = encode_hello_ack(1, 64 * 1024 * 1024);
         let parsed = decode_hello_ack(&ack[4..]).unwrap();
         assert_eq!(parsed.magic, HELLO_MAGIC);
-        assert_eq!(parsed.status, HELLO_STATUS_ERROR);
+        assert_eq!(parsed.status, 1);
         assert_eq!(parsed.limit_bytes, 64 * 1024 * 1024);
     }
 
     #[test]
-    fn hello_payload_size_excludes_legacy_frame_collision() {
-        // The HELLO payload (8 bytes) is far smaller than any legacy
-        // framed control block. A peer mistakenly sending a control
+    fn hello_payload_size_excludes_control_block_collision() {
+        // The HELLO payload (8 bytes) is far smaller than any control
+        // WAL block. A peer mistakenly sending a control
         // block first is rejected at the length-prefix check before
         // the magic is even parsed. The pre-handshake recv ceiling on
         // the server matches HELLO_PAYLOAD_LEN exactly, so this is a

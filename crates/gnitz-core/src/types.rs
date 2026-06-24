@@ -12,6 +12,7 @@ pub use gnitz_wire::{
     // System table IDs
     CIRCUIT_NODES_TAB,
     CIRCUIT_NODE_COLUMNS_TAB,
+    // Opcodes
     OPCODE_ANTI_JOIN_DELTA_DELTA,
     OPCODE_ANTI_JOIN_DELTA_TRACE,
     OPCODE_DELAY,
@@ -33,8 +34,6 @@ pub use gnitz_wire::{
     OPCODE_PARTITION_FILTER,
     OPCODE_REDUCE,
     OPCODE_SCAN_DELTA,
-    // Opcodes
-    OPCODE_SCAN_TRACE,
     OPCODE_SEMI_JOIN_DELTA_DELTA,
     OPCODE_SEMI_JOIN_DELTA_TRACE,
     OPCODE_UNION,

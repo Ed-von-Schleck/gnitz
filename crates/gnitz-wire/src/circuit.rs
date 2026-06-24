@@ -15,14 +15,9 @@ pub const OPCODE_INTEGRATE: u64 = 7;
 pub const OPCODE_DELAY: u64 = 8;
 pub const OPCODE_REDUCE: u64 = 9;
 pub const OPCODE_DISTINCT: u64 = 10;
-/// Delta input source. Replaces both `input_delta()` and
-/// `input_delta_tagged()` from the legacy layout — the actual table_id
-/// lives in the node row's `source_table` column for both.
-/// (Numeric value preserved from the prior `OPCODE_SCAN_TRACE = 11`.)
+/// Delta input source for a base table. The table id lives in the node row's
+/// `source_table` column.
 pub const OPCODE_SCAN_DELTA: u64 = 11;
-/// Legacy alias retained temporarily during the circuit-graph schema
-/// rewrite. New code should use `OPCODE_SCAN_DELTA`.
-pub const OPCODE_SCAN_TRACE: u64 = OPCODE_SCAN_DELTA;
 pub const OPCODE_SEEK_TRACE: u64 = 12;
 pub const OPCODE_CLEAR_DELTAS: u64 = 15;
 pub const OPCODE_ANTI_JOIN_DELTA_TRACE: u64 = 16;
@@ -164,14 +159,24 @@ impl RangeRel {
 }
 
 /// Join physical strategy. `DeltaTraceRange` keeps `JoinKind: Copy` (its fields
-/// are `Copy`); only `OpNode::Join` ever carries it (anti/semi range joins are
-/// out of scope and rejected in the planner).
+/// are `Copy`). Only `OpNode::Join` carries this; anti-/semi-joins carry the
+/// narrower [`SetJoinKind`], so their outer/range forms are not merely "rejected
+/// in the planner" — the type cannot name them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinKind {
     DeltaTrace,
     DeltaTraceOuter,
     DeltaDelta,
     DeltaTraceRange { n_eq: u8, rel: RangeRel },
+}
+
+/// Physical strategy for anti-/semi-join. Narrower than [`JoinKind`]: the
+/// set-difference operators have no outer (null-fill) or range form, so the type
+/// cannot name one. Opcodes 16–19 already encode exactly this set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetJoinKind {
+    DeltaTrace,
+    DeltaDelta,
 }
 
 /// MAP sub-variant discriminant.
@@ -231,8 +236,8 @@ pub enum OpNode {
         agg: AggKind,
     },
     Join(JoinKind),
-    AntiJoin(JoinKind),
-    SemiJoin(JoinKind),
+    AntiJoin(SetJoinKind),
+    SemiJoin(SetJoinKind),
     /// `OPCODE_INTEGRATE = 7`. Primary INTEGRATE: writes to view storage.
     IntegrateSink,
     /// `OPCODE_INTEGRATE_TRACE = 25`. Accumulates Z-set for join trace.
@@ -377,10 +382,10 @@ pub fn decode_op_node(
                 .ok_or_else(|| format!("JOIN_DELTA_TRACE_RANGE unknown rel {}", row.value2))?;
             OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel })
         }
-        OPCODE_ANTI_JOIN_DELTA_TRACE => OpNode::AntiJoin(JoinKind::DeltaTrace),
-        OPCODE_ANTI_JOIN_DELTA_DELTA => OpNode::AntiJoin(JoinKind::DeltaDelta),
-        OPCODE_SEMI_JOIN_DELTA_TRACE => OpNode::SemiJoin(JoinKind::DeltaTrace),
-        OPCODE_SEMI_JOIN_DELTA_DELTA => OpNode::SemiJoin(JoinKind::DeltaDelta),
+        OPCODE_ANTI_JOIN_DELTA_TRACE => OpNode::AntiJoin(SetJoinKind::DeltaTrace),
+        OPCODE_ANTI_JOIN_DELTA_DELTA => OpNode::AntiJoin(SetJoinKind::DeltaDelta),
+        OPCODE_SEMI_JOIN_DELTA_TRACE => OpNode::SemiJoin(SetJoinKind::DeltaTrace),
+        OPCODE_SEMI_JOIN_DELTA_DELTA => OpNode::SemiJoin(SetJoinKind::DeltaDelta),
         OPCODE_INTEGRATE => OpNode::IntegrateSink,
         OPCODE_INTEGRATE_TRACE => OpNode::IntegrateTrace,
         OPCODE_EXCHANGE_SHARD => OpNode::ExchangeShard {

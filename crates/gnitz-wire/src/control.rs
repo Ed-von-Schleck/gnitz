@@ -1,7 +1,7 @@
 //! IPC control-block wire layout.
 //!
 //! The control WAL block carries the per-message header. Both `gnitz-engine`
-//! (server) and `gnitz-protocol` (client) build/parse this block; the column
+//! (server) and `gnitz-core` (client) build/parse this block; the column
 //! indices, payload indices, and null-bit positions live here so the two
 //! implementations cannot drift.
 //!
@@ -22,64 +22,25 @@
 //!   u64::MAX   -- broadcast reply (one reply per worker per broadcast)
 //!   other      -- master-allocated, monotonic per request
 
+use crate::catalog::col;
 use crate::{TypeCode, WireSysCol};
 
 pub const CONTROL_COLS: &[WireSysCol] = &[
-    WireSysCol {
-        name: "msg_idx",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "status",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "client_id",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "target_id",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "flags",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "seek_pk",
-        type_code: TypeCode::U128,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "seek_col_idx",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "request_id",
-        type_code: TypeCode::U64,
-        nullable: false,
-    },
-    WireSysCol {
-        name: "error_msg",
-        type_code: TypeCode::String,
-        nullable: true,
-    },
-    WireSysCol {
-        name: "seek_pk_extra",
-        type_code: TypeCode::Blob,
-        nullable: true,
-    },
+    col("msg_idx", TypeCode::U64, false),
+    col("status", TypeCode::U64, false),
+    col("client_id", TypeCode::U64, false),
+    col("target_id", TypeCode::U64, false),
+    col("flags", TypeCode::U64, false),
+    col("seek_pk", TypeCode::U128, false),
+    col("seek_col_idx", TypeCode::U64, false),
+    col("request_id", TypeCode::U64, false),
+    col("error_msg", TypeCode::String, true),
+    col("seek_pk_extra", TypeCode::Blob, true),
 ];
 
 pub const NUM_COLUMNS: usize = CONTROL_COLS.len();
 
-pub const fn col_index(name: &str) -> usize {
+const fn col_index(name: &str) -> usize {
     crate::col_index_in(CONTROL_COLS, name)
 }
 
@@ -125,8 +86,6 @@ pub const NUM_REGIONS: usize = 3 + (NUM_COLUMNS - 1) + 1;
 
 // Region indices. V3 format: 3 system regions (pk=0, weight=1, null_bmp=2)
 // followed by payload columns in schema order, then blob last.
-pub const REGION_PK: usize = 0;
-pub const REGION_WEIGHT: usize = 1;
 pub const REGION_NULL_BMP: usize = 2;
 pub const REGION_STATUS: usize = 3 + PAYLOAD_STATUS;
 pub const REGION_CLIENT_ID: usize = 3 + PAYLOAD_CLIENT_ID;
