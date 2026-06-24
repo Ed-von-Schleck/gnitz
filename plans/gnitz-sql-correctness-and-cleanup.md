@@ -1,11 +1,11 @@
 # gnitz-sql correctness and cleanup
 
 A code-quality pass over `crates/gnitz-sql/src` (the SQL front end: parse → bind →
-plan/lower for views, or → execute for DML). Twenty-five concrete changes, ordered
-by leverage (impact × confidence ÷ effort) and grouped into themes. The four
-correctness fixes change query results or accepted DDL and ship first; everything
-after is duplication, type-safety, and hygiene with no behavioural change unless
-noted.
+plan/lower for views, or → execute for DML). The four correctness fixes (C1–C4) that
+change query results or accepted DDL have shipped (see "Correctness fixes (C1–C4) —
+DONE" below); the twenty-one remaining changes are ordered by leverage
+(impact × confidence ÷ effort) and grouped into themes — duplication, type-safety, and
+hygiene with no behavioural change unless noted.
 
 Every item names exact `file:line` anchors, the change (with code), the invariants
 it must not break, effort (S/M/L), value, and how to verify. Line numbers are from
@@ -13,231 +13,25 @@ the current tree and will drift as items land — re-anchor by symbol name.
 
 ---
 
-## Correctness fixes (do first)
+## Correctness fixes (C1–C4) — DONE
 
-### C1 — Reject INSERT with an explicit column list instead of silently mis-mapping
+Shipped. Each converts a silent wrong-result / data-corruption into an honest error.
+Validated by pure unit tests (run under `make verify`) plus feature-gated integration
+tests (`cargo test -p gnitz-sql --features integration`).
 
-- **Files:** `dml/insert.rs:141-168, 381-403`
-- **Problem:** `extract_insert_parts` (insert.rs:381-403) destructures
-  `Statement::Insert(insert)` and returns `(table_name, rows, insert.on.as_ref())`
-  — it never reads `insert.columns`. INSERT runs purely positionally in schema
-  order (`schema.payload_columns()` / `row[ci]`, lines 159-166). The only arity
-  guard (lines 146-153) compares the VALUES-tuple arity to the *table* column
-  count, not to the column list. So `INSERT INTO t (b, a) VALUES (1, 2)` on a
-  two-column table passes the guard and writes `a=1, b=2` — values silently
-  swapped, no error. A shorter-than-arity list is incidentally caught by the arity
-  guard with a misleading message. The comment at insert.rs:142-145 states
-  positional-only as an *unenforced* assumption.
-- **Change:** In the `Statement::Insert(insert)` arm of `extract_insert_parts`,
-  before extracting the source, reject a non-empty column list:
-
-  ```rust
-  Statement::Insert(insert) => {
-      if !insert.columns.is_empty() {
-          return Err(GnitzSqlError::Unsupported(
-              "INSERT with an explicit column list is not supported; \
-               supply all columns positionally in schema order".to_string(),
-          ));
-      }
-      let table_name = match &insert.table { /* unchanged */ };
-      // ... unchanged ...
-  }
-  ```
-
-  `GnitzSqlError::Unsupported(String)` is already used twice in this function
-  (lines 387, 396). Drop the now-redundant "(no column list)" parenthetical from
-  the insert.rs:142-145 comment, since the assumption is now enforced.
-- **Invariants:** None broken — this *enforces* the documented full-row-positional
-  contract (insert.rs:142-145) that was previously only assumed.
-- **Effort:** S. **Value:** High — silent data corruption on a routine shape,
-  converted to an honest error.
-- **Verify:** Unit test: `INSERT INTO t (b, a) VALUES (1, 2)` (list length == table
-  arity, order differs) returns `Unsupported`; plain `INSERT INTO t VALUES (1, 2)`
-  still succeeds.
-
-### C2 — Validate aggregate argument types on the HAVING-only path
-
-- **Files:** `plan/view/group_by.rs:232-258, 677-743, 745-769, 296-298` and the
-  import at `group_by.rs:12`; leave `bind/structural.rs:230-244` intact.
-- **Problem:** Both aggregate argument-type guards are SELECT-path only — the
-  SUM/AVG numeric/non-wide-int block (group_by.rs:236-250, walking
-  `BoundExpr::AggCall`) and the MIN/MAX `is_min_max_orderable` check
-  (structural.rs:230-244, in `SingleTable::bind_function`). An aggregate referenced
-  *only* by HAVING (absent from SELECT) is materialised via `collect_having_aggs →
-  having_agg_func → append_having_agg → push_agg_specs` with no type check, because
-  the HAVING leaf binder never calls `SingleTable::bind_function`. A view like
-  `GROUP BY k HAVING SUM(blob_col) > 0` (or `AVG(uuid_col)`, `MIN(str_col)`) ships
-  an `agg_spec` the engine cannot evaluate; the engine delegates this rejection to
-  the planner. Result for an unsupported type: STRING → silent garbage in all
-  builds (the i64 comparator reads the 8-byte German-string descriptor prefix as a
-  signed int); wide-int (U128/UUID/I128) or BLOB → debug panic / release garbage.
-  Aggregates present in *both* SELECT and HAVING are already validated
-  (`collect_having_aggs` dedups against `agg_mappings`); only the HAVING-only case
-  escapes.
-- **Change:** Lift validation into `push_agg_specs` (group_by.rs:677) — the single
-  convergence point of both callers — then delete the SELECT-path block. After the
-  existing wildcard guard:
-
-  ```rust
-  if let Some(c) = arg_col {
-      let tc = schema.columns[c].type_code;
-      match agg_func {
-          AggFunc::Sum | AggFunc::Avg => {
-              if !(is_integer_type(tc) || tc.is_float()) || is_wide_int(tc) {
-                  return Err(GnitzSqlError::Bind(format!(
-                      "{agg_func:?} is not supported on column type {tc:?} ('{}')",
-                      schema.columns[c].name,
-                  )));
-              }
-          }
-          AggFunc::Min | AggFunc::Max => {
-              if !is_min_max_orderable(tc) {
-                  return Err(GnitzSqlError::Bind(format!(
-                      "{agg_func:?} is not supported on column type {tc:?} ('{}')",
-                      schema.columns[c].name,
-                  )));
-              }
-          }
-          AggFunc::Count | AggFunc::CountNonNull => {}
-      }
-  }
-  ```
-
-  Add `is_min_max_orderable` to the `use crate::types::…` import at group_by.rs:12;
-  delete the SELECT-path validation at group_by.rs:232-258. Leave
-  `SingleTable::bind_function`'s MIN/MAX check (structural.rs:230-244) — it guards
-  non-GROUP-BY SELECT-list MIN/MAX and carries its own test. GROUP-BY-SELECT MIN/MAX
-  is now double-checked (binder + push_agg_specs); harmless.
-- **Invariants:** `push_agg_specs` is the documented single source of truth for spec
-  layout (group_by.rs:669-686) and already carries one cross-cutting guard (the
-  wildcard check); validation belongs there. Do not break the SELECT-path
-  `BoundExpr::AggCall` rejection `bind_function` still performs.
-- **Effort:** S. **Value:** Medium-high — silent corruption / unevaluatable circuit
-  on a real shape, converging two callers onto one validated gate.
-- **Verify:** `CREATE VIEW … GROUP BY k HAVING SUM(blob_col) > 0` (plus
-  `AVG(uuid_col)`, `MIN(str_col)`) must return `Bind`. The lifted MIN/MAX error
-  variant is now `Bind` (was `Unsupported`); a GROUP-BY-level test asserting the
-  variant must expect `Bind`. The existing `SingleTable` MIN/MAX test is unaffected.
-
-### C3 — Reject out-of-i64-range integer literals instead of coercing to lossy f64
-
-- **Files:** `bind/structural.rs:129-142`
-- **Problem:** `bind_literal` does `n.parse::<i64>().map(LitInt).or_else(|_|
-  n.parse::<f64>().map(LitFloat))`. A non-fractional literal that overflows i64 but
-  the user meant as an integer (e.g. `18446744073709551615` = `u64::MAX`) fails the
-  i64 parse, succeeds the f64 parse, and becomes `LitFloat`. `infer_type` types
-  `LitFloat` as F64 (ir.rs:31); the opcode lowerer casts the integer column
-  int→float and emits `fcmp_eq` (lower.rs:212-220). f64's 52-bit mantissa cannot
-  represent `u64::MAX`, so `u64col = 18446744073709551615` runs a lossy float
-  compare and matches wrong rows. Blast radius is narrow: only `bind_structural`
-  (WHERE / projection / residual); PK-seek (`parse_literal_i128`) and INSERT
-  colwrite already range-check via i128.
-- **Change:** Rewrite the `Value::Number` arm so a non-fractional overflowing
-  literal errors and only genuinely fractional text takes the f64 path:
-
-  ```rust
-  Value::Number(n, _) => {
-      if let Ok(i) = n.parse::<i64>() {
-          Ok(BoundExpr::LitInt(i))
-      } else if n.contains(['.', 'e', 'E']) {
-          n.parse::<f64>()
-              .map(BoundExpr::LitFloat)
-              .map_err(|_| GnitzSqlError::Bind(format!("invalid number literal: {n}")))
-      } else {
-          // Non-fractional literal that overflows i64. BoundExpr::LitInt is
-          // i64-only, so it cannot be represented — reject rather than run an
-          // integer-column comparison through lossy f64.
-          Err(GnitzSqlError::Bind(format!("integer literal out of range: {n}")))
-      }
-  }
-  ```
-
-  `BoundExpr::LitInt` is i64-only (ir.rs:16). Negative literals arrive as
-  `UnaryOp(Neg, LitInt(digits))`, so only large positive magnitudes reach this arm.
-- **Invariants:** PK byte-equality / OPK packing unaffected (PK paths range-check
-  separately). Replace the `// Try integer first, then float.` comment with the
-  rationale above.
-- **Effort:** S. **Value:** Medium — wrong rows on wide-unsigned comparisons;
-  contained fix.
-- **Verify:** `bind_literal(Number("18446744073709551615"))` returns `Bind`; `"1.5"`
-  / `"1e3"` still bind `LitFloat`; `"42"` binds `LitInt`.
-
-### C4 — Reject FK rewrites that narrow or re-sign the child column's declared type
-
-- **Files:** `plan/ddl.rs:15-31` (`check_fk_type_compat`), call sites at ddl.rs:285-297
-  and 332-344; one new predicate in `types.rs`.
-- **Problem:** `check_fk_type_compat` (ddl.rs:18-31) treats *any* integer child as
-  compatible with *any* integer parent (`is_integer_type` ignores width and
-  signedness). After the check, the child column's declared type is overwritten with
-  the parent's (`cols[i].type_code = parent_pk_type`, ddl.rs:297, 344) — the engine
-  requires the FK column to encode byte-identically to the parent PK, so adopting
-  the parent type is intentional. But when the parent is *narrower* or
-  *differently-signed* than the declared child (e.g. child `BIGINT UNSIGNED`/U64
-  referencing parent `INT`/I32), the column is silently narrowed/re-signed: the
-  user's declared domain is discarded, and values legal under the declared type are
-  later rejected at INSERT with a message naming the wrong type. (The value path
-  range-checks against the rewritten type, so this is silent declared-type narrowing
-  and confusing rejection, not on-disk corruption.) The standalone widening case
-  (`INT` child → `BIGINT` parent) is genuinely safe and must keep working.
-
-  Note: the only safe rewrite is `child → parent` when **parent can represent every
-  value of the child's declared type**. The intuitive "require child width ≥ parent"
-  rule is backwards — that is the narrowing case being closed.
-- **Change:** Add a domain-subset predicate in `types.rs` (its stated home for
-  type-membership tests), then gate the integer branch on it:
-
-  ```rust
-  // types.rs — alongside is_integer_type / is_wide_int.
-  /// True for the signed integer TypeCodes (I8..I128); false for unsigned.
-  /// Only valid for `is_integer_type(tc)` inputs.
-  pub(crate) fn int_is_signed(tc: TypeCode) -> bool {
-      matches!(tc, TypeCode::I8 | TypeCode::I16 | TypeCode::I32 | TypeCode::I64 | TypeCode::I128)
-  }
-
-  /// True iff every value of integer type `child` is representable in integer
-  /// type `parent` — so rewriting an FK child column to the parent's type loses
-  /// no value the child could legally hold.
-  pub(crate) fn int_domain_fits(child: TypeCode, parent: TypeCode) -> bool {
-      let (cw, pw) = (child.wire_stride(), parent.wire_stride());
-      match (int_is_signed(child), int_is_signed(parent)) {
-          (false, false) | (true, true) => cw <= pw, // same signedness: parent ≥ child width
-          (false, true) => cw < pw,                  // unsigned child needs a strictly wider signed parent
-          (true, false) => false,                    // signed child has negatives no unsigned parent holds
-      }
-  }
-  ```
-
-  ```rust
-  // ddl.rs — check_fk_type_compat
-  let is_compat = if is_integer_type(fk_col_type) && is_integer_type(parent_col_type) {
-      int_domain_fits(fk_col_type, parent_col_type)
-  } else {
-      fk_col_type == parent_col_type
-  };
-  if !is_compat {
-      return Err(GnitzSqlError::Bind(format!(
-          "FK type mismatch: column type {fk_col_type:?} cannot reference column type \
-           {parent_col_type:?} — the child column adopts the referenced column's type, \
-           which would narrow or re-sign {fk_col_type:?}; declare the child as \
-           {parent_col_type:?} or a narrower compatible integer",
-      )));
-  }
-  ```
-
-  `wire_stride()` is 1/2/4/8 for narrow ints and 16 for U128/I128; UUID is not an
-  `is_integer_type`, so a UUID FK still falls to the exact-match arm. Update the
-  ddl.rs:15-17 doc to "an integer child widens to an integer parent whose domain
-  covers it; otherwise the types must match exactly."
-- **Invariants:** The child column must still end up typed as the parent PK (the
-  engine's FK encoding contract); this only restricts *which declared child types*
-  are accepted. Same error variant (`Bind`) and shared by both resolver paths.
-- **Effort:** M. **Value:** Medium — closes silent declared-type narrowing on FK
-  DDL while preserving the safe widening idiom.
-- **Verify:** `CREATE TABLE c (id U64 PK, p BIGINT UNSIGNED REFERENCES parent_i32(id))`
-  now returns `Bind`; `… p INT REFERENCES parent_bigint(id)` (true widen) still
-  succeeds and the child column ends up `I64`. Any existing test asserting a
-  wide-child→narrow-parent FK succeeds is encoding the bug and must flip to expect
-  `Bind`.
+- **C1** — INSERT with an explicit column list (`dml/insert.rs`,
+  `validate_insert_column_list`): accept a full in-order list (positional write is
+  already correct), reject reordered/partial lists. *Refined from the audit's blanket
+  reject, which would have broken ~200 existing in-order column-list INSERTs.*
+- **C2** — Aggregate argument types are validated in `push_agg_specs`
+  (`plan/view/group_by.rs`), the single convergence point of the SELECT-list and
+  HAVING-only callers; the SELECT-path block was removed. A HAVING-only
+  `SUM(blob)`/`AVG(uuid)`/`MIN(str)` now returns `Bind` instead of unevaluatable garbage.
+- **C3** — Out-of-i64-range non-fractional integer literals are rejected in
+  `bind_literal` (`bind/structural.rs`) instead of silently coercing to a lossy f64.
+- **C4** — FK rewrites that would narrow or re-sign the child's declared type are
+  rejected via `int_domain_fits` (`types.rs`) in `check_fk_type_compat` (`plan/ddl.rs`);
+  the safe widening idiom (`INT` child → `BIGINT` parent) still works.
 
 ---
 
@@ -882,7 +676,7 @@ fixed once.
 
 ## Sequencing
 
-- **C1–C4** (correctness) first, independent of each other.
+- **C1–C4** (correctness) — DONE; shipped independently of each other.
 - **B2** adds `compile_bound_expr_to_program` and narrows `compile_bound_expr`'s
   return; **B1**'s `build_optional_filter` uses it — land B2 then B1.
 - **B4** depends on nothing else but exercises the shard path; run its E2E
