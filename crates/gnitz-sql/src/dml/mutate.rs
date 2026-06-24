@@ -12,7 +12,7 @@ use crate::codec::nullmap::null_word_set;
 use crate::dml::plan::{classify_access, collect_index_seek_candidates, try_extract_pk_in, AccessPath};
 use crate::error::GnitzSqlError;
 use crate::exec::eval::eval_expr;
-use crate::exec::residual::{bind_residuals, row_passes_residuals};
+use crate::exec::residual::{bind_residuals, matching_indices};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::{ClientError, ColData, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
@@ -89,30 +89,69 @@ pub(crate) fn resolve_set_target(
     Ok(col_idx)
 }
 
-fn write_set_columns(
+/// Build one merged Z-set row into `dst`: PK from `(pk_src, pk_idx)`; null-bitmap
+/// seed and carried (unassigned) columns from `(carry_src, carry_idx)`. For each
+/// payload column, `resolve(ci)` returns `Some(value)` to write that value (and
+/// set/clear its null bit) or `None` to carry the column through unchanged from
+/// `carry_src`. Shared by UPDATE SET (pk_src == carry_src) and ON CONFLICT DO
+/// UPDATE (PK from the incoming row, carry/null-seed from the existing row).
+pub(crate) fn build_merged_row<F>(
+    pk_src: &ZSetBatch,
+    pk_idx: usize,
+    carry_src: &ZSetBatch,
+    carry_idx: usize,
+    schema: &Schema,
+    dst: &mut ZSetBatch,
+    mut resolve: F,
+) -> Result<(), GnitzSqlError>
+where
+    F: FnMut(usize) -> Result<Option<ColumnValue>, GnitzSqlError>,
+{
+    dst.pks.push_from(&pk_src.pks, pk_idx);
+    dst.weights.push(1);
+    // Seed from the carry source's null word; each assignment flips only its own
+    // payload bit (set on a NULL result, clear on non-NULL), unassigned bits ride.
+    let mut null_bits = carry_src.nulls[carry_idx];
+    for (payload_idx, ci, col_def) in schema.payload_columns() {
+        match resolve(ci)? {
+            Some(cv) => {
+                null_word_set(&mut null_bits, payload_idx, matches!(cv, ColumnValue::Null));
+                append_column_value(&mut dst.columns[ci], cv, col_def.type_code)?;
+            }
+            None => {
+                let stride = col_def.type_code.wire_stride();
+                carry_src.columns[ci].push_row_from(carry_idx, stride, &mut dst.columns[ci]);
+            }
+        }
+    }
+    dst.nulls.push(null_bits);
+    Ok(())
+}
+
+/// Write the SET-merged update row for every `matched` index of `current` into
+/// `dst` (each at weight +1). The assignment index is built once and reused
+/// across rows — it depends only on `assignments` and `schema`, not the row —
+/// mirroring INSERT's `client_side_merge_do_update` loop.
+fn write_set_rows(
     current: &ZSetBatch,
-    row_idx: usize,
+    matched: &[usize],
     assignments: &[(usize, BoundExpr)],
     schema: &Schema,
     dst: &mut ZSetBatch,
 ) -> Result<(), GnitzSqlError> {
-    dst.pks.push_from(&current.pks, row_idx);
-    dst.weights.push(1);
-    // Start with the existing row's null bits; each assignment updates only
-    // its own column's bit (set for a NULL result, clear for non-NULL).
-    let mut null_bits = current.nulls[row_idx];
-
-    for (payload_idx, ci, col_def) in schema.payload_columns() {
-        if let Some((_, expr)) = assignments.iter().find(|(idx, _)| *idx == ci) {
-            let cv = eval_set_expr(expr, current, row_idx, schema)?;
-            null_word_set(&mut null_bits, payload_idx, matches!(cv, ColumnValue::Null));
-            append_column_value(&mut dst.columns[ci], cv, col_def.type_code)?;
-        } else {
-            let stride = col_def.type_code.wire_stride();
-            current.columns[ci].push_row_from(row_idx, stride, &mut dst.columns[ci]);
-        }
+    // Pre-index assignments by column for O(1) lookup per payload column
+    // (closes the prior O(cols²) per-row `assignments.iter().find`).
+    let mut asn_by_col: Vec<Option<&BoundExpr>> = vec![None; schema.columns.len()];
+    for (ci, expr) in assignments {
+        asn_by_col[*ci] = Some(expr);
     }
-    dst.nulls.push(null_bits);
+    for &row_idx in matched {
+        build_merged_row(current, row_idx, current, row_idx, schema, dst, |ci| {
+            asn_by_col[ci]
+                .map(|expr| eval_set_expr(expr, current, row_idx, schema))
+                .transpose()
+        })?;
+    }
     Ok(())
 }
 
@@ -198,14 +237,10 @@ fn resolve_residual_rows(
 ) -> Result<ResolvedRows, GnitzSqlError> {
     let actual_schema = schema_opt.as_deref().unwrap_or(schema);
     let preds = bind_residuals(binder, residual, schema)?;
-    let mut matched = Vec::new();
-    if let Some(batch) = &batch_opt {
-        for i in 0..batch.pks.len() {
-            if row_passes_residuals(&preds, batch, i, actual_schema)? {
-                matched.push(i);
-            }
-        }
-    }
+    let matched = match &batch_opt {
+        Some(batch) => matching_indices(&preds, batch, actual_schema)?,
+        None => Vec::new(),
+    };
     Ok(ResolvedRows {
         schema: schema_opt,
         batch: batch_opt,
@@ -251,9 +286,7 @@ pub(crate) fn execute_update(
     let count = resolved.matched.len();
     if let Some(batch) = &resolved.batch {
         let mut updates = ZSetBatch::new(actual_schema);
-        for &i in &resolved.matched {
-            write_set_columns(batch, i, &assignments, actual_schema, &mut updates)?;
-        }
+        write_set_rows(batch, &resolved.matched, &assignments, actual_schema, &mut updates)?;
         if count > 0 {
             client.push_with_mode(table_id, actual_schema, &updates, WireConflictMode::Update)?;
         }
@@ -351,7 +384,7 @@ mod tests {
     use gnitz_core::TypeCode;
 
     // ------------------------------------------------------------------
-    // write_set_columns must update the null bitmap for assignments
+    // write_set_rows must update the null bitmap for assignments
     // ------------------------------------------------------------------
 
     #[test]
@@ -363,7 +396,7 @@ mod tests {
 
         let assignments = vec![(1usize, BoundExpr::LitInt(99))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_columns(&current, 0, &assignments, &schema, &mut dst).unwrap();
+        write_set_rows(&current, &[0], &assignments, &schema, &mut dst).unwrap();
 
         assert_eq!(
             dst.nulls[0] & 0b1,
@@ -401,7 +434,7 @@ mod tests {
         // SET a = b  (ColRef(2) = b, which is NULL in current)
         let assignments = vec![(1usize, BoundExpr::ColRef(2))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_columns(&current, 0, &assignments, &schema, &mut dst).unwrap();
+        write_set_rows(&current, &[0], &assignments, &schema, &mut dst).unwrap();
 
         // a's null bit (payload_idx 0 → bit 0) must now be set
         assert_ne!(dst.nulls[0] & 0b01, 0, "a must be null after SET a = NULL_col");
@@ -434,14 +467,14 @@ mod tests {
         // Only assign to a; b is untouched
         let assignments = vec![(1usize, BoundExpr::LitInt(10))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_columns(&current, 0, &assignments, &schema, &mut dst).unwrap();
+        write_set_rows(&current, &[0], &assignments, &schema, &mut dst).unwrap();
 
         assert_eq!(dst.nulls[0] & 0b01, 0, "a must not be null (assigned non-null)");
         assert_ne!(dst.nulls[0] & 0b10, 0, "b must remain null (unassigned)");
     }
 
     #[test]
-    fn write_set_columns_carries_blob_column_through() {
+    fn write_set_rows_carries_blob_column_through() {
         // UPDATE assigns `v` only; the unmodified BLOB column must carry
         // through. Red against the missing `ColData::Bytes` arm (unreachable!).
         let schema = Schema {
@@ -465,7 +498,7 @@ mod tests {
 
         let assignments = vec![(2usize, BoundExpr::LitInt(99))];
         let mut dst = ZSetBatch::new(&schema);
-        write_set_columns(&current, 0, &assignments, &schema, &mut dst).unwrap();
+        write_set_rows(&current, &[0], &assignments, &schema, &mut dst).unwrap();
 
         if let ColData::Bytes(v) = &dst.columns[1] {
             assert_eq!(v[0].as_deref(), Some(&[1u8, 2, 3][..]));
@@ -474,6 +507,64 @@ mod tests {
         }
         if let ColData::Fixed(buf) = &dst.columns[2] {
             assert_eq!(i64::from_le_bytes(buf[..8].try_into().unwrap()), 99);
+        }
+    }
+
+    #[test]
+    fn build_merged_row_takes_pk_from_pk_src_and_carries_from_carry_src() {
+        // DO UPDATE shape: PK from the incoming (excluded) row; null-seed and
+        // carried columns from the existing stored row. Schema: pk, v (I64), b (Blob).
+        let schema = Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64, false),
+                col_def("v", TypeCode::I64, true),
+                col_def("b", TypeCode::Blob, true),
+            ],
+            pk_cols: vec![0],
+        };
+
+        // pk_src (incoming): PK = 100; payload irrelevant (only the PK is read).
+        let mut pk_src = ZSetBatch::new(&schema);
+        pk_src.pks.push_u128(100u128);
+        pk_src.weights.push(1);
+        pk_src.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut pk_src.columns[1] {
+            buf.extend_from_slice(&0i64.to_le_bytes());
+        }
+        if let ColData::Bytes(v) = &mut pk_src.columns[2] {
+            v.push(Some(vec![9, 9, 9]));
+        }
+
+        // carry_src (existing): PK = 200; v = 7 (non-null); b = [1,2,3] to carry.
+        let mut carry_src = ZSetBatch::new(&schema);
+        carry_src.pks.push_u128(200u128);
+        carry_src.weights.push(1);
+        carry_src.nulls.push(0);
+        if let ColData::Fixed(buf) = &mut carry_src.columns[1] {
+            buf.extend_from_slice(&7i64.to_le_bytes());
+        }
+        if let ColData::Bytes(v) = &mut carry_src.columns[2] {
+            v.push(Some(vec![1, 2, 3]));
+        }
+
+        // Resolver: assign v = NULL (must SET its null bit); leave b unassigned (carry).
+        let mut dst = ZSetBatch::new(&schema);
+        build_merged_row(&pk_src, 0, &carry_src, 0, &schema, &mut dst, |ci| {
+            Ok(if ci == 1 { Some(ColumnValue::Null) } else { None })
+        })
+        .unwrap();
+
+        let stride = schema.pk_stride() as u8;
+        // PK comes from pk_src (100), NOT carry_src (200).
+        assert_eq!(dst.pks.get_tuple(0, stride), pk_src.pks.get_tuple(0, stride));
+        assert_ne!(dst.pks.get_tuple(0, stride), carry_src.pks.get_tuple(0, stride));
+        // v's null bit (payload_idx 0) must be SET after the NULL assignment.
+        assert_ne!(dst.nulls[0] & 0b01, 0, "v must be null after SET v = NULL");
+        // b carried from carry_src ([1,2,3]), not pk_src ([9,9,9]).
+        if let ColData::Bytes(v) = &dst.columns[2] {
+            assert_eq!(v[0].as_deref(), Some(&[1u8, 2, 3][..]));
+        } else {
+            panic!("expected carried Bytes column");
         }
     }
 }

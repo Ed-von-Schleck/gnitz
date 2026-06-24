@@ -53,6 +53,25 @@ pub(crate) fn row_passes_residuals(
     Ok(true)
 }
 
+/// Indices of the rows of `batch` that pass every residual predicate, in order.
+/// An empty `preds` slice matches every row. Shared by the SELECT residual
+/// filter and the UPDATE/DELETE WHERE-row resolution, which both need the
+/// passing indices.
+pub(crate) fn matching_indices(
+    preds: &[BoundExpr],
+    batch: &ZSetBatch,
+    schema: &Schema,
+) -> Result<Vec<usize>, GnitzSqlError> {
+    let n = batch.pks.len();
+    let mut matched = Vec::with_capacity(n);
+    for i in 0..n {
+        if row_passes_residuals(preds, batch, i, schema)? {
+            matched.push(i);
+        }
+    }
+    Ok(matched)
+}
+
 fn apply_residual_filter(
     result: (Option<Arc<Schema>>, Option<ZSetBatch>),
     preds: &[BoundExpr],
@@ -67,11 +86,15 @@ fn apply_residual_filter(
         Some(b) => b,
     };
     let actual_schema = schema_opt.as_deref().unwrap_or(schema);
+    let n = batch.pks.len();
+    let matched = matching_indices(preds, &batch, actual_schema)?;
+    if matched.len() == n {
+        // Every row passed — return the fetched batch unmoved, no per-row clone.
+        return Ok((schema_opt, Some(batch)));
+    }
     let mut new_batch = ZSetBatch::new(actual_schema);
-    for i in 0..batch.pks.len() {
-        if row_passes_residuals(preds, &batch, i, actual_schema)? {
-            copy_batch_row(&batch, i, &mut new_batch, actual_schema);
-        }
+    for &i in &matched {
+        copy_batch_row(&batch, i, &mut new_batch, actual_schema);
     }
     Ok((schema_opt, Some(new_batch)))
 }

@@ -6,10 +6,10 @@
 
 use crate::ast_util::extract_name;
 use crate::bind::Binder;
-use crate::codec::colwrite::{append_column_value, append_value_to_col, ColumnValue};
+use crate::codec::colwrite::{append_value_to_col, ColumnValue};
 use crate::codec::nullmap::null_word_set;
 use crate::codec::pk_codec::{extract_pk_value, is_null_expr};
-use crate::dml::mutate::{eval_set_expr, resolve_set_target};
+use crate::dml::mutate::{build_merged_row, eval_set_expr, resolve_set_target};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::copy_batch_row;
 use crate::ir::BoundExpr;
@@ -20,10 +20,9 @@ use sqlparser::ast::{
     TableObject, Values,
 };
 
-/// Resolved ON CONFLICT target for v1: either the PK column of the
-/// table, or a reserved slot for future ON CONSTRAINT / unique secondary
-/// targets (not implemented in v1). `None` = no target specified —
-/// DO NOTHING with no target is treated as "any PK conflict".
+/// The resolved INSERT disposition after the ON CONFLICT clause (if any) is bound.
+/// The conflict target itself is validated and discarded in `validate_conflict_target`;
+/// only the action survives into the plan.
 enum ConflictPlan {
     /// Default SQL INSERT: push with WireConflictMode::Error.
     Error,
@@ -123,7 +122,7 @@ pub(crate) fn execute_insert(
                 OnConflictAction::DoUpdate(do_update) => {
                     if do_update.selection.is_some() {
                         return Err(GnitzSqlError::Unsupported(
-                            "ON CONFLICT ... DO UPDATE WHERE not supported in v1".to_string(),
+                            "ON CONFLICT ... DO UPDATE WHERE not supported".to_string(),
                         ));
                     }
                     let assignments = bind_do_update_assignments(&do_update.assignments, &schema, binder)?;
@@ -343,24 +342,11 @@ fn client_side_merge_do_update(
                 copy_batch_row(batch, i, &mut out, schema);
             }
             Some(existing_batch) => {
-                out.pks.push_from(&batch.pks, i);
-                out.weights.push(1);
-
-                // Start with the existing row's null bits; assignments
-                // that resolve to NULL will flip their bit below.
-                let mut null_bits: u64 = existing_batch.nulls[0];
-
-                for (payload_idx, ci, col_def) in schema.payload_columns() {
-                    if let Some(rhs) = asn_by_col[ci] {
-                        let cv = eval_do_update_rhs(rhs, &existing_batch, batch, i, schema)?;
-                        null_word_set(&mut null_bits, payload_idx, matches!(cv, ColumnValue::Null));
-                        append_column_value(&mut out.columns[ci], cv, col_def.type_code)?;
-                    } else {
-                        let stride = col_def.type_code.wire_stride();
-                        existing_batch.columns[ci].push_row_from(0, stride, &mut out.columns[ci]);
-                    }
-                }
-                out.nulls.push(null_bits);
+                build_merged_row(batch, i, &existing_batch, 0, schema, &mut out, |ci| {
+                    asn_by_col[ci]
+                        .map(|rhs| eval_do_update_rhs(rhs, &existing_batch, batch, i, schema))
+                        .transpose()
+                })?;
             }
         }
     }
