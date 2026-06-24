@@ -100,6 +100,14 @@ impl TypeCode {
         matches!(self, TypeCode::String | TypeCode::Blob)
     }
 
+    /// Whether this type is a signed integer (I8/I16/I32/I64/I128). Typed
+    /// counterpart of the free [`is_signed_int`]: the order-preserving encoders
+    /// flip the sign bit for these so two's-complement negatives sort below
+    /// non-negatives. Unsigned, float, and string types are not signed.
+    pub const fn is_signed_int(&self) -> bool {
+        is_signed_int(*self as u8)
+    }
+
     /// Whether this type may be a PRIMARY KEY column. PK regions are compared
     /// as raw bytes, which is correct only for integer scalars: String/Blob
     /// carry out-of-line blob heaps that cannot be bulk-copied in the PK
@@ -753,6 +761,19 @@ mod tests {
                 FixedInt::from_type_code(tc).is_some(),
                 "mismatch for {tc:?}"
             );
+        }
+    }
+
+    #[test]
+    fn signed_int_predicate_classifies_and_method_agrees() {
+        use TypeCode::*;
+        let signed = [I8, I16, I32, I64, I128];
+        for tc in [
+            U8, I8, U16, I16, U32, I32, F32, U64, I64, F64, String, U128, UUID, Blob, I128,
+        ] {
+            let want = signed.contains(&tc);
+            assert_eq!(is_signed_int(tc as u8), want, "free fn mismatch for {tc:?}");
+            assert_eq!(tc.is_signed_int(), want, "method mismatch for {tc:?}");
         }
     }
 

@@ -9,7 +9,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr};
 use crate::lower::compile_bound_expr;
 use crate::plan::validate::{reject_duplicate_column_names, reject_float_key};
-use crate::types::{is_integer_type, is_wide_int};
+use crate::types::{is_integer_type, is_min_max_orderable, is_wide_int};
 use crate::SqlResult;
 use gnitz_core::{
     CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, Schema, TypeCode, AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX,
@@ -229,34 +229,6 @@ pub(crate) fn execute_create_group_by_view(
                     },
                     None => None,
                 };
-                // Reject aggregates whose source column type is meaningless for
-                // the function: numeric aggregates need a numeric column, and
-                // MIN/MAX need an orderable column (the engine's decode_signed
-                // marks U128/UUID unreachable and reads STRING/BLOB as garbage).
-                if let Some(c) = src_col {
-                    let tc = source_schema.columns[c].type_code;
-                    let is_numeric = is_integer_type(tc) || tc.is_float();
-                    match func {
-                        AggFunc::Sum | AggFunc::Avg | AggFunc::CountNonNull => {
-                            // SUM/AVG accumulate into a 64-bit slot; the wide
-                            // (U128/UUID/I128) types overflow it and the engine's
-                            // decode_signed marks them unreachable. CountNonNull
-                            // only counts presence, so it accepts any type.
-                            if matches!(func, AggFunc::Sum | AggFunc::Avg) && (!is_numeric || is_wide_int(tc)) {
-                                return Err(GnitzSqlError::Bind(format!(
-                                    "{:?} is not supported on column type {:?} ('{}')",
-                                    func, tc, source_schema.columns[c].name,
-                                )));
-                            }
-                        }
-                        // MIN/MAX over a non-orderable column (wide ints, STRING,
-                        // BLOB) is already rejected when the aggregate is bound —
-                        // the SingleTable leaf binder checks `is_min_max_orderable`
-                        // — so any MIN/MAX reaching here has an orderable argument.
-                        AggFunc::Min | AggFunc::Max | AggFunc::Count => {}
-                    }
-                }
-
                 let out_type = agg_result_type(*func, src_col, &source_schema);
                 let agg_idx = agg_mappings.len();
                 let start = agg_specs.len();
@@ -689,6 +661,32 @@ fn push_agg_specs(
             "{agg_func:?} requires an argument column; only COUNT(*) accepts a wildcard"
         )));
     }
+    // Reject argument column types the engine cannot evaluate. Single validated
+    // gate for both the SELECT-list and HAVING-only (`append_having_agg`) callers.
+    // SELECT-list MIN/MAX is also rejected earlier by the leaf binder, so only the
+    // HAVING-only path reaches the MIN/MAX arm here.
+    if let Some(c) = arg_col {
+        let tc = schema.columns[c].type_code;
+        match agg_func {
+            AggFunc::Sum | AggFunc::Avg => {
+                if !(is_integer_type(tc) || tc.is_float()) || is_wide_int(tc) {
+                    return Err(GnitzSqlError::Bind(format!(
+                        "{agg_func:?} is not supported on column type {tc:?} ('{}')",
+                        schema.columns[c].name,
+                    )));
+                }
+            }
+            AggFunc::Min | AggFunc::Max => {
+                if !is_min_max_orderable(tc) {
+                    return Err(GnitzSqlError::Bind(format!(
+                        "{agg_func:?} is not supported on column type {tc:?} ('{}')",
+                        schema.columns[c].name,
+                    )));
+                }
+            }
+            AggFunc::Count | AggFunc::CountNonNull => {}
+        }
+    }
     let mut push = |op: u64, func: AggFunc, col: usize| {
         agg_specs.push(AggSpec {
             op,
@@ -991,5 +989,48 @@ fn extract_func_arg_col(func: &sqlparser::ast::Function, schema: &Schema) -> Res
         _ => Err(GnitzSqlError::Unsupported(
             "HAVING: function requires one argument".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::col_def;
+
+    // Columns: 0=pk(U64), 1=n(I64), 2=b(Blob), 3=u(UUID), 4=s(String).
+    fn schema() -> Schema {
+        Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64, false),
+                col_def("n", TypeCode::I64, true),
+                col_def("b", TypeCode::Blob, true),
+                col_def("u", TypeCode::UUID, true),
+                col_def("s", TypeCode::String, true),
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    fn try_push(func: AggFunc, arg_col: Option<usize>) -> Result<AggShape, GnitzSqlError> {
+        let mut specs = Vec::new();
+        push_agg_specs(func, arg_col, &schema(), &mut specs)
+    }
+
+    #[test]
+    fn push_agg_specs_rejects_unevaluatable_arg_types() {
+        assert!(matches!(try_push(AggFunc::Sum, Some(2)), Err(GnitzSqlError::Bind(_)))); // SUM(blob)
+        assert!(matches!(try_push(AggFunc::Avg, Some(3)), Err(GnitzSqlError::Bind(_)))); // AVG(uuid)
+        assert!(matches!(try_push(AggFunc::Min, Some(4)), Err(GnitzSqlError::Bind(_)))); // MIN(str)
+        assert!(matches!(try_push(AggFunc::Max, Some(2)), Err(GnitzSqlError::Bind(_))));
+        // MAX(blob)
+    }
+
+    #[test]
+    fn push_agg_specs_accepts_valid_arg_types() {
+        assert!(try_push(AggFunc::Sum, Some(1)).is_ok()); // SUM(i64)
+        assert!(try_push(AggFunc::Avg, Some(1)).is_ok()); // AVG(i64)
+        assert!(try_push(AggFunc::Min, Some(1)).is_ok()); // MIN(i64)
+        assert!(try_push(AggFunc::Count, None).is_ok()); // COUNT(*)
+        assert!(try_push(AggFunc::CountNonNull, Some(2)).is_ok()); // COUNT(blob) — presence only
     }
 }

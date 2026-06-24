@@ -98,3 +98,49 @@ fn insert_exact_column_count_succeeds() {
     exec(&mut client, &sn, "INSERT INTO t VALUES (1, 10)");
     assert_eq!(payload_rows(&mut client, &sn, "t", &["id", "v"]), vec![vec![1, 10]],);
 }
+
+// ── C1: explicit INSERT column lists (accept in-order, reject reordered/partial)
+
+#[test]
+fn insert_reordered_column_list_is_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+    let result = try_exec(&mut client, &sn, "INSERT INTO t (v, id) VALUES (10, 1)");
+    assert!(
+        result.is_err(),
+        "INSERT with a reordered column list must be rejected (it would silently swap values)"
+    );
+    assert!(
+        payload_rows(&mut client, &sn, "t", &["id", "v"]).is_empty(),
+        "the rejected INSERT must not have inserted a row",
+    );
+}
+
+#[test]
+fn insert_in_order_column_list_succeeds() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+    // A full column list in schema order is accepted (positional write is correct).
+    exec(&mut client, &sn, "INSERT INTO t (id, v) VALUES (1, 10)");
+    assert_eq!(payload_rows(&mut client, &sn, "t", &["id", "v"]), vec![vec![1, 10]]);
+}
+
+#[test]
+fn insert_partial_column_list_is_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+    let result = try_exec(&mut client, &sn, "INSERT INTO t (id) VALUES (1)");
+    assert!(result.is_err(), "INSERT with a partial column list must be rejected");
+}

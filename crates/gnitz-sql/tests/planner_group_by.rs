@@ -157,6 +157,83 @@ fn test_sum_avg_u128_rejected() {
     }
 }
 
+// ── C2: HAVING-only aggregates are type-validated (not just SELECT-list) ──
+//
+// An aggregate referenced only by HAVING is materialised via `push_agg_specs`
+// without a leaf-binder pass, so its argument type is validated there too.
+
+#[test]
+fn test_having_only_sum_over_u128_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT UNSIGNED NOT NULL, big DECIMAL(38,0) NOT NULL)")
+        .unwrap();
+    let err = p
+        .execute("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING SUM(big) > 0")
+        .unwrap_err();
+    assert!(
+        matches!(err, GnitzSqlError::Bind(_)),
+        "HAVING-only SUM(u128) must be Bind, got {err:?}"
+    );
+}
+
+#[test]
+fn test_having_only_avg_over_uuid_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT UNSIGNED NOT NULL, u UUID)")
+        .unwrap();
+    let err = p
+        .execute("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING AVG(u) > 0")
+        .unwrap_err();
+    assert!(
+        matches!(err, GnitzSqlError::Bind(_)),
+        "HAVING-only AVG(uuid) must be Bind, got {err:?}"
+    );
+}
+
+#[test]
+fn test_having_only_min_over_string_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT UNSIGNED NOT NULL, s TEXT)")
+        .unwrap();
+    let err = p
+        .execute("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING MIN(s) > 'a'")
+        .unwrap_err();
+    assert!(
+        matches!(err, GnitzSqlError::Bind(_)),
+        "HAVING-only MIN(string) must be Bind, got {err:?}"
+    );
+}
+
+#[test]
+fn test_having_only_sum_over_bigint_succeeds() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, c BIGINT NOT NULL)")
+        .unwrap();
+    // HAVING-only SUM over an i64 column is valid and must still compile.
+    p.execute("CREATE VIEW v AS SELECT g, COUNT(*) AS cnt FROM t GROUP BY g HAVING SUM(c) > 0")
+        .unwrap();
+}
+
 #[test]
 fn test_min_uuid_rejected() {
     let srv = match ServerHandle::start() {

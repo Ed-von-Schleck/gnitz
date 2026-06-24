@@ -5,26 +5,28 @@ use crate::ast_util::extract_name;
 use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{default_index_name, reject_duplicate_column_names, validate_user_index_name};
-use crate::types::{is_integer_type, sql_type_to_typecode};
+use crate::types::{int_domain_fits, is_integer_type, sql_type_to_typecode};
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, TypeCode};
 use sqlparser::ast::{
     ColumnOption, Expr, ObjectType, SqlOption, TableConstraint, Value, ValueWithSpan, WrappedCollection,
 };
 
-/// FK child/parent type compatibility: any integer child widens to any integer
-/// parent; otherwise the types must match exactly. Returns the standard mismatch
-/// error so both resolver paths reject identically.
+/// FK child/parent type compatibility: an integer child widens to an integer
+/// parent whose domain covers it; otherwise the types must match exactly. Returns
+/// the standard mismatch error so both resolver paths reject identically.
 fn check_fk_type_compat(fk_col_type: TypeCode, parent_col_type: TypeCode) -> Result<(), GnitzSqlError> {
     let is_compat = if is_integer_type(fk_col_type) && is_integer_type(parent_col_type) {
-        true
+        int_domain_fits(fk_col_type, parent_col_type)
     } else {
         fk_col_type == parent_col_type
     };
     if !is_compat {
         return Err(GnitzSqlError::Bind(format!(
-            "FK type mismatch: column type {fk_col_type:?} is not compatible with referenced \
-             column type {parent_col_type:?}",
+            "FK type mismatch: column type {fk_col_type:?} cannot reference column type \
+             {parent_col_type:?} — the child column adopts the referenced type, which would \
+             narrow or re-sign {fk_col_type:?}; declare the child with a type whose range \
+             fits within {parent_col_type:?}",
         )));
     }
     Ok(())
@@ -639,4 +641,34 @@ pub(crate) fn execute_create_index(
         .map_err(GnitzSqlError::Exec)?;
 
     Ok(SqlResult::IndexCreated { index_id })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fk_widening_and_identity_accepted() {
+        assert!(check_fk_type_compat(TypeCode::I32, TypeCode::I64).is_ok()); // safe widen
+        assert!(check_fk_type_compat(TypeCode::U32, TypeCode::I64).is_ok()); // unsigned → wider signed
+        assert!(check_fk_type_compat(TypeCode::I32, TypeCode::I32).is_ok()); // identity
+        assert!(check_fk_type_compat(TypeCode::U64, TypeCode::U64).is_ok()); // identity
+        assert!(check_fk_type_compat(TypeCode::UUID, TypeCode::UUID).is_ok()); // non-integer exact match
+    }
+
+    #[test]
+    fn fk_narrowing_resigning_or_cross_type_rejected() {
+        for (child, parent) in [
+            (TypeCode::U64, TypeCode::I32),   // narrow + re-sign
+            (TypeCode::U64, TypeCode::I64),   // same width, unsigned → signed
+            (TypeCode::I64, TypeCode::U64),   // signed → unsigned
+            (TypeCode::U128, TypeCode::I128), // 16→16, unsigned → signed
+            (TypeCode::U64, TypeCode::UUID),  // integer child → non-integer parent
+        ] {
+            assert!(
+                matches!(check_fk_type_compat(child, parent), Err(GnitzSqlError::Bind(_))),
+                "{child:?} → {parent:?} must be rejected"
+            );
+        }
+    }
 }

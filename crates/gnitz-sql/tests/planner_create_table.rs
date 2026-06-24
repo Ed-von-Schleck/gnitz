@@ -409,6 +409,49 @@ fn test_fk_column_type_matches_parent_native_pk() {
     assert_ne!(fk_col.fk_table_id, 0, "FK reference should be wired");
 }
 
+#[test]
+fn test_fk_narrowing_unsigned_child_is_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE parent (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    // Child declared U64 (BIGINT UNSIGNED) referencing an I32 parent PK: adopting
+    // the parent type would narrow + re-sign the declared domain → rejected.
+    let err = p
+        .execute("CREATE TABLE child (cid INT PRIMARY KEY, p_id BIGINT UNSIGNED REFERENCES parent(id))")
+        .unwrap_err();
+    assert!(matches!(err, GnitzSqlError::Bind(_)), "got {err:?}");
+}
+
+#[test]
+fn test_fk_widening_int_to_bigint_succeeds() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE parent (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        // INT child widening to a BIGINT (I64) parent is lossless and accepted.
+        p.execute("CREATE TABLE child (cid INT PRIMARY KEY, p_id INT REFERENCES parent(id))")
+            .unwrap();
+    }
+    let s = schema_after_create(&mut client, &sn, "child");
+    let fk_col = s.columns.iter().find(|c| c.name.eq_ignore_ascii_case("p_id")).unwrap();
+    assert_eq!(
+        fk_col.type_code,
+        TypeCode::I64,
+        "widened FK child adopts the parent's I64 PK type"
+    );
+    assert_ne!(fk_col.fk_table_id, 0, "FK reference should be wired");
+}
+
 // ── GROUP BY natural-PK coverage ─────────────────────────────────────
 
 #[test]

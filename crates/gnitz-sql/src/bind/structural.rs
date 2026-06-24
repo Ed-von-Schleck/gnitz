@@ -128,12 +128,21 @@ fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
 /// Number/string literal → `BoundExpr`.
 fn bind_literal(v: &Value) -> Result<BoundExpr, GnitzSqlError> {
     match v {
-        // Try integer first, then float.
-        Value::Number(n, _) => n
-            .parse::<i64>()
-            .map(BoundExpr::LitInt)
-            .or_else(|_| n.parse::<f64>().map(BoundExpr::LitFloat))
-            .map_err(|_| GnitzSqlError::Bind(format!("invalid number literal: {n}"))),
+        Value::Number(n, _) => {
+            if let Ok(i) = n.parse::<i64>() {
+                Ok(BoundExpr::LitInt(i))
+            } else if n.contains(['.', 'e', 'E']) {
+                n.parse::<f64>()
+                    .map(BoundExpr::LitFloat)
+                    .map_err(|_| GnitzSqlError::Bind(format!("invalid number literal: {n}")))
+            } else {
+                // Non-fractional literal that overflows i64. `BoundExpr::LitInt` is
+                // i64-only; representing it as f64 would run an integer-column
+                // comparison through a lossy 52-bit mantissa (e.g. u64::MAX matches
+                // the wrong rows).
+                Err(GnitzSqlError::Bind(format!("integer literal out of range: {n}")))
+            }
+        }
         Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Ok(BoundExpr::LitStr(s.clone())),
         _ => Err(GnitzSqlError::Unsupported(format!(
             "value type not supported in expressions: {v:?}"
@@ -295,6 +304,27 @@ mod tests {
             }
             e => panic!("expected Unsupported, got {e:?}"),
         }
+    }
+
+    fn num(n: &str) -> Result<BoundExpr, GnitzSqlError> {
+        bind_literal(&Value::Number(n.into(), false))
+    }
+
+    #[test]
+    fn bind_literal_rejects_out_of_i64_range_integer() {
+        // u64::MAX overflows i64 and is non-fractional → rejected, not coerced to f64.
+        assert!(matches!(num("18446744073709551615"), Err(GnitzSqlError::Bind(_))));
+    }
+
+    #[test]
+    fn bind_literal_accepts_fractional_and_exponent_floats() {
+        assert!(matches!(num("1.5"), Ok(BoundExpr::LitFloat(_))));
+        assert!(matches!(num("1e3"), Ok(BoundExpr::LitFloat(_))));
+    }
+
+    #[test]
+    fn bind_literal_accepts_in_range_integer() {
+        assert!(matches!(num("42"), Ok(BoundExpr::LitInt(42))));
     }
 
     #[test]

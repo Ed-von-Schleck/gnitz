@@ -24,7 +24,9 @@ fn setup_views(client: &mut GnitzClient, sn: &str) {
 
 fn insert(client: &mut GnitzClient, sn: &str, tbl: &str, id: i64, val: i64) {
     let mut p = SqlPlanner::new(client, sn);
-    p.execute(&format!("INSERT INTO {} (id, val) VALUES ({}, {})", tbl, id, val))
+    // Positional (no column list): callers use tables whose payload column is
+    // named `val` *or* `c`, and INSERT is full-row positional anyway.
+    p.execute(&format!("INSERT INTO {} VALUES ({}, {})", tbl, id, val))
         .unwrap();
 }
 

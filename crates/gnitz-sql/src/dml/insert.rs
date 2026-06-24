@@ -16,8 +16,8 @@ use crate::ir::BoundExpr;
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, PkTuple, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
-    Assignment, ConflictTarget, Expr, OnConflict, OnConflictAction, OnInsert, Query, SetExpr, Statement, TableObject,
-    Values,
+    Assignment, ConflictTarget, Expr, Ident, OnConflict, OnConflictAction, OnInsert, Query, SetExpr, Statement,
+    TableObject, Values,
 };
 
 /// Resolved ON CONFLICT target for v1: either the PK column of the
@@ -94,9 +94,13 @@ pub(crate) fn execute_insert(
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     // Extract table name, row source, and ON CONFLICT action.
-    let (table_name_str, rows, on_insert) = extract_insert_parts(stmt)?;
+    let (table_name_str, rows, columns, on_insert) = extract_insert_parts(stmt)?;
 
     let (tid, schema) = binder.resolve_base_table(client, &table_name_str)?;
+
+    // INSERT is positional; reject any column list that isn't the full set in
+    // schema order (it would otherwise silently misplace values).
+    validate_insert_column_list(columns, &schema)?;
 
     // Resolve the ON CONFLICT clause into a `ConflictPlan`.
     let plan = match on_insert {
@@ -141,8 +145,9 @@ pub(crate) fn execute_insert(
     for row in rows {
         // Standard SQL rejects a VALUES row whose arity differs from the column
         // count: too few values, or excess trailing values that were previously
-        // discarded silently. INSERT here is full-row positional (no column
-        // list), so this guard makes every per-column index below in-bounds.
+        // discarded silently. INSERT here is full-row positional (any explicit
+        // column list was already validated as the full set in schema order),
+        // so this guard makes every per-column index below in-bounds.
         if row.len() != schema.columns.len() {
             return Err(GnitzSqlError::Bind(format!(
                 "INSERT specifies {} value(s) but table '{}' has {} column(s)",
@@ -375,8 +380,32 @@ fn eval_do_update_rhs(
     }
 }
 
-/// `(table_name, rows, on_clause)` — return type of [`extract_insert_parts`].
-type InsertParts<'a> = (String, &'a [Vec<Expr>], Option<&'a OnInsert>);
+/// INSERT writes VALUES positionally into `schema.payload_columns()` in schema
+/// order, so an explicit column list is correct only when it names every column
+/// once, in schema order. A reordered or partial list would silently misplace
+/// values — reject it. (Full column-list remapping is a separate feature.)
+fn validate_insert_column_list(columns: &[Ident], schema: &Schema) -> Result<(), GnitzSqlError> {
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let in_schema_order = columns.len() == schema.columns.len()
+        && columns
+            .iter()
+            .zip(&schema.columns)
+            .all(|(c, sc)| c.value.eq_ignore_ascii_case(&sc.name));
+    if !in_schema_order {
+        return Err(GnitzSqlError::Unsupported(
+            "INSERT with an explicit column list is only supported when it lists all \
+             columns in schema order; reordered or partial column lists are not supported"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `(table_name, rows, columns, on_clause)` — return type of [`extract_insert_parts`].
+/// `columns` is the explicit INSERT column list (empty when omitted).
+type InsertParts<'a> = (String, &'a [Vec<Expr>], &'a [Ident], Option<&'a OnInsert>);
 
 fn extract_insert_parts(stmt: &Statement) -> Result<InsertParts<'_>, GnitzSqlError> {
     match stmt {
@@ -396,7 +425,7 @@ fn extract_insert_parts(stmt: &Statement) -> Result<InsertParts<'_>, GnitzSqlErr
                 .ok_or_else(|| GnitzSqlError::Unsupported("INSERT without VALUES not supported".to_string()))?;
 
             let rows = extract_values_rows(source)?;
-            Ok((table_name, rows, insert.on.as_ref()))
+            Ok((table_name, rows, insert.columns.as_slice(), insert.on.as_ref()))
         }
         _ => Err(GnitzSqlError::Bind("not an INSERT statement".to_string())),
     }
@@ -408,5 +437,46 @@ fn extract_values_rows(query: &Query) -> Result<&[Vec<Expr>], GnitzSqlError> {
         _ => Err(GnitzSqlError::Unsupported(
             "INSERT only supports VALUES (not INSERT INTO ... SELECT)".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::two_col;
+    use gnitz_core::TypeCode;
+
+    // `two_col` has columns ["pk", "val"] in schema order.
+    fn idents(names: &[&str]) -> Vec<Ident> {
+        names.iter().map(|n| Ident::new(*n)).collect()
+    }
+
+    #[test]
+    fn insert_no_column_list_is_ok() {
+        assert!(validate_insert_column_list(&[], &two_col(TypeCode::I64)).is_ok());
+    }
+
+    #[test]
+    fn insert_in_order_full_list_is_ok() {
+        // Full set, schema order, case-insensitive → accepted.
+        assert!(validate_insert_column_list(&idents(&["pk", "VAL"]), &two_col(TypeCode::I64)).is_ok());
+    }
+
+    #[test]
+    fn insert_reordered_list_is_rejected() {
+        let err = validate_insert_column_list(&idents(&["val", "pk"]), &two_col(TypeCode::I64)).unwrap_err();
+        assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn insert_partial_list_is_rejected() {
+        let err = validate_insert_column_list(&idents(&["pk"]), &two_col(TypeCode::I64)).unwrap_err();
+        assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn insert_wrong_name_is_rejected() {
+        let err = validate_insert_column_list(&idents(&["pk", "nope"]), &two_col(TypeCode::I64)).unwrap_err();
+        assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got {err:?}");
     }
 }

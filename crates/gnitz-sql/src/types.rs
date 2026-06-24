@@ -76,6 +76,19 @@ pub(crate) fn is_min_max_orderable(tc: TypeCode) -> bool {
     !is_wide_int(tc) && !tc.is_german_string()
 }
 
+/// True iff every value of integer type `child` is representable in integer type
+/// `parent`, so rewriting an FK child column to the parent's type loses no value
+/// the child could legally hold. Only valid for integer inputs (both
+/// `is_integer_type`); UUID and the non-integers never reach it.
+pub(crate) fn int_domain_fits(child: TypeCode, parent: TypeCode) -> bool {
+    let (cw, pw) = (child.wire_stride(), parent.wire_stride());
+    match (child.is_signed_int(), parent.is_signed_int()) {
+        (false, false) | (true, true) => cw <= pw, // same signedness → parent ≥ child width
+        (false, true) => cw < pw,                  // unsigned child needs a strictly wider signed parent
+        (true, false) => false,                    // signed child has negatives no unsigned parent holds
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +248,35 @@ mod tests {
         // Date is not supported
         let msg = err(DataType::Date);
         assert!(msg.contains("unsupported SQL type"), "unexpected error: {msg}");
+    }
+
+    // --- FK integer-domain compatibility (int_domain_fits) ---
+
+    #[test]
+    fn int_domain_fits_accepts_lossless_rewrites() {
+        for (c, p) in [
+            (TypeCode::I32, TypeCode::I64),  // signed widen
+            (TypeCode::U32, TypeCode::I64),  // unsigned → strictly wider signed
+            (TypeCode::U8, TypeCode::U16),   // unsigned widen
+            (TypeCode::I32, TypeCode::I32),  // identity
+            (TypeCode::U64, TypeCode::U64),  // identity
+            (TypeCode::U64, TypeCode::I128), // u64 fits i128
+        ] {
+            assert!(int_domain_fits(c, p), "{c:?} → {p:?} should fit");
+        }
+    }
+
+    #[test]
+    fn int_domain_fits_rejects_lossy_rewrites() {
+        for (c, p) in [
+            (TypeCode::U64, TypeCode::I64),   // same width, unsigned → signed
+            (TypeCode::U32, TypeCode::I32),   // same width, unsigned → signed
+            (TypeCode::I64, TypeCode::U64),   // signed → unsigned
+            (TypeCode::I32, TypeCode::U32),   // signed → unsigned
+            (TypeCode::U128, TypeCode::I128), // 16→16, unsigned → signed
+            (TypeCode::U8, TypeCode::I8),     // 1→1, unsigned → signed
+        ] {
+            assert!(!int_domain_fits(c, p), "{c:?} → {p:?} should not fit");
+        }
     }
 }
