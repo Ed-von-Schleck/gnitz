@@ -290,10 +290,6 @@ pub struct DagEngine {
 
 struct PendingEntry {
     depth: i32,
-    /// Monotonic insertion index within a single `drive_dag` invocation.
-    /// Tiebreak for the unstable depth sort: reproduces the per-depth
-    /// insertion order the previous stable sort preserved implicitly.
-    seq: u32,
     view_id: i64,
     source_id: i64,
     batch: Batch,
@@ -1097,7 +1093,6 @@ impl DagEngine {
         view_ids: &[i64],
         source_id: i64,
         delta: Batch,
-        next_seq: &mut u32,
     ) -> (Vec<PendingEntry>, FxHashMap<(i64, i64), usize>) {
         let last_valid_idx = view_ids.iter().rposition(|&vid| self.tables.contains_key(&vid));
         let mut delta_opt = Some(delta);
@@ -1115,12 +1110,10 @@ impl DagEngine {
                 };
                 pending.push(PendingEntry {
                     depth,
-                    seq: *next_seq,
                     view_id: vid,
                     source_id,
                     batch: b,
                 });
-                *next_seq += 1;
             }
         }
         if let Some(d) = delta_opt {
@@ -1163,8 +1156,7 @@ impl DagEngine {
             return 0;
         }
 
-        let mut next_seq: u32 = 0;
-        let (mut pending, mut pending_pos) = self.build_pending(&view_ids, source_id, delta, &mut next_seq);
+        let (mut pending, mut pending_pos) = self.build_pending(&view_ids, source_id, delta);
         let mut dirty_views: FxHashSet<i64> = FxHashSet::default();
 
         while let Some(entry) = pending.pop() {
@@ -1214,7 +1206,6 @@ impl DagEngine {
                 view_id,
                 src_schema,
                 delta,
-                &mut next_seq,
             );
             if let Some(batch) = out_delta {
                 crate::storage::batch_pool::recycle(batch);
@@ -1371,13 +1362,7 @@ impl DagEngine {
     /// `(view_id, source_id) → index` lookup. Both DAG drivers call this after
     /// pushing a new entry.
     fn resort_pending(pending: &mut [PendingEntry], pending_pos: &mut FxHashMap<(i64, i64), usize>) {
-        // Unstable (in-place, no scratch alloc) sort. The `seq` tiebreak makes the
-        // order identical to the previous stable `sort_by_key(Reverse(depth))`:
-        // depth descending, and within a depth the ascending `seq` is the push
-        // order a stable sort preserved implicitly. `(depth, seq)` is a total order
-        // (seq is unique), so the unstable sort is fully determined. Mirrors the
-        // argsort idiom in `ops/reduce/sort.rs` (sort_unstable_by + `.then_with`).
-        pending.sort_unstable_by(|a, b| b.depth.cmp(&a.depth).then_with(|| a.seq.cmp(&b.seq)));
+        pending.sort_by_key(|n| std::cmp::Reverse(n.depth));
         pending_pos.clear();
         for (i, pe) in pending.iter().enumerate() {
             pending_pos.insert((pe.view_id, pe.source_id), i);
@@ -1399,7 +1384,6 @@ impl DagEngine {
     /// the operand with it would trip the vm seed guard. `src_schema` must be
     /// `self.tables[&view_id].schema`; `tables` is read only for dependents'
     /// depth, so the immutable borrow does not conflict with the snapshot.
-    #[allow(clippy::too_many_arguments)]
     fn queue_dependents(
         pending: &mut Vec<PendingEntry>,
         pending_pos: &mut FxHashMap<(i64, i64), usize>,
@@ -1408,7 +1392,6 @@ impl DagEngine {
         view_id: i64,
         src_schema: SchemaDescriptor,
         delta: Option<&Batch>,
-        next_seq: &mut u32,
     ) {
         let mut pushed = false;
         for &dep_id in dep_view_ids {
@@ -1432,12 +1415,10 @@ impl DagEngine {
                 };
                 pending.push(PendingEntry {
                     depth: dep_depth,
-                    seq: *next_seq,
                     view_id: dep_id,
                     source_id: view_id,
                     batch,
                 });
-                *next_seq += 1;
                 pushed = true;
             }
         }
