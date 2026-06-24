@@ -104,7 +104,7 @@ pub(crate) fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram 
 /// co-partition byte-for-byte and the `_join_pk` catalog stride matches both. Only
 /// a cross-sign pair whose unsigned side is 128-bit (`U128`/`UUID`) stays
 /// rejected — its faithful common type is a signed-256 type that does not exist.
-fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, GnitzSqlError> {
+fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
     for col in [left, right] {
         reject_float_key(col, "JOIN ON")?;
     }
@@ -119,17 +119,14 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, Gni
             left.name, left.type_code, right.name, right.type_code
         )));
     }
-    left.type_code
-        .join_key_common_type(right.type_code)
-        .map(|t| t as u8)
-        .ok_or_else(|| {
-            GnitzSqlError::Unsupported(format!(
-                "JOIN ON: join key columns '{}' ({:?}) and '{}' ({:?}) cannot co-partition; \
+    left.type_code.join_key_common_type(right.type_code).ok_or_else(|| {
+        GnitzSqlError::Unsupported(format!(
+            "JOIN ON: join key columns '{}' ({:?}) and '{}' ({:?}) cannot co-partition; \
              a cross-sign pair whose unsigned side is 128-bit (e.g. DECIMAL(38,0)/UUID \
              joined with a signed integer) needs a signed-256 type that does not exist",
-                left.name, left.type_code, right.name, right.type_code
-            ))
-        })
+            left.name, left.type_code, right.name, right.type_code
+        ))
+    })
 }
 
 /// Validate the range conjunct's key pair and return its common reindex output
@@ -138,7 +135,7 @@ fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, Gni
 /// they are rejected here (they remain legal in the equality prefix). Floats are
 /// rejected by `validate_join_key_pair`, which then resolves the common integer
 /// type via `join_key_common_type` (cross-sign promotion included).
-fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<u8, GnitzSqlError> {
+fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
     for col in [left, right] {
         if col.type_code.is_german_string() {
             return Err(GnitzSqlError::Unsupported(format!(
@@ -201,20 +198,8 @@ fn cross_table_pair(l: usize, r: usize, left_n: usize) -> Option<(usize, usize, 
 /// output — no relabel.
 pub(crate) fn pure_range_m_output_cols(tc: TypeCode) -> Vec<ColumnDef> {
     vec![
-        ColumnDef {
-            name: "_group_pk".into(),
-            type_code: TypeCode::U128,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        },
-        ColumnDef {
-            name: "m".into(),
-            type_code: tc,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        },
+        ColumnDef::new("_group_pk", TypeCode::U128, false),
+        ColumnDef::new("m", tc, false),
     ]
 }
 
@@ -226,7 +211,7 @@ pub(crate) struct RangeConjunct {
     pub(crate) left_col: usize,
     pub(crate) right_col: usize,
     pub(crate) op: RangeRel,
-    pub(crate) tc: u8,
+    pub(crate) tc: TypeCode,
 }
 
 /// The full ON-clause classification: per-position-paired equality-prefix key
@@ -235,7 +220,7 @@ pub(crate) struct RangeConjunct {
 /// — every other ON conjunct (a second range, `<>`, a column-vs-literal test, a
 /// same-table or arithmetic comparison, an OR/IS NULL group), evaluated as a
 /// linear post-join `Filter` for INNER joins (§6).
-pub(crate) type JoinPredicates = (Vec<usize>, Vec<usize>, Vec<u8>, Option<RangeConjunct>, Vec<Expr>);
+pub(crate) type JoinPredicates = (Vec<usize>, Vec<usize>, Vec<TypeCode>, Option<RangeConjunct>, Vec<Expr>);
 
 /// Classify a JOIN ON clause into its equality-prefix pairs and an optional
 /// single range conjunct. A pure superset of the old equi-only extraction: with
@@ -305,7 +290,7 @@ fn collect_join_predicates(
     alias_map: &AliasMap,
     left_cols: &mut Vec<usize>,
     right_cols: &mut Vec<usize>,
-    target_tcs: &mut Vec<u8>,
+    target_tcs: &mut Vec<TypeCode>,
     range: &mut Option<RangeConjunct>,
     residual: &mut Vec<Expr>,
 ) -> Result<(), GnitzSqlError> {
@@ -511,13 +496,7 @@ mod tests {
     use sqlparser::parser::Parser;
 
     fn col(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
-        ColumnDef {
-            name: name.into(),
-            type_code: tc,
-            is_nullable: nullable,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        }
+        ColumnDef::new(name, tc, nullable)
     }
 
     fn parse_on(src: &str) -> Expr {
@@ -571,7 +550,7 @@ mod tests {
 
     /// The equi-join half of `JoinPredicates` (no range conjunct): paired key
     /// columns + per-pair common reindex type. Named for legible helper returns.
-    type EquiKeys = (Vec<usize>, Vec<usize>, Vec<u8>);
+    type EquiKeys = (Vec<usize>, Vec<usize>, Vec<TypeCode>);
 
     /// Like `extract` but also returns the per-pair common reindex output type
     /// `T`, for cross-width promotion assertions. Asserts no range conjunct.
@@ -696,59 +675,59 @@ mod tests {
         // Same-type pairs: T == the source reindex output type.
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U64, false), &col("b", TypeCode::U64, false)).unwrap(),
-            TypeCode::U64 as u8
+            TypeCode::U64
         );
         validate_join_key_pair(&col("a", TypeCode::String, false), &col("b", TypeCode::String, false)).unwrap();
         validate_join_key_pair(&col("a", TypeCode::String, false), &col("b", TypeCode::Blob, false)).unwrap();
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U128, false), &col("b", TypeCode::UUID, false)).unwrap(),
-            TypeCode::U128 as u8
+            TypeCode::U128
         );
         // Cross-width same-sign pairs promote to the wider type.
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::I32, false), &col("b", TypeCode::I64, false)).unwrap(),
-            TypeCode::I64 as u8
+            TypeCode::I64
         );
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U32, false), &col("b", TypeCode::U64, false)).unwrap(),
-            TypeCode::U64 as u8
+            TypeCode::U64
         );
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U8, false), &col("b", TypeCode::U64, false)).unwrap(),
-            TypeCode::U64 as u8
+            TypeCode::U64
         );
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U32, false), &col("b", TypeCode::U128, false)).unwrap(),
-            TypeCode::U128 as u8
+            TypeCode::U128
         );
         // Cross-sign pairs whose unsigned side is ≤ 8 bytes (U64) promote to the
         // narrowest signed type holding both ranges.
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U32, false), &col("b", TypeCode::I64, false)).unwrap(),
-            TypeCode::I64 as u8
+            TypeCode::I64
         );
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U8, false), &col("b", TypeCode::I16, false)).unwrap(),
-            TypeCode::I16 as u8
+            TypeCode::I16
         );
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U16, false), &col("b", TypeCode::I32, false)).unwrap(),
-            TypeCode::I32 as u8
+            TypeCode::I32
         );
         // U32 = I32 needs the wider I64 (a signed type of equal width cannot hold
         // U32's full range).
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U32, false), &col("b", TypeCode::I32, false)).unwrap(),
-            TypeCode::I64 as u8
+            TypeCode::I64
         );
         // U64 cross-sign with any signed integer ⇒ the signed-128 common type.
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U64, false), &col("b", TypeCode::I64, false)).unwrap(),
-            TypeCode::I128 as u8
+            TypeCode::I128
         );
         assert_eq!(
             validate_join_key_pair(&col("a", TypeCode::U64, false), &col("b", TypeCode::I8, false)).unwrap(),
-            TypeCode::I128 as u8
+            TypeCode::I128
         );
     }
 
@@ -775,19 +754,19 @@ mod tests {
         let r = vec![col("x", TypeCode::I64, false)];
         let (lc, rc, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
         assert_eq!((lc, rc), (vec![0], vec![0]));
-        assert_eq!(tcs, vec![TypeCode::I64 as u8]);
+        assert_eq!(tcs, vec![TypeCode::I64]);
 
         // U32 = U64 → T = U64.
         let l = vec![col("x", TypeCode::U32, false)];
         let r = vec![col("x", TypeCode::U64, false)];
         let (_, _, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
-        assert_eq!(tcs, vec![TypeCode::U64 as u8]);
+        assert_eq!(tcs, vec![TypeCode::U64]);
 
         // Cross-sign: INT UNSIGNED (U32) = BIGINT (I64) → T = I64.
         let l = vec![col("x", TypeCode::U32, false)];
         let r = vec![col("x", TypeCode::I64, false)];
         let (_, _, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
-        assert_eq!(tcs, vec![TypeCode::I64 as u8]);
+        assert_eq!(tcs, vec![TypeCode::I64]);
     }
 
     /// BIGINT UNSIGNED (U64) cross-sign joined with any signed integer promotes to
@@ -799,7 +778,7 @@ mod tests {
             let r = vec![col("x", signed, false)];
             let (lc, rc, tcs) = extract_with_tcs("a.x = b.x", l, r).unwrap();
             assert_eq!((lc, rc), (vec![0], vec![0]));
-            assert_eq!(tcs, vec![TypeCode::I128 as u8], "U64 = {signed:?} must promote to I128");
+            assert_eq!(tcs, vec![TypeCode::I128], "U64 = {signed:?} must promote to I128");
         }
     }
 
@@ -864,7 +843,7 @@ mod tests {
         // a.k = b.k AND a.lo <= b.t. cols: a=[k=0, lo=1], b=[k=0, t=1].
         let (eq_l, eq_r, eq_tcs, range, _) = extract_full("a.x = b.x AND a.y <= b.y", two_u64(), two_u64()).unwrap();
         assert_eq!((eq_l, eq_r), (vec![0], vec![0]));
-        assert_eq!(eq_tcs, vec![TypeCode::U64 as u8]);
+        assert_eq!(eq_tcs, vec![TypeCode::U64]);
         let rc = range.expect("range conjunct");
         assert_eq!((rc.left_col, rc.right_col, rc.op), (1, 1, RangeRel::Le));
     }
@@ -938,6 +917,6 @@ mod tests {
         let l = vec![col("id", TypeCode::U64, false), col("x", TypeCode::U32, false)];
         let r = vec![col("id", TypeCode::U64, false), col("y", TypeCode::I64, false)];
         let (_, _, _, range, _) = extract_full("a.x < b.y", l, r).unwrap();
-        assert_eq!(range.unwrap().tc, TypeCode::I64 as u8);
+        assert_eq!(range.unwrap().tc, TypeCode::I64);
     }
 }

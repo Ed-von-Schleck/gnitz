@@ -271,13 +271,7 @@ mod tests {
     use sqlparser::parser::Parser;
 
     fn col(name: &str, tc: TypeCode) -> ColumnDef {
-        ColumnDef {
-            name: name.into(),
-            type_code: tc,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        }
+        ColumnDef::new(name, tc, false)
     }
 
     fn schema_with_val(val_tc: TypeCode) -> Schema {
@@ -413,16 +407,7 @@ mod tests {
         ));
         // Nullable column: binds to the IsNull / IsNotNull opcode at the column index.
         let nullable = Schema {
-            columns: vec![
-                col("pk", TypeCode::U64),
-                ColumnDef {
-                    name: "c".into(),
-                    type_code: TypeCode::I64,
-                    is_nullable: true,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-            ],
+            columns: vec![col("pk", TypeCode::U64), ColumnDef::new("c", TypeCode::I64, true)],
             pk_cols: vec![0],
         };
         assert!(matches!(

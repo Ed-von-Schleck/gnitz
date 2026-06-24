@@ -259,13 +259,7 @@ pub(crate) fn execute_create_set_op_view(
 
     // Output schema: U128 PK + all payload columns
     let mut out_cols_final: Vec<ColumnDef> = Vec::new();
-    out_cols_final.push(ColumnDef {
-        name: "_set_pk".into(),
-        type_code: TypeCode::U128,
-        is_nullable: false,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-    });
+    out_cols_final.push(ColumnDef::new("_set_pk", TypeCode::U128, false));
     for (l, r) in left_cols.iter().zip(&right_cols) {
         let mut col = l.clone();
         // Output nullability is operator-specific. EXCEPT emits only left-side
@@ -317,13 +311,7 @@ pub(crate) fn execute_create_distinct_view(
 
     // Output schema: synthetic U128 PK + the projected columns.
     let mut out_cols: Vec<ColumnDef> = Vec::with_capacity(proj_cols.len() + 1);
-    out_cols.push(ColumnDef {
-        name: "_distinct_pk".into(),
-        type_code: TypeCode::U128,
-        is_nullable: false,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-    });
+    out_cols.push(ColumnDef::new("_distinct_pk", TypeCode::U128, false));
     out_cols.extend(proj_cols);
     reject_duplicate_column_names(out_cols.iter().map(|c| c.name.as_str()), "SELECT DISTINCT view")?;
 

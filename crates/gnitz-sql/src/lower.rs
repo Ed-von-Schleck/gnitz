@@ -309,13 +309,7 @@ mod tests {
     use gnitz_core::{ColumnDef, ExprProgram, Schema, TypeCode};
 
     fn col(name: &str, tc: TypeCode) -> ColumnDef {
-        ColumnDef {
-            name: name.into(),
-            type_code: tc,
-            is_nullable: true,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        }
+        ColumnDef::new(name, tc, true)
     }
 
     /// col 0 = pk (U64), col 1 = s (String), col 2 = t (String).

@@ -27,14 +27,10 @@ use std::rc::Rc;
 /// the round-trip inverse of the engine's `resolve_reindex_type`. Shared by the
 /// equi builder (`slot_tcs = target_tcs`) and the range builder
 /// (`slot_tcs = all_tcs`, the eq prefix plus the range slot).
-fn side_target_tcs(cols: &[usize], schema: &Schema, slot_tcs: &[u8]) -> Vec<u8> {
+fn side_target_tcs(cols: &[usize], schema: &Schema, slot_tcs: &[TypeCode]) -> Vec<u8> {
     cols.iter()
         .zip(slot_tcs)
-        .map(|(&c, &t)| {
-            schema.columns[c]
-                .type_code
-                .carried_reindex_tc(TypeCode::from_validated_u8(t))
-        })
+        .map(|(&c, &t)| schema.columns[c].type_code.carried_reindex_tc(t))
         .collect()
 }
 
@@ -362,15 +358,9 @@ pub(crate) fn execute_create_join_view(
         } else {
             format!("_join_pk_{i}")
         };
-        out_cols.push(ColumnDef {
-            name,
-            // The pair's common type T_i — the single persisted stride both sides'
-            // reindex Maps and every cross-process consumer re-derive.
-            type_code: TypeCode::from_validated_u8(t),
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        });
+        // The pair's common type T_i — the single persisted stride both sides'
+        // reindex Maps and every cross-process consumer re-derive.
+        out_cols.push(ColumnDef::new(name, t, false));
     }
     for col in &left_schema.columns {
         out_cols.push(col.clone());
@@ -483,7 +473,7 @@ fn build_range_join_view(
     right_schema: &Schema,
     left_join_cols: &[usize],
     right_join_cols: &[usize],
-    eq_tcs: &[u8],
+    eq_tcs: &[TypeCode],
     range: RangeConjunct,
     is_left_join: bool,
     residual: &[Expr],
@@ -532,7 +522,7 @@ fn build_range_join_view(
         .copied()
         .chain(std::iter::once(range.right_col))
         .collect();
-    let all_tcs: Vec<u8> = eq_tcs.iter().copied().chain(std::iter::once(range.tc)).collect();
+    let all_tcs: Vec<TypeCode> = eq_tcs.iter().copied().chain(std::iter::once(range.tc)).collect();
 
     // Per-side carried target tc per slot (0 = self-derive); see `side_target_tcs`.
     let left_target_tcs = side_target_tcs(&left_reindex_cols, left_schema, &all_tcs);
@@ -551,7 +541,7 @@ fn build_range_join_view(
     // compile. (Band LEFT, n_eq ≥ 1, uses the cap-free `A − distinct(π_A(inner))`
     // set-difference null-fill instead, so it has no range-type restriction.)
     if is_left_join && n_eq == 0 {
-        let range_tc = TypeCode::from_validated_u8(range.tc);
+        let range_tc = range.tc;
         if FixedInt::from_type_code(range_tc).is_none() {
             return Err(GnitzSqlError::Unsupported(format!(
                 "pure-range LEFT JOIN needs a ≤8-byte integer range column (got {range_tc:?}); \
@@ -630,13 +620,7 @@ fn build_range_join_view(
     // type, no cross-side promotion).
     let mut union_cols: Vec<ColumnDef> = Vec::with_capacity(k + left_n + right_n);
     for (i, &t) in all_tcs.iter().enumerate() {
-        union_cols.push(ColumnDef {
-            name: format!("_join_pk_{i}"),
-            type_code: TypeCode::from_validated_u8(t),
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        });
+        union_cols.push(ColumnDef::new(format!("_join_pk_{i}"), t, false));
     }
     for col in &left_schema.columns {
         union_cols.push(col.clone());
@@ -699,12 +683,12 @@ fn build_range_join_view(
         .map(|&c| (left_schema, c))
         .chain(right_schema.pk_cols.iter().map(|&c| (right_schema, c)))
         .enumerate()
-        .map(|(slot, (schema, c))| ColumnDef {
-            name: format!("_pair_pk_{slot}"),
-            type_code: schema.columns[c].type_code.reindex_output_type(),
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
+        .map(|(slot, (schema, c))| {
+            ColumnDef::new(
+                format!("_pair_pk_{slot}"),
+                schema.columns[c].type_code.reindex_output_type(),
+                false,
+            )
         })
         .collect();
 
@@ -745,7 +729,7 @@ fn build_range_join_view(
             // `matched = A ⋈ {m}` carries each `a`'s true weight (one-row `m` cannot
             // multiply, no `distinct`), it is weight-exact for a bag-valued left
             // input too.
-            let range_tc = TypeCode::from_validated_u8(range.tc);
+            let range_tc = range.tc;
             let want_max = matches!(range.op, RangeRel::Lt | RangeRel::Le);
             let agg_func = if want_max { AGG_MAX } else { AGG_MIN };
             let m_schema = Schema {
@@ -804,13 +788,7 @@ fn build_range_join_view(
             // non-owned / NULL-key rows), NOT `input_a_raw`: a pure-range relay
             // broadcasts `a`, so re-keying the raw input would emit `W×` copies the
             // pair-PK shard would sum (plan §2, unlike band's scattered `a_all`).
-            let jp = ColumnDef {
-                name: "_jp".into(),
-                type_code: range_tc,
-                is_nullable: false,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-            };
+            let jp = ColumnDef::new("_jp", range_tc, false);
             let nf_raw_schema = Schema {
                 columns: std::iter::once(jp).chain(left_schema.columns.iter().cloned()).collect(),
                 pk_cols: vec![0],

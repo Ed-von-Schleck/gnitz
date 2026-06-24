@@ -209,13 +209,11 @@ pub(crate) fn execute_create_table(
     // Phase 1 — build column defs (name, type, nullability only).
     let mut cols: Vec<ColumnDef> = Vec::with_capacity(sql_cols.len());
     for col in sql_cols.iter() {
-        cols.push(ColumnDef {
-            name: col.name.value.clone(),
-            type_code: sql_type_to_typecode(&col.data_type)?,
-            is_nullable: !col.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull)),
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        });
+        cols.push(ColumnDef::new(
+            col.name.value.clone(),
+            sql_type_to_typecode(&col.data_type)?,
+            !col.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull)),
+        ));
     }
 
     // Phase 2 — gather PK column indices.

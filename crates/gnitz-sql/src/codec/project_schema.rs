@@ -58,13 +58,7 @@ fn resolve_proj_col(
         let out_type = bound.infer_type(source_schema);
         Ok((
             ProjItem::Computed { bound_expr: bound },
-            ColumnDef {
-                name: alias.unwrap_or_else(|| format!("_expr{idx}")),
-                type_code: out_type,
-                is_nullable: true,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-            },
+            ColumnDef::new(alias.unwrap_or_else(|| format!("_expr{idx}")), out_type, true),
         ))
     }
 }

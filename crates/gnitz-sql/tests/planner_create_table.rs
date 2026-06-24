@@ -538,20 +538,8 @@ fn test_create_view_with_nullable_first_column_rejected() {
 
     // Create a real source so we can build a circuit referring to a valid table id.
     let cols = vec![
-        ColumnDef {
-            name: "id".into(),
-            type_code: TypeCode::U64,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        },
-        ColumnDef {
-            name: "v".into(),
-            type_code: TypeCode::I64,
-            is_nullable: true,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        },
+        ColumnDef::new("id", TypeCode::U64, false),
+        ColumnDef::new("v", TypeCode::I64, true),
     ];
     let src_tid = client.create_table(&sn, "src", &cols, &[0u32], true, false, 0).unwrap();
 
@@ -564,20 +552,8 @@ fn test_create_view_with_nullable_first_column_rejected() {
     let circuit = cb.build();
 
     let bad_out = vec![
-        ColumnDef {
-            name: "pk".into(),
-            type_code: TypeCode::U64,
-            is_nullable: true,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        },
-        ColumnDef {
-            name: "v".into(),
-            type_code: TypeCode::I64,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        },
+        ColumnDef::new("pk", TypeCode::U64, true),
+        ColumnDef::new("v", TypeCode::I64, false),
     ];
     let err = client
         .create_view_with_circuit(&sn, "bad_view", "", circuit, &bad_out, &[0])

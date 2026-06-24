@@ -8,13 +8,7 @@ use sqlparser::ast::{Expr, UnaryOperator, Value, ValueWithSpan};
 use sqlparser::tokenizer::Span;
 
 pub(crate) fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
-    ColumnDef {
-        name: name.into(),
-        type_code: tc,
-        is_nullable: nullable,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-    }
+    ColumnDef::new(name, tc, nullable)
 }
 
 /// `(pk pk_tc, v I64)` — single-column PK of a chosen type plus one payload.

@@ -299,13 +299,7 @@ pub(crate) fn execute_create_group_by_view(
         reduce_schema_cols.push(source_schema.columns[group_col_indices[0]].clone());
     } else {
         reduce_pk_cols.push(0);
-        reduce_schema_cols.push(ColumnDef {
-            name: "_group_pk".into(),
-            type_code: TypeCode::U128,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        });
+        reduce_schema_cols.push(ColumnDef::new("_group_pk", TypeCode::U128, false));
         for &gi in &group_col_indices {
             reduce_schema_cols.push(source_schema.columns[gi].clone());
         }
@@ -319,13 +313,7 @@ pub(crate) fn execute_create_group_by_view(
         // (float SUM/MIN/MAX → F64, MIN/MAX preserve the source type, SUM/COUNT*
         // → I64), so the planner's virtual reduce schema matches the compiler's
         // physical reduce output (§3a) with no per-op reconstruction.
-        reduce_schema_cols.push(ColumnDef {
-            name: "_agg".into(),
-            type_code: spec.out_type,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        });
+        reduce_schema_cols.push(ColumnDef::new("_agg", spec.out_type, false));
     }
     let reduce_schema = Schema {
         columns: reduce_schema_cols,
@@ -436,16 +424,14 @@ pub(crate) fn execute_create_group_by_view(
                 } else {
                     // Synthetic-PK path, or second projection of the same group column.
                     post_map_eb.copy_col(tc as u32, reduce_col as u32, payload_idx);
-                    out_cols.push(ColumnDef {
-                        name: name.clone(),
-                        type_code: tc,
-                        // Natural-PK path (group_set_eq_pk / single_col_natural_pk):
-                        // the source col is non-nullable. Synthetic-PK path: propagate
-                        // source nullability — nothing forces NOT NULL.
-                        is_nullable: source_schema.columns[*src_col].is_nullable,
-                        fk_table_id: 0,
-                        fk_col_idx: 0,
-                    });
+                    // Natural-PK path (group_set_eq_pk / single_col_natural_pk):
+                    // the source col is non-nullable. Synthetic-PK path: propagate
+                    // source nullability — nothing forces NOT NULL.
+                    out_cols.push(ColumnDef::new(
+                        name.clone(),
+                        tc,
+                        source_schema.columns[*src_col].is_nullable,
+                    ));
                     payload_idx += 1;
                 }
             }
@@ -469,16 +455,10 @@ pub(crate) fn execute_create_group_by_view(
                         let cnt_f = post_map_eb.int_to_float(cnt_reg);
                         let avg_reg = post_map_eb.float_div(sum_f, cnt_f);
                         post_map_eb.emit_col(avg_reg, payload_idx);
-                        out_cols.push(ColumnDef {
-                            // AVG of an empty / all-NULL group is NULL (COUNT_NON_NULL=0
-                            // → float_div by zero marks the result NULL), so the column
-                            // must be nullable to match what the circuit can emit.
-                            name: m.output_name.clone(),
-                            type_code: TypeCode::F64,
-                            is_nullable: true,
-                            fk_table_id: 0,
-                            fk_col_idx: 0,
-                        });
+                        // AVG of an empty / all-NULL group is NULL (COUNT_NON_NULL=0
+                        // → float_div by zero marks the result NULL), so the column
+                        // must be nullable to match what the circuit can emit.
+                        out_cols.push(ColumnDef::new(m.output_name.clone(), TypeCode::F64, true));
                         payload_idx += 1;
                     }
                     AggShape::NullfillSum => {
@@ -506,33 +486,25 @@ pub(crate) fn execute_create_group_by_view(
                             post_map_eb.div(sum_reg, gate)
                         };
                         post_map_eb.emit_col(gated, payload_idx);
-                        out_cols.push(ColumnDef {
-                            // A surviving group whose non-null count is zero yields
-                            // NULL (div-by-zero), so the column must be nullable.
-                            name: m.output_name.clone(),
-                            type_code: m.output_type,
-                            is_nullable: true,
-                            fk_table_id: 0,
-                            fk_col_idx: 0,
-                        });
+                        // A surviving group whose non-null count is zero yields
+                        // NULL (div-by-zero), so the column must be nullable.
+                        out_cols.push(ColumnDef::new(m.output_name.clone(), m.output_type, true));
                         payload_idx += 1;
                     }
                     AggShape::Direct => {
                         // Direct aggregate: single spec copied straight through.
                         let tc = reduce_schema.columns[sum_col].type_code;
                         post_map_eb.copy_col(tc as u32, sum_col as u32, payload_idx);
-                        out_cols.push(ColumnDef {
-                            name: m.output_name.clone(),
-                            type_code: m.output_type,
-                            // SUM/MIN/MAX emit NULL for an all-NULL group (emit.rs sets
-                            // the null bit when the accumulator is_zero(), since it skips
-                            // NULL inputs). COUNT/COUNT_NON_NULL always return an integer
-                            // (0, never NULL). Match emit.rs so a schema-driven decoder
-                            // reads NULL instead of raw zero bytes.
-                            is_nullable: matches!(m.agg_func, AggFunc::Sum | AggFunc::Min | AggFunc::Max),
-                            fk_table_id: 0,
-                            fk_col_idx: 0,
-                        });
+                        // SUM/MIN/MAX emit NULL for an all-NULL group (emit.rs sets
+                        // the null bit when the accumulator is_zero(), since it skips
+                        // NULL inputs). COUNT/COUNT_NON_NULL always return an integer
+                        // (0, never NULL). Match emit.rs so a schema-driven decoder
+                        // reads NULL instead of raw zero bytes.
+                        out_cols.push(ColumnDef::new(
+                            m.output_name.clone(),
+                            m.output_type,
+                            matches!(m.agg_func, AggFunc::Sum | AggFunc::Min | AggFunc::Max),
+                        ));
                         payload_idx += 1;
                     }
                 }

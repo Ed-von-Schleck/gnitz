@@ -162,13 +162,7 @@ mod tests {
     use gnitz_core::{ColumnDef, TypeCode};
 
     fn col(name: &str, tc: TypeCode) -> ColumnDef {
-        ColumnDef {
-            name: name.into(),
-            type_code: tc,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        }
+        ColumnDef::new(name, tc, false)
     }
 
     #[test]

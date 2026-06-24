@@ -22,6 +22,22 @@ pub struct ColumnDef {
     pub fk_col_idx: u64,
 }
 
+impl ColumnDef {
+    /// A column with no foreign key — the common case. Client-side schema
+    /// builders (the SQL planner, the C ABI, the Python driver) synthesize
+    /// non-FK columns through here; the planner's FK path sets
+    /// `fk_table_id`/`fk_col_idx` with a struct literal instead.
+    pub fn new(name: impl Into<String>, type_code: TypeCode, is_nullable: bool) -> Self {
+        Self {
+            name: name.into(),
+            type_code,
+            is_nullable,
+            fk_table_id: 0,
+            fk_col_idx: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
     pub columns: Vec<ColumnDef>,

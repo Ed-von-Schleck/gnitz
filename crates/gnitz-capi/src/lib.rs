@@ -256,13 +256,8 @@ pub unsafe extern "C" fn gnitz_schema_add_col(
             return -1;
         }
     }
-    s.0.columns.push(ColumnDef {
-        name: cstr(name).to_owned(),
-        type_code: tc,
-        is_nullable: nullable != 0,
-        fk_table_id: 0,
-        fk_col_idx: 0,
-    });
+    s.0.columns
+        .push(ColumnDef::new(cstr(name).to_owned(), tc, nullable != 0));
     0
 }
 

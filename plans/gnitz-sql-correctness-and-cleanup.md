@@ -2,10 +2,13 @@
 
 A code-quality pass over `crates/gnitz-sql/src` (the SQL front end: parse → bind →
 plan/lower for views, or → execute for DML). Shipped so far — the four correctness
-fixes C1–C4, the two Theme A fixes A1–A2, and the three Theme B view/binder refactors
-B2–B4 (see the "— DONE" sections below); the twelve remaining changes are ordered by
-leverage (impact × confidence ÷ effort) and grouped into themes — duplication,
-type-safety, and hygiene with no behavioural change unless noted.
+fixes C1–C4, the two Theme A fixes A1–A2, the three Theme B view/binder refactors
+B2–B4, the DML row-builder dedup C-DML-1, the F2 doc fix, the two Theme G perf
+tweaks G1–G2, and the two Theme D type-safety changes D1 (join-key `TypeCode`) and D3
+(`ColumnDef::new`) (see the "— DONE" sections below; C-DML-2 was dropped); the five
+remaining changes (D2, E1, F1, F3, F4) are ordered by leverage (impact × confidence ÷
+effort) and grouped into themes — duplication, type-safety, and hygiene with no
+behavioural change unless noted.
 
 Every item names exact `file:line` anchors, the change (with code), the invariants
 it must not break, effort (S/M/L), value, and how to verify. Line numbers are from
@@ -94,143 +97,57 @@ avoids. The two inline WHERE blocks stay.
 
 ---
 
-## Theme C — DML row-builder and seek-loop dedup
+## Theme C (C-DML-1) — DONE
 
-### C-DML-1 — Extract the merged-row builder (UPDATE SET ∥ DO UPDATE) and fix the lookup drift
+Shipped. `build_merged_row` (`dml/mutate.rs`) is the single merged-row builder shared
+by UPDATE SET (`write_set_columns`) and ON CONFLICT DO UPDATE
+(`client_side_merge_do_update`): PK from a `pk_src`, null-seed + carried columns from a
+`carry_src`, a per-column `resolve` closure choosing eval-vs-carry. The extraction
+deleted the drift-prone untested insert.rs copy and folded `write_set_columns`'s prior
+O(cols²) per-column `assignments.iter().find` into the same O(1) `asn_by_col`
+pre-index the DO-UPDATE arm already used (`resolve_set_target`'s `seen` guard rules out
+duplicate column indices, so the lookup change is result-identical). A distinct-source
+unit test covers the PK-from-`pk_src` / carry-from-`carry_src` asymmetry that the four
+`write_set_columns` tests (now exercising `build_merged_row` transitively) miss.
+Validated by `make verify`, the gated `cargo test -p gnitz-sql --features integration`
+suite, and W=4 `make e2e`.
 
-Subsumes the per-row linear-scan perf drift into the extraction, so the lookup is
-fixed once.
-
-- **Files:** `dml/mutate.rs:92-117, 247-256`; `dml/insert.rs:313-363`.
-- **Problem:** `write_set_columns` (mutate.rs:99-115) and the `Some(existing_batch)`
-  arm of `client_side_merge_do_update` (insert.rs:341-358) duplicate the same
-  merged-row builder: push pk + weight 1, seed `null_bits` from a source row's null
-  word, then per payload column either (eval RHS → `null_word_set` on NULL +
-  `append_column_value`) or carry the source column via `push_row_from`, then push
-  `null_bits`. The null-on-NULL-assignment + carry-through semantics are covered by
-  four `write_set_columns` tests; the insert.rs copy is untested. They have already
-  drifted — mutate.rs does a per-column linear `assignments.iter().find` (O(cols²)),
-  insert.rs pre-indexes `asn_by_col` for O(1). Critically, the PK source and the
-  carry/null-seed source differ in DO UPDATE (PK from incoming `batch[i]`;
-  nulls+columns from `existing_batch[0]`), so they must be separate parameters.
-- **Change:** Extract a shared helper in mutate.rs taking the PK source separately
-  from the carry/null-seed source plus a fallible per-column resolver closure:
-
-  ```rust
-  pub(crate) fn build_merged_row<F>(
-      pk_src: &ZSetBatch, pk_idx: usize,        // PK pushed from here
-      carry_src: &ZSetBatch, carry_idx: usize,  // null seed + carried columns from here
-      schema: &Schema, dst: &mut ZSetBatch, mut resolve: F,
-  ) -> Result<(), GnitzSqlError>
-  where F: FnMut(usize) -> Result<Option<ColumnValue>, GnitzSqlError> {
-      dst.pks.push_from(&pk_src.pks, pk_idx);
-      dst.weights.push(1);
-      let mut null_bits = carry_src.nulls[carry_idx];
-      for (payload_idx, ci, col_def) in schema.payload_columns() {
-          match resolve(ci)? {
-              Some(cv) => {
-                  null_word_set(&mut null_bits, payload_idx, matches!(cv, ColumnValue::Null));
-                  append_column_value(&mut dst.columns[ci], cv, col_def.type_code)?;
-              }
-              None => {
-                  let stride = col_def.type_code.wire_stride();
-                  carry_src.columns[ci].push_row_from(carry_idx, stride, &mut dst.columns[ci]);
-              }
-          }
-      }
-      dst.nulls.push(null_bits);
-      Ok(())
-  }
-  ```
-
-  `write_set_columns` builds `asn_by_col: Vec<Option<&BoundExpr>>` once (sized to
-  `actual_schema.columns.len()`), then calls `build_merged_row(current, i, current,
-  i, schema, dst, |ci| asn_by_col[ci].map(|e| eval_set_expr(e, current, i, schema)).transpose())`
-  — closing the O(cols²) drift in the same edit. The DO UPDATE arm calls
-  `build_merged_row(batch, i, &existing_batch, 0, schema, &mut out, |ci|
-  asn_by_col[ci].map(|rhs| eval_do_update_rhs(rhs, &existing_batch, batch, i, schema)).transpose())`.
-  Export `build_merged_row` `pub(crate)`; insert.rs already imports from
-  `crate::dml::mutate`.
-- **Invariants:** Exact `payload_columns()` order; seed-then-flip-only-assigned null
-  semantics; the distinct PK/carry sources in DO UPDATE. Z-set element identity =
-  (PK, all payload) preserved. The four `write_set_columns` tests now exercise
-  `build_merged_row` transitively.
-- **Effort:** S. **Value:** Medium — removes a drift-prone untested copy and closes
-  the O(cols²) lookup in one change.
-- **Verify:** The four `write_set_columns` tests pass unchanged; add a DO-UPDATE
-  merge test asserting null-on-NULL-assignment and carry-through against
-  `existing_batch[0]` with PK from the incoming batch.
-
-### C-DML-2 — Extract the first-hit index-seek loop (SELECT ∥ UPDATE/DELETE)
-
-- **Files:** `dml/select.rs:92-108`; `dml/mutate.rs:171-179`; new helper in
-  `exec/residual.rs`.
-- **Problem:** `execute_select` and `resolve_where_rows` (mutate.rs:171-179) each
-  hand-write the same equality-index seek loop over `collect_index_seek_candidates`
-  output: per candidate try `client.seek_by_index`, `NoIndex ⇒ continue`, other
-  `Err ⇒ Exec`, first `Ok ⇒ terminal` (a hit with zero rows still terminates). Only
-  the success arm and the candidate-collection closure differ.
-- **Change:** Add a generic helper in `exec/residual.rs` (where `ScanReply` lives;
-  not dml/plan.rs, which is pure analysis with no client access):
-
-  ```rust
-  pub(crate) fn first_index_seek<T>(
-      client: &mut GnitzClient,
-      table_id: u64,
-      candidates: Vec<crate::dml::plan::IndexSeekCandidate<'_>>,
-      mut on_hit: impl FnMut(&mut GnitzClient, ScanReply, &[&Expr]) -> Result<T, GnitzSqlError>,
-  ) -> Result<Option<T>, GnitzSqlError> {
-      for (col_indices, key_vals, residual) in candidates {
-          match client.seek_by_index(table_id, col_indices.as_slice(), &key_vals) {
-              Ok(reply) => return Ok(Some(on_hit(client, reply, &residual)?)),
-              Err(ClientError::NoIndex) => continue,
-              Err(e) => return Err(GnitzSqlError::Exec(e)),
-          }
-      }
-      Ok(None)
-  }
-  ```
-
-  Pass `client` *into* `on_hit` so the closure doesn't conflict with the helper's
-  `&mut client`. `select.rs` calls it with `|_c, reply, residual|
-  residual_filtered(binder, &schema, reply, residual)`; `mutate.rs` with
-  `|_c, (s, b, _), residual| resolve_residual_rows(binder, schema, s, b, residual)`.
-  Each keeps its own candidate-collection step (select runs range candidates first).
-- **Invariants:** Terminal semantics — `Some` for any served index (row count
-  irrelevant), `None` only when every candidate returned `NoIndex`; select then
-  falls to its non-indexed error, mutate to the predicate full scan.
-- **Effort:** S. **Value:** Low — ~8 duplicated lines each, no correctness change.
-- **Verify:** Both files compile; `make test`. No new test — behaviour unchanged.
+**C-DML-2 was dropped** (extract a `first_index_seek` helper for the SELECT and
+UPDATE/DELETE equality-index seek loops). No clean home: `exec/residual.rs` would
+violate exec's documented "holds no edge back up into dml/plan" invariant (the helper
+needs `IndexSeekCandidate` from `dml/plan.rs`), and `dml/plan.rs` is deliberately
+client-agnostic (a `fetch_indexes` closure, `ClientError`-typed) so hosting a
+client-driving, `GnitzSqlError`-returning fn breaks its character. The change is
+line-neutral, and select.rs's third structurally-identical loop (the range loop over
+`seek_by_index_range`/`IndexRangeCandidate`) cannot share a `seek_by_index`-shaped
+helper anyway — so the single-definition goal is unreachable. The two ~9-line loops
+stay inline.
 
 ---
 
 ## Theme D — Type safety
 
-### D1 — Carry the join-key common type as `TypeCode`, not raw `u8`
+**D1 and D3 — DONE.** Two behaviour-neutral type-safety changes; circuits and wire bytes
+byte-identical. Validated by `make verify`, the gated
+`cargo test -p gnitz-sql --features integration` planner suite, and the W=4 `make e2e`
+join/set-op/distinct subset (210 passed).
 
-- **Files:** `plan/view/predicates.rs:109-135, 227-240`; `plan/view/join.rs:30-39, 353`.
-- **Problem:** The join-key common type T is carried as a bare `u8` even though it is
-  a real `TypeCode`: `validate_join_key_pair` / `validate_range_join_key_pair` return
-  `Result<u8>` (holding a `TypeCode`, doing `t as u8`), `RangeConjunct.tc` is `u8`,
-  and the eq-tcs slot of `JoinPredicates` is `Vec<u8>`. The single consumer
-  (join.rs:353) immediately reverses it with `TypeCode::from_validated_u8(t)`. Since
-  `TypeCode` is `Copy`, this is a pointless round-trip discarding the enum's safety.
-- **Change (entirely within gnitz-sql):** (1) The two `validate_*_join_key_pair`
-  return `Result<TypeCode, _>` — drop the trailing `.map(|t| t as u8)`
-  (`join_key_common_type` already returns `Option<TypeCode>`). (2) `RangeConjunct.tc:
-  TypeCode`. (3) The eq-tcs slot of `JoinPredicates` → `Vec<TypeCode>` (and the
-  `target_tcs`/`eq_tcs` locals). (4) At join.rs:353 use `t` directly instead of
-  `TypeCode::from_validated_u8(t)`.
-- **Invariants:** Do not touch the `0`="self-derive" sentinel, `carried_reindex_tc`,
-  `resolve_reindex_type`, or `map_reindex(&[u8])`. That `0` sentinel is the
-  gnitz-wire contract (collision-free: no `TypeCode` is 0) and keeps
-  same-type/U128-vs-UUID/string circuits byte-identical at the wire boundary
-  (join.rs:22-29). The `as u8` cast stays only at that `map_reindex`/`ExprBuilder`
-  boundary.
-- **Effort:** S. **Value:** Low — recovers `Copy`-enum safety on the one value that
-  round-trips internally.
-- **Verify:** Tests asserting `tcs == vec![TypeCode::X as u8]` become
-  `vec![TypeCode::X]`; `make verify`.
+- **D1** — the join-key common type now threads as `TypeCode` end-to-end:
+  `validate_join_key_pair` / `validate_range_join_key_pair` return `Result<TypeCode>`,
+  `RangeConjunct.tc` and the `JoinPredicates` eq-tcs slot are `TypeCode` /
+  `Vec<TypeCode>`, and `side_target_tcs` / `build_range_join_view` take `&[TypeCode]` —
+  deleting the internal `TypeCode → u8 → TypeCode` round-trip at all five
+  `from_validated_u8` consumer sites. The `as u8` cast survives only inside
+  `carried_reindex_tc` / `resolve_reindex_type` / `map_reindex(&[u8])`, and the `0`
+  self-derive sentinel is untouched, so the wire/circuit serialization is unchanged.
+- **D3** — `ColumnDef::new(name, type_code, is_nullable)` added to `gnitz_core::ColumnDef`;
+  all 22 zero-FK `ColumnDef` literals in gnitz-sql (16 production + 6 test) now go through
+  it, deleting the dead `fk_table_id: 0, fk_col_idx: 0` boilerplate. Synthetic names
+  (`_join_pk`, `_set_pk`, `_distinct_pk`, `_group_pk`, `_agg`, `_jp`, `m`,
+  `_pair_pk_{slot}`) are preserved verbatim. The engine's separate catalog `ColumnDef`
+  and gnitz-core's own ~150 zero-FK literals were out of scope and left untouched.
+
+> **D2's anchors below predate D1/D3** and have drifted; re-anchor by symbol name.
 
 ### D2 — Newtype the three join-column coordinate spaces
 
@@ -272,38 +189,6 @@ fixed once.
   unrepresentable; the audit's clearest illegal-states-unrepresentable win.
 - **Verify:** `make verify` (it must compile through every conversion); the join
   cluster's existing tests pass unchanged.
-
-### D3 — Add `ColumnDef::new` and drop the `fk_table_id: 0, fk_col_idx: 0` boilerplate
-
-- **Files:** gnitz-core `ColumnDef` (add a method); ~20 gnitz-sql synthetic-column
-  sites — `grep -rn 'fk_table_id: 0' crates/gnitz-sql/src` (join.rs, group_by.rs,
-  set_op.rs, predicates.rs, project_schema.rs, ddl.rs:210-216).
-- **Problem:** `gnitz_core::ColumnDef` is a bare 5-field struct with no constructor;
-  every gnitz-sql synthetic-column construction spells out `fk_table_id: 0,
-  fk_col_idx: 0` as dead boilerplate (the FK fields are only meaningful in the engine
-  catalog path). A future field addition forces edits at every site.
-- **Change:** Add an additive constructor in gnitz-core (no existing `impl
-  ColumnDef`):
-
-  ```rust
-  impl ColumnDef {
-      pub fn new(name: impl Into<String>, type_code: TypeCode, is_nullable: bool) -> Self {
-          Self { name: name.into(), type_code, is_nullable, fk_table_id: 0, fk_col_idx: 0 }
-      }
-  }
-  ```
-
-  Replace the synthetic struct literals with `ColumnDef::new(...)`, preserving the
-  exact name strings (`"_set_pk"`, `"_distinct_pk"`, `"_group_pk"`, `"m"`, etc.).
-- **Invariants:** Synthetic column names are byte-stability-load-bearing for the
-  shippable view (join.rs:349-357 comment); `new` takes the name verbatim. Leave the
-  FK-bearing engine-side literals (`registry.rs`, catalog tests using `parent_tid`)
-  as explicit struct literals — they set non-default FK fields. Do not add a
-  `synthetic_u128_pk` wrapper — it would hide the exact name at the call site.
-- **Effort:** S. **Value:** Low — removes ~20 lines of dead boilerplate;
-  future-field-proof.
-- **Verify:** `make verify`; view-shippability (synthetic-name byte-stability) tests
-  unchanged.
 
 ---
 
@@ -365,40 +250,13 @@ fixed once.
 - **Effort:** S. **Value:** Low — removes a misdirecting comment.
 - **Verify:** Read-through against eval.rs:240-265; no behavioural change.
 
-### F2 — Fix the ConflictPlan doc (no target / no future-work framing)
+### F2 — Fix the ConflictPlan doc — DONE
 
-- **Files:** `dml/insert.rs:23-37`
-- **Problem:** The `enum ConflictPlan` doc (insert.rs:23-26) calls it a "Resolved ON
-  CONFLICT target" holding the PK column or a "reserved slot for future ON CONSTRAINT
-  / unique secondary targets (not implemented in v1)". The enum holds none of that —
-  three target-free disposition variants (`Error`, `DoNothingPk`,
-  `DoUpdatePk { assignments }`); the conflict target is validated and discarded in
-  `validate_conflict_target` (called line 115) before the plan is built from `action`
-  alone. The "reserved-slot / v1" framing is also forbidden future-work.
-- **Change:** Replace with a doc describing the three resolved dispositions, no
-  target/future framing:
-
-  ```rust
-  /// The resolved INSERT disposition after the ON CONFLICT clause (if any) is
-  /// bound. The conflict target itself is validated and discarded in
-  /// `validate_conflict_target`; only the action survives into the plan.
-  enum ConflictPlan {
-      /// Default INSERT: push with WireConflictMode::Error.
-      Error,
-      /// `ON CONFLICT [(pk)] DO NOTHING`: pre-filter existing PKs client-side via
-      /// `seek`, then push survivors with WireConflictMode::Error.
-      DoNothingPk,
-      /// `ON CONFLICT (pk) DO UPDATE SET ...`: seek existing rows, merge the
-      /// assignments client-side, then push merged with WireConflictMode::Update.
-      DoUpdatePk { assignments: Vec<(usize, BoundUpdateExpr)> },
-  }
-  ```
-
-- **Invariants:** None. The line-122 "in v1" *user-facing error string* is out of
-  scope.
-- **Effort:** S. **Value:** Low — removes a wrong type description and a forbidden
-  future-work note.
-- **Verify:** Read-through; no behavioural change.
+Shipped. The `enum ConflictPlan` header doc (`dml/insert.rs`) no longer claims a
+"resolved target / reserved slot for future ON CONSTRAINT … not implemented in v1"
+(the enum holds three target-free dispositions; the target is validated and discarded
+in `validate_conflict_target`). The forbidden future-work framing is gone. The three
+variant docs were already accurate and were left as-is. Comment-only.
 
 ### F3 — Route INSERT integer encoding through `parse_pk_literal_packed`
 
@@ -452,72 +310,28 @@ fixed once.
 
 ---
 
-## Theme G — Minor performance
+## Theme G — DONE
 
-### G1 — All-pass short-circuit in `apply_residual_filter`
-
-- **Files:** `exec/residual.rs:56-77` (and `exec/batch.rs:8-16` `copy_batch_row`).
-- **Problem:** `apply_residual_filter` copies each passing row via `copy_batch_row`,
-  which for Strings/Bytes does `push(s[idx].clone())`. When the predicate passes
-  every row (a broad-but-selective residual over a string/blob-heavy result), this
-  clones every value — whereas the sibling `apply_projection` (batch.rs:200-214)
-  deliberately bulk-moves whole column vectors to avoid exactly this.
-- **Change:** Collect passing indices first; if every row passed, return the original
-  batch unmoved (mirrors the empty-residual early return):
-
-  ```rust
-  let n = batch.pks.len();
-  let mut matched: Vec<usize> = Vec::with_capacity(n);
-  for i in 0..n {
-      if row_passes_residuals(preds, &batch, i, actual_schema)? { matched.push(i); }
-  }
-  if matched.len() == n {
-      return Ok((schema_opt, Some(batch)));   // all rows pass — no per-row copy
-  }
-  let mut new_batch = ZSetBatch::new(actual_schema);
-  for &i in &matched {
-      copy_batch_row(&batch, i, &mut new_batch, actual_schema);
-  }
-  Ok((schema_opt, Some(new_batch)))
-  ```
-
-  The selective path is unchanged except for materialising `matched` first (a cheap
-  `usize` vec); the all-pass path skips the full row-by-row clone.
-- **Invariants:** Returning the original `batch` when all rows pass is identical to a
-  full copy (same rows, order, weights, schema). Keep the allocation-avoidance
-  rationale shared with `apply_projection`.
-- **Effort:** S. **Value:** Low — avoids a full string/blob clone on broad residual
-  scans.
-- **Verify:** `make test` (SELECT residual tests); results unchanged.
-
-### G2 — Reserve `matched` capacity in `resolve_residual_rows`
-
-- **Files:** `dml/mutate.rs:201-208`
-- **Problem:** `matched` is `Vec::new()` then pushed one index at a time in a loop
-  bounded by `batch.pks.len()` — a known tight upper bound.
-- **Change:** `let mut matched =
-  Vec::with_capacity(batch_opt.as_ref().map_or(0, |b| b.pks.len()));` (over-reserve is
-  bounded by the fetched input and harmless).
-- **Invariants:** Capacity hint only; no behavioural change.
-- **Effort:** S. **Value:** Low — saves a few reallocations on WHERE-result
-  reshaping. (Do not also reserve `new_batch`'s regions in `exec/residual.rs`:
-  neither `PkColumn` nor `ColData` exposes a `reserve`, so it would require new
-  cross-crate API for an already-amortised one-shot path.)
-- **Verify:** `make test`; no test change.
+Shipped, both behaviour-neutral. **G1** — `apply_residual_filter` (`exec/residual.rs`)
+collects passing indices first and returns the fetched batch unmoved when every row
+passes, skipping the full per-row `copy_batch_row` clone on a broad residual (verified
+byte-identical: `copy_batch_row` copies weight/null/payload verbatim, no
+ghost-drop/consolidate/re-encode). **G2** — `resolve_residual_rows` (`dml/mutate.rs`)
+reserves `matched` to `batch.pks.len()`.
 
 ---
 
 ## Sequencing
 
-- **C1–C4** (correctness) and **B2–B4** (view/binder DRY) — DONE; **B1 dropped**.
-- **D1** (TypeCode) and **D3** (`ColumnDef::new`) both touch join.rs:349-357 — land D1
-  first so the column construction uses the typed `t` before D3 wraps it in
-  `ColumnDef::new`.
-- **D2** (coordinate newtypes) is the largest item; land it after D1 so the join-key
-  type plumbing is already simplified.
+- **C1–C4** and **B2–B4** — DONE; **B1 dropped**. **C-DML-1**, **F2**, **G1–G2**,
+  **D1**, **D3** — DONE; **C-DML-2 dropped**.
+- **D2** (coordinate newtypes) is now next — the largest remaining item. Its anchors in
+  the Theme D section predate the D1/D3 landings and have drifted; re-anchor by symbol
+  name. The join-key type plumbing it builds on is already simplified.
+- **E1**, **F1**, **F3** are independent and can land in any order.
 - **F4** (drop `&self` on `bind_expr`) must update every `binder.bind_expr` call site
   in the same edit — the inline WHERE filters in the view builders (`set_op`,
-  `group_by`, `simple`) and **C-DML-1**'s usage.
+  `group_by`, `simple`).
 
 ---
 
