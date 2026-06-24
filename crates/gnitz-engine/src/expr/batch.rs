@@ -742,6 +742,29 @@ pub(in crate::expr) fn eval_batch(
                     if !prog.is_bit_only(dst) {
                         unpack_bool_to_regs(scratch, dst, m);
                     }
+                    // Dead-tail skip: this AND is a chain trigger and the whole
+                    // morsel is definite-FALSE, so the AND-chain filter is FALSE —
+                    // write the terminal (`result_reg`) all-FALSE and stop. The mask
+                    // is keyed by register, so `dst < num_regs ≤ 64` keeps the shift
+                    // in range; `!= 0` fast-skips no-chain filters. Nullable arm only:
+                    // it already keeps packed bits, so the all-FALSE test is a cheap
+                    // word-OR (the `no_nulls` arm has none to reduce over).
+                    if prog.chain_trigger_mask != 0 && (prog.chain_trigger_mask >> dst) & 1 != 0 {
+                        let base = dst * NULL_WORDS_PER_REG;
+                        let words = m.div_ceil(64);
+                        let mut alive = 0u64;
+                        for w in 0..words {
+                            alive |= scratch.bool_bits[base + w] | scratch.null_bits[base + w];
+                        }
+                        if alive == 0 {
+                            let tb = prog.result_reg as usize * NULL_WORDS_PER_REG;
+                            for w in 0..words {
+                                scratch.bool_bits[tb + w] = 0;
+                                scratch.null_bits[tb + w] = 0;
+                            }
+                            break;
+                        }
+                    }
                 }
             }
             Instr::BoolOr { dst, a, b } => {

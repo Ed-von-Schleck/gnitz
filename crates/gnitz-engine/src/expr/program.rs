@@ -740,8 +740,10 @@ impl LogicalProgram {
             payload_col_info,
             bit_only_mask: 0,
             bool_input_mask: 0,
+            chain_trigger_mask: 0,
         };
         prog.classify(is_filter);
+        prog.compute_and_chain(is_filter);
         prog
     }
 }
@@ -792,6 +794,48 @@ pub struct ResolvedProgram {
     /// Bit `r` set iff register `r` is read by a boolean consumer; the producer
     /// must populate `bool_bits[r]`.
     pub(in crate::expr) bool_input_mask: u64,
+    /// Destination registers of the non-terminal ANDs in the one result-terminal
+    /// AND chain: bit `r` set means "if the AND writing register `r` is all
+    /// definite-FALSE for the morsel, the filter result is too — write the terminal
+    /// (`result_reg`) all-FALSE and stop". 0 for non-filter programs and programs
+    /// with no such chain. Every register is `< num_regs ≤ 64` (asserted in
+    /// `LogicalProgram::new`), so a u64 indexed by register suffices.
+    pub(in crate::expr) chain_trigger_mask: u64,
+}
+
+/// Invoke `f` once per register this instruction reads.
+fn each_reg_read(i: &Instr, mut f: impl FnMut(u16)) {
+    use Instr::*;
+    match *i {
+        IntAdd { a, b, .. }
+        | IntSub { a, b, .. }
+        | IntMul { a, b, .. }
+        | IntDiv { a, b, .. }
+        | IntMod { a, b, .. }
+        | FloatAdd { a, b, .. }
+        | FloatSub { a, b, .. }
+        | FloatMul { a, b, .. }
+        | FloatDiv { a, b, .. }
+        | Cmp { a, b, .. }
+        | FCmp { a, b, .. }
+        | BoolAnd { a, b, .. }
+        | BoolOr { a, b, .. } => {
+            f(a);
+            f(b);
+        }
+        IntNeg { a, .. } | FloatNeg { a, .. } | IntToFloat { a, .. } | BoolNot { a, .. } => f(a),
+        Emit { src, .. } => f(src),
+        LoadPayloadInt { .. }
+        | LoadPayloadFloat { .. }
+        | LoadPk { .. }
+        | LoadConst { .. }
+        | IsNull { .. }
+        | IsNotNull { .. }
+        | StrColConst { .. }
+        | StrColCol { .. }
+        | CopyCol { .. }
+        | EmitNull { .. } => {}
+    }
 }
 
 impl ResolvedProgram {
@@ -813,6 +857,69 @@ impl ResolvedProgram {
         let (bit_only, bool_input) = self.classify_registers(is_filter);
         self.bit_only_mask = bit_only;
         self.bool_input_mask = bool_input;
+    }
+
+    /// Detect the one result-terminal AND chain and record, in `chain_trigger_mask`,
+    /// the destination registers of its non-terminal ANDs. At runtime, when such an
+    /// AND is all definite-FALSE for a morsel, `eval_batch` writes the terminal
+    /// (`result_reg`) all-FALSE and breaks (see the `BoolAnd` nullable arm). Only
+    /// the accumulator spine is walked, so an inner AND reached through a
+    /// `BoolNot`/`BoolOr` operand is never marked — forcing FALSE under those would
+    /// be a miscompile.
+    pub(in crate::expr) fn compute_and_chain(&mut self, is_filter: bool) {
+        self.chain_trigger_mask = 0;
+        let n = self.instrs.len();
+        // Filter-only; need ≥ 3 instrs for a ≥ 2-AND chain. A filter has one
+        // register per instruction, so n == num_regs ≤ 64 (asserted), keeping
+        // `pc as u8` and the register-indexed scratch arrays in range.
+        if !is_filter || self.num_regs == 0 || !(3..=64).contains(&n) {
+            return;
+        }
+        // Terminal = last instruction = expression root; must be an AND on result_reg.
+        let Instr::BoolAnd {
+            dst: term_dst,
+            a: term_a,
+            b: term_b,
+        } = self.instrs[n - 1]
+        else {
+            return;
+        };
+        if term_dst as u32 != self.result_reg {
+            return;
+        }
+        // Single-assignment (alloc_reg never reuses): each register has one writer.
+        // Track only AND writers — a spine link must be an AND, so a non-MAX slot
+        // already means "written by an AND".
+        let mut and_writer = [u8::MAX; 64];
+        let mut use_count = [0u8; 64];
+        for (pc, ins) in self.instrs.iter().enumerate() {
+            if let Instr::BoolAnd { dst, .. } = *ins {
+                and_writer[dst as usize] = pc as u8;
+            }
+            each_reg_read(ins, |r| use_count[r as usize] = use_count[r as usize].saturating_add(1));
+        }
+        // A spine link is an AND-written register used exactly once (clean chain).
+        let is_link = |r: u16| and_writer[r as usize] != u8::MAX && use_count[r as usize] == 1;
+        // Walk the accumulator spine; mark every non-terminal chain AND by its dst.
+        let mut mask = 0u64;
+        let (mut a, mut b) = (term_a, term_b);
+        loop {
+            let acc = if is_link(a) {
+                a
+            } else if is_link(b) {
+                b
+            } else {
+                break;
+            };
+            mask |= 1u64 << acc;
+            let w = and_writer[acc as usize] as usize;
+            let Instr::BoolAnd { a: na, b: nb, .. } = self.instrs[w] else {
+                break;
+            };
+            a = na;
+            b = nb;
+        }
+        self.chain_trigger_mask = mask;
     }
 
     /// Classify each register's role on the nullable-arm hot path. Returns

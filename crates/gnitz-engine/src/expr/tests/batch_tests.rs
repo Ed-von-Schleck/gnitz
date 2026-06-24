@@ -4,10 +4,10 @@
 #![allow(clippy::erasing_op, clippy::identity_op)]
 
 use super::super::batch::{eval_batch, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
-use super::super::program::{LogicalInstr, LogicalProgram};
+use super::super::program::{LogicalInstr, LogicalProgram, ResolvedProgram};
 use super::eval_predicate_via_batch as eval_predicate;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::Batch;
+use crate::storage::{Batch, MemBatch};
 
 fn make_schema_2col() -> SchemaDescriptor {
     SchemaDescriptor::new(
@@ -506,12 +506,12 @@ fn schema_pk_three_ints_nullable() -> SchemaDescriptor {
     )
 }
 
-/// Build a batch with `n` rows. For each row, the value of each of the three
-/// I64 payload columns is `f(row, col_idx)`. The null bit for each column is
-/// set when `null_pred(row, col_idx)` returns true.
-fn build_three_col_batch(
+/// Build an `n`-row batch with `ncols` I64 payload columns. Column `col` of `row`
+/// holds `f(row, col)`; its null bit is set when `null_pred(row, col)` is true.
+fn build_n_col_batch(
     schema: &SchemaDescriptor,
     n: usize,
+    ncols: usize,
     f: impl Fn(usize, usize) -> i64,
     null_pred: impl Fn(usize, usize) -> bool,
 ) -> Batch {
@@ -520,13 +520,13 @@ fn build_three_col_batch(
         b.extend_pk((row + 1) as u128);
         b.extend_weight(&1i64.to_le_bytes());
         let mut null_word: u64 = 0;
-        for col in 0..3 {
+        for col in 0..ncols {
             if null_pred(row, col) {
                 null_word |= 1u64 << col;
             }
         }
         b.extend_null_bmp(&null_word.to_le_bytes());
-        for col in 0..3 {
+        for col in 0..ncols {
             b.extend_col(col, &f(row, col).to_le_bytes());
         }
         b.count += 1;
@@ -583,9 +583,10 @@ fn bit_only_three_and_chain_boundary_sweep() {
     // Test sizes that cover: m < 64, m = 64 exactly, m crossing 64, the full
     // MORSEL=256, and the multi-morsel case (MORSEL + 1).
     for &n in &[1, 7, 63, 64, 65, 127, 128, 255, 256, 257, 300] {
-        let batch = build_three_col_batch(
+        let batch = build_n_col_batch(
             &schema,
             n,
+            3,
             // value cycles 0..4 to mix matching/non-matching rows
             |row, col| ((row + col) as i64) % 4,
             // null every 5th row in col0, every 7th in col1, every 11th in col2
@@ -897,5 +898,423 @@ fn bit_only_is_not_null_tail_mask() {
             got, expected,
             "row {row}: nn1={nn1} nn2={nn2} expected={expected} got={got}",
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AND-chain dead-tail short-circuit (the runtime skip in eval_batch)
+// ---------------------------------------------------------------------------
+
+fn schema_pk_three_ints_non_nullable() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+/// The 3-clause chain `col0 > 255 AND col1 > 1 AND col2 > 1`, leading column
+/// clustered (`col0 = row`, never null). Morsel 0 (rows 0..255) is entirely
+/// definite-FALSE on the leading clause, so the dead-tail skip fires; later
+/// morsels carry survivors, so it must not. Across the boundary sweep,
+/// run_filter must match a per-row 3VL reference at every n — covering the
+/// firing path, the survivor path, and partial-morsel tail handling.
+#[test]
+fn and_chain_skip_fires_boundary_sweep() {
+    use crate::expr::{CmpOp, ScalarFunc};
+
+    let schema = schema_pk_three_ints_nullable();
+
+    // col0 > 255 AND col1 > 1 AND col2 > 1  (const regs: 255 and 1)
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },  // r0 = col0
+        LogicalInstr::LoadConst { dst: 1, val: 255 }, // r1 = 255
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = col0 > 255
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },  // r3 = col1
+        LogicalInstr::LoadConst { dst: 4, val: 1 },   // r4 = 1
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 5,
+            a: 3,
+            b: 4,
+        }, // r5 = col1 > 1
+        LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 }, // r6 = r2 AND r5  (trigger)
+        LogicalInstr::LoadColInt { dst: 7, col: 3 },  // r7 = col2
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 8,
+            a: 7,
+            b: 4,
+        }, // r8 = col2 > 1
+        LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 }, // r9 = r6 AND r8  (result_reg)
+    ];
+
+    for &n in &[1, 7, 63, 64, 65, 127, 128, 255, 256, 257, 300] {
+        let batch = build_n_col_batch(
+            &schema,
+            n,
+            3,
+            // col0 = row (clustered); col1, col2 cycle 0..4
+            |row, col| match col {
+                0 => row as i64,
+                1 => ((row + 1) as i64) % 4,
+                _ => ((row + 2) as i64) % 4,
+            },
+            // col0 never null (leading clause is definite-FALSE, not NULL);
+            // null col1 every 7th row, col2 every 11th
+            |row, col| match col {
+                0 => false,
+                1 => row % 7 == 0,
+                _ => row % 11 == 0,
+            },
+        );
+        let mb = batch.as_mem_batch();
+
+        let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs.clone(), 10, 9, vec![]), &schema);
+
+        let mut passed = vec![false; n];
+        kind.run_filter(&mb, n, |s, e| {
+            passed[s..e].fill(true);
+        });
+
+        for (row, &got) in passed.iter().enumerate() {
+            let v0 = row as i64;
+            let v1 = ((row + 1) as i64) % 4;
+            let v2 = ((row + 2) as i64) % 4;
+            let n1 = row % 7 == 0;
+            let n2 = row % 11 == 0;
+            let b0 = Some(v0 > 255); // col0 never null
+            let b1 = if n1 { None } else { Some(v1 > 1) };
+            let b2 = if n2 { None } else { Some(v2 > 1) };
+            let (v01, n01) = ref_and(b0, b1);
+            let combined = if n01 { None } else { Some(v01) };
+            let (v_all, n_all) = ref_and(combined, b2);
+            let expected = !n_all && v_all;
+            assert_eq!(
+                got, expected,
+                "n={n} row={row} v0={v0} v1={v1}(null={n1}) v2={v2}(null={n2}) got={got} expected={expected}",
+            );
+        }
+    }
+}
+
+/// NULL-flooded morsel must not misfire. `col0 = -1 AND col1 > 0 AND col2 > 0`
+/// with col0 NULL on 3 of every 4 rows: the leading clause (hence the trigger
+/// AND) is NULL — not definite-FALSE — on those rows, so `alive != 0` and the
+/// skip must not fire. The 1-in-4 survivor rows (col0 = -1) must still pass; a
+/// misfire would zero the terminal and wrongly drop them. (An all-NULL morsel
+/// could not catch a misfire: NULL and FALSE both mean "excluded", so the
+/// output would be identical either way — the survivors are what make it sharp.)
+#[test]
+fn and_chain_null_flood_does_not_misfire() {
+    use crate::expr::{CmpOp, ScalarFunc};
+
+    let schema = schema_pk_three_ints_nullable();
+
+    // col0 = -1 AND col1 > 0 AND col2 > 0  (const regs: -1 and 0)
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: -1 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Eq,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::LoadConst { dst: 4, val: 0 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 5,
+            a: 3,
+            b: 4,
+        },
+        LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 }, // trigger
+        LogicalInstr::LoadColInt { dst: 7, col: 3 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 8,
+            a: 7,
+            b: 4,
+        },
+        LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 }, // result_reg
+    ];
+
+    for &n in &[64, 256, 257] {
+        let batch = build_n_col_batch(
+            &schema,
+            n,
+            3,
+            // col0 = -1 (meaningful only on survivor rows); col1 = col2 = 5
+            |_row, col| if col == 0 { -1 } else { 5 },
+            // col0 NULL on 3 of every 4 rows; col1/col2 never null
+            |row, col| col == 0 && row % 4 != 0,
+        );
+        let mb = batch.as_mem_batch();
+
+        let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs.clone(), 10, 9, vec![]), &schema);
+
+        let mut passed = vec![false; n];
+        kind.run_filter(&mb, n, |s, e| {
+            passed[s..e].fill(true);
+        });
+
+        for (row, &got) in passed.iter().enumerate() {
+            // survivor rows (row % 4 == 0): col0 = -1 → all clauses TRUE → pass.
+            // other rows: col0 NULL → chain NULL → fail.
+            let expected = row % 4 == 0;
+            assert_eq!(got, expected, "n={n} row={row} got={got} expected={expected}");
+        }
+    }
+}
+
+/// Non-nullable AND chain: the same predicate over NOT NULL columns selects the
+/// `no_nulls` arm, where `bool_bits`/`null_bits` are never allocated. The skip
+/// lives only on the nullable arm, so it must never run here — were it to, the
+/// `alive` reduce would index the empty `bool_bits` and panic. Results must
+/// still be correct.
+#[test]
+fn and_chain_non_nullable_skips_runtime_check() {
+    use crate::expr::{CmpOp, ScalarFunc};
+
+    let schema = schema_pk_three_ints_non_nullable();
+
+    // col0 = -1 AND col1 > 0 AND col2 > 0
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: -1 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Eq,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::LoadConst { dst: 4, val: 0 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 5,
+            a: 3,
+            b: 4,
+        },
+        LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 },
+        LogicalInstr::LoadColInt { dst: 7, col: 3 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 8,
+            a: 7,
+            b: 4,
+        },
+        LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 },
+    ];
+
+    for &n in &[64, 256, 257] {
+        let batch = build_n_col_batch(
+            &schema,
+            n,
+            3,
+            // survivor rows (row % 4 == 0): col0 = -1; others col0 = 0 (!= -1)
+            |row, col| {
+                if col != 0 {
+                    5
+                } else if row % 4 == 0 {
+                    -1
+                } else {
+                    0
+                }
+            },
+            // non-nullable: no nulls anywhere
+            |_row, _col| false,
+        );
+        let mb = batch.as_mem_batch();
+
+        let kind = ScalarFunc::from_predicate(LogicalProgram::new(instrs.clone(), 10, 9, vec![]), &schema);
+
+        let mut passed = vec![false; n];
+        kind.run_filter(&mb, n, |s, e| {
+            passed[s..e].fill(true);
+        });
+
+        for (row, &got) in passed.iter().enumerate() {
+            let expected = row % 4 == 0; // col0 == -1
+            assert_eq!(got, expected, "n={n} row={row} got={got} expected={expected}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A/B microbench for the AND-chain dead-tail skip (regression artifact).
+// ---------------------------------------------------------------------------
+
+/// Drive `eval_batch` over every morsel of `mb`, XOR-folding the terminal filter
+/// word into a checksum (anti-elision + an ON/OFF equivalence guard). The skip
+/// lives entirely in `eval_batch`; `run_filter`'s bit extraction is a fixed
+/// per-morsel cost, so isolating `eval_batch` measures the mechanism directly.
+fn run_chain_eval(prog: &ResolvedProgram, mb: &MemBatch, n: usize, scratch: &mut EvalScratch) -> u64 {
+    let base = prog.result_reg as usize * NULL_WORDS_PER_REG;
+    let mut checksum = 0u64;
+    for morsel_start in (0..n).step_by(MORSEL) {
+        let m = MORSEL.min(n - morsel_start);
+        eval_batch(prog, mb, morsel_start, m, scratch);
+        for w in 0..m.div_ceil(64) {
+            checksum ^= scratch.bool_bits[base + w] & !scratch.null_bits[base + w];
+        }
+    }
+    checksum
+}
+
+/// Time `run_chain_eval` with the skip ON (computed mask) vs OFF (mask zeroed)
+/// over `min` of `ITERS` order-alternated iterations; assert ON and OFF agree.
+fn bench_chain(label: &str, prog_on: &ResolvedProgram, prog_off: &ResolvedProgram, mb: &MemBatch, n: usize) {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let mut scratch = EvalScratch::new();
+    scratch.ensure_capacity(prog_on.num_regs as usize, false, MORSEL);
+
+    // Warm up and confirm the skip does not change the result.
+    let c_on = run_chain_eval(prog_on, mb, n, &mut scratch);
+    let c_off = run_chain_eval(prog_off, mb, n, &mut scratch);
+    assert_eq!(c_on, c_off, "{label}: skip ON/OFF produced different filter results");
+
+    const ITERS: usize = 60;
+    let (mut min_on, mut min_off) = (u128::MAX, u128::MAX);
+    for i in 0..ITERS {
+        // Alternate which variant is timed first to cancel ordering drift.
+        if i % 2 == 0 {
+            let s = Instant::now();
+            black_box(run_chain_eval(prog_on, mb, n, &mut scratch));
+            min_on = min_on.min(s.elapsed().as_nanos());
+            let s = Instant::now();
+            black_box(run_chain_eval(prog_off, mb, n, &mut scratch));
+            min_off = min_off.min(s.elapsed().as_nanos());
+        } else {
+            let s = Instant::now();
+            black_box(run_chain_eval(prog_off, mb, n, &mut scratch));
+            min_off = min_off.min(s.elapsed().as_nanos());
+            let s = Instant::now();
+            black_box(run_chain_eval(prog_on, mb, n, &mut scratch));
+            min_on = min_on.min(s.elapsed().as_nanos());
+        }
+    }
+    let (ms_on, ms_off) = (min_on as f64 / 1e6, min_off as f64 / 1e6);
+    let delta = (min_off as f64 - min_on as f64) / min_off as f64 * 100.0;
+    println!(
+        "{label}: skip ON {ms_on:.2} ms  OFF {ms_off:.2} ms  ({n} rows)  -> {:.1}% {}",
+        delta.abs(),
+        if delta >= 0.0 {
+            "faster with skip"
+        } else {
+            "slower with skip"
+        },
+    );
+}
+
+/// A/B microbench: 1M-row batch, 5-clause nullable chain
+/// `a > t AND b > 0 AND c > 0 AND d > 0 AND e > 0`, skip toggled via the trigger
+/// mask in one binary. Run with:
+///   cargo test -p gnitz-engine --release and_chain_skip_bench \
+///       -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn and_chain_skip_bench() {
+    use crate::expr::CmpOp;
+
+    // PK + 5 nullable I64 columns.
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+
+    // a > THRESHOLD AND b > 0 AND c > 0 AND d > 0 AND e > 0  (16 regs, result r15).
+    let build_instrs = |threshold: i64| {
+        vec![
+            LogicalInstr::LoadColInt { dst: 0, col: 1 }, // a
+            LogicalInstr::LoadConst { dst: 1, val: threshold },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+            LogicalInstr::LoadColInt { dst: 3, col: 2 }, // b
+            LogicalInstr::LoadConst { dst: 4, val: 0 },
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 5,
+                a: 3,
+                b: 4,
+            },
+            LogicalInstr::BoolAnd { dst: 6, a: 2, b: 5 }, // trigger
+            LogicalInstr::LoadColInt { dst: 7, col: 3 },  // c
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 8,
+                a: 7,
+                b: 4,
+            },
+            LogicalInstr::BoolAnd { dst: 9, a: 6, b: 8 }, // trigger
+            LogicalInstr::LoadColInt { dst: 10, col: 4 }, // d
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 11,
+                a: 10,
+                b: 4,
+            },
+            LogicalInstr::BoolAnd { dst: 12, a: 9, b: 11 }, // trigger
+            LogicalInstr::LoadColInt { dst: 13, col: 5 },   // e
+            LogicalInstr::Cmp {
+                op: CmpOp::Gt,
+                dst: 14,
+                a: 13,
+                b: 4,
+            },
+            LogicalInstr::BoolAnd { dst: 15, a: 12, b: 14 }, // result
+        ]
+    };
+
+    const N: usize = 1_000_000;
+
+    // Favorable: a = row (clustered), threshold at ~70% so the first ~70% of
+    // morsels are entirely a <= t (definite-FALSE); the rest pass all 5 clauses
+    // (b..e = 10 > 0). No nulls in a/b so the skip fires cleanly.
+    let favorable = build_n_col_batch(
+        &schema,
+        N,
+        5,
+        |row, col| if col == 0 { row as i64 } else { 10 },
+        |_, _| false,
+    );
+    // Neutral: a = 10 with threshold -1 (always true), so every morsel keeps a
+    // survivor and the skip never fires — measures the alive-reduce overhead.
+    let neutral = build_n_col_batch(&schema, N, 5, |_, _| 10, |_, _| false);
+
+    let mut variants: Vec<(&str, &Batch, i64)> = vec![
+        ("favorable", &favorable, (N as i64 * 7) / 10),
+        ("neutral", &neutral, -1),
+    ];
+    for (label, batch, threshold) in variants.drain(..) {
+        let prog_on = LogicalProgram::new(build_instrs(threshold), 16, 15, vec![]).resolve(&schema, true);
+        let mut prog_off = LogicalProgram::new(build_instrs(threshold), 16, 15, vec![]).resolve(&schema, true);
+        assert_ne!(prog_on.chain_trigger_mask, 0, "bench prog should have a detected chain");
+        prog_off.chain_trigger_mask = 0;
+        let mb = batch.as_mem_batch();
+        bench_chain(label, &prog_on, &prog_off, &mb, N);
     }
 }

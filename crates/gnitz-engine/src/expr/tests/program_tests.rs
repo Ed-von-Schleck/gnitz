@@ -1276,3 +1276,189 @@ fn test_string_prefix_le_ordering() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// AND-chain short-circuit detection (`compute_and_chain`)
+// ---------------------------------------------------------------------------
+
+/// Resolve `instrs` as a FILTER program (is_filter = true) so AND-chain
+/// detection runs; `make_prog` resolves as a map (is_filter = false).
+fn resolve_filter(
+    schema: &SchemaDescriptor,
+    instrs: Vec<LogicalInstr>,
+    num_regs: u32,
+    result_reg: u32,
+) -> ResolvedProgram {
+    LogicalProgram::new(instrs, num_regs, result_reg, vec![]).resolve(schema, /* is_filter = */ true)
+}
+
+/// `c1>1 AND c2>1 AND c3>1 AND c4>1`: a clean left-deep 4-clause chain (3 ANDs).
+/// The two non-terminal ANDs (dst reg 5, reg 8) are triggers; the terminal AND
+/// (dst reg 11 = result_reg) is not marked.
+#[test]
+fn and_chain_marks_nonterminal_ands() {
+    let schema = make_schema(0, &[8, 9, 9, 9, 9]); // PK + 4 nullable I64
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 1 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // c1>1
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        }, // c2>1
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 }, // trigger (reg 5)
+        LogicalInstr::LoadColInt { dst: 6, col: 3 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 7,
+            a: 6,
+            b: 1,
+        }, // c3>1
+        LogicalInstr::BoolAnd { dst: 8, a: 5, b: 7 }, // trigger (reg 8)
+        LogicalInstr::LoadColInt { dst: 9, col: 4 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 10,
+            a: 9,
+            b: 1,
+        }, // c4>1
+        LogicalInstr::BoolAnd { dst: 11, a: 8, b: 10 }, // terminal (reg 11)
+    ];
+    let prog = resolve_filter(&schema, instrs, 12, 11);
+    assert_eq!(prog.chain_trigger_mask, (1u64 << 5) | (1u64 << 8));
+    assert_eq!(prog.chain_trigger_mask.count_ones(), 2);
+}
+
+/// A single-AND filter (`c1>1 AND c2>1`) has no non-terminal AND, so the mask is
+/// empty: the spine walk finds no upstream single-use AND.
+#[test]
+fn and_chain_single_and_empty_mask() {
+    let schema = make_schema(0, &[8, 9, 9]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 1 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        },
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 }, // terminal = result_reg
+    ];
+    let prog = resolve_filter(&schema, instrs, 6, 5);
+    assert_eq!(prog.chain_trigger_mask, 0);
+}
+
+/// `NOT (c1>1 AND c2>1)`: terminal is a `BoolNot`, not an AND on result_reg, so
+/// nothing is detected — forcing the inner AND FALSE would be a miscompile
+/// (`NOT false = true`).
+#[test]
+fn and_chain_not_terminal_no_mask() {
+    let schema = make_schema(0, &[8, 9, 9]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 1 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        },
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
+        LogicalInstr::BoolNot { dst: 6, a: 5 }, // result_reg
+    ];
+    let prog = resolve_filter(&schema, instrs, 7, 6);
+    assert_eq!(prog.chain_trigger_mask, 0);
+}
+
+/// `(c1>1 AND c2>1) OR c3>1`: terminal is a `BoolOr`, so the inner AND is reached
+/// through an OR operand, not the accumulator spine — not a trigger.
+#[test]
+fn and_chain_or_terminal_no_mask() {
+    let schema = make_schema(0, &[8, 9, 9, 9]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 1 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        },
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
+        LogicalInstr::LoadColInt { dst: 6, col: 3 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 7,
+            a: 6,
+            b: 1,
+        },
+        LogicalInstr::BoolOr { dst: 8, a: 5, b: 7 }, // result_reg
+    ];
+    let prog = resolve_filter(&schema, instrs, 9, 8);
+    assert_eq!(prog.chain_trigger_mask, 0);
+}
+
+/// The same clean chain resolved as a MAP (`is_filter = false`) gets a 0 mask:
+/// detection is gated on `is_filter`, matching where `bit_only_mask` is gated.
+#[test]
+fn and_chain_map_program_no_mask() {
+    let schema = make_schema(0, &[8, 9, 9, 9]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadConst { dst: 1, val: 1 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 2,
+            a: 0,
+            b: 1,
+        },
+        LogicalInstr::LoadColInt { dst: 3, col: 2 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 4,
+            a: 3,
+            b: 1,
+        },
+        LogicalInstr::BoolAnd { dst: 5, a: 2, b: 4 },
+        LogicalInstr::LoadColInt { dst: 6, col: 3 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 7,
+            a: 6,
+            b: 1,
+        },
+        LogicalInstr::BoolAnd { dst: 8, a: 5, b: 7 },
+    ];
+    let prog = LogicalProgram::new(instrs, 9, 8, vec![]).resolve(&schema, /* is_filter = */ false);
+    assert_eq!(prog.chain_trigger_mask, 0);
+}
