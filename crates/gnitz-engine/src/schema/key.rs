@@ -718,5 +718,28 @@ mod tests {
                 assert_opk_equivalence(&s, &a, &b);
             }
         }
+
+        proptest! {
+            /// `compare_pk_ordering` agrees with the authoritative byte comparator
+            /// at every PK width — narrow (register `pack_pk_be`) and wide
+            /// (>16-byte prefix + `compare_pk_bytes` tiebreak) alike — so
+            /// `== Ordering::Equal` is exactly byte equality, the property the
+            /// N-way merge fold and the single-batch drain rely on for grouping.
+            #[test]
+            fn compare_pk_ordering_matches_byte_compare((types, perm, a, b) in arb_pk_case()) {
+                let cols: Vec<SchemaColumn> =
+                    types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
+                let s = SchemaDescriptor::new(&cols, &perm);
+                let stride = s.pk_stride() as usize;
+                let (mut oa, mut ob) = (vec![0u8; stride], vec![0u8; stride]);
+                encode_order_preserving_pk(&s, &a, &mut oa);
+                encode_order_preserving_pk(&s, &b, &mut ob);
+                prop_assert_eq!(compare_pk_ordering(&oa, &ob), compare_pk_bytes(&oa, &ob));
+                prop_assert_eq!(
+                    compare_pk_ordering(&oa, &ob) == std::cmp::Ordering::Equal,
+                    oa == ob
+                );
+            }
+        }
     }
 }

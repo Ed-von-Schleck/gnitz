@@ -500,8 +500,13 @@ pub(crate) fn run_merge<S: ColumnarSource + MergeSource>(
 /// N-way merge closure builder + driver. The keyless heap reads each player's
 /// OPK bytes through `(source_idx, row)`: `compare_pk_ordering` settles the PK
 /// axis (one byte comparator at every width), then the payload `row_cmp`.
-/// `same_pk` is the width-agnostic OPK byte equality (so two distinct wide PKs
-/// sharing a 16-byte prefix never fold); `eq_payload` is the payload term.
+/// `same_pk` tests OPK equality through `compare_pk_ordering` — the same
+/// comparator as `less`, deliberately not a raw `get_pk_bytes(..) ==
+/// get_pk_bytes(..)`: on the runtime-width slices `get_pk_bytes` yields, raw `==`
+/// lowers to an out-of-line `bcmp` call, whereas `compare_pk_ordering` inlines to
+/// a register `pack_pk_be` compare for the dominant ≤16-byte PK (the
+/// `compare_pk_bytes` tiebreak fires only when two wide PKs share a 16-byte
+/// prefix, so they never fold). `eq_payload` is the payload term.
 /// Monomorphised per (source, payload) so `drive_merge`'s hot loop stays
 /// branch-free; the no-op `next_non_ghost` on a ghost-free source inlines the
 /// advance to `position + 1`.
@@ -529,7 +534,7 @@ fn run_merge_body<S, RowCmp>(
         }
     };
     let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-        sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
+        compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) == Ordering::Equal
     };
     let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
         row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
@@ -615,15 +620,7 @@ fn sort_consolidate_inner<RowCmp>(
         },
         ord => ord,
     });
-    drain_groups_into(
-        n,
-        batch,
-        schema,
-        writer,
-        row_cmp,
-        |p, c| batch.get_pk_bytes(p) == batch.get_pk_bytes(c),
-        |pos| (entries[pos].idx as usize, entries[pos].pk),
-    );
+    drain_groups_into(n, batch, schema, writer, row_cmp, |pos| entries[pos].idx as usize);
 }
 
 /// Weight-fold an already-sorted batch: sum weights for identical (PK, payload)
@@ -633,62 +630,54 @@ pub(crate) fn fold_sorted(batch: &MemBatch, schema: &SchemaDescriptor, writer: &
     if n == 0 {
         return;
     }
-    // No ordered PK comparison here: input is already sorted. Group
-    // detection in `drain_groups_into` is the `cur_pk == pending_pk` packed
-    // prefix reject plus the exact OPK-byte `pk_eq` (redundant-but-correct for
-    // narrow, the real separator for wide low-16 collisions).
+    // No ordered PK comparison here: input is already sorted. Group detection in
+    // `drain_groups_into` is `compare_pk_ordering` on the OPK bytes (the register
+    // `pack_pk_be` compare for narrow keys, a `compare_pk_bytes` tiebreak only for
+    // wide low-16 collisions) then the payload term.
     with_payload_cmp!(schema, fold_with, n, batch, schema, writer)
 }
 
-/// `fold_sorted` closure dispatcher: forwards to the single generic drain with
-/// the exact OPK-byte `pk_eq` for every width.
+/// `fold_sorted` closure dispatcher: forwards to the single generic drain, whose
+/// PK term is `compare_pk_ordering` at every width.
 #[inline]
 fn fold_with<RowCmp>(n: usize, batch: &MemBatch, schema: &SchemaDescriptor, writer: &mut DirectWriter, row_cmp: RowCmp)
 where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
 {
-    drain_groups_into(
-        n,
-        batch,
-        schema,
-        writer,
-        row_cmp,
-        |p, c| batch.get_pk_bytes(p) == batch.get_pk_bytes(c),
-        |pos| (pos, pack_pk_be(batch.get_pk_bytes(pos))),
-    );
+    // Input is already sorted, so the iteration position is the batch row index.
+    drain_groups_into(n, batch, schema, writer, row_cmp, |pos| pos);
 }
 
 /// Shared pending-group drain loop used by `sort_and_consolidate` and `fold_sorted`.
 ///
-/// `resolve(pos)` maps an iteration position to `(batch_row_idx, pk)`.
-/// For `sort_and_consolidate` this is an indirection through a sorted index array;
+/// `resolve(pos)` maps an iteration position to the batch row index. For
+/// `sort_and_consolidate` this is an indirection through a sorted index array;
 /// for `fold_sorted` the input is already sorted so `pos == batch_row_idx`.
 ///
-/// `cur_pk == pending_pk` (the packed `pk_sort_key` prefix) is the O(1)
-/// reject — exact for narrow, an inequality filter for wide. `pk_eq` is the
-/// exact OPK-byte equality, redundant-but-correct for narrow (the prefix is
-/// the whole PK) and the real separator for wide (two distinct PKs sharing a
-/// 16-byte prefix). It only runs once the O(1) prefix reject passes.
+/// Group detection is `compare_pk_ordering` on the two rows' OPK bytes — the
+/// register `pack_pk_be` compare for narrow keys, with a `compare_pk_bytes`
+/// tiebreak only when two wide (>16-byte) PKs collide on the leading 16 bytes —
+/// then the payload `row_cmp`. This is the same comparator the N-way merge fold
+/// settles its PK axis on, and (as there) the register compare rather than a raw
+/// byte `==`, which would emit a `bcmp` call on these runtime-width slices.
 #[inline]
-fn drain_groups_into<RowCmp, PkEq>(
+fn drain_groups_into<RowCmp>(
     n: usize,
     batch: &MemBatch,
     schema: &SchemaDescriptor,
     writer: &mut DirectWriter,
     row_cmp: RowCmp,
-    pk_eq: PkEq,
-    resolve: impl Fn(usize) -> (usize, u128),
+    resolve: impl Fn(usize) -> usize,
 ) where
     RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
-    PkEq: Fn(usize, usize) -> bool + Copy,
 {
-    let (mut pending_idx, mut pending_pk) = resolve(0);
+    let mut pending_idx = resolve(0);
     let mut pending_weight = batch.get_weight(pending_idx);
 
     for pos in 1..n {
-        let (cur_idx, cur_pk) = resolve(pos);
-        let same_group = cur_pk == pending_pk
-            && pk_eq(pending_idx, cur_idx)
+        let cur_idx = resolve(pos);
+        let same_group = compare_pk_ordering(batch.get_pk_bytes(pending_idx), batch.get_pk_bytes(cur_idx))
+            == Ordering::Equal
             && row_cmp(schema, batch, pending_idx, batch, cur_idx) == Ordering::Equal;
 
         if same_group {
@@ -698,7 +687,6 @@ fn drain_groups_into<RowCmp, PkEq>(
                 writer.write_row(batch, pending_idx, pending_weight);
             }
             pending_idx = cur_idx;
-            pending_pk = cur_pk;
             pending_weight = batch.get_weight(cur_idx);
         }
     }
