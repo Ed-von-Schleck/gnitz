@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import signal
@@ -53,7 +52,10 @@ class PerfRecorder:
             print(f"[perf] No worker children found; profiling master={self._pid} only")
 
         pid_str = ",".join(str(p) for p in all_pids)
-        callgraph = ["--call-graph", "dwarf,65528"] if self._dwarf else ["-g"]
+        # fp (frame-pointer) unwinding needs a frame-pointer build but resolves
+        # inlined release frames that dwarf drops; dwarf is the fallback for
+        # binaries built without frame pointers.
+        callgraph = ["--call-graph", "dwarf,65528"] if self._dwarf else ["--call-graph", "fp"]
         try:
             self._proc = subprocess.Popen(
                 ["perf", "record", "-F", "99", *callgraph, "-k", "1", "-e", "cycles",
@@ -131,60 +133,44 @@ class PerfRecorder:
     def flamegraph(self) -> Path | None:
         """Generate flamegraph SVG from perf.data.
 
-        Tries inferno (Rust) first, falls back to FlameGraph perl scripts.
-        Returns path to SVG or None on failure.
+        Uses the first toolchain whose tools are both installed, in preference
+        order: inferno (Rust) first, FlameGraph perl scripts as fallback. Each
+        toolchain runs the same `perf script | collapse > svg` pipeline; if one
+        is installed but fails, the next is tried. Returns the SVG path, or None
+        if no toolchain is available or all of them fail.
         """
         perf_data = self._output_dir / "perf.data"
         if not perf_data.exists():
             return None
 
         svg_path = self._output_dir / "flamegraph.svg"
-
-        # Try inferno (Rust toolchain)
-        if shutil.which("inferno-collapse-perf") and shutil.which("inferno-flamegraph"):
+        for collapse_tool, graph_tool in (
+            ("inferno-collapse-perf", "inferno-flamegraph"),
+            ("stackcollapse-perf.pl", "flamegraph.pl"),
+        ):
+            if not (shutil.which(collapse_tool) and shutil.which(graph_tool)):
+                continue
             try:
                 script = subprocess.run(
                     ["perf", "script", "-i", str(perf_data)],
                     capture_output=True, text=True, timeout=60,
                 )
                 collapse = subprocess.run(
-                    ["inferno-collapse-perf"],
+                    [collapse_tool],
                     input=script.stdout, capture_output=True, text=True, timeout=60,
                 )
                 with open(svg_path, "w") as f:
                     subprocess.run(
-                        ["inferno-flamegraph"],
-                        input=collapse.stdout, stdout=f, timeout=60,
+                        [graph_tool],
+                        input=collapse.stdout, stdout=f, text=True, timeout=60,
                     )
                 print(f"[perf] Flamegraph written to {svg_path}")
                 return svg_path
             except Exception as e:
-                print(f"[perf] inferno flamegraph failed: {e}")
+                print(f"[perf] {collapse_tool} flamegraph failed: {e}")
 
-        # Fallback: FlameGraph perl scripts
-        for tool in ("stackcollapse-perf.pl", "flamegraph.pl"):
-            if not shutil.which(tool):
-                print(f"[perf] {tool} not found. Install inferno or FlameGraph.")
-                return None
-        try:
-            script = subprocess.run(
-                ["perf", "script", "-i", str(perf_data)],
-                capture_output=True, text=True, timeout=60,
-            )
-            collapse = subprocess.run(
-                ["stackcollapse-perf.pl"],
-                input=script.stdout, capture_output=True, text=True, timeout=60,
-            )
-            with open(svg_path, "w") as f:
-                subprocess.run(
-                    ["flamegraph.pl"],
-                    input=collapse.stdout, stdout=f, timeout=60,
-                )
-            print(f"[perf] Flamegraph written to {svg_path}")
-            return svg_path
-        except Exception as e:
-            print(f"[perf] FlameGraph generation failed: {e}")
-            return None
+        print("[perf] No flamegraph tool found. Install inferno or FlameGraph.")
+        return None
 
 
 class PerfStat:

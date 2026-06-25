@@ -139,6 +139,7 @@ cython_debug/
 # Server binaries (built by Makefile)
 /gnitz-server
 /gnitz-server-release
+/gnitz-server-profiling
 
 # IDE specific files
 .vscode/

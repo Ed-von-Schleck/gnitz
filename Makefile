@@ -22,7 +22,7 @@ K          ?=                                # pytest -k expression
         test rust-engine-test fmt fmt-check clippy check verify \
         server release-server pyext pyext-release e2e e2e-release release-test \
         clean distclean \
-        bench bench-full bench-sweep bench-perf bench-perf-dwarf
+        bench bench-full bench-sweep bench-perf bench-perf-dwarf bench-profile profiling-server
 
 all: test
 
@@ -89,7 +89,7 @@ release-test: e2e-release ## Validate the release build end-to-end
 
 clean: ## Remove built binaries + per-run scratch data (keeps post-mortem logs)
 	@echo "Removing server binaries and per-run scratch data..."
-	@rm -f gnitz-server gnitz-server-release
+	@rm -f gnitz-server gnitz-server-release gnitz-server-profiling
 	@rm -rf ~/git/gnitz/tmp/gnitz_*
 
 distclean: clean ## clean + cargo target cache + post-mortem logs
@@ -123,3 +123,13 @@ bench-perf-dwarf: WORKERS = 4
 bench-perf-dwarf: FULL       = 1
 bench-perf-dwarf: PERF_DWARF = 1
 bench-perf-dwarf: bench ## Full + perf with DWARF call graphs
+
+profiling-server: ## Build frame-pointer release server -> ./gnitz-server-profiling (accurate perf call graphs)
+	cd crates && RUSTFLAGS="-C force-frame-pointers=yes" CARGO_TARGET_DIR=target/profiling \
+		cargo build --release -p gnitz-engine --bin gnitz-server
+	cp crates/target/profiling/release/gnitz-server gnitz-server-profiling
+
+bench-profile: profiling-server pyext-release ## Profile incremental view maintenance under perf (frame pointers, W=4)
+	cd crates/gnitz-py && GNITZ_SERVER_BIN=$(abspath gnitz-server-profiling) \
+		uv run python ../../benchmarks/run.py --full --workers=4 --perf -k view_maintenance
+	cd crates/gnitz-py && uv run python ../../benchmarks/report.py
