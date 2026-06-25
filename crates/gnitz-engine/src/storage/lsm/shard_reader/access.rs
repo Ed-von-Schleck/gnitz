@@ -211,7 +211,7 @@ impl MappedShard {
     /// is a raw `memcmp` binary search — correct at every PK width with no
     /// schema dependency. `key` must be exactly `pk_stride` OPK bytes.
     pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
-        super::super::columnar::binary_lower_bound(0, self.count, key, &|i| self.get_pk_bytes(i))
+        super::super::columnar::lower_bound_opk(self.count, key, self.pk_stride as usize, |i| self.get_pk_bytes(i))
     }
 
     /// Galloping forward lower bound seeded at `hint` (the caller's live
@@ -220,7 +220,7 @@ impl MappedShard {
     /// body to `Batch::advance_to` — same `count`/`get_pk_bytes` contract. `key`
     /// must be exactly `pk_stride` OPK bytes.
     pub fn advance_to(&self, key: &[u8], hint: usize) -> usize {
-        super::super::columnar::gallop_lower_bound_bytes(self.count, key, hint, |i| self.get_pk_bytes(i))
+        super::super::columnar::gallop_opk(self.count, key, hint, self.pk_stride as usize, |i| self.get_pk_bytes(i))
     }
 
     /// Test-only u128 oracle (exact-match point lookup) cross-checking the

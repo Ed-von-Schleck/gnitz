@@ -126,27 +126,22 @@ pub(crate) fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], t
 // now; re-exported so `columnar::*` / `crate::storage::*` call sites are
 // unchanged. (`encode_order_preserving_pk` moved there too but has no
 // storage-side caller, so it is not re-exported.)
+use crate::schema::key::PkSortKey; // the OPK register sort key, for the seek fast path below
 pub(crate) use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, opk_key};
 
 // ---------------------------------------------------------------------------
 // Sorted-stream lower-bound search (stateless + galloping)
 // ---------------------------------------------------------------------------
 
-/// Lower bound (first index with `get(i) >= key`) over `[lo, hi)`. `get(i)`
-/// yields row `i`'s OPK PK bytes; memcmp order equals typed order at every PK
-/// width. The named `'a` is load-bearing: a bare `Fn(usize) -> &[u8]` desugars
-/// to a higher-ranked bound the `|i| self.get_pk_bytes(i)` closures (result
-/// borrows `self`) cannot satisfy.
+/// Lower bound over `[lo, hi)`: the first index whose row sorts at-or-after the
+/// probe, where `lt(i)` reports row `i < probe`. The byte and register seek paths
+/// differ only in `lt` — a slice `memcmp` vs an OPK-register integer compare — so
+/// the search skeleton lives here once.
 #[inline]
-pub(crate) fn binary_lower_bound<'a>(
-    mut lo: usize,
-    mut hi: usize,
-    key: &[u8],
-    get: &impl Fn(usize) -> &'a [u8],
-) -> usize {
+fn lower_bound_by(mut lo: usize, mut hi: usize, lt: impl Fn(usize) -> bool) -> usize {
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if get(mid) < key {
+        if lt(mid) {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -155,14 +150,45 @@ pub(crate) fn binary_lower_bound<'a>(
     lo
 }
 
-/// Lower bound over `[0, count)`, seeded at `hint`. Galloping forward when the
-/// boundary is after the hint (`O(log gap)`), `O(1)` when the boundary IS the
-/// hint (consecutive keys in one inter-row gap, or a run past the source end with
-/// `hint == count`), and a bounded `[0, hint)` search when the boundary is before
-/// it. Correct for ANY hint, and since `[0, hint] ⊆ [0, count)` it is **never
-/// asymptotically worse** than `binary_lower_bound(0, count, …)` — a backward or
-/// stale hint forfeits only the speedup, at the cost of at most two extra
-/// comparisons.
+/// Galloping lower bound over `[0, count)`, seeded at `hint`: `O(log gap)` forward
+/// when the boundary is after the hint, `O(1)` when the boundary IS the hint
+/// (consecutive keys in one inter-row gap, or a run past the source end with
+/// `hint == count`), and a bounded `[0, hint)` search when it is before. Correct
+/// for ANY hint, and since `[0, hint] ⊆ [0, count)` it is **never asymptotically
+/// worse** than `lower_bound_by(0, count, …)` — a backward or stale hint forfeits
+/// only the speedup, at the cost of at most two extra comparisons. `lt(i)` reports
+/// row `i < probe`, as in [`lower_bound_by`].
+#[inline]
+fn gallop_by(count: usize, hint: usize, lt: impl Fn(usize) -> bool) -> usize {
+    let h = hint.min(count);
+    if h < count && lt(h) {
+        // boundary strictly after the hint
+        let mut lo = h; // invariant: row `lo` sorts before the probe
+        let mut step = 1usize;
+        while lo + step < count && lt(lo + step) {
+            lo += step;
+            step *= 2;
+        }
+        let hi = (lo + step).min(count); // row `hi` sorts >= probe, or hi == count
+        return lower_bound_by(lo + 1, hi, lt);
+    }
+    if h == 0 || lt(h - 1) {
+        return h;
+    } // boundary is exactly h (incl. h == count)
+    lower_bound_by(0, h, lt) // genuine overshoot: bounded [0, h)
+}
+
+/// Byte-`memcmp` lower bound over `[lo, hi)`. `get(i)` yields row `i`'s OPK PK
+/// bytes; memcmp order equals typed order at every PK width. The named `'a` is
+/// load-bearing: a bare `Fn(usize) -> &[u8]` desugars to a higher-ranked bound the
+/// `|i| self.get_pk_bytes(i)` closures (result borrows `self`) cannot satisfy.
+#[inline]
+pub(crate) fn binary_lower_bound<'a>(lo: usize, hi: usize, key: &[u8], get: &impl Fn(usize) -> &'a [u8]) -> usize {
+    lower_bound_by(lo, hi, |i| get(i) < key)
+}
+
+/// Galloping byte-`memcmp` lower bound; see [`gallop_by`]. The seek fallback for PK
+/// strides past the register widths, and the byte oracle in tests.
 #[inline]
 pub(crate) fn gallop_lower_bound_bytes<'a>(
     count: usize,
@@ -170,22 +196,70 @@ pub(crate) fn gallop_lower_bound_bytes<'a>(
     hint: usize,
     get: impl Fn(usize) -> &'a [u8],
 ) -> usize {
-    let h = hint.min(count);
-    if h < count && get(h) < key {
-        // boundary strictly after the hint
-        let mut lo = h; // invariant: get(lo) < key
-        let mut step = 1usize;
-        while lo + step < count && get(lo + step) < key {
-            lo += step;
-            step *= 2;
+    gallop_by(count, hint, |i| get(i) < key)
+}
+
+// ---------------------------------------------------------------------------
+// Seek fast path: load each `pk_stride` OPK key into a register and compare it as
+// an integer. For two equal-width OPK images the integer order is the byte order
+// (`compare_pk_bytes`), so a register search returns the identical lower bound as
+// the byte search above — pinned by `lower_bound_opk_matches_byte_search`. The key
+// is `PkSortKey::from_opk`, the same register key the merge/sort drive uses, and
+// the stride→width dispatch mirrors `reduce::sort::sort_indices_by_pk`. Every
+// `from_opk` arm is a full order-preserving key (the `[u128; 2]` arm's low limb
+// settles a leading-16-byte tie), so the dispatch is exact through 32-byte strides;
+// wider PKs fall back to the byte search.
+// ---------------------------------------------------------------------------
+
+/// Stride-dispatched OPK lower bound — the seek-path entry point. `stride` is the
+/// stored key width (`pk_stride`); `key` is exactly `stride` OPK bytes (a full key,
+/// or a prefix the caller already zero-padded to `stride`).
+#[inline]
+pub(crate) fn lower_bound_opk<'a>(count: usize, key: &[u8], stride: usize, get: impl Fn(usize) -> &'a [u8]) -> usize {
+    debug_assert_eq!(key.len(), stride, "seek probe width must equal pk_stride");
+    match stride {
+        0..=8 => {
+            let p = u64::from_opk(key);
+            lower_bound_by(0, count, |i| u64::from_opk(get(i)) < p)
         }
-        let hi = (lo + step).min(count); // get(hi) >= key, or hi == count
-        return binary_lower_bound(lo + 1, hi, key, &get);
+        9..=16 => {
+            let p = u128::from_opk(key);
+            lower_bound_by(0, count, |i| u128::from_opk(get(i)) < p)
+        }
+        17..=32 => {
+            let p = <[u128; 2]>::from_opk(key);
+            lower_bound_by(0, count, |i| <[u128; 2]>::from_opk(get(i)) < p)
+        }
+        _ => binary_lower_bound(0, count, key, &get),
     }
-    if h == 0 || get(h - 1) < key {
-        return h;
-    } // boundary is exactly h (incl. h == count)
-    binary_lower_bound(0, h, key, &get) // genuine overshoot: bounded [0, h)
+}
+
+/// Stride-dispatched galloping lower bound; see [`lower_bound_opk`]. Same dispatch,
+/// same byte fallback.
+#[inline]
+pub(crate) fn gallop_opk<'a>(
+    count: usize,
+    key: &[u8],
+    hint: usize,
+    stride: usize,
+    get: impl Fn(usize) -> &'a [u8],
+) -> usize {
+    debug_assert_eq!(key.len(), stride, "seek probe width must equal pk_stride");
+    match stride {
+        0..=8 => {
+            let p = u64::from_opk(key);
+            gallop_by(count, hint, |i| u64::from_opk(get(i)) < p)
+        }
+        9..=16 => {
+            let p = u128::from_opk(key);
+            gallop_by(count, hint, |i| u128::from_opk(get(i)) < p)
+        }
+        17..=32 => {
+            let p = <[u128; 2]>::from_opk(key);
+            gallop_by(count, hint, |i| <[u128; 2]>::from_opk(get(i)) < p)
+        }
+        _ => gallop_lower_bound_bytes(count, key, hint, get),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -962,5 +1036,52 @@ mod tests {
         let key = 7u16.to_be_bytes();
         assert_eq!(gallop_lower_bound_bytes(0, &key, 0, get), 0);
         assert_eq!(binary_lower_bound(0, 0, &key, &get), 0);
+    }
+
+    /// `lower_bound_opk` / `gallop_opk` (the register dispatch) return the identical
+    /// index as the byte oracle (`binary_lower_bound` / `gallop_lower_bound_bytes`)
+    /// for every full-`stride` probe, across all four arms — `u64` (≤8), `u128`
+    /// (9..=16), `[u128; 2]` (17..=32), and the byte fallback (>32). Order
+    /// equivalence between the register and byte compare per width is the
+    /// load-bearing property; the `from_opk` packers themselves are additionally
+    /// pinned by `pack_pk_be_specialization_matches_naive` and the reduce argsort
+    /// tests (incl. the `[u128; 2]` leading-16 tie). Values span two bytes, so a
+    /// wrong-endian load would miscompare.
+    #[test]
+    fn lower_bound_opk_matches_byte_search() {
+        // Right-align a value into the OPK tail (high bytes zero, the natural layout
+        // for a small key) at any stride; `* 7` leaves gaps for between-key probes.
+        let enc = |val: u64, stride: usize| -> Vec<u8> {
+            let mut k = vec![0u8; stride];
+            let t = stride.min(8);
+            k[stride - t..].copy_from_slice(&val.to_be_bytes()[8 - t..]);
+            k
+        };
+        for &stride in &[4usize, 8, 12, 16, 24, 32, 40] {
+            let n = 200usize;
+            let region: Vec<u8> = (0..n).flat_map(|i| enc((i as u64) * 7 + 3, stride)).collect();
+            let get = |i: usize| &region[i * stride..i * stride + stride];
+
+            // Every stored key, a below-all and above-all key, and one landing in
+            // each inter-key gap (the last lands above all). All exactly `stride`.
+            let mut probes: Vec<Vec<u8>> = (0..n).map(|i| get(i).to_vec()).collect();
+            probes.push(enc(0, stride)); // below all (the min stored key encodes 3)
+            probes.push(vec![0xffu8; stride]); // above all
+            probes.extend((0..n).map(|i| enc((i as u64) * 7 + 3 + 4, stride))); // in-gap
+
+            for p in &probes {
+                assert_eq!(p.len(), stride);
+                let oracle = binary_lower_bound(0, n, p, &get);
+                assert_eq!(lower_bound_opk(n, p, stride, get), oracle, "stride={stride} p={p:02x?}");
+                for &hint in &[0usize, n / 3, n, oracle] {
+                    assert_eq!(gallop_lower_bound_bytes(n, p, hint, get), oracle);
+                    assert_eq!(
+                        gallop_opk(n, p, hint, stride, get),
+                        oracle,
+                        "gallop stride={stride} p={p:02x?}"
+                    );
+                }
+            }
+        }
     }
 }
