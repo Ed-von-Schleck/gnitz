@@ -340,11 +340,6 @@ class TestSetOps:
             vals = sorted(r["val"] for r in rows)
             assert vals == [20, 99], f"expected [20, 99] after update, got {vals}"
         finally:
-            for sql in ["DROP VIEW v", "DROP TABLE t"]:
-                try:
-                    client.execute_sql(sql, schema_name=sn)
-                except Exception:
-                    pass
             client.drop_schema(sn)
 
 
@@ -394,11 +389,6 @@ class TestSetOpsDifferential:
             oracle.apply_update(a_state, "pk", 1, {"val": 99})
             check(f"{op} after-update-a")
         finally:
-            for sql in ["DROP VIEW v", "DROP TABLE a", "DROP TABLE b"]:
-                try:
-                    client.execute_sql(sql, schema_name=sn)
-                except Exception:
-                    pass
             client.drop_schema(sn)
 
     def test_except_differential(self, client):
@@ -412,6 +402,108 @@ class TestSetOpsDifferential:
 
     def test_union_all_differential(self, client):
         self._run(client, "UNION ALL")
+
+
+class TestDistinctDifferential:
+    """SELECT DISTINCT projected so real dedup happens (many rows share one value),
+    checked against the from-scratch oracle after every epoch. DISTINCT is the
+    non-linear boundary-crossing operator (DBSP Prop 4.7) and had no differential
+    test: a value stays at weight 1 while any row carries it, vanishes only when
+    the last is retracted, and an UPDATE that moves a row's value crosses an exit
+    and an entry boundary in a single epoch."""
+
+    def test_distinct_single_col_churn(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("CREATE VIEW v AS SELECT DISTINCT g FROM t", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            t_state = {}
+
+            def check(ctx):
+                exp = oracle.oracle_distinct(
+                    oracle.oracle_filter_project(t_state, None, ["g"]))
+                oracle.assert_view_matches(client, vid, ["g"], exp, ctx=ctx)
+
+            # g=1 and g=2 each carried by two rows; g=3 by one.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 1}, {"pk": 2, "g": 1}, {"pk": 3, "g": 2},
+                {"pk": 4, "g": 2}, {"pk": 5, "g": 3}])
+            check("after-insert")
+
+            # Drop one of g=1's two carriers: g=1 stays (boundary NOT crossed).
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1])
+            check("after-delete-one-of-two")
+
+            # Drop g=3's only carrier: g=3 vanishes (exit boundary crossed).
+            client.execute_sql("DELETE FROM t WHERE pk = 5", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [5])
+            check("after-delete-last-carrier")
+
+            # Move g=1's last carrier (pk=2) to a brand-new g=4: g=1 exits and g=4
+            # enters in one epoch — both boundaries cross simultaneously.
+            client.execute_sql("UPDATE t SET g = 4 WHERE pk = 2", schema_name=sn)
+            oracle.apply_update(t_state, "pk", 2, {"g": 4})
+            check("after-update-cross-both-boundaries")
+
+            # Re-introduce g=3.
+            client.execute_sql("INSERT INTO t VALUES (6, 3)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 6, "g": 3}])
+            check("after-reinsert")
+        finally:
+            client.drop_schema(sn)
+
+    def test_distinct_two_col_churn(self, client):
+        """DISTINCT over two columns: dedup keys on the whole (a, b) pair. An
+        UPDATE to one component moves the pair, and the pair survives only while a
+        carrier remains."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("CREATE VIEW v AS SELECT DISTINCT a, b FROM t", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            t_state = {}
+
+            def check(ctx):
+                exp = oracle.oracle_distinct(
+                    oracle.oracle_filter_project(t_state, None, ["a", "b"]))
+                oracle.assert_view_matches(client, vid, ["a", "b"], exp, ctx=ctx)
+
+            # (1,1) carried twice; (1,2) and (2,1) once each. (1,1) and (1,2) share
+            # `a`, (1,1) and (2,1) share `b` — so dedup must key on the pair.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1, 1), (2, 1, 1), (3, 1, 2), (4, 2, 1)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "a": 1, "b": 1}, {"pk": 2, "a": 1, "b": 1},
+                {"pk": 3, "a": 1, "b": 2}, {"pk": 4, "a": 2, "b": 1}])
+            check("after-insert")
+
+            # Drop one carrier of (1,1): pair stays.
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1])
+            check("after-delete-one-carrier")
+
+            # Move (1,2)'s carrier to (2,1): (1,2) exits, (2,1) already present so
+            # its weight stays 1 (a second carrier, not a second row).
+            client.execute_sql("UPDATE t SET b = 1, a = 2 WHERE pk = 3", schema_name=sn)
+            oracle.apply_update(t_state, "pk", 3, {"a": 2, "b": 1})
+            check("after-update-onto-existing-pair")
+
+            # Remove pk=4 — (2,1) still carried by pk=3 → stays.
+            client.execute_sql("DELETE FROM t WHERE pk = 4", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [4])
+            check("after-delete-other-carrier")
+        finally:
+            client.drop_schema(sn)
 
 
 class TestSetOpNullability:

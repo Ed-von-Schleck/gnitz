@@ -6,6 +6,7 @@ Run:
 import random
 import pytest
 import gnitz
+import _oracle as oracle
 
 
 def _uid():
@@ -1900,5 +1901,209 @@ class TestAdaptiveMinMaxOutputType:
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
             client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+
+class TestAggregateDifferential:
+    """GROUP BY aggregates checked against the from-scratch differential oracle
+    after every epoch, including a nested aggregate-over-DISTINCT view. The
+    expected value is recomputed in pure Python and never touches the engine, so
+    a shared-operator bug cannot hide behind a hand-written expectation the way it
+    can in the value-pinned tests above. The source is a unique-PK base table, so
+    these stay clear of the foreign-group reduce-gather defect (a separate plan
+    owns the non-unique-PK multi-aggregate shape). All columns are integer, so
+    every column — integer AVG included — is compared by value: SUM/COUNT are
+    exact integers and AVG is one deterministic f64 division of them."""
+
+    def test_all_aggs_integer_churn(self, client):
+        """COUNT/SUM/AVG/MIN/MAX over one integer column driven through insert →
+        UPDATE → delete-the-extremum (forces a MIN/MAX retraction recompute) →
+        empty-a-group → re-insert. AVG values are non-even (7/3, 3/2) so the f64
+        division is actually exercised, not just whole-number results."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+                "a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, COUNT(*) AS cnt, SUM(a) AS total, "
+                "AVG(a) AS av, MIN(a) AS lo, MAX(a) AS hi FROM t GROUP BY g",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["g", "cnt", "total", "av", "lo", "hi"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["g", "a"], ["g"],
+                    [("cnt", "COUNT", None), ("total", "SUM", "a"), ("av", "AVG", "a"),
+                     ("lo", "MIN", "a"), ("hi", "MAX", "a")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            # g=10: {1,2,4} → AVG 7/3; g=20: {5} → AVG 5.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 1), (2, 10, 2), (3, 10, 4), (4, 20, 5)",
+                schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 10, "a": 1}, {"pk": 2, "g": 10, "a": 2},
+                {"pk": 3, "g": 10, "a": 4}, {"pk": 4, "g": 20, "a": 5}])
+            check("after-insert")
+
+            # Raise g=10's max to 9 → SUM/AVG/MAX shift.
+            client.execute_sql("UPDATE t SET a = 9 WHERE pk = 3", schema_name=sn)
+            oracle.apply_update(t_state, "pk", 3, {"a": 9})
+            check("after-update-max")
+
+            # Delete g=10's current MAX holder → MAX recomputes from history to 2.
+            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [3])
+            check("after-delete-extremum")
+
+            # Empty g=20 entirely → the group vanishes from the view.
+            client.execute_sql("DELETE FROM t WHERE pk = 4", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [4])
+            check("after-group-empty")
+
+            # Re-create g=20 with a fresh value.
+            client.execute_sql("INSERT INTO t VALUES (5, 20, 8)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 5, "g": 20, "a": 8}])
+            check("after-reinsert")
+        finally:
+            client.drop_schema(sn)
+
+    def test_nullable_aggs_null_edge_churn(self, client):
+        """A nullable aggregate column driven to all-NULL and back. SUM/AVG/MIN/MAX
+        must skip NULL inputs and read back NULL once a group's last non-NULL value
+        is retracted (the group surviving via COUNT(*)), then recover — exactly the
+        null-gate the oracle models. Independent recompute across the whole churn,
+        not a single hand-checked transition."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+                "v BIGINT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, COUNT(*) AS c, SUM(v) AS sm, AVG(v) AS av, "
+                "MIN(v) AS mn, MAX(v) AS hi FROM t GROUP BY k",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["k", "c", "sm", "av", "mn", "hi"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["k", "v"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["k", "v"], ["k"],
+                    [("c", "COUNT", None), ("sm", "SUM", "v"), ("av", "AVG", "v"),
+                     ("mn", "MIN", "v"), ("hi", "MAX", "v")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            # k=10: one non-NULL (5) + one NULL → aggs over {5}, c=2.
+            client.execute_sql("INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "k": 10, "v": 5}, {"pk": 2, "k": 10, "v": None}])
+            check("after-insert-mixed")
+
+            # Add a second non-NULL → aggs over {5,15}, AVG 10.
+            client.execute_sql("INSERT INTO t VALUES (3, 10, 15)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 3, "k": 10, "v": 15}])
+            check("after-second-nonnull")
+
+            # Retract one non-NULL → aggs over {15}.
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1])
+            check("after-delete-one-nonnull")
+
+            # Retract the last non-NULL → group all-NULL: SUM/AVG/MIN/MAX NULL, c=1.
+            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [3])
+            check("after-all-null")
+
+            # Re-introduce a non-NULL → aggregates recover.
+            client.execute_sql("INSERT INTO t VALUES (4, 10, 7)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 4, "k": 10, "v": 7}])
+            check("after-recover")
+        finally:
+            client.drop_schema(sn)
+
+    def test_nested_count_distinct_over_distinct_view_churn(self, client):
+        """A nested view — outer GROUP BY COUNT(*) over an inner SELECT DISTINCT —
+        is count-distinct-per-group, checked differentially across churn. It
+        composes incremental DISTINCT boundary-crossing with a cross-view delta
+        into a downstream aggregate, a path no single-view test reaches. The oracle
+        chains oracle_distinct into oracle_groupby_aggregate, mirroring the view
+        stack. Both groups stay non-empty throughout (a fully-emptied COUNT-only
+        group is a separate, independently tracked reduce defect), so the churn
+        exercises distinct-pair boundary crossings, duplicate carriers, and a
+        cross-group key UPDATE — never a group's elimination."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+                "k BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("CREATE VIEW d AS SELECT DISTINCT g, k FROM t", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM d GROUP BY g", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["g", "c"]
+            t_state = {}
+
+            def check(ctx):
+                d = oracle.oracle_distinct(
+                    oracle.oracle_filter_project(t_state, None, ["g", "k"]))
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    d, ["g", "k"], ["g"], [("c", "COUNT", None)])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            # g=1: k in {7,7,8} → distinct {7,8} → c=2; g=2: k in {9,10} → c=2.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1, 7), (2, 1, 7), (3, 1, 8), (4, 2, 9), (5, 2, 10)",
+                schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 1, "k": 7}, {"pk": 2, "g": 1, "k": 7},
+                {"pk": 3, "g": 1, "k": 8}, {"pk": 4, "g": 2, "k": 9},
+                {"pk": 5, "g": 2, "k": 10}])
+            check("after-insert")
+
+            # Drop one carrier of (1,7) → pair survives → g=1 c=2 unchanged.
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1])
+            check("after-delete-one-carrier")
+
+            # Drop the last carrier of (1,7) → its pair exits → g=1 distinct {8} c=1
+            # (the group stays alive via k=8 — no outer-group elimination).
+            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [2])
+            check("after-delete-last-carrier-of-pair")
+
+            # Insert a duplicate carrier of (2,9) → distinct set unchanged → c=2.
+            client.execute_sql("INSERT INTO t VALUES (6, 2, 9)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 6, "g": 2, "k": 9}])
+            check("after-duplicate-carrier")
+
+            # Move (2,10)'s only carrier onto k=9 → pair (2,10) exits → g=2 c=1
+            # (still alive via the (2,9) carriers).
+            client.execute_sql("UPDATE t SET k = 9 WHERE pk = 5", schema_name=sn)
+            oracle.apply_update(t_state, "pk", 5, {"k": 9})
+            check("after-update-onto-existing-pair")
+
+            # Cross-group key UPDATE: move pk=4 from g=2 to g=1 (k=9). g=2 keeps its
+            # (2,9) pair via pk5/pk6 (c=1), g=1 gains a new distinct (1,9) → c=2.
+            # Retracts one DISTINCT pair and inserts another in one epoch, both
+            # groups remaining non-empty.
+            client.execute_sql("UPDATE t SET g = 1 WHERE pk = 4", schema_name=sn)
+            oracle.apply_update(t_state, "pk", 4, {"g": 1})
+            check("after-cross-group-move")
         finally:
             client.drop_schema(sn)

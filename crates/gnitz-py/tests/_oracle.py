@@ -26,8 +26,34 @@ A base relation's state is a ``dict`` mapping primary-key value -> row-dict
 (column-name -> value). The test applies INSERT/DELETE/UPDATE to this dict in
 lockstep with the SQL it sends to the engine, then asserts the view matches the
 oracle recomputed from the dict.
+
+Named weight-multisets (composing for nested views)
+---------------------------------------------------
+The aggregate / DISTINCT primitives operate on a **named weight-multiset**: a
+``Counter`` keyed by value-tuples paired with an ordered ``cols`` name list (the
+same ``project``/``out_cols`` style the comparison helpers use). They return the
+same shape, so a view over a ``GROUP BY``/``DISTINCT`` view is modelled by
+chaining one call's output into the next. Bootstrap the first multiset from base
+state with ``oracle_filter_project`` (projecting the union of the group columns
+and every aggregate-argument column), then feed it through
+``oracle_groupby_aggregate`` / ``oracle_distinct``.
+
+Float canonicalization
+----------------------
+A scanned (or expected) value that is a Python ``float`` is canonicalized to its
+raw IEEE-754 bits (``struct.pack("<d", v)``) before it enters a ``Counter`` key,
+by both ``scan_multiset`` and ``assert_view_matches``. Without it ``Counter``
+equality would be wrong two ways: ``nan != nan`` (a bit-stable MIN/MAX NaN output
+would never match itself) and ``-0.0 == 0.0`` (two distinct bit patterns would
+merge). Integer/string/NULL values are left untouched, so an all-integer view
+compares exactly as before. A **float-column** ``SUM``/``AVG`` is non-deterministic
+between live tick-order and rebuild chunk-order (IEEE addition is non-associative)
+and must still be omitted from ``project`` by the test author; canonicalization only
+makes the *deterministic* float columns (``MIN``/``MAX`` copy verbatim bits, integer
+``AVG`` is one exact division) compare bit-exactly.
 """
 
+import struct
 from collections import Counter
 
 
@@ -119,8 +145,10 @@ def oracle_setop(op, left, right):
     op = op.upper().strip()
     if op == "UNION ALL":
         return Counter(left) + Counter(right)
-    lset = {k for k, w in left.items() if w > 0}
-    rset = {k for k, w in right.items() if w > 0}
+    # The deduplicating ops decide membership exactly as DISTINCT does (net
+    # weight > 0), so reuse that single source of truth for the boundary rule.
+    lset = set(oracle_distinct(left))
+    rset = set(oracle_distinct(right))
     if op == "UNION":
         keys = lset | rset
     elif op == "INTERSECT":
@@ -132,7 +160,118 @@ def oracle_setop(op, left, right):
     return Counter({k: 1 for k in keys})
 
 
+def oracle_distinct(rel):
+    """Collapse a weight-multiset to weight 1 per tuple with net weight > 0.
+
+    Models ``SELECT DISTINCT`` (and the deduplicating set-op core) per DBSP
+    Proposition 4.7: a tuple is present at weight 1 iff its accumulated net
+    weight is positive, independent of how many physical rows carry it. ``rel``
+    is a ``Counter`` keyed by value-tuples; DISTINCT does not change the column
+    list, so the caller keeps tracking it. Returns a new ``Counter``.
+    """
+    return Counter({k: 1 for k, w in rel.items() if w > 0})
+
+
+def oracle_groupby_aggregate(rel, cols, group_names, aggs):
+    """Weight-multiset for ``SELECT group_names, aggs FROM rel GROUP BY group_names``.
+
+    ``rel``         — input weight-multiset: a ``Counter`` keyed by value-tuples
+                      ordered per ``cols``; each tuple's weight is its row
+                      multiplicity. Build the first one with
+                      ``oracle_filter_project``, projecting the union of the group
+                      columns and every aggregate-argument column.
+    ``cols``        — ordered name list describing ``rel``'s tuples.
+    ``group_names`` — subset of ``cols`` to group by.
+    ``aggs``        — list of ``(out_name, kind, arg_col)`` specs; ``kind`` is one
+                      of COUNT/SUM/MIN/MAX/AVG and ``arg_col`` is the source column
+                      (``None`` only for COUNT(*)).
+
+    Returns ``(weights, out_cols)`` — a named weight-multiset of the same shape as
+    the input, so a nested view chains this output into another call. ``out_cols``
+    is ``group_names`` followed by each agg's ``out_name``; every surviving group
+    carries weight 1.
+
+    Semantics mirror the engine exactly:
+      * COUNT(*) sums row weight; COUNT(col)/SUM/MIN/MAX/AVG skip NULL inputs.
+      * a group with no non-NULL input for an aggregate yields NULL there
+        (SUM/AVG/MIN/MAX), while COUNT(*) still counts the rows.
+      * integer SUM (and AVG's numerator) wrap mod 2**64 (engine ``wrapping_add``).
+      * MIN/MAX select by IEEE total order (matching ``encode_ordered`` / the
+        ``f64::total_cmp`` order) and emit the verbatim selected value.
+      * AVG = SUM / COUNT(col) as a single ``f64`` division.
+    """
+    idx = {name: i for i, name in enumerate(cols)}
+    arg_cols = {arg for (_o, _k, arg) in aggs if arg is not None}
+    groups = {}   # group-tuple -> {"weight": int, "vals": {arg_col: [(value, weight)]}}
+    for tup, w in rel.items():
+        if w <= 0:
+            continue
+        gkey = tuple(tup[idx[g]] for g in group_names)
+        slot = groups.get(gkey)
+        if slot is None:
+            slot = groups[gkey] = {"weight": 0, "vals": {a: [] for a in arg_cols}}
+        slot["weight"] += w
+        for a in arg_cols:
+            slot["vals"][a].append((tup[idx[a]], w))
+    out_cols = list(group_names) + [out for (out, _k, _a) in aggs]
+    weights = Counter()
+    for gkey, slot in groups.items():
+        row = list(gkey) + [_agg_value(kind, arg, slot) for (_o, kind, arg) in aggs]
+        weights[tuple(row)] += 1
+    return weights, out_cols
+
+
+def _agg_value(kind, arg, slot):
+    """Compute one aggregate over a group ``slot`` (see ``oracle_groupby_aggregate``)."""
+    if kind == "COUNT" and arg is None:
+        return slot["weight"]                                  # COUNT(*): row weight
+    nonnull = [(v, w) for (v, w) in slot["vals"][arg] if v is not None]
+    if kind == "COUNT":
+        return sum(w for (_v, w) in nonnull)                   # COUNT(col): non-null weight
+    if not nonnull:
+        return None                                            # empty / all-NULL group
+    if kind == "SUM":
+        return _wrap_i64(sum(v * w for (v, w) in nonnull))
+    if kind == "AVG":
+        total = _wrap_i64(sum(v * w for (v, w) in nonnull))
+        count = sum(w for (_v, w) in nonnull)
+        return float(total) / float(count)
+    if kind in ("MIN", "MAX"):
+        vals = [v for (v, _w) in nonnull]
+        return (min if kind == "MIN" else max)(vals, key=_total_order_key)
+    raise ValueError(f"oracle_groupby_aggregate: unknown agg kind {kind!r}")
+
+
+def _wrap_i64(x):
+    """Reduce a Python int to the signed 64-bit value the engine's ``wrapping_add``
+    accumulator holds — mod 2**64, two's-complement — so an integer SUM matches the
+    engine even on overflow."""
+    return ((x + (1 << 63)) % (1 << 64)) - (1 << 63)
+
+
+def _total_order_key(v):
+    """MIN/MAX selection order matching the engine. Floats use the IEEE-754 total
+    order (``f64::total_cmp`` / the order-preserving ``encode_ordered`` bit
+    transform), so -0.0 < +0.0 and NaN sorts at the extremes exactly as the engine
+    selects; every other type uses natural Python order."""
+    if isinstance(v, float):
+        b = struct.unpack("<Q", struct.pack("<d", v))[0]
+        return b ^ (0xFFFFFFFFFFFFFFFF if b >> 63 else 0x8000000000000000)
+    return v
+
+
 # ── view scan + comparison ─────────────────────────────────────────────────
+
+def _canon(v):
+    """Canonicalize a scanned/expected value for use as a ``Counter`` key.
+
+    A Python ``float`` becomes its raw IEEE-754 bits so bit-stable MIN/MAX (and
+    integer-AVG) outputs compare exactly: NaN then compares equal to itself and
+    -0.0 stays distinct from +0.0, which ``==`` would otherwise get wrong. All
+    other types (int/str/bytes/None) pass through unchanged.
+    """
+    return struct.pack("<d", v) if isinstance(v, float) else v
+
 
 def scan_multiset(client, view_tid, project):
     """Scan ``view_tid`` and return the weight-multiset over ``project`` columns.
@@ -141,13 +280,14 @@ def scan_multiset(client, view_tid, project):
     projected content (e.g. UNION ALL's two branches, distinct synthetic PKs)
     coalesce to one entry with the combined weight. The synthetic PKs
     ``_join_pk`` / ``_set_pk`` are excluded automatically — ``project`` only
-    lists meaningful columns, so they are never read. A negative *net* weight
-    means a retraction underflowed and is a hard error.
+    lists meaningful columns, so they are never read. Float columns are
+    canonicalized to bits (``_canon``) so MIN/MAX/AVG values compare bit-exactly.
+    A negative *net* weight means a retraction underflowed and is a hard error.
     """
     c = Counter()
     for r in client.scan(view_tid):
         d = r._asdict()
-        c[tuple(d[col] for col in project)] += r.weight
+        c[tuple(_canon(d[col]) for col in project)] += r.weight
     for k, w in c.items():
         assert w >= 0, f"negative net weight {w} for tuple {k} in view {view_tid}"
     return Counter({k: w for k, w in c.items() if w != 0})
@@ -157,9 +297,11 @@ def assert_view_matches(client, view_tid, project, expected, ctx=""):
     """Assert the view's weight-multiset equals ``expected``.
 
     On mismatch, prints a per-tuple expected-vs-actual weight diff for every
-    tuple that differs (missing, extra, or wrong weight).
+    tuple that differs (missing, extra, or wrong weight). Expected tuples are
+    float-canonicalized identically to the scan so MIN/MAX/AVG values match.
     """
-    expected = Counter({k: w for k, w in expected.items() if w != 0})
+    expected = Counter({tuple(_canon(v) for v in k): w
+                        for k, w in expected.items() if w != 0})
     actual = scan_multiset(client, view_tid, project)
     if actual == expected:
         return

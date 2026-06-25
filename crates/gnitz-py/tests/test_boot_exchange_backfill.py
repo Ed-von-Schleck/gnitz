@@ -27,9 +27,11 @@ import tempfile
 import time
 import shutil
 import signal
+from collections import Counter
 
 import pytest
 import gnitz
+import _oracle as oracle
 from _serverproc import server_preexec
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
@@ -516,6 +518,149 @@ def test_range_two_base_join_after_restart():
         assert all(w == 1 for w in p_w.values()), f"range join duplicated: {p_w}"
         assert set(p_w.keys()) == exp_pairs, \
             f"range join wrong after restart: got {len(p_w)} of {len(exp_pairs)} pairs"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── rebuild-equivalence for shapes the existing suites don't restart ────────────
+#
+# These crash-restart a populated server and assert each view's weight-multiset
+# (oracle.scan_multiset — float columns canonicalized to bits, net-zero tuples
+# dropped, weights summed per projected tuple) is byte-identical before and after.
+# They are *consistency* checks: rebuild drives the same incremental operator path
+# as live maintenance, so they pin the boot/backfill wiring (the historical
+# under-fill class) for shapes the value-asserting suites never restart — GROUP BY
+# MIN/MAX/AVG, every set-op, and DISTINCT across a crash. A float-column SUM/AVG
+# would be excluded from `project` (non-deterministic fold order); the integer
+# aggregates here are all bit-stable across rebuild, so every column is compared.
+
+
+def test_group_by_min_max_avg_after_restart():
+    """GROUP BY MIN/MAX/AVG must rebuild identically across a crash restart —
+    absent from both backfill suites, which restart only SUM/COUNT. A pre-restart
+    DELETE removes a group's MIN holder so the live trace carries a MIN-retraction
+    recompute before the snapshot. Integer AVG is part of the multiset and compared
+    by value (SUM and COUNT are exact integers, AVG one deterministic division)."""
+    tmpdir, data_dir, sock_path = _make_env("gnitz_gbmma_")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("mm")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NOT NULL)",
+            schema_name="mm",
+        )
+        conn.execute_sql(
+            "CREATE VIEW v AS SELECT g, MIN(a) AS lo, MAX(a) AS hi, AVG(a) AS av, "
+            "COUNT(*) AS c FROM t GROUP BY g",
+            schema_name="mm",
+        )
+        # 6 groups, ~10 rows each, spread `a` values so MIN/MAX/AVG are non-trivial
+        # and several AVGs are non-integral (exercising the f64 division).
+        rows = [(pk, pk % 6, (pk * 7) % 50) for pk in range(60)]
+        conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="mm")
+        # Delete group 0's MIN holder (pk=0, a=0) → live MIN(g=0) recomputes.
+        conn.execute_sql("DELETE FROM t WHERE pk = 0", schema_name="mm")
+
+        vid, _ = conn.resolve_table("mm", "v")
+        project = ["g", "lo", "hi", "av", "c"]
+        before = oracle.scan_multiset(conn, vid, project)
+        assert before, "MIN/MAX/AVG view must be non-empty before restart"
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vid, _ = conn.resolve_table("mm", "v")
+        after = oracle.scan_multiset(conn, vid, project)
+        assert after == before, (
+            f"MIN/MAX/AVG view diverged across rebuild:\nbefore={before}\nafter={after}")
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("op", ["UNION ALL", "UNION", "INTERSECT", "EXCEPT"])
+def test_set_op_after_restart(op):
+    """Each set-op must rebuild identically across a crash restart. UNION ALL's
+    weight-2 overlaps, the deduplicating ops' boundary state, and EXCEPT/INTERSECT
+    anti/semi-join traces all run through the boot backfill here — the existing vbf
+    suite covers only UNION, and only via the live-create path. A pre-restart DELETE
+    from `b` exercises the difference/intersection trace before the snapshot."""
+    tag = "".join(ch for ch in op.lower() if ch.isalpha())
+    tmpdir, data_dir, sock_path = _make_env(f"gnitz_so_{tag}_")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("so")
+        conn.execute_sql(
+            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name="so")
+        conn.execute_sql(
+            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name="so")
+        conn.execute_sql(
+            f"CREATE VIEW v AS SELECT val FROM a {op} SELECT val FROM b", schema_name="so")
+        # a.val in {0..19} (each twice), b.val in {10..29} (each twice): overlapping
+        # ranges so dedup / difference / intersection are all non-trivial, and
+        # duplicate vals within a side give UNION ALL weight > 1.
+        conn.execute_sql(
+            f"INSERT INTO a VALUES {_values([(i, i % 20) for i in range(40)])}", schema_name="so")
+        conn.execute_sql(
+            f"INSERT INTO b VALUES {_values([(i, (i % 20) + 10) for i in range(40)])}", schema_name="so")
+        # Remove both carriers of b.val=15 → 15 leaves b (re-enters EXCEPT, leaves
+        # INTERSECT) while staying in a.
+        conn.execute_sql("DELETE FROM b WHERE pk IN (5, 25)", schema_name="so")
+
+        vid, _ = conn.resolve_table("so", "v")
+        before = oracle.scan_multiset(conn, vid, ["val"])
+        assert before, f"{op} view must be non-empty before restart"
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vid, _ = conn.resolve_table("so", "v")
+        after = oracle.scan_multiset(conn, vid, ["val"])
+        assert after == before, (
+            f"{op} view diverged across rebuild:\nbefore={before}\nafter={after}")
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_distinct_after_restart():
+    """SELECT DISTINCT must rebuild identically across a crash restart. The vbf
+    suite covers DISTINCT only via live-create-over-data; this pins the boot
+    rebuild path for the non-linear distinct operator. Many rows share each value
+    (real dedup), and a pre-restart DELETE leaves every surviving value with at
+    least one carrier so the snapshot is a stable deduplicated set."""
+    tmpdir, data_dir, sock_path = _make_env("gnitz_distinct_")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("di")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)", schema_name="di")
+        conn.execute_sql("CREATE VIEW v AS SELECT DISTINCT g FROM t", schema_name="di")
+        # g = pk % 7 → 7 distinct values, each carried by ~9 rows.
+        rows = [(pk, pk % 7) for pk in range(60)]
+        conn.execute_sql(f"INSERT INTO t VALUES {_values(rows)}", schema_name="di")
+        # Drop one carrier of g=0 (pk=0) — g=0 keeps carriers pk=7,14,... so every
+        # distinct value still survives.
+        conn.execute_sql("DELETE FROM t WHERE pk = 0", schema_name="di")
+
+        vid, _ = conn.resolve_table("di", "v")
+        before = oracle.scan_multiset(conn, vid, ["g"])
+        assert before == Counter({(g,): 1 for g in range(7)}), f"unexpected pre-restart set: {before}"
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vid, _ = conn.resolve_table("di", "v")
+        after = oracle.scan_multiset(conn, vid, ["g"])
+        assert after == before, (
+            f"DISTINCT view diverged across rebuild:\nbefore={before}\nafter={after}")
         conn.close()
         _stop_server(proc)
     finally:

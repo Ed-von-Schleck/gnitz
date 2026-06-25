@@ -4007,6 +4007,79 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
     );
 }
 
+#[test]
+fn test_reduce_min_group_by_pk_retracts_extreme() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    // group_by_pk MIN replay path (`advance_to` + `for_each_pk_group_row`) over a
+    // non-unique-PK input: one PK carrying two payloads, GROUP BY the full PK.
+    // Retracting the payload that holds the current MIN must recompute MIN from
+    // the survivor. This exercises the `fill_cleared_batch` → `consolidate_if_needed`
+    // cancellation in the replay buffer: if the refilled batch is wrongly flagged
+    // consolidated, the retracted (pk=1, val=10) keeps its positive trace copy and
+    // MIN stays 10 instead of moving to 20.
+    let in_schema = make_schema_u64_i64();
+    let out_schema = make_pk_sum_out_schema(); // [U128 pk, I64 agg (nullable)]
+
+    // trace_in: pk=1 with two payloads (val=10, val=20). The group IS the PK, so
+    // both belong to group pk=1; MIN(10, 20) = 10.
+    let ti = make_batch(&in_schema, &[(1, 1, 10), (1, 1, 20)]).into_inner();
+    let mut ti_ch = CursorHandle::from_owned(&[Rc::new(ti)], in_schema);
+
+    // trace_out: old MIN(pk=1) = 10.
+    let mut prev = Batch::with_schema(out_schema, 1);
+    prev.extend_pk(1u128);
+    prev.extend_weight(&1i64.to_le_bytes());
+    prev.extend_null_bmp(&0u64.to_le_bytes());
+    prev.extend_col(0, &10i64.to_le_bytes());
+    prev.count += 1;
+    prev.sorted = true;
+    prev.consolidated = true;
+    let mut to_ch = CursorHandle::from_owned(&[Rc::new(prev)], out_schema);
+
+    // Delta: retract (pk=1, val=10) — the payload holding the current MIN.
+    let delta = make_batch(&in_schema, &[(1, -1, 10)]).into_inner();
+
+    let agg = AggDescriptor {
+        col_idx: 1,
+        agg_op: AggOp::Min,
+        col_type_code: TypeCode::I64,
+        _pad: [0; 2],
+    };
+
+    let (out, _) = op_reduce(
+        &delta,
+        Some(ti_ch.cursor_mut()),
+        to_ch.cursor_mut(),
+        &in_schema,
+        &out_schema,
+        &[0u32], // GROUP BY PK col 0 → group_by_pk replay path
+        &[agg],
+        None,
+        false,
+        TypeCode::U64,
+        None,
+        0,
+        None,
+        None,
+    );
+
+    // Retract old MIN=10 (w=-1) + emit new MIN=20 (w=+1). With the consolidation
+    // bug the survivor and the retracted copy both step, MIN stays 10, and the
+    // emitted +1 row carries 10 instead of 20.
+    assert_eq!(out.count, 2, "one retract + one re-emit for pk=1");
+    let mut by_w: Vec<(i64, i64)> = (0..out.count)
+        .map(|i| (out.get_weight(i), read_i64_le(out.col_data(0), i * 8)))
+        .collect();
+    by_w.sort_by_key(|&(w, _)| w);
+    assert_eq!(
+        by_w,
+        vec![(-1, 10), (1, 20)],
+        "retract old MIN=10, insert new MIN=20 after the val=10 payload is retracted",
+    );
+}
+
 // -----------------------------------------------------------------------
 // sort_owned / op_gather_reduce canonical PK order
 //
