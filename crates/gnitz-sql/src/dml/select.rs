@@ -14,7 +14,7 @@ use crate::exec::batch::{apply_limit, apply_projection};
 use crate::exec::residual::residual_filtered;
 use crate::SqlResult;
 use gnitz_core::{ClientError, GnitzClient};
-use sqlparser::ast::{Query, SetExpr};
+use sqlparser::ast::{Distinct, GroupByExpr, LimitClause, Query, SetExpr};
 use std::sync::Arc;
 
 pub(crate) fn execute_select(
@@ -36,6 +36,68 @@ pub(crate) fn execute_select(
             ))
         }
     };
+
+    // Direct SELECT is a thin seek/scan plus stateless client-side project/limit, with
+    // no operator for set/group semantics or row-offset. These clauses are silently
+    // dropped today — each a silent wrong result. Reject them, as ORDER BY and a
+    // non-indexed WHERE already are.
+
+    // DISTINCT: a dropped dedup returns duplicates whenever the projection is not a
+    // unique key (a strict subset of a compound PK, or a column subset of a view).
+    // Plain DISTINCT belongs in a CREATE VIEW (real incremental distinct). DISTINCT ON
+    // needs an ORDER BY this path forbids and no CREATE VIEW accepts it, so it is
+    // rejected outright with no redirect.
+    match &select.distinct {
+        Some(Distinct::On(_)) => {
+            return Err(GnitzSqlError::Unsupported(
+                "DISTINCT ON is not supported in direct SELECT".to_string(),
+            ))
+        }
+        Some(Distinct::Distinct) => {
+            return Err(GnitzSqlError::Unsupported(
+                "DISTINCT is not supported in direct SELECT; use a CREATE VIEW".to_string(),
+            ))
+        }
+        None => {}
+    }
+
+    // GROUP BY / HAVING: no reduce here; grouped aggregation and per-group filtering
+    // belong in a CREATE VIEW.
+    let has_group_by = match &select.group_by {
+        GroupByExpr::All(_) => true,
+        GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+    };
+    if has_group_by {
+        return Err(GnitzSqlError::Unsupported(
+            "GROUP BY is not supported in direct SELECT; use a CREATE VIEW".to_string(),
+        ));
+    }
+    if select.having.is_some() {
+        return Err(GnitzSqlError::Unsupported(
+            "HAVING is not supported in direct SELECT; use a CREATE VIEW".to_string(),
+        ));
+    }
+
+    // OFFSET / LIMIT…BY / FETCH: silently discarded (the `..` in extract_limit;
+    // query.fetch is never read). Meaningless without an ORDER BY this path forbids.
+    match &query.limit_clause {
+        Some(LimitClause::OffsetCommaLimit { .. }) | Some(LimitClause::LimitOffset { offset: Some(_), .. }) => {
+            return Err(GnitzSqlError::Unsupported(
+                "OFFSET is not supported in direct SELECT".to_string(),
+            ))
+        }
+        Some(LimitClause::LimitOffset { limit_by, .. }) if !limit_by.is_empty() => {
+            return Err(GnitzSqlError::Unsupported(
+                "LIMIT ... BY is not supported in direct SELECT".to_string(),
+            ))
+        }
+        _ => {}
+    }
+    if query.fetch.is_some() {
+        return Err(GnitzSqlError::Unsupported(
+            "FETCH is not supported in direct SELECT".to_string(),
+        ));
+    }
 
     // Exactly one FROM table, no joins
     if select.from.len() != 1 {

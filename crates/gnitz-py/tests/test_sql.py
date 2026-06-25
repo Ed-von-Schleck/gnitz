@@ -207,6 +207,41 @@ class TestSqlSelect:
         finally:
             client.drop_schema(sn)
 
+    def test_select_unsupported_clauses_rejected(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup_with_rows(client, sn)
+            # DISTINCT is *accepted today* on `pk` — it returns rows with the dedup
+            # silently dropped (correct only because pk is unique). The guard must
+            # intercept it, turning a previously-accepted query into an explicit error.
+            with pytest.raises(gnitz.GnitzError, match="DISTINCT is not supported"):
+                client.execute_sql("SELECT DISTINCT pk FROM t", schema_name=sn)
+            # DISTINCT ON gets its own message (no CREATE VIEW redirect).
+            with pytest.raises(gnitz.GnitzError, match="DISTINCT ON is not supported"):
+                client.execute_sql("SELECT DISTINCT ON (pk) pk FROM t", schema_name=sn)
+            # GROUP BY: returns ungrouped rows today.
+            with pytest.raises(gnitz.GnitzError, match="GROUP BY is not supported"):
+                client.execute_sql("SELECT pk FROM t GROUP BY pk", schema_name=sn)
+            # HAVING: predicate silently dropped today.
+            with pytest.raises(gnitz.GnitzError, match="HAVING is not supported"):
+                client.execute_sql("SELECT pk FROM t HAVING pk > 0", schema_name=sn)
+            # OFFSET: skip silently ignored today (returns the first LIMIT rows).
+            with pytest.raises(gnitz.GnitzError, match="OFFSET is not supported"):
+                client.execute_sql("SELECT * FROM t LIMIT 2 OFFSET 1", schema_name=sn)
+            # FETCH: silently dropped today.
+            with pytest.raises(gnitz.GnitzError, match="FETCH is not supported"):
+                client.execute_sql("SELECT * FROM t FETCH FIRST 2 ROWS ONLY", schema_name=sn)
+            # Ordinary direct SELECT and plain LIMIT are unaffected.
+            res = client.execute_sql("SELECT pk FROM t", schema_name=sn)
+            assert res[0]["type"] == "Rows"
+            assert len(res[0]["rows"]) == 5
+            res2 = client.execute_sql("SELECT * FROM t LIMIT 2", schema_name=sn)
+            assert len(res2[0]["rows"]) == 2
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
 
 # ---------------------------------------------------------------------------
 # TestSqlCreateView
