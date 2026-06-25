@@ -154,6 +154,14 @@ def main():
         merge_summaries(output_dir)
     print_summary_table(output_dir)
 
+    # Surface profiling artifacts (only present under --perf / --perf-dwarf).
+    for perf_data in sorted(output_dir.rglob("perf.data")):
+        print(f"\nperf.data: {perf_data}")
+        flame = perf_data.with_name("flamegraph.svg")
+        if flame.exists():
+            print(f"flamegraph: {flame}")
+        print(f"  inspect: perf report -i {perf_data}")
+
 
 if __name__ == "__main__":
     main()
