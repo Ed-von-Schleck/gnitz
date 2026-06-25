@@ -7,10 +7,12 @@ use crate::bind::{bind_single_table, Binder};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::lower::compile_bound_expr_to_program;
-use crate::plan::validate::{reject_duplicate_column_names, reject_float_keys};
+use crate::plan::validate::{
+    reject_duplicate_column_names, reject_float_keys, reject_unhonored_select_clauses, HonoredClauses,
+};
 use crate::SqlResult;
 use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, Schema, TypeCode};
-use sqlparser::ast::{SelectItem, SetExpr, SetOperator, SetQuantifier};
+use sqlparser::ast::{Distinct, SelectItem, SetExpr, SetOperator, SetQuantifier};
 
 fn compile_set_op_side(
     client: &mut GnitzClient,
@@ -20,6 +22,18 @@ fn compile_set_op_side(
     branch_id: u8,
     context: &str,
 ) -> Result<(gnitz_core::NodeId, Vec<ColumnDef>, u64), GnitzSqlError> {
+    // Honor only FROM, WHERE, and the projection here. The DISTINCT-view caller dedups
+    // plain DISTINCT after this returns; the set-op caller rejects a plain branch DISTINCT
+    // before calling in. Reject every other clause so none is silently dropped (a wrong result).
+    reject_unhonored_select_clauses(
+        select,
+        HonoredClauses {
+            where_filter: true,
+            grouping: false,
+        },
+        context,
+    )?;
+
     if select.from.len() != 1 || !select.from[0].joins.is_empty() {
         return Err(GnitzSqlError::Unsupported(format!(
             "{context}: only a single table without JOINs is supported"
@@ -149,6 +163,19 @@ pub(crate) fn execute_create_set_op_view(
             ))
         }
     };
+
+    // The funnel (compile_set_op_side) honors plain DISTINCT only for the DISTINCT-view caller,
+    // which dedups after it. A set-op branch is not deduplicated per branch, so a branch DISTINCT
+    // would be silently dropped — under UNION ALL that leaks duplicates. The funnel rejects
+    // DISTINCT ON for both callers; this covers plain branch DISTINCT, the one clause whose
+    // support differs by caller.
+    for (branch, side) in [(left_select, "left"), (right_select, "right")] {
+        if matches!(&branch.distinct, Some(Distinct::Distinct)) {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "set operation: DISTINCT on the {side} branch is not supported"
+            )));
+        }
+    }
 
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, 0);

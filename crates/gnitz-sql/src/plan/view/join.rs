@@ -6,7 +6,7 @@
 use crate::ast_util::{extract_table_factor_name, is_wildcard_projection};
 use crate::bind::{resolve_qualified_column, resolve_unqualified_column, AliasMap, Binder, ResolvedRelation};
 use crate::error::GnitzSqlError;
-use crate::plan::validate::reject_duplicate_column_names;
+use crate::plan::validate::{reject_duplicate_column_names, reject_unhonored_select_clauses, HonoredClauses};
 use crate::plan::view::predicates::{
     build_reindex_program, build_residual_filter_prog, converse_rel, extract_join_predicates, multi_null_filter_prog,
     pure_range_m_output_cols, RangeConjunct,
@@ -72,6 +72,17 @@ pub(crate) fn execute_create_join_view(
     select: &sqlparser::ast::Select,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
+    // Join views consume only the FROM/ON join and the projection — not a top-level WHERE
+    // (no builder reads it) nor GROUP BY/HAVING/PREWHERE/… Reject all of them so a dropped
+    // clause is a clean error; a WHERE belongs over a wrapping view.
+    reject_unhonored_select_clauses(
+        select,
+        HonoredClauses {
+            where_filter: false,
+            grouping: false,
+        },
+        "CREATE VIEW JOIN",
+    )?;
     // Extract left table
     let left_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW JOIN")?;
     let left_alias = match &select.from[0].relation {

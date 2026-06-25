@@ -17,6 +17,19 @@ pub(crate) fn is_wildcard_projection(projection: &[sqlparser::ast::SelectItem]) 
         .all(|p| matches!(p, sqlparser::ast::SelectItem::Wildcard(_)))
 }
 
+/// True when a SELECT carries a GROUP BY — either `GROUP BY ALL` or a non-empty
+/// grouping-column list. sqlparser emits `Expressions([])` for a GROUP-BY-less
+/// SELECT, which is *not* present. `GROUP BY ALL` counts as present so it is
+/// classified/rejected, never silently dropped. The single definition behind
+/// every "is this SELECT grouped?" test.
+pub(crate) fn group_by_is_present(group_by: &sqlparser::ast::GroupByExpr) -> bool {
+    use sqlparser::ast::GroupByExpr;
+    match group_by {
+        GroupByExpr::All(_) => true,
+        GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+    }
+}
+
 /// Extract table name from a TableFactor::Table.
 pub(crate) fn extract_table_factor_name(
     tf: &sqlparser::ast::TableFactor,

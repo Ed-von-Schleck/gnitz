@@ -8,7 +8,9 @@ use crate::bind::{bind_single_table, bind_structural, find_unique_column, Binder
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr};
 use crate::lower::compile_bound_expr_to_program;
-use crate::plan::validate::{reject_duplicate_column_names, reject_float_key};
+use crate::plan::validate::{
+    reject_duplicate_column_names, reject_float_key, reject_unhonored_select_clauses, HonoredClauses,
+};
 use crate::types::{is_integer_type, is_min_max_orderable, is_wide_int};
 use crate::SqlResult;
 use gnitz_core::{
@@ -142,6 +144,16 @@ pub(crate) fn execute_create_group_by_view(
     select: &sqlparser::ast::Select,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
+    // Grouped views consume FROM, WHERE, GROUP BY, HAVING, and the projection; reject every
+    // other clause (PREWHERE, TOP, QUALIFY, …) so a dropped clause is a clean error.
+    reject_unhonored_select_clauses(
+        select,
+        HonoredClauses {
+            where_filter: true,
+            grouping: true,
+        },
+        "CREATE VIEW",
+    )?;
     // 1. Resolve source table
     let table_name = extract_table_factor_name(&select.from[0].relation, "GROUP BY")?;
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;

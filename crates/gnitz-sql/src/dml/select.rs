@@ -4,7 +4,7 @@
 //! there is no predicate full-scan fallback — a WHERE no index can serve is a
 //! clean error, not a table scan.
 
-use crate::ast_util::extract_table_factor_name;
+use crate::ast_util::{extract_table_factor_name, group_by_is_present};
 use crate::bind::{bind_single_table, Binder};
 use crate::dml::plan::{
     collect_index_range_candidates, collect_index_seek_candidates, extract_limit, try_extract_pk_seek_residual,
@@ -14,7 +14,7 @@ use crate::exec::batch::{apply_limit, apply_projection};
 use crate::exec::residual::residual_filtered;
 use crate::SqlResult;
 use gnitz_core::{ClientError, GnitzClient};
-use sqlparser::ast::{Distinct, GroupByExpr, LimitClause, Query, SetExpr};
+use sqlparser::ast::{Distinct, LimitClause, Query, SetExpr};
 use std::sync::Arc;
 
 pub(crate) fn execute_select(
@@ -63,11 +63,7 @@ pub(crate) fn execute_select(
 
     // GROUP BY / HAVING: no reduce here; grouped aggregation and per-group filtering
     // belong in a CREATE VIEW.
-    let has_group_by = match &select.group_by {
-        GroupByExpr::All(_) => true,
-        GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
-    };
-    if has_group_by {
+    if group_by_is_present(&select.group_by) {
         return Err(GnitzSqlError::Unsupported(
             "GROUP BY is not supported in direct SELECT; use a CREATE VIEW".to_string(),
         ));

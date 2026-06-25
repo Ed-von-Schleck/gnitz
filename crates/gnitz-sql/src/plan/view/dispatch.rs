@@ -2,13 +2,13 @@
 //! the view's shape, and dispatch to the matching builder. The single module in
 //! `plan/view` that knows about all the others.
 
-use crate::ast_util::{extract_name, extract_table_factor_name, is_wildcard_projection};
+use crate::ast_util::{extract_name, extract_table_factor_name, group_by_is_present, is_wildcard_projection};
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::plan::view::{group_by, join, set_op, simple};
 use crate::SqlResult;
 use gnitz_core::GnitzClient;
-use sqlparser::ast::{Expr, GroupByExpr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement};
+use sqlparser::ast::{Expr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement};
 
 pub(crate) fn execute_create_view(
     client: &mut GnitzClient,
@@ -28,6 +28,13 @@ pub(crate) fn execute_create_view(
     if query.limit_clause.is_some() {
         return Err(GnitzSqlError::Unsupported(
             "LIMIT and OFFSET are not supported in VIEW definitions".into(),
+        ));
+    }
+    // FETCH (FETCH FIRST n ROWS ONLY) is a row-limit on the Query, separate from limit_clause and
+    // invisible to the per-Select builders. Like LIMIT, it has no incremental-view semantics.
+    if query.fetch.is_some() {
+        return Err(GnitzSqlError::Unsupported(
+            "FETCH is not supported in VIEW definitions".into(),
         ));
     }
 
@@ -113,7 +120,10 @@ impl<'a> ViewShape<'a> {
             }
         };
 
-        // DISTINCT is checked before the single-FROM requirement.
+        // DISTINCT is checked before the single-FROM requirement. Both plain DISTINCT and DISTINCT
+        // ON route here; the shared side-compiler (compile_set_op_side) honors only FROM/WHERE/
+        // projection and rejects every other clause (DISTINCT ON, GROUP BY, HAVING, PREWHERE, TOP,
+        // …), none of which has incremental-view semantics here.
         if select.distinct.is_some() {
             return Ok(ViewShape::Distinct(select));
         }
@@ -126,11 +136,7 @@ impl<'a> ViewShape<'a> {
         if !select.from[0].joins.is_empty() {
             return Ok(ViewShape::Join(select));
         }
-        let has_group_by = match &select.group_by {
-            GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
-            _ => false,
-        };
-        if has_group_by {
+        if group_by_is_present(&select.group_by) {
             return Ok(ViewShape::GroupBy(select));
         }
         Ok(ViewShape::Simple(select))
@@ -189,12 +195,10 @@ fn inline_ctes(client: &mut GnitzClient, query: &Query, binder: &mut Binder<'_>)
                             _ => false,
                         }
                     }));
-            let has_group_by = matches!(&cte_select.group_by,
-                GroupByExpr::Expressions(e, _) if !e.is_empty());
             if cte_select.selection.is_some()
                 || cte_select.having.is_some()
                 || cte_select.distinct.is_some()
-                || has_group_by
+                || group_by_is_present(&cte_select.group_by)
                 || cte.query.order_by.is_some()
                 || cte.query.limit_clause.is_some()
                 || !proj_is_identity

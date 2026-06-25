@@ -89,3 +89,115 @@ pub(crate) fn reject_non_key_eligible(name: &str, tc: TypeCode, role: &str) -> R
     }
     Ok(())
 }
+
+/// The `Select` clauses a view shape legitimately consumes, beyond the universal
+/// `from` + `projection`. Passed to [`reject_unhonored_select_clauses`]; every
+/// clause not named here (and not honored unconditionally) is rejected.
+#[derive(Clone, Copy)]
+pub(crate) struct HonoredClauses {
+    /// A top-level `WHERE` filter. Honored by every shape except the join
+    /// builder, which consumes only the `ON` predicate — a join-view `WHERE` has
+    /// no builder and would be dropped.
+    pub where_filter: bool,
+    /// `GROUP BY` and its `HAVING`. Honored only by the grouped-aggregate builder.
+    pub grouping: bool,
+}
+
+/// Reject any `Select` clause a view builder does not consume. Each CREATE VIEW
+/// builder reads a hand-picked subset of the parsed `Select`; without this guard
+/// every unread clause (PREWHERE, TOP, QUALIFY, a join-view WHERE, …) is silently
+/// dropped, turning the view the caller wrote into a different one that runs and
+/// returns rows — a silent wrong result. `honored` names the clauses *this* shape
+/// consumes; `context` names the surface for the message.
+///
+/// `distinct` is split out: `DISTINCT ON` is always rejected (non-deterministic
+/// without an ORDER BY views forbid); plain `DISTINCT` is routed to the
+/// DISTINCT-view shape by the classifier and rejected per-branch by the set-op
+/// caller, so it falls through this guard untouched.
+///
+/// The match is an exhaustive destructure with no `..`: when a future
+/// `sqlparser` bump adds a `Select` field, this stops compiling until the new
+/// field is classified honored-or-rejected — converting a silent-drop-on-upgrade
+/// into a build break.
+pub(crate) fn reject_unhonored_select_clauses(
+    select: &sqlparser::ast::Select,
+    honored: HonoredClauses,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    use sqlparser::ast::Distinct;
+    let sqlparser::ast::Select {
+        // Read by every view builder.
+        from: _,
+        projection: _,
+        // Conditionally honored (see `HonoredClauses`); `distinct` handled below.
+        selection,
+        distinct,
+        group_by,
+        having,
+        // Never honored: each carries semantics no view builder implements.
+        top,
+        into,
+        prewhere,
+        qualify,
+        connect_by,
+        lateral_views,
+        cluster_by,
+        distribute_by,
+        sort_by,
+        named_window,
+        // Inert: parser tokens, positional flags for an already-checked clause
+        // (`top`/`qualify`/`distinct`), or a clause the GenericDialect never
+        // produces (`value_table_mode` is BigQuery-only). No droppable semantics.
+        select_token: _,
+        top_before_distinct: _,
+        window_before_qualify: _,
+        value_table_mode: _,
+        flavor: _,
+    } = select;
+
+    let reject = |clause: &str| GnitzSqlError::Unsupported(format!("{context}: {clause} is not supported"));
+
+    if matches!(distinct, Some(Distinct::On(_))) {
+        return Err(reject("DISTINCT ON"));
+    }
+    if !honored.where_filter && selection.is_some() {
+        return Err(reject("WHERE"));
+    }
+    if !honored.grouping && crate::ast_util::group_by_is_present(group_by) {
+        return Err(reject("GROUP BY"));
+    }
+    if !honored.grouping && having.is_some() {
+        return Err(reject("HAVING"));
+    }
+    if top.is_some() {
+        return Err(reject("TOP"));
+    }
+    if prewhere.is_some() {
+        return Err(reject("PREWHERE"));
+    }
+    if into.is_some() {
+        return Err(reject("SELECT INTO"));
+    }
+    if qualify.is_some() {
+        return Err(reject("QUALIFY"));
+    }
+    if connect_by.is_some() {
+        return Err(reject("CONNECT BY"));
+    }
+    if !lateral_views.is_empty() {
+        return Err(reject("LATERAL VIEW"));
+    }
+    if !cluster_by.is_empty() {
+        return Err(reject("CLUSTER BY"));
+    }
+    if !distribute_by.is_empty() {
+        return Err(reject("DISTRIBUTE BY"));
+    }
+    if !sort_by.is_empty() {
+        return Err(reject("SORT BY"));
+    }
+    if !named_window.is_empty() {
+        return Err(reject("WINDOW"));
+    }
+    Ok(())
+}

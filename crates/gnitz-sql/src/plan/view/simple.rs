@@ -7,7 +7,7 @@ use crate::bind::{bind_single_table, Binder};
 use crate::codec::project_schema::{build_projection, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::lower::{compile_bound_expr, compile_bound_expr_to_program};
-use crate::plan::validate::reject_duplicate_column_names;
+use crate::plan::validate::{reject_duplicate_column_names, reject_unhonored_select_clauses, HonoredClauses};
 use crate::SqlResult;
 use gnitz_core::{CircuitBuilder, ExprBuilder, GnitzClient};
 
@@ -19,6 +19,16 @@ pub(crate) fn execute_create_simple_view(
     select: &sqlparser::ast::Select,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
+    // Filter/map views consume only WHERE + projection; reject the rest (GROUP BY, HAVING,
+    // PREWHERE, TOP, …) so a dropped clause is a clean error, not a silent wrong result.
+    reject_unhonored_select_clauses(
+        select,
+        HonoredClauses {
+            where_filter: true,
+            grouping: false,
+        },
+        "CREATE VIEW",
+    )?;
     let table_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW")?;
 
     let (source_tid, source_schema) = binder.resolve(client, &table_name)?;

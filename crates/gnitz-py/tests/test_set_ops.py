@@ -4,6 +4,7 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_set_ops.py -v --tb=short
 """
 import random
+import pytest
 import gnitz
 import _oracle as oracle
 
@@ -339,6 +340,97 @@ class TestSetOps:
             rows = client.scan(vid)
             vals = sorted(r["val"] for r in rows)
             assert vals == [20, 99], f"expected [20, 99] after update, got {vals}"
+        finally:
+            client.drop_schema(sn)
+
+    def test_view_rejects_silently_dropped_clauses(self, client):
+        """Every CREATE VIEW shape (simple, grouped, join, set-op, DISTINCT) reads only a
+        hand-picked subset of the SELECT. A clause a shape does not consume must be rejected,
+        not silently dropped — a dropped clause runs a different query than the caller wrote."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)", schema_name=sn
+            )
+
+            def rejects(sql, msg):
+                with pytest.raises(gnitz.GnitzError, match=msg):
+                    client.execute_sql(sql, schema_name=sn)
+
+            # --- DISTINCT ON: single SELECT, set-op branch, and the degenerate shape ---
+            # (degenerate `DISTINCT ON (a) a` == `DISTINCT a` but is rejected ON PURPOSE —
+            # not worth an ON-list/projection equivalence check.)
+            for sql in (
+                "CREATE VIEW v AS SELECT DISTINCT ON (a) a, b FROM t",
+                "CREATE VIEW v AS SELECT DISTINCT ON (a) a FROM t UNION SELECT b FROM t",
+                "CREATE VIEW v AS SELECT DISTINCT ON (a) a FROM t",
+            ):
+                rejects(sql, "DISTINCT ON is not supported")
+
+            # --- GROUP BY / HAVING dropped in the DISTINCT-view and set-op-branch paths ---
+            rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t GROUP BY a", "GROUP BY is not supported")
+            rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t HAVING a > 0", "HAVING is not supported")
+            rejects(
+                "CREATE VIEW v AS SELECT a FROM t GROUP BY a UNION ALL SELECT b FROM t",
+                "GROUP BY is not supported",
+            )
+            # HAVING on a non-grouped (simple) view: no reduce, the predicate never runs.
+            rejects("CREATE VIEW v AS SELECT a FROM t HAVING a > 0", "HAVING is not supported")
+
+            # --- PREWHERE (dropped filter) and TOP (dropped limit), across shapes ---
+            rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t PREWHERE a > 5", "PREWHERE is not supported")
+            rejects("CREATE VIEW v AS SELECT a FROM t PREWHERE a > 5", "PREWHERE is not supported")
+            rejects(
+                "CREATE VIEW v AS SELECT a, COUNT(*) FROM t PREWHERE a > 5 GROUP BY a",
+                "PREWHERE is not supported",
+            )
+            rejects("CREATE VIEW v AS SELECT DISTINCT TOP 5 a FROM t", "TOP is not supported")
+
+            # --- exotic clauses now each report by name (QUALIFY on DISTINCT, SORT BY on simple) ---
+            rejects(
+                "CREATE VIEW v AS SELECT DISTINCT a FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY a) = 1",
+                "QUALIFY is not supported",
+            )
+            rejects("CREATE VIEW v AS SELECT a FROM t SORT BY a", "SORT BY is not supported")
+
+            # --- a top-level WHERE on a JOIN view has no builder and would be dropped ---
+            rejects(
+                "CREATE VIEW v AS SELECT t.a FROM t JOIN u ON t.pk = u.pk WHERE t.a > 5",
+                "WHERE is not supported",
+            )
+
+            # --- GROUP BY ALL must be classified, never routed to the simple path and dropped ---
+            rejects("CREATE VIEW v AS SELECT a FROM t GROUP BY ALL", "GROUP BY")
+
+            # --- FETCH dropped at the view front door (Query-level row-limit) ---
+            rejects("CREATE VIEW v AS SELECT a FROM t FETCH FIRST 5 ROWS ONLY", "FETCH is not supported")
+
+            # --- plain branch DISTINCT (caller check; would leak dups under UNION ALL) ---
+            rejects(
+                "CREATE VIEW v AS SELECT DISTINCT a FROM t UNION ALL SELECT b FROM t",
+                "DISTINCT on the .* branch is not supported",
+            )
+
+            # --- every honored shape still compiles (positive controls) ---
+            ok = {
+                "vsimple": "SELECT a, b FROM t WHERE a > 0",
+                "vdistinct": "SELECT DISTINCT a, b FROM t",
+                "vgroup": "SELECT a, COUNT(*) FROM t GROUP BY a",
+                "vjoin": "SELECT t.a, u.c FROM t JOIN u ON t.pk = u.pk",
+                "vsetop": "SELECT a FROM t UNION ALL SELECT b FROM t",
+            }
+            for name, body in ok.items():
+                client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=sn)
+                client.resolve_table(sn, name)  # registered (raises if absent)
+                client.execute_sql(f"DROP VIEW {name}", schema_name=sn)
+
+            client.execute_sql("DROP TABLE u", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
             client.drop_schema(sn)
 
