@@ -49,6 +49,20 @@ pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
     }
 }
 
+/// OPK byte-equality of two **equal-length** PK regions (a full PK, or a shared
+/// equi-prefix sliced to the same width on both sides) — the equality sibling of
+/// [`compare_pk_ordering`]. `pk_bytes_eq(a, b) == (a == b)` at every width: for
+/// `len ≤ 16` the executed path is the register `pack_pk_be` compare with no
+/// `bcmp`/`memcmp` call (OPK encoding is a bijection, so the left-aligned `u128`
+/// images are equal iff the keys are byte-equal); for `len > 16` it confirms a
+/// leading-16 prefix tie with the full `compare_pk_bytes`. Operates under the same
+/// equal-width contract as `compare_pk_ordering`. Use at every merge/group fold or
+/// probe that tests "same PK".
+#[inline(always)]
+pub(crate) fn pk_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    compare_pk_ordering(a, b) == Ordering::Equal
+}
+
 // ---------------------------------------------------------------------------
 // Order-preserving PK encoder
 // ---------------------------------------------------------------------------
@@ -677,6 +691,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pk_bytes_eq_matches_byte_equality_direct() {
+        // Wide (> 16): fully-equal → true; equal leading-16 prefix, differing
+        // suffix → false (the tiebreak arm, otherwise only covered two layers up).
+        let mut a = [0u8; 24];
+        let mut b = [0u8; 24];
+        for i in 0..24 {
+            a[i] = i as u8;
+            b[i] = i as u8;
+        }
+        assert!(pk_bytes_eq(&a, &b));
+        b[16] ^= 1;
+        assert!(!pk_bytes_eq(&a, &b));
+        assert_eq!(pk_bytes_eq(&a, &b), a[..] == b[..]);
+        // Narrow (≤ 16): the register arm, equal and unequal.
+        let x = [1u8; 8];
+        let mut y = [1u8; 8];
+        assert!(pk_bytes_eq(&x, &y));
+        y[7] = 2;
+        assert!(!pk_bytes_eq(&x, &y));
+    }
+
     // -----------------------------------------------------------------------
     // OPK ↔ compare_pk_bytes property test
     // -----------------------------------------------------------------------
@@ -739,6 +775,24 @@ mod tests {
                     compare_pk_ordering(&oa, &ob) == std::cmp::Ordering::Equal,
                     oa == ob
                 );
+            }
+        }
+
+        proptest! {
+            /// `pk_bytes_eq` is exactly byte-equality of the OPK regions at every
+            /// PK width — the register-arm narrow case and the prefix-tiebreak wide
+            /// case alike — the property every "same PK" merge/group fold relies on.
+            #[test]
+            fn pk_bytes_eq_matches_byte_equality((types, perm, a, b) in arb_pk_case()) {
+                let cols: Vec<SchemaColumn> =
+                    types.iter().map(|&tc| SchemaColumn::new(tc, 0)).collect();
+                let s = SchemaDescriptor::new(&cols, &perm);
+                let stride = s.pk_stride() as usize;
+                let (mut oa, mut ob) = (vec![0u8; stride], vec![0u8; stride]);
+                encode_order_preserving_pk(&s, &a, &mut oa);
+                encode_order_preserving_pk(&s, &b, &mut ob);
+                prop_assert_eq!(pk_bytes_eq(&oa, &ob), oa == ob);
+                prop_assert!(pk_bytes_eq(&oa, &oa));
             }
         }
     }

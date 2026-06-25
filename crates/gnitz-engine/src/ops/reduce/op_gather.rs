@@ -1,7 +1,7 @@
 //! Gather-reduce: merge partial aggregate deltas from workers.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ReadCursor};
+use crate::storage::{pk_bytes_eq, Batch, ReadCursor};
 
 use super::agg::{fold_old_aggs, readback_agg_bits, Accumulator, AggDescriptor};
 use super::emit::emit_gather_row;
@@ -59,7 +59,7 @@ pub fn op_gather_reduce(
         // Accumulate all partial deltas for this group; a NULL partial
         // contributes nothing (combining its zero bytes would corrupt MIN/MAX —
         // e.g. global MIN(5, 0) = 0 — and saturate has_value for SUM).
-        while idx < n && smb.get_pk_bytes(idx) == group_pk_bytes {
+        while idx < n && pk_bytes_eq(smb.get_pk_bytes(idx), group_pk_bytes) {
             let w = smb.get_weight(idx);
             let in_null_word = smb.get_null_word(idx);
             for k in 0..num_aggs {

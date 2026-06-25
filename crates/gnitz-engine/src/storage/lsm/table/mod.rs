@@ -559,7 +559,7 @@ impl Table {
 
         self.shard_index.find_pk_bytes(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
-            while idx < shard_rc.count && shard_rc.get_pk_bytes(idx) == key {
+            while idx < shard_rc.count && columnar::pk_bytes_eq(shard_rc.get_pk_bytes(idx), key) {
                 let ord = columnar::compare_rows(&self.schema, shard_rc.as_ref(), idx, ref_source, ref_row);
                 if ord == Ordering::Equal {
                     total_w += shard_rc.get_weight(idx);
@@ -634,7 +634,7 @@ impl Table {
 
         self.shard_index.find_pk_bytes(key, &mut |shard_rc, start_idx| {
             let mut idx = start_idx;
-            while idx < shard_rc.count && shard_rc.get_pk_bytes(idx) == key {
+            while idx < shard_rc.count && columnar::pk_bytes_eq(shard_rc.get_pk_bytes(idx), key) {
                 total_w += shard_rc.get_weight(idx);
                 if need_candidates {
                     candidates.push((Rc::clone(&shard_rc), idx));

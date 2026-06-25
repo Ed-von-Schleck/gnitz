@@ -9,7 +9,7 @@ use std::ptr;
 use std::rc::Rc;
 
 use super::batch::Batch;
-use super::columnar::compare_pk_ordering;
+use super::columnar::{compare_pk_ordering, pk_bytes_eq};
 use super::heap::{drive_merge, HeapNode, LoserTree};
 use super::merge::UnifiedSource;
 use super::shard_reader::MappedShard;
@@ -416,7 +416,7 @@ impl ReadCursor {
     /// undefined on an unpositioned cursor.
     #[inline]
     pub fn current_pk_eq(&self, key_bytes: &[u8]) -> bool {
-        self.current_pk_bytes() == key_bytes
+        pk_bytes_eq(self.current_pk_bytes(), key_bytes)
     }
 
     /// Walk the equal-PK group at the current position to its end, reporting
@@ -451,7 +451,7 @@ impl ReadCursor {
         if matches!(self.mode, SourceMode::Single) {
             while self.states[0].is_valid() {
                 let pos = self.states[0].position;
-                if self.sources[0].get_pk_bytes(pos) != key {
+                if !pk_bytes_eq(self.sources[0].get_pk_bytes(pos), key) {
                     break;
                 }
                 f(self.sources[0].get_weight(pos));
@@ -692,7 +692,7 @@ impl ReadCursor {
         // `same_pk`).
         let less = heap_less_with(schema, sources, row_cmp);
         let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-            sources[a_src].get_pk_bytes(a_row) == sources[b_src].get_pk_bytes(b_row)
+            pk_bytes_eq(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row))
         };
         let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
             row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
@@ -768,7 +768,7 @@ impl ReadCursor {
             let mut fold_run = |s: usize, net: &mut i64| {
                 while states[s].is_valid() {
                     let pos = states[s].position;
-                    if sources[s].get_pk_bytes(pos) != ex_pk
+                    if !pk_bytes_eq(sources[s].get_pk_bytes(pos), ex_pk)
                         || row_cmp(schema, &sources[s], pos, &sources[ex_src], ex_row) != Ordering::Equal
                     {
                         break;

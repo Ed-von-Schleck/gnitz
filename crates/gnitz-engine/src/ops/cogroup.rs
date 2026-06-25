@@ -12,7 +12,7 @@
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use crate::storage::{Batch, ReadCursor};
+use crate::storage::{pk_bytes_eq, Batch, ReadCursor};
 
 /// A sorted OPK-byte stream with a galloping forward skip. `ReadCursor`
 /// implements it via `advance_to` (seeding each source at its live position); a
@@ -70,7 +70,7 @@ impl<'a> BatchCursor<'a> {
     pub(crate) fn group_end(&self) -> usize {
         let k = self.batch.get_pk_bytes(self.pos);
         let mut j = self.pos + 1;
-        while j < self.batch.count && self.batch.get_pk_bytes(j) == k {
+        while j < self.batch.count && pk_bytes_eq(self.batch.get_pk_bytes(j), k) {
             j += 1;
         }
         j
@@ -131,7 +131,7 @@ pub(crate) fn cogroup_intersection<M: SortedKeyStream>(
             Ordering::Greater => m.advance_to(dk),         // skip match side
             Ordering::Equal => {
                 let mut j = i + 1;
-                while j < n && delta.get_pk_bytes(j) == dk {
+                while j < n && pk_bytes_eq(delta.get_pk_bytes(j), dk) {
                     j += 1;
                 } // delta group
                 on_match(dk, i..j, m); // walks match group
@@ -160,7 +160,7 @@ pub(crate) fn cogroup_left<M: SortedKeyStream>(
     while i < n {
         let dk = delta.get_pk_bytes(i);
         let mut j = i + 1;
-        while j < n && delta.get_pk_bytes(j) == dk {
+        while j < n && pk_bytes_eq(delta.get_pk_bytes(j), dk) {
             j += 1;
         }
         m.advance_to(dk); // galloping skip; group may be empty

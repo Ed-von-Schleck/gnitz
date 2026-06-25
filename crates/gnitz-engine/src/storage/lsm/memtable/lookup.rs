@@ -37,7 +37,7 @@ fn run_exact_match_start_bytes(run: &Batch, key: &[u8]) -> usize {
 /// lookup so callers never re-derive the bound check or the index step.
 pub(crate) fn run_pk_match_rows<'a>(run: &'a Batch, key: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
     let start = run_exact_match_start_bytes(run, key);
-    (start..run.count).take_while(move |&lo| run.get_pk_bytes(lo) == key)
+    (start..run.count).take_while(move |&lo| columnar::pk_bytes_eq(run.get_pk_bytes(lo), key))
 }
 
 impl MemTable {

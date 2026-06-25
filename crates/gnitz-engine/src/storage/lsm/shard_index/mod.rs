@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::ffi::CString;
 use std::rc::Rc;
 
+use super::columnar::pk_bytes_eq;
 use super::compare_pk_bytes;
 use super::error::StorageError;
 use super::manifest::PkBuf;
@@ -101,7 +102,7 @@ impl ShardEntry {
             return None;
         }
         let idx = self.shard.find_lower_bound_bytes(key);
-        if idx < self.shard.count && self.shard.get_pk_bytes(idx) == key {
+        if idx < self.shard.count && pk_bytes_eq(self.shard.get_pk_bytes(idx), key) {
             return Some((Rc::clone(&self.shard), idx));
         }
         None

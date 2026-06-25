@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{with_payload_cmp, Batch, ConsolidatedBatch, MemBatch};
+use crate::storage::{pk_bytes_eq, with_payload_cmp, Batch, ConsolidatedBatch, MemBatch};
 
 use super::super::cogroup::{cogroup_intersection, cogroup_left, BatchCursor};
 use super::rowwrite::write_join_row_from_batches;
@@ -102,7 +102,7 @@ where
     cogroup_left(ca, &mut bc, |key, a_range, m| {
         // B's equal-PK group, or an empty range when B lacks the key (cogroup_left
         // lands m at lower_bound(key), which may be a later key's row).
-        let has_b = m.pos < cb.count && cb.get_pk_bytes(m.pos) == key;
+        let has_b = m.pos < cb.count && pk_bytes_eq(cb.get_pk_bytes(m.pos), key);
         let (b_start, b_end) = if has_b { (m.pos, m.group_end()) } else { (m.pos, m.pos) };
         let mut scan_b = b_start;
         let mut unmatched_start: Option<usize> = None;

@@ -1,7 +1,7 @@
 //! Non-equi (range / band) join delta-trace.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{range_cut_points, Batch, MemBatch, ReadCursor};
+use crate::storage::{pk_bytes_eq, range_cut_points, Batch, MemBatch, ReadCursor};
 use gnitz_wire::RangeRel;
 
 use super::rowwrite::write_join_row;
@@ -156,7 +156,7 @@ fn range_merge_walk(
         // slots ascending in [d_lo, d_hi].
         let e = &delta_mb.get_pk_bytes(lo)[..eq_size];
         let mut hi = lo + 1;
-        while hi < m && &delta_mb.get_pk_bytes(hi)[..eq_size] == e {
+        while hi < m && pk_bytes_eq(&delta_mb.get_pk_bytes(hi)[..eq_size], e) {
             hi += 1;
         }
 

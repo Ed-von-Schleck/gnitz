@@ -127,7 +127,7 @@ pub(crate) fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], t
 // unchanged. (`encode_order_preserving_pk` moved there too but has no
 // storage-side caller, so it is not re-exported.)
 use crate::schema::key::PkSortKey; // the OPK register sort key, for the seek fast path below
-pub(crate) use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, opk_key};
+pub(crate) use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, opk_key, pk_bytes_eq};
 
 // ---------------------------------------------------------------------------
 // Sorted-stream lower-bound search (stateless + galloping)

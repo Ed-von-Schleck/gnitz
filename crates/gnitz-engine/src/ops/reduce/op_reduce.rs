@@ -1,7 +1,7 @@
 //! Incremental REDUCE operator: δ_out = Agg(history + δ_in) − Agg(history).
 
 use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
-use crate::storage::{scatter_copy, Batch, ConsolidatedBatch, DrainGuard, MemBatch, ReadCursor};
+use crate::storage::{pk_bytes_eq, scatter_copy, Batch, ConsolidatedBatch, DrainGuard, MemBatch, ReadCursor};
 
 use super::super::util::{cmp_col_window, extract_group_key, extract_group_key_cursor, GroupKeyExtractor};
 use super::agg::{apply_agg_from_value_index, fold_old_aggs, is_single_col_natural_pk, Accumulator, AggDescriptor};
@@ -406,7 +406,7 @@ pub fn op_reduce(
             if group_by_pk {
                 // Full PK byte-window compare: exact at every width, unlike the
                 // lossy u128 get_pk for pk_stride > 16.
-                if mb.get_pk_bytes(curr_idx) != group_pk_bytes {
+                if !pk_bytes_eq(mb.get_pk_bytes(curr_idx), group_pk_bytes) {
                     break;
                 }
             } else if compare_by_group_cols(&mb, curr_idx, group_start_idx, group_descs) != std::cmp::Ordering::Equal {
