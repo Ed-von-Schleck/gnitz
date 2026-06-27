@@ -1488,8 +1488,8 @@ mod tests {
             type_code::I64, // agg col (payload col 1)
         ]);
 
-        // Output schema: [U128 PK, I64 group_col, I64 sum_col]
-        let out_schema = make_schema(&[type_code::I64, type_code::I64]);
+        // Output schema: [U128 PK, I64 group_col, I64 sum_col, I64 count companion]
+        let out_schema = make_schema(&[type_code::I64, type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
 
@@ -1521,13 +1521,22 @@ mod tests {
 
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
-        // Agg descriptors: SUM of payload col 1 (schema col 2).
-        let agg_descs = [AggDescriptor {
-            col_idx: 2,
-            agg_op: AggOp::Sum,
-            col_type_code: TypeCode::I64,
-            _pad: [0; 2],
-        }];
+        // Agg descriptors: SUM of payload col 1 (schema col 2), plus the trailing
+        // Count cardinality companion every all-linear reduce carries.
+        let agg_descs = [
+            AggDescriptor {
+                col_idx: 2,
+                agg_op: AggOp::Sum,
+                col_type_code: TypeCode::I64,
+                _pad: [0; 2],
+            },
+            AggDescriptor {
+                col_idx: 0,
+                agg_op: AggOp::Count,
+                col_type_code: TypeCode::I64,
+                _pad: [0; 2],
+            },
+        ];
         let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
 
         let mut builder = ProgramBuilder::new();
@@ -2282,7 +2291,8 @@ mod tests {
     #[test]
     fn test_reduce_sum_value() {
         let in_schema = make_schema(&[type_code::I64]);
-        let out_schema = make_schema(&[type_code::I64]);
+        // [U128 PK, I64 sum, I64 count companion]
+        let out_schema = make_schema(&[type_code::I64, type_code::I64]);
 
         let dir = tempfile::tempdir().unwrap();
 
@@ -2310,13 +2320,22 @@ mod tests {
         .unwrap();
         let trace_in_ptr = &mut trace_in_table as *mut Table;
 
-        // SUM of col 1 (agg_op=2 = AGG_SUM, not AGG_COUNT)
-        let agg_descs = [AggDescriptor {
-            col_idx: 1,
-            agg_op: AggOp::Sum,
-            col_type_code: TypeCode::I64,
-            _pad: [0; 2],
-        }];
+        // SUM of col 1 (agg_op=2 = AGG_SUM, not AGG_COUNT) plus the trailing Count
+        // cardinality companion every all-linear reduce carries.
+        let agg_descs = [
+            AggDescriptor {
+                col_idx: 1,
+                agg_op: AggOp::Sum,
+                col_type_code: TypeCode::I64,
+                _pad: [0; 2],
+            },
+            AggDescriptor {
+                col_idx: 0,
+                agg_op: AggOp::Count,
+                col_type_code: TypeCode::I64,
+                _pad: [0; 2],
+            },
+        ];
         // GROUP BY col 0 (pk)
         let group_cols = [0u32];
 

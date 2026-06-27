@@ -4,7 +4,9 @@
 //! `Having` leaf binder over the grouped relation).
 
 use crate::ast_util::{extract_table_factor_name, single_relation_col_name};
-use crate::bind::{bind_single_table, bind_structural, find_unique_column, Binder, LeafBinder};
+use crate::bind::{
+    bind_single_table, bind_structural, find_unique_column, reject_unsupported_agg_qualifiers, Binder, LeafBinder,
+};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr};
 use crate::lower::compile_bound_expr_to_program;
@@ -279,6 +281,23 @@ pub(crate) fn execute_create_group_by_view(
     //     it. Done before reduce_schema is built so the new columns are included.
     if let Some(having_expr) = &select.having {
         collect_having_aggs(having_expr, &source_schema, &mut agg_specs, &mut agg_mappings)?;
+    }
+
+    // 3c. An all-linear reduce gates group existence on a NULL-blind COUNT(*)
+    //     cardinality (a group exists iff its net row weight > 0). Reuse a user
+    //     COUNT(*) when present; else append exactly one hidden trailing companion.
+    //     Appended last — after every SELECT and HAVING-only aggregate — so it
+    //     shifts no existing aggregate's specs_start; it is added to agg_specs
+    //     only (never select_items / agg_mappings), so the post-reduce MAP strips
+    //     it (a raw reduce column with no output column, like a HAVING-only agg).
+    let all_linear = agg_specs
+        .iter()
+        .all(|s| matches!(s.op, AGG_COUNT | AGG_SUM | AGG_COUNT_NON_NULL));
+    if all_linear && !agg_specs.iter().any(|s| s.op == AGG_COUNT) {
+        // Route through push_agg_specs — the single source of truth for spec
+        // layout and out_type — rather than hand-rolling the COUNT spec. The
+        // companion has no select_item / agg_mapping, so its AggShape is discarded.
+        push_agg_specs(AggFunc::Count, None, &source_schema, &mut agg_specs)?;
     }
 
     // 4. Determine reduce output schema layout.
@@ -579,6 +598,7 @@ fn having_agg_func(
     func: &sqlparser::ast::Function,
     source_schema: &Schema,
 ) -> Result<(AggFunc, Option<usize>), GnitzSqlError> {
+    reject_unsupported_agg_qualifiers(func)?;
     let name = func.name.to_string().to_lowercase();
     let arg_col = extract_func_arg_col(func, source_schema)?;
     let agg_func = match name.as_str() {

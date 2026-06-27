@@ -5,7 +5,8 @@ use crate::ir::{AggFunc, BinOp, BoundExpr, UnaryOp};
 use crate::types::is_min_max_orderable;
 use gnitz_core::Schema;
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator, Value,
+    BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator,
+    Value,
 };
 
 /// Bind an expression against a single-relation schema (WHERE, projections,
@@ -181,11 +182,53 @@ impl SingleTable<'_> {
     }
 }
 
+/// Reject any qualifier on an aggregate call that the binder does not implement.
+/// Both aggregate-binding sites (`SingleTable::bind_function` and HAVING's
+/// `having_agg_func`) read only the argument list; every other `Function` field
+/// would otherwise be silently dropped, computing the plain aggregate.
+pub(crate) fn reject_unsupported_agg_qualifiers(func: &Function) -> Result<(), GnitzSqlError> {
+    // Colon form ("{what}: not supported …") sidesteps subject-verb number
+    // agreement and matches the binder's existing message style
+    // (e.g. "{name}: not supported on {:?} columns").
+    let unsupported = |what: &str| {
+        Err(GnitzSqlError::Unsupported(format!(
+            "{what}: not supported on aggregates"
+        )))
+    };
+    if func.filter.is_some() {
+        return unsupported("FILTER (WHERE …)");
+    }
+    if func.over.is_some() {
+        return unsupported("window functions (OVER)");
+    }
+    if !func.within_group.is_empty() {
+        return unsupported("WITHIN GROUP (ORDER BY …)");
+    }
+    if func.null_treatment.is_some() {
+        return unsupported("IGNORE/RESPECT NULLS");
+    }
+    if !matches!(func.parameters, FunctionArguments::None) {
+        return unsupported("parametric (ClickHouse) calls");
+    }
+    if let FunctionArguments::List(list) = &func.args {
+        if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
+            return Err(GnitzSqlError::Unsupported(
+                "DISTINCT aggregates are not supported".into(),
+            ));
+        }
+        if !list.clauses.is_empty() {
+            return unsupported("in-argument clauses (ORDER BY / LIMIT / SEPARATOR)");
+        }
+    }
+    Ok(())
+}
+
 impl LeafBinder for SingleTable<'_> {
     fn bind_column(&self, e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
         Ok(BoundExpr::ColRef(self.idx(e)?))
     }
     fn bind_function(&self, func: &Function) -> Result<BoundExpr, GnitzSqlError> {
+        reject_unsupported_agg_qualifiers(func)?;
         let name = func.name.to_string().to_lowercase();
         match name.as_str() {
             "count" => {
@@ -412,5 +455,44 @@ mod tests {
             bind_single_table(&parse("t.c IS NOT NULL"), &nullable).unwrap(),
             BoundExpr::IsNotNull(1)
         ));
+    }
+
+    /// Every aggregate qualifier the binder does not implement must be rejected,
+    /// not silently dropped to the plain aggregate. Exercised through
+    /// `bind_single_table` so the guard's wiring into `bind_function` is covered,
+    /// not just the helper in isolation.
+    #[test]
+    fn test_binder_rejects_aggregate_qualifiers() {
+        let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
+        for (src, want) in [
+            ("COUNT(DISTINCT c)", "DISTINCT"),
+            ("SUM(DISTINCT c)", "DISTINCT"),
+            ("MIN(DISTINCT c)", "DISTINCT"), // no-op distinct, rejected for a uniform surface
+            ("SUM(c) FILTER (WHERE c > 0)", "FILTER"),
+            ("SUM(c) OVER (PARTITION BY pk)", "OVER"),
+        ] {
+            assert_unsupported(bind_single_table(&parse(src), &schema), want);
+        }
+    }
+
+    /// The accepted qualifier (`ALL`, the SQL default — `COUNT(ALL c)` ≡
+    /// `COUNT(c)`) and the plain forms must keep binding.
+    #[test]
+    fn test_binder_accepts_all_and_plain_aggregates() {
+        let schema = schema_with_val(TypeCode::I64);
+        for src in [
+            "COUNT(*)",
+            "COUNT(c)",
+            "COUNT(ALL c)",
+            "SUM(c)",
+            "MIN(c)",
+            "MAX(c)",
+            "AVG(c)",
+        ] {
+            assert!(
+                bind_single_table(&parse(src), &schema).is_ok(),
+                "expected {src} to bind"
+            );
+        }
     }
 }

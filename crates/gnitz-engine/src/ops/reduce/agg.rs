@@ -109,6 +109,12 @@ impl Accumulator {
         !self.has_value
     }
 
+    /// Row count held by a COUNT/COUNT_NON_NULL accumulator — a group's net
+    /// cardinality, for the emission gate. Meaningful only for the count family.
+    pub(super) fn count_value(&self) -> i64 {
+        self.acc
+    }
+
     pub(super) fn get_value_bits(&self) -> u64 {
         self.acc as u64
     }

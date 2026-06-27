@@ -4,7 +4,9 @@ use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{pk_bytes_eq, scatter_copy, Batch, ConsolidatedBatch, DrainGuard, MemBatch, ReadCursor};
 
 use super::super::util::{cmp_col_window, extract_group_key, extract_group_key_cursor, GroupKeyExtractor};
-use super::agg::{apply_agg_from_value_index, fold_old_aggs, is_single_col_natural_pk, Accumulator, AggDescriptor};
+use super::agg::{
+    apply_agg_from_value_index, fold_old_aggs, is_single_col_natural_pk, Accumulator, AggDescriptor, AggOp,
+};
 use super::emit::{emit_finalized_row, emit_reduce_row};
 use super::sort::{argsort_delta, argsort_pk_canonical, build_sort_descs, compare_by_group_cols, SortDesc};
 
@@ -365,6 +367,18 @@ pub fn op_reduce(
         None
     };
 
+    // A group exists iff its net cardinality (row weight) is positive; the unique
+    // AggOp::Count accumulator carries that signal. The SQL planner gives every
+    // all-linear GROUP BY view exactly one Count — a user COUNT(*) or an appended
+    // companion — so SQL views gate on cardinality and shed emptied/all-NULL
+    // groups correctly. When no Count is present — a non-linear reduce, or a
+    // hand-built circuit from the low-level CircuitBuilder API that omits one —
+    // `cardinality_idx` is None and the gate falls back to the any_nonzero
+    // touched-ness test below (the prior behavior).
+    let cardinality_idx: Option<usize> = all_linear
+        .then(|| agg_descs.iter().position(|d| d.agg_op == AggOp::Count))
+        .flatten();
+
     let mut idx = 0usize;
     let mut num_groups = 0usize;
     while idx < n {
@@ -552,9 +566,26 @@ pub fn op_reduce(
             }
         }
 
-        // Emission: +1 for new value
-        let any_nonzero = accs.iter().any(|a| !a.is_zero());
-        if any_nonzero {
+        // Emission: a group exists iff its net cardinality is positive. With a
+        // COUNT signal (SQL all-linear reduce): read it — correct for both emptied
+        // groups (fold saturates has_value) and new all-NULL groups (nothing
+        // touches the value accumulators). Without one (non-linear, whose w>0
+        // replay already eliminates emptied groups; or a companion-less low-level
+        // circuit): fall back to the any_nonzero touched-ness test.
+        let should_emit = match cardinality_idx {
+            Some(ci) => {
+                // Bag-positive reduce inputs ⇒ cardinality ≥ 0; fail loudly if a
+                // future operator ever violates that, since the gate is not
+                // sign-robust the way the old any_nonzero touched-ness test was.
+                debug_assert!(
+                    accs[ci].count_value() >= 0,
+                    "reduce input must be bag-positive: negative group cardinality",
+                );
+                accs[ci].count_value() > 0
+            }
+            None => accs.iter().any(|a| !a.is_zero()),
+        };
+        if should_emit {
             emit_reduce_row(
                 &mut raw_output,
                 &mb,

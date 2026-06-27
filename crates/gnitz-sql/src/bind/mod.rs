@@ -14,4 +14,6 @@ mod structural;
 pub(crate) use resolve::{
     find_unique_column, resolve_qualified_column, resolve_unqualified_column, AliasMap, Binder, ResolvedRelation,
 };
-pub(crate) use structural::{bind_single_table, bind_structural, fold_null_test, LeafBinder};
+pub(crate) use structural::{
+    bind_single_table, bind_structural, fold_null_test, reject_unsupported_agg_qualifiers, LeafBinder,
+};

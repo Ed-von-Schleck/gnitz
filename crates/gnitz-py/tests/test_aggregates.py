@@ -1017,8 +1017,9 @@ class TestGroupBy:
             client.execute_sql("DELETE FROM orders WHERE pk = 2", schema_name=sn)
 
             by_cat = {r["category"]: r["cnt"] for r in client.scan(vid) if r.weight > 0}
-            # Category 10 should have cnt=0 or be absent; category 20 should have cnt=1
-            assert by_cat.get(10, 0) == 0
+            # Category 10 is emptied → the group must VANISH (cardinality 0), not
+            # survive as a cnt=0 zombie. Category 20 stays at cnt=1.
+            assert 10 not in by_cat, f"emptied group must be absent, got {by_cat}"
             assert by_cat[20] == 1
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
@@ -1047,7 +1048,8 @@ class TestGroupBy:
 
             client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
             totals = {r["category"]: r["total"] for r in client.scan(vid) if r.weight > 0}
-            assert totals.get(10, 0) == 0
+            # Emptied SUM-only group must VANISH, not survive as a total=0 zombie.
+            assert 10 not in totals, f"emptied group must be absent, got {totals}"
 
             # Re-insert and verify aggregate restores
             client.execute_sql(
@@ -2105,5 +2107,354 @@ class TestAggregateDifferential:
             client.execute_sql("UPDATE t SET g = 1 WHERE pk = 4", schema_name=sn)
             oracle.apply_update(t_state, "pk", 4, {"g": 1})
             check("after-cross-group-move")
+        finally:
+            client.drop_schema(sn)
+
+
+class TestAggregateQualifierRejection:
+    """Aggregate-call qualifiers the binder does not implement (DISTINCT, FILTER,
+    OVER, …) must be rejected loudly, never silently dropped to the plain
+    aggregate — the durable-wrong-result class. Both binding sites are guarded:
+    the GROUP BY SELECT list and HAVING."""
+
+    def _setup(self, client, sn):
+        client.execute_sql(
+            "CREATE TABLE t ("
+            "  pk BIGINT NOT NULL PRIMARY KEY,"
+            "  g BIGINT NOT NULL,"
+            "  x BIGINT NOT NULL"
+            ")",
+            schema_name=sn,
+        )
+
+    @pytest.mark.parametrize("fn", ["COUNT", "SUM", "AVG", "MIN", "MAX"])
+    def test_select_list_distinct_rejected(self, client, fn):
+        """SELECT-list `agg(DISTINCT x)` binds to the plain aggregate today; the
+        guard must reject it so the view is never created. MIN/MAX(DISTINCT x) is
+        a no-op distinct but is rejected by the blanket rule for a uniform surface."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    f"CREATE VIEW v AS SELECT g, {fn}(DISTINCT x) AS a FROM t GROUP BY g",
+                    schema_name=sn,
+                )
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_distinct_rejected(self, client):
+        """The second binding site: `HAVING COUNT(DISTINCT x) > 1` routes through
+        having_agg_func, not bind_function — a SELECT-list-only fix would miss it
+        and silently evaluate COUNT(x) > 1."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT g, SUM(x) AS s FROM t GROUP BY g "
+                    "HAVING COUNT(DISTINCT x) > 1",
+                    schema_name=sn,
+                )
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_filter_clause_rejected(self, client):
+        """`SUM(x) FILTER (WHERE x > 0)` is the same silent-drop class as DISTINCT
+        — the FILTER would be dropped and a plain SUM(x) computed."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT g, SUM(x) FILTER (WHERE x > 0) AS s "
+                    "FROM t GROUP BY g",
+                    schema_name=sn,
+                )
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_over_window_rejected(self, client):
+        """`SUM(x) OVER (PARTITION BY g)` is a window function silently computed as
+        a grouped aggregate — window semantics lost. Must be rejected."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT g, SUM(x) OVER (PARTITION BY g) AS s "
+                    "FROM t GROUP BY g",
+                    schema_name=sn,
+                )
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_plain_aggregates_and_all_still_compute(self, client):
+        """Regression: the guard must leave plain aggregates and the one accepted
+        qualifier — ALL (`COUNT(ALL x)` ≡ `COUNT(x)`) — binding and computing
+        unchanged."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, "
+                "COUNT(*) AS c_star, COUNT(x) AS c_x, COUNT(ALL x) AS c_all, "
+                "SUM(x) AS s, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx "
+                "FROM t GROUP BY g",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 2), (2, 10, 4), (3, 20, 7)",
+                schema_name=sn,
+            )
+            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            assert by_g[10]["c_star"] == 2
+            assert by_g[10]["c_x"] == 2
+            assert by_g[10]["c_all"] == 2            # COUNT(ALL x) ≡ COUNT(x)
+            assert by_g[10]["s"] == 6                # 2 + 4
+            assert abs(by_g[10]["a"] - 3.0) < 0.001  # AVG = 6/2
+            assert by_g[10]["mn"] == 2
+            assert by_g[10]["mx"] == 4
+            assert by_g[20]["c_all"] == 1
+            assert by_g[20]["s"] == 7
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+
+class TestLinearReduceGroupExistence:
+    """An all-linear GROUP BY view (COUNT/SUM/AVG, no MIN/MAX) carrying NO user
+    COUNT(*) must still decide group existence on cardinality: an emptied group
+    vanishes (no sum=0 / NULL / count=0 zombie) and a brand-new group whose
+    aggregated column is all-NULL appears (SUM/AVG = NULL). These are invisible to
+    the COUNT(*)-carrying differential tests — COUNT(*)'s accumulator is touched
+    on every row and masks the gate. Checked against the from-scratch oracle,
+    which models the SQL semantics exactly (an emptied group is absent; an all-NULL
+    group is present with SUM/AVG = NULL)."""
+
+    def test_sum_only_nonnull_empty_and_recreate(self, client):
+        """SELECT g, SUM(a) over non-nullable a, no COUNT(*): emptying a group
+        drops it (no sum=0 zombie); re-inserting brings it back."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+                "a BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, SUM(a) AS s FROM t GROUP BY g",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["g", "s"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["g", "a"], ["g"], [("s", "SUM", "a")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 3), (2, 20, 5)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 10, "a": 3}, {"pk": 2, "g": 20, "a": 5}])
+            check("after-insert")
+
+            # Empty g=10 → the group must vanish, not survive as (g=10, s=0).
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1])
+            check("after-empty-g10")
+
+            # Re-create g=10 → it returns.
+            client.execute_sql("INSERT INTO t VALUES (3, 10, 7)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 3, "g": 10, "a": 7}])
+            check("after-recreate-g10")
+        finally:
+            client.drop_schema(sn)
+
+    def test_sum_only_nullable_all_null_group_and_empty(self, client):
+        """SELECT g, SUM(a) over nullable a, no COUNT(*): a brand-new group whose
+        only row is all-NULL appears with SUM = NULL (not dropped); emptying a
+        group still removes it."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+                "a BIGINT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, SUM(a) AS s FROM t GROUP BY g",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["g", "s"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["g", "a"], ["g"], [("s", "SUM", "a")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 4), (2, 20, 6)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 10, "a": 4}, {"pk": 2, "g": 20, "a": 6}])
+            check("after-insert")
+
+            # New group g=7 whose only row is all-NULL → present with SUM = NULL.
+            client.execute_sql("INSERT INTO t VALUES (3, 7, NULL)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 3, "g": 7, "a": None}])
+            check("after-new-all-null")
+
+            # Empty g=10 → vanishes.
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1])
+            check("after-empty-g10")
+        finally:
+            client.drop_schema(sn)
+
+    def test_avg_only_nullable_all_null_group_and_empty(self, client):
+        """SELECT g, AVG(a) over nullable a, no COUNT(*): same lifecycle as SUM —
+        a new all-NULL group appears with AVG = NULL; an emptied group vanishes."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+                "a BIGINT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, AVG(a) AS av FROM t GROUP BY g",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["g", "av"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["g", "a"], ["g"], [("av", "AVG", "a")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 4), (2, 20, 6)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 10, "a": 4}, {"pk": 2, "g": 20, "a": 6}])
+            check("after-insert")
+
+            # New all-NULL group g=7 → present with AVG = NULL.
+            client.execute_sql("INSERT INTO t VALUES (3, 7, NULL)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 3, "g": 7, "a": None}])
+            check("after-new-all-null")
+
+            # Empty g=10 → vanishes.
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1])
+            check("after-empty-g10")
+        finally:
+            client.drop_schema(sn)
+
+    def test_count_col_only_empty_recreate_and_all_null_present(self, client):
+        """SELECT g, COUNT(a) over nullable a, no COUNT(*): emptying a group drops
+        it, re-inserting restores it. A new all-NULL group becomes PRESENT (this
+        plan restores existence); its COUNT(a) renders as NULL here where SQL wants
+        0 — a separate emitter concern — so the all-NULL step asserts presence
+        only, not the value, via a direct scan rather than the oracle."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+                "a BIGINT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, COUNT(a) AS c FROM t GROUP BY g",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["g", "c"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["g", "a"], ["g"], [("c", "COUNT", "a")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 4), (2, 20, 6)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 10, "a": 4}, {"pk": 2, "g": 20, "a": 6}])
+            check("after-insert")
+
+            # Empty g=10 → vanishes; re-insert → returns (COUNT(a) = 1).
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1])
+            check("after-empty-g10")
+            client.execute_sql("INSERT INTO t VALUES (3, 10, 7)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 3, "g": 10, "a": 7}])
+            check("after-recreate-g10")
+
+            # New all-NULL group g=7: this plan makes the row APPEAR. Its value is
+            # NULL (the COUNT(col)-renders-NULL-not-0 emitter fix is separate), so
+            # check existence only, not the value.
+            client.execute_sql("INSERT INTO t VALUES (4, 7, NULL)", schema_name=sn)
+            g7 = [r for r in client.scan(vid) if r.weight > 0 and r["g"] == 7]
+            assert len(g7) == 1, f"new all-NULL COUNT(a) group must appear, got {g7}"
+        finally:
+            client.drop_schema(sn)
+
+    def test_nested_sum_inner_empty_no_phantom(self, client):
+        """The nested cascade: an outer COUNT(*) GROUP BY over an inner SUM GROUP
+        BY. When an inner group empties, the inner row must vanish — otherwise its
+        sum=0 zombie feeds the outer as a phantom (s=0, c=1) group and leaves a
+        stale (s=old, c=0). Checked by chaining the oracle through both views."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+                "a BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW iv AS SELECT g, SUM(a) AS s FROM t GROUP BY g",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW ov AS SELECT s, COUNT(*) AS c FROM iv GROUP BY s",
+                schema_name=sn)
+            ov_id = client.resolve_table(sn, "ov")[0]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
+                inner, inner_cols = oracle.oracle_groupby_aggregate(
+                    base, ["g", "a"], ["g"], [("s", "SUM", "a")])
+                outer, outer_cols = oracle.oracle_groupby_aggregate(
+                    inner, inner_cols, ["s"], [("c", "COUNT", None)])
+                assert outer_cols == ["s", "c"]
+                oracle.assert_view_matches(client, ov_id, ["s", "c"], outer, ctx=ctx)
+
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1, 5), (2, 2, 8)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 1, "a": 5}, {"pk": 2, "g": 2, "a": 8}])
+            check("after-insert")
+
+            # Empty inner group g=1 → its row must disappear from iv, so ov shows
+            # neither a phantom (s=0, c=1) nor a stale (s=5, c=0).
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1])
+            check("after-inner-empty")
         finally:
             client.drop_schema(sn)

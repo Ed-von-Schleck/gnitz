@@ -159,18 +159,21 @@ fn test_reduce_sum_retraction() {
         &[0],
     );
 
-    // Output: pk(U128), grp(I64), sum(I64)
+    // Output: pk(U128), grp(I64), sum(I64), count(I64). The trailing count is the
+    // cardinality companion every all-linear reduce now carries; op_reduce gates
+    // emission on it (and asserts its presence).
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
     );
 
     // Empty trace_out
-    let empty_out = Rc::new(Batch::empty(2, 16));
+    let empty_out = Rc::new(Batch::empty(3, 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
     // Tick 1: insert 3 rows in group 10: val=100, val=200, val=300
@@ -189,12 +192,7 @@ fn test_reduce_sum_retraction() {
         ConsolidatedBatch::new_unchecked(b)
     };
 
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
+    let aggs = sum_count_aggs(2, TypeCode::I64);
 
     let (out1, _) = op_reduce(
         &delta1,
@@ -203,7 +201,7 @@ fn test_reduce_sum_retraction() {
         &in_schema,
         &out_schema,
         &[1u32],
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -242,7 +240,7 @@ fn test_reduce_sum_retraction() {
         &in_schema,
         &out_schema,
         &[1u32],
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -251,8 +249,306 @@ fn test_reduce_sum_retraction() {
         None,
         None,
     );
-    // Output: retract old sum (600, w=-1) + insert new sum (400, w=+1) = 2 rows
+    // Output: retract old sum (600, w=-1) + insert new sum (400, w=+1) = 2 rows.
+    // The group survives (cardinality 3 → 2), so the +1 is emitted.
     assert_eq!(out2.count, 2);
+}
+
+/// All-linear gate: a non-nullable SUM-only group driven to empty must emit only
+/// the −1 retraction of its stored row — no +1 zombie carrying SUM=0. The reduce
+/// carries the appended Count cardinality companion; once the group's net
+/// cardinality reaches 0 the gate suppresses the new row, so the group vanishes
+/// exactly as SQL (and the Z-set model) require.
+#[test]
+fn linear_sum_only_emptied_group_eliminated() {
+    use crate::schema::{type_code, SchemaColumn};
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    // Input: pk(U64), grp(I64), val(I64). Output (synthetic GROUP BY grp):
+    // _group_pk(U128), grp(I64), sum(I64 nullable), count(I64 companion).
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let aggs = sum_count_aggs(2, TypeCode::I64);
+
+    let reduce = |delta: &ConsolidatedBatch, to: &mut crate::storage::ReadCursor| {
+        op_reduce(
+            delta,
+            None,
+            to,
+            &in_schema,
+            &out_schema,
+            &[1u32],
+            &aggs,
+            None,
+            false,
+            TypeCode::U64,
+            None,
+            0,
+            None,
+            None,
+        )
+        .0
+    };
+
+    // Tick 1: insert (pk1, grp=10, val=5) → group exists (sum=5, count=1).
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let row = |pk: u128, w: i64| {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(pk);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &10i64.to_le_bytes()); // grp=10
+        b.extend_col(1, &5i64.to_le_bytes()); // val=5
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let out1 = reduce(&row(1, 1), to_ch.cursor_mut());
+    assert_eq!(out1.count, 1, "group present after first insert");
+
+    // Tick 2: retract the only row → cardinality 1 → 0. The gate suppresses the
+    // +1, leaving just the −1 retraction, so the group disappears (no zombie).
+    let prev = Rc::new(out1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let out2 = reduce(&row(1, -1), to_ch2.cursor_mut());
+    assert_eq!(out2.count, 1, "emptied group emits only the retraction, no +1 zombie");
+    assert_eq!(out2.get_weight(0), -1, "the sole output row is the −1 retraction");
+    assert_eq!(
+        read_i64_le(out2.col_data(1), 0),
+        5,
+        "retraction re-emits the stored SUM=5"
+    );
+}
+
+/// All-linear gate: inserting the *first* row of a new group whose aggregated
+/// column is NULL must surface the group (SQL: `SUM = NULL`), not drop it. With
+/// the appended Count companion the null-blind row count is 1, so the gate emits
+/// the group; the SUM/CountNonNull accumulators stay untouched, so the raw SUM
+/// bit is NULL and the NullfillSum finalize renders SUM = NULL.
+#[test]
+fn linear_sum_only_new_all_null_group_present() {
+    use crate::expr::{CmpOp, LogicalInstr, LogicalProgram};
+    use crate::schema::{type_code, SchemaColumn};
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    // Input: pk(U64), grp(I64), val(I64 nullable).
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    // Raw reduce output: _group_pk | grp | sum (nullable) | cnn | count.
+    // agg order mirrors agg_descs = [Sum, CountNonNull, Count] — the nullable-SUM
+    // NullfillSum pair plus the trailing appended cardinality companion.
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0), // _group_pk
+            SchemaColumn::new(type_code::I64, 0),  // grp
+            SchemaColumn::new(type_code::I64, 1),  // sum (nullable)
+            SchemaColumn::new(type_code::I64, 0),  // cnn
+            SchemaColumn::new(type_code::I64, 0),  // count (companion)
+        ],
+        &[0],
+    );
+    // Finalize projects [pk, grp, sum]; cnn and the count companion are stripped.
+    let fin_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1), // sum (nullable)
+        ],
+        &[0],
+    );
+    // NullfillSum: grp → fin payload 0; sum(col 2) / (cnn(col 3) != 0) → fin
+    // payload 1 (div-by-zero marks SUM NULL when the non-null count is 0).
+    let i64_tc = type_code::I64;
+    let instrs = vec![
+        LogicalInstr::CopyCol {
+            src_col: 1,
+            out: 0,
+            tc: i64_tc,
+        },
+        LogicalInstr::LoadColInt { dst: 0, col: 3 }, // r0 = cnn
+        LogicalInstr::LoadConst { dst: 1, val: 0 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Ne,
+            dst: 2,
+            a: 0,
+            b: 1,
+        }, // r2 = (cnn != 0)
+        LogicalInstr::LoadColInt { dst: 3, col: 2 }, // r3 = sum
+        LogicalInstr::IntDiv { dst: 4, a: 3, b: 2 }, // r4 = sum / gate
+        LogicalInstr::Emit { src: 4, out: 1 },       // emit r4 → fin payload 1 (sum)
+    ];
+    let fin_prog = LogicalProgram::new(instrs, 5, 0, vec![]).resolve(&out_schema, false);
+
+    let aggs = [
+        AggDescriptor {
+            col_idx: 2,
+            agg_op: AggOp::Sum,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 2,
+            agg_op: AggOp::CountNonNull,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 0,
+            agg_op: AggOp::Count,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+    ];
+
+    // New group g=7 whose only row has val=NULL.
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let delta = {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&(1u64 << 1).to_le_bytes()); // val (payload idx 1) NULL
+        b.extend_col(0, &7i64.to_le_bytes()); // grp=7
+        b.extend_col(1, &0i64.to_le_bytes()); // val NULL (placeholder)
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+    let (raw, fin) = op_reduce(
+        &delta,
+        None,
+        to_ch.cursor_mut(),
+        &in_schema,
+        &out_schema,
+        &[1u32],
+        &aggs,
+        None,
+        false,
+        TypeCode::U64,
+        None,
+        0,
+        Some(&fin_prog),
+        Some(&fin_schema),
+    );
+    let fin = fin.expect("finalize output present");
+    assert_eq!(
+        raw.count, 1,
+        "new all-NULL group is present (cardinality 1), not dropped"
+    );
+    assert_eq!(fin.count, 1);
+    assert_eq!(fin.get_weight(0), 1, "one +1 row");
+    assert_eq!(read_i64_le(fin.col_data(0), 0), 7, "grp=7");
+    assert_eq!(
+        (fin.get_null_word(0) >> 1) & 1,
+        1,
+        "SUM of an all-NULL group renders as NULL",
+    );
+}
+
+/// All-linear gate, reuse path: a COUNT(*)-only group driven to empty is
+/// eliminated. The user COUNT(*) *is* the cardinality signal (no companion is
+/// appended), so the gate suppresses the +1 once the count nets to 0.
+#[test]
+fn count_star_only_emptied_group_eliminated() {
+    use crate::schema::{type_code, SchemaColumn};
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    // Input: pk(U64), grp(I64). Output (synthetic GROUP BY grp):
+    // _group_pk(U128), grp(I64), count(I64).
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let aggs = [AggDescriptor {
+        col_idx: 0,
+        agg_op: AggOp::Count,
+        col_type_code: TypeCode::I64,
+        _pad: [0; 2],
+    }];
+
+    let reduce = |delta: &ConsolidatedBatch, to: &mut crate::storage::ReadCursor| {
+        op_reduce(
+            delta,
+            None,
+            to,
+            &in_schema,
+            &out_schema,
+            &[1u32],
+            &aggs,
+            None,
+            false,
+            TypeCode::U64,
+            None,
+            0,
+            None,
+            None,
+        )
+        .0
+    };
+
+    let row = |pk: u128, w: i64| {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(pk);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &10i64.to_le_bytes()); // grp=10
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        ConsolidatedBatch::new_unchecked(b)
+    };
+
+    // Tick 1: insert one row → count=1.
+    let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let out1 = reduce(&row(1, 1), to_ch.cursor_mut());
+    assert_eq!(out1.count, 1);
+    assert_eq!(read_i64_le(out1.col_data(1), 0), 1, "count=1");
+
+    // Tick 2: retract it → count 1 → 0 → group eliminated (only the −1 retraction).
+    let prev = Rc::new(out1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let out2 = reduce(&row(1, -1), to_ch2.cursor_mut());
+    assert_eq!(out2.count, 1, "COUNT(*)=0 group is eliminated, not kept as a zombie");
+    assert_eq!(out2.get_weight(0), -1, "the sole output row is the −1 retraction");
 }
 
 /// Nullable SUM must transition to NULL when a retraction removes the last
@@ -714,13 +1010,14 @@ fn reduce_trace_seek_wide_pk() {
 
     // Wide PK: 3×U64 (stride 24) + I64 val. GROUP BY the full PK.
     let in_schema = wide_pk_3xu64_schema();
-    // Output: natural wide PK (3×U64) + SUM(I64, nullable).
+    // Output: natural wide PK (3×U64) + SUM(I64, nullable) + count companion.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
         ],
         &[0, 1, 2],
     );
@@ -728,12 +1025,7 @@ fn reduce_trace_seek_wide_pk() {
 
     let pk = |a: u64, b: u64, c: u64| opk_pk(&in_schema, &[a as u128, b as u128, c as u128]);
 
-    let agg = AggDescriptor {
-        col_idx: 3,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
+    let aggs = sum_count_aggs(3, TypeCode::I64);
     let group_by = [0u32, 1, 2];
 
     // Tick 1: two rows in one group (7,7,7) — val 100 and 200 → SUM = 300.
@@ -759,7 +1051,7 @@ fn reduce_trace_seek_wide_pk() {
         &in_schema,
         &out_schema,
         &group_by,
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -794,7 +1086,7 @@ fn reduce_trace_seek_wide_pk() {
         &in_schema,
         &out_schema,
         &group_by,
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -839,6 +1131,7 @@ fn reduce_trace_seek_compound_pk() {
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
         ],
         &[0, 1],
     );
@@ -846,12 +1139,7 @@ fn reduce_trace_seek_compound_pk() {
     assert!(in_schema.pk_stride() <= 16, "test invariant: stride 16 is narrow");
 
     let pk = |a: u64, b: u64| opk_pk(&in_schema, &[a as u128, b as u128]);
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
+    let aggs = sum_count_aggs(2, TypeCode::I64);
     let group_by = [0u32, 1];
 
     // Tick 1: insert (1,5)->100 and (2,3)->200 (two distinct groups).
@@ -877,7 +1165,7 @@ fn reduce_trace_seek_compound_pk() {
         &in_schema,
         &out_schema,
         &group_by,
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -914,7 +1202,7 @@ fn reduce_trace_seek_compound_pk() {
         &in_schema,
         &out_schema,
         &group_by,
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -955,17 +1243,13 @@ fn reduce_trace_seek_signed_pk() {
         &[
             SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
     );
     assert!(in_schema.pk_is_signed_single_col(), "test invariant: single signed PK");
 
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
+    let aggs = sum_count_aggs(1, TypeCode::I64);
     let group_by = [0u32];
 
     // Tick 1: insert key=-1 -> 200, key=2 -> 100.
@@ -991,7 +1275,7 @@ fn reduce_trace_seek_signed_pk() {
         &in_schema,
         &out_schema,
         &group_by,
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -1025,7 +1309,7 @@ fn reduce_trace_seek_signed_pk() {
         &in_schema,
         &out_schema,
         &group_by,
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -1366,27 +1650,23 @@ fn test_reduce_sum_i32() {
 
     let in_schema = make_schema_with_type(type_code::I32);
 
-    // Output: pk(U128), sum(I64)
+    // Output: pk(U128), sum(I64), count(I64) — trailing count companion.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
     );
 
-    let empty_out = Rc::new(Batch::empty(1, 16));
+    let empty_out = Rc::new(Batch::empty(2, 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
     // 3 rows with I32 values, group by PK
     let delta = make_batch_typed_i32(&in_schema, &[(1, 1, 100i32), (2, 1, 200i32), (3, 1, -50i32)]);
 
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I32,
-        _pad: [0; 2],
-    };
+    let aggs = sum_count_aggs(1, TypeCode::I32);
 
     // GROUP BY pk → each row is its own group
     let (out, _) = op_reduce(
@@ -1396,7 +1676,7 @@ fn test_reduce_sum_i32() {
         &in_schema,
         &out_schema,
         &[0u32],
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -3653,13 +3933,47 @@ fn make_pk_sum_out_schema() -> SchemaDescriptor {
     )
 }
 
+/// SUM-over-single-col-PK output schema with the trailing `I64 count`
+/// cardinality companion that every all-linear reduce now carries:
+/// `U128 pk, I64 sum (nullable), I64 count`.
+fn make_pk_sum_count_out_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+/// `[Sum(sum_col, sum_tc), Count(col 0)]` — a linear SUM plus the appended
+/// cardinality companion every all-linear reduce carries, the agg_descs the
+/// planner produces for `SELECT …, SUM(v) … GROUP BY …`.
+fn sum_count_aggs(sum_col: u32, sum_tc: TypeCode) -> [AggDescriptor; 2] {
+    [
+        AggDescriptor {
+            col_idx: sum_col,
+            agg_op: AggOp::Sum,
+            col_type_code: sum_tc,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 0,
+            agg_op: AggOp::Count,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+    ]
+}
+
 #[test]
 fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
     use crate::storage::CursorHandle;
     use std::rc::Rc;
 
     let in_schema = make_schema_u64_i64();
-    let out_schema = make_pk_sum_out_schema();
+    let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
@@ -3668,12 +3982,7 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
     // two distinct pk=5 rows.
     let delta = make_batch_raw_pk(&in_schema, &[(5, 1, 10), (3, 1, 20), (5, 1, 30)], |pk: u64| pk as u128);
 
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
+    let aggs = sum_count_aggs(1, TypeCode::I64);
 
     let (out, _) = op_reduce(
         &delta,
@@ -3682,7 +3991,7 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
         &in_schema,
         &out_schema,
         &[0u32],
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -3758,7 +4067,7 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
     use std::rc::Rc;
 
     let in_schema = make_schema_u64_i64();
-    let out_schema = make_pk_sum_out_schema();
+    let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
@@ -3767,12 +4076,7 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
     let mut delta = make_batch_raw_pk(&in_schema, &[(3, 1, 20), (5, 1, 10), (5, 1, 30)], |pk: u64| pk as u128);
     delta.sorted = true;
 
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
+    let aggs = sum_count_aggs(1, TypeCode::I64);
 
     let (out, _) = op_reduce(
         &delta,
@@ -3781,7 +4085,7 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
         &in_schema,
         &out_schema,
         &[0u32],
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
@@ -3873,11 +4177,13 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
 
     let in_schema = make_schema_i64pk_i64();
     // Output PK is naturally U128 here too (extends signed encoding via
-    // emit_pk on a single-col PK; we only check ordering of payload).
+    // emit_pk on a single-col PK; we only check ordering of payload). The
+    // trailing I64 is the cardinality companion every all-linear reduce carries.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U128, 0),
             SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
     );
@@ -3891,12 +4197,7 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
         (pk as u64) as u128
     });
 
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
+    let aggs = sum_count_aggs(1, TypeCode::I64);
 
     let (out, _) = op_reduce(
         &delta,
@@ -3905,7 +4206,7 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
         &in_schema,
         &out_schema,
         &[0u32],
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::I64,
@@ -3940,14 +4241,17 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
     use std::rc::Rc;
 
     let in_schema = make_schema_u64_i64();
-    let out_schema = make_pk_sum_out_schema();
+    let out_schema = make_pk_sum_count_out_schema();
 
-    // Build a pre-populated trace_out carrying (pk=5, SUM=100).
+    // Build a pre-populated trace_out carrying (pk=5, SUM=100, count=1). The
+    // trailing count is the cardinality companion; the old group's one prior row
+    // gives count=1, so the group survives the +1 insert delta.
     let mut prev = Batch::with_schema(out_schema, 1);
     prev.extend_pk(5u128);
     prev.extend_weight(&1i64.to_le_bytes());
     prev.extend_null_bmp(&0u64.to_le_bytes());
     prev.extend_col(0, &100i64.to_le_bytes());
+    prev.extend_col(1, &1i64.to_le_bytes());
     prev.count += 1;
     prev.sorted = true;
     prev.consolidated = true;
@@ -3958,12 +4262,7 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
     // TWO `(pk=5, w=-1, SUM=100)` retractions plus split partials.
     let delta = make_batch_raw_pk(&in_schema, &[(5, 1, 10), (3, 1, 20), (5, 1, 30)], |pk: u64| pk as u128);
 
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
+    let aggs = sum_count_aggs(1, TypeCode::I64);
 
     let (out, _) = op_reduce(
         &delta,
@@ -3972,7 +4271,7 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
         &in_schema,
         &out_schema,
         &[0u32],
-        &[agg],
+        &aggs,
         None,
         false,
         TypeCode::U64,
