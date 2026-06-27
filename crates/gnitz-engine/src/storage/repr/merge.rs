@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
-use super::columnar::{compare_pk_ordering, with_payload_cmp, ColumnarSource, SortEntry};
+use super::columnar::{compare_pk_ordering, schema_is_fixedint_nonnull, with_payload_cmp, ColumnarSource, SortEntry};
 // `columnar` as a module path is needed only by the test module's
 // `compare_pk_bytes`/`compare_rows` calls; dispatch uses `with_payload_cmp!`.
 #[cfg(test)]
@@ -409,6 +409,20 @@ impl<'a> DirectWriter<'a> {
         self.null_bmp[out_row * 8..out_row * 8 + 8].copy_from_slice(&null_word.to_le_bytes());
 
         let schema = self.schema;
+        // Fast path: every payload column is a non-nullable fixed-width int (the
+        // cached `FixedIntNonnull` class). No null bit can be set and no column
+        // is a German string, so skip the per-column null test and string-type
+        // branch and copy each cell straight through.
+        if schema_is_fixedint_nonnull(&schema) {
+            for (payload_idx, _ci, col) in schema.payload_columns() {
+                let col_size = col.size() as usize;
+                let off = out_row * col_size;
+                let src = batch.get_col_ptr(row, payload_idx, col_size);
+                self.col_bufs[payload_idx][off..off + col_size].copy_from_slice(src);
+            }
+            return;
+        }
+
         for (payload_idx, _ci, col) in schema.payload_columns() {
             let col_size = col.size() as usize;
             let is_null = (null_word >> payload_idx) & 1 != 0;
