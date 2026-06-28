@@ -2382,6 +2382,7 @@ mod tests {
             OpNode::Reduce {
                 group_cols: vec![1],
                 agg: AggKind::Null,
+                global_ground: false,
             },
         );
         gb.insert(4, OpNode::IntegrateSink);

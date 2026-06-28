@@ -405,7 +405,26 @@ impl CatalogEngine {
                 continue;
             };
             let mut touched = false;
-            while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
+            let mut first = true;
+            loop {
+                let chunk = match handle.cursor.drain_chunk(chunk_rows) {
+                    Some(chunk) => chunk,
+                    // Source dry on the first iteration: feed one empty epoch
+                    // through the same body so a global-aggregate reduce's n==0
+                    // ground seed fires (op_reduce mints its one SQL-required row
+                    // only when it receives an epoch). A no-op for every other view
+                    // — all operators early-return on an empty delta. This mirrors
+                    // the partitioned exchange-backfill's trailing pad round; it
+                    // must live here because `backfill_view` drives BOTH live CREATE
+                    // and the post-recovery rebuild of non-exchange views, so a call
+                    // site would lose the ground row on restart of an empty view.
+                    None if first => match self.dag.tables.get(&source_id).map(|e| e.schema) {
+                        Some(schema) => Batch::empty_with_schema(&schema),
+                        None => break,
+                    },
+                    None => break,
+                };
+                first = false;
                 if let Some(result) = self.dag.execute_epoch(vid, chunk, source_id) {
                     if result.count > 0 {
                         self.dag.ingest_to_family(vid, result);

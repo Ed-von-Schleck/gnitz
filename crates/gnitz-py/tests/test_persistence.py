@@ -1483,3 +1483,151 @@ def test_multiworker_crash_after_checkpoint():
         _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_global_aggregate_empty_source_survives_restart():
+    """A global (ungrouped) aggregate over a never-populated table shows one ground
+    row (COUNT=0, SUM=NULL). Views are ephemeral and re-derived through the circuit
+    at restart, so the seed must re-fire and exactly one ground row must survive."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_persist_gae_")
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("gae")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+            schema_name="gae")
+        conn.execute_sql(
+            "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
+            schema_name="gae")
+        vid, _ = conn.resolve_table("gae", "v")
+        rows = [r for r in conn.scan(vid) if r.weight > 0]
+        assert len(rows) == 1 and rows[0]["cnt"] == 0 and rows[0]["total"] is None
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vid2, _ = conn.resolve_table("gae", "v")
+        rows = [r for r in conn.scan(vid2) if r.weight > 0]
+        assert len(rows) == 1, f"post-restart: ground row must survive, got {len(rows)}"
+        assert rows[0]["cnt"] == 0 and rows[0]["total"] is None
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_global_aggregate_emptied_then_restart():
+    """A global aggregate populated then fully deleted shows one ground row; after a
+    restart (durable base table is empty) the re-derived view keeps exactly one."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_persist_gae2_")
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("gae2")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+            schema_name="gae2")
+        conn.execute_sql(
+            "CREATE VIEW v AS SELECT COUNT(*) AS cnt, MIN(a) AS lo FROM t",
+            schema_name="gae2")
+        vid, _ = conn.resolve_table("gae2", "v")
+        conn.execute_sql("INSERT INTO t VALUES (1, 5), (2, 8)", schema_name="gae2")
+        conn.execute_sql("DELETE FROM t", schema_name="gae2")
+        rows = [r for r in conn.scan(vid) if r.weight > 0]
+        assert len(rows) == 1 and rows[0]["cnt"] == 0 and rows[0]["lo"] is None
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vid2, _ = conn.resolve_table("gae2", "v")
+        rows = [r for r in conn.scan(vid2) if r.weight > 0]
+        assert len(rows) == 1, f"post-restart: one ground row, got {len(rows)}"
+        assert rows[0]["cnt"] == 0 and rows[0]["lo"] is None
+        # And the value returns on a fresh insert after restart.
+        conn.execute_sql("INSERT INTO t VALUES (3, 4)", schema_name="gae2")
+        r = [r for r in conn.scan(vid2) if r.weight > 0]
+        assert len(r) == 1 and r[0]["cnt"] == 1 and r[0]["lo"] == 4
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_global_aggregate_worker_count_change_reseeds():
+    """Create a global aggregate at 4 workers, restart at 2: V0's owner partition
+    moves to a different worker, so the new owner-bake must re-seed the ground.
+    Ephemeral re-derivation + per-process owner-bake must compose to exactly one
+    surviving row."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_persist_gawc_")
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=4)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("gawc")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+            schema_name="gawc")
+        conn.execute_sql(
+            "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
+            schema_name="gawc")
+        vid, _ = conn.resolve_table("gawc", "v")
+        rows = [r for r in conn.scan(vid) if r.weight > 0]
+        assert len(rows) == 1 and rows[0]["cnt"] == 0
+        conn.close()
+
+        # Restart at a DIFFERENT worker count: V0 owner moves W3 -> W1.
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=2)
+        conn = gnitz.connect(sock_path)
+        vid2, _ = conn.resolve_table("gawc", "v")
+        rows = [r for r in conn.scan(vid2) if r.weight > 0]
+        assert len(rows) == 1, f"new V0 owner must re-seed exactly one row, got {len(rows)}"
+        assert rows[0]["cnt"] == 0 and rows[0]["total"] is None
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_global_aggregate_replicated_survives_restart():
+    """A global aggregate over a WITH (replicated=true) empty source shows one
+    ground row, and the re-derived view keeps exactly one after a crash restart
+    (the backfill empty-epoch + replicated `i_am_owner` disjunct must re-fire)."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"), prefix="gnitz_persist_garep_")
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("garep")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) "
+            "WITH (replicated = true)",
+            schema_name="garep")
+        conn.execute_sql(
+            "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
+            schema_name="garep")
+        vid, _ = conn.resolve_table("garep", "v")
+        rows = [r for r in conn.scan(vid) if r.weight > 0]
+        assert len(rows) == 1 and rows[0]["cnt"] == 0 and rows[0]["total"] is None
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vid2, _ = conn.resolve_table("garep", "v")
+        rows = [r for r in conn.scan(vid2) if r.weight > 0]
+        assert len(rows) == 1, f"replicated ground must survive restart, got {len(rows)}"
+        assert rows[0]["cnt"] == 0 and rows[0]["total"] is None
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

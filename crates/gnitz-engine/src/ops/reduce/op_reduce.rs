@@ -3,11 +3,13 @@
 use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{pk_bytes_eq, scatter_copy, Batch, ConsolidatedBatch, DrainGuard, MemBatch, ReadCursor};
 
-use super::super::util::{cmp_col_window, extract_group_key, extract_group_key_cursor, GroupKeyExtractor};
+use super::super::util::{
+    cmp_col_window, extract_group_key, extract_group_key_cursor, global_group_key, GroupKeyExtractor,
+};
 use super::agg::{
     apply_agg_from_value_index, fold_old_aggs, is_single_col_natural_pk, Accumulator, AggDescriptor, AggOp,
 };
-use super::emit::{emit_finalized_row, emit_reduce_row};
+use super::emit::{emit_finalized_row, emit_global_ground, emit_reduce_row};
 use super::sort::{argsort_delta, argsort_pk_canonical, build_sort_descs, compare_by_group_cols, SortDesc};
 
 /// `clear()` does not re-zero the data buffer, so the scatter variants used
@@ -129,6 +131,13 @@ pub fn op_reduce(
     gi_col_idx: u32,
     finalize_prog: Option<&crate::expr::ResolvedProgram>,
     finalize_out_schema: Option<&SchemaDescriptor>,
+    // Global-aggregate ground machinery. `global_ground` is the planner's
+    // SQL-intent discriminator (true only for the user's ungrouped scalar
+    // aggregate); `i_am_owner` is the per-worker fact that this worker owns
+    // partition `partition_for_key(V₀)` (always true for a replicated reduce).
+    // Both false for every grouped reduce, which is then byte-for-byte unchanged.
+    global_ground: bool,
+    i_am_owner: bool,
 ) -> (Batch, Option<Batch>) {
     let num_aggs = agg_descs.len();
     let num_out_cols = output_schema.num_columns();
@@ -147,6 +156,49 @@ pub fn op_reduce(
 
     let n = working.count;
     if n == 0 {
+        // Seed site for the global-aggregate ground row. An empty source delivers
+        // an empty delta every pad round, so any post-loop code is unreachable;
+        // this is the only place to mint the one row SQL requires over a
+        // never-populated / fully-retracted source. Idempotent and owner-guarded:
+        //   * Only the V₀ owner seeds — every worker runs this pad, but exactly one
+        //     owns partition `partition_for_key(V₀)`. `i_am_owner` is always true
+        //     for a replicated reduce (single-source-read from worker 0).
+        //   * Only if `trace_out` has no row at V₀ yet — the reduce integrates its
+        //     own output within the epoch and `refresh_owned_cursors` rebuilds the
+        //     cursor each epoch, so a prior pad's seed is visible here and never
+        //     re-seeded → no weight-2 ground is constructible.
+        if global_ground && i_am_owner {
+            // V₀ batch-free: `extract_group_key` reads the (empty) delta's
+            // `null_word` unconditionally and would panic on the empty slice.
+            let v0 = global_group_key();
+            let stride = output_schema.pk_stride() as usize;
+            let mut out_pk_buf = [0u8; crate::schema::MAX_PK_BYTES];
+            out_pk_buf[..stride].copy_from_slice(&v0.to_be_bytes()[16 - stride..]);
+            let out_pk_bytes = &out_pk_buf[..stride];
+
+            trace_out_cursor.seek_bytes(out_pk_bytes);
+            let has_v0 = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(out_pk_bytes);
+            if !has_v0 {
+                let mut raw_output = Batch::with_schema(*output_schema, 1);
+                let mut fin_output = finalize_out_schema.map(|fs| Batch::with_schema(*fs, 1));
+                // The seed runs before the loop's accs / FinalizeContext setup, so
+                // build a fresh finalize context here.
+                let mut fin_ctx = finalize_prog.map(|p| crate::expr::FinalizeContext::new(p, output_schema));
+                emit_global_ground(
+                    &mut raw_output,
+                    out_pk_bytes,
+                    agg_descs,
+                    input_schema,
+                    output_schema,
+                    group_by_cols,
+                    finalize_prog,
+                    finalize_out_schema,
+                    fin_output.as_mut(),
+                    fin_ctx.as_mut(),
+                );
+                return (raw_output, fin_output);
+            }
+        }
         let empty_fin = finalize_out_schema.map(Batch::empty_with_schema);
         return (Batch::empty_with_schema(output_schema), empty_fin);
     }
@@ -612,6 +664,27 @@ pub fn op_reduce(
                     ctx,
                 );
             }
+        } else if global_ground {
+            // The emission gate shed the computed row (this group emptied, or a
+            // lone all-NULL MIN/MAX). For the user's ungrouped scalar aggregate
+            // this is THE one logical group, and SQL requires exactly one row, so
+            // emit the ground (COUNT=0, SUM/MIN/MAX/AVG=NULL) in its place. The
+            // pre-existing `has_old` retraction above already copied whatever was
+            // at trace_out@V₀ at weight −1, so computed→ground, ground→computed,
+            // and value-change ticks all net to one row. (Grouped reduces have
+            // `global_ground = false` and correctly emit nothing here.)
+            emit_global_ground(
+                &mut raw_output,
+                out_pk_bytes,
+                agg_descs,
+                input_schema,
+                output_schema,
+                group_by_cols,
+                finalize_prog,
+                finalize_out_schema,
+                fin_output.as_mut(),
+                fin_ctx.as_mut(),
+            );
         }
 
         num_groups += 1;

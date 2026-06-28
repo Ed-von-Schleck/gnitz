@@ -469,7 +469,11 @@ pub(super) fn emit_node(
             builder.add_distinct(in_reg as u16, reg_id as u16, out_delta_id as u16, hist_table_ptr);
         }
 
-        gnitz_wire::OpNode::Reduce { group_cols, agg } => {
+        gnitz_wire::OpNode::Reduce {
+            group_cols,
+            agg,
+            global_ground,
+        } => {
             emit_reduce(
                 loaded,
                 rw,
@@ -477,6 +481,7 @@ pub(super) fn emit_node(
                 reg_id,
                 group_cols,
                 agg,
+                *global_ground,
                 &in_regs,
                 builder,
                 state,
@@ -694,6 +699,7 @@ pub(super) fn emit_reduce(
     reg_id: i32,
     group_cols: &[u16],
     agg: &gnitz_wire::AggKind,
+    global_ground: bool,
     in_regs: &HashMap<i32, i32>,
     builder: &mut ProgramBuilder,
     state: &mut EmitState,
@@ -914,6 +920,33 @@ pub(super) fn emit_reduce(
         std::ptr::null()
     };
 
+    // Bake worker ownership of the global-aggregate seed exactly as the
+    // `PartitionFilter` arm bakes `(worker_rank(), num_workers())`. A reduce whose
+    // input has no upstream `ExchangeShard` is **replicated** (`reduce_multi_local`
+    // — the full source is on every worker), so every worker is its own owner and
+    // seeds its local copy; the load-bearing disjunct, since a replicated view is
+    // single-source-read from worker 0, not `worker_for_partition(V₀)`. A sharded
+    // global aggregate (`reduce_multi`) funnels all rows to partition
+    // `partition_for_key(V₀)`'s owner, so only that worker seeds. Checked against
+    // the static `loaded.incoming` graph (which retains the `ExchangeShard →
+    // Reduce` edge across the post-phase split), NOT the post-phase register wiring
+    // (the ExchangeShard node emits no instruction). `i_am_owner` is meaningful
+    // only when `global_ground`; left `false` otherwise so a grouped reduce never
+    // pays the bake.
+    let i_am_owner = global_ground && {
+        let replicated = !loaded.incoming.get(&nid).is_some_and(|ins| {
+            ins.iter().any(|&(src, port)| {
+                port == PORT_IN && matches!(loaded.nodes.get(&src), Some(gnitz_wire::OpNode::ExchangeShard { .. }))
+            })
+        });
+        replicated
+            || worker_rank() as usize
+                == crate::ops::worker_for_partition(
+                    crate::storage::partition_for_key(crate::ops::global_group_key()),
+                    num_workers() as usize,
+                )
+    };
+
     builder.add_reduce(
         in_reg_id as u16,
         (tr_in_reg_id >= 0).then_some(tr_in_reg_id as u16),
@@ -930,6 +963,8 @@ pub(super) fn emit_reduce(
         gi_col_idx,
         fin_prog_ptr,
         fin_schema_ptr,
+        global_ground,
+        i_am_owner,
     );
 
     if !tr_in_table_ptr.is_null() {

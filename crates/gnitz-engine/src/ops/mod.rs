@@ -33,4 +33,4 @@ pub(crate) use linear::{op_filter, op_map, op_negate, op_null_extend, op_union};
 pub(crate) use reduce::is_single_col_natural_pk;
 pub(crate) use reduce::{op_gather_reduce, op_reduce, AggDescriptor, AggOp};
 pub(crate) use scan::op_scan_trace;
-pub(crate) use util::{all_payload_null_mask, AVI_AV_BYTES};
+pub(crate) use util::{all_payload_null_mask, global_group_key, AVI_AV_BYTES};

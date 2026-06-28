@@ -2458,3 +2458,411 @@ class TestLinearReduceGroupExistence:
             check("after-inner-empty")
         finally:
             client.drop_schema(sn)
+
+
+class TestGlobalAggregate:
+    """Ungrouped (global) aggregate views — `SELECT MIN(x) FROM t` with no GROUP
+    BY. One logical group at the synthetic constant PK V0; SQL scalar-aggregate
+    semantics require exactly one output row even over an empty/fully-retracted
+    source (COUNT(*)=0, SUM/MIN/MAX/AVG=NULL). Run under GNITZ_WORKERS=1 and =4;
+    at =4 every source row funnels through partition 220's owner."""
+
+    @staticmethod
+    def _one_row(client, vid):
+        """The single positive-weight row of a global aggregate (asserts exactly one)."""
+        rows = [r for r in client.scan(vid) if r.weight > 0]
+        assert len(rows) == 1, f"expected exactly one global row, got {len(rows)}: {rows}"
+        return rows[0]
+
+    def test_count_sum_avg_min_max_populated(self, client):
+        """All five aggregates over a populated source, one row, correct values."""
+        sn = "ga_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total, "
+                "AVG(a) AS av, MIN(a) AS lo, MAX(a) AS hi FROM t",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 2), (2, 4), (3, 9)", schema_name=sn)
+            r = self._one_row(client, vid)
+            assert r["cnt"] == 3
+            assert r["total"] == 15
+            assert abs(r["av"] - 5.0) < 1e-9
+            assert r["lo"] == 2
+            assert r["hi"] == 9
+        finally:
+            client.drop_schema(sn)
+
+    def test_min_max_retract_to_next_best(self, client):
+        """Deleting the current MIN/MAX advances the global extremum to next-best."""
+        sn = "gar_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW vlo AS SELECT MIN(a) AS m FROM t", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW vhi AS SELECT MAX(a) AS m FROM t", schema_name=sn)
+            vlo = client.resolve_table(sn, "vlo")[0]
+            vhi = client.resolve_table(sn, "vhi")[0]
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
+            assert self._one_row(client, vlo)["m"] == 10
+            assert self._one_row(client, vhi)["m"] == 30
+            # Delete both extrema; MIN -> 20, MAX -> 20.
+            client.execute_sql("DELETE FROM t WHERE pk IN (1, 3)", schema_name=sn)
+            assert self._one_row(client, vlo)["m"] == 20, "MIN must advance to next-best"
+            assert self._one_row(client, vhi)["m"] == 20, "MAX must advance to next-best"
+        finally:
+            client.drop_schema(sn)
+
+    def test_where_filter(self, client):
+        """A WHERE filter on a global aggregate is honored."""
+        sn = "gaw_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total "
+                "FROM t WHERE a > 5", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 2), (2, 7), (3, 9)", schema_name=sn)
+            r = self._one_row(client, vid)
+            assert r["cnt"] == 2 and r["total"] == 16
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_filter_and_empty_source(self, client):
+        """HAVING is a post-reduce filter. Over an empty source the ground row is
+        in trace_out@V0 but `HAVING COUNT(*) > 0` filters it out of the view."""
+        sn = "gah_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(*) AS cnt FROM t HAVING COUNT(*) > 2",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            # Empty source: 0 > 2 filters the ground row → zero rows.
+            assert [r for r in client.scan(vid) if r.weight > 0] == []
+            client.execute_sql("INSERT INTO t VALUES (1, 1), (2, 1)", schema_name=sn)
+            assert [r for r in client.scan(vid) if r.weight > 0] == [], "2 not > 2"
+            client.execute_sql("INSERT INTO t VALUES (3, 1)", schema_name=sn)
+            assert self._one_row(client, vid)["cnt"] == 3
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_count_gt_zero_empty_source_zero_rows(self, client):
+        """`HAVING COUNT(*) > 0` over an empty source yields zero rows (the ground
+        row exists in trace_out@V0 but is filtered)."""
+        sn = "gah0_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(*) AS cnt FROM t HAVING COUNT(*) > 0",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            assert [r for r in client.scan(vid) if r.weight > 0] == []
+        finally:
+            client.drop_schema(sn)
+
+    def test_empty_source_one_row_at_creation_and_after_delete_all(self, client):
+        """Over a never-populated source the view shows one ground row (COUNT(*)=0,
+        SUM=NULL); after delete-all it returns to that ground; a refill restores
+        the computed values."""
+        sn = "gae_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            # View created over an EMPTY table — the seed must fire.
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            r = self._one_row(client, vid)
+            assert r["cnt"] == 0, "COUNT(*) over empty source is 0"
+            assert r["total"] is None, "SUM over empty source is NULL"
+
+            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=sn)
+            r = self._one_row(client, vid)
+            assert r["cnt"] == 2 and r["total"] == 12
+
+            client.execute_sql("DELETE FROM t", schema_name=sn)
+            r = self._one_row(client, vid)
+            assert r["cnt"] == 0 and r["total"] is None, "delete-all returns to ground"
+
+            client.execute_sql("INSERT INTO t VALUES (3, 4)", schema_name=sn)
+            r = self._one_row(client, vid)
+            assert r["cnt"] == 1 and r["total"] == 4, "value returns on refill"
+        finally:
+            client.drop_schema(sn)
+
+    def test_empty_source_count_col_is_zero(self, client):
+        """The empty-source ground forces COUNT(col)=0 (the only place COUNT(col)=0
+        is asserted — a non-empty all-NULL source is the separately-owned emitter
+        bug's domain and out of scope)."""
+        sn = "gec_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(a) AS c FROM t", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            assert self._one_row(client, vid)["c"] == 0, "COUNT(col) over empty source is 0"
+        finally:
+            client.drop_schema(sn)
+
+    def test_nonnullable_sum_empties_to_one_null_row(self, client):
+        """A non-nullable lone SUM (AggShape::Direct, no companion) driven empty:
+        the cardinality gate sheds the computed row and the ground branch supplies
+        one NULL row — not a concrete 0."""
+        sn = "gns_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT SUM(a) AS total FROM t", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, 5)", schema_name=sn)
+            assert self._one_row(client, vid)["total"] == 5
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            assert self._one_row(client, vid)["total"] is None, "emptied SUM is NULL, not 0"
+        finally:
+            client.drop_schema(sn)
+
+    def test_lone_min_all_null_then_value(self, client):
+        """A lone MIN over an all-NULL (non-empty) source is one NULL row; inserting
+        a value makes it appear."""
+        sn = "gmn_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT MIN(a) AS m FROM t", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, NULL), (2, NULL)", schema_name=sn)
+            assert self._one_row(client, vid)["m"] is None, "all-NULL MIN is NULL"
+            client.execute_sql("INSERT INTO t VALUES (3, 7)", schema_name=sn)
+            assert self._one_row(client, vid)["m"] == 7, "MIN appears once a value arrives"
+        finally:
+            client.drop_schema(sn)
+
+    def test_mixed_all_null_count_min_routes_to_ground(self, client):
+        """`SELECT COUNT(x), MIN(x)` over a non-empty all-NULL source: all
+        accumulators untouched → should_emit false → the ground supplies
+        COUNT(x)=0, MIN=NULL (never a COUNT=-N zombie)."""
+        sn = "gmm_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(a) AS c, MIN(a) AS m FROM t",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, NULL), (2, NULL)", schema_name=sn)
+            r = self._one_row(client, vid)
+            assert r["c"] == 0, "all-NULL mixed COUNT(x) routes to ground → 0"
+            assert r["m"] is None, "all-NULL MIN is NULL"
+        finally:
+            client.drop_schema(sn)
+
+    def test_select_star_pins_group_pk(self, client):
+        """SELECT * over a global aggregate ships the synthetic `_group_pk` U128
+        constant plus the aggregate column (documented limitation)."""
+        sn = "gss_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT MIN(a) AS lo FROM t", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, 3)", schema_name=sn)
+            r = self._one_row(client, vid)
+            cols = set(r._asdict().keys())
+            assert "_group_pk" in cols, f"_group_pk must be present, got {cols}"
+            assert "lo" in cols and r["lo"] == 3
+        finally:
+            client.drop_schema(sn)
+
+    def test_strict_validator_rejections(self, client):
+        """Computed-over-aggregate and literal projections are rejected at plan
+        time (the strict grouped-projection validator), pinning the invariant the
+        ground derivation depends on."""
+        sn = "gsv_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            for bad in [
+                "SELECT COUNT(*) + 1 AS c FROM t",
+                "SELECT COUNT(*) AS c, 'x' AS lit FROM t",
+                "SELECT SUM(a * 2) AS s FROM t",
+            ]:
+                with pytest.raises(Exception):
+                    client.execute_sql(f"CREATE VIEW bad AS {bad}", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_global_aggregate_differential(self, client):
+        """Global aggregate checked against the recompute oracle across an
+        empty → insert → update → delete-all → reinsert churn. The empty-source
+        one-row result (the entire reason the ground machinery exists) is covered
+        by the oracle, not only hand assertions."""
+        sn = "gad_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total, "
+                "AVG(a) AS av, MIN(a) AS lo, MAX(a) AS hi FROM t",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["cnt", "total", "av", "lo", "hi"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["a"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["a"], [],
+                    [("cnt", "COUNT", None), ("total", "SUM", "a"), ("av", "AVG", "a"),
+                     ("lo", "MIN", "a"), ("hi", "MAX", "a")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            check("empty-at-creation")
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 2), (2, 4), (3, 9)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "a": 2}, {"pk": 2, "a": 4}, {"pk": 3, "a": 9}])
+            check("after-insert")
+            client.execute_sql("UPDATE t SET a = 1 WHERE pk = 3", schema_name=sn)
+            oracle.apply_update(t_state, "pk", 3, {"a": 1})
+            check("after-update-min")
+            client.execute_sql("DELETE FROM t", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1, 2, 3])
+            check("after-delete-all")
+            client.execute_sql("INSERT INTO t VALUES (4, 8)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 4, "a": 8}])
+            check("after-reinsert")
+        finally:
+            client.drop_schema(sn)
+
+    def test_replicated_source_empty_and_populated(self, client):
+        """A global aggregate over a WITH (replicated=true) source: the empty-source
+        ground row (the `i_am_owner` replicated disjunct + backfill empty-epoch fix)
+        must be exactly one row, weight 1 — not zero (disjunct dropped) and not N
+        (N-fold per-worker). Also checks a populated value."""
+        sn = "grep_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) "
+                "WITH (replicated = true)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 1, f"replicated empty-source ground must be ONE row, got {len(rows)}"
+            assert rows[0].weight == 1, f"ground weight must be 1, got {rows[0].weight}"
+            assert rows[0]["cnt"] == 0 and rows[0]["total"] is None
+            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=sn)
+            r = self._one_row(client, vid)
+            assert r["cnt"] == 2 and r["total"] == 12, "replicated source not N-fold multiplied"
+        finally:
+            client.drop_schema(sn)
+
+    def test_replicated_nonaggregate_regression(self, client):
+        """A replicated non-aggregate (filter/map) view over an empty source still
+        backfills correctly with the new empty-epoch — no spurious row."""
+        sn = "grn_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) "
+                "WITH (replicated = true)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT pk, a * 2 AS d FROM t WHERE a > 0",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            assert [r for r in client.scan(vid) if r.weight > 0] == [], "no spurious row over empty source"
+            client.execute_sql("INSERT INTO t VALUES (1, 3)", schema_name=sn)
+            rows = {r["pk"]: r["d"] for r in client.scan(vid) if r.weight > 0}
+            assert rows == {1: 6}
+        finally:
+            client.drop_schema(sn)
+
+    def test_min_max_together_under_small_churn(self, client):
+        """`SELECT MIN(x), MAX(x)` in one view is NOT AVI-eligible (two aggregates)
+        and not all-linear, so it takes the whole-table replay path. Correctness
+        only — a small churn (insert → delete an extremum → empty → refill),
+        checked against the recompute oracle, exercises that O(table)/tick path."""
+        sn = "gmx_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT MIN(a) AS lo, MAX(a) AS hi FROM t",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["lo", "hi"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["a"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["a"], [], [("lo", "MIN", "a"), ("hi", "MAX", "a")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            check("empty")
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 5), (2, 9), (3, 2)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "a": 5}, {"pk": 2, "a": 9}, {"pk": 3, "a": 2}])
+            check("after-insert")  # lo=2, hi=9
+            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [2])
+            check("after-delete-max")  # hi recomputes to 5
+            client.execute_sql("DELETE FROM t", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1, 3])
+            check("after-empty")  # one NULL/NULL ground row
+            client.execute_sql("INSERT INTO t VALUES (4, 7)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 4, "a": 7}])
+            check("after-refill")  # lo=hi=7
+        finally:
+            client.drop_schema(sn)

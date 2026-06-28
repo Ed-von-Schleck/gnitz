@@ -213,6 +213,14 @@ def oracle_groupby_aggregate(rel, cols, group_names, aggs):
         slot["weight"] += w
         for a in arg_cols:
             slot["vals"][a].append((tup[idx[a]], w))
+    # A no-GROUP-BY (ungrouped/global) aggregate is one logical group that exists
+    # even over empty input: SQL scalar-aggregate semantics require exactly one row
+    # (COUNT(*)=0, COUNT(col)=0, SUM/MIN/MAX/AVG=NULL via _agg_value's empty-group
+    # arms). A plain GROUP BY emits a row only per non-empty input group, so seed
+    # the lone empty group `()` when the grouping set is empty and no input row
+    # formed one. Over a non-empty source the `()` group already exists.
+    if not group_names and not groups:
+        groups[()] = {"weight": 0, "vals": {a: [] for a in arg_cols}}
     out_cols = list(group_names) + [out for (out, _k, _a) in aggs]
     weights = Counter()
     for gkey, slot in groups.items():

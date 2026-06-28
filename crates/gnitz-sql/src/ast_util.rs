@@ -30,6 +30,66 @@ pub(crate) fn group_by_is_present(group_by: &sqlparser::ast::GroupByExpr) -> boo
     }
 }
 
+/// True for the aggregate function names the binder's `bind_function` accepts
+/// (`count`, `sum`, `min`, `max`, `avg`), matched case-insensitively. Kept in
+/// sync with that binder match by hand: an aggregate added there must be added
+/// here too, or a no-`GROUP BY` use of it would misroute to the scalar `Simple`
+/// builder and report the less-specific lowering error.
+pub(crate) fn is_aggregate_func_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "count" | "sum" | "min" | "max" | "avg"
+    )
+}
+
+/// True when any SELECT projection item contains an aggregate function call —
+/// at the top level (`MIN(x)`) or nested inside an arithmetic/comparison
+/// expression (`MIN(x) + 1`). Dispatch uses this to route a no-`GROUP BY`
+/// aggregate to the grouped builder (which compiles the ungrouped global
+/// aggregate, or rejects a computed-over-aggregate via its strict validator)
+/// instead of to the scalar `Simple` builder. The recursion mirrors the binder's
+/// `bind_structural` node set so the two agree on where an aggregate can hide.
+pub(crate) fn projection_has_aggregate(select: &sqlparser::ast::Select) -> bool {
+    use sqlparser::ast::SelectItem;
+    select.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(e) => expr_has_aggregate(e),
+        SelectItem::ExprWithAlias { expr, .. } => expr_has_aggregate(expr),
+        // `*` / `tbl.*` cannot be an aggregate.
+        _ => false,
+    })
+}
+
+/// Recursively test whether an expression contains an aggregate function call.
+/// Recurses through exactly the node set `bind_structural` reaches (binary/unary
+/// ops, nesting, BETWEEN, IS [NOT] NULL) plus an aggregate's own arguments.
+fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    match e {
+        Expr::Function(f) => {
+            if is_aggregate_func_name(&f.name.to_string()) {
+                return true;
+            }
+            // A non-aggregate wrapper over an aggregate (`abs(SUM(x))`) is still a
+            // grouped shape; recurse into the call's arguments.
+            match &f.args {
+                FunctionArguments::List(list) => list.args.iter().any(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => expr_has_aggregate(inner),
+                    _ => false,
+                }),
+                _ => false,
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
+        Expr::UnaryOp { expr, .. } => expr_has_aggregate(expr),
+        Expr::Nested(inner) => expr_has_aggregate(inner),
+        Expr::Between { expr, low, high, .. } => {
+            expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high)
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => expr_has_aggregate(inner),
+        _ => false,
+    }
+}
+
 /// Extract table name from a TableFactor::Table.
 pub(crate) fn extract_table_factor_name(
     tf: &sqlparser::ast::TableFactor,

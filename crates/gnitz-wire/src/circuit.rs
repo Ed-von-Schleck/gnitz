@@ -81,6 +81,7 @@ pub const NODE_COL_KIND_AGG_SPEC: u64 = 4; // REDUCE aggregate specs (value1=fun
 pub const NODE_COL_KIND_BRANCH_ID: u64 = 5; // MAP_HASH_ROW per-side branch discriminator (value1=branch_id)
 pub const NODE_COL_KIND_REINDEX: u64 = 6; // MAP_EXPR equijoin pre-index cols (value1=col_idx, position=key order)
 pub const NODE_COL_KIND_RANGE_JOIN: u64 = 7; // JOIN_DELTA_TRACE_RANGE params (value1=n_eq, value2=rel)
+pub const NODE_COL_KIND_GLOBAL_GROUND: u64 = 8; // REDUCE global-aggregate ground discriminator (value1=bool)
 
 // ---------------------------------------------------------------------------
 // Aggregate function IDs
@@ -234,6 +235,14 @@ pub enum OpNode {
     Reduce {
         group_cols: Vec<u16>,
         agg: AggKind,
+        /// True only for the user's ungrouped (global) scalar aggregate — the
+        /// reduce that must emit exactly one row over an empty/fully-retracted
+        /// source (COUNT(*)=0, SUM/MIN/MAX/AVG=NULL). A **SQL-intent
+        /// discriminator**, not a Z-set property: the LEFT range-join's threshold
+        /// reduce (`reduce_multi_local`) also has empty group cols but must NOT
+        /// seed a ground row, so the flag cannot be derived from
+        /// `group_cols.is_empty()` and travels explicitly from the planner.
+        global_ground: bool,
     },
     Join(JoinKind),
     AntiJoin(SetJoinKind),
@@ -364,7 +373,18 @@ pub fn decode_op_node(
             } else {
                 AggKind::Specs(specs)
             };
-            OpNode::Reduce { group_cols, agg }
+            // Absent row ⇒ `false` (the ordinary grouped / range-join reduce); a
+            // present row carries the global-aggregate intent in value1. One param
+            // row, exactly like NODE_COL_KIND_RANGE_JOIN.
+            let global_ground = cols
+                .iter()
+                .find(|c| c.kind == NODE_COL_KIND_GLOBAL_GROUND)
+                .is_some_and(|c| c.value1 != 0);
+            OpNode::Reduce {
+                group_cols,
+                agg,
+                global_ground,
+            }
         }
         OPCODE_JOIN_DELTA_TRACE => OpNode::Join(JoinKind::DeltaTrace),
         OPCODE_JOIN_DELTA_TRACE_OUTER => OpNode::Join(JoinKind::DeltaTraceOuter),

@@ -389,12 +389,19 @@ pub(crate) fn execute_create_group_by_view(
     // The circuit builder needs only (op, col) per spec; out_type is the
     // planner's concern and already shaped reduce_schema above.
     let circuit_specs: Vec<(u64, usize)> = agg_specs.iter().map(|s| (s.op, s.col)).collect();
+    // An empty group set is the user's ungrouped (global) scalar aggregate —
+    // `SELECT MIN(x) FROM t` with no GROUP BY. It compiles as a one-row reduce
+    // (synthetic `_group_pk` at the constant V₀) that must emit exactly one row
+    // even over an empty/fully-retracted source, so the engine seeds a ground row
+    // (COUNT=0, SUM/MIN/MAX/AVG=NULL). Grouped reduces (`group_col_indices`
+    // non-empty) pass `false` and are byte-for-byte unchanged.
+    let global_ground = group_col_indices.is_empty();
     let reduced = if source_replicated {
         // Shard-free: every worker reduces its full local copy to the same global
         // aggregate (no ExchangeShard ⇒ no gather barrier, no N-fold sum).
-        cb.reduce_multi_local(filtered, &reduce_group_cols, &circuit_specs)
+        cb.reduce_multi_local(filtered, &reduce_group_cols, &circuit_specs, global_ground)
     } else {
-        cb.reduce_multi(filtered, &reduce_group_cols, &circuit_specs)
+        cb.reduce_multi(filtered, &reduce_group_cols, &circuit_specs, global_ground)
     };
 
     // 6. Post-reduce MAP: project group cols + compute aggregates (AVG = SUM/COUNT)

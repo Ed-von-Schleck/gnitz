@@ -368,6 +368,9 @@ impl ProgramBuilder {
         // Finalize
         finalize_prog: *const crate::expr::ResolvedProgram,
         finalize_schema: *const SchemaDescriptor,
+        // Global-aggregate ground machinery
+        global_ground: bool,
+        i_am_owner: bool,
     ) {
         let (agg_off, agg_cnt) = self.add_agg_descs(agg_descs);
         let (gc_off, gc_cnt) = self.add_group_cols(group_cols);
@@ -406,6 +409,8 @@ impl ProgramBuilder {
             avi,
             finalize_func_idx,
             finalize_schema_idx,
+            global_ground,
+            i_am_owner,
         });
     }
 

@@ -430,6 +430,22 @@ pub(super) fn extract_group_key(mb: &MemBatch, row: usize, schema: &SchemaDescri
     extract_group_key_row(&BatchRow { mb, row }, schema, group_by_cols)
 }
 
+/// The 128-bit group key of the **empty** group-column set — the constant `V₀` a
+/// global (ungrouped) aggregate folds to. Batch-free: identical to the XXH3 empty
+/// digest `extract_group_key(.., &[])` produces over any populated row (the
+/// zero-column fold reads no row content), but without touching a batch, so it is
+/// callable at emit time (no batch exists) and over an empty delta — where
+/// `extract_group_key`'s unconditional `null_word()` read would index an empty
+/// slice and panic (a safe slice index, so it panics in release too). The single
+/// seam where `V₀` is defined: the owner-bake's `partition_for_key`, the seed's
+/// `emit_global_ground` PK and `trace_out` probe all route through this, while the
+/// runtime router and PK-stamp use the equal `extract_group_key` over a real row —
+/// so every site agrees byte-for-byte with no embedded literal.
+#[inline]
+pub(crate) fn global_group_key() -> u128 {
+    Xxh3Default::new().digest128()
+}
+
 /// Extract 128-bit group key from a `ReadCursor`'s current row. Hashes
 /// byte-identically to [`extract_group_key`] for the same logical row, so a
 /// trace row routes to the delta group it belongs to.
@@ -612,6 +628,38 @@ mod index_col_extractor_tests {
 
         let ex = IndexColExtractor::new(&schema, 1);
         assert_eq!(ex.extract(&mb, 0), 0xBEEFu64);
+    }
+
+    // The batch-free `global_group_key()` (used at emit time and over an empty
+    // delta) must equal the runtime `extract_group_key(.., &[])` over a real,
+    // arbitrarily-populated row — they are the SAME V₀, so routing, PK-stamp,
+    // owner-bake and seed all agree byte-for-byte. Row content must not perturb
+    // it (the empty-column fold reads nothing).
+    #[test]
+    fn global_group_key_matches_runtime_empty_cols() {
+        use super::{extract_group_key, global_group_key};
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
+        let v0 = global_group_key();
+        for (pk, payload, null) in [(1u128, 42i64, false), (999, -7, false), (0, 0, true)] {
+            let mut b = Batch::with_schema(schema, 1);
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&(null as u64).to_le_bytes());
+            b.extend_col(0, &payload.to_le_bytes());
+            b.count += 1;
+            let mb = b.as_mem_batch();
+            assert_eq!(
+                extract_group_key(&mb, 0, &schema, &[]),
+                v0,
+                "extract_group_key over empty group cols must equal global_group_key regardless of row content",
+            );
+        }
     }
 
     // Co-partition invariant (bug #2 regression): a single narrow-int

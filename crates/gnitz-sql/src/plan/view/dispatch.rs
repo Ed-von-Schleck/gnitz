@@ -2,7 +2,9 @@
 //! the view's shape, and dispatch to the matching builder. The single module in
 //! `plan/view` that knows about all the others.
 
-use crate::ast_util::{extract_name, extract_table_factor_name, group_by_is_present, is_wildcard_projection};
+use crate::ast_util::{
+    extract_name, extract_table_factor_name, group_by_is_present, is_wildcard_projection, projection_has_aggregate,
+};
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::plan::view::{group_by, join, set_op, simple};
@@ -136,7 +138,15 @@ impl<'a> ViewShape<'a> {
         if !select.from[0].joins.is_empty() {
             return Ok(ViewShape::Join(select));
         }
-        if group_by_is_present(&select.group_by) {
+        // GROUP BY *or* a no-`GROUP BY` aggregate (`SELECT MIN(x) FROM t`) routes
+        // to the grouped builder: the latter is one logical group compiled as a
+        // reduce with an empty group-column set. Routing it here (rather than to
+        // `Simple`, which would refuse the aggregate in scalar lowering with a
+        // less specific error) reuses the entire grouped pipeline — the
+        // synthetic-PK branch and the strict projection validator both already
+        // handle the empty group set. A `MIN(x)+1` is detected too and rejected
+        // by that validator, not by `Simple`'s lowering.
+        if group_by_is_present(&select.group_by) || projection_has_aggregate(select) {
             return Ok(ViewShape::GroupBy(select));
         }
         Ok(ViewShape::Simple(select))

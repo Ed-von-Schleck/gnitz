@@ -540,7 +540,6 @@ def _scan_global_agg(client, vid):
 
 
 @_NEEDS_MULTI
-@pytest.mark.xfail(strict=True, reason="distributed gather-reduce global MIN retraction re-emits deleted extremum")
 def test_global_min_multiworker_retract_current_min(client):
     sn = "gmr_" + _uid()
     client.create_schema(sn)
@@ -568,7 +567,6 @@ def test_global_min_multiworker_retract_current_min(client):
 
 
 @_NEEDS_MULTI
-@pytest.mark.xfail(strict=True, reason="distributed gather-reduce global MAX retraction re-emits deleted extremum")
 def test_global_max_multiworker_retract_current_max(client):
     sn = "gxr_" + _uid()
     client.create_schema(sn)

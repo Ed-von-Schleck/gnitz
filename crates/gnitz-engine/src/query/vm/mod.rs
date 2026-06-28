@@ -144,6 +144,12 @@ pub(crate) enum Instr {
         avi: Option<ReduceAvi>,
         finalize_func_idx: Option<u16>,
         finalize_schema_idx: Option<u16>,
+        // Global-aggregate ground machinery (see `op_reduce`). `global_ground` is
+        // the planner's SQL-intent discriminator; `i_am_owner` is baked per-worker
+        // at emit time (`replicated || worker_rank() == owner(V₀)`). Both default
+        // off for every grouped reduce.
+        global_ground: bool,
+        i_am_owner: bool,
     },
     GatherReduce {
         in_reg: u16,
@@ -1563,6 +1569,8 @@ mod tests {
             0,
             std::ptr::null(), // finalize_prog
             std::ptr::null(), // finalize_schema
+            false,
+            false,
         );
 
         // INTEGRATE raw_delta → trace_out
@@ -1680,6 +1688,8 @@ mod tests {
             0,
             std::ptr::null(),
             std::ptr::null(),
+            false,
+            false,
         );
         builder.add_halt();
 
@@ -1733,6 +1743,8 @@ mod tests {
             0,
             std::ptr::null(),
             std::ptr::null(),
+            false,
+            false,
         );
         builder.add_halt();
 
@@ -2116,6 +2128,8 @@ mod tests {
             0,
             std::ptr::null(),
             std::ptr::null(),
+            false,
+            false,
         );
         builder.add_integrate(
             2,
@@ -2356,6 +2370,8 @@ mod tests {
             0,
             std::ptr::null(),
             std::ptr::null(),
+            false,
+            false,
         );
         builder.add_integrate(
             3,

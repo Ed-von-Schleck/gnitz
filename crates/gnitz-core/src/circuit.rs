@@ -165,7 +165,11 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         OpNode::Union => ((OPCODE_UNION, None, None), Vec::new()),
         OpNode::Delay => ((OPCODE_DELAY, None, None), Vec::new()),
         OpNode::Distinct => ((OPCODE_DISTINCT, None, None), Vec::new()),
-        OpNode::Reduce { group_cols, agg } => {
+        OpNode::Reduce {
+            group_cols,
+            agg,
+            global_ground,
+        } => {
             let mut kind_rows = Vec::with_capacity(group_cols.len() + 4);
             for (i, c) in group_cols.iter().enumerate() {
                 kind_rows.push((NODE_COL_KIND_GROUP, i as u16, *c as u64, 0));
@@ -174,6 +178,12 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
                 for (i, (func, col)) in specs.into_iter().enumerate() {
                     kind_rows.push((NODE_COL_KIND_AGG_SPEC, i as u16, func.as_u64(), col as u64));
                 }
+            }
+            // Only the user's global scalar aggregate carries the row; an
+            // ordinary grouped / range-join reduce omits it (decodes to `false`),
+            // keeping every existing reduce circuit byte-identical on the wire.
+            if global_ground {
+                kind_rows.push((NODE_COL_KIND_GLOBAL_GROUND, 0, 1, 0));
             }
             ((OPCODE_REDUCE, None, None), kind_rows)
         }
@@ -430,7 +440,13 @@ impl CircuitBuilder {
     /// partitioning of `input` — `reduce`/`reduce_multi` shard first;
     /// `reduce_multi_local` passes a deliberately pre-replicated input straight
     /// through. Empty `agg_specs` ⇒ `AggKind::Null` (group-only distinct-reduce).
-    fn reduce_node(&mut self, input: NodeId, group_cols: &[usize], agg_specs: &[(u64, usize)]) -> NodeId {
+    fn reduce_node(
+        &mut self,
+        input: NodeId,
+        group_cols: &[usize],
+        agg_specs: &[(u64, usize)],
+        global_ground: bool,
+    ) -> NodeId {
         let group: Vec<u16> = group_cols.iter().map(|&c| c as u16).collect();
         let specs: Vec<(AggFunc, u16)> = agg_specs
             .iter()
@@ -448,6 +464,7 @@ impl CircuitBuilder {
             } else {
                 AggKind::Specs(specs)
             },
+            global_ground,
         });
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
@@ -456,14 +473,25 @@ impl CircuitBuilder {
     /// Reduce with automatic shard insertion (required for multi-worker correctness).
     pub fn reduce(&mut self, input: NodeId, group_cols: &[usize], agg_func_id: u64, agg_col_idx: usize) -> NodeId {
         let sharded = self.shard(input, group_cols);
-        self.reduce_node(sharded, group_cols, &[(agg_func_id, agg_col_idx)])
+        // The low-level single-agg API is never the user's global scalar
+        // aggregate (that path goes through `reduce_multi`/`reduce_multi_local`),
+        // so it never seeds a ground row.
+        self.reduce_node(sharded, group_cols, &[(agg_func_id, agg_col_idx)], false)
     }
 
     /// Multi-aggregate reduce with automatic shard insertion (required for
     /// multi-worker correctness). `agg_specs`: list of (agg_func_id, col_idx).
-    pub fn reduce_multi(&mut self, input: NodeId, group_cols: &[usize], agg_specs: &[(u64, usize)]) -> NodeId {
+    /// `global_ground` is `true` only for the user's ungrouped scalar aggregate
+    /// (empty `group_cols`); the grouped builder passes `group_cols.is_empty()`.
+    pub fn reduce_multi(
+        &mut self,
+        input: NodeId,
+        group_cols: &[usize],
+        agg_specs: &[(u64, usize)],
+        global_ground: bool,
+    ) -> NodeId {
         let sharded = self.shard(input, group_cols);
-        self.reduce_node(sharded, group_cols, agg_specs)
+        self.reduce_node(sharded, group_cols, agg_specs, global_ground)
     }
 
     /// Shard-free multi-aggregate reduce: aggregates `input` **locally on every
@@ -473,8 +501,18 @@ impl CircuitBuilder {
     /// `input` must already be replicated/broadcast (byte-identical *contents* per
     /// worker), so each worker's local reduce computes the SAME global aggregate.
     /// Misused on a partitioned input it silently computes per-worker partials.
-    pub fn reduce_multi_local(&mut self, input: NodeId, group_cols: &[usize], agg_specs: &[(u64, usize)]) -> NodeId {
-        self.reduce_node(input, group_cols, agg_specs)
+    ///
+    /// `global_ground` is `true` only for the user's ungrouped scalar aggregate
+    /// over a replicated source; the LEFT range-join threshold reduce (also empty
+    /// group cols) passes `false` so it never seeds a spurious `(m=NULL)` row.
+    pub fn reduce_multi_local(
+        &mut self,
+        input: NodeId,
+        group_cols: &[usize],
+        agg_specs: &[(u64, usize)],
+        global_ground: bool,
+    ) -> NodeId {
+        self.reduce_node(input, group_cols, agg_specs, global_ground)
     }
 
     /// Exchange shard: routes rows to workers by hashing the given columns.
@@ -669,6 +707,39 @@ mod tests {
                     .any(|n| matches!(n, OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 0, rel: r }) if *r == rel)),
                 "rel {rel:?} did not round-trip"
             );
+        }
+    }
+
+    /// The `global_ground` discriminator rides as one param row and survives
+    /// into_rows → from_rows: set for an ungrouped global aggregate, clear for an
+    /// ordinary grouped reduce (so existing reduce circuits are byte-identical).
+    #[test]
+    fn reduce_global_ground_roundtrips() {
+        use gnitz_wire::{AggKind, NODE_COL_KIND_GLOBAL_GROUND};
+        for ground in [false, true] {
+            let mut cb = CircuitBuilder::new(3, 100);
+            let input = cb.input_delta();
+            // Empty group cols + one COUNT(*) spec, the ungrouped-aggregate shape.
+            let red = cb.reduce_multi(input, &[], &[(gnitz_wire::AGG_COUNT, 0)], ground);
+            cb.sink(red);
+            let rows = cb.build().into_rows();
+
+            // The param row is present iff `ground`.
+            let gg_rows = rows
+                .node_columns
+                .iter()
+                .filter(|(nid, kind, ..)| *nid == red && *kind == NODE_COL_KIND_GLOBAL_GROUND)
+                .count();
+            assert_eq!(gg_rows, ground as usize, "global_ground row present iff set");
+
+            let decoded = Circuit::from_rows(3, rows).expect("from_rows");
+            match decoded.nodes.get(&red) {
+                Some(OpNode::Reduce { global_ground, agg, .. }) => {
+                    assert_eq!(*global_ground, ground);
+                    assert!(matches!(agg, AggKind::Specs(_)));
+                }
+                other => panic!("expected Reduce, got {other:?}"),
+            }
         }
     }
 

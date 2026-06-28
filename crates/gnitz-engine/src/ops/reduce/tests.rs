@@ -209,6 +209,8 @@ fn test_reduce_sum_retraction() {
         0,
         None,
         None,
+        false,
+        false,
     );
     // SUM of (100+200+300) = 600
     assert_eq!(out1.count, 1);
@@ -248,6 +250,8 @@ fn test_reduce_sum_retraction() {
         0,
         None,
         None,
+        false,
+        false,
     );
     // Output: retract old sum (600, w=-1) + insert new sum (400, w=+1) = 2 rows.
     // The group survives (cardinality 3 → 2), so the +1 is emitted.
@@ -302,6 +306,8 @@ fn linear_sum_only_emptied_group_eliminated() {
             0,
             None,
             None,
+            false,
+            false,
         )
         .0
     };
@@ -455,6 +461,8 @@ fn linear_sum_only_new_all_null_group_present() {
         0,
         Some(&fin_prog),
         Some(&fin_schema),
+        false,
+        false,
     );
     let fin = fin.expect("finalize output present");
     assert_eq!(
@@ -520,6 +528,8 @@ fn count_star_only_emptied_group_eliminated() {
             0,
             None,
             None,
+            false,
+            false,
         )
         .0
     };
@@ -689,6 +699,8 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         0,
         Some(&fin_prog),
         Some(&fin_schema),
+        false,
+        false,
     );
     let fin1 = fin1.expect("finalize output present");
     // One group: count=2, sum=5 (non-null while a contributor remains), cnn=1.
@@ -735,6 +747,8 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         0,
         Some(&fin_prog),
         Some(&fin_schema),
+        false,
+        false,
     );
     let fin2 = fin2.expect("finalize output present");
     // Retract the old aggregate (w=-1) and insert the new one (w=+1).
@@ -842,6 +856,8 @@ fn null_min_retraction_re_emits_null() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out1.count, 1);
     assert!(
@@ -879,6 +895,8 @@ fn null_min_retraction_re_emits_null() {
         0,
         None,
         None,
+        false,
+        false,
     );
     let mb2 = out2.as_mem_batch();
     let retr = (0..out2.count)
@@ -965,6 +983,8 @@ fn null_sum_fold_stays_null() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert!(
         out1.as_mem_batch().get_null_word(0) & sum_null_bit != 0,
@@ -988,6 +1008,8 @@ fn null_sum_fold_stays_null() {
         0,
         None,
         None,
+        false,
+        false,
     );
     let mb2 = out2.as_mem_batch();
     let new_row = (0..out2.count).find(|&i| out2.get_weight(i) > 0).expect("insert row");
@@ -1059,6 +1081,8 @@ fn reduce_trace_seek_wide_pk() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out1.count, 1, "one group");
     assert_eq!(out1.get_pk_bytes(0), &pk(7, 7, 7)[..]);
@@ -1094,6 +1118,8 @@ fn reduce_trace_seek_wide_pk() {
         0,
         None,
         None,
+        false,
+        false,
     );
     // Retraction of old SUM (300, w=-1) then insert of new SUM (100, w=+1).
     assert_eq!(
@@ -1173,6 +1199,8 @@ fn reduce_trace_seek_compound_pk() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out1.count, 2, "two groups");
     assert_eq!(out1.get_pk_bytes(0), &pk(1, 5)[..]);
@@ -1210,6 +1238,8 @@ fn reduce_trace_seek_compound_pk() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(
         out2.count, 2,
@@ -1283,6 +1313,8 @@ fn reduce_trace_seek_signed_pk() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out1.count, 2, "two groups (-1 sorts before 2)");
     assert_eq!(opk_pk_i64(out1.get_pk_bytes(0)), -1);
@@ -1317,6 +1349,8 @@ fn reduce_trace_seek_signed_pk() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(
         out2.count, 2,
@@ -1376,6 +1410,8 @@ fn test_reduce_count() {
         0,
         None,
         None,
+        false,
+        false,
     );
     // Each pk forms its own group, COUNT=1 for each
     assert_eq!(out.count, 3);
@@ -1435,6 +1471,8 @@ fn test_reduce_gi_same_pk_multiple_payloads() {
         1u32,                         // gi_col_idx: grp column
         None,                         // finalize_prog
         None,                         // finalize_out_schema
+        false,
+        false,
     );
 
     // The accumulator stores the first 8 bytes of the German string as i64.
@@ -1684,6 +1722,8 @@ fn test_reduce_sum_i32() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out.count, 3);
     // Check values: row offsets depend on PK order (group_by_pk path)
@@ -1740,6 +1780,8 @@ fn test_reduce_min_f32() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out.count, 1);
     // MIN should be -1.0 stored as f64 bits
@@ -1792,6 +1834,8 @@ fn test_reduce_max_i16() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out.count, 1);
     let max_val = read_i64_le(out.col_data(0), 0);
@@ -2098,6 +2142,8 @@ fn test_reduce_gi_i32_group_key_overread() {
         1u32,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 2, "expected 2 output groups (grp=3 and grp=5)");
@@ -2234,6 +2280,8 @@ fn test_reduce_gi_signed_source_pk_negative() {
         1u32,
         None,
         None,
+        false,
+        false,
     );
 
     let m = gi_out_min_for_grp(&out, 7).expect("no output row for grp=7");
@@ -2347,6 +2395,8 @@ fn test_reduce_gi_wide_source_pk_stride24() {
         3u32,
         None,
         None,
+        false,
+        false,
     );
 
     let m = gi_out_min_for_grp(&out, 9).expect("no output row for grp=9");
@@ -2425,6 +2475,8 @@ fn test_reduce_gi_narrow_source_matches_no_gi() {
                 1u32,
                 None,
                 None,
+                false,
+                false,
             );
             gi_out_min_for_grp(&out, 5).expect("GI: no output row for grp=5")
         } else {
@@ -2445,6 +2497,8 @@ fn test_reduce_gi_narrow_source_matches_no_gi() {
                 1u32,
                 None,
                 None,
+                false,
+                false,
             );
             gi_out_min_for_grp(&out, 5).expect("no-GI: no output row for grp=5")
         }
@@ -2892,6 +2946,8 @@ fn test_reduce_min_pk_col_compound_pk() {
         0,
         None,
         None,
+        false,
+        false,
     );
     // group_by_pk: each (pk0, pk1) is its own group, so we get one row
     // per input row; MIN within each group equals the row's pk_col_1.
@@ -2949,6 +3005,8 @@ fn test_reduce_min_pk_col_single_pk_u64() {
         0,
         None,
         None,
+        false,
+        false,
     );
     // GROUP BY pk → each row is its own group; MIN(pk) per group equals the row's pk.
     assert_eq!(out.count, 3);
@@ -3004,6 +3062,8 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 2);
@@ -3213,6 +3273,8 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     // Two groups: pk_col_0=1 (count=2), pk_col_0=2 (count=1).
@@ -3370,6 +3432,8 @@ fn test_reduce_min_u64_high_bit_set() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out.count, 1);
     let min_bits = u64::from_le_bytes(out.col_data(1)[0..8].try_into().unwrap());
@@ -3416,6 +3480,8 @@ fn test_reduce_max_u64_high_bit_set() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out.count, 1);
     let max_bits = u64::from_le_bytes(out.col_data(1)[0..8].try_into().unwrap());
@@ -3461,6 +3527,8 @@ fn test_reduce_min_u64_incremental() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out1.count, 1);
     let min1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
@@ -3496,6 +3564,8 @@ fn test_reduce_min_u64_incremental() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out2.count, 2, "retract old MIN + emit new MIN");
     let retracted = u64::from_le_bytes(out2.col_data(1)[0..8].try_into().unwrap());
@@ -3549,6 +3619,8 @@ fn test_reduce_max_u64_incremental() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out1.count, 1);
     let max1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
@@ -3579,6 +3651,8 @@ fn test_reduce_max_u64_incremental() {
         0,
         None,
         None,
+        false,
+        false,
     );
     // Expect: retract old MAX (10) + emit new MAX (u64::MAX).
     assert_eq!(out2.count, 2);
@@ -3677,6 +3751,8 @@ fn test_reduce_min_u64_replay_via_trace_in() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(out1.count, 1);
     let min1 = u64::from_le_bytes(out1.col_data(1)[0..8].try_into().unwrap());
@@ -3710,6 +3786,8 @@ fn test_reduce_min_u64_replay_via_trace_in() {
         0,
         None,
         None,
+        false,
+        false,
     );
     // Retract old MIN (u64::MAX) + emit new MIN (5).
     assert_eq!(out2.count, 2);
@@ -3764,6 +3842,8 @@ fn test_reduce_min_max_i64_boundary() {
             0,
             None,
             None,
+            false,
+            false,
         );
         assert_eq!(out.count, 1);
         let min = read_i64_le(out.col_data(1), 0);
@@ -3802,6 +3882,8 @@ fn test_reduce_min_max_i64_boundary() {
             0,
             None,
             None,
+            false,
+            false,
         );
         assert_eq!(out.count, 1);
         let max = read_i64_le(out.col_data(1), 0);
@@ -4001,6 +4083,8 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 2, "one row per distinct PK");
@@ -4052,6 +4136,8 @@ fn test_reduce_group_by_pk_unsorted_input_count() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 2);
@@ -4095,6 +4181,8 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 2);
@@ -4152,6 +4240,8 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 2);
@@ -4216,6 +4306,8 @@ fn test_reduce_group_by_pk_unsorted_signed_pk() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 3, "one row per distinct signed PK");
@@ -4281,6 +4373,8 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     // Expected: one retract (pk=5, w=-1, SUM=100), one emit (pk=5,
@@ -4364,6 +4458,8 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     // Retract old MIN=10 (w=-1) + emit new MIN=20 (w=+1). With the consolidation
@@ -4576,6 +4672,8 @@ fn avi_two_groups_distinct_byte_form_keys() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 2, "two groups → two rows");
@@ -4704,6 +4802,8 @@ fn avi_retraction_returns_next_extremum() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     // Expect a retraction of the old MIN (5, weight -1) and the recomputed MIN
@@ -4813,6 +4913,8 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             0,
             None,
             None,
+            false,
+            false,
         );
 
         assert_eq!(out.count, 1, "stride {stride}");
@@ -4919,6 +5021,8 @@ fn trace_scan_retraction_recomputes_min() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     // Expect a retraction of the old MIN (5, weight -1) and the recomputed
@@ -5035,6 +5139,8 @@ fn min_tie_retract_one_copy_keeps_min() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     let mut new_min = None;
@@ -5124,6 +5230,8 @@ fn min_ignores_null_values() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 1);
@@ -5241,6 +5349,8 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     let mut inserted = None;
@@ -5401,6 +5511,8 @@ fn avi_wide_two_u64_groups_match_reference() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, reference.len(), "one row per group");
@@ -5509,6 +5621,8 @@ fn avi_wide_single_u128_group_distinct() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 2);
@@ -5630,6 +5744,8 @@ fn avi_wide_mixed_signed_unsigned_key() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 3);
@@ -5745,6 +5861,8 @@ fn avi_wide_prefix_collision_distinct_groups() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     assert_eq!(out.count, 1, "delta touched only group (1,2,3)");
@@ -5870,6 +5988,8 @@ fn avi_wide_retraction_returns_next_extremum() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     let mut retracted = None;
@@ -6114,6 +6234,8 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     // One row per distinct PK; output is sorted + consolidated.
@@ -6422,6 +6544,8 @@ fn run_fallback_min_i64_grp(
         0,
         None,
         None,
+        false,
+        false,
     );
 
     let got1 = read_grp_min_pairs(&out1);
@@ -6451,6 +6575,8 @@ fn run_fallback_min_i64_grp(
         0,
         None,
         None,
+        false,
+        false,
     );
 
     let grp_data = out2.col_data(0);
@@ -6616,6 +6742,8 @@ fn fallback_min_multi_col_group() {
         0,
         None,
         None,
+        false,
+        false,
     );
     // Verify 3 distinct groups came out.
     assert_eq!(out1.count, 3, "tick 1 must emit 3 groups");
@@ -6646,6 +6774,8 @@ fn fallback_min_multi_col_group() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     // No retraction (trace_out was empty), just one insert for group (1,1).
@@ -6743,6 +6873,8 @@ fn fallback_trace_rewind_at_most_once() {
         0,
         None,
         None,
+        false,
+        false,
     );
 
     let rewinds = REWIND_CALLS.with(|c| c.get());
@@ -6976,6 +7108,8 @@ fn test_reduce_max_blob_group_retraction() {
         0,
         None,
         None,
+        false,
+        false,
     );
     assert_eq!(
         out1.count, 2,
@@ -7012,6 +7146,8 @@ fn test_reduce_max_blob_group_retraction() {
         0,
         None,
         None,
+        false,
+        false,
     );
     // blob_a's MAX updates 30 → 10: retract old (30, w=-1) + insert new (10, w=+1).
     // blob_b is untouched.
@@ -7070,5 +7206,553 @@ fn gather_combine_skips_null_partial() {
         read_i64_le(out.col_data(0), 0),
         5,
         "gather MIN must ignore the all-NULL partial, not combine it as 0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Global (ungrouped) aggregate ground-row tests
+//
+// A no-`GROUP BY` aggregate is one logical group with an empty group-column set;
+// the output PK is the synthetic constant V₀. `op_reduce` must emit exactly one
+// row at V₀ over an empty/fully-retracted source (COUNT=0, SUM/MIN/MAX=NULL).
+// ---------------------------------------------------------------------------
+
+/// Source for the global-aggregate tests: `[pk:U64, val:I64(nullable)]`.
+fn g_src() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    )
+}
+
+/// Build a delta over `g_src()` from `(pk, weight, val)` rows.
+fn g_delta(rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
+    let schema = g_src();
+    let mut b = Batch::with_schema(schema, rows.len().max(1));
+    for &(pk, w, val) in rows {
+        b.extend_pk(pk as u128);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes());
+        b.count += 1;
+    }
+    b.sorted = true;
+    b.consolidated = true;
+    ConsolidatedBatch::new_unchecked(b)
+}
+
+const G_COUNT: AggDescriptor = AggDescriptor {
+    col_idx: 0,
+    agg_op: AggOp::Count,
+    col_type_code: TypeCode::U64,
+    _pad: [0; 2],
+};
+const G_SUM: AggDescriptor = AggDescriptor {
+    col_idx: 1,
+    agg_op: AggOp::Sum,
+    col_type_code: TypeCode::I64,
+    _pad: [0; 2],
+};
+const G_MIN: AggDescriptor = AggDescriptor {
+    col_idx: 1,
+    agg_op: AggOp::Min,
+    col_type_code: TypeCode::I64,
+    _pad: [0; 2],
+};
+
+/// Output `[_group_pk:U128, sum:I64(nullable), count:I64]` (SUM + cardinality
+/// companion) — the all-linear global-aggregate shape.
+fn g_out_sum_count() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+/// Output `[_group_pk:U128, count:I64, min:I64(nullable)]` — the mixed
+/// non-linear global-aggregate shape (`SELECT COUNT(*), MIN(x)`).
+fn g_out_count_min() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    )
+}
+
+/// `op_reduce` over `g_src()` with empty group cols (the global-aggregate path).
+#[allow(clippy::too_many_arguments)]
+fn g_reduce(
+    delta: &ConsolidatedBatch,
+    trace_in: Option<&mut crate::storage::ReadCursor>,
+    trace_out: &mut crate::storage::ReadCursor,
+    out_schema: &SchemaDescriptor,
+    aggs: &[AggDescriptor],
+    i_am_owner: bool,
+) -> (Batch, Option<Batch>) {
+    let in_schema = g_src();
+    op_reduce(
+        delta,
+        trace_in,
+        trace_out,
+        &in_schema,
+        out_schema,
+        &[], // empty group cols ⇒ one global group at V₀
+        aggs,
+        None,
+        false,
+        TypeCode::U64,
+        None,
+        0,
+        None,
+        None,
+        true, // global_ground
+        i_am_owner,
+    )
+}
+
+/// Seed over an empty source emits exactly one ground row at V₀: COUNT=0, SUM=NULL.
+#[test]
+fn global_seed_over_empty_emits_one_ground_row() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = g_out_sum_count();
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+    let (raw, _) = g_reduce(
+        &g_delta(&[]),
+        None,
+        to_ch.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        true,
+    );
+
+    assert_eq!(raw.count, 1, "empty-source global aggregate must emit one ground row");
+    assert_eq!(raw.get_weight(0), 1, "ground row weight +1");
+    assert_eq!(raw.get_pk(0), crate::ops::global_group_key(), "ground PK must be V₀");
+    assert_eq!(raw.get_null_word(0) & 1, 1, "SUM must be NULL over empty source");
+    assert_eq!(
+        read_i64_le(raw.col_data(1), 0),
+        0,
+        "COUNT(*) must be 0 over empty source"
+    );
+    assert_eq!((raw.get_null_word(0) >> 1) & 1, 0, "COUNT must be present (not NULL)");
+}
+
+/// The seed is idempotent: a second empty pad whose trace_out already holds the
+/// V₀ ground re-seeds nothing (no weight-2 ground is constructible).
+#[test]
+fn global_seed_idempotent_across_two_empty_pads() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = g_out_sum_count();
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (raw1, _) = g_reduce(
+        &g_delta(&[]),
+        None,
+        to_ch.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        true,
+    );
+    assert_eq!(raw1.count, 1, "first pad seeds the ground");
+
+    // Second pad: trace_out now holds the V₀ ground from the first pad.
+    let prev = Rc::new(raw1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let (raw2, _) = g_reduce(
+        &g_delta(&[]),
+        None,
+        to_ch2.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        true,
+    );
+    assert_eq!(raw2.count, 0, "second pad must NOT re-seed (V₀ already in trace_out)");
+}
+
+/// A non-owner worker's empty pad seeds nothing — it emits a literally empty
+/// batch (asserted on the batch itself, not a merged result).
+#[test]
+fn global_non_owner_empty_pad_emits_zero_rows() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = g_out_sum_count();
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (raw, _) = g_reduce(
+        &g_delta(&[]),
+        None,
+        to_ch.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        false, // not the V₀ owner
+    );
+    assert_eq!(raw.count, 0, "non-owner empty pad must emit a zero-row batch");
+}
+
+/// Create over a non-empty source emits one computed row and NO ground.
+#[test]
+fn global_create_over_nonempty_emits_computed_no_ground() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = g_out_sum_count();
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (raw, _) = g_reduce(
+        &g_delta(&[(1, 1, 5), (2, 1, 10)]),
+        None,
+        to_ch.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        true,
+    );
+    assert_eq!(raw.count, 1, "one computed row, no ground");
+    assert_eq!(read_i64_le(raw.col_data(0), 0), 15, "SUM=15");
+    assert_eq!(read_i64_le(raw.col_data(1), 0), 2, "COUNT=2");
+    assert_eq!(raw.get_null_word(0) & 1, 0, "SUM present (not NULL)");
+}
+
+/// Fully retracting an all-linear global aggregate sheds the computed row and the
+/// ground branch supplies one NULL/zero row in its place (net = one ground row).
+#[test]
+fn global_emptied_by_delete_emits_ground() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = g_out_sum_count();
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (raw1, _) = g_reduce(
+        &g_delta(&[(1, 1, 5)]),
+        None,
+        to_ch.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        true,
+    );
+    assert_eq!(read_i64_le(raw1.col_data(0), 0), 5, "SUM=5");
+
+    // Retract the only row → cardinality 0.
+    let prev = Rc::new(raw1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let (raw2, _) = g_reduce(
+        &g_delta(&[(1, -1, 5)]),
+        None,
+        to_ch2.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        true,
+    );
+
+    // Retract old computed (-1) + emit ground (+1) = 2 rows; net view = ground.
+    assert_eq!(raw2.count, 2, "retraction of old + ground insert");
+    let mb = raw2.as_mem_batch();
+    let pos = (0..2).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
+    assert_eq!(raw2.get_null_word(pos) & 1, 1, "ground SUM=NULL");
+    assert_eq!(read_i64_le(raw2.col_data(1), pos * 8), 0, "ground COUNT=0");
+}
+
+/// A seeded ground transitions to a computed row when the source is populated:
+/// the ground at V₀ is retracted and the computed row replaces it.
+#[test]
+fn global_ground_to_computed_on_first_insert() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = g_out_sum_count();
+    // Tick 1: seed the ground over an empty source.
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (ground, _) = g_reduce(
+        &g_delta(&[]),
+        None,
+        to_ch.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        true,
+    );
+    assert_eq!(ground.count, 1);
+
+    // Tick 2: insert a row; trace_out holds the ground.
+    let prev = Rc::new(ground);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let (raw2, _) = g_reduce(
+        &g_delta(&[(1, 1, 7)]),
+        None,
+        to_ch2.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        true,
+    );
+
+    // Retract ground (-1) + emit computed (+1) = 2 rows; net view = computed.
+    assert_eq!(raw2.count, 2, "retract ground + emit computed");
+    let mb = raw2.as_mem_batch();
+    let pos = (0..2).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
+    assert_eq!(read_i64_le(raw2.col_data(0), pos * 8), 7, "computed SUM=7");
+    assert_eq!(read_i64_le(raw2.col_data(1), pos * 8), 1, "computed COUNT=1");
+    assert_eq!(raw2.get_null_word(pos) & 1, 0, "computed SUM present");
+}
+
+/// A value-change tick on a surviving global aggregate emits the old/new computed
+/// rows and NO ground delta (the group never crosses the cardinality boundary).
+#[test]
+fn global_value_change_emits_no_ground() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = g_out_sum_count();
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (raw1, _) = g_reduce(
+        &g_delta(&[(1, 1, 5)]),
+        None,
+        to_ch.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        true,
+    );
+    assert_eq!(read_i64_le(raw1.col_data(0), 0), 5);
+
+    // Change pk1's value 5 → 8 (retract old, insert new) — cardinality stays 1.
+    let prev = Rc::new(raw1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let (raw2, _) = g_reduce(
+        &g_delta(&[(1, -1, 5), (1, 1, 8)]),
+        None,
+        to_ch2.cursor_mut(),
+        &out_schema,
+        &[G_SUM, G_COUNT],
+        true,
+    );
+    assert_eq!(raw2.count, 2, "retract old computed + emit new computed");
+    let mb = raw2.as_mem_batch();
+    let pos = (0..2).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
+    // The +1 row is the new computed value, never a NULL ground.
+    assert_eq!(read_i64_le(raw2.col_data(0), pos * 8), 8, "new SUM=8");
+    assert_eq!(read_i64_le(raw2.col_data(1), pos * 8), 1, "COUNT stays 1");
+    assert_eq!(raw2.get_null_word(pos) & 1, 0, "no NULL ground delta on a value change");
+}
+
+/// Mixed non-linear `[COUNT(*), MIN(x)]` fully emptied → one ground row
+/// `COUNT=0, MIN=NULL`, never a `COUNT=−N` zombie (the replay resets all accs).
+#[test]
+fn global_mixed_count_min_emptied_emits_ground() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = g_out_count_min();
+    let in_schema = g_src();
+    let aggs = [G_COUNT, G_MIN];
+
+    // Tick 1: insert one row (trace_in empty). MIN is non-linear → replay path.
+    let empty_in = Rc::new(Batch::empty(in_schema.num_payload_cols(), 8));
+    let mut ti1 = CursorHandle::from_owned(&[empty_in], in_schema);
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (raw1, _) = g_reduce(
+        &g_delta(&[(1, 1, 5)]),
+        Some(ti1.cursor_mut()),
+        to_ch.cursor_mut(),
+        &out_schema,
+        &aggs,
+        true,
+    );
+    assert_eq!(read_i64_le(raw1.col_data(0), 0), 1, "COUNT=1");
+    assert_eq!(read_i64_le(raw1.col_data(1), 0), 5, "MIN=5");
+
+    // Tick 2: retract the only row. trace_in holds the integrated history.
+    let hist = {
+        let mut b = Batch::with_schema(in_schema, 1);
+        b.extend_pk(1u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &5i64.to_le_bytes());
+        b.count += 1;
+        b.sorted = true;
+        b.consolidated = true;
+        Rc::new(b)
+    };
+    let mut ti2 = CursorHandle::from_owned(&[hist], in_schema);
+    let prev = Rc::new(raw1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let (raw2, _) = g_reduce(
+        &g_delta(&[(1, -1, 5)]),
+        Some(ti2.cursor_mut()),
+        to_ch2.cursor_mut(),
+        &out_schema,
+        &aggs,
+        true,
+    );
+
+    assert_eq!(raw2.count, 2, "retract old + ground insert");
+    let mb = raw2.as_mem_batch();
+    let pos = (0..2).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
+    assert_eq!(read_i64_le(raw2.col_data(0), pos * 8), 0, "ground COUNT=0, never -N");
+    assert_eq!((raw2.get_null_word(pos) >> 1) & 1, 1, "ground MIN=NULL");
+}
+
+/// A lone global `MIN` over ≥1 row, then retract the current min → the view
+/// advances to the next-best value (the replay path over an empty group set).
+#[test]
+fn global_lone_min_retract_to_next_best() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    // Output `[_group_pk:U128, min:I64(nullable)]`, agg `[MIN]` (no companion).
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    let in_schema = g_src();
+
+    // Tick 1: insert val=5 and val=3 → MIN=3.
+    let empty_in = Rc::new(Batch::empty(in_schema.num_payload_cols(), 8));
+    let mut ti1 = CursorHandle::from_owned(&[empty_in], in_schema);
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (raw1, _) = g_reduce(
+        &g_delta(&[(1, 1, 5), (2, 1, 3)]),
+        Some(ti1.cursor_mut()),
+        to_ch.cursor_mut(),
+        &out_schema,
+        &[G_MIN],
+        true,
+    );
+    assert_eq!(read_i64_le(raw1.col_data(0), 0), 3, "MIN=3");
+
+    // Tick 2: retract the current min (val=3) → MIN advances to 5.
+    let hist = {
+        let mut b = Batch::with_schema(in_schema, 2);
+        for (pk, v) in [(1u128, 5i64), (2, 3)] {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &v.to_le_bytes());
+            b.count += 1;
+        }
+        b.sorted = true;
+        b.consolidated = true;
+        Rc::new(b)
+    };
+    let mut ti2 = CursorHandle::from_owned(&[hist], in_schema);
+    let prev = Rc::new(raw1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let (raw2, _) = g_reduce(
+        &g_delta(&[(2, -1, 3)]),
+        Some(ti2.cursor_mut()),
+        to_ch2.cursor_mut(),
+        &out_schema,
+        &[G_MIN],
+        true,
+    );
+    let mb = raw2.as_mem_batch();
+    let pos = (0..raw2.count).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
+    assert_eq!(
+        read_i64_le(raw2.col_data(0), pos * 8),
+        5,
+        "MIN advances 3 → 5 (next-best)"
+    );
+}
+
+/// The AVI empty-prefix path: a lone global MIN over ≥1 row resolves via the
+/// 0-byte-prefix AVI seek (`avi_group_key_eligible(&[])` is true; the seek matches
+/// every entry, returning the GLOBAL extremum in agg-value order), and a
+/// retraction advances to the next-best AVI post-state. This is the O(log N) path
+/// the planner builds for a lone global MIN/MAX; the trace-path test above covers
+/// the avi = None fallback.
+#[test]
+fn global_lone_min_avi_empty_prefix() {
+    use super::super::util::encode_ordered;
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let in_schema = g_src();
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+
+    // AVI for empty group cols: key = av_encoded(8) only (0-byte group prefix).
+    let avi_schema = crate::ops::index::make_avi_schema(&in_schema, &[]);
+    assert_eq!(avi_schema.pk_stride(), 8, "0 group bytes + 8 av");
+    let avi_with = |min: i64| {
+        let mut b = Batch::with_schema(avi_schema, 1);
+        let av = encode_ordered(&min.to_le_bytes(), type_code::I64, false);
+        b.extend_pk_bytes(&av.to_be_bytes());
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.count += 1;
+        b
+    };
+
+    let g_min_avi = |delta: &ConsolidatedBatch, to: &mut crate::storage::ReadCursor, avi: i64| {
+        let mut avi_ch = CursorHandle::from_owned(&[Rc::new(avi_with(avi))], avi_schema);
+        op_reduce(
+            delta,
+            None,
+            to,
+            &in_schema,
+            &out_schema,
+            &[], // empty group cols
+            &[G_MIN],
+            Some(avi_ch.cursor_mut()),
+            false,
+            TypeCode::I64,
+            None,
+            0,
+            None,
+            None,
+            true,
+            true,
+        )
+    };
+
+    // Tick 1: delta val=50 is NOT the min; the AVI holds the true global min 10,
+    // so a correct result can only come from the 0-byte-prefix index seek.
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+    let (raw1, _) = g_min_avi(&g_delta(&[(1, 1, 50)]), to_ch.cursor_mut(), 10);
+    let mb1 = raw1.as_mem_batch();
+    let p1 = (0..raw1.count).find(|&i| mb1.get_weight(i) == 1).expect("a +1 row");
+    assert_eq!(
+        read_i64_le(raw1.col_data(0), p1 * 8),
+        10,
+        "AVI empty-prefix seek returns the GLOBAL min, not the delta's 50"
+    );
+
+    // Tick 2: a retraction re-evaluates the group; the AVI post-state is 20.
+    let prev = Rc::new(raw1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let (raw2, _) = g_min_avi(&g_delta(&[(2, -1, 10)]), to_ch2.cursor_mut(), 20);
+    let mb2 = raw2.as_mem_batch();
+    let p2 = (0..raw2.count).find(|&i| mb2.get_weight(i) == 1).expect("a +1 row");
+    assert_eq!(
+        read_i64_le(raw2.col_data(0), p2 * 8),
+        20,
+        "AVI advances to the next-best post-state on retraction"
     );
 }

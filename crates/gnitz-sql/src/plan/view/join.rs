@@ -763,7 +763,12 @@ fn build_range_join_view(
             // `reindex_m` carries NO `partition_filter` (unlike `int_a`/`int_b`);
             // `trace_m` is the one-row trace `matched` probes.
             let mbh = cb.map_hash_row(reindex_b, &[0], 0);
-            let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)]); // [_group_pk:U128, m:Tc]
+            // `global_ground = false`: this empty-group reduce is the range-join's
+            // threshold `m = MAX/MIN(b.range)`, NOT a user scalar aggregate. A
+            // ground row here would seed `(m=NULL)` into the threshold trace and
+            // break the `A − ∅ = A` null-fill that needs that trace empty over an
+            // empty other side.
+            let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)], false); // [_group_pk:U128, m:Tc]
             let carried_m = range_tc.carried_reindex_tc(range_tc);
             let reindex_m = cb.map_reindex(red, &[1], &[carried_m], build_reindex_program(&m_schema));
             let trace_m = cb.integrate_trace(reindex_m);

@@ -498,6 +498,8 @@ pub(crate) fn execute_epoch_multi(
                 avi,
                 finalize_func_idx,
                 finalize_schema_idx,
+                global_ground,
+                i_am_owner,
             } => {
                 let in_schema = reg!(*in_reg).schema;
                 let out_schema = &program.schemas[*output_schema_idx as usize];
@@ -599,6 +601,8 @@ pub(crate) fn execute_epoch_multi(
                     gi_col_idx,
                     fin_prog,
                     fin_schema,
+                    *global_ground,
+                    *i_am_owner,
                 );
 
                 // Drop temporary cursor handles (returned to pool)

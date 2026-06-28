@@ -4,7 +4,7 @@ use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
 
 use super::super::util::write_string_from_batch;
-use super::agg::Accumulator;
+use super::agg::{Accumulator, AggDescriptor, AggOp};
 
 /// Emit one aggregate column: NULL (and zero-filled) when the accumulator holds
 /// no value, else its value bits truncated to the column width. Shared by
@@ -89,6 +89,91 @@ pub(super) fn emit_reduce_row(
 
     output.extend_null_bmp(&null_word.to_le_bytes());
     output.count += 1;
+}
+
+/// Emit the synthetic **ground row** of a global (ungrouped) aggregate at PK
+/// `out_pk_bytes` (= `V₀`): COUNT-family columns at `0` (present), SUM/MIN/MAX at
+/// NULL. This is the one row SQL scalar-aggregate semantics require over an empty
+/// or fully-retracted source (`COUNT(*)=0`, `SUM/MIN/MAX/AVG=NULL`); the
+/// post-reduce MAP turns a derived `(SUM=NULL, COUNT_NON_NULL=0)` into
+/// `AVG`/nullable-`SUM` = NULL with no special case.
+///
+/// Built from a **fresh** accumulator set in the empty-group state — never the
+/// reduce loop's computed `accs` — so the ground row's layout has a single home,
+/// shared by both emission sites (the `n>0` cardinality-zero branch and the
+/// `n==0` seed), and cannot drift from a computed row. Emitted at weight +1; the
+/// caller nets it to one row (the `has_old` retraction in `n>0`, the
+/// `!trace_out_has_V0` guard in `n==0`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_global_ground(
+    raw_output: &mut Batch,
+    out_pk_bytes: &[u8],
+    agg_descs: &[AggDescriptor],
+    input_schema: &SchemaDescriptor,
+    output_schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+    finalize_prog: Option<&crate::expr::ResolvedProgram>,
+    finalize_out_schema: Option<&SchemaDescriptor>,
+    fin_output: Option<&mut Batch>,
+    fin_ctx: Option<&mut crate::expr::FinalizeContext>,
+) {
+    let num_aggs = agg_descs.len();
+
+    // A global-aggregate output schema is `[_group_pk, aggs…]` — no group-exemplar
+    // columns — so every payload column in `emit_reduce_row` takes the
+    // `ci >= agg_base` branch and reads only the accumulator + `out_pk_bytes`; the
+    // lone branch that dereferences `input_mb[exemplar_row]` is unreachable. Pin
+    // it: this is what lets the empty-delta seed pass an empty input batch with no
+    // out-of-bounds read.
+    debug_assert!(
+        output_schema.num_payload_cols() == num_aggs,
+        "global_ground output schema must have zero group-exemplar columns",
+    );
+
+    // Fresh accumulators in the empty-group state. COUNT-family present at `0`
+    // (null bit clear → renders `0`); SUM/MIN/MAX left absent (`has_value` false →
+    // null bit set → renders NULL). Forcing COUNT-family to `0` is correct
+    // independently of the separately-owned COUNT-family-renders-NULL emitter bug.
+    let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, input_schema)).collect();
+    for (acc, d) in accs.iter_mut().zip(agg_descs) {
+        if matches!(d.agg_op, AggOp::Count | AggOp::CountNonNull) {
+            acc.seed_from_raw_bits(0);
+        }
+    }
+
+    // No source row exists (the seed runs over an empty delta), and none is read:
+    // a throwaway empty input batch satisfies `emit_reduce_row`'s signature, and
+    // the unreachable exemplar branch never dereferences it. `use_natural_pk` is
+    // irrelevant for the same reason (no exemplar column is emitted).
+    let empty_input = Batch::empty_with_schema(input_schema);
+    let empty_mb = empty_input.as_mem_batch();
+    emit_reduce_row(
+        raw_output,
+        &empty_mb,
+        0,
+        out_pk_bytes,
+        &accs,
+        input_schema,
+        output_schema,
+        group_by_cols,
+        /* use_natural_pk = */ false,
+        num_aggs,
+    );
+
+    if let (Some(prog), Some(fin_schema), Some(fin_out), Some(ctx)) =
+        (finalize_prog, finalize_out_schema, fin_output, fin_ctx)
+    {
+        emit_finalized_row(
+            fin_out,
+            raw_output,
+            raw_output.count - 1,
+            1,
+            prog,
+            output_schema,
+            fin_schema,
+            ctx,
+        );
+    }
 }
 
 /// Emit a finalized row by evaluating the finalize ExprProgram on the raw output.
