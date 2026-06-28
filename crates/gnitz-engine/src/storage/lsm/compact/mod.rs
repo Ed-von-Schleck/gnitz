@@ -1,16 +1,15 @@
 //! Self-contained shard compaction: N-way merge of sorted shard files.
 //!
-//! Carved along the merge/route seam: the N-way (PK, payload) merge kernel and
-//! the routing-aware `merge_and_route` live in [`merge`]; the guard lookup and
-//! the `compact_shards` orchestration live in [`route`].
-//! This module re-exports the public entry points and hosts the shared tests,
-//! which exercise both halves through the public surface.
+//! All orchestration lives in [`merge`]: the routed core `compact_routed`
+//! (open → merge → route → column-first scatter), the guard lookup, and the two
+//! public entry points — single-target `compact_shards` and multi-target
+//! `merge_and_route` — as thin wrappers over it. This module re-exports those
+//! entry points and hosts the shared tests, which exercise both wrappers — and
+//! thus the shared core — through the public surface.
 
 mod merge;
-mod route;
 
-pub use merge::merge_and_route;
-pub use route::compact_shards;
+pub use merge::{compact_shards, merge_and_route};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -20,11 +19,10 @@ pub use route::compact_shards;
 mod tests {
     use super::super::batch::Batch;
     use super::super::columnar;
-    use super::super::merge::BlobCacheGuard;
+    use super::super::merge::{pack_pk_be, run_merge, BlobCacheGuard};
     use super::super::shard_file::PkUniqueChecker;
     use super::super::shard_reader::MappedShard;
-    use super::merge::open_and_merge;
-    use super::route::find_guard_for_key;
+    use super::merge::{find_guard_for_key, open_shards};
     use super::*;
     use crate::foundation::codec::{read_i64_le, read_u32_le};
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
@@ -1144,17 +1142,17 @@ mod tests {
         schema: &SchemaDescriptor,
         can_tag: bool,
     ) {
+        let shards = open_shards(input_files, schema).unwrap();
         let mut batch = Batch::with_schema(*schema, 1024);
         let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
         let mut checker = PkUniqueChecker::new();
-        open_and_merge(input_files, schema, |_key, weight, shard, row| {
-            let pk_bytes = shard.get_pk_bytes(row);
+        run_merge(&shards, schema, |src, row, w| {
+            let pk_bytes = shards[src].get_pk_bytes(row);
             if can_tag {
-                checker.observe(pk_bytes, weight);
+                checker.observe(pk_bytes, w);
             }
-            batch.append_row_from_source_bytes(pk_bytes, weight, shard, row, blob_cache.get_mut());
-        })
-        .unwrap();
+            batch.append_row_from_source_bytes(pk_bytes, w, &shards[src], row, blob_cache.get_mut());
+        });
         batch
             .write_as_shard_with_flags(output_file, 0, checker.flags_if(can_tag))
             .unwrap();
@@ -1275,6 +1273,148 @@ mod tests {
         let (uniq, rows) = assert_compact_paths_agree(&dir, &schema, &shard_rows, true);
         assert_eq!(rows.len(), 4, "all four distinct-PK rows survive");
         assert!(uniq, "distinct-PK output must be tagged pk-unique");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- Multi-guard routed differential -------------------------------------
+    //
+    // `merge_and_route` now shares `compact_routed`'s column-first scatter with
+    // the single-target `compact_shards`. The `compact_shards` differentials
+    // above already pin per-row materialization value-identity over that scatter;
+    // this test pins only the *routed* split they cannot reach — survivors
+    // spanning multiple guard ranges land in the right per-guard shard (rows,
+    // weights, null words, per-guard pk-unique flag), an empty guard and a
+    // fully-cancelled guard each write no shard — by checking every routed guard
+    // shard against a row-at-a-time oracle that routes the same `run_merge`
+    // survivor stream through `append_row_from_source_bytes` per guard.
+
+    /// Row-at-a-time multi-guard compaction: the prior `merge_and_route` body,
+    /// kept as the routed oracle (one growable `Batch` + `BlobCacheGuard` per
+    /// guard). Returns `Some(path)` per non-empty guard, `None` for an empty one.
+    fn oracle_merge_and_route_row_at_a_time(
+        input_files: &[&CStr],
+        out_dir: &std::path::Path,
+        guard_keys: &[u128],
+        schema: &SchemaDescriptor,
+        can_tag: bool,
+    ) -> Vec<Option<String>> {
+        let shards = open_shards(input_files, schema).unwrap();
+        let n = guard_keys.len();
+        let mut batches: Vec<Batch> = (0..n).map(|_| Batch::with_schema(*schema, 256)).collect();
+        let mut blob_caches: Vec<BlobCacheGuard> = (0..n).map(|_| BlobCacheGuard::acquire(schema, 256)).collect();
+        let mut checkers: Vec<PkUniqueChecker> = (0..n).map(|_| PkUniqueChecker::new()).collect();
+        run_merge(&shards, schema, |src, row, w| {
+            let pk = shards[src].get_pk_bytes(row);
+            let g = find_guard_for_key(guard_keys, pack_pk_be(pk));
+            if can_tag {
+                checkers[g].observe(pk, w);
+            }
+            batches[g].append_row_from_source_bytes(pk, w, &shards[src], row, blob_caches[g].get_mut());
+        });
+        (0..n)
+            .map(|g| {
+                if batches[g].count == 0 {
+                    return None;
+                }
+                let path = out_dir.join(format!("oracle_G{g}.db"));
+                let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                batches[g]
+                    .write_as_shard_with_flags(&cpath, 0, checkers[g].flags_if(can_tag))
+                    .unwrap();
+                Some(path.to_str().unwrap().to_string())
+            })
+            .collect()
+    }
+
+    /// Survivors spanning four guard ranges with cross-shard duplicate PKs: a
+    /// non-pk-unique guard (a fold to weight 4 plus a same-PK/different-payload
+    /// pair), a fully-cancelled guard (all its rows net to zero), an empty guard
+    /// (no rows route to it), and a distinct-PK pk-unique guard. Each routed
+    /// output shard must equal the per-guard row-at-a-time oracle.
+    #[test]
+    fn test_merge_and_route_multi_guard_matches_row_at_a_time() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_route_multi_diff");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let schema = diff_schema();
+
+        // Two input shards, each internally (PK, payload)-sorted. Guard ranges
+        // (U64 PK): G0=[0,100), G1=[100,200), G2=[200,300), G3=[300,∞).
+        let s0: &[DiffRow] = &[
+            (10, 1, Some("aaa"), Some(LONG_A), Some(100)), // G0 — folds with s1 pk=10 → w=4
+            (50, 1, Some("g0b"), Some("g0c"), None),       // G0 — c2 NULL
+            (120, 1, Some("cancel"), Some("x"), Some(7)),  // G1 — cancelled by s1
+            (310, 1, Some("t0"), Some("t1"), Some(1)),     // G3
+            (320, 1, None, Some("u"), Some(2)),            // G3 — c0 NULL
+        ];
+        let s1: &[DiffRow] = &[
+            (10, 1, Some("aaa"), Some("bbb"), Some(200)), // G0 — distinct payload (bbb < LONG_A)
+            (10, 3, Some("aaa"), Some(LONG_A), Some(100)), // G0 — folds with s0 pk=10
+            (120, -1, Some("cancel"), Some("x"), Some(7)), // G1 — cancels s0 pk=120 → net 0
+            (330, 1, Some("t2"), Some(LONG_DUP), None),   // G3 — c2 NULL
+        ];
+
+        let p0 = dir.join("in0.db");
+        let p1 = dir.join("in1.db");
+        write_diff_shard(p0.to_str().unwrap(), &schema, s0);
+        write_diff_shard(p1.to_str().unwrap(), &schema, s1);
+        let c0 = std::ffi::CString::new(p0.to_str().unwrap()).unwrap();
+        let c1 = std::ffi::CString::new(p1.to_str().unwrap()).unwrap();
+        let inputs = [c0.as_c_str(), c1.as_c_str()];
+
+        // Guard keys live in the same order-preserving pack_pk_be space as the
+        // router's sort key, so derive them from the boundary values' OPK bytes.
+        let guard_keys: Vec<u128> = [0u64, 100, 200, 300]
+            .iter()
+            .map(|&b| crate::storage::merge::pk_sort_key(&b.to_be_bytes()))
+            .collect();
+
+        let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        // table_id=7, level_num=1, lsn_tag=42 → routed shards are shard_7_42_L1_G{g}.db.
+        let routed = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 7, 1, 42, true).unwrap();
+        let oracle = oracle_merge_and_route_row_at_a_time(&inputs, &dir, &guard_keys, &schema, true);
+
+        // Only the populated guards (0 and 3) produce output, in increasing-g order.
+        assert_eq!(routed.len(), 2, "only guards 0 and 3 have survivors, got {routed:?}");
+        assert_eq!(routed[0].0, guard_keys[0]);
+        assert_eq!(routed[1].0, guard_keys[3]);
+
+        for (g, oracle_entry) in oracle.iter().enumerate() {
+            let routed_path = dir.join(format!("shard_7_42_L1_G{g}.db"));
+            match oracle_entry {
+                None => assert!(
+                    !routed_path.exists(),
+                    "guard {g} has no survivors — routed must write no shard"
+                ),
+                Some(oracle_path) => {
+                    assert!(routed_path.exists(), "guard {g} has survivors — routed shard missing");
+                    let (uniq_new, rows_new) = decode_diff_shard(routed_path.to_str().unwrap(), &schema);
+                    let (uniq_old, rows_old) = decode_diff_shard(oracle_path, &schema);
+                    assert_eq!(rows_new, rows_old, "guard {g} routed vs row-at-a-time rows diverged");
+                    assert_eq!(uniq_new, uniq_old, "guard {g} pk-unique flag diverged");
+                }
+            }
+        }
+
+        // Concrete per-guard pins beyond oracle agreement.
+        let (g0_uniq, g0_rows) = decode_diff_shard(dir.join("shard_7_42_L1_G0.db").to_str().unwrap(), &schema);
+        assert!(!g0_uniq, "guard 0 has two pk=10 survivors → not pk-unique");
+        let pk10 = 10u64.to_be_bytes().to_vec();
+        let folded = g0_rows
+            .iter()
+            .find(|r| r.0 == pk10 && r.3[2] == DiffCell::Int(100))
+            .expect("folded pk=10 row present in guard 0");
+        assert_eq!(folded.1, 4, "pk=10 folds across shards to weight 4");
+        assert_eq!(
+            g0_rows.len(),
+            3,
+            "guard 0: pk=10 (×2 payloads) + pk=50, got {g0_rows:?}"
+        );
+
+        let (g3_uniq, g3_rows) = decode_diff_shard(dir.join("shard_7_42_L1_G3.db").to_str().unwrap(), &schema);
+        assert!(g3_uniq, "guard 3 has distinct PKs → pk-unique");
+        assert_eq!(g3_rows.len(), 3, "guard 3: pk=310,320,330, got {g3_rows:?}");
 
         let _ = fs::remove_dir_all(&dir);
     }

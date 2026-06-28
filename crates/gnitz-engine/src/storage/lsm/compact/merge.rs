@@ -1,40 +1,32 @@
-//! N-way (PK, payload) merge kernel for shard compaction.
+//! Shard compaction: N-way (PK, payload) merge of sorted shard files, routed to
+//! per-guard output shards.
 //!
-//! Opens the input shards, builds per-shard cursors + the keyless loser tree,
-//! and runs the fused merge + inline consolidation loop through `drive_merge`
-//! (§8 cluster-1 — the sole pending-group drain owner). The `with_payload_cmp!`
-//! dispatch selects the payload comparator once, never per comparison, and
-//! `compare_pk_ordering` settles the PK axis, so the inner loop is fully
-//! monomorphised. `merge_and_route` is the routing-aware merge that splits the
-//! consolidated stream across the guard buckets.
+//! [`open_shards`] maps the inputs; [`compact_routed`] is the sole orchestrator —
+//! open → merge → route → column-first scatter → one output shard per guard run.
+//! The N-way merge + inline-consolidation kernel itself is the shared
+//! [`run_merge`](super::super::merge::run_merge) (§8 cluster-1, the sole
+//! pending-group drain owner); this module only drives it and materializes the
+//! survivors. [`compact_shards`] (single-target) and [`merge_and_route`]
+//! (multi-target L0→L1 / vertical) are thin wrappers over `compact_routed` that
+//! differ only in shard naming and whether an empty guard still emits a 0-row shard.
 
 use std::ffi::CStr;
 
-use super::super::batch::Batch;
+use super::super::batch::write_to_batch;
 use super::super::error::StorageError;
-use super::super::merge::{pack_pk_be, run_merge, BlobCacheGuard};
+use super::super::merge::{pack_pk_be, run_merge, UnifiedSource};
+use super::super::scatter::scatter_unified_sources_with_weights;
 use super::super::shard_file::PkUniqueChecker;
 use super::super::shard_reader::MappedShard;
-use super::route::find_guard_for_key;
 use crate::schema::SchemaDescriptor;
 
 // ---------------------------------------------------------------------------
-// Shard compaction merge: open the shards, drive the shared `run_merge`
+// Shard open + guard lookup
 // ---------------------------------------------------------------------------
 
-/// Open the input shards and run the shared N-way (PK, payload) merge +
-/// consolidation ([`run_merge`]) over them. Calls `emit(key, net_weight, shard,
-/// row)` for each surviving consolidated row, where `key` is the row's
-/// `pack_pk_be` guard-routing key — re-derived from its OPK bytes in the emit,
-/// since the keyless heap carries no cached key. Ghost (weight-0) rows are
-/// skipped inside `run_merge` via `MappedShard`'s `MergeSource::next_non_ghost`.
-///
-/// File I/O lives here so the monomorphised merge loop in `run_merge` carries no
-/// duplicated open/error code.
-/// Open the input shards into owned `MappedShard`s, validating checksums. Split
-/// out of [`open_and_merge`] so the columnar `compact_shards` can drive its own
-/// `run_merge` over the same opened shards — collecting survivors for the
-/// column-first scatter — without the row-at-a-time routing emit.
+/// Open the input shards into owned `MappedShard`s, validating checksums. File
+/// I/O lives here so the monomorphised merge loop in [`run_merge`] carries no
+/// duplicated open/error code; the differential-test oracle reuses it too.
 pub(super) fn open_shards(input_files: &[&CStr], schema: &SchemaDescriptor) -> Result<Vec<MappedShard>, StorageError> {
     let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
     for f in input_files {
@@ -43,22 +35,135 @@ pub(super) fn open_shards(input_files: &[&CStr], schema: &SchemaDescriptor) -> R
     Ok(shards)
 }
 
-pub(super) fn open_and_merge(
-    input_files: &[&CStr],
-    schema: &SchemaDescriptor,
-    mut emit: impl FnMut(u128, i64, &MappedShard, usize),
-) -> Result<(), StorageError> {
-    let shards = open_shards(input_files, schema)?;
-    run_merge(&shards, schema, |src, row, w| {
-        emit(pack_pk_be(shards[src].get_pk_bytes(row)), w, &shards[src], row);
-    });
-    Ok(())
+/// Guard owning `key`: the last guard key `≤ key` (guard 0 for keys below the
+/// first). Monotone in `key`, so over the sorted merge stream each guard's
+/// survivors form one contiguous run.
+pub(super) fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
+    guard_keys.partition_point(|&g| g <= key).saturating_sub(1)
 }
 
 // ---------------------------------------------------------------------------
-// Routing-aware merge entry point
+// The routed compaction core
 // ---------------------------------------------------------------------------
 
+/// Sole owner of shard-compaction orchestration: open the inputs, run the N-way
+/// (PK, payload) merge into a survivor buffer, route each survivor to its guard,
+/// and write one column-first output shard per guard run, named `name_for(guard_idx)`.
+///
+/// `emit_empty_guards` decides a guard with no survivors: `false` skips it
+/// (multi-target — an empty guard must not register an L1 shard); `true` still
+/// writes its 0-row shard (single-target — the caller owes exactly one file).
+///
+/// Returns `(guard_key, path)` per written shard in increasing guard-index order.
+/// On an overlong path or a write error, every shard already written this call is
+/// removed before returning `Err` (atomic-or-nothing).
+pub(super) fn compact_routed(
+    input_files: &[&CStr],
+    guard_keys: &[u128],
+    schema: &SchemaDescriptor,
+    table_id: u32,
+    can_tag_pk_unique: bool,
+    emit_empty_guards: bool,
+    mut name_for: impl FnMut(usize) -> String,
+) -> Result<Vec<(u128, String)>, StorageError> {
+    // An empty guard list would make find_guard_for_key index a nonexistent
+    // guard; every caller passes a non-empty list, but don't rely on it silently.
+    if guard_keys.is_empty() {
+        return Err(StorageError::InvalidPath);
+    }
+
+    let shards = open_shards(input_files, schema)?;
+    let total_rows: usize = shards.iter().map(|s| s.count).sum(); // survivor upper bound
+    let total_blob: usize = shards.iter().map(|s| s.blob_len).sum();
+
+    // Phase 1 — merge into survivors (sorted (PK, payload)), counting the rows
+    // routed to each guard. `find_guard_for_key` is monotone over the sorted
+    // stream, so each guard's survivors are contiguous; observing on that sorted
+    // stream is also what lets `PkUniqueChecker` spot adjacent duplicate PKs.
+    let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total_rows);
+    let mut checkers: Vec<PkUniqueChecker> = (0..guard_keys.len()).map(|_| PkUniqueChecker::new()).collect();
+    let mut run_len = vec![0usize; guard_keys.len()];
+    run_merge(&shards, schema, |src, row, w| {
+        survivors.push((src as u32, row as u32, w));
+        let pk = shards[src].get_pk_bytes(row);
+        let g = find_guard_for_key(guard_keys, pack_pk_be(pk));
+        if can_tag_pk_unique {
+            checkers[g].observe(pk, w);
+        }
+        run_len[g] += 1;
+    });
+
+    // Phase 2 — one shard per guard, each scattered column-at-a-time from its
+    // contiguous survivor slice. The `UnifiedSource` views hold raw pointers into
+    // each shard's mmap (no lifetime tie); `shards` outlives them and every
+    // scatter, all within this call.
+    let unified: Vec<UnifiedSource> = shards.iter().map(|s| s.to_unified(schema)).collect();
+    let nsurv = survivors.len();
+    let mut out: Vec<(u128, String)> = Vec::with_capacity(guard_keys.len());
+
+    // Roll back every shard already written this call (overlong-path / write
+    // failure) so a compaction that can't finalize leaves L0 intact.
+    fn unlink_written(out: &[(u128, String)]) {
+        for (_, written) in out {
+            let _ = std::fs::remove_file(written);
+        }
+    }
+
+    let mut start = 0;
+    for g in 0..guard_keys.len() {
+        let bucket = &survivors[start..start + run_len[g]];
+        start += run_len[g];
+        if bucket.is_empty() && !emit_empty_guards {
+            continue;
+        }
+        let path = name_for(g);
+        if path.len() >= 256 {
+            unlink_written(&out);
+            return Err(StorageError::InvalidPath);
+        }
+        // Reserve this run's row-proportional share of the blob arena, not the
+        // whole `total_blob` per guard: a string-heavy split would otherwise
+        // malloc the full arena once per guard (and `DirectWriter` still grows it
+        // if a run's strings exceed the estimate).
+        let blob_cap = (total_blob * bucket.len() / nsurv.max(1)).max(1);
+        let batch = write_to_batch(schema, bucket.len(), blob_cap, |writer| {
+            scatter_unified_sources_with_weights(&unified, bucket, writer);
+        });
+        let cpath = std::ffi::CString::new(path.as_str()).unwrap();
+        let flags = checkers[g].flags_if(can_tag_pk_unique);
+        if let Err(e) = batch.write_as_shard_with_flags(&cpath, table_id, flags) {
+            unlink_written(&out);
+            return Err(e);
+        }
+        out.push((guard_keys[g], path));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Public wrappers
+// ---------------------------------------------------------------------------
+
+/// Compact `input_files` into exactly one output shard. A thin single-guard
+/// wrapper over [`compact_routed`]: every survivor routes to guard 0
+/// (`find_guard_for_key(&[0], k) = 0` for all `k`), and `emit_empty_guards = true`
+/// guarantees the one shard even when every row cancels.
+pub fn compact_shards(
+    input_files: &[&CStr],
+    output_file: &CStr,
+    schema: &SchemaDescriptor,
+    table_id: u32,
+    can_tag_pk_unique: bool,
+) -> Result<(), StorageError> {
+    let path = output_file.to_str().unwrap_or("").to_string();
+    compact_routed(input_files, &[0], schema, table_id, can_tag_pk_unique, true, |_| {
+        path.clone()
+    })?;
+    Ok(())
+}
+
+/// Compact `input_files` across `guard_keys` into one column-first output shard
+/// per non-empty guard, each named `shard_{table_id}_{lsn_tag}_L{level_num}_G{g}.db`.
 #[allow(clippy::too_many_arguments)]
 pub fn merge_and_route(
     input_files: &[&CStr],
@@ -70,61 +175,14 @@ pub fn merge_and_route(
     lsn_tag: u64,
     can_tag_pk_unique: bool,
 ) -> Result<Vec<(u128, String)>, StorageError> {
-    // Empty guard_keys would make find_guard_for_key return 0 (via
-    // saturating_sub(1)) and then index batches[0] out of bounds. Callers
-    // always pass a non-empty list, but don't rely on that silently.
-    if guard_keys.is_empty() {
-        return Err(StorageError::InvalidPath);
-    }
-    let num_guards = guard_keys.len();
-    let out_dir_str = output_dir.to_str().unwrap_or("");
-
-    let mut batches: Vec<Batch> = (0..num_guards).map(|_| Batch::with_schema(*schema, 256)).collect();
-    let mut blob_caches: Vec<BlobCacheGuard> = (0..num_guards).map(|_| BlobCacheGuard::acquire(schema, 256)).collect();
-    let mut checkers: Vec<PkUniqueChecker> = (0..num_guards).map(|_| PkUniqueChecker::new()).collect();
-    let out_filenames: Vec<String> = (0..num_guards)
-        .map(|i| format!("{out_dir_str}/shard_{table_id}_{lsn_tag}_L{level_num}_G{i}.db"))
-        .collect();
-
-    // `key` is the order-preserving sort key — the guard-routing key (matching
-    // `l1_guard_keys`, now also OPK). The PK itself is copied from the source
-    // bytes so wide PKs are not truncated.
-    open_and_merge(input_files, schema, |key, weight, shard, row| {
-        let gi = find_guard_for_key(guard_keys, key);
-        let pk_bytes = shard.get_pk_bytes(row);
-        if can_tag_pk_unique {
-            checkers[gi].observe(pk_bytes, weight);
-        }
-        batches[gi].append_row_from_source_bytes(pk_bytes, weight, shard, row, blob_caches[gi].get_mut());
-    })?;
-
-    // Reject overlong output paths before writing any shard, so a compaction that
-    // can't finalize leaves L0 intact rather than a half-written level.
-    for i in 0..num_guards {
-        if batches[i].count > 0 && out_filenames[i].len() >= 256 {
-            return Err(StorageError::InvalidPath);
-        }
-    }
-
-    let mut out: Vec<(u128, String)> = Vec::with_capacity(num_guards);
-    for (i, filename) in out_filenames.into_iter().enumerate() {
-        if batches[i].count == 0 {
-            continue;
-        }
-        let cpath = std::ffi::CString::new(filename.as_str()).unwrap();
-        let flags = checkers[i].flags_if(can_tag_pk_unique);
-        if let Err(e) = batches[i].write_as_shard_with_flags(&cpath, table_id, flags) {
-            // Roll back every shard already written this compaction so a failed
-            // merge leaves L0 intact rather than a half-written level. `out` holds
-            // exactly those (empty guards were `continue`d, never written, never
-            // pushed), so a path for an empty guard is never `unlink`ed.
-            for (_, written) in &out {
-                let _ = std::fs::remove_file(written);
-            }
-            return Err(e);
-        }
-        out.push((guard_keys[i], filename));
-    }
-
-    Ok(out)
+    let dir = output_dir.to_str().unwrap_or("").to_string();
+    compact_routed(
+        input_files,
+        guard_keys,
+        schema,
+        table_id,
+        can_tag_pk_unique,
+        false,
+        move |g| format!("{dir}/shard_{table_id}_{lsn_tag}_L{level_num}_G{g}.db"),
+    )
 }
