@@ -1560,6 +1560,59 @@ mod tests {
         }
     }
 
+    /// The shared decoder applies the header's FLAG_BATCH_SORTED /
+    /// FLAG_BATCH_CONSOLIDATED bits onto the decoded batch — the precondition the
+    /// client trust strip neutralizes. Encode a frame whose data batch is flagged
+    /// sorted+consolidated (the encoder mirrors the batch's own fields into the
+    /// header), decode it, and confirm both flags arrive set; then apply the
+    /// `handle_message` strip and confirm both clear.
+    #[test]
+    fn decode_applies_batch_flags_then_strip_clears_them() {
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let mut batch = Batch::with_schema(schema, 1);
+        batch.extend_pk(1u128);
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.extend_col(0, &42i64.to_le_bytes());
+        batch.count += 1;
+        batch.sorted = true;
+        batch.consolidated = true;
+
+        let col_names = [b"pk".as_slice(), b"v".as_slice()];
+        let wire = encode_wire(
+            7,
+            0,
+            0,
+            0,
+            0,
+            0,
+            STATUS_OK,
+            b"",
+            Some(&schema),
+            Some(&col_names),
+            Some(&batch),
+        );
+
+        let mut decoded = decode_wire(&wire).expect("decode");
+        {
+            let b = decoded.data_batch.as_ref().expect("data batch present");
+            assert!(b.sorted, "decoder applies FLAG_BATCH_SORTED");
+            assert!(b.consolidated, "decoder applies FLAG_BATCH_CONSOLIDATED");
+        }
+
+        // The trust-boundary strip, identical to handle_message.
+        let b = decoded.data_batch.as_mut().unwrap();
+        b.sorted = false;
+        b.consolidated = false;
+        assert!(!b.sorted && !b.consolidated, "strip clears both engine-internal flags");
+    }
+
     /// A control block whose error_msg German-string struct points past the
     /// blob must surface an error, not panic, when peeked.
     #[test]

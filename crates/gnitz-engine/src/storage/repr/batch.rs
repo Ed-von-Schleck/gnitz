@@ -2007,6 +2007,81 @@ mod tests {
         )
     }
 
+    // U64 PK + a *nullable* I64 payload, so a row can carry a set null bit over
+    // non-zero bytes — the null-canonicalization case the trust strip protects.
+    fn pk_u64_nullable_i64_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        )
+    }
+
+    fn append_test_row(b: &mut Batch, pk: u128, w: i64, val: i64, null_word: u64) {
+        b.extend_pk(pk);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&null_word.to_le_bytes());
+        b.extend_col(0, &val.to_le_bytes());
+        b.count += 1;
+    }
+
+    /// The trust-boundary strip's mechanism, exercised directly on
+    /// `into_consolidated` (no server). An unsorted batch carries, at
+    /// non-adjacent positions, a duplicate `(PK, payload)` pair and a `+1`/`-1`
+    /// ghost pair, plus a NULL payload cell whose underlying bytes are non-zero.
+    ///
+    /// A client that lies with `FLAG_BATCH_SORTED | FLAG_BATCH_CONSOLIDATED`
+    /// makes `into_consolidated` short-circuit and trust the batch verbatim — the
+    /// duplicate stays unmerged and the ghost survives (silent wrong weights).
+    /// Clearing the flags — what `handle_message` now does to every client batch —
+    /// forces a real sort+fold: the duplicate sums to `+2`, the ghost is dropped,
+    /// the output is `(PK, payload)`-sorted, and the NULL cell stays NULL.
+    #[test]
+    fn into_consolidated_trusts_flags_strip_forces_real_consolidation() {
+        let schema = pk_u64_nullable_i64_schema();
+        let build = || {
+            let mut b = Batch::with_schema(schema, 5);
+            append_test_row(&mut b, 5, 1, 100, 0); // dup A
+            append_test_row(&mut b, 1, 1, 7, 0); // ghost +
+            append_test_row(&mut b, 9, 1, -1, 1); // NULL cell over non-zero (0xFF..) bytes
+            append_test_row(&mut b, 5, 1, 100, 0); // dup B (non-adjacent to A)
+            append_test_row(&mut b, 1, -1, 7, 0); // ghost - (non-adjacent to +)
+            b
+        };
+
+        // Negative control: a spoofed sorted+consolidated batch is trusted
+        // verbatim — `into_consolidated` short-circuits, doing no work.
+        let mut corrupt = build();
+        corrupt.mark_sorted();
+        corrupt.mark_consolidated();
+        let corrupt = corrupt.into_consolidated(&schema).into_inner();
+        assert_eq!(corrupt.count, 5, "spoofed flags skip all consolidation");
+        assert!(
+            (0..corrupt.count).any(|i| corrupt.get_weight(i) == -1),
+            "ghost survives the short-circuit"
+        );
+
+        // The strip: clear both flags, then consolidate for real.
+        let mut clean = build();
+        clean.sorted = false;
+        clean.consolidated = false;
+        let clean = clean.into_consolidated(&schema).into_inner();
+
+        // Ghost eliminated and duplicate folded → 2 surviving rows, (PK,payload)-sorted.
+        assert_eq!(clean.count, 2, "ghost dropped, duplicate folded");
+        assert_eq!(clean.get_pk(0), 5);
+        assert_eq!(clean.get_pk(1), 9);
+        // PK 5: the non-adjacent duplicate summed to +2; value intact; not null.
+        assert_eq!(clean.get_weight(0), 2, "duplicate (PK,payload) folds to +2");
+        assert_eq!(i64::from_le_bytes(clean.get_col_ptr(0, 0, 8).try_into().unwrap()), 100);
+        assert_eq!(clean.get_null_word(0) & 1, 0);
+        // PK 9: the NULL cell still decodes as NULL (null bit preserved).
+        assert_eq!(clean.get_weight(1), 1);
+        assert_eq!(clean.get_null_word(1) & 1, 1, "null cell stays NULL");
+    }
+
     #[test]
     fn pk_stride_u64_roundtrip() {
         let schema = minimal_u64_with_i64_schema();

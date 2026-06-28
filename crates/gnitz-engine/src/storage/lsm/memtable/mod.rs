@@ -170,6 +170,65 @@ mod tests {
         assert!(!Rc::ptr_eq(&snap2, &runs_pre[1]));
     }
 
+    /// A 2-row batch with descending PKs — not `(PK, payload)`-sorted. Default
+    /// flags (`with_schema` sets both true); callers adjust them per scenario.
+    fn desc_two_row_batch(schema: &SchemaDescriptor) -> Batch {
+        let mut b = Batch::with_schema(*schema, 2);
+        for &(pk, val) in &[(20u128, 200i64), (10, 100)] {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    /// A client lie that sets `FLAG_BATCH_CONSOLIDATED` but not
+    /// `FLAG_BATCH_SORTED` is a *deferred* crash. The decoder applies the flags,
+    /// `into_consolidated` short-circuits on `consolidated` (preserving
+    /// `sorted = false`), and the unsorted run enters the MemTable. The next
+    /// consolidation — a flush, or `force_consolidate` once ≥ 16 runs accrue —
+    /// calls `runs_as_sorted`, whose `expect` panics. The `handle_message` strip
+    /// clears the flags at ingress so this run never forms.
+    #[test]
+    #[should_panic(expected = "MemTable runs are always sorted")]
+    fn memtable_consolidated_unsorted_run_panics_on_force_consolidate() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+        mt.upsert_sorted_batch(make_batch(&schema, &[(5, 1, 50)])).unwrap();
+
+        // consolidated stays set (default), sorted cleared: the spoofed combination.
+        let mut bad = desc_two_row_batch(&schema);
+        bad.sorted = false;
+        assert!(bad.consolidated, "models FLAG_BATCH_CONSOLIDATED without _SORTED");
+        mt.upsert_sorted_batch(bad.into_consolidated(&schema)).unwrap();
+
+        // 2 runs → force_consolidate clears its ≤1-run early-return and reaches
+        // runs_as_sorted, which rejects the unsorted run.
+        let _ = mt.consolidate_for_flush();
+    }
+
+    /// Cleared path: the same unsorted rows with both flags stripped (as the
+    /// ingress strip leaves every client batch) sort+consolidate without panic.
+    #[test]
+    fn memtable_cleared_flags_unsorted_run_consolidates_ok() {
+        let schema = make_u64_i64_schema();
+        let mut mt = MemTable::new(schema, 1 << 20);
+        mt.upsert_sorted_batch(make_batch(&schema, &[(5, 1, 50)])).unwrap();
+
+        let mut clean = desc_two_row_batch(&schema);
+        clean.sorted = false;
+        clean.consolidated = false;
+        mt.upsert_sorted_batch(clean.into_consolidated(&schema)).unwrap();
+
+        let snap = mt.consolidate_for_flush();
+        assert_eq!(snap.count, 3, "PK 5, 10, 20 all survive");
+        assert_eq!(snap.get_pk(0), 5);
+        assert_eq!(snap.get_pk(1), 10);
+        assert_eq!(snap.get_pk(2), 20);
+    }
+
     #[test]
     fn memtable_lookup_pk() {
         let schema = make_u64_i64_schema();

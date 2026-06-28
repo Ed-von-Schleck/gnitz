@@ -678,7 +678,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
 
     // Decode the frame. Schema-less PUSH frames (warm-cache path) have
     // FLAG_HAS_DATA but not FLAG_HAS_SCHEMA; they need a catalog hint.
-    let decoded = {
+    let mut decoded = {
         let ctrl = match ipc::peek_control_block(data) {
             Ok(c) => c,
             Err(e) => {
@@ -738,6 +738,16 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
             }
         }
     };
+
+    // Trust boundary: FLAG_BATCH_SORTED / FLAG_BATCH_CONSOLIDATED assert "already
+    // sorted/consolidated, skip the work." A client must never be trusted to claim
+    // that, so neutralize them on every client-decoded batch; downstream
+    // consolidation (the catalog DDL ingest and the commit path) then re-establishes
+    // the invariants. No-op for conforming clients, which never set these.
+    if let Some(b) = decoded.data_batch.as_mut() {
+        b.sorted = false;
+        b.consolidated = false;
+    }
 
     let client_id = decoded.control.client_id;
     let target_id = decoded.control.target_id as i64;
