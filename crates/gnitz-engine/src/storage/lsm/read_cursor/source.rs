@@ -11,7 +11,7 @@
 use std::ptr;
 use std::rc::Rc;
 
-use super::super::batch::{Batch, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK};
+use super::super::batch::{Batch, FIXED_REGION_BYTES};
 use super::super::columnar::ColumnarSource;
 use super::super::merge::{ColPtr, UnifiedSource};
 use super::super::shard_reader::{MappedShard, ScalarRegion};
@@ -106,37 +106,10 @@ impl CursorSource {
     /// Infallible: `MappedShard::open` validates all encoding constraints and
     /// region sizes at open time, so no arm here can fail.
     pub(super) fn to_unified(&self, schema: &SchemaDescriptor) -> UnifiedSource {
-        let mut cols = [ColPtr {
-            base: ptr::null(),
-            stride: 0,
-        }; MAX_COLUMNS - 1];
         match self {
             CursorSource::Batch(b) => {
                 let mb = b.as_mem_batch();
-                let data_ptr = mb.data.as_ptr();
-                let pk_stride = mb.pk_stride as usize;
-                let pk_off = mb.offsets[REG_PK];
-                let nbm_off = mb.offsets[REG_NULL_BMP];
-                for (pi, _ci, col) in schema.payload_columns() {
-                    let off = mb.offsets[REG_PAYLOAD_START + pi];
-                    cols[pi] = ColPtr {
-                        base: unsafe { data_ptr.add(off) },
-                        stride: col.size() as usize,
-                    };
-                }
-                UnifiedSource {
-                    pk: ColPtr {
-                        base: unsafe { data_ptr.add(pk_off) },
-                        stride: pk_stride,
-                    },
-                    null_bmp: ColPtr {
-                        base: unsafe { data_ptr.add(nbm_off) },
-                        stride: FIXED_REGION_BYTES,
-                    },
-                    cols,
-                    blob_ptr: mb.blob.as_ptr(),
-                    blob_len: mb.blob.len(),
-                }
+                super::super::merge::mem_batch_to_unified(&mb, schema)
             }
             CursorSource::Shard(s) => {
                 let pk_stride = s.pk_stride as usize;
@@ -166,6 +139,10 @@ impl CursorSource {
                     },
                 };
 
+                let mut cols = [ColPtr {
+                    base: ptr::null(),
+                    stride: 0,
+                }; MAX_COLUMNS - 1];
                 for (pi, _ci, col) in schema.payload_columns() {
                     let cs = col.size() as usize;
                     cols[pi] = match &s.col_regions[pi] {

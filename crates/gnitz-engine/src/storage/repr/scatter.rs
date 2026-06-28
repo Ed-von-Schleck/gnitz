@@ -348,8 +348,9 @@ fn gather_mb_col<const N: usize>(sources: &[Option<MemBatch<'_>>], rows: &[(u8, 
 /// Column-first scatter from multiple `UnifiedSource`s with explicit per-row
 /// weights from the merge walk.
 ///
-/// Used by `ReadCursor::scatter_drained_into`. Callers must filter zero-weight
-/// rows before calling — `drain_sorted_into` does so.
+/// Used by the read-cursor drain (`ReadCursor::scatter_drained_into`) and the
+/// flush-path `merge_batches`. Callers must pass only net-nonzero weights; both
+/// the drain walk and `drive_merge`'s group fold emit only net-nonzero groups.
 pub(crate) fn scatter_unified_sources_with_weights(
     sources: &[UnifiedSource],
     rows: &[(u32, u32, i64)],
