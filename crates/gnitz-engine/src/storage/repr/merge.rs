@@ -868,6 +868,141 @@ mod tests {
         }
     }
 
+    fn build_mat_batch(schema: &SchemaDescriptor, n: usize, k: usize, kind: u8) -> Batch {
+        let mut b = Batch::with_schema(*schema, n);
+        for i in 0..n {
+            b.extend_pk((k * n + i) as u128); // distinct ascending across batches
+            b.extend_weight(&1i64.to_le_bytes());
+            match kind {
+                0 => {
+                    b.extend_null_bmp(&0u64.to_le_bytes());
+                    b.extend_col(0, &(i as i64).to_le_bytes());
+                    b.extend_col(1, &((i as i64) * 2).to_le_bytes());
+                    b.extend_col(2, &((i as i64) * 3).to_le_bytes());
+                }
+                1 => {
+                    let nw: u64 = if i % 4 == 0 { 1 << 0 } else { 0 };
+                    b.extend_null_bmp(&nw.to_le_bytes());
+                    b.extend_col(0, &(i as i64).to_le_bytes());
+                    b.extend_col(1, &((i as i64) * 2).to_le_bytes());
+                    b.extend_col(2, &((i as i64) * 3).to_le_bytes());
+                }
+                _ => {
+                    let nw: u64 = if i % 4 == 0 { 1 << 2 } else { 0 };
+                    b.extend_null_bmp(&nw.to_le_bytes());
+                    let s0 = if i % 2 == 0 {
+                        format!("s{}", i % 100)
+                    } else {
+                        format!("a-longer-spilled-string-value-{i}")
+                    };
+                    let s1 = format!("col1-string-payload-{}", i % 1000);
+                    let st0 = gnitz_wire::encode_german_string(s0.as_bytes(), &mut b.blob);
+                    let st1 = gnitz_wire::encode_german_string(s1.as_bytes(), &mut b.blob);
+                    b.extend_col(0, &st0);
+                    b.extend_col(1, &st1);
+                    b.extend_col(2, &(i as i64).to_le_bytes());
+                }
+            }
+            b.count += 1;
+        }
+        b
+    }
+
+    /// Materialization throughput: column-first scatter vs row-at-a-time
+    /// `write_row`, over a FIXED survivor stream (merge excluded from timing).
+    /// This is the swap the flush merge made and the compaction columnarization
+    /// will make; the per-cell vs per-column dispatch delta is identical for
+    /// batch and shard sources, so the in-memory delta transfers to compaction.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+    fn materialize_row_vs_column_bench() {
+        use super::super::batch::write_to_batch;
+        use super::super::scatter::scatter_unified_sources_with_weights;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const K: usize = 4;
+        const N: usize = 200_000;
+        const ITERS: usize = 40;
+
+        let s_fixed = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let s_nullable = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1),
+                SchemaColumn::new(type_code::I64, 1),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
+        let s_string = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::STRING, 1),
+                SchemaColumn::new(type_code::STRING, 1),
+                SchemaColumn::new(type_code::I64, 1),
+            ],
+            &[0],
+        );
+
+        for (label, schema, kind) in [
+            ("fixed_nonnull", &s_fixed, 0u8),
+            ("nullable_int", &s_nullable, 1u8),
+            ("german_string", &s_string, 2u8),
+        ] {
+            let batches: Vec<Batch> = (0..K).map(|k| build_mat_batch(schema, N, k, kind)).collect();
+            let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
+            let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
+
+            let total_rows: usize = sorted.iter().map(|b| b.count).sum();
+            let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(total_rows);
+            run_merge(&sorted, schema, |s, r, w| survivors.push((s as u32, r as u32, w)));
+            let total_blob: usize = mem.iter().map(|m| m.blob.len()).sum();
+            let unified: Vec<UnifiedSource> = mem.iter().map(|m| mem_batch_to_unified(m, schema)).collect();
+
+            // Warm up both paths once (allocator, page-in).
+            black_box(write_to_batch(schema, survivors.len(), total_blob, |w| {
+                scatter_unified_sources_with_weights(&unified, &survivors, w);
+            }));
+
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                let b = write_to_batch(schema, survivors.len(), total_blob, |w| {
+                    scatter_unified_sources_with_weights(&unified, &survivors, w);
+                });
+                black_box(&b);
+            }
+            let col_secs = t.elapsed().as_secs_f64();
+
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                let b = write_to_batch(schema, survivors.len(), total_blob, |w| {
+                    for &(s, r, wt) in &survivors {
+                        w.write_row(&mem[s as usize], r as usize, wt);
+                    }
+                });
+                black_box(&b);
+            }
+            let row_secs = t.elapsed().as_secs_f64();
+
+            let rows = survivors.len();
+            let col_rps = (ITERS as f64 * rows as f64) / col_secs;
+            let row_rps = (ITERS as f64 * rows as f64) / row_secs;
+            println!(
+                "materialize/{label}: {rows} rows  col-first {col_rps:.0} rows/s  row-at-a-time {row_rps:.0} rows/s  speedup {:.2}x",
+                row_secs / col_secs
+            );
+        }
+    }
+
     // Takes &[Batch] so test call sites don't need to construct SortedMemBatch.
     fn merge_to_rows(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
         let mem_batches: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
