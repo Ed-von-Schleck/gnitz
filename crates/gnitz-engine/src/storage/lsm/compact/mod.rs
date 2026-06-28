@@ -20,7 +20,10 @@ pub use route::compact_shards;
 mod tests {
     use super::super::batch::Batch;
     use super::super::columnar;
+    use super::super::merge::BlobCacheGuard;
+    use super::super::shard_file::PkUniqueChecker;
     use super::super::shard_reader::MappedShard;
+    use super::merge::open_and_merge;
     use super::route::find_guard_for_key;
     use super::*;
     use crate::foundation::codec::{read_i64_le, read_u32_le};
@@ -1020,6 +1023,258 @@ mod tests {
         assert_compare_pk_bytes_sorted(&merged);
         let present: Vec<Vec<u8>> = (0..merged.count).map(|i| merged.get_pk_bytes(i).to_vec()).collect();
         assert_eq!(present, vec![pk3(1, 1, 100), pk3(1, 1, 200)]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- Columnar vs row-at-a-time materialization (differential) ------------
+    //
+    // `compact_shards` now materializes its merge survivors through the shared
+    // column-first scatter instead of the per-row `append_row_from_source_bytes`.
+    // These tests pin that the new path is value-identical to the old one over
+    // the shard arm of the scatter — the one element the batch-only
+    // `columnar_materialize_differential` (in `repr::merge`) does not cover.
+
+    /// Row spec for the string-schema differential shards: pk, weight, two
+    /// German-string cells (`None` = NULL), one nullable I64 cell (`None` = NULL).
+    type DiffRow = (u64, i64, Option<&'static str>, Option<&'static str>, Option<i64>);
+
+    /// Decoded payload cell, compared by *content* so a differing blob byte
+    /// layout (column-major vs row-major append order) is tolerated.
+    #[derive(Debug, PartialEq)]
+    enum DiffCell {
+        Null,
+        Str(Vec<u8>),
+        Int(i64),
+    }
+
+    /// One decoded compacted row: `(pk_bytes, weight, null_word, payload cells)`.
+    type DecodedRow = (Vec<u8>, i64, u64, Vec<DiffCell>);
+
+    /// U64 PK + STRING + STRING + nullable I64 — two spilling string columns, so
+    /// the column-major blob-offset relocation is exercised.
+    fn diff_schema() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(TYPE_U64, 0),
+                SchemaColumn::new(TYPE_STRING, 0),
+                SchemaColumn::new(TYPE_STRING, 0),
+                SchemaColumn::new(TYPE_I64, 1),
+            ],
+            &[0],
+        )
+    }
+
+    /// Build a `(PK, payload)`-sorted shard file from `rows`. Long strings (> 12
+    /// bytes) spill to the blob heap; `None` cells set the null bit.
+    fn write_diff_shard(path: &str, schema: &SchemaDescriptor, rows: &[DiffRow]) {
+        let mut batch = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, c0, c1, c2) in rows {
+            let mut nw = 0u64;
+            let st0 = match c0 {
+                Some(s) => gnitz_wire::encode_german_string(s.as_bytes(), &mut batch.blob),
+                None => {
+                    nw |= 1 << 0;
+                    [0u8; 16]
+                }
+            };
+            let st1 = match c1 {
+                Some(s) => gnitz_wire::encode_german_string(s.as_bytes(), &mut batch.blob),
+                None => {
+                    nw |= 1 << 1;
+                    [0u8; 16]
+                }
+            };
+            let ic = match c2 {
+                Some(v) => v.to_le_bytes(),
+                None => {
+                    nw |= 1 << 2;
+                    [0u8; 8]
+                }
+            };
+            batch.extend_pk(pk as u128);
+            batch.extend_weight(&w.to_le_bytes());
+            batch.extend_null_bmp(&nw.to_le_bytes());
+            batch.extend_col(0, &st0);
+            batch.extend_col(1, &st1);
+            batch.extend_col(2, &ic);
+            batch.count += 1;
+        }
+        let cpath = std::ffi::CString::new(path).unwrap();
+        batch.write_as_shard(&cpath, 0).unwrap();
+    }
+
+    /// Read a compacted shard back to `(is_pk_unique, rows)`, decoding strings to
+    /// their content against the shard's own blob (never the raw struct bytes).
+    fn decode_diff_shard(path: &str, schema: &SchemaDescriptor) -> (bool, Vec<DecodedRow>) {
+        let cpath = std::ffi::CString::new(path).unwrap();
+        let shard = MappedShard::open(&cpath, schema, false).unwrap();
+        let blob = shard.blob_slice();
+        let rows = (0..shard.count)
+            .map(|i| {
+                let pk = shard.get_pk_bytes(i).to_vec();
+                let w = shard.get_weight(i);
+                let nw = shard.get_null_word(i);
+                let cells = schema
+                    .payload_columns()
+                    .map(|(pi, _ci, col)| {
+                        let cs = col.size() as usize;
+                        if (nw >> pi) & 1 == 1 {
+                            DiffCell::Null
+                        } else if gnitz_wire::is_german_string(col.type_code) {
+                            let st: [u8; 16] = shard.get_col_ptr(i, pi, 16).try_into().unwrap();
+                            DiffCell::Str(gnitz_wire::try_decode_german_string(&st, blob).expect("valid string"))
+                        } else {
+                            DiffCell::Int(i64::from_le_bytes(shard.get_col_ptr(i, pi, cs).try_into().unwrap()))
+                        }
+                    })
+                    .collect();
+                (pk, w, nw, cells)
+            })
+            .collect();
+        (shard.is_pk_unique, rows)
+    }
+
+    /// The prior row-at-a-time `compact_shards`: merge survivors materialized one
+    /// `(row, column)` at a time via `append_row_from_source_bytes`. The oracle
+    /// the columnar path is checked against.
+    fn oracle_compact_row_at_a_time(
+        input_files: &[&CStr],
+        output_file: &CStr,
+        schema: &SchemaDescriptor,
+        can_tag: bool,
+    ) {
+        let mut batch = Batch::with_schema(*schema, 1024);
+        let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
+        let mut checker = PkUniqueChecker::new();
+        open_and_merge(input_files, schema, |_key, weight, shard, row| {
+            let pk_bytes = shard.get_pk_bytes(row);
+            if can_tag {
+                checker.observe(pk_bytes, weight);
+            }
+            batch.append_row_from_source_bytes(pk_bytes, weight, shard, row, blob_cache.get_mut());
+        })
+        .unwrap();
+        batch
+            .write_as_shard_with_flags(output_file, 0, checker.flags_if(can_tag))
+            .unwrap();
+    }
+
+    /// Compact `shard_rows` both ways (`compact_shards` and the oracle) with
+    /// `can_tag`, and assert value-identity of the readback. Returns the new
+    /// path's `(is_pk_unique, rows)` for caller-specific pins.
+    fn assert_compact_paths_agree(
+        dir: &std::path::Path,
+        schema: &SchemaDescriptor,
+        shard_rows: &[Vec<DiffRow>],
+        can_tag: bool,
+    ) -> (bool, Vec<DecodedRow>) {
+        let in_paths: Vec<std::path::PathBuf> = (0..shard_rows.len()).map(|i| dir.join(format!("in{i}.db"))).collect();
+        for (rows, p) in shard_rows.iter().zip(&in_paths) {
+            write_diff_shard(p.to_str().unwrap(), schema, rows);
+        }
+        let in_cstrs: Vec<std::ffi::CString> = in_paths
+            .iter()
+            .map(|p| std::ffi::CString::new(p.to_str().unwrap()).unwrap())
+            .collect();
+        let inputs: Vec<&CStr> = in_cstrs.iter().map(|c| c.as_c_str()).collect();
+
+        let out_new = dir.join("out_new.db");
+        let out_old = dir.join("out_old.db");
+        let cnew = std::ffi::CString::new(out_new.to_str().unwrap()).unwrap();
+        let cold = std::ffi::CString::new(out_old.to_str().unwrap()).unwrap();
+
+        compact_shards(&inputs, &cnew, schema, 0, can_tag).unwrap();
+        oracle_compact_row_at_a_time(&inputs, &cold, schema, can_tag);
+
+        let (uniq_new, rows_new) = decode_diff_shard(out_new.to_str().unwrap(), schema);
+        let (uniq_old, rows_old) = decode_diff_shard(out_old.to_str().unwrap(), schema);
+
+        assert_eq!(rows_new, rows_old, "columnar vs row-at-a-time materialization diverged");
+        assert_eq!(uniq_new, uniq_old, "pk-unique flag diverged between paths");
+        (uniq_new, rows_new)
+    }
+
+    const LONG_A: &str = "long_string_value_A_padpadpadpad"; // > 12 → spills
+    const LONG_DUP: &str = "duplicated_long_string_payload_zz"; // > 12, reused across cells
+
+    /// Differential over cross-shard duplicate PKs (a fold to weight 4), a
+    /// cancellation (pk=40 dropped), nulls in distinct columns, two spilling
+    /// STRING columns, and a same-PK/different-payload pair that makes the output
+    /// non-pk-unique. Columnar output must equal the row-at-a-time oracle.
+    #[test]
+    fn test_compact_columnar_matches_row_at_a_time() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_columnar_diff");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let schema = diff_schema();
+
+        let shard_rows = vec![
+            vec![
+                (10, 1, Some("aaa"), Some(LONG_A), Some(100)),
+                (20, 1, Some("short"), Some(LONG_DUP), None), // c2 NULL
+                (30, 1, None, Some("mid"), Some(-5)),         // c0 NULL
+                (40, 1, Some("ghost0"), Some("ghost1"), Some(7)),
+            ],
+            vec![
+                (10, 3, Some("aaa"), Some(LONG_A), Some(100)), // folds with s1 pk=10 → w=4
+                (25, 1, Some(LONG_DUP), Some("x"), Some(9)),
+                (40, -1, Some("ghost0"), Some("ghost1"), Some(7)), // cancels s1 pk=40 → dropped
+                (50, 1, Some("last"), None, Some(0)),              // c1 NULL
+            ],
+            vec![
+                (10, 1, Some("aaa"), Some("bbb"), Some(200)), // pk=10 distinct payload → second survivor
+                (60, 1, Some("tail0"), Some("tail1"), None),  // c2 NULL
+            ],
+        ];
+
+        let (uniq, rows) = assert_compact_paths_agree(&dir, &schema, &shard_rows, true);
+
+        // Concrete pins beyond agreement.
+        assert_eq!(rows.len(), 7, "expected 7 survivors (pk=40 cancels), got {rows:?}");
+        assert!(!uniq, "two pk=10 survivors share a PK → output not pk-unique");
+        let pk10 = 10u64.to_be_bytes().to_vec();
+        let folded = rows
+            .iter()
+            .find(|r| r.0 == pk10 && r.3[2] == DiffCell::Int(100))
+            .expect("folded pk=10 row present");
+        assert_eq!(folded.1, 4, "pk=10 folds across shards to weight 4");
+        assert_eq!(
+            folded.3[1],
+            DiffCell::Str(LONG_A.as_bytes().to_vec()),
+            "spilled long string"
+        );
+        assert!(
+            !rows.iter().any(|r| r.0 == 40u64.to_be_bytes().to_vec()),
+            "pk=40 ghost must be dropped",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Differential with all-distinct PKs and `can_tag = true`: the columnar
+    /// output must be tagged `SHARD_FLAG_PK_UNIQUE`, identically to the oracle.
+    #[test]
+    fn test_compact_columnar_pk_unique_flag_tagged() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_columnar_unique");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let schema = diff_schema();
+
+        let shard_rows = vec![
+            vec![
+                (1, 1, Some("a"), Some("p"), Some(1)),
+                (3, 1, Some("c"), Some(LONG_A), Some(3)),
+            ],
+            vec![
+                (2, 1, Some("b"), Some(LONG_DUP), Some(2)),
+                (4, 1, Some("d"), None, None),
+            ],
+        ];
+
+        let (uniq, rows) = assert_compact_paths_agree(&dir, &schema, &shard_rows, true);
+        assert_eq!(rows.len(), 4, "all four distinct-PK rows survive");
+        assert!(uniq, "distinct-PK output must be tagged pk-unique");
 
         let _ = fs::remove_dir_all(&dir);
     }

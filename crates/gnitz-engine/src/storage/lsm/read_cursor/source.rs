@@ -11,11 +11,11 @@
 use std::ptr;
 use std::rc::Rc;
 
-use super::super::batch::{Batch, FIXED_REGION_BYTES};
+use super::super::batch::Batch;
 use super::super::columnar::ColumnarSource;
-use super::super::merge::{ColPtr, UnifiedSource};
-use super::super::shard_reader::{MappedShard, ScalarRegion};
-use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
+use super::super::merge::UnifiedSource;
+use super::super::shard_reader::MappedShard;
+use crate::schema::SchemaDescriptor;
 
 pub(super) enum CursorSource {
     /// Rc-owned in-memory batch.  The Rc keeps the data alive for the
@@ -107,65 +107,9 @@ impl CursorSource {
     /// region sizes at open time, so no arm here can fail.
     pub(super) fn to_unified(&self, schema: &SchemaDescriptor) -> UnifiedSource {
         match self {
-            CursorSource::Batch(b) => {
-                let mb = b.as_mem_batch();
-                super::super::merge::mem_batch_to_unified(&mb, schema)
-            }
-            CursorSource::Shard(s) => {
-                let pk_stride = s.pk_stride as usize;
-                let data_ptr = s.data().as_ptr();
-
-                let pk = match &s.pk {
-                    ScalarRegion::Raw { offset, .. } => ColPtr {
-                        base: unsafe { data_ptr.add(*offset) },
-                        stride: pk_stride,
-                    },
-                    // stride=0: base.add(ri * 0) == base for every row, reads
-                    // the constant value identically to null_bmp Constant.
-                    ScalarRegion::Constant { value, .. } => ColPtr {
-                        base: value.as_ptr(),
-                        stride: 0,
-                    },
-                };
-
-                let null_bmp = match &s.null_bmp {
-                    ScalarRegion::Raw { offset, .. } => ColPtr {
-                        base: unsafe { data_ptr.add(*offset) },
-                        stride: FIXED_REGION_BYTES,
-                    },
-                    ScalarRegion::Constant { value, .. } => ColPtr {
-                        base: value.as_ptr(),
-                        stride: 0,
-                    },
-                };
-
-                let mut cols = [ColPtr {
-                    base: ptr::null(),
-                    stride: 0,
-                }; MAX_COLUMNS - 1];
-                for (pi, _ci, col) in schema.payload_columns() {
-                    let cs = col.size() as usize;
-                    cols[pi] = match &s.col_regions[pi] {
-                        ScalarRegion::Raw { offset, .. } => ColPtr {
-                            base: unsafe { data_ptr.add(*offset) },
-                            stride: cs,
-                        },
-                        ScalarRegion::Constant { value, .. } => ColPtr {
-                            base: value.as_ptr(),
-                            stride: 0,
-                        },
-                    };
-                }
-
-                let blob = s.blob_slice();
-                UnifiedSource {
-                    pk,
-                    null_bmp,
-                    cols,
-                    blob_ptr: blob.as_ptr(),
-                    blob_len: blob.len(),
-                }
-            }
+            CursorSource::Batch(b) => super::super::merge::mem_batch_to_unified(&b.as_mem_batch(), schema),
+            // `s` is `&Rc<MappedShard>`; the method call auto-derefs to `&MappedShard`.
+            CursorSource::Shard(s) => s.to_unified(schema),
         }
     }
 }

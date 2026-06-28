@@ -6,10 +6,13 @@
 
 use std::ptr;
 
+use super::super::batch::FIXED_REGION_BYTES;
+use super::super::merge::{ColPtr, UnifiedSource};
 use super::super::xor8;
 use super::{MappedShard, ScalarRegion, WeightRegion};
 use crate::foundation::codec::{read_i64_le, read_u64_le};
 use crate::schema::key::PkBuf;
+use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
 
 impl MappedShard {
     #[inline]
@@ -334,6 +337,72 @@ impl MappedShard {
     /// Bulk-copy all rows into an Batch.
     pub(crate) fn to_owned_batch(&self, schema: &crate::schema::SchemaDescriptor) -> super::super::batch::Batch {
         self.slice_to_owned_batch(0, self.count, schema)
+    }
+
+    /// Derive a `UnifiedSource` view over this shard: each `ScalarRegion` becomes
+    /// a `(base, stride)` `ColPtr` into the shard's mmap, with `Constant` regions
+    /// mapped to `stride == 0` so `base.add(ri * stride) == base` reads the same
+    /// bytes for every row. Pure pointer arithmetic — no allocation, no scan. The
+    /// returned `ColPtr`s alias the mapped memory, so the caller must keep `self`
+    /// alive for as long as the view is read.
+    ///
+    /// The shard-side counterpart of `repr::merge::mem_batch_to_unified`; shared
+    /// by the read-cursor drain (shard-vs-`MemBatch` polymorphism) and shard
+    /// compaction.
+    pub(crate) fn to_unified(&self, schema: &SchemaDescriptor) -> UnifiedSource {
+        let pk_stride = self.pk_stride as usize;
+        let data_ptr = self.data().as_ptr();
+
+        let pk = match &self.pk {
+            ScalarRegion::Raw { offset, .. } => ColPtr {
+                base: unsafe { data_ptr.add(*offset) },
+                stride: pk_stride,
+            },
+            // stride=0: base.add(ri * 0) == base for every row, reads the
+            // constant value identically to a null_bmp Constant.
+            ScalarRegion::Constant { value, .. } => ColPtr {
+                base: value.as_ptr(),
+                stride: 0,
+            },
+        };
+
+        let null_bmp = match &self.null_bmp {
+            ScalarRegion::Raw { offset, .. } => ColPtr {
+                base: unsafe { data_ptr.add(*offset) },
+                stride: FIXED_REGION_BYTES,
+            },
+            ScalarRegion::Constant { value, .. } => ColPtr {
+                base: value.as_ptr(),
+                stride: 0,
+            },
+        };
+
+        let mut cols = [ColPtr {
+            base: ptr::null(),
+            stride: 0,
+        }; MAX_COLUMNS - 1];
+        for (pi, _ci, col) in schema.payload_columns() {
+            let cs = col.size() as usize;
+            cols[pi] = match &self.col_regions[pi] {
+                ScalarRegion::Raw { offset, .. } => ColPtr {
+                    base: unsafe { data_ptr.add(*offset) },
+                    stride: cs,
+                },
+                ScalarRegion::Constant { value, .. } => ColPtr {
+                    base: value.as_ptr(),
+                    stride: 0,
+                },
+            };
+        }
+
+        let blob = self.blob_slice();
+        UnifiedSource {
+            pk,
+            null_bmp,
+            cols,
+            blob_ptr: blob.as_ptr(),
+            blob_len: blob.len(),
+        }
     }
 }
 

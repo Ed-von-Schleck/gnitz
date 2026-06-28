@@ -31,16 +31,24 @@ use crate::schema::SchemaDescriptor;
 ///
 /// File I/O lives here so the monomorphised merge loop in `run_merge` carries no
 /// duplicated open/error code.
+/// Open the input shards into owned `MappedShard`s, validating checksums. Split
+/// out of [`open_and_merge`] so the columnar `compact_shards` can drive its own
+/// `run_merge` over the same opened shards — collecting survivors for the
+/// column-first scatter — without the row-at-a-time routing emit.
+pub(super) fn open_shards(input_files: &[&CStr], schema: &SchemaDescriptor) -> Result<Vec<MappedShard>, StorageError> {
+    let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
+    for f in input_files {
+        shards.push(MappedShard::open(f, schema, true)?);
+    }
+    Ok(shards)
+}
+
 pub(super) fn open_and_merge(
     input_files: &[&CStr],
     schema: &SchemaDescriptor,
     mut emit: impl FnMut(u128, i64, &MappedShard, usize),
 ) -> Result<(), StorageError> {
-    let mut shards: Vec<MappedShard> = Vec::with_capacity(input_files.len());
-    for f in input_files {
-        shards.push(MappedShard::open(f, schema, true)?);
-    }
-
+    let shards = open_shards(input_files, schema)?;
     run_merge(&shards, schema, |src, row, w| {
         emit(pack_pk_be(shards[src].get_pk_bytes(row)), w, &shards[src], row);
     });
