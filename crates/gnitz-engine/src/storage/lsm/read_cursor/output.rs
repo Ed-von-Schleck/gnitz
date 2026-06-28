@@ -159,7 +159,9 @@ impl ReadCursor {
     pub(crate) fn materialize(mut self) -> Rc<Batch> {
         if self.sources.len() == 1 && self.states[0].position == 0 {
             match &self.sources[0] {
-                CursorSource::Batch(rc) if rc.consolidated => return Rc::clone(rc),
+                CursorSource::Batch(rc) if rc.consolidated_verified(&self.schema) => {
+                    return Rc::clone(rc);
+                }
                 CursorSource::Shard(rc) if !rc.has_ghosts => {
                     return Rc::new(rc.to_owned_batch(&self.schema));
                 }

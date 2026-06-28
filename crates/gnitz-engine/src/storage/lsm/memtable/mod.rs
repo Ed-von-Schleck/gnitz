@@ -184,28 +184,31 @@ mod tests {
         b
     }
 
-    /// A client lie that sets `FLAG_BATCH_CONSOLIDATED` but not
-    /// `FLAG_BATCH_SORTED` is a *deferred* crash. The decoder applies the flags,
-    /// `into_consolidated` short-circuits on `consolidated` (preserving
-    /// `sorted = false`), and the unsorted run enters the MemTable. The next
-    /// consolidation — a flush, or `force_consolidate` once ≥ 16 runs accrue —
-    /// calls `runs_as_sorted`, whose `expect` panics. The `handle_message` strip
-    /// clears the flags at ingress so this run never forms.
+    /// A run that lies about being `sorted` is rejected at the next
+    /// consolidation. `ConsolidatedBatch::new_unchecked` checks only that the
+    /// flags are *set*, not that the data matches, so a descending batch flagged
+    /// sorted+consolidated slips into the MemTable. The next consolidation — a
+    /// flush, or `force_consolidate` once ≥ 16 runs accrue — calls
+    /// `runs_as_sorted` → `as_sorted_mem_batch`, which now verifies the `sorted`
+    /// flag against the data (debug) and panics. The `handle_message` strip clears
+    /// the flags at ingress so this run never forms.
+    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "MemTable runs are always sorted")]
-    fn memtable_consolidated_unsorted_run_panics_on_force_consolidate() {
+    #[should_panic(expected = "flagged sorted")]
+    fn memtable_lying_sorted_run_rejected_at_flush() {
         let schema = make_u64_i64_schema();
         let mut mt = MemTable::new(schema, 1 << 20);
         mt.upsert_sorted_batch(make_batch(&schema, &[(5, 1, 50)])).unwrap();
 
-        // consolidated stays set (default), sorted cleared: the spoofed combination.
+        // The lie: descending data flagged sorted+consolidated. `new_unchecked`
+        // trusts the flags, so the unverified run enters the MemTable.
         let mut bad = desc_two_row_batch(&schema);
-        bad.sorted = false;
-        assert!(bad.consolidated, "models FLAG_BATCH_CONSOLIDATED without _SORTED");
-        mt.upsert_sorted_batch(bad.into_consolidated(&schema)).unwrap();
+        bad.sorted = true;
+        bad.consolidated = true;
+        mt.upsert_sorted_batch(ConsolidatedBatch::new_unchecked(bad)).unwrap();
 
         // 2 runs → force_consolidate clears its ≤1-run early-return and reaches
-        // runs_as_sorted, which rejects the unsorted run.
+        // runs_as_sorted, which verifies the lying `sorted` flag and rejects the run.
         let _ = mt.consolidate_for_flush();
     }
 
@@ -473,9 +476,9 @@ mod tests {
         ]);
 
         let batches: Vec<SortedMemBatch> = vec![
-            run1.as_sorted_mem_batch().expect("test batch is sorted"),
-            run2.as_sorted_mem_batch().expect("test batch is sorted"),
-            run3.as_sorted_mem_batch().expect("test batch is sorted"),
+            run1.as_sorted_mem_batch(&schema).expect("test batch is sorted"),
+            run2.as_sorted_mem_batch(&schema).expect("test batch is sorted"),
+            run3.as_sorted_mem_batch(&schema).expect("test batch is sorted"),
         ];
 
         let consolidated = consolidate_batches(&batches, &schema);

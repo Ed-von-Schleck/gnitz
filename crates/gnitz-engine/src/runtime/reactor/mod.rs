@@ -956,12 +956,11 @@ impl Reactor {
         let sch = schema.as_ref().expect("FLAG_HAS_DATA set but no schema — ring corrupt");
         let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
         owned.append_mem_batch_range(&mb, 0, mb.count, crate::storage::WeightFill::Copy);
-        if flags & FLAG_BATCH_SORTED != 0 {
-            owned.mark_sorted();
-        }
-        if flags & FLAG_BATCH_CONSOLIDATED != 0 {
-            owned.mark_consolidated();
-        }
+        // Authoritative: the wire flags are ground truth. `with_schema` defaults
+        // both flags to true and `append_mem_batch_range` does not clear them, so
+        // an absent wire flag must actively reset — never leave the stale default.
+        owned.sorted = flags & FLAG_BATCH_SORTED != 0;
+        owned.consolidated = flags & FLAG_BATCH_CONSOLIDATED != 0;
         let control = zc.control;
         let _ = mb; // release borrows from slot before dropping the slot
         drop(slot); // RAII: advance consume_cursor before waking awaiter
@@ -990,12 +989,11 @@ impl Reactor {
                 .expect("exchange FLAG_HAS_DATA without schema — ring corrupt");
             let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
             owned.append_mem_batch_range(&mb, 0, mb.count, crate::storage::WeightFill::Copy);
-            if flags & FLAG_BATCH_SORTED != 0 {
-                owned.mark_sorted();
-            }
-            if flags & FLAG_BATCH_CONSOLIDATED != 0 {
-                owned.mark_consolidated();
-            }
+            // Authoritative: the wire flags are ground truth. `with_schema` defaults
+            // both flags to true and `append_mem_batch_range` does not clear them, so
+            // an absent wire flag must actively reset — never leave the stale default.
+            owned.sorted = flags & FLAG_BATCH_SORTED != 0;
+            owned.consolidated = flags & FLAG_BATCH_CONSOLIDATED != 0;
             let _ = mb; // release borrow from slot bytes before dropping slot
             Some(owned)
         } else {

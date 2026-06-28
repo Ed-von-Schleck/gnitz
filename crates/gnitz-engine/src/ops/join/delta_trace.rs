@@ -159,8 +159,8 @@ pub fn op_join_delta_trace(
     });
 
     // Trace-major cartesian emission is PK-sorted but NOT (PK, payload)-sorted
-    // (left payloads interleave across trace entries); downstream re-sorts.
-    output.sorted = false;
+    // (left payloads interleave across trace entries) and is unfolded; `empty_joined`
+    // leaves both flags clear, downstream re-sorts and consolidates.
     output
 }
 
@@ -222,7 +222,9 @@ pub fn op_join_delta_trace_outer(
         }
     });
 
-    output.sorted = false;
+    // Trace-major cartesian + null-fill emission — not (PK, payload)-sorted and
+    // unfolded; `empty_joined` leaves both flags clear, downstream re-sorts and
+    // consolidates.
     output
 }
 

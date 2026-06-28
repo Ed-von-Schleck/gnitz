@@ -286,6 +286,11 @@ impl Batch {
     /// non-PK columns followed by `right_schema`'s non-PK columns.  Used for
     /// join outputs ([left_PK, left_payload..., right_payload...]), which
     /// have no single `SchemaDescriptor` in the engine.
+    ///
+    /// `sorted`/`consolidated` default to `false` (like `write_to_batch`): join
+    /// emission appends cartesian/trace-major rows that are neither ordered nor
+    /// folded, and the `extend_*` appenders never touch the flags. A producer that
+    /// emits in (PK, payload) order (the Δ⋈Δ cogroup join) sets them explicitly.
     pub fn empty_joined(left_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> Self {
         let mut strides = [0u8; MAX_BATCH_REGIONS];
         strides[REG_PK] = pk_stride(left_schema);
@@ -301,8 +306,8 @@ impl Batch {
             num_regions: out_idx as u8,
             capacity: 0,
             count: 0,
-            sorted: true,
-            consolidated: true,
+            sorted: false,
+            consolidated: false,
             schema: None,
             blob_id: next_blob_id(),
         }
@@ -934,11 +939,88 @@ impl Batch {
     }
 
     /// Returns `None` for unsorted batches; `count <= 1` is always sorted.
-    pub(in crate::storage) fn as_sorted_mem_batch(&self) -> Option<merge::SortedMemBatch<'_>> {
-        if self.sorted || self.count <= 1 {
+    pub(in crate::storage) fn as_sorted_mem_batch(
+        &self,
+        schema: &SchemaDescriptor,
+    ) -> Option<merge::SortedMemBatch<'_>> {
+        if self.sorted_verified(schema) || self.count <= 1 {
             Some(merge::SortedMemBatch::new_unchecked(self.as_mem_batch()))
         } else {
             None
+        }
+    }
+
+    /// Read the `sorted` flag, asserting in debug builds that the data actually is
+    /// sorted by (PK, payload). Prefer this over a bare `self.sorted` at any
+    /// skip-point that trusts the flag to avoid a re-sort: a lying flag is caught
+    /// here, exactly where it would otherwise cause silent weight errors.
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
+    #[inline]
+    pub(crate) fn sorted_verified(&self, schema: &SchemaDescriptor) -> bool {
+        #[cfg(debug_assertions)]
+        if self.sorted {
+            self.debug_verify_sorted(schema);
+        }
+        self.sorted
+    }
+
+    /// Read the `consolidated` flag, asserting in debug builds that the data
+    /// actually is consolidated (strictly (PK, payload)-increasing, ghost-free).
+    /// Prefer this over a bare `self.consolidated` at any skip-point that trusts
+    /// the flag to avoid a re-fold.
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
+    #[inline]
+    pub(crate) fn consolidated_verified(&self, schema: &SchemaDescriptor) -> bool {
+        #[cfg(debug_assertions)]
+        if self.consolidated {
+            self.debug_verify_consolidated(schema);
+        }
+        self.consolidated
+    }
+
+    /// Debug-only (PK, payload) order of adjacent rows `i` and `i + 1` — the total
+    /// order every merge/consolidation path sorts by (§4). Shared by both verifiers.
+    #[cfg(debug_assertions)]
+    fn adjacent_pair_ord(&self, schema: &SchemaDescriptor, i: usize) -> std::cmp::Ordering {
+        use super::columnar::{compare_pk_bytes, compare_rows};
+        compare_pk_bytes(self.get_pk_bytes(i), self.get_pk_bytes(i + 1))
+            .then_with(|| compare_rows(schema, self, i, self, i + 1))
+    }
+
+    /// Debug-only: assert the data is sorted by (PK, payload) — non-decreasing,
+    /// adjacent ties permitted. The `sorted` contract, nothing more.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_verify_sorted(&self, schema: &SchemaDescriptor) {
+        for i in 0..self.count.saturating_sub(1) {
+            debug_assert_ne!(
+                self.adjacent_pair_ord(schema, i),
+                std::cmp::Ordering::Greater,
+                "batch flagged sorted, but row {i} > row {} by (PK, payload)",
+                i + 1
+            );
+        }
+    }
+
+    /// Debug-only: assert the data is fully consolidated — strictly increasing by
+    /// (PK, payload) (no unfolded duplicate) AND no zero-weight row (ghost
+    /// eliminated, §2). Subsumes `debug_verify_sorted`.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_verify_consolidated(&self, schema: &SchemaDescriptor) {
+        for i in 0..self.count {
+            debug_assert_ne!(
+                self.get_weight(i),
+                0,
+                "batch flagged consolidated, but row {i} has weight 0 (ghost not eliminated)"
+            );
+            if i + 1 < self.count {
+                debug_assert_eq!(
+                    self.adjacent_pair_ord(schema, i),
+                    std::cmp::Ordering::Less,
+                    "batch flagged consolidated, but rows {i},{} are not strictly \
+                     increasing (unsorted or unfolded duplicate)",
+                    i + 1
+                );
+            }
         }
     }
 
@@ -1401,10 +1483,10 @@ impl Batch {
     /// `ConsolidatedBatch` without any allocation (free move).
     /// Slow path: sorts and weight-folds into a fresh batch, then drops `self`.
     pub fn into_consolidated(self, schema: &SchemaDescriptor) -> ConsolidatedBatch {
-        if self.consolidated || self.count == 0 {
+        if self.consolidated_verified(schema) || self.count == 0 {
             return ConsolidatedBatch(self);
         }
-        let already_sorted = self.sorted;
+        let already_sorted = self.sorted_verified(schema);
         let mb = self.as_mem_batch();
         let blob_cap = mb.blob.len().max(1);
         let mut result = write_to_batch(schema, self.count, blob_cap, |writer| {
@@ -1429,7 +1511,7 @@ impl Batch {
     /// let c: &Batch = cs.as_deref().unwrap_or(delta);
     /// ```
     pub fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<ConsolidatedBatch> {
-        if batch.consolidated || batch.count == 0 {
+        if batch.consolidated_verified(schema) || batch.count == 0 {
             return None;
         }
         let mb = batch.as_mem_batch();
@@ -2027,44 +2109,32 @@ mod tests {
         b.count += 1;
     }
 
+    /// A deliberately corrupt, unsorted batch: a duplicate `(PK, payload)` pair
+    /// and a `+1`/`-1` ghost pair at non-adjacent positions, plus a NULL payload
+    /// cell whose underlying bytes are non-zero. Used to exercise both the strip
+    /// (real consolidation) and the debug verifier that rejects a spoofed-flag
+    /// version of it.
+    fn build_corrupt_batch(schema: &SchemaDescriptor) -> Batch {
+        let mut b = Batch::with_schema(*schema, 5);
+        append_test_row(&mut b, 5, 1, 100, 0); // dup A
+        append_test_row(&mut b, 1, 1, 7, 0); // ghost +
+        append_test_row(&mut b, 9, 1, -1, 1); // NULL cell over non-zero (0xFF..) bytes
+        append_test_row(&mut b, 5, 1, 100, 0); // dup B (non-adjacent to A)
+        append_test_row(&mut b, 1, -1, 7, 0); // ghost - (non-adjacent to +)
+        b
+    }
+
     /// The trust-boundary strip's mechanism, exercised directly on
-    /// `into_consolidated` (no server). An unsorted batch carries, at
-    /// non-adjacent positions, a duplicate `(PK, payload)` pair and a `+1`/`-1`
-    /// ghost pair, plus a NULL payload cell whose underlying bytes are non-zero.
-    ///
-    /// A client that lies with `FLAG_BATCH_SORTED | FLAG_BATCH_CONSOLIDATED`
-    /// makes `into_consolidated` short-circuit and trust the batch verbatim — the
-    /// duplicate stays unmerged and the ghost survives (silent wrong weights).
-    /// Clearing the flags — what `handle_message` now does to every client batch —
-    /// forces a real sort+fold: the duplicate sums to `+2`, the ghost is dropped,
-    /// the output is `(PK, payload)`-sorted, and the NULL cell stays NULL.
+    /// `into_consolidated` (no server). Clearing the flags — what `handle_message`
+    /// does to every client batch — forces a real sort+fold: the duplicate sums to
+    /// `+2`, the ghost is dropped, the output is `(PK, payload)`-sorted, and the
+    /// NULL cell stays NULL. (A spoof that instead *keeps* both flags set on this
+    /// corrupt data is rejected by the debug consumer-side verifier — see
+    /// `into_consolidated_spoofed_corrupt_flags_panic_in_debug`.)
     #[test]
-    fn into_consolidated_trusts_flags_strip_forces_real_consolidation() {
+    fn into_consolidated_strip_forces_real_consolidation() {
         let schema = pk_u64_nullable_i64_schema();
-        let build = || {
-            let mut b = Batch::with_schema(schema, 5);
-            append_test_row(&mut b, 5, 1, 100, 0); // dup A
-            append_test_row(&mut b, 1, 1, 7, 0); // ghost +
-            append_test_row(&mut b, 9, 1, -1, 1); // NULL cell over non-zero (0xFF..) bytes
-            append_test_row(&mut b, 5, 1, 100, 0); // dup B (non-adjacent to A)
-            append_test_row(&mut b, 1, -1, 7, 0); // ghost - (non-adjacent to +)
-            b
-        };
-
-        // Negative control: a spoofed sorted+consolidated batch is trusted
-        // verbatim — `into_consolidated` short-circuits, doing no work.
-        let mut corrupt = build();
-        corrupt.mark_sorted();
-        corrupt.mark_consolidated();
-        let corrupt = corrupt.into_consolidated(&schema).into_inner();
-        assert_eq!(corrupt.count, 5, "spoofed flags skip all consolidation");
-        assert!(
-            (0..corrupt.count).any(|i| corrupt.get_weight(i) == -1),
-            "ghost survives the short-circuit"
-        );
-
-        // The strip: clear both flags, then consolidate for real.
-        let mut clean = build();
+        let mut clean = build_corrupt_batch(&schema);
         clean.sorted = false;
         clean.consolidated = false;
         let clean = clean.into_consolidated(&schema).into_inner();
@@ -2080,6 +2150,22 @@ mod tests {
         // PK 9: the NULL cell still decodes as NULL (null bit preserved).
         assert_eq!(clean.get_weight(1), 1);
         assert_eq!(clean.get_null_word(1) & 1, 1, "null cell stays NULL");
+    }
+
+    /// The spoof the strip defends against: both flags set on a batch that is
+    /// neither sorted nor folded. `into_consolidated`'s consolidated short-circuit
+    /// now verifies the data in debug and panics instead of trusting it verbatim
+    /// (which would leave the duplicate unmerged and the ghost alive — silent
+    /// wrong weights).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "flagged consolidated")]
+    fn into_consolidated_spoofed_corrupt_flags_panic_in_debug() {
+        let schema = pk_u64_nullable_i64_schema();
+        let mut corrupt = build_corrupt_batch(&schema);
+        corrupt.mark_sorted();
+        corrupt.mark_consolidated();
+        let _ = corrupt.into_consolidated(&schema);
     }
 
     #[test]
@@ -2471,5 +2557,88 @@ mod tests {
         }
         let schema = SchemaDescriptor::new(&cols, &[0]);
         let _ = Batch::empty_joined(&schema, &schema);
+    }
+
+    // ── Consumer skip-point flag verifiers (debug_verify_sorted /
+    //    debug_verify_consolidated) ─────────────────────────────────────────
+    //
+    // Build a single-col-U64-PK / I64-payload batch from (pk, weight, payload)
+    // triples and stamp the sorted/consolidated flags directly. This hands a
+    // *lying* flag to a consumer skip-point so the debug verifier can be caught
+    // tripping. `empty_with_schema` defaults both flags to true, so the explicit
+    // assignment is what makes each lie precise.
+    fn flagged_batch(rows: &[(u128, i64, i64)], sorted: bool, consolidated: bool) -> (Batch, SchemaDescriptor) {
+        let schema = single_col_pk_schema(type_code::U64);
+        let mut b = Batch::empty_with_schema(&schema);
+        b.reserve_rows(rows.len());
+        for &(pk, w, v) in rows {
+            append_test_row(&mut b, pk, w, v, 0);
+        }
+        b.sorted = sorted;
+        b.consolidated = consolidated;
+        (b, schema)
+    }
+
+    // B: into_consolidated's `already_sorted` fold path trusts `sorted`.
+    // Descending PKs (2,1) but sorted=true, consolidated=false → B, not A.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "flagged sorted")]
+    fn into_consolidated_panics_on_lying_sorted() {
+        let (b, schema) = flagged_batch(&[(2, 1, 0), (1, 1, 0)], true, false);
+        let _ = b.into_consolidated(&schema);
+    }
+
+    // C: as_sorted_mem_batch certifies a SortedMemBatch from `sorted`.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "flagged sorted")]
+    fn as_sorted_mem_batch_panics_on_lying_sorted() {
+        let (b, schema) = flagged_batch(&[(2, 1, 0), (1, 1, 0)], true, false);
+        let _ = b.as_sorted_mem_batch(&schema);
+    }
+
+    // A: into_consolidated's consolidated short-circuit trusts `consolidated`.
+    // Adjacent-equal (PK=1, payload=5) duplicate but consolidated=true.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "not strictly")]
+    fn into_consolidated_panics_on_lying_consolidated_dup() {
+        let (b, schema) = flagged_batch(&[(1, 1, 5), (1, 1, 5)], true, true);
+        let _ = b.into_consolidated(&schema);
+    }
+
+    // D: consolidate_if_needed's consolidated short-circuit trusts `consolidated`.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "not strictly")]
+    fn consolidate_if_needed_panics_on_lying_consolidated_dup() {
+        let (b, schema) = flagged_batch(&[(1, 1, 5), (1, 1, 5)], true, true);
+        let _ = Batch::consolidate_if_needed(&b, &schema);
+    }
+
+    // Ghost clause: strictly ordered, but a net-zero row under consolidated=true.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "ghost not eliminated")]
+    fn into_consolidated_panics_on_consolidated_ghost() {
+        let (b, schema) = flagged_batch(&[(1, 1, 0), (2, 0, 0), (3, 1, 0)], true, true);
+        let _ = b.into_consolidated(&schema);
+    }
+
+    // A genuinely sorted+consolidated batch passes A, C, and D with no panic.
+    #[test]
+    fn honest_sorted_consolidated_batch_passes_verifiers() {
+        let (b, schema) = flagged_batch(&[(1, 1, 0), (2, 1, 0), (3, 1, 0)], true, true);
+        assert!(
+            b.as_sorted_mem_batch(&schema).is_some(),
+            "C: honest sorted batch certifies"
+        );
+        assert!(
+            Batch::consolidate_if_needed(&b, &schema).is_none(),
+            "D: honest consolidated batch borrows original"
+        );
+        let cb = b.into_consolidated(&schema);
+        assert_eq!(cb.count, 3, "A: honest consolidated batch passes through");
     }
 }

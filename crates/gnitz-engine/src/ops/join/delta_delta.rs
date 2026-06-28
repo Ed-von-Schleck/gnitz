@@ -197,7 +197,11 @@ pub fn op_join_delta_delta(
         m.seek(b_end);
     });
 
+    // Distinct left×right products emitted in ascending (PK, payload) order and
+    // ghost-free (the `w_out != 0` guard), so the output is genuinely sorted and
+    // consolidated — set both, since `empty_joined` defaults them clear.
     output.sorted = true;
+    output.consolidated = true;
     gnitz_debug!("op_join_dd: a={} b={} out={}", n_a, n_b, output.count);
     output
 }

@@ -1713,8 +1713,9 @@ fn test_reduce_min_f32() {
     let empty_out = Rc::new(Batch::empty(1, 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
-    // Use a 2-col input schema: pk(U64), val(F32), GROUP BY pk
-    let delta = make_batch_f32(&in_schema, &[(1, 1, 3.5f32), (1, 1, -1.0f32), (1, 1, 7.0f32)]);
+    // Use a 2-col input schema: pk(U64), val(F32), GROUP BY pk. Rows in
+    // (PK, payload) order so the consolidated flag the helper stamps is honest.
+    let delta = make_batch_f32(&in_schema, &[(1, 1, -1.0f32), (1, 1, 3.5f32), (1, 1, 7.0f32)]);
 
     let agg = AggDescriptor {
         col_idx: 1,
@@ -1765,8 +1766,9 @@ fn test_reduce_max_i16() {
     let empty_out = Rc::new(Batch::empty(1, 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
-    // 3 rows with I16 values, all same PK
-    let delta = make_batch_typed_i16(&in_schema, &[(1, 1, -100i16), (1, 1, 200i16), (1, 1, 50i16)]);
+    // 3 rows with I16 values, all same PK, in (PK, payload) order so the
+    // consolidated flag the helper stamps is honest.
+    let delta = make_batch_typed_i16(&in_schema, &[(1, 1, -100i16), (1, 1, 50i16), (1, 1, 200i16)]);
 
     let agg = AggDescriptor {
         col_idx: 1,
@@ -6069,16 +6071,21 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
         &[0, 1],
     );
 
-    // Distinct PKs: (1,1) twice → cnt 2, (1,2) once → cnt 1. Unsorted input so
-    // the argsort_pk_canonical branch runs.
+    // Two distinct compound PKs, folded and (PK,payload)-sorted: (1,1) at weight
+    // 2 → cnt 2, (1,2) at weight 1 → cnt 1. Flagged consolidated (genuinely
+    // folded, ghost-free, sorted) but with `sorted` left unset, so op_reduce
+    // re-derives canonical order through the argsort_pk_canonical branch — the
+    // wide compound-PK path under test.
     let delta = {
-        let mut b = Batch::with_schema(in_schema, 3);
-        for (a, c) in [(1u128, 2u128), (1, 1), (1, 1)] {
+        let mut b = Batch::with_schema(in_schema, 2);
+        for (a, c, w) in [(1u128, 1u128, 2i64), (1, 2, 1)] {
             b.extend_pk_opk(&in_schema, &[a, c]);
-            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.count += 1;
         }
+        b.sorted = false;
+        b.consolidated = true;
         b
     };
 

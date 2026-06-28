@@ -39,7 +39,7 @@ pub(crate) fn consolidate_runs(runs: &[Rc<Batch>], schema: &SchemaDescriptor) ->
     }
     let sorted: Vec<SortedMemBatch> = runs
         .iter()
-        .map(|r| r.as_sorted_mem_batch().expect("flushed runs are sorted"))
+        .map(|r| r.as_sorted_mem_batch(schema).expect("flushed runs are sorted"))
         .collect();
     Rc::new(consolidate_batches(&sorted, schema))
 }
@@ -88,7 +88,10 @@ impl MemTable {
     fn runs_as_sorted(&self) -> Vec<SortedMemBatch<'_>> {
         self.runs
             .iter()
-            .map(|r| r.as_sorted_mem_batch().expect("MemTable runs are always sorted"))
+            .map(|r| {
+                r.as_sorted_mem_batch(&self.schema)
+                    .expect("MemTable runs are always sorted")
+            })
             .collect()
     }
 

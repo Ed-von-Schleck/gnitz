@@ -120,9 +120,9 @@ fn range_per_row_seek(
     }
 
     // Probe order is delta-major with arbitrary trace payload runs per row — not
-    // (PK, payload)-sorted. The re-key + output exchange + consolidation downstream
-    // restore order; do not let a merge trust this batch as sorted.
-    output.sorted = false;
+    // (PK, payload)-sorted, and the cartesian emission is unfolded. `empty_joined`
+    // leaves both flags clear so no consumer trusts it as either; the re-key +
+    // output exchange + consolidation downstream restore order.
     output
 }
 
@@ -226,8 +226,9 @@ fn range_merge_walk(
         lo = hi;
     }
 
-    // Trace-major with delta runs per trace row — not (PK, payload)-sorted.
-    output.sorted = false;
+    // Trace-major with delta runs per trace row — not (PK, payload)-sorted and
+    // unfolded; `empty_joined` leaves both flags clear, downstream re-sorts and
+    // consolidates.
     output
 }
 
@@ -323,9 +324,9 @@ mod tests {
     fn test_range_dt_lt_backward_reseek() {
         let schema = make_schema_u64_i64();
         let mut ch = trace_cursor(make_batch(&schema, &[(5, 1, 105), (15, 1, 115), (25, 1, 125)]), schema);
-        // Two delta rows; consolidation sorts them ascending (10, 30). Processing
-        // 30 after 10 forces a backward seek to 0x00 for the second probe.
-        let delta = make_batch(&schema, &[(30, 1, 300), (10, 1, 100)]);
+        // Two delta rows in ascending (PK) order (10, 30). Processing 30 after 10
+        // forces a backward seek to 0x00 for the second probe.
+        let delta = make_batch(&schema, &[(10, 1, 100), (30, 1, 300)]);
         let out = op_join_delta_trace_range(&delta, ch.cursor_mut(), &schema, &schema, 0, RangeRel::Lt);
         // x=10 → {y<10}={105}; x=30 → {y<30}={105,115,125}. 4 rows total.
         let mut pairs: Vec<(u64, i64)> = (0..out.count)

@@ -187,7 +187,7 @@ pub fn op_reduce(
 
     // Argsort. group_by_pk keeps the sorted/consolidated output mark; only the
     // iteration order changes when the input is unsorted.
-    let sorted_indices: Vec<u32> = if group_by_pk && working.sorted {
+    let sorted_indices: Vec<u32> = if group_by_pk && working.sorted_verified(input_schema) {
         (0..n as u32).collect()
     } else if group_by_pk {
         argsort_pk_canonical(&mb)

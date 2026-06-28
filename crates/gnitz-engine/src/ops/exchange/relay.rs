@@ -382,6 +382,12 @@ pub(crate) fn op_relay_scatter_consolidated_mode(
     num_workers: usize,
     mode: RouteMode,
 ) -> Vec<Batch> {
+    // The `ConsolidatedBatch` type certifies the flag; in debug, additionally
+    // verify the data matches before the merge-walk fast-paths on it.
+    #[cfg(debug_assertions)]
+    for s in sources.iter().flatten() {
+        s.debug_verify_consolidated(schema);
+    }
     let mem_batches: Vec<Option<MemBatch>> = sources
         .iter()
         .map(|opt| match opt {
