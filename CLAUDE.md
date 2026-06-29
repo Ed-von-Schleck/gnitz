@@ -264,13 +264,17 @@ weight -1, new at +1.
   the next value from history. Uses optional AggValueIndex for
   O(log N + 1) lookup instead of full trace scan.
 
-*Anti-join and Semi-join:*
-Non-linear (depend on `distinct(B)` internally).
-`antijoin(A, B) = A - semijoin(A, distinct(B))`. Incremental:
-`Δ(antijoin(A, B)) = anti_dt(ΔA, I(D)) - semi_dt(ΔD, I(A)) - semi_dd(ΔA, ΔD)`
-where `D = distinct(B)`. Output uses left schema only; weights preserved
-(not multiplied). SQL: EXCEPT = anti-join, INTERSECT = bidirectional
-semi-join.
+*Anti-join:*
+Non-linear (depends on `distinct(B)` internally). Output uses left schema
+only; weights preserved (not multiplied). The sole caller is the equi LEFT
+JOIN null-fill (set-difference form), which needs the anti-join's
+multiplicity preservation for a bag-valued preserved side. SQL set
+operations (UNION/INTERSECT/EXCEPT, both DISTINCT and ALL) are **join-free**:
+every one is a linear combination of `{union, negate}` plus the non-linear
+weight-clamp primitive (`distinct = clamp[-1,1]`, `positive_part =
+clamp[0,i64::MAX]`) over content-hashed leaves — e.g. EXCEPT DISTINCT =
+`positive_part(distinct(A) − distinct(B))`, INTERSECT DISTINCT =
+`distinct(A) − positive_part(distinct(A) − distinct(B))`.
 
 *All non-linear operators:* Consolidation mandatory — must see true net
 weights. Enforced by `ConsolidatedScope`.
@@ -447,7 +451,7 @@ foundation (L0)  — independent leaves; depends on nothing
   - `repr` (L2) — the in-memory batch and the kernels over it: `batch` (region layout), `batch_wire` (wire/shard serde), `batch_pool` (buffer recycling), `columnar` (comparators), `merge` (sort-merge consolidation), `scatter` (exchange repartition), `heap` (k-way merge), `bloom`/`xor8` (PK-probe filters).
   - `lsm` (L3) — the on-disk half: `wal`, `shard_file`/`shard_reader`/`shard_index`, `compact` (N-way compaction), `memtable`, `read_cursor`, and the `Table`/`PartitionedTable` facades.
 - **`expr`** — compiled expression programs evaluated over batches (`program`, `batch`, `plan`).
-- **`ops`** — the DBSP operators: `join` (inner/outer/anti/semi, split by Δ⋈trace, Δ⋈Δ, and range), `reduce` (aggregation), `exchange` (repartition: `router` + `relay`), `distinct`, `linear` (filter/map/negate/union), `scan`, `reindex` (re-key for join/group), `cogroup`, `index` (secondary indexes).
+- **`ops`** — the DBSP operators: `join` (inner/outer/anti, split by Δ⋈trace, Δ⋈Δ, and range), `reduce` (aggregation), `exchange` (repartition: `router` + `relay`), `distinct`, `linear` (filter/map/negate/union), `scan`, `reindex` (re-key for join/group), `cogroup`, `index` (secondary indexes).
 - **`query`** (L5) — the circuit layer behind the `dag` facade: `compiler` (view → DBSP circuit → VM program), `vm` (executes the program), `dag` (`DagEngine`: plan cache, epoch evaluator, ingestion). `catalog` and `runtime` reach this layer only through `dag`.
 - **`catalog`** — the DDL/metadata engine wrapping `DagEngine`: `ddl`, `sys_tables`, `hooks`, `registry`, `metadata`, `validation`, `write_path`, persistence (`store_io`, `partition_lsn`), `cache`, `bootstrap`.
 - **`runtime`** (L7) — the multi-process server (`main.rs` builds `gnitz-server`):

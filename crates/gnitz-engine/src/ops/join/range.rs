@@ -615,7 +615,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Anti/Semi-join DT: cursor re-seek for same-PK rows
+    // Anti-join DT: cursor re-seek for same-PK rows
     // -----------------------------------------------------------------------
 
     /// Build a band-join trace/delta over the `(U64 k, U64 range)` compound PK

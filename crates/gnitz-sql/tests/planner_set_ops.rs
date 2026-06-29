@@ -1,6 +1,9 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::GnitzClient;
+use gnitz_core::{
+    GnitzClient, OPCODE_ANTI_JOIN_DELTA_DELTA, OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_DELTA,
+    OPCODE_JOIN_DELTA_TRACE, OPCODE_POSITIVE_PART,
+};
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
@@ -252,11 +255,13 @@ fn test_union_projection_applied() {
     assert_eq!(i64_at(&batch, col_idx(&schema, "name"), 0), 100);
 }
 
-// ── item 27: EXCEPT/INTERSECT lift the right side through distinct ────
+// ── item 27: EXCEPT/INTERSECT lift each side through distinct ────
 //
 // Two B rows with different PKs but identical projected content must change
-// B's set membership only ONCE. Without distinct lifting the second insert
-// re-fires the correction semi-join, driving the EXCEPT output to weight -1.
+// B's set membership only ONCE. EXCEPT DISTINCT = positive_part(da − db) with
+// da = distinct(A), db = distinct(B): without the leaf distinct the second B
+// insert would push db to 2, driving da − db = 1 − 2 = −1 and underflowing the
+// clamp's input; distinct caps db at 1 so the difference stays at 0.
 
 #[test]
 fn test_except_distinct_lifting_no_underflow() {
@@ -519,16 +524,8 @@ fn test_except_left_duplicate_projected_weight_one() {
         // Two left rows projecting to c=5; right side still empty.
         p.execute("INSERT INTO a (id, c) VALUES (1, 5), (2, 5)").unwrap();
     }
-    let weight_of_5 = |client: &mut GnitzClient| -> i64 {
-        let (schema, batch) = read_view(client, &sn, "v");
-        let ci = col_idx(&schema, "c");
-        (0..batch.len())
-            .filter(|&r| i64_at(&batch, ci, r) == 5)
-            .map(|r| batch.weights[r])
-            .sum()
-    };
     assert_eq!(
-        weight_of_5(&mut client),
+        view_value_weight(&mut client, &sn, "v", "c", 5),
         1,
         "EXCEPT must lift the left branch through distinct: c=5 carried by two source rows → weight 1, not 2"
     );
@@ -537,9 +534,44 @@ fn test_except_left_duplicate_projected_weight_one() {
     // would leave it surviving at weight 1).
     insert(&mut client, &sn, "b", 1, 5);
     assert_eq!(
-        weight_of_5(&mut client),
+        view_value_weight(&mut client, &sn, "v", "c", 5),
         0,
         "once the right side covers c=5 the EXCEPT must net to 0"
+    );
+}
+
+#[test]
+fn test_intersect_left_duplicate_projected_weight_one() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE a (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE b (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE VIEW v AS SELECT c FROM a INTERSECT SELECT c FROM b")
+            .unwrap();
+        // Two left rows projecting to c=5; right side still empty (cL=2, cR=0).
+        p.execute("INSERT INTO a (id, c) VALUES (1, 5), (2, 5)").unwrap();
+    }
+    // cL=2, cR=0 → min(da, db) = min(1, 0) = 0: c=5 not in the right set.
+    assert_eq!(
+        view_value_weight(&mut client, &sn, "v", "c", 5),
+        0,
+        "INTERSECT must be empty while the right side lacks c=5"
+    );
+
+    // Right side now has one c=5 (cL=2, cR=1) → min(da, db) = min(1, 1) = 1, NOT
+    // the raw left multiplicity 2: the leaf distinct clamps da to 1.
+    insert(&mut client, &sn, "b", 1, 5);
+    assert_eq!(
+        view_value_weight(&mut client, &sn, "v", "c", 5),
+        1,
+        "INTERSECT must clamp the duplicated left value to weight 1, not 2"
     );
 }
 
@@ -719,5 +751,58 @@ fn test_set_op_duplicate_output_columns_rejected() {
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("duplicate column"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
+    }
+}
+
+/// INTERSECT/EXCEPT DISTINCT compile to the join-free weight-clamp algebra: the
+/// view circuits must carry NO join/anti-join nodes of any kind and DO carry a
+/// positive_part node. (Semi-join is fully retired, so there is no opcode left to
+/// assert zero on — its absence is structural.)
+#[test]
+fn test_set_op_distinct_join_free_circuit_shape() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE jf_a (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE jf_b (id BIGINT PRIMARY KEY, c BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE VIEW jf_except AS SELECT c FROM jf_a EXCEPT SELECT c FROM jf_b")
+            .unwrap();
+        p.execute("CREATE VIEW jf_intersect AS SELECT c FROM jf_a INTERSECT SELECT c FROM jf_b")
+            .unwrap();
+    }
+    let except = client.resolve_table_or_view_id(&sn, "jf_except").unwrap().0;
+    let intersect = client.resolve_table_or_view_id(&sn, "jf_intersect").unwrap().0;
+
+    let nodes = scan_circuit_nodes(&mut client);
+    let nodes = nodes.as_ref();
+    for (vid, name) in [(except, "EXCEPT"), (intersect, "INTERSECT")] {
+        let n = |op: u64| opcode_node_count(nodes, vid, op);
+        assert_eq!(n(OPCODE_JOIN_DELTA_TRACE), 0, "{name} DISTINCT must have no equi join");
+        assert_eq!(
+            n(OPCODE_JOIN_DELTA_DELTA),
+            0,
+            "{name} DISTINCT must have no delta-delta join"
+        );
+        assert_eq!(
+            n(OPCODE_ANTI_JOIN_DELTA_TRACE),
+            0,
+            "{name} DISTINCT must have no anti-join (DT)"
+        );
+        assert_eq!(
+            n(OPCODE_ANTI_JOIN_DELTA_DELTA),
+            0,
+            "{name} DISTINCT must have no anti-join (DD)"
+        );
+        assert_eq!(
+            n(OPCODE_POSITIVE_PART),
+            1,
+            "{name} DISTINCT must emit exactly one positive_part node"
+        );
     }
 }

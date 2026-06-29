@@ -1930,9 +1930,6 @@ impl PyCircuitBuilder {
     pub fn anti_join(&mut self, delta: u64, trace_table_id: u64) -> PyResult<u64> {
         Ok(circuit_builder!(self).anti_join(delta, trace_table_id))
     }
-    pub fn semi_join(&mut self, delta: u64, trace_table_id: u64) -> PyResult<u64> {
-        Ok(circuit_builder!(self).semi_join(delta, trace_table_id))
-    }
 
     #[pyo3(signature = (input, group_by_cols, agg_func_id = 0, agg_col_idx = 0))]
     pub fn reduce(

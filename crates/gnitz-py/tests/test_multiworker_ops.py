@@ -246,8 +246,9 @@ def test_except_stable_after_update(client):
 
 @_NEEDS_MULTI
 def test_intersect_stable_after_update(client):
-    """UPDATE through INTERSECT: the semi-join DT cursor must re-seek so the
-    new row (same PK, different payload) still matches the trace."""
+    """UPDATE through INTERSECT: the join-free min(da,db) arithmetic must track
+    membership per full-row identity so the new row (same PK, different payload)
+    is treated as a distinct element."""
     sn = "inu_" + _uid()
     client.create_schema(sn)
     try:
@@ -273,10 +274,9 @@ def test_intersect_stable_after_update(client):
         assert pks1 == [1], f"before update: {pks1}"
 
         # UPDATE pk=1 val=100→500. Delta: (pk=1,val=100,w=-1), (pk=1,val=500,w=+1).
-        # The retraction of (1,100) must drop the intersect row (its semi-join
-        # cursor must re-seek for the retraction, not advance past it). Under
-        # full-row identity the new (1,500) does NOT match b's (1,100), so pk=1
-        # leaves the INTERSECT entirely.
+        # The retraction of (1,100) must drop the intersect row. Under full-row
+        # identity the new (1,500) does NOT match b's (1,100), so pk=1 leaves the
+        # INTERSECT entirely.
         client.execute_sql("UPDATE a SET val = 500 WHERE pk = 1", schema_name=sn)
 
         rows2 = _scan_positive(client, vid)
@@ -287,15 +287,15 @@ def test_intersect_stable_after_update(client):
 
 
 # -----------------------------------------------------------------------
-# INTERSECT no weight inflation (swapped semi-join path)
+# INTERSECT no weight inflation
 # -----------------------------------------------------------------------
 
 
 @_NEEDS_MULTI
 def test_intersect_no_weight_inflation(client):
-    """INTERSECT must not duplicate rows when the trace side has multiple
-    entries for the same PK.  A large delta triggers the swapped semi-join
-    path (iterate trace, binary-search delta)."""
+    """INTERSECT must not duplicate rows when one side has multiple entries for
+    the same projected value. The leaf distinct caps each side's multiplicity at
+    1, so min(da, db) stays in {0,1}."""
     sn = "iwi_" + _uid()
     client.create_schema(sn)
     try:

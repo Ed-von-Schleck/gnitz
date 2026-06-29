@@ -16,7 +16,6 @@ class CircuitBuilder:
     def map_expr(self, input, expr):              return self._native.map_expr(input, expr)
     def join(self, delta, trace_table_id):        return self._native.join(delta, trace_table_id)
     def anti_join(self, delta, trace_table_id):   return self._native.anti_join(delta, trace_table_id)
-    def semi_join(self, delta, trace_table_id):   return self._native.semi_join(delta, trace_table_id)
     def shard(self, input, shard_columns):        return self._native.shard(input, shard_columns)
     def gather(self, input):                      return self._native.gather(input)
     def sink(self, input):                        return self._native.sink(input)

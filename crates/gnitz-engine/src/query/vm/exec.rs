@@ -402,24 +402,6 @@ pub(crate) fn execute_epoch_multi(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::SemiJoinDT {
-                delta_reg,
-                trace_reg,
-                out_reg,
-            } => {
-                let schema = reg!(*delta_reg).schema;
-                if let Some(cursor) = cursor_mut!(*trace_reg) {
-                    let result = ops::op_semi_join_delta_trace(&reg!(*delta_reg).batch, cursor, &schema);
-                    reg_mut!(*out_reg).batch = result;
-                }
-            }
-
-            Instr::SemiJoinDD { a_reg, b_reg, out_reg } => {
-                let schema = reg!(*a_reg).schema;
-                let result = ops::op_semi_join_delta_delta(&reg!(*a_reg).batch, &reg!(*b_reg).batch, &schema);
-                reg_mut!(*out_reg).batch = result;
-            }
-
             Instr::NullExtend {
                 in_reg,
                 out_reg,

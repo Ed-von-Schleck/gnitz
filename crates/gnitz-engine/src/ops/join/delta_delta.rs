@@ -1,4 +1,4 @@
-//! Delta-delta joins: anti-join, semi-join, inner join (ΔA ⋈ ΔB).
+//! Delta-delta joins: anti-join, inner join (ΔA ⋈ ΔB).
 //!
 //! Both operands are deltas in the same epoch; matching is a (PK, payload)
 //! co-group over a `BatchCursor` on B.
@@ -12,54 +12,13 @@ use super::super::cogroup::{cogroup_intersection, cogroup_left, BatchCursor};
 use super::rowwrite::write_join_row_from_batches;
 
 // ---------------------------------------------------------------------------
-// Anti-join / Semi-join delta-delta
+// Anti-join delta-delta
 // ---------------------------------------------------------------------------
 
 /// Emit batch_a rows whose (PK, payload) has NO positive-weight match in batch_b.
 /// For SQL EXCEPT: a row is excluded only if B has a matching (PK, payload), not just PK.
 pub fn op_anti_join_delta_delta(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
     filter_join_dd_with_payload(batch_a, batch_b, schema)
-}
-
-/// Emit batch_a rows whose PK HAS a positive-weight match in batch_b.
-pub fn op_semi_join_delta_delta(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
-    semi_join_dd(batch_a, batch_b, schema)
-}
-
-/// PK-only semi-join DD: emit each A PK group iff B has a positive-weight row at
-/// that PK. `cogroup_intersection` over a `BatchCursor` on B visits only shared
-/// PKs (galloping past the gaps — the skewed tiny ΔB ⋈ huge ΔA case gets the same
-/// speedup the delta-trace joins do), and the callback brackets B's equal-PK
-/// group by index to test presence.
-fn semi_join_dd(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
-    let npc = schema.num_payload_cols();
-    let cs_a = Batch::consolidate_if_needed(batch_a, schema);
-    let cs_b = Batch::consolidate_if_needed(batch_b, schema);
-    let ca: &Batch = cs_a.as_ref().unwrap_or(batch_a);
-    let cb: &Batch = cs_b.as_ref().unwrap_or(batch_b);
-    let n_a = ca.count;
-    if n_a == 0 {
-        return Batch::empty(npc, schema.pk_stride());
-    }
-
-    let mut output = Batch::empty_with_schema(schema);
-    let mut bc = BatchCursor::new(cb);
-
-    cogroup_intersection(ca, &mut bc, |_key, a_range, m| {
-        // Intersection ⇒ m is at B's equal-PK group; bracket and test presence.
-        let b_end = m.group_end();
-        let present = (m.pos..b_end).any(|j| cb.get_weight(j) > 0);
-        m.seek(b_end);
-        if present {
-            output.append_batch(ca, a_range.start, a_range.end);
-        }
-    });
-
-    // Emitted in A's (PK, payload) order, one append per unmatched run ⇒ sorted
-    // and ghost-free (left schema only).
-    output.certify_layout(Layout::Consolidated, schema);
-    gnitz_debug!("op_semi_join_dd: a={} b={} out={}", n_a, cb.count, output.count);
-    output
 }
 
 /// Payload-aware anti-join DD: excludes A rows only when B has a matching
@@ -343,34 +302,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Semi-join DD tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_semi_join_dd_basic() {
-        let schema = make_schema_u64_i64();
-        let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-        let b = make_batch(&schema, &[(2, 1, 200), (3, 1, 300)]);
-        let out = op_semi_join_delta_delta(&a, &b, &schema);
-        assert_eq!(out.count, 2);
-        assert_eq!((out.get_pk(0) as u64), 2);
-        assert_eq!((out.get_pk(1) as u64), 3);
-        assert!(out.is_consolidated());
-    }
-
-    #[test]
-    fn test_anti_semi_complement_matching_payloads() {
-        // When B has matching payloads, anti + semi = total
-        let schema = make_schema_u64_i64();
-        let a = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-        let b = make_batch(&schema, &[(2, 1, 20), (4, 1, 40)]);
-        let total = a.count;
-        let anti = op_anti_join_delta_delta(&a, &b, &schema);
-        let semi = op_semi_join_delta_delta(&a, &b, &schema);
-        assert_eq!(anti.count + semi.count, total);
-    }
-
-    // -----------------------------------------------------------------------
     // Join DD tests
     // -----------------------------------------------------------------------
 
@@ -483,17 +414,6 @@ mod tests {
         assert_eq!(out.count, 0);
     }
 
-    #[test]
-    fn test_semi_join_dd_unchanged() {
-        // Semi-join DD should still use PK-only semantics
-        let schema = make_schema_u64_i64();
-        let a = make_batch(&schema, &[(1, 1, 10), (1, 1, 20)]);
-        let b = make_batch(&schema, &[(1, 1, 999)]); // different payload but same PK
-        let out = op_semi_join_delta_delta(&a, &b, &schema);
-        // PK-only: both A rows match B's PK → 2 rows
-        assert_eq!(out.count, 2);
-    }
-
     // -----------------------------------------------------------------------
     // BLOB payload copy in join writers (item 2)
     // -----------------------------------------------------------------------
@@ -566,14 +486,11 @@ mod tests {
     }
 
     #[test]
-    fn test_semi_anti_join_dd_signed_pk() {
+    fn test_anti_join_dd_signed_pk() {
         let schema = make_schema_signed();
         // a sorted signed: -3, 2. b sorted signed: -3.
         let a = make_signed_batch(&schema, &[(-3, 1, 1), (2, 1, 2)]);
         let b = make_signed_batch(&schema, &[(-3, 1, 1)]);
-        let semi = op_semi_join_delta_delta(&a, &b, &schema);
-        assert_eq!(semi.count, 1, "only -3 shares a PK");
-        assert_eq!(signed_pk_i64(&semi, 0), -3);
         let anti = op_anti_join_delta_delta(&a, &b, &schema);
         assert_eq!(anti.count, 1, "2 is not in b");
         assert_eq!(signed_pk_i64(&anti, 0), 2);
@@ -607,18 +524,6 @@ mod tests {
         assert_eq!(out.count, 2);
         assert_eq!(out.get_weight(0), 1);
         assert_eq!(out.get_weight(1), 1);
-    }
-
-    #[test]
-    fn test_semi_join_dd_wide_pk() {
-        // Wide-PK semi-join: A has (1,0,0) and (3,0,0); B has (1,0,0) only.
-        // Output: only (1,0,0) from A.
-        let schema = wide_pk_3xu64_schema();
-        let a = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (3, 0, 0, 1, 30)]);
-        let b = make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]);
-        let out = op_semi_join_delta_delta(&a, &b, &schema);
-        assert_eq!(out.count, 1);
-        assert_eq!(out.get_pk_bytes(0), wide_pk_bytes(&schema, 1, 0, 0).as_slice());
     }
 
     #[test]

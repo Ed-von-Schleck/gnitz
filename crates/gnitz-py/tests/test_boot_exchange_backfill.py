@@ -586,9 +586,10 @@ def test_group_by_min_max_avg_after_restart():
 def test_set_op_after_restart(op):
     """Each set-op must rebuild identically across a crash restart. UNION ALL's
     weight-2 overlaps, the deduplicating ops' boundary state, and EXCEPT/INTERSECT
-    anti/semi-join traces all run through the boot backfill here — the existing vbf
-    suite covers only UNION, and only via the live-create path. A pre-restart DELETE
-    from `b` exercises the difference/intersection trace before the snapshot."""
+    distinct/positive_part integrals all run through the boot backfill here — the
+    existing vbf suite covers only UNION, and only via the live-create path. A
+    pre-restart DELETE from `b` exercises the difference/intersection state before
+    the snapshot."""
     tag = "".join(ch for ch in op.lower() if ch.isalpha())
     tmpdir, data_dir, sock_path = _make_env(f"gnitz_so_{tag}_")
     try:

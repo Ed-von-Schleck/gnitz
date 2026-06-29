@@ -197,8 +197,6 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         ),
         OpNode::AntiJoin(SetJoinKind::DeltaTrace) => ((OPCODE_ANTI_JOIN_DELTA_TRACE, None, None), Vec::new()),
         OpNode::AntiJoin(SetJoinKind::DeltaDelta) => ((OPCODE_ANTI_JOIN_DELTA_DELTA, None, None), Vec::new()),
-        OpNode::SemiJoin(SetJoinKind::DeltaTrace) => ((OPCODE_SEMI_JOIN_DELTA_TRACE, None, None), Vec::new()),
-        OpNode::SemiJoin(SetJoinKind::DeltaDelta) => ((OPCODE_SEMI_JOIN_DELTA_DELTA, None, None), Vec::new()),
         OpNode::IntegrateSink => ((OPCODE_INTEGRATE, None, None), Vec::new()),
         OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None), Vec::new()),
         OpNode::ExchangeShard { shard_cols } => (
@@ -402,10 +400,6 @@ impl CircuitBuilder {
         self.binary_join_scan(OpNode::AntiJoin(SetJoinKind::DeltaTrace), delta, trace_table_id)
     }
 
-    pub fn semi_join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
-        self.binary_join_scan(OpNode::SemiJoin(SetJoinKind::DeltaTrace), delta, trace_table_id)
-    }
-
     pub fn join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
         self.binary_join(OpNode::Join(JoinKind::DeltaTrace), delta, trace_node)
     }
@@ -440,10 +434,6 @@ impl CircuitBuilder {
 
     pub fn left_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
         self.binary_join(OpNode::Join(JoinKind::DeltaTraceOuter), delta, trace_node)
-    }
-
-    pub fn semi_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        self.binary_join(OpNode::SemiJoin(SetJoinKind::DeltaTrace), delta, trace_node)
     }
 
     /// Shared `Reduce`-node construction: map the group cols + agg specs, alloc

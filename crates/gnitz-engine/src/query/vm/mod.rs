@@ -112,16 +112,6 @@ pub(crate) enum Instr {
         b_reg: u16,
         out_reg: u16,
     },
-    SemiJoinDT {
-        delta_reg: u16,
-        trace_reg: u16,
-        out_reg: u16,
-    },
-    SemiJoinDD {
-        a_reg: u16,
-        b_reg: u16,
-        out_reg: u16,
-    },
     NullExtend {
         in_reg: u16,
         out_reg: u16,
@@ -1441,57 +1431,6 @@ mod tests {
     }
 
     #[test]
-    fn test_semi_join_dt() {
-        // SemiJoinDT: keep delta rows that HAVE a match in trace.
-        let schema = schema_1i64();
-
-        let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("semijoin_test");
-        let mut table = Table::new(
-            tdir.to_str().unwrap(),
-            "trace",
-            schema,
-            0,
-            1 << 20,
-            crate::storage::Persistence::Ephemeral,
-        )
-        .unwrap();
-
-        let trace_batch = make_batch(schema, &[(1u128, 1, 100), (3u128, 1, 300)]);
-        table.ingest_owned_batch(trace_batch).unwrap();
-
-        let cursor = table.open_cursor();
-        let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
-
-        let mut builder = ProgramBuilder::new();
-        builder.add_semi_join_dt(0, 1, 2);
-        builder.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::trace(schema),
-            RegisterMeta::delta(schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
-
-        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30)]);
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[])
-            .unwrap()
-            .unwrap();
-
-        let rows = extract_rows(&result);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, 1); // pk=1 matches trace
-        assert_eq!(rows[1].0, 3); // pk=3 matches trace
-
-        unsafe {
-            drop(Box::from_raw(ch as *mut CursorHandle));
-        }
-        table.close();
-    }
-
-    #[test]
     fn test_reduce_sum_multi_tick() {
         // REDUCE with SUM aggregation over a group column.
         // Uses real tables for trace_out and trace_in.
@@ -1884,101 +1823,6 @@ mod tests {
         unsafe {
             drop(Box::from_raw(func_ptr as *mut ScalarFunc));
         }
-    }
-
-    /// Anti-join + semi-join should partition the input: |anti| + |semi| == |input|.
-    #[test]
-    fn test_anti_semi_complement() {
-        let schema = schema_1i64();
-
-        let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("complement_test");
-        let mut table = Table::new(
-            tdir.to_str().unwrap(),
-            "trace",
-            schema,
-            0,
-            1 << 20,
-            crate::storage::Persistence::Ephemeral,
-        )
-        .unwrap();
-
-        // Trace has pk=1, pk=3, pk=5
-        let trace_batch = make_batch(schema, &[(1u128, 1, 100), (3u128, 1, 300), (5u128, 1, 500)]);
-        table.ingest_owned_batch(trace_batch).unwrap();
-
-        // Anti-join pipeline: reg 0 -> anti_join(reg 0, reg 1) -> reg 2
-        let cursor_aj = table.open_cursor();
-        let ch_aj = Box::into_raw(Box::new(cursor_aj)) as *mut libc::c_void;
-
-        let mut builder_aj = ProgramBuilder::new();
-        builder_aj.add_anti_join_dt(0, 1, 2);
-        builder_aj.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::trace(schema),
-            RegisterMeta::delta(schema),
-        ];
-        let mut vm_aj = *builder_aj.build(&reg_meta);
-        let cursors_aj = vec![std::ptr::null_mut(), ch_aj, std::ptr::null_mut()];
-
-        // Delta has pk=1,2,3,4,5
-        let input_aj = make_batch(
-            schema,
-            &[
-                (1u128, 1, 10),
-                (2u128, 1, 20),
-                (3u128, 1, 30),
-                (4u128, 1, 40),
-                (5u128, 1, 50),
-            ],
-        );
-        let r_aj = execute_epoch(&vm_aj.program, &mut vm_aj.regfile, input_aj, 0, 2, &cursors_aj, &[])
-            .unwrap()
-            .unwrap();
-
-        // Semi-join pipeline
-        let cursor_sj = table.open_cursor();
-        let ch_sj = Box::into_raw(Box::new(cursor_sj)) as *mut libc::c_void;
-
-        let mut builder_sj = ProgramBuilder::new();
-        builder_sj.add_semi_join_dt(0, 1, 2);
-        builder_sj.add_halt();
-
-        let mut vm_sj = *builder_sj.build(&reg_meta);
-        let cursors_sj = vec![std::ptr::null_mut(), ch_sj, std::ptr::null_mut()];
-
-        let input_sj = make_batch(
-            schema,
-            &[
-                (1u128, 1, 10),
-                (2u128, 1, 20),
-                (3u128, 1, 30),
-                (4u128, 1, 40),
-                (5u128, 1, 50),
-            ],
-        );
-        let r_sj = execute_epoch(&vm_sj.program, &mut vm_sj.regfile, input_sj, 0, 2, &cursors_sj, &[])
-            .unwrap()
-            .unwrap();
-
-        // Anti should get pk=2,4 (no match); semi should get pk=1,3,5 (match)
-        assert_eq!(r_aj.count, 2, "anti-join should keep 2 non-matching rows");
-        assert_eq!(r_sj.count, 3, "semi-join should keep 3 matching rows");
-        assert_eq!(
-            r_aj.count + r_sj.count,
-            5,
-            "anti + semi must equal input count (complement property)"
-        );
-
-        unsafe {
-            drop(Box::from_raw(ch_aj as *mut CursorHandle));
-        }
-        unsafe {
-            drop(Box::from_raw(ch_sj as *mut CursorHandle));
-        }
-        table.close();
     }
 
     /// Filter with expression bytecode: col1 > 25 keeps rows with val 30, 40, 50.

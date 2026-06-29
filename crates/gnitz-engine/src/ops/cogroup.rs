@@ -95,7 +95,7 @@ impl SortedKeyStream for BatchCursor<'_> {
 /// Intersection co-group: emit only at keys present on **both** sides. Both
 /// pointers galloping-skip to catch up, so the cost is bounded by the smaller
 /// side's matches plus galloping skips — optimal whichever side is larger,
-/// replacing any size selector. Inner join, semi join, inner DD join.
+/// replacing any size selector. Inner join, inner DD join.
 ///
 /// **Self-positioning.** The first act is `m.advance_to(delta[0])`, so a shared
 /// match cursor (a trace register reused by several ops in one epoch) is reset

@@ -813,8 +813,9 @@ impl DagEngine {
     /// else catches it. Matching any `Join` rather than the equi `JoinKind`s is
     /// exact and leaves no variant list to drift: the only other kind, a
     /// range/band join (`DeltaTraceRange`), always also carries an `ExchangeShard`
-    /// and so is already covered by the first arm. (Set-ops are `AntiJoin` /
-    /// `SemiJoin`, not `Join`, and likewise carry an `ExchangeShard`.)
+    /// and so is already covered by the first arm. (Set-ops are `AntiJoin` and
+    /// join-free union/positive_part arithmetic, not `Join`, and likewise carry
+    /// an `ExchangeShard`.)
     ///
     /// Loads the meta circuit once and reuses it to warm `view_props.needs_exchange`
     /// for the boot `view_needs_exchange` sweep that runs right after
@@ -1671,8 +1672,8 @@ impl DagEngine {
     /// `relay(pre, side_source)` is the repartition step: multi-worker passes
     /// `exchange.do_exchange` (keyed by the side's source so the two IPC rounds
     /// don't collide in the master accumulator); single-worker passes identity
-    /// (one worker owns all shards, so no IPC). The combine (Union / semi /
-    /// anti-join) needs sorted, weight-merged input, hence the consolidate.
+    /// (one worker owns all shards, so no IPC). The combine (Union / anti-join /
+    /// positive_part) needs sorted, weight-merged input, hence the consolidate.
     fn run_two_sided(
         &mut self,
         view_id: i64,

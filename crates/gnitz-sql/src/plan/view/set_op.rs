@@ -1,6 +1,6 @@
 //! Set-operation and SELECT DISTINCT view compilation: UNION (ALL), INTERSECT,
-//! EXCEPT, and DISTINCT, all hashed to a synthetic content-PK and deduplicated /
-//! semi-/anti-joined per operator.
+//! EXCEPT, and DISTINCT, all hashed to a synthetic content-PK and combined with
+//! join-free union/negate/distinct/positive_part arithmetic per operator.
 
 use crate::ast_util::{extract_table_factor_name, is_wildcard_projection};
 use crate::bind::{bind_single_table, Binder};
@@ -64,7 +64,7 @@ fn compile_set_op_side(
     let reindexed = cb.map_hash_row(filtered, &proj_indices, branch_id);
     // Repartition by the synthetic hash PK (column 0) so that under
     // multiple workers each row lands on the worker that owns its new PK's
-    // shard, co-locating matching rows for the downstream semi/anti-join and
+    // shard, co-locating matching rows for the downstream set arithmetic and
     // placing each output row on its owning worker for the sink/scan. The hash
     // is computed in-circuit, so the master cannot pre-shard the source by it;
     // this in-circuit exchange is mandatory. Single-worker mode elides the IPC.
@@ -135,6 +135,23 @@ fn resolve_set_projection(
     Ok((indices, out_cols))
 }
 
+/// The two leaf nodes feeding an INTERSECT/EXCEPT weight-clamp arm. DISTINCT (and
+/// the bare default quantifier) clamps each side to {0,1} via `distinct` so the
+/// arithmetic is set-valued; ALL keeps the raw per-row bag counts. Only called
+/// from the `q @ (Distinct | None | All)` arms, so `All` vs. "distinct it" is the
+/// whole decision.
+fn set_op_leaves(
+    cb: &mut CircuitBuilder,
+    quantifier: SetQuantifier,
+    left: gnitz_core::NodeId,
+    right: gnitz_core::NodeId,
+) -> (gnitz_core::NodeId, gnitz_core::NodeId) {
+    match quantifier {
+        SetQuantifier::All => (left, right),
+        _ => (cb.distinct(left), cb.distinct(right)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_create_set_op_view(
     client: &mut GnitzClient,
@@ -191,14 +208,16 @@ pub(crate) fn execute_create_set_op_view(
     let (right_node, right_cols, right_tid) =
         compile_set_op_side(client, right_select, binder, &mut cb, right_branch_id, "set operation")?;
 
-    // INTERSECT/EXCEPT inline both branches and semi/anti-join each against the
-    // other's delayed trace with no same-epoch cross-correction. When both
-    // branches are the same relation, one delta drives both sides in a single
-    // pass and the correction term is dropped — silently wrong results. Mirror
-    // of the self-join guard. UNION / UNION ALL are linear merges with no
-    // correction term, exempt. Two *different* views over the same base table
-    // produce two distinct dependency edges (two passes), so the discriminator
-    // is source-id equality, not base-table overlap.
+    // INTERSECT/EXCEPT build their two distinct-ed leaves on the same content-hash
+    // PK, then combine with union/negate/positive_part. When both branches resolve
+    // to the same relation, one source delta would have to drive both branch
+    // pipelines in a single epoch — which the single-source-per-epoch execution
+    // model does not deliver — so reject it. Mirror of the self-join guard. The
+    // join-free arithmetic itself has no cross-term, so this is an execution-model
+    // constraint, not a correctness-of-the-math one. UNION / UNION ALL are linear
+    // merges, exempt. Two *different* views over the same base table produce two
+    // distinct dependency edges (two passes), so the discriminator is source-id
+    // equality, not base-table overlap.
     if matches!(op, SetOperator::Intersect | SetOperator::Except) && left_tid == right_tid {
         return Err(GnitzSqlError::Unsupported(
             "INTERSECT/EXCEPT whose two inputs are the same relation is not supported".into(),
@@ -232,71 +251,36 @@ pub(crate) fn execute_create_set_op_view(
             let merged = cb.union(left_node, right_node);
             cb.distinct(merged)
         }
-        (SetOperator::Intersect, SetQuantifier::Distinct | SetQuantifier::None) => {
-            // Lift both sides through `distinct`: set membership flips once per
-            // projected row regardless of how many source rows carry it, and the
-            // integrated traces then hold only weight-1 entries (semi-join tests
-            // existence, not weight, so storing raw multiplicities only bloats
-            // the trace tables for no effect). Build each `integrate_trace`
-            // before its `distinct`'s other consumer so the Kahn schedule
-            // (ascending node-id tie-break) keeps the non-destructive reader
-            // ahead of any destructive co-consumer; here both readers of each
-            // `distinct` are semi-joins (no trace-absent destructive branch).
-            let distinct_l = cb.distinct(left_node);
-            let distinct_r = cb.distinct(right_node);
-            let trace_l = cb.integrate_trace(distinct_l);
-            let trace_r = cb.integrate_trace(distinct_r);
-            let semi_lr = cb.semi_join_with_trace_node(distinct_l, trace_r);
-            let semi_rl = cb.semi_join_with_trace_node(distinct_r, trace_l);
-            cb.union(semi_lr, semi_rl)
-        }
-        (SetOperator::Except, SetQuantifier::Distinct | SetQuantifier::None) => {
-            // EXCEPT DISTINCT: difference of the two projected sets. Lifting the
-            // left through `distinct` before the anti-join caps a value carried
-            // by multiple source rows at weight 1 (the raw `left_node` would emit
-            // weight n, surviving the difference once the right side covers it);
-            // the integrated traces then hold only weight-1 entries.
-            let distinct_l = cb.distinct(left_node);
-            let distinct_r = cb.distinct(right_node);
-            // `trace_l` is created before `except_lr`: whenever `trace_r` is still
-            // empty the anti-join takes its trace-absent branch and drains
-            // `distinct_l`'s register, so the non-destructive `integrate_trace`
-            // (lower node id) must — and does — schedule first.
-            let trace_l = cb.integrate_trace(distinct_l);
-            let trace_r = cb.integrate_trace(distinct_r);
-            // ΔA path: left set-members not in I(B).
-            let except_lr = cb.anti_join_with_trace_node(distinct_l, trace_r);
-            // ΔB path: when B's set membership flips, retract/emit the matching
-            // left row. Reading `distinct_r` makes a second insert of an
-            // already-present projected B row a no-op.
-            let semi_rl = cb.semi_join_with_trace_node(distinct_r, trace_l);
-            let correction = cb.negate(semi_rl);
-            cb.union(except_lr, correction)
-        }
-
-        // ── Bag semantics: clamp the net per-row count, don't deduplicate. ──
+        // ── INTERSECT / EXCEPT: join-free weight-clamp algebra. ──
         // Both sides are content-hashed with branch_id = 0 (right_branch_id is 0 for
-        // everything but UNION ALL), so L's and R's copies of a row co-hash and net to
-        // the per-row counts cL, cR before the clamp. The path has no join / semi-join /
-        // anti-join: `positive_part` owns its own integral, so correctness is independent
-        // of which side ticks first (single-source-per-epoch; no cross-delta term).
-        (SetOperator::Except, SetQuantifier::All) => {
-            // EXCEPT ALL = positive_part(A − B) ⇒ max(0, cL − cR).
-            let neg_r = cb.negate(right_node);
-            let diff = cb.union(left_node, neg_r); // cL − cR
-            cb.positive_part(diff) // max(0, cL − cR)
-        }
-        (SetOperator::Intersect, SetQuantifier::All) => {
-            // INTERSECT ALL = A − positive_part(A − B) ⇒ min(cL, cR). `left_node` feeds
-            // BOTH unions, so it must sit on the non-destructive PORT_IN_B (second
-            // operand) of each: the destructive-register ordering invariant rejects a
-            // register with two destructive (PORT_IN_A) consumers. union is Z-set
+        // everything but UNION ALL), so L's and R's copies of a row co-hash and net
+        // to per-row counts before the clamp. One algebra serves both quantifiers:
+        // DISTINCT differs from ALL only by clamping each leaf to {0,1} first
+        // (`set_op_leaves`). The path has no join / anti-join: `positive_part` owns
+        // its own integral, so correctness is independent of which side ticks first
+        // (single-source-per-epoch; no cross-delta term).
+        (SetOperator::Intersect, q @ (SetQuantifier::Distinct | SetQuantifier::None | SetQuantifier::All)) => {
+            // INTERSECT = min(a, b) = a − positive_part(a − b). For DISTINCT the
+            // {0,1} leaves make the output {0,1}, so no outer distinct is needed.
+            // `a` feeds BOTH unions, so it must sit on the non-destructive PORT_IN_B
+            // (second operand): the destructive-register invariant rejects two
+            // destructive (PORT_IN_A) consumers of one register. union is Z-set
             // addition (commutative), so this reordering preserves the value.
-            let neg_r = cb.negate(right_node);
-            let diff = cb.union(neg_r, left_node); // −cR + cL = cL − cR
-            let pos = cb.positive_part(diff); // max(0, cL − cR)
+            let (a, b) = set_op_leaves(&mut cb, q, left_node, right_node);
+            let neg_b = cb.negate(b);
+            let diff = cb.union(neg_b, a); // −b + a = a − b
+            let pos = cb.positive_part(diff); // max(0, a − b)
             let neg_pos = cb.negate(pos);
-            cb.union(neg_pos, left_node) // −max(0, cL−cR) + cL = min(cL, cR)
+            cb.union(neg_pos, a) // a − max(0, a−b) = min(a, b)
+        }
+        (SetOperator::Except, q @ (SetQuantifier::Distinct | SetQuantifier::None | SetQuantifier::All)) => {
+            // EXCEPT = positive_part(a − b). For DISTINCT, clamping the leaves BEFORE
+            // the subtraction is load-bearing: positive_part on raw multiplicities
+            // gives [cL>cR], wrong for cL=2,cR=1 (SQL needs the value absent).
+            let (a, b) = set_op_leaves(&mut cb, q, left_node, right_node);
+            let neg_b = cb.negate(b);
+            let diff = cb.union(a, neg_b); // a − b
+            cb.positive_part(diff) // max(0, a − b)
         }
 
         // BY NAME column alignment is a separate unimplemented feature; reject it
@@ -324,9 +308,8 @@ pub(crate) fn execute_create_set_op_view(
     for (l, r) in left_cols.iter().zip(&right_cols) {
         let mut col = l.clone();
         // Output nullability is operator-specific. EXCEPT emits only left-side
-        // values (right-side corrections must match a left set-pk to fire, and a
-        // NULL-in-c right tuple has a set-pk a NOT NULL left column never
-        // produces), so it is nullable iff the left input is. INTERSECT emits a
+        // rows — a right-only value hits positive_part(0−1)=0 and a both-sides
+        // value cancels +1/−1 — so it is nullable iff the left input is. INTERSECT emits a
         // tuple only when it is in both sides (set membership matches NULLs as
         // equal), so a column is nullable iff BOTH inputs admit NULL there.
         // UNION{,ALL} may emit from either side. Tightening only ever removes the

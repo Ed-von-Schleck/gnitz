@@ -76,6 +76,18 @@ pub fn i64_at(batch: &ZSetBatch, col: usize, row: usize) -> i64 {
     }
 }
 
+/// Net weight of `value` in integer column `col` of `view`: sum the weights of
+/// every row whose `col` equals `value`. Set-op tests read the multiplicity of a
+/// single projected value this way.
+pub fn view_value_weight(client: &mut GnitzClient, sn: &str, view: &str, col: &str, value: i64) -> i64 {
+    let (schema, batch) = read_view(client, sn, view);
+    let ci = col_idx(&schema, col);
+    (0..batch.len())
+        .filter(|&r| i64_at(&batch, ci, r) == value)
+        .map(|r| batch.weights[r])
+        .sum()
+}
+
 /// Read a PK-region integer column's value (as i64) at `row`. The client decodes
 /// the OPK PK region back to native little-endian on receive, so a fixed-width
 /// integer PK column reads exactly like a payload column. `ci` must be a PK

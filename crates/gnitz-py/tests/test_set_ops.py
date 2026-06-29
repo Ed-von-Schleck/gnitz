@@ -583,6 +583,12 @@ class TestSetOpsDifferential:
             f"CREATE VIEW v AS SELECT val FROM a {op} SELECT val FROM b", schema_name=sn)
         return client.resolve_table(sn, "v")[0]
 
+    def _assert_setop(self, client, vid, op, a_state, b_state, ctx):
+        left = oracle.oracle_filter_project(a_state, None, ["val"])
+        right = oracle.oracle_filter_project(b_state, None, ["val"])
+        exp = oracle.oracle_setop(op, left, right)
+        oracle.assert_view_matches(client, vid, ["val"], exp, ctx=ctx)
+
     def _run(self, client, op):
         sn = "s" + _uid()
         client.create_schema(sn)
@@ -591,10 +597,7 @@ class TestSetOpsDifferential:
             a_state, b_state = {}, {}
 
             def check(ctx):
-                left = oracle.oracle_filter_project(a_state, None, ["val"])
-                right = oracle.oracle_filter_project(b_state, None, ["val"])
-                exp = oracle.oracle_setop(op, left, right)
-                oracle.assert_view_matches(client, vid, ["val"], exp, ctx=ctx)
+                self._assert_setop(client, vid, op, a_state, b_state, ctx)
 
             # Overlapping values across the two tables so dedup/weight matters.
             client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
@@ -634,6 +637,55 @@ class TestSetOpsDifferential:
 
     def test_intersect_all_differential(self, client):
         self._run(client, "INTERSECT ALL")
+
+    def _run_membership_flip(self, client, op):
+        """Drive a single projected value across the set-membership boundary in
+        BOTH directions, including the tick where positive_part's pre-image
+        integral goes negative (da − db = −1 while it stays clamped at 0). Both
+        EXCEPT and INTERSECT DISTINCT route through positive_part, so its
+        boundary emits must net exactly per the from-scratch oracle each tick."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            vid = self._setup(client, sn, op)
+            a_state, b_state = {}, {}
+
+            def check(ctx):
+                self._assert_setop(client, vid, op, a_state, b_state, ctx)
+
+            # a has val=10 (da=1), b empty (db=0): da − db = 1.
+            client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
+            oracle.apply_insert(a_state, "pk", [{"pk": 1, "val": 10}])
+            check(f"{op} a-only")
+
+            # b gains val=10 (db=1): da − db = 0.
+            client.execute_sql("INSERT INTO b VALUES (2, 10)", schema_name=sn)
+            oracle.apply_insert(b_state, "pk", [{"pk": 2, "val": 10}])
+            check(f"{op} both")
+
+            # Retract a's only val=10 (da=0) while b still has it (db=1): the
+            # positive_part input integral for val=10 is now da − db = −1.
+            client.execute_sql("DELETE FROM a WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(a_state, "pk", [1])
+            check(f"{op} a-empty-negative-integral")
+
+            # Retract b's val=10 too (db=0): da − db back to 0.
+            client.execute_sql("DELETE FROM b WHERE pk = 2", schema_name=sn)
+            oracle.apply_delete(b_state, "pk", [2])
+            check(f"{op} both-empty")
+
+            # Re-introduce val=10 on a only (da=1, db=0): da − db = 1 again.
+            client.execute_sql("INSERT INTO a VALUES (3, 10)", schema_name=sn)
+            oracle.apply_insert(a_state, "pk", [{"pk": 3, "val": 10}])
+            check(f"{op} a-only-again")
+        finally:
+            client.drop_schema(sn)
+
+    def test_except_membership_flip(self, client):
+        self._run_membership_flip(client, "EXCEPT")
+
+    def test_intersect_membership_flip(self, client):
+        self._run_membership_flip(client, "INTERSECT")
 
 
 class TestDistinctDifferential:

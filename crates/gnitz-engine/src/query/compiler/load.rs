@@ -228,12 +228,10 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
     // nullable-key null/not-null sibling reindexes carry the SAME key as the match
     // reindex and remain (deduped). Non-join views (PK-redistribution, GROUP BY) have
     // no join node, so the guard is off and every reindex is collected as before.
-    let is_join_view = loaded.nodes.values().any(|op| {
-        matches!(
-            op,
-            gnitz_wire::OpNode::Join(_) | gnitz_wire::OpNode::AntiJoin(_) | gnitz_wire::OpNode::SemiJoin(_)
-        )
-    });
+    let is_join_view = loaded
+        .nodes
+        .values()
+        .any(|op| matches!(op, gnitz_wire::OpNode::Join(_) | gnitz_wire::OpNode::AntiJoin(_)));
     let feeds_trace_or_join = |nid: i32| {
         loaded.outgoing.get(&nid).is_some_and(|outs| {
             outs.iter().any(|&(d, _)| {
@@ -243,7 +241,6 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
                         gnitz_wire::OpNode::IntegrateTrace
                             | gnitz_wire::OpNode::Join(_)
                             | gnitz_wire::OpNode::AntiJoin(_)
-                            | gnitz_wire::OpNode::SemiJoin(_)
                     )
                 )
             })

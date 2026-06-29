@@ -4,7 +4,7 @@ use gnitz_core::{
     OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_DELAY, OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_INTEGRATE_TRACE,
     OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_OUTER, OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR,
     OPCODE_MAP_PROJ, OPCODE_NEGATE, OPCODE_NULL_EXTEND, OPCODE_PARTITION_FILTER, OPCODE_REDUCE, OPCODE_SCAN_DELTA,
-    OPCODE_SEMI_JOIN_DELTA_TRACE, OPCODE_UNION,
+    OPCODE_UNION,
 };
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
@@ -1092,10 +1092,9 @@ fn test_pure_range_left_join_circuit_shape() {
         "two side PartitionFilters; trace_m has none"
     );
 
-    // No outer/anti/semi/equi join machinery, no Delay.
+    // No outer/anti/equi join machinery, no Delay.
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_OUTER), 0, "no outer-join operator");
     assert_eq!(n_left(OPCODE_ANTI_JOIN_DELTA_TRACE), 0, "no anti-join");
-    assert_eq!(n_left(OPCODE_SEMI_JOIN_DELTA_TRACE), 0, "no semi-join");
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
     assert_eq!(n_left(OPCODE_DELAY), 0, "no Delay node");
 
@@ -1272,7 +1271,7 @@ fn test_range_join_partition_filter_circuit_shape() {
 /// chain `distinct(π_A(inner))` → `negate` → `union` (A − D) → `null_extend` →
 /// re-key → project → `union` (inner ∪ null-fill): `map_reindex ×3`, `map ×2`,
 /// `distinct ×1`, `negate ×1`, `union ×2`, `null_extend ×1`. Crucially it adds
-/// **zero** ExchangeShard, range/anti/semi/outer Join, IntegrateTrace, Delay, or
+/// **zero** ExchangeShard, range/anti/outer Join, IntegrateTrace, Delay, or
 /// PartitionFilter — the null-fill is partition-local and reuses the inner output,
 /// riding the one existing pair-PK output exchange. The INNER view is unchanged
 /// (no distinct / null_extend / negate).
@@ -1365,7 +1364,6 @@ fn test_band_left_join_circuit_shape() {
         0,
         "set-difference form uses no anti-join"
     );
-    assert_eq!(n_left(OPCODE_SEMI_JOIN_DELTA_TRACE), 0, "no semi-join");
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_OUTER), 0, "no outer-join operator");
 

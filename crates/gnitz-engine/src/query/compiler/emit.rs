@@ -126,7 +126,6 @@ pub(super) fn is_join_trace_side(loaded: &LoadedCircuit, nid: i32) -> bool {
                             loaded.nodes.get(&dst),
                             Some(gnitz_wire::OpNode::Join(_))
                                 | Some(gnitz_wire::OpNode::AntiJoin(_))
-                                | Some(gnitz_wire::OpNode::SemiJoin(_))
                                 | Some(gnitz_wire::OpNode::SeekTrace)
                         )
                 })
@@ -207,7 +206,6 @@ pub(super) fn emit_node(
                                         loaded.nodes.get(&dst),
                                         Some(gnitz_wire::OpNode::Join(_))
                                             | Some(gnitz_wire::OpNode::AntiJoin(_))
-                                            | Some(gnitz_wire::OpNode::SemiJoin(_))
                                             | Some(gnitz_wire::OpNode::SeekTrace)
                                     )
                             })
@@ -560,20 +558,6 @@ pub(super) fn emit_node(
                 }
                 gnitz_wire::SetJoinKind::DeltaDelta => {
                     builder.add_anti_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
-                }
-            }
-        }
-
-        gnitz_wire::OpNode::SemiJoin(kind) => {
-            let a_reg = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
-            let b_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
-            reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[a_reg as usize].schema);
-            match kind {
-                gnitz_wire::SetJoinKind::DeltaTrace => {
-                    builder.add_semi_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
-                }
-                gnitz_wire::SetJoinKind::DeltaDelta => {
-                    builder.add_semi_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
             }
         }
