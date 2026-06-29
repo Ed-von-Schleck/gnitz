@@ -1,9 +1,9 @@
-//! Group-column comparator, argsort, and PK-ordered sort used by reduce/gather.
+//! Group-column comparator and PK-ordered argsort used by the reduce operator.
 
 use std::cmp::Ordering;
 
 use crate::schema::{key::PkSortKey, SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
-use crate::storage::{compare_pk_bytes, scatter_copy, with_payload_cmp, write_to_batch, Batch, MemBatch};
+use crate::storage::{compare_pk_bytes, Batch, MemBatch};
 
 use super::super::util::cmp_col_window;
 
@@ -159,84 +159,42 @@ pub(super) fn argsort_delta(batch: &Batch, schema: &SchemaDescriptor, group_by_c
     indices
 }
 
-/// Sort `indices` by a width-matched `PkSortKey` (materialised once per row), then
-/// `tiebreak` on a full-key tie. The key is the whole OPK image, so `tiebreak`
-/// fires only on a true PK duplicate — never as an intervening PK-byte compare.
-/// Keys are read by reference (not `sort_unstable_by_key`, which would re-copy the
-/// 32-byte `[u128; 2]` key per comparison).
-fn sort_indices_keyed<K: PkSortKey, F: Fn(usize, usize) -> Ordering>(mb: &MemBatch, indices: &mut [u32], tiebreak: F) {
+/// Sort `indices` by a width-matched `PkSortKey` (materialised once per row). The
+/// key is the whole OPK image, so the compare is exact; rows sharing a PK keep
+/// arbitrary relative order (the reduce groups them regardless). Keys are read by
+/// reference (not `sort_unstable_by_key`, which would re-copy the 32-byte
+/// `[u128; 2]` key per comparison).
+fn sort_indices_keyed<K: PkSortKey>(mb: &MemBatch, indices: &mut [u32]) {
     let keys: Vec<K> = (0..mb.count).map(|i| K::from_opk(mb.get_pk_bytes(i))).collect();
-    indices.sort_unstable_by(|&a, &b| {
-        keys[a as usize]
-            .cmp(&keys[b as usize])
-            .then_with(|| tiebreak(a as usize, b as usize))
-    });
+    indices.sort_unstable_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
 }
 
-/// Sort `indices` into canonical (PK, tiebreak) order. `pk_stride` selects the
-/// width-matched key — `u64`/`u128`/`[u128; 2]` for strides ≤8/≤16/≤32 (the cutoffs
-/// are the key widths) — each the full OPK image, so a plain key compare is exact
-/// for unsigned, signed, and compound PKs alike. PKs too wide to pack (`> 32` B —
-/// exotic 3–5 wide-column composites) byte-walk the OPK regions via
-/// `compare_pk_bytes`. `tiebreak` settles full-key ties: a payload compare for
-/// `sort_owned`, a no-op for a pure-PK argsort (the latter folds away in codegen).
-fn sort_indices_by_pk<F: Fn(usize, usize) -> Ordering + Copy>(mb: &MemBatch, indices: &mut [u32], tiebreak: F) {
+/// Sort `indices` into canonical PK order. `pk_stride` selects the width-matched
+/// key — `u64`/`u128`/`[u128; 2]` for strides ≤8/≤16/≤32 (the cutoffs are the key
+/// widths) — each the full OPK image, so a plain key compare is exact for unsigned,
+/// signed, and compound PKs alike. PKs too wide to pack (`> 32` B — exotic 3–5
+/// wide-column composites) byte-walk the OPK regions via `compare_pk_bytes`. Rows
+/// sharing a PK keep arbitrary relative order (the reduce groups them regardless).
+fn sort_indices_by_pk(mb: &MemBatch, indices: &mut [u32]) {
     match mb.pk_stride as usize {
-        0..=8 => sort_indices_keyed::<u64, _>(mb, indices, tiebreak),
-        9..=16 => sort_indices_keyed::<u128, _>(mb, indices, tiebreak),
-        17..=32 => sort_indices_keyed::<[u128; 2], _>(mb, indices, tiebreak),
-        _ => indices.sort_unstable_by(|&a, &b| {
-            compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize))
-                .then_with(|| tiebreak(a as usize, b as usize))
-        }),
+        0..=8 => sort_indices_keyed::<u64>(mb, indices),
+        9..=16 => sort_indices_keyed::<u128>(mb, indices),
+        17..=32 => sort_indices_keyed::<[u128; 2]>(mb, indices),
+        _ => indices
+            .sort_unstable_by(|&a, &b| compare_pk_bytes(mb.get_pk_bytes(a as usize), mb.get_pk_bytes(b as usize))),
     }
 }
 
-/// Argsort indices into canonical PK order (`compare_pk_bytes` order). No payload
-/// tiebreak — rows sharing a PK keep arbitrary relative order (reduce groups them
-/// regardless of order within a PK).
+/// Argsort indices into canonical PK order (`compare_pk_bytes` order).
 pub(super) fn argsort_pk_canonical(mb: &MemBatch) -> Vec<u32> {
     let mut idx: Vec<u32> = (0..mb.count as u32).collect();
-    sort_indices_by_pk(mb, &mut idx, |_, _| Ordering::Equal);
+    sort_indices_by_pk(mb, &mut idx);
     idx
-}
-
-/// `with_payload_cmp!` target: adapt the 5-arg payload comparator to the 2-arg
-/// full-key tiebreak `sort_indices_by_pk` wants, fixing `schema`/`mb`.
-fn sort_owned_indices<RowCmp>(schema: &SchemaDescriptor, mb: &MemBatch, indices: &mut [u32], row_cmp: RowCmp)
-where
-    RowCmp: Fn(&SchemaDescriptor, &MemBatch, usize, &MemBatch, usize) -> Ordering + Copy,
-{
-    sort_indices_by_pk(mb, indices, |a, b| row_cmp(schema, mb, a, mb, b));
-}
-
-/// Sort batch by (PK, payload) without consolidation.
-/// Used by op_gather_reduce where we need to see each partial separately.
-pub(super) fn sort_owned(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
-    let n = batch.count;
-    if n <= 1 || batch.sorted {
-        return batch.clone_batch();
-    }
-
-    let mb = batch.as_mem_batch();
-
-    let mut indices: Vec<u32> = (0..n as u32).collect();
-
-    // Select the payload comparator once on the outside; `sort_owned_indices`
-    // branches on PK width inside and uses it as the full-key tiebreak.
-    with_payload_cmp!(schema, sort_owned_indices, schema, &mb, &mut indices);
-
-    let blob_cap = mb.blob.len().max(1);
-    let mut output = write_to_batch(schema, n, blob_cap, |writer| {
-        scatter_copy(&mb, &indices, &[], writer);
-    });
-    output.sorted = true;
-    output
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{argsort_pk_canonical, sort_owned};
+    use super::argsort_pk_canonical;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::{compare_pk_bytes, Batch};
 
@@ -275,9 +233,9 @@ mod tests {
         )
     }
 
-    /// Both PK-sort entry points must reproduce the authoritative `compare_pk_bytes`
+    /// `argsort_pk_canonical` must reproduce the authoritative `compare_pk_bytes`
     /// order. PKs are distinct, so the (unstable) sort yields a unique order and the
-    /// ordered key bytes compare exactly; `sort_owned`'s payload tiebreak stays inert.
+    /// ordered key bytes compare exactly.
     fn assert_canonical_order(schema: &SchemaDescriptor, pk_rows: &[Vec<u8>]) {
         let mut want: Vec<u32> = (0..pk_rows.len() as u32).collect();
         want.sort_by(|&a, &b| compare_pk_bytes(&pk_rows[a as usize], &pk_rows[b as usize]));
@@ -288,13 +246,6 @@ mod tests {
         let got = argsort_pk_canonical(&mb);
         let got_keys: Vec<&[u8]> = got.iter().map(|&i| mb.get_pk_bytes(i as usize)).collect();
         assert_eq!(got_keys, want_keys, "argsort_pk_canonical order mismatch");
-
-        let mut unsorted = build_pk_batch(schema, pk_rows);
-        unsorted.sorted = false;
-        let sorted = sort_owned(&unsorted, schema);
-        let smb = sorted.as_mem_batch();
-        let so_keys: Vec<&[u8]> = (0..sorted.count).map(|i| smb.get_pk_bytes(i)).collect();
-        assert_eq!(so_keys, want_keys, "sort_owned order mismatch");
     }
 
     #[test]

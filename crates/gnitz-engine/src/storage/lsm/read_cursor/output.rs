@@ -103,9 +103,10 @@ impl ReadCursor {
         // Stay flag-neutral: whether appending a row preserves sort/consolidation
         // depends on the caller's access pattern, which only the caller knows. The
         // catalog retraction helpers build in (PK, payload) order and keep the
-        // batch's initial `true,true`; op_gather/op_reduce re-assert the flags they
-        // need. The shared appender clears both unconditionally (its bulk callers
-        // append out of order), so save and restore them across the delegation.
+        // batch's initial `true,true`; op_reduce appends retract/insert rows in emit
+        // order and clears both flags itself once the tick is assembled. The shared
+        // appender clears both unconditionally (its bulk callers append out of
+        // order), so save and restore them across the delegation.
         let (sorted, consolidated) = (batch.sorted, batch.consolidated);
         batch.append_row_from_source_bytes(
             self.current_pk_bytes(),

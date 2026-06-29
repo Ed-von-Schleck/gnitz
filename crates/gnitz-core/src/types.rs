@@ -8,6 +8,7 @@ pub use gnitz_wire::{
     AGG_MAX,
     AGG_MIN,
     AGG_SUM,
+    AGG_SUM_ZERO,
     CIRCUIT_EDGES_TAB,
     // System table IDs
     CIRCUIT_NODES_TAB,

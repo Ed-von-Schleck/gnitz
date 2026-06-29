@@ -46,7 +46,6 @@ pub(crate) fn load_circuit(
 ) -> Option<LoadedCircuit> {
     let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
     let mut edges: Vec<(i32, i32, i32)> = Vec::new();
-    let mut gather_reduce_cols: HashMap<i32, Vec<(u64, u16, u64, u64)>> = HashMap::new();
 
     // Phase 1: read CircuitNodeColumns, sorted by (kind, position) per node.
     let mut cols_by_node: HashMap<i32, Vec<gnitz_wire::CircuitNodeColumn>> = HashMap::new();
@@ -108,16 +107,6 @@ pub(crate) fn load_circuit(
             // skipping it leaves any edge referencing it dangling, which yields
             // an invalid topological order or silent output corruption.
             let op = gnitz_wire::decode_op_node(opcode, src_tab, expr_blob, cols).ok()?;
-            if matches!(op, gnitz_wire::OpNode::GatherReduce) {
-                if let Some(c) = cols_by_node.get(&node_id) {
-                    // GatherReduce stays on the legacy tuple path (emit_gather_reduce)
-                    // until OpNode::GatherReduce gains a typed `agg` field.
-                    gather_reduce_cols.insert(
-                        node_id,
-                        c.iter().map(|c| (c.kind, c.position, c.value1, c.value2)).collect(),
-                    );
-                }
-            }
             nodes.insert(node_id, op);
             ch.cursor.advance();
             hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
@@ -154,7 +143,6 @@ pub(crate) fn load_circuit(
         out_schema,
         nodes,
         edges,
-        gather_reduce_cols,
         ..LoadedCircuit::empty()
     })
 }

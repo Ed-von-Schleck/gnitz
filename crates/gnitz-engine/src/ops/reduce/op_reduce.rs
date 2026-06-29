@@ -1,7 +1,7 @@
 //! Incremental REDUCE operator: δ_out = Agg(history + δ_in) − Agg(history).
 
 use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
-use crate::storage::{pk_bytes_eq, scatter_copy, Batch, ConsolidatedBatch, DrainGuard, MemBatch, ReadCursor};
+use crate::storage::{pk_bytes_eq, scatter_copy, Batch, DrainGuard, MemBatch, ReadCursor};
 
 use super::super::util::{
     cmp_col_window, extract_group_key, extract_group_key_cursor, global_group_key, GroupKeyExtractor,
@@ -698,11 +698,21 @@ pub fn op_reduce(
         fin_output.as_ref().map_or(0, |b| b.count)
     );
 
-    if group_by_pk {
-        // PK-grouped output: one row per unique PK, sorted and weight-folded.
-        raw_output.sorted = true;
-        raw_output.consolidated = true;
-        debug_assert!(ConsolidatedBatch::from_batch_ref(&raw_output).is_some());
+    // A reduce tick emits, per changed group, the old aggregate row @ -1 then the
+    // new aggregate row @ +1, in emit order. That is neither (PK, payload)-sorted
+    // (a decreasing aggregate — MAX after deleting the current max, a global SUM
+    // after a delete — yields a descending old/new pair) nor ghost-free (an
+    // unchanged-but-re-emitted group yields a net-zero pair), so the output is an
+    // unconsolidated delta and must not claim otherwise. `Batch::with_schema`
+    // defaults both flags true and the `extend_*` emit path never clears them, so
+    // clear them at the producer: a consumer that trusts the flag — the two-phase
+    // `reduce_local → ExchangeShard` relay, whose `prepare_relay` fast-paths on a
+    // certified-`ConsolidatedBatch` — would otherwise read the rows out of order.
+    raw_output.sorted = false;
+    raw_output.consolidated = false;
+    if let Some(fin) = fin_output.as_mut() {
+        fin.sorted = false;
+        fin.consolidated = false;
     }
     (raw_output, fin_output)
 }

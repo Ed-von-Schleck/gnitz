@@ -65,9 +65,6 @@ pub(crate) struct LoadedCircuit {
     pub(crate) outgoing: HashMap<i32, Vec<(i32, i32)>>,
     incoming: HashMap<i32, Vec<(i32, i32)>>,
     consumers: HashMap<i32, Vec<i32>>,
-    /// Raw node-column rows for GatherReduce nodes only (stays on legacy path
-    /// until OpNode::GatherReduce gains an `agg: AggKind` field).
-    gather_reduce_cols: HashMap<i32, Vec<(u64, u16, u64, u64)>>,
 }
 
 impl LoadedCircuit {
@@ -80,7 +77,6 @@ impl LoadedCircuit {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             consumers: HashMap::new(),
-            gather_reduce_cols: HashMap::new(),
         }
     }
 }
@@ -630,7 +626,6 @@ mod tests {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             consumers: HashMap::new(),
-            gather_reduce_cols: HashMap::new(),
         };
         assert!(topo_sort(&mut loaded).is_ok());
         assert_eq!(loaded.ordered, vec![0, 1, 2]);
@@ -651,7 +646,6 @@ mod tests {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             consumers: HashMap::new(),
-            gather_reduce_cols: HashMap::new(),
         };
         assert!(topo_sort(&mut loaded).is_err());
     }
@@ -1139,7 +1133,6 @@ mod tests {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             consumers: HashMap::new(),
-            gather_reduce_cols: HashMap::new(),
         };
         topo_sort(&mut loaded).unwrap();
 
@@ -1218,7 +1211,6 @@ mod tests {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             consumers: HashMap::new(),
-            gather_reduce_cols: HashMap::new(),
         };
         let ordered: Vec<i32> = (0..n).collect();
         let result = build_plan(&loaded, &empty_rw(), &ordered, &[], "", 0, 1, None, &[], vec![]);
@@ -1298,29 +1290,6 @@ mod tests {
             result.is_none(),
             "IntegrateTrace child-table failure must fail the compile"
         );
-    }
-
-    // ── Item 6: GATHER_REDUCE col_idx ───────────────────────────────────────
-
-    #[test]
-    fn test_build_gather_agg_descs_col_idx_is_agg_column() {
-        // Partial schema = group key (col 0, U64) + one SUM aggregate (col 1, I64).
-        // The aggregate descriptor's col_idx must point at the aggregate column
-        // (1), not the PK (0).
-        let partial = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        );
-        let descs = build_gather_agg_descs(&partial, &[(AggOp::Sum as u64, 0)]);
-        assert_eq!(descs.len(), 1);
-        assert_eq!(
-            descs[0].col_idx, 1,
-            "agg col_idx must be the aggregate column, not the PK"
-        );
-        assert_eq!(descs[0].agg_op, AggOp::Sum);
     }
 
     // ── Item 32: sink schema type validation ────────────────────────────────
@@ -1844,7 +1813,6 @@ mod tests {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             consumers: HashMap::new(),
-            gather_reduce_cols: HashMap::new(),
         };
         topo_sort(&mut lc).expect("test circuit must be acyclic");
         lc
@@ -2878,64 +2846,6 @@ mod tests {
             scan_tid_through_filters(&loaded, 3),
             None,
             "a fan-in at an intervening Filter also bails (the Filter has two incoming edges)"
-        );
-    }
-
-    // ── Finding 1: ExchangeGather must forward its output to exchange-input reg ──
-
-    /// ExchangeGather is a logical passthrough: at runtime the exchange mechanism
-    /// injects gathered data into the exchange-input register (`plan.in_reg`).
-    /// GatherReduce reads from ExchangeGather's output, so ExchangeGather's output
-    /// register must alias the exchange-input register — not a separate unwritten one.
-    #[test]
-    fn test_exchange_gather_routes_to_exchange_input_register() {
-        let schema = two_col_schema();
-        let dir = tempfile::tempdir().unwrap();
-
-        // Post-exchange circuit: ExchangeShard(0) → ExchangeGather(1) → GatherReduce(2).
-        // We build only the post-plan: post_ordered = [1, 2], exchange_input = Some((0, schema)).
-        let loaded = {
-            let mut nodes = HashMap::new();
-            nodes.insert(0, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![] });
-            nodes.insert(1, gnitz_wire::OpNode::ExchangeGather);
-            nodes.insert(2, gnitz_wire::OpNode::GatherReduce);
-            make_loaded(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)])
-        };
-
-        let post_ordered = vec![1, 2];
-        let plan = build_plan(
-            &loaded,
-            &empty_rw(),
-            &post_ordered,
-            &[],
-            dir.path().to_str().unwrap(),
-            0,
-            1,
-            Some(2), // GatherReduce(2) is the output node; skips schema mismatch check
-            &[(0, schema)],
-            vec![],
-        )
-        .expect("post-plan must compile");
-
-        let gather_in_reg = plan
-            .vm
-            .program
-            .instructions
-            .iter()
-            .find_map(|instr| {
-                if let crate::query::vm::Instr::GatherReduce { in_reg, .. } = instr {
-                    Some(*in_reg)
-                } else {
-                    None
-                }
-            })
-            .expect("post-plan must contain a GatherReduce instruction");
-
-        assert_eq!(
-            gather_in_reg as i32, plan.in_reg,
-            "GatherReduce reads from register {} but exchange data arrives at register {}: \
-             ExchangeGather did not forward its output to the exchange-input register",
-            gather_in_reg, plan.in_reg
         );
     }
 

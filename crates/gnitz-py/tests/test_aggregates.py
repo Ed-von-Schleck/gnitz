@@ -2866,3 +2866,127 @@ class TestGlobalAggregate:
             check("after-refill")  # lo=hi=7
         finally:
             client.drop_schema(sn)
+
+    # ── Two-phase (distributable) all-linear global aggregate ──────────────────
+
+    @staticmethod
+    def _count_reduce_nodes(client, vid):
+        """REDUCE (opcode 9) circuit nodes for view `vid`: 2 for the two-phase
+        shape (reduce_local + reduce_combine), 1 for the single funnel reduce."""
+        OPCODE_REDUCE, CIRCUIT_NODES_TAB = 9, 11
+        return sum(
+            1 for r in client.scan(CIRCUIT_NODES_TAB)
+            if r.weight > 0 and r["view_id"] == vid and r["opcode"] == OPCODE_REDUCE
+        )
+
+    def test_two_phase_all_linear_distributed(self, client):
+        """All-linear global aggregate (COUNT*/SUM/AVG/COUNT(col)) over a
+        partitioned table takes the two-phase path: a per-worker local partial,
+        then ≤N partials combined on V0's owner. Checked against the recompute
+        oracle across insert/update/delete churn spread over all partitions.
+        Integer arithmetic is bit-exact, so two-phase == funnel == oracle with no
+        tolerance. Run under GNITZ_WORKERS=1 and =4 — passing at both pins the
+        weight-exact partial split (the funnel==two_phase identity)."""
+        sn = "g2p_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total, "
+                "AVG(a) AS av, COUNT(b) AS nb FROM t",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            # Eligible → two-phase (2 REDUCE nodes), even at W=1.
+            assert self._count_reduce_nodes(client, vid) == 2, "all-linear integer global agg must be two-phase"
+            project = ["cnt", "total", "av", "nb"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["a", "b"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["a", "b"], [],
+                    [("cnt", "COUNT", None), ("total", "SUM", "a"),
+                     ("av", "AVG", "a"), ("nb", "COUNT", "b")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            check("empty")
+            # 40 rows with varied PKs (spread across partitions); b NULL on a third.
+            rows = [{"pk": i, "a": (i * 7) % 50, "b": (None if i % 3 == 0 else i)} for i in range(1, 41)]
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ", ".join(
+                    f"({r['pk']}, {r['a']}, {'NULL' if r['b'] is None else r['b']})" for r in rows),
+                schema_name=sn)
+            oracle.apply_insert(t_state, "pk", rows)
+            check("after-insert")
+            client.execute_sql("UPDATE t SET a = 100 WHERE pk = 5", schema_name=sn)
+            oracle.apply_update(t_state, "pk", 5, {"a": 100})
+            # Un-null a previously-NULL b (pk 9, 9 % 3 == 0) → COUNT(b) rises.
+            client.execute_sql("UPDATE t SET b = 9 WHERE pk = 9", schema_name=sn)
+            oracle.apply_update(t_state, "pk", 9, {"b": 9})
+            check("after-update")
+            del_pks = list(range(1, 41, 2))  # odd PKs, across partitions
+            client.execute_sql(
+                f"DELETE FROM t WHERE pk IN ({', '.join(map(str, del_pks))})", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", del_pks)
+            check("after-delete")
+            remaining = [r["pk"] for r in rows if r["pk"] not in del_pks]
+            client.execute_sql("DELETE FROM t", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", remaining)
+            check("after-delete-all")  # back to the ground row
+            client.execute_sql("INSERT INTO t VALUES (99, 3, 4)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 99, "a": 3, "b": 4}])
+            check("after-refill")
+        finally:
+            client.drop_schema(sn)
+
+    def test_two_phase_fresh_all_null_count_col_is_zero(self, client):
+        """Two-phase COUNT(col) over a non-empty source whose column was NEVER
+        non-null renders 0: each worker's partial COUNT_NON_NULL is untouched and
+        the combine SumZero of them grounds to 0. This is SQL-correct and the
+        two-phase path's deliberate divergence from the funnel/grouped reduce
+        (which render NULL). The column MUST be fresh all-NULL — inserting non-null
+        rows then nulling them leaves a concrete 0 on both paths and tests nothing."""
+        sn = "g2n_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NULL)",
+                schema_name=sn)
+            client.execute_sql("CREATE VIEW v AS SELECT COUNT(a) AS c FROM t", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            assert self._count_reduce_nodes(client, vid) == 2, "COUNT(col) global agg must be two-phase"
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL), (4, NULL)", schema_name=sn)
+            assert self._one_row(client, vid)["c"] == 0, "fresh all-NULL COUNT(col) is 0 under two-phase"
+        finally:
+            client.drop_schema(sn)
+
+    def test_two_phase_eligibility_integer_vs_float(self, client):
+        """Eligibility predicate: integer SUM/AVG global aggregates compile to the
+        two-phase shape (2 REDUCE nodes); a float SUM — and AVG over a float, whose
+        SUM component is float — are excluded (non-associative IEEE addition would
+        make the result worker-count-dependent) and keep the single funnel reduce
+        (1 REDUCE node)."""
+        sn = "g2f_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, ai BIGINT NOT NULL, af DOUBLE NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("CREATE VIEW vsi AS SELECT SUM(ai) AS s FROM t", schema_name=sn)
+            client.execute_sql("CREATE VIEW vai AS SELECT AVG(ai) AS s FROM t", schema_name=sn)
+            client.execute_sql("CREATE VIEW vsf AS SELECT SUM(af) AS s FROM t", schema_name=sn)
+            client.execute_sql("CREATE VIEW vaf AS SELECT AVG(af) AS s FROM t", schema_name=sn)
+            vsi = client.resolve_table(sn, "vsi")[0]
+            vai = client.resolve_table(sn, "vai")[0]
+            vsf = client.resolve_table(sn, "vsf")[0]
+            vaf = client.resolve_table(sn, "vaf")[0]
+            assert self._count_reduce_nodes(client, vsi) == 2, "integer SUM is two-phase"
+            assert self._count_reduce_nodes(client, vai) == 2, "AVG over integer is two-phase"
+            assert self._count_reduce_nodes(client, vsf) == 1, "float SUM keeps the funnel"
+            assert self._count_reduce_nodes(client, vaf) == 1, "AVG over float keeps the funnel"
+        finally:
+            client.drop_schema(sn)

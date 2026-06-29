@@ -22,6 +22,11 @@ pub enum AggOp {
     Min = 3,
     Max = 4,
     CountNonNull = 5,
+    /// `Sum`'s fold with `Count`'s `0` identity: sums values like `Sum` but
+    /// grounds/renders an untouched accumulator to `0` instead of NULL. The
+    /// two-phase global-aggregate combine sums per-worker partial count columns
+    /// with this (a COUNT's empty value is `0`, not NULL).
+    SumZero = 6,
 }
 
 impl TryFrom<u8> for AggOp {
@@ -34,6 +39,7 @@ impl TryFrom<u8> for AggOp {
             3 => Ok(AggOp::Min),
             4 => Ok(AggOp::Max),
             5 => Ok(AggOp::CountNonNull),
+            6 => Ok(AggOp::SumZero),
             other => Err(other),
         }
     }
@@ -47,13 +53,14 @@ impl From<gnitz_wire::AggFunc> for AggOp {
             gnitz_wire::AggFunc::Min => AggOp::Min,
             gnitz_wire::AggFunc::Max => AggOp::Max,
             gnitz_wire::AggFunc::CountNonNull => AggOp::CountNonNull,
+            gnitz_wire::AggFunc::SumZero => AggOp::SumZero,
         }
     }
 }
 
 impl AggOp {
     pub fn is_linear(self) -> bool {
-        matches!(self, AggOp::Count | AggOp::Sum | AggOp::CountNonNull)
+        matches!(self, AggOp::Count | AggOp::Sum | AggOp::CountNonNull | AggOp::SumZero)
     }
 }
 
@@ -103,6 +110,13 @@ impl Accumulator {
 
     pub(super) fn is_linear(&self) -> bool {
         self.agg_op.is_linear()
+    }
+
+    /// True iff an untouched (`is_zero()`) accumulator renders as `0` rather than
+    /// NULL — the `SumZero` identity. Lets `emit_agg_col` ground a combine's
+    /// all-NULL-input count column to `0` without growing a per-op render switch.
+    pub(super) fn grounds_to_zero(&self) -> bool {
+        matches!(self.agg_op, AggOp::SumZero)
     }
 
     pub(super) fn is_zero(&self) -> bool {
@@ -181,7 +195,9 @@ impl Accumulator {
         let is_f = self.is_float();
 
         match self.agg_op {
-            AggOp::Sum => {
+            // SumZero folds identically to Sum (it differs only in its identity /
+            // empty-render, handled by the seed and `emit_agg_col`).
+            AggOp::Sum | AggOp::SumZero => {
                 if is_f {
                     let val_f = decode_float(bytes, tc);
                     let cur_f = f64::from_bits(self.acc as u64);
@@ -248,7 +264,7 @@ impl Accumulator {
                 self.acc = self.acc.wrapping_add(prev.wrapping_mul(weight));
                 self.has_value = true;
             }
-            AggOp::Sum => {
+            AggOp::Sum | AggOp::SumZero => {
                 if is_f {
                     let prev_f = f64::from_bits(value_bits);
                     let w_f = weight as f64;
@@ -279,7 +295,7 @@ impl Accumulator {
                 self.acc = self.acc.wrapping_add(prev);
                 self.has_value = true;
             }
-            AggOp::Sum => {
+            AggOp::Sum | AggOp::SumZero => {
                 if is_f {
                     let prev_f = f64::from_bits(other_bits);
                     let cur_f = f64::from_bits(self.acc as u64);
@@ -415,8 +431,7 @@ pub(super) fn readback_agg_bits(bytes: &[u8], src_tc: TypeCode) -> u64 {
 }
 
 /// Fold the old aggregate values stored in `cursor`'s current row into `accs`
-/// at weight +1 — the `new = old + delta` step shared by `op_reduce`'s linear
-/// fast path and `op_gather_reduce`'s old-global fold.
+/// at weight +1 — the `new = old + delta` step on `op_reduce`'s linear fast path.
 ///
 /// A NULL old aggregate contributes nothing: folding its zero bytes would
 /// saturate `has_value`, decoding NULL as 0. The aggregates are the trailing

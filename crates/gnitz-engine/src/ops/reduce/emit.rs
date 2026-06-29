@@ -1,4 +1,4 @@
-//! Output row emitters: raw reduce rows, finalized rows, gather-reduce rows.
+//! Output row emitters: raw reduce rows, finalized rows, the global-aggregate ground row.
 
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
@@ -6,13 +6,20 @@ use crate::storage::{Batch, MemBatch};
 use super::super::util::write_string_from_batch;
 use super::agg::{Accumulator, AggDescriptor, AggOp};
 
-/// Emit one aggregate column: NULL (and zero-filled) when the accumulator holds
-/// no value, else its value bits truncated to the column width. Shared by
-/// `emit_reduce_row` and `emit_gather_row` so the two emitters cannot drift.
+/// Emit one aggregate column: its value bits truncated to the column width when
+/// the accumulator holds a value, else its empty-render — NULL for SUM/MIN/MAX, a
+/// concrete `0` (null bit clear) for `SumZero` (its `0` identity, so a combine's
+/// all-NULL-input count column grounds to `0`, not NULL). COUNT-family
+/// accumulators are seeded present, so they take the value branch. Used by
+/// `emit_reduce_row`.
 #[inline]
 fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, cs: usize, null_word: &mut u64) {
     if acc.is_zero() {
-        *null_word |= 1u64 << out_pi;
+        // Untouched: zero bytes either way; only SUM/MIN/MAX flag the null bit.
+        // SumZero leaves it clear so its `0` identity renders as a concrete `0`.
+        if !acc.grounds_to_zero() {
+            *null_word |= 1u64 << out_pi;
+        }
         output.fill_col_zero(out_pi, cs);
     } else {
         output.extend_col(out_pi, &acc.get_value_bits().to_le_bytes()[..cs]);
@@ -132,8 +139,11 @@ pub(super) fn emit_global_ground(
 
     // Fresh accumulators in the empty-group state. COUNT-family present at `0`
     // (null bit clear → renders `0`); SUM/MIN/MAX left absent (`has_value` false →
-    // null bit set → renders NULL). Forcing COUNT-family to `0` is correct
-    // independently of the separately-owned COUNT-family-renders-NULL emitter bug.
+    // null bit set → renders NULL). SumZero is also absent here yet still renders
+    // `0` — `emit_agg_col`'s `grounds_to_zero` carries its `0` identity at render,
+    // so it needs no seed (one render path for SumZero, ground and normal alike).
+    // Forcing COUNT-family to `0` is correct independently of the separately-owned
+    // COUNT-family-renders-NULL emitter bug.
     let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, input_schema)).collect();
     for (acc, d) in accs.iter_mut().zip(agg_descs) {
         if matches!(d.agg_op, AggOp::Count | AggOp::CountNonNull) {
@@ -270,49 +280,4 @@ pub(super) fn emit_finalized_row(
 
     fin_output.extend_null_bmp(&fin_null_mask.to_le_bytes());
     fin_output.count += 1;
-}
-
-/// Emit one gather-reduce output row — the +1 new-global row. Retractions are
-/// byte-copied from the stored row via `copy_current_row_into`, not built here.
-pub(super) fn emit_gather_row(
-    output: &mut Batch,
-    input_mb: &MemBatch,
-    exemplar_row: usize,
-    accs: &[Accumulator],
-    schema: &SchemaDescriptor,
-    num_aggs: usize,
-) {
-    let num_cols = schema.num_columns();
-    let agg_base = num_cols - num_aggs;
-
-    // The gather partial's PK region IS the materialised group key — copy the
-    // exemplar row's OPK bytes verbatim (correct at every arity and width).
-    output.extend_pk_bytes(input_mb.get_pk_bytes(exemplar_row));
-    output.extend_weight(&1i64.to_le_bytes());
-
-    let mut null_word: u64 = 0;
-    let in_null = input_mb.get_null_word(exemplar_row);
-
-    for (out_pi, ci, col) in schema.payload_columns() {
-        let cs = col.size() as usize;
-
-        if ci >= agg_base {
-            emit_agg_col(output, &accs[ci - agg_base], out_pi, cs, &mut null_word);
-        } else {
-            // Group exemplar column: copy from input
-            let src_pi = out_pi; // same position
-            if (in_null >> src_pi) & 1 != 0 {
-                null_word |= 1u64 << out_pi;
-                output.fill_col_zero(out_pi, cs);
-            } else if gnitz_wire::is_german_string(col.type_code) {
-                write_string_from_batch(output, out_pi, input_mb, exemplar_row, src_pi);
-            } else {
-                let src = input_mb.get_col_ptr(exemplar_row, src_pi, cs);
-                output.extend_col(out_pi, src);
-            }
-        }
-    }
-
-    output.extend_null_bmp(&null_word.to_le_bytes());
-    output.count += 1;
 }

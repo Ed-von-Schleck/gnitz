@@ -151,13 +151,6 @@ pub(crate) enum Instr {
         global_ground: bool,
         i_am_owner: bool,
     },
-    GatherReduce {
-        in_reg: u16,
-        trace_out_reg: u16,
-        out_reg: u16,
-        agg_descs_offset: u32,
-        agg_descs_count: u16,
-    },
 }
 
 /// GI (group-index) reference: a GI-table slot + the indexed column. Shared by the

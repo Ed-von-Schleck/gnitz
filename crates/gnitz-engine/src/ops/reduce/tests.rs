@@ -11,9 +11,8 @@ use crate::test_support::make_schema_i64pk_i64;
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};
 use super::emit::{emit_finalized_row, emit_reduce_row};
-use super::op_gather::op_gather_reduce;
 use super::op_reduce::{cursor_matches_group, op_reduce};
-use super::sort::{argsort_delta, build_sort_descs, compare_by_group_cols, sort_owned};
+use super::sort::{argsort_delta, build_sort_descs, compare_by_group_cols};
 
 /// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
 /// bytes back to the native value — the inverse of `extend_pk_opk` for an I64 PK.
@@ -1498,71 +1497,6 @@ fn test_reduce_gi_same_pk_multiple_payloads() {
     );
 }
 
-// -----------------------------------------------------------------------
-// op_gather_reduce
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_gather_reduce_retraction() {
-    use crate::schema::type_code;
-    use crate::storage::CursorHandle;
-    use std::rc::Rc;
-
-    // Schema: pk(U128), count(I64) — same as partial/output schema
-    let schema = SchemaDescriptor::new(
-        &[
-            crate::schema::SchemaColumn::new(type_code::U128, 0),
-            crate::schema::SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-
-    // Tick 1: two partial COUNT=2 from different workers → global COUNT=4
-    let empty_out = Rc::new(Batch::empty(1, 16));
-    let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
-
-    let mut partial1 = Batch::with_schema(schema, 2);
-
-    // Two entries for same group key (pk=1), count=2 each
-    for count in [2i64, 2] {
-        partial1.extend_pk(1u128);
-        partial1.extend_weight(&1i64.to_le_bytes());
-        partial1.extend_null_bmp(&0u64.to_le_bytes());
-        partial1.extend_col(0, &count.to_le_bytes());
-        partial1.count += 1;
-    }
-
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
-
-    let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
-    assert_eq!(out1.count, 1);
-    let global_count = read_i64_le(out1.col_data(0), 0);
-    assert_eq!(global_count, 4);
-
-    // Tick 2: retract 1 from each worker → partial counts are -1 each → global delta = -2
-    let prev_out = Rc::new(out1);
-    let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
-
-    let mut partial2 = Batch::with_schema(schema, 2);
-
-    for count in [-1i64, -1] {
-        partial2.extend_pk(1u128);
-        partial2.extend_weight(&1i64.to_le_bytes());
-        partial2.extend_null_bmp(&0u64.to_le_bytes());
-        partial2.extend_col(0, &count.to_le_bytes());
-        partial2.count += 1;
-    }
-
-    let out2 = op_gather_reduce(&partial2, to_ch2.cursor_mut(), &schema, &[agg]);
-    // Should have 2 rows: retract old (4, w=-1) + insert new (2, w=+1)
-    assert_eq!(out2.count, 2);
-}
-
 #[test]
 fn test_argsort_delta_f32_group() {
     let schema = make_schema_u64_f32();
@@ -1843,71 +1777,6 @@ fn test_reduce_max_i16() {
 }
 
 // -----------------------------------------------------------------------
-// Fix 6: gather_reduce MIN retraction
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_gather_reduce_min_retraction() {
-    use crate::storage::CursorHandle;
-    use std::rc::Rc;
-
-    // Schema: pk(U128), min_val(I64)
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-
-    // Tick 1: partial MIN=5 from one worker → global MIN=5
-    let empty_out = Rc::new(Batch::empty(1, 16));
-    let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
-
-    let mut partial1 = Batch::with_schema(schema, 1);
-
-    partial1.extend_pk(1u128);
-    partial1.extend_weight(&1i64.to_le_bytes());
-    partial1.extend_null_bmp(&0u64.to_le_bytes());
-    partial1.extend_col(0, &5i64.to_le_bytes());
-    partial1.count += 1;
-
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Min,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
-
-    let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
-    assert_eq!(out1.count, 1);
-    let min1 = read_i64_le(out1.col_data(0), 0);
-    assert_eq!(min1, 5);
-
-    // Tick 2: partial MIN=3 from one worker. The old global (5) should be folded in
-    // via merge_accumulated with weight=1 → combine(5). New MIN should be min(3, 5) = 3.
-    let prev_out = Rc::new(out1);
-    let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
-
-    let mut partial2 = Batch::with_schema(schema, 1);
-
-    partial2.extend_pk(1u128);
-    partial2.extend_weight(&1i64.to_le_bytes());
-    partial2.extend_null_bmp(&0u64.to_le_bytes());
-    partial2.extend_col(0, &3i64.to_le_bytes());
-    partial2.count += 1;
-
-    let out2 = op_gather_reduce(&partial2, to_ch2.cursor_mut(), &schema, &[agg]);
-    // Should have: retract old (5, w=-1) + insert new (3, w=+1)
-    assert_eq!(out2.count, 2, "should retract old MIN and emit new MIN");
-    let retracted = read_i64_le(out2.col_data(0), 0);
-    assert_eq!(retracted, 5, "retraction should be old MIN value 5");
-    assert_eq!(out2.get_weight(0), -1);
-    let new_min = read_i64_le(out2.col_data(0), 8);
-    assert_eq!(new_min, 3, "new MIN should be 3 (min of old 5 and partial 3)");
-    assert_eq!(out2.get_weight(1), 1);
-}
-
 // -----------------------------------------------------------------------
 // UUID non-PK GROUP BY correctness
 // -----------------------------------------------------------------------
@@ -3891,86 +3760,6 @@ fn test_reduce_min_max_i64_boundary() {
     }
 }
 
-#[test]
-fn test_gather_reduce_min_u64() {
-    use crate::storage::CursorHandle;
-    use std::rc::Rc;
-
-    // Schema for op_gather_reduce: U128 pk + U64 min_val (no group cols).
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::U64, 1),
-        ],
-        &[0],
-    );
-
-    // Tick 1: two partial MINs from different workers, both for the same
-    // group pk=1. One has a small value (3), one is high-bit-set
-    // (1u64<<63). Unsigned MIN across both = 3.
-    // Pre-fix signed comparator treats 1u64<<63 as i64::MIN < 3, so it
-    // would report 1u64<<63 as the merged MIN.
-    let empty_out = Rc::new(Batch::empty(1, 16));
-    let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
-
-    let mut partial1 = Batch::with_schema(schema, 2);
-
-    partial1.extend_pk(1u128);
-    partial1.extend_weight(&1i64.to_le_bytes());
-    partial1.extend_null_bmp(&0u64.to_le_bytes());
-    partial1.extend_col(0, &3u64.to_le_bytes());
-    partial1.count += 1;
-
-    partial1.extend_pk(1u128);
-    partial1.extend_weight(&1i64.to_le_bytes());
-    partial1.extend_null_bmp(&0u64.to_le_bytes());
-    partial1.extend_col(0, &(1u64 << 63).to_le_bytes());
-    partial1.count += 1;
-
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Min,
-        col_type_code: TypeCode::U64,
-        _pad: [0; 2],
-    };
-
-    let out1 = op_gather_reduce(&partial1, to_ch.cursor_mut(), &schema, &[agg]);
-    assert_eq!(out1.count, 1);
-    let min1 = u64::from_le_bytes(out1.col_data(0)[0..8].try_into().unwrap());
-    assert_eq!(min1, 3u64, "gather-reduce MIN across partials must be unsigned");
-
-    // Tick 2: old global = 3 (from tick 1). New partial has u64::MAX.
-    // op_gather_reduce folds the old global in via merge_accumulated →
-    // combine, then merges the new partial via combine. Under unsigned
-    // ordering, MIN stays at 3 (3 < u64::MAX). Under signed comparison,
-    // u64::MAX → -1 wins, MIN flips to u64::MAX.
-    //
-    // op_gather_reduce always emits retract+new when has_old (no
-    // skip-if-equal), so 2 rows are emitted; we check the new value.
-    let prev_out = Rc::new(out1);
-    let mut to_ch2 = CursorHandle::from_owned(&[prev_out], schema);
-
-    let mut partial2 = Batch::with_schema(schema, 1);
-
-    partial2.extend_pk(1u128);
-    partial2.extend_weight(&1i64.to_le_bytes());
-    partial2.extend_null_bmp(&0u64.to_le_bytes());
-    partial2.extend_col(0, &u64::MAX.to_le_bytes());
-    partial2.count += 1;
-
-    let out2 = op_gather_reduce(&partial2, to_ch2.cursor_mut(), &schema, &[agg]);
-    assert_eq!(out2.count, 2, "retract old + emit new (unchanged) MIN");
-    let retracted = u64::from_le_bytes(out2.col_data(0)[0..8].try_into().unwrap());
-    assert_eq!(retracted, 3u64);
-    assert_eq!(out2.get_weight(0), -1);
-    let new_min = u64::from_le_bytes(out2.col_data(0)[8..16].try_into().unwrap());
-    assert_eq!(
-        new_min, 3u64,
-        "fold-old + combine-new under unsigned ordering keeps MIN at 3"
-    );
-    assert_eq!(out2.get_weight(1), 1);
-}
-
 // -----------------------------------------------------------------------
 // group_by_pk fast path on unsorted input
 //
@@ -4098,8 +3887,14 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
     let sum1 = read_i64_le(out.col_data(0), 8);
     assert_eq!(sum0, 20, "SUM for pk=3");
     assert_eq!(sum1, 40, "SUM for pk=5 (10+30) — pre-fix produced two split rows");
-    assert!(out.sorted, "output is PK-sorted by the fast path");
-    assert!(out.consolidated, "output is consolidated by the fast path");
+    // The rows above are physically in canonical PK order (3 before 5), but
+    // op_reduce now ships its output as an honest unconsolidated delta: it never
+    // certifies the flags (a decreasing aggregate would emit a descending old/new
+    // pair at the same PK), so downstream re-sorts/folds.
+    assert!(
+        !out.sorted && !out.consolidated,
+        "reduce output is an unconsolidated delta"
+    );
 }
 
 #[test]
@@ -4474,104 +4269,6 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
         by_w,
         vec![(-1, 10), (1, 20)],
         "retract old MIN=10, insert new MIN=20 after the val=10 payload is retracted",
-    );
-}
-
-// -----------------------------------------------------------------------
-// sort_owned / op_gather_reduce canonical PK order
-//
-// sort_owned (used by op_gather_reduce) sorts indices by `pks[a].cmp(...)`
-// on a u128 widen, which violates canonical order for signed/float
-// single-col PKs and for compound PKs (where pk_indices priority is
-// reversed by u128 LE byte layout).
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_sort_owned_signed_pk_canonical_order() {
-    let schema = make_schema_i64pk_i64();
-    let batch = make_batch_raw_pk(&schema, &[(-1, 1, 10), (2, 1, 20), (-3, 1, 30)], |pk: i64| {
-        (pk as u64) as u128
-    });
-    let sorted = sort_owned(&batch, &schema);
-
-    assert!(sorted.sorted, "sort_owned must set the sorted flag");
-    assert_eq!(sorted.count, 3);
-    let pks: Vec<i64> = (0..sorted.count).map(|i| opk_pk_i64(sorted.get_pk_bytes(i))).collect();
-    assert_eq!(
-        pks,
-        vec![-3, -1, 2],
-        "signed PK rows must come out in signed-ascending order"
-    );
-}
-
-#[test]
-fn test_sort_owned_compound_pk_canonical_order() {
-    let schema = make_compound_pk_2xu64_schema();
-    let mut batch = make_batch_compound_2xu64(&schema, &[(2, 1, 1, 20), (1, 2, 1, 10)]);
-    batch.sorted = false;
-    let sorted = sort_owned(&batch, &schema);
-
-    assert!(sorted.sorted);
-    assert_eq!(sorted.count, 2);
-    let p0 = sorted.get_pk_bytes(0);
-    let p1 = sorted.get_pk_bytes(1);
-    // Compound PK columns are OPK (big-endian) at rest.
-    let p0_c0 = u64::from_be_bytes(p0[0..8].try_into().unwrap());
-    let p0_c1 = u64::from_be_bytes(p0[8..16].try_into().unwrap());
-    let p1_c0 = u64::from_be_bytes(p1[0..8].try_into().unwrap());
-    let p1_c1 = u64::from_be_bytes(p1[8..16].try_into().unwrap());
-    assert_eq!(
-        (p0_c0, p0_c1),
-        (1, 2),
-        "compound-PK canonical sort follows pk_indices order, not u128 LE byte order"
-    );
-    assert_eq!((p1_c0, p1_c1), (2, 1));
-}
-
-#[test]
-fn test_gather_reduce_signed_pk_output_sorted_flag() {
-    use crate::storage::CursorHandle;
-    use std::rc::Rc;
-
-    // op_gather_reduce's partial schema = output schema. Use a signed PK
-    // so the sort_owned path inside must route through the order-preserving key.
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-    let empty_out = Rc::new(Batch::empty(schema.num_payload_cols(), 16));
-    let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
-
-    // Unsorted partial-reduce input with negative PKs interleaved.
-    let mut partial = Batch::with_schema(schema, 3);
-    for &(pk, sum) in &[(-1i64, 10i64), (2i64, 20i64), (-3i64, 30i64)] {
-        partial.extend_pk_opk(&schema, &[(pk as u64) as u128]);
-        partial.extend_weight(&1i64.to_le_bytes());
-        partial.extend_null_bmp(&0u64.to_le_bytes());
-        partial.extend_col(0, &sum.to_le_bytes());
-        partial.count += 1;
-    }
-    partial.sorted = false;
-    partial.consolidated = false;
-
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Sum,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
-
-    let out = op_gather_reduce(&partial, to_ch.cursor_mut(), &schema, &[agg]);
-
-    assert_eq!(out.count, 3);
-    let pks: Vec<i64> = (0..out.count).map(|i| opk_pk_i64(out.get_pk_bytes(i))).collect();
-    assert_eq!(
-        pks,
-        vec![-3, -1, 2],
-        "gather-reduce output must be in canonical signed-PK order for output.sorted=true to be truthful"
     );
 }
 
@@ -6238,17 +5935,24 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
         false,
     );
 
-    // One row per distinct PK; output is sorted + consolidated.
+    // op_reduce ships an honest unconsolidated delta — it no longer certifies the
+    // flags even on the group-by-PK fast path.
     assert!(
-        out.sorted && out.consolidated,
-        "group-by-PK output must be sorted+consolidated"
+        !out.sorted && !out.consolidated,
+        "reduce output is an unconsolidated delta"
     );
-    let mut counts: Vec<i64> = (0..out.count)
+    // The argsort_pk_canonical branch still physically orders the wide compound-PK
+    // output: (1,1) (cnt 2) precedes (1,2) (cnt 1). Read counts in physical row
+    // order to pin that canonical ordering (the branch under test).
+    let counts: Vec<i64> = (0..out.count)
         .filter(|&i| out.get_weight(i) > 0)
         .map(|i| read_i64_le(out.col_data(0), i * 8))
         .collect();
-    counts.sort_unstable();
-    assert_eq!(counts, vec![1, 2], "two distinct compound PKs with counts 1 and 2");
+    assert_eq!(
+        counts,
+        vec![2, 1],
+        "two distinct compound PKs in canonical order: (1,1)→2 then (1,2)→1"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -7161,54 +6865,6 @@ fn test_reduce_max_blob_group_retraction() {
     assert_eq!(insert, Some(10), "insert new MAX(blob_a)=10 after the 30 row is gone");
 }
 
-/// Gather-reduce must ignore a NULL partial when combining a group: a NULL MIN
-/// partial injected as `combine(0)` would corrupt the global MIN (MIN(5,0)=0).
-/// Latent today (op_gather_reduce is unwired in SQL planning) but a real value
-/// bug for the future GatherReduce milestone.
-#[test]
-fn gather_combine_skips_null_partial() {
-    use crate::storage::CursorHandle;
-    use std::rc::Rc;
-
-    // partial/output: pk(U128), min(I64 nullable). min is payload index 0.
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    );
-    let agg_min = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggOp::Min,
-        col_type_code: TypeCode::I64,
-        _pad: [0; 2],
-    };
-
-    // Group pk=1: an all-NULL partial and a MIN=5 partial → global MIN = 5.
-    let mut partial = Batch::with_schema(schema, 2);
-    partial.extend_pk(1u128);
-    partial.extend_weight(&1i64.to_le_bytes());
-    partial.extend_null_bmp(&1u64.to_le_bytes()); // min (payload idx 0) NULL
-    partial.extend_col(0, &0i64.to_le_bytes());
-    partial.count += 1;
-    partial.extend_pk(1u128);
-    partial.extend_weight(&1i64.to_le_bytes());
-    partial.extend_null_bmp(&0u64.to_le_bytes());
-    partial.extend_col(0, &5i64.to_le_bytes());
-    partial.count += 1;
-
-    let empty_out = Rc::new(Batch::empty_with_schema(&schema));
-    let mut to_ch = CursorHandle::from_owned(&[empty_out], schema);
-    let out = op_gather_reduce(&partial, to_ch.cursor_mut(), &schema, &[agg_min]);
-    assert_eq!(out.count, 1);
-    assert_eq!(
-        read_i64_le(out.col_data(0), 0),
-        5,
-        "gather MIN must ignore the all-NULL partial, not combine it as 0"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Global (ungrouped) aggregate ground-row tests
 //
@@ -7754,5 +7410,227 @@ fn global_lone_min_avi_empty_prefix() {
         read_i64_le(raw2.col_data(0), p2 * 8),
         20,
         "AVI advances to the next-best post-state on retraction"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SumZero aggregate + two-phase global-aggregate combine
+//
+// SumZero = Sum's fold with Count's `0` identity: it sums its source column like
+// SUM but renders an untouched accumulator as a concrete `0` (null bit clear),
+// not NULL. The two-phase global-aggregate combine uses it to sum per-worker
+// partial COUNT/COUNT_NON_NULL columns (a COUNT's empty value is `0`, not NULL).
+// ---------------------------------------------------------------------------
+
+/// SumZero folds values exactly like Sum, is linear (keeps the combine on the
+/// linear fast path), and an untouched accumulator grounds to `0`, not NULL.
+#[test]
+fn sumzero_folds_like_sum_and_grounds_to_zero() {
+    assert!(AggOp::SumZero.is_linear(), "SumZero must be linear");
+
+    let schema = g_src();
+    let desc = AggDescriptor {
+        col_idx: 1,
+        agg_op: AggOp::SumZero,
+        col_type_code: TypeCode::I64,
+        _pad: [0; 2],
+    };
+    let mut acc = Accumulator::new(&desc, &schema);
+
+    // Fresh: untouched, and renders 0 (Count's identity) rather than NULL (Sum's).
+    assert!(acc.is_zero(), "fresh SumZero is untouched");
+    assert!(acc.grounds_to_zero(), "an untouched SumZero renders 0, not NULL");
+
+    // Folds values with weight, exactly like Sum: 5·(+1) + 10·(+1) + 7·(−1) = 8.
+    let batch = g_delta(&[(1, 1, 5), (2, 1, 10), (3, -1, 7)]);
+    let mb = batch.as_mem_batch();
+    for row in 0..batch.count {
+        acc.step_from_batch(&mb, row, mb.get_weight(row));
+    }
+    assert!(!acc.is_zero(), "SumZero with input is touched");
+    assert_eq!(
+        acc.get_value_bits() as i64,
+        8,
+        "SumZero sums its source values (5 + 10 − 7)"
+    );
+}
+
+/// Combine-input partial schema: `[_group_pk:U128, cnt:I64(nullable)]` — one
+/// per-worker partial count column, all rows at PK V₀ (the local reduce output).
+fn combine_partial_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    )
+}
+
+/// Combine output `[_group_pk:U128, combined:I64, count_of_partials:I64]`: the
+/// summed partial column plus the trailing COUNT-of-partials existence gate.
+fn combine_out_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+/// Build a combine-input delta of partials at PK V₀ from `(weight, Option<value>)`
+/// (a `None` value is a NULL partial count column).
+fn combine_partials(rows: &[(i64, Option<i64>)]) -> Batch {
+    let schema = combine_partial_schema();
+    let v0 = crate::ops::global_group_key();
+    let mut b = Batch::with_schema(schema, rows.len().max(1));
+    for &(w, val) in rows {
+        b.extend_pk(v0);
+        b.extend_weight(&w.to_le_bytes());
+        match val {
+            Some(v) => {
+                b.extend_null_bmp(&0u64.to_le_bytes());
+                b.extend_col(0, &v.to_le_bytes());
+            }
+            None => {
+                b.extend_null_bmp(&1u64.to_le_bytes()); // cnt (payload idx 0) NULL
+                b.extend_col(0, &0i64.to_le_bytes());
+            }
+        }
+        b.count += 1;
+    }
+    b
+}
+
+// SumZero merges the partial counts; a trailing Count counts partial rows (the
+// existence gate `op_reduce` finds via the lone AggOp::Count).
+const C_SUMZERO: AggDescriptor = AggDescriptor {
+    col_idx: 1,
+    agg_op: AggOp::SumZero,
+    col_type_code: TypeCode::I64,
+    _pad: [0; 2],
+};
+const C_COUNT_PARTIALS: AggDescriptor = AggDescriptor {
+    col_idx: 0,
+    agg_op: AggOp::Count,
+    col_type_code: TypeCode::U128,
+    _pad: [0; 2],
+};
+
+/// The phase-3 combine `op_reduce` over hand-built partials (empty group cols →
+/// one global group at V₀, `global_ground = true`, `i_am_owner = true`).
+fn combine_reduce(delta: &Batch, trace_out: &mut crate::storage::ReadCursor, out_schema: &SchemaDescriptor) -> Batch {
+    let in_schema = combine_partial_schema();
+    op_reduce(
+        delta,
+        None,
+        trace_out,
+        &in_schema,
+        out_schema,
+        &[], // empty group cols ⇒ one global group at V₀
+        &[C_SUMZERO, C_COUNT_PARTIALS],
+        None,
+        false,
+        TypeCode::U64,
+        None,
+        0,
+        None,
+        None,
+        true, // global_ground
+        true, // i_am_owner (V₀'s owner)
+    )
+    .0
+}
+
+/// The combine sums the partial *count values* (3 + 5 = 8), not the number of
+/// partials (2). Consolidation of identical partials nets by weight.
+#[test]
+fn combine_sums_partial_counts_not_partial_rows() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = combine_out_schema();
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+    // Two workers' partials: counts 3 and 5.
+    let out = combine_reduce(
+        &combine_partials(&[(1, Some(3)), (1, Some(5))]),
+        to_ch.cursor_mut(),
+        &out_schema,
+    );
+    assert_eq!(out.count, 1, "one combined row");
+    assert_eq!(out.get_pk(0), crate::ops::global_group_key(), "combined row at V₀");
+    assert_eq!(
+        read_i64_le(out.col_data(0), 0),
+        8,
+        "SumZero sums partial counts (3 + 5), not the partial count (#partials = 2)"
+    );
+    assert_eq!(read_i64_le(out.col_data(1), 0), 2, "COUNT-of-partials gate = 2");
+}
+
+/// All-NULL partials (every worker's COUNT(col) is NULL — a fresh all-NULL
+/// column) combine to a concrete `0` with the null bit clear, never NULL.
+#[test]
+fn combine_all_null_partials_render_zero_not_null() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = combine_out_schema();
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+    // Two non-empty workers, each with a NULL partial count → SumZero untouched.
+    let out = combine_reduce(
+        &combine_partials(&[(1, None), (1, None)]),
+        to_ch.cursor_mut(),
+        &out_schema,
+    );
+    assert_eq!(out.count, 1, "non-empty global (2 partials) emits one combined row");
+    assert_eq!(read_i64_le(out.col_data(0), 0), 0, "all-NULL COUNT(col) combines to 0");
+    assert_eq!(
+        out.get_null_word(0) & 1,
+        0,
+        "combined COUNT(col) is 0 with null bit CLEAR, not NULL"
+    );
+    assert_eq!(
+        read_i64_le(out.col_data(1), 0),
+        2,
+        "still 2 partials (global non-empty)"
+    );
+}
+
+/// Full retraction nets the COUNT-of-partials to 0; the gate sheds the computed
+/// row and the combine emits the ground (combined = 0 via SumZero, null clear).
+#[test]
+fn combine_full_retraction_sheds_to_ground() {
+    use crate::storage::CursorHandle;
+    use std::rc::Rc;
+
+    let out_schema = combine_out_schema();
+    let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
+    let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
+
+    let out1 = combine_reduce(&combine_partials(&[(1, Some(5))]), to_ch.cursor_mut(), &out_schema);
+    assert_eq!(read_i64_le(out1.col_data(0), 0), 5, "combined = 5");
+
+    // Retract the only partial → COUNT-of-partials nets to 0.
+    let prev = Rc::new(out1);
+    let mut to_ch2 = CursorHandle::from_owned(&[prev], out_schema);
+    let out2 = combine_reduce(&combine_partials(&[(-1, Some(5))]), to_ch2.cursor_mut(), &out_schema);
+    assert_eq!(out2.count, 2, "retract old computed (−1) + ground insert (+1)");
+    let mb = out2.as_mem_batch();
+    let pos = (0..2).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
+    assert_eq!(
+        read_i64_le(out2.col_data(0), pos * 8),
+        0,
+        "ground combined count = 0 (SumZero's `0` identity)"
+    );
+    assert_eq!(
+        out2.get_null_word(pos) & 1,
+        0,
+        "combined count present (SumZero grounds to 0, not NULL)"
     );
 }

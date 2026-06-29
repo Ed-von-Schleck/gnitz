@@ -28,7 +28,7 @@ pub const OPCODE_EXCHANGE_SHARD: u64 = 20;
 pub const OPCODE_EXCHANGE_GATHER: u64 = 21;
 pub const OPCODE_JOIN_DELTA_TRACE_OUTER: u64 = 22;
 pub const OPCODE_NULL_EXTEND: u64 = 23;
-pub const OPCODE_GATHER_REDUCE: u64 = 24;
+// 24 is a retired opcode (the removed GatherReduce placeholder); left a hole.
 /// Discriminates IntegrateTrace from IntegrateSink (OPCODE_INTEGRATE=7)
 /// without a nullable column.
 pub const OPCODE_INTEGRATE_TRACE: u64 = 25;
@@ -92,6 +92,11 @@ pub const AGG_SUM: u64 = 2;
 pub const AGG_MIN: u64 = 3;
 pub const AGG_MAX: u64 = 4;
 pub const AGG_COUNT_NON_NULL: u64 = 5;
+/// `Sum`'s fold (`acc += value × weight`) with `Count`'s `0` identity (grounds to
+/// `0`, renders `0` when untouched). The two-phase global-aggregate combine sums
+/// per-worker partial COUNT/COUNT_NON_NULL columns with this — a plain `Sum` would
+/// render their empty value as NULL instead of `0`.
+pub const AGG_SUM_ZERO: u64 = 6;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation (shared between gnitz-core and gnitz-engine)
@@ -106,6 +111,7 @@ pub enum AggFunc {
     Min = AGG_MIN,
     Max = AGG_MAX,
     CountNonNull = AGG_COUNT_NON_NULL,
+    SumZero = AGG_SUM_ZERO,
 }
 
 impl AggFunc {
@@ -116,6 +122,7 @@ impl AggFunc {
             AGG_MIN => Some(AggFunc::Min),
             AGG_MAX => Some(AggFunc::Max),
             AGG_COUNT_NON_NULL => Some(AggFunc::CountNonNull),
+            AGG_SUM_ZERO => Some(AggFunc::SumZero),
             _ => None,
         }
     }
@@ -259,9 +266,6 @@ pub enum OpNode {
     NullExtend {
         type_codes: Vec<u8>,
     },
-    /// `OPCODE_GATHER_REDUCE = 24`. Server-internal; carries no typed fields until
-    /// the GatherReduce planning milestone adds `agg: AggKind`.
-    GatherReduce,
     /// `OPCODE_SEEK_TRACE = 12`. Server-internal.
     SeekTrace,
     /// `OPCODE_CLEAR_DELTAS = 15`. Server-internal.
@@ -415,7 +419,6 @@ pub fn decode_op_node(
         OPCODE_NULL_EXTEND => OpNode::NullExtend {
             type_codes: collect_typecodes(NODE_COL_KIND_NULL_EXT),
         },
-        OPCODE_GATHER_REDUCE => OpNode::GatherReduce,
         OPCODE_SEEK_TRACE => OpNode::SeekTrace,
         OPCODE_CLEAR_DELTAS => OpNode::ClearDeltas,
         OPCODE_PARTITION_FILTER => OpNode::PartitionFilter,

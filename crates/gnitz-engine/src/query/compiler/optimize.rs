@@ -370,7 +370,8 @@ pub(super) fn reindex_output_schema(
 /// Mirrored by the SQL planner's `agg_result_type`.
 pub(super) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
     match agg_op {
-        AggOp::Count | AggOp::CountNonNull | AggOp::Null => type_code::I64,
+        // SumZero sums integer count/sum columns; like COUNT it produces I64.
+        AggOp::Count | AggOp::CountNonNull | AggOp::Null | AggOp::SumZero => type_code::I64,
         AggOp::Sum => {
             if col_type_code.is_float() {
                 type_code::F64

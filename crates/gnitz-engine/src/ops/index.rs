@@ -116,13 +116,12 @@ pub fn op_integrate_with_indexes(
         return Ok(());
     }
 
-    // `reduce` for non-group-by-PK aggregates may emit retract+insert pairs
-    // that are physically unsorted while claiming `consolidated = true`.
+    // `op_reduce` now ships its retract+insert output as an honest unconsolidated
+    // delta (sorted = consolidated = false), so the table ingest re-sorts/folds it;
+    // no defensive flag-scrub is needed here. `clone_batch` stays: `batch` is
+    // borrowed and read again by the GI/AVI population below.
     if let Some(table) = target_table {
-        let mut cloned = batch.clone_batch();
-        cloned.sorted = false;
-        cloned.consolidated = false;
-        table.ingest_owned_batch_memonly(cloned)?;
+        table.ingest_owned_batch_memonly(batch.clone_batch())?;
     }
 
     let mb = batch.as_mem_batch();

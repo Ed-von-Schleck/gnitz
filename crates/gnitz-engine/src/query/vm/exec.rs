@@ -616,22 +616,6 @@ pub(crate) fn execute_epoch_multi(
                     }
                 }
             }
-
-            Instr::GatherReduce {
-                in_reg,
-                trace_out_reg,
-                out_reg,
-                agg_descs_offset,
-                agg_descs_count,
-            } => {
-                let schema = reg!(*in_reg).schema;
-                let aggs = &program.agg_descs
-                    [*agg_descs_offset as usize..(*agg_descs_offset as usize + *agg_descs_count as usize)];
-                if let Some(cursor) = cursor_mut!(*trace_out_reg) {
-                    let result = ops::op_gather_reduce(&reg!(*in_reg).batch, cursor, &schema, aggs);
-                    reg_mut!(*out_reg).batch = result;
-                }
-            }
         }
     }
 

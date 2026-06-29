@@ -515,20 +515,14 @@ def test_grouped_max_multiworker_retract_current_max(client):
 
 
 # -----------------------------------------------------------------------
-# KNOWN BUG (expected failures): distributed gather-reduce cannot recompute
-# the next-best extremum when the current GLOBAL MIN/MAX is retracted.
+# Global (no-GROUP BY) MIN/MAX retraction must recompute the next-best extremum.
 #
-# A grouped aggregate keeps each group on one worker (rows partition by group
-# key), so its retraction is handled entirely by the local single-node reduce
-# (with its trace_in / AggValueIndex) and works. A GLOBAL aggregate (no GROUP
-# BY) is the broken case: the one logical group is split across all workers,
-# and `op_gather_reduce` combines their partials with no per-worker input
-# history — it only has the previous global result in trace_out, drops
-# negative-weight non-linear partials, and re-folds its own previous global. So
-# deleting the current global extremum re-emits the deleted value instead of
-# the next-best. Fixing it needs its own design (a distributed replay trace, or
-# gating gather-reduce off for non-linear aggregates over retractable sources).
-# xfail(strict) so a future fix trips this and prompts removal of the marker.
+# A global MIN/MAX stays on the single-worker FUNNEL: its ExchangeShard(∅) routes
+# every row to V₀'s owner, where one reduce holds the full input history
+# (trace_in / AggValueIndex) and recomputes the next-best on retraction. The
+# two-phase distributable path is restricted to all-linear aggregates precisely
+# because a per-worker MIN/MAX partial cannot be retraction-combined without that
+# per-extremum history — so MIN/MAX keeps the funnel and these stay correct.
 # -----------------------------------------------------------------------
 
 

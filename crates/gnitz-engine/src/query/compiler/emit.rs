@@ -630,25 +630,6 @@ pub(super) fn emit_node(
             builder.add_null_extend(in_reg as u16, reg_id as u16, right);
         }
 
-        gnitz_wire::OpNode::GatherReduce => {
-            let raw_cols = loaded.gather_reduce_cols.get(&nid).map(|v| v.as_slice()).unwrap_or(&[]);
-            emit_gather_reduce(
-                raw_cols,
-                nid,
-                reg_id,
-                &in_regs,
-                builder,
-                state,
-                out_reg_of,
-                reg_meta,
-                owned_tables,
-                owned_trace_regs,
-                view_dir,
-                view_table_id,
-                view_id,
-            );
-        }
-
         gnitz_wire::OpNode::SeekTrace => {
             let trace_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
             let key_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
@@ -984,111 +965,6 @@ pub(super) fn emit_reduce(
     emit_simple_integrate(builder, raw_delta_id as u16, trace_table_ptr);
 }
 
-// ---------------------------------------------------------------------------
-// GATHER_REDUCE emission
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
-/// Build the per-aggregate descriptors for a GATHER_REDUCE node from its
-/// partial-aggregate schema. The aggregate columns occupy the final
-/// `agg_specs.len()` columns of the partial schema (the leading columns are the
-/// group key). Each descriptor's `col_idx` must point at the aggregate column's
-/// position in that partial schema (`agg_col_in_partial`) — using 0 would make
-/// `Accumulator::new` derive a PK offset and corrupt gather-reduce results if
-/// the gather path ever calls `step_from_batch`.
-pub(super) fn build_gather_agg_descs(
-    partial_schema: &SchemaDescriptor,
-    agg_specs: &[(u64, u64)],
-) -> Vec<AggDescriptor> {
-    let num_out_cols = partial_schema.num_columns();
-    let agg_count = agg_specs.len();
-    let mut agg_descs: Vec<AggDescriptor> = Vec::new();
-    if agg_count > 0 {
-        assert!(
-            num_out_cols >= agg_count,
-            "GATHER_REDUCE: agg_count ({agg_count}) exceeds partial schema column count ({num_out_cols})",
-        );
-        for (ai, &(func_id, _)) in agg_specs.iter().enumerate() {
-            let agg_op =
-                AggOp::try_from(func_id as u8).unwrap_or_else(|v| panic!("invalid agg_op {v} from wire protocol"));
-            let agg_col_in_partial = num_out_cols - agg_count + ai;
-            let col_type = TypeCode::from_validated_u8(partial_schema.columns[agg_col_in_partial].type_code);
-            agg_descs.push(AggDescriptor {
-                col_idx: agg_col_in_partial as u32,
-                agg_op,
-                col_type_code: col_type,
-                _pad: [0; 2],
-            });
-        }
-    } else {
-        agg_descs.push(AggDescriptor {
-            col_idx: 0,
-            agg_op: AggOp::Null,
-            col_type_code: TypeCode::U64,
-            _pad: [0; 2],
-        });
-    }
-    agg_descs
-}
-
-// Vecs are grown in place (push); `Vec<Box<Table>>` is load-bearing — a raw
-// pointer is taken into an element below, so the Box keeps the Table at a stable
-// address across Vec reallocation. Same signature shape as the sibling emit_*
-// helpers above.
-#[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
-pub(super) fn emit_gather_reduce(
-    raw_cols: &[(u64, u16, u64, u64)],
-    nid: i32,
-    reg_id: i32,
-    in_regs: &HashMap<i32, i32>,
-    builder: &mut ProgramBuilder,
-    state: &mut EmitState,
-    out_reg_of: &mut HashMap<i32, i32>,
-    reg_meta: &mut Vec<RegisterMeta>,
-    owned_tables: &mut Vec<Box<Table>>,
-    owned_trace_regs: &mut Vec<(u16, usize)>,
-    view_dir: &str,
-    view_table_id: u32,
-    view_id: u64,
-) {
-    let in_reg_id = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-    let partial_schema = reg_meta[in_reg_id as usize].schema;
-
-    let agg_specs: Vec<(u64, u64)> = raw_cols
-        .iter()
-        .filter(|(k, _, _, _)| *k == gnitz_wire::NODE_COL_KIND_AGG_SPEC)
-        .map(|(_, _, v1, v2)| (*v1, *v2))
-        .collect();
-    let agg_descs = build_gather_agg_descs(&partial_schema, &agg_specs);
-
-    let trace_table = match create_child_table(
-        state,
-        view_dir,
-        &format!("_gather_{view_id}_{nid}"),
-        partial_schema,
-        view_table_id,
-    ) {
-        Ok(t) => t,
-        Err(_) => {
-            state.emit_failed = true;
-            return;
-        }
-    };
-    let table_idx = owned_tables.len();
-    owned_tables.push(Box::new(trace_table));
-    let trace_table_ptr = &*owned_tables[table_idx] as *const Table as *mut Table;
-
-    reg_meta[reg_id as usize] = RegisterMeta::trace(partial_schema);
-    owned_trace_regs.push((reg_id as u16, table_idx));
-
-    let raw_delta_id = reg_meta.len() as i32;
-    reg_meta.push(RegisterMeta::delta(partial_schema));
-    out_reg_of.insert(nid, raw_delta_id);
-
-    builder.add_gather_reduce(in_reg_id as u16, reg_id as u16, raw_delta_id as u16, &agg_descs);
-    emit_simple_integrate(builder, raw_delta_id as u16, trace_table_ptr);
-}
-
 #[allow(clippy::too_many_arguments, clippy::vec_box)]
 pub(super) fn build_plan(
     loaded: &LoadedCircuit,
@@ -1183,7 +1059,7 @@ pub(super) fn build_plan(
 
     // Register ids are u16 instruction fields. `reg_meta` is sized to the base
     // register per node plus the exchange seeds here; the emitters push the extras
-    // on demand — ScanTrace/Distinct/Delay/GatherReduce push 1, Reduce up to 3
+    // on demand — ScanTrace/Distinct/Delay push 1, Reduce up to 3
     // (raw_delta + finalize + trace-in). Each node pushes at most 3, so reserving
     // `next_reg + 3 * ordered.len()` holds the whole program in a single
     // allocation, and that same bound — rejected here before the emit loop creates

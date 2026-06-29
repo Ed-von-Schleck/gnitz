@@ -17,7 +17,7 @@ use crate::types::{is_integer_type, is_min_max_orderable, is_wide_int};
 use crate::SqlResult;
 use gnitz_core::{
     CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, Schema, TypeCode, AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX,
-    AGG_MIN, AGG_SUM,
+    AGG_MIN, AGG_SUM, AGG_SUM_ZERO,
 };
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, SelectItem};
 
@@ -396,7 +396,50 @@ pub(crate) fn execute_create_group_by_view(
     // (COUNT=0, SUM/MIN/MAX/AVG=NULL). Grouped reduces (`group_col_indices`
     // non-empty) pass `false` and are byte-for-byte unchanged.
     let global_ground = group_col_indices.is_empty();
-    let reduced = if source_replicated {
+    // Two-phase (distributable) path for an all-linear, integer, partitioned GLOBAL
+    // aggregate: fold a per-worker partial locally (no exchange), then exchange only
+    // the ≤ N partials to V₀'s owner and combine them. A linear aggregate satisfies
+    // Agg(A+B)=Agg(A)+Agg(B), so this replaces the single-worker full-delta funnel.
+    // Float SUM (and AVG over a float, whose SUM component is float) is excluded:
+    // IEEE-754 addition is non-associative, so summing per-worker partials would make
+    // the result depend on the worker count — those keep the deterministic funnel.
+    // `two_phase ⊆ global_ground`: it is the distributable refinement of the
+    // ungrouped (empty group set) case, so it reuses that predicate.
+    let two_phase = global_ground
+        && !source_replicated
+        && all_linear
+        && !agg_specs.iter().any(|s| s.op == AGG_SUM && s.out_type.is_float());
+    let reduced = if two_phase {
+        // Phase 1 — per-worker local partial. No ExchangeShard, global_ground = false
+        // (a worker with no local rows contributes no partial, never a ground row).
+        // Output: [_group_pk:U128 (col 0, PK), agg0 (col 1), agg1 (col 2), ...].
+        let local = cb.reduce_multi_local(filtered, &[], &circuit_specs, false);
+
+        // Phase 2 (exchange) + Phase 3 (combine). reduce_multi inserts the single
+        // ExchangeShard(∅) routing every partial (all at PK V₀) to V₀'s owner, then
+        // the combine reduce sums each partial column: a COUNT/COUNT_NON_NULL partial
+        // sums with SumZero (Sum fold, 0 ground — a COUNT's empty value is 0, not
+        // NULL), a SUM partial with plain Sum (NULL ground). The user aggregate
+        // columns land at the same positions as the funnel reduce's, so the post-map
+        // is unchanged; the trailing COUNT-of-partials is the existence gate (the
+        // reduce's cardinality gate finds it via the lone AggOp::Count). global_ground
+        // = true: an empty global source emits exactly one ground row here.
+        let mut combine_specs: Vec<(u64, usize)> = circuit_specs
+            .iter()
+            .enumerate()
+            .map(|(i, (op, _))| {
+                let merge = match *op {
+                    AGG_COUNT | AGG_COUNT_NON_NULL => AGG_SUM_ZERO,
+                    AGG_SUM => AGG_SUM,
+                    _ => unreachable!("two_phase implies all-linear, integer specs"),
+                };
+                // Local output column `1 + i` holds local agg `i` (col 0 is _group_pk).
+                (merge, 1 + i)
+            })
+            .collect();
+        combine_specs.push((AGG_COUNT, 0)); // COUNT-of-partials existence gate
+        cb.reduce_multi(local, &[], &combine_specs, true)
+    } else if source_replicated {
         // Shard-free: every worker reduces its full local copy to the same global
         // aggregate (no ExchangeShard ⇒ no gather barrier, no N-fold sum).
         cb.reduce_multi_local(filtered, &reduce_group_cols, &circuit_specs, global_ground)

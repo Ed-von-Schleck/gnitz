@@ -209,7 +209,6 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             (OPCODE_NULL_EXTEND, None, None),
             encode_col_list(NODE_COL_KIND_NULL_EXT, type_codes),
         ),
-        OpNode::GatherReduce => ((OPCODE_GATHER_REDUCE, None, None), Vec::new()),
         OpNode::SeekTrace => ((OPCODE_SEEK_TRACE, None, None), Vec::new()),
         OpNode::ClearDeltas => ((OPCODE_CLEAR_DELTAS, None, None), Vec::new()),
         OpNode::PartitionFilter => ((OPCODE_PARTITION_FILTER, None, None), Vec::new()),
@@ -495,16 +494,21 @@ impl CircuitBuilder {
     }
 
     /// Shard-free multi-aggregate reduce: aggregates `input` **locally on every
-    /// worker** with NO upstream `ExchangeShard`.
+    /// worker** with NO upstream `ExchangeShard`. Two valid modes, distinguished by
+    /// `input`'s partitioning (the builder cannot type-enforce which):
     ///
-    /// **Precondition (a soft contract — the builder cannot type-enforce it):**
-    /// `input` must already be replicated/broadcast (byte-identical *contents* per
-    /// worker), so each worker's local reduce computes the SAME global aggregate.
-    /// Misused on a partitioned input it silently computes per-worker partials.
+    /// * **Replicated input** (byte-identical *contents* per worker): each worker's
+    ///   local reduce computes the SAME full global aggregate. Pass
+    ///   `global_ground = true` for the user's ungrouped scalar aggregate so each
+    ///   worker seeds the ground over an empty source.
+    /// * **Partitioned input** (the two-phase global aggregate, phase 1): each worker
+    ///   folds its own shard into a per-worker *partial*, which a downstream
+    ///   `reduce_multi` then exchanges (≤ N partials) and combines. Pass
+    ///   `global_ground = false` — a worker with no local rows must contribute no
+    ///   partial, never a spurious per-worker ground row.
     ///
-    /// `global_ground` is `true` only for the user's ungrouped scalar aggregate
-    /// over a replicated source; the LEFT range-join threshold reduce (also empty
-    /// group cols) passes `false` so it never seeds a spurious `(m=NULL)` row.
+    /// The LEFT range-join threshold reduce (also empty group cols) likewise passes
+    /// `false` so it never seeds a spurious `(m=NULL)` row.
     pub fn reduce_multi_local(
         &mut self,
         input: NodeId,

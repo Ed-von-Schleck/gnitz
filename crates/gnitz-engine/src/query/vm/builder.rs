@@ -414,17 +414,6 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn add_gather_reduce(&mut self, in_reg: u16, trace_out_reg: u16, out_reg: u16, agg_descs: &[AggDescriptor]) {
-        let (agg_off, agg_cnt) = self.add_agg_descs(agg_descs);
-        self.instructions.push(Instr::GatherReduce {
-            in_reg,
-            trace_out_reg,
-            out_reg,
-            agg_descs_offset: agg_off,
-            agg_descs_count: agg_cnt,
-        });
-    }
-
     // ── Build ────────────────────────────────────────────────────────────
 
     /// Consume the builder, producing a simple VmHandle (no owned resources).
