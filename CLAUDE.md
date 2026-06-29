@@ -9,7 +9,7 @@ gnitz is **pre-alpha** and not used in production anywhere because it has not be
 **Plans (`plans/`):**
 - Never cite a plan path/filename in code, tests, or comments.
 - Not ground truth: validate against source/tests/git; only edit the plan named for the task.
-- Authoring: state one committed design — no history, no optional/either-or, no "follow-on/future-work" (fold in, spin out a new plan, or drop); include validated snippets; never cross-link plans (state needed facts inline); out-of-scope bugs get their own plan.
+- Authoring: state one committed design — no history, no optional/either-or, no "follow-on/future-work" (fold in, spin out a new plan, or drop); include validated snippets; never cross-link plans (state needed facts inline); out-of-scope bugs get their own plan. When a plan is written, all decisions need to be made - no "gates" in plans are allowed.
 - Don't write memories about a specific plan (they're transient).
 
 GnitzDB-specific development guidelines are in the **GnitzDB Developer Guide**
