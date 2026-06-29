@@ -231,17 +231,13 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
     let is_join_view = loaded
         .nodes
         .values()
-        .any(|op| matches!(op, gnitz_wire::OpNode::Join(_) | gnitz_wire::OpNode::AntiJoin(_)));
+        .any(|op| matches!(op, gnitz_wire::OpNode::Join(_)));
     let feeds_trace_or_join = |nid: i32| {
         loaded.outgoing.get(&nid).is_some_and(|outs| {
             outs.iter().any(|&(d, _)| {
                 matches!(
                     loaded.nodes.get(&d),
-                    Some(
-                        gnitz_wire::OpNode::IntegrateTrace
-                            | gnitz_wire::OpNode::Join(_)
-                            | gnitz_wire::OpNode::AntiJoin(_)
-                    )
+                    Some(gnitz_wire::OpNode::IntegrateTrace | gnitz_wire::OpNode::Join(_))
                 )
             })
         })

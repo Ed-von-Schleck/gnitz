@@ -1,9 +1,6 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::{
-    GnitzClient, OPCODE_ANTI_JOIN_DELTA_DELTA, OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_DELTA,
-    OPCODE_JOIN_DELTA_TRACE, OPCODE_POSITIVE_PART,
-};
+use gnitz_core::{GnitzClient, OPCODE_JOIN_DELTA_TRACE, OPCODE_POSITIVE_PART};
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
@@ -784,21 +781,6 @@ fn test_set_op_distinct_join_free_circuit_shape() {
     for (vid, name) in [(except, "EXCEPT"), (intersect, "INTERSECT")] {
         let n = |op: u64| opcode_node_count(nodes, vid, op);
         assert_eq!(n(OPCODE_JOIN_DELTA_TRACE), 0, "{name} DISTINCT must have no equi join");
-        assert_eq!(
-            n(OPCODE_JOIN_DELTA_DELTA),
-            0,
-            "{name} DISTINCT must have no delta-delta join"
-        );
-        assert_eq!(
-            n(OPCODE_ANTI_JOIN_DELTA_TRACE),
-            0,
-            "{name} DISTINCT must have no anti-join (DT)"
-        );
-        assert_eq!(
-            n(OPCODE_ANTI_JOIN_DELTA_DELTA),
-            0,
-            "{name} DISTINCT must have no anti-join (DD)"
-        );
         assert_eq!(
             n(OPCODE_POSITIVE_PART),
             1,

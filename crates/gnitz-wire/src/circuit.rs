@@ -10,7 +10,7 @@ pub const OPCODE_MAP: u64 = 2;
 pub const OPCODE_NEGATE: u64 = 3;
 pub const OPCODE_UNION: u64 = 4;
 pub const OPCODE_JOIN_DELTA_TRACE: u64 = 5;
-pub const OPCODE_JOIN_DELTA_DELTA: u64 = 6;
+// 6 is a retired opcode (the removed fused inner ΔA⋈ΔB join); left a hole.
 pub const OPCODE_INTEGRATE: u64 = 7;
 pub const OPCODE_DELAY: u64 = 8;
 pub const OPCODE_REDUCE: u64 = 9;
@@ -20,12 +20,13 @@ pub const OPCODE_DISTINCT: u64 = 10;
 pub const OPCODE_SCAN_DELTA: u64 = 11;
 pub const OPCODE_SEEK_TRACE: u64 = 12;
 pub const OPCODE_CLEAR_DELTAS: u64 = 15;
-pub const OPCODE_ANTI_JOIN_DELTA_TRACE: u64 = 16;
-pub const OPCODE_ANTI_JOIN_DELTA_DELTA: u64 = 17;
+// 16 is a retired opcode (the removed anti-join delta-trace, last used by the
+//    decomposed equi LEFT-JOIN null-fill before it became positive_part); left a hole.
+// 17 is a retired opcode (the removed fused anti ΔA⋈ΔB join); left a hole.
 // 18, 19 are retired opcodes (the removed SemiJoin delta-trace / delta-delta); left a hole.
 pub const OPCODE_EXCHANGE_SHARD: u64 = 20;
 pub const OPCODE_EXCHANGE_GATHER: u64 = 21;
-pub const OPCODE_JOIN_DELTA_TRACE_OUTER: u64 = 22;
+// 22 is a retired opcode (the removed fused LEFT-outer join); left a hole.
 pub const OPCODE_NULL_EXTEND: u64 = 23;
 // 24 is a retired opcode (the removed GatherReduce placeholder); left a hole.
 /// Discriminates IntegrateTrace from IntegrateSink (OPCODE_INTEGRATE=7)
@@ -35,8 +36,7 @@ pub const OPCODE_INTEGRATE_TRACE: u64 = 25;
 pub const OPCODE_MAP_PROJ: u64 = 26;
 /// MAP sub-variant: expression program (compute) with optional PK reindex.
 pub const OPCODE_MAP_EXPR: u64 = 27;
-/// MAP sub-variant: drop payload, keep PK only.
-pub const OPCODE_MAP_KEY_ONLY: u64 = 28;
+// 28 is a retired opcode (the removed key-only MAP sub-variant); left a hole.
 /// MAP sub-variant: copy all columns to payload, set PK = hash of full row.
 pub const OPCODE_MAP_HASH_ROW: u64 = 29;
 /// Read-only trace source for join trace ports; never participates in cascade.
@@ -169,25 +169,12 @@ impl RangeRel {
     }
 }
 
-/// Join physical strategy. `DeltaTraceRange` keeps `JoinKind: Copy` (its fields
-/// are `Copy`). Only `OpNode::Join` carries this; the anti-join carries the
-/// narrower [`SetJoinKind`], so its outer/range forms are not merely "rejected
-/// in the planner" — the type cannot name them.
+/// Join physical strategy carried by `OpNode::Join`. `DeltaTraceRange` keeps
+/// `JoinKind: Copy` (its fields are `Copy`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinKind {
     DeltaTrace,
-    DeltaTraceOuter,
-    DeltaDelta,
     DeltaTraceRange { n_eq: u8, rel: RangeRel },
-}
-
-/// Physical strategy for anti-join. Narrower than [`JoinKind`]: the
-/// set-difference operator has no outer (null-fill) or range form, so the type
-/// cannot name one. Opcodes 16–17 already encode exactly this set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SetJoinKind {
-    DeltaTrace,
-    DeltaDelta,
 }
 
 /// MAP sub-variant discriminant.
@@ -211,8 +198,6 @@ pub enum MapKind {
         reindex_cols: Vec<u16>,
         reindex_target_tcs: Vec<u8>,
     },
-    /// Drop all payload columns, keep only PK and weight.
-    KeyOnly,
     /// Full-row-identity reindex. Like `Projection` (keep the listed columns as
     /// payload, in order), but the synthetic PK is set to a hash of the kept
     /// payload bytes. Used by EXCEPT/INTERSECT/DISTINCT so set membership is
@@ -261,7 +246,6 @@ pub enum OpNode {
         global_ground: bool,
     },
     Join(JoinKind),
-    AntiJoin(SetJoinKind),
     /// `OPCODE_INTEGRATE = 7`. Primary INTEGRATE: writes to view storage.
     IntegrateSink,
     /// `OPCODE_INTEGRATE_TRACE = 25`. Accumulates Z-set for join trace.
@@ -364,7 +348,6 @@ pub fn decode_op_node(
                 reindex_target_tcs,
             })
         }
-        OPCODE_MAP_KEY_ONLY => OpNode::Map(MapKind::KeyOnly),
         OPCODE_MAP_HASH_ROW => {
             let branch_id = cols
                 .iter()
@@ -400,8 +383,6 @@ pub fn decode_op_node(
             }
         }
         OPCODE_JOIN_DELTA_TRACE => OpNode::Join(JoinKind::DeltaTrace),
-        OPCODE_JOIN_DELTA_TRACE_OUTER => OpNode::Join(JoinKind::DeltaTraceOuter),
-        OPCODE_JOIN_DELTA_DELTA => OpNode::Join(JoinKind::DeltaDelta),
         OPCODE_JOIN_DELTA_TRACE_RANGE => {
             // n_eq + rel ride in a single NODE_COL_KIND_RANGE_JOIN row. Reject a
             // missing row or an unknown rel at this decode trust boundary rather
@@ -415,8 +396,6 @@ pub fn decode_op_node(
                 .ok_or_else(|| format!("JOIN_DELTA_TRACE_RANGE unknown rel {}", row.value2))?;
             OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel })
         }
-        OPCODE_ANTI_JOIN_DELTA_TRACE => OpNode::AntiJoin(SetJoinKind::DeltaTrace),
-        OPCODE_ANTI_JOIN_DELTA_DELTA => OpNode::AntiJoin(SetJoinKind::DeltaDelta),
         OPCODE_INTEGRATE => OpNode::IntegrateSink,
         OPCODE_INTEGRATE_TRACE => OpNode::IntegrateTrace,
         OPCODE_EXCHANGE_SHARD => OpNode::ExchangeShard {

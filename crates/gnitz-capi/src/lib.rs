@@ -1149,11 +1149,6 @@ pub unsafe extern "C" fn gnitz_circuit_join(cb: *mut GnitzCircuitBuilder, delta:
     check_ptr_mut!(cb, 0).0.join(delta, trace_table_id)
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_anti_join(cb: *mut GnitzCircuitBuilder, delta: u64, trace_table_id: u64) -> u64 {
-    check_ptr_mut!(cb, 0).0.anti_join(delta, trace_table_id)
-}
-
 /// Reduce with automatic shard insertion.
 /// group_cols: array of column indices, n_group_cols entries; may be NULL/0 for no grouping.
 #[no_mangle]

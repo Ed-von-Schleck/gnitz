@@ -76,18 +76,6 @@ pub(crate) enum Instr {
         out_reg: u16,
         right_schema_idx: u16,
     },
-    JoinDD {
-        a_reg: u16,
-        b_reg: u16,
-        out_reg: u16,
-        right_schema_idx: u16,
-    },
-    JoinDTOuter {
-        delta_reg: u16,
-        trace_reg: u16,
-        out_reg: u16,
-        right_schema_idx: u16,
-    },
     JoinDTRange {
         delta_reg: u16,
         trace_reg: u16,
@@ -101,16 +89,6 @@ pub(crate) enum Instr {
         out_reg: u16,
         worker_id: u32,
         num_workers: u32,
-    },
-    AntiJoinDT {
-        delta_reg: u16,
-        trace_reg: u16,
-        out_reg: u16,
-    },
-    AntiJoinDD {
-        a_reg: u16,
-        b_reg: u16,
-        out_reg: u16,
     },
     NullExtend {
         in_reg: u16,
@@ -957,69 +935,6 @@ mod tests {
         );
     }
 
-    // Item 9a: JoinDTOuter with an absent trace cursor must consolidate the
-    // delta before null-extending; downstream operators assert consolidated
-    // input.
-    #[test]
-    fn test_join_dt_outer_absent_trace_consolidates() {
-        let schema = schema_1i64();
-        // Raw, unconsolidated input: two identical (PK, payload) rows the operator
-        // must fold. Built inline (not via `make_batch`, which certifies
-        // Consolidated and would reject the duplicate).
-        let mut input = Batch::with_schema(schema, 2);
-        for _ in 0..2 {
-            input.extend_pk(2u128);
-            input.extend_weight(&1i64.to_le_bytes());
-            input.extend_null_bmp(&0u64.to_le_bytes());
-            input.extend_col(0, &20i64.to_le_bytes());
-            input.count += 1;
-        }
-        let mut builder = ProgramBuilder::new();
-        builder.add_join_dt_outer(0, 1, 2, schema);
-        builder.add_halt();
-        let reg_meta = [RegisterMeta::delta(schema); 3];
-        let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[])
-            .unwrap()
-            .unwrap();
-        assert!(
-            result.is_consolidated(),
-            "absent-trace outer-join output must be consolidated",
-        );
-    }
-
-    // Item 9b: AntiJoinDT with an absent trace cursor must consolidate the
-    // pass-through delta, not forward it raw.
-    #[test]
-    fn test_anti_join_dt_absent_trace_consolidates() {
-        let schema = schema_1i64();
-        // Raw, unconsolidated input: two identical (PK, payload) rows the operator
-        // must fold. Built inline (not via `make_batch`, which certifies
-        // Consolidated and would reject the duplicate).
-        let mut input = Batch::with_schema(schema, 2);
-        for _ in 0..2 {
-            input.extend_pk(2u128);
-            input.extend_weight(&1i64.to_le_bytes());
-            input.extend_null_bmp(&0u64.to_le_bytes());
-            input.extend_col(0, &20i64.to_le_bytes());
-            input.count += 1;
-        }
-        let mut builder = ProgramBuilder::new();
-        builder.add_anti_join_dt(0, 1, 2);
-        builder.add_halt();
-        let reg_meta = [RegisterMeta::delta(schema); 3];
-        let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[])
-            .unwrap()
-            .unwrap();
-        assert!(
-            result.is_consolidated(),
-            "absent-trace anti-join output must be consolidated",
-        );
-    }
-
     #[test]
     fn test_input_already_consolidated() {
         // Pre-consolidated input should not cause extra work.
@@ -1379,58 +1294,6 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_join_dt() {
-        // AntiJoinDT: keep delta rows that have NO match in trace.
-        let schema = schema_1i64();
-
-        let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("antijoin_test");
-        let mut table = Table::new(
-            tdir.to_str().unwrap(),
-            "trace",
-            schema,
-            0,
-            1 << 20,
-            crate::storage::Persistence::Ephemeral,
-        )
-        .unwrap();
-
-        // Trace has pk=1 and pk=3
-        let trace_batch = make_batch(schema, &[(1u128, 1, 100), (3u128, 1, 300)]);
-        table.ingest_owned_batch(trace_batch).unwrap();
-
-        let cursor = table.open_cursor();
-        let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
-
-        let mut builder = ProgramBuilder::new();
-        builder.add_anti_join_dt(0, 1, 2);
-        builder.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::trace(schema),
-            RegisterMeta::delta(schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(), ch, std::ptr::null_mut()];
-
-        // Delta has pk=1, pk=2, pk=3. Only pk=2 should survive anti-join.
-        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30)]);
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[])
-            .unwrap()
-            .unwrap();
-
-        let rows = extract_rows(&result);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, 2); // only pk=2 survives
-
-        unsafe {
-            drop(Box::from_raw(ch as *mut CursorHandle));
-        }
-        table.close();
-    }
-
-    #[test]
     fn test_reduce_sum_multi_tick() {
         // REDUCE with SUM aggregation over a group column.
         // Uses real tables for trace_out and trace_in.
@@ -1744,44 +1607,6 @@ mod tests {
     }
 
     #[test]
-    fn test_join_dd() {
-        // JoinDD: join two delta batches. Use filter(null) to copy input into
-        // both reg 1 and reg 2, then join them (self-join on same PK).
-        let schema = schema_1i64();
-        let join_schema = make_schema(&[type_code::I64, type_code::I64]);
-
-        let mut builder = ProgramBuilder::new();
-        // Copy input (reg 0) into reg 1 and reg 2 via null filters
-        builder.add_filter(0, 1, std::ptr::null());
-        builder.add_filter(0, 2, std::ptr::null());
-        // Self-join: reg 1 × reg 2
-        builder.add_join_dd(1, 2, 3, schema);
-        builder.add_halt();
-
-        let input = make_batch(schema, &[(10u128, 2, 100)]);
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::delta(schema),
-            RegisterMeta::delta(schema),
-            RegisterMeta::delta(join_schema),
-        ];
-        let vm = builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 4];
-        let result = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 3, &cursors, &[])
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result.count, 1);
-        let w = i64::from_le_bytes(result.weight_data()[0..8].try_into().unwrap());
-        assert_eq!(w, 4); // 2 * 2 (self-join weight multiplication)
-        let c0 = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
-        let c1 = i64::from_le_bytes(result.col_data(1)[0..8].try_into().unwrap());
-        assert_eq!(c0, 100);
-        assert_eq!(c1, 100);
-    }
-
-    #[test]
     fn test_program_builder_resource_dedup() {
         // Verify that adding the same func/table pointer twice reuses the same index.
         let schema = schema_1i64();
@@ -2032,78 +1857,6 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], (1, 1, 10));
         assert_eq!(rows[1], (2, 1, 20));
-    }
-
-    // ── Regression: AntiJoinDT with null trace cursor ────────────────────
-
-    /// AntiJoinDT semantics: if the trace is absent (null cursor), nothing is
-    /// excluded → all delta rows should pass through unchanged.
-    /// Bug: current code silently returns empty instead.
-    #[test]
-    fn test_anti_join_dt_null_cursor() {
-        let schema = schema_1i64();
-
-        let mut builder = ProgramBuilder::new();
-        // reg 0 = delta, reg 1 = trace (null cursor), reg 2 = output
-        builder.add_anti_join_dt(0, 1, 2);
-        builder.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::trace(schema),
-            RegisterMeta::delta(schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-
-        // Pass null for the trace register — simulates cursor-create failure or
-        // an empty table that could not produce a cursor handle.
-        let cursors = vec![std::ptr::null_mut(); 3];
-
-        let input = make_batch(schema, &[(1u128, 1, 10), (2u128, 1, 20), (3u128, 1, 30)]);
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[]).unwrap();
-
-        // With no trace to exclude against, all 3 delta rows must survive.
-        let result = result.expect("anti-join with null trace must pass all delta rows");
-        assert_eq!(
-            result.count, 3,
-            "all delta rows should survive when trace cursor is null"
-        );
-    }
-
-    /// JoinDTOuter semantics: if the trace is absent (null cursor), every delta
-    /// row has no right-side match → all should be null-extended.
-    /// Bug: current code silently returns empty instead.
-    #[test]
-    fn test_join_dt_outer_null_cursor() {
-        let left_schema = schema_1i64();
-        // right schema: same shape (one I64 payload col)
-        let right_schema = schema_1i64();
-        // outer join output: left col + right col (right cols will be null)
-        let out_schema = make_schema(&[type_code::I64, type_code::I64]);
-
-        let mut builder = ProgramBuilder::new();
-        // reg 0 = delta, reg 1 = trace (null cursor), reg 2 = output
-        builder.add_join_dt_outer(0, 1, 2, right_schema);
-        builder.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(left_schema),
-            RegisterMeta::trace(right_schema),
-            RegisterMeta::delta(out_schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-
-        let cursors = vec![std::ptr::null_mut(); 3];
-
-        let input = make_batch(left_schema, &[(1u128, 1, 10), (2u128, 1, 20)]);
-        let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 2, &cursors, &[]).unwrap();
-
-        // With no trace, outer join must null-extend all 2 delta rows.
-        let result = result.expect("outer join with null trace must null-extend all delta rows");
-        assert_eq!(
-            result.count, 2,
-            "all delta rows should be null-extended when trace cursor is null"
-        );
     }
 
     /// Proper SUM test: use agg_op=2 (AGG_SUM) and verify the actual aggregate

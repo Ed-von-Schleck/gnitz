@@ -304,41 +304,6 @@ pub(crate) fn execute_epoch_multi(
                 }
             }
 
-            Instr::JoinDD {
-                a_reg,
-                b_reg,
-                out_reg,
-                right_schema_idx,
-            } => {
-                let left_schema = reg!(*a_reg).schema;
-                let right_schema = &program.schemas[*right_schema_idx as usize];
-                let result =
-                    ops::op_join_delta_delta(&reg!(*a_reg).batch, &reg!(*b_reg).batch, &left_schema, right_schema);
-                reg_mut!(*out_reg).batch = result;
-            }
-
-            Instr::JoinDTOuter {
-                delta_reg,
-                trace_reg,
-                out_reg,
-                right_schema_idx,
-            } => {
-                let left_schema = reg!(*delta_reg).schema;
-                let right_schema = &program.schemas[*right_schema_idx as usize];
-                if let Some(cursor) = cursor_mut!(*trace_reg) {
-                    let result =
-                        ops::op_join_delta_trace_outer(&reg!(*delta_reg).batch, cursor, &left_schema, right_schema);
-                    reg_mut!(*out_reg).batch = result;
-                } else {
-                    // Absent trace ⟹ every delta row has no right-side match → null-extend.
-                    // op_null_extend requires consolidated input.
-                    let cs = Batch::consolidate_if_needed(&reg!(*delta_reg).batch, &left_schema);
-                    let consolidated = cs.as_ref().unwrap_or(&reg!(*delta_reg).batch);
-                    let result = ops::op_null_extend(consolidated, &left_schema, right_schema);
-                    reg_mut!(*out_reg).batch = result;
-                }
-            }
-
             Instr::JoinDTRange {
                 delta_reg,
                 trace_reg,
@@ -372,33 +337,6 @@ pub(crate) fn execute_epoch_multi(
             } => {
                 let schema = reg!(*in_reg).schema;
                 let result = ops::op_partition_filter(&reg!(*in_reg).batch, &schema, *worker_id, *num_workers);
-                reg_mut!(*out_reg).batch = result;
-            }
-
-            Instr::AntiJoinDT {
-                delta_reg,
-                trace_reg,
-                out_reg,
-            } => {
-                let schema = reg!(*delta_reg).schema;
-                if let Some(cursor) = cursor_mut!(*trace_reg) {
-                    let result = ops::op_anti_join_delta_trace(&reg!(*delta_reg).batch, cursor, &schema);
-                    reg_mut!(*out_reg).batch = result;
-                } else {
-                    // Absent trace ⟹ nothing to exclude; pass delta through, but
-                    // consolidate so downstream operators receive consolidated input.
-                    let npc = reg!(*delta_reg).batch.num_payload_cols();
-                    let stride = schema.pk_stride();
-                    let batch = std::mem::replace(&mut reg_mut!(*delta_reg).batch, Batch::empty(npc, stride));
-                    let cs = Batch::consolidate_if_needed(&batch, &schema);
-                    let consolidated = cs.unwrap_or(batch);
-                    reg_mut!(*out_reg).batch = consolidated;
-                }
-            }
-
-            Instr::AntiJoinDD { a_reg, b_reg, out_reg } => {
-                let schema = reg!(*a_reg).schema;
-                let result = ops::op_anti_join_delta_delta(&reg!(*a_reg).batch, &reg!(*b_reg).batch, &schema);
                 reg_mut!(*out_reg).batch = result;
             }
 

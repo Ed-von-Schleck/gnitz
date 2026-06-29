@@ -27,10 +27,7 @@ pub(crate) use index::{op_integrate_with_indexes, AviDesc};
 // Facade for the AVI schema builder + AVI key layout, so out-of-ops callers
 // (compiler, master) reach `crate::ops::X`, not the internals.
 pub(crate) use index::make_avi_schema;
-pub(crate) use join::{
-    op_anti_join_delta_delta, op_anti_join_delta_trace, op_join_delta_delta, op_join_delta_trace,
-    op_join_delta_trace_outer, op_join_delta_trace_range,
-};
+pub(crate) use join::{op_join_delta_trace, op_join_delta_trace_range};
 pub(crate) use linear::{op_filter, op_map, op_negate, op_null_extend, op_union};
 pub(crate) use reduce::is_single_col_natural_pk;
 pub(crate) use reduce::{op_reduce, AggDescriptor, AggOp};

@@ -615,16 +615,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Anti-join DT: cursor re-seek for same-PK rows
+    // Band/range-join test fixtures (OPK-ordered batches)
     // -----------------------------------------------------------------------
 
     /// Build a band-join trace/delta over the `(U64 k, U64 range)` compound PK
     /// using OPK (big-endian) encoding, so memcmp on the PK region is numeric
-    /// order — the contract the range probe relies on. Rows must be passed in
-    /// ascending `(k, range)` order. (`make_compound_batch` writes native LE
-    /// bytes, correct only for the equality DD joins that compare PKs for
-    /// equality, not the range probe that compares them for order.)
-    /// Range-join inputs need only be (PK, payload)-sorted: the walk handles
+    /// order — the contract the range probe relies on (an order-blind native-LE
+    /// encoding would seek wrong). Rows must be passed in ascending `(k, range)`
+    /// order. Range-join inputs need only be (PK, payload)-sorted: the walk handles
     /// tombstones (weight 0) and multiset duplicates explicitly, so the rows are
     /// flagged `Sorted`, not `Consolidated` — the contract the data actually meets.
     fn make_band_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> Batch {

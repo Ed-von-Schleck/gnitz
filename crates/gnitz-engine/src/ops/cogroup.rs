@@ -1,8 +1,8 @@
 //! Sorted-stream co-group merge skeletons.
 //!
 //! Every place the engine merges two sorted OPK-byte streams — the delta-trace
-//! joins, distinct, the natural-PK reduce reads, the delta-delta joins, and the
-//! symmetric set-union merge — is one operation: **co-group two sorted byte-key
+//! joins, distinct, the natural-PK reduce reads, and the symmetric set-union
+//! merge — is one operation: **co-group two sorted byte-key
 //! streams** by equal PK, hand each `(key, left-group, right-group)` to the
 //! operator. These skeletons own that control flow; the operator callback owns
 //! the row copy. The skip step galloping-seeks from the live position
@@ -17,8 +17,9 @@ use crate::storage::{pk_bytes_eq, Batch, ReadCursor};
 /// A sorted OPK-byte stream with a galloping forward skip. `ReadCursor`
 /// implements it via `advance_to` (seeding each source at its live position); a
 /// [`BatchCursor`] implements it via `Batch::advance_to` over the batch rows —
-/// so the delta-delta joins co-group through the same skeleton as the
-/// delta-trace joins. The skeletons own the control flow with just these two
+/// so the symmetric set-union merge co-groups two delta batches through the same
+/// skeleton the delta-trace joins use against a trace. The skeletons own the
+/// control flow with just these two
 /// operations; the per-group walk that reads weights/payloads is the operator
 /// callback's concern, done through the concrete cursor's own accessors.
 pub(crate) trait SortedKeyStream {
@@ -143,8 +144,7 @@ pub(crate) fn cogroup_intersection<M: SortedKeyStream>(
 
 /// Left co-group: visit **every** delta group (the match side galloping-skips to
 /// it), because the operator emits per delta key whether or not the match group
-/// exists. Outer join (null-fill on an empty group), anti join, distinct,
-/// reduce, anti DD.
+/// exists. Used by distinct.
 ///
 /// **Callback contract.** Same as [`cogroup_intersection`]: `on_group` walks the
 /// forward-only `m` over the match group (possibly empty) and must walk the

@@ -419,62 +419,15 @@ impl ReadCursor {
         pk_bytes_eq(self.current_pk_bytes(), key_bytes)
     }
 
-    /// Walk the equal-PK group at the current position to its end, reporting
-    /// whether any entry has positive weight — i.e. whether `key` is a member of
-    /// `Distinct(trace)`. An uncompacted trace may present a tombstone
-    /// (weight ≤ 0) *before* a live row, so the whole group is scanned, not just
-    /// its head. Consumes the group: on return the cursor sits at the first row
-    /// past it, satisfying the co-group callback's "walk the whole group"
-    /// contract. `key` is the group's OPK bytes (the `key` handed to a
-    /// `cogroup_left`/`cogroup_intersection` callback).
-    pub fn group_has_positive(&mut self, key: &[u8]) -> bool {
-        let mut present = false;
-        self.walk_pk_group(key, |w| present |= w > 0);
-        present
-    }
-
-    /// Walk the equal-`key` PK group from the current position to its end,
-    /// invoking `f` with each non-ghost `(PK, payload)` sub-group's **net**
-    /// weight — exactly the rows the old `while current_pk_eq { advance }` loop
-    /// observed, one per consolidated sub-group (never the whole PK group summed,
-    /// which would mis-report a group whose payloads' weights offset). The
-    /// comparator dispatch is hoisted out of the per-row loop. On return the
-    /// cursor sits at the first row past the group with every `current_*` field
-    /// committed (or `valid == false` at end of source) — the same postcondition
-    /// the replaced loop left, which the next co-group `key()` / loop guard reads.
-    fn walk_pk_group<F: FnMut(i64)>(&mut self, key: &[u8], mut f: F) {
-        // Single bypass: a tight position scan reading only `get_weight` /
-        // `get_pk_bytes` (the cursor-free floor's cost), skipping the per-row
-        // `current_*` materialization (null word, entry idx, …).
-        // The terminating `drive_single` commits the exit row so the
-        // postcondition holds. This is the cogroup-benchmark's hot path.
-        if matches!(self.mode, SourceMode::Single) {
-            while self.states[0].is_valid() {
-                let pos = self.states[0].position;
-                if !pk_bytes_eq(self.sources[0].get_pk_bytes(pos), key) {
-                    break;
-                }
-                f(self.sources[0].get_weight(pos));
-                self.states[0].advance(&self.sources[0]);
-            }
-            self.drive_single();
-            return;
-        }
-        // Empty / Multi: the per-row-commit walk with the comparator dispatch
-        // hoisted out of the advance loop (Empty's guard fails on `!valid`). The
-        // Multi heap fold dominates the per-row `current_*` commit, so a lean
-        // emit there saves little; correctness and the dispatch hoist are the win.
-        self.for_each_pk_group_row(key, |c| f(c.current_weight));
-    }
-
     /// Walk the equal-`key` PK group, invoking `f(&*self)` at each emitted row so
     /// the callback can read the current trace row's columns / weight (e.g.
-    /// `write_join_row`, `push_current_row`). Unlike [`walk_pk_group`] this commits
-    /// `current_*` per row (the callback reads through it), but hoists the
-    /// `with_row_cmp!` dispatch out of the loop. `f` must not
-    /// re-enter the cursor. Same exit postcondition and `(PK, payload)`-sub-group
-    /// granularity as [`walk_pk_group`]; same group-walk contract as the
-    /// `while current_pk_eq { advance }` loops it replaces.
+    /// `write_join_row`, `push_current_row`). Commits `current_*` per row (the
+    /// callback reads through it), but hoists the `with_row_cmp!` dispatch out of
+    /// the loop. `f` must not re-enter the cursor. On return the cursor sits at the
+    /// first row past the group (or `valid == false` at end of source) with every
+    /// `current_*` field committed, at `(PK, payload)`-sub-group granularity — the
+    /// same group-walk contract as the `while current_pk_eq { advance }` loops it
+    /// replaces.
     pub(crate) fn for_each_pk_group_row<F: FnMut(&ReadCursor)>(&mut self, key: &[u8], f: F) {
         with_row_cmp!(
             self.schema,
@@ -1808,75 +1761,7 @@ mod tests {
         assert_eq!(out.count, 0, "invalid cursor copy must not write a row");
     }
 
-    // -- Phase A: walk_pk_group / for_each_pk_group_row --------------------
-
-    /// `group_has_positive` must fold per `(PK, payload)` sub-group, never sum
-    /// the whole PK group: a group with one payload at net +1 and another at net
-    /// −1 is *present* (the +1 payload is live), yet a whole-group sum (0) would
-    /// report it absent. Pinned for both the Single lean scan and the Multi fold.
-    #[test]
-    fn group_has_positive_offsetting_payloads_is_present() {
-        let schema = make_schema_i64();
-        // Single source, pre-consolidated: PK=5 payload 100 @ +1, payload 200 @ −1.
-        let single = make_batch(&[(5, 1, 100), (5, -1, 200)]);
-        let mut c = create_read_cursor(std::slice::from_ref(&single), &[], schema);
-        assert!(
-            c.group_has_positive(&5u128.to_be_bytes()),
-            "Single: the +1 payload is live; a whole-group sum (0) reports absent"
-        );
-
-        // Multi source: the +1 and −1 payloads arrive in different batches, so the
-        // heap fold (drive) produces the two sub-groups — the path a "sum the PK
-        // group" regression would corrupt.
-        let b1 = make_batch(&[(5, 1, 100)]);
-        let b2 = make_batch(&[(5, -1, 200)]);
-        let mut c = create_read_cursor(&[b1, b2], &[], schema);
-        assert!(
-            c.group_has_positive(&5u128.to_be_bytes()),
-            "Multi: per-(PK,payload) fold must keep the +1 payload visible"
-        );
-    }
-
-    /// After walking the equal-PK group at `key`, the cursor's committed
-    /// `current_*` must equal a from-scratch `seek_bytes(next_key)` — `next_key`
-    /// being the first PK strictly past the group. This is what catches a wrong
-    /// exit-state commit (e.g. a naive heap-root peek) that would corrupt the
-    /// next co-group group's `key()` / loop guard.
-    fn assert_walk_exit_matches_seek(sources: &[Rc<Batch>], key: u128, next_key: u128) {
-        let schema = make_schema_i64();
-        let mut walked = create_read_cursor(sources, &[], schema);
-        walked.advance_to(&key.to_be_bytes()); // position at the group head, as a co-group does
-        walked.group_has_positive(&key.to_be_bytes());
-
-        let mut fresh = create_read_cursor(sources, &[], schema);
-        fresh.seek_bytes(&next_key.to_be_bytes());
-
-        assert_eq!(walked.valid, fresh.valid, "valid after walk(key={key})");
-        if walked.valid {
-            assert_eq!(
-                walked.current_pk_bytes(),
-                fresh.current_pk_bytes(),
-                "pk_bytes key={key}"
-            );
-            assert_eq!(walked.current_weight, fresh.current_weight, "weight key={key}");
-            assert_eq!(walked.current_null_word, fresh.current_null_word, "null_word key={key}");
-        }
-    }
-
-    #[test]
-    fn group_has_positive_exit_state_matches_fresh_seek() {
-        // Single source: walk a mid group (→ lands on PK=10) and the last group
-        // (→ exhausts). The −1 payload at PK=5 exercises the tombstone-before-end.
-        let single = make_batch(&[(5, 1, 100), (5, -1, 200), (10, 1, 1000), (10, 1, 2000)]);
-        assert_walk_exit_matches_seek(std::slice::from_ref(&single), 5, 10);
-        assert_walk_exit_matches_seek(std::slice::from_ref(&single), 10, 11);
-
-        // Multi source: same PKs split across batches (the heap-fold path).
-        let b1 = make_batch(&[(5, 1, 100), (10, 1, 1000)]);
-        let b2 = make_batch(&[(5, -1, 200), (10, 1, 2000)]);
-        assert_walk_exit_matches_seek(&[Rc::clone(&b1), Rc::clone(&b2)], 5, 10);
-        assert_walk_exit_matches_seek(&[b1, b2], 10, 11);
-    }
+    // -- Phase A: for_each_pk_group_row ------------------------------------
 
     /// `for_each_pk_group_row` visits one entry per non-ghost (PK, payload)
     /// sub-group with `current_*` committed (the callback reads columns/weight),

@@ -192,8 +192,6 @@ uint64_t gnitz_circuit_distinct(GnitzCircuitBuilder *cb, uint64_t input);
 
 uint64_t gnitz_circuit_join(GnitzCircuitBuilder *cb, uint64_t delta, uint64_t trace_table_id);
 
-uint64_t gnitz_circuit_anti_join(GnitzCircuitBuilder *cb, uint64_t delta, uint64_t trace_table_id);
-
 uint64_t gnitz_circuit_reduce(GnitzCircuitBuilder *cb,
                               uint64_t input,
                               const size_t *group_cols,

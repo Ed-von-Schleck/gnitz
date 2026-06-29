@@ -124,9 +124,7 @@ pub(super) fn is_join_trace_side(loaded: &LoadedCircuit, nid: i32) -> bool {
                     port == PORT_TRACE
                         && matches!(
                             loaded.nodes.get(&dst),
-                            Some(gnitz_wire::OpNode::Join(_))
-                                | Some(gnitz_wire::OpNode::AntiJoin(_))
-                                | Some(gnitz_wire::OpNode::SeekTrace)
+                            Some(gnitz_wire::OpNode::Join(_)) | Some(gnitz_wire::OpNode::SeekTrace)
                         )
                 })
         })
@@ -204,9 +202,7 @@ pub(super) fn emit_node(
                                 port == PORT_TRACE
                                     && matches!(
                                         loaded.nodes.get(&dst),
-                                        Some(gnitz_wire::OpNode::Join(_))
-                                            | Some(gnitz_wire::OpNode::AntiJoin(_))
-                                            | Some(gnitz_wire::OpNode::SeekTrace)
+                                        Some(gnitz_wire::OpNode::Join(_)) | Some(gnitz_wire::OpNode::SeekTrace)
                                     )
                             })
                         }),
@@ -405,16 +401,6 @@ pub(super) fn emit_node(
                     reg_meta[reg_id as usize] = RegisterMeta::delta(schema);
                     builder.add_map(in_reg as u16, reg_id as u16, fp, schema, &[], &[], false, 0);
                 }
-
-                gnitz_wire::MapKind::KeyOnly => {
-                    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_PK_COLUMNS];
-                    let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
-                    let pk_len = copy_pk_columns_into(&in_reg_schema, &mut cols, &mut pk_idx);
-                    let s = SchemaDescriptor::new(&cols[..pk_len], &pk_idx[..pk_len]);
-                    let fp = create_universal_projection(&[], &[], &in_reg_schema, &s, owned_funcs);
-                    reg_meta[reg_id as usize] = RegisterMeta::delta(s);
-                    builder.add_map(in_reg as u16, reg_id as u16, fp, s, &[], &[], false, 0);
-                }
             }
         }
 
@@ -524,19 +510,6 @@ pub(super) fn emit_node(
                         RegisterMeta::delta(merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None));
                     builder.add_join_dt(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
                 }
-                gnitz_wire::JoinKind::DeltaTraceOuter => {
-                    reg_meta[reg_id as usize] = RegisterMeta::delta(merge_schemas_for_join(
-                        &a_schema,
-                        &b_schema,
-                        JoinNullFill::RightNullable,
-                    ));
-                    builder.add_join_dt_outer(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
-                }
-                gnitz_wire::JoinKind::DeltaDelta => {
-                    reg_meta[reg_id as usize] =
-                        RegisterMeta::delta(merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None));
-                    builder.add_join_dd(a_reg as u16, b_reg as u16, reg_id as u16, b_schema);
-                }
                 gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => {
                     // Same output layout as the equi delta-trace join; only the
                     // probe differs. `n_eq`/`rel` ride to the op so it can derive
@@ -544,20 +517,6 @@ pub(super) fn emit_node(
                     reg_meta[reg_id as usize] =
                         RegisterMeta::delta(merge_schemas_for_join(&a_schema, &b_schema, JoinNullFill::None));
                     builder.add_join_dt_range(a_reg as u16, b_reg as u16, reg_id as u16, b_schema, *n_eq, *rel);
-                }
-            }
-        }
-
-        gnitz_wire::OpNode::AntiJoin(kind) => {
-            let a_reg = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
-            let b_reg = in_regs.get(&PORT_TRACE).copied().unwrap_or(0);
-            reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[a_reg as usize].schema);
-            match kind {
-                gnitz_wire::SetJoinKind::DeltaTrace => {
-                    builder.add_anti_join_dt(a_reg as u16, b_reg as u16, reg_id as u16);
-                }
-                gnitz_wire::SetJoinKind::DeltaDelta => {
-                    builder.add_anti_join_dd(a_reg as u16, b_reg as u16, reg_id as u16);
                 }
             }
         }
@@ -934,8 +893,7 @@ pub(super) fn build_plan(
 
     // Destructive-register ordering invariant. `Union`, `Distinct`, `PositivePart`,
     // and `Delay` empty their PORT_IN register in place (std::mem::replace/swap with
-    // an empty batch, to avoid allocation); the trace-absent `AntiJoin(DeltaTrace)` branch
-    // does the same to its PORT_IN_A delta input. Every node has one output register
+    // an empty batch, to avoid allocation). Every node has one output register
     // shared by all its consumers, so a register that fans into both a
     // non-destructive reader (e.g. integrate_trace) and a destructive consumer is
     // correct only if the destructive op runs LAST among that register's consumers —
@@ -957,13 +915,11 @@ pub(super) fn build_plan(
             continue;
         }
         // Ops that destructively empty an input register, and the port they empty.
-        // (Union's in_a and AntiJoinDT's delta side are both PORT_IN_A == PORT_IN.)
         let dtor_port = match loaded.nodes.get(&nid) {
             Some(gnitz_wire::OpNode::Distinct)
             | Some(gnitz_wire::OpNode::PositivePart)
             | Some(gnitz_wire::OpNode::Union)
             | Some(gnitz_wire::OpNode::Delay) => Some(PORT_IN),
-            Some(gnitz_wire::OpNode::AntiJoin(gnitz_wire::SetJoinKind::DeltaTrace)) => Some(PORT_IN_A),
             _ => None,
         };
         let Some(port) = dtor_port else { continue };

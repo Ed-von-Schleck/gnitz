@@ -158,10 +158,11 @@ pub(crate) fn execute_create_join_view(
 
     // LEFT/OUTER + residual is rejected (§3): for an outer join the ON predicate is
     // part of the *match* condition — a preserved-side row whose only physical
-    // matches all fail the residual must still null-fill, but two of the three
-    // null-fill constructions (equi, pure-range) are keyed independently of the
-    // inner output and so would not retro-null-fill. A consistent boundary beats an
-    // inconsistent partial one; INNER residuals are fully supported.
+    // matches all fail the residual must still null-fill, but the pure-range
+    // null-fill decides match existence from the MAX/MIN threshold witness,
+    // independently of the inner output, and so would not retro-null-fill a row
+    // matched only by residual-failing pairs. A consistent boundary across all join
+    // shapes beats an inconsistent partial one; INNER residuals are fully supported.
     if is_left_join && !residual.is_empty() {
         return Err(GnitzSqlError::Unsupported(
             "LEFT/OUTER JOIN with a residual ON predicate (a non-equi/non-range \
@@ -173,24 +174,12 @@ pub(crate) fn execute_create_join_view(
     }
 
     // Range (band) join: one range conjunct (optionally behind equality
-    // conjuncts) routes to the broadcast / re-key / output-exchange circuit.
+    // conjuncts) routes to the broadcast / re-key / output-exchange circuit. The
+    // band LEFT null-fill is the weight-exact `positive_part(A − π_A(inner))`, so a
+    // bag-valued preserved (left) side — a view, a UNION ALL dropping the PK — is
+    // correct and needs no base-table guard (`positive_part` subtracts the raw
+    // matched multiplicity and clamps the result, never over-filling).
     if let Some(range) = range_conjunct {
-        // Band (n_eq >= 1) LEFT null-fill is `A − distinct(π_A(inner))`; `distinct` clamps
-        // each matched left identity to weight 1, so it is weight-exact only when the
-        // preserved (left) side's identities are unique — true for a unique_pk base table,
-        // but a view can be bag-valued (e.g. a UNION ALL dropping the PK), leaking a spurious
-        // null-fill. `resolve_table_id` hits TABLE_TAB only, so a view/CTE misses it (the same
-        // discriminator `resolve_base_table` uses). Pure-range LEFT (n_eq == 0) is unaffected.
-        let n_eq = left_join_cols.len();
-        if is_left_join && n_eq >= 1 && client.resolve_table_id(schema_name, &left_name).is_err() {
-            return Err(GnitzSqlError::Unsupported(
-                "band LEFT JOIN does not currently support a non-base-table preserved \
-                 (left) side (e.g. a view); its null-fill clamps matched multiplicity to \
-                 1, over-filling a bag-valued input — use INNER JOIN or a base table on \
-                 the left"
-                    .into(),
-            ));
-        }
         return build_range_join_view(
             client,
             schema_name,
@@ -243,9 +232,6 @@ pub(crate) fn execute_create_join_view(
     let left_n = left_schema.columns.len();
     let right_n = right_schema.columns.len();
 
-    // Right-side type codes for null-extend (used by LEFT-join null fills).
-    let right_col_tcs: Vec<u64> = right_schema.columns.iter().map(|c| c.type_code as u64).collect();
-
     // A NULL equi-join key must match nothing (SQL 3VL: NULL = anything, including
     // NULL = NULL, is unknown). map_reindex would promote a NULL integer key to
     // synthetic PK 0 and a NULL string to the empty-content hash 0, colliding with
@@ -270,41 +256,27 @@ pub(crate) fn execute_create_join_view(
     };
     let reindex_b = cb.map_reindex(input_b, &right_join_cols, &right_target_tcs, right_reindex_prog);
 
-    // Preserved (left) side.
-    //   INNER join: a left row with any NULL key component matches nothing — drop it.
-    //   LEFT  join: such a row must still be emitted with NULL right columns but must
-    //               bypass the match (else it collides with a right 0/"" key and
-    //               pollutes trace_a, corrupting join_ba and the ΔB null-fill
-    //               correction). Split it out, reindex it to the synthetic join PK
-    //               (so it is layout-compatible with the join output — a bare Filter
-    //               would keep the left table's native PK stride and corrupt the
-    //               downstream Union, which merges by raw PK bytes into one stride),
-    //               null-extend it, and union it into the unmatched-left stream.
-    //               Its NULL components pack to 0 bytes, which is harmless: the source
-    //               columns are among the copied payload and compare_rows treats
-    //               NULL ≠ 0, so it never merges with a real-0-key row.
-    let (input_a_match, left_null_filled) = if !left_key_nullable {
-        (input_a, None)
-    } else {
-        let left_not_null = cb.filter(
+    // Preserved (left) side. A left row with any NULL key component matches nothing
+    // (SQL 3VL), so it is dropped from the inner match on BOTH join kinds — it would
+    // otherwise collide with a real 0/"" key and pollute `trace_a`. For a LEFT join
+    // such a row is still null-filled, but via the `a_all` term below (which re-keys
+    // the FULL `input_a`, NULL-keyed rows included), not a dedicated bypass: a
+    // NULL-keyed row is never in `inner`, so `π_A(inner)` is 0 for it and
+    // `positive_part(A − π_A(inner)) = w_A` null-fills it at full multiplicity.
+    let input_a_match = if left_key_nullable {
+        cb.filter(
             input_a,
             Some(multi_null_filter_prog(&left_join_cols, &left_schema, false)?),
-        );
-        if !is_left_join {
-            (left_not_null, None)
-        } else {
-            let left_null = cb.filter(
-                input_a,
-                Some(multi_null_filter_prog(&left_join_cols, &left_schema, true)?),
-            );
-            // MUST use the same left_target_tcs and reindex program as reindex_a,
-            // else this branch reindexes at the source width and the downstream
-            // UNION merges two different `_join_pk` strides.
-            let left_null_ri = cb.map_reindex(left_null, &left_join_cols, &left_target_tcs, left_reindex_prog.clone());
-            (left_not_null, Some(cb.null_extend(left_null_ri, &right_col_tcs)))
-        }
+        )
+    } else {
+        input_a
     };
-    let reindex_a = cb.map_reindex(input_a_match, &left_join_cols, &left_target_tcs, left_reindex_prog);
+    let reindex_a = cb.map_reindex(
+        input_a_match,
+        &left_join_cols,
+        &left_target_tcs,
+        left_reindex_prog.clone(),
+    );
 
     let trace_a = cb.integrate_trace(reindex_a);
     let trace_b = cb.integrate_trace(reindex_b);
@@ -315,33 +287,45 @@ pub(crate) fn execute_create_join_view(
     let inner_merged = normalize_to_ab(&mut cb, join_ab, join_ba, k, left_n, right_n);
 
     let merged = if is_left_join {
-        // Decomposed LEFT OUTER JOIN: inner ∪ (anti_join × null_right) ∪ null-key bypass.
-        // This handles both ΔA and ΔB correctly.
+        // LEFT OUTER null-fill: ν = positive_part(A − π_A(inner)), keyed by the join
+        // key `_join_pk` (a.pk rides in the A payload as the disambiguator).
+        //
+        // `proj_a` re-projects the inner output to [_join_pk, A] (drops the B cols);
+        // `a_all` re-keys the FULL `input_a` (every left row, NULL-keyed included) to
+        // the IDENTICAL [_join_pk, A] encoding — the same `left_target_tcs` and reindex
+        // program as `reindex_a`, so the `_join_pk` strides match byte-for-byte and a
+        // matched row's +w_A and −m (= −w_A·S) cancel before the clamp. The arm-4
+        // join-shard scatter routes `input_a` by the join key, so `a_all` and the inner
+        // output are co-located on the `_join_pk` worker — no exchange (the inner join
+        // needs none either). `positive_part` subtracts the RAW matched multiplicity
+        // (weight-exact for a bag-valued left input) and absorbs both the within-epoch
+        // ΔA/Δπ_A(inner) simultaneity and the cross-epoch ΔB-match transient.
+        // `cb.map` projection indices are full-column (the k `_join_pk` PK cols are
+        // 0..k; the A‖B payload starts at k), so the A region is k..k+left_n.
+        let a_payload_cols: Vec<usize> = (k..k + left_n).collect();
+        let proj_a = cb.map(inner_merged, &a_payload_cols); // [_join_pk, A]
 
-        // Key-only B: strip payload, keep only join key PK for distinct tracking
-        let key_only_b = cb.map_key_only(reindex_b);
-        let distinct_b = cb.distinct(key_only_b);
-        let trace_db = cb.integrate_trace(distinct_b);
-
-        // ΔA null-fill path: left rows whose join key has no match in I(distinct(B))
-        let antijoin_a = cb.anti_join_with_trace_node(reindex_a, trace_db);
-        let null_filled_a = cb.null_extend(antijoin_a, &right_col_tcs);
-
-        // ΔB correction path: when B key appears/disappears, adjust null-fills
-        // join_dt(distinct_b, trace_a) gives (key, A_payload) for affected left rows
-        // distinct_b emits +1 when key appears → negate → -1 → retract null-fill
-        // distinct_b emits -1 when key disappears → negate → +1 → emit null-fill
-        let correction_raw = cb.join_with_trace_node(distinct_b, trace_a);
-        let correction = cb.negate(correction_raw);
-        let null_filled_correction = cb.null_extend(correction, &right_col_tcs);
-
-        let mut all_null_fills = cb.union(null_filled_a, null_filled_correction);
-        // NULL-key left rows bypass the match entirely (SQL 3VL) but are still
-        // emitted once as (left payload, NULL right) via this reindexed branch.
-        if let Some(f) = left_null_filled {
-            all_null_fills = cb.union(all_null_fills, f);
-        }
-        cb.union(inner_merged, all_null_fills)
+        // Non-nullable left key ⟹ `input_a_match == input_a`, so re-keying `input_a`
+        // here is byte-identical to `reindex_a` (same cols, tcs, program) — reuse that
+        // node rather than emit a second full-width re-key of ΔA every tick. Only the
+        // nullable case needs its own node: `reindex_a` is built off the NULL-filtered
+        // `input_a_match` (kept out of `trace_a`), whereas `a_all` must re-key the
+        // UNFILTERED `input_a` so NULL-keyed rows still null-fill.
+        let a_all = if left_key_nullable {
+            cb.map_reindex(input_a, &left_join_cols, &left_target_tcs, left_reindex_prog)
+        } else {
+            reindex_a
+        };
+        let neg = cb.negate(proj_a);
+        // `a_all` may alias `reindex_a` (read non-destructively by trace_a + join_ab), so
+        // it rides the non-destructive PORT_IN_B operand; `op_union` empties PORT_IN_A.
+        let diff = cb.union(neg, a_all); // −π_A(inner) + A
+        let nu = cb.positive_part(diff); // max(0, A − π_A(inner))
+        let right_col_tcs: Vec<u64> = right_schema.columns.iter().map(|c| c.type_code as u64).collect();
+        let null_fill = cb.null_extend(nu, &right_col_tcs);
+        // `inner_merged` also feeds `proj_a`, so ride it on the non-destructive PORT_IN_B
+        // operand — the union must not empty a register `proj_a` still reads.
+        cb.union(null_fill, inner_merged)
     } else {
         inner_merged
     };
@@ -842,12 +826,15 @@ fn build_range_join_view(
                 nf_match
             }
         } else {
-            // ── Band set-difference form (plan §3) ──────────────────────────────
-            // nf = A − distinct(π_A(inner)). The matched left rows (with full A
-            // payload) are read straight off the inner output, so this is a pure
-            // Z-set difference; the only non-linear node is the `distinct`, which
-            // absorbs the within-epoch ΔA/Δmatched simultaneity. Every node is
-            // co-located on the eq-prefix worker (a.pk unique → never spans workers).
+            // ── Band null-fill: ν = positive_part(A − π_A(inner)) (plan §3) ──────
+            // The matched left rows (with full A payload) are read straight off the
+            // inner output as π_A(inner); `positive_part` clamps `A − π_A(inner)` to
+            // its non-negative part. Weight-exact: it subtracts the RAW matched
+            // multiplicity `m = w_A·S` and clamps the result, so a matched weight-`w`
+            // row reaches `w·(1−S) ≤ 0 → 0` and a bag-valued left input never leaks a
+            // spurious null-fill. The lone non-linear node, `positive_part`, absorbs
+            // the within-epoch ΔA/Δmatched simultaneity. Every node is co-located on
+            // the eq-prefix worker (a.pk unique → never spans workers).
             //
             // A reindex Map's OUTPUT schema is always [new-PK, <every input column>]
             // (`reindex_output_schema`), so the only clean [a.pk, A] is re-key (copy
@@ -860,20 +847,21 @@ fn build_range_join_view(
                 build_reindex_program(&union_schema),
             );
             let a_cols: Vec<usize> = (pa + k..pa + k + left_n).collect();
-            let proj_a = cb.map(rekey_a, &a_cols); // [a.pk, A]
-            let matched = cb.distinct(proj_a); // partition-local distinct (§3)
+            let proj_a = cb.map(rekey_a, &a_cols); // π_A(inner), keyed [a.pk, A]
 
             // A = every left row (incl. NULL-key rows the inner match filtered out),
             // re-keyed to a.pk with the IDENTICAL [a.pk, A] encoding as proj_a so a
-            // matched row's +1 (A) and −1 (D) are byte-identical and cancel (§4, §8).
+            // matched row's +w_A (A) and −m (π_A(inner)) are byte-identical and
+            // cancel before the clamp (§4, §8).
             let a_all = cb.map_reindex(
                 input_a_raw,
                 &left_schema.pk_cols,
                 &zero_a,
                 build_reindex_program(left_schema),
             );
-            let neg = cb.negate(matched);
-            cb.union(a_all, neg) // A − D, keyed [a.pk, A]
+            let neg = cb.negate(proj_a);
+            let diff = cb.union(a_all, neg); // A − π_A(inner), keyed [a.pk, A]
+            cb.positive_part(diff) // max(0, A − π_A(inner))
         };
 
         // Shared tail: attach the NULL B columns, then re-key onto the pair-PK.

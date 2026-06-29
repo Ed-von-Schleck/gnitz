@@ -429,7 +429,7 @@ pub(crate) unsafe fn compile_view(
         }
         2 => {
             // Binary set-op: two independent HashRow→ExchangeShard sub-pipelines
-            // meeting at a combine (Union / AntiJoin / positive_part). Carve each
+            // meeting at a combine (Union / positive_part). Carve each
             // side out by the ancestors of its exchange input; everything else
             // (the combine + sink, reading both relayed batches) is the post
             // phase.
@@ -1842,8 +1842,8 @@ mod tests {
 
     // ── §5: destructive-register ordering invariant ─────────────────────────
     //
-    // Union/Distinct/Delay (and the trace-absent AntiJoin(DeltaTrace)) empty
-    // their input register in place. When that register fans out to other
+    // Union/Distinct/PositivePart/Delay empty their input register in place.
+    // When that register fans out to other
     // consumers, the destructive op must be scheduled LAST among them, or the
     // co-readers see an emptied batch. build_plan rejects violations (returns
     // None) in every build profile, release included.
@@ -2017,7 +2017,7 @@ mod tests {
         //
         // ScanDelta provides input_delta_reg_id via source_reg_map.
         // ScanTrace feeds Union on PORT_IN_B (=1), but Union is not in
-        // {Join, AntiJoin, SeekTrace}, so is_join_trace_side = false →
+        // {Join, SeekTrace}, so is_join_trace_side = false →
         // add_scan_trace is emitted and one extra delta register is allocated.
         let schema = two_col_schema();
         let mut nodes = HashMap::new();

@@ -1,10 +1,9 @@
 #![cfg(feature = "integration")]
 
 use gnitz_core::{
-    OPCODE_ANTI_JOIN_DELTA_TRACE, OPCODE_DELAY, OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_INTEGRATE_TRACE,
-    OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_OUTER, OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR,
-    OPCODE_MAP_PROJ, OPCODE_NEGATE, OPCODE_NULL_EXTEND, OPCODE_PARTITION_FILTER, OPCODE_REDUCE, OPCODE_SCAN_DELTA,
-    OPCODE_UNION,
+    OPCODE_DELAY, OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_INTEGRATE_TRACE, OPCODE_JOIN_DELTA_TRACE,
+    OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR, OPCODE_MAP_PROJ, OPCODE_NEGATE, OPCODE_NULL_EXTEND,
+    OPCODE_PARTITION_FILTER, OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_SCAN_DELTA, OPCODE_UNION,
 };
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
@@ -1092,9 +1091,7 @@ fn test_pure_range_left_join_circuit_shape() {
         "two side PartitionFilters; trace_m has none"
     );
 
-    // No outer/anti/equi join machinery, no Delay.
-    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_OUTER), 0, "no outer-join operator");
-    assert_eq!(n_left(OPCODE_ANTI_JOIN_DELTA_TRACE), 0, "no anti-join");
+    // No equi join machinery, no Delay.
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
     assert_eq!(n_left(OPCODE_DELAY), 0, "no Delay node");
 
@@ -1320,15 +1317,19 @@ fn test_band_left_join_circuit_shape() {
         "proj_a + nf_proj"
     );
     assert_eq!(
-        n_left(OPCODE_DISTINCT) - n_inner(OPCODE_DISTINCT),
+        n_left(OPCODE_POSITIVE_PART) - n_inner(OPCODE_POSITIVE_PART),
         1,
-        "one distinct(π_A(inner))"
+        "one positive_part(A − π_A(inner))"
     );
-    assert_eq!(n_left(OPCODE_NEGATE) - n_inner(OPCODE_NEGATE), 1, "negate(D) for A − D");
+    assert_eq!(
+        n_left(OPCODE_NEGATE) - n_inner(OPCODE_NEGATE),
+        1,
+        "negate(π_A(inner)) for A − π_A(inner)"
+    );
     assert_eq!(
         n_left(OPCODE_UNION) - n_inner(OPCODE_UNION),
         2,
-        "A − D diff + inner ∪ null-fill"
+        "A − π_A(inner) diff + inner ∪ null-fill"
     );
     assert_eq!(
         n_left(OPCODE_NULL_EXTEND) - n_inner(OPCODE_NULL_EXTEND),
@@ -1359,21 +1360,16 @@ fn test_band_left_join_circuit_shape() {
         "band LEFT carries no PartitionFilter"
     );
     assert_eq!(n_left(OPCODE_DELAY), 0, "no Delay node");
-    assert_eq!(
-        n_left(OPCODE_ANTI_JOIN_DELTA_TRACE),
-        0,
-        "set-difference form uses no anti-join"
-    );
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
-    assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE_OUTER), 0, "no outer-join operator");
 
-    // Exactly one distinct, and the INNER view is shape-unchanged by the LEFT path.
+    // Exactly one positive_part, no distinct, and the INNER view is shape-unchanged.
     assert_eq!(
-        n_left(OPCODE_DISTINCT),
+        n_left(OPCODE_POSITIVE_PART),
         1,
-        "exactly one distinct in the band LEFT circuit"
+        "exactly one positive_part in the band LEFT circuit"
     );
-    assert_eq!(n_inner(OPCODE_DISTINCT), 0, "INNER band view has no distinct");
+    assert_eq!(n_left(OPCODE_DISTINCT), 0, "weight-exact band LEFT uses no distinct");
+    assert_eq!(n_inner(OPCODE_POSITIVE_PART), 0, "INNER band view has no positive_part");
     assert_eq!(n_inner(OPCODE_NULL_EXTEND), 0, "INNER band view has no null_extend");
     assert_eq!(n_inner(OPCODE_NEGATE), 0, "INNER band view has no negate");
 }
@@ -1832,14 +1828,15 @@ fn test_join_uppercase_alias_in_on_clause() {
 
 // ── Band LEFT JOIN over a non-base-table preserved side (A2) ─────────────────
 
-/// A band (equi + range) LEFT JOIN builds its null-fill as
-/// `a_all − distinct(π_A(inner))`, which clamps matched multiplicity to 1 and is
-/// weight-exact only for a unique-PK (base-table) preserved side. A view can be
-/// bag-valued (a UNION ALL that drops the PK collapses duplicate projected content
-/// to one `_set_pk` identity of weight >= 2), so the shape is rejected. A base-table
-/// left side still compiles.
+/// A band (equi + range) LEFT JOIN builds its null-fill as the weight-exact
+/// `positive_part(A − π_A(inner))`, which subtracts the RAW matched multiplicity
+/// and clamps the result — correct even for a bag-valued (non-unique-PK) preserved
+/// side. So a view left side (a UNION ALL that drops the PK, collapsing duplicate
+/// projected content to one `_set_pk` identity of weight >= 2) now REGISTERS, no
+/// base-table guard. (The data-level bag correctness is asserted by the
+/// `test_band_left_*` e2e suite.)
 #[test]
-fn test_band_left_join_rejects_view_preserved_side() {
+fn test_band_left_join_accepts_view_preserved_side() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -1860,32 +1857,27 @@ fn test_band_left_join_rejects_view_preserved_side() {
     p.execute("CREATE VIEW uv AS SELECT k, lo FROM t1 UNION ALL SELECT k, lo FROM t2")
         .unwrap();
 
-    // Same band LEFT over a base table on the left still compiles (positive control).
+    // Band LEFT over a base table on the left compiles (control).
     let ok = p.execute(
         "CREATE VIEW good AS SELECT lt.id AS a, inr.id AS b \
          FROM lt LEFT JOIN inr ON lt.k = inr.k AND lt.lo <= inr.t",
     );
-    assert!(
-        ok.is_ok(),
-        "band LEFT over a base table must still compile: {:?}",
-        ok.err()
-    );
+    assert!(ok.is_ok(), "band LEFT over a base table must compile: {:?}", ok.err());
 
-    // Band LEFT (k equi + lo<=t range) over the bag-valued view -> rejected, not registered.
-    let err = p
-        .execute(
-            "CREATE VIEW bad AS SELECT uv.k AS a, inr.id AS b \
-             FROM uv LEFT JOIN inr ON uv.k = inr.k AND uv.lo <= inr.t",
-        )
-        .unwrap_err();
+    // Band LEFT (k equi + lo<=t range) over the bag-valued view now REGISTERS —
+    // `positive_part` is weight-exact, so no base-table guard rejects it.
+    let bag = p.execute(
+        "CREATE VIEW bag AS SELECT uv.k AS a, inr.id AS b \
+         FROM uv LEFT JOIN inr ON uv.k = inr.k AND uv.lo <= inr.t",
+    );
     assert!(
-        matches!(err, GnitzSqlError::Unsupported(_)),
-        "expected Unsupported, got {:?}",
-        err
+        bag.is_ok(),
+        "band LEFT over a bag-valued view must now compile (positive_part is weight-exact): {:?}",
+        bag.err()
     );
     // `p`'s &mut client borrow ends above (no further `p` use), so the direct probe is ok.
     assert!(
-        client.resolve_table_or_view_id(&sn, "bad").is_err(),
-        "rejected view must not register"
+        client.resolve_table_or_view_id(&sn, "bag").is_ok(),
+        "accepted bag-valued band LEFT view must register"
     );
 }

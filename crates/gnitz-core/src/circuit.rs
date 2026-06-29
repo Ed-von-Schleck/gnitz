@@ -1,6 +1,6 @@
 use crate::expr::ExprProgram;
 
-pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel, SetJoinKind};
+pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel};
 
 pub type NodeId = u64;
 pub type Port = u8;
@@ -155,7 +155,6 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
                 .collect();
             ((OPCODE_MAP_EXPR, None, Some(program)), kind_rows)
         }
-        OpNode::Map(MapKind::KeyOnly) => ((OPCODE_MAP_KEY_ONLY, None, None), Vec::new()),
         OpNode::Map(MapKind::HashRow(cols, branch_id)) => {
             let mut kind_rows = encode_col_list(NODE_COL_KIND_PROJ, cols);
             kind_rows.push((NODE_COL_KIND_BRANCH_ID, 0, branch_id as u64, 0));
@@ -189,14 +188,10 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             ((OPCODE_REDUCE, None, None), kind_rows)
         }
         OpNode::Join(JoinKind::DeltaTrace) => ((OPCODE_JOIN_DELTA_TRACE, None, None), Vec::new()),
-        OpNode::Join(JoinKind::DeltaTraceOuter) => ((OPCODE_JOIN_DELTA_TRACE_OUTER, None, None), Vec::new()),
-        OpNode::Join(JoinKind::DeltaDelta) => ((OPCODE_JOIN_DELTA_DELTA, None, None), Vec::new()),
         OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }) => (
             (OPCODE_JOIN_DELTA_TRACE_RANGE, None, None),
             vec![(NODE_COL_KIND_RANGE_JOIN, 0, n_eq as u64, rel.as_u64())],
         ),
-        OpNode::AntiJoin(SetJoinKind::DeltaTrace) => ((OPCODE_ANTI_JOIN_DELTA_TRACE, None, None), Vec::new()),
-        OpNode::AntiJoin(SetJoinKind::DeltaDelta) => ((OPCODE_ANTI_JOIN_DELTA_DELTA, None, None), Vec::new()),
         OpNode::IntegrateSink => ((OPCODE_INTEGRATE, None, None), Vec::new()),
         OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None), Vec::new()),
         OpNode::ExchangeShard { shard_cols } => (
@@ -337,13 +332,6 @@ impl CircuitBuilder {
         nid
     }
 
-    /// Strip all payload columns, keep only PK and weight.
-    pub fn map_key_only(&mut self, input: NodeId) -> NodeId {
-        let nid = self.alloc_node(OpNode::Map(MapKind::KeyOnly));
-        self.connect(input, nid, gnitz_wire::PORT_IN);
-        nid
-    }
-
     pub fn negate(&mut self, input: NodeId) -> NodeId {
         let nid = self.alloc_node(OpNode::Negate);
         self.connect(input, nid, gnitz_wire::PORT_IN);
@@ -396,10 +384,6 @@ impl CircuitBuilder {
         self.binary_join_scan(OpNode::Join(JoinKind::DeltaTrace), delta, trace_table_id)
     }
 
-    pub fn anti_join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
-        self.binary_join_scan(OpNode::AntiJoin(SetJoinKind::DeltaTrace), delta, trace_table_id)
-    }
-
     pub fn join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
         self.binary_join(OpNode::Join(JoinKind::DeltaTrace), delta, trace_node)
     }
@@ -422,18 +406,6 @@ impl CircuitBuilder {
         let nid = self.alloc_node(OpNode::PartitionFilter);
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
-    }
-
-    pub fn anti_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        self.binary_join(OpNode::AntiJoin(SetJoinKind::DeltaTrace), delta, trace_node)
-    }
-
-    pub fn left_join(&mut self, delta: NodeId, trace_table_id: u64) -> NodeId {
-        self.binary_join_scan(OpNode::Join(JoinKind::DeltaTraceOuter), delta, trace_table_id)
-    }
-
-    pub fn left_join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        self.binary_join(OpNode::Join(JoinKind::DeltaTraceOuter), delta, trace_node)
     }
 
     /// Shared `Reduce`-node construction: map the group cols + agg specs, alloc

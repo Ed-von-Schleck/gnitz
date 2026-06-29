@@ -1,9 +1,8 @@
-//! Join operators: anti-join, inner join, outer join.
+//! Join operators: inner join (equi and non-equi).
 //!
-//! Split by match shape: `delta_trace` (Δ ⋈ trace), `delta_delta` (ΔA ⋈ ΔB),
-//! `range` (non-equi delta-trace), and the shared `rowwrite` row builders.
+//! Split by match shape: `delta_trace` (equi Δ ⋈ trace), `range` (non-equi
+//! delta-trace), and the shared `rowwrite` row builder.
 
-mod delta_delta;
 mod delta_trace;
 mod range;
 mod rowwrite;
@@ -11,6 +10,5 @@ mod rowwrite;
 #[cfg(test)]
 mod test_common;
 
-pub(crate) use delta_delta::{op_anti_join_delta_delta, op_join_delta_delta};
-pub(crate) use delta_trace::{op_anti_join_delta_trace, op_join_delta_trace, op_join_delta_trace_outer};
+pub(crate) use delta_trace::op_join_delta_trace;
 pub(crate) use range::op_join_delta_trace_range;

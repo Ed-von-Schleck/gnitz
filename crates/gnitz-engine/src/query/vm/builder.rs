@@ -229,26 +229,6 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn add_join_dd(&mut self, a_reg: u16, b_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {
-        let right_schema_idx = self.schema_idx(right_schema);
-        self.instructions.push(Instr::JoinDD {
-            a_reg,
-            b_reg,
-            out_reg,
-            right_schema_idx,
-        });
-    }
-
-    pub fn add_join_dt_outer(&mut self, delta_reg: u16, trace_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {
-        let right_schema_idx = self.schema_idx(right_schema);
-        self.instructions.push(Instr::JoinDTOuter {
-            delta_reg,
-            trace_reg,
-            out_reg,
-            right_schema_idx,
-        });
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn add_join_dt_range(
         &mut self,
@@ -277,18 +257,6 @@ impl ProgramBuilder {
             worker_id,
             num_workers,
         });
-    }
-
-    pub fn add_anti_join_dt(&mut self, delta_reg: u16, trace_reg: u16, out_reg: u16) {
-        self.instructions.push(Instr::AntiJoinDT {
-            delta_reg,
-            trace_reg,
-            out_reg,
-        });
-    }
-
-    pub fn add_anti_join_dd(&mut self, a_reg: u16, b_reg: u16, out_reg: u16) {
-        self.instructions.push(Instr::AntiJoinDD { a_reg, b_reg, out_reg });
     }
 
     pub fn add_null_extend(&mut self, in_reg: u16, out_reg: u16, right_schema: SchemaDescriptor) {

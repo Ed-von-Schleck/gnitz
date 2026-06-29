@@ -2064,6 +2064,61 @@ class TestRangeJoin:
         finally:
             _drop_all(client, sn, views=["v"], tables=["a", "b"])
 
+    def test_band_left_bag_valued_view(self, client):
+        """Bag-valued (non-unique-PK) preserved side — the weight-exactness bug fix.
+        A UNION ALL view that DROPS the PK collapses duplicate (k, lo) rows to ONE
+        _set_pk identity of weight 2. `positive_part(A − π_A(inner))` subtracts the
+        RAW matched multiplicity (= w_A·S) and clamps the result, so a MATCHED
+        weight-2 identity reaches w_A·(1−S) ≤ 0 → 0 null-fills (the retired
+        `A − distinct(π_A(inner))` form clamped the witness to 1 and leaked a spurious
+        weight-1 (k, lo, NULL)); an UNMATCHED weight-2 identity null-fills at the full
+        weight 2. Runs the view-encoded (non-unique a.pk) left side through the band
+        scaffolding for the first time, at W=4."""
+        sn = "blbag" + _uid()
+        client.create_schema(sn)
+        try:
+            for tbl in ("t1", "t2"):
+                client.execute_sql(
+                    f"CREATE TABLE {tbl} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
+                    schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE inr (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
+                schema_name=sn)
+            # uv drops the source PK, so duplicate (k, lo) rows within a branch
+            # collapse to one _set_pk identity whose weight is their multiplicity.
+            client.execute_sql(
+                "CREATE VIEW uv AS SELECT k, lo FROM t1 UNION ALL SELECT k, lo FROM t2", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT uv.k AS uk, uv.lo AS ulo, inr.id AS bid "
+                "FROM uv LEFT JOIN inr ON uv.k = inr.k AND uv.lo <= inr.t", schema_name=sn)
+            vid, _ = client.resolve_table(sn, "v")
+
+            def weighted():
+                return {(r["uk"], r["ulo"], r["bid"]): r.weight
+                        for r in client.scan(vid) if r.weight != 0}
+
+            # inr matches the k=5 group only; the k=9 group has no inr row.
+            client.execute_sql("INSERT INTO inr VALUES (100, 5, 50)", schema_name=sn)
+            # t1: (5,10)×2 → weight-2 MATCHED identity; (9,10)×2 → weight-2 UNMATCHED.
+            client.execute_sql(
+                "INSERT INTO t1 VALUES (1, 5, 10), (2, 5, 10), (3, 9, 10), (4, 9, 10)", schema_name=sn)
+
+            got = weighted()
+            assert got.get((5, 10, 100)) == 2, f"matched bag identity: 2 matched rows expected, got {got}"
+            assert (5, 10, None) not in got, \
+                f"matched bag must NOT null-fill (positive_part is weight-exact); got {got}"
+            assert got.get((9, 10, None)) == 2, f"unmatched bag identity null-fills at full weight 2, got {got}"
+
+            # Retract the only matching inr → the matched weight-2 identity flips to a
+            # full weight-2 null-fill, and the matched pairs retract cleanly.
+            client.execute_sql("DELETE FROM inr WHERE id = 100", schema_name=sn)
+            got = weighted()
+            assert (5, 10, 100) not in got, f"matched pair must retract, got {got}"
+            assert got.get((5, 10, None)) == 2, f"flipped identity null-fills at full weight 2, got {got}"
+            assert got.get((9, 10, None)) == 2, f"untouched identity unchanged, got {got}"
+        finally:
+            _drop_all(client, sn, views=["v", "uv"], tables=["t1", "t2", "inr"])
+
     # ── Pure-range LEFT OUTER (no eq conjunct): the MAX/MIN threshold null-fill ──
     #
     # `∃b. a.x < b.y  ⟺  a.x < MAX(b.y)`, so the unmatched left rows are exactly

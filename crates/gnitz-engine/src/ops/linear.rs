@@ -290,8 +290,8 @@ where
 }
 
 /// Null-extend: copy input batch and append N null-filled payload columns.
-/// Used in LEFT JOIN decomposition to convert anti-join output (left-only rows)
-/// into null-filled outer join rows.
+/// Used by the LEFT JOIN null-fill to extend the unmatched preserved rows
+/// (ν = positive_part(A − π_A(inner))) with NULL right columns.
 pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> Batch {
     assert!(
         in_schema.num_columns() + right_schema.num_payload_cols() <= crate::schema::MAX_COLUMNS,

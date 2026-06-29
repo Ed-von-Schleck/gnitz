@@ -196,56 +196,50 @@ Only non-linear and bilinear operators need the integral. The output of
 **Left outer join** — extends bilinear join with null-fill:
 - For each delta row, if inner-join matches exist: emit them (weight =
   `w_delta × w_trace`, same as inner join). If no match: emit one
-  null-filled row (weight = `w_delta`, right columns = NULL via
-  `NullAccessor`).
+  null-filled row (weight = `w_delta`, right columns = NULL).
 - **Not bilinear**: the null-fill path breaks the weight-product property
   (output weight depends on match existence, not just weight arithmetic).
-- Implemented as `OPCODE_JOIN_DELTA_TRACE_OUTER` (`join.py:212-270`).
-  Feldera uses a different approach: a "saturate" operator injects ghost
-  `(k, NULL)` tuples, then runs a standard inner join.
+- Built **join-free**: `LEFT JOIN = inner ∪ null_extend(ν)`, where `ν` is the
+  unmatched preserved rows at their true multiplicity. There is **no** fused
+  outer opcode. It generalizes **symmetrically** — RIGHT = the mirror `ν_B`
+  over the right side, FULL = both — though RIGHT/FULL are not yet
+  implemented. Feldera instead injects ghost `(k, NULL)` tuples via a
+  "saturate" operator and runs a standard inner join.
 
-*Set-difference form (the general null-fill).* A LEFT outer join is equivalently
-`inner ∪ null_extend(A − distinct(π_A(inner)))`, where `π_A(inner)` projects the
-**preserved side's full payload**. The null-fill is thus a Z-set **difference**
-`A − D` — linear (adding `A` and `−D`), not an anti-join that must recover
-payload: the matched preserved rows are read straight off the inner output and
-deduplicated to one row per preserved identity by `distinct`. Keying `D` by the
-**preserved row's identity** (its source PK) is what makes this the general form —
-it holds even when one preserved row matches a whole interval of the other side
-(range / band joins). An equi join may instead key `D` by the join key (the
-`distinct(B_keys)` form), valid only because equi-match existence is a function of
-`B` alone. **No delta-delta cross term is needed** despite `D` depending on the
-preserved side: the lone non-linear operator, `distinct`, natively absorbs the
-within-epoch `ΔA` / `Δmatched` simultaneity (DBSP Prop 4.7 — it emits `+a` / `−a`
-exactly on the per-identity 0-boundary crossing). GnitzDB's band/range LEFT join
-uses this form.
+*The null-fill `ν` is a weight-exact Z-set difference.* Per preserved-row
+identity `x` (its source PK + full payload), with weight `w_A ≥ 0` in `A` and
+`S ≥ 0` the summed other-side weight it matches, `ν(x) = w_A · [S = 0]` — the
+unmatched rows, multiplicity intact. Two realizations, chosen by path so the
+difference stays **partition-local** (it cancels per worker, before any output
+exchange):
 
-*Empty-other-side robustness.* `D = ∅` gives `A − ∅ = A`: an empty or absent other
-side null-fills every preserved row, free, with no sentinel. A null-fill written
-instead as a **direct** match against a witness relation — e.g. `A ⋈_{a.x ≥ m} {m}`
-for a single-inequality threshold `m = MAX/MIN(other.col)` — **vanishes** when that
-relation is empty and must be seeded with a sentinel row; the difference form
-`A − (A ⋈_{a.x < m} {m})` keeps the bare `A` passthrough, so empty `{m}` correctly
-null-fills all of `A` and needs no seed. Prefer the difference form for any
-"`A` that does / does not satisfy `P`" split whose witness can be absent.
+- **equi / band:** `ν = positive_part(A − π_A(inner))`. `π_A(inner)` re-keys the
+  inner output back to the preserved identity and projects `A`'s columns,
+  carrying weight `m = w_A · S` there (the bilinear inner join's consolidation
+  sums the per-match `w_A · w_b`). `positive_part` subtracts the **raw** `m` and
+  clamps the *result*: `max(0, w_A·(1 − S)) = w_A·[S=0]`. It shares `distinct`'s
+  engine body (`op_weight_clamp`), differing only in `(lo,hi) = (0, i64::MAX)`,
+  self-consolidates, and natively absorbs the within-epoch `ΔA` / `Δπ_A(inner)`
+  simultaneity (DBSP Prop 4.7), so **no delta-delta cross term** arises. It is
+  **weight-exact for a bag-valued preserved side** (a non-`unique_pk` table, a
+  `UNION ALL` view): clamping the *result* of subtracting the raw `m` never
+  over-fills — unlike the retired `A − distinct(π_A(inner))`, whose `distinct`
+  clamped the *witness* to 1 and leaked a spurious weight-`w−1` null-fill on a
+  matched weight-`w` row. Partition-local because the runtime join-shard scatter
+  (equi) / eq-prefix scatter (band) co-locates `π_A(inner)` and `A` on one worker.
 
-*Weight-exactness — `distinct` clamps multiplicity.* `D = distinct(π_A(inner))` is
-exact only when the preserved side's identities are unique (weight ≤ 1 — the
-`unique_pk` base-table case, the common one). A **bag-valued** preserved side (a
-non-`unique_pk` table, a `UNION ALL` view) is **over-filled**: `distinct` clamps
-matched multiplicity to 1 while `A` keeps weight `w`, so a *matched* weight-`w`
-preserved row leaks a spurious weight-`w−1` null-fill. The exact form subtracts
-match **existence** while preserving `A`'s multiplicity, with an existence witness
-that is a function of the **other** side (so it is available in-epoch for a row
-matched in its own insertion epoch): an anti-join by the join key over
-`distinct(B_keys)` (equi — match existence is a function of `B` alone), or a
-threshold join against the one-row-per-group `MAX/MIN(other.range)` (band/range —
-the one row per group cannot multiply, so no `distinct` is needed and `A`'s weight
-is carried verbatim). A witness taken from the **inner output** (`distinct(π_A(inner))`)
-is *not* a valid weight-exact substitute through a `z⁻¹` trace: it is entangled with
-`ΔA`, so a trace anti-join would spuriously null-fill a row matched in its own epoch.
-The current band set-difference dodges that only by netting `+a`/`−a` in-epoch through
-`distinct` — which is exactly what clamps the weight; the threshold witness fixes both.
+- **pure range (`n_eq == 0`):** `ν = A − (A ⋈ {m})` against the one-row threshold
+  `m = MAX/MIN(other.range)` (`<,≤` → MAX; `>,≥` → MIN), since `∃b. a.x OP b.y ⟺
+  a.x OP m`. `m` is an inline shard-free reduce over the **broadcast** other side,
+  so it is **replicated** on every worker and the match test `A ⋈ {m}` is
+  partition-local. This is itself weight-exact — a one-row `m` cannot multiply, so
+  `A ⋈ {m}` carries each `a`'s weight verbatim (no `distinct`, no `positive_part`)
+  — and needs no sentinel: an empty / all-NULL other side gives `m = ∅`, so
+  `A − ∅ = A` null-fills every preserved row free. `π_A(inner)` is **not** usable
+  here: the broadcast range join scatters its output by the *other* side's range
+  key, not the preserved key, so gathering it onto the preserved-key worker for
+  the per-worker clamp would need a **second sequential exchange the compiler
+  forbids**; the replicated threshold sidesteps that.
 
 **Non-linear operators** — require access to the accumulated integral:
 
@@ -264,17 +258,14 @@ weight -1, new at +1.
   the next value from history. Uses optional AggValueIndex for
   O(log N + 1) lookup instead of full trace scan.
 
-*Anti-join:*
-Non-linear (depends on `distinct(B)` internally). Output uses left schema
-only; weights preserved (not multiplied). The sole caller is the equi LEFT
-JOIN null-fill (set-difference form), which needs the anti-join's
-multiplicity preservation for a bag-valued preserved side. SQL set
-operations (UNION/INTERSECT/EXCEPT, both DISTINCT and ALL) are **join-free**:
+*Set operations (UNION/INTERSECT/EXCEPT, both DISTINCT and ALL):* **join-free** —
 every one is a linear combination of `{union, negate}` plus the non-linear
 weight-clamp primitive (`distinct = clamp[-1,1]`, `positive_part =
 clamp[0,i64::MAX]`) over content-hashed leaves — e.g. EXCEPT DISTINCT =
 `positive_part(distinct(A) − distinct(B))`, INTERSECT DISTINCT =
-`distinct(A) − positive_part(distinct(A) − distinct(B))`.
+`distinct(A) − positive_part(distinct(A) − distinct(B))`. There is **no**
+anti-join operator: these set ops and the LEFT-JOIN null-fill (above, equi/band
+form) are the only `positive_part` users.
 
 *All non-linear operators:* Consolidation mandatory — must see true net
 weights. Enforced by `ConsolidatedScope`.
@@ -451,7 +442,7 @@ foundation (L0)  — independent leaves; depends on nothing
   - `repr` (L2) — the in-memory batch and the kernels over it: `batch` (region layout), `batch_wire` (wire/shard serde), `batch_pool` (buffer recycling), `columnar` (comparators), `merge` (sort-merge consolidation), `scatter` (exchange repartition), `heap` (k-way merge), `bloom`/`xor8` (PK-probe filters).
   - `lsm` (L3) — the on-disk half: `wal`, `shard_file`/`shard_reader`/`shard_index`, `compact` (N-way compaction), `memtable`, `read_cursor`, and the `Table`/`PartitionedTable` facades.
 - **`expr`** — compiled expression programs evaluated over batches (`program`, `batch`, `plan`).
-- **`ops`** — the DBSP operators: `join` (inner/outer/anti, split by Δ⋈trace, Δ⋈Δ, and range), `reduce` (aggregation), `exchange` (repartition: `router` + `relay`), `distinct`, `linear` (filter/map/negate/union), `scan`, `reindex` (re-key for join/group), `cogroup`, `index` (secondary indexes).
+- **`ops`** — the DBSP operators: `join` (equi and range/band inner join, both Δ⋈trace; LEFT outer is built join-free from inner + `positive_part`, §3), `reduce` (aggregation), `exchange` (repartition: `router` + `relay`), `distinct`, `linear` (filter/map/negate/union), `scan`, `reindex` (re-key for join/group), `cogroup`, `index` (secondary indexes).
 - **`query`** (L5) — the circuit layer behind the `dag` facade: `compiler` (view → DBSP circuit → VM program), `vm` (executes the program), `dag` (`DagEngine`: plan cache, epoch evaluator, ingestion). `catalog` and `runtime` reach this layer only through `dag`.
 - **`catalog`** — the DDL/metadata engine wrapping `DagEngine`: `ddl`, `sys_tables`, `hooks`, `registry`, `metadata`, `validation`, `write_path`, persistence (`store_io`, `partition_lsn`), `cache`, `bootstrap`.
 - **`runtime`** (L7) — the multi-process server (`main.rs` builds `gnitz-server`):
