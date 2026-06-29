@@ -10,7 +10,7 @@ use proptest::prelude::*;
 
 use crate::schema::key::{compare_pk_bytes, encode_order_preserving_pk};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, ConsolidatedBatch};
+use crate::storage::{Batch, Layout};
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
 /// (`pk_stride = 24`, wide) with a single I64 payload column.
@@ -59,14 +59,14 @@ pub(crate) fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
 /// column — the at-rest §6 layout), so the bytes are byte-identical to an
 /// ingested row and to what `partition_for_pk_bytes` routes.
 ///
-/// `rows` must be OPK-sorted (non-decreasing PK). This is asserted here, at the
-/// `sorted = true` / `new_unchecked` claim it guards: `new_unchecked` trusts the
-/// flag without inspecting bytes, so a dropped big-endian flip in the encoder
-/// (which sorts e.g. 256 before 1) trips this assert instead of silently
-/// scattering scrambled bytes past a test's self-referential checks. Equal PKs
-/// with differing payloads are allowed (multiset deltas), so only a strictly
-/// *decreasing* PK is rejected.
-pub(crate) fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i64)]) -> ConsolidatedBatch {
+/// `rows` must be OPK-sorted (non-decreasing PK). The explicit assert below runs
+/// in every build (unlike `certify_layout`'s debug-only verify) and gives a
+/// targeted message: a dropped big-endian flip in the encoder (which sorts e.g.
+/// 256 before 1) trips it here rather than silently scattering scrambled bytes
+/// past a test's self-referential checks. Equal PKs with differing payloads are
+/// allowed (multiset deltas), so only a strictly *decreasing* PK is rejected;
+/// `certify_layout(Consolidated)` then debug-verifies the full (PK, payload) order.
+pub(crate) fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i64)]) -> Batch {
     let mut b = Batch::with_schema(*schema, rows.len().max(1));
     for &(c0, c1, c2, w, val) in rows {
         b.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
@@ -82,9 +82,8 @@ pub(crate) fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64,
             "make_wide_batch row {r}: non-OPK-sorted PK (encoder regression?)",
         );
     }
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.certify_layout(Layout::Consolidated, schema);
+    b
 }
 
 /// Build a one-row `Batch` from OPK-encoded `pk` bytes (see [`opk_pk`]), DBSP
@@ -125,8 +124,7 @@ pub(crate) fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64
         b.extend_col(0, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
+    b.certify_layout(Layout::Consolidated, schema);
     b
 }
 

@@ -7,8 +7,6 @@ use std::ffi::{CStr, CString};
 use std::rc::Rc;
 
 use super::batch::Batch;
-#[cfg(test)]
-use super::batch::ConsolidatedBatch;
 use super::columnar;
 use super::error::StorageError;
 use super::manifest::PreparedManifest;
@@ -427,7 +425,7 @@ impl Table {
 
     /// Test helper: upsert a consolidated batch directly into the memtable (no WAL).
     #[cfg(test)]
-    pub(crate) fn memtable_upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
+    pub(crate) fn memtable_upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         self.cached_full_scan = None;
         self.memtable.upsert_sorted_batch(batch)
     }
@@ -728,8 +726,8 @@ mod tests {
 
     /// Build an unsorted owned `Batch` of (pk, weight, val_i64) rows for the
     /// 2-column `make_u64_i64_schema` (U64 PK + I64 payload). Rows land in
-    /// the order given; `sorted` and `consolidated` are cleared so the
-    /// ingest path runs the canonical sort+fold.
+    /// the order given; a freshly-built batch is `Raw` so the ingest path
+    /// runs the canonical sort+fold.
     fn make_batch(rows: &[(u64, i64, i64)]) -> Batch {
         let schema = make_u64_i64_schema();
         let mut batch = Batch::with_schema(schema, rows.len().max(1));
@@ -739,10 +737,6 @@ mod tests {
             batch.extend_null_bmp(&0u64.to_le_bytes());
             batch.extend_col(0, &val.to_le_bytes());
             batch.count += 1;
-        }
-        if !rows.is_empty() {
-            batch.sorted = false;
-            batch.consolidated = false;
         }
         batch
     }
@@ -988,8 +982,8 @@ mod tests {
 
         // Build a reverse-sorted batch (PK order: 30, 20, 10).
         let batch = make_batch(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
-        // make_batch produces an unsorted batch (sorted=false default).
-        assert!(!batch.sorted);
+        // make_batch produces a Raw (unsorted) batch.
+        assert!(!batch.is_sorted());
 
         t.ingest_owned_batch(batch).unwrap();
 
@@ -1271,10 +1265,6 @@ mod tests {
                 b.extend_null_bmp(&0u64.to_le_bytes());
                 b.extend_col(0, &val.to_le_bytes());
                 b.count += 1;
-            }
-            if !rows.is_empty() {
-                b.sorted = false;
-                b.consolidated = false;
             }
             b
         };

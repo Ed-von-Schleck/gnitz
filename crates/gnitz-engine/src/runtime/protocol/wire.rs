@@ -23,6 +23,33 @@ pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
 /// so the client's loop termination — "stop on no FLAG_CONTINUATION" — still works).
 pub(crate) const FLAG_SCAN_LAST: u64 = 1 << 53;
 
+/// Map a batch's layout claim to its wire flag bits. Encode normalizes
+/// `Consolidated ⇒ both bits`; `layout_from_wire_flags` inverts losslessly. The
+/// pair folds every bit↔enum conversion into one place so the encode and decode
+/// sides can never drift.
+pub(crate) fn layout_to_wire_flags(layout: crate::storage::Layout) -> u64 {
+    use crate::storage::Layout;
+    match layout {
+        Layout::Raw => 0,
+        Layout::Sorted => FLAG_BATCH_SORTED,
+        Layout::Consolidated => FLAG_BATCH_SORTED | FLAG_BATCH_CONSOLIDATED,
+    }
+}
+
+/// Recover a batch layout claim from wire flag bits. The constructor already
+/// defaults `Raw`, so this is the value fed to `certify_layout` at the decode
+/// boundary (which debug-verifies the data against the claim).
+pub(crate) fn layout_from_wire_flags(flags: u64) -> crate::storage::Layout {
+    use crate::storage::Layout;
+    if flags & FLAG_BATCH_CONSOLIDATED != 0 {
+        Layout::Consolidated
+    } else if flags & FLAG_BATCH_SORTED != 0 {
+        Layout::Sorted
+    } else {
+        Layout::Raw
+    }
+}
+
 // WAL block header field offsets (matches storage/lsm/wal.rs; duplicated here to
 // avoid cross-module coupling between runtime and storage internals).
 const WAL_OFF_COUNT: usize = 12;
@@ -647,12 +674,10 @@ pub fn encode_wire_into_range(
     }
     if has_data {
         wire_flags |= FLAG_HAS_DATA;
-        if data_batch.sorted {
-            wire_flags |= FLAG_BATCH_SORTED;
-        }
-        if data_batch.consolidated {
-            wire_flags |= FLAG_BATCH_CONSOLIDATED;
-        }
+        // Maps `b.layout()` with no re-verify: a non-`Raw` tag was certified
+        // (debug-verified) at its producer, so the shipped claim is
+        // verified-by-construction.
+        wire_flags |= layout_to_wire_flags(data_batch.layout());
     }
 
     let written = encode_ctrl_block_direct(
@@ -719,13 +744,8 @@ fn encode_wire_into_impl(
     }
     if has_data {
         wire_flags |= FLAG_HAS_DATA;
-        let b = data_batch.unwrap();
-        if b.sorted {
-            wire_flags |= FLAG_BATCH_SORTED;
-        }
-        if b.consolidated {
-            wire_flags |= FLAG_BATCH_CONSOLIDATED;
-        }
+        // See `encode_data_response_block`: maps `b.layout()`, verified-by-construction.
+        wire_flags |= layout_to_wire_flags(data_batch.unwrap().layout());
     }
 
     let written = encode_ctrl_block_direct(
@@ -1242,12 +1262,9 @@ fn decode_wire_body(
             return Err("data block truncated");
         }
         let (mut batch, _) = Batch::decode_from_wal_block(&data[off..off + data_size], eff_schema, verify_checksum)?;
-        if (flags & FLAG_BATCH_SORTED) != 0 {
-            batch.mark_sorted();
-        }
-        if (flags & FLAG_BATCH_CONSOLIDATED) != 0 {
-            batch.mark_consolidated();
-        }
+        // The constructor defaults `Raw`; raise to the wire's claim, debug-verifying
+        // the decoded data against it (the backstop against a lying frame).
+        batch.certify_layout(layout_from_wire_flags(flags), eff_schema);
         Some(batch)
     } else {
         None
@@ -1331,6 +1348,7 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+    use crate::storage::Layout;
     use crate::test_support::arb_type_code;
     use gnitz_wire::{is_pk_eligible, MAX_PK_COLUMNS};
     use proptest::collection::vec;
@@ -1581,8 +1599,7 @@ mod tests {
         batch.extend_null_bmp(&0u64.to_le_bytes());
         batch.extend_col(0, &42i64.to_le_bytes());
         batch.count += 1;
-        batch.sorted = true;
-        batch.consolidated = true;
+        batch.certify_layout(Layout::Consolidated, &schema);
 
         let col_names = [b"pk".as_slice(), b"v".as_slice()];
         let wire = encode_wire(
@@ -1602,15 +1619,17 @@ mod tests {
         let mut decoded = decode_wire(&wire).expect("decode");
         {
             let b = decoded.data_batch.as_ref().expect("data batch present");
-            assert!(b.sorted, "decoder applies FLAG_BATCH_SORTED");
-            assert!(b.consolidated, "decoder applies FLAG_BATCH_CONSOLIDATED");
+            assert!(b.is_sorted(), "decoder applies FLAG_BATCH_SORTED");
+            assert!(b.is_consolidated(), "decoder applies FLAG_BATCH_CONSOLIDATED");
         }
 
         // The trust-boundary strip, identical to handle_message.
         let b = decoded.data_batch.as_mut().unwrap();
-        b.sorted = false;
-        b.consolidated = false;
-        assert!(!b.sorted && !b.consolidated, "strip clears both engine-internal flags");
+        b.set_layout_unchecked(Layout::Raw);
+        assert!(
+            !b.is_sorted() && !b.is_consolidated(),
+            "strip clears both engine-internal flags"
+        );
     }
 
     /// A control block whose error_msg German-string struct points past the

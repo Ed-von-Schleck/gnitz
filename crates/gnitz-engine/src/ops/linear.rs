@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 
 use crate::expr::ScalarFunc;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::storage::{with_payload_cmp, Batch, ConsolidatedBatch, MemBatch};
+use crate::storage::{with_payload_cmp, Batch, Layout, MemBatch};
 
 use super::cogroup::{cogroup_union, BatchCursor};
 use super::reindex::{reindex_hash_row, ReindexPacker};
@@ -49,14 +49,10 @@ pub fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) ->
         }
     });
 
-    // append_batch resets sorted+consolidated to false; restore them based on input.
-    if ConsolidatedBatch::from_batch_ref(batch).is_some() {
-        output.sorted = true;
-        output.consolidated = true;
-    } else {
-        output.sorted = batch.sorted;
-        output.consolidated = false;
-    }
+    // The appends above downgraded `output` to `Raw`. A filtered subset preserves
+    // the input's order, weights, and (PK, payload) distinctness, so it carries
+    // exactly the input's layout — a faithful propagate (no re-verify).
+    output.inherit_layout(batch);
 
     gnitz_debug!("op_filter: in={} out={}", n, output.count);
     output
@@ -102,20 +98,23 @@ pub fn op_map(
             "MAP output row count must equal input row count",
         );
         reindex_hash_row(out_schema, &mut output, branch_id);
-        output.sorted = false;
-        output.consolidated = false;
+        // `evaluate_map_batch` returns `Raw`; the hash-reindex only rewrites PK
+        // bytes (no layout raise), so the result stays `Raw` — nothing to lower.
         gnitz_debug!("op_map: in={} out={} reindex=HASH", batch.count, output.count);
         return output;
     }
 
     if reindex_cols.is_empty() {
         // Batch path
-        let mut result = func.evaluate_map_batch(batch, out_schema);
+        let result = func.evaluate_map_batch(batch, out_schema);
         debug_assert_eq!(
             result.count, batch.count,
             "MAP output row count must equal input row count",
         );
-        result.sorted = batch.sorted;
+        // A payload-reordering projection over a duplicate-PK input can break
+        // (PK, payload) order, so keep `evaluate_map_batch`'s `Raw` rather than
+        // propagating the input's `sorted` (the D1 fail-safe: only `into_consolidated`
+        // would ever trust it, and it re-sorts a `Raw` batch anyway).
         gnitz_debug!("op_map: in={} out={} reindex=none", batch.count, result.count);
         return result;
     }
@@ -137,8 +136,8 @@ pub fn op_map(
     let packer = ReindexPacker::new(in_schema, reindex_cols, target_tcs);
     packer.promote_into(&in_mb, &mut output);
 
-    output.sorted = false;
-    output.consolidated = false;
+    // `evaluate_map_batch` returns `Raw`; the column reindex only rewrites PK
+    // bytes, so the result stays `Raw`.
     gnitz_debug!(
         "op_map: in={} out={} reindex={}cols",
         batch.count,
@@ -186,16 +185,14 @@ pub fn op_union(batch_a: Batch, batch_b: Option<&Batch>, schema: &SchemaDescript
         return b.clone_batch();
     }
 
-    if batch_a.sorted && b.sorted {
+    if batch_a.sorted_verified(schema) && b.sorted_verified(schema) {
         return op_union_merge(&batch_a, b, schema);
     }
 
-    // Unsorted: concatenate
+    // Unsorted: concatenate (the appends leave `output` `Raw`).
     let mut output = Batch::with_schema(*schema, batch_a.count + b.count);
     output.append_batch(&batch_a, 0, batch_a.count);
     output.append_batch(b, 0, b.count);
-    output.sorted = false;
-    output.consolidated = false;
     gnitz_debug!(
         "op_union: a={} b={} out={} concat",
         batch_a.count,
@@ -285,8 +282,9 @@ where
         }
     });
 
-    output.sorted = true;
-    output.consolidated = false;
+    // Payload-aware merge of two sorted inputs ⇒ genuinely (PK, payload)-sorted,
+    // but unfolded (Z-Set `+` does not sum weights). Certify `Sorted`.
+    output.certify_layout(Layout::Sorted, schema);
     gnitz_debug!("op_union: a={} b={} out={} sorted_merge", n_a, n_b, output.count);
     output
 }
@@ -363,8 +361,9 @@ pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, right_schema:
         output.null_bmp_data_mut()[off..off + 8].copy_from_slice(&out_null.to_le_bytes());
     }
 
-    output.sorted = batch.sorted;
-    output.consolidated = batch.consolidated;
+    // Null-extending appends columns without touching PK order or weights, so the
+    // output carries exactly the input's layout (faithful propagate, no re-verify).
+    output.inherit_layout(batch);
     gnitz_debug!("op_null_extend: in={} right_npc={}", n, right_npc);
     output
 }
@@ -377,7 +376,7 @@ pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, right_schema:
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::Batch;
+    use crate::storage::{Batch, Layout};
     use crate::test_support::{
         make_batch_i64pk, make_schema_i64pk_i64, make_schema_pk_u64_payload_blob, make_schema_pk_u64_payload_string,
         make_wide_batch, wide_pk_3xu64_schema,
@@ -403,8 +402,7 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, schema);
         b
     }
 
@@ -424,7 +422,7 @@ mod tests {
         let b = make_batch(&schema, &[(1, 1, 10)]);
         let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 2);
-        assert!(out.sorted);
+        assert!(out.is_sorted());
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!(get_payload_i64(&out, 1), 20);
     }
@@ -468,8 +466,8 @@ mod tests {
             (7, 70),
         ];
         assert_eq!(got, want, "full union, (PK, payload)-sorted");
-        assert!(out.sorted);
-        assert!(!out.consolidated, "Z-Set + does not fold weights");
+        assert!(out.is_sorted());
+        assert!(!out.is_consolidated(), "Z-Set + does not fold weights");
     }
 
     #[test]
@@ -480,7 +478,7 @@ mod tests {
         let b = make_batch(&schema, &[(1, 1, 10), (1, 1, 25)]);
         let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 4);
-        assert!(out.sorted);
+        assert!(out.is_sorted());
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!(get_payload_i64(&out, 1), 20);
         assert_eq!(get_payload_i64(&out, 2), 25);
@@ -496,7 +494,7 @@ mod tests {
         let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 200)]);
         let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 4);
-        assert!(out.sorted);
+        assert!(out.is_sorted());
         assert_eq!((out.get_pk(0) as u64), 1);
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!((out.get_pk(1) as u64), 1);
@@ -515,7 +513,7 @@ mod tests {
         let b = make_batch(&schema, &[(1, -1, 10)]);
         let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 2);
-        assert!(out.sorted);
+        assert!(out.is_sorted());
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!(get_payload_i64(&out, 1), 10);
     }
@@ -563,8 +561,7 @@ mod tests {
             b.extend_col(0, &gs);
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, schema);
         b
     }
 
@@ -594,7 +591,7 @@ mod tests {
         let out = op_union(a, Some(&b), &schema);
 
         assert_eq!(out.count, 2, "Z-Set + keeps both shared-PK rows");
-        assert!(out.sorted);
+        assert!(out.is_sorted());
         // Both rows carry PK=1.
         assert_eq!(out.get_pk(0) as u64, 1);
         assert_eq!(out.get_pk(1) as u64, 1);
@@ -642,13 +639,15 @@ mod tests {
         let schema = make_schema_u64_i64();
         let func = ScalarFunc::from_predicate(LogicalProgram::new(instrs, 1, 0, vec![]), &schema);
 
-        let mut batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-        batch.consolidated = true;
+        let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
 
         let out = op_filter(&batch, &func, &schema);
         assert_eq!(out.count, 2);
-        assert!(out.consolidated, "consolidated input + pass-all → consolidated output");
-        assert!(out.sorted);
+        assert!(
+            out.is_consolidated(),
+            "consolidated input + pass-all → consolidated output"
+        );
+        assert!(out.is_sorted());
     }
 
     // -----------------------------------------------------------------------
@@ -665,7 +664,7 @@ mod tests {
         assert_eq!(out.get_weight(1), 1);
         assert_eq!(get_payload_i64(&out, 0), 10);
         assert_eq!(get_payload_i64(&out, 1), 20);
-        assert!(out.consolidated);
+        assert!(out.is_consolidated());
     }
 
     // -----------------------------------------------------------------------
@@ -704,13 +703,13 @@ mod tests {
         // sorted by (PK, payload), all rows present, equal-PK groups
         // payload-sorted, weights not summed (union, not consolidation).
         let schema = wide_pk_3xu64_schema();
-        let a = make_wide_batch(&schema, &[(0, 0, 1, 1, 20), (0, 0, 3, 1, 300)]).into_inner();
-        let b = make_wide_batch(&schema, &[(0, 0, 1, 1, 10), (0, 0, 2, 1, 200)]).into_inner();
+        let a = make_wide_batch(&schema, &[(0, 0, 1, 1, 20), (0, 0, 3, 1, 300)]);
+        let b = make_wide_batch(&schema, &[(0, 0, 1, 1, 10), (0, 0, 2, 1, 200)]);
 
         let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 4);
-        assert!(out.sorted);
-        assert!(!out.consolidated);
+        assert!(out.is_sorted());
+        assert!(!out.is_consolidated());
 
         assert_eq!(wide_pk_triple(&out, 0), (0, 0, 1));
         assert_eq!(get_payload_i64(&out, 0), 10);
@@ -743,7 +742,7 @@ mod tests {
         let a = make_batch(&schema, &[(1, 1, 10)]);
         let out = op_union(a, None, &schema);
         assert_eq!(out.count, 1);
-        assert!(out.sorted && out.consolidated);
+        assert!(out.is_sorted() && out.is_consolidated());
         assert_eq!(get_payload_i64(&out, 0), 10);
     }
 
@@ -761,7 +760,7 @@ mod tests {
         let b = make_batch_i64pk(&schema, &[(-1, 1, 400), (3, 1, 500)]);
         let out = op_union(a, Some(&b), &schema);
         assert_eq!(out.count, 5);
-        assert!(out.sorted);
+        assert!(out.is_sorted());
         let pks: Vec<i64> = (0..out.count)
             .map(|i| {
                 let mut le = [0u8; 8];
@@ -860,8 +859,7 @@ mod tests {
         gs[8..16].copy_from_slice(&heap_off.to_le_bytes());
         b.extend_col(0, &gs);
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, &schema);
 
         let func = always_true_func(&schema);
         let out = op_filter(&b, &func, &schema);
@@ -1021,8 +1019,8 @@ mod tests {
         assert_eq!(get_payload_i64(&out, 1), 100);
         assert_eq!(get_payload_i64(&out, 2), 300);
         // Reindex destroys PK order — output must be marked accordingly.
-        assert!(!out.sorted, "reindex output must not be marked sorted");
-        assert!(!out.consolidated, "reindex output must not be marked consolidated");
+        assert!(!out.is_sorted(), "reindex output must not be marked sorted");
+        assert!(!out.is_consolidated(), "reindex output must not be marked consolidated");
     }
 
     // -----------------------------------------------------------------------

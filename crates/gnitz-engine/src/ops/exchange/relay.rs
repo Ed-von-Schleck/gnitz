@@ -7,8 +7,8 @@ use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::{
-    compare_pk_ordering, partition_for_pk_bytes, pk_sort_key, scatter_multi_source, write_to_batch, Batch,
-    ConsolidatedBatch, MemBatch,
+    compare_pk_ordering, partition_for_pk_bytes, pk_sort_key, scatter_multi_source, write_to_batch, Batch, Layout,
+    MemBatch,
 };
 
 use super::router::{build_w_map, compound_join_packer, key_is_promoted, route_nonpk_row, RouteMode};
@@ -68,10 +68,12 @@ pub(super) fn op_repartition_batch(
         })
         .collect();
     if is_pk_routing {
+        // Each per-worker PK-routed sub-batch is an in-order, distinct subset of
+        // the single source, so it carries the source's layout faithfully — the
+        // same `inherit_layout` propagation `op_repartition_batches_mode` uses.
         for b in out.iter_mut() {
             if b.count > 0 {
-                b.sorted = batch.sorted;
-                b.consolidated = batch.consolidated;
+                b.inherit_layout(batch);
             }
         }
     }
@@ -172,8 +174,10 @@ pub(crate) fn op_repartition_batches_mode(
             if let (Some(src), None) = (contributing.next(), contributing.next()) {
                 for b in out.iter_mut() {
                     if b.count > 0 {
-                        b.sorted = src.sorted;
-                        b.consolidated = src.consolidated;
+                        // PK-routed single source: each per-worker sub-batch is an
+                        // in-order subset of one source, so it carries the source's
+                        // layout faithfully.
+                        b.inherit_layout(src);
                     }
                 }
             }
@@ -366,7 +370,7 @@ fn relay_scatter_merge_walk(
 /// Output batches are sorted but not consolidated (duplicate PKs can appear across sources).
 #[cfg(test)]
 pub(super) fn op_relay_scatter_consolidated(
-    sources: &[Option<&ConsolidatedBatch>],
+    sources: &[Option<&Batch>],
     col_indices: &[u32],
     schema: &SchemaDescriptor,
     num_workers: usize,
@@ -375,15 +379,15 @@ pub(super) fn op_relay_scatter_consolidated(
 }
 
 pub(crate) fn op_relay_scatter_consolidated_mode(
-    sources: &[Option<&ConsolidatedBatch>],
+    sources: &[Option<&Batch>],
     col_indices: &[u32],
     target_tcs: &[u8],
     schema: &SchemaDescriptor,
     num_workers: usize,
     mode: RouteMode,
 ) -> Vec<Batch> {
-    // The `ConsolidatedBatch` type certifies the flag; in debug, additionally
-    // verify the data matches before the merge-walk fast-paths on it.
+    // The dispatch gate selected these on `is_consolidated()`; debug-verify each
+    // source's data here before the merge-walk fast-paths on it.
     #[cfg(debug_assertions)]
     for s in sources.iter().flatten() {
         s.debug_verify_consolidated(schema);
@@ -433,9 +437,12 @@ pub(crate) fn op_relay_scatter_consolidated_mode(
                 let mut b = write_to_batch(schema, worker_rows[w].len(), blob_cap, |writer| {
                     scatter_multi_source(&mem_batches, &worker_rows[w], writer);
                 });
-                b.sorted = true;
+                // One contributing source ⇒ each worker's PK-routed slice is an
+                // in-order, distinct subset of a consolidated source: certify it.
+                // Multiple sources merge by PK only (not (PK, payload)), so the
+                // output is not even `Sorted` — leave it `Raw`; the consumer re-folds.
                 if single_source {
-                    b.consolidated = true;
+                    b.certify_layout(Layout::Consolidated, schema);
                 }
                 b
             })
@@ -547,22 +554,14 @@ pub(super) fn op_multi_scatter(
             }
         }
 
-        // Flag propagation: PK-spec sub-batches inherit sorted/consolidated from source.
+        // Layout propagation: each PK-spec sub-batch is a faithful, in-order subset
+        // of the single source, so it inherits the source's layout (the same
+        // propagation `op_repartition_batch` uses). Non-PK specs stay Raw.
         for si in 0..n_specs {
-            let spec = col_specs[si];
-            if spec == schema.pk_indices() {
-                if crate::storage::ConsolidatedBatch::from_batch_ref(batch).is_some() {
-                    for batch in results[si].iter_mut().take(num_workers) {
-                        if batch.count > 0 {
-                            batch.sorted = true;
-                            batch.consolidated = true;
-                        }
-                    }
-                } else if batch.sorted {
-                    for batch in results[si].iter_mut().take(num_workers) {
-                        if batch.count > 0 {
-                            batch.sorted = true;
-                        }
+            if col_specs[si] == schema.pk_indices() {
+                for sb in results[si].iter_mut() {
+                    if sb.count > 0 {
+                        sb.inherit_layout(batch);
                     }
                 }
             }
@@ -622,7 +621,7 @@ mod tests {
         )
     }
 
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
+    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -633,12 +632,11 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Consolidated, schema);
+        b
     }
 
-    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> ConsolidatedBatch {
+    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -663,9 +661,8 @@ mod tests {
             b.extend_col(0, &gs);
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Consolidated, schema);
+        b
     }
 
     fn total_rows(batches: &[Batch]) -> usize {
@@ -714,7 +711,7 @@ mod tests {
         );
         // sources[1] = b1 (si=1), sources[2] = b2 (si=2): the tiebreak must emit
         // b1's (3,3,3) copy before b2's.
-        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
         let result = op_relay_scatter_consolidated(&sources, schema.pk_indices(), &schema, num_workers);
 
         assert_eq!(total_rows(&result), 10);
@@ -781,7 +778,7 @@ mod tests {
         ((c1 as u128) << 64) | (c0 as u128)
     }
 
-    fn make_narrow_compound_batch(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> ConsolidatedBatch {
+    fn make_narrow_compound_batch(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
             // `mk_compound_pk` packs c0 in the low 8 bytes and c1 in the high 8.
@@ -796,9 +793,8 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Consolidated, schema);
+        b
     }
 
     #[test]
@@ -837,7 +833,7 @@ mod tests {
                 (mk_compound_pk(7, 0), 1, 33),
             ],
         );
-        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
         // col_indices = [0, 1] is the full PK set: exercises the compound-PK-set
         // is_pk_routing path (route_pk via partition_for_pk_bytes over the OPK bytes).
         let result = op_relay_scatter_consolidated(&sources, &[0u32, 1u32], &schema, num_workers);
@@ -874,7 +870,7 @@ mod tests {
         )
     }
 
-    fn make_i64_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> ConsolidatedBatch {
+    fn make_i64_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
             // Signed PK at rest is OPK (big-endian, sign-bit flipped), so
@@ -886,28 +882,27 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Consolidated, schema);
+        b
     }
 
     #[test]
     fn test_relay_scatter_i64_pk_signed_ordering() {
-        // Native I64 PK with negative values. Each output batch must be
-        // sorted under canonical signed order — raw u128 ordering would put
-        // -1 (0xFFFF...) after +1 and break the `sorted = true` invariant set
-        // by op_relay_scatter_consolidated.
+        // Native I64 PK with negative values. The multi-source merge walk
+        // orders rows by OPK bytes (canonical signed order) — raw u128 ordering
+        // would put -1 (0xFFFF...) after +1. The per-worker output is left Raw
+        // (≥2 sources, PK-only merge), but each worker's rows must still be in
+        // OPK order; that is what this test guards.
         let schema = make_schema_i64_i64();
         let num_workers = 4;
         // Each source sorted ascending under signed I64 order.
         let b0 = make_i64_batch(&schema, &[(-100, 1, 10), (-1, 1, 11), (5, 1, 12)]);
         let b1 = make_i64_batch(&schema, &[(-50, 1, 20), (0, 1, 21), (100, 1, 22)]);
-        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
 
         assert_eq!(total_rows(&result), 6);
         for (w, sb) in result.iter().enumerate() {
-            assert!(sb.sorted, "worker {w} output not marked sorted");
             for r in 1..sb.count {
                 let prev = sb.get_pk(r - 1);
                 let cur = sb.get_pk(r);
@@ -937,7 +932,7 @@ mod tests {
                 (256, 11, 12, 1, 4), // c0 multi-byte: under LE this sorts before (7,8,9)
             ],
         );
-        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0)];
         let result = op_relay_scatter_consolidated(&sources, schema.pk_indices(), &schema, num_workers);
 
         assert_eq!(total_rows(&result), 4);
@@ -1075,20 +1070,23 @@ mod tests {
     fn test_repartition_batch_pk_routing_propagates_flags() {
         let schema = make_schema_u64_i64(); // PK = col 0 (U64), payload = col 1 (I64)
         let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-        assert!(b.sorted && b.consolidated);
+        assert!(b.is_sorted() && b.is_consolidated());
 
         // PK routing (col 0 == pk_indices()): single source ⇒ flags propagate.
         let pk_routed = op_repartition_batch(&b, &[0u32], &schema, 4);
         for sb in pk_routed.iter().filter(|s| s.count > 0) {
-            assert!(sb.sorted, "PK-routed sub-batch must inherit sorted");
-            assert!(sb.consolidated, "PK-routed sub-batch must inherit consolidated");
+            assert!(sb.is_sorted(), "PK-routed sub-batch must inherit sorted");
+            assert!(sb.is_consolidated(), "PK-routed sub-batch must inherit consolidated");
         }
 
         // Non-PK routing (col 1): hash distribution destroys PK order ⇒ no flags.
         let hash_routed = op_repartition_batch(&b, &[1u32], &schema, 4);
         for sb in hash_routed.iter().filter(|s| s.count > 0) {
-            assert!(!sb.sorted, "non-PK-routed sub-batch must not claim sorted");
-            assert!(!sb.consolidated, "non-PK-routed sub-batch must not claim consolidated");
+            assert!(!sb.is_sorted(), "non-PK-routed sub-batch must not claim sorted");
+            assert!(
+                !sb.is_consolidated(),
+                "non-PK-routed sub-batch must not claim consolidated"
+            );
         }
     }
 
@@ -1100,8 +1098,11 @@ mod tests {
         let single: Vec<Option<&Batch>> = vec![Some(&b0)];
         let out = op_repartition_batches_mode(&single, &[0u32], &[], &schema, 4, RouteMode::GroupKey);
         for sb in out.iter().filter(|s| s.count > 0) {
-            assert!(sb.sorted, "single-source PK-routed must inherit sorted");
-            assert!(sb.consolidated, "single-source PK-routed must inherit consolidated");
+            assert!(sb.is_sorted(), "single-source PK-routed must inherit sorted");
+            assert!(
+                sb.is_consolidated(),
+                "single-source PK-routed must inherit consolidated"
+            );
         }
 
         // Two contributing sources, PK routing: per-source-concatenated output is
@@ -1110,23 +1111,26 @@ mod tests {
         let multi: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         let out = op_repartition_batches_mode(&multi, &[0u32], &[], &schema, 4, RouteMode::GroupKey);
         for sb in out.iter().filter(|s| s.count > 0) {
-            assert!(!sb.sorted, "multi-source scatter must not claim sorted");
-            assert!(!sb.consolidated, "multi-source scatter must not claim consolidated");
+            assert!(!sb.is_sorted(), "multi-source scatter must not claim sorted");
+            assert!(
+                !sb.is_consolidated(),
+                "multi-source scatter must not claim consolidated"
+            );
         }
     }
 
     #[test]
     fn test_repartition_batch_sorted_not_consolidated_pk_routing() {
         let schema = make_schema_u64_i64();
-        let mut b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).into_inner();
+        let mut b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         // Sorted but not consolidated source: only `sorted` may propagate.
-        b.consolidated = false;
-        assert!(b.sorted && !b.consolidated);
+        b.set_layout_unchecked(Layout::Sorted);
+        assert!(b.is_sorted() && !b.is_consolidated());
 
         let out = op_repartition_batch(&b, &[0u32], &schema, 4);
         for sb in out.iter().filter(|s| s.count > 0) {
-            assert!(sb.sorted, "PK-routed sub-batch inherits sorted");
-            assert!(!sb.consolidated, "must not invent consolidated");
+            assert!(sb.is_sorted(), "PK-routed sub-batch inherits sorted");
+            assert!(!sb.is_consolidated(), "must not invent consolidated");
         }
     }
 
@@ -1137,28 +1141,38 @@ mod tests {
         let b0 = make_batch(&schema, &[(1, 1, 10), (5, 1, 50), (9, 1, 90)]);
         let b1 = make_batch(&schema, &[(2, 1, 20), (6, 1, 60), (10, 1, 100)]);
 
-        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
 
         assert_eq!(total_rows(&result), 6);
         for sb in &result {
             if sb.count > 0 {
+                // Multiple sources merge by PK only (not (PK, payload)), so the
+                // output claims neither Consolidated nor Sorted — the consumer
+                // re-folds. The rows are still PK-ordered, though: verify that.
                 assert!(
-                    !sb.consolidated,
+                    !sb.is_consolidated(),
                     "merged path uses PK-only comparison, must not claim consolidated"
                 );
-                assert!(sb.sorted, "merged path output must be sorted");
+                assert!(!sb.is_sorted(), "multi-source merged path is left Raw");
+                for r in 1..sb.count {
+                    assert_ne!(
+                        compare_pk_bytes(sb.get_pk_bytes(r - 1), sb.get_pk_bytes(r)),
+                        Ordering::Greater,
+                        "merged path output not PK-ordered at row {r}",
+                    );
+                }
             }
         }
 
         // Single contributing source: no cross-source duplicate PK possible, so
         // the output is consolidated as well as sorted.
-        let single: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0)];
+        let single: Vec<Option<&Batch>> = vec![Some(&b0)];
         let result = op_relay_scatter_consolidated(&single, &[0u32], &schema, num_workers);
         assert_eq!(total_rows(&result), 3);
         for sb in result.iter().filter(|s| s.count > 0) {
-            assert!(sb.sorted, "single-source merge output must be sorted");
-            assert!(sb.consolidated, "single-source merge output must be consolidated");
+            assert!(sb.is_sorted(), "single-source merge output must be sorted");
+            assert!(sb.is_consolidated(), "single-source merge output must be consolidated");
         }
     }
 
@@ -1176,7 +1190,7 @@ mod tests {
         for sb in &result {
             if sb.count > 0 {
                 assert!(
-                    !sb.consolidated,
+                    !sb.is_consolidated(),
                     "non-consolidated path output must not be consolidated"
                 );
             }
@@ -1188,7 +1202,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let num_workers = 4;
         let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-        assert!(b.sorted && b.consolidated);
+        assert!(b.is_sorted() && b.is_consolidated());
 
         let specs: Vec<&[u32]> = vec![&[0u32], &[1u32]];
         let result = op_multi_scatter(&b, &specs, &schema, num_workers);
@@ -1196,15 +1210,18 @@ mod tests {
         // PK spec (specs[0]): sub-batches must inherit sorted + consolidated
         for sb in &result[0] {
             if sb.count > 0 {
-                assert!(sb.sorted, "PK spec sub-batch must inherit sorted");
-                assert!(sb.consolidated, "PK spec sub-batch must inherit consolidated");
+                assert!(sb.is_sorted(), "PK spec sub-batch must inherit sorted");
+                assert!(sb.is_consolidated(), "PK spec sub-batch must inherit consolidated");
             }
         }
         // Non-PK spec (specs[1]): must NOT inherit
         for sb in &result[1] {
             if sb.count > 0 {
-                assert!(!sb.sorted, "non-PK spec sub-batch must not inherit sorted");
-                assert!(!sb.consolidated, "non-PK spec sub-batch must not inherit consolidated");
+                assert!(!sb.is_sorted(), "non-PK spec sub-batch must not inherit sorted");
+                assert!(
+                    !sb.is_consolidated(),
+                    "non-PK spec sub-batch must not inherit consolidated"
+                );
             }
         }
     }
@@ -1264,13 +1281,13 @@ mod tests {
         // claim consolidated because it uses PK-only comparison.
         let b0 = make_batch(&schema, &[(1, 1, 10)]);
         let b1 = make_batch(&schema, &[(1, 1, 10)]);
-        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
 
         assert_eq!(total_rows(&result), 2, "both rows must appear in output");
         for sb in &result {
             if sb.count > 0 {
-                assert!(!sb.consolidated, "merged path must not claim consolidated");
+                assert!(!sb.is_consolidated(), "merged path must not claim consolidated");
             }
         }
     }
@@ -1283,7 +1300,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: (PK=1, val=100, w=+1) — a row inserted in a previous tick.
-        let trace_batch = Rc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
+        let trace_batch = Rc::new(make_batch(&schema, &[(1, 1, 100)]));
         let mut cursor_handle = CursorHandle::from_owned(&[trace_batch], schema);
 
         // Delta: UPDATE PK=1 sets val=100 → 200.
@@ -1291,7 +1308,7 @@ mod tests {
         // Both rows have the same PK but different payloads; sorted by payload ascending.
         let delta = make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]);
 
-        let (out, _consolidated) = crate::ops::op_distinct(delta.into_inner(), cursor_handle.cursor_mut(), &schema);
+        let (out, _consolidated) = crate::ops::op_distinct(delta, cursor_handle.cursor_mut(), &schema);
 
         assert_eq!(
             out.count, 2,
@@ -1317,7 +1334,7 @@ mod tests {
         // After merge-walk each worker's batch must be PK-sorted.
         let b0 = make_batch(&schema, &[(1, 1, 0), (3, 1, 0), (5, 1, 0)]);
         let b1 = make_batch(&schema, &[(2, 1, 0), (4, 1, 0), (6, 1, 0)]);
-        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, 4);
         for sb in &result {
             for r in 1..sb.count {
@@ -1336,7 +1353,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let b0 = make_batch(&schema, &[(1, 1, 10)]);
         let b1 = make_batch(&schema, &[(1, 1, 20)]);
-        let sources: Vec<Option<&ConsolidatedBatch>> = vec![Some(&b0), Some(&b1)];
+        let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
         let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, 4);
         for sb in &result {
             if sb.count >= 2 {
@@ -1407,7 +1424,7 @@ mod tests {
         )
     }
 
-    fn make_join_key_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u128)]) -> ConsolidatedBatch {
+    fn make_join_key_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u128)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, c1, c2) in rows {
             b.extend_pk(pk as u128);
@@ -1417,9 +1434,8 @@ mod tests {
             b.extend_col(1, &c2.to_le_bytes()); // U128 payload (pi 1)
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Consolidated, schema);
+        b
     }
 
     #[test]
@@ -1535,9 +1551,8 @@ mod tests {
             b.extend_col(0, &key.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        let cb = ConsolidatedBatch::new_unchecked(b);
+        b.certify_layout(Layout::Consolidated, &schema);
+        let cb = b;
         let cols = [1u32];
         let targets = [type_code::I64];
 
@@ -1594,7 +1609,8 @@ mod tests {
             ],
             &[0],
         );
-        let pk_rows: &[(i32, u64)] = &[(-5, 9), (-1, 9), (3, 9), (i32::MIN, 9)];
+        // OPK order: i32::MIN sign-flips to 0x0000_0000 → sorts first, then ascending.
+        let pk_rows: &[(i32, u64)] = &[(i32::MIN, 9), (-5, 9), (-1, 9), (3, 9)];
         let mut pb = Batch::with_schema(pk_schema, pk_rows.len());
         for &(pk, v) in pk_rows {
             let mut opk = [0u8; 4];
@@ -1605,9 +1621,8 @@ mod tests {
             pb.extend_col(0, &v.to_le_bytes());
             pb.count += 1;
         }
-        pb.sorted = true;
-        pb.consolidated = true;
-        let pk_cb = ConsolidatedBatch::new_unchecked(pb);
+        pb.certify_layout(Layout::Consolidated, &pk_schema);
+        let pk_cb = pb;
         let pk_cols = [0u32];
         let pk_targets = [type_code::I64];
         let pk_packer = ReindexPacker::new(&pk_schema, &pk_cols, &pk_targets);
@@ -1720,7 +1735,7 @@ mod tests {
 
         // Run both walk variants over the same K sources, assert identical output,
         // and time each. `build` keeps the three stride builders' batches alive.
-        let bench = |label: &str, cbs: &[ConsolidatedBatch]| {
+        let bench = |label: &str, cbs: &[Batch]| {
             let mem_batches: Vec<Option<MemBatch>> = cbs.iter().map(|cb| Some(cb.as_mem_batch())).collect();
             let total: usize = mem_batches.iter().flatten().map(|m| m.count).sum();
             let w_map = build_w_map(num_workers);
@@ -1795,7 +1810,7 @@ mod tests {
 
         // stride 8 — single U64 PK.
         let s8 = make_schema_u64_i64();
-        let b8: Vec<ConsolidatedBatch> = (0..K)
+        let b8: Vec<Batch> = (0..K)
             .map(|s| {
                 let rows: Vec<(u64, i64, i64)> = (0..per_src).map(|j| ((s + K * j) as u64, 1, j as i64)).collect();
                 make_batch(&s8, &rows)
@@ -1806,7 +1821,7 @@ mod tests {
         // stride 16 — (U64, U64) compound PK. c0 = global index (ascending), c1 = 0;
         // `make_narrow_compound_batch` reads the low 64 bits as c0 (see `mk_compound_pk`).
         let s16 = make_narrow_compound_schema();
-        let b16: Vec<ConsolidatedBatch> = (0..K)
+        let b16: Vec<Batch> = (0..K)
             .map(|s| {
                 let rows: Vec<(u128, i64, i64)> = (0..per_src).map(|j| ((s + K * j) as u128, 1, j as i64)).collect();
                 make_narrow_compound_batch(&s16, &rows)
@@ -1816,7 +1831,7 @@ mod tests {
 
         // stride 24 — (U64, U64, U64) wide PK. c0 = global index (ascending), c1=c2=0.
         let s24 = wide_pk_3xu64_schema();
-        let b24: Vec<ConsolidatedBatch> = (0..K)
+        let b24: Vec<Batch> = (0..K)
             .map(|s| {
                 let rows: Vec<(u64, u64, u64, i64, i64)> =
                     (0..per_src).map(|j| ((s + K * j) as u64, 0, 0, 1, j as i64)).collect();

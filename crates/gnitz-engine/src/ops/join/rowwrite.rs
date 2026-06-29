@@ -177,7 +177,7 @@ mod tests {
     use super::super::test_common::*;
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::Batch;
+    use crate::storage::{Batch, Layout};
 
     #[test]
     fn test_write_join_row_compound_pk_bytes() {
@@ -286,8 +286,7 @@ mod tests {
         trace.extend_weight(&1i64.to_le_bytes());
         trace.extend_null_bmp(&0u64.to_le_bytes());
         trace.count += 1;
-        trace.sorted = true;
-        trace.consolidated = true;
+        trace.certify_layout(Layout::Consolidated, &right_schema);
         let trace = Rc::new(trace);
         let mut ch = CursorHandle::from_owned(&[trace], right_schema);
         let cursor = ch.cursor_mut();

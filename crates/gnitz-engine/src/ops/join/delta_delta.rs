@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{pk_bytes_eq, with_payload_cmp, Batch, ConsolidatedBatch, MemBatch};
+use crate::storage::{pk_bytes_eq, with_payload_cmp, Batch, Layout, MemBatch};
 
 use super::super::cogroup::{cogroup_intersection, cogroup_left, BatchCursor};
 use super::rowwrite::write_join_row_from_batches;
@@ -17,13 +17,13 @@ use super::rowwrite::write_join_row_from_batches;
 
 /// Emit batch_a rows whose (PK, payload) has NO positive-weight match in batch_b.
 /// For SQL EXCEPT: a row is excluded only if B has a matching (PK, payload), not just PK.
-pub fn op_anti_join_delta_delta(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> ConsolidatedBatch {
-    ConsolidatedBatch::new_unchecked(filter_join_dd_with_payload(batch_a, batch_b, schema))
+pub fn op_anti_join_delta_delta(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
+    filter_join_dd_with_payload(batch_a, batch_b, schema)
 }
 
 /// Emit batch_a rows whose PK HAS a positive-weight match in batch_b.
-pub fn op_semi_join_delta_delta(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> ConsolidatedBatch {
-    ConsolidatedBatch::new_unchecked(semi_join_dd(batch_a, batch_b, schema))
+pub fn op_semi_join_delta_delta(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
+    semi_join_dd(batch_a, batch_b, schema)
 }
 
 /// PK-only semi-join DD: emit each A PK group iff B has a positive-weight row at
@@ -35,8 +35,8 @@ fn semi_join_dd(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> 
     let npc = schema.num_payload_cols();
     let cs_a = Batch::consolidate_if_needed(batch_a, schema);
     let cs_b = Batch::consolidate_if_needed(batch_b, schema);
-    let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
-    let cb: &Batch = cs_b.as_deref().unwrap_or(batch_b);
+    let ca: &Batch = cs_a.as_ref().unwrap_or(batch_a);
+    let cb: &Batch = cs_b.as_ref().unwrap_or(batch_b);
     let n_a = ca.count;
     if n_a == 0 {
         return Batch::empty(npc, schema.pk_stride());
@@ -55,8 +55,9 @@ fn semi_join_dd(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> 
         }
     });
 
-    output.sorted = true;
-    output.consolidated = true;
+    // Emitted in A's (PK, payload) order, one append per unmatched run ⇒ sorted
+    // and ghost-free (left schema only).
+    output.certify_layout(Layout::Consolidated, schema);
     gnitz_debug!("op_semi_join_dd: a={} b={} out={}", n_a, cb.count, output.count);
     output
 }
@@ -66,8 +67,8 @@ fn semi_join_dd(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> 
 fn filter_join_dd_with_payload(batch_a: &Batch, batch_b: &Batch, schema: &SchemaDescriptor) -> Batch {
     let cs_a = Batch::consolidate_if_needed(batch_a, schema);
     let cs_b = Batch::consolidate_if_needed(batch_b, schema);
-    let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
-    let cb: &Batch = cs_b.as_deref().unwrap_or(batch_b);
+    let ca: &Batch = cs_a.as_ref().unwrap_or(batch_a);
+    let cb: &Batch = cs_b.as_ref().unwrap_or(batch_b);
 
     with_payload_cmp!(schema, filter_join_dd_with_payload_inner, ca, cb, schema)
 }
@@ -133,8 +134,9 @@ where
         m.seek(b_end);
     });
 
-    output.sorted = true;
-    output.consolidated = true;
+    // A rows emitted in (PK, payload) order, each unmatched run one append ⇒
+    // sorted and ghost-free (left schema only).
+    output.certify_layout(Layout::Consolidated, schema);
     gnitz_debug!("op_anti_join_dd: a={} b={} out={}", n_a, n_b, output.count);
     output
 }
@@ -158,8 +160,8 @@ pub fn op_join_delta_delta(
 
     let cs_a = Batch::consolidate_if_needed(batch_a, left_schema);
     let cs_b = Batch::consolidate_if_needed(batch_b, right_schema);
-    let ca: &Batch = cs_a.as_deref().unwrap_or(batch_a);
-    let cb: &Batch = cs_b.as_deref().unwrap_or(batch_b);
+    let ca: &Batch = cs_a.as_ref().unwrap_or(batch_a);
+    let cb: &Batch = cs_b.as_ref().unwrap_or(batch_b);
     let n_a = ca.count;
     let n_b = cb.count;
 
@@ -198,12 +200,37 @@ pub fn op_join_delta_delta(
     });
 
     // Distinct left×right products emitted in ascending (PK, payload) order and
-    // ghost-free (the `w_out != 0` guard), so the output is genuinely sorted and
-    // consolidated — set both, since `empty_joined` defaults them clear.
-    output.sorted = true;
-    output.consolidated = true;
+    // ghost-free (the `w_out != 0` guard) ⇒ `Consolidated`. The joined batch carries
+    // no single `SchemaDescriptor`, so in debug we reconstruct one to verify the
+    // claim; release `certify_layout` ignores the schema (single field store), so
+    // pass `left_schema` there and skip building the throwaway joined schema.
+    #[cfg(debug_assertions)]
+    output.certify_layout(Layout::Consolidated, &joined_schema(left_schema, right_schema));
+    #[cfg(not(debug_assertions))]
+    output.certify_layout(Layout::Consolidated, left_schema);
     gnitz_debug!("op_join_dd: a={} b={} out={}", n_a, n_b, output.count);
     output
+}
+
+/// Build the inner-join output schema `[left cols…, right payload…]` carrying the
+/// left PK — the layout `op_join_delta_delta` certifies against. Mirrors the
+/// physical join output (`empty_joined`); a no-alloc stack build used only to
+/// debug-verify the certified `Consolidated` tag, so it is itself debug-only
+/// (release `certify_layout` ignores the schema).
+#[cfg(debug_assertions)]
+fn joined_schema(left: &SchemaDescriptor, right: &SchemaDescriptor) -> SchemaDescriptor {
+    use crate::schema::SchemaColumn;
+    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    let mut n = 0;
+    for ci in 0..left.num_columns() {
+        cols[n] = left.columns[ci];
+        n += 1;
+    }
+    for (_, _, col) in right.payload_columns() {
+        cols[n] = *col;
+        n += 1;
+    }
+    SchemaDescriptor::new(&cols[..n], left.pk_indices())
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +242,7 @@ mod tests {
     use super::super::test_common::*;
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD};
-    use crate::storage::{Batch, ConsolidatedBatch};
+    use crate::storage::{Batch, Layout};
     use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
     #[test]
@@ -227,7 +254,7 @@ mod tests {
         let out = op_anti_join_delta_delta(&a, &b, &schema);
         // All 3 rows survive (different payloads)
         assert_eq!(out.count, 3);
-        assert!(out.consolidated);
+        assert!(out.is_consolidated());
     }
 
     #[test]
@@ -328,7 +355,7 @@ mod tests {
         assert_eq!(out.count, 2);
         assert_eq!((out.get_pk(0) as u64), 2);
         assert_eq!((out.get_pk(1) as u64), 3);
-        assert!(out.consolidated);
+        assert!(out.is_consolidated());
     }
 
     #[test]
@@ -359,7 +386,7 @@ mod tests {
         // (w=1*1=1), (w=1*3=3), (w=1*-1=-1), (w=2*1=2), (w=2*3=6), (w=2*-1=-2)
         // All non-zero → 6 rows
         assert_eq!(out.count, 6);
-        assert!(out.sorted);
+        assert!(out.is_sorted());
 
         // Check weights: row 0 = (a[0] × b[0]) = 1*1 = 1
         assert_eq!(out.get_weight(0), 1);
@@ -413,8 +440,7 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = false;
+        b.certify_layout(Layout::Sorted, &rs);
 
         let out = op_join_delta_delta(&a, &b, &ls, &rs);
         // b consolidates to empty (1 + -1 = 0 for same pk+payload) → no match
@@ -665,7 +691,7 @@ mod tests {
         )
     }
 
-    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> ConsolidatedBatch {
+    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -690,9 +716,8 @@ mod tests {
             b.extend_col(0, &gs);
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Consolidated, schema);
+        b
     }
 
     fn read_str_payload(batch: &Batch, col: usize, row: usize) -> String {
@@ -720,7 +745,7 @@ mod tests {
         )
     }
 
-    fn make_batch_blob(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> ConsolidatedBatch {
+    fn make_batch_blob(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, bytes) in rows {
             b.extend_pk(pk as u128);
@@ -740,8 +765,7 @@ mod tests {
             b.extend_col(0, &gs);
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Consolidated, schema);
+        b
     }
 }

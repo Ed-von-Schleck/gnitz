@@ -10,8 +10,8 @@ use crate::foundation::posix_io;
 use crate::foundation::syscall;
 use crate::foundation::xxh;
 use crate::runtime::wire::{
-    build_schema_wire_block, encode_ctrl_block_direct, encode_wire_into, wire_size, CTRL_BLOCK_SIZE_NO_BLOB,
-    FLAG_BATCH_CONSOLIDATED, FLAG_BATCH_SORTED, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK,
+    build_schema_wire_block, encode_ctrl_block_direct, encode_wire_into, layout_to_wire_flags, wire_size,
+    CTRL_BLOCK_SIZE_NO_BLOB, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK,
 };
 use crate::schema::SchemaDescriptor;
 use crate::storage::{carve_writer_slices, scatter_copy, Batch, DirectWriter};
@@ -1005,12 +1005,7 @@ impl SalWriter {
             let full_wire_flags = wire_flags
                 | FLAG_HAS_SCHEMA
                 | if count_w > 0 { FLAG_HAS_DATA } else { 0 }
-                | if input_batch.sorted { FLAG_BATCH_SORTED } else { 0 }
-                | if input_batch.consolidated {
-                    FLAG_BATCH_CONSOLIDATED
-                } else {
-                    0
-                };
+                | layout_to_wire_flags(input_batch.layout());
             encode_ctrl_block_direct(
                 slot,
                 0,

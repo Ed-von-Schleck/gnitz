@@ -943,6 +943,7 @@ pub(crate) fn create_read_cursor(
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+    use crate::storage::Layout;
     use crate::test_support::wide_pk_3xu64_schema;
 
     fn make_schema_i64() -> SchemaDescriptor {
@@ -981,8 +982,7 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, &schema);
         Rc::new(b)
     }
 
@@ -1104,8 +1104,7 @@ mod tests {
             b.extend_col(0, &v.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, &schema);
         let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
 
         cursor.seek_bytes(&compound_pk_bytes(2, 3));
@@ -1151,8 +1150,7 @@ mod tests {
             b.extend_col(0, &v.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, &schema);
         let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
 
         cursor.seek_bytes(&i64_opk(-1));
@@ -1554,8 +1552,7 @@ mod tests {
             bt.extend_null_bmp(&0u64.to_le_bytes());
             bt.extend_col(0, &val.to_le_bytes());
             bt.count += 1;
-            bt.sorted = true;
-            bt.consolidated = true;
+            bt.certify_layout(Layout::Consolidated, &schema);
             Rc::new(bt)
         };
         // (1,2) precedes (2,1) by (col_A, col_B); the raw-u128 order is reversed.
@@ -1599,8 +1596,7 @@ mod tests {
             bt.extend_col(0, &val.to_le_bytes());
             bt.count += 1;
         }
-        bt.sorted = true;
-        bt.consolidated = true;
+        bt.certify_layout(Layout::Consolidated, &schema);
         Rc::new(bt)
     }
 
@@ -1690,8 +1686,7 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, &schema);
         let batch = Rc::new(b);
         let mut cursor = create_read_cursor(&[batch], &[], schema);
 
@@ -1723,7 +1718,7 @@ mod tests {
         while let Some(chunk) = cursor.drain_chunk(n) {
             assert!(chunk.count <= n, "chunk overflow: {} > {}", chunk.count, n);
             assert!(chunk.count > 0, "drain_chunk returned an empty Some chunk");
-            assert!(chunk.sorted && chunk.consolidated);
+            assert!(chunk.is_sorted() && chunk.is_consolidated());
             for row in 0..chunk.count {
                 let val = i64::from_le_bytes(chunk.get_col_ptr(row, 0, 8).try_into().unwrap());
                 rows.push((chunk.get_pk(row), chunk.get_weight(row), val));
@@ -2238,8 +2233,7 @@ mod tests {
         st[8..16].copy_from_slice(&0u64.to_le_bytes());
         b.extend_col(0, &st);
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, &schema);
         let cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
         assert!(cursor.valid, "cursor must position on the single row");
         assert_eq!(

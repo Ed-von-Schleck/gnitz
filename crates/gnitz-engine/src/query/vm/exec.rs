@@ -158,7 +158,7 @@ pub(crate) fn execute_epoch_multi(
                 let schema = reg!(*trace_reg).schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_scan_trace(cursor, &schema, *chunk_limit);
-                    reg_mut!(*out_reg).batch = result.into_inner();
+                    reg_mut!(*out_reg).batch = result;
                 }
             }
 
@@ -186,8 +186,6 @@ pub(crate) fn execute_epoch_multi(
                     // NullPredicate: clone — in_reg may be read by multiple instructions.
                     let mut out = in_batch.clone_batch();
                     out.set_schema(schema);
-                    out.sorted = in_batch.sorted;
-                    out.consolidated = in_batch.consolidated;
                     out
                 } else {
                     let func = unsafe { &*func_ptr };
@@ -279,12 +277,12 @@ pub(crate) fn execute_epoch_multi(
                     let stride = schema.pk_stride();
                     let delta = std::mem::replace(&mut reg_mut!(*in_reg).batch, Batch::empty(npc, stride));
                     let (output, consolidated) = ops::op_distinct(delta, cursor, &schema);
-                    reg_mut!(*out_reg).batch = output.into_inner();
+                    reg_mut!(*out_reg).batch = output;
                     // Ingest consolidated delta into history table
                     if *hist_table_idx >= 0 {
                         let ptr = program.tables[*hist_table_idx as usize];
                         let table = unsafe { &mut *ptr };
-                        let _ = table.ingest_owned_batch(consolidated.into_inner());
+                        let _ = table.ingest_owned_batch(consolidated);
                     }
                 }
                 // If cursor is null, in_reg retains its data (not consumed).
@@ -333,7 +331,7 @@ pub(crate) fn execute_epoch_multi(
                     // Absent trace ⟹ every delta row has no right-side match → null-extend.
                     // op_null_extend requires consolidated input.
                     let cs = Batch::consolidate_if_needed(&reg!(*delta_reg).batch, &left_schema);
-                    let consolidated = cs.as_deref().unwrap_or(&reg!(*delta_reg).batch);
+                    let consolidated = cs.as_ref().unwrap_or(&reg!(*delta_reg).batch);
                     let result = ops::op_null_extend(consolidated, &left_schema, right_schema);
                     reg_mut!(*out_reg).batch = result;
                 }
@@ -383,7 +381,7 @@ pub(crate) fn execute_epoch_multi(
                 let schema = reg!(*delta_reg).schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_anti_join_delta_trace(&reg!(*delta_reg).batch, cursor, &schema);
-                    reg_mut!(*out_reg).batch = result.into_inner();
+                    reg_mut!(*out_reg).batch = result;
                 } else {
                     // Absent trace ⟹ nothing to exclude; pass delta through, but
                     // consolidate so downstream operators receive consolidated input.
@@ -391,7 +389,7 @@ pub(crate) fn execute_epoch_multi(
                     let stride = schema.pk_stride();
                     let batch = std::mem::replace(&mut reg_mut!(*delta_reg).batch, Batch::empty(npc, stride));
                     let cs = Batch::consolidate_if_needed(&batch, &schema);
-                    let consolidated = cs.map(|c| c.into_inner()).unwrap_or(batch);
+                    let consolidated = cs.unwrap_or(batch);
                     reg_mut!(*out_reg).batch = consolidated;
                 }
             }
@@ -399,7 +397,7 @@ pub(crate) fn execute_epoch_multi(
             Instr::AntiJoinDD { a_reg, b_reg, out_reg } => {
                 let schema = reg!(*a_reg).schema;
                 let result = ops::op_anti_join_delta_delta(&reg!(*a_reg).batch, &reg!(*b_reg).batch, &schema);
-                reg_mut!(*out_reg).batch = result.into_inner();
+                reg_mut!(*out_reg).batch = result;
             }
 
             Instr::SemiJoinDT {
@@ -410,14 +408,14 @@ pub(crate) fn execute_epoch_multi(
                 let schema = reg!(*delta_reg).schema;
                 if let Some(cursor) = cursor_mut!(*trace_reg) {
                     let result = ops::op_semi_join_delta_trace(&reg!(*delta_reg).batch, cursor, &schema);
-                    reg_mut!(*out_reg).batch = result.into_inner();
+                    reg_mut!(*out_reg).batch = result;
                 }
             }
 
             Instr::SemiJoinDD { a_reg, b_reg, out_reg } => {
                 let schema = reg!(*a_reg).schema;
                 let result = ops::op_semi_join_delta_delta(&reg!(*a_reg).batch, &reg!(*b_reg).batch, &schema);
-                reg_mut!(*out_reg).batch = result.into_inner();
+                reg_mut!(*out_reg).batch = result;
             }
 
             Instr::NullExtend {

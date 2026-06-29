@@ -4,7 +4,7 @@
 
 use std::rc::Rc;
 
-use super::super::batch::{write_to_batch, Batch, ConsolidatedBatch};
+use super::super::batch::{write_to_batch, Batch, Layout};
 use super::super::error::StorageError;
 use super::super::merge::{self, pack_pk_be, SortedMemBatch};
 use super::{MemTable, INLINE_CONSOLIDATE_THRESHOLD};
@@ -25,8 +25,7 @@ pub(super) fn consolidate_batches(batches: &[SortedMemBatch], schema: &SchemaDes
     let mut result = write_to_batch(schema, total_rows, total_blob, |writer| {
         merge::merge_batches(batches, schema, writer);
     });
-    result.sorted = true;
-    result.consolidated = true;
+    result.certify_layout(Layout::Consolidated, schema);
     result
 }
 
@@ -58,9 +57,13 @@ impl MemTable {
         }
     }
 
-    /// Append a consolidated batch as a new run.
-    pub fn upsert_sorted_batch(&mut self, batch: ConsolidatedBatch) -> Result<(), StorageError> {
-        let batch = batch.into_inner();
+    /// Append a consolidated batch as a new run. The batch must be consolidated
+    /// (debug-verified at entry); producers certify it via `into_consolidated`.
+    pub fn upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
+        debug_assert!(
+            batch.consolidated_verified(&self.schema),
+            "upsert_sorted_batch requires a consolidated batch",
+        );
         if batch.count == 0 {
             return Ok(());
         }

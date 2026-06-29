@@ -414,6 +414,7 @@ mod tests {
     use super::*;
     use crate::ops::{AggDescriptor, AggOp};
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
+    use crate::storage::Layout;
 
     #[test]
     fn test_clear_deltas_clears_only_delta_registers() {
@@ -486,8 +487,7 @@ mod tests {
             b.extend_col(0, &c0.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, &schema);
         b
     }
 
@@ -503,8 +503,7 @@ mod tests {
             b.extend_col(1, &c1.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, &schema);
         b
     }
 
@@ -976,9 +975,17 @@ mod tests {
     #[test]
     fn test_join_dt_outer_absent_trace_consolidates() {
         let schema = schema_1i64();
-        let mut input = make_batch(schema, &[(2u128, 1, 20), (2u128, 1, 20)]);
-        input.sorted = false;
-        input.consolidated = false;
+        // Raw, unconsolidated input: two identical (PK, payload) rows the operator
+        // must fold. Built inline (not via `make_batch`, which certifies
+        // Consolidated and would reject the duplicate).
+        let mut input = Batch::with_schema(schema, 2);
+        for _ in 0..2 {
+            input.extend_pk(2u128);
+            input.extend_weight(&1i64.to_le_bytes());
+            input.extend_null_bmp(&0u64.to_le_bytes());
+            input.extend_col(0, &20i64.to_le_bytes());
+            input.count += 1;
+        }
         let mut builder = ProgramBuilder::new();
         builder.add_join_dt_outer(0, 1, 2, schema);
         builder.add_halt();
@@ -989,7 +996,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            result.consolidated,
+            result.is_consolidated(),
             "absent-trace outer-join output must be consolidated",
         );
     }
@@ -999,9 +1006,17 @@ mod tests {
     #[test]
     fn test_anti_join_dt_absent_trace_consolidates() {
         let schema = schema_1i64();
-        let mut input = make_batch(schema, &[(2u128, 1, 20), (2u128, 1, 20)]);
-        input.sorted = false;
-        input.consolidated = false;
+        // Raw, unconsolidated input: two identical (PK, payload) rows the operator
+        // must fold. Built inline (not via `make_batch`, which certifies
+        // Consolidated and would reject the duplicate).
+        let mut input = Batch::with_schema(schema, 2);
+        for _ in 0..2 {
+            input.extend_pk(2u128);
+            input.extend_weight(&1i64.to_le_bytes());
+            input.extend_null_bmp(&0u64.to_le_bytes());
+            input.extend_col(0, &20i64.to_le_bytes());
+            input.count += 1;
+        }
         let mut builder = ProgramBuilder::new();
         builder.add_anti_join_dt(0, 1, 2);
         builder.add_halt();
@@ -1012,7 +1027,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            result.consolidated,
+            result.is_consolidated(),
             "absent-trace anti-join output must be consolidated",
         );
     }

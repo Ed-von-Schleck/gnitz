@@ -685,7 +685,9 @@ mod tests {
         // reindexed (delta) side and the OPK-routed (trace) side co-partition.
         let schema = make_schema_i64pk_i64();
         // Each row carries the same logical value V in both the PK and the payload.
-        let vals = [-7i64, -1, 0, 3, i64::MIN, i64::MAX];
+        // Listed in signed (OPK) ascending order so the consolidated batch the
+        // builder certifies is genuinely (PK, payload)-sorted.
+        let vals = [i64::MIN, -7i64, -1, 0, 3, i64::MAX];
         let rows: Vec<(i64, i64, i64)> = vals.iter().map(|&v| (v, 1, v)).collect();
         let batch = make_batch_i64pk(&schema, &rows);
         let mb = batch.as_mem_batch();

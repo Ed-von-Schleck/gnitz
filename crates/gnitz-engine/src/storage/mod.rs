@@ -20,7 +20,7 @@ use repr::{batch, batch_wire, columnar, merge, range_key, scatter};
 mod data_roundtrip_proptest;
 
 // ── Public API ──────────────────────────────────────────────────────────────
-pub use batch::{write_to_batch, Batch, ConsolidatedBatch};
+pub use batch::{write_to_batch, Batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
 pub use lsm::partitioned_table::{partition_for_key, partition_for_pk_bytes, PartitionedTable, Routing};
@@ -32,7 +32,7 @@ pub use scatter::{scatter_copy, scatter_multi_source};
 // ── Crate-internal: operator hot-path types (not official surface) ───────────
 pub(crate) use batch::carve_writer_slices;
 pub(crate) use batch::{
-    index_meta_schema_desc, make_index_schema, project_schema, BatchBuilder, WeightFill, INDEX_META_COL_NAMES,
+    index_meta_schema_desc, make_index_schema, project_schema, BatchBuilder, Layout, WeightFill, INDEX_META_COL_NAMES,
     MAX_WIRE_REGIONS,
 };
 pub(crate) use columnar::{

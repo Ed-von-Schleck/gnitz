@@ -4,7 +4,7 @@
 //! co-group on the join key. Output schema: `[left_PK, left_payload…, right_payload…]`.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{scatter_copy, write_to_batch, Batch, ConsolidatedBatch, ReadCursor};
+use crate::storage::{scatter_copy, write_to_batch, Batch, Layout, ReadCursor};
 
 use super::super::cogroup::{cogroup_intersection, cogroup_left};
 use super::rowwrite::{write_join_row, write_join_row_null_right};
@@ -26,17 +26,13 @@ thread_local! {
 /// `cogroup_left` visits every delta group (the match side galloping-skips to
 /// it); the group is emitted iff `group_has_positive` reports no live row in the
 /// trace group — i.e. the key is absent from Distinct(trace).
-pub fn op_anti_join_delta_trace(
-    delta: &Batch,
-    cursor: &mut ReadCursor,
-    schema: &SchemaDescriptor,
-) -> ConsolidatedBatch {
+pub fn op_anti_join_delta_trace(delta: &Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> Batch {
     let npc = schema.num_payload_cols();
     let cs = Batch::consolidate_if_needed(delta, schema);
-    let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
+    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
+        return Batch::empty(npc, schema.pk_stride());
     }
 
     JOIN_EMIT_INDICES.with(|pool| {
@@ -52,7 +48,7 @@ pub fn op_anti_join_delta_trace(
         });
 
         if emit_indices.is_empty() {
-            return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
+            return Batch::empty(npc, schema.pk_stride());
         }
 
         let mb = consolidated.as_mem_batch();
@@ -62,9 +58,8 @@ pub fn op_anti_join_delta_trace(
         });
         // emit_indices ascend (groups visited in key order, ranges ascending),
         // so rows come out in consolidated-delta order: (PK, payload)-sorted.
-        output.sorted = true;
-        output.consolidated = true;
-        ConsolidatedBatch::new_unchecked(output)
+        output.certify_layout(Layout::Consolidated, schema);
+        output
     })
 }
 
@@ -77,17 +72,13 @@ pub fn op_anti_join_delta_trace(
 /// to catch up, optimal whichever side is larger — replacing the old size
 /// selector + swapped path); the delta group is emitted iff `group_has_positive`
 /// reports a live row in the trace group.
-pub fn op_semi_join_delta_trace(
-    delta: &Batch,
-    cursor: &mut ReadCursor,
-    schema: &SchemaDescriptor,
-) -> ConsolidatedBatch {
+pub fn op_semi_join_delta_trace(delta: &Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> Batch {
     let npc = schema.num_payload_cols();
     let cs = Batch::consolidate_if_needed(delta, schema);
-    let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
+    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
-        return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
+        return Batch::empty(npc, schema.pk_stride());
     }
 
     JOIN_EMIT_INDICES.with(|pool| {
@@ -103,7 +94,7 @@ pub fn op_semi_join_delta_trace(
         });
 
         if emit_indices.is_empty() {
-            return ConsolidatedBatch::new_unchecked(Batch::empty(npc, schema.pk_stride()));
+            return Batch::empty(npc, schema.pk_stride());
         }
 
         let mb = consolidated.as_mem_batch();
@@ -111,9 +102,8 @@ pub fn op_semi_join_delta_trace(
         let mut output = write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
             scatter_copy(&mb, &emit_indices, &[], writer);
         });
-        output.sorted = true;
-        output.consolidated = true;
-        ConsolidatedBatch::new_unchecked(output)
+        output.certify_layout(Layout::Consolidated, schema);
+        output
     })
 }
 
@@ -137,7 +127,7 @@ pub fn op_join_delta_trace(
     let out_npc = left_schema.num_payload_cols() + right_schema.num_payload_cols();
 
     let cs = Batch::consolidate_if_needed(delta, left_schema);
-    let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
+    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return Batch::empty(out_npc, left_schema.pk_stride());
@@ -182,7 +172,7 @@ pub fn op_join_delta_trace_outer(
     let out_npc = left_schema.num_payload_cols() + right_schema.num_payload_cols();
 
     let cs = Batch::consolidate_if_needed(delta, left_schema);
-    let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
+    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return Batch::empty(out_npc, left_schema.pk_stride());
@@ -238,7 +228,7 @@ mod tests {
     use super::*;
     use crate::foundation::codec::read_i64_le;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::{Batch, ConsolidatedBatch};
+    use crate::storage::{Batch, Layout};
     use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
     #[test]
@@ -249,7 +239,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: pk=2 and pk=4 exist
-        let trace = Rc::new(make_batch(&schema, &[(2, 1, 200), (4, 1, 400)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(2, 1, 200), (4, 1, 400)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: pk=1,2,3
@@ -260,7 +250,7 @@ mod tests {
         assert_eq!(out.count, 2);
         assert_eq!((out.get_pk(0) as u64), 1);
         assert_eq!((out.get_pk(1) as u64), 3);
-        assert!(out.consolidated);
+        assert!(out.is_consolidated());
     }
 
     #[test]
@@ -271,7 +261,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: pk=2 and pk=3 exist with positive weight
-        let trace = Rc::new(make_batch(&schema, &[(2, 1, 200), (3, 1, 300)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(2, 1, 200), (3, 1, 300)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: pk=1,2,3,4
@@ -294,7 +284,7 @@ mod tests {
 
         let schema = make_schema_compound();
         // Trace (storage order): (1,5) and (2,3).
-        let trace = Rc::new(make_compound_batch(&schema, &[(1, 5, 1, 100), (2, 3, 1, 200)]).into_inner());
+        let trace = Rc::new(make_compound_batch(&schema, &[(1, 5, 1, 100), (2, 3, 1, 200)]));
 
         // Delta (storage order): (1,5), (2,3), (3,1).
         let delta = make_compound_batch(&schema, &[(1, 5, 1, 10), (2, 3, 1, 20), (3, 1, 1, 30)]);
@@ -320,7 +310,7 @@ mod tests {
 
         let schema = make_schema_signed();
         // Trace (signed order): -3, -1.
-        let trace = Rc::new(make_signed_batch(&schema, &[(-3, 1, 30), (-1, 1, 10)]).into_inner());
+        let trace = Rc::new(make_signed_batch(&schema, &[(-3, 1, 30), (-1, 1, 10)]));
 
         // Delta (signed order): -3, -1, 2.
         let delta = make_signed_batch(&schema, &[(-3, 1, 1), (-1, 1, 2), (2, 1, 3)]);
@@ -345,7 +335,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: pk=1 exists
-        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Non-consolidated delta: pk=1 appears twice (w=2 and w=3)
@@ -357,8 +347,7 @@ mod tests {
             delta.extend_col(0, &val.to_le_bytes());
             delta.count += 1;
         }
-        delta.sorted = true;
-        delta.consolidated = false;
+        delta.set_layout_unchecked(Layout::Sorted);
 
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // After consolidation of delta: pk=1 w=5 → matches trace → 1 row
@@ -380,7 +369,7 @@ mod tests {
         let right_schema = make_schema_u64_i64();
 
         // Right trace: pk=1 val=100
-        let trace = Rc::new(make_batch(&right_schema, &[(1, 1, 100)]).into_inner());
+        let trace = Rc::new(make_batch(&right_schema, &[(1, 1, 100)]));
         let mut ch = CursorHandle::from_owned(&[trace], right_schema);
 
         // Delta (left): pk=1 val=10 (matches), pk=2 val=20 (no match → null fill)
@@ -415,7 +404,7 @@ mod tests {
         let left_schema = make_schema_i32();
         let right_schema = make_schema_i32();
         // Trace (right): keys 1 and 2, both present.
-        let trace = Rc::new(make_i32_batch(&right_schema, &[(1, 1, 100), (2, 1, 200)]).into_inner());
+        let trace = Rc::new(make_i32_batch(&right_schema, &[(1, 1, 100), (2, 1, 200)]));
         let mut ch = CursorHandle::from_owned(&[trace], right_schema);
         // Delta (left): keys 1 and 2.
         let delta = make_i32_batch(&left_schema, &[(1, 1, 10), (2, 1, 20)]);
@@ -436,10 +425,10 @@ mod tests {
         // of (PK, payload) order, so the output must be marked unsorted.
         let schema = make_schema_u64_i64();
         // Trace: PK=1 with two right payloads (100, 200).
-        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100), (1, 1, 200)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100), (1, 1, 200)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
         // Delta: PK=1 with three left payloads.
-        let delta = make_batch(&schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]).into_inner();
+        let delta = make_batch(&schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]);
 
         let out = op_join_delta_trace(&delta, ch.cursor_mut(), &schema, &schema);
         assert_eq!(out.count, 6, "3 left × 2 right = 6 join outputs");
@@ -451,7 +440,7 @@ mod tests {
             .collect();
         let actually_sorted = pairs.windows(2).all(|w| w[0] <= w[1]);
         assert!(
-            !out.sorted || actually_sorted,
+            !out.is_sorted() || actually_sorted,
             "many-to-many join marked output sorted but payload order is {pairs:?}",
         );
     }
@@ -468,7 +457,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: PK=1 exists with positive weight
-        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: two rows with PK=1 but different payloads (both should be matched)
@@ -487,7 +476,7 @@ mod tests {
         let schema = make_schema_u64_i64();
 
         // Trace: PK=1 exists with positive weight
-        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: two rows with PK=1 but different payloads (both should be matched)
@@ -512,7 +501,7 @@ mod tests {
         // Trace: PK=u64::MAX with positive weight — previously the sentinel
         // last_pk = u128::MAX would match this on first occurrence and skip it.
         let max_pk = u64::MAX;
-        let trace = Rc::new(make_batch(&schema, &[(max_pk, 1, 0)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(max_pk, 1, 0)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Build 25 delta rows: a large delta against a 1-row trace
@@ -536,7 +525,7 @@ mod tests {
 
         // Trace: 3 entries for PK=1 with different payloads
         // This triggers the trace-has-many scenario
-        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100), (1, 1, 200), (1, 1, 300)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100), (1, 1, 200), (1, 1, 300)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta: 25 rows — a large delta against a 3-row (same-PK) trace
@@ -565,7 +554,7 @@ mod tests {
         // Trace for PK=1 has two entries (sorted by payload): a tombstone
         // (payload 100, w=-1) then a live row (payload 200, w=+1). Net: PK=1
         // is present. Anti-join must NOT emit the delta row for PK=1.
-        let trace = Rc::new(make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
         let delta = make_batch(&schema, &[(1, 1, 5)]);
         let out = op_anti_join_delta_trace(&delta, ch.cursor_mut(), &schema);
@@ -577,7 +566,7 @@ mod tests {
         use crate::storage::CursorHandle;
         use std::rc::Rc;
         let schema = make_schema_u64_i64();
-        let trace = Rc::new(make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
         let delta = make_batch(&schema, &[(1, 1, 5)]);
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
@@ -590,7 +579,7 @@ mod tests {
         use std::rc::Rc;
         let schema = make_schema_u64_i64();
         // Trace: PK=1 present (positive).
-        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100)]).into_inner());
+        let trace = Rc::new(make_batch(&schema, &[(1, 1, 100)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
         // Two consolidated delta rows with same PK=1, distinct payloads.
         let delta = make_batch(&schema, &[(1, 1, 10), (1, 1, 20)]);
@@ -610,7 +599,7 @@ mod tests {
         let right_schema = make_schema_u64_i64();
         // Trace has a single tombstone entry for PK=1 (w=-1). No positive
         // entry → the key is NOT in Distinct(trace) → null-fill must be emitted.
-        let trace = Rc::new(make_batch(&right_schema, &[(1, -1, 100)]).into_inner());
+        let trace = Rc::new(make_batch(&right_schema, &[(1, -1, 100)]));
         let mut ch = CursorHandle::from_owned(&[trace], right_schema);
         let delta = make_batch(&left_schema, &[(1, 1, 10)]);
         let out = op_join_delta_trace_outer(&delta, ch.cursor_mut(), &left_schema, &right_schema);
@@ -638,7 +627,7 @@ mod tests {
         let right_schema = make_schema_u64_i64();
         // Trace for PK=1: a live entry (w=+1) and a tombstone (w=-1). The key
         // IS in Distinct(trace) → no null-fill.
-        let trace = Rc::new(make_batch(&right_schema, &[(1, 1, 100), (1, -1, 200)]).into_inner());
+        let trace = Rc::new(make_batch(&right_schema, &[(1, 1, 100), (1, -1, 200)]));
         let mut ch = CursorHandle::from_owned(&[trace], right_schema);
         let delta = make_batch(&left_schema, &[(1, 1, 10)]);
         let out = op_join_delta_trace_outer(&delta, ch.cursor_mut(), &left_schema, &right_schema);
@@ -662,7 +651,7 @@ mod tests {
         // The co-group hands the whole same-PK delta group to the callback at
         // once, producted against the once-walked trace group (no re-seek).
         let schema = wide_pk_3xu64_schema();
-        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]).into_inner());
+        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]));
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
         let mut delta = Batch::with_schema(schema, 2);
@@ -678,7 +667,7 @@ mod tests {
         delta.extend_null_bmp(&0u64.to_le_bytes());
         delta.extend_col(0, &20i64.to_le_bytes());
         delta.count += 1;
-        delta.sorted = true;
+        delta.certify_layout(Layout::Sorted, &schema);
 
         let out = op_join_delta_trace(&delta, ch.cursor_mut(), &schema, &schema);
         // 2 delta rows × 1 trace row = 2 output rows
@@ -702,17 +691,16 @@ mod tests {
         // Trace: Row A (+1). Delta: Row A (+1) and Row B (+1).
         // Large delta (2 rows) vs 1-row trace.
         let schema = wide_pk_3xu64_schema();
-        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 2, 1, 100)]).into_inner());
+        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 2, 1, 100)]));
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
-        let delta_cb = make_wide_batch(
+        let delta = make_wide_batch(
             &schema,
             &[
                 (1, 1, 2, 1, 200), // matches trace pk
                 (1, 1, 9, 1, 300), // different pk — must NOT match
             ],
         );
-        let delta = delta_cb.into_inner();
 
         let out = op_join_delta_trace(&delta, ch.cursor_mut(), &schema, &schema);
         // Only Row A matches (delta row 0 × trace row 0). Row B has no trace entry.
@@ -731,7 +719,7 @@ mod tests {
         use std::rc::Rc;
         // Same multiset delta setup as the inner-join test, but for outer join.
         let schema = wide_pk_3xu64_schema();
-        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]).into_inner());
+        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]));
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
         let mut delta = Batch::with_schema(schema, 2);
@@ -745,7 +733,7 @@ mod tests {
         delta.extend_null_bmp(&0u64.to_le_bytes());
         delta.extend_col(0, &20i64.to_le_bytes());
         delta.count += 1;
-        delta.sorted = true;
+        delta.certify_layout(Layout::Sorted, &schema);
 
         let out = op_join_delta_trace_outer(&delta, ch.cursor_mut(), &schema, &schema);
         // Both delta rows match → 2 joined output rows, no null-fills.
@@ -768,11 +756,10 @@ mod tests {
         // Delta: (1,1,2) and (1,1,9). Trace: (1,1,9) only.
         // Anti-join: emit delta rows whose PK is NOT in trace → only (1,1,2).
         let schema = wide_pk_3xu64_schema();
-        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 9, 1, 50)]).into_inner());
+        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 9, 1, 50)]));
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
-        let delta_cb = make_wide_batch(&schema, &[(1, 1, 2, 1, 10), (1, 1, 9, 1, 20)]);
-        let delta = delta_cb.into_inner();
+        let delta = make_wide_batch(&schema, &[(1, 1, 2, 1, 10), (1, 1, 9, 1, 20)]);
         let out = op_anti_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         assert_eq!(out.count, 1);
         assert_eq!(out.get_pk_bytes(0), wide_pk_bytes(&schema, 1, 1, 2).as_slice());
@@ -785,11 +772,10 @@ mod tests {
         // Delta: (1,1,2) and (1,1,9). Trace: (1,1,9) only.
         // Semi-join: emit delta rows whose PK IS in trace → only (1,1,9).
         let schema = wide_pk_3xu64_schema();
-        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 9, 1, 50)]).into_inner());
+        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 9, 1, 50)]));
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
-        let delta_cb = make_wide_batch(&schema, &[(1, 1, 2, 1, 10), (1, 1, 9, 1, 20)]);
-        let delta = delta_cb.into_inner();
+        let delta = make_wide_batch(&schema, &[(1, 1, 2, 1, 10), (1, 1, 9, 1, 20)]);
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         assert_eq!(out.count, 1);
         assert_eq!(out.get_pk_bytes(0), wide_pk_bytes(&schema, 1, 1, 9).as_slice());
@@ -808,12 +794,12 @@ mod tests {
         // Trace has (1,1,0) only. Delta has (1,1,0) and (1,1,1<<56).
         // Only (1,1,0) should be semi-joined.
         let schema = wide_pk_3xu64_schema();
-        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 0, 1, 99)]).into_inner());
+        let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 0, 1, 99)]));
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
         // Large c2 differs starting at byte 17 of the OPK key.
         let c2_large = 1u64 << 56;
-        let delta_cb = make_wide_batch(
+        let delta = make_wide_batch(
             &schema,
             &[
                 (1, 1, 0, 1, 10),
@@ -821,7 +807,6 @@ mod tests {
                 (2, 0, 0, 1, 30), // extra row so the delta outnumbers the 1-row trace
             ],
         );
-        let delta = delta_cb.into_inner();
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Only (1,1,0) matches the trace.
         assert_eq!(out.count, 1);
@@ -834,12 +819,11 @@ mod tests {
         use std::rc::Rc;
         // Trace entry for a wide PK with weight <= 0 must be skipped (no emit).
         let schema = wide_pk_3xu64_schema();
-        let trace_batch = Rc::new(make_wide_batch(&schema, &[(5, 5, 5, -1, 99)]).into_inner());
+        let trace_batch = Rc::new(make_wide_batch(&schema, &[(5, 5, 5, -1, 99)]));
         let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
 
         // Large delta vs a 1-row trace.
-        let delta_cb = make_wide_batch(&schema, &[(5, 5, 5, 1, 10), (6, 6, 6, 1, 20)]);
-        let delta = delta_cb.into_inner();
+        let delta = make_wide_batch(&schema, &[(5, 5, 5, 1, 10), (6, 6, 6, 1, 20)]);
         let out = op_semi_join_delta_trace(&delta, ch.cursor_mut(), &schema);
         // Negative-weight trace row must not produce any output.
         assert_eq!(out.count, 0, "negative-weight trace row must be skipped");
@@ -859,7 +843,7 @@ mod tests {
         )
     }
 
-    fn make_i32_batch(schema: &SchemaDescriptor, rows: &[(i32, i64, i64)]) -> ConsolidatedBatch {
+    fn make_i32_batch(schema: &SchemaDescriptor, rows: &[(i32, i64, i64)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
             b.extend_pk((pk as u32) as u128);
@@ -868,8 +852,7 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Consolidated, schema);
+        b
     }
 }

@@ -68,12 +68,13 @@ impl MemTable {
 // std::f*::consts.
 #[allow(clippy::approx_constant)]
 mod tests {
-    use super::super::batch::{relocate_string_cell, ConsolidatedBatch};
+    use super::super::batch::relocate_string_cell;
     use super::super::error::StorageError;
     use super::super::merge::SortedMemBatch;
     use super::runs::consolidate_batches;
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+    use crate::storage::Layout;
 
     fn make_u64_i64_schema() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -87,7 +88,7 @@ mod tests {
 
     /// Build a consolidated Batch from (pk, weight, payload) triples.
     /// Assumes triples are already sorted by pk with no duplicate (pk, payload) pairs.
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
+    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -99,7 +100,6 @@ mod tests {
             b.count += 1;
         }
 
-        b.sorted = true;
         b.into_consolidated(schema)
     }
 
@@ -184,32 +184,27 @@ mod tests {
         b
     }
 
-    /// A run that lies about being `sorted` is rejected at the next
-    /// consolidation. `ConsolidatedBatch::new_unchecked` checks only that the
-    /// flags are *set*, not that the data matches, so a descending batch flagged
-    /// sorted+consolidated slips into the MemTable. The next consolidation — a
-    /// flush, or `force_consolidate` once ≥ 16 runs accrue — calls
-    /// `runs_as_sorted` → `as_sorted_mem_batch`, which now verifies the `sorted`
-    /// flag against the data (debug) and panics. The `handle_message` strip clears
-    /// the flags at ingress so this run never forms.
+    /// A run that lies about being consolidated is rejected on the way in.
+    /// `set_layout_unchecked` sets the tag without verifying data, so a descending
+    /// batch flagged Consolidated is built without complaint. But the consumer that
+    /// trusts the tag — `upsert_sorted_batch`, which skips a re-fold — calls
+    /// `consolidated_verified`, which checks the flag against the data (debug) and
+    /// panics. The `handle_message` strip clears the layout at ingress so this run
+    /// never reaches the MemTable in production.
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "flagged sorted")]
+    #[should_panic(expected = "flagged consolidated")]
     fn memtable_lying_sorted_run_rejected_at_flush() {
         let schema = make_u64_i64_schema();
         let mut mt = MemTable::new(schema, 1 << 20);
         mt.upsert_sorted_batch(make_batch(&schema, &[(5, 1, 50)])).unwrap();
 
-        // The lie: descending data flagged sorted+consolidated. `new_unchecked`
-        // trusts the flags, so the unverified run enters the MemTable.
+        // The lie: descending data flagged Consolidated without verification.
+        // `set_layout_unchecked` trusts the caller, so the batch is built — but
+        // `upsert_sorted_batch` verifies the tag and rejects the run.
         let mut bad = desc_two_row_batch(&schema);
-        bad.sorted = true;
-        bad.consolidated = true;
-        mt.upsert_sorted_batch(ConsolidatedBatch::new_unchecked(bad)).unwrap();
-
-        // 2 runs → force_consolidate clears its ≤1-run early-return and reaches
-        // runs_as_sorted, which verifies the lying `sorted` flag and rejects the run.
-        let _ = mt.consolidate_for_flush();
+        bad.set_layout_unchecked(Layout::Consolidated);
+        mt.upsert_sorted_batch(bad).unwrap();
     }
 
     /// Cleared path: the same unsorted rows with both flags stripped (as the
@@ -220,9 +215,7 @@ mod tests {
         let mut mt = MemTable::new(schema, 1 << 20);
         mt.upsert_sorted_batch(make_batch(&schema, &[(5, 1, 50)])).unwrap();
 
-        let mut clean = desc_two_row_batch(&schema);
-        clean.sorted = false;
-        clean.consolidated = false;
+        let clean = desc_two_row_batch(&schema);
         mt.upsert_sorted_batch(clean.into_consolidated(&schema)).unwrap();
 
         let snap = mt.consolidate_for_flush();
@@ -333,17 +326,17 @@ mod tests {
 
         // Search for PK 10, payload 100 — should find weight 1
         let ref_batch = make_batch(&schema, &[(10, 1, 100)]);
-        let w = mt.find_weight_for_row_bytes(&pk10, &*ref_batch, 0);
+        let w = mt.find_weight_for_row_bytes(&pk10, &ref_batch, 0);
         assert_eq!(w, 1);
 
         // Search for PK 10, payload 200 — should find weight 1
         let ref_batch2 = make_batch(&schema, &[(10, 1, 200)]);
-        let w2 = mt.find_weight_for_row_bytes(&pk10, &*ref_batch2, 0);
+        let w2 = mt.find_weight_for_row_bytes(&pk10, &ref_batch2, 0);
         assert_eq!(w2, 1);
 
         // Search for PK 10, payload 999 — should find weight 0
         let ref_batch3 = make_batch(&schema, &[(10, 1, 999)]);
-        let w3 = mt.find_weight_for_row_bytes(&pk10, &*ref_batch3, 0);
+        let w3 = mt.find_weight_for_row_bytes(&pk10, &ref_batch3, 0);
         assert_eq!(w3, 0);
     }
 
@@ -414,13 +407,13 @@ mod tests {
     #[test]
     fn batch_clear() {
         let schema = make_u64_i64_schema();
-        let mut batch = make_batch(&schema, &[(10, 1, 100)]).into_inner();
+        let mut batch = make_batch(&schema, &[(10, 1, 100)]);
         assert_eq!(batch.count, 1);
 
         batch.clear();
         assert_eq!(batch.count, 0);
-        assert!(batch.sorted);
-        assert!(batch.consolidated);
+        assert!(batch.is_sorted());
+        assert!(batch.is_consolidated());
     }
 
     /// Schema matching reduce output: U128 PK (pk_index=0) + I64 group_val + I64 agg_val
@@ -451,8 +444,7 @@ mod tests {
             b.count += 1;
         }
 
-        b.sorted = true;
-        b.consolidated = false;
+        b.certify_layout(Layout::Sorted, &schema);
         b
     }
 
@@ -898,12 +890,12 @@ mod tests {
         // ...and that payload's group genuinely nets strictly positive (internal
         // consistency: the found row is not a cancelled or zero-net group).
         let ref_batch = make_batch(&schema, &[(10, 1, val)]);
-        assert!(mt.find_weight_for_row_bytes(&pk10, &*ref_batch, 0) > 0);
+        assert!(mt.find_weight_for_row_bytes(&pk10, &ref_batch, 0) > 0);
     }
 
     /// Build a run from `(pk, weight, payload)` triples in any order, sorting by
     /// PK first so the run's binary-search invariant holds.
-    fn make_run(schema: &SchemaDescriptor, mut rows: Vec<(u64, i64, i64)>) -> ConsolidatedBatch {
+    fn make_run(schema: &SchemaDescriptor, mut rows: Vec<(u64, i64, i64)>) -> Batch {
         rows.sort_by_key(|&(pk, _, _)| pk);
         make_batch(schema, &rows)
     }

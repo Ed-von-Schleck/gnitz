@@ -247,7 +247,7 @@ impl MappedShard {
         row_count: usize,
         schema: &crate::schema::SchemaDescriptor,
     ) -> super::super::batch::Batch {
-        use super::super::batch::{compute_offsets, strides_from_schema, Batch};
+        use super::super::batch::{compute_offsets, strides_from_schema, Batch, Layout};
 
         if row_count == 0 {
             return Batch::empty_with_schema(schema);
@@ -328,9 +328,10 @@ impl MappedShard {
         };
 
         let mut batch = unsafe { Batch::from_prebuilt(data, blob, strides, offsets, num_regions_u8, row_count) };
-        batch.sorted = true;
-        batch.consolidated = true;
         batch.set_schema(*schema);
+        // Shards are written consolidated; a contiguous slice stays (PK, payload)-
+        // sorted and ghost-free (callers guard `!has_ghosts`). Certify it.
+        batch.certify_layout(Layout::Consolidated, schema);
         batch
     }
 

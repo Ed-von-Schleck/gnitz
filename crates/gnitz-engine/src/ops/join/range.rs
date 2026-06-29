@@ -40,7 +40,7 @@ pub fn op_join_delta_trace_range(
     let out_npc = left_schema.num_payload_cols() + right_schema.num_payload_cols();
 
     let cs = Batch::consolidate_if_needed(delta, left_schema);
-    let consolidated: &Batch = cs.as_deref().unwrap_or(delta);
+    let consolidated: &Batch = cs.as_ref().unwrap_or(delta);
     let n = consolidated.count;
     if n == 0 {
         return Batch::empty(out_npc, left_schema.pk_stride());
@@ -256,7 +256,7 @@ mod tests {
     use super::*;
     use crate::foundation::codec::read_i64_le;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::{Batch, ConsolidatedBatch};
+    use crate::storage::{Batch, Layout};
 
     /// All four rels over an unsigned key, n_eq = 0. The boundary case x == y
     /// must match `Le`/`Ge` and not `Lt`/`Gt`. The trace payload tags the rows
@@ -376,8 +376,8 @@ mod tests {
             trace.extend_col(0, &val.to_le_bytes());
             trace.count += 1;
         }
-        trace.sorted = true;
-        let mut ch = trace_cursor(ConsolidatedBatch::new_unchecked(trace), schema);
+        trace.set_layout_unchecked(Layout::Consolidated);
+        let mut ch = trace_cursor(trace, schema);
         // Delta retraction: x=40, w=-1, so all matches negate.
         let delta = make_batch(&schema, &[(40, -1, 400)]);
         // rel Lt: {y < 40} = all three, but y=20's product is -1*0 = 0 (skipped).
@@ -489,8 +489,10 @@ mod tests {
         let schema = make_schema_u64_i64();
         let delta = make_batch(&schema, &[(40, -1, 400)]); // retraction
         for rel in [RangeRel::Lt, RangeRel::Le] {
-            // y=20 is a tombstone (w=0), y=25 carries a negative weight.
-            let trace = make_batch(&schema, &[(10, 1, 110), (20, 0, 120), (25, -1, 125), (30, 1, 130)]);
+            // y=20 is a tombstone (w=0), y=25 carries a negative weight. A trace
+            // carrying a weight-0 row is sorted but not consolidated, so it is
+            // flagged `Sorted` (consolidation would have dropped the ghost).
+            let trace = make_sorted_u64_batch(&schema, &[(10, 1, 110), (20, 0, 120), (25, -1, 125), (30, 1, 130)]);
             assert_merge_eq_per_row(schema, 0, rel, &delta, trace);
         }
     }
@@ -622,7 +624,10 @@ mod tests {
     /// ascending `(k, range)` order. (`make_compound_batch` writes native LE
     /// bytes, correct only for the equality DD joins that compare PKs for
     /// equality, not the range probe that compares them for order.)
-    fn make_band_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> ConsolidatedBatch {
+    /// Range-join inputs need only be (PK, payload)-sorted: the walk handles
+    /// tombstones (weight 0) and multiset duplicates explicitly, so the rows are
+    /// flagged `Sorted`, not `Consolidated` — the contract the data actually meets.
+    fn make_band_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(k, range, w, val) in rows {
             b.extend_pk_opk(schema, &[k as u128, range as u128]);
@@ -631,9 +636,24 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Sorted, schema);
+        b
+    }
+
+    /// `make_schema_u64_i64` batch flagged `Sorted` (not `Consolidated`): for a
+    /// trace that deliberately carries a weight-0 tombstone, which a consolidated
+    /// batch may not contain. Rows must be (PK, payload)-sorted.
+    fn make_sorted_u64_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
+        let mut b = Batch::with_schema(*schema, rows.len().max(1));
+        for &(pk, w, val) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b.certify_layout(Layout::Sorted, schema);
+        b
     }
 
     /// Right-payload (trace I64 col) + weight of each emitted range-join row, in
@@ -644,9 +664,9 @@ mod tests {
             .collect()
     }
 
-    fn trace_cursor(batch: ConsolidatedBatch, schema: SchemaDescriptor) -> crate::storage::CursorHandle {
+    fn trace_cursor(batch: Batch, schema: SchemaDescriptor) -> crate::storage::CursorHandle {
         use std::rc::Rc;
-        crate::storage::CursorHandle::from_owned(&[Rc::new(batch.into_inner())], schema)
+        crate::storage::CursorHandle::from_owned(&[Rc::new(batch)], schema)
     }
 
     /// Schema with `n_eq` U64 equality columns + 1 U64 range column (all PK) and
@@ -661,9 +681,13 @@ mod tests {
     /// Build a batch over `make_range_schema(n_eq)`. Each row is
     /// `(eq_cols, range, weight, payload)`; the `n_eq + 1` PK columns are
     /// OPK-encoded (big-endian U64) so memcmp equals numeric order. Rows must be
-    /// pre-sorted ascending by `(eq.., range)` — the merge walk groups by a
-    /// forward scan and the cursor expects sorted PK bytes.
-    fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)]) -> ConsolidatedBatch {
+    /// pre-sorted ascending by `(eq.., range, payload)` — the merge walk groups by
+    /// a forward scan and the cursor expects (PK, payload)-sorted rows.
+    ///
+    /// Flagged `Sorted`, not `Consolidated`: the differential inputs carry
+    /// tombstones (weight 0) and multiset duplicates the walk handles directly, so
+    /// the data is sorted but not ghost-free/duplicate-folded.
+    fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for (eq, range, w, val) in rows {
             let mut vals: Vec<u128> = eq.iter().map(|&x| x as u128).collect();
@@ -674,9 +698,8 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Sorted, schema);
+        b
     }
 
     /// Random small `(eq.., range, weight, payload)` rows, sorted by `(eq.., range)`.
@@ -694,7 +717,9 @@ mod tests {
                 (eq, range, w, val)
             })
             .collect();
-        rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        // Sort by (eq.., range, payload) — the full (PK, payload) order the
+        // `Sorted` flag the builder sets asserts (payload breaks PK ties).
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.3.cmp(&b.3)));
         rows
     }
 
@@ -723,13 +748,21 @@ mod tests {
         n_eq: usize,
         rel: RangeRel,
         delta: &Batch,
-        trace: ConsolidatedBatch,
+        trace: Batch,
     ) -> usize {
         let mut ch = trace_cursor(trace, schema);
         let oracle = range_per_row_seek(delta, ch.cursor_mut(), &schema, &schema, n_eq, rel);
         ch.cursor_mut().rewind();
         let merged = range_merge_walk(delta, ch.cursor_mut(), &schema, &schema, n_eq, rel);
-        assert!(!merged.sorted, "merge output must be marked unsorted");
+        // The merge emits trace-major with delta runs — unsorted and unfolded — so
+        // it leaves the layout tag clear for the downstream re-sort. Assert on the
+        // tag, not `is_sorted()`: an empty merge has no rows and so is structurally
+        // sorted regardless of the tag.
+        assert_eq!(
+            merged.layout(),
+            Layout::Raw,
+            "merge output must leave the layout tag clear (Raw) for downstream re-sort",
+        );
         assert_eq!(
             range_multiset(&oracle),
             range_multiset(&merged),

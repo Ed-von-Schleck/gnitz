@@ -1,7 +1,7 @@
 //! DBSP distinct operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{scatter_copy, write_to_batch, Batch, ConsolidatedBatch, ReadCursor};
+use crate::storage::{scatter_copy, write_to_batch, Batch, Layout, ReadCursor};
 
 use super::cogroup::cogroup_left;
 use super::util::{compare_cursor_payload_to_batch_row, signum};
@@ -14,19 +14,12 @@ use super::util::{compare_cursor_payload_to_batch_row, signum};
 ///
 /// Returns `(output_batch, consolidated_delta)`.
 /// The consolidated delta is returned so the caller can feed it to `ingest_batch`.
-pub fn op_distinct(
-    delta: Batch,
-    cursor: &mut ReadCursor,
-    schema: &SchemaDescriptor,
-) -> (ConsolidatedBatch, ConsolidatedBatch) {
+pub fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> (Batch, Batch) {
     // 1. Consolidate delta
     let consolidated = delta.into_consolidated(schema);
     let n = consolidated.count;
     if n == 0 {
-        return (
-            ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema)),
-            consolidated,
-        );
+        return (Batch::empty_with_schema(schema), consolidated);
     }
 
     // 2. Co-group the consolidated delta against the integral trace on PK, then
@@ -74,10 +67,7 @@ pub fn op_distinct(
 
     // 3. Scatter-copy emitting rows
     if emit_indices.is_empty() {
-        return (
-            ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema)),
-            consolidated,
-        );
+        return (Batch::empty_with_schema(schema), consolidated);
     }
 
     let mb = consolidated.as_mem_batch();
@@ -85,10 +75,11 @@ pub fn op_distinct(
     let mut output = write_to_batch(schema, emit_indices.len(), blob_cap, |writer| {
         scatter_copy(&mb, &emit_indices, &emit_weights, writer);
     });
-    output.sorted = true;
-    output.consolidated = true;
+    // Emitting rows are scattered in consolidated-delta order (ascending indices),
+    // one per transitioning element ⇒ (PK, payload)-sorted and ghost-free.
+    output.certify_layout(Layout::Consolidated, schema);
 
-    (ConsolidatedBatch::new_unchecked(output), consolidated)
+    (output, consolidated)
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +90,7 @@ pub fn op_distinct(
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::Batch;
+    use crate::storage::{Batch, Layout};
     use crate::test_support::{make_wide_batch, wide_pk_3xu64_schema};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
@@ -122,8 +113,7 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, schema);
         b
     }
 
@@ -225,8 +215,7 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes()[..col_size]);
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, schema);
         b
     }
 
@@ -307,8 +296,7 @@ mod tests {
             b.extend_col(0, &cell);
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, schema);
         b
     }
 
@@ -368,8 +356,7 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, schema);
         b
     }
 
@@ -417,14 +404,13 @@ mod tests {
     fn make_signed_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
         let mut b = Batch::with_schema(*schema, rows.len().max(1));
         for &(pk, w, val) in rows {
-            b.extend_pk((pk as u64) as u128);
+            b.extend_pk_opk(schema, &[(pk as u64) as u128]);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, schema);
         b
     }
 
@@ -454,7 +440,9 @@ mod tests {
         let delta2 = make_signed_batch(&schema, &[(-1, -1, 10)]);
         let (out2, _) = op_distinct(delta2, ch2.cursor_mut(), &schema);
         assert_eq!(out2.count, 1, "signed: fully retracting an element emits -1");
-        assert_eq!(out2.get_pk(0) as i64, -1);
+        let mut le = [0u8; 8];
+        gnitz_wire::decode_pk_column(&out2.get_pk_bytes(0)[..8], type_code::I64, &mut le);
+        assert_eq!(i64::from_le_bytes(le), -1);
         assert_eq!(out2.get_weight(0), -1);
     }
 
@@ -469,9 +457,12 @@ mod tests {
 
         let delta = make_batch(&schema, &[(1, 1, 10)]);
         let (out, consolidated) = op_distinct(delta, ch.cursor_mut(), &schema);
-        assert!(out.consolidated, "distinct output must be consolidated");
-        assert!(out.sorted, "distinct output must be sorted");
-        assert!(consolidated.consolidated, "consolidated output must be consolidated");
+        assert!(out.is_consolidated(), "distinct output must be consolidated");
+        assert!(out.is_sorted(), "distinct output must be sorted");
+        assert!(
+            consolidated.is_consolidated(),
+            "consolidated output must be consolidated"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -488,7 +479,7 @@ mod tests {
         let empty = Rc::new(Batch::empty(1, schema.pk_stride()));
         let mut ch = CursorHandle::from_owned(&[empty], schema);
 
-        let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (2, 0, 0, 1, 20), (3, 0, 0, 1, 30)]).into_inner();
+        let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 10), (2, 0, 0, 1, 20), (3, 0, 0, 1, 30)]);
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         assert_eq!(out.count, 3, "three new wide-PK rows must each emit +1");
         for i in 0..3 {
@@ -503,10 +494,10 @@ mod tests {
         // Trace has (1,0,0, payload=99, w=1). Delta re-adds same (PK, payload).
         // Already in set → output must be empty.
         let schema = wide_pk_3xu64_schema();
-        let trace = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 99)]).into_inner());
+        let trace = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 99)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
-        let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 99)]).into_inner();
+        let delta = make_wide_batch(&schema, &[(1, 0, 0, 1, 99)]);
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         assert_eq!(
             out.count, 0,
@@ -524,12 +515,12 @@ mod tests {
         // This tests the cursor.current_pk_bytes() != key break condition.
         let schema = wide_pk_3xu64_schema();
         // (1,1,0) is already in the trace
-        let trace = Rc::new(make_wide_batch(&schema, &[(1, 1, 0, 1, 50)]).into_inner());
+        let trace = Rc::new(make_wide_batch(&schema, &[(1, 1, 0, 1, 50)]));
         let mut ch = CursorHandle::from_owned(&[trace], schema);
 
         // Delta has the NEW key (1,1, 1<<56) which shares 16 OPK bytes with (1,1,0)
         let c2_new = 1u64 << 56;
-        let delta = make_wide_batch(&schema, &[(1, 1, c2_new, 1, 60)]).into_inner();
+        let delta = make_wide_batch(&schema, &[(1, 1, c2_new, 1, 60)]);
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         // The new row is not in the trace → emit +1. The old row is not in delta.
         assert_eq!(out.count, 1, "prefix-collision new row must emit +1");
@@ -558,8 +549,7 @@ mod tests {
         trace_b.extend_null_bmp(&0u64.to_le_bytes());
         trace_b.extend_col(0, &42i64.to_le_bytes());
         trace_b.count += 1;
-        trace_b.sorted = true;
-        trace_b.consolidated = true;
+        trace_b.certify_layout(Layout::Consolidated, &schema);
 
         let trace = Rc::new(trace_b);
         let mut ch = CursorHandle::from_owned(&[trace], schema);
@@ -570,8 +560,7 @@ mod tests {
         delta.extend_null_bmp(&0u64.to_le_bytes());
         delta.extend_col(0, &42i64.to_le_bytes());
         delta.count += 1;
-        delta.sorted = true;
-        delta.consolidated = true;
+        delta.certify_layout(Layout::Consolidated, &schema);
 
         let (out, _) = op_distinct(delta, ch.cursor_mut(), &schema);
         assert_eq!(

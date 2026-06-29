@@ -229,7 +229,7 @@ pub(crate) fn cogroup_union(
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::{Batch, CursorHandle};
+    use crate::storage::{Batch, CursorHandle, Layout};
     use std::rc::Rc;
 
     fn schema() -> SchemaDescriptor {
@@ -253,8 +253,7 @@ mod tests {
             b.extend_col(0, &v.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, &s);
         Rc::new(b)
     }
 

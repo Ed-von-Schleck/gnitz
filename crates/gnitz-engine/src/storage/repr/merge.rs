@@ -770,7 +770,7 @@ fn drain_groups_into<RowCmp>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::batch::Batch;
+    use super::super::batch::{Batch, Layout};
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
@@ -2196,7 +2196,11 @@ mod tests {
 
         /// Build a (PK, payload)-sorted run. Rows must be in ascending PK order
         /// (PKs are distinct here, so PK order == (PK, payload) order).
-        fn build_run(schema: &SchemaDescriptor, consolidated: bool, rows: Vec<RowSpec>) -> Batch {
+        /// `layout` must be `Sorted` or `Consolidated`; it is certified (verified in
+        /// debug) so the data must actually match the claim. Pass `Consolidated` to
+        /// model a consolidated-run whose null cells the columnar copy trusts rather
+        /// than re-zeroing.
+        fn build_run(schema: &SchemaDescriptor, layout: Layout, rows: Vec<RowSpec>) -> Batch {
             let mut b = Batch::empty_with_schema(schema);
             b.reserve_rows(rows.len().max(1));
             for row in &rows {
@@ -2212,11 +2216,7 @@ mod tests {
                 b.extend_col(2, &ic);
                 b.count += 1;
             }
-            b.sorted = true;
-            // merge_batches does not consult this flag (it reads rows regardless);
-            // it is set to model the consolidated-run case whose null cells the
-            // columnar copy trusts rather than re-zeroing.
-            b.consolidated = consolidated;
+            b.certify_layout(layout, schema);
             b
         }
 
@@ -2347,10 +2347,10 @@ mod tests {
             sgarbage[0..4].copy_from_slice(&5u32.to_le_bytes());
             sgarbage[4..9].copy_from_slice(b"GARBG");
 
-            // Run A (not consolidated).
+            // Run A (sorted, not consolidated).
             let a = build_run(
                 schema,
-                false,
+                Layout::Sorted,
                 vec![
                     RowSpec {
                         pk: pk(10),
@@ -2382,11 +2382,11 @@ mod tests {
                     },
                 ],
             );
-            // Run B (not consolidated). pk=10 repeats Run A's (PK, payload) by
-            // *content* (a different blob offset) → the merge folds them to w=4.
+            // Run B (sorted, not consolidated). pk=10 repeats Run A's (PK, payload)
+            // by *content* (a different blob offset) → the merge folds them to w=4.
             let b = build_run(
                 schema,
-                false,
+                Layout::Sorted,
                 vec![
                     RowSpec {
                         pk: pk(10),
@@ -2411,11 +2411,11 @@ mod tests {
                     },
                 ],
             );
-            // Run C (consolidated flag set; carries garbage-under-null cells).
+            // Run C (consolidated; carries garbage-under-null cells).
             // pk=40 cancels Run A's pk=40 (net zero → dropped).
             let c = build_run(
                 schema,
-                true,
+                Layout::Consolidated,
                 vec![
                     RowSpec {
                         pk: pk(40),

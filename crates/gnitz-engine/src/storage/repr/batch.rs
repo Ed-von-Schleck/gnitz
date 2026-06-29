@@ -194,6 +194,26 @@ pub(crate) fn carve_writer_slices<'a>(
     (pk, weight, null_bmp, col_slices)
 }
 
+/// Cached row-layout guarantee. Ordered ladder `Raw < Sorted < Consolidated`,
+/// where `Consolidated` implies `Sorted`, so `#[derive(Ord)]` makes
+/// `is_sorted()` a `>= Sorted` test. A mutation can only *lower* it; the only
+/// raise path is `certify_layout`, which debug-verifies the data first.
+///
+/// `pub(crate)` so callers name the variants, but the `Batch.layout` field is
+/// private — only `certify_layout` / `inherit_layout` / `downgrade` (and
+/// `set_weight`'s `Sorted` ceiling) mutate it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum Layout {
+    /// No order/fold guarantee.
+    Raw,
+    /// Rows are (PK, payload)-sorted (non-decreasing), but may carry unfolded
+    /// duplicates or zero-weight ghosts.
+    Sorted,
+    /// Strictly (PK, payload)-increasing and ghost-free (weights folded). The
+    /// `into_consolidated` / merge fast paths trust this to skip a re-fold.
+    Consolidated,
+}
+
 /// Owned columnar batch.  All fixed-stride column data lives in a single
 /// contiguous `data` buffer.  Blob data is separate (variable-length).
 ///
@@ -213,8 +233,10 @@ pub struct Batch {
     num_regions: u8,
     capacity: u32,
     pub count: usize,
-    pub(crate) sorted: bool,
-    pub(crate) consolidated: bool,
+    /// Cached row-layout claim (private; mutated only through the layout API).
+    /// Fresh batches default to `Raw` — a forgotten raise degrades to a safe
+    /// re-fold, never a lie.
+    layout: Layout,
     pub schema: Option<SchemaDescriptor>,
     /// Identity token for blob-sharing: two batches with equal `blob_id` have
     /// identical blob content, making verbatim 16-byte German String struct
@@ -252,8 +274,7 @@ impl Batch {
             num_regions: nr as u8,
             capacity: 0,
             count: 0,
-            sorted: true,
-            consolidated: true,
+            layout: Layout::Raw,
             schema: None,
             blob_id: next_blob_id(),
         }
@@ -275,8 +296,7 @@ impl Batch {
             num_regions: nr,
             capacity: 0,
             count: 0,
-            sorted: true,
-            consolidated: true,
+            layout: Layout::Raw,
             schema: Some(*schema),
             blob_id: next_blob_id(),
         }
@@ -287,10 +307,10 @@ impl Batch {
     /// join outputs ([left_PK, left_payload..., right_payload...]), which
     /// have no single `SchemaDescriptor` in the engine.
     ///
-    /// `sorted`/`consolidated` default to `false` (like `write_to_batch`): join
-    /// emission appends cartesian/trace-major rows that are neither ordered nor
-    /// folded, and the `extend_*` appenders never touch the flags. A producer that
-    /// emits in (PK, payload) order (the Δ⋈Δ cogroup join) sets them explicitly.
+    /// Layout defaults to `Raw` (like `write_to_batch`): join emission appends
+    /// cartesian/trace-major rows that are neither ordered nor folded, and the
+    /// `extend_*` appenders never raise the layout. A producer that emits in
+    /// (PK, payload) order (the Δ⋈Δ cogroup join) certifies it explicitly.
     pub fn empty_joined(left_schema: &SchemaDescriptor, right_schema: &SchemaDescriptor) -> Self {
         let mut strides = [0u8; MAX_BATCH_REGIONS];
         strides[REG_PK] = pk_stride(left_schema);
@@ -306,8 +326,7 @@ impl Batch {
             num_regions: out_idx as u8,
             capacity: 0,
             count: 0,
-            sorted: false,
-            consolidated: false,
+            layout: Layout::Raw,
             schema: None,
             blob_id: next_blob_id(),
         }
@@ -348,8 +367,7 @@ impl Batch {
             num_regions: nr,
             capacity: cap as u32,
             count: 0,
-            sorted: true,
-            consolidated: true,
+            layout: Layout::Raw,
             schema: Some(schema),
             blob_id: next_blob_id(),
         }
@@ -425,8 +443,7 @@ impl Batch {
             num_regions: nr as u8,
             capacity: count as u32,
             count,
-            sorted: false,
-            consolidated: false,
+            layout: Layout::Raw,
             schema: None,
             blob_id: next_blob_id(),
         }
@@ -457,8 +474,7 @@ impl Batch {
             num_regions,
             capacity: count as u32,
             count,
-            sorted: false,
-            consolidated: false,
+            layout: Layout::Raw,
             schema: None,
             blob_id: next_blob_id(),
         }
@@ -592,8 +608,11 @@ impl Batch {
     pub fn get_weight(&self, row: usize) -> i64 {
         read_i64_le(&self.data[self.offsets[REG_WEIGHT]..], row * 8)
     }
-    /// Overwrite a row's weight in place. Clears `consolidated`: the new
-    /// weight may equal an adjacent row's element weight or zero.
+    /// Overwrite a row's weight in place. Lowers the layout to a `Sorted`
+    /// ceiling (never below): weight is not part of the sort key, so row order is
+    /// preserved unconditionally, but the new weight may be zero (a ghost) or
+    /// equal an adjacent element's weight (an unfolded duplicate), so the
+    /// `Consolidated` guarantee no longer holds.
     #[inline]
     pub fn set_weight(&mut self, row: usize, w: i64) {
         debug_assert!(
@@ -604,7 +623,7 @@ impl Batch {
         );
         let off = self.offsets[REG_WEIGHT] + row * 8;
         self.data[off..off + 8].copy_from_slice(&w.to_le_bytes());
-        self.consolidated = false;
+        self.layout = self.layout.min(Layout::Sorted);
     }
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
@@ -804,14 +823,21 @@ impl Batch {
         );
         let off = self.offsets[REG_PK] + row * stride;
         self.data[off..off + stride].copy_from_slice(&pk.to_be_bytes()[16 - stride..]);
+        self.downgrade();
     }
 
+    /// Overwrite the PK at `row` with raw OPK bytes. Like every order-key mutator
+    /// this downgrades the layout to `Raw`: an in-place PK rewrite can break
+    /// (PK, payload) order, so no prior sort/fold claim survives. (Today's reindex
+    /// callers build a fresh `Raw` output, so this is a no-op for them — but it
+    /// keeps the "order-destroying mutator self-downgrades" discipline uniform.)
     #[inline]
     pub fn set_pk_at_bytes(&mut self, row: usize, bytes: &[u8]) {
         let stride = self.strides[REG_PK] as usize;
         debug_assert_eq!(bytes.len(), stride, "set_pk_at_bytes: length must equal pk_stride",);
         let off = self.offsets[REG_PK] + row * stride;
         self.data[off..off + stride].copy_from_slice(bytes);
+        self.downgrade();
     }
 
     /// Iterate PKs as `u128`. Test-only (the only caller is a batch round-trip
@@ -849,8 +875,9 @@ impl Batch {
     /// Non-STRING payload columns: one `copy_from_slice` per region.
     /// STRING payload columns: per-row blob relocation via `relocate_string_cell`.
     ///
-    /// Leaves `sorted`/`consolidated` untouched (callers that need them cleared
-    /// — e.g. the `append_batch` wrappers — do so themselves).
+    /// Downgrades the layout to `Raw`: any append can break (PK, payload) order or
+    /// introduce a duplicate/ghost, so no prior claim survives. This closes the
+    /// W2M-decode trap where a stale strong claim could outlive an appender.
     ///
     /// Preconditions:
     /// - `start <= end <= src.count`
@@ -920,6 +947,7 @@ impl Batch {
             }
         }
         self.count += n;
+        self.downgrade();
     }
 
     // ── Lifecycle ───────────────────────────────────────────────────────
@@ -938,6 +966,28 @@ impl Batch {
         }
     }
 
+    /// The cached layout claim (non-verifying). Use `layout()`/`is_*()` where the
+    /// boolean suffices; use the verifying `*_verified` readers at trust sites.
+    #[inline]
+    pub(crate) fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// True if the rows are (PK, payload)-sorted. An empty batch is sorted
+    /// structurally (no pair can be out of order), independent of the cached tag —
+    /// so the constructor default of `Raw` needs no per-reader special-casing.
+    #[inline]
+    pub(crate) fn is_sorted(&self) -> bool {
+        self.count == 0 || self.layout >= Layout::Sorted
+    }
+
+    /// True if the rows are consolidated (strictly (PK, payload)-increasing and
+    /// ghost-free). An empty batch is consolidated structurally.
+    #[inline]
+    pub(crate) fn is_consolidated(&self) -> bool {
+        self.count == 0 || self.layout == Layout::Consolidated
+    }
+
     /// Returns `None` for unsorted batches; `count <= 1` is always sorted.
     pub(in crate::storage) fn as_sorted_mem_batch(
         &self,
@@ -950,32 +1000,74 @@ impl Batch {
         }
     }
 
-    /// Read the `sorted` flag, asserting in debug builds that the data actually is
-    /// sorted by (PK, payload). Prefer this over a bare `self.sorted` at any
-    /// skip-point that trusts the flag to avoid a re-sort: a lying flag is caught
-    /// here, exactly where it would otherwise cause silent weight errors.
+    /// `is_sorted()`, additionally asserting in debug builds that the data really
+    /// is (PK, payload)-sorted whenever the cached tag claims it. Prefer this over
+    /// `is_sorted()` at any skip-point that trusts the claim to avoid a re-sort: a
+    /// lying tag is caught here, exactly where it would otherwise cause silent
+    /// weight errors.
     #[cfg_attr(not(debug_assertions), allow(unused_variables))]
     #[inline]
     pub(crate) fn sorted_verified(&self, schema: &SchemaDescriptor) -> bool {
         #[cfg(debug_assertions)]
-        if self.sorted {
+        if self.layout >= Layout::Sorted {
             self.debug_verify_sorted(schema);
         }
-        self.sorted
+        self.is_sorted()
     }
 
-    /// Read the `consolidated` flag, asserting in debug builds that the data
-    /// actually is consolidated (strictly (PK, payload)-increasing, ghost-free).
-    /// Prefer this over a bare `self.consolidated` at any skip-point that trusts
-    /// the flag to avoid a re-fold.
+    /// `is_consolidated()`, additionally asserting in debug builds that the data
+    /// really is consolidated whenever the cached tag claims it. Prefer this over
+    /// `is_consolidated()` at any skip-point that trusts the claim to avoid a
+    /// re-fold.
     #[cfg_attr(not(debug_assertions), allow(unused_variables))]
     #[inline]
     pub(crate) fn consolidated_verified(&self, schema: &SchemaDescriptor) -> bool {
         #[cfg(debug_assertions)]
-        if self.consolidated {
+        if self.layout == Layout::Consolidated {
             self.debug_verify_consolidated(schema);
         }
-        self.consolidated
+        self.is_consolidated()
+    }
+
+    /// Raise this batch's layout to `layout`, debug-verifying the data first. The
+    /// ONLY way the guarantee goes up. Both provenance kernels and the wire-decode
+    /// trust boundary call it, so an over-claiming kernel and a lying wire frame
+    /// are caught identically — at the producer, schema in hand. In release it is
+    /// a single field store.
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
+    #[inline]
+    pub(crate) fn certify_layout(&mut self, layout: Layout, schema: &SchemaDescriptor) {
+        #[cfg(debug_assertions)]
+        match layout {
+            Layout::Raw => {}
+            Layout::Sorted => self.debug_verify_sorted(schema),
+            Layout::Consolidated => self.debug_verify_consolidated(schema),
+        }
+        self.layout = layout;
+    }
+
+    /// Reset to no layout claim. Every order/fold-destroying mutator calls this.
+    #[inline]
+    pub(crate) fn downgrade(&mut self) {
+        self.layout = Layout::Raw;
+    }
+
+    /// Copy a faithful-propagation source's already-verified layout tag without
+    /// re-verifying: the source was verified at its birth and a subset / faithful
+    /// copy (filter, null-extend, partition-filter, single-source sub-slice)
+    /// preserves order, weights, and (PK, payload) distinctness.
+    #[inline]
+    pub(crate) fn inherit_layout(&mut self, src: &Batch) {
+        self.layout = src.layout;
+    }
+
+    /// Test-only: force the layout tag without verifying the data — for tests that
+    /// deliberately construct an inconsistent (spoofed) batch to exercise a
+    /// consumer's debug verifier or a defensive re-fold. Production has no such
+    /// path: `certify_layout` always verifies.
+    #[cfg(test)]
+    pub(crate) fn set_layout_unchecked(&mut self, layout: Layout) {
+        self.layout = layout;
     }
 
     /// Debug-only (PK, payload) order of adjacent rows `i` and `i + 1` — the total
@@ -1084,8 +1176,7 @@ impl Batch {
             num_regions: self.num_regions,
             capacity: self.count as u32,
             count: self.count,
-            sorted: self.sorted,
-            consolidated: self.consolidated,
+            layout: self.layout,
             schema: self.schema,
             blob_id: self.blob_id,
         }
@@ -1129,8 +1220,6 @@ impl Batch {
             return;
         }
         self.append_mem_batch_range(&src.as_mem_batch(), start, end, WeightFill::Copy);
-        self.sorted = false;
-        self.consolidated = false;
     }
 
     /// Bulk-copy rows with negated weights.
@@ -1140,8 +1229,6 @@ impl Batch {
             return;
         }
         self.append_mem_batch_range(&src.as_mem_batch(), start, end, WeightFill::Negate);
-        self.sorted = false;
-        self.consolidated = false;
     }
 
     /// Bulk-copy rows [start, end) verbatim — no string blob relocation.
@@ -1185,8 +1272,7 @@ impl Batch {
             }
         }
         self.count += n;
-        self.sorted = false;
-        self.consolidated = false;
+        self.downgrade();
     }
 
     /// Append a single row from raw C-style region pointers.
@@ -1242,8 +1328,7 @@ impl Batch {
         }
 
         self.count += 1;
-        self.sorted = false;
-        self.consolidated = false;
+        self.downgrade();
     }
 
     /// Append a row from RowBuilder-style value arrays.
@@ -1311,16 +1396,14 @@ impl Batch {
         }
 
         self.count += 1;
-        self.sorted = false;
-        self.consolidated = false;
+        self.downgrade();
     }
 
     /// Reset to empty without freeing buffer allocations.
     pub fn clear(&mut self) {
         self.count = 0;
         self.blob.clear();
-        self.sorted = true;
-        self.consolidated = true;
+        self.downgrade();
         self.blob_id = next_blob_id();
         // data buffer stays allocated — capacity and offsets remain valid.
     }
@@ -1473,18 +1556,22 @@ impl Batch {
         }
 
         self.count += 1;
-        self.sorted = false;
-        self.consolidated = false;
+        self.downgrade();
     }
 
-    /// Consume this batch, consolidating it if needed.
+    /// Consume this batch, consolidating it if needed. The returned batch is
+    /// certified `Consolidated`.
     ///
-    /// Fast path: if already consolidated or empty, wraps `self` in a
-    /// `ConsolidatedBatch` without any allocation (free move).
-    /// Slow path: sorts and weight-folds into a fresh batch, then drops `self`.
-    pub fn into_consolidated(self, schema: &SchemaDescriptor) -> ConsolidatedBatch {
-        if self.consolidated_verified(schema) || self.count == 0 {
-            return ConsolidatedBatch(self);
+    /// Fast path: an already-consolidated (or empty) `self` is returned by move
+    /// with no allocation. Slow path: sorts and weight-folds into a fresh batch,
+    /// then drops `self`.
+    pub fn into_consolidated(mut self, schema: &SchemaDescriptor) -> Batch {
+        if self.consolidated_verified(schema) {
+            // Already consolidated, or empty (structurally consolidated): return
+            // by move. Pin the tag so an empty `Raw` batch still reports
+            // `Consolidated` to downstream trust sites.
+            self.layout = Layout::Consolidated;
+            return self;
         }
         let already_sorted = self.sorted_verified(schema);
         let mb = self.as_mem_batch();
@@ -1496,22 +1583,21 @@ impl Batch {
                 merge::sort_and_consolidate(&mb, schema, writer);
             }
         });
-        result.sorted = true;
-        result.consolidated = true;
-        ConsolidatedBatch(result)
+        result.certify_layout(Layout::Consolidated, schema);
+        result
     }
 
-    /// Consolidate a borrowed batch if needed. Returns `None` when the batch is already
-    /// consolidated or empty (caller borrows the original). Returns `Some(ConsolidatedBatch)`
-    /// when a new consolidated batch was allocated (caller borrows that instead).
+    /// Consolidate a borrowed batch if needed. Returns `None` when the batch is
+    /// already consolidated or empty (caller borrows the original). Returns
+    /// `Some(batch)` — certified `Consolidated` — when a new batch was allocated.
     ///
     /// Idiomatic usage:
     /// ```ignore
     /// let cs = Batch::consolidate_if_needed(delta, schema);
-    /// let c: &Batch = cs.as_deref().unwrap_or(delta);
+    /// let c: &Batch = cs.as_ref().unwrap_or(delta);
     /// ```
-    pub fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<ConsolidatedBatch> {
-        if batch.consolidated_verified(schema) || batch.count == 0 {
+    pub fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<Batch> {
+        if batch.consolidated_verified(schema) {
             return None;
         }
         let mb = batch.as_mem_batch();
@@ -1519,21 +1605,13 @@ impl Batch {
         let mut result = write_to_batch(schema, batch.count, blob_cap, |writer| {
             merge::sort_and_consolidate(&mb, schema, writer);
         });
-        result.sorted = true;
-        result.consolidated = true;
-        Some(ConsolidatedBatch::new_unchecked(result))
+        result.certify_layout(Layout::Consolidated, schema);
+        Some(result)
     }
 
     #[cfg(test)]
     pub(crate) fn data_capacity(&self) -> usize {
         self.data.capacity()
-    }
-
-    pub fn mark_sorted(&mut self) {
-        self.sorted = true;
-    }
-    pub fn mark_consolidated(&mut self) {
-        self.consolidated = true;
     }
 }
 
@@ -1570,40 +1648,6 @@ impl ColumnarSource for Batch {
     #[inline]
     fn blob_slice(&self) -> &[u8] {
         &self.blob
-    }
-}
-
-/// Owned `Batch` certified to be consolidated (sorted, no duplicate PKs, weights folded).
-///
-/// Obtain via `Batch::into_consolidated` (checked) or `new_unchecked` (caller asserts).
-#[repr(transparent)]
-pub struct ConsolidatedBatch(Batch);
-
-impl ConsolidatedBatch {
-    pub(crate) fn new_unchecked(batch: Batch) -> Self {
-        debug_assert!(batch.sorted || batch.count == 0, "ConsolidatedBatch must be sorted");
-        debug_assert!(
-            batch.consolidated || batch.count == 0,
-            "ConsolidatedBatch must be consolidated"
-        );
-        ConsolidatedBatch(batch)
-    }
-    pub fn into_inner(self) -> Batch {
-        self.0
-    }
-    /// Reinterpret `&Batch` as `&ConsolidatedBatch` when `batch.consolidated` is set.
-    /// Empty batches are always considered consolidated.
-    // SAFETY: ConsolidatedBatch is #[repr(transparent)] over Batch.
-    pub(crate) fn from_batch_ref(batch: &Batch) -> Option<&Self> {
-        (batch.consolidated || batch.count == 0)
-            .then(|| unsafe { &*(batch as *const Batch as *const ConsolidatedBatch) })
-    }
-}
-
-impl std::ops::Deref for ConsolidatedBatch {
-    type Target = Batch;
-    fn deref(&self) -> &Batch {
-        &self.0
     }
 }
 
@@ -1667,8 +1711,7 @@ pub fn write_to_batch(
         blob_id: next_blob_id(),
         capacity: max_rows as u32,
         count: actual_rows,
-        sorted: false,
-        consolidated: false,
+        layout: Layout::Raw,
         schema: Some(*schema),
     }
 }
@@ -1763,12 +1806,11 @@ impl BatchBuilder {
         self.curr_col += 1;
     }
 
-    /// Finish the current row (writes null bitmap).
+    /// Finish the current row (writes null bitmap). The batch stays `Raw` (its
+    /// constructor default; `extend_*` never raises the layout).
     pub(crate) fn end_row(&mut self) {
         self.batch.extend_null_bmp(&self.curr_null_word.to_le_bytes());
         self.batch.count += 1;
-        self.batch.sorted = false;
-        self.batch.consolidated = false;
     }
 
     /// Convenience: begin + put columns + end for a simple row.
@@ -2134,10 +2176,10 @@ mod tests {
     #[test]
     fn into_consolidated_strip_forces_real_consolidation() {
         let schema = pk_u64_nullable_i64_schema();
-        let mut clean = build_corrupt_batch(&schema);
-        clean.sorted = false;
-        clean.consolidated = false;
-        let clean = clean.into_consolidated(&schema).into_inner();
+        // `build_corrupt_batch` yields a `Raw` batch (the constructor default), so
+        // `into_consolidated` runs a real sort+fold — the strip's mechanism.
+        let clean = build_corrupt_batch(&schema);
+        let clean = clean.into_consolidated(&schema);
 
         // Ghost eliminated and duplicate folded → 2 surviving rows, (PK,payload)-sorted.
         assert_eq!(clean.count, 2, "ghost dropped, duplicate folded");
@@ -2163,8 +2205,7 @@ mod tests {
     fn into_consolidated_spoofed_corrupt_flags_panic_in_debug() {
         let schema = pk_u64_nullable_i64_schema();
         let mut corrupt = build_corrupt_batch(&schema);
-        corrupt.mark_sorted();
-        corrupt.mark_consolidated();
+        corrupt.set_layout_unchecked(Layout::Consolidated);
         let _ = corrupt.into_consolidated(&schema);
     }
 
@@ -2563,10 +2604,9 @@ mod tests {
     //    debug_verify_consolidated) ─────────────────────────────────────────
     //
     // Build a single-col-U64-PK / I64-payload batch from (pk, weight, payload)
-    // triples and stamp the sorted/consolidated flags directly. This hands a
-    // *lying* flag to a consumer skip-point so the debug verifier can be caught
-    // tripping. `empty_with_schema` defaults both flags to true, so the explicit
-    // assignment is what makes each lie precise.
+    // triples and stamp a (possibly lying) layout directly via the test-only
+    // `set_layout_unchecked`. This hands a *lying* tag to a consumer skip-point so
+    // the debug verifier can be caught tripping.
     fn flagged_batch(rows: &[(u128, i64, i64)], sorted: bool, consolidated: bool) -> (Batch, SchemaDescriptor) {
         let schema = single_col_pk_schema(type_code::U64);
         let mut b = Batch::empty_with_schema(&schema);
@@ -2574,8 +2614,14 @@ mod tests {
         for &(pk, w, v) in rows {
             append_test_row(&mut b, pk, w, v, 0);
         }
-        b.sorted = sorted;
-        b.consolidated = consolidated;
+        let layout = if consolidated {
+            Layout::Consolidated
+        } else if sorted {
+            Layout::Sorted
+        } else {
+            Layout::Raw
+        };
+        b.set_layout_unchecked(layout);
         (b, schema)
     }
 
@@ -2640,5 +2686,49 @@ mod tests {
         );
         let cb = b.into_consolidated(&schema);
         assert_eq!(cb.count, 3, "A: honest consolidated batch passes through");
+    }
+
+    // Layout lifecycle: constructors default `Raw`; `extend_*` never raises;
+    // `certify_layout` raises; `set_weight` lowers `Consolidated` to a `Sorted`
+    // ceiling; any append downgrades to `Raw`; `clear()` resets to `Raw`.
+    #[test]
+    fn layout_lifecycle_default_raise_and_lower() {
+        let schema = single_col_pk_schema(type_code::U64);
+        let mut b = Batch::with_schema(schema, 4);
+        assert_eq!(b.layout(), Layout::Raw, "constructor defaults Raw");
+        append_test_row(&mut b, 1, 1, 10, 0);
+        append_test_row(&mut b, 2, 1, 20, 0);
+        assert_eq!(b.layout(), Layout::Raw, "extend_* never raises the layout");
+
+        // Genuinely (PK, payload)-sorted, ghost-free → certify Consolidated.
+        b.certify_layout(Layout::Consolidated, &schema);
+        assert!(b.is_sorted() && b.is_consolidated());
+
+        // set_weight keeps order but may introduce a ghost/duplicate → Sorted ceiling.
+        b.set_weight(0, 7);
+        assert_eq!(b.layout(), Layout::Sorted);
+        assert!(b.is_sorted() && !b.is_consolidated());
+
+        // Any append downgrades all the way to Raw (the W2M-class fail-safe).
+        let mut src = Batch::with_schema(schema, 1);
+        append_test_row(&mut src, 3, 1, 30, 0);
+        b.append_batch(&src, 0, 1);
+        assert_eq!(b.layout(), Layout::Raw, "append downgrades to Raw");
+
+        b.clear();
+        assert_eq!(b.layout(), Layout::Raw, "clear resets to Raw");
+    }
+
+    // An empty batch reads sorted + consolidated regardless of its (Raw) tag — the
+    // `count == 0` special-case inside the accessors, so the constructor flip to
+    // `Raw` needs no per-reader audit.
+    #[test]
+    fn empty_batch_reads_sorted_and_consolidated() {
+        let schema = single_col_pk_schema(type_code::U64);
+        let b = Batch::with_schema(schema, 4);
+        assert_eq!(b.count, 0);
+        assert_eq!(b.layout(), Layout::Raw);
+        assert!(b.is_sorted(), "empty batch is structurally sorted");
+        assert!(b.is_consolidated(), "empty batch is structurally consolidated");
     }
 }

@@ -613,10 +613,6 @@ mod tests {
             batch.extend_col(0, &val.to_le_bytes());
             batch.count += 1;
         }
-        if !rows.is_empty() {
-            batch.sorted = false;
-            batch.consolidated = false;
-        }
         batch
     }
 
@@ -800,8 +796,6 @@ mod tests {
             batch.extend_col(0, &val.to_le_bytes());
             batch.count += 1;
         }
-        batch.sorted = false;
-        batch.consolidated = false;
         pt.ingest_owned_batch(batch).unwrap();
 
         // Both twins are found via the prefix-sliced probe; an absent suffix in
@@ -936,8 +930,6 @@ mod tests {
             batch.count += 1;
             n += 1;
         }
-        batch.sorted = false;
-        batch.consolidated = false;
         // The wide-PK routing loop must not panic (get_pk would, for
         // pk_stride > 16). All rows route outside the single live
         // partition, so no Table::ingest is invoked.

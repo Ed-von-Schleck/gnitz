@@ -41,9 +41,7 @@ use crate::foundation::syscall::FUTEX2_SIZE_U32;
 use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
-use crate::runtime::wire::{
-    self, DecodedWire, FLAG_BATCH_CONSOLIDATED, FLAG_BATCH_SORTED, FLAG_EXCHANGE, FLAG_HAS_DATA,
-};
+use crate::runtime::wire::{self, DecodedWire, FLAG_EXCHANGE, FLAG_HAS_DATA};
 
 /// High bit of `internal_req_id` (u32) marks scan-allocated request IDs.
 /// Regular IDs stay in [1, MAX_REGULAR_REQ_ID] (bit 31 clear).
@@ -956,11 +954,9 @@ impl Reactor {
         let sch = schema.as_ref().expect("FLAG_HAS_DATA set but no schema — ring corrupt");
         let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
         owned.append_mem_batch_range(&mb, 0, mb.count, crate::storage::WeightFill::Copy);
-        // Authoritative: the wire flags are ground truth. `with_schema` defaults
-        // both flags to true and `append_mem_batch_range` does not clear them, so
-        // an absent wire flag must actively reset — never leave the stale default.
-        owned.sorted = flags & FLAG_BATCH_SORTED != 0;
-        owned.consolidated = flags & FLAG_BATCH_CONSOLIDATED != 0;
+        // The wire flags are ground truth. `append_mem_batch_range` leaves `owned`
+        // `Raw`; raise to the decoded claim, debug-verifying the data against it.
+        owned.certify_layout(wire::layout_from_wire_flags(flags), sch);
         let control = zc.control;
         let _ = mb; // release borrows from slot before dropping the slot
         drop(slot); // RAII: advance consume_cursor before waking awaiter
@@ -989,11 +985,9 @@ impl Reactor {
                 .expect("exchange FLAG_HAS_DATA without schema — ring corrupt");
             let mut owned = crate::storage::Batch::with_schema(*sch, mb.count);
             owned.append_mem_batch_range(&mb, 0, mb.count, crate::storage::WeightFill::Copy);
-            // Authoritative: the wire flags are ground truth. `with_schema` defaults
-            // both flags to true and `append_mem_batch_range` does not clear them, so
-            // an absent wire flag must actively reset — never leave the stale default.
-            owned.sorted = flags & FLAG_BATCH_SORTED != 0;
-            owned.consolidated = flags & FLAG_BATCH_CONSOLIDATED != 0;
+            // The wire flags are ground truth. `append_mem_batch_range` leaves
+            // `owned` `Raw`; raise to the decoded claim, debug-verifying the data.
+            owned.certify_layout(wire::layout_from_wire_flags(flags), sch);
             let _ = mb; // release borrow from slot bytes before dropping slot
             Some(owned)
         } else {

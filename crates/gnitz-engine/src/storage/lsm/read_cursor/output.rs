@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use super::super::batch::{write_to_batch, Batch};
+use super::super::batch::{write_to_batch, Batch, Layout};
 use super::super::columnar::with_row_cmp;
 use super::super::merge::{DirectWriter, MemBatch};
 use super::super::scatter::scatter_unified_sources_with_weights;
@@ -85,14 +85,19 @@ impl Drop for DrainGuard {
 }
 
 impl ReadCursor {
-    /// Copy the current row into `batch` with an explicit weight, leaving
-    /// `batch`'s sorted/consolidated flags untouched.
+    /// Copy the current row into `batch` with an explicit weight, downgrading
+    /// `batch`'s layout to `Raw` (the shared appender does this — any append can
+    /// break order/folding).
     ///
     /// This is `Batch::append_row_from_source_bytes` applied at the cursor's
     /// current position: `CursorSource` implements `ColumnarSource`, so the shared
     /// appender does the weight/null/payload write (German-string blob relocation
     /// included) with no hand-rolled per-column loop here. The byte-form PK is
     /// correct at every width.
+    ///
+    /// Cold catalog-builder callers re-fold downstream; the operator caller
+    /// (`op_reduce`) wants `Raw` anyway — it emits retract/insert pairs in emit
+    /// order, an unconsolidated delta.
     pub(crate) fn copy_current_row_into(&self, batch: &mut Batch, weight: i64) {
         // `current_pk_bytes()` and the appender both index the positioned source,
         // which panics on an unpositioned cursor (empty `sources`). Keep the
@@ -100,14 +105,6 @@ impl ReadCursor {
         if !self.valid {
             return;
         }
-        // Stay flag-neutral: whether appending a row preserves sort/consolidation
-        // depends on the caller's access pattern, which only the caller knows. The
-        // catalog retraction helpers build in (PK, payload) order and keep the
-        // batch's initial `true,true`; op_reduce appends retract/insert rows in emit
-        // order and clears both flags itself once the tick is assembled. The shared
-        // appender clears both unconditionally (its bulk callers append out of
-        // order), so save and restore them across the delegation.
-        let (sorted, consolidated) = (batch.sorted, batch.consolidated);
         batch.append_row_from_source_bytes(
             self.current_pk_bytes(),
             weight,
@@ -115,8 +112,6 @@ impl ReadCursor {
             self.current_row,
             None,
         );
-        batch.sorted = sorted;
-        batch.consolidated = consolidated;
     }
 
     /// Drain up to `limit` net rows in merge order into an owned `Batch`
@@ -148,10 +143,9 @@ impl ReadCursor {
         let mut batch = write_to_batch(&self.schema, merge_order.len(), blob_cap, |writer| {
             self.scatter_drained_into(&merge_order, writer)
         });
-        // The merge walk emits in (PK, payload) order with consolidated
-        // weights; `write_to_batch` doesn't know that, so set the flags.
-        batch.sorted = true;
-        batch.consolidated = true;
+        // The merge walk emits in (PK, payload) order with consolidated weights;
+        // `write_to_batch` returns `Raw`, so certify `Consolidated`.
+        batch.certify_layout(Layout::Consolidated, &self.schema);
         Some(batch)
     }
 
@@ -210,8 +204,9 @@ impl ReadCursor {
                 let end = start + row_count;
                 let mut out = Batch::with_schema(*schema, row_count.max(1));
                 out.append_batch(b, start, end);
-                out.sorted = b.sorted;
-                out.consolidated = b.consolidated;
+                // A contiguous slice of a sorted/consolidated source preserves its
+                // layout (faithful); `append_batch` downgraded `out` to `Raw` first.
+                out.inherit_layout(b);
                 out
             }
             CursorSource::Shard(s) => {

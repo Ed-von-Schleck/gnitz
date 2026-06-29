@@ -4,7 +4,7 @@ use crate::runtime::wire::{
     CTRL_BLOCK_SIZE_NO_BLOB, STATUS_ERROR, STATUS_OK,
 };
 use crate::schema::{encode_german_string, try_decode_german_string, type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, ConsolidatedBatch};
+use crate::storage::{Batch, Layout};
 
 fn simple_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
@@ -27,7 +27,7 @@ fn string_schema() -> SchemaDescriptor {
     )
 }
 
-fn make_simple_batch(pk: u64, val: u64) -> ConsolidatedBatch {
+fn make_simple_batch(pk: u64, val: u64) -> Batch {
     let sd = simple_schema();
     let mut b = Batch::with_schema(sd, 1);
     b.extend_pk(pk as u128);
@@ -35,9 +35,8 @@ fn make_simple_batch(pk: u64, val: u64) -> ConsolidatedBatch {
     b.extend_null_bmp(&0u64.to_le_bytes());
     b.extend_col(0, &val.to_le_bytes());
     b.count = 1;
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.certify_layout(Layout::Consolidated, &sd);
+    b
 }
 
 #[test]
@@ -110,8 +109,8 @@ fn test_encode_decode_roundtrip_with_data() {
     assert_eq!(pk, 100);
     let val = u64::from_le_bytes(db.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(val, 999);
-    assert!(db.sorted);
-    assert!(db.consolidated);
+    assert!(db.is_sorted());
+    assert!(db.is_consolidated());
 }
 
 #[test]

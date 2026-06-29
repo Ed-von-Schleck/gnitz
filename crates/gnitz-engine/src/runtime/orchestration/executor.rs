@@ -745,8 +745,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
     // consolidation (the catalog DDL ingest and the commit path) then re-establishes
     // the invariants. No-op for conforming clients, which never set these.
     if let Some(b) = decoded.data_batch.as_mut() {
-        b.sorted = false;
-        b.consolidated = false;
+        b.downgrade();
     }
 
     let client_id = decoded.control.client_id;

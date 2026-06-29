@@ -533,8 +533,8 @@ impl ScalarFunc {
             }
         }
 
-        output.sorted = false;
-        output.consolidated = false;
+        // `output` came from `with_schema` (`Raw`) and only raw region writes
+        // above, so it stays `Raw` — `op_map` keeps it that way.
         output
     }
 }

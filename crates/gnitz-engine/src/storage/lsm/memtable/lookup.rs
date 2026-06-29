@@ -119,7 +119,7 @@ impl MemTable {
         // retract+insert pair per run — hence `C ≤ 2R < 2·INLINE_CONSOLIDATE_-
         // THRESHOLD` (~30). C only approaches that bound for a key re-updated on
         // nearly every un-consolidated run; absent that it stays small. A
-        // `ConsolidatedBatch` folds only by (PK, payload), so the synthetic
+        // Consolidation folds only by (PK, payload), so the synthetic
         // multi-payload case exceeds even 2R — the growable buffer absorbs any C.
         self.cand_scratch.clear();
         for (ri, run) in self.runs.iter().enumerate() {

@@ -1585,9 +1585,8 @@ impl DagEngine {
     /// them here guarantees `into_consolidated` actually sorts, which the
     /// downstream merge-walk join/distinct operators depend on.
     fn consolidate_exchanged(mut batch: Batch, schema: &SchemaDescriptor) -> Batch {
-        batch.sorted = false;
-        batch.consolidated = false;
-        batch.into_consolidated(schema).into_inner()
+        batch.downgrade();
+        batch.into_consolidated(schema)
     }
 
     /// Normalize a VM epoch result into the DAG's `Option<Batch>` convention:
@@ -1946,8 +1945,8 @@ impl DagEngine {
             out.count += 1;
         }
 
-        out.sorted = false;
-        out.consolidated = false;
+        // `out` is `Raw` from `with_schema`; the `extend_*` loop above never raises
+        // it, and the index-table ingest re-sorts/folds it.
         out
     }
 

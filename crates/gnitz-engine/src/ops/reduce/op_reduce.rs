@@ -37,12 +37,10 @@ fn fill_cleared_batch(
         scatter_copy(delta_mb, delta_indices, &[], &mut writer);
     }
     batch.count = needed;
-    // `clear()` left the reused batch flagged sorted+consolidated; the rows just
-    // written are neither. Without this, `consolidate_if_needed` short-circuits
-    // and a retracted (PK,payload) and its insert both survive, corrupting
-    // non-linear (MIN/MAX) aggregates.
-    batch.sorted = false;
-    batch.consolidated = false;
+    // `clear()` reset the reused batch to `Raw` and the scatter writes raw rows
+    // (no layout raise), so it stays `Raw` — `consolidate_if_needed` then folds the
+    // retract/insert pairs rather than short-circuiting (which would corrupt
+    // non-linear MIN/MAX aggregates).
 }
 
 /// Check if a cursor's current row matches the group columns of an exemplar row.
@@ -152,7 +150,7 @@ pub fn op_reduce(
     } else {
         Batch::consolidate_if_needed(delta, input_schema)
     };
-    let working: &Batch = cs.as_deref().unwrap_or(delta);
+    let working: &Batch = cs.as_ref().unwrap_or(delta);
 
     let n = working.count;
     if n == 0 {
@@ -210,7 +208,7 @@ pub fn op_reduce(
     // bytes) — so no narrow-stride restriction is needed.
     // The fast path's group-detection loop walks rows in iteration order
     // and breaks on PK mismatch — sound iff iteration order is canonical
-    // PK order. When `working.sorted` is set the input is already in that
+    // PK order. When `working` is sorted the input is already in that
     // order (consolidation, integrated trace, sorted union); otherwise we
     // must argsort by canonical PK order to avoid splitting one PK into
     // multiple groups. Output's pk_indices is in source pk-list order
@@ -602,7 +600,7 @@ pub fn op_reduce(
 
                 // Consolidate replay and step all accumulators (borrow replay; don't consume it)
                 let merged_cs = Batch::consolidate_if_needed(replay, input_schema);
-                let merged: &Batch = merged_cs.as_deref().unwrap_or(&*replay);
+                let merged: &Batch = merged_cs.as_ref().unwrap_or(&*replay);
                 for acc in accs.iter_mut() {
                     acc.reset();
                 }
@@ -699,20 +697,12 @@ pub fn op_reduce(
     );
 
     // A reduce tick emits, per changed group, the old aggregate row @ -1 then the
-    // new aggregate row @ +1, in emit order. That is neither (PK, payload)-sorted
-    // (a decreasing aggregate — MAX after deleting the current max, a global SUM
-    // after a delete — yields a descending old/new pair) nor ghost-free (an
-    // unchanged-but-re-emitted group yields a net-zero pair), so the output is an
-    // unconsolidated delta and must not claim otherwise. `Batch::with_schema`
-    // defaults both flags true and the `extend_*` emit path never clears them, so
-    // clear them at the producer: a consumer that trusts the flag — the two-phase
-    // `reduce_local → ExchangeShard` relay, whose `prepare_relay` fast-paths on a
-    // certified-`ConsolidatedBatch` — would otherwise read the rows out of order.
-    raw_output.sorted = false;
-    raw_output.consolidated = false;
-    if let Some(fin) = fin_output.as_mut() {
-        fin.sorted = false;
-        fin.consolidated = false;
-    }
+    // new aggregate row @ +1, in emit order — neither (PK, payload)-sorted (a
+    // decreasing aggregate, e.g. MAX after deleting the current max, yields a
+    // descending old/new pair) nor ghost-free (an unchanged re-emit yields a
+    // net-zero pair). The output is thus an unconsolidated delta, carried by the
+    // `Raw` constructor default (the `extend_*` emit path never raises the layout),
+    // so a downstream consumer (e.g. the reduce→exchange relay) re-folds it rather
+    // than trusting a false claim.
     (raw_output, fin_output)
 }

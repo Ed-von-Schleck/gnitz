@@ -589,8 +589,8 @@ mod tests {
         let batch = shard.to_owned_batch(&schema);
 
         assert_eq!(batch.count, 10);
-        assert!(batch.sorted);
-        assert!(batch.consolidated);
+        assert!(batch.is_sorted());
+        assert!(batch.is_consolidated());
         for i in 0..10 {
             assert_eq!(batch.get_pk(i), (i + 1) as u128);
             let w = read_i64_le(batch.weight_data(), i * 8);

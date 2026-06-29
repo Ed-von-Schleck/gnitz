@@ -5,7 +5,7 @@ use crate::foundation::codec::{read_i64_le, read_u64_le};
 use crate::schema::{
     encode_german_string, type_code, SchemaColumn, SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL,
 };
-use crate::storage::{Batch, ConsolidatedBatch};
+use crate::storage::{Batch, Layout};
 use crate::test_support::make_schema_i64pk_i64;
 
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
@@ -33,7 +33,7 @@ fn make_schema_u64_i64() -> SchemaDescriptor {
     )
 }
 
-fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
+fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
     let n = rows.len();
     let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -44,9 +44,8 @@ fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Consolidat
         b.extend_col(0, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
 }
 
 fn make_schema_u64_f32() -> SchemaDescriptor {
@@ -59,7 +58,7 @@ fn make_schema_u64_f32() -> SchemaDescriptor {
     )
 }
 
-fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> ConsolidatedBatch {
+fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> Batch {
     let n = rows.len();
     let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -70,9 +69,8 @@ fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> Consol
         b.extend_col(0, &val.to_bits().to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
 }
 
 /// 3-column source schema: U64 pk (pk_index=0), I64 grp, STRING val (nullable).
@@ -100,7 +98,7 @@ fn make_reduce_str_out_schema() -> SchemaDescriptor {
 }
 
 /// Build a 3-column Batch (U64 pk, I64 grp, STRING val) from tuples.
-fn make_batch_3col_grp_str(schema: &SchemaDescriptor, rows: &[(u64, i64, i64, &str)]) -> ConsolidatedBatch {
+fn make_batch_3col_grp_str(schema: &SchemaDescriptor, rows: &[(u64, i64, i64, &str)]) -> Batch {
     let n = rows.len();
     let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -113,14 +111,13 @@ fn make_batch_3col_grp_str(schema: &SchemaDescriptor, rows: &[(u64, i64, i64, &s
         b.extend_col(1, &gs);
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
 }
 
 /// Build a byte-form GI Batch for a single-U64-PK source: key = gc(8) ++
 /// source_pk(8). Each row is `(source_pk_u64, gc_u64)`.
-fn make_gi_batch(src: &SchemaDescriptor, rows: &[(u64, u64)]) -> ConsolidatedBatch {
+fn make_gi_batch(src: &SchemaDescriptor, rows: &[(u64, u64)]) -> Batch {
     let gi_schema = crate::ops::index::make_gi_schema(src);
     let n = rows.len();
     let mut b = Batch::with_schema(gi_schema, n.max(1));
@@ -137,9 +134,8 @@ fn make_gi_batch(src: &SchemaDescriptor, rows: &[(u64, u64)]) -> ConsolidatedBat
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
 }
 
 #[test]
@@ -186,9 +182,8 @@ fn test_reduce_sum_retraction() {
             b.extend_col(1, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     let aggs = sum_count_aggs(2, TypeCode::I64);
@@ -229,9 +224,8 @@ fn test_reduce_sum_retraction() {
         b.extend_col(0, &10i64.to_le_bytes());
         b.extend_col(1, &200i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     let (out2, _) = op_reduce(
@@ -289,7 +283,7 @@ fn linear_sum_only_emptied_group_eliminated() {
     );
     let aggs = sum_count_aggs(2, TypeCode::I64);
 
-    let reduce = |delta: &ConsolidatedBatch, to: &mut crate::storage::ReadCursor| {
+    let reduce = |delta: &Batch, to: &mut crate::storage::ReadCursor| {
         op_reduce(
             delta,
             None,
@@ -322,9 +316,8 @@ fn linear_sum_only_emptied_group_eliminated() {
         b.extend_col(0, &10i64.to_le_bytes()); // grp=10
         b.extend_col(1, &5i64.to_le_bytes()); // val=5
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let out1 = reduce(&row(1, 1), to_ch.cursor_mut());
     assert_eq!(out1.count, 1, "group present after first insert");
@@ -441,9 +434,8 @@ fn linear_sum_only_new_all_null_group_present() {
         b.extend_col(0, &7i64.to_le_bytes()); // grp=7
         b.extend_col(1, &0i64.to_le_bytes()); // val NULL (placeholder)
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let (raw, fin) = op_reduce(
         &delta,
@@ -511,7 +503,7 @@ fn count_star_only_emptied_group_eliminated() {
         _pad: [0; 2],
     }];
 
-    let reduce = |delta: &ConsolidatedBatch, to: &mut crate::storage::ReadCursor| {
+    let reduce = |delta: &Batch, to: &mut crate::storage::ReadCursor| {
         op_reduce(
             delta,
             None,
@@ -540,9 +532,8 @@ fn count_star_only_emptied_group_eliminated() {
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &10i64.to_le_bytes()); // grp=10
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     // Tick 1: insert one row → count=1.
@@ -678,9 +669,8 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         b.extend_col(0, &10i64.to_le_bytes()); // grp
         b.extend_col(1, &0i64.to_le_bytes()); // val = NULL (placeholder bytes)
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     let (raw1, fin1) = op_reduce(
@@ -726,9 +716,8 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
         b.extend_col(0, &10i64.to_le_bytes());
         b.extend_col(1, &5i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     let (_raw2, fin2) = op_reduce(
@@ -836,9 +825,8 @@ fn null_min_retraction_re_emits_null() {
         b.extend_col(0, &10i64.to_le_bytes());
         b.extend_col(1, &0i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let (out1, _) = op_reduce(
         &delta1,
@@ -875,9 +863,8 @@ fn null_min_retraction_re_emits_null() {
         b.extend_col(0, &10i64.to_le_bytes());
         b.extend_col(1, &7i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let (out2, _) = op_reduce(
         &delta2,
@@ -960,9 +947,8 @@ fn null_sum_fold_stays_null() {
         b.extend_col(0, &10i64.to_le_bytes());
         b.extend_col(1, &0i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     let empty_out = Rc::new(Batch::empty_with_schema(&out_schema));
@@ -1061,9 +1047,8 @@ fn reduce_trace_seek_wide_pk() {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let (out1, _) = op_reduce(
         &delta1,
@@ -1098,9 +1083,8 @@ fn reduce_trace_seek_wide_pk() {
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &200i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let (out2, _) = op_reduce(
         &delta2,
@@ -1179,9 +1163,8 @@ fn reduce_trace_seek_compound_pk() {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let (out1, _) = op_reduce(
         &delta1,
@@ -1218,9 +1201,8 @@ fn reduce_trace_seek_compound_pk() {
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &50i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let (out2, _) = op_reduce(
         &delta2,
@@ -1293,9 +1275,8 @@ fn reduce_trace_seek_signed_pk() {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let (out1, _) = op_reduce(
         &delta1,
@@ -1329,9 +1310,8 @@ fn reduce_trace_seek_signed_pk() {
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &50i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let (out2, _) = op_reduce(
         &delta2,
@@ -1431,11 +1411,13 @@ fn test_reduce_gi_same_pk_multiple_payloads() {
     let gi_schema = crate::ops::index::make_gi_schema(&input_schema);
 
     // trace_in: apple and zebra both at PK=1 (apple sorts first by payload)
-    let ti_batch =
-        Rc::new(make_batch_3col_grp_str(&input_schema, &[(1, 1, 1, "apple"), (1, 1, 1, "zebra")]).into_inner());
+    let ti_batch = Rc::new(make_batch_3col_grp_str(
+        &input_schema,
+        &[(1, 1, 1, "apple"), (1, 1, 1, "zebra")],
+    ));
 
     // GI: only PK=1 → group gc_u64=1
-    let gi_batch = Rc::new(make_gi_batch(&input_schema, &[(1, 1)]).into_inner());
+    let gi_batch = Rc::new(make_gi_batch(&input_schema, &[(1, 1)]));
 
     // trace_out: empty (no previous aggregate, no retraction emitted)
     let to_batch = Rc::new(Batch::empty(output_schema.num_payload_cols(), 16));
@@ -1583,7 +1565,7 @@ fn make_schema_with_type(tc: u8) -> SchemaDescriptor {
     SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0])
 }
 
-fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> ConsolidatedBatch {
+fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> Batch {
     let n = rows.len();
     let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -1594,12 +1576,11 @@ fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> 
         b.extend_col(0, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
 }
 
-fn make_batch_typed_i16(schema: &SchemaDescriptor, rows: &[(u64, i64, i16)]) -> ConsolidatedBatch {
+fn make_batch_typed_i16(schema: &SchemaDescriptor, rows: &[(u64, i64, i16)]) -> Batch {
     let n = rows.len();
     let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -1610,9 +1591,8 @@ fn make_batch_typed_i16(schema: &SchemaDescriptor, rows: &[(u64, i64, i16)]) -> 
         b.extend_col(0, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
 }
 
 #[test]
@@ -1813,8 +1793,7 @@ fn build_batch_u64_uuid(schema: &SchemaDescriptor, rows: &[(u64, u128)]) -> Batc
         b.extend_col(0, &uuid.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
+    b.set_layout_unchecked(Layout::Consolidated);
     b
 }
 
@@ -1828,8 +1807,7 @@ fn build_batch_u64_uuid_i64(schema: &SchemaDescriptor, rows: &[(u64, u128, i64)]
         b.extend_col(1, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
+    b.set_layout_unchecked(Layout::Consolidated);
     b
 }
 
@@ -1950,13 +1928,12 @@ fn test_reduce_gi_i32_group_key_overread() {
         b.extend_col(0, &5i32.to_le_bytes());
         b.extend_col(1, &200i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b).into_inner()
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     });
 
     // GI: gc_u64=5 → source pk=30
-    let gi_batch = Rc::new(make_gi_batch(&in_schema, &[(30, 5)]).into_inner());
+    let gi_batch = Rc::new(make_gi_batch(&in_schema, &[(30, 5)]));
 
     // Empty trace_out (no prior aggregate)
     let to_batch = Rc::new(Batch::empty(2, 16));
@@ -1980,9 +1957,8 @@ fn test_reduce_gi_i32_group_key_overread() {
         b.extend_col(0, &5i32.to_le_bytes());
         b.extend_col(1, &300i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     let mut ti_handle = CursorHandle::from_owned(&[ti_batch], in_schema);
@@ -2104,8 +2080,7 @@ fn test_reduce_gi_signed_source_pk_negative() {
             b.extend_col(1, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -2116,7 +2091,7 @@ fn test_reduce_gi_signed_source_pk_negative() {
 
     // GI: gc=7 ++ source pk. Listed in remapped-unsigned order: -5 → 0xFF..FB
     // sorts before -3 → 0xFF..FD.
-    let gi_batch = Rc::new(make_gi_batch(&in_schema, &[((-5i64) as u64, 7), ((-3i64) as u64, 7)]).into_inner());
+    let gi_batch = Rc::new(make_gi_batch(&in_schema, &[((-5i64) as u64, 7), ((-3i64) as u64, 7)]));
 
     let to_batch = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
 
@@ -2203,8 +2178,7 @@ fn test_reduce_gi_wide_source_pk_stride24() {
             b.extend_col(1, &val.to_le_bytes()); // payload idx 1 = val (col 4)
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -2228,8 +2202,7 @@ fn test_reduce_gi_wide_source_pk_stride24() {
             gib.extend_null_bmp(&0u64.to_le_bytes());
             gib.count += 1;
         }
-        gib.sorted = true;
-        gib.consolidated = true;
+        gib.set_layout_unchecked(Layout::Consolidated);
         gib
     });
 
@@ -2306,8 +2279,7 @@ fn test_reduce_gi_narrow_source_matches_no_gi() {
             b.extend_col(1, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -2327,7 +2299,7 @@ fn test_reduce_gi_narrow_source_matches_no_gi() {
             _pad: [0; 2],
         };
         if with_gi {
-            let gi_batch = Rc::new(make_gi_batch(&in_schema, &[(1, 5), (2, 5), (3, 9)]).into_inner());
+            let gi_batch = Rc::new(make_gi_batch(&in_schema, &[(1, 5), (2, 5), (3, 9)]));
             let mut gi_handle = CursorHandle::from_owned(&[gi_batch], gi_schema);
             let (out, _) = op_reduce(
                 &delta,
@@ -2431,8 +2403,7 @@ fn build_pk_other(schema: &SchemaDescriptor, rows: &[(u64, i64)]) -> Batch {
         b.extend_col(0, &other.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
+    b.set_layout_unchecked(Layout::Consolidated);
     b
 }
 
@@ -2536,8 +2507,7 @@ fn build_pk_null_i64(schema: &SchemaDescriptor, rows: &[(u64, Option<i64>)]) -> 
         b.extend_col(0, &val.unwrap_or(0).to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
+    b.set_layout_unchecked(Layout::Consolidated);
     b
 }
 
@@ -2701,8 +2671,7 @@ fn make_batch_compound_2xu64(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, 
         b.extend_col(0, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
+    b.set_layout_unchecked(Layout::Consolidated);
     b
 }
 
@@ -3191,7 +3160,7 @@ fn make_schema_u64pk_i64grp_u64val() -> SchemaDescriptor {
 fn make_batch_u64pk_i64grp_u64val(
     schema: &SchemaDescriptor,
     rows: &[(u64, i64, i64, u64)], // (pk, weight, grp, u64_val)
-) -> ConsolidatedBatch {
+) -> Batch {
     let n = rows.len();
     let mut b = Batch::with_schema(*schema, n.max(1));
     for &(pk, w, grp, val) in rows {
@@ -3202,9 +3171,8 @@ fn make_batch_u64pk_i64grp_u64val(
         b.extend_col(1, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
 }
 
 fn make_schema_u64pk_i64grp_i64val() -> SchemaDescriptor {
@@ -3221,7 +3189,7 @@ fn make_schema_u64pk_i64grp_i64val() -> SchemaDescriptor {
 fn make_batch_u64pk_i64grp_i64val(
     schema: &SchemaDescriptor,
     rows: &[(u64, i64, i64, i64)], // (pk, weight, grp, i64_val)
-) -> ConsolidatedBatch {
+) -> Batch {
     let n = rows.len();
     let mut b = Batch::with_schema(*schema, n.max(1));
     for &(pk, w, grp, val) in rows {
@@ -3232,9 +3200,8 @@ fn make_batch_u64pk_i64grp_i64val(
         b.extend_col(1, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
 }
 
 /// Group-by-grp output schema: synthetic U128 PK, I64 grp, U64 agg.
@@ -3413,7 +3380,7 @@ fn test_reduce_min_u64_incremental() {
     let prev_out = Rc::new(out1);
     let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
 
-    let ti2 = Rc::new(make_batch_u64pk_i64grp_u64val(&in_schema, &[(1, 1, 7, 1u64 << 60)]).into_inner());
+    let ti2 = Rc::new(make_batch_u64pk_i64grp_u64val(&in_schema, &[(1, 1, 7, 1u64 << 60)]));
     let mut ti_ch2 = CursorHandle::from_owned(&[ti2], in_schema);
 
     let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(2, 1, 7, 1u64 << 63)]);
@@ -3500,7 +3467,7 @@ fn test_reduce_max_u64_incremental() {
     let prev_out = Rc::new(out1);
     let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
 
-    let ti2 = Rc::new(make_batch_u64pk_i64grp_u64val(&in_schema, &[(1, 1, 7, 10)]).into_inner());
+    let ti2 = Rc::new(make_batch_u64pk_i64grp_u64val(&in_schema, &[(1, 1, 7, 10)]));
     let mut ti_ch2 = CursorHandle::from_owned(&[ti2], in_schema);
 
     let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(2, 1, 7, u64::MAX)]);
@@ -3562,9 +3529,8 @@ fn test_avi_seed_u64_high_bit() {
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &10u64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let mb = batch.as_mem_batch();
     acc.step_from_batch(&mb, 0, 1);
@@ -3633,7 +3599,7 @@ fn test_reduce_min_u64_replay_via_trace_in() {
     // Unsigned MIN(u64::MAX, 5) = 5; the smaller value replaces the seed.
     // Pre-fix signed: 5i64 > -1i64 (=u64::MAX as i64), so MIN stays at
     // u64::MAX and no MIN change is observed.
-    let ti2 = Rc::new(delta1.into_inner());
+    let ti2 = Rc::new(delta1);
     let mut ti_ch2 = CursorHandle::from_owned(&[ti2], in_schema);
     let prev_out = Rc::new(out1);
     let mut to_ch2 = CursorHandle::from_owned(&[prev_out], out_schema);
@@ -3765,7 +3731,7 @@ fn test_reduce_min_max_i64_boundary() {
 //
 // op_reduce's group_by_pk fast path walks rows in physical order and
 // treats consecutive same-PK rows as one group. That assumption only
-// holds when `working.sorted` is true; an unsorted delta (e.g. from
+// holds when `working` is sorted; an unsorted delta (e.g. from
 // `map_reindex` upstream) splits one PK into multiple groups and
 // produces duplicate PK rows / double-retractions.
 // -----------------------------------------------------------------------
@@ -3789,8 +3755,7 @@ fn make_batch_raw_pk<T: Copy>(
         b.extend_col(0, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = false;
-    b.consolidated = false;
+    b.set_layout_unchecked(Layout::Raw);
     b
 }
 
@@ -3892,7 +3857,7 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
     // certifies the flags (a decreasing aggregate would emit a descending old/new
     // pair at the same PK), so downstream re-sorts/folds.
     assert!(
-        !out.sorted && !out.consolidated,
+        !out.is_sorted() && !out.is_consolidated(),
         "reduce output is an unconsolidated delta"
     );
 }
@@ -3955,9 +3920,9 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
     // Same data as the unsorted-sum test but pre-sorted. The
-    // `working.sorted` branch must produce identical output.
+    // sorted-`working` branch must produce identical output.
     let mut delta = make_batch_raw_pk(&in_schema, &[(3, 1, 20), (5, 1, 10), (5, 1, 30)], |pk: u64| pk as u128);
-    delta.sorted = true;
+    delta.set_layout_unchecked(Layout::Sorted);
 
     let aggs = sum_count_aggs(1, TypeCode::I64);
 
@@ -4009,8 +3974,7 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
     // Unsorted compound-PK delta: physical order is (2,1) then (1,2).
     // Canonical pk_indices order should emit (1,2) first.
     let mut delta = make_batch_compound_2xu64(&in_schema, &[(2, 1, 1, 20), (1, 2, 1, 10)]);
-    delta.sorted = false;
-    delta.consolidated = false;
+    delta.set_layout_unchecked(Layout::Raw);
 
     let agg = AggDescriptor {
         col_idx: 2,
@@ -4142,8 +4106,7 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
     prev.extend_col(0, &100i64.to_le_bytes());
     prev.extend_col(1, &1i64.to_le_bytes());
     prev.count += 1;
-    prev.sorted = true;
-    prev.consolidated = true;
+    prev.set_layout_unchecked(Layout::Consolidated);
     let prev_rc = Rc::new(prev);
     let mut to_ch = CursorHandle::from_owned(&[prev_rc], out_schema);
 
@@ -4214,7 +4177,7 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
 
     // trace_in: pk=1 with two payloads (val=10, val=20). The group IS the PK, so
     // both belong to group pk=1; MIN(10, 20) = 10.
-    let ti = make_batch(&in_schema, &[(1, 1, 10), (1, 1, 20)]).into_inner();
+    let ti = make_batch(&in_schema, &[(1, 1, 10), (1, 1, 20)]);
     let mut ti_ch = CursorHandle::from_owned(&[Rc::new(ti)], in_schema);
 
     // trace_out: old MIN(pk=1) = 10.
@@ -4224,12 +4187,11 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
     prev.extend_null_bmp(&0u64.to_le_bytes());
     prev.extend_col(0, &10i64.to_le_bytes());
     prev.count += 1;
-    prev.sorted = true;
-    prev.consolidated = true;
+    prev.set_layout_unchecked(Layout::Consolidated);
     let mut to_ch = CursorHandle::from_owned(&[Rc::new(prev)], out_schema);
 
     // Delta: retract (pk=1, val=10) — the payload holding the current MIN.
-    let delta = make_batch(&in_schema, &[(1, -1, 10)]).into_inner();
+    let delta = make_batch(&in_schema, &[(1, -1, 10)]);
 
     let agg = AggDescriptor {
         col_idx: 1,
@@ -4319,9 +4281,8 @@ fn avi_two_groups_distinct_byte_form_keys() {
             b.extend_col(in_schema.try_payload_idx(3).unwrap(), &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     // AVI: key = a(4) ++ b(4) ++ av_encoded(8). Group (1,1) min=10, (2,2) min=20.
@@ -4434,9 +4395,8 @@ fn avi_retraction_returns_next_extremum() {
         b.extend_col(in_schema.try_payload_idx(1).unwrap(), &1u32.to_le_bytes());
         b.extend_col(in_schema.try_payload_idx(2).unwrap(), &5i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let group_key = extract_group_key(&delta.as_mem_batch(), 0, &in_schema, &[1u32]);
 
@@ -4455,8 +4415,7 @@ fn avi_retraction_returns_next_extremum() {
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -4469,8 +4428,7 @@ fn avi_retraction_returns_next_extremum() {
         b.extend_col(0, &1u32.to_le_bytes()); // a
         b.extend_col(1, &5i64.to_le_bytes()); // min
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         Rc::new(b)
     };
 
@@ -4564,9 +4522,8 @@ fn avi_non_power_of_two_stride_drives_cursor() {
             b.extend_col(in_schema.try_payload_idx(1).unwrap(), &gval.to_le_bytes()[..gsize]);
             b.extend_col(in_schema.try_payload_idx(2).unwrap(), &100i64.to_le_bytes());
             b.count += 1;
-            b.sorted = true;
-            b.consolidated = true;
-            ConsolidatedBatch::new_unchecked(b)
+            b.set_layout_unchecked(Layout::Consolidated);
+            b
         };
 
         let avi_schema = crate::ops::index::make_avi_schema(&in_schema, &[1u32]);
@@ -4664,8 +4621,7 @@ fn trace_scan_retraction_recomputes_min() {
         let mut b = Batch::with_schema(in_schema, 2);
         mk_row(&mut b, 1, 1, 1, 5);
         mk_row(&mut b, 2, 1, 1, 10);
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         Rc::new(b)
     };
 
@@ -4679,8 +4635,7 @@ fn trace_scan_retraction_recomputes_min() {
         b.extend_col(0, &1i64.to_le_bytes()); // g
         b.extend_col(1, &5i64.to_le_bytes()); // min
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         Rc::new(b)
     };
 
@@ -4688,9 +4643,8 @@ fn trace_scan_retraction_recomputes_min() {
     let delta = {
         let mut b = Batch::with_schema(in_schema, 1);
         mk_row(&mut b, 1, -1, 1, 5);
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     let mut ti_ch = CursorHandle::from_owned(&[ti_batch], in_schema);
@@ -4783,8 +4737,7 @@ fn min_tie_retract_one_copy_keeps_min() {
         mk_row(&mut b, 1, 1, 1, 5);
         mk_row(&mut b, 2, 1, 1, 5);
         mk_row(&mut b, 3, 1, 1, 10);
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         Rc::new(b)
     };
     let group_key = extract_group_key(&ti_batch.as_mem_batch(), 0, &in_schema, &[1u32]);
@@ -4797,8 +4750,7 @@ fn min_tie_retract_one_copy_keeps_min() {
         b.extend_col(0, &1i64.to_le_bytes());
         b.extend_col(1, &5i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         Rc::new(b)
     };
 
@@ -4806,9 +4758,8 @@ fn min_tie_retract_one_copy_keeps_min() {
     let delta = {
         let mut b = Batch::with_schema(in_schema, 1);
         mk_row(&mut b, 1, -1, 1, 5);
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     let mut ti_ch = CursorHandle::from_owned(&[ti_batch], in_schema);
@@ -4897,9 +4848,8 @@ fn min_ignores_null_values() {
         mk_row(&mut b, 1, 1, 0, true);
         mk_row(&mut b, 2, 1, 7, false);
         mk_row(&mut b, 3, 1, 3, false);
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
 
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
@@ -4978,9 +4928,8 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         b.extend_col(in_schema.try_payload_idx(2).unwrap(), &4u32.to_le_bytes());
         b.extend_col(in_schema.try_payload_idx(3).unwrap(), &5i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let group_key = extract_group_key(&delta.as_mem_batch(), 0, &in_schema, &[1u32, 2u32]);
 
@@ -5002,8 +4951,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         };
         put(&mut b, 3, 4, 9);
         put(&mut b, 3, 5, 1); // decoy: same a, different b, smaller value
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -5016,8 +4964,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         b.extend_col(1, &4u32.to_le_bytes());
         b.extend_col(2, &5i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         Rc::new(b)
     };
 
@@ -5160,8 +5107,7 @@ fn avi_wide_two_u64_groups_match_reference() {
             bt.extend_null_bmp(&0u64.to_le_bytes());
             bt.count += 1;
         }
-        bt.sorted = true;
-        bt.consolidated = true;
+        bt.set_layout_unchecked(Layout::Consolidated);
         bt
     };
 
@@ -5287,8 +5233,7 @@ fn avi_wide_single_u128_group_distinct() {
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -5410,8 +5355,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -5527,8 +5471,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -5616,9 +5559,8 @@ fn avi_wide_retraction_returns_next_extremum() {
         b.extend_col(in_schema.try_payload_idx(2).unwrap(), &gb.to_le_bytes());
         b.extend_col(in_schema.try_payload_idx(3).unwrap(), &5i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.set_layout_unchecked(Layout::Consolidated);
+        b
     };
     let group_key = extract_group_key(&delta.as_mem_batch(), 0, &in_schema, &[1u32, 2u32]);
 
@@ -5641,8 +5583,7 @@ fn avi_wide_retraction_returns_next_extremum() {
         put(&mut b, ga, gb, 9);
         put(&mut b, ga, gb, 15);
         put(&mut b, ga, gb + 1, 1);
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -5655,8 +5596,7 @@ fn avi_wide_retraction_returns_next_extremum() {
         b.extend_col(1, &gb.to_le_bytes());
         b.extend_col(2, &5i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         Rc::new(b)
     };
 
@@ -5901,8 +5841,7 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = false;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -5938,7 +5877,7 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
     // op_reduce ships an honest unconsolidated delta — it no longer certifies the
     // flags even on the group-by-PK fast path.
     assert!(
-        !out.sorted && !out.consolidated,
+        !out.is_sorted() && !out.is_consolidated(),
         "reduce output is an unconsolidated delta"
     );
     // The argsort_pk_canonical branch still physically orders the wide compound-PK
@@ -6015,8 +5954,7 @@ fn extract_group_key_cursor_matches_batch() {
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         assert_group_key_cursor_matches_batch(&b, &schema, &[0u32]);
     }
 
@@ -6038,8 +5976,7 @@ fn extract_group_key_cursor_matches_batch() {
             b.extend_col(pi, &grp.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         assert_group_key_cursor_matches_batch(&b, &schema, &[1u32]);
     }
 
@@ -6068,8 +6005,7 @@ fn extract_group_key_cursor_matches_batch() {
         b.extend_null_bmp(&(1u64 << pi).to_le_bytes()); // pi-th bit = null
         b.extend_col(pi, &0i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         assert_group_key_cursor_matches_batch(&b, &schema, &[1u32]);
     }
 
@@ -6092,8 +6028,7 @@ fn extract_group_key_cursor_matches_batch() {
             b.extend_col(pi, &gs);
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         assert_group_key_cursor_matches_batch(&b, &schema, &[1u32]);
     }
 
@@ -6107,8 +6042,7 @@ fn extract_group_key_cursor_matches_batch() {
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         assert_group_key_cursor_matches_batch(&b, &schema, &[0u32]);
     }
 
@@ -6141,8 +6075,7 @@ fn extract_group_key_cursor_matches_batch() {
             b.extend_col(pi1, &c2.unwrap_or(0).to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         assert_group_key_cursor_matches_batch(&b, &schema, &[1u32, 2u32]);
     }
 }
@@ -6166,8 +6099,7 @@ fn make_fallback_batch_i64_grp(
         b.extend_col(pi_val, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
+    b.set_layout_unchecked(Layout::Consolidated);
     b
 }
 
@@ -6415,8 +6347,7 @@ fn fallback_min_multi_col_group() {
             b.extend_col(pi_val, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         b
     };
 
@@ -6538,8 +6469,7 @@ fn fallback_trace_rewind_at_most_once() {
         ti_b.extend_col(pi_val, &(g as i64 * 10).to_le_bytes());
         ti_b.count += 1;
     }
-    ti_b.sorted = true;
-    ti_b.consolidated = true;
+    ti_b.set_layout_unchecked(Layout::Consolidated);
 
     // Delta: one new row per group (odd PKs).
     let mut delta_b = Batch::with_schema(in_schema, num_groups);
@@ -6551,8 +6481,7 @@ fn fallback_trace_rewind_at_most_once() {
         delta_b.extend_col(pi_val, &(g as i64 * 10 + 5).to_le_bytes());
         delta_b.count += 1;
     }
-    delta_b.sorted = true;
-    delta_b.consolidated = true;
+    delta_b.set_layout_unchecked(Layout::Consolidated);
 
     let ti_rc = Rc::new(ti_b);
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
@@ -6722,8 +6651,7 @@ fn make_batch_blob_grp_i64(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8], 
         b.extend_col(pi_val, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
+    b.set_layout_unchecked(Layout::Consolidated);
     b
 }
 
@@ -6885,7 +6813,7 @@ fn g_src() -> SchemaDescriptor {
 }
 
 /// Build a delta over `g_src()` from `(pk, weight, val)` rows.
-fn g_delta(rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
+fn g_delta(rows: &[(u64, i64, i64)]) -> Batch {
     let schema = g_src();
     let mut b = Batch::with_schema(schema, rows.len().max(1));
     for &(pk, w, val) in rows {
@@ -6895,9 +6823,8 @@ fn g_delta(rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
         b.extend_col(0, &val.to_le_bytes());
         b.count += 1;
     }
-    b.sorted = true;
-    b.consolidated = true;
-    ConsolidatedBatch::new_unchecked(b)
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
 }
 
 const G_COUNT: AggDescriptor = AggDescriptor {
@@ -6948,7 +6875,7 @@ fn g_out_count_min() -> SchemaDescriptor {
 /// `op_reduce` over `g_src()` with empty group cols (the global-aggregate path).
 #[allow(clippy::too_many_arguments)]
 fn g_reduce(
-    delta: &ConsolidatedBatch,
+    delta: &Batch,
     trace_in: Option<&mut crate::storage::ReadCursor>,
     trace_out: &mut crate::storage::ReadCursor,
     out_schema: &SchemaDescriptor,
@@ -7242,8 +7169,7 @@ fn global_mixed_count_min_emptied_emits_ground() {
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &5i64.to_le_bytes());
         b.count += 1;
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         Rc::new(b)
     };
     let mut ti2 = CursorHandle::from_owned(&[hist], in_schema);
@@ -7307,8 +7233,7 @@ fn global_lone_min_retract_to_next_best() {
             b.extend_col(0, &v.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.set_layout_unchecked(Layout::Consolidated);
         Rc::new(b)
     };
     let mut ti2 = CursorHandle::from_owned(&[hist], in_schema);
@@ -7365,7 +7290,7 @@ fn global_lone_min_avi_empty_prefix() {
         b
     };
 
-    let g_min_avi = |delta: &ConsolidatedBatch, to: &mut crate::storage::ReadCursor, avi: i64| {
+    let g_min_avi = |delta: &Batch, to: &mut crate::storage::ReadCursor, avi: i64| {
         let mut avi_ch = CursorHandle::from_owned(&[Rc::new(avi_with(avi))], avi_schema);
         op_reduce(
             delta,

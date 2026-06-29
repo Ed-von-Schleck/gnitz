@@ -100,9 +100,8 @@ pub(crate) fn op_partition_filter(batch: &Batch, schema: &SchemaDescriptor, work
     }
     let mut out = Batch::from_indexed_rows(&mb, &indices, schema);
     // Filtering keeps the ascending row order and (PK, payload) distinctness of
-    // the input, so the consolidated/sorted flags carry through unchanged.
-    out.sorted = batch.sorted;
-    out.consolidated = batch.consolidated;
+    // the input, so the layout carries through unchanged (faithful propagate).
+    out.inherit_layout(batch);
     out
 }
 
@@ -427,7 +426,7 @@ pub(crate) fn compute_worker_indices(
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD};
-    use crate::storage::ConsolidatedBatch;
+    use crate::storage::Layout;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -449,7 +448,7 @@ mod tests {
         )
     }
 
-    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> ConsolidatedBatch {
+    fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -460,12 +459,11 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Consolidated, schema);
+        b
     }
 
-    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> ConsolidatedBatch {
+    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
         let n = rows.len();
         let mut b = Batch::with_schema(*schema, n.max(1));
 
@@ -490,9 +488,8 @@ mod tests {
             b.extend_col(0, &gs);
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
-        ConsolidatedBatch::new_unchecked(b)
+        b.certify_layout(Layout::Consolidated, schema);
+        b
     }
 
     /// A BLOB payload column shares STRING's 16-byte German-string header
@@ -517,8 +514,7 @@ mod tests {
                 (3, 1, ""),
             ],
         );
-        let b = cb.into_inner();
-        let mb = b.as_mem_batch();
+        let mb = cb.as_mem_batch();
         // Must not panic and must distinguish the two non-empty values.
         let k_short = extract_col_key(&mb, 0, 1, &schema);
         let k_long = extract_col_key(&mb, 1, 1, &schema);
@@ -534,7 +530,7 @@ mod tests {
         let schema = make_schema_u64_i64();
         let num_workers = 4u32;
         let rows: Vec<(u64, i64, i64)> = (0..40u64).map(|i| (i * 7 + 1, 1, i as i64)).collect();
-        let batch = make_batch(&schema, &rows).into_inner();
+        let batch = make_batch(&schema, &rows);
 
         // Each row kept by exactly the worker that owns its PK partition; the
         // union across workers is the whole batch with no duplication.
@@ -554,7 +550,7 @@ mod tests {
     #[test]
     fn test_partition_filter_single_worker_keeps_all() {
         let schema = make_schema_u64_i64();
-        let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).into_inner();
+        let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         let out = op_partition_filter(&batch, &schema, 0, 1);
         assert_eq!(out.count, 3, "(0, 1) must keep every row");
     }
@@ -562,7 +558,7 @@ mod tests {
     #[test]
     fn test_partition_filter_empty_in_empty_out() {
         let schema = make_schema_u64_i64();
-        let batch = make_batch(&schema, &[]).into_inner();
+        let batch = make_batch(&schema, &[]);
         let out = op_partition_filter(&batch, &schema, 1, 4);
         assert_eq!(out.count, 0);
     }

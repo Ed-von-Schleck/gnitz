@@ -129,9 +129,9 @@ pub fn op_integrate_with_indexes(
     // GroupIndex population
     if let Some(gi_desc) = gi {
         let gi_schema = make_gi_schema(input_schema);
+        // `Raw` from `with_schema`; the `extend_*` population below never raises
+        // the layout, so the table ingest re-sorts/folds it.
         let mut gi_batch = Batch::with_schema(gi_schema, batch.count);
-        gi_batch.sorted = false;
-        gi_batch.consolidated = false;
 
         let gi_col = gi_desc.col_idx as usize;
         let gc_extractor = super::util::IndexColExtractor::new(input_schema, gi_col);
@@ -173,9 +173,8 @@ pub fn op_integrate_with_indexes(
     // physically laid out in it.
     if let Some(avi_desc) = avi {
         let avi_schema = make_avi_schema(input_schema, &avi_desc.group_by_cols);
+        // `Raw` from `with_schema`; the `extend_*` population below never raises it.
         let mut avi_batch = Batch::with_schema(avi_schema, batch.count);
-        avi_batch.sorted = false;
-        avi_batch.consolidated = false;
 
         let avi_col = avi_desc.agg_col_idx as usize;
         // Resolve the aggregate column's location once (loop-invariant): a PK

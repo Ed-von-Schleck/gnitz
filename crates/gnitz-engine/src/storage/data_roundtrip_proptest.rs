@@ -126,10 +126,8 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         batch.count += 1;
     }
 
-    // extend_* did not touch the flags and with_schema defaults them true; mark
-    // unsorted so ingest_owned_batch actually sorts + consolidates.
-    batch.sorted = false;
-    batch.consolidated = false;
+    // extend_* did not touch the flags and with_schema defaults to Raw; a fresh
+    // batch is already Raw so ingest_owned_batch will sort + consolidate.
     (batch, leading)
 }
 

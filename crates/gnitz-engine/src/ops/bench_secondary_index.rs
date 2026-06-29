@@ -65,8 +65,6 @@ fn build_input(schema: &SchemaDescriptor) -> Batch {
         b.extend_col(1, &((row.wrapping_mul(2654435761)) as i64).to_le_bytes());
         b.count += 1;
     }
-    b.sorted = false;
-    b.consolidated = false;
     b
 }
 
@@ -159,8 +157,6 @@ fn secondary_index_bench_gi_decomposition() {
     };
     let build_batch = || {
         let mut out = Batch::with_schema(gi_schema, N_ROWS);
-        out.sorted = false;
-        out.consolidated = false;
         let mut key = [0u8; MAX_PK_BYTES];
         for row in 0..N_ROWS {
             let klen = gi_key(&mut key, row);
@@ -186,7 +182,7 @@ fn secondary_index_bench_gi_decomposition() {
         std::hint::black_box(build_batch().into_consolidated(&gi_schema));
     });
     let upsert = time_upsert(tmp.path(), gi_schema, 100, || {
-        build_batch().into_consolidated(&gi_schema).into_inner()
+        build_batch().into_consolidated(&gi_schema)
     });
 
     // Cross-check the layered sum against the real public entry point.
@@ -252,8 +248,6 @@ fn secondary_index_bench_gi_incremental() {
     let start = Instant::now();
     for _ in 0..epochs {
         let mut batch = Batch::with_schema(schema, delta);
-        batch.sorted = false;
-        batch.consolidated = false;
         let mut touched: Vec<u64> = Vec::with_capacity(delta);
         for _ in 0..delta {
             let g = pk % N_GROUPS;
@@ -355,8 +349,6 @@ fn secondary_index_bench_avi_decomposition() {
     };
     let build_batch = || {
         let mut out = Batch::with_schema(avi_schema, N_ROWS);
-        out.sorted = false;
-        out.consolidated = false;
         let mut key = [0u8; MAX_PK_BYTES];
         for row in 0..N_ROWS {
             let klen = avi_key(&mut key, row);
@@ -382,7 +374,7 @@ fn secondary_index_bench_avi_decomposition() {
         std::hint::black_box(build_batch().into_consolidated(&avi_schema));
     });
     let upsert = time_upsert(tmp.path(), avi_schema, 200, || {
-        build_batch().into_consolidated(&avi_schema).into_inner()
+        build_batch().into_consolidated(&avi_schema)
     });
 
     let mut id = 2000u32;
@@ -419,8 +411,6 @@ fn secondary_index_bench_avi_decomposition() {
 fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: impl Fn(usize) -> [u8; 8]) {
     let build = || {
         let mut out = Batch::with_schema(pk_schema, N_ROWS);
-        out.sorted = false;
-        out.consolidated = false;
         for row in 0..N_ROWS {
             out.extend_pk_bytes(&pk_bytes_for(row));
             out.extend_weight(&1i64.to_le_bytes());

@@ -669,11 +669,16 @@ impl MasterDispatcher {
             } else {
                 RouteMode::GroupKey
             };
-            let consolidated_sources: Option<Vec<Option<&ConsolidatedBatch>>> = payloads
+            // Every contributing source must be consolidated to take the
+            // merge-walk scatter; a single non-consolidated source collapses the
+            // whole `Option` to `None` and falls back to the re-sorting repartition.
+            // The scatter (`op_relay_scatter_consolidated_mode`) debug-verifies each.
+            let consolidated_sources: Option<Vec<Option<&Batch>>> = payloads
                 .iter()
                 .map(|opt| match opt {
                     None => Some(None),
-                    Some(b) => ConsolidatedBatch::from_batch_ref(b).map(Some),
+                    Some(b) if b.is_consolidated() => Some(Some(b)),
+                    Some(_) => None,
                 })
                 .collect();
             match consolidated_sources {

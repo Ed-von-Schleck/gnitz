@@ -3288,11 +3288,8 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
         bb.extend_col(0, &x.to_le_bytes());
         bb.count += 1;
     }
-    // Rows were appended out of PK order; clear the (default-true) flags so the
-    // ingest's `into_consolidated` actually sorts the shard. `BatchBuilder`
-    // resets these per row; a hand-built batch must do so itself.
-    bb.sorted = false;
-    bb.consolidated = false;
+    // Rows were appended out of PK order; the batch is `Raw` (the constructor
+    // default), so the ingest's `into_consolidated` sorts the shard.
     let idx_batch = DagEngine::batch_project_index(&bb, &[3], &schema, &idx_schema);
 
     let mut base = Box::new(

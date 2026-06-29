@@ -1,7 +1,7 @@
 //! Scan trace operator.
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ConsolidatedBatch, ReadCursor};
+use crate::storage::{Batch, ReadCursor};
 
 // ---------------------------------------------------------------------------
 // Scan trace (source operator)
@@ -14,12 +14,13 @@ use crate::storage::{Batch, ConsolidatedBatch, ReadCursor};
 /// The cursor is left at the next unscanned position.
 ///
 /// `chunk_limit <= 0` means scan everything until cursor exhaustion.
-pub fn op_scan_trace(cursor: &mut ReadCursor, schema: &SchemaDescriptor, chunk_limit: i32) -> ConsolidatedBatch {
+pub fn op_scan_trace(cursor: &mut ReadCursor, schema: &SchemaDescriptor, chunk_limit: i32) -> Batch {
     let limit = if chunk_limit > 0 { chunk_limit as usize } else { 0 };
+    // `drain_to_batch` certifies its output `Consolidated`; an empty scan yields an
+    // empty batch (structurally consolidated).
     cursor
         .drain_to_batch(limit)
-        .map(ConsolidatedBatch::new_unchecked)
-        .unwrap_or_else(|| ConsolidatedBatch::new_unchecked(Batch::empty_with_schema(schema)))
+        .unwrap_or_else(|| Batch::empty_with_schema(schema))
 }
 
 // ---------------------------------------------------------------------------
@@ -30,7 +31,7 @@ pub fn op_scan_trace(cursor: &mut ReadCursor, schema: &SchemaDescriptor, chunk_l
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::Batch;
+    use crate::storage::{Batch, Layout};
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -52,8 +53,7 @@ mod tests {
             b.extend_col(0, &val.to_le_bytes());
             b.count += 1;
         }
-        b.sorted = true;
-        b.consolidated = true;
+        b.certify_layout(Layout::Consolidated, schema);
         b
     }
 
@@ -75,8 +75,8 @@ mod tests {
         assert_eq!(out1.count, 3);
         assert_eq!(out1.get_pk(0), 1);
         assert_eq!(out1.get_pk(2), 3);
-        assert!(out1.sorted);
-        assert!(out1.consolidated);
+        assert!(out1.is_sorted());
+        assert!(out1.is_consolidated());
 
         // Second scan: remaining 2 rows
         let out2 = op_scan_trace(ch.cursor_mut(), &schema, 3);
