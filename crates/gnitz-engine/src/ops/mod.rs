@@ -12,7 +12,9 @@ mod util;
 #[cfg(test)]
 mod bench_secondary_index;
 
+#[cfg(test)]
 pub(crate) use distinct::op_distinct;
+pub(crate) use distinct::op_weight_clamp;
 pub(crate) use exchange::{
     op_partition_filter, op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, RouteMode,
 };

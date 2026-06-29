@@ -12,16 +12,17 @@ def _uid():
     return str(random.randint(100000, 999999))
 
 
+def _create_ab_tables(client, sn):
+    """Create the two single-PK `a`/`b` tables every set-op test runs against."""
+    client.execute_sql(
+        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
+
+
 class TestSetOps:
     def _setup_two_tables(self, client, sn):
-        client.execute_sql(
-            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql(
-            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
+        _create_ab_tables(client, sn)
 
     def test_union_all(self, client):
         sn = "s" + _uid()
@@ -435,16 +436,149 @@ class TestSetOps:
             client.drop_schema(sn)
 
 
+class TestBagSetOps:
+    """EXCEPT ALL / INTERSECT ALL preserve bag multiplicity: per row
+    max(0, cL−cR) and min(cL, cR), vs the deduplicating EXCEPT/INTERSECT.
+    Multiplicity comes from distinct-PK base rows projected onto a shared value
+    column. Expected multisets are hand-computed (independent of the oracle)."""
+
+    def _two_tables(self, client, sn):
+        _create_ab_tables(client, sn)
+
+    def test_except_all_arithmetic(self, client):
+        """left {10:3, 20:1}, right {10:1, 30:2} ⇒ EXCEPT ALL ⇒ {10:2, 20:1}.
+        Row 30 (cL=0, cR=2) drives positive_part's integral net-NEGATIVE (A−B=−2)
+        and must still be absent — the one behavior no set-op `distinct` exercises
+        (every existing `distinct` input is base-positive)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._two_tables(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT val FROM a EXCEPT ALL SELECT val FROM b", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql("INSERT INTO a VALUES (1,10),(2,10),(3,10),(4,20)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (5,10),(6,30),(7,30)", schema_name=sn)
+
+            oracle.assert_view_matches(
+                client, vid, ["val"], {(10,): 2, (20,): 1}, ctx="except_all_arith")
+        finally:
+            client.drop_schema(sn)
+
+    def test_intersect_all_arithmetic(self, client):
+        """left {10:3, 20:1}, right {10:1, 30:2} ⇒ INTERSECT ALL ⇒ {10:1}.
+        20 (cR=0) and 30 (cL=0) both drop out; 10 carries min(3,1)=1."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._two_tables(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT val FROM a INTERSECT ALL SELECT val FROM b", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql("INSERT INTO a VALUES (1,10),(2,10),(3,10),(4,20)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (5,10),(6,30),(7,30)", schema_name=sn)
+
+            oracle.assert_view_matches(
+                client, vid, ["val"], {(10,): 1}, ctx="intersect_all_arith")
+        finally:
+            client.drop_schema(sn)
+
+    def test_bag_retraction(self, client):
+        """Delete the single right '10': EXCEPT ALL's 10-count rises 2→3,
+        INTERSECT ALL's 10-count falls 1→0. Pins positive_part's boundary emit
+        under a negative delta on both bag operators at once."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._two_tables(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v_exc AS SELECT val FROM a EXCEPT ALL SELECT val FROM b", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v_int AS SELECT val FROM a INTERSECT ALL SELECT val FROM b", schema_name=sn)
+            exc = client.resolve_table(sn, "v_exc")[0]
+            inter = client.resolve_table(sn, "v_int")[0]
+
+            client.execute_sql("INSERT INTO a VALUES (1,10),(2,10),(3,10),(4,20)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (5,10),(6,30),(7,30)", schema_name=sn)
+            oracle.assert_view_matches(client, exc, ["val"], {(10,): 2, (20,): 1}, ctx="exc-before")
+            oracle.assert_view_matches(client, inter, ["val"], {(10,): 1}, ctx="int-before")
+
+            # Delete the lone right-side 10 (pk=5): right 10-count 1→0.
+            client.execute_sql("DELETE FROM b WHERE pk = 5", schema_name=sn)
+            oracle.assert_view_matches(client, exc, ["val"], {(10,): 3, (20,): 1}, ctx="exc-after")
+            oracle.assert_view_matches(client, inter, ["val"], {}, ctx="int-after")
+        finally:
+            client.drop_schema(sn)
+
+    def test_set_vs_bag_divergence(self, client):
+        """cL=2, cR=1 for value 10: set EXCEPT removes it entirely (→ absent);
+        bag EXCEPT ALL keeps max(0, 2−1)=1. The two views are now distinct code
+        paths over the same inputs."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._two_tables(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v_set AS SELECT val FROM a EXCEPT SELECT val FROM b", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v_bag AS SELECT val FROM a EXCEPT ALL SELECT val FROM b", schema_name=sn)
+            v_set = client.resolve_table(sn, "v_set")[0]
+            v_bag = client.resolve_table(sn, "v_bag")[0]
+
+            client.execute_sql("INSERT INTO a VALUES (1,10),(2,10)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (3,10)", schema_name=sn)
+
+            oracle.assert_view_matches(client, v_set, ["val"], {}, ctx="set EXCEPT (10 fully removed)")
+            oracle.assert_view_matches(client, v_bag, ["val"], {(10,): 1}, ctx="bag EXCEPT ALL (one 10 survives)")
+        finally:
+            client.drop_schema(sn)
+
+    def test_quantifier_dispatch(self, client):
+        """EXCEPT ALL / INTERSECT ALL now compile (bag semantics); BY NAME set
+        operations are rejected, not silently aligned positionally. A rejected
+        CREATE registers no view."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._two_tables(client, sn)
+
+            # BY NAME (any operator/quantifier) is unimplemented → rejected.
+            rejected = {
+                "union_all_by_name": "SELECT val FROM a UNION ALL BY NAME SELECT val FROM b",
+                "intersect_by_name": "SELECT val FROM a INTERSECT BY NAME SELECT val FROM b",
+                "except_by_name": "SELECT val FROM a EXCEPT BY NAME SELECT val FROM b",
+            }
+            for name, body in rejected.items():
+                with pytest.raises(Exception):
+                    client.execute_sql(f"CREATE VIEW rej_{name} AS {body}", schema_name=sn)
+                with pytest.raises(Exception):
+                    client.resolve_table(sn, f"rej_{name}")  # no view registered
+
+            # Bag ALL forms and the deduplicating forms all create successfully.
+            ok = {
+                "ok_except_all": "SELECT val FROM a EXCEPT ALL SELECT val FROM b",
+                "ok_intersect_all": "SELECT val FROM a INTERSECT ALL SELECT val FROM b",
+                "ok_union_all": "SELECT val FROM a UNION ALL SELECT val FROM b",
+                "ok_except": "SELECT val FROM a EXCEPT SELECT val FROM b",
+                "ok_intersect": "SELECT val FROM a INTERSECT SELECT val FROM b",
+            }
+            for name, body in ok.items():
+                client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=sn)
+                client.resolve_table(sn, name)  # registered (raises if absent)
+                client.execute_sql(f"DROP VIEW {name}", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+
 class TestSetOpsDifferential:
     """Lock-in: the two-distinct-table set-ops, projected on `val` so dedup and
     weight actually matter, checked against the from-scratch oracle after each
     epoch (validates the oracle against the known-good two-table path)."""
 
     def _setup(self, client, sn, op):
-        client.execute_sql(
-            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
-        client.execute_sql(
-            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
+        _create_ab_tables(client, sn)
         client.execute_sql(
             f"CREATE VIEW v AS SELECT val FROM a {op} SELECT val FROM b", schema_name=sn)
         return client.resolve_table(sn, "v")[0]
@@ -494,6 +628,12 @@ class TestSetOpsDifferential:
 
     def test_union_all_differential(self, client):
         self._run(client, "UNION ALL")
+
+    def test_except_all_differential(self, client):
+        self._run(client, "EXCEPT ALL")
+
+    def test_intersect_all_differential(self, client):
+        self._run(client, "INTERSECT ALL")
 
 
 class TestDistinctDifferential:

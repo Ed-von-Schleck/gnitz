@@ -58,11 +58,17 @@ pub(crate) enum Instr {
         has_b: bool,
         out_reg: u16,
     },
-    Distinct {
+    /// Shared instruction for `distinct` and `positive_part`: per consolidated
+    /// (PK, payload), emit `clamp(w_new, lo, hi) − clamp(w_old, lo, hi)`. Bounds
+    /// `(-1, 1)` ⇒ `distinct` (set membership); `(0, i64::MAX)` ⇒ `positive_part`
+    /// (bag multiplicity).
+    WeightClamp {
         in_reg: u16,
         hist_reg: u16,
         out_reg: u16,
         hist_table_idx: i16,
+        lo: i64,
+        hi: i64,
     },
     JoinDT {
         delta_reg: u16,
@@ -1141,7 +1147,7 @@ mod tests {
 
         let mut builder = ProgramBuilder::new();
         // reg 0 = input delta, reg 1 = history trace, reg 2 = output delta
-        builder.add_distinct(0, 1, 2, table_ptr);
+        builder.add_weight_clamp(0, 1, 2, table_ptr, -1, 1); // distinct preset
         builder.add_halt();
 
         let reg_meta = [
@@ -2386,7 +2392,7 @@ mod tests {
 
         // reg 0 = input delta (kind 0), reg 1 = external trace (kind 1), reg 2 = output delta
         let mut builder = ProgramBuilder::new();
-        builder.add_distinct(0, 1, 2, std::ptr::null_mut()); // hist_table_idx = -1 (no ingest)
+        builder.add_weight_clamp(0, 1, 2, std::ptr::null_mut(), -1, 1); // distinct preset; hist_table_idx = -1 (no ingest)
         builder.add_halt();
 
         let reg_meta = [

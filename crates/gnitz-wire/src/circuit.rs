@@ -49,6 +49,10 @@ pub const OPCODE_JOIN_DELTA_TRACE_RANGE: u64 = 32;
 /// a band join scatters by its eq prefix and omits this node). Worker identity is
 /// a compile-time constant, so the node carries no payload.
 pub const OPCODE_PARTITION_FILTER: u64 = 33;
+/// Multiplicity-preserving sibling of DISTINCT: clamps each consolidated
+/// (PK, payload)'s net weight to `[0, i64::MAX]` (vs DISTINCT's `[-1, 1]`). The
+/// bag preset for EXCEPT ALL / INTERSECT ALL; shares DISTINCT's engine body.
+pub const OPCODE_POSITIVE_PART: u64 = 34;
 
 // ---------------------------------------------------------------------------
 // Circuit-layer type aliases
@@ -239,6 +243,12 @@ pub enum OpNode {
     Union,
     Delay,
     Distinct,
+    /// `OPCODE_POSITIVE_PART = 34`. Multiplicity-preserving counterpart to
+    /// `Distinct`: per consolidated (PK, payload) emits
+    /// `clamp(w_new, 0, i64::MAX) − clamp(w_old, 0, i64::MAX)`, where `Distinct`
+    /// clamps to `[-1, 1]`. Shares `Distinct`'s engine body; the bag preset for
+    /// `EXCEPT ALL = positive_part(A − B)` and `INTERSECT ALL = A − positive_part(A − B)`.
+    PositivePart,
     Reduce {
         group_cols: Vec<u16>,
         agg: AggKind,
@@ -369,6 +379,7 @@ pub fn decode_op_node(
         OPCODE_UNION => OpNode::Union,
         OPCODE_DELAY => OpNode::Delay,
         OPCODE_DISTINCT => OpNode::Distinct,
+        OPCODE_POSITIVE_PART => OpNode::PositivePart,
         OPCODE_REDUCE => {
             let group_cols = collect_cols(NODE_COL_KIND_GROUP);
             let specs = collect_aggs()?;

@@ -227,12 +227,12 @@ pub(crate) fn execute_create_set_op_view(
 
     let out_node = match (op, set_quantifier) {
         (SetOperator::Union, SetQuantifier::All) => cb.union(left_node, right_node),
-        (SetOperator::Union, _) => {
+        (SetOperator::Union, SetQuantifier::Distinct | SetQuantifier::None) => {
             // UNION (distinct): union → distinct
             let merged = cb.union(left_node, right_node);
             cb.distinct(merged)
         }
-        (SetOperator::Intersect, _) => {
+        (SetOperator::Intersect, SetQuantifier::Distinct | SetQuantifier::None) => {
             // Lift both sides through `distinct`: set membership flips once per
             // projected row regardless of how many source rows carry it, and the
             // integrated traces then hold only weight-1 entries (semi-join tests
@@ -250,7 +250,7 @@ pub(crate) fn execute_create_set_op_view(
             let semi_rl = cb.semi_join_with_trace_node(distinct_r, trace_l);
             cb.union(semi_lr, semi_rl)
         }
-        (SetOperator::Except, _) => {
+        (SetOperator::Except, SetQuantifier::Distinct | SetQuantifier::None) => {
             // EXCEPT DISTINCT: difference of the two projected sets. Lifting the
             // left through `distinct` before the anti-join caps a value carried
             // by multiple source rows at weight 1 (the raw `left_node` would emit
@@ -273,6 +273,41 @@ pub(crate) fn execute_create_set_op_view(
             let correction = cb.negate(semi_rl);
             cb.union(except_lr, correction)
         }
+
+        // ── Bag semantics: clamp the net per-row count, don't deduplicate. ──
+        // Both sides are content-hashed with branch_id = 0 (right_branch_id is 0 for
+        // everything but UNION ALL), so L's and R's copies of a row co-hash and net to
+        // the per-row counts cL, cR before the clamp. The path has no join / semi-join /
+        // anti-join: `positive_part` owns its own integral, so correctness is independent
+        // of which side ticks first (single-source-per-epoch; no cross-delta term).
+        (SetOperator::Except, SetQuantifier::All) => {
+            // EXCEPT ALL = positive_part(A − B) ⇒ max(0, cL − cR).
+            let neg_r = cb.negate(right_node);
+            let diff = cb.union(left_node, neg_r); // cL − cR
+            cb.positive_part(diff) // max(0, cL − cR)
+        }
+        (SetOperator::Intersect, SetQuantifier::All) => {
+            // INTERSECT ALL = A − positive_part(A − B) ⇒ min(cL, cR). `left_node` feeds
+            // BOTH unions, so it must sit on the non-destructive PORT_IN_B (second
+            // operand) of each: the destructive-register ordering invariant rejects a
+            // register with two destructive (PORT_IN_A) consumers. union is Z-set
+            // addition (commutative), so this reordering preserves the value.
+            let neg_r = cb.negate(right_node);
+            let diff = cb.union(neg_r, left_node); // −cR + cL = cL − cR
+            let pos = cb.positive_part(diff); // max(0, cL − cR)
+            let neg_pos = cb.negate(pos);
+            cb.union(neg_pos, left_node) // −max(0, cL−cR) + cL = min(cL, cR)
+        }
+
+        // BY NAME column alignment is a separate unimplemented feature; reject it
+        // honestly rather than silently falling back to positional alignment.
+        (_, SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName) => {
+            return Err(GnitzSqlError::Unsupported(
+                "BY NAME set operations are not supported".into(),
+            ))
+        }
+
+        // SetOperator::Minus (any quantifier) and any future operator.
         _ => {
             return Err(GnitzSqlError::Unsupported(format!(
                 "set operation {op:?} not supported"

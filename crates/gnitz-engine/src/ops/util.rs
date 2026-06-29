@@ -38,17 +38,6 @@ pub(super) fn write_string_from_batch(
 // Helpers
 // ---------------------------------------------------------------------------
 
-#[inline]
-pub(super) fn signum(x: i64) -> i64 {
-    if x > 0 {
-        1
-    } else if x < 0 {
-        -1
-    } else {
-        0
-    }
-}
-
 /// Merge a right-side null bitmap into a left-side bitmap for a composite output
 /// row laid out as `[left payload..., right payload...]`. The right bits shift
 /// up by `left_npc` (the left payload-column count). `right << 64` panics in

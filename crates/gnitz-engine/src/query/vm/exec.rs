@@ -265,18 +265,20 @@ pub(crate) fn execute_epoch_multi(
                 }
             }
 
-            Instr::Distinct {
+            Instr::WeightClamp {
                 in_reg,
                 hist_reg,
                 out_reg,
                 hist_table_idx,
+                lo,
+                hi,
             } => {
                 if let Some(cursor) = cursor_mut!(*hist_reg) {
                     let schema = reg!(*in_reg).schema;
                     let npc = reg!(*in_reg).batch.num_payload_cols();
                     let stride = schema.pk_stride();
                     let delta = std::mem::replace(&mut reg_mut!(*in_reg).batch, Batch::empty(npc, stride));
-                    let (output, consolidated) = ops::op_distinct(delta, cursor, &schema);
+                    let (output, consolidated) = ops::op_weight_clamp(delta, cursor, &schema, *lo, *hi);
                     reg_mut!(*out_reg).batch = output;
                     // Ingest consolidated delta into history table
                     if *hist_table_idx >= 0 {

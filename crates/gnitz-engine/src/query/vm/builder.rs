@@ -196,13 +196,26 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn add_distinct(&mut self, in_reg: u16, hist_reg: u16, out_reg: u16, hist_table: *mut Table) {
+    /// `(lo, hi) = (-1, 1)` ⇒ `distinct` (set membership); `(0, i64::MAX)` ⇒
+    /// `positive_part` (bag multiplicity). Both compile to the one `WeightClamp`
+    /// instruction / exec arm.
+    pub fn add_weight_clamp(
+        &mut self,
+        in_reg: u16,
+        hist_reg: u16,
+        out_reg: u16,
+        hist_table: *mut Table,
+        lo: i64,
+        hi: i64,
+    ) {
         let hist_table_idx = self.table_idx(hist_table) as i16;
-        self.instructions.push(Instr::Distinct {
+        self.instructions.push(Instr::WeightClamp {
             in_reg,
             hist_reg,
             out_reg,
             hist_table_idx,
+            lo,
+            hi,
         });
     }
 

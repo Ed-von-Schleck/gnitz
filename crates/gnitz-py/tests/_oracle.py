@@ -134,17 +134,31 @@ def oracle_equijoin(left, lwhere, lkey, lproj,
 def oracle_setop(op, left, right):
     """Apply a set operation to two branch multisets.
 
-    ``UNION ALL`` sums weights (the only multiplicity-preserving op). The
-    deduplicating ops collapse to weight 1 per surviving tuple, where
+    The **bag** (``ALL``) ops preserve per-tuple multiplicity (``cL``/``cR`` are
+    the left/right counts):
+
+      * ``UNION ALL``     — ``cL + cR``
+      * ``EXCEPT ALL``    — ``max(0, cL − cR)``
+      * ``INTERSECT ALL`` — ``min(cL, cR)``
+
+    The deduplicating ops collapse to weight 1 per surviving tuple, where
     "surviving" is decided on *set membership* (net weight > 0) of each side:
 
       * ``UNION``     — tuple present in either side
       * ``INTERSECT`` — tuple present in both sides
       * ``EXCEPT``    — tuple present in the left but not the right
     """
+    # The three bag ops are exactly Counter's native arithmetic, all of which
+    # drop non-positive results (safe: base multiplicities are ≥ 0, so
+    # `cL - cR` and `min(cL, cR)` are dropped only when they hit the `> 0`
+    # boundary the bag semantics also clamp at).
     op = op.upper().strip()
     if op == "UNION ALL":
-        return Counter(left) + Counter(right)
+        return Counter(left) + Counter(right)       # cL + cR
+    if op == "EXCEPT ALL":
+        return Counter(left) - Counter(right)       # max(0, cL − cR)
+    if op == "INTERSECT ALL":
+        return Counter(left) & Counter(right)       # min(cL, cR)
     # The deduplicating ops decide membership exactly as DISTINCT does (net
     # weight > 0), so reuse that single source of truth for the boundary rule.
     lset = set(oracle_distinct(left))

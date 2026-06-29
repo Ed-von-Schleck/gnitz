@@ -4,17 +4,38 @@ use crate::schema::SchemaDescriptor;
 use crate::storage::{scatter_copy, write_to_batch, Batch, Layout, ReadCursor};
 
 use super::cogroup::cogroup_left;
-use super::util::{compare_cursor_payload_to_batch_row, signum};
+use super::util::compare_cursor_payload_to_batch_row;
 
 // ---------------------------------------------------------------------------
 // Distinct
 // ---------------------------------------------------------------------------
 
-/// DBSP distinct: converts multiset deltas into set-membership deltas.
-///
-/// Returns `(output_batch, consolidated_delta)`.
-/// The consolidated delta is returned so the caller can feed it to `ingest_batch`.
+/// DBSP distinct (set-membership clamp `[-1, 1]`): the named `op_weight_clamp`
+/// preset for the unit tests. `w.clamp(-1, 1) == signum(w)` for every integer.
+/// Production never calls this — `Instr::WeightClamp` dispatches to
+/// [`op_weight_clamp`] directly — so it is `#[cfg(test)]`.
+#[cfg(test)]
 pub fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> (Batch, Batch) {
+    op_weight_clamp(delta, cursor, schema, -1, 1)
+}
+
+/// Shared body for the two weight-clamp operators. Per consolidated (PK, payload)
+/// emits `clamp(w_old + Δw, lo, hi) − clamp(w_old, lo, hi)`; the `(lo, hi)` preset
+/// selects the operator:
+///
+/// * `(-1, 1)` → `distinct` (set membership — `clamp(w, -1, 1) == signum(w)`),
+/// * `(0, i64::MAX)` → `positive_part` (bag multiplicity, negative part only).
+///
+/// Both are the DBSP incremental form of a per-element weight clamp lifted to its
+/// delta. Returns `(output_batch, consolidated_delta)`; the consolidated delta is
+/// returned so the caller can feed it to `ingest_batch`.
+pub fn op_weight_clamp(
+    delta: Batch,
+    cursor: &mut ReadCursor,
+    schema: &SchemaDescriptor,
+    lo: i64,
+    hi: i64,
+) -> (Batch, Batch) {
     // 1. Consolidate delta
     let consolidated = delta.into_consolidated(schema);
     let n = consolidated.count;
@@ -24,8 +45,8 @@ pub fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescrip
 
     // 2. Co-group the consolidated delta against the integral trace on PK, then
     //    run a (PK, payload) sub-merge inside each group: for each delta element
-    //    fold the byte-equal trace row's weight and compute the sign change
-    //    signum(w_old + w_delta) − signum(w_old). `cogroup_left` visits every
+    //    fold the byte-equal trace row's weight and compute the clamped change
+    //    clamp(w_old + w_delta) − clamp(w_old). `cogroup_left` visits every
     //    delta group (every element transitions or not); the inner payload merge
     //    walks the delta sub-range and the trace PK group in lockstep, both
     //    being (PK, payload)-sorted, so the per-element trace probe is the
@@ -54,10 +75,8 @@ pub fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescrip
                 }
             };
 
-            let s_old = signum(w_old);
             let w_new = w_old.wrapping_add(consolidated.get_weight(i));
-            let s_new = signum(w_new);
-            let out_w = s_new - s_old;
+            let out_w = w_new.clamp(lo, hi) - w_old.clamp(lo, hi);
             if out_w != 0 {
                 emit_indices.push(i as u32);
                 emit_weights.push(out_w);
@@ -147,6 +166,61 @@ mod tests {
         assert_eq!(out2.count, 1);
         assert_eq!((out2.get_pk(0) as u64), 2);
         assert_eq!(out2.get_weight(0), -1);
+    }
+
+    /// `positive_part` boundary behavior: the same clamp body as `distinct`, but
+    /// with bounds `{0, i64::MAX}` (bag multiplicity — clamp the negative part
+    /// only). Integral 5; ticks +3, −10, +4 emit the clamped deltas
+    /// `max(0,8)−max(0,5)=+3`, `max(0,−2)−max(0,8)=−8`, `max(0,2)−max(0,−2)=+2`.
+    /// Tick 3's pre-image integral is **negative** (−2) — the case no set-op
+    /// `distinct` exercises — and must still emit the correct +2.
+    #[test]
+    fn test_op_positive_part_boundary() {
+        use crate::storage::CursorHandle;
+        use std::rc::Rc;
+
+        let schema = make_schema_u64_i64();
+
+        // Tick 1: integral 5, delta +3 → w_new 8 → emit max(0,8)−max(0,5)=+3.
+        let trace1 = Rc::new(make_batch(&schema, &[(1, 5, 10)]));
+        let mut ch1 = CursorHandle::from_owned(&[trace1], schema);
+        let (out1, _) = op_weight_clamp(
+            make_batch(&schema, &[(1, 3, 10)]),
+            ch1.cursor_mut(),
+            &schema,
+            0,
+            i64::MAX,
+        );
+        assert_eq!(out1.count, 1);
+        assert_eq!(out1.get_weight(0), 3, "max(0,8) - max(0,5) = +3");
+
+        // Tick 2: integral 8, delta −10 → w_new −2 → emit max(0,−2)−max(0,8)=−8.
+        let trace2 = Rc::new(make_batch(&schema, &[(1, 8, 10)]));
+        let mut ch2 = CursorHandle::from_owned(&[trace2], schema);
+        let (out2, _) = op_weight_clamp(
+            make_batch(&schema, &[(1, -10, 10)]),
+            ch2.cursor_mut(),
+            &schema,
+            0,
+            i64::MAX,
+        );
+        assert_eq!(out2.count, 1);
+        assert_eq!(out2.get_weight(0), -8, "max(0,-2) - max(0,8) = -8");
+
+        // Tick 3: integral −2 (net-negative), delta +4 → w_new 2 → emit
+        // max(0,2)−max(0,−2)=+2. A negative pre-image clamps to 0, so the row
+        // re-enters the bag at exactly its positive part.
+        let trace3 = Rc::new(make_batch(&schema, &[(1, -2, 10)]));
+        let mut ch3 = CursorHandle::from_owned(&[trace3], schema);
+        let (out3, _) = op_weight_clamp(
+            make_batch(&schema, &[(1, 4, 10)]),
+            ch3.cursor_mut(),
+            &schema,
+            0,
+            i64::MAX,
+        );
+        assert_eq!(out3.count, 1);
+        assert_eq!(out3.get_weight(0), 2, "max(0,2) - max(0,-2) = +2");
     }
 
     /// Several payloads at one PK, exercising the (PK, payload) sub-merge inside

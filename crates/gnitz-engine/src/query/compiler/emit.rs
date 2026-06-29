@@ -443,13 +443,24 @@ pub(super) fn emit_node(
             builder.add_delay(in_reg as u16, state_reg as u16, reg_id as u16);
         }
 
-        gnitz_wire::OpNode::Distinct => {
+        gnitz_wire::OpNode::Distinct | gnitz_wire::OpNode::PositivePart => {
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             let in_reg_schema = reg_meta[in_reg as usize].schema;
+            // `distinct` is the only one the optimizer elides (its input is already
+            // distinct); `positive_part` is never seeded into `is_distinct_at`, so
+            // it is never in `skip_nodes` — this check is simply false for it.
             if rw.skip_nodes.contains(&nid) {
                 out_reg_of.insert(nid, in_reg);
                 return;
             }
+            // Set-membership clamp `[-1, 1]` for distinct; bag clamp `[0, i64::MAX]`
+            // (negative part only) for positive_part. The two presets are the sole
+            // difference between the operators; both emit one `WeightClamp` instr.
+            let (lo, hi) = if matches!(op, gnitz_wire::OpNode::PositivePart) {
+                (0, i64::MAX)
+            } else {
+                (-1, 1)
+            };
             let child_name = format!("_hist_{view_id}_{nid}");
             let hist_table = match create_child_table(state, view_dir, &child_name, in_reg_schema, view_table_id) {
                 Ok(t) => t,
@@ -466,7 +477,14 @@ pub(super) fn emit_node(
             let out_delta_id = reg_meta.len() as i32;
             reg_meta.push(RegisterMeta::delta(in_reg_schema));
             out_reg_of.insert(nid, out_delta_id);
-            builder.add_distinct(in_reg as u16, reg_id as u16, out_delta_id as u16, hist_table_ptr);
+            builder.add_weight_clamp(
+                in_reg as u16,
+                reg_id as u16,
+                out_delta_id as u16,
+                hist_table_ptr,
+                lo,
+                hi,
+            );
         }
 
         gnitz_wire::OpNode::Reduce {
@@ -930,9 +948,9 @@ pub(super) fn build_plan(
         next_reg += 1;
     }
 
-    // Destructive-register ordering invariant. `Union`, `Distinct`, and `Delay`
-    // empty their PORT_IN register in place (std::mem::replace/swap with an empty
-    // batch, to avoid allocation); the trace-absent `AntiJoin(DeltaTrace)` branch
+    // Destructive-register ordering invariant. `Union`, `Distinct`, `PositivePart`,
+    // and `Delay` empty their PORT_IN register in place (std::mem::replace/swap with
+    // an empty batch, to avoid allocation); the trace-absent `AntiJoin(DeltaTrace)` branch
     // does the same to its PORT_IN_A delta input. Every node has one output register
     // shared by all its consumers, so a register that fans into both a
     // non-destructive reader (e.g. integrate_trace) and a destructive consumer is
@@ -957,9 +975,10 @@ pub(super) fn build_plan(
         // Ops that destructively empty an input register, and the port they empty.
         // (Union's in_a and AntiJoinDT's delta side are both PORT_IN_A == PORT_IN.)
         let dtor_port = match loaded.nodes.get(&nid) {
-            Some(gnitz_wire::OpNode::Distinct) | Some(gnitz_wire::OpNode::Union) | Some(gnitz_wire::OpNode::Delay) => {
-                Some(PORT_IN)
-            }
+            Some(gnitz_wire::OpNode::Distinct)
+            | Some(gnitz_wire::OpNode::PositivePart)
+            | Some(gnitz_wire::OpNode::Union)
+            | Some(gnitz_wire::OpNode::Delay) => Some(PORT_IN),
             Some(gnitz_wire::OpNode::AntiJoin(gnitz_wire::SetJoinKind::DeltaTrace)) => Some(PORT_IN_A),
             _ => None,
         };

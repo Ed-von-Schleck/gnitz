@@ -165,6 +165,7 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         OpNode::Union => ((OPCODE_UNION, None, None), Vec::new()),
         OpNode::Delay => ((OPCODE_DELAY, None, None), Vec::new()),
         OpNode::Distinct => ((OPCODE_DISTINCT, None, None), Vec::new()),
+        OpNode::PositivePart => ((OPCODE_POSITIVE_PART, None, None), Vec::new()),
         OpNode::Reduce {
             group_cols,
             agg,
@@ -366,6 +367,17 @@ impl CircuitBuilder {
 
     pub fn distinct(&mut self, input: NodeId) -> NodeId {
         let nid = self.alloc_node(OpNode::Distinct);
+        self.connect(input, nid, gnitz_wire::PORT_IN);
+        nid
+    }
+
+    /// Multiplicity-preserving sibling of [`distinct`](Self::distinct): clamps each
+    /// consolidated (PK, payload)'s net weight to `[0, i64::MAX]` instead of
+    /// `[-1, 1]`, so output weights stay ≥ 0 but are not collapsed to set
+    /// membership. `EXCEPT ALL = positive_part(A − B)` and
+    /// `INTERSECT ALL = A − positive_part(A − B)` build on it.
+    pub fn positive_part(&mut self, input: NodeId) -> NodeId {
+        let nid = self.alloc_node(OpNode::PositivePart);
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }
