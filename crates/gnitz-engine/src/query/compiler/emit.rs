@@ -76,8 +76,8 @@ pub(super) struct FinalizePrograms {
 /// Path of a per-worker scratch directory under `view_dir`. Rank-stamped because
 /// forked workers share `view_dir`; an un-stamped path would have every worker
 /// open the same directory and clobber each other's shard files. Single source
-/// of truth for the convention — `create_child_table` and the nested GI dir both
-/// derive their paths from it, so the rank stamp can never drift between them.
+/// of truth for the convention — `create_child_table` derives its path from it,
+/// so the rank stamp can never drift between child tables.
 pub(super) fn child_scratch_dir(view_dir: &str, child_name: &str) -> String {
     format!("{}/scratch_{}_w{}", view_dir, child_name, worker_rank())
 }
@@ -655,17 +655,7 @@ pub(super) fn compute_in_regs(loaded: &LoadedCircuit, nid: i32, out_reg_of: &Has
 }
 
 pub(super) fn emit_simple_integrate(builder: &mut ProgramBuilder, in_reg: u16, table_ptr: *mut Table) {
-    builder.add_integrate(
-        in_reg,
-        table_ptr,
-        std::ptr::null_mut(),
-        0, // no GI
-        std::ptr::null_mut(),
-        false,
-        0,
-        &[],
-        0, // no AVI
-    );
+    builder.add_integrate(in_reg, table_ptr, std::ptr::null_mut(), &[], &[]);
 }
 
 // ---------------------------------------------------------------------------
@@ -700,8 +690,6 @@ pub(super) fn emit_reduce(
     let gcols_u32: Vec<u32> = group_cols.iter().map(|&c| c as u32).collect();
 
     let mut agg_descs: Vec<AggDescriptor> = Vec::new();
-    let mut agg_func_id: AggOp = AggOp::Null;
-    let mut agg_col_idx: u32 = 0;
 
     match agg {
         gnitz_wire::AggKind::Null => {
@@ -722,10 +710,6 @@ pub(super) fn emit_reduce(
                     col_type_code,
                     _pad: [0; 2],
                 });
-            }
-            if agg_descs.len() == 1 {
-                agg_func_id = agg_descs[0].agg_op;
-                agg_col_idx = agg_descs[0].col_idx;
             }
         }
     }
@@ -766,30 +750,33 @@ pub(super) fn emit_reduce(
     }
 
     let all_linear = agg_descs.iter().all(|a| a.agg_op.is_linear());
-    // No nullable check on agg_col_idx: NULL aggregate values never reach the
-    // AVI. The reduce accumulator skips NULL inputs (ops/reduce/agg.rs) and AVI
-    // integration skips NULL aggregate values before encoding the index key
-    // (ops/index.rs), whose value column is a non-nullable PK. Moving either
-    // filter without revisiting this would write a zeroed key and corrupt
-    // MIN/MAX.
-    let will_use_avi = agg_descs.len() == 1
-        && matches!(agg_func_id, AggOp::Min | AggOp::Max)
-        && agg_value_idx_eligible(TypeCode::from_validated_u8(
-            in_reg_schema.columns[agg_col_idx as usize].type_code,
-        ))
-        && avi_group_key_eligible(&in_reg_schema, &gcols_u32);
+    let has_value_indexed = agg_descs.iter().any(|a| a.agg_op.uses_value_index());
+    // Serve every MIN/MAX aggregate (grouped or global) from one combined value
+    // index, keyed `group_cols ‖ ordinal ‖ av_encoded`, when every value-indexed
+    // aggregate is order-encodable and the group key is byte-form-eligible (the
+    // ordinal column is accounted for in `avi_group_key_eligible`'s budget). The
+    // empty global key is eligible, so a global MIN/MAX always resolves via the
+    // index; nothing value-indexed is left on the trace-scan fallback below.
+    //
+    // No nullable check on the aggregate columns: NULL aggregate values never
+    // reach the AVI. The reduce accumulator skips NULL inputs (ops/reduce/agg.rs)
+    // and AVI population skips a NULL aggregate value before encoding the index
+    // key (ops/index.rs), whose value column is a non-nullable PK. Moving either
+    // filter without revisiting this would write a zeroed key and corrupt MIN/MAX.
+    let all_value_indexed_eligible = agg_descs
+        .iter()
+        .filter(|a| a.agg_op.uses_value_index())
+        .all(|a| agg_value_idx_eligible(a.col_type_code));
+    let use_avi = has_value_indexed && all_value_indexed_eligible && avi_group_key_eligible(&in_reg_schema, &gcols_u32);
 
     let mut tr_in_reg_id: i32 = -1;
     let mut tr_in_table_ptr: *mut Table = std::ptr::null_mut();
-    let mut tr_in_table_idx: Option<usize> = None;
 
-    // Name of the trace-input scratch table; reused below to nest the GI under
-    // the very same scratch dir so the two paths can't drift apart.
     let tr_in_name = format!("_reduce_in_{view_id}_{nid}");
 
     if let Some(&existing) = in_regs.get(&PORT_TRACE) {
         tr_in_reg_id = existing;
-    } else if !all_linear && !will_use_avi {
+    } else if !all_linear && !use_avi {
         let tr_in = match create_child_table(state, view_dir, &tr_in_name, in_reg_schema, view_table_id) {
             Ok(t) => t,
             Err(_) => {
@@ -800,58 +787,28 @@ pub(super) fn emit_reduce(
         let idx = owned_tables.len();
         owned_tables.push(Box::new(tr_in));
         tr_in_table_ptr = &*owned_tables[idx] as *const Table as *mut Table;
-        tr_in_table_idx = Some(idx);
 
         tr_in_reg_id = reg_meta.len() as i32;
         reg_meta.push(RegisterMeta::trace(in_reg_schema));
         owned_trace_regs.push((tr_in_reg_id as u16, idx));
     }
 
-    let mut gi_table_ptr: *mut Table = std::ptr::null_mut();
-    let mut gi_col_idx: u32 = 0;
-
-    if tr_in_table_idx.is_some() && gcols.len() == 1 {
-        let gc_col_idx = gcols[0] as usize;
-        let gc_raw = in_reg_schema.columns[gc_col_idx].type_code;
-        // A nullable group column makes the GI unsound: NULL rows are skipped at
-        // population, but the reduce GI path extracts gc=0 from a NULL group's
-        // zero-filled slot and would collide it with a real group 0. Fall back to
-        // the predicate-filtered full trace scan, which distinguishes NULL from 0.
-        let gc_nullable = in_reg_schema.columns[gc_col_idx].nullable != 0;
-        if !gc_nullable && is_fixed_int(gc_raw) {
-            // Nest the GI under the trace-input table's own scratch dir, built
-            // from the same `child_scratch_dir` convention so the rank stamp can
-            // never drift between the two. Nesting folds the GI into the parent's
-            // cleanup — the parent dir is the one registered in
-            // `state.scratch_dirs`, and `remove_dir_all` is recursive.
-            let gi_dir = format!("{}/_gidx", child_scratch_dir(view_dir, &tr_in_name));
-            if let Ok(gi_table) = Table::new(
-                &gi_dir,
-                "_gidx",
-                crate::ops::make_gi_schema(&in_reg_schema),
-                0,
-                1024 * 1024,
-                Persistence::Ephemeral,
-            ) {
-                let idx = owned_tables.len();
-                owned_tables.push(Box::new(gi_table));
-                gi_table_ptr = &*owned_tables[idx] as *const Table as *mut Table;
-                gi_col_idx = gc_col_idx as u32;
-            }
-        }
-    }
-
+    // One combined value index per reduce: a single table keyed
+    // `group_cols ‖ ordinal ‖ av_encoded`, serving every MIN/MAX aggregate.
+    // `avi_aggs` is the value-indexed subset of `agg_descs`, in descriptor order
+    // (ordinal = position) — the same order, selected by the same predicate, that
+    // the reduce read side walks into its seek prefix. One table → one table_id,
+    // one scratch dir, one compaction-filename namespace, so per-aggregate entries
+    // cannot collide on a memory-pressure flush.
     let mut avi_table_ptr: *mut Table = std::ptr::null_mut();
-    let mut avi_for_max = false;
-    let mut avi_agg_col_type_code: u8 = 0;
-    let mut avi_group_cols: Vec<u32> = Vec::new();
-    let mut avi_agg_col_idx: u32 = 0;
+    let mut avi_aggs: Vec<AggDescriptor> = Vec::new();
 
-    if will_use_avi {
-        avi_for_max = agg_func_id == AggOp::Max;
-        avi_agg_col_type_code = in_reg_schema.columns[agg_col_idx as usize].type_code;
-        avi_agg_col_idx = agg_col_idx;
-        avi_group_cols = gcols_u32.clone();
+    if use_avi {
+        avi_aggs = agg_descs
+            .iter()
+            .filter(|d| d.agg_op.uses_value_index())
+            .copied()
+            .collect();
         let avi_child = format!("_avidx_{view_id}_{nid}");
         if let Ok(av_table) = create_child_table(
             state,
@@ -866,17 +823,16 @@ pub(super) fn emit_reduce(
         }
     }
 
+    // The combined index integrates BEFORE the reduce reads it, so a prefix seek
+    // returns the post-delta extreme directly. (The trace_in integrate below runs
+    // after the reduce and carries no index.)
     if !avi_table_ptr.is_null() {
         builder.add_integrate(
             in_reg_id as u16,
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0,
             avi_table_ptr,
-            avi_for_max,
-            avi_agg_col_type_code,
-            &avi_group_cols,
-            avi_agg_col_idx,
+            &gcols_u32,
+            &avi_aggs,
         );
     }
 
@@ -938,28 +894,17 @@ pub(super) fn emit_reduce(
         &gcols_u32,
         reduce_out_schema,
         avi_table_ptr,
-        avi_for_max,
-        avi_agg_col_type_code,
-        gi_table_ptr,
-        gi_col_idx,
         fin_prog_ptr,
         fin_schema_ptr,
         global_ground,
         i_am_owner,
     );
 
+    // The trace_in integrate (non-linear, non-AVI fallback) carries no value
+    // index — tr_in and the AVI are mutually exclusive (the tr_in gate is
+    // `!all_linear && !use_avi`).
     if !tr_in_table_ptr.is_null() {
-        builder.add_integrate(
-            in_reg_id as u16,
-            tr_in_table_ptr,
-            gi_table_ptr,
-            gi_col_idx,
-            avi_table_ptr,
-            avi_for_max,
-            avi_agg_col_type_code,
-            &avi_group_cols,
-            avi_agg_col_idx,
-        );
+        emit_simple_integrate(builder, in_reg_id as u16, tr_in_table_ptr);
     }
 
     emit_simple_integrate(builder, raw_delta_id as u16, trace_table_ptr);

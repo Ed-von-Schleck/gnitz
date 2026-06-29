@@ -452,15 +452,19 @@ pub(super) fn agg_value_idx_eligible(tc: TypeCode) -> bool {
     is_fixed_int(tc as u8) || tc.is_float()
 }
 
-/// AVI stores the group key as a fixed-width byte prefix. A group key is
-/// byte-form-eligible iff every group column is a non-nullable, fixed-width,
-/// non-float scalar (a valid PK-column type) and the composite key
-/// `group_stride + av_encoded` fits the composite PK budget (`MAX_PK_BYTES`).
-/// The byte-form cursor (drive, seek, consolidation) orders by
-/// `compare_pk_bytes`, so any stride up to the engine PK limit is wide-safe;
-/// only column type/count and the byte budget gate eligibility.
+/// The combined AVI stores its key as a fixed-width byte prefix
+/// `group_cols ‖ ordinal(u8) ‖ av_encoded`. A group key is byte-form-eligible
+/// iff every group column is a non-nullable, fixed-width, non-float scalar (a
+/// valid PK-column type) and the composite key — group stride **plus the
+/// 1-byte ordinal plus the av value** — fits the composite PK budget
+/// (`MAX_PK_COLUMNS` columns, `MAX_PK_BYTES` bytes). The byte-form cursor
+/// (drive, seek, consolidation) orders by `compare_pk_bytes`, so any stride up
+/// to the engine PK limit is wide-safe; only column type/count and the byte
+/// budget gate eligibility. The empty global key (`gcols = []`) stays eligible
+/// (`0 + 2 ≤ MAX_PK_COLUMNS`), so a global MIN/MAX always resolves via the index.
 pub(super) fn avi_group_key_eligible(schema: &SchemaDescriptor, gcols: &[u32]) -> bool {
-    if gcols.len() + 1 > crate::schema::MAX_PK_COLUMNS {
+    // group cols + ordinal column + av column must fit the PK-column budget.
+    if gcols.len() + 2 > crate::schema::MAX_PK_COLUMNS {
         return false;
     }
     let mut stride = 0usize;
@@ -477,6 +481,7 @@ pub(super) fn avi_group_key_eligible(schema: &SchemaDescriptor, gcols: &[u32]) -
         }
         stride += col.size() as usize;
     }
-    let key_bytes = stride + crate::ops::AVI_AV_BYTES;
+    // + 1 ordinal byte + the order-encoded value.
+    let key_bytes = stride + 1 + crate::ops::AVI_AV_BYTES;
     key_bytes <= crate::schema::MAX_PK_BYTES
 }

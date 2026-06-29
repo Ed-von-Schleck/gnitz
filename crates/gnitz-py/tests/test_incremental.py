@@ -1506,7 +1506,7 @@ class TestReduceRetraction:
 
 
 # ---------------------------------------------------------------------------
-# TestReduceStringGIPath (CircuitBuilder) — GI-path regression
+# String MAX reduce (CircuitBuilder) — single-scan trace fallback regression
 # ---------------------------------------------------------------------------
 
 def _make_grp_str_table(client, sn):
@@ -1558,22 +1558,20 @@ def _scan_str_reduce(client, vid):
     return {row[1]: row[2] for row in client.scan(vid) if row.weight > 0}
 
 
-class TestReduceStringGIPath:
+class TestReduceStringFallbackPath:
 
-    def test_max_string_gi_path_same_pk_multiple_payloads(self, client):
-        """MAX on STRING col (GI path): history replay must loop over all payloads at each PK.
+    def test_max_string_fallback_same_pk_multiple_payloads(self, client):
+        """MAX on a STRING column is not value-index-eligible (German strings do
+        not order-encode), so it takes the single-scan trace fallback — which must
+        collect ALL (PK, payload) entries at a shared PK, not just the first.
 
         unique_pk=False allows (PK=1, grp=1, val="apple") and
         (PK=1, grp=1, val="zebra") to coexist.  On tick 2 we retract
-        "apple" from PK=1.  The GI path must seek trace_in to PK=1 and
-        advance past ALL matching (PK, payload) entries — not just the first.
-
-        Bug (if instead of while): only "apple" is collected from PK=1;
-        replay = {apple+1, apple−1} → empty → MAX changes to "mango"'s
-        compare key (from PK=2).
-
-        Fix (while + advance): both "apple" and "zebra" are collected;
-        replay = {apple+1, zebra+1, apple−1} → {zebra+1} → MAX unchanged.
+        "apple" from PK=1.  The fallback scans the trace once and routes every
+        same-PK row to its group, so both "apple" and "zebra" are collected;
+        replay = {apple+1, zebra+1, apple−1} → {zebra+1} → MAX unchanged. Missing
+        "zebra" would leave replay → empty → MAX wrongly falling to "mango"
+        (from PK=2).
         """
         sn = "s" + _uid()
         client.create_schema(sn)
@@ -1589,14 +1587,14 @@ class TestReduceStringGIPath:
             assert 1 in r1, "group 1 must have an aggregate after tick 1"
 
             # Tick 2: retract "apple" from PK=1.
-            # GI loop must collect both apple and zebra from trace_in at PK=1,
-            # then subtract apple (from delta), leaving zebra as the new MAX.
+            # The fallback scan must collect both apple and zebra from trace_in at
+            # PK=1, then subtract apple (from delta), leaving zebra as the new MAX.
             # The MAX compare key must NOT change vs. tick 1.
             _push_str_grp(client, tid, schema, [(1, 1, "apple")], weight=-1)
             r2 = _scan_str_reduce(client, vid)
             assert r1 == r2, (
                 "MAX must be unchanged after retracting apple: "
-                "zebra still present at PK=1 but GI bug drops it from replay"
+                "zebra still present at PK=1 but a same-PK collection bug drops it from replay"
             )
         finally:
             try:

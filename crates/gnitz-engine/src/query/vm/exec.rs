@@ -2,7 +2,7 @@
 //! dispatch loop — kept whole (do-not-touch §8 cluster 4).
 
 use super::*;
-use crate::ops::{self, AviDesc, GiDesc};
+use crate::ops::{self, AviDesc};
 use crate::storage::ReadCursor;
 use crate::storage::{Batch, CursorHandle};
 
@@ -429,12 +429,7 @@ pub(crate) fn execute_epoch_multi(
                 reg_mut!(*out_reg).batch = result;
             }
 
-            Instr::Integrate {
-                in_reg,
-                table_idx,
-                gi,
-                avi,
-            } => {
+            Instr::Integrate { in_reg, table_idx, avi } => {
                 let schema = reg!(*in_reg).schema;
 
                 let target_ptr = if *table_idx >= 0 {
@@ -448,37 +443,19 @@ pub(crate) fn execute_epoch_multi(
                     None
                 };
 
-                let gi_desc = gi.as_ref().map(|g| GiDesc {
-                    table: program.tables[g.table_idx as usize],
-                    col_idx: g.col_idx,
-                });
-
-                let avi_desc = avi.as_ref().map(|a| {
-                    let gcols = &program.group_cols
-                        [a.group_cols_offset as usize..(a.group_cols_offset as usize + a.group_cols_count as usize)];
-                    AviDesc {
-                        table: program.tables[a.table_idx as usize],
-                        for_max: a.for_max,
-                        agg_col_type_code: a.agg_col_type_code,
-                        group_by_cols: gcols.to_vec(),
-                        agg_col_idx: a.agg_col_idx,
-                    }
+                let avi_desc = avi.as_ref().map(|a| AviDesc {
+                    table: program.tables[a.table_idx as usize],
+                    group_by_cols: a.group_by_cols.clone(),
+                    aggs: a.aggs.clone(),
                 });
 
                 gnitz_debug!(
-                    "vm: INTEGRATE in_count={} target={} gi={} avi={}",
+                    "vm: INTEGRATE in_count={} target={} avi={}",
                     reg!(*in_reg).batch.count,
                     target.is_some(),
-                    gi_desc.is_some(),
                     avi_desc.is_some()
                 );
-                let _ = ops::op_integrate_with_indexes(
-                    &reg!(*in_reg).batch,
-                    target,
-                    &schema,
-                    gi_desc.as_ref(),
-                    avi_desc.as_ref(),
-                );
+                let _ = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, target, &schema, avi_desc.as_ref());
             }
 
             Instr::Reduce {
@@ -492,7 +469,6 @@ pub(crate) fn execute_epoch_multi(
                 group_cols_offset,
                 group_cols_count,
                 output_schema_idx,
-                gi,
                 avi,
                 finalize_func_idx,
                 finalize_schema_idx,
@@ -527,8 +503,9 @@ pub(crate) fn execute_epoch_multi(
                     return Err(-10);
                 }
 
-                // AVI cursor — created fresh from the AVI table (not a register).
-                // Must be created AFTER INTEGRATE populates the AVI table.
+                // Combined AVI cursor — created fresh from the value-index table
+                // (not a register). Must be created AFTER INTEGRATE populates the
+                // table, so the prefix seek returns the post-delta extreme.
                 // Operator-state read; keep compacting (see refresh_owned_cursors).
                 #[allow(clippy::disallowed_methods)] // explicit maintenance: REDUCE AVI operator state
                 let mut avi_cursor_handle: Option<Box<CursorHandle>> = if let Some(avi) = avi {
@@ -539,23 +516,11 @@ pub(crate) fn execute_epoch_multi(
                     None
                 };
 
-                // GI cursor — created fresh from the GI table (not a register)
-                // Operator-state read; keep compacting (see refresh_owned_cursors).
-                #[allow(clippy::disallowed_methods)] // explicit maintenance: REDUCE GI operator state
-                let mut gi_cursor_handle: Option<Box<CursorHandle>> = if let Some(gi) = gi {
-                    let gi_ptr = program.tables[gi.table_idx as usize];
-                    let gi_table = unsafe { &mut *gi_ptr };
-                    gi_table.create_cursor_compacting().ok().map(Box::new)
-                } else {
-                    None
-                };
-
                 gnitz_debug!(
-                    "vm: REDUCE in_count={} trace_in={} trace_out=ok avi={} gi={} aggs={}",
+                    "vm: REDUCE in_count={} trace_in={} trace_out=ok avi={} aggs={}",
                     reg!(*in_reg).batch.count,
                     !ti_cursor_ptr.is_null(),
                     avi_cursor_handle.is_some(),
-                    gi_cursor_handle.is_some(),
                     aggs.len()
                 );
 
@@ -570,19 +535,6 @@ pub(crate) fn execute_epoch_multi(
                     None
                 };
                 let avi_opt: Option<&mut ReadCursor> = avi_cursor_handle.as_deref_mut().map(|ch| ch.cursor_mut());
-                let gi_opt: Option<&mut ReadCursor> = gi_cursor_handle.as_deref_mut().map(|ch| ch.cursor_mut());
-
-                // AVI type code: real code only when the AVI cursor was actually
-                // created (preserves the prior `avi_opt.is_some()` gate); else U64.
-                let avi_tc = match avi {
-                    Some(a) if avi_opt.is_some() => crate::schema::TypeCode::from_validated_u8(a.agg_col_type_code),
-                    _ => crate::schema::TypeCode::U64,
-                };
-                // None -> false (unused by op_reduce when the AVI cursor is None).
-                let avi_for_max = avi.as_ref().is_some_and(|a| a.for_max);
-                // None -> 0 (a valid col idx; op_reduce builds the GI extractor
-                // unconditionally).
-                let gi_col_idx = gi.as_ref().map_or(0, |g| g.col_idx);
 
                 let (raw_out, fin_out) = ops::op_reduce(
                     &reg!(*in_reg).batch,
@@ -593,19 +545,14 @@ pub(crate) fn execute_epoch_multi(
                     gcols,
                     aggs,
                     avi_opt,
-                    avi_for_max,
-                    avi_tc,
-                    gi_opt,
-                    gi_col_idx,
                     fin_prog,
                     fin_schema,
                     *global_ground,
                     *i_am_owner,
                 );
 
-                // Drop temporary cursor handles (returned to pool)
+                // Drop temporary cursor handle (returned to pool)
                 drop(avi_cursor_handle);
-                drop(gi_cursor_handle);
 
                 reg_mut!(*out_reg).batch = raw_out;
                 if let Some(fin_batch) = fin_out {

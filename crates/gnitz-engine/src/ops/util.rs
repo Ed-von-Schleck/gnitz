@@ -130,47 +130,6 @@ pub(super) fn compare_cursor_payload_to_batch_row(
 // Raw index/group column extractors
 // ---------------------------------------------------------------------------
 
-/// Precomputed reader for one raw, injective index/group column. Built once
-/// before a population or read-back loop so the per-row path is a slice plus a
-/// `read_unsigned`, with no schema walk.
-///
-/// Raw (not hashed): GroupIndex replay groups source rows by this exact value
-/// and does not re-filter by group membership, so the encoding must stay
-/// injective within the column's domain — a hashed (colliding) value would
-/// merge distinct groups. GI's gc column is always U8..I64 (size ∈ {1,2,4,8}),
-/// so `read_unsigned` never sees an out-of-range width.
-pub(super) struct IndexColExtractor {
-    loc: ColumnLocator,
-}
-
-impl IndexColExtractor {
-    pub(super) fn new(schema: &SchemaDescriptor, col_idx: usize) -> Self {
-        Self {
-            loc: schema.locate(col_idx),
-        }
-    }
-
-    #[inline]
-    pub(super) fn extract(&self, mb: &MemBatch, row: usize) -> u64 {
-        let bytes = self.loc.bytes(mb, row);
-        let size = self.loc.size();
-        if self.loc.is_pk() {
-            // PK columns hold OPK (big-endian) bytes at rest; widen to the
-            // canonical value (native for unsigned, sign-flipped for signed).
-            gnitz_wire::widen_pk_be(bytes, size) as u64
-        } else {
-            crate::schema::read_unsigned(bytes, size)
-        }
-    }
-
-    /// True iff the extracted column is NULL in `row` (always false for a PK
-    /// column). The null gate GI population applies before reading a row.
-    #[inline]
-    pub(super) fn is_null(&self, mb: &MemBatch, row: usize) -> bool {
-        self.loc.is_null(mb, row)
-    }
-}
-
 /// Precomputed gatherer for the byte-form AVI composite group key. Resolves
 /// each group column's layout once; `gather` then concatenates raw bytes per
 /// row. Callers must have passed `query::compiler::avi_group_key_eligible`
@@ -551,84 +510,9 @@ fn extract_group_key_row<R: GroupKeyRow>(row: &R, schema: &SchemaDescriptor, gro
 }
 
 #[cfg(test)]
-mod index_col_extractor_tests {
-    use super::IndexColExtractor;
+mod group_key_tests {
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Batch;
-
-    // Compound narrow PK (U32, U32), stride 8: the addressed column must be
-    // sliced from the packed slot, not read as the whole slot.
-    #[test]
-    fn compound_pk_slices_addressed_column() {
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U32, 0),
-                SchemaColumn::new(type_code::U32, 0),
-            ],
-            &[0, 1],
-        );
-        assert_eq!(schema.pk_byte_offset(0), 0);
-        assert_eq!(schema.pk_byte_offset(1), 4);
-
-        let (c0, c1): (u32, u32) = (0x1111_2222, 0xAAAA_BBBB);
-        let mut b = Batch::with_schema(schema, 1);
-        // OPK slot: col0 OPK in bytes [0..4], col1 OPK in bytes [4..8].
-        b.extend_pk_opk(&schema, &[c0 as u128, c1 as u128]);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.count += 1;
-        let mb = b.as_mem_batch();
-
-        let ex0 = IndexColExtractor::new(&schema, 0);
-        let ex1 = IndexColExtractor::new(&schema, 1);
-        assert_eq!(ex0.extract(&mb, 0), c0 as u64, "col 0 must be the low U32 only");
-        assert_eq!(
-            ex1.extract(&mb, 0),
-            c1 as u64,
-            "col 1 must be the high U32, not the whole slot"
-        );
-    }
-
-    // Single U64 PK spanning the whole slot: extractor reduces to the old
-    // `source_pk as u64`, preserving bit-identical behaviour.
-    #[test]
-    fn single_u64_pk_is_bit_identical() {
-        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-        let v: u64 = 0xDEAD_BEEF_CAFE_F00D;
-        let mut b = Batch::with_schema(schema, 1);
-        b.extend_pk(v as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.count += 1;
-        let mb = b.as_mem_batch();
-
-        let ex = IndexColExtractor::new(&schema, 0);
-        assert_eq!(ex.extract(&mb, 0), v);
-        assert_eq!(ex.extract(&mb, 0), mb.get_pk(0) as u64);
-    }
-
-    // Payload column path: the addressed payload slot is zero-extended to u64.
-    #[test]
-    fn payload_column_zero_extends() {
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::U16, 0),
-            ],
-            &[0],
-        );
-        let pi = schema.try_payload_idx(1).unwrap();
-        let mut b = Batch::with_schema(schema, 1);
-        b.extend_pk(7u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(pi, &0xBEEFu16.to_le_bytes());
-        b.count += 1;
-        let mb = b.as_mem_batch();
-
-        let ex = IndexColExtractor::new(&schema, 1);
-        assert_eq!(ex.extract(&mb, 0), 0xBEEFu64);
-    }
 
     // The batch-free `global_group_key()` (used at emit time and over an empty
     // delta) must equal the runtime `extract_group_key(.., &[])` over a real,

@@ -368,16 +368,14 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
-    def test_wide_gi_group_by_min_max_u128_pk(self, client):
+    def test_wide_group_by_min_max_u128_pk_source(self, client):
         """GROUP BY MIN/MAX over a table with a 16-byte PRIMARY KEY
-        (DECIMAL(38,0) = U128). The GroupIndex key is `8-byte group code` ++
-        `16-byte source PK` = 24 bytes — the *wide* (>16) consolidation path,
-        which base-table compound PKs (stride capped at 16) can't reach. The
-        consolidation sort orders the wide GI key via an order-preserving
-        prefix + compare_pk_bytes tiebreak; deleting the row holding a group's
-        MIN/MAX forces an incremental recompute that re-seeks the source trace
-        through that wide key. Big ids (> u64::MAX) make the source PK occupy
-        all 16 bytes, so the OPK prefix straddles its high column."""
+        (DECIMAL(38,0) = U128). The two MIN/MAX aggregates over a non-PK group key
+        resolve through the combined value index (keyed `g ‖ ordinal ‖ av`), which
+        never re-reads the source trace by PK — so the wide U128 source PK (big ids
+        > u64::MAX occupying all 16 bytes) is irrelevant to the read path. Deleting
+        the row holding a group's MIN/MAX forces an incremental recompute that
+        seeks the index's post-delta extreme directly."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -408,8 +406,8 @@ class TestGroupBy:
             assert by_g[10]["lo"] == 50 and by_g[10]["hi"] == 200, by_g
             assert by_g[20]["lo"] == 30 and by_g[20]["hi"] == 70, by_g
 
-            # Delete group 10's MIN holder (id=2) → MIN recomputes to 100 via a
-            # wide-GI re-seek of the remaining group-10 source rows.
+            # Delete group 10's MIN holder (id=2) → MIN recomputes to 100 from the
+            # combined value index's post-delta extreme for group 10.
             client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
             by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
             assert by_g[10]["lo"] == 100 and by_g[10]["hi"] == 200, by_g
@@ -1278,9 +1276,11 @@ class TestReducePathRegressions:
             client.drop_schema(sn)
 
     def test_min_max_group_by_nullable_int_null_vs_zero(self, client):
-        """MIN/MAX GROUP BY a nullable int takes the GI path; the GI must be
-        disabled for a nullable group column so the NULL group does not collide
-        with group 0 (which would fetch 0's history or drop NULL's state)."""
+        """MIN/MAX GROUP BY a nullable int. A nullable group column is not
+        byte-form-eligible for the combined value index (the key prefix has no
+        null bit), so the reduce takes the single-scan trace fallback, which
+        distinguishes a NULL group from group 0 — they must not collide (a
+        collision would fetch 0's history or drop NULL's state)."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -2988,5 +2988,189 @@ class TestGlobalAggregate:
             assert self._count_reduce_nodes(client, vai) == 2, "AVG over integer is two-phase"
             assert self._count_reduce_nodes(client, vsf) == 1, "float SUM keeps the funnel"
             assert self._count_reduce_nodes(client, vaf) == 1, "AVG over float keeps the funnel"
+        finally:
+            client.drop_schema(sn)
+
+
+class TestCombinedValueIndex:
+    """The combined AggValueIndex serves every MIN/MAX of a reduce (grouped or
+    global) from one table keyed `group ‖ ordinal ‖ av`, replacing the GroupIndex
+    whose PK-keyed trace re-read leaked foreign groups' rows into a group's
+    extremes. These exercise the planner→compiler→engine path end to end."""
+
+    def test_foreign_group_fanout_join(self, client):
+        """A fan-out join feeds `GROUP BY g` over a NON-unique-PK reduce input: one
+        `fact` row joins several `dim` rows carrying different `g`, so the same
+        join-output PK spans multiple groups — the exact shape the removed GI
+        over-read corrupted. The combined index isolates each group by its key
+        prefix, so each group's MIN/MAX excludes the others'. Run incrementally
+        (insert after the view exists) so the per-tick recompute path is taken."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE fact (fid BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE dim (did BIGINT NOT NULL PRIMARY KEY, fkey BIGINT NOT NULL, "
+                "g INT NOT NULL, x BIGINT NOT NULL, y BIGINT NOT NULL)",
+                schema_name=sn)
+            # j: one fact row fans out to many dim rows with different g, so the
+            # join-output PK (fact.fid) repeats across groups.
+            client.execute_sql(
+                "CREATE VIEW j AS SELECT fact.fid AS fid, dim.g AS g, dim.x AS x, dim.y AS y "
+                "FROM fact JOIN dim ON fact.fid = dim.fkey",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW agg AS SELECT g, MIN(x) AS lo, MAX(y) AS hi, COUNT(*) AS c "
+                "FROM j GROUP BY g",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "agg")[0]
+
+            client.execute_sql("INSERT INTO fact VALUES (1), (2)", schema_name=sn)
+            # fact 1 → g=10(x=5,y=100), g=20(x=7,y=200); fact 2 → g=10(x=3,y=50), g=20(x=9,y=300).
+            client.execute_sql(
+                "INSERT INTO dim VALUES "
+                "(1, 1, 10, 5, 100), (2, 1, 20, 7, 200), "
+                "(3, 2, 10, 3, 50), (4, 2, 20, 9, 300)",
+                schema_name=sn)
+
+            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            assert (by_g[10]["lo"], by_g[10]["hi"], by_g[10]["c"]) == (3, 100, 2), (
+                f"group 10 extremes must exclude group 20's rows; got {by_g[10]}")
+            assert (by_g[20]["lo"], by_g[20]["hi"], by_g[20]["c"]) == (7, 300, 2), (
+                f"group 20 extremes must exclude group 10's rows; got {by_g[20]}")
+
+            # Incremental: delete fact 2's group-10 contributor (dim did=3, x=3).
+            # Group 10's MIN must recompute to 5 from the surviving group-10 row —
+            # never pulling group 20's smaller-keyed entries.
+            client.execute_sql("DELETE FROM dim WHERE did = 3", schema_name=sn)
+            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            assert (by_g[10]["lo"], by_g[10]["hi"], by_g[10]["c"]) == (5, 100, 1), by_g[10]
+            assert (by_g[20]["lo"], by_g[20]["hi"], by_g[20]["c"]) == (7, 300, 2), by_g[20]
+        finally:
+            client.drop_schema(sn)
+
+    def test_foreign_group_fanout_join_backfill(self, client):
+        """Same fan-out foreign-group shape, but the grouped view is CREATEd over a
+        PRE-POPULATED join (combined-index backfill / from-scratch derivation),
+        not an incremental tick."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE fact (fid BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE dim (did BIGINT NOT NULL PRIMARY KEY, fkey BIGINT NOT NULL, "
+                "g INT NOT NULL, x BIGINT NOT NULL, y BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql("INSERT INTO fact VALUES (1), (2)", schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO dim VALUES "
+                "(1, 1, 10, 5, 100), (2, 1, 20, 7, 200), "
+                "(3, 2, 10, 3, 50), (4, 2, 20, 9, 300)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW j AS SELECT fact.fid AS fid, dim.g AS g, dim.x AS x, dim.y AS y "
+                "FROM fact JOIN dim ON fact.fid = dim.fkey",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW agg AS SELECT g, MIN(x) AS lo, MAX(y) AS hi, COUNT(*) AS c "
+                "FROM j GROUP BY g",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "agg")[0]
+            by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
+            assert (by_g[10]["lo"], by_g[10]["hi"], by_g[10]["c"]) == (3, 100, 2), by_g[10]
+            assert (by_g[20]["lo"], by_g[20]["hi"], by_g[20]["c"]) == (7, 300, 2), by_g[20]
+        finally:
+            client.drop_schema(sn)
+
+    def test_lone_nullable_min_all_null_group(self, client):
+        """A lone `SELECT g, MIN(a) GROUP BY g` over a NULLABLE `a` — no user
+        COUNT(*). The planner appends a hidden cardinality COUNT and the combined
+        index carries the nullable MIN, so an all-NULL group is PRESENT with
+        MIN=NULL (matching the differential oracle), not silently dropped. Checked
+        from-scratch after each epoch: a new all-NULL group appears; a mixed
+        group's last non-NULL retraction leaves it surviving as NULL; retracting
+        the remaining NULL row removes it."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, MIN(a) AS lo FROM t GROUP BY g", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["g", "lo"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["g", "a"], ["g"], [("lo", "MIN", "a")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            # g=10 mixed {a=5, a=NULL}; g=20 entirely all-NULL {a=NULL}.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL), (3, 20, NULL)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 10, "a": 5}, {"pk": 2, "g": 10, "a": None},
+                {"pk": 3, "g": 20, "a": None}])
+            check("insert: all-NULL group 20 must appear as (20, NULL)")
+
+            # Retract g=10's only non-NULL → survives via the NULL row as (10, NULL).
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [1])
+            check("retract last non-NULL: group 10 survives as (10, NULL)")
+
+            # Retract g=10's remaining NULL row → group 10 disappears.
+            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [2])
+            check("retract remaining NULL: group 10 gone")
+        finally:
+            client.drop_schema(sn)
+
+    def test_lone_min_nonnull_combined_index(self, client):
+        """Non-nullable lone `MIN(a) GROUP BY g` over the combined-index common
+        path: insert, retract the current MIN (forces a post-state index re-seek),
+        re-insert below. Differential oracle each epoch. Runs at the suite's worker
+        count (W=4 under `make e2e`), pinning the path byte-for-byte correct."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, MIN(a) AS lo FROM t GROUP BY g", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["g", "lo"]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["g", "a"], ["g"], [("lo", "MIN", "a")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 5), (2, 10, 3), (3, 10, 9), (4, 20, 7)",
+                schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 10, "a": 5}, {"pk": 2, "g": 10, "a": 3},
+                {"pk": 3, "g": 10, "a": 9}, {"pk": 4, "g": 20, "a": 7}])
+            check("insert")
+
+            # Retract g=10's current MIN (a=3) → recompute to 5 from the index.
+            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [2])
+            check("retract-min")
+
+            # Insert below the current MIN → drops to 1.
+            client.execute_sql("INSERT INTO t VALUES (5, 10, 1)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 5, "g": 10, "a": 1}])
+            check("reinsert-lower")
         finally:
             client.drop_schema(sn)

@@ -1,5 +1,6 @@
-//! Secondary index integration: GiDesc, AviDesc, op_integrate_with_indexes.
+//! Secondary index integration: AviDesc, op_integrate_with_indexes.
 
+use crate::ops::{AggDescriptor, AggOp};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
 
@@ -7,84 +8,51 @@ use crate::storage::Batch;
 // Public descriptor types
 // ---------------------------------------------------------------------------
 
-/// GI/AVI descriptor for integrate_with_indexes.
+/// Combined AggValueIndex descriptor for `op_integrate_with_indexes`.
+///
+/// One descriptor (and one index table) serves *every* MIN/MAX aggregate of a
+/// reduce. `aggs` is the value-indexed (`AggOp::uses_value_index`) subset of the
+/// reduce's descriptors, in `agg_descs` order — entry `j` is the aggregate
+/// written under ordinal `j` in the combined key `group_cols ‖ ordinal ‖
+/// av_encoded`. Carrying the descriptors (rather than a stripped
+/// `(col, for_max, type)` tuple) lets the population derive `for_max`/type the
+/// same way the reduce read side does, so the two cannot drift.
 ///
 /// The `table` raw pointer is `pub(crate)` rather than `pub`: it is a bare
 /// `*mut Table` whose access is constrained to crate-internal call sites
 /// (the compiler emits the desc in `vm`, `op_integrate_with_indexes` consumes
 /// it) — never a cross-boundary handle.
-pub struct GiDesc {
-    pub(crate) table: *mut crate::storage::Table,
-    pub(crate) col_idx: u32,
-}
-
 pub struct AviDesc {
     pub(crate) table: *mut crate::storage::Table,
-    pub(crate) for_max: bool,
-    pub(crate) agg_col_type_code: u8,
     pub(crate) group_by_cols: Vec<u32>,
-    pub(crate) agg_col_idx: u32,
-}
-
-/// Width of the GI key's leading `gc` (group-code) prefix: a single U64. The
-/// source PK columns follow at byte offset `GI_GC_BYTES`.
-pub(crate) const GI_GC_BYTES: usize = 8;
-
-/// GI index PK = [U64 gc] ++ source PK columns, all in the PK region; no
-/// payload. Signed source PK columns are mapped to their unsigned counterpart
-/// of the same width: GI ordering only groups entries by the `gc` prefix, so
-/// within-prefix order is irrelevant, but a signed column would sort negative
-/// source PKs *before* the zero-padded prefix-seek key and the scan would skip
-/// them. The remap keeps the byte width (pk_stride unchanged) and equality
-/// (consolidation holds), and makes 0 the true minimum so a zero-padded prefix
-/// seek lands on the first entry of the group.
-pub(crate) fn make_gi_schema(src: &SchemaDescriptor) -> SchemaDescriptor {
-    // gc + src PK columns must fit MAX_PK_COLUMNS.
-    assert!(
-        src.pk_indices().len() < crate::schema::MAX_PK_COLUMNS,
-        "make_gi_schema: source PK column count {} leaves no room for the gc \
-         prefix within MAX_PK_COLUMNS={}",
-        src.pk_indices().len(),
-        crate::schema::MAX_PK_COLUMNS,
-    );
-    // gc + source pk_stride must fit MAX_PK_BYTES.
-    assert!(
-        GI_GC_BYTES + src.pk_stride() as usize <= crate::schema::MAX_PK_BYTES,
-        "make_gi_schema: gc({GI_GC_BYTES}) + source pk_stride {} exceeds MAX_PK_BYTES={}",
-        src.pk_stride(),
-        crate::schema::MAX_PK_BYTES,
-    );
-    let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
-    let mut pk = vec![0u32];
-    for (ord, _ci, col) in src.pk_columns() {
-        let mut c = *col;
-        c.type_code = match col.type_code {
-            type_code::I8 => type_code::U8,
-            type_code::I16 => type_code::U16,
-            type_code::I32 => type_code::U32,
-            type_code::I64 => type_code::U64,
-            other => other,
-        };
-        cols.push(c);
-        pk.push((ord + 1) as u32);
-    }
-    SchemaDescriptor::new(&cols, &pk)
+    pub(crate) aggs: Vec<AggDescriptor>,
 }
 
 /// AVI index schema: the group-by columns (native fixed-width types, in GROUP
-/// BY order) followed by the order-encoded aggregate value (U64). All columns
+/// BY order), then a `u8` ordinal selecting which non-linear aggregate the
+/// entry belongs to, then the order-encoded aggregate value (U64). All columns
 /// are PK; there is no payload. Built only for byte-form-eligible group keys
 /// (see `query::compiler::avi_group_key_eligible`).
+///
+/// The ordinal sits **between** the group key and the value so the byte-ordered
+/// key sorts by `(group, ordinal, av)`: a group's ordinal-0 entries precede its
+/// ordinal-1 entries, and within an ordinal the per-aggregate `for_max`
+/// encoding sorts the extreme first. So `MIN(a)` (ordinal 0) and `MAX(a)`
+/// (ordinal 1) coexist with no collision and no `for_max` clash, and one
+/// schema shape serves single- and multi-aggregate reduces alike. The empty
+/// global key reduces the prefix to just `ordinal`.
 pub(crate) fn make_avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescriptor {
-    let mut cols = Vec::with_capacity(group_by_cols.len() + 1);
-    let mut pk = Vec::with_capacity(group_by_cols.len() + 1);
+    let mut cols = Vec::with_capacity(group_by_cols.len() + 2);
+    let mut pk = Vec::with_capacity(group_by_cols.len() + 2);
     for (i, &c) in group_by_cols.iter().enumerate() {
         // Force non-nullable: eligibility guarantees the value is always present.
         cols.push(SchemaColumn::new(src.columns[c as usize].type_code, 0));
         pk.push(i as u32);
     }
-    cols.push(SchemaColumn::new(type_code::U64, 0)); // av_encoded
+    cols.push(SchemaColumn::new(type_code::U8, 0)); // ordinal
     pk.push(group_by_cols.len() as u32);
+    cols.push(SchemaColumn::new(type_code::U64, 0)); // av_encoded
+    pk.push((group_by_cols.len() + 1) as u32);
     let schema = SchemaDescriptor::new(&cols, &pk);
     // Guard against a gate relaxation overshooting the engine PK limit. The
     // byte-form cursor orders wide keys via compare_pk_bytes, so the bound is
@@ -101,15 +69,14 @@ pub(crate) fn make_avi_schema(src: &SchemaDescriptor, group_by_cols: &[u32]) -> 
 // op_integrate_with_indexes
 // ---------------------------------------------------------------------------
 
-/// Integrate a delta batch into a target table, optionally populating
-/// GroupIndex and AggValueIndex secondary indexes.
+/// Integrate a delta batch into a target table, optionally populating the
+/// combined AggValueIndex secondary index.
 ///
 /// The Rust Table handles memtable capacity internally (flush-on-overflow).
 pub fn op_integrate_with_indexes(
     batch: &Batch,
     target_table: Option<&mut crate::storage::Table>,
     input_schema: &SchemaDescriptor,
-    gi: Option<&GiDesc>,
     avi: Option<&AviDesc>,
 ) -> Result<(), crate::storage::StorageError> {
     if batch.count == 0 {
@@ -119,90 +86,65 @@ pub fn op_integrate_with_indexes(
     // `op_reduce` now ships its retract+insert output as an honest unconsolidated
     // delta (sorted = consolidated = false), so the table ingest re-sorts/folds it;
     // no defensive flag-scrub is needed here. `clone_batch` stays: `batch` is
-    // borrowed and read again by the GI/AVI population below.
+    // borrowed and read again by the AVI population below.
     if let Some(table) = target_table {
         table.ingest_owned_batch_memonly(batch.clone_batch())?;
     }
 
     let mb = batch.as_mem_batch();
 
-    // GroupIndex population
-    if let Some(gi_desc) = gi {
-        let gi_schema = make_gi_schema(input_schema);
-        // `Raw` from `with_schema`; the `extend_*` population below never raises
-        // the layout, so the table ingest re-sorts/folds it.
-        let mut gi_batch = Batch::with_schema(gi_schema, batch.count);
-
-        let gi_col = gi_desc.col_idx as usize;
-        let gc_extractor = super::util::IndexColExtractor::new(input_schema, gi_col);
-
-        // Each row overwrites a constant-length `key[..GI_GC_BYTES + src_pk.len()]`
-        // window, so no stale trailing bytes can leak across iterations.
-        let mut key = [0u8; crate::schema::MAX_PK_BYTES];
-        for row in 0..batch.count {
-            // PK is never null (catalog rule: pk-not-null.md); the extractor's
-            // locator returns false for a PK column and checks the null-bitmap
-            // bit for a payload column.
-            if gc_extractor.is_null(&mb, row) {
-                continue;
-            }
-
-            let gc_u64 = gc_extractor.extract(&mb, row);
-            let weight = mb.get_weight(row);
-
-            key[..GI_GC_BYTES].copy_from_slice(&gc_u64.to_le_bytes());
-            let src_pk = mb.get_pk_bytes(row);
-            key[GI_GC_BYTES..GI_GC_BYTES + src_pk.len()].copy_from_slice(src_pk);
-
-            gi_batch.extend_pk_bytes(&key[..GI_GC_BYTES + src_pk.len()]);
-            gi_batch.extend_weight(&weight.to_le_bytes());
-            gi_batch.extend_null_bmp(&0u64.to_le_bytes());
-            gi_batch.count += 1;
-        }
-
-        if gi_batch.count > 0 {
-            let gi_table = unsafe { &mut *gi_desc.table };
-            let _ = gi_table.ingest_owned_batch_memonly(gi_batch);
-        }
-    }
-
-    // AggValueIndex population. Key layout: group_key_bytes ++ av_encoded(8),
-    // ordered group-major then aggregate-minor, so the lookup's prefix walk
-    // (`agg::apply_agg_from_value_index`) matches the full group identity — no
-    // hash, no collision. Gather against `input_schema`: the delta `mb` is
-    // physically laid out in it.
+    // Combined AggValueIndex population. Key layout: group_key_bytes ++
+    // ordinal(1) ++ av_encoded(8), ordered group-major, then by ordinal, then by
+    // value — so the lookup's prefix walk (`agg::apply_agg_from_value_index`) on
+    // `group ‖ ordinal` matches the full group+aggregate identity with no hash
+    // and no collision. One entry per (row, value-indexed aggregate) is written
+    // into the one table with one ingest. `for_max`/type are derived from each
+    // aggregate descriptor exactly as the reduce read side does. Gather against
+    // `input_schema`: the delta `mb` is physically laid out in it.
     if let Some(avi_desc) = avi {
         let avi_schema = make_avi_schema(input_schema, &avi_desc.group_by_cols);
-        // `Raw` from `with_schema`; the `extend_*` population below never raises it.
-        let mut avi_batch = Batch::with_schema(avi_schema, batch.count);
+        let num_aggs = avi_desc.aggs.len();
+        // `Raw` from `with_schema`; the `extend_*` population below never raises
+        // it. Capacity is one entry per (row × value-indexed aggregate).
+        let mut avi_batch = Batch::with_schema(avi_schema, batch.count * num_aggs);
 
-        let avi_col = avi_desc.agg_col_idx as usize;
-        // Resolve the aggregate column's location once (loop-invariant): a PK
+        // Resolve each aggregate column's location once (loop-invariant): a PK
         // aggregate is sliced from the packed PK region, a payload aggregate read
         // from its dense slot.
-        let avi_loc = input_schema.locate(avi_col);
+        let locs: Vec<_> = avi_desc
+            .aggs
+            .iter()
+            .map(|d| input_schema.locate(d.col_idx as usize))
+            .collect();
 
         let extractor = super::util::GroupKeyExtractor::new(input_schema, &avi_desc.group_by_cols);
         let n = extractor.stride;
         let mut key = [0u8; crate::schema::MAX_PK_BYTES];
         for row in 0..batch.count {
-            // PK is never null; a NULL payload aggregate is skipped.
-            if avi_loc.is_null(&mb, row) {
-                continue;
-            }
-
+            let weight = mb.get_weight(row);
             extractor.gather(&mb, row, &mut key);
-            let av_bytes = avi_loc.bytes(&mb, row);
-            let av_u64 = super::util::encode_ordered(av_bytes, avi_desc.agg_col_type_code, avi_desc.for_max);
-            // Serialise the order-encoded value big-endian: the index orders
-            // entries by raw lexicographic byte comparison, so big-endian bytes
-            // make lexicographic order match the encoded value's numeric order.
-            key[n..n + super::util::AVI_AV_BYTES].copy_from_slice(&av_u64.to_be_bytes());
+            for (j, (d, loc)) in avi_desc.aggs.iter().zip(&locs).enumerate() {
+                // PK is never null; a NULL payload aggregate is skipped for this
+                // ordinal (the seek then misses → MIN/MAX renders NULL).
+                if loc.is_null(&mb, row) {
+                    continue;
+                }
+                // Ordinal is a native u8 — its OPK encoding is its byte. Each
+                // ordinal overwrites the constant-length `key[..n + 1 + AV]`
+                // window, so no stale bytes leak across the ordinal loop.
+                key[n] = j as u8;
+                let av_bytes = loc.bytes(&mb, row);
+                let av_u64 = super::util::encode_ordered(av_bytes, d.col_type_code as u8, d.agg_op == AggOp::Max);
+                // Serialise the order-encoded value big-endian: the index orders
+                // entries by raw lexicographic byte comparison, so big-endian
+                // bytes make lexicographic order match the encoded value's order.
+                key[n + 1..n + 1 + super::util::AVI_AV_BYTES].copy_from_slice(&av_u64.to_be_bytes());
 
-            avi_batch.extend_pk_bytes(&key[..n + super::util::AVI_AV_BYTES]);
-            avi_batch.extend_weight(&mb.get_weight(row).to_le_bytes());
-            avi_batch.extend_null_bmp(&0u64.to_le_bytes());
-            avi_batch.count += 1;
+                avi_batch.extend_pk_bytes(&key[..n + 1 + super::util::AVI_AV_BYTES]);
+                avi_batch.extend_weight(&weight.to_le_bytes());
+                avi_batch.extend_null_bmp(&0u64.to_le_bytes());
+                avi_batch.count += 1;
+            }
         }
 
         if avi_batch.count > 0 {

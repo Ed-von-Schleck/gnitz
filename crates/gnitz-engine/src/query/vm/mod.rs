@@ -124,7 +124,6 @@ pub(crate) enum Instr {
     Integrate {
         in_reg: u16,
         table_idx: i32, // index into Program::tables, -1 = no target (sink)
-        gi: Option<Gi>,
         avi: Option<IntegrateAvi>,
     },
     Reduce {
@@ -138,9 +137,8 @@ pub(crate) enum Instr {
         group_cols_offset: u32,
         group_cols_count: u16,
         output_schema_idx: u16,
-        // GI/AVI cursors are created fresh from their tables each tick; `None`
-        // means the operator has no GI/AVI index.
-        gi: Option<Gi>,
+        // The combined AVI cursor is created fresh from its table each tick;
+        // `None` means the operator has no value index (all-linear or fallback).
         avi: Option<ReduceAvi>,
         finalize_func_idx: Option<u16>,
         finalize_schema_idx: Option<u16>,
@@ -153,30 +151,24 @@ pub(crate) enum Instr {
     },
 }
 
-/// GI (group-index) reference: a GI-table slot + the indexed column. Shared by the
-/// Integrate and Reduce instructions (the descriptor is byte-identical in both).
-pub(crate) struct Gi {
-    pub table_idx: u16,
-    pub col_idx: u32,
-}
-
-/// AVI descriptor embedded in an Integrate instruction.
+/// Combined-AVI descriptor embedded in an Integrate instruction. One table
+/// serves every MIN/MAX aggregate of the reduce; `aggs` is the value-indexed
+/// subset of the reduce's descriptors in `agg_descs` order (ordinal = position),
+/// and `group_by_cols` is the group key the index is partitioned by. The
+/// population derives `for_max`/type from each descriptor, matching the read side.
 pub(crate) struct IntegrateAvi {
     pub table_idx: u16,
-    pub for_max: bool,
-    pub agg_col_type_code: u8,
-    pub group_cols_offset: u32,
-    pub group_cols_count: u16,
-    pub agg_col_idx: u32,
+    pub group_by_cols: Vec<u32>,
+    pub aggs: Vec<AggDescriptor>,
 }
 
-/// AVI descriptor embedded in a Reduce instruction. Deliberately narrower than
-/// [`IntegrateAvi`]: the Reduce path uses the reduce's own group_cols and has no
-/// agg_col_idx, so those three `IntegrateAvi` fields are omitted.
+/// Combined-AVI descriptor embedded in a Reduce instruction. Deliberately
+/// narrower than [`IntegrateAvi`]: the Reduce read side only needs the table to
+/// open a cursor against — it reads `for_max`/type per aggregate from
+/// `agg_descs` by ordinal and gathers the group key from the reduce's own
+/// `group_cols`.
 pub(crate) struct ReduceAvi {
     pub table_idx: u16,
-    pub for_max: bool,
-    pub agg_col_type_code: u8,
 }
 
 /// Opaque handle owning a compiled program and its register file.
@@ -198,7 +190,7 @@ pub(crate) struct VmHandle {
     /// dereference the `Table` they were opened against, so this MUST drop
     /// before `owned_tables`.
     owned_cursor_handles: Vec<Option<Box<CursorHandle>>>,
-    /// Child tables created during compilation (history, reduce-in, GI, AVI).
+    /// Child tables created during compilation (history, reduce-in, AVI).
     /// `program.tables` may point into these.  Dropped AFTER `program`.
     pub owned_tables: Vec<Box<Table>>,
     /// Scalar functions created during compilation.
@@ -1570,11 +1562,7 @@ mod tests {
             &agg_descs,
             &group_cols,
             out_schema,
-            std::ptr::null_mut(), // avi_table
-            false,
-            0,
-            std::ptr::null_mut(), // gi_table
-            0,
+            std::ptr::null_mut(),
             std::ptr::null(), // finalize_prog
             std::ptr::null(), // finalize_schema
             false,
@@ -1583,28 +1571,20 @@ mod tests {
 
         // INTEGRATE raw_delta → trace_out
         builder.add_integrate(
-            2,             // in_reg (raw_delta)
-            trace_out_ptr, // target table
+            2, // in_reg (raw_delta)
+            trace_out_ptr,
             std::ptr::null_mut(),
-            0, // no GI
-            std::ptr::null_mut(),
-            false,
-            0,
             &[],
-            0, // no AVI
+            &[],
         );
 
         // INTEGRATE input → trace_in
         builder.add_integrate(
-            0,            // in_reg
-            trace_in_ptr, // target table
+            0, // in_reg
+            trace_in_ptr,
             std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            false,
-            0,
             &[],
-            0,
+            &[],
         );
 
         builder.add_halt();
@@ -1690,10 +1670,6 @@ mod tests {
             &group_cols,
             out_schema,
             std::ptr::null_mut(),
-            false,
-            0,
-            std::ptr::null_mut(),
-            0,
             std::ptr::null(),
             std::ptr::null(),
             false,
@@ -1745,10 +1721,6 @@ mod tests {
             &group_cols,
             out_schema,
             std::ptr::null_mut(),
-            false,
-            0,
-            std::ptr::null_mut(),
-            0,
             std::ptr::null(),
             std::ptr::null(),
             false,
@@ -2130,37 +2102,13 @@ mod tests {
             &group_cols,
             out_schema,
             std::ptr::null_mut(),
-            false,
-            0,
-            std::ptr::null_mut(),
-            0,
             std::ptr::null(),
             std::ptr::null(),
             false,
             false,
         );
-        builder.add_integrate(
-            2,
-            trace_out_ptr,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            false,
-            0,
-            &[],
-            0,
-        );
-        builder.add_integrate(
-            0,
-            trace_in_ptr,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            false,
-            0,
-            &[],
-            0,
-        );
+        builder.add_integrate(2, trace_out_ptr, std::ptr::null_mut(), &[], &[]);
+        builder.add_integrate(0, trace_in_ptr, std::ptr::null_mut(), &[], &[]);
         builder.add_halt();
 
         let reg_meta = [
@@ -2372,37 +2320,13 @@ mod tests {
             &group_cols,
             out_schema,
             std::ptr::null_mut(),
-            false,
-            0,
-            std::ptr::null_mut(),
-            0,
             std::ptr::null(),
             std::ptr::null(),
             false,
             false,
         );
-        builder.add_integrate(
-            3,
-            trace_out_ptr,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            false,
-            0,
-            &[],
-            0,
-        );
-        builder.add_integrate(
-            0,
-            trace_in_ptr,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            false,
-            0,
-            &[],
-            0,
-        );
+        builder.add_integrate(3, trace_out_ptr, std::ptr::null_mut(), &[], &[]);
+        builder.add_integrate(0, trace_in_ptr, std::ptr::null_mut(), &[], &[]);
         builder.add_halt();
 
         let reg_meta = [

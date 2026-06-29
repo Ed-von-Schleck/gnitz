@@ -21,10 +21,10 @@ pub(crate) use exchange::{with_broadcast_indices, with_worker_indices, worker_fo
 // production scatter paths all borrow via `with_worker_indices`.
 #[cfg(test)]
 pub(crate) use exchange::compute_worker_indices;
-pub(crate) use index::{op_integrate_with_indexes, AviDesc, GiDesc};
-// Facade for the index/aggregate-value schema builders + AVI key layout, so
-// out-of-ops callers (compiler, master) reach `crate::ops::X`, not the internals.
-pub(crate) use index::{make_avi_schema, make_gi_schema};
+pub(crate) use index::{op_integrate_with_indexes, AviDesc};
+// Facade for the AVI schema builder + AVI key layout, so out-of-ops callers
+// (compiler, master) reach `crate::ops::X`, not the internals.
+pub(crate) use index::make_avi_schema;
 pub(crate) use join::{
     op_anti_join_delta_delta, op_anti_join_delta_trace, op_join_delta_delta, op_join_delta_trace,
     op_join_delta_trace_outer, op_join_delta_trace_range, op_semi_join_delta_delta, op_semi_join_delta_trace,

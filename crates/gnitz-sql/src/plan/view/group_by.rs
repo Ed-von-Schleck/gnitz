@@ -283,17 +283,25 @@ pub(crate) fn execute_create_group_by_view(
         collect_having_aggs(having_expr, &source_schema, &mut agg_specs, &mut agg_mappings)?;
     }
 
-    // 3c. An all-linear reduce gates group existence on a NULL-blind COUNT(*)
-    //     cardinality (a group exists iff its net row weight > 0). Reuse a user
-    //     COUNT(*) when present; else append exactly one hidden trailing companion.
-    //     Appended last — after every SELECT and HAVING-only aggregate — so it
-    //     shifts no existing aggregate's specs_start; it is added to agg_specs
-    //     only (never select_items / agg_mappings), so the post-reduce MAP strips
-    //     it (a raw reduce column with no output column, like a HAVING-only agg).
+    // 3c. Every grouped or global scalar reduce gates group existence on a
+    //     NULL-blind COUNT(*) cardinality (a group exists iff its net row weight
+    //     > 0). Both the combined value-index path and the single-scan fallback
+    //     read it — a mixed reduce folds its linear companions to a numeric value
+    //     whose saturating `has_value` cannot signal an emptied group, so without
+    //     this companion an emptied group would emit a phantom `(g, NULL, 0)` row.
+    //     Reuse a user COUNT(*) when present; else append exactly one hidden
+    //     trailing companion. Appended last — after every SELECT and HAVING-only
+    //     aggregate — so it shifts no existing aggregate's specs_start; it is added
+    //     to agg_specs only (never select_items / agg_mappings), so the post-reduce
+    //     MAP strips it (a raw reduce column with no output column, like a
+    //     HAVING-only agg). Every planner-built reduce is grouped or a global
+    //     scalar aggregate, so the guard is simply "no COUNT(*) present yet" —
+    //     linear or not. (`all_linear` is computed here pre-append for the
+    //     two-phase decision below; the companion never changes linearity.)
     let all_linear = agg_specs
         .iter()
         .all(|s| matches!(s.op, AGG_COUNT | AGG_SUM | AGG_COUNT_NON_NULL));
-    if all_linear && !agg_specs.iter().any(|s| s.op == AGG_COUNT) {
+    if !agg_specs.iter().any(|s| s.op == AGG_COUNT) {
         // Route through push_agg_specs — the single source of truth for spec
         // layout and out_type — rather than hand-rolling the COUNT spec. The
         // companion has no select_item / agg_mapping, so its AggShape is discarded.

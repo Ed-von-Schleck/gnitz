@@ -92,16 +92,6 @@ impl ProgramBuilder {
         Some(idx)
     }
 
-    /// Build an optional GI descriptor: intern `gi_table` and pair it with
-    /// `col_idx`, or `None` when there is no GI table. Shared by `add_integrate`
-    /// and `add_reduce`.
-    fn gi_desc(&mut self, gi_table: *mut Table, col_idx: u32) -> Option<Gi> {
-        (!gi_table.is_null()).then(|| Gi {
-            table_idx: self.table_idx(gi_table) as u16,
-            col_idx,
-        })
-    }
-
     fn add_agg_descs(&mut self, descs: &[AggDescriptor]) -> (u32, u16) {
         let offset = self.agg_descs.len() as u32;
         self.agg_descs.extend_from_slice(descs);
@@ -309,42 +299,24 @@ impl ProgramBuilder {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// `avi_aggs` is the value-indexed subset of the reduce's descriptors in
+    /// `agg_descs` order (ordinal = position); empty (with a null `avi_table`)
+    /// when the integrate populates no value index.
     pub fn add_integrate(
         &mut self,
         in_reg: u16,
         target_table: *mut Table,
-        // GI params (all NULL/0 if no GI)
-        gi_table: *mut Table,
-        gi_col_idx: u32,
-        // AVI params (all NULL/0 if no AVI)
         avi_table: *mut Table,
-        avi_for_max: bool,
-        avi_agg_col_type_code: u8,
         avi_group_cols: &[u32],
-        avi_agg_col_idx: u32,
+        avi_aggs: &[AggDescriptor],
     ) {
         let table_idx = self.table_idx(target_table);
-        let gi = self.gi_desc(gi_table, gi_col_idx);
-        let avi = if !avi_table.is_null() {
-            let (gc_off, gc_cnt) = self.add_group_cols(avi_group_cols);
-            Some(IntegrateAvi {
-                table_idx: self.table_idx(avi_table) as u16,
-                for_max: avi_for_max,
-                agg_col_type_code: avi_agg_col_type_code,
-                group_cols_offset: gc_off,
-                group_cols_count: gc_cnt,
-                agg_col_idx: avi_agg_col_idx,
-            })
-        } else {
-            None
-        };
-        self.instructions.push(Instr::Integrate {
-            in_reg,
-            table_idx,
-            gi,
-            avi,
+        let avi = (!avi_table.is_null()).then(|| IntegrateAvi {
+            table_idx: self.table_idx(avi_table) as u16,
+            group_by_cols: avi_group_cols.to_vec(),
+            aggs: avi_aggs.to_vec(),
         });
+        self.instructions.push(Instr::Integrate { in_reg, table_idx, avi });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -358,13 +330,9 @@ impl ProgramBuilder {
         agg_descs: &[AggDescriptor],
         group_cols: &[u32],
         output_schema: SchemaDescriptor,
-        // AVI params
+        // The combined value index table (null if no AVI). `for_max`/type per
+        // aggregate are read from `agg_descs` by ordinal on the read side.
         avi_table: *mut Table,
-        avi_for_max: bool,
-        avi_agg_col_type_code: u8,
-        // GI params
-        gi_table: *mut Table,
-        gi_col_idx: u32,
         // Finalize
         finalize_prog: *const crate::expr::ResolvedProgram,
         finalize_schema: *const SchemaDescriptor,
@@ -376,16 +344,9 @@ impl ProgramBuilder {
         let (gc_off, gc_cnt) = self.add_group_cols(group_cols);
         let output_schema_idx = self.schema_idx(output_schema);
 
-        let gi = self.gi_desc(gi_table, gi_col_idx);
-        let avi = if !avi_table.is_null() {
-            Some(ReduceAvi {
-                table_idx: self.table_idx(avi_table) as u16,
-                for_max: avi_for_max,
-                agg_col_type_code: avi_agg_col_type_code,
-            })
-        } else {
-            None
-        };
+        let avi = (!avi_table.is_null()).then(|| ReduceAvi {
+            table_idx: self.table_idx(avi_table) as u16,
+        });
 
         let finalize_func_idx = self.expr_idx(finalize_prog);
         let finalize_schema_idx = if !finalize_schema.is_null() {
@@ -405,7 +366,6 @@ impl ProgramBuilder {
             group_cols_offset: gc_off,
             group_cols_count: gc_cnt,
             output_schema_idx,
-            gi,
             avi,
             finalize_func_idx,
             finalize_schema_idx,

@@ -202,18 +202,18 @@ class TestJoinSignedKey:
 
 
 # ---------------------------------------------------------------------------
-# Multi-aggregate GROUP BY reduce whose GroupIndex re-seeks a signed source PK
+# Multi-aggregate GROUP BY reduce over a signed source PK, via the combined index
 # ---------------------------------------------------------------------------
 
-class TestReduceGiSignedKey:
-    """`SELECT g, MIN(v), MAX(v) FROM t GROUP BY g` carries TWO aggregates, so it
-    routes through the GroupIndex (GI) read-back rather than the AggValueIndex —
-    AVI is built only for a single MIN/MAX. On every incremental recompute the GI
-    maps a group to its source rows' PKs and re-seeks the source trace by each
-    PK. When t's PK is a signed BIGINT with negative keys, that re-seek must
-    locate the negative key (the same byte-ordering hazard op_distinct/op_join
-    face, but on the reduce trace). The positive-PK aggregate suites never
-    exercise this, so it is covered here end to end."""
+class TestReduceSignedKeyCombinedIndex:
+    """`SELECT g, MIN(v), MAX(v) FROM t GROUP BY g` carries two MIN/MAX
+    aggregates over a non-PK group key, so it routes through the combined
+    AggValueIndex (one table keyed `g ‖ ordinal ‖ av`, two ordinals over `v`) —
+    never re-reading the source trace by PK. The combined index resolves each
+    group with a single exact-byte prefix seek, so a signed BIGINT source PK with
+    negative keys (which the index never touches on the read path) cannot perturb
+    the result. The assertions below pin that incremental MIN/MAX recompute over a
+    negative-PK source stays correct end to end."""
 
     def test_incremental_min_max_negative_pk(self, client):
         sn = "s" + _uid()
@@ -239,8 +239,8 @@ class TestReduceGiSignedKey:
             assert (by_g[2]["lo"], by_g[2]["hi"]) == (7, 7)
 
             # Incremental retraction at a negative PK: delete the current MIN of
-            # g=1 (v=50 at id=-3). Recomputing g=1 must re-seek the trace at the
-            # remaining negative key id=-5 (v=100) — the GI-driven trace seek.
+            # g=1 (v=50 at id=-3). Recomputing g=1 reads the combined index's
+            # post-delta extreme for g=1 (v=100), never touching the signed PK.
             client.execute_sql("DELETE FROM t WHERE id = -3", schema_name=sn)
             by_g = {r["g"]: r for r in client.scan(vid) if r.weight > 0}
             assert (by_g[1]["lo"], by_g[1]["hi"]) == (100, 100), (

@@ -122,11 +122,10 @@ pub fn op_reduce(
     output_schema: &SchemaDescriptor,
     group_by_cols: &[u32],
     agg_descs: &[AggDescriptor],
+    // The one combined-index cursor — keyed `group_cols ‖ ordinal ‖ av_encoded`,
+    // serving every MIN/MAX aggregate. `None` for all-linear reduces and the
+    // single-scan fallback. `for_max`/type per aggregate come from `agg_descs`.
     avi_cursor: Option<&mut ReadCursor>,
-    avi_for_max: bool,
-    avi_agg_col_type_code: TypeCode,
-    gi_cursor: Option<&mut ReadCursor>,
-    gi_col_idx: u32,
     finalize_prog: Option<&crate::expr::ResolvedProgram>,
     finalize_out_schema: Option<&SchemaDescriptor>,
     // Global-aggregate ground machinery. `global_ground` is the planner's
@@ -278,15 +277,10 @@ pub fn op_reduce(
     // multiple times in the loop. They're already &mut so we can use them directly.
     let mut trace_in = trace_in_cursor;
     let mut avi = avi_cursor;
-    let mut gi = gi_cursor;
-
-    // GI group-column extractor: built once so population and read-back agree
-    // on a raw, injective gc. `gi_col_idx` defaults to a valid column index
-    // (0) when GI is unused, so building unconditionally is safe.
-    let gc_extractor = super::super::util::IndexColExtractor::new(input_schema, gi_col_idx as usize);
 
     // AVI group-key gatherer: built once so the per-group lookup gathers the
-    // full byte-form group key (the prefix the AVI cursor seeks on).
+    // full byte-form group key (the prefix, plus the per-aggregate ordinal
+    // appended in the loop, that the combined-index cursor seeks on).
     let avi_extractor = avi
         .is_some()
         .then(|| GroupKeyExtractor::new(input_schema, group_by_cols));
@@ -301,7 +295,7 @@ pub fn op_reduce(
     // matched_rows is sorted by group so `offsets[g] = (start, len)` slices the
     // rows belonging to group g.
     type FallbackScan = (Vec<(u32, u32, i64)>, Vec<(u32, u32)>);
-    let fallback_state: Option<FallbackScan> = if !all_linear && avi.is_none() && !group_by_pk && gi.is_none() {
+    let fallback_state: Option<FallbackScan> = if !all_linear && avi.is_none() && !group_by_pk {
         trace_in.as_deref_mut().map(|ti_cursor| {
             // Pass 1: one exemplar row per distinct delta group, in group order.
             let mut group_exemplars = Vec::with_capacity(n);
@@ -419,13 +413,18 @@ pub fn op_reduce(
 
     // A group exists iff its net cardinality (row weight) is positive; the unique
     // AggOp::Count accumulator carries that signal. The SQL planner gives every
-    // all-linear GROUP BY view exactly one Count — a user COUNT(*) or an appended
-    // companion — so SQL views gate on cardinality and shed emptied/all-NULL
-    // groups correctly. When no Count is present — a non-linear reduce, or a
-    // hand-built circuit from the low-level CircuitBuilder API that omits one —
-    // `cardinality_idx` is None and the gate falls back to the any_nonzero
-    // touched-ness test below (the prior behavior).
-    let cardinality_idx: Option<usize> = all_linear
+    // grouped or global scalar reduce exactly one NULL-blind COUNT — a user
+    // COUNT(*) or an appended companion — so it gates on cardinality and sheds
+    // emptied / all-NULL groups correctly. All three disjuncts are load-bearing:
+    // `!group_by_cols.is_empty()` covers a grouped non-linear reduce (whose
+    // folded linear companion would otherwise emit a phantom row at count 0),
+    // `global_ground` covers a global non-linear reduce (same hazard, empty
+    // gcols), `all_linear` covers the two-phase local partial. `.flatten()`
+    // degrades a genuinely count-less reduce — the range-join threshold reduce
+    // (`global_ground=false`, empty gcols, no COUNT) and low-level CircuitBuilder
+    // reduces — to the `any_nonzero` touched-ness test below (it must not seed a
+    // ground row).
+    let cardinality_idx: Option<usize> = (all_linear || !group_by_cols.is_empty() || global_ground)
         .then(|| agg_descs.iter().position(|d| d.agg_op == AggOp::Count))
         .flatten();
 
@@ -528,16 +527,43 @@ pub fn op_reduce(
             fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, &agg_col_widths, cbase, pbase);
         } else if !all_linear {
             if let (Some(ref mut avi_c), Some(extractor)) = (&mut avi, &avi_extractor) {
-                // AVI path: gather the full group key and prefix-seek the index.
+                // Combined-index path. Fold the linear companions (SUM / the
+                // cardinality COUNT) off the still-positioned trace_out cursor —
+                // `new = old + Σdelta` — into their accumulators (a no-op for a new
+                // group). `fold_old_aggs` skips the non-linear accumulators; the
+                // index owns each MIN/MAX and overwrites it below.
+                if has_old {
+                    fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, &agg_col_widths, cbase, pbase);
+                }
+                // Gather the group key once into a buffer with one spare trailing
+                // byte for the per-aggregate ordinal; then for each non-linear
+                // aggregate write its ordinal and prefix-seek `group ‖ ordinal`,
+                // seeding the post-delta extreme (or resetting on an empty seek).
+                // `for_max`/type come from `agg_descs[k]`; the ordinal `j` is the
+                // aggregate's position in non-linear-descriptor order, matching the
+                // index's write side.
                 let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
                 extractor.gather(&mb, group_start_idx, &mut gk);
-                apply_agg_from_value_index(
-                    avi_c,
-                    &gk[..extractor.stride],
-                    avi_for_max,
-                    avi_agg_col_type_code,
-                    &mut accs[0],
-                );
+                let gstride = extractor.stride;
+                // Ordinal `j` is the position among the value-indexed aggregates
+                // in descriptor order — selected by the same `uses_value_index`
+                // predicate, in the same order, the index write side used, so the
+                // two agree by construction.
+                for (j, (k, d)) in agg_descs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.agg_op.uses_value_index())
+                    .enumerate()
+                {
+                    gk[gstride] = j as u8;
+                    apply_agg_from_value_index(
+                        avi_c,
+                        &gk[..gstride + 1],
+                        d.agg_op == AggOp::Max,
+                        d.col_type_code,
+                        &mut accs[k],
+                    );
+                }
             } else {
                 let replay = replay.as_mut().unwrap();
                 replay.clear();
@@ -555,29 +581,6 @@ pub fn op_reduce(
                         ti_cursor.for_each_pk_group_row(group_pk_bytes, |c| {
                             c.push_current_row(&mut trace_rows);
                         });
-                    } else if let Some(gi_c) = gi.as_deref_mut() {
-                        // The GI key is `[gc(LE) ‖ src_pk(OPK)]`. gc is stored
-                        // and probed in the same LE encoding (the GI is only
-                        // point-probed by an exact gc prefix, never numeric
-                        // range, so it need not be OPK); src_pk is the source
-                        // table's OPK bytes, so it seeks the OPK trace directly.
-                        let gc_u64_val = gc_extractor.extract(&mb, group_start_idx);
-                        let mut prefix = [0u8; crate::ops::index::GI_GC_BYTES];
-                        prefix.copy_from_slice(&gc_u64_val.to_le_bytes());
-                        let mut hit = gi_c.seek_first_positive_with_prefix(&prefix);
-                        while hit {
-                            let k = gi_c.current_pk_bytes();
-                            let src_pk_bytes = &k[crate::ops::index::GI_GC_BYTES..];
-                            // ti_cursor traversal is non-monotonic across GI
-                            // entries; `seek_bytes` is an absolute binary search
-                            // so a backward re-seek is O(log N) and correct.
-                            ti_cursor.seek_bytes(src_pk_bytes);
-                            ti_cursor.for_each_pk_group_row(src_pk_bytes, |c| {
-                                c.push_current_row(&mut trace_rows);
-                            });
-                            gi_c.advance();
-                            hit = gi_c.walk_to_positive_with_prefix(&prefix);
-                        }
                     } else {
                         // Precomputed by the single-scan pre-pass; `num_groups`
                         // is this group's index (the pre-pass walks identical
@@ -617,11 +620,12 @@ pub fn op_reduce(
         }
 
         // Emission: a group exists iff its net cardinality is positive. With a
-        // COUNT signal (SQL all-linear reduce): read it — correct for both emptied
-        // groups (fold saturates has_value) and new all-NULL groups (nothing
-        // touches the value accumulators). Without one (non-linear, whose w>0
-        // replay already eliminates emptied groups; or a companion-less low-level
-        // circuit): fall back to the any_nonzero touched-ness test.
+        // COUNT signal (every grouped or global scalar planner reduce): read it —
+        // correct for emptied groups (the folded companion nets to 0), new all-NULL
+        // groups (the count is positive, the value accumulators untouched → emit
+        // `(g, NULL, …)`), and surviving groups. Without one (the range-join
+        // threshold reduce, or a companion-less low-level circuit): fall back to
+        // the any_nonzero touched-ness test.
         let should_emit = match cardinality_idx {
             Some(ci) => {
                 // Bag-positive reduce inputs ⇒ cardinality ≥ 0; fail loudly if a

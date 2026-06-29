@@ -1,14 +1,13 @@
-//! Microbenchmarks for the reduce-time secondary-index population hot path
-//! (GroupIndex + AggValueIndex). Ignored by default; run with:
+//! Microbenchmarks for the reduce-time combined-AggValueIndex population hot
+//! path. Ignored by default; run with:
 //!
 //! ```text
 //! cargo test -p gnitz-engine --release secondary_index_bench -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Lives inside `ops` (not the crate root) so it can call the real internal
-//! key-composition helpers (`IndexColExtractor`, `GroupKeyExtractor`,
-//! `encode_ordered`) and decompose the per-row population cost into four
-//! cleanly-attributed layers:
+//! key-composition helpers (`GroupKeyExtractor`, `encode_ordered`) and decompose
+//! the per-row population cost into four cleanly-attributed layers:
 //!
 //!   compose : build the index key into a stack buffer, discard
 //!   assembly: the `extend_*` calls that turn keys into a `Batch` (= build - compose)
@@ -22,8 +21,9 @@
 
 use std::time::{Duration, Instant};
 
-use super::index::{make_avi_schema, make_gi_schema, op_integrate_with_indexes, AviDesc, GiDesc, GI_GC_BYTES};
-use super::util::{encode_ordered, GroupKeyExtractor, IndexColExtractor, AVI_AV_BYTES};
+use super::index::{make_avi_schema, op_integrate_with_indexes, AviDesc};
+use super::util::{encode_ordered, GroupKeyExtractor, AVI_AV_BYTES};
+use super::{AggDescriptor, AggOp};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
 use crate::storage::{Batch, Persistence, Table};
 
@@ -43,7 +43,7 @@ fn arena() -> u64 {
 }
 
 /// Source schema: U64 pk (col 0) | U32 grp (col 1) | I64 val (col 2).
-/// GI groups by col 1; AVI groups by col 1 and aggregates MIN over col 2.
+/// AVI groups by col 1 and aggregates MIN over col 2.
 fn src_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
@@ -139,191 +139,6 @@ fn time_upsert(
 
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
-fn secondary_index_bench_gi_decomposition() {
-    let schema = src_schema();
-    let gi_schema = make_gi_schema(&schema);
-    let input = build_input(&schema);
-    let mb = input.as_mem_batch();
-    let tmp = tempfile::tempdir().unwrap();
-    let gc = IndexColExtractor::new(&schema, 1);
-
-    // GI key = gc(8) ++ source PK bytes.
-    let gi_key = |key: &mut [u8], row: usize| -> usize {
-        let gc_u64 = gc.extract(&mb, row);
-        key[..GI_GC_BYTES].copy_from_slice(&gc_u64.to_le_bytes());
-        let src_pk = mb.get_pk_bytes(row);
-        key[GI_GC_BYTES..GI_GC_BYTES + src_pk.len()].copy_from_slice(src_pk);
-        GI_GC_BYTES + src_pk.len()
-    };
-    let build_batch = || {
-        let mut out = Batch::with_schema(gi_schema, N_ROWS);
-        let mut key = [0u8; MAX_PK_BYTES];
-        for row in 0..N_ROWS {
-            let klen = gi_key(&mut key, row);
-            out.extend_pk_bytes(&key[..klen]);
-            out.extend_weight(&mb.get_weight(row).to_le_bytes());
-            out.extend_null_bmp(&0u64.to_le_bytes());
-            out.count += 1;
-        }
-        out
-    };
-
-    let compose = time(|| {
-        let mut key = [0u8; MAX_PK_BYTES];
-        for row in 0..N_ROWS {
-            let klen = gi_key(&mut key, row);
-            std::hint::black_box(&key[..klen]);
-        }
-    });
-    let build = time(|| {
-        std::hint::black_box(build_batch());
-    });
-    let sort = time(|| {
-        std::hint::black_box(build_batch().into_consolidated(&gi_schema));
-    });
-    let upsert = time_upsert(tmp.path(), gi_schema, 100, || {
-        build_batch().into_consolidated(&gi_schema)
-    });
-
-    // Cross-check the layered sum against the real public entry point.
-    let mut id = 1000u32;
-    let full = time(|| {
-        let mut t = Table::new(
-            tmp.path().to_str().unwrap(),
-            "gi",
-            gi_schema,
-            id,
-            arena(),
-            Persistence::Ephemeral,
-        )
-        .unwrap();
-        id += 1;
-        let gi = GiDesc {
-            table: &mut t as *mut Table,
-            col_idx: 1,
-        };
-        op_integrate_with_indexes(&input, None, &schema, Some(&gi), None).unwrap();
-        std::hint::black_box(&t);
-    });
-
-    report("GI (U64 pk)", compose, build, sort, upsert);
-    println!("  (op_integrate full path: {:.2} ns/row)", ns_per_row(full));
-}
-
-/// Incremental lifecycle bench: one long-lived GI table fed many small
-/// per-epoch deltas, each epoch reading back (compacting cursor + prefix
-/// walk over the touched groups) exactly as `op_reduce` does. This is the
-/// production shape the single-batch decomposition tests above cannot see:
-/// a tiny arena (index tables ship 256 KiB–1 MiB) flushes frequently, and
-/// since the read path opens `create_cursor_compacting`, every read past
-/// `L0_COMPACT_THRESHOLD` shards triggers a compaction — LSM write
-/// amplification driven purely by memtable size. Sweep `GNITZ_BENCH_ARENA_KB`
-/// (e.g. 1024 = shipped GI arena vs. 65536 = working-set-sized) to price it.
-#[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
-fn secondary_index_bench_gi_incremental() {
-    let delta: usize = std::env::var("GNITZ_BENCH_DELTA")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-    let epochs: usize = N_ROWS / delta;
-
-    let schema = src_schema();
-    let gi_schema = make_gi_schema(&schema);
-    let tmp = tempfile::tempdir().unwrap();
-    let mut t = Table::new(
-        tmp.path().to_str().unwrap(),
-        "gi_inc",
-        gi_schema,
-        0,
-        arena(),
-        Persistence::Ephemeral,
-    )
-    .unwrap();
-
-    let mut pk: u64 = 0;
-    let mut write_t = Duration::ZERO;
-    let mut open_t = Duration::ZERO;
-    let mut seek_t = Duration::ZERO;
-    let start = Instant::now();
-    for _ in 0..epochs {
-        let mut batch = Batch::with_schema(schema, delta);
-        let mut touched: Vec<u64> = Vec::with_capacity(delta);
-        for _ in 0..delta {
-            let g = pk % N_GROUPS;
-            batch.extend_pk(pk as u128);
-            batch.extend_weight(&1i64.to_le_bytes());
-            batch.extend_null_bmp(&0u64.to_le_bytes());
-            batch.extend_col(0, &(g as u32).to_le_bytes());
-            batch.extend_col(1, &((pk.wrapping_mul(2654435761)) as i64).to_le_bytes());
-            batch.count += 1;
-            touched.push(g);
-            pk += 1;
-        }
-
-        let gi = GiDesc {
-            table: &mut t as *mut Table,
-            col_idx: 1,
-        };
-        let w0 = Instant::now();
-        op_integrate_with_indexes(&batch, None, &schema, Some(&gi), None).unwrap();
-        write_t += w0.elapsed();
-
-        // Read-back: compacting cursor, then walk each touched group's prefix
-        // (the GI group-column value widens to the u64 gc prefix).
-        touched.sort_unstable();
-        touched.dedup();
-        let o0 = Instant::now();
-        // Mirrors op_reduce's GI read path (vm.rs), which compacts on read.
-        #[allow(clippy::disallowed_methods)]
-        let mut handle = t.create_cursor_compacting().unwrap();
-        open_t += o0.elapsed();
-        let c = handle.cursor_mut();
-        let s0 = Instant::now();
-        for g in &touched {
-            let prefix = (*g).to_le_bytes();
-            let mut hit = c.seek_first_positive_with_prefix(&prefix);
-            while hit {
-                std::hint::black_box(c.current_pk_bytes());
-                c.advance();
-                hit = c.walk_to_positive_with_prefix(&prefix);
-            }
-        }
-        seek_t += s0.elapsed();
-    }
-    let elapsed = start.elapsed();
-    let rows = (epochs * delta) as f64;
-    println!(
-        "\nGI incremental — {epochs} epochs x {delta} rows, arena {} KiB:",
-        arena() / 1024
-    );
-    println!(
-        "  {:.1} ns/row   ({:.2} Mrows/s)   total {:.3}s",
-        elapsed.as_nanos() as f64 / rows,
-        rows / elapsed.as_secs_f64() / 1e6,
-        elapsed.as_secs_f64(),
-    );
-    let pct = |d: Duration| 100.0 * d.as_secs_f64() / elapsed.as_secs_f64();
-    let nspr = |d: Duration| d.as_nanos() as f64 / rows;
-    println!(
-        "    write (integrate)   {:7.1} ns/row   {:5.1}%",
-        nspr(write_t),
-        pct(write_t)
-    );
-    println!(
-        "    read: cursor open   {:7.1} ns/row   {:5.1}%",
-        nspr(open_t),
-        pct(open_t)
-    );
-    println!(
-        "    read: prefix seeks  {:7.1} ns/row   {:5.1}%",
-        nspr(seek_t),
-        pct(seek_t)
-    );
-}
-
-#[test]
-#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn secondary_index_bench_avi_decomposition() {
     let schema = src_schema();
     let group_by_cols = vec![1u32];
@@ -338,14 +153,16 @@ fn secondary_index_bench_avi_decomposition() {
         .expect("AVI agg col is a payload column by construction");
     let tc = type_code::I64;
 
-    // AVI key = group_key_bytes ++ av_encoded(8).
+    // Combined AVI key = group_key_bytes ++ ordinal(1) ++ av_encoded(8). Single
+    // aggregate here, so ordinal 0.
     let avi_key = |key: &mut [u8], row: usize| -> usize {
         extractor.gather(&mb, row, key);
+        key[n] = 0; // ordinal
         let av_bytes = mb.get_col_ptr(row, avi_pi, 8);
         let av = encode_ordered(av_bytes, tc, false);
         // Big-endian, mirroring the production key layout in op_integrate_with_indexes.
-        key[n..n + AVI_AV_BYTES].copy_from_slice(&av.to_be_bytes());
-        n + AVI_AV_BYTES
+        key[n + 1..n + 1 + AVI_AV_BYTES].copy_from_slice(&av.to_be_bytes());
+        n + 1 + AVI_AV_BYTES
     };
     let build_batch = || {
         let mut out = Batch::with_schema(avi_schema, N_ROWS);
@@ -391,12 +208,15 @@ fn secondary_index_bench_avi_decomposition() {
         id += 1;
         let avi = AviDesc {
             table: &mut t as *mut Table,
-            for_max: false,
-            agg_col_type_code: TypeCode::I64 as u8,
             group_by_cols: group_by_cols.clone(),
-            agg_col_idx: 2,
+            aggs: vec![AggDescriptor {
+                col_idx: 2,
+                agg_op: AggOp::Min,
+                col_type_code: TypeCode::I64,
+                _pad: [0; 2],
+            }],
         };
-        op_integrate_with_indexes(&input, None, &schema, None, Some(&avi)).unwrap();
+        op_integrate_with_indexes(&input, None, &schema, Some(&avi)).unwrap();
         std::hint::black_box(&t);
     });
 

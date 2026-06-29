@@ -62,6 +62,17 @@ impl AggOp {
     pub fn is_linear(self) -> bool {
         matches!(self, AggOp::Count | AggOp::Sum | AggOp::CountNonNull | AggOp::SumZero)
     }
+
+    /// True iff this aggregate is maintained through the combined AggValueIndex —
+    /// the order-encodable extremes MIN/MAX. This is the single source of truth
+    /// for "which aggregates the value index serves, and in what ordinal order":
+    /// the index write side (`op_integrate_with_indexes`) and the reduce read
+    /// side (`op_reduce`) both select and order their entries by this predicate
+    /// over `agg_descs`, so the two agree by construction. Note it is *not* the
+    /// negation of `is_linear`: `Null` is neither linear nor value-indexed.
+    pub fn uses_value_index(self) -> bool {
+        matches!(self, AggOp::Min | AggOp::Max)
+    }
 }
 
 /// Descriptor for one aggregate function.
@@ -431,13 +442,22 @@ pub(super) fn readback_agg_bits(bytes: &[u8], src_tc: TypeCode) -> u64 {
 }
 
 /// Fold the old aggregate values stored in `cursor`'s current row into `accs`
-/// at weight +1 — the `new = old + delta` step on `op_reduce`'s linear fast path.
+/// at weight +1 — the `new = old + delta` step on `op_reduce`'s linear fast path,
+/// reused in the combined-index path to fold a mixed reduce's linear companions.
 ///
 /// A NULL old aggregate contributes nothing: folding its zero bytes would
 /// saturate `has_value`, decoding NULL as 0. The aggregates are the trailing
 /// output columns (`build_reduce_output_schema` appends them last), so `cbase`
 /// (first agg column index) and `pbase` (first agg payload slot) address each
 /// value and its null bit at any PK arity.
+///
+/// Non-linear (MIN/MAX) accumulators are skipped: the combined AVI owns each
+/// extreme and `apply_agg_from_value_index` *overwrites* the accumulator after
+/// this fold (or resets it on an empty seek), so folding the old extreme here
+/// would be discarded regardless. The skip just avoids a wasted `trace_out`
+/// read + `combine()` per non-linear aggregate, and documents that the AVI —
+/// never the fold — owns the non-linear value. The all-linear caller never
+/// skips (every accumulator is linear).
 pub(super) fn fold_old_aggs(
     accs: &mut [Accumulator],
     cursor: &ReadCursor,
@@ -447,6 +467,9 @@ pub(super) fn fold_old_aggs(
     pbase: usize,
 ) {
     for (k, acc) in accs.iter_mut().enumerate() {
+        if !agg_descs[k].agg_op.is_linear() {
+            continue;
+        }
         if (cursor.current_null_word >> (pbase + k)) & 1 != 0 {
             continue;
         }
@@ -479,13 +502,16 @@ pub(crate) fn is_single_col_natural_pk(schema: &SchemaDescriptor, group_cols: &[
 // AVI lookup
 // ---------------------------------------------------------------------------
 
-/// Seek the AVI cursor to a group via its full byte-form group key and apply
+/// Seek the AVI cursor to a group via its full byte-form seek prefix and apply
 /// the decoded MIN/MAX to the accumulator.
 ///
-/// The AVI PK is `group_key_bytes ++ av_encoded(8)`, ordered group-major then
-/// aggregate-minor. The first positive-weight entry whose key starts with the
-/// full group key is therefore the extremal value, and the prefix match
-/// confirms the row belongs to this exact group (no hash, so no collision).
+/// `group_key` is the opaque seek prefix `group_cols ‖ ordinal` — the caller
+/// appends the one-byte per-aggregate ordinal so a single combined index can
+/// serve several MIN/MAX of the same group without collision. The full AVI PK is
+/// `group_cols ‖ ordinal ‖ av_encoded(8)`, ordered group-major, then by ordinal,
+/// then by value, so the first positive-weight entry whose key starts with
+/// `group_key` is the extremal value for that group+aggregate, and the prefix
+/// match confirms the row belongs to this exact group (no hash, so no collision).
 pub(super) fn apply_agg_from_value_index(
     avi_cursor: &mut ReadCursor,
     group_key: &[u8],
@@ -497,12 +523,13 @@ pub(super) fn apply_agg_from_value_index(
     if avi_cursor.seek_first_positive_with_prefix(group_key) {
         let k = avi_cursor.current_pk_bytes();
         // current_pk_bytes() is the full AVI PK region; make_avi_schema lays it
-        // out as group_stride + AVI_AV_BYTES (av_encoded), so the trailing bytes
-        // are always in bounds for a group_key of length group_stride.
+        // out as `group ‖ ordinal ‖ av_encoded`, so the trailing av bytes are
+        // always in bounds for a seek prefix `group_key` of length
+        // `group_stride + 1` (group plus the ordinal byte).
         debug_assert_eq!(
             k.len(),
             group_key.len() + AVI_AV_BYTES,
-            "AVI key = group_stride + AVI_AV_BYTES",
+            "AVI key = seek prefix (group ‖ ordinal) + AVI_AV_BYTES",
         );
         let av_start = group_key.len();
         let av = u64::from_be_bytes(k[av_start..av_start + AVI_AV_BYTES].try_into().unwrap());
