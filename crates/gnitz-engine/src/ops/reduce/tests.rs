@@ -10,7 +10,7 @@ use crate::test_support::make_schema_i64pk_i64;
 
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};
-use super::emit::{emit_finalized_row, emit_reduce_row};
+use super::emit::{emit_finalized_row, emit_global_ground, emit_reduce_row};
 use super::op_reduce::{cursor_matches_group, op_reduce};
 use super::sort::{argsort_delta, build_sort_descs, compare_by_group_cols};
 
@@ -6483,9 +6483,9 @@ fn global_lone_min_avi_empty_prefix() {
 // ---------------------------------------------------------------------------
 
 /// SumZero folds values exactly like Sum, is linear (keeps the combine on the
-/// linear fast path), and an untouched accumulator grounds to `0`, not NULL.
+/// linear fast path), and an untouched accumulator renders `0`, not NULL.
 #[test]
-fn sumzero_folds_like_sum_and_grounds_to_zero() {
+fn sumzero_folds_like_sum_and_empty_renders_zero() {
     assert!(AggOp::SumZero.is_linear(), "SumZero must be linear");
 
     let schema = g_src();
@@ -6498,8 +6498,8 @@ fn sumzero_folds_like_sum_and_grounds_to_zero() {
     let mut acc = Accumulator::new(&desc, &schema);
 
     // Fresh: untouched, and renders 0 (Count's identity) rather than NULL (Sum's).
-    assert!(acc.is_zero(), "fresh SumZero is untouched");
-    assert!(acc.grounds_to_zero(), "an untouched SumZero renders 0, not NULL");
+    assert!(acc.is_untouched(), "fresh SumZero is untouched");
+    assert!(acc.empty_renders_zero(), "an untouched SumZero renders 0, not NULL");
 
     // Folds values with weight, exactly like Sum: 5·(+1) + 10·(+1) + 7·(−1) = 8.
     let batch = g_delta(&[(1, 1, 5), (2, 1, 10), (3, -1, 7)]);
@@ -6507,11 +6507,146 @@ fn sumzero_folds_like_sum_and_grounds_to_zero() {
     for row in 0..batch.count {
         acc.step_from_batch(&mb, row, mb.get_weight(row));
     }
-    assert!(!acc.is_zero(), "SumZero with input is touched");
+    assert!(!acc.is_untouched(), "SumZero with input is touched");
     assert_eq!(
         acc.get_value_bits() as i64,
         8,
         "SumZero sums its source values (5 + 10 − 7)"
+    );
+}
+
+/// `COUNT(col)` over an all-NULL group renders a concrete `0` with the null bit
+/// **clear**, never NULL. Every row hits `step_from_batch`'s null gate, so the
+/// CountNonNull accumulator stays untouched; the emitted column's null bit is the
+/// only observable distinguishing `0` from NULL (the value bytes are zero either
+/// way). Regression guard for the COUNT-family-renders-NULL emitter bug.
+#[test]
+fn count_non_null_all_null_group_renders_zero_null_clear() {
+    let in_schema = g_src(); // [U64 pk, I64 payload(nullable)]
+    let desc = AggDescriptor {
+        col_idx: 1,
+        agg_op: AggOp::CountNonNull,
+        col_type_code: TypeCode::I64,
+        _pad: [0; 2],
+    };
+    let mut acc = Accumulator::new(&desc, &in_schema);
+
+    // Two rows whose payload column (payload slot 0) is NULL.
+    let mut batch = Batch::with_schema(g_src(), 2);
+    for pk in [1u128, 2u128] {
+        batch.extend_pk(pk);
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&1u64.to_le_bytes()); // payload slot 0 = NULL
+        batch.extend_col(0, &0i64.to_le_bytes());
+        batch.count += 1;
+    }
+    batch.set_layout_unchecked(Layout::Consolidated);
+    let mb = batch.as_mem_batch();
+    for row in 0..batch.count {
+        acc.step_from_batch(&mb, row, mb.get_weight(row));
+    }
+    assert!(acc.is_untouched(), "all-NULL group leaves CountNonNull untouched");
+
+    // Emit the group row. Natural-PK grouping on the U64 PK col: output is
+    // [U64 pk, I64 count], no group-exemplar column.
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let mut output = Batch::with_schema(out_schema, 1);
+    let accs = vec![acc];
+    emit_reduce_row(
+        &mut output,
+        &mb,
+        0,
+        mb.get_pk_bytes(0),
+        &accs,
+        &in_schema,
+        &out_schema,
+        &[0u32],
+        true, /* use_natural_pk */
+        1,
+    );
+
+    assert_eq!(output.count, 1);
+    let out_mb = output.as_mem_batch();
+    assert_eq!(
+        out_mb.get_null_word(0) & 1,
+        0,
+        "COUNT(col) of all-NULL group must have the null bit CLEAR (renders 0, not NULL)",
+    );
+    assert_eq!(
+        read_i64_le(out_mb.get_col_ptr(0, 0, 8), 0),
+        0,
+        "COUNT(col) of all-NULL group decodes to 0",
+    );
+}
+
+/// `emit_global_ground` still renders the COUNT family as a concrete `0` with the
+/// null bit clear after the explicit COUNT seed loop was deleted — the untouched
+/// accumulators now render via `empty_renders_zero`. Guards that deletion for both
+/// COUNT(*) and COUNT(col) ground columns.
+#[test]
+fn emit_global_ground_renders_count_family_zero_null_clear() {
+    let in_schema = g_src();
+    // Global-aggregate output: [_group_pk:U128, count_star:I64, count_col:I64].
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let descs = [
+        AggDescriptor {
+            col_idx: 0,
+            agg_op: AggOp::Count,
+            col_type_code: TypeCode::U64,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 1,
+            agg_op: AggOp::CountNonNull,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+    ];
+    let mut raw_output = Batch::with_schema(out_schema, 1);
+    let v0 = [0u8; 16]; // U128 ground PK (V₀)
+    emit_global_ground(
+        &mut raw_output,
+        &v0,
+        &descs,
+        &in_schema,
+        &out_schema,
+        &[], // no group-by columns
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert_eq!(raw_output.count, 1, "ground row emitted");
+    let out_mb = raw_output.as_mem_batch();
+    // Both count columns (payload slots 0 and 1) render 0 with the null bit clear.
+    assert_eq!(
+        out_mb.get_null_word(0) & 0b11,
+        0,
+        "COUNT(*) and COUNT(col) ground columns must be null-clear",
+    );
+    assert_eq!(
+        read_i64_le(out_mb.get_col_ptr(0, 0, 8), 0),
+        0,
+        "COUNT(*) ground value is 0"
+    );
+    assert_eq!(
+        read_i64_le(out_mb.get_col_ptr(0, 1, 8), 0),
+        0,
+        "COUNT(col) ground value is 0"
     );
 }
 

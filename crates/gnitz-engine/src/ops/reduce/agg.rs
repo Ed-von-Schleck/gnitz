@@ -63,6 +63,14 @@ impl AggOp {
         matches!(self, AggOp::Count | AggOp::Sum | AggOp::CountNonNull | AggOp::SumZero)
     }
 
+    /// True iff an untouched accumulator renders `0`, not NULL — the
+    /// zero-identity family. COUNT / COUNT_NON_NULL count rows (empty = 0);
+    /// SumZero is Sum's fold under Count's 0 identity (the two-phase
+    /// partial-count combine). SUM / MIN / MAX have a NULL empty value.
+    pub fn empty_renders_zero(self) -> bool {
+        matches!(self, AggOp::Count | AggOp::CountNonNull | AggOp::SumZero)
+    }
+
     /// True iff this aggregate is maintained through the combined AggValueIndex —
     /// the order-encodable extremes MIN/MAX. This is the single source of truth
     /// for "which aggregates the value index serves, and in what ordinal order":
@@ -123,14 +131,17 @@ impl Accumulator {
         self.agg_op.is_linear()
     }
 
-    /// True iff an untouched (`is_zero()`) accumulator renders as `0` rather than
-    /// NULL — the `SumZero` identity. Lets `emit_agg_col` ground a combine's
-    /// all-NULL-input count column to `0` without growing a per-op render switch.
-    pub(super) fn grounds_to_zero(&self) -> bool {
-        matches!(self.agg_op, AggOp::SumZero)
+    /// Delegates to [`AggOp::empty_renders_zero`] (the agg-op rationale lives
+    /// there); `emit_agg_col` reads it to render an untouched accumulator as `0`
+    /// rather than NULL without a per-op switch.
+    pub(super) fn empty_renders_zero(&self) -> bool {
+        self.agg_op.empty_renders_zero()
     }
 
-    pub(super) fn is_zero(&self) -> bool {
+    /// True iff the accumulator was never stepped (`has_value` is false) — "no
+    /// row contributed," not "the value equals zero." `emit_agg_col` reads this to
+    /// pick the empty-render (NULL, or `0` per `empty_renders_zero`).
+    pub(super) fn is_untouched(&self) -> bool {
         !self.has_value
     }
 

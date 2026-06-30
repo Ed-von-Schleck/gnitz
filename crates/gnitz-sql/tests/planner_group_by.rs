@@ -686,10 +686,11 @@ fn test_group_by_float_key_rejected() {
 
 // ── Aggregate output-column nullability (SUM/MIN/MAX vs COUNT) ────────
 //
-// emit.rs sets the null bit on a direct aggregate output when the accumulator
-// is_zero() (an all-NULL group), so SUM/MIN/MAX can emit NULL while COUNT /
-// COUNT_NON_NULL always emit an integer. The view schema's nullability must
-// match, or a schema-driven decoder reads raw zero bytes as a live value.
+// emit.rs sets the null bit on a direct aggregate output when the accumulator is
+// is_untouched() and not empty_renders_zero() (an all-NULL group), so SUM/MIN/MAX
+// emit NULL while COUNT / COUNT_NON_NULL render a concrete 0 (null bit clear). The
+// view schema's nullability must match, or a schema-driven decoder reads raw zero
+// bytes as a live value (or, for COUNT, surfaces a forbidden NULL).
 
 #[test]
 fn test_aggregate_output_nullability_schema() {
@@ -765,9 +766,14 @@ fn test_aggregate_all_null_group_emits_null() {
         is_null_at(&batch, col_idx(&schema, "mxx") - pk, 0),
         "MAX of all-NULL group must be NULL"
     );
-    // COUNT columns decode to integers: COUNT(x)=0, COUNT(*)=2. (emit.rs sets the
-    // raw null bit on a zero COUNT_NON_NULL accumulator, but the schema marks
-    // COUNT non-nullable so the zero bytes decode as the correct count of 0.)
+    // COUNT columns decode to integers: COUNT(x)=0, COUNT(*)=2. emit.rs renders an
+    // untouched COUNT_NON_NULL as a concrete 0 with the null bit CLEAR (its
+    // empty_renders_zero family), so COUNT(x) of an all-NULL group is 0, never the
+    // forbidden NULL on this non-nullable column.
+    assert!(
+        !is_null_at(&batch, cx - pk, 0),
+        "COUNT(x) of all-NULL group is 0, not NULL"
+    );
     assert_eq!(i64_at(&batch, cx, 0), 0, "COUNT(x) of all-NULL group must decode to 0");
     assert_eq!(i64_at(&batch, ca, 0), 2, "COUNT(*) must count both rows");
 }

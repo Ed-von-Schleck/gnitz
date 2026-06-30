@@ -2369,10 +2369,9 @@ class TestLinearReduceGroupExistence:
 
     def test_count_col_only_empty_recreate_and_all_null_present(self, client):
         """SELECT g, COUNT(a) over nullable a, no COUNT(*): emptying a group drops
-        it, re-inserting restores it. A new all-NULL group becomes PRESENT (this
-        plan restores existence); its COUNT(a) renders as NULL here where SQL wants
-        0 — a separate emitter concern — so the all-NULL step asserts presence
-        only, not the value, via a direct scan rather than the oracle."""
+        it, re-inserting restores it. A new all-NULL group becomes PRESENT with
+        COUNT(a) = 0 (SQL guarantees COUNT is never NULL), asserted through the
+        Python client's null-bit-gated decode via a direct scan."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -2407,12 +2406,69 @@ class TestLinearReduceGroupExistence:
             oracle.apply_insert(t_state, "pk", [{"pk": 3, "g": 10, "a": 7}])
             check("after-recreate-g10")
 
-            # New all-NULL group g=7: this plan makes the row APPEAR. Its value is
-            # NULL (the COUNT(col)-renders-NULL-not-0 emitter fix is separate), so
-            # check existence only, not the value.
+            # New all-NULL group g=7: the row APPEARS and COUNT(a) renders as a
+            # concrete 0 (SQL guarantees COUNT is never NULL), surfaced here through
+            # the client's null-bit-gated decode.
             client.execute_sql("INSERT INTO t VALUES (4, 7, NULL)", schema_name=sn)
             g7 = [r for r in client.scan(vid) if r.weight > 0 and r["g"] == 7]
             assert len(g7) == 1, f"new all-NULL COUNT(a) group must appear, got {g7}"
+            assert g7[0]["c"] == 0, f"COUNT(a) of all-NULL group must be 0, not NULL, got {g7[0]['c']}"
+        finally:
+            client.drop_schema(sn)
+
+    def test_count_star_and_col_all_null_and_mixed_groups_churn(self, client):
+        """SELECT g, COUNT(*), COUNT(x): the differential oracle drives the VALUE
+        (not just existence) of COUNT(x) over an all-NULL group (= 0) and a mixed
+        group (some NULL, some non-NULL x), across inserts and deletes. COUNT(*)
+        counts every row; COUNT(x) counts only non-NULL x and is never NULL — so
+        emptying a group's non-NULL rows leaves COUNT(x) = 0 while COUNT(*) keeps
+        the row alive."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+                "x BIGINT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, COUNT(*) AS ca, COUNT(x) AS cx "
+                "FROM t GROUP BY g", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["g", "ca", "cx"]
+            aggs = [("ca", "COUNT", None), ("cx", "COUNT", "x")]
+            t_state = {}
+
+            def check(ctx):
+                base = oracle.oracle_filter_project(t_state, None, ["g", "x"])
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    base, ["g", "x"], ["g"], aggs)
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            # g=7 all-NULL x (ca=2, cx=0); g=8 mixed (ca=3, cx=2); g=9 all
+            # non-NULL control (ca=1, cx=1).
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 7, NULL), (2, 7, NULL), (3, 8, 5), "
+                "(4, 8, NULL), (5, 8, 6), (6, 9, 9)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [
+                {"pk": 1, "g": 7, "x": None}, {"pk": 2, "g": 7, "x": None},
+                {"pk": 3, "g": 8, "x": 5}, {"pk": 4, "g": 8, "x": None},
+                {"pk": 5, "g": 8, "x": 6}, {"pk": 6, "g": 9, "x": 9}])
+            check("after-insert")
+
+            # Delete one non-NULL of g=8 → cx drops to 1, ca to 2.
+            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [3])
+            check("after-delete-one-nonnull-g8")
+
+            # Delete g=8's last non-NULL → g=8 all-NULL: ca=1, cx=0 (still alive).
+            client.execute_sql("DELETE FROM t WHERE pk = 5", schema_name=sn)
+            oracle.apply_delete(t_state, "pk", [5])
+            check("after-delete-to-all-null-g8")
+
+            # Re-insert a non-NULL x into the now-all-NULL g=8 → cx back to 1.
+            client.execute_sql("INSERT INTO t VALUES (7, 8, 11)", schema_name=sn)
+            oracle.apply_insert(t_state, "pk", [{"pk": 7, "g": 8, "x": 11}])
+            check("after-reinsert-nonnull-g8")
         finally:
             client.drop_schema(sn)
 
@@ -2615,9 +2671,10 @@ class TestGlobalAggregate:
             client.drop_schema(sn)
 
     def test_empty_source_count_col_is_zero(self, client):
-        """The empty-source ground forces COUNT(col)=0 (the only place COUNT(col)=0
-        is asserted — a non-empty all-NULL source is the separately-owned emitter
-        bug's domain and out of scope)."""
+        """The empty-source ground renders COUNT(col)=0 (where SUM/MIN/MAX would be
+        NULL). A non-empty all-NULL source renders COUNT(col)=0 too — the same emit
+        predicate — and is covered by the grouped/all-NULL tests; this one pins the
+        empty-source ground specifically."""
         sn = "gec_" + _uid()
         client.create_schema(sn)
         try:
@@ -2945,10 +3002,11 @@ class TestGlobalAggregate:
     def test_two_phase_fresh_all_null_count_col_is_zero(self, client):
         """Two-phase COUNT(col) over a non-empty source whose column was NEVER
         non-null renders 0: each worker's partial COUNT_NON_NULL is untouched and
-        the combine SumZero of them grounds to 0. This is SQL-correct and the
-        two-phase path's deliberate divergence from the funnel/grouped reduce
-        (which render NULL). The column MUST be fresh all-NULL — inserting non-null
-        rows then nulling them leaves a concrete 0 on both paths and tests nothing."""
+        the combine SumZero of them grounds to 0. This is SQL-correct and now agrees
+        with the funnel/grouped reduce, which also render an untouched COUNT(col) as
+        0 (the empty_renders_zero family). The column MUST be fresh all-NULL —
+        inserting non-null rows then nulling them leaves a concrete 0 on every path
+        and tests nothing."""
         sn = "g2n_" + _uid()
         client.create_schema(sn)
         try:

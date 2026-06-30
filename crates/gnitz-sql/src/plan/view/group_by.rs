@@ -586,10 +586,11 @@ pub(crate) fn execute_create_group_by_view(
                         let tc = reduce_schema.columns[sum_col].type_code;
                         post_map_eb.copy_col(tc as u32, sum_col as u32, payload_idx);
                         // SUM/MIN/MAX emit NULL for an all-NULL group (emit.rs sets
-                        // the null bit when the accumulator is_zero(), since it skips
-                        // NULL inputs). COUNT/COUNT_NON_NULL always return an integer
-                        // (0, never NULL). Match emit.rs so a schema-driven decoder
-                        // reads NULL instead of raw zero bytes.
+                        // the null bit when the accumulator is_untouched() and not
+                        // empty_renders_zero(), since they skip NULL inputs).
+                        // COUNT/COUNT_NON_NULL always return an integer (0, never
+                        // NULL — empty_renders_zero()). Match emit.rs so a
+                        // schema-driven decoder reads NULL instead of raw zero bytes.
                         out_cols.push(ColumnDef::new(
                             m.output_name.clone(),
                             m.output_type,

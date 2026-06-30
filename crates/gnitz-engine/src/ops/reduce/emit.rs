@@ -4,20 +4,21 @@ use crate::schema::{ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
 
 use super::super::util::write_string_from_batch;
-use super::agg::{Accumulator, AggDescriptor, AggOp};
+use super::agg::{Accumulator, AggDescriptor};
 
 /// Emit one aggregate column: its value bits truncated to the column width when
-/// the accumulator holds a value, else its empty-render — NULL for SUM/MIN/MAX, a
-/// concrete `0` (null bit clear) for `SumZero` (its `0` identity, so a combine's
-/// all-NULL-input count column grounds to `0`, not NULL). COUNT-family
-/// accumulators are seeded present, so they take the value branch. Used by
+/// the accumulator holds a value, else its empty-render. An untouched accumulator
+/// renders a concrete `0` (null bit clear) for the zero-identity family — COUNT /
+/// COUNT_NON_NULL / SumZero (`empty_renders_zero`) — and NULL for SUM/MIN/MAX. So
+/// `COUNT(col)` over an all-NULL group renders `0`, not NULL. Used by
 /// `emit_reduce_row`.
 #[inline]
 fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, cs: usize, null_word: &mut u64) {
-    if acc.is_zero() {
-        // Untouched: zero bytes either way; only SUM/MIN/MAX flag the null bit.
-        // SumZero leaves it clear so its `0` identity renders as a concrete `0`.
-        if !acc.grounds_to_zero() {
+    if acc.is_untouched() {
+        // Never stepped: zero bytes either way. The zero-identity family (COUNT
+        // family / SumZero) leaves the null bit clear so it renders a concrete
+        // `0`; SUM/MIN/MAX flag NULL.
+        if !acc.empty_renders_zero() {
             *null_word |= 1u64 << out_pi;
         }
         output.fill_col_zero(out_pi, cs);
@@ -99,7 +100,7 @@ pub(super) fn emit_reduce_row(
 }
 
 /// Emit the synthetic **ground row** of a global (ungrouped) aggregate at PK
-/// `out_pk_bytes` (= `V₀`): COUNT-family columns at `0` (present), SUM/MIN/MAX at
+/// `out_pk_bytes` (= `V₀`): COUNT-family columns render `0`, SUM/MIN/MAX render
 /// NULL. This is the one row SQL scalar-aggregate semantics require over an empty
 /// or fully-retracted source (`COUNT(*)=0`, `SUM/MIN/MAX/AVG=NULL`); the
 /// post-reduce MAP turns a derived `(SUM=NULL, COUNT_NON_NULL=0)` into
@@ -137,19 +138,13 @@ pub(super) fn emit_global_ground(
         "global_ground output schema must have zero group-exemplar columns",
     );
 
-    // Fresh accumulators in the empty-group state. COUNT-family present at `0`
-    // (null bit clear → renders `0`); SUM/MIN/MAX left absent (`has_value` false →
-    // null bit set → renders NULL). SumZero is also absent here yet still renders
-    // `0` — `emit_agg_col`'s `grounds_to_zero` carries its `0` identity at render,
-    // so it needs no seed (one render path for SumZero, ground and normal alike).
-    // Forcing COUNT-family to `0` is correct independently of the separately-owned
-    // COUNT-family-renders-NULL emitter bug.
-    let mut accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, input_schema)).collect();
-    for (acc, d) in accs.iter_mut().zip(agg_descs) {
-        if matches!(d.agg_op, AggOp::Count | AggOp::CountNonNull) {
-            acc.seed_from_raw_bits(0);
-        }
-    }
+    // Fresh accumulators in the empty-group state — every one untouched
+    // (`has_value` false). `emit_agg_col` renders each by `empty_renders_zero`: the
+    // COUNT family and SumZero ground to a concrete `0` (null bit clear), SUM/MIN/MAX
+    // to NULL. No COUNT seed is needed — an untouched Count / CountNonNull already
+    // renders `0` (byte-identical to a `seed_from_raw_bits(0)` value), so the ground
+    // row shares the one render path with a normal row.
+    let accs: Vec<Accumulator> = agg_descs.iter().map(|d| Accumulator::new(d, input_schema)).collect();
 
     // No source row exists (the seed runs over an empty delta), and none is read:
     // a throwaway empty input batch satisfies `emit_reduce_row`'s signature, and

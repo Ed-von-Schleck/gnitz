@@ -622,8 +622,9 @@ pub fn op_reduce(
         // Emission: a group exists iff its net cardinality is positive. With a
         // COUNT signal (every grouped or global scalar planner reduce): read it —
         // correct for emptied groups (the folded companion nets to 0), new all-NULL
-        // groups (the count is positive, the value accumulators untouched → emit
-        // `(g, NULL, …)`), and surviving groups. Without one (the range-join
+        // groups (the count is positive, the value accumulators untouched →
+        // SUM/MIN/MAX render NULL while COUNT(col) renders `0`), and surviving
+        // groups. Without one (the range-join
         // threshold reduce, or a companion-less low-level circuit): fall back to
         // the any_nonzero touched-ness test.
         let should_emit = match cardinality_idx {
@@ -637,7 +638,7 @@ pub fn op_reduce(
                 );
                 accs[ci].count_value() > 0
             }
-            None => accs.iter().any(|a| !a.is_zero()),
+            None => accs.iter().any(|a| !a.is_untouched()),
         };
         if should_emit {
             emit_reduce_row(
