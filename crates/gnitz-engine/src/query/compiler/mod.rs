@@ -926,10 +926,12 @@ mod tests {
         assert_eq!(agg_output_type(AggOp::Min, TypeCode::U64), type_code::U64);
         assert_eq!(agg_output_type(AggOp::Max, TypeCode::U64), type_code::U64);
         assert_eq!(agg_output_type(AggOp::Sum, TypeCode::U64), type_code::I64);
-        // Non-fixed-int sources (STRING / 16-byte) keep the 8-byte I64 slot: the
-        // accumulator holds an 8-byte compare key, not a value of the source
-        // type. SQL rejects these for MIN/MAX, but the low-level circuit API
-        // allows MAX(STRING), so the I64 fallback must hold.
+        // Non-fixed-int sources (STRING / 16-byte) fall to the I64 arm as a
+        // total-function default. MIN/MAX over them is rejected at compile (the
+        // SQL binder, and emit_reduce's order-encodability guard — see
+        // test_build_plan_min_max_over_non_encodable_rejected), so this result only
+        // types a discarded schema and never reaches execution; agg_output_type
+        // stays total, hence these asserts still hold.
         assert_eq!(agg_output_type(AggOp::Max, TypeCode::String), type_code::I64);
         assert_eq!(agg_output_type(AggOp::Min, TypeCode::U128), type_code::I64);
     }
@@ -1217,6 +1219,76 @@ mod tests {
         assert!(
             result.is_none(),
             "build_plan must return None when register count exceeds u16::MAX"
+        );
+    }
+
+    #[test]
+    fn test_build_plan_min_max_over_non_encodable_rejected() {
+        // emit_reduce's order-encodability guard must fail the compile (build_plan →
+        // None) for a MIN/MAX whose aggregate column is not order-encodable (STRING /
+        // 16-byte), rather than let the reduce reach encode_ordered's unreachable arm
+        // and panic a worker at execution. The SQL binder rejects this upstream
+        // (gnitz-sql); this covers the low-level CircuitBuilder path that bypasses it.
+        //
+        // Discriminating by construction: the ONLY difference between the two builds
+        // is the aggregate column's type. The order-encodable I64 agg compiles (Some),
+        // proving the circuit shape and view_dir are otherwise valid, so the STRING
+        // agg's None is attributable solely to the guard.
+        use gnitz_wire::{AggFunc, AggKind, OpNode};
+        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+
+        let compiles = |agg_tc: u8, tag: &str| -> bool {
+            let view_dir = format!("{base}/minmax_guard_{tag}_{}", std::process::id());
+            let _ = std::fs::remove_dir_all(&view_dir);
+            std::fs::create_dir_all(&view_dir).unwrap();
+            // col 0: U64 PK + group key; col 1: the MAX aggregate column.
+            let in_schema = SchemaDescriptor::new(
+                &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(agg_tc, 0)],
+                &[0],
+            );
+            let mut nodes = HashMap::new();
+            nodes.insert(0, OpNode::ScanDelta(10));
+            nodes.insert(
+                1,
+                OpNode::Reduce {
+                    group_cols: vec![0],
+                    agg: AggKind::Specs(vec![(AggFunc::Max, 1)]),
+                    global_ground: false,
+                },
+            );
+            nodes.insert(2, OpNode::IntegrateSink);
+            let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+            let loaded = make_loaded(nodes, edges);
+            let ext = [ExternalTable {
+                table_id: 10,
+                schema: in_schema,
+            }];
+            let ordered = loaded.ordered.clone();
+            let some = build_plan(
+                &loaded,
+                &empty_rw(),
+                &ordered,
+                &ext,
+                &view_dir,
+                0,
+                1,
+                Some(2),
+                &[],
+                vec![],
+            )
+            .is_some();
+            let _ = std::fs::remove_dir_all(&view_dir);
+            some
+        };
+
+        assert!(
+            compiles(type_code::I64, "i64"),
+            "control: MAX over an order-encodable I64 column must compile"
+        );
+        assert!(
+            !compiles(type_code::STRING, "str"),
+            "MAX over a non-order-encodable STRING column must fail the compile (engine guard)"
         );
     }
 

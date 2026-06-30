@@ -1196,22 +1196,25 @@ def _make_grp_str_table(client, sn):
 
 
 def _make_reduce_str_view(client, sn, tid, agg_func_id, vname=None):
-    """Reduce view: group_by=[1](grp), agg=[2](val STRING). Returns (vid, vname).
+    """Reduce view: GROUP BY [2](val STRING), agg over [1](grp I64). Returns (vid, vname).
 
-    The output agg column is I64 (not STRING): the accumulator stores only the
-    first 8 bytes of the German string as a comparison key (output_column_type()
-    returns TYPE_I64 for MIN/MAX regardless of the input column type).
+    Grouping by the STRING column is not AVI-group-key-eligible (German strings
+    don't byte-form-encode as a PK prefix), so MIN/MAX takes the single-scan trace
+    fallback — the path under test. The aggregate is the order-encodable I64
+    column; MIN/MAX over a STRING column is unsupported (rejected when the reduce
+    circuit is compiled), so the fallback is reached here via a STRING *group key*,
+    not a STRING aggregate.
     """
     if vname is None:
         vname = "v_" + _uid()
     cb = client.circuit_builder(source_table_id=tid)
     inp = cb.input_delta()
-    red = cb.reduce(inp, group_by_cols=[1], agg_func_id=agg_func_id, agg_col_idx=2)
+    red = cb.reduce(inp, group_by_cols=[2], agg_func_id=agg_func_id, agg_col_idx=1)
     cb.sink(red)
     circuit = cb.build()
     out_cols = [
         gnitz.ColumnDef("pk", gnitz.TypeCode.U128, primary_key=True),
-        gnitz.ColumnDef("grp", gnitz.TypeCode.I64),
+        gnitz.ColumnDef("val", gnitz.TypeCode.STRING),
         gnitz.ColumnDef("agg", gnitz.TypeCode.I64, is_nullable=True),
     ]
     vid = client.create_view_with_circuit(sn, vname, circuit, out_cols)
@@ -1227,24 +1230,27 @@ def _push_str_grp(client, tid, schema, rows, weight=1):
 
 
 def _scan_str_reduce(client, vid):
-    """Scan reduce view; return {grp_val: agg_str} for positive-weight rows."""
+    """Scan reduce view; return {group_str: max_int} for positive-weight rows."""
     return {row[1]: row[2] for row in client.scan(vid) if row.weight > 0}
 
 
 class TestReduceStringFallbackPath:
 
-    def test_max_string_fallback_same_pk_multiple_payloads(self, client):
-        """MAX on a STRING column is not value-index-eligible (German strings do
-        not order-encode), so it takes the single-scan trace fallback — which must
-        collect ALL (PK, payload) entries at a shared PK, not just the first.
+    def test_max_fallback_same_pk_multiple_payloads(self, client):
+        """A MIN/MAX whose GROUP BY key is a STRING column is not
+        AVI-group-key-eligible, so it takes the single-scan trace fallback — which
+        must collect ALL (PK, payload) entries at a shared PK, not just the first.
+        (The aggregate is the order-encodable I64 column; MAX over a STRING column
+        is unsupported and rejected at compile time, so the fallback is exercised
+        via a STRING group key, not a STRING aggregate.)
 
-        unique_pk=False allows (PK=1, grp=1, val="apple") and
-        (PK=1, grp=1, val="zebra") to coexist.  On tick 2 we retract
-        "apple" from PK=1.  The fallback scans the trace once and routes every
-        same-PK row to its group, so both "apple" and "zebra" are collected;
-        replay = {apple+1, zebra+1, apple−1} → {zebra+1} → MAX unchanged. Missing
-        "zebra" would leave replay → empty → MAX wrongly falling to "mango"
-        (from PK=2).
+        unique_pk=False allows (PK=1, grp=10, val="x") and
+        (PK=1, grp=20, val="x") to coexist.  On tick 2 we retract grp=10 from
+        PK=1.  The fallback scans the trace once and routes every same-PK row to
+        its group, so both grp=10 and grp=20 are collected;
+        replay = {10+1, 20+1, 10−1} → {20+1} → MAX(val="x") stays 20. Dropping the
+        second same-PK payload would leave replay → empty → MAX wrongly falling to
+        5 (from PK=2).
         """
         sn = "s" + _uid()
         client.create_schema(sn)
@@ -1252,22 +1258,20 @@ class TestReduceStringFallbackPath:
             tid, schema, tname = _make_grp_str_table(client, sn)
             vid, vname = _make_reduce_str_view(client, sn, tid, agg_func_id=4)  # MAX
 
-            # Tick 1: push apple and zebra at PK=1, mango at PK=2.
-            # The output agg is the I64 compare key of whichever string wins MAX.
+            # Tick 1: two rows at PK=1 in group "x" (grp=10, grp=20), one at PK=2.
             _push_str_grp(client, tid, schema,
-                          [(1, 1, "apple"), (1, 1, "zebra"), (2, 1, "mango")])
+                          [(1, 10, "x"), (1, 20, "x"), (2, 5, "x")])
             r1 = _scan_str_reduce(client, vid)
-            assert 1 in r1, "group 1 must have an aggregate after tick 1"
+            assert r1.get("x") == 20, "MAX(grp) over group 'x' must be 20 after tick 1"
 
-            # Tick 2: retract "apple" from PK=1.
-            # The fallback scan must collect both apple and zebra from trace_in at
-            # PK=1, then subtract apple (from delta), leaving zebra as the new MAX.
-            # The MAX compare key must NOT change vs. tick 1.
-            _push_str_grp(client, tid, schema, [(1, 1, "apple")], weight=-1)
+            # Tick 2: retract grp=10 from PK=1. The fallback scan must collect both
+            # grp=10 and grp=20 from trace_in at PK=1, then subtract grp=10 (from
+            # delta), leaving grp=20 as the MAX. The MAX must NOT change vs. tick 1.
+            _push_str_grp(client, tid, schema, [(1, 10, "x")], weight=-1)
             r2 = _scan_str_reduce(client, vid)
             assert r1 == r2, (
-                "MAX must be unchanged after retracting apple: "
-                "zebra still present at PK=1 but a same-PK collection bug drops it from replay"
+                "MAX must be unchanged after retracting grp=10: grp=20 "
+                "still present at PK=1 but a same-PK collection bug drops it from replay"
             )
         finally:
             try:

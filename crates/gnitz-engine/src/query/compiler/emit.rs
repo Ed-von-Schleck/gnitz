@@ -728,7 +728,22 @@ pub(super) fn emit_reduce(
         .iter()
         .filter(|a| a.agg_op.uses_value_index())
         .all(|a| agg_value_idx_eligible(a.col_type_code));
-    let use_avi = has_value_indexed && all_value_indexed_eligible && avi_group_key_eligible(&in_reg_schema, &gcols_u32);
+    // MIN/MAX require an order-encodable (≤8-byte int/float) aggregate column:
+    // both the accumulator and the AVI key on `encode_ordered`, which has no
+    // monotone key for a STRING / U128 / UUID / BLOB source. Fail the compile here
+    // (→ `build_plan` returns `None`, so the view compiles to nothing and produces
+    // no output) rather than letting the trace-scan fallback reach
+    // `encode_ordered`'s unreachable arm and panic the worker at execution. The
+    // SQL binder already rejects MIN/MAX over these types with a clear error; this
+    // is the defensive guard for the low-level CircuitBuilder path that bypasses
+    // the binder.
+    if has_value_indexed && !all_value_indexed_eligible {
+        state.emit_failed = true;
+        return;
+    }
+    // Past the guard above, every value-indexed aggregate is order-encodable, so
+    // AVI use turns only on the group key being byte-form-eligible.
+    let use_avi = has_value_indexed && avi_group_key_eligible(&in_reg_schema, &gcols_u32);
 
     let mut tr_in_reg_id: i32 = -1;
     let mut tr_in_table_ptr: *mut Table = std::ptr::null_mut();

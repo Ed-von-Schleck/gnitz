@@ -4934,13 +4934,7 @@ fn avi_full_path_min_max_across_high_byte() {
             _pad: [0; 2],
         };
         let mut acc = Accumulator::new(&agg_desc, &in_schema);
-        let ok = apply_agg_from_value_index(
-            ch.cursor_mut(),
-            &gk[..extractor.stride + 1],
-            for_max,
-            TypeCode::I64,
-            &mut acc,
-        );
+        let ok = apply_agg_from_value_index(ch.cursor_mut(), &gk[..extractor.stride + 1], for_max, &mut acc);
         assert!(ok, "AVI seek must find group g=5");
         acc.get_value_bits() as i64
     };

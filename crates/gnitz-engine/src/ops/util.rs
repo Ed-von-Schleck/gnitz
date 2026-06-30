@@ -227,6 +227,7 @@ pub(super) fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
 /// yields the maximum first. Width is ≤ 8 (F32 is 4); U128/UUID/String/Blob
 /// are excluded upstream by `agg_value_idx_eligible`, so the fallback arm is
 /// unreachable.
+#[inline]
 pub(super) fn encode_ordered(bytes: &[u8], col_type_code: u8, for_max: bool) -> u64 {
     let val = match col_type_code {
         type_code::F32 => ieee_order_bits_f32(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
@@ -249,6 +250,7 @@ pub(super) fn encode_ordered(bytes: &[u8], col_type_code: u8, for_max: bool) -> 
 /// Inverse of [`encode_ordered`]: recover the original value's raw little-endian
 /// bits (IEEE bits for floats, two's-complement for signed, the value itself for
 /// unsigned) from its order-preserving u64 key.
+#[inline]
 pub(super) fn decode_ordered(encoded: u64, col_type_code: TypeCode, for_max: bool) -> u64 {
     let e = if for_max { !encoded } else { encoded };
     match col_type_code {

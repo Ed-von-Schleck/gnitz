@@ -152,7 +152,13 @@ impl Accumulator {
     }
 
     pub(super) fn get_value_bits(&self) -> u64 {
-        self.acc as u64
+        // MIN/MAX hold the MIN-oriented order-preserving encoding; decode back to
+        // native value bits for emit. Linear aggregates store the value verbatim.
+        if self.agg_op.uses_value_index() {
+            super::super::util::decode_ordered(self.acc as u64, self.col_type_code, false)
+        } else {
+            self.acc as u64
+        }
     }
 
     pub(super) fn seed_from_raw_bits(&mut self, bits: u64) {
@@ -190,12 +196,14 @@ impl Accumulator {
 
         let tc = self.col_type_code;
         let cs = self.loc.size();
-        // SUM/MIN/MAX accumulate into an i64/u64 slot; the planner rejects
-        // U128/UUID/BLOB sources for these (decode_signed/decode_float mark them
-        // unreachable). STRING is also rejected by the planner, but decode_signed
-        // does handle it via an 8-byte prefix compare, so engine-level callers may
-        // still reach here with a 16-byte STRING slot — exempt it. Every other
-        // column addressed here is ≤ 8 bytes.
+        // SUM accumulates into an i64/u64 slot via decode_signed/decode_float;
+        // MIN/MAX order-encode via encode_ordered, which handles only the
+        // order-encodable ≤8-byte int/float types — a non-encodable MIN/MAX source
+        // (STRING, U128/UUID/BLOB) is rejected when the reduce circuit is compiled
+        // (`compiler::emit_reduce`) and never reaches here. STRING stays exempt from
+        // this assert for SUM: decode_signed handles a 16-byte STRING slot via an
+        // 8-byte prefix compare, so an engine-level SUM caller can reach here with
+        // one. Every other column addressed here is ≤ 8 bytes.
         debug_assert!(
             cs <= 8 || tc == TypeCode::String,
             "SUM/MIN/MAX over a >8-byte non-STRING column must be rejected by the planner",
@@ -229,43 +237,25 @@ impl Accumulator {
                     self.acc = self.acc.wrapping_add(val.wrapping_mul(weight));
                 }
             }
-            AggOp::Min => {
-                if is_f {
-                    let v = decode_float(bytes, tc);
-                    if first || v.total_cmp(&f64::from_bits(self.acc as u64)) == std::cmp::Ordering::Less {
-                        self.acc = f64::to_bits(v) as i64;
-                    }
+            // MIN/MAX hold the AVI's MIN-oriented order-preserving encoding
+            // (`encode_ordered`, `for_max=false`), so the extreme test is one
+            // unsigned `u64` compare — the U64-unsigned and float-total-order
+            // rules live solely in the codec, never duplicated here. The encoded
+            // extreme is decoded back to native bits at emit (`get_value_bits`).
+            // Only order-encodable types reach here: a non-encodable MIN/MAX
+            // source (STRING, U128/UUID/BLOB) is rejected when the reduce circuit
+            // is compiled (`compiler::emit_reduce`), never executed, so
+            // `encode_ordered`'s unreachable arm is genuinely unreachable.
+            AggOp::Min | AggOp::Max => {
+                let enc = super::super::util::encode_ordered(bytes, tc as u8, false);
+                let cur = self.acc as u64;
+                let replaces = if self.agg_op == AggOp::Max {
+                    enc > cur
                 } else {
-                    let v = decode_signed(bytes, tc);
-                    // U64 comparison must be unsigned: `decode_signed` returns the
-                    // bit pattern verbatim, so high-bit-set values look negative
-                    // under signed `<`.
-                    let replaces = if tc == TypeCode::U64 {
-                        (v as u64) < (self.acc as u64)
-                    } else {
-                        v < self.acc
-                    };
-                    if first || replaces {
-                        self.acc = v;
-                    }
-                }
-            }
-            AggOp::Max => {
-                if is_f {
-                    let v = decode_float(bytes, tc);
-                    if first || v.total_cmp(&f64::from_bits(self.acc as u64)) == std::cmp::Ordering::Greater {
-                        self.acc = f64::to_bits(v) as i64;
-                    }
-                } else {
-                    let v = decode_signed(bytes, tc);
-                    let replaces = if tc == TypeCode::U64 {
-                        (v as u64) > (self.acc as u64)
-                    } else {
-                        v > self.acc
-                    };
-                    if first || replaces {
-                        self.acc = v;
-                    }
+                    enc < cur
+                };
+                if first || replaces {
+                    self.acc = enc as i64;
                 }
             }
             // Count and CountNonNull return early above; Null is a no-op sentinel.
@@ -274,101 +264,31 @@ impl Accumulator {
         }
     }
 
-    /// Merge an already-accumulated value (from trace_out) into this accumulator.
-    /// For linear aggregates (COUNT, SUM): applies weight arithmetic.
-    /// For MIN/MAX with positive weight: delegates to combine().
-    /// For MIN/MAX with negative weight: no-op (cannot un-MIN/un-MAX).
-    pub(super) fn merge_accumulated(&mut self, value_bits: u64, weight: i64) {
-        let is_f = self.is_float();
+    /// Fold a stored linear aggregate value (read back from `trace_out`) into
+    /// this accumulator at weight +1 — the `new = old + Σdelta` seed on
+    /// `op_reduce`'s linear paths. Only ever reached for the linear COUNT/SUM
+    /// family: `fold_old_aggs` skips the non-linear MIN/MAX (whose extreme the
+    /// AVI owns and overwrites), so those arms are unreachable. COUNT must
+    /// integer-fold even over a float source column, so the COUNT-vs-SUM split is
+    /// load-bearing — it cannot collapse to a single `is_float` branch.
+    pub(super) fn merge_accumulated(&mut self, value_bits: u64) {
         match self.agg_op {
             AggOp::Count | AggOp::CountNonNull => {
-                let prev = value_bits as i64;
-                self.acc = self.acc.wrapping_add(prev.wrapping_mul(weight));
+                self.acc = self.acc.wrapping_add(value_bits as i64);
                 self.has_value = true;
             }
             AggOp::Sum | AggOp::SumZero => {
-                if is_f {
-                    let prev_f = f64::from_bits(value_bits);
-                    let w_f = weight as f64;
+                if self.is_float() {
                     let cur_f = f64::from_bits(self.acc as u64);
-                    self.acc = f64::to_bits(cur_f + prev_f * w_f) as i64;
+                    self.acc = f64::to_bits(cur_f + f64::from_bits(value_bits)) as i64;
                 } else {
-                    let prev = value_bits as i64;
-                    self.acc = self.acc.wrapping_add(prev.wrapping_mul(weight));
+                    self.acc = self.acc.wrapping_add(value_bits as i64);
                 }
                 self.has_value = true;
             }
-            AggOp::Min | AggOp::Max => {
-                if weight > 0 {
-                    self.combine(value_bits);
-                }
-                // Negative weight: algebraically unsound for MIN/MAX — skip.
+            AggOp::Min | AggOp::Max | AggOp::Null => {
+                unreachable!("fold_old_aggs folds only linear aggregates")
             }
-            AggOp::Null => {}
-        }
-    }
-
-    /// Combine a partial aggregate from another shard.
-    pub(super) fn combine(&mut self, other_bits: u64) {
-        let is_f = self.is_float();
-        match self.agg_op {
-            AggOp::Count | AggOp::CountNonNull => {
-                let prev = other_bits as i64;
-                self.acc = self.acc.wrapping_add(prev);
-                self.has_value = true;
-            }
-            AggOp::Sum | AggOp::SumZero => {
-                if is_f {
-                    let prev_f = f64::from_bits(other_bits);
-                    let cur_f = f64::from_bits(self.acc as u64);
-                    self.acc = f64::to_bits(cur_f + prev_f) as i64;
-                } else {
-                    let prev = other_bits as i64;
-                    self.acc = self.acc.wrapping_add(prev);
-                }
-                self.has_value = true;
-            }
-            AggOp::Min => {
-                let first = !self.has_value;
-                self.has_value = true;
-                if is_f {
-                    let other_f = f64::from_bits(other_bits);
-                    if first || other_f < f64::from_bits(self.acc as u64) {
-                        self.acc = f64::to_bits(other_f) as i64;
-                    }
-                } else {
-                    let other_v = other_bits as i64;
-                    let replaces = if self.col_type_code == TypeCode::U64 {
-                        (other_v as u64) < (self.acc as u64)
-                    } else {
-                        other_v < self.acc
-                    };
-                    if first || replaces {
-                        self.acc = other_v;
-                    }
-                }
-            }
-            AggOp::Max => {
-                let first = !self.has_value;
-                self.has_value = true;
-                if is_f {
-                    let other_f = f64::from_bits(other_bits);
-                    if first || other_f > f64::from_bits(self.acc as u64) {
-                        self.acc = f64::to_bits(other_f) as i64;
-                    }
-                } else {
-                    let other_v = other_bits as i64;
-                    let replaces = if self.col_type_code == TypeCode::U64 {
-                        (other_v as u64) > (self.acc as u64)
-                    } else {
-                        other_v > self.acc
-                    };
-                    if first || replaces {
-                        self.acc = other_v;
-                    }
-                }
-            }
-            AggOp::Null => {}
         }
     }
 }
@@ -466,7 +386,7 @@ pub(super) fn readback_agg_bits(bytes: &[u8], src_tc: TypeCode) -> u64 {
 /// extreme and `apply_agg_from_value_index` *overwrites* the accumulator after
 /// this fold (or resets it on an empty seek), so folding the old extreme here
 /// would be discarded regardless. The skip just avoids a wasted `trace_out`
-/// read + `combine()` per non-linear aggregate, and documents that the AVI —
+/// read + fold per non-linear aggregate, and documents that the AVI —
 /// never the fold — owns the non-linear value. The all-linear caller never
 /// skips (every accumulator is linear).
 pub(super) fn fold_old_aggs(
@@ -488,7 +408,7 @@ pub(super) fn fold_old_aggs(
         let ptr = cursor.col_ptr(cbase + k, cw);
         if !ptr.is_null() {
             let bytes = unsafe { std::slice::from_raw_parts(ptr, cw) };
-            acc.merge_accumulated(readback_agg_bits(bytes, agg_descs[k].col_type_code), 1);
+            acc.merge_accumulated(readback_agg_bits(bytes, agg_descs[k].col_type_code));
         }
     }
 }
@@ -513,8 +433,9 @@ pub(crate) fn is_single_col_natural_pk(schema: &SchemaDescriptor, group_cols: &[
 // AVI lookup
 // ---------------------------------------------------------------------------
 
-/// Seek the AVI cursor to a group via its full byte-form seek prefix and apply
-/// the decoded MIN/MAX to the accumulator.
+/// Seek the AVI cursor to a group via its full byte-form seek prefix and seed the
+/// accumulator with the group's MIN-oriented order-encoded extreme (decoded back
+/// to a native value later, at emit, in `get_value_bits`).
 ///
 /// `group_key` is the opaque seek prefix `group_cols ‖ ordinal` — the caller
 /// appends the one-byte per-aggregate ordinal so a single combined index can
@@ -527,7 +448,6 @@ pub(super) fn apply_agg_from_value_index(
     avi_cursor: &mut ReadCursor,
     group_key: &[u8],
     for_max: bool,
-    agg_col_type_code: TypeCode,
     acc: &mut Accumulator,
 ) -> bool {
     use super::super::util::AVI_AV_BYTES;
@@ -544,7 +464,10 @@ pub(super) fn apply_agg_from_value_index(
         );
         let av_start = group_key.len();
         let av = u64::from_be_bytes(k[av_start..av_start + AVI_AV_BYTES].try_into().unwrap());
-        acc.seed_from_raw_bits(super::super::util::decode_ordered(av, agg_col_type_code, for_max));
+        // The AVI stores `encode_ordered(v, for_max)`; the accumulator holds the
+        // MIN-oriented encoding, so undo the MAX inversion (no value decode — that
+        // happens once, at emit, in `get_value_bits`).
+        acc.seed_from_raw_bits(if for_max { !av } else { av });
         return true;
     }
     acc.reset();

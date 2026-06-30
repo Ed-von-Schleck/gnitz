@@ -363,10 +363,13 @@ pub(super) fn reindex_output_schema(
 /// trace read-back (`readback_agg_bits`) reconstructs the 8-byte accumulator
 /// from that width. The old U64 special case folds into this rule — the source
 /// type simply *is* `U64`. Any non-float, non-≤8-byte-integer source (STRING /
-/// 16-byte types) keeps the 8-byte `I64` slot, which for STRING holds the
-/// German-string compare key the accumulator computes; SQL rejects MIN/MAX on
-/// those upstream, but the low-level circuit API allows `MAX(STRING)`, so the
-/// fallback is load-bearing. SUM stays I64: it can overflow the source width.
+/// 16-byte types) falls to the `I64` arm, but only as a total-function default
+/// for the output schema this builds: a MIN/MAX over such a source is rejected at
+/// compile — by the SQL binder upstream, and by `emit_reduce`'s order-encodability
+/// guard on the low-level circuit API that bypasses the binder — so that schema is
+/// discarded (`build_plan` returns `None`) and the `I64` arm never reaches
+/// execution. The accumulator order-encodes via `encode_ordered`, which has no key
+/// for these types at all. SUM stays I64: it can overflow the source width.
 /// Mirrored by the SQL planner's `agg_result_type`.
 pub(super) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
     match agg_op {

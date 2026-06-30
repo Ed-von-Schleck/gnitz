@@ -556,13 +556,7 @@ pub fn op_reduce(
                     .enumerate()
                 {
                     gk[gstride] = j as u8;
-                    apply_agg_from_value_index(
-                        avi_c,
-                        &gk[..gstride + 1],
-                        d.agg_op == AggOp::Max,
-                        d.col_type_code,
-                        &mut accs[k],
-                    );
+                    apply_agg_from_value_index(avi_c, &gk[..gstride + 1], d.agg_op == AggOp::Max, &mut accs[k]);
                 }
             } else {
                 let replay = replay.as_mut().unwrap();
