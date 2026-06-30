@@ -92,6 +92,12 @@ pub(crate) fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram 
     eb.build(0) // result_reg unused — COPY_COL writes directly
 }
 
+/// A schema's column type codes in order — the `null_extend` argument naming the
+/// NULL columns to append for the non-preserved side of an outer-join null-fill.
+pub(crate) fn schema_type_codes(schema: &Schema) -> Vec<u64> {
+    schema.columns.iter().map(|c| c.type_code as u64).collect()
+}
+
 /// Validate one equijoin key pair and return the pair's common reindex output
 /// type `T`. Float keys are rejected outright (IEEE-754 -0.0/+0.0 compare
 /// byte-unequal and NaN has no canonical form). A German string (STRING/BLOB) may

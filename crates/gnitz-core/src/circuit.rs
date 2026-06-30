@@ -368,6 +368,20 @@ impl CircuitBuilder {
         nid
     }
 
+    /// The weight-exact Z-set difference `positive_part(minuend − subtrahend)` as
+    /// one node triple (`negate` → `union` → `positive_part`). Used by EXCEPT /
+    /// INTERSECT set-ops and by the LEFT/RIGHT/FULL outer-join null-fills
+    /// (`ν = positive_part(P − π_P(inner))`). Centralizes the operand-order rule:
+    /// the `minuend` rides the non-destructive `PORT_IN_B` operand because
+    /// `op_union` empties `PORT_IN_A`, and the minuend may be a shared node (e.g. a
+    /// null-fill's `a_all` aliasing the join's `reindex_a`); `negate(subtrahend)` is
+    /// freshly allocated, so `PORT_IN_A` is safe for it.
+    pub fn positive_diff(&mut self, minuend: NodeId, subtrahend: NodeId) -> NodeId {
+        let neg = self.negate(subtrahend);
+        let diff = self.union(neg, minuend);
+        self.positive_part(diff)
+    }
+
     fn binary_join(&mut self, op: OpNode, delta: NodeId, trace_node: NodeId) -> NodeId {
         let nid = self.alloc_node(op);
         self.connect(delta, nid, gnitz_wire::PORT_IN_A);

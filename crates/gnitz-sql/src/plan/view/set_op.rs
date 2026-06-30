@@ -262,14 +262,12 @@ pub(crate) fn execute_create_set_op_view(
         (SetOperator::Intersect, q @ (SetQuantifier::Distinct | SetQuantifier::None | SetQuantifier::All)) => {
             // INTERSECT = min(a, b) = a − positive_part(a − b). For DISTINCT the
             // {0,1} leaves make the output {0,1}, so no outer distinct is needed.
-            // `a` feeds BOTH unions, so it must sit on the non-destructive PORT_IN_B
-            // (second operand): the destructive-register invariant rejects two
-            // destructive (PORT_IN_A) consumers of one register. union is Z-set
-            // addition (commutative), so this reordering preserves the value.
+            // `a` feeds BOTH the `positive_diff` (as its minuend) and the final union,
+            // so both keep it on the non-destructive PORT_IN_B: `positive_diff` puts
+            // the minuend there, and the final `union(neg_pos, a)` does too. union is
+            // Z-set addition (commutative), so the reordering preserves the value.
             let (a, b) = set_op_leaves(&mut cb, q, left_node, right_node);
-            let neg_b = cb.negate(b);
-            let diff = cb.union(neg_b, a); // −b + a = a − b
-            let pos = cb.positive_part(diff); // max(0, a − b)
+            let pos = cb.positive_diff(a, b); // max(0, a − b)
             let neg_pos = cb.negate(pos);
             cb.union(neg_pos, a) // a − max(0, a−b) = min(a, b)
         }
@@ -278,9 +276,7 @@ pub(crate) fn execute_create_set_op_view(
             // the subtraction is load-bearing: positive_part on raw multiplicities
             // gives [cL>cR], wrong for cL=2,cR=1 (SQL needs the value absent).
             let (a, b) = set_op_leaves(&mut cb, q, left_node, right_node);
-            let neg_b = cb.negate(b);
-            let diff = cb.union(a, neg_b); // a − b
-            cb.positive_part(diff) // max(0, a − b)
+            cb.positive_diff(a, b) // max(0, a − b)
         }
 
         // BY NAME column alignment is a separate unimplemented feature; reject it

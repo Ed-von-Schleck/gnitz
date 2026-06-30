@@ -1881,3 +1881,285 @@ fn test_band_left_join_accepts_view_preserved_side() {
         "accepted bag-valued band LEFT view must register"
     );
 }
+
+// ── RIGHT / FULL OUTER JOIN ───────────────────────────────────────────────────
+//
+// RIGHT/FULL fall out of LEFT by symmetry: no new engine operator, opcode, or
+// inner-join term — only the mirror null-fill `ν_B = positive_part(B − π_B(inner))`
+// and FULL = `ν_A` + `ν_B`. The circuit-shape tests pin that RIGHT adds exactly one
+// `positive_part` + one `null_extend` over the inner skeleton (FULL: two each), with
+// the SAME two inner join terms (no extra join, trace, or exchange). Data correctness
+// lives in the Python E2E suite (`test_right_full_join.py`).
+
+/// Equi RIGHT and FULL register and project user columns after the `_join_pk`.
+#[test]
+fn test_equi_right_full_join_accepts() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE er_a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, av BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE er_b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)")
+        .unwrap();
+    assert!(
+        p.execute(
+            "CREATE VIEW er_r AS SELECT er_a.av AS av, er_b.bv AS bv FROM er_a RIGHT JOIN er_b ON er_a.fk = er_b.id"
+        )
+        .is_ok(),
+        "equi RIGHT JOIN should register"
+    );
+    assert!(
+        p.execute(
+            "CREATE VIEW er_f AS SELECT er_a.av AS av, er_b.bv AS bv FROM er_a FULL JOIN er_b ON er_a.fk = er_b.id"
+        )
+        .is_ok(),
+        "equi FULL JOIN should register"
+    );
+}
+
+/// Equi RIGHT/FULL null-fill, pinned at the circuit level against an INNER view over
+/// identical tables. RIGHT adds exactly one `positive_part` (`ν_B`) and one
+/// `null_extend`; FULL adds two of each (`ν_A` + `ν_B`). Both keep the inner's TWO
+/// `JOIN_DELTA_TRACE` terms (no extra join) and add no exchange.
+#[test]
+fn test_equi_right_full_circuit_shape() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE ers_a (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE ers_b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)")
+            .unwrap();
+        for (name, jt) in [("ers_i", "JOIN"), ("ers_r", "RIGHT JOIN"), ("ers_f", "FULL JOIN")] {
+            p.execute(&format!(
+                "CREATE VIEW {name} AS SELECT ers_b.bv AS bv \
+                 FROM ers_a {jt} ers_b ON ers_a.fk = ers_b.id"
+            ))
+            .unwrap();
+        }
+    }
+    let inner = client.resolve_table_or_view_id(&sn, "ers_i").unwrap().0;
+    let right = client.resolve_table_or_view_id(&sn, "ers_r").unwrap().0;
+    let full = client.resolve_table_or_view_id(&sn, "ers_f").unwrap().0;
+
+    let nodes = scan_circuit_nodes(&mut client);
+    let nodes = nodes.as_ref();
+    let n = |vid: u64, op: u64| opcode_node_count(nodes, vid, op);
+
+    // The two inner join terms (ΔA⋈I(B), ΔB⋈I(A)) are present and UNCHANGED — RIGHT/FULL
+    // reuse the inner output, adding no join.
+    for vid in [inner, right, full] {
+        assert_eq!(
+            n(vid, OPCODE_JOIN_DELTA_TRACE),
+            2,
+            "exactly the 2 inner equi join terms"
+        );
+        assert_eq!(n(vid, OPCODE_EXCHANGE_SHARD), 0, "equi join has no output exchange");
+        assert_eq!(n(vid, OPCODE_DISTINCT), 0, "weight-exact null-fill uses no distinct");
+    }
+
+    // INNER: no null-fill. RIGHT: ν_B (1 positive_part + 1 null_extend). FULL: ν_A + ν_B.
+    assert_eq!(n(inner, OPCODE_POSITIVE_PART), 0, "INNER has no positive_part");
+    assert_eq!(n(inner, OPCODE_NULL_EXTEND), 0, "INNER has no null_extend");
+    assert_eq!(n(right, OPCODE_POSITIVE_PART), 1, "RIGHT emits one ν_B positive_part");
+    assert_eq!(
+        n(right, OPCODE_NULL_EXTEND),
+        1,
+        "RIGHT null-extends the left columns once"
+    );
+    assert_eq!(n(full, OPCODE_POSITIVE_PART), 2, "FULL emits ν_A and ν_B");
+    assert_eq!(n(full, OPCODE_NULL_EXTEND), 2, "FULL null-extends both sides");
+}
+
+/// A band (`n_eq ≥ 1`) RIGHT and FULL register cleanly — partition-local on the
+/// eq-prefix scatter, riding the inner pairs' pair-PK output exchange.
+#[test]
+fn test_band_right_full_join_accepts() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE br_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE br_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)")
+        .unwrap();
+    assert!(
+        p.execute(
+            "CREATE VIEW br_r AS SELECT br_a.id AS aid, br_b.id AS bid \
+             FROM br_a RIGHT JOIN br_b ON br_a.k = br_b.k AND br_a.lo <= br_b.t"
+        )
+        .is_ok(),
+        "band RIGHT JOIN should register"
+    );
+    assert!(
+        p.execute(
+            "CREATE VIEW br_f AS SELECT br_a.id AS aid, br_b.id AS bid \
+             FROM br_a FULL JOIN br_b ON br_a.k = br_b.k AND br_a.lo <= br_b.t"
+        )
+        .is_ok(),
+        "band FULL JOIN should register"
+    );
+}
+
+/// Band RIGHT/FULL null-fill, pinned at the circuit level. Same shape as the equi
+/// case but over `JOIN_DELTA_TRACE_RANGE` terms, and riding the inner pairs' SINGLE
+/// pair-PK `ExchangeShard` (no extra exchange added by the null-fill).
+#[test]
+fn test_band_right_full_circuit_shape() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE brs_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE brs_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)")
+            .unwrap();
+        for (name, jt) in [("brs_i", "JOIN"), ("brs_r", "RIGHT JOIN"), ("brs_f", "FULL JOIN")] {
+            p.execute(&format!(
+                "CREATE VIEW {name} AS SELECT brs_a.id AS aid, brs_b.id AS bid \
+                 FROM brs_a {jt} brs_b ON brs_a.k = brs_b.k AND brs_a.lo <= brs_b.t"
+            ))
+            .unwrap();
+        }
+    }
+    let inner = client.resolve_table_or_view_id(&sn, "brs_i").unwrap().0;
+    let right = client.resolve_table_or_view_id(&sn, "brs_r").unwrap().0;
+    let full = client.resolve_table_or_view_id(&sn, "brs_f").unwrap().0;
+
+    let nodes = scan_circuit_nodes(&mut client);
+    let nodes = nodes.as_ref();
+    let n = |vid: u64, op: u64| opcode_node_count(nodes, vid, op);
+
+    // The two inner range terms are present and unchanged; exactly one pair-PK exchange
+    // is shared by inner pairs and null-fills.
+    for vid in [inner, right, full] {
+        assert_eq!(
+            n(vid, OPCODE_JOIN_DELTA_TRACE_RANGE),
+            2,
+            "exactly the 2 inner range terms"
+        );
+        assert_eq!(n(vid, OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
+        assert_eq!(
+            n(vid, OPCODE_EXCHANGE_SHARD),
+            1,
+            "the single shared pair-PK output exchange"
+        );
+        assert_eq!(n(vid, OPCODE_DISTINCT), 0, "weight-exact null-fill uses no distinct");
+        assert_eq!(n(vid, OPCODE_PARTITION_FILTER), 0, "band carries no PartitionFilter");
+    }
+
+    assert_eq!(n(inner, OPCODE_POSITIVE_PART), 0, "INNER band has no positive_part");
+    assert_eq!(n(inner, OPCODE_NULL_EXTEND), 0, "INNER band has no null_extend");
+    assert_eq!(
+        n(right, OPCODE_POSITIVE_PART),
+        1,
+        "band RIGHT emits one ν_B positive_part"
+    );
+    assert_eq!(
+        n(right, OPCODE_NULL_EXTEND),
+        1,
+        "band RIGHT null-extends the left columns once"
+    );
+    assert_eq!(n(full, OPCODE_POSITIVE_PART), 2, "band FULL emits ν_A and ν_B");
+    assert_eq!(n(full, OPCODE_NULL_EXTEND), 2, "band FULL null-extends both sides");
+}
+
+/// Pure-range (`n_eq == 0`, a sole inequality with no equi conjunct) RIGHT and FULL
+/// are rejected with a clean `Unsupported` — their mirror null-fill has no `π(inner)`
+/// witness. LEFT pure-range stays supported.
+#[test]
+fn test_pure_range_right_full_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE prr_a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE prr_b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)")
+            .unwrap();
+        for (name, jt) in [("prr_r", "RIGHT"), ("prr_f", "FULL")] {
+            let err = p
+                .execute(&format!(
+                    "CREATE VIEW {name} AS SELECT prr_a.id AS aid, prr_b.id AS bid \
+                     FROM prr_a {jt} JOIN prr_b ON prr_a.x < prr_b.y"
+                ))
+                .unwrap_err();
+            match err {
+                GnitzSqlError::Unsupported(s) => {
+                    assert!(s.contains("pure-range RIGHT/FULL"), "got: {s}")
+                }
+                e => panic!("expected Unsupported, got {e:?}"),
+            }
+        }
+        // LEFT pure-range over the same tables still registers.
+        assert!(
+            p.execute(
+                "CREATE VIEW prr_l AS SELECT prr_a.id AS aid, prr_b.id AS bid \
+                 FROM prr_a LEFT JOIN prr_b ON prr_a.x < prr_b.y"
+            )
+            .is_ok(),
+            "pure-range LEFT is unaffected"
+        );
+    }
+    for name in ["prr_r", "prr_f"] {
+        assert!(
+            client.resolve_table_or_view_id(&sn, name).is_err(),
+            "no pure-range {name} view should register"
+        );
+    }
+    assert!(
+        client.resolve_table_or_view_id(&sn, "prr_l").is_ok(),
+        "pure-range LEFT view registered"
+    );
+}
+
+/// A 16-byte pure-range FULL gets the pure-range-unsupported message, NOT the LEFT
+/// ≤8-byte-range-column message: `Full` satisfies both `preserves_right()` (n_eq == 0)
+/// and `preserves_left()` (n_eq == 0), and the RIGHT/FULL rejection MUST run first.
+#[test]
+fn test_pure_range_full_wide_gets_purerange_message() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE prw_a (id BIGINT NOT NULL PRIMARY KEY, x DECIMAL(38,0) NOT NULL)")
+        .unwrap();
+    p.execute("CREATE TABLE prw_b (id BIGINT NOT NULL PRIMARY KEY, y DECIMAL(38,0) NOT NULL)")
+        .unwrap();
+    let err = p
+        .execute(
+            "CREATE VIEW prw_f AS SELECT prw_a.id AS aid, prw_b.id AS bid \
+             FROM prw_a FULL JOIN prw_b ON prw_a.x < prw_b.y",
+        )
+        .unwrap_err();
+    match err {
+        GnitzSqlError::Unsupported(s) => {
+            assert!(
+                s.contains("pure-range RIGHT/FULL"),
+                "wrong message (ordering bug?): {s}"
+            );
+            assert!(
+                !s.contains("16-byte accumulator"),
+                "must not be the LEFT 8-byte-gate message: {s}"
+            );
+        }
+        e => panic!("expected Unsupported, got {e:?}"),
+    }
+}
