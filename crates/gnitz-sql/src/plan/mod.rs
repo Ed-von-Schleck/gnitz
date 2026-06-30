@@ -4,7 +4,7 @@
 //! `dml`.
 
 mod ddl;
-mod validate;
+pub(crate) mod validate;
 mod view;
 
 pub(crate) use ddl::{execute_create_index, execute_create_table, execute_drop};

@@ -12,7 +12,7 @@ use crate::plan::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, Schema, TypeCode};
-use sqlparser::ast::{Distinct, SelectItem, SetExpr, SetOperator, SetQuantifier};
+use sqlparser::ast::{SelectItem, SetExpr, SetOperator, SetQuantifier};
 
 fn compile_set_op_side(
     client: &mut GnitzClient,
@@ -21,15 +21,19 @@ fn compile_set_op_side(
     cb: &mut CircuitBuilder,
     branch_id: u8,
     context: &str,
+    distinct_honored: bool,
 ) -> Result<(gnitz_core::NodeId, Vec<ColumnDef>, u64), GnitzSqlError> {
-    // Honor only FROM, WHERE, and the projection here. The DISTINCT-view caller dedups
-    // plain DISTINCT after this returns; the set-op caller rejects a plain branch DISTINCT
-    // before calling in. Reject every other clause so none is silently dropped (a wrong result).
+    // Honor FROM, WHERE, and the projection always; plain DISTINCT only when
+    // `distinct_honored` — i.e. the DISTINCT-view caller, which dedups after this
+    // returns. Set-op branches pass `false`: a per-branch DISTINCT is not
+    // deduplicated and would leak duplicates under UNION ALL. Reject every other
+    // clause so none is silently dropped (a wrong result).
     reject_unhonored_select_clauses(
         select,
         HonoredClauses {
             where_filter: true,
             grouping: false,
+            distinct: distinct_honored,
         },
         context,
     )?;
@@ -181,19 +185,6 @@ pub(crate) fn execute_create_set_op_view(
         }
     };
 
-    // The funnel (compile_set_op_side) honors plain DISTINCT only for the DISTINCT-view caller,
-    // which dedups after it. A set-op branch is not deduplicated per branch, so a branch DISTINCT
-    // would be silently dropped — under UNION ALL that leaks duplicates. The funnel rejects
-    // DISTINCT ON for both callers; this covers plain branch DISTINCT, the one clause whose
-    // support differs by caller.
-    for (branch, side) in [(left_select, "left"), (right_select, "right")] {
-        if matches!(&branch.distinct, Some(Distinct::Distinct)) {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "set operation: DISTINCT on the {side} branch is not supported"
-            )));
-        }
-    }
-
     let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, 0);
 
@@ -204,9 +195,16 @@ pub(crate) fn execute_create_set_op_view(
     let right_branch_id = matches!((op, set_quantifier), (SetOperator::Union, SetQuantifier::All)) as u8;
 
     let (left_node, left_cols, left_tid) =
-        compile_set_op_side(client, left_select, binder, &mut cb, 0, "set operation")?;
-    let (right_node, right_cols, right_tid) =
-        compile_set_op_side(client, right_select, binder, &mut cb, right_branch_id, "set operation")?;
+        compile_set_op_side(client, left_select, binder, &mut cb, 0, "set operation", false)?;
+    let (right_node, right_cols, right_tid) = compile_set_op_side(
+        client,
+        right_select,
+        binder,
+        &mut cb,
+        right_branch_id,
+        "set operation",
+        false,
+    )?;
 
     // INTERSECT/EXCEPT build their two distinct-ed leaves on the same content-hash
     // PK, then combine with union/negate/positive_part. When both branches resolve
@@ -343,7 +341,7 @@ pub(crate) fn execute_create_distinct_view(
     // under the "SELECT DISTINCT" error context. `distinct` then dedups on that
     // hash-of-projection PK; keying by the source PK (unique) would make it a
     // no-op and leak the unprojected columns.
-    let (sharded, proj_cols, _) = compile_set_op_side(client, select, binder, &mut cb, 0, "SELECT DISTINCT")?;
+    let (sharded, proj_cols, _) = compile_set_op_side(client, select, binder, &mut cb, 0, "SELECT DISTINCT", true)?;
     let distinct_node = cb.distinct(sharded);
 
     cb.sink(distinct_node);

@@ -4,7 +4,7 @@
 //! there is no predicate full-scan fallback — a WHERE no index can serve is a
 //! clean error, not a table scan.
 
-use crate::ast_util::{extract_table_factor_name, group_by_is_present};
+use crate::ast_util::extract_table_factor_name;
 use crate::bind::{bind_single_table, Binder};
 use crate::dml::plan::{
     collect_index_range_candidates, collect_index_seek_candidates, extract_limit, try_extract_pk_seek_residual,
@@ -12,9 +12,12 @@ use crate::dml::plan::{
 use crate::error::GnitzSqlError;
 use crate::exec::batch::{apply_limit, apply_projection};
 use crate::exec::residual::residual_filtered;
+use crate::plan::validate::{
+    reject_unhonored_query_clauses, reject_unhonored_select_clauses, HonoredClauses, HonoredQueryClauses,
+};
 use crate::SqlResult;
 use gnitz_core::{ClientError, GnitzClient};
-use sqlparser::ast::{Distinct, LimitClause, Query, SetExpr};
+use sqlparser::ast::{LimitClause, Query, SetExpr};
 use std::sync::Arc;
 
 pub(crate) fn execute_select(
@@ -23,9 +26,18 @@ pub(crate) fn execute_select(
     query: &Query,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    if query.order_by.is_some() {
-        return Err(GnitzSqlError::Unsupported("ORDER BY not supported".to_string()));
-    }
+    // Direct SELECT honors a plain `LIMIT n` (applied client-side below) and nothing else on the
+    // `Query` envelope. `with: false` closes the silent `WITH` drop (a shadowing CTE resolved the
+    // wrong table); `limit: true` leaves `limit_clause` to the OFFSET / `LIMIT … BY` handling
+    // further down. ORDER BY, FETCH, FOR UPDATE/SHARE, SETTINGS, FORMAT are all rejected here.
+    reject_unhonored_query_clauses(
+        query,
+        HonoredQueryClauses {
+            with: false,
+            limit: true,
+        },
+        "direct SELECT",
+    )?;
     let limit = extract_limit(query);
 
     let select = match query.body.as_ref() {
@@ -37,45 +49,25 @@ pub(crate) fn execute_select(
         }
     };
 
-    // Direct SELECT is a thin seek/scan plus stateless client-side project/limit, with
-    // no operator for set/group semantics or row-offset. These clauses are silently
-    // dropped today — each a silent wrong result. Reject them, as ORDER BY and a
-    // non-indexed WHERE already are.
+    // Direct SELECT is a thin seek/scan plus stateless client-side project/limit. It
+    // honors WHERE (the access-path ladder below) and the projection; every other
+    // Select-body clause has no operator here and would be silently dropped — a wrong
+    // result. Route the whole tail through the shared guard, as ORDER BY and a
+    // non-indexed WHERE already error. DISTINCT, GROUP BY, and HAVING belong in a
+    // CREATE VIEW (real incremental distinct / reduce).
+    reject_unhonored_select_clauses(
+        select,
+        HonoredClauses {
+            where_filter: true,
+            grouping: false,
+            distinct: false,
+        },
+        "direct SELECT",
+    )?;
 
-    // DISTINCT: a dropped dedup returns duplicates whenever the projection is not a
-    // unique key (a strict subset of a compound PK, or a column subset of a view).
-    // Plain DISTINCT belongs in a CREATE VIEW (real incremental distinct). DISTINCT ON
-    // needs an ORDER BY this path forbids and no CREATE VIEW accepts it, so it is
-    // rejected outright with no redirect.
-    match &select.distinct {
-        Some(Distinct::On(_)) => {
-            return Err(GnitzSqlError::Unsupported(
-                "DISTINCT ON is not supported in direct SELECT".to_string(),
-            ))
-        }
-        Some(Distinct::Distinct) => {
-            return Err(GnitzSqlError::Unsupported(
-                "DISTINCT is not supported in direct SELECT; use a CREATE VIEW".to_string(),
-            ))
-        }
-        None => {}
-    }
-
-    // GROUP BY / HAVING: no reduce here; grouped aggregation and per-group filtering
-    // belong in a CREATE VIEW.
-    if group_by_is_present(&select.group_by) {
-        return Err(GnitzSqlError::Unsupported(
-            "GROUP BY is not supported in direct SELECT; use a CREATE VIEW".to_string(),
-        ));
-    }
-    if select.having.is_some() {
-        return Err(GnitzSqlError::Unsupported(
-            "HAVING is not supported in direct SELECT; use a CREATE VIEW".to_string(),
-        ));
-    }
-
-    // OFFSET / LIMIT…BY / FETCH: silently discarded (the `..` in extract_limit;
-    // query.fetch is never read). Meaningless without an ORDER BY this path forbids.
+    // The envelope guard honors `limit_clause` (plain `LIMIT n`, applied client-side below); its
+    // OFFSET and `LIMIT … BY` sub-forms have their own messages here, both meaningless without an
+    // ORDER BY this path forbids.
     match &query.limit_clause {
         Some(LimitClause::OffsetCommaLimit { .. }) | Some(LimitClause::LimitOffset { offset: Some(_), .. }) => {
             return Err(GnitzSqlError::Unsupported(
@@ -88,11 +80,6 @@ pub(crate) fn execute_select(
             ))
         }
         _ => {}
-    }
-    if query.fetch.is_some() {
-        return Err(GnitzSqlError::Unsupported(
-            "FETCH is not supported in direct SELECT".to_string(),
-        ));
     }
 
     // Exactly one FROM table, no joins

@@ -411,10 +411,15 @@ class TestSetOps:
             # --- FETCH dropped at the view front door (Query-level row-limit) ---
             rejects("CREATE VIEW v AS SELECT a FROM t FETCH FIRST 5 ROWS ONLY", "FETCH is not supported")
 
-            # --- plain branch DISTINCT (caller check; would leak dups under UNION ALL) ---
+            # --- Query-envelope tail clauses GenericDialect parses and the view front door dropped ---
+            rejects("CREATE VIEW v AS SELECT pk FROM t FOR UPDATE", "FOR UPDATE/SHARE is not supported")
+            rejects("CREATE VIEW v AS SELECT pk FROM t SETTINGS max_threads = 1", "SETTINGS is not supported")
+            rejects("CREATE VIEW v AS SELECT pk FROM t FORMAT JSON", "FORMAT is not supported")
+
+            # --- plain branch DISTINCT (shared guard; would leak dups under UNION ALL) ---
             rejects(
                 "CREATE VIEW v AS SELECT DISTINCT a FROM t UNION ALL SELECT b FROM t",
-                "DISTINCT on the .* branch is not supported",
+                "DISTINCT is not supported",
             )
 
             # --- every honored shape still compiles (positive controls) ---

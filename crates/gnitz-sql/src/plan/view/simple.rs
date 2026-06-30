@@ -26,6 +26,7 @@ pub(crate) fn execute_create_simple_view(
         HonoredClauses {
             where_filter: true,
             grouping: false,
+            distinct: false,
         },
         "CREATE VIEW",
     )?;

@@ -232,6 +232,34 @@ class TestSqlSelect:
             # FETCH: silently dropped today.
             with pytest.raises(gnitz.GnitzError, match="FETCH is not supported"):
                 client.execute_sql("SELECT * FROM t FETCH FIRST 2 ROWS ONLY", schema_name=sn)
+            # PREWHERE: filter silently dropped today → whole table scanned.
+            with pytest.raises(gnitz.GnitzError, match="PREWHERE is not supported"):
+                client.execute_sql("SELECT pk FROM t PREWHERE val > 5", schema_name=sn)
+            # TOP: row-limit silently dropped today → every row returned.
+            with pytest.raises(gnitz.GnitzError, match="TOP is not supported"):
+                client.execute_sql("SELECT TOP 2 pk FROM t", schema_name=sn)
+            # An inert exotic clause is rejected uniformly, not silently accepted.
+            with pytest.raises(gnitz.GnitzError, match="QUALIFY is not supported"):
+                client.execute_sql(
+                    "SELECT pk FROM t QUALIFY ROW_NUMBER() OVER (ORDER BY pk) = 1", schema_name=sn
+                )
+            # WITH on a direct SELECT was silently ignored; a shadowing CTE returned the wrong table.
+            with pytest.raises(gnitz.GnitzError, match="WITH .CTE. is not supported"):
+                client.execute_sql("WITH c AS (SELECT * FROM t) SELECT pk FROM c", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="WITH .CTE. is not supported"):
+                client.execute_sql("WITH t AS (SELECT * FROM t) SELECT pk FROM t", schema_name=sn)
+            # Envelope tail clauses GenericDialect parses and used to drop.
+            with pytest.raises(gnitz.GnitzError, match="FOR UPDATE/SHARE is not supported"):
+                client.execute_sql("SELECT pk FROM t FOR UPDATE", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="SETTINGS is not supported"):
+                client.execute_sql("SELECT pk FROM t SETTINGS max_threads = 1", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="FORMAT is not supported"):
+                client.execute_sql("SELECT pk FROM t FORMAT JSON", schema_name=sn)
+            # INSERT source Query: the whole envelope was silently dropped, inserting every VALUES row.
+            with pytest.raises(gnitz.GnitzError, match="LIMIT/OFFSET is not supported"):
+                client.execute_sql("INSERT INTO t VALUES (100, 200) LIMIT 1", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="FOR UPDATE/SHARE is not supported"):
+                client.execute_sql("INSERT INTO t VALUES (101, 201) FOR UPDATE", schema_name=sn)
             # Ordinary direct SELECT and plain LIMIT are unaffected.
             res = client.execute_sql("SELECT pk FROM t", schema_name=sn)
             assert res[0]["type"] == "Rows"
@@ -239,6 +267,78 @@ class TestSqlSelect:
             res2 = client.execute_sql("SELECT * FROM t LIMIT 2", schema_name=sn)
             assert len(res2[0]["rows"]) == 2
             client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_dml_unsupported_clauses_rejected(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup_with_rows(client, sn)
+            with pytest.raises(gnitz.GnitzError, match="INSERT: RETURNING is not supported"):
+                client.execute_sql("INSERT INTO t VALUES (6, 60) RETURNING pk", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="UPDATE: RETURNING is not supported"):
+                client.execute_sql("UPDATE t SET val = 9 WHERE pk = 1 RETURNING pk", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="DELETE: RETURNING is not supported"):
+                client.execute_sql("DELETE FROM t WHERE pk = 1 RETURNING pk", schema_name=sn)
+            # ORDER BY is rejected before LIMIT, so each is its own statement.
+            with pytest.raises(gnitz.GnitzError, match="DELETE: LIMIT is not supported"):
+                client.execute_sql("DELETE FROM t LIMIT 1", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="DELETE: ORDER BY is not supported"):
+                client.execute_sql("DELETE FROM t ORDER BY pk", schema_name=sn)
+            # FROM/USING rejection fires before any table resolution, so `other` need not exist.
+            with pytest.raises(gnitz.GnitzError, match="UPDATE: FROM .join-update. is not supported"):
+                client.execute_sql("UPDATE t SET val = u.val FROM other u WHERE t.pk = u.pk", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="DELETE: USING .join-delete. is not supported"):
+                client.execute_sql("DELETE FROM t USING other u WHERE t.pk = u.pk", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="INSERT: IGNORE is not supported"):
+                client.execute_sql("INSERT IGNORE INTO t VALUES (6, 60)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="INSERT: REPLACE INTO is not supported"):
+                client.execute_sql("REPLACE INTO t VALUES (6, 60)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="AS SELECT .CTAS. is not supported"):
+                client.execute_sql("CREATE TABLE t2 (pk BIGINT PRIMARY KEY) AS SELECT pk FROM t", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="CREATE TABLE: TEMPORARY is not supported"):
+                client.execute_sql("CREATE TEMPORARY TABLE tmp (pk BIGINT PRIMARY KEY)", schema_name=sn)
+            # Happy paths unaffected.
+            client.execute_sql("INSERT INTO t VALUES (6, 60)", schema_name=sn)
+            client.execute_sql("UPDATE t SET val = 99 WHERE pk = 6", schema_name=sn)
+            client.execute_sql("DELETE FROM t WHERE pk = 6", schema_name=sn)
+            client.execute_sql("CREATE TABLE t3 (pk BIGINT PRIMARY KEY, v BIGINT)", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_ddl_unsupported_clauses_rejected(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql("CREATE TABLE p (k BIGINT PRIMARY KEY)", schema_name=sn)
+            client.execute_sql("CREATE TABLE t (pk BIGINT PRIMARY KEY, c BIGINT)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="CREATE VIEW: output column aliases is not supported"):
+                client.execute_sql("CREATE VIEW v (a) AS SELECT pk FROM t", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="CREATE VIEW: TEMPORARY is not supported"):
+                client.execute_sql("CREATE TEMPORARY VIEW vt AS SELECT pk FROM t", schema_name=sn)
+            # MATERIALIZED accepted (gnitz views are incrementally materialized).
+            client.execute_sql("CREATE MATERIALIZED VIEW vm AS SELECT pk FROM t", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="CREATE INDEX: WHERE .partial index. is not supported"):
+                client.execute_sql("CREATE INDEX ix ON t (c) WHERE c > 0", schema_name=sn)
+            # Column/table CHECK, DEFAULT silently dropped → constraint never enforced.
+            with pytest.raises(gnitz.GnitzError, match="column definition: CHECK is not supported"):
+                client.execute_sql("CREATE TABLE c1 (pk BIGINT PRIMARY KEY, x BIGINT CHECK (x > 0))", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="table constraint: CHECK constraint is not supported"):
+                client.execute_sql("CREATE TABLE c2 (pk BIGINT PRIMARY KEY, x BIGINT, CHECK (x > 0))", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="column definition: DEFAULT is not supported"):
+                client.execute_sql("CREATE TABLE d1 (pk BIGINT PRIMARY KEY, x BIGINT DEFAULT 5)", schema_name=sn)
+            # FK referential action silently dropped.
+            with pytest.raises(gnitz.GnitzError, match="FOREIGN KEY ON DELETE/ON UPDATE action"):
+                client.execute_sql(
+                    "CREATE TABLE f (pk BIGINT PRIMARY KEY, c BIGINT REFERENCES p(k) ON DELETE CASCADE)",
+                    schema_name=sn,
+                )
+            # Happy paths unaffected; USING BTREE is the accepted default.
+            client.execute_sql("CREATE VIEW v2 AS SELECT pk FROM t", schema_name=sn)
+            client.execute_sql("CREATE INDEX ix2 ON t (c)", schema_name=sn)
+            client.execute_sql("CREATE INDEX ixb ON t USING BTREE (c)", schema_name=sn)
+            client.execute_sql("CREATE TABLE f2 (pk BIGINT PRIMARY KEY, c BIGINT REFERENCES p(k))", schema_name=sn)
         finally:
             client.drop_schema(sn)
 

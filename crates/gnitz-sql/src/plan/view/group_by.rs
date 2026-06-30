@@ -153,6 +153,7 @@ pub(crate) fn execute_create_group_by_view(
         HonoredClauses {
             where_filter: true,
             grouping: true,
+            distinct: false,
         },
         "CREATE VIEW",
     )?;

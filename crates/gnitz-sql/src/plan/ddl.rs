@@ -5,7 +5,8 @@ use crate::ast_util::extract_name;
 use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{
-    default_index_name, reject_duplicate_column_names, reject_non_key_eligible, validate_user_index_name,
+    default_index_name, reject_duplicate_column_names, reject_non_key_eligible, reject_unhonored_column_options,
+    reject_unhonored_table_constraints, validate_user_index_name,
 };
 use crate::types::{int_domain_fits, is_integer_type, sql_type_to_typecode};
 use crate::SqlResult;
@@ -207,6 +208,16 @@ pub(crate) fn execute_create_table(
     // Reject duplicate column names up front: the PK/UNIQUE column lookups
     // below resolve by name and would silently bind to the first match.
     reject_duplicate_column_names(sql_cols.iter().map(|c| c.name.value.as_str()), "table definition")?;
+
+    // Reject every column option / table constraint the table builder does not
+    // honor (DEFAULT, CHECK, GENERATED, FK referential actions, inline INDEX, …)
+    // before column/PK processing, so an unsupported clause errors here rather
+    // than being silently dropped or masked by the "requires at least one
+    // PRIMARY KEY column" admission error below.
+    for col in sql_cols {
+        reject_unhonored_column_options(col, "column definition")?;
+    }
+    reject_unhonored_table_constraints(&create.constraints, "table constraint")?;
 
     // Phase 1 — build column defs (name, type, nullability only).
     let mut cols: Vec<ColumnDef> = Vec::with_capacity(sql_cols.len());

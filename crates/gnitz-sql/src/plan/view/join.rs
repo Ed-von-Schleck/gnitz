@@ -109,6 +109,7 @@ pub(crate) fn execute_create_join_view(
         HonoredClauses {
             where_filter: false,
             grouping: false,
+            distinct: false,
         },
         "CREATE VIEW JOIN",
     )?;

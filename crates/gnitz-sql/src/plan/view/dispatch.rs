@@ -7,6 +7,10 @@ use crate::ast_util::{
 };
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
+use crate::plan::validate::{
+    reject_unhonored_query_clauses, reject_unhonored_select_clauses, unsupported_clause, HonoredClauses,
+    HonoredQueryClauses,
+};
 use crate::plan::view::{group_by, join, set_op, simple};
 use crate::SqlResult;
 use gnitz_core::GnitzClient;
@@ -22,23 +26,17 @@ pub(crate) fn execute_create_view(
 ) -> Result<SqlResult, GnitzSqlError> {
     let view_name = extract_name(view_name_obj, "CREATE VIEW")?;
 
-    if query.order_by.is_some() {
-        return Err(GnitzSqlError::Unsupported("ORDER BY not supported".to_string()));
-    }
-    // An incremental circuit has no meaningful LIMIT/OFFSET semantics; a silently
-    // ignored LIMIT would stream the full table.
-    if query.limit_clause.is_some() {
-        return Err(GnitzSqlError::Unsupported(
-            "LIMIT and OFFSET are not supported in VIEW definitions".into(),
-        ));
-    }
-    // FETCH (FETCH FIRST n ROWS ONLY) is a row-limit on the Query, separate from limit_clause and
-    // invisible to the per-Select builders. Like LIMIT, it has no incremental-view semantics.
-    if query.fetch.is_some() {
-        return Err(GnitzSqlError::Unsupported(
-            "FETCH is not supported in VIEW definitions".into(),
-        ));
-    }
+    // The CREATE VIEW envelope honors only `WITH` (inlined just below by `inline_ctes`); every
+    // other tail clause (ORDER BY, LIMIT/OFFSET, FETCH, FOR UPDATE/SHARE, FOR XML/JSON, SETTINGS,
+    // FORMAT) has no incremental-view semantics and would otherwise be silently dropped.
+    reject_unhonored_query_clauses(
+        query,
+        HonoredQueryClauses {
+            with: true,
+            limit: false,
+        },
+        "CREATE VIEW",
+    )?;
 
     let sql_text = format!("{stmt}");
 
@@ -164,29 +162,66 @@ fn inline_ctes(client: &mut GnitzClient, query: &Query, binder: &mut Binder<'_>)
         }
         for cte in &with.cte_tables {
             let cte_name = cte.alias.name.value.clone();
+            let ctx = format!("CTE '{cte_name}'");
+            // Exhaustively destructure the `Cte` envelope so a future field can't be silently
+            // dropped. `alias`/`query`/`closing_paren_token` are consumed below; `materialized`
+            // parses only under PostgreSqlDialect, so under the planner's GenericDialect it is
+            // always None — `_`-bound (no dead runtime check), still drift-protected by the
+            // exhaustive destructure.
+            let sqlparser::ast::Cte {
+                alias: _,
+                query: _,
+                from: cte_from,
+                materialized: _,
+                closing_paren_token: _,
+            } = cte;
+            if cte_from.is_some() {
+                return Err(unsupported_clause(&ctx, "a trailing FROM"));
+            }
+            // Reject the `Query`-envelope clauses a CTE body cannot honor (a nested `WITH`,
+            // LIMIT/OFFSET, FETCH, FOR UPDATE/SHARE, SETTINGS, …) at loop top — before the body
+            // match and `binder.resolve`. A nested CTE (`WITH d …`) has body=Select, so only this
+            // guard catches it; an after-resolve placement would fail with a misleading "relation
+            // not found" for the never-registered inner table.
+            reject_unhonored_query_clauses(
+                &cte.query,
+                HonoredQueryClauses {
+                    with: false,
+                    limit: false,
+                },
+                &ctx,
+            )?;
             // Resolve the CTE's SELECT to find its source table and schema
             let cte_select = match cte.query.body.as_ref() {
                 SetExpr::Select(s) => s,
-                _ => {
-                    return Err(GnitzSqlError::Unsupported(format!(
-                        "CTE '{cte_name}': only SELECT supported"
-                    )))
-                }
+                _ => return Err(GnitzSqlError::Unsupported(format!("{ctx}: only SELECT supported"))),
             };
+            // Reject every Select-body clause the pass-through cannot honor (WHERE,
+            // DISTINCT, GROUP BY, HAVING, and the exotic tail — PREWHERE, TOP, …)
+            // before resolving the source table, so a dropped clause is a clean
+            // error, not silently inlined as a pass-through.
+            reject_unhonored_select_clauses(
+                cte_select,
+                HonoredClauses {
+                    where_filter: false,
+                    grouping: false,
+                    distinct: false,
+                },
+                &ctx,
+            )?;
             if cte_select.from.len() != 1 || !cte_select.from[0].joins.is_empty() {
                 return Err(GnitzSqlError::Unsupported(format!(
-                    "CTE '{cte_name}': only single table without JOINs"
+                    "{ctx}: only single table without JOINs"
                 )));
             }
-            let cte_table_name = extract_table_factor_name(&cte_select.from[0].relation, &format!("CTE '{cte_name}'"))?;
+            let cte_table_name = extract_table_factor_name(&cte_select.from[0].relation, &ctx)?;
             // Resolve the CTE's source table and cache the CTE name as an alias.
             let (cte_tid, cte_schema) = binder.resolve(client, &cte_table_name)?;
-            // A CTE is inlined only as a plain column pass-through of its source
-            // table. Anything that changes the row set or shape (WHERE, GROUP BY,
-            // HAVING, DISTINCT, ORDER BY, LIMIT, or a non-identity projection)
-            // would be silently discarded by the alias mechanism and return wrong
-            // rows, so reject it explicitly. (Compiling an arbitrary CTE body as a
-            // sub-plan is a separate, unimplemented feature.)
+            // Beyond the Select-body clauses and the Query envelope the guards above
+            // rejected, a CTE is inlined only as a plain column pass-through: a
+            // non-identity projection would be silently discarded by the alias
+            // mechanism and return wrong rows, so reject it here too. (Compiling an
+            // arbitrary CTE body as a sub-plan is a separate, unimplemented feature.)
             // Positional identity: `*`, or one identifier per source column in
             // order. The qualified form (`SELECT t.a, t.b FROM t`) parses as
             // `CompoundIdentifier` and is the same positional pass-through — match
@@ -205,18 +240,11 @@ fn inline_ctes(client: &mut GnitzClient, query: &Query, binder: &mut Binder<'_>)
                             _ => false,
                         }
                     }));
-            if cte_select.selection.is_some()
-                || cte_select.having.is_some()
-                || cte_select.distinct.is_some()
-                || group_by_is_present(&cte_select.group_by)
-                || cte.query.order_by.is_some()
-                || cte.query.limit_clause.is_some()
-                || !proj_is_identity
-            {
+            if !proj_is_identity {
                 return Err(GnitzSqlError::Unsupported(format!(
-                    "CTE '{cte_name}': only a plain column pass-through of a single table is \
-                     supported; WHERE, a subset/reordered/computed projection, GROUP BY, \
-                     HAVING, DISTINCT, ORDER BY and LIMIT inside a CTE are not yet supported"
+                    "{ctx}: only a plain column pass-through of a single table is \
+                     supported; a subset/reordered/computed projection inside a CTE is not yet \
+                     supported"
                 )));
             }
             // Apply CTE column aliases (`WITH cte(a, b) AS ...`): rename the

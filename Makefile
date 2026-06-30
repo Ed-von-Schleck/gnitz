@@ -34,8 +34,8 @@ help: ## Show this help
 # Tests & quality gates
 # ---------------------------------------------------------------------------
 
-test: ## Run all Rust workspace tests (gnitz-py excluded — pyo3 extension can't link a test harness)
-	cd crates && cargo test --workspace --exclude gnitz-py $(T)
+test: ## Run all Rust workspace tests incl. gnitz-sql integration (gnitz-py excluded — pyo3 extension can't link a test harness)
+	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration $(T)
 
 rust-engine-test: ## Run only the gnitz-engine tests (faster inner loop)
 	cd crates && cargo test -p gnitz-engine $(T)
@@ -46,8 +46,8 @@ fmt: ## Format the whole workspace
 fmt-check: ## Check formatting without writing (CI gate)
 	cd crates && cargo fmt --all --check
 
-clippy: ## Lint the workspace; warnings are errors
-	cd crates && cargo clippy --workspace --all-targets -- -D warnings
+clippy: ## Lint the workspace incl. integration tests; warnings are errors
+	cd crates && cargo clippy --workspace --all-targets --features gnitz-sql/integration -- -D warnings
 
 check: ## Fast type-check without producing binaries
 	cd crates && cargo check --workspace

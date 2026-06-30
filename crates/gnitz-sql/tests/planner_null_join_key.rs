@@ -96,10 +96,12 @@ fn test_inner_nullable_left_key_emits_one_filter() {
     }
 }
 
-/// LEFT JOIN, nullable preserved (left) key, NOT NULL right: the preserved side
-/// is split into `IS NOT NULL` (match) and `IS NULL` (bypass) → two filters.
+/// LEFT JOIN, nullable preserved (left) key, NOT NULL right: one `IS NOT NULL`
+/// filter gates the inner match. The NULL-keyed preserved rows are null-filled by
+/// the filter-free `positive_part(A − π_A(inner))` path (which re-keys the
+/// unfiltered input), not a dedicated `IS NULL` bypass — so one filter total.
 #[test]
-fn test_left_nullable_preserved_key_emits_split() {
+fn test_left_nullable_preserved_key_emits_one_filter() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -115,13 +117,15 @@ fn test_left_nullable_preserved_key_emits_split() {
             .execute("CREATE VIEW v AS SELECT * FROM l LEFT JOIN r ON l.fk = r.k")
             .unwrap();
         let vid = view_id_of(&res);
-        assert_eq!(filter_node_count(&mut client, vid), 2);
+        assert_eq!(filter_node_count(&mut client, vid), 1);
     }
 }
 
-/// LEFT JOIN, both keys nullable: right `IS NOT NULL` + left split = 3 filters.
+/// LEFT JOIN, both keys nullable: one `IS NOT NULL` filter per side gates the
+/// inner match (left + right = two). The preserved (left) side's NULL-keyed rows
+/// null-fill via the filter-free `positive_part` path, adding no bypass filter.
 #[test]
-fn test_left_both_nullable_emits_three_filters() {
+fn test_left_both_nullable_emits_two_filters() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -137,6 +141,6 @@ fn test_left_both_nullable_emits_three_filters() {
             .execute("CREATE VIEW v AS SELECT * FROM l LEFT JOIN r ON l.fk = r.rk")
             .unwrap();
         let vid = view_id_of(&res);
-        assert_eq!(filter_node_count(&mut client, vid), 3);
+        assert_eq!(filter_node_count(&mut client, vid), 2);
     }
 }

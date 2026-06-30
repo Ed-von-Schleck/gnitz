@@ -86,6 +86,74 @@ fn test_cte_with_where_rejected() {
 }
 
 #[test]
+fn test_cte_with_fetch_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT NOT NULL)")
+        .unwrap();
+    // FETCH was the one envelope clause inline_ctes silently dropped.
+    let err = p
+        .execute("CREATE VIEW v AS WITH cte AS (SELECT * FROM t FETCH FIRST 5 ROWS ONLY) SELECT a FROM cte")
+        .unwrap_err();
+    assert!(
+        matches!(err, GnitzSqlError::Unsupported(_)),
+        "CTE FETCH must be rejected, got {err:?}"
+    );
+    assert!(client.resolve_table_or_view_id(&sn, "v").is_err());
+}
+
+#[test]
+fn test_cte_nested_with_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT NOT NULL)")
+        .unwrap();
+    // A nested CTE body (`WITH d …`) parses as body=Select, so only the loop-top
+    // Query guard catches it — verifying the placement is load-bearing.
+    let err = p
+        .execute("CREATE VIEW v AS WITH cte AS (WITH d AS (SELECT * FROM t) SELECT * FROM d) SELECT a FROM cte")
+        .unwrap_err();
+    assert!(
+        matches!(err, GnitzSqlError::Unsupported(_)),
+        "nested CTE must be rejected, got {err:?}"
+    );
+    assert!(client.resolve_table_or_view_id(&sn, "v").is_err());
+}
+
+// A CTE body carrying an exotic Select clause (PREWHERE here) must be rejected by
+// the shared guard, not silently inlined as a pass-through with the clause dropped.
+#[test]
+fn test_cte_with_prewhere_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT NOT NULL)")
+        .unwrap();
+    let err = p
+        .execute("CREATE VIEW v AS WITH cte AS (SELECT * FROM t PREWHERE b > 5) SELECT a FROM cte")
+        .unwrap_err();
+    assert!(
+        matches!(err, GnitzSqlError::Unsupported(_)),
+        "CTE PREWHERE must be rejected, got {err:?}"
+    );
+    assert!(
+        client.resolve_table_or_view_id(&sn, "v").is_err(),
+        "rejected-CTE view must not be registered"
+    );
+}
+
+#[test]
 fn test_cte_subset_projection_rejected() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
