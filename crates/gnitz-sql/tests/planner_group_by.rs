@@ -6,13 +6,16 @@ use gnitz_test_harness::ServerHandle;
 mod common;
 use common::*;
 
-// ── item 42: AVG must ignore NULLs and never emit NaN/Infinity ───────
+// ── item 42: AVG ignores NULLs and never emits NaN/Infinity ───────
 //
 // The plan's literal scenario (a *zero-count* group reaching `float_div` and
-// producing NaN) is unreachable: a group whose averaged column is entirely
-// NULL is suppressed by the reduce and emits no row at all. AVG's divisor is
-// COUNT(non-null); `EXPR_FLOAT_DIV` additionally null-marks any zero divisor.
-// So no emitted AVG row is ever NaN. This guard pins that invariant.
+// producing NaN) is unreachable: AVG's divisor is COUNT(non-null), and
+// `EXPR_FLOAT_DIV` null-marks any zero divisor, so an all-NULL group's AVG reads
+// as NULL — never NaN/Infinity. The group itself is NOT suppressed: group
+// existence is gated on net cardinality (`COUNT(*) > 0`, the appended companion),
+// so a group that has a row — even an all-NULL one — is emitted with AVG = NULL,
+// exactly as SQL requires and as the transition-to-all-NULL sibling below. This
+// guard pins the no-NaN invariant.
 
 #[test]
 fn test_avg_ignores_nulls_no_nan() {
@@ -28,7 +31,7 @@ fn test_avg_ignores_nulls_no_nan() {
             .unwrap();
         p.execute("CREATE VIEW v AS SELECT g, AVG(x) AS ax FROM t GROUP BY g")
             .unwrap();
-        // g=5: only NULL (zero-count group → suppressed, no row).
+        // g=5: only NULL → the group exists (one row) → AVG = NULL (not NaN).
         // g=6: NULL + 3.0 → mean ignores NULL → 3.0.
         // g=7: 4.0 → 4.0.
         p.execute("INSERT INTO t (id, g, x) VALUES (1, 5, NULL), (2, 6, NULL), (3, 6, 3.0), (4, 7, 4.0)")
@@ -39,11 +42,15 @@ fn test_avg_ignores_nulls_no_nan() {
     let ax_col = col_idx(&schema, "ax");
     let ax_payload = ax_col - 1; // single synthetic U128 PK at index 0
 
-    // The all-NULL group g=5 must not appear; no emitted average is NaN/Inf.
+    // Every group with a row is emitted; the only NULL average is the all-NULL
+    // group g=5, and no emitted average is ever NaN/Infinity.
+    let mut saw_g5_null = false;
     for r in 0..batch.len() {
         let g = i64_at(&batch, g_col, r);
-        assert_ne!(g, 5, "an all-NULL group must not be emitted");
-        if !is_null_at(&batch, ax_payload, r) {
+        if is_null_at(&batch, ax_payload, r) {
+            assert_eq!(g, 5, "only the all-NULL group g=5 has a NULL average");
+            saw_g5_null = true;
+        } else {
             let ax = f64_at(&batch, ax_col, r);
             assert!(ax.is_finite(), "AVG must never be NaN/Infinity, got {} for g={}", ax, g);
             match g {
@@ -53,14 +60,19 @@ fn test_avg_ignores_nulls_no_nan() {
             }
         }
     }
-    assert_eq!(batch.len(), 2, "exactly groups g=6 and g=7 are emitted");
+    assert!(
+        saw_g5_null,
+        "the all-NULL group g=5 is emitted with AVG = NULL (cardinality gate, not suppressed)"
+    );
+    assert_eq!(batch.len(), 3, "groups g=5 (AVG NULL), g=6, and g=7 are all emitted");
 }
 
-// A group that *transitions* to all-NULL via DELETE is NOT suppressed (unlike
-// a from-inception all-NULL group): the SUM/COUNT accumulators keep has_value
-// after the retract+merge, so the group is re-emitted with COUNT_NON_NULL=0 →
-// AVG = float_div(_, 0) → NULL. The AVG output column must therefore be nullable
-// to represent the emitted NULL; declaring it NOT NULL mislabels that value.
+// A group that transitions to all-NULL via DELETE persists — like a from-inception
+// all-NULL group (above): group existence is gated on net cardinality
+// (`COUNT(*) > 0`, the appended companion), and the group still holds the NULL row,
+// so it is re-emitted with COUNT_NON_NULL=0 → AVG = float_div(_, 0) → NULL. The AVG
+// output column must therefore be nullable to represent the emitted NULL; declaring
+// it NOT NULL mislabels that value.
 
 #[test]
 fn test_avg_emits_null_on_delete_to_all_null() {
