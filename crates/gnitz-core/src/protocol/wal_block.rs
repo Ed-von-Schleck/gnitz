@@ -617,20 +617,8 @@ mod tests {
     fn u64_schema() -> Schema {
         Schema {
             columns: vec![
-                ColumnDef {
-                    name: "pk".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "v".into(),
-                    type_code: TypeCode::I64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("v", TypeCode::I64, false),
             ],
             pk_cols: vec![0],
         }
@@ -639,20 +627,8 @@ mod tests {
     fn str_schema() -> Schema {
         Schema {
             columns: vec![
-                ColumnDef {
-                    name: "pk".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "s".into(),
-                    type_code: TypeCode::String,
-                    is_nullable: true,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("s", TypeCode::String, true),
             ],
             pk_cols: vec![0],
         }
@@ -661,20 +637,8 @@ mod tests {
     fn u128_schema() -> Schema {
         Schema {
             columns: vec![
-                ColumnDef {
-                    name: "pk".into(),
-                    type_code: TypeCode::U128,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "v".into(),
-                    type_code: TypeCode::U128,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("pk", TypeCode::U128, false),
+                ColumnDef::new("v", TypeCode::U128, false),
             ],
             pk_cols: vec![0],
         }
@@ -867,20 +831,8 @@ mod tests {
     fn i128_schema() -> Schema {
         Schema {
             columns: vec![
-                ColumnDef {
-                    name: "pk".into(),
-                    type_code: TypeCode::I128,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "v".into(),
-                    type_code: TypeCode::I128,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("pk", TypeCode::I128, false),
+                ColumnDef::new("v", TypeCode::I128, false),
             ],
             pk_cols: vec![0],
         }
@@ -1155,27 +1107,9 @@ mod tests {
     fn wide24_schema() -> Schema {
         Schema {
             columns: vec![
-                ColumnDef {
-                    name: "pk0".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "pk1".into(),
-                    type_code: TypeCode::U128,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "v".into(),
-                    type_code: TypeCode::I64,
-                    is_nullable: true,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("pk0", TypeCode::U64, false),
+                ColumnDef::new("pk1", TypeCode::U128, false),
+                ColumnDef::new("v", TypeCode::I64, true),
             ],
             pk_cols: vec![0, 1],
         }
@@ -1259,41 +1193,11 @@ mod tests {
         // Maximum user pk_stride: four U128 PK columns = 64 bytes/row.
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "a".into(),
-                    type_code: TypeCode::U128,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "b".into(),
-                    type_code: TypeCode::U128,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "c".into(),
-                    type_code: TypeCode::U128,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "d".into(),
-                    type_code: TypeCode::U128,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "v".into(),
-                    type_code: TypeCode::I64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("a", TypeCode::U128, false),
+                ColumnDef::new("b", TypeCode::U128, false),
+                ColumnDef::new("c", TypeCode::U128, false),
+                ColumnDef::new("d", TypeCode::U128, false),
+                ColumnDef::new("v", TypeCode::I64, false),
             ],
             pk_cols: vec![0, 1, 2, 3],
         };

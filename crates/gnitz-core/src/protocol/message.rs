@@ -540,20 +540,8 @@ mod tests {
         // Empty batch → FLAG_HAS_SCHEMA but not FLAG_HAS_DATA
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "pk".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "val".into(),
-                    type_code: TypeCode::I64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("val", TypeCode::I64, false),
             ],
             pk_cols: vec![0],
         };
@@ -586,27 +574,9 @@ mod tests {
     fn test_message_roundtrip_data() {
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "pk".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "i64".into(),
-                    type_code: TypeCode::I64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "f64".into(),
-                    type_code: TypeCode::F64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("i64", TypeCode::I64, false),
+                ColumnDef::new("f64", TypeCode::F64, false),
             ],
             pk_cols: vec![0],
         };
@@ -666,27 +636,9 @@ mod tests {
     fn test_message_roundtrip_strings() {
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "pk".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "s1".into(),
-                    type_code: TypeCode::String,
-                    is_nullable: true,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "s2".into(),
-                    type_code: TypeCode::String,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("s1", TypeCode::String, true),
+                ColumnDef::new("s2", TypeCode::String, false),
             ],
             pk_cols: vec![0],
         };
@@ -831,20 +783,8 @@ mod tests {
     fn test_encode_parse_with_data() {
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "pk".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "val".into(),
-                    type_code: TypeCode::I64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("val", TypeCode::I64, false),
             ],
             pk_cols: vec![0],
         };
@@ -872,13 +812,7 @@ mod tests {
     #[test]
     fn test_encode_parse_empty_batch() {
         let schema = Schema {
-            columns: vec![ColumnDef {
-                name: "pk".into(),
-                type_code: TypeCode::U64,
-                is_nullable: false,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-            }],
+            columns: vec![ColumnDef::new("pk", TypeCode::U64, false)],
             pk_cols: vec![0],
         };
         let empty = ZSetBatch::new(&schema);
@@ -916,20 +850,8 @@ mod tests {
     fn hint_only_frame_returns_data_schema_none() {
         let schema = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "pk".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "val".into(),
-                    type_code: TypeCode::I64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("val", TypeCode::I64, false),
             ],
             pk_cols: vec![0],
         };

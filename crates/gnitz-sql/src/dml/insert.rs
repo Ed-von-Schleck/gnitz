@@ -11,13 +11,13 @@ use crate::codec::nullmap::null_word_set;
 use crate::codec::pk_codec::{extract_pk_value, is_null_expr};
 use crate::dml::mutate::{build_merged_row, eval_set_expr, resolve_set_target};
 use crate::error::GnitzSqlError;
-use crate::exec::batch::copy_batch_row;
+use crate::exec::batch::{apply_projection, copy_batch_row};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, PkTuple, Schema, WireConflictMode, ZSetBatch};
+use gnitz_core::{FixedInt, GnitzClient, PkTuple, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{
-    Assignment, ConflictTarget, Expr, Ident, OnConflict, OnConflictAction, OnInsert, Query, SetExpr, Statement,
-    TableObject, Values,
+    Assignment, ConflictTarget, Expr, Ident, OnConflict, OnConflictAction, OnInsert, Query, SelectItem, SetExpr,
+    Statement, TableObject, Values,
 };
 
 /// The resolved INSERT disposition after the ON CONFLICT clause (if any) is bound.
@@ -92,14 +92,23 @@ pub(crate) fn execute_insert(
     stmt: &Statement,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    // Extract table name, row source, and ON CONFLICT action.
-    let (table_name_str, rows, columns, on_insert) = extract_insert_parts(stmt)?;
+    // Extract table name, row source, ON CONFLICT action, and RETURNING clause.
+    let (table_name_str, rows, columns, on_insert, returning) = extract_insert_parts(stmt)?;
 
     let (tid, schema) = binder.resolve_base_table(client, &table_name_str)?;
 
-    // INSERT is positional; reject any column list that isn't the full set in
-    // schema order (it would otherwise silently misplace values).
+    // INSERT is positional; reject any column list that isn't every non-SERIAL
+    // column in schema order (it would otherwise silently misplace values).
     validate_insert_column_list(columns, &schema)?;
+
+    // RETURNING is supported on the plain-INSERT path only; capturing the
+    // effective row under ON CONFLICT (which may UPDATE or skip a row) is out of
+    // scope.
+    if returning.is_some() && on_insert.is_some() {
+        return Err(GnitzSqlError::Unsupported(
+            "RETURNING with ON CONFLICT is not supported".to_string(),
+        ));
+    }
 
     // Resolve the ON CONFLICT clause into a `ConflictPlan`.
     let plan = match on_insert {
@@ -141,27 +150,65 @@ pub(crate) fn execute_insert(
     let mut batch = ZSetBatch::new(&schema);
     let n = rows.len();
 
+    // A SERIAL PK is the table's lone single-column PK (enforced at CREATE), so
+    // the user omits it: arity excludes it, the PK is drawn from the sequence and
+    // stamped, and each VALUES element indexes the payload columns directly. The
+    // dense `payload_idx` equals the position in the SERIAL-omitted row precisely
+    // because the omitted column is the single PK (the single-PK closed form).
+    // `serial_max` is the underlying int type's max positive value (the canonical
+    // `FixedInt::range`), against which an exhausted sequence is rejected per row;
+    // `is_serial` gates the PK source and the payload-index shape.
+    let serial_max: Option<i128> = schema.columns.iter().find(|c| c.is_serial).map(|c| {
+        FixedInt::from_type_code(c.type_code)
+            .expect("SERIAL underlying is a fixed int")
+            .range()
+            .1
+    });
+    let is_serial = serial_max.is_some();
+    let expected = schema.columns.len() - usize::from(is_serial);
+    let stride = schema.pk_stride() as u8;
+
     for row in rows {
-        // Standard SQL rejects a VALUES row whose arity differs from the column
+        // Standard SQL rejects a VALUES row whose arity differs from the expected
         // count: too few values, or excess trailing values that were previously
-        // discarded silently. INSERT here is full-row positional (any explicit
-        // column list was already validated as the full set in schema order),
-        // so this guard makes every per-column index below in-bounds.
-        if row.len() != schema.columns.len() {
+        // discarded silently. This guard makes every per-column index below
+        // in-bounds.
+        if row.len() != expected {
+            let hint = if is_serial {
+                " (its SERIAL primary key is auto-assigned)"
+            } else {
+                ""
+            };
             return Err(GnitzSqlError::Bind(format!(
-                "INSERT specifies {} value(s) but table '{}' has {} column(s)",
+                "INSERT specifies {} value(s) but table '{}' expects {} value(s){}",
                 row.len(),
                 table_name_str,
-                schema.columns.len()
+                expected,
+                hint
             )));
         }
-        let pk = extract_pk_value(row, &schema)?;
-        batch.pks.push_tuple(&pk);
+        if let Some(max) = serial_max {
+            // Draw the next SERIAL id and reject an exhausted sequence (a value
+            // past the column type's max), mirroring PostgreSQL. A client-side
+            // rejection, so it is a `Bind` error like the arity guard above — not
+            // `Exec`, which is reserved for surfaced server `ClientError`s.
+            let id = client.next_serial_id(tid)?;
+            if id as i128 > max {
+                return Err(GnitzSqlError::Bind(format!(
+                    "SERIAL primary key exhausted: next value {id} exceeds the column type maximum {max}"
+                )));
+            }
+            batch.pks.push_tuple(&PkTuple::from_u128(stride, id as u128));
+        } else {
+            batch.pks.push_tuple(&extract_pk_value(row, &schema)?);
+        }
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
         for (payload_idx, ci, col_def) in schema.payload_columns() {
-            let val_expr = &row[ci];
+            // SERIAL-omitted rows are dense over the payload columns; full rows
+            // are schema-indexed.
+            let val_expr = if is_serial { &row[payload_idx] } else { &row[ci] };
             // Check if this value is NULL and set the null bitmap
             if is_null_expr(val_expr) {
                 null_word_set(&mut null_bits, payload_idx, true);
@@ -175,6 +222,18 @@ pub(crate) fn execute_insert(
         ConflictPlan::Error => {
             // SQL-standard INSERT: server rejects on any PK conflict.
             client.push_with_mode(tid, &schema, &batch, WireConflictMode::Error)?;
+            // RETURNING (plain-INSERT path only): project the just-built batch —
+            // the assigned SERIAL ids are already stamped into its PK region, so
+            // this needs no round-trip. `apply_projection` accepts column
+            // references and `*`, and requires ≥1 PK column (so `RETURNING id` /
+            // `RETURNING *` work; a non-PK-only list is rejected).
+            if let Some(items) = returning {
+                let (proj_schema, proj_batch) = apply_projection(items, &schema, Some(batch))?;
+                return Ok(SqlResult::Rows {
+                    schema: proj_schema,
+                    batch: proj_batch,
+                });
+            }
             Ok(SqlResult::RowsAffected { count: n })
         }
         ConflictPlan::DoNothingPk => {
@@ -373,24 +432,52 @@ fn validate_insert_column_list(columns: &[Ident], schema: &Schema) -> Result<(),
     if columns.is_empty() {
         return Ok(());
     }
-    let in_schema_order = columns.len() == schema.columns.len()
+    // Expected list = every non-SERIAL column, in schema order. For a non-SERIAL
+    // table this reduces to the full column list in schema order — byte-identical
+    // to the pre-SERIAL behavior, not a regression.
+    let expected: Vec<&str> = schema
+        .columns
+        .iter()
+        .filter(|c| !c.is_serial)
+        .map(|c| c.name.as_str())
+        .collect();
+    let matches = columns.len() == expected.len()
         && columns
             .iter()
-            .zip(&schema.columns)
-            .all(|(c, sc)| c.value.eq_ignore_ascii_case(&sc.name));
-    if !in_schema_order {
+            .zip(&expected)
+            .all(|(c, n)| c.value.eq_ignore_ascii_case(n));
+    if !matches {
+        // Naming the SERIAL column at all is a targeted error, since it can never
+        // appear in a valid list.
+        if columns.iter().any(|c| {
+            schema
+                .columns
+                .iter()
+                .any(|sc| sc.is_serial && sc.name.eq_ignore_ascii_case(&c.value))
+        }) {
+            return Err(GnitzSqlError::Unsupported(
+                "cannot supply a value for a SERIAL column; omit it from the INSERT".to_string(),
+            ));
+        }
         return Err(GnitzSqlError::Unsupported(
-            "INSERT with an explicit column list is only supported when it lists all \
-             columns in schema order; reordered or partial column lists are not supported"
+            "INSERT with an explicit column list is only supported when it names all \
+             non-SERIAL columns in schema order; reordered or partial column lists are not supported"
                 .to_string(),
         ));
     }
     Ok(())
 }
 
-/// `(table_name, rows, columns, on_clause)` — return type of [`extract_insert_parts`].
-/// `columns` is the explicit INSERT column list (empty when omitted).
-type InsertParts<'a> = (String, &'a [Vec<Expr>], &'a [Ident], Option<&'a OnInsert>);
+/// `(table_name, rows, columns, on_clause, returning)` — return type of
+/// [`extract_insert_parts`]. `columns` is the explicit INSERT column list (empty
+/// when omitted); `returning` is the projection list of a RETURNING clause.
+type InsertParts<'a> = (
+    String,
+    &'a [Vec<Expr>],
+    &'a [Ident],
+    Option<&'a OnInsert>,
+    Option<&'a [SelectItem]>,
+);
 
 fn extract_insert_parts(stmt: &Statement) -> Result<InsertParts<'_>, GnitzSqlError> {
     match stmt {
@@ -410,7 +497,13 @@ fn extract_insert_parts(stmt: &Statement) -> Result<InsertParts<'_>, GnitzSqlErr
                 .ok_or_else(|| GnitzSqlError::Unsupported("INSERT without VALUES not supported".to_string()))?;
 
             let rows = extract_values_rows(source)?;
-            Ok((table_name, rows, insert.columns.as_slice(), insert.on.as_ref()))
+            Ok((
+                table_name,
+                rows,
+                insert.columns.as_slice(),
+                insert.on.as_ref(),
+                insert.returning.as_deref(),
+            ))
         }
         _ => Err(GnitzSqlError::Bind("not an INSERT statement".to_string())),
     }

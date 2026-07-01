@@ -275,8 +275,8 @@ class TestSqlSelect:
         client.create_schema(sn)
         try:
             self._setup_with_rows(client, sn)
-            with pytest.raises(gnitz.GnitzError, match="INSERT: RETURNING is not supported"):
-                client.execute_sql("INSERT INTO t VALUES (6, 60) RETURNING pk", schema_name=sn)
+            # INSERT ... RETURNING is supported (see test_serial.py); UPDATE and
+            # DELETE RETURNING remain unsupported.
             with pytest.raises(gnitz.GnitzError, match="UPDATE: RETURNING is not supported"):
                 client.execute_sql("UPDATE t SET val = 9 WHERE pk = 1 RETURNING pk", schema_name=sn)
             with pytest.raises(gnitz.GnitzError, match="DELETE: RETURNING is not supported"):

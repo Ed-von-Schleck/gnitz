@@ -31,6 +31,7 @@ fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, c
     bb.put_u64(if cd.is_nullable { 1 } else { 0 });
     bb.put_u64(cd.fk_table_id as u64);
     bb.put_u64(cd.fk_col_idx as u64);
+    bb.put_u64(0); // is_serial (engine ColumnDef has no SERIAL marker)
     bb.end_row();
     engine.ingest_to_family(COL_TAB_ID, &bb.finish())
 }

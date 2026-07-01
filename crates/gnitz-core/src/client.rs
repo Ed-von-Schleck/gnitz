@@ -6,6 +6,7 @@ use crate::protocol::{
 };
 use gnitz_wire::RangeDescriptor;
 use lru::LruCache;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const SCHEMA_CACHE_CAP: std::num::NonZeroUsize = std::num::NonZeroUsize::new(64).unwrap();
@@ -133,10 +134,25 @@ pub struct IndexMeta {
     pub is_unique: bool,
 }
 
+/// A cached half-open range `[next, end)` of unissued SERIAL ids for one table,
+/// drawn from the master by `alloc_serial_range`. Cache-loss on disconnect
+/// discards the unissued tail (an intentional, PostgreSQL-style gap).
+struct SerialRange {
+    next: u64,
+    end: u64,
+}
+
+/// Number of SERIAL ids reserved per master round-trip. The range cache is
+/// load-bearing, not a micro-optimization: each reservation is a
+/// `catalog_rwlock`-serialized, fsync'd durable advance on the master, so
+/// caching amortizes that one fsync across `SERIAL_RANGE_SIZE` inserts.
+const SERIAL_RANGE_SIZE: u64 = 64;
+
 pub struct GnitzClient {
     conn: Connection,
     schema_cache: LruCache<u64, (Arc<Schema>, u16)>,
     index_cache: LruCache<u64, (Arc<Vec<IndexMeta>>, u8)>,
+    serial_cache: HashMap<u64, SerialRange>,
 }
 
 impl GnitzClient {
@@ -145,7 +161,31 @@ impl GnitzClient {
             conn: Connection::connect(socket_path)?,
             schema_cache: LruCache::new(SCHEMA_CACHE_CAP),
             index_cache: LruCache::new(SCHEMA_CACHE_CAP),
+            serial_cache: HashMap::new(),
         })
+    }
+
+    /// Draw the next SERIAL id for `table_id` from the per-connection range
+    /// cache, refilling from the master's durable sequence when the range is
+    /// exhausted. Ids are contiguous within a range; a refill may leave a gap
+    /// if a prior range's tail was never issued (intentional, PostgreSQL-style).
+    pub fn next_serial_id(&mut self, table_id: u64) -> Result<u64, ClientError> {
+        if let Some(r) = self.serial_cache.get_mut(&table_id) {
+            if r.next < r.end {
+                let id = r.next;
+                r.next += 1;
+                return Ok(id);
+            }
+        }
+        let base = self.conn.alloc_serial_range(table_id, SERIAL_RANGE_SIZE)?;
+        self.serial_cache.insert(
+            table_id,
+            SerialRange {
+                next: base + 1,
+                end: base + SERIAL_RANGE_SIZE,
+            },
+        );
+        Ok(base)
     }
 
     pub fn close(self) {
@@ -972,7 +1012,7 @@ impl GnitzClient {
 }
 
 fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) -> Result<Vec<ColumnDef>, ClientError> {
-    let mut col_entries: Vec<(u64, String, TypeCode, bool, u64, u64)> = Vec::new();
+    let mut col_entries: Vec<(u64, String, TypeCode, bool, u64, u64, bool)> = Vec::new();
     for i in col_batch.live_rows() {
         let row_owner_id = col_u64(&col_batch.columns[1], i)?;
         let row_owner_kind = col_u64(&col_batch.columns[2], i)?;
@@ -987,18 +1027,30 @@ fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) ->
         let is_nullable = col_u64(&col_batch.columns[6], i)? != 0;
         let fk_table_id = col_u64(&col_batch.columns[7], i)?;
         let fk_col_idx = col_u64(&col_batch.columns[8], i)?;
-        col_entries.push((col_idx, name, type_code, is_nullable, fk_table_id, fk_col_idx));
-    }
-    col_entries.sort_by_key(|e| e.0);
-    Ok(col_entries
-        .into_iter()
-        .map(|(_, name, type_code, is_nullable, fk_table_id, fk_col_idx)| ColumnDef {
+        let is_serial = col_u64(&col_batch.columns[9], i)? != 0;
+        col_entries.push((
+            col_idx,
             name,
             type_code,
             is_nullable,
             fk_table_id,
             fk_col_idx,
-        })
+            is_serial,
+        ));
+    }
+    col_entries.sort_by_key(|e| e.0);
+    Ok(col_entries
+        .into_iter()
+        .map(
+            |(_, name, type_code, is_nullable, fk_table_id, fk_col_idx, is_serial)| ColumnDef {
+                name,
+                type_code,
+                is_nullable,
+                fk_table_id,
+                fk_col_idx,
+                is_serial,
+            },
+        )
         .collect())
 }
 
@@ -1091,7 +1143,8 @@ impl GnitzClient {
                     .u64_val(col.type_code as u64)
                     .u64_val(if col.is_nullable { 1 } else { 0 })
                     .u64_val(col.fk_table_id)
-                    .u64_val(col.fk_col_idx);
+                    .u64_val(col.fk_col_idx)
+                    .u64_val(if col.is_serial { 1 } else { 0 });
             }
         }
         self.conn.push(COL_TAB, schema, &batch, &mut self.schema_cache)?;

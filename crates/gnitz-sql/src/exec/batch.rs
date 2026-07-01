@@ -75,7 +75,7 @@ pub(crate) fn apply_projection(
 
     if new_pk_cols.is_empty() {
         return Err(GnitzSqlError::Unsupported(
-            "SELECT must project at least one PRIMARY KEY column".to_string(),
+            "projection must include at least one PRIMARY KEY column".to_string(),
         ));
     }
 

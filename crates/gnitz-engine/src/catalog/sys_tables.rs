@@ -21,7 +21,6 @@ pub(super) const OWNER_KIND_VIEW: i64 = gnitz_wire::OWNER_KIND_VIEW as i64;
 pub(crate) const SEQ_ID_SCHEMAS: i64 = 1;
 pub(crate) const SEQ_ID_TABLES: i64 = 2;
 pub(crate) const SEQ_ID_INDICES: i64 = 3;
-pub(super) const SEQ_ID_PROGRAMS: i64 = 4;
 
 pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
@@ -35,7 +34,7 @@ pub(crate) const VIEW_TAB_ID: i64 = gnitz_wire::VIEW_TAB as i64;
 pub(super) const COL_TAB_ID: i64 = gnitz_wire::COL_TAB as i64;
 pub(crate) const IDX_TAB_ID: i64 = gnitz_wire::IDX_TAB as i64;
 pub(super) const DEP_TAB_ID: i64 = gnitz_wire::DEP_TAB as i64;
-pub(super) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
+pub(crate) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
 pub(super) const CIRCUIT_NODES_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODES_TAB as i64;
 pub(super) const CIRCUIT_EDGES_TAB_ID: i64 = gnitz_wire::CIRCUIT_EDGES_TAB as i64;
 pub(super) const CIRCUIT_NODE_COLUMNS_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB as i64;
@@ -137,6 +136,10 @@ pub(crate) const IDXTAB_PAY_NAME: usize = IDXTAB_COL_NAME - 1;
 pub(crate) const IDXTAB_PAY_IS_UNIQUE: usize = IDXTAB_COL_IS_UNIQUE - 1;
 
 pub(super) const SEQTAB_COL_VALUE: usize = 1;
+/// Payload index of the `value` column — the sole non-PK column — for
+/// `read_batch_u64`, which indexes payload (not logical) columns. Mirrors the
+/// `*_PAY_* = *_COL_* - 1` pattern above.
+pub(super) const SEQTAB_PAY_VALUE: usize = SEQTAB_COL_VALUE - 1;
 
 // Default arena sizes for system tables and user tables
 pub(super) const SYS_TABLE_ARENA: u64 = 256 * 1024; // 256 KB
@@ -210,6 +213,9 @@ pub(super) const fn view_tab_schema() -> SchemaDescriptor {
     )
 }
 pub(super) const fn col_tab_schema() -> SchemaDescriptor {
+    // 10 columns (indices 0-9). The trailing u64 (index 9) is the client's
+    // `is_serial` marker; the engine stores it verbatim and never reads it
+    // (`scan_column_defs` reads only indices 4-8), so it has no index constant.
     make_schema(
         &[
             u64_col(),
@@ -217,6 +223,7 @@ pub(super) const fn col_tab_schema() -> SchemaDescriptor {
             u64_col(),
             u64_col(),
             str_col(),
+            u64_col(),
             u64_col(),
             u64_col(),
             u64_col(),

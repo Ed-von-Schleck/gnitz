@@ -309,12 +309,14 @@ pub(crate) fn reject_unhonored_insert_clauses(
         // Inert keyword markers (`INTO` / `TABLE`): positional flags, no droppable semantics.
         into: _,
         has_table_keyword: _,
+        // Handled downstream in `execute_insert`: INSERT ... RETURNING is supported
+        // (projected client-side from the just-built batch).
+        returning: _,
         // Rejected: each is a clause the engine does not implement.
         or,
         ignore,
         overwrite,
         partitioned,
-        returning,
         replace_into,
         priority,
         insert_alias,
@@ -326,9 +328,6 @@ pub(crate) fn reject_unhonored_insert_clauses(
     } = insert;
 
     let reject = |clause: &str| unsupported_clause(context, clause);
-    if returning.is_some() {
-        return Err(reject("RETURNING"));
-    }
     if or.is_some() {
         return Err(reject("OR (conflict clause)"));
     }

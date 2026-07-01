@@ -51,6 +51,7 @@ impl CatalogEngine {
             next_schema_id: FIRST_USER_SCHEMA_ID,
             next_table_id: FIRST_USER_TABLE_ID,
             next_index_id: FIRST_USER_INDEX_ID,
+            user_sequences: std::collections::HashMap::new(),
             active_part_start: 0,
             active_part_end: NUM_PARTITIONS,
             sys_schemas,
@@ -269,6 +270,7 @@ impl CatalogEngine {
                     bb.put_u64(nullable); // is_nullable
                     bb.put_u64(0); // fk_table_id
                     bb.put_u64(0); // fk_col_idx
+                    bb.put_u64(0); // is_serial (system columns are never SERIAL)
                     bb.end_row();
                 }
             }
@@ -288,9 +290,6 @@ impl CatalogEngine {
             bb.end_row();
             bb.begin_row(SEQ_ID_INDICES as u128, 1);
             bb.put_u64((FIRST_USER_INDEX_ID - 1) as u64);
-            bb.end_row();
-            bb.begin_row(SEQ_ID_PROGRAMS as u128, 1);
-            bb.put_u64((FIRST_USER_TABLE_ID - 1) as u64);
             bb.end_row();
             let batch = bb.finish();
             ingest_batch_into(&mut self.sys_sequences, &batch);
@@ -332,13 +331,12 @@ impl CatalogEngine {
                             self.next_index_id = next;
                         }
                     }
-                    SEQ_ID_PROGRAMS => {
-                        let next = val + 1;
-                        if next > self.next_table_id {
-                            self.next_table_id = next;
-                        }
-                    }
-                    _ => {}
+                    // User-table SERIAL sequence (seq_id == table_id ≥
+                    // FIRST_USER_TABLE_ID). Store the high-water; next id =
+                    // high_water + 1. `observe_user_sequence` ignores a stray
+                    // catalog-range seq_id in the empty 4..16 gap, so it is never
+                    // misclassified as a user sequence.
+                    other => self.observe_user_sequence(other, val),
                 }
             }
             cursor.cursor.advance();

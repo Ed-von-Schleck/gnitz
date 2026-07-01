@@ -42,6 +42,14 @@ pub const FLAG_GET_INDICES: u64 = 1 << 54;
 /// written to the SAL group header.
 pub const FLAG_SEEK_BY_INDEX_RANGE: u64 = 1 << 55;
 
+/// ALLOCATE_SERIAL_RANGE request flag. The client→master leg of a user-table
+/// SERIAL sequence range reservation. Like the other high request bits it rides
+/// above the SAL mirror (bits 0-15) and the bit-16–47 packed fields; bit 55 is
+/// the current top, so 56 is the next free. The request carries
+/// `target_id = table_id` (the sequence key) and the range `count` in
+/// `seek_col_idx`; this high bit is never written to the SAL group header.
+pub const FLAG_ALLOCATE_SERIAL_RANGE: u64 = 1 << 56;
+
 // ---------------------------------------------------------------------------
 // Wire-level packed fields: bits 16-39 of wire_flags
 // ---------------------------------------------------------------------------
@@ -71,6 +79,17 @@ const _: () = {
     assert!(
         FLAG_SEEK_BY_INDEX_RANGE
             & (SAL_FLAGS_MASK | packed | FLAG_HAS_SCHEMA | FLAG_HAS_DATA | FLAG_CONTINUATION | FLAG_GET_INDICES)
+            == 0
+    );
+    assert!(
+        FLAG_ALLOCATE_SERIAL_RANGE
+            & (SAL_FLAGS_MASK
+                | packed
+                | FLAG_HAS_SCHEMA
+                | FLAG_HAS_DATA
+                | FLAG_CONTINUATION
+                | FLAG_GET_INDICES
+                | FLAG_SEEK_BY_INDEX_RANGE)
             == 0
     );
 };

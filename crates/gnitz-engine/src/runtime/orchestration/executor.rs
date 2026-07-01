@@ -23,7 +23,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::catalog::{
     CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
-    SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, TABLE_TAB_ID, VIEW_TAB_ID,
+    SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
 };
 use crate::foundation::posix_io::guard_panic;
 use crate::runtime::committer::{self, CommitRequest};
@@ -752,6 +752,17 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
     let target_id = decoded.control.target_id as i64;
     let flags = decoded.control.flags;
     let client_version = ipc::wire_flags_get_schema_version(flags);
+
+    // ---------- SERIAL range reservation ----------
+    // Carries `target_id = seq_id (= table_id) ≠ 0` and the range `count` in
+    // `seek_col_idx`, so it precedes the `target_id == 0` catalog-id block.
+    if flags & gnitz_wire::FLAG_ALLOCATE_SERIAL_RANGE != 0 {
+        let seq_id = target_id; // = table_id
+        let count = decoded.control.seek_col_idx.max(1) as i64;
+        let base = commit_serial_range_durable(shared, seq_id, count).await;
+        send_alloc(shared, fd, base, client_id).await;
+        return;
+    }
 
     // ---------- ID allocations ----------
     if target_id == 0 {
@@ -1795,6 +1806,87 @@ async fn send_error(shared: &Rc<Shared>, fd: i32, target_id: i64, client_id: u64
     // flags=0: client ignores schema version on error responses.
     let buf = encode_response_buffer(target_id, client_id, None, STATUS_ERROR, error_msg, None, 0, 0);
     shared.reactor.send_buffer_or_close(fd, buf).await;
+}
+
+/// Durably reserve a SERIAL id range for `seq_id` and return the range base.
+///
+/// The high-water must be persisted *at allocation time*: `recover_sequences`
+/// runs pre-fork and the master holds no user-table rows, so a lost advance
+/// cannot be re-derived. This routes the `sys_sequences` delta through the DDL
+/// SAL commit path — the same path `CREATE` uses, which
+/// `recover_system_tables_from_sal` replays via `hook_sequence_register`.
+///
+/// The critical requirement is that it acquire `catalog_rwlock.write()` at the
+/// top, before reading `ingest_lsn`, and hold it across the fsync await and
+/// `ingest_lsn.set()`, exactly as `handle_ddl` does. Without the write lock two
+/// concurrent range requests would read the same stale `ingest_lsn`, compute the
+/// same `zone_lsn`, and double-open / double-commit / double-broadcast one LSN —
+/// violating strict-monotonic zone LSNs and letting a later checkpoint watermark
+/// dedup-drop a committed-but-unflushed advance on recovery, re-issuing a
+/// committed id. The zone body mirrors `handle_ddl`'s post-lock tail
+/// (zone_lsn … close_ddl_zone); it needs none of `handle_ddl`'s VIEW-only prelude
+/// (TickGate quiesce, committer barrier, base-table drain), because a
+/// `sys_sequences` advance is a pure system-table write with no DAG evaluation
+/// and no rollback path.
+async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i64) -> i64 {
+    let _write = shared.catalog_rwlock.write().await;
+
+    // Raw-pointer derefs (as handle_ddl) so no `&mut CatalogEngine` borrow is
+    // held across the `.await` points below; the write lock guarantees no other
+    // coroutine touches the catalog while we are parked.
+    let cat_ptr = shared.catalog;
+    let (base, delta) = unsafe { (*cat_ptr).reserve_user_sequence(seq_id, count) };
+
+    // Dominate every family's current_lsn, not just ingest_lsn (see handle_ddl),
+    // so a later checkpoint watermark cannot dedup-drop this advance on recovery.
+    let zone_lsn = shared
+        .ingest_lsn
+        .get()
+        .max(unsafe { (*cat_ptr).max_table_current_lsn() })
+        + 1;
+    let zone_lsn_nz = NonZeroU64::new(zone_lsn).expect("zone LSN allocator starts above 0");
+    // A sys_sequences advance is a pure system-table write (no evaluate_dag, no
+    // rollback). A hook failure on a well-formed 2-row delta is an invariant
+    // violation — abort rather than attempt compensation. `gnitz_fatal_abort!`
+    // expands to an `unsafe` block, so keep it out of the raw-deref `unsafe`.
+    let ingest_res = unsafe {
+        (*cat_ptr).ctx.open_ddl_zone(zone_lsn_nz);
+        (*cat_ptr).ingest_to_family(SEQ_TAB_ID, &delta)
+    };
+    if let Err(e) = ingest_res {
+        gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
+    }
+
+    // SAL emission window (mirrors handle_ddl): broadcast + commit sentinel under
+    // sal_writer_excl, then fsync before publishing ingest_lsn. A broadcast
+    // failure after the catalog mutation permanently diverges master/worker
+    // state, so it is unrecoverable — abort.
+    let drained = unsafe { (*cat_ptr).drain_pending_broadcasts() };
+    let fsync_fut = {
+        let _sal_excl = shared.sal_writer_excl.lock().await;
+        let disp = shared.dispatcher;
+        if let Err(e) = guard_panic("serial-range-broadcast", || unsafe {
+            for (tid, bat) in &drained {
+                (*disp).broadcast_ddl(*tid, bat, zone_lsn)?;
+            }
+            (*disp).commit_zone(zone_lsn)?;
+            Ok::<(), String>(())
+        }) {
+            gnitz_fatal_abort!("serial-range broadcast failed after in-memory catalog mutation: {}", e);
+        }
+        shared.reactor.fsync(shared.sal_fd)
+    };
+    if fsync_fut.await < 0 {
+        gnitz_fatal_abort!("SAL fdatasync (serial range) failed");
+    }
+
+    // Publish only after fsync (Cleanup D): readers never see an LSN whose
+    // backing sys_sequences delta is not yet on disk.
+    shared.ingest_lsn.set(zone_lsn);
+    unsafe {
+        (*cat_ptr).ctx.close_ddl_zone();
+    }
+    base
 }
 
 async fn send_alloc(shared: &Rc<Shared>, fd: i32, new_id: i64, client_id: u64) {

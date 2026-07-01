@@ -32,6 +32,26 @@ pub(crate) fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlEr
     }
 }
 
+/// Postgres SERIAL family → the underlying signed integer type, case-insensitive.
+/// `None` for any non-SERIAL type. SERIAL/BIGSERIAL/SMALLSERIAL are not sqlparser
+/// keywords, so 0.56 tokenizes them as words and parses them as
+/// `DataType::Custom(ObjectName, Vec<String>)`; `SERIAL4`/`SERIAL8`/`SERIAL2` are
+/// accepted aliases via the same fallthrough. Kept separate from
+/// `sql_type_to_typecode` (which stays pure real-types) — a SERIAL column carries
+/// the underlying type plus the `is_serial` marker.
+pub(crate) fn serial_underlying(dt: &DataType) -> Option<TypeCode> {
+    let DataType::Custom(name, _mods) = dt else {
+        return None;
+    };
+    let ident = name.0.last().and_then(|p| p.as_ident())?;
+    match ident.value.to_ascii_uppercase().as_str() {
+        "SMALLSERIAL" | "SERIAL2" => Some(TypeCode::I16),
+        "SERIAL" | "SERIAL4" => Some(TypeCode::I32),
+        "BIGSERIAL" | "SERIAL8" => Some(TypeCode::I64),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TypeCode capability predicates
 //
@@ -248,6 +268,37 @@ mod tests {
         // Date is not supported
         let msg = err(DataType::Date);
         assert!(msg.contains("unsupported SQL type"), "unexpected error: {msg}");
+    }
+
+    // --- SERIAL recognition (serial_underlying) ---
+
+    fn custom(name: &str) -> DataType {
+        use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
+        DataType::Custom(ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]), vec![])
+    }
+
+    #[test]
+    fn serial_family_maps_to_signed_ints() {
+        assert_eq!(serial_underlying(&custom("SMALLSERIAL")), Some(TypeCode::I16));
+        assert_eq!(serial_underlying(&custom("SERIAL2")), Some(TypeCode::I16));
+        assert_eq!(serial_underlying(&custom("SERIAL")), Some(TypeCode::I32));
+        assert_eq!(serial_underlying(&custom("SERIAL4")), Some(TypeCode::I32));
+        assert_eq!(serial_underlying(&custom("BIGSERIAL")), Some(TypeCode::I64));
+        assert_eq!(serial_underlying(&custom("SERIAL8")), Some(TypeCode::I64));
+    }
+
+    #[test]
+    fn serial_recognition_is_case_insensitive() {
+        assert_eq!(serial_underlying(&custom("serial")), Some(TypeCode::I32));
+        assert_eq!(serial_underlying(&custom("BigSerial")), Some(TypeCode::I64));
+    }
+
+    #[test]
+    fn non_serial_types_are_none() {
+        assert_eq!(serial_underlying(&custom("HYPERLOGLOG")), None); // unrelated custom type
+        assert_eq!(serial_underlying(&DataType::Int(None)), None);
+        assert_eq!(serial_underlying(&DataType::BigInt(None)), None);
+        assert_eq!(serial_underlying(&DataType::Text), None);
     }
 
     // --- FK integer-domain compatibility (int_domain_fits) ---

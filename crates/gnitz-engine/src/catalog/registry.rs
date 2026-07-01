@@ -203,17 +203,59 @@ impl CatalogEngine {
     // -- Sequence management -----------------------------------------------
 
     pub fn advance_sequence(&mut self, seq_id: i64, old_val: i64, new_val: i64) {
-        let schema = seq_tab_schema();
-        let mut bb = BatchBuilder::new(schema);
-        // Retract old
-        bb.begin_row(seq_id as u128, -1);
-        bb.put_u64(old_val as u64);
-        bb.end_row();
-        // Insert new
-        bb.begin_row(seq_id as u128, 1);
-        bb.put_u64(new_val as u64);
-        bb.end_row();
-        let batch = bb.finish();
+        let batch = build_seq_delta(seq_id, old_val, new_val);
         ingest_batch_into(&mut self.sys_sequences, &batch);
     }
+
+    /// Reserve `count` ids for a user-table SERIAL sequence. Returns
+    /// `(base, delta)` where the reserved range is `[base, base + count)` and
+    /// `delta` is the `sys_sequences` retract+insert the caller must durably
+    /// persist (via the DDL SAL commit path). Unlike `advance_sequence` this
+    /// updates the in-memory `user_sequences` high-water synchronously — that
+    /// map is the source of truth for live allocation and, because the caller
+    /// holds `catalog_rwlock.write()`, its `&mut self` also serializes concurrent
+    /// reserves — and returns the delta rather than writing the memtable itself.
+    ///
+    /// On an absent sequence `hw = 0`: the retract of a non-existent `(seq_id, 0)`
+    /// row nets to zero under consolidation, leaving exactly the `+1` insert —
+    /// the catalog's seed-on-first-use pattern. `saturating_add` avoids an i64
+    /// debug-panic at the (unreachable) ~2^63 boundary; the client overflow guard
+    /// rejects the id long before then.
+    pub fn reserve_user_sequence(&mut self, seq_id: i64, count: i64) -> (i64, Batch) {
+        let hw = self.user_sequences.get(&seq_id).copied().unwrap_or(0);
+        let new_hw = hw.saturating_add(count);
+        self.user_sequences.insert(seq_id, new_hw);
+        (hw + 1, build_seq_delta(seq_id, hw, new_hw))
+    }
+
+    /// Fold an observed `sys_sequences` high-water into `user_sequences`,
+    /// ignoring catalog sequences (`seq_id < FIRST_USER_TABLE_ID`, which recover
+    /// via the object-id hooks). Monotone — never lowers an existing high-water.
+    /// Single-sources the "what is a user sequence" threshold shared by
+    /// `hook_sequence_register` (live and SAL-replayed advances) and
+    /// `recover_sequences` (the flushed-shard scan).
+    pub(super) fn observe_user_sequence(&mut self, seq_id: i64, high_water: i64) {
+        if seq_id < FIRST_USER_TABLE_ID {
+            return;
+        }
+        let e = self.user_sequences.entry(seq_id).or_insert(0);
+        *e = (*e).max(high_water);
+    }
+}
+
+/// Build the `sys_sequences` retract-old + insert-new delta for one sequence.
+/// Shared by `advance_sequence` (ingests to the memtable) and
+/// `reserve_user_sequence` (returns it for the durable commit).
+fn build_seq_delta(seq_id: i64, old_val: i64, new_val: i64) -> Batch {
+    let schema = seq_tab_schema();
+    let mut bb = BatchBuilder::new(schema);
+    // Retract old
+    bb.begin_row(seq_id as u128, -1);
+    bb.put_u64(old_val as u64);
+    bb.end_row();
+    // Insert new
+    bb.begin_row(seq_id as u128, 1);
+    bb.put_u64(new_val as u64);
+    bb.end_row();
+    bb.finish()
 }

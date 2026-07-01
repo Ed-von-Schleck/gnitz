@@ -1581,7 +1581,7 @@ def test_compound_pk_no_pk_projection_rejected(client):
         _make_compound_table(client, sn, "t")
         with pytest.raises(gnitz.GnitzError) as exc:
             client.execute_sql("SELECT payload FROM t", schema_name=sn)
-        assert "must project at least one PRIMARY KEY column" in str(exc.value)
+        assert "at least one PRIMARY KEY column" in str(exc.value)
     finally:
         _cleanup(client, sn, "t")
 

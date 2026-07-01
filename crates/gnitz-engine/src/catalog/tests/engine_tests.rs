@@ -106,6 +106,99 @@ fn test_orphaned_metadata_recovery() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── user-table SERIAL sequences ──────────────────────────────────────
+
+/// `reserve_user_sequence` seeds an absent sequence at base 1, hands out
+/// contiguous ranges, and advances the in-memory high-water each call.
+#[test]
+fn test_reserve_user_sequence_seed_and_contiguous() {
+    let dir = temp_dir("reserve_user_seq");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let seq_id = FIRST_USER_TABLE_ID;
+
+    // Seed-on-first-use: absent sequence ⇒ base 1, high-water 64.
+    let (base1, delta1) = engine.reserve_user_sequence(seq_id, 64);
+    assert_eq!(base1, 1);
+    assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(64));
+    // The delta is a retract(old)+insert(new) pair.
+    assert_eq!(delta1.count, 2);
+
+    // The next range is contiguous: base 65, high-water 128.
+    let (base2, _delta2) = engine.reserve_user_sequence(seq_id, 64);
+    assert_eq!(base2, 65);
+    assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(128));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `saturating_add` keeps a reservation at the i64 ceiling from panicking
+/// (unreachable in practice — the client overflow guard rejects far sooner).
+#[test]
+fn test_reserve_user_sequence_saturates() {
+    let dir = temp_dir("reserve_user_seq_sat");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let seq_id = FIRST_USER_TABLE_ID;
+    engine.user_sequences.insert(seq_id, i64::MAX - 1);
+
+    let (base, _delta) = engine.reserve_user_sequence(seq_id, 64);
+    assert_eq!(base, i64::MAX); // hw + 1
+    assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(i64::MAX));
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// End-to-end durable round-trip: reserve → ingest the delta through the real
+/// family path (firing `hook_sequence_register`) → flush → reopen. Recovery must
+/// restore the high-water (the phantom retract of `(seq_id, 0)` on first use is
+/// weight-filtered), and the next reservation continues at `high_water + 1`.
+#[test]
+fn test_user_sequence_durable_roundtrip() {
+    let dir = temp_dir("user_seq_roundtrip");
+    let user_seq = FIRST_USER_TABLE_ID + 3;
+    {
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let (base, delta) = engine.reserve_user_sequence(user_seq, 64);
+        assert_eq!(base, 1);
+        // Clear the synchronously-set map entry to prove the hook re-populates it.
+        engine.user_sequences.remove(&user_seq);
+        engine.ingest_to_family(SEQ_TAB_ID, &delta).unwrap();
+        assert_eq!(engine.user_sequences.get(&user_seq).copied(), Some(64));
+        let _ = engine.sys_sequences.flush();
+        engine.close();
+    }
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    assert_eq!(engine.user_sequences.get(&user_seq).copied(), Some(64));
+    let (base2, _delta) = engine.reserve_user_sequence(user_seq, 64);
+    assert_eq!(base2, 65, "next id continues after the recovered high-water");
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The `>= FIRST_USER_TABLE_ID` recovery guard must ignore a stray sequence id
+/// in the empty 4..16 gap, never misclassifying it as a user sequence.
+#[test]
+fn test_recover_ignores_sub_user_seq_id() {
+    let dir = temp_dir("recover_gap_guard");
+    let stray = 7i64; // below FIRST_USER_TABLE_ID
+    {
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        let schema = seq_tab_schema();
+        let mut bb = BatchBuilder::new(schema);
+        bb.begin_row(stray as u128, 1);
+        bb.put_u64(999);
+        bb.end_row();
+        ingest_batch_into(&mut engine.sys_sequences, &bb.finish());
+        let _ = engine.sys_sequences.flush();
+        engine.close();
+    }
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    assert!(!engine.user_sequences.contains_key(&stray));
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── test_sequence_gap_recovery ───────────────────────────────────────
 
 #[test]
@@ -144,6 +237,7 @@ fn test_sequence_gap_recovery() {
         cbb.put_u64(0); // is_nullable
         cbb.put_u64(0); // fk_table_id
         cbb.put_u64(0); // fk_col_idx
+        cbb.put_u64(0); // is_serial
         cbb.end_row();
         ingest_batch_into(&mut engine.sys_columns, &cbb.finish());
 

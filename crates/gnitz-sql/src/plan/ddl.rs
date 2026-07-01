@@ -8,7 +8,7 @@ use crate::plan::validate::{
     default_index_name, reject_duplicate_column_names, reject_non_key_eligible, reject_unhonored_column_options,
     reject_unhonored_table_constraints, validate_user_index_name,
 };
-use crate::types::{int_domain_fits, is_integer_type, sql_type_to_typecode};
+use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, TypeCode};
 use sqlparser::ast::{
@@ -219,14 +219,22 @@ pub(crate) fn execute_create_table(
     }
     reject_unhonored_table_constraints(&create.constraints, "table constraint")?;
 
-    // Phase 1 — build column defs (name, type, nullability only).
+    // Phase 1 — build column defs (name, type, nullability only). A SERIAL
+    // column resolves to its underlying signed int, is always NOT NULL, and
+    // carries the `is_serial` marker; at most one per table. The lone-PK
+    // constraint is enforced after PK gathering (Phase 2).
     let mut cols: Vec<ColumnDef> = Vec::with_capacity(sql_cols.len());
     for col in sql_cols.iter() {
-        cols.push(ColumnDef::new(
-            col.name.value.clone(),
-            sql_type_to_typecode(&col.data_type)?,
-            !col.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull)),
-        ));
+        let cd = if let Some(tc) = serial_underlying(&col.data_type) {
+            ColumnDef::new(col.name.value.clone(), tc, false).serial() // NOT NULL
+        } else {
+            ColumnDef::new(
+                col.name.value.clone(),
+                sql_type_to_typecode(&col.data_type)?,
+                !col.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull)),
+            )
+        };
+        cols.push(cd);
     }
 
     // Phase 2 — gather PK column indices.
@@ -444,6 +452,22 @@ pub(crate) fn execute_create_table(
     // non-nullable here regardless of type.
     for &i in &pk_indices {
         cols[i as usize].is_nullable = false;
+    }
+
+    // A SERIAL column must be the table's sole, single-column PRIMARY KEY. This
+    // is load-bearing for the INSERT payload indexing (the single-PK closed form
+    // `payload_idx = ci if ci < pk_index else ci - 1` only holds for a lone PK),
+    // not just a simplification — reject a SERIAL column that is part of a compound
+    // PK, is not the PK at all, or shares the table with a second SERIAL column.
+    if cols.iter().filter(|c| c.is_serial).count() > 1 {
+        return Err(GnitzSqlError::Unsupported("at most one SERIAL column per table".into()));
+    }
+    if let Some(sci) = cols.iter().position(|c| c.is_serial) {
+        if pk_indices.as_slice() != [sci as u32] {
+            return Err(GnitzSqlError::Unsupported(
+                "a SERIAL column must be the table's single-column PRIMARY KEY".into(),
+            ));
+        }
     }
 
     // A lone single-column PK is already unique; drop a redundant secondary

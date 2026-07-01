@@ -87,13 +87,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
             pk_pairs.push((pos, i));
         }
 
-        columns.push(ColumnDef {
-            name,
-            type_code: tc,
-            is_nullable,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-        });
+        columns.push(ColumnDef::new(name, tc, is_nullable));
     }
 
     pk_pairs.sort_by_key(|(p, _)| *p);
@@ -159,13 +153,7 @@ mod tests {
     fn make_meta_batch(ncols: usize) -> ZSetBatch {
         let schema = Schema {
             columns: (0..ncols)
-                .map(|i| ColumnDef {
-                    name: format!("col{i}"),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                })
+                .map(|i| ColumnDef::new(format!("col{i}"), TypeCode::U64, false))
                 .collect(),
             pk_cols: vec![0],
         };
@@ -268,41 +256,11 @@ mod tests {
     fn test_schema_meta_roundtrip() {
         let original = Schema {
             columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    type_code: TypeCode::U64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "name".into(),
-                    type_code: TypeCode::String,
-                    is_nullable: true,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "score".into(),
-                    type_code: TypeCode::F64,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "tag".into(),
-                    type_code: TypeCode::I32,
-                    is_nullable: true,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
-                ColumnDef {
-                    name: "uuid".into(),
-                    type_code: TypeCode::U128,
-                    is_nullable: false,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                },
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("name", TypeCode::String, true),
+                ColumnDef::new("score", TypeCode::F64, false),
+                ColumnDef::new("tag", TypeCode::I32, true),
+                ColumnDef::new("uuid", TypeCode::U128, false),
             ],
             pk_cols: vec![0],
         };

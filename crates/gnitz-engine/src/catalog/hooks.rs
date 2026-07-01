@@ -83,11 +83,31 @@ impl CatalogEngine {
             SysFamily::ViewDep => {
                 self.dag.invalidate_dep_map();
             }
-            // No cache/side-effect reactions: sequences are master-only
-            // bookkeeping, and the circuit graph is loaded by `load_circuit`,
-            // not by hooks.
-            SysFamily::Sequence | SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => {
+            // Restore the user-sequence high-water from a durably-committed or
+            // SAL-replayed advance so a committed SERIAL id is never re-issued.
+            SysFamily::Sequence => {
+                self.hook_sequence_register(batch)?;
             }
+            // No cache/side-effect reactions: the circuit graph is loaded by
+            // `load_circuit`, not by hooks.
+            SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => {}
+        }
+        Ok(())
+    }
+
+    /// Fold a `sys_sequences` advance into the in-memory `user_sequences` map.
+    /// Fires via `submit` (live durable range advances and SAL replay at
+    /// recovery). Catalog sequences (`seq_id < FIRST_USER_TABLE_ID`) recover via
+    /// the object-id hooks instead, so they are skipped — the guard is defensive
+    /// since `advance_sequence` bypasses `submit` and never reaches here.
+    fn hook_sequence_register(&mut self, batch: &Batch) -> Result<(), String> {
+        for i in 0..batch.count {
+            if batch.get_weight(i) <= 0 {
+                continue;
+            }
+            let seq_id = batch.get_pk(i) as i64;
+            let hw = self.read_batch_u64(batch, i, SEQTAB_PAY_VALUE) as i64;
+            self.observe_user_sequence(seq_id, hw);
         }
         Ok(())
     }

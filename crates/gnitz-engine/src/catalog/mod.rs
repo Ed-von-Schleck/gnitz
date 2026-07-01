@@ -52,7 +52,7 @@ use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, CursorHandle, PartitionedTable, Persistence, Routing, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
-pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES};
+pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_TAB_ID};
 pub(crate) use sys_tables::{IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS};
 pub(crate) use sys_tables::{IDX_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID};
 pub(crate) use types::ColumnDef;
@@ -102,6 +102,13 @@ pub struct CatalogEngine {
     pub(crate) next_schema_id: i64,
     pub(crate) next_table_id: i64,
     pub(crate) next_index_id: i64,
+    /// User-table SERIAL sequences: `seq_id` (== table_id) → high-water (last id
+    /// handed out). Next id = high_water + 1. Populated at recovery from the
+    /// flushed `sys_sequences` shard and newer SAL advances, and durably advanced
+    /// per range reservation. Distinct from the scalar catalog counters above
+    /// because a user sequence's values live in worker-owned rows the master
+    /// cannot re-derive.
+    pub(crate) user_sequences: std::collections::HashMap<i64, i64>,
     pub(crate) active_part_start: u32,
     pub(crate) active_part_end: u32,
 

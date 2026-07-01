@@ -1427,14 +1427,12 @@ mod tests {
         let columns = (0..sd.num_columns())
             .map(|i| {
                 let col = &sd.columns[i];
-                ColumnDef {
-                    name: format!("c{i}"),
-                    // arb_schema only emits valid codes, so unwrap is total.
-                    type_code: TypeCode::try_from_u8(col.type_code).unwrap(),
-                    is_nullable: col.nullable != 0,
-                    fk_table_id: 0,
-                    fk_col_idx: 0,
-                }
+                // arb_schema only emits valid codes, so unwrap is total.
+                ColumnDef::new(
+                    format!("c{i}"),
+                    TypeCode::try_from_u8(col.type_code).unwrap(),
+                    col.nullable != 0,
+                )
             })
             .collect();
         let pk_cols = sd.pk_indices().iter().map(|&i| i as usize).collect();

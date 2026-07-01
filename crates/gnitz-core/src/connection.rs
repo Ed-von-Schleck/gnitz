@@ -7,8 +7,9 @@ use crate::protocol::{
     connect as proto_connect, hello_handshake, recv_message, send_message, send_message_noschema,
     send_message_with_extra, wire_flags_get_index_version, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
     wire_flags_set_index_version, wire_flags_set_schema_version, Message, PkTuple, Schema, WireConflictMode, ZSetBatch,
-    FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES,
-    FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
+    FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
+    FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR,
+    STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
 };
 use lru::LruCache;
 
@@ -84,18 +85,28 @@ impl Connection {
     }
 
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
-        let msg = self.roundtrip(0, FLAG_ALLOCATE_TABLE_ID, None, None)?;
+        let msg = self.roundtrip(0, FLAG_ALLOCATE_TABLE_ID, 0, None, None)?;
         Ok(msg.target_id)
     }
 
     pub fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
-        let msg = self.roundtrip(0, FLAG_ALLOCATE_SCHEMA_ID, None, None)?;
+        let msg = self.roundtrip(0, FLAG_ALLOCATE_SCHEMA_ID, 0, None, None)?;
         Ok(msg.target_id)
     }
 
     pub fn alloc_index_id(&mut self) -> Result<u64, ClientError> {
-        let msg = self.roundtrip(0, FLAG_ALLOCATE_INDEX_ID, None, None)?;
+        let msg = self.roundtrip(0, FLAG_ALLOCATE_INDEX_ID, 0, None, None)?;
         Ok(msg.target_id)
+    }
+
+    /// Reserve a contiguous range of `count` SERIAL ids for the sequence keyed
+    /// by `seq_table_id`. Returns the range base; the caller owns
+    /// `[base, base + count)`. The range `count` rides in `seek_col_idx`, and
+    /// `target_id = seq_table_id ≠ 0` steers the master to the durable
+    /// range-advance branch.
+    pub fn alloc_serial_range(&mut self, seq_table_id: u64, count: u64) -> Result<u64, ClientError> {
+        let msg = self.roundtrip(seq_table_id, FLAG_ALLOCATE_SERIAL_RANGE, count, None, None)?;
+        Ok(msg.target_id) // base of [base, base + count)
     }
 
     /// Default push: silent-upsert (`WireConflictMode::Update`).
@@ -258,6 +269,7 @@ impl Connection {
         &mut self,
         target_id: u64,
         flags: u64,
+        seek_col_idx: u64,
         schema: Option<&Schema>,
         data: Option<&ZSetBatch>,
     ) -> Result<Message, ClientError> {
@@ -267,7 +279,7 @@ impl Connection {
             self.client_id,
             flags,
             &PkTuple::EMPTY,
-            0,
+            seek_col_idx,
             schema,
             data,
         )?;
@@ -448,13 +460,7 @@ mod cache_tests {
     fn schema_cache_arc_not_clone() {
         let mut cache: LruCache<u64, (Arc<Schema>, u16)> = LruCache::new(std::num::NonZeroUsize::new(4).unwrap());
         let schema = Arc::new(Schema {
-            columns: vec![ColumnDef {
-                name: "id".into(),
-                type_code: TypeCode::I64,
-                is_nullable: false,
-                fk_table_id: 0,
-                fk_col_idx: 0,
-            }],
+            columns: vec![ColumnDef::new("id", TypeCode::I64, false)],
             pk_cols: vec![0],
         });
         cache.put(42, (Arc::clone(&schema), 1));
