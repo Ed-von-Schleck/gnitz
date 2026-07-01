@@ -313,24 +313,9 @@ impl CatalogEngine {
                 let seq_id = cursor.cursor.current_key_narrow() as u64 as i64;
                 let val = cursor_read_u64(&cursor, SEQTAB_COL_VALUE) as i64;
                 match seq_id {
-                    SEQ_ID_SCHEMAS => {
-                        let next = val + 1;
-                        if next > self.next_schema_id {
-                            self.next_schema_id = next;
-                        }
-                    }
-                    SEQ_ID_TABLES => {
-                        let next = val + 1;
-                        if next > self.next_table_id {
-                            self.next_table_id = next;
-                        }
-                    }
-                    SEQ_ID_INDICES => {
-                        let next = val + 1;
-                        if next > self.next_index_id {
-                            self.next_index_id = next;
-                        }
-                    }
+                    SEQ_ID_SCHEMAS => raise_id_counter(&mut self.next_schema_id, val),
+                    SEQ_ID_TABLES => raise_id_counter(&mut self.next_table_id, val),
+                    SEQ_ID_INDICES => raise_id_counter(&mut self.next_index_id, val),
                     // User-table SERIAL sequence (seq_id == table_id ≥
                     // FIRST_USER_TABLE_ID). Store the high-water; next id =
                     // high_water + 1. `observe_user_sequence` ignores a stray

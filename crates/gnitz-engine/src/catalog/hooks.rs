@@ -314,9 +314,7 @@ impl CatalogEngine {
                     0,
                     directory,
                 );
-                if tid + 1 > self.next_table_id {
-                    self.next_table_id = tid + 1;
-                }
+                raise_id_counter(&mut self.next_table_id, tid);
             } else if let Some(directory) = self.dag.tables.get(&tid).map(|e| e.directory.clone()) {
                 // Safe to cascade unconditionally: precheck_sys_ingest rejects
                 // FK/view-dep-blocked drops before the -1 row reaches the WAL.
@@ -469,9 +467,7 @@ impl CatalogEngine {
                     max_depth,
                     directory,
                 );
-                if vid + 1 > self.next_table_id {
-                    self.next_table_id = vid + 1;
-                }
+                raise_id_counter(&mut self.next_table_id, vid);
 
                 // During DROP VIEW rollback the partition files are intact; re-pushing
                 // source rows through the circuit would double every aggregation.
@@ -563,9 +559,7 @@ impl CatalogEngine {
                 // Keep worker next_index_id in sync with master-assigned IDs so that
                 // create_fk_indices → allocate_index_id never collides with an explicit
                 // user index that was broadcast via IDX_TAB +1.
-                if idx_id + 1 > self.next_index_id {
-                    self.next_index_id = idx_id + 1;
-                }
+                raise_id_counter(&mut self.next_index_id, idx_id);
 
                 // One circuit per column list (dedup by ordered list). If an
                 // incumbent exists, don't build a second table — but a UNIQUE

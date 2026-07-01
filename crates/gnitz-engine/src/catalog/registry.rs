@@ -243,6 +243,22 @@ impl CatalogEngine {
     }
 }
 
+/// Raise a monotonic catalog id counter so the next allocation lands strictly
+/// past `allocated` (the largest id known to be in use). Monotone and
+/// idempotent — never lowers the counter, so a retract+reinsert replay is a
+/// no-op. Scalar-counter analog of `observe_user_sequence`: single-sources the
+/// "never re-issue a durably registered id after a crash lost the memtable-only
+/// `advance_sequence`" invariant shared by the object-register replay paths
+/// (`hook_{table,view,index}_register` and `apply_schema_by_id`, from the
+/// fsync'd TABLE_TAB / VIEW_TAB / IDX_TAB / SCHEMA_TAB row) and
+/// `recover_sequences` (the flushed `sys_sequences` scan). A free fn rather than
+/// a method so callers can pass `&mut self.next_*_id` while `self` is otherwise
+/// borrowed.
+#[inline]
+pub(super) fn raise_id_counter(counter: &mut i64, allocated: i64) {
+    *counter = (*counter).max(allocated + 1);
+}
+
 /// Build the `sys_sequences` retract-old + insert-new delta for one sequence.
 /// Shared by `advance_sequence` (ingests to the memtable) and
 /// `reserve_user_sequence` (returns it for the durable commit).

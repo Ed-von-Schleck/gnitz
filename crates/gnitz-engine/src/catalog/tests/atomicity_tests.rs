@@ -5,6 +5,14 @@ use std::fs;
 // Helpers (supplement the shared helpers in mod.rs)
 // ---------------------------------------------------------------------------
 
+fn build_schema_tab_row(sid: i64, name: &str) -> Batch {
+    let mut bb = BatchBuilder::new(schema_tab_schema());
+    bb.begin_row(sid as u128, 1);
+    bb.put_string(name);
+    bb.end_row();
+    bb.finish()
+}
+
 fn build_idx_tab_row(idx_id: i64, owner_id: i64, source_col_idx: u64, name: &str, is_unique: bool) -> Batch {
     let mut bb = BatchBuilder::new(idx_tab_schema());
     bb.begin_row(idx_id as u128, 1);
@@ -514,6 +522,34 @@ fn test_next_index_id_advances_on_index_register() {
          hook_index_register (not advanced before fix)",
         engine.next_index_id,
         large_idx_id
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_next_schema_id_advances_on_schema_register() {
+    // Pre-fix: the Schema-family appliers never advance next_schema_id, so a
+    // SCHEMA_TAB row replayed from the SAL after a crash-before-checkpoint
+    // restores the schema's caches but leaves next_schema_id stale — the next
+    // CREATE SCHEMA re-allocates the same schema_id. Mirrors
+    // test_next_index_id_advances_on_index_register.
+    let dir = temp_dir("atomicity_schema_seq");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    // A SCHEMA_TAB row whose id is far ahead of the recovered counter, standing
+    // in for a durable CREATE SCHEMA whose sys_sequences advance never reached a
+    // flushed shard.
+    let large_sid = engine.next_schema_id + 500;
+    let batch = build_schema_tab_row(large_sid, "recovered_schema");
+    engine.ingest_to_family(SCHEMA_TAB_ID, &batch).unwrap();
+
+    assert!(
+        engine.next_schema_id > large_sid,
+        "next_schema_id ({}) must exceed the registered sid ({}) so \
+         allocate_schema_id never re-issues it (not advanced before fix)",
+        engine.next_schema_id,
+        large_sid,
     );
 
     let _ = fs::remove_dir_all(&dir);

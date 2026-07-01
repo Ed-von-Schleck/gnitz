@@ -136,6 +136,12 @@ impl CatalogEngine {
             if weight > 0 {
                 let name = self.read_batch_string(batch, i, 0);
                 self.caches.schema_by_id.insert(sid, name);
+                // Re-derive next_schema_id from the durable SCHEMA_TAB row so a
+                // crash-before-checkpoint never re-issues it (advance_sequence is
+                // memtable-only; this row is fsync'd at CREATE). The Schema family
+                // has no hook_schema_register, so this applier is its re-derive
+                // site — the role hook_{table,index}_register play for their ids.
+                raise_id_counter(&mut self.next_schema_id, sid);
             } else {
                 self.caches.schema_by_id.remove(&sid);
             }

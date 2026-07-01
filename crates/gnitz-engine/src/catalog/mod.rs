@@ -68,6 +68,7 @@ pub(in crate::catalog) use cache::CatalogCacheSet;
 #[cfg(test)]
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
+pub(in crate::catalog) use registry::raise_id_counter;
 pub(in crate::catalog) use sys_tables::SysFamily;
 pub(in crate::catalog) use sys_tables::{PUBLIC_SCHEMA_ID, SYSTEM_SCHEMA_ID};
 pub(in crate::catalog) use types::{FkConstraint, FkParentRef};

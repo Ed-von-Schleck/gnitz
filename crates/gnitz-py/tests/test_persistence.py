@@ -940,6 +940,32 @@ def test_sequence_monotonicity_after_crash():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_schema_id_not_reused_after_crash_before_checkpoint():
+    """CREATE SCHEMA, hard-crash before any checkpoint, CREATE another schema:
+    the two schema_ids must differ. Pre-fix, next_schema_id recovers stale from
+    the unflushed sys_sequences shard and the second CREATE re-allocates the
+    first id. Schema analog of test_sequence_monotonicity_after_crash."""
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        proc = _start_server(data_dir, sock_path)
+        conn = gnitz.connect(sock_path)
+        sid1 = conn.create_schema("crash_s1")
+        conn.close()
+
+        proc = _crash_and_restart(proc, sock_path, data_dir)
+        conn = gnitz.connect(sock_path)
+        sid2 = conn.create_schema("crash_s2")
+        conn.close()
+        _stop_server(proc)
+
+        assert sid2 > sid1, (
+            f"schema_id reused after crash-before-checkpoint: "
+            f"crash_s1={sid1}, crash_s2={sid2}"
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_double_crash_recovery():
     """Data survives two consecutive crashes without any clean shutdown."""
     tmpdir, data_dir, sock_path = _make_env()
