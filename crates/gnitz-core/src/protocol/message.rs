@@ -4,8 +4,8 @@ use std::sync::OnceLock;
 use super::codec::{batch_to_schema, schema_to_batch};
 use super::error::ProtocolError;
 use super::header::{
-    wire_flags_get_schema_version, Header, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK,
-    STATUS_SCHEMA_MISMATCH,
+    wire_flags_get_schema_version, Header, FLAG_DDL_TXN, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_ERROR, STATUS_NO_INDEX,
+    STATUS_OK, STATUS_SCHEMA_MISMATCH,
 };
 use super::header::{IPC_CONTROL_TID, WAL_BLOCK_HEADER_SIZE};
 use super::transport::{recv_framed, send_framed};
@@ -246,6 +246,36 @@ pub fn encode_message(
     }
     if let Some(db) = data_block {
         out.extend_from_slice(&db);
+    }
+    Ok(out)
+}
+
+/// Encode an atomic DDL transaction frame (`FLAG_DDL_TXN`) into wire bytes
+/// (without the 4-byte frame header). Every system-table write — a `CREATE`'s N
+/// family batches, a `DROP`/`CREATE INDEX`/`CREATE SCHEMA`'s single batch — is
+/// carried by one such frame so the server ingests the whole bundle under one
+/// durable SAL zone.
+///
+/// Layout: the reused control block (`target_id = 0`, `flags = FLAG_DDL_TXN`),
+/// then `u32` family count, then each family's `encode_wal_block`. Each data
+/// block embeds its own `table_id` (WAL offset 8) and total size (WAL offset
+/// 16), so the server decoder walks the list by header alone with no schema in
+/// hand and defers schema resolution to the catalog layer.
+pub fn encode_ddl_txn(client_id: u64, families: &[(u64, &Schema, ZSetBatch)]) -> Result<Vec<u8>, ProtocolError> {
+    let ctrl_hdr = Header {
+        status: STATUS_OK,
+        target_id: 0,
+        client_id,
+        flags: FLAG_DDL_TXN,
+        seek_pk: 0,
+        seek_col_idx: 0,
+        request_id: 0,
+    };
+    let mut out = encode_control_block(&ctrl_hdr, "", &[])?;
+    out.extend_from_slice(&(families.len() as u32).to_le_bytes());
+    for (tid, schema, batch) in families {
+        let block = encode_wal_block(schema, *tid as u32, batch);
+        out.extend_from_slice(&block);
     }
     Ok(out)
 }

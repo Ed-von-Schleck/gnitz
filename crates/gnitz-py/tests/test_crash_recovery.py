@@ -280,6 +280,147 @@ def test_ddl_crash_with_workers_no_orphans():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_ddl_crash_fk_and_view_no_orphan():
+    """A CREATE TABLE child(... REFERENCES parent) and a CREATE VIEW over parent
+    that abort after broadcasts but before the commit sentinel must leave no
+    durable trace — no orphan COL_TAB/DEP_TAB that would block the parent. The
+    pre-fix cross-zone orphan (COL_TAB committed in its own zone before the
+    owning TABLE_TAB) is structurally unconstructible once a CREATE is one atomic
+    message, so this is the regression proof."""
+    if not is_debug_build():
+        pytest.skip("requires debug build (GNITZ_INJECT_DDL_PANIC seam)")
+
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # ---- Phase 1: clean parent with data. -----------------------------
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("crash_fk")
+        conn.execute_sql(
+            "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)",
+            schema_name="crash_fk",
+        )
+        conn.execute_sql("INSERT INTO parent VALUES (1), (2), (3)", schema_name="crash_fk")
+        conn.close()
+
+        # ---- Phase 2a: crash a CREATE TABLE child with an FK to parent. ----
+        proc = _restart_server(
+            proc, data_dir, sock_path, workers=_NUM_WORKERS,
+            extra_env={"GNITZ_INJECT_DDL_PANIC": "after_broadcasts"},
+        )
+        conn = gnitz.connect(sock_path)
+        try:
+            conn.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT NOT NULL PRIMARY KEY,"
+                "  pid BIGINT NOT NULL REFERENCES parent(id))",
+                schema_name="crash_fk",
+            )
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _wait_for_crash(proc)
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 2b: crash a CREATE VIEW over parent. -------------------
+        proc = _restart_server(
+            proc, data_dir, sock_path, workers=_NUM_WORKERS,
+            extra_env={"GNITZ_INJECT_DDL_PANIC": "after_broadcasts"},
+        )
+        conn = gnitz.connect(sock_path)
+        try:
+            conn.execute_sql(
+                "CREATE VIEW v AS SELECT id FROM parent",
+                schema_name="crash_fk",
+            )
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _wait_for_crash(proc)
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 3: restart clean, verify parent is untouched. ----------
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        # Neither aborted entity survives.
+        with pytest.raises(Exception):
+            conn.resolve_table("crash_fk", "child")
+        # No phantom FK child blocks a DELETE of the parent's rows...
+        conn.execute_sql("DELETE FROM parent WHERE id = 1", schema_name="crash_fk")
+        # ...nor an orphan FK child / view dependency blocks DROP TABLE parent.
+        conn.execute_sql("DROP TABLE parent", schema_name="crash_fk")
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_ddl_crash_unique_index_foldin_rolls_back():
+    """CREATE TABLE with an inline UNIQUE index that aborts after broadcasts must
+    roll the WHOLE zone back — never a committed table missing its unique index.
+    After a clean restart the table does not exist, and a fresh re-create still
+    enforces the unique constraint (proving the folded-in index came back)."""
+    if not is_debug_build():
+        pytest.skip("requires debug build (GNITZ_INJECT_DDL_PANIC seam)")
+
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("crash_uidx")
+        conn.close()
+
+        proc = _restart_server(
+            proc, data_dir, sock_path, workers=_NUM_WORKERS,
+            extra_env={"GNITZ_INJECT_DDL_PANIC": "after_broadcasts"},
+        )
+        conn = gnitz.connect(sock_path)
+        try:
+            conn.execute_sql(
+                "CREATE TABLE t ("
+                "  a BIGINT NOT NULL PRIMARY KEY,"
+                "  b BIGINT NOT NULL UNIQUE)",
+                schema_name="crash_uidx",
+            )
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _wait_for_crash(proc)
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        # The whole bundle (COL_TAB + TABLE_TAB + IDX_TAB) rolled back — no table.
+        with pytest.raises(Exception):
+            conn.resolve_table("crash_uidx", "t")
+        # A clean re-create still enforces the unique constraint.
+        conn.execute_sql(
+            "CREATE TABLE t ("
+            "  a BIGINT NOT NULL PRIMARY KEY,"
+            "  b BIGINT NOT NULL UNIQUE)",
+            schema_name="crash_uidx",
+        )
+        conn.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name="crash_uidx")
+        with pytest.raises(Exception):
+            conn.execute_sql("INSERT INTO t VALUES (2, 10)", schema_name="crash_uidx")
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _index_on_col(conn, owner_tid, col_idx):
     """True if a live IdxTab row indexes column `col_idx` of table `owner_tid`."""
     from gnitz.core import IDX_TAB, unpack_pk_cols

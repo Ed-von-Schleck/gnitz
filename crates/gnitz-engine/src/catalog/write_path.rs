@@ -32,26 +32,17 @@ pub(crate) trait CatalogDeltaSink {
 }
 
 impl CatalogDeltaSink for CatalogEngine {
-    fn submit(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
+    fn submit(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
         if self.ctx.in_rollback() {
             // During rollback all cascade writes must bypass pending_broadcasts
             // so no compensating row is re-broadcast to workers.
             return self.submit_local(family, batch);
         }
-        let id = family.id();
-        // Reject BEFORE any WAL write; avoids dangling retractions that would
-        // later trip replay_catalog.
-        self.precheck_sys_ingest(id, &batch)?;
-        // Apply + fire hooks, pinning this zone's writes to the DDL zone LSN.
-        self.apply_local(family, &mut batch, self.ctx.ddl_zone_lsn())?;
-
-        // Enqueue after hooks so nested cascade pushes land first and the
-        // executor broadcasts children → parent. Drop empty batches so
-        // worker-side no-op cascades don't accumulate unread entries.
-        if batch.count > 0 {
-            self.pending_broadcasts.push((id, batch));
-        }
-        Ok(())
+        // `submit` is the composition of the two steps the DDL_TXN handler drives
+        // separately per bundle family: precheck (no mutation) then
+        // apply-and-enqueue. Cascade callers (hooks) keep the atomic composition.
+        self.precheck_family(family.id(), &batch)?;
+        self.apply_and_enqueue_family(family.id(), batch)
     }
 
     fn submit_local(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
@@ -142,6 +133,39 @@ impl CatalogEngine {
                 Ok(())
             }
         }
+    }
+
+    /// Precheck one system-family delta (the CREATE/DROP invariant guards) with
+    /// no mutation — the read-only half of [`CatalogDeltaSink::submit`]. Exposed
+    /// so the `DDL_TXN` handler can precheck a family, set its rollback marker,
+    /// then apply it, leaving the marker `None` iff the precheck failed (so a
+    /// precheck rejection reconstructs no ghost row on rollback).
+    pub(crate) fn precheck_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
+        self.precheck_sys_ingest(table_id, batch)
+    }
+
+    /// Apply one system-family delta to storage, fire its hooks, and enqueue it
+    /// for broadcast — the mutating half of [`CatalogDeltaSink::submit`], pinned
+    /// to the open DDL zone LSN. Takes the batch by value so it moves straight
+    /// into `pending_broadcasts` (one storage clone, no hooks clone). Enqueue
+    /// happens after hooks so nested cascade pushes land first and the executor
+    /// broadcasts children → parent; empty batches are dropped so worker-side
+    /// no-op cascades don't accumulate unread entries.
+    pub(crate) fn apply_and_enqueue_family(&mut self, table_id: i64, mut batch: Batch) -> Result<(), String> {
+        let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
+        self.apply_local(family, &mut batch, self.ctx.ddl_zone_lsn())?;
+        if batch.count > 0 {
+            self.pending_broadcasts.push((table_id, batch));
+        }
+        Ok(())
+    }
+
+    /// The schema descriptor for a system-family `tid`, or `None` if `tid` is not
+    /// a system family. Unlike `get_schema_desc`, this never panics on an unknown
+    /// id in the system range, so the `DDL_TXN` decoder can reject a bogus family
+    /// tid before decoding its wal-block slice into a `Batch`.
+    pub(crate) fn sys_family_schema(&self, tid: i64) -> Option<SchemaDescriptor> {
+        SysFamily::from_id(tid).map(|f| sys_tab_schema(f.id()))
     }
 
     /// Emit the single retraction delta for `pk` in `family`: seek the live row,
@@ -690,10 +714,13 @@ impl CatalogEngine {
     // Stage-A compensation (DDL rollback)
     // -----------------------------------------------------------------------
 
-    /// Topological creation priority for rollback sort. Lower = earlier in the
-    /// dependency chain (created first, destroyed last). Priorities must be
-    /// distinct for TABLE_TAB and VIEW_TAB so the relative order is stable.
-    fn rollback_topo_priority(tid: i64) -> u8 {
+    /// Topological creation priority for the catalog family order. Lower =
+    /// earlier in the dependency chain (created first, destroyed last). Used both
+    /// to order the `DDL_TXN` handler's ascending forward ingest (so every
+    /// register/index hook sees its dependencies already in the memtable) and to
+    /// order rollback's descending negate. Priorities must be distinct for
+    /// TABLE_TAB and VIEW_TAB so the relative order is stable.
+    pub(crate) fn catalog_topo_priority(tid: i64) -> u8 {
         match tid {
             SCHEMA_TAB_ID => 0,
             COL_TAB_ID => 1,
@@ -718,42 +745,55 @@ impl CatalogEngine {
         }
     }
 
-    /// Compensate a failed Stage-A DDL: undo every in-memory mutation that
-    /// was applied before the failure so the catalog is exactly as it was.
+    /// Compensate a failed `DDL_TXN` bundle: undo every in-memory mutation that
+    /// was applied before the failure so the catalog is exactly as it was, in
+    /// master memory, before any worker sees a byte.
     ///
-    /// Called from the executor's Stage-A error arm. `original_batch` is the
-    /// batch that was passed to `ingest_to_family` before the failure.
-    pub(crate) fn compensate_stage_a(&mut self, target_id: i64, original_batch: &Batch) {
+    /// The drained `pending_broadcasts` already holds every family that was
+    /// applied **and enqueued** (the families before the failing one). The
+    /// handler additionally passes the single family that was applied but **not
+    /// yet enqueued** — a hook/panic failure inside `apply_and_enqueue_family` —
+    /// as `applied_not_enqueued`, so it too is negated. On a **precheck** failure
+    /// the handler passes `None`: nothing was applied for that family, so nothing
+    /// is reconstructed and **no ghost `-1` is written**. At most one family is
+    /// ever applied-not-enqueued, so `Option` is the exact type.
+    pub(crate) fn compensate_stage_a(&mut self, applied_not_enqueued: Option<(i64, Batch)>) {
         let mut rollback_list = self.drain_pending_broadcasts();
 
-        // pending_broadcasts is children-before-parents: the top-level batch is
-        // pushed last (after fire_hooks returns Ok). It is present iff fire_hooks
-        // succeeded (evaluate_dag then panicked); absent iff fire_hooks itself
-        // failed. Use iter().any() for robustness over .last().
-        let top_level_present = rollback_list.iter().any(|(tid, _)| *tid == target_id);
-        if !top_level_present {
-            let mut b = original_batch.clone();
-            b.set_schema(sys_tab_schema(target_id));
-            rollback_list.push((target_id, b));
+        if let Some((tid, mut batch)) = applied_not_enqueued {
+            batch.set_schema(sys_tab_schema(tid));
+            rollback_list.push((tid, batch));
         }
 
-        let is_create = (0..original_batch.count).any(|i| original_batch.get_weight(i) > 0);
+        // Precheck-failed first family: nothing applied, trivial no-op.
+        if rollback_list.is_empty() {
+            return;
+        }
+
+        // Derive the rollback direction from the (weight-uniform) list: a bundle
+        // is either a CREATE (all +1) or a DROP (all -1).
+        let is_create = rollback_list
+            .iter()
+            .any(|(_, b)| (0..b.count).any(|i| b.get_weight(i) > 0));
 
         debug_assert!(
-            original_batch.count == 0
-                || (0..original_batch.count).all(|i| original_batch.get_weight(i) > 0)
-                || (0..original_batch.count).all(|i| original_batch.get_weight(i) < 0),
-            "compensate_stage_a assumes a weight-homogeneous top-level batch; a mixed \
-             CREATE/DROP batch would misclassify the rollback direction and mishandle \
+            rollback_list
+                .iter()
+                .all(|(_, b)| (0..b.count).all(|i| b.get_weight(i) > 0))
+                || rollback_list
+                    .iter()
+                    .all(|(_, b)| (0..b.count).all(|i| b.get_weight(i) < 0)),
+            "compensate_stage_a assumes a weight-homogeneous bundle; a mixed \
+             CREATE/DROP bundle would misclassify the rollback direction and mishandle \
              pending_dir_deletions"
         );
 
         // For CREATE rollback: dependents unregistered before dependencies — DESCENDING.
         // For DROP rollback: dependencies restored before dependents — ASCENDING.
         if is_create {
-            rollback_list.sort_by_key(|(tid, _)| std::cmp::Reverse(Self::rollback_topo_priority(*tid)));
+            rollback_list.sort_by_key(|(tid, _)| std::cmp::Reverse(Self::catalog_topo_priority(*tid)));
         } else {
-            rollback_list.sort_by_key(|(tid, _)| Self::rollback_topo_priority(*tid));
+            rollback_list.sort_by_key(|(tid, _)| Self::catalog_topo_priority(*tid));
         }
 
         // Replay each with negated weight through the no-broadcast path.

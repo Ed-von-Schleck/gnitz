@@ -720,6 +720,8 @@ pub unsafe extern "C" fn gnitz_create_table(
         unique_pk != 0,
         false,
         0,
+        // No inline UNIQUE constraint surface in the C API (those ride on SQL DDL).
+        &[],
     ) {
         Ok(id) => id,
         Err(e) => {

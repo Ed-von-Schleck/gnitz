@@ -25,6 +25,36 @@ pub const MAX_WORKERS: usize = 64;
 pub(crate) const GROUP_HEADER_SIZE: usize = 576;
 pub const SAL_MMAP_SIZE: usize = 1 << 30;
 
+/// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
+/// plus the 2 MiB prefault-ahead window and the checkpoint headroom.
+const MIN_SAL_BYTES: usize = 16 << 20;
+
+/// The SAL mmap size in bytes. `SAL_MMAP_SIZE` (1 GiB) is the production default;
+/// `GNITZ_SAL_BYTES` overrides it downward. This exists because each server
+/// eagerly `fallocate`s + pre-faults the *whole* SAL at startup, so on a shared
+/// data_dir filesystem (e.g. a tmpfs `/tmp`) many servers spawning in parallel
+/// can exhaust it and take a `SIGBUS` on the forced page-fault — the integration
+/// test harness spawns dozens at once, so it sets a small value. The size is read
+/// once and cached: the master and its `fork()`ed workers inherit both the env
+/// and this cache, so they can never disagree on the wrap arithmetic. The
+/// override is clamped to `[MIN_SAL_BYTES, SAL_MMAP_SIZE]`.
+///
+/// Keep the value consistent across restarts on a given data_dir: recovery walks
+/// only the first `sal_mmap_size()` bytes of the SAL file, so restarting with a
+/// smaller size after a crash could skip committed-but-unflushed groups written
+/// past the new bound (do a clean shutdown/checkpoint before shrinking).
+pub fn sal_mmap_size() -> usize {
+    use std::sync::OnceLock;
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("GNITZ_SAL_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|v| v.clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE))
+            .unwrap_or(SAL_MMAP_SIZE)
+    })
+}
+
 const PAGE_SIZE: u64 = 4096;
 
 // SAL group header flags (u32)
@@ -1207,18 +1237,29 @@ pub struct SalMessage<'a> {
 pub struct SalReader {
     ptr: *const u8,
     worker_id: u32,
+    mmap_size: u64,
     m2w_efd: i32,
 }
 
 unsafe impl Send for SalReader {}
 
 impl SalReader {
-    pub fn new(ptr: *const u8, worker_id: u32, _mmap_size: usize, m2w_efd: i32) -> Self {
+    pub fn new(ptr: *const u8, worker_id: u32, mmap_size: usize, m2w_efd: i32) -> Self {
         SalReader {
             ptr,
             worker_id,
+            mmap_size: mmap_size as u64,
             m2w_efd,
         }
+    }
+
+    /// The SAL mmap size this reader was opened with. Stored rather than
+    /// re-fetched from the `sal_mmap_size()` global so the hot per-group read
+    /// loops do a field read, not an atomic `OnceLock` load. Mirrors
+    /// `SalWriter::mmap_size`.
+    #[inline]
+    pub fn mmap_size(&self) -> u64 {
+        self.mmap_size
     }
 
     /// Read next group at `cursor`. Returns None if no message.

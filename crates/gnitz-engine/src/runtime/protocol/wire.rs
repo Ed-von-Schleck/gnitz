@@ -52,6 +52,7 @@ pub(crate) fn layout_from_wire_flags(flags: u64) -> crate::storage::Layout {
 
 // WAL block header field offsets (matches storage/lsm/wal.rs; duplicated here to
 // avoid cross-module coupling between runtime and storage internals).
+const WAL_OFF_TID: usize = 8;
 const WAL_OFF_COUNT: usize = 12;
 pub(crate) const WAL_OFF_SIZE: usize = 16;
 const WAL_OFF_VERSION: usize = 20;
@@ -1122,6 +1123,63 @@ pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
     decode_wire_impl(data, None, true)
 }
 
+/// Decode a `FLAG_DDL_TXN` frame into its per-family `(table_id, wal-block
+/// slice)` list, in send order. Walks the concatenated family blocks by header
+/// alone — `table_id` at `WAL_OFF_TID`, total size at `WAL_OFF_SIZE` — so no
+/// schema is needed here; the caller resolves each family's schema from the
+/// catalog and calls `Batch::decode_from_wal_block` on its slice. The frame is:
+/// control block, then `u32` family count, then `count` data blocks. The control
+/// block is validated (version, region count) but not returned — the caller
+/// already has the routing header from `handle_message`'s peek.
+/// Read the length-prefixed WAL block at `off` in `data`: confirm the header is
+/// present, read the block's total size (`WAL_OFF_SIZE`), confirm the block fits,
+/// and return its slice. Every framed decoder walks concatenated blocks this way
+/// — the schema block, the data block, each DDL_TXN family — so the bounds check
+/// lives in one place; callers advance `off` by the returned slice's `len()`. The
+/// header-present check precedes the size read, so the 4-byte field access is
+/// always in range.
+fn wal_block_slice_at(data: &[u8], off: usize) -> Result<&[u8], &'static str> {
+    if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
+        return Err("WAL block header truncated");
+    }
+    let size = u32::from_le_bytes(data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
+    if size < gnitz_wire::WAL_HEADER_SIZE || off + size > data.len() {
+        return Err("WAL block truncated");
+    }
+    Ok(&data[off..off + size])
+}
+
+pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(i64, &[u8])>, &'static str> {
+    if data.len() < gnitz_wire::WAL_HEADER_SIZE {
+        return Err("IPC payload too small");
+    }
+    let ctrl_size = u32::from_le_bytes(
+        data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4]
+            .try_into()
+            .map_err(|_| "bad control size")?,
+    ) as usize;
+    if ctrl_size > data.len() {
+        return Err("control block truncated");
+    }
+    peek_control_block(&data[..ctrl_size])?;
+
+    let mut off = ctrl_size;
+    if off + 4 > data.len() {
+        return Err("DDL_TXN family count truncated");
+    }
+    let count = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+
+    let mut families = Vec::with_capacity(count);
+    for _ in 0..count {
+        let block = wal_block_slice_at(data, off)?;
+        let tid = u32::from_le_bytes(block[WAL_OFF_TID..WAL_OFF_TID + 4].try_into().unwrap()) as i64;
+        families.push((tid, block));
+        off += block.len();
+    }
+    Ok(families)
+}
+
 /// Like `decode_wire` but skips WAL block checksum verification.  Use for
 /// trusted intra-process IPC (W2M ring).
 pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
@@ -1224,18 +1282,8 @@ fn decode_wire_body(
     }
 
     if has_schema {
-        if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
-            return Err("schema block truncated");
-        }
-        let schema_size = u32::from_le_bytes(
-            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4]
-                .try_into()
-                .map_err(|_| "bad schema size")?,
-        ) as usize;
-        if off + schema_size > data.len() {
-            return Err("schema block truncated");
-        }
-        let parsed = decode_schema_block(&data[off..off + schema_size], verify_checksum)?;
+        let sblock = wal_block_slice_at(data, off)?;
+        let parsed = decode_schema_block(sblock, verify_checksum)?;
         // Integrity cross-check against hint even when versions match.
         if let Some(ref hint) = schema_hint {
             if crate::schema::validate_schema_match(&parsed, hint.descriptor).is_err() {
@@ -1245,23 +1293,13 @@ fn decode_wire_body(
         } else {
             wire_schema = Some(parsed);
         }
-        off += schema_size;
+        off += sblock.len();
     }
 
     let data_batch = if has_data {
         let eff_schema = wire_schema.as_ref().ok_or("no schema for data block")?;
-        if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
-            return Err("data block truncated");
-        }
-        let data_size = u32::from_le_bytes(
-            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4]
-                .try_into()
-                .map_err(|_| "bad data size")?,
-        ) as usize;
-        if off + data_size > data.len() {
-            return Err("data block truncated");
-        }
-        let (mut batch, _) = Batch::decode_from_wal_block(&data[off..off + data_size], eff_schema, verify_checksum)?;
+        let dblock = wal_block_slice_at(data, off)?;
+        let (mut batch, _) = Batch::decode_from_wal_block(dblock, eff_schema, verify_checksum)?;
         // The constructor defaults `Raw`; raise to the wire's claim, debug-verifying
         // the decoded data against it (the backstop against a lying frame).
         batch.certify_layout(layout_from_wire_flags(flags), eff_schema);
@@ -1303,35 +1341,15 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     }
 
     if has_schema {
-        if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
-            return Err("schema block truncated");
-        }
-        let schema_size = u32::from_le_bytes(
-            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4]
-                .try_into()
-                .map_err(|_| "bad schema size")?,
-        ) as usize;
-        if off + schema_size > data.len() {
-            return Err("schema block truncated");
-        }
-        wire_schema = Some(decode_schema_block(&data[off..off + schema_size], false)?);
-        off += schema_size;
+        let sblock = wal_block_slice_at(data, off)?;
+        wire_schema = Some(decode_schema_block(sblock, false)?);
+        off += sblock.len();
     }
 
     let data_batch = if has_data {
         let eff_schema = wire_schema.as_ref().ok_or("no schema for data block")?;
-        if off + gnitz_wire::WAL_HEADER_SIZE > data.len() {
-            return Err("data block truncated");
-        }
-        let data_size = u32::from_le_bytes(
-            data[off + WAL_OFF_SIZE..off + WAL_OFF_SIZE + 4]
-                .try_into()
-                .map_err(|_| "bad data size")?,
-        ) as usize;
-        if off + data_size > data.len() {
-            return Err("data block truncated");
-        }
-        let mb = crate::storage::decode_mem_batch_from_wal_block(&data[off..off + data_size], eff_schema)?;
+        let dblock = wal_block_slice_at(data, off)?;
+        let mb = crate::storage::decode_mem_batch_from_wal_block(dblock, eff_schema)?;
         Some(mb)
     } else {
         None
@@ -1354,6 +1372,203 @@ mod tests {
     use proptest::collection::vec;
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
+
+    /// Client `encode_ddl_txn` → server `decode_ddl_txn` → `Batch::decode_from_wal_block`
+    /// against the server `sys_tab_schema`, for 1-, 2-, 3-, and 6-family bundles.
+    /// This is the one place a cross-crate sys-schema drift or a silent misframe
+    /// can hide, so it encodes with the *client* schemas and decodes with the
+    /// *server* schemas — the two crates hand-keep those identical.
+    #[test]
+    fn ddl_txn_roundtrip_client_to_server() {
+        use gnitz_core::protocol::types::{BatchAppender, Schema, ZSetBatch};
+        use gnitz_core::types::{
+            circuit_edges_schema, circuit_node_columns_schema, circuit_nodes_schema, col_tab_schema, dep_tab_schema,
+            idx_tab_schema, table_tab_schema, view_tab_schema,
+        };
+        use gnitz_wire::{
+            COL_TAB, DEP_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB,
+            {CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB},
+        };
+
+        // Build a small COL_TAB batch for `oid` with `n` U64 columns.
+        let col_batch = |oid: u64, kind: u64, n: usize| -> ZSetBatch {
+            let s = col_tab_schema();
+            let mut b = ZSetBatch::new(s);
+            {
+                let mut a = BatchAppender::new(&mut b, s);
+                for i in 0..n {
+                    a.add_row(((oid << 9) | i as u64) as u128, 1)
+                        .u64_val(oid)
+                        .u64_val(kind)
+                        .u64_val(i as u64)
+                        .str_val(&format!("c{i}"))
+                        .u64_val(4) // type_code U64
+                        .u64_val(0)
+                        .u64_val(0)
+                        .u64_val(0)
+                        .u64_val(0);
+                }
+            }
+            b
+        };
+        let table_batch = |tid: u64, weight: i64| -> ZSetBatch {
+            let s = table_tab_schema();
+            let mut b = ZSetBatch::new(s);
+            BatchAppender::new(&mut b, s)
+                .add_row(tid as u128, weight)
+                .u64_val(3) // schema_id
+                .str_val("t")
+                .str_val("")
+                .u64_val(0)
+                .u64_val(0)
+                .u64_val(0);
+            b
+        };
+        let idx_batch = |idx_id: u64, owner: u64| -> ZSetBatch {
+            let s = idx_tab_schema();
+            let mut b = ZSetBatch::new(s);
+            BatchAppender::new(&mut b, s)
+                .add_row(idx_id as u128, 1)
+                .u64_val(owner)
+                .u64_val(0)
+                .u64_val(gnitz_wire::pack_pk_cols(&[1]))
+                .str_val("idx_t_b")
+                .u64_val(1)
+                .str_val("");
+            b
+        };
+
+        // Verify a bundle roundtrips: family count, order (tid), per-row weight,
+        // and — for single-PK families — the PK. `check_pk` skips the compound-PK
+        // circuit/dep families whose engine `get_pk` returns the packed narrow key
+        // rather than the client's low/high u128 layout.
+        let verify = |families: &[(u64, &'static Schema, ZSetBatch)], check_pk: &[bool]| {
+            let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, families).expect("encode_ddl_txn");
+            let decoded = decode_ddl_txn(&payload).expect("decode_ddl_txn");
+            assert_eq!(decoded.len(), families.len(), "family count");
+            for (fi, ((exp_tid, _s, exp_batch), (got_tid, slice))) in families.iter().zip(&decoded).enumerate() {
+                assert_eq!(*got_tid, *exp_tid as i64, "family {fi} tid/order");
+                let schema = crate::catalog::sys_tab_schema(*got_tid);
+                let (batch, _) = Batch::decode_from_wal_block(slice, &schema, false).expect("decode family batch");
+                assert_eq!(batch.count, exp_batch.len(), "row count tid {got_tid}");
+                for i in 0..batch.count {
+                    assert_eq!(
+                        batch.get_weight(i),
+                        exp_batch.weights[i],
+                        "weight row {i} tid {got_tid}"
+                    );
+                    if check_pk[fi] {
+                        assert_eq!(batch.get_pk(i), exp_batch.pks.get(i), "pk row {i} tid {got_tid}");
+                    }
+                }
+            }
+        };
+
+        // 1-family: DROP TABLE (one TABLE_TAB -1).
+        verify(&[(TABLE_TAB, table_tab_schema(), table_batch(16, -1))], &[true]);
+
+        // 2-family: CREATE TABLE (COL_TAB + TABLE_TAB).
+        verify(
+            &[
+                (COL_TAB, col_tab_schema(), col_batch(17, 0, 2)),
+                (TABLE_TAB, table_tab_schema(), table_batch(17, 1)),
+            ],
+            &[true, true],
+        );
+
+        // 3-family: CREATE TABLE + inline UNIQUE index (COL_TAB + TABLE_TAB + IDX_TAB).
+        verify(
+            &[
+                (COL_TAB, col_tab_schema(), col_batch(18, 0, 2)),
+                (TABLE_TAB, table_tab_schema(), table_batch(18, 1)),
+                (IDX_TAB, idx_tab_schema(), idx_batch(100, 18)),
+            ],
+            &[true, true, true],
+        );
+
+        // 6-family: CREATE VIEW (COL + DEP + 3 circuit + VIEW). The compound-PK
+        // families are built with the client's exact low/high u128 packing.
+        let vid: u64 = 20;
+        let src: u64 = 16;
+        let dep = {
+            let s = dep_tab_schema();
+            let mut b = ZSetBatch::new(s);
+            BatchAppender::new(&mut b, s)
+                .add_row((vid as u128) | ((src as u128) << 64), 1)
+                .u64_val(0);
+            b
+        };
+        // Compound-PK families: `pk = view_id (low) | sub (high)`, matching the
+        // client's low/high packing. `check_pk` is false for these, so the exact
+        // sub values are arbitrary — pick non-trivial ones (clippy `identity_op`).
+        let nodes = {
+            let s = circuit_nodes_schema();
+            let mut b = ZSetBatch::new(s);
+            {
+                let mut a = BatchAppender::new(&mut b, s);
+                a.add_row((vid as u128) | (1u128 << 64), 1)
+                    .u64_val(1)
+                    .u64_val(0)
+                    .u64_val(src)
+                    .bytes_null();
+                a.add_row((vid as u128) | (2u128 << 64), 1)
+                    .u64_val(2)
+                    .u64_val(1)
+                    .u64_null()
+                    .bytes_null();
+            }
+            b
+        };
+        let edges = {
+            let s = circuit_edges_schema();
+            let mut b = ZSetBatch::new(s);
+            let sub = (2u128 << 8) | 1u128; // (dst_node, dst_port)
+            BatchAppender::new(&mut b, s)
+                .add_row((vid as u128) | (sub << 64), 1)
+                .u64_val(2)
+                .u64_val(1)
+                .u64_val(1);
+            b
+        };
+        let node_cols = {
+            let s = circuit_node_columns_schema();
+            let mut b = ZSetBatch::new(s);
+            let sub = (1u128 << 24) | (2u128 << 16) | 3u128; // (node_id, kind, position)
+            BatchAppender::new(&mut b, s)
+                .add_row((vid as u128) | (sub << 64), 1)
+                .u64_val(1)
+                .u64_val(2)
+                .u64_val(3)
+                .u64_val(4)
+                .u64_val(5);
+            b
+        };
+        let view = {
+            let s = view_tab_schema();
+            let mut b = ZSetBatch::new(s);
+            BatchAppender::new(&mut b, s)
+                .add_row(vid as u128, 1)
+                .u64_val(3)
+                .str_val("v")
+                .str_val("")
+                .str_val("")
+                .u64_val(0)
+                .u64_val(0);
+            b
+        };
+        verify(
+            &[
+                (COL_TAB, col_tab_schema(), col_batch(vid, 1, 1)),
+                (DEP_TAB, dep_tab_schema(), dep),
+                (CIRCUIT_NODES_TAB, circuit_nodes_schema(), nodes),
+                (CIRCUIT_EDGES_TAB, circuit_edges_schema(), edges),
+                (CIRCUIT_NODE_COLUMNS_TAB, circuit_node_columns_schema(), node_cols),
+                (VIEW_TAB, view_tab_schema(), view),
+            ],
+            // Skip pk check on the compound-PK DEP/circuit families.
+            &[true, false, false, false, false, true],
+        );
+    }
 
     /// `max_pk` bounds the generated PK arity: the engine codec supports up to
     /// `MAX_PK_COLUMNS` (5, the secondary-index schema width), but the persisted

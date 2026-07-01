@@ -30,9 +30,11 @@ impl CatalogEngine {
     //   COL_TAB writes MUST precede TABLE_TAB / VIEW_TAB writes.
     //
     // Where this is enforced:
-    //   * Client DDL (`gnitz-core/src/client.rs::create_table`): sequential
-    //     `conn.push(COL_TAB, ...)` then `conn.push(TABLE_TAB, ...)`. Each
-    //     push is a full RPC (ingest + broadcast + fsync + ACK).
+    //   * Live DDL: every catalog write arrives as one `FLAG_DDL_TXN` bundle,
+    //     and the server ingest loop (`handle_ddl_txn`) applies the bundle's
+    //     families in ascending `catalog_topo_priority` order under one zone —
+    //     COL_TAB(1) before the TABLE_TAB(6)/VIEW_TAB(7) register hook that reads
+    //     it. The client send order is irrelevant; the server sorts.
     //   * Wire: the SAL is a single FIFO; worker `FLAG_DDL_SYNC` dispatch
     //     preserves master broadcast order.
     //   * Replay (`bootstrap.rs::replay_catalog`): TABLE_TAB is replayed
@@ -323,8 +325,16 @@ impl CatalogEngine {
                 // During rollback the rollback gate in `CatalogDeltaSink::submit`
                 // ensures these writes bypass pending_broadcasts.
                 self.cascade_retract_indices(tid)?;
-                // During CREATE TABLE rollback the column records were committed by
-                // prior RPCs; retracting them here would diverge master from workers.
+                // Under atomic CREATE the COL_TAB rows are applied via the enqueuing
+                // path, so they are in compensation's drained set and negated
+                // directly. CREATE rollback replays descending topo, so this
+                // TABLE_TAB(6) -1 fires its DROP-branch cascade BEFORE the drained
+                // COL_TAB(1) -1: an unguarded cascade_retract_columns would retract
+                // the columns, then the drained -1 would retract them again → a net
+                // -1 ghost. Skip it during rollback so compensation's direct negate
+                // is the sole retractor. (The unguarded cascade_retract_indices above
+                // is the dual: FK auto-indices use submit_local — never enqueued — so
+                // the cascade is their only retractor and must run.)
                 if !self.ctx.in_rollback() {
                     self.cascade_retract_columns(tid)?;
                 }
@@ -496,9 +506,14 @@ impl CatalogEngine {
                     self.backfill_view(vid);
                 }
             } else if let Some(directory) = self.dag.tables.get(&vid).map(|e| e.directory.clone()) {
-                // During CREATE VIEW rollback the circuit/dep and column records
-                // were committed by prior RPCs; retracting them here would diverge
-                // master from workers.
+                // Under atomic CREATE the circuit/dep/COL_TAB rows are applied via
+                // the enqueuing path, so they are in compensation's drained set and
+                // negated directly. CREATE rollback replays descending topo, so this
+                // VIEW_TAB(7) -1 fires its DROP-branch cascade BEFORE the drained
+                // circuit(3–5)/DEP(2)/COL(1) -1s: an unguarded cascade would retract
+                // them, then the drained -1s would retract them again → a net -1
+                // ghost. Skip it during rollback so compensation's direct negate is
+                // the sole retractor.
                 if !self.ctx.in_rollback() {
                     self.cascade_retract_circuit_and_deps(vid)?;
                     self.cascade_retract_columns(vid)?;

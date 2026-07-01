@@ -61,7 +61,7 @@ pub enum TickTrigger {
     /// (the loop is serial, so the prior tick has returned) and none will
     /// start — then blocks on `release` until the DDL hands the gate back.
     /// This drains any in-flight steady-state exchange tick before the DDL
-    /// parks the reactor; see `handle_system_dml`.
+    /// parks the reactor; see `handle_ddl_txn`.
     Quiesce {
         acked: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
@@ -69,7 +69,7 @@ pub enum TickTrigger {
 }
 
 /// Releases the tick-subsystem quiesce gate when dropped, so a CREATE-VIEW
-/// stop-the-world window ends on every exit path of `handle_system_dml`
+/// stop-the-world window ends on every exit path of `handle_ddl_txn`
 /// (success or early-return error). Sending wakes the parked `tick_loop_async`,
 /// which resumes dequeuing ticks. `None` for non-view DDL (no gate taken).
 struct TickGate(Option<oneshot::Sender<()>>);
@@ -753,6 +753,19 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
     let flags = decoded.control.flags;
     let client_version = ipc::wire_flags_get_schema_version(flags);
 
+    // ---------- Atomic DDL transaction (the system-write frame) ----------
+    // Every system-table write — a CREATE's N family batches or a
+    // DROP/CREATE INDEX/CREATE SCHEMA's single batch — arrives as one
+    // FLAG_DDL_TXN frame and is ingested under one durable SAL zone. It shares
+    // the `target_id == 0` sentinel with the alloc RPCs but carries a disjoint
+    // flag, so branch here before the alloc block. `handle_ddl_txn` re-decodes the
+    // bundle from the raw frame (the generic `decode_wire` above sees no data
+    // block and yields control-only, which is unused for this route).
+    if flags & gnitz_wire::FLAG_DDL_TXN != 0 {
+        handle_ddl_txn(shared, fd, client_id, data, client_version).await;
+        return;
+    }
+
     // ---------- SERIAL range reservation ----------
     // Carries `target_id = seq_id (= table_id) ≠ 0` and the range `count` in
     // `seek_col_idx`, so it precedes the `target_id == 0` catalog-id block.
@@ -936,7 +949,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
 
     // ---------- System-table DML (catalog + optional DDL broadcast) ----------
     if target_id < FIRST_USER_TABLE_ID {
-        handle_system_dml(shared, fd, client_id, target_id, decoded, client_version).await;
+        handle_system_scan(shared, fd, client_id, target_id, decoded, client_version).await;
     }
 
     // Fallthrough: ignore (should not happen).
@@ -1322,9 +1335,10 @@ fn make_terminal_scan_frame(target_id: i64, client_id: u64, lsn: u64) -> PooledS
     encode_response_buffer(target_id, client_id, None, STATUS_OK, b"", None, lsn as u128, 0)
 }
 
-/// System-table path: catalog ingest + (optionally) DDL broadcast.
-/// DDL path acquires the catalog write lock and drains the committer.
-async fn handle_system_dml(
+/// System-table read path: an empty-batch SCAN of a catalog family. Every
+/// catalog WRITE now arrives as a `FLAG_DDL_TXN` frame (`handle_ddl_txn`), so a
+/// non-empty batch on the plain system-table frame is a protocol error.
+async fn handle_system_scan(
     shared: &Rc<Shared>,
     fd: i32,
     client_id: u64,
@@ -1333,69 +1347,132 @@ async fn handle_system_dml(
     client_version: u16,
 ) {
     let batch = decoded.data_batch;
-    let non_empty = batch.as_ref().map(|b| b.count > 0).unwrap_or(false);
-
-    // Empty SCAN for system tables — no DDL, no lock needed.
-    if !non_empty {
-        let _g = shared.catalog_rwlock.read().await;
-        let cat_ptr = shared.catalog;
-        match guard_panic("scan", || unsafe { (*cat_ptr).scan_family(target_id) }) {
-            Ok(b) => {
-                let batch_ref = if b.count > 0 { Some(b) } else { None };
-                send_ok_response(
-                    shared,
-                    fd,
-                    target_id,
-                    batch_ref.as_deref(),
-                    client_id,
-                    shared.last_tick_lsn.get() as u128,
-                    client_version,
-                )
-                .await;
-            }
-            Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
-        }
+    if batch.as_ref().map(|b| b.count > 0).unwrap_or(false) {
+        send_error(
+            shared,
+            fd,
+            target_id,
+            client_id,
+            b"system-table writes must use the DDL_TXN frame",
+        )
+        .await;
         return;
     }
 
-    // DDL path: drain the committer barrier BEFORE acquiring the catalog write
+    // Empty SCAN for system tables — no DDL, no lock needed.
+    let _g = shared.catalog_rwlock.read().await;
+    let cat_ptr = shared.catalog;
+    match guard_panic("scan", || unsafe { (*cat_ptr).scan_family(target_id) }) {
+        Ok(b) => {
+            let batch_ref = if b.count > 0 { Some(b) } else { None };
+            send_ok_response(
+                shared,
+                fd,
+                target_id,
+                batch_ref.as_deref(),
+                client_id,
+                shared.last_tick_lsn.get() as u128,
+                client_version,
+            )
+            .await;
+        }
+        Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+    }
+}
+
+/// Collect the PKs of the bundle's `tid` family whose weight matches the
+/// requested sign — the CREATE `+1` rows (`positive`) or the DROP `-1` rows.
+/// Empty if the bundle carries no such family. A DDL bundle is weight-homogeneous
+/// per family, so this cleanly selects the create rows or the drop rows.
+fn family_pks_by_sign(families: &[(i64, Batch)], tid: i64, positive: bool) -> Vec<i64> {
+    families
+        .iter()
+        .find(|(t, _)| *t == tid)
+        .map(|(_, b)| {
+            (0..b.count)
+                .filter(|&i| {
+                    if positive {
+                        b.get_weight(i) > 0
+                    } else {
+                        b.get_weight(i) < 0
+                    }
+                })
+                .map(|i| b.get_pk(i) as i64)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Atomic DDL transaction: ingest a bundle of system-table family batches under
+/// one durable SAL zone. Reached only via the `FLAG_DDL_TXN` route. Every
+/// catalog write — a CREATE's N families or a DROP/CREATE INDEX/CREATE SCHEMA's
+/// single family — flows here, so there is one system-write code path end to
+/// end. Families are ingested in ascending topo order (so every register/index
+/// hook sees its dependencies already in the memtable); on any failure the
+/// applied families are negated in master memory before broadcast, so a crash
+/// *or* a precheck failure can never strand an orphan catalog row.
+async fn handle_ddl_txn(shared: &Rc<Shared>, fd: i32, client_id: u64, data: &[u8], client_version: u16) {
+    // Decode the bundle and materialise each family's wal-block slice into an
+    // owned Batch up front (before any lock), resolving its system schema from
+    // the catalog. `sys_family_schema` rejects a bogus family tid without the
+    // panic `sys_tab_schema` would hit on an unknown id in the system range.
+    let raw_families = match ipc::decode_ddl_txn(data) {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!("decode error: {e}");
+            send_error(shared, fd, 0, client_id, msg.as_bytes()).await;
+            return;
+        }
+    };
+    if raw_families.is_empty() {
+        send_error(shared, fd, 0, client_id, b"DDL_TXN: empty family bundle").await;
+        return;
+    }
+    let family_count = raw_families.len();
+    let mut families: Vec<(i64, Batch)> = Vec::with_capacity(family_count);
+    for &(tid, slice) in &raw_families {
+        let schema = match shared.cat().sys_family_schema(tid) {
+            Some(s) => s,
+            None => {
+                let msg = format!("DDL_TXN: {tid} is not a system family");
+                send_error(shared, fd, 0, client_id, msg.as_bytes()).await;
+                return;
+            }
+        };
+        match Batch::decode_from_wal_block(slice, &schema, false) {
+            Ok((mut b, _)) => {
+                // Trust boundary: neutralize any client-claimed sorted/consolidated
+                // flags; the catalog ingest re-establishes them.
+                b.downgrade();
+                families.push((tid, b));
+            }
+            Err(e) => {
+                let msg = format!("DDL_TXN family {tid} decode error: {e}");
+                send_error(shared, fd, 0, client_id, msg.as_bytes()).await;
+                return;
+            }
+        }
+    }
+
+    // A CREATE VIEW is a stop-the-world op (source drain + distributed backfill,
+    // reactor parked). The VIEW_TAB family's +1 rows, if any, are the new views;
+    // a DROP-only or non-VIEW bundle yields none and keeps the plain path.
+    let new_view_ids: Vec<i64> = family_pks_by_sign(&families, VIEW_TAB_ID, true);
+    let view_create = !new_view_ids.is_empty();
+
+    // Drain the committer barrier BEFORE acquiring the catalog write
     // lock. The barrier flushes user-table WAL and waits for worker ACKs (tens
     // of ms under load); holding the write lock across that wait would block
     // every concurrent SCAN/SEEK read for no reason — no catalog mutation
-    // happens until after the barrier returns. Safe because the executor is
-    // single-threaded: no other DDL can send its own barrier or take the write
-    // lock while this coroutine is parked at rx.await, and concurrent user-table
-    // commits don't touch the catalog schema.
+    // happens until after the barrier returns. Quiesce the tick subsystem for a
+    // CREATE VIEW while the reactor still runs and before the write lock
+    // (run_tick/relay_loop take the read lock, so a write-lock-held quiesce would
+    // deadlock). `TickGate` releases the gate on every exit path.
     let t_ddl_start = Instant::now();
     let (tx, rx) = oneshot::channel::<()>();
     shared.committer_tx.send(CommitRequest::Barrier { done: tx });
     let _ = rx.await;
-    let t_after_barrier = Instant::now();
 
-    // A CREATE VIEW over data-bearing sources is a stop-the-world operation: it
-    // drains the new view's sources and drives the view through the distributed
-    // backfill, both inline with the reactor parked (further below). The +1
-    // (create) rows are the new views; collect their ids before the write lock
-    // (the batch is not mutated before its post-lock unwrap) and use the list
-    // both to gate the quiesce here and to drive the drain/backfill below. A
-    // DROP-only VIEW batch yields none and every non-VIEW DDL is excluded — both
-    // keep the plain path. Quiesce the tick subsystem FIRST, while the reactor
-    // still runs: an in-flight steady-state exchange tick's relays are delivered
-    // by relay_loop (a reactor task), so it must finish before we park the
-    // reactor. Quiescing must precede the write lock — run_tick/relay_loop both
-    // take the read lock, so a write-lock-held quiesce would deadlock. `TickGate`
-    // releases the gate on every exit path.
-    let new_view_ids: Vec<i64> = if target_id == VIEW_TAB_ID {
-        batch.as_ref().map_or_else(Vec::new, |b| {
-            (0..b.count)
-                .filter(|&i| b.get_weight(i) > 0)
-                .map(|i| b.get_pk(i) as i64)
-                .collect()
-        })
-    } else {
-        Vec::new()
-    };
-    let view_create = !new_view_ids.is_empty();
     let _tick_gate = if view_create {
         let (acked_tx, acked_rx) = oneshot::channel::<()>();
         let (release_tx, release_rx) = oneshot::channel::<()>();
@@ -1410,74 +1487,43 @@ async fn handle_system_dml(
     };
 
     let _write = shared.catalog_rwlock.write().await;
-    let t_after_write = Instant::now();
 
-    let batch = batch.unwrap();
-
-    let t_drain_start = Instant::now();
-    if !new_view_ids.is_empty() {
+    if view_create {
         // Lock-held committer barrier: a push could have committed between the
         // pre-lock barrier and the write lock; flush it so every straggler is
-        // resident in pending_deltas before we drain. The committer stays idle
-        // for the rest of the handler (the write lock blocks new pushes).
+        // resident in pending_deltas before the in-loop source drain. The
+        // committer stays idle for the rest of the handler (the write lock blocks
+        // new pushes).
         let (tx, rx) = oneshot::channel::<()>();
         shared.committer_tx.send(CommitRequest::Barrier { done: tx });
         let _ = rx.await;
-
-        // Drain every base table reachable from the new views — directly or
-        // through an existing view source — so its pending_deltas reaches its
-        // existing dependents exactly once and its committed store is current
-        // before the view backfills. The source set comes from the durable
-        // circuit (persisted before this VIEW_TAB row). One source per drain,
-        // each a synchronous FLAG_TICK + inline collect with the reactor parked.
-        let sources = unsafe { (*shared.catalog).dag.base_tables_reachable_from(new_view_ids.clone()) };
-        for src in sources {
-            if let Err(e) = guard_panic("view-drain", || shared.disp().drain_tick_blocking(src)) {
-                // The view is not registered yet and no zone is open, so surface
-                // the error and bail; TickGate's drop releases the gate and the
-                // write lock drops on return.
-                send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
-                return;
-            }
-        }
     }
-    let t_drain_done = Instant::now();
-    let t_mut_start = Instant::now();
 
     let cat_ptr_raw = shared.catalog;
     // Discard any stale queue entries from a prior failed DDL so they don't
     // piggyback on this one. (pending_dir_deletions is NOT discarded here: a
     // failed DDL already clears it on the error path, and recovery legitimately
-    // queues drops here that must be drained — not discarded — by this DDL's
-    // post-fsync drain.)
+    // queues drops here that must be drained — not discarded — by the post-fsync
+    // drain.)
     let _ = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
 
-    // Pre-flight global uniqueness for every CREATE of a unique secondary index
-    // BEFORE reserving the zone LSN or mutating the catalog, so a violation needs
-    // no rollback — it just surfaces to the client. Uniqueness is a global
-    // property, but the per-worker `backfill_index` scan only sees a single
-    // partition: a within-partition duplicate would fatally `_exit` every
-    // affected worker via the DdlSync path, and a cross-partition duplicate would
-    // be silently accepted. Validating across all workers on the master here
-    // catches both and never broadcasts on failure, so no worker reaches that
-    // fatal path. Routing every unique-index `+1` through this one branch makes
-    // it the single choke point (standalone CREATE UNIQUE INDEX or an inline
-    // unique constraint that lowers to an IDX_TAB row). The IDX_TAB row layout
-    // (and the IDXTAB_PAY_* payload indices read below) is fixed by
+    // Pre-flight global uniqueness for every unique secondary index in this
+    // bundle BEFORE reserving the zone LSN or mutating the catalog, so a
+    // violation needs no rollback — it just surfaces to the client. This runs
+    // before the ingest loop, so for a table created in the same bundle the owner
+    // is not yet in `dag.tables` and `validate_unique_index_create_async`
+    // short-circuits to an empty set (sound: the new table is empty, and
+    // hook_index_register's own owner-check still succeeds later in the loop). The
+    // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
     // `create_index` and read identically by `hook_index_register`.
     let mut filter_seeds: Vec<(i64, u64, FxHashSet<crate::storage::PkBuf>, bool)> = Vec::new();
-    if target_id == IDX_TAB_ID {
-        for i in 0..batch.count {
-            if batch.get_weight(i) > 0 && unsafe { (*cat_ptr_raw).read_batch_u64(&batch, i, IDXTAB_PAY_IS_UNIQUE) } != 0
+    if let Some((_, idx_batch)) = families.iter().find(|(tid, _)| *tid == IDX_TAB_ID) {
+        for i in 0..idx_batch.count {
+            if idx_batch.get_weight(i) > 0
+                && unsafe { (*cat_ptr_raw).read_batch_u64(idx_batch, i, IDXTAB_PAY_IS_UNIQUE) } != 0
             {
-                let owner_id = unsafe { (*cat_ptr_raw).read_batch_u64(&batch, i, IDXTAB_PAY_OWNER_ID) } as i64;
-                // source_cols is the packed list — single-column or composite.
-                // Pre-flight every well-formed unique index over its full column
-                // list; a malformed row is rejected by hook_index_register inside
-                // the ingest below with a precise error, so skip pre-flighting it
-                // here (a wasted distributed scan that could surface a misleading
-                // "duplicate value" error first).
-                let packed = unsafe { (*cat_ptr_raw).read_batch_u64(&batch, i, IDXTAB_PAY_SOURCE_COLS) };
+                let owner_id = unsafe { (*cat_ptr_raw).read_batch_u64(idx_batch, i, IDXTAB_PAY_OWNER_ID) } as i64;
+                let packed = unsafe { (*cat_ptr_raw).read_batch_u64(idx_batch, i, IDXTAB_PAY_SOURCE_COLS) };
                 let cols = gnitz_wire::unpack_pk_cols(packed);
                 if !cols.is_well_formed() {
                     continue;
@@ -1494,7 +1540,7 @@ async fn handle_system_dml(
                     // No zone LSN reserved, no catalog mutation yet: just surface
                     // the violation to the client. The write lock drops on return.
                     Err(e) => {
-                        send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
+                        send_error(shared, fd, 0, client_id, e.as_bytes()).await;
                         return;
                     }
                     // Hold the distinct span set to seed the filter post-commit,
@@ -1505,20 +1551,14 @@ async fn handle_system_dml(
         }
     }
 
-    // Reserve the zone LSN but do NOT publish it yet. ingest_lsn becomes
-    // visible to readers only after fsync confirms durability — Cleanup D
-    // closes the pre-fsync window where clients could see an LSN whose
-    // backing data is not yet on disk.
-    //
-    // Allocation must dominate every family's current_lsn, not just
-    // ingest_lsn: un-pinned sys-table ingests (FK auto-indices, rollback
-    // compensation) auto-bump family counters past the zone allocator, and
-    // a checkpoint persists drifted counters as recovery dedup watermarks.
-    // A zone LSN at or below such a watermark would have its committed-but-
-    // unflushed deltas deduped away on recovery (`msg.lsn <= flushed`),
-    // silently dropping an fsync-acknowledged DDL. Taking the max also
-    // keeps a failed DDL's pinned LSN (never published to ingest_lsn) from
-    // being reused by the next zone.
+    // Reserve the zone LSN but do NOT publish it until fsync confirms durability.
+    // Allocation must dominate every family's current_lsn (not just ingest_lsn):
+    // un-pinned sys-table ingests auto-bump family counters, and a checkpoint
+    // persists drifted counters as recovery dedup watermarks — a zone LSN at or
+    // below such a watermark would have its committed-but-unflushed deltas deduped
+    // away on recovery. Re-reading max_table_current_lsn per DDL keeps every
+    // allocated zone LSN strictly greater, and keeps a failed DDL's pinned LSN
+    // (never published) from being reused by the next zone.
     let zone_lsn = shared
         .ingest_lsn
         .get()
@@ -1529,23 +1569,62 @@ async fn handle_system_dml(
         (*cat_ptr_raw).ctx.open_ddl_zone(zone_lsn_nz);
     }
 
-    // Clone before evaluate_dag consumes the batch; used by compensate_stage_a
-    // to reconstruct the rollback list when fire_hooks succeeded but evaluate_dag
-    // panicked (the top-level batch was never pushed to pending_broadcasts).
-    let batch_for_undo = batch.clone();
+    // The post-fsync unique-filter maintenance needs the durably-dropped tids and
+    // (owner, packed-cols) pairs (the -1 rows); the ingest loop consumes
+    // `families`, so extract those minimal lists now instead of cloning the whole
+    // TABLE_TAB / IDX_TAB batches. A bundle is one DDL, so at most one family
+    // carries -1 rows; a CREATE bundle yields empty lists.
+    let dropped_tids: Vec<i64> = family_pks_by_sign(&families, TABLE_TAB_ID, false);
+    let dropped_indices: Vec<(i64, u64)> = families
+        .iter()
+        .find(|(tid, _)| *tid == IDX_TAB_ID)
+        .map(|(_, b)| {
+            (0..b.count)
+                .filter(|&i| b.get_weight(i) < 0)
+                .map(|i| {
+                    let owner_id = unsafe { (*cat_ptr_raw).read_batch_u64(b, i, IDXTAB_PAY_OWNER_ID) } as i64;
+                    let packed = unsafe { (*cat_ptr_raw).read_batch_u64(b, i, IDXTAB_PAY_SOURCE_COLS) };
+                    (owner_id, packed)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
-    if let Err(e) = guard_panic("DDL", || {
+    // Ingest the families in ascending topo order so every register/index hook
+    // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
+    // new view's base sources once the circuit/dep families are in the memtable
+    // (so get_source_ids resolves) but before the VIEW_TAB register hook's inline
+    // backfill scans them — VIEW_TAB is the first family at or past view priority.
+    // The between-precheck-and-apply marker holds the single family that was
+    // applied but not yet enqueued (a hook/panic failure), which compensation must
+    // negate; a precheck failure leaves the marker None, so no ghost -1 is written.
+    // The ingest loop writes nothing to the SAL (broadcasts are queued and emitted
+    // only in the tail below), so the in-loop drain's tick precedes the zone's
+    // broadcasts in SAL order exactly as before.
+    families.sort_by_key(|(tid, _)| CatalogEngine::catalog_topo_priority(*tid));
+    let view_prio = CatalogEngine::catalog_topo_priority(VIEW_TAB_ID);
+    let mut applied_not_enqueued: Option<(i64, Batch)> = None;
+    let mut drained_sources = false;
+    let ingest_res = guard_panic("DDL", || {
         let cat = unsafe { &mut *cat_ptr_raw };
-        cat.ingest_to_family(target_id, &batch)?;
-        let dag = cat.get_dag_ptr();
-        unsafe {
-            (*dag).evaluate_dag(target_id, batch);
+        for (fid, fbatch) in families {
+            if view_create && !drained_sources && CatalogEngine::catalog_topo_priority(fid) >= view_prio {
+                for src in cat.dag.base_tables_reachable_from(new_view_ids.clone()) {
+                    shared.disp().drain_tick_blocking(src)?;
+                }
+                drained_sources = true;
+            }
+            cat.precheck_family(fid, &fbatch)?;
+            applied_not_enqueued = Some((fid, fbatch.clone()));
+            cat.apply_and_enqueue_family(fid, fbatch)?;
+            applied_not_enqueued = None;
         }
         Ok(())
-    }) {
+    });
+    if let Err(e) = ingest_res {
         guard_panic("DDL-compensate", || {
             unsafe {
-                (*cat_ptr_raw).compensate_stage_a(target_id, &batch_for_undo);
+                (*cat_ptr_raw).compensate_stage_a(applied_not_enqueued.take());
             }
             Ok::<(), String>(())
         })
@@ -1555,35 +1634,24 @@ async fn handle_system_dml(
         unsafe {
             (*cat_ptr_raw).ctx.close_ddl_zone();
         }
-        send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
+        send_error(shared, fd, 0, client_id, e.as_bytes()).await;
         return;
     }
-    let t_mut_done = Instant::now();
 
-    // SAL emission window: acquire III.3b mutex to serialize the
-    // broadcast write against committer + tick + relay. Lock held ONLY
-    // across the synchronous broadcast + fsync SQE submit; the fsync
-    // .await happens after release so concurrent writers can proceed.
+    // SAL emission window (byte-identical to the single-family DDL): broadcast
+    // each drained family under the shared zone_lsn, close the zone with the
+    // commit sentinel, then fsync. A failure here is unrecoverable — workers
+    // already applied the FLAG_DDL_SYNC groups in real time — so abort.
     let drained = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
     let fsync_fut = {
         let _sal_excl = shared.sal_writer_excl.lock().await;
         let disp_ptr_raw = shared.dispatcher;
-        // All broadcasts in the zone share `zone_lsn`. The trailing
-        // commit sentinel marks the zone durably closed; recovery
-        // applies the zone's groups only when the sentinel is on disk.
-        //
-        // Failure here is unrecoverable: ingest_to_family already mutated
-        // the master catalog, and FLAG_DDL_SYNC groups that were written
-        // are processed by workers in real-time before any sentinel
-        // arrives.  A partial failure leaves master/worker schemas
-        // permanently diverged.  DDL rollback is not implemented; abort.
         if let Err(e) = guard_panic("broadcast_ddl", || unsafe {
             for (tid, bat) in &drained {
                 (*disp_ptr_raw).broadcast_ddl(*tid, bat, zone_lsn)?;
             }
-            // Crash-injection seam: abort after broadcasts but BEFORE
-            // the commit sentinel — exercises the recovery path where a
-            // half-written zone must be skipped.
+            // Crash-injection seam: abort after broadcasts but BEFORE the commit
+            // sentinel — exercises the recovery skip of a half-written zone.
             #[cfg(debug_assertions)]
             if std::env::var("GNITZ_INJECT_DDL_PANIC").as_deref() == Ok("after_broadcasts") {
                 libc::abort();
@@ -1595,87 +1663,55 @@ async fn handle_system_dml(
         }
         shared.reactor.fsync(shared.sal_fd)
     };
-    let t_bcast_done = Instant::now();
     let fsync_rc = fsync_fut.await;
-    let t_fsync_done = Instant::now();
     if fsync_rc < 0 {
         gnitz_fatal_abort!("SAL fdatasync (DDL) failed rc={}", fsync_rc);
     }
 
-    // Publish only after fsync. Tick handlers reading shared.ingest_lsn
-    // during the DDL window now see the *old* LSN; tick-derived state
-    // therefore reflects only durable work.
+    // Publish only after fsync, then close the zone and defer dir removals to the
+    // next checkpoint (whose worker-ACK barrier proves every worker consumed past
+    // this DROP; removing here races a lagging worker's partition-dir create).
     shared.ingest_lsn.set(zone_lsn);
     unsafe {
         (*cat_ptr_raw).ctx.close_ddl_zone();
-    }
-    // Drop is now durable, but worker processes share this tree and may still
-    // be applying the CREATE of an entity dropped in the same session. Defer
-    // physical removal to the next checkpoint, whose worker-ACK barrier proves
-    // every worker has consumed past this DROP. Removing here races a lagging
-    // worker's partition-dir create and aborts it with ENOENT.
-    unsafe {
         (*cat_ptr_raw).defer_pending_dir_deletions();
     }
 
     // Invalidate unique-filter state for durably-dropped tables/indices so a
     // recreated table with the same ID does not inherit stale filter entries.
     let disp_ptr_raw = shared.dispatcher;
-    if target_id == TABLE_TAB_ID {
-        for i in 0..batch_for_undo.count {
-            if batch_for_undo.get_weight(i) < 0 {
-                let tid = batch_for_undo.get_pk(i) as i64;
-                unsafe {
-                    (*disp_ptr_raw).unique_filter_invalidate_table(tid);
-                }
-            }
+    for &tid in &dropped_tids {
+        unsafe {
+            (*disp_ptr_raw).unique_filter_invalidate_table(tid);
         }
-    } else if target_id == IDX_TAB_ID {
-        for i in 0..batch_for_undo.count {
-            if batch_for_undo.get_weight(i) < 0 {
-                let owner_id = unsafe { (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, IDXTAB_PAY_OWNER_ID) } as i64;
-                let packed = unsafe { (*cat_ptr_raw).read_batch_u64(&batch_for_undo, i, IDXTAB_PAY_SOURCE_COLS) };
-                // Remove the filter keyed by the dropped index's exact packed
-                // column list. A non-existent key (e.g. a non-unique FK index)
-                // is a harmless no-op; keying by the whole list means dropping
-                // `(a, b)` never clears a distinct single-column filter on `a`.
-                unsafe {
-                    (*disp_ptr_raw).unique_filter_remove(owner_id, packed);
-                }
-            }
+    }
+    for &(owner_id, packed) in &dropped_indices {
+        // Keying by the whole packed list means dropping `(a, b)` never clears a
+        // distinct single-column filter on `a`.
+        unsafe {
+            (*disp_ptr_raw).unique_filter_remove(owner_id, packed);
         }
     }
 
-    // Seed the unique filters from the CREATE-time pre-flight's distinct key
-    // sets so the first INSERT skips a redundant full-cluster warmup scan. The
-    // pre-flight scanned every worker under the same catalog write lock the
-    // warmup uses, so each set is complete and `warm = true` is sound. Done here
-    // (post-fsync), never in the validator: the validator runs before the
-    // IDX_TAB +1 commits, and a broadcast/fsync failure aborts the process
-    // before this point, so no filter is published for an index that never
-    // committed. Symmetric with the removal above and needs no rollback.
+    // Seed the unique filters from the pre-flight's distinct key sets so the first
+    // INSERT skips a redundant full-cluster warmup scan. Post-fsync only: a
+    // broadcast/fsync failure aborts the process before this point, so no filter
+    // is published for an index that never committed.
     for (owner_id, packed, seen, capped) in filter_seeds {
         unsafe {
             (*disp_ptr_raw).unique_filter_seed(owner_id, packed, seen, capped);
         }
     }
 
-    // View-scoped distributed backfill. The view is now registered on every
-    // worker (the FLAG_DDL_SYNC broadcast above; workers apply it before the
-    // FLAG_BACKFILL below in SAL order) and the CREATE is durable. Drive each
-    // exchange / equi-join view (`view_seeds_exchange_backfill`) through the boot
-    // backfill machinery — once per source. Plain projection/filter views were
-    // already filled inline by the workers' ddl_sync hook over the (now drained)
-    // committed sources. Synchronous, reactor parked. A post-fsync Err cannot be
-    // rolled back (the CREATE is durable), so abort — restart's boot backfill
-    // rebuilds the view.
-    let t_backfill_start = Instant::now();
+    // View-scoped distributed backfill for every exchange / equi-join view; plain
+    // projection/filter views were already filled inline by hook_view_register
+    // over the (now drained) committed sources. A post-fsync Err cannot be rolled
+    // back (the CREATE is durable), so abort — restart's boot backfill rebuilds it.
     for &vid in &new_view_ids {
         if unsafe { (*cat_ptr_raw).dag.view_seeds_exchange_backfill(vid) } {
             // A multi-source equi-join iterates both sources: backfilling the
             // first fills its trace (join against the empty other trace → no
-            // output), then the second produces the full join against it — the
-            // two-sided trace fill is intrinsic to the bilinear join.
+            // output), then the second produces the full join against it.
             let sources = unsafe { (*cat_ptr_raw).dag.get_source_ids(vid) };
             for src in sources {
                 if let Err(e) = guard_panic("view-backfill", || shared.disp().fan_out_backfill(vid, src)) {
@@ -1690,35 +1726,11 @@ async fn handle_system_dml(
             }
         }
     }
-    let t_backfill_done = Instant::now();
-    if !new_view_ids.is_empty() {
-        gnitz_info!(
-            "live CREATE VIEW backfill: {} view(s), drain={:?}, backfill={:?}, parked={:?}",
-            new_view_ids.len(),
-            t_drain_done.duration_since(t_drain_start),
-            t_backfill_done.duration_since(t_backfill_start),
-            t_backfill_done.duration_since(t_drain_start),
-        );
-    }
 
-    send_ok_response(shared, fd, target_id, None, client_id, zone_lsn as u128, client_version).await;
-    let t_ddl_done = Instant::now();
-    let total = t_ddl_done.duration_since(t_ddl_start);
+    send_ok_response(shared, fd, 0, None, client_id, zone_lsn as u128, client_version).await;
+    let total = t_ddl_start.elapsed();
     if total > Duration::from_millis(20) {
-        gnitz_debug!(
-            "DDL tid={} SLOW total={:?} barrier={:?} write_acq={:?} drain={:?} mutate={:?} broadcast={:?} \
-             fsync={:?} backfill={:?} send={:?}",
-            target_id,
-            total,
-            t_after_barrier.duration_since(t_ddl_start),
-            t_after_write.duration_since(t_after_barrier),
-            t_drain_done.duration_since(t_drain_start),
-            t_mut_done.duration_since(t_mut_start),
-            t_bcast_done.duration_since(t_mut_done),
-            t_fsync_done.duration_since(t_bcast_done),
-            t_backfill_done.duration_since(t_backfill_start),
-            t_ddl_done.duration_since(t_fsync_done),
-        );
+        gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
     }
 }
 

@@ -34,7 +34,7 @@ help: ## Show this help
 # Tests & quality gates
 # ---------------------------------------------------------------------------
 
-test: ## Run all Rust workspace tests incl. gnitz-sql integration (gnitz-py excluded — pyo3 extension can't link a test harness)
+test: server ## Run all Rust workspace tests incl. gnitz-sql integration (gnitz-py excluded — pyo3 extension can't link a test harness)
 	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration $(T)
 
 rust-engine-test: ## Run only the gnitz-engine tests (faster inner loop)

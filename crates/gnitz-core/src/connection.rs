@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use crate::error::ClientError;
 use crate::protocol::{
-    connect as proto_connect, hello_handshake, recv_message, send_message, send_message_noschema,
-    send_message_with_extra, wire_flags_get_index_version, wire_flags_get_schema_version, wire_flags_set_conflict_mode,
-    wire_flags_set_index_version, wire_flags_set_schema_version, Message, PkTuple, Schema, WireConflictMode, ZSetBatch,
-    FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID,
-    FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_SEEK, FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR,
-    STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
+    connect as proto_connect, encode_ddl_txn, hello_handshake, recv_message, send_framed, send_message,
+    send_message_noschema, send_message_with_extra, wire_flags_get_index_version, wire_flags_get_schema_version,
+    wire_flags_set_conflict_mode, wire_flags_set_index_version, wire_flags_set_schema_version, Message, PkTuple,
+    Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE,
+    FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+    FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
 };
 use lru::LruCache;
 
@@ -131,6 +131,26 @@ impl Connection {
     ) -> Result<u64, ClientError> {
         batch.validate(schema).map_err(ClientError::ServerError)?;
         let msg = self.roundtrip_push(target_id, schema, batch, mode, cache)?;
+        Ok(msg.seek_pk as u64)
+    }
+
+    /// Send an atomic DDL transaction: a bundle of system-table family batches
+    /// (`FLAG_DDL_TXN`) that the server ingests under one durable SAL zone. Used
+    /// by every catalog write — a `CREATE`'s N families or a
+    /// `DROP`/`CREATE INDEX`/`CREATE SCHEMA`'s single family. Returns the zone
+    /// LSN (echoed in the ACK's `seek_pk`, as `push` does).
+    ///
+    /// No schema cache interaction: system-table schemas are compile-time-fixed
+    /// and known to both sides, so the frame carries a schema block per family
+    /// (via `encode_wal_block`) and the server resolves each family's schema from
+    /// its own catalog.
+    pub fn push_ddl_txn(&mut self, families: &[(u64, &Schema, ZSetBatch)]) -> Result<u64, ClientError> {
+        for (_, schema, batch) in families {
+            batch.validate(schema).map_err(ClientError::ServerError)?;
+        }
+        let payload = encode_ddl_txn(self.client_id, families)?;
+        send_framed(self.sock.as_raw_fd(), &payload)?;
+        let msg = check_response(recv_message(self.sock.as_raw_fd(), None, self.max_payload_len)?)?;
         Ok(msg.seek_pk as u64)
     }
 

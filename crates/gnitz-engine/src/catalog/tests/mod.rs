@@ -114,6 +114,13 @@ fn count_records(table: &mut Table) -> usize {
 /// hook layer directly (bypassing `create_table`). `dir` only feeds the
 /// stored directory string — the path is never actually created on disk.
 fn build_table_tab_row(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str) -> Batch {
+    build_table_tab_row_flags(dir, tid, raw_pk_cols, table_name, 0)
+}
+
+/// Like `build_table_tab_row` but with an explicit packed `flags` word (so a test
+/// can build a row that passes precheck yet fails `hook_table_register`, e.g. a
+/// REPLICATED table with a non-default distribution prefix).
+fn build_table_tab_row_flags(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str, flags: u64) -> Batch {
     let mut bb = BatchBuilder::new(table_tab_schema());
     bb.begin_row(tid as u128, 1);
     bb.put_u64(PUBLIC_SCHEMA_ID as u64);
@@ -121,7 +128,7 @@ fn build_table_tab_row(dir: &str, tid: i64, raw_pk_cols: u64, table_name: &str) 
     bb.put_string(&format!("{dir}/public/{table_name}"));
     bb.put_u64(raw_pk_cols);
     bb.put_u64(0); // created_lsn
-    bb.put_u64(0); // flags
+    bb.put_u64(flags);
     bb.end_row();
     bb.finish()
 }

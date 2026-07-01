@@ -1524,7 +1524,8 @@ impl PyGnitzClient {
         let pk_slice = [pk_col_idx as u32];
         // Single-PK surface ⇒ partitioned, default distribution (full PK);
         // `REPLICATED` and `CLUSTER BY` are SQL-only features.
-        to_py_err(client!(self).create_table(schema_name, table_name, &cols, &pk_slice, unique_pk, false, 0))
+        // No inline UNIQUE constraint surface in the Python binding (those ride on SQL DDL).
+        to_py_err(client!(self).create_table(schema_name, table_name, &cols, &pk_slice, unique_pk, false, 0, &[]))
     }
 
     pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> PyResult<()> {

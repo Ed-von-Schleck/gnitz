@@ -371,7 +371,7 @@ pub(super) const SYS_TAB_INFOS: &[SysTabInfo] = &[
     },
 ];
 
-pub(super) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
+pub(crate) fn sys_tab_schema(id: i64) -> SchemaDescriptor {
     match id {
         SCHEMA_TAB_ID => S_SCHEMA_TAB,
         TABLE_TAB_ID => S_TABLE_TAB,

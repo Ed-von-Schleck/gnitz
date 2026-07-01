@@ -12,7 +12,7 @@ pub mod types;
 pub use circuit::{
     AggFunc, AggKind, Circuit, CircuitBuilder, CircuitRows, JoinKind, MapKind, NodeId, OpNode, Port, RangeRel, TableId,
 };
-pub use client::{GnitzClient, IndexMeta};
+pub use client::{GnitzClient, IndexMeta, InlineUniqueIndex};
 pub use connection::{
     Connection, COL_TAB, DEP_TAB, FIRST_USER_SCHEMA_ID, FIRST_USER_TABLE_ID, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB,
     VIEW_TAB,

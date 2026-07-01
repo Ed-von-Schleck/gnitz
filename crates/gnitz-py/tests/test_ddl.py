@@ -107,3 +107,37 @@ def test_create_then_drop_no_worker_race(race_server):
     client.create_schema(sn2)
     client.drop_schema(sn2)
     client.drop_schema(sn)
+
+
+def test_ddl_txn_frame_all_single_family_ops(client):
+    """Every catalog write now rides one DDL_TXN frame. Exercise the full set of
+    single-family paths — CREATE/DROP of schema, table, index, view — in sequence
+    to guard the frame reroute of each working path."""
+    sn = "s" + _uid()
+    client.create_schema(sn)  # CREATE SCHEMA
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)",
+            schema_name=sn,
+        )  # CREATE TABLE
+        client.execute_sql("CREATE INDEX ON t(b)", schema_name=sn)  # CREATE INDEX
+        client.execute_sql("CREATE VIEW v AS SELECT a FROM t", schema_name=sn)  # CREATE VIEW
+        client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
+        # The view is populated (incremental maintenance ran through the bundle).
+        vid, _ = client.resolve_table(sn, "v")
+        assert len(list(client.scan(vid))) == 1
+
+        client.execute_sql("DROP VIEW v", schema_name=sn)  # DROP VIEW
+        client.execute_sql(f"DROP INDEX {sn}__t__idx_b", schema_name=sn)  # DROP INDEX
+        client.execute_sql("DROP TABLE t", schema_name=sn)  # DROP TABLE
+        client.drop_schema(sn)  # DROP SCHEMA
+    finally:
+        for stmt in ("DROP VIEW v", "DROP TABLE t"):
+            try:
+                client.execute_sql(stmt, schema_name=sn)
+            except Exception:
+                pass
+        try:
+            client.drop_schema(sn)
+        except Exception:
+            pass

@@ -611,3 +611,120 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// DDL_TXN bundle rollback — the ghost regression and the hook-failure path
+//
+// These drive the generalized handler shape directly: precheck_family +
+// apply_and_enqueue_family per family, with the between-precheck-and-apply
+// marker, then compensate_stage_a — exactly as `handle_ddl_txn` does. The
+// existing tests above stop at `ingest_to_family` and never reach
+// compensate_stage_a, so the ghost -1 was untested.
+// ---------------------------------------------------------------------------
+
+/// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB fails **precheck**
+/// (duplicate name) must leave neither an orphan COL_TAB nor a ghost `-1`
+/// TABLE_TAB. The marker stays `None` (precheck failed before apply), so
+/// compensation reconstructs nothing and only negates the drained COL_TAB.
+#[test]
+fn ddl_txn_precheck_failure_no_orphan_or_ghost() {
+    let dir = temp_dir("ddl_txn_precheck_ghost");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    // Occupy the qualified name "public.dupname".
+    engine.create_table("public.dupname", &cols, &[0], false).unwrap();
+    let cols_before = count_records(&mut engine.sys_columns);
+    let tables_before = count_records(&mut engine.sys_tables);
+    // Discard any queue entries the setup left behind, exactly as `handle_ddl_txn`
+    // does before ingesting a new bundle — so compensation drains only this
+    // bundle's families.
+    let _ = engine.drain_pending_broadcasts();
+
+    let new_tid = engine.allocate_table_id();
+    // Ascending topo: COL_TAB(1) applied + enqueued first.
+    let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
+    engine.precheck_family(COL_TAB_ID, &col_batch).unwrap();
+    engine.apply_and_enqueue_family(COL_TAB_ID, col_batch).unwrap();
+
+    // TABLE_TAB(6): precheck fails (duplicate name), so the handler's loop never
+    // applies it and its marker stays None. Compensation reconstructs nothing.
+    let table_batch = build_table_tab_row(&dir, new_tid, pack_pk_cols(&[0]), "dupname");
+    assert!(
+        engine.precheck_family(TABLE_TAB_ID, &table_batch).is_err(),
+        "duplicate-name TABLE_TAB must fail precheck"
+    );
+    engine.compensate_stage_a(None);
+
+    // The durable property: no orphan COL_TAB, no ghost -1 TABLE_TAB.
+    assert_eq!(
+        count_records(&mut engine.sys_columns),
+        cols_before,
+        "orphan COL_TAB rows must be negated to zero"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_tables),
+        tables_before,
+        "no ghost -1 TABLE_TAB row"
+    );
+    assert!(
+        !engine.caches.entity_by_id.contains_key(&new_tid),
+        "no phantom entity survives for the reusable new_tid"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A CREATE bundle `[COL_TAB, TABLE_TAB]` whose TABLE_TAB passes precheck but
+/// fails **inside** apply_and_enqueue (a register-hook error) must reconstruct
+/// and negate the applied-not-enqueued TABLE_TAB row (net-zero sys_tables) and
+/// negate the drained COL_TAB exactly once (no double-retraction ghost). A
+/// REPLICATED table with a non-default distribution prefix is the trigger:
+/// precheck does not check the pair, but `hook_table_register` rejects it after
+/// the row is applied.
+#[test]
+fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
+    let dir = temp_dir("ddl_txn_hook_rollback");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let cols_before = count_records(&mut engine.sys_columns);
+    let tables_before = count_records(&mut engine.sys_tables);
+
+    let new_tid = engine.allocate_table_id();
+    let col_batch = engine.build_col_batch(new_tid, OWNER_KIND_TABLE, &cols, 1);
+    engine.precheck_family(COL_TAB_ID, &col_batch).unwrap();
+    engine.apply_and_enqueue_family(COL_TAB_ID, col_batch).unwrap();
+
+    // REPLICATED + dist_prefix = 1: passes precheck, rejected by hook_table_register.
+    let flags = gnitz_wire::pack_table_flags(false, true, 1);
+    let table_batch = build_table_tab_row_flags(&dir, new_tid, pack_pk_cols(&[0]), "hooktbl", flags);
+    engine
+        .precheck_family(TABLE_TAB_ID, &table_batch)
+        .expect("replicated + dist_prefix passes precheck (it is a hook-layer check)");
+    // Marker set BEFORE apply; apply fails in the hook, so it stays Some.
+    let mut marker: Option<(i64, Batch)> = Some((TABLE_TAB_ID, table_batch.clone()));
+    let applied = engine.apply_and_enqueue_family(TABLE_TAB_ID, table_batch);
+    assert!(
+        applied.is_err(),
+        "hook_table_register must reject a REPLICATED table with a distribution prefix"
+    );
+    engine.compensate_stage_a(marker.take());
+
+    assert_eq!(
+        count_records(&mut engine.sys_tables),
+        tables_before,
+        "applied-not-enqueued TABLE_TAB row must net to zero"
+    );
+    assert_eq!(
+        count_records(&mut engine.sys_columns),
+        cols_before,
+        "drained COL_TAB rows must net to zero (negated exactly once)"
+    );
+    assert!(
+        !engine.dag.tables.contains_key(&new_tid),
+        "no registered table survives the rollback"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

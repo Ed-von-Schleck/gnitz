@@ -8,7 +8,6 @@ crate-type = ["cdylib", "staticlib"]
 
 [features]
 default     = []
-integration = ["gnitz-core/integration"]
 
 [dependencies]
 gnitz-core     = { path = "../gnitz-core" }

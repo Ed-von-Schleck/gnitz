@@ -50,6 +50,17 @@ pub const FLAG_SEEK_BY_INDEX_RANGE: u64 = 1 << 55;
 /// `seek_col_idx`; this high bit is never written to the SAL group header.
 pub const FLAG_ALLOCATE_SERIAL_RANGE: u64 = 1 << 56;
 
+/// DDL_TXN request flag. The client→master frame carrying an atomic bundle of
+/// system-table family batches for one catalog write (CREATE/DROP of
+/// table/view/index/schema, CREATE SCHEMA/INDEX). Purely a wire-level decode
+/// hint: it is consumed at `handle_message` routing and is NEVER written to the
+/// SAL — each family is broadcast under its own `FLAG_DDL_SYNC` group and the
+/// zone's `FLAG_TXN_COMMIT` sentinel is unrelated `sal.rs` state — so it takes a
+/// free high client-only bit (bit 57, above the SAL mirror at bits 0-15 and the
+/// bit-16–47 packed fields; 56 is the current top). Disjoint from every other
+/// flag by the compile-time guard below.
+pub const FLAG_DDL_TXN: u64 = 1 << 57;
+
 // ---------------------------------------------------------------------------
 // Wire-level packed fields: bits 16-39 of wire_flags
 // ---------------------------------------------------------------------------
@@ -90,6 +101,18 @@ const _: () = {
                 | FLAG_CONTINUATION
                 | FLAG_GET_INDICES
                 | FLAG_SEEK_BY_INDEX_RANGE)
+            == 0
+    );
+    assert!(
+        FLAG_DDL_TXN
+            & (SAL_FLAGS_MASK
+                | packed
+                | FLAG_HAS_SCHEMA
+                | FLAG_HAS_DATA
+                | FLAG_CONTINUATION
+                | FLAG_GET_INDICES
+                | FLAG_SEEK_BY_INDEX_RANGE
+                | FLAG_ALLOCATE_SERIAL_RANGE)
             == 0
     );
 };

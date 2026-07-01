@@ -48,6 +48,15 @@ impl ServerHandle {
             .arg(&sock_path)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file)); // captured for post-mortem
+
+        // Each server eagerly fallocate+pre-faults its whole SAL at startup, so the
+        // 1 GiB production default would let a parallel `cargo test` run (one server
+        // per test) exhaust the shared tmpfs data_dir and take a SIGBUS on the
+        // forced page-fault. Integration tests are functional (tiny writes), so cap
+        // the SAL small unless the caller already pinned a size.
+        if env::var_os("GNITZ_SAL_BYTES").is_none() {
+            cmd.env("GNITZ_SAL_BYTES", "134217728"); // 128 MiB
+        }
         if workers > 1 {
             cmd.arg(format!("--workers={workers}"));
         }

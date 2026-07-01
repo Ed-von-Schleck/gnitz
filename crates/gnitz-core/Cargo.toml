@@ -3,9 +3,6 @@ name = "gnitz-core"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-integration = []
-
 [dependencies]
 gnitz-wire  = { path = "../gnitz-wire" }
 libc        = "0.2"

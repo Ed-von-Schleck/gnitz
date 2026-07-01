@@ -10,7 +10,7 @@ use crate::plan::validate::{
 };
 use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
 use crate::SqlResult;
-use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, TypeCode};
+use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TypeCode};
 use sqlparser::ast::{
     ColumnOption, Expr, ObjectType, SqlOption, TableConstraint, Value, ValueWithSpan, WrappedCollection,
 };
@@ -523,6 +523,31 @@ pub(crate) fn execute_create_table(
         ));
     }
 
+    // Fold every inline UNIQUE constraint into the CREATE TABLE bundle so the
+    // table and its unique indices commit — or roll back — as one atomic DDL
+    // zone. No more create_table-then-create_index window that could leave a
+    // committed table missing its constraint. Resolve each index's catalog name
+    // here (SQL-level naming); `create_table` allocates the index ids, derives
+    // column types from `cols` (so a UNIQUE+FK column's rewritten type is used),
+    // and assembles the IDX_TAB family. Types were pre-validated above.
+    let index_names: Vec<String> = unique_cols
+        .iter()
+        .map(|(col_indices, constraint_name)| {
+            constraint_name.clone().unwrap_or_else(|| {
+                let col_names: Vec<&str> = col_indices.iter().map(|&c| cols[c as usize].name.as_str()).collect();
+                default_index_name(schema_name, &table_name, &col_names)
+            })
+        })
+        .collect();
+    let unique_indexes: Vec<InlineUniqueIndex> = unique_cols
+        .iter()
+        .zip(&index_names)
+        .map(|((col_indices, _), name)| InlineUniqueIndex {
+            col_indices: col_indices.as_slice(),
+            name: name.as_str(),
+        })
+        .collect();
+
     let tid = client
         .create_table(
             schema_name,
@@ -532,26 +557,9 @@ pub(crate) fn execute_create_table(
             true,
             replicated,
             dist_prefix_len,
+            &unique_indexes,
         )
         .map_err(GnitzSqlError::Exec)?;
-
-    // Unique secondary indices: created after the table exists (create_index
-    // requires the table id). Types were pre-validated, and the base table is
-    // empty, so create_index here cannot fail on a bad type or duplicate data —
-    // only on transport-level errors. On failure, best-effort drop_table to
-    // avoid an orphaned table with missing constraints (DDL is not
-    // transactional across the create_table / create_index boundary).
-    for (col_indices, constraint_name) in &unique_cols {
-        let col_types: Vec<TypeCode> = col_indices.iter().map(|&c| cols[c as usize].type_code).collect();
-        let index_name = constraint_name.clone().unwrap_or_else(|| {
-            let col_names: Vec<&str> = col_indices.iter().map(|&c| cols[c as usize].name.as_str()).collect();
-            default_index_name(schema_name, &table_name, &col_names)
-        });
-        if let Err(e) = client.create_index(tid, col_indices, &col_types, &index_name, true) {
-            let _ = client.drop_table(schema_name, &table_name);
-            return Err(GnitzSqlError::Exec(e));
-        }
-    }
 
     Ok(SqlResult::TableCreated { table_id: tid })
 }

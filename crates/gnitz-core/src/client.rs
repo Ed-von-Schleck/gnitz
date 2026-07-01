@@ -134,6 +134,18 @@ pub struct IndexMeta {
     pub is_unique: bool,
 }
 
+/// One inline `UNIQUE` constraint to fold into a `CREATE TABLE`'s atomic DDL
+/// bundle. `col_indices` are the constrained columns (a 1-element list for a
+/// single-column UNIQUE); `name` is the resolved catalog index name that
+/// `DROP INDEX` will match. Column types are derived from the table's columns,
+/// so a UNIQUE+FK column's parent-rewritten (integer) type is picked up
+/// automatically.
+#[derive(Clone, Copy, Debug)]
+pub struct InlineUniqueIndex<'a> {
+    pub col_indices: &'a [u32],
+    pub name: &'a str,
+}
+
 /// A cached half-open range `[next, end)` of unissued SERIAL ids for one table,
 /// drawn from the master by `alloc_serial_range`. Cache-loss on disconnect
 /// discards the unissued tail (an intentional, PostgreSQL-style gap).
@@ -420,7 +432,7 @@ impl GnitzClient {
             .u64_val(is_unique as u64)
             .str_val("");
 
-        self.push(IDX_TAB, idx_schema, &batch)?;
+        self.conn.push_ddl_txn(&[(IDX_TAB, idx_schema, batch)])?;
         Ok(index_id)
     }
 
@@ -450,7 +462,7 @@ impl GnitzClient {
                 .str_val(index_name)
                 .u64_val(is_unique)
                 .str_val(&cache_dir);
-            self.push(IDX_TAB, idx_schema, &batch)?;
+            self.conn.push_ddl_txn(&[(IDX_TAB, idx_schema, batch)])?;
             return Ok(());
         }
         Err(ClientError::ServerError(format!("index '{index_name}' not found")))
@@ -514,7 +526,7 @@ impl GnitzClient {
         BatchAppender::new(&mut batch, schema)
             .add_row(new_sid as u128, 1)
             .str_val(name);
-        self.conn.push(SCHEMA_TAB, schema, &batch, &mut self.schema_cache)?;
+        self.conn.push_ddl_txn(&[(SCHEMA_TAB, schema, batch)])?;
         Ok(new_sid)
     }
 
@@ -587,7 +599,7 @@ impl GnitzClient {
         BatchAppender::new(&mut batch, schema)
             .add_row(schema_id as u128, -1)
             .str_val(name);
-        self.conn.push(SCHEMA_TAB, schema, &batch, &mut self.schema_cache)?;
+        self.conn.push_ddl_txn(&[(SCHEMA_TAB, schema, batch)])?;
         Ok(())
     }
 
@@ -596,6 +608,11 @@ impl GnitzClient {
     /// prefix). `0` means the default — distribute by the full PK, byte-identical
     /// to the pre-distribution-key behavior. The SQL planner validates `k` against
     /// the PK before calling this; the single-PK Python/test surfaces pass `0`.
+    ///
+    /// `unique_indexes` are the table's inline `UNIQUE` constraints, folded into
+    /// the same atomic DDL bundle as `[COL_TAB, TABLE_TAB, IDX_TAB]` so a failure
+    /// rolls the whole `CREATE` back — never a table left missing its unique
+    /// constraint. Pass an empty slice for a table with no inline UNIQUE.
     #[allow(clippy::too_many_arguments)]
     pub fn create_table(
         &mut self,
@@ -606,6 +623,7 @@ impl GnitzClient {
         unique_pk: bool,
         replicated: bool,
         dist_prefix_len: usize,
+        unique_indexes: &[InlineUniqueIndex],
     ) -> Result<u64, ClientError> {
         if !(1..=gnitz_wire::PK_LIST_MAX_COLS).contains(&pk_cols.len()) {
             return Err(ClientError::ServerError(format!(
@@ -628,10 +646,11 @@ impl GnitzClient {
         // distinguishes it from a bare scalar index.
         let pk_packed = gnitz_wire::pack_pk_cols(pk_cols);
 
-        // COL_TAB first — server hook fires on TABLE_TAB insert and reads COL_TAB
-        self.push_col_tab_records(new_tid, OWNER_KIND_TABLE, columns)?;
+        // COL_TAB family — the server sorts families by topo priority, so it
+        // ingests columns before the TABLE_TAB register hook that reads them.
+        let col_family = build_col_tab_batch(new_tid, OWNER_KIND_TABLE, columns)?;
 
-        // TABLE_TAB last
+        // TABLE_TAB family.
         let tbl_schema = table_tab_schema();
         let mut tb = ZSetBatch::new(tbl_schema);
         BatchAppender::new(&mut tb, tbl_schema)
@@ -642,7 +661,40 @@ impl GnitzClient {
             .u64_val(pk_packed)
             .u64_val(0)
             .u64_val(gnitz_wire::pack_table_flags(unique_pk, replicated, dist_prefix_len));
-        self.conn.push(TABLE_TAB, tbl_schema, &tb, &mut self.schema_cache)?;
+
+        // IDX_TAB family — every inline UNIQUE index as one multi-row batch
+        // (`hook_index_register` loops over rows). Allocate ids and validate up
+        // front so the batch is assembled without interleaving RPCs. Column types
+        // come from `columns`, so a UNIQUE+FK column's parent-rewritten type is
+        // used. Empty ⇒ the bundle is just `[COL_TAB, TABLE_TAB]`.
+        let mut index_ids: Vec<u64> = Vec::with_capacity(unique_indexes.len());
+        for spec in unique_indexes {
+            gnitz_wire::validate_pk_col_list(spec.col_indices)
+                .map_err(|e| ClientError::ServerError(format!("create_table: unique index: {e}")))?;
+            for &c in spec.col_indices {
+                validate_index_col_type(columns[c as usize].type_code)?;
+            }
+            index_ids.push(self.conn.alloc_index_id()?);
+        }
+        let mut families: Vec<(u64, &Schema, ZSetBatch)> = vec![col_family, (TABLE_TAB, tbl_schema, tb)];
+        if !unique_indexes.is_empty() {
+            let idx_schema = idx_tab_schema();
+            let mut idx_batch = ZSetBatch::new(idx_schema);
+            {
+                let mut a = BatchAppender::new(&mut idx_batch, idx_schema);
+                for (spec, &index_id) in unique_indexes.iter().zip(&index_ids) {
+                    a.add_row(index_id as u128, 1)
+                        .u64_val(new_tid) // owner_id
+                        .u64_val(0) // owner_kind = table
+                        .u64_val(gnitz_wire::pack_pk_cols(spec.col_indices)) // source_col_idx
+                        .str_val(spec.name)
+                        .u64_val(1) // is_unique
+                        .str_val(""); // cache_directory
+                }
+            }
+            families.push((IDX_TAB, idx_schema, idx_batch));
+        }
+        self.conn.push_ddl_txn(&families)?;
 
         Ok(new_tid)
     }
@@ -668,7 +720,7 @@ impl GnitzClient {
             .u64_val(record.pk_col_idx)
             .u64_val(record.created_lsn)
             .u64_val(record.flags);
-        self.conn.push(TABLE_TAB, tbl_schema, &tb, &mut self.schema_cache)?;
+        self.conn.push_ddl_txn(&[(TABLE_TAB, tbl_schema, tb)])?;
 
         Ok(())
     }
@@ -774,8 +826,16 @@ impl GnitzClient {
             schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
-        // 1. Column records
-        self.push_col_tab_records(vid, OWNER_KIND_VIEW, output_columns)?;
+        // Assemble every family batch into one atomic `push_ddl_txn` bundle, in
+        // dependency order (the server re-sorts by topo priority anyway). The
+        // server ingests the families under one durable zone, so the VIEW_TAB
+        // register hook sees the columns, deps, and circuit already in the
+        // memtable — no per-family RPC, and a failure rolls the entire CREATE VIEW
+        // back.
+        let mut families: Vec<(u64, &Schema, ZSetBatch)> = Vec::new();
+
+        // 1. Column records.
+        families.push(build_col_tab_batch(vid, OWNER_KIND_VIEW, output_columns)?);
 
         // 2. Dependency records — every ScanDelta source_table.
         let deps = circuit.dependencies();
@@ -806,7 +866,7 @@ impl GnitzClient {
                     a.add_row(pk, 1).u64_val(0); // dep_view_id
                 }
             }
-            self.conn.push(DEP_TAB, dep_s, &dep, &mut self.schema_cache)?;
+            families.push((DEP_TAB, dep_s, dep));
         }
 
         // Materialise the typed circuit into the three-table row bundle.
@@ -835,8 +895,7 @@ impl GnitzClient {
                     };
                 }
             }
-            self.conn
-                .push(CIRCUIT_NODES_TAB, nodes_s, &nodes, &mut self.schema_cache)?;
+            families.push((CIRCUIT_NODES_TAB, nodes_s, nodes));
         }
 
         // 4. CircuitEdges (natural-key PK — no synthetic edge_id).
@@ -856,8 +915,7 @@ impl GnitzClient {
                         .u64_val(*src_node);
                 }
             }
-            self.conn
-                .push(CIRCUIT_EDGES_TAB, edges_s, &edges, &mut self.schema_cache)?;
+            families.push((CIRCUIT_EDGES_TAB, edges_s, edges));
         }
 
         // 5. CircuitNodeColumns (replaces group_cols + the four PARAM_BASE ranges).
@@ -881,15 +939,17 @@ impl GnitzClient {
                         .u64_val(*v2);
                 }
             }
-            self.conn
-                .push(CIRCUIT_NODE_COLUMNS_TAB, s, &nc, &mut self.schema_cache)?;
+            families.push((CIRCUIT_NODE_COLUMNS_TAB, s, nc));
         }
 
-        // 6. View record — must be last (triggers server-side hook + circuit
-        // compilation). Encode the view PK with the shared wire packer so the
-        // engine catalog decodes it identically to a TABLE_TAB PK.
+        // 6. View record — the VIEW_TAB register hook triggers server-side
+        // compilation. Encode the view PK with the shared wire packer so the
+        // engine catalog decodes it identically to a TABLE_TAB PK. Last in the
+        // bundle by dependency order, though the server re-sorts by topo priority.
         let pk_packed = gnitz_wire::pack_pk_cols(pk_cols);
-        self.push_view_record(vid, schema_id, view_name, sql_text, pk_packed)?;
+        families.push(build_view_tab_batch(vid, schema_id, view_name, sql_text, pk_packed));
+
+        self.conn.push_ddl_txn(&families)?;
 
         Ok(vid)
     }
@@ -915,7 +975,7 @@ impl GnitzClient {
             .str_val(&vr.cache_directory)
             .u64_val(vr.created_lsn)
             .u64_val(vr.pk_col_idx);
-        self.conn.push(VIEW_TAB, view_s, &vb, &mut self.schema_cache)?;
+        self.conn.push_ddl_txn(&[(VIEW_TAB, view_s, vb)])?;
 
         Ok(())
     }
@@ -1123,55 +1183,55 @@ fn collect_schema_member_names(batch: &ZSetBatch, schema_id: u64) -> Result<Vec<
     Ok(out)
 }
 
-impl GnitzClient {
-    fn push_col_tab_records(
-        &mut self,
-        owner_id: u64,
-        owner_kind: u64,
-        columns: &[ColumnDef],
-    ) -> Result<(), ClientError> {
-        let schema = col_tab_schema();
-        let mut batch = ZSetBatch::new(schema);
-        {
-            let mut a = BatchAppender::new(&mut batch, schema);
-            for (i, col) in columns.iter().enumerate() {
-                a.add_row(pack_col_id(owner_id, i)? as u128, 1)
-                    .u64_val(owner_id)
-                    .u64_val(owner_kind)
-                    .u64_val(i as u64)
-                    .str_val(&col.name)
-                    .u64_val(col.type_code as u64)
-                    .u64_val(if col.is_nullable { 1 } else { 0 })
-                    .u64_val(col.fk_table_id)
-                    .u64_val(col.fk_col_idx)
-                    .u64_val(if col.is_serial { 1 } else { 0 });
-            }
+/// Build the `COL_TAB` family batch for a table/view's column records — a pure
+/// batch builder returning `(target_id, schema, batch)` for `push_ddl_txn` to
+/// bundle. Touches no connection state; the DDL's whole family set is ingested
+/// atomically server-side, so column records no longer need a standalone RPC.
+fn build_col_tab_batch(
+    owner_id: u64,
+    owner_kind: u64,
+    columns: &[ColumnDef],
+) -> Result<(u64, &'static Schema, ZSetBatch), ClientError> {
+    let schema = col_tab_schema();
+    let mut batch = ZSetBatch::new(schema);
+    {
+        let mut a = BatchAppender::new(&mut batch, schema);
+        for (i, col) in columns.iter().enumerate() {
+            a.add_row(pack_col_id(owner_id, i)? as u128, 1)
+                .u64_val(owner_id)
+                .u64_val(owner_kind)
+                .u64_val(i as u64)
+                .str_val(&col.name)
+                .u64_val(col.type_code as u64)
+                .u64_val(if col.is_nullable { 1 } else { 0 })
+                .u64_val(col.fk_table_id)
+                .u64_val(col.fk_col_idx)
+                .u64_val(if col.is_serial { 1 } else { 0 });
         }
-        self.conn.push(COL_TAB, schema, &batch, &mut self.schema_cache)?;
-        Ok(())
     }
+    Ok((COL_TAB, schema, batch))
+}
 
-    fn push_view_record(
-        &mut self,
-        vid: u64,
-        schema_id: u64,
-        view_name: &str,
-        sql_text: &str,
-        pk_packed: u64,
-    ) -> Result<(), ClientError> {
-        let view_s = view_tab_schema();
-        let mut vb = ZSetBatch::new(view_s);
-        BatchAppender::new(&mut vb, view_s)
-            .add_row(vid as u128, 1)
-            .u64_val(schema_id)
-            .str_val(view_name)
-            .str_val(sql_text)
-            .str_val("")
-            .u64_val(0)
-            .u64_val(pk_packed);
-        self.conn.push(VIEW_TAB, view_s, &vb, &mut self.schema_cache)?;
-        Ok(())
-    }
+/// Build the `VIEW_TAB` family batch (the view record) — a pure batch builder
+/// for `push_ddl_txn` to bundle after the view's columns/deps/circuit families.
+fn build_view_tab_batch(
+    vid: u64,
+    schema_id: u64,
+    view_name: &str,
+    sql_text: &str,
+    pk_packed: u64,
+) -> (u64, &'static Schema, ZSetBatch) {
+    let view_s = view_tab_schema();
+    let mut vb = ZSetBatch::new(view_s);
+    BatchAppender::new(&mut vb, view_s)
+        .add_row(vid as u128, 1)
+        .u64_val(schema_id)
+        .str_val(view_name)
+        .str_val(sql_text)
+        .str_val("")
+        .u64_val(0)
+        .u64_val(pk_packed);
+    (VIEW_TAB, view_s, vb)
 }
 
 #[cfg(test)]

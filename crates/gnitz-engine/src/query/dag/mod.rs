@@ -1124,30 +1124,25 @@ impl DagEngine {
         (pending, pending_pos)
     }
 
-    // ── drive_dag (shared DAG driver) ───────────────────────────────────
+    // ── drive_dag (DAG traversal driver) ────────────────────────────────
 
-    /// Shared engine for both DAG evaluation modes. Seeds the pending queue from
+    /// Drives DAG evaluation from a base delta. Seeds the pending queue from
     /// `source_id`'s direct dependents, then repeatedly pops the shallowest
     /// pending edge, runs `execute` on it, ingests the output, and fans that
-    /// output onto each downstream edge — until the queue drains. Every modified
-    /// view trace is flushed exactly once after the DAG settles.
+    /// output — or, for a view that produced nothing, an empty placeholder so
+    /// collective exchange rounds stay in lockstep across workers — onto each
+    /// downstream edge, until the queue drains. Every modified view trace is
+    /// flushed exactly once after the DAG settles.
     ///
-    /// `execute` is the per-view step: the single-worker driver runs
-    /// `execute_epoch_for_dag`; the multi-worker driver runs the exchange-aware
-    /// `execute_multi_worker_step` (capturing its `ExchangeCallback`). It takes
+    /// `execute` is the per-view step (the exchange-aware
+    /// `execute_multi_worker_step`, capturing its `ExchangeCallback`). It takes
     /// the engine as an explicit `&mut Self` argument — borrowed only for the
     /// call, never captured — and returns the view's output delta, or
     /// `None`/empty when the view produced nothing this epoch.
-    ///
-    /// `queue_empty` decides the fate of a view that produced no output:
-    /// single-worker drops it (`false` — nothing downstream can change), while
-    /// multi-worker still fans an empty placeholder onto each dependent (`true`)
-    /// so collective exchange rounds stay in lockstep across workers.
     fn drive_dag(
         &mut self,
         source_id: i64,
         delta: Batch,
-        queue_empty: bool,
         mut execute: impl FnMut(&mut Self, i64, Batch, i64) -> Option<Batch>,
     ) -> i32 {
         self.get_dep_map();
@@ -1183,18 +1178,12 @@ impl DagEngine {
                     continue;
                 }
                 self.ingest_by_ref(view_id, out_delta.as_ref().unwrap());
-            } else if !queue_empty {
-                // Single-worker: an empty output has no downstream effect.
-                if let Some(b) = out_delta {
-                    crate::storage::batch_pool::recycle(b);
-                }
-                continue;
             }
 
-            // Fan the output — or, under `queue_empty`, an empty placeholder —
-            // onto each dependent edge. Borrow the dep list (disjoint from
-            // `&self.tables`) rather than cloning; `map_or` yields an empty slice
-            // for a view with no dependents, which queue_dependents no-ops.
+            // Fan the output — or, for a view that produced nothing, an empty
+            // placeholder — onto each dependent edge. Borrow the dep list (disjoint
+            // from `&self.tables`) rather than cloning; `map_or` yields an empty
+            // slice for a view with no dependents, which queue_dependents no-ops.
             let src_schema = self.tables[&view_id].schema;
             let delta = if has_output { out_delta.as_ref() } else { None };
             let dep_view_ids = self.dep.forward.get(&view_id).map_or(&[][..], Vec::as_slice);
@@ -1220,32 +1209,17 @@ impl DagEngine {
         0
     }
 
-    /// Single-worker DAG evaluation: run each view's epoch directly, with no
-    /// exchange IPC. An empty output is dropped — nothing downstream can change.
-    pub fn evaluate_dag(&mut self, source_id: i64, delta: Batch) -> i32 {
-        gnitz_debug!(
-            "dag: evaluate_dag source_id={} delta_count={} tables={}",
-            source_id,
-            delta.count,
-            self.tables.len()
-        );
-        self.drive_dag(source_id, delta, false, |this, view_id, input, src_id| {
-            this.execute_epoch_for_dag(view_id, input, src_id)
-        })
-    }
-
-    /// Multi-worker DAG evaluation with exchange IPC. Same traversal as the
-    /// single-worker `evaluate_dag`, but each view runs through
-    /// `execute_multi_worker_step` (the pre / exchange / post dance), and
-    /// `queue_empty = true` keeps empty placeholders flowing downstream so
-    /// collective exchange rounds stay in lockstep across workers.
+    /// Multi-worker DAG evaluation with exchange IPC. Each view runs through
+    /// `execute_multi_worker_step` (the pre / exchange / post dance); the empty
+    /// placeholders `drive_dag` fans downstream keep collective exchange rounds in
+    /// lockstep across workers.
     pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(
         &mut self,
         source_id: i64,
         delta: Batch,
         exchange: &mut E,
     ) -> i32 {
-        self.drive_dag(source_id, delta, true, |this, view_id, input, src_id| {
+        self.drive_dag(source_id, delta, |this, view_id, input, src_id| {
             this.execute_multi_worker_step(view_id, input, src_id, exchange)
         })
     }
@@ -1473,11 +1447,11 @@ impl DagEngine {
         (ptrs, storage)
     }
 
-    /// Execute epoch for evaluate_dag, handling pre/post plan split for
-    /// single-worker (no exchange IPC).
+    /// Execute one view's epoch with the pre/post plan split but no exchange IPC —
+    /// the backfill path, where a single owner sees every shard.
     fn execute_epoch_for_dag(&mut self, view_id: i64, input: Batch, source_id: i64) -> Option<Batch> {
         if !self.ensure_compiled(view_id) {
-            gnitz_warn!("dag: evaluate_dag — no plan for view_id={}", view_id);
+            gnitz_warn!("dag: execute_epoch_for_dag — no plan for view_id={}", view_id);
             return None;
         }
         let has_post = self.cache.get(&view_id).unwrap().post.is_some();

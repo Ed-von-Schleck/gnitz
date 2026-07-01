@@ -11,7 +11,7 @@ use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::query::ExchangeCallback;
 use crate::runtime::sal::{
     schema_wire_safe, SalMessageKind, SalReader, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP,
-    BACKFILL_PAD_BIT, FLAG_CHECKPOINT, FLAG_EXCHANGE, SAL_MMAP_SIZE,
+    BACKFILL_PAD_BIT, FLAG_CHECKPOINT, FLAG_EXCHANGE,
 };
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::w2m_ring;
@@ -552,7 +552,7 @@ impl WorkerProcess {
     /// successful epoch match — a post-epoch group remains parked at the
     /// cursor until the cursor is reset by checkpoint.
     fn next_sal_message(&mut self) -> Option<(SalMessageKind, i64, Option<&'static [u8]>)> {
-        if self.read_cursor + 8 >= SAL_MMAP_SIZE as u64 {
+        if self.read_cursor + 8 >= self.sal_reader.mmap_size() {
             return None;
         }
         let (msg, new_cursor) = self.sal_reader.try_read(self.read_cursor)?;

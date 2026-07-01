@@ -11,7 +11,7 @@ use crate::foundation::syscall;
 use crate::query::RelationKind;
 use crate::runtime::executor::ServerExecutor;
 use crate::runtime::master::MasterDispatcher;
-use crate::runtime::sal::{SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_PUSH, FLAG_TXN_COMMIT, SAL_MMAP_SIZE};
+use crate::runtime::sal::{sal_mmap_size, SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_PUSH, FLAG_TXN_COMMIT};
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring::{self, W2M_REGION_SIZE};
 use crate::runtime::wire as ipc;
@@ -42,9 +42,11 @@ fn partition_range(worker_id: u32, num_workers: u32) -> (u32, u32) {
 //
 //   Pass 1 — collect every LSN that has its commit sentinel on disk
 //            (FLAG_TXN_COMMIT). Any LSN without one is "uncommitted" and
-//            its groups are skipped at apply time. Half-completed DDL
-//            (orphan COL_TAB) is therefore impossible: if the sentinel
-//            never made it to disk, none of the zone's groups apply.
+//            its groups are skipped at apply time. A whole CREATE is now one
+//            zone — its N families ride one `FLAG_DDL_TXN` bundle committed
+//            under a single zone LSN — so an orphan COL_TAB is impossible for a
+//            CREATE, not just intra-zone: the CREATE's groups apply iff its one
+//            sentinel is durable, i.e. all of COL_TAB and TABLE_TAB or none.
 //
 //   Pass 2 — walk again. For each group whose LSN is committed and
 //            > family_lsns[tid] (table not already flushed past this
@@ -60,7 +62,7 @@ fn collect_committed_lsns(sal_reader: &SalReader) -> HashSet<u64> {
     let mut committed: HashSet<u64> = HashSet::new();
     let mut offset: u64 = 0;
     let mut last_epoch: u32 = 0;
-    while (offset as usize) + 8 < SAL_MMAP_SIZE {
+    while offset + 8 < sal_reader.mmap_size() {
         let (msg, new_offset) = match sal_reader.try_read(offset) {
             Some(v) => v,
             None => break,
@@ -95,7 +97,7 @@ where
     let mut offset: u64 = 0;
     let mut applied: u32 = 0;
     let mut last_epoch: u32 = 0;
-    while (offset as usize) + 8 < SAL_MMAP_SIZE {
+    while offset + 8 < sal_reader.mmap_size() {
         let (msg, new_offset) = match sal_reader.try_read(offset) {
             Some(v) => v,
             None => break,
@@ -140,7 +142,7 @@ where
 /// batch addressed to a system table — orphan COL_TAB rows from a
 /// crashed DDL are skipped because their zone never closed.
 fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngine) {
-    let sal_reader = SalReader::new(sal_ptr, 0, SAL_MMAP_SIZE, -1);
+    let sal_reader = SalReader::new(sal_ptr, 0, sal_mmap_size(), -1);
     let all_lsns = catalog.collect_all_flushed_lsns();
     let family_lsns: HashMap<i64, u64> = all_lsns
         .into_iter()
@@ -278,10 +280,10 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     unsafe {
         libc::fstat(sal_fd, &mut stat);
     }
-    if (stat.st_size as usize) < SAL_MMAP_SIZE {
-        posix_io::fallocate(sal_fd, SAL_MMAP_SIZE as i64);
+    if (stat.st_size as usize) < sal_mmap_size() {
+        posix_io::fallocate(sal_fd, sal_mmap_size() as i64);
     }
-    let sal_ptr = syscall::mmap_shared(sal_fd, SAL_MMAP_SIZE);
+    let sal_ptr = syscall::mmap_shared(sal_fd, sal_mmap_size());
     if sal_ptr.is_null() {
         let msg = b"Error: failed to mmap SAL\n";
         unsafe {
@@ -292,7 +294,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     // Pre-fault writable PTEs so the hot write path never page-faults.
     // MADV_POPULATE_WRITE (Linux 5.14+) installs dirty PTEs and triggers
     // the filesystem mkwrite callback upfront, without dirtying page contents.
-    posix_io::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
+    posix_io::madvise_populate_write(sal_ptr, sal_mmap_size());
 
     // --- V2 migration: clean break, sentinel marker file ---
     //
@@ -309,9 +311,9 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
         let v2_marker_path = format!("{data_dir}/wal.sal.v2");
         if !std::path::Path::new(&v2_marker_path).exists() {
             unsafe {
-                libc::memset(sal_ptr as *mut libc::c_void, 0, SAL_MMAP_SIZE);
+                libc::memset(sal_ptr as *mut libc::c_void, 0, sal_mmap_size());
             }
-            posix_io::madvise_populate_write(sal_ptr, SAL_MMAP_SIZE);
+            posix_io::madvise_populate_write(sal_ptr, sal_mmap_size());
             if let Err(e) = std::fs::File::create(&v2_marker_path) {
                 let msg = format!("Error: failed to create wal.sal.v2 marker: {e}\n");
                 unsafe {
@@ -488,7 +490,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             }
 
             // Construct channel types for this worker
-            let sal_reader = SalReader::new(sal_ptr as *const u8, w as u32, SAL_MMAP_SIZE, m2w_efds[w]);
+            let sal_reader = SalReader::new(sal_ptr as *const u8, w as u32, sal_mmap_size(), m2w_efds[w]);
             let w2m_writer = W2mWriter::new(w2m_ptrs[w], W2M_REGION_SIZE as u64);
 
             // SAL recovery — replay unflushed push data
@@ -581,7 +583,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     catalog.close_user_table_partitions();
     catalog.set_active_partitions(0, 0);
 
-    let sal_writer = SalWriter::new(sal_ptr, sal_fd, SAL_MMAP_SIZE as u64, m2w_efds.clone());
+    let sal_writer = SalWriter::new(sal_ptr, sal_fd, sal_mmap_size() as u64, m2w_efds.clone());
     let w2m_receiver = W2mReceiver::new(w2m_ptrs.clone());
 
     let dispatcher = MasterDispatcher::new(nw, worker_pids.clone(), catalog_ptr, sal_writer, w2m_receiver);

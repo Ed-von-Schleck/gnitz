@@ -136,6 +136,51 @@ class TestFkInlineReferences:
         finally:
             _cleanup(client, sn, "child", "parent")
 
+    def test_dup_name_fk_create_leaves_no_phantom_child(self, client):
+        """Atomic-DDL headline regression (no crash, deterministic red-green).
+
+        A duplicate-name CREATE TABLE whose column REFERENCES a parent must not
+        strand a phantom FK child. Pre-fix, the COL_TAB families committed as a
+        separate RPC *before* the TABLE_TAB name check failed, so the running
+        master's fk_by_parent[parent] carried a phantom child and DROP TABLE
+        parent was blocked in the same session (and every reboot re-materialised
+        it). Under atomic CREATE the whole bundle rolls back in master memory, so
+        no phantom forms and DROP TABLE parent succeeds.
+        """
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)",
+                schema_name=sn,
+            )
+            # Re-CREATE t (duplicate name) with a column REFERENCES parent. The
+            # server ingests COL_TAB (whose FK hook populates fk_by_parent[parent])
+            # then rejects TABLE_TAB on the duplicate name — one atomic zone,
+            # rolled back on the failure.
+            err = None
+            try:
+                client.execute_sql(
+                    "CREATE TABLE t ("
+                    "  id BIGINT NOT NULL PRIMARY KEY,"
+                    "  pref BIGINT NOT NULL REFERENCES parent(id)"
+                    ")",
+                    schema_name=sn,
+                )
+            except gnitz.GnitzError as e:
+                err = e
+            assert err is not None, "duplicate-name CREATE TABLE must error"
+
+            # The real `t` has no FK to parent, so the ONLY thing that could block
+            # this is a stranded phantom child. Post-fix it drops cleanly.
+            client.execute_sql("DROP TABLE parent", schema_name=sn)
+        finally:
+            _cleanup(client, sn, "t", "parent")
+
     def test_fk_parent_pk_not_first_column(self, client):
         """Regression: parent PK declared at a NON-leading column position.
 

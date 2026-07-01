@@ -392,7 +392,7 @@ impl MasterDispatcher {
     /// with no concurrent relay to service:
     /// - **Boot** (`fan_out_backfill`), before the reactor is up.
     /// - **Live CREATE VIEW**, the reactor-parked stop-the-world DDL window:
-    ///   `handle_system_dml` holds the catalog write lock (so the async
+    ///   `handle_ddl_txn` holds the catalog write lock (so the async
     ///   `relay_loop`, which would take the read lock, cannot run and cannot
     ///   deadlock) and drives the backfill/drain inline. `w2m()` resolves
     ///   through the reactor's receiver there (see `set_w2m_receiver_ptr`).
@@ -501,7 +501,7 @@ impl MasterDispatcher {
     /// Invariant: callers must live on a path that owns SAL checkpoint
     /// exclusivity. Today that is the bootstrap backfill, the committer task,
     /// and the reactor-parked stop-the-world CREATE-VIEW backfill
-    /// (`handle_system_dml` holds the catalog write lock with the committer
+    /// (`handle_ddl_txn` holds the catalog write lock with the committer
     /// proven idle and the reactor parked, so no other SAL writer exists —
     /// the same exclusivity boot has). The *async* fan-out / tick / steady-state
     /// DDL paths must NOT call this — a concurrent FLAG_FLUSH races the
@@ -830,7 +830,7 @@ impl MasterDispatcher {
 
     /// Synchronously drain one source's pending ticks during the reactor-parked
     /// CREATE-VIEW window: emit a FLAG_TICK, signal, and collect each worker's
-    /// ACK while relaying its exchange dependents inline. The `handle_system_dml`
+    /// ACK while relaying its exchange dependents inline. The `handle_ddl_txn`
     /// caller holds the catalog write lock and the tick gate with the committer
     /// idle, so the async `relay_loop` cannot run (no deadlock) and no other tick
     /// races this. Checkpointing is forced off: a tick carries no backfill pad,
