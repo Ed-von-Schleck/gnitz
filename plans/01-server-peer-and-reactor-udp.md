@@ -135,6 +135,13 @@ pub struct RecvBuf {
 
 impl RecvBuf {
     pub fn as_slice(&self) -> &[u8] {
+        // `from_raw_parts` requires a non-null pointer even at len 0, so a
+        // null ptr (a zero-length frame from a mock/alternate transport) maps
+        // to the empty slice explicitly rather than constructing UB. Mirrors
+        // the null check in `Drop`.
+        if self.ptr.is_null() {
+            return &[];
+        }
         // SAFETY: ptr/len come from a completed reactor recv; the buffer
         // is exclusively owned by this RecvBuf until drop.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
@@ -214,28 +221,127 @@ In `master/dispatch.rs`, `fan_out_scan_async` and
 `crates/gnitz-engine/src/foundation/posix_io.rs` gains, next to
 `server_create`:
 
+`udp_bind` uses `socket(AF_INET|AF_INET6, SOCK_DGRAM, 0)` per the address
+family, sets the buffer sizes with `setsockopt`, binds, and does not set
+`O_NONBLOCK` (irrelevant under io_uring). No `connect()` — the server socket
+is unconnected and every send carries an explicit destination. Every error
+path closes the socket before returning: a raw `i32` fd has no `Drop`, so an
+early return without `close` leaks it (same discipline as `server_create`).
+
 ```rust
 /// Create + bind a UDP socket on `addr`. Requests `rcvbuf_bytes` /
 /// `sndbuf_bytes` via SO_RCVBUF/SO_SNDBUF (best-effort; the kernel may
 /// clamp). Returns the fd, or a negative value on error (same convention
 /// as `server_create`).
-pub fn udp_bind(addr: std::net::SocketAddr, rcvbuf_bytes: usize, sndbuf_bytes: usize) -> i32;
+pub fn udp_bind(addr: std::net::SocketAddr, rcvbuf_bytes: usize, sndbuf_bytes: usize) -> i32 {
+    let family = match addr {
+        std::net::SocketAddr::V4(_) => libc::AF_INET,
+        std::net::SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    unsafe {
+        let fd = libc::socket(family, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return -1;
+        }
+        // SO_RCVBUF / SO_SNDBUF take a *const c_int (4 bytes). Passing a
+        // pointer to `usize` would hand the kernel 4 of its 8 bytes — correct
+        // only by luck on little-endian. Copy into a c_int and point at that.
+        let rcvbuf = rcvbuf_bytes as libc::c_int;
+        if libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &rcvbuf as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) < 0
+        {
+            libc::close(fd);
+            return -2;
+        }
+        let sndbuf = sndbuf_bytes as libc::c_int;
+        if libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &sndbuf as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) < 0
+        {
+            libc::close(fd);
+            return -3;
+        }
+        let (ss, len) = sockaddr_from_addr(&addr);
+        if libc::bind(fd, &ss as *const libc::sockaddr_storage as *const libc::sockaddr, len) < 0 {
+            libc::close(fd);
+            return -4;
+        }
+        fd
+    }
+}
 
 /// getsockname() as a SocketAddr — resolves the real port after a
 /// port-0 bind. Returns None on error or non-INET family.
-pub fn udp_local_addr(fd: i32) -> Option<std::net::SocketAddr>;
+pub fn udp_local_addr(fd: i32) -> Option<std::net::SocketAddr> {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe { libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) };
+    if rc < 0 {
+        return None;
+    }
+    addr_from_sockaddr(&ss, len)
+}
 
-/// SocketAddr → (sockaddr_storage, socklen_t). Zero-pads the storage.
-pub fn sockaddr_from_addr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t);
+/// SocketAddr → (sockaddr_storage, socklen_t). Zero-pads the storage and
+/// preserves the IPv6 flowinfo/scope_id so link-local destinations route
+/// (without a scope id the kernel rejects an `fe80::` send with EINVAL).
+pub fn sockaddr_from_addr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        std::net::SocketAddr::V4(a) => {
+            let sin = unsafe { &mut *(&mut ss as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = a.port().to_be();
+            // octets() are already network order; from_ne_bytes keeps the
+            // in-memory byte order intact on both endiannesses.
+            sin.sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
+            (ss, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+        }
+        std::net::SocketAddr::V6(a) => {
+            let sin6 = unsafe { &mut *(&mut ss as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = a.port().to_be();
+            sin6.sin6_flowinfo = a.flowinfo();
+            sin6.sin6_addr.s6_addr = a.ip().octets();
+            sin6.sin6_scope_id = a.scope_id();
+            (ss, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+        }
+    }
+}
 
 /// (sockaddr_storage, len) → SocketAddr. None for non-AF_INET/AF_INET6.
-pub fn addr_from_sockaddr(ss: &libc::sockaddr_storage, len: libc::socklen_t) -> Option<std::net::SocketAddr>;
+/// Preserves IPv6 flowinfo/scope_id so a reply to a received `src` reaches
+/// a link-local peer.
+pub fn addr_from_sockaddr(ss: &libc::sockaddr_storage, _len: libc::socklen_t) -> Option<std::net::SocketAddr> {
+    match ss.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let sin = unsafe { &*(ss as *const _ as *const libc::sockaddr_in) };
+            let ip = std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+            Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, u16::from_be(sin.sin_port))))
+        }
+        libc::AF_INET6 => {
+            let sin6 = unsafe { &*(ss as *const _ as *const libc::sockaddr_in6) };
+            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            Some(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                ip,
+                u16::from_be(sin6.sin6_port),
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
 ```
-
-`udp_bind` uses `socket(AF_INET|AF_INET6, SOCK_DGRAM, 0)` per the address
-family, sets the buffer sizes with `setsockopt`, binds, and does not set
-`O_NONBLOCK` (irrelevant under io_uring). No `connect()` — the server socket
-is unconnected and every send carries an explicit destination.
 
 #### Ring trait
 
@@ -307,7 +413,9 @@ no source address; and the CQE handler reads back the *kernel-updated*
 `msg_namelen` and `msg_flags` from the op's msghdr (io_uring's recvmsg path
 copies both into the submitted msghdr) before `buf.set_len(res as usize)`.
 
-New `ReactorShared` fields:
+New `ReactorShared` fields, appended **after** the existing `ring` field
+(the op-storage maps must drop after `ring`; see the drop-order invariant
+below):
 
 ```rust
 /// In-flight UDP send op storage, keyed by udata id. Removed (and freed)
@@ -318,9 +426,35 @@ udp_send_ops: RefCell<FxHashMap<u64, Box<UdpSendOp>>>,
 udp_recv_ops: RefCell<FxHashMap<u64, Box<UdpRecvOp>>>,
 udp_recv_wakers: RefCell<FxHashMap<u64, Waker>>,
 parked_udp_recv: RefCell<FxHashMap<u64, Result<UdpDatagram, i32>>>,
-/// Recv ids whose future was dropped before the CQE (tombstone pattern,
-/// mirrors cancelled_fsyncs).
+/// Recv ids whose future was dropped while its RECVMSG was still armed.
+/// `UdpRecvFuture::drop` submits an `AsyncCancel` for the SQE (so it cannot
+/// linger and consume a later datagram) and records the id here; the
+/// `KIND_UDP_RECV` handler consults it and frees the op box + drops the
+/// result — whether the CQE is the `-ECANCELED` from the cancel or a
+/// datagram that raced it. Empty on the steady-state path.
 cancelled_udp_recvs: RefCell<FxHashSet<u64>>,
+```
+
+**Drop-order invariant (already load-bearing, now documented).** Rust drops
+struct fields in declaration order, and `ring: RefCell<IoUringRing>` is the
+first field of `ReactorShared`. Dropping `ring` runs `IoUring`'s destructor,
+which `close()`s the io_uring fd; the kernel's teardown of that fd cancels and
+waits out every in-flight SQE, releasing the kernel's references to userspace
+buffers. Only *after* that do `udp_send_ops` / `udp_recv_ops` (and the existing
+`send_buffers_in_flight` / `conns`) drop and free those buffers. Reversing the
+order would free buffers the kernel still owns — a use-after-free during
+teardown. This plan keeps `ring` first and adds a doc comment on it recording
+the invariant:
+
+```rust
+/// SAFETY INVARIANT: `ring` MUST be the first declared field. Rust drops
+/// fields in declaration order; dropping `ring` closes the io_uring fd,
+/// whose kernel-side teardown cancels all in-flight SQEs and drops the
+/// kernel's references to userspace buffers. Only then is it safe to free
+/// the buffers those SQEs pointed at — `udp_send_ops`, `udp_recv_ops`,
+/// `send_buffers_in_flight`, `conns`. Moving `ring` below any of them is a
+/// use-after-free at shutdown.
+ring: RefCell<IoUringRing>,
 ```
 
 UDP sends reuse the existing send result plumbing — ids come from
@@ -335,6 +469,12 @@ on the send side. Two new CQE kinds:
 ```rust
 pub const KIND_UDP_SEND: u64 = 9;
 pub const KIND_UDP_RECV: u64 = 10;
+/// CQE tag for the `AsyncCancel` a dropped `UdpRecvFuture` submits against
+/// its RECVMSG. A dedicated tag (not `KIND_FUTEX_CANCEL`, whose handler sets
+/// `futex_waitv_cancelled`) so a UDP recv cancellation never disturbs the
+/// FUTEX_WAITV shutdown handshake. The dispatch arm is a pure no-op — the
+/// cancellation's *effect* is observed on the RECVMSG's own CQE.
+pub const KIND_UDP_CANCEL: u64 = 11;
 ```
 
 `dispatch_cqe` arms:
@@ -342,8 +482,12 @@ pub const KIND_UDP_RECV: u64 = 10;
 - `KIND_UDP_SEND`: `udp_send_ops.remove(&id)` unconditionally (frees payload +
   msghdr storage), then the exact `KIND_SEND` tail: tombstone-gated park of
   `cqe.res` into `parked_send_results` + wake.
-- `KIND_UDP_RECV`: `udp_recv_ops.remove(&id)` unconditionally. If the
-  tombstone is set, drop everything. Otherwise park into `parked_udp_recv`:
+- `KIND_UDP_RECV`: `udp_recv_ops.remove(&id)` unconditionally (frees the op
+  box). If the tombstone (`cancelled_udp_recvs`) is set, consume it and drop
+  everything — this covers both the `-ECANCELED` from a dropped future's cancel
+  and a datagram that raced that cancel (dropping the datagram here is
+  equivalent to it arriving one instant after the consumer stopped waiting).
+  Otherwise park into `parked_udp_recv`:
   - `res < 0` → `Err(res)`.
   - `res >= 0` with `msghdr.msg_flags & libc::MSG_TRUNC != 0` →
     `Err(-libc::EMSGSIZE)` (the datagram exceeded the caller's
@@ -351,6 +495,9 @@ pub const KIND_UDP_RECV: u64 = 10;
   - otherwise `buf.set_len(res as usize)`, decode
     `addr_from_sockaddr(&src, msg_namelen)` (undecodable family →
     `Err(-libc::EAFNOSUPPORT)`), park `Ok(UdpDatagram { buf, src })`, wake.
+- `KIND_UDP_CANCEL`: no-op. This is the `AsyncCancel`'s own CQE; the
+  cancellation's effect arrives separately as the RECVMSG's `-ECANCELED` under
+  `KIND_UDP_RECV` above (same split as the FUTEX_WAITV cancel pair).
 
 #### Public API and futures
 
@@ -379,13 +526,58 @@ impl Reactor {
 
 Both constructors allocate the id, build + insert the boxed op, prep the SQE,
 and flush with `submit_and_wait_timeout(0, 0)` (logging on flush error, same
-as `send_buf_inner`). Both futures are `FsyncFuture`-shaped — a `completed`
-flag set on `Poll::Ready`, `Drop` that (a) returns early when completed,
-(b) reclaims a result parked after the last poll, (c) otherwise withdraws the
-waker and tombstones the id so the late CQE handler discards the result. The
-op storage is *not* touched by `Drop`: the kernel may still hold the pointers,
-and the CQE handler is the single point that frees storage. `UdpSendFuture`
+as `send_buf_inner`). Both futures carry a `completed` flag set on
+`Poll::Ready`. Neither `Drop` frees op storage — the kernel may still hold the
+pointers, and the CQE handler is the single point that frees it. `UdpSendFuture`
 resolves `i32`; `UdpRecvFuture` resolves `Result<UdpDatagram, i32>`.
+
+`UdpSendFuture::drop` is exactly `FsyncFuture`-shaped: return early if
+completed, else reclaim a result parked after the last poll, else withdraw the
+send waker and tombstone the id (`cancelled_sends`). A send SQE left in flight
+simply completes and its result is discarded — harmless, so no cancellation.
+
+`UdpRecvFuture::drop` adds one step, because a dropped-but-armed one-shot
+RECVMSG is *not* harmless: it outlives its future and consumes the next
+datagram to arrive, then the tombstone discards it — silent packet theft (and
+the shared QUIC socket can't be closed to cancel one read). So a still-pending
+drop first `AsyncCancel`s the SQE, so it cannot linger and eat a later
+datagram:
+
+```rust
+impl Drop for UdpRecvFuture {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.inner.udp_recv_wakers.borrow_mut().remove(&self.id);
+        // CQE already parked a datagram: reclaim (drop) it. Rare — equivalent
+        // to the datagram arriving one instant after we stopped waiting.
+        if self.inner.parked_udp_recv.borrow_mut().remove(&self.id).is_some() {
+            return;
+        }
+        // CQE still pending: cancel the armed RECVMSG so it cannot linger and
+        // silently consume a *later* datagram (a one-shot recv SQE outlives its
+        // future). The cancel's own CQE lands on the ignored KIND_UDP_CANCEL
+        // sink; the RECVMSG's CQE (-ECANCELED, or a datagram that raced the
+        // cancel) lands on KIND_UDP_RECV, where the tombstone frees the op box
+        // and drops the result.
+        {
+            let mut ring = self.inner.ring.borrow_mut();
+            ring.prep_async_cancel(udata(KIND_UDP_RECV, self.id), udata(KIND_UDP_CANCEL, 0));
+            let _ = ring.submit_and_wait_timeout(0, 0);
+        }
+        self.inner.cancelled_udp_recvs.borrow_mut().insert(self.id);
+    }
+}
+```
+
+This makes `recv_udp` safe to compose with a timeout — `select2(recv_udp(fd,
+n), reactor.timer(deadline))` drops the losing recv on every timer win (that is
+how a QUIC loss-detection loop is written), and without the cancel each such
+drop would arm a datagram-eating landmine on the shared socket. The one
+residual — a datagram delivered into the op buffer in the exact window before
+the cancel takes effect — is dropped and is indistinguishable from ordinary
+network loss (recovered by QUIC retransmission).
 
 Concurrency contract: any number of `send_udp` ops may be in flight on one fd
 (each owns its storage; io_uring may complete them in any order — CQE-order
@@ -401,10 +593,15 @@ motivates it.
 
 Dropping the reactor with UDP ops in flight has the same contract as the
 existing conn recv/send SQEs: the process is exiting (L6 in
-async-invariants.md — no graceful shutdown), so no `AsyncCancel` handshake is
-added. Tests must drain their outstanding UDP ops before dropping the reactor
-(send the expected datagram or complete the roundtrip), the same discipline
-the conn tests follow.
+async-invariants.md — no graceful shutdown), so no *global* shutdown handshake
+is added (unlike the FUTEX_WAITV singleton, whose storage must be reclaimed
+mid-run). The per-future `AsyncCancel` in `UdpRecvFuture::drop` is a
+correctness measure for the live-composition case (timeout/`select2`), not a
+teardown step; at reactor teardown any not-yet-drained cancel or CQE is reaped
+by the kernel when the io_uring fd closes (the drop-order invariant above
+guarantees that close precedes freeing the op boxes). Tests must still drain
+their outstanding UDP ops before dropping the reactor (send the expected
+datagram or complete the roundtrip), the same discipline the conn tests follow.
 
 ## File Changes
 
@@ -440,20 +637,24 @@ composition lives on `Peer`. `alloc_send_id` (conn.rs:9) becomes
 `prep_sendmsg` / `prep_recvmsg` on the trait and `IoUringRing` (two 6-line
 impls following `prep_recv`).
 
-### 6. `crates/gnitz-engine/src/runtime/reactor/udp.rs` (new, ~220 lines)
+### 6. `crates/gnitz-engine/src/runtime/reactor/udp.rs` (new, ~230 lines)
 
 Op structs, box-then-wire constructors, `send_udp` / `recv_udp`,
-`UdpSendFuture` / `UdpRecvFuture`, `UdpDatagram`.
+`UdpSendFuture` (tombstone-only `Drop`) / `UdpRecvFuture` (`AsyncCancel` +
+tombstone `Drop`), `UdpDatagram`.
 
 ### 7. `crates/gnitz-engine/src/runtime/reactor/mod.rs`
 
-`KIND_UDP_SEND` / `KIND_UDP_RECV`, five new `ReactorShared` fields (+ init in
-`Reactor::new`), two `dispatch_cqe` arms, `mod udp;` + re-exports.
+`KIND_UDP_SEND` / `KIND_UDP_RECV` / `KIND_UDP_CANCEL`, five new `ReactorShared`
+fields (+ init in `Reactor::new`), the drop-order doc comment on the existing
+`ring` field, three `dispatch_cqe` arms (`KIND_UDP_SEND`, `KIND_UDP_RECV`,
+no-op `KIND_UDP_CANCEL`), `mod udp;` + re-exports.
 
 ### 8. `crates/gnitz-engine/src/foundation/posix_io.rs`
 
-`udp_bind`, `udp_local_addr`, `sockaddr_from_addr`, `addr_from_sockaddr`
-(~90 lines incl. doc comments).
+`udp_bind` (closes the fd on every error path; `c_int` setsockopt args),
+`udp_local_addr`, `sockaddr_from_addr` / `addr_from_sockaddr` (round-trip
+IPv6 flowinfo/scope_id) (~120 lines incl. doc comments).
 
 ## Edge cases
 
@@ -474,6 +675,13 @@ Op structs, box-then-wire constructors, `send_udp` / `recv_udp`,
   queued, submitted on the next tick (existing convention, `send_buf_inner`).
 - **fd reuse.** UDP ops carry no per-fd reactor state (no `Conn`, no
   pending queues), so the `register_conn` sentinel-clearing rules don't apply.
+- **Dropped pending recv.** A one-shot RECVMSG outlives its future; a naive
+  tombstone-only drop would leave it armed to consume (and discard) a later
+  datagram. `UdpRecvFuture::drop` `AsyncCancel`s the SQE instead — see the
+  future's `Drop` above. Load-bearing for timeout/`select2` composition.
+- **Reactor field drop order.** `ring` is the first `ReactorShared` field so it
+  drops (closing the io_uring fd, which cancels+drains in-flight SQEs) before
+  the op-storage maps free their buffers. See the drop-order invariant above.
 
 ## Tests
 
@@ -490,13 +698,15 @@ New `#[cfg(test)]` module in `reactor/udp.rs`, using the reactor's
    `Err(-EMSGSIZE)`.
 5. **Pipelined sends:** 32 `send_udp` futures joined concurrently; all resolve
    to the payload length; receiver drains 32 datagrams.
-6. **Cancelled recv:** drop a `UdpRecvFuture` before any datagram arrives,
-   then send **two** datagrams and run a second `recv_udp` to completion.
-   The dropped future's SQE stays armed, so two datagrams guarantee both
-   ops complete: the tombstoned CQE is discarded, the live receive resolves
-   with the other datagram, and nothing is left in flight at reactor drop
-   (per the drain-before-drop rule above). Assert `cancelled_udp_recvs` is
-   empty at the end — proof the late CQE consumed its tombstone.
+6. **Cancelled recv (no packet theft):** construct a `UdpRecvFuture` (the
+   constructor arms the RECVMSG) and drop it before any datagram arrives, then
+   pump the reactor until `cancelled_udp_recvs` is empty — the drop's
+   `AsyncCancel` drives the RECVMSG to a `-ECANCELED` CQE that consumes the
+   tombstone and frees the op box. Now send **one** datagram and run a fresh
+   `recv_udp` to completion: it resolves with that datagram, proving the
+   cancelled op did not steal it. Assert `udp_recv_ops` and
+   `cancelled_udp_recvs` are both empty at the end (nothing left in flight at
+   reactor drop, per the drain-before-drop rule above).
 7. **Error path:** `send_udp` on a closed fd resolves a negative errno.
 8. **posix_io unit tests:** `sockaddr_from_addr` / `addr_from_sockaddr`
    round-trip for v4/v6; `udp_local_addr` resolves a port-0 bind.
