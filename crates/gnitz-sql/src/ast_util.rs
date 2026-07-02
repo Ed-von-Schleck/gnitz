@@ -59,34 +59,66 @@ pub(crate) fn projection_has_aggregate(select: &sqlparser::ast::Select) -> bool 
     })
 }
 
-/// Recursively test whether an expression contains an aggregate function call.
-/// Recurses through exactly the node set `bind_structural` reaches (binary/unary
-/// ops, nesting, BETWEEN, IS [NOT] NULL) plus an aggregate's own arguments.
+/// Recursively test whether an expression contains an aggregate function call:
+/// the call itself, or — for a non-aggregate wrapper over one (`abs(SUM(x))`,
+/// still a grouped shape) — any of its operands.
 fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
+    if let sqlparser::ast::Expr::Function(f) = e {
+        if is_aggregate_func_name(&f.name.to_string()) {
+            return true;
+        }
+    }
+    expr_operands(e).into_iter().any(expr_has_aggregate)
+}
+
+/// The direct operand subexpressions of `e` — the node set the structural
+/// binder recurses through (binary/unary ops, parens, BETWEEN, IS [NOT] NULL,
+/// IN lists) plus function-call arguments. Subquery nodes contribute no
+/// operands: no walker may silently descend into a subquery. The single
+/// definition behind the crate's expression walkers (`expr_has_aggregate`,
+/// HAVING aggregate collection, EXISTS correlation side-counting), so a node
+/// added to the binder's vocabulary reaches them all at once.
+pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
     use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
     match e {
-        Expr::Function(f) => {
-            if is_aggregate_func_name(&f.name.to_string()) {
-                return true;
-            }
-            // A non-aggregate wrapper over an aggregate (`abs(SUM(x))`) is still a
-            // grouped shape; recurse into the call's arguments.
-            match &f.args {
-                FunctionArguments::List(list) => list.args.iter().any(|a| match a {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => expr_has_aggregate(inner),
-                    _ => false,
-                }),
-                _ => false,
-            }
+        Expr::BinaryOp { left, right, .. } => vec![left, right],
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            vec![expr]
         }
-        Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
-        Expr::UnaryOp { expr, .. } => expr_has_aggregate(expr),
-        Expr::Nested(inner) => expr_has_aggregate(inner),
-        Expr::Between { expr, low, high, .. } => {
-            expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high)
+        Expr::Between { expr, low, high, .. } => vec![expr, low, high],
+        Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
+        Expr::Function(f) => match &f.args {
+            FunctionArguments::List(list) => list
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Flattens an `AND`-tree into its leaf conjuncts, left to right. Descends
+/// through `AND` nesting and unwraps parenthesised `Nested` wrappers; any other
+/// node (an equality, a range, an `OR`-group, …) is a leaf kept intact. Shared
+/// by the DML access-path planner and the CREATE VIEW shape classifier.
+pub(crate) fn flatten_conjuncts<'e>(expr: &'e sqlparser::ast::Expr, out: &mut Vec<&'e sqlparser::ast::Expr>) {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match expr {
+        Expr::Nested(inner) => flatten_conjuncts(inner, out),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            flatten_conjuncts(left, out);
+            flatten_conjuncts(right, out);
         }
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) => expr_has_aggregate(inner),
-        _ => false,
+        _ => out.push(expr),
     }
 }
 
@@ -101,6 +133,20 @@ pub(crate) fn extract_table_factor_name(
             "{context}: only simple table references supported"
         ))),
     }
+}
+
+/// Extract `(table name, effective alias)` from a TableFactor::Table — the
+/// declared alias when present, else the table name itself.
+pub(crate) fn extract_table_name_and_alias(
+    tf: &sqlparser::ast::TableFactor,
+    context: &str,
+) -> Result<(String, String), GnitzSqlError> {
+    let name = extract_table_factor_name(tf, context)?;
+    let alias = match tf {
+        sqlparser::ast::TableFactor::Table { alias: Some(a), .. } => a.name.value.clone(),
+        _ => name.clone(),
+    };
+    Ok((name, alias))
 }
 
 /// Bare column name of a single-relation reference: a plain `Identifier`, or a

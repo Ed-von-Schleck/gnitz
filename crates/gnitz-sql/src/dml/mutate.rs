@@ -1,7 +1,6 @@
 //! UPDATE and DELETE: resolve the matching rows once via `resolve_where_rows`
 //! (the shared PK-seek → secondary-index → predicate-scan ladder), then write
-//! the SET batch (UPDATE) or collect the PKs to retract (DELETE). DELETE keeps
-//! one extra `pk IN (...)` fast path ahead of the shared ladder. The SET-list
+//! the SET batch (UPDATE) or collect the PKs to retract (DELETE). The SET-list
 //! helpers (`eval_set_expr`, `resolve_set_target`) are also reused by INSERT's
 //! `ON CONFLICT DO UPDATE`.
 
@@ -9,13 +8,13 @@ use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::bind::{bind_single_table, Binder};
 use crate::codec::colwrite::{append_column_value, ColumnValue};
 use crate::codec::nullmap::null_word_set;
-use crate::dml::plan::{classify_access, collect_index_seek_candidates, try_extract_pk_in, AccessPath};
+use crate::dml::plan::{classify_access, collect_index_seek_candidates, seek_pk_multi, AccessPath};
 use crate::error::GnitzSqlError;
 use crate::exec::eval::eval_expr;
 use crate::exec::residual::{bind_residuals, matching_indices};
 use crate::ir::BoundExpr;
 use crate::SqlResult;
-use gnitz_core::{ClientError, ColData, GnitzClient, PkColumn, PkTuple, Schema, WireConflictMode, ZSetBatch};
+use gnitz_core::{ClientError, ColData, GnitzClient, PkColumn, Schema, WireConflictMode, ZSetBatch};
 use sqlparser::ast::{Assignment, AssignmentTarget, Expr, FromTable, Statement};
 use std::sync::Arc;
 
@@ -200,6 +199,18 @@ fn resolve_where_rows(
             let (schema_opt, batch_opt, _) = client.seek(table_id, &pk)?;
             resolve_residual_rows(schema, schema_opt, batch_opt, &residual)
         }
+        AccessPath::PkMultiSeek { pks } => {
+            // `pk IN (…)`: the concatenated seek replies ARE the matching rows —
+            // no residual; an absent key contributes none, so the count reports
+            // rows actually touched.
+            let (schema_opt, batch_opt) = seek_pk_multi(client, table_id, schema, &pks, None)?;
+            let matched = (0..batch_opt.as_ref().map_or(0, |b| b.pks.len())).collect();
+            Ok(ResolvedRows {
+                schema: schema_opt,
+                batch: batch_opt,
+                matched,
+            })
+        }
         AccessPath::Filtered { where_expr } => {
             // Secondary-index equality seek: the first index that exists serves
             // the query — a hit with no matching rows is terminal. Only an
@@ -318,36 +329,6 @@ pub(crate) fn execute_delete(
     let table_name = extract_table_factor_name(&tables[0].relation, "DELETE")?;
 
     let (table_id, schema) = binder.resolve_base_table(client, &table_name)?;
-
-    // PK IN-list fast path (single-PK only; `try_extract_pk_in` returns None for
-    // a compound PK). It is mutually exclusive with the PK-seek / index / scan
-    // ladder — a top-level `IN` list never also binds the PK by equality — so
-    // checking it ahead of the shared driver does not change which path serves a
-    // given WHERE. Seek each key and retract only those that exist, so the count
-    // reports rows actually removed (a repeated key counted once) rather than the
-    // raw list length.
-    if let Some(where_expr) = &del.selection {
-        if let Some(pks) = try_extract_pk_in(where_expr, &schema) {
-            let stride = schema.pk_stride() as u8;
-            let mut seen: std::collections::HashSet<u128> = std::collections::HashSet::with_capacity(pks.len());
-            let mut pk_col = PkColumn::empty_for_schema(&schema);
-            for v in pks {
-                if !seen.insert(v) {
-                    continue;
-                } // intra-list dedup
-                let pk = PkTuple::from_u128(stride, v);
-                let (_schema_opt, batch_opt, _) = client.seek(table_id, &pk)?;
-                if batch_opt.as_ref().is_some_and(|b| !b.pks.is_empty()) {
-                    pk_col.push_u128(v);
-                }
-            }
-            let count = pk_col.len();
-            if count > 0 {
-                client.delete(table_id, &schema, pk_col)?;
-            }
-            return Ok(SqlResult::RowsAffected { count });
-        }
-    }
 
     let resolved = resolve_where_rows(client, table_id, &schema, del.selection.as_ref())?;
     let actual_schema = resolved.schema.as_deref().unwrap_or(&*schema);

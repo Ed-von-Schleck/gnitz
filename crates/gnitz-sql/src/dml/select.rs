@@ -7,7 +7,8 @@
 use crate::ast_util::extract_table_factor_name;
 use crate::bind::{bind_single_table, Binder};
 use crate::dml::plan::{
-    collect_index_range_candidates, collect_index_seek_candidates, extract_limit, try_extract_pk_seek_residual,
+    collect_index_range_candidates, collect_index_seek_candidates, extract_limit, seek_pk_multi, try_extract_pk_in,
+    try_extract_pk_seek_residual,
 };
 use crate::error::GnitzSqlError;
 use crate::exec::batch::{apply_limit, apply_projection};
@@ -100,7 +101,14 @@ pub(crate) fn execute_select(
 
     // Check WHERE clause
     let (schema_out, batch_opt, _) = if let Some(where_expr) = &select.selection {
-        if let Some((pk, residual)) = try_extract_pk_seek_residual(where_expr, &schema) {
+        if let Some(pks) = try_extract_pk_in(where_expr, &schema) {
+            // `pk IN (…)` multi-seek: the IN list is the whole top-level WHERE
+            // (`try_extract_pk_in` matches only a bare InList), so no residual
+            // filtering applies and every fetched row is an output row — the
+            // LIMIT caps the seek round trips, not just the reply.
+            let (schema_opt, batch_opt) = seek_pk_multi(client, tid, &schema, &pks, limit)?;
+            (schema_opt, batch_opt, 0)
+        } else if let Some((pk, residual)) = try_extract_pk_seek_residual(where_expr, &schema) {
             let res = client.seek(tid, &pk)?;
             residual_filtered(&schema, res, &residual)?
         } else {

@@ -460,11 +460,29 @@ impl LeafBinder for JoinResidual<'_> {
     }
 }
 
+/// Bind every conjunct through `bind` and AND-fold the results into one filter
+/// program compiled against `schema`; `None` for an empty list. The filter ANDs
+/// the conjuncts, so collection order is immaterial to the result. Shared by
+/// the join residual splice and the EXISTS/IN local/pre-filter programs.
+pub(crate) fn and_fold_compile<'e>(
+    conjuncts: impl IntoIterator<Item = &'e Expr>,
+    mut bind: impl FnMut(&'e Expr) -> Result<BoundExpr, GnitzSqlError>,
+    schema: &Schema,
+) -> Result<Option<gnitz_core::ExprProgram>, GnitzSqlError> {
+    let mut acc: Option<BoundExpr> = None;
+    for e in conjuncts {
+        let b = bind(e)?;
+        acc = Some(match acc {
+            None => b,
+            Some(a) => BoundExpr::BinOp(Box::new(a), BinOp::And, Box::new(b)),
+        });
+    }
+    acc.map(|e| compile_bound_expr_to_program(&e, schema)).transpose()
+}
+
 /// AND every residual conjunct (bound against the merged join-output schema via
 /// the `JoinResidual` leaf) into one `ExprProgram`. `residual` is non-empty —
-/// callers guard, and the residual is only spliced for INNER joins (§6.3). The
-/// filter ANDs the conjuncts, so the ON left-to-right collection order is
-/// immaterial to the result.
+/// callers guard, and the residual is only spliced for INNER joins (§6.3).
 pub(crate) fn build_residual_filter_prog(
     residual: &[Expr],
     alias_map: &AliasMap,
@@ -476,15 +494,8 @@ pub(crate) fn build_residual_filter_prog(
         merged: merged_schema,
         base: payload_base,
     };
-    let mut acc: Option<BoundExpr> = None;
-    for e in residual {
-        let b = bind_structural(e, &leaf)?;
-        acc = Some(match acc {
-            None => b,
-            Some(a) => BoundExpr::BinOp(Box::new(a), BinOp::And, Box::new(b)),
-        });
-    }
-    compile_bound_expr_to_program(&acc.expect("non-empty residual"), merged_schema)
+    let prog = and_fold_compile(residual, |e| bind_structural(e, &leaf), merged_schema)?;
+    Ok(prog.expect("non-empty residual"))
 }
 
 #[cfg(test)]

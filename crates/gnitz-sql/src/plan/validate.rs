@@ -97,6 +97,19 @@ pub(crate) fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
     GnitzSqlError::Unsupported(format!("{context}: {clause} is not supported"))
 }
 
+/// Reject a circuit whose widest intermediate batch exceeds the engine's
+/// column limit, before the server's hard schema-build assertion. `what` names
+/// the view kind and stage ("JOIN view output", "EXISTS view intermediate", …).
+pub(crate) fn reject_column_overflow(what: &str, cols: usize) -> Result<(), GnitzSqlError> {
+    if cols > gnitz_core::MAX_COLUMNS {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{what} has {cols} columns, exceeding the {}-column limit",
+            gnitz_core::MAX_COLUMNS
+        )));
+    }
+    Ok(())
+}
+
 /// The `Select` clauses a view shape legitimately consumes, beyond the universal
 /// `from` + `projection`. Passed to [`reject_unhonored_select_clauses`]; every
 /// clause not named here (and not honored unconditionally) is rejected.

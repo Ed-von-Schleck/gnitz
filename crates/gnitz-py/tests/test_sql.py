@@ -399,3 +399,93 @@ class TestSqlCreateView:
             client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
             client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# TestInListViewFilter — the IN-list desugar through the engine expression VM
+# ---------------------------------------------------------------------------
+
+class TestInListViewFilter:
+    def test_view_where_in_list(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM t WHERE val IN (10, 30)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # A NULL val makes every Eq NULL → the OR-chain NULL → row excluded.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, NULL)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert sorted(r.pk for r in rows) == [1, 3]
+        finally:
+            for sql in ["DROP VIEW v", "DROP TABLE t"]:
+                try:
+                    client.execute_sql(sql, schema_name=sn)
+                except Exception:
+                    pass
+            client.drop_schema(sn)
+
+    def test_view_where_not_in_excludes_null(self, client):
+        """NOT IN over a NULL operand is NOT(NULL) = NULL → excluded (SQL 3VL)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM t WHERE val NOT IN (10, 30)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, NULL)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert sorted(r.pk for r in rows) == [2]
+        finally:
+            for sql in ["DROP VIEW v", "DROP TABLE t"]:
+                try:
+                    client.execute_sql(sql, schema_name=sn)
+                except Exception:
+                    pass
+            client.drop_schema(sn)
+
+    def test_view_where_string_in_list(self, client):
+        """String elements route through the EXPR_STR_COL_EQ_CONST lowering."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, tag TEXT)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM t WHERE tag IN ('red', 'blue')",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 'red'), (2, 'green'), (3, 'blue'), (4, NULL)",
+                schema_name=sn,
+            )
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert sorted(r.pk for r in rows) == [1, 3]
+        finally:
+            for sql in ["DROP VIEW v", "DROP TABLE t"]:
+                try:
+                    client.execute_sql(sql, schema_name=sn)
+                except Exception:
+                    pass
+            client.drop_schema(sn)

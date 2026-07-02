@@ -1,16 +1,19 @@
 //! WHERE access-path planning for the DML verbs: the conjunct flattener, the
-//! PK-seek / secondary-index equality / ordered-range recognizers, and the
-//! `AccessPath` classification the UPDATE/DELETE driver consumes. Pure analysis
-//! over the catalog schema and (for the index collectors) the live index list —
-//! no row mutation lives here. `select` and `mutate` sink into this module;
-//! it never references either.
+//! PK-seek / secondary-index equality / ordered-range recognizers, the
+//! `AccessPath` classification the UPDATE/DELETE driver consumes, and the
+//! multi-key seek fetcher serving [`AccessPath::PkMultiSeek`]. Read-only
+//! analysis and fetching — no row mutation lives here. `select` and `mutate`
+//! sink into this module; it never references either.
 
+use crate::ast_util::flatten_conjuncts;
 use crate::bind::find_unique_column;
 use crate::codec::pk_codec::{
     extract_sql_literal, parse_literal_i128, parse_pk_literal_packed, parse_uuid_str, SqlLiteral,
 };
-use gnitz_core::{ClientError, Cut, FixedInt, PkTuple, RangeDescriptor, Schema, TypeCode};
+use crate::error::GnitzSqlError;
+use gnitz_core::{ClientError, Cut, FixedInt, GnitzClient, PkTuple, RangeDescriptor, Schema, TypeCode, ZSetBatch};
 use sqlparser::ast::{BinaryOperator, Expr, LimitClause, Value};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -28,21 +31,31 @@ pub(crate) enum AccessPath<'e> {
     /// `WHERE` fully binds the PK: a single point seek; `residual` post-filters
     /// the seeked row's non-PK conjuncts.
     PkSeek { pk: PkTuple, residual: Vec<&'e Expr> },
+    /// `WHERE` is exactly `pk IN (literal, …)` on a single-column PK: one point
+    /// seek per key, no residual. Mutually exclusive with [`AccessPath::PkSeek`]
+    /// — a bare top-level `IN` list never also binds the PK by equality.
+    PkMultiSeek { pks: Vec<u128> },
     /// `WHERE` needs a secondary-index probe, falling back to a predicate full
     /// scan when no index serves it.
     Filtered { where_expr: &'e Expr },
 }
 
 /// Classify a single-table UPDATE/DELETE `WHERE` (or its absence) into the
-/// access path that serves it. Pure: detecting a full PK binding is the only
-/// decision made here; the index-vs-scan split is left to execution.
+/// access path that serves it. Pure: detecting a full PK binding (single- or
+/// multi-key) is the only decision made here; the index-vs-scan split is left
+/// to execution.
 pub(crate) fn classify_access<'e>(selection: Option<&'e Expr>, schema: &Schema) -> AccessPath<'e> {
     match selection {
         None => AccessPath::ScanAll,
-        Some(where_expr) => match try_extract_pk_seek_residual(where_expr, schema) {
-            Some((pk, residual)) => AccessPath::PkSeek { pk, residual },
-            None => AccessPath::Filtered { where_expr },
-        },
+        Some(where_expr) => {
+            if let Some(pks) = try_extract_pk_in(where_expr, schema) {
+                AccessPath::PkMultiSeek { pks }
+            } else if let Some((pk, residual)) = try_extract_pk_seek_residual(where_expr, schema) {
+                AccessPath::PkSeek { pk, residual }
+            } else {
+                AccessPath::Filtered { where_expr }
+            }
+        }
     }
 }
 
@@ -79,24 +92,6 @@ pub(crate) fn extract_limit(query: &sqlparser::ast::Query) -> Option<usize> {
 // ---------------------------------------------------------------------------
 // Conjunct flattening + PK-seek extraction
 // ---------------------------------------------------------------------------
-
-/// Flattens an `AND`-tree into its leaf conjuncts, left to right. Descends
-/// through `AND` nesting and unwraps parenthesised `Nested` wrappers; any other
-/// node (an equality, a range, an `OR`-group, …) is a leaf kept intact.
-fn flatten_conjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
-    match expr {
-        Expr::Nested(inner) => flatten_conjuncts(inner, out),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            flatten_conjuncts(left, out);
-            flatten_conjuncts(right, out);
-        }
-        _ => out.push(expr),
-    }
-}
 
 /// `Some((pk_tuple, residual))` when the conjuncts of `expr` bind every PK
 /// column to a literal; `residual` holds the leftover conjuncts (non-PK
@@ -185,6 +180,9 @@ pub(crate) fn try_col_eq_literal(expr: &Expr, schema: &Schema) -> Option<(usize,
     Some((col_idx, key))
 }
 
+/// `Some(keys)` when `expr` is exactly `pk IN (literal, …)` on a single-column
+/// PK; the keys are deduped (first occurrence wins), so every consumer counts a
+/// repeated key once. `None` routes the WHERE back to the seek/index/scan ladder.
 pub(crate) fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128>> {
     // Compound PK has no IN-list fast path; fall back to a full delta scan.
     if schema.pk_count() != 1 {
@@ -208,6 +206,7 @@ pub(crate) fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128
         if !pk_col.name.eq_ignore_ascii_case(col_name) {
             return None;
         }
+        let mut seen = HashSet::with_capacity(list.len());
         let mut pks = Vec::with_capacity(list.len());
         for item in list {
             // Optionally-negated numerics, plus single-quoted UUID strings for a
@@ -219,12 +218,47 @@ pub(crate) fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128
                 SqlLiteral::Str(s) if pk_col.type_code == TypeCode::UUID => parse_uuid_str(s).ok()?,
                 _ => return None,
             };
-            pks.push(v);
+            if seen.insert(v) {
+                pks.push(v);
+            }
         }
         Some(pks)
     } else {
         None
     }
+}
+
+/// Seek every key of a [`AccessPath::PkMultiSeek`] list and concatenate the
+/// replies into one batch: absent keys contribute no rows, so the batch holds
+/// exactly the rows the IN list matches. `row_cap` stops seeking once that many
+/// rows have accumulated (SELECT's LIMIT — every fetched row is an output row
+/// on this path, so further round trips are pure waste).
+pub(crate) fn seek_pk_multi(
+    client: &mut GnitzClient,
+    table_id: u64,
+    schema: &Schema,
+    pks: &[u128],
+    row_cap: Option<usize>,
+) -> Result<(Option<Arc<Schema>>, Option<ZSetBatch>), GnitzSqlError> {
+    let stride = schema.pk_stride() as u8;
+    let mut reply_schema: Option<Arc<Schema>> = None;
+    let mut out: Option<ZSetBatch> = None;
+    for &v in pks {
+        let (schema_opt, batch_opt, _) = client.seek(table_id, &PkTuple::from_u128(stride, v))?;
+        if reply_schema.is_none() {
+            reply_schema = schema_opt;
+        }
+        if let Some(batch) = batch_opt {
+            match &mut out {
+                None => out = Some(batch),
+                Some(acc) => acc.extend_from_owned(batch),
+            }
+        }
+        if row_cap.is_some_and(|cap| out.as_ref().is_some_and(|b| b.pks.len() >= cap)) {
+            break;
+        }
+    }
+    Ok((reply_schema, out))
 }
 
 // ---------------------------------------------------------------------------

@@ -228,17 +228,39 @@ pub(crate) fn reindex_cols_through_filters(loaded: &LoadedCircuit, scan_nid: i32
     // nullable-key null/not-null sibling reindexes carry the SAME key as the match
     // reindex and remain (deduped). Non-join views (PK-redistribution, GROUP BY) have
     // no join node, so the guard is off and every reindex is collected as before.
+    //
+    // Two probe-support consumers count like the trace/probe itself (they appear only
+    // in pure-range circuits, where the reindex may reach the trace/probe through no
+    // other edge — the pure-range EXISTS circuit has exactly these two shapes):
+    //   - a `PartitionFilter` whose own consumer is the trace/probe (the broadcast
+    //     trimmer between a scattered reindex and its integrate);
+    //   - a `Map(HashRow)` (the head of the inline `m = MAX/MIN(b.range)` threshold
+    //     reduce over the broadcast side).
+    // Neither re-classifies any other reindex: the pure-range LEFT join's sibling
+    // reindexes already qualify directly (same key, deduped), and the null-key /
+    // null-fill re-keys feed a PartitionFilter-into-Union or a plain Map, not these.
     let is_join_view = loaded
         .nodes
         .values()
         .any(|op| matches!(op, gnitz_wire::OpNode::Join(_)));
+    let is_trace_or_join = |nid: i32| {
+        matches!(
+            loaded.nodes.get(&nid),
+            Some(gnitz_wire::OpNode::IntegrateTrace | gnitz_wire::OpNode::Join(_))
+        )
+    };
     let feeds_trace_or_join = |nid: i32| {
         loaded.outgoing.get(&nid).is_some_and(|outs| {
             outs.iter().any(|&(d, _)| {
-                matches!(
-                    loaded.nodes.get(&d),
-                    Some(gnitz_wire::OpNode::IntegrateTrace | gnitz_wire::OpNode::Join(_))
-                )
+                is_trace_or_join(d)
+                    || match loaded.nodes.get(&d) {
+                        Some(gnitz_wire::OpNode::PartitionFilter) => loaded
+                            .outgoing
+                            .get(&d)
+                            .is_some_and(|outs2| outs2.iter().any(|&(d2, _)| is_trace_or_join(d2))),
+                        Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::HashRow(..))) => true,
+                        _ => false,
+                    }
             })
         })
     };

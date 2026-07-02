@@ -3,7 +3,7 @@
 //! post-reduce projection, and the HAVING cluster (collection, binding, and the
 //! `Having` leaf binder over the grouped relation).
 
-use crate::ast_util::{extract_table_factor_name, single_relation_col_name};
+use crate::ast_util::{expr_operands, extract_table_factor_name, single_relation_col_name};
 use crate::bind::{
     bind_single_table, bind_structural, find_unique_column, reject_unsupported_agg_qualifiers, Binder, LeafBinder,
 };
@@ -825,43 +825,28 @@ fn append_having_agg(
 }
 
 /// Recursively collect aggregate calls referenced in a HAVING expression,
-/// appending any not already present in `agg_mappings`.
+/// appending any not already present in `agg_mappings`. Descends through
+/// `expr_operands` — the binder's node set — so every construct the binder
+/// reaches (`agg IS NULL`, `agg BETWEEN lo AND hi`, `agg IN (…)`)
+/// materialises its aggregates; a node bound but not walked here would bind an
+/// aggregate that was never materialised and fail `resolve_having_mapping`.
 fn collect_having_aggs(
     expr: &Expr,
     source_schema: &Schema,
     agg_specs: &mut Vec<AggSpec>,
     agg_mappings: &mut Vec<AggMapping>,
 ) -> Result<(), GnitzSqlError> {
-    match expr {
-        Expr::Function(func) => {
-            let (agg_func, arg_col) = having_agg_func(func, source_schema)?;
-            if !agg_mappings.iter().any(|m| agg_mapping_matches(m, agg_func, arg_col)) {
-                append_having_agg(agg_func, arg_col, source_schema, agg_specs, agg_mappings)?;
-            }
-            Ok(())
+    if let Expr::Function(func) = expr {
+        let (agg_func, arg_col) = having_agg_func(func, source_schema)?;
+        if !agg_mappings.iter().any(|m| agg_mapping_matches(m, agg_func, arg_col)) {
+            append_having_agg(agg_func, arg_col, source_schema, agg_specs, agg_mappings)?;
         }
-        Expr::BinaryOp { left, right, .. } => {
-            collect_having_aggs(left, source_schema, agg_specs, agg_mappings)?;
-            collect_having_aggs(right, source_schema, agg_specs, agg_mappings)
-        }
-        Expr::UnaryOp { expr, .. } => collect_having_aggs(expr, source_schema, agg_specs, agg_mappings),
-        // `<agg> IS [NOT] NULL` materialises its aggregate (and, for a nullable
-        // SUM, the companion COUNT_NON_NULL `bind_having_null_test` reads) even
-        // when the SELECT list omits it.
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            collect_having_aggs(inner, source_schema, agg_specs, agg_mappings)
-        }
-        Expr::Nested(inner) => collect_having_aggs(inner, source_schema, agg_specs, agg_mappings),
-        // Lockstep with the binder: `bind_structural` now reaches `BETWEEN`, so the
-        // agg-collection node set must too — else `HAVING agg BETWEEN lo AND hi` binds
-        // an aggregate that was never materialised and `resolve_having_mapping` fails.
-        Expr::Between { expr, low, high, .. } => {
-            collect_having_aggs(expr, source_schema, agg_specs, agg_mappings)?;
-            collect_having_aggs(low, source_schema, agg_specs, agg_mappings)?;
-            collect_having_aggs(high, source_schema, agg_specs, agg_mappings)
-        }
-        _ => Ok(()),
+        return Ok(());
     }
+    for operand in expr_operands(expr) {
+        collect_having_aggs(operand, source_schema, agg_specs, agg_mappings)?;
+    }
+    Ok(())
 }
 
 /// Invariant context for `bind_having_expr`'s recursion: everything needed to

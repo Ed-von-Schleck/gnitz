@@ -18,6 +18,26 @@ pub(crate) struct ResolvedRelation {
 /// alias/name → resolved relation, for multi-table (join) column resolution.
 pub(crate) type AliasMap = HashMap<String, ResolvedRelation>;
 
+/// Build an `AliasMap` from `(alias, table_id, schema)` triples, assigning each
+/// relation's `col_offset` cumulatively in list order — the single encoding of
+/// the combined A‖B column space shared by the join and EXISTS/IN builders.
+pub(crate) fn build_alias_map(relations: &[(&str, u64, &Rc<Schema>)]) -> AliasMap {
+    let mut map = AliasMap::with_capacity(relations.len());
+    let mut col_offset = 0;
+    for &(alias, table_id, schema) in relations {
+        map.insert(
+            alias.to_lowercase(),
+            ResolvedRelation {
+                table_id,
+                schema: Rc::clone(schema),
+                col_offset,
+            },
+        );
+        col_offset += schema.columns.len();
+    }
+    map
+}
+
 /// Find the column named `col_name` in `columns`, case-insensitively.
 ///
 /// - `Ok(Some(idx))` — exactly one column matches.

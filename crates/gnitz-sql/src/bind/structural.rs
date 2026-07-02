@@ -95,6 +95,48 @@ pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<Bo
                 between
             })
         }
+        // `e IN (l1, …, ln)` ≡ `e = l1 OR … OR e = ln`; NOT IN negates it. SQL 3VL
+        // is preserved by the desugar itself: a NULL `e` makes every Eq NULL, the
+        // OR-chain NULL, and NOT(NULL) NULL — the row is excluded either way (same
+        // argument as the BETWEEN desugar above). The tested expression is bound
+        // once and cloned into each Eq.
+        Expr::InList { expr: e, list, negated } => {
+            let (first, rest) = list
+                .split_first()
+                .ok_or_else(|| GnitzSqlError::Unsupported("IN with an empty list".into()))?;
+            let tested = bind_structural(e, leaf)?;
+            let eq = |item| -> Result<BoundExpr, GnitzSqlError> {
+                Ok(BoundExpr::BinOp(
+                    Box::new(tested.clone()),
+                    BinOp::Eq,
+                    Box::new(bind_structural(item, leaf)?),
+                ))
+            };
+            let mut chain = eq(first)?;
+            for item in rest {
+                chain = BoundExpr::BinOp(Box::new(chain), BinOp::Or, Box::new(eq(item)?));
+            }
+            Ok(if *negated {
+                BoundExpr::UnaryOp(UnaryOp::Not, Box::new(chain))
+            } else {
+                chain
+            })
+        }
+        // Subquery expressions have exactly one supported placement — one top-level
+        // AND conjunct of a Simple-shaped CREATE VIEW WHERE, where the exists
+        // builder intercepts them before binding. Reaching these arms means the
+        // subquery sits somewhere else (under OR/NOT, in a projection, HAVING, DML,
+        // a direct SELECT), so name the placement rule instead of the generic
+        // catch-all message.
+        Expr::Exists { .. } | Expr::InSubquery { .. } => Err(GnitzSqlError::Unsupported(
+            "[NOT] EXISTS/IN (SELECT …) is only supported as a top-level AND \
+             conjunct of a CREATE VIEW WHERE clause"
+                .into(),
+        )),
+        Expr::Subquery(_) => Err(GnitzSqlError::Unsupported("scalar subqueries are not supported".into())),
+        Expr::AnyOp { .. } | Expr::AllOp { .. } => Err(GnitzSqlError::Unsupported(
+            "ANY/SOME/ALL subquery comparisons are not supported".into(),
+        )),
         _ => Err(GnitzSqlError::Unsupported(format!(
             "expression type not supported: {expr:?}"
         ))),
@@ -473,6 +515,87 @@ mod tests {
         ] {
             assert_unsupported(bind_single_table(&parse(src), &schema), want);
         }
+    }
+
+    /// `c IN (…)` desugars to an Eq/Or chain; `NOT IN` wraps it in Not. A single
+    /// element degenerates to the bare Eq (no Or wrapper).
+    #[test]
+    fn test_bind_in_list_desugars_to_or_chain() {
+        let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
+        match bind_single_table(&parse("c IN (1, 2)"), &schema).unwrap() {
+            BoundExpr::BinOp(l, BinOp::Or, r) => {
+                assert!(matches!(*l, BoundExpr::BinOp(_, BinOp::Eq, _)));
+                assert!(matches!(*r, BoundExpr::BinOp(_, BinOp::Eq, _)));
+            }
+            other => panic!("expected Or(Eq, Eq), got {other:?}"),
+        }
+        assert!(matches!(
+            bind_single_table(&parse("c IN (7)"), &schema).unwrap(),
+            BoundExpr::BinOp(_, BinOp::Eq, _)
+        ));
+        match bind_single_table(&parse("c NOT IN (1, 2)"), &schema).unwrap() {
+            BoundExpr::UnaryOp(UnaryOp::Not, inner) => {
+                assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::Or, _)))
+            }
+            other => panic!("expected Not(Or(..)), got {other:?}"),
+        }
+        // Left-assoc chain at n = 3: Or(Or(Eq, Eq), Eq).
+        match bind_single_table(&parse("c IN (1, 2, 3)"), &schema).unwrap() {
+            BoundExpr::BinOp(l, BinOp::Or, r) => {
+                assert!(matches!(*l, BoundExpr::BinOp(_, BinOp::Or, _)));
+                assert!(matches!(*r, BoundExpr::BinOp(_, BinOp::Eq, _)));
+            }
+            other => panic!("expected Or(Or, Eq), got {other:?}"),
+        }
+    }
+
+    /// String and float list elements bind through the same literal leaves plain
+    /// `=` uses; an empty list is rejected (constructed directly — the parser
+    /// won't produce one).
+    #[test]
+    fn test_bind_in_list_string_float_and_empty() {
+        let s = schema_with_val(TypeCode::String);
+        assert!(bind_single_table(&parse("c IN ('a', 'b')"), &s).is_ok());
+        let f = schema_with_val(TypeCode::F64);
+        assert!(bind_single_table(&parse("c IN (1.5, 2.5)"), &f).is_ok());
+        let empty = Expr::InList {
+            expr: Box::new(parse("c")),
+            list: vec![],
+            negated: false,
+        };
+        assert_unsupported(bind_single_table(&empty, &f), "empty list");
+    }
+
+    /// Subquery expressions outside the one supported placement get the targeted
+    /// message, not the generic catch-all.
+    #[test]
+    fn test_bind_rejects_subquery_expressions_with_targeted_messages() {
+        let schema = schema_with_val(TypeCode::I64);
+        for src in [
+            "EXISTS (SELECT c FROM t)",
+            "NOT EXISTS (SELECT c FROM t)",
+            "c IN (SELECT c FROM t)",
+            "c NOT IN (SELECT c FROM t)",
+            // Under OR the conjunct partitioner never intercepts it either.
+            "c = 1 OR EXISTS (SELECT c FROM t)",
+        ] {
+            assert_unsupported(
+                bind_single_table(&parse(src), &schema),
+                "top-level AND conjunct of a CREATE VIEW WHERE",
+            );
+        }
+        assert_unsupported(
+            bind_single_table(&parse("c = ANY (SELECT c FROM t)"), &schema),
+            "ANY/SOME/ALL",
+        );
+        assert_unsupported(
+            bind_single_table(&parse("c > ALL (SELECT c FROM t)"), &schema),
+            "ANY/SOME/ALL",
+        );
+        assert_unsupported(
+            bind_single_table(&parse("(SELECT c FROM t) = 1"), &schema),
+            "scalar subqueries",
+        );
     }
 
     /// The accepted qualifier (`ALL`, the SQL default — `COUNT(ALL c)` ≡

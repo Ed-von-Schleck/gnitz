@@ -4,6 +4,7 @@
 //! `execute_create_view` is exposed; everything else is internal to the cluster.
 
 mod dispatch;
+mod exists;
 mod group_by;
 mod join;
 mod predicates;

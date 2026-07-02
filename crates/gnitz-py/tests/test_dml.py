@@ -550,3 +550,169 @@ class TestStringEdgeCases:
         finally:
             client.drop_table(sn, "strs")
             client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# TestPkInMultiSeek — `pk IN (…)` fast-path parity across DELETE/UPDATE/SELECT,
+# plus IN-list predicates that fall through to the residual scan
+# ---------------------------------------------------------------------------
+
+class TestPkInMultiSeek:
+    def _setup_t3(self, client, sn):
+        client.execute_sql(_CREATE_T3, schema_name=sn)
+        client.execute_sql(_INSERT_3ROWS, schema_name=sn)
+        tid, _ = client.resolve_table(sn, "t")
+        return tid
+
+    def test_update_pk_in(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid = self._setup_t3(client, sn)
+            res = client.execute_sql("UPDATE t SET val = 0 WHERE pk IN (1, 3)", schema_name=sn)
+            assert res[0]["type"] == "RowsAffected"
+            assert res[0]["count"] == 2
+            rows = _rows_map(client, tid)
+            assert rows[1].val == 0
+            assert rows[2].val == 200
+            assert rows[3].val == 0
+        finally:
+            try:
+                client.execute_sql("DROP TABLE t", schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+    def test_update_pk_in_repeated_and_absent_keys(self, client):
+        """Repeated keys count once; absent keys contribute nothing."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid = self._setup_t3(client, sn)
+            res = client.execute_sql(
+                "UPDATE t SET val = val + 1 WHERE pk IN (2, 2, 999)", schema_name=sn
+            )
+            assert res[0]["count"] == 1
+            rows = _rows_map(client, tid)
+            assert rows[2].val == 201  # applied exactly once despite the repeat
+            assert rows[1].val == 100 and rows[3].val == 300
+        finally:
+            try:
+                client.execute_sql("DROP TABLE t", schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+    def test_select_pk_in(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup_t3(client, sn)
+            res = client.execute_sql("SELECT * FROM t WHERE pk IN (1, 3)", schema_name=sn)
+            assert res[0]["type"] == "Rows"
+            pairs = sorted((r.pk, r.val) for r in res[0]["rows"])
+            assert pairs == [(1, 100), (3, 300)]
+        finally:
+            try:
+                client.execute_sql("DROP TABLE t", schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+    def test_select_pk_in_repeated_absent_projection_limit(self, client):
+        """Dedup + absent keys, flowing into the shared projection/LIMIT tail."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup_t3(client, sn)
+            res = client.execute_sql(
+                "SELECT * FROM t WHERE pk IN (3, 3, 1, 999)", schema_name=sn
+            )
+            pks = sorted(r.pk for r in res[0]["rows"])
+            assert pks == [1, 3]
+            res = client.execute_sql(
+                "SELECT pk, val FROM t WHERE pk IN (1, 2, 3) LIMIT 2", schema_name=sn
+            )
+            assert len(list(res[0]["rows"])) == 2
+        finally:
+            try:
+                client.execute_sql("DROP TABLE t", schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+    def test_uuid_pk_in_update_select_parity(self, client):
+        """UUID string keys route through the same IN fast path as `=` seeks."""
+        ua = '550e8400-e29b-41d4-a716-446655440000'
+        ub = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'
+        uc = '01935000-0000-7000-8000-000000000001'
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk UUID NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            for u, v in [(ua, 1), (ub, 2), (uc, 3)]:
+                client.execute_sql(f"INSERT INTO t VALUES ('{u}', {v})", schema_name=sn)
+
+            res = client.execute_sql(
+                f"UPDATE t SET v = 99 WHERE pk IN ('{ua}', '{uc}')", schema_name=sn
+            )
+            assert res[0]["count"] == 2
+
+            res = client.execute_sql(
+                f"SELECT * FROM t WHERE pk IN ('{ua}', '{ub}')", schema_name=sn
+            )
+            vals = sorted(r.v for r in res[0]["rows"])
+            assert vals == [2, 99]
+
+            res = client.execute_sql(
+                f"DELETE FROM t WHERE pk IN ('{ub}', '{ub}')", schema_name=sn
+            )
+            assert res[0]["count"] == 1
+        finally:
+            try:
+                client.execute_sql("DROP TABLE t", schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+    def test_update_pk_not_in_falls_to_scan(self, client):
+        """NOT IN never matches the fast path; the desugared OR-chain evaluates
+        on the predicate full scan."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid = self._setup_t3(client, sn)
+            res = client.execute_sql(
+                "UPDATE t SET val = 0 WHERE pk NOT IN (2)", schema_name=sn
+            )
+            assert res[0]["count"] == 2
+            rows = _rows_map(client, tid)
+            assert rows[1].val == 0 and rows[3].val == 0 and rows[2].val == 200
+        finally:
+            try:
+                client.execute_sql("DROP TABLE t", schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)
+
+    def test_delete_non_pk_in_scan(self, client):
+        """A non-PK IN list evaluates as a residual predicate over the full scan."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            tid = self._setup_t3(client, sn)
+            res = client.execute_sql(
+                "DELETE FROM t WHERE val IN (100, 300, 555)", schema_name=sn
+            )
+            assert res[0]["count"] == 2
+            rows = _rows_map(client, tid)
+            assert list(rows.keys()) == [2]
+        finally:
+            try:
+                client.execute_sql("DROP TABLE t", schema_name=sn)
+            except Exception:
+                pass
+            client.drop_schema(sn)

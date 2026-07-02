@@ -3,7 +3,8 @@
 //! `plan/view` that knows about all the others.
 
 use crate::ast_util::{
-    extract_name, extract_table_factor_name, group_by_is_present, is_wildcard_projection, projection_has_aggregate,
+    extract_name, extract_table_factor_name, flatten_conjuncts, group_by_is_present, is_wildcard_projection,
+    projection_has_aggregate,
 };
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
@@ -11,10 +12,10 @@ use crate::plan::validate::{
     reject_unhonored_query_clauses, reject_unhonored_select_clauses, unsupported_clause, HonoredClauses,
     HonoredQueryClauses,
 };
-use crate::plan::view::{group_by, join, set_op, simple};
+use crate::plan::view::{exists, group_by, join, set_op, simple};
 use crate::SqlResult;
 use gnitz_core::GnitzClient;
-use sqlparser::ast::{Expr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement};
+use sqlparser::ast::{Expr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, UnaryOperator};
 
 pub(crate) fn execute_create_view(
     client: &mut GnitzClient,
@@ -68,6 +69,22 @@ pub(crate) fn execute_create_view(
         ViewShape::Join(select) => {
             join::execute_create_join_view(client, schema_name, &view_name, &sql_text, select, binder)
         }
+        ViewShape::Subquery {
+            select,
+            subq,
+            outer_not,
+            local,
+        } => exists::execute_create_exists_view(
+            client,
+            schema_name,
+            &view_name,
+            &sql_text,
+            select,
+            subq,
+            outer_not,
+            &local,
+            binder,
+        ),
         ViewShape::GroupBy(select) => {
             group_by::execute_create_group_by_view(client, schema_name, &view_name, &sql_text, select, binder)
         }
@@ -91,8 +108,45 @@ enum ViewShape<'a> {
     },
     Distinct(&'a Select),
     Join(&'a Select),
+    /// A Simple-shaped view whose WHERE carries exactly one top-level
+    /// `[NOT] EXISTS (…)` / `x [NOT] IN (SELECT …)` conjunct — routed to the
+    /// semi/anti-join builder.
+    Subquery {
+        select: &'a Select,
+        /// The peeled `Exists`/`InSubquery` node (`Nested` and `NOT` wrappers
+        /// removed).
+        subq: &'a Expr,
+        /// True when a net-negating stack of `NOT` wrappers surrounded the
+        /// node; the builder folds it into the node's own `negated` flag.
+        outer_not: bool,
+        /// The remaining WHERE conjuncts, filtering the outer relation.
+        local: Vec<&'a Expr>,
+    },
     GroupBy(&'a Select),
     Simple(&'a Select),
+}
+
+/// Peel `Nested` wrappers and `NOT`s off a WHERE conjunct; when the core is a
+/// subquery test (`EXISTS` / `IN (SELECT …)`), return it with the net-negation
+/// flag — each peeled `NOT` toggles it, so `NOT (EXISTS …)` classifies like
+/// `NOT EXISTS …` and a double negation cancels.
+fn as_subquery_conjunct(e: &Expr) -> Option<(&Expr, bool)> {
+    let mut cur = e;
+    let mut outer_not = false;
+    loop {
+        match cur {
+            Expr::Nested(inner) => cur = inner,
+            Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr,
+            } => {
+                outer_not = !outer_not;
+                cur = expr;
+            }
+            _ => break,
+        }
+    }
+    matches!(cur, Expr::Exists { .. } | Expr::InSubquery { .. }).then_some((cur, outer_not))
 }
 
 impl<'a> ViewShape<'a> {
@@ -135,6 +189,40 @@ impl<'a> ViewShape<'a> {
         // A JOIN outranks GROUP BY.
         if !select.from[0].joins.is_empty() {
             return Ok(ViewShape::Join(select));
+        }
+        // A single top-level `[NOT] EXISTS` / `[NOT] IN (SELECT …)` WHERE
+        // conjunct routes to the semi/anti-join builder. Checked after JOIN (a
+        // join-view WHERE is rejected wholesale by that builder) and before
+        // GROUP BY, which cannot host the subquery in one circuit (the exists
+        // builder rejects that combination with a targeted message).
+        if let Some(selection) = &select.selection {
+            let mut conjuncts = Vec::new();
+            flatten_conjuncts(selection, &mut conjuncts);
+            let mut subq: Option<(&Expr, bool)> = None;
+            let mut local: Vec<&Expr> = Vec::new();
+            for &c in &conjuncts {
+                match as_subquery_conjunct(c) {
+                    Some(peeled) => {
+                        if subq.is_some() {
+                            return Err(GnitzSqlError::Unsupported(
+                                "at most one EXISTS/IN subquery conjunct per view WHERE; \
+                                 stack views instead"
+                                    .into(),
+                            ));
+                        }
+                        subq = Some(peeled);
+                    }
+                    None => local.push(c),
+                }
+            }
+            if let Some((node, outer_not)) = subq {
+                return Ok(ViewShape::Subquery {
+                    select,
+                    subq: node,
+                    outer_not,
+                    local,
+                });
+            }
         }
         // GROUP BY *or* a no-`GROUP BY` aggregate (`SELECT MIN(x) FROM t`) routes
         // to the grouped builder: the latter is one logical group compiled as a
