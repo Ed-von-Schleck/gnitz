@@ -108,6 +108,16 @@ impl StoreHandle {
         }
     }
 
+    /// Dispatched durable ingest of a borrowed `Batch` — the single-copy path
+    /// for callers that keep reading the batch (see
+    /// `Table::ingest_borrowed_batch`).
+    pub fn ingest_borrowed_batch(&self, batch: &Batch) -> Result<(), StorageError> {
+        match self {
+            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).ingest_borrowed_batch(batch) },
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).ingest_borrowed_batch(batch) },
+        }
+    }
+
     /// Dispatched flush across all variants.
     pub fn flush(&mut self) -> Result<bool, StorageError> {
         match self {

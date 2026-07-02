@@ -85,11 +85,11 @@ pub fn op_integrate_with_indexes(
     }
 
     // `op_reduce` now ships its retract+insert output as an honest unconsolidated
-    // delta (sorted = consolidated = false), so the table ingest re-sorts/folds it;
-    // no defensive flag-scrub is needed here. `clone_batch` stays: `batch` is
-    // borrowed and read again by the AVI population below.
+    // delta (sorted = consolidated = false); the borrowed ingest consolidates it
+    // straight into the memtable's owned copy — one copy per tick, and `batch`
+    // stays readable for the AVI population below.
     if let Some(table) = target_table {
-        table.ingest_owned_batch_memonly(batch.clone_batch())?;
+        table.ingest_borrowed_batch_memonly(batch)?;
     }
 
     let mb = batch.as_mem_batch();

@@ -304,6 +304,30 @@ impl Table {
         self.upsert_owned_and_maybe_flush(batch, true)
     }
 
+    /// Ingest a borrowed Batch, copying it exactly once: an unconsolidated
+    /// batch is consolidated straight into the owned copy the memtable keeps
+    /// (the consolidation pass IS the copy), an already-consolidated batch is
+    /// cloned verbatim. The borrow-based twin of [`Self::ingest_owned_batch`]
+    /// for callers that keep reading `batch` afterwards — `clone_batch()` +
+    /// `ingest_owned_batch()` would copy an unconsolidated batch twice.
+    pub fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
+        self.upsert_borrowed_and_maybe_flush(batch, false)
+    }
+
+    /// [`Self::ingest_borrowed_batch`] without WAL; see
+    /// [`Self::ingest_owned_batch_memonly`] for the memonly semantics.
+    pub fn ingest_borrowed_batch_memonly(&mut self, batch: &Batch) -> Result<(), StorageError> {
+        self.upsert_borrowed_and_maybe_flush(batch, true)
+    }
+
+    fn upsert_borrowed_and_maybe_flush(&mut self, batch: &Batch, force_ephemeral: bool) -> Result<(), StorageError> {
+        if batch.count == 0 {
+            return Ok(());
+        }
+        let owned = Batch::consolidate_if_needed(batch, &self.schema).unwrap_or_else(|| batch.clone_batch());
+        self.upsert_owned_and_maybe_flush(owned, force_ephemeral)
+    }
+
     fn upsert_owned_and_maybe_flush(&mut self, batch: Batch, force_ephemeral: bool) -> Result<(), StorageError> {
         if batch.count == 0 {
             return Ok(());

@@ -131,16 +131,33 @@ impl PartitionedTable {
     /// Ingest an already-constructed Batch (owned). Moves into tables[0]
     /// directly for the single-partition case, scatters via a borrowed
     /// `MemBatch` view otherwise.
-    #[allow(clippy::needless_range_loop)]
     pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         if batch.count == 0 || self.tables.is_empty() {
             return Ok(());
         }
-
         if self.is_replicated() {
             return self.tables[0].ingest_owned_batch(batch);
         }
+        self.scatter_ingest(&batch)
+        // `batch` drops here; its buffers return to batch_pool.
+    }
 
+    /// Ingest a borrowed Batch. The scatter path copies per partition either
+    /// way; the replicated path routes to `Table::ingest_borrowed_batch`, whose
+    /// consolidation pass doubles as the single copy for an unconsolidated
+    /// batch (see there).
+    pub fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
+        if batch.count == 0 || self.tables.is_empty() {
+            return Ok(());
+        }
+        if self.is_replicated() {
+            return self.tables[0].ingest_borrowed_batch(batch);
+        }
+        self.scatter_ingest(batch)
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn scatter_ingest(&mut self, batch: &Batch) -> Result<(), StorageError> {
         let mb = batch.as_mem_batch();
         let np = NUM_PARTITIONS;
 
@@ -177,8 +194,6 @@ impl PartitionedTable {
             }
             Ok(())
         })
-
-        // `batch` drops here; its buffers return to batch_pool.
     }
 
     // ------------------------------------------------------------------

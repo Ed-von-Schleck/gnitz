@@ -1006,7 +1006,7 @@ impl DagEngine {
             .iter()
             .map(|ic| Self::batch_project_index(source, ic.col_indices.as_slice(), schema, &ic.index_schema))
             .collect();
-        let _ = entry.handle.ingest_owned_batch(source.clone_batch());
+        let _ = entry.handle.ingest_borrowed_batch(source);
         for (ic, idx_batch) in entry.index_circuits.iter_mut().zip(index_batches) {
             if idx_batch.count > 0 {
                 let _ = ic.table_mut().ingest_owned_batch(idx_batch);

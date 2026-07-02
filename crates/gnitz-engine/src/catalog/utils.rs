@@ -107,10 +107,7 @@ pub(crate) fn subdir_names(path: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ingest_batch_into(table: &mut Table, batch: &Batch) {
-    if batch.count == 0 {
-        return;
-    }
-    let _ = table.ingest_owned_batch(batch.clone_batch());
+    let _ = table.ingest_borrowed_batch(batch);
 }
 
 // ---------------------------------------------------------------------------
