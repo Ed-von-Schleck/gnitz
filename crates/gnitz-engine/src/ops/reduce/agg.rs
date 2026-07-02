@@ -209,16 +209,10 @@ impl Accumulator {
             "SUM/MIN/MAX over a >8-byte non-STRING column must be rejected by the planner",
         );
 
-        // PK regions hold OPK (order-preserving big-endian) bytes; decode the
-        // addressed PK column back to native little-endian before aggregating.
-        // A payload column is already native-LE, so `bytes()` is used verbatim.
-        let pk_le_buf;
-        let bytes: &[u8] = if self.loc.is_pk() {
-            pk_le_buf = gnitz_wire::decode_pk_column_owned(self.loc.bytes(mb, row), tc as u8);
-            &pk_le_buf[..cs]
-        } else {
-            self.loc.bytes(mb, row)
-        };
+        // `native_le_bytes` OPK-decodes a PK-source column back to native
+        // little-endian before aggregating; a payload column reads verbatim.
+        let mut pk_scratch = [0u8; 16];
+        let bytes = self.loc.native_le_bytes(mb, row, &mut pk_scratch);
 
         let first = !self.has_value;
         self.has_value = true;

@@ -2464,18 +2464,10 @@ fn make_batch_u64pk_i64grp_i64val(
     schema: &SchemaDescriptor,
     rows: &[(u64, i64, i64, i64)], // (pk, weight, grp, i64_val)
 ) -> Batch {
-    let n = rows.len();
-    let mut b = Batch::with_schema(*schema, n.max(1));
-    for &(pk, w, grp, val) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &grp.to_le_bytes());
-        b.extend_col(1, &val.to_le_bytes());
-        b.count += 1;
-    }
-    b.set_layout_unchecked(Layout::Consolidated);
-    b
+    // `val as u64` writes the identical LE bytes; the twin builders differ only
+    // in the tuple's val type.
+    let rows: Vec<(u64, i64, i64, u64)> = rows.iter().map(|&(pk, w, grp, val)| (pk, w, grp, val as u64)).collect();
+    make_batch_u64pk_i64grp_u64val(schema, &rows)
 }
 
 /// Group-by-grp output schema: synthetic U128 PK, I64 grp, U64 agg.
@@ -4862,18 +4854,74 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
     );
 }
 
-// Bug 3: the order-encoded aggregate value must be serialized big-endian so the
-// index's lexicographic byte ordering matches numeric order. With three values
-// in one group whose extremes differ above the low byte ({101, 111, -5}), a
-// little-endian serialization sorts 101 first and reports it as the MIN; -5 is
-// never seen. Drives the full production path: op_integrate_with_indexes
-// populates the AVI, then apply_agg_from_value_index reads it back.
-#[test]
-fn avi_full_path_min_max_across_high_byte() {
+// Populate a fresh ephemeral AVI table from `deltas` through the production
+// `op_integrate_with_indexes`, then read the extreme of delta[0]-row-0's group
+// back through the production `apply_agg_from_value_index` seek. `col_idx` is
+// the aggregate source column (PK or payload). Shared by the AVI full-path
+// tests below.
+fn avi_read_extreme(
+    in_schema: &SchemaDescriptor,
+    group_by: &[u32],
+    col_idx: u32,
+    deltas: &[&Batch],
+    for_max: bool,
+) -> i64 {
     use super::super::util::GroupKeyExtractor;
     use crate::ops::index::{make_avi_schema, op_integrate_with_indexes, AviDesc};
     use crate::storage::Table;
 
+    // The aggregate's type is the source column's type.
+    let tc_enum = TypeCode::from_validated_u8(in_schema.columns[col_idx as usize].type_code);
+    let avi_schema = make_avi_schema(in_schema, group_by);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut avi_t = Table::new(
+        tmp.path().to_str().unwrap(),
+        "avi",
+        avi_schema,
+        0,
+        1 << 20,
+        crate::storage::Persistence::Ephemeral,
+    )
+    .unwrap();
+    let agg = AggDescriptor {
+        col_idx,
+        agg_op: if for_max { AggOp::Max } else { AggOp::Min },
+        col_type_code: tc_enum,
+        _pad: [0; 2],
+    };
+    let aggs = [agg];
+    let avi = AviDesc {
+        table: &mut avi_t as *mut Table,
+        group_by_cols: group_by,
+        aggs: &aggs,
+    };
+    // Each op_integrate_with_indexes call is a separate AVI ingest; the cursor's
+    // two-tier consolidation sums weights across ingests, so a retracted extreme
+    // (net-zero) is skipped by seek_first_positive_with_prefix.
+    for d in deltas {
+        op_integrate_with_indexes(d, None, in_schema, Some(&avi)).unwrap();
+    }
+
+    let mut ch = avi_t.open_cursor();
+    let extractor = GroupKeyExtractor::new(in_schema, group_by);
+    let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
+    extractor.gather(&deltas[0].as_mem_batch(), 0, &mut gk);
+    gk[extractor.stride] = 0; // ordinal 0 (single aggregate)
+    let mut acc = Accumulator::new(&agg, in_schema);
+    assert!(
+        apply_agg_from_value_index(ch.cursor_mut(), &gk[..extractor.stride + 1], for_max, &mut acc),
+        "AVI seek must find the probed group",
+    );
+    acc.get_value_bits() as i64
+}
+
+// Bug 3: the order-encoded aggregate value must be serialized big-endian so the
+// index's lexicographic byte ordering matches numeric order. With three values
+// in one group whose extremes differ above the low byte ({101, 111, -5}), a
+// little-endian serialization sorts 101 first and reports it as the MIN; -5 is
+// never seen.
+#[test]
+fn avi_full_path_min_max_across_high_byte() {
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0), // pk
@@ -4896,55 +4944,108 @@ fn avi_full_path_min_max_across_high_byte() {
         b
     };
 
-    let tmp = tempfile::tempdir().unwrap();
-    let group_by = vec![1u32];
-
-    let seed = |for_max: bool, table_id: u32| -> i64 {
-        let avi_schema = make_avi_schema(&in_schema, &group_by);
-        let mut avi_t = Table::new(
-            tmp.path().to_str().unwrap(),
-            "avi",
-            avi_schema,
-            table_id,
-            1 << 20,
-            crate::storage::Persistence::Ephemeral,
-        )
-        .unwrap();
-        let avi = AviDesc {
-            table: &mut avi_t as *mut Table,
-            group_by_cols: group_by.clone(),
-            aggs: vec![AggDescriptor {
-                col_idx: 2,
-                agg_op: if for_max { AggOp::Max } else { AggOp::Min },
-                col_type_code: TypeCode::I64,
-                _pad: [0; 2],
-            }],
-        };
-        op_integrate_with_indexes(&delta, None, &in_schema, Some(&avi)).unwrap();
-
-        let mut ch = avi_t.open_cursor();
-        let extractor = GroupKeyExtractor::new(&in_schema, &group_by);
-        let mut gk = [0u8; crate::schema::MAX_PK_BYTES];
-        extractor.gather(&delta.as_mem_batch(), 0, &mut gk);
-        gk[extractor.stride] = 0; // ordinal 0 (single aggregate)
-        let agg_desc = AggDescriptor {
-            col_idx: 2,
-            agg_op: if for_max { AggOp::Max } else { AggOp::Min },
-            col_type_code: TypeCode::I64,
-            _pad: [0; 2],
-        };
-        let mut acc = Accumulator::new(&agg_desc, &in_schema);
-        let ok = apply_agg_from_value_index(ch.cursor_mut(), &gk[..extractor.stride + 1], for_max, &mut acc);
-        assert!(ok, "AVI seek must find group g=5");
-        acc.get_value_bits() as i64
-    };
-
     assert_eq!(
-        seed(false, 90),
+        avi_read_extreme(&in_schema, &[1], 2, &[&delta], false),
         -5,
         "MIN across the high-byte boundary must be -5, not 101"
     );
-    assert_eq!(seed(true, 91), 111, "MAX must be 111");
+    assert_eq!(
+        avi_read_extreme(&in_schema, &[1], 2, &[&delta], true),
+        111,
+        "MAX must be 111"
+    );
+}
+
+/// Delta over a two-column PK `[U64 a (pk), <int> b (pk)]`, no payload: one row
+/// per `(b, weight)` with a=5. `opk_pk` truncates each u128 to the column
+/// width, so a negative `b as u128` still packs the correct two's-complement
+/// LE bytes.
+fn pk_ab_delta(schema: &SchemaDescriptor, rows: &[(i128, i64)]) -> Batch {
+    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    for &(bv, w) in rows {
+        b.extend_pk_opk(schema, &[5u128, bv as u128]);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.count += 1;
+    }
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
+}
+
+// A signed PK-source aggregate end-to-end: PK = (a:U64, b:I64), GROUP BY a,
+// MIN/MAX(b). The population OPK-decodes b before order-encoding; without the
+// decode the byte-swapped image reports the wrong extreme (101 instead of -5 for
+// MIN) and the retract-at-extreme walk advances to the wrong next value.
+#[test]
+fn avi_full_path_pk_source_signed_min_max() {
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0, 1],
+    );
+    // Group a=5, b ∈ {-5, 1, 256, 100}: extremes straddle the sign (-5) and the
+    // high byte (256).
+    let delta = pk_ab_delta(&in_schema, &[(-5, 1), (1, 1), (256, 1), (100, 1)]);
+    let read = |deltas: &[&Batch], for_max: bool| avi_read_extreme(&in_schema, &[0], 1, deltas, for_max);
+
+    // Insert epoch.
+    assert_eq!(
+        read(&[&delta], false),
+        -5,
+        "MIN across sign/high-byte boundary must be -5"
+    );
+    assert_eq!(read(&[&delta], true), 256, "MAX across the high byte must be 256");
+
+    // Retract-at-extreme: retracting the current MIN advances it to the next
+    // value; retracting the current MAX falls it back.
+    let retract_min = pk_ab_delta(&in_schema, &[(-5, -1)]);
+    assert_eq!(
+        read(&[&delta, &retract_min], false),
+        1,
+        "after retracting -5, MIN advances to 1"
+    );
+    let retract_max = pk_ab_delta(&in_schema, &[(256, -1)]);
+    assert_eq!(
+        read(&[&delta, &retract_max], true),
+        100,
+        "after retracting 256, MAX falls to 100"
+    );
+}
+
+// The unsigned high-byte-boundary case at the reduce full-path level: PK =
+// (a:U64, b:U64), b ∈ {1, 256, 100}. 1 (0x0001) and 256 (0x0100) byte-swap into
+// each other, so a population that skips the OPK decode reports 256 as the MIN.
+#[test]
+fn avi_full_path_pk_source_unsigned_high_byte() {
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ],
+        &[0, 1],
+    );
+    let delta = pk_ab_delta(&in_schema, &[(1, 1), (256, 1), (100, 1)]);
+    let read = |deltas: &[&Batch], for_max: bool| avi_read_extreme(&in_schema, &[0], 1, deltas, for_max);
+
+    assert_eq!(read(&[&delta], false), 1, "MIN must be 1, not the byte-swapped 256");
+    assert_eq!(read(&[&delta], true), 256, "MAX must be 256");
+
+    // Retract the MAX (256); MAX falls back to 100.
+    let retract_max = pk_ab_delta(&in_schema, &[(256, -1)]);
+    assert_eq!(
+        read(&[&delta, &retract_max], true),
+        100,
+        "after retracting 256, MAX falls to 100"
+    );
+    // Retract the MIN (1); MIN advances to 100.
+    let retract_min = pk_ab_delta(&in_schema, &[(1, -1)]);
+    assert_eq!(
+        read(&[&delta, &retract_min], false),
+        100,
+        "after retracting 1, MIN advances to 100"
+    );
 }
 
 // Bug 4: a float aggregate's accumulator and output column are F64, so the AVI
@@ -5242,29 +5343,6 @@ fn extract_group_key_cursor_matches_batch() {
     }
 }
 
-// Helper: build a sorted+consolidated Batch for the 3-col fallback correctness schemas.
-// Schema: U64 pk | group_col (type/nullable per schema) | I64 val.
-// Rows: (pk, weight, group_bytes [16 if string else 8], null_bit for group_col, val).
-fn make_fallback_batch_i64_grp(
-    schema: &SchemaDescriptor,
-    rows: &[(u64, i64, i64, bool, i64)], // (pk, w, grp, grp_is_null, val)
-) -> Batch {
-    let pi_grp = schema.try_payload_idx(1).unwrap();
-    let pi_val = schema.try_payload_idx(2).unwrap();
-    let mut b = Batch::with_schema(*schema, rows.len().max(1));
-    for &(pk, w, grp, grp_null, val) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        let null_word = if grp_null { 1u64 << pi_grp } else { 0u64 };
-        b.extend_null_bmp(&null_word.to_le_bytes());
-        b.extend_col(pi_grp, &grp.to_le_bytes());
-        b.extend_col(pi_val, &val.to_le_bytes());
-        b.count += 1;
-    }
-    b.set_layout_unchecked(Layout::Consolidated);
-    b
-}
-
 /// Read (grp_i64, min_i64) pairs from a fallback-style output (U128 pk | I64 grp | I64 min).
 fn read_grp_min_pairs(out: &Batch) -> Vec<(i64, i64)> {
     let grp_data = out.col_data(0);
@@ -5290,8 +5368,8 @@ fn read_grp_min_pairs(out: &Batch) -> Vec<(i64, i64)> {
 ///   Tick 1: insert `tick1_rows` → verify MIN per group.
 ///   Tick 2: apply `delta_rows` with trace_in from tick 1 → verify updated MIN.
 fn run_fallback_min_i64_grp(
-    tick1_rows: &[(u64, i64, i64, bool, i64)], // (pk, w, grp, grp_null, val)
-    delta_rows: &[(u64, i64, i64, bool, i64)],
+    tick1_rows: &[GrpValRow],
+    delta_rows: &[GrpValRow],
     expected_tick1: &mut Vec<(i64, i64)>, // sorted (grp, min) pairs after tick 1
     expected_tick2: &mut Vec<(i64, i64)>, // sorted (grp, min) pairs after tick 2
 ) {
@@ -5323,7 +5401,7 @@ fn run_fallback_min_i64_grp(
     };
 
     // --- Tick 1: empty trace_in, empty trace_out ---
-    let delta1 = make_fallback_batch_i64_grp(&in_schema, tick1_rows);
+    let delta1 = build_grp_val_delta(&in_schema, tick1_rows);
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
     let mut to_ch1 = CursorHandle::from_owned(&[empty_out], out_schema);
 
@@ -5347,9 +5425,9 @@ fn run_fallback_min_i64_grp(
     assert_eq!(got1, *expected_tick1, "tick 1 MIN mismatch");
 
     // --- Tick 2: trace_in = tick1 input, trace_out = tick1 output ---
-    let ti_batch = Rc::new(make_fallback_batch_i64_grp(&in_schema, tick1_rows));
+    let ti_batch = Rc::new(build_grp_val_delta(&in_schema, tick1_rows));
     let to_batch = Rc::new(out1);
-    let delta2 = make_fallback_batch_i64_grp(&in_schema, delta_rows);
+    let delta2 = build_grp_val_delta(&in_schema, delta_rows);
 
     let mut ti_ch2 = CursorHandle::from_owned(&[ti_batch], in_schema);
     let mut to_ch2 = CursorHandle::from_owned(&[to_batch], out_schema);
@@ -5376,10 +5454,10 @@ fn run_fallback_min_i64_grp(
     // tick1 produced (already verified) plus the new delta's contribution.
     // We build expected from tick1 final values + delta applied.
     let mut final_rows: std::collections::BTreeMap<i64, Vec<i64>> = std::collections::BTreeMap::new();
-    for &(_, w, grp, grp_null, val) in tick1_rows.iter().chain(delta_rows.iter()) {
-        if grp_null {
-            continue;
-        } // NULL group: skip for simplicity (tested separately)
+    for &(_, grp, val, w) in tick1_rows.iter().chain(delta_rows.iter()) {
+        let Some(grp) = grp else {
+            continue; // NULL group: skip for simplicity (tested separately)
+        };
         if w > 0 {
             final_rows.entry(grp).or_default().push(val);
         } else {
@@ -5418,13 +5496,13 @@ fn run_fallback_min_i64_grp(
 fn fallback_min_nullable_i64_group_linear_probe() {
     // 3 distinct non-null groups.
     let tick1 = vec![
-        (1u64, 1i64, 10i64, false, 100i64),
-        (2, 1, 10, false, 50),
-        (3, 1, 20, false, 30),
-        (4, 1, 30, false, 200),
+        (1u64, Some(10i64), 100i64, 1i64),
+        (2, Some(10), 50, 1),
+        (3, Some(20), 30, 1),
+        (4, Some(30), 200, 1),
     ];
     // Delete the row with val=100 from group 10 → new MIN(10) = 50.
-    let delta2 = vec![(1u64, -1i64, 10i64, false, 100i64)];
+    let delta2 = vec![(1u64, Some(10i64), 100i64, -1i64)];
     let mut exp1 = vec![(10i64, 50i64), (20, 30), (30, 200)];
     let mut exp2 = vec![(10i64, 50i64), (20, 30), (30, 200)];
     run_fallback_min_i64_grp(&tick1, &delta2, &mut exp1, &mut exp2);
@@ -5434,17 +5512,17 @@ fn fallback_min_nullable_i64_group_linear_probe() {
 #[test]
 fn fallback_min_nullable_i64_group_hash_path() {
     // 20 distinct groups (exceeds HASH_THRESHOLD=16).
-    let tick1: Vec<(u64, i64, i64, bool, i64)> = (0..20)
+    let tick1: Vec<GrpValRow> = (0..20)
         .flat_map(|g| {
             vec![
-                ((g * 2) as u64, 1, g as i64, false, (g * 10 + 5) as i64),
-                ((g * 2 + 1) as u64, 1, g as i64, false, (g * 10 + 1) as i64),
+                ((g * 2) as u64, Some(g as i64), (g * 10 + 5) as i64, 1),
+                ((g * 2 + 1) as u64, Some(g as i64), (g * 10 + 1) as i64, 1),
             ]
         })
         .collect();
     // MIN per group g = g*10+1. Delete the row with val=51 from group 5 → MIN(5) becomes 55.
     // pk=11 = g*2+1 for g=5 carries val=g*10+1=51.
-    let delta2 = vec![(11u64, -1i64, 5i64, false, 51i64)]; // remove pk=11 (val=51)
+    let delta2 = vec![(11u64, Some(5i64), 51i64, -1i64)]; // remove pk=11 (val=51)
     let mut exp1: Vec<(i64, i64)> = (0..20).map(|g| (g as i64, (g * 10 + 1) as i64)).collect();
     let mut exp2: Vec<(i64, i64)> = (0..20)
         .map(|g| (g as i64, if g == 5 { 55 } else { (g * 10 + 1) as i64 }))
@@ -5948,17 +6026,7 @@ fn g_src() -> SchemaDescriptor {
 
 /// Build a delta over `g_src()` from `(pk, weight, val)` rows.
 fn g_delta(rows: &[(u64, i64, i64)]) -> Batch {
-    let schema = g_src();
-    let mut b = Batch::with_schema(schema, rows.len().max(1));
-    for &(pk, w, val) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
-    }
-    b.set_layout_unchecked(Layout::Consolidated);
-    b
+    make_batch(&g_src(), rows)
 }
 
 const G_COUNT: AggDescriptor = AggDescriptor {
@@ -5979,19 +6047,6 @@ const G_MIN: AggDescriptor = AggDescriptor {
     col_type_code: TypeCode::I64,
     _pad: [0; 2],
 };
-
-/// Output `[_group_pk:U128, sum:I64(nullable), count:I64]` (SUM + cardinality
-/// companion) — the all-linear global-aggregate shape.
-fn g_out_sum_count() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::I64, 1),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
 
 /// Output `[_group_pk:U128, count:I64, min:I64(nullable)]` — the mixed
 /// non-linear global-aggregate shape (`SELECT COUNT(*), MIN(x)`).
@@ -6039,7 +6094,7 @@ fn global_seed_over_empty_emits_one_ground_row() {
     use crate::storage::CursorHandle;
     use std::rc::Rc;
 
-    let out_schema = g_out_sum_count();
+    let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
 
@@ -6071,7 +6126,7 @@ fn global_seed_idempotent_across_two_empty_pads() {
     use crate::storage::CursorHandle;
     use std::rc::Rc;
 
-    let out_schema = g_out_sum_count();
+    let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
     let (raw1, _) = g_reduce(
@@ -6105,7 +6160,7 @@ fn global_non_owner_empty_pad_emits_zero_rows() {
     use crate::storage::CursorHandle;
     use std::rc::Rc;
 
-    let out_schema = g_out_sum_count();
+    let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
     let (raw, _) = g_reduce(
@@ -6125,7 +6180,7 @@ fn global_create_over_nonempty_emits_computed_no_ground() {
     use crate::storage::CursorHandle;
     use std::rc::Rc;
 
-    let out_schema = g_out_sum_count();
+    let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
     let (raw, _) = g_reduce(
@@ -6149,7 +6204,7 @@ fn global_emptied_by_delete_emits_ground() {
     use crate::storage::CursorHandle;
     use std::rc::Rc;
 
-    let out_schema = g_out_sum_count();
+    let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
     let (raw1, _) = g_reduce(
@@ -6189,7 +6244,7 @@ fn global_ground_to_computed_on_first_insert() {
     use crate::storage::CursorHandle;
     use std::rc::Rc;
 
-    let out_schema = g_out_sum_count();
+    let out_schema = make_pk_sum_count_out_schema();
     // Tick 1: seed the ground over an empty source.
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
@@ -6231,7 +6286,7 @@ fn global_value_change_emits_no_ground() {
     use crate::storage::CursorHandle;
     use std::rc::Rc;
 
-    let out_schema = g_out_sum_count();
+    let out_schema = make_pk_sum_count_out_schema();
     let empty_out = Rc::new(Batch::empty(out_schema.num_payload_cols(), 16));
     let mut to_ch = CursorHandle::from_owned(&[empty_out], out_schema);
     let (raw1, _) = g_reduce(
@@ -6852,14 +6907,15 @@ fn build_combined_avi(
     .unwrap();
     // The value-indexed (MIN/MAX) subset, in descriptor order — exactly what the
     // compiler feeds the integrate instruction (see `emit_reduce`).
+    let vi_aggs: Vec<AggDescriptor> = agg_descs
+        .iter()
+        .filter(|d| d.agg_op.uses_value_index())
+        .copied()
+        .collect();
     let avi = AviDesc {
         table: &mut t as *mut crate::storage::Table,
-        group_by_cols: group_cols.to_vec(),
-        aggs: agg_descs
-            .iter()
-            .filter(|d| d.agg_op.uses_value_index())
-            .copied()
-            .collect(),
+        group_by_cols: group_cols,
+        aggs: &vi_aggs,
     };
     for d in deltas {
         op_integrate_with_indexes(d, None, in_schema, Some(&avi)).unwrap();
@@ -7481,4 +7537,423 @@ fn reduce_multi_avi_global_emptied() {
         "ground SUM = NULL (not a phantom 0)"
     );
     assert_eq!(read_i64_le(out2.col_data(2), ins * 8), 0, "ground COUNT = 0");
+}
+
+// ===========================================================================
+// Monotone trace_out probe for canonical single-column group keys.
+//
+// A canonical single-column GROUP BY — a single PK sub-column (Pk arm) or a
+// single non-nullable routable-int payload column (Payload arm) — visits
+// groups in ascending output-PK order, so `op_reduce` upgrades its `trace_out`
+// retraction probe from the absolute `seek_bytes` to the galloping
+// `advance_to`. These tests drive that path across multi-epoch retraction
+// (incl. sign-flip boundaries), confirm a nullable group key stays on the
+// absolute seek (hash arm), force `SourceMode::Multi` so the multi-source
+// gallop and the debug ascending tripwire run at scale, and pin the shared
+// classifier directly.
+// ===========================================================================
+
+/// One input row over a `[U64 pk, <grp>, I64 val]` schema: `(pk, grp, val,
+/// weight)`. `grp == None` marks a NULL group (nullable schemas only). Shared
+/// by the monotone-probe tests below and the non-linear fallback tests above.
+type GrpValRow = (u64, Option<i64>, i64, i64);
+
+/// Output schema for a synthetic-U128-PK `SUM/COUNT` reduce:
+/// `[U128 pk, <grp>, I64 sum(nullable), I64 count]`. The trailing count is the
+/// cardinality companion every all-linear reduce carries.
+fn sum_count_out_synthetic(grp_col: SchemaColumn) -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            grp_col,
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+/// Build an input delta over `[U64 pk, <grp>, I64 val]` from `(pk, grp, val, w)`
+/// rows; `grp == None` marks the group column NULL (nullable schemas only). The
+/// grp column is written from an i64 image, which is byte-identical to the u64
+/// image for the non-negative values the U64-group test uses.
+fn build_grp_val_delta(schema: &SchemaDescriptor, rows: &[GrpValRow]) -> Batch {
+    let g_pi = schema.try_payload_idx(1).unwrap();
+    let v_pi = schema.try_payload_idx(2).unwrap();
+    let mut b = Batch::with_schema(*schema, rows.len().max(1));
+    for &(pk, grp, val, w) in rows {
+        b.extend_pk(pk as u128);
+        b.extend_weight(&w.to_le_bytes());
+        let null_word = if grp.is_none() { 1u64 << g_pi } else { 0 };
+        b.extend_null_bmp(&null_word.to_le_bytes());
+        b.extend_col(g_pi, &grp.unwrap_or(0).to_le_bytes());
+        b.extend_col(v_pi, &val.to_le_bytes());
+        b.count += 1;
+    }
+    b.set_layout_unchecked(Layout::Consolidated);
+    b
+}
+
+/// DBSP linear reference for `SUM(val)/COUNT` over the raw input rows: both
+/// aggregates are linear, so `sum[g] += val·w` and `count[g] += w` over every
+/// input row across every epoch; a group is live iff `count ≠ 0`. A NULL group
+/// (`None`) is its own group.
+fn sum_count_reference<'a>(
+    rows: impl IntoIterator<Item = &'a GrpValRow>,
+) -> std::collections::BTreeMap<Option<i64>, (i128, i64)> {
+    let mut m: std::collections::BTreeMap<Option<i64>, (i128, i64)> = std::collections::BTreeMap::new();
+    for &(_pk, g, v, w) in rows {
+        let e = m.entry(g).or_insert((0, 0));
+        e.0 += v as i128 * w as i128;
+        e.1 += w;
+    }
+    m.retain(|_, &mut (_, c)| c != 0);
+    m
+}
+
+/// Drive `op_reduce` over `epochs` against a real ephemeral `trace_out` Table,
+/// integrating each epoch's output delta back into the trace (flushed once
+/// after epoch 0 when `flush_after_first`). Returns the final consolidated
+/// trace_out batch and the maximum source count any epoch's probe cursor was
+/// built from, so a caller can assert `SourceMode::Multi` (≥ 3 sources) was
+/// exercised.
+fn run_reduce_trace_epochs(
+    dir: &std::path::Path,
+    in_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
+    group_by: &[u32],
+    aggs: &[AggDescriptor],
+    epochs: &[Batch],
+    flush_after_first: bool,
+) -> (std::rc::Rc<Batch>, usize) {
+    // A fresh tempdir per call isolates shard files, so a constant table_id is
+    // collision-free.
+    let mut trace = crate::storage::Table::new(
+        dir.to_str().unwrap(),
+        "trace_out",
+        *out_schema,
+        0,
+        1 << 20,
+        crate::storage::Persistence::Ephemeral,
+    )
+    .unwrap();
+    let mut max_sources = 0usize;
+    for (i, d) in epochs.iter().enumerate() {
+        // Sources the cursor for THIS epoch's probe sees: memtable runs + folded
+        // in-memory runs + shard files (each becomes one CursorSource).
+        let sources = trace.snapshot_runs().len() + trace.in_memory_runs().len() + trace.all_shard_arcs().len();
+        max_sources = max_sources.max(sources);
+        let out = {
+            let mut ch = trace.open_cursor();
+            let (out, _) = op_reduce(
+                d,
+                None,
+                ch.cursor_mut(),
+                in_schema,
+                out_schema,
+                group_by,
+                aggs,
+                None,
+                None,
+                None,
+                false,
+                false,
+            );
+            out
+        };
+        trace.ingest_owned_batch(out).unwrap();
+        if flush_after_first && i == 0 {
+            trace.flush().unwrap();
+        }
+    }
+    (trace.full_scan(), max_sources)
+}
+
+/// Read a synthetic-U128-PK reduce output `[U128 pk, <grp>, I64 sum, I64 count]`
+/// into a `grp → (sum, count)` map (a NULL group key reads as `None`), asserting
+/// one net-weight-1 row per group.
+fn readback_synthetic_i64(batch: &Batch) -> std::collections::BTreeMap<Option<i64>, (i128, i64)> {
+    let mut m: std::collections::BTreeMap<Option<i64>, (i128, i64)> = std::collections::BTreeMap::new();
+    for r in 0..batch.count {
+        assert_eq!(batch.get_weight(r), 1, "each live group row nets weight 1");
+        let grp = (batch.get_null_word(r) & 1 == 0).then(|| read_i64_le(batch.col_data(0), r * 8));
+        let sum = read_i64_le(batch.col_data(1), r * 8) as i128;
+        let count = read_i64_le(batch.col_data(2), r * 8);
+        assert!(
+            m.insert(grp, (sum, count)).is_none(),
+            "one output row per group (grp={grp:?})"
+        );
+    }
+    m
+}
+
+// Payload I64 group key, multi-epoch retraction across the sign flip. GROUP BY
+// a non-nullable I64 payload column ⇒ canonical Payload-arm key + synthetic
+// U128 output PK ⇒ the monotone `advance_to` probe. Epoch 1 inserts every
+// group; epoch 2 updates and deletes rows in several groups (including the
+// negative ones), so the retraction probe galloping over sign-flipped output
+// PKs must land on the exact old aggregate row.
+#[test]
+fn reduce_monotone_probe_payload_i64_group() {
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0), // grp (non-nullable payload) — Payload arm
+            SchemaColumn::new(type_code::I64, 0), // val
+        ],
+        &[0],
+    );
+    let out_schema = sum_count_out_synthetic(SchemaColumn::new(type_code::I64, 0));
+    let aggs = sum_count_aggs(2, TypeCode::I64);
+
+    let epoch_rows: [&[GrpValRow]; 2] = [
+        &[
+            (1, Some(-5), 10, 1),
+            (2, Some(-5), 20, 1),
+            (3, Some(-1), 5, 1),
+            (8, Some(-1), -3, 1),
+            (4, Some(0), 7, 1),
+            (5, Some(0), 8, 1),
+            (6, Some(3), 100, 1),
+            (7, Some(3), 200, 1),
+        ],
+        &[
+            (2, Some(-5), 20, -1), // delete a group-(-5) row
+            (6, Some(3), 100, -1),
+            (6, Some(3), 150, 1), // update a group-3 row 100 → 150
+            (4, Some(0), 7, -1),  // delete a group-0 row
+            (9, Some(-1), 50, 1), // insert a new group-(-1) row
+        ],
+    ];
+    let batches: Vec<Batch> = epoch_rows.iter().map(|r| build_grp_val_delta(&in_schema, r)).collect();
+    let reference = sum_count_reference(epoch_rows.iter().flat_map(|r| r.iter()));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (final_batch, _) =
+        run_reduce_trace_epochs(tmp.path(), &in_schema, &out_schema, &[1u32], &aggs, &batches, false);
+
+    assert_eq!(
+        final_batch.count,
+        reference.len(),
+        "one live row per group, no un-cancelled ghosts"
+    );
+    assert_eq!(
+        readback_synthetic_i64(&final_batch),
+        reference,
+        "incremental SUM/COUNT across sign-flip retraction must match the from-scratch reference",
+    );
+}
+
+// Payload U64 group key — the unsigned arm. A non-nullable U64 payload column is
+// natural-PK-eligible, so the output PK IS the group value (stride 8) and the
+// key is Payload-arm canonical ⇒ monotone `advance_to`. Groups straddle the high
+// byte (1 vs 256) so a byte-order slip in the gallop would misorder them.
+#[test]
+fn reduce_monotone_probe_payload_u64_group() {
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0), // grp (non-nullable payload) — natural PK
+            SchemaColumn::new(type_code::I64, 0), // val
+        ],
+        &[0],
+    );
+    // Natural U64 output PK: [U64 pk(=grp), I64 sum(nullable), I64 count].
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let aggs = sum_count_aggs(2, TypeCode::I64);
+
+    let epoch_rows: [&[GrpValRow]; 2] = [
+        &[
+            (1, Some(0), 5, 1),
+            (2, Some(1), 10, 1),
+            (3, Some(1), 20, 1),
+            (4, Some(256), 7, 1),
+            (5, Some(1000), 100, 1),
+            (6, Some(1000), 200, 1),
+        ],
+        &[
+            (3, Some(1), 20, -1), // delete a group-1 row
+            (4, Some(256), 7, -1),
+            (4, Some(256), 70, 1), // update group 256: 7 → 70
+            (7, Some(0), 15, 1),   // insert into group 0
+        ],
+    ];
+    let batches: Vec<Batch> = epoch_rows.iter().map(|r| build_grp_val_delta(&in_schema, r)).collect();
+    let reference = sum_count_reference(epoch_rows.iter().flat_map(|r| r.iter()));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (final_batch, _) =
+        run_reduce_trace_epochs(tmp.path(), &in_schema, &out_schema, &[1u32], &aggs, &batches, false);
+
+    assert_eq!(final_batch.count, reference.len(), "one live row per group");
+    // Natural-PK readback: group value is the (big-endian, unsigned) output PK;
+    // payload is [sum, count].
+    let mut got: std::collections::BTreeMap<Option<i64>, (i128, i64)> = std::collections::BTreeMap::new();
+    for r in 0..final_batch.count {
+        assert_eq!(final_batch.get_weight(r), 1);
+        let grp = u64::from_be_bytes(final_batch.get_pk_bytes(r)[..8].try_into().unwrap()) as i64;
+        let sum = read_i64_le(final_batch.col_data(0), r * 8) as i128;
+        let count = read_i64_le(final_batch.col_data(1), r * 8);
+        assert!(
+            got.insert(Some(grp), (sum, count)).is_none(),
+            "one output row per group"
+        );
+    }
+    assert_eq!(
+        got, reference,
+        "unsigned-arm incremental SUM/COUNT must match the reference"
+    );
+}
+
+// A nullable group column takes the hash arm, so the classifier returns None,
+// the probe stays on the absolute `seek_bytes`, and the ascending tripwire
+// never fires. Same retraction workload plus a NULL group (its own group);
+// results must still match the from-scratch reference.
+#[test]
+fn reduce_nullable_group_stays_absolute_seek() {
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1), // grp NULLABLE ⇒ hash arm
+            SchemaColumn::new(type_code::I64, 0), // val
+        ],
+        &[0],
+    );
+    let out_schema = sum_count_out_synthetic(SchemaColumn::new(type_code::I64, 1)); // grp nullable
+    let aggs = sum_count_aggs(2, TypeCode::I64);
+
+    let epoch_rows: [&[GrpValRow]; 2] = [
+        &[
+            (1, None, 10, 1),
+            (2, None, 20, 1), // NULL group
+            (3, Some(-1), 5, 1),
+            (4, Some(7), 100, 1),
+            (5, Some(7), 1, 1),
+        ],
+        &[
+            (2, None, 20, -1),     // retract a NULL-group row
+            (4, Some(7), 100, -1), // delete a group-7 row
+            (6, Some(-1), 50, 1),  // insert into group -1
+        ],
+    ];
+    let batches: Vec<Batch> = epoch_rows.iter().map(|r| build_grp_val_delta(&in_schema, r)).collect();
+    let reference = sum_count_reference(epoch_rows.iter().flat_map(|r| r.iter()));
+    assert!(reference.contains_key(&None), "the NULL group must stay live");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (final_batch, _) =
+        run_reduce_trace_epochs(tmp.path(), &in_schema, &out_schema, &[1u32], &aggs, &batches, false);
+
+    assert_eq!(final_batch.count, reference.len(), "one live row per group");
+    assert_eq!(
+        readback_synthetic_i64(&final_batch),
+        reference,
+        "hash-arm incremental SUM/COUNT (incl. the NULL group) must match the reference",
+    );
+}
+
+// Pin the shared classifier: the two canonical single-column arms (a PK
+// column, a non-nullable routable-int payload), and the hash fold (None) for
+// nullable / STRING / float / multi-column / empty group sets.
+// `extract_group_key_row` dispatches its fast path on the arm and `op_reduce`
+// keys its monotone probe on `is_some()`, so a drift here is a correctness
+// bug, not a perf one.
+#[test]
+fn single_col_canonical_group_key_predicate() {
+    use super::super::util::{single_col_canonical_group_key, CanonicalKeyArm};
+    let u64c = SchemaColumn::new(type_code::U64, 0);
+    let i64c = SchemaColumn::new(type_code::I64, 0);
+    let i64_null = SchemaColumn::new(type_code::I64, 1);
+    let strc = SchemaColumn::new(type_code::STRING, 0);
+    let f64c = SchemaColumn::new(type_code::F64, 0);
+    let u128c = SchemaColumn::new(type_code::U128, 0);
+
+    let check = |cols: &[SchemaColumn], pk: &[u32], gb: &[u32], expected: Option<CanonicalKeyArm>, label: &str| {
+        let schema = SchemaDescriptor::new(cols, pk);
+        assert_eq!(single_col_canonical_group_key(&schema, gb), expected, "{label}");
+    };
+    let (pk_arm, pl_arm) = (Some(CanonicalKeyArm::Pk), Some(CanonicalKeyArm::Payload));
+    check(&[u64c, i64c], &[0], &[1], pl_arm, "non-nullable I64 payload");
+    check(&[u64c, u64c], &[0], &[1], pl_arm, "non-nullable U64 payload");
+    check(&[u64c, u128c], &[0], &[1], pl_arm, "U128 payload (routable_int)");
+    check(&[u64c, i64c], &[0], &[0], pk_arm, "single PK column");
+    check(&[u64c, i64_null], &[0], &[1], None, "nullable → hash arm");
+    check(&[u64c, strc], &[0], &[1], None, "STRING → hash arm");
+    check(&[u64c, f64c], &[0], &[1], None, "float → hash arm");
+    check(&[u64c, i64c, i64c], &[0], &[1, 2], None, "multi-column → hash arm");
+    check(&[u64c, i64c], &[0], &[], None, "empty (global) group set");
+}
+
+// Many groups per epoch over ≥ 3 trace_out sources. 200 groups spanning the sign
+// flip (-100..99), six epochs each touching every group (insert / update /
+// delete). One flush after epoch 0 plus accumulating memtable runs pushes the
+// trace_out cursor to `SourceMode::Multi` (≥ 3 sources) from epoch 3 on, so the
+// multi-source gallop (`seek_forward_multi`) and the debug ascending tripwire
+// both execute across hundreds of monotone probes. Construction makes every
+// group's final aggregate identical (SUM=10, COUNT=3), so any mis-landed
+// retraction shows up as a wrong sum or an un-cancelled duplicate.
+#[test]
+fn reduce_monotone_probe_many_groups_multi_source() {
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0), // grp — Payload arm
+            SchemaColumn::new(type_code::I64, 0), // val
+        ],
+        &[0],
+    );
+    let out_schema = sum_count_out_synthetic(SchemaColumn::new(type_code::I64, 0));
+    let aggs = sum_count_aggs(2, TypeCode::I64);
+
+    let groups: Vec<i64> = (-100..100).collect();
+    let mut next_pk = 0u64;
+    let mut epochs_data: Vec<Vec<GrpValRow>> = Vec::new();
+    for ep in 0..6 {
+        let mut rows = Vec::new();
+        for &g in &groups {
+            let vws: Vec<(i64, i64)> = match ep {
+                0 => vec![(g, 1), (g + 1000, 1)],
+                1 => vec![(5, 1)],
+                2 => vec![(g, -1)], // retract epoch-0 insert #1
+                3 => vec![(7, 1)],
+                4 => vec![(g + 1000, -1)], // retract epoch-0 insert #2
+                5 => vec![(-2, 1)],
+                _ => unreachable!(),
+            };
+            for (val, w) in vws {
+                rows.push((next_pk, Some(g), val, w));
+                next_pk += 1;
+            }
+        }
+        epochs_data.push(rows);
+    }
+    let batches: Vec<Batch> = epochs_data.iter().map(|r| build_grp_val_delta(&in_schema, r)).collect();
+    let reference = sum_count_reference(epochs_data.iter().flatten());
+    assert_eq!(reference.len(), 200, "all 200 groups stay live");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (final_batch, max_sources) =
+        run_reduce_trace_epochs(tmp.path(), &in_schema, &out_schema, &[1u32], &aggs, &batches, true);
+
+    assert!(
+        max_sources >= 3,
+        "trace_out probe must reach SourceMode::Multi (≥ 3 sources); saw {max_sources}",
+    );
+    assert_eq!(
+        final_batch.count,
+        reference.len(),
+        "one live row per group, no duplicates"
+    );
+    assert_eq!(
+        readback_synthetic_i64(&final_batch),
+        reference,
+        "many-group multi-source incremental SUM/COUNT must match the from-scratch reference",
+    );
 }

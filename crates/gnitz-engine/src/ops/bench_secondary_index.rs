@@ -208,8 +208,8 @@ fn secondary_index_bench_avi_decomposition() {
         id += 1;
         let avi = AviDesc {
             table: &mut t as *mut Table,
-            group_by_cols: group_by_cols.clone(),
-            aggs: vec![AggDescriptor {
+            group_by_cols: &group_by_cols,
+            aggs: &[AggDescriptor {
                 col_idx: 2,
                 agg_op: AggOp::Min,
                 col_type_code: TypeCode::I64,

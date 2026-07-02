@@ -367,8 +367,8 @@ pub(crate) fn execute_epoch_multi(
 
                 let avi_desc = avi.as_ref().map(|a| AviDesc {
                     table: program.tables[a.table_idx as usize],
-                    group_by_cols: a.group_by_cols.clone(),
-                    aggs: a.aggs.clone(),
+                    group_by_cols: &a.group_by_cols,
+                    aggs: &a.aggs,
                 });
 
                 gnitz_debug!(

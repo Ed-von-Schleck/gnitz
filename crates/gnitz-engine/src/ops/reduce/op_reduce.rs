@@ -4,7 +4,8 @@ use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{pk_bytes_eq, scatter_copy, Batch, DrainGuard, MemBatch, ReadCursor};
 
 use super::super::util::{
-    cmp_col_window, extract_group_key, extract_group_key_cursor, global_group_key, GroupKeyExtractor,
+    cmp_col_window, extract_group_key, extract_group_key_cursor, global_group_key, single_col_canonical_group_key,
+    GroupKeyExtractor,
 };
 use super::agg::{
     apply_agg_from_value_index, fold_old_aggs, is_single_col_natural_pk, Accumulator, AggDescriptor, AggOp,
@@ -200,7 +201,7 @@ pub fn op_reduce(
         return (Batch::empty_with_schema(output_schema), empty_fin);
     }
 
-    // group_set_eq_pk: GROUP BY is a permutation of the source PK columns.
+    // group_by_pk: GROUP BY is a permutation of the source PK columns.
     // Group membership is tested on the full PK byte window (get_pk_bytes),
     // exact at every width, and argsort_pk_canonical orders every PK width
     // correctly (a width-matched key, or the compare_pk_bytes walk above 32
@@ -212,8 +213,14 @@ pub fn op_reduce(
     // must argsort by canonical PK order to avoid splitting one PK into
     // multiple groups. Output's pk_indices is in source pk-list order
     // regardless of group_by_cols permutation.
-    let group_set_eq_pk = input_schema.group_cols_eq_pk(group_by_cols);
-    let group_by_pk = group_set_eq_pk;
+    let group_by_pk = input_schema.group_cols_eq_pk(group_by_cols);
+
+    // Monotone probe eligibility: natural-PK grouping and canonical
+    // single-column group keys both visit groups in ascending output-PK order
+    // (argsort by compare_by_group_cols == canonical byte order), so the
+    // trace_out retraction probe can gallop from the live position instead of
+    // paying an absolute full-height seek + loser-tree rebuild per group.
+    let monotone_out_pk = group_by_pk || single_col_canonical_group_key(input_schema, group_by_cols).is_some();
 
     // Pre-compute sort descriptors for group comparisons (non-pk path).
     let (sort_descs, sort_descs_len) = if group_by_pk {
@@ -247,7 +254,7 @@ pub fn op_reduce(
     // Output mapping: matches build_reduce_output_schema's logic — must
     // stay in sync. Independent of the stride-gated fast-path eligibility
     // above (compound natural-PK at stride > 16 still emits natural PKs).
-    let use_natural_pk = group_set_eq_pk || is_single_col_natural_pk(input_schema, group_by_cols);
+    let use_natural_pk = group_by_pk || is_single_col_natural_pk(input_schema, group_by_cols);
 
     let mut raw_output = Batch::with_schema(*output_schema, 32);
     let mut fin_output = finalize_out_schema.map(|fs| Batch::with_schema(*fs, 32));
@@ -430,6 +437,12 @@ pub fn op_reduce(
 
     let mut idx = 0usize;
     let mut num_groups = 0usize;
+    // Debug tripwire: on the monotone paths assert out_pk_bytes strictly
+    // ascends in group-visit order, so a comparator/key-encoding divergence
+    // surfaces as a test failure rather than a silent `advance_to`
+    // degrade-to-rescan perf regression.
+    #[cfg(debug_assertions)]
+    let mut prev_out_pk: Vec<u8> = Vec::new();
     while idx < n {
         let group_start_pos = idx;
         let group_start_idx = sorted_indices[group_start_pos] as usize;
@@ -460,6 +473,20 @@ pub fn op_reduce(
             &out_pk_buf[..stride]
         };
 
+        // Strict `<`: consecutive groups are comparator-distinct and the
+        // monotone key forms are injective on the compared bytes, so an equal
+        // consecutive key is itself an encoding/comparator divergence — exactly
+        // what this catches. All slices share the loop-invariant output stride,
+        // so slice-lex order is OPK order.
+        #[cfg(debug_assertions)]
+        if monotone_out_pk {
+            assert!(
+                prev_out_pk.is_empty() || prev_out_pk.as_slice() < out_pk_bytes,
+                "monotone group key must strictly ascend in group-visit order",
+            );
+            out_pk_bytes.clone_into(&mut prev_out_pk);
+        }
+
         // Step linear accumulators over delta rows in this group
         for acc in accs.iter_mut() {
             acc.reset();
@@ -486,12 +513,10 @@ pub fn op_reduce(
         }
 
         // Retraction: read old value from trace_out, keyed by the group's output
-        // PK (`out_pk_bytes`). Natural-PK grouping visits groups in ascending
-        // output-PK order, so the probe is monotone → galloping `advance_to`
-        // seeded at the live position. Payload GROUP BY keys on the synthetic
-        // group key, whose order need not match trace_out storage order, so it
-        // keeps the absolute `seek_bytes` (correct for a non-monotone probe).
-        if group_by_pk {
+        // PK (`out_pk_bytes`). A monotone visit order gallops with `advance_to`
+        // seeded at the live position; a hashed group key's order need not match
+        // trace_out storage order, so it keeps the absolute `seek_bytes`.
+        if monotone_out_pk {
             trace_out_cursor.advance_to(out_pk_bytes);
         } else {
             trace_out_cursor.seek_bytes(out_pk_bytes);

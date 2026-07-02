@@ -75,8 +75,8 @@ pub(super) fn emit_reduce_row(
                         // back to native LE before copying into the payload region
                         // (a raw copy keeps the flipped sign bit / big-endian order
                         // for signed and wide columns).
-                        let le = gnitz_wire::decode_pk_column_owned(loc.bytes(input_mb, exemplar_row), col.type_code);
-                        output.extend_col(out_pi, &le[..cs]);
+                        let mut scratch = [0u8; 16];
+                        output.extend_col(out_pi, loc.native_le_bytes(input_mb, exemplar_row, &mut scratch));
                     }
                     ColumnLocator::Payload { slot, .. } => {
                         if loc.is_null(input_mb, exemplar_row) {

@@ -682,11 +682,6 @@ impl ColumnLocator {
     }
 
     #[inline]
-    pub(crate) fn is_pk(&self) -> bool {
-        matches!(self, ColumnLocator::Pk { .. })
-    }
-
-    #[inline]
     pub(crate) fn type_code(&self) -> u8 {
         match *self {
             ColumnLocator::Pk { type_code, .. } | ColumnLocator::Payload { type_code, .. } => type_code,
@@ -719,6 +714,28 @@ impl ColumnLocator {
                 &mb.get_pk_bytes(row)[o..o + size as usize]
             }
             ColumnLocator::Payload { slot, size, .. } => mb.get_col_ptr(row, slot as usize, size as usize),
+        }
+    }
+
+    /// Native little-endian value bytes of the column in `row`: a payload
+    /// column verbatim, a PK column OPK-decoded into `scratch` (undoing the
+    /// big-endian sign-flipped at-rest form). The value-reading counterpart to
+    /// [`Self::bytes`] — every consumer that interprets a column's *value*
+    /// (aggregation, order-encoding, exemplar copies) must read through here so
+    /// a PK-source column can never be consumed in its at-rest byte order.
+    #[inline]
+    pub(crate) fn native_le_bytes<'a, 'b: 'a>(
+        &self,
+        mb: &impl RowView<'b>,
+        row: usize,
+        scratch: &'a mut [u8; 16],
+    ) -> &'a [u8] {
+        match *self {
+            ColumnLocator::Pk { size, type_code, .. } => {
+                *scratch = gnitz_wire::decode_pk_column_owned(self.bytes(mb, row), type_code);
+                &scratch[..size as usize]
+            }
+            ColumnLocator::Payload { .. } => self.bytes(mb, row),
         }
     }
 
@@ -1729,8 +1746,6 @@ mod tests {
             },
         );
         // Accessors agree with the variant fields.
-        assert!(s.locate(0).is_pk());
-        assert!(!s.locate(2).is_pk());
         assert_eq!(s.locate(2).size(), 8);
     }
 

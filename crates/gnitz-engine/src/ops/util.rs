@@ -221,12 +221,13 @@ pub(super) fn ieee_order_bits_f32_reverse(encoded: u64) -> u32 {
 }
 
 /// Order-preserving u64 encoding of a fixed-width aggregate value held in
-/// `bytes` (native little-endian). Shared by the payload and PK-column AVI
-/// paths so a PK aggregate column encodes identically to the same value in a
-/// payload column. `for_max` inverts the order so the cursor's ascending walk
-/// yields the maximum first. Width is ≤ 8 (F32 is 4); U128/UUID/String/Blob
-/// are excluded upstream by `agg_value_idx_eligible`, so the fallback arm is
-/// unreachable.
+/// `bytes` (native little-endian). A PK aggregate column's at-rest bytes are
+/// the OPK window (big-endian, sign-flipped) — callers read them through
+/// `ColumnLocator::native_le_bytes`, so a PK aggregate column encodes
+/// identically to the same value in a payload column. `for_max` inverts
+/// the order so the cursor's ascending walk yields the maximum first. Width is
+/// ≤ 8 (F32 is 4); U128/UUID/String/Blob are excluded upstream by
+/// `agg_value_idx_eligible`, so the fallback arm is unreachable.
 #[inline]
 pub(super) fn encode_ordered(bytes: &[u8], col_type_code: u8, for_max: bool) -> u64 {
     let val = match col_type_code {
@@ -404,35 +405,74 @@ pub(super) fn extract_group_key_cursor(cursor: &ReadCursor, schema: &SchemaDescr
     extract_group_key_row(cursor, schema, group_by_cols)
 }
 
+/// Which canonical (order-preserving) fast-path arm [`extract_group_key_row`]
+/// emits the group key of `group_by_cols` through, or `None` for the XXH3
+/// fold (multi-column, nullable, or non-routable type). `op_reduce` upgrades
+/// its `trace_out` retraction probe to the monotone `advance_to` exactly when
+/// this is `Some`: a canonical key ascends in group-visit order because the
+/// group comparator, the route-key encoding, and the OPK truncation to the
+/// output stride agree on one byte order — the agreement `op_reduce`'s debug
+/// tripwire and the monotone-probe tests pin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CanonicalKeyArm {
+    /// Single PK (sub-)column: key via `pk_route_key` over the OPK window.
+    Pk,
+    /// Single non-nullable routable-int payload column: key via
+    /// `payload_route_key`.
+    Payload,
+}
+
+#[inline]
+pub(super) fn single_col_canonical_group_key(
+    schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+) -> Option<CanonicalKeyArm> {
+    if group_by_cols.len() != 1 {
+        return None;
+    }
+    let c = group_by_cols[0] as usize;
+    if schema.is_pk_col(c) {
+        return Some(CanonicalKeyArm::Pk);
+    }
+    let col = &schema.columns[c];
+    (col.nullable == 0 && crate::schema::is_routable_int(col.type_code)).then_some(CanonicalKeyArm::Payload)
+}
+
 #[inline]
 fn extract_group_key_row<R: GroupKeyRow>(row: &R, schema: &SchemaDescriptor, group_by_cols: &[u32]) -> u128 {
-    // Single PK group column: the addressed column's canonical key (native for
-    // unsigned, sign-flipped for signed) via `pk_route_key` — identical to
+    // Canonical single-column fast path, dispatched by the shared
+    // `single_col_canonical_group_key` classifier (see its doc).
+    //
+    // Pk arm: the addressed column's canonical key (native for unsigned,
+    // sign-flipped for signed) via `pk_route_key` — identical to
     // `partition_for_pk_bytes` and `mb.get_pk(row)`, so a join key routes the
     // same whether it is a (sub-)PK column here or a single PK / payload FK on
-    // the join's other side. For a single-PK schema this equals `mb.get_pk(row)`.
-    if group_by_cols.len() == 1 && schema.is_pk_col(group_by_cols[0] as usize) {
-        let c_idx = group_by_cols[0] as usize;
-        let off = schema.pk_byte_offset(c_idx) as usize;
-        let cs = schema.columns[c_idx].size() as usize;
-        return crate::schema::pk_route_key(row.pk_bytes(), off, cs);
-    }
-
-    if group_by_cols.len() == 1 {
+    // the join's other side. For a single-PK schema this equals
+    // `mb.get_pk(row)`.
+    //
+    // Payload arm: a value routes to the same partition whether it is the PK on
+    // one side of a join (OPK bytes, widened) or a payload FK column on the
+    // other: `payload_route_key` OPK-encodes+widens to the canonical value
+    // (sign-flipped for signed), matching the PK side. Nullable columns (the
+    // hash loop handles NULL distinctly) and STRING/BLOB/F32/F64 fall through
+    // to the hash loop — a zero-extended content prefix is not a valid routing
+    // key for them.
+    if let Some(arm) = single_col_canonical_group_key(schema, group_by_cols) {
         let c_idx = group_by_cols[0] as usize;
         let col = &schema.columns[c_idx];
-        let tc = col.type_code;
-        // Skip fast path for nullable — the hash loop handles NULL distinctly.
-        // A value routes to the same partition whether it is the PK on one side
-        // of a join (OPK bytes, widened above) or a payload FK column on the
-        // other: `payload_route_key` OPK-encodes+widens to the canonical value
-        // (sign-flipped for signed), matching the PK side. STRING/BLOB/F32/F64
-        // fall through to the hash loop — a zero-extended content prefix is not
-        // a valid routing key for them.
-        if col.nullable == 0 && crate::schema::is_routable_int(tc) {
-            let cs = col.size() as usize;
-            if let Some(b) = row.payload_bytes(schema, c_idx, cs) {
-                return crate::schema::payload_route_key(b, 0, cs, tc);
+        let cs = col.size() as usize;
+        match arm {
+            CanonicalKeyArm::Pk => {
+                let off = schema.pk_byte_offset(c_idx) as usize;
+                return crate::schema::pk_route_key(row.pk_bytes(), off, cs);
+            }
+            CanonicalKeyArm::Payload => {
+                // `payload_bytes == None` (a cursor-impl invariant violation
+                // only, never on the `MemBatch` path) falls through to the
+                // fold's NULL-marker hash.
+                if let Some(b) = row.payload_bytes(schema, c_idx, cs) {
+                    return crate::schema::payload_route_key(b, 0, cs, col.type_code);
+                }
             }
         }
     }

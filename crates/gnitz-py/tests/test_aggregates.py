@@ -423,6 +423,101 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_pk_source_min_group_by_full_pk(self, client):
+        """The aggregate source is a PRIMARY KEY column: `SELECT a, b, MIN(b) ...
+        GROUP BY a, b` over PK (a, b). Each (a, b) is its own group so MIN(b) is
+        just b — but the value-index population must OPK-decode b's at-rest bytes
+        before order-encoding, or the round-tripped MIN(b) is byte-swapped (256 ->
+        1). b straddles the high byte and the sign."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (a, b))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, b, MIN(b) AS mb FROM t GROUP BY a, b",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # b straddles the high byte (1=0x0001 and 256=0x0100 are byte-swap
+            # twins) and the sign (-5); MIN(b) must round-trip to b for every row.
+            rows = [(1, 1), (1, 256), (1, 100), (2, 65536), (2, -5), (2, 300)]
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ", ".join(f"({a}, {b})" for a, b in rows),
+                schema_name=sn,
+            )
+            got = {(r["a"], r["b"]): r["mb"] for r in client.scan(vid) if r.weight > 0}
+            assert len(got) == len(rows), f"expected {len(rows)} groups, got {got}"
+            for a, b in rows:
+                assert got[(a, b)] == b, f"MIN(b) for ({a},{b}) must round-trip to {b}, got {got[(a, b)]}"
+
+            # Delete the row at a byte-swap-sensitive value: its group vanishes,
+            # the others are untouched.
+            client.execute_sql("DELETE FROM t WHERE a = 1 AND b = 256", schema_name=sn)
+            got = {(r["a"], r["b"]): r["mb"] for r in client.scan(vid) if r.weight > 0}
+            assert (1, 256) not in got, "deleted group must vanish"
+            assert got[(1, 1)] == 1 and got[(2, 65536)] == 65536, got
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_pk_source_min_max_group_by_partial_pk(self, client):
+        """MIN/MAX over a PRIMARY KEY column with multi-row groups: `SELECT a,
+        MIN(b), MAX(b) ... GROUP BY a` over PK (a, b). A group holds several `b`
+        that straddle the high byte, so the value index must OPK-decode `b` to keep
+        its order — else the extreme walk (and its retract-at-extreme recovery)
+        selects a byte-swapped value."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (a, b))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, MIN(b) AS lo, MAX(b) AS hi FROM t GROUP BY a",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # Group 100: b straddles the high byte {1, 256, 100, 65536} (MIN=1,
+            # MAX=65536). Group 300: negatives {-5, 4, 10} (MIN=-5, MAX=10).
+            groups = {100: [1, 256, 100, 65536], 300: [-5, 4, 10]}
+            rows = [(a, b) for a, bs in groups.items() for b in bs]
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ", ".join(f"({a}, {b})" for a, b in rows),
+                schema_name=sn,
+            )
+            by_a = {r["a"]: r for r in client.scan(vid) if r.weight > 0}
+            assert by_a[100]["lo"] == 1 and by_a[100]["hi"] == 65536, by_a
+            assert by_a[300]["lo"] == -5 and by_a[300]["hi"] == 10, by_a
+
+            # Delete group 100's MAX holder (b=65536) → MAX falls to 256 (the
+            # byte-swap twin of 1: order must survive the decode).
+            client.execute_sql("DELETE FROM t WHERE a = 100 AND b = 65536", schema_name=sn)
+            by_a = {r["a"]: r for r in client.scan(vid) if r.weight > 0}
+            assert by_a[100]["lo"] == 1 and by_a[100]["hi"] == 256, by_a
+
+            # Delete group 100's MIN holder (b=1) → MIN rises to 100.
+            client.execute_sql("DELETE FROM t WHERE a = 100 AND b = 1", schema_name=sn)
+            by_a = {r["a"]: r for r in client.scan(vid) if r.weight > 0}
+            assert by_a[100]["lo"] == 100 and by_a[100]["hi"] == 256, by_a
+
+            # Delete group 300's MIN holder (b=-5) → MIN rises to 4.
+            client.execute_sql("DELETE FROM t WHERE a = 300 AND b = -5", schema_name=sn)
+            by_a = {r["a"]: r for r in client.scan(vid) if r.weight > 0}
+            assert by_a[300]["lo"] == 4 and by_a[300]["hi"] == 10, by_a
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_having(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)
