@@ -268,14 +268,14 @@ pub struct RecvFuture {
 }
 
 impl Future for RecvFuture {
-    type Output = Option<(*mut u8, usize)>;
+    type Output = Option<io::RecvBuf>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let taken = {
             let mut map = self.inner.pending_recv.borrow_mut();
             map.get_mut(&self.fd).and_then(|q| q.pop_front())
         };
-        if let Some((ptr, len)) = taken {
-            return Poll::Ready(Some((ptr, len)));
+        if let Some(buf) = taken {
+            return Poll::Ready(Some(buf));
         }
         if self.inner.recv_closed.borrow().get(&self.fd).copied().unwrap_or(false) {
             return Poll::Ready(None);
@@ -298,6 +298,11 @@ impl Drop for RecvFuture {
 pub(super) enum SendAlive {
     Pooled(Rc<crate::storage::batch_pool::PooledSendBuf>),
     Slot(Rc<W2mSlot>),
+    /// One-shot UDP SENDMSG op: keeps the msghdr/iovec/sockaddr/payload the
+    /// kernel reads alive until the CQE. `Rc`, not `Box`, because the op is
+    /// self-referential (msghdr points at sibling fields) and moving an `Rc`
+    /// handle never retags or relocates the pointee.
+    UdpOp(Rc<udp::UdpSendOp>),
     /// The backing memory lives `'static` (e.g. the precomputed HELLO
     /// ACK), so no liveness tracking is required — the kernel pointer
     /// remains valid for the lifetime of the process.
@@ -309,6 +314,7 @@ impl Clone for SendAlive {
         match self {
             SendAlive::Pooled(rc) => SendAlive::Pooled(Rc::clone(rc)),
             SendAlive::Slot(rc) => SendAlive::Slot(Rc::clone(rc)),
+            SendAlive::UdpOp(rc) => SendAlive::UdpOp(Rc::clone(rc)),
             SendAlive::Static => SendAlive::Static,
         }
     }

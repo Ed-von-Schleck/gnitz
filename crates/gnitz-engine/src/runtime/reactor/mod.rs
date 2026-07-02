@@ -61,6 +61,7 @@ pub mod io;
 mod ring;
 mod runloop;
 pub mod sync;
+mod udp;
 mod uring;
 
 #[cfg(test)]
@@ -69,6 +70,7 @@ use futures::{FsyncFuture, ScanSlotFuture, SendAlive, TimerFuture};
 pub(crate) use futures::{ReplyFuture, ScanLease};
 
 pub use exchange::{ExchangeAccumulator, PendingRelay};
+pub use io::RecvBuf;
 #[cfg(test)]
 pub use sync::join2;
 pub use sync::{join_all_unpin, join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either};
@@ -85,6 +87,16 @@ pub const KIND_ACCEPT: u64 = 5;
 pub const KIND_RECV: u64 = 6;
 pub const KIND_SEND: u64 = 7;
 pub const KIND_FUTEX_CANCEL: u64 = 8;
+/// One-shot RECVMSG on a UDP socket. (UDP *sends* need no kind of their
+/// own: their ids come from the stream-send counter and their CQEs land on
+/// `KIND_SEND`.)
+pub const KIND_UDP_RECV: u64 = 9;
+/// CQE tag for the `AsyncCancel` a dropped `UdpRecvFuture` submits against
+/// its RECVMSG. A dedicated tag (not `KIND_FUTEX_CANCEL`, whose handler sets
+/// `futex_waitv_cancelled`) so a UDP recv cancellation never disturbs the
+/// FUTEX_WAITV shutdown handshake. The dispatch arm is a pure no-op — the
+/// cancellation's *effect* is observed on the RECVMSG's own CQE.
+pub const KIND_UDP_CANCEL: u64 = 10;
 
 const KIND_SHIFT: u64 = 56;
 const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
@@ -114,6 +126,13 @@ struct Task {
 }
 
 struct ReactorShared {
+    /// SAFETY INVARIANT: `ring` MUST be the first declared field. Rust drops
+    /// fields in declaration order; dropping `ring` closes the io_uring fd,
+    /// whose kernel-side teardown cancels all in-flight SQEs and drops the
+    /// kernel's references to userspace buffers. Only then is it safe to free
+    /// the buffers those SQEs pointed at — `udp_recv_ops`,
+    /// `send_buffers_in_flight`, `conns`. Moving `ring` below any of them is a
+    /// use-after-free at shutdown.
     ring: RefCell<IoUringRing>,
     /// Live tasks keyed by a monotonically-increasing id. HashMap (not
     /// `slab::Slab`) because same-key reinsertion is load-bearing: a
@@ -192,7 +211,7 @@ struct ReactorShared {
     /// pipelined clients deadlock once the kernel socket buffer fills
     /// (we can only drain messages one-at-a-time from the handler,
     /// while the kernel blocks the client's send).
-    pending_recv: RefCell<FxHashMap<i32, std::collections::VecDeque<(*mut u8, usize)>>>,
+    pending_recv: RefCell<FxHashMap<i32, std::collections::VecDeque<io::RecvBuf>>>,
     /// Closed-fd sentinel: set to true when a recv CQE arrived with
     /// res<=0 or the connection was forcibly closed. A subsequent
     /// `recv()` returns `None`.
@@ -216,6 +235,20 @@ struct ReactorShared {
     /// come from different counters — a shared set would let a cancelled
     /// send id wrongly tombstone a live fsync of the same numeric value.
     cancelled_sends: RefCell<FxHashSet<u64>>,
+    /// In-flight UDP recv op storage, keyed by udata id. Removed (and freed)
+    /// unconditionally when the CQE drains — the kernel is done with the
+    /// pointers at that moment, awaiter alive or not. (UDP *send* ops need no
+    /// map: they ride `SendAlive::UdpOp` through the stream-send machinery.)
+    udp_recv_ops: RefCell<FxHashMap<u64, Box<udp::UdpRecvOp>>>,
+    udp_recv_wakers: RefCell<FxHashMap<u64, Waker>>,
+    parked_udp_recv: RefCell<FxHashMap<u64, Result<udp::UdpDatagram, i32>>>,
+    /// Recv ids whose future was dropped while its RECVMSG was still armed.
+    /// `UdpRecvFuture::drop` submits an `AsyncCancel` for the SQE (so it cannot
+    /// linger and consume a later datagram) and records the id here; the
+    /// `KIND_UDP_RECV` handler consults it and frees the op box + drops the
+    /// result — whether the CQE is the `-ECANCELED` from the cancel or a
+    /// datagram that raced it. Empty on the steady-state path.
+    cancelled_udp_recvs: RefCell<FxHashSet<u64>>,
     /// Shutdown flag. `block_until_shutdown` polls until this is set.
     shutdown: Cell<bool>,
     /// FLAG_EXCHANGE accumulator: when route_reply sees an exchange wire,
@@ -349,6 +382,10 @@ impl Reactor {
             send_buffers_in_flight: RefCell::new(FxHashMap::default()),
             parked_send_results: RefCell::new(FxHashMap::default()),
             cancelled_sends: RefCell::new(FxHashSet::default()),
+            udp_recv_ops: RefCell::new(FxHashMap::default()),
+            udp_recv_wakers: RefCell::new(FxHashMap::default()),
+            parked_udp_recv: RefCell::new(FxHashMap::default()),
+            cancelled_udp_recvs: RefCell::new(FxHashSet::default()),
             shutdown: Cell::new(false),
             exchange_acc: RefCell::new(ExchangeAccumulator::new(0)),
             relay_tx: RefCell::new(None),
@@ -841,7 +878,11 @@ impl Reactor {
             KIND_SEND => {
                 // Buffer / inflight / fd cleanup is unconditional — the kernel
                 // is done with the pointer regardless of whether the awaiter is
-                // still alive.
+                // still alive. UDP datagram sends land here too (same id
+                // counter, `SendAlive::UdpOp` keep-alive): for them the fd
+                // lookup is an absent-key no-op and the
+                // `send_buffers_in_flight` remove reclaims a dropped future's
+                // op box.
                 let fd = self.inner.send_fd_for_id.borrow_mut().remove(&id);
                 if let Some(fd) = fd {
                     if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&fd) {
@@ -864,6 +905,12 @@ impl Reactor {
                         w.wake();
                     }
                 }
+            }
+            KIND_UDP_RECV => self.handle_udp_recv_cqe(id, &cqe),
+            KIND_UDP_CANCEL => {
+                // The AsyncCancel's own CQE. The cancellation's *effect*
+                // arrives separately as the RECVMSG's -ECANCELED under
+                // KIND_UDP_RECV (same split as the FUTEX_WAITV cancel pair).
             }
             _ => {}
         }

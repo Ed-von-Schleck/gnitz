@@ -15,7 +15,7 @@ mod orchestration;
 mod protocol;
 mod reactor;
 
-use orchestration::{committer, executor, master, worker};
+use orchestration::{committer, executor, master, peer, worker};
 use protocol::{sal, w2m, w2m_ring, wire};
 
 pub use bootstrap::server_main;

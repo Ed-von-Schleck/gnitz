@@ -102,6 +102,22 @@ impl Ring for IoUringRing {
         }
     }
 
+    fn prep_sendmsg(&mut self, fd: i32, msg: *const libc::msghdr, user_data: u64) {
+        self.ensure_sq_room();
+        let entry = opcode::SendMsg::new(types::Fd(fd), msg).build().user_data(user_data);
+        unsafe {
+            self.ring.submission().push(&entry).unwrap();
+        }
+    }
+
+    fn prep_recvmsg(&mut self, fd: i32, msg: *mut libc::msghdr, user_data: u64) {
+        self.ensure_sq_room();
+        let entry = opcode::RecvMsg::new(types::Fd(fd), msg).build().user_data(user_data);
+        unsafe {
+            self.ring.submission().push(&entry).unwrap();
+        }
+    }
+
     fn submit_and_wait_timeout(&mut self, min_complete: u32, timeout_ms: i32) -> Result<i32, i32> {
         let pending = self.ring.submission().len();
 

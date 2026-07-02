@@ -209,6 +209,123 @@ pub fn server_create(path: &str) -> i32 {
     }
 }
 
+/// Create + bind a UDP socket on `addr`. Requests `rcvbuf_bytes` /
+/// `sndbuf_bytes` via SO_RCVBUF/SO_SNDBUF (best-effort; the kernel may
+/// clamp). Returns the fd, or a negative value on error (same convention
+/// as `server_create`).
+///
+/// The socket is left unconnected — every send carries an explicit
+/// destination — and blocking (O_NONBLOCK is irrelevant under io_uring).
+#[allow(dead_code)] // test-only until the network transport binds its QUIC socket
+pub fn udp_bind(addr: std::net::SocketAddr, rcvbuf_bytes: usize, sndbuf_bytes: usize) -> i32 {
+    let family = match addr {
+        std::net::SocketAddr::V4(_) => libc::AF_INET,
+        std::net::SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    unsafe {
+        let fd = libc::socket(family, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return -1;
+        }
+        if !set_sock_buf(fd, libc::SO_RCVBUF, rcvbuf_bytes) {
+            libc::close(fd);
+            return -2;
+        }
+        if !set_sock_buf(fd, libc::SO_SNDBUF, sndbuf_bytes) {
+            libc::close(fd);
+            return -3;
+        }
+        let (ss, len) = sockaddr_from_addr(&addr);
+        if libc::bind(fd, &ss as *const libc::sockaddr_storage as *const libc::sockaddr, len) < 0 {
+            libc::close(fd);
+            return -4;
+        }
+        fd
+    }
+}
+
+/// Set a socket buffer-size option (SO_RCVBUF / SO_SNDBUF). These options
+/// take a *const c_int (4 bytes); passing a pointer to `usize` would hand
+/// the kernel 4 of its 8 bytes — correct only by luck on little-endian.
+/// Copy into a c_int and point at that.
+unsafe fn set_sock_buf(fd: i32, opt: libc::c_int, bytes: usize) -> bool {
+    let v = bytes as libc::c_int;
+    libc::setsockopt(
+        fd,
+        libc::SOL_SOCKET,
+        opt,
+        &v as *const libc::c_int as *const libc::c_void,
+        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+    ) >= 0
+}
+
+/// getsockname() as a SocketAddr — resolves the real port after a
+/// port-0 bind. Returns None on error or non-INET family.
+#[allow(dead_code)] // test-only until the network transport binds its QUIC socket
+pub fn udp_local_addr(fd: i32) -> Option<std::net::SocketAddr> {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe { libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) };
+    if rc < 0 {
+        return None;
+    }
+    addr_from_sockaddr(&ss)
+}
+
+/// SocketAddr → (sockaddr_storage, socklen_t). Zero-pads the storage and
+/// preserves the IPv6 flowinfo/scope_id so link-local destinations route
+/// (without a scope id the kernel rejects an `fe80::` send with EINVAL).
+pub fn sockaddr_from_addr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        std::net::SocketAddr::V4(a) => {
+            let sin = unsafe { &mut *(&mut ss as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = a.port().to_be();
+            // octets() are already network order; from_ne_bytes keeps the
+            // in-memory byte order intact on both endiannesses.
+            sin.sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
+            (ss, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+        }
+        std::net::SocketAddr::V6(a) => {
+            let sin6 = unsafe { &mut *(&mut ss as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = a.port().to_be();
+            sin6.sin6_flowinfo = a.flowinfo();
+            sin6.sin6_addr.s6_addr = a.ip().octets();
+            sin6.sin6_scope_id = a.scope_id();
+            (ss, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+        }
+    }
+}
+
+/// sockaddr_storage → SocketAddr, discriminated by `ss_family` alone.
+/// None for non-AF_INET/AF_INET6. Preserves IPv6 flowinfo/scope_id so a
+/// reply to a received `src` reaches a link-local peer.
+pub fn addr_from_sockaddr(ss: &libc::sockaddr_storage) -> Option<std::net::SocketAddr> {
+    match ss.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let sin = unsafe { &*(ss as *const _ as *const libc::sockaddr_in) };
+            let ip = std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+            Some(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                ip,
+                u16::from_be(sin.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            let sin6 = unsafe { &*(ss as *const _ as *const libc::sockaddr_in6) };
+            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            Some(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                ip,
+                u16::from_be(sin6.sin6_port),
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
 /// Raise RLIMIT_NOFILE soft limit to `target` (capped by hard limit).
 /// Returns the new soft limit, or -1 on failure.
 pub fn raise_fd_limit(target: u64) -> i64 {
@@ -330,6 +447,60 @@ mod tests {
         assert!(long_path.len() >= 108);
         let fd = server_create(&long_path);
         assert!(fd < 0, "expected error for overlong path, got fd={fd}");
+    }
+
+    #[test]
+    fn test_sockaddr_roundtrip_v4() {
+        let addr: std::net::SocketAddr = "192.168.7.13:5432".parse().unwrap();
+        let (ss, len) = sockaddr_from_addr(&addr);
+        assert_eq!(len as usize, std::mem::size_of::<libc::sockaddr_in>());
+        assert_eq!(addr_from_sockaddr(&ss), Some(addr));
+    }
+
+    #[test]
+    fn test_sockaddr_roundtrip_v6() {
+        // flowinfo + scope_id must survive the round-trip (link-local replies).
+        let addr = std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1234:5678".parse().unwrap(),
+            9999,
+            7,
+            3,
+        ));
+        let (ss, len) = sockaddr_from_addr(&addr);
+        assert_eq!(len as usize, std::mem::size_of::<libc::sockaddr_in6>());
+        assert_eq!(addr_from_sockaddr(&ss), Some(addr));
+    }
+
+    #[test]
+    fn test_addr_from_sockaddr_unknown_family() {
+        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        ss.ss_family = libc::AF_UNIX as libc::sa_family_t;
+        assert_eq!(addr_from_sockaddr(&ss), None);
+    }
+
+    #[test]
+    fn test_udp_bind_resolves_port() {
+        let fd = udp_bind("127.0.0.1:0".parse().unwrap(), 1 << 20, 1 << 20);
+        assert!(fd >= 0, "udp_bind failed: {fd}");
+        let local = udp_local_addr(fd).expect("udp_local_addr");
+        assert!(local.is_ipv4());
+        assert_eq!(local.ip().to_string(), "127.0.0.1");
+        assert_ne!(local.port(), 0, "port-0 bind must resolve to a real port");
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn test_udp_bind_v6() {
+        let fd = udp_bind("[::1]:0".parse().unwrap(), 1 << 20, 1 << 20);
+        assert!(fd >= 0, "udp_bind v6 failed: {fd}");
+        let local = udp_local_addr(fd).expect("udp_local_addr");
+        assert!(local.is_ipv6());
+        assert_ne!(local.port(), 0);
+        unsafe {
+            libc::close(fd);
+        }
     }
 
     #[test]

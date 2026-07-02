@@ -28,6 +28,7 @@ use crate::catalog::{
 use crate::foundation::posix_io::guard_panic;
 use crate::runtime::committer::{self, CommitRequest};
 use crate::runtime::master::{first_worker_error_opt, MasterDispatcher};
+use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
     join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, PendingRelay, Reactor, ReplyFuture,
 };
@@ -273,69 +274,48 @@ async fn accept_loop(shared: Rc<Shared>) {
             continue;
         }
         shared.reactor.register_conn(fd);
+        let peer = Peer::unix(fd, Rc::clone(&shared.reactor));
         let s = Rc::clone(&shared);
-        shared.reactor.spawn(connection_loop(fd, s));
+        shared.reactor.spawn(connection_loop(peer, s));
     }
 }
 
 enum HelloOutcome {
     /// Connection accepted; optionally bound to an authenticated client_id.
     Pass(Option<u64>),
-    /// Caller must close the fd.
+    /// Caller must close the connection.
     Reject,
 }
 
-/// RAII guard that frees a reactor-allocated receive buffer on any exit path,
-/// including when the enclosing task future is dropped at an `.await` suspension
-/// point (e.g. server shutdown). A bare `libc::free` after `.await` would leak.
-struct MallocGuard(*mut u8);
-impl Drop for MallocGuard {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                libc::free(self.0 as *mut libc::c_void);
+async fn connection_loop(peer: Peer, shared: Rc<Shared>) {
+    let bound_client_id = match peer.recv().await {
+        Some(buf) => match run_hello_handshake(&peer, buf.as_slice()).await {
+            HelloOutcome::Pass(b) => b,
+            HelloOutcome::Reject => {
+                peer.close();
+                return;
             }
-        }
-    }
-}
-
-async fn connection_loop(fd: i32, shared: Rc<Shared>) {
-    let bound_client_id = match shared.reactor.recv(fd).await {
-        Some((ptr, len)) => {
-            let _guard = MallocGuard(ptr);
-            let outcome = run_hello_handshake(fd, &shared, ptr, len).await;
-            match outcome {
-                HelloOutcome::Pass(b) => b,
-                HelloOutcome::Reject => {
-                    shared.reactor.close_fd(fd);
-                    return;
-                }
-            }
-        }
+        },
         None => {
-            shared.reactor.close_fd(fd);
+            peer.close();
             return;
         }
     };
 
     loop {
-        let (ptr, len) = match shared.reactor.recv(fd).await {
+        let buf = match peer.recv().await {
             Some(v) => v,
             None => break,
         };
-        let _guard = MallocGuard(ptr); // freed on any exit path including cancellation
-        let data = unsafe { std::slice::from_raw_parts(ptr, len) };
-        handle_message(fd, data, &shared, bound_client_id).await;
+        handle_message(&peer, buf.as_slice(), &shared, bound_client_id).await;
     }
-    shared.reactor.close_fd(fd);
+    peer.close();
 }
 
 /// Validate a HELLO frame, elevate the connection's payload limit, and
 /// reply with the symmetric ACK. See `Reactor::set_max_payload_len` for
 /// why the limit must be raised before any `.await` here.
-async fn run_hello_handshake(fd: i32, shared: &Rc<Shared>, ptr: *mut u8, len: usize) -> HelloOutcome {
-    let data = unsafe { std::slice::from_raw_parts(ptr, len) };
-
+async fn run_hello_handshake(peer: &Peer, data: &[u8]) -> HelloOutcome {
     // `decode_hello_payload` validates the 8-byte length; the magic
     // check below is defence-in-depth on top of the pre-handshake recv
     // ceiling that already excludes non-HELLO first frames.
@@ -353,7 +333,7 @@ async fn run_hello_handshake(fd: i32, shared: &Rc<Shared>, ptr: *mut u8, len: us
             "unsupported wire version: peer={}, server={}",
             hello.version, server_version,
         );
-        send_error(shared, fd, 0, 0, msg.as_bytes()).await;
+        send_error(peer, 0, 0, msg.as_bytes()).await;
         return HelloOutcome::Reject;
     }
 
@@ -361,11 +341,9 @@ async fn run_hello_handshake(fd: i32, shared: &Rc<Shared>, ptr: *mut u8, len: us
     // wired today; future auth hooks would set `bound_client_id` here.
     let bound_client_id: Option<u64> = None;
 
-    shared
-        .reactor
-        .set_max_payload_len(fd, gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
+    peer.set_max_payload_len(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
 
-    let rc = shared.reactor.send_hello_ack(fd).await;
+    let rc = peer.send_hello_ack().await;
     if rc < 0 {
         return HelloOutcome::Reject;
     }
@@ -646,7 +624,7 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
 // Message dispatch
 // ---------------------------------------------------------------------------
 
-async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_id: Option<u64>) {
+async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_client_id: Option<u64>) {
     // Routing fast path: read (target_id, client_id) directly from the
     // control block's directory without allocating or running the full
     // decode. The auth check below uses the same parse the schema-hint
@@ -656,7 +634,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         Ok(v) => v,
         Err(e) => {
             let msg = format!("decode error: {e}");
-            send_error(shared, fd, 0, 0, msg.as_bytes()).await;
+            send_error(peer, 0, 0, msg.as_bytes()).await;
             return;
         }
     };
@@ -665,8 +643,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
             // Reject before any heap-allocating decode path. A forged
             // client_id never reaches Batch::decode_from_wal_block.
             send_error(
-                shared,
-                fd,
+                peer,
                 peeked_target_id as i64,
                 bound,
                 b"client_id not bound to this connection",
@@ -683,7 +660,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
             Ok(c) => c,
             Err(e) => {
                 let msg = format!("decode error: {e}");
-                send_error(shared, fd, 0, 0, msg.as_bytes()).await;
+                send_error(peer, 0, 0, msg.as_bytes()).await;
                 return;
             }
         };
@@ -693,8 +670,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
             let client_version = ipc::wire_flags_get_schema_version(ctrl.flags);
             if client_version == 0 {
                 send_error(
-                    shared,
-                    fd,
+                    peer,
                     ctrl.target_id as i64,
                     ctrl.client_id,
                     b"FLAG_HAS_DATA without FLAG_HAS_SCHEMA",
@@ -704,14 +680,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
             }
             let server_version = shared.cat().get_schema_version(ctrl.target_id as i64);
             if client_version != server_version {
-                send_control_only(
-                    shared,
-                    fd,
-                    ctrl.target_id as i64,
-                    ctrl.client_id,
-                    STATUS_SCHEMA_MISMATCH,
-                )
-                .await;
+                send_control_only(peer, ctrl.target_id as i64, ctrl.client_id, STATUS_SCHEMA_MISMATCH).await;
                 return;
             }
             let catalog_schema = shared.get_schema_desc(ctrl.target_id as i64);
@@ -723,7 +692,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
                 Ok(d) => d,
                 Err(e) => {
                     let msg = format!("decode error: {e}");
-                    send_error(shared, fd, ctrl.target_id as i64, ctrl.client_id, msg.as_bytes()).await;
+                    send_error(peer, ctrl.target_id as i64, ctrl.client_id, msg.as_bytes()).await;
                     return;
                 }
             }
@@ -732,7 +701,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
                 Ok(d) => d,
                 Err(e) => {
                     let msg = format!("decode error: {e}");
-                    send_error(shared, fd, 0, 0, msg.as_bytes()).await;
+                    send_error(peer, 0, 0, msg.as_bytes()).await;
                     return;
                 }
             }
@@ -762,7 +731,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
     // bundle from the raw frame (the generic `decode_wire` above sees no data
     // block and yields control-only, which is unused for this route).
     if flags & gnitz_wire::FLAG_DDL_TXN != 0 {
-        handle_ddl_txn(shared, fd, client_id, data, client_version).await;
+        handle_ddl_txn(shared, peer, client_id, data, client_version).await;
         return;
     }
 
@@ -773,7 +742,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         let seq_id = target_id; // = table_id
         let count = decoded.control.seek_col_idx.max(1) as i64;
         let base = commit_serial_range_durable(shared, seq_id, count).await;
-        send_alloc(shared, fd, base, client_id).await;
+        send_alloc(peer, base, client_id).await;
         return;
     }
 
@@ -782,19 +751,19 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         if flags & FLAG_ALLOCATE_TABLE_ID != 0 {
             let new_id = shared.cat().allocate_table_id();
             shared.cat().advance_sequence(SEQ_ID_TABLES, new_id - 1, new_id);
-            send_alloc(shared, fd, new_id, client_id).await;
+            send_alloc(peer, new_id, client_id).await;
             return;
         }
         if flags & FLAG_ALLOCATE_SCHEMA_ID != 0 {
             let new_id = shared.cat().allocate_schema_id();
             shared.cat().advance_sequence(SEQ_ID_SCHEMAS, new_id - 1, new_id);
-            send_alloc(shared, fd, new_id, client_id).await;
+            send_alloc(peer, new_id, client_id).await;
             return;
         }
         if flags & FLAG_ALLOCATE_INDEX_ID != 0 {
             let new_id = shared.cat().allocate_index_id();
             shared.cat().advance_sequence(SEQ_ID_INDICES, new_id - 1, new_id);
-            send_alloc(shared, fd, new_id, client_id).await;
+            send_alloc(peer, new_id, client_id).await;
             return;
         }
     }
@@ -807,7 +776,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         let _g = shared.catalog_rwlock.read().await;
         handle_seek(
             shared,
-            fd,
+            peer,
             client_id,
             target_id,
             decoded.control.seek_pk,
@@ -821,7 +790,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         let _g = shared.catalog_rwlock.read().await;
         handle_seek_by_index(
             shared,
-            fd,
+            peer,
             client_id,
             target_id,
             decoded.control.seek_col_idx, // pack_pk_cols(col_indices)
@@ -836,7 +805,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         let _g = shared.catalog_rwlock.read().await;
         handle_seek_by_index_range(
             shared,
-            fd,
+            peer,
             client_id,
             target_id,
             decoded.control.seek_col_idx,   // pack_pk_cols(col_indices)
@@ -855,7 +824,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         let _g = shared.catalog_rwlock.read().await;
         handle_get_indices(
             shared,
-            fd,
+            peer,
             client_id,
             target_id,
             ipc::wire_flags_get_index_version(flags),
@@ -865,7 +834,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
     }
 
     if target_id >= FIRST_USER_TABLE_ID && (!has_batch || batch_count == 0) {
-        handle_scan(shared, fd, client_id, target_id, client_version).await;
+        handle_scan(shared, peer, client_id, target_id, client_version).await;
         return;
     }
 
@@ -874,7 +843,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         if let Some(ref wire_schema) = decoded.schema {
             let expected = shared.get_schema_desc(target_id);
             if let Err(e) = validate_schema_match(wire_schema, &expected) {
-                send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
+                send_error(peer, target_id, client_id, e.as_bytes()).await;
                 return;
             }
         }
@@ -888,7 +857,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         let _cat = shared.catalog_rwlock.read().await;
         if !shared.cat().has_id(target_id) {
             let msg = format!("table {target_id} not found");
-            send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+            send_error(peer, target_id, client_id, msg.as_bytes()).await;
             return;
         }
         // Acquire all FK-related table locks in ascending tid order.
@@ -906,7 +875,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         if let Err(e) = guard_panic("validate", || unsafe {
             (*cat_ptr_raw).validate_unique_indices(target_id, &batch)
         }) {
-            send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
+            send_error(peer, target_id, client_id, e.as_bytes()).await;
             return;
         }
         // Distributed validation (FK / unique indices + UPSERT).
@@ -920,7 +889,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         )
         .await
         {
-            send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
+            send_error(peer, target_id, client_id, e.as_bytes()).await;
             return;
         }
 
@@ -935,13 +904,13 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
         let commit_result = rx.await;
         match commit_result {
             Ok(Ok(lsn)) => {
-                send_ok_response(shared, fd, target_id, None, client_id, lsn as u128, client_version).await;
+                send_ok_response(shared, peer, target_id, None, client_id, lsn as u128, client_version).await;
             }
             Ok(Err(e)) => {
-                send_error(shared, fd, target_id, client_id, e.as_bytes()).await;
+                send_error(peer, target_id, client_id, e.as_bytes()).await;
             }
             Err(_) => {
-                send_error(shared, fd, target_id, client_id, b"committer shut down").await;
+                send_error(peer, target_id, client_id, b"committer shut down").await;
             }
         }
         return;
@@ -949,7 +918,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
 
     // ---------- System-table DML (catalog + optional DDL broadcast) ----------
     if target_id < FIRST_USER_TABLE_ID {
-        handle_system_scan(shared, fd, client_id, target_id, decoded, client_version).await;
+        handle_system_scan(shared, peer, client_id, target_id, decoded, client_version).await;
     }
 
     // Fallthrough: ignore (should not happen).
@@ -957,7 +926,7 @@ async fn handle_message(fd: i32, data: &[u8], shared: &Rc<Shared>, bound_client_
 
 async fn handle_seek(
     shared: &Rc<Shared>,
-    fd: i32,
+    peer: &Peer,
     client_id: u64,
     target_id: i64,
     pk: u128,
@@ -966,7 +935,7 @@ async fn handle_seek(
 ) {
     if !shared.cat().has_id(target_id) {
         let msg = format!("table {target_id} not found");
-        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+        send_error(peer, target_id, client_id, msg.as_bytes()).await;
         return;
     }
     if target_id >= FIRST_USER_TABLE_ID {
@@ -980,13 +949,13 @@ async fn handle_seek(
         )
         .await
         {
-            Ok(slot) => shared.reactor.send_slot_or_close(fd, slot).await,
-            Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+            Ok(slot) => peer.send_slot_or_close(slot).await,
+            Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
         }
     } else {
         match unsafe { (*shared.catalog).seek_family(target_id, pk, seek_pk_extra) } {
-            Ok(batch) => send_ok_response(shared, fd, target_id, batch.as_ref(), client_id, pk, client_version).await,
-            Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+            Ok(batch) => send_ok_response(shared, peer, target_id, batch.as_ref(), client_id, pk, client_version).await,
+            Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
         }
     }
 }
@@ -1014,7 +983,7 @@ fn validated_index_cols(
 #[allow(clippy::too_many_arguments)]
 async fn handle_seek_by_index(
     shared: &Rc<Shared>,
-    fd: i32,
+    peer: &Peer,
     client_id: u64,
     target_id: i64,
     seek_col_idx: u64,
@@ -1024,14 +993,14 @@ async fn handle_seek_by_index(
 ) {
     if !shared.cat().has_id(target_id) {
         let msg = format!("table {target_id} not found");
-        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+        send_error(peer, target_id, client_id, msg.as_bytes()).await;
         return;
     }
     if target_id >= FIRST_USER_TABLE_ID {
         let cols = match validated_index_cols(shared, target_id, seek_col_idx, "seek_by_index") {
             Ok(cols) => cols,
             Err(msg) => {
-                send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+                send_error(peer, target_id, client_id, msg.as_bytes()).await;
                 return;
             }
         };
@@ -1049,7 +1018,7 @@ async fn handle_seek_by_index(
                 // control-only status, caught here with zero worker dispatch, so
                 // the SQL planner falls back to a scan or a CREATE INDEX hint
                 // without a prior catalog probe.
-                send_control_only(shared, fd, target_id, client_id, STATUS_NO_INDEX).await;
+                send_control_only(peer, target_id, client_id, STATUS_NO_INDEX).await;
                 return;
             }
         };
@@ -1068,8 +1037,8 @@ async fn handle_seek_by_index(
             )
             .await
             {
-                Ok(slot) => shared.reactor.send_slot_or_close(fd, slot).await,
-                Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+                Ok(slot) => peer.send_slot_or_close(slot).await,
+                Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
             }
             return;
         }
@@ -1092,7 +1061,7 @@ async fn handle_seek_by_index(
             Ok(merged) => {
                 send_ok_response(
                     shared,
-                    fd,
+                    peer,
                     target_id,
                     merged.as_ref(),
                     client_id,
@@ -1101,12 +1070,12 @@ async fn handle_seek_by_index(
                 )
                 .await;
             }
-            Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+            Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
         }
     } else {
         // System tables never carry secondary indexes.
         let msg = format!("SEEK_BY_INDEX on system table {target_id} is not supported");
-        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+        send_error(peer, target_id, client_id, msg.as_bytes()).await;
     }
 }
 
@@ -1118,7 +1087,7 @@ async fn handle_seek_by_index(
 /// the sole OPK encoder).
 async fn handle_seek_by_index_range(
     shared: &Rc<Shared>,
-    fd: i32,
+    peer: &Peer,
     client_id: u64,
     target_id: i64,
     seek_col_idx: u64,
@@ -1127,18 +1096,18 @@ async fn handle_seek_by_index_range(
 ) {
     if !shared.cat().has_id(target_id) {
         let msg = format!("table {target_id} not found");
-        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+        send_error(peer, target_id, client_id, msg.as_bytes()).await;
         return;
     }
     if target_id < FIRST_USER_TABLE_ID {
         let msg = format!("SEEK_BY_INDEX_RANGE on system table {target_id} is not supported");
-        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+        send_error(peer, target_id, client_id, msg.as_bytes()).await;
         return;
     }
     let cols = match validated_index_cols(shared, target_id, seek_col_idx, "seek_by_index_range") {
         Ok(cols) => cols,
         Err(msg) => {
-            send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+            send_error(peer, target_id, client_id, msg.as_bytes()).await;
             return;
         }
     };
@@ -1149,7 +1118,7 @@ async fn handle_seek_by_index_range(
         .index_circuit_for_cols(target_id, cols.as_slice())
         .is_some();
     if !has_index {
-        send_control_only(shared, fd, target_id, client_id, STATUS_NO_INDEX).await;
+        send_control_only(peer, target_id, client_id, STATUS_NO_INDEX).await;
         return;
     }
     match MasterDispatcher::fan_out_seek_by_index_range_collect_async(
@@ -1163,9 +1132,9 @@ async fn handle_seek_by_index_range(
     .await
     {
         Ok(merged) => {
-            send_ok_response(shared, fd, target_id, merged.as_ref(), client_id, 0, client_version).await;
+            send_ok_response(shared, peer, target_id, merged.as_ref(), client_id, 0, client_version).await;
         }
-        Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
     }
 }
 
@@ -1175,7 +1144,7 @@ async fn handle_seek_by_index_range(
 /// enforced-unique", identical to the server's own FK gate `validate_fk_column`).
 /// The client's cached epoch arrives in the index-version wire bits; on a match
 /// we reply "unchanged" (no schema, no data), otherwise the fresh list.
-async fn handle_get_indices(shared: &Rc<Shared>, fd: i32, client_id: u64, target_id: i64, client_epoch: u8) {
+async fn handle_get_indices(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_epoch: u8) {
     let server_epoch = shared.cat().get_index_version(target_id); // absent ⇒ 1
     let flags = ipc::wire_flags_set_index_version(0, server_epoch);
 
@@ -1183,7 +1152,7 @@ async fn handle_get_indices(shared: &Rc<Shared>, fd: i32, client_id: u64, target
     // an empty list): OK, no schema, no data → client keeps its cached Rc.
     if client_epoch == server_epoch {
         let buf = encode_response_buffer(target_id, client_id, None, STATUS_OK, b"", None, 0, flags);
-        shared.reactor.send_buffer_or_close(fd, buf).await;
+        peer.send_buffer_or_close(buf).await;
         return;
     }
 
@@ -1215,10 +1184,10 @@ async fn handle_get_indices(shared: &Rc<Shared>, fd: i32, client_id: u64, target
         0,
         flags,
     );
-    shared.reactor.send_buffer_or_close(fd, buf).await;
+    peer.send_buffer_or_close(buf).await;
 }
 
-async fn handle_scan(shared: &Rc<Shared>, fd: i32, client_id: u64, target_id: i64, client_version: u16) {
+async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
     // Drain pending ticks before reading: views derive from source-table
     // pushes through the DAG (IV.2). Send a Drain trigger unconditionally
     // — even when `tick_tids` is observed empty — so any in-flight
@@ -1253,7 +1222,7 @@ async fn handle_scan(shared: &Rc<Shared>, fd: i32, client_id: u64, target_id: i6
     let _g = shared.catalog_rwlock.read().await;
     if !shared.cat().has_id(target_id) {
         let msg = format!("table {target_id} not found");
-        send_error(shared, fd, target_id, client_id, msg.as_bytes()).await;
+        send_error(peer, target_id, client_id, msg.as_bytes()).await;
         return;
     }
     // A replicated relation (a replicated base table, or a view all of whose
@@ -1283,9 +1252,9 @@ async fn handle_scan(shared: &Rc<Shared>, fd: i32, client_id: u64, target_id: i6
             0,
             prelim_flags,
         );
-        let rc = shared.reactor.send_buffer(fd, prelim).await;
+        let rc = peer.send_buffer(prelim).await;
         if rc < 0 {
-            shared.reactor.close_fd(fd);
+            peer.close();
             return;
         }
         // Embed server_version as client_version so workers omit their schema blocks.
@@ -1302,7 +1271,7 @@ async fn handle_scan(shared: &Rc<Shared>, fd: i32, client_id: u64, target_id: i6
             target_id,
             0,
             client_id,
-            fd,
+            peer,
             effective_client_version,
         )
         .await
@@ -1313,7 +1282,7 @@ async fn handle_scan(shared: &Rc<Shared>, fd: i32, client_id: u64, target_id: i6
             &shared.sal_writer_excl,
             target_id,
             client_id,
-            fd,
+            peer,
             effective_client_version,
         )
         .await
@@ -1321,12 +1290,12 @@ async fn handle_scan(shared: &Rc<Shared>, fd: i32, client_id: u64, target_id: i6
     match result {
         Ok(true) => {
             let terminal = make_terminal_scan_frame(target_id, client_id, lsn);
-            shared.reactor.send_buffer_or_close(fd, terminal).await;
+            peer.send_buffer_or_close(terminal).await;
         }
         Ok(false) => {
-            shared.reactor.close_fd(fd);
+            peer.close();
         }
-        Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
     }
 }
 
@@ -1340,7 +1309,7 @@ fn make_terminal_scan_frame(target_id: i64, client_id: u64, lsn: u64) -> PooledS
 /// non-empty batch on the plain system-table frame is a protocol error.
 async fn handle_system_scan(
     shared: &Rc<Shared>,
-    fd: i32,
+    peer: &Peer,
     client_id: u64,
     target_id: i64,
     decoded: ipc::DecodedWire,
@@ -1349,8 +1318,7 @@ async fn handle_system_scan(
     let batch = decoded.data_batch;
     if batch.as_ref().map(|b| b.count > 0).unwrap_or(false) {
         send_error(
-            shared,
-            fd,
+            peer,
             target_id,
             client_id,
             b"system-table writes must use the DDL_TXN frame",
@@ -1367,7 +1335,7 @@ async fn handle_system_scan(
             let batch_ref = if b.count > 0 { Some(b) } else { None };
             send_ok_response(
                 shared,
-                fd,
+                peer,
                 target_id,
                 batch_ref.as_deref(),
                 client_id,
@@ -1376,7 +1344,7 @@ async fn handle_system_scan(
             )
             .await;
         }
-        Err(e) => send_error(shared, fd, target_id, client_id, e.as_bytes()).await,
+        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
     }
 }
 
@@ -1411,7 +1379,7 @@ fn family_pks_by_sign(families: &[(i64, Batch)], tid: i64, positive: bool) -> Ve
 /// hook sees its dependencies already in the memtable); on any failure the
 /// applied families are negated in master memory before broadcast, so a crash
 /// *or* a precheck failure can never strand an orphan catalog row.
-async fn handle_ddl_txn(shared: &Rc<Shared>, fd: i32, client_id: u64, data: &[u8], client_version: u16) {
+async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8], client_version: u16) {
     // Decode the bundle and materialise each family's wal-block slice into an
     // owned Batch up front (before any lock), resolving its system schema from
     // the catalog. `sys_family_schema` rejects a bogus family tid without the
@@ -1420,12 +1388,12 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, fd: i32, client_id: u64, data: &[u8
         Ok(d) => d,
         Err(e) => {
             let msg = format!("decode error: {e}");
-            send_error(shared, fd, 0, client_id, msg.as_bytes()).await;
+            send_error(peer, 0, client_id, msg.as_bytes()).await;
             return;
         }
     };
     if raw_families.is_empty() {
-        send_error(shared, fd, 0, client_id, b"DDL_TXN: empty family bundle").await;
+        send_error(peer, 0, client_id, b"DDL_TXN: empty family bundle").await;
         return;
     }
     let family_count = raw_families.len();
@@ -1435,7 +1403,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, fd: i32, client_id: u64, data: &[u8
             Some(s) => s,
             None => {
                 let msg = format!("DDL_TXN: {tid} is not a system family");
-                send_error(shared, fd, 0, client_id, msg.as_bytes()).await;
+                send_error(peer, 0, client_id, msg.as_bytes()).await;
                 return;
             }
         };
@@ -1448,7 +1416,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, fd: i32, client_id: u64, data: &[u8
             }
             Err(e) => {
                 let msg = format!("DDL_TXN family {tid} decode error: {e}");
-                send_error(shared, fd, 0, client_id, msg.as_bytes()).await;
+                send_error(peer, 0, client_id, msg.as_bytes()).await;
                 return;
             }
         }
@@ -1540,7 +1508,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, fd: i32, client_id: u64, data: &[u8
                     // No zone LSN reserved, no catalog mutation yet: just surface
                     // the violation to the client. The write lock drops on return.
                     Err(e) => {
-                        send_error(shared, fd, 0, client_id, e.as_bytes()).await;
+                        send_error(peer, 0, client_id, e.as_bytes()).await;
                         return;
                     }
                     // Hold the distinct span set to seed the filter post-commit,
@@ -1634,7 +1602,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, fd: i32, client_id: u64, data: &[u8
         unsafe {
             (*cat_ptr_raw).ctx.close_ddl_zone();
         }
-        send_error(shared, fd, 0, client_id, e.as_bytes()).await;
+        send_error(peer, 0, client_id, e.as_bytes()).await;
         return;
     }
 
@@ -1727,7 +1695,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, fd: i32, client_id: u64, data: &[u8
         }
     }
 
-    send_ok_response(shared, fd, 0, None, client_id, zone_lsn as u128, client_version).await;
+    send_ok_response(shared, peer, 0, None, client_id, zone_lsn as u128, client_version).await;
     let total = t_ddl_start.elapsed();
     if total > Duration::from_millis(20) {
         gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
@@ -1785,7 +1753,7 @@ fn encode_response_buffer(
 
 async fn send_ok_response(
     shared: &Rc<Shared>,
-    fd: i32,
+    peer: &Peer,
     target_id: i64,
     result: Option<&Batch>,
     client_id: u64,
@@ -1800,24 +1768,24 @@ async fn send_ok_response(
     };
     let flags = ipc::wire_flags_set_schema_version(0, server_version);
     let buf = encode_response_buffer(target_id, client_id, result, STATUS_OK, b"", schema_arg, seek_pk, flags);
-    shared.reactor.send_buffer_or_close(fd, buf).await;
+    peer.send_buffer_or_close(buf).await;
 }
 
 /// Control-only reply carrying just a status code: no schema, no data, no error
 /// text. The schema-mismatch (`STATUS_SCHEMA_MISMATCH`) and no-index
 /// (`STATUS_NO_INDEX`) responses are byte-identical apart from the status, and
 /// the client treats each frame as a pure signal.
-async fn send_control_only(shared: &Rc<Shared>, fd: i32, target_id: i64, client_id: u64, status: u32) {
+async fn send_control_only(peer: &Peer, target_id: i64, client_id: u64, status: u32) {
     let buf = encode_response_buffer(target_id, client_id, None, status, b"", None, 0, 0);
-    shared.reactor.send_buffer_or_close(fd, buf).await;
+    peer.send_buffer_or_close(buf).await;
 }
 
-async fn send_error(shared: &Rc<Shared>, fd: i32, target_id: i64, client_id: u64, error_msg: &[u8]) {
+async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8]) {
     // STATUS_ERROR suppresses the schema block (has_schema = false), so
     // prebuilt_schema = None is correct and saves the cache lookup.
     // flags=0: client ignores schema version on error responses.
     let buf = encode_response_buffer(target_id, client_id, None, STATUS_ERROR, error_msg, None, 0, 0);
-    shared.reactor.send_buffer_or_close(fd, buf).await;
+    peer.send_buffer_or_close(buf).await;
 }
 
 /// Durably reserve a SERIAL id range for `seq_id` and return the range base.
@@ -1901,10 +1869,10 @@ async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i6
     base
 }
 
-async fn send_alloc(shared: &Rc<Shared>, fd: i32, new_id: i64, client_id: u64) {
+async fn send_alloc(peer: &Peer, new_id: i64, client_id: u64) {
     // Alloc responses carry no schema block; schema version irrelevant.
     let buf = encode_response_buffer(new_id, client_id, None, STATUS_OK, b"", None, 0, 0);
-    shared.reactor.send_buffer_or_close(fd, buf).await;
+    peer.send_buffer_or_close(buf).await;
 }
 
 #[cfg(test)]

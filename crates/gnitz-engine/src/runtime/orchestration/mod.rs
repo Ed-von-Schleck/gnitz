@@ -9,4 +9,5 @@
 pub(super) mod committer;
 pub(super) mod executor;
 pub(super) mod master;
+pub(super) mod peer;
 pub(super) mod worker;

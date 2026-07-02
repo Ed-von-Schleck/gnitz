@@ -1195,7 +1195,7 @@ impl MasterDispatcher {
         sal_excl: &Rc<AsyncMutex<()>>,
         target_id: i64,
         client_id: u64,
-        fd: i32,
+        peer: &Peer,
         client_version: u16,
     ) -> Result<bool, String> {
         // `_lease` held across the entire continuation drain: every worker
@@ -1235,7 +1235,7 @@ impl MasterDispatcher {
         // a fault the client sees its data frames followed by a STATUS_ERROR
         // frame, which `recv_scan_response` handles mid-stream.
         for (w, slot) in slots.into_iter().enumerate() {
-            if !drain_scan_train(reactor, fd, slot, req_ids[w] as u32, w).await? {
+            if !drain_scan_train(reactor, peer, slot, req_ids[w] as u32, w).await? {
                 return Ok(false);
             }
         }
@@ -1257,7 +1257,7 @@ impl MasterDispatcher {
         target_id: i64,
         worker: usize,
         client_id: u64,
-        fd: i32,
+        peer: &Peer,
         client_version: u16,
     ) -> Result<bool, String> {
         let req_id = {
@@ -1297,7 +1297,7 @@ impl MasterDispatcher {
         // gate discards — not parks — late frames.
         let _lease = reactor.scan_lease(&[req_id as u32]);
         let slot = reactor.await_scan_slot(req_id as u32).await;
-        drain_scan_train(reactor, fd, slot, req_id as u32, worker).await
+        drain_scan_train(reactor, peer, slot, req_id as u32, worker).await
     }
 
     /// Async version of `execute_pipeline`. Writes each check with
@@ -1778,22 +1778,22 @@ impl MasterDispatcher {
 }
 
 /// Forward one worker's SCAN continuation train to the client: send each frame
-/// to `fd` (dropping it before awaiting the next, per the W2M ring contract) and
-/// loop until the train header reports no more frames. `slot` is the first,
+/// to `peer` (dropping it before awaiting the next, per the W2M ring contract)
+/// and loop until the train header reports no more frames. `slot` is the first,
 /// already-awaited frame. Returns `Ok(false)` if the client disconnects
 /// mid-stream and `Err` on a malformed train header. Shared by
 /// `fan_out_scan_async` (one call per worker) and
 /// `fan_out_scan_single_worker_async` (one call for the single source worker).
 async fn drain_scan_train(
     reactor: &crate::runtime::reactor::Reactor,
-    fd: i32,
+    peer: &Peer,
     mut slot: W2mSlot,
     req_id: u32,
     worker: usize,
 ) -> Result<bool, String> {
     loop {
         let (_, has_more) = parse_train_header(&slot, worker, "scan")?;
-        let rc = reactor.send_slot(fd, slot).await;
+        let rc = peer.send_slot(slot).await;
         if rc < 0 {
             return Ok(false);
         }

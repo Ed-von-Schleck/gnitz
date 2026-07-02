@@ -48,6 +48,14 @@ pub trait Ring {
     /// own CQE follows.
     fn prep_async_cancel(&mut self, target_user_data: u64, user_data: u64);
 
+    /// Submit a one-shot sendmsg(2). The pointed-to msghdr (and everything it
+    /// references: iovec, payload, sockaddr) must stay alive until the CQE.
+    fn prep_sendmsg(&mut self, fd: i32, msg: *const libc::msghdr, user_data: u64);
+
+    /// Submit a one-shot recvmsg(2). Same lifetime contract, plus the msghdr's
+    /// msg_name/msg_iov buffers are written by the kernel.
+    fn prep_recvmsg(&mut self, fd: i32, msg: *mut libc::msghdr, user_data: u64);
+
     /// Submit pending SQEs and optionally wait for completions.
     ///
     /// - `min_complete > 0, timeout_ms > 0`: block until ≥min_complete CQEs

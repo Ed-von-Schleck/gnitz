@@ -9,6 +9,29 @@
 /// limit to the negotiated value via `Reactor::set_max_payload_len`.
 pub(super) const HELLO_PRE_HANDSHAKE_LEN: usize = gnitz_wire::HELLO_PAYLOAD_LEN as usize;
 
+/// One complete inbound frame payload, owned. Malloc'd by `handle_recv_cqe`
+/// and freed on drop on every exit path, including task cancellation at an
+/// `.await` point. `ptr` is never null and `len` never 0: a failed malloc or
+/// a zero-length frame closes the connection before a message is queued.
+pub struct RecvBuf {
+    pub(super) ptr: *mut u8,
+    pub(super) len: usize,
+}
+
+impl RecvBuf {
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr/len describe a completed reactor recv (non-null by the
+        // struct invariant); the buffer is exclusively owned until drop.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for RecvBuf {
+    fn drop(&mut self) {
+        unsafe { libc::free(self.ptr as *mut libc::c_void) }
+    }
+}
+
 pub(super) enum RecvPhase {
     Header { pos: usize },
     Payload { buf: *mut u8, len: usize, pos: usize },

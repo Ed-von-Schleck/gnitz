@@ -6,7 +6,9 @@ use super::*;
 
 impl Reactor {
     /// Allocate a per-send id distinct from reply / fsync id space.
-    fn alloc_send_id(&self) -> u64 {
+    /// `pub(super)` so `reactor::udp` allocates its op ids from the same
+    /// counter (shared counter ⇒ no collisions in the shared send maps).
+    pub(super) fn alloc_send_id(&self) -> u64 {
         let id = self.inner.next_send_id.get();
         let next = match id.checked_add(1) {
             Some(n) if n != u64::MAX => n,
@@ -92,10 +94,9 @@ impl Reactor {
         conn.recv_armed = true;
     }
 
-    /// Future resolving to the next complete message on `fd`, or `None`
-    /// when the peer has disconnected.  Each call drains at most one
-    /// message; the caller is responsible for `libc::free`-ing the
-    /// returned ptr.
+    /// Future resolving to the next complete message on `fd` as an owned
+    /// [`io::RecvBuf`] (freed on drop), or `None` when the peer has
+    /// disconnected.  Each call drains at most one message.
     pub fn recv(&self, fd: i32) -> RecvFuture {
         RecvFuture {
             fd,
@@ -131,24 +132,6 @@ impl Reactor {
             gnitz_wire::encode_hello_ack(gnitz_wire::HELLO_STATUS_OK, gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32);
         self.send_buf_inner(fd, OK_ACK.as_ptr(), OK_ACK.len(), SendAlive::Static)
             .await
-    }
-
-    /// Send a one-shot response buffer, closing `fd` on transport failure.
-    /// This is the terminal action shared by every request handler: once the
-    /// reply is on the wire there is nothing left to do on the connection, so a
-    /// negative send rc (peer gone / write error) simply schedules the close.
-    pub async fn send_buffer_or_close(&self, fd: i32, buf: crate::storage::batch_pool::PooledSendBuf) {
-        if self.send_buffer(fd, buf).await < 0 {
-            self.close_fd(fd);
-        }
-    }
-
-    /// `send_slot` counterpart of [`Self::send_buffer_or_close`]: forward a
-    /// worker ring slot as the final reply, closing `fd` on transport failure.
-    pub async fn send_slot_or_close(&self, fd: i32, slot: W2mSlot) {
-        if self.send_slot(fd, slot).await < 0 {
-            self.close_fd(fd);
-        }
     }
 
     /// Common send loop. `alive` keeps the backing memory valid until the CQE fires.
@@ -269,7 +252,7 @@ impl Reactor {
                     .borrow_mut()
                     .entry(fd)
                     .or_default()
-                    .push_back((ptr, len));
+                    .push_back(io::RecvBuf { ptr, len });
                 // Arm next header recv immediately so the kernel can keep
                 // draining the client's send buffer. Per-session FIFO is
                 // preserved by the `VecDeque` order — the handler still
@@ -323,15 +306,8 @@ impl Reactor {
             self.inner.closing_fds.borrow_mut().remove(&fd);
             self.inner.conns.borrow_mut().remove(&fd);
             self.inner.recv_waiters.borrow_mut().remove(&fd);
-            if let Some(queue) = self.inner.pending_recv.borrow_mut().remove(&fd) {
-                for (ptr, _) in queue {
-                    if !ptr.is_null() {
-                        unsafe {
-                            libc::free(ptr as *mut libc::c_void);
-                        }
-                    }
-                }
-            }
+            // Dropping the queue frees each undelivered RecvBuf payload.
+            self.inner.pending_recv.borrow_mut().remove(&fd);
             unsafe {
                 libc::close(fd);
             }
