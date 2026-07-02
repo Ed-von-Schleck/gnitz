@@ -193,7 +193,8 @@ Only non-linear and bilinear operators need the integral. The output of
   output. Original table PKs are preserved in payload columns (moved
   there by `map_reindex`). No information is lost.
 
-**Left outer join** — extends bilinear join with null-fill:
+**Outer joins (LEFT / RIGHT / FULL)** — extend the bilinear join with null-fill
+(described for LEFT; RIGHT is the mirror, FULL does both sides):
 - For each delta row, if inner-join matches exist: emit them (weight =
   `w_delta × w_trace`, same as inner join). If no match: emit one
   null-filled row (weight = `w_delta`, right columns = NULL).
@@ -201,10 +202,11 @@ Only non-linear and bilinear operators need the integral. The output of
   (output weight depends on match existence, not just weight arithmetic).
 - Built **join-free**: `LEFT JOIN = inner ∪ null_extend(ν)`, where `ν` is the
   unmatched preserved rows at their true multiplicity. There is **no** fused
-  outer opcode. It generalizes **symmetrically** — RIGHT = the mirror `ν_B`
-  over the right side, FULL = both — though RIGHT/FULL are not yet
-  implemented. Feldera instead injects ghost `(k, NULL)` tuples via a
-  "saturate" operator and runs a standard inner join.
+  outer opcode. It generalizes **symmetrically** — RIGHT emits the mirror
+  `ν_B` over the right side, FULL emits both. All three are implemented for
+  equi and band joins; pure range (`n_eq == 0`) supports LEFT only (see the
+  pure-range realization below). Feldera instead injects ghost `(k, NULL)`
+  tuples via a "saturate" operator and runs a standard inner join.
 
 *The null-fill `ν` is a weight-exact Z-set difference.* Per preserved-row
 identity `x` (its source PK + full payload), with weight `w_A ≥ 0` in `A` and
@@ -239,7 +241,11 @@ exchange):
   here: the broadcast range join scatters its output by the *other* side's range
   key, not the preserved key, so gathering it onto the preserved-key worker for
   the per-worker clamp would need a **second sequential exchange the compiler
-  forbids**; the replicated threshold sidesteps that.
+  forbids**; the replicated threshold sidesteps that. The threshold pipeline
+  exists only for the LEFT orientation: pure-range RIGHT/FULL is rejected at
+  plan time (its mirror `ν_B` would need a second, B-side threshold
+  `m_A = MAX/MIN(A.range)`, not built), and MIN/MAX has only an 8-byte
+  accumulator, so the range column must be a ≤8-byte integer.
 
 **Non-linear operators** — require access to the accumulated integral:
 
@@ -264,8 +270,8 @@ weight-clamp primitive (`distinct = clamp[-1,1]`, `positive_part =
 clamp[0,i64::MAX]`) over content-hashed leaves — e.g. EXCEPT DISTINCT =
 `positive_part(distinct(A) − distinct(B))`, INTERSECT DISTINCT =
 `distinct(A) − positive_part(distinct(A) − distinct(B))`. There is **no**
-anti-join operator: these set ops and the LEFT-JOIN null-fill (above, equi/band
-form) are the only `positive_part` users.
+anti-join operator: these set ops and the outer-join null-fills (above,
+equi/band form) are the only `positive_part` users.
 
 *All non-linear operators:* Consolidation mandatory — must see true net
 weights. Enforced by `ConsolidatedScope`.
@@ -442,7 +448,7 @@ foundation (L0)  — independent leaves; depends on nothing
   - `repr` (L2) — the in-memory batch and the kernels over it: `batch` (region layout), `batch_wire` (wire/shard serde), `batch_pool` (buffer recycling), `columnar` (comparators), `merge` (sort-merge consolidation), `scatter` (exchange repartition), `heap` (k-way merge), `bloom`/`xor8` (PK-probe filters).
   - `lsm` (L3) — the on-disk half: `wal`, `shard_file`/`shard_reader`/`shard_index`, `compact` (N-way compaction), `memtable`, `read_cursor`, and the `Table`/`PartitionedTable` facades.
 - **`expr`** — compiled expression programs evaluated over batches (`program`, `batch`, `plan`).
-- **`ops`** — the DBSP operators: `join` (equi and range/band inner join, both Δ⋈trace; LEFT outer is built join-free from inner + `positive_part`, §3), `reduce` (aggregation), `exchange` (repartition: `router` + `relay`), `distinct`, `linear` (filter/map/negate/union), `scan`, `reindex` (re-key for join/group), `cogroup`, `index` (secondary indexes).
+- **`ops`** — the DBSP operators: `join` (equi and range/band inner join, both Δ⋈trace; LEFT/RIGHT/FULL outer are built join-free from inner + `positive_part`, §3), `reduce` (aggregation), `exchange` (repartition: `router` + `relay`), `distinct`, `linear` (filter/map/negate/union), `scan`, `reindex` (re-key for join/group), `cogroup`, `index` (secondary indexes).
 - **`query`** (L5) — the circuit layer behind the `dag` facade: `compiler` (view → DBSP circuit → VM program), `vm` (executes the program), `dag` (`DagEngine`: plan cache, epoch evaluator, ingestion). `catalog` and `runtime` reach this layer only through `dag`.
 - **`catalog`** — the DDL/metadata engine wrapping `DagEngine`: `ddl`, `sys_tables`, `hooks`, `registry`, `metadata`, `validation`, `write_path`, persistence (`store_io`, `partition_lsn`), `cache`, `bootstrap`.
 - **`runtime`** (L7) — the multi-process server (`main.rs` builds `gnitz-server`):
