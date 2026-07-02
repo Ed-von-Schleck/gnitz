@@ -25,15 +25,13 @@ of dependent views in one batch (`write_path.rs:522-539`).
 
 ## Prerequisite state
 
-The planner already lowers a single `[NOT] EXISTS`/`[NOT] IN` conjunct over a
-Simple-shaped view into semi/anti circuits derived from the outer-join null-fill
-(`plan/view/exists.rs`, dispatched via a `ViewShape::Subquery` variant), and
-`bind_structural` desugars IN-lists and rejects out-of-position subqueries with targeted
-errors. **These symbols do not exist at authoring time** — they are the deliverable of
-the preceding increment; the SemiAnti scope items and Sequencing step 6 are hard-blocked
-on them, while every other step stands on the current tree. Additionally re-verify two
-code-level facts this plan leans on, both plausible targets of concurrent join-machinery
-work: the distributed backfill tail resolves a view's sources via `get_source_ids`
+The SemiAnti emitter and Sequencing step 6 reuse the shipped `[NOT] EXISTS`/`[NOT] IN`
+support: the planner lowers a single subquery conjunct over a Simple-shaped view into
+semi/anti circuits derived from the outer-join null-fill (`plan/view/exists.rs`,
+dispatched via `ViewShape::Subquery`), and `bind_structural` desugars IN-lists and
+rejects out-of-position subqueries with targeted errors. Re-verify two code-level facts
+this plan leans on, both plausible targets of concurrent join-machinery work: the
+distributed backfill tail resolves a view's sources via `get_source_ids`
 (`executor.rs:1683`, `dag/mod.rs:493-496`) and replays them from their stores — if the
 source-list accessor or join-trace sourcing has changed (e.g. base-table trace elision),
 re-derive §3 against the then-current lookup; and `write_circuit_rows`' family layouts
@@ -51,17 +49,28 @@ SQL surface after this plan (CREATE VIEW bodies):
 - **GROUP BY / HAVING / DISTINCT / set-ops over arbitrary sub-plans** (anchored inputs
   become hidden views).
 - **Derived tables**: `FROM (SELECT …) AS d` — the sub-select lowers recursively.
-- **General CTEs**: each `WITH x AS (SELECT …)` lowers once; an anchor-bearing CTE
-  becomes one hidden view shared by all its references (DAG sharing); a linear CTE
-  inlines per reference. The pass-through-only CTE inliner (`dispatch.rs:158-274`) is
-  deleted.
+- **General CTEs**: each `WITH x AS (SELECT …)` is lowered **per reference** — a linear
+  CTE inlines its sub-tree, an anchor-bearing CTE lowers to its own hidden view at each
+  reference site (referenced *N* times ⇒ *N* independent hidden views, each with a
+  distinct source id). No node-level DAG sharing: `Rel` children stay unique-owned
+  `Box<Rel>`, the splitter needs no pointer-identity interning, and two references of one
+  anchor CTE joined together are two distinct sources (never a self-join). The extra
+  store per duplicate reference is the accepted cost; cross-reference common-subexpression
+  sharing is a separate, whole-planner increment. To bound the pathological
+  self-referential-CTE blow-up (`WITH b AS (SELECT * FROM a JOIN a) …` doubling per
+  level), the assembler rejects a bundle whose segment count exceeds `MAX_CHAIN_SEGMENTS =
+  64` with a clean planner error. The pass-through-only CTE inliner (`dispatch.rs:158-274`)
+  is deleted.
 - **Multiple subquery conjuncts** and subquery conjuncts over any sub-plan: each
   `[NOT] EXISTS`/`[NOT] IN` conjunct becomes its own Semi/Anti anchor (per-conjunct
   restrictions unchanged from the current exists builder).
-- **Self-joins and same-source set-ops**: the right occurrence is wrapped in an
-  auto-generated hidden pass-through view, giving it a distinct source id — the
-  documented two-views-over-one-base pattern (`test_shared_source_incremental.py`),
-  now automatic. The extra store copy is the accepted cost.
+- **Self-joins and same-source set-ops**: when the *same pre-existing relation id* (a
+  base table or a committed view) appears twice in one tree, the right occurrence is
+  wrapped in an auto-generated hidden pass-through view, giving it a distinct source id —
+  the documented two-views-over-one-base pattern (`test_shared_source_incremental.py`),
+  now automatic. (Two references of one anchor CTE are already distinct hidden views per
+  the per-reference rule above, so they never reach this path.) The extra store copy is
+  the accepted cost.
 
 Still rejected: ORDER BY/LIMIT in views, correlated scalar subqueries, ANY/ALL,
 subqueries outside top-level WHERE conjuncts, join reordering, non-equi/range join
@@ -112,7 +121,9 @@ pub(crate) enum Rel {
         left: Box<Rel>, right: Box<Rel>, kind: JoinKind, // Inner|Left|Right|Full
         eq: EqKeys,                     // (left_cols, right_cols, target_tcs)
         range: Option<RangeConjunct>,
-        residual: Vec<sqlparser::ast::Expr>, // INNER only, bound at emit vs merged schema
+        residual: Option<BoundExpr>,    // INNER only; ANDed, bound at lowering vs the
+                                        // logical [left.schema ++ right.schema]; the
+                                        // emitter shifts its indices to physical (§2 map).
     },
     /// EXISTS/IN (negated = NOT …): the x1 semi/anti anchor over arbitrary inputs.
     SemiAnti { outer: Box<Rel>, inner: Box<Rel>, negated: bool, eq: EqKeys,
@@ -125,10 +136,18 @@ pub(crate) enum Rel {
 }
 ```
 
-Every node exposes `fn schema(&self) -> &[ColumnDef]` (computed at construction).
-`Join.residual` stays as raw AST fragments because `build_residual_filter_prog`
-(`predicates.rs:468`) binds against the merged `[_join_pk…, A, B]` schema that only
-exists at emit time; everything else is `BoundExpr`/indices.
+Every node exposes `fn schema(&self) -> &Schema` (columns + `pk_cols`, computed at
+construction — the `pk_cols` fixes each node's physical PK arity `k`).
+Every node — `Join.residual` included — carries only resolved data: nothing survives as
+raw AST past lowering, so no IR consumer ever needs the `AliasMap` again. The residual is
+the one predicate that today binds at emit time (`build_residual_filter_prog`,
+`predicates.rs:468`, resolves ON columns through the `AliasMap`, then shifts by the
+`_join_pk` arity `k`). That `AliasMap` is gone after lowering, so the residual is instead
+bound *during* lowering against the join's logical `[left.schema ++ right.schema]`
+(indices `0..left_n+right_n`), ANDed into one `BoundExpr`, and re-indexed to physical at
+emit by the general §2 mapping below — identical result, because a residual is INNER-only
+and the merged `out_cols` clone the source `ColumnDef`s, so `fold_null_test` sees the same
+nullability at either binding site.
 
 **Lowering (AST → Rel)** replaces `ViewShape::classify`:
 
@@ -159,10 +178,97 @@ exists at emit time; everything else is `BoundExpr`/indices.
 - GROUP BY / aggregates → `Reduce` (reusing the grouped builder's binding: group cols,
   agg specs, HAVING); DISTINCT → `Distinct`; set-op bodies → `SetOp` with both sides
   lowered recursively.
-- CTEs: lower each CTE body once into a `Rel`; references clone linear trees or share
-  the anchor-bearing tree by reference (an `Rc<Rel>` interned per CTE name).
-- Same source id appearing twice anywhere in the tree: wrap the second occurrence in
-  `PassThroughView(Source)` — realized by the splitter as a hidden linear view.
+- CTEs: keep the parsed `Query` per `WITH` name; each *reference* re-lowers that body
+  into a fresh `Rel` sub-tree (linear or anchor-bearing). No node sharing — the splitter
+  then cuts each anchor-bearing reference into its own hidden view. Distinct references
+  therefore carry distinct source ids by construction.
+- Same *pre-existing* source id appearing twice anywhere in the tree (a base table or
+  committed view referenced twice — not two CTE references, which already differ): wrap
+  the second occurrence in `PassThroughView(Source)` — realized by the splitter as a
+  hidden linear view whose input is that pre-existing relation.
+
+**Logical → physical column mapping (the emit-time contract).** Lowering resolves every
+column to a *logical* index (0-based within a node's `schema()`); the emitter maps logical
+→ physical once, at three points, all driven by two integers per node — the leading
+synthetic-PK arity `k` and, for a hidden-view input, its `Source.vis.start`:
+
+- **Anchor output PK arity `k`.** Each anchor emitter produces
+  `[_pk × k, payload…]`; `k` is fixed by the anchor kind: equi join / equi semi-anti =
+  eq-slot count (`_join_pk` at 0..k, `join.rs:439-448`, `exists.rs:485-493`); range join =
+  `pair_pk` (`join.rs:764-815`); range semi-anti = outer PK arity `pa` (`exists.rs:689`);
+  reduce = its reduce-PK arity; distinct/set-op = their PK arity; linear = source PK
+  count. The emitter returns `k` alongside its circuit so downstream index math is exact.
+- **Pre-anchor linear inputs.** WHERE-pushdown and derived tables put `Filter`/`Project`
+  nodes *below* an anchor, above its `Source` leaves (`FROM (SELECT * FROM t WHERE x>5) d
+  JOIN …`). An anchor input is therefore a linear chain terminating in one `Source`, not a
+  bare id. A shared recursion compiles it, threading the leaf's tid so the join's
+  self-join guard still sees two distinct sources:
+
+  ```rust
+  // Returns (input node feeding the anchor, the leaf Source's tid). `emit_projection`
+  // is the shared map / map_expr projection emitter lifted from simple.rs:86-132.
+  fn compile_linear_input(cb: &mut CircuitBuilder, rel: &Rel) -> (NodeId, u64) {
+      match rel {
+          Rel::Source { tid, .. } => (cb.input_delta_tagged(*tid), *tid),
+          Rel::Filter { input, pred } => {
+              let (n, tid) = compile_linear_input(cb, input);
+              let prog = compile_bound_expr_to_program(pred, input.schema())?;
+              (cb.filter(n, Some(prog)), tid)
+          }
+          Rel::Project { input, items, .. } => {
+              let (n, tid) = compile_linear_input(cb, input);
+              (emit_projection(cb, n, items, input.schema()), tid)
+          }
+          _ => unreachable!("splitter guarantees a linear chain over one Source here"),
+      }
+  }
+  ```
+
+- **Post-anchor linear tail.** The splitter's connected-subtree rule keeps the linear
+  `Filter`/`Project` nodes *above* an anchor in the anchor's own segment (`WHERE` over a
+  join output, `SELECT * FROM (…GROUP BY…) d WHERE c>5` ⇒ `Filter(Reduce)`,
+  `count(*)+1`). Tails appear above **every** anchor kind, so the tail compiler is shared
+  by all emitters, not just the join — it is exactly the residual-splice generalized
+  (`join.rs:469-485`). Tail predicates were bound at lowering against the anchor's
+  *logical* output; the emitter shifts them by `k` to reach the physical `[_pk × k,
+  payload…]` layout:
+
+  ```rust
+  fn shift_bound_expr(e: &BoundExpr, base: usize) -> BoundExpr {
+      match e {
+          BoundExpr::ColRef(c)    => BoundExpr::ColRef(c + base),
+          BoundExpr::IsNull(c)    => BoundExpr::IsNull(c + base),
+          BoundExpr::IsNotNull(c) => BoundExpr::IsNotNull(c + base),
+          BoundExpr::BinOp(l, op, r) =>
+              BoundExpr::BinOp(shift_bound_expr(l, base).into(), *op, shift_bound_expr(r, base).into()),
+          BoundExpr::UnaryOp(op, x) => BoundExpr::UnaryOp(*op, shift_bound_expr(x, base).into()),
+          lit => lit.clone(), // Lit*/AggCall carry no column index
+      }
+  }
+
+  // `out_schema` is the anchor's PHYSICAL output ([_pk × k, payload…]); tail predicates
+  // and projection items were bound against the anchor's logical output, so shift by k.
+  fn compile_linear_tail(cb: &mut CircuitBuilder, mut cur: NodeId, tail: &[LinearNode],
+                         k: usize, out_schema: &Schema) -> NodeId {
+      for node in tail {
+          match node {
+              LinearNode::Filter { pred } => {
+                  let prog = compile_bound_expr_to_program(&shift_bound_expr(pred, k), out_schema)?;
+                  cur = cb.filter(cur, Some(prog));
+              }
+              LinearNode::Project { items } => cur = emit_projection_shifted(cb, cur, items, k, out_schema),
+          }
+      }
+      cur
+  }
+  ```
+
+  The `Join.residual` is the first `compile_linear_tail` call on the join's merged output
+  with `base = k`; a hidden-view input additionally offsets by that input's `vis.start`
+  (its synthetic-PK region is copied into the payload by `build_reindex_program` but is
+  never a logical column). Because the shift is a pure function of `k` (+ `vis.start`), a
+  segment whose input was cut into a hidden view compiles byte-identically to one over a
+  base table — the synthetic PK stays invisible end to end.
 
 ### 3. The splitter (Rel → Vec<Segment>)
 
@@ -187,42 +293,67 @@ linear-tail capability (WHERE over join output = a linear `Filter` compiled onto
 join circuit before projection, precisely how INNER residuals already compile,
 `join.rs:469-484`). Chains appear only for genuinely multi-anchor queries.
 
-**Backfill-order invariant (load-bearing):** every hidden view contains an anchor, and
-every anchor circuit carries a `Join` node or an `ExchangeShard`, so
-`view_seeds_exchange_backfill` (`dag/mod.rs:828-840`) is true for every chain member —
-all of them take the distributed backfill tail, which runs strictly in VIEW_TAB row
-order (`executor.rs:1678-1696`, `family_pks_by_sign` insertion order; each
-`fan_out_backfill` is fully synchronous and the worker flushes the view after its last
-chunk, `worker/mod.rs:1233`, so upstream is materialized before downstream scans). The
-assembler emits VIEW_TAB rows in topo order. Note the final user view carries the
-*smallest* vid but the *last* row (hidden names embed its id), so PK order ≠ row order
-by construction — any future PK-sort/consolidation of the VIEW_TAB batch on this path
-would silently break the tail; therefore `handle_ddl_txn` gains a topological-order
-assertion over `new_view_ids` (dep-map lookup per pair; abort the bundle, don't
-backfill misordered), pinned by a deliberately misordered regression test. The one
-hidden-view exception is the self-join pass-through, which is linear and takes the
-**inline** path — safe for a different reason than "source pre-exists": the inline
-`backfill_view` is skipped on the master (its `active_part_start == active_part_end`
-gate, `hooks.rs:502`) and runs on **each worker** during `ddl_sync` hook firing
-(`store_io.rs:443`), filling the worker's own partition from the pass-through's source
-(a base table or pre-existing view — a `debug_assert` in the splitter pins that a
-linear hidden segment's input is a pre-existing relation id, never a same-bundle
-exchange view).
+**Backfill-order invariant (load-bearing):** an anchor-bearing hidden view carries a
+`Join` node or an `ExchangeShard`, so `view_seeds_exchange_backfill`
+(`dag/mod.rs:828-840`) is true and it takes the **distributed** backfill tail
+(`executor.rs:1674-1696`); a linear pass-through hidden view takes the **inline** path
+(`hook_view_register`, gated on `!view_seeds_exchange_backfill`). A chain requires the
+distributed tail to fill an upstream hidden view before a downstream one scans it. The
+assembler **emits VIEW_TAB rows in topological order** — a standing contract, since the
+register hook computes each view's `depth` from its already-registered sources
+(`hooks.rs:465-470`, `unwrap_or(0)` for a not-yet-seen source) and that depth seeds boot
+rebuild ordering. But the *live backfill tail* need not also couple to row order: today it
+iterates raw VIEW_TAB batch order (`family_pks_by_sign`, `executor.rs:1428`), and the plan
+originally guarded that coupling with a pre-commit topo assertion — which cannot run
+cleanly (the dep-map is unpopulated before the ingest loop; asserting after it is
+post-fsync, unabortable, and boot-loop-prone). Instead, **the tail topologically sorts
+`new_view_ids` by their intra-bundle dependencies** (`get_source_ids`, which the tail
+already calls at `executor.rs:1683`; the dep-map is populated during the ingest loop,
+DEP_TAB applying before VIEW_TAB in topo priority). Backfill materialization order then
+holds independently of batch row order, no new pre-commit check is added, and boot
+recovery already re-derives order from the dep-map. Anchor-view compilation is likewise
+order-safe: the register hook skips the inline branch for every seeding view
+(`!view_seeds_exchange_backfill`, `hooks.rs:504`) and compiles it at the tail when all
+bundle views are registered. A deliberately row-misordered bundle is the regression test:
+its live backfill must still materialize correctly.
+
+The inline pass-through is safe because its source **pre-exists**: the inline
+`backfill_view` is skipped on the master (its `active_part_start == active_part_end` gate,
+`hooks.rs:502`) and runs on **each worker** during `ddl_sync` hook firing
+(`store_io.rs:443`), filling the worker's own partition from a base table or committed
+view — never a same-bundle hidden view, so it never races the distributed tail. A
+`debug_assert` in the splitter pins that a linear hidden segment's input is a pre-existing
+relation id; under the per-reference CTE rule (§2) this holds universally, because the
+only linear hidden view is the same-pre-existing-source pass-through — an anchor CTE
+referenced twice becomes two distinct hidden views, never a pass-through over a
+same-bundle exchange view.
 
 ### 4. Segment emitters (refactor of `plan/view/*`)
 
-The five shape builders are dismantled into emitters keyed by anchor kind, each
-producing `(Circuit, Vec<ColumnDef>, Vec<u32> /* pk */)` from a segment whose inputs are
-plain relation ids:
+The five shape builders are dismantled into emitters keyed by anchor kind, each producing
+`(Circuit, Vec<ColumnDef>, Vec<u32> /* pk */)` from a segment. A segment's inputs are
+**linear `&Rel` sub-trees** (a `Source`, or `Filter`/`Project` chains over one `Source`),
+not bare relation ids: each emitter obtains its anchor input node(s) via
+`compile_linear_input` (§2) — so a WHERE pushed to one join side or a derived table's
+inner filter is compiled in place — and each emitter finishes by threading its anchor
+output through the shared `compile_linear_tail(cb, anchor_out, tail, k, out_schema)` (§2)
+before `cb.sink`, passing its own physical PK arity `k` and output schema:
 
-- `emit_linear` — from `simple.rs` (filter + projection/expr-map).
-- `emit_join` — from `join.rs` (equi + range/band, all join kinds, residuals, null-fill),
-  now also compiling the segment's post-anchor linear `Filter`/`Project` tail before the
-  sink (the residual-filter splice point, `join.rs:469-484`, generalizes to any bound
-  filter over the merged schema).
-- `emit_semi_anti` — from `plan/view/exists.rs`.
-- `emit_reduce` — from `group_by.rs`.
-- `emit_distinct` / `emit_set_op` — from `set_op.rs`.
+- `emit_linear` — from `simple.rs` (filter + projection/expr-map); `k` = source PK count.
+- `emit_join` — from `join.rs` (equi + range/band, all join kinds, residuals, null-fill);
+  `k` = eq-slot count (equi) or `pair_pk` (range). The residual is the first tail entry;
+  the generalized tail also carries any post-join `Filter`/`Project` (the residual-splice
+  point, `join.rs:469-485`, generalized to any bound filter/projection over the merged
+  schema).
+- `emit_semi_anti` — from `plan/view/exists.rs`; `k` = eq-slot count (equi) or outer PK
+  arity `pa` (range) — `_join_pk`/`_src_pk` sits at slot 0, so a tail over the outer
+  columns shifts by that `k`.
+- `emit_reduce` — from `group_by.rs`; `k` = reduce PK arity. HAVING stays the
+  reduce's own post-reduce filter; a tail is any *further* `Filter`/`Project` above it.
+- `emit_distinct` / `emit_set_op` — from `set_op.rs`; `k` = their PK arity.
+
+Every emitter therefore compiles pre-anchor linear inputs and post-anchor linear tails
+uniformly — the linear-tail capability is not join-specific.
 
 `execute_create_view` becomes: lower → split → for each segment allocate a vid
 (`alloc_table_id`, one round-trip each — accepted; N is small) → emit circuits (hidden
@@ -247,8 +378,9 @@ pub struct PlannedView<'a> {
     pub output_columns: &'a [ColumnDef], pub pk_cols: &'a [u32],
 }
 /// Creates all views in one atomic DDL_TXN. `views` must be in dependency
-/// (topological) order — VIEW_TAB row order drives hook firing and the
-/// distributed backfill tail. Returns the vids in input order.
+/// (topological) order — VIEW_TAB row order sets each view's registration
+/// `depth`; the distributed backfill tail re-derives materialization order
+/// from the dep-map (§3). Returns the vids in input order.
 pub fn create_view_chain(&mut self, schema_name: &str, views: &[PlannedView<'_>])
     -> Result<Vec<u64>, ClientError>
 ```
@@ -264,12 +396,16 @@ derived lists read only the first block per family
 `write_circuit_rows` becomes `create_view_chain` with one element (single definition;
 the old body is deleted).
 
+`create_view_chain` rejects a `views` slice longer than `MAX_CHAIN_SEGMENTS` up front (the
+per-reference CTE blow-up guard, §Scope), before any allocation.
+
 Atomicity: the existing per-family `precheck → mark → apply` loop
 (`executor.rs:1576-1591`) plus `compensate_stage_a` (`executor.rs:1592-1607`,
 `write_path.rs:748-819`; its weight-homogeneity `debug_assert` holds for an all-`+1`
 chain) already gives all-or-nothing; a mid-chain failure (e.g. user-name collision
 caught by `precheck_qname_unique`) rolls back every applied family. The only engine
-change on this path is the `new_view_ids` topo-order assertion (§3).
+change on this path is the distributed backfill tail's dependency-order sort (§3), which
+replaces the tail's reliance on VIEW_TAB row order.
 
 ### 6. Cascading DROP
 
@@ -296,18 +432,25 @@ and retried later — the existing retry-until-stable loop already handles order
 
 1. **Name reservation**: `validate_user_identifier` at CREATE TABLE/VIEW/SCHEMA + DROP,
    planner unit tests, e2e error-message tests.
-2. **`create_view_chain`** (client) replacing `write_circuit_rows`; Rust integration
-   test via `gnitz-test-harness`: two hand-built chained circuits (linear-over-base +
-   join-over-it) created in one bundle over pre-populated bases; assert atomic rollback
-   on a name collision in the second view; assert backfill correctness at W=4.
+2. **`create_view_chain`** (client, replacing `write_circuit_rows`) **+ the backfill
+   tail's dependency-order sort** (engine, `handle_ddl_txn`). Rust integration test via
+   `gnitz-test-harness`: two hand-built chained circuits (linear-over-base + join-over-it)
+   created in one bundle over pre-populated bases; assert atomic rollback on a name
+   collision in the second view; assert backfill correctness at W=4, including a
+   deliberately **row-misordered** bundle (hidden view after its consumer in VIEW_TAB
+   order) that must still backfill correctly via the tail sort.
 3. **Cascading DROP** (`drop_view` + `drop_view_if_exists` + drain tolerance), e2e:
    drop user view → hidden members gone; DROP TABLE under a chain still RESTRICTs.
 4. **IR + lowering + emitters, behavior-neutral**: all currently-supported view shapes
-   route through lower→split→emit and produce circuits the engine compiles identically;
-   `ViewShape` and CTE inliner deleted. Gate: full existing e2e suite green; circuit
-   golden tests (node/edge multiset comparison) for one view of each legacy shape.
+   route through lower→split→emit and produce circuits the engine compiles identically.
+   Lands the shared `compile_linear_input` / `compile_linear_tail` / `shift_bound_expr`
+   helpers (§2) and the pre-bound `Join.residual`; `ViewShape` and the CTE inliner are
+   deleted. Gate: full existing e2e suite green; circuit golden tests (node/edge multiset
+   comparison) for one view of each legacy shape — the residual golden pins the pre-bind +
+   shift equals the old emit-time bind byte-for-byte.
 5. **Multi-anchor surface**: multi-way joins, WHERE-over-join, GROUP-BY-over-join,
-   DISTINCT/set-ops over sub-plans, derived tables, general CTEs (shared and inlined).
+   DISTINCT/set-ops over sub-plans, derived tables, general CTEs (per reference: linear
+   inline, anchor CTE → a hidden view at each reference).
 6. **Multiple subquery conjuncts + subqueries over sub-plans** (SemiAnti anchors
    composed by the splitter).
 7. **Self-join pass-through** wrapping + tests.
@@ -320,10 +463,10 @@ Each step compiles and passes `make verify` + `make e2e` independently.
 |------|--------|
 | `crates/gnitz-sql/src/plan/lp.rs` | new: `Rel` IR, lowering, splitter |
 | `crates/gnitz-sql/src/plan/view/dispatch.rs` | classification deleted; lower→split→emit pipeline; name validation |
-| `crates/gnitz-sql/src/plan/view/{simple,join,exists,group_by,set_op}.rs` | entry points become segment emitters over relation-id inputs |
+| `crates/gnitz-sql/src/plan/view/{simple,join,exists,group_by,set_op}.rs` | entry points become segment emitters over linear `&Rel` inputs; shared `compile_linear_input` / `compile_linear_tail` / `shift_bound_expr` helpers |
 | `crates/gnitz-sql/src/plan/ddl.rs` | CREATE TABLE/SCHEMA name validation; DROP leading-`_` rejection |
 | `crates/gnitz-core/src/client.rs` | `create_view_chain` (replaces `write_circuit_rows`), cascading `drop_view`, `drop_view_if_exists` |
-| `crates/gnitz-engine/src/runtime/orchestration/executor.rs` | topological-order assertion over `new_view_ids` before the backfill tail |
+| `crates/gnitz-engine/src/runtime/orchestration/executor.rs` | distributed backfill tail sorts `new_view_ids` in intra-bundle dependency order (`get_source_ids`) instead of trusting VIEW_TAB row order |
 | `crates/gnitz-engine/tests/` (or `test_support`) | chain-bundle integration test via `gnitz-test-harness` |
 | `crates/gnitz-py/tests/test_multi_join.py` | new e2e suite (multi-join, group-by-over-join, derived tables, CTEs, chains) |
 | `crates/gnitz-py/tests/test_catalog.py` | hidden-view drop/cascade/visibility cases |
@@ -332,7 +475,8 @@ Each step compiles and passes `make verify` + `make e2e` independently.
 
 - **Planner units**: lowering of each SQL form to the expected `Rel` tree; splitter
   segment boundaries (linear folds upstream; one anchor per segment; pass-through
-  wrapping; shared CTE = one hidden segment); name-reservation rejections.
+  wrapping; an anchor CTE referenced twice = two independent hidden segments;
+  `MAX_CHAIN_SEGMENTS` rejection); name-reservation rejections.
 - **Golden circuit tests**: every legacy single-anchor shape emits a circuit with the
   same node/edge multiset as before the refactor.
 - **Client/engine integration**: multi-view bundle atomicity (success, mid-bundle
@@ -342,9 +486,10 @@ Each step compiles and passes `make verify` + `make e2e` independently.
 - **E2E behavior** (W=4, weight-asserted): 3- and 4-way joins incl. outer steps;
   `WHERE` over join views; `GROUP BY` over a join with incremental retractions crossing
   group boundaries; EXISTS + EXISTS + local WHERE in one view; derived table with
-  aggregate inside; CTE referenced twice (shared hidden view — one store, two readers);
-  self-join; chain creation over populated bases (backfill order) and boot-restart
-  rebuild of a chain; `DROP VIEW` cascade; `DROP TABLE` blocked under a chain.
+  aggregate inside; an anchor CTE referenced twice (two independent hidden views, two
+  stores, joined as distinct sources); self-join of a base table; chain creation over
+  populated bases (backfill order) and boot-restart rebuild of a chain; `DROP VIEW`
+  cascade; `DROP TABLE` blocked under a chain.
 - **Perf**: `make bench` before/after step 4 (behavior-neutral refactor must not move
   view-maintenance throughput beyond the documented ±3-4% e2e noise); a chain micro-lag
   check (per-hop cascade cost) via a 3-hop chain e2e timing assertion kept generous.
@@ -360,5 +505,8 @@ Each step compiles and passes `make verify` + `make e2e` independently.
 - SAL durability contract: chain creation is one durable DDL zone; backfill exchange
   rounds stay command-only.
 - Engine wire format, opcodes, and `precheck_sys_ingest` semantics unchanged; the
-  engine-side co-drop and N-view ingest paths are exercised, not modified.
+  engine-side co-drop and N-view ingest paths are exercised, not modified. The sole
+  engine change is the distributed backfill tail's dependency-order sort of `new_view_ids`
+  (§3) — same `fan_out_backfill` calls, reordered; the `precheck → mark → apply`
+  atomicity, zone durability, and hooks are untouched.
 - Base-table positivity, (PK, payload) identity, and OPK conventions untouched.
