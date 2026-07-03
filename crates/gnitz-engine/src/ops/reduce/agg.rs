@@ -166,6 +166,31 @@ impl Accumulator {
         self.has_value = true;
     }
 
+    /// Does the MIN-oriented encoding `enc` beat the current extreme? MAX keeps the
+    /// larger encoding, MIN the smaller — the single source of the extreme-direction
+    /// rule, shared by `step_from_batch` and `merge_encoded_extreme`. Reads `acc`
+    /// only, so callers gate on their own first/has_value state.
+    #[inline]
+    fn extreme_replaces(&self, enc: u64) -> bool {
+        if self.agg_op == AggOp::Max {
+            enc > self.acc as u64
+        } else {
+            enc < self.acc as u64
+        }
+    }
+
+    /// Fold a pre-encoded MIN-oriented extreme into this MIN/MAX accumulator —
+    /// the same extreme compare as `step_from_batch`'s MIN/MAX arm. Used by the
+    /// AVI probe-skip path in `op_reduce` to fold the stored `old` extreme into an
+    /// accumulator already carrying the delta's positive-row extreme (`pos`).
+    pub(super) fn merge_encoded_extreme(&mut self, enc: u64) {
+        debug_assert!(matches!(self.agg_op, AggOp::Min | AggOp::Max));
+        if !self.has_value || self.extreme_replaces(enc) {
+            self.acc = enc as i64;
+            self.has_value = true;
+        }
+    }
+
     fn is_float(&self) -> bool {
         self.col_type_code.is_float()
     }
@@ -242,13 +267,7 @@ impl Accumulator {
             // `encode_ordered`'s unreachable arm is genuinely unreachable.
             AggOp::Min | AggOp::Max => {
                 let enc = super::super::util::encode_ordered(bytes, tc as u8, false);
-                let cur = self.acc as u64;
-                let replaces = if self.agg_op == AggOp::Max {
-                    enc > cur
-                } else {
-                    enc < cur
-                };
-                if first || replaces {
+                if first || self.extreme_replaces(enc) {
                     self.acc = enc as i64;
                 }
             }
@@ -373,8 +392,8 @@ pub(super) fn readback_agg_bits(bytes: &[u8], src_tc: TypeCode) -> u64 {
 /// A NULL old aggregate contributes nothing: folding its zero bytes would
 /// saturate `has_value`, decoding NULL as 0. The aggregates are the trailing
 /// output columns (`build_reduce_output_schema` appends them last), so `cbase`
-/// (first agg column index) and `pbase` (first agg payload slot) address each
-/// value and its null bit at any PK arity.
+/// (first agg column index) addresses each value and — via `col_is_null`'s
+/// logical→payload mapping — its null bit at any PK arity.
 ///
 /// Non-linear (MIN/MAX) accumulators are skipped: the combined AVI owns each
 /// extreme and `apply_agg_from_value_index` *overwrites* the accumulator after
@@ -389,22 +408,37 @@ pub(super) fn fold_old_aggs(
     agg_descs: &[AggDescriptor],
     agg_col_widths: &[usize],
     cbase: usize,
-    pbase: usize,
 ) {
     for (k, acc) in accs.iter_mut().enumerate() {
         if !agg_descs[k].agg_op.is_linear() {
             continue;
         }
-        if (cursor.current_null_word >> (pbase + k)) & 1 != 0 {
+        if cursor.col_is_null(cbase + k) {
             continue;
         }
-        let cw = agg_col_widths[k];
-        let ptr = cursor.col_ptr(cbase + k, cw);
-        if !ptr.is_null() {
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, cw) };
+        if let Some(bytes) = cursor.col_bytes(cbase + k, agg_col_widths[k]) {
             acc.merge_accumulated(readback_agg_bits(bytes, agg_descs[k].col_type_code));
         }
     }
+}
+
+/// The stored integer MIN/MAX value in the trace_out row's agg column as its
+/// MIN-oriented encoding, or `None` if the null bit is set (a previously all-NULL
+/// group). Integer sources only — a float MIN/MAX always probes — so the output
+/// slot is native-LE at the source width and `encode_ordered` is exact and
+/// bijective: no F32→F64 rescale, no NaN payload to lose. `c_idx` is the agg
+/// column's logical index (its null bit is resolved through `col_is_null`), `cw`
+/// its output width (= source width for integers).
+pub(super) fn read_old_minmax_encoded(cursor: &ReadCursor, c_idx: usize, cw: usize, src_tc: TypeCode) -> Option<u64> {
+    debug_assert!(
+        !src_tc.is_float(),
+        "read_old_minmax_encoded called on a float aggregate (float MIN/MAX always probes)",
+    );
+    if cursor.col_is_null(c_idx) {
+        return None;
+    }
+    let bytes = cursor.col_bytes(c_idx, cw)?;
+    Some(super::super::util::encode_ordered(bytes, src_tc as u8, false))
 }
 
 /// True iff `group_cols` is a single column whose type permits using

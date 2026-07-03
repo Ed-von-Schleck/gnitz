@@ -8,10 +8,22 @@ use super::super::util::{
     GroupKeyExtractor,
 };
 use super::agg::{
-    apply_agg_from_value_index, fold_old_aggs, is_single_col_natural_pk, Accumulator, AggDescriptor, AggOp,
+    apply_agg_from_value_index, fold_old_aggs, is_single_col_natural_pk, read_old_minmax_encoded, Accumulator,
+    AggDescriptor, AggOp,
 };
 use super::emit::{emit_finalized_row, emit_global_ground, emit_reduce_row};
 use super::sort::{argsort_delta, argsort_pk_canonical, build_sort_descs, compare_by_group_cols, SortDesc};
+
+/// Upper bound on the per-group delta rows the AVI probe-skip path pre-steps into
+/// a MIN/MAX accumulator. Pre-stepping is O(positive delta rows); the probe it
+/// saves is a fixed O(log N) seek, so beyond this many delta rows in a group the
+/// pre-step costs more than the probe. A group longer than the cap force-probes
+/// (its partial pre-stepped accumulator is overwritten by the probe, so the cap
+/// is correctness-neutral). Keeps the optimization net-beneficial across the
+/// whole grouping-cardinality range — a low-cardinality GROUP BY, a boot backfill
+/// (whole table in one epoch), or a large single-key batch never pays an
+/// unbounded pre-step to save one cheap probe.
+const SKIP_TRACK_CAP: usize = 128;
 
 /// `clear()` does not re-zero the data buffer, so the scatter variants used
 /// here must be the unconditional-copy ones — a nullable-skip would leak stale
@@ -89,11 +101,9 @@ pub(super) fn cursor_matches_group(
             continue;
         }
 
-        let cursor_ptr = cursor.col_ptr(desc.c_idx as usize, cs);
-        if cursor_ptr.is_null() {
+        let Some(cursor_bytes) = cursor.col_bytes(desc.c_idx as usize, cs) else {
             return false;
-        }
-        let cursor_bytes = unsafe { std::slice::from_raw_parts(cursor_ptr, cs) };
+        };
         let exemplar_bytes = exemplar_mb.get_col_ptr(exemplar_row, pi, cs);
 
         // Group membership is an equality test, but byte-equality and typed
@@ -273,17 +283,28 @@ pub fn op_reduce(
     let agg_col_widths: Vec<usize> = (0..num_aggs)
         .map(|k| output_schema.columns[num_out_cols - num_aggs + k].size() as usize)
         .collect();
-    // First aggregate column's logical index / payload slot (the aggregates are
-    // the trailing output columns, so these hold at any PK arity). Loop-invariant
-    // — hoisted out of the group loop alongside `agg_col_widths`.
+    // First aggregate column's logical index (the aggregates are the trailing
+    // output columns, so this holds at any PK arity). Loop-invariant — hoisted
+    // out of the group loop alongside `agg_col_widths`. Each aggregate's null bit
+    // is resolved from this logical index via `ReadCursor::col_is_null`.
     let cbase = num_out_cols - num_aggs;
-    let pbase = output_schema.num_payload_cols() - num_aggs;
 
     // We need mutable access to optional cursors. Take ownership via Option::take pattern.
     // The caller passes these as Option<&mut ReadCursor>, but we need to use them
     // multiple times in the loop. They're already &mut so we can use them directly.
     let mut trace_in = trace_in_cursor;
     let mut avi = avi_cursor;
+    // Loop-invariant: MIN/MAX accumulators are pre-stepped during the group walk
+    // only on the AVI path, and only when some value-indexed aggregate can actually
+    // use the skip path. A float MIN/MAX always probes (its output is F64-widened,
+    // not byte-exact to the source), so an all-float set of extremes never benefits
+    // — gating it out here skips the per-row pre-step that its probe would discard.
+    // The non-AVI replay path handles MIN/MAX itself (it resets and re-steps every
+    // accumulator from the merged replay), so pre-stepping there would be wasted.
+    let track_nonlinear = avi.is_some()
+        && agg_descs
+            .iter()
+            .any(|d| d.agg_op.uses_value_index() && !d.col_type_code.is_float());
 
     // AVI group-key gatherer: built once so the per-group lookup gathers the
     // full byte-form group key (the prefix, plus the per-aggregate ordinal
@@ -491,6 +512,10 @@ pub fn op_reduce(
         for acc in accs.iter_mut() {
             acc.reset();
         }
+        // Per group: has any consolidated delta row weight ≤ 0? A retraction is
+        // the only thing that can make a MIN/MAX extreme recede, so an all-insert
+        // group can skip the AVI probe and fold `combine(old, pos)` instead.
+        let mut saw_negative = false;
         while idx < n {
             let curr_idx = sorted_indices[idx] as usize;
             if group_by_pk {
@@ -504,13 +529,32 @@ pub fn op_reduce(
             }
 
             let w = mb.get_weight(curr_idx);
+            if w <= 0 {
+                saw_negative = true;
+            }
+            // Pre-step the delta's inserts into the MIN/MAX accumulators so each
+            // holds `pos` (the extreme over the group's positive-weight, non-NULL
+            // delta rows) for the skip path; the probe path overwrites it. Gated
+            // once per row (independent of which accumulator): only on the AVI
+            // path, only for positive rows, only while the group stays all-insert
+            // and under the pre-step cap — beyond it the group force-probes and the
+            // partial `pos` is discarded. A mixed-in float MIN/MAX pre-stepped here
+            // is likewise discarded by its unconditional probe below.
+            let prestep_nonlinear =
+                track_nonlinear && w > 0 && !saw_negative && (idx - group_start_pos) < SKIP_TRACK_CAP;
             for acc in accs.iter_mut() {
-                if acc.is_linear() {
+                if acc.is_linear() || prestep_nonlinear {
                     acc.step_from_batch(&mb, curr_idx, w);
                 }
             }
             idx += 1;
         }
+        // A group longer than the cap force-probes below. The pre-step gate and
+        // this share the per-group row span (`idx - group_start_pos`): pre-step
+        // covers positions `0..SKIP_TRACK_CAP`, and a longer group is `capped`, so
+        // the two never disagree — an un-capped group has every positive row in
+        // its accumulator.
+        let capped = (idx - group_start_pos) > SKIP_TRACK_CAP;
 
         // Retraction: read old value from trace_out, keyed by the group's output
         // PK (`out_pk_bytes`). A monotone visit order gallops with `advance_to`
@@ -549,7 +593,7 @@ pub fn op_reduce(
         if all_linear && has_old {
             // new = old + delta: fold the old aggregates straight off the
             // still-positioned trace cursor into the accumulators.
-            fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, &agg_col_widths, cbase, pbase);
+            fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, &agg_col_widths, cbase);
         } else if !all_linear {
             if let (Some(ref mut avi_c), Some(extractor)) = (&mut avi, &avi_extractor) {
                 // Combined-index path. Fold the linear companions (SUM / the
@@ -558,7 +602,7 @@ pub fn op_reduce(
                 // group). `fold_old_aggs` skips the non-linear accumulators; the
                 // index owns each MIN/MAX and overwrites it below.
                 if has_old {
-                    fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, &agg_col_widths, cbase, pbase);
+                    fold_old_aggs(&mut accs, trace_out_cursor, agg_descs, &agg_col_widths, cbase);
                 }
                 // Gather the group key once into a buffer with one spare trailing
                 // byte for the per-aggregate ordinal; then for each non-linear
@@ -580,8 +624,32 @@ pub fn op_reduce(
                     .filter(|(_, d)| d.agg_op.uses_value_index())
                     .enumerate()
                 {
-                    gk[gstride] = j as u8;
-                    apply_agg_from_value_index(avi_c, &gk[..gstride + 1], d.agg_op == AggOp::Max, &mut accs[k]);
+                    // Skip the AVI probe for an all-insert integer group that
+                    // already has a stored extreme: a MIN/MAX extreme can only
+                    // recede on a retraction, so an existing group's new extreme is
+                    // `combine(old, pos)`. `old` (= extreme(I_pre), the previously
+                    // emitted value) is under the still-positioned trace_out cursor,
+                    // and `pos` (the delta's positive-row extreme) is already in
+                    // `accs[k]`, pre-stepped in the group walk. Probe otherwise —
+                    // a retraction, a float source, a capped group, or a new group
+                    // (`!has_old`, no `old` to combine; the index is its own source
+                    // of truth) — byte-for-byte the old behavior.
+                    if saw_negative || d.col_type_code.is_float() || capped || !has_old {
+                        gk[gstride] = j as u8;
+                        apply_agg_from_value_index(avi_c, &gk[..gstride + 1], d.agg_op == AggOp::Max, &mut accs[k]);
+                    } else if let Some(enc) = read_old_minmax_encoded(
+                        // `accs[k]` holds `pos` (or is untouched → NULL); fold in
+                        // `old`, read off the trace_out cursor already positioned by
+                        // the `has_old` seek and left in place by `fold_old_aggs`
+                        // above — a column read, not a seek. A NULL `old`
+                        // (previously all-NULL group) folds nothing, leaving `pos`.
+                        trace_out_cursor,
+                        cbase + k,
+                        agg_col_widths[k],
+                        d.col_type_code,
+                    ) {
+                        accs[k].merge_encoded_extreme(enc);
+                    }
                 }
             } else {
                 let replay = replay.as_mut().unwrap();

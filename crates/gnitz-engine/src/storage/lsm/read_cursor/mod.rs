@@ -782,6 +782,22 @@ impl ReadCursor {
         }
     }
 
+    /// Raw bytes of logical column `col` (length `size`) for the current row, or
+    /// `None` when the column pointer is null — invalid cursor, PK column, or an
+    /// out-of-range/absent column. Centralizes the `col_ptr` + `from_raw_parts`
+    /// unsafe read shared by the reduce operator's column reads.
+    ///
+    /// Does NOT consult the null bitmap: a NULL *value* still yields `Some` bytes
+    /// (`col_ptr` never reads the null word), so callers needing NULL semantics
+    /// check `col_is_null` / the null word first.
+    pub(crate) fn col_bytes(&self, col: usize, size: usize) -> Option<&[u8]> {
+        let ptr = self.col_ptr(col, size);
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, size) })
+    }
+
     /// Blob arena base pointer for the current row's source.
     pub fn blob_ptr(&self) -> *const u8 {
         if !self.valid {

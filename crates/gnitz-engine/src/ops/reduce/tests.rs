@@ -7957,3 +7957,817 @@ fn reduce_monotone_probe_many_groups_multi_source() {
         "many-group multi-source incremental SUM/COUNT must match the from-scratch reference",
     );
 }
+
+// ===========================================================================
+// MIN/MAX AVI probe-skip: an all-insert integer group folds `combine(old, pos)`
+// from the reduce's own accumulator and the stored trace_out extreme instead of
+// probing the value index; a group with any retraction (or a float source, or a
+// group past the pre-step cap) still probes. These tests drive the *real* AVI
+// path — the value index is populated per epoch by `op_integrate_with_indexes`
+// (post-delta, as the compiler wires it: AVI Integrate precedes Reduce) and the
+// reduce reads it — and check the skip path against both the unchanged trace-scan
+// (`avi = None`) path and a from-scratch oracle.
+// ===========================================================================
+
+/// Content-keyed Z-set of a consolidated reduce-output batch:
+/// `(pk_bytes, payload_bytes, null_word) → summed weight`, ghosts dropped. Two
+/// batches are equal as Z-sets iff their maps are equal — order-independent, and
+/// exact because the emit path is shared by both reduce paths, so a correct skip
+/// produces byte-identical rows to a probe.
+fn zset_canonical(
+    b: &Batch,
+    out_schema: &SchemaDescriptor,
+) -> std::collections::BTreeMap<(Vec<u8>, Vec<u8>, u64), i64> {
+    let mut m = std::collections::BTreeMap::new();
+    for r in 0..b.count {
+        let pk = b.get_pk_bytes(r).to_vec();
+        let nw = b.get_null_word(r);
+        let mut payload = Vec::new();
+        for (pi, _ci, col) in out_schema.payload_columns() {
+            let cs = col.size() as usize;
+            payload.extend_from_slice(&b.col_data(pi)[r * cs..r * cs + cs]);
+        }
+        *m.entry((pk, payload, nw)).or_insert(0i64) += b.get_weight(r);
+    }
+    m.retain(|_, &mut w| w != 0);
+    m
+}
+
+/// Drive a non-linear (MIN/MAX + COUNT companion) reduce over `epochs` against
+/// live ephemeral tables, returning the consolidated `trace_out` after each
+/// epoch.
+///
+/// `use_avi = true` runs the real combined-AVI path: each input delta is
+/// integrated into a live AVI table *before* the reduce (the index must reflect
+/// post-delta `I(input)`), and the reduce reads that index plus the pre-delta
+/// `trace_out`. `use_avi = false` runs the unchanged trace-scan reference:
+/// `avi = None` with a live `trace_in` integrated *after* the reduce (it must
+/// reflect the pre-delta integral during the reduce). Both maintain `trace_out`
+/// identically, so a correct skip makes the two output streams equal epoch by
+/// epoch.
+fn run_minmax_epochs(
+    in_schema: &SchemaDescriptor,
+    out_schema: &SchemaDescriptor,
+    group_by: &[u32],
+    aggs: &[AggDescriptor],
+    epochs: &[Batch],
+    use_avi: bool,
+    global_ground: bool,
+) -> Vec<std::rc::Rc<Batch>> {
+    use crate::ops::index::{make_avi_schema, op_integrate_with_indexes, AviDesc};
+    use crate::storage::{Persistence, Table};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_str().unwrap();
+
+    let mut trace_out = Table::new(dir, "trace_out", *out_schema, 0, 1 << 20, Persistence::Ephemeral).unwrap();
+    let mut trace_in =
+        (!use_avi).then(|| Table::new(dir, "trace_in", *in_schema, 1, 1 << 20, Persistence::Ephemeral).unwrap());
+    let avi_schema = make_avi_schema(in_schema, group_by);
+    let mut avi_t = use_avi.then(|| Table::new(dir, "avi", avi_schema, 2, 1 << 20, Persistence::Ephemeral).unwrap());
+
+    // Value-indexed (MIN/MAX) subset in descriptor order — exactly what the
+    // compiler feeds the integrate instruction and the reduce read side.
+    let vi_aggs: Vec<AggDescriptor> = aggs.iter().filter(|d| d.agg_op.uses_value_index()).copied().collect();
+
+    let mut states = Vec::with_capacity(epochs.len());
+    for d in epochs {
+        // AVI Integrate precedes Reduce: post-delta `I(input)` before the read.
+        if let Some(t) = avi_t.as_mut() {
+            let avi = AviDesc {
+                table: t as *mut Table,
+                group_by_cols: group_by,
+                aggs: &vi_aggs,
+            };
+            op_integrate_with_indexes(d, None, in_schema, Some(&avi)).unwrap();
+        }
+        let out = {
+            let mut to_ch = trace_out.open_cursor();
+            match (avi_t.as_ref(), trace_in.as_ref()) {
+                (Some(at), None) => {
+                    let mut avi_ch = at.open_cursor();
+                    op_reduce(
+                        d,
+                        None,
+                        to_ch.cursor_mut(),
+                        in_schema,
+                        out_schema,
+                        group_by,
+                        aggs,
+                        Some(avi_ch.cursor_mut()),
+                        None,
+                        None,
+                        global_ground,
+                        global_ground,
+                    )
+                    .0
+                }
+                (None, Some(ti)) => {
+                    let mut ti_ch = ti.open_cursor();
+                    op_reduce(
+                        d,
+                        Some(ti_ch.cursor_mut()),
+                        to_ch.cursor_mut(),
+                        in_schema,
+                        out_schema,
+                        group_by,
+                        aggs,
+                        None,
+                        None,
+                        None,
+                        global_ground,
+                        global_ground,
+                    )
+                    .0
+                }
+                _ => unreachable!("exactly one of avi / trace_in is live"),
+            }
+        };
+        // Reference path: integrate the input into `trace_in` AFTER the reduce so
+        // the cursor read above saw the pre-delta integral.
+        if let Some(ti) = trace_in.as_mut() {
+            op_integrate_with_indexes(d, Some(ti), in_schema, None).unwrap();
+        }
+        trace_out.ingest_owned_batch(out).unwrap();
+        states.push(trace_out.full_scan());
+    }
+    states
+}
+
+/// `[U64 pk, I64 grp, I64 val]` → group by the I64 payload `grp`.
+fn mm_in_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+/// `[U128 pk, I64 grp, I64 min(nullable), I64 max(nullable), I64 count]`.
+fn mm_out_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+/// `MIN(val), MAX(val), COUNT(pk)` — MIN ordinal 0, MAX ordinal 1 in the AVI.
+fn mm_aggs() -> [AggDescriptor; 3] {
+    [
+        AggDescriptor {
+            col_idx: 2,
+            agg_op: AggOp::Min,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 2,
+            agg_op: AggOp::Max,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 0,
+            agg_op: AggOp::Count,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+    ]
+}
+
+/// Raw (unconsolidated) input delta over `mm_in_schema()` from `(pk, grp, val, w)`
+/// rows; `op_reduce` consolidates internally. `grp`/`val` are non-NULL.
+fn build_mm_delta(rows: &[(u64, i64, i64, i64)]) -> Batch {
+    let s = mm_in_schema();
+    let g_pi = s.try_payload_idx(1).unwrap();
+    let v_pi = s.try_payload_idx(2).unwrap();
+    let mut b = Batch::with_schema(s, rows.len().max(1));
+    for &(pk, grp, val, w) in rows {
+        b.extend_pk(pk as u128);
+        b.extend_weight(&w.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(g_pi, &grp.to_le_bytes());
+        b.extend_col(v_pi, &val.to_le_bytes());
+        b.count += 1;
+    }
+    b
+}
+
+/// `grp → (min, max, count)` for a MIN/MAX/COUNT reduce, NULL extremes as `None`.
+type MmState = std::collections::BTreeMap<i64, (Option<i64>, Option<i64>, i64)>;
+
+/// Read a consolidated `mm_out_schema()` batch into `grp → (min, max, count)`,
+/// a NULL min/max reading as `None`. Asserts one net-weight-1 row per group.
+fn readback_mm(b: &Batch) -> MmState {
+    let mut m = std::collections::BTreeMap::new();
+    for r in 0..b.count {
+        assert_eq!(b.get_weight(r), 1, "each live group is one net-weight-1 row");
+        let nw = b.get_null_word(r);
+        let grp = read_i64_le(b.col_data(0), r * 8);
+        let min = ((nw >> 1) & 1 == 0).then(|| read_i64_le(b.col_data(1), r * 8));
+        let max = ((nw >> 2) & 1 == 0).then(|| read_i64_le(b.col_data(2), r * 8));
+        let count = read_i64_le(b.col_data(3), r * 8);
+        assert!(m.insert(grp, (min, max, count)).is_none(), "one output row per group");
+    }
+    m
+}
+
+// Primary oracle: a multi-epoch stream of inserts, updates (retract+insert), and
+// deletes over many groups. The real AVI (probe-skip) path must equal both the
+// unchanged trace-scan reference AND a from-scratch group-by MIN/MAX/COUNT oracle
+// after every epoch — weight-exact, not just row presence. An all-insert epoch
+// into an existing group takes the skip path; a new group or any
+// retraction/update forces a probe.
+#[test]
+fn avi_skip_randomized_equivalence_mixed_churn() {
+    use crate::test_rng::Rng;
+    use std::collections::BTreeMap;
+
+    let in_schema = mm_in_schema();
+    let out_schema = mm_out_schema();
+    let aggs = mm_aggs();
+
+    let mut rng = Rng::new(0x00C0_FFEE_1234_5678);
+    let mut live: BTreeMap<u64, (i64, i64)> = BTreeMap::new(); // pk -> (grp, val)
+    let mut next_pk = 1u64;
+    const N_GROUPS: u64 = 10;
+
+    let mut epochs: Vec<Batch> = Vec::new();
+    let mut oracles: Vec<MmState> = Vec::new();
+
+    for _ep in 0..30 {
+        let mut ops: Vec<(u64, i64, i64, i64)> = Vec::new();
+        let n_ops = 1 + rng.gen_range(10) as usize;
+        for _ in 0..n_ops {
+            let choice = if live.is_empty() { 0 } else { rng.gen_range(3) };
+            match choice {
+                // insert a fresh pk
+                0 => {
+                    let grp = rng.gen_range(N_GROUPS) as i64 - 3; // spans negative groups
+                    let val = rng.gen_range(120) as i64 - 60;
+                    let pk = next_pk;
+                    next_pk += 1;
+                    live.insert(pk, (grp, val));
+                    ops.push((pk, grp, val, 1));
+                }
+                // update an existing pk's value (retract + insert)
+                1 => {
+                    let keys: Vec<u64> = live.keys().copied().collect();
+                    let pk = keys[rng.gen_range(keys.len() as u64) as usize];
+                    let (grp, old_val) = live[&pk];
+                    let new_val = rng.gen_range(120) as i64 - 60;
+                    ops.push((pk, grp, old_val, -1));
+                    ops.push((pk, grp, new_val, 1));
+                    live.insert(pk, (grp, new_val));
+                }
+                // delete an existing pk
+                _ => {
+                    let keys: Vec<u64> = live.keys().copied().collect();
+                    let pk = keys[rng.gen_range(keys.len() as u64) as usize];
+                    let (grp, val) = live[&pk];
+                    ops.push((pk, grp, val, -1));
+                    live.remove(&pk);
+                }
+            }
+        }
+        // Consolidate to a net Z-set delta: within-epoch retract+insert of the same
+        // (pk, grp, val) cancels (so it never falsely suppresses `saw_negative`).
+        let mut netted: BTreeMap<(u64, i64, i64), i64> = BTreeMap::new();
+        for &(pk, grp, val, w) in &ops {
+            *netted.entry((pk, grp, val)).or_insert(0) += w;
+        }
+        let rows: Vec<(u64, i64, i64, i64)> = netted
+            .into_iter()
+            .filter(|&(_, w)| w != 0)
+            .map(|((pk, grp, val), w)| (pk, grp, val, w))
+            .collect();
+        epochs.push(build_mm_delta(&rows));
+
+        // From-scratch oracle from the live base-table state.
+        let mut oracle: MmState = BTreeMap::new();
+        for &(grp, val) in live.values() {
+            let e = oracle.entry(grp).or_insert((None, None, 0));
+            e.0 = Some(e.0.map_or(val, |m: i64| m.min(val)));
+            e.1 = Some(e.1.map_or(val, |m: i64| m.max(val)));
+            e.2 += 1;
+        }
+        oracles.push(oracle);
+    }
+
+    let avi_states = run_minmax_epochs(&in_schema, &out_schema, &[1u32], &aggs, &epochs, true, false);
+    let ref_states = run_minmax_epochs(&in_schema, &out_schema, &[1u32], &aggs, &epochs, false, false);
+
+    for ep in 0..epochs.len() {
+        assert_eq!(
+            zset_canonical(&avi_states[ep], &out_schema),
+            zset_canonical(&ref_states[ep], &out_schema),
+            "epoch {ep}: AVI probe-skip path must equal the trace-scan reference",
+        );
+        assert_eq!(
+            readback_mm(&avi_states[ep]),
+            oracles[ep],
+            "epoch {ep}: AVI probe-skip path must equal the from-scratch MIN/MAX oracle",
+        );
+    }
+}
+
+// Explicit skip/probe cases over a single group, one assertion per epoch.
+#[test]
+fn avi_skip_probe_unit_cases() {
+    let in_schema = mm_in_schema();
+    let out_schema = mm_out_schema();
+    let aggs = mm_aggs();
+    let run = |epochs: &[Batch]| run_minmax_epochs(&in_schema, &out_schema, &[1u32], &aggs, epochs, true, false);
+
+    // (a)/(b) insert-only: MAX rises above old, MIN unchanged; a later insert
+    // below old leaves both extremes folded from `combine(old, pos)`.
+    {
+        let epochs = [
+            build_mm_delta(&[(1, 0, 5, 1)]), // min=max=5
+            build_mm_delta(&[(2, 0, 8, 1)]), // all-insert: max 5→8 (skip), min stays 5
+            build_mm_delta(&[(3, 0, 2, 1)]), // all-insert: min 5→2 (skip), max stays 8
+        ];
+        let s = run(&epochs);
+        assert_eq!(readback_mm(&s[0])[&0], (Some(5), Some(5), 1));
+        assert_eq!(
+            readback_mm(&s[1])[&0],
+            (Some(5), Some(8), 2),
+            "insert above raises MAX via skip"
+        );
+        assert_eq!(
+            readback_mm(&s[2])[&0],
+            (Some(2), Some(8), 3),
+            "insert below lowers MIN via skip"
+        );
+    }
+
+    // (c) retraction strictly inside the range: probe, extremes unchanged.
+    {
+        let epochs = [
+            build_mm_delta(&[(1, 0, 1, 1), (2, 0, 5, 1), (3, 0, 10, 1)]), // min=1, max=10
+            build_mm_delta(&[(2, 0, 5, -1)]),                             // retract the interior 5
+        ];
+        let s = run(&epochs);
+        assert_eq!(
+            readback_mm(&s[1])[&0],
+            (Some(1), Some(10), 2),
+            "interior retraction probes; extremes hold"
+        );
+    }
+
+    // (d) retraction of an extreme with multiplicity 2 at that value: probe, the
+    // second copy keeps MAX at 10.
+    {
+        let epochs = [
+            build_mm_delta(&[(1, 0, 10, 1), (2, 0, 10, 1), (3, 0, 1, 1)]), // two rows at 10
+            build_mm_delta(&[(1, 0, 10, -1)]),                             // retract one 10
+        ];
+        let s = run(&epochs);
+        assert_eq!(
+            readback_mm(&s[1])[&0],
+            (Some(1), Some(10), 2),
+            "duplicated extreme survives one retraction"
+        );
+    }
+
+    // (e) retraction of the unique extreme: probe, MAX recedes to the next value.
+    {
+        let epochs = [
+            build_mm_delta(&[(1, 0, 10, 1), (2, 0, 5, 1), (3, 0, 1, 1)]),
+            build_mm_delta(&[(1, 0, 10, -1)]), // retract the unique max
+        ];
+        let s = run(&epochs);
+        assert_eq!(
+            readback_mm(&s[1])[&0],
+            (Some(1), Some(5), 2),
+            "unique extreme recedes to next via probe"
+        );
+    }
+
+    // (g) group emptied to zero cardinality: the cardinality gate sheds it.
+    {
+        let epochs = [
+            build_mm_delta(&[(1, 0, 5, 1)]),
+            build_mm_delta(&[(1, 0, 5, -1)]), // retract the sole row
+        ];
+        let s = run(&epochs);
+        assert!(
+            !readback_mm(&s[1]).contains_key(&0),
+            "emptied group is shed, not a zombie"
+        );
+    }
+}
+
+// (f) A new all-insert group whose aggregate values are all NULL: the skip path
+// leaves the MIN/MAX accumulators untouched and renders NULL, while COUNT counts
+// the rows.
+#[test]
+fn avi_skip_new_all_null_group() {
+    let in_schema = mm_in_schema();
+    let out_schema = mm_out_schema();
+    let aggs = mm_aggs();
+
+    // Nullable-value delta: both rows have a NULL `val`.
+    let delta = {
+        let s = mm_in_schema();
+        let g_pi = s.try_payload_idx(1).unwrap();
+        let v_pi = s.try_payload_idx(2).unwrap();
+        let mut b = Batch::with_schema(s, 2);
+        for pk in [1u64, 2] {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&(1u64 << v_pi).to_le_bytes()); // val NULL
+            b.extend_col(g_pi, &0i64.to_le_bytes());
+            b.extend_col(v_pi, &0i64.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    };
+    let s = run_minmax_epochs(&in_schema, &out_schema, &[1u32], &aggs, &[delta], true, false);
+    assert_eq!(
+        readback_mm(&s[0])[&0],
+        (None, None, 2),
+        "all-NULL insert-only group: MIN/MAX render NULL, COUNT counts rows",
+    );
+}
+
+// Cap: an *existing* group receives more than `SKIP_TRACK_CAP` all-insert rows in
+// one epoch, tripping the pre-step cap so it force-probes (its partial pre-stepped
+// accumulator is discarded by the probe) rather than folding. The cap trigger —
+// not `!has_old` — is what's exercised; the result must match the from-scratch
+// extreme, confirming the cap is correctness-neutral.
+#[test]
+fn avi_skip_cap_force_probes() {
+    let in_schema = mm_in_schema();
+    let out_schema = mm_out_schema();
+    let aggs = mm_aggs();
+
+    // Epoch 0 creates the group (extreme 500); epoch 1 inserts 200 > 128 rows into
+    // the now-existing group — an all-insert, has_old group past the cap.
+    let seed = build_mm_delta(&[(1, 0, 500, 1)]);
+    let bulk: Vec<(u64, i64, i64, i64)> = (0..200).map(|i| (i as u64 + 10, 0, i as i64 - 50, 1)).collect();
+    let epochs = [seed, build_mm_delta(&bulk)];
+    let s = run_minmax_epochs(&in_schema, &out_schema, &[1u32], &aggs, &epochs, true, false);
+    assert_eq!(readback_mm(&s[0])[&0], (Some(500), Some(500), 1));
+    assert_eq!(
+        readback_mm(&s[1])[&0],
+        (Some(-50), Some(500), 201),
+        "a capped all-insert existing group force-probes and still matches the from-scratch extreme",
+    );
+}
+
+// (h) An integer MIN and a float MAX on distinct columns of one group in one
+// insert-only epoch: the integer MIN skips (fold `combine(old, pos)`), the float
+// MAX probes (floats always probe) — both correct in the same pass.
+#[test]
+fn avi_skip_mixed_int_min_float_max() {
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0), // grp
+            SchemaColumn::new(type_code::I64, 0), // ival (integer MIN, skips)
+            SchemaColumn::new(type_code::F64, 0), // fval (float MAX, probes)
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 1), // min(ival)
+            SchemaColumn::new(type_code::F64, 1), // max(fval) widens to F64
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let aggs = [
+        AggDescriptor {
+            col_idx: 2,
+            agg_op: AggOp::Min,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 3,
+            agg_op: AggOp::Max,
+            col_type_code: TypeCode::F64,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 0,
+            agg_op: AggOp::Count,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+    ];
+    let build = |rows: &[(u64, i64, i64, f64, i64)]| -> Batch {
+        let g_pi = in_schema.try_payload_idx(1).unwrap();
+        let i_pi = in_schema.try_payload_idx(2).unwrap();
+        let f_pi = in_schema.try_payload_idx(3).unwrap();
+        let mut b = Batch::with_schema(in_schema, rows.len().max(1));
+        for &(pk, grp, ival, fval, w) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(g_pi, &grp.to_le_bytes());
+            b.extend_col(i_pi, &ival.to_le_bytes());
+            b.extend_col(f_pi, &fval.to_bits().to_le_bytes());
+            b.count += 1;
+        }
+        b
+    };
+    let epochs = [
+        build(&[(1, 0, 5, 1.0, 1)]),
+        build(&[(2, 0, 3, 2.0, 1)]), // all-insert: int MIN 5→3 (skip), float MAX 1.0→2.0 (probe)
+    ];
+    let s = run_minmax_epochs(&in_schema, &out_schema, &[1u32], &aggs, &epochs, true, false);
+    let read = |b: &Batch| -> (Option<i64>, Option<f64>, i64) {
+        assert_eq!(b.count, 1);
+        let nw = b.get_null_word(0);
+        let min = ((nw >> 1) & 1 == 0).then(|| read_i64_le(b.col_data(1), 0));
+        let max = ((nw >> 2) & 1 == 0).then(|| f64::from_bits(read_u64_le(b.col_data(2), 0)));
+        let count = read_i64_le(b.col_data(3), 0);
+        (min, max, count)
+    };
+    assert_eq!(
+        read(&s[1]),
+        (Some(3), Some(2.0), 2),
+        "integer MIN skips and float MAX probes in one insert-only pass",
+    );
+}
+
+/// Drive a float MIN/MAX reduce through both paths and assert equality every
+/// epoch. Floats always probe, so this pins that the today-behavior float path is
+/// preserved — including ±0.0 and NaN under the total order.
+fn check_float_minmax_matches_reference(val_tc: TypeCode, epochs_rows: &[Vec<(u64, i64, f64, i64)>]) {
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(val_tc as u8, 0),
+        ],
+        &[0],
+    );
+    // Float MIN/MAX widen to F64 in the output, regardless of an F32 source.
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::F64, 1),
+            SchemaColumn::new(type_code::F64, 1),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let aggs = [
+        AggDescriptor {
+            col_idx: 2,
+            agg_op: AggOp::Min,
+            col_type_code: val_tc,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 2,
+            agg_op: AggOp::Max,
+            col_type_code: val_tc,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 0,
+            agg_op: AggOp::Count,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+    ];
+    let build = |rows: &[(u64, i64, f64, i64)]| -> Batch {
+        let g_pi = in_schema.try_payload_idx(1).unwrap();
+        let v_pi = in_schema.try_payload_idx(2).unwrap();
+        let mut b = Batch::with_schema(in_schema, rows.len().max(1));
+        for &(pk, grp, val, w) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(g_pi, &grp.to_le_bytes());
+            if val_tc == TypeCode::F32 {
+                b.extend_col(v_pi, &(val as f32).to_bits().to_le_bytes());
+            } else {
+                b.extend_col(v_pi, &val.to_bits().to_le_bytes());
+            }
+            b.count += 1;
+        }
+        b
+    };
+    let epochs: Vec<Batch> = epochs_rows.iter().map(|r| build(r)).collect();
+    let avi = run_minmax_epochs(&in_schema, &out_schema, &[1u32], &aggs, &epochs, true, false);
+    let refr = run_minmax_epochs(&in_schema, &out_schema, &[1u32], &aggs, &epochs, false, false);
+    for ep in 0..epochs.len() {
+        assert_eq!(
+            zset_canonical(&avi[ep], &out_schema),
+            zset_canonical(&refr[ep], &out_schema),
+            "float MIN/MAX epoch {ep}: AVI path must equal the trace-scan reference",
+        );
+    }
+}
+
+#[test]
+fn avi_float_f64_minmax_matches_reference() {
+    check_float_minmax_matches_reference(
+        TypeCode::F64,
+        &[
+            vec![(1, 0, -0.0, 1), (2, 0, 0.0, 1), (3, 0, 5.0, 1), (4, 0, -5.0, 1)], // ±0.0 both present
+            vec![(5, 0, f64::NAN, 1)],                                              // NaN is the max under total_cmp
+            vec![(3, 0, 5.0, -1)],                                                  // retract a finite (always probes)
+            vec![(5, 0, f64::NAN, -1)],                                             // retract the NaN
+        ],
+    );
+}
+
+#[test]
+fn avi_float_f32_minmax_matches_reference() {
+    check_float_minmax_matches_reference(
+        TypeCode::F32,
+        &[
+            vec![(1, 0, -0.0, 1), (2, 0, 0.0, 1), (3, 0, 2.5, 1), (4, 0, -2.5, 1)],
+            vec![(5, 0, f64::NAN, 1)],
+            vec![(3, 0, 2.5, -1)],
+        ],
+    );
+}
+
+/// PK-source MAX: the aggregated column is a PK column, read through
+/// `native_le_bytes` both when pre-stepping the accumulator (skip path) and when
+/// the AVI is populated. `b_signed` picks a signed (sign-flipped OPK) or unsigned
+/// second PK column.
+fn check_pk_source_max(b_signed: bool) {
+    use std::collections::BTreeMap;
+    let b_tc = if b_signed { type_code::I64 } else { type_code::U64 };
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0), // a (pk, group)
+            SchemaColumn::new(b_tc, 0),           // b (pk, aggregated by MAX)
+            SchemaColumn::new(type_code::I64, 0), // pad (payload)
+        ],
+        &[0, 1],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0), // a (natural PK)
+            SchemaColumn::new(b_tc, 1),           // max(b) (nullable)
+            SchemaColumn::new(type_code::I64, 0), // count
+        ],
+        &[0],
+    );
+    let aggs = [
+        AggDescriptor {
+            col_idx: 1,
+            agg_op: AggOp::Max,
+            col_type_code: TypeCode::from_validated_u8(b_tc),
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 0,
+            agg_op: AggOp::Count,
+            col_type_code: TypeCode::U64,
+            _pad: [0; 2],
+        },
+    ];
+    let build = |rows: &[(u64, i64, i64)]| -> Batch {
+        let pad_pi = in_schema.try_payload_idx(2).unwrap();
+        let mut bt = Batch::with_schema(in_schema, rows.len().max(1));
+        for &(a, b, w) in rows {
+            bt.extend_pk_opk(&in_schema, &[a as u128, b as u128]);
+            bt.extend_weight(&w.to_le_bytes());
+            bt.extend_null_bmp(&0u64.to_le_bytes());
+            bt.extend_col(pad_pi, &0i64.to_le_bytes());
+            bt.count += 1;
+        }
+        bt
+    };
+    let low = if b_signed { -5 } else { 5 };
+    let epochs = [
+        build(&[(1, 10, 1), (1, low, 1), (2, 3, 1)]), // a=1: max=10 (count 2); a=2: max=3
+        build(&[(1, 20, 1)]),                         // all-insert: a=1 max 10→20 (skip)
+        build(&[(1, 20, -1)]),                        // retract extreme: a=1 max 20→10 (probe)
+    ];
+    let s = run_minmax_epochs(&in_schema, &out_schema, &[0u32], &aggs, &epochs, true, false);
+    let read = |b: &Batch| -> BTreeMap<u64, (i64, i64)> {
+        let mut m = BTreeMap::new();
+        for r in 0..b.count {
+            let a = u64::from_be_bytes(b.get_pk_bytes(r)[..8].try_into().unwrap());
+            let max_b = read_i64_le(b.col_data(0), r * 8);
+            let count = read_i64_le(b.col_data(1), r * 8);
+            m.insert(a, (max_b, count));
+        }
+        m
+    };
+    assert_eq!(read(&s[0]), BTreeMap::from([(1, (10, 2)), (2, (3, 1))]));
+    assert_eq!(
+        read(&s[1])[&1],
+        (20, 3),
+        "insert-only PK-source MAX rises via the skip path"
+    );
+    assert_eq!(
+        read(&s[2])[&1],
+        (10, 2),
+        "retract-at-extreme PK-source MAX recedes via the probe"
+    );
+}
+
+#[test]
+fn avi_skip_pk_source_max_signed() {
+    check_pk_source_max(true);
+}
+
+#[test]
+fn avi_skip_pk_source_max_unsigned() {
+    check_pk_source_max(false);
+}
+
+// Global (ungrouped) MIN/MAX over the V₀ group (empty prefix): once the V₀ group
+// exists, an insert-only epoch skips; a retract-at-extreme epoch probes and
+// recedes.
+#[test]
+fn avi_skip_global_aggregate() {
+    let in_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let out_schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    let aggs = [
+        AggDescriptor {
+            col_idx: 1,
+            agg_op: AggOp::Min,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 1,
+            agg_op: AggOp::Max,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+        AggDescriptor {
+            col_idx: 0,
+            agg_op: AggOp::Count,
+            col_type_code: TypeCode::I64,
+            _pad: [0; 2],
+        },
+    ];
+    let build = |rows: &[(u64, i64, i64)]| -> Batch {
+        let v_pi = in_schema.try_payload_idx(1).unwrap();
+        let mut b = Batch::with_schema(in_schema, rows.len().max(1));
+        for &(pk, val, w) in rows {
+            b.extend_pk(pk as u128);
+            b.extend_weight(&w.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(v_pi, &val.to_le_bytes());
+            b.count += 1;
+        }
+        b
+    };
+    let epochs = [
+        build(&[(1, 5, 1)]),            // seed the V₀ group (new → probe): min=max=5
+        build(&[(2, 8, 1), (3, 1, 1)]), // insert-only into existing V₀ (skip): min=1, max=8, count=3
+        build(&[(2, 8, -1)]),           // retract the max (probe): max 8→5
+    ];
+    let s = run_minmax_epochs(&in_schema, &out_schema, &[], &aggs, &epochs, true, true);
+    let read = |b: &Batch| -> (Option<i64>, Option<i64>, i64) {
+        assert_eq!(b.count, 1, "global aggregate is exactly one row");
+        let nw = b.get_null_word(0);
+        let min = (nw & 1 == 0).then(|| read_i64_le(b.col_data(0), 0));
+        let max = ((nw >> 1) & 1 == 0).then(|| read_i64_le(b.col_data(1), 0));
+        let count = read_i64_le(b.col_data(2), 0);
+        (min, max, count)
+    };
+    assert_eq!(read(&s[0]), (Some(5), Some(5), 1), "seed global MIN/MAX");
+    assert_eq!(
+        read(&s[1]),
+        (Some(1), Some(8), 3),
+        "insert-only global MIN/MAX into existing V₀ via skip"
+    );
+    assert_eq!(
+        read(&s[2]),
+        (Some(1), Some(5), 2),
+        "retract-the-max global recedes via probe"
+    );
+}
