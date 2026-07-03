@@ -1,77 +1,95 @@
-# Routing-key extraction: single-home the last two drift hazards
+# Key-, routing-, and merge-walk hot-path fixes
 
-## Verdict up front
+A set of independent, self-contained fixes across the engine's PK-key packing,
+exchange routing, and merge-walk hot paths. Each preserves observable behaviour
+unless noted, and each is gated by an existing or moved test. The sections are
+orthogonal and may land in any order.
 
-**The routing-key encodings are already single-homed; the three "duplicate"
-key functions are three thin policies whose differences are load-bearing,
-documented, and test-pinned. Do not merge them.** What remains — and what this
-plan implements — are the two genuine drift hazards the research found, plus a
-correctness cleanup that falls out of colocating the second pair:
+## 1. `pack_pk_be`: register-load the wide and common-narrow widths
 
-- **A.** The relay-scatter PK-routing gate is duplicated verbatim (with its
-  load-bearing comment) at two sites. Single-home it in `router.rs`.
-- **B.** The master-side index-routing cache (`PartitionRouter` +
-  `extract_col_key`) lives in `ops/exchange/router.rs`, three layers away from
-  `index_route_key` (`runtime/orchestration/master/mod.rs:677`) — the function
-  it must byte-agree with. Both are master-only code. Relocate them into one
-  master module so the coherence pair and its pinning tests are adjacent, and in
-  doing so **drop STRING/BLOB from the cache**: their seeks always broadcast
-  (`index_route_key` returns `None`), so every string entry the record path
-  hashes in is dead weight no seek can ever probe. Excluding them at the record
-  site makes `extract_col_key` integer-only and collapses its documented
-  string-image divergence entirely.
+`crates/gnitz-engine/src/schema/key.rs`. The wildcard arm packs every width other
+than 8/16 through a 16-byte stack buffer and a runtime-length `copy_from_slice` —
+including all `> 16` keys (whose leading 16 bytes are a plain register load) and
+the common `u16`/`u32` single-column PKs. `pack_pk_be` is the packer behind
+`pk_sort_key` (relay `order_cache`, `sort_consolidate_inner` sort keys) and
+`compare_pk_ordering` / `pk_bytes_eq` (every N-way merge comparison), so the stack
+copy sits on the hot comparator path. Fold the `16` arm and the `> 16` case into
+one `len >= 16` register load (which also drops the wildcard's now-dead
+`len.min(16)`), and add `2`/`4` arms for the narrow scalars:
 
-## Ground truth: what is already single-homed
+```rust
+#[inline(always)]
+pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
+    match pk_bytes.len() {
+        8 => (u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128) << 64,
+        len if len >= 16 => u128::from_be_bytes(pk_bytes[..16].try_into().unwrap()),
+        4 => (u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128) << 96,
+        2 => (u16::from_be_bytes(pk_bytes[..2].try_into().unwrap()) as u128) << 112,
+        // 1/3/5/6/7/9..=15: odd narrow widths — pad-and-copy (len < 16 here, so
+        // the whole slice is copied and the old `len.min(16)` is unnecessary).
+        len => {
+            let mut buf = [0u8; 16];
+            buf[..len].copy_from_slice(pk_bytes);
+            u128::from_be_bytes(buf)
+        }
+    }
+}
+```
 
-Every byte-level key encoding has exactly one definition; the "three copies"
-named in the commissioning finding are policy selectors over these:
+Update the doc comment's "`{8, 16}` arms" wording to "`{2, 4, 8, ≥16}` arms".
+`pack_pk_be_specialization_matches_naive` (widths 1/2/4/8/16/24/80) already pins
+every arm value-identical to the pad-and-copy. `u128::from_opk` is `pack_pk_be`, so
+it inherits the `≥16` register load for free.
 
-| Shared encoding | Home | Used by |
-|---|---|---|
-| OPK encode / widen (`encode_pk_column`, `widen_pk_be`) | `gnitz-wire` | every key path, incl. `index_route_key` |
-| `pk_route_key` / `payload_route_key` (canonical sign-flipped route image) | `schema` | group-key fold, single-col fast paths, `ColumnLocator::route_key` |
-| `partition_for_pk_bytes` / `partition_for_key` | `schema::key` (via storage facade) | every partition decision |
-| `german_string_promote_key` (128-bit string `_join_pk` image) | `ops/reindex.rs:79` | `PkPromoter::read_string` (trace side) AND `route_partition_key` (scatter side) |
-| `hash_german_string_content` (length-prefixed string fold input) | `ops/util.rs:292` | group-key fold AND `reindex_hash_row` |
-| The group-key fold itself | `ops/util.rs:408` `extract_group_key_row`, one body over batch + cursor via `GroupKeyRow` | `extract_group_key`, `extract_group_key_cursor`; pinned by `extract_group_key_cursor_matches_batch` (`ops/reduce/tests.rs:5108`) |
-| Pack-or-hash scatter decision | `ops/exchange/router.rs:263-310` `key_is_promoted` / `compound_join_packer` / `route_nonpk_row` | both scatter implementations |
+## 2. `PkSortKey::from_opk`: register-load the dominant seek widths
 
-The three policy functions and why each divergence must stay:
+`crates/gnitz-engine/src/schema/key.rs`. `from_opk` is the comparator body of the
+OPK seek fast path: `lower_bound_opk` / `gallop_opk`
+(`storage/repr/columnar.rs`) call it once per binary-search / gallop step. The
+`u64` and `[u128; 2]` impls pad-copy through a stack buffer even at the exact
+dominant stride (8 / 32 bytes). Add the exact-width register load:
 
-- `extract_group_key` (`ops/util.rs:379`): NULL hashes **distinct** — it also
-  mints GROUP BY output PKs in `op_reduce`, where a NULL group and a 0 group
-  must not collide on one PK (`router.rs:199-203`).
-- `route_partition_key` (`ops/exchange/router.rs:204`): a NULL single int
-  column routes by its **raw zero bytes**, and a string by
-  `german_string_promote_key` — both must match the `_join_pk` bytes
-  `PkPromoter::promote_into` writes, or a LEFT-join NULL-key bypass row lands
-  on a worker that does not own its `_join_pk` partition and the view scan
-  misses it (`router.rs:193-203`). `RouteMode` exists precisely to select
-  between this and `extract_group_key`.
-- `extract_col_key` (the index-routing-cache image): **integer/U128/UUID only**
-  — NULL → 0, OPK-encode-and-widen otherwise. STRING/BLOB never reach it (part B
-  excludes them at the record site), so it carries no string image. Its sole
-  counterpart is `index_route_key`, which rebuilds the identical key from a
-  native seek value.
+```rust
+impl PkSortKey for u64 {
+    #[inline(always)]
+    fn from_opk(opk: &[u8]) -> u64 {
+        // Dispatched only for strides ≤ 8; the `== 8` arm loads the dominant
+        // U64/I64 key straight into a register (no memcpy). The narrower strides
+        // left-align at the MSB end so a raw `u64` compare is the OPK byte order.
+        if opk.len() == 8 {
+            u64::from_be_bytes(opk.try_into().unwrap())
+        } else {
+            let mut x = [0u8; 8];
+            x[..opk.len()].copy_from_slice(opk);
+            u64::from_be_bytes(x)
+        }
+    }
+}
 
-### Rejected: one policy-parameterized key function
+impl PkSortKey for [u128; 2] {
+    #[inline(always)]
+    fn from_opk(opk: &[u8]) -> [u128; 2] {
+        // Dispatched only for 17..=32-byte strides: hi = the full leading 16 bytes
+        // (always a register load), lo = the trailing 1..=16 left-aligned. Array
+        // `Ord` is lexicographic, so the low limb settles a leading-16-byte tie a
+        // bare `u128` prefix would tie on.
+        let hi = u128::from_be_bytes(opk[..16].try_into().unwrap());
+        if opk.len() == 32 {
+            [hi, u128::from_be_bytes(opk[16..32].try_into().unwrap())]
+        } else {
+            let mut lo = [0u8; 16];
+            lo[..opk.len() - 16].copy_from_slice(&opk[16..]);
+            [hi, u128::from_be_bytes(lo)]
+        }
+    }
+}
+```
 
-Merging the three into `routing_key(…, policy)` centralizes nothing that is
-not already central (the encodings) and turns three thin functions, each
-carrying its own correctness comment, into one function with a NULL-policy ×
-string-policy branch matrix — including combinations no caller may ever use.
-Net lines ≈ 0; readability and the documented divergences lose.
+`lower_bound_opk_matches_byte_search` (strides 4/8/12/16/24/32/40) drives
+`from_opk` through both arms against the byte oracle and pins them. The `u128`
+impl needs no change — it delegates to `pack_pk_be`.
 
-### Rejected: unifying the two string-key images
-
-`german_string_promote_key`'s xxh128 image and `hash_german_string_content`'s
-length-prefixed stream are each one half of a different coherence pair
-(`_join_pk` writer ↔ scatter router; row-identity hash ↔ group fold). Each pair
-already shares one function; collapsing across pairs couples consumers the code
-documents as independent and changes hash images for zero behavioral gain.
-(`extract_col_key` no longer holds a third string image — it is integer-only.)
-
-## A. Single-home the relay-scatter PK-routing gate
+## 3. Single-home the relay-scatter PK-routing gate
 
 The identical expression + comment pair lives at
 `ops/exchange/relay.rs:130` (`op_repartition_batches_mode`) and
@@ -128,7 +146,7 @@ Signatures validated: `pk_indices() -> &[u32]`
 `col_indices: &[u32]`, `target_tcs: &[u8]`, `schema: &SchemaDescriptor` in
 scope.
 
-## B. Colocate and simplify the index-routing coherence pair
+## 4. Colocate and simplify the index-routing coherence pair
 
 `PartitionRouter` is master-only state: constructed at
 `runtime/orchestration/master/dispatch.rs:38`, written at `dispatch.rs:783`
@@ -137,9 +155,13 @@ scope.
 `master/mod.rs:294`. Nothing in `ops`, `query`, `catalog`, or the worker uses
 it. Its key image (`extract_col_key`) must byte-agree with `index_route_key`
 (`master/mod.rs:677-690`) — a pair currently spread across two layers and
-kept honest by comments on both ends plus a master-side test.
+kept honest by comments on both ends plus a master-side test. Colocate them into
+one master module so the coherence pair and its pinning tests are adjacent, and
+in doing so drop STRING/BLOB from the cache: their seeks always broadcast
+(`index_route_key` returns `None`), so every string entry the record path hashes
+in is dead weight no seek can ever probe.
 
-### B.1 Exclude STRING/BLOB from the cache
+### 4.1 Exclude STRING/BLOB from the cache
 
 `index_route_key` returns `None` for STRING/BLOB, so a unique-index seek on a
 string column always falls through to the broadcast path — it never probes
@@ -167,7 +189,7 @@ for ci in 0..n_idx {
     // cached (table, col, hash) → worker entry is never probed. Recording it
     // only grows the map with every distinct string value and hashes on every
     // commit, for a routing decision no seek can use. Skip it — this also keeps
-    // `extract_col_key` integer-only (B.2).
+    // `extract_col_key` integer-only (§4.2).
     if gnitz_wire::is_german_string(schema.columns[col_idx as usize].type_code) {
         continue;
     }
@@ -192,9 +214,9 @@ so `schema.columns[col_idx as usize]` is in bounds. This changes nothing a seek
 observes — string seeks already broadcast and find their rows — it only stops
 the cache from accreting entries it can never serve.
 
-### B.2 `extract_col_key` becomes integer-only
+### 4.2 `extract_col_key` becomes integer-only
 
-With B.1 filtering STRING/BLOB out of the sole caller, `extract_col_key`'s
+With §4.1 filtering STRING/BLOB out of the sole caller, `extract_col_key`'s
 content-hash branch and its NULL-string wild-heap guard are dead production
 code. Drop them; the function reduces to the integer/U128/UUID arm plus a NULL
 guard for nullable integer columns:
@@ -227,7 +249,7 @@ column, so the `debug_assert` is a documented tripwire, not a crash guard — th
 key it would produce is simply never stored. `record_routing_from_source` (the
 insert/remove loop) is unchanged and moves verbatim.
 
-### B.3 Relocation
+### 4.3 Relocation
 
 Create `crates/gnitz-engine/src/runtime/orchestration/master/index_router.rs`:
 
@@ -245,17 +267,17 @@ Create `crates/gnitz-engine/src/runtime/orchestration/master/index_router.rs`:
 
 Move, with the signature changes above:
 
-1. `extract_col_key` (integer-only per B.2) — private to the new module.
+1. `extract_col_key` (integer-only per §4.2) — private to the new module.
 2. `PartitionRouter` + impl (`router.rs:112-187`, including the section header
    and doc). Visibility drops from `pub` to `pub(super)` (only `master/mod.rs`
    and `master/dispatch.rs` touch it). The `#[cfg(test)] record_routing`
    batch-scan helper is **deleted**, not moved — it is a test-only near-duplicate
    of `record_routing_from_source`; its callers switch to the production method
-   (B.4).
+   (§4.4).
 3. `index_route_key` (`master/mod.rs:670-690`, doc comment included) — becomes
    `pub(super)`.
 
-### B.4 Tests
+### 4.4 Tests
 
 - **Delete** the two STRING/BLOB tests (`extract_col_key_handles_blob_column`,
   `test_partition_router_string_col`) and their sole builders
@@ -327,7 +349,7 @@ use crate::storage::Layout; // make_batch certifies its layout
 (`SchemaDescriptor`, `Batch`, and `MemBatch` come in via `super::*` from the
 module body's own imports.)
 
-### B.5 Reference updates
+### 4.5 Reference updates
 
 - `runtime/orchestration/master/mod.rs`: add `mod index_router;`; change the
   `router` field type path (`:294`) and drop the now-moved `index_route_key`
@@ -343,39 +365,116 @@ module body's own imports.)
   `PartitionRouter`, the three moved/deleted tests, the two string builders) and
   the now-unused `use rustc_hash::FxHashMap;` (`:6`, sole user was
   `PartitionRouter`). `extract_group_key` import stays (used by
-  `route_partition_key`).
+  `route_partition_key`). Keeps the scatter-side policies (`RouteMode`,
+  `route_partition_key`, `hash_row_for_partition`, `route_nonpk_row`,
+  `compound_join_packer`, `key_is_promoted`, `scatter_is_pk_routed`,
+  `fill_worker_indices`, `op_partition_filter`).
 
 Dependency check: the new module needs `SchemaDescriptor`, `ColumnLocator`
-(via `schema.locate`), `foundation::xxh` is **no longer needed** (integer-only),
-`MemBatch`/`Batch` — all below `runtime` in the layering, so no new
-wrong-direction edge. `ops/exchange/router.rs` loses its only master-serving
-code and keeps the scatter-side policies (`RouteMode`, `route_partition_key`,
-`hash_row_for_partition`, `route_nonpk_row`, `compound_join_packer`,
-`key_is_promoted`, `scatter_is_pk_routed`, `fill_worker_indices`,
-`op_partition_filter`).
+(via `schema.locate`), `MemBatch`/`Batch` — all below `runtime` in the layering,
+so no new wrong-direction edge. `foundation::xxh` is no longer needed
+(integer-only).
 
-## Not in scope
+## 5. `PreflightKeyStream`: drop the view before its backing slot
 
-- **Untrusted `col_idx` bounds.** The client seek path validates every column
-  index against `num_columns()` in `validated_index_cols` (`executor.rs:975`)
-  before dispatch, the internal `seek_unique_holder` path uses catalog-defined
-  columns, and `num_columns() ≤ MAX_COLUMNS` is asserted at schema creation — so
-  `index_route_key`'s `columns[col_idx]` can never index out of bounds. No guard
-  is added; one would duplicate the deliberate single validation point.
-- **Retract-then-insert cache eviction.** The master's `record_index_routing`
-  never sees a batch carrying both a `+1` and a `-1` for the same real key:
-  UPDATE and ON CONFLICT DO UPDATE emit only `+1` rows (the old-value retraction
-  is synthesized downstream by the worker's `enforce_unique_pk`), and DELETE
-  emits only `-1` rows with filler payload (`client.rs:530`). No reordering fix
-  is needed.
+`crates/gnitz-engine/src/runtime/orchestration/master/preflight.rs`. `mb` is a
+lifetime-erased zero-copy view into `slot`'s W2M ring bytes; the struct doc and
+`attach_frame` both state "the view must die before its backing slot". Rust
+drops fields in declaration order, but `slot` is declared before `mb`, so the
+struct's own drop glue releases the ring slot *before* the view — the reverse of
+the invariant. `MemBatch` has no `Drop` today, so this is latent rather than a
+live use-after-free, but the ordering must be correct by construction. Declare
+`mb` before `slot`:
+
+```rust
+struct PreflightKeyStream {
+    /// Worker index (error attribution) and scan request id (frame pulls).
+    w: usize,
+    req_id: u64,
+    /// Zero-copy view of the current frame's key batch (`None` for an empty
+    /// terminal frame or after a decode error). Declared before `slot` so it
+    /// drops first — it borrows `slot`'s ring bytes with its lifetime erased.
+    mb: Option<crate::storage::MemBatch<'static>>,
+    /// Ring slot backing `mb`. Holding it parks the frame's ring bytes.
+    slot: Option<W2mSlot>,
+    /// Cursor into `mb`.
+    row: usize,
+    /// Current frame is non-terminal: status 0 and no FLAG_SCAN_LAST.
+    has_more: bool,
+}
+```
+
+`new` uses named-field init, so only the declaration order changes.
+
+## 6. Ownership-doc repair
+
+Six module docs record the ownership rules for the merge / exec hot paths but
+cite a section ("§8 cluster N") of a document that no longer exists, so the
+contract text is unreachable. Replace each dangling reference with the
+self-contained rule. Exact edits:
+
+1. `crates/gnitz-engine/src/query/vm/exec.rs:1-2`
+
+   ```rust
+   //! Epoch execution: `execute_epoch` / `execute_epoch_multi` and the opcode
+   //! dispatch loop — kept whole: boxing per-opcode handlers or splitting the
+   //! match arms would break monomorphization of the dispatch loop.
+   ```
+
+2. `crates/gnitz-engine/src/storage/lsm/compact/merge.rs:7-9` (the
+   parenthetical spans three lines) — delete the dead pointer, keep the rule:
+
+   ```rust
+   //! [`run_merge`](super::super::merge::run_merge) (the sole pending-group
+   //! drain owner; re-extracting a local drain loop would fork the
+   //! (PK, payload) total order); this module only drives it and materializes
+   ```
+
+3. `crates/gnitz-engine/src/ops/join/rowwrite.rs:1-3`
+
+   ```rust
+   //! Shared inner-join row writer. Kept `#[inline]` so the per-row column-copy
+   //! loops fold into their callers across the join split — the "no per-row
+   //! cross-file call boundary" guarantee.
+   ```
+
+4. `crates/gnitz-engine/src/ops/distinct.rs:543`
+
+   ```rust
+   // Wide-PK distinct tests
+   ```
+
+5. `crates/gnitz-engine/src/catalog/write_path.rs:6-7` — the invariant is
+   already stated in full by the surrounding sentence; drop only the dead
+   parenthetical:
+
+   ```rust
+   //! `sys_tables.rs` / `apply_context.rs`. No second ingest entry point may
+   //! skip this precheck/hooks path.
+   ```
+
+6. `crates/gnitz-engine/src/runtime/orchestration/worker/exchange.rs:1-3` —
+   drop the dead sentence; the module doc already names the machinery:
+
+   ```rust
+   //! Worker exchange-wait re-entry: the defer-then-replay machinery
+   //! (`do_exchange_wait` inline dispatch loop + `dispatch_deferred` /
+   //! `replay_deferred_ticks`).
+   ```
 
 ## Verification
 
-- `make verify` — fmt, clippy-as-errors, full unit tests. The moved pinning
-  tests (`partition_router_basic`, `index_route_key_hits_signed_routing_cache`)
-  and the untouched `extract_group_key_cursor_matches_batch` must pass — no hash
-  image changes on any surviving path.
-- `make e2e` (multi-worker, `GNITZ_WORKERS=4`) — item A touches the exchange
-  scatter gate (join/group-by/set-op suites exercise both scatter paths); the
-  unique-index suites, including a string/BLOB unique index, confirm B.1 leaves
+- `make verify` — fmt, clippy-as-errors, full unit tests. Pins for each section:
+  - §1 `pack_pk_be_specialization_matches_naive` and the `opk_proptest` module
+    (`schema/key.rs`).
+  - §2 `lower_bound_opk_matches_byte_search` (`storage/repr/columnar.rs`).
+  - §3/§4 the moved `partition_router_basic` /
+    `index_route_key_hits_signed_routing_cache` and the untouched
+    `extract_group_key_cursor_matches_batch` — no hash image changes on any
+    surviving path.
+  - §5 is a compile-time reorder over a `Drop`-free `MemBatch`; §6 is
+    comment-only.
+- `make e2e` (multi-worker, `GNITZ_WORKERS=4`) — §3 touches the exchange scatter
+  gate (join / group-by / set-op suites exercise both scatter paths); the
+  unique-index suites, including a string/BLOB unique index, confirm §4.1 leaves
   seek results unchanged (string seeks still broadcast and find their rows).
