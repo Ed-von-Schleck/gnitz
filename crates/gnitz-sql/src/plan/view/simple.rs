@@ -1,81 +1,61 @@
-//! The filter/map single-table view: an optional WHERE filter plus a projection
-//! (pure column reorder/subset, or an expr-map when the projection derives or
-//! duplicates a PK column).
+//! The filter/map linear segment emitter: an optional WHERE filter plus a
+//! projection (pure column reorder/subset, or an expr-map when the projection
+//! derives or duplicates a PK column). Consumes the `Project(Filter?(Source))`
+//! IR that `lp::lower_linear` produces; the front-end (clause rejection,
+//! resolution, binding) lives in lowering.
 
-use crate::ast_util::{extract_table_factor_name, is_wildcard_projection};
-use crate::bind::{bind_single_table, Binder};
-use crate::codec::project_schema::{build_projection, ProjItem};
+use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::lower::{compile_bound_expr, compile_bound_expr_to_program};
-use crate::plan::validate::{reject_duplicate_column_names, reject_unhonored_select_clauses, HonoredClauses};
-use crate::SqlResult;
-use gnitz_core::{CircuitBuilder, ExprBuilder, GnitzClient};
+use crate::plan::lp::Rel;
+use crate::plan::view::EmitPieces;
+use gnitz_core::{CircuitBuilder, ExprBuilder};
 
-pub(crate) fn execute_create_simple_view(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    view_name: &str,
-    sql_text: &str,
-    select: &sqlparser::ast::Select,
-    binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
-    // Filter/map views consume only WHERE + projection; reject the rest (GROUP BY, HAVING,
-    // PREWHERE, TOP, …) so a dropped clause is a clean error, not a silent wrong result.
-    reject_unhonored_select_clauses(
-        select,
-        HonoredClauses {
-            where_filter: true,
-            grouping: false,
-            distinct: false,
-        },
-        "CREATE VIEW",
-    )?;
-    let table_name = extract_table_factor_name(&select.from[0].relation, "CREATE VIEW")?;
-
-    let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
-
-    // Build filter expression (if any)
-    let expr_prog = if let Some(where_expr) = &select.selection {
-        let bound = bind_single_table(where_expr, &source_schema)?;
-        Some(compile_bound_expr_to_program(&bound, &source_schema)?)
-    } else {
-        None
+/// Emit a linear segment's circuit from its lowered `Rel`. Returns
+/// `(circuit, output_columns, pk_cols)`; the view's physical PK is the leading
+/// `k` source-PK columns (`pk_cols == 0..k`). `view_id` is the segment's
+/// allocated id (pre-allocated so a chain's downstream segment can reference it).
+pub(crate) fn emit_linear(view_id: u64, rel: Rel) -> Result<EmitPieces, GnitzSqlError> {
+    // A lowered linear view is rooted at a Project (lowering appends one
+    // unconditionally), over an optional Filter, over one Source.
+    let Rel::Project {
+        input,
+        items,
+        out_cols,
+        pk_arity: k,
+    } = rel
+    else {
+        unreachable!("a lowered linear view is rooted at a Project");
+    };
+    let (filter, src) = match *input {
+        Rel::Filter { input, pred } => (Some(pred), *input),
+        other => (None, other),
+    };
+    let Rel::Source {
+        tid: source_tid,
+        schema: source_schema,
+    } = src
+    else {
+        unreachable!("a lowered linear view terminates in one Source");
     };
 
-    // Build projection column list
-    let is_wildcard = is_wildcard_projection(&select.projection);
-    let (items, out_cols) = build_projection(&select.projection, &source_schema)?;
-
-    // The pass-through generalization can now emit the same name twice (SELECT
-    // name, name; or an alias landing on the auto-prepended PK). This keys on
-    // output *names*, so a duplicate PK *value* under distinct names (SELECT id,
-    // id AS id2) is unaffected and accepted.
-    //
-    // A `SELECT *` over a dup-named source (a join view surfacing both sides'
-    // `id`) legitimately carries the duplicate names through positionally — the
-    // same wildcard contract as `execute_create_join_view`. Gate the guard on
-    // `!is_wildcard` so only an *explicit* projection that produces a duplicate
-    // (`SELECT name, name`) errors.
-    if !is_wildcard {
-        reject_duplicate_column_names(out_cols.iter().map(|c| c.name.as_str()), "CREATE VIEW projection")?;
-    }
+    // Filter program (if any), compiled against the source schema.
+    let expr_prog = filter
+        .as_ref()
+        .map(|pred| compile_bound_expr_to_program(pred, &source_schema))
+        .transpose()?;
 
     // Slots 0..k are the view's physical PK (carried verbatim by commit_row). A
     // payload slot (>= k) that is a PK PassThrough is a duplicate PK value; a
     // Computed is a derived column. Either forces the expr-map, which trusts the
-    // planner's declared schema (node_schema = out_schema) and writes/derives
-    // each payload slot explicitly — the pure projection path would silently drop
-    // a PK value requested as a payload column.
-    let k = source_schema.pk_count();
+    // planner's declared schema and writes/derives each payload slot explicitly —
+    // the pure projection path would silently drop a PK value requested as a
+    // payload column.
     let needs_expr_map = items[k..].iter().any(|item| match item {
         ProjItem::Computed { .. } => true,
         ProjItem::PassThrough { src_col } => source_schema.is_pk_col(*src_col),
     });
 
-    // Allocate view_id
-    let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
-
-    // Build circuit
     let mut cb = CircuitBuilder::new(view_id, source_tid);
     let inp = cb.input_delta();
     let filtered = match expr_prog {
@@ -135,11 +115,7 @@ pub(crate) fn execute_create_simple_view(
     let circuit = cb.build();
 
     // The view's physical PK is the leading k columns (the source PK passed
-    // through in pk_indices() order). Persist exactly that.
+    // through in pk_indices() order).
     let view_pk: Vec<u32> = (0..k as u32).collect();
-    client
-        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols, &view_pk)
-        .map_err(GnitzSqlError::Exec)?;
-
-    Ok(SqlResult::ViewCreated { view_id })
+    Ok((circuit, out_cols, view_pk))
 }

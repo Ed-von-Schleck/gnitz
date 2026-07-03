@@ -291,7 +291,7 @@ pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
 /// decode. `sub` is the per-view secondary (node_id, dep_table_id, or an
 /// edge/node-column field pack).
 ///
-/// CONVERGENCE INVARIANT: the client (`write_circuit_rows`) packs the same
+/// CONVERGENCE INVARIANT: the client (`create_view_chain`) packs the same
 /// compound PK with `view_id` in the LOW u128 half (`vid | (sub << 64)`),
 /// the byte-order dual of this `(vid << 64) | sub`. The two reach storage
 /// through different encoders — the client OPK-encodes each 8-byte PK column

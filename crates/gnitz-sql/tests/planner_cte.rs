@@ -58,11 +58,12 @@ fn test_cte_alias_count_mismatch_rejected() {
     );
 }
 
-// ── item 15: a CTE body with WHERE/projection must be rejected, not ──
-// silently discarded (which would return the unfiltered base table).
+// ── item 15: a CTE body with a WHERE compiles into a hidden view segment ──
+// chained to the final view — never silently discarded (which would return
+// the unfiltered base table).
 
 #[test]
-fn test_cte_with_where_rejected() {
+fn test_cte_with_where_compiles_to_hidden_chain() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -71,18 +72,13 @@ fn test_cte_with_where_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT NOT NULL)")
         .unwrap();
-    let err = p
-        .execute("CREATE VIEW v AS WITH cte AS (SELECT * FROM t WHERE b > 5) SELECT a FROM cte")
-        .unwrap_err();
-    assert!(
-        matches!(err, GnitzSqlError::Unsupported(_)),
-        "CTE with WHERE must be rejected (not silently discarded), got {:?}",
-        err
-    );
-    assert!(
-        client.resolve_table_or_view_id(&sn, "v").is_err(),
-        "rejected-CTE view must not be registered"
-    );
+    p.execute("INSERT INTO t VALUES (1, 10), (2, 3)").unwrap();
+    p.execute("CREATE VIEW v AS WITH cte AS (SELECT * FROM t WHERE b > 5) SELECT a FROM cte")
+        .unwrap();
+    // The WHERE was compiled (a hidden filter segment feeds `v`), not dropped:
+    // only the b > 5 row survives.
+    let rows = payload_rows(&mut client, &sn, "v", &["a"]);
+    assert_eq!(rows, vec![vec![1]], "CTE WHERE must filter, not be discarded");
 }
 
 #[test]
@@ -154,7 +150,7 @@ fn test_cte_with_prewhere_rejected() {
 }
 
 #[test]
-fn test_cte_subset_projection_rejected() {
+fn test_cte_subset_projection_compiles_to_hidden_chain() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -163,15 +159,18 @@ fn test_cte_subset_projection_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE t (a BIGINT PRIMARY KEY, b BIGINT NOT NULL)")
         .unwrap();
-    // Projection drops column b — not an identity pass-through.
-    let err = p
-        .execute("CREATE VIEW v AS WITH cte AS (SELECT a FROM t) SELECT a FROM cte")
-        .unwrap_err();
-    assert!(
-        matches!(err, GnitzSqlError::Unsupported(_)),
-        "CTE with a subset projection must be rejected, got {:?}",
-        err
-    );
+    p.execute("INSERT INTO t VALUES (1, 10), (2, 3)").unwrap();
+    // Projection drops column b — not an identity pass-through, so the CTE body
+    // compiles into a hidden projection segment (same machinery as a derived
+    // table) rather than aliasing the base table.
+    p.execute("CREATE VIEW v AS WITH cte AS (SELECT a FROM t) SELECT a FROM cte")
+        .unwrap();
+    let (_, schema) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["a"], "the subset projection must drop column b");
+    let mut rows = payload_rows(&mut client, &sn, "v", &["a"]);
+    rows.sort();
+    assert_eq!(rows, vec![vec![1], vec![2]]);
 }
 
 #[test]

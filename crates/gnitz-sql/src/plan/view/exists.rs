@@ -47,22 +47,21 @@ use crate::plan::view::predicates::{
     and_fold_compile, build_reindex_program, converse_rel, extract_join_predicates, multi_null_filter_prog,
     RangeConjunct,
 };
-use crate::SqlResult;
+use crate::plan::view::EmitPieces;
 use gnitz_core::{CircuitBuilder, ColumnDef, FixedInt, GnitzClient, NodeId, Schema, TypeCode};
 use sqlparser::ast::{BinaryOperator, Expr, Ident, Select, SelectItem, SetExpr};
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_create_exists_view(
+/// Emit an EXISTS/IN semi/anti-join view's circuit pieces `(circuit, cols, pk)`
+/// for a pre-allocated `view_id`.
+pub(crate) fn emit_exists_pieces(
     client: &mut GnitzClient,
-    schema_name: &str,
-    view_name: &str,
-    sql_text: &str,
+    view_id: u64,
     select: &Select,
     subq: &Expr,
     outer_not: bool,
     local_conjuncts: &[&Expr],
     binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
+) -> Result<EmitPieces, GnitzSqlError> {
     // GROUP BY / aggregates cannot host the subquery in one circuit; a targeted
     // message beats the generic clause guard's.
     if group_by_is_present(&select.group_by) || projection_has_aggregate(select) {
@@ -135,7 +134,16 @@ pub(crate) fn execute_create_exists_view(
         },
         "EXISTS/IN subquery",
     )?;
-    if inner_select.from.len() != 1 || !inner_select.from[0].joins.is_empty() {
+    // The subquery FROM must be one plain relation. A derived table is rejected
+    // explicitly: the front door pre-compiles derived tables only in the view's
+    // top-level FROM, so the lenient alias extractor would mis-resolve one here.
+    if inner_select.from.len() != 1
+        || !inner_select.from[0].joins.is_empty()
+        || matches!(
+            &inner_select.from[0].relation,
+            sqlparser::ast::TableFactor::Derived { .. }
+        )
+    {
         return Err(GnitzSqlError::Unsupported(
             "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views".into(),
         ));
@@ -315,7 +323,7 @@ pub(crate) fn execute_create_exists_view(
         None => {
             // Widest intermediate is a join term: [k pk, A, B].
             reject_column_overflow("EXISTS view intermediate", left_cols.len() + outer_n + inner_n)?;
-            build_equi_exists(client, schema_name, view_name, sql_text, ctx)
+            emit_equi_exists(view_id, ctx)
         }
         Some(range) => {
             if left_cols.is_empty() && FixedInt::from_type_code(range.tc).is_none() {
@@ -332,7 +340,7 @@ pub(crate) fn execute_create_exists_view(
                 "EXISTS view intermediate",
                 outer_schema.pk_cols.len() + left_cols.len() + 1 + outer_n + inner_n,
             )?;
-            build_range_exists(client, schema_name, view_name, sql_text, ctx, range)
+            emit_range_exists(view_id, ctx, range)
         }
     }
 }
@@ -397,13 +405,7 @@ fn semi_or_anti(cb: &mut CircuitBuilder, a_all: NodeId, pi_a: NodeId, negated: b
 /// the k synthetic `_join_pk` columns (no output exchange — the join-shard
 /// scatter co-locates `a_all`, `π_A(inner)` and the traces per `_join_pk`
 /// worker, exactly like the LEFT-join null-fill).
-fn build_equi_exists(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    view_name: &str,
-    sql_text: &str,
-    ctx: ExistsCtx<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
+fn emit_equi_exists(view_id: u64, ctx: ExistsCtx<'_>) -> Result<EmitPieces, GnitzSqlError> {
     let k = ctx.left_cols.len();
     let a_n = ctx.outer_schema.columns.len();
     let b_n = ctx.inner_schema.columns.len();
@@ -417,7 +419,6 @@ fn build_equi_exists(
     let left_key_nullable = ctx.left_cols.iter().any(|&c| ctx.outer_schema.columns[c].is_nullable);
     let right_key_nullable = ctx.right_cols.iter().any(|&c| ctx.inner_schema.columns[c].is_nullable);
 
-    let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let (mut cb, a_local, b_local) = ctx.open_circuit(view_id);
 
     let b_match = if right_key_nullable {
@@ -486,31 +487,13 @@ fn build_equi_exists(
         };
         out_pk_cols.push(ColumnDef::new(name, t, false));
     }
-    finish_exists_view(
-        client,
-        schema_name,
-        view_name,
-        sql_text,
-        &ctx,
-        cb,
-        sink_pre,
-        &out_pk_cols,
-        false,
-        view_id,
-    )
+    finish_exists_pieces(&ctx, cb, sink_pre, &out_pk_cols, false)
 }
 
 /// Range correlation — band (`n_eq ≥ 1` + one range conjunct) or pure range
 /// (`n_eq == 0`). Both re-key onto the outer source PK and ride the mandatory
 /// range-join output exchange (view PK = `_src_pk × pa`).
-fn build_range_exists(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    view_name: &str,
-    sql_text: &str,
-    ctx: ExistsCtx<'_>,
-    range: RangeConjunct,
-) -> Result<SqlResult, GnitzSqlError> {
+fn emit_range_exists(view_id: u64, ctx: ExistsCtx<'_>, range: RangeConjunct) -> Result<EmitPieces, GnitzSqlError> {
     let a_n = ctx.outer_schema.columns.len();
     let b_n = ctx.inner_schema.columns.len();
     let n_eq = ctx.left_cols.len();
@@ -552,7 +535,6 @@ fn build_range_exists(
         .iter()
         .any(|&c| ctx.inner_schema.columns[c].is_nullable);
 
-    let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let (mut cb, a_local, b_local) = ctx.open_circuit(view_id);
 
     let input_a = if left_key_nullable {
@@ -687,39 +669,22 @@ fn build_range_exists(
             )
         })
         .collect();
-    finish_exists_view(
-        client,
-        schema_name,
-        view_name,
-        sql_text,
-        &ctx,
-        cb,
-        sink_pre,
-        &src_pk_coldefs,
-        true,
-        view_id,
-    )
+    finish_exists_pieces(&ctx, cb, sink_pre, &src_pk_coldefs, true)
 }
 
-/// The shared create-view tail: build the user projection over the outer
-/// relation (`pk_coldefs` are the view's leading PK columns), append the final
-/// Map only when the projection is not the identity, shard on exactly the view
-/// PK columns in order when the circuit carries an output exchange (band /
-/// pure-range — the compound-key alignment invariant shared with the range
-/// join builder; equi has no exchange), then sink and register the view.
-#[allow(clippy::too_many_arguments)]
-fn finish_exists_view(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    view_name: &str,
-    sql_text: &str,
+/// The shared emit tail: build the user projection over the outer relation
+/// (`pk_coldefs` are the view's leading PK columns), append the final Map only
+/// when the projection is not the identity, shard on exactly the view PK columns
+/// in order when the circuit carries an output exchange (band / pure-range — the
+/// compound-key alignment invariant shared with the range join builder; equi has
+/// no exchange), then sink and return the pieces.
+fn finish_exists_pieces(
     ctx: &ExistsCtx<'_>,
     mut cb: CircuitBuilder,
     sink_pre: NodeId,
     pk_coldefs: &[ColumnDef],
     shard: bool,
-    view_id: u64,
-) -> Result<SqlResult, GnitzSqlError> {
+) -> Result<EmitPieces, GnitzSqlError> {
     let a_n = ctx.outer_schema.columns.len();
     let npk = pk_coldefs.len();
     let (final_cols, final_projection) = build_join_view_projection(
@@ -747,11 +712,7 @@ fn finish_exists_view(
         reject_duplicate_column_names(final_cols.iter().map(|c| c.name.as_str()), "EXISTS view")?;
     }
     let view_pk: Vec<u32> = (0..npk as u32).collect();
-    client
-        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols, &view_pk)
-        .map_err(GnitzSqlError::Exec)?;
-
-    Ok(SqlResult::ViewCreated { view_id })
+    Ok((circuit, final_cols, view_pk))
 }
 
 /// AND a conjunct into the accumulating correlation tree.

@@ -1826,13 +1826,12 @@ class TestRangeJoin:
                 "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL, "
                 "z BIGINT NOT NULL, s VARCHAR(20) NOT NULL, fy DOUBLE NOT NULL)", schema_name=sn)
             rejected = {
-                # A non-order-preserving range pair (string / float content hash) and
-                # a range self-join remain rejected. A *second* range conjunct is no
-                # longer rejected — it becomes a residual post-join filter (asserted
-                # below).
+                # A non-order-preserving range pair (string / float content hash) remains
+                # rejected. A range *self-join* and a *second* range conjunct are no longer
+                # rejected — the former wraps the repeat in a pass-through view, the latter
+                # becomes a residual post-join filter (both asserted below).
                 "string_pair": "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.s < b.s",
                 "float_pair":  "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fx < b.fy",
-                "self_join":   "CREATE VIEW v AS SELECT * FROM a a1 JOIN a a2 ON a1.x < a2.x",
             }
             for label, sql in rejected.items():
                 with pytest.raises(Exception):
@@ -1840,6 +1839,12 @@ class TestRangeJoin:
                 # No view should have been registered by a rejected CREATE.
                 with pytest.raises(Exception):
                     client.resolve_table(sn, "v")
+            # A range self-join now registers: the repeated `a` is auto-wrapped in a
+            # pass-through hidden view, giving the range join two distinct sources.
+            client.execute_sql(
+                "CREATE VIEW self_range_v AS SELECT a1.id AS i FROM a a1 JOIN a a2 ON a1.x < a2.x",
+                schema_name=sn)
+            client.resolve_table(sn, "self_range_v")  # registered (raises if absent)
             # Two range conjuncts now register: the first is the physical range, the
             # second a residual post-join filter (INNER).
             client.execute_sql(
@@ -1847,7 +1852,7 @@ class TestRangeJoin:
                 schema_name=sn)
             client.resolve_table(sn, "two_range_v")  # registered (raises if absent)
         finally:
-            _drop_all(client, sn, views=["v", "two_range_v"], tables=["a", "b"])
+            _drop_all(client, sn, views=["v", "self_range_v", "two_range_v"], tables=["a", "b"])
 
     # ── Band LEFT OUTER (eq prefix + range): the null-fill set-difference ──────
     #

@@ -40,7 +40,7 @@ pub(crate) fn multi_null_filter_prog(
     want_null: bool,
 ) -> Result<gnitz_core::ExprProgram, GnitzSqlError> {
     // Caller invariant: cols is non-empty (at least one join key column) AND at
-    // least one entry is nullable (the outer guard in execute_create_join_view
+    // least one entry is nullable (the outer guard in emit_join
     // ensures both). Guard here so future callers fail loudly rather than
     // panicking at cols[0].
     if cols.is_empty() {
@@ -50,7 +50,7 @@ pub(crate) fn multi_null_filter_prog(
     }
     // Only nullable columns can ever satisfy IsNull or fail IsNotNull, so drop the
     // NOT NULL columns to elide tautological (want_null=false) / contradictory
-    // (want_null=true) filter instructions. The caller (execute_create_join_view)
+    // (want_null=true) filter instructions. The caller (emit_join)
     // only reaches this with ≥ 1 nullable key column, so `nullable` is non-empty on
     // every real path; the `is_empty` fallback to the unfiltered `cols` still
     // degrades correctly should that ever change — with every key NOT NULL,
@@ -506,7 +506,7 @@ mod tests {
     //
     // These exercise the k ≥ 2 logic directly: extract_join_predicates and
     // validate_join_key_pair return their result *before* the `k > 1` planner
-    // gate in execute_create_join_view, so a composite key is fully testable
+    // gate in emit_join, so a composite key is fully testable
     // here even though CREATE VIEW still rejects it end-to-end.
 
     use sqlparser::dialect::GenericDialect;
@@ -525,7 +525,7 @@ mod tests {
     }
 
     /// Build the (left_schema, right_schema, alias_map) trio the way
-    /// `execute_create_join_view` does, for aliases `a` (left) / `b` (right).
+    /// `plan_join_chain` does, for aliases `a` (left) / `b` (right).
     fn join_ctx(left: Vec<ColumnDef>, right: Vec<ColumnDef>) -> (Schema, Schema, AliasMap) {
         let left_n = left.len();
         let left_schema = Schema {

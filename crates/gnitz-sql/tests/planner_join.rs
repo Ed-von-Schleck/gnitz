@@ -1152,9 +1152,11 @@ fn test_range_join_reject_string_range_pair() {
     }
 }
 
-/// A range self-join is rejected (the self-join guard fires for both join kinds).
+/// A range self-join registers: the repeated relation is wrapped in a
+/// distinct-source pass-through hidden view, so the two join inputs are never
+/// the same source (single-source-per-epoch holds).
 #[test]
-fn test_range_join_reject_self_join() {
+fn test_range_join_self_join_wraps() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -1163,14 +1165,12 @@ fn test_range_join_reject_self_join() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE rself (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, y BIGINT NOT NULL)")
         .unwrap();
-    let err = p
-        .execute("CREATE VIEW rself_v AS SELECT * FROM rself a JOIN rself b ON a.x < b.y")
-        .unwrap_err();
-    assert!(
-        matches!(err, GnitzSqlError::Unsupported(_)),
-        "expected Unsupported, got {:?}",
-        err
-    );
+    p.execute("CREATE VIEW rself_v AS SELECT a.id AS ai, b.id AS bi FROM rself a JOIN rself b ON a.x < b.y")
+        .unwrap();
+    p.execute("INSERT INTO rself VALUES (1, 1, 10), (2, 5, 2)").unwrap();
+    // Pairs where left.x < right.y: (1,1) 1<10, (1,2) 1<2, (2,1) 5<10; not (2,2) 5<2.
+    let rows = payload_rows(&mut client, &sn, "rself_v", &["ai", "bi"]);
+    assert_eq!(rows, vec![vec![1, 1], vec![1, 2], vec![2, 1]]);
 }
 
 /// The output pair-PK count cap: two 2-column-PK tables sum to a 4-column pair-PK

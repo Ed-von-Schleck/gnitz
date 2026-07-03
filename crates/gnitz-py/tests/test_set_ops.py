@@ -399,10 +399,12 @@ class TestSetOps:
             )
             rejects("CREATE VIEW v AS SELECT a FROM t SORT BY a", "SORT BY is not supported")
 
-            # --- a top-level WHERE on a JOIN view has no builder and would be dropped ---
+            # --- a top-level WHERE on a JOIN is consumed, not dropped (INNER: folded into the
+            #     residual; OUTER equi: a post-null-fill filter). Only a WHERE over an OUTER
+            #     *range/band* join remains unsupported, so it is rejected, not silently dropped ---
             rejects(
-                "CREATE VIEW v AS SELECT t.a FROM t JOIN u ON t.pk = u.pk WHERE t.a > 5",
-                "WHERE is not supported",
+                "CREATE VIEW v AS SELECT t.a FROM t LEFT JOIN u ON t.a < u.c WHERE t.a > 5",
+                "range/band OUTER join",
             )
 
             # --- GROUP BY ALL must be classified, never routed to the simple path and dropped ---

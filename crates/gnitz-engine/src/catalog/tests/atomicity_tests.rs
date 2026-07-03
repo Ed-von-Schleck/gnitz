@@ -262,7 +262,7 @@ fn test_view_tab_too_many_cols_rejected() {
     // precheck rejects before apply_entity_by_qname mutates the caches.
     // hook_view_register carries the same guard as the build_schema_from_col_defs
     // assert backstop. This is the engine-side counterpart to the client guard in
-    // write_circuit_rows.
+    // create_view_chain.
     let dir = temp_dir("atomicity_view_too_many_cols");
     let mut engine = CatalogEngine::open(&dir).unwrap();
     let init_rows = count_records(&mut engine.sys_views);

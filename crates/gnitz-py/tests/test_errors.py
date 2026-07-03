@@ -175,3 +175,59 @@ class TestSchemaColumnLimit:
         cols = [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64) for i in range(100)]
         with pytest.raises(ValueError):
             gnitz.Schema(cols)
+
+
+# ---------------------------------------------------------------------------
+# Name reservation — user identifiers cannot start with `_` (reserved for the
+# system prefix and for synthesized hidden views `__h{vid}_{i}`). The SQL
+# planner enforces this for CREATE/DROP TABLE and VIEW; the client enforces it
+# for create_schema (no SQL surface). This is the single production gate.
+# ---------------------------------------------------------------------------
+
+class TestNameReservation:
+    def test_create_table_leading_underscore_rejected(self, client):
+        sn = "err" + _uid()
+        try:
+            client.create_schema(sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    "CREATE TABLE _secret (pk BIGINT NOT NULL PRIMARY KEY)",
+                    schema_name=sn,
+                )
+        finally:
+            _cleanup(client, sn)
+
+    def test_create_view_leading_underscore_rejected(self, client):
+        sn = "err" + _uid()
+        try:
+            client.create_schema(sn)
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE VIEW _v AS SELECT * FROM t", schema_name=sn)
+        finally:
+            _cleanup(client, sn, tables=["t"])
+
+    def test_drop_table_leading_underscore_rejected(self, client):
+        sn = "err" + _uid()
+        try:
+            client.create_schema(sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("DROP TABLE _nope", schema_name=sn)
+        finally:
+            _cleanup(client, sn)
+
+    def test_drop_view_leading_underscore_rejected(self, client):
+        sn = "err" + _uid()
+        try:
+            client.create_schema(sn)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("DROP VIEW _nope", schema_name=sn)
+        finally:
+            _cleanup(client, sn)
+
+    def test_create_schema_leading_underscore_rejected(self, client):
+        with pytest.raises(gnitz.GnitzError):
+            client.create_schema("_reserved")

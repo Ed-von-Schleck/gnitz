@@ -160,6 +160,44 @@ struct SerialRange {
 /// caching amortizes that one fsync across `SERIAL_RANGE_SIZE` inserts.
 const SERIAL_RANGE_SIZE: u64 = 64;
 
+/// Upper bound on the number of segments in one atomic view chain. Bounds the
+/// pathological self-referential-CTE blow-up (`WITH b AS (SELECT * FROM a JOIN a)
+/// …` doubling per level) with a clean planner error rather than an unbounded
+/// bundle. Enforced by `create_view_chain`.
+pub const MAX_CHAIN_SEGMENTS: usize = 64;
+
+/// The name of the `idx`-th hidden segment view owned by the user view with id
+/// `owner_vid`. Ownership is name-encoded: `drop_view` cascades over
+/// [`hidden_view_prefix`], so producer (planner) and consumer (drop) must share
+/// this one definition.
+pub fn hidden_view_name(owner_vid: u64, idx: usize) -> String {
+    format!("{}{idx}", hidden_view_prefix(owner_vid))
+}
+
+/// The name prefix every hidden segment of `owner_vid` carries. The separator
+/// terminator is load-bearing: `__h5_` must not match `__h51_0`.
+pub fn hidden_view_prefix(owner_vid: u64) -> String {
+    format!("__h{owner_vid}_")
+}
+
+/// Whether `name` is a synthesized hidden segment view (any owner). Sound
+/// because user identifiers cannot start with `_` (`validate_user_identifier`).
+pub fn is_hidden_view_name(name: &str) -> bool {
+    name.starts_with("__h")
+}
+
+/// One view in a [`GnitzClient::create_view_chain`] bundle. The `circuit`'s
+/// `view_id` names the view's allocated id when non-zero — a chain pre-allocates
+/// every segment's id so a downstream circuit can `ScanDelta` an upstream hidden
+/// view; a zero id is allocated by `create_view_chain`.
+pub struct PlannedView {
+    pub name: String,
+    pub sql_text: String,
+    pub circuit: Circuit,
+    pub output_columns: Vec<ColumnDef>,
+    pub pk_cols: Vec<u32>,
+}
+
 pub struct GnitzClient {
     conn: Connection,
     schema_cache: LruCache<u64, (Arc<Schema>, u16)>,
@@ -520,6 +558,10 @@ impl GnitzClient {
     // --- DDL ---
 
     pub fn create_schema(&mut self, name: &str) -> Result<u64, ClientError> {
+        // Reject the empty string, a leading `_` (reserved system prefix), and
+        // illegal characters. The SQL planner has no CREATE SCHEMA surface, so
+        // this client entry point is the sole enforcement for schema names.
+        crate::validate_user_identifier(name).map_err(ClientError::ServerError)?;
         let new_sid = self.conn.alloc_schema_id()?;
         let schema = schema_tab_schema();
         let mut batch = ZSetBatch::new(schema);
@@ -583,9 +625,14 @@ impl GnitzClient {
         let schema_id = find_schema_id(&sdata, name)?;
 
         // Views first — a view may read a member table; the drain retries to
-        // resolve intra-schema view-on-view chains across passes.
+        // resolve intra-schema view-on-view chains across passes. Synthesized
+        // hidden members (`__h…`) are excluded: each is removed exclusively by
+        // its owning user view's drop cascade, so draining them directly would
+        // only burn RESTRICTed round-trips (owner still live) or target an
+        // already-cascaded name.
         let (_, vdata, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
-        let views = vdata.map_or(Ok(Vec::new()), |b| collect_schema_member_names(&b, schema_id))?;
+        let mut views = vdata.map_or(Ok(Vec::new()), |b| collect_schema_member_names(&b, schema_id))?;
+        views.retain(|n| !is_hidden_view_name(n));
         self.drain_drops(views, |c, m| c.drop_view(name, m))?;
 
         // Then tables — the drain retries to resolve intra-schema FK chains.
@@ -744,7 +791,7 @@ impl GnitzClient {
         let circuit = cb.build();
 
         // Minimal SCAN→SINK passthrough: single output PK at slot 0.
-        self.write_circuit_rows(schema_name, view_name, "", vid, circuit, output_columns, &[0])
+        self.create_view_with_circuit(schema_name, view_name, "", circuit, output_columns, &[0])
     }
 
     pub fn create_view_with_circuit(
@@ -756,67 +803,79 @@ impl GnitzClient {
         output_columns: &[ColumnDef],
         pk_cols: &[u32],
     ) -> Result<u64, ClientError> {
-        let vid = if circuit.view_id == 0 {
-            self.conn.alloc_table_id()?
-        } else {
-            circuit.view_id
-        };
-        self.write_circuit_rows(schema_name, view_name, sql_text, vid, circuit, output_columns, pk_cols)
+        let vids = self.create_view_chain(
+            schema_name,
+            vec![PlannedView {
+                name: view_name.to_string(),
+                sql_text: sql_text.to_string(),
+                circuit,
+                output_columns: output_columns.to_vec(),
+                pk_cols: pk_cols.to_vec(),
+            }],
+        )?;
+        Ok(vids[0])
     }
 
-    /// Shared serialisation path for `create_view` / `create_view_with_circuit`.
-    /// Writes columns, dependencies, the three circuit tables, and the view
-    /// record (which must come last — it triggers the server-side hook).
+    /// Create every view in `views` in one atomic `DDL_TXN`. `views` must be in
+    /// dependency (topological) order — VIEW_TAB row order sets each view's
+    /// registration `depth`; the distributed backfill tail re-derives
+    /// materialization order from the dep-map. Returns the vids in input order.
     ///
-    /// `pk_cols` is the view's physical PK column list — the leading `k` output
-    /// slots. It is `[0]` for every synthetic-PK view (join / set-op / distinct /
-    /// minimal passthrough) and `0..k` for a plain projection that passes a
-    /// compound source PK through.
-    #[allow(clippy::too_many_arguments)]
-    fn write_circuit_rows(
-        &mut self,
-        schema_name: &str,
-        view_name: &str,
-        sql_text: &str,
-        vid: u64,
-        circuit: Circuit,
-        output_columns: &[ColumnDef],
-        pk_cols: &[u32],
-    ) -> Result<u64, ClientError> {
-        // The view's PK region is the leading `k` columns (pk_cols == 0..k); it
-        // has no null bitmap, so any nullable PK column is internally
-        // inconsistent. Validate every PK slot, not just the first.
-        if output_columns.is_empty() {
-            return Err(ClientError::ServerError(
-                "View must have at least one output column".into(),
-            ));
-        }
-        // Single choke point every view kind passes through: surface an over-wide
-        // output schema as a clean planner error before the DDL round-trip, rather
-        // than tripping the engine's build_schema_from_col_defs assert. (The JOIN
-        // path already rejects combined_cols > MAX_COLUMNS ahead of alloc_table_id;
-        // this covers plain projection, GROUP BY, set-op, and DISTINCT uniformly.)
-        if output_columns.len() > gnitz_wire::MAX_COLUMNS {
+    /// **One `BatchAppender` per family spans all views** — the engine's derived
+    /// per-family lists (`family_pks_by_sign`, `families.find`) read only the
+    /// first block per tid, so a chain must merge every view's COL/DEP/circuit
+    /// rows into a single batch per family and one all-`+1` VIEW_TAB batch in
+    /// input order. A single `push_ddl_txn` then commits — or, via the engine's
+    /// per-family precheck/compensate loop, rolls back — the whole chain.
+    ///
+    /// `pk_cols` for each view is its physical PK column list — the leading `k`
+    /// output slots (`[0]` for a synthetic-PK view, `0..k` for a compound-PK
+    /// passthrough).
+    pub fn create_view_chain(&mut self, schema_name: &str, views: Vec<PlannedView>) -> Result<Vec<u64>, ClientError> {
+        // Reject an over-long chain before any allocation (the self-referential
+        // CTE blow-up guard).
+        if views.len() > MAX_CHAIN_SEGMENTS {
             return Err(ClientError::ServerError(format!(
-                "View has {} output columns, exceeding the {}-column limit",
-                output_columns.len(),
-                gnitz_wire::MAX_COLUMNS
+                "view chain has {} segments, exceeding the {MAX_CHAIN_SEGMENTS}-segment limit",
+                views.len(),
             )));
         }
-        for &p in pk_cols {
-            match output_columns.get(p as usize) {
-                Some(c) if !c.is_nullable => {}
-                Some(_) => {
-                    return Err(ClientError::ServerError(
-                        "View Primary Key column must not be nullable".into(),
-                    ))
-                }
-                None => {
-                    return Err(ClientError::ServerError(format!(
-                        "View PK column index {} out of range ({} output columns)",
-                        p,
-                        output_columns.len()
-                    )))
+
+        // Per-view pre-flight validation up front, before any id allocation, so a
+        // bad schema surfaces with no residue. The view's PK region is the leading
+        // `k` columns and has no null
+        // bitmap, so a nullable PK slot is internally inconsistent; validate every
+        // PK slot. The MAX_COLUMNS choke point surfaces an over-wide output schema
+        // as a clean error before the DDL round-trip (else the engine's
+        // build_schema_from_col_defs assert trips).
+        for pv in &views {
+            if pv.output_columns.is_empty() {
+                return Err(ClientError::ServerError(
+                    "View must have at least one output column".into(),
+                ));
+            }
+            if pv.output_columns.len() > gnitz_wire::MAX_COLUMNS {
+                return Err(ClientError::ServerError(format!(
+                    "View has {} output columns, exceeding the {}-column limit",
+                    pv.output_columns.len(),
+                    gnitz_wire::MAX_COLUMNS
+                )));
+            }
+            for &p in &pv.pk_cols {
+                match pv.output_columns.get(p as usize) {
+                    Some(c) if !c.is_nullable => {}
+                    Some(_) => {
+                        return Err(ClientError::ServerError(
+                            "View Primary Key column must not be nullable".into(),
+                        ))
+                    }
+                    None => {
+                        return Err(ClientError::ServerError(format!(
+                            "View PK column index {} out of range ({} output columns)",
+                            p,
+                            pv.output_columns.len()
+                        )))
+                    }
                 }
             }
         }
@@ -826,104 +885,97 @@ impl GnitzClient {
             schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
         let schema_id = find_schema_id(&schema_batch, schema_name)?;
 
-        // Assemble every family batch into one atomic `push_ddl_txn` bundle, in
-        // dependency order (the server re-sorts by topo priority anyway). The
-        // server ingests the families under one durable zone, so the VIEW_TAB
-        // register hook sees the columns, deps, and circuit already in the
-        // memtable — no per-family RPC, and a failure rolls the entire CREATE VIEW
-        // back.
-        let mut families: Vec<(u64, &Schema, ZSetBatch)> = Vec::new();
-
-        // 1. Column records.
-        families.push(build_col_tab_batch(vid, OWNER_KIND_VIEW, output_columns)?);
-
-        // 2. Dependency records — every ScanDelta source_table.
-        let deps = circuit.dependencies();
-        if !deps.is_empty() {
-            let dep_s = dep_tab_schema();
-            let mut dep = ZSetBatch::new(dep_s);
-            {
-                let mut a = BatchAppender::new(&mut dep, dep_s);
-                for &dep_tid in &deps {
-                    // Compound PK (view_id, dep_table_id): low 8 bytes = view_id,
-                    // high 8 bytes = dep_table_id. dep_view_id is the only payload.
-                    //
-                    // CONVERGENCE INVARIANT (all circuit-PK packings below too):
-                    // the client packs view_id in the LOW u128 half while the
-                    // engine's `pack_view_pk` packs it in the HIGH half. These
-                    // produce the IDENTICAL view_id-major big-endian at-rest OPK
-                    // image only because the client's multi-column `PkColumn::Bytes`
-                    // arm OPK-encodes each 8-byte PK column independently (low u128
-                    // bytes → first column) while the engine writes the whole u128
-                    // big-endian — byte-order duals that agree only because every
-                    // circuit-PK column is exactly 8 bytes and unsigned.
-                    // `load_circuit` / `retract_rows_by_view` prefix-seek on
-                    // `view_id.to_be_bytes()` and depend on this. Do NOT "align"
-                    // the two packings: flipping the client to `(vid << 64) | sub`
-                    // moves `sub` into the leading at-rest bytes and breaks every
-                    // view-load prefix seek.
-                    let pk = (vid as u128) | ((dep_tid as u128) << 64);
-                    a.add_row(pk, 1).u64_val(0); // dep_view_id
-                }
-            }
-            families.push((DEP_TAB, dep_s, dep));
+        // Each view's vid: its circuit's pre-allocated id, or a fresh one. A chain
+        // pre-sets every id (downstream circuits reference upstream hidden views),
+        // so no alloc happens on that path.
+        let mut vids: Vec<u64> = Vec::with_capacity(views.len());
+        for pv in &views {
+            let vid = if pv.circuit.view_id == 0 {
+                self.conn.alloc_table_id()?
+            } else {
+                pv.circuit.view_id
+            };
+            vids.push(vid);
         }
 
-        // Materialise the typed circuit into the three-table row bundle.
-        let rows = circuit.into_rows();
+        // One batch per family, spanning all views. COL_TAB and VIEW_TAB are
+        // always non-empty; the circuit families are included only if some view
+        // contributed rows.
+        let col_s = col_tab_schema();
+        let dep_s = dep_tab_schema();
+        let nodes_s = circuit_nodes_schema();
+        let edges_s = circuit_edges_schema();
+        let ncol_s = circuit_node_columns_schema();
+        let view_s = view_tab_schema();
 
-        // 3. CircuitNodes
-        if !rows.nodes.is_empty() {
-            let nodes_s = circuit_nodes_schema();
-            let mut nodes = ZSetBatch::new(nodes_s);
-            {
-                let mut a = BatchAppender::new(&mut nodes, nodes_s);
+        let mut col_batch = ZSetBatch::new(col_s);
+        let mut dep_batch = ZSetBatch::new(dep_s);
+        let mut nodes_batch = ZSetBatch::new(nodes_s);
+        let mut edges_batch = ZSetBatch::new(edges_s);
+        let mut ncol_batch = ZSetBatch::new(ncol_s);
+        let mut view_batch = ZSetBatch::new(view_s);
+
+        {
+            let mut col_a = BatchAppender::new(&mut col_batch, col_s);
+            let mut dep_a = BatchAppender::new(&mut dep_batch, dep_s);
+            let mut nodes_a = BatchAppender::new(&mut nodes_batch, nodes_s);
+            let mut edges_a = BatchAppender::new(&mut edges_batch, edges_s);
+            let mut ncol_a = BatchAppender::new(&mut ncol_batch, ncol_s);
+            let mut view_a = BatchAppender::new(&mut view_batch, view_s);
+
+            for (pv, vid) in views.into_iter().zip(vids.iter().copied()) {
+                // 1. Column records.
+                append_col_rows(&mut col_a, vid, OWNER_KIND_VIEW, &pv.output_columns)?;
+
+                // 2. Dependency records — every ScanDelta source_table.
+                //
+                // CONVERGENCE INVARIANT (all circuit-PK packings below too): the
+                // client packs view_id in the LOW u128 half while the engine's
+                // `pack_view_pk` packs it in the HIGH half. These produce the
+                // IDENTICAL view_id-major big-endian at-rest OPK image only because
+                // the client's multi-column `PkColumn::Bytes` arm OPK-encodes each
+                // 8-byte PK column independently (low u128 bytes → first column)
+                // while the engine writes the whole u128 big-endian — byte-order
+                // duals that agree only because every circuit-PK column is exactly
+                // 8 bytes and unsigned. `load_circuit` / `retract_rows_by_view`
+                // prefix-seek on `view_id.to_be_bytes()` and depend on this. Do NOT
+                // "align" the two packings: flipping the client to `(vid << 64) |
+                // sub` moves `sub` into the leading at-rest bytes and breaks every
+                // view-load prefix seek.
+                for dep_tid in pv.circuit.dependencies() {
+                    // Compound PK (view_id, dep_table_id): low 8 bytes = view_id.
+                    let pk = (vid as u128) | ((dep_tid as u128) << 64);
+                    dep_a.add_row(pk, 1).u64_val(0); // dep_view_id
+                }
+
+                // 3–5. Materialise the typed circuit into the three-table bundle.
+                let rows = pv.circuit.into_rows();
                 for (node_id, opcode, src_tab, expr_blob) in &rows.nodes {
-                    // Compound PK (view_id, sub=node_id): low 8 bytes = view_id,
-                    // high 8 bytes = node_id.
+                    // Compound PK (view_id, sub=node_id): low 8 bytes = view_id.
                     let pk = (vid as u128) | ((*node_id as u128) << 64);
-                    a.add_row(pk, 1).u64_val(*node_id).u64_val(*opcode);
+                    nodes_a.add_row(pk, 1).u64_val(*node_id).u64_val(*opcode);
                     // source_table and expr_program are nullable; the `*_null`
-                    // writers set the row bitmap themselves, so no `null_mask`.
+                    // writers set the row bitmap themselves.
                     match src_tab {
-                        Some(t) => a.u64_val(*t),
-                        None => a.u64_null(),
+                        Some(t) => nodes_a.u64_val(*t),
+                        None => nodes_a.u64_null(),
                     };
                     match expr_blob {
-                        Some(b) => a.bytes_val(b),
-                        None => a.bytes_null(),
+                        Some(b) => nodes_a.bytes_val(b),
+                        None => nodes_a.bytes_null(),
                     };
                 }
-            }
-            families.push((CIRCUIT_NODES_TAB, nodes_s, nodes));
-        }
-
-        // 4. CircuitEdges (natural-key PK — no synthetic edge_id).
-        if !rows.edges.is_empty() {
-            let edges_s = circuit_edges_schema();
-            let mut edges = ZSetBatch::new(edges_s);
-            {
-                let mut a = BatchAppender::new(&mut edges, edges_s);
                 for (dst_node, dst_port, src_node) in &rows.edges {
                     debug_assert!(*dst_node < (1u64 << 40), "dst_node {dst_node} exceeds 40-bit cap");
                     // Compound PK (view_id, sub): sub packs (dst_node, dst_port).
                     let sub = ((*dst_node as u128) << 8) | (*dst_port as u128);
                     let pk = (vid as u128) | (sub << 64);
-                    a.add_row(pk, 1)
+                    edges_a
+                        .add_row(pk, 1)
                         .u64_val(*dst_node)
                         .u64_val(*dst_port as u64)
                         .u64_val(*src_node);
                 }
-            }
-            families.push((CIRCUIT_EDGES_TAB, edges_s, edges));
-        }
-
-        // 5. CircuitNodeColumns (replaces group_cols + the four PARAM_BASE ranges).
-        if !rows.node_columns.is_empty() {
-            let s = circuit_node_columns_schema();
-            let mut nc = ZSetBatch::new(s);
-            {
-                let mut a = BatchAppender::new(&mut nc, s);
                 for (node_id, kind, position, v1, v2) in &rows.node_columns {
                     debug_assert!((*position as u64) <= 0xFFFF);
                     debug_assert!((*kind) <= 0xFF);
@@ -931,29 +983,67 @@ impl GnitzClient {
                     // Compound PK (view_id, sub): sub packs (node_id, kind, position).
                     let sub = ((*node_id as u128) << 24) | ((*kind as u128) << 16) | (*position as u128);
                     let pk = (vid as u128) | (sub << 64);
-                    a.add_row(pk, 1)
+                    ncol_a
+                        .add_row(pk, 1)
                         .u64_val(*node_id)
                         .u64_val(*kind)
                         .u64_val(*position as u64)
                         .u64_val(*v1)
                         .u64_val(*v2);
                 }
+
+                // 6. View record — the VIEW_TAB register hook triggers server-side
+                // compilation. Rows are appended in input (topological) order so
+                // each view's registration `depth` derives from its already-present
+                // sources. Encode the view PK with the shared wire packer so the
+                // engine catalog decodes it identically to a TABLE_TAB PK.
+                let pk_packed = gnitz_wire::pack_pk_cols(&pv.pk_cols);
+                append_view_row(
+                    &mut view_a,
+                    1,
+                    &ViewRecord {
+                        vid,
+                        schema_id,
+                        name: pv.name,
+                        sql_definition: pv.sql_text,
+                        cache_directory: String::new(),
+                        created_lsn: 0,
+                        pk_col_idx: pk_packed,
+                    },
+                );
             }
-            families.push((CIRCUIT_NODE_COLUMNS_TAB, s, nc));
         }
 
-        // 6. View record — the VIEW_TAB register hook triggers server-side
-        // compilation. Encode the view PK with the shared wire packer so the
-        // engine catalog decodes it identically to a TABLE_TAB PK. Last in the
-        // bundle by dependency order, though the server re-sorts by topo priority.
-        let pk_packed = gnitz_wire::pack_pk_cols(pk_cols);
-        families.push(build_view_tab_batch(vid, schema_id, view_name, sql_text, pk_packed));
+        // One families entry per tid (mandatory: the engine's derived lists read
+        // only the first block per family), in dependency order — the server
+        // re-sorts by topo priority anyway.
+        let mut families: Vec<(u64, &Schema, ZSetBatch)> = Vec::new();
+        families.push((COL_TAB, col_s, col_batch));
+        if !dep_batch.is_empty() {
+            families.push((DEP_TAB, dep_s, dep_batch));
+        }
+        if !nodes_batch.is_empty() {
+            families.push((CIRCUIT_NODES_TAB, nodes_s, nodes_batch));
+        }
+        if !edges_batch.is_empty() {
+            families.push((CIRCUIT_EDGES_TAB, edges_s, edges_batch));
+        }
+        if !ncol_batch.is_empty() {
+            families.push((CIRCUIT_NODE_COLUMNS_TAB, ncol_s, ncol_batch));
+        }
+        families.push((VIEW_TAB, view_s, view_batch));
 
         self.conn.push_ddl_txn(&families)?;
 
-        Ok(vid)
+        Ok(vids)
     }
 
+    /// Drop a view and, cascading, every hidden segment view it owns
+    /// (`__h{vid}_…`). The user view's `-1` and each hidden member's `-1` share
+    /// one VIEW_TAB batch / one `push_ddl_txn`, so the engine's co-drop carve-out
+    /// admits the bundle (every dependent is present in the same batch's drop set)
+    /// and the whole chain retires atomically. A user view with no hidden members
+    /// (every view created before this feature) drops exactly as before.
     pub fn drop_view(&mut self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch =
@@ -965,16 +1055,23 @@ impl GnitzClient {
             .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found")))?;
         let vr = find_view_record(&view_batch, schema_id, view_name)?;
 
+        // Hidden segment members this view owns. Ownership is name-encoded
+        // (hidden views are never shared across user views); the shared
+        // `hidden_view_prefix` keeps the producer (planner) and this consumer on
+        // one definition.
+        let prefix = hidden_view_prefix(vr.vid);
+        let members = collect_view_records_with_prefix(&view_batch, schema_id, &prefix)?;
+
+        // One VIEW_TAB batch: the user view's `-1` plus every hidden member's
+        // `-1`, full payload reproduced per record.
         let view_s = view_tab_schema();
         let mut vb = ZSetBatch::new(view_s);
-        BatchAppender::new(&mut vb, view_s)
-            .add_row(vr.vid as u128, -1)
-            .u64_val(vr.schema_id)
-            .str_val(&vr.name)
-            .str_val(&vr.sql_definition)
-            .str_val(&vr.cache_directory)
-            .u64_val(vr.created_lsn)
-            .u64_val(vr.pk_col_idx);
+        {
+            let mut a = BatchAppender::new(&mut vb, view_s);
+            for rec in std::iter::once(&vr).chain(members.iter()) {
+                append_view_row(&mut a, -1, rec);
+            }
+        }
         self.conn.push_ddl_txn(&[(VIEW_TAB, view_s, vb)])?;
 
         Ok(())
@@ -1144,6 +1241,35 @@ fn find_table_record(batch: &ZSetBatch, schema_id: u64, table_name: &str) -> Res
     Err(ClientError::ServerError(format!("Table '{table_name}' not found")))
 }
 
+/// Decode row `i` of a `VIEW_TAB` batch into a `ViewRecord` — the single home
+/// for the VIEW_TAB column layout on the read side (`append_view_row` is the
+/// write side); every row filter builds on it.
+fn decode_view_record(batch: &ZSetBatch, i: usize) -> Result<ViewRecord, ClientError> {
+    Ok(ViewRecord {
+        vid: batch.pks.get(i) as u64,
+        schema_id: col_u64(&batch.columns[1], i)?,
+        name: col_str(&batch.columns[2], i)?.unwrap_or("").to_string(),
+        sql_definition: col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
+        cache_directory: col_str(&batch.columns[4], i)?.unwrap_or("").to_string(),
+        created_lsn: col_u64(&batch.columns[5], i)?,
+        pk_col_idx: col_u64(&batch.columns[6], i)?,
+    })
+}
+
+/// Append one `VIEW_TAB` row — the single home for the VIEW_TAB payload layout
+/// on the write side, mirroring `decode_view_record`. A drop's `-1` row must
+/// reproduce the `+1`'s payload byte-for-byte to cancel in the Z-set, so the
+/// create and drop-cascade paths both write through here.
+fn append_view_row(a: &mut BatchAppender<'_>, weight: i64, rec: &ViewRecord) {
+    a.add_row(rec.vid as u128, weight)
+        .u64_val(rec.schema_id)
+        .str_val(&rec.name)
+        .str_val(&rec.sql_definition)
+        .str_val(&rec.cache_directory)
+        .u64_val(rec.created_lsn)
+        .u64_val(rec.pk_col_idx);
+}
+
 fn find_view_record(batch: &ZSetBatch, schema_id: u64, view_name: &str) -> Result<ViewRecord, ClientError> {
     for i in batch.live_rows() {
         if col_u64(&batch.columns[1], i)? != schema_id {
@@ -1152,17 +1278,32 @@ fn find_view_record(batch: &ZSetBatch, schema_id: u64, view_name: &str) -> Resul
         if col_str(&batch.columns[2], i)? != Some(view_name) {
             continue;
         }
-        return Ok(ViewRecord {
-            vid: batch.pks.get(i) as u64,
-            schema_id,
-            name: view_name.to_string(),
-            sql_definition: col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
-            cache_directory: col_str(&batch.columns[4], i)?.unwrap_or("").to_string(),
-            created_lsn: col_u64(&batch.columns[5], i)?,
-            pk_col_idx: col_u64(&batch.columns[6], i)?,
-        });
+        return decode_view_record(batch, i);
     }
     Err(ClientError::ServerError(format!("View '{view_name}' not found")))
+}
+
+/// Collect the full `ViewRecord`s of every live `VIEW_TAB` row whose `schema_id`
+/// matches and whose name starts with `prefix`. Drives the cascading DROP of a
+/// user view's synthesized hidden segment views (`__h{vid}_…`) — each `-1` row
+/// needs the full payload reproduced, so names alone (`collect_schema_member_names`)
+/// don't suffice.
+fn collect_view_records_with_prefix(
+    batch: &ZSetBatch,
+    schema_id: u64,
+    prefix: &str,
+) -> Result<Vec<ViewRecord>, ClientError> {
+    let mut out = Vec::new();
+    for i in batch.live_rows() {
+        if col_u64(&batch.columns[1], i)? != schema_id {
+            continue;
+        }
+        if !matches!(col_str(&batch.columns[2], i)?, Some(n) if n.starts_with(prefix)) {
+            continue;
+        }
+        out.push(decode_view_record(batch, i)?);
+    }
+    Ok(out)
 }
 
 /// Collect the entity names of every live row in a `TABLE_TAB`/`VIEW_TAB` batch
@@ -1183,6 +1324,30 @@ fn collect_schema_member_names(batch: &ZSetBatch, schema_id: u64) -> Result<Vec<
     Ok(out)
 }
 
+/// Append one owner's `COL_TAB` column records to `a` — the single home for the
+/// COL_TAB row layout, shared by the table path (`build_col_tab_batch`) and the
+/// view-chain path (which merges every view's rows into one family batch).
+fn append_col_rows(
+    a: &mut BatchAppender<'_>,
+    owner_id: u64,
+    owner_kind: u64,
+    columns: &[ColumnDef],
+) -> Result<(), ClientError> {
+    for (i, col) in columns.iter().enumerate() {
+        a.add_row(pack_col_id(owner_id, i)? as u128, 1)
+            .u64_val(owner_id)
+            .u64_val(owner_kind)
+            .u64_val(i as u64)
+            .str_val(&col.name)
+            .u64_val(col.type_code as u64)
+            .u64_val(if col.is_nullable { 1 } else { 0 })
+            .u64_val(col.fk_table_id)
+            .u64_val(col.fk_col_idx)
+            .u64_val(if col.is_serial { 1 } else { 0 });
+    }
+    Ok(())
+}
+
 /// Build the `COL_TAB` family batch for a table/view's column records — a pure
 /// batch builder returning `(target_id, schema, batch)` for `push_ddl_txn` to
 /// bundle. Touches no connection state; the DDL's whole family set is ingested
@@ -1194,44 +1359,13 @@ fn build_col_tab_batch(
 ) -> Result<(u64, &'static Schema, ZSetBatch), ClientError> {
     let schema = col_tab_schema();
     let mut batch = ZSetBatch::new(schema);
-    {
-        let mut a = BatchAppender::new(&mut batch, schema);
-        for (i, col) in columns.iter().enumerate() {
-            a.add_row(pack_col_id(owner_id, i)? as u128, 1)
-                .u64_val(owner_id)
-                .u64_val(owner_kind)
-                .u64_val(i as u64)
-                .str_val(&col.name)
-                .u64_val(col.type_code as u64)
-                .u64_val(if col.is_nullable { 1 } else { 0 })
-                .u64_val(col.fk_table_id)
-                .u64_val(col.fk_col_idx)
-                .u64_val(if col.is_serial { 1 } else { 0 });
-        }
-    }
+    append_col_rows(
+        &mut BatchAppender::new(&mut batch, schema),
+        owner_id,
+        owner_kind,
+        columns,
+    )?;
     Ok((COL_TAB, schema, batch))
-}
-
-/// Build the `VIEW_TAB` family batch (the view record) — a pure batch builder
-/// for `push_ddl_txn` to bundle after the view's columns/deps/circuit families.
-fn build_view_tab_batch(
-    vid: u64,
-    schema_id: u64,
-    view_name: &str,
-    sql_text: &str,
-    pk_packed: u64,
-) -> (u64, &'static Schema, ZSetBatch) {
-    let view_s = view_tab_schema();
-    let mut vb = ZSetBatch::new(view_s);
-    BatchAppender::new(&mut vb, view_s)
-        .add_row(vid as u128, 1)
-        .u64_val(schema_id)
-        .str_val(view_name)
-        .str_val(sql_text)
-        .str_val("")
-        .u64_val(0)
-        .u64_val(pk_packed);
-    (VIEW_TAB, view_s, vb)
 }
 
 #[cfg(test)]

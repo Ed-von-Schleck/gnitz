@@ -3,8 +3,8 @@
 //! symmetric 2-term DBSP join against the other side's trace, normalize the two
 //! terms onto `[A cols, B cols]`, and (for outer joins) attach the null-fill.
 
-use crate::ast_util::{extract_table_name_and_alias, is_wildcard_projection};
-use crate::bind::{build_alias_map, resolve_qualified_column, resolve_unqualified_column, AliasMap, Binder};
+use crate::ast_util::{extract_table_name_and_alias, flatten_conjuncts, is_wildcard_projection};
+use crate::bind::{resolve_qualified_column, resolve_unqualified_column, AliasMap, Binder, ResolvedRelation};
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{
     reject_column_overflow, reject_duplicate_column_names, reject_unhonored_select_clauses, HonoredClauses,
@@ -13,11 +13,12 @@ use crate::plan::view::predicates::{
     build_reindex_program, build_residual_filter_prog, converse_rel, extract_join_predicates, multi_null_filter_prog,
     pure_range_m_output_cols, schema_type_codes, RangeConjunct,
 };
-use crate::SqlResult;
+use crate::plan::view::{EmitPieces, ViewChain};
 use gnitz_core::{
     CircuitBuilder, ColumnDef, ExprBuilder, FixedInt, GnitzClient, RangeRel, Schema, TypeCode, AGG_MAX, AGG_MIN,
 };
-use sqlparser::ast::{Expr, JoinConstraint, JoinOperator, SelectItem};
+use sqlparser::ast::{Expr, Ident, JoinConstraint, JoinOperator, SelectItem};
+use std::rc::Rc;
 
 /// Which side(s) of a join survive unmatched. Threaded through both builders in
 /// place of the old `is_left_join: bool`. The two predicates drive both null-fill
@@ -94,82 +95,309 @@ pub(crate) fn normalize_to_ab(
     cb.union(proj_ab_node, proj_ba_node)
 }
 
-pub(crate) fn execute_create_join_view(
+/// The resolved front-end of one 2-way join step: both sides resolved, the ON
+/// clause classified into equality pairs + an optional range conjunct + the
+/// residual, and the join kind decided. Produced per step by `plan_join_chain`,
+/// consumed by the emit path. (The residual/projection still bind through the
+/// `AliasMap` at emit; the per-side re-bind against hidden-view inputs lands
+/// with the multi-anchor surface.)
+struct LoweredJoin {
+    left_tid: u64,
+    right_tid: u64,
+    left_schema: std::rc::Rc<Schema>,
+    right_schema: std::rc::Rc<Schema>,
+    alias_map: AliasMap,
+    join_type: JoinType,
+    left_join_cols: Vec<usize>,
+    right_join_cols: Vec<usize>,
+    target_tcs: Vec<TypeCode>,
+    range_conjunct: Option<RangeConjunct>,
+    residual: Vec<Expr>,
+    /// Top-level WHERE conjuncts of an OUTER equi join, applied as a linear filter
+    /// over the merged (post-null-fill) output. Empty for INNER (folded into
+    /// `residual`) and rejected for OUTER range joins.
+    where_filter: Vec<Expr>,
+}
+
+/// The ON expression and type of one join step. Each step supports
+/// INNER / LEFT / RIGHT / FULL, left-deep in syntactic order (no reordering),
+/// so `a LEFT JOIN b JOIN c` is `(a LEFT JOIN b) JOIN c` — each step's emit is the
+/// standard 2-way emit, outer null-fill included.
+///
+/// sqlparser 0.56 spells the bare/`OUTER` forms as separate variants
+/// (`Left`/`LeftOuter`, `Right`/`RightOuter`); FULL has only `FullOuter`.
+fn join_on_and_type(join: &sqlparser::ast::Join) -> Result<(&Expr, JoinType), GnitzSqlError> {
+    match &join.join_operator {
+        JoinOperator::Inner(JoinConstraint::On(e)) | JoinOperator::Join(JoinConstraint::On(e)) => {
+            Ok((e, JoinType::Inner))
+        }
+        JoinOperator::LeftOuter(JoinConstraint::On(e)) | JoinOperator::Left(JoinConstraint::On(e)) => {
+            Ok((e, JoinType::Left))
+        }
+        JoinOperator::RightOuter(JoinConstraint::On(e)) | JoinOperator::Right(JoinConstraint::On(e)) => {
+            Ok((e, JoinType::Right))
+        }
+        JoinOperator::FullOuter(JoinConstraint::On(e)) => Ok((e, JoinType::Full)),
+        _ => Err(GnitzSqlError::Unsupported(
+            "CREATE VIEW JOIN: only INNER / LEFT / RIGHT / FULL JOIN ... ON supported".into(),
+        )),
+    }
+}
+
+/// Classify a top-level WHERE over a join step, mutating `residual` and returning
+/// the post-join `where_filter` — the single home for this rule:
+///  - INNER: `ON p WHERE q ≡ ON (p AND q)`, so fold q into the residual — the same
+///    linear filter over the join output the ON residual uses.
+///  - OUTER equi: a WHERE is a linear filter over the merged *post-null-fill* output.
+///    Its 3VL is exactly right — a null-filled column failing the predicate drops its
+///    row — and it yields the same result as pushing preserved-side conjuncts below the
+///    join. The ON residual (a match condition) stays outer-rejected; WHERE is post-join.
+///  - OUTER range: the band null-fill's interaction with a post-filter is unproven, so
+///    reject it (use an INNER join or a wrapping view).
+fn classify_join_where(
+    selection: Option<&Expr>,
+    join_type: JoinType,
+    has_range: bool,
+    residual: &mut Vec<Expr>,
+) -> Result<Vec<Expr>, GnitzSqlError> {
+    let Some(where_expr) = selection else {
+        return Ok(Vec::new());
+    };
+    let mut conjuncts = Vec::new();
+    flatten_conjuncts(where_expr, &mut conjuncts);
+    if join_type == JoinType::Inner {
+        residual.extend(conjuncts.into_iter().cloned());
+        Ok(Vec::new())
+    } else if has_range {
+        Err(GnitzSqlError::Unsupported(
+            "WHERE over a range/band OUTER join is not supported; use an INNER join or \
+             move the predicate into a wrapping view"
+                .into(),
+        ))
+    } else {
+        Ok(conjuncts.into_iter().cloned().collect())
+    }
+}
+
+/// Join-chain provenance: one entry per original relation alias —
+/// `(alias, its base schema, column offset within the current accumulator)`.
+type Provenance = Vec<(String, Rc<Schema>, usize)>;
+
+/// Intermediate hidden segment projection plus the next provenance: every
+/// accumulated real column (each original alias's columns, via the provenance)
+/// then the new relation's columns, keeping their original names. It carries all
+/// real columns forward while dropping the accumulator's leading synthetic
+/// `_join_pk` (the provenance offsets skip it), so no synthetic PK ever
+/// accumulates in the payload. Original names (possibly duplicated across the two
+/// sides) are kept so a downstream reduce/distinct over a hidden `H` can resolve
+/// columns by name; the duplicate-output-name guard is skipped for these hidden
+/// segments (never user-queried — see `emit_join`'s `check_dup_names`), and the
+/// next join's own ON resolves through the provenance (original schemas), never
+/// these names.
+///
+/// The returned provenance offsets are payload-relative — the caller shifts them
+/// past the emitted segment's synthetic-PK region (whose arity depends on the
+/// join kind) once it is known. One loop builds both, so the projection order and
+/// the offsets cannot drift.
+fn all_real_columns_projection(
+    prov: &Provenance,
+    right_alias: &str,
+    right_schema: &Rc<Schema>,
+) -> (Vec<SelectItem>, Provenance) {
+    let mut items = Vec::new();
+    let mut new_prov: Provenance = Vec::with_capacity(prov.len() + 1);
+    let mut push_alias = |alias: &str, sch: &Rc<Schema>| {
+        new_prov.push((alias.to_string(), Rc::clone(sch), items.len()));
+        for c in &sch.columns {
+            items.push(SelectItem::UnnamedExpr(Expr::CompoundIdentifier(vec![
+                Ident::new(alias),
+                Ident::new(c.name.as_str()),
+            ])));
+        }
+    };
+    for (alias, sch, _) in prov {
+        push_alias(alias, sch);
+    }
+    push_alias(right_alias, right_schema);
+    (items, new_prov)
+}
+
+/// Plan a join FROM (`from[0].joins.len() >= 1`) as a left-deep chain of 2-way
+/// join steps, reusing the standard join emitter unchanged. Each intermediate
+/// `h_i = h_{i-1} ⋈ r_i` is a hidden view pushed onto `chain` (pre-allocated id,
+/// all real columns projected); the final step is emitted with `emit_vid`, the
+/// user's projection, and the top-level WHERE (`classify_join_where`). A single
+/// join is the degenerate case: no intermediates, one emit. Original table
+/// aliases are tracked through a *provenance* map — alias → (accumulator, column
+/// offset) — so a later `ON`/projection/WHERE reference to `a.x` resolves to the
+/// accumulated hidden view's physical column with no name rewriting. Returns the
+/// final pieces.
+pub(crate) fn plan_join_chain(
     client: &mut GnitzClient,
-    schema_name: &str,
-    view_name: &str,
-    sql_text: &str,
-    select: &sqlparser::ast::Select,
     binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
-    // Join views consume only the FROM/ON join and the projection — not a top-level WHERE
-    // (no builder reads it) nor GROUP BY/HAVING/PREWHERE/… Reject all of them so a dropped
-    // clause is a clean error; a WHERE belongs over a wrapping view.
+    emit_vid: u64,
+    select: &sqlparser::ast::Select,
+    chain: &mut ViewChain,
+) -> Result<EmitPieces, GnitzSqlError> {
     reject_unhonored_select_clauses(
         select,
         HonoredClauses {
-            where_filter: false,
+            where_filter: true,
             grouping: false,
             distinct: false,
         },
         "CREATE VIEW JOIN",
     )?;
-    let (left_name, left_alias) = extract_table_name_and_alias(&select.from[0].relation, "CREATE VIEW JOIN")?;
+    let from = &select.from[0];
+    let n_joins = from.joins.len();
+    debug_assert!(n_joins >= 1, "plan_join_chain requires a join");
 
-    // Only support one join
-    if select.from[0].joins.len() != 1 {
-        return Err(GnitzSqlError::Unsupported(
-            "CREATE VIEW: only single JOIN supported".to_string(),
-        ));
+    // The leftmost relation seeds the accumulator.
+    let (left_name, left_alias) = extract_table_name_and_alias(&from.relation, "CREATE VIEW JOIN")?;
+    let (mut acc_tid, mut acc_schema) = binder.resolve(client, &left_name)?;
+    // Provenance: (original alias, its base schema, column offset within `acc`).
+    let mut prov: Provenance = vec![(left_alias, Rc::clone(&acc_schema), 0)];
+    // Base relation ids already incorporated. A right relation whose base id repeats is a
+    // self-join, wrapped in a distinct-source pass-through hidden view below; the wrapper
+    // is recorded per base id so a third and later occurrence reuses it instead of
+    // materializing another full-table copy.
+    let mut used_base_tids: Vec<u64> = vec![acc_tid];
+    let mut wrappers: Vec<(u64, (u64, Rc<Schema>))> = Vec::new();
+
+    for (i, join) in from.joins.iter().enumerate() {
+        let (on, join_type) = join_on_and_type(join)?;
+        let (right_name, right_alias) = extract_table_name_and_alias(&join.relation, "CREATE VIEW JOIN")?;
+        if prov.iter().any(|(a, _, _)| a.eq_ignore_ascii_case(&right_alias)) {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "duplicate relation alias '{right_alias}' in a multi-way join"
+            )));
+        }
+        let (r_base_tid, r_base_schema) = binder.resolve(client, &right_name)?;
+        // Self-join: a repeated base relation is wrapped in a distinct-source pass-through
+        // hidden view, so the two join inputs are never the same source (single-source-
+        // per-epoch is preserved; the shared base reaches them in separate epochs). Its
+        // output schema equals the source's (identity), possibly PK-reordered, so use the
+        // emitted schema. One wrapper per base id: reusing it for a later occurrence keeps
+        // every join step's two inputs distinct sources (the accumulator is always a
+        // hidden intermediate by then) — the accepted shared-source-branch shape.
+        let (r_tid, r_schema) = if used_base_tids.contains(&r_base_tid) {
+            match wrappers.iter().find(|(base, _)| *base == r_base_tid) {
+                Some((_, w)) => w.clone(),
+                None => {
+                    let w = chain.add_segment(client, |_, _, vid| {
+                        let rel = crate::plan::lp::passthrough_rel(r_base_tid, Rc::clone(&r_base_schema))?;
+                        crate::plan::view::simple::emit_linear(vid, rel)
+                    })?;
+                    wrappers.push((r_base_tid, w.clone()));
+                    w
+                }
+            }
+        } else {
+            used_base_tids.push(r_base_tid);
+            (r_base_tid, r_base_schema)
+        };
+
+        // Provenance alias map: original aliases → accumulator (at their offsets); the
+        // new relation → right, at offset = accumulator width.
+        let mut alias_map = AliasMap::with_capacity(prov.len() + 1);
+        for (a, sch, off) in &prov {
+            alias_map.insert(
+                a.to_lowercase(),
+                ResolvedRelation {
+                    table_id: acc_tid,
+                    schema: Rc::clone(sch),
+                    col_offset: *off,
+                },
+            );
+        }
+        alias_map.insert(
+            right_alias.to_lowercase(),
+            ResolvedRelation {
+                table_id: r_tid,
+                schema: Rc::clone(&r_schema),
+                col_offset: acc_schema.columns.len(),
+            },
+        );
+
+        let (left_join_cols, right_join_cols, target_tcs, range_conjunct, mut residual) =
+            extract_join_predicates(on, &acc_schema, &r_schema, &alias_map)?;
+
+        let is_last = i == n_joins - 1;
+        // The top-level WHERE applies to the final step's output.
+        let where_filter = if is_last {
+            classify_join_where(
+                select.selection.as_ref(),
+                join_type,
+                range_conjunct.is_some(),
+                &mut residual,
+            )?
+        } else {
+            Vec::new()
+        };
+
+        let lowered = LoweredJoin {
+            left_tid: acc_tid,
+            right_tid: r_tid,
+            left_schema: Rc::clone(&acc_schema),
+            right_schema: Rc::clone(&r_schema),
+            alias_map,
+            join_type,
+            left_join_cols,
+            right_join_cols,
+            target_tcs,
+            range_conjunct,
+            residual,
+            where_filter,
+        };
+
+        if is_last {
+            return emit_join(emit_vid, &select.projection, lowered, true);
+        }
+
+        // Intermediate: emit a hidden segment carrying all real columns forward. It is
+        // never user-queried (downstream resolves by provenance/name), so keep original
+        // names and skip the duplicate-output-name guard.
+        let (projection, mut new_prov) = all_real_columns_projection(&prov, &right_alias, &r_schema);
+        let (view_id, seg_schema) =
+            chain.add_segment(client, |_, _, vid| emit_join(vid, &projection, lowered, false))?;
+
+        // Advance the accumulator, shifting the payload-relative provenance past
+        // this segment's synthetic-PK region.
+        let k_i = seg_schema.pk_cols.len();
+        for p in &mut new_prov {
+            p.2 += k_i;
+        }
+        acc_tid = view_id;
+        acc_schema = seg_schema;
+        prov = new_prov;
     }
-    let join = &select.from[0].joins[0];
+    unreachable!("join-chain loop returns on the last (is_last) join")
+}
 
-    let (right_name, right_alias) = extract_table_name_and_alias(&join.relation, "CREATE VIEW JOIN")?;
-
-    // Determine join type. sqlparser 0.56 spells the bare/`OUTER` forms as separate
-    // variants (`Left`/`LeftOuter`, `Right`/`RightOuter`); FULL has only `FullOuter`.
-    let (on_expr, join_type) = match &join.join_operator {
-        JoinOperator::Inner(JoinConstraint::On(expr)) | JoinOperator::Join(JoinConstraint::On(expr)) => {
-            (expr, JoinType::Inner)
-        }
-        JoinOperator::LeftOuter(JoinConstraint::On(expr)) | JoinOperator::Left(JoinConstraint::On(expr)) => {
-            (expr, JoinType::Left)
-        }
-        JoinOperator::RightOuter(JoinConstraint::On(expr)) | JoinOperator::Right(JoinConstraint::On(expr)) => {
-            (expr, JoinType::Right)
-        }
-        JoinOperator::FullOuter(JoinConstraint::On(expr)) => (expr, JoinType::Full),
-        _ => {
-            return Err(GnitzSqlError::Unsupported(
-                "CREATE VIEW: only INNER / LEFT / RIGHT / FULL JOIN ... ON supported".to_string(),
-            ))
-        }
-    };
-
-    // Resolve both tables
-    let (left_tid, left_schema) = binder.resolve(client, &left_name)?;
-    let (right_tid, right_schema) = binder.resolve(client, &right_name)?;
-
-    // The 2-term DBSP join formula assumes the left and right input deltas are
-    // never simultaneously active. A self-join feeds the same delta to both
-    // sides in one epoch, dropping the bilinear ΔT⋈ΔT cross-term — silent data
-    // loss whenever same-key rows arrive in one batch.
-    if left_tid == right_tid {
-        return Err(GnitzSqlError::Unsupported(
-            "self-join (joining a table with itself) is not supported".into(),
-        ));
-    }
-
-    // Build alias map for qualified column resolution
-    let alias_map = build_alias_map(&[
-        (&left_alias, left_tid, &left_schema),
-        (&right_alias, right_tid, &right_schema),
-    ]);
-
-    // Classify the ON clause: equality prefix pairs, an optional range conjunct,
-    // and the residual list (conjuncts the physical join cannot consume directly).
-    let (left_join_cols, right_join_cols, target_tcs, range_conjunct, residual) =
-        extract_join_predicates(on_expr, &left_schema, &right_schema, &alias_map)?;
+/// Emit a join view's circuit (equi or range/band, INNER or outer) from its
+/// resolved `LoweredJoin`, returning `(circuit, output_columns, pk_cols)`.
+/// `view_id` is pre-allocated so a chain's downstream segment can reference this
+/// segment's store; the segment itself is created by the caller.
+fn emit_join(
+    view_id: u64,
+    projection: &[SelectItem],
+    lowered: LoweredJoin,
+    check_dup_names: bool,
+) -> Result<EmitPieces, GnitzSqlError> {
+    let LoweredJoin {
+        left_tid,
+        right_tid,
+        left_schema,
+        right_schema,
+        alias_map,
+        join_type,
+        left_join_cols,
+        right_join_cols,
+        target_tcs,
+        range_conjunct,
+        residual,
+        where_filter,
+    } = lowered;
 
     // Outer (LEFT/RIGHT/FULL) + residual is rejected (§3): for an outer join the ON
     // predicate is part of the *match* condition — a preserved-side row whose only
@@ -196,12 +424,16 @@ pub(crate) fn execute_create_join_view(
     // multiplicity and clamps the result, never over-filling). RIGHT/FULL extend it
     // symmetrically for the band path; pure-range RIGHT/FULL is rejected inside.
     if let Some(range) = range_conjunct {
-        return build_range_join_view(
-            client,
-            schema_name,
-            view_name,
-            sql_text,
-            select,
+        // A range join never carries a `where_filter`: INNER folds WHERE into the
+        // residual, OUTER range rejects it (both in `classify_join_where`).
+        debug_assert!(
+            where_filter.is_empty(),
+            "range join WHERE folds into residual or is rejected"
+        );
+        return emit_range_join(
+            view_id,
+            projection,
+            check_dup_names,
             &alias_map,
             left_tid,
             right_tid,
@@ -230,9 +462,6 @@ pub(crate) fn execute_create_join_view(
         "JOIN view output",
         k + left_schema.columns.len() + right_schema.columns.len(),
     )?;
-
-    // Allocate view_id
-    let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
 
     // Build circuit. Each side's reindex program copies all columns as payload and
     // reindexes by the join key; it is a pure function of the schema, so it is built
@@ -439,29 +668,33 @@ pub(crate) fn execute_create_join_view(
         out_cols.push(c);
     }
 
-    // Residual ON predicates: splice one linear Filter over the normalized join
-    // output `merged` ([_join_pk × k, A, B]) before projection/sink. A residual ⇒
-    // INNER (outer was rejected above), so `merged == inner_merged` and `out_cols`
-    // carries each base column's real (INNER) nullability — exactly the schema the
-    // engine resolves the predicate against. The filter is linear (incrementally
-    // free, no state), and INNER 3VL drops a NULL/UNKNOWN predicate row natively.
-    let merged = if residual.is_empty() {
+    // One linear filter over the normalized join output `merged` ([_join_pk × k, A, B])
+    // before projection/sink, bound against `out_cols` (which carries each column's real
+    // nullability) — incrementally free (no state). At most one source is non-empty
+    // (`classify_join_where`), so concatenating them emits a single program:
+    //   - Residual ON predicates ⇒ INNER (outer was rejected above), so `merged ==
+    //     inner_merged`; INNER 3VL drops a NULL/UNKNOWN predicate row natively.
+    //   - OUTER-equi WHERE (`where_filter`) is applied over the *post-null-fill* output:
+    //     a null-filled column failing the predicate drops its row (correct 3VL), which
+    //     matches pushing preserved-side conjuncts below the join.
+    let post_filter: Vec<Expr> = residual.into_iter().chain(where_filter).collect();
+    let merged = if post_filter.is_empty() {
         merged
     } else {
         let merged_schema = Schema {
             columns: out_cols.clone(),
             pk_cols: (0..k).collect(),
         };
-        let prog = build_residual_filter_prog(&residual, &alias_map, &merged_schema, k)?;
+        let prog = build_residual_filter_prog(&post_filter, &alias_map, &merged_schema, k)?;
         cb.filter(merged, Some(prog))
     };
 
     // Compute the user projection + view schema via the shared join-projection
     // helper. A lone `SELECT *` flows through its Wildcard arm and stays identity
     // (the projection map is then skipped below), so no wildcard fast path here.
-    let is_wildcard = is_wildcard_projection(&select.projection);
+    let is_wildcard = is_wildcard_projection(projection);
     let (final_cols, final_projection) = build_join_view_projection(
-        &select.projection,
+        projection,
         &alias_map,
         &out_cols[..k],
         left_n + right_n,
@@ -490,14 +723,10 @@ pub(crate) fn execute_create_join_view(
     // same-named columns from both sides (both tables' `id`); that is the
     // established wildcard contract, so the guard applies only to explicit
     // projections.
-    if !is_wildcard {
+    if !is_wildcard && check_dup_names {
         reject_duplicate_column_names(final_cols.iter().map(|c| c.name.as_str()), "join view")?;
     }
-    client
-        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols, &view_pk)
-        .map_err(GnitzSqlError::Exec)?;
-
-    Ok(SqlResult::ViewCreated { view_id })
+    Ok((circuit, final_cols, view_pk))
 }
 
 /// Build a non-equi (range / band) join view: `n_eq` equality conjuncts (possibly
@@ -529,12 +758,10 @@ pub(crate) fn execute_create_join_view(
 ///
 /// All ride the single pair-PK output exchange.
 #[allow(clippy::too_many_arguments)]
-fn build_range_join_view(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    view_name: &str,
-    sql_text: &str,
-    select: &sqlparser::ast::Select,
+fn emit_range_join(
+    view_id: u64,
+    projection: &[SelectItem],
+    check_dup_names: bool,
     alias_map: &AliasMap,
     left_tid: u64,
     right_tid: u64,
@@ -546,7 +773,7 @@ fn build_range_join_view(
     range: RangeConjunct,
     join_type: JoinType,
     residual: &[Expr],
-) -> Result<SqlResult, GnitzSqlError> {
+) -> Result<EmitPieces, GnitzSqlError> {
     let left_n = left_schema.columns.len();
     let right_n = right_schema.columns.len();
     let n_eq = left_join_cols.len();
@@ -632,7 +859,6 @@ fn build_range_join_view(
         }
     }
 
-    let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, 0);
     let input_a_raw = cb.input_delta_tagged(left_tid);
     let input_b_raw = cb.input_delta_tagged(right_tid);
@@ -782,9 +1008,9 @@ fn build_range_join_view(
     // User projection via the shared helper. Always applied (it must drop the
     // `_join_pk` slots, which DIFFER per term); keeps the pair-PK region and
     // selects user columns from A/B as the payload.
-    let is_wildcard = is_wildcard_projection(&select.projection);
+    let is_wildcard = is_wildcard_projection(projection);
     let (final_cols, final_projection) = build_join_view_projection(
-        &select.projection,
+        projection,
         alias_map,
         &pair_pk_coldefs,
         left_n + right_n,
@@ -976,14 +1202,10 @@ fn build_range_join_view(
         view_pk.iter().map(|&c| c as usize).collect::<Vec<_>>(),
         "range join: ExchangeShard cols must equal view_pk in strict order"
     );
-    if !is_wildcard {
+    if !is_wildcard && check_dup_names {
         reject_duplicate_column_names(final_cols.iter().map(|c| c.name.as_str()), "range join view")?;
     }
-    client
-        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &final_cols, &view_pk)
-        .map_err(GnitzSqlError::Exec)?;
-
-    Ok(SqlResult::ViewCreated { view_id })
+    Ok((circuit, final_cols, view_pk))
 }
 
 /// The pure-range threshold pipeline's outputs: `matched = A ⋈ {m}` and (when
@@ -1092,8 +1314,8 @@ pub(crate) fn build_pure_range_threshold(
 
 /// Build a join view's user projection: the leading PK columns followed by the
 /// selected payload columns, plus the parallel union-column index list the
-/// output `Map` projects. Shared by the equi (`execute_create_join_view`) and
-/// range (`build_range_join_view`) builders, which differ only in their PK region
+/// output `Map` projects. Shared by the equi (`emit_join`) and
+/// range (`emit_range_join`) builders, which differ only in their PK region
 /// and where the A‖B payload columns sit in the union layout:
 ///   - `leading_cols`: the synthesized PK columns, cloned verbatim into the output
 ///     schema (`_join_pk` slots for equi, `_pair_pk` slots for range).

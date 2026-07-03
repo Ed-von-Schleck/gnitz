@@ -1671,11 +1671,18 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         }
     }
 
+    // Order the bundle's new views by intra-bundle dependency before backfilling:
+    // a chain requires an upstream hidden view to be materialized before a
+    // downstream one scans it. The order is re-derived from the dep-map (populated
+    // during the ingest loop, DEP_TAB applying before VIEW_TAB) rather than from
+    // VIEW_TAB row order.
+    let ordered_view_ids: Vec<i64> = unsafe { (*cat_ptr_raw).dag.order_by_intra_bundle_deps(&new_view_ids) };
+
     // View-scoped distributed backfill for every exchange / equi-join view; plain
     // projection/filter views were already filled inline by hook_view_register
     // over the (now drained) committed sources. A post-fsync Err cannot be rolled
     // back (the CREATE is durable), so abort — restart's boot backfill rebuilds it.
-    for &vid in &new_view_ids {
+    for &vid in &ordered_view_ids {
         if unsafe { (*cat_ptr_raw).dag.view_seeds_exchange_backfill(vid) } {
             // A multi-source equi-join iterates both sources: backfilling the
             // first fills its trace (join against the empty other trace → no

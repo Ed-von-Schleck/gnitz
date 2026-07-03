@@ -73,10 +73,13 @@ fn test_duplicate_column_name_rejected() {
     );
 }
 
-// ── item 24: self-join rejection ─────────────────────────────────────
+// ── item 24: self-join via pass-through wrap ─────────────────────────
 
 #[test]
-fn test_self_join_rejected() {
+fn test_self_join_supported() {
+    // A direct self-join registers: the repeated relation is wrapped in a
+    // distinct-source pass-through hidden view, so the two join inputs are
+    // never the same source (single-source-per-epoch holds).
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -85,13 +88,12 @@ fn test_self_join_rejected() {
     let mut p = SqlPlanner::new(&mut client, &sn);
     p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, fk BIGINT NOT NULL)")
         .unwrap();
-    let err = p
-        .execute("CREATE VIEW v AS SELECT t1.id FROM t AS t1 JOIN t AS t2 ON t1.fk = t2.fk")
-        .unwrap_err();
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.to_lowercase().contains("self-join"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
-    }
+    p.execute("CREATE VIEW v AS SELECT t1.id AS i1, t2.id AS i2 FROM t AS t1 JOIN t AS t2 ON t1.fk = t2.fk")
+        .unwrap();
+    p.execute("INSERT INTO t VALUES (1, 7), (2, 7), (3, 9)").unwrap();
+    // fk=7 pairs {1,2}×{1,2}; fk=9 pairs {3}×{3}.
+    let rows = payload_rows(&mut client, &sn, "v", &["i1", "i2"]);
+    assert_eq!(rows, vec![vec![1, 1], vec![1, 2], vec![2, 1], vec![2, 2], vec![3, 3]]);
 }
 
 // ── item 26: self-referencing foreign key ────────────────────────────

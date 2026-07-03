@@ -101,7 +101,7 @@ fn test_create_view_ambiguous_where() {
     assert_ambiguous(p.execute("CREATE VIEW v5 AS SELECT * FROM jv WHERE id = 5"));
 }
 
-/// GROUP BY clause — `execute_create_group_by_view` (§5.3).
+/// GROUP BY clause — `emit_group_by_pieces` (§5.3).
 #[test]
 fn test_create_view_ambiguous_group_by() {
     let srv = match ServerHandle::start() {

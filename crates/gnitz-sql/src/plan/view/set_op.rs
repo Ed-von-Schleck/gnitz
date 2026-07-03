@@ -10,18 +10,35 @@ use crate::lower::compile_bound_expr_to_program;
 use crate::plan::validate::{
     reject_duplicate_column_names, reject_float_keys, reject_unhonored_select_clauses, HonoredClauses,
 };
-use crate::SqlResult;
+use crate::plan::view::EmitPieces;
 use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, Schema, TypeCode};
 use sqlparser::ast::{SelectItem, SetExpr, SetOperator, SetQuantifier};
 
-fn compile_set_op_side(
+/// Resolve a set-op side's FROM: exactly one plain table. A derived table or a
+/// JOIN input is not composed here (set-op branches are not pre-compiled by the
+/// front door), so both reject via the strict extractor / the arity check.
+fn resolve_side_source(
     client: &mut GnitzClient,
-    select: &sqlparser::ast::Select,
     binder: &mut Binder<'_>,
+    select: &sqlparser::ast::Select,
+    context: &str,
+) -> Result<(u64, std::rc::Rc<Schema>), GnitzSqlError> {
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{context}: only a single table without JOINs is supported"
+        )));
+    }
+    let table_name = extract_table_factor_name(&select.from[0].relation, context)?;
+    binder.resolve(client, &table_name)
+}
+
+fn compile_set_op_side(
+    select: &sqlparser::ast::Select,
     cb: &mut CircuitBuilder,
     branch_id: u8,
     context: &str,
     distinct_honored: bool,
+    source: (u64, std::rc::Rc<Schema>),
 ) -> Result<(gnitz_core::NodeId, Vec<ColumnDef>, u64), GnitzSqlError> {
     // Honor FROM, WHERE, and the projection always; plain DISTINCT only when
     // `distinct_honored` — i.e. the DISTINCT-view caller, which dedups after this
@@ -38,13 +55,10 @@ fn compile_set_op_side(
         context,
     )?;
 
-    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{context}: only a single table without JOINs is supported"
-        )));
-    }
-    let table_name = extract_table_factor_name(&select.from[0].relation, context)?;
-    let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
+    // `source` is pre-resolved by the caller: the side's single FROM table, or —
+    // for the DISTINCT caller — a hidden view H compiled from a JOIN input, over
+    // which this side's WHERE/projection resolve by column name.
+    let (source_tid, source_schema) = source;
 
     let inp = cb.input_delta_tagged(source_tid);
 
@@ -156,18 +170,18 @@ fn set_op_leaves(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_create_set_op_view(
+/// Emit a set-operation view's circuit pieces `(circuit, cols, pk)` for a
+/// pre-allocated `view_id` — as a plain view or as a chain final over compiled
+/// sub-plans (each side's FROM resolves to a hidden view).
+pub(crate) fn emit_set_op_pieces(
     client: &mut GnitzClient,
-    schema_name: &str,
-    view_name: &str,
-    sql_text: &str,
+    view_id: u64,
     op: SetOperator,
     set_quantifier: SetQuantifier,
     left: &SetExpr,
     right: &SetExpr,
     binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
+) -> Result<EmitPieces, GnitzSqlError> {
     let left_select = match left {
         SetExpr::Select(s) => s,
         _ => {
@@ -185,7 +199,6 @@ pub(crate) fn execute_create_set_op_view(
         }
     };
 
-    let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, 0);
 
     // UNION ALL keeps both copies of an identical row (weight +2), so the two
@@ -194,23 +207,26 @@ pub(crate) fn execute_create_set_op_view(
     // identical rows, so both sides use branch_id = 0.
     let right_branch_id = matches!((op, set_quantifier), (SetOperator::Union, SetQuantifier::All)) as u8;
 
+    let left_src = resolve_side_source(client, binder, left_select, "set operation")?;
     let (left_node, left_cols, left_tid) =
-        compile_set_op_side(client, left_select, binder, &mut cb, 0, "set operation", false)?;
+        compile_set_op_side(left_select, &mut cb, 0, "set operation", false, left_src)?;
+    let right_src = resolve_side_source(client, binder, right_select, "set operation")?;
     let (right_node, right_cols, right_tid) = compile_set_op_side(
-        client,
         right_select,
-        binder,
         &mut cb,
         right_branch_id,
         "set operation",
         false,
+        right_src,
     )?;
 
     // INTERSECT/EXCEPT build their two distinct-ed leaves on the same content-hash
     // PK, then combine with union/negate/positive_part. When both branches resolve
     // to the same relation, one source delta would have to drive both branch
     // pipelines in a single epoch — which the single-source-per-epoch execution
-    // model does not deliver — so reject it. Mirror of the self-join guard. The
+    // model does not deliver — so reject it. (The join planner solves the same
+    // constraint by wrapping the repeated relation in a pass-through hidden view;
+    // set-op sides could adopt that wrap if this shape is ever needed.) The
     // join-free arithmetic itself has no cross-term, so this is an execution-model
     // constraint, not a correctness-of-the-math one. UNION / UNION ALL are linear
     // merges, exempt. Two *different* views over the same base table produce two
@@ -319,29 +335,24 @@ pub(crate) fn execute_create_set_op_view(
     reject_duplicate_column_names(out_cols_final.iter().map(|c| c.name.as_str()), "set operation view")?;
 
     // Set-op views emit a synthetic single-column content-hash PK at slot 0.
-    client
-        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols_final, &[0])
-        .map_err(GnitzSqlError::Exec)?;
-
-    Ok(SqlResult::ViewCreated { view_id })
+    Ok((circuit, out_cols_final, vec![0]))
 }
 
-pub(crate) fn execute_create_distinct_view(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    view_name: &str,
-    sql_text: &str,
+/// Emit a `SELECT DISTINCT` view's circuit pieces `(circuit, cols, pk)` for a
+/// pre-allocated `view_id` over the pre-resolved `source` — a plain table, or a
+/// hidden view H compiled from a JOIN input.
+pub(crate) fn emit_distinct_pieces(
+    view_id: u64,
     select: &sqlparser::ast::Select,
-    binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
-    let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
+    source: (u64, std::rc::Rc<Schema>),
+) -> Result<EmitPieces, GnitzSqlError> {
     let mut cb = CircuitBuilder::new(view_id, 0);
-    // Reuse the set-op side pipeline (validate FROM, resolve, input delta,
-    // optional WHERE, project, hash-reindex by the projected content, and shard)
-    // under the "SELECT DISTINCT" error context. `distinct` then dedups on that
+    // Reuse the set-op side pipeline (clause rejection, input delta, optional
+    // WHERE, project, hash-reindex by the projected content, and shard) under the
+    // "SELECT DISTINCT" error context. `distinct` then dedups on that
     // hash-of-projection PK; keying by the source PK (unique) would make it a
     // no-op and leak the unprojected columns.
-    let (sharded, proj_cols, _) = compile_set_op_side(client, select, binder, &mut cb, 0, "SELECT DISTINCT", true)?;
+    let (sharded, proj_cols, _) = compile_set_op_side(select, &mut cb, 0, "SELECT DISTINCT", true, source)?;
     let distinct_node = cb.distinct(sharded);
 
     cb.sink(distinct_node);
@@ -354,9 +365,5 @@ pub(crate) fn execute_create_distinct_view(
     reject_duplicate_column_names(out_cols.iter().map(|c| c.name.as_str()), "SELECT DISTINCT view")?;
 
     // DISTINCT views emit a synthetic single-column content-hash PK at slot 0.
-    client
-        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols, &[0])
-        .map_err(GnitzSqlError::Exec)?;
-
-    Ok(SqlResult::ViewCreated { view_id })
+    Ok((circuit, out_cols, vec![0]))
 }

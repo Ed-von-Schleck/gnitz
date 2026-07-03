@@ -290,12 +290,14 @@ fn test_except_distinct_lifting_no_underflow() {
     );
 }
 
-// ── same-source INTERSECT/EXCEPT rejection (mirror of the self-join guard) ──
+// ── same-source INTERSECT/EXCEPT rejection ──────────────────────────
 //
 // Both branches resolving to the SAME source relation id collapse to one
 // dependency edge: a single delta drives both branch pipelines in one pass and
 // the cross-correction term is dropped (silently wrong results). The guard
-// rejects exactly that. The discriminator is source-id equality, NOT base-table
+// rejects exactly that. (The join planner solves the same constraint by
+// wrapping the repeated relation in a pass-through hidden view; set-op sides
+// do not wrap yet.) The discriminator is source-id equality, NOT base-table
 // overlap — two different views over the same base produce two edges and stay
 // accepted (see the two-view tests below).
 
@@ -665,30 +667,6 @@ fn test_union_nullability_is_or() {
         view_col_nullable(&mut client, &sn, "v_ua", "v"),
         "UNION ALL keeps the OR: a nullable side makes the output nullable"
     );
-}
-
-#[test]
-fn test_direct_self_join_still_rejected() {
-    // Mirror of planner_view_validation.rs:81; kept here so the set-op scope
-    // boundary is documented in one place.
-    let srv = match ServerHandle::start() {
-        Some(s) => s,
-        None => return,
-    };
-    let (mut client, sn) = make_planner(&srv);
-    {
-        let mut p = SqlPlanner::new(&mut client, &sn);
-        p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL)")
-            .unwrap();
-    }
-    let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = p
-        .execute("CREATE VIEW j AS SELECT a.id FROM t AS a JOIN t AS b ON a.k = b.k")
-        .unwrap_err();
-    match err {
-        GnitzSqlError::Unsupported(s) => assert!(s.to_lowercase().contains("self-join"), "got: {}", s),
-        e => panic!("expected Unsupported, got {:?}", e),
-    }
 }
 
 // ── float set-op row-identity rejection (Fix A2) ─────────────────────

@@ -633,7 +633,7 @@ fn test_view_over_compound_pk_group_by_accepted() {
 
 #[test]
 fn test_view_over_compound_pk_too_wide_rejected() {
-    // The uniform client guard in write_circuit_rows must reject a view whose
+    // The uniform client guard in create_view_chain must reject a view whose
     // output column count exceeds MAX_COLUMNS (65) cleanly, never tripping the
     // engine's build_schema_from_col_defs assert. A compound-PK source plus a
     // re-selection of both PK columns as extra payload pushes SELECT * (64 cols)

@@ -122,7 +122,9 @@ pub(crate) fn flatten_conjuncts<'e>(expr: &'e sqlparser::ast::Expr, out: &mut Ve
     }
 }
 
-/// Extract table name from a TableFactor::Table.
+/// Extract table name from a TableFactor::Table. Strict — a derived table
+/// (subquery in FROM) is rejected; only the CREATE VIEW planner paths that
+/// pre-compile derived tables may accept one (`extract_relation_name`).
 pub(crate) fn extract_table_factor_name(
     tf: &sqlparser::ast::TableFactor,
     context: &str,
@@ -135,13 +137,31 @@ pub(crate) fn extract_table_factor_name(
     }
 }
 
-/// Extract `(table name, effective alias)` from a TableFactor::Table — the
-/// declared alias when present, else the table name itself.
+/// Extract the resolvable relation name of a CREATE VIEW FROM factor: a table's
+/// name, or a derived table's alias. Only for the view-planner paths that run
+/// *after* the front door pre-compiled every top-level derived table into a
+/// hidden view registered under its alias — elsewhere (DML, set-op sides, CTE
+/// bodies) a derived table is NOT pre-compiled and the alias would mis-resolve,
+/// so those paths use the strict `extract_table_factor_name`. An unaliased
+/// derived table cannot be referenced, so it is rejected.
+pub(crate) fn extract_relation_name(tf: &sqlparser::ast::TableFactor, context: &str) -> Result<String, GnitzSqlError> {
+    match tf {
+        sqlparser::ast::TableFactor::Derived { alias: Some(a), .. } => Ok(a.name.value.clone()),
+        sqlparser::ast::TableFactor::Derived { alias: None, .. } => Err(GnitzSqlError::Unsupported(format!(
+            "{context}: a derived table (subquery in FROM) needs an alias"
+        ))),
+        _ => extract_table_factor_name(tf, context),
+    }
+}
+
+/// Extract `(relation name, effective alias)` from a CREATE VIEW FROM factor —
+/// the declared alias when present, else the name itself. Derived tables resolve
+/// by alias (see `extract_relation_name` for when that is sound).
 pub(crate) fn extract_table_name_and_alias(
     tf: &sqlparser::ast::TableFactor,
     context: &str,
 ) -> Result<(String, String), GnitzSqlError> {
-    let name = extract_table_factor_name(tf, context)?;
+    let name = extract_relation_name(tf, context)?;
     let alias = match tf {
         sqlparser::ast::TableFactor::Table { alias: Some(a), .. } => a.name.value.clone(),
         _ => name.clone(),

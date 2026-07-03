@@ -24,6 +24,16 @@ pub(crate) fn reject_duplicate_column_names<'a>(
     Ok(())
 }
 
+/// Validate a user-supplied table/view/schema name: reject the empty string,
+/// a leading `_` (reserved for the system prefix and for synthesized hidden
+/// views, `__h{vid}_{i}`), and any character outside `[A-Za-z0-9_]`. This is the
+/// single production enforcement point for these names — the engine's own
+/// validators are `#[cfg(test)]`-only — so CREATE TABLE/VIEW and DROP TABLE/VIEW
+/// all funnel through it right after `extract_name`.
+pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {
+    gnitz_core::validate_user_identifier(name).map_err(GnitzSqlError::Plan)
+}
+
 /// Validate a user-supplied name destined to become an index name — a CREATE
 /// INDEX name or a UNIQUE/constraint name that maps to a secondary index.
 /// Beyond the general identifier rules, the reserved `__fk_` infix is rejected:
@@ -32,7 +42,7 @@ pub(crate) fn reject_duplicate_column_names<'a>(
 /// than in `validate_user_identifier`, which also guards table/column/schema
 /// names that may legitimately contain `__fk_`.
 pub(crate) fn validate_user_index_name(name: &str) -> Result<(), GnitzSqlError> {
-    gnitz_core::validate_user_identifier(name).map_err(GnitzSqlError::Plan)?;
+    validate_user_name(name)?;
     if name.contains(gnitz_core::FK_INDEX_INFIX) {
         return Err(GnitzSqlError::Plan(format!(
             "Index/constraint names cannot contain the reserved '{}' infix",
@@ -712,4 +722,23 @@ pub(crate) fn reject_unhonored_table_constraints(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_user_name_rejects_reserved_and_malformed() {
+        // Leading `_` is reserved (system prefix + synthesized `__h…` views).
+        assert!(matches!(validate_user_name("_hidden"), Err(GnitzSqlError::Plan(_))));
+        assert!(matches!(validate_user_name("__h5_0"), Err(GnitzSqlError::Plan(_))));
+        // Empty and illegal characters.
+        assert!(matches!(validate_user_name(""), Err(GnitzSqlError::Plan(_))));
+        assert!(matches!(validate_user_name("bad-name"), Err(GnitzSqlError::Plan(_))));
+        assert!(matches!(validate_user_name("a.b"), Err(GnitzSqlError::Plan(_))));
+        // Ordinary names — including an internal `_` — are accepted.
+        assert!(validate_user_name("orders").is_ok());
+        assert!(validate_user_name("my_view2").is_ok());
+    }
 }

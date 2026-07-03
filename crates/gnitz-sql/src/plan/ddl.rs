@@ -6,7 +6,7 @@ use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{
     default_index_name, reject_duplicate_column_names, reject_non_key_eligible, reject_unhonored_column_options,
-    reject_unhonored_table_constraints, validate_user_index_name,
+    reject_unhonored_table_constraints, validate_user_index_name, validate_user_name,
 };
 use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
 use crate::SqlResult;
@@ -202,6 +202,7 @@ pub(crate) fn execute_create_table(
     create: &sqlparser::ast::CreateTable,
 ) -> Result<SqlResult, GnitzSqlError> {
     let table_name = extract_name(&create.name, "CREATE TABLE")?;
+    validate_user_name(&table_name)?;
 
     let sql_cols = &create.columns;
 
@@ -575,9 +576,15 @@ pub(crate) fn execute_drop(
 
         match object_type {
             ObjectType::Table => {
+                // Reject a leading-`_` target planner-side: no user object can
+                // carry such a name (creation validates it too), and this keeps
+                // synthesized hidden views (`__h…`) undroppable by name — they
+                // are only removed by the owning view's cascade.
+                validate_user_name(&name)?;
                 client.drop_table(schema_name, &name).map_err(GnitzSqlError::Exec)?;
             }
             ObjectType::View => {
+                validate_user_name(&name)?;
                 client.drop_view(schema_name, &name).map_err(GnitzSqlError::Exec)?;
             }
             ObjectType::Index => {

@@ -74,9 +74,9 @@ impl Schema {
         &self.pk_cols
     }
 
-    /// Number of PK columns (compound-key arity). The wire/storage layer
-    /// represents arity >= 2, but the SQL planner still rejects compound
-    /// PRIMARY KEY, so every planner-constructed schema has count 1.
+    /// Number of PK columns (compound-key arity). Compound primary keys are
+    /// supported end to end — `CREATE TABLE … PRIMARY KEY (a, b, …)` produces a
+    /// schema with `count >= 2` — so callers must not assume a lone PK column.
     #[inline]
     pub fn pk_count(&self) -> usize {
         self.pk_cols.len()

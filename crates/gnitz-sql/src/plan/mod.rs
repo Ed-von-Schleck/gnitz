@@ -4,6 +4,7 @@
 //! `dml`.
 
 mod ddl;
+pub(crate) mod lp;
 pub(crate) mod validate;
 mod view;
 

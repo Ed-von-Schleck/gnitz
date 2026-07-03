@@ -3,9 +3,9 @@
 //! post-reduce projection, and the HAVING cluster (collection, binding, and the
 //! `Having` leaf binder over the grouped relation).
 
-use crate::ast_util::{expr_operands, extract_table_factor_name, single_relation_col_name};
+use crate::ast_util::{expr_operands, single_relation_col_name};
 use crate::bind::{
-    bind_single_table, bind_structural, find_unique_column, reject_unsupported_agg_qualifiers, Binder, LeafBinder,
+    bind_single_table, bind_structural, find_unique_column, reject_unsupported_agg_qualifiers, LeafBinder,
 };
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr};
@@ -13,8 +13,8 @@ use crate::lower::compile_bound_expr_to_program;
 use crate::plan::validate::{
     reject_duplicate_column_names, reject_float_key, reject_unhonored_select_clauses, HonoredClauses,
 };
+use crate::plan::view::EmitPieces;
 use crate::types::{is_integer_type, is_min_max_orderable, is_wide_int};
-use crate::SqlResult;
 use gnitz_core::{
     CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, Schema, TypeCode, AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX,
     AGG_MIN, AGG_SUM, AGG_SUM_ZERO,
@@ -138,14 +138,22 @@ fn group_col_reduce_pos(
     }
 }
 
-pub(crate) fn execute_create_group_by_view(
+/// Emit a GROUP BY view's reduce circuit from its `select`, returning
+/// `(circuit, output_columns, pk_cols)`. `view_id` is pre-allocated so a chain's
+/// downstream segment can reference this segment's store; the segment itself is
+/// created by the caller. The view's PK is the group key — a natural PK, so a
+/// grouped hidden segment needs no synthetic-PK (`vis`) offset when joined.
+///
+/// `source` is the pre-resolved input relation `(tid, schema)` — the FROM table,
+/// or a hidden view H compiled from a JOIN input, over which the group /
+/// aggregate / HAVING columns resolve by name (a qualifier on a compound ref is
+/// informational in a single-source context — see `bind_single_table`).
+pub(crate) fn emit_group_by_pieces(
     client: &mut GnitzClient,
-    schema_name: &str,
-    view_name: &str,
-    sql_text: &str,
+    view_id: u64,
     select: &sqlparser::ast::Select,
-    binder: &mut Binder<'_>,
-) -> Result<SqlResult, GnitzSqlError> {
+    source: (u64, std::rc::Rc<Schema>),
+) -> Result<EmitPieces, GnitzSqlError> {
     // Grouped views consume FROM, WHERE, GROUP BY, HAVING, and the projection; reject every
     // other clause (PREWHERE, TOP, QUALIFY, …) so a dropped clause is a clean error.
     reject_unhonored_select_clauses(
@@ -157,9 +165,7 @@ pub(crate) fn execute_create_group_by_view(
         },
         "CREATE VIEW",
     )?;
-    // 1. Resolve source table
-    let table_name = extract_table_factor_name(&select.from[0].relation, "GROUP BY")?;
-    let (source_tid, source_schema) = binder.resolve(client, &table_name)?;
+    let (source_tid, source_schema) = source;
     // A reduce directly over a REPLICATED source must run shard-free on every
     // worker (`reduce_multi_local`): the full copy is already on every worker, so
     // a sharded reduce would scatter W identical copies into each group owner and
@@ -361,7 +367,6 @@ pub(crate) fn execute_create_group_by_view(
     };
 
     // 5. Build circuit
-    let view_id = client.alloc_table_id().map_err(GnitzSqlError::Exec)?;
     let mut cb = CircuitBuilder::new(view_id, source_tid);
     let inp = cb.input_delta();
 
@@ -644,11 +649,7 @@ pub(crate) fn execute_create_group_by_view(
     // PK (source-PK order) for a compound natural PK, else the lone leading
     // column. `reduce_schema.pk_cols` is dense (`0..pk_count`).
     let view_pk: Vec<u32> = (0..reduce_schema.pk_cols.len() as u32).collect();
-    client
-        .create_view_with_circuit(schema_name, view_name, sql_text, circuit, &out_cols, &view_pk)
-        .map_err(GnitzSqlError::Exec)?;
-
-    Ok(SqlResult::ViewCreated { view_id })
+    Ok((circuit, out_cols, view_pk))
 }
 
 /// Resolve a HAVING function call to its aggregate function selector + argument

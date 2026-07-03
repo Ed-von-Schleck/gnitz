@@ -160,9 +160,11 @@ class TestTransitiveSelfJoin:
 
 # Direct self-join rejection is a planner check (no runtime join), so it is
 # correct at every worker count.
-class TestDirectSelfJoinRejected:
-    def test_direct_self_join_rejected(self, client):
-        """Direct self-join t JOIN t (single dependency edge) is rejected."""
+class TestDirectSelfJoin:
+    def test_direct_self_join_supported(self, client):
+        """Direct self-join `t AS a JOIN t AS b` is now supported: the planner wraps the
+        repeated occurrence in an auto-generated pass-through view (this file's manual
+        two-views-over-one-base pattern, now automatic)."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -170,11 +172,20 @@ class TestDirectSelfJoinRejected:
                 "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
                 schema_name=sn,
             )
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE VIEW j AS SELECT a.id FROM t AS a JOIN t AS b ON a.k = b.k",
-                    schema_name=sn,
-                )
+            client.execute_sql(
+                "CREATE VIEW j AS SELECT a.id AS aid, b.id AS bid FROM t AS a JOIN t AS b ON a.k = b.k",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO t VALUES (1, 100), (2, 100), (3, 200)", schema_name=sn)
+            vid = client.resolve_table(sn, "j")[0]
+            got = sorted((r._asdict()["aid"], r._asdict()["bid"]) for r in client.scan(vid) if r.weight > 0)
+            # k=100 pairs {1,2}×{1,2}; k=200 pairs {3}×{3}.
+            assert got == [(1, 1), (1, 2), (2, 1), (2, 2), (3, 3)], got
+
+            # Incremental: a new k=100 row joins every existing k=100 row (both directions).
+            client.execute_sql("INSERT INTO t VALUES (4, 100)", schema_name=sn)
+            got = sorted((r._asdict()["aid"], r._asdict()["bid"]) for r in client.scan(vid) if r.weight > 0)
+            assert (4, 1) in got and (1, 4) in got and (4, 4) in got, got
         finally:
             _cleanup(client, sn, tables=["t"], views=["j"])
 

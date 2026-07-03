@@ -495,6 +495,50 @@ impl DagEngine {
         self.dep.reverse.get(&view_id).cloned().unwrap_or_default()
     }
 
+    /// Order a DDL bundle's view ids by their intra-bundle dependencies (Kahn's
+    /// algorithm over `get_source_ids(vid) ∩ bundle`), so a chain's upstream
+    /// hidden view is backfilled before a downstream one scans it. VIEW_TAB row
+    /// order carries the registration `depth` (a standing contract), but the
+    /// live backfill must not also couple to that order — a deliberately
+    /// row-misordered bundle must still backfill. A bundle is acyclic by
+    /// construction; the no-progress fallback appends the remainder in input
+    /// order so termination holds regardless.
+    pub fn order_by_intra_bundle_deps(&mut self, view_ids: &[i64]) -> Vec<i64> {
+        if view_ids.len() <= 1 {
+            return view_ids.to_vec();
+        }
+        let bundle: FxHashSet<i64> = view_ids.iter().copied().collect();
+        let mut in_deps: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
+        for &vid in view_ids {
+            let deps: Vec<i64> = self
+                .get_source_ids(vid)
+                .into_iter()
+                .filter(|s| *s != vid && bundle.contains(s))
+                .collect();
+            in_deps.insert(vid, deps);
+        }
+        let mut emitted: FxHashSet<i64> = FxHashSet::default();
+        let mut order: Vec<i64> = Vec::with_capacity(view_ids.len());
+        while order.len() < view_ids.len() {
+            let before = order.len();
+            for &vid in view_ids {
+                if !emitted.contains(&vid) && in_deps[&vid].iter().all(|d| emitted.contains(d)) {
+                    order.push(vid);
+                    emitted.insert(vid);
+                }
+            }
+            if order.len() == before {
+                debug_assert!(false, "cycle in DDL bundle view dependencies: {view_ids:?}");
+                for &vid in view_ids {
+                    if emitted.insert(vid) {
+                        order.push(vid);
+                    }
+                }
+            }
+        }
+        order
+    }
+
     // ── Metadata queries (lightweight, no compilation) ──────────────────
 
     /// Load typed circuit nodes/edges for metadata queries. Cheaper than full
