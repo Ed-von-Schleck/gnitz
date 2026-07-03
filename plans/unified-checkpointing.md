@@ -196,19 +196,116 @@ Between checkpoints, **all** tables behave like today's Ephemeral tables:
   `compact_if_needed` (`table/mod.rs:616-637`) collapses to
   `should_compact()` + `run_compact()`: compaction writes its output files
   unsynced, swaps the in-memory index, and appends superseded files to
-  `pending_deletions` — which is drained only after the next barrier publish.
-  Between checkpoints, superseded compaction inputs and their replacements
-  coexist on disk (bounded by one checkpoint interval).
+  `pending_deletions` (all three compaction paths do — `index.rs:154,284,392`)
+  — which is drained only after the next barrier publish. Between checkpoints,
+  superseded compaction inputs and their replacements coexist on disk (bounded
+  by one checkpoint interval).
+- **Compaction output names off `guard_max_lsn`, not the boot-resetting
+  `compact_seq`.** `compact_one_guard` names its `hcomp` output
+  `hcomp_{tid}_L{level}_G{guard}_{compact_seq}.db` (`index.rs:257-264`), but
+  `compact_seq` starts at 0 each boot and is not restored by `load_manifest`,
+  so after a reboot a fresh compaction reuses a value already baked into a
+  live, manifest-referenced `hcomp` file — the new output collides with an
+  existing input, that input is appended to `pending_deletions`, and
+  `try_cleanup` then unlinks the freshly written live shard, orphaning it under
+  the published manifest (ENOENT on the next boot). The deferred-cleanup
+  crash-safety argument below *depends* on mid-epoch compaction outputs being
+  unique orphans; this collision violates it. Name off the guard's max LSN
+  instead — reboot-stable (restored by `load_manifest`) and strictly
+  increasing per re-compaction (a re-compaction needs newly flushed inputs at
+  `current_lsn` > every existing entry), mirroring the vertical path's already
+  reboot-stable `lsn_tag` (`index.rs:348-352`):
+
+  ```rust
+  // storage/lsm/shard_index/index.rs — compact_one_guard output name
+  let guard_max_lsn = guard.entries.iter().map(|e| e.max_lsn).max().unwrap_or(0);
+  let name_tag = if guard_max_lsn > 0 { guard_max_lsn } else { self.compact_seq };
+  let out_path = format!(
+      "{}/hcomp_{}_L{}_G{}_{}.db",
+      self.output_dir, self.table_id, Self::level_num(level_idx),
+      guard.guard_key, name_tag,
+  );
+  ```
+
+  The `compact_seq` fallback is unreachable once every ingest bumps
+  `current_lsn` (§lifecycle) — every entry then carries a real LSN, so
+  `guard_max_lsn > 0` always. Since the output's own `max_lsn` equals
+  `guard_max_lsn` and the next re-compaction's inputs all sit at strictly
+  higher LSNs, no output ever reuses an input filename.
 - At the barrier, a dirty table's flush is: push memtable snapshot into
   `in_memory_l0` (existing Ephemeral flush), fold to one run, write that run
   as one shard (the spill path, minus the ceiling check), register it, and
   prepare the manifest — then the barrier fsyncs **every file referenced by
   the new manifest** (open-by-path → fdatasync → close; `ShardEntry.filename`
-  holds full paths, `shard_index/mod.rs:49`; clean files cost ~1 µs, so no
-  dirty-file tracking exists), renames the manifest, fsyncs dirs, and drains
-  `pending_deletions`. Clean tables (empty memtable, empty L0, no index
-  changes since last publish) are skipped exactly as today's `Empty` path
-  skips them.
+  holds full paths, `shard_index/mod.rs:49`; clean files cost ~1 µs, so the
+  barrier re-fsyncs every referenced file rather than tracking per-*file*
+  dirtiness), renames the manifest, fsyncs dirs, and drains `pending_deletions`.
+- **A table needs a barrier publish iff its on-disk manifest does not reflect
+  its in-memory state.** That is `!memtable.is_empty() || !in_memory_l0.is_empty()
+  || !shard_index.pending_deletions.is_empty()` — the third disjunct is the
+  load-bearing addition. Today's `flush_prepare` Empty gate keys only on
+  `memtable.is_empty()` (`flush.rs:80`), which is correct only because
+  compaction republishes its own manifest inline (`compact_if_needed`). Once
+  publication defers to the barrier, a table that compacts mid-epoch and then
+  goes quiet ends the epoch with an empty memtable **and** empty `in_memory_l0`
+  (the spill that triggered the compaction cleared it), so an
+  `memtable`-only gate would skip its publish while the barrier still drains
+  its superseded pre-compaction shards from `pending_deletions` — leaving the
+  last (pre-compaction) manifest pointing at unlinked files. Every compaction
+  path appends to `pending_deletions` (`index.rs:154,284,392`), drained only
+  after publish, so `!pending_deletions.is_empty()` is exactly "compacted since
+  last publish"; no separate dirty flag is needed. The Empty gate becomes:
+
+  ```rust
+  // storage/lsm/table/flush.rs — flush_prepare Empty gate
+  self.found_source = FoundSource::None;
+  if self.memtable.is_empty()
+      && self.in_memory_l0.is_empty()
+      && !self.shard_index.has_pending_deletions()
+  {
+      return Ok(FlushOutcome::Empty);
+  }
+  ```
+
+  When the only dirt is compaction (empty memtable and `in_memory_l0`), the
+  barrier prepares a **manifest-only** publish: no new shard is written; the
+  prepared manifest reflects the compaction-swapped index, and the
+  fsync-every-referenced-file rule durably commits the (already-written,
+  unsynced) compaction outputs before the manifest rename. Truly clean tables
+  (all three empty) are skipped exactly as today's `Empty` path skips them.
+- **Barrier-flush fd hygiene (pre-existing leak, closed here).** The barrier's
+  commit loops collect open directory fds (raw `libc::c_int`, no `Drop`) and
+  close them only on the success path: `PartitionedTable::flush_commit_batch`
+  (`partitioned_table.rs:359-367`) accumulates one dirfd per committed partition,
+  and the worker's `handle_flush_all`/`flush_chunk` (`worker/mod.rs:1459-1551`)
+  accumulate one per committed family into `dir_inodes`, closing the set only in
+  the final dir-fsync sweep (`worker/mod.rs:1502-1506`). An I/O error mid-loop
+  (`renameat`/`fstat`/`fdatasync` failure) returns via `?`, dropping the
+  collected fds unclosed; the worker survives the error (`send_error` +
+  `Continue`) and the committer only warns and continues, so repeated failed
+  checkpoints under a persistent disk error leak fds cumulatively. The two loops
+  leak disjoint fd sets (within-family, before the failing partition;
+  across-families, before the failing chunk). Fix by owning every collected dir
+  fd as `OwnedFd` at its boundary, so *every* exit — success, error `?`, panic
+  unwind — closes it via `Drop`, deleting the manual close loop:
+
+  ```rust
+  // storage/lsm/partitioned_table.rs — flush_commit_batch owns dirfds, so a
+  // mid-loop `?` drops (closes) every fd already collected.
+  let mut dirfds: Vec<OwnedFd> = Vec::with_capacity(works.len());
+  for (idx, w) in works {
+      if let Some(fd) = self.tables[idx].flush_commit(w)? {
+          dirfds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+      }
+  }
+  Ok(dirfds.into_iter().map(OwnedFd::into_raw_fd).collect())
+  ```
+
+  `flush_chunk` likewise takes each returned fd as `OwnedFd` immediately, storing
+  `dir_inodes: Vec<(u64, u64, OwnedFd)>`; the `dedup_dirfds` fsync sweep borrows
+  them and `handle_flush_all` drops the vec on every path (no manual close loop).
+  `flush_commit` and `flush_family_commit_batch` keep returning raw `c_int`;
+  ownership transfers at these two collection boundaries.
 
 ### DML found-row path learns the RAM tier
 
@@ -367,18 +464,29 @@ Boot sequence changes (in `runtime/bootstrap.rs` order):
    flushed-shards scan plus the per-worker replay projection covers the tail
    exactly as today).
 2. Workers (post-fork): `recover_from_sal` replays FLAG_PUSH into base tables
-   as today, and **keeps** each zone's effective delta —
+   as today, and per replayed zone now **keeps** the effective delta —
    `replay_ingest` returns it (it already computes it and discards it,
    `store_io.rs:473-483`) — buffering into the worker's `pending_deltas`,
-   exactly like live `handle_push`. The boot flush
+   exactly like live `handle_push`. Replay is driven in windows interleaved
+   with the drain sweep (step 3), not as one exhaustive pass. The boot flush
    (`runtime/bootstrap.rs:507-512`) is deleted.
-3. Master, after all worker ACKs: **pre-live tick drive** — for every base
-   table id in source-depth order, `drain_tick_blocking(src)` (the existing
-   CREATE-VIEW primitive, `dispatch.rs:839-848`; empty sources are no-op
-   ticks). Each source's entire buffered delta is driven as **one
-   consolidated epoch**, so high-churn tails collapse to net rows before
-   touching circuits. This brings every generation-valid view from its
-   checkpoint cut to the present.
+3. Master, coordinating with the workers: **windowed pre-live tick drive.**
+   `pending_deltas` is a per-tid in-RAM `Batch` that does not spill, and the
+   uncheckpointed tail is up to 75 % of `GNITZ_SAL_BYTES` (≈ 768 MiB) with an
+   effective-delta buffer ~2× that for update-heavy tails (retract + insert per
+   unique-pk update) — so draining a source's *entire* buffer in one epoch would
+   spike recovery RAM to ~1.5 GiB/worker (worst on low worker counts, where each
+   worker owns a larger partition share). Instead replay proceeds in
+   **LSN-bounded windows**: workers replay until their aggregate `pending_deltas`
+   reaches a byte budget (`RECOVERY_DRAIN_BYTES`, default 64 MiB) or the tail is
+   exhausted, then the master drives one `drain_tick_blocking` sweep over every
+   dirty base table in source-depth order (`dispatch.rs:839-848`; workers whose
+   buffer for a source is empty issue empty ticks — the backfill lockstep
+   pattern, required so exchanging views stay in step), then replay resumes.
+   Each `(source, window)` is a state-exact consolidated epoch; peak
+   `pending_deltas` is bounded to one window rather than the whole tail, while
+   high-churn *within* a window still collapses to net rows. This brings every
+   generation-valid view from its checkpoint cut to the present.
 4. Master: for views whose state was invalid, invalidate their plans, erase
    their (tick-drive-polluted) scratch and output state, and run today's
    backfill paths (worker-local `backfill_view` + `backfill_exchange_views`).
@@ -436,18 +544,21 @@ partitions rebuild. A Barrier-triggered re-run of steps 0-1 during the drain
 re-bumps the generation, so step 3 stamps the latest value — read the stamp
 at step-3 emission time.
 
-**Coalesced recovery replay is state-exact.** Driving each source's summed
-delta in one epoch, sources sequenced, preserves single-source-per-epoch;
-for a bilinear join the second source's epoch sees the first's updated trace,
-so the cross term `ΔA ⋈ ΔB` is emitted exactly once (the same
+**Windowed recovery replay is state-exact.** Driving each source's buffered
+delta as one or more consolidated windows, sources sequenced within each
+window, preserves single-source-per-epoch; for a bilinear join a source's
+window sees the other side's accumulated trace, so each cross pair
+`ΔA_i ⋈ ΔB_j` is emitted exactly once across the interleaving (the same
 across-epochs argument as the shared-source-branch case). Weight-clamp
 operators (distinct, positive_part) and reduce are functions of their
-integrals, and integrals telescope over any delta decomposition. Per-epoch
-*output deltas* differ from the original schedule; final accumulated state —
-all recovery needs, since no client observes pre-live intermediates — does
-not. Source ordering follows tick_tids insertion order as live ticks do.
-This argument requires that no operator holds cross-epoch state outside its
-integral tables — which is why the Delay opcode is removed server-side.
+integrals, and integrals telescope over **any** delta decomposition — so the
+window boundary is a free choice: it bounds peak buffer RAM (§Recovery step 3)
+without changing the fixpoint. Per-epoch *output deltas* differ from the
+original schedule; final accumulated state — all recovery needs, since no
+client observes pre-live intermediates — does not. Source ordering follows
+tick_tids insertion order as live ticks do. This argument requires that no
+operator holds cross-epoch state outside its integral tables — which is why
+the Delay opcode is removed server-side.
 
 **`pending_deltas` never clears.** Every buffered entry has a matching
 `tick_rows` bump on the same push (`committer.rs:503-511` /
@@ -460,9 +571,16 @@ paths.
 files are never unlinked before the next publish (drain moves strictly after
 barrier publish), so a crash loads the cut manifest over intact cut files;
 unsynced mid-epoch compaction outputs are unreferenced orphans, removed by
-`gc_orphans` at open. The barrier's fsync-everything-referenced rule is what
-makes publishing a manifest over mid-epoch-written (unsynced) compaction
-outputs safe.
+`gc_orphans` at open. Two properties this rests on: (1) a compaction output
+never reuses a live input's filename — guaranteed by the `guard_max_lsn`
+naming above, without which a post-reboot collision would append the live
+shard to `pending_deletions` and orphan it; (2) a table dirtied only by
+compaction still publishes at the barrier before its `pending_deletions` are
+drained — guaranteed by the `!has_pending_deletions()` term in the Empty gate,
+without which the pre-compaction manifest would survive while its shards are
+unlinked. The barrier's fsync-everything-referenced rule is what makes
+publishing a manifest over mid-epoch-written (unsynced) compaction outputs
+safe.
 
 **Pushes admitted during the drain would be safe but are not admitted.** A
 push committed mid-drain lands in the post-reset SAL and in base memtables
@@ -489,7 +607,17 @@ Rust (unit/integration, `make test`):
   spill registers real LSNs and reopen seeds `current_lsn`.
 - Compaction with deferred cleanup: crash-sim by reopening from the old
   manifest after a compaction that did not republish — cut state intact,
-  orphans GC'd.
+  orphans GC'd. Reboot-collision naming: force `compact_seq` to revisit a
+  value baked into a live `hcomp` file (reload a manifest that references one,
+  then compact) and assert the new output takes a distinct `guard_max_lsn`
+  name and the live shard is not unlinked. Compact-then-quiet: compact a table,
+  leave its memtable and `in_memory_l0` empty, run a barrier, reopen — the
+  manifest reflects the compacted index and every referenced shard exists.
+- Barrier-flush fd hygiene: a debug-only injection seam forces `flush_commit`
+  (within a family) and `fstat` (across chunks) to fail on the Nth fd; assert
+  the flush returns `Err` and the process fd count (`/proc/self/fd`) is
+  unchanged. Success-path regression: repeated checkpoints over several
+  partitioned tables leave the fd count flat.
 - `recover_sequences` arms for seq_ids 4/5.
 
 E2E (pytest, `make e2e`, always `GNITZ_WORKERS=4`):
@@ -515,6 +643,11 @@ E2E (pytest, `make e2e`, always `GNITZ_WORKERS=4`):
      (log marker), demonstrating instant resume.
 - Sustained-ingest test at a small SAL (`GNITZ_SAL_BYTES=16 MiB`) crossing
   many checkpoints with concurrent scans: no wedge, views stay equal to base.
+- Large-churn-tail recovery: fill the SAL near its checkpoint threshold with
+  updates to a hot base table feeding a view, SIGKILL before checkpoint,
+  restart, and assert (a) views correct and (b) peak worker RSS stays near
+  `RECOVERY_DRAIN_BYTES` rather than the full tail — proving the windowed
+  drain bounds recovery memory.
 
 Benchmark (validation, not a gate): a restart-time benchmark with a large
 join trace (two ~1 M-row tables joined many-to-many) comparing time-to-first
@@ -564,7 +697,14 @@ after each.
 - [ ] 4. **No mid-epoch manifest publish.** Strip publish/cleanup from
   `compact_if_needed`; move manifest prepare/rename to the barrier;
   barrier fsyncs every manifest-referenced file by path; `pending_deletions`
-  drains post-publish. Crash-sim compaction tests.
+  drains post-publish. Compaction output names off `guard_max_lsn`, not the
+  boot-resetting `compact_seq`. The Empty gate gains the
+  `!has_pending_deletions()` term so a compacted-then-quiet table still
+  publishes (manifest-only when memtable and L0 are empty). Own collected dir
+  fds as `OwnedFd` in `flush_commit_batch` and `flush_chunk`/`handle_flush_all`
+  so every error path closes them via `Drop` (deletes the manual close loop).
+  Crash-sim compaction tests: reboot-collision naming, compact-then-quiet
+  reopen; injected `flush_commit`/`fstat` failure leaves the fd count unchanged.
 - [ ] 5. **Checkpoint records + manifest V6 + three-step sequence.**
   `SEQ_ID_CHECKPOINT_GEN`/`SEQ_ID_TOPOLOGY` + `recover_sequences` arms +
   `STATE_FORMAT`; manifest V6 with generation; `FLAG_FLUSH_EPH` wire
@@ -573,9 +713,12 @@ after each.
   ephemeral round; boot and graceful shutdown run the sequence. Rederive
   manifests are now written and stamped but still erased at open (no reload
   yet) — state is discarded exactly as today, so behavior is unchanged.
-- [ ] 6. **Recovery reload + pre-live tick drive.** Conditional manifest load
-  for Rederive tables (master stores + worker compile-time scratch);
-  `replay_ingest` keeps effective deltas → worker buffering; delete the boot
-  flush; pre-live `drain_tick_blocking` sweep; erase-then-backfill for
-  invalid views; Delay opcode removed server-side. Crash-window injection
-  knob + e2e restart tests 1–5; restart benchmark; documentation updates.
+- [ ] 6. **Recovery reload + windowed pre-live tick drive.** Conditional
+  manifest load for Rederive tables (master stores + worker compile-time
+  scratch); `replay_ingest` keeps effective deltas → worker buffering; delete
+  the boot flush; **windowed** `drain_tick_blocking` sweep bounded by
+  `RECOVERY_DRAIN_BYTES` (peak `pending_deltas` ≤ one window, not the whole
+  tail); erase-then-backfill for invalid views; Delay opcode removed
+  server-side. Crash-window injection knob + e2e restart tests 1–5; a
+  large-churn-tail recovery test asserting bounded worker RSS; restart
+  benchmark; documentation updates.
