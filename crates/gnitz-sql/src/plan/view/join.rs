@@ -908,6 +908,10 @@ fn emit_range_join(
     // reindex and integrate) before integrating, or traces replicate and matches
     // duplicate. The join terms probe the UNFILTERED reindex either way — for a
     // band join that reindex IS the worker's scattered eq-prefix slice.
+    //
+    // The compiler makes each `PartitionFilter` a keep-all identity when the view's
+    // sources are all replicated (it then runs correct-local over full broadcast
+    // traces), so this stays unconditional here.
     let (int_a, int_b) = if n_eq == 0 {
         (cb.partition_filter(reindex_a), cb.partition_filter(reindex_b))
     } else {
@@ -1117,6 +1121,8 @@ fn emit_range_join(
             // UNFILTERED broadcast `input_a_raw`, re-keyed to a.pk (already the clean
             // `[a.pk…, A]` shape) and routed ONCE by a local `partition_filter` (no
             // exchange) — else broadcast yields W× copies the pair-PK shard would sum.
+            // (The compiler makes the filter a keep-all identity for an all-replicated
+            // view, which runs correct-local over the full broadcast on every worker.)
             let nf_keyed = if left_key_nullable {
                 let anull = cb.filter(
                     input_a_raw,

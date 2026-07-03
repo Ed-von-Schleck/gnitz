@@ -140,6 +140,10 @@ pub(super) struct EmitState {
     // probing unsupported queries can't permanently leak inodes; on success the
     // VM's owned tables keep them alive.
     scratch_dirs: Vec<String>,
+    // True iff every `ScanDelta` source of this view is a replicated base table.
+    // Consumed by the `PartitionFilter` emit arm to bake the trim as a keep-all
+    // identity (an all-replicated view runs correct-local on every worker).
+    all_sources_replicated: bool,
 }
 
 #[allow(clippy::too_many_arguments, clippy::vec_box, clippy::ptr_arg)]
@@ -555,10 +559,19 @@ pub(super) fn emit_node(
             // Pass-through schema; drops the rows this worker does not own before
             // they reach `integrate_trace`. Worker identity is the compile-time
             // `(worker_rank, num_workers)` of this process (default `(0, 1)` =
-            // keep-all for single-process / unit tests).
+            // keep-all for single-process / unit tests). An all-replicated view runs
+            // correct-local over the full broadcast on every worker, so it bakes
+            // `(0, 1)` too — `op_partition_filter` degenerates to a keep-all identity
+            // at `num_workers <= 1`, integrating the full input instead of trimming
+            // away the rows this worker does not own.
             let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
             reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[in_reg as usize].schema);
-            builder.add_partition_filter(in_reg as u16, reg_id as u16, worker_rank(), num_workers());
+            let (wid, nw) = if state.all_sources_replicated {
+                (0, 1)
+            } else {
+                (worker_rank(), num_workers())
+            };
+            builder.add_partition_filter(in_reg as u16, reg_id as u16, wid, nw);
         }
 
         gnitz_wire::OpNode::ExchangeGather => {
@@ -1009,12 +1022,36 @@ pub(super) fn build_plan(
     let mut ext_trace_regs: Vec<(u16, i64)> = Vec::new();
     let mut source_reg_map: HashMap<i64, i32> = HashMap::new();
 
+    // Are all of this view's `ScanDelta` sources replicated base tables? The
+    // `ScanDelta` set is exactly `circuit.dependencies()` (`ScanTrace` excluded),
+    // the same source set `DagEngine::view_all_sources_replicated` reads from the
+    // dep map — so this compile-time flag equals the runtime decision that
+    // short-circuits the view to the local epoch path, and cannot drift from it.
+    // `loaded` is the whole circuit in every phase, so the flag is phase-independent.
+    let mut has_source = false;
+    let all_sources_replicated = loaded
+        .nodes
+        .values()
+        .filter_map(|op| match op {
+            gnitz_wire::OpNode::ScanDelta(tid) => Some(*tid as i64),
+            _ => None,
+        })
+        .all(|tid| {
+            has_source = true;
+            ext_tables
+                .iter()
+                .find(|t| t.table_id == tid)
+                .is_some_and(|t| t.schema.replicated())
+        })
+        && has_source;
+
     let mut builder = ProgramBuilder::new();
     let mut state = EmitState {
         sink_reg_id: -1,
         input_delta_reg_id: first_exchange_input_reg_id,
         emit_failed: false,
         scratch_dirs: Vec::new(),
+        all_sources_replicated,
     };
 
     for &nid in ordered {

@@ -555,3 +555,272 @@ def test_replicated_full_copy_survives_reboot_on_every_worker(client):
         if proc is not None:
             _stop(proc)
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Exchange-shaped views over all-replicated sources run correct-local
+#
+# A view whose sources are all replicated is read from worker 0 only, but the
+# set-op / SELECT DISTINCT / range-band-join circuits scatter their output across
+# every worker. At GNITZ_WORKERS >= 2 that silently drops the rows whose hash
+# missed worker 0's partition and inflates the survivors' weights (broadcast in ×
+# scatter out). Every case below asserts per-row WEIGHTS, not just presence — the
+# bug inflates weights, so a presence-only check would pass on the ALL variants.
+# Masked at W=1 (no scatter); the suite always runs W=4.
+# ---------------------------------------------------------------------------
+
+
+def _wmap(rows, *cols):
+    """{col-value(s) -> net weight} over positive-net rows, summing any duplicate
+    identity (a duplicate summing above its expected weight is exactly the ×W
+    inflation these tests pin down). Single col -> scalar key; else a tuple."""
+    out = {}
+    for r in rows:
+        key = r[cols[0]] if len(cols) == 1 else tuple(r[c] for c in cols)
+        out[key] = out.get(key, 0) + r.weight
+    return {k: w for k, w in out.items() if w != 0}
+
+
+def _mk_repl_ab(client, sn, a_extra="val BIGINT NOT NULL", b_extra="val BIGINT NOT NULL"):
+    """Two replicated single-PK tables `a`/`b` for the set-op and join cases."""
+    client.execute_sql(
+        f"CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, {a_extra}) "
+        "WITH (replicated = true)", schema_name=sn)
+    client.execute_sql(
+        f"CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, {b_extra}) "
+        "WITH (replicated = true)", schema_name=sn)
+
+
+def test_replicated_union_all_and_distinct(client):
+    """UNION ALL / UNION over two replicated tables. The overlap rows (3,30),(4,40)
+    carry weight 2 under UNION ALL (Σw=8) and 1 under UNION DISTINCT — both would be
+    wrong under the scatter bug (dropped rows and/or ×W weights)."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        _mk_repl_ab(client, sn)
+        client.execute_sql(
+            "CREATE VIEW v_all AS SELECT * FROM a UNION ALL SELECT * FROM b", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW v_dist AS SELECT * FROM a UNION SELECT * FROM b", schema_name=sn)
+        v_all = client.resolve_table(sn, "v_all")[0]
+        v_dist = client.resolve_table(sn, "v_dist")[0]
+
+        client.execute_sql("INSERT INTO a VALUES (1,10),(2,20),(3,30),(4,40)", schema_name=sn)
+        client.execute_sql("INSERT INTO b VALUES (3,30),(4,40),(5,50),(6,60)", schema_name=sn)
+
+        all_rows = list(client.scan(v_all))
+        assert _wmap(all_rows, "pk", "val") == {
+            (1, 10): 1, (2, 20): 1, (3, 30): 2, (4, 40): 2, (5, 50): 1, (6, 60): 1,
+        }
+        assert sum(r.weight for r in all_rows if r.weight > 0) == 8
+        assert _wmap(client.scan(v_dist), "pk", "val") == {
+            (1, 10): 1, (2, 20): 1, (3, 30): 1, (4, 40): 1, (5, 50): 1, (6, 60): 1,
+        }
+    finally:
+        client.drop_schema(sn)
+
+
+def test_replicated_intersect_except(client):
+    """INTERSECT / EXCEPT (DISTINCT and ALL) over two replicated tables. Each row is
+    unique per source (unique_pk), so ALL and DISTINCT coincide at weight 1 — but they
+    compile to different clamp circuits, so both are exercised."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        _mk_repl_ab(client, sn)
+        client.execute_sql(
+            "CREATE VIEW v_int AS SELECT * FROM a INTERSECT SELECT * FROM b", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW v_exc AS SELECT * FROM a EXCEPT SELECT * FROM b", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW v_int_all AS SELECT * FROM a INTERSECT ALL SELECT * FROM b", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW v_exc_all AS SELECT * FROM a EXCEPT ALL SELECT * FROM b", schema_name=sn)
+        vid = {n: client.resolve_table(sn, n)[0]
+               for n in ("v_int", "v_exc", "v_int_all", "v_exc_all")}
+
+        client.execute_sql("INSERT INTO a VALUES (1,10),(2,20),(3,30),(4,40)", schema_name=sn)
+        client.execute_sql("INSERT INTO b VALUES (3,30),(4,40),(5,50),(6,60)", schema_name=sn)
+
+        assert _wmap(client.scan(vid["v_int"]), "pk", "val") == {(3, 30): 1, (4, 40): 1}
+        assert _wmap(client.scan(vid["v_int_all"]), "pk", "val") == {(3, 30): 1, (4, 40): 1}
+        assert _wmap(client.scan(vid["v_exc"]), "pk", "val") == {(1, 10): 1, (2, 20): 1}
+        assert _wmap(client.scan(vid["v_exc_all"]), "pk", "val") == {(1, 10): 1, (2, 20): 1}
+    finally:
+        client.drop_schema(sn)
+
+
+def test_replicated_select_distinct(client):
+    """SELECT DISTINCT over one replicated source. The content-hash PK scatters the
+    output; under the bug worker 0 keeps only its hash slice, losing distinct values."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql("CREATE VIEW v AS SELECT DISTINCT val FROM t", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+
+        client.execute_sql("INSERT INTO t VALUES (1,5),(2,5),(3,7),(4,7),(5,9)", schema_name=sn)
+
+        assert _wmap(client.scan(vid), "val") == {5: 1, 7: 1, 9: 1}
+    finally:
+        client.drop_schema(sn)
+
+
+def test_replicated_self_union_all(client):
+    """`a UNION ALL a` over one replicated table: every identical row keeps weight 2
+    (branch-id disambiguated), NOT 2×W. Pins that the local path is not itself
+    inflating the broadcast delta."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE s (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM s UNION ALL SELECT * FROM s", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+
+        client.execute_sql("INSERT INTO s VALUES (1,10),(2,20),(3,30)", schema_name=sn)
+
+        assert _wmap(client.scan(vid), "pk", "val") == {(1, 10): 2, (2, 20): 2, (3, 30): 2}
+    finally:
+        client.drop_schema(sn)
+
+
+def test_replicated_band_join_inner_and_left(client):
+    """Band join (`a.k = b.k AND a.lo <= b.t`, n_eq=1) over two replicated tables,
+    INNER and LEFT. Band output rides the mandatory output exchange; the bug drops
+    pairs and inflates weights. Every expected pair once (weight 1)."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        _mk_repl_ab(
+            client, sn,
+            a_extra="k BIGINT NOT NULL, lo BIGINT NOT NULL",
+            b_extra="k BIGINT NOT NULL, t BIGINT NOT NULL")
+        client.execute_sql(
+            "CREATE VIEW vin AS SELECT a.pk AS aid, b.pk AS bid "
+            "FROM a JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW vleft AS SELECT a.pk AS aid, b.pk AS bid "
+            "FROM a LEFT JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
+        vin = client.resolve_table(sn, "vin")[0]
+        vleft = client.resolve_table(sn, "vleft")[0]
+
+        # a4 (k=3) matches no b -> LEFT null-fills it.
+        client.execute_sql(
+            "INSERT INTO a VALUES (1,1,10),(2,1,50),(3,2,5),(4,3,1)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO b VALUES (1,1,40),(2,1,60),(3,2,100)", schema_name=sn)
+
+        # a1(lo10): b1(t40),b2(t60); a2(lo50): b2(t60); a3(k2,lo5): b3(t100).
+        assert _wmap(client.scan(vin), "aid", "bid") == {
+            (1, 1): 1, (1, 2): 1, (2, 2): 1, (3, 3): 1,
+        }
+        assert _wmap(client.scan(vleft), "aid", "bid") == {
+            (1, 1): 1, (1, 2): 1, (2, 2): 1, (3, 3): 1, (4, None): 1,
+        }
+    finally:
+        client.drop_schema(sn)
+
+
+def test_replicated_pure_range_join_inner_and_left(client):
+    """Pure-range join (`a.x < b.y`, n_eq=0) over two replicated tables. The broadcast
+    input is normally trimmed by a PartitionFilter to the owning worker's slice; under
+    an all-replicated local run that filter must be gone (Part B) or it discards rows.
+    Includes a LEFT with a NULL range key, exercising the second (NULL-branch) filter."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW vin AS SELECT a.pk AS aid, b.pk AS bid "
+            "FROM a JOIN b ON a.x < b.y", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW vleft AS SELECT a.pk AS aid, b.pk AS bid "
+            "FROM a LEFT JOIN b ON a.x < b.y", schema_name=sn)
+        vin = client.resolve_table(sn, "vin")[0]
+        vleft = client.resolve_table(sn, "vleft")[0]
+
+        # a4 has a NULL range key -> never matches (3VL) -> LEFT null-fills via the
+        # separate NULL-branch. a3 (x=50) exceeds every b.y -> null-fills too.
+        client.execute_sql("INSERT INTO a VALUES (1,10),(2,30),(3,50),(4,NULL)", schema_name=sn)
+        client.execute_sql("INSERT INTO b VALUES (1,20),(2,40)", schema_name=sn)
+
+        # a1(10)<20,<40; a2(30)<40; a3(50) none; a4(NULL) none.
+        assert _wmap(client.scan(vin), "aid", "bid") == {(1, 1): 1, (1, 2): 1, (2, 2): 1}
+        assert _wmap(client.scan(vleft), "aid", "bid") == {
+            (1, 1): 1, (1, 2): 1, (2, 2): 1, (3, None): 1, (4, None): 1,
+        }
+    finally:
+        client.drop_schema(sn)
+
+
+def test_replicated_pure_range_exists(client):
+    """Pure-range EXISTS/NOT EXISTS (`b.y < a.x` -> `a.x > MIN(b.y)`) over two
+    replicated tables. Carries the same broadcast-trim PartitionFilters as the
+    pure-range LEFT join (Part B). A NULL outer range key exercises the NOT EXISTS
+    NULL-branch filter."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT, v BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW semi AS SELECT v FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y < a.x)",
+            schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW anti AS SELECT v FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.y < a.x)",
+            schema_name=sn)
+        semi = client.resolve_table(sn, "semi")[0]
+        anti = client.resolve_table(sn, "anti")[0]
+
+        # MIN(b.y)=15. a2(x=20)>15 -> exists; a1(x=10),a3(x=5) -> not; a4(x=NULL) -> not.
+        client.execute_sql(
+            "INSERT INTO a VALUES (1,10,100),(2,20,200),(3,5,300),(4,NULL,400)", schema_name=sn)
+        client.execute_sql("INSERT INTO b VALUES (1,15)", schema_name=sn)
+
+        assert _wmap(client.scan(semi), "v") == {200: 1}
+        assert _wmap(client.scan(anti), "v") == {100: 1, 300: 1, 400: 1}
+    finally:
+        client.drop_schema(sn)
+
+
+def test_replicated_equi_in_subquery(client):
+    """Equi `IN (SELECT ...)` over two replicated tables. Already local via the
+    join-shard co-partition skip; pins that the all-replicated short-circuit (Part A)
+    keeps it correct — the semi-join emits each outer row once at weight 1."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW vin AS SELECT v FROM a WHERE k IN (SELECT k FROM b)", schema_name=sn)
+        vin = client.resolve_table(sn, "vin")[0]
+
+        # b holds k in {1,3}. a rows with k in {1,3} pass; k=2 does not.
+        client.execute_sql(
+            "INSERT INTO a VALUES (1,1,100),(2,2,200),(3,3,300),(4,1,400)", schema_name=sn)
+        client.execute_sql("INSERT INTO b VALUES (1,1),(2,3)", schema_name=sn)
+
+        assert _wmap(client.scan(vin), "v") == {100: 1, 300: 1, 400: 1}
+    finally:
+        client.drop_schema(sn)

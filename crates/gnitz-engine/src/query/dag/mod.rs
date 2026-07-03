@@ -697,11 +697,16 @@ impl DagEngine {
     /// non-replicated here, so nested-over-replicated views are conservatively
     /// treated as partitioned — the MVP surface is base-table dimensions.
     ///
-    /// Sources come from the cached reverse dependency map (`get_source_ids`), which records
-    /// exactly `circuit.dependencies()` — the deduped `ScanDelta` source set — so
-    /// this answers the question off the dependency map with no circuit load.
+    /// Sources come from the reverse dependency map, which records exactly
+    /// `circuit.dependencies()` — the deduped `ScanDelta` source set — so this
+    /// answers the question off the dependency map with no circuit load and no
+    /// allocation: `get_dep_map` rebuilds if stale, then the entry is read by
+    /// reference (`self.dep` and `self.tables` are disjoint borrows).
     pub(crate) fn view_all_sources_replicated(&mut self, view_id: i64) -> bool {
-        let sources = self.get_source_ids(view_id);
+        self.get_dep_map();
+        let Some(sources) = self.dep.reverse.get(&view_id) else {
+            return false;
+        };
         !sources.is_empty()
             && sources
                 .iter()
@@ -1292,6 +1297,19 @@ impl DagEngine {
         exchange: &mut E,
     ) -> Option<Batch> {
         self.ensure_compiled(view_id);
+
+        // A view whose sources are all replicated holds the full copy of every source
+        // and receives the full (broadcast) delta on every worker, so it computes its
+        // entire result locally: the output is itself replicated and the worker-0 scan
+        // reads it whole. Run it exactly as single-worker mode does — no exchange IPC.
+        // (Equi-join and GROUP BY already reach a local path via the co-partition skip
+        // and reduce_multi_local; this intercepts the compiled-exchange shapes: binary
+        // set-ops, SELECT DISTINCT, range/band joins.) Every worker evaluates
+        // view_all_sources_replicated identically, so they skip the same exchange rounds
+        // and the collective barrier stays balanced.
+        if self.view_all_sources_replicated(view_id) {
+            return self.execute_epoch_for_dag(view_id, input, src_id);
+        }
 
         // Only `has_exchange` is eager — two arms test it. The two single-use
         // checks (`view_skips_exchange` and the join-shard-cols emptiness test)

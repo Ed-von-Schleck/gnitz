@@ -572,6 +572,8 @@ fn emit_range_exists(view_id: u64, ctx: ExistsCtx<'_>, range: RangeConjunct) -> 
         // worker by the broadcast relay — no inner join terms at all. The input
         // is broadcast, so each worker trims to its owned slice before
         // integrating (PartitionFilter), exactly like the pure-range LEFT join.
+        // (The compiler makes the trim a keep-all identity for an all-replicated
+        // view, which runs correct-local over the full broadcast on every worker.)
         let int_a = cb.partition_filter(reindex_a);
         let trace_a = cb.integrate_trace(int_a);
         let thr = build_pure_range_threshold(
