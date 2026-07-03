@@ -182,15 +182,42 @@ nullability at either binding site.
   into a fresh `Rel` sub-tree (linear or anchor-bearing). No node sharing — the splitter
   then cuts each anchor-bearing reference into its own hidden view. Distinct references
   therefore carry distinct source ids by construction.
-- Same *pre-existing* source id appearing twice anywhere in the tree (a base table or
-  committed view referenced twice — not two CTE references, which already differ): wrap
-  the second occurrence in `PassThroughView(Source)` — realized by the splitter as a
-  hidden linear view whose input is that pre-existing relation.
+- Same *pre-existing* source id appearing more than once anywhere in the tree (a base
+  table or committed view — not two CTE references, which already differ): wrap **every
+  occurrence after the first** in its own `PassThroughView(Source)`, each realized by the
+  splitter as a distinct hidden linear view (distinct vid ⇒ distinct source id) whose input
+  is that pre-existing relation. For `a JOIN a JOIN a`, both the 2nd and 3rd `a` are wrapped
+  in separate hidden views — one shared wrapper would recreate a same-source join and trip
+  the guard.
 
 **Logical → physical column mapping (the emit-time contract).** Lowering resolves every
 column to a *logical* index (0-based within a node's `schema()`); the emitter maps logical
-→ physical once, at three points, all driven by two integers per node — the leading
-synthetic-PK arity `k` and, for a hidden-view input, its `Source.vis.start`:
+→ physical once, at three points. The map is **per-input piecewise**, not a single scalar:
+each of an anchor's inputs contributes its own leading synthetic-PK arity (its
+`Source.vis.start`, 0 for a base table), and the emitter shifts a column by the cumulative
+offset of the side it came from.
+
+> **Per-side join mapping (load-bearing — a single scalar base is unsound).** A binary
+> join's merged output is physically `[_pk × k_f, left.FULL…, right.FULL…]`, where each
+> side's FULL width *includes that side's own synthetic-PK region* (`build_reindex_program`
+> copies every input column, `_join_pk` included, into payload). With `left` carrying a
+> synthetic PK of arity `k_left` (= its `vis.start`) and `right` of arity `k_right`, a
+> **visible** column at logical index `L` maps as:
+> - `L < left_visible_n` (left col): physical `= k_f + k_left + L`
+> - `L ≥ left_visible_n` (right col): physical `= k_f + k_left + k_right + L`
+>
+> The split point is `left_visible_n`. For base-table inputs `k_left = k_right = 0`, so both
+> collapse to today's single `k_f` shift (behavior-neutral golden tests hold). For a
+> **left-hidden** input the shift is still uniform (`k_right = 0`). The break the single
+> scalar would cause is **right-hidden** (or both-hidden): a `SELECT j.x FROM t JOIN (…join…)
+> j` would emit `k_f + L` for `j.x` and read `j`'s `_join_pk` instead — wrong value + a
+> synthetic-PK leak. So `build_join_view_projection`, the residual/tail shift, and wildcard
+> expansion take this 2-piece shift keyed on `left_visible_n`, not one `base`. Non-join
+> anchors (reduce/distinct/set-op/linear) have one input, so their map is the single
+> `k` scalar as written below.
+
+The single-input scalars are still the leading synthetic-PK arity `k` and, for a
+hidden-view input, its `Source.vis.start`:
 
 - **Anchor output PK arity `k`.** Each anchor emitter produces
   `[_pk × k, payload…]`; `k` is fixed by the anchor kind: equi join / equi semi-anti =
@@ -233,16 +260,24 @@ synthetic-PK arity `k` and, for a hidden-view input, its `Source.vis.start`:
   *logical* output; the emitter shifts them by `k` to reach the physical `[_pk × k,
   payload…]` layout:
 
+  A column's shift is supplied by a `remap: &dyn Fn(usize) -> usize` closure so the
+  single-input anchors pass `|c| c + k` while the join passes the 2-piece per-side map
+  (above). `shift_bound_expr` must be **total** over `BoundExpr` — `AggCall.arg` can carry a
+  `ColRef`, so the catch-all cloning it would silently leave that index unshifted (it is
+  only latently safe today because ON/tail predicates reject aggregates; recurse anyway):
+
   ```rust
-  fn shift_bound_expr(e: &BoundExpr, base: usize) -> BoundExpr {
+  fn shift_bound_expr(e: &BoundExpr, remap: &dyn Fn(usize) -> usize) -> BoundExpr {
       match e {
-          BoundExpr::ColRef(c)    => BoundExpr::ColRef(c + base),
-          BoundExpr::IsNull(c)    => BoundExpr::IsNull(c + base),
-          BoundExpr::IsNotNull(c) => BoundExpr::IsNotNull(c + base),
+          BoundExpr::ColRef(c)    => BoundExpr::ColRef(remap(*c)),
+          BoundExpr::IsNull(c)    => BoundExpr::IsNull(remap(*c)),
+          BoundExpr::IsNotNull(c) => BoundExpr::IsNotNull(remap(*c)),
           BoundExpr::BinOp(l, op, r) =>
-              BoundExpr::BinOp(shift_bound_expr(l, base).into(), *op, shift_bound_expr(r, base).into()),
-          BoundExpr::UnaryOp(op, x) => BoundExpr::UnaryOp(*op, shift_bound_expr(x, base).into()),
-          lit => lit.clone(), // Lit*/AggCall carry no column index
+              BoundExpr::BinOp(shift_bound_expr(l, remap).into(), *op, shift_bound_expr(r, remap).into()),
+          BoundExpr::UnaryOp(op, x) => BoundExpr::UnaryOp(*op, shift_bound_expr(x, remap).into()),
+          BoundExpr::AggCall { func, arg } =>
+              BoundExpr::AggCall { func: *func, arg: arg.as_ref().map(|a| shift_bound_expr(a, remap).into()) },
+          lit => lit.clone(), // Lit* carry no column index
       }
   }
 
@@ -263,12 +298,14 @@ synthetic-PK arity `k` and, for a hidden-view input, its `Source.vis.start`:
   }
   ```
 
-  The `Join.residual` is the first `compile_linear_tail` call on the join's merged output
-  with `base = k`; a hidden-view input additionally offsets by that input's `vis.start`
-  (its synthetic-PK region is copied into the payload by `build_reindex_program` but is
-  never a logical column). Because the shift is a pure function of `k` (+ `vis.start`), a
-  segment whose input was cut into a hidden view compiles byte-identically to one over a
-  base table — the synthetic PK stays invisible end to end.
+  (`compile_linear_tail` takes the same `remap` closure; the code above elides it for
+  brevity.) The `Join.residual` is the first `compile_linear_tail` call on the join's merged
+  output, with the **per-side** `remap` (left cols `+ (k_f + k_left)`, right cols
+  `+ (k_f + k_left + k_right)`, split at `left_visible_n`); each side's synthetic-PK region
+  is copied into the payload by `build_reindex_program` but is never a logical column.
+  Because the shift is a pure function of `(k_f, k_left, k_right, left_visible_n)`, a segment
+  whose input was cut into a hidden view compiles byte-identically to one over a base table
+  (where `k_left = k_right = 0`) — the synthetic PK stays invisible end to end.
 
 ### 3. The splitter (Rel → Vec<Segment>)
 

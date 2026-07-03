@@ -9,11 +9,15 @@ distinct semantics, distinct k-regimes, and distinct comparator strategies.**
 The one plausible cross-family migration (the exchange relay walk onto the
 storage consolidation kernel) is rejected below with numbers.
 
-What survives as implementation work: the ownership rules that make this
-verdict true are recorded in code comments that cite a section ("§8 cluster N")
-of a document that no longer exists. Six comment sites carry dangling
-references; this plan repairs them so each family's ownership contract is
-self-contained at its definition site.
+What survives as implementation work, in two parts. **(a) Ownership-doc
+repair.** The ownership rules that make this verdict true are recorded in code
+comments that cite a section ("§8 cluster N") of a document that no longer
+exists; six comment sites carry dangling references, repaired below so each
+family's ownership contract is self-contained at its definition site. **(b)
+Audited primitive fixes.** Auditing this plan surfaced three
+behaviour-preserving speedups to the shared merge-walk key primitives
+(`pack_pk_be`, `from_opk`) plus one drop-order correctness fix in the preflight
+merge; all are folded in below, each gated by an existing test.
 
 ## The verified merge-walk inventory
 
@@ -225,7 +229,162 @@ re-propose the migration this plan rejects:
 /// equivalent in a consolidating kernel.
 ```
 
+## Implementation: audited primitive fixes
+
+Three fixes to the shared merge-walk key primitives, validated against source
+and the existing equivalence tests. All preserve observable behaviour (the
+drop-order fix is a compile-time reorder over a `Drop`-free `MemBatch`); each is
+pinned by a test already in the `make verify` run.
+
+### Fix 1 — `pack_pk_be`: register-load the wide and common-narrow widths
+
+`crates/gnitz-engine/src/schema/key.rs`. The wildcard arm packs every width
+other than 8/16 through a 16-byte stack buffer and a runtime-length
+`copy_from_slice` — including all `> 16` keys (whose leading 16 bytes are a plain
+register load) and the common `u16`/`u32` single-column PKs. `pack_pk_be` is the
+packer behind `pk_sort_key` (relay `order_cache`, `sort_consolidate_inner` sort
+keys) and `compare_pk_ordering` / `pk_bytes_eq` (every N-way merge comparison),
+so the stack copy sits on the hot comparator path. Fold the `16` arm and the
+`> 16` case into one `len >= 16` register load (which also drops the wildcard's
+now-dead `len.min(16)`), and add `2`/`4` arms for the narrow scalars:
+
+```rust
+#[inline(always)]
+pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
+    match pk_bytes.len() {
+        8 => (u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128) << 64,
+        len if len >= 16 => u128::from_be_bytes(pk_bytes[..16].try_into().unwrap()),
+        4 => (u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128) << 96,
+        2 => (u16::from_be_bytes(pk_bytes[..2].try_into().unwrap()) as u128) << 112,
+        // 1/3/5/6/7/9..=15: odd narrow widths — pad-and-copy (len < 16 here, so
+        // the whole slice is copied and the old `len.min(16)` is unnecessary).
+        len => {
+            let mut buf = [0u8; 16];
+            buf[..len].copy_from_slice(pk_bytes);
+            u128::from_be_bytes(buf)
+        }
+    }
+}
+```
+
+Update the doc comment's "`{8, 16}` arms" wording to "`{2, 4, 8, ≥16}` arms".
+`pack_pk_be_specialization_matches_naive` (widths 1/2/4/8/16/24/80) already pins
+every arm value-identical to the pad-and-copy. `u128::from_opk` is `pack_pk_be`,
+so it inherits the `≥16` register load for free.
+
+### Fix 2 — `PkSortKey::from_opk`: register-load the dominant seek widths
+
+`crates/gnitz-engine/src/schema/key.rs`. `from_opk` is the comparator body of the
+OPK seek fast path: `lower_bound_opk` / `gallop_opk`
+(`storage/repr/columnar.rs`) call it once per binary-search / gallop step. The
+`u64` and `[u128; 2]` impls pad-copy through a stack buffer even at the exact
+dominant stride (8 / 32 bytes). Add the exact-width register load:
+
+```rust
+impl PkSortKey for u64 {
+    #[inline(always)]
+    fn from_opk(opk: &[u8]) -> u64 {
+        // Dispatched only for strides ≤ 8; the `== 8` arm loads the dominant
+        // U64/I64 key straight into a register (no memcpy). The narrower strides
+        // left-align at the MSB end so a raw `u64` compare is the OPK byte order.
+        if opk.len() == 8 {
+            u64::from_be_bytes(opk.try_into().unwrap())
+        } else {
+            let mut x = [0u8; 8];
+            x[..opk.len()].copy_from_slice(opk);
+            u64::from_be_bytes(x)
+        }
+    }
+}
+
+impl PkSortKey for [u128; 2] {
+    #[inline(always)]
+    fn from_opk(opk: &[u8]) -> [u128; 2] {
+        // Dispatched only for 17..=32-byte strides: hi = the full leading 16 bytes
+        // (always a register load), lo = the trailing 1..=16 left-aligned. Array
+        // `Ord` is lexicographic, so the low limb settles a leading-16-byte tie a
+        // bare `u128` prefix would tie on.
+        let hi = u128::from_be_bytes(opk[..16].try_into().unwrap());
+        if opk.len() == 32 {
+            [hi, u128::from_be_bytes(opk[16..32].try_into().unwrap())]
+        } else {
+            let mut lo = [0u8; 16];
+            lo[..opk.len() - 16].copy_from_slice(&opk[16..]);
+            [hi, u128::from_be_bytes(lo)]
+        }
+    }
+}
+```
+
+`lower_bound_opk_matches_byte_search` (strides 4/8/12/16/24/32/40) drives
+`from_opk` through both arms against the byte oracle and pins them. The `u128`
+impl needs no change — it delegates to `pack_pk_be`.
+
+### Fix 3 — `PreflightKeyStream`: drop the view before its backing slot
+
+`crates/gnitz-engine/src/runtime/orchestration/master/preflight.rs`. `mb` is a
+lifetime-erased zero-copy view into `slot`'s W2M ring bytes; the struct doc and
+`attach_frame` both state "the view must die before its backing slot". Rust
+drops fields in declaration order, but `slot` is declared before `mb`, so the
+struct's own drop glue releases the ring slot *before* the view — the reverse of
+the invariant. `MemBatch` has no `Drop` today, so this is latent rather than a
+live use-after-free, but the ordering must be correct by construction. Declare
+`mb` before `slot`:
+
+```rust
+struct PreflightKeyStream {
+    /// Worker index (error attribution) and scan request id (frame pulls).
+    w: usize,
+    req_id: u64,
+    /// Zero-copy view of the current frame's key batch (`None` for an empty
+    /// terminal frame or after a decode error). Declared before `slot` so it
+    /// drops first — it borrows `slot`'s ring bytes with its lifetime erased.
+    mb: Option<crate::storage::MemBatch<'static>>,
+    /// Ring slot backing `mb`. Holding it parks the frame's ring bytes.
+    slot: Option<W2mSlot>,
+    /// Cursor into `mb`.
+    row: usize,
+    /// Current frame is non-terminal: status 0 and no FLAG_SCAN_LAST.
+    has_more: bool,
+}
+```
+
+`new` uses named-field init, so only the declaration order changes.
+
+### Evaluated and rejected
+
+- **`pk_bytes_eq(a, b)` → `a == b`.** The ≤16-byte PK is the dominant case, and
+  on the runtime-width slices `get_pk_bytes` yields, `a == b` lowers to an
+  out-of-line `bcmp` call whereas `compare_pk_ordering` inlines to a register
+  `pack_pk_be` compare — `run_merge_body`'s `same_pk` (`storage/repr/merge.rs`)
+  states exactly this and deliberately does not use raw `==`. The redundant
+  byte-swap the audit flags is already elided by LLVM in the equality-only path;
+  the wide-key double work it correctly notes is removed by Fix 1 above without
+  regressing the ten hot per-row `pk_bytes_eq` sites (cogroup, reduce, band-join,
+  read-cursor, point-lookup bracketing).
+- **`relay_walk_inner` tiebreak: skip `compare_pk_ordering` on a ≤16 cache
+  tie.** The tie arm runs only on a cross-source duplicate PK (rare), the
+  "redundant" work is two register `pack_pk_be`s (cheaper still after Fix 1), and
+  the replacement adds a per-tie `len` branch and ~7 lines — net worse to read
+  for a saving on a cold path.
+- **Thread-local `SortEntry` scratch in `sort_consolidate_inner`.** Unmeasured;
+  adds a thread-local plus a `borrow_mut`/clear/reserve dance (net more code) and
+  duplicates what the batch pool already exists to do. No benchmark shows this
+  flush-path allocation is material.
+- **`SmallVec` for `LoserTree`.** The dominant repositioning pattern rebuilds
+  nothing — `advance_to`'s forward fast path (`seek_forward_multi`) maintains the
+  tree in place at zero allocation — so the two build `Vec`s are paid only on the
+  non-dominant rewinds / backward / absolute seeks and once per compaction.
+  `tree` is read per node on the hot `walk_up` / `drive` loop, where a `SmallVec`
+  inline-vs-spilled discriminant on every access risks costing more than the rare
+  small allocation it removes. Not worth a new dependency.
+
 ## Verification
 
-Comment-only edits: `make verify` (fmt + clippy-as-errors + full unit tests)
-must pass. No behavior change; no e2e run required beyond the pre-commit gate.
+`make verify` (fmt + clippy-as-errors + full unit tests) must pass. The
+ownership-doc edits are comment-only. The primitive fixes are
+behaviour-preserving and each is pinned by an existing test in the same run:
+`pack_pk_be_specialization_matches_naive` and the `opk_proptest` module
+(`schema/key.rs`) for Fix 1, `lower_bound_opk_matches_byte_search`
+(`storage/repr/columnar.rs`) for Fix 2, and Fix 3 is a compile-time reorder over
+a `Drop`-free `MemBatch`. No e2e run required beyond the pre-commit gate.
