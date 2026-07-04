@@ -213,3 +213,117 @@ fn test_cte_qualified_identity_passthrough_accepted() {
         "qualified CTE pass-through must preserve column order"
     );
 }
+
+// ── Case-insensitive CTE references ──────────────────────────────────
+
+#[test]
+fn cte_reference_case_insensitive() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    p.execute("CREATE TABLE t (id BIGINT PRIMARY KEY)").unwrap();
+    // A base table `cc` exists too — the CTE `Cc` must shadow it (standard SQL),
+    // and the case-varying `cc` reference must bind to the CTE, not the base table.
+    p.execute("CREATE TABLE cc (other BIGINT PRIMARY KEY)").unwrap();
+    p.execute("CREATE VIEW v AS WITH Cc AS (SELECT id FROM t WHERE id > 0) SELECT id FROM cc")
+        .unwrap();
+    // The view's output column is `id` (from the CTE over `t`); had `cc` bound to
+    // the base table (column `other`), `SELECT id FROM cc` would have failed.
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert!(
+        s.columns.iter().any(|c| c.name.eq_ignore_ascii_case("id")),
+        "CTE `Cc` must shadow base table `cc`; got {:?}",
+        s.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+}
+
+// ── A derived table must not see its FROM siblings (non-LATERAL) ──────
+// A subquery in FROM is not correlated unless LATERAL (which is rejected), so its
+// body may reference CTEs and catalog relations but never another item in the same
+// FROM. Sibling aliases are registered only after the whole FROM is compiled.
+
+#[test]
+fn sibling_derived_table_out_of_scope() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
+    // No relation named `a` exists. `b`'s body `FROM a` names a sibling derived
+    // table — out of scope for a non-LATERAL derived table — so it falls through to
+    // the catalog and errors, rather than binding the sibling.
+    let res = try_exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT b.id FROM (SELECT id FROM t) a \
+         JOIN (SELECT id FROM a) b ON a.id = b.id",
+    );
+    assert!(res.is_err(), "sibling `a` must be out of scope");
+    assert!(
+        client.resolve_table_or_view_id(&sn, "v").is_err(),
+        "the rejected view must not be registered"
+    );
+}
+
+#[test]
+fn sibling_alias_binds_catalog_relation() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    );
+    // `b`'s `FROM a` binds the catalog table `a` (has `v`), not the sibling derived
+    // `a` (only `id`). Compiling `SELECT b.v` proves the reference resolved through
+    // the catalog: the sibling has no `v`.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS SELECT b.v FROM (SELECT id FROM t) a \
+         JOIN (SELECT id, v FROM a) b ON a.id = b.id",
+    );
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert!(
+        s.columns.iter().any(|c| c.name.eq_ignore_ascii_case("v")),
+        "b.v must resolve through catalog `a`; got {:?}",
+        s.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn sibling_reference_binds_cte_not_sibling() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT NOT NULL)",
+    );
+    // CTE `a` (has `v`) is in scope for both derived tables. `b`'s `FROM a` must bind
+    // the CTE — not the sibling derived `a`, which has only `id` — so `SELECT id, v`
+    // resolves. The sibling `a` shadows the CTE only in the final body's join.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v AS WITH a AS (SELECT id, v FROM t WHERE v > 0) \
+         SELECT b.v FROM (SELECT id FROM t) a JOIN (SELECT id, v FROM a) b ON a.id = b.id",
+    );
+    let (_, s) = client.resolve_table_or_view_id(&sn, "v").unwrap();
+    assert!(
+        s.columns.iter().any(|c| c.name.eq_ignore_ascii_case("v")),
+        "b.v must resolve through CTE `a`; got {:?}",
+        s.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+}

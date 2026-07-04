@@ -5,8 +5,8 @@ use crate::ast_util::extract_name;
 use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{
-    default_index_name, reject_duplicate_column_names, reject_non_key_eligible, reject_unhonored_column_options,
-    reject_unhonored_table_constraints, validate_user_index_name, validate_user_name,
+    default_index_name, disambiguate_index_name, reject_duplicate_column_names, reject_non_key_eligible,
+    reject_unhonored_column_options, reject_unhonored_table_constraints, validate_user_index_name, validate_user_name,
 };
 use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
 use crate::SqlResult;
@@ -528,18 +528,44 @@ pub(crate) fn execute_create_table(
     // table and its unique indices commit — or roll back — as one atomic DDL
     // zone. No more create_table-then-create_index window that could leave a
     // committed table missing its constraint. Resolve each index's catalog name
-    // here (SQL-level naming); `create_table` allocates the index ids, derives
-    // column types from `cols` (so a UNIQUE+FK column's rewritten type is used),
-    // and assembles the IDX_TAB family. Types were pre-validated above.
-    let index_names: Vec<String> = unique_cols
-        .iter()
-        .map(|(col_indices, constraint_name)| {
-            constraint_name.clone().unwrap_or_else(|| {
+    // here (SQL-level naming), disambiguating auto-names that collide (distinct
+    // column sets can render the same `…__idx_a_b_c` base when a column name
+    // contains `_`); `create_table` allocates the index ids, derives column types
+    // from `cols` (so a UNIQUE+FK column's rewritten type is used), and assembles
+    // the IDX_TAB family. Types were pre-validated above. The table is new, so no
+    // *pre-existing* index can collide (index names embed the table name); only
+    // auto-names within this bundle can collide with each other or with an
+    // explicit constraint name.
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Explicit constraint names first — fixed points that auto-names route around.
+    for (_, constraint_name) in &unique_cols {
+        if let Some(n) = constraint_name {
+            taken.insert(n.to_ascii_lowercase());
+        }
+    }
+    // Column sets auto-named so far: an identical set is a true duplicate
+    // (reject); a distinct set rendering the same base disambiguates.
+    let mut auto: Vec<&[u32]> = Vec::new();
+    let mut index_names: Vec<String> = Vec::with_capacity(unique_cols.len());
+    for (col_indices, constraint_name) in &unique_cols {
+        let name = match constraint_name {
+            Some(n) => n.clone(),
+            None => {
                 let col_names: Vec<&str> = col_indices.iter().map(|&c| cols[c as usize].name.as_str()).collect();
-                default_index_name(schema_name, &table_name, &col_names)
-            })
-        })
-        .collect();
+                let base = default_index_name(schema_name, &table_name, &col_names);
+                if auto.contains(&col_indices.as_slice()) {
+                    return Err(GnitzSqlError::Plan(format!(
+                        "duplicate UNIQUE constraint on the same columns ('{base}')"
+                    )));
+                }
+                auto.push(col_indices.as_slice());
+                let name = disambiguate_index_name(base, &taken);
+                taken.insert(name.clone());
+                name
+            }
+        };
+        index_names.push(name);
+    }
     let unique_indexes: Vec<InlineUniqueIndex> = unique_cols
         .iter()
         .zip(&index_names)
@@ -667,10 +693,29 @@ pub(crate) fn execute_create_index(
     gnitz_core::index_key_types(&raw_types, schema.pk_count(), schema.pk_stride())
         .map_err(GnitzSqlError::Unsupported)?; // also rejects String/Blob/float
 
-    let index_name = explicit_name.unwrap_or_else(|| {
-        let names: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-        default_index_name(schema_name, &table_name, &names)
-    });
+    let index_name = match explicit_name {
+        Some(name) => name, // explicit: an exact-name collision still errors in `create_index`
+        None => {
+            let names: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+            let base = default_index_name(schema_name, &table_name, &names);
+            let existing = client.index_name_cols().map_err(GnitzSqlError::Exec)?;
+            // A prior *auto-named* index on this exact column set is the same index:
+            // reject it, preserving the pre-disambiguation duplicate rejection (name
+            // collision was the only guard before). An FK-backing or explicitly-named
+            // index on these columns carries a different name, so it never blocks a
+            // distinct auto-name.
+            if existing
+                .iter()
+                .any(|(name, cols)| name == &base && cols.as_slice() == col_indices.as_slice())
+            {
+                return Err(GnitzSqlError::Plan(format!(
+                    "an index on these columns already exists as '{base}'"
+                )));
+            }
+            let taken: std::collections::HashSet<String> = existing.into_iter().map(|(n, _)| n).collect();
+            disambiguate_index_name(base, &taken)
+        }
+    };
 
     let index_id = client
         .create_index(table_id, &col_indices, &col_types, &index_name, is_unique)

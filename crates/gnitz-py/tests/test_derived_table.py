@@ -148,3 +148,29 @@ class TestDerivedTable:
             assert "distinct" in str(ei.value).lower() or "not yet" in str(ei.value).lower(), str(ei.value)
         finally:
             _cleanup(client, sn)
+
+    def test_sibling_derived_not_correlated(self, client):
+        """A sibling derived table is out of scope: a same-named reference in a
+        later sibling binds the catalog relation, not the sibling (a non-LATERAL
+        derived table is not correlated)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, dummy BIGINT NOT NULL)", schema_name=sn
+            )
+            client.execute_sql("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn)
+            # `b`'s `FROM a` binds the catalog table `a` (id, v), not the sibling
+            # derived `a` (only id). If it bound the sibling, `b.v` would not resolve.
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT b.v AS bv "
+                "FROM (SELECT id FROM t) a JOIN (SELECT id, v FROM a) b ON a.id = b.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO a VALUES (1, 100), (2, 200)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 0), (2, 0)", schema_name=sn)
+            # Sibling derived a = {1, 2} (from t); catalog a = {(1, 100), (2, 200)}.
+            # Join a.id = b.id projects b.v for ids 1 and 2.
+            assert _rows(client, sn, "v", ["bv"]) == [(100,), (200,)]
+        finally:
+            _cleanup(client, sn)

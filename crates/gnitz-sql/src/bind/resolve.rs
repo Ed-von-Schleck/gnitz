@@ -26,7 +26,7 @@ pub(crate) fn build_alias_map(relations: &[(&str, u64, &Rc<Schema>)]) -> AliasMa
     let mut col_offset = 0;
     for &(alias, table_id, schema) in relations {
         map.insert(
-            alias.to_lowercase(),
+            alias.to_ascii_lowercase(),
             ResolvedRelation {
                 table_id,
                 schema: Rc::clone(schema),
@@ -74,7 +74,7 @@ pub(crate) fn resolve_qualified_column(
     tables: &AliasMap,
 ) -> Result<usize, GnitzSqlError> {
     let rel = tables
-        .get(&table_alias.to_lowercase())
+        .get(&table_alias.to_ascii_lowercase())
         .ok_or_else(|| GnitzSqlError::Bind(format!("table alias '{table_alias}' not found")))?;
     let idx = find_unique_column(&rel.schema.columns, col_name)?
         .ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in table '{table_alias}'")))?;
@@ -114,12 +114,15 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Cache a `name → relation` entry. The cache is a single-table context, so
-    /// `col_offset` is always 0; a join's real per-relation offset lives only in
-    /// the planner's `AliasMap`, never here.
-    fn cache_relation(&mut self, name: String, table_id: u64, schema: Rc<Schema>) {
+    /// Cache a `name → relation` entry, keyed by the canonical ASCII-lowercase
+    /// form — the single fold site, so a case-varying reference (`WITH Cc … FROM
+    /// cc`) hits regardless of which caller inserted (matching the join
+    /// `AliasMap` convention; SQL identifiers are case-insensitive). The cache is
+    /// a single-table context, so `col_offset` is always 0; a join's real
+    /// per-relation offset lives only in the planner's `AliasMap`, never here.
+    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Rc<Schema>) {
         self.cache.insert(
-            name,
+            name.to_ascii_lowercase(),
             ResolvedRelation {
                 table_id,
                 schema,
@@ -129,14 +132,16 @@ impl<'a> Binder<'a> {
     }
 
     pub(crate) fn resolve(&mut self, client: &mut GnitzClient, name: &str) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
-        if let Some(entry) = self.cache.get(name) {
+        // Probe with the canonical key — the cache holds base-table resolutions
+        // *and* CTE/derived-table aliases (which never reach the catalog).
+        if let Some(entry) = self.cache.get(&name.to_ascii_lowercase()) {
             return Ok((entry.table_id, Rc::clone(&entry.schema)));
         }
         let (tid, schema) = client
             .resolve_table_or_view_id(self.schema_name, name)
             .map_err(GnitzSqlError::Exec)?;
         let rc = Rc::new(schema);
-        self.cache_relation(name.to_string(), tid, Rc::clone(&rc));
+        self.cache_relation(name, tid, Rc::clone(&rc));
         Ok((tid, rc))
     }
 
@@ -155,7 +160,7 @@ impl<'a> Binder<'a> {
         match client.resolve_table_id(self.schema_name, name) {
             Ok((tid, schema)) => {
                 let rc = Rc::new(schema);
-                self.cache_relation(name.to_string(), tid, Rc::clone(&rc));
+                self.cache_relation(name, tid, Rc::clone(&rc));
                 Ok((tid, rc))
             }
             // Miss: re-probe including views to tell "is a view" (reject as
@@ -171,7 +176,7 @@ impl<'a> Binder<'a> {
     }
 
     /// Cache a CTE or alias name as resolving to the given (table_id, schema).
-    pub(crate) fn cache_alias(&mut self, name: String, resolved: (u64, Rc<Schema>)) {
+    pub(crate) fn cache_alias(&mut self, name: &str, resolved: (u64, Rc<Schema>)) {
         self.cache_relation(name, resolved.0, resolved.1);
     }
 }
@@ -211,7 +216,7 @@ mod tests {
     #[test]
     fn test_resolve_qualified_column_case_insensitive_alias() {
         // The AliasMap is keyed by lowercased aliases (join.rs builds it with
-        // `.to_lowercase()`); under the case-preserving GenericDialect a reference
+        // `.to_ascii_lowercase()`); under the case-preserving GenericDialect a reference
         // like `ON A.x = ...` arrives as raw "A". The probe must lowercase to hit,
         // and `col_offset` must still be added through.
         let mut map: AliasMap = HashMap::new();

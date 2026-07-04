@@ -271,7 +271,7 @@ impl LeafBinder for SingleTable<'_> {
     }
     fn bind_function(&self, func: &Function) -> Result<BoundExpr, GnitzSqlError> {
         reject_unsupported_agg_qualifiers(func)?;
-        let name = func.name.to_string().to_lowercase();
+        let name = func.name.to_string().to_ascii_lowercase();
         match name.as_str() {
             "count" => {
                 if let FunctionArguments::List(list) = &func.args {

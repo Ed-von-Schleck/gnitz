@@ -660,7 +660,7 @@ fn having_agg_func(
     source_schema: &Schema,
 ) -> Result<(AggFunc, Option<usize>), GnitzSqlError> {
     reject_unsupported_agg_qualifiers(func)?;
-    let name = func.name.to_string().to_lowercase();
+    let name = func.name.to_string().to_ascii_lowercase();
     let arg_col = extract_func_arg_col(func, source_schema)?;
     let agg_func = match name.as_str() {
         "count" => {

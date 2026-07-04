@@ -981,6 +981,26 @@ fn test_reserved_fk_infix_constraint_name_rejected() {
 }
 
 #[test]
+fn test_reserved_fk_infix_mixed_case_constraint_name_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    // A mixed-case `__FK_` infix must also be rejected: names are canonicalized to
+    // lowercase at store time, so `my__FK_thing` would otherwise persist as the
+    // reserved `my__fk_thing` and become an undroppable index.
+    let err = p
+        .execute("CREATE TABLE ur (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT my__FK_thing UNIQUE(a))")
+        .unwrap_err();
+    match err {
+        GnitzSqlError::Plan(s) => assert!(s.contains("reserved '__fk_' infix"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}
+
+#[test]
 fn test_invalid_identifier_constraint_name_rejected() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
@@ -1097,6 +1117,85 @@ fn test_create_index_invalid_identifier_rejected() {
     let err = p.execute("CREATE INDEX _bad ON ii(col)").unwrap_err();
     match err {
         GnitzSqlError::Plan(s) => assert!(s.contains("cannot start with '_'"), "got: {}", s),
+        e => panic!("expected Plan, got {:?}", e),
+    }
+}
+
+// ── Case-insensitive relation-name resolution ────────────────────────
+
+#[test]
+fn relation_names_are_case_insensitive() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    // `Foo` stores the canonical `foo`; references in any case resolve to it.
+    exec(&mut client, &sn, "CREATE TABLE Foo (id BIGINT PRIMARY KEY)");
+    exec(&mut client, &sn, "SELECT * FROM foo");
+    exec(&mut client, &sn, "INSERT INTO FOO (id) VALUES (1)");
+    // A second CREATE folding to the same canonical name is a duplicate.
+    let dup = try_exec(&mut client, &sn, "CREATE TABLE foo (id BIGINT PRIMARY KEY)");
+    assert!(
+        dup.is_err(),
+        "case-varying re-CREATE of an existing table must be rejected"
+    );
+}
+
+#[test]
+fn drop_matches_stored_name_any_case() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn, "CREATE TABLE Bar (id BIGINT PRIMARY KEY)");
+    // `DROP TABLE bAr` lowercases to the stored `bar`; the -1 cancels the +1 row.
+    exec(&mut client, &sn, "DROP TABLE bAr");
+    assert!(
+        client.resolve_table_id(&sn, "bar").is_err(),
+        "the dropped table must be gone (the -1 cancelled the stored row)"
+    );
+}
+
+// ── Collision-free auto-generated inline UNIQUE index names ───────────
+
+#[test]
+fn inline_unique_name_collision_disambiguated() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    // `(a, b_c)` and `(a_b, c)` both render the base `…__idx_a_b_c`; the second
+    // auto-name is disambiguated to `…__idx_a_b_c_2`. Both indexes exist under
+    // distinct names, so both are droppable.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b_c BIGINT, a_b BIGINT, c BIGINT, \
+         UNIQUE(a, b_c), UNIQUE(a_b, c))",
+    );
+    exec(&mut client, &sn, &format!("DROP INDEX {sn}__t__idx_a_b_c"));
+    exec(&mut client, &sn, &format!("DROP INDEX {sn}__t__idx_a_b_c_2"));
+}
+
+#[test]
+fn inline_duplicate_unique_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    // Two UNIQUE constraints on the identical column set are a true duplicate.
+    let err = try_exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (a BIGINT PRIMARY KEY, UNIQUE(a), UNIQUE(a))",
+    )
+    .unwrap_err();
+    match err {
+        GnitzSqlError::Plan(s) => assert!(s.contains("duplicate UNIQUE"), "got: {}", s),
         e => panic!("expected Plan, got {:?}", e),
     }
 }

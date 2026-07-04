@@ -375,15 +375,9 @@ fn inline_ctes(
             _ => return Err(GnitzSqlError::Unsupported(format!("{ctx}: only SELECT supported"))),
         };
         if is_compilable_hidden_body(cte_select) {
-            compile_hidden_body(
-                client,
-                binder,
-                cte_select,
-                &cte.alias.name.value,
-                &cte.alias.columns,
-                &ctx,
-                chain,
-            )?;
+            // A later CTE may reference an earlier one, so register immediately.
+            let resolved = compile_hidden_body(client, binder, cte_select, &cte.alias.columns, &ctx, chain)?;
+            binder.cache_alias(&cte.alias.name.value, resolved);
         } else {
             inline_passthrough_cte(client, cte, cte_select, binder, &ctx, chain)?;
         }
@@ -439,15 +433,9 @@ fn inline_passthrough_cte(
                 }
             }));
     if !proj_is_identity {
-        return compile_hidden_body(
-            client,
-            binder,
-            cte_select,
-            &cte.alias.name.value,
-            &cte.alias.columns,
-            ctx,
-            chain,
-        );
+        let resolved = compile_hidden_body(client, binder, cte_select, &cte.alias.columns, ctx, chain)?;
+        binder.cache_alias(&cte.alias.name.value, resolved);
+        return Ok(());
     }
     // Apply CTE column aliases (`WITH cte(a, b) AS ...`).
     let cte_schema = if !cte.alias.columns.is_empty() {
@@ -457,24 +445,26 @@ fn inline_passthrough_cte(
     } else {
         cte_schema
     };
-    binder.cache_alias(cte.alias.name.value.clone(), (cte_tid, cte_schema));
+    binder.cache_alias(&cte.alias.name.value, (cte_tid, cte_schema));
     Ok(())
 }
 
 /// Compile a hidden-segment body — a JOIN, a GROUP BY / aggregate (over a table
 /// or a join), or a linear filter/map — into a hidden view pushed onto `chain`,
-/// registered in the binder under `register_name` so the final view resolves it.
-/// The single routing site for chainable sub-plan bodies, shared by the CTE and
+/// returning its `(view id, schema)`. Does **not** register the alias in the
+/// binder: the caller owns that. The CTE callers register immediately (a later
+/// CTE may reference an earlier one), while the derived-table caller defers
+/// registration until the whole FROM is compiled (a sibling is out of scope). The
+/// single routing site for chainable sub-plan bodies, shared by the CTE and
 /// derived-table entries (which keep only their distinct envelope validation).
 fn compile_hidden_body(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
     select: &Select,
-    register_name: &str,
     column_aliases: &[sqlparser::ast::TableAliasColumnDef],
     ctx: &str,
     chain: &mut ViewChain,
-) -> Result<(), GnitzSqlError> {
+) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
     // A sub-plan body's FROM must be plain relations: the front door pre-compiles
     // derived tables only in the view's top-level FROM, so a nested one would
     // mis-resolve by alias here.
@@ -493,7 +483,7 @@ fn compile_hidden_body(
     // everything else is a filter/map.
     let grouped = group_by_is_present(&select.group_by) || projection_has_aggregate(select);
     let is_plain_join = !from.joins.is_empty() && !grouped;
-    let (hidden_vid, schema) = chain.add_segment(client, |client, chain, vid| {
+    chain.add_segment(client, |client, chain, vid| {
         let (circuit, mut cols, pk) = if grouped {
             let (src, op_select) = resolve_operator_input(client, binder, select, chain, ctx)?;
             group_by::emit_group_by_pieces(client, vid, &op_select, src)?
@@ -506,9 +496,7 @@ fn compile_hidden_body(
         // Positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`).
         apply_hidden_column_aliases(column_aliases, &mut cols, is_plain_join, ctx)?;
         Ok((circuit, cols, pk))
-    })?;
-    binder.cache_alias(register_name.to_string(), (hidden_vid, schema));
-    Ok(())
+    })
 }
 
 /// Resolve a DISTINCT / GROUP BY operator's input relation — the source
@@ -559,6 +547,14 @@ fn compile_derived_tables(
         return Ok(());
     }
     let from = &select.from[0];
+    // A non-LATERAL derived table may reference CTEs and catalog relations but not
+    // a sibling FROM item. `compile_hidden_body` returns the compiled alias without
+    // registering it, so nothing a sibling compiles is visible to a later sibling;
+    // register them all only after the whole FROM is compiled. A later sibling
+    // naming an earlier one thus falls through to a catalog relation (or errors) —
+    // never the sibling — and, in the final body, a sibling alias shadows a
+    // same-named CTE (standard SQL).
+    let mut deferred: Vec<(String, (u64, Rc<Schema>))> = Vec::new();
     for tf in std::iter::once(&from.relation).chain(from.joins.iter().map(|j| &j.relation)) {
         let TableFactor::Derived {
             lateral,
@@ -600,15 +596,12 @@ fn compile_derived_tables(
                 "{ctx}: only a single-FROM, non-DISTINCT subquery is supported"
             )));
         }
-        compile_hidden_body(
-            client,
-            binder,
-            sub_select,
-            &alias.name.value,
-            &alias.columns,
-            &ctx,
-            chain,
-        )?;
+        let resolved = compile_hidden_body(client, binder, sub_select, &alias.columns, &ctx, chain)?;
+        deferred.push((alias.name.value.clone(), resolved));
+    }
+    // The final body resolves every sibling; a sibling alias shadows a same-named CTE.
+    for (name, resolved) in deferred {
+        binder.cache_alias(&name, resolved);
     }
     Ok(())
 }
@@ -679,7 +672,7 @@ fn collect_operator_names(select: &Select) -> Option<Vec<String>> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut names: Vec<String> = Vec::new();
     for (_, name) in refs {
-        if seen.insert(name.to_lowercase()) {
+        if seen.insert(name.to_ascii_lowercase()) {
             names.push(name.to_string());
         }
     }

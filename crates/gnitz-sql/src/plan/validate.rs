@@ -15,7 +15,7 @@ pub(crate) fn reject_duplicate_column_names<'a>(
 ) -> Result<(), GnitzSqlError> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for name in names {
-        if !seen.insert(name.to_lowercase()) {
+        if !seen.insert(name.to_ascii_lowercase()) {
             return Err(GnitzSqlError::Plan(format!(
                 "duplicate column name '{name}' in {context}"
             )));
@@ -41,9 +41,14 @@ pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {
 /// undroppable (`drop_index` refuses it). The infix check is scoped here rather
 /// than in `validate_user_identifier`, which also guards table/column/schema
 /// names that may legitimately contain `__fk_`.
+///
+/// The infix is matched against the **canonical (lowercase) form**, because the
+/// client canonicalizes index names at store time: a mixed-case `x__FK_y` would
+/// otherwise pass this guard yet be stored as the reserved `x__fk_y`, which the
+/// engine then refuses to drop.
 pub(crate) fn validate_user_index_name(name: &str) -> Result<(), GnitzSqlError> {
     validate_user_name(name)?;
-    if name.contains(gnitz_core::FK_INDEX_INFIX) {
+    if name.to_ascii_lowercase().contains(gnitz_core::FK_INDEX_INFIX) {
         return Err(GnitzSqlError::Plan(format!(
             "Index/constraint names cannot contain the reserved '{}' infix",
             gnitz_core::FK_INDEX_INFIX
@@ -56,9 +61,28 @@ pub(crate) fn validate_user_index_name(name: &str) -> Result<(), GnitzSqlError> 
 /// `{schema}__{table}__idx_{col1}_{col2}…` (column names joined with `_`).
 /// `DROP INDEX <name>` resolves this exact string, so the format is a stable
 /// contract (the drop-by-name tests in `planner_create_table` pin it); this is
-/// its single definition, shared by CREATE INDEX and CREATE TABLE … UNIQUE.
+/// its single definition, shared by CREATE INDEX and CREATE TABLE … UNIQUE. The
+/// output is lowercased so the base is canonical (matching the client's
+/// store-time canonicalization), which the collision disambiguation depends on.
 pub(crate) fn default_index_name(schema_name: &str, table_name: &str, col_names: &[&str]) -> String {
-    format!("{schema_name}__{table_name}__idx_{}", col_names.join("_"))
+    format!("{schema_name}__{table_name}__idx_{}", col_names.join("_")).to_ascii_lowercase()
+}
+
+/// Return `base` if free, else the first `{base}_{n}` (n ≥ 2) not in `taken` —
+/// PostgreSQL's scheme, keeping the readable base for the common non-colliding
+/// case. `taken` holds canonical (lowercase) names; `base` is already canonical.
+/// Only auto-generated names are routed here — an explicit collision still errors.
+pub(crate) fn disambiguate_index_name(base: String, taken: &std::collections::HashSet<String>) -> String {
+    if !taken.contains(&base) {
+        return base;
+    }
+    for n in 2u32.. {
+        let candidate = format!("{base}_{n}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u32 range exhausted")
 }
 
 /// Reject a float column used as any hashed key — a GROUP BY grouping key, a

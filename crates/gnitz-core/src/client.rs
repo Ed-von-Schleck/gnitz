@@ -52,6 +52,17 @@ fn col_str(col: &ColData, i: usize) -> Result<Option<&str>, ClientError> {
     }
 }
 
+/// Canonical stored form of a user relation/schema/index name. Names are ASCII
+/// `[A-Za-z0-9_]` (enforced by `validate_user_identifier` at this client's
+/// create entry points, so no front end can bypass it), so an ASCII lowercase
+/// is a total, collision-free fold and the single definition of catalog-name
+/// case-insensitivity. Folded at the two boundaries every catalog name flows
+/// through — this client (the catalog gateway) and the binder cache — so the
+/// engine only ever sees already-canonical names and needs no production change.
+fn canon_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 /// A secondary index maps the indexed column to the PK of the index table, so
 /// the indexed column must be PK-eligible. Defer to the canonical
 /// `is_pk_eligible` allow-list (the exact set the server's `get_index_key_type`
@@ -429,6 +440,11 @@ impl GnitzClient {
         index_name: &str,
         is_unique: bool,
     ) -> Result<u64, ClientError> {
+        // Gateway backstop for non-SQL front ends (capi): enforce the ASCII
+        // `[A-Za-z0-9_]` charset `canon_name` relies on. The SQL planner
+        // validates earlier with better error types.
+        crate::validate_user_identifier(index_name).map_err(ClientError::ServerError)?;
+        let index_name = canon_name(index_name);
         // Arity, 7-bit column range, duplicates — the Err form of the
         // pack_pk_cols contract, so the pack below can never panic.
         gnitz_wire::validate_pk_col_list(col_indices)
@@ -447,14 +463,8 @@ impl GnitzClient {
         // after the first match, leaving the second row with a catalog entry but no
         // circuit). Mirrors the engine DDL path's `index_by_name` check, which the
         // client push otherwise bypasses.
-        let (_, existing, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
-        if let Some(idx_batch) = existing {
-            for i in idx_batch.live_rows() {
-                let name = col_str(&idx_batch.columns[4], i)?.unwrap_or("");
-                if name == index_name {
-                    return Err(ClientError::ServerError(format!("index '{index_name}' already exists")));
-                }
-            }
+        if self.index_name_cols()?.iter().any(|(name, _)| *name == index_name) {
+            return Err(ClientError::ServerError(format!("index '{index_name}' already exists")));
         }
 
         let index_id = self.alloc_index_id()?;
@@ -466,7 +476,7 @@ impl GnitzClient {
             .u64_val(table_id)
             .u64_val(0)
             .u64_val(gnitz_wire::pack_pk_cols(col_indices))
-            .str_val(index_name)
+            .str_val(&index_name)
             .u64_val(is_unique as u64)
             .str_val("");
 
@@ -475,6 +485,7 @@ impl GnitzClient {
     }
 
     pub fn drop_index_by_name(&mut self, index_name: &str) -> Result<(), ClientError> {
+        let index_name = canon_name(index_name);
         let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
         let idx_batch = idx_batch.ok_or_else(|| ClientError::ServerError(format!("index '{index_name}' not found")))?;
         for i in idx_batch.live_rows() {
@@ -497,13 +508,36 @@ impl GnitzClient {
                 .u64_val(owner_id)
                 .u64_val(owner_kind)
                 .u64_val(src_col)
-                .str_val(index_name)
+                .str_val(&index_name)
                 .u64_val(is_unique)
                 .str_val(&cache_dir);
             self.conn.push_ddl_txn(&[(IDX_TAB, idx_schema, batch)])?;
             return Ok(());
         }
         Err(ClientError::ServerError(format!("index '{index_name}' not found")))
+    }
+
+    /// `(name, indexed columns)` of every live secondary-index IDX_TAB row (name in
+    /// canonical lowercase, since `create_index`/`create_table` canonicalize at
+    /// store time). `create_index` checks it for a duplicate name; the planner uses
+    /// it to reject a re-index of an identical column set under the auto base name
+    /// and to disambiguate an auto-generated name against the taken set. Name is
+    /// column 4, the packed source columns are column 3 — the same slots
+    /// `create_index` writes and `drop_index_by_name` reads.
+    pub fn index_name_cols(&mut self) -> Result<Vec<(String, gnitz_wire::PkColList)>, ClientError> {
+        let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
+        let Some(idx_batch) = idx_batch else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for i in idx_batch.live_rows() {
+            let Some(name) = col_str(&idx_batch.columns[4], i)? else {
+                continue;
+            };
+            let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch.columns[3], i)?);
+            out.push((name.to_string(), cols));
+        }
+        Ok(out)
     }
 
     pub fn delete(&mut self, table_id: u64, schema: &Schema, pks: PkColumn) -> Result<(), ClientError> {
@@ -562,12 +596,13 @@ impl GnitzClient {
         // illegal characters. The SQL planner has no CREATE SCHEMA surface, so
         // this client entry point is the sole enforcement for schema names.
         crate::validate_user_identifier(name).map_err(ClientError::ServerError)?;
+        let name = canon_name(name);
         let new_sid = self.conn.alloc_schema_id()?;
         let schema = schema_tab_schema();
         let mut batch = ZSetBatch::new(schema);
         BatchAppender::new(&mut batch, schema)
             .add_row(new_sid as u128, 1)
-            .str_val(name);
+            .str_val(&name);
         self.conn.push_ddl_txn(&[(SCHEMA_TAB, schema, batch)])?;
         Ok(new_sid)
     }
@@ -620,9 +655,10 @@ impl GnitzClient {
     /// Already-dropped leaves stay dropped, but the still-referenced member and
     /// the `SCHEMA_TAB` row are never retracted, so no orphan results.
     pub fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
+        let name = canon_name(name);
         let (_, sdata, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let sdata = sdata.ok_or_else(|| ClientError::ServerError(format!("Schema '{name}' not found")))?;
-        let schema_id = find_schema_id(&sdata, name)?;
+        let schema_id = find_schema_id(&sdata, &name)?;
 
         // Views first — a view may read a member table; the drain retries to
         // resolve intra-schema view-on-view chains across passes. Synthesized
@@ -633,19 +669,19 @@ impl GnitzClient {
         let (_, vdata, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
         let mut views = vdata.map_or(Ok(Vec::new()), |b| collect_schema_member_names(&b, schema_id))?;
         views.retain(|n| !is_hidden_view_name(n));
-        self.drain_drops(views, |c, m| c.drop_view(name, m))?;
+        self.drain_drops(views, |c, m| c.drop_view(&name, m))?;
 
         // Then tables — the drain retries to resolve intra-schema FK chains.
         let (_, tdata, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         let tables = tdata.map_or(Ok(Vec::new()), |b| collect_schema_member_names(&b, schema_id))?;
-        self.drain_drops(tables, |c, m| c.drop_table(name, m))?;
+        self.drain_drops(tables, |c, m| c.drop_table(&name, m))?;
 
         // Schema now empty; the engine member-count guard accepts this row.
         let schema = schema_tab_schema();
         let mut batch = ZSetBatch::new(schema);
         BatchAppender::new(&mut batch, schema)
             .add_row(schema_id as u128, -1)
-            .str_val(name);
+            .str_val(&name);
         self.conn.push_ddl_txn(&[(SCHEMA_TAB, schema, batch)])?;
         Ok(())
     }
@@ -672,6 +708,15 @@ impl GnitzClient {
         dist_prefix_len: usize,
         unique_indexes: &[InlineUniqueIndex],
     ) -> Result<u64, ClientError> {
+        // Gateway backstop for non-SQL front ends (capi): enforce the ASCII
+        // `[A-Za-z0-9_]` charset `canon_name` relies on for the names this call
+        // stores. The SQL planner validates earlier with better error types.
+        crate::validate_user_identifier(table_name).map_err(ClientError::ServerError)?;
+        for spec in unique_indexes {
+            crate::validate_user_identifier(spec.name).map_err(ClientError::ServerError)?;
+        }
+        let schema_name = canon_name(schema_name);
+        let table_name = canon_name(table_name);
         if !(1..=gnitz_wire::PK_LIST_MAX_COLS).contains(&pk_cols.len()) {
             return Err(ClientError::ServerError(format!(
                 "create_table: PK column count {} out of range 1..={}",
@@ -685,7 +730,7 @@ impl GnitzClient {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch =
             schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
 
         // Encode the PK list using the shared wire packer so the engine
         // catalog decodes it identically. Single-PK callers still flow
@@ -703,7 +748,7 @@ impl GnitzClient {
         BatchAppender::new(&mut tb, tbl_schema)
             .add_row(new_tid as u128, 1)
             .u64_val(schema_id)
-            .str_val(table_name)
+            .str_val(&table_name)
             .str_val("")
             .u64_val(pk_packed)
             .u64_val(0)
@@ -734,7 +779,7 @@ impl GnitzClient {
                         .u64_val(new_tid) // owner_id
                         .u64_val(0) // owner_kind = table
                         .u64_val(gnitz_wire::pack_pk_cols(spec.col_indices)) // source_col_idx
-                        .str_val(spec.name)
+                        .str_val(&canon_name(spec.name))
                         .u64_val(1) // is_unique
                         .str_val(""); // cache_directory
                 }
@@ -747,15 +792,17 @@ impl GnitzClient {
     }
 
     pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> Result<(), ClientError> {
+        let schema_name = canon_name(schema_name);
+        let table_name = canon_name(table_name);
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch =
             schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
 
         let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         let tbl_batch = tbl_batch
             .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
-        let record = find_table_record(&tbl_batch, schema_id, table_name)?;
+        let record = find_table_record(&tbl_batch, schema_id, &table_name)?;
 
         let tbl_schema = table_tab_schema();
         let mut tb = ZSetBatch::new(tbl_schema);
@@ -832,6 +879,7 @@ impl GnitzClient {
     /// output slots (`[0]` for a synthetic-PK view, `0..k` for a compound-PK
     /// passthrough).
     pub fn create_view_chain(&mut self, schema_name: &str, views: Vec<PlannedView>) -> Result<Vec<u64>, ClientError> {
+        let schema_name = canon_name(schema_name);
         // Reject an over-long chain before any allocation (the self-referential
         // CTE blow-up guard).
         if views.len() > MAX_CHAIN_SEGMENTS {
@@ -849,6 +897,13 @@ impl GnitzClient {
         // as a clean error before the DDL round-trip (else the engine's
         // build_schema_from_col_defs assert trips).
         for pv in &views {
+            // Gateway backstop for non-SQL front ends (capi): enforce the ASCII
+            // `[A-Za-z0-9_]` charset `canon_name` relies on. Hidden segment names
+            // are system-generated (`__h…` — the leading `_` is exactly what marks
+            // them non-user), so only user-visible names are validated.
+            if !is_hidden_view_name(&pv.name) {
+                crate::validate_user_identifier(&pv.name).map_err(ClientError::ServerError)?;
+            }
             if pv.output_columns.is_empty() {
                 return Err(ClientError::ServerError(
                     "View must have at least one output column".into(),
@@ -883,7 +938,7 @@ impl GnitzClient {
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch =
             schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
 
         // Each view's vid: its circuit's pre-allocated id, or a fresh one. A chain
         // pre-sets every id (downstream circuits reference upstream hidden views),
@@ -1004,7 +1059,7 @@ impl GnitzClient {
                     &ViewRecord {
                         vid,
                         schema_id,
-                        name: pv.name,
+                        name: canon_name(&pv.name),
                         sql_definition: pv.sql_text,
                         cache_directory: String::new(),
                         created_lsn: 0,
@@ -1045,15 +1100,17 @@ impl GnitzClient {
     /// and the whole chain retires atomically. A user view with no hidden members
     /// (every view created before this feature) drops exactly as before.
     pub fn drop_view(&mut self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
+        let schema_name = canon_name(schema_name);
+        let view_name = canon_name(view_name);
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch =
             schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
 
         let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
         let view_batch = view_batch
             .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found")))?;
-        let vr = find_view_record(&view_batch, schema_id, view_name)?;
+        let vr = find_view_record(&view_batch, schema_id, &view_name)?;
 
         // Hidden segment members this view owns. Ownership is name-encoded
         // (hidden views are never shared across user views); the shared
@@ -1078,15 +1135,17 @@ impl GnitzClient {
     }
 
     pub fn resolve_table_id(&mut self, schema_name: &str, table_name: &str) -> Result<(u64, Schema), ClientError> {
+        let schema_name = canon_name(schema_name);
+        let table_name = canon_name(table_name);
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch =
             schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
 
         let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         let tbl_batch = tbl_batch
             .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
-        let record = find_table_record(&tbl_batch, schema_id, table_name)?;
+        let record = find_table_record(&tbl_batch, schema_id, &table_name)?;
 
         let (_, col_batch, _) = self.conn.scan(COL_TAB, &mut self.schema_cache)?;
         let col_batch = col_batch.ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
@@ -1102,10 +1161,12 @@ impl GnitzClient {
     }
 
     pub fn resolve_table_or_view_id(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema), ClientError> {
+        let schema_name = canon_name(schema_name);
+        let name = canon_name(name);
         let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
         let schema_batch =
             schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, schema_name)?;
+        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
 
         // Scan COL_TAB once — shared by both the table and view branches below
         let (_, col_batch, _) = self.conn.scan(COL_TAB, &mut self.schema_cache)?;
@@ -1114,7 +1175,7 @@ impl GnitzClient {
         // Try TABLE_TAB first (most common path)
         let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
         if let Some(ref tbl_batch) = tbl_batch {
-            if let Ok(record) = find_table_record(tbl_batch, schema_id, name) {
+            if let Ok(record) = find_table_record(tbl_batch, schema_id, &name) {
                 let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
                 return Ok((
                     record.tid,
@@ -1130,7 +1191,7 @@ impl GnitzClient {
         let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
         let view_batch = view_batch
             .ok_or_else(|| ClientError::ServerError(format!("Table or view '{schema_name}.{name}' not found")))?;
-        let record = find_view_record(&view_batch, schema_id, name)?;
+        let record = find_view_record(&view_batch, schema_id, &name)?;
         let columns = extract_col_entries(&col_batch, record.vid, OWNER_KIND_VIEW)?;
         // The view PK is the persisted leading-k column list: a single synthetic
         // hash column for join/set-op/distinct views, or the source PK passed

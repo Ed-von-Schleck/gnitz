@@ -231,7 +231,7 @@ fn mark_live(qual: Option<&str>, name: &str, visible: &[(String, Rc<Schema>)], l
             continue;
         }
         if sch.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
-            live.entry(alias.clone()).or_default().insert(name.to_lowercase());
+            live.entry(alias.clone()).or_default().insert(name.to_ascii_lowercase());
         }
     }
 }
@@ -258,7 +258,7 @@ fn collect_live_from_projection(projection: &[SelectItem], aliases: &[(String, R
     } else {
         for (alias, sch) in aliases {
             let set = live.entry(alias.clone()).or_default();
-            set.extend(sch.columns.iter().map(|c| c.name.to_lowercase()));
+            set.extend(sch.columns.iter().map(|c| c.name.to_ascii_lowercase()));
         }
     }
 }
@@ -291,10 +291,10 @@ fn live_columns_projection(
     let mut new_prov: Provenance = Vec::with_capacity(prov.len() + 1);
     let empty = HashSet::new();
     let mut push_alias = |alias: &str, sch: &Rc<Schema>| {
-        let live_names = live.get(&alias.to_lowercase()).unwrap_or(&empty);
+        let live_names = live.get(&alias.to_ascii_lowercase()).unwrap_or(&empty);
         // Kept columns of `sch`, schema order — those still referenced downstream.
         let kept: Vec<usize> = (0..sch.columns.len())
-            .filter(|&i| live_names.contains(&sch.columns[i].name.to_lowercase()))
+            .filter(|&i| live_names.contains(&sch.columns[i].name.to_ascii_lowercase()))
             .collect();
         let pruned = Rc::new(Schema {
             columns: kept.iter().map(|&i| sch.columns[i].clone()).collect(),
@@ -390,9 +390,12 @@ pub(crate) fn plan_join_chain(
     // has no segment and stays empty).
     let suffix: Vec<LiveNames> = if n_joins > 1 {
         let mut alias_order: Vec<(String, Rc<Schema>)> = Vec::with_capacity(n_joins + 1);
-        alias_order.push((left_alias.to_lowercase(), Rc::clone(&acc_schema)));
+        alias_order.push((left_alias.to_ascii_lowercase(), Rc::clone(&acc_schema)));
         for step in &steps {
-            alias_order.push((step.right_alias.to_lowercase(), Rc::clone(&step.right_base_schema)));
+            alias_order.push((
+                step.right_alias.to_ascii_lowercase(),
+                Rc::clone(&step.right_base_schema),
+            ));
         }
         let mut final_refs = LiveNames::new();
         collect_live_from_projection(&select.projection, &alias_order, &mut final_refs);
@@ -459,7 +462,7 @@ pub(crate) fn plan_join_chain(
         let mut alias_map = AliasMap::with_capacity(prov.len() + 1);
         for (a, sch, off) in &prov {
             alias_map.insert(
-                a.to_lowercase(),
+                a.to_ascii_lowercase(),
                 ResolvedRelation {
                     table_id: acc_tid,
                     schema: Rc::clone(sch),
@@ -468,7 +471,7 @@ pub(crate) fn plan_join_chain(
             );
         }
         alias_map.insert(
-            right_alias.to_lowercase(),
+            right_alias.to_ascii_lowercase(),
             ResolvedRelation {
                 table_id: r_tid,
                 schema: Rc::clone(&r_schema),
