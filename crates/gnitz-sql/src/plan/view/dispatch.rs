@@ -3,8 +3,9 @@
 //! `plan/view` that knows about all the others.
 
 use crate::ast_util::{
-    extract_name, extract_relation_name, extract_table_factor_name, flatten_conjuncts, group_by_is_present,
-    is_wildcard_projection, projection_has_aggregate,
+    collect_column_refs, collect_projection_column_refs, extract_name, extract_relation_name,
+    extract_table_factor_name, flatten_conjuncts, group_by_is_present, is_wildcard_projection,
+    projection_has_aggregate,
 };
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
@@ -16,9 +17,10 @@ use crate::plan::view::{exists, group_by, join, set_op, simple, ViewChain};
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, PlannedView, Schema};
 use sqlparser::ast::{
-    Expr, GroupByExpr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
+    Expr, GroupByExpr, Ident, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
     UnaryOperator, WildcardAdditionalOptions,
 };
+use std::collections::HashSet;
 use std::rc::Rc;
 
 pub(crate) fn execute_create_view(
@@ -66,16 +68,18 @@ pub(crate) fn execute_create_view(
             right,
         } => set_op::emit_set_op_pieces(client, final_vid, op, set_quantifier, left, right, binder)?,
         // DISTINCT / GROUP BY resolve their input relation first: a plain FROM
-        // resolves through the binder; a join FROM compiles to a hidden view H
-        // (all columns) and the operator runs over H, resolving its projection /
-        // WHERE / group columns against H by name.
+        // resolves through the binder; a join FROM compiles to a hidden view H whose
+        // circuit already applied the top-level WHERE, and the operator runs over H,
+        // resolving its projection / group columns against H by name. `resolve_operator_input`
+        // returns the `Select` the operator should see — with `selection` cleared on
+        // the join path, so the WHERE is never re-applied over H.
         ViewShape::Distinct(select) => {
-            let src = resolve_operator_input(client, binder, select, &mut chain, "SELECT DISTINCT")?;
-            set_op::emit_distinct_pieces(final_vid, select, src)?
+            let (src, op_select) = resolve_operator_input(client, binder, select, &mut chain, "SELECT DISTINCT")?;
+            set_op::emit_distinct_pieces(final_vid, &op_select, src)?
         }
         ViewShape::GroupBy(select) => {
-            let src = resolve_operator_input(client, binder, select, &mut chain, "GROUP BY")?;
-            group_by::emit_group_by_pieces(client, final_vid, select, src)?
+            let (src, op_select) = resolve_operator_input(client, binder, select, &mut chain, "GROUP BY")?;
+            group_by::emit_group_by_pieces(client, final_vid, &op_select, src)?
         }
         // Any join FROM — 2-way, N-way, or self-referential — plans as a left-deep
         // chain; intermediate segments and self-join pass-through wrappers land on
@@ -491,8 +495,8 @@ fn compile_hidden_body(
     let is_plain_join = !from.joins.is_empty() && !grouped;
     let (hidden_vid, schema) = chain.add_segment(client, |client, chain, vid| {
         let (circuit, mut cols, pk) = if grouped {
-            let src = resolve_operator_input(client, binder, select, chain, ctx)?;
-            group_by::emit_group_by_pieces(client, vid, select, src)?
+            let (src, op_select) = resolve_operator_input(client, binder, select, chain, ctx)?;
+            group_by::emit_group_by_pieces(client, vid, &op_select, src)?
         } else if is_plain_join {
             join::plan_join_chain(client, binder, vid, select, chain)?
         } else {
@@ -507,25 +511,34 @@ fn compile_hidden_body(
     Ok(())
 }
 
-/// Resolve a DISTINCT / GROUP BY operator's input relation: a JOIN FROM compiles
-/// to a hidden view H on `chain` first; a plain FROM resolves through the binder.
+/// Resolve a DISTINCT / GROUP BY operator's input relation — the source
+/// `(id, schema)` — and the `Select` the operator should evaluate over it: a JOIN
+/// FROM compiles to a hidden view H on `chain` first (the join circuit already
+/// consumed the top-level WHERE), so the operator receives a clone with
+/// `selection` cleared — it must not re-apply the WHERE over H. A plain FROM
+/// resolves through the binder and keeps the `Select` as written (its WHERE is a
+/// filter over one base relation, already minimal).
 fn resolve_operator_input(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
     select: &Select,
     chain: &mut ViewChain,
     context: &str,
-) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
+) -> Result<((u64, Rc<Schema>), Select), GnitzSqlError> {
     if select.from.len() != 1 {
         return Err(GnitzSqlError::Unsupported(format!(
             "{context}: only a single table without JOINs is supported"
         )));
     }
-    if !select.from[0].joins.is_empty() {
-        return compile_join_to_hidden(client, binder, select, chain);
-    }
-    let name = extract_relation_name(&select.from[0].relation, context)?;
-    binder.resolve(client, &name)
+    let mut op_select = select.clone();
+    let src = if !select.from[0].joins.is_empty() {
+        op_select.selection = None;
+        compile_join_to_hidden(client, binder, select, chain)?
+    } else {
+        let name = extract_relation_name(&select.from[0].relation, context)?;
+        binder.resolve(client, &name)?
+    };
+    Ok((src, op_select))
 }
 
 /// Compile every derived table in the query's top-level FROM (the base relation
@@ -602,20 +615,28 @@ fn compile_derived_tables(
 
 /// Compile a `select`'s join input into hidden segment(s) on `chain`, ending in
 /// a full-column view `H`. Returns `(H's view id, H's schema)` for the operator
-/// that runs over H. The grouping / DISTINCT / WHERE / projection clauses are
-/// stripped for `H` — they belong to that outer operator, which resolves H's
-/// columns by name.
+/// that runs over H. The top-level WHERE stays in `H` — the join circuit consumes
+/// it (`classify_join_where`), so `H` materializes the *filtered* join. Only the
+/// grouping / HAVING / DISTINCT / projection clauses are stripped for `H`: they
+/// belong to that outer operator, which resolves H's columns by name.
 fn compile_join_to_hidden(
     client: &mut GnitzClient,
     binder: &mut Binder<'_>,
     select: &Select,
     chain: &mut ViewChain,
 ) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
-    // The join, projected in full (the join's ON stays in `from`); WHERE/GROUP/DISTINCT
-    // are the outer operator's, applied over H.
+    // The join projected to only the columns the outer operator reads over `H`
+    // (the join's ON stays in `from`, the WHERE in `selection` — the join circuit
+    // filters it); GROUP/HAVING/DISTINCT are the outer operator's, so blank them
+    // here so they never enter the join.
     let mut join_select = select.clone();
-    join_select.projection = vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())];
-    join_select.selection = None;
+    join_select.projection = match collect_operator_names(select) {
+        Some(names) => names
+            .into_iter()
+            .map(|n| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(n))))
+            .collect(),
+        None => vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())],
+    };
     join_select.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
     join_select.having = None;
     join_select.distinct = None;
@@ -623,4 +644,44 @@ fn compile_join_to_hidden(
     chain.add_segment(client, |client, chain, vid| {
         join::plan_join_chain(client, binder, vid, &join_select, chain)
     })
+}
+
+/// The bare column names a DISTINCT / GROUP BY operator evaluates over its hidden
+/// join input `H`: the projection's column refs (group cols + aggregate arguments,
+/// or the DISTINCT items), the GROUP BY expressions, and HAVING — collected in
+/// BARE-NAME mode (qualifier discarded), deduped case-insensitively (first spelling
+/// kept). Returns `None` when a wildcard projection item is present, GROUP BY ALL is
+/// used, or nothing is collected (e.g. `SELECT COUNT(*)`), so the caller keeps the
+/// wildcard `H` — the degenerate no-pruning case. Bare-name collection mirrors the
+/// operator's own name binding over `H` (`bind_single_table` discards the
+/// qualifier), so it keeps every same-named candidate and leaves the deterministic
+/// "ambiguous column" behavior unchanged — collecting `SUM(a.amt)` as
+/// qualified-to-`a` would instead prune a same-named `b.amt` and turn that error
+/// into a liveness-dependent acceptance.
+fn collect_operator_names(select: &Select) -> Option<Vec<String>> {
+    // GROUP BY ALL is rejected downstream; keep the wildcard rather than mis-prune.
+    if matches!(select.group_by, GroupByExpr::All(_)) {
+        return None;
+    }
+    let mut refs: Vec<(Option<&str>, &str)> = Vec::new();
+    // A wildcard projection (e.g. `SELECT DISTINCT *`) is the no-pruning case.
+    if !collect_projection_column_refs(&select.projection, &mut refs) {
+        return None;
+    }
+    if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
+        for e in exprs {
+            collect_column_refs(e, &mut refs);
+        }
+    }
+    if let Some(h) = &select.having {
+        collect_column_refs(h, &mut refs);
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut names: Vec<String> = Vec::new();
+    for (_, name) in refs {
+        if seen.insert(name.to_lowercase()) {
+            names.push(name.to_string());
+        }
+    }
+    (!names.is_empty()).then_some(names)
 }

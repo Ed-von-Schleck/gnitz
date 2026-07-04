@@ -1,9 +1,9 @@
 #![cfg(feature = "integration")]
 
 use gnitz_core::{
-    OPCODE_DELAY, OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_INTEGRATE_TRACE, OPCODE_JOIN_DELTA_TRACE,
-    OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR, OPCODE_MAP_PROJ, OPCODE_NEGATE, OPCODE_NULL_EXTEND,
-    OPCODE_PARTITION_FILTER, OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_SCAN_DELTA, OPCODE_UNION,
+    OPCODE_DELAY, OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_FILTER, OPCODE_INTEGRATE_TRACE,
+    OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR, OPCODE_MAP_PROJ, OPCODE_NEGATE,
+    OPCODE_NULL_EXTEND, OPCODE_PARTITION_FILTER, OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_SCAN_DELTA, OPCODE_UNION,
 };
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
@@ -1107,6 +1107,132 @@ fn test_pure_range_left_join_circuit_shape() {
     );
 }
 
+/// The restructured OUTER range/band tail, pinned at the circuit level. A band
+/// LEFT JOIN with and without a top-level WHERE, over identical tables: the WHERE
+/// lands as EXACTLY ONE extra `Filter` over the full-width post-null-fill union and
+/// changes nothing else — same null-fill union (2 `Union`s: the merge + ν_A), same
+/// `NullExtend`, same projection maps, one output exchange. With non-nullable keys
+/// and an OUTER join (empty residual), that WHERE `Filter` is the ONLY `Filter`; the
+/// no-WHERE view carries none.
+#[test]
+fn test_outer_range_where_circuit_shape() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE tw_a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL, v BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE tw_b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)")
+            .unwrap();
+        // Band LEFT JOIN (eq prefix k=k + range lo<t), preserved-left, no WHERE.
+        p.execute(
+            "CREATE VIEW tw_nowhere AS SELECT tw_a.id AS aid, tw_b.id AS bid \
+             FROM tw_a LEFT JOIN tw_b ON tw_a.k = tw_b.k AND tw_a.lo < tw_b.t",
+        )
+        .unwrap();
+        // Same shape + a preserved-side top-level WHERE.
+        p.execute(
+            "CREATE VIEW tw_where AS SELECT tw_a.id AS aid, tw_b.id AS bid \
+             FROM tw_a LEFT JOIN tw_b ON tw_a.k = tw_b.k AND tw_a.lo < tw_b.t WHERE tw_a.v > 5",
+        )
+        .unwrap();
+    }
+    let nowhere = client.resolve_table_or_view_id(&sn, "tw_nowhere").unwrap().0;
+    let withwhere = client.resolve_table_or_view_id(&sn, "tw_where").unwrap().0;
+
+    let nodes = scan_circuit_nodes(&mut client);
+    let nodes = nodes.as_ref();
+    let n_nowhere = |op: u64| opcode_node_count(nodes, nowhere, op);
+    let n_where = |op: u64| opcode_node_count(nodes, withwhere, op);
+
+    // Exactly one Filter when the WHERE is present; none when absent.
+    assert_eq!(
+        n_where(OPCODE_FILTER),
+        1,
+        "the WHERE is one full-width post-null-fill filter"
+    );
+    assert_eq!(
+        n_nowhere(OPCODE_FILTER),
+        0,
+        "no WHERE, non-nullable keys, OUTER (empty residual) — zero filters"
+    );
+
+    // The WHERE adds ONLY the filter: the full-width null-fill union, the null-extend,
+    // and every projection map are identical with and without it.
+    assert_eq!(
+        n_nowhere(OPCODE_UNION),
+        3,
+        "band LEFT: normalize merge + positive_diff subtraction + inner ∪ ν_A"
+    );
+    assert_eq!(n_where(OPCODE_UNION), n_nowhere(OPCODE_UNION), "WHERE adds no union");
+    assert_eq!(
+        n_where(OPCODE_NULL_EXTEND),
+        n_nowhere(OPCODE_NULL_EXTEND),
+        "WHERE adds no null-extend"
+    );
+    assert_eq!(
+        n_where(OPCODE_MAP_PROJ),
+        n_nowhere(OPCODE_MAP_PROJ),
+        "WHERE adds no projection map (the second-stage user map is present either way)"
+    );
+    // One pair-PK output exchange either way.
+    assert_eq!(n_where(OPCODE_EXCHANGE_SHARD), 1);
+    assert_eq!(n_nowhere(OPCODE_EXCHANGE_SHARD), 1);
+}
+
+/// Chain column pruning, pinned at the segment level. A 3-way join whose 2nd ON
+/// references a leftmost-table column (`a.v`) absent from the final projection: that
+/// column is RETAINED in the hidden segment `h0 = a ⋈ b` (a later ON needs it), while
+/// `a`'s dead column and `b`'s columns are pruned out. Resolve `h0` by
+/// `hidden_view_name(final_vid, 0)` and assert its registered schema is exactly the
+/// live set.
+#[test]
+fn test_chain_segment_pruned_to_live_columns() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL, dead BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)")
+            .unwrap();
+        p.execute("CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, cv BIGINT NOT NULL)")
+            .unwrap();
+        // h0 = a ⋈ b (step 0, ON a.k=b.id); final = h0 ⋈ c (ON a.v=c.id). Final SELECT
+        // a.id, c.cv. `a.v` is referenced only by the 2nd ON; `a.dead`, `a.k`, `b.*` by
+        // nothing downstream of h0.
+        p.execute(
+            "CREATE VIEW v AS SELECT a.id AS aid, c.cv AS ccv \
+             FROM a JOIN b ON a.k = b.id JOIN c ON a.v = c.id",
+        )
+        .unwrap();
+    }
+    let final_vid = client.resolve_table_or_view_id(&sn, "v").unwrap().0;
+    let h0_name = gnitz_core::hidden_view_name(final_vid, 0);
+    let (_h0_id, h0_schema) = client.resolve_table_or_view_id(&sn, &h0_name).unwrap();
+
+    let names: Vec<&str> = h0_schema.columns.iter().map(|c| c.name.as_str()).collect();
+    // Live set = {_join_pk (the segment's own key), a.id (final proj), a.v (2nd ON)}.
+    // `a.k` (step-0 ON, consumed), `a.dead`, and `b.x`/`b.id` are pruned.
+    assert_eq!(
+        names,
+        vec!["_join_pk", "id", "v"],
+        "h0 keeps only its key + the live real columns (a.id, a.v); dead/consumed cols pruned"
+    );
+    assert!(!names.contains(&"dead"), "the dead column is pruned");
+    assert!(!names.contains(&"k"), "a.k (only step-0 ON) is pruned");
+    assert!(
+        !names.contains(&"x"),
+        "b's columns are pruned (b unreferenced downstream of h0)"
+    );
+}
+
 /// Two range conjuncts now register: the first is the physical band/range, the
 /// second a residual post-join filter (INNER).
 #[test]
@@ -1313,8 +1439,9 @@ fn test_band_left_join_circuit_shape() {
     );
     assert_eq!(
         n_left(OPCODE_MAP_PROJ) - n_inner(OPCODE_MAP_PROJ),
-        2,
-        "proj_a + nf_proj"
+        3,
+        "inner_full + proj_a + nf_proj (the OUTER tail keeps full width through the \
+         null-fill union, then projects; INNER projects in one map)"
     );
     assert_eq!(
         n_left(OPCODE_POSITIVE_PART) - n_inner(OPCODE_POSITIVE_PART),

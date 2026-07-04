@@ -185,3 +185,39 @@ class TestSelfJoinLifecycle:
                 client.execute_sql("DROP TABLE emp", schema_name=sn)
         finally:
             _cleanup(client, sn)
+
+
+class TestSelfJoinChainPruning:
+    """A relation referenced three-plus times (a self-join chain via the pass-through
+    wrapper) with a narrow final projection — pruning keeps only the live
+    columns of each occurrence."""
+
+    def test_three_level_self_join_chain(self, client):
+        """emp e -> its manager m -> the manager's manager g, projecting only e.nm and
+        g.nm. Intermediate segments carry just the join keys + those two names."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE emp (id BIGINT NOT NULL PRIMARY KEY, mgr BIGINT NOT NULL, nm BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT e.nm AS emp, g.nm AS grandboss "
+                "FROM emp e JOIN emp m ON e.mgr = m.id JOIN emp g ON m.mgr = g.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO emp VALUES (1, 0, 100), (2, 1, 200), (3, 2, 300)", schema_name=sn)
+            # e3(mgr=2) -> m2(id=2, mgr=1) -> g1(id=1, nm=100): (300, 100).
+            # e2(mgr=1) -> m1(id=1, mgr=0) -> g0 absent: dropped.
+            assert _rows(client, sn, "v", ["emp", "grandboss"]) == [(300, 100)]
+
+            # New employee 4 -> m3 -> g2(nm=200).
+            client.execute_sql("INSERT INTO emp VALUES (4, 3, 400)", schema_name=sn)
+            assert _rows(client, sn, "v", ["emp", "grandboss"]) == [(300, 100), (400, 200)]
+
+            # Retract emp 1 (the grandmanager on e3's chain) -> (300,100) drops.
+            client.execute_sql("DELETE FROM emp WHERE id = 1", schema_name=sn)
+            assert _rows(client, sn, "v", ["emp", "grandboss"]) == [(400, 200)]
+        finally:
+            _cleanup(client, sn)

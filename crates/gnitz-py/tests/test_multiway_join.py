@@ -572,3 +572,250 @@ class TestMultiwayEdgeCases:
             assert _rows(client, sn, "v", ["x", "y"]) == [(1, 100 + n - 1)]
         finally:
             _cleanup(client, sn)
+
+
+def _wrows(client, sn, view, keys):
+    """Rows as (tuple, net_weight) pairs — NULL-safe sort — so a test can assert the
+    multiplicity of a bag-valued (weight > 1) row, not just its presence."""
+    vid = client.resolve_table(sn, view)[0]
+    agg = {}
+    for r in client.scan(vid):
+        t = tuple(r._asdict()[k] for k in keys)
+        agg[t] = agg.get(t, 0) + r.weight
+    rows = [(t, w) for t, w in agg.items() if w != 0]
+    return sorted(rows, key=lambda p: tuple((x is None, x) for x in p[0]))
+
+
+class TestMultiwayPruning:
+    """Intermediate segments project only the columns a later ON, the final
+    projection, or the final WHERE still references. Correctness is unchanged; the
+    tests exercise later-ON-only columns, wide tables, outer null-fills, and
+    backfill parity under pruning."""
+
+    def test_intermediate_retains_later_on_column(self, client):
+        """A column referenced only by a LATER ON (and absent from the final
+        projection) must survive the intermediate segment; a truly-dead column is
+        pruned. Result matches a full recompute, under insert/update/delete."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL, "
+                "dead BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql("CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, cv BIGINT NOT NULL)", schema_name=sn)
+            # a.v is used ONLY by the 2nd ON; a.dead by nothing. Both flow through h0.
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id AS aid, c.cv AS ccv "
+                "FROM a JOIN b ON a.k = b.id JOIN c ON a.v = c.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO b VALUES (10, 0)", schema_name=sn)  # b.id=10
+            client.execute_sql("INSERT INTO c VALUES (700, 88)", schema_name=sn)  # c.id=700
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 700, 999)", schema_name=sn)  # a.k=10->b, a.v=700->c
+            assert _rows(client, sn, "v", ["aid", "ccv"]) == [(1, 88)]
+
+            # Update the dead column — no effect on the result.
+            client.execute_sql("UPDATE a SET dead = 12345 WHERE id = 1", schema_name=sn)
+            assert _rows(client, sn, "v", ["aid", "ccv"]) == [(1, 88)]
+
+            # A second a whose later-ON key a.v matches a different c.
+            client.execute_sql("INSERT INTO c VALUES (800, 77)", schema_name=sn)
+            client.execute_sql("INSERT INTO a VALUES (2, 10, 800, 0)", schema_name=sn)
+            assert _rows(client, sn, "v", ["aid", "ccv"]) == [(1, 88), (2, 77)]
+
+            # Retract c(700) — a1's 2nd-ON match breaks.
+            client.execute_sql("DELETE FROM c WHERE id = 700", schema_name=sn)
+            assert _rows(client, sn, "v", ["aid", "ccv"]) == [(2, 77)]
+        finally:
+            _cleanup(client, sn)
+
+    def test_four_way_wide_tables_prune_enables_plan(self, client):
+        """A 4-way join of 18-column tables with a 2-column final SELECT. Unpruned the
+        final overflow check is 1 + 55 + 18 = 74 > 65 (MAX_COLUMNS) and the view is
+        rejected; pruning the accumulator to its live columns (h1 → ~3 cols) drops it
+        far under the cap, so the view plans and maintains correctly."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            # 18 columns each: id (PK) + a key column + 16 pad columns.
+            def wide(tab, keyname):
+                pads = ", ".join(f"p{i} BIGINT NOT NULL" for i in range(16))
+                client.execute_sql(
+                    f"CREATE TABLE {tab} (id BIGINT NOT NULL PRIMARY KEY, {keyname} BIGINT NOT NULL, {pads})",
+                    schema_name=sn,
+                )
+
+            wide("a", "k1")
+            wide("b", "k2")
+            wide("c", "k3")
+            wide("d", "val")
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id AS aid, d.val AS dval "
+                "FROM a JOIN b ON a.k1 = b.id JOIN c ON b.k2 = c.id JOIN d ON c.k3 = d.id",
+                schema_name=sn,
+            )
+            # The view must exist (unpruned it would be rejected at 74 > 65).
+            client.resolve_table(sn, "v")
+
+            padvals = ", ".join("0" for _ in range(16))
+            client.execute_sql(f"INSERT INTO d VALUES (30, 42, {padvals})", schema_name=sn)  # d.id=30
+            client.execute_sql(f"INSERT INTO c VALUES (20, 30, {padvals})", schema_name=sn)  # c.id=20, c.k3=30
+            client.execute_sql(f"INSERT INTO b VALUES (10, 20, {padvals})", schema_name=sn)  # b.id=10, b.k2=20
+            client.execute_sql(f"INSERT INTO a VALUES (1, 10, {padvals})", schema_name=sn)  # a.id=1, a.k1=10
+            assert _rows(client, sn, "v", ["aid", "dval"]) == [(1, 42)]
+
+            # Break the chain mid-way — the row drops.
+            client.execute_sql("DELETE FROM c WHERE id = 20", schema_name=sn)
+            assert _rows(client, sn, "v", ["aid", "dval"]) == []
+            # Restore with a new d.val — re-derives.
+            client.execute_sql(f"INSERT INTO c VALUES (20, 30, {padvals})", schema_name=sn)
+            client.execute_sql("UPDATE d SET val = 99 WHERE id = 30", schema_name=sn)
+            assert _rows(client, sn, "v", ["aid", "dval"]) == [(1, 99)]
+        finally:
+            _cleanup(client, sn)
+
+    def test_left_step_midchain_nullfill_weight_exact(self, client):
+        """A LEFT step mid-chain, pruned: two preserved rows that agree on every KEPT
+        (non-dropped) column collapse to one bag-valued null-fill row of weight 2;
+        retracting one leaves weight 1, both leaves it gone — the weight-exact
+        positive_part null-fill survives pruning."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, junk BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
+            client.execute_sql("CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, cv BIGINT NOT NULL)", schema_name=sn)
+            # a LEFT JOIN b (mid-chain) then JOIN c. `a.junk` is dead → pruned from h0,
+            # so a1/a2 (same k, different junk) coincide in h0.
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.k AS ak, b.id AS bid, c.cv AS ccv "
+                "FROM a LEFT JOIN b ON a.k = b.id JOIN c ON a.k = c.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO b VALUES (10)", schema_name=sn)  # only k=10 matches b
+            client.execute_sql("INSERT INTO c VALUES (5, 99), (10, 88)", schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO a VALUES (1, 5, 111), (2, 5, 222), (3, 10, 333)",
+                schema_name=sn,
+            )
+            # a1,a2 (k=5): unmatched b -> bid NULL; c(5)=99. Same kept cols -> weight 2.
+            # a3 (k=10): b(10) matched -> bid 10; c(10)=88.
+            assert _wrows(client, sn, "v", ["ak", "bid", "ccv"]) == [
+                ((5, None, 99), 2),
+                ((10, 10, 88), 1),
+            ]
+
+            # Retract a1 -> the (5,None,99) bag drops to weight 1, still present.
+            client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
+            assert _wrows(client, sn, "v", ["ak", "bid", "ccv"]) == [
+                ((5, None, 99), 1),
+                ((10, 10, 88), 1),
+            ]
+            # Retract a2 too -> the null-fill bag is fully gone.
+            client.execute_sql("DELETE FROM a WHERE id = 2", schema_name=sn)
+            assert _wrows(client, sn, "v", ["ak", "bid", "ccv"]) == [((10, 10, 88), 1)]
+        finally:
+            _cleanup(client, sn)
+
+    def test_full_step_midchain_pruned(self, client):
+        """A FULL step mid-chain under pruning: both-side null-fills correct; the
+        b-side null-fill carries a NULL join key that drops out of the next INNER join
+        (as SQL requires), and a dead column is pruned."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, dead BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql("CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, cv BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.k AS ak, b.bv AS bbv, c.cv AS ccv "
+                "FROM a FULL JOIN b ON a.k = b.id JOIN c ON a.k = c.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO b VALUES (10, 500), (99, 600)", schema_name=sn)
+            client.execute_sql("INSERT INTO c VALUES (10, 88), (5, 77)", schema_name=sn)
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 111), (2, 5, 222)", schema_name=sn)
+            # a1 (k=10): b(10) matched bv=500; c(10)=88 -> (10,500,88).
+            # a2 (k=5): unmatched b -> bbv NULL; c(5)=77 -> (5,None,77).
+            # b(99) right-only null-fill has a NULL a-key -> no c match -> dropped.
+            assert _rows_ns(client, sn, "v", ["ak", "bbv", "ccv"]) == [(5, None, 77), (10, 500, 88)]
+
+            # Retract a1 -> its row drops; a2 unaffected.
+            client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
+            assert _rows_ns(client, sn, "v", ["ak", "bbv", "ccv"]) == [(5, None, 77)]
+        finally:
+            _cleanup(client, sn)
+
+    def test_pruned_multiway_backfill_parity(self, client):
+        """A pruned plain multiway view created over pre-populated tables (backfill)
+        equals the fresh-insert run."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            _tables(client, sn, ["a", "b", "c"])
+            # Populate BEFORE the view exists.
+            client.execute_sql("INSERT INTO b VALUES (10, 500, 0)", schema_name=sn)
+            client.execute_sql("INSERT INTO c VALUES (500, 0, 99)", schema_name=sn)
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 7), (2, 10, 8)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id AS aid, c.v AS cv "
+                "FROM a JOIN b ON a.k = b.id JOIN c ON b.k = c.id",
+                schema_name=sn,
+            )
+            # Both a rows chain a->b(10)->c(500,v99).
+            assert _rows(client, sn, "v", ["aid", "cv"]) == [(1, 99), (2, 99)]
+        finally:
+            _cleanup(client, sn)
+
+    def test_star_multiway_unpruned_identical(self, client):
+        """`SELECT *` marks everything live: the multiway view keeps all real columns
+        and the single final `_join_pk`, result-identical to pre-pruning. `SELECT
+        DISTINCT *` over a join likewise keeps the wildcard H (no pruning)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            _tables(client, sn, ["a", "b", "c"])
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.k = b.id JOIN c ON b.k = c.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO b VALUES (10, 500, 0)", schema_name=sn)
+            client.execute_sql("INSERT INTO c VALUES (500, 0, 99)", schema_name=sn)
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 7)", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert len(rows) == 1
+            names = list(rows[0]._asdict().keys())
+            # One final synthetic PK, no accumulated intermediate PK (wildcard = no pruning).
+            assert names.count("_join_pk") == 1, names
+
+            # Wildcard DISTINCT over a join keeps the wildcard H and dedups full rows.
+            # Distinct column names so the DISTINCT output has no duplicate-name clash.
+            client.execute_sql(
+                "CREATE TABLE da (id BIGINT NOT NULL PRIMARY KEY, dfk BIGINT NOT NULL, dav BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE db (bid BIGINT NOT NULL PRIMARY KEY, dbv BIGINT NOT NULL)", schema_name=sn
+            )
+            client.execute_sql(
+                "CREATE VIEW vd AS SELECT DISTINCT * FROM da JOIN db ON da.dfk = db.bid",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO db VALUES (5, 42)", schema_name=sn)
+            # Two da rows both join db(5); their full rows differ (da.id) → two distinct rows.
+            client.execute_sql("INSERT INTO da VALUES (1, 5, 7), (2, 5, 7)", schema_name=sn)
+            vdid = client.resolve_table(sn, "vd")[0]
+            drows = [r for r in client.scan(vdid) if r.weight > 0]
+            assert len(drows) == 2, drows
+        finally:
+            _cleanup(client, sn)

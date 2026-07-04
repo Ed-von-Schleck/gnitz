@@ -1,16 +1,15 @@
 """E2E tests: a top-level WHERE over a join view.
 
 INNER `FROM a JOIN b ON a.k=b.k WHERE p` ≡ `ON (a.k=b.k AND p)`, so the WHERE folds
-into the residual filter over the join output. OUTER (LEFT/RIGHT/FULL) equi joins
-apply the WHERE as a post-null-fill 3VL filter over the merged output (preserved-side
-predicates keep null-filled rows; right-side predicates drop them). A WHERE over an
-OUTER range/band join is rejected.
+into the residual filter over the join output. Every OUTER (LEFT/RIGHT/FULL) join —
+equi, range, or band — applies the WHERE as one linear 3VL filter over the full-width
+post-null-fill output (preserved-side predicates keep null-filled rows; right-side
+predicates drop them; `IS NULL` selects the unmatched rows).
 
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_join_where.py -v --tb=short
 """
 import random
-import pytest
 
 
 def _uid():
@@ -233,18 +232,71 @@ class TestJoinWhere:
         finally:
             _cleanup(client, sn, tables=["orders", "customers"], views=["v"])
 
-    def test_where_on_outer_range_join_rejected(self, client):
-        """WHERE over an OUTER range/band join is not supported."""
+    def test_where_on_pure_range_left_join(self, client):
+        """A plain pure-range LEFT JOIN + WHERE (formerly rejected). The WHERE is a
+        linear 3VL filter over the full-width post-null-fill output: a null-fill row
+        passing a preserved-side predicate is kept, one failing it is dropped; matched
+        rows filter too. Maintains under insert + retraction."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
             _setup(client, sn)
-            with pytest.raises(Exception) as ei:
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT orders.id AS oid FROM orders "
-                    "LEFT JOIN customers ON orders.amount < customers.tier WHERE orders.amount > 10",
-                    schema_name=sn,
-                )
-            assert "range" in str(ei.value).lower() or "not yet supported" in str(ei.value), str(ei.value)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT orders.id AS oid, customers.tier AS ct "
+                "FROM orders LEFT JOIN customers ON orders.amount < customers.tier "
+                "WHERE orders.cid > 0",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO customers VALUES (10, 'Alice', 50)", schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 5, 30), (2, 7, 100), (3, 0, 200), (4, 9, 20)",
+                schema_name=sn,
+            )
+            # o1,o4 matched (amount<50) -> ct=50; o2 unmatched but cid>0 -> null-fill kept;
+            # o3 unmatched and cid=0 -> WHERE drops it.
+            got = sorted((r["oid"], r["ct"]) for r in _rows(client, sn, "v"))
+            assert got == [(1, 50), (2, None), (4, 50)], got
+
+            # Retract a matched row; add an unmatched order passing the WHERE.
+            client.execute_sql("DELETE FROM orders WHERE id = 1", schema_name=sn)
+            client.execute_sql("INSERT INTO orders VALUES (5, 3, 500)", schema_name=sn)
+            got = sorted((r["oid"], r["ct"]) for r in _rows(client, sn, "v"))
+            assert got == [(2, None), (4, 50), (5, None)], got
+        finally:
+            _cleanup(client, sn, tables=["orders", "customers"], views=["v"])
+
+    def test_where_on_band_left_join(self, client):
+        """A band LEFT JOIN (eq prefix + range) + WHERE: the null-fill is the
+        weight-exact positive_part form; the WHERE filters the full-width output."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            _setup(client, sn)
+            # a.cid = b.id (equality prefix) AND a.amount < b.tier (range).
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT orders.id AS oid, customers.tier AS ct "
+                "FROM orders LEFT JOIN customers ON orders.cid = customers.id "
+                "AND orders.amount < customers.tier WHERE orders.amount > 15",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO customers VALUES (10, 'Alice', 100), (20, 'Bob', 50)",
+                schema_name=sn,
+            )
+            # o1 cid=10,amt=30: 30<100 matched -> ct=100, amt>15 kept.
+            # o2 cid=20,amt=80: 80<50 false -> null-fill, amt>15 kept -> ct=None.
+            # o3 cid=99,amt=40: no cid match -> null-fill, amt>15 kept -> ct=None.
+            # o4 cid=10,amt=10: 10<100 matched -> ct=100, amt>15 FALSE dropped.
+            client.execute_sql(
+                "INSERT INTO orders VALUES (1, 10, 30), (2, 20, 80), (3, 99, 40), (4, 10, 10)",
+                schema_name=sn,
+            )
+            got = sorted((r["oid"], r["ct"]) for r in _rows(client, sn, "v"))
+            assert got == [(1, 100), (2, None), (3, None)], got
+
+            # Retract the matched o1; it must leave the view.
+            client.execute_sql("DELETE FROM orders WHERE id = 1", schema_name=sn)
+            got = sorted((r["oid"], r["ct"]) for r in _rows(client, sn, "v"))
+            assert got == [(2, None), (3, None)], got
         finally:
             _cleanup(client, sn, tables=["orders", "customers"], views=["v"])

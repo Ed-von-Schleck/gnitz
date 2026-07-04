@@ -102,6 +102,49 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
     }
 }
 
+/// Collect every column reference in `expr` as `(qualifier, bare_name)` — a
+/// two-part `CompoundIdentifier` yields `(Some(q), c)`, a bare `Identifier` yields
+/// `(None, c)`. Sub-expressions recurse through `expr_operands` (function
+/// arguments included, so an aggregate's argument column is captured), the same
+/// node set the structural binder walks — a node it omits is one the binder
+/// rejects, so under-collection can only reproduce that bind error, never a wrong
+/// result. Subquery and `*`/`tbl.*` nodes contribute no references (the caller
+/// handles a wildcard). The join-chain liveness pre-pass and the hidden-`H`
+/// projection collector share this one walker.
+pub(crate) fn collect_column_refs<'e>(expr: &'e sqlparser::ast::Expr, out: &mut Vec<(Option<&'e str>, &'e str)>) {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Identifier(id) => out.push((None, id.value.as_str())),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            out.push((Some(parts[0].value.as_str()), parts[1].value.as_str()));
+        }
+        _ => {
+            for sub in expr_operands(expr) {
+                collect_column_refs(sub, out);
+            }
+        }
+    }
+}
+
+/// Collect the column references of every projection item into `out` via
+/// `collect_column_refs`. Returns `false` when any item is a wildcard
+/// (`*` / `tbl.*`) — the caller's everything-is-referenced case, in which `out`
+/// is meaningless and ignored. The join-chain liveness pre-pass and the
+/// hidden-`H` projection collector share this one item walk.
+pub(crate) fn collect_projection_column_refs<'e>(
+    items: &'e [sqlparser::ast::SelectItem],
+    out: &mut Vec<(Option<&'e str>, &'e str)>,
+) -> bool {
+    use sqlparser::ast::SelectItem;
+    for item in items {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => collect_column_refs(e, out),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return false,
+        }
+    }
+    true
+}
+
 /// Flattens an `AND`-tree into its leaf conjuncts, left to right. Descends
 /// through `AND` nesting and unwraps parenthesised `Nested` wrappers; any other
 /// node (an equality, a range, an `OR`-group, …) is a leaf kept intact. Shared

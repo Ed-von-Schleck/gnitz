@@ -3,7 +3,10 @@
 //! symmetric 2-term DBSP join against the other side's trace, normalize the two
 //! terms onto `[A cols, B cols]`, and (for outer joins) attach the null-fill.
 
-use crate::ast_util::{extract_table_name_and_alias, flatten_conjuncts, is_wildcard_projection};
+use crate::ast_util::{
+    collect_column_refs, collect_projection_column_refs, extract_table_name_and_alias, flatten_conjuncts,
+    is_wildcard_projection,
+};
 use crate::bind::{resolve_qualified_column, resolve_unqualified_column, AliasMap, Binder, ResolvedRelation};
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{
@@ -18,6 +21,7 @@ use gnitz_core::{
     CircuitBuilder, ColumnDef, ExprBuilder, FixedInt, GnitzClient, RangeRel, Schema, TypeCode, AGG_MAX, AGG_MIN,
 };
 use sqlparser::ast::{Expr, Ident, JoinConstraint, JoinOperator, SelectItem};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// Which side(s) of a join survive unmatched. Threaded through both builders in
@@ -47,6 +51,32 @@ impl JoinType {
     fn preserves_right(self) -> bool {
         matches!(self, JoinType::Right | JoinType::Full)
     }
+}
+
+/// The combined `[A cols, B cols]` output payload of one join step, with the
+/// outer-join nullability adjustment applied: a row preserved on one side carries
+/// NULLs on the OTHER side's columns, so a left column is nullable iff the RIGHT
+/// side is preserved (Right|Full) and a right column iff the LEFT side is
+/// (Left|Full). A client decoding a NULL in a NOT NULL column would panic, so
+/// this rule has exactly this one home — shared by the equi (`emit_join`) and
+/// range (`emit_range_join`) builders.
+fn combined_payload_coldefs(left_schema: &Schema, right_schema: &Schema, join_type: JoinType) -> Vec<ColumnDef> {
+    let mut cols = Vec::with_capacity(left_schema.columns.len() + right_schema.columns.len());
+    for col in &left_schema.columns {
+        let mut c = col.clone();
+        if join_type.preserves_right() {
+            c.is_nullable = true;
+        }
+        cols.push(c);
+    }
+    for col in &right_schema.columns {
+        let mut c = col.clone();
+        if join_type.preserves_left() {
+            c.is_nullable = true;
+        }
+        cols.push(c);
+    }
+    cols
 }
 
 /// Per-side carried reindex target type for each join key slot: `T_i` only when
@@ -113,9 +143,9 @@ struct LoweredJoin {
     target_tcs: Vec<TypeCode>,
     range_conjunct: Option<RangeConjunct>,
     residual: Vec<Expr>,
-    /// Top-level WHERE conjuncts of an OUTER equi join, applied as a linear filter
-    /// over the merged (post-null-fill) output. Empty for INNER (folded into
-    /// `residual`) and rejected for OUTER range joins.
+    /// Top-level WHERE conjuncts of an OUTER join, applied as a linear filter over
+    /// the merged (post-null-fill) output — uniformly for equi, range, and band
+    /// OUTER joins. Empty for INNER (folded into `residual`).
     where_filter: Vec<Expr>,
 }
 
@@ -148,70 +178,137 @@ fn join_on_and_type(join: &sqlparser::ast::Join) -> Result<(&Expr, JoinType), Gn
 /// the post-join `where_filter` — the single home for this rule:
 ///  - INNER: `ON p WHERE q ≡ ON (p AND q)`, so fold q into the residual — the same
 ///    linear filter over the join output the ON residual uses.
-///  - OUTER equi: a WHERE is a linear filter over the merged *post-null-fill* output.
-///    Its 3VL is exactly right — a null-filled column failing the predicate drops its
-///    row — and it yields the same result as pushing preserved-side conjuncts below the
-///    join. The ON residual (a match condition) stays outer-rejected; WHERE is post-join.
-///  - OUTER range: the band null-fill's interaction with a post-filter is unproven, so
-///    reject it (use an INNER join or a wrapping view).
+///  - OUTER (equi, range, or band): a WHERE is a linear 3VL filter over the merged
+///    *post-null-fill* output. Its 3VL is exactly right — a null-filled column failing
+///    the predicate drops its row, `IS NULL` keeps unmatched rows — and it yields the
+///    same result as pushing preserved-side conjuncts below the join. The ON residual
+///    (a match condition) stays outer-rejected; WHERE is post-join, uniformly across
+///    the equi and range/band paths.
 fn classify_join_where(
     selection: Option<&Expr>,
     join_type: JoinType,
-    has_range: bool,
     residual: &mut Vec<Expr>,
 ) -> Result<Vec<Expr>, GnitzSqlError> {
     let Some(where_expr) = selection else {
         return Ok(Vec::new());
     };
-    let mut conjuncts = Vec::new();
-    flatten_conjuncts(where_expr, &mut conjuncts);
+    let mut leaves = Vec::new();
+    flatten_conjuncts(where_expr, &mut leaves);
+    let conjuncts: Vec<Expr> = leaves.into_iter().cloned().collect();
     if join_type == JoinType::Inner {
-        residual.extend(conjuncts.into_iter().cloned());
+        residual.extend(conjuncts);
         Ok(Vec::new())
-    } else if has_range {
-        Err(GnitzSqlError::Unsupported(
-            "WHERE over a range/band OUTER join is not supported; use an INNER join or \
-             move the predicate into a wrapping view"
-                .into(),
-        ))
     } else {
-        Ok(conjuncts.into_iter().cloned().collect())
+        Ok(conjuncts)
     }
 }
 
 /// Join-chain provenance: one entry per original relation alias —
-/// `(alias, its base schema, column offset within the current accumulator)`.
+/// `(alias, its pruned per-alias schema, column offset within the current
+/// accumulator)`. The schema is pruned to the columns kept in the segment:
+/// resolution reads only `.columns` (name → position), so a dead column is simply
+/// absent; the segment's real PK region comes from the emitted segment schema,
+/// never these entries.
 type Provenance = Vec<(String, Rc<Schema>, usize)>;
 
-/// Intermediate hidden segment projection plus the next provenance: every
-/// accumulated real column (each original alias's columns, via the provenance)
-/// then the new relation's columns, keeping their original names. It carries all
-/// real columns forward while dropping the accumulator's leading synthetic
-/// `_join_pk` (the provenance offsets skip it), so no synthetic PK ever
-/// accumulates in the payload. Original names (possibly duplicated across the two
-/// sides) are kept so a downstream reduce/distinct over a hidden `H` can resolve
-/// columns by name; the duplicate-output-name guard is skipped for these hidden
-/// segments (never user-queried — see `emit_join`'s `check_dup_names`), and the
-/// next join's own ON resolves through the provenance (original schemas), never
-/// these names.
+/// Per-alias set of live column names, both lowercased (`alias → {name}`): the
+/// columns of each original relation alias still referenced by a later ON, the
+/// final projection, or the final WHERE. Keyed/matched by NAME (never base index)
+/// so it maps cleanly onto each segment's already-pruned schema — names survive
+/// pruning, indices do not. The chain pre-pass builds one per intermediate
+/// segment; `live_columns_projection` reads it.
+type LiveNames = HashMap<String, HashSet<String>>;
+
+/// Resolve `qual`/`name` against the aliases visible at a reference site and mark
+/// it live: a qualified `q.c` marks `q`'s column `c`; a bare `c` marks it in every
+/// visible alias carrying a column named `c` (unique → precise, ambiguous → a safe
+/// over-approximation — a real binding error surfaces at emit regardless). Names
+/// resolve against the UNPRUNED base schemas carried by `visible` (whose aliases
+/// are already lowercased).
+fn mark_live(qual: Option<&str>, name: &str, visible: &[(String, Rc<Schema>)], live: &mut LiveNames) {
+    for (alias, sch) in visible {
+        if qual.is_some_and(|q| !alias.eq_ignore_ascii_case(q)) {
+            continue;
+        }
+        if sch.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+            live.entry(alias.clone()).or_default().insert(name.to_lowercase());
+        }
+    }
+}
+
+/// Mark live every column referenced by `expr`, resolving each `(qualifier, name)`
+/// against `visible` via `mark_live`.
+fn collect_live_from_expr(expr: &Expr, visible: &[(String, Rc<Schema>)], live: &mut LiveNames) {
+    let mut refs: Vec<(Option<&str>, &str)> = Vec::new();
+    collect_column_refs(expr, &mut refs);
+    for (qual, name) in refs {
+        mark_live(qual, name, visible, live);
+    }
+}
+
+/// Mark live every column the final projection references (over all aliases). A
+/// wildcard (`*` / `tbl.*`) marks every column of every alias — the degenerate
+/// no-pruning case that keeps a `SELECT *` chain byte-identical to today.
+fn collect_live_from_projection(projection: &[SelectItem], aliases: &[(String, Rc<Schema>)], live: &mut LiveNames) {
+    let mut refs: Vec<(Option<&str>, &str)> = Vec::new();
+    if collect_projection_column_refs(projection, &mut refs) {
+        for (qual, name) in refs {
+            mark_live(qual, name, aliases, live);
+        }
+    } else {
+        for (alias, sch) in aliases {
+            let set = live.entry(alias.clone()).or_default();
+            set.extend(sch.columns.iter().map(|c| c.name.to_lowercase()));
+        }
+    }
+}
+
+/// Intermediate hidden segment projection plus the next provenance: per accumulated
+/// alias (via the provenance) then the new relation, only the columns still LIVE
+/// downstream (`live`), keeping their original names in schema order. Carries the
+/// live real columns forward while dropping the accumulator's leading synthetic
+/// `_join_pk` (the provenance offsets skip it), so no synthetic PK ever accumulates
+/// in the payload. Original names (possibly duplicated across the two sides) are
+/// kept so a downstream reduce/distinct over a hidden `H` can resolve columns by
+/// name; the duplicate-output-name guard is skipped for these hidden segments
+/// (never user-queried — see `emit_join`'s `check_dup_names`), and the next join's
+/// own ON resolves through the provenance (pruned per-alias schemas), never these
+/// names.
 ///
-/// The returned provenance offsets are payload-relative — the caller shifts them
-/// past the emitted segment's synthetic-PK region (whose arity depends on the
-/// join kind) once it is known. One loop builds both, so the projection order and
-/// the offsets cannot drift.
-fn all_real_columns_projection(
+/// Each provenance entry carries the alias's PRUNED schema (kept `ColumnDef`s
+/// verbatim, `pk_cols` filtered to kept positions — possibly empty) and the
+/// payload-relative offset. The caller shifts the offsets past the emitted
+/// segment's synthetic-PK region (whose arity depends on the join kind) once it is
+/// known. One loop builds projection and provenance, so their order/offsets cannot
+/// drift.
+fn live_columns_projection(
     prov: &Provenance,
     right_alias: &str,
     right_schema: &Rc<Schema>,
+    live: &LiveNames,
 ) -> (Vec<SelectItem>, Provenance) {
     let mut items = Vec::new();
     let mut new_prov: Provenance = Vec::with_capacity(prov.len() + 1);
+    let empty = HashSet::new();
     let mut push_alias = |alias: &str, sch: &Rc<Schema>| {
-        new_prov.push((alias.to_string(), Rc::clone(sch), items.len()));
-        for c in &sch.columns {
+        let live_names = live.get(&alias.to_lowercase()).unwrap_or(&empty);
+        // Kept columns of `sch`, schema order — those still referenced downstream.
+        let kept: Vec<usize> = (0..sch.columns.len())
+            .filter(|&i| live_names.contains(&sch.columns[i].name.to_lowercase()))
+            .collect();
+        let pruned = Rc::new(Schema {
+            columns: kept.iter().map(|&i| sch.columns[i].clone()).collect(),
+            pk_cols: sch
+                .pk_cols
+                .iter()
+                .filter_map(|&pk| kept.iter().position(|&k| k == pk))
+                .collect(),
+        });
+        new_prov.push((alias.to_string(), pruned, items.len()));
+        for &i in &kept {
             items.push(SelectItem::UnnamedExpr(Expr::CompoundIdentifier(vec![
                 Ident::new(alias),
-                Ident::new(c.name.as_str()),
+                Ident::new(sch.columns[i].name.as_str()),
             ])));
         }
     };
@@ -222,10 +319,21 @@ fn all_real_columns_projection(
     (items, new_prov)
 }
 
+/// One resolved join step of the chain: its ON + join type and the right
+/// relation's alias and base `(tid, schema)` — resolved once, consumed by both
+/// the liveness pre-pass and the emit loop.
+struct JoinStep<'a> {
+    on: &'a Expr,
+    join_type: JoinType,
+    right_alias: String,
+    right_base_tid: u64,
+    right_base_schema: Rc<Schema>,
+}
+
 /// Plan a join FROM (`from[0].joins.len() >= 1`) as a left-deep chain of 2-way
 /// join steps, reusing the standard join emitter unchanged. Each intermediate
 /// `h_i = h_{i-1} ⋈ r_i` is a hidden view pushed onto `chain` (pre-allocated id,
-/// all real columns projected); the final step is emitted with `emit_vid`, the
+/// live columns projected); the final step is emitted with `emit_vid`, the
 /// user's projection, and the top-level WHERE (`classify_join_where`). A single
 /// join is the degenerate case: no intermediates, one emit. Original table
 /// aliases are tracked through a *provenance* map — alias → (accumulator, column
@@ -255,7 +363,57 @@ pub(crate) fn plan_join_chain(
     // The leftmost relation seeds the accumulator.
     let (left_name, left_alias) = extract_table_name_and_alias(&from.relation, "CREATE VIEW JOIN")?;
     let (mut acc_tid, mut acc_schema) = binder.resolve(client, &left_name)?;
-    // Provenance: (original alias, its base schema, column offset within `acc`).
+
+    // Resolve every join step once — ON + join type, right alias, right base
+    // (tid, schema) — for the liveness pre-pass and the emit loop below.
+    let mut steps: Vec<JoinStep<'_>> = Vec::with_capacity(n_joins);
+    for join in &from.joins {
+        let (on, join_type) = join_on_and_type(join)?;
+        let (right_name, right_alias) = extract_table_name_and_alias(&join.relation, "CREATE VIEW JOIN")?;
+        let (right_base_tid, right_base_schema) = binder.resolve(client, &right_name)?;
+        steps.push(JoinStep {
+            on,
+            join_type,
+            right_alias,
+            right_base_tid,
+            right_base_schema,
+        });
+    }
+
+    // ── Liveness pre-pass (chains only — a 2-way join emits no intermediate
+    // segment, so there is nothing to prune). Collect the column references of each
+    // step's ON (visible = aliases 0..=that step's right relation), the final
+    // projection, and the final WHERE, against the relations' (lowercased alias,
+    // unpruned base schema) in left-deep order — pruning starts at the first emitted
+    // segment's projection. `suffix[k]` unions steps ≥ k with the final consumer;
+    // the segment emitted after step i keeps exactly `suffix[i + 1]` (`suffix[0]`
+    // has no segment and stays empty).
+    let suffix: Vec<LiveNames> = if n_joins > 1 {
+        let mut alias_order: Vec<(String, Rc<Schema>)> = Vec::with_capacity(n_joins + 1);
+        alias_order.push((left_alias.to_lowercase(), Rc::clone(&acc_schema)));
+        for step in &steps {
+            alias_order.push((step.right_alias.to_lowercase(), Rc::clone(&step.right_base_schema)));
+        }
+        let mut final_refs = LiveNames::new();
+        collect_live_from_projection(&select.projection, &alias_order, &mut final_refs);
+        if let Some(sel) = &select.selection {
+            collect_live_from_expr(sel, &alias_order, &mut final_refs);
+        }
+        let mut suffix: Vec<LiveNames> = vec![LiveNames::new(); n_joins + 1];
+        suffix[n_joins] = final_refs;
+        for k in (1..n_joins).rev() {
+            let mut s = suffix[k + 1].clone();
+            collect_live_from_expr(steps[k].on, &alias_order[..=k + 1], &mut s);
+            suffix[k] = s;
+        }
+        suffix
+    } else {
+        Vec::new()
+    };
+
+    // Provenance: (original alias, its pruned per-alias schema, column offset within
+    // `acc`). Seeded with the leftmost relation's full base schema (pruned once it
+    // enters the first emitted segment).
     let mut prov: Provenance = vec![(left_alias, Rc::clone(&acc_schema), 0)];
     // Base relation ids already incorporated. A right relation whose base id repeats is a
     // self-join, wrapped in a distinct-source pass-through hidden view below; the wrapper
@@ -264,15 +422,14 @@ pub(crate) fn plan_join_chain(
     let mut used_base_tids: Vec<u64> = vec![acc_tid];
     let mut wrappers: Vec<(u64, (u64, Rc<Schema>))> = Vec::new();
 
-    for (i, join) in from.joins.iter().enumerate() {
-        let (on, join_type) = join_on_and_type(join)?;
-        let (right_name, right_alias) = extract_table_name_and_alias(&join.relation, "CREATE VIEW JOIN")?;
-        if prov.iter().any(|(a, _, _)| a.eq_ignore_ascii_case(&right_alias)) {
+    for (i, step) in steps.iter().enumerate() {
+        let (on, join_type, right_alias) = (step.on, step.join_type, &step.right_alias);
+        if prov.iter().any(|(a, _, _)| a.eq_ignore_ascii_case(right_alias)) {
             return Err(GnitzSqlError::Unsupported(format!(
                 "duplicate relation alias '{right_alias}' in a multi-way join"
             )));
         }
-        let (r_base_tid, r_base_schema) = binder.resolve(client, &right_name)?;
+        let (r_base_tid, r_base_schema) = (step.right_base_tid, &step.right_base_schema);
         // Self-join: a repeated base relation is wrapped in a distinct-source pass-through
         // hidden view, so the two join inputs are never the same source (single-source-
         // per-epoch is preserved; the shared base reaches them in separate epochs). Its
@@ -285,7 +442,7 @@ pub(crate) fn plan_join_chain(
                 Some((_, w)) => w.clone(),
                 None => {
                     let w = chain.add_segment(client, |_, _, vid| {
-                        let rel = crate::plan::lp::passthrough_rel(r_base_tid, Rc::clone(&r_base_schema))?;
+                        let rel = crate::plan::lp::passthrough_rel(r_base_tid, Rc::clone(r_base_schema))?;
                         crate::plan::view::simple::emit_linear(vid, rel)
                     })?;
                     wrappers.push((r_base_tid, w.clone()));
@@ -294,7 +451,7 @@ pub(crate) fn plan_join_chain(
             }
         } else {
             used_base_tids.push(r_base_tid);
-            (r_base_tid, r_base_schema)
+            (r_base_tid, Rc::clone(r_base_schema))
         };
 
         // Provenance alias map: original aliases → accumulator (at their offsets); the
@@ -325,12 +482,7 @@ pub(crate) fn plan_join_chain(
         let is_last = i == n_joins - 1;
         // The top-level WHERE applies to the final step's output.
         let where_filter = if is_last {
-            classify_join_where(
-                select.selection.as_ref(),
-                join_type,
-                range_conjunct.is_some(),
-                &mut residual,
-            )?
+            classify_join_where(select.selection.as_ref(), join_type, &mut residual)?
         } else {
             Vec::new()
         };
@@ -354,10 +506,11 @@ pub(crate) fn plan_join_chain(
             return emit_join(emit_vid, &select.projection, lowered, true);
         }
 
-        // Intermediate: emit a hidden segment carrying all real columns forward. It is
-        // never user-queried (downstream resolves by provenance/name), so keep original
-        // names and skip the duplicate-output-name guard.
-        let (projection, mut new_prov) = all_real_columns_projection(&prov, &right_alias, &r_schema);
+        // Intermediate: emit a hidden segment carrying forward only the columns still
+        // LIVE downstream (`suffix[i + 1]` — later ONs + the final projection/WHERE). It
+        // is never user-queried (downstream resolves by provenance/name), so keep
+        // original names and skip the duplicate-output-name guard.
+        let (projection, mut new_prov) = live_columns_projection(&prov, right_alias, &r_schema, &suffix[i + 1]);
         let (view_id, seg_schema) =
             chain.add_segment(client, |_, _, vid| emit_join(vid, &projection, lowered, false))?;
 
@@ -381,24 +534,9 @@ pub(crate) fn plan_join_chain(
 fn emit_join(
     view_id: u64,
     projection: &[SelectItem],
-    lowered: LoweredJoin,
+    mut lowered: LoweredJoin,
     check_dup_names: bool,
 ) -> Result<EmitPieces, GnitzSqlError> {
-    let LoweredJoin {
-        left_tid,
-        right_tid,
-        left_schema,
-        right_schema,
-        alias_map,
-        join_type,
-        left_join_cols,
-        right_join_cols,
-        target_tcs,
-        range_conjunct,
-        residual,
-        where_filter,
-    } = lowered;
-
     // Outer (LEFT/RIGHT/FULL) + residual is rejected (§3): for an outer join the ON
     // predicate is part of the *match* condition — a preserved-side row whose only
     // physical matches all fail the residual must still null-fill, but the null-fill
@@ -406,7 +544,7 @@ fn emit_join(
     // witness), independently of the residual, and so would not retro-null-fill a row
     // matched only by residual-failing pairs. A consistent boundary across all join
     // shapes beats an inconsistent partial one; INNER residuals are fully supported.
-    if join_type != JoinType::Inner && !residual.is_empty() {
+    if lowered.join_type != JoinType::Inner && !lowered.residual.is_empty() {
         return Err(GnitzSqlError::Unsupported(
             "LEFT/RIGHT/FULL JOIN with a residual ON predicate (a non-equi/non-range \
              conjunct, or a second range conjunct) is not supported; the residual \
@@ -423,30 +561,24 @@ fn emit_join(
     // and needs no base-table guard (`positive_part` subtracts the raw matched
     // multiplicity and clamps the result, never over-filling). RIGHT/FULL extend it
     // symmetrically for the band path; pure-range RIGHT/FULL is rejected inside.
-    if let Some(range) = range_conjunct {
-        // A range join never carries a `where_filter`: INNER folds WHERE into the
-        // residual, OUTER range rejects it (both in `classify_join_where`).
-        debug_assert!(
-            where_filter.is_empty(),
-            "range join WHERE folds into residual or is rejected"
-        );
-        return emit_range_join(
-            view_id,
-            projection,
-            check_dup_names,
-            &alias_map,
-            left_tid,
-            right_tid,
-            &left_schema,
-            &right_schema,
-            &left_join_cols,
-            &right_join_cols,
-            &target_tcs,
-            range,
-            join_type,
-            &residual,
-        );
+    if let Some(range) = lowered.range_conjunct.take() {
+        return emit_range_join(view_id, projection, check_dup_names, &lowered, range);
     }
+
+    let LoweredJoin {
+        left_tid,
+        right_tid,
+        left_schema,
+        right_schema,
+        alias_map,
+        join_type,
+        left_join_cols,
+        right_join_cols,
+        target_tcs,
+        range_conjunct: _,
+        residual,
+        where_filter,
+    } = lowered;
 
     // Equi-join path (zero range conjuncts) — byte-identical to before. The
     // reindex-slot arity cap was already enforced in extract_join_predicates.
@@ -648,25 +780,9 @@ fn emit_join(
         // reindex Maps and every cross-process consumer re-derive.
         out_cols.push(ColumnDef::new(name, t, false));
     }
-    // Output-column nullability: a row preserved on one side carries NULLs on the
-    // OTHER side's columns, so left columns are nullable iff the RIGHT side is
-    // preserved (Right|Full) and right columns iff the LEFT side is (Left|Full). The
-    // `_join_pk` columns stay non-nullable (a NULL key packs to the synthetic 0,
-    // never a NULL PK). A client decoding a NULL in a NOT NULL column would panic.
-    for col in &left_schema.columns {
-        let mut c = col.clone();
-        if join_type.preserves_right() {
-            c.is_nullable = true;
-        }
-        out_cols.push(c);
-    }
-    for col in &right_schema.columns {
-        let mut c = col.clone();
-        if join_type.preserves_left() {
-            c.is_nullable = true;
-        }
-        out_cols.push(c);
-    }
+    // The A‖B payload with outer nullability applied; the `_join_pk` columns above
+    // stay non-nullable (a NULL key packs to the synthetic 0, never a NULL PK).
+    out_cols.extend(combined_payload_coldefs(&left_schema, &right_schema, join_type));
 
     // One linear filter over the normalized join output `merged` ([_join_pk × k, A, B])
     // before projection/sink, bound against `out_cols` (which carries each column's real
@@ -757,23 +873,33 @@ fn emit_join(
 ///     sentinel, no `distinct`.
 ///
 /// All ride the single pair-PK output exchange.
-#[allow(clippy::too_many_arguments)]
+///
+/// An INNER `lowered` carries an empty `where_filter` (WHERE folds into the
+/// residual); an OUTER one carries the WHERE conjuncts, applied as one linear
+/// 3VL filter over the full-width post-null-fill output. `lowered.range_conjunct`
+/// was taken by the caller and arrives as `range`.
 fn emit_range_join(
     view_id: u64,
     projection: &[SelectItem],
     check_dup_names: bool,
-    alias_map: &AliasMap,
-    left_tid: u64,
-    right_tid: u64,
-    left_schema: &Schema,
-    right_schema: &Schema,
-    left_join_cols: &[usize],
-    right_join_cols: &[usize],
-    eq_tcs: &[TypeCode],
+    lowered: &LoweredJoin,
     range: RangeConjunct,
-    join_type: JoinType,
-    residual: &[Expr],
 ) -> Result<EmitPieces, GnitzSqlError> {
+    let LoweredJoin {
+        left_tid,
+        right_tid,
+        join_type,
+        ..
+    } = *lowered;
+    let left_schema: &Schema = &lowered.left_schema;
+    let right_schema: &Schema = &lowered.right_schema;
+    let alias_map = &lowered.alias_map;
+    let left_join_cols = &lowered.left_join_cols;
+    let right_join_cols = &lowered.right_join_cols;
+    let eq_tcs = &lowered.target_tcs;
+    let residual = &lowered.residual;
+    let where_filter = &lowered.where_filter;
+
     let left_n = left_schema.columns.len();
     let right_n = right_schema.columns.len();
     let n_eq = left_join_cols.len();
@@ -971,25 +1097,10 @@ fn emit_range_join(
     // must not survive into the exchanged/consolidated output) and selects user
     // columns from A/B. A/B columns start at this payload offset.
     let payload_offset = pair_pk + k;
-    // Output-column nullability mirrors the equi path: a row preserved on one side
-    // carries NULLs on the OTHER side's columns. So a left column is nullable iff the
-    // RIGHT side is preserved (Right|Full) and a right column iff the LEFT side is
-    // (Left|Full), or a client decoding a NULL in a NOT NULL column panics.
-    let combined_coldef = |idx: usize| -> ColumnDef {
-        if idx < left_n {
-            let mut c = left_schema.columns[idx].clone();
-            if join_type.preserves_right() {
-                c.is_nullable = true;
-            }
-            c
-        } else {
-            let mut c = right_schema.columns[idx - left_n].clone();
-            if join_type.preserves_left() {
-                c.is_nullable = true;
-            }
-            c
-        }
-    };
+    // The combined A‖B output columns (outer nullability applied, same rule as the
+    // equi path) — the projection helper and the full-width WHERE's combined schema
+    // both read them.
+    let combined_payload = combined_payload_coldefs(left_schema, right_schema, join_type);
 
     // Leading output PK columns: A's then B's source-PK column types (the re-key
     // self-derive output type), non-nullable, `_pair_pk_{slot}` numbered across
@@ -1009,35 +1120,43 @@ fn emit_range_join(
         })
         .collect();
 
-    // User projection via the shared helper. Always applied (it must drop the
-    // `_join_pk` slots, which DIFFER per term); keeps the pair-PK region and
-    // selects user columns from A/B as the payload.
+    // User projection via the shared helper, built against the layout its final map
+    // reads: INNER projects straight off `rekey` (`[pair-PK, _join_pk × k, A, B]`,
+    // payload at `payload_offset`) and always maps (the per-term `_join_pk` slots
+    // DIFFER per term and may never reach the sink); OUTER projects off the
+    // full-width post-null-fill union (`[pair-PK, A, B]`, payload at `pair_pk`).
     let is_wildcard = is_wildcard_projection(projection);
+    let user_offset = if join_type == JoinType::Inner {
+        payload_offset
+    } else {
+        pair_pk
+    };
     let (final_cols, final_projection) = build_join_view_projection(
         projection,
         alias_map,
         &pair_pk_coldefs,
         left_n + right_n,
-        payload_offset,
-        combined_coldef,
+        user_offset,
+        |i| combined_payload[i].clone(),
         "range JOIN view",
     )?;
 
-    let projected = cb.map(rekey, &final_projection);
-
-    // ── Outer null-fill ─────────────────────────────────────────────────────────
-    // Each branch produces `nf_keyed`, the null-fill keyed by the preserved-row
-    // identity `[P.pk…, P]`, then runs it through the shared `nf_tail` (null-extend →
-    // re-key onto the pair-PK → project), riding the inner pairs' output exchange.
+    // ── Outer null-fill + full-width WHERE ───────────────────────────────────────
+    // INNER: a single user-projection map over the rekey output (drops the per-term
+    // `_join_pk` slots); no null-fill, no `where_filter` (WHERE folded into the
+    // residual, already filtered before rekey). OUTER: keep the full combined width
+    // `[pair-PK, A, B]` through the null-fill union so the WHERE runs as one linear
+    // 3VL filter over the post-null-fill output, then project to the user columns.
     let sink_input = if join_type == JoinType::Inner {
-        projected
+        cb.map(rekey, &final_projection)
     } else {
         // Shared tail: null-extend ν_P with the O-side NULL columns, re-key onto the
         // pair-PK `[a.pk…, b.pk…]` (the other side's PK rides in the NULL-O payload,
-        // packing to the synthetic 0), and project onto final_cols. `preserved_is_left`
-        // selects the canonical (P=A) vs reordered (P=B) layout: `null_extend` appends
-        // and `map_reindex` locks its payload to input order, so only the final
-        // `cb.map` (nf_proj) can place the NULL-O columns before P (the P=B case).
+        // packing to the synthetic 0), and project to the FULL combined width
+        // `[pair-PK, A, B]`. `preserved_is_left` selects the canonical (P=A) vs
+        // reordered (P=B) layout: `null_extend` appends and `map_reindex` locks its
+        // payload to input order, so only the final `cb.map` can place the NULL-O
+        // columns before P (the P=B case).
         let nf_tail =
             |cb: &mut CircuitBuilder, nf_keyed: gnitz_core::NodeId, preserved_is_left: bool| -> gnitz_core::NodeId {
                 let (p_pk, p_n) = if preserved_is_left { (pa, left_n) } else { (pb, right_n) };
@@ -1071,12 +1190,12 @@ fn emit_range_join(
                 let nf_rekey = cb.map_reindex(nullfill, &nf_pair_pk_cols, &zero_tcs, eb.build(0));
 
                 // nf_rekey output: [pair-PK, P.pk × p_pk, <[P, NULL-O] in input order>];
-                // the [P, NULL-O] payload sits at pair_pk + p_pk. Map each user-selected
-                // combined column (canonical [A, B] index) to its slot, canonicalizing P=B.
-                let nf_projection: Vec<usize> = final_projection
-                    .iter()
-                    .map(|&idx| {
-                        let ci = idx - payload_offset; // combined A‖B index
+                // the [P, NULL-O] payload sits at pair_pk + p_pk. Map EVERY combined
+                // column (canonical [A, B] index) to its slot, canonicalizing P=B, so
+                // the branch is full width `[pair-PK, A, B]` — the layout the post-union
+                // WHERE and the final user projection both read.
+                let nf_full_projection: Vec<usize> = (0..left_n + right_n)
+                    .map(|ci| {
                         if preserved_is_left {
                             pair_pk + pa + ci // [A, B] contiguous after pair-PK + a.pk
                         } else if ci < left_n {
@@ -1086,12 +1205,21 @@ fn emit_range_join(
                         }
                     })
                     .collect();
-                cb.map(nf_rekey, &nf_projection)
+                cb.map(nf_rekey, &nf_full_projection)
             };
 
-        if n_eq == 0 {
-            let zero_a = vec![0u8; pa];
-            // ── Pure-range threshold SUBTRACTION form (plan §1–§3, §6) ──────────
+        // Full-width inner pairs `[pair-PK, A, B]` — drop the per-term `_join_pk`
+        // slots (they DIFFER per term and must never survive the union). Fresh and
+        // single-consumer, so it seeds the union accumulator on the non-destructive
+        // PORT_IN_B and each fresh null-fill branch rides PORT_IN_A.
+        let inner_full = cb.map(
+            rekey,
+            &(payload_offset..payload_offset + left_n + right_n).collect::<Vec<_>>(),
+        );
+
+        let zero_a = vec![0u8; pa];
+        let unioned = if n_eq == 0 {
+            // ── Pure-range threshold SUBTRACTION form ───────────────────────────
             // Unmatched left rows are `A − matched`, where `matched = {a : a.x OP m}`
             // against the ONE-ROW threshold `m = MAX/MIN(b.range_col)`. Subtracting
             // (rather than emitting the complement directly) makes an empty
@@ -1136,7 +1264,7 @@ fn emit_range_join(
                 nf_match
             };
             let branch = nf_tail(&mut cb, nf_keyed, true);
-            cb.union(projected, branch)
+            cb.union(branch, inner_full)
         } else {
             // ── Band (n_eq ≥ 1): ν_A (preserves_left) and/or ν_B (preserves_right). ──
             // ν_P = positive_part(P − π_P(inner)): the matched preserved rows are read
@@ -1148,9 +1276,8 @@ fn emit_range_join(
             // `merged` THEN a project of the P region (P's PK cols are its slice of
             // `pair_pk_cols`). All nodes are co-located on the eq-prefix worker (the
             // source PK is unique → never spans workers).
-            let zero_a = vec![0u8; pa];
             let zero_b = vec![0u8; pb];
-            let mut sink = projected;
+            let mut acc = inner_full;
             if join_type.preserves_left() {
                 let rekey_a = cb.map_reindex(
                     merged,
@@ -1167,7 +1294,7 @@ fn emit_range_join(
                 );
                 let nu_a = cb.positive_diff(a_all, proj_a); // max(0, A − π_A(inner)), keyed [a.pk, A]
                 let branch = nf_tail(&mut cb, nu_a, true);
-                sink = cb.union(sink, branch);
+                acc = cb.union(branch, acc);
             }
             if join_type.preserves_right() {
                 let rekey_b = cb.map_reindex(
@@ -1188,9 +1315,41 @@ fn emit_range_join(
                 );
                 let nu_b = cb.positive_diff(b_all, proj_b); // max(0, B − π_B(inner)), keyed [b.pk, B]
                 let branch = nf_tail(&mut cb, nu_b, false);
-                sink = cb.union(sink, branch);
+                acc = cb.union(branch, acc);
             }
-            sink
+            acc
+        };
+
+        // One linear 3VL WHERE filter over the full-width post-null-fill union, bound
+        // against the combined schema `[pair-PK, A, B]` (which carries each column's
+        // outer-adjusted nullability, so a null-filled column failing the predicate
+        // drops its row and `IS NULL` keeps unmatched rows). No source is non-empty
+        // for INNER (handled above), so this is the single WHERE home for OUTER.
+        let filtered = if where_filter.is_empty() {
+            unioned
+        } else {
+            let combined_cols: Vec<ColumnDef> = pair_pk_coldefs
+                .iter()
+                .cloned()
+                .chain(combined_payload.iter().cloned())
+                .collect();
+            let combined_schema = Schema {
+                columns: combined_cols,
+                pk_cols: (0..pair_pk).collect(),
+            };
+            let prog = build_residual_filter_prog(where_filter, alias_map, &combined_schema, pair_pk)?;
+            cb.filter(unioned, Some(prog))
+        };
+
+        // User projection over the full-width `[pair-PK, A, B]` layout
+        // (`final_projection` was built with `user_offset = pair_pk`); identity —
+        // e.g. `SELECT *` — skips the map, mirroring the equi path.
+        let is_identity = final_projection.len() == left_n + right_n
+            && final_projection.iter().enumerate().all(|(i, &p)| p == i + pair_pk);
+        if is_identity {
+            filtered
+        } else {
+            cb.map(filtered, &final_projection)
         }
     };
 
@@ -1326,9 +1485,10 @@ pub(crate) fn build_pure_range_threshold(
 ///   - `leading_cols`: the synthesized PK columns, cloned verbatim into the output
 ///     schema (`_join_pk` slots for equi, `_pair_pk` slots for range).
 ///   - `coldef(i)`: maps a combined A‖B column index (`0..n_combined`) to its
-///     output `ColumnDef` (equi reads the pre-built, LEFT-join-nullable-adjusted
-///     list; range reads the raw source schemas — INNER only).
-///   - `payload_offset`: the union-column index of combined column 0.
+///     output `ColumnDef` (equi and range read the outer-nullability-adjusted
+///     `combined_payload_coldefs` list; EXISTS reads the outer schema).
+///   - `payload_offset`: the union-column index of combined column 0 in the
+///     layout the caller's final `Map` reads.
 ///
 /// A lone `SELECT *` flows through the `Wildcard` arm, so no caller needs a
 /// separate wildcard fast path. `label` names the view kind in error messages.

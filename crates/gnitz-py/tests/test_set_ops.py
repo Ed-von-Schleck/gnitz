@@ -399,13 +399,9 @@ class TestSetOps:
             )
             rejects("CREATE VIEW v AS SELECT a FROM t SORT BY a", "SORT BY is not supported")
 
-            # --- a top-level WHERE on a JOIN is consumed, not dropped (INNER: folded into the
-            #     residual; OUTER equi: a post-null-fill filter). Only a WHERE over an OUTER
-            #     *range/band* join remains unsupported, so it is rejected, not silently dropped ---
-            rejects(
-                "CREATE VIEW v AS SELECT t.a FROM t LEFT JOIN u ON t.a < u.c WHERE t.a > 5",
-                "range/band OUTER join",
-            )
+            # (A top-level WHERE on any JOIN — INNER, OUTER equi, or OUTER range/band — is
+            #  consumed inside the join circuit, never dropped; the OUTER range/band form is a
+            #  positive control below, no longer rejected.)
 
             # --- GROUP BY ALL must be classified, never routed to the simple path and dropped ---
             rejects("CREATE VIEW v AS SELECT a FROM t GROUP BY ALL", "GROUP BY")
@@ -431,6 +427,8 @@ class TestSetOps:
                 "vgroup": "SELECT a, COUNT(*) FROM t GROUP BY a",
                 "vjoin": "SELECT t.a, u.c FROM t JOIN u ON t.pk = u.pk",
                 "vsetop": "SELECT a FROM t UNION ALL SELECT b FROM t",
+                # OUTER range/band + WHERE now compiles (post-null-fill 3VL filter).
+                "vrangeleft": "SELECT t.a FROM t LEFT JOIN u ON t.a < u.c WHERE t.a > 5",
             }
             for name, body in ok.items():
                 client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=sn)
