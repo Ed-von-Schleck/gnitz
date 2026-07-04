@@ -1497,6 +1497,223 @@ class TestReducePathRegressions:
             client.drop_schema(sn)
 
 
+class TestHavingIsNullCompleteness:
+    """HAVING IS [NOT] NULL over the grouped relation for direct aggregates
+    (MIN/MAX/COUNT/non-nullable SUM) and group columns. Direct aggregates read the
+    value column's raw null bit; group columns const-fold when non-nullable (every
+    PK-region key) or read their payload null bit on the synthetic path. Complements
+    the companion-gated nullable-SUM/AVG HAVING tests in TestGroupBy."""
+
+    def test_having_min_is_null_direct_aggregate(self, client):
+        """HAVING MIN(v) IS [NOT] NULL reads the value column's raw null bit: an
+        all-NULL group renders MIN=NULL. Membership updates incrementally as a
+        group flips to all-NULL by retraction — weights verified."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_null AS SELECT k, MIN(v) AS mn FROM t GROUP BY k HAVING MIN(v) IS NULL",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_notnull AS SELECT k, MIN(v) AS mn FROM t GROUP BY k HAVING MIN(v) IS NOT NULL",
+                schema_name=sn,
+            )
+            vid_null = client.resolve_table(sn, "v_null")[0]
+            vid_notnull = client.resolve_table(sn, "v_notnull")[0]
+
+            def groups(vid):
+                return {r["k"]: r.weight for r in client.scan(vid) if r.weight > 0}
+
+            # k=10: {5, NULL} → MIN=5; k=20: {NULL} → MIN=NULL.
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL), (3, 20, NULL)",
+                schema_name=sn,
+            )
+            assert groups(vid_null) == {20: 1}, "IS NULL admits only the all-NULL group k=20"
+            assert groups(vid_notnull) == {10: 1}, "IS NOT NULL admits only k=10 (MIN=5)"
+
+            # Retract k=10's only non-NULL contributor → MIN(k=10) becomes NULL.
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            assert groups(vid_null) == {10: 1, 20: 1}, "k=10 enters IS NULL once its MIN → NULL"
+            assert groups(vid_notnull) == {}, "no group has a non-NULL MIN now"
+
+            client.execute_sql("DROP VIEW v_null", schema_name=sn)
+            client.execute_sql("DROP VIEW v_notnull", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_count_star_is_not_null_const_folds(self, client):
+        """COUNT(*) never renders NULL, so HAVING COUNT(*) IS NOT NULL const-folds
+        to true (every surviving group passes) and IS NULL to false (none)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_pass AS SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING COUNT(*) IS NOT NULL",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_none AS SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING COUNT(*) IS NULL",
+                schema_name=sn,
+            )
+            vid_pass = client.resolve_table(sn, "v_pass")[0]
+            vid_none = client.resolve_table(sn, "v_none")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 20)", schema_name=sn)
+            assert {r["k"]: r.weight for r in client.scan(vid_pass) if r.weight > 0} == {10: 1, 20: 1}
+            assert [r for r in client.scan(vid_none) if r.weight > 0] == [], "IS NULL admits no group"
+            client.execute_sql("DROP VIEW v_pass", schema_name=sn)
+            client.execute_sql("DROP VIEW v_none", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_nullable_group_col_is_null(self, client):
+        """HAVING on a nullable GROUP BY column (synthetic-PK path) reads the payload
+        null bit: IS NULL admits the single NULL-key group, IS NOT NULL admits the
+        rest (including the distinct integer-zero group)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_null AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING g IS NULL",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_notnull AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING g IS NOT NULL",
+                schema_name=sn,
+            )
+            vid_null = client.resolve_table(sn, "v_null")[0]
+            vid_notnull = client.resolve_table(sn, "v_notnull")[0]
+            # Two NULL-key rows, one g=0, one g=7.
+            client.execute_sql("INSERT INTO t VALUES (1, NULL), (2, NULL), (3, 0), (4, 7)", schema_name=sn)
+            null_rows = [r for r in client.scan(vid_null) if r.weight > 0]
+            assert len(null_rows) == 1, "IS NULL admits exactly the NULL-key group"
+            assert null_rows[0]["g"] is None and null_rows[0]["c"] == 2 and null_rows[0].weight == 1
+            nn = {r["g"]: (r["c"], r.weight) for r in client.scan(vid_notnull) if r.weight > 0}
+            assert nn == {0: (1, 1), 7: (1, 1)}, "IS NOT NULL admits g=0 and g=7 (NULL != 0)"
+            client.execute_sql("DROP VIEW v_null", schema_name=sn)
+            client.execute_sql("DROP VIEW v_notnull", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_natural_pk_group_col_const_folds(self, client):
+        """HAVING on a natural-PK group column const-folds (PK columns are
+        non-nullable), for both a single-column PK (group_set_eq_pk) and a compound
+        PK. Emitting EXPR_IS_NULL against the PK region would trip eval_is_null's
+        debug assertion — running against the debug server exercises that guard.
+        IS NOT NULL passes every group; IS NULL passes none."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            # Single-column PK: GROUP BY pk hits group_set_eq_pk.
+            client.execute_sql(
+                "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW s_pass AS SELECT pk, COUNT(*) AS c FROM t1 GROUP BY pk HAVING pk IS NOT NULL",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW s_none AS SELECT pk, COUNT(*) AS c FROM t1 GROUP BY pk HAVING pk IS NULL",
+                schema_name=sn,
+            )
+            # Compound PK: GROUP BY a, b hits the compound group_set_eq_pk path.
+            client.execute_sql(
+                "CREATE TABLE t2 (a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (a, b))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW c_pass AS SELECT a, b, COUNT(*) AS c FROM t2 GROUP BY a, b HAVING a IS NOT NULL",
+                schema_name=sn,
+            )
+            s_pass = client.resolve_table(sn, "s_pass")[0]
+            s_none = client.resolve_table(sn, "s_none")[0]
+            c_pass = client.resolve_table(sn, "c_pass")[0]
+
+            client.execute_sql("INSERT INTO t1 VALUES (1, 100), (2, 200)", schema_name=sn)
+            client.execute_sql("INSERT INTO t2 VALUES (5, 6), (5, 7)", schema_name=sn)
+
+            assert {r["pk"]: r.weight for r in client.scan(s_pass) if r.weight > 0} == {1: 1, 2: 1}
+            assert [r for r in client.scan(s_none) if r.weight > 0] == [], "IS NULL on a PK admits nothing"
+            got = {(r["a"], r["b"]): r.weight for r in client.scan(c_pass) if r.weight > 0}
+            assert got == {(5, 6): 1, (5, 7): 1}, "compound-PK group col IS NOT NULL passes all"
+
+            for v in ("s_pass", "s_none", "c_pass"):
+                client.execute_sql(f"DROP VIEW {v}", schema_name=sn)
+            client.execute_sql("DROP TABLE t1", schema_name=sn)
+            client.execute_sql("DROP TABLE t2", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_qualified_aggregate_column(self, client):
+        """HAVING MIN(t.v) — a qualified aggregate argument — binds the same column
+        as SELECT MIN(t.v), in both the IS [NOT] NULL and the value positions."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_notnull AS SELECT k FROM t GROUP BY k HAVING MIN(t.v) IS NOT NULL",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_gt AS SELECT k FROM t GROUP BY k HAVING MIN(t.v) > 3",
+                schema_name=sn,
+            )
+            vid_notnull = client.resolve_table(sn, "v_notnull")[0]
+            vid_gt = client.resolve_table(sn, "v_gt")[0]
+            # k=10: MIN=5 (not null, >3); k=20: MIN=NULL; k=30: MIN=2 (not null, not >3).
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 10, 5), (2, 20, NULL), (3, 30, 2)",
+                schema_name=sn,
+            )
+            assert {r["k"] for r in client.scan(vid_notnull) if r.weight > 0} == {10, 30}
+            assert {r["k"] for r in client.scan(vid_gt) if r.weight > 0} == {10}
+            client.execute_sql("DROP VIEW v_notnull", schema_name=sn)
+            client.execute_sql("DROP VIEW v_gt", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_having_null_test_on_expression_rejected(self, client):
+        """IS [NOT] NULL in HAVING is only for an aggregate or a group column; an
+        arithmetic expression is rejected (not silently treated as a column)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            with pytest.raises(gnitz.GnitzError, match="aggregate or a group column"):
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT a FROM t GROUP BY a HAVING (a + b) IS NULL",
+                    schema_name=sn,
+                )
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+
 class TestGroupByKeyCorrectness:
     """GROUP BY key correctness: float keys rejected (Fix A), the group identity
     is a true 128-bit hash (Fix B), and BLOB grouping keys work end-to-end (Fix

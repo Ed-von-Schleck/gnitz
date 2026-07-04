@@ -116,6 +116,28 @@ fn client_gateway_rejects_invalid_index_name() {
 }
 
 #[test]
+fn drop_index_reserved_name_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+    // A reserved leading-`_` index name is rejected planner-side, before any round-trip.
+    let e_reserved = try_exec(&mut client, &sn, "DROP INDEX \"__invalid\"").unwrap_err();
+    assert!(
+        matches!(e_reserved, GnitzSqlError::Plan(_)),
+        "reserved-prefix DROP INDEX name must be a Plan error, got {e_reserved:?}"
+    );
+    // The `__fk_` infix — reserved for FK-backing index names — is rejected too.
+    let e_fk = try_exec(&mut client, &sn, "DROP INDEX \"x__fk_y\"").unwrap_err();
+    assert!(
+        matches!(e_fk, GnitzSqlError::Plan(_)),
+        "reserved `__fk_` infix in DROP INDEX must be a Plan error, got {e_fk:?}"
+    );
+}
+
+#[test]
 fn same_columns_named_index_coexists() {
     let srv = match ServerHandle::start() {
         Some(s) => s,

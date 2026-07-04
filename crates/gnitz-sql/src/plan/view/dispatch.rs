@@ -377,7 +377,7 @@ fn inline_ctes(
         if is_compilable_hidden_body(cte_select) {
             // A later CTE may reference an earlier one, so register immediately.
             let resolved = compile_hidden_body(client, binder, cte_select, &cte.alias.columns, &ctx, chain)?;
-            binder.cache_alias(&cte.alias.name.value, resolved);
+            binder.cache_alias(&cte.alias.name.value, resolved)?;
         } else {
             inline_passthrough_cte(client, cte, cte_select, binder, &ctx, chain)?;
         }
@@ -434,7 +434,7 @@ fn inline_passthrough_cte(
             }));
     if !proj_is_identity {
         let resolved = compile_hidden_body(client, binder, cte_select, &cte.alias.columns, ctx, chain)?;
-        binder.cache_alias(&cte.alias.name.value, resolved);
+        binder.cache_alias(&cte.alias.name.value, resolved)?;
         return Ok(());
     }
     // Apply CTE column aliases (`WITH cte(a, b) AS ...`).
@@ -445,7 +445,7 @@ fn inline_passthrough_cte(
     } else {
         cte_schema
     };
-    binder.cache_alias(&cte.alias.name.value, (cte_tid, cte_schema));
+    binder.cache_alias(&cte.alias.name.value, (cte_tid, cte_schema))?;
     Ok(())
 }
 
@@ -601,7 +601,7 @@ fn compile_derived_tables(
     }
     // The final body resolves every sibling; a sibling alias shadows a same-named CTE.
     for (name, resolved) in deferred {
-        binder.cache_alias(&name, resolved);
+        binder.cache_alias(&name, resolved)?;
     }
     Ok(())
 }

@@ -6,7 +6,7 @@
 
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
-use crate::lower::{compile_bound_expr, compile_bound_expr_to_program};
+use crate::lower::{compile_bound_expr, compile_filter_program};
 use crate::plan::lp::Rel;
 use crate::plan::view::EmitPieces;
 use gnitz_core::{CircuitBuilder, ExprBuilder};
@@ -39,11 +39,12 @@ pub(crate) fn emit_linear(view_id: u64, rel: Rel) -> Result<EmitPieces, GnitzSql
         unreachable!("a lowered linear view terminates in one Source");
     };
 
-    // Filter program (if any), compiled against the source schema.
-    let expr_prog = filter
-        .as_ref()
-        .map(|pred| compile_bound_expr_to_program(pred, &source_schema))
-        .transpose()?;
+    // Filter program (if any), compiled against the source schema. A predicate
+    // that bound to a true constant compiles to no filter at all.
+    let expr_prog = match &filter {
+        Some(pred) => compile_filter_program(pred, &source_schema)?,
+        None => None,
+    };
 
     // Slots 0..k are the view's physical PK (carried verbatim by commit_row). A
     // payload slot (>= k) that is a PK PassThrough is a duplicate PK value; a

@@ -4,12 +4,10 @@
 //! `Having` leaf binder over the grouped relation).
 
 use crate::ast_util::{expr_operands, single_relation_col_name};
-use crate::bind::{
-    bind_single_table, bind_structural, find_unique_column, reject_unsupported_agg_qualifiers, LeafBinder,
-};
+use crate::bind::{bind_single_table, bind_structural, find_unique_column, fold_null_test, LeafBinder, SingleTable};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BinOp, BoundExpr};
-use crate::lower::compile_bound_expr_to_program;
+use crate::lower::compile_filter_program;
 use crate::plan::validate::{
     reject_duplicate_column_names, reject_float_key, reject_unhonored_select_clauses, HonoredClauses,
 };
@@ -19,7 +17,7 @@ use gnitz_core::{
     CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, Schema, TypeCode, AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX,
     AGG_MIN, AGG_SUM, AGG_SUM_ZERO,
 };
-use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, SelectItem};
+use sqlparser::ast::{Expr, GroupByExpr, SelectItem};
 
 /// Tracks how a user-level aggregate maps to reduce agg_specs.
 struct AggMapping {
@@ -27,6 +25,12 @@ struct AggMapping {
     shape: AggShape,
     output_name: String,
     output_type: TypeCode,
+    /// Whether the output column can be NULL at runtime, computed once at
+    /// construction (`append_agg_mapping`) and read by both the SELECT
+    /// projection's output schema and the HAVING `IS [NOT] NULL` const-fold, so
+    /// the two cannot drift. Companion shapes are blanket-nullable; `Direct` is
+    /// the exact structural fact (`direct_agg_nullable`).
+    output_nullable: bool,
     agg_func: AggFunc,
     arg_col: Option<usize>,
 }
@@ -96,6 +100,31 @@ fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Schema) -> Ty
             Some(c) => schema.columns[c].type_code, // preserve the source type (incl. U64)
             None => TypeCode::I64,
         },
+    }
+}
+
+/// Whether an `AggShape::Direct` aggregate's output column can be NULL at
+/// runtime, given the query shape. Computed once per aggregate at mapping
+/// construction (`AggMapping::output_nullable`); everything downstream reads
+/// the stored field.
+///
+/// A **global** (empty group set) aggregate seeds a ground row that renders
+/// SUM/MIN/MAX/AVG as NULL over an empty source, so it is always nullable. A
+/// **grouped** aggregate never renders NULL from emptiness (an emptied group is
+/// retracted, not null-filled), so on a surviving group:
+/// * COUNT / COUNT_NON_NULL are always a concrete integer (`empty_renders_zero`);
+/// * a Direct SUM is only reached for a non-nullable source (a nullable source
+///   routes to `NullfillSum`), so it always has a value;
+/// * MIN / MAX render NULL only for an all-NULL group, i.e. a nullable source.
+///
+/// Mirrors `emit.rs`'s null-bit rule (`is_untouched() && !empty_renders_zero()`).
+/// AVG is never `Direct` (it always carries a COUNT_NON_NULL companion).
+fn direct_agg_nullable(agg_func: AggFunc, arg_col: Option<usize>, is_global: bool, schema: &Schema) -> bool {
+    match agg_func {
+        AggFunc::Count | AggFunc::CountNonNull => false,
+        AggFunc::Sum => is_global,
+        AggFunc::Min | AggFunc::Max => is_global || schema.columns[arg_col.unwrap()].is_nullable,
+        AggFunc::Avg => unreachable!("AVG is never AggShape::Direct"),
     }
 }
 
@@ -207,6 +236,15 @@ pub(crate) fn emit_group_by_pieces(
         }
     }
 
+    // An empty group set is the user's ungrouped (global) scalar aggregate —
+    // `SELECT MIN(x) FROM t` with no GROUP BY. It compiles as a one-row reduce
+    // (synthetic `_group_pk` at the constant V₀) that must emit exactly one row
+    // even over an empty/fully-retracted source, so the engine seeds a ground row
+    // (COUNT=0, SUM/MIN/MAX/AVG=NULL) — which is also why a global aggregate's
+    // output is always nullable. Grouped reduces (`group_col_indices` non-empty)
+    // pass `false` and are byte-for-byte unchanged.
+    let global_ground = group_col_indices.is_empty();
+
     // 3. Analyze SELECT items → group cols + aggregates
     let mut agg_mappings: Vec<AggMapping> = Vec::new();
     let mut select_items: Vec<GroupBySelectItem> = Vec::new();
@@ -239,21 +277,8 @@ pub(crate) fn emit_group_by_pieces(
                 });
             }
             BoundExpr::AggCall { func, arg } => {
-                let src_col = match arg {
-                    Some(a) => match a.as_ref() {
-                        BoundExpr::ColRef(c) => Some(*c),
-                        _ => {
-                            return Err(GnitzSqlError::Unsupported(
-                                "aggregate on computed expression not supported".to_string(),
-                            ))
-                        }
-                    },
-                    None => None,
-                };
-                let out_type = agg_result_type(*func, src_col, &source_schema);
+                let src_col = agg_arg_col(arg.as_deref())?;
                 let agg_idx = agg_mappings.len();
-                let start = agg_specs.len();
-                let shape = push_agg_specs(*func, src_col, &source_schema, &mut agg_specs)?;
                 let out_name = alias.unwrap_or_else(|| {
                     let prefix = match func {
                         AggFunc::Count | AggFunc::CountNonNull => "_count",
@@ -264,14 +289,15 @@ pub(crate) fn emit_group_by_pieces(
                     };
                     format!("{prefix}{idx}")
                 });
-                agg_mappings.push(AggMapping {
-                    specs_start: start,
-                    shape,
-                    output_name: out_name,
-                    output_type: out_type,
-                    agg_func: *func,
-                    arg_col: src_col,
-                });
+                append_agg_mapping(
+                    *func,
+                    src_col,
+                    out_name,
+                    global_ground,
+                    &source_schema,
+                    &mut agg_specs,
+                    &mut agg_mappings,
+                )?;
                 select_items.push(GroupBySelectItem::Aggregate { agg_idx });
             }
             _ => {
@@ -287,7 +313,13 @@ pub(crate) fn emit_group_by_pieces(
     //     agg_spec and a reduce-output column even when the SELECT list omits
     //     it. Done before reduce_schema is built so the new columns are included.
     if let Some(having_expr) = &select.having {
-        collect_having_aggs(having_expr, &source_schema, &mut agg_specs, &mut agg_mappings)?;
+        collect_having_aggs(
+            having_expr,
+            global_ground,
+            &source_schema,
+            &mut agg_specs,
+            &mut agg_mappings,
+        )?;
     }
 
     // 3c. Every grouped or global scalar reduce gates group existence on a
@@ -370,10 +402,13 @@ pub(crate) fn emit_group_by_pieces(
     let mut cb = CircuitBuilder::new(view_id, source_tid);
     let inp = cb.input_delta();
 
-    // Optional WHERE filter
+    // Optional WHERE filter (elided when the predicate bound to a true constant).
     let filtered = if let Some(where_expr) = &select.selection {
         let bound = bind_single_table(where_expr, &source_schema)?;
-        cb.filter(inp, Some(compile_bound_expr_to_program(&bound, &source_schema)?))
+        match compile_filter_program(&bound, &source_schema)? {
+            Some(p) => cb.filter(inp, Some(p)),
+            None => inp,
+        }
     } else {
         inp
     };
@@ -403,13 +438,6 @@ pub(crate) fn emit_group_by_pieces(
     // The circuit builder needs only (op, col) per spec; out_type is the
     // planner's concern and already shaped reduce_schema above.
     let circuit_specs: Vec<(u64, usize)> = agg_specs.iter().map(|s| (s.op, s.col)).collect();
-    // An empty group set is the user's ungrouped (global) scalar aggregate —
-    // `SELECT MIN(x) FROM t` with no GROUP BY. It compiles as a one-row reduce
-    // (synthetic `_group_pk` at the constant V₀) that must emit exactly one row
-    // even over an empty/fully-retracted source, so the engine seeds a ground row
-    // (COUNT=0, SUM/MIN/MAX/AVG=NULL). Grouped reduces (`group_col_indices`
-    // non-empty) pass `false` and are byte-for-byte unchanged.
-    let global_ground = group_col_indices.is_empty();
     // Two-phase (distributable) path for an all-linear, integer, partitioned GLOBAL
     // aggregate: fold a per-worker partial locally (no exchange), then exchange only
     // the ≤ N partials to V₀'s owner and combine them. A linear aggregate satisfies
@@ -549,12 +577,10 @@ pub(crate) fn emit_group_by_pieces(
                         let cnt_reg = post_map_eb.load_col_int(cnt_col);
                         let cnt_f = post_map_eb.int_to_float(cnt_reg);
                         let avg_reg = post_map_eb.float_div(sum_f, cnt_f);
-                        post_map_eb.emit_col(avg_reg, payload_idx);
                         // AVG of an empty / all-NULL group is NULL (COUNT_NON_NULL=0
-                        // → float_div by zero marks the result NULL), so the column
-                        // must be nullable to match what the circuit can emit.
-                        out_cols.push(ColumnDef::new(m.output_name.clone(), TypeCode::F64, true));
-                        payload_idx += 1;
+                        // → float_div by zero marks the result NULL), hence the
+                        // blanket-nullable output.
+                        post_map_eb.emit_col(avg_reg, payload_idx);
                     }
                     AggShape::NullfillSum => {
                         // Nullable-source SUM: the raw SUM column's null bit is the
@@ -580,30 +606,26 @@ pub(crate) fn emit_group_by_pieces(
                             let sum_reg = post_map_eb.load_col_int(sum_col);
                             post_map_eb.div(sum_reg, gate)
                         };
-                        post_map_eb.emit_col(gated, payload_idx);
                         // A surviving group whose non-null count is zero yields
-                        // NULL (div-by-zero), so the column must be nullable.
-                        out_cols.push(ColumnDef::new(m.output_name.clone(), m.output_type, true));
-                        payload_idx += 1;
+                        // NULL (div-by-zero), hence the blanket-nullable output.
+                        post_map_eb.emit_col(gated, payload_idx);
                     }
                     AggShape::Direct => {
-                        // Direct aggregate: single spec copied straight through.
+                        // Direct aggregate: single spec copied straight through,
+                        // raw null bit included (set by emit.rs only for an
+                        // all-NULL MIN/MAX group or a global ground row).
                         let tc = reduce_schema.columns[sum_col].type_code;
                         post_map_eb.copy_col(tc as u32, sum_col as u32, payload_idx);
-                        // SUM/MIN/MAX emit NULL for an all-NULL group (emit.rs sets
-                        // the null bit when the accumulator is_untouched() and not
-                        // empty_renders_zero(), since they skip NULL inputs).
-                        // COUNT/COUNT_NON_NULL always return an integer (0, never
-                        // NULL — empty_renders_zero()). Match emit.rs so a
-                        // schema-driven decoder reads NULL instead of raw zero bytes.
-                        out_cols.push(ColumnDef::new(
-                            m.output_name.clone(),
-                            m.output_type,
-                            matches!(m.agg_func, AggFunc::Sum | AggFunc::Min | AggFunc::Max),
-                        ));
-                        payload_idx += 1;
                     }
                 }
+                // The declared nullability was fixed at mapping construction
+                // (`AggMapping::output_nullable`) to exactly what the emission
+                // above can render, so a schema-driven decoder never reads raw
+                // zero bytes as a live value (or, for COUNT, a forbidden NULL) —
+                // and a grouped SUM/MIN/MAX over a non-nullable source is NOT
+                // NULL, letting downstream comparators skip null tracking.
+                out_cols.push(ColumnDef::new(m.output_name.clone(), m.output_type, m.output_nullable));
+                payload_idx += 1;
             }
         }
     }
@@ -629,7 +651,12 @@ pub(crate) fn emit_group_by_pieces(
                 agg_col_offset,
             },
         )?;
-        cb.filter(reduced, Some(compile_bound_expr_to_program(&bound, &reduce_schema)?))
+        // A HAVING that bound to a true constant (e.g. `IS NOT NULL` on a shape
+        // that can never be NULL) compiles to no filter operator at all.
+        match compile_filter_program(&bound, &reduce_schema)? {
+            Some(p) => cb.filter(reduced, Some(p)),
+            None => reduced,
+        }
     } else {
         reduced
     };
@@ -652,35 +679,34 @@ pub(crate) fn emit_group_by_pieces(
     Ok((circuit, out_cols, view_pk))
 }
 
+/// The physical source column of a bound aggregate argument: `None` for
+/// COUNT(*), the column index for a plain (possibly qualified) reference. A
+/// computed argument (`SUM(a + b)`) is rejected — the engine aggregates a
+/// physical column.
+fn agg_arg_col(arg: Option<&BoundExpr>) -> Result<Option<usize>, GnitzSqlError> {
+    match arg {
+        None => Ok(None),
+        Some(BoundExpr::ColRef(c)) => Ok(Some(*c)),
+        Some(_) => Err(GnitzSqlError::Unsupported(
+            "aggregate on computed expression not supported".to_string(),
+        )),
+    }
+}
+
 /// Resolve a HAVING function call to its aggregate function selector + argument
 /// column, shared by collection and binding so both agree on what an aggregate
-/// reference means.
+/// reference means. Routed through the same leaf binder as a SELECT-list
+/// aggregate (`SingleTable::bind_function`), so the two surfaces share one
+/// definition of a supported aggregate call — name set, qualifier rejection,
+/// COUNT(*) vs COUNT(col), qualified arguments, and MIN/MAX orderability.
 fn having_agg_func(
     func: &sqlparser::ast::Function,
     source_schema: &Schema,
 ) -> Result<(AggFunc, Option<usize>), GnitzSqlError> {
-    reject_unsupported_agg_qualifiers(func)?;
-    let name = func.name.to_string().to_ascii_lowercase();
-    let arg_col = extract_func_arg_col(func, source_schema)?;
-    let agg_func = match name.as_str() {
-        "count" => {
-            if arg_col.is_none() {
-                AggFunc::Count
-            } else {
-                AggFunc::CountNonNull
-            }
-        }
-        "sum" => AggFunc::Sum,
-        "min" => AggFunc::Min,
-        "max" => AggFunc::Max,
-        "avg" => AggFunc::Avg,
-        _ => {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "HAVING: function '{name}' not supported"
-            )))
-        }
-    };
-    Ok((agg_func, arg_col))
+    match (SingleTable { schema: source_schema }).bind_function(func)? {
+        BoundExpr::AggCall { func, arg } => Ok((func, agg_arg_col(arg.as_deref())?)),
+        other => unreachable!("SingleTable::bind_function only binds aggregate calls, got {other:?}"),
+    }
 }
 
 /// True iff `m` is the reduce mapping for the aggregate `(agg_func, arg_col)`.
@@ -721,9 +747,9 @@ fn push_agg_specs(
         )));
     }
     // Reject argument column types the engine cannot evaluate. Single validated
-    // gate for both the SELECT-list and HAVING-only (`append_having_agg`) callers.
-    // SELECT-list MIN/MAX is also rejected earlier by the leaf binder, so only the
-    // HAVING-only path reaches the MIN/MAX arm here.
+    // gate for both the SELECT-list and HAVING callers. Both bind their aggregate
+    // call through the leaf binder, which already rejects unorderable MIN/MAX —
+    // that arm here is the backstop; the SUM/AVG arm is the sole gate.
     if let Some(c) = arg_col {
         let tc = schema.columns[c].type_code;
         match agg_func {
@@ -799,26 +825,37 @@ fn push_agg_specs(
     })
 }
 
-/// Push the agg_specs + AggMapping for one HAVING-only aggregate (one absent
-/// from the SELECT list). Reuses `push_agg_specs` so the reduce-output column
-/// positions line up with the SELECT projection. The mapping is found later by
-/// `agg_mapping_matches`.
-fn append_having_agg(
+/// Push the agg_specs + `AggMapping` for one aggregate — the single
+/// construction site, shared by the SELECT projection and the HAVING-only
+/// materialisation (`collect_having_aggs`) so the reduce-output column
+/// positions and the output nullability cannot drift between the two. Reuses
+/// `push_agg_specs` (the spec-layout authority); `is_global` is whether the
+/// group set is empty (a global aggregate's ground row renders NULL).
+fn append_agg_mapping(
     agg_func: AggFunc,
     arg_col: Option<usize>,
+    output_name: String,
+    is_global: bool,
     source_schema: &Schema,
     agg_specs: &mut Vec<AggSpec>,
     agg_mappings: &mut Vec<AggMapping>,
 ) -> Result<(), GnitzSqlError> {
     let out_type = agg_result_type(agg_func, arg_col, source_schema);
-    let agg_idx = agg_mappings.len();
     let start = agg_specs.len();
     let shape = push_agg_specs(agg_func, arg_col, source_schema, agg_specs)?;
+    let output_nullable = match shape {
+        // AVG's and nullable-SUM's null-ness lives in the COUNT_NON_NULL
+        // companion (the finalize renders NULL via div-by-zero), so their
+        // outputs keep the blanket nullable mark.
+        AggShape::Avg | AggShape::NullfillSum => true,
+        AggShape::Direct => direct_agg_nullable(agg_func, arg_col, is_global, source_schema),
+    };
     agg_mappings.push(AggMapping {
         specs_start: start,
         shape,
-        output_name: format!("_having_agg{agg_idx}"),
+        output_name,
         output_type: out_type,
+        output_nullable,
         agg_func,
         arg_col,
     });
@@ -833,6 +870,7 @@ fn append_having_agg(
 /// aggregate that was never materialised and fail `resolve_having_mapping`.
 fn collect_having_aggs(
     expr: &Expr,
+    is_global: bool,
     source_schema: &Schema,
     agg_specs: &mut Vec<AggSpec>,
     agg_mappings: &mut Vec<AggMapping>,
@@ -840,12 +878,21 @@ fn collect_having_aggs(
     if let Expr::Function(func) = expr {
         let (agg_func, arg_col) = having_agg_func(func, source_schema)?;
         if !agg_mappings.iter().any(|m| agg_mapping_matches(m, agg_func, arg_col)) {
-            append_having_agg(agg_func, arg_col, source_schema, agg_specs, agg_mappings)?;
+            let name = format!("_having_agg{}", agg_mappings.len());
+            append_agg_mapping(
+                agg_func,
+                arg_col,
+                name,
+                is_global,
+                source_schema,
+                agg_specs,
+                agg_mappings,
+            )?;
         }
         return Ok(());
     }
     for operand in expr_operands(expr) {
-        collect_having_aggs(operand, source_schema, agg_specs, agg_mappings)?;
+        collect_having_aggs(operand, is_global, source_schema, agg_specs, agg_mappings)?;
     }
     Ok(())
 }
@@ -903,14 +950,15 @@ struct Having<'a> {
     ctx: &'a HavingCtx<'a>,
 }
 
-impl LeafBinder for Having<'_> {
-    fn bind_column(&self, e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
+impl Having<'_> {
+    /// Resolve a group-column name to `(source column, reduce-output position)`,
+    /// enforcing GROUP BY membership. The one name→position pipeline for every
+    /// HAVING group-column reference (value position and null test alike), so
+    /// the two cannot drift on the source-PK-order mapping a permuted
+    /// `group_set_eq_pk` needs (natural-PK grouping puts group cols in the PK
+    /// region; the synthetic path lays them out after the U128 _group_pk).
+    fn resolve_group_col(&self, col_name: &str) -> Result<(usize, usize), GnitzSqlError> {
         let ctx = self.ctx;
-        // HAVING references the grouped relation by source column name. A qualified
-        // ref (`t.g`) resolves the bare name the same way — the qualifier carries no
-        // disambiguating information over a single grouped relation.
-        let col_name = single_relation_col_name(e)
-            .ok_or_else(|| GnitzSqlError::Unsupported(format!("HAVING: unsupported column reference {e:?}")))?;
         let src = find_unique_column(&ctx.source_schema.columns, col_name)?
             .ok_or_else(|| GnitzSqlError::Bind(format!("HAVING: column '{col_name}' not found")))?;
         // HAVING may only reference grouped columns.
@@ -919,9 +967,6 @@ impl LeafBinder for Having<'_> {
                 "HAVING: column '{col_name}' must appear in GROUP BY or an aggregate function"
             )));
         }
-        // Map the name to its reduce-output position (natural-PK grouping puts the
-        // lone group col at the PK index 0; the synthetic path lays group cols out
-        // after the U128 _group_pk).
         let reduce_col = group_col_reduce_pos(
             src,
             ctx.group_set_eq_pk,
@@ -929,6 +974,18 @@ impl LeafBinder for Having<'_> {
             ctx.source_schema,
             ctx.group_col_indices,
         );
+        Ok((src, reduce_col))
+    }
+}
+
+impl LeafBinder for Having<'_> {
+    fn bind_column(&self, e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
+        // HAVING references the grouped relation by source column name. A qualified
+        // ref (`t.g`) resolves the bare name the same way — the qualifier carries no
+        // disambiguating information over a single grouped relation.
+        let col_name = single_relation_col_name(e)
+            .ok_or_else(|| GnitzSqlError::Unsupported(format!("HAVING: unsupported column reference {e:?}")))?;
+        let (_, reduce_col) = self.resolve_group_col(col_name)?;
         Ok(BoundExpr::ColRef(reduce_col))
     }
     fn bind_function(&self, func: &sqlparser::ast::Function) -> Result<BoundExpr, GnitzSqlError> {
@@ -974,58 +1031,52 @@ impl LeafBinder for Having<'_> {
         }
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
-        // Only aggregates whose null-ness is carried by a hidden COUNT_NON_NULL
-        // companion — nullable-source SUM and AVG — are supported: their value
-        // column's raw null bit is unreliable (a linear-fold SUM emits 0, not NULL,
-        // once its last non-null contributor is retracted, and AVG has no single raw
-        // column), so the projected null-ness is `companion == 0`. Binding the test
-        // to `companion {== | !=} 0` keeps HAVING in agreement with the SELECT
-        // projection's gate.
+        // IS [NOT] NULL over the grouped relation. A companion-carrying aggregate
+        // (nullable SUM / AVG) reads the hidden COUNT_NON_NULL companion — its raw
+        // value column's saturating has_value bit is unreliable (a linear-fold SUM
+        // emits 0, not NULL, once its last non-null contributor is retracted, and
+        // AVG has no single raw column). Everything else — a Direct aggregate's
+        // value column or a bare group column — routes through the shared
+        // `fold_null_test` with its authoritative nullability, so a never-null
+        // shape const-folds: the fast-path win of `fold_null_test` (keeps
+        // eval_batch's no_nulls arm), and for a non-nullable group column it also
+        // keeps EXPR_IS_NULL off the PK sentinel (see eval_is_null's assertion).
         match inner {
             Expr::Nested(i) => self.bind_null_test(i, want_null),
             Expr::Function(func) => {
                 let m = resolve_having_mapping(func, self.ctx)?;
+                let val_col = self.ctx.agg_col_offset + m.specs_start;
                 if m.shape.has_count_companion() {
-                    // The companion COUNT_NON_NULL sits at specs_start + 1; the value
-                    // is NULL exactly when that count is 0.
-                    let cnt_col = self.ctx.agg_col_offset + m.specs_start + 1;
+                    // Nullable SUM / AVG: NULL ⇔ COUNT_NON_NULL companion (at
+                    // specs_start + 1) is 0 — the same gate the SELECT
+                    // projection applies.
                     let bop = if want_null { BinOp::Eq } else { BinOp::Ne };
                     Ok(BoundExpr::BinOp(
-                        Box::new(BoundExpr::ColRef(cnt_col)),
+                        Box::new(BoundExpr::ColRef(val_col + 1)),
                         bop,
                         Box::new(BoundExpr::LitInt(0)),
                     ))
                 } else {
-                    Err(GnitzSqlError::Unsupported(format!(
-                        "HAVING: IS [NOT] NULL on {:?} is not supported",
-                        m.agg_func
-                    )))
+                    // Direct aggregate: the value column's raw null bit is
+                    // authoritative, exactly as the SELECT projection reads it.
+                    Ok(fold_null_test(m.output_nullable, val_col, want_null))
                 }
             }
-            _ => Err(GnitzSqlError::Unsupported(
-                "HAVING: IS [NOT] NULL is only supported on nullable SUM/AVG aggregates".to_string(),
-            )),
-        }
-    }
-}
-
-/// Extract the column index from a function argument (for HAVING binding).
-fn extract_func_arg_col(func: &sqlparser::ast::Function, schema: &Schema) -> Result<Option<usize>, GnitzSqlError> {
-    match &func.args {
-        FunctionArguments::List(list) if list.args.len() == 1 => match &list.args[0] {
-            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Ok(None),
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
-                let idx = find_unique_column(&schema.columns, &id.value)?
-                    .ok_or_else(|| GnitzSqlError::Bind(format!("column '{}' not found", id.value)))?;
-                Ok(Some(idx))
+            _ => {
+                // A bare group-column reference.
+                let col_name = single_relation_col_name(inner).ok_or_else(|| {
+                    GnitzSqlError::Unsupported(
+                        "HAVING: IS [NOT] NULL is only supported on an aggregate or a group column".to_string(),
+                    )
+                })?;
+                let (src, reduce_col) = self.resolve_group_col(col_name)?;
+                Ok(fold_null_test(
+                    self.ctx.source_schema.columns[src].is_nullable,
+                    reduce_col,
+                    want_null,
+                ))
             }
-            _ => Err(GnitzSqlError::Unsupported(
-                "HAVING: unsupported function argument".to_string(),
-            )),
-        },
-        _ => Err(GnitzSqlError::Unsupported(
-            "HAVING: function requires one argument".to_string(),
-        )),
+        }
     }
 }
 
@@ -1069,5 +1120,28 @@ mod tests {
         assert!(try_push(AggFunc::Min, Some(1)).is_ok()); // MIN(i64)
         assert!(try_push(AggFunc::Count, None).is_ok()); // COUNT(*)
         assert!(try_push(AggFunc::CountNonNull, Some(2)).is_ok()); // COUNT(blob) — presence only
+    }
+
+    // The Direct-aggregate nullability decision shared by the SELECT projection
+    // (output-schema nullability) and the HAVING `IS [NOT] NULL` const-fold. Col 0
+    // (`pk`, U64) is non-nullable; col 1 (`n`, I64) is nullable.
+    #[test]
+    fn direct_agg_nullable_matches_emit_semantics() {
+        let s = schema();
+        // COUNT / COUNT_NON_NULL: always a concrete integer, grouped or global.
+        assert!(!direct_agg_nullable(AggFunc::Count, None, false, &s));
+        assert!(!direct_agg_nullable(AggFunc::Count, None, true, &s));
+        assert!(!direct_agg_nullable(AggFunc::CountNonNull, Some(1), false, &s));
+        assert!(!direct_agg_nullable(AggFunc::CountNonNull, Some(1), true, &s));
+        // Direct SUM (only reached for a non-nullable source): NULL only globally,
+        // where an empty source seeds a NULL ground row. Grouped never renders NULL.
+        assert!(!direct_agg_nullable(AggFunc::Sum, Some(0), false, &s));
+        assert!(direct_agg_nullable(AggFunc::Sum, Some(0), true, &s));
+        // MIN / MAX: NULL globally (ground row), or grouped over a nullable source
+        // (all-NULL group). Grouped over a non-nullable source never renders NULL.
+        assert!(!direct_agg_nullable(AggFunc::Min, Some(0), false, &s)); // grouped, non-nullable pk
+        assert!(direct_agg_nullable(AggFunc::Min, Some(1), false, &s)); // grouped, nullable n
+        assert!(direct_agg_nullable(AggFunc::Max, Some(0), true, &s)); // global, non-nullable pk
+        assert!(direct_agg_nullable(AggFunc::Max, Some(1), false, &s)); // grouped, nullable n
     }
 }

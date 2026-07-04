@@ -456,7 +456,8 @@ impl LeafBinder for JoinResidual<'_> {
         ))
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
-        Ok(fold_null_test(self.merged, self.idx(inner)?, want_null))
+        let idx = self.idx(inner)?;
+        Ok(fold_null_test(self.merged.columns[idx].is_nullable, idx, want_null))
     }
 }
 

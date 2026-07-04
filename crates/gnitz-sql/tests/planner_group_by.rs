@@ -6,6 +6,16 @@ use gnitz_test_harness::ServerHandle;
 mod common;
 use common::*;
 
+/// The declared nullability of `schema`'s column `name` (case-insensitive).
+fn col_nullable(schema: &gnitz_core::Schema, name: &str) -> bool {
+    schema
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+        .unwrap()
+        .is_nullable
+}
+
 // ── item 42: AVG ignores NULLs and never emits NaN/Infinity ───────
 //
 // The plan's literal scenario (a *zero-count* group reaching `float_div` and
@@ -171,8 +181,9 @@ fn test_sum_avg_u128_rejected() {
 
 // ── C2: HAVING-only aggregates are type-validated (not just SELECT-list) ──
 //
-// An aggregate referenced only by HAVING is materialised via `push_agg_specs`
-// without a leaf-binder pass, so its argument type is validated there too.
+// A HAVING aggregate binds through the same leaf binder as a SELECT-list one
+// (unorderable MIN/MAX rejected there), and its SUM/AVG argument type is
+// validated by `push_agg_specs` when it is materialised.
 
 #[test]
 fn test_having_only_sum_over_u128_rejected() {
@@ -225,9 +236,10 @@ fn test_having_only_min_over_string_rejected() {
     let err = p
         .execute("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING MIN(s) > 'a'")
         .unwrap_err();
+    // The same leaf-binder rejection a SELECT-list MIN(string) gets.
     assert!(
-        matches!(err, GnitzSqlError::Bind(_)),
-        "HAVING-only MIN(string) must be Bind, got {err:?}"
+        matches!(err, GnitzSqlError::Unsupported(_)),
+        "HAVING-only MIN(string) must be Unsupported, got {err:?}"
     );
 }
 
@@ -710,18 +722,66 @@ fn test_aggregate_output_nullability_schema() {
         .unwrap();
     }
     let (_, s) = client.resolve_table_or_view_id(&sn, "agg_v").unwrap();
-    let nullable = |name: &str| {
-        s.columns
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name))
-            .unwrap()
-            .is_nullable
-    };
+    let nullable = |name: &str| col_nullable(&s, name);
     assert!(nullable("sx"), "SUM output must be nullable");
     assert!(nullable("mnx"), "MIN output must be nullable");
     assert!(nullable("mxx"), "MAX output must be nullable");
     assert!(!nullable("cx"), "COUNT(x) output must be non-nullable");
     assert!(!nullable("ca"), "COUNT(*) output must be non-nullable");
+}
+
+// A grouped SUM/MIN/MAX over a NON-nullable source can never render NULL — an
+// emptied group is retracted, not null-filled — so the output column is declared
+// NOT NULL (the exact structural fact, tighter than the blanket nullable mark). A
+// global (no GROUP BY) aggregate keeps its nullability: an empty source seeds a
+// NULL ground row. Complements the nullable-source case above.
+#[test]
+fn test_direct_aggregate_nonnull_source_nullability_schema() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    {
+        let mut p = SqlPlanner::new(&mut client, &sn);
+        p.execute("CREATE TABLE nn_t (id BIGINT PRIMARY KEY, g BIGINT NOT NULL, x BIGINT NOT NULL)")
+            .unwrap();
+        p.execute(
+            "CREATE VIEW nn_grouped AS SELECT g, SUM(x) AS sx, MIN(x) AS mnx, MAX(x) AS mxx, \
+             COUNT(x) AS cx FROM nn_t GROUP BY g",
+        )
+        .unwrap();
+        p.execute("CREATE VIEW nn_global AS SELECT SUM(x) AS sx, MIN(x) AS mnx, MAX(x) AS mxx FROM nn_t")
+            .unwrap();
+    }
+    let (_, sg) = client.resolve_table_or_view_id(&sn, "nn_grouped").unwrap();
+    assert!(
+        !col_nullable(&sg, "sx"),
+        "grouped SUM over a NOT NULL source is NOT NULL"
+    );
+    assert!(
+        !col_nullable(&sg, "mnx"),
+        "grouped MIN over a NOT NULL source is NOT NULL"
+    );
+    assert!(
+        !col_nullable(&sg, "mxx"),
+        "grouped MAX over a NOT NULL source is NOT NULL"
+    );
+    assert!(!col_nullable(&sg, "cx"), "COUNT(x) output is NOT NULL");
+
+    let (_, sgl) = client.resolve_table_or_view_id(&sn, "nn_global").unwrap();
+    assert!(
+        col_nullable(&sgl, "sx"),
+        "global SUM is nullable (empty-source ground row)"
+    );
+    assert!(
+        col_nullable(&sgl, "mnx"),
+        "global MIN is nullable (empty-source ground row)"
+    );
+    assert!(
+        col_nullable(&sgl, "mxx"),
+        "global MAX is nullable (empty-source ground row)"
+    );
 }
 
 #[test]
@@ -780,9 +840,9 @@ fn test_aggregate_all_null_group_emits_null() {
 
 // ── HAVING wildcard aggregate: SUM(*)/MIN(*)/MAX(*)/AVG(*) must error, not panic ──
 //
-// Only COUNT(*) accepts a wildcard. For every other aggregate `having_agg_func`
-// resolves `arg_col = None`, which `push_agg_specs` would `arg_col.unwrap()` —
-// panicking the server process. The guard returns a plan error instead.
+// Only COUNT(*) accepts a wildcard. Every other aggregate rejects it at the
+// leaf binder ("requires exactly one column argument"), and `push_agg_specs`
+// keeps its own wildcard guard so no caller can reach its `arg_col.unwrap()`.
 
 #[test]
 fn having_wildcard_agg_returns_error_not_panic() {

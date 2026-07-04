@@ -240,6 +240,51 @@ fn cte_reference_case_insensitive() {
     );
 }
 
+// ── A CTE / derived-table alias obeys the reserved-prefix rule ───────
+// A user-chosen alias is held to the same rule as a created relation, rejected
+// when the alias is registered (`Binder::cache_alias` — the one gate every alias
+// passes to become resolvable). The bodies are valid, isolating the alias.
+
+#[test]
+fn reserved_prefix_cte_and_derived_alias_rejected() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
+    // A reserved-prefix CTE name is rejected when its alias registers.
+    let e_cte = try_exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v1 AS WITH _cte AS (SELECT id FROM t WHERE id > 0) SELECT id FROM _cte",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e_cte, GnitzSqlError::Plan(_)),
+        "reserved-prefix CTE alias must be a Plan error, got {e_cte:?}"
+    );
+    assert!(
+        client.resolve_table_or_view_id(&sn, "v1").is_err(),
+        "rejected-CTE view must not be registered"
+    );
+    // A reserved-prefix derived-table alias is likewise rejected.
+    let e_derived = try_exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW v2 AS SELECT x FROM (SELECT id AS x FROM t) AS __h0_0",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e_derived, GnitzSqlError::Plan(_)),
+        "reserved-prefix derived-table alias must be a Plan error, got {e_derived:?}"
+    );
+    assert!(
+        client.resolve_table_or_view_id(&sn, "v2").is_err(),
+        "rejected derived-table view must not be registered"
+    );
+}
+
 // ── A derived table must not see its FROM siblings (non-LATERAL) ──────
 // A subquery in FROM is not correlated unless LATERAL (which is rejected), so its
 // body may reference CTEs and catalog relations but never another item in the same

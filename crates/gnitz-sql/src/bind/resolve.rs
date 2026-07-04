@@ -101,6 +101,16 @@ pub(crate) fn resolve_unqualified_column(col_name: &str, tables: &AliasMap) -> R
     found.ok_or_else(|| GnitzSqlError::Bind(format!("column '{col_name}' not found in any table")))
 }
 
+/// The reserved-prefix / identifier rule for any relation name entering
+/// resolution — the same `gnitz_core` rule DDL creation enforces
+/// (`plan::validate::validate_user_name`), applied here without a `bind → plan`
+/// dependency. The `Binder` holds every name to it at the point the name
+/// becomes resolvable: catalog probes in `resolve` / `resolve_base_table`,
+/// alias inserts in `cache_alias`.
+fn validate_relation_name(name: &str) -> Result<(), GnitzSqlError> {
+    gnitz_core::validate_user_identifier(name).map_err(GnitzSqlError::Plan)
+}
+
 pub(crate) struct Binder<'a> {
     schema_name: &'a str,
     cache: AliasMap,
@@ -137,6 +147,14 @@ impl<'a> Binder<'a> {
         if let Some(entry) = self.cache.get(&name.to_ascii_lowercase()) {
             return Ok((entry.table_id, Rc::clone(&entry.schema)));
         }
+        // Referenced relations obey the same reserved-prefix rule as created
+        // ones: a fresh catalog probe of a leading-`_` name can only be a user
+        // naming internal plumbing (a hidden chain segment `__h{vid}_{idx}`), and
+        // honoring it leaks a dependency that makes the owner view undroppable.
+        // Placed after the cache check — every cached name passed the same rule
+        // on insert (`cache_alias` validates; `cache_relation` is fed from these
+        // already-validated probes), never a raw `__h…` catalog name.
+        validate_relation_name(name)?;
         let (tid, schema) = client
             .resolve_table_or_view_id(self.schema_name, name)
             .map_err(GnitzSqlError::Exec)?;
@@ -156,6 +174,13 @@ impl<'a> Binder<'a> {
         client: &mut GnitzClient,
         name: &str,
     ) -> Result<(u64, Rc<Schema>), GnitzSqlError> {
+        // Same reserved-prefix rule as the read funnel: a write/index target
+        // naming a leading-`_` relation can only be a user reaching for system
+        // plumbing (a hidden segment). Rejecting here — before the catalog probe —
+        // also closes the existence side-channel the two-probe fallback below
+        // would otherwise open (a hidden segment returns "is a view", a missing
+        // name returns "not found").
+        validate_relation_name(name)?;
         // `resolve_table_id` consults TABLE_TAB only, so a view name misses it.
         match client.resolve_table_id(self.schema_name, name) {
             Ok((tid, schema)) => {
@@ -175,9 +200,15 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Cache a CTE or alias name as resolving to the given (table_id, schema).
-    pub(crate) fn cache_alias(&mut self, name: &str, resolved: (u64, Rc<Schema>)) {
+    /// Cache a CTE / derived-table alias as resolving to the given
+    /// (table_id, schema). The alias is a user-chosen relation name that later
+    /// references resolve *ahead of* the funnel guard in `resolve` (the cache is
+    /// probed before validation), so it is held to the same reserved-prefix rule
+    /// here — the one gate every alias passes to become resolvable.
+    pub(crate) fn cache_alias(&mut self, name: &str, resolved: (u64, Rc<Schema>)) -> Result<(), GnitzSqlError> {
+        validate_relation_name(name)?;
         self.cache_relation(name, resolved.0, resolved.1);
+        Ok(())
     }
 }
 

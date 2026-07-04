@@ -6,7 +6,7 @@ use crate::ast_util::{extract_table_factor_name, is_wildcard_projection};
 use crate::bind::{bind_single_table, Binder};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use crate::lower::compile_bound_expr_to_program;
+use crate::lower::compile_filter_program;
 use crate::plan::validate::{
     reject_duplicate_column_names, reject_float_keys, reject_unhonored_select_clauses, HonoredClauses,
 };
@@ -81,10 +81,13 @@ fn resolve_set_op_side(
 
     let inp = cb.input_delta_tagged(source_tid);
 
-    // Optional WHERE
+    // Optional WHERE (elided when the predicate bound to a true constant).
     let filtered = if let Some(where_expr) = &select.selection {
         let bound = bind_single_table(where_expr, &source_schema)?;
-        cb.filter(inp, Some(compile_bound_expr_to_program(&bound, &source_schema)?))
+        match compile_filter_program(&bound, &source_schema)? {
+            Some(p) => cb.filter(inp, Some(p)),
+            None => inp,
+        }
     } else {
         inp
     };

@@ -13,7 +13,8 @@
 //! bundle whose VIEW_TAB rows are deliberately misordered (consumer before
 //! producer) still backfills correctly only if the tail re-derives the order.
 
-use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, PlannedView};
+use gnitz_core::{hidden_view_name, CircuitBuilder, ColumnDef, GnitzClient, PlannedView};
+use gnitz_sql::GnitzSqlError;
 use gnitz_test_harness::ServerHandle;
 
 mod common;
@@ -169,7 +170,7 @@ fn chain_drop_cascades_hidden_members() {
     let f_vid = client.alloc_table_id().unwrap();
     // Hidden segment named by the real `__h{final_vid}_{i}` convention so
     // `drop_view`'s prefix scan (`__h{f_vid}_`) matches it.
-    let h_name = format!("__h{f_vid}_0");
+    let h_name = hidden_view_name(f_vid, 0);
     let views = plan_chain(h_vid, f_vid, base_tid, &h_name, "userview", &cols);
     client.create_view_chain(&sn, Vec::from(views)).unwrap();
 
@@ -210,7 +211,7 @@ fn chain_drop_table_restricts_under_chain() {
 
     let h_vid = client.alloc_table_id().unwrap();
     let f_vid = client.alloc_table_id().unwrap();
-    let h_name = format!("__h{f_vid}_0");
+    let h_name = hidden_view_name(f_vid, 0);
     let views = plan_chain(h_vid, f_vid, base_tid, &h_name, "userview", &cols);
     client.create_view_chain(&sn, Vec::from(views)).unwrap();
 
@@ -236,7 +237,7 @@ fn chain_drop_schema_drains_hidden_members() {
 
     let h_vid = client.alloc_table_id().unwrap();
     let f_vid = client.alloc_table_id().unwrap();
-    let h_name = format!("__h{f_vid}_0");
+    let h_name = hidden_view_name(f_vid, 0);
     let views = plan_chain(h_vid, f_vid, base_tid, &h_name, "userview", &cols);
     client.create_view_chain(&sn, Vec::from(views)).unwrap();
 
@@ -272,4 +273,94 @@ fn chain_rejects_over_length() {
     assert!(res.is_err(), "over-length chain must be rejected");
     let msg = format!("{:?}", res.unwrap_err());
     assert!(msg.contains("segment"), "error names the segment limit: {msg}");
+}
+
+/// Create table `t(id, v)` and a WHERE'd-CTE view `name` over it, then return
+/// `(owner view id, hidden segment name)`. A WHERE'd CTE compiles into exactly one
+/// hidden segment named `__h{owner_vid}_0`, where the owner vid is the id `name`
+/// itself resolves to — so the hidden name is derived from the resolved owner.
+fn make_hidden_chain(client: &mut GnitzClient, sn: &str, name: &str) -> (u64, String) {
+    exec(
+        client,
+        sn,
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+    );
+    exec(
+        client,
+        sn,
+        &format!("CREATE VIEW {name} AS WITH c AS (SELECT id, v FROM t WHERE v > 10) SELECT id FROM c"),
+    );
+    let vid = client.resolve_table_or_view_id(sn, name).unwrap().0;
+    (vid, hidden_view_name(vid, 0))
+}
+
+/// A SQL statement naming a hidden chain segment by its raw `__h…` name — a
+/// bare `SELECT` or a `CREATE VIEW` body — is rejected at the read funnel
+/// (`Binder::resolve`), while the same name still resolves through the raw
+/// client API (the low-level surface is deliberately unguarded; the
+/// chain-introspection tests above depend on it). Without the guard the view
+/// body writes a dependency row that makes the owner view permanently
+/// undroppable — the regression asserted here by the successful `DROP VIEW`.
+#[test]
+fn hidden_segment_reference_rejected() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let (_vid, hidden) = make_hidden_chain(&mut client, &sn, "s");
+    // The hidden segment is registered on the trusted low-level surface.
+    assert!(
+        client.resolve_table_or_view_id(&sn, &hidden).is_ok(),
+        "hidden segment {hidden} should be registered"
+    );
+    // A bare SELECT naming it is rejected with the reserved-prefix error.
+    let e_sel = try_exec(&mut client, &sn, &format!("SELECT * FROM {hidden}")).unwrap_err();
+    assert!(
+        matches!(e_sel, GnitzSqlError::Plan(_)),
+        "reserved-prefix SELECT must be a Plan error, got {e_sel:?}"
+    );
+    // Referencing it from a view body is rejected the same way.
+    let err = try_exec(&mut client, &sn, &format!("CREATE VIEW v2 AS SELECT * FROM {hidden}")).unwrap_err();
+    assert!(
+        matches!(err, GnitzSqlError::Plan(_)),
+        "reserved-prefix reference must be a Plan error, got {err:?}"
+    );
+    // With no leaked dependent, the owner view drops — and cascades the segment.
+    exec(&mut client, &sn, "DROP VIEW s");
+    assert!(client.resolve_table_or_view_id(&sn, "s").is_err(), "owner view dropped");
+    assert!(
+        client.resolve_table_or_view_id(&sn, &hidden).is_err(),
+        "hidden segment cascaded away with its owner"
+    );
+}
+
+/// A write / index target naming a hidden segment is rejected with the
+/// reserved-prefix error (not the "is a view" message), and a *non-existent*
+/// hidden name yields the SAME error — the existence side-channel is closed.
+#[test]
+fn hidden_segment_write_target_rejected() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    let (_vid, hidden) = make_hidden_chain(&mut client, &sn, "s");
+    let e_ins = try_exec(&mut client, &sn, &format!("INSERT INTO {hidden} VALUES (1, 1)")).unwrap_err();
+    assert!(
+        matches!(e_ins, GnitzSqlError::Plan(_)),
+        "INSERT into a hidden segment must be a Plan error, got {e_ins:?}"
+    );
+    let e_idx = try_exec(&mut client, &sn, &format!("CREATE INDEX ix ON {hidden} (v)")).unwrap_err();
+    assert!(
+        matches!(e_idx, GnitzSqlError::Plan(_)),
+        "CREATE INDEX on a hidden segment must be a Plan error, got {e_idx:?}"
+    );
+    // A non-existent hidden name must give the same reserved-prefix Plan error —
+    // no "is a view" vs "not found" existence side-channel.
+    let e_absent = try_exec(&mut client, &sn, "INSERT INTO __h999999_0 VALUES (1, 1)").unwrap_err();
+    assert!(
+        matches!(e_absent, GnitzSqlError::Plan(_)),
+        "a non-existent hidden name must give the same Plan error, got {e_absent:?}"
+    );
 }

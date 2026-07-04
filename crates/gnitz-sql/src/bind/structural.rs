@@ -192,12 +192,14 @@ fn bind_literal(v: &Value) -> Result<BoundExpr, GnitzSqlError> {
     }
 }
 
-/// Shared NOT-NULL fold: a non-nullable column makes `IS [NOT] NULL` a constant
+/// Shared NOT-NULL fold: a never-null value makes `IS [NOT] NULL` a constant
 /// (never null, never — for IS NULL — true), keeping the null-tracking opcode
 /// (which forces `eval_batch`'s slow path — `is_strictly_non_nullable` returns
-/// false on any is_null) out of the program.
-pub(crate) fn fold_null_test(schema: &Schema, idx: usize, want_null: bool) -> BoundExpr {
-    if !schema.columns[idx].is_nullable {
+/// false on any is_null) out of the program. `nullable` is the caller's
+/// authoritative nullability fact for the value at column `idx` — a schema
+/// column's `is_nullable`, or a HAVING aggregate's structural nullability.
+pub(crate) fn fold_null_test(nullable: bool, idx: usize, want_null: bool) -> BoundExpr {
+    if !nullable {
         BoundExpr::LitInt(i64::from(!want_null))
     } else if want_null {
         BoundExpr::IsNull(idx)
@@ -342,7 +344,8 @@ impl LeafBinder for SingleTable<'_> {
         }
     }
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
-        Ok(fold_null_test(self.schema, self.idx(inner)?, want_null))
+        let idx = self.idx(inner)?;
+        Ok(fold_null_test(self.schema.columns[idx].is_nullable, idx, want_null))
     }
 }
 

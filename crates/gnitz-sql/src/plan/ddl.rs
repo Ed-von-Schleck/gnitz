@@ -106,6 +106,9 @@ fn resolve_fk_target(
         return resolve_fk_target_inline(current_cols, current_pk_cols, &ref_table, referred_columns, fk_col_type);
     }
 
+    // The one relation-name catalog probe outside the Binder funnels: hold the
+    // FK target to the same reserved-prefix rule they enforce.
+    validate_user_name(&ref_table)?;
     let (ref_tid, ref_schema) = client
         .resolve_table_id(schema_name, &ref_table)
         .map_err(|e| GnitzSqlError::Bind(format!("FK target '{ref_table}': {e}")))?;
@@ -614,6 +617,10 @@ pub(crate) fn execute_drop(
                 client.drop_view(schema_name, &name).map_err(GnitzSqlError::Exec)?;
             }
             ObjectType::Index => {
+                // Mirror CREATE INDEX's name rule (reserved prefix + `__fk_`
+                // infix): a clearer planner-side error, one fewer round-trip —
+                // the engine's own FK-index drop refusal stays the backstop.
+                validate_user_index_name(&name)?;
                 client.drop_index_by_name(&name).map_err(GnitzSqlError::Exec)?;
             }
             _ => {

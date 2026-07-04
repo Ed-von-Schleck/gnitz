@@ -303,6 +303,22 @@ pub(crate) fn compile_bound_expr_to_program(
     Ok(eb.build(reg))
 }
 
+/// Compile a whole-predicate WHERE/HAVING filter, or `None` when the binder
+/// folded it to a true constant (e.g. `IS NOT NULL` on a non-nullable column) —
+/// the caller then skips the filter operator entirely, instead of paying a
+/// statically-true per-row evaluation plus a full output-batch copy on every
+/// tick of the view's life. A false constant keeps its filter: it must still
+/// drop every row.
+pub(crate) fn compile_filter_program(
+    pred: &BoundExpr,
+    schema: &Schema,
+) -> Result<Option<gnitz_core::ExprProgram>, GnitzSqlError> {
+    match pred {
+        BoundExpr::LitInt(v) if *v != 0 => Ok(None),
+        _ => Ok(Some(compile_bound_expr_to_program(pred, schema)?)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
