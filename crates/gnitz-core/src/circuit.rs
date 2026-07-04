@@ -126,6 +126,19 @@ where
         .collect()
 }
 
+/// Like [`encode_col_list`], but carries a per-column promoted target type code
+/// in `value2` (0 = keep/derive from the source type). `.get(i)...unwrap_or(0)`
+/// degrades a short/absent `target_tcs` to "no promotion" instead of panicking.
+fn encode_col_list_with_tcs(kind: u64, cols: &[u16], target_tcs: &[u8]) -> Vec<(u64, u16, u64, u64)> {
+    cols.iter()
+        .enumerate()
+        .map(|(i, &col)| {
+            let v2 = target_tcs.get(i).copied().unwrap_or(0) as u64;
+            (kind, i as u16, col as u64, v2)
+        })
+        .collect()
+}
+
 fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
     use gnitz_wire::*;
     match op {
@@ -140,23 +153,11 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             reindex_cols,
             reindex_target_tcs,
         }) => {
-            // value1 = column index, value2 = promoted target type code (0 = derive
-            // from source). Hand-rolled (not encode_col_list) so the shared
-            // PROJ/HashRow helper stays a pure index list; the planner writes 0 on a
-            // side already at T, keeping same-type / U128-vs-UUID / string circuits
-            // byte-identical.
-            let kind_rows: Vec<(u64, u16, u64, u64)> = reindex_cols
-                .iter()
-                .enumerate()
-                .map(|(i, &col)| {
-                    let v2 = reindex_target_tcs.get(i).copied().unwrap_or(0) as u64;
-                    (NODE_COL_KIND_REINDEX, i as u16, col as u64, v2)
-                })
-                .collect();
+            let kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_REINDEX, &reindex_cols, &reindex_target_tcs);
             ((OPCODE_MAP_EXPR, None, Some(program)), kind_rows)
         }
-        OpNode::Map(MapKind::HashRow(cols, branch_id)) => {
-            let mut kind_rows = encode_col_list(NODE_COL_KIND_PROJ, cols);
+        OpNode::Map(MapKind::HashRow(cols, target_tcs, branch_id)) => {
+            let mut kind_rows = encode_col_list_with_tcs(NODE_COL_KIND_PROJ, &cols, &target_tcs);
             kind_rows.push((NODE_COL_KIND_BRANCH_ID, 0, branch_id as u64, 0));
             ((OPCODE_MAP_HASH_ROW, None, None), kind_rows)
         }
@@ -314,12 +315,18 @@ impl CircuitBuilder {
     /// membership is decided by the projected row content, not by the source PK
     /// (EXCEPT/INTERSECT/DISTINCT).
     ///
+    /// `target_tcs` is parallel to `projection` (`0` = keep the source column's
+    /// type); a non-zero entry promotes that payload column to the given ≤8-byte
+    /// integer type so a cross-width set-op pair shares one physical layout. Pass
+    /// an all-zero slice (or one shorter than `projection`) for the same-type /
+    /// DISTINCT case, which compiles a byte-identical circuit.
+    ///
     /// `branch_id` is mixed into the hash; pass distinct ids (0 and 1) to the two
     /// sides of a `UNION ALL` so identical rows do not collide to one PK, and 0
     /// to both sides of deduplicating set-ops.
-    pub fn map_hash_row(&mut self, input: NodeId, projection: &[usize], branch_id: u8) -> NodeId {
+    pub fn map_hash_row(&mut self, input: NodeId, projection: &[usize], target_tcs: &[u8], branch_id: u8) -> NodeId {
         let cols: Vec<u16> = projection.iter().map(|&c| c as u16).collect();
-        let nid = self.alloc_node(OpNode::Map(MapKind::HashRow(cols, branch_id)));
+        let nid = self.alloc_node(OpNode::Map(MapKind::HashRow(cols, target_tcs.to_vec(), branch_id)));
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }

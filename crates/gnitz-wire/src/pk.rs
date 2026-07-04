@@ -90,11 +90,29 @@ pub fn decode_pk_column_owned(src: &[u8], tc: u8) -> [u8; 16] {
     buf
 }
 
+/// Widen a native-LE integer of type `src_tc` into the wider native-LE slot
+/// `dst` (`dst.len() >= src.len()`), sign-extending a signed source and
+/// zero-extending an unsigned one. This is the one definition of value-
+/// preserving integer widening for identity-critical bytes: the cross-width
+/// join key promotion ([`encode_pk_column_promoted`]) and the set-op payload
+/// promotion (`copy_column`) both go through it, so equal numeric values widen
+/// to byte-identical representations on every path.
+#[inline]
+pub fn widen_native_le(src: &[u8], src_tc: u8, dst: &mut [u8]) {
+    let src_width = src.len();
+    debug_assert!(dst.len() >= src_width);
+    // Native LE: the sign bit is the high bit of the most-significant (last)
+    // byte; the extension bytes are appended at the high LE indices.
+    let is_neg = crate::is_signed_int(src_tc) && src_width > 0 && (src[src_width - 1] & 0x80) != 0;
+    dst[..src_width].copy_from_slice(src);
+    dst[src_width..].fill(if is_neg { 0xFF } else { 0x00 });
+}
+
 /// OPK-encode a native-LE value of type `src_tc` into a `target_tc` slot.
-/// `dst.len() == wire_stride(target_tc) >= src.len()`. Sign-extends (signed src)
-/// or zero-extends (unsigned src) the native value to the target width, then
-/// [`encode_pk_column`]s at `target_tc`. When `src_tc == target_tc` this is
-/// exactly `encode_pk_column` (no widening) — the no-widening fast path.
+/// `dst.len() == wire_stride(target_tc) >= src.len()`. [`widen_native_le`]s the
+/// value to the target width, then [`encode_pk_column`]s at `target_tc`. When
+/// `src_tc == target_tc` this is exactly `encode_pk_column` (no widening) — the
+/// no-widening fast path.
 ///
 /// Both the trace-side reindex Map and the delta-scatter routing key go through
 /// this single primitive, so equal numeric values from either side of a
@@ -117,14 +135,8 @@ pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mu
         return;
     }
 
-    // Native LE: the sign bit is the high bit of the most-significant (last)
-    // byte; the extension bytes are appended at the high LE indices.
-    let is_neg = crate::is_signed_int(src_tc) && src_width > 0 && (src[src_width - 1] & 0x80) != 0;
-    let pad = if is_neg { 0xFFu8 } else { 0x00u8 };
-
     let mut scratch = [0u8; 16];
-    scratch[..src_width].copy_from_slice(src);
-    scratch[src_width..target_width].fill(pad);
+    widen_native_le(src, src_tc, &mut scratch[..target_width]);
     encode_pk_column(&scratch[..target_width], target_tc, dst);
 }
 

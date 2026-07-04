@@ -358,10 +358,40 @@ pub(super) fn emit_node(
                     );
                 }
 
-                gnitz_wire::MapKind::HashRow(proj_cols, branch_id) => {
+                gnitz_wire::MapKind::HashRow(proj_cols, target_tcs, branch_id) => {
                     // Keep the listed columns as payload (positions 0..k), like a
                     // Projection, but prepend a synthetic U128 PK that op_map sets
                     // to a hash of those payload columns (reindex_hash path).
+                    // `target_tcs[j] != 0` promotes payload column j to that
+                    // ≤8-byte integer type (cross-width set-op coercion): the node
+                    // schema declares the wider slot and `from_projection` widens the
+                    // source into it, so both set-op sides hash one physical layout.
+                    //
+                    // Same trust-boundary guards as the Expression reindex arm above:
+                    // an out-of-range column would read a zeroed schema slot (a
+                    // silently wrong hash), and a carried target must be exactly the
+                    // planner's value-preserving promotion of its source —
+                    // `join_key_common_type(src, t) == Some(t)` — restricted to the
+                    // ≤8-byte fixed-int domain the payload widen supports. A
+                    // violation means a corrupt/forged catalog; fail the compile
+                    // cleanly rather than truncate in `copy_column`.
+                    if 1 + proj_cols.len() > crate::schema::MAX_COLUMNS
+                        || proj_cols.iter().any(|&c| c as usize >= in_reg_schema.num_columns())
+                    {
+                        state.emit_failed = true;
+                        return;
+                    }
+                    let promotion_invalid = proj_cols.iter().enumerate().any(|(j, &c)| {
+                        let t = target_tcs.get(j).copied().unwrap_or(0);
+                        t != 0 && {
+                            let src = in_reg_schema.columns[c as usize].type_code;
+                            !gnitz_wire::is_fixed_int(t) || gnitz_wire::join_key_common_type(src, t) != Some(t)
+                        }
+                    });
+                    if promotion_invalid {
+                        state.emit_failed = true;
+                        return;
+                    }
                     let src_indices: Vec<i32> = proj_cols.iter().map(|&c| c as i32).collect();
                     let src_types: Vec<u8> = src_indices
                         .iter()
@@ -370,7 +400,16 @@ pub(super) fn emit_node(
                     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
                     cols[0] = SchemaColumn::new(type_code::U128, 0);
                     for (j, &i) in src_indices.iter().enumerate() {
-                        cols[1 + j] = in_reg_schema.columns[i as usize];
+                        let src = in_reg_schema.columns[i as usize];
+                        let tgt = target_tcs.get(j).copied().unwrap_or(0);
+                        let out_tc = if tgt != 0 { tgt } else { src.type_code };
+                        // `new` re-derives size/signedness for the promoted type;
+                        // keep THIS SIDE's nullability. Per-side, not the
+                        // operator-merged view nullability: an INTERSECT/EXCEPT leaf
+                        // is `distinct`-ed on its own before the tuple-tightening
+                        // combine, so its row comparator must classify by what this
+                        // side can actually emit.
+                        cols[1 + j] = SchemaColumn::new(out_tc, src.nullable);
                     }
                     let node_schema = SchemaDescriptor::new(&cols[..1 + src_indices.len()], &[0]);
                     let fp = create_universal_projection(

@@ -203,12 +203,20 @@ pub enum MapKind {
     /// payload bytes. Used by EXCEPT/INTERSECT/DISTINCT so set membership is
     /// decided by the projected row content, not by the source PK.
     ///
-    /// The second field is a per-side `branch_id` mixed into the hash so that
+    /// `target_tcs` is parallel to the projection columns (`0` = keep the source
+    /// column's type). A non-zero entry `i` is the promoted payload type code the
+    /// widening projection coerces column `i` into, so a cross-width set-op pair
+    /// (e.g. `I32 UNION I64`) gives equal logical values one physical layout for
+    /// the content hash and the downstream union/positive_part merge. It is
+    /// always a ≤8-byte fixed-width integer; all-zero for same-type set-ops and
+    /// `SELECT DISTINCT`.
+    ///
+    /// The `branch_id` is a per-side discriminator mixed into the hash so that
     /// identical payloads on the left vs right branch of a `UNION ALL` get
     /// distinct synthetic PKs (and therefore accumulate weight +2 rather than
     /// collapsing). Deduplicating set-ops (UNION/EXCEPT/INTERSECT) use 0 on both
     /// sides; UNION ALL uses 0 on the left and 1 on the right.
-    HashRow(Vec<u16>, u8),
+    HashRow(Vec<u16>, Vec<u8>, u8),
 }
 
 /// Typed operator-node payload. Expression blobs are stored as raw `Vec<u8>`;
@@ -279,6 +287,32 @@ pub struct CircuitNodeColumn {
     pub value2: u64,
 }
 
+/// Collect one column kind's `(value1, value2)` rows into parallel
+/// (source column index, promoted target type code) vectors. Rows are
+/// position-ordered per kind, so filtering preserves column order. `value2 == 0`
+/// means "keep/derive from the source type"; a non-zero target must satisfy
+/// `valid` — this decode is the trust boundary where catalog bytes become a
+/// typed node, so a bogus target is rejected here rather than left to drive a
+/// wrong slot width downstream.
+fn collect_cols_with_tcs(
+    cols: &[CircuitNodeColumn],
+    kind: u64,
+    valid: fn(u8) -> bool,
+    err: impl Fn(u8) -> String,
+) -> Result<(Vec<u16>, Vec<u8>), String> {
+    let mut out_cols: Vec<u16> = Vec::new();
+    let mut out_tcs: Vec<u8> = Vec::new();
+    for c in cols.iter().filter(|c| c.kind == kind) {
+        let tc = c.value2 as u8;
+        if tc != 0 && !valid(tc) {
+            return Err(err(tc));
+        }
+        out_cols.push(c.value1 as u16);
+        out_tcs.push(tc);
+    }
+    Ok((out_cols, out_tcs))
+}
+
 /// Reconstruct an `OpNode` from the three-table row bundle.
 ///
 /// `cols` is the sorted (kind, position, value1, value2) slice for this node,
@@ -322,26 +356,14 @@ pub fn decode_op_node(
         OPCODE_MAP_PROJ => OpNode::Map(MapKind::Projection(collect_cols(NODE_COL_KIND_PROJ))),
         OPCODE_MAP_EXPR => {
             let program = expr_blob.ok_or_else(|| "MAP_EXPR missing expr_program blob".to_string())?;
-            // Reindex columns live in CircuitNodeColumns (NODE_COL_KIND_REINDEX),
-            // position-ordered so a compound key's column order is preserved.
-            // `value1` is the source column, `value2` the promoted key type code
-            // `T` (`0` = derive from source). This decode is the trust boundary
-            // where catalog bytes become a typed node: reject a non-zero `value2`
-            // that is not a PK-eligible type code here, rather than letting it
-            // silently produce a wrong reindex output stride downstream (a float /
-            // unknown code would otherwise survive as a bogus slot width).
-            let mut reindex_cols: Vec<u16> = Vec::new();
-            let mut reindex_target_tcs: Vec<u8> = Vec::new();
-            for c in cols {
-                if c.kind == NODE_COL_KIND_REINDEX {
-                    let tc = c.value2 as u8;
-                    if tc != 0 && !crate::is_pk_eligible(tc) {
-                        return Err(format!("MAP_EXPR reindex target type code {tc} is not PK-eligible"));
-                    }
-                    reindex_cols.push(c.value1 as u16);
-                    reindex_target_tcs.push(tc);
-                }
-            }
+            // Reject a non-zero target that is not PK-eligible: the reindex
+            // targets flow into the 16-byte-capable OPK promoter
+            // (`encode_pk_column_promoted`), so its trust boundary admits exactly
+            // that domain.
+            let (reindex_cols, reindex_target_tcs) =
+                collect_cols_with_tcs(cols, NODE_COL_KIND_REINDEX, crate::is_pk_eligible, |tc| {
+                    format!("MAP_EXPR reindex target type code {tc} is not PK-eligible")
+                })?;
             OpNode::Map(MapKind::Expression {
                 program,
                 reindex_cols,
@@ -354,7 +376,14 @@ pub fn decode_op_node(
                 .find(|c| c.kind == NODE_COL_KIND_BRANCH_ID)
                 .map(|c| c.value1 as u8)
                 .unwrap_or(0);
-            OpNode::Map(MapKind::HashRow(collect_cols(NODE_COL_KIND_PROJ), branch_id))
+            // The promotion domain is a ≤8-byte fixed-width integer — stricter
+            // than the Expression reindex's `is_pk_eligible`, which also admits
+            // the 16-byte U128/UUID/I128 that the payload widen in `copy_column`
+            // cannot hold.
+            let (proj_cols, target_tcs) = collect_cols_with_tcs(cols, NODE_COL_KIND_PROJ, crate::is_fixed_int, |tc| {
+                format!("MAP_HASH_ROW target type code {tc} is not a fixed-width integer")
+            })?;
+            OpNode::Map(MapKind::HashRow(proj_cols, target_tcs, branch_id))
         }
         OPCODE_NEGATE => OpNode::Negate,
         OPCODE_UNION => OpNode::Union,

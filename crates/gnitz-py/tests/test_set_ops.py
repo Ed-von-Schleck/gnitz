@@ -835,3 +835,201 @@ class TestSetOpNullability:
             client.execute_sql("DROP TABLE b", schema_name=sn)
         finally:
             client.drop_schema(sn)
+
+
+class TestSetOpIntegerPromotion:
+    """Cross-width / cross-sign integer set operations. The narrower side is
+    widened to the join-key common type so equal logical values share one physical
+    representation; the content hash then coalesces them and the union /
+    positive_part merge reads one width. Distinct values (and wide-only values that
+    exceed the narrow type's range) stay distinct."""
+
+    # (label, left_type, right_type, shared, left_only, right_only). `shared` fits
+    # both types. The two `*_only` values live on only one side; at least one
+    # exceeds the other side's type range, pinning that wide values survive and
+    # never falsely coalesce.
+    _WIDTH_CASES = [
+        ("i32_i64", "INT", "BIGINT", 5, 7, 8_000_000_000),                 # I32 vs I64 → I64
+        ("u16_u32", "SMALLINT UNSIGNED", "INT UNSIGNED", 5, 7, 200_000),   # U16 vs U32 → U32
+        ("u32_i32", "INT UNSIGNED", "INT", 5, 3_000_000_000, 9),           # U32 vs I32 → I64
+    ]
+
+    @pytest.mark.parametrize("label,lt,rt,shared,left_only,right_only", _WIDTH_CASES)
+    def test_cross_width_union_intersect_except(
+        self, client, label, lt, rt, shared, left_only, right_only
+    ):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                f"CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val {lt} NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                f"CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val {rt} NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_union AS SELECT val FROM t1 UNION SELECT val FROM t2", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v_isect AS SELECT val FROM t1 INTERSECT SELECT val FROM t2", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v_except AS SELECT val FROM t1 EXCEPT SELECT val FROM t2", schema_name=sn)
+            vu = client.resolve_table(sn, "v_union")[0]
+            vi = client.resolve_table(sn, "v_isect")[0]
+            ve = client.resolve_table(sn, "v_except")[0]
+
+            client.execute_sql(f"INSERT INTO t2 VALUES (1, {shared}), (2, {right_only})", schema_name=sn)
+            client.execute_sql(f"INSERT INTO t1 VALUES (1, {shared}), (2, {left_only})", schema_name=sn)
+
+            # UNION DISTINCT: `shared` coalesces to ONE row (weight 1, not 2);
+            # both `*_only` values stay distinct.
+            oracle.assert_view_matches(
+                client, vu, ["val"],
+                {(shared,): 1, (left_only,): 1, (right_only,): 1}, ctx=f"{label} UNION")
+            # INTERSECT: only `shared` — proves the two widths hash-match.
+            oracle.assert_view_matches(client, vi, ["val"], {(shared,): 1}, ctx=f"{label} INTERSECT")
+            # EXCEPT: only the left-only value — `shared` cancels across widths.
+            oracle.assert_view_matches(client, ve, ["val"], {(left_only,): 1}, ctx=f"{label} EXCEPT")
+        finally:
+            client.drop_schema(sn)
+
+    def test_widened_pk_source_compound_pk_sign_extend(self, client):
+        """A set-op side projects a narrow PK column (INT, the 2nd column of a
+        compound PK so its OPK byte offset is non-zero) that widens to BIGINT to
+        match the other side. Exercises copy_column's PK branch: decode the OPK at
+        the SOURCE width, then sign-extend into the wider slot. A negative id pins
+        the sign-extension — zero-extension would turn -3 into 4294967293 and break
+        the coalesce."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t1 (a BIGINT NOT NULL, id INT NOT NULL, filler BIGINT NOT NULL, "
+                "PRIMARY KEY (a, id))",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_union AS SELECT id FROM t1 UNION SELECT val FROM t2", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v_isect AS SELECT id FROM t1 INTERSECT SELECT val FROM t2", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v_except AS SELECT id FROM t1 EXCEPT SELECT val FROM t2", schema_name=sn)
+            vu = client.resolve_table(sn, "v_union")[0]
+            vi = client.resolve_table(sn, "v_isect")[0]
+            ve = client.resolve_table(sn, "v_except")[0]
+
+            client.execute_sql("INSERT INTO t2 VALUES (1, 5), (2, -3), (3, 100)", schema_name=sn)
+            client.execute_sql("INSERT INTO t1 VALUES (1, 5, 0), (2, -3, 0), (3, 7, 0)", schema_name=sn)
+
+            # id 5 and -3 coalesce with val 5 and -3 (negative pins sign-extension).
+            oracle.assert_view_matches(
+                client, vu, ["id"],
+                {(5,): 1, (-3,): 1, (7,): 1, (100,): 1}, ctx="widened-pk UNION")
+            oracle.assert_view_matches(
+                client, vi, ["id"], {(5,): 1, (-3,): 1}, ctx="widened-pk INTERSECT")
+            oracle.assert_view_matches(client, ve, ["id"], {(7,): 1}, ctx="widened-pk EXCEPT")
+        finally:
+            client.drop_schema(sn)
+
+    def test_nullable_cross_width_pair(self, client):
+        """A NULL on the widened (INT) side coalesces with a NULL on the native
+        (BIGINT) side under UNION/INTERSECT and cancels under EXCEPT; a NULL never
+        collides with a non-null 0 (the value bytes are skipped when a row is
+        null)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val INT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NULL)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v_union AS SELECT val FROM t1 UNION SELECT val FROM t2", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v_isect AS SELECT val FROM t1 INTERSECT SELECT val FROM t2", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v_except AS SELECT val FROM t1 EXCEPT SELECT val FROM t2", schema_name=sn)
+            vu = client.resolve_table(sn, "v_union")[0]
+            vi = client.resolve_table(sn, "v_isect")[0]
+            ve = client.resolve_table(sn, "v_except")[0]
+
+            # t1: NULL, 5, 0 (a non-null zero).  t2: NULL, 5, big (wide-only).
+            client.execute_sql("INSERT INTO t2 VALUES (1, NULL), (2, 5), (3, 8000000000)", schema_name=sn)
+            client.execute_sql("INSERT INTO t1 VALUES (1, NULL), (2, 5), (3, 0)", schema_name=sn)
+
+            # UNION: NULL and 5 coalesce; 0 and the wide-only value stay distinct.
+            oracle.assert_view_matches(
+                client, vu, ["val"],
+                {(None,): 1, (5,): 1, (0,): 1, (8000000000,): 1}, ctx="nullable UNION")
+            # INTERSECT: NULL matches NULL, 5 matches 5; 0 is left-only, big is right-only.
+            oracle.assert_view_matches(
+                client, vi, ["val"], {(None,): 1, (5,): 1}, ctx="nullable INTERSECT")
+            # EXCEPT: NULL and 5 cancel; only the non-null 0 survives (NULL != 0).
+            oracle.assert_view_matches(client, ve, ["val"], {(0,): 1}, ctx="nullable EXCEPT")
+        finally:
+            client.drop_schema(sn)
+
+    def test_incremental_membership_flip_promoted_and_plain_cols(self, client):
+        """Incremental insert then retraction flips INTERSECT membership over a
+        two-column projection where `k` is cross-width (INT vs BIGINT, promoted) and
+        `tag` is BIGINT on both (not promoted). Both columns must participate in the
+        row identity."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, k INT NOT NULL, tag BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, tag BIGINT NOT NULL)",
+                schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, tag FROM t1 INTERSECT SELECT k, tag FROM t2", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql("INSERT INTO t1 VALUES (1, 5, 100)", schema_name=sn)
+            # No match yet.
+            oracle.assert_view_matches(client, vid, ["k", "tag"], {}, ctx="flip: t1 only")
+
+            client.execute_sql("INSERT INTO t2 VALUES (1, 5, 100)", schema_name=sn)
+            # (5,100) now in both — INT 5 coalesces with BIGINT 5.
+            oracle.assert_view_matches(client, vid, ["k", "tag"], {(5, 100): 1}, ctx="flip: matched")
+
+            # Non-matching rows: same k, different tag; and different k, same tag.
+            client.execute_sql("INSERT INTO t2 VALUES (2, 5, 200), (3, 6, 100)", schema_name=sn)
+            oracle.assert_view_matches(
+                client, vid, ["k", "tag"], {(5, 100): 1}, ctx="flip: both cols identity")
+
+            # Retract the sole match — membership flips back to empty (delta weight -1).
+            client.execute_sql("DELETE FROM t2 WHERE pk = 1", schema_name=sn)
+            oracle.assert_view_matches(client, vid, ["k", "tag"], {}, ctx="flip: retracted")
+        finally:
+            client.drop_schema(sn)
+
+    # (label, left_type, right_type, error_substring) — pairs with no common
+    # ≤8-byte integer layout must error cleanly rather than read garbage.
+    _REJECT_CASES = [
+        ("string_vs_int", "TEXT", "BIGINT", "type mismatch"),          # string vs int
+        ("u64_vs_i64", "BIGINT UNSIGNED", "BIGINT", "type mismatch"),  # → I128, rejected
+        ("float", "DOUBLE", "DOUBLE", "float column"),                 # rejected by reject_float_keys
+    ]
+
+    @pytest.mark.parametrize("label,lt,rt,err", _REJECT_CASES)
+    def test_cross_width_rejected(self, client, label, lt, rt, err):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                f"CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val {lt} NOT NULL)", schema_name=sn)
+            client.execute_sql(
+                f"CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val {rt} NOT NULL)", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match=err):
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT val FROM t1 UNION ALL SELECT val FROM t2", schema_name=sn)
+        finally:
+            client.drop_schema(sn)

@@ -1442,7 +1442,7 @@ pub(crate) fn build_pure_range_threshold(
         pk_cols: vec![0],
     };
 
-    let mbh = cb.map_hash_row(reindex_b, &[0], 0);
+    let mbh = cb.map_hash_row(reindex_b, &[0], &[], 0);
     let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)], false); // [_group_pk:U128, m:Tc]
     let carried_m = range_tc.carried_reindex_tc(range_tc);
     let reindex_m = cb.map_reindex(red, &[1], &[carried_m], build_reindex_program(&m_schema));

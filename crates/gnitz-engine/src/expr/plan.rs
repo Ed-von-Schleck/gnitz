@@ -18,12 +18,14 @@ use crate::storage::{Batch, MemBatch};
 
 /// Copy a single column from `in_batch` to `output`. `cm.src_pi` holds the
 /// resolved payload byte: `SENTINEL` indicates the PK column, otherwise it is
-/// the dense payload index in the input batch. `cm.stride` is precomputed at
-/// construction time — the byte width of the destination column. `blob_cache` is
-/// shared across all ColMoves of one `evaluate_map_batch` (and pooled across ticks via
-/// `BlobCacheGuard`) so identical STRING/BLOB heap spans are appended to the
-/// output blob at most once. It is `None` only when the output schema has no
-/// German-string column, in which case the STRING/BLOB branch is never reached.
+/// the dense payload index in the input batch. The source is read at its own
+/// type's width; when the destination slot (`cm.stride`, from the output
+/// schema) is wider — a promoted integer column — the copy sign/zero-extends
+/// the value into it. `blob_cache` is shared across all ColMoves of one
+/// `evaluate_map_batch` (and pooled across ticks via `BlobCacheGuard`) so
+/// identical STRING/BLOB heap spans are appended to the output blob at most
+/// once. It is `None` only when the output schema has no German-string column,
+/// in which case the STRING/BLOB branch is never reached.
 fn copy_column(
     in_batch: &Batch,
     output: &mut Batch,
@@ -31,7 +33,8 @@ fn copy_column(
     mut blob_cache: Option<&mut crate::schema::BlobCache>,
 ) {
     let n = in_batch.count;
-    let stride = cm.stride as usize;
+    let stride = cm.stride as usize; // destination write width
+    let src_stride = crate::schema::type_size(cm.type_code) as usize; // source read width
 
     if cm.src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
         // PK region holds OPK bytes; decode the addressed column back to native
@@ -42,8 +45,16 @@ fn copy_column(
         let mut le = [0u8; crate::schema::MAX_PK_BYTES];
         for row in 0..n {
             let opk = in_batch.get_pk_bytes(row);
-            gnitz_wire::decode_pk_column(&opk[pk_off..pk_off + stride], cm.type_code, &mut le[..stride]);
-            dst[row * stride..row * stride + stride].copy_from_slice(&le[..stride]);
+            // Read the source column's OWN width from the OPK region (not the wider
+            // destination stride, which would over-read into the next PK column),
+            // decode to native LE, then widen if the output slot is wider.
+            gnitz_wire::decode_pk_column(&opk[pk_off..pk_off + src_stride], cm.type_code, &mut le[..src_stride]);
+            let out = &mut dst[row * stride..row * stride + stride];
+            if src_stride == stride {
+                out.copy_from_slice(&le[..stride]);
+            } else {
+                gnitz_wire::widen_native_le(&le[..src_stride], cm.type_code, out);
+            }
         }
     } else if gnitz_wire::is_german_string(cm.type_code) {
         // STRING and BLOB share the 16-byte German-string struct: a long
@@ -65,21 +76,35 @@ fn copy_column(
         }
     } else {
         let in_pi = cm.src_pi as usize;
-        debug_assert!(
-            n * stride <= in_batch.col_data(in_pi).len(),
-            "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
-             (batch count={}, payload cols={})",
-            n,
-            stride,
-            n * stride,
-            in_pi,
-            in_batch.col_data(in_pi).len(),
-            in_batch.count,
-            in_batch.num_payload_cols(),
-        );
-        output
-            .col_data_mut(cm.dst_payload)
-            .copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
+        if src_stride == stride {
+            debug_assert!(
+                n * stride <= in_batch.col_data(in_pi).len(),
+                "copy_column: n*stride ({}*{}={}) > in_batch.col_data({}).len()={} \
+                 (batch count={}, payload cols={})",
+                n,
+                stride,
+                n * stride,
+                in_pi,
+                in_batch.col_data(in_pi).len(),
+                in_batch.count,
+                in_batch.num_payload_cols(),
+            );
+            output
+                .col_data_mut(cm.dst_payload)
+                .copy_from_slice(&in_batch.col_data(in_pi)[..n * stride]);
+        } else {
+            // Wider destination slot (a promoted integer column): sign/zero-extend
+            // the narrower source into it, one row at a time.
+            let src = in_batch.col_data(in_pi);
+            let dst = output.col_data_mut(cm.dst_payload);
+            for row in 0..n {
+                gnitz_wire::widen_native_le(
+                    &src[row * src_stride..row * src_stride + src_stride],
+                    cm.type_code,
+                    &mut dst[row * stride..row * stride + stride],
+                );
+            }
+        }
     }
 }
 
@@ -151,14 +176,16 @@ struct ColMove {
     src_pi: u8,
     /// Dense payload index in the output batch.
     dst_payload: usize,
-    /// Type code of the column (used to dispatch the string path and to decode
-    /// the OPK bytes of a PK source column).
+    /// SOURCE type code of the column — dispatches the string path, decodes the
+    /// OPK bytes of a PK source column, determines the source read width, and
+    /// (when widening) drives the extension signedness: value-preserving
+    /// widening always extends per the source's signedness, even when the
+    /// destination's sign class differs (e.g. U32 promoted into an I64 slot).
     type_code: u8,
-    /// Precomputed byte width of the destination column. For non-PK copies
-    /// this equals the input column's stride (same type). For PK→payload copies
-    /// the destination carries the same type as the source PK column
-    /// (`build_reindex_program` emits the source type code), so the stride —
-    /// taken from the *output* schema — equals the source OPK column's width.
+    /// Destination write width, taken from the output schema. Wider than the
+    /// source column's own width only for a promoted integer column (currently
+    /// produced by cross-width set-ops), where the copy sign/zero-extends the
+    /// source into the slot.
     stride: u8,
     /// Byte offset of this column within the OPK PK region. Valid only when
     /// `src_pi == PAYLOAD_MAPPING_PK_SENTINEL`; 0 for single-column PKs.
@@ -187,24 +214,6 @@ pub struct ScalarFunc {
     null_perm: NullPerm,
     compute: Option<InterpretedCompute>,
     scratch: RefCell<EvalScratch>,
-}
-
-/// Stride for a single ColMove. For non-PK copies (`src_pi != SENTINEL`),
-/// source and destination strides are equal — the column is moved, not
-/// reshaped. For PK→payload copies (`src_pi == SENTINEL`), the destination
-/// payload column must carry the same type as the source PK column:
-/// `build_reindex_program` emits the source type code and `reindex_output_schema`
-/// places the same type in the output payload, so the stride from `out_schema`
-/// is always identical to the source OPK column's byte width. Reading more
-/// bytes than the OPK column occupies would alias the next PK column.
-fn col_move_stride(src_pi: u8, dst_payload: usize, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> u8 {
-    if src_pi == PAYLOAD_MAPPING_PK_SENTINEL {
-        let out_ci = out_schema.payload_col_idx(dst_payload);
-        out_schema.columns[out_ci].size()
-    } else {
-        let src_ci = in_schema.payload_col_idx(src_pi as usize);
-        in_schema.columns[src_ci].size()
-    }
 }
 
 impl ScalarFunc {
@@ -243,11 +252,12 @@ impl ScalarFunc {
                 } else {
                     0u8
                 };
+                let out_ci = out_schema.payload_col_idx(i);
                 ColMove {
                     src_pi,
                     dst_payload: i,
                     type_code: tc,
-                    stride: col_move_stride(src_pi, i, in_schema, out_schema),
+                    stride: out_schema.columns[out_ci].size(),
                     pk_byte_offset,
                 }
             })
@@ -280,11 +290,12 @@ impl ScalarFunc {
                         ColSrc::Pk { off } => (PAYLOAD_MAPPING_PK_SENTINEL, off),
                         ColSrc::Payload(pi) => (pi, 0u8),
                     };
+                    let out_ci = out_schema.payload_col_idx(out_payload as usize);
                     col_moves.push(ColMove {
                         src_pi,
                         dst_payload: out_payload as usize,
                         type_code: tc,
-                        stride: col_move_stride(src_pi, out_payload as usize, in_schema, out_schema),
+                        stride: out_schema.columns[out_ci].size(),
                         pk_byte_offset,
                     });
                 }

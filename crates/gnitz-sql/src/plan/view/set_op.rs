@@ -11,7 +11,7 @@ use crate::plan::validate::{
     reject_duplicate_column_names, reject_float_keys, reject_unhonored_select_clauses, HonoredClauses,
 };
 use crate::plan::view::EmitPieces;
-use gnitz_core::{CircuitBuilder, ColumnDef, GnitzClient, Schema, TypeCode};
+use gnitz_core::{CircuitBuilder, ColumnDef, FixedInt, GnitzClient, Schema, TypeCode};
 use sqlparser::ast::{SelectItem, SetExpr, SetOperator, SetQuantifier};
 
 /// Resolve a set-op side's FROM: exactly one plain table. A derived table or a
@@ -32,14 +32,33 @@ fn resolve_side_source(
     binder.resolve(client, &table_name)
 }
 
-fn compile_set_op_side(
+/// Per-column common type for a set-op pair, or `None` to keep the exact-match
+/// type-mismatch error. Same types pass through; a cross-width integer pair
+/// promotes to the join-key ladder's common type (same-sign → the wider type;
+/// cross-sign with the unsigned operand ≤ U32 → the narrowest strictly-wider
+/// signed type, e.g. `U32` vs `I32` → `I64`) but only when the result is a
+/// concrete ≤8-byte integer. `None`, the `I128` collapse (`U64` vs `I64`), and
+/// every 16-byte / non-integer / string pair are rejected: the widening path
+/// loads a value into one i64 register and cannot represent a 16-byte extremum.
+fn set_op_common_type(l: TypeCode, r: TypeCode) -> Option<TypeCode> {
+    if l == r {
+        return Some(l);
+    }
+    let t = l.join_key_common_type(r)?;
+    FixedInt::from_type_code(t).is_some().then_some(t)
+}
+
+/// First half of a set-op / DISTINCT side: clause rejection, input delta, optional
+/// WHERE, and projection resolution. Returns the filtered node plus the projected
+/// source column indices and their output column defs — but does NOT hash/shard,
+/// because the promotion targets need both sides' output columns first.
+fn resolve_set_op_side(
     select: &sqlparser::ast::Select,
     cb: &mut CircuitBuilder,
-    branch_id: u8,
     context: &str,
     distinct_honored: bool,
     source: (u64, std::rc::Rc<Schema>),
-) -> Result<(gnitz_core::NodeId, Vec<ColumnDef>, u64), GnitzSqlError> {
+) -> Result<(gnitz_core::NodeId, Vec<usize>, Vec<ColumnDef>, u64), GnitzSqlError> {
     // Honor FROM, WHERE, and the projection always; plain DISTINCT only when
     // `distinct_honored` — i.e. the DISTINCT-view caller, which dedups after this
     // returns. Set-op branches pass `false`: a per-branch DISTINCT is not
@@ -75,19 +94,31 @@ fn compile_set_op_side(
     // set membership is over exactly the projected columns.
     let (proj_indices, out_cols) = resolve_set_projection(&select.projection, &source_schema, context)?;
 
+    Ok((filtered, proj_indices, out_cols, source_tid))
+}
+
+/// Second half: hash the projected columns to a synthetic content PK — widening
+/// each column whose `target_tcs` entry is non-zero into the promoted layout so
+/// both set-op sides share one physical representation — then shard by that PK.
+fn hash_shard_side(
+    cb: &mut CircuitBuilder,
+    filtered: gnitz_core::NodeId,
+    proj_indices: &[usize],
+    target_tcs: &[u8],
+    branch_id: u8,
+) -> gnitz_core::NodeId {
     // Reindex by a hash of the projected columns, so set membership
     // (EXCEPT/INTERSECT/UNION-distinct) is decided by the projected row content,
     // not by the source table's PK: two rows from different tables sharing a PK
     // but differing in payload must not match.
-    let reindexed = cb.map_hash_row(filtered, &proj_indices, branch_id);
+    let reindexed = cb.map_hash_row(filtered, proj_indices, target_tcs, branch_id);
     // Repartition by the synthetic hash PK (column 0) so that under
     // multiple workers each row lands on the worker that owns its new PK's
     // shard, co-locating matching rows for the downstream set arithmetic and
     // placing each output row on its owning worker for the sink/scan. The hash
     // is computed in-circuit, so the master cannot pre-shard the source by it;
     // this in-circuit exchange is mandatory. Single-worker mode elides the IPC.
-    let sharded = cb.shard(reindexed, &[0]);
-    Ok((sharded, out_cols, source_tid))
+    cb.shard(reindexed, &[0])
 }
 
 /// Resolve a set-operation side's projection to source column indices plus
@@ -208,17 +239,11 @@ pub(crate) fn emit_set_op_pieces(
     let right_branch_id = matches!((op, set_quantifier), (SetOperator::Union, SetQuantifier::All)) as u8;
 
     let left_src = resolve_side_source(client, binder, left_select, "set operation")?;
-    let (left_node, left_cols, left_tid) =
-        compile_set_op_side(left_select, &mut cb, 0, "set operation", false, left_src)?;
+    let (left_filtered, left_proj, left_cols, left_tid) =
+        resolve_set_op_side(left_select, &mut cb, "set operation", false, left_src)?;
     let right_src = resolve_side_source(client, binder, right_select, "set operation")?;
-    let (right_node, right_cols, right_tid) = compile_set_op_side(
-        right_select,
-        &mut cb,
-        right_branch_id,
-        "set operation",
-        false,
-        right_src,
-    )?;
+    let (right_filtered, right_proj, right_cols, right_tid) =
+        resolve_set_op_side(right_select, &mut cb, "set operation", false, right_src)?;
 
     // INTERSECT/EXCEPT build their two distinct-ed leaves on the same content-hash
     // PK, then combine with union/negate/positive_part. When both branches resolve
@@ -246,17 +271,40 @@ pub(crate) fn emit_set_op_pieces(
             right_cols.len()
         )));
     }
-    // The merge operators read payload bytes using the left schema's column
-    // sizes; a STRING column read as an 8-byte integer (or vice versa) produces
-    // garbage, so both sides must agree on column types.
-    for (i, (l, r)) in left_cols.iter().zip(&right_cols).enumerate() {
-        if l.type_code != r.type_code {
-            return Err(GnitzSqlError::Plan(format!(
-                "set operation: column {} type mismatch ({:?} vs {:?})",
-                i, l.type_code, r.type_code,
-            )));
-        }
-    }
+    // Per-column common type. The merge operators read payload bytes at one fixed
+    // width per column, so both sides must share a physical layout. Same types
+    // pass through; a cross-width integer pair widens to a common ≤8-byte integer
+    // (value-preserving, so equal logical values co-hash). A pair with no such
+    // common type — string vs int, a 16-byte pair, or the `U64` vs `I64` → I128
+    // collapse the one-register widen cannot represent — keeps the exact-match
+    // type-mismatch error rather than reading garbage.
+    let common_tcs: Vec<TypeCode> = left_cols
+        .iter()
+        .zip(&right_cols)
+        .enumerate()
+        .map(|(i, (l, r))| {
+            set_op_common_type(l.type_code, r.type_code).ok_or_else(|| {
+                GnitzSqlError::Plan(format!(
+                    "set operation: column {} type mismatch ({:?} vs {:?})",
+                    i, l.type_code, r.type_code,
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    // A side promotes column i iff its type differs from the common type (0 =
+    // keep the source type). Both sides emit the promoted layout, so the content
+    // hash agrees across sides and the union / positive_part merge reads one width.
+    let side_targets = |cols: &[ColumnDef]| -> Vec<u8> {
+        cols.iter()
+            .zip(&common_tcs)
+            .map(|(c, &ct)| if c.type_code == ct { 0 } else { ct as u8 })
+            .collect()
+    };
+    let left_target_tcs = side_targets(&left_cols);
+    let right_target_tcs = side_targets(&right_cols);
+    let left_node = hash_shard_side(&mut cb, left_filtered, &left_proj, &left_target_tcs, 0);
+    let right_node = hash_shard_side(&mut cb, right_filtered, &right_proj, &right_target_tcs, right_branch_id);
 
     let out_node = match (op, set_quantifier) {
         (SetOperator::Union, SetQuantifier::All) => cb.union(left_node, right_node),
@@ -312,11 +360,14 @@ pub(crate) fn emit_set_op_pieces(
     cb.sink(out_node);
     let circuit = cb.build();
 
-    // Output schema: U128 PK + all payload columns
+    // Output schema: U128 PK + all payload columns at the promoted common type.
+    // The column name comes from the left side (SQL takes output names from the
+    // first query); the type is the shared physical layout both sides emit.
     let mut out_cols_final: Vec<ColumnDef> = Vec::new();
     out_cols_final.push(ColumnDef::new("_set_pk", TypeCode::U128, false));
-    for (l, r) in left_cols.iter().zip(&right_cols) {
+    for ((l, r), &ct) in left_cols.iter().zip(&right_cols).zip(&common_tcs) {
         let mut col = l.clone();
+        col.type_code = ct;
         // Output nullability is operator-specific. EXCEPT emits only left-side
         // rows — a right-only value hits positive_part(0−1)=0 and a both-sides
         // value cancels +1/−1 — so it is nullable iff the left input is. INTERSECT emits a
@@ -352,7 +403,9 @@ pub(crate) fn emit_distinct_pieces(
     // "SELECT DISTINCT" error context. `distinct` then dedups on that
     // hash-of-projection PK; keying by the source PK (unique) would make it a
     // no-op and leak the unprojected columns.
-    let (sharded, proj_cols, _) = compile_set_op_side(select, &mut cb, 0, "SELECT DISTINCT", true, source)?;
+    let (filtered, proj_indices, proj_cols, _) = resolve_set_op_side(select, &mut cb, "SELECT DISTINCT", true, source)?;
+    // A single source has nothing to promote against — empty `target_tcs`.
+    let sharded = hash_shard_side(&mut cb, filtered, &proj_indices, &[], 0);
     let distinct_node = cb.distinct(sharded);
 
     cb.sink(distinct_node);
