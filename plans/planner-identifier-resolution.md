@@ -145,6 +145,27 @@ With this, `WITH Cc AS (…) SELECT … FROM cc` caches under `cc` and the `cc`
 probe hits it; a base-table reference in any case lowercases to the same key and,
 on a miss, probes the now case-insensitive client.
 
+#### 1c. One case-fold primitive for identifiers (`resolve.rs`, `validate.rs`, `join.rs`, `dispatch.rs`)
+
+Part 1 makes `to_ascii_lowercase()` the canonical identifier fold. Several
+resolution sites still fold with the Unicode `str::to_lowercase()`: the
+join/derived alias-map keys and probe (`build_alias_map`,
+`resolve_qualified_column`), the join liveness/provenance maps
+(`plan/view/join.rs` — alias keys and column-name sets), duplicate-column
+detection (`reject_duplicate_column_names`), and the operator-name collector
+(`collect_operator_names`). Every one folds a name that `validate_user_identifier`
+already constrains to ASCII `[A-Za-z0-9_]`, so over the supported input space
+`to_lowercase()` and `to_ascii_lowercase()` return the same bytes — and each fold
+is applied symmetrically to both the stored key and the probe, so switching them
+cannot desynchronize a key/probe pair. Change every one to `to_ascii_lowercase()`
+so name resolution uses a single fold, consistent with the canonical rule. This
+is a consistency change, not a measured optimization; make no perf claim about it.
+
+Sites: `bind/resolve.rs` (`build_alias_map`, `resolve_qualified_column`);
+`plan/validate.rs` (`reject_duplicate_column_names`); `plan/view/join.rs` (the
+liveness `insert`/`extend`/`contains` folds and the `alias_order` / provenance
+alias-map keys); `plan/view/dispatch.rs` (`collect_operator_names`).
+
 ### Part 1 tests
 
 Rust (`integration`):
@@ -184,27 +205,60 @@ Disambiguation runs in the planner, where the auto-vs-explicit distinction is
 known; an explicit duplicate name still errors, unchanged. Names are compared on
 their canonical (lowercase) form, so Part 1 must land first.
 
-#### 2a. Client — read-only index-name enumeration (`crates/gnitz-core/src/client.rs`)
+**Disambiguation must not resurrect a true duplicate.** Today the *only* thing
+rejecting a second auto-named `CREATE INDEX ON t(a)` is the name collision
+(`client.create_index`'s IDX_TAB name scan / the engine `precheck_sys_ingest`
+mirror) — there is no structural (column-set) index dedup anywhere. Left
+unguarded, the disambiguator would turn that rejection into a silent second index
+`…__idx_a_2` on the identical column set. So the planner first rejects a re-index
+of an **identical column set already carrying the auto base name**, and only then
+disambiguates. The discriminator is `(name == base) ∧ (cols == col_indices)`, read
+off the raw IDX_TAB rows:
 
-The catalog exposes no index-name list today; both name readers inline-scan
-IDX_TAB. Add the one small read-only helper the planner needs (name is column 4):
+- **True duplicate** (`(a)` then `(a)`): the prior index stored the base name over
+  the same columns → reject, exactly as before.
+- **False collision** (`(a, b_c)` then `(a_b, c)`): the prior index has the base
+  name but a *different* column set → disambiguate to `…__idx_a_b_c_2`.
+- **A same-column index under a different name** — an FK-backing index
+  (`…__fk_…`) or an explicitly-named user index — never carries the auto base
+  name, so it neither blocks the auto-name nor is disturbed. This is why the check
+  keys on the raw `(name, cols)` rows rather than the deduped `table_indexes`
+  circuit list, whose entries fold every name on a column set into one row (a
+  cols-only test there would spuriously reject `CREATE INDEX ON t(fk_col)` and
+  block promoting an FK index to `UNIQUE`).
+
+#### 2a. Client — read-only index (name, columns) enumeration (`crates/gnitz-core/src/client.rs`)
+
+The catalog exposes no index list to the planner today; the name readers inline-scan
+IDX_TAB. Add one small read-only helper returning each live IDX_TAB row's `(name,
+cols)` — name from column 4, the packed source columns from column 3 (the same
+slots `create_index` writes and `drop_index_by_name` reads). The disambiguator
+needs the columns (for the true-duplicate check) and the names (for the taken
+set), so one scan serves both. The stored name is already canonical (Part 1
+canonicalizes at store time), matching the canonical `base`:
 
 ```rust
-/// The names of all live secondary indexes (IDX_TAB column 4), canonical
-/// (lowercase) form. Used by the planner to disambiguate an auto-generated
-/// index name on collision.
-pub fn index_names(&mut self) -> Result<Vec<String>, ClientError> {
+/// `(name, indexed columns)` of every live secondary-index IDX_TAB row (name in
+/// canonical lowercase). The planner uses this to reject a re-index of an
+/// identical column set under the auto base name and to disambiguate an
+/// auto-generated name against the taken set.
+pub fn index_name_cols(&mut self) -> Result<Vec<(String, gnitz_wire::PkColList)>, ClientError> {
     let (_, idx_batch, _) = self.conn.scan(IDX_TAB, &mut self.schema_cache)?;
     let Some(idx_batch) = idx_batch else { return Ok(Vec::new()) };
-    let mut names = Vec::new();
+    let mut out = Vec::new();
     for i in idx_batch.live_rows() {
-        if let Some(name) = col_str(&idx_batch.columns[4], i)? {
-            names.push(name.to_string());
-        }
+        let Some(name) = col_str(&idx_batch.columns[4], i)? else { continue };
+        let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch.columns[3], i)?);
+        out.push((name.to_string(), cols));
     }
-    Ok(names)
+    Ok(out)
 }
 ```
+
+The auto base name embeds `{schema}__{table}`, so it can only ever collide with
+another index on the same table; a global scan is therefore correct for both the
+duplicate check and the taken set (a different table's row can share neither the
+name nor, meaningfully, the column-set-plus-name pair).
 
 #### 2b. Planner — disambiguate auto names (`crates/gnitz-sql/src/plan/validate.rs`, `ddl.rs`)
 
@@ -237,16 +291,29 @@ pub(crate) fn default_index_name(schema_name: &str, table_name: &str, col_names:
 ```
 
 - **Standalone `CREATE INDEX`** (`execute_create_index`, `ddl.rs`): only the
-  auto-name branch disambiguates, against the existing catalog names:
+  auto-name branch runs the duplicate check and disambiguation, against the
+  existing catalog rows:
 
   ```rust
   let index_name = match explicit_name {
-      Some(name) => name, // explicit: an existing collision still errors downstream
+      Some(name) => name, // explicit: an exact-name collision still errors in `create_index`
       None => {
           let names: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
           let base = default_index_name(schema_name, &table_name, &names);
-          let taken: std::collections::HashSet<String> =
-              client.index_names().map_err(GnitzSqlError::Exec)?.into_iter().collect();
+          let existing = client.index_name_cols().map_err(GnitzSqlError::Exec)?;
+          // A prior *auto-named* index on this exact column set is the same index:
+          // reject it, preserving the pre-disambiguation duplicate rejection. An
+          // FK-backing or explicitly-named index on these columns carries a
+          // different name, so it never blocks a distinct auto-name.
+          if existing
+              .iter()
+              .any(|(name, cols)| name == &base && cols.as_slice() == col_indices.as_slice())
+          {
+              return Err(GnitzSqlError::Plan(format!(
+                  "an index on these columns already exists as '{base}'"
+              )));
+          }
+          let taken: std::collections::HashSet<String> = existing.into_iter().map(|(n, _)| n).collect();
           disambiguate_index_name(base, &taken)
       }
   };
@@ -255,32 +322,43 @@ pub(crate) fn default_index_name(schema_name: &str, table_name: &str, col_names:
 - **Inline `UNIQUE` in `CREATE TABLE`** (`execute_create_table`, `ddl.rs`): the
   table is new, so no pre-existing index can collide (index names embed the
   table name, unique per schema); only the auto-names **within this bundle** can
-  collide with each other, so seed `taken` with the bundle's explicit constraint
-  names and disambiguate each auto-name as it is assigned:
+  collide with each other. Seed `taken` with the bundle's explicit constraint
+  names, then for each auto-name reject an identical column set already assigned an
+  auto-name (the bundle-local true duplicate, e.g. `UNIQUE(a), UNIQUE(a)`) and
+  otherwise disambiguate:
 
   ```rust
   let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
-  // Explicit constraint names first — they are fixed points auto-names route around.
+  // Explicit constraint names first — fixed points auto-names route around.
   for (_, constraint_name) in &unique_cols {
       if let Some(n) = constraint_name {
           taken.insert(n.to_ascii_lowercase());
       }
   }
-  let index_names: Vec<String> = unique_cols
-      .iter()
-      .map(|(col_indices, constraint_name)| {
-          if let Some(name) = constraint_name {
-              name.clone()
-          } else {
+  // Auto-names assigned so far, with their column sets: an identical set is a
+  // true duplicate (reject); a distinct set rendering the same base disambiguates.
+  let mut auto: Vec<(String, &[u32])> = Vec::new();
+  let mut index_names: Vec<String> = Vec::with_capacity(unique_cols.len());
+  for (col_indices, constraint_name) in &unique_cols {
+      let name = match constraint_name {
+          Some(n) => n.clone(),
+          None => {
               let col_names: Vec<&str> =
                   col_indices.iter().map(|&c| cols[c as usize].name.as_str()).collect();
               let base = default_index_name(schema_name, &table_name, &col_names);
-              let name = disambiguate_index_name(base, &taken);
+              if auto.iter().any(|(b, c)| b == &base && *c == col_indices.as_slice()) {
+                  return Err(GnitzSqlError::Plan(format!(
+                      "duplicate UNIQUE constraint on the same columns ('{base}')"
+                  )));
+              }
+              let name = disambiguate_index_name(base.clone(), &taken);
+              auto.push((base, col_indices.as_slice()));
               taken.insert(name.clone());
               name
           }
-      })
-      .collect();
+      };
+      index_names.push(name);
+  }
   ```
 
 The client's store-time canonicalization (Part 1) lowercases whatever name it
@@ -298,15 +376,26 @@ Rust (`integration`):
 2. `inline_unique_name_collision_disambiguated` (`planner_create_table.rs`):
    `CREATE TABLE t (…, UNIQUE(a, b_c), UNIQUE(a_b, c))` succeeds; both indexes
    are droppable by their (suffixed) auto-names.
+3. `same_columns_auto_index_rejected` (`planner_create_index.rs`): `CREATE INDEX
+   ON t(a)` then `CREATE INDEX ON t(a)` — the second is rejected by the
+   same-columns check (the identical column set already carries the auto base
+   name), *not* silently disambiguated to `…__idx_a_2`.
+4. `same_columns_named_index_coexists` (`planner_create_index.rs`): `CREATE INDEX
+   my_idx ON t(a)` then `CREATE INDEX ON t(a)` — both succeed (the named index does
+   not carry the auto base name, so it does not block the auto-name), pinning that
+   the reject keys on `(name == base) ∧ (cols == col_indices)`, not on columns
+   alone.
+5. `inline_duplicate_unique_rejected` (`planner_create_table.rs`): `CREATE TABLE t
+   (a BIGINT PRIMARY KEY, UNIQUE(a), UNIQUE(a))` is rejected as a duplicate UNIQUE
+   constraint on the same columns.
 
 Test-contract updates (the previous behavior was the bug):
 
 - `create_index_duplicate_name_is_rejected` (`planner_create_index.rs`): today
-  asserts the *second auto-named* `CREATE INDEX ON t(v)` is rejected. On the
-  **same column set** the two are genuinely the same index — keep this rejection
-  (the disambiguator only fires on *distinct* column sets that happen to render
-  the same base; identical column sets are rejected earlier as a true duplicate).
-  Verify this still holds and adjust only if the rejection path changed.
+  asserts the *second auto-named* `CREATE INDEX ON t(v)` is rejected. It still is,
+  now by the same-columns structural check rather than the downstream name
+  collision (both indexes are the identical column set). Verify the rejection
+  still fires and adjust only the expected error text if it changed.
 - The engine mirror `test_create_index_duplicate_rejected`
   (`catalog/tests/index_tests.rs`) is unaffected — it drives the engine's direct
   API with an explicit duplicate name.
@@ -318,18 +407,25 @@ never suffixed.
 ## Files touched
 
 - `crates/gnitz-core/src/client.rs` — `canon_name` + store/probe canonicalization
-  (Part 1); `index_names` (Part 2).
-- `crates/gnitz-sql/src/bind/resolve.rs` — lowercase binder-cache keys (Part 1).
+  (Part 1); `index_name_cols` (Part 2).
+- `crates/gnitz-sql/src/bind/resolve.rs` — lowercase binder-cache keys (Part 1);
+  `to_ascii_lowercase` in `build_alias_map` / `resolve_qualified_column` (Part 1c).
 - `crates/gnitz-sql/src/plan/validate.rs` — `default_index_name` lowercase +
-  `disambiguate_index_name` (Part 2).
-- `crates/gnitz-sql/src/plan/ddl.rs` — auto-name disambiguation in
-  `execute_create_index` and `execute_create_table` (Part 2).
+  `disambiguate_index_name` (Part 2); `to_ascii_lowercase` in
+  `reject_duplicate_column_names` (Part 1c).
+- `crates/gnitz-sql/src/plan/view/join.rs` — `to_ascii_lowercase` in the liveness
+  and provenance alias/column folds (Part 1c).
+- `crates/gnitz-sql/src/plan/view/dispatch.rs` — `to_ascii_lowercase` in
+  `collect_operator_names` (Part 1c).
+- `crates/gnitz-sql/src/plan/ddl.rs` — auto-name duplicate check + disambiguation
+  in `execute_create_index` and `execute_create_table` (Part 2).
 - Tests: `planner_create_table.rs`, `planner_cte.rs`, `planner_create_index.rs`.
 
 ## Sequencing
 
-- [ ] 1. Part 1 (client canonicalization + binder-cache keys); Part 1 tests;
+- [ ] 1. Part 1 (client canonicalization + binder-cache keys) + Part 1c
+      (`to_ascii_lowercase` sweep); Part 1 tests; `make verify` green.
+- [ ] 2. Part 2 (`index_name_cols` + same-columns duplicate check +
+      disambiguation, both DDL paths); Part 2 tests + contract updates;
       `make verify` green.
-- [ ] 2. Part 2 (`index_names` + disambiguation); Part 2 tests + contract
-      updates; `make verify` green.
 - [ ] 3. `make e2e` green (W=4) — exercises the DDL/resolution paths end-to-end.
