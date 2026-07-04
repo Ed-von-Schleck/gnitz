@@ -58,6 +58,25 @@ pub(super) fn null_func_ptr() -> *const ScalarFunc {
     std::ptr::null()
 }
 
+/// Both inputs of a `Union` share a physical layout (equal type codes, sizes, and
+/// PK indices); only per-column nullability may differ. Return `a`'s schema with
+/// each column's nullability OR-ed with `b`'s, so a null-carrying side forces the
+/// null-aware `Generic` row comparator instead of the null-blind `FixedIntNonnull`
+/// fast path (which orders by raw payload bytes and would fail to coalesce two
+/// logically-NULL rows carrying non-zero bytes under the null bit).
+pub(super) fn union_nullability_merge(a: &SchemaDescriptor, b: &SchemaDescriptor) -> SchemaDescriptor {
+    debug_assert_eq!(a.num_columns(), b.num_columns(), "union inputs must share a layout");
+    debug_assert_eq!(a.pk_indices(), b.pk_indices(), "union inputs must share a layout");
+    let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
+    for (c, col) in cols[..a.num_columns()].iter_mut().enumerate() {
+        let ac = a.columns[c];
+        let bc = b.columns[c];
+        debug_assert_eq!(ac.type_code, bc.type_code, "union inputs must share a layout");
+        *col = SchemaColumn::new(ac.type_code, ac.nullable | bc.nullable);
+    }
+    SchemaDescriptor::new(&cols[..a.num_columns()], a.pk_indices())
+}
+
 /// Folded-finalize programs threaded through plan emission. `logical` holds the
 /// unresolved programs indexed by `fold_finalize` idx — each is `.take()`n and
 /// resolved exactly once against its reduce node's output schema. `resolved` is
@@ -455,9 +474,17 @@ pub(super) fn emit_node(
 
         gnitz_wire::OpNode::Union => {
             let in_a = in_regs.get(&PORT_IN_A).copied().unwrap_or(0);
-            reg_meta[reg_id as usize] = RegisterMeta::delta(reg_meta[in_a as usize].schema);
             let has_b = in_regs.contains_key(&PORT_IN_B);
             let in_b = in_regs.get(&PORT_IN_B).copied().unwrap_or(0);
+            let a_schema = reg_meta[in_a as usize].schema;
+            let out_schema = if has_b {
+                union_nullability_merge(&a_schema, &reg_meta[in_b as usize].schema)
+            } else {
+                // O(1) identity pass-through (op_union returns PORT_IN_A unchanged); no B
+                // schema to merge.
+                a_schema
+            };
+            reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
             builder.add_union(in_a as u16, in_b as u16, has_b, reg_id as u16);
         }
 

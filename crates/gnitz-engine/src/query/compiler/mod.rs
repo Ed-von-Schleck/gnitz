@@ -2940,4 +2940,106 @@ mod tests {
             "null system-table pointers must return None, not a silently empty circuit"
         );
     }
+
+    // ── Union output-schema nullability merge (null-comparator honesty) ──
+
+    /// `union_nullability_merge` ORs the two inputs' per-column nullability, so a
+    /// null-carrying side reclassifies the output from the null-blind
+    /// `FixedIntNonnull` fast comparator to the null-aware `Generic` one.
+    #[test]
+    fn test_union_nullability_merge_classification() {
+        use crate::schema::PayloadCmpKind;
+        let pk = SchemaColumn::new(type_code::U128, 0);
+        let nonnull = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
+        let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
+
+        // Non-nullable A + nullable B → nullable output column, Generic comparator.
+        let m = union_nullability_merge(&nonnull, &nullable);
+        assert_eq!(m.columns[1].nullable, 1, "OR of non-nullable and nullable = nullable");
+        assert_eq!(m.payload_cmp, PayloadCmpKind::Generic);
+
+        // Both non-nullable → stays on the FixedIntNonnull fast path (byte-identical).
+        let m2 = union_nullability_merge(&nonnull, &nonnull);
+        assert_eq!(m2.columns[1].nullable, 0);
+        assert_eq!(m2.payload_cmp, PayloadCmpKind::FixedIntNonnull);
+
+        // Nullable A + non-nullable B → Generic too (OR is symmetric).
+        let m3 = union_nullability_merge(&nullable, &nonnull);
+        assert_eq!(m3.columns[1].nullable, 1);
+        assert_eq!(m3.payload_cmp, PayloadCmpKind::Generic);
+    }
+
+    /// End-to-end mechanism: two rows that are both NULL in an `I64` payload
+    /// column but carry DIFFERENT non-zero bytes under the null bit (the
+    /// `NullGarbage` construction) and share one content-hash PK.
+    ///
+    /// Root-cause contrast at the dispatched row comparator: the merged schema's
+    /// null-aware `Generic` comparator reads `null == null` and coalesces them;
+    /// the pre-fix inherited `FixedIntNonnull` comparator orders by the raw
+    /// garbage bytes and splits them — the bug this fix removes. (The split can't
+    /// be shown by running consolidation to completion: the write path zero-fills
+    /// null cells, so the two rows become byte-equal only *after* the fast
+    /// comparator has already emitted them as two elements, tripping the
+    /// consolidated-layout debug assert rather than yielding a clean 2-row batch.)
+    ///
+    /// Then end-to-end under the merged (null-aware) schema: the two NULL-garbage
+    /// rows, fed one per `union` input, coalesce through the union + a distinct
+    /// weight-clamp to a single weight-1 row.
+    #[test]
+    fn test_union_nullability_merge_coalesces_null_garbage() {
+        use crate::ops::{op_distinct, op_union};
+        use crate::storage::{compare_rows, compare_rows_fixedint_nonnull, Batch, CursorHandle, Layout};
+        use std::cmp::Ordering;
+        use std::rc::Rc;
+
+        let pk = SchemaColumn::new(type_code::U128, 0);
+        let schema_a = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
+        let schema_b = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
+        // Classification (merged → Generic, schema_a → FixedIntNonnull) is covered by
+        // test_union_nullability_merge_classification; this test starts from that
+        // given and exercises the row-comparator mechanism it selects.
+        let merged = union_nullability_merge(&schema_a, &schema_b);
+
+        // Append one NULL row carrying `garbage` bytes under the null bit, on a
+        // fixed content-hash PK shared by every row here.
+        let push_null_garbage = |bat: &mut Batch, garbage: i64| {
+            bat.extend_pk(0x1234_5678_9abc_def0);
+            bat.extend_weight(&1i64.to_le_bytes());
+            bat.extend_null_bmp(&1u64.to_le_bytes()); // payload col 0 → NULL
+            bat.extend_col(0, &garbage.to_le_bytes()); // non-zero bytes under the null bit
+            bat.count += 1;
+        };
+        let g0 = 0x5555_5555_5555_5555u64 as i64;
+        let g1 = 0xAAAA_AAAA_AAAA_AAAAu64 as i64;
+
+        // Root-cause contrast: same PK, both NULL, different garbage bytes.
+        let mut pair = Batch::with_schema(merged, 2);
+        push_null_garbage(&mut pair, g0);
+        push_null_garbage(&mut pair, g1);
+        assert_eq!(
+            compare_rows(&merged, &pair, 0, &pair, 1),
+            Ordering::Equal,
+            "null-aware Generic comparator: two NULL rows are one element",
+        );
+        assert_ne!(
+            compare_rows_fixedint_nonnull(&schema_a, &pair, 0, &pair, 1),
+            Ordering::Equal,
+            "null-blind FixedIntNonnull comparator: garbage bytes split them (the bug)",
+        );
+
+        // End-to-end under the merged schema: one NULL-garbage row per union input.
+        let single = |garbage: i64| {
+            let mut bat = Batch::with_schema(merged, 1);
+            push_null_garbage(&mut bat, garbage);
+            bat.certify_layout(Layout::Consolidated, &merged);
+            bat
+        };
+        let unioned = op_union(single(g0), Some(&single(g1)), &merged);
+        assert_eq!(unioned.count, 2, "Z-Set + keeps both rows before consolidation");
+        let empty = Rc::new(Batch::empty(1, 16));
+        let mut ch = CursorHandle::from_owned(std::slice::from_ref(&empty), merged);
+        let (out, _) = op_distinct(unioned, ch.cursor_mut(), &merged);
+        assert_eq!(out.count, 1, "null-aware comparator coalesces the two NULL rows");
+        assert_eq!(out.get_weight(0), 1, "distinct clamps the coalesced weight 2 → 1");
+    }
 }

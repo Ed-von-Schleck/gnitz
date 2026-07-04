@@ -121,6 +121,48 @@ class TestSetOps:
         finally:
             client.drop_schema(sn)
 
+    def test_union_distinct_nullable_right_coalesces_null(self, client):
+        """Projection UNION whose LEFT column is `BIGINT NOT NULL` and RIGHT is
+        nullable `BIGINT`: the union output column is nullable, so the compiled
+        view schema must classify its row comparator as null-aware (`Generic`),
+        not the null-blind fixed-int fast path. Multiple NULL rows from the right
+        coalesce to a single NULL row (weight 1) under UNION DISTINCT, and a NULL
+        must never coincide with a genuine non-null 0. Confirms the null-aware
+        view schema end to end."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t_nonnull (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE t_nullable (pk BIGINT NOT NULL PRIMARY KEY, b BIGINT)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a FROM t_nonnull UNION SELECT b FROM t_nullable",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            # Left: 10, 20, and a genuine 0 (must stay distinct from NULL).
+            client.execute_sql(
+                "INSERT INTO t_nonnull VALUES (1, 10), (2, 20), (3, 0)", schema_name=sn)
+            # Right: two NULL b rows (distinct PKs, same NULL content) plus 30.
+            client.execute_sql(
+                "INSERT INTO t_nullable VALUES (10, NULL), (11, NULL), (12, 30)", schema_name=sn)
+
+            # UNION DISTINCT: one row per distinct value. The two NULLs coalesce to
+            # a single NULL row of weight 1; 0 and NULL are separate rows.
+            oracle.assert_view_matches(
+                client, vid, ["a"],
+                {(0,): 1, (10,): 1, (20,): 1, (30,): 1, (None,): 1},
+                ctx="union_distinct_nullable_right",
+            )
+        finally:
+            client.drop_schema(sn)
+
     def test_union_all_retraction(self, client):
         """Deleting a row from one source retracts it from the UNION ALL view."""
         sn = "s" + _uid()
