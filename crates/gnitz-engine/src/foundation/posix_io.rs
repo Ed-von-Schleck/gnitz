@@ -88,6 +88,28 @@ pub fn ftruncate(fd: i32, size: i64) -> i32 {
     unsafe { libc::ftruncate(fd, size as libc::off_t) }
 }
 
+/// Create an anonymous temporary file (`O_TMPFILE`) on the filesystem backing
+/// `dir`, returning its fd (`>= 0`) or -1 on error.
+///
+/// The file has NO directory entry: the kernel reclaims its inode and blocks
+/// the instant the last fd (or mapping) referencing it goes away — on a normal
+/// close, on process exit, and on every abnormal exit (`panic = "abort"`,
+/// `SIGKILL`, OOM-kill) — so it can never leak onto disk, with no unlink
+/// bookkeeping at all.
+///
+/// Opened `O_RDWR` so the caller can write the file and later `mmap` it
+/// `PROT_READ`. `dir` must be a real directory on a filesystem that supports
+/// `O_TMPFILE` (ext4 / xfs / btrfs / tmpfs — every filesystem gnitz stores data
+/// on). `O_TMPFILE` already implies `O_DIRECTORY`, so the path is validated as a
+/// directory by the kernel.
+pub fn open_tmpfile(dir: &str) -> i32 {
+    let dir_c = match std::ffi::CString::new(dir) {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+    unsafe { libc::open(dir_c.as_ptr(), libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC, 0o600) }
+}
+
 /// Set FS_NOCOW_FL on fd (btrfs in-place overwrites).
 /// Silently ignored on non-btrfs filesystems.
 /// Returns 0 on success, -1 on error (non-fatal).
@@ -206,6 +228,31 @@ pub fn server_create(path: &str) -> i32 {
         }
 
         fd
+    }
+}
+
+/// Abort both directions of a connected socket (`shutdown(fd, SHUT_RDWR)`).
+///
+/// Unlike `close`, this forces the kernel to tear the connection down
+/// immediately even with data queued, so any io_uring `OP_SEND` still pending
+/// on `fd` errors out promptly (`ECONNRESET`/`EPIPE`) and its CQE fires. Used
+/// to evict a client that has stopped draining a zero-copy ring-slot egress,
+/// releasing the held W2M slot once the send completes. Retries on `EINTR`;
+/// tolerates `ENOTCONN` (peer already gone). Returns 0 on success (or
+/// `ENOTCONN`), -1 on any other error. Does NOT close the fd — the caller still
+/// reaps it through the normal close path.
+pub fn shutdown(fd: i32) -> i32 {
+    loop {
+        let rc = unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+        if rc >= 0 {
+            return 0;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::ENOTCONN) => return 0,
+            _ => return -1,
+        }
     }
 }
 
@@ -533,6 +580,65 @@ mod tests {
         let local = udp_local_addr(fd).expect("udp_local_addr");
         assert!(local.is_ipv6());
         assert_ne!(local.port(), 0);
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn test_shutdown_aborts_connected_socket() {
+        // On a connected socketpair, `shutdown(SHUT_RDWR)` aborts the write
+        // side, so a subsequent send on that end fails (EPIPE) instead of
+        // queueing — the property the reactor relies on to force a stalled
+        // client's pending OP_SEND to error out. MSG_NOSIGNAL suppresses
+        // SIGPIPE so the failing send returns rather than killing the process.
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        let (a, b) = (fds[0], fds[1]);
+        assert_eq!(shutdown(a), 0, "shutdown on connected socket must succeed");
+        let buf = [0u8; 4];
+        let n = unsafe { libc::send(a, buf.as_ptr() as *const libc::c_void, buf.len(), libc::MSG_NOSIGNAL) };
+        assert!(n < 0, "send after SHUT_RDWR must fail, got {n}");
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+    }
+
+    #[test]
+    fn test_open_tmpfile_is_anonymous_and_round_trips() {
+        // O_TMPFILE yields an inode with ZERO directory links: nothing to leak,
+        // reclaimed on close. The data written round-trips (fd is O_RDWR).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_path = dir.path().to_str().expect("utf8 dir");
+        let fd = open_tmpfile(dir_path);
+        assert!(fd >= 0, "open_tmpfile failed on {dir_path}: {fd}");
+
+        let data = b"external-sort spill run bytes";
+        assert_eq!(unsafe { write_all_fd(fd, data) }, 0, "write_all_fd");
+
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0, "fstat");
+        assert_eq!(st.st_nlink, 0, "O_TMPFILE inode must have no directory entry");
+        assert_eq!(st.st_size as usize, data.len(), "written size");
+
+        assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0, "rewind");
+        let mut back = vec![0u8; data.len()];
+        assert_eq!(unsafe { read_all_fd(fd, &mut back) }, data.len() as i64, "read back");
+        assert_eq!(&back, data, "round-trip through the anonymous file");
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn test_shutdown_tolerates_enotconn() {
+        // An unconnected socket → shutdown returns ENOTCONN, which the wrapper
+        // maps to success (0): evicting an already-gone peer is not an error.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket() failed");
+        assert_eq!(shutdown(fd), 0, "ENOTCONN must be tolerated as success");
         unsafe {
             libc::close(fd);
         }

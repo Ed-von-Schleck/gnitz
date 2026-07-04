@@ -252,6 +252,15 @@ impl CatalogEngine {
         }
     }
 
+    /// The on-disk directory of a user table (`{base_dir}/{schema}/{name}_{tid}`),
+    /// the parent of its per-partition `part_{p}` subdirs. Guaranteed to exist on
+    /// the data filesystem once the table is created, so it anchors an
+    /// `O_TMPFILE` spill (e.g. the CREATE UNIQUE INDEX pre-flight external sort)
+    /// onto the same disk as the table's data. `None` for an unknown table.
+    pub(crate) fn table_directory(&self, table_id: i64) -> Option<&str> {
+        self.dag.tables.get(&table_id).map(|e| e.directory.as_str())
+    }
+
     /// Get a raw mutable pointer to the DagEngine.
     pub(crate) fn get_dag_ptr(&mut self) -> *mut DagEngine {
         &mut self.dag as *mut DagEngine

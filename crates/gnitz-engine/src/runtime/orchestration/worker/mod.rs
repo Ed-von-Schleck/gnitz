@@ -1304,14 +1304,18 @@ impl WorkerProcess {
     /// positive-weight, non-null row of this worker's committed partition of
     /// `owner_id` to the OPK leading-key span of `col_indices` (the same
     /// `IndexKeySpec::key_bytes` contract the master's filter warmup and merge use),
-    /// sort the spans byte-lexicographically, and stream them back sorted. A
-    /// consolidated row at weight ≥ 2 emits its span twice — it IS that many
-    /// live instances of the key, and the duplicate must be visible to the merge
-    /// as an adjacent pair. No local dedup and no within-partition duplicate
-    /// check: the master's adjacent-equal merge subsumes both, and a
-    /// `Vec<PkBuf>` (contiguous, sorted via `PkBuf: Ord`) beats a `BTreeSet` on
-    /// both memory and sort cost. The span is the composite generalisation of the
-    /// old single-`u128` key — a `UNIQUE (a, b)` span exceeds 16 bytes.
+    /// and stream the spans back byte-lexicographically sorted. A consolidated
+    /// row at weight ≥ 2 emits its span twice — it IS that many live instances of
+    /// the key, and the duplicate must be visible to the merge as an adjacent
+    /// pair. No local dedup and no within-partition duplicate check: the master's
+    /// adjacent-equal merge subsumes both.
+    ///
+    /// Sorting is the bounded external merge sort (`storage::SpillSort`), so
+    /// peak RAM is the spill budget, not the partition size — a
+    /// whole-partition in-RAM sort OOM-kills the worker on a large table. All
+    /// fallible spill I/O completes before the first frame is sent, so a fault
+    /// returns `Err` (surfaced to the master as a clean pre-flight fault via
+    /// `send_error`), never a truncated train.
     ///
     /// MUST observe the same snapshot `backfill_index` will later project:
     /// the master sends this command inside the DDL critical section
@@ -1339,17 +1343,25 @@ impl WorkerProcess {
         let spec = crate::schema::IndexKeySpec::new(col_indices, &schema, &idx_schema);
         let frame_schema = crate::runtime::sal::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
-        // Stream the partition chunk-wise and project each chunk to spans —
-        // peak memory beyond one chunk is the span Vec. `key_bytes` keeps the
-        // single column→span definition shared with the filter warmup and the
-        // master merge.
+        // The spill file is an anonymous inode on the owner table's own data
+        // disk, so it never leaks and shares the table's filesystem.
+        let stride = spec.key_size();
+        let dir = self
+            .cat()
+            .table_directory(owner_id)
+            .ok_or_else(|| format!("unique pre-flight: no directory for table {owner_id}"))?
+            .to_string();
         let chunk_rows = self.cat().ddl_scan_chunk_rows;
-        let mut keys: Vec<PkBuf> = Vec::new();
+
+        // Stream the partition chunk-wise, projecting each row to its span and
+        // feeding it to the external sort. Peak RAM is the spill budget, not the
+        // partition. `key_bytes` keeps the single column→span definition shared
+        // with the filter warmup and the master merge.
+        let mut sorter = crate::storage::SpillSort::new(&dir, stride, unique_preflight_spill_bytes());
         let mut keybuf = PkBuf::empty(0);
         if let Some(mut handle) = self.cat().open_store_cursor(owner_id) {
             while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
                 let mb = chunk.as_mem_batch();
-                keys.reserve(chunk.count);
                 for row in 0..chunk.count {
                     let w = chunk.get_weight(row);
                     if w <= 0 {
@@ -1358,25 +1370,28 @@ impl WorkerProcess {
                     if !spec.key_bytes(&mb, row, &mut keybuf) {
                         continue;
                     }
-                    keys.push(keybuf);
+                    sorter.push(keybuf.pk_bytes())?;
                     // Chunks are consolidated: weight ≥ 2 is the same row w
                     // times; one extra copy suffices to put an adjacent equal
                     // pair in the sorted stream for the master's merge.
                     if w > 1 {
-                        keys.push(keybuf);
+                        sorter.push(keybuf.pk_bytes())?;
                     }
                 }
             }
         }
-        keys.sort_unstable();
 
+        // `finish` runs the final spill + merge setup (the last fallible I/O);
+        // the returned producer then lends the globally-sorted spans
+        // infallibly, one at a time, into the frame train.
+        let mut producer = sorter.finish()?;
         send_unique_preflight_keys(
             &self.w2m_writer,
             owner_id as u64,
-            &keys,
             &frame_schema,
             request_id,
             unique_preflight_keys_per_frame(),
+            &mut producer,
         );
         Ok(())
     }
@@ -1634,53 +1649,76 @@ fn unique_preflight_keys_per_frame() -> usize {
         .unwrap_or(UNIQUE_PREFLIGHT_KEYS_PER_FRAME)
 }
 
-/// Stream `keys` (already sorted) to the master as a train of continuation
-/// frames carrying the synthetic pre-flight frame schema (`frame_schema` =
-/// `unique_preflight_wire_schema`, whose PK region is exactly the OPK
-/// leading-key span; each `keys[i]` is that span verbatim). Every frame is
-/// tagged `FLAG_CONTINUATION`; the terminal frame additionally
-/// `FLAG_SCAN_LAST`. An empty key set emits one empty terminal frame so the
-/// master's drain still sees the train end.
+/// Default in-RAM key-byte budget before the pre-flight sort spills a run (128 MiB).
+const UNIQUE_PREFLIGHT_SPILL_BYTES: usize = 128 * 1024 * 1024;
+
+/// Byte budget of accumulated key spans before the pre-flight's external sort
+/// spills a sorted run to disk. Read from `GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES`
+/// (a production memory lever, honoured in every build), default 128 MiB. Peak
+/// worker RAM during the pre-flight is roughly this budget plus the sort index
+/// and one reorder buffer — bounded regardless of partition size.
+fn unique_preflight_spill_bytes() -> usize {
+    std::env::var("GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(UNIQUE_PREFLIGHT_SPILL_BYTES)
+}
+
+/// Stream the sorted OPK leading-key spans lent by `keys` to the master as a
+/// train of continuation frames carrying the synthetic pre-flight frame schema
+/// (`frame_schema` = `unique_preflight_wire_schema`, whose PK region is exactly
+/// the span; each span is written into the PK region verbatim). Every frame is
+/// tagged `FLAG_CONTINUATION`; the terminal frame additionally `FLAG_SCAN_LAST`.
+/// An empty producer emits one empty terminal frame so the master's drain still
+/// sees the train end.
+///
+/// `keys` lends one span at a time so the whole set never has to exist in RAM
+/// at once, and its exact `remaining` count sizes each frame and marks the
+/// terminal one without lookahead. It is infallible: the fast path reads its
+/// own buffer, and the merge reads mapped spill memory (all fallible spill I/O
+/// ran in `SpillSort::finish` before the first frame), so there is no
+/// mid-stream read that could truncate the train under an I/O error.
 ///
 /// Deliberately NOT `send_scan_response`: that path attaches the owner
 /// table's *cached* schema wire block, which would make the master decode
 /// these frames with the table's row stride, and its `pending_streams`
-/// chunking would require materialising all keys as one 32 B/row `Batch` (2×
-/// the caller's `Vec`). The synthetic schema's wire block is built one-off (the
-/// `ReplySchema::OneOff` pattern) and never written to the
-/// table-keyed schema-block cache, so the table's cached block is never
-/// poisoned. `send_encoded` blocks on a full ring until the master's merge
-/// drains it — acceptable backpressure: the worker has nothing else to do
-/// during the DDL window.
+/// chunking would require materialising all keys as one 32 B/row `Batch`. The
+/// synthetic schema's wire block is built one-off (the `ReplySchema::OneOff`
+/// pattern) and never written to the table-keyed schema-block cache, so the
+/// table's cached block is never poisoned. `send_encoded` blocks on a full ring
+/// until the master's merge drains it — acceptable backpressure: the worker has
+/// nothing else to do during the DDL window.
 pub(crate) fn send_unique_preflight_keys(
     w2m_writer: &W2mWriter,
     target_id: u64,
-    keys: &[PkBuf],
     frame_schema: &SchemaDescriptor,
     request_id: u64,
     keys_per_frame: usize,
+    keys: &mut crate::storage::KeyProducer,
 ) {
     debug_assert!(keys_per_frame > 0, "keys_per_frame must be positive");
     let schema_block = ipc::build_schema_wire_block(frame_schema, &[], target_id as u32);
 
-    // Reusable chunk batch: filled, encoded, and cleared per frame.
-    let mut chunk = Batch::with_schema(*frame_schema, keys.len().min(keys_per_frame));
-    let mut start = 0usize;
+    // Reusable chunk batch: filled, encoded, and cleared per frame, sized up
+    // front to exactly one frame's fill.
+    let mut chunk = Batch::with_schema(*frame_schema, keys.remaining().min(keys_per_frame));
+    let mut is_first = true;
     loop {
-        let end = keys.len().min(start + keys_per_frame);
         chunk.clear();
-        for k in &keys[start..end] {
+        let n = keys.remaining().min(keys_per_frame);
+        for _ in 0..n {
+            let k = keys.next().expect("producer lends `remaining` spans");
             chunk.ensure_row_capacity();
             // The span is already OPK; write the raw bytes into the PK region
             // (len == pk_stride). The master reads them back verbatim via
             // `mb.get_pk_bytes(row)` → `PkBuf` — the wire is byte-transparent.
-            chunk.extend_pk_bytes(k.pk_bytes());
+            chunk.extend_pk_bytes(k);
             chunk.extend_weight(&1i64.to_le_bytes());
             chunk.extend_null_bmp(&0u64.to_le_bytes());
             chunk.count += 1;
         }
-        let is_first = start == 0;
-        let is_last = end == keys.len();
+        let is_last = keys.remaining() == 0;
         // Schema block only on the first frame; continuations decode against
         // the master's saved schema hint (synthetic schema version is 0, so
         // no wire_flags_set_schema_version is needed).
@@ -1704,10 +1742,10 @@ pub(crate) fn send_unique_preflight_keys(
                 prebuilt,
             );
         });
+        is_first = false;
         if is_last {
             break;
         }
-        start = end;
     }
 }
 

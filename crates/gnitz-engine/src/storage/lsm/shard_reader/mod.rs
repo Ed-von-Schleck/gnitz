@@ -20,17 +20,30 @@ use crate::foundation::posix_io;
 mod access;
 mod open;
 
-/// RAII handle for an mmap'd file region.
-///
-/// Owning the mapping in a single `Drop`-bearing struct means the unmap path
-/// lives in exactly one place — neither `MappedShard::open`'s error returns
-/// nor `MappedShard::Drop` need to repeat the `munmap` call.
-struct Mmap {
+/// RAII handle for an mmap'd file region. Shared with the LSM siblings
+/// (`spill` maps its external-sort file through it), so the unmap path lives
+/// in exactly one place — neither `MappedShard::open`'s error returns nor
+/// `MappedShard::Drop` need to repeat the `munmap` call.
+pub(super) struct Mmap {
     ptr: *mut u8,
     len: usize,
 }
 
 impl Mmap {
+    /// mmap `[0, len)` of `fd` read-only with a sequential-access hint.
+    /// `len` must be `> 0`. The mapping holds its own reference to the inode,
+    /// so the caller may close `fd` immediately after.
+    pub(super) fn from_fd(fd: i32, len: usize) -> std::io::Result<Self> {
+        debug_assert!(len > 0);
+        let raw = unsafe { libc::mmap(ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+        if raw == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ptr = raw as *mut u8;
+        posix_io::madvise_sequential(ptr, len);
+        Ok(Mmap { ptr, len })
+    }
+
     /// Open `path` read-only, mmap the whole file, and apply huge-page +
     /// sequential madvise hints.  Returns `Truncated` for a file shorter than
     /// `HEADER_SIZE` (the minimum a shard header occupies).
@@ -50,27 +63,13 @@ impl Mmap {
         if len < HEADER_SIZE {
             return Err(StorageError::Truncated);
         }
-        let raw = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if raw == libc::MAP_FAILED {
-            return Err(StorageError::Io);
-        }
-        let ptr = raw as *mut u8;
-        posix_io::madvise_hugepage(ptr, len);
-        posix_io::madvise_sequential(ptr, len);
-        Ok(Mmap { ptr, len })
+        let map = Self::from_fd(fd.as_raw_fd(), len).map_err(|_| StorageError::Io)?;
+        posix_io::madvise_hugepage(map.ptr, map.len);
+        Ok(map)
     }
 
     #[inline]
-    fn as_slice(&self) -> &[u8] {
+    pub(super) fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }

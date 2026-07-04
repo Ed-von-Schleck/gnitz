@@ -19,6 +19,7 @@
 pub(super) mod manifest;
 pub(super) mod partitioned_table;
 pub(super) mod read_cursor;
+pub(super) mod spill;
 pub(super) mod table;
 
 // `wal` + `shard_file` are reached by the documented `repr::batch_wire → lsm`

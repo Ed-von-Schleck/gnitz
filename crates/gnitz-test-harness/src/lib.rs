@@ -28,6 +28,15 @@ impl ServerHandle {
     }
 
     pub fn start_n(workers: usize) -> Option<Self> {
+        Self::start_with_env(workers, &[])
+    }
+
+    /// Like [`Self::start_n`], but sets extra environment variables on the
+    /// server process only (not the test's own process env), so a test that
+    /// needs a server-side seam — e.g. `GNITZ_CLIENT_SEND_TIMEOUT_MS` — cannot
+    /// race a sibling test through the process-global env under parallel
+    /// `cargo test`.
+    pub fn start_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Option<Self> {
         let bin = env::var("GNITZ_SERVER_BIN")
             .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
         if !PathBuf::from(&bin).is_file() {
@@ -56,6 +65,9 @@ impl ServerHandle {
         // the SAL small unless the caller already pinned a size.
         if env::var_os("GNITZ_SAL_BYTES").is_none() {
             cmd.env("GNITZ_SAL_BYTES", "134217728"); // 128 MiB
+        }
+        for (k, v) in extra_env {
+            cmd.env(k, v);
         }
         if workers > 1 {
             cmd.arg(format!("--workers={workers}"));

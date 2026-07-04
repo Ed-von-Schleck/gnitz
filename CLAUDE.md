@@ -479,6 +479,8 @@ Note that when piping `make e2e` or any other command through `| tail ...`, do n
 | `GNITZ_LOG_LEVEL` | `quiet` / `normal` / `verbose` (`debug` = alias) |
 | `GNITZ_SERVER_BIN` | Override server binary (e.g. aim E2E at the release build) |
 | `GNITZ_CHECKPOINT_BYTES` | SAL checkpoint threshold (default 75% of SAL) |
+| `GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES` | CREATE UNIQUE INDEX pre-flight in-RAM sort budget before spilling to disk (default 128 MiB) |
+| `GNITZ_CLIENT_SEND_TIMEOUT_MS` | Per-frame deadline on ring-slot client egress before a stalled client is evicted (default 30 s) |
 
 ## Debug logging
 

@@ -6,7 +6,7 @@
 //! covered by the multi-worker E2E suite.
 //!
 //! Every key is the OPK leading-key span (`PkBuf`) — equality-correct and
-//! byte-orderable at any width — replacing the old single-`u128` key.
+//! byte-orderable at any width.
 
 use rustc_hash::FxHashSet;
 
@@ -20,7 +20,7 @@ use crate::runtime::wire::{
 };
 use crate::runtime::worker::send_unique_preflight_keys;
 use crate::schema::{type_code, IndexKeySpec, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, PkBuf};
+use crate::storage::{Batch, KeyProducer, PkBuf, SpillSort};
 
 // ---------------------------------------------------------------------------
 // Span helpers
@@ -45,6 +45,19 @@ fn span_i64(v: i64) -> PkBuf {
 fn u128_frame_schema() -> SchemaDescriptor {
     // Index columns are all non-nullable (PK region); nullable=0 throughout.
     SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0)], &[0])
+}
+
+/// Build the real sorted-span producer over pre-sorted `keys` via
+/// `SpillSort`'s in-RAM fast path (budget far above the data, so the spill
+/// dir is never touched) — the same producer `handle_unique_preflight` feeds
+/// to the frame sink.
+fn producer_of(keys: &[PkBuf]) -> KeyProducer {
+    let stride = keys.first().map_or(16, |k| k.pk_bytes().len());
+    let mut s = SpillSort::new("", stride, usize::MAX);
+    for k in keys {
+        s.push(k.pk_bytes()).unwrap();
+    }
+    s.finish().unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +170,7 @@ fn preflight_train_multi_frame_key_roundtrip() {
     .collect();
     let frame_schema = u128_frame_schema();
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(writer, 77, &keys, &frame_schema, 9001, 4);
+        send_unique_preflight_keys(writer, 77, &frame_schema, 9001, 4, &mut producer_of(&keys));
         let got = drain_train(receiver, 9001);
         assert_eq!(got, keys);
         assert!(receiver.try_read_slot(0).is_none(), "no frames after terminal");
@@ -171,7 +184,7 @@ fn preflight_train_exact_frame_boundary() {
     let keys: Vec<PkBuf> = (0..8u128).map(span_u128).collect();
     let frame_schema = u128_frame_schema();
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(writer, 77, &keys, &frame_schema, 42, 4);
+        send_unique_preflight_keys(writer, 77, &frame_schema, 42, 4, &mut producer_of(&keys));
         let got = drain_train(receiver, 42);
         assert_eq!(got, keys);
         assert!(receiver.try_read_slot(0).is_none());
@@ -184,7 +197,7 @@ fn preflight_train_exact_frame_boundary() {
 fn preflight_train_empty_partition_single_terminal_frame() {
     let frame_schema = u128_frame_schema();
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(writer, 77, &[], &frame_schema, 7, 4);
+        send_unique_preflight_keys(writer, 77, &frame_schema, 7, 4, &mut producer_of(&[]));
         let slot = receiver.try_read_slot(0).expect("terminal frame");
         let ctrl = peek_control_block(slot.bytes()).expect("ctrl decodes");
         assert_eq!(ctrl.status, 0);
@@ -222,7 +235,7 @@ fn preflight_train_composite_wide_span_roundtrip() {
     };
     let keys = vec![span(7, 1), span(7, 2), span(9, 1)];
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(writer, 5, &keys, &frame_schema, 3, 2);
+        send_unique_preflight_keys(writer, 5, &frame_schema, 3, 2, &mut producer_of(&keys));
         let got = drain_train(receiver, 3);
         assert_eq!(got, keys);
         assert_eq!(got[0].pk_bytes().len(), 16, "composite span is the full 16 bytes");
@@ -303,7 +316,7 @@ fn preflight_signed_payload_projection_roundtrip() {
 
     let frame_schema = unique_preflight_wire_schema(&make_index_schema(&[1], &schema).unwrap(), 1);
     with_test_ring(|writer, receiver| {
-        send_unique_preflight_keys(writer, 5, &keys, &frame_schema, 11, 3);
+        send_unique_preflight_keys(writer, 5, &frame_schema, 11, 3, &mut producer_of(&keys));
         let got = drain_train(receiver, 11);
         assert_eq!(got, keys);
         // The duplicate pair is adjacent in the sorted stream — exactly what the

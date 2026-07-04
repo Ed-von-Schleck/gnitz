@@ -62,11 +62,23 @@ impl Future for TimerFuture {
 
 impl Drop for TimerFuture {
     fn drop(&mut self) {
-        if self.timer_id.is_some() {
-            // Signal dispatch_cqe to discard the CQE without waking.
-            // No SQE cancellation is needed: the CQE will arrive and be
-            // silently dropped by the KIND_TIMEOUT handler.
+        if let Some(id) = self.timer_id {
+            // Signal dispatch_cqe to discard the CQE without waking — covers
+            // a fire whose CQE already raced past the cancel below.
             self.cancelled.set(true);
+            // Reclaim the kernel timer promptly instead of letting it run to
+            // its deadline: deadline guards (e.g. the per-frame send-slot
+            // eviction timer) drop their timer on every happy-path completion,
+            // and without the cancel each one would leave an armed Timeout,
+            // its waker entry, and its Timespec box behind for the full
+            // window. The cancel's own CQE lands on the no-op
+            // KIND_TIMEOUT_CANCEL sink; the Timeout's CQE (-ECANCELED) lands
+            // on KIND_TIMEOUT, whose handler sees `cancelled` and discards
+            // the wake. Same pattern as `UdpRecvFuture::drop`.
+            self.inner
+                .ring
+                .borrow_mut()
+                .prep_async_cancel(udata(KIND_TIMEOUT, id), udata(KIND_TIMEOUT_CANCEL, 0));
         }
     }
 }

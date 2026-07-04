@@ -48,6 +48,11 @@ impl Peer {
         }
     }
 
+    /// Forward a worker W2M ring slot to the client zero-copy, under the
+    /// reactor's per-frame egress deadline: a client that stalls the send is
+    /// shut down so the held ring slot frees (see [`Reactor::send_slot`]).
+    /// Returns the send rc (`< 0` — disconnect or eviction — means the client
+    /// is gone).
     pub async fn send_slot(&self, slot: W2mSlot) -> i32 {
         match &self.inner {
             PeerInner::Unix { fd, reactor } => reactor.send_slot(*fd, slot).await,

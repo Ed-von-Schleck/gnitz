@@ -97,6 +97,12 @@ pub const KIND_UDP_RECV: u64 = 9;
 /// FUTEX_WAITV shutdown handshake. The dispatch arm is a pure no-op — the
 /// cancellation's *effect* is observed on the RECVMSG's own CQE.
 pub const KIND_UDP_CANCEL: u64 = 10;
+/// CQE tag for the `AsyncCancel` a dropped `TimerFuture` submits against its
+/// Timeout SQE, so a cancelled timer's kernel state is reclaimed immediately
+/// instead of at its deadline. The dispatch arm is a pure no-op — the
+/// cancellation's *effect* is the Timeout's own `-ECANCELED` CQE under
+/// `KIND_TIMEOUT`, discarded there via the `cancelled` flag.
+pub const KIND_TIMEOUT_CANCEL: u64 = 11;
 
 const KIND_SHIFT: u64 = 56;
 const ID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
@@ -940,10 +946,10 @@ impl Reactor {
                 }
             }
             KIND_UDP_RECV => self.handle_udp_recv_cqe(id, &cqe),
-            KIND_UDP_CANCEL => {
+            KIND_UDP_CANCEL | KIND_TIMEOUT_CANCEL => {
                 // The AsyncCancel's own CQE. The cancellation's *effect*
-                // arrives separately as the RECVMSG's -ECANCELED under
-                // KIND_UDP_RECV (same split as the FUTEX_WAITV cancel pair).
+                // arrives separately as the target op's -ECANCELED under its
+                // own kind (same split as the FUTEX_WAITV cancel pair).
             }
             _ => {}
         }

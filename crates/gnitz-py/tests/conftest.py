@@ -219,6 +219,18 @@ def unique_preflight_fault_server(monkeypatch):
 
 
 @pytest.fixture
+def unique_preflight_spill_server(monkeypatch):
+    """Server whose CREATE UNIQUE INDEX pre-flight spills its key sort to disk at
+    a tiny 256-byte budget, so a few hundred rows per worker force many
+    external-sort spill runs and a k-way merge — exercising the bounded-memory
+    path end-to-end. Unlike the debug seams above, `GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES`
+    is a real config knob honoured in every build, so this also bites a release
+    server."""
+    yield from _seamed_server(
+        monkeypatch, {"GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES": "256"})
+
+
+@pytest.fixture
 def relay_lowspace_server(monkeypatch):
     """Server with the one-shot low-relay-space seam (GNITZ_INJECT_RELAY_SPACE_LOW)
     armed, for the barrier-only-checkpoint reclaim test. Unlike the other seam

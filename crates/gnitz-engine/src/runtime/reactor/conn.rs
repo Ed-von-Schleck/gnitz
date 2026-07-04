@@ -4,6 +4,24 @@
 use super::futures::{AcceptFuture, RecvFuture, SendAlive, SendFuture};
 use super::*;
 
+/// Per-frame wall-clock deadline for zero-copy ring-slot client egress, read
+/// once from `GNITZ_CLIENT_SEND_TIMEOUT_MS` (default 30 s). The deadline is
+/// per-frame, so a client making steady progress across a large train is never
+/// penalised — only one that makes zero progress for the full window (a stalled
+/// or maliciously zero-window peer) is evicted. Generous by default so ordinary
+/// transient congestion never sheds a healthy client; e2e tests shrink it to
+/// bound the freeze window they assert on.
+fn client_send_timeout() -> std::time::Duration {
+    static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let ms = std::env::var("GNITZ_CLIENT_SEND_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30_000);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
 impl Reactor {
     /// Allocate a per-send id distinct from reply / fsync id space.
     /// `pub(super)` so `reactor::udp` allocates its op ids from the same
@@ -113,15 +131,49 @@ impl Reactor {
         self.send_buf_inner(fd, ptr, len, SendAlive::Pooled(Rc::new(buf))).await
     }
 
-    /// Send the frame bytes of a W2M ring slot directly, without copying.
+    /// Send the frame bytes of a W2M ring slot directly, without copying,
+    /// under the per-frame client-egress deadline.
     ///
     /// The slot is kept alive (consume_cursor stays fixed) until the io_uring
     /// OP_SEND CQE fires, at which point the kernel has consumed the data and
-    /// the slot is dropped, advancing the cursor.
+    /// the slot is dropped, advancing the cursor. That pin is why every slot
+    /// send carries the deadline: a client that stops draining its socket
+    /// pins the slot; with enough stalled frames the worker's W2M ring fills
+    /// and the single-threaded worker blocks synchronously in `send_encoded`'s
+    /// futex, starving every other client's SAL progress — a cluster-wide
+    /// freeze. All ring-slot egress (scan trains, seek replies) shares this
+    /// one guarded primitive, so no forwarding path can reintroduce the
+    /// freeze by picking an unguarded variant.
+    ///
+    /// If the send makes no progress within `client_send_timeout()`, the
+    /// client is treated as dead: `shutdown(SHUT_RDWR)` forces the in-flight
+    /// `OP_SEND` to error out promptly, then the SAME send future is awaited
+    /// to completion so the held `W2mSlot` is released (advancing
+    /// consume_cursor) only AFTER its CQE — never dropped while an SQE still
+    /// references its buffer. Returns the send rc: `>= 0` sent, `< 0` the
+    /// client disconnected or was evicted (the post-`shutdown` rc, clamped
+    /// negative in case the completion raced the deadline).
+    ///
+    /// Passing `send_fut.as_mut()` (a `Pin<&mut>` — itself a `Future`) to
+    /// `select2` means the timer winning drops only that borrow, never the send
+    /// future, so it stays owned here for the mandatory post-`shutdown` await.
     pub async fn send_slot(&self, fd: i32, slot: W2mSlot) -> i32 {
         let frame = slot.frame_bytes();
         let (ptr, len) = (frame.as_ptr(), frame.len());
-        self.send_buf_inner(fd, ptr, len, SendAlive::Slot(Rc::new(slot))).await
+        let mut send_fut = std::pin::pin!(self.send_buf_inner(fd, ptr, len, SendAlive::Slot(Rc::new(slot))));
+        let deadline = Instant::now() + client_send_timeout();
+        match select2(send_fut.as_mut(), self.timer(deadline)).await {
+            Either::A(rc) => rc,
+            Either::B(()) => {
+                crate::gnitz_warn!(
+                    "reactor: client fd={} stalled ring-slot egress past {:?}; evicting to free the W2M ring",
+                    fd,
+                    client_send_timeout(),
+                );
+                crate::foundation::posix_io::shutdown(fd);
+                send_fut.await.min(-1)
+            }
+        }
     }
 
     /// Send the precomputed OK HELLO ACK frame. The bytes are a `'static`

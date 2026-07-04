@@ -1782,6 +1782,63 @@ class TestUniqueIndexCreatePreflight:
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_pk"], tables=["t"])
 
+    def test_preflight_spill_large_partition_bounded_and_correct(
+            self, unique_preflight_spill_server):
+        """With a tiny spill budget, a CREATE UNIQUE INDEX over a table whose
+        per-worker partition far exceeds the budget drives the external merge
+        sort (many spill runs + a k-way merge over the runs). On all-distinct
+        data the index is created and then enforces uniqueness on a fresh
+        INSERT; a genuinely new value is still admitted."""
+        client = unique_preflight_spill_server
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn)
+            # 2000 distinct vals over a wide PK spread → hundreds of spans per
+            # worker, far past the 256-byte (32-span) budget → many spilled runs.
+            n = 2000
+            _insert_rows(client, sn, [(i * 7 + 1, i) for i in range(n)])
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert _table_has_index(client, sn, "t")
+            # The created index enforces uniqueness: val=5 is already present.
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(
+                    f"INSERT INTO t VALUES ({n * 10}, 5)", schema_name=sn)
+            # A genuinely new value is admitted.
+            client.execute_sql(
+                f"INSERT INTO t VALUES ({n * 10 + 1}, {n + 1})", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+    def test_preflight_spill_rejects_duplicate_across_runs(
+            self, unique_preflight_spill_server):
+        """A pre-existing duplicate value buried in a large partition (spilled
+        across many external-sort runs, on the same worker or across partitions)
+        is still caught by the pre-flight: the CREATE is rejected, no index
+        remains, and a fresh duplicate INSERT is still permitted (no phantom
+        constraint from the aborted DDL)."""
+        client = unique_preflight_spill_server
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            self._bigint_table(client, sn)
+            n = 2000
+            rows = [(i * 7 + 1, i) for i in range(n)]
+            # Repeat the first row's val on a far-away PK appended last, so the
+            # two equal spans are buried among many runs / partitions and only
+            # the sorted merge brings them adjacent.
+            rows.append((n * 10 + 3, 0))
+            _insert_rows(client, sn, rows)
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            assert not _table_has_index(client, sn, "t"), \
+                "no index may exist after a rejected spill-scale CREATE UNIQUE INDEX"
+            # No phantom constraint: a fresh duplicate is still allowed.
+            client.execute_sql(
+                f"INSERT INTO t VALUES ({n * 10 + 4}, 0)", schema_name=sn)
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
 
 # ---------------------------------------------------------------------------
 # TestCompositeIndex — multi-column secondary indexes

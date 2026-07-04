@@ -1798,6 +1798,11 @@ async fn drain_scan_train(
 ) -> Result<bool, String> {
     loop {
         let (_, has_more) = parse_train_header(&slot, worker, "scan")?;
+        // Deadline-guarded (built into `send_slot`): a client that stops
+        // draining this zero-copy ring slot is evicted, rc goes negative, and
+        // this returns Ok(false); the caller drops the `ScanLease`, discarding
+        // the rest of the train and advancing consume_cursor so the worker
+        // unblocks.
         let rc = peer.send_slot(slot).await;
         if rc < 0 {
             return Ok(false);

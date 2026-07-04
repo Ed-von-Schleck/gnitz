@@ -45,6 +45,7 @@ pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
 #[cfg(test)]
 pub(crate) use lsm::read_cursor::REWIND_CALLS;
 pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
+pub(crate) use lsm::spill::{KeyProducer, SpillSort};
 pub(crate) use lsm::wal::block_size as wal_block_size;
 pub(crate) use merge::{pk_sort_key, BlobCacheGuard, DirectWriter};
 pub(crate) use range_key::{increment_key_in_place, range_cut_points};
