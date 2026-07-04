@@ -70,7 +70,6 @@ def checkpoint_client(checkpoint_server):
 
 
 def _setup(client):
-    import random
     uid = str(random.randint(100_000, 999_999))
     sn = "s" + uid
     client.create_schema(sn)
@@ -81,8 +80,47 @@ def _setup(client):
     return sn, tid, schema
 
 
-def _count_view(client, vid):
-    return sum(r.weight for r in client.scan(vid) if r.weight > 0)
+def _count_live(client, tid):
+    """Net live row count of a table or view."""
+    return sum(r.weight for r in client.scan(tid) if r.weight > 0)
+
+
+def _filler_schema(client, table_name="filler"):
+    """Create a fresh schema + BIGINT (pk, val) table; return (tid, schema, sn)."""
+    sn = "ck" + str(random.randint(100_000, 999_999))
+    client.create_schema(sn)
+    client.execute_sql(
+        f"CREATE TABLE {table_name} (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+        schema_name=sn,
+    )
+    tid, _ = client.resolve_table(sn, table_name)
+    cols = [
+        # BIGINT maps to I64 (native PK types: planner no longer coerces).
+        gnitz.ColumnDef("pk", gnitz.TypeCode.I64, primary_key=True),
+        gnitz.ColumnDef("val", gnitz.TypeCode.I64),
+    ]
+    schema = gnitz.Schema(cols)
+    return tid, schema, sn
+
+
+def _push_loop(client, tid, schema, errors, started, n_batches=25, batch_size=400):
+    """Flood `tid` with n_batches × batch_size rows to trigger checkpoints.
+
+    Sets `started` after the first push (and on failure, so waiters wake) and
+    records any exception in `errors`.
+    """
+    try:
+        for i in range(n_batches):
+            batch = gnitz.ZSetBatch(schema)
+            for j in range(batch_size):
+                pk = i * batch_size + j
+                batch.append(pk=pk, val=pk)
+            client.push(tid, batch)
+            if i == 0:
+                started.set()
+    except Exception as exc:
+        errors.append(("push", exc))
+        started.set()
 
 
 def test_no_rows_lost_across_checkpoints(checkpoint_client):
@@ -104,31 +142,31 @@ def test_no_rows_lost_across_checkpoints(checkpoint_client):
             batch.append(pk=i, val=i)
         client.push(tid, batch)
 
-    rows = list(client.scan(tid))
-    live = sum(r.weight for r in rows if r.weight > 0)
+    live = _count_live(client, tid)
     assert live == total, f"Expected {total} rows, got {live} — entries lost during checkpoint"
 
 
-def test_no_rows_lost_with_view_during_checkpoints(checkpoint_client):
-    """Table rows pushed concurrently with tick evaluation must not be lost.
+def test_view_matches_base_across_checkpoints(checkpoint_client):
+    """A view must converge to its base table across frequent checkpoints.
 
     A view forces tick evaluation.  With GNITZ_CHECKPOINT_BYTES=32KB,
-    checkpoints fire after every few flushes.  Ticks fire concurrently with
-    pushes once 10 000 rows accumulate.  This exercises the timing window
-    where checkpoint and tick evaluation overlap — the exact scenario where
-    pre_write_pushes could silently drop entries on checkpoint failure.
+    checkpoints fire after every few flushes; with 15 000 rows the auto-tick
+    (10 000 rows) fires mid-sequence too — so a checkpoint lands between
+    committed-but-unticked view deltas and the tick that would apply them.
 
-    We only assert the TABLE count, not the view count.  At this checkpoint
-    threshold, checkpoints clear pending_deltas faster than ticks can consume
-    them (expected architectural behaviour), so the view count is an
-    unreliable signal.  The important invariant is that the durable table
-    storage reflects all 15 000 pushed rows.
+    Regression: if a checkpoint's flush discards the workers' buffered
+    effective deltas (pending_deltas), the base table keeps the rows but no
+    later tick ever applies them to the view, which stays permanently diverged
+    until a restart rebuilds it.  Once the scan barrier drains the pending
+    ticks, BOTH the durable table AND the derived view must reflect all
+    15 000 rows.
     """
     client = checkpoint_client
     sn, tid, schema = _setup(client)
 
     # Create a view so tick evaluation runs concurrently with pushes.
     client.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name=sn)
+    vid, _ = client.resolve_table(sn, "v")
 
     # 15 000 rows: exceeds TICK_COALESCE_ROWS (10 000) so ticks fire during
     # the push sequence, not only after.
@@ -140,9 +178,68 @@ def test_no_rows_lost_with_view_during_checkpoints(checkpoint_client):
             batch.append(pk=i, val=i)
         client.push(tid, batch)
 
-    table_live = sum(r.weight for r in client.scan(tid) if r.weight > 0)
+    table_live = _count_live(client, tid)
     assert table_live == total, \
         f"Table count mismatch: expected {total}, got {table_live} — entries lost during checkpoint"
+    # The scan barrier drains any still-pending ticks before reading, so the
+    # view must now equal the base — no delta discarded by a checkpoint.
+    view_live = _count_live(client, vid)
+    assert view_live == total, \
+        f"View diverged from base: expected {total}, got {view_live} — a checkpoint dropped buffered view deltas"
+
+
+def test_views_track_base_under_sustained_ingest_with_scans(checkpoint_server):
+    """A view stays equal to its base table across many checkpoints while a
+    reader concurrently scans it — no wedge, no divergence.
+
+    Sustained ingest in small (< 10 000-row) batches crosses many 32KB
+    checkpoints without the auto-tick firing per batch, so buffered view
+    deltas routinely straddle a checkpoint.  A second connection scans the
+    view throughout (each scan drains pending ticks via the scan barrier).
+    After ingest, both the table and the view must show every row, and neither
+    thread may hang.
+    """
+    with gnitz.connect(checkpoint_server) as pusher, \
+         gnitz.connect(checkpoint_server) as scanner:
+        tid, schema, sn = _filler_schema(pusher, table_name="t")
+        pusher.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name=sn)
+        vid, _ = pusher.resolve_table(sn, "v")
+
+        total = 12_000
+        errors = []
+        push_started = threading.Event()
+
+        def scan_loop():
+            push_started.wait(timeout=15)
+            try:
+                for _ in range(30):
+                    # Each scan drains pending ticks and must never hang; the
+                    # view weight is monotonic, never exceeding rows pushed.
+                    live = _count_live(scanner, vid)
+                    assert live <= total, f"view overcounted: {live} > {total}"
+            except Exception as exc:
+                errors.append(("scan", exc))
+
+        # 300-row batches stay under TICK_COALESCE_ROWS: no per-batch auto-tick.
+        push_t = threading.Thread(target=_push_loop, daemon=True,
+                                  args=(pusher, tid, schema, errors, push_started),
+                                  kwargs={"n_batches": 40, "batch_size": 300})
+        scan_t = threading.Thread(target=scan_loop, daemon=True)
+        push_t.start()
+        scan_t.start()
+        push_t.join(timeout=60)
+        scan_t.join(timeout=30)
+
+        assert not push_t.is_alive(), "push loop hung during concurrent checkpoints"
+        assert not scan_t.is_alive(), "scan loop hung during concurrent checkpoints"
+        for src, exc in errors:
+            raise AssertionError(f"{src} thread raised: {exc}")
+
+        table_live = _count_live(pusher, tid)
+        view_live = _count_live(pusher, vid)
+        assert table_live == total, f"table: expected {total}, got {table_live}"
+        assert view_live == total, \
+            f"view diverged from base after sustained checkpointed ingest: expected {total}, got {view_live}"
 
 
 # ---------------------------------------------------------------------------
@@ -160,34 +257,6 @@ def test_no_rows_lost_with_view_during_checkpoints(checkpoint_client):
 # with a timeout; assert-not-alive converts a permanent hang into a test
 # failure.
 
-def _filler_schema(client, sock_path):
-    """Return (socket_path, filler_tid, filler_schema, sn) after DDL."""
-    sn = "ck" + str(random.randint(100_000, 999_999))
-    client.create_schema(sn)
-    client.execute_sql(
-        "CREATE TABLE filler (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-        schema_name=sn,
-    )
-    filler_tid, _ = client.resolve_table(sn, "filler")
-    cols = [
-        # BIGINT maps to I64 (native PK types: planner no longer coerces).
-        gnitz.ColumnDef("pk", gnitz.TypeCode.I64, primary_key=True),
-        gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-    ]
-    schema = gnitz.Schema(cols)
-    return filler_tid, schema, sn
-
-
-def _push_to_fill(client, filler_tid, schema, n_batches=25, batch_size=400):
-    """Push n_batches × batch_size rows into filler to trigger checkpoints."""
-    for i in range(n_batches):
-        batch = gnitz.ZSetBatch(schema)
-        for j in range(batch_size):
-            pk = i * batch_size + j
-            batch.append(pk=pk, val=pk)
-        client.push(filler_tid, batch)
-
-
 def test_seek_during_checkpoints(checkpoint_server):
     """SEEK (single_worker_async) must not hang when checkpoints fire concurrently.
 
@@ -198,7 +267,7 @@ def test_seek_during_checkpoints(checkpoint_server):
     with gnitz.connect(checkpoint_server) as pusher, \
          gnitz.connect(checkpoint_server) as seeker:
 
-        filler_tid, filler_schema, sn = _filler_schema(pusher, checkpoint_server)
+        filler_tid, filler_schema, sn = _filler_schema(pusher)
 
         # Create a target table with one row for the seeker.
         pusher.execute_sql(
@@ -211,20 +280,6 @@ def test_seek_during_checkpoints(checkpoint_server):
         errors = []
         push_started = threading.Event()
 
-        def push_loop():
-            try:
-                for i in range(25):
-                    batch = gnitz.ZSetBatch(filler_schema)
-                    for j in range(400):
-                        pk = i * 400 + j
-                        batch.append(pk=pk, val=pk)
-                    pusher.push(filler_tid, batch)
-                    if i == 0:
-                        push_started.set()
-            except Exception as exc:
-                errors.append(("push", exc))
-                push_started.set()
-
         def seek_loop():
             push_started.wait(timeout=15)
             try:
@@ -233,7 +288,8 @@ def test_seek_during_checkpoints(checkpoint_server):
             except Exception as exc:
                 errors.append(("seek", exc))
 
-        push_t = threading.Thread(target=push_loop, daemon=True)
+        push_t = threading.Thread(target=_push_loop, daemon=True,
+                                  args=(pusher, filler_tid, filler_schema, errors, push_started))
         seek_t = threading.Thread(target=seek_loop, daemon=True)
         push_t.start()
         seek_t.start()
@@ -257,7 +313,7 @@ def test_scan_during_checkpoints(checkpoint_server):
     with gnitz.connect(checkpoint_server) as pusher, \
          gnitz.connect(checkpoint_server) as scanner:
 
-        filler_tid, filler_schema, sn = _filler_schema(pusher, checkpoint_server)
+        filler_tid, filler_schema, sn = _filler_schema(pusher)
 
         pusher.execute_sql(
             "CREATE TABLE target (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
@@ -269,20 +325,6 @@ def test_scan_during_checkpoints(checkpoint_server):
         errors = []
         push_started = threading.Event()
 
-        def push_loop():
-            try:
-                for i in range(25):
-                    batch = gnitz.ZSetBatch(filler_schema)
-                    for j in range(400):
-                        pk = i * 400 + j
-                        batch.append(pk=pk, val=pk)
-                    pusher.push(filler_tid, batch)
-                    if i == 0:
-                        push_started.set()
-            except Exception as exc:
-                errors.append(("push", exc))
-                push_started.set()
-
         def scan_loop():
             push_started.wait(timeout=15)
             try:
@@ -291,7 +333,8 @@ def test_scan_during_checkpoints(checkpoint_server):
             except Exception as exc:
                 errors.append(("scan", exc))
 
-        push_t = threading.Thread(target=push_loop, daemon=True)
+        push_t = threading.Thread(target=_push_loop, daemon=True,
+                                  args=(pusher, filler_tid, filler_schema, errors, push_started))
         scan_t = threading.Thread(target=scan_loop, daemon=True)
         push_t.start()
         scan_t.start()
@@ -326,7 +369,7 @@ def test_unique_constraint_enforced_under_checkpoint_pressure(checkpoint_server)
     with gnitz.connect(checkpoint_server) as pusher, \
          gnitz.connect(checkpoint_server) as inserter:
 
-        filler_tid, filler_schema, sn = _filler_schema(pusher, checkpoint_server)
+        filler_tid, filler_schema, sn = _filler_schema(pusher)
 
         inserter.execute_sql(
             "CREATE TABLE unique_t ("
@@ -343,20 +386,6 @@ def test_unique_constraint_enforced_under_checkpoint_pressure(checkpoint_server)
         errors = []
         push_started = threading.Event()
 
-        def push_loop():
-            try:
-                for i in range(25):
-                    batch = gnitz.ZSetBatch(filler_schema)
-                    for j in range(400):
-                        pk = i * 400 + j
-                        batch.append(pk=pk, val=pk)
-                    pusher.push(filler_tid, batch)
-                    if i == 0:
-                        push_started.set()
-            except Exception as exc:
-                errors.append(("push", exc))
-                push_started.set()
-
         n_rows = 50
 
         def insert_loop():
@@ -370,7 +399,8 @@ def test_unique_constraint_enforced_under_checkpoint_pressure(checkpoint_server)
             except Exception as exc:
                 errors.append(("insert", exc))
 
-        push_t = threading.Thread(target=push_loop, daemon=True)
+        push_t = threading.Thread(target=_push_loop, daemon=True,
+                                  args=(pusher, filler_tid, filler_schema, errors, push_started))
         insert_t = threading.Thread(target=insert_loop, daemon=True)
         push_t.start()
         insert_t.start()
@@ -385,7 +415,7 @@ def test_unique_constraint_enforced_under_checkpoint_pressure(checkpoint_server)
             raise AssertionError(f"{src} thread raised: {exc}")
 
         # 1. All rows must be visible.
-        live = sum(r.weight for r in inserter.scan(unique_tid) if r.weight > 0)
+        live = _count_live(inserter, unique_tid)
         assert live == n_rows, f"Expected {n_rows} rows, got {live} after checkpoints"
 
         # 2. Unique filter must still enforce the constraint.

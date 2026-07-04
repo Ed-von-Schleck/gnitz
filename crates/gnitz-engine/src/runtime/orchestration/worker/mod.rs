@@ -868,6 +868,15 @@ impl WorkerProcess {
                         // after the DDL zone is durable. Discard the worker's
                         // redundant queue so it cannot grow unbounded.
                         self.cat().discard_pending_dir_deletions();
+                        // A DROP retracts the table/view's catalog row, so its id is
+                        // no longer live. If a push landed between its last tick and
+                        // the drop, its pending_deltas entry would never tick again
+                        // (the master's tick loop filters dropped ids), so GC any
+                        // now-dead ids here — this is a dead entry's only reaper.
+                        // Raw reborrow: `self.cat()` would borrow all of self and
+                        // conflict with the `pending_deltas` field borrow.
+                        let cat = unsafe { &*self.catalog };
+                        self.pending_deltas.retain(|tid, _| cat.has_id(*tid));
                         gnitz_debug!("W{} ddl_sync tid={}", self.worker_id, target_id);
                     }
                 }
@@ -1457,7 +1466,14 @@ impl WorkerProcess {
     }
 
     fn handle_flush_all(&mut self) -> Result<(), String> {
-        self.pending_deltas.clear();
+        // pending_deltas is intentionally NOT cleared here. A checkpoint can
+        // fire before buffered effective deltas are ticked into their views;
+        // discarding them would leave views diverged from the base tables until a
+        // restart rebuilds them. The checkpoint only persists base-table data —
+        // views are re-derived — so the buffered deltas must survive to be ticked
+        // by the next auto-tick or the scan barrier. Live entries drain on the
+        // next tick (bounded by the 10k-row auto-tick); a dropped table's entry is
+        // GC'd in the DdlSync arm (retain(has_id)).
         let ids = self.cat().iter_user_table_ids();
         let mut dir_inodes: Vec<(u64, u64, libc::c_int)> = Vec::new();
 

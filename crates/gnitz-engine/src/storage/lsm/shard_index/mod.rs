@@ -289,6 +289,13 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
+    /// Guard key for a native u64 PK value, in the order-preserving
+    /// `pk_sort_key` space (the same key the read router and the compaction
+    /// merge use), so multi-guard levels route data keys correctly.
+    fn gk(v: u64) -> u128 {
+        crate::storage::merge::pk_sort_key(&v.to_be_bytes())
+    }
+
     /// Build and write a shard file with the given PK/value pairs.
     fn write_test_shard(dir: &std::path::Path, name: &str, pks: &[u64], values: &[i64]) -> String {
         let n = pks.len();
@@ -373,6 +380,14 @@ mod tests {
         }
 
         assert_eq!(idx.max_lsn(), idx2.max_lsn());
+
+        // The compaction counter is persisted and restored, so a post-restart
+        // compaction never reuses a sequence value baked into a live shard name.
+        assert!(idx.compact_seq > 0, "run_compact must have advanced compact_seq");
+        assert_eq!(
+            idx.compact_seq, idx2.compact_seq,
+            "compact_seq must survive publish/load"
+        );
     }
 
     #[test]
@@ -451,7 +466,7 @@ mod tests {
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
         idx.ensure_level(1);
 
-        // Build a guard at key 0 with 3 entries (max_lsn=100 → lsn_tag=100)
+        // Build a guard at key 0 with 3 entries.
         for i in 0..3u64 {
             let path = write_test_shard(dir.path(), &format!("src_{i}.db"), &[i + 1], &[(i as i64 + 1) * 10]);
             let e = ShardEntry::open(&path, &schema, 0, 100).unwrap();
@@ -464,8 +479,10 @@ mod tests {
             idx.levels[0].get_or_create_guard(5000).entries.push(e);
         }
 
-        // Block the output path: shard_42_100_L2_G0.db must fail to finalize
-        let blocker = dir.path().join("shard_42_100_L2_G0.db");
+        // Block the output path so it fails to finalize. The output is named by
+        // this call's `compact_seq` (fresh index → increments to 1) and the
+        // fallback destination guard key 0 (L2 is empty), at level L2.
+        let blocker = dir.path().join("shard_42_1_L2_G0.db");
         std::fs::create_dir_all(&blocker).unwrap();
 
         let pre_guard_count = idx.levels[0].guards.len();
@@ -769,6 +786,150 @@ mod tests {
         let mut found_250 = false;
         idx.find_pk(250, &mut |_, _| found_250 = true);
         assert!(found_250, "destination key 250 lost after L2->L3 vertical compaction");
+    }
+
+    /// Regression: two vertical compactions that select different worst guards
+    /// routing to *disjoint* destination guards, both topping at the same
+    /// `max_lsn`, must emit distinct output basenames. Without the per-call
+    /// `compact_seq` + destination-guard-key naming, both calls would emit the
+    /// same name (shared lsn tag + positional loop index), the second rename
+    /// would clobber the first call's live shard, and a reload would lose that
+    /// guard's key range.
+    #[test]
+    fn test_vertical_disjoint_guards_no_name_collision() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        idx.ensure_level(2);
+
+        // Key 250 routes to the gk(100) bucket; 6000 to the gk(5000) bucket.
+        // L1 guard gk(100): two entries (keys 100, 110).
+        for (i, &k) in [100u64, 110].iter().enumerate() {
+            let p = write_test_shard(dir.path(), &format!("l1a_{i}.db"), &[k], &[k as i64]);
+            idx.levels[0]
+                .get_or_create_guard(gk(100))
+                .entries
+                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+        }
+        // L1 guard gk(5000): two entries (keys 5000, 5010).
+        for (i, &k) in [5000u64, 5010].iter().enumerate() {
+            let p = write_test_shard(dir.path(), &format!("l1b_{i}.db"), &[k], &[k as i64]);
+            idx.levels[0]
+                .get_or_create_guard(gk(5000))
+                .entries
+                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+        }
+        // L2 pre-seed: guard gk(100) (key 250) and guard gk(5000) (key 6000) at the
+        // same max_lsn, so both vertical calls compute the identical `vert_max_lsn`
+        // — the pre-fix collision tag.
+        {
+            let p = write_test_shard(dir.path(), "l2a.db", &[250], &[2500]);
+            idx.levels[1]
+                .get_or_create_guard(gk(100))
+                .entries
+                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+            let p = write_test_shard(dir.path(), "l2b.db", &[6000], &[60000]);
+            idx.levels[1]
+                .get_or_create_guard(gk(5000))
+                .entries
+                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+        }
+
+        // Call 1 folds L1 guard 100 → L2 guard 100; call 2 folds L1 guard 5000 →
+        // L2 guard 5000 (disjoint destinations, both topping at max_lsn=100).
+        idx.compact_guard_vertical(1).unwrap();
+        idx.compact_guard_vertical(1).unwrap();
+
+        // Both destination guards reference distinct, existing files.
+        let files: Vec<String> = idx.levels[1]
+            .guards
+            .iter()
+            .flat_map(|g| g.entries.iter().map(|e| e.filename.clone()))
+            .collect();
+        assert_eq!(files.len(), 2, "two L2 guards, one entry each");
+        assert_ne!(files[0], files[1], "disjoint-guard outputs must not share a name");
+        for f in &files {
+            assert!(std::path::Path::new(f).exists(), "output shard {f} missing");
+        }
+
+        // Publish + reload into a fresh index: every key must survive.
+        let manifest_path = dir.path().join("MANIFEST");
+        idx.publish_manifest(manifest_path.to_str().unwrap()).unwrap();
+        let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+        for k in [100u64, 110, 5000, 5010, 250, 6000] {
+            let mut found = false;
+            idx2.find_pk(k as u128, &mut |_, _| found = true);
+            assert!(found, "key {k} lost after disjoint-guard vertical compactions + reload");
+        }
+    }
+
+    /// Regression: re-compacting the *same* destination guard twice must not let
+    /// `try_cleanup` delete the live shard. If both calls emitted the same output
+    /// name, the second would overwrite the first's file in place and then queue
+    /// that very name for deletion — `try_cleanup` would unlink the live shard
+    /// and the table would fail to reopen. The per-call `compact_seq` keeps the
+    /// outputs distinct, so only the genuinely-superseded input is deleted.
+    #[test]
+    fn test_vertical_same_guard_recompaction_try_cleanup_keeps_live() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        idx.ensure_level(2);
+
+        // L2 guard gk(100) pre-seeded with key 250.
+        {
+            let p = write_test_shard(dir.path(), "l2.db", &[250], &[2500]);
+            idx.levels[1]
+                .get_or_create_guard(gk(100))
+                .entries
+                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+        }
+        // L1 guard gk(100): two entries (keys 100, 110).
+        for (i, &k) in [100u64, 110].iter().enumerate() {
+            let p = write_test_shard(dir.path(), &format!("l1a_{i}.db"), &[k], &[k as i64]);
+            idx.levels[0]
+                .get_or_create_guard(gk(100))
+                .entries
+                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+        }
+        idx.compact_guard_vertical(1).unwrap();
+
+        // Re-add L1 guard gk(100) with two more entries (keys 120, 130) and
+        // re-compact into the same destination guard.
+        for (i, &k) in [120u64, 130].iter().enumerate() {
+            let p = write_test_shard(dir.path(), &format!("l1b_{i}.db"), &[k], &[k as i64]);
+            idx.levels[0]
+                .get_or_create_guard(gk(100))
+                .entries
+                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+        }
+        idx.compact_guard_vertical(1).unwrap();
+
+        // Flush the queued deletions (the consumed inputs). The live L2 shard must
+        // NOT be among them.
+        idx.try_cleanup();
+        let live = idx.levels[1].guards[0].entries[0].filename.clone();
+        assert!(
+            std::path::Path::new(&live).exists(),
+            "try_cleanup deleted the live L2 shard {live}",
+        );
+
+        // Publish + reload: every key survives.
+        let manifest_path = dir.path().join("MANIFEST");
+        idx.publish_manifest(manifest_path.to_str().unwrap()).unwrap();
+        let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+        idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
+        for k in [100u64, 110, 120, 130, 250] {
+            let mut found = false;
+            idx2.find_pk(k as u128, &mut |_, _| found = true);
+            assert!(
+                found,
+                "key {k} lost after same-guard re-compaction + try_cleanup + reload"
+            );
+        }
     }
 
     #[test]

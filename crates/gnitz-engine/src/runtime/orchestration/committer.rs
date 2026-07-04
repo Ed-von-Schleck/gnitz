@@ -144,20 +144,19 @@ pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
         let has_barriers = !barrier_senders.is_empty();
         if shared.disp().sal_needs_checkpoint() || (has_barriers && !shared.disp().sal_has_relay_space()) {
             if let Err(e) = run_checkpoint_phase(&shared, &mut fut_slots, &mut ack_slots).await {
-                // Barrier semantics are "committer reached this point", not
-                // "checkpoint succeeded": signal anyway. relay_loop rechecks
-                // space and aborts if reclaim failed.
-                crate::gnitz_warn!("checkpoint failed: {}", e);
-                for p in pushes {
-                    let _ = p.done.send(Err(e.clone()));
-                }
-                if has_barriers {
-                    merge_pool.clear();
-                }
-                for b in barrier_senders {
-                    let _ = b.send(());
-                }
-                continue;
+                // A failed checkpoint is unrecoverable in-process. Every worker
+                // that processed FLAG_FLUSH has already bumped its read epoch
+                // (worker `advance_read_epoch`), but on failure the master did NOT
+                // reset its SAL (`checkpoint_post_ack` returned early, or a worker
+                // ACK errored). Master and workers are now permanently epoch-
+                // desynced: every later master write fails the workers' epoch
+                // check and is silently dropped, and the next checkpoint deadlocks
+                // awaiting ACKs that never come — all while holding
+                // `sal_writer_excl`, wedging the whole cluster. Abort so restart
+                // replays the deliberately un-reset SAL and re-derives views from
+                // the durable base tables. Consistent with the commit_zone /
+                // SAL-fdatasync fatal sites below.
+                crate::gnitz_fatal_abort!("checkpoint failed, cluster epoch-desynced: {}", e);
             }
         }
 
@@ -218,7 +217,14 @@ fn debounce_drain(
                 });
             }
             Some(CommitRequest::Barrier { done }) => {
+                // Stop at the first barrier: requests queued after it are
+                // logically younger than whatever issued the barrier (a DDL, or a
+                // low-SAL-space relay reclaim), so folding them into this batch
+                // would make the barrier wait on their commit for no ordering
+                // benefit — and, for the reclaim barrier, would keep consuming the
+                // SAL space it is trying to free. They ride the next batch.
                 barrier_senders.push(done);
+                break;
             }
             None => break,
         }

@@ -469,6 +469,8 @@ make e2e K='joins' WORKERS=1   # pytest -k filter; override worker count
 make test T=name               # one Rust test (make rust-engine-test = engine only)
 ```
 
+Note that when piping `make e2e` or any other command through `| tail ...`, do not trust the exit code 0, since that only says that `tail` exited successfully, not necessarily the tests.
+
 ## Environment variables
 
 | Var | Effect |

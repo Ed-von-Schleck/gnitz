@@ -326,9 +326,10 @@ mod tests {
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
         let guards: [u128; 2] = [0, 100];
 
-        // table_id=0, level_num=1, lsn_tag=99 → second output is shard_0_99_L1_G1.db
-        // Block it with a directory so finalize fails for guard 1.
-        let blocker = dir.join("shard_0_99_L1_G1.db");
+        // table_id=0, level_num=1, compact_seq=99, guard keys {0,100} → the second
+        // output is shard_0_99_L1_G100.db (named by guard key, not loop index).
+        // Block it with a directory so finalize fails for that guard.
+        let blocker = dir.join("shard_0_99_L1_G100.db");
         fs::create_dir_all(&blocker).unwrap();
 
         let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
@@ -1371,7 +1372,8 @@ mod tests {
             .collect();
 
         let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
-        // table_id=7, level_num=1, lsn_tag=42 → routed shards are shard_7_42_L1_G{g}.db.
+        // table_id=7, level_num=1, compact_seq=42 → routed shards are named by the
+        // destination guard *key*: shard_7_42_L1_G{guard_keys[g]}.db.
         let routed = merge_and_route(&inputs, &cdir, &guard_keys, &schema, 7, 1, 42, true).unwrap();
         let oracle = oracle_merge_and_route_row_at_a_time(&inputs, &dir, &guard_keys, &schema, true);
 
@@ -1381,7 +1383,7 @@ mod tests {
         assert_eq!(routed[1].0, guard_keys[3]);
 
         for (g, oracle_entry) in oracle.iter().enumerate() {
-            let routed_path = dir.join(format!("shard_7_42_L1_G{g}.db"));
+            let routed_path = dir.join(format!("shard_7_42_L1_G{}.db", guard_keys[g]));
             match oracle_entry {
                 None => assert!(
                     !routed_path.exists(),
@@ -1398,7 +1400,8 @@ mod tests {
         }
 
         // Concrete per-guard pins beyond oracle agreement.
-        let (g0_uniq, g0_rows) = decode_diff_shard(dir.join("shard_7_42_L1_G0.db").to_str().unwrap(), &schema);
+        let g0_name = format!("shard_7_42_L1_G{}.db", guard_keys[0]);
+        let (g0_uniq, g0_rows) = decode_diff_shard(dir.join(&g0_name).to_str().unwrap(), &schema);
         assert!(!g0_uniq, "guard 0 has two pk=10 survivors → not pk-unique");
         let pk10 = 10u64.to_be_bytes().to_vec();
         let folded = g0_rows
@@ -1412,7 +1415,8 @@ mod tests {
             "guard 0: pk=10 (×2 payloads) + pk=50, got {g0_rows:?}"
         );
 
-        let (g3_uniq, g3_rows) = decode_diff_shard(dir.join("shard_7_42_L1_G3.db").to_str().unwrap(), &schema);
+        let g3_name = format!("shard_7_42_L1_G{}.db", guard_keys[3]);
+        let (g3_uniq, g3_rows) = decode_diff_shard(dir.join(&g3_name).to_str().unwrap(), &schema);
         assert!(g3_uniq, "guard 3 has distinct PKs → pk-unique");
         assert_eq!(g3_rows.len(), 3, "guard 3: pk=310,320,330, got {g3_rows:?}");
 

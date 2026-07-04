@@ -9,10 +9,11 @@ use crate::schema::MAX_PK_BYTES;
 //
 // Header (64 bytes):
 //   [0,8)   Magic   0x4D414E49464E5447
-//   [8,16)  Version u64 (4)
+//   [8,16)  Version u64 (5)
 //   [16,24) Count   u64
 //   [24,32) Global max LSN u64
-//   [32,64) Reserved
+//   [32,40) Compaction sequence u64
+//   [40,64) Reserved
 //
 // Entry (338 bytes each):
 //   [0,8)     table_id   u64
@@ -33,6 +34,9 @@ const MAGIC: u64 = 0x4D414E49464E5447;
 const VERSION_V5: u64 = 5;
 const HEADER_SIZE: usize = 64;
 const ENTRY_SIZE_V4: usize = 338;
+
+// Header offset of the per-table compaction sequence.
+const OFF_COMPACT_SEQ: usize = 32;
 
 // Field offsets within an entry, kept in sync with the doc-comment above.
 const OFF_TABLE_ID: usize = 0;
@@ -103,9 +107,20 @@ impl ManifestEntryRaw {
     }
 }
 
+/// Header metadata serialized alongside the entries.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct ManifestHeader {
+    pub global_max_lsn: u64,
+    pub compact_seq: u64,
+}
+
 /// Serialize manifest entries into `out_buf`.
 /// Returns bytes written, or `BufferTooSmall` if `out_buf` cannot fit.
-pub fn serialize(out_buf: &mut [u8], entries: &[ManifestEntryRaw], global_max_lsn: u64) -> Result<usize, StorageError> {
+pub fn serialize(
+    out_buf: &mut [u8],
+    entries: &[ManifestEntryRaw],
+    header: ManifestHeader,
+) -> Result<usize, StorageError> {
     let count = entries.len();
     let total = HEADER_SIZE + count * ENTRY_SIZE_V4;
     if out_buf.len() < total {
@@ -119,7 +134,8 @@ pub fn serialize(out_buf: &mut [u8], entries: &[ManifestEntryRaw], global_max_ls
     write_u64_le(out_buf, 0, MAGIC);
     write_u64_le(out_buf, 8, VERSION_V5);
     write_u64_le(out_buf, 16, count as u64);
-    write_u64_le(out_buf, 24, global_max_lsn);
+    write_u64_le(out_buf, 24, header.global_max_lsn);
+    write_u64_le(out_buf, OFF_COMPACT_SEQ, header.compact_seq);
 
     // Write entries field-by-field (symmetric with parse; immune to padding changes).
     // Each PkBuf is written as `len: u8` then the full 80-byte `bytes`
@@ -143,7 +159,7 @@ pub fn serialize(out_buf: &mut [u8], entries: &[ManifestEntryRaw], global_max_ls
     Ok(total)
 }
 
-/// Parse a manifest buffer. Returns entry count on success.
+/// Parse a manifest buffer. Returns the entry count and header on success.
 ///
 /// V4 only. There is no on-disk data to migrate in dev and the test
 /// suite is green at session start, so a non-V4 version is a hard
@@ -152,8 +168,7 @@ pub fn parse(
     buf: &[u8],
     out_entries: &mut [ManifestEntryRaw],
     max_entries: u32,
-    out_global_max_lsn: &mut u64,
-) -> Result<usize, StorageError> {
+) -> Result<(usize, ManifestHeader), StorageError> {
     if buf.len() < HEADER_SIZE {
         return Err(StorageError::Truncated);
     }
@@ -165,7 +180,10 @@ pub fn parse(
 
     let version = read_u64_le(buf, 8);
     let count = read_u64_le(buf, 16) as usize;
-    *out_global_max_lsn = read_u64_le(buf, 24);
+    let header = ManifestHeader {
+        global_max_lsn: read_u64_le(buf, 24),
+        compact_seq: read_u64_le(buf, OFF_COMPACT_SEQ),
+    };
 
     if version != VERSION_V5 {
         return Err(StorageError::InvalidVersion);
@@ -196,7 +214,7 @@ pub fn parse(
         *out_entry = entry;
     }
 
-    Ok(n)
+    Ok((n, header))
 }
 
 /// Read a `[len u8][80 bytes]` PkBuf field at `field_off`.
@@ -226,13 +244,12 @@ pub const fn serialized_size(count: usize) -> usize {
 
 /// Read a manifest file from disk, parse it, write entries into `out_entries`.
 ///
-/// Returns entry count on success.
+/// Returns the entry count and header on success.
 pub fn read_file(
     path: &std::ffi::CStr,
     out_entries: &mut [ManifestEntryRaw],
     max_entries: u32,
-    out_global_max_lsn: &mut u64,
-) -> Result<usize, StorageError> {
+) -> Result<(usize, ManifestHeader), StorageError> {
     unsafe {
         let fd = libc::open(path.as_ptr(), libc::O_RDONLY, 0);
         if fd < 0 {
@@ -259,7 +276,7 @@ pub fn read_file(
             return Err(StorageError::Io);
         }
 
-        parse(&buf, out_entries, max_entries, out_global_max_lsn)
+        parse(&buf, out_entries, max_entries)
     }
 }
 
@@ -310,13 +327,13 @@ unsafe fn fsync_parent_dir(path: &std::ffi::CStr) {
 pub fn prepare_file(
     path: &std::ffi::CStr,
     entries: &[ManifestEntryRaw],
-    global_max_lsn: u64,
+    header: ManifestHeader,
 ) -> Result<PreparedManifest, StorageError> {
     let count = entries.len();
     let total = serialized_size(count);
 
     let mut buf = vec![0u8; total];
-    let written = serialize(&mut buf, entries, global_max_lsn)?;
+    let written = serialize(&mut buf, entries, header)?;
 
     let tmp_path = super::cstr_with_tmp_suffix(path)?;
     let final_path = std::ffi::CString::new(path.to_bytes()).map_err(|_| StorageError::InvalidPath)?;
@@ -352,9 +369,9 @@ pub fn prepare_file(
 pub fn write_file(
     path: &std::ffi::CStr,
     entries: &[ManifestEntryRaw],
-    global_max_lsn: u64,
+    header: ManifestHeader,
 ) -> Result<(), StorageError> {
-    let mut prepared = prepare_file(path, entries, global_max_lsn)?;
+    let mut prepared = prepare_file(path, entries, header)?;
     let fd = prepared.fd.take().expect("prepare_file always returns fd");
     unsafe {
         if fdatasync_eintr(fd).is_err() {
@@ -407,6 +424,13 @@ mod tests {
 
     fn pkbuf(slice: &[u8]) -> PkBuf {
         PkBuf::from_bytes(slice)
+    }
+
+    fn hdr(global_max_lsn: u64, compact_seq: u64) -> ManifestHeader {
+        ManifestHeader {
+            global_max_lsn,
+            compact_seq,
+        }
     }
 
     fn assert_pkbuf_eq(got: &PkBuf, want: &PkBuf) {
@@ -468,8 +492,7 @@ mod tests {
         write_u64_le(&mut buf, 8, VERSION_V5);
         write_u64_le(&mut buf, 16, u64::MAX); // count
         let mut out = [ManifestEntryRaw::zeroed(); 1];
-        let mut max_lsn = 0u64;
-        let r = parse(&buf, &mut out, 1, &mut max_lsn);
+        let r = parse(&buf, &mut out, 1);
         assert!(matches!(r, Err(StorageError::Truncated)));
     }
 
@@ -513,14 +536,13 @@ mod tests {
         let n = entries.len();
         let mut buf = vec![0u8; serialized_size(n)];
 
-        let written = serialize(&mut buf, &entries, 999).unwrap();
+        let written = serialize(&mut buf, &entries, hdr(999, 7)).unwrap();
         assert_eq!(written, buf.len());
 
         let mut out = vec![ManifestEntryRaw::zeroed(); n];
-        let mut lsn = 0u64;
-        let count = parse(&buf, &mut out, n as u32, &mut lsn).unwrap();
+        let (count, header) = parse(&buf, &mut out, n as u32).unwrap();
         assert_eq!(count, n);
-        assert_eq!(lsn, 999);
+        assert_eq!(header, hdr(999, 7), "header must round-trip through serialize/parse");
 
         for i in 0..n {
             assert_eq!(out[i].table_id, entries[i].table_id);
@@ -545,22 +567,20 @@ mod tests {
         write_u64_le(&mut buf, 24, 0);
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
-        let mut lsn = 0u64;
-        assert_eq!(parse(&buf, &mut out, 1, &mut lsn), Err(StorageError::InvalidVersion),);
+        assert_eq!(parse(&buf, &mut out, 1), Err(StorageError::InvalidVersion));
     }
 
     #[test]
     fn corrupt_pkbuf_len_rejected() {
         let entries = vec![make_entry(1, "shard_1.db")];
         let mut buf = vec![0u8; serialized_size(1)];
-        serialize(&mut buf, &entries, 0).unwrap();
+        serialize(&mut buf, &entries, hdr(0, 0)).unwrap();
 
         // Overwrite the pk_min len byte with 255 (> MAX_PK_BYTES).
         buf[HEADER_SIZE + OFF_PK_MIN] = 255;
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
-        let mut lsn = 0u64;
-        assert_eq!(parse(&buf, &mut out, 1, &mut lsn), Err(StorageError::Truncated),);
+        assert_eq!(parse(&buf, &mut out, 1), Err(StorageError::Truncated));
     }
 
     #[test]
@@ -573,11 +593,10 @@ mod tests {
         e.pk_max = pkbuf(&[0xCD; 16]);
 
         let mut buf = vec![0u8; serialized_size(1)];
-        serialize(&mut buf, &[e], 0).unwrap();
+        serialize(&mut buf, &[e], hdr(0, 0)).unwrap();
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
-        let mut lsn = 0u64;
-        parse(&buf, &mut out, 1, &mut lsn).unwrap();
+        parse(&buf, &mut out, 1).unwrap();
 
         assert_eq!(out[0].pk_min.len, 16);
         assert_eq!(out[0].pk_min.pk_bytes(), &[0xAB; 16]);
@@ -591,43 +610,43 @@ mod tests {
         write_u64_le(&mut buf, 0, 0xDEADBEEF);
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
-        let mut lsn = 0u64;
-        assert_eq!(parse(&buf, &mut out, 1, &mut lsn), Err(StorageError::InvalidMagic));
+        assert_eq!(parse(&buf, &mut out, 1), Err(StorageError::InvalidMagic));
     }
 
     #[test]
     fn truncated() {
-        assert_eq!(parse(&[0u8; 10], &mut [], 0, &mut 0u64), Err(StorageError::Truncated),);
+        assert_eq!(parse(&[0u8; 10], &mut [], 0), Err(StorageError::Truncated));
     }
 
     #[test]
     fn buffer_too_small() {
         let entries = vec![make_entry(1, "test.db")];
         let mut buf = vec![0u8; 64]; // too small for header + entry
-        assert_eq!(serialize(&mut buf, &entries, 0), Err(StorageError::BufferTooSmall));
+        assert_eq!(
+            serialize(&mut buf, &entries, hdr(0, 0)),
+            Err(StorageError::BufferTooSmall)
+        );
     }
 
     #[test]
     fn empty_manifest() {
         let mut buf = vec![0u8; HEADER_SIZE];
-        let written = serialize(&mut buf, &[], 42).unwrap();
+        let written = serialize(&mut buf, &[], hdr(42, 0)).unwrap();
         assert_eq!(written, HEADER_SIZE);
 
-        let mut lsn = 0u64;
-        let count = parse(&buf, &mut [], 0, &mut lsn).unwrap();
+        let (count, header) = parse(&buf, &mut [], 0).unwrap();
         assert_eq!(count, 0);
-        assert_eq!(lsn, 42);
+        assert_eq!(header.global_max_lsn, 42);
     }
 
     #[test]
     fn filename_null_terminated() {
         let e = make_entry(1, "hello.db");
         let mut buf = vec![0u8; serialized_size(1)];
-        serialize(&mut buf, &[e], 0).unwrap();
+        serialize(&mut buf, &[e], hdr(0, 0)).unwrap();
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
-        let mut lsn = 0u64;
-        parse(&buf, &mut out, 1, &mut lsn).unwrap();
+        parse(&buf, &mut out, 1).unwrap();
 
         // Extract filename
         let end = out[0].filename.iter().position(|&b| b == 0).unwrap_or(128);
@@ -649,14 +668,17 @@ mod tests {
             make_entry(3, "shard_3.db"),
         ];
 
-        write_file(&cpath, &entries, 99).unwrap();
+        write_file(&cpath, &entries, hdr(99, 5)).unwrap();
         assert!(path.exists());
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 8];
-        let mut lsn = 0u64;
-        let count = read_file(&cpath, &mut out, 8, &mut lsn).unwrap();
+        let (count, header) = read_file(&cpath, &mut out, 8).unwrap();
         assert_eq!(count, 3);
-        assert_eq!(lsn, 99);
+        assert_eq!(
+            header,
+            hdr(99, 5),
+            "header must round-trip through write_file/read_file"
+        );
         assert_eq!(out[0].table_id, 1);
         assert_eq!(out[1].table_id, 2);
         assert_eq!(out[2].table_id, 3);
@@ -671,8 +693,7 @@ mod tests {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
-        let mut lsn = 0u64;
-        let rc = read_file(&cpath, &mut out, 1, &mut lsn);
+        let rc = read_file(&cpath, &mut out, 1);
         assert_eq!(rc, Err(StorageError::Io));
     }
 
@@ -682,12 +703,11 @@ mod tests {
         let path = dir.path().join("MANIFEST_EMPTY");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
-        write_file(&cpath, &[], 42).unwrap();
+        write_file(&cpath, &[], hdr(42, 0)).unwrap();
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
-        let mut lsn = 0u64;
-        let count = read_file(&cpath, &mut out, 1, &mut lsn).unwrap();
+        let (count, header) = read_file(&cpath, &mut out, 1).unwrap();
         assert_eq!(count, 0);
-        assert_eq!(lsn, 42);
+        assert_eq!(header.global_max_lsn, 42);
     }
 }

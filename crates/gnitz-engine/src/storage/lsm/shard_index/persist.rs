@@ -7,9 +7,15 @@ use std::ffi::{CStr, CString};
 use std::rc::Rc;
 
 use super::super::error::StorageError;
-use super::super::manifest::{self, ManifestEntryRaw, PreparedManifest};
+use super::super::manifest::{self, ManifestEntryRaw, ManifestHeader, PreparedManifest};
 use super::super::shard_reader::MappedShard;
 use super::{ShardEntry, ShardIndex, MAX_LEVELS};
+
+/// Basename of a shard's full path — its manifest identity. Shard files always
+/// live flat in the table's `output_dir`, which `load_manifest` re-prepends.
+fn shard_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap()
+}
 
 impl ShardIndex {
     fn build_manifest_entries(&self) -> Vec<ManifestEntryRaw> {
@@ -36,9 +42,17 @@ impl ShardIndex {
         raw.max_lsn = e.max_lsn;
         raw.level = level;
         raw.guard_key = gk;
-        let name_bytes = e.filename.as_bytes();
-        let len = name_bytes.len().min(127);
-        raw.filename[..len].copy_from_slice(&name_bytes[..len]);
+        // Store the basename, not the full path: a full path could exceed the
+        // 128-byte filename field, and a truncated name is an unopenable shard
+        // at reload. Basenames are bounded well under the field width — a
+        // violation is a naming-scheme bug, so fail loudly instead of truncating.
+        let name_bytes = shard_basename(&e.filename).as_bytes();
+        assert!(
+            name_bytes.len() < 128,
+            "shard basename overflows the manifest filename field: {}",
+            e.filename,
+        );
+        raw.filename[..name_bytes.len()].copy_from_slice(name_bytes);
         raw
     }
 
@@ -51,14 +65,18 @@ impl ShardIndex {
             None => return Ok(()),
         };
         let mut entries = vec![ManifestEntryRaw::zeroed(); cap];
-        let mut global_lsn = 0u64;
-        let count = manifest::read_file(&cpath, &mut entries, cap as u32, &mut global_lsn)?;
+        let (count, header) = manifest::read_file(&cpath, &mut entries, cap as u32)?;
+        // Compaction output names must never reuse a value baked into a live,
+        // manifest-referenced shard across a restart.
+        self.compact_seq = header.compact_seq;
 
         for raw in entries.iter().take(count) {
             if raw.table_id != self.table_id as u64 {
                 continue;
             }
-            let filename = raw.filename_str().to_string();
+            // The manifest stores the basename; the shard lives in this table's
+            // directory (`entry_to_raw`). Re-prepend it to recover the path.
+            let filename = format!("{}/{}", self.output_dir, raw.filename_str());
             let entry = ShardEntry::open(&filename, &self.schema, raw.min_lsn, raw.max_lsn)?;
 
             if raw.level == 0 {
@@ -88,10 +106,7 @@ impl ShardIndex {
         let shard_prefix = format!("shard_{}_", self.table_id);
         let hcomp_prefix = format!("hcomp_{}_", self.table_id);
 
-        let live: HashSet<&str> = self
-            .all_entries()
-            .filter_map(|e| std::path::Path::new(&e.filename).file_name().and_then(|n| n.to_str()))
-            .collect();
+        let live: HashSet<&str> = self.all_entries().map(|e| shard_basename(&e.filename)).collect();
 
         let mut removed = 0usize;
 
@@ -119,9 +134,15 @@ impl ShardIndex {
 
     pub fn publish_manifest(&self, path: &str) -> Result<(), StorageError> {
         let entries = self.build_manifest_entries();
-        let global_lsn = self.max_lsn();
         let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
-        manifest::write_file(&cpath, &entries, global_lsn)
+        manifest::write_file(&cpath, &entries, self.manifest_header(self.max_lsn()))
+    }
+
+    fn manifest_header(&self, global_max_lsn: u64) -> ManifestHeader {
+        ManifestHeader {
+            global_max_lsn,
+            compact_seq: self.compact_seq,
+        }
     }
 
     /// Open a shard mmap from `tmp_path` and return a not-yet-indexed
@@ -152,6 +173,6 @@ impl ShardIndex {
         entries.push(self.entry_to_raw(pending, 0, 0));
 
         let global_lsn = self.max_lsn().max(pending.max_lsn);
-        manifest::prepare_file(manifest_path, &entries, global_lsn)
+        manifest::prepare_file(manifest_path, &entries, self.manifest_header(global_lsn))
     }
 }

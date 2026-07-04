@@ -120,16 +120,42 @@ impl ShardIndex {
         }
     }
 
+    /// Advance and return the compaction counter. Every output-emitting
+    /// compaction draws a fresh value — persisted via the manifest header — so
+    /// no two output shards ever share a basename over the table's lifetime,
+    /// even across restarts.
+    fn next_compact_seq(&mut self) -> u64 {
+        self.compact_seq += 1;
+        self.compact_seq
+    }
+
+    /// Open every just-compacted output shard. On any failure, unlink all
+    /// outputs so a failed compaction leaves no orphan on disk for the running
+    /// session; callers mutate index state only after every open succeeded.
+    fn open_outputs(&self, outputs: &[(u128, String)], max_lsn: u64) -> Result<Vec<(u128, ShardEntry)>, StorageError> {
+        let mut opened = Vec::with_capacity(outputs.len());
+        for (gk, filename) in outputs {
+            match ShardEntry::open(filename, &self.schema, 0, max_lsn) {
+                Ok(entry) => opened.push((*gk, entry)),
+                Err(e) => {
+                    for (_, f) in outputs {
+                        let _ = fs::remove_file(f);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(opened)
+    }
+
     pub fn run_compact(&mut self) -> Result<(), StorageError> {
         if !self.needs_compaction {
             return Ok(());
         }
 
-        self.compact_seq += 1;
+        let compact_seq = self.next_compact_seq();
         let l0_filenames: Vec<String> = self.l0.iter().map(|e| e.filename.clone()).collect();
         let l0_max_lsn = self.l0.iter().map(|e| e.max_lsn).max().unwrap_or(0);
-
-        let lsn_tag = if l0_max_lsn > 0 { l0_max_lsn } else { self.compact_seq };
 
         let guard_keys = self.l1_guard_keys();
 
@@ -145,7 +171,7 @@ impl ShardIndex {
             &self.schema,
             self.table_id,
             1,
-            lsn_tag,
+            compact_seq,
             self.can_tag_pk_unique,
         )?;
 
@@ -203,15 +229,10 @@ impl ShardIndex {
 
     fn commit_l0_to_l1(&mut self, guard_outputs: &[(u128, String)], max_lsn: u64) -> Result<(), StorageError> {
         self.ensure_level(1);
-        let schema_copy = self.schema;
 
-        // Open all new entries before touching self.l0.
-        // If any open fails, l0 is still intact and the caller can retry.
-        let mut new_entries: Vec<(u128, ShardEntry)> = Vec::with_capacity(guard_outputs.len());
-        for (gk, filename) in guard_outputs {
-            let entry = ShardEntry::open(filename, &schema_copy, 0, max_lsn)?;
-            new_entries.push((*gk, entry));
-        }
+        // Open all new entries before touching self.l0: on failure the outputs
+        // are unlinked and L0 is intact, so the caller can retry.
+        let new_entries = self.open_outputs(guard_outputs, max_lsn)?;
 
         // All opens succeeded — safe to mutate state.
         self.l0.clear();
@@ -250,17 +271,18 @@ impl ShardIndex {
     }
 
     fn compact_one_guard(&mut self, level_idx: usize, guard_idx: usize) -> Result<(), StorageError> {
-        self.compact_seq += 1;
+        let compact_seq = self.next_compact_seq();
         let guard = &self.levels[level_idx].guards[guard_idx];
 
+        let guard_key = guard.guard_key;
         let guard_max_lsn = guard.entries.iter().map(|e| e.max_lsn).max().unwrap_or(0);
         let out_path = format!(
             "{}/hcomp_{}_L{}_G{}_{}.db",
             self.output_dir,
             self.table_id,
             Self::level_num(level_idx),
-            guard.guard_key,
-            self.compact_seq,
+            guard_key,
+            compact_seq,
         );
 
         let input_filenames: Vec<String> = guard.entries.iter().map(|e| e.filename.clone()).collect();
@@ -279,7 +301,8 @@ impl ShardIndex {
             return Err(e);
         }
 
-        let new_entry = ShardEntry::open(&out_path, &self.schema, 0, guard_max_lsn)?;
+        let mut opened = self.open_outputs(&[(guard_key, out_path)], guard_max_lsn)?;
+        let (_, new_entry) = opened.pop().expect("single-guard compaction has one output");
 
         self.pending_deletions.extend(input_filenames);
 
@@ -317,7 +340,7 @@ impl ShardIndex {
             u128::MAX
         };
 
-        self.compact_seq += 1;
+        let compact_seq = self.next_compact_seq();
         let dest_idx = src_level_num;
         self.ensure_level(src_level_num + 1);
 
@@ -345,12 +368,6 @@ impl ShardIndex {
             }
         }
 
-        let lsn_tag = if vert_max_lsn > 0 {
-            vert_max_lsn
-        } else {
-            self.compact_seq
-        };
-
         let guard_keys: Vec<u128> = if !dest_guard_indices.is_empty() {
             dest_guard_indices
                 .iter()
@@ -371,23 +388,11 @@ impl ShardIndex {
             &self.schema,
             self.table_id,
             src_level_num as u32 + 1,
-            lsn_tag,
+            compact_seq,
             self.can_tag_pk_unique,
         )?;
 
-        let schema_copy = self.schema;
-        let mut opened: Vec<(u128, ShardEntry)> = Vec::with_capacity(guard_outputs.len());
-        for (gk, filename) in &guard_outputs {
-            match ShardEntry::open(filename, &schema_copy, 0, vert_max_lsn) {
-                Ok(entry) => opened.push((*gk, entry)),
-                Err(e) => {
-                    for (_, f) in &guard_outputs {
-                        let _ = fs::remove_file(f);
-                    }
-                    return Err(e);
-                }
-            }
-        }
+        let opened = self.open_outputs(&guard_outputs, vert_max_lsn)?;
 
         self.pending_deletions.extend(all_input_files);
         self.levels[src_idx].guards.remove(worst_idx);

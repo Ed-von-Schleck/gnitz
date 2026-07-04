@@ -49,7 +49,8 @@ pub(super) fn find_guard_for_key(guard_keys: &[u128], key: u128) -> usize {
 
 /// Sole owner of shard-compaction orchestration: open the inputs, run the N-way
 /// (PK, payload) merge into a survivor buffer, route each survivor to its guard,
-/// and write one column-first output shard per guard run, named `name_for(guard_idx)`.
+/// and write one column-first output shard per guard run, named
+/// `name_for(guard_key)` — the destination guard's stable key.
 ///
 /// `emit_empty_guards` decides a guard with no survivors: `false` skips it
 /// (multi-target — an empty guard must not register an L1 shard); `true` still
@@ -65,7 +66,7 @@ pub(super) fn compact_routed(
     table_id: u32,
     can_tag_pk_unique: bool,
     emit_empty_guards: bool,
-    mut name_for: impl FnMut(usize) -> String,
+    mut name_for: impl FnMut(u128) -> String,
 ) -> Result<Vec<(u128, String)>, StorageError> {
     // An empty guard list would make find_guard_for_key index a nonexistent
     // guard; every caller passes a non-empty list, but don't rely on it silently.
@@ -117,7 +118,7 @@ pub(super) fn compact_routed(
         if bucket.is_empty() && !emit_empty_guards {
             continue;
         }
-        let path = name_for(g);
+        let path = name_for(guard_keys[g]);
         if path.len() >= 256 {
             unlink_written(&out);
             return Err(StorageError::InvalidPath);
@@ -125,8 +126,9 @@ pub(super) fn compact_routed(
         // Reserve this run's row-proportional share of the blob arena, not the
         // whole `total_blob` per guard: a string-heavy split would otherwise
         // malloc the full arena once per guard (and `DirectWriter` still grows it
-        // if a run's strings exceed the estimate).
-        let blob_cap = (total_blob * bucket.len() / nsurv.max(1)).max(1);
+        // if a run's strings exceed the estimate). Widen to u128 for the product
+        // so a huge (blob-bytes × rows) intermediate can't overflow the estimate.
+        let blob_cap = (total_blob as u128 * bucket.len() as u128 / nsurv.max(1) as u128).max(1) as usize;
         let batch = write_to_batch(schema, bucket.len(), blob_cap, |writer| {
             scatter_unified_sources_with_weights(&unified, bucket, writer);
         });
@@ -164,7 +166,12 @@ pub fn compact_shards(
 }
 
 /// Compact `input_files` across `guard_keys` into one column-first output shard
-/// per non-empty guard, each named `shard_{table_id}_{lsn_tag}_L{level_num}_G{g}.db`.
+/// per non-empty guard, each named
+/// `shard_{table_id}_{compact_seq}_L{level_num}_G{guard_key}.db`. `compact_seq`
+/// is the caller's per-table monotonic compaction counter — globally unique per
+/// call across restarts — and `guard_key` is unique within a call, so no two
+/// outputs ever share a basename over the table's lifetime (which is what keeps
+/// `write_shard_streaming`'s finalizing rename from clobbering a live shard).
 #[allow(clippy::too_many_arguments)]
 pub fn merge_and_route(
     input_files: &[&CStr],
@@ -173,7 +180,7 @@ pub fn merge_and_route(
     schema: &SchemaDescriptor,
     table_id: u32,
     level_num: u32,
-    lsn_tag: u64,
+    compact_seq: u64,
     can_tag_pk_unique: bool,
 ) -> Result<Vec<(u128, String)>, StorageError> {
     let dir = output_dir.to_str().unwrap_or("").to_string();
@@ -184,6 +191,6 @@ pub fn merge_and_route(
         table_id,
         can_tag_pk_unique,
         false,
-        move |g| format!("{dir}/shard_{table_id}_{lsn_tag}_L{level_num}_G{g}.db"),
+        move |gk| format!("{dir}/shard_{table_id}_{compact_seq}_L{level_num}_G{gk}.db"),
     )
 }
