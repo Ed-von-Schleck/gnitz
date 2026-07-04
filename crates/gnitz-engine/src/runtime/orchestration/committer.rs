@@ -24,6 +24,7 @@
 //!   catalog mutation.
 
 use crate::foundation::posix_io::guard_panic;
+use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{first_worker_error_opt, MasterDispatcher};
 use crate::runtime::reactor::{join_into, mpsc, oneshot, AsyncMutex, Reactor, ReplyFuture};
 use crate::runtime::wire::{DecodedWire, WireConflictMode};
@@ -74,10 +75,9 @@ pub struct Shared {
     /// the entire checkpoint + commit emission window so a concurrent
     /// tick task or DDL broadcast cannot interleave a SAL group.
     pub sal_writer_excl: Rc<AsyncMutex<()>>,
-    /// Monotonic LSN incremented on each successful commit; exposed to
-    /// handlers via the `done` oneshot and shared with the executor so
-    /// SCAN/SEEK responses report the same value.
-    pub ingest_lsn: Rc<Cell<u64>>,
+    /// Zone-LSN allocation high-water + durability watermark, shared with the
+    /// executor so SCAN/SEEK responses report the same LSN commits publish.
+    pub lsn_alloc: Rc<ZoneLsnAllocator>,
     pub num_workers: usize,
     pub tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
     pub tick_tids: Rc<RefCell<Vec<i64>>>,
@@ -387,12 +387,16 @@ async fn commit_pushes(
     //
     // All groups in this batch share one zone_lsn. The commit sentinel
     // written after all groups lets recovery treat the batch atomically:
-    // either every group applies or none do. ingest_lsn is bumped once,
+    // either every group applies or none do. The zone LSN is published once,
     // after fsync (Phase D), so clients only see durable LSNs.
     // ------------------------------------------------------------------
-    let zone_lsn = shared.ingest_lsn.get() + 1;
-    let fsync_fut = {
+    let (zone_lsn, fsync_fut) = {
         let _sal_excl = shared.sal_writer_excl.lock().await;
+
+        // Reserve under sal_writer_excl so reservation order == SAL write order
+        // across every durable allocator (this committer, DDL, SERIAL). A
+        // user-table push pins no system-family counter, so the floor is 0.
+        let zone_lsn = shared.lsn_alloc.reserve(0);
 
         for g in groups.iter_mut() {
             if g.write_err.is_some() {
@@ -450,7 +454,7 @@ async fn commit_pushes(
         // await_reply only borrows reactor state, never the SAL writer,
         // so populating the slots after dropping the lock is correct
         // and lets concurrent tick/relay tasks make progress sooner.
-        shared.reactor.fsync(shared.sal_fd)
+        (zone_lsn, shared.reactor.fsync(shared.sal_fd))
     };
 
     // Build per-worker reply futures into the caller-supplied scratch
@@ -489,7 +493,7 @@ async fn commit_pushes(
         ack_slots.clear();
 
         // Invalidate filters for groups whose worker ACK reported an error.
-        // ingest_lsn publish + filter ingest are deferred to Phase D after fsync.
+        // LSN publish + filter ingest are deferred to Phase D after fsync.
         for g in groups.iter_mut() {
             if g.write_err.is_some() {
                 let _ = guard_panic("unique_filter_invalidate", || {
@@ -502,7 +506,7 @@ async fn commit_pushes(
         // Bump tick counters and maybe fire the auto-tick BEFORE awaiting
         // the fsync CQE so DAG evaluation overlaps with fdatasync. We
         // bump tick_rows on writes that succeeded at the worker level —
-        // ingest_lsn publish is deferred but tick batching can proceed.
+        // the LSN publish is deferred but tick batching can proceed.
         {
             let mut tr = shared.tick_rows.borrow_mut();
             let mut tids = shared.tick_tids.borrow_mut();
@@ -542,7 +546,7 @@ async fn commit_pushes(
     // Pipelined pushes batched together share one zone_lsn, so clients
     // may see duplicate LSNs — only non-decreasing monotonicity is guaranteed.
     if groups.iter().any(|g| g.write_err.is_none()) {
-        shared.ingest_lsn.set(zone_lsn);
+        shared.lsn_alloc.publish(zone_lsn);
     }
 
     // Update unique-index filters now that fsync confirms durability.

@@ -96,10 +96,11 @@ impl CatalogEngine {
     /// the shared tail of [`CatalogDeltaSink::submit`] / `submit_local`. When
     /// `pin_lsn` is `Some(lsn)` it pins the family's `current_lsn` to `lsn.get()`
     /// (the DDL zone LSN) so recovery's dedup check (`msg.lsn <= flushed`) matches
-    /// the SAL group LSN. Pins never regress the counter: the zone allocator
-    /// takes `max(ingest_lsn, max_table_current_lsn()) + 1`, so even counters
-    /// drifted by un-pinned auto-bump ingests sit strictly below every newly
-    /// allocated zone LSN. Does NOT broadcast.
+    /// the SAL group LSN. Pins never regress the counter: every zone is reserved
+    /// with a floor that dominates the pinned family's `current_lsn`
+    /// (`ZoneLsnAllocator::reserve`), so even counters drifted by un-pinned
+    /// auto-bump ingests sit strictly below the zone LSN pinning them. Does NOT
+    /// broadcast.
     fn apply_local(&mut self, family: SysFamily, batch: &mut Batch, pin_lsn: Option<NonZeroU64>) -> Result<(), String> {
         let id = family.id();
         let table = self

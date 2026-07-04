@@ -9,6 +9,7 @@
 //! is a child module of the `table` module that defines the struct.
 
 use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 
 use super::super::error::StorageError;
@@ -38,14 +39,17 @@ impl Table {
     /// Opened per flush/compaction rather than held for the table's lifetime,
     /// so a 256-partition table pins 0 directory fds at rest instead of 256
     /// (which exhausted the default `ulimit -n` after a handful of tables).
-    /// The caller owns the returned fd and must close it.
-    pub(super) fn open_dirfd(&self) -> Result<libc::c_int, StorageError> {
+    /// The caller owns the returned `OwnedFd`, which closes it on drop — so an
+    /// error `?` anywhere downstream releases it with no manual close.
+    pub(super) fn open_dirfd(&self) -> Result<OwnedFd, StorageError> {
         let dir_c = CString::new(self.directory.as_str()).map_err(|_| StorageError::InvalidPath)?;
         let fd = unsafe { libc::open(dir_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
         if fd < 0 {
             return Err(StorageError::Io);
         }
-        Ok(fd)
+        // SAFETY: `fd` is a fresh, valid descriptor from `open`; ownership
+        // transfers to the `OwnedFd`, the sole closer from here on.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     /// Phase 1 of two-phase flush, honoring the table's intrinsic persistence.
@@ -121,22 +125,14 @@ impl Table {
         // committer.
         let dirfd = self.open_dirfd()?;
 
-        let prepared = match shard_file::write_shard_streaming_prepare(
-            dirfd,
+        let prepared = shard_file::write_shard_streaming_prepare(
+            dirfd.as_raw_fd(),
             &name_c,
             self.table_id,
             snapshot.count as u32,
             &regions,
             flush_flags,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                unsafe {
-                    libc::close(dirfd);
-                }
-                return Err(e);
-            }
-        };
+        )?;
         let shard_fd = prepared.fd;
         let tmp_name = prepared.tmp_name;
 
@@ -175,20 +171,19 @@ impl Table {
     }
 
     /// Phase 3: rename shard then manifest into final names; insert
-    /// pending_shard into shard_index; reset the memtable. Returns the
-    /// per-flush directory fd (opened in `flush_prepare`, owned by the
-    /// returned `Some`) for the caller to `fsync` after all renames in the
-    /// worker batch and then **close**. On any error path the fd is closed
-    /// here (or by `FlushWork`'s Drop, when `shard_rename` is restored) so a
-    /// failed commit does not leak it.
-    pub(crate) fn flush_commit(&mut self, mut work: FlushWork) -> Result<Option<libc::c_int>, StorageError> {
+    /// pending_shard into shard_index; reset the memtable. Returns the per-flush
+    /// directory fd (opened in `flush_prepare`, ownership moved out of
+    /// `ShardRename` here) for the caller to `fsync` after all renames in the
+    /// worker batch. Every path — success and each early error return — releases
+    /// the fd through its `OwnedFd`, so a failed commit never leaks it.
+    pub(crate) fn flush_commit(&mut self, mut work: FlushWork) -> Result<Option<OwnedFd>, StorageError> {
         // Rename shard .tmp → final.
         let dirfd = if let Some(rename) = work.shard_rename.take() {
             let rc = unsafe {
                 libc::renameat(
-                    rename.dirfd,
+                    rename.dirfd.as_raw_fd(),
                     rename.tmp_name.as_ptr(),
-                    rename.dirfd,
+                    rename.dirfd.as_raw_fd(),
                     rename.final_name.as_ptr(),
                 )
             };
@@ -197,8 +192,8 @@ impl Table {
                 work.shard_rename = Some(rename);
                 return Err(StorageError::Io);
             }
-            // Rename succeeded: the fd is no longer owned by `ShardRename`
-            // (consumed by `take()`), so ownership moves to the returned value.
+            // Rename succeeded: ownership of the dir fd moves out of the consumed
+            // `ShardRename` into the returned `OwnedFd`.
             Some(rename.dirfd)
         } else {
             None
@@ -211,11 +206,6 @@ impl Table {
                 // Restore so Drop unlinks the manifest .tmp. The shard is
                 // already at its final path and will be collected by orphan GC.
                 work.manifest = Some(m);
-                if let Some(fd) = dirfd {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                }
                 return Err(StorageError::Io);
             }
         }
@@ -245,15 +235,9 @@ impl Table {
                     }
                 }
                 work.close_fds();
-                // `flush_commit` returns the owned per-flush dir fd; fsync it
-                // then close it — it is not held for the table's lifetime.
-                let dirfd = self.flush_commit(*work)?;
-                if let Some(fd) = dirfd {
-                    let ok = fsync_eintr(fd).is_ok();
-                    unsafe {
-                        libc::close(fd);
-                    }
-                    if !ok {
+                // fsync the per-flush dir fd; it is not held for the table's life.
+                if let Some(fd) = self.flush_commit(*work)? {
+                    if fsync_eintr(fd.as_raw_fd()).is_err() {
                         return Err(StorageError::Io);
                     }
                 }
@@ -363,7 +347,7 @@ impl Table {
 
         let dirfd = self.open_dirfd()?;
         let res = shard_file::write_shard_streaming(
-            dirfd,
+            dirfd.as_raw_fd(),
             &name_c,
             self.table_id,
             run.count as u32,
@@ -371,9 +355,7 @@ impl Table {
             false,
             0,
         );
-        unsafe {
-            libc::close(dirfd);
-        }
+        drop(dirfd);
         res?; // Write failed: heap still owns `run`; no on-disk residue.
 
         let final_full = format!("{}/{}", self.directory, shard_name);

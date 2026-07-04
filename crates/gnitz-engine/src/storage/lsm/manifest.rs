@@ -1,3 +1,5 @@
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
 use super::error::StorageError;
 use crate::foundation::codec::{read_u64_le, write_u64_le};
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
@@ -250,56 +252,44 @@ pub fn read_file(
     out_entries: &mut [ManifestEntryRaw],
     max_entries: u32,
 ) -> Result<(usize, ManifestHeader), StorageError> {
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDONLY, 0);
-        if fd < 0 {
-            return Err(StorageError::Io);
-        }
+    let fd = open_owned(path, libc::O_RDONLY).ok_or(StorageError::Io)?;
 
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut st) < 0 {
-            libc::close(fd);
-            return Err(StorageError::Io);
-        }
-        let file_size = st.st_size as usize;
-
-        if file_size < HEADER_SIZE {
-            libc::close(fd);
-            return Err(StorageError::Truncated);
-        }
-
-        let mut buf = vec![0u8; file_size];
-        let bytes_read = crate::foundation::posix_io::read_all_fd(fd, &mut buf);
-        libc::close(fd);
-
-        if bytes_read < 0 || (bytes_read as usize) < file_size {
-            return Err(StorageError::Io);
-        }
-
-        parse(&buf, out_entries, max_entries)
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
+        return Err(StorageError::Io);
     }
+    let file_size = st.st_size as usize;
+
+    if file_size < HEADER_SIZE {
+        return Err(StorageError::Truncated);
+    }
+
+    let mut buf = vec![0u8; file_size];
+    // SAFETY: `buf` is a valid writable buffer of `file_size` bytes.
+    let bytes_read = unsafe { crate::foundation::posix_io::read_all_fd(fd.as_raw_fd(), &mut buf) };
+
+    if bytes_read < 0 || (bytes_read as usize) < file_size {
+        return Err(StorageError::Io);
+    }
+
+    parse(&buf, out_entries, max_entries)
 }
 
 /// Open .tmp manifest at "<path>.tmp", serialize entries into it, and return
 /// the open fd plus owned path buffers. Does NOT fdatasync, close, or rename.
 /// On any internal write error closes the fd and unlinks the .tmp.
 pub struct PreparedManifest {
-    pub fd: Option<libc::c_int>,
+    pub fd: Option<OwnedFd>,
     pub tmp_path: std::ffi::CString,
     pub final_path: std::ffi::CString,
     /// Set true once the `.tmp` has been renamed into place. Until then, Drop
     /// unlinks the `.tmp` so a panic or early return between `prepare_file` and
-    /// the rename never leaks the temporary file.
+    /// the rename never leaks the temporary file. The fd closes via `OwnedFd`.
     pub committed: bool,
 }
 
 impl Drop for PreparedManifest {
     fn drop(&mut self) {
-        if let Some(fd) = self.fd.take() {
-            unsafe {
-                libc::close(fd);
-            }
-        }
         if !self.committed {
             unsafe {
                 libc::unlink(self.tmp_path.as_ptr());
@@ -308,19 +298,27 @@ impl Drop for PreparedManifest {
     }
 }
 
+/// `libc::open` returning an `OwnedFd`, or `None` on failure (errno untouched).
+fn open_owned(path: &std::ffi::CStr, flags: libc::c_int) -> Option<OwnedFd> {
+    let fd = unsafe { libc::open(path.as_ptr(), flags, 0o644 as libc::mode_t) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fresh descriptor from `open`; the `OwnedFd` is the sole closer.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// fsync the directory containing `path`, so the renamed directory entry
 /// survives a crash (fdatasync on the file does not flush the parent inode).
-unsafe fn fsync_parent_dir(path: &std::ffi::CStr) {
+fn fsync_parent_dir(path: &std::ffi::CStr) {
     let bytes = path.to_bytes();
     let dir = match bytes.iter().rposition(|&b| b == b'/') {
         Some(0) => std::ffi::CString::new("/").unwrap(),
         Some(i) => std::ffi::CString::new(&bytes[..i]).unwrap(),
         None => std::ffi::CString::new(".").unwrap(),
     };
-    let fd = libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
-    if fd >= 0 {
-        let _ = fsync_eintr(fd); // best-effort; ignore error on directory fd
-        libc::close(fd);
+    if let Some(fd) = open_owned(&dir, libc::O_RDONLY | libc::O_DIRECTORY) {
+        let _ = fsync_eintr(fd.as_raw_fd()); // best-effort; ignore error on directory fd
     }
 }
 
@@ -338,30 +336,23 @@ pub fn prepare_file(
     let tmp_path = super::cstr_with_tmp_suffix(path)?;
     let final_path = std::ffi::CString::new(path.to_bytes()).map_err(|_| StorageError::InvalidPath)?;
 
-    unsafe {
-        let fd = libc::open(
-            tmp_path.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-            0o644 as libc::mode_t,
-        );
-        if fd < 0 {
-            return Err(StorageError::Io);
-        }
+    let fd = open_owned(&tmp_path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC).ok_or(StorageError::Io)?;
 
-        let rc = crate::foundation::posix_io::write_all_fd(fd, &buf[..written]);
-        if rc < 0 {
-            libc::close(fd);
+    // SAFETY: `buf[..written]` is a valid initialized byte range.
+    let rc = unsafe { crate::foundation::posix_io::write_all_fd(fd.as_raw_fd(), &buf[..written]) };
+    if rc < 0 {
+        unsafe {
             libc::unlink(tmp_path.as_ptr());
-            return Err(StorageError::Io);
         }
-
-        Ok(PreparedManifest {
-            fd: Some(fd),
-            tmp_path,
-            final_path,
-            committed: false,
-        })
+        return Err(StorageError::Io);
     }
+
+    Ok(PreparedManifest {
+        fd: Some(fd),
+        tmp_path,
+        final_path,
+        committed: false,
+    })
 }
 
 /// Serialize entries and write atomically (prepare, fdatasync, close, rename).
@@ -373,19 +364,18 @@ pub fn write_file(
 ) -> Result<(), StorageError> {
     let mut prepared = prepare_file(path, entries, header)?;
     let fd = prepared.fd.take().expect("prepare_file always returns fd");
+    if fdatasync_eintr(fd.as_raw_fd()).is_err() {
+        return Err(StorageError::Io);
+    }
+    drop(fd); // Close before the rename.
     unsafe {
-        if fdatasync_eintr(fd).is_err() {
-            libc::close(fd);
-            return Err(StorageError::Io);
-        }
-        libc::close(fd);
         if libc::rename(prepared.tmp_path.as_ptr(), prepared.final_path.as_ptr()) < 0 {
             return Err(StorageError::Io);
         }
-        prepared.committed = true;
-        // Flush the directory inode so the rename survives a power loss.
-        fsync_parent_dir(&prepared.final_path);
     }
+    prepared.committed = true;
+    // Flush the directory inode so the rename survives a power loss.
+    fsync_parent_dir(&prepared.final_path);
     Ok(())
 }
 
@@ -395,23 +385,20 @@ pub fn write_file(
 /// load_manifest treats this as the empty manifest), `Ok(Some(n))` when the
 /// header parses, or `Err(_)` on any other failure.
 pub fn entry_count(path: &std::ffi::CStr) -> Result<Option<usize>, StorageError> {
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDONLY, 0);
-        if fd < 0 {
-            return Ok(None);
-        }
-        let mut hdr = [0u8; HEADER_SIZE];
-        let n = crate::foundation::posix_io::read_all_fd(fd, &mut hdr);
-        libc::close(fd);
-        if n < HEADER_SIZE as i64 {
-            return Err(StorageError::Truncated);
-        }
-        let magic = read_u64_le(&hdr, 0);
-        if magic != MAGIC {
-            return Err(StorageError::InvalidMagic);
-        }
-        Ok(Some(read_u64_le(&hdr, 16) as usize))
+    let Some(fd) = open_owned(path, libc::O_RDONLY) else {
+        return Ok(None);
+    };
+    let mut hdr = [0u8; HEADER_SIZE];
+    // SAFETY: `hdr` is a valid writable buffer of `HEADER_SIZE` bytes.
+    let n = unsafe { crate::foundation::posix_io::read_all_fd(fd.as_raw_fd(), &mut hdr) };
+    if n < HEADER_SIZE as i64 {
+        return Err(StorageError::Truncated);
     }
+    let magic = read_u64_le(&hdr, 0);
+    if magic != MAGIC {
+        return Err(StorageError::InvalidMagic);
+    }
+    Ok(Some(read_u64_le(&hdr, 16) as usize))
 }
 
 // ---------------------------------------------------------------------------

@@ -117,14 +117,14 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
     let seq_id = FIRST_USER_TABLE_ID;
 
     // Seed-on-first-use: absent sequence ⇒ base 1, high-water 64.
-    let (base1, delta1) = engine.reserve_user_sequence(seq_id, 64);
+    let (base1, delta1, _) = engine.reserve_user_sequence(seq_id, 64);
     assert_eq!(base1, 1);
     assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(64));
     // The delta is a retract(old)+insert(new) pair.
     assert_eq!(delta1.count, 2);
 
     // The next range is contiguous: base 65, high-water 128.
-    let (base2, _delta2) = engine.reserve_user_sequence(seq_id, 64);
+    let (base2, _delta2, _) = engine.reserve_user_sequence(seq_id, 64);
     assert_eq!(base2, 65);
     assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(128));
 
@@ -141,7 +141,7 @@ fn test_reserve_user_sequence_saturates() {
     let seq_id = FIRST_USER_TABLE_ID;
     engine.user_sequences.insert(seq_id, i64::MAX - 1);
 
-    let (base, _delta) = engine.reserve_user_sequence(seq_id, 64);
+    let (base, _delta, _) = engine.reserve_user_sequence(seq_id, 64);
     assert_eq!(base, i64::MAX); // hw + 1
     assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(i64::MAX));
 
@@ -159,7 +159,7 @@ fn test_user_sequence_durable_roundtrip() {
     let user_seq = FIRST_USER_TABLE_ID + 3;
     {
         let mut engine = CatalogEngine::open(&dir).unwrap();
-        let (base, delta) = engine.reserve_user_sequence(user_seq, 64);
+        let (base, delta, _) = engine.reserve_user_sequence(user_seq, 64);
         assert_eq!(base, 1);
         // Clear the synchronously-set map entry to prove the hook re-populates it.
         engine.user_sequences.remove(&user_seq);
@@ -170,7 +170,7 @@ fn test_user_sequence_durable_roundtrip() {
     }
     let mut engine = CatalogEngine::open(&dir).unwrap();
     assert_eq!(engine.user_sequences.get(&user_seq).copied(), Some(64));
-    let (base2, _delta) = engine.reserve_user_sequence(user_seq, 64);
+    let (base2, _delta, _) = engine.reserve_user_sequence(user_seq, 64);
     assert_eq!(base2, 65, "next id continues after the recovered high-water");
     engine.close();
     let _ = fs::remove_dir_all(&dir);

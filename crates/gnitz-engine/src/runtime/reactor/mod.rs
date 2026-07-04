@@ -66,8 +66,8 @@ mod uring;
 
 #[cfg(test)]
 use futures::SendFuture;
-use futures::{FsyncFuture, ScanSlotFuture, SendAlive, TimerFuture};
-pub(crate) use futures::{ReplyFuture, ScanLease};
+pub(crate) use futures::{FsyncFuture, ReplyFuture, ScanLease};
+use futures::{ScanSlotFuture, SendAlive, TimerFuture};
 
 pub use exchange::{ExchangeAccumulator, PendingRelay};
 pub use io::RecvBuf;
@@ -1756,6 +1756,62 @@ mod tests {
         r.block_until_idle();
         assert!(relay_done.get(), "concurrent task must have acquired the mutex");
         assert!(commit_done.get(), "committer must complete after its ACK is delivered");
+    }
+
+    /// Structural regression for the SERIAL range allocation: it acquires the
+    /// catalog write lock AND the SAL-writer lock, emits synchronously, drops
+    /// BOTH, then awaits the fdatasync CQE with no locks held. A concurrent
+    /// catalog READER (SEEK / SEEK_BY_INDEX* / tick emission) must make progress
+    /// during that await — proving the write lock is not held across the fsync.
+    /// If it were, the writer-preferring rwlock would block the reader and both
+    /// would deadlock (the reader never sends the fake fsync completion).
+    #[test]
+    fn catalog_write_lock_not_held_across_serial_fsync() {
+        let r = make_reactor();
+        let rwlock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
+        let sal: Rc<AsyncMutex<()>> = Rc::new(AsyncMutex::new(()));
+        // Stand-in for the fsync CQE: the SERIAL task awaits it AFTER dropping
+        // both locks; the reader sends it after acquiring the read lock.
+        let (fsync_tx, fsync_rx) = oneshot::channel::<()>();
+        let serial_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+        let reader_done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+
+        let rw1 = Rc::clone(&rwlock);
+        let sal1 = Rc::clone(&sal);
+        let sd = Rc::clone(&serial_done);
+        r.spawn(async move {
+            // Reserve + mutate + emit under both locks, release both, THEN fsync.
+            {
+                let _w = rw1.write().await;
+                let _s = sal1.lock().await;
+                // ...synchronous SAL emission would go here...
+            }
+            // Both locks dropped. Park on the fsync with no locks held.
+            let _ = fsync_rx.await;
+            sd.set(true);
+        });
+
+        let rw2 = Rc::clone(&rwlock);
+        let rd = Rc::clone(&reader_done);
+        r.spawn(async move {
+            // A catalog reader MUST acquire the read lock while the SERIAL task is
+            // parked on its fsync — impossible if the write lock were held across
+            // that await.
+            let _rg = rw2.read().await;
+            rd.set(true);
+            // Unblock the SERIAL task's fsync.
+            let _ = fsync_tx.send(());
+        });
+
+        r.block_until_idle();
+        assert!(
+            reader_done.get(),
+            "catalog reader must acquire the read lock during the SERIAL fsync"
+        );
+        assert!(
+            serial_done.get(),
+            "SERIAL task must complete after its fsync CQE arrives"
+        );
     }
 
     /// Structural regression: the relay loop acquires `sal_writer_excl` for a

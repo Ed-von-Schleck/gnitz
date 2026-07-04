@@ -6,6 +6,7 @@
 //! live here, so both sub-modules read the (otherwise private) fields directly.
 
 use std::ffi::CStr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 
 use xorf::Xor8;
@@ -38,24 +39,27 @@ impl Mmap {
         if fd < 0 {
             return Err(StorageError::Io);
         }
+        // SAFETY: fresh descriptor from `open`; the `OwnedFd` is the sole
+        // closer, so every return below closes it (the mapping outlives the fd).
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut st) } < 0 {
-            unsafe {
-                libc::close(fd);
-            }
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
             return Err(StorageError::Io);
         }
         let len = st.st_size as usize;
         if len < HEADER_SIZE {
-            unsafe {
-                libc::close(fd);
-            }
             return Err(StorageError::Truncated);
         }
-        let raw = unsafe { libc::mmap(ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
-        unsafe {
-            libc::close(fd);
-        }
+        let raw = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
         if raw == libc::MAP_FAILED {
             return Err(StorageError::Io);
         }

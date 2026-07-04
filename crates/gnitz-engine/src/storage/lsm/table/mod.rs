@@ -4,6 +4,7 @@
 
 use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 
 use super::batch::Batch;
@@ -67,7 +68,7 @@ pub enum FlushOutcome {
 /// Owned by the worker between `flush_prepare` and `flush_commit`. Drop
 /// unlinks any remaining `.tmp` files so a partial failure leaves no debris.
 pub struct FlushWork {
-    shard_fd: Option<libc::c_int>,
+    shard_fd: Option<OwnedFd>,
     shard_rename: Option<ShardRename>,
     manifest: Option<PreparedManifest>,
     /// The flush's shard, written and mmap'd at its `.tmp` path but not yet
@@ -77,7 +78,7 @@ pub struct FlushWork {
 }
 
 pub struct ShardRename {
-    dirfd: libc::c_int,
+    dirfd: OwnedFd,
     tmp_name: CString,
     final_name: CString,
 }
@@ -86,39 +87,31 @@ impl FlushWork {
     /// Close any still-open fds. Called by the worker after the io_uring
     /// fdatasync batch completes and before renames start.
     pub fn close_fds(&mut self) {
-        if let Some(fd) = self.shard_fd.take() {
-            unsafe {
-                libc::close(fd);
-            }
-        }
+        self.shard_fd = None;
         if let Some(m) = &mut self.manifest {
-            if let Some(fd) = m.fd.take() {
-                unsafe {
-                    libc::close(fd);
-                }
-            }
+            m.fd = None;
         }
     }
 
     pub fn shard_fd(&self) -> Option<libc::c_int> {
-        self.shard_fd
+        self.shard_fd.as_ref().map(|fd| fd.as_raw_fd())
     }
     pub fn manifest_fd(&self) -> Option<libc::c_int> {
-        self.manifest.as_ref().and_then(|m| m.fd)
+        self.manifest
+            .as_ref()
+            .and_then(|m| m.fd.as_ref())
+            .map(|fd| fd.as_raw_fd())
     }
 }
 
 impl Drop for FlushWork {
     fn drop(&mut self) {
-        self.close_fds();
         if let Some(r) = self.shard_rename.take() {
-            // `dirfd` is owned by this in-flight flush (opened in
-            // `flush_prepare`); unlink the orphaned .tmp through it, then close
-            // it. `flush_commit` `take()`s `shard_rename` on success, so the
-            // committed fd is returned to the caller, never reaching here.
+            // Unlink the orphaned shard .tmp through the per-flush dir fd.
+            // `flush_commit` `take()`s `shard_rename` on success, so a committed
+            // flush never reaches here. All fds close via their `OwnedFd` drops.
             unsafe {
-                libc::unlinkat(r.dirfd, r.tmp_name.as_ptr(), 0);
-                libc::close(r.dirfd);
+                libc::unlinkat(r.dirfd.as_raw_fd(), r.tmp_name.as_ptr(), 0);
             }
         }
         if let Some(m) = self.manifest.take() {
@@ -621,13 +614,10 @@ impl Table {
         self.shard_index.run_compact()?;
         if let Some(ref path) = self.manifest_path {
             self.shard_index.publish_manifest(path)?;
-            // Open the dir fd just for this fsync, then close it — not held
-            // for the table's lifetime.
+            // Open the dir fd just for this fsync; the `OwnedFd` closes it on
+            // drop — not held for the table's lifetime.
             let dirfd = self.open_dirfd()?;
-            let ok = fsync_eintr(dirfd).is_ok();
-            unsafe {
-                libc::close(dirfd);
-            }
+            let ok = fsync_eintr(dirfd.as_raw_fd()).is_ok();
             if !ok {
                 return Err(StorageError::Io);
             }

@@ -1,17 +1,4 @@
-//! io_uring batched fdatasync helpers: `dedup_dirfds` and the
-//! `uring_batch_fdatasync` durability primitive.
-
-/// Deduplicate a list of (dev, ino, fd) triples by (dev, ino), returning one fd per
-/// unique directory inode. Both fields are u64 to handle varying ino_t/dev_t widths.
-pub(crate) fn dedup_dirfds(mut inodes: Vec<(u64, u64, libc::c_int)>) -> Vec<libc::c_int> {
-    // Returns one fd per unique (dev, ino) so a shared directory is fsynced
-    // once. The fds are per-flush and owned by the caller, which closes EVERY
-    // collected fd (not just this deduped subset) after the fsync — so this
-    // helper must NOT close the duplicates it drops.
-    inodes.sort_unstable_by_key(|&(dev, ino, _)| (dev, ino));
-    inodes.dedup_by_key(|&mut (dev, ino, _)| (dev, ino));
-    inodes.into_iter().map(|(_, _, fd)| fd).collect()
-}
+//! io_uring batched fdatasync: the `uring_batch_fdatasync` durability primitive.
 
 /// Submit one FSYNC(DATASYNC) SQE per fd and await completion of all of them.
 /// Drains the SQ when full so a chunk of more than `sq_entries` fds requires
@@ -72,38 +59,6 @@ fn uring_batch_fdatasync_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_dedup_dirfds_removes_duplicates() {
-        // dedup_dirfds only deduplicates by (dev, ino) — it does not close the
-        // duplicates it drops (the caller closes every collected fd).
-        let inodes = vec![
-            (1u64, 10u64, 3i32),
-            (1u64, 10u64, 7i32), // duplicate of (1,10)
-            (1u64, 20u64, 5i32),
-            (2u64, 10u64, 9i32), // same ino, different dev — not a duplicate
-        ];
-        let mut result = dedup_dirfds(inodes);
-        result.sort_unstable();
-        assert_eq!(result.len(), 3, "one fd per unique (dev, ino)");
-        // No duplicate fds for (1, 10)
-        assert!(result.contains(&3i32) || result.contains(&7i32));
-        assert!(result.contains(&5i32));
-        assert!(result.contains(&9i32));
-    }
-
-    #[test]
-    fn test_dedup_dirfds_empty() {
-        assert_eq!(dedup_dirfds(vec![]), Vec::<libc::c_int>::new());
-    }
-
-    #[test]
-    fn test_dedup_dirfds_all_unique() {
-        let inodes = vec![(1u64, 1u64, 10i32), (1u64, 2u64, 20i32), (2u64, 1u64, 30i32)];
-        let mut result = dedup_dirfds(inodes);
-        result.sort_unstable();
-        assert_eq!(result, vec![10i32, 20i32, 30i32]);
-    }
 
     /// Build an io_uring ring, or return `None` if the platform denies the
     /// syscall (no io_uring support, no CAP_SYS_ADMIN, or AppArmor/seccomp

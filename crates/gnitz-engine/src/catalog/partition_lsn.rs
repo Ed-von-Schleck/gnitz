@@ -183,8 +183,8 @@ impl CatalogEngine {
     }
 
     /// Maximum `current_lsn` across all tables — system and user. The
-    /// executor seeds `shared.ingest_lsn` from this at boot and the DDL
-    /// zone allocator re-reads it per DDL, so every allocated zone LSN is
+    /// executor seeds its zone-LSN allocator from this at boot and passes it
+    /// as the reservation floor per DDL, so every allocated zone LSN is
     /// strictly greater than each table's current counter: no recovery
     /// watermark a checkpoint persisted can cover a committed-but-unflushed
     /// zone, and a failed zone's pinned LSN is never reused.

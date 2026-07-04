@@ -4,6 +4,7 @@
 //! (`memtable.rs`).
 
 use std::ffi::CStr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use libc::c_int;
 
@@ -217,7 +218,7 @@ unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> Result<(
 /// .tmp basename so the caller can batch the fdatasync and perform the rename
 /// later. On any internal error the fd is closed and the .tmp is unlinked.
 pub struct PreparedShard {
-    pub fd: c_int,
+    pub fd: OwnedFd,
     pub tmp_name: std::ffi::CString,
 }
 
@@ -246,20 +247,18 @@ pub fn write_shard_streaming(
     durable: bool,
     flags: u8,
 ) -> Result<(), StorageError> {
-    let prepared = write_shard_streaming_prepare(dirfd, basename, table_id, row_count, regions, flags)?;
-    if durable && fdatasync_eintr(prepared.fd).is_err() {
+    let PreparedShard { fd, tmp_name } =
+        write_shard_streaming_prepare(dirfd, basename, table_id, row_count, regions, flags)?;
+    if durable && fdatasync_eintr(fd.as_raw_fd()).is_err() {
         unsafe {
-            libc::close(prepared.fd);
-            libc::unlinkat(dirfd, prepared.tmp_name.as_ptr(), 0);
+            libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
         }
         return Err(StorageError::Io);
     }
+    drop(fd); // Close before the rename, matching the batched two-phase path.
     unsafe {
-        libc::close(prepared.fd);
-    }
-    unsafe {
-        if libc::renameat(dirfd, prepared.tmp_name.as_ptr(), dirfd, basename.as_ptr()) < 0 {
-            libc::unlinkat(dirfd, prepared.tmp_name.as_ptr(), 0);
+        if libc::renameat(dirfd, tmp_name.as_ptr(), dirfd, basename.as_ptr()) < 0 {
+            libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
             return Err(StorageError::Io);
         }
         // Flush the directory inode so the renamed entry survives a power loss
@@ -284,7 +283,7 @@ fn write_shard_streaming_inner(
     row_count: u32,
     regions: &[(*const u8, usize)],
     flags: u8,
-) -> Result<(c_int, std::ffi::CString), StorageError> {
+) -> Result<(OwnedFd, std::ffi::CString), StorageError> {
     let num_regions = regions.len();
     let n = row_count as usize;
     let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
@@ -419,18 +418,20 @@ fn write_shard_streaming_inner(
         if fd < 0 {
             return Err(StorageError::Io);
         }
+        // SAFETY: fresh descriptor from `openat`; the `OwnedFd` is the sole
+        // closer, so every error return below closes it — `abort` only unlinks.
+        let fd = OwnedFd::from_raw_fd(fd);
 
-        let abort = |fd: c_int, tmp_ptr: *const libc::c_char| -> StorageError {
-            libc::close(fd);
-            libc::unlinkat(dirfd, tmp_ptr, 0);
+        let abort = || -> StorageError {
+            libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
             StorageError::Io
         };
 
-        if libc::ftruncate(fd, total_size as libc::off_t) < 0 {
-            return Err(abort(fd, tmp_name.as_ptr()));
+        if libc::ftruncate(fd.as_raw_fd(), total_size as libc::off_t) < 0 {
+            return Err(abort());
         }
 
-        pwrite_all(fd, &hdr_buf, 0).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
+        pwrite_all(fd.as_raw_fd(), &hdr_buf, 0).map_err(|_| abort())?;
 
         for i in 0..num_regions {
             let (src_ptr, orig_sz) = regions[i];
@@ -440,23 +441,23 @@ fn write_shard_streaming_inner(
                 RegionEncoding::Raw => {
                     if actual_sizes[i] > 0 && !src_ptr.is_null() {
                         let src = std::slice::from_raw_parts(src_ptr, orig_sz);
-                        pwrite_all(fd, src, r_off).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
+                        pwrite_all(fd.as_raw_fd(), src, r_off).map_err(|_| abort())?;
                     }
                 }
                 RegionEncoding::Constant => {
                     let elem_width = actual_sizes[i];
                     let src = std::slice::from_raw_parts(src_ptr, elem_width);
-                    pwrite_all(fd, src, r_off).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
+                    pwrite_all(fd.as_raw_fd(), src, r_off).map_err(|_| abort())?;
                 }
                 RegionEncoding::TwoValue { .. } => {
                     let buf = two_value_bufs[i].as_ref().expect("TwoValue buf precomputed");
-                    pwrite_all(fd, buf, r_off).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
+                    pwrite_all(fd.as_raw_fd(), buf, r_off).map_err(|_| abort())?;
                 }
             }
         }
 
         if let Some(ref data) = xor8_data {
-            pwrite_all(fd, data, xor8_offset as libc::off_t).map_err(|_| abort(fd, tmp_name.as_ptr()))?;
+            pwrite_all(fd.as_raw_fd(), data, xor8_offset as libc::off_t).map_err(|_| abort())?;
         }
 
         Ok((fd, tmp_name))

@@ -14,6 +14,7 @@ import random
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 
 import pytest
@@ -390,6 +391,98 @@ def test_returning_across_cache_refill(client):
         assert ids == list(range(1, 101))
     finally:
         _cleanup(client, sn, "t")
+
+
+# ---------------------------------------------------------------------------
+# Concurrent SERIAL allocation interleaved with reads
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_serial_alloc_with_seeks(server):
+    """Many connections drawing SERIAL ids concurrently — forcing repeated durable
+    range refills (every SERIAL_RANGE_SIZE = 64 inserts) — while a reader streams
+    SEEKs the whole time. Exercises the SERIAL path releasing the catalog write
+    lock BEFORE its fdatasync: concurrent range fsyncs now overlap and a SEEK may
+    run during one. Asserts (1) no id is ever issued twice (a zone double-open
+    would collide), (2) each connection's own ids are strictly increasing, and
+    (3) the concurrent SEEK loop never hangs or errors.
+    """
+    sn = "srlc" + _uid()
+    with gnitz.connect(server) as c0:
+        c0.create_schema(sn)
+        c0.execute_sql("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)", schema_name=sn)
+        tid, _ = c0.resolve_table(sn, "t")
+
+    try:
+        n_writers = 4
+        per_writer = 100  # > 64 forces at least one durable range refill per writer
+        writer_ids = [None] * n_writers
+        errors = []
+        writers_running = threading.Event()
+
+        def writer(idx):
+            try:
+                with gnitz.connect(server) as c:
+                    got = []
+                    for i in range(per_writer):
+                        res = c.execute_sql(
+                            f"INSERT INTO t (name) VALUES ('w{idx}_{i}') RETURNING id",
+                            schema_name=sn,
+                        )
+                        got.extend(r.id for r in _returned_rows(res))
+                        if i == 0:
+                            writers_running.set()
+                    writer_ids[idx] = got
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("writer", exc))
+
+        def seeker():
+            writers_running.wait(timeout=15)
+            try:
+                with gnitz.connect(server) as c:
+                    for _ in range(200):
+                        # A miss returns empty (not an error); the point is that
+                        # the round-trip completes while SERIAL fsyncs are in flight.
+                        list(c.seek(tid, pk=1))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("seek", exc))
+
+        wthreads = [
+            threading.Thread(target=writer, args=(i,), daemon=True) for i in range(n_writers)
+        ]
+        sthread = threading.Thread(target=seeker, daemon=True)
+        for t in wthreads:
+            t.start()
+        sthread.start()
+        for t in wthreads:
+            t.join(timeout=60)
+        sthread.join(timeout=30)
+
+        assert all(not t.is_alive() for t in wthreads), "a SERIAL writer hung"
+        assert not sthread.is_alive(), "the concurrent SEEK loop hung"
+        for src, exc in errors:
+            raise AssertionError(f"{src} thread raised: {exc}")
+
+        # (2) per-connection strict monotonicity.
+        for idx, ids in enumerate(writer_ids):
+            assert ids is not None and len(ids) == per_writer, f"writer {idx} lost rows"
+            assert ids == sorted(ids) and len(set(ids)) == len(ids), (
+                f"writer {idx} ids not strictly increasing: {ids}"
+            )
+
+        # (1) global uniqueness — no id issued to two connections.
+        all_ids = [i for ids in writer_ids for i in ids]
+        assert len(all_ids) == n_writers * per_writer
+        assert len(set(all_ids)) == len(all_ids), "a SERIAL id was issued twice (zone double-open)"
+
+        # A full scan agrees with the set of issued ids (gaps from partially
+        # consumed per-connection range tails are permitted).
+        with gnitz.connect(server) as c:
+            live = sorted(r.id for r in c.scan(tid) if r.weight > 0)
+        assert live == sorted(set(all_ids)), "scan disagrees with the issued ids"
+    finally:
+        with gnitz.connect(server) as c:
+            _cleanup(c, sn, "t")
 
 
 # ---------------------------------------------------------------------------

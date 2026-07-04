@@ -27,10 +27,11 @@ use crate::catalog::{
 };
 use crate::foundation::posix_io::guard_panic;
 use crate::runtime::committer::{self, CommitRequest};
+use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{first_worker_error_opt, MasterDispatcher};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
-    join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, PendingRelay, Reactor, ReplyFuture,
+    join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, FsyncFuture, PendingRelay, Reactor, ReplyFuture,
 };
 use crate::runtime::wire::{
     self as ipc, SchemaWithVersion, FLAG_GET_INDICES, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH,
@@ -98,9 +99,9 @@ pub struct Shared {
     /// Tick trigger sender; senders include INSERT (auto-trigger on
     /// threshold cross) and SCAN (explicit drain).
     tick_tx: mpsc::Sender<TickTrigger>,
-    /// Committer-owned counter; shared here so SCAN/SEEK handlers can
-    /// report the same LSN the committer assigns.
-    ingest_lsn: Rc<Cell<u64>>,
+    /// Zone-LSN allocation high-water + durability watermark, shared with the
+    /// committer so SCAN/SEEK handlers report the same LSN it assigns.
+    lsn_alloc: Rc<ZoneLsnAllocator>,
     last_tick_lsn: Rc<Cell<u64>>,
     /// Per-table row counter feeding the tick threshold.
     tick_rows: Rc<RefCell<FxHashMap<i64, usize>>>,
@@ -203,12 +204,12 @@ impl ServerExecutor {
         reactor.attach_server_fd(server_fd);
 
         let sal_writer_excl = Rc::new(AsyncMutex::new(()));
-        // Seed ingest_lsn above every table's current_lsn so each new zone
-        // LSN is strictly greater, keeping `ingest_to_family`'s direct
+        // Seed the zone-LSN allocator above every table's current_lsn so each
+        // new zone LSN is strictly greater, keeping `ingest_to_family`'s direct
         // current_lsn assignment monotonic across restarts.
-        let initial_ingest_lsn = unsafe { &*catalog }.max_table_current_lsn();
-        let ingest_lsn = Rc::new(Cell::new(initial_ingest_lsn));
-        let last_tick_lsn = Rc::new(Cell::new(initial_ingest_lsn));
+        let initial_lsn = unsafe { &*catalog }.max_table_current_lsn();
+        let lsn_alloc = Rc::new(ZoneLsnAllocator::new(initial_lsn));
+        let last_tick_lsn = Rc::new(Cell::new(initial_lsn));
         let tick_rows: Rc<RefCell<FxHashMap<i64, usize>>> = Rc::new(RefCell::new(FxHashMap::default()));
         let tick_tids: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let t_last_push = Rc::new(Cell::new(None));
@@ -226,7 +227,7 @@ impl ServerExecutor {
             disp_ptr: dispatcher,
             sal_fd,
             sal_writer_excl: Rc::clone(&sal_writer_excl),
-            ingest_lsn: Rc::clone(&ingest_lsn),
+            lsn_alloc: Rc::clone(&lsn_alloc),
             num_workers,
             tick_rows: Rc::clone(&tick_rows),
             tick_tids: Rc::clone(&tick_tids),
@@ -244,7 +245,7 @@ impl ServerExecutor {
             catalog_rwlock: Rc::new(AsyncRwLock::new()),
             sal_writer_excl: Rc::clone(&sal_writer_excl),
             tick_tx,
-            ingest_lsn: Rc::clone(&ingest_lsn),
+            lsn_alloc: Rc::clone(&lsn_alloc),
             last_tick_lsn: Rc::clone(&last_tick_lsn),
             tick_rows: Rc::clone(&tick_rows),
             tick_tids: Rc::clone(&tick_tids),
@@ -509,10 +510,10 @@ async fn run_tick(
     if tids.is_empty() {
         return Ok(());
     }
-    // Snapshot before any .await: a concurrent push can bump ingest_lsn
+    // Snapshot before any .await: a concurrent push can advance the published LSN
     // while we wait for tick ACKs, and setting last_tick_lsn to that
     // higher value would report an LSN that this tick never processed.
-    let snapshot_lsn = shared.ingest_lsn.get();
+    let snapshot_lsn = shared.lsn_alloc.published();
 
     // Allocate every (tid, worker) req_id up front so the SAL emission
     // sequence is fully prepared before we take any locks.
@@ -1519,19 +1520,14 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         }
     }
 
-    // Reserve the zone LSN but do NOT publish it until fsync confirms durability.
-    // Allocation must dominate every family's current_lsn (not just ingest_lsn):
-    // un-pinned sys-table ingests auto-bump family counters, and a checkpoint
-    // persists drifted counters as recovery dedup watermarks — a zone LSN at or
-    // below such a watermark would have its committed-but-unflushed deltas deduped
-    // away on recovery. Re-reading max_table_current_lsn per DDL keeps every
-    // allocated zone LSN strictly greater, and keeps a failed DDL's pinned LSN
-    // (never published) from being reused by the next zone.
+    // Reserve the zone LSN but do NOT publish it until fsync confirms
+    // durability. A DDL bundle writes arbitrary system families, so the floor is
+    // `max_table_current_lsn` — the zone must dominate EVERY family's counter
+    // (see `ZoneLsnAllocator::reserve` for why a drifted counter would dedup-drop
+    // the zone on recovery).
     let zone_lsn = shared
-        .ingest_lsn
-        .get()
-        .max(unsafe { (*cat_ptr_raw).max_table_current_lsn() })
-        + 1;
+        .lsn_alloc
+        .reserve(unsafe { (*cat_ptr_raw).max_table_current_lsn() });
     let zone_lsn_nz = NonZeroU64::new(zone_lsn).expect("zone LSN allocator starts above 0");
     unsafe {
         (*cat_ptr_raw).ctx.open_ddl_zone(zone_lsn_nz);
@@ -1613,23 +1609,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     let drained = unsafe { (*cat_ptr_raw).drain_pending_broadcasts() };
     let fsync_fut = {
         let _sal_excl = shared.sal_writer_excl.lock().await;
-        let disp_ptr_raw = shared.dispatcher;
-        if let Err(e) = guard_panic("broadcast_ddl", || unsafe {
-            for (tid, bat) in &drained {
-                (*disp_ptr_raw).broadcast_ddl(*tid, bat, zone_lsn)?;
-            }
-            // Crash-injection seam: abort after broadcasts but BEFORE the commit
-            // sentinel — exercises the recovery skip of a half-written zone.
-            #[cfg(debug_assertions)]
-            if std::env::var("GNITZ_INJECT_DDL_PANIC").as_deref() == Ok("after_broadcasts") {
-                libc::abort();
-            }
-            (*disp_ptr_raw).commit_zone(zone_lsn)?;
-            Ok::<(), String>(())
-        }) {
-            gnitz_fatal_abort!("DDL broadcast failed after in-memory catalog mutation: {}", e);
-        }
-        shared.reactor.fsync(shared.sal_fd)
+        emit_zone_to_sal(shared, "DDL", &drained, zone_lsn)
     };
     let fsync_rc = fsync_fut.await;
     if fsync_rc < 0 {
@@ -1639,7 +1619,7 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // Publish only after fsync, then close the zone and defer dir removals to the
     // next checkpoint (whose worker-ACK barrier proves every worker consumed past
     // this DROP; removing here races a lagging worker's partition-dir create).
-    shared.ingest_lsn.set(zone_lsn);
+    shared.lsn_alloc.publish(zone_lsn);
     unsafe {
         (*cat_ptr_raw).ctx.close_ddl_zone();
         (*cat_ptr_raw).defer_pending_dir_deletions();
@@ -1795,6 +1775,33 @@ async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8
     peer.send_buffer_or_close(buf).await;
 }
 
+/// Emit a closed catalog zone to the SAL: broadcast each drained family batch
+/// under `zone_lsn`, write the commit sentinel (`commit_zone`, which also
+/// signals all workers), and submit the fdatasync SQE, returning its future.
+/// The caller must hold `sal_writer_excl` across the call so reservation order
+/// == SAL write order. A failure here comes after the in-memory catalog
+/// mutation and would permanently diverge master/worker state — unrecoverable,
+/// so abort.
+fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(i64, Batch)], zone_lsn: u64) -> FsyncFuture {
+    let disp = shared.dispatcher;
+    if let Err(e) = guard_panic(op, || unsafe {
+        for (tid, bat) in drained {
+            (*disp).broadcast_ddl(*tid, bat, zone_lsn)?;
+        }
+        // Crash-injection seam: abort after broadcasts but BEFORE the commit
+        // sentinel — exercises the recovery skip of a half-written zone.
+        #[cfg(debug_assertions)]
+        if std::env::var("GNITZ_INJECT_DDL_PANIC").as_deref() == Ok("after_broadcasts") {
+            libc::abort();
+        }
+        (*disp).commit_zone(zone_lsn)?;
+        Ok::<(), String>(())
+    }) {
+        gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);
+    }
+    shared.reactor.fsync(shared.sal_fd)
+}
+
 /// Durably reserve a SERIAL id range for `seq_id` and return the range base.
 ///
 /// The high-water must be persisted *at allocation time*: `recover_sequences`
@@ -1803,76 +1810,72 @@ async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8
 /// SAL commit path — the same path `CREATE` uses, which
 /// `recover_system_tables_from_sal` replays via `hook_sequence_register`.
 ///
-/// The critical requirement is that it acquire `catalog_rwlock.write()` at the
-/// top, before reading `ingest_lsn`, and hold it across the fsync await and
-/// `ingest_lsn.set()`, exactly as `handle_ddl` does. Without the write lock two
-/// concurrent range requests would read the same stale `ingest_lsn`, compute the
-/// same `zone_lsn`, and double-open / double-commit / double-broadcast one LSN —
-/// violating strict-monotonic zone LSNs and letting a later checkpoint watermark
-/// dedup-drop a committed-but-unflushed advance on recovery, re-issuing a
-/// committed id. The zone body mirrors `handle_ddl`'s post-lock tail
-/// (zone_lsn … close_ddl_zone); it needs none of `handle_ddl`'s VIEW-only prelude
-/// (TickGate quiesce, committer barrier, base-table drain), because a
-/// `sys_sequences` advance is a pure system-table write with no DAG evaluation
-/// and no rollback path.
+/// **Reserve + mutate + emit under both locks, release both BEFORE the fsync.**
+/// The whole reserve/mutate/emit span is synchronous (the only `.await`s are the
+/// two lock acquisitions), so catalog readers — SEEK / SEEK_BY_INDEX* /
+/// GET_INDICES / tick emission, all of which take `catalog_rwlock.read()` — block
+/// only for that brief span, never across the `fdatasync`. Distinctness and
+/// publish-after-fsync are the `ZoneLsnAllocator` contract; the reservation
+/// floor is `sys_sequences`' own counter, computed by `reserve_user_sequence`
+/// (a SERIAL zone writes that one family, so recovery's per-family dedup needs
+/// no other counter dominated). The pin (`current_lsn = zone_lsn`) runs
+/// synchronously under the locks, so recovery's dedup matches the SAL group LSN.
+///
+/// The full `open_ddl_zone … ingest … close_ddl_zone` lifecycle is contained in
+/// the one await-free write-lock section, so the single `ctx.ddl_zone_lsn` slot
+/// is never observed by another allocator once the write lock drops. It needs
+/// none of `handle_ddl`'s VIEW-only prelude (TickGate quiesce, committer barrier,
+/// base-table drain): a `sys_sequences` advance has no DAG evaluation and no
+/// rollback path.
 async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i64) -> i64 {
-    let _write = shared.catalog_rwlock.write().await;
-
-    // Raw-pointer derefs (as handle_ddl) so no `&mut CatalogEngine` borrow is
-    // held across the `.await` points below; the write lock guarantees no other
-    // coroutine touches the catalog while we are parked.
-    let cat_ptr = shared.catalog;
-    let (base, delta) = unsafe { (*cat_ptr).reserve_user_sequence(seq_id, count) };
-
-    // Dominate every family's current_lsn, not just ingest_lsn (see handle_ddl),
-    // so a later checkpoint watermark cannot dedup-drop this advance on recovery.
-    let zone_lsn = shared
-        .ingest_lsn
-        .get()
-        .max(unsafe { (*cat_ptr).max_table_current_lsn() })
-        + 1;
-    let zone_lsn_nz = NonZeroU64::new(zone_lsn).expect("zone LSN allocator starts above 0");
-    // A sys_sequences advance is a pure system-table write (no evaluate_dag, no
-    // rollback). A hook failure on a well-formed 2-row delta is an invariant
-    // violation — abort rather than attempt compensation. `gnitz_fatal_abort!`
-    // expands to an `unsafe` block, so keep it out of the raw-deref `unsafe`.
-    let ingest_res = unsafe {
-        (*cat_ptr).ctx.open_ddl_zone(zone_lsn_nz);
-        (*cat_ptr).ingest_to_family(SEQ_TAB_ID, &delta)
-    };
-    if let Err(e) = ingest_res {
-        gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
-    }
-
-    // SAL emission window (mirrors handle_ddl): broadcast + commit sentinel under
-    // sal_writer_excl, then fsync before publishing ingest_lsn. A broadcast
-    // failure after the catalog mutation permanently diverges master/worker
-    // state, so it is unrecoverable — abort.
-    let drained = unsafe { (*cat_ptr).drain_pending_broadcasts() };
-    let fsync_fut = {
+    let (base, zone_lsn, fsync_fut) = {
+        // Lock order catalog -> SAL, matching INSERT/SEEK, so acquiring SAL under
+        // catalog.write cannot deadlock. Both guards drop at the end of this block.
+        let _write = shared.catalog_rwlock.write().await;
         let _sal_excl = shared.sal_writer_excl.lock().await;
-        let disp = shared.dispatcher;
-        if let Err(e) = guard_panic("serial-range-broadcast", || unsafe {
-            for (tid, bat) in &drained {
-                (*disp).broadcast_ddl(*tid, bat, zone_lsn)?;
-            }
-            (*disp).commit_zone(zone_lsn)?;
-            Ok::<(), String>(())
-        }) {
-            gnitz_fatal_abort!("serial-range broadcast failed after in-memory catalog mutation: {}", e);
+
+        // Raw-pointer derefs (as handle_ddl) so no `&mut CatalogEngine` borrow is
+        // held across a later `.await`; the write lock guarantees no other
+        // coroutine touches the catalog while this block runs.
+        let cat_ptr = shared.catalog;
+        let (base, delta, zone_floor) = unsafe { (*cat_ptr).reserve_user_sequence(seq_id, count) };
+        let zone_lsn = shared.lsn_alloc.reserve(zone_floor);
+        let zone_lsn_nz = NonZeroU64::new(zone_lsn).expect("zone LSN allocator starts above 0");
+
+        // A sys_sequences advance is a pure system-table write (no evaluate_dag,
+        // no rollback); a hook failure on a well-formed 2-row delta is an
+        // invariant violation — abort rather than compensate.
+        // `gnitz_fatal_abort!` expands to an `unsafe` block, so keep it out of the
+        // raw-deref `unsafe`.
+        let ingest_res = unsafe {
+            (*cat_ptr).ctx.open_ddl_zone(zone_lsn_nz);
+            (*cat_ptr).ingest_to_family(SEQ_TAB_ID, &delta)
+        };
+        if let Err(e) = ingest_res {
+            gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
         }
-        shared.reactor.fsync(shared.sal_fd)
+        unsafe {
+            (*cat_ptr).ctx.close_ddl_zone();
+        }
+
+        // SAL emission under the still-held sal_writer_excl; the fdatasync SQE is
+        // submitted synchronously. Both guards drop as this block ends, before
+        // the await below.
+        let drained = unsafe { (*cat_ptr).drain_pending_broadcasts() };
+        (
+            base,
+            zone_lsn,
+            emit_zone_to_sal(shared, "serial-range", &drained, zone_lsn),
+        )
     };
+
     if fsync_fut.await < 0 {
         gnitz_fatal_abort!("SAL fdatasync (serial range) failed");
     }
 
-    // Publish only after fsync (Cleanup D): readers never see an LSN whose
-    // backing sys_sequences delta is not yet on disk.
-    shared.ingest_lsn.set(zone_lsn);
-    unsafe {
-        (*cat_ptr).ctx.close_ddl_zone();
-    }
+    // Publish only after fsync: readers never see an LSN whose backing
+    // sys_sequences delta is not yet on disk.
+    shared.lsn_alloc.publish(zone_lsn);
     base
 }
 

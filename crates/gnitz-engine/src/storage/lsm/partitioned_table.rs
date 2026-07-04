@@ -5,6 +5,7 @@
 //! `mix(pk) >> 56` (see `schema::key`), not `xxh3 & 0xFF`.
 
 use std::cell::RefCell;
+use std::os::fd::OwnedFd;
 use std::rc::Rc;
 
 use super::batch::Batch;
@@ -46,6 +47,12 @@ pub struct PartitionedTable {
     part_offset: u32,
     schema: SchemaDescriptor,
     last_found_partition: Option<usize>,
+    /// Test seam: force `flush_commit_batch` to return `Err` right before it
+    /// would commit the `n`-th partition (0-based). Exercises the mid-batch
+    /// error path so the fd-hygiene test can prove the already-collected
+    /// `OwnedFd`s are released (not leaked) on early return.
+    #[cfg(test)]
+    commit_fail_after: Option<usize>,
 }
 
 impl PartitionedTable {
@@ -105,6 +112,8 @@ impl PartitionedTable {
             part_offset: part_start,
             schema,
             last_found_partition: None,
+            #[cfg(test)]
+            commit_fail_after: None,
         })
     }
 
@@ -355,10 +364,21 @@ impl PartitionedTable {
     }
 
     /// Phase 3: dispatch each FlushWork back to its partition's `flush_commit`.
-    /// Returns the dirfds to fsync (one per partition that committed).
-    pub fn flush_commit_batch(&mut self, works: Vec<(usize, FlushWork)>) -> Result<Vec<libc::c_int>, StorageError> {
-        let mut dirfds = Vec::with_capacity(works.len());
+    /// Returns the owned dir fds to fsync (one per partition that committed).
+    /// A partial-batch failure leaks nothing: the error `?` drops the fds
+    /// already collected, and the un-consumed `works` tail is closed by
+    /// `FlushWork`'s Drop.
+    pub fn flush_commit_batch(&mut self, works: Vec<(usize, FlushWork)>) -> Result<Vec<OwnedFd>, StorageError> {
+        let mut dirfds: Vec<OwnedFd> = Vec::with_capacity(works.len());
         for (idx, w) in works {
+            // Test seam: fail before committing the n-th partition (`dirfds.len()`
+            // is the count already collected). The collected `dirfds` and the
+            // remaining `works` drop here, closing every fd — the property the
+            // fd-hygiene test checks.
+            #[cfg(test)]
+            if self.commit_fail_after == Some(dirfds.len()) {
+                return Err(StorageError::Io);
+            }
             if let Some(fd) = self.tables[idx].flush_commit(w)? {
                 dirfds.push(fd);
             }
@@ -605,6 +625,7 @@ mod tests {
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::test_support::wide_pk_3xu64_schema;
+    use std::os::fd::AsRawFd;
 
     fn make_schema() -> SchemaDescriptor {
         SchemaDescriptor::new(
@@ -1168,5 +1189,118 @@ mod tests {
             f.current_lsn,
             "current_lsn still reports the max for the allocator",
         );
+    }
+
+    // ── Barrier-flush directory-fd hygiene ───────────────────────────────
+
+    /// Count this process's open fds that point at a partition directory
+    /// (`.../part_N`) under `root`. At rest the engine holds zero — dir fds are
+    /// opened per flush and released on commit — and shard/manifest *file* fds
+    /// inside a partition dir have a `shard_`/`manifest` basename, not `part_`,
+    /// so they are excluded. Scoped to `root` (each test's unique tempdir)
+    /// because `/proc/self/fd` is process-global and cargo runs tests in
+    /// parallel threads: without the prefix filter a sibling test's transient
+    /// dir fds would be counted here. This is thus a precise, isolated probe of
+    /// the dir-fd leak, independent of the data fds a flush legitimately opens.
+    fn count_partition_dir_fds(root: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .filter(|target| {
+                target.starts_with(root)
+                    && target
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|n| n.starts_with("part_"))
+            })
+            .count()
+    }
+
+    fn durable_hashed(dir: &std::path::Path, name: &str, table_id: u32) -> PartitionedTable {
+        PartitionedTable::new(
+            dir.join(name).to_str().unwrap(),
+            "test",
+            make_schema(),
+            table_id,
+            Routing::Hashed,
+            Persistence::Durable,
+            0,
+            256,
+        )
+        .unwrap()
+    }
+
+    /// A `flush_commit_batch` that fails partway leaks no directory fd: the fds
+    /// of already-committed partitions are collected as `OwnedFd`s and released
+    /// by `Drop` on the early return, and the un-consumed `works` tail is closed
+    /// by `FlushWork`'s Drop. Pre-fix (raw `c_int`), the collected fds dropped
+    /// unclosed on the mid-batch `?` — the cumulative leak this pins shut.
+    #[test]
+    fn flush_commit_batch_no_dirfd_leak_on_midbatch_error() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pt = durable_hashed(dir.path(), "pt_fd_hygiene", 840);
+
+        // Enough distinct PKs that ≥2 partitions receive data, so the commit
+        // batch has ≥2 works and the mid-batch failure is reachable.
+        let rows: Vec<(u64, i64, i64)> = (0..64).map(|i| (i, 1, i as i64)).collect();
+        pt.ingest_owned_batch(make_batch(&rows)).unwrap();
+
+        let root = dir.path();
+        assert_eq!(count_partition_dir_fds(root), 0, "no dir fds held at rest");
+
+        let works = pt.flush_prepare().unwrap();
+        let n = works.len();
+        assert!(
+            n >= 2,
+            "need ≥2 partitions with data to exercise a mid-batch failure (got {n})"
+        );
+        // flush_prepare opened one dir fd per pending partition, held in each
+        // FlushWork's ShardRename until commit.
+        assert!(
+            count_partition_dir_fds(root) >= n,
+            "prepared works hold their dir fds open"
+        );
+
+        // Fail right before committing the 2nd partition: the 1st partition's
+        // dir fd has already been collected into the returned Vec<OwnedFd>.
+        pt.commit_fail_after = Some(1);
+        assert!(matches!(pt.flush_commit_batch(works), Err(StorageError::Io)));
+
+        // The committed partition's collected fd and every uncommitted work's fd
+        // are closed by Drop on the error unwind — nothing leaks.
+        assert_eq!(
+            count_partition_dir_fds(root),
+            0,
+            "mid-batch commit failure leaks no dir fd (n_works={n})",
+        );
+    }
+
+    /// Success-path regression: repeated checkpoints over a partitioned table
+    /// leave the partition-dir-fd count flat at zero. The worker fsyncs each
+    /// returned `OwnedFd` then drops the vec; modeled here by the fsync + drop.
+    #[test]
+    fn repeated_flush_commit_batch_leaves_dirfds_flat() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut pt = durable_hashed(root, "pt_fd_flat", 850);
+
+        for round in 0..8u64 {
+            let rows: Vec<(u64, i64, i64)> = (0..16).map(|i| (round * 100 + i, 1, i as i64)).collect();
+            pt.ingest_owned_batch(make_batch(&rows)).unwrap();
+            let works = pt.flush_prepare().unwrap();
+            let fds = pt.flush_commit_batch(works).unwrap();
+            for fd in &fds {
+                let _ = crate::foundation::posix_io::fsync_eintr(fd.as_raw_fd());
+            }
+            drop(fds); // OwnedFds close here, as they do in the worker sweep.
+            assert_eq!(
+                count_partition_dir_fds(root),
+                0,
+                "round {round}: dir fds released after commit"
+            );
+        }
     }
 }

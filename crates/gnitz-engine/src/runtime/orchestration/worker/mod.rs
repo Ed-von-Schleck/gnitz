@@ -5,6 +5,7 @@
 //! per-worker W2M shared region.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
@@ -263,7 +264,7 @@ mod exchange;
 mod fsync;
 mod reply;
 
-use fsync::{dedup_dirfds, uring_batch_fdatasync};
+use fsync::uring_batch_fdatasync;
 
 /// Debug-only test seam: parse env var `var` as a `usize`. Always `None` in
 /// release builds, which never read the environment.
@@ -1475,7 +1476,10 @@ impl WorkerProcess {
         // next tick (bounded by the 10k-row auto-tick); a dropped table's entry is
         // GC'd in the DdlSync arm (retain(has_id)).
         let ids = self.cat().iter_user_table_ids();
-        let mut dir_inodes: Vec<(u64, u64, libc::c_int)> = Vec::new();
+        // One dir fd per unique (dev, ino), so a shared directory is fsynced
+        // once — deduped at insertion in `flush_chunk` (a duplicate's `OwnedFd`
+        // closes immediately).
+        let mut dir_fds: HashMap<(u64, u64), OwnedFd> = HashMap::new();
 
         let mut ring = io_uring::IoUring::new(256).map_err(|e| format!("io_uring::new failed: {e}"))?;
 
@@ -1498,30 +1502,20 @@ impl WorkerProcess {
             pending.push((tid, works));
             pending_fds += added_fds;
             if pending_fds >= FD_CHUNK_THRESHOLD {
-                self.flush_chunk(&mut ring, &mut pending, &mut dir_inodes)?;
+                self.flush_chunk(&mut ring, &mut pending, &mut dir_fds)?;
                 pending_fds = 0;
             }
         }
-        self.flush_chunk(&mut ring, &mut pending, &mut dir_inodes)?;
+        self.flush_chunk(&mut ring, &mut pending, &mut dir_fds)?;
 
-        // The fds are per-flush dir fds, owned by this batch (opened in
-        // `flush_prepare`, returned by `flush_commit`). Fsync one fd per unique
-        // directory inode, then close every fd so the flush leaks none.
-        let all_fds: Vec<libc::c_int> = dir_inodes.iter().map(|&(_, _, fd)| fd).collect();
-        let mut fsync_err = None;
-        for fd in dedup_dirfds(dir_inodes) {
-            if let Err(e) = crate::foundation::posix_io::fsync_eintr(fd) {
-                fsync_err = Some(e);
-                break;
+        // The dir fds are per-flush (opened in `flush_prepare`, returned by
+        // `flush_commit`). `dir_fds` drops at end of scope — on the success
+        // return and every `?` unwind alike — closing all of them, so the flush
+        // leaks nothing even under a persistent disk error.
+        for fd in dir_fds.values() {
+            if let Err(e) = crate::foundation::posix_io::fsync_eintr(fd.as_raw_fd()) {
+                return Err(format!("dir fsync failed: {e}"));
             }
-        }
-        for fd in all_fds {
-            unsafe {
-                libc::close(fd);
-            }
-        }
-        if let Some(err) = fsync_err {
-            return Err(format!("dir fsync failed: {err}"));
         }
         Ok(())
     }
@@ -1530,7 +1524,7 @@ impl WorkerProcess {
         &mut self,
         ring: &mut io_uring::IoUring,
         pending: &mut Vec<(i64, Vec<(usize, FlushWork)>)>,
-        dir_inodes: &mut Vec<(u64, u64, libc::c_int)>,
+        dir_fds: &mut HashMap<(u64, u64), OwnedFd>,
     ) -> Result<(), String> {
         if pending.is_empty() {
             return Ok(());
@@ -1556,11 +1550,11 @@ impl WorkerProcess {
                 .map_err(|e| format!("flush_commit tid={tid}: {e}"))?;
             for dirfd in dirfds {
                 let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(dirfd, &mut stat) } < 0 {
+                if unsafe { libc::fstat(dirfd.as_raw_fd(), &mut stat) } < 0 {
                     let err = std::io::Error::last_os_error();
                     return Err(format!("fstat: {err}"));
                 }
-                dir_inodes.push((stat.st_dev, stat.st_ino, dirfd));
+                dir_fds.entry((stat.st_dev, stat.st_ino)).or_insert(dirfd);
             }
         }
         Ok(())

@@ -208,24 +208,37 @@ impl CatalogEngine {
     }
 
     /// Reserve `count` ids for a user-table SERIAL sequence. Returns
-    /// `(base, delta)` where the reserved range is `[base, base + count)` and
-    /// `delta` is the `sys_sequences` retract+insert the caller must durably
-    /// persist (via the DDL SAL commit path). Unlike `advance_sequence` this
-    /// updates the in-memory `user_sequences` high-water synchronously — that
-    /// map is the source of truth for live allocation and, because the caller
-    /// holds `catalog_rwlock.write()`, its `&mut self` also serializes concurrent
-    /// reserves — and returns the delta rather than writing the memtable itself.
+    /// `(base, delta, zone_floor)` where the reserved range is
+    /// `[base, base + count)` and `delta` is the `sys_sequences` retract+insert
+    /// the caller must durably persist (via the DDL SAL commit path). Unlike
+    /// `advance_sequence` this updates the in-memory `user_sequences` high-water
+    /// synchronously — that map is the source of truth for live allocation and,
+    /// because the caller holds `catalog_rwlock.write()`, its `&mut self` also
+    /// serializes concurrent reserves — and returns the delta rather than
+    /// writing the memtable itself.
+    ///
+    /// `zone_floor` is `sys_sequences`' own `current_lsn` — the ONE family this
+    /// delta writes (its `hook_sequence_register` folds a pure in-memory map
+    /// with no cascade into other families), and thus the only counter the
+    /// caller's durable zone LSN must dominate: un-pinned object-id
+    /// `advance_sequence`s drift it, and recovery dedups per family
+    /// (`msg.lsn <= flushed[target]`). Computed here so that fact lives beside
+    /// the code that builds the delta.
     ///
     /// On an absent sequence `hw = 0`: the retract of a non-existent `(seq_id, 0)`
     /// row nets to zero under consolidation, leaving exactly the `+1` insert —
     /// the catalog's seed-on-first-use pattern. `saturating_add` avoids an i64
     /// debug-panic at the (unreachable) ~2^63 boundary; the client overflow guard
     /// rejects the id long before then.
-    pub fn reserve_user_sequence(&mut self, seq_id: i64, count: i64) -> (i64, Batch) {
+    pub fn reserve_user_sequence(&mut self, seq_id: i64, count: i64) -> (i64, Batch, u64) {
         let hw = self.user_sequences.get(&seq_id).copied().unwrap_or(0);
         let new_hw = hw.saturating_add(count);
         self.user_sequences.insert(seq_id, new_hw);
-        (hw + 1, build_seq_delta(seq_id, hw, new_hw))
+        (
+            hw + 1,
+            build_seq_delta(seq_id, hw, new_hw),
+            self.sys_sequences.current_lsn,
+        )
     }
 
     /// Fold an observed `sys_sequences` high-water into `user_sequences`,

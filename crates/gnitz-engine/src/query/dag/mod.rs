@@ -1116,12 +1116,13 @@ impl DagEngine {
         Ok(works)
     }
 
-    /// Phase 3 of two-phase flush. Returns one dirfd per partition committed.
+    /// Phase 3 of two-phase flush. Returns one owned dir fd per partition
+    /// committed.
     pub fn flush_commit_batch(
         &mut self,
         table_id: i64,
         works: Vec<(usize, FlushWork)>,
-    ) -> Result<Vec<libc::c_int>, String> {
+    ) -> Result<Vec<std::os::fd::OwnedFd>, String> {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => return Ok(vec![]),

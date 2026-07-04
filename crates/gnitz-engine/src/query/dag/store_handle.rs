@@ -140,9 +140,13 @@ impl StoreHandle {
         }
     }
 
-    /// Dispatched Phase 3 across all variants. Returns one dirfd per
-    /// committed partition.
-    pub fn flush_commit_batch(&mut self, works: Vec<(usize, FlushWork)>) -> Result<Vec<libc::c_int>, StorageError> {
+    /// Dispatched Phase 3 across all variants. Returns one owned dir fd per
+    /// committed partition (see `PartitionedTable::flush_commit_batch` for the
+    /// partial-batch fd contract).
+    pub fn flush_commit_batch(
+        &mut self,
+        works: Vec<(usize, FlushWork)>,
+    ) -> Result<Vec<std::os::fd::OwnedFd>, StorageError> {
         let t: &mut Table = match self {
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr },
             StoreHandle::Partitioned(cell) => return cell.get_mut().flush_commit_batch(works),

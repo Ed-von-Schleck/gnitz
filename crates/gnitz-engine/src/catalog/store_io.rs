@@ -418,12 +418,12 @@ impl CatalogEngine {
         }
     }
 
-    /// Phase 3 across a table family. Returns dirfds to fsync.
+    /// Phase 3 across a table family. Returns the owned dir fds to fsync.
     pub fn flush_family_commit_batch(
         &mut self,
         table_id: i64,
         works: Vec<(usize, crate::storage::FlushWork)>,
-    ) -> Result<Vec<libc::c_int>, String> {
+    ) -> Result<Vec<std::os::fd::OwnedFd>, String> {
         if table_id < FIRST_USER_TABLE_ID {
             // System tables commit inline; no FlushWork should arrive here.
             debug_assert!(works.is_empty());
