@@ -1,9 +1,7 @@
-//! Exchange partition routing: `PartitionRouter`, `worker_for_partition`,
-//! `with_*_indices`, `RouteMode`, and the per-row routing-key helpers.
+//! Exchange partition routing: `worker_for_partition`, `with_*_indices`,
+//! `RouteMode`, `scatter_is_pk_routed`, and the per-row routing-key helpers.
 
 use std::cell::RefCell;
-
-use rustc_hash::FxHashMap;
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::{partition_for_key, partition_for_pk_bytes, Batch, MemBatch};
@@ -15,39 +13,6 @@ use super::super::util::extract_group_key;
 // steady-state repartition/scatter ops allocate nothing for routing tables.
 thread_local! {
     pub(super) static SCATTER_INDICES: RefCell<Vec<Vec<u32>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Extract the routing key for `col_idx` from row `row` of `mb`.
-/// STRING columns are hashed to u64 (stored as u128); all others use the full value.
-fn extract_col_key(mb: &MemBatch<'_>, row: usize, col_idx: usize, schema: &SchemaDescriptor) -> u128 {
-    let loc = schema.locate(col_idx);
-    // NULL values shard together. Return 0 without touching the slot: a NULL
-    // string/blob column's German-string length field is uninitialized, and a
-    // garbage length > SHORT_STRING_THRESHOLD would drive a wild heap read. PK
-    // columns are never null, so this only fires for a payload column.
-    if loc.is_null(mb, row) {
-        return 0u128;
-    }
-    // German strings have no order-preserving routing image; route by a content
-    // hash (a raw byte image would alias distinct strings sharing a prefix). PK
-    // columns are never STRING/BLOB, so `is_german_string` already implies a
-    // payload column. A 64-bit hash widened to u128 is deliberate: this key feeds
-    // only the index-routing cache, whose string seeks fall back to broadcast
-    // (`index_route_key` returns None for STRING/BLOB), so it need not match the
-    // 128-bit join-scatter image `german_string_promote_key` produces.
-    if gnitz_wire::is_german_string(loc.type_code()) {
-        let content = crate::schema::german_string_content(loc.bytes(mb, row), mb.blob);
-        return if content.is_empty() {
-            0u128
-        } else {
-            crate::foundation::xxh::checksum(content) as u128
-        };
-    }
-    // PK column → widen its OPK bytes; integer / U128 / UUID payload → OPK-encode
-    // then widen. Both agree with `partition_for_pk_bytes` on the PK side
-    // (including the sign-flip for signed columns). Matched by `index_route_key`,
-    // which rebuilds this same key from a native seek value.
-    loc.route_key(mb, row)
 }
 
 /// Build a 256-entry partition→worker lookup table, hoisting the division out
@@ -103,87 +68,6 @@ pub(crate) fn op_partition_filter(batch: &Batch, schema: &SchemaDescriptor, work
     // the input, so the layout carries through unchanged (faithful propagate).
     out.inherit_layout(batch);
     out
-}
-
-// ---------------------------------------------------------------------------
-// Partition routing cache
-// ---------------------------------------------------------------------------
-
-/// Master-side routing cache: maps (table_id, col_idx, key) → worker.
-///
-/// Populated by `record_routing` after repartitioning unique-indexed columns.
-/// Lets the master unicast index seeks instead of broadcasting on cache hit.
-pub struct PartitionRouter {
-    index_routing: FxHashMap<(u32, u32, u128), u32>,
-}
-
-impl PartitionRouter {
-    pub fn new() -> Self {
-        PartitionRouter {
-            index_routing: FxHashMap::default(),
-        }
-    }
-
-    /// Returns the worker for a given index key, or -1 on cache miss.
-    pub fn worker_for_index_key(&self, tid: u32, col_idx: u32, key: u128) -> i32 {
-        match self.index_routing.get(&(tid, col_idx, key)) {
-            Some(&w) => w as i32,
-            None => -1,
-        }
-    }
-
-    /// Like `record_routing` but iterates over `indices` into `source` rather
-    /// than every row of a pre-partitioned sub-batch. Used by the scatter-to-wire
-    /// path which never materialises per-worker Batch objects.
-    pub fn record_routing_from_source(
-        &mut self,
-        source: &Batch,
-        indices: &[u32],
-        schema: &SchemaDescriptor,
-        tid: u32,
-        col_idx: u32,
-        worker: u32,
-    ) {
-        let mb = source.as_mem_batch();
-        for &idx in indices {
-            let row = idx as usize;
-            let weight = source.get_weight(row);
-            let key = extract_col_key(&mb, row, col_idx as usize, schema);
-            let map_key = (tid, col_idx, key);
-            if weight < 0 {
-                self.index_routing.remove(&map_key);
-            } else {
-                self.index_routing.insert(map_key, worker);
-            }
-        }
-    }
-
-    /// Scan every row in `batch` and record or retract its index key → worker mapping.
-    /// Rows with negative weight retract; non-negative weight records.
-    /// Test-only: the production path populates the cache through the sibling
-    /// `record_routing_from_source` (`write_commit_group → record_index_routing`),
-    /// which `fan_out_seek_by_index_async` reads to unicast a unique-index seek.
-    #[cfg(test)]
-    pub(crate) fn record_routing(
-        &mut self,
-        batch: &Batch,
-        schema: &SchemaDescriptor,
-        tid: u32,
-        col_idx: u32,
-        worker: u32,
-    ) {
-        let mb = batch.as_mem_batch();
-        for row in 0..batch.count {
-            let weight = batch.get_weight(row);
-            let key = extract_col_key(&mb, row, col_idx as usize, schema);
-            let map_key = (tid, col_idx, key);
-            if weight < 0 {
-                self.index_routing.remove(&map_key);
-            } else {
-                self.index_routing.insert(map_key, worker);
-            }
-        }
-    }
 }
 
 /// Scatter routing key for `cols` at `row`. Equal to `extract_group_key` for
@@ -262,6 +146,22 @@ pub(super) fn hash_row_for_partition(
 #[inline]
 pub(super) fn key_is_promoted(target_tcs: &[u8]) -> bool {
     target_tcs.iter().any(|&tc| tc != 0)
+}
+
+/// One home for the relay-scatter "route by native PK bytes" gate: strict
+/// sequence equality with the schema's PK list (set equality would route a
+/// permuted compound PK differently from `partition_for_pk_bytes`, which
+/// hashes OPK bytes in schema order) AND no cross-width promotion (a promoted
+/// key packs at the wider `T`; its narrow source PK bytes must not route
+/// natively). Shared by `op_repartition_batches_mode` and
+/// `relay_scatter_merge_walk` so the two scatter paths cannot drift.
+///
+/// Deliberately NOT used by `fill_worker_indices`: the write-path scatter
+/// routes by the table's distribution prefix (`schema.partition_for_pk`), a
+/// different hash domain with no promotion concept.
+#[inline]
+pub(super) fn scatter_is_pk_routed(col_indices: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
+    col_indices == schema.pk_indices() && !key_is_promoted(target_tcs)
 }
 
 /// The packer that routes a `JoinPromote` scatter by the SAME packed OPK bytes
@@ -425,7 +325,7 @@ pub(crate) fn compute_worker_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, SHORT_STRING_THRESHOLD};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Layout;
 
     fn make_schema_u64_i64() -> SchemaDescriptor {
@@ -433,16 +333,6 @@ mod tests {
             &[
                 SchemaColumn::new(type_code::U64, 0),
                 SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    }
-
-    fn make_schema_u64_string() -> SchemaDescriptor {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::STRING, 0),
             ],
             &[0],
         )
@@ -461,68 +351,6 @@ mod tests {
         }
         b.certify_layout(Layout::Consolidated, schema);
         b
-    }
-
-    fn make_batch_str(schema: &SchemaDescriptor, rows: &[(u64, i64, &str)]) -> Batch {
-        let n = rows.len();
-        let mut b = Batch::with_schema(*schema, n.max(1));
-
-        for &(pk, w, s) in rows {
-            b.extend_pk(pk as u128);
-            b.extend_weight(&w.to_le_bytes());
-            b.extend_null_bmp(&0u64.to_le_bytes());
-
-            let bytes = s.as_bytes();
-            let length = bytes.len() as u32;
-            let mut gs = [0u8; 16];
-            gs[0..4].copy_from_slice(&length.to_le_bytes());
-            if bytes.len() <= SHORT_STRING_THRESHOLD {
-                let copy_len = bytes.len().min(12);
-                gs[4..4 + copy_len].copy_from_slice(&bytes[..copy_len]);
-            } else {
-                gs[4..8].copy_from_slice(&bytes[..4]);
-                let offset = b.blob.len() as u64;
-                gs[8..16].copy_from_slice(&offset.to_le_bytes());
-                b.blob.extend_from_slice(bytes);
-            }
-            b.extend_col(0, &gs);
-            b.count += 1;
-        }
-        b.certify_layout(Layout::Consolidated, schema);
-        b
-    }
-
-    /// A BLOB payload column shares STRING's 16-byte German-string header
-    /// (col_size = 16). `extract_col_key` must hash it like a STRING rather
-    /// than falling into the generic 8-byte-buffer branch (which would panic).
-    #[test]
-    fn extract_col_key_handles_blob_column() {
-        let schema = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::BLOB, 0),
-            ],
-            &[0],
-        );
-        // make_batch_str builds the same German-string encoding for any
-        // 16-byte-struct column; long value (> threshold) exercises the blob spill.
-        let cb = make_batch_str(
-            &schema,
-            &[
-                (1, 1, "short"),
-                (2, 1, "a long blob value well beyond the inline threshold"),
-                (3, 1, ""),
-            ],
-        );
-        let mb = cb.as_mem_batch();
-        // Must not panic and must distinguish the two non-empty values.
-        let k_short = extract_col_key(&mb, 0, 1, &schema);
-        let k_long = extract_col_key(&mb, 1, 1, &schema);
-        let k_empty = extract_col_key(&mb, 2, 1, &schema);
-        assert_ne!(k_short, 0);
-        assert_ne!(k_long, 0);
-        assert_eq!(k_empty, 0, "empty blob hashes to 0");
-        assert_ne!(k_short, k_long);
     }
 
     #[test]
@@ -561,45 +389,6 @@ mod tests {
         let batch = make_batch(&schema, &[]);
         let out = op_partition_filter(&batch, &schema, 1, 4);
         assert_eq!(out.count, 0);
-    }
-
-    #[test]
-    fn partition_router_basic() {
-        let schema = make_schema_u64_i64();
-        let mut router = PartitionRouter::new();
-
-        let b = make_batch(&schema, &[(42, 1, 0)]);
-        router.record_routing(&b, &schema, 1, 0, 3);
-        assert_eq!(router.worker_for_index_key(1, 0, 42), 3);
-        assert_eq!(router.worker_for_index_key(1, 0, 99), -1);
-
-        // Retract: negative weight removes the entry
-        let b2 = make_batch(&schema, &[(42, -1, 0)]);
-        router.record_routing(&b2, &schema, 1, 0, 3);
-        assert_eq!(router.worker_for_index_key(1, 0, 42), -1);
-    }
-
-    #[test]
-    fn test_partition_router_string_col() {
-        let schema = make_schema_u64_string();
-        let mut router = PartitionRouter::new();
-
-        // Short string
-        let b = make_batch_str(&schema, &[(1, 1, "hello")]);
-        router.record_routing(&b, &schema, 1, 1, 2);
-        // Must not panic — the old code would overflow copying 16 bytes into 8-byte buffer.
-        // The key_lo is a hash, so we just check it was stored and is retrievable.
-        // record_routing uses col_idx=1 (STRING column), so look up the hashed key.
-        let mb = b.as_mem_batch();
-        let struct_bytes = mb.get_col_ptr(0, 0, 16); // payload_idx(1, 0) = 0
-        let length = crate::foundation::codec::read_u32_le(struct_bytes, 0) as usize;
-        let hashed_key = crate::foundation::xxh::checksum(&struct_bytes[4..4 + length]);
-        assert_eq!(router.worker_for_index_key(1, 1, hashed_key as u128), 2);
-
-        // Long string (> 12 bytes)
-        let b2 = make_batch_str(&schema, &[(2, 1, "a_long_string_value")]);
-        router.record_routing(&b2, &schema, 1, 1, 3);
-        // Must not panic
     }
 
     #[test]

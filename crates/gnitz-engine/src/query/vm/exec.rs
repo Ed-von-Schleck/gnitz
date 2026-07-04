@@ -1,5 +1,6 @@
 //! Epoch execution: `execute_epoch` / `execute_epoch_multi` and the opcode
-//! dispatch loop — kept whole (do-not-touch §8 cluster 4).
+//! dispatch loop — kept whole: boxing per-opcode handlers or splitting the
+//! match arms would break monomorphization of the dispatch loop.
 
 use super::*;
 use crate::ops::{self, AviDesc};

@@ -1,6 +1,6 @@
 //! Shared inner-join row writer. Kept `#[inline]` so the per-row column-copy
-//! loops fold into their callers across the join split — the §8-cluster-7 "no
-//! per-row cross-file call boundary" guarantee.
+//! loops fold into their callers across the join split — the "no per-row
+//! cross-file call boundary" guarantee.
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, MemBatch, ReadCursor};

@@ -2,6 +2,7 @@
 //! writes, worker signalling + ack collection, relay emit, the fan-out family
 //! (seek / scan / index / gather), checkpointing, and the scan-fanout helpers.
 
+use super::index_router::index_route_key;
 use super::*;
 
 /// Timeout for the synchronous `W2mReceiver::wait_for` fallback in the two
@@ -778,6 +779,10 @@ impl MasterDispatcher {
                 Some(c) if c.len() == 1 => c[0],
                 _ => continue,
             };
+            // `col_idx` is a registered single-column unique index, so it is always
+            // an integer/U128/UUID column: `index_key_type` rejects STRING/BLOB (and
+            // floats) as secondary-index columns at registration, so no string-keyed
+            // circuit reaches here to record.
             for (w, wi) in worker_indices[..self.num_workers].iter().enumerate() {
                 if !wi.is_empty() {
                     self.router.record_routing_from_source(
@@ -897,11 +902,11 @@ impl MasterDispatcher {
         col_idx: u32,
         key: u128,
     ) -> Result<W2mSlot, String> {
-        // The routing cache is keyed by `extract_col_key` (OPK-widened for
-        // integer columns, XXH3 for STRING/BLOB), but `key` is the native seek
-        // value. Transform it into the stored representation before probing;
-        // a raw native query always misses for signed integers (and could
-        // spuriously hit a different value's OPK-widened key).
+        // The routing cache is keyed by the OPK-widened `extract_col_key` image,
+        // but `key` is the native seek value. Transform it into the stored
+        // representation before probing; a raw native query always misses for
+        // signed integers (and could spuriously hit a different value's
+        // OPK-widened key).
         let cached = unsafe {
             let schema = (*(*disp_ptr).catalog).get_schema_desc(target_id);
             match schema.and_then(|s| index_route_key(&s, col_idx, key)) {

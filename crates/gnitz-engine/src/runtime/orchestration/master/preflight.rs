@@ -5,22 +5,29 @@
 
 use super::*;
 
-/// Per-worker state for one sorted-key stream in `merge_index_scan`.
-///
-/// `mb` is a zero-copy view into `slot`'s ring bytes with its lifetime
-/// erased: it is valid only while `slot` is held, so `attach_frame` clears
-/// `mb` before dropping or replacing `slot`, and nothing reads `mb` after the
-/// stream's slot is released.
+/// The `(view, slot)` drop-order contract in one place: `mb` is a zero-copy
+/// view into `slot`'s W2M ring bytes with its lifetime erased, so it is valid
+/// only while `slot` is held and MUST drop first. Bundling the two here — view
+/// field before slot field — makes whole-struct drop order correct by
+/// construction, so the enclosing `PreflightKeyStream` can order its other
+/// fields freely. `attach_frame` still clears `mb` before replacing `slot` to
+/// cover the mid-life (non-drop) replacement.
+#[derive(Default)]
+struct FrameView {
+    mb: Option<crate::storage::MemBatch<'static>>,
+    slot: Option<W2mSlot>,
+}
+
+/// Per-worker state for one sorted-key stream in `merge_index_scan`. Nothing
+/// reads `frame.mb` after its slot is released.
 struct PreflightKeyStream {
     /// Worker index (error attribution) and scan request id (frame pulls).
     w: usize,
     req_id: u64,
-    /// Ring slot backing `mb`. Holding it parks the frame's ring bytes.
-    slot: Option<W2mSlot>,
-    /// Zero-copy view of the current frame's key batch (`None` for an empty
-    /// terminal frame or after a decode error).
-    mb: Option<crate::storage::MemBatch<'static>>,
-    /// Cursor into `mb`.
+    /// Current frame: a zero-copy key-batch view (`None` for an empty terminal
+    /// frame or after a decode error) pinned by its backing ring slot.
+    frame: FrameView,
+    /// Cursor into `frame.mb`.
     row: usize,
     /// Current frame is non-terminal: status 0 and no FLAG_SCAN_LAST.
     has_more: bool,
@@ -31,8 +38,7 @@ impl PreflightKeyStream {
         PreflightKeyStream {
             w,
             req_id,
-            slot: None,
-            mb: None,
+            frame: FrameView::default(),
             row: 0,
             has_more: false,
         }
@@ -43,8 +49,8 @@ impl PreflightKeyStream {
     /// unwinds to the `ScanLease` drop, which discards the undrained trains.
     fn attach_frame(&mut self, slot: W2mSlot, frame_schema: &SchemaDescriptor) -> Result<(), String> {
         // The view must die before its backing slot.
-        self.mb = None;
-        self.slot = None;
+        self.frame.mb = None;
+        self.frame.slot = None;
         self.row = 0;
         let (ctrl, has_more) = parse_train_header(&slot, self.w, "unique pre-flight")?;
         self.has_more = has_more;
@@ -66,8 +72,8 @@ impl PreflightKeyStream {
         let bytes: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(slot.bytes()) };
         let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl_size, ctrl, schema_hint)
             .map_err(|e| scan_decode_err(self.w, e))?;
-        self.mb = zc.data_batch;
-        self.slot = Some(slot);
+        self.frame.mb = zc.data_batch;
+        self.frame.slot = Some(slot);
         Ok(())
     }
 
@@ -82,7 +88,7 @@ impl PreflightKeyStream {
         reactor: &crate::runtime::reactor::Reactor,
     ) -> Result<Option<PkBuf>, String> {
         loop {
-            if let Some(mb) = &self.mb {
+            if let Some(mb) = &self.frame.mb {
                 if self.row < mb.count {
                     let key = PkBuf::from_bytes(mb.get_pk_bytes(self.row));
                     self.row += 1;
@@ -90,8 +96,8 @@ impl PreflightKeyStream {
                 }
             }
             if !self.has_more {
-                self.mb = None;
-                self.slot = None;
+                self.frame.mb = None;
+                self.frame.slot = None;
                 return Ok(None);
             }
             let slot = reactor.await_scan_slot(self.req_id as u32).await;

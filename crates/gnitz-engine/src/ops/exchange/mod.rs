@@ -8,5 +8,5 @@ pub(crate) use relay::{op_relay_broadcast, op_relay_scatter_consolidated_mode, o
 #[cfg(test)]
 pub(crate) use router::compute_worker_indices;
 pub(crate) use router::{
-    op_partition_filter, with_broadcast_indices, with_worker_indices, worker_for_partition, PartitionRouter, RouteMode,
+    op_partition_filter, with_broadcast_indices, with_worker_indices, worker_for_partition, RouteMode,
 };

@@ -1,6 +1,6 @@
 //! Worker exchange-wait re-entry: the defer-then-replay machinery
 //! (`do_exchange_wait` inline dispatch loop + `dispatch_deferred` /
-//! `replay_deferred_ticks`). See foundations.md §8 cluster 6.
+//! `replay_deferred_ticks`).
 
 use super::*;
 

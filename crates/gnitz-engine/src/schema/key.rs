@@ -154,10 +154,12 @@ pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
 /// the order-preserving leading-16 prefix (authoritative whenever two prefixes
 /// differ; a prefix collision needs a `compare_pk_bytes` tiebreak).
 ///
-/// The `{8, 16}` arms load the dominant `U64`/`U128` widths straight into a
-/// register, value-equal to the pad-and-copy (8 bytes occupy the high 64 bits,
-/// low 64 zero) — pinned by `pack_pk_be_specialization_matches_naive`. The
-/// wildcard arm covers 1/2/4-byte scalars and wide prefixes.
+/// The `{2, 4, 8, ≥16}` arms load the dominant scalar and `U128`/wide-prefix
+/// widths straight into a register, value-equal to the pad-and-copy (a narrow
+/// value occupies the high bits, the low bits zero; `≥16` reads the
+/// order-preserving leading 16 bytes) — pinned by
+/// `pack_pk_be_specialization_matches_naive`. The wildcard arm covers only the
+/// odd narrow widths (1/3/5/6/7/9..=15).
 ///
 /// NOT a value accessor — for a U64 OPK value 1 (`[0,…,0,1]` at `[..8]`) this
 /// packs as `1·2^64`, not 1. Sibling of `pack_pk_le`, opposite alignment from
@@ -166,11 +168,14 @@ pub fn partition_for_pk_bytes(bytes: &[u8]) -> usize {
 pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
     match pk_bytes.len() {
         8 => (u64::from_be_bytes(pk_bytes[..8].try_into().unwrap()) as u128) << 64,
-        16 => u128::from_be_bytes(pk_bytes[..16].try_into().unwrap()),
+        len if len >= 16 => u128::from_be_bytes(pk_bytes[..16].try_into().unwrap()),
+        4 => (u32::from_be_bytes(pk_bytes[..4].try_into().unwrap()) as u128) << 96,
+        2 => (u16::from_be_bytes(pk_bytes[..2].try_into().unwrap()) as u128) << 112,
+        // 1/3/5/6/7/9..=15: odd narrow widths — pad-and-copy (len < 16 here, so
+        // the whole slice is copied and the old `len.min(16)` is unnecessary).
         len => {
-            let take = len.min(16);
             let mut buf = [0u8; 16];
-            buf[..take].copy_from_slice(&pk_bytes[..take]);
+            buf[..len].copy_from_slice(pk_bytes);
             u128::from_be_bytes(buf)
         }
     }
@@ -201,11 +206,16 @@ pub(crate) trait PkSortKey: Ord + Copy {
 impl PkSortKey for u64 {
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> u64 {
-        // Left-align at the MSB end (low bytes pad to zero), so a raw `u64` compare
-        // is the OPK byte order. Dispatched only for strides ≤ 8.
-        let mut x = [0u8; 8];
-        x[..opk.len()].copy_from_slice(opk);
-        u64::from_be_bytes(x)
+        // Dispatched only for strides ≤ 8; the `== 8` arm loads the dominant
+        // U64/I64 key straight into a register (no memcpy). The narrower strides
+        // left-align at the MSB end so a raw `u64` compare is the OPK byte order.
+        if opk.len() == 8 {
+            u64::from_be_bytes(opk.try_into().unwrap())
+        } else {
+            let mut x = [0u8; 8];
+            x[..opk.len()].copy_from_slice(opk);
+            u64::from_be_bytes(x)
+        }
     }
 }
 
@@ -221,15 +231,18 @@ impl PkSortKey for u128 {
 impl PkSortKey for [u128; 2] {
     #[inline(always)]
     fn from_opk(opk: &[u8]) -> [u128; 2] {
-        // Dispatched only for 17..=32-byte strides: hi = the full leading 16 bytes,
-        // lo = the remaining 1..=16 bytes left-aligned. Array `Ord` is lexicographic
-        // (hi then lo), so the second limb settles a leading-16-byte collision a bare
-        // `u128` prefix would tie on.
-        let mut hi = [0u8; 16];
-        let mut lo = [0u8; 16];
-        hi.copy_from_slice(&opk[..16]);
-        lo[..opk.len() - 16].copy_from_slice(&opk[16..]);
-        [u128::from_be_bytes(hi), u128::from_be_bytes(lo)]
+        // Dispatched only for 17..=32-byte strides: hi = the full leading 16 bytes
+        // (always a register load), lo = the trailing 1..=16 left-aligned. Array
+        // `Ord` is lexicographic, so the low limb settles a leading-16-byte tie a
+        // bare `u128` prefix would tie on.
+        let hi = u128::from_be_bytes(opk[..16].try_into().unwrap());
+        if opk.len() == 32 {
+            [hi, u128::from_be_bytes(opk[16..32].try_into().unwrap())]
+        } else {
+            let mut lo = [0u8; 16];
+            lo[..opk.len() - 16].copy_from_slice(&opk[16..]);
+            [hi, u128::from_be_bytes(lo)]
+        }
     }
 }
 

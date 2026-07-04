@@ -4,7 +4,7 @@
 //! directory-deletion queues, and Stage-A (DDL rollback) compensation.
 //! `fire_hooks` lives in `hooks.rs`; `SysFamily` / `ApplyContext` in
 //! `sys_tables.rs` / `apply_context.rs`. No second ingest entry point may
-//! skip this precheck/hooks path (foundations §8 cluster-8).
+//! skip this precheck/hooks path.
 
 use std::num::NonZeroU64;
 

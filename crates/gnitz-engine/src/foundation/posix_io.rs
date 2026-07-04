@@ -348,6 +348,41 @@ pub fn raise_fd_limit(target: u64) -> i64 {
     }
 }
 
+/// Best-effort memory budget for the process, in bytes.
+///
+/// Reads cgroup v2 `/sys/fs/cgroup/memory.max` — the real container limit —
+/// and parses it when finite; falls back to total physical RAM
+/// (`_SC_PHYS_PAGES × _SC_PAGE_SIZE`) when the file is absent or reads the
+/// literal `"max"` (no limit). This is the technique the JVM and Go use to
+/// avoid the sysconf-reports-host-RAM pitfall inside a container.
+///
+/// Cached in a `OnceLock` (read once — the value is process-lifetime
+/// invariant and the sole caller, the master reactor, has no fork-time
+/// divergence to worry about). Returns 0 only if every source fails, which
+/// callers clamp up to a floor.
+pub fn available_memory_bytes() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        // cgroup v2 `memory.max` when finite. The literal `"max"` (no limit)
+        // fails the integer parse and falls through, as does an absent file.
+        if let Some(v) = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+        {
+            return v;
+        }
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+        if pages > 0 && page_size > 0 {
+            (pages as usize).saturating_mul(page_size as usize)
+        } else {
+            0
+        }
+    })
+}
+
 /// Run `f` under `catch_unwind`. On panic, returns
 /// `Err("internal server error (panic in <op>)")`. Otherwise the closure's
 /// `Result` is returned unchanged. Used in async handlers and the committer

@@ -190,6 +190,22 @@ impl Reactor {
         }
     }
 
+    /// Mark `conn`/`fd` closing and wake any parked recv waiter (so its
+    /// `recv().await` resolves to `None`). Borrows only the sibling
+    /// `RefCell`s — never `conns` — so it composes with a caller that holds a
+    /// live `conns` borrow and the `&mut Conn` it hands in. Omits the trailing
+    /// `return`, so each caller keeps its own control flow: leaving
+    /// `recv_armed` false means `reap_closing_conns` fires as soon as
+    /// `send_inflight` reaches 0, dropping the whole `pending_recv` backlog.
+    fn begin_recv_close(&self, conn: &mut io::Conn, fd: i32) {
+        conn.closing = true;
+        self.inner.closing_fds.borrow_mut().insert(fd);
+        self.inner.recv_closed.borrow_mut().insert(fd, true);
+        if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
+            w.wake();
+        }
+    }
+
     pub(super) fn handle_recv_cqe(&self, fd: i32, res: i32) {
         let mut conns = self.inner.conns.borrow_mut();
         let conn = match conns.get_mut(&fd) {
@@ -199,12 +215,7 @@ impl Reactor {
         conn.recv_armed = false;
 
         if res <= 0 || conn.closing {
-            conn.closing = true;
-            self.inner.closing_fds.borrow_mut().insert(fd);
-            self.inner.recv_closed.borrow_mut().insert(fd, true);
-            if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
-                w.wake();
-            }
+            self.begin_recv_close(conn, fd);
             return;
         }
 
@@ -220,25 +231,30 @@ impl Reactor {
             io::RecvAdvance::HeaderDone => {
                 let plen = conn.recv_state.payload_len();
                 if plen > conn.max_payload_len {
-                    conn.closing = true;
-                    self.inner.closing_fds.borrow_mut().insert(fd);
-                    self.inner.recv_closed.borrow_mut().insert(fd, true);
-                    if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
-                        w.wake();
-                    }
+                    self.begin_recv_close(conn, fd);
                     return;
+                }
+                let w = io::frame_weight(plen);
+                if self.inner.total_inbound_bytes.get() + w > self.inner.global_cap.get() {
+                    crate::gnitz_warn!(
+                        "reactor: inbound cap would be exceeded, closing fd={} (held={} B + {} B, cap={} B)",
+                        fd,
+                        self.inner.total_inbound_bytes.get(),
+                        w,
+                        self.inner.global_cap.get(),
+                    );
+                    self.begin_recv_close(conn, fd);
+                    return; // refuse before malloc — no overshoot
                 }
                 let pbuf = unsafe { libc::malloc(plen) as *mut u8 };
                 if pbuf.is_null() {
-                    conn.closing = true;
-                    self.inner.closing_fds.borrow_mut().insert(fd);
-                    self.inner.recv_closed.borrow_mut().insert(fd, true);
-                    if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
-                        w.wake();
-                    }
+                    self.begin_recv_close(conn, fd);
                     return;
                 }
-                conn.recv_state.start_payload(pbuf, plen);
+                // `RecvBuf::new` charges `frame_weight(plen)` to the global
+                // counter; the matching refund is in its `Drop`.
+                conn.recv_state
+                    .start_payload(io::RecvBuf::new(pbuf, plen, Rc::clone(&self.inner.total_inbound_bytes)));
                 self.inner
                     .ring
                     .borrow_mut()
@@ -246,13 +262,15 @@ impl Reactor {
                 conn.recv_armed = true;
             }
             io::RecvAdvance::MessageDone => {
-                let (ptr, len) = conn.recv_state.take_message();
+                // The charged `RecvBuf` moves from the recv state machine into
+                // the delivery queue; its accounting rides along untouched.
+                let rbuf = conn.recv_state.take_message();
                 self.inner
                     .pending_recv
                     .borrow_mut()
                     .entry(fd)
                     .or_default()
-                    .push_back(io::RecvBuf { ptr, len });
+                    .push_back(rbuf);
                 // Arm next header recv immediately so the kernel can keep
                 // draining the client's send buffer. Per-session FIFO is
                 // preserved by the `VecDeque` order — the handler still
@@ -268,12 +286,7 @@ impl Reactor {
                 }
             }
             io::RecvAdvance::Disconnect => {
-                conn.closing = true;
-                self.inner.closing_fds.borrow_mut().insert(fd);
-                self.inner.recv_closed.borrow_mut().insert(fd, true);
-                if let Some(w) = self.inner.recv_waiters.borrow_mut().remove(&fd) {
-                    w.wake();
-                }
+                self.begin_recv_close(conn, fd);
             }
         }
     }
@@ -304,9 +317,12 @@ impl Reactor {
                 continue;
             }
             self.inner.closing_fds.borrow_mut().remove(&fd);
+            // Dropping the `Conn` (with its in-flight `recv_state` payload) and
+            // the `pending_recv` queue frees every undrained `RecvBuf`; each
+            // one's `Drop` refunds its charge to the global counter, so a reaped
+            // connection's buffers never leak the accounting upward.
             self.inner.conns.borrow_mut().remove(&fd);
             self.inner.recv_waiters.borrow_mut().remove(&fd);
-            // Dropping the queue frees each undelivered RecvBuf payload.
             self.inner.pending_recv.borrow_mut().remove(&fd);
             unsafe {
                 libc::close(fd);

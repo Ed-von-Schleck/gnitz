@@ -11,7 +11,7 @@ use crate::storage::{
     MemBatch,
 };
 
-use super::router::{build_w_map, compound_join_packer, key_is_promoted, route_nonpk_row, RouteMode};
+use super::router::{build_w_map, compound_join_packer, route_nonpk_row, scatter_is_pk_routed, RouteMode};
 // `SCATTER_INDICES` + the `ReindexPacker`, plus `hash_row_for_partition`,
 // `partition_for_key`, and `compare_pk_bytes`, are reached only from the
 // `#[cfg(test)]` scatter helpers / co-partition tests below; production relay paths
@@ -55,8 +55,11 @@ pub(super) fn op_repartition_batch(
     let mb = batch.as_mem_batch();
     // Single source by definition; mirror the production single-source rule.
     // `compute_worker_indices` does not return the routing decision, so recompute
-    // `is_pk_routing` here (a cheap slice compare).
-    let is_pk_routing = col_indices == schema.pk_indices();
+    // `is_pk_routing` here through the shared gate (empty `target_tcs`: this helper
+    // takes none, and `key_is_promoted(&[]) == false`, so it can't drift from the
+    // production scatters). It gates layout propagation here, not routing — the
+    // helper routes via `compute_worker_indices`.
+    let is_pk_routing = scatter_is_pk_routed(col_indices, &[], schema);
     let mut out: Vec<Batch> = worker_indices
         .into_iter()
         .map(|indices| {
@@ -123,11 +126,8 @@ pub(crate) fn op_repartition_batches_mode(
         // and compound-PK routing both go through `partition_for_pk_bytes`
         // so the partition matches `PartitionedTable::local_index`. Mixing
         // the hash-combine path with PK-existence checks would route rows
-        // to the wrong worker.
-        // A promoted join key must not take the native-PK fast-path: its source PK
-        // bytes are at the narrow width while the trace `_join_pk` is `T`-wide, so
-        // the two would land on different workers. Route it through the packer.
-        let is_pk_routing = col_indices == schema.pk_indices() && !key_is_promoted(target_tcs);
+        // to the wrong worker. The gate itself is `scatter_is_pk_routed`.
+        let is_pk_routing = scatter_is_pk_routed(col_indices, target_tcs, schema);
         // Compound/promoted JoinPromote routes by the packed `_join_pk` (see
         // `compound_join_packer`); the `pack_buf` is hoisted out of the row loop
         // because `pack_into` fully overwrites `buf[..out_stride]` each row.
@@ -316,13 +316,9 @@ fn relay_scatter_merge_walk(
         }
     }
 
-    // Strict sequence equality (see `fill_worker_indices`): set equality would
-    // route a permuted compound PK to a different worker than the schema-order
-    // `partition_for_pk_bytes` on the other join side.
-    // A promoted join key must not take the native-PK fast-path (its source PK is
-    // at the narrow width, the trace `_join_pk` is `T`-wide); route it through the
-    // packer so the two sides co-partition.
-    let is_pk_routing = col_indices == schema.pk_indices() && !key_is_promoted(target_tcs);
+    // Co-partition with the other join side by routing native PK bytes only when
+    // the shared gate says so (`scatter_is_pk_routed`).
+    let is_pk_routing = scatter_is_pk_routed(col_indices, target_tcs, schema);
 
     // Compound/promoted JoinPromote routes by the packed `_join_pk` (see
     // `compound_join_packer`) — the consolidated join path, exactly where

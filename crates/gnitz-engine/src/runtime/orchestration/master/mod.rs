@@ -13,7 +13,7 @@ use gnitz_wire::PkColList;
 
 use crate::ops::{
     op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, with_broadcast_indices,
-    with_worker_indices, worker_for_partition, PartitionRouter, RouteMode,
+    with_worker_indices, worker_for_partition, RouteMode,
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
@@ -30,6 +30,7 @@ use crate::runtime::wire::{
 };
 use crate::storage::{Batch, PkBuf};
 use gnitz_wire::wire_flags_set_conflict_mode;
+use index_router::PartitionRouter;
 
 // ---------------------------------------------------------------------------
 // Pipelined validation checks
@@ -316,6 +317,7 @@ pub struct MasterDispatcher {
 unsafe impl Send for MasterDispatcher {}
 
 mod dispatch;
+mod index_router;
 mod preflight;
 mod unique_filter;
 
@@ -667,28 +669,6 @@ fn build_check_batch(schema: &SchemaDescriptor, keys: &[u128], src_type: u8, poo
     })
 }
 
-/// Encode a native index-seek key into the routing-cache representation
-/// `extract_col_key` stores: OPK-widened for integer / U128 / UUID columns.
-/// Returns `None` for STRING/BLOB, whose cache keys are XXH3 of the bytes and
-/// cannot be rebuilt from a `u128` — those seeks fall through to the broadcast
-/// path (which is already correct). `extract_col_key`'s PK-column and integer-
-/// payload arms both reduce to `widen_pk_be(encode_pk_column(native))`, so one
-/// encoder covers both regardless of whether the column is itself a PK column.
-fn index_route_key(schema: &SchemaDescriptor, col_idx: u32, native: u128) -> Option<u128> {
-    use crate::schema::type_code;
-    let col = schema.columns[col_idx as usize];
-    match col.type_code {
-        type_code::STRING | type_code::BLOB => None,
-        type_code::U128 | type_code::UUID => Some(native),
-        _ => {
-            let sz = col.size() as usize;
-            let mut opk = [0u8; 16];
-            gnitz_wire::encode_pk_column(&native.to_le_bytes()[..sz], col.type_code, &mut opk[..sz]);
-            Some(gnitz_wire::widen_pk_be(&opk[..sz], sz))
-        }
-    }
-}
-
 /// Build the UPSERT PK-identification check batch from `keys`, the distinct
 /// net-positive PK byte spans collected by the preflight aggregation. Writes
 /// each `PkBuf`'s OPK bytes verbatim into the PK region: the spans are already
@@ -911,28 +891,6 @@ mod unique_filter_tests {
             !filter.values.contains(&unsigned_span),
             "must not hold the non-order-preserving unsigned image"
         );
-    }
-
-    #[test]
-    fn index_route_key_hits_signed_routing_cache() {
-        // The routing cache stores `extract_col_key` (OPK-widened) keys, but
-        // seeks arrive with the native value. For a signed column the two differ,
-        // so a raw native query misses; `index_route_key` must transform it to hit.
-        let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::I64, 0)], &[0]);
-        let mut opk = [0u8; 8];
-        gnitz_wire::encode_pk_column(&(-7i64).to_le_bytes(), type_code::I64, &mut opk);
-        let keys = [PkBuf::from_bytes(&opk)];
-        let batch = build_check_batch_pkbuf(&schema, &keys, None);
-
-        let mut router = PartitionRouter::new();
-        router.record_routing(&batch, &schema, 1, 0, 2);
-
-        let native = (-7i64) as u64 as u128;
-        // Raw native query misses: native != OPK-widened for a signed column.
-        assert_eq!(router.worker_for_index_key(1, 0, native), -1);
-        // Transformed query hits.
-        let rk = index_route_key(&schema, 0, native).expect("integer column has a route key");
-        assert_eq!(router.worker_for_index_key(1, 0, rk), 2);
     }
 
     #[test]

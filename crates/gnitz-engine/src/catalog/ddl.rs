@@ -290,8 +290,8 @@ impl CatalogEngine {
 
         // STRING and BLOB values cannot be reduced to a comparable u128 key
         // without collision; the distributed uniqueness-check pipeline would
-        // silently bypass or falsely reject rows. (Non-unique FK indices use the
-        // xxhash-based extract_col_key path and are unaffected.)
+        // silently bypass or falsely reject rows. (Non-unique FK indices don't
+        // run this uniqueness-check pipeline, so they are unaffected.)
         if is_unique
             && col_indices
                 .iter()

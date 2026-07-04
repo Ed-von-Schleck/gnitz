@@ -194,6 +194,19 @@ struct ReactorShared {
     /// inline hdr buffer address survives HashMap resizes — io_uring SQEs
     /// capture the pointer.
     conns: RefCell<FxHashMap<i32, Box<io::Conn>>>,
+    /// Global running total of `frame_weight` over every live inbound
+    /// `RecvBuf` — in-flight (`recv_state`), queued (`pending_recv`), and any
+    /// handed to a consumer that has not dropped it yet. The OOM guard:
+    /// `HeaderDone` refuses (and closes the connection) any allocation that
+    /// would push this past `global_cap`. `RecvBuf::new` charges it and
+    /// `RecvBuf`'s `Drop` refunds it, so consume, connection reap, and
+    /// task-cancel all reconcile automatically with no hand-maintained
+    /// per-connection shadow. Shared with every `RecvBuf` via `Rc` so the
+    /// counter outlives them all regardless of teardown field-drop order.
+    total_inbound_bytes: Rc<Cell<usize>>,
+    /// Ceiling for `total_inbound_bytes`, resolved once at startup by
+    /// `resolve_inbound_cap`. A plain load on the recv hot path.
+    global_cap: Cell<usize>,
     /// Listen socket fd; set by `attach_server_fd`. The reactor submits a
     /// single `AcceptMulti` SQE on attach and re-arms on cancellation.
     server_fd: Cell<i32>,
@@ -345,6 +358,24 @@ fn probe_futex_waitv_support_inner() {
     drop(atomic);
 }
 
+/// Resolve the global inbound-memory ceiling once at startup.
+///
+/// `GNITZ_INBOUND_MEM_BYTES` is an operator override (floored so it can never
+/// bar a single max-size frame). Otherwise the default is a quarter of the
+/// process memory budget — cgroup `memory.max` if set, else physical RAM —
+/// clamped to `[INBOUND_CAP_FLOOR, INBOUND_CAP_CEIL]`. A fraction of the
+/// *actual* budget scales with the deployment; a flat constant would OOM a
+/// mid-size box yet never trip inside a small container.
+fn resolve_inbound_cap() -> usize {
+    if let Some(v) = std::env::var("GNITZ_INBOUND_MEM_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return v.max(io::INBOUND_CAP_FLOOR); // operator override wins
+    }
+    (crate::foundation::posix_io::available_memory_bytes() / 4).clamp(io::INBOUND_CAP_FLOOR, io::INBOUND_CAP_CEIL)
+}
+
 impl Reactor {
     pub fn new(ring_capacity: u32) -> std::io::Result<Self> {
         probe_futex_waitv_support();
@@ -371,6 +402,8 @@ impl Reactor {
             next_scan_req_id: Cell::new(SCAN_REQ_ID_BASE),
             next_send_id: Cell::new(1),
             conns: RefCell::new(FxHashMap::default()),
+            total_inbound_bytes: Rc::new(Cell::new(0)),
+            global_cap: Cell::new(resolve_inbound_cap()),
             server_fd: Cell::new(-1),
             accept_queue: RefCell::new(VecDeque::new()),
             accept_waker: RefCell::new(None),
@@ -1146,6 +1179,13 @@ impl Reactor {
     #[cfg(test)]
     pub(super) fn task_count(&self) -> usize {
         self.inner.tasks.borrow().len()
+    }
+
+    /// Test-only: lower the inbound-memory cap so cap-trip paths can be
+    /// exercised without allocating gigabytes.
+    #[cfg(test)]
+    pub(super) fn set_inbound_cap(&self, cap: usize) {
+        self.inner.global_cap.set(cap);
     }
 }
 
@@ -2464,6 +2504,213 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
+    // Inbound-memory hard cap (fd-path OOM guard).
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Build a length-prefixed wire frame: 4-byte LE payload length + payload.
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + payload.len());
+        v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Blocking `libc::write` of every byte of `bytes` to `fd`.
+    unsafe fn write_all(fd: i32, bytes: &[u8]) {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let n = libc::write(fd, bytes[off..].as_ptr() as *const libc::c_void, bytes.len() - off);
+            assert!(n > 0, "write returned {n}");
+            off += n as usize;
+        }
+    }
+
+    /// AF_UNIX SOCK_STREAM pair. Returns `(server_read_fd, client_write_fd)`:
+    /// the reactor `register_conn`s the first and recvs from it; the test
+    /// `write_all`s framed bytes into the second.
+    unsafe fn stream_pair() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        let rc = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
+        assert_eq!(rc, 0, "socketpair");
+        (fds[1], fds[0])
+    }
+
+    /// Poll a fresh `recv(fd)` future exactly once, returning its result:
+    /// `Some(_)` if it resolved (a frame, or `None` when closed), `None` if
+    /// still pending.
+    fn poll_recv_once(r: &Reactor, fd: i32) -> Option<Option<io::RecvBuf>> {
+        let mut fut = Box::pin(r.recv(fd));
+        let waker = make_waker(usize::MAX);
+        let mut cx = Context::from_waker(&waker);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => Some(v),
+            Poll::Pending => None,
+        }
+    }
+
+    /// Drive the reactor up to `max` non-blocking ticks, returning `true` as
+    /// soon as `cond` holds after a tick (and `false` if it never does).
+    fn poll_until(r: &Reactor, max: usize, mut cond: impl FnMut() -> bool) -> bool {
+        (0..max).any(|_| {
+            r.poll_nonblocking();
+            cond()
+        })
+    }
+
+    /// Cap trips: unconsumed frames whose cumulative weight passes the ceiling
+    /// close the connection at the breaching header (before malloc), and reap
+    /// returns the global counter to 0.
+    #[test]
+    fn inbound_cap_trips_and_reap_reconciles() {
+        unsafe {
+            let (read_fd, write_fd) = stream_pair();
+            let r = make_reactor();
+            r.register_conn(read_fd);
+            r.set_max_payload_len(read_fd, 1 << 20);
+            // frame_weight(100) = 100. Two frames = 200 held; the 3rd frame's
+            // header pushes 200 + 100 = 300 > 250 and is refused before malloc.
+            r.set_inbound_cap(250);
+            let payload = vec![0xABu8; 100];
+            let mut wire = Vec::new();
+            for _ in 0..3 {
+                wire.extend_from_slice(&framed(&payload));
+            }
+            write_all(write_fd, &wire);
+
+            let reaped = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd));
+            assert!(reaped, "cap-trip connection was never reaped");
+            assert_eq!(
+                r.inner.total_inbound_bytes.get(),
+                0,
+                "reap must subtract the reaped connection's undrained share"
+            );
+            assert!(
+                poll_recv_once(&r, read_fd).unwrap().is_none(),
+                "recv after a cap-trip close must yield None"
+            );
+
+            libc::close(write_fd); // read_fd was closed by reap
+        }
+    }
+
+    /// In-flight (partial, un-completed) payloads are accounted, and a second
+    /// connection whose first frame would breach the full cap is refused — the
+    /// many-connection uncounted-in-flight OOM vector.
+    #[test]
+    fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
+        unsafe {
+            let (read_fd, write_fd) = stream_pair();
+            let r = make_reactor();
+            r.register_conn(read_fd);
+            r.set_max_payload_len(read_fd, 1 << 20);
+            // Exactly one 10_000-byte in-flight buffer fits.
+            r.set_inbound_cap(10_000);
+
+            // Header claims 10_000 bytes but only 100 are delivered: the buffer
+            // is malloc'd and counted, yet no frame completes (no MessageDone).
+            let mut hdr_and_part = Vec::new();
+            hdr_and_part.extend_from_slice(&10_000u32.to_le_bytes());
+            hdr_and_part.extend_from_slice(&[0x11u8; 100]);
+            write_all(write_fd, &hdr_and_part);
+
+            let counted = poll_until(&r, 10_000, || r.inner.total_inbound_bytes.get() == 10_000);
+            assert!(counted, "in-flight buffer was not accounted");
+            assert!(
+                r.inner.pending_recv.borrow().get(&read_fd).is_none_or(|q| q.is_empty()),
+                "no frame should have completed from a partial payload"
+            );
+
+            // Second connection whose first frame would breach the now-full cap.
+            let (read_fd2, write_fd2) = stream_pair();
+            r.register_conn(read_fd2);
+            r.set_max_payload_len(read_fd2, 1 << 20);
+            write_all(write_fd2, &framed(&[0x22u8; 100]));
+
+            let refused = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd2));
+            assert!(refused, "over-cap second connection was not closed");
+            // Refused connection allocated nothing; the first buffer is intact.
+            assert_eq!(r.inner.total_inbound_bytes.get(), 10_000);
+
+            libc::close(write_fd);
+            libc::close(write_fd2); // read_fd2 was closed by reap
+            libc::close(read_fd); // conn1 never reaped (in-flight)
+        }
+    }
+
+    /// Accounting balances: consumption decrements the counter, so total traffic
+    /// far above the cap never trips as long as the consumer keeps pace, and the
+    /// counter returns to 0 once the queue fully drains.
+    #[test]
+    fn inbound_cap_accounting_balances_on_consume() {
+        let (read_fd, write_fd) = unsafe { stream_pair() };
+        let r = Rc::new(make_reactor());
+        r.register_conn(read_fd);
+        r.set_max_payload_len(read_fd, 1 << 20);
+        // Cap admits several frames; the pipeline holds ~1 at a time because
+        // each frame is popped in the same tick it lands, so 10 frames/round of
+        // 1_000-weight traffic (10_000 > cap) never trips.
+        r.set_inbound_cap(5_000);
+
+        let payload = vec![0x7Eu8; 1_000]; // frame_weight = 1_000
+        for _round in 0..2 {
+            let mut wire = Vec::new();
+            for _ in 0..10 {
+                wire.extend_from_slice(&framed(&payload));
+            }
+            unsafe { write_all(write_fd, &wire) };
+            let r2 = Rc::clone(&r);
+            r.block_on(async move {
+                for _ in 0..10 {
+                    let buf = r2.recv(read_fd).await.expect("frame");
+                    assert_eq!(buf.as_slice().len(), 1_000);
+                }
+            });
+        }
+        assert_eq!(
+            r.inner.total_inbound_bytes.get(),
+            0,
+            "counter must return to 0 once every frame is consumed"
+        );
+
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+    }
+
+    /// Tiny-frame floor: a flood of 1-byte payloads trips the cap after
+    /// ~CAP/64 frames (each weighs the 64-byte floor), not CAP — without the
+    /// floor, 65 one-byte frames weigh 65 B and would never trip.
+    #[test]
+    fn inbound_cap_tiny_frame_floor_trips_early() {
+        unsafe {
+            let (read_fd, write_fd) = stream_pair();
+            let r = make_reactor();
+            r.register_conn(read_fd);
+            // 1-byte payloads ≤ HELLO_PRE_HANDSHAKE_LEN (8), so no
+            // set_max_payload_len is needed.
+            r.set_inbound_cap(4096);
+            // 64 frames = 64 × 64 = 4096 held; the 65th frame's header would
+            // make 4160 > 4096 and is refused.
+            let mut wire = Vec::new();
+            for _ in 0..65 {
+                wire.extend_from_slice(&framed(&[0xCD]));
+            }
+            write_all(write_fd, &wire);
+
+            let reaped = poll_until(&r, 20_000, || !r.inner.conns.borrow().contains_key(&read_fd));
+            assert!(reaped, "tiny-frame flood must trip the cap via the frame_weight floor");
+            assert_eq!(
+                r.inner.total_inbound_bytes.get(),
+                0,
+                "reap must reconcile the counter after a tiny-frame trip"
+            );
+
+            libc::close(write_fd); // read_fd was closed by reap
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
     // FLAG_EXCHANGE demux + W2M reset gating + select2 +
     // sal_writer_excl + TimerFuture::Drop.
     // ─────────────────────────────────────────────────────────────────
@@ -3200,32 +3447,29 @@ mod tests {
         assert!(matches!(rs.advance(4), io::RecvAdvance::HeaderDone));
 
         let buf = unsafe { libc::malloc(8) as *mut u8 };
-        rs.start_payload(buf, 8);
+        rs.start_payload(io::RecvBuf::new(buf, 8, Rc::new(StdCell::new(0))));
 
         // Partial payload.
         assert!(matches!(rs.advance(5), io::RecvAdvance::NeedMore));
         // Remaining 3 bytes complete the message.
         assert!(matches!(rs.advance(3), io::RecvAdvance::MessageDone));
 
-        let (ret_ptr, ret_len) = rs.take_message();
-        assert_eq!(ret_ptr, buf);
-        assert_eq!(ret_len, 8);
+        // `take_message` yields the owning `RecvBuf` (frees on drop).
+        let ret = rs.take_message();
+        assert_eq!(ret.ptr, buf);
+        assert_eq!(ret.len, 8);
 
         // After take_message the state must be back in header phase.
         let (_, rem) = rs.remaining();
         assert_eq!(rem, 4, "take_message must reset to header phase");
-
-        unsafe {
-            libc::free(buf as *mut libc::c_void);
-        }
     }
 
     #[test]
     fn recv_state_free_payload_resets_to_header() {
         let mut rs = io::RecvState::new();
         let buf = unsafe { libc::malloc(4) as *mut u8 };
-        rs.start_payload(buf, 4);
-        // free_payload must release the allocation and reset the phase.
+        rs.start_payload(io::RecvBuf::new(buf, 4, Rc::new(StdCell::new(0))));
+        // free_payload drops the RecvBuf (releasing the allocation) and resets.
         rs.free_payload();
         let (_, rem) = rs.remaining();
         assert_eq!(rem, 4, "free_payload must reset to Header{{pos:0}}");

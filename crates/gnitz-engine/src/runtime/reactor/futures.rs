@@ -275,6 +275,9 @@ impl Future for RecvFuture {
             map.get_mut(&self.fd).and_then(|q| q.pop_front())
         };
         if let Some(buf) = taken {
+            // Ownership of the charged `RecvBuf` passes to the caller; its
+            // `Drop` refunds the global inbound-byte counter once the caller is
+            // done with it, so the buffer stays accounted for its full residency.
             return Poll::Ready(Some(buf));
         }
         if self.inner.recv_closed.borrow().get(&self.fd).copied().unwrap_or(false) {

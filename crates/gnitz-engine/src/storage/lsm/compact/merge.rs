@@ -4,8 +4,9 @@
 //! [`open_shards`] maps the inputs; [`compact_routed`] is the sole orchestrator —
 //! open → merge → route → column-first scatter → one output shard per guard run.
 //! The N-way merge + inline-consolidation kernel itself is the shared
-//! [`run_merge`](super::super::merge::run_merge) (§8 cluster-1, the sole
-//! pending-group drain owner); this module only drives it and materializes the
+//! [`run_merge`](super::super::merge::run_merge) (the sole pending-group
+//! drain owner; re-extracting a local drain loop would fork the
+//! (PK, payload) total order); this module only drives it and materializes
 //! survivors. [`compact_shards`] (single-target) and [`merge_and_route`]
 //! (multi-target L0→L1 / vertical) are thin wrappers over `compact_routed` that
 //! differ only in shard naming and whether an empty guard still emits a 0-row shard.

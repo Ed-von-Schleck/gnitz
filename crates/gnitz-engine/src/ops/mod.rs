@@ -18,7 +18,7 @@ pub(crate) use distinct::op_weight_clamp;
 pub(crate) use exchange::{
     op_partition_filter, op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, RouteMode,
 };
-pub(crate) use exchange::{with_broadcast_indices, with_worker_indices, worker_for_partition, PartitionRouter};
+pub(crate) use exchange::{with_broadcast_indices, with_worker_indices, worker_for_partition};
 // Only the test harness routes via the eager (cloning) variant now; the
 // production scatter paths all borrow via `with_worker_indices`.
 #[cfg(test)]
