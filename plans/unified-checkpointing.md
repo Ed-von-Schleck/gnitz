@@ -38,11 +38,13 @@ wire protocol. Existing data directories are not readable afterwards
 
 Shipped lifecycle (`crates/gnitz-engine/src/storage/lsm/`):
 
-- `RecoverySource { SalReplay, Rederive }` (`table/mod.rs:48`): base + system
-  tables are `SalReplay` (manifest loaded at open, SAL tail replayed); views,
-  index circuits, and operator scratch are `Rederive` (erased at open via
-  `erase_stale_shards`, `table/mod.rs:754`, prefixes `shard_{tid}_` and
-  `hcomp_{tid}_`; rebuilt from sources).
+- `RecoverySource { SalReplay, Rederive, RederiveCheckpointed }`
+  (`table/mod.rs:48`): base + system tables are `SalReplay` (manifest loaded
+  at open, SAL tail replayed); index circuits are `Rederive`, and view output
+  stores + operator scratch are `RederiveCheckpointed` (ephemeral-round
+  persisted, deferred compaction cleanup) — both rederived variants are erased
+  at open via `erase_stale_shards` (prefixes `shard_{tid}_` and `hcomp_{tid}_`)
+  and rebuilt from sources.
 - Ingest overflow folds into `in_memory_l0` for **every** table
   (`flush_to_ram`, `flush.rs:100`): memtable snapshot → per-run-bloomed
   `InMemRun`, fold at `INMEM_COMPACT_THRESHOLD = 4` runs, spill past
@@ -166,6 +168,16 @@ next barrier, which republishes over the compacted index before unlinking.
 Spills are written `durable = false` and recorded in a per-index `unsynced` set;
 the PK-unique tag stays (a read-path property).
 
+Commit 2 refines this split with a third `RecoverySource` variant,
+`RederiveCheckpointed`, carried by every table the ephemeral round persists
+(view output stores via `RelationKind::recovery_source()`, operator-trace
+scratch via `create_child_table`): `compact_if_needed` drains immediately only
+for plain `Rederive`. Ephemeral-published tables therefore **defer** (else a
+compacted-away shard would be unlinked while the last-published manifest still
+references it — stranded at reload); index tables and non-flushed `Rederive`
+scratch keep immediate drain (else their deferred deletions leak forever, never
+barrier-flushed).
+
 Invariants steps 2–3 rely on:
 
 - **The barrier is the sole manifest-publish point**, gated on **three
@@ -187,9 +199,10 @@ Invariants steps 2–3 rely on:
   registered via `add_shard`, marked `unsynced`, RAM tier cleared); `flush_commit`
   renames the manifest alone and returns the dir fd. A final table-dir fsync makes
   the manifest rename and the prepare-time shard renames durable together.
-- **`SalReplay` cleanup is drained post-publish** (worker: `drain_family_deletions`
-  strictly after the family's dir fsyncs, on the all-chunks-succeeded path);
-  `Rederive` and system/manual-`flush()` tables drain inline.
+- **`SalReplay` cleanup is drained post-publish** (the worker flush loop drains
+  each published table strictly after the dir fsyncs, on the
+  all-chunks-succeeded path); `Rederive` and system/manual-`flush()` tables
+  drain inline.
 - **`FlushWork` carries `{ sync_paths: Vec<CString>, manifest }`** — one unified
   shape for both the shard-written and compaction-only publishes (no
   `manifest_only` constructor, F4). Dropping it before commit unlinks only the
@@ -228,17 +241,27 @@ spill-plus-compaction write volume (≤ 75 % of `GNITZ_SAL_BYTES`).
   to the manifest version and must be bumped by any change to operator-state
   schemas or shard/manifest layout — a mismatch wipes all Rederive state at
   boot, always correct because it re-derives.
-- `FLAG_FLUSH` gains a sibling wire constant `FLAG_FLUSH_EPH` (gnitz-wire),
+- `FLAG_FLUSH` gains a sibling SAL group-header flag `FLAG_FLUSH_EPH`
+  (`runtime/protocol/sal.rs`, bit 19; classified into `SalMessageKind::FlushEph`),
   dispatched inline in both worker contexts exactly like `FLAG_FLUSH`; the
-  group header's `lsn` field carries the generation. `handle_flush_all(mode)`:
-  the **base round** iterates `SalReplay` user families as today; the
-  **ephemeral round** flushes, per view, the operator-trace tables **before**
-  the view's output store — every compiled plan's `VmHandle.owned_tables`
-  (via a new `DagEngine` iterator over the plan cache, clearing
-  `owned_cursor_handles` first per the `refresh_owned_cursors` pattern; sound
-  because no epoch runs at the barrier) first, then the `Rederive` view
-  output families. **Index tables are not flushed in either round** — they
-  stay erase-at-boot (out of scope, goal section).
+  group header's `lsn` field carries the generation, latched into
+  `worker_ctx::committed_generation` at the worker's SAL-read/classify site.
+  Both rounds run the worker's one shared `flush_tables(tables, prepare)` body
+  (`*mut Table` collection → prepare → chunked fdatasync → commit → deduped dir
+  fsyncs → post-publish deletion drain); they differ only in collection and
+  prepare fn. The **base round** (`handle_flush_all`) flushes
+  `DagEngine::collect_base_flush_tables` — every user relation's partitions +
+  index circuits, system (`Borrowed`) handles skipped — with `flush_prepare`.
+  The **ephemeral round** (`handle_flush_all_ephemeral`) collects, via
+  `DagEngine::collect_ephemeral_flush_tables` over the plan cache (nulling each
+  `VmHandle`'s owned cursors first per the `refresh_owned_cursors` pattern; sound
+  because no epoch runs at the barrier), two disjoint `*mut Table` sets — every
+  compiled plan's `owned_tables` (operator traces) and every `RelationKind::View`
+  output-store partition — and force-persists **all traces (Pass 1) before all
+  outputs (Pass 2)** through `flush_prepare_ephemeral`/`flush_commit`. **Index
+  tables are not force-persisted in either round** — they live in
+  `TableEntry::index_circuits`, not the plan cache; the base round folds them
+  to RAM (`DoneInline`) and they stay erase-at-boot.
 
 Committer sequence (steady state), replacing `run_checkpoint_phase` — no
 checkpoint "flavors":
@@ -256,9 +279,14 @@ checkpoint "flavors":
    send TickTrigger::Drain{tids, done}, await done;
    send TickTrigger::Quiesce{acked, release}, await acked.
    The drain runs against a just-reset, nearly empty SAL, so it cannot
-   exhaust SAL space. While awaiting `done`, the committer services only
-   CommitRequest::Barrier by re-running steps 0-1 (base tables are clean
-   then — ticks mutate views, not base); Push requests stay queued.
+   exhaust SAL space. The reclaim barriers that triggered this checkpoint are
+   signaled **right after step 1** (their space is already reclaimed), so
+   `relay_loop` unparks before the drain and can refill space during it. While
+   awaiting `done`/`acked`, the committer services a mid-drain **reclaim**
+   Barrier by a reclaim-only base round (step 1, **no gen re-bump**); a **DDL**
+   Barrier is deferred to sequence end (servicing it would interleave a CREATE
+   VIEW's reactor-parked backfill); Push requests stay queued and are folded
+   into the post-sequence commit.
 3. EPHEMERAL ROUND (holding sal_writer_excl across write + ACKs + reset):
    write FLAG_FLUSH_EPH(gen = committed_generation) → signal → all-worker
    ACKs (each worker flushes traces before output stores, manifests stamped
@@ -278,7 +306,7 @@ restart recovers instantly. There is no time-based trigger.
 
 **Conditional load.** `Table::new` gains `expected_generation: Option<u64>`:
 `None` for `SalReplay` tables (always load, as today); `Some(g)` for
-`Rederive` view tables — load the manifest iff `manifest.generation == g`
+`RederiveCheckpointed` view tables — load the manifest iff `manifest.generation == g`
 (then `gc_orphans`, seed `current_lsn`), else `erase_stale_shards` and start
 empty. An absent manifest is invalid. Worker compile-time scratch tables get
 `expected_generation` from the fork-inherited `committed_generation`, read by
@@ -295,6 +323,12 @@ master, from the authoritative output manifests alone — made sufficient by
 the **flush-ordering invariant** (traces flush before outputs, §2): an output
 manifest at generation `G` implies that worker's traces are durable at `G`,
 so "every output partition at `G`" implies every constituent flush completed.
+The invariant is **per-view**: the ephemeral round flushes all traces (Pass 1)
+before all outputs (Pass 2), but Pass-2 output order **across sibling views is
+unordered**. A join view reads a *sibling view's* output store as an
+`ext_trace`, so a valid view may depend on a rebuilt one — commit 3 must handle
+that cross-view validity (it is outside the per-view traces-before-outputs
+invariant, and is commit 3's concern, not commit 2's).
 
 ```
 topology_valid  = recorded_topology == (launched_workers << 32 | STATE_FORMAT)
@@ -420,9 +454,12 @@ groups. A crash during step 3 leaves a view's manifests split across
 generations — safe because validity is all-or-nothing per relation and traces
 flush before outputs: the master's pre-fork output scan sees at least one
 partition below `committed_generation` whenever any constituent flush did not
-complete, so the whole relation erases and re-derives. A Barrier-triggered
-re-run of steps 0-1 during the drain re-bumps the generation, so step 3
-stamps the latest value — read the stamp at step-3 emission time.
+complete, so the whole relation erases and re-derives. The generation is
+bumped **once** (step 0); a mid-drain relay-space Barrier is serviced by a
+**reclaim-only base round (no gen bump)**, and the triggering reclaim barriers
+are **signaled right after step 1** (not at sequence end) so `relay_loop`
+unparks before the drain; DDL barriers are deferred to sequence end and never
+serviced mid-sequence. Step 3 therefore stamps the single step-0 generation.
 
 **Windowed recovery replay is state-exact.** Driving each source's buffered
 delta as consolidated windows, sources sequenced within each window,
@@ -556,13 +593,19 @@ after each.
   the **`unsynced`** set by path in `FD_CHUNK_THRESHOLD` sub-chunks and drains
   `pending_deletions` post-publish; `SalReplay` spills revert to unsynced (tag
   kept). `FlushWork` is `{ sync_paths, manifest }` (no `manifest_only`).
-- [ ] 2. **Checkpoint records + manifest V6 + three-step sequence.**
+- [x] 2. **Checkpoint records + manifest V6 + three-step sequence.** *(DONE)*
   `SEQ_ID_CHECKPOINT_GEN`/`SEQ_ID_TOPOLOGY` + `recover_sequences` arms +
   `STATE_FORMAT`; V6 generation stamped via the
-  `worker_ctx::committed_generation` atomic; `FLAG_FLUSH_EPH` +
-  `handle_flush_all(mode)` split + the `VmHandle.owned_tables` iterator
-  (traces before outputs; indexes excluded); committer sequence gen-bump →
-  base round → drain → ephemeral round; boot and graceful shutdown run the
+  `worker_ctx::committed_generation` atomic; `FLAG_FLUSH_EPH` + a dedicated
+  `handle_flush_all_ephemeral`, with both worker rounds sharing one
+  `flush_tables(tables, prepare)` body over `*mut Table` collectors
+  (`collect_base_flush_tables` / `collect_ephemeral_flush_tables`, traces
+  before outputs; indexes fold-only); committer sequence gen-bump →
+  base round → drain → ephemeral round, with a mid-drain relay-space barrier
+  serviced by a **reclaim-only base round** (no gen re-bump) and Ddl/Shutdown
+  barriers deferred to sequence end; `RecoverySource::RederiveCheckpointed`
+  gives ephemeral-published tables deferred compaction cleanup; boot-end and a
+  signal-driven graceful shutdown (a Shutdown-kind committer barrier) run the
   sequence. View manifests are now written and stamped but still erased at
   open (no reload yet) — behavior unchanged.
 - [ ] 3. **Recovery reload + windowed pre-live tick drive.** Conditional
