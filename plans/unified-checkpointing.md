@@ -17,8 +17,11 @@ independent redesign — while its rebuild is already the cheap linear part of
 boot: `backfill_index` (`catalog/ddl.rs:449`) is a stateless projection scan
 over base shards on the pre-fork master, with no circuit evaluation and no
 trace state. Indexes keep today's erase-at-open + rebuild forever under this
-plan; only the multi-writer filename collision in their shared directories is
-fixed here (commit 1), because the shipped naming unification made it live.
+plan. The cross-writer collision their shared directory once had is already
+fixed independently — slice-local secondary indexes home each worker's copy in
+a per-rank subdirectory (`index_table_dir` → `{idx_dir}/w{rank}`,
+`catalog/utils.rs`; the master's copy stays empty at `{idx_dir}`), so no two
+processes write the same index directory.
 
 This plan assumes two properties of the surrounding engine, stated where they
 are used: the checkpoint drains pending ticks before flushing and does not
@@ -47,50 +50,49 @@ Shipped lifecycle (`crates/gnitz-engine/src/storage/lsm/`):
   ingest. The DML found-row path (`retract_pk_bytes`,
   `get_weight_for_row_bytes`, `scan_inmem`) resolves live rows across
   memtable + RAM tier + shards by global net weight.
-- Spill (`spill_in_memory_to_disk`, `flush.rs:366`): folds to one net-state
-  run, writes `shard_{tid}_{lsn}.db` (`next_shard_name_and_lsn`,
-  `flush.rs:114`) — durable + PK-unique-tagged (`shard_flush_flags`,
-  `flush.rs:124`) for `SalReplay`, unsynced + untagged for `Rederive` —
-  registers real LSNs, then `compact_if_needed`.
-- Barrier/synchronous flush (`flush_prepare`, `flush.rs:152`): `Rederive` →
-  fold to RAM, `DoneInline`; `SalReplay` → fold memtable + L0, single
-  clean-gate `in_memory_l0.is_empty()`, then one consolidated PK-tagged shard
-  `.tmp` + manifest `.tmp` (`prepare_manifest_with_pending`) → `Pending`.
-  `flush_commit` (`flush.rs:234`) renames both and clears the RAM tier.
-  `flush()` (`flush.rs:32`) is the synchronous wrapper; system tables go
-  through it via `flush_all_system_tables` (`catalog/bootstrap.rs:425`).
-- `compact_if_needed` (`table/mod.rs:667`) still publishes the manifest,
-  fsyncs the dir, and drains cleanup mid-epoch — the only non-barrier publish
-  left (removed by commit 2). Compaction outputs are
-  `hcomp_{tid}_L{n}_G{guard}_{seq}.db` (`shard_index/index.rs:280`) keyed on
-  the per-table `compact_seq`, persisted in the manifest header
-  (`manifest.rs:116`) — no code parses any shard filename; gc and erase are
-  prefix matchers.
+- Spill (`spill_in_memory_to_disk`, `flush.rs`): folds to one net-state run
+  and commits it via `persist_l0_run` — written **unsynced** one-shot at its
+  final `shard_{tid}_{lsn}.db` name (`next_shard_name_and_lsn`),
+  PK-unique-tagged for base tables (`shard_flush_flags`), registered with real
+  LSNs, marked in the index's `unsynced` set — then `compact_if_needed`.
+- Barrier/synchronous flush (`flush_prepare`, `flush.rs`): `Rederive` → fold
+  to RAM, `DoneInline`; `SalReplay` → fold memtable + L0, gate on the three
+  disjuncts (design §1), commit the folded run via the same `persist_l0_run`,
+  stage the manifest `.tmp` (`prepare_manifest`) → `Pending` with
+  `FlushWork { sync_paths, manifest }`. The barrier fdatasyncs `sync_paths` by
+  path in `FD_CHUNK_THRESHOLD` sub-chunks; `flush_commit` renames the manifest
+  alone and clears `unsynced`. `flush()` is the synchronous wrapper (sweep +
+  rename + dir fsync + deletion drain); system tables go through it via
+  `flush_all_system_tables` (`catalog/bootstrap.rs:425`).
+- `compact_if_needed` (`table/mod.rs`) no longer publishes (commit 1 shipped):
+  it runs `run_compact` and drains `pending_deletions` immediately for
+  `Rederive`, deferring for `SalReplay`. L0→L1 compaction outputs are
+  `shard_{tid}_{seq}_L{n}_G{guard}.db` (`compact/merge.rs:194`) and guard
+  compactions `hcomp_{tid}_L{n}_G{guard}_{seq}.db` (`shard_index/index.rs`),
+  keyed on the per-table `compact_seq`, persisted in the manifest header — no
+  code parses any shard filename; gc and erase are prefix matchers.
 
-Multi-writer directories (verified — motivates commit 1):
+Multi-writer directories (verified):
 
-- **Index tables.** The `sys_indices` hook fires on the master (DDL/replay)
-  and on every worker (`ddl_sync`); each process opens the same
-  `{owner_dir}/idx_{idx_id}` and is fed one projected batch per base-table
-  push (`ingest_store_and_indices`, `query/dag/mod.rs:1053`). The master is
-  write-idle post-fork (`close_user_table_partitions`,
-  `runtime/bootstrap.rs:583-584`; user pushes go to workers; its live
-  CREATE-INDEX backfill streams from closed partitions), but all W workers
-  write the shared dir concurrently, and their per-table `current_lsn`
-  counters advance in near-lockstep (one bump per non-empty push slice). With
-  pid-less names, two workers spilling the same index table write the **same**
-  `shard_{tid}_{lsn}.db.tmp` and rename over each other
-  (`write_shard_streaming`, `shard_file.rs:241`): interleaved `.tmp` writes,
-  then each process mmaps whichever file won the rename — cross-process
-  corruption, live, needing only a > 4 MiB-per-worker index. The
-  `hcomp_*_{seq}` compaction names have the same cross-process collision
-  (per-process `compact_seq`, also near-lockstep) — pre-existing.
-- **Worker copies of `_sys` tables**, inherited across fork over master-owned
-  dirs and fed by `ddl_sync`. Workers never barrier-flush them
-  (`handle_flush_all` iterates `iter_user_table_ids()`,
-  `worker/mod.rs:1484`, `catalog/registry.rs:11`; `flush_all_system_tables`
-  is master-side), but a > 4 MiB spill would write `shard_{tid}_{lsn}.db`
-  into the master's directory with a name the master's own barrier can mint.
+- **Index tables — now single-writer per process.** Slice-local secondary
+  indexes home each worker's copy of `{owner_dir}/idx_{idx_id}` in its own
+  per-rank subdirectory (`index_table_dir` → `{idx_dir}/w{rank}`,
+  `catalog/utils.rs:85`), reached by every index-table open (`new_index_table`,
+  `catalog/utils.rs:98`) — the live CREATE-INDEX hook (`catalog/hooks.rs:640`)
+  and the worker-boot rebuild (`backfill_all_indexes`, `catalog/ddl.rs:529`).
+  The master's copy stays empty at `{idx_dir}` and is never written
+  (`catalog/hooks.rs:648`); the CREATE-UNIQUE-INDEX preflight opens no index
+  `Table` at all. So no two processes write the same index directory — the
+  earlier cross-worker spill/compaction collision is gone.
+- **Worker copies of `_sys` tables — the one remaining multi-writer directory,
+  left unaddressed.** Inherited across fork over the master's dirs and fed by
+  `ddl_sync`; workers never barrier-flush them (`handle_flush_all` iterates
+  `iter_user_table_ids()`, `worker/mod.rs:1484`, `catalog/registry.rs:11`;
+  `flush_all_system_tables` is master-side), but a > 4 MiB `_sys` overflow on a
+  worker would spill `shard_{tid}_{lsn}.db` into the master's directory with a
+  name the master's own barrier can mint — a rare, pre-existing cross-process
+  hazard. This plan does not fix it: the correct remedy is per-process `_sys`
+  directory ownership (an independent redesign), not filename stamping.
 - Every other directory is single-writer: base-table partition dirs are
   worker-owned; `_sys` barrier writes are master-only; `VmHandle` scratch dirs
   are rank-scoped (`{view_dir}/scratch_{child}_w{rank}`); replicated stores
@@ -154,110 +156,51 @@ files); one consolidated shard per checkpoint beats many 256 KiB shards by
 
 ## Design
 
-### 1. Process-scoped spill and compaction filenames
+### 1. No mid-epoch manifest publish (barrier-only durability) — **DONE**
 
-Spill filenames gain the writing process's pid:
-`shard_{tid}_p{pid}_{lsn}.db` (in `next_shard_name_and_lsn`'s spill caller —
-split the helper so the barrier keeps the pid-free form). Compaction outputs
-gain it too: `hcomp_{tid}_p{pid}_L{n}_G{guard}_{seq}.db`
-(`shard_index/index.rs:280` and the vertical/L0→L1 sites). Barrier shards
-keep `shard_{tid}_{lsn}.db` — they are written only into single-writer
-directories (worker-owned partitions, master-owned `_sys`).
+The checkpoint barrier is the sole manifest-publish point. `compact_if_needed`
+no longer publishes: it runs `run_compact` (swap the in-memory index, append
+superseded files to `pending_deletions`), draining that queue **immediately for
+`Rederive`** (no manifest to strand) and **deferring it for `SalReplay`** to the
+next barrier, which republishes over the compacted index before unlinking.
+Spills are written `durable = false` and recorded in a per-index `unsynced` set;
+the PK-unique tag stays (a read-path property).
 
-Why this is sufficient and safe:
+Invariants steps 2–3 rely on:
 
-- No filename is parsed anywhere: `compact_seq` and shard LSNs are manifest
-  header/entry fields (`manifest.rs:116`), and `gc_orphans` /
-  `erase_stale_shards` match the `shard_{tid}_` / `hcomp_{tid}_` prefixes,
-  which the pid segment preserves.
-- Concurrent processes sharing a dir (index tables; a worker `_sys` copy vs
-  the master) can no longer mint the same name — distinct pids.
-- Across reboots, collision-freedom is carried by the persisted per-table
-  `compact_seq` and by LSN monotonicity (reopen seeds
-  `current_lsn = max_lsn() + 1`), exactly as today; a recycled pid cannot
-  reuse a name because the seq/LSN component has moved past every persisted
-  entry. Deferred cleanup (design §2) therefore never unlinks a live shard.
-- The single-process uniqueness comment at `next_shard_name_and_lsn`
-  (`flush.rs:114`) is rewritten: spills are process-scoped; barrier shards
-  are single-writer by directory ownership.
+- **The barrier is the sole manifest-publish point**, gated on **three
+  disjuncts** (evaluated after the memtable fold). A `SalReplay` table publishes
+  iff `!in_memory_l0.is_empty()` (new RAM state) **or** `has_unsynced()`
+  (unpublished spills — the load-bearing F1 fix: without it a lone spill that
+  cleared the RAM tier and tripped no compaction returns `Empty`, and the
+  checkpoint's *unconditional global* `sal.checkpoint_reset()` then destroys the
+  SAL push while `gc_orphans` deletes the unmanifested spill — acknowledged rows
+  lost) **or** `has_pending_deletions()` (compacted since last publish — else the
+  surviving manifest points at files the deferred drain removes). None ⇒ `Empty`.
+- **Every manifest-referenced file is durable at publish.** The barrier fsyncs
+  only the **`unsynced` set** by path (prior spills + this barrier's own folded
+  shard), opening each `O_RDONLY` in sub-chunks of `FD_CHUNK_THRESHOLD` and
+  batch-`fdatasync`ing — bounding concurrent fds regardless of partition count
+  (F2). Files from prior barriers are already durable and never re-synced;
+  compaction outputs are written `durable = true` (F3) so they too need no sweep.
+  The folded shard is written **one-shot at its final name** (`durable = false`,
+  registered via `add_shard`, marked `unsynced`, RAM tier cleared); `flush_commit`
+  renames the manifest alone and returns the dir fd. A final table-dir fsync makes
+  the manifest rename and the prepare-time shard renames durable together.
+- **`SalReplay` cleanup is drained post-publish** (worker: `drain_family_deletions`
+  strictly after the family's dir fsyncs, on the all-chunks-succeeded path);
+  `Rederive` and system/manual-`flush()` tables drain inline.
+- **`FlushWork` carries `{ sync_paths: Vec<CString>, manifest }`** — one unified
+  shape for both the shard-written and compaction-only publishes (no
+  `manifest_only` constructor, F4). Dropping it before commit unlinks only the
+  manifest `.tmp` (`PreparedManifest`'s own `Drop`); the one-shot shard is an
+  orphan `gc_orphans` reclaims.
 
-### 2. No mid-epoch manifest publish (barrier-only durability)
+Deferred compaction cleanup keeps superseded inputs on disk until the next
+barrier; the transient overhead is bounded by one checkpoint interval's
+spill-plus-compaction write volume (≤ 75 % of `GNITZ_SAL_BYTES`).
 
-`compact_if_needed` (`table/mod.rs:667`) collapses to `should_compact()` +
-`run_compact()`: compaction writes its outputs unsynced, swaps the in-memory
-index, and appends superseded files to `pending_deletions` (all three
-compaction paths already do) — drained only after the next barrier publish.
-Between checkpoints, superseded compaction inputs and their replacements
-coexist on disk; the transient overhead is bounded by one checkpoint
-interval's spill-plus-compaction write volume, itself bounded by the
-un-checkpointed SAL tail (≤ 75 % of `GNITZ_SAL_BYTES`), because on-disk
-shards arise only from spills and every ingested byte flows through the SAL.
-Cleanup cannot be pulled earlier: mid-epoch, the superseded inputs are still
-referenced by the last-published manifest, so unlinking them before the new
-manifest supersedes them would strand the cut manifest over deleted files on
-the next boot.
-
-`SalReplay` spills revert to `durable = false` (the barrier's fsync sweep
-below covers them; the PK-unique tag stays — it is a read-path property, not
-a durability one).
-
-The barrier `flush_prepare` changes in two ways from the shipped code
-(`flush.rs:152`):
-
-- **The clean gate gains a `pending_deletions` disjunct.** A table needs a
-  barrier publish iff its on-disk manifest does not reflect its post-fold
-  in-memory state: `!in_memory_l0.is_empty() ||
-  shard_index.has_pending_deletions()`, evaluated after the fold. The
-  disjunct is load-bearing: once publication defers to the barrier, a table
-  that compacts mid-epoch and then goes quiet ends the epoch with an empty
-  RAM tier, yet must still publish so its superseded pre-compaction shards
-  can be unlinked — otherwise the last manifest survives pointing at files
-  the deferred drain removes. `!pending_deletions.is_empty()` is exactly
-  "compacted since last publish"; no separate dirty flag is needed.
-- **The shard write becomes one-shot at its final name** (the spill path's
-  `write_shard_streaming` with `durable = false` and the existing
-  `shard_flush_flags`), replacing the `.tmp` + fd two-phase — the barrier's
-  sweep now syncs by path, so no per-flush fd needs to survive to the fsync
-  batch. `flush_commit` renames the manifest alone.
-
-```rust
-// storage/lsm/table/flush.rs — barrier Phase-1 tail (delta from the shipped
-// flush_prepare; fold-first gate, helpers, and retry-safety are already in).
-self.fold_memtable_into_l0();
-self.compact_in_memory();
-if self.in_memory_l0.is_empty() {
-    if self.shard_index.has_pending_deletions() {
-        // Compaction-only: publish the swapped index, no new shard.
-        let manifest = self.prepare_manifest()?;
-        return Ok(FlushOutcome::Pending(Box::new(FlushWork::manifest_only(manifest))));
-    }
-    return Ok(FlushOutcome::Empty);
-}
-let run = Rc::clone(&self.in_memory_l0[0].batch);
-let (shard_name, lsn_max) = self.next_shard_name_and_lsn();
-let flush_flags = self.shard_flush_flags(&run);
-// write_shard_streaming(dirfd, &name_c, .., durable = false, flush_flags)
-//   → add_shard(final_full, 0, lsn_max) → in_memory_l0.clear()
-//   → prepare_manifest() → Pending(FlushWork { manifest, .. rest None }).
-```
-
-Both paths end in the same no-pending `prepare_manifest` (a two-phase sibling
-of `publish_manifest`: build entries over the current index →
-`manifest::prepare_file` to a `.tmp`), differing only in whether a shard was
-written first. A write/register failure leaves the run in `in_memory_l0` with
-nothing live on disk — retry-safe like the spill path.
-
-**The barrier fsyncs every file referenced by the new manifest** before the
-manifest rename: open-by-path → fdatasync → close (`ShardEntry.filename`
-holds full paths). Clean files cost ~1 µs, so the sweep re-fsyncs everything
-rather than tracking per-file dirtiness; this is what makes publishing a
-manifest over mid-epoch-written (unsynced) compaction outputs and unsynced
-spills safe. The worker's `handle_flush_all` fdatasync batch switches from
-`FlushWork` fds to this by-path sweep (chunking at `FD_CHUNK_THRESHOLD`
-unchanged), then commit renames, deduped dir fsyncs, then
-`drain_pending_deletions`.
-
-### 3. Manifest V6, checkpoint records, and the three-step sequence
+### 2. Manifest V6, checkpoint records, and the three-step sequence
 
 - Manifest header gains `generation: u64` → `VERSION_V6` (written into the
   reserved header window; the header stays 64 bytes). Stamped at every
@@ -331,7 +274,7 @@ the gen bump's flush). A checkpoint also runs at the end of boot (replacing
 the boot flush) and on graceful shutdown (before FLAG_SHUTDOWN), so a clean
 restart recovers instantly. There is no time-based trigger.
 
-### 4. Conditional reload and windowed recovery
+### 3. Conditional reload and windowed recovery
 
 **Conditional load.** `Table::new` gains `expected_generation: Option<u64>`:
 `None` for `SalReplay` tables (always load, as today); `Some(g)` for
@@ -349,7 +292,7 @@ tables; loading some partitions while others start empty would let the
 whole-view backfill double-count (backfill **adds** via `ingest_to_family`,
 and output stores are not `unique_pk`). The verdict is computed once, on the
 master, from the authoritative output manifests alone — made sufficient by
-the **flush-ordering invariant** (traces flush before outputs, §3): an output
+the **flush-ordering invariant** (traces flush before outputs, §2): an output
 manifest at generation `G` implies that worker's traces are durable at `G`,
 so "every output partition at `G`" implies every constituent flush completed.
 
@@ -497,15 +440,26 @@ holds cross-epoch state outside its integral tables — hence the Delay purge.
 **Deferred compaction cleanup is crash-safe.** The last published manifest's
 files are never unlinked before the next publish (drain moves strictly after
 barrier publish), so a crash loads the cut manifest over intact cut files;
-unsynced mid-epoch compaction outputs are unreferenced orphans, removed by
-`gc_orphans` at open. Two properties this rests on: (1) a compaction output
-never reuses the filename of any live shard — per-table persisted
-`compact_seq` + destination guard key within a process, the pid segment
-(design §1) across processes, and seq/LSN monotonicity across reboots;
-(2) a table dirtied only by compaction still publishes at the barrier before
-its `pending_deletions` drain — the `has_pending_deletions()` gate disjunct
-(design §2), without which the pre-compaction manifest would survive while
-its shards are unlinked.
+mid-epoch compaction outputs — themselves written `durable = true`
+(`write_shard_streaming` fdatasyncs each output and fsyncs the dir) but
+unreferenced by the cut manifest — are durable orphans, removed by `gc_orphans`
+at open. Two properties this rests on: (1) a compaction output
+never reuses the filename of any live shard — within a process, the per-table
+persisted `compact_seq` + destination guard key; across reboots, seq/LSN
+monotonicity. Across *processes* the question arises only in a shared
+directory, and after slice-local secondary indexes the sole shared directory
+is the master's `_sys` dir (written by the
+master and every worker's inherited `_sys` copy); its near-lockstep
+`compact_seq` collision is the pre-existing, out-of-scope `_sys` hazard, not
+introduced here; and (2) a table dirtied only by compaction still publishes at
+the barrier before its `pending_deletions` drain — the `has_pending_deletions()`
+gate disjunct (design §1), without which the pre-compaction manifest would
+survive while its shards are unlinked. Commit 2's deferral has one bounded
+consequence in that same `_sys` dir: a worker's `_sys` copy, which never
+barrier-flushes, leaves the superseded inputs of any `_sys` compaction
+undrained — a disk-space leak (not a correctness issue), bounded by `_sys`
+write volume and reclaimed by `gc_orphans` at the next boot; the proper fix is
+per-process `_sys` ownership.
 
 **Pushes admitted during the drain would be safe but are not admitted.** A
 push committed mid-drain lands in the post-reset SAL and in base memtables,
@@ -519,22 +473,19 @@ the sequence for simplicity; only Barrier is serviced.
 
 Rust (unit/integration, `make test`):
 
-- Commit 1: spill and compaction output filenames embed `std::process::id()`
-  (assert the format on both paths; cross-process uniqueness then holds by
-  construction); barrier shard names stay `shard_{tid}_{lsn}.db`;
-  `erase_stale_shards` and `gc_orphans` still match pid-segmented names.
-- Commit 2: compaction with deferred cleanup — crash-sim by reopening from
-  the old manifest after a compaction that did not republish: cut state
-  intact, orphans GC'd. Compact-then-quiet: compact, leave memtable and
-  `in_memory_l0` empty, run a barrier, reopen — the manifest reflects the
-  compacted index and every referenced shard exists (the
-  `has_pending_deletions()` gate arm). Barrier gate matrix: empty RAM tier +
-  pending deletions → manifest-only publish; empty on all three → `Empty`.
-  Unsynced-spill-then-barrier reopen: every manifest-referenced file synced
-  by the sweep.
-- Commit 3: manifest V6 round-trip; generation stamp preserved by compaction
+- Commit 1 *(shipped)*: lone-spill-survives-checkpoint (F1 regression: spill →
+  barrier → reopen, spilled rows present, manifest references the spill).
+  Deferred-cleanup crash-sim: reopen from the old manifest after a compaction
+  that did not republish — cut state intact, compaction outputs GC'd.
+  Compact-then-quiet: compact, empty memtable + RAM tier, barrier, reopen — the
+  manifest reflects the compacted index and every referenced shard exists.
+  Barrier gate matrix: RAM empty + unsynced → publish + sweep; RAM empty +
+  pending deletions only → publish, no new shard; RAM empty + nothing → `Empty`.
+  Rederive-immediate cleanup (F5) and system/`flush()`-drain (F-sys). Direct
+  `unsynced` mark/prune-on-compaction/clear unit test.
+- Commit 2: manifest V6 round-trip; generation stamp preserved by compaction
   republish; `recover_sequences` arms for seq_ids 4/5.
-- Commit 4: `Table::new` conditional load (match → load, mismatch/absent →
+- Commit 3: `Table::new` conditional load (match → load, mismatch/absent →
   erase); `OpNode::Delay` rejected — `load_circuit` a client circuit carrying
   `OPCODE_DELAY`, compile, assert `CompileError`.
 
@@ -561,10 +512,6 @@ E2E (pytest, `make e2e`, always `GNITZ_WORKERS=4`):
      corrupted/absent must rebuild the whole relation. Include a
      replicated-derived view (partitioned ⋈ replicated) so the distinct
      per-worker slices are exercised.
-- Large secondary index under sustained multi-worker ingest (enough rows that
-  every worker's index slice spills past `INMEM_CEILING`), then index-seek
-  correctness assertions — the regression surface for the commit-1 filename
-  collision.
 - Large-churn-tail recovery: fill the SAL near its checkpoint threshold with
   updates to a hot base table feeding a view, SIGKILL before checkpoint,
   restart, assert (a) views correct and (b) peak worker RSS stays near
@@ -600,19 +547,16 @@ O(base-through-circuits) rebuild into O(SAL-tail).
 Each checkbox is one commit; the tree is green (`make verify` + `make e2e`)
 after each.
 
-- [ ] 1. **Process-scoped spill/compaction filenames.** Spills gain
-  `_p{pid}_`; compaction outputs gain `_p{pid}_`; barrier shards unchanged;
-  rewrite the uniqueness comment at `next_shard_name_and_lsn`; update the
-  spill-naming unit tests and add the large-index spill e2e. Fixes the live
-  cross-worker collision in shared index directories and the
-  worker-`_sys`-copy hazard.
-- [ ] 2. **No mid-epoch manifest publish.** Strip publish/cleanup from
-  `compact_if_needed`; barrier `flush_prepare` gains the
-  `has_pending_deletions()` gate disjunct and the manifest-only path, and
-  writes its shard one-shot at the final name; the worker barrier fsyncs
-  every manifest-referenced file by path and drains `pending_deletions`
-  post-publish; `SalReplay` spills revert to unsynced (tag kept).
-- [ ] 3. **Checkpoint records + manifest V6 + three-step sequence.**
+- [x] 1. **No mid-epoch manifest publish.** *(DONE)* Stripped publish/cleanup
+  from `compact_if_needed` (immediate drain for `Rederive`, deferred for
+  `SalReplay`); barrier `flush_prepare` gained the **three-disjunct** gate
+  (`!in_memory_l0.is_empty() || has_unsynced() || has_pending_deletions()` — the
+  `has_unsynced` disjunct closes the lone-spill loss the global SAL reset caused)
+  and writes its shard one-shot at the final name; the worker barrier fsyncs only
+  the **`unsynced`** set by path in `FD_CHUNK_THRESHOLD` sub-chunks and drains
+  `pending_deletions` post-publish; `SalReplay` spills revert to unsynced (tag
+  kept). `FlushWork` is `{ sync_paths, manifest }` (no `manifest_only`).
+- [ ] 2. **Checkpoint records + manifest V6 + three-step sequence.**
   `SEQ_ID_CHECKPOINT_GEN`/`SEQ_ID_TOPOLOGY` + `recover_sequences` arms +
   `STATE_FORMAT`; V6 generation stamped via the
   `worker_ctx::committed_generation` atomic; `FLAG_FLUSH_EPH` +
@@ -621,7 +565,7 @@ after each.
   base round → drain → ephemeral round; boot and graceful shutdown run the
   sequence. View manifests are now written and stamped but still erased at
   open (no reload yet) — behavior unchanged.
-- [ ] 4. **Recovery reload + windowed pre-live tick drive.** Conditional
+- [ ] 3. **Recovery reload + windowed pre-live tick drive.** Conditional
   manifest load for view tables (master stores from the pre-fork per-view
   verdict over the store-shape partition set; worker scratch from
   fork-inherited `committed_generation`); `replay_ingest` keeps effective
