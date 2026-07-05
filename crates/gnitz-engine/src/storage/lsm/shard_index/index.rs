@@ -36,7 +36,9 @@ impl ShardIndex {
 
     pub fn add_shard(&mut self, path: &str, min_lsn: u64, max_lsn: u64) -> Result<(), StorageError> {
         let entry = ShardEntry::open(path, &self.schema, min_lsn, max_lsn)?;
-        self.add_opened_shard(entry);
+        self.l0.push(entry);
+        self.sort_l0();
+        self.update_flags();
         Ok(())
     }
 
@@ -58,6 +60,45 @@ impl ShardIndex {
 
     pub fn should_compact(&self) -> bool {
         self.needs_compaction
+    }
+
+    /// Record a shard file written unsynced (spill or barrier fold) so the next
+    /// barrier fdatasyncs it by path before publishing the manifest that
+    /// references it.
+    pub fn mark_unsynced(&mut self, path: &str) {
+        self.unsynced.push(path.to_string());
+    }
+
+    pub fn has_unsynced(&self) -> bool {
+        !self.unsynced.is_empty()
+    }
+
+    /// The unsynced set, cloned by `flush_prepare` into the barrier's sweep list.
+    pub fn unsynced_paths(&self) -> &[String] {
+        &self.unsynced
+    }
+
+    /// Clear the unsynced set once the barrier has fdatasync'd every path in it
+    /// and renamed the manifest that references them.
+    pub fn clear_unsynced(&mut self) {
+        self.unsynced.clear();
+    }
+
+    /// True when compaction has superseded files since the last publish — the
+    /// barrier must still publish (over the swapped index) so the deferred drain
+    /// can unlink them without stranding the old manifest over deleted files.
+    pub fn has_pending_deletions(&self) -> bool {
+        !self.pending_deletions.is_empty()
+    }
+
+    /// Move compaction-superseded input files to `pending_deletions` for the
+    /// (possibly deferred) drain. The sole writer of `pending_deletions`: an
+    /// unpublished spill among the inputs no longer needs a barrier sweep, so
+    /// it is pruned from `unsynced` in the same step — keeping the invariant
+    /// that every `unsynced` path stays openable until swept.
+    fn supersede_files(&mut self, inputs: Vec<String>) {
+        self.unsynced.retain(|p| !inputs.contains(p));
+        self.pending_deletions.extend(inputs);
     }
 
     pub fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
@@ -97,15 +138,6 @@ impl ShardIndex {
 
     pub fn max_lsn(&self) -> u64 {
         self.all_entries().map(|e| e.max_lsn).max().unwrap_or(0)
-    }
-
-    /// Insert an already-mmap'd, not-yet-indexed `ShardEntry` into L0. Caller
-    /// must have renamed the underlying .tmp into `entry.filename` already;
-    /// Linux rename(2) does not invalidate existing mmaps. Infallible.
-    pub fn add_opened_shard(&mut self, entry: ShardEntry) {
-        self.l0.push(entry);
-        self.sort_l0();
-        self.update_flags();
     }
 
     pub(super) fn get_or_create_level(&mut self, level_num: usize) -> &mut FLSMLevel {
@@ -177,7 +209,7 @@ impl ShardIndex {
 
         self.commit_l0_to_l1(&guard_outputs, l0_max_lsn)?;
 
-        self.pending_deletions.extend(l0_filenames);
+        self.supersede_files(l0_filenames);
 
         self.compact_guards_if_needed()?;
 
@@ -304,7 +336,7 @@ impl ShardIndex {
         let mut opened = self.open_outputs(&[(guard_key, out_path)], guard_max_lsn)?;
         let (_, new_entry) = opened.pop().expect("single-guard compaction has one output");
 
-        self.pending_deletions.extend(input_filenames);
+        self.supersede_files(input_filenames);
 
         self.levels[level_idx].guards[guard_idx].entries = vec![new_entry];
 
@@ -394,7 +426,7 @@ impl ShardIndex {
 
         let opened = self.open_outputs(&guard_outputs, vert_max_lsn)?;
 
-        self.pending_deletions.extend(all_input_files);
+        self.supersede_files(all_input_files);
         self.levels[src_idx].guards.remove(worst_idx);
         {
             self.levels[dest_idx]

@@ -425,6 +425,17 @@ impl CatalogEngine {
         }
     }
 
+    /// Drain a user family's deferred compaction deletions after the barrier
+    /// republished its manifests over the compacted index. Called by the worker
+    /// post-publish, strictly after the family's dir fsyncs. System tables drain
+    /// inline in `flush()` (their inputs stay durable meanwhile), so this is a
+    /// no-op for them.
+    pub fn drain_family_deletions(&mut self, table_id: i64) {
+        if table_id >= FIRST_USER_TABLE_ID {
+            self.dag.drain_family_deletions(table_id);
+        }
+    }
+
     /// Worker DDL sync: ingest into system table + fire hooks. Workers receive
     /// DDL deltas from master and update their registry; durability is
     /// master-side (fsynced SAL + the master's own system-table flush). The

@@ -1,14 +1,12 @@
 //! Manifest serialize / load / recover for [`ShardIndex`]: building manifest
-//! entries, loading + reopening shards, orphan GC, atomic publish, and the
-//! two-phase pending-shard manifest preparation.
+//! entries, loading + reopening shards, orphan GC, and staging the manifest
+//! `.tmp` the barrier renames into place.
 
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
-use std::rc::Rc;
 
 use super::super::error::StorageError;
 use super::super::manifest::{self, ManifestEntryRaw, ManifestHeader, PreparedManifest};
-use super::super::shard_reader::MappedShard;
 use super::{ShardEntry, ShardIndex, MAX_LEVELS};
 
 /// Basename of a shard's full path — its manifest identity. Shard files always
@@ -132,12 +130,6 @@ impl ShardIndex {
         removed
     }
 
-    pub fn publish_manifest(&self, path: &str) -> Result<(), StorageError> {
-        let entries = self.build_manifest_entries();
-        let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
-        manifest::write_file(&cpath, &entries, self.manifest_header(self.max_lsn()))
-    }
-
     fn manifest_header(&self, global_max_lsn: u64) -> ManifestHeader {
         ManifestHeader {
             global_max_lsn,
@@ -145,34 +137,12 @@ impl ShardIndex {
         }
     }
 
-    /// Open a shard mmap from `tmp_path` and return a not-yet-indexed
-    /// `ShardEntry` recording the metadata needed to publish it later. The index
-    /// is NOT mutated. `final_path` is the full filesystem path the shard will
-    /// live at after the rename (recorded as the entry's `filename`).
-    pub fn open_shard_for_pending(
-        &self,
-        tmp_path: &CStr,
-        final_path: String,
-        min_lsn: u64,
-        max_lsn: u64,
-    ) -> Result<ShardEntry, StorageError> {
-        let mapped = Rc::new(MappedShard::open(tmp_path, &self.schema, false)?);
-        Ok(ShardEntry::from_mapped(mapped, final_path, min_lsn, max_lsn))
-    }
-
-    /// Serialize all current entries plus one pending (not-yet-indexed)
-    /// `ShardEntry` into a manifest `.tmp`. Returns the prepared manifest
-    /// (fd + paths) without modifying any index state. `entry_to_raw` reads only
-    /// the entry's metadata fields — it never dereferences `shard`.
-    pub fn prepare_manifest_with_pending(
-        &self,
-        manifest_path: &CStr,
-        pending: &ShardEntry,
-    ) -> Result<PreparedManifest, StorageError> {
-        let mut entries = self.build_manifest_entries();
-        entries.push(self.entry_to_raw(pending, 0, 0));
-
-        let global_lsn = self.max_lsn().max(pending.max_lsn);
-        manifest::prepare_file(manifest_path, &entries, self.manifest_header(global_lsn))
+    /// Serialize the current index into a manifest `.tmp`, returning the prepared
+    /// manifest (fd + paths) without modifying any index state. The barrier's
+    /// one-shot shard write already registered its shard via `add_shard`, so the
+    /// current index is authoritative — no pending entry to splice in.
+    pub fn prepare_manifest(&self, manifest_path: &CStr) -> Result<PreparedManifest, StorageError> {
+        let entries = self.build_manifest_entries();
+        manifest::prepare_file(manifest_path, &entries, self.manifest_header(self.max_lsn()))
     }
 }

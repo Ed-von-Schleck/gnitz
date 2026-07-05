@@ -357,7 +357,7 @@ impl PartitionedTable {
             // at checkpoint.
             match table.flush_prepare()? {
                 FlushOutcome::Empty | FlushOutcome::DoneInline => {}
-                FlushOutcome::Pending(w) => works.push((i, *w)),
+                FlushOutcome::Pending(w) => works.push((i, w)),
             }
         }
         Ok(works)
@@ -366,8 +366,8 @@ impl PartitionedTable {
     /// Phase 3: dispatch each FlushWork back to its partition's `flush_commit`.
     /// Returns the owned dir fds to fsync (one per partition that committed).
     /// A partial-batch failure leaks nothing: the error `?` drops the fds
-    /// already collected, and the un-consumed `works` tail is closed by
-    /// `FlushWork`'s Drop.
+    /// already collected, and the un-consumed `works` tail drops its staged
+    /// manifest `.tmp`s (`PreparedManifest`'s Drop) and closes their fds.
     pub fn flush_commit_batch(&mut self, works: Vec<(usize, FlushWork)>) -> Result<Vec<OwnedFd>, StorageError> {
         let mut dirfds: Vec<OwnedFd> = Vec::with_capacity(works.len());
         for (idx, w) in works {
@@ -379,11 +379,17 @@ impl PartitionedTable {
             if self.commit_fail_after == Some(dirfds.len()) {
                 return Err(StorageError::Io);
             }
-            if let Some(fd) = self.tables[idx].flush_commit(w)? {
-                dirfds.push(fd);
-            }
+            dirfds.push(self.tables[idx].flush_commit(w)?);
         }
         Ok(dirfds)
+    }
+
+    /// Drain every partition's deferred compaction deletions post-publish.
+    /// Best-effort per partition (see `Table::drain_deletions`).
+    pub fn drain_deletions(&mut self) {
+        for table in &mut self.tables {
+            table.drain_deletions();
+        }
     }
 
     pub fn current_lsn(&self) -> u64 {
@@ -1054,8 +1060,9 @@ mod tests {
     }
 
     /// A durable `PartitionedTable` still routes flushes through the durable
-    /// branch: `flush_prepare` returns `Pending` work and writes shard `.tmp`
-    /// files. Guards against the durability fix over-broadening to base tables.
+    /// branch: `flush_prepare` returns `Pending` work, writes its folded shard at
+    /// its final name, and stages a manifest `.tmp`. Guards against the
+    /// durability fix over-broadening to base tables.
     #[test]
     fn flush_prepare_durable_returns_pending() {
         raise_fd_limit_for_tests();
@@ -1079,11 +1086,17 @@ mod tests {
         let works = pt.flush_prepare().unwrap();
         assert!(!works.is_empty(), "durable table must return Pending work");
         assert!(
-            count_tree(&tdir, |n| n.ends_with(".tmp")) > 0,
-            "durable flush_prepare must write shard/manifest .tmp files",
+            count_tree(&tdir, |n| n == "manifest.bin.tmp") > 0,
+            "durable flush_prepare must stage a manifest .tmp",
         );
-        // FlushWork::drop unlinks the .tmp files; memtable was not reset on prepare.
+        // Dropping the work unlinks the manifest .tmp (PreparedManifest::drop);
+        // prepare already wrote the folded shard at its final name and registered
+        // it in the index, so the rows stay readable and no .tmp survives.
         drop(works);
+        assert!(
+            count_tree(&tdir, |n| n.ends_with(".tmp")) == 0,
+            "drop must unlink the staged manifest .tmp",
+        );
         assert!(pt.has_pk(10) && pt.has_pk(20) && pt.has_pk(30));
     }
 
@@ -1231,11 +1244,12 @@ mod tests {
         .unwrap()
     }
 
-    /// A `flush_commit_batch` that fails partway leaks no directory fd: the fds
-    /// of already-committed partitions are collected as `OwnedFd`s and released
-    /// by `Drop` on the early return, and the un-consumed `works` tail is closed
-    /// by `FlushWork`'s Drop. Pre-fix (raw `c_int`), the collected fds dropped
-    /// unclosed on the mid-batch `?` — the cumulative leak this pins shut.
+    /// A `flush_commit_batch` that fails partway leaks no directory fd: each
+    /// committed partition's dir fd (opened in `flush_commit` for the final
+    /// fsync) is collected as an `OwnedFd` and released by `Drop` on the early
+    /// return; the un-consumed `works` tail drops its staged manifest `.tmp`s (no
+    /// fds). Pre-fix (raw `c_int`), the collected fds dropped unclosed on the
+    /// mid-batch `?` — the cumulative leak this pins shut.
     #[test]
     fn flush_commit_batch_no_dirfd_leak_on_midbatch_error() {
         raise_fd_limit_for_tests();
@@ -1256,15 +1270,17 @@ mod tests {
             n >= 2,
             "need ≥2 partitions with data to exercise a mid-batch failure (got {n})"
         );
-        // flush_prepare opened one dir fd per pending partition, held in each
-        // FlushWork's ShardRename until commit.
-        assert!(
-            count_partition_dir_fds(root) >= n,
-            "prepared works hold their dir fds open"
+        // flush_prepare writes each shard at its final name and drops the dir fd
+        // it opened for the write — no dir fd survives into the FlushWork.
+        assert_eq!(
+            count_partition_dir_fds(root),
+            0,
+            "prepare holds no dir fds (shard written at final name)"
         );
 
         // Fail right before committing the 2nd partition: the 1st partition's
-        // dir fd has already been collected into the returned Vec<OwnedFd>.
+        // dir fd (opened by its flush_commit) has already been collected into the
+        // returned Vec<OwnedFd>.
         pt.commit_fail_after = Some(1);
         assert!(matches!(pt.flush_commit_batch(works), Err(StorageError::Io)));
 

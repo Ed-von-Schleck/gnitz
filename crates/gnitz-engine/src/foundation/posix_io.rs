@@ -2,6 +2,8 @@
 //! EINTR/partial-write handling, fdatasync/fsync, fallocate, ftruncate, NOCOW,
 //! madvise, server socket, fd-limit, plus the `catch_unwind` panic guard.
 
+use std::os::fd::{FromRawFd, OwnedFd};
+
 use libc::c_int;
 
 /// Write all bytes to fd, handling partial writes and EINTR.
@@ -48,6 +50,16 @@ pub unsafe fn read_all_fd(fd: c_int, buf: &mut [u8]) -> i64 {
         offset += ret as usize;
     }
     offset as i64
+}
+
+/// `libc::open` returning an `OwnedFd`, or `None` on failure (errno untouched).
+pub(crate) fn open_owned(path: &std::ffi::CStr, flags: c_int) -> Option<OwnedFd> {
+    let fd = unsafe { libc::open(path.as_ptr(), flags, 0o644 as libc::mode_t) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fresh descriptor from `open`; the `OwnedFd` is the sole closer.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// `fdatasync` with EINTR retry. Returns the OS error on any other failure.

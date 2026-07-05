@@ -65,9 +65,7 @@ impl ShardEntry {
     }
 
     /// Build an entry from an already-mmap'd shard, deriving its PK bounds via
-    /// `MappedShard::pk_bounds`. `filename` is where the shard lives now
-    /// (`open`) or will live after the pending rename
-    /// (`open_shard_for_pending`).
+    /// `MappedShard::pk_bounds`.
     fn from_mapped(shard: Rc<MappedShard>, filename: String, min_lsn: u64, max_lsn: u64) -> Self {
         let (pk_min, pk_max) = shard.pk_bounds();
         ShardEntry {
@@ -184,6 +182,13 @@ pub struct ShardIndex {
     needs_compaction: bool,
     compact_seq: u64,
     pending_deletions: Vec<String>,
+    /// Full paths of shard files written unsynced since the last manifest
+    /// publish — spills (`durable = false`) and the barrier's own folded shard.
+    /// The barrier fdatasyncs exactly this set by path before renaming the new
+    /// manifest, then `clear_unsynced` empties it; a compaction that supersedes
+    /// an unpublished spill prunes it here (`run_compact`). Clean files from
+    /// prior barriers are already durable and never re-synced.
+    unsynced: Vec<String>,
     /// Propagated from `Table::can_tag_pk_unique`; passed through to
     /// `compact_shards` / `merge_and_route` so compacted output shards
     /// are tagged correctly. Defaults to `false` (conservative).
@@ -201,6 +206,7 @@ impl ShardIndex {
             needs_compaction: false,
             compact_seq: 0,
             pending_deletions: Vec::new(),
+            unsynced: Vec::new(),
             can_tag_pk_unique: false,
         }
     }
@@ -319,6 +325,17 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
+    /// Publish the index's manifest at `path` for reload tests: stage the
+    /// `.tmp` via the production `prepare_manifest`, then rename it into place
+    /// (the barrier's `flush_commit` step, minus the fsyncs the round-trip
+    /// doesn't observe).
+    fn publish_manifest(idx: &ShardIndex, path: &std::path::Path) {
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let mut m = idx.prepare_manifest(&cpath).unwrap();
+        assert_eq!(unsafe { libc::rename(m.tmp_path.as_ptr(), m.final_path.as_ptr()) }, 0);
+        m.committed = true;
+    }
+
     #[test]
     fn test_add_shard_and_find_pk() {
         raise_fd_limit_for_tests();
@@ -365,7 +382,7 @@ mod tests {
 
         // Publish manifest
         let manifest_path = dir.path().join("MANIFEST");
-        idx.publish_manifest(manifest_path.to_str().unwrap()).unwrap();
+        publish_manifest(&idx, &manifest_path);
 
         // Load into a fresh index
         let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
@@ -600,6 +617,45 @@ mod tests {
         assert!(idx.pending_deletions.is_empty());
         assert!(!std::path::Path::new(&path1).exists());
         assert!(!std::path::Path::new(&path2).exists());
+    }
+
+    /// The `unsynced` set: `mark_unsynced` records spill/barrier shards, a
+    /// compaction prunes the inputs it consumes (they move to `pending_deletions`
+    /// and no longer need a barrier sweep), and `clear_unsynced` empties the rest.
+    #[test]
+    fn test_unsynced_tracking_mark_prune_clear() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
+
+        assert!(!idx.has_unsynced());
+        for i in 0..5u64 {
+            let pk = (i + 1) * 10;
+            let p = write_test_shard(dir.path(), &format!("shard_42_{i}.db"), &[pk], &[pk as i64]);
+            idx.add_shard(&p, i, i + 1).unwrap();
+            idx.mark_unsynced(&p);
+        }
+        assert!(idx.has_unsynced());
+        assert_eq!(idx.unsynced_paths().len(), 5);
+
+        // Compaction folds L0 into L1: every consumed input is pruned from
+        // `unsynced` and queued in `pending_deletions`.
+        assert!(idx.should_compact());
+        idx.run_compact().unwrap();
+        assert!(idx.has_pending_deletions(), "compacted inputs queued for deletion");
+        assert!(
+            !idx.has_unsynced(),
+            "every compacted L0 spill must be pruned from the unsynced set"
+        );
+
+        // clear_unsynced empties whatever a later spill marked.
+        let p = write_test_shard(dir.path(), "shard_42_late.db", &[999], &[9990]);
+        idx.add_shard(&p, 9, 9).unwrap();
+        idx.mark_unsynced(&p);
+        assert!(idx.has_unsynced());
+        idx.clear_unsynced();
+        assert!(!idx.has_unsynced());
     }
 
     #[test]
@@ -855,7 +911,7 @@ mod tests {
 
         // Publish + reload into a fresh index: every key must survive.
         let manifest_path = dir.path().join("MANIFEST");
-        idx.publish_manifest(manifest_path.to_str().unwrap()).unwrap();
+        publish_manifest(&idx, &manifest_path);
         let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
         idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
         for k in [100u64, 110, 5000, 5010, 250, 6000] {
@@ -919,7 +975,7 @@ mod tests {
 
         // Publish + reload: every key survives.
         let manifest_path = dir.path().join("MANIFEST");
-        idx.publish_manifest(manifest_path.to_str().unwrap()).unwrap();
+        publish_manifest(&idx, &manifest_path);
         let mut idx2 = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
         idx2.load_manifest(manifest_path.to_str().unwrap()).unwrap();
         for k in [100u64, 110, 120, 130, 250] {

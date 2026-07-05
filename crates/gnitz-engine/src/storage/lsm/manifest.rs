@@ -1,8 +1,8 @@
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::error::StorageError;
 use crate::foundation::codec::{read_u64_le, write_u64_le};
-use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
+use crate::foundation::posix_io::open_owned;
 use crate::schema::MAX_PK_BYTES;
 
 // ---------------------------------------------------------------------------
@@ -279,7 +279,7 @@ pub fn read_file(
 /// the open fd plus owned path buffers. Does NOT fdatasync, close, or rename.
 /// On any internal write error closes the fd and unlinks the .tmp.
 pub struct PreparedManifest {
-    pub fd: Option<OwnedFd>,
+    pub fd: OwnedFd,
     pub tmp_path: std::ffi::CString,
     pub final_path: std::ffi::CString,
     /// Set true once the `.tmp` has been renamed into place. Until then, Drop
@@ -295,30 +295,6 @@ impl Drop for PreparedManifest {
                 libc::unlink(self.tmp_path.as_ptr());
             }
         }
-    }
-}
-
-/// `libc::open` returning an `OwnedFd`, or `None` on failure (errno untouched).
-fn open_owned(path: &std::ffi::CStr, flags: libc::c_int) -> Option<OwnedFd> {
-    let fd = unsafe { libc::open(path.as_ptr(), flags, 0o644 as libc::mode_t) };
-    if fd < 0 {
-        return None;
-    }
-    // SAFETY: fresh descriptor from `open`; the `OwnedFd` is the sole closer.
-    Some(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// fsync the directory containing `path`, so the renamed directory entry
-/// survives a crash (fdatasync on the file does not flush the parent inode).
-fn fsync_parent_dir(path: &std::ffi::CStr) {
-    let bytes = path.to_bytes();
-    let dir = match bytes.iter().rposition(|&b| b == b'/') {
-        Some(0) => std::ffi::CString::new("/").unwrap(),
-        Some(i) => std::ffi::CString::new(&bytes[..i]).unwrap(),
-        None => std::ffi::CString::new(".").unwrap(),
-    };
-    if let Some(fd) = open_owned(&dir, libc::O_RDONLY | libc::O_DIRECTORY) {
-        let _ = fsync_eintr(fd.as_raw_fd()); // best-effort; ignore error on directory fd
     }
 }
 
@@ -348,35 +324,11 @@ pub fn prepare_file(
     }
 
     Ok(PreparedManifest {
-        fd: Some(fd),
+        fd,
         tmp_path,
         final_path,
         committed: false,
     })
-}
-
-/// Serialize entries and write atomically (prepare, fdatasync, close, rename).
-/// On any error before the rename, `PreparedManifest::drop` unlinks the `.tmp`.
-pub fn write_file(
-    path: &std::ffi::CStr,
-    entries: &[ManifestEntryRaw],
-    header: ManifestHeader,
-) -> Result<(), StorageError> {
-    let mut prepared = prepare_file(path, entries, header)?;
-    let fd = prepared.fd.take().expect("prepare_file always returns fd");
-    if fdatasync_eintr(fd.as_raw_fd()).is_err() {
-        return Err(StorageError::Io);
-    }
-    drop(fd); // Close before the rename.
-    unsafe {
-        if libc::rename(prepared.tmp_path.as_ptr(), prepared.final_path.as_ptr()) < 0 {
-            return Err(StorageError::Io);
-        }
-    }
-    prepared.committed = true;
-    // Flush the directory inode so the rename survives a power loss.
-    fsync_parent_dir(&prepared.final_path);
-    Ok(())
 }
 
 /// Read just the entry count from a manifest file header.
@@ -643,6 +595,15 @@ mod tests {
 
     // --- File I/O tests ---
 
+    /// Publish `entries` at `path` for round-trip tests: stage the `.tmp` via
+    /// the production `prepare_file`, then rename it into place (the barrier's
+    /// `flush_commit` step, minus the fsyncs the round-trip doesn't observe).
+    fn write_manifest(path: &std::ffi::CStr, entries: &[ManifestEntryRaw], header: ManifestHeader) {
+        let mut m = prepare_file(path, entries, header).unwrap();
+        assert_eq!(unsafe { libc::rename(m.tmp_path.as_ptr(), m.final_path.as_ptr()) }, 0);
+        m.committed = true;
+    }
+
     #[test]
     fn write_read_file_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -655,7 +616,7 @@ mod tests {
             make_entry(3, "shard_3.db"),
         ];
 
-        write_file(&cpath, &entries, hdr(99, 5)).unwrap();
+        write_manifest(&cpath, &entries, hdr(99, 5));
         assert!(path.exists());
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 8];
@@ -664,7 +625,7 @@ mod tests {
         assert_eq!(
             header,
             hdr(99, 5),
-            "header must round-trip through write_file/read_file"
+            "header must round-trip through prepare_file/read_file"
         );
         assert_eq!(out[0].table_id, 1);
         assert_eq!(out[1].table_id, 2);
@@ -690,7 +651,7 @@ mod tests {
         let path = dir.path().join("MANIFEST_EMPTY");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
 
-        write_file(&cpath, &[], hdr(42, 0)).unwrap();
+        write_manifest(&cpath, &[], hdr(42, 0));
 
         let mut out = vec![ManifestEntryRaw::zeroed(); 1];
         let (count, header) = read_file(&cpath, &mut out, 1).unwrap();

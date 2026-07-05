@@ -213,31 +213,10 @@ unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> Result<(
     Ok(())
 }
 
-/// Open .tmp shard file (basename + ".tmp") and write the full shard image to
-/// it, but do NOT fdatasync, close, or rename. Returns the open fd plus the
-/// .tmp basename so the caller can batch the fdatasync and perform the rename
-/// later. On any internal error the fd is closed and the .tmp is unlinked.
-pub struct PreparedShard {
-    pub fd: OwnedFd,
-    pub tmp_name: std::ffi::CString,
-}
-
-#[allow(clippy::needless_range_loop)]
-pub fn write_shard_streaming_prepare(
-    dirfd: c_int,
-    basename: &CStr,
-    table_id: u32,
-    row_count: u32,
-    regions: &[(*const u8, usize)],
-    flags: u8,
-) -> Result<PreparedShard, StorageError> {
-    let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, table_id, row_count, regions, flags)?;
-    Ok(PreparedShard { fd, tmp_name })
-}
-
 /// Write the .tmp shard, then fdatasync (if durable), close, and rename to
-/// `basename`. Used by compaction outputs and non-durable / single-table flush
-/// paths where batching across partitions is not needed.
+/// `basename`. The sole shard writer: spills and barrier folds pass
+/// `durable = false` (the barrier's by-path sweep fdatasyncs them), compaction
+/// outputs and WAL-block conversions pass `durable = true`.
 pub fn write_shard_streaming(
     dirfd: c_int,
     basename: &CStr,
@@ -247,8 +226,7 @@ pub fn write_shard_streaming(
     durable: bool,
     flags: u8,
 ) -> Result<(), StorageError> {
-    let PreparedShard { fd, tmp_name } =
-        write_shard_streaming_prepare(dirfd, basename, table_id, row_count, regions, flags)?;
+    let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, table_id, row_count, regions, flags)?;
     if durable && fdatasync_eintr(fd.as_raw_fd()).is_err() {
         unsafe {
             libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);

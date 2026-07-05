@@ -265,6 +265,12 @@ mod reply;
 
 use fsync::uring_batch_fdatasync;
 
+/// Concurrent-fd budget for the barrier flush. Bounds both the per-table
+/// accumulation before a `flush_chunk` and the sub-chunk size the chunk opens
+/// its by-path fdatasync sweep in — so a 256-partition family never opens
+/// thousands of fds at once (EMFILE).
+const FD_CHUNK_THRESHOLD: usize = 256;
+
 /// Debug-only test seam: parse env var `var` as a `usize`. Always `None` in
 /// release builds, which never read the environment.
 fn debug_env_usize(var: &str) -> Option<usize> {
@@ -1491,9 +1497,12 @@ impl WorkerProcess {
 
         let mut ring = io_uring::IoUring::new(256).map_err(|e| format!("io_uring::new failed: {e}"))?;
 
-        const FD_CHUNK_THRESHOLD: usize = 256;
         let mut pending: Vec<(i64, Vec<(usize, FlushWork)>)> = Vec::new();
         let mut pending_fds = 0usize;
+        // Families that published a manifest this barrier — drained (deferred
+        // compaction deletions) after every dir fsync completes, so a crash
+        // between publish and drain loads the cut manifest over intact files.
+        let mut flushed_tids: Vec<i64> = Vec::new();
 
         for tid in ids {
             let works = self
@@ -1503,10 +1512,10 @@ impl WorkerProcess {
             if works.is_empty() {
                 continue;
             }
-            let added_fds: usize = works
-                .iter()
-                .map(|(_, w)| w.shard_fd().is_some() as usize + w.manifest_fd().is_some() as usize)
-                .sum();
+            flushed_tids.push(tid);
+            // Each work opens one fd per unsynced file (the by-path sweep) plus
+            // the manifest .tmp fd.
+            let added_fds: usize = works.iter().map(|(_, w)| w.sync_paths().len() + 1).sum();
             pending.push((tid, works));
             pending_fds += added_fds;
             if pending_fds >= FD_CHUNK_THRESHOLD {
@@ -1516,14 +1525,23 @@ impl WorkerProcess {
         }
         self.flush_chunk(&mut ring, &mut pending, &mut dir_fds)?;
 
-        // The dir fds are per-flush (opened in `flush_prepare`, returned by
-        // `flush_commit`). `dir_fds` drops at end of scope — on the success
-        // return and every `?` unwind alike — closing all of them, so the flush
-        // leaks nothing even under a persistent disk error.
+        // The dir fds are per-flush (opened in `flush_commit`). `dir_fds` drops at
+        // end of scope — on the success return and every `?` unwind alike —
+        // closing all of them, so the flush leaks nothing even under a persistent
+        // disk error.
         for fd in dir_fds.values() {
             if let Err(e) = crate::foundation::posix_io::fsync_eintr(fd.as_raw_fd()) {
                 return Err(format!("dir fsync failed: {e}"));
             }
+        }
+
+        // Every published manifest is durable now; drain each flushed family's
+        // deferred compaction deletions. Strictly after the dir fsyncs and only
+        // on the all-chunks-succeeded path (any chunk `?` short-circuits above,
+        // before any drain), so a superseded input is never unlinked while the
+        // manifest still referencing it is unpublished.
+        for tid in flushed_tids {
+            self.cat().drain_family_deletions(tid);
         }
         Ok(())
     }
@@ -1538,17 +1556,33 @@ impl WorkerProcess {
             return Ok(());
         }
 
-        let fds: Vec<libc::c_int> = pending
+        // fdatasync the manifest .tmp fds (open from `flush_prepare`) as one batch.
+        let manifest_fds: Vec<libc::c_int> = pending
             .iter()
             .flat_map(|(_, ws)| ws.iter())
-            .flat_map(|(_, w)| w.shard_fd().into_iter().chain(w.manifest_fd()))
+            .map(|(_, w)| w.manifest_fd())
             .collect();
-        uring_batch_fdatasync(ring, &fds)?;
+        uring_batch_fdatasync(ring, &manifest_fds)?;
 
-        for (_, ws) in pending.iter_mut() {
-            for (_, w) in ws {
-                w.close_fds();
-            }
+        // Sweep: open every unsynced file O_RDONLY and fdatasync it by path, in
+        // sub-chunks of FD_CHUNK_THRESHOLD so a large family never holds thousands
+        // of fds open at once. Each sub-chunk's `OwnedFd`s close before the next.
+        let paths: Vec<&std::ffi::CStr> = pending
+            .iter()
+            .flat_map(|(_, ws)| ws.iter())
+            .flat_map(|(_, w)| w.sync_paths().iter().map(|c| c.as_c_str()))
+            .collect();
+        for sub in paths.chunks(FD_CHUNK_THRESHOLD) {
+            let owned: Vec<OwnedFd> = sub
+                .iter()
+                .map(|p| {
+                    crate::foundation::posix_io::open_owned(p, libc::O_RDONLY)
+                        .ok_or_else(|| "open for sweep".to_string())
+                })
+                .collect::<Result<_, _>>()?;
+            let raw: Vec<libc::c_int> = owned.iter().map(|f| f.as_raw_fd()).collect();
+            uring_batch_fdatasync(ring, &raw)?;
+            // owned drops here → fds closed before the next sub-chunk
         }
 
         for (tid, works) in pending.drain(..) {

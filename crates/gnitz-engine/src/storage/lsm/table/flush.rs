@@ -2,10 +2,10 @@
 //!
 //! The flush/spill path carved off `Table`'s ingest/cursor/lookup surface:
 //! `flush_to_ram` (ingest overflow — fold the memtable into the RAM tier, no
-//! file I/O), `flush_prepare` (Phase 1 of the barrier / durable path —
-//! consolidate, then write the shard image to a `.tmp`, returning `FlushWork`),
-//! `flush_commit` (Phase 2 — fsync, rename into place, publish the manifest),
-//! the synchronous `flush` wrapper, and in-memory ceiling enforcement
+//! file I/O), `flush_prepare` (Phase 1 of the barrier / durable path — fold,
+//! write the shard one-shot at its final name, stage the manifest `.tmp`,
+//! returning `FlushWork`), `flush_commit` (Phase 2 — rename the manifest into
+//! place), the synchronous `flush` wrapper, and in-memory ceiling enforcement
 //! (`compact_in_memory` / `spill_in_memory_to_disk`). `Table`'s fields are read
 //! directly here — `flush` is a child module of the `table` module that defines
 //! the struct.
@@ -16,41 +16,46 @@ use std::rc::Rc;
 
 use super::super::batch::Batch;
 use super::super::error::StorageError;
+use super::super::manifest::PreparedManifest;
 use super::super::memtable;
 use super::super::shard_file::{self, PkUniqueChecker};
 use super::{
-    FlushOutcome, FlushWork, FoundSource, InMemRun, RecoverySource, ShardRename, Table, INMEM_CEILING,
-    INMEM_COMPACT_THRESHOLD,
+    FlushOutcome, FlushWork, FoundSource, InMemRun, RecoverySource, Table, INMEM_CEILING, INMEM_COMPACT_THRESHOLD,
 };
-use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
+use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr, open_owned};
 
 impl Table {
     /// Synchronous flush. `Rederive` tables fold into the RAM tier (`DoneInline`);
-    /// `SalReplay` tables fold memtable + L0 into one durable shard, fdatasync it
-    /// (and the manifest) inline, commit, and fsync the dir. The sole synchronous
-    /// fsync entry point — used by manual FLUSH and system-table checkpoint.
+    /// `SalReplay` tables fold memtable + L0 into one shard written at its final
+    /// name (unsynced), fdatasync every unsynced file by path + the manifest
+    /// `.tmp`, rename the manifest, fsync the dir, then drain deferred cleanup.
+    /// The sole synchronous fsync entry point — used by manual FLUSH and the
+    /// system-table checkpoint (which never reach the worker-barrier drain).
     pub fn flush(&mut self) -> Result<bool, StorageError> {
         match self.flush_prepare()? {
             FlushOutcome::Empty => Ok(false),
             FlushOutcome::DoneInline => Ok(true),
-            FlushOutcome::Pending(mut work) => {
-                if let Some(fd) = work.shard_fd() {
-                    if fdatasync_eintr(fd).is_err() {
+            FlushOutcome::Pending(work) => {
+                // Sweep: fdatasync every unpublished/unsynced file by path (prior
+                // spills + this barrier's folded shard) before the manifest rename.
+                for p in work.sync_paths() {
+                    let fd = open_owned(p, libc::O_RDONLY).ok_or(StorageError::Io)?;
+                    if fdatasync_eintr(fd.as_raw_fd()).is_err() {
                         return Err(StorageError::Io);
                     }
                 }
-                if let Some(fd) = work.manifest_fd() {
-                    if fdatasync_eintr(fd).is_err() {
-                        return Err(StorageError::Io);
-                    }
+                if fdatasync_eintr(work.manifest_fd()).is_err() {
+                    return Err(StorageError::Io);
                 }
-                work.close_fds();
                 // fsync the per-flush dir fd; it is not held for the table's life.
-                if let Some(fd) = self.flush_commit(*work)? {
-                    if fsync_eintr(fd.as_raw_fd()).is_err() {
-                        return Err(StorageError::Io);
-                    }
+                let dirfd = self.flush_commit(work)?;
+                if fsync_eintr(dirfd.as_raw_fd()).is_err() {
+                    return Err(StorageError::Io);
                 }
+                // Deferred compaction cleanup: the manifest now references the
+                // compacted index durably, so superseded inputs are safe to
+                // unlink. (The worker barrier drains user families instead.)
+                self.drain_deletions();
                 Ok(true)
             }
         }
@@ -143,12 +148,18 @@ impl Table {
     /// sources at open.
     ///
     /// `SalReplay` (base tables, master system tables): fold the memtable into
-    /// the RAM tier, then gate — a truly clean tier (`in_memory_l0` empty, or
-    /// fully cancelled to net-zero) returns `Empty`, since it is recoverable from
-    /// the SAL. Otherwise fold L0 to one net-state run, write it as a single
-    /// shard `.tmp` (no fdatasync), open MappedShard for metadata, write manifest
-    /// `.tmp`, and return `Pending(FlushWork)`. `in_memory_l0` is NOT cleared here
-    /// (retry-safe); `flush_commit` clears it once the shard is durable.
+    /// the RAM tier, then gate on three disjuncts. The tier is published iff it
+    /// holds new state (`in_memory_l0` non-empty after the fold), OR the index
+    /// carries unpublished/unsynced spills (`has_unsynced` — else the checkpoint's
+    /// global SAL reset would drop acknowledged rows), OR compaction has
+    /// superseded files since the last publish (`has_pending_deletions` — else the
+    /// deferred drain would unlink files the surviving manifest still references).
+    /// When none hold the tier is `Empty` (SAL-recoverable).
+    ///
+    /// On a publish the folded run (if any) is committed to disk via
+    /// `persist_l0_run` — the same commit point the spill path uses. The
+    /// barrier's by-path sweep fdatasyncs every unsynced file; `flush_commit`
+    /// renames the manifest alone.
     pub fn flush_prepare(&mut self) -> Result<FlushOutcome, StorageError> {
         self.found_source = FoundSource::None;
         if self.recovery_source == RecoverySource::Rederive {
@@ -159,129 +170,111 @@ impl Table {
         // SalReplay barrier flush: fold-first, then gate, then one shard.
         self.fold_memtable_into_l0();
         self.compact_in_memory();
-        if self.in_memory_l0.is_empty() {
-            // Nothing ingested since the last checkpoint, or the whole tier
-            // cancelled to net-zero across runs (e.g. insert then delete of the
-            // same rows in separate overflows). The SAL covers either case.
+
+        if !self.in_memory_l0.is_empty() {
+            self.persist_l0_run()?;
+        } else if !self.shard_index.has_unsynced() && !self.shard_index.has_pending_deletions() {
+            // Nothing ingested since the last checkpoint, no unpublished spills,
+            // and nothing compacted — the SAL covers it.
             return Ok(FlushOutcome::Empty);
         }
-        // `compact_in_memory` left exactly one net-state run (count > 0). Borrow
-        // it — a write/register failure below leaves heap intact for retry.
-        let run = Rc::clone(&self.in_memory_l0[0].batch);
+        // Otherwise fall through to publish: capture unpublished spills into a
+        // durable manifest before the SAL reset (else the global reset drops
+        // them), and/or republish over a compacted index so the deferred drain
+        // can unlink the superseded inputs.
 
+        let sync_paths = self
+            .shard_index
+            .unsynced_paths()
+            .iter()
+            .map(|p| CString::new(p.as_str()).map_err(|_| StorageError::InvalidPath))
+            .collect::<Result<Vec<_>, _>>()?;
+        let manifest = self.prepare_manifest_tmp()?;
+        Ok(FlushOutcome::Pending(FlushWork { sync_paths, manifest }))
+    }
+
+    /// Commit the RAM tier's single folded net-state run (left by
+    /// `compact_in_memory`, count > 0) to disk: write it **unsynced** at its
+    /// final `shard_{tid}_{lsn}.db` name, register it in the index, mark it for
+    /// the barrier's by-path fdatasync sweep, and drop it from heap. The shared
+    /// commit point of the spill and barrier paths.
+    ///
+    /// Transactional. The run is borrowed — not removed — so a write failure
+    /// leaves heap intact for retry with nothing on disk; a registration
+    /// failure unlinks the just-written shard before returning. Heap is cleared
+    /// only once the shard is written and registered.
+    fn persist_l0_run(&mut self) -> Result<(), StorageError> {
+        let run = Rc::clone(
+            &self
+                .in_memory_l0
+                .first()
+                .expect("compact_in_memory leaves one net-state run")
+                .batch,
+        );
         let (shard_name, lsn_max) = self.next_shard_name_and_lsn();
         let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
-        let regions = run.regions();
         let flush_flags = self.shard_flush_flags(&run);
 
-        // Owned for this flush only. The durable branch moves ownership into
-        // `ShardRename` (whose Drop closes it on a rollback) and hands it to the
-        // committer.
         let dirfd = self.open_dirfd()?;
-
-        let prepared = shard_file::write_shard_streaming_prepare(
+        let res = shard_file::write_shard_streaming(
             dirfd.as_raw_fd(),
             &name_c,
             self.table_id,
             run.count as u32,
-            &regions,
+            &run.regions(),
+            false, // unsynced; the barrier sweep fdatasyncs it by path
             flush_flags,
-        )?;
-        let shard_fd = prepared.fd;
-        let tmp_name = prepared.tmp_name;
+        );
+        drop(dirfd);
+        res?; // Write failed: heap still owns `run`; no on-disk residue.
 
-        let mut work = FlushWork {
-            shard_fd: Some(shard_fd),
-            shard_rename: Some(ShardRename {
-                dirfd,
-                tmp_name: tmp_name.clone(),
-                final_name: name_c.clone(),
-            }),
-            manifest: None,
-            pending_shard: None,
-        };
-
-        let tmp_full_c = CString::new(format!(
-            "{}/{}",
-            self.directory,
-            tmp_name.to_str().map_err(|_| StorageError::InvalidPath)?,
-        ))
-        .map_err(|_| StorageError::InvalidPath)?;
+        // Register with real LSNs so a reopen seeds `current_lsn = max_lsn() + 1`.
         let final_full = format!("{}/{}", self.directory, shard_name);
+        if let Err(e) = self.shard_index.add_shard(&final_full, 0, lsn_max) {
+            // Registration failed: unlink the shard we wrote, keep heap intact.
+            let _ = std::fs::remove_file(&final_full);
+            return Err(e);
+        }
+        // Unsynced on disk: the next barrier's sweep fdatasyncs it (and the gate's
+        // `has_unsynced` disjunct forces that barrier before any SAL reset).
+        self.shard_index.mark_unsynced(&final_full);
 
-        let pending = self
-            .shard_index
-            .open_shard_for_pending(&tmp_full_c, final_full, 0, lsn_max)?;
-
-        let manifest_path = self
-            .manifest_path
-            .as_ref()
-            .expect("SalReplay table must have manifest_path");
-        let manifest_c = CString::new(manifest_path.as_str()).map_err(|_| StorageError::InvalidPath)?;
-        work.manifest = Some(self.shard_index.prepare_manifest_with_pending(&manifest_c, &pending)?);
-        work.pending_shard = Some(pending);
-
-        Ok(FlushOutcome::Pending(Box::new(work)))
+        // Commit: the run is on disk and registered — safe to drop from heap.
+        self.in_memory_l0.clear();
+        Ok(())
     }
 
-    /// Phase 2: rename shard then manifest into final names; insert
-    /// pending_shard into shard_index; clear the RAM tier.
-    /// Returns the per-flush directory fd (opened in `flush_prepare`, ownership
-    /// moved out of `ShardRename` here) for the caller to `fsync` after all
-    /// renames in the worker batch. Every path — success and each early error
-    /// return — releases the fd through its `OwnedFd`, so a failed commit never
-    /// leaks it.
-    pub(crate) fn flush_commit(&mut self, mut work: FlushWork) -> Result<Option<OwnedFd>, StorageError> {
-        // Rename shard .tmp → final.
-        let dirfd = if let Some(rename) = work.shard_rename.take() {
-            let rc = unsafe {
-                libc::renameat(
-                    rename.dirfd.as_raw_fd(),
-                    rename.tmp_name.as_ptr(),
-                    rename.dirfd.as_raw_fd(),
-                    rename.final_name.as_ptr(),
-                )
-            };
-            if rc < 0 {
-                // Restore so Drop unlinks the shard .tmp and closes the fd.
-                work.shard_rename = Some(rename);
-                return Err(StorageError::Io);
-            }
-            // Rename succeeded: ownership of the dir fd moves out of the consumed
-            // `ShardRename` into the returned `OwnedFd`.
-            Some(rename.dirfd)
-        } else {
-            None
-        };
+    /// Stage the manifest `.tmp` over the current index for the barrier to
+    /// rename. The barrier's one-shot shard write already registered its shard
+    /// via `add_shard`, so the live index is authoritative.
+    fn prepare_manifest_tmp(&self) -> Result<PreparedManifest, StorageError> {
+        let manifest_c = CString::new(self.manifest_full_path()).map_err(|_| StorageError::InvalidPath)?;
+        self.shard_index.prepare_manifest(&manifest_c)
+    }
 
-        // Rename manifest .tmp → final. fd already closed by close_fds.
-        if let Some(m) = work.manifest.take() {
-            let rc = unsafe { libc::rename(m.tmp_path.as_ptr(), m.final_path.as_ptr()) };
-            if rc < 0 {
-                // Restore so Drop unlinks the manifest .tmp. The shard is
-                // already at its final path and will be collected by orphan GC.
-                work.manifest = Some(m);
-                return Err(StorageError::Io);
-            }
+    /// Phase 2: rename the manifest `.tmp` into place and return the per-flush
+    /// directory fd for the caller to `fsync` after all renames in the worker
+    /// batch. The folded shard was already written at its final name and
+    /// registered by `flush_prepare`, the RAM tier already cleared, and the
+    /// barrier sweep has fdatasync'd every unsynced file — so all that remains is
+    /// the manifest rename. On a rename failure the `.tmp` is unlinked by
+    /// `PreparedManifest`'s Drop and the shard survives as an orphan (GC'd next
+    /// open); every fd is released through its `OwnedFd` on every path.
+    pub(crate) fn flush_commit(&mut self, work: FlushWork) -> Result<OwnedFd, StorageError> {
+        let mut m = work.manifest;
+        let rc = unsafe { libc::rename(m.tmp_path.as_ptr(), m.final_path.as_ptr()) };
+        if rc < 0 {
+            // `m` drops here: `PreparedManifest`'s Drop unlinks the .tmp.
+            return Err(StorageError::Io);
         }
+        m.committed = true; // renamed; suppress the .tmp unlink in Drop
 
-        // Publish the pending shard into the index (infallible).
-        if let Some(pending) = work.pending_shard.take() {
-            self.shard_index.add_opened_shard(pending);
-        }
-
-        // The barrier folded memtable + L0 into the now-durable shard; drop the
-        // RAM tier. Reached only from a `Pending` outcome (the SalReplay branch),
-        // and only after every rename succeeded — a commit failure returns above
-        // with the RAM tier intact for retry. The memtable was folded (and reset)
-        // by `flush_prepare`; nothing refills it between prepare and commit on
-        // the single-threaded worker.
-        debug_assert!(
-            self.memtable.is_empty(),
-            "rows ingested between flush_prepare and flush_commit would be dropped",
-        );
-        self.in_memory_l0.clear();
-        Ok(dirfd)
+        // The files in `unsynced` were fdatasync'd by the barrier sweep and are
+        // now referenced by the renamed manifest; clear so the next barrier does
+        // not re-sync already-durable files. No concurrent writer: single-threaded
+        // worker, barrier holds sal_writer_excl.
+        self.shard_index.clear_unsynced();
+        self.open_dirfd()
     }
 
     // ------------------------------------------------------------------
@@ -340,15 +333,17 @@ impl Table {
     /// Ceiling breach: fold to net state first. Folding cancels cross-flush
     /// churn (an insert in flush N against its retraction in N+1) and can
     /// reclaim enough to fall back under the ceiling — in which case this
-    /// returns without touching disk. Otherwise write the folded run to a real
-    /// `shard_{tid}_{lsn}` (unified with the durable/barrier naming), register
-    /// it, drop it from heap, then compact the disk tier.
+    /// returns without touching disk. Otherwise commit the folded run to disk
+    /// (`persist_l0_run`), then compact the disk tier.
     ///
-    /// SalReplay spills are durable + PK-tagged (a later checkpoint barrier's
-    /// manifest references them, but the barrier only fsyncs its own shard — so
-    /// an unsynced spill would be lost on crash yet skipped by the advanced
-    /// watermark). Rederive spills publish no manifest and are erased+rebuilt at
-    /// open, so they stay unsynced + untagged.
+    /// Spills are written **unsynced** (`durable = false`) and marked in the
+    /// index's `unsynced` set. For `SalReplay` the next barrier fdatasyncs them
+    /// by path before publishing (the `has_unsynced` gate disjunct guarantees a
+    /// barrier fires while unpublished spills exist, so the checkpoint's global
+    /// SAL reset never drops an acknowledged spill); the PK-unique tag stays (a
+    /// read-path property, not a durability one). Rederive spills publish no
+    /// manifest and are erased+rebuilt at open, so their `unsynced` marks are
+    /// pruned by disk compaction and never swept.
     ///
     /// After a spill the table carries disk runs + future heap runs; cross-tier
     /// churn does NOT fold (neither `compact_in_memory`, which is heap-only, nor
@@ -356,67 +351,24 @@ impl Table {
     /// occurs for tables that breached the ceiling, affects disk footprint not
     /// heap (heap stays <= ceiling by construction), and the disk tier still
     /// self-compacts.
-    ///
-    /// Transactional. The consolidated run stays in `in_memory_l0` until the
-    /// shard is both written and registered; heap is dropped only on the commit
-    /// path. A `write_shard_streaming` failure leaves the run in heap for retry
-    /// with nothing on disk to clean up; an `add_shard` failure unlinks the
-    /// just-written shard before returning. No error can lose the integrated
-    /// state or strand an orphan file.
     fn spill_in_memory_to_disk(&mut self) -> Result<(), StorageError> {
         self.compact_in_memory();
         // Folding may have dropped the net state back under the ceiling (heavy
         // churn cancels to near-nothing); if so there is nothing to spill.
-        if self.in_memory_bytes() <= self.inmem_ceiling() {
-            return Ok(());
-        }
         // Above the ceiling the byte total is > 0, so `compact_in_memory` left
         // exactly one net-state run (count > 0) in heap — `flush_to_ram` never
         // enqueues an empty snapshot and `compact_in_memory` only re-pushes
-        // `merged.count > 0`. Borrow it — do not remove — so a write/register
-        // failure below leaves heap intact for retry.
-        let run = Rc::clone(
-            &self
-                .in_memory_l0
-                .first()
-                .expect("compaction leaves one net-state run when above the spill ceiling")
-                .batch,
-        );
-
-        let (shard_name, lsn_max) = self.next_shard_name_and_lsn();
-        let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
-        let flush_flags = self.shard_flush_flags(&run);
-        let durable = self.recovery_source == RecoverySource::SalReplay;
-
-        let dirfd = self.open_dirfd()?;
-        let res = shard_file::write_shard_streaming(
-            dirfd.as_raw_fd(),
-            &name_c,
-            self.table_id,
-            run.count as u32,
-            &run.regions(),
-            durable,
-            flush_flags,
-        );
-        drop(dirfd);
-        res?; // Write failed: heap still owns `run`; no on-disk residue.
-
-        // Register with real LSNs so a reopen seeds `current_lsn = max_lsn() + 1`.
-        let final_full = format!("{}/{}", self.directory, shard_name);
-        if let Err(e) = self.shard_index.add_shard(&final_full, 0, lsn_max) {
-            // Registration failed: unlink the shard we wrote, keep heap intact.
-            let _ = std::fs::remove_file(&final_full);
-            return Err(e);
+        // `merged.count > 0`.
+        if self.in_memory_bytes() <= self.inmem_ceiling() {
+            return Ok(());
         }
-
-        // Commit: the run is on disk and registered — safe to drop from heap.
-        self.in_memory_l0.clear();
+        self.persist_l0_run()?;
 
         // Bound the spilled disk L0. A repeatedly-spilling table is read only
         // via the non-compacting `open_cursor`, so without this its shards
         // accumulate unbounded and every cursor merges them all.
-        // `compact_if_needed` is a no-op until the disk tier crosses its own
-        // threshold and skips the manifest (None) for a Rederive table.
+        // `compact_if_needed` publishes no manifest: it defers cleanup to the
+        // next barrier for SalReplay and drains inline for Rederive.
         self.compact_if_needed()?;
         Ok(())
     }

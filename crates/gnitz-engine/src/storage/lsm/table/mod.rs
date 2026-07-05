@@ -7,7 +7,7 @@
 
 use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
 use super::batch::Batch;
@@ -18,9 +18,8 @@ use super::manifest::PreparedManifest;
 use super::memtable::{self, MemTable};
 use super::merge::pack_pk_be;
 use super::read_cursor::{self, CursorHandle};
-use super::shard_index::{ShardEntry, ShardIndex};
+use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
-use crate::foundation::posix_io::fsync_eintr;
 use crate::schema::SchemaDescriptor;
 
 /// Fold `in_memory_l0` once it exceeds this many runs. Mirrors the disk
@@ -62,71 +61,45 @@ pub enum RecoverySource {
 
 /// Outcome of `Table::flush_prepare`.
 pub enum FlushOutcome {
-    /// `SalReplay` table with memtable and RAM tier net-empty after the fold —
-    /// nothing to publish; the SAL covers it.
+    /// `SalReplay` table with memtable and RAM tier net-empty after the fold, no
+    /// unpublished spills, and no compaction pending — nothing to publish; the
+    /// SAL covers it.
     Empty,
     /// `Rederive` table folded into the RAM tier; no file I/O, no deferred work.
     DoneInline,
-    /// `SalReplay`: .tmp files written, fdatasync + rename pending.
-    /// Boxed because `FlushWork` is ~300B and dwarfs the unit variants.
-    Pending(Box<FlushWork>),
+    /// `SalReplay`: the folded shard is written at its final name (unsynced) and
+    /// a manifest `.tmp` is staged; the barrier fdatasyncs `sync_paths` then
+    /// renames the manifest.
+    Pending(FlushWork),
 }
 
-/// Open file descriptors and rename targets pending for one durable flush.
-/// Owned by the worker between `flush_prepare` and `flush_commit`. Drop
-/// unlinks any remaining `.tmp` files so a partial failure leaves no debris.
+/// The deferred half of one barrier flush, owned by the worker between
+/// `flush_prepare` and `flush_commit`. Carries the full paths of every file
+/// written unsynced since the last publish (prior spills + this barrier's own
+/// folded shard) and the staged manifest `.tmp`. The barrier fdatasyncs each
+/// `sync_paths` entry (opening it O_RDONLY, in bounded fd sub-chunks),
+/// fdatasyncs the manifest `.tmp`, then renames it. Dropping a `FlushWork`
+/// before commit unlinks only the manifest `.tmp` (via `PreparedManifest`'s own
+/// `Drop`); the shard — already at its final name and registered in the index —
+/// is an unreferenced orphan reclaimed by `gc_orphans` at the next open.
 pub struct FlushWork {
-    shard_fd: Option<OwnedFd>,
-    shard_rename: Option<ShardRename>,
-    manifest: Option<PreparedManifest>,
-    /// The flush's shard, written and mmap'd at its `.tmp` path but not yet
-    /// inserted into the index — held here from `flush_prepare` until
-    /// `flush_commit` renames the `.tmp` into place and inserts it.
-    pending_shard: Option<ShardEntry>,
-}
-
-pub struct ShardRename {
-    dirfd: OwnedFd,
-    tmp_name: CString,
-    final_name: CString,
+    sync_paths: Vec<CString>,
+    manifest: PreparedManifest,
 }
 
 impl FlushWork {
-    /// Close any still-open fds. Called by the worker after the io_uring
-    /// fdatasync batch completes and before renames start.
-    pub fn close_fds(&mut self) {
-        self.shard_fd = None;
-        if let Some(m) = &mut self.manifest {
-            m.fd = None;
-        }
+    /// Full paths the barrier must fdatasync (each opened O_RDONLY) before the
+    /// manifest rename — the files this publish makes reachable that are not yet
+    /// durable.
+    pub fn sync_paths(&self) -> &[CString] {
+        &self.sync_paths
     }
 
-    pub fn shard_fd(&self) -> Option<libc::c_int> {
-        self.shard_fd.as_ref().map(|fd| fd.as_raw_fd())
-    }
-    pub fn manifest_fd(&self) -> Option<libc::c_int> {
-        self.manifest
-            .as_ref()
-            .and_then(|m| m.fd.as_ref())
-            .map(|fd| fd.as_raw_fd())
-    }
-}
-
-impl Drop for FlushWork {
-    fn drop(&mut self) {
-        if let Some(r) = self.shard_rename.take() {
-            // Unlink the orphaned shard .tmp through the per-flush dir fd.
-            // `flush_commit` `take()`s `shard_rename` on success, so a committed
-            // flush never reaches here. All fds close via their `OwnedFd` drops.
-            unsafe {
-                libc::unlinkat(r.dirfd.as_raw_fd(), r.tmp_name.as_ptr(), 0);
-            }
-        }
-        if let Some(m) = self.manifest.take() {
-            unsafe {
-                libc::unlink(m.tmp_path.as_ptr());
-            }
-        }
+    /// The staged manifest `.tmp`'s fd, open from `prepare_file` until
+    /// `flush_commit` consumes the work (it closes when the `PreparedManifest`
+    /// drops after the rename).
+    pub fn manifest_fd(&self) -> libc::c_int {
+        self.manifest.fd.as_raw_fd()
     }
 }
 
@@ -220,7 +193,6 @@ pub struct Table {
     directory: String,
 
     recovery_source: RecoverySource,
-    manifest_path: Option<String>,
 
     pub current_lsn: u64,
 
@@ -278,7 +250,6 @@ impl Table {
             table_id,
             directory: dir.to_string(),
             recovery_source,
-            manifest_path: None,
             current_lsn: 1,
             found_source: FoundSource::None,
             cached_full_scan: None,
@@ -289,17 +260,22 @@ impl Table {
         };
 
         if recovery_source == RecoverySource::SalReplay {
-            let manifest_path = format!("{dir}/manifest.bin");
-            table.shard_index.load_manifest(&manifest_path)?;
+            table.shard_index.load_manifest(&table.manifest_full_path())?;
             table.shard_index.gc_orphans();
             table.current_lsn = table.shard_index.max_lsn() + 1;
             if table.current_lsn == 0 {
                 table.current_lsn = 1;
             }
-            table.manifest_path = Some(manifest_path);
         }
 
         Ok(table)
+    }
+
+    /// Full path of this table's manifest — a pure function of the directory.
+    /// Only `SalReplay` tables publish one (`Rederive` state is erased at open),
+    /// but the path itself carries no state worth caching.
+    fn manifest_full_path(&self) -> String {
+        format!("{}/manifest.bin", self.directory)
     }
 
     /// Enable `SHARD_FLAG_PK_UNIQUE` tagging for flushed and compacted shards.
@@ -664,24 +640,38 @@ impl Table {
     // Compaction
     // ------------------------------------------------------------------
 
+    /// Run L0→L1+ compaction if the disk tier crossed its threshold. No manifest
+    /// publish and no dir fsync happen here — the barrier is the sole
+    /// manifest-publish point, and it fsyncs everything the new manifest
+    /// references. Compaction only swaps the in-memory index and appends the
+    /// superseded inputs to `pending_deletions`.
+    ///
+    /// Cleanup timing splits on recovery source. A `Rederive` table publishes
+    /// no manifest referencing the superseded inputs, so it drains them
+    /// immediately — deferring would leak them until boot-time
+    /// `erase_stale_shards`. A `SalReplay` table defers both publish and
+    /// cleanup to the next barrier, which republishes over the compacted index
+    /// before unlinking the inputs; unlinking mid-epoch would strand the
+    /// last-published manifest over deleted files on the next boot.
     pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         if !self.shard_index.should_compact() {
             return Ok(());
         }
         self.found_source = FoundSource::None;
         self.shard_index.run_compact()?;
-        if let Some(ref path) = self.manifest_path {
-            self.shard_index.publish_manifest(path)?;
-            // Open the dir fd just for this fsync; the `OwnedFd` closes it on
-            // drop — not held for the table's lifetime.
-            let dirfd = self.open_dirfd()?;
-            let ok = fsync_eintr(dirfd.as_raw_fd()).is_ok();
-            if !ok {
-                return Err(StorageError::Io);
-            }
+        if self.recovery_source == RecoverySource::Rederive {
+            self.drain_deletions();
         }
-        self.shard_index.try_cleanup();
         Ok(())
+    }
+
+    /// Unlink compaction-superseded shard files, once no surviving manifest can
+    /// reference them: post-publish for `SalReplay` tables (the worker barrier
+    /// per family, the synchronous `flush()` inline), immediately after
+    /// `run_compact` for `Rederive` tables. Best-effort — a still-present file
+    /// is retried on the next drain.
+    pub(crate) fn drain_deletions(&mut self) {
+        self.shard_index.try_cleanup();
     }
 
     // ------------------------------------------------------------------
@@ -827,6 +817,33 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Count files directly in `dir` whose basename satisfies `pred`.
+    fn count_files(dir: &std::path::Path, pred: impl Fn(&str) -> bool) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().filter(|e| pred(&e.file_name().to_string_lossy())).count())
+            .unwrap_or(0)
+    }
+
+    /// Count compaction-output files for `table_id`. L0→L1 outputs are named
+    /// `shard_{tid}_{seq}_L{n}_G{gk}.db` (the `_L` marker distinguishes them from
+    /// flat spill/barrier shards); guard compactions use the `hcomp_{tid}_`
+    /// prefix. Either presence proves a compaction ran.
+    fn compaction_output_count(dir: &std::path::Path, table_id: u32) -> usize {
+        let shard = format!("shard_{table_id}_");
+        let hcomp = format!("hcomp_{table_id}_");
+        count_files(dir, |n| {
+            (n.starts_with(&shard) && n.contains("_L")) || n.starts_with(&hcomp)
+        })
+    }
+
+    /// Count every on-disk shard/compaction-output file for `table_id`
+    /// (`shard_{tid}_*` + `hcomp_{tid}_*`).
+    fn all_shard_file_count(dir: &std::path::Path, table_id: u32) -> usize {
+        let shard = format!("shard_{table_id}_");
+        let hcomp = format!("hcomp_{table_id}_");
+        count_files(dir, |n| n.starts_with(&shard) || n.starts_with(&hcomp))
     }
 
     /// Materialize `open_cursor` into a (pk -> net_weight) map.
@@ -1123,9 +1140,11 @@ mod tests {
         );
     }
 
-    /// Dropping a `Pending` FlushWork without committing must unlink the
-    /// shard `.tmp` and the manifest `.tmp`, leaving the directory clean
-    /// for a future retry.
+    /// Dropping a `Pending` FlushWork without committing must unlink the staged
+    /// manifest `.tmp`, leaving the directory clean for a future retry. The
+    /// folded shard was written at its final name (not a `.tmp`) and registered
+    /// in the index by `flush_prepare`, so it survives as an orphan the next
+    /// open's `gc_orphans` reclaims — no `.tmp` residue either way.
     #[test]
     fn flush_prepare_drop_cleans_tmp_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -1144,8 +1163,8 @@ mod tests {
                     .filter_map(|e| e.file_name().into_string().ok())
                     .collect();
                 assert!(
-                    dir_entries.iter().any(|n| n.ends_with(".tmp")),
-                    ".tmp files must exist before Drop, got {dir_entries:?}"
+                    dir_entries.iter().any(|n| n == "manifest.bin.tmp"),
+                    "the staged manifest .tmp must exist before Drop, got {dir_entries:?}"
                 );
                 drop(work);
             }
@@ -2006,5 +2025,265 @@ mod tests {
         let fr = t.found_row().expect("found row from RAM tier");
         let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
         assert_eq!(val, 30, "found-row payload matches the RAM-tier row");
+    }
+
+    // ── Barrier-only durability: unsynced spills, deferred cleanup ────────
+
+    /// F1 regression. A `SalReplay` table whose only post-checkpoint write
+    /// spilled — clearing the RAM tier, one lone L0 shard, no compaction, so no
+    /// manifest was published — must still barrier-flush to `Pending` (via the
+    /// `has_unsynced` gate disjunct) and durably capture the spill. Without the
+    /// disjunct the barrier returns `Empty`, the spill is never manifested, and a
+    /// reopen's `gc_orphans` deletes it — acknowledged rows lost.
+    #[test]
+    fn lone_spill_survives_checkpoint_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("lone_spill_ckpt");
+        let schema = make_u64_i64_schema();
+        let mut t = new_table(&tdir, schema, 7600, 128, RecoverySource::SalReplay);
+        t.set_inmem_ceiling_for_test(100);
+
+        // One over-ceiling ingest → one spill shard (1 < L0 compaction threshold,
+        // so no compaction, no publish).
+        let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
+        t.ingest_owned_batch(make_batch(&rows)).unwrap();
+        assert_eq!(t.in_memory_bytes(), 0, "ceiling breach spilled to disk");
+        assert_eq!(t.all_shard_arcs().len(), 1, "exactly one lone spill shard");
+
+        assert!(
+            t.flush().unwrap(),
+            "barrier must publish the lone unpublished spill (F1), not return Empty"
+        );
+        t.close();
+
+        let mut t2 = new_table(&tdir, schema, 7600, 128, RecoverySource::SalReplay);
+        assert!(
+            !t2.all_shard_arcs().is_empty(),
+            "manifest must reference the spill shard"
+        );
+        for k in 0..10u128 {
+            assert!(t2.has_pk(k), "spilled row {k} must survive checkpoint + reopen");
+        }
+        t2.close();
+    }
+
+    /// Deferred-cleanup crash simulation. After a mid-epoch compaction that did
+    /// not republish (SalReplay defers), a crash (drop without a barrier) reopens
+    /// from the *old* manifest: the cut state is intact, and the unreferenced
+    /// compaction outputs + post-cut spills are orphans reclaimed by `gc_orphans`.
+    #[test]
+    fn deferred_cleanup_crash_sim_reopens_from_old_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("deferred_cleanup_crash");
+        let schema = make_u64_i64_schema();
+        let mut t = new_table(&tdir, schema, 7700, 128, RecoverySource::SalReplay);
+        t.set_inmem_ceiling_for_test(100);
+
+        // Cut A: one row, published by a barrier (manifest M0 references its shard).
+        t.ingest_owned_batch(make_batch(&[(1000, 1, 1)])).unwrap();
+        assert!(t.flush().unwrap(), "cut A publishes M0");
+
+        // Post-cut churn: spill > L0_COMPACT_THRESHOLD shards so run_compact fires,
+        // swapping the index and deferring cleanup (no mid-epoch publish).
+        for r in 0..6u64 {
+            let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
+            t.ingest_owned_batch(make_batch(&rows)).unwrap();
+        }
+        assert!(
+            compaction_output_count(&tdir, 7700) > 0,
+            "post-cut compaction must have produced deferred outputs"
+        );
+        // Crash: drop without a barrier flush → reopen from the old manifest M0.
+        drop(t);
+
+        let mut t2 = new_table(&tdir, schema, 7700, 128, RecoverySource::SalReplay);
+        assert!(t2.has_pk(1000), "cut A row survives the crash (loaded from M0)");
+        assert!(!t2.has_pk(0), "post-cut orphaned data must not resurrect");
+        assert_eq!(
+            compaction_output_count(&tdir, 7700),
+            0,
+            "deferred compaction outputs (never in M0) must be gc'd at open"
+        );
+        t2.close();
+    }
+
+    /// Compact-then-quiet. A table that compacts mid-epoch and then goes quiet
+    /// (empty memtable and RAM tier) must still publish at the barrier so the
+    /// manifest reflects the compacted index; a reopen finds every referenced
+    /// shard and every row.
+    #[test]
+    fn compact_then_quiet_barrier_publishes_compacted_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("compact_then_quiet");
+        let schema = make_u64_i64_schema();
+        let mut t = new_table(&tdir, schema, 7800, 128, RecoverySource::SalReplay);
+        t.set_inmem_ceiling_for_test(100);
+
+        let mut all_keys = Vec::new();
+        for r in 0..6u64 {
+            let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
+            for &(pk, _, _) in &rows {
+                all_keys.push(pk);
+            }
+            t.ingest_owned_batch(make_batch(&rows)).unwrap();
+        }
+        assert_eq!(t.in_memory_bytes(), 0, "spilled: RAM tier empty");
+        assert!(t.memtable_is_empty(), "no live memtable rows");
+        assert!(compaction_output_count(&tdir, 7800) > 0, "compaction ran");
+
+        assert!(t.flush().unwrap(), "quiet compacted table must still publish");
+        t.close();
+
+        let mut t2 = new_table(&tdir, schema, 7800, 128, RecoverySource::SalReplay);
+        for pk in &all_keys {
+            assert!(
+                t2.has_pk(*pk as u128),
+                "row {pk} present after compact + barrier + reopen"
+            );
+        }
+        t2.close();
+    }
+
+    /// The three-disjunct barrier gate, one arm each: RAM empty + nothing →
+    /// `Empty`; RAM empty + a lone unsynced spill → `Pending` with the spill in
+    /// the sweep list; RAM empty + compaction pending only (unsynced cleared) →
+    /// `Pending` with an empty sweep and no new shard.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // arm 3 forces a compaction via create_cursor_compacting
+    fn barrier_gate_matrix() {
+        let schema = make_u64_i64_schema();
+
+        // Arm 1 — clean tier gates to Empty.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let tdir = dir.path().join("gate_empty");
+            let mut t = new_table(&tdir, schema, 7900, 1 << 20, RecoverySource::SalReplay);
+            t.ingest_owned_batch(make_batch(&[(1, 1, 1)])).unwrap();
+            assert!(t.flush().unwrap(), "first barrier publishes the folded row");
+            assert!(
+                matches!(t.flush_prepare().unwrap(), FlushOutcome::Empty),
+                "a clean SalReplay tier (no RAM, no unsynced, no pending) gates to Empty"
+            );
+        }
+
+        // Arm 2 — a lone unsynced spill gates to Pending with the spill swept.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let tdir = dir.path().join("gate_unsynced");
+            let mut t = new_table(&tdir, schema, 7901, 128, RecoverySource::SalReplay);
+            t.set_inmem_ceiling_for_test(100);
+            let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, 1)).collect();
+            t.ingest_owned_batch(make_batch(&rows)).unwrap();
+            assert_eq!(t.in_memory_bytes(), 0, "spilled");
+            match t.flush_prepare().unwrap() {
+                FlushOutcome::Pending(w) => {
+                    assert!(
+                        !w.sync_paths().is_empty(),
+                        "the unsynced spill must be in the sweep list"
+                    )
+                }
+                _ => panic!("an unsynced spill must gate to Pending"),
+            }
+        }
+
+        // Arm 3 — compaction pending only (unsynced cleared) gates to Pending with
+        // an empty sweep (compaction outputs are already durable) and no new shard.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let tdir = dir.path().join("gate_pending");
+            let mut t = new_table(&tdir, schema, 7902, 1 << 20, RecoverySource::SalReplay);
+            // Five durable barrier shards → L0 over the compaction threshold, each
+            // barrier clearing `unsynced` on commit.
+            for k in 0..5u64 {
+                t.ingest_owned_batch(make_batch(&[(k, 1, 1)])).unwrap();
+                assert!(t.flush().unwrap());
+            }
+            // Force the compaction of those durable shards: pending_deletions set,
+            // unsynced empty, RAM tier empty.
+            let _ = t.create_cursor_compacting().unwrap();
+            let shards_before = shard_db_files(&tdir, 7902).len();
+            match t.flush_prepare().unwrap() {
+                FlushOutcome::Pending(w) => assert!(
+                    w.sync_paths().is_empty(),
+                    "a compaction-only publish sweeps nothing (outputs already durable)"
+                ),
+                _ => panic!("pending deletions must gate to Pending"),
+            }
+            assert_eq!(
+                shard_db_files(&tdir, 7902).len(),
+                shards_before,
+                "a compaction-only publish writes no new shard"
+            );
+        }
+    }
+
+    /// F5. A `Rederive` table that spills and compacts drains the superseded
+    /// inputs inline in `compact_if_needed` (it publishes no manifest that could
+    /// strand them), so raw spill shards stay bounded and nothing leaks.
+    #[test]
+    fn rederive_compaction_drains_deletions_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("rederive_immediate_drain");
+        let schema = make_u64_i64_schema();
+        let mut t = new_table(&tdir, schema, 8000, 128, RecoverySource::Rederive);
+        t.set_inmem_ceiling_for_test(100);
+
+        for r in 0..8u64 {
+            let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
+            t.ingest_owned_batch(make_batch(&rows)).unwrap();
+            assert_eq!(t.in_memory_bytes(), 0, "round {r} spilled");
+        }
+        assert!(compaction_output_count(&tdir, 8000) > 0, "compaction must have run");
+        assert!(
+            shard_db_files(&tdir, 8000).len() <= 5,
+            "compacted inputs drained inline: {} raw spills remain",
+            shard_db_files(&tdir, 8000).len(),
+        );
+        for r in 0..8u64 {
+            for k in 0..10u64 {
+                assert!(t.has_pk((r * 100 + k) as u128), "row survives compaction");
+            }
+        }
+    }
+
+    /// F-sys. A `SalReplay` table stands in for a master `_sys` table:
+    /// `compact_if_needed` defers cleanup (a manifest could strand the inputs),
+    /// and the synchronous `flush()` republishes over the compacted index and
+    /// drains the deferred inputs — no intra-session leak.
+    #[test]
+    fn salreplay_flush_drains_deferred_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("salreplay_flush_drain");
+        let schema = make_u64_i64_schema();
+        let mut t = new_table(&tdir, schema, 8100, 128, RecoverySource::SalReplay);
+        t.set_inmem_ceiling_for_test(100);
+
+        for r in 0..6u64 {
+            let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
+            t.ingest_owned_batch(make_batch(&rows)).unwrap();
+        }
+        assert!(compaction_output_count(&tdir, 8100) > 0, "compaction ran");
+        let files_before = all_shard_file_count(&tdir, 8100);
+
+        assert!(t.flush().unwrap(), "flush republishes over the compacted index");
+        assert!(
+            all_shard_file_count(&tdir, 8100) < files_before,
+            "flush must drain the deferred compaction inputs (no intra-session leak)"
+        );
+
+        for r in 0..6u64 {
+            for k in 0..10u64 {
+                assert!(t.has_pk((r * 100 + k) as u128), "row present after flush-drain");
+            }
+        }
+        t.close();
+
+        let mut t2 = new_table(&tdir, schema, 8100, 128, RecoverySource::SalReplay);
+        for r in 0..6u64 {
+            for k in 0..10u64 {
+                assert!(t2.has_pk((r * 100 + k) as u128), "row survives flush-drain + reopen");
+            }
+        }
+        t2.close();
     }
 }

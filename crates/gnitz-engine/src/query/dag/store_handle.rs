@@ -136,7 +136,7 @@ impl StoreHandle {
         };
         match table.flush_prepare()? {
             FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
-            FlushOutcome::Pending(w) => Ok(vec![(0, *w)]),
+            FlushOutcome::Pending(w) => Ok(vec![(0, w)]),
         }
     }
 
@@ -153,11 +153,19 @@ impl StoreHandle {
         };
         let mut out = Vec::with_capacity(works.len());
         for (_, w) in works {
-            if let Some(fd) = t.flush_commit(w)? {
-                out.push(fd);
-            }
+            out.push(t.flush_commit(w)?);
         }
         Ok(out)
+    }
+
+    /// Dispatched deferred-deletion drain across all variants. `Partitioned`
+    /// drains every partition's `pending_deletions`; `Borrowed` (system tables)
+    /// the single table's.
+    pub fn drain_deletions(&mut self) {
+        match self {
+            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.drain_deletions(),
+            StoreHandle::Partitioned(cell) => cell.get_mut().drain_deletions(),
+        }
     }
 
     /// Current LSN of the store (Table: current_lsn field; Partitioned: max across shards).

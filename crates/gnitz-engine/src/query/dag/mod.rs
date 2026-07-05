@@ -1226,6 +1226,14 @@ impl DagEngine {
             .map_err(|_| format!("flush_commit_batch failed for table_id={table_id}"))
     }
 
+    /// Drain a table's deferred compaction deletions post-publish. Best-effort
+    /// (like `try_cleanup`); a still-present shard is retried next barrier.
+    pub fn drain_family_deletions(&mut self, table_id: i64) {
+        if let Some(entry) = self.tables.get_mut(&table_id) {
+            entry.handle.drain_deletions();
+        }
+    }
+
     // ── DAG traversal helpers ───────────────────────────────────────────
 
     /// Seed the initial pending list for a DAG traversal.
