@@ -185,10 +185,18 @@ Between checkpoints, **all** tables behave like today's Ephemeral tables:
   `compact_if_needed` (`table/mod.rs:616-637`) collapses to
   `should_compact()` + `run_compact()`: compaction writes its output files
   unsynced, swaps the in-memory index, and appends superseded files to
-  `pending_deletions` (all three compaction paths do — `index.rs:154,284,392`)
+  `pending_deletions` (all three compaction paths do — `index.rs:180,307,397`)
   — which is drained only after the next barrier publish. Between checkpoints,
-  superseded compaction inputs and their replacements coexist on disk (bounded
-  by one checkpoint interval).
+  superseded compaction inputs and their replacements coexist on disk. This
+  transient overhead is bounded by one checkpoint interval's spill-plus-compaction
+  write volume, itself bounded by the un-checkpointed SAL tail (≤ 75 % of
+  `GNITZ_SAL_BYTES`) because on-disk shards arise only from spills and every
+  ingested byte flows through the SAL. Cleanup cannot be pulled earlier than the
+  barrier publish: mid-epoch, the superseded inputs are still referenced by the
+  last-published (active on-disk) manifest, so unlinking them before the new
+  manifest supersedes them would strand the cut manifest over deleted files on the
+  next boot. A shorter checkpoint interval (lower `GNITZ_CHECKPOINT_BYTES`) trades
+  durable-write cost for a tighter transient-disk bound.
 - **Mid-epoch compaction defers its cleanup, so it relies on compaction output
   names being reboot-stable and collision-free across *both* the horizontal and
   vertical paths** — an output must never reuse the filename of any live shard
@@ -238,49 +246,94 @@ Between checkpoints, **all** tables behave like today's Ephemeral tables:
   The XOR8 filter needs no change — `write_shard_streaming` builds it
   unconditionally when `row_count > 0`; its `durable` bool gates only the
   per-file fsync, not filter construction, so the spill path never dropped it.
-- **A table needs a barrier publish iff its on-disk manifest does not reflect
-  its in-memory state.** That is `!memtable.is_empty() || !in_memory_l0.is_empty()
-  || !shard_index.pending_deletions.is_empty()` — the third disjunct is the
-  load-bearing addition. Today's `flush_prepare` Empty gate keys only on
-  `memtable.is_empty()` (`flush.rs:80`), which is correct only because
-  compaction republishes its own manifest inline (`compact_if_needed`). Once
-  publication defers to the barrier, a table that compacts mid-epoch and then
-  goes quiet ends the epoch with an empty memtable **and** empty `in_memory_l0`
-  (the spill that triggered the compaction cleared it), so an
-  `memtable`-only gate would skip its publish while the barrier still drains
-  its superseded pre-compaction shards from `pending_deletions` — leaving the
-  last (pre-compaction) manifest pointing at unlinked files. Every compaction
-  path appends to `pending_deletions` (`index.rs:154,284,392`), drained only
-  after publish, so `!pending_deletions.is_empty()` is exactly "compacted since
-  last publish"; no separate dirty flag is needed. The Empty gate becomes:
+- **The barrier flush folds the memtable into the RAM tier before it decides
+  whether there is anything to publish.** Ingest overflow already leaves a table
+  with an *empty memtable and a populated `in_memory_l0`* (the overflow flush
+  pushes the memtable snapshot into `in_memory_l0` and resets the memtable) — the
+  common post-overflow state, not an edge case. So the barrier `flush_prepare`
+  must first consolidate any residual memtable into `in_memory_l0`, and only
+  *then* test whether the table is clean. Gating on the memtable alone — as the
+  pre-unification `flush_prepare_with` did, with a `memtable.is_empty()` gate and
+  a second `snapshot.count == 0` gate (`flush.rs:84,89`), both preceding the
+  `in_memory_l0.push` — would drop a populated `in_memory_l0` on the floor at the
+  barrier: silent data loss after the following SAL reset.
+
+- **A table needs a barrier publish iff its on-disk manifest does not reflect its
+  post-fold in-memory state**: `!in_memory_l0.is_empty() ||
+  !shard_index.pending_deletions.is_empty()`, evaluated *after* the memtable is
+  folded in. The `pending_deletions` disjunct is the load-bearing addition: once
+  publication defers to the barrier, a table that compacts mid-epoch and then goes
+  quiet ends the epoch with an empty memtable **and** empty `in_memory_l0` (the
+  spill that triggered the compaction cleared it), yet the barrier still must
+  publish so it can drain the superseded pre-compaction shards from
+  `pending_deletions` — otherwise the last (pre-compaction) manifest survives
+  pointing at unlinked files. Every compaction path appends to `pending_deletions`
+  (`index.rs:180,307,397`), drained only after publish, so
+  `!pending_deletions.is_empty()` is exactly "compacted since last publish"; no
+  separate dirty flag is needed.
+
+  There is a single fold-then-gate path (no second memtable-only gate — the
+  memtable is folded into `in_memory_l0` up front):
 
   ```rust
-  // storage/lsm/table/flush.rs — flush_prepare Empty gate
-  self.found_source = FoundSource::None;
-  if self.memtable.is_empty()
-      && self.in_memory_l0.is_empty()
-      && !self.shard_index.has_pending_deletions()
-  {
-      return Ok(FlushOutcome::Empty);
+  // storage/lsm/table/flush.rs — barrier Phase-1 flush (unified lifecycle).
+  // Ingest overflow no longer reaches here: it takes the in-RAM branch
+  // (memtable snapshot → in_memory_l0, fold, spill past the ceiling; no shard,
+  // no manifest). This method runs only at the checkpoint barrier.
+  pub fn flush_prepare(&mut self) -> Result<FlushOutcome, StorageError> {
+      self.found_source = FoundSource::None;
+
+      // 1. Fold the residual memtable into the RAM tier. `in_memory_l0` may
+      //    already hold runs from mid-epoch overflow flushes; after this every
+      //    live row is in `in_memory_l0` and the memtable is empty. The pushed
+      //    run gets a fresh per-run bloom (§DML found-row path).
+      if !self.memtable.is_empty() {
+          let snapshot = self.memtable.consolidate_for_flush();
+          if snapshot.count > 0 {
+              self.cached_full_scan = None;
+              self.in_memory_l0.push(InMemRun::from_batch(snapshot));
+          }
+          self.memtable.reset();
+      }
+
+      // 2. Clean iff nothing to write AND nothing compacted since last publish.
+      if self.in_memory_l0.is_empty() {
+          if self.shard_index.has_pending_deletions() {
+              // Compaction-only: prepare_manifest (no new shard) → Pending{manifest}.
+              let manifest = self.prepare_manifest()?;
+              return Ok(FlushOutcome::Pending(Box::new(FlushWork::manifest_only(manifest))));
+          }
+          return Ok(FlushOutcome::Empty);
+      }
+
+      // 3. Fold the RAM tier to one net-state run and write it as one shard via
+      //    the one-shot barrier write above (write_shard_streaming, durable=false,
+      //    with the PK-unique flush_flags), register it, then prepare the manifest
+      //    over the now-updated index. Retry-safe exactly like the spill path
+      //    (flush.rs:322-378): a write failure leaves the run in `in_memory_l0`
+      //    with nothing on disk; an add_shard failure unlinks the shard and keeps
+      //    the run; on success the run clears from `in_memory_l0`.
+      self.compact_in_memory();
+      let run = Rc::clone(&self.in_memory_l0[0].batch);
+      // ... write_shard_streaming(dirfd, &name_c, run, false, flush_flags) →
+      //     add_shard(final_full, 0, current_lsn - 1) → in_memory_l0.clear() →
+      //     prepare_manifest() → FlushOutcome::Pending(FlushWork { manifest }).
   }
   ```
 
-  When the only dirt is compaction (empty memtable and `in_memory_l0`), the
-  barrier prepares a **manifest-only** publish: no new shard is written; the
-  prepared manifest reflects the compaction-swapped index, and the
-  fsync-every-referenced-file rule durably commits the (already-written,
-  unsynced) compaction outputs before the manifest rename. This case must also
-  clear the **second** Empty gate: after the gate above, `flush_prepare_with`
-  consolidates the memtable and returns `Empty` again on an empty snapshot
-  (`flush.rs`: `let snapshot = self.memtable.consolidate_for_flush(); if
-  snapshot.count == 0 { self.memtable.reset(); return
-  Ok(FlushOutcome::Empty); }`). For a compaction-only table the snapshot *is*
-  empty, so this second gate would swallow the publish exactly as the first would.
-  Route the `snapshot.count == 0 && has_pending_deletions()` case **past**
-  shard-writing straight to manifest preparation over the compaction-swapped
-  index (`ShardIndex::publish_manifest` / `build_manifest_entries`,
-  `shard_index/persist.rs`) instead of returning `Empty`. Truly clean tables
-  (all three empty) are skipped exactly as today's `Empty` path skips them.
+  Both the shard-writing path and the compaction-only path end in the same
+  no-pending `prepare_manifest` (a two-phase sibling of `publish_manifest`,
+  `persist.rs:135`: `build_manifest_entries` over the current index →
+  `manifest::prepare_file` to a `.tmp` → `PreparedManifest`), returning
+  `FlushOutcome::Pending` with only the manifest set (`shard_fd = None`,
+  `pending_shard = None`); they differ only in whether a shard was written and
+  registered first. `flush_commit` renames that manifest alone — the shard, if
+  any, is already at its final name via the one-shot write. The
+  fsync-every-referenced-file sweep durably syncs the new shard and the
+  already-written, unsynced compaction outputs before the manifest rename. Truly
+  clean tables (empty `in_memory_l0`, no pending deletions) return `Empty` exactly
+  as today's clean path skips them.
+
 ### DML found-row path learns the RAM tier
 
 `enforce_unique_pk` (`dag/mod.rs:1790,1823-1841`) is the one caller that
@@ -313,14 +366,15 @@ pub enum FoundSource {
   always 0 or 1 with strict insert/delete alternation, so "memtable-positive
   but globally dead" is unreachable — global-net arming makes tier-local
   netting subtleties moot rather than relying on that argument.
-- Each RAM run carries a **bloom filter**: inherited from the memtable at
-  snapshot push (the run *is* the memtable content;
-  `may_contain_pk`/`bloom_add_batch`, `memtable/lookup.rs:47-49`,
-  `memtable/runs.rs:54-58`) and rebuilt during a fold (one hashing pass over
-  rows the merge already touches). Store as
-  `in_memory_l0: Vec<InMemRun { batch: Rc<Batch>, bloom: BloomFilter }>` with
-  an accessor yielding the batches for cursor gathering, so
-  `open_cursor`/`gather_runs` are untouched. `scan_inmem` gates each run's
+- Each RAM run carries a **bloom filter**, built by a single
+  `InMemRun::from_batch(Rc<Batch>)` constructor — one hashing pass keyed exactly
+  like the memtable bloom (`pack_pk_be` of the OPK bytes, `memtable/lookup.rs:47-49`,
+  `memtable/runs.rs:54-58`), count-sized. The same constructor serves both the
+  snapshot push and the fold (the folded run is a fresh merge that cannot inherit
+  a bloom anyway). Store as
+  `in_memory_l0: Vec<InMemRun { batch: Rc<Batch>, bloom: BloomFilter }>` with an
+  accessor (`in_memory_runs`) yielding owned batch handles for cursor gathering,
+  so `open_cursor`/`gather_runs` are untouched. `scan_inmem` gates each run's
   binary search on its bloom. No per-run XOR8 and no per-run PK-uniqueness
   certificate: correctness never needs them, and `is_pk_unique = false` for
   Batch cursor sources (`read_cursor/mod.rs:190-194`) is the existing
@@ -329,8 +383,26 @@ pub enum FoundSource {
 ### Manifest V6 and conditional load for Rederive tables
 
 - Manifest header gains a `generation: u64` field → `VERSION_V6`
-  (`manifest.rs:33`). The generation is written at barrier publish;
+  (`manifest.rs:113-117`, written into the reserved header window at offset 40;
+  the header stays 64 bytes). The generation is written at barrier publish;
   `SalReplay` tables write it too (uniform format) but never check it.
+- **The write-side stamp reaches `manifest_header` without threading a parameter
+  through the LSM API.** `committed_generation` is a process-global `AtomicU64`
+  alongside `WORKER_RANK`/`NUM_WORKERS` in `foundation::worker_ctx` — workers are
+  single-threaded processes, so the existing atomic-static pattern fits (a
+  thread-local would not: the value is read deep inside `storage/lsm`, an L3
+  module that may depend on the L0 `worker_ctx`). It holds the current committed
+  generation at all times: set on the master when it bumps the generation
+  (checkpoint step 0), and on each worker from the `FLAG_FLUSH_EPH(gen)` group
+  header the instant the ephemeral round arrives, before `handle_flush_all`
+  iterates tables. `ShardIndex::manifest_header` (`shard_index/persist.rs:141`)
+  reads `worker_ctx::committed_generation()` into the V6 header. The same atomic,
+  set to the recovered value at fork, feeds the scratch tables'
+  `expected_generation` at compile time (below); a later live ephemeral round
+  overwriting it does not disturb an already-captured `expected_generation`.
+  Base/`SalReplay` flushes stamp whatever the atomic holds and never read it
+  back, so their stamped value is immaterial — no separate base-round generation
+  plumbing (e.g. a read from `_sequences` per flush) is needed.
 - `Table::new` gains `expected_generation: Option<u64>`: `None` for
   `SalReplay` tables (always load, as today); `Some(g)` for `Rederive`
   tables — load the manifest iff `manifest.generation == g` (then
@@ -372,7 +444,8 @@ the recovered values (`committed_generation`, `recorded_topology`); workers
 inherit them across the fork.
 
 Checkpoint validity is a **per-relation, all-or-nothing** verdict — never
-per-partition. A view's ephemeral state spans 256 output-store partitions plus
+per-partition. A view's ephemeral state spans its output-store partitions (256
+for a hashed store, `W` for a replicated one — see the enumeration below) plus
 every worker's operator-trace ("scratch") tables; loading some partitions from a
 generation-valid manifest while others start empty would let the whole-view
 backfill double-count the loaded partitions, because `backfill_view` re-derives
@@ -387,20 +460,45 @@ manifests alone — made sufficient by a **flush-ordering invariant**: the
 ephemeral round flushes a relation's trace/scratch tables **before** its
 authoritative output store(s) (§checkpoint sequence). Within a worker, an output
 manifest at generation `G` therefore implies that worker's traces for the
-relation are already durable at `G`; and since the master reads all 256
-output-partition manifests pre-fork, "every output partition at `G`" implies
-every worker completed both its trace and its output flush — a correct
-all-or-nothing verdict from one pre-fork scan, with no worker round-trip:
+relation are already durable at `G`; and since the master reads *every*
+output-partition manifest of the relation pre-fork (the enumeration below), "every
+output partition at `G`" implies every worker completed both its trace and its
+output flush — a correct all-or-nothing verdict from one pre-fork scan, with no
+worker round-trip:
 
 ```
 topology_valid  = recorded_topology == (launched_workers << 32 | STATE_FORMAT)
 relation_valid  = topology_valid
-                  && every authoritative output manifest of the relation exists
-                  && every one carries generation == committed_generation
+                  && for every output-partition path P of the relation (below):
+                       manifest(P) exists
+                       && manifest(P).generation == committed_generation
 ```
 
-The master evaluates `relation_valid` per view (over its 256 output partitions)
-and per master-built index, then broadcasts the invalid set as part of the
+**Enumerating a relation's output-partition paths follows its store shape
+(`Routing`), not its read-gather predicate.** The master reads the shape off its
+own pre-fork handle: a **hashed** output store (no replicated source) spans all
+256 partitions `{dir}/part_0/manifest.bin … part_255/manifest.bin`; a
+**replicated** output store (`Routing::Replicated`, built for any relation with a
+replicated source, `hooks.rs:194`) is homed one partition per worker at
+`part_{partition_range(w, W).0}` (`bootstrap.rs:26-35`: `chunk = 256 / W`,
+`start = w · chunk`), so it spans exactly `W` manifests —
+`{ part_{partition_range(w, W).0} : w ∈ 0..W }`, **not** 256 and **not**
+`part_0..part_{W-1}` (at `W=4` those are `part_0, part_64, part_128, part_192`).
+`W` is `launched_workers`, which `topology_valid` has already pinned to the
+checkpoint-time worker count, so the range-homed offsets the master enumerates
+match exactly what the workers flushed. This distinction is load-bearing in both
+directions: reading only `part_0` would miss the **distinct** per-worker slices of
+a replicated-*derived* view (partitioned ⋈ replicated: a replicated store shape
+but a union read), and enumerating `0..256` would flag `256 − W` non-existent
+partitions and force a needless rebuild every boot. The store-shape predicate is
+`PartitionedTable::is_replicated()` on the master's handle (or equivalently the
+relation's `has_replicated_source` = *any* source replicated), which is distinct
+from `relation_output_is_replicated` (= *all* sources replicated; that one gates
+single- vs union-read, not on-disk layout, `partition_lsn.rs:117`) — do not
+substitute one for the other.
+
+The master evaluates `relation_valid` per view (over its store-shape partition
+set) and per master-built index, then broadcasts the invalid set as part of the
 step-4 backfill coordination it already drives. The one verdict drives both
 sides: workers load a relation's scratch iff its verdict is valid and erase it
 otherwise, so output and scratch never disagree.
@@ -471,10 +569,11 @@ Boot sequence changes (in `runtime/bootstrap.rs` order):
 
 1. Master: catalog open + `replay_catalog` + system-table SAL replay as
    today, now also recovering `SEQ_ID_CHECKPOINT_GEN`/`SEQ_ID_TOPOLOGY`.
-   For each view (over its 256 output partitions) and each master-built index,
-   the master computes the per-relation `relation_valid` verdict (§validity):
-   valid → load every partition; invalid → erase the whole relation and mark it
-   for backfill (step 4). No relation is loaded partially. `backfill_index` runs
+   For each view (over its store-shape output-partition set — 256 for a hashed
+   store, the `W` range-homed offsets for a replicated one, §validity) and each
+   master-built index, the master computes the per-relation `relation_valid`
+   verdict (§validity): valid → load every partition; invalid → erase the whole
+   relation and mark it for backfill (step 4). No relation is loaded partially. `backfill_index` runs
    only for invalid index state (its existing flushed-shards scan plus the
    per-worker replay projection covers the tail exactly as today).
 2. Workers (post-fork): `recover_from_sal` replays FLAG_PUSH into base tables
@@ -660,6 +759,13 @@ Rust (unit/integration, `make test`):
   orphans GC'd. Compact-then-quiet: compact a table, leave its memtable and
   `in_memory_l0` empty, run a barrier, reopen — the manifest reflects the
   compacted index and every referenced shard exists.
+- **Barrier flush of an empty-memtable, populated-`in_memory_l0` table** (the
+  common post-overflow state): assert the fold-first gate writes the L0 shard and
+  the table reloads intact — it must NOT return `Empty` and drop the RAM tier.
+  Sibling gate cases in one test matrix: empty memtable + empty L0 +
+  `has_pending_deletions()` → the no-shard `prepare_manifest` publish (manifest
+  reflects the compaction-swapped index, no new shard); empty on all three →
+  `Empty`.
 - Barrier shard carries the PK-unique tag: barrier-flush a `unique_pk` base
   table with a live memtable+L0, read the shard header, assert
   `SHARD_FLAG_PK_UNIQUE` is set and the XOR8 filter is present (parity with the
@@ -686,6 +792,15 @@ E2E (pytest, `make e2e`, always `GNITZ_WORKERS=4`):
      directory reclaimed.
   5. graceful shutdown → restart: correct views, and assert no backfill ran
      (log marker), demonstrating instant resume.
+  6. **Replicated-view resume/rebuild** (the range-homed partition set, §validity):
+     a view over replicated base tables (`Routing::Replicated`, homed at
+     `part_{w·(256/W)}` per worker) — checkpoint → graceful restart resumes with
+     no backfill (asserts the master enumerates the `W` range-homed offsets, not
+     `part_0` alone and not `0..256`); then a variant where one worker's
+     partition manifest is corrupted/absent before restart must rebuild the whole
+     relation (no silent per-partition load). Include a replicated-*derived* view
+     (partitioned ⋈ replicated: replicated store shape, union read) so the
+     distinct per-worker slices are exercised, not identical copies.
 - Large-churn-tail recovery: fill the SAL near its checkpoint threshold with
   updates to a hot base table feeding a view, SIGKILL before checkpoint,
   restart, and assert (a) views correct and (b) peak worker RSS stays near
@@ -710,6 +825,12 @@ convert the O(base-through-circuits) rebuild into O(SAL-tail).
   released across the drain; Quiesce parking; Barrier servicing rule), and
   the stale `next_lsn` "reset on checkpoint" comment (`master/mod.rs:309-313`)
   gets fixed in passing since that section is being rewritten.
+- The `GNITZ_CHECKPOINT_BYTES` doc entry: note that deferred compaction cleanup
+  keeps superseded compaction inputs on disk until the next barrier, so peak disk
+  use carries a transient overhead bounded by one checkpoint interval's
+  spill-plus-compaction write volume (≤ the SAL threshold); a smaller
+  `GNITZ_CHECKPOINT_BYTES` tightens that bound at the cost of more frequent
+  durable writes.
 
 ---
 
@@ -722,41 +843,60 @@ directory fds as `OwnedFd`, and names compaction outputs collision-freely
 (persisted monotonic sequence + destination guard key) — the three properties the
 Design relies on.
 
-- [ ] 1. **DML RAM-tier readiness.** `FoundSource::InMemRun`, `scan_inmem`
-  consolidation, global-net-weight arming, extended
-  `get_weight_for_row_bytes`, per-run blooms (`InMemRun` struct), delete the
-  `debug_assert`. Rust unit tests. No behavior change for durable tables yet
-  (their L0 is still empty).
-- [ ] 2. **Lifecycle unification.** All ingest overflow → RAM-L0; delete
-  `force_ephemeral`/memonly and the ingest-reachable inline-fsync arm;
-  `current_lsn` bumps on every ingest; unified spill naming + real LSNs;
-  barrier flush (existing `handle_flush_all`) writes memtable+L0 as one
-  consolidated shard per dirty table; `Persistence` → `RecoverySource`
-  rename. E2E green proves recovery handles the wider replay window.
+- [x] 1. **DML RAM-tier readiness. DONE.** `in_memory_l0` is now `Vec<InMemRun>`
+  (per-run PK bloom); `FoundSource::InMemRun` + `scan_inmem` (candidates) + a
+  RAM-tier loop in `get_weight_for_row_bytes` make `retract_pk_bytes` arm the
+  live row by global net weight across memtable + RAM + shards. The
+  `debug_assert` is gone; durable base tables are unaffected until commit 2
+  fills their L0.
+- [x] 2. **Lifecycle unification. DONE.** Ingest overflow now lands in
+  `in_memory_l0` for **every** table (`current_lsn` bumps per ingest, feeding the
+  spill/barrier shard-naming floor). `force_ephemeral`/memonly, `flush_durable`,
+  `flush_prepare_with`, `flush_inner`, and `flush_seq` are gone; ingest overflow
+  routes through `flush_to_ram`. `flush_prepare` branches on `recovery_source`
+  (Rederive → `DoneInline`; SalReplay → fold memtable + L0 into one consolidated,
+  PK-unique-tagged shard behind a fold-first `in_memory_l0.is_empty()` clean-gate)
+  and `flush_commit` clears L0. Spills use the unified `shard_{tid}_{lsn}.db`
+  naming with real LSNs and are durable + PK-tagged for SalReplay tables (unsynced
+  + untagged for Rederive). `Persistence` is renamed
+  `RecoverySource {SalReplay, Rederive}` (open-time behavior unchanged).
+  System-table checkpoint flush goes through `flush()`. Base tables are durable
+  **only at the barrier** now — commit 3 defers the manifest publish and adds the
+  `!has_pending_deletions()` gate + fsync-every-referenced-file sweep (which lets
+  SalReplay spills revert to unsynced). E2E green proves recovery handles the
+  wider replay window.
 - [ ] 3. **No mid-epoch manifest publish.** Strip publish/cleanup from
   `compact_if_needed`; move manifest prepare/rename to the barrier;
   barrier fsyncs every manifest-referenced file by path; `pending_deletions`
   drains post-publish (safe because compaction output naming is reboot-stable and
-  collision-free, so deferred cleanup never unlinks a live shard). The Empty gate
-  gains the
-  `!has_pending_deletions()` term so a compacted-then-quiet table still
-  publishes (manifest-only when memtable and L0 are empty), routing the
-  empty-snapshot-but-`has_pending_deletions()` case past the second `count == 0`
-  gate to a manifest-only publish. Barrier shards carry the PK-unique tag
+  collision-free, so deferred cleanup never unlinks a live shard). The barrier
+  `flush_prepare` folds the residual memtable into `in_memory_l0` **first**, then
+  applies a single clean-gate `in_memory_l0.is_empty() && !has_pending_deletions()`
+  — so a table with an empty memtable but a populated L0 (the common post-overflow
+  state) writes its L0 shard instead of being swallowed by a memtable-only gate,
+  and a compacted-then-quiet table (empty L0, pending deletions) takes the
+  no-shard `prepare_manifest` publish path. Barrier shards carry the PK-unique tag
   (`PkUniqueChecker`, gated on `can_tag_pk_unique`), not the spill path's `0`.
-  Crash-sim compaction test: compact-then-quiet reopen — the manifest reflects
-  the compacted index and every referenced shard exists.
+  Tests: (a) barrier-flush a table with empty memtable + populated `in_memory_l0`
+  and assert the L0 shard is written and reloads intact (not `Empty`); (b)
+  crash-sim compact-then-quiet reopen — the manifest reflects the compacted index
+  and every referenced shard exists.
 - [ ] 4. **Checkpoint records + manifest V6 + three-step sequence.**
   `SEQ_ID_CHECKPOINT_GEN`/`SEQ_ID_TOPOLOGY` + `recover_sequences` arms +
-  `STATE_FORMAT`; manifest V6 with generation; `FLAG_FLUSH_EPH` wire
-  constant + `handle_flush_all(mode)` split + `VmHandle.owned_tables`
-  iterator; committer sequence becomes gen-bump → base round → drain →
-  ephemeral round; boot and graceful shutdown run the sequence. Rederive
+  `STATE_FORMAT`; manifest V6 with generation, stamped via the
+  `worker_ctx::committed_generation` process-global atomic (set on the master at
+  gen-bump and on each worker from the `FLAG_FLUSH_EPH(gen)` header, read by
+  `ShardIndex::manifest_header`); `FLAG_FLUSH_EPH` wire constant +
+  `handle_flush_all(mode)` split + `VmHandle.owned_tables` iterator; committer
+  sequence becomes gen-bump → base round → drain → ephemeral round; boot and
+  graceful shutdown run the sequence. Rederive
   manifests are now written and stamped but still erased at open (no reload
   yet) — state is discarded exactly as today, so behavior is unchanged.
 - [ ] 5. **Recovery reload + windowed pre-live tick drive.** Conditional
   manifest load for Rederive tables (master stores from the pre-fork per-view
-  verdict; worker compile-time scratch from fork-inherited `committed_generation`);
+  verdict, enumerated over the relation's store-shape partition set — 256 for a
+  hashed store, the `W` range-homed offsets for a replicated one; worker
+  compile-time scratch from fork-inherited `committed_generation`);
   `replay_ingest` keeps effective deltas → worker buffering; delete the boot
   flush; **master-planned byte-balanced LSN windows** (header-only pre-fork walk,
   `RECOVERY_DRAIN_BYTES`) driven as broadcast-window → resumable per-window
