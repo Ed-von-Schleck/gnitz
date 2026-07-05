@@ -394,48 +394,6 @@ impl CatalogEngine {
         }
     }
 
-    /// Phase 1 across a table family. System tables flush inline (legacy
-    /// path; they checkpoint during DDL, not at `flush_all`).
-    pub fn flush_family_prepare(&mut self, table_id: i64) -> Result<Vec<(usize, crate::storage::FlushWork)>, String> {
-        if table_id < FIRST_USER_TABLE_ID {
-            if let Some(table) = self.sys_table_mut(table_id) {
-                table.flush().map_err(|e| format!("flush error: {e}"))?;
-                table
-                    .compact_if_needed()
-                    .map_err(|e| format!("compaction error: {e:?}"))?;
-            }
-            Ok(Vec::new())
-        } else {
-            self.dag.flush_prepare(table_id)
-        }
-    }
-
-    /// Phase 3 across a table family. Returns the owned dir fds to fsync.
-    pub fn flush_family_commit_batch(
-        &mut self,
-        table_id: i64,
-        works: Vec<(usize, crate::storage::FlushWork)>,
-    ) -> Result<Vec<std::os::fd::OwnedFd>, String> {
-        if table_id < FIRST_USER_TABLE_ID {
-            // System tables commit inline; no FlushWork should arrive here.
-            debug_assert!(works.is_empty());
-            Ok(Vec::new())
-        } else {
-            self.dag.flush_commit_batch(table_id, works)
-        }
-    }
-
-    /// Drain a user family's deferred compaction deletions after the barrier
-    /// republished its manifests over the compacted index. Called by the worker
-    /// post-publish, strictly after the family's dir fsyncs. System tables drain
-    /// inline in `flush()` (their inputs stay durable meanwhile), so this is a
-    /// no-op for them.
-    pub fn drain_family_deletions(&mut self, table_id: i64) {
-        if table_id >= FIRST_USER_TABLE_ID {
-            self.dag.drain_family_deletions(table_id);
-        }
-    }
-
     /// Worker DDL sync: ingest into system table + fire hooks. Workers receive
     /// DDL deltas from master and update their registry; durability is
     /// master-side (fsynced SAL + the master's own system-table flush). The
@@ -451,7 +409,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("Unknown system table_id {table_id}"))?;
         // Propagate into the worker's DdlSync-fatal path (dispatch treats a
         // DdlSync error as fatal: STATUS_ERROR + shutdown + _exit, which the
-        // master's worker_watcher turns into a cluster abort). A swallowed
+        // master's watchdog turns into a cluster abort). A swallowed
         // storage failure here diverges this worker's catalog from the master.
         table
             .ingest_owned_batch(batch)

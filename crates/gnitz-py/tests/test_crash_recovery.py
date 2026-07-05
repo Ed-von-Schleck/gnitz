@@ -1006,7 +1006,7 @@ def test_ingest_apply_error_aborts_and_replays(inject, with_index):
     ACKed rows the old code silently lost must come back via SAL replay.
 
     Phase 2 arms the seam and INSERTs: the owning worker aborts inside
-    ingest_store_and_indices, the master's worker_watcher turns the dead worker
+    ingest_store_and_indices, the master's watchdog turns the dead worker
     into a cluster shutdown. Phase 3 boots clean and every inserted PK is present
     — the load-bearing assertion (the un-flushed PUSH zone stayed above the
     watermark and was replayed)."""
@@ -1048,7 +1048,7 @@ def test_ingest_apply_error_aborts_and_replays(inject, with_index):
             conn.close()
         except Exception:
             pass
-        # The seam aborts the owning worker; worker_watcher detects the dead
+        # The seam aborts the owning worker; the watchdog detects the dead
         # worker, reports it, and fans it into a graceful cluster shutdown (the
         # master then exits 0). The proof the abort fired: the process terminated
         # (not hung) and the master reported the crash.

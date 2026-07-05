@@ -70,6 +70,19 @@ def _crash_and_restart(proc, sock_path, data_dir, workers=None, extra_env=None):
     return _start_server(data_dir, sock_path, workers=workers, extra_env=extra_env)
 
 
+def _graceful_stop_server(proc, timeout=30):
+    """SIGTERM the *master only* (not the process group), so its shutdown watcher
+    can drive a final checkpoint (needs live workers to ACK the flush) before it
+    broadcasts FLAG_SHUTDOWN to the workers and exits. Returns the master's exit
+    code; raises on hang (a non-terminating master fails the liveness assertion)."""
+    try:
+        os.kill(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=timeout)
+    return proc.returncode
+
+
 def test_table_data_survives_restart():
     """Create table + insert rows, stop server, restart, verify rows survive."""
     tmpdir = tempfile.mkdtemp(
@@ -230,6 +243,63 @@ def test_view_survives_restart():
             f"post-restart: expected neg_val=-100, got {rows[2]['neg_val']}"
         )
 
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_graceful_shutdown_smoke():
+    """Liveness smoke test for the graceful-shutdown path (commit 2): a SIGTERM
+    to the master must drive a final checkpoint and exit cleanly (rc 0, no hang),
+    and a restart must yield correct views. Reload is not wired yet, so the views
+    resume via the (unchanged) rebuild path — this only asserts the signal path
+    is live, not that backfill is skipped (that is a commit-3 assertion)."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"),
+        prefix="gnitz_graceful_",
+    )
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("gs")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name="gs",
+        )
+        conn.execute_sql(
+            "CREATE VIEW v AS SELECT pk, val * -1 AS neg_val FROM t",
+            schema_name="gs",
+        )
+        conn.execute_sql("INSERT INTO t VALUES (1, 42)", schema_name="gs")
+        vid, _ = conn.resolve_table("gs", "v")
+        assert len(conn.scan(vid)) >= 1, "pre-shutdown: view should have rows"
+        conn.close()
+
+        # Graceful shutdown: SIGTERM the master. It must exit cleanly without
+        # hanging (a hang raises TimeoutExpired from proc.wait).
+        rc = _graceful_stop_server(proc)
+        assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}"
+
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # Restart: views must be correct (rebuilt) for both the pre-shutdown row
+        # and a freshly pushed one.
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vid2, _ = conn.resolve_table("gs", "v")
+        conn.execute_sql("INSERT INTO t VALUES (2, 100)", schema_name="gs")
+        rows = {r["pk"]: r for r in conn.scan(vid2) if r.weight > 0}
+        assert 1 in rows and rows[1]["neg_val"] == -42, (
+            f"post-restart: pre-shutdown row wrong, got {rows}"
+        )
+        assert 2 in rows and rows[2]["neg_val"] == -100, (
+            f"post-restart: new row wrong, got {rows}"
+        )
         conn.close()
         _stop_server(proc)
     finally:

@@ -69,24 +69,43 @@ on wake; master never CAS-clears. Master on all-rings-idle:
 `MASTER_PARKED` set → `FUTEX_WAITV` → cleared on wake.
 
 **Worker death** — a dead worker parked on `writer_seq` is not a
-liveness hazard: `executor::worker_watcher` polls
+liveness hazard: `executor::watchdog` polls
 `MasterDispatcher::check_workers` (a `waitpid`-based crash probe) and
 triggers `shutdown_workers` + `request_shutdown`. Symmetric master
 death: the worker side polls `getppid` in `worker_main` and exits if
 the master's PID changes. FUTEX contracts inherit this abort semantic
 — no per-contract liveness claim.
 
-**Checkpoint exclusivity** — committer is the sole checkpoint driver:
-`FLAG_FLUSH` → ACKs → `flush_all_system_tables` → `checkpoint_reset`. No
-concurrent SAL writer permitted in that window. `maybe_checkpoint` must not
-be called from `fan_out_*_async`, `tick_loop_async`,
-`execute_pipeline_async`, `broadcast_ddl`, or `single_worker_async`.
+**Checkpoint exclusivity** — committer is the sole steady-state checkpoint
+driver, now a three-step sequence (`run_checkpoint_sequence`): step 0 bumps the
+checkpoint generation (lock-free); step 1 is the **base round** (`FLAG_FLUSH` →
+ACKs → `checkpoint_post_ack`); step 2 **drains** the dirty views (a
+`TickTrigger::Drain` then `TickTrigger::Quiesce`, lock released so the tick task
+can acquire it per tick); step 3 is the **ephemeral round** (`FLAG_FLUSH_EPH` →
+ACKs → bare `checkpoint_reset`) that persists view trace/output state stamped
+with the generation. No concurrent SAL writer is permitted inside any round.
+`maybe_checkpoint`/`do_checkpoint` must not be called from `fan_out_*_async`,
+`tick_loop_async`, `execute_pipeline_async`, `broadcast_ddl`, or
+`single_worker_async` — the committer sequence (or boot-end `boot_checkpoint`,
+pre-reactor) owns SAL checkpoint exclusivity.
 
-`sal_writer_excl` must be held for the **entire** checkpoint sequence (write
-+ ACK wait + `checkpoint_post_ack`). Releasing it before the await would let
-concurrent writers write SAL groups with the old epoch; workers skip
-mismatched epochs, and `checkpoint_post_ack` then resets `write_cursor` to 0,
-permanently orphaning those groups and hanging the writers.
+`sal_writer_excl` is held for the **entire** window of **each round** (write +
+ACK wait + reset), but **released across the step-2 drain** (which acquires it
+per tick). Releasing it before a round's await would let concurrent writers
+write SAL groups with the old epoch; workers skip mismatched epochs, and the
+round's reset then orphans those groups and hangs the writers.
+
+**Drain-window servicing.** While the committer awaits a Drain `done` /
+Quiesce `acked` (`await_servicing`), it keeps the SAL live: a **Reclaim**
+Barrier (relay-space) is serviced by a reclaim-only base round (no gen
+re-bump) so `relay_loop` can refill space; the triggering reclaim barriers are
+signaled **right after step 1** (before the drain) to avoid a relay deadlock;
+**Ddl**/**Shutdown** Barriers are deferred to sequence end (servicing a DDL
+mid-sequence would interleave a CREATE VIEW's reactor-parked backfill); pushes
+stay queued and fold into the post-sequence commit. The **quiesce** parks the
+tick loop across the ephemeral round so no tick runs during the view flush.
+Graceful shutdown sends one **Shutdown** Barrier, which both forces the full
+sequence for its batch and resolves only at sequence end.
 
 **SAL-writer mutex** — `sal_writer_excl: Rc<AsyncMutex<()>>` serialises
 tick, commit, DDL, relay, and all read-only fan-out SAL emissions (seek,

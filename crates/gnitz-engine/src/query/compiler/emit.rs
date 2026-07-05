@@ -113,13 +113,17 @@ pub(super) fn create_child_table(
     // Track the path before creating so cleanup also removes a partially
     // created directory if Table::new fails.
     state.scratch_dirs.push(child_dir.clone());
+    // `RederiveCheckpointed`: the ephemeral checkpoint round force-persists
+    // these view operator-trace tables with generation-stamped manifests.
+    // `create_child_table` is reached only from view-plan compilation, never
+    // index-circuit compilation (index tables stay plain `Rederive`).
     Table::new(
         &child_dir,
         child_name,
         schema,
         table_id,
         256 * 1024,
-        RecoverySource::Rederive,
+        RecoverySource::RederiveCheckpointed,
     )
 }
 

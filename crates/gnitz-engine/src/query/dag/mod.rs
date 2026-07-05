@@ -7,9 +7,7 @@ use crate::ops;
 use crate::query::compiler::{self, CompileOutput, ExternalTable, SubPlan};
 use crate::query::vm;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{
-    Batch, CursorHandle, FlushOutcome, FlushWork, PartitionedTable, RecoverySource, StorageError, Table,
-};
+use crate::storage::{Batch, CursorHandle, PartitionedTable, RecoverySource, StorageError, Table};
 use gnitz_wire::PkColList;
 
 mod store_handle;
@@ -121,13 +119,14 @@ const _: () = assert!(std::mem::size_of::<RelationKind>() == 1);
 
 impl RelationKind {
     /// How this relation's tail is recovered. `SalReplay` kinds load shards from
-    /// the manifest and replay the SAL tail; `Rederive` kinds erase on open and
-    /// are rebuilt from their sources.
+    /// the manifest and replay the SAL tail; view output stores are
+    /// `RederiveCheckpointed` — erased on open and rebuilt today, but persisted
+    /// with generation-stamped manifests by the ephemeral checkpoint round.
     #[inline]
     pub fn recovery_source(self) -> RecoverySource {
         match self {
             RelationKind::SystemCatalog | RelationKind::BaseTable { .. } => RecoverySource::SalReplay,
-            RelationKind::View => RecoverySource::Rederive,
+            RelationKind::View => RecoverySource::RederiveCheckpointed,
         }
     }
 
@@ -502,7 +501,7 @@ impl DagEngine {
             debug_assert!(
                 self.tables
                     .get(&view_id)
-                    .is_none_or(|e| e.kind.recovery_source() == RecoverySource::Rederive),
+                    .is_none_or(|e| e.kind.recovery_source() != RecoverySource::SalReplay),
                 "distributed backfill into durable relation {view_id}: \
                  would double-count loaded shards",
             );
@@ -1175,63 +1174,79 @@ impl DagEngine {
         }
     }
 
-    /// Phase 1 of two-phase flush. Walks the table handle and any index
-    /// circuits, returning the FlushWorks the caller must drive through
-    /// the io_uring fdatasync batch and Phase 3.
+    /// Collect the tables the base checkpoint round (`FLAG_FLUSH`) flushes:
+    /// every registered user relation's partitions plus its index-circuit
+    /// tables. System tables (`StoreHandle::Borrowed`) are skipped — workers
+    /// never barrier-flush their inherited `_sys` copies. `SalReplay` partitions
+    /// publish (`Pending`); rederived partitions and index tables fold to RAM
+    /// (`DoneInline`), which the generic flush loop consumes.
     ///
-    /// Index circuits are non-durable, so they execute their inline shard
-    /// write here and contribute nothing to the returned Vec.
-    pub fn flush_prepare(&mut self, table_id: i64) -> Result<Vec<(usize, FlushWork)>, String> {
-        let entry = match self.tables.get_mut(&table_id) {
-            Some(e) => e,
-            None => return Ok(vec![]),
-        };
-        let works = entry
-            .handle
-            .flush_prepare()
-            .map_err(|_| format!("flush_prepare failed for table_id={table_id}"))?;
-        for ic in &mut entry.index_circuits {
-            // Index tables are created Ephemeral, so this is an inline write
-            // that returns DoneInline/Empty and resets the memtable. A Pending
-            // means a durable index table snuck in — reject it.
-            match ic.table_mut().flush_prepare() {
-                Ok(FlushOutcome::Empty) | Ok(FlushOutcome::DoneInline) => {}
-                Ok(FlushOutcome::Pending(_)) => {
-                    return Err(format!(
-                        "index flush_prepare unexpectedly returned Pending for table_id={table_id}"
-                    ));
+    /// Same `*mut Table` validity argument as `collect_ephemeral_flush_tables`
+    /// below.
+    pub(crate) fn collect_base_flush_tables(&mut self) -> Vec<*mut Table> {
+        let mut out: Vec<*mut Table> = Vec::new();
+        for entry in self.tables.values_mut() {
+            if let Some(pt) = entry.handle.as_partitioned_mut() {
+                for t in pt.partitions_mut() {
+                    out.push(t as *mut Table);
                 }
-                Err(_) => {
-                    return Err(format!("index flush_prepare failed for table_id={table_id}"));
+            }
+            for ic in &mut entry.index_circuits {
+                out.push(ic.table_mut() as *mut Table);
+            }
+        }
+        out
+    }
+
+    /// Collect the tables the ephemeral checkpoint round force-persists, in two
+    /// disjoint sets: (1) every compiled view plan's operator-trace tables, and
+    /// (2) every view's output-store partitions. The worker flushes set 1 fully
+    /// durable before set 2 (the flush-ordering invariant: any output manifest at
+    /// generation G implies that view's traces are durable at G).
+    ///
+    /// Returned as raw `*mut Table` — owned trace tables are not in `self.tables`
+    /// so they cannot be keyed by `tid`, and the engine already passes
+    /// `*mut Table`. Valid because the worker flush handler is a synchronous `fn`
+    /// on a single-threaded process: no reactor yield and no concurrent
+    /// `cache`/`tables` mutation, so the partition set is frozen for the flush.
+    /// `cache` and `tables` are separate fields (clean disjoint borrow) and the
+    /// two sets are disjoint allocations (scratch dirs vs the view dir). Index
+    /// tables are excluded: they live in `TableEntry::index_circuits`, not the
+    /// plan cache, and stay erase-at-boot.
+    pub(crate) fn collect_ephemeral_flush_tables(&mut self) -> (Vec<*mut Table>, Vec<*mut Table>) {
+        fn collect_vm(vm: &mut vm::VmHandle, out: &mut Vec<*mut Table>) {
+            // Null owned cursors before the fold so none holds a stale snapshot.
+            vm.null_owned_cursors();
+            for owned in vm.owned_tables.iter_mut() {
+                out.push(&mut **owned as *mut Table);
+            }
+        }
+
+        let mut traces: Vec<*mut Table> = Vec::new();
+        for plan in self.cache.values_mut() {
+            collect_vm(&mut plan.pre.vm, &mut traces);
+            if let Some(post) = plan.post.as_mut() {
+                collect_vm(&mut post.vm, &mut traces);
+            }
+            if let Some(sb) = plan.side_b.as_mut() {
+                collect_vm(&mut sb.plan.vm, &mut traces);
+            }
+        }
+
+        let mut outputs: Vec<*mut Table> = Vec::new();
+        for entry in self.tables.values() {
+            if entry.kind != RelationKind::View {
+                continue;
+            }
+            // Views are always `Partitioned`; a replicated view holds exactly its
+            // one worker-owned partition (no `part_0`-only miss).
+            if let Some(pt) = entry.handle.as_partitioned_mut() {
+                for t in pt.partitions_mut() {
+                    outputs.push(t as *mut Table);
                 }
             }
         }
-        Ok(works)
-    }
-
-    /// Phase 3 of two-phase flush. Returns one owned dir fd per partition
-    /// committed.
-    pub fn flush_commit_batch(
-        &mut self,
-        table_id: i64,
-        works: Vec<(usize, FlushWork)>,
-    ) -> Result<Vec<std::os::fd::OwnedFd>, String> {
-        let entry = match self.tables.get_mut(&table_id) {
-            Some(e) => e,
-            None => return Ok(vec![]),
-        };
-        entry
-            .handle
-            .flush_commit_batch(works)
-            .map_err(|_| format!("flush_commit_batch failed for table_id={table_id}"))
-    }
-
-    /// Drain a table's deferred compaction deletions post-publish. Best-effort
-    /// (like `try_cleanup`); a still-present shard is retried next barrier.
-    pub fn drain_family_deletions(&mut self, table_id: i64) {
-        if let Some(entry) = self.tables.get_mut(&table_id) {
-            entry.handle.drain_deletions();
-        }
+        (traces, outputs)
     }
 
     // ── DAG traversal helpers ───────────────────────────────────────────
@@ -1737,7 +1752,7 @@ impl DagEngine {
     /// fault to surface. Continuing would drop the delta and permanently desync
     /// the view's integral (and in multi-worker, a skipped exchange round
     /// deadlocks the cluster), so we fail stop. In multi-worker the master's
-    /// `worker_watcher` reaps the exited worker and tears the tick down;
+    /// `watchdog` reaps the exited worker and tears the tick down;
     /// single-worker exits the process. If a recoverable (data/query-level) VM
     /// error is ever introduced, it must be a distinct code routed to
     /// transaction-level failure — never funneled here.

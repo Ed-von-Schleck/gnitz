@@ -541,6 +541,16 @@ operations — view ticks, scans, seeks, backfills, validation queries —
 wake the workers without it, since a lost command needs no recovery
 (base-table data is intact and views are re-derived).
 
+The **checkpoint** is the sole shard-durability point: between checkpoints no
+table publishes a manifest on the ingest path, so the fsynced SAL alone carries
+durability and every table's overflow lives in the RAM tier. A steady-state
+checkpoint runs **two flush rounds** — a base round (`FLAG_FLUSH`, `SalReplay`
+base + system tables) and, after draining pending view ticks, an ephemeral round
+(`FLAG_FLUSH_EPH`) that persists every view's operator-trace tables and output
+stores, stamping each manifest with a monotonic checkpoint generation. Views are
+still erase-and-rebuilt at open today; generation-valid checkpoint reload is a
+later change. Secondary indexes are always rebuilt at open.
+
 ## Benchmarking
 
 ```bash

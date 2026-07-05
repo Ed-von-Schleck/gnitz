@@ -162,12 +162,25 @@ impl Table {
     /// renames the manifest alone.
     pub fn flush_prepare(&mut self) -> Result<FlushOutcome, StorageError> {
         self.found_source = FoundSource::None;
-        if self.recovery_source == RecoverySource::Rederive {
+        if self.recovery_source != RecoverySource::SalReplay {
             self.flush_to_ram()?;
             return Ok(FlushOutcome::DoneInline);
         }
+        self.prepare_persist()
+    }
 
-        // SalReplay barrier flush: fold-first, then gate, then one shard.
+    /// The force-persist body shared by the base barrier round and the ephemeral
+    /// checkpoint round: fold the memtable into the RAM tier, gate on the three
+    /// disjuncts, then commit one folded net-state shard and stage the manifest.
+    /// The tier is published iff it holds new state (`in_memory_l0` non-empty
+    /// after the fold), OR the index carries unpublished/unsynced spills
+    /// (`has_unsynced` — else the checkpoint's global SAL reset would drop
+    /// acknowledged rows), OR compaction has superseded files since the last
+    /// publish (`has_pending_deletions` — else the deferred drain would unlink
+    /// files the surviving manifest still references). When none hold the tier is
+    /// `Empty`. Callers reset `found_source` before invoking (the fold reads it).
+    fn prepare_persist(&mut self) -> Result<FlushOutcome, StorageError> {
+        // Fold-first, then gate, then one shard.
         self.fold_memtable_into_l0();
         self.compact_in_memory();
 
@@ -191,6 +204,18 @@ impl Table {
             .collect::<Result<Vec<_>, _>>()?;
         let manifest = self.prepare_manifest_tmp()?;
         Ok(FlushOutcome::Pending(FlushWork { sync_paths, manifest }))
+    }
+
+    /// Phase 1 of the **ephemeral** checkpoint round: force-persist this table's
+    /// RAM tier to a durable, generation-stamped shard + manifest regardless of
+    /// `recovery_source`. Used for the `RederiveCheckpointed` view operator-trace
+    /// tables and output stores the ephemeral round persists (their manifests are
+    /// stamped with the checkpoint generation via
+    /// `worker_ctx::committed_generation`). The retained three-disjunct gate
+    /// means a table dirtied only by deferred compaction still republishes.
+    pub fn flush_prepare_ephemeral(&mut self) -> Result<FlushOutcome, StorageError> {
+        self.found_source = FoundSource::None;
+        self.prepare_persist()
     }
 
     /// Commit the RAM tier's single folded net-state run (left by

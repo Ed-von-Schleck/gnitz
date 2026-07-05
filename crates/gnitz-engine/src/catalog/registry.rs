@@ -265,6 +265,46 @@ impl CatalogEngine {
         let e = self.user_sequences.entry(seq_id).or_insert(0);
         *e = (*e).max(high_water);
     }
+
+    // -- Checkpoint records -------------------------------------------------
+
+    /// Bump the committed checkpoint generation, durably record it in
+    /// `_sequences` (seq id 4), and publish it to `worker_ctx` so every manifest
+    /// this master publishes from now on carries the new stamp. Returns the new
+    /// generation. Synchronous (memtable ingest + blocking flush), so it runs as
+    /// an atomic block between the committer's checkpoint steps with no
+    /// interleaving. From this instant every existing Rederive manifest is stale;
+    /// a crash below rebuilds views instead of silently staleifying them.
+    pub fn bump_checkpoint_generation(&mut self) -> u64 {
+        let new = self.committed_generation + 1;
+        // Retract the old high-water, insert the new. On the first bump the
+        // retract of a non-existent (4, 0) row nets to zero (seed-on-first-use).
+        // `advance_sequence` fatal-aborts on ingest failure.
+        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, self.committed_generation as i64, new as i64);
+        self.committed_generation = new;
+        crate::foundation::worker_ctx::set_committed_generation(new);
+        // The row must be shard-durable before the SAL reset that follows
+        // discards the memtable copy. A flush failure here is fatal: resetting
+        // the SAL on a swallowed failure destroys the only durable copy.
+        if let Err(e) = self.flush_all_system_tables() {
+            crate::gnitz_fatal_abort!("checkpoint generation flush failed: {} — aborting before SAL reset", e);
+        }
+        new
+    }
+
+    /// Record the cluster topology (`worker_count << 32 | STATE_FORMAT`) in
+    /// `_sequences` (seq id 5). Idempotent: a same-topology restart already
+    /// holds the current value, so the write is skipped. Does not flush — the
+    /// sole caller (`boot_checkpoint`) bumps the checkpoint generation right
+    /// after, and that flush carries this row to the same shard.
+    pub fn record_topology(&mut self, worker_count: u32) {
+        let value = ((worker_count as u64) << 32) | crate::storage::STATE_FORMAT as u64;
+        if self.recorded_topology == value {
+            return;
+        }
+        self.advance_sequence(SEQ_ID_TOPOLOGY, self.recorded_topology as i64, value as i64);
+        self.recorded_topology = value;
+    }
 }
 
 /// Raise a monotonic catalog id counter so the next allocation lands strictly

@@ -26,7 +26,7 @@ use crate::catalog::{
     SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
 };
 use crate::foundation::posix_io::guard_panic;
-use crate::runtime::committer::{self, CommitRequest};
+use crate::runtime::committer::{self, BarrierKind, CommitRequest};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{first_worker_error_opt, MasterDispatcher};
 use crate::runtime::peer::Peer;
@@ -108,6 +108,10 @@ pub struct Shared {
     tick_tids: Rc<RefCell<Vec<i64>>>,
     t_last_push: Rc<Cell<Option<Instant>>>,
     table_locks: RefCell<FxHashMap<i64, Rc<AsyncMutex<()>>>>,
+    /// Set true by the graceful-shutdown watcher before it sends the final
+    /// Shutdown barrier, so `handle_message`'s push path rejects new pushes
+    /// — none may commit after the final checkpoint's view flush.
+    draining: Rc<Cell<bool>>,
 }
 
 impl Shared {
@@ -221,7 +225,9 @@ impl ServerExecutor {
         // FLAG_EXCHANGE accumulator can hand off completed views.
         reactor.attach_relay_tx(relay_tx);
 
-        let auto_tick_tx = tick_tx.clone();
+        // Graceful-shutdown push gate (reactor-thread-only).
+        let draining = Rc::new(Cell::new(false));
+
         let committer_shared = Rc::new(committer::Shared {
             reactor: Rc::clone(&reactor),
             disp_ptr: dispatcher,
@@ -231,10 +237,8 @@ impl ServerExecutor {
             num_workers,
             tick_rows: Rc::clone(&tick_rows),
             tick_tids: Rc::clone(&tick_tids),
-            fire_auto_tick: Rc::new(move || {
-                auto_tick_tx.send(TickTrigger::Auto);
-            }),
             t_last_push: Rc::clone(&t_last_push),
+            tick_tx: tick_tx.clone(),
         });
         let shared = Rc::new(Shared {
             reactor: Rc::clone(&reactor),
@@ -251,13 +255,18 @@ impl ServerExecutor {
             tick_tids: Rc::clone(&tick_tids),
             t_last_push: Rc::clone(&t_last_push),
             table_locks: RefCell::new(FxHashMap::default()),
+            draining: Rc::clone(&draining),
         });
+
+        // Catch SIGTERM/SIGINT so the watchdog can drive a final checkpoint
+        // before exiting.
+        install_shutdown_signal_handlers();
 
         reactor.spawn(committer::run(committer_rx, committer_shared));
         reactor.spawn(accept_loop(Rc::clone(&shared)));
         reactor.spawn(tick_loop_async(Rc::clone(&shared), tick_rx));
         reactor.spawn(relay_loop(Rc::clone(&shared), relay_rx));
-        reactor.spawn(worker_watcher(Rc::clone(&shared)));
+        reactor.spawn(watchdog(Rc::clone(&shared)));
 
         reactor.block_until_shutdown();
         0
@@ -352,15 +361,77 @@ async fn run_hello_handshake(peer: &Peer, data: &[u8]) -> HelloOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// Worker-crash watcher
+// Watchdog: worker crashes + graceful shutdown (SIGTERM / SIGINT)
 // ---------------------------------------------------------------------------
 
-async fn worker_watcher(shared: Rc<Shared>) {
+/// Set by the SIGTERM/SIGINT handler; polled by `watchdog`. A plain
+/// `AtomicBool` store is async-signal-safe (unlike touching the reactor-thread
+/// `Cell` flags), so the handler does nothing but flip this.
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Install async-signal-safe handlers for SIGTERM and SIGINT. The handler only
+/// flips `SHUTDOWN_REQUESTED`; all real work happens on the reactor thread in
+/// `watchdog`. `SA_RESTART` lets an interrupted `io_uring_enter` restart
+/// itself, so the signal never surfaces an EINTR error to the reactor — the
+/// watchdog's 100 ms timer picks up the flag.
+fn install_shutdown_signal_handlers() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handle_shutdown_signal as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+}
+
+/// One 100 ms reactor-timer poll loop with two terminal duties: worker-crash
+/// detection (broadcast FLAG_SHUTDOWN, stop the reactor) and graceful shutdown
+/// on SIGTERM/SIGINT — stop admitting pushes, run one final full checkpoint
+/// through the committer (drain + persist while the reactor is still live),
+/// then broadcast FLAG_SHUTDOWN and request reactor shutdown so `server_main`
+/// exits cleanly. A signalfd fd-await would need new reactor machinery; the
+/// timer poll is the established pattern.
+async fn watchdog(shared: Rc<Shared>) {
     loop {
         shared
             .reactor
             .timer(Instant::now() + Duration::from_millis(WORKER_WATCH_MS))
             .await;
+
+        if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            gnitz_info!("shutdown signal received; draining, checkpointing, and stopping");
+
+            // 1. Stop admitting new pushes (none may commit after the final
+            //    flush).
+            shared.draining.set(true);
+
+            // 2. One final full checkpoint through the committer. The Shutdown
+            //    barrier forces the whole sequence and is deferred to its end,
+            //    so `done` resolves only after the base + drain + ephemeral
+            //    rounds complete. A just-pushed delta may still sit in
+            //    `pending_deltas` (the tick-coalesce window not yet fired), so
+            //    the drain inside the sequence is load-bearing.
+            let (tx, rx) = oneshot::channel::<()>();
+            shared.committer_tx.send(CommitRequest::Barrier {
+                kind: BarrierKind::Shutdown,
+                done: tx,
+            });
+            let _ = rx.await;
+
+            // 3. Workers flush + _exit, then stop the reactor
+            //    (block_until_shutdown returns and server_main exits 0). The
+            //    reactor/W2M receiver stays live throughout, so no `w2m()`
+            //    handle dangles.
+            shared.disp().shutdown_workers();
+            shared.reactor.request_shutdown();
+            return;
+        }
+
         let crashed = shared.disp().check_workers();
         if crashed >= 0 {
             let base_dir = shared.cat().base_dir.clone();
@@ -614,7 +685,10 @@ async fn relay_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<PendingRelay>) {
             }
             gnitz_warn!("SAL space low before exchange relay; triggering checkpoint");
             let (tx, rx_done) = oneshot::channel();
-            shared.committer_tx.send(CommitRequest::Barrier { done: tx });
+            shared.committer_tx.send(CommitRequest::Barrier {
+                kind: BarrierKind::Reclaim,
+                done: tx,
+            });
             let _ = rx_done.await;
             reclaimed = true;
         }
@@ -891,6 +965,14 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
         .await
         {
             send_error(peer, target_id, client_id, e.as_bytes()).await;
+            return;
+        }
+
+        // Graceful shutdown in flight: reject so no push commits after the final
+        // checkpoint's view flush. The client sees a clean error and can retry
+        // against the restarted server.
+        if shared.draining.get() {
+            send_error(peer, target_id, client_id, b"server shutting down").await;
             return;
         }
 
@@ -1439,7 +1521,10 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
     // deadlock). `TickGate` releases the gate on every exit path.
     let t_ddl_start = Instant::now();
     let (tx, rx) = oneshot::channel::<()>();
-    shared.committer_tx.send(CommitRequest::Barrier { done: tx });
+    shared.committer_tx.send(CommitRequest::Barrier {
+        kind: BarrierKind::Ddl,
+        done: tx,
+    });
     let _ = rx.await;
 
     let _tick_gate = if view_create {
@@ -1464,7 +1549,10 @@ async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: 
         // committer stays idle for the rest of the handler (the write lock blocks
         // new pushes).
         let (tx, rx) = oneshot::channel::<()>();
-        shared.committer_tx.send(CommitRequest::Barrier { done: tx });
+        shared.committer_tx.send(CommitRequest::Barrier {
+            kind: BarrierKind::Ddl,
+            done: tx,
+        });
         let _ = rx.await;
     }
 

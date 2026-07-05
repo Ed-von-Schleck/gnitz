@@ -134,6 +134,12 @@ impl ShardIndex {
         ManifestHeader {
             global_max_lsn,
             compact_seq: self.compact_seq,
+            // Single stamp point: every publish path (spill, barrier,
+            // compaction-republish) funnels through here, so the manifest
+            // generation is always the process's `committed_generation`. Base
+            // (`SalReplay`) tables stamp whatever the atomic holds and never
+            // read it back.
+            generation: crate::foundation::worker_ctx::committed_generation(),
         }
     }
 

@@ -18,7 +18,7 @@ use crate::storage::Batch;
 ///
 /// Failure mode: if a worker dies mid-exchange, its entries stay in the
 /// accumulator and the tick's `join_all` parks forever. This is fine
-/// because `worker_watcher` (executor.rs) triggers reactor shutdown on
+/// because `watchdog` (executor.rs) triggers reactor shutdown on
 /// any worker crash, tearing down all parked tasks.
 pub struct ExchangeAccumulator {
     rounds: FxHashMap<(i64, i64), ExchangeRound>,

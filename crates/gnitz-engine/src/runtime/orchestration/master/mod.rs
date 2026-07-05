@@ -20,8 +20,8 @@ use crate::runtime::reactor::{AsyncMutex, PendingRelay, ScanLease};
 use crate::runtime::sal::{
     pack_gather_cols, unique_preflight_wire_schema, SalWriter, BACKFILL_DECISION_CHECKPOINT,
     BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, FLAG_BACKFILL, FLAG_DDL_SYNC, FLAG_EXCHANGE,
-    FLAG_EXCHANGE_RELAY, FLAG_FLUSH, FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
-    FLAG_SEEK_BY_INDEX_RANGE_SAL, FLAG_SHUTDOWN, FLAG_TICK, FLAG_UNIQUE_PREFLIGHT,
+    FLAG_EXCHANGE_RELAY, FLAG_FLUSH, FLAG_FLUSH_EPH, FLAG_GATHER, FLAG_HAS_PK, FLAG_PUSH, FLAG_SEEK,
+    FLAG_SEEK_BY_INDEX, FLAG_SEEK_BY_INDEX_RANGE_SAL, FLAG_SHUTDOWN, FLAG_TICK, FLAG_UNIQUE_PREFLIGHT,
 };
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{
@@ -308,8 +308,9 @@ pub struct MasterDispatcher {
     check_batch_pool: FxHashMap<i64, Vec<Batch>>,
 
     /// Monotonic LSN allocator. The SAL writer no longer owns a counter;
-    /// the dispatcher hands out LSNs (one per zone) via `next_lsn`.
-    /// Reset on checkpoint via `reset_sal`.
+    /// the dispatcher hands out LSNs (one per zone) via `next_lsn`. Never reset
+    /// on checkpoint — only the SAL write cursor + epoch reset (`checkpoint_reset`);
+    /// LSNs stay monotonic across checkpoints so recovery watermarks never alias.
     next_lsn: u64,
 }
 

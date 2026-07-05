@@ -19,7 +19,7 @@ use crate::runtime::w2m_ring;
 use crate::runtime::wire::{self as ipc, FLAG_CONTINUATION, FLAG_SCAN_LAST, STATUS_ERROR, STATUS_OK};
 use crate::schema::SchemaDescriptor;
 use crate::storage::Batch;
-use crate::storage::{BlobCacheGuard, FlushWork, PkBuf};
+use crate::storage::{BlobCacheGuard, FlushOutcome, FlushWork, PkBuf, StorageError, Table};
 
 // ---------------------------------------------------------------------------
 // PendingScan
@@ -266,7 +266,7 @@ mod reply;
 use fsync::uring_batch_fdatasync;
 
 /// Concurrent-fd budget for the barrier flush. Bounds both the per-table
-/// accumulation before a `flush_chunk` and the sub-chunk size the chunk opens
+/// accumulation before a `flush_tables_chunk` and the sub-chunk size the chunk opens
 /// its by-path fdatasync sweep in — so a 256-partition family never opens
 /// thousands of fds at once (EMFILE).
 const FD_CHUNK_THRESHOLD: usize = 256;
@@ -561,6 +561,15 @@ impl WorkerProcess {
             return None;
         }
         self.read_cursor = new_cursor;
+        // The ephemeral flush round carries the checkpoint generation in the
+        // group header's `lsn` field. Latch it into `worker_ctx` before dispatch
+        // so `manifest_header` stamps every view manifest this round publishes
+        // with it. This is the single SAL-read choke point — both the top-level
+        // loop and the inside-exchange-wait loop funnel through here — so the
+        // stamp is set correctly in either context.
+        if msg.kind == SalMessageKind::FlushEph {
+            crate::foundation::worker_ctx::set_committed_generation(msg.lsn);
+        }
         Some((msg.kind, msg.target_id as i64, msg.wire_data))
     }
 
@@ -780,6 +789,7 @@ impl WorkerProcess {
             // ── All others: identical inline behavior in both contexts ─
             (_, SalMessageKind::Shutdown)
             | (_, SalMessageKind::Flush)
+            | (_, SalMessageKind::FlushEph)
             | (_, SalMessageKind::Backfill)
             | (_, SalMessageKind::HasPk)
             | (_, SalMessageKind::Gather)
@@ -849,6 +859,18 @@ impl WorkerProcess {
             SalMessageKind::Flush => {
                 self.advance_read_epoch();
                 match self.handle_flush_all() {
+                    Ok(()) => self.send_ack(0, FLAG_CHECKPOINT as u64, request_id),
+                    Err(msg) => self.send_error(&msg, request_id),
+                }
+                DispatchResult::Continue
+            }
+
+            // Ephemeral-state flush round: persist every view's operator-trace
+            // tables and output stores, stamped with the checkpoint generation
+            // already latched into `worker_ctx` at the classify site.
+            SalMessageKind::FlushEph => {
+                self.advance_read_epoch();
+                match self.handle_flush_all_ephemeral() {
                     Ok(()) => self.send_ack(0, FLAG_CHECKPOINT as u64, request_id),
                     Err(msg) => self.send_error(&msg, request_id),
                 }
@@ -1239,7 +1261,7 @@ impl WorkerProcess {
         // output trace once after the final chunk. Only when it produced rows
         // (the first source of a join produces none — it just fills its trace).
         if view_id != 0 && produced_any {
-            // On abort the master's worker_watcher turns the dead worker into a
+            // On abort the master's watchdog turns the dead worker into a
             // cluster abort, and restart re-derives the view.
             self.cat().dag.flush_view_or_abort(view_id);
         }
@@ -1480,6 +1502,8 @@ impl WorkerProcess {
         Ok(())
     }
 
+    /// Base checkpoint round: flush every user relation's partitions + index
+    /// circuits (`SalReplay` publishes; rederived tables fold to RAM inline).
     fn handle_flush_all(&mut self) -> Result<(), String> {
         // pending_deltas is intentionally NOT cleared here. A checkpoint can
         // fire before buffered effective deltas are ticked into their views;
@@ -1489,87 +1513,114 @@ impl WorkerProcess {
         // by the next auto-tick or the scan barrier. Live entries drain on the
         // next tick (bounded by the 10k-row auto-tick); a dropped table's entry is
         // GC'd in the DdlSync arm (retain(has_id)).
-        let ids = self.cat().iter_user_table_ids();
-        // One dir fd per unique (dev, ino), so a shared directory is fsynced
-        // once — deduped at insertion in `flush_chunk` (a duplicate's `OwnedFd`
-        // closes immediately).
-        let mut dir_fds: HashMap<(u64, u64), OwnedFd> = HashMap::new();
+        let dag = self.cat().get_dag_ptr();
+        let tables = unsafe { &mut *dag }.collect_base_flush_tables();
+        self.flush_tables(&tables, Table::flush_prepare)
+    }
 
+    /// Ephemeral checkpoint round: force-persist every view's operator-trace
+    /// tables and output stores, stamped with the generation latched at the
+    /// classify site. Two global passes — traces first, then outputs — satisfy
+    /// the flush-ordering invariant (any output@G ⟹ that view's own traces
+    /// durable@G) and batch better than per-view interleaving.
+    fn handle_flush_all_ephemeral(&mut self) -> Result<(), String> {
+        let dag = self.cat().get_dag_ptr();
+        let (traces, outputs) = unsafe { &mut *dag }.collect_ephemeral_flush_tables();
+        self.flush_tables(&traces, Table::flush_prepare_ephemeral)?; // Pass 1: all traces fully durable FIRST
+        self.flush_tables(&outputs, Table::flush_prepare_ephemeral) // Pass 2: all output stores
+    }
+
+    /// The flush body shared by the base round and each ephemeral pass; only
+    /// the table collection and the prepare fn differ between the two. Prepares
+    /// each table (skipping `Empty`/`DoneInline`), batch-fdatasyncs the
+    /// manifest and unsynced fds in `FD_CHUNK_THRESHOLD` chunks, commits each
+    /// manifest rename with deduped dir fsyncs, then drains each published
+    /// table's deferred compaction deletions post-publish.
+    ///
+    /// SAFETY: the pointers come from the DAG collectors and are valid for this
+    /// synchronous handler (single-threaded worker, no reactor yield, so the
+    /// table set is frozen for the flush).
+    fn flush_tables(
+        &mut self,
+        tables: &[*mut Table],
+        prepare: fn(&mut Table) -> Result<FlushOutcome, StorageError>,
+    ) -> Result<(), String> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        // One dir fd per unique (dev, ino), so a shared directory is fsynced
+        // once — deduped at insertion in `flush_tables_chunk` (a duplicate's
+        // `OwnedFd` closes immediately).
+        let mut dir_fds: HashMap<(u64, u64), OwnedFd> = HashMap::new();
         let mut ring = io_uring::IoUring::new(256).map_err(|e| format!("io_uring::new failed: {e}"))?;
 
-        let mut pending: Vec<(i64, Vec<(usize, FlushWork)>)> = Vec::new();
+        let mut pending: Vec<(*mut Table, FlushWork)> = Vec::new();
         let mut pending_fds = 0usize;
-        // Families that published a manifest this barrier — drained (deferred
+        // Tables that published a manifest this round — drained (deferred
         // compaction deletions) after every dir fsync completes, so a crash
         // between publish and drain loads the cut manifest over intact files.
-        let mut flushed_tids: Vec<i64> = Vec::new();
+        let mut flushed: Vec<*mut Table> = Vec::new();
 
-        for tid in ids {
-            let works = self
-                .cat()
-                .flush_family_prepare(tid)
-                .map_err(|e| format!("flush_prepare tid={tid}: {e}"))?;
-            if works.is_empty() {
-                continue;
-            }
-            flushed_tids.push(tid);
+        for &t in tables {
+            let outcome = prepare(unsafe { &mut *t }).map_err(|e| format!("flush_prepare: {e}"))?;
+            let work = match outcome {
+                FlushOutcome::Empty | FlushOutcome::DoneInline => continue,
+                FlushOutcome::Pending(w) => w,
+            };
             // Each work opens one fd per unsynced file (the by-path sweep) plus
             // the manifest .tmp fd.
-            let added_fds: usize = works.iter().map(|(_, w)| w.sync_paths().len() + 1).sum();
-            pending.push((tid, works));
-            pending_fds += added_fds;
+            pending_fds += work.sync_paths().len() + 1;
+            pending.push((t, work));
             if pending_fds >= FD_CHUNK_THRESHOLD {
-                self.flush_chunk(&mut ring, &mut pending, &mut dir_fds)?;
+                self.flush_tables_chunk(&mut ring, &mut pending, &mut dir_fds, &mut flushed)?;
                 pending_fds = 0;
             }
         }
-        self.flush_chunk(&mut ring, &mut pending, &mut dir_fds)?;
+        self.flush_tables_chunk(&mut ring, &mut pending, &mut dir_fds, &mut flushed)?;
 
-        // The dir fds are per-flush (opened in `flush_commit`). `dir_fds` drops at
-        // end of scope — on the success return and every `?` unwind alike —
-        // closing all of them, so the flush leaks nothing even under a persistent
-        // disk error.
+        // The dir fds are per-flush (opened in `flush_commit`). `dir_fds` drops
+        // at scope end on every path (success or `?`), closing all of them —
+        // nothing leaks even under a persistent disk error.
         for fd in dir_fds.values() {
             if let Err(e) = crate::foundation::posix_io::fsync_eintr(fd.as_raw_fd()) {
                 return Err(format!("dir fsync failed: {e}"));
             }
         }
 
-        // Every published manifest is durable now; drain each flushed family's
-        // deferred compaction deletions. Strictly after the dir fsyncs and only
-        // on the all-chunks-succeeded path (any chunk `?` short-circuits above,
-        // before any drain), so a superseded input is never unlinked while the
-        // manifest still referencing it is unpublished.
-        for tid in flushed_tids {
-            self.cat().drain_family_deletions(tid);
+        // Every published manifest is durable now; drain deferred compaction
+        // deletions. Strictly after the dir fsyncs and only on the all-chunks-
+        // succeeded path (any chunk `?` short-circuits above, before any drain),
+        // so a superseded input is never unlinked while the manifest still
+        // referencing it is unpublished.
+        for t in flushed {
+            unsafe { &mut *t }.drain_deletions();
         }
         Ok(())
     }
 
-    fn flush_chunk(
+    /// One FD-bounded chunk of `flush_tables`: batch-fdatasync the manifest
+    /// `.tmp` fds, sweep + fdatasync the unsynced files by path in sub-chunks,
+    /// then commit each table's manifest rename collecting deduped dir fds.
+    fn flush_tables_chunk(
         &mut self,
         ring: &mut io_uring::IoUring,
-        pending: &mut Vec<(i64, Vec<(usize, FlushWork)>)>,
+        pending: &mut Vec<(*mut Table, FlushWork)>,
         dir_fds: &mut HashMap<(u64, u64), OwnedFd>,
+        flushed: &mut Vec<*mut Table>,
     ) -> Result<(), String> {
         if pending.is_empty() {
             return Ok(());
         }
 
-        // fdatasync the manifest .tmp fds (open from `flush_prepare`) as one batch.
-        let manifest_fds: Vec<libc::c_int> = pending
-            .iter()
-            .flat_map(|(_, ws)| ws.iter())
-            .map(|(_, w)| w.manifest_fd())
-            .collect();
+        let manifest_fds: Vec<libc::c_int> = pending.iter().map(|(_, w)| w.manifest_fd()).collect();
         uring_batch_fdatasync(ring, &manifest_fds)?;
 
         // Sweep: open every unsynced file O_RDONLY and fdatasync it by path, in
-        // sub-chunks of FD_CHUNK_THRESHOLD so a large family never holds thousands
-        // of fds open at once. Each sub-chunk's `OwnedFd`s close before the next.
+        // sub-chunks of FD_CHUNK_THRESHOLD so a large table set never holds
+        // thousands of fds open at once. Each sub-chunk's `OwnedFd`s close
+        // before the next.
         let paths: Vec<&std::ffi::CStr> = pending
             .iter()
-            .flat_map(|(_, ws)| ws.iter())
             .flat_map(|(_, w)| w.sync_paths().iter().map(|c| c.as_c_str()))
             .collect();
         for sub in paths.chunks(FD_CHUNK_THRESHOLD) {
@@ -1585,19 +1636,17 @@ impl WorkerProcess {
             // owned drops here → fds closed before the next sub-chunk
         }
 
-        for (tid, works) in pending.drain(..) {
-            let dirfds = self
-                .cat()
-                .flush_family_commit_batch(tid, works)
-                .map_err(|e| format!("flush_commit tid={tid}: {e}"))?;
-            for dirfd in dirfds {
-                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(dirfd.as_raw_fd(), &mut stat) } < 0 {
-                    let err = std::io::Error::last_os_error();
-                    return Err(format!("fstat: {err}"));
-                }
-                dir_fds.entry((stat.st_dev, stat.st_ino)).or_insert(dirfd);
+        for (t, work) in pending.drain(..) {
+            let dirfd = unsafe { &mut *t }
+                .flush_commit(work)
+                .map_err(|e| format!("flush_commit: {e}"))?;
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(dirfd.as_raw_fd(), &mut stat) } < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(format!("fstat: {err}"));
             }
+            dir_fds.entry((stat.st_dev, stat.st_ino)).or_insert(dirfd);
+            flushed.push(t);
         }
         Ok(())
     }
@@ -1624,7 +1673,7 @@ impl WorkerProcess {
     }
 
     /// Unrecoverable worker fault: log, flush, `_exit`. The master's
-    /// worker_watcher turns the dead worker into a cluster abort.
+    /// watchdog turns the dead worker into a cluster abort.
     fn fatal_shutdown(&mut self, msg: &str) -> ! {
         gnitz_warn!("W{} FATAL: {}. Shutting down.", self.worker_id, msg);
         self.shutdown()

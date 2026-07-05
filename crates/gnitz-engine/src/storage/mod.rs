@@ -39,7 +39,7 @@ pub(crate) use columnar::{
     cmp_col_window, compare_pk_bytes, compare_pk_ordering, compare_rows, compare_rows_fixedint_nonnull, opk_key,
     pk_bytes_eq, with_payload_cmp,
 };
-pub(crate) use lsm::manifest::PkBuf;
+pub(crate) use lsm::manifest::{PkBuf, STATE_FORMAT};
 #[cfg(test)]
 pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
 #[cfg(test)]

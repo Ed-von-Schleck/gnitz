@@ -516,11 +516,17 @@ impl MasterDispatcher {
     }
 
     fn do_checkpoint(&mut self) -> Result<(), String> {
-        let schema = SchemaDescriptor::minimal_u64();
         let lsn = self.next_lsn();
-        self.send_broadcast(0, lsn, FLAG_FLUSH, None, &schema, &[], 0, 0, 0)?;
-        self.collect_acks()?;
+        self.sync_flush_round(lsn, FLAG_FLUSH)?;
         self.checkpoint_post_ack()
+    }
+
+    /// One synchronous flush round (pre-reactor W2M path): broadcast the flush
+    /// group, await every worker's ACK. The caller runs the matching reset.
+    fn sync_flush_round(&mut self, lsn: u64, flags: u32) -> Result<(), String> {
+        let schema = SchemaDescriptor::minimal_u64();
+        self.send_broadcast(0, lsn, flags, None, &schema, &[], 0, 0, 0)?;
+        self.collect_acks()
     }
 
     // -----------------------------------------------------------------------
@@ -1643,6 +1649,8 @@ impl MasterDispatcher {
         -1
     }
 
+    /// Broadcast `FLAG_SHUTDOWN` (each worker flushes + `_exit`s) and reap the
+    /// worker processes.
     pub fn shutdown_workers(&mut self) {
         let schema = SchemaDescriptor::minimal_u64();
         let lsn = self.next_lsn();
@@ -1710,30 +1718,17 @@ impl MasterDispatcher {
         }
     }
 
-    /// Write a FLAG_FLUSH checkpoint group with per-worker req_ids.
-    /// Does NOT sync/signal. Caller signals + awaits replies. `lsn` is
-    /// supplied by the caller.
-    pub(crate) fn write_checkpoint_group(&mut self, lsn: u64, req_ids: &[u64]) -> Result<(), String> {
+    /// Write a checkpoint flush group (`FLAG_FLUSH` base round or
+    /// `FLAG_FLUSH_EPH` ephemeral round) with per-worker req_ids. Does NOT
+    /// sync/signal. Caller signals + awaits replies. `lsn` is supplied by the
+    /// caller — the ephemeral round passes the checkpoint generation there, which
+    /// workers read to stamp view manifests.
+    pub(crate) fn write_checkpoint_group(&mut self, lsn: u64, flags: u32, req_ids: &[u64]) -> Result<(), String> {
         let schema = SchemaDescriptor::minimal_u64();
         // One "slot" per worker with empty batch — each worker replies
         // after flushing its system tables and advancing its epoch.
         let refs: Vec<Option<&Batch>> = (0..self.num_workers).map(|_| None).collect();
-        self.write_group_with_req_ids(
-            0,
-            lsn,
-            FLAG_FLUSH,
-            0,
-            &refs,
-            &schema,
-            &[],
-            0,
-            0,
-            req_ids,
-            -1,
-            0,
-            None,
-            &[],
-        )
+        self.write_group_with_req_ids(0, lsn, flags, 0, &refs, &schema, &[], 0, 0, req_ids, -1, 0, None, &[])
     }
 
     /// Post-ACK checkpoint cleanup: flush system tables before resetting
@@ -1756,6 +1751,43 @@ impl MasterDispatcher {
         cat.drain_checkpoint_gated_deletions();
         self.sal.checkpoint_reset();
         gnitz_info!("SAL checkpoint epoch={}", self.sal.epoch());
+        Ok(())
+    }
+
+    /// Reset the SAL cursor + advance the epoch, without the system-table flush
+    /// or gated-deletion drain of `checkpoint_post_ack`. Used by the ephemeral
+    /// checkpoint round: since the base round's reset, only command groups (tick
+    /// / relay) were written, so nothing durable is discarded and gated deletions
+    /// already drained in the base round.
+    pub(crate) fn checkpoint_reset_only(&mut self) {
+        self.sal.checkpoint_reset();
+        gnitz_info!("SAL checkpoint (ephemeral) epoch={}", self.sal.epoch());
+    }
+
+    /// Bump the committed checkpoint generation (step 0 of the sequence).
+    /// Delegates to the catalog: durably records the seq-4 row and publishes the
+    /// new value to `worker_ctx`. Returns the new generation.
+    pub(crate) fn bump_checkpoint_generation(&mut self) -> u64 {
+        unsafe { &mut *self.catalog }.bump_checkpoint_generation()
+    }
+
+    /// Synchronous boot-end checkpoint (pre-reactor W2M path): record the
+    /// launched topology, bump the generation, then run the base + ephemeral
+    /// flush rounds. No drain — recovery already drained everything and no pushes
+    /// are admitted yet (the socket is not open), so `pending_deltas` is empty.
+    /// Freshly backfilled views are durably checkpointed before the socket opens.
+    pub(crate) fn boot_checkpoint(&mut self, worker_count: u32) -> Result<(), String> {
+        // The topology row's durability rides the gen bump's system-table flush
+        // (both are `_sequences` rows).
+        unsafe { &mut *self.catalog }.record_topology(worker_count);
+        let gen = self.bump_checkpoint_generation();
+        // Base round (FLAG_FLUSH → ACKs → flush system tables + reset).
+        self.do_checkpoint()?;
+        // Ephemeral round: workers persist view trace/output state stamped `gen`,
+        // then a bare SAL reset (only the base round's own command groups sit in
+        // the SAL since its reset).
+        self.sync_flush_round(gen, FLAG_FLUSH_EPH)?;
+        self.checkpoint_reset_only();
         Ok(())
     }
 

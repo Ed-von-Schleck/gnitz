@@ -51,8 +51,16 @@ pub enum RecoverySource {
     /// from the manifest at open. Base tables and master system tables.
     SalReplay,
     /// Storage is erased at open and the relation is rebuilt (rederived) from
-    /// its sources. Views and index circuits.
+    /// its sources. Index circuits and non-checkpointed operator scratch.
     Rederive,
+    /// Rederived like `Rederive`, but the ephemeral checkpoint round
+    /// force-persists this table with a generation-stamped manifest (view
+    /// operator-trace tables and output stores). Compaction cleanup therefore
+    /// defers to the next publish like `SalReplay` — an immediate drain would
+    /// unlink a compacted-away shard the last-published manifest still
+    /// references (stranded at reload). Still erased at open today;
+    /// generation-gated conditional reload replaces the erase in a later step.
+    RederiveCheckpointed,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,8 +243,8 @@ impl Table {
         // Try to set NOCOW (btrfs; silently ignored on other fs)
         set_nocow_dir(&dir_c);
 
-        // Rederive tables erase stale shards (prefix-matched) and start empty.
-        if recovery_source == RecoverySource::Rederive {
+        // Rederived tables erase stale shards (prefix-matched) and start empty.
+        if recovery_source != RecoverySource::SalReplay {
             erase_stale_shards(dir, table_id);
         }
 
@@ -649,10 +657,11 @@ impl Table {
     /// Cleanup timing splits on recovery source. A `Rederive` table publishes
     /// no manifest referencing the superseded inputs, so it drains them
     /// immediately — deferring would leak them until boot-time
-    /// `erase_stale_shards`. A `SalReplay` table defers both publish and
-    /// cleanup to the next barrier, which republishes over the compacted index
-    /// before unlinking the inputs; unlinking mid-epoch would strand the
-    /// last-published manifest over deleted files on the next boot.
+    /// `erase_stale_shards`. A `SalReplay` or `RederiveCheckpointed` table
+    /// defers both publish and cleanup to the next barrier, which republishes
+    /// over the compacted index before unlinking the inputs; unlinking
+    /// mid-epoch would strand the last-published manifest over deleted files
+    /// on the next boot.
     pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         if !self.shard_index.should_compact() {
             return Ok(());
@@ -2142,6 +2151,56 @@ mod tests {
             );
         }
         t2.close();
+    }
+
+    /// The manifest generation is stamped from `worker_ctx::committed_generation()`
+    /// at every publish, so a compaction republish carries the *current*
+    /// generation, and a later republish re-stamps a newer one. Uses the
+    /// thread-local generation override for determinism under parallel
+    /// `cargo test` (the process-global atomic is clobbered by every
+    /// `CatalogEngine::open`).
+    #[test]
+    fn generation_preserved_by_compaction_republish() {
+        use super::super::manifest::{read_file, ManifestEntryRaw};
+        use crate::foundation::worker_ctx;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("gen_republish");
+        let schema = make_u64_i64_schema();
+        let manifest_path = std::ffi::CString::new(tdir.join("manifest.bin").to_str().unwrap()).unwrap();
+        let read_generation = |path: &std::ffi::CStr| -> u64 {
+            let mut out = vec![ManifestEntryRaw::zeroed(); 64];
+            read_file(path, &mut out, 64).unwrap().1.generation
+        };
+
+        // Publish at generation G1 with a compaction pending.
+        worker_ctx::set_test_gen_override(Some(0x1111));
+        let mut t = new_table(&tdir, schema, 7900, 128, RecoverySource::SalReplay);
+        t.set_inmem_ceiling_for_test(100);
+        for r in 0..6u64 {
+            let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
+            t.ingest_owned_batch(make_batch(&rows)).unwrap();
+        }
+        assert!(compaction_output_count(&tdir, 7900) > 0, "compaction ran");
+        assert!(t.flush().unwrap(), "compacted table republishes");
+        assert_eq!(
+            read_generation(&manifest_path),
+            0x1111,
+            "republished manifest carries the current generation",
+        );
+
+        // A later publish at a higher generation re-stamps the manifest.
+        worker_ctx::set_test_gen_override(Some(0x2222));
+        t.ingest_owned_batch(make_batch(&[(9999, 1, 1)])).unwrap();
+        assert!(t.flush().unwrap(), "second barrier republishes");
+        t.close();
+        assert_eq!(
+            read_generation(&manifest_path),
+            0x2222,
+            "later republish re-stamps the newer generation",
+        );
+
+        worker_ctx::set_test_gen_override(None);
     }
 
     /// The three-disjunct barrier gate, one arm each: RAM empty + nothing →

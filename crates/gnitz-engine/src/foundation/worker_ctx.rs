@@ -24,6 +24,19 @@ static WORKER_RANK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 /// plan-cache invalidation.
 static NUM_WORKERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
+/// The committed checkpoint generation baked into every manifest this process
+/// publishes. A process-global `AtomicU64` mirroring `WORKER_RANK`: the manifest
+/// stamp is read deep inside `storage/lsm` (L3), far below any place a parameter
+/// could be threaded, and workers are single-threaded processes. The master sets
+/// it at each gen-bump (and once at boot after `recover_sequences`, so the value
+/// is COW-inherited by the forked workers); each worker sets it from the
+/// `FLAG_FLUSH_EPH` group header before flushing its ephemeral view state.
+///
+/// Test caveat (same footgun as `WORKER_RANK`): `cargo test` shares one process
+/// across test threads, so this atomic is shared. A test that reads a published
+/// generation must set it and read it back within one non-yielding test.
+static COMMITTED_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// This process's role in the multi-process server: `0` Standalone (the
 /// default — unit tests and any in-process embedding), `1` Master (the pre-fork
 /// dispatcher), `2` Worker (a forked slice owner). Set once per process:
@@ -64,6 +77,42 @@ pub(crate) fn is_worker() -> bool {
 
 pub(crate) fn worker_rank() -> u32 {
     WORKER_RANK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// Per-test-thread override of the committed generation. The process-global
+// `COMMITTED_GENERATION` is clobbered by every `CatalogEngine::open` (which sets
+// it from the recovered value), so a test that publishes a manifest and checks
+// its generation would flake under parallel `cargo test`. A thread-local
+// override is per-test-thread, so it never races another test.
+#[cfg(test)]
+thread_local! {
+    static TEST_GEN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The checkpoint generation stamped into manifests this process publishes.
+/// Read by `ShardIndex::manifest_header` at every publish.
+pub(crate) fn committed_generation() -> u64 {
+    #[cfg(test)]
+    {
+        if let Some(g) = TEST_GEN_OVERRIDE.with(|c| c.get()) {
+            return g;
+        }
+    }
+    COMMITTED_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only: pin the generation `manifest_header` stamps on the current thread
+/// (`Some`) or clear the override (`None`).
+#[cfg(test)]
+pub(crate) fn set_test_gen_override(g: Option<u64>) {
+    TEST_GEN_OVERRIDE.with(|c| c.set(g));
+}
+
+/// Set the checkpoint generation this process stamps into published manifests.
+/// Called on the master at each gen-bump and once at boot, and on each worker
+/// from the `FLAG_FLUSH_EPH` group header before the ephemeral flush round.
+pub(crate) fn set_committed_generation(g: u64) {
+    COMMITTED_GENERATION.store(g, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub(crate) fn num_workers() -> u32 {

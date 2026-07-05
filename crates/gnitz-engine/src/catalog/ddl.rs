@@ -400,7 +400,7 @@ impl CatalogEngine {
             self.dag
                 .tables
                 .get(&vid)
-                .is_none_or(|e| e.kind.recovery_source() == RecoverySource::Rederive),
+                .is_none_or(|e| e.kind.recovery_source() != RecoverySource::SalReplay),
             "backfill_view on durable relation {vid}: would double-count loaded shards",
         );
         if !self.dag.ensure_compiled(vid) {

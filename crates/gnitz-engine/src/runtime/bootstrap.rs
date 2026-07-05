@@ -654,6 +654,18 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
         return 1;
     }
 
+    // Boot-end checkpoint: record the launched topology, bump the generation, and
+    // durably checkpoint the freshly backfilled view state (base + ephemeral
+    // rounds) before the socket opens, so a clean restart resumes from it. No
+    // drain — recovery already drained everything and no pushes are admitted yet.
+    if let Err(e) = dispatcher.boot_checkpoint(num_workers) {
+        let msg = format!("Error: boot checkpoint failed: {e}\n");
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
+        return 1;
+    }
+
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);
     let server_fd = posix_io::server_create(socket_path);

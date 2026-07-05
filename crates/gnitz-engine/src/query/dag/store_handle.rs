@@ -4,7 +4,7 @@
 //! owned by `CatalogEngine`. There is no custom `Drop`: the `Partitioned`
 //! box is freed by the default drop glue when its registry entry is removed.
 
-use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, PartitionedTable, StorageError, Table};
+use crate::storage::{Batch, CursorHandle, PartitionedTable, StorageError, Table};
 use std::cell::UnsafeCell;
 
 /// Storage handle of a registered relation. `Partitioned` owns its boxed
@@ -123,48 +123,6 @@ impl StoreHandle {
         match self {
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush(),
             StoreHandle::Partitioned(cell) => cell.get_mut().flush(),
-        }
-    }
-
-    /// Dispatched Phase 1 across all variants. Returns one
-    /// (partition_idx, FlushWork) per partition that produced deferred
-    /// work; for Borrowed `partition_idx` is always 0.
-    pub fn flush_prepare(&mut self) -> Result<Vec<(usize, FlushWork)>, StorageError> {
-        let table: &mut Table = match self {
-            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr },
-            StoreHandle::Partitioned(cell) => return cell.get_mut().flush_prepare(),
-        };
-        match table.flush_prepare()? {
-            FlushOutcome::Empty | FlushOutcome::DoneInline => Ok(Vec::new()),
-            FlushOutcome::Pending(w) => Ok(vec![(0, w)]),
-        }
-    }
-
-    /// Dispatched Phase 3 across all variants. Returns one owned dir fd per
-    /// committed partition (see `PartitionedTable::flush_commit_batch` for the
-    /// partial-batch fd contract).
-    pub fn flush_commit_batch(
-        &mut self,
-        works: Vec<(usize, FlushWork)>,
-    ) -> Result<Vec<std::os::fd::OwnedFd>, StorageError> {
-        let t: &mut Table = match self {
-            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr },
-            StoreHandle::Partitioned(cell) => return cell.get_mut().flush_commit_batch(works),
-        };
-        let mut out = Vec::with_capacity(works.len());
-        for (_, w) in works {
-            out.push(t.flush_commit(w)?);
-        }
-        Ok(out)
-    }
-
-    /// Dispatched deferred-deletion drain across all variants. `Partitioned`
-    /// drains every partition's `pending_deletions`; `Borrowed` (system tables)
-    /// the single table's.
-    pub fn drain_deletions(&mut self) {
-        match self {
-            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.drain_deletions(),
-            StoreHandle::Partitioned(cell) => cell.get_mut().drain_deletions(),
         }
     }
 

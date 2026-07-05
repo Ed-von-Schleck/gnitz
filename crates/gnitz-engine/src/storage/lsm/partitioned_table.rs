@@ -5,7 +5,6 @@
 //! `mix(pk) >> 56` (see `schema::key`), not `xxh3 & 0xFF`.
 
 use std::cell::RefCell;
-use std::os::fd::OwnedFd;
 use std::rc::Rc;
 
 use super::batch::Batch;
@@ -14,7 +13,9 @@ use super::columnar;
 use super::error::StorageError;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
-use super::table::{self, FlushOutcome, FlushWork, RecoverySource, Table};
+use super::table::{self, RecoverySource, Table};
+#[cfg(test)]
+use super::table::{FlushOutcome, FlushWork};
 use crate::schema::SchemaDescriptor;
 
 thread_local! {
@@ -47,12 +48,6 @@ pub struct PartitionedTable {
     part_offset: u32,
     schema: SchemaDescriptor,
     last_found_partition: Option<usize>,
-    /// Test seam: force `flush_commit_batch` to return `Err` right before it
-    /// would commit the `n`-th partition (0-based). Exercises the mid-batch
-    /// error path so the fd-hygiene test can prove the already-collected
-    /// `OwnedFd`s are released (not leaked) on early return.
-    #[cfg(test)]
-    commit_fail_after: Option<usize>,
 }
 
 impl PartitionedTable {
@@ -112,8 +107,6 @@ impl PartitionedTable {
             part_offset: part_start,
             schema,
             last_found_partition: None,
-            #[cfg(test)]
-            commit_fail_after: None,
         })
     }
 
@@ -345,51 +338,12 @@ impl PartitionedTable {
         Ok(any_wrote)
     }
 
-    /// Phase 1 across all partitions. Returns one (partition_idx, FlushWork)
-    /// pair per partition that produced deferred work. `Empty`/`DoneInline`
-    /// outcomes are silently consumed (memtable already reset for those).
-    pub fn flush_prepare(&mut self) -> Result<Vec<(usize, FlushWork)>, StorageError> {
-        let mut works = Vec::new();
-        for (i, table) in self.tables.iter_mut().enumerate() {
-            // Each child honors its own durability. Base-table children are
-            // durable (return `Pending`); non-durable view children flush
-            // in-memory (return `DoneInline`) and stop writing throwaway shards
-            // at checkpoint.
-            match table.flush_prepare()? {
-                FlushOutcome::Empty | FlushOutcome::DoneInline => {}
-                FlushOutcome::Pending(w) => works.push((i, w)),
-            }
-        }
-        Ok(works)
-    }
-
-    /// Phase 3: dispatch each FlushWork back to its partition's `flush_commit`.
-    /// Returns the owned dir fds to fsync (one per partition that committed).
-    /// A partial-batch failure leaks nothing: the error `?` drops the fds
-    /// already collected, and the un-consumed `works` tail drops its staged
-    /// manifest `.tmp`s (`PreparedManifest`'s Drop) and closes their fds.
-    pub fn flush_commit_batch(&mut self, works: Vec<(usize, FlushWork)>) -> Result<Vec<OwnedFd>, StorageError> {
-        let mut dirfds: Vec<OwnedFd> = Vec::with_capacity(works.len());
-        for (idx, w) in works {
-            // Test seam: fail before committing the n-th partition (`dirfds.len()`
-            // is the count already collected). The collected `dirfds` and the
-            // remaining `works` drop here, closing every fd — the property the
-            // fd-hygiene test checks.
-            #[cfg(test)]
-            if self.commit_fail_after == Some(dirfds.len()) {
-                return Err(StorageError::Io);
-            }
-            dirfds.push(self.tables[idx].flush_commit(w)?);
-        }
-        Ok(dirfds)
-    }
-
-    /// Drain every partition's deferred compaction deletions post-publish.
-    /// Best-effort per partition (see `Table::drain_deletions`).
-    pub fn drain_deletions(&mut self) {
-        for table in &mut self.tables {
-            table.drain_deletions();
-        }
+    /// Mutable access to every partition's `Table`. The checkpoint flush rounds
+    /// collect partitions through this as raw `*mut Table` and drive each
+    /// through the per-`Table` two-phase flush. A replicated store holds
+    /// exactly its one worker-owned partition here.
+    pub fn partitions_mut(&mut self) -> &mut [Table] {
+        &mut self.tables
     }
 
     pub fn current_lsn(&self) -> u64 {
@@ -1059,6 +1013,20 @@ mod tests {
         n
     }
 
+    /// Per-partition two-phase prepare, as the worker's unified flush loop
+    /// drives it: `Table::flush_prepare` on every partition, collecting the
+    /// `Pending` works with their partition index.
+    fn prepare_all(pt: &mut PartitionedTable) -> Vec<(usize, FlushWork)> {
+        let mut works = Vec::new();
+        for (i, t) in pt.partitions_mut().iter_mut().enumerate() {
+            match t.flush_prepare().unwrap() {
+                FlushOutcome::Empty | FlushOutcome::DoneInline => {}
+                FlushOutcome::Pending(w) => works.push((i, w)),
+            }
+        }
+        works
+    }
+
     /// A durable `PartitionedTable` still routes flushes through the durable
     /// branch: `flush_prepare` returns `Pending` work, writes its folded shard at
     /// its final name, and stages a manifest `.tmp`. Guards against the
@@ -1083,7 +1051,7 @@ mod tests {
 
         pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]))
             .unwrap();
-        let works = pt.flush_prepare().unwrap();
+        let works = prepare_all(&mut pt);
         assert!(!works.is_empty(), "durable table must return Pending work");
         assert!(
             count_tree(&tdir, |n| n == "manifest.bin.tmp") > 0,
@@ -1123,7 +1091,7 @@ mod tests {
 
         pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300), (40, 1, 400)]))
             .unwrap();
-        let works = pt.flush_prepare().unwrap();
+        let works = prepare_all(&mut pt);
         assert!(works.is_empty(), "Rederive table must return no Pending work");
         assert_eq!(
             count_tree(&tdir, |n| n.starts_with("shard_")),
@@ -1162,7 +1130,7 @@ mod tests {
         pt.ingest_owned_batch(make_batch(&rows)).unwrap();
 
         // Flush all partitions into in_memory_l0; memtables now empty.
-        assert!(pt.flush_prepare().unwrap().is_empty());
+        assert!(prepare_all(&mut pt).is_empty());
 
         let batch = pt.create_cursor_compacting().unwrap().cursor.materialize();
         let mut seen = std::collections::HashSet::new();
@@ -1244,31 +1212,31 @@ mod tests {
         .unwrap()
     }
 
-    /// A `flush_commit_batch` that fails partway leaks no directory fd: each
-    /// committed partition's dir fd (opened in `flush_commit` for the final
-    /// fsync) is collected as an `OwnedFd` and released by `Drop` on the early
-    /// return; the un-consumed `works` tail drops its staged manifest `.tmp`s (no
-    /// fds). Pre-fix (raw `c_int`), the collected fds dropped unclosed on the
-    /// mid-batch `?` — the cumulative leak this pins shut.
+    /// A partial family commit leaks no directory fd: each committed
+    /// partition's dir fd (opened in `flush_commit` for the final fsync) is an
+    /// `OwnedFd` released by `Drop`, and the un-committed `works` tail drops
+    /// its staged manifest `.tmp`s (`PreparedManifest`'s Drop, no fds). This is
+    /// the RAII property the worker's flush loop relies on when a mid-batch
+    /// `flush_commit` error unwinds its pending vec.
     #[test]
-    fn flush_commit_batch_no_dirfd_leak_on_midbatch_error() {
+    fn partial_commit_leaks_no_dirfd() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let mut pt = durable_hashed(dir.path(), "pt_fd_hygiene", 840);
 
-        // Enough distinct PKs that ≥2 partitions receive data, so the commit
-        // batch has ≥2 works and the mid-batch failure is reachable.
+        // Enough distinct PKs that ≥2 partitions receive data, so a partial
+        // commit (some works committed, the rest dropped) is reachable.
         let rows: Vec<(u64, i64, i64)> = (0..64).map(|i| (i, 1, i as i64)).collect();
         pt.ingest_owned_batch(make_batch(&rows)).unwrap();
 
         let root = dir.path();
         assert_eq!(count_partition_dir_fds(root), 0, "no dir fds held at rest");
 
-        let works = pt.flush_prepare().unwrap();
+        let mut works = prepare_all(&mut pt);
         let n = works.len();
         assert!(
             n >= 2,
-            "need ≥2 partitions with data to exercise a mid-batch failure (got {n})"
+            "need ≥2 partitions with data to exercise a partial commit (got {n})"
         );
         // flush_prepare writes each shard at its final name and drops the dir fd
         // it opened for the write — no dir fd survives into the FlushWork.
@@ -1278,26 +1246,30 @@ mod tests {
             "prepare holds no dir fds (shard written at final name)"
         );
 
-        // Fail right before committing the 2nd partition: the 1st partition's
-        // dir fd (opened by its flush_commit) has already been collected into the
-        // returned Vec<OwnedFd>.
-        pt.commit_fail_after = Some(1);
-        assert!(matches!(pt.flush_commit_batch(works), Err(StorageError::Io)));
+        // Commit only the first partition's work, then drop everything — the
+        // shape of the worker's error unwind after a mid-batch failure.
+        let (idx, w) = works.remove(0);
+        let fd = pt.partitions_mut()[idx].flush_commit(w).unwrap();
+        drop(fd);
+        drop(works);
 
-        // The committed partition's collected fd and every uncommitted work's fd
-        // are closed by Drop on the error unwind — nothing leaks.
         assert_eq!(
             count_partition_dir_fds(root),
             0,
-            "mid-batch commit failure leaks no dir fd (n_works={n})",
+            "partial commit leaks no dir fd (n_works={n})",
+        );
+        assert_eq!(
+            count_tree(&dir.path().join("pt_fd_hygiene"), |name| name.ends_with(".tmp")),
+            0,
+            "dropped works unlink their staged manifest .tmps",
         );
     }
 
     /// Success-path regression: repeated checkpoints over a partitioned table
     /// leave the partition-dir-fd count flat at zero. The worker fsyncs each
-    /// returned `OwnedFd` then drops the vec; modeled here by the fsync + drop.
+    /// commit's `OwnedFd` then drops it; modeled here by the fsync + drop.
     #[test]
-    fn repeated_flush_commit_batch_leaves_dirfds_flat() {
+    fn repeated_flush_commit_leaves_dirfds_flat() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1306,12 +1278,11 @@ mod tests {
         for round in 0..8u64 {
             let rows: Vec<(u64, i64, i64)> = (0..16).map(|i| (round * 100 + i, 1, i as i64)).collect();
             pt.ingest_owned_batch(make_batch(&rows)).unwrap();
-            let works = pt.flush_prepare().unwrap();
-            let fds = pt.flush_commit_batch(works).unwrap();
-            for fd in &fds {
+            for (idx, w) in prepare_all(&mut pt) {
+                let fd = pt.partitions_mut()[idx].flush_commit(w).unwrap();
                 let _ = crate::foundation::posix_io::fsync_eintr(fd.as_raw_fd());
+                // fd closes here, as it does in the worker sweep.
             }
-            drop(fds); // OwnedFds close here, as they do in the worker sweep.
             assert_eq!(
                 count_partition_dir_fds(root),
                 0,

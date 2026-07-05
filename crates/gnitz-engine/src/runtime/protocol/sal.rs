@@ -68,6 +68,14 @@ pub const FLAG_BACKFILL: u32 = 2048;
 pub const FLAG_TICK: u32 = 4096;
 pub const FLAG_CHECKPOINT: u32 = 8192;
 pub const FLAG_FLUSH: u32 = 16384;
+/// Ephemeral-state flush round of the checkpoint sequence: flush every view's
+/// operator-trace tables and output stores (traces before outputs), stamping
+/// their manifests with the checkpoint generation carried in the group header's
+/// `lsn` field. Dispatched inline in both worker contexts like `FLAG_FLUSH`, but
+/// distinct so the base round (`FLAG_FLUSH`, `SalReplay` user tables) and the
+/// ephemeral round (`Rederive` view state) stay separate handlers. Bit 19 — the
+/// next free bit above `FLAG_SEEK_BY_INDEX_RANGE_SAL` (1<<18).
+pub const FLAG_FLUSH_EPH: u32 = 1 << 19;
 /// Marks an empty broadcast group as the closing "commit sentinel" of an
 /// atomic zone. All preceding groups at the same LSN belong to the zone;
 /// recovery applies them only when this sentinel is on disk. The flag
@@ -195,6 +203,7 @@ pub(crate) fn unpack_gather_cols(packed: u64) -> impl Iterator<Item = u8> {
 pub enum SalMessageKind {
     Shutdown,
     Flush,
+    FlushEph,
     DdlSync,
     ExchangeRelay,
     PreloadedExchange,
@@ -226,6 +235,9 @@ impl SalMessageKind {
         }
         if flags & FLAG_FLUSH != 0 {
             return SalMessageKind::Flush;
+        }
+        if flags & FLAG_FLUSH_EPH != 0 {
+            return SalMessageKind::FlushEph;
         }
         if flags & FLAG_DDL_SYNC != 0 {
             return SalMessageKind::DdlSync;
@@ -276,6 +288,7 @@ impl SalMessageKind {
             self,
             SalMessageKind::Shutdown
                 | SalMessageKind::Flush
+                | SalMessageKind::FlushEph
                 | SalMessageKind::DdlSync
                 | SalMessageKind::PreloadedExchange
                 | SalMessageKind::Backfill
@@ -289,9 +302,10 @@ impl SalMessageKind {
     /// All variants in classification priority order. Used by tests that
     /// walk every kind to exercise the dispatcher's full match.
     #[allow(dead_code)]
-    pub const ALL: [SalMessageKind; 15] = [
+    pub const ALL: [SalMessageKind; 16] = [
         SalMessageKind::Shutdown,
         SalMessageKind::Flush,
+        SalMessageKind::FlushEph,
         SalMessageKind::DdlSync,
         SalMessageKind::ExchangeRelay,
         SalMessageKind::PreloadedExchange,

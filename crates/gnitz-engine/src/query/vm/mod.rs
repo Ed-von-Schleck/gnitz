@@ -199,15 +199,12 @@ impl VmHandle {
             "vm: refresh_owned_cursors, {} owned trace regs",
             self.owned_trace_regs.len()
         );
-        // Resize storage if needed
-        if self.owned_cursor_handles.len() < self.owned_trace_regs.len() {
-            self.owned_cursor_handles
-                .resize_with(self.owned_trace_regs.len(), || None);
-        }
+        // Drop previous cursors before creating new ones (releases shard refs
+        // etc.), then size the slot storage back to full length.
+        self.null_owned_cursors();
+        self.owned_cursor_handles
+            .resize_with(self.owned_trace_regs.len(), || None);
         for (slot, &(reg_id, table_idx)) in self.owned_trace_regs.iter().enumerate() {
-            // Drop previous cursor before creating new one (releases shard refs etc.)
-            self.owned_cursor_handles[slot] = None;
-
             // SAFETY: table_idx is valid (set during compilation). We need &mut
             // to the table, but we also hold &self.owned_trace_regs. This is safe
             // because owned_trace_regs is not modified here, and the table is
@@ -232,6 +229,24 @@ impl VmHandle {
                     self.regfile.registers[reg_id as usize].cursor_ptr = std::ptr::null_mut();
                 }
             }
+        }
+    }
+
+    /// Drop every owned-trace cursor and null its register `cursor_ptr` — the
+    /// first half of `refresh_owned_cursors`, minus the compaction + cursor
+    /// re-creation. Called before the ephemeral checkpoint round folds each owned
+    /// trace table's RAM tier into a shard, so no live cursor holds a stale
+    /// snapshot of it. Defensive tidiness, not a safety requirement: held cursors
+    /// keep their own `Rc<Batch>` / shard `Arc` clones (a fold produces a
+    /// stale-not-dangling snapshot) and the next epoch calls
+    /// `refresh_owned_cursors` before any deref — but nulling here keeps the
+    /// flush's safety local and obvious. Only `owned_trace_regs` are handled
+    /// (`_int_`/`_hist_`/`_reduce_`/`_reduce_in_`, all cross-epoch); the epoch-local
+    /// `_avidx_` cursor is created and dropped inside the `Reduce` instruction.
+    pub fn null_owned_cursors(&mut self) {
+        self.owned_cursor_handles.clear(); // drops every held cursor
+        for &(reg_id, _table_idx) in &self.owned_trace_regs {
+            self.regfile.registers[reg_id as usize].cursor_ptr = std::ptr::null_mut();
         }
     }
 }

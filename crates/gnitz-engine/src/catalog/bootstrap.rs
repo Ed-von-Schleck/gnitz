@@ -54,6 +54,8 @@ impl CatalogEngine {
             user_sequences: std::collections::HashMap::new(),
             active_part_start: 0,
             active_part_end: NUM_PARTITIONS,
+            committed_generation: 0,
+            recorded_topology: 0,
             sys_schemas,
             sys_tables,
             sys_views,
@@ -87,6 +89,11 @@ impl CatalogEngine {
 
         // Phase 1: Recover sequence counters
         engine.recover_sequences();
+
+        // Publish the recovered checkpoint generation so it is COW-inherited by
+        // forked workers and stamped into any manifest the master publishes
+        // before the first checkpoint bump.
+        crate::foundation::worker_ctx::set_committed_generation(engine.committed_generation);
 
         // Register system table families
         engine.register_system_table_families();
@@ -324,6 +331,13 @@ impl CatalogEngine {
                     SEQ_ID_SCHEMAS => raise_id_counter(&mut self.next_schema_id, val),
                     SEQ_ID_TABLES => raise_id_counter(&mut self.next_table_id, val),
                     SEQ_ID_INDICES => raise_id_counter(&mut self.next_index_id, val),
+                    // Checkpoint generation is monotonic; a mid-checkpoint crash
+                    // may leave two rows, so take the max. Topology is a single
+                    // latest-wins value. Both fall in the 4..16 gap
+                    // `observe_user_sequence` ignores, so they never leak into
+                    // `user_sequences`.
+                    SEQ_ID_CHECKPOINT_GEN => self.committed_generation = self.committed_generation.max(val as u64),
+                    SEQ_ID_TOPOLOGY => self.recorded_topology = val as u64,
                     // User-table SERIAL sequence (seq_id == table_id ≥
                     // FIRST_USER_TABLE_ID). Store the high-water; next id =
                     // high_water + 1. `observe_user_sequence` ignores a stray

@@ -176,6 +176,38 @@ fn test_user_sequence_durable_roundtrip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `recover_sequences` recovers the checkpoint generation (seq id 4) and the
+/// topology (seq id 5) written by `bump_checkpoint_generation` / `record_topology`,
+/// COW-inheritable by forked workers and read by commit-3 recovery.
+#[test]
+fn test_recover_checkpoint_gen_and_topology() {
+    let dir = temp_dir("recover_ckpt_records");
+    let expected_topology = ((4u64) << 32) | crate::storage::STATE_FORMAT as u64;
+    {
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        assert_eq!(engine.committed_generation, 0, "fresh DB starts at generation 0");
+        assert_eq!(engine.recorded_topology, 0, "fresh DB has no topology row");
+        // Boot order: the topology row is written first and its durability
+        // rides the following gen bump's system-table flush.
+        engine.record_topology(4);
+        assert_eq!(engine.recorded_topology, expected_topology);
+        assert_eq!(engine.bump_checkpoint_generation(), 1);
+        assert_eq!(engine.bump_checkpoint_generation(), 2, "generation is monotonic");
+        engine.close();
+    }
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    assert_eq!(
+        engine.committed_generation, 2,
+        "recovered checkpoint generation survives a reopen",
+    );
+    assert_eq!(
+        engine.recorded_topology, expected_topology,
+        "recovered topology (worker_count << 32 | STATE_FORMAT) survives a reopen",
+    );
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The `>= FIRST_USER_TABLE_ID` recovery guard must ignore a stray sequence id
 /// in the empty 4..16 gap, never misclassifying it as a user sequence.
 #[test]

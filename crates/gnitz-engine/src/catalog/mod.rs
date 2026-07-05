@@ -52,7 +52,10 @@ use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, CursorHandle, PartitionedTable, RecoverySource, Routing, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
-pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_TAB_ID};
+pub(crate) use sys_tables::{
+    FIRST_USER_TABLE_ID, SEQ_ID_CHECKPOINT_GEN, SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_ID_TOPOLOGY,
+    SEQ_TAB_ID,
+};
 pub(crate) use sys_tables::{IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS};
 pub(crate) use sys_tables::{IDX_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID};
 // The fixed system-table schema for a family tid. The production DDL decode
@@ -117,6 +120,17 @@ pub struct CatalogEngine {
     pub(crate) user_sequences: std::collections::HashMap<i64, i64>,
     pub(crate) active_part_start: u32,
     pub(crate) active_part_end: u32,
+
+    /// The committed checkpoint generation. Recovered from `SEQ_ID_CHECKPOINT_GEN`
+    /// at boot (0 on a fresh DB), bumped once per checkpoint via
+    /// `bump_checkpoint_generation`. Fork-inherited by workers as the generation
+    /// their scratch tables gate reload on (commit 3).
+    pub(crate) committed_generation: u64,
+    /// The topology row last recorded: `(worker_count as u64) << 32 | STATE_FORMAT`.
+    /// Recovered from `SEQ_ID_TOPOLOGY` at boot (0 on a fresh DB); commit 3
+    /// compares it against the launched worker count + `STATE_FORMAT` to decide
+    /// whether persisted view state is reloadable.
+    pub(crate) recorded_topology: u64,
 
     // --- System tables (owned, single-partition, durable) ---
     pub(crate) sys_schemas: Box<Table>,

@@ -6,16 +6,17 @@ use crate::foundation::posix_io::open_owned;
 use crate::schema::MAX_PK_BYTES;
 
 // ---------------------------------------------------------------------------
-// Manifest file format (V4)
+// Manifest file format (V6)
 // ---------------------------------------------------------------------------
 //
 // Header (64 bytes):
 //   [0,8)   Magic   0x4D414E49464E5447
-//   [8,16)  Version u64 (5)
+//   [8,16)  Version u64 (6)
 //   [16,24) Count   u64
 //   [24,32) Global max LSN u64
 //   [32,40) Compaction sequence u64
-//   [40,64) Reserved
+//   [40,48) Checkpoint generation u64
+//   [48,64) Reserved
 //
 // Entry (338 bytes each):
 //   [0,8)     table_id   u64
@@ -33,12 +34,21 @@ use crate::schema::MAX_PK_BYTES;
 // single-PK only and out of scope here.
 
 const MAGIC: u64 = 0x4D414E49464E5447;
-const VERSION_V5: u64 = 5;
+const VERSION_V6: u64 = 6;
 const HEADER_SIZE: usize = 64;
-const ENTRY_SIZE_V4: usize = 338;
+const ENTRY_SIZE_V6: usize = 338;
+
+/// Operator-state / on-disk-layout format version. Bump on any change to an
+/// operator-state schema or to the shard/manifest layout; a mismatch (recorded
+/// in `_sequences` via `SEQ_ID_TOPOLOGY`) wipes all Rederive view state at boot,
+/// always correct because it re-derives.
+pub const STATE_FORMAT: u32 = 1;
 
 // Header offset of the per-table compaction sequence.
 const OFF_COMPACT_SEQ: usize = 32;
+
+// Header offset of the checkpoint generation (V6).
+const OFF_GENERATION: usize = 40;
 
 // Field offsets within an entry, kept in sync with the doc-comment above.
 const OFF_TABLE_ID: usize = 0;
@@ -56,14 +66,14 @@ const OFF_GUARD_KEY: usize = 322;
 // in-memory struct is not #[repr(C)], so size_of is unrelated to the
 // 338-byte on-disk image.
 const _: () = assert!(
-    ENTRY_SIZE_V4 == 8 + (1 + 80) + (1 + 80) + 8 + 8 + 128 + 8 + 16,
-    "V4 entry field widths do not sum to ENTRY_SIZE_V4",
+    ENTRY_SIZE_V6 == 8 + (1 + 80) + (1 + 80) + 8 + 8 + 128 + 8 + 16,
+    "V6 entry field widths do not sum to ENTRY_SIZE_V6",
 );
 // The 81-byte PkBuf field windows are fixed. A wider MAX_PK_BYTES would
 // silently grow PkBuf::bytes while the windows stay fixed, so serialize's
 // copy_from_slice of the full bytes array would panic at runtime. Force
-// a deliberate build break (→ V5 format decision) instead.
-const _: () = assert!(MAX_PK_BYTES == 80, "V4 manifest layout assumes an 80-byte PK capacity",);
+// a deliberate build break (→ V7 format decision) instead.
+const _: () = assert!(MAX_PK_BYTES == 80, "V6 manifest layout assumes an 80-byte PK capacity",);
 
 // `PkBuf` — the width-tagged PK byte buffer — now lives in `schema::key`
 // (its `Ord` delegates to `compare_pk_bytes`, which moved there too).
@@ -114,6 +124,11 @@ impl ManifestEntryRaw {
 pub struct ManifestHeader {
     pub global_max_lsn: u64,
     pub compact_seq: u64,
+    /// Checkpoint generation this manifest was published at (V6). Stamped at
+    /// every publish from `worker_ctx::committed_generation`; `SalReplay` tables
+    /// write whatever the atomic holds and never read it back, `Rederive` view
+    /// tables gate their conditional reload on it.
+    pub generation: u64,
 }
 
 /// Serialize manifest entries into `out_buf`.
@@ -124,7 +139,7 @@ pub fn serialize(
     header: ManifestHeader,
 ) -> Result<usize, StorageError> {
     let count = entries.len();
-    let total = HEADER_SIZE + count * ENTRY_SIZE_V4;
+    let total = HEADER_SIZE + count * ENTRY_SIZE_V6;
     if out_buf.len() < total {
         return Err(StorageError::BufferTooSmall);
     }
@@ -134,10 +149,11 @@ pub fn serialize(
 
     // Write header
     write_u64_le(out_buf, 0, MAGIC);
-    write_u64_le(out_buf, 8, VERSION_V5);
+    write_u64_le(out_buf, 8, VERSION_V6);
     write_u64_le(out_buf, 16, count as u64);
     write_u64_le(out_buf, 24, header.global_max_lsn);
     write_u64_le(out_buf, OFF_COMPACT_SEQ, header.compact_seq);
+    write_u64_le(out_buf, OFF_GENERATION, header.generation);
 
     // Write entries field-by-field (symmetric with parse; immune to padding changes).
     // Each PkBuf is written as `len: u8` then the full 80-byte `bytes`
@@ -145,7 +161,7 @@ pub fn serialize(
     // construction, so the on-disk image is deterministic regardless of
     // the zero-init of the output buffer.
     for (i, e) in entries.iter().enumerate().take(count) {
-        let off = HEADER_SIZE + i * ENTRY_SIZE_V4;
+        let off = HEADER_SIZE + i * ENTRY_SIZE_V6;
         write_u64_le(out_buf, off + OFF_TABLE_ID, e.table_id);
         out_buf[off + OFF_PK_MIN] = e.pk_min.len;
         out_buf[off + OFF_PK_MIN + 1..off + OFF_PK_MIN + 1 + MAX_PK_BYTES].copy_from_slice(&e.pk_min.bytes);
@@ -185,13 +201,14 @@ pub fn parse(
     let header = ManifestHeader {
         global_max_lsn: read_u64_le(buf, 24),
         compact_seq: read_u64_le(buf, OFF_COMPACT_SEQ),
+        generation: read_u64_le(buf, OFF_GENERATION),
     };
 
-    if version != VERSION_V5 {
+    if version != VERSION_V6 {
         return Err(StorageError::InvalidVersion);
     }
 
-    let body = count.checked_mul(ENTRY_SIZE_V4).ok_or(StorageError::Truncated)?;
+    let body = count.checked_mul(ENTRY_SIZE_V6).ok_or(StorageError::Truncated)?;
     let expected_data = HEADER_SIZE.checked_add(body).ok_or(StorageError::Truncated)?;
     if buf.len() < expected_data {
         return Err(StorageError::Truncated);
@@ -199,7 +216,7 @@ pub fn parse(
 
     let n = count.min(max_entries as usize);
     for (i, out_entry) in out_entries.iter_mut().enumerate().take(n) {
-        let off = HEADER_SIZE + i * ENTRY_SIZE_V4;
+        let off = HEADER_SIZE + i * ENTRY_SIZE_V6;
         let mut entry = ManifestEntryRaw::zeroed();
 
         entry.table_id = read_u64_le(buf, off + OFF_TABLE_ID);
@@ -237,7 +254,7 @@ fn parse_pkbuf(buf: &[u8], field_off: usize) -> Result<PkBuf, StorageError> {
 
 /// Returns the buffer size needed to serialize `count` entries.
 pub const fn serialized_size(count: usize) -> usize {
-    HEADER_SIZE + count * ENTRY_SIZE_V4
+    HEADER_SIZE + count * ENTRY_SIZE_V6
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +386,7 @@ mod tests {
         ManifestHeader {
             global_max_lsn,
             compact_seq,
+            generation: 0,
         }
     }
 
@@ -424,11 +442,11 @@ mod tests {
 
     #[test]
     fn parse_rejects_count_overflow() {
-        // A corrupt header whose count * ENTRY_SIZE_V4 overflows usize must be
+        // A corrupt header whose count * ENTRY_SIZE_V6 overflows usize must be
         // rejected, not wrap past the length check.
         let mut buf = vec![0u8; HEADER_SIZE];
         write_u64_le(&mut buf, 0, MAGIC);
-        write_u64_le(&mut buf, 8, VERSION_V5);
+        write_u64_le(&mut buf, 8, VERSION_V6);
         write_u64_le(&mut buf, 16, u64::MAX); // count
         let mut out = [ManifestEntryRaw::zeroed(); 1];
         let r = parse(&buf, &mut out, 1);
@@ -494,6 +512,26 @@ mod tests {
             assert_eq!(out[i].guard_key, entries[i].guard_key);
             assert_eq!(out[i].filename, entries[i].filename);
         }
+    }
+
+    #[test]
+    fn generation_roundtrip() {
+        // The V6 generation stamp must survive serialize/parse. Construct the
+        // header directly (not via the process-global `committed_generation`
+        // atomic, which `cargo test` shares across threads).
+        let entries = vec![make_entry(1, "shard_1.db")];
+        let header = ManifestHeader {
+            global_max_lsn: 1234,
+            compact_seq: 9,
+            generation: 42,
+        };
+        let mut buf = vec![0u8; serialized_size(1)];
+        serialize(&mut buf, &entries, header).unwrap();
+
+        let mut out = vec![ManifestEntryRaw::zeroed(); 1];
+        let (count, got) = parse(&buf, &mut out, 1).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(got, header, "generation must round-trip through serialize/parse");
     }
 
     #[test]

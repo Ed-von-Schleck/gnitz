@@ -21,6 +21,11 @@ pub(super) const OWNER_KIND_VIEW: i64 = gnitz_wire::OWNER_KIND_VIEW as i64;
 pub(crate) const SEQ_ID_SCHEMAS: i64 = 1;
 pub(crate) const SEQ_ID_TABLES: i64 = 2;
 pub(crate) const SEQ_ID_INDICES: i64 = 3;
+/// Committed checkpoint generation (monotonic). Falls in the ignored 4..16 gap
+/// of `observe_user_sequence`, so a fresh DB writing no row defaults it to 0.
+pub(crate) const SEQ_ID_CHECKPOINT_GEN: i64 = 4;
+/// Cluster topology: `(worker_count as u64) << 32 | STATE_FORMAT as u64`.
+pub(crate) const SEQ_ID_TOPOLOGY: i64 = 5;
 
 pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
