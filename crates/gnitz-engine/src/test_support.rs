@@ -184,3 +184,23 @@ pub(crate) fn arb_type_code() -> impl Strategy<Value = u8> {
 pub(crate) fn arb_pk_type() -> impl Strategy<Value = u8> {
     arb_type_code().prop_filter("type code must be PK-eligible", |&tc| gnitz_wire::is_pk_eligible(tc))
 }
+
+/// Re-run the current test binary filtered to `internal_test` (with `envs`
+/// set) and assert the child `gnitz_fatal_abort!`s — `_exit(134)` is a normal
+/// (non-signal) exit on Linux, so `code() == Some(134)`. A direct in-process
+/// call would terminate the test runner; a clean subprocess also avoids any
+/// multi-threaded fork hazard. The internal test must guard on one of the
+/// `envs` vars so a normal test sweep skips it.
+pub(crate) fn assert_test_aborts_134(internal_test: &str, envs: &[(&str, &str)]) {
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.arg(internal_test);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let status = cmd.status().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(134),
+        "{internal_test} must gnitz_fatal_abort! (exit 134)",
+    );
+}

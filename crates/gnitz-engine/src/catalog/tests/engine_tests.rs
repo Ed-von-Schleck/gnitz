@@ -93,7 +93,7 @@ fn test_orphaned_metadata_recovery() {
         bb.put_u64(0); // is_unique
         bb.put_string(""); // cache_dir
         bb.end_row();
-        ingest_batch_into(&mut engine.sys_indices, &bb.finish());
+        engine.sys_indices.ingest_borrowed_batch(&bb.finish()).unwrap();
         let _ = engine.sys_indices.flush();
         engine.close();
         drop(engine);
@@ -189,7 +189,7 @@ fn test_recover_ignores_sub_user_seq_id() {
         bb.begin_row(stray as u128, 1);
         bb.put_u64(999);
         bb.end_row();
-        ingest_batch_into(&mut engine.sys_sequences, &bb.finish());
+        engine.sys_sequences.ingest_borrowed_batch(&bb.finish()).unwrap();
         let _ = engine.sys_sequences.flush();
         engine.close();
     }
@@ -222,7 +222,7 @@ fn test_sequence_gap_recovery() {
         bb.put_u64(0); // created_lsn
         bb.put_u64(0); // flags
         bb.end_row();
-        ingest_batch_into(&mut engine.sys_tables, &bb.finish());
+        engine.sys_tables.ingest_borrowed_batch(&bb.finish()).unwrap();
 
         // Inject column record for tid=250
         let col_schema = col_tab_schema();
@@ -239,7 +239,7 @@ fn test_sequence_gap_recovery() {
         cbb.put_u64(0); // fk_col_idx
         cbb.put_u64(0); // is_serial
         cbb.end_row();
-        ingest_batch_into(&mut engine.sys_columns, &cbb.finish());
+        engine.sys_columns.ingest_borrowed_batch(&cbb.finish()).unwrap();
 
         let _ = engine.sys_tables.flush();
         let _ = engine.sys_columns.flush();

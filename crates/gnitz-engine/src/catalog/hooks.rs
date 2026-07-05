@@ -633,20 +633,26 @@ impl CatalogEngine {
                 let cleanup_idx = self.pending_dir_deletions.len();
                 self.pending_dir_deletions.push(idx_dir.clone());
 
-                let idx_table = Table::new(
-                    &idx_dir,
-                    &format!("_idx_{idx_id}"),
-                    idx_schema,
-                    idx_id as u32,
-                    SYS_TABLE_ARENA,
-                    RecoverySource::Rederive,
-                )
-                .map_err(|e| format!("Failed to create index table: error {e}"))?;
+                // Homed at THIS process's per-rank dir (workers) or the index
+                // dir itself (master/standalone). The parent `idx_dir` is what
+                // stays staged in pending_dir_deletions — recursive removal
+                // reclaims the rank subdirs too on a failed create or a DROP.
+                let idx_table = new_index_table(&idx_dir, idx_id, idx_schema)?;
 
                 let mut idx_table_box = Box::new(idx_table);
                 let idx_table_ptr = &mut *idx_table_box as *mut Table;
-                if !self.ctx.in_rollback() {
-                    self.backfill_index(owner_id, cols.as_slice(), is_unique, idx_table_ptr, &idx_schema)?;
+                // The master never populates its index copies (they stay
+                // permanently empty; distributed HAS_PK/seek probes union the
+                // workers' slice-local copies). Workers and standalone backfill
+                // from their local base slice.
+                if !self.ctx.in_rollback() && !crate::foundation::worker_ctx::is_master() {
+                    self.backfill_index(
+                        owner_id,
+                        cols.as_slice(),
+                        idx_table_ptr,
+                        &idx_schema,
+                        is_unique && self.ctx.is_live(),
+                    )?;
                 }
                 self.dag
                     .add_index_circuit(owner_id, cols.as_slice(), idx_id, idx_table_box, idx_schema, is_unique);

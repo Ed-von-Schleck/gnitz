@@ -106,7 +106,12 @@ impl CatalogEngine {
         let table = self
             .sys_table_mut(id)
             .expect("SysFamily::id() maps to a known sys table");
-        ingest_batch_into(table, batch);
+        // Live DDL's one sound non-fatal exit: a failure here is pre-broadcast
+        // (nothing durable, nothing broadcast, client not ACKed), so Stage-A
+        // compensation can unwind it. Propagate rather than abort.
+        table
+            .ingest_borrowed_batch(batch)
+            .map_err(|e| format!("apply_local: sys-table ingest failed (family={id}): {e}"))?;
         if let Some(lsn) = pin_lsn {
             table.current_lsn = lsn.get();
         }
@@ -673,6 +678,7 @@ impl CatalogEngine {
                         }
                         let idx_full = format!("{full}/{idx_name}");
                         if live_indices.contains(&idx_full) {
+                            remove_stale_index_rank_dirs(&idx_full);
                             continue;
                         }
                         match std::fs::remove_dir_all(&idx_full) {

@@ -24,13 +24,42 @@ static WORKER_RANK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 /// plan-cache invalidation.
 static NUM_WORKERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-/// Set the calling process's worker rank and worker count. Called post-fork
-/// before any view is compiled, so the scratch tables a worker opens carry its
-/// own rank and its `PartitionFilter` nodes are emitted with this process's
-/// `(worker_id, num_workers)`.
+/// This process's role in the multi-process server: `0` Standalone (the
+/// default — unit tests and any in-process embedding), `1` Master (the pre-fork
+/// dispatcher), `2` Worker (a forked slice owner). Set once per process:
+/// `set_master_role` before `CatalogEngine::open`, `set_worker_rank` in the
+/// forked child before any catalog work. Role-dependent behavior (index
+/// backfill homing) is covered by the e2e suite over a real fork; unit tests
+/// must never set a role — `cargo test` shares one process across test threads.
+static ROLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+const ROLE_MASTER: u8 = 1;
+const ROLE_WORKER: u8 = 2;
+
+/// Set the calling process's worker rank and worker count, and latch its role
+/// to Worker. Called post-fork before any view is compiled, so the scratch
+/// tables a worker opens carry its own rank, its `PartitionFilter` nodes are
+/// emitted with this process's `(worker_id, num_workers)`, and its index tables
+/// home into a per-rank subdirectory.
 pub(crate) fn set_worker_rank(rank: u32, num_workers: u32) {
     WORKER_RANK.store(rank, std::sync::atomic::Ordering::Relaxed);
     NUM_WORKERS.store(num_workers.max(1), std::sync::atomic::Ordering::Relaxed);
+    ROLE.store(ROLE_WORKER, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Latch this process's role to Master. Called at the top of `server_main`,
+/// before `CatalogEngine::open`, so the pre-fork catalog replay hooks already
+/// see Master (and skip the index backfill their forked children rebuild).
+pub(crate) fn set_master_role() {
+    ROLE.store(ROLE_MASTER, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn is_master() -> bool {
+    ROLE.load(std::sync::atomic::Ordering::Relaxed) == ROLE_MASTER
+}
+
+pub(crate) fn is_worker() -> bool {
+    ROLE.load(std::sync::atomic::Ordering::Relaxed) == ROLE_WORKER
 }
 
 pub(crate) fn worker_rank() -> u32 {

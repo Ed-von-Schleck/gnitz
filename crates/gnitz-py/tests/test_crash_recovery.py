@@ -793,3 +793,342 @@ def test_master_sys_flush_failure_preserves_sal():
         _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Slice-local secondary indexes: post-restart correctness.
+#
+# Before slice-local unification, a boot-recovered index was a full copy
+# replicated on every worker (plus a dead full copy on the master). Post-restart
+# the foreign (W-1)/W fraction of each worker's copy went stale as those rows
+# churned on their owning workers, so the distributed unique/FK probes — which
+# union raw index hits across workers — saw phantom entries. These four tests
+# pin the fixed behavior: every worker's index holds exactly its own base slice,
+# so the master's HAS_PK / seek union over workers is exactly global existence.
+# They pass at any worker count and would fail pre-fix at GNITZ_WORKERS >= 2.
+# ---------------------------------------------------------------------------
+
+
+def test_unique_reinsert_after_restart():
+    """A unique value held at boot, then deleted post-restart, must be
+    re-insertable (bugs 1 and 4). Pre-fix, non-owning workers keep the value's
+    stale +1 forever in their full boot index copy; the DELETE nets it to 0 only
+    on the owning worker, so the re-INSERT's FLAG_HAS_PK union hits a stale
+    worker and is falsely rejected as a unique violation."""
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # ---- Phase 1: table with a UNIQUE column, one holder of u=5. ------
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("ureinsert")
+        conn.execute_sql(
+            "CREATE TABLE t ("
+            "  id BIGINT NOT NULL PRIMARY KEY,"
+            "  u BIGINT NOT NULL UNIQUE)",
+            schema_name="ureinsert",
+        )
+        conn.execute_sql("INSERT INTO t VALUES (1, 5)", schema_name="ureinsert")
+        conn.close()
+
+        # ---- Phase 2: restart (every worker rebuilds its index slice-local),
+        # delete the sole holder, then re-insert u=5 under a fresh PK. --------
+        proc = _restart_server(proc, data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.execute_sql("DELETE FROM t WHERE id = 1", schema_name="ureinsert")
+        # Must succeed: no live row holds u=5 anywhere after the delete.
+        conn.execute_sql("INSERT INTO t VALUES (2, 5)", schema_name="ureinsert")
+
+        tid, _ = conn.resolve_table("ureinsert", "t")
+        rows = [r for r in conn.scan(tid) if r.weight > 0]
+        assert len(rows) == 1, f"expected exactly one live row, got {rows}"
+        assert rows[0]["id"] == 2 and rows[0]["u"] == 5, f"unexpected row: {rows[0]}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_fk_no_orphan_after_restart():
+    """An FK child referencing a parent value deleted post-restart must be
+    rejected — the orphan must not be admitted (bug 2). The parent-existence
+    probe broadcast-seeks the parent's UNIQUE index; pre-fix a stale worker
+    still holds the deleted value and answers 'present', admitting the orphan."""
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # ---- Phase 1: parent P(u UNIQUE), child C.f -> P(u); P holds u=5. --
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("fkorphan")
+        conn.execute_sql(
+            "CREATE TABLE p ("
+            "  id BIGINT NOT NULL PRIMARY KEY,"
+            "  u BIGINT NOT NULL UNIQUE)",
+            schema_name="fkorphan",
+        )
+        conn.execute_sql(
+            "CREATE TABLE c ("
+            "  id BIGINT NOT NULL PRIMARY KEY,"
+            "  f BIGINT NOT NULL REFERENCES p(u))",
+            schema_name="fkorphan",
+        )
+        conn.execute_sql("INSERT INTO p VALUES (1, 5)", schema_name="fkorphan")
+        conn.close()
+
+        # ---- Phase 2: restart, delete the parent, then try to insert a child
+        # referencing the now-absent value — must FAIL. ----------------------
+        proc = _restart_server(proc, data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.execute_sql("DELETE FROM p WHERE id = 1", schema_name="fkorphan")
+        with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+            conn.execute_sql("INSERT INTO c VALUES (10, 5)", schema_name="fkorphan")
+
+        # The rejected child must leave no row behind.
+        cid, _ = conn.resolve_table("fkorphan", "c")
+        rows = [r for r in conn.scan(cid) if r.weight > 0]
+        assert len(rows) == 0, f"orphan child was admitted: {rows}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_fk_restrict_update_after_restart():
+    """Retargeting a parent's referenced value must succeed once its only child
+    is gone, even across a restart (bug 3). The RESTRICT check probes the child's
+    FK index for the old value; pre-fix a stale worker still holds the deleted
+    child entry and falsely blocks the update."""
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # ---- Phase 1: P(u UNIQUE), C.f -> P(u); one parent and one child. --
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("fkrestrict")
+        conn.execute_sql(
+            "CREATE TABLE p ("
+            "  id BIGINT NOT NULL PRIMARY KEY,"
+            "  u BIGINT NOT NULL UNIQUE)",
+            schema_name="fkrestrict",
+        )
+        conn.execute_sql(
+            "CREATE TABLE c ("
+            "  id BIGINT NOT NULL PRIMARY KEY,"
+            "  f BIGINT NOT NULL REFERENCES p(u))",
+            schema_name="fkrestrict",
+        )
+        conn.execute_sql("INSERT INTO p VALUES (1, 5)", schema_name="fkrestrict")
+        conn.execute_sql("INSERT INTO c VALUES (10, 5)", schema_name="fkrestrict")
+        # Remove the only child, so the parent value is free to retarget.
+        conn.execute_sql("DELETE FROM c WHERE id = 10", schema_name="fkrestrict")
+        conn.close()
+
+        # ---- Phase 2: restart, then retarget the parent value — must SUCCEED
+        # because no child references u=5 anymore. ---------------------------
+        proc = _restart_server(proc, data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.execute_sql("UPDATE p SET u = 6", schema_name="fkrestrict")
+
+        pid, _ = conn.resolve_table("fkrestrict", "p")
+        rows = [r for r in conn.scan(pid) if r.weight > 0]
+        assert len(rows) == 1 and rows[0]["u"] == 6, f"update did not take: {rows}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_secondary_index_select_after_restart():
+    """A non-unique secondary index spanning partitions must return the correct
+    holder set after a restart, and stay correct under post-restart INSERT/DELETE
+    — guarding the boot backfill-before-SAL-replay seam (a rebuild after replay
+    would double-count the committed tail; before, but skipping replay, would
+    drop it). Read through the distributed seek path, which merges every worker's
+    slice-local index and resolves hits against the local base slice."""
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # ---- Phase 1: 30 rows across partitions; every third shares g=7. --
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("sidx")
+        conn.execute_sql(
+            "CREATE TABLE t ("
+            "  id BIGINT NOT NULL PRIMARY KEY,"
+            "  g BIGINT NOT NULL)",
+            schema_name="sidx",
+        )
+        values = ", ".join(f"({i}, {7 if i % 3 == 0 else 1000 + i})" for i in range(30))
+        conn.execute_sql(f"INSERT INTO t VALUES {values}", schema_name="sidx")
+        conn.execute_sql("CREATE INDEX ON t(g)", schema_name="sidx")
+        conn.close()
+
+        # ---- Phase 2: restart, then read the index for g=7 via seek. -------
+        proc = _restart_server(proc, data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        tid, _ = conn.resolve_table("sidx", "t")
+
+        def seek_g7():
+            res = conn.seek_by_index(tid, [1], [7])
+            return sorted(res.batch.pks) if res.batch is not None else []
+
+        expected = sorted(i for i in range(30) if i % 3 == 0)  # {0,3,...,27}
+        assert seek_g7() == expected, "g=7 holders must survive restart exactly"
+
+        # ---- Phase 3: post-restart mutation flows through the rebuilt index.
+        conn.execute_sql("DELETE FROM t WHERE id = 0", schema_name="sidx")
+        conn.execute_sql("INSERT INTO t VALUES (100, 7)", schema_name="sidx")
+        expected2 = sorted([i for i in expected if i != 0] + [100])
+        assert seek_g7() == expected2, "index must track post-restart INSERT/DELETE"
+
+        # Base multiplicity is exactly-once (no doubled weights).
+        live = [r for r in conn.scan(tid) if r.weight > 0]
+        assert all(r.weight == 1 for r in live), "base weights must be exactly one"
+        assert len(live) == 30, f"expected 30 live rows, got {len(live)}"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Fail-stop on storage errors while applying committed state.
+#
+# The GNITZ_INJECT_INGEST_APPLY_ERROR=store|index debug seam substitutes an
+# Err for the matching ingest inside DagEngine::ingest_store_and_indices — the
+# base-table PUSH apply and the SAL-replay apply. The old code swallowed the
+# error, leaving the worker's state diverged from the durable SAL while the
+# client held an ACK; the next checkpoint then orphaned the ACKed data forever.
+# The fix aborts at the point of detection so restart + SAL replay re-applies it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("inject,with_index", [("store", False), ("index", True)])
+def test_ingest_apply_error_aborts_and_replays(inject, with_index):
+    """A storage error applying a committed PUSH must abort the cluster, and the
+    ACKed rows the old code silently lost must come back via SAL replay.
+
+    Phase 2 arms the seam and INSERTs: the owning worker aborts inside
+    ingest_store_and_indices, the master's worker_watcher turns the dead worker
+    into a cluster shutdown. Phase 3 boots clean and every inserted PK is present
+    — the load-bearing assertion (the un-flushed PUSH zone stayed above the
+    watermark and was replayed)."""
+    if not is_debug_build():
+        pytest.skip("requires debug build (GNITZ_INJECT_INGEST_APPLY_ERROR seam)")
+
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # ---- Phase 1: clean server; CREATE TABLE (+ INDEX for the variant). --
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("apply_err")
+        conn.execute_sql(
+            "CREATE TABLE t ("
+            "  pk BIGINT NOT NULL PRIMARY KEY,"
+            "  val BIGINT NOT NULL)",
+            schema_name="apply_err",
+        )
+        if with_index:
+            conn.execute_sql("CREATE INDEX ON t(val)", schema_name="apply_err")
+        conn.close()
+
+        # ---- Phase 2: restart with the seam armed; the INSERT must abort. ----
+        proc = _restart_server(
+            proc, data_dir, sock_path, workers=_NUM_WORKERS,
+            extra_env={"GNITZ_INJECT_INGEST_APPLY_ERROR": inject},
+        )
+        conn = gnitz.connect(sock_path)
+        try:
+            # The ACK races the abort — the apply aborts before it can be sent,
+            # so this raises on a dead socket (or, rarely, returns just before).
+            conn.execute_sql(
+                "INSERT INTO t VALUES (1, 100), (2, 200), (3, 300), (4, 400), (5, 500)",
+                schema_name="apply_err",
+            )
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        # The seam aborts the owning worker; worker_watcher detects the dead
+        # worker, reports it, and fans it into a graceful cluster shutdown (the
+        # master then exits 0). The proof the abort fired: the process terminated
+        # (not hung) and the master reported the crash.
+        proc.wait(timeout=15)
+        stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+        assert "crashed" in stderr, (
+            f"master must report the aborted worker, got stderr tail: {stderr[-500:]}"
+        )
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 3: clean boot recovers every ACked/attempted row. ---------
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        tid, _ = conn.resolve_table("apply_err", "t")
+        rows = list(conn.scan(tid))
+        pks = {r["pk"] for r in rows}
+        assert pks == {1, 2, 3, 4, 5}, (
+            f"SAL replay must restore the rows the swallow would have orphaned: got {pks}"
+        )
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_boot_replay_apply_error_aborts_boot():
+    """A storage error while replaying a committed PUSH at boot must abort the
+    boot BEFORE the master zeroes the SAL sentinel, so the rows' only durable
+    copy (the SAL) survives for the next boot.
+
+    Without the fix the worker swallows the replay error, acks readiness, and
+    the master resets the SAL — destroying every un-checkpointed pre-crash row."""
+    if not is_debug_build():
+        pytest.skip("requires debug build (GNITZ_INJECT_INGEST_APPLY_ERROR seam)")
+
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        # ---- Phase 1: create + insert, SIGKILL before any checkpoint. --------
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("replay_err")
+        conn.execute_sql(
+            "CREATE TABLE t ("
+            "  pk BIGINT NOT NULL PRIMARY KEY,"
+            "  val BIGINT NOT NULL)",
+            schema_name="replay_err",
+        )
+        conn.execute_sql(
+            "INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)",
+            schema_name="replay_err",
+        )
+        conn.close()
+        # Rows live only in the SAL + memtable, never flushed.
+        _stop_server(proc)
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 2: boot with the seam armed must FAIL during SAL replay. --
+        # The worker aborts inside ingest_store_and_indices while replaying the
+        # committed PUSH zone, before its readiness ACK, so the master fails
+        # wait_all_workers before zeroing the SAL sentinel.
+        proc = _start_server(
+            data_dir, sock_path, workers=_NUM_WORKERS,
+            extra_env={"GNITZ_INJECT_INGEST_APPLY_ERROR": "store"},
+            expect_socket=False,
+        )
+        rc = proc.wait(timeout=15)
+        assert rc != 0, f"boot should have aborted during SAL replay, got rc={rc}"
+        assert not os.path.exists(sock_path), "failed boot must not accept requests"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # ---- Phase 3: a clean boot recovers every pre-crash row. -------------
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        tid, _ = conn.resolve_table("replay_err", "t")
+        rows = list(conn.scan(tid))
+        assert {r["pk"] for r in rows} == {1, 2, 3}, "SAL must survive the failed boot"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)

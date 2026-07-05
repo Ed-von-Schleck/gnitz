@@ -11,6 +11,25 @@ use crate::storage::{Batch, CursorHandle};
 // Execution
 // ---------------------------------------------------------------------------
 
+/// Storage failure while integrating a tick's delta into an owned table: the
+/// view/history state has diverged from its durable inputs and there is no
+/// sound continue (dropping the delta permanently desyncs the integral).
+/// Mirrors `dag::vm_epoch_result`'s fail-stop; recovery is restart + SAL replay.
+/// Funneling these through a new `vm_epoch_result` error code was rejected —
+/// that abort's message is reserved for malformed-circuit codes and would
+/// mislead debugging.
+fn fatal_on_tick_ingest_err(op: &str, table_idx: i32, r: Result<(), crate::storage::StorageError>) {
+    if let Err(e) = r {
+        crate::gnitz_fatal_abort!(
+            "vm: {} ingest failed (table_idx={}): {} — tick state diverged \
+             from durable inputs; aborting for restart+SAL replay",
+            op,
+            table_idx,
+            e,
+        );
+    }
+}
+
 /// Execute one epoch of a compiled program.
 ///
 /// The input_batch is moved into `input_reg`.  After execution, the output
@@ -285,7 +304,8 @@ pub(crate) fn execute_epoch_multi(
                     if *hist_table_idx >= 0 {
                         let ptr = program.tables[*hist_table_idx as usize];
                         let table = unsafe { &mut *ptr };
-                        let _ = table.ingest_owned_batch(consolidated);
+                        let res = table.ingest_owned_batch(consolidated);
+                        fatal_on_tick_ingest_err("weight-clamp history", *hist_table_idx as i32, res);
                     }
                 }
                 // If cursor is null, in_reg retains its data (not consumed).
@@ -378,7 +398,8 @@ pub(crate) fn execute_epoch_multi(
                     target.is_some(),
                     avi_desc.is_some()
                 );
-                let _ = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, target, &schema, avi_desc.as_ref());
+                let res = ops::op_integrate_with_indexes(&reg!(*in_reg).batch, target, &schema, avi_desc.as_ref());
+                fatal_on_tick_ingest_err("integrate", *table_idx, res);
             }
 
             Instr::Reduce {
@@ -498,5 +519,31 @@ pub(crate) fn execute_epoch_multi(
         Ok(Some(result))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod fail_stop_tests {
+    use super::fatal_on_tick_ingest_err;
+    use crate::storage::StorageError;
+
+    // A storage error while integrating a tick delta must _exit(134).
+    #[test]
+    fn test_fatal_on_tick_ingest_err_exit_status() {
+        crate::test_support::assert_test_aborts_134(
+            "fatal_on_tick_ingest_err_internal",
+            &[("GNITZ_RUN_TICK_ABORT_TEST", "1")],
+        );
+    }
+
+    // Guard: runs the abort only under GNITZ_RUN_TICK_ABORT_TEST (set by the
+    // parent). A returning call would fail the `unreachable!`.
+    #[test]
+    fn fatal_on_tick_ingest_err_internal() {
+        if std::env::var("GNITZ_RUN_TICK_ABORT_TEST").is_err() {
+            return;
+        }
+        fatal_on_tick_ingest_err("integrate", 7, Err(StorageError::Io));
+        unreachable!("fatal_on_tick_ingest_err must not return on Err");
     }
 }

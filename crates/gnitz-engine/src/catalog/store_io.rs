@@ -14,14 +14,9 @@ impl CatalogEngine {
         if table_id < FIRST_USER_TABLE_ID {
             return Err("ingest_returning_effective not supported for system tables".to_string());
         }
-        let (rc, effective_opt) = self.dag.ingest_returning_effective(table_id, batch);
-        if rc < 0 {
-            return Err(format!("ingest failed for table_id={table_id} rc={rc}"));
-        }
-        match effective_opt {
-            Some(eff) => Ok(eff),
-            None => Err(format!("ingest returned no effective batch for table_id={table_id}")),
-        }
+        self.dag
+            .ingest_returning_effective(table_id, batch)
+            .ok_or_else(|| format!("ingest failed for table_id={table_id}: not registered"))
     }
 
     /// Scan all positive-weight rows from a table.
@@ -393,12 +388,9 @@ impl CatalogEngine {
             }
             Ok(())
         } else {
-            let rc = self.dag.flush(table_id);
-            if rc < 0 {
-                Err(format!("flush failed for table_id={table_id} rc={rc}"))
-            } else {
-                Ok(())
-            }
+            self.dag
+                .flush(table_id)
+                .map_err(|e| format!("flush failed for table_id={table_id}: {e}"))
         }
     }
 
@@ -446,7 +438,13 @@ impl CatalogEngine {
         let table = self
             .sys_table_mut(table_id)
             .ok_or_else(|| format!("Unknown system table_id {table_id}"))?;
-        let _ = table.ingest_owned_batch(batch);
+        // Propagate into the worker's DdlSync-fatal path (dispatch treats a
+        // DdlSync error as fatal: STATUS_ERROR + shutdown + _exit, which the
+        // master's worker_watcher turns into a cluster abort). A swallowed
+        // storage failure here diverges this worker's catalog from the master.
+        table
+            .ingest_owned_batch(batch)
+            .map_err(|e| format!("ddl_sync: sys-table ingest failed (table_id={table_id}): {e}"))?;
         Ok(())
     }
 
@@ -457,7 +455,10 @@ impl CatalogEngine {
             .tables
             .get(&table_id)
             .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
-        let _ = entry.handle.ingest_owned_batch(batch);
+        entry
+            .handle
+            .ingest_owned_batch(batch)
+            .map_err(|e| format!("raw_store_ingest: ingest failed (table_id={table_id}): {e}"))?;
         Ok(())
     }
 
@@ -477,11 +478,10 @@ impl CatalogEngine {
             // System tables: use raw ingest (no unique_pk semantics).
             return self.raw_store_ingest(table_id, batch);
         }
-        let (rc, _effective) = self.dag.ingest_returning_effective(table_id, batch);
-        if rc < 0 {
-            return Err(format!("replay_ingest failed for table_id={table_id} rc={rc}"));
-        }
-        Ok(())
+        self.dag
+            .ingest_returning_effective(table_id, batch)
+            .map(|_| ())
+            .ok_or_else(|| format!("replay_ingest failed for table_id={table_id}: not registered"))
     }
 
     // -- Scan store -------------------------------------------------------

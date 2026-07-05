@@ -1076,32 +1076,43 @@ impl MasterDispatcher {
         };
         let frame_schema = unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
+        // Single-source a REPLICATED owner: under a fan-out each distinct value
+        // would arrive `nw` times and pop adjacently in the merge —
+        // `PreflightAccumulator::offer` reads that as a duplicate and fails the
+        // CREATE on a genuinely unique table. The count-agnostic merge still
+        // catches real within-copy duplicates via the same adjacent-equal
+        // check, and the seed reflects true cardinality. Hashed owners keep the
+        // full fan-out (genuine cross-partition duplicates surface as equal
+        // spans from different workers).
+        let unicast = replicated_unicast(disp_ptr, owner_id);
+
         // Fan out the pre-flight command (the packed column list rides in
         // seek_col_idx); each worker answers with its sorted-span
         // continuation-frame train. `_lease` held to end of scope: when the
         // merge returns early (error or duplicate verdict) the lease drop
         // discards the undrained trains at the ring boundary.
-        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
-            let (schema, col_names) = disp.get_schema_and_names(owner_id);
-            let lsn = disp.next_lsn();
-            disp.write_group_with_req_ids(
-                owner_id,
-                lsn,
-                FLAG_UNIQUE_PREFLIGHT,
-                0,
-                &[],
-                &schema,
-                &col_names,
-                0,
-                packed,
-                req_ids,
-                -1,
-                0,
-                None,
-                &[],
-            )
-        })
-        .await?;
+        let (slots, req_ids, _lease) =
+            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
+                let (schema, col_names) = disp.get_schema_and_names(owner_id);
+                let lsn = disp.next_lsn();
+                disp.write_group_with_req_ids(
+                    owner_id,
+                    lsn,
+                    FLAG_UNIQUE_PREFLIGHT,
+                    0,
+                    &[],
+                    &schema,
+                    &col_names,
+                    0,
+                    packed,
+                    req_ids,
+                    unicast,
+                    0,
+                    None,
+                    &[],
+                )
+            })
+            .await?;
 
         let merged = merge_index_scan(slots, &req_ids, reactor, &frame_schema).await?;
         if merged.duplicate {

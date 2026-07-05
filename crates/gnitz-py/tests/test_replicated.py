@@ -33,6 +33,18 @@ def _positive(rows):
     return [r for r in rows if r.weight > 0]
 
 
+def _select_pks(client, sql, sn):
+    """Sorted list of positive-weight PKs from a SQL SELECT — duplicates kept, so
+    a ×W read inflation (the same row returned once per worker) shows up as
+    repeated PKs, not a deduped set."""
+    res = client.execute_sql(sql, schema_name=sn)
+    assert res[0]["type"] == "Rows"
+    b = res[0]["rows"].batch
+    if b is None:
+        return []
+    return sorted(b.pks[i] for i in range(len(b.pks)) if b.weights[i] > 0)
+
+
 # ---------------------------------------------------------------------------
 # Writes broadcast + reads single-source
 # ---------------------------------------------------------------------------
@@ -458,6 +470,144 @@ def test_replicated_plus_cluster_by_rejected(client):
             )
         msg = str(exc.value).lower()
         assert "replicated" in msg and "cluster by" in msg
+    finally:
+        client.drop_schema(sn)
+
+
+# ---------------------------------------------------------------------------
+# Secondary indexes on a replicated owner: reads single-source, CREATE UNIQUE
+# INDEX pre-flight single-sources
+#
+# Every worker holds an identical full copy of a replicated table and its
+# secondary indexes. Any read that broadcasts-and-merges (indexed SELECT, range
+# scan) would return each row once per worker (×W), and the CREATE UNIQUE INDEX
+# pre-flight would see every value W times and reject a genuinely unique table
+# as duplicate. These paths must single-source worker 0. Masked at W=1 (single
+# copy); the suite runs W=4.
+# ---------------------------------------------------------------------------
+
+
+@_NEEDS_MULTI
+def test_replicated_indexed_select_returns_one_copy(client):
+    """SELECT on a NON-unique secondary-indexed column of a replicated table must
+    return each matching row once, not once per worker. The seek broadcasts and
+    merges every worker's matches; on a replicated owner all W copies match, so
+    without single-sourcing the client sees ×W duplicates."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, cust BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        # cust=42 held by two distinct rows; cust=99 by one.
+        client.execute_sql(
+            "INSERT INTO dim VALUES (1, 42), (2, 42), (3, 99)", schema_name=sn)
+        client.execute_sql("CREATE INDEX ON dim(cust)", schema_name=sn)
+
+        assert _select_pks(client, "SELECT * FROM dim WHERE cust = 42", sn) == [1, 2]
+        assert _select_pks(client, "SELECT * FROM dim WHERE cust = 99", sn) == [3]
+        assert _select_pks(client, "SELECT * FROM dim WHERE cust = 7", sn) == []
+    finally:
+        client.drop_schema(sn)
+
+
+@_NEEDS_MULTI
+def test_replicated_indexed_range_returns_one_copy(client):
+    """Ordered range scan over a secondary index of a replicated table must return
+    each row once, not ×W. Same broadcast-and-merge path as the point seek."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO dim VALUES (1, 0), (2, 10), (3, 20), (4, 30)", schema_name=sn)
+        client.execute_sql("CREATE INDEX ON dim(x)", schema_name=sn)
+
+        assert _select_pks(client, "SELECT * FROM dim WHERE x BETWEEN 10 AND 20", sn) == [2, 3]
+        assert _select_pks(client, "SELECT * FROM dim WHERE x > 10", sn) == [3, 4]
+        assert _select_pks(client, "SELECT * FROM dim WHERE x < 20", sn) == [1, 2]
+    finally:
+        client.drop_schema(sn)
+
+
+@_NEEDS_MULTI
+def test_replicated_unique_indexed_point_select(client):
+    """SELECT on a single-column UNIQUE-indexed column of a replicated table
+    returns the one holder (the unicast-to-one-worker fast path stays correct
+    when routed straight to worker 0's full copy)."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO dim VALUES (1, 100), (2, 200), (3, 300)", schema_name=sn)
+        client.execute_sql("CREATE UNIQUE INDEX ON dim(val)", schema_name=sn)
+
+        assert _select_pks(client, "SELECT * FROM dim WHERE val = 200", sn) == [2]
+        assert _select_pks(client, "SELECT * FROM dim WHERE val = 999", sn) == []
+    finally:
+        client.drop_schema(sn)
+
+
+@_NEEDS_MULTI
+def test_create_unique_index_on_populated_replicated_table(client):
+    """CREATE UNIQUE INDEX on a populated replicated table with all-distinct
+    values must SUCCEED. The pre-flight fans to every worker; on a replicated
+    owner each worker streams the same full copy, so without single-sourcing the
+    merge sees every value W times and rejects the unique table as duplicate.
+    After creation the constraint enforces on later inserts."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO dim VALUES (1, 100), (2, 200), (3, 300), (4, 400), (5, 500)",
+            schema_name=sn)
+
+        # The bug: this raises a false duplicate error under W >= 2.
+        client.execute_sql("CREATE UNIQUE INDEX ON dim(val)", schema_name=sn)
+
+        # Enforcement is live: a colliding value is rejected, a fresh one inserts.
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("INSERT INTO dim VALUES (6, 100)", schema_name=sn)
+        client.execute_sql("INSERT INTO dim VALUES (6, 600)", schema_name=sn)
+
+        # Single-source read: one copy of every row.
+        tid = client.resolve_table(sn, "dim")[0]
+        rows = _positive(client.scan(tid))
+        assert sorted(r["val"] for r in rows) == [100, 200, 300, 400, 500, 600]
+    finally:
+        client.drop_schema(sn)
+
+
+def test_create_unique_index_on_replicated_rejects_real_duplicate(client):
+    """A GENUINE duplicate on a replicated table must still fail CREATE UNIQUE
+    INDEX. Two rows share the indexed value before the CREATE; single-sourcing
+    the pre-flight to one worker's full copy still catches it (adjacent equal
+    spans within the one stream), so the index is not created and no phantom
+    constraint is left behind."""
+    sn = "r" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE dim (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
+            "WITH (replicated = true)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO dim VALUES (1, 42), (2, 42), (3, 99)", schema_name=sn)
+
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql("CREATE UNIQUE INDEX ON dim(val)", schema_name=sn)
+
+        # No phantom constraint: another duplicate value is still accepted.
+        client.execute_sql("INSERT INTO dim VALUES (4, 42)", schema_name=sn)
+        tid = client.resolve_table(sn, "dim")[0]
+        assert len(_positive(client.scan(tid))) == 4
     finally:
         client.drop_schema(sn)
 

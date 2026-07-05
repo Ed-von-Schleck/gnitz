@@ -7,7 +7,9 @@ use crate::ops;
 use crate::query::compiler::{self, CompileOutput, ExternalTable, SubPlan};
 use crate::query::vm;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, PartitionedTable, RecoverySource, Table};
+use crate::storage::{
+    Batch, CursorHandle, FlushOutcome, FlushWork, PartitionedTable, RecoverySource, StorageError, Table,
+};
 use gnitz_wire::PkColList;
 
 mod store_handle;
@@ -59,6 +61,35 @@ pub struct IndexCircuitEntry {
     pub index_table: UnsafeCell<Box<Table>>,
     pub index_schema: SchemaDescriptor,
     pub is_unique: bool,
+}
+
+/// Fault-injection seam for the push-apply / SAL-replay path; identity in
+/// release builds. In a debug build with
+/// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`, substitutes
+/// `Err(StorageError::Io)` for the matching ingest inside
+/// `ingest_store_and_indices`, so the fail-stop abort fires deterministically
+/// without a real disk fault. No one-shot latch — the process aborts on first
+/// fire. The env is read once. Placing the seam at the dag layer keeps
+/// `storage` seam-free and fires exactly on the push-apply/replay path
+/// (`raw_store_ingest` and VM integration bypass it), so a seam-armed server
+/// still boots cleanly on a pushless data dir and fails only on the first
+/// INSERT apply.
+fn inject_ingest_apply_error(
+    which: &str,
+    r: Result<(), crate::storage::StorageError>,
+) -> Result<(), crate::storage::StorageError> {
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::OnceLock;
+        static MODE: OnceLock<Option<String>> = OnceLock::new();
+        let armed = MODE.get_or_init(|| std::env::var("GNITZ_INJECT_INGEST_APPLY_ERROR").ok());
+        if armed.as_deref() == Some(which) {
+            return Err(crate::storage::StorageError::Io);
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = which;
+    r
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +408,22 @@ impl DagEngine {
                 .index_circuits
                 .retain(|ic| ic.col_indices.as_slice() != col_indices);
         }
+    }
+
+    /// Replace the index circuit's owned Table (worker-boot re-home to the rank
+    /// subdir): drop the fork-inherited parent-dir table and install `t`.
+    /// Returns the new table pointer for the backfill; `None` if no circuit on
+    /// `col_indices` matches. Dropping the old `Box` closes the inherited table.
+    /// Sound: pointer consumers (`get_index_store_handle`, cursors) are fetched
+    /// per request, and the swap runs before the worker serves anything.
+    pub fn replace_index_table(&mut self, table_id: i64, col_indices: &[u32], t: Box<Table>) -> Option<*mut Table> {
+        let entry = self.tables.get_mut(&table_id)?;
+        let ic = entry
+            .index_circuits
+            .iter_mut()
+            .find(|ic| ic.col_indices.as_slice() == col_indices)?;
+        ic.index_table = UnsafeCell::new(t);
+        Some(ic.table_mut() as *mut Table)
     }
 
     /// Set the uniqueness flag of the index circuit on `col_indices` in place
@@ -979,7 +1026,11 @@ impl DagEngine {
     /// 2. store.ingest_batch
     /// 3. index projection
     pub fn ingest_to_family(&mut self, table_id: i64, batch: Batch) -> i32 {
-        self.ingest_returning_effective(table_id, batch).0
+        if self.ingest_returning_effective(table_id, batch).is_some() {
+            0
+        } else {
+            -1
+        }
     }
 
     /// Ingest a borrowed batch (no clone) for the common non-unique-PK path.
@@ -999,20 +1050,21 @@ impl DagEngine {
         }
 
         let schema = entry.schema;
-        Self::ingest_store_and_indices(entry, &schema, batch);
+        Self::ingest_store_and_indices(table_id, entry, &schema, batch);
 
         0
     }
 
-    /// Ingest a batch and return the effective batch (after unique_pk enforcement).
-    /// The effective batch is what downstream views need to see.
-    /// Returns (rc, Option<Batch>).
-    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> (i32, Option<Batch>) {
+    /// Ingest a batch and return the effective batch (after unique_pk
+    /// enforcement) — what downstream views need to see. `None` means exactly
+    /// "table not registered"; a storage-apply failure never returns
+    /// (`ingest_store_and_indices` aborts).
+    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> Option<Batch> {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => {
                 gnitz_warn!("dag: ingest_returning_effective — table_id={} not registered", table_id);
-                return (-1, None);
+                return None;
             }
         };
 
@@ -1037,50 +1089,90 @@ impl DagEngine {
         };
 
         if effective_batch.count == 0 {
-            return (0, Some(effective_batch));
+            return Some(effective_batch);
         }
 
         let entry = self.tables.get_mut(&table_id).unwrap();
 
-        Self::ingest_store_and_indices(entry, &schema, &effective_batch);
+        Self::ingest_store_and_indices(table_id, entry, &schema, &effective_batch);
 
-        (0, Some(effective_batch))
+        Some(effective_batch)
     }
 
     /// Project all index batches from `source`, ingest a clone into the store,
     /// then drain the projected index batches into their respective index tables.
     /// Shared by `ingest_by_ref` and `ingest_returning_effective`.
-    fn ingest_store_and_indices(entry: &mut TableEntry, schema: &SchemaDescriptor, source: &Batch) {
+    ///
+    /// A storage error here means committed (or SAL-replayed) data was not
+    /// applied while the client already holds a durability ACK, so process state
+    /// has diverged from the durable SAL. That is fatal at the point of
+    /// detection: `gnitz_fatal_abort!` and let restart + SAL replay re-apply the
+    /// batch (its WAL zone stays above the flushed-shard watermark, so it *will*
+    /// be replayed). Silent swallowing is the one unsound response — it neither
+    /// applies nor replays the entry, and the next checkpoint orphans it.
+    fn ingest_store_and_indices(table_id: i64, entry: &mut TableEntry, schema: &SchemaDescriptor, source: &Batch) {
         let index_batches: Vec<Batch> = entry
             .index_circuits
             .iter()
             .map(|ic| Self::batch_project_index(source, ic.col_indices.as_slice(), schema, &ic.index_schema))
             .collect();
-        let _ = entry.handle.ingest_borrowed_batch(source);
+
+        if let Err(e) = inject_ingest_apply_error("store", entry.handle.ingest_borrowed_batch(source)) {
+            crate::gnitz_fatal_abort!(
+                "dag: base-table ingest failed (table_id={}): {} — committed data \
+                 not applied, state diverged from durable SAL; aborting for \
+                 restart+replay",
+                table_id,
+                e,
+            );
+        }
+
         for (ic, idx_batch) in entry.index_circuits.iter_mut().zip(index_batches) {
             if idx_batch.count > 0 {
-                let _ = ic.table_mut().ingest_owned_batch(idx_batch);
+                let index_id = ic.index_id;
+                if let Err(e) = inject_ingest_apply_error("index", ic.table_mut().ingest_owned_batch(idx_batch)) {
+                    crate::gnitz_fatal_abort!(
+                        "dag: secondary-index ingest failed (table_id={}, index_id={}): {} \
+                         — index diverged from base table; aborting for restart+replay",
+                        table_id,
+                        index_id,
+                        e,
+                    );
+                }
             }
         }
     }
 
-    /// Flush a table's WAL.  Returns 0 on success, -1 on missing table or
-    /// any underlying storage error (the i32 is what the caller — vm/worker —
-    /// already pattern-matches against, so we keep the legacy signature here).
-    pub fn flush(&mut self, table_id: i64) -> i32 {
-        let entry = match self.tables.get_mut(&table_id) {
-            Some(e) => e,
-            None => return -1,
+    /// Flush a table's WAL through the store handle and every index circuit.
+    /// An unregistered `table_id` is a caller bug (debug_assert), a no-op in
+    /// release; `Err` is always a storage fault.
+    pub fn flush(&mut self, table_id: i64) -> Result<(), StorageError> {
+        let Some(entry) = self.tables.get_mut(&table_id) else {
+            debug_assert!(false, "flush of unregistered table_id {table_id}");
+            return Ok(());
         };
-        if entry.handle.flush().is_err() {
-            return -1;
-        }
+        entry.handle.flush()?;
         for ic in &mut entry.index_circuits {
-            if ic.table_mut().flush().is_err() {
-                return -1;
-            }
+            ic.table_mut().flush()?;
         }
-        0
+        Ok(())
+    }
+
+    /// Flush `view_id`'s trace, aborting the process on a storage fault: the
+    /// callers flush a view they just ingested or backfilled, so a failure is
+    /// a RAM-tier spill fault — the trace can no longer be bounded, and
+    /// continuing would grow memory unchecked under a sustained fault.
+    /// Restart re-derives the view from its base tables (the same disk fault
+    /// would already abort the base ingest via `ingest_store_and_indices`).
+    pub fn flush_view_or_abort(&mut self, view_id: i64) {
+        if let Err(e) = self.flush(view_id) {
+            crate::gnitz_fatal_abort!(
+                "dag: view trace flush failed (view_id={}): {} — view state \
+                 cannot be bounded; aborting for restart+re-derive",
+                view_id,
+                e,
+            );
+        }
     }
 
     /// Phase 1 of two-phase flush. Walks the table handle and any index
@@ -1254,7 +1346,7 @@ impl DagEngine {
 
         // Flush each modified view trace exactly once after the full DAG settles.
         for vid in dirty_views {
-            let _ = self.flush(vid);
+            self.flush_view_or_abort(vid);
         }
 
         0
@@ -2214,7 +2306,7 @@ mod tests {
 
         // With the fix, flush propagates to index circuits and writes a shard.
         // Without the fix, index circuits are skipped and no shard is written.
-        assert_eq!(dag.flush(70), 0);
+        dag.flush(70).unwrap();
         let shard_count = std::fs::read_dir(&idx_dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -2507,22 +2599,12 @@ mod tests {
         assert!(pt.has_pk_bytes(&pk24(7, 8, 9)), "K2 survives +1,-1,+1 at net +1");
     }
 
-    // Spawn a clean subprocess to verify that vm_epoch_result calls
-    // gnitz_fatal_abort! (→ _exit(134)) on Err. A direct in-process call would
-    // terminate the test runner; std::process::Command gives us a clean process
-    // with no multi-threaded fork hazard.
+    // vm_epoch_result must gnitz_fatal_abort! (→ _exit(134)) on Err.
     #[test]
     fn test_vm_epoch_result_abort_exit_status() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("test_vm_epoch_result_abort_internal")
-            .env("GNITZ_RUN_ABORT_TEST", "1")
-            .status()
-            .unwrap();
-        // _exit(134) is a normal (non-signal) exit on Linux, so code() == Some(134).
-        assert_eq!(
-            status.code(),
-            Some(134),
-            "vm_epoch_result must call gnitz_fatal_abort! (exit 134) on Err",
+        crate::test_support::assert_test_aborts_134(
+            "test_vm_epoch_result_abort_internal",
+            &[("GNITZ_RUN_ABORT_TEST", "1")],
         );
     }
 
@@ -2562,5 +2644,52 @@ mod tests {
             current,
             "Partitioned current_lsn → max current_lsn"
         );
+    }
+
+    // A storage error while applying committed data in `ingest_store_and_indices`
+    // must _exit(134) (fail-stop; recovery is restart + SAL replay). Driven via
+    // the `GNITZ_INJECT_INGEST_APPLY_ERROR` debug seam. The `index`-stage
+    // variant is exercised end-to-end by the
+    // `test_ingest_apply_error_aborts_and_replays` e2e test.
+    #[test]
+    fn test_ingest_apply_error_abort_exit_status() {
+        crate::test_support::assert_test_aborts_134(
+            "ingest_apply_error_abort_internal",
+            &[
+                ("GNITZ_RUN_INGEST_ABORT_TEST", "1"),
+                ("GNITZ_INJECT_INGEST_APPLY_ERROR", "store"),
+            ],
+        );
+    }
+
+    // Guard: runs the seam-armed ingest only under GNITZ_RUN_INGEST_ABORT_TEST
+    // (set by the parent). Registers a base table and ingests one row; the armed
+    // "store" seam substitutes Err for the base ingest, tripping the abort.
+    #[test]
+    fn ingest_apply_error_abort_internal() {
+        if std::env::var("GNITZ_RUN_INGEST_ABORT_TEST").is_err() {
+            return;
+        }
+        let mut dag = DagEngine::new();
+        let schema = crate::schema::SchemaDescriptor::minimal_u64();
+        let dir = dag_test_dir("seam_abort");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut tbl =
+            Box::new(Table::new(&dir, "seam_abort", schema, 99, 256 * 1024, RecoverySource::Rederive).unwrap());
+        dag.register_table(
+            70,
+            StoreHandle::Borrowed(&mut *tbl as *mut Table),
+            schema,
+            RelationKind::BaseTable { unique_pk: false },
+            0,
+            String::new(),
+        );
+        let mut batch = Batch::with_schema(schema, 1);
+        batch.extend_pk(1u128);
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.count += 1;
+        dag.ingest_to_family(70, batch);
+        unreachable!("ingest_store_and_indices must abort when the seam is armed");
     }
 }

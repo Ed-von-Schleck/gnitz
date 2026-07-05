@@ -96,7 +96,7 @@ fn test_system_table_flush_compacts_l0() {
         bb.put_u64(0); // is_unique
         bb.put_string(""); // cache_directory
         bb.end_row();
-        ingest_batch_into(&mut engine.sys_indices, &bb.finish());
+        engine.sys_indices.ingest_borrowed_batch(&bb.finish()).unwrap();
         engine.flush_family(IDX_TAB_ID).unwrap();
     }
     let shards = engine.sys_indices.all_shard_arcs().len();
@@ -216,6 +216,43 @@ fn test_validate_unique_indices_duplicate_value() {
     // The diagnostic must carry the qualified table and column, not a bare column.
     assert!(err.contains("public.t"), "violation should name the table: {err}");
     assert!(err.contains("val"), "violation should name the column: {err}");
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// Same first-line committed-duplicate rejection, but after a
+// `backfill_all_indexes` rebuild (the worker-boot path) replaces the index
+// Table and re-derives the committed holder from the base slice. The
+// committed-holder probe in validate_unique_indices must still see the value.
+#[test]
+fn test_validate_unique_indices_duplicate_after_backfill_all_rebuild() {
+    let dir = temp_dir("catalog_uidx_dup_after_rebuild");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
+    engine.create_index("public.t", &["val"], true).unwrap(); // unique index on val
+    let schema = engine.get_schema(tid).unwrap();
+
+    // Commit the holder row (val=42) and flush it to the base shards.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(1u128, 1);
+    bb.put_u64(42);
+    bb.end_row();
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // Rebuild every index from its base slice, replacing the fork-inherited copy.
+    engine.backfill_all_indexes().unwrap();
+
+    // Insert a second row with the same val=42 → must still violate the unique index.
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(2u128, 1);
+    bb.put_u64(42);
+    bb.end_row();
+    let result = engine.validate_unique_indices(tid, &bb.finish());
+    assert!(result.is_err(), "committed duplicate must be rejected after rebuild");
+    assert!(result.unwrap_err().contains("Unique index violation"));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

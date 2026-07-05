@@ -49,7 +49,7 @@ fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, c
 //
 // Each test is RED until precheck_sys_ingest is extended to cover positive-
 // weight (CREATE) rows for TABLE_TAB, VIEW_TAB, and IDX_TAB.  Before that
-// extension the hook fires *after* ingest_batch_into and the cache appliers,
+// extension the hook fires *after* the sys-table ingest and the cache appliers,
 // so a hook failure leaves orphaned rows in the memtable and dirty cache
 // entries.  After the extension, precheck rejects before any mutation.
 // ---------------------------------------------------------------------------

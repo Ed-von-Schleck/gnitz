@@ -204,7 +204,18 @@ impl CatalogEngine {
 
     pub fn advance_sequence(&mut self, seq_id: i64, old_val: i64, new_val: i64) {
         let batch = build_seq_delta(seq_id, old_val, new_val);
-        ingest_batch_into(&mut self.sys_sequences, &batch);
+        // The caller has already handed the allocated id to memory; un-allocating
+        // is impossible, and replying an error while keeping the bump would
+        // re-issue the id after restart. Fail-stop — same as the serial-range
+        // sequence ingest in `executor.rs`.
+        if let Err(e) = self.sys_sequences.ingest_borrowed_batch(&batch) {
+            crate::gnitz_fatal_abort!(
+                "sys_sequences ingest (object id advance, seq_id={}) failed: {} \
+                 — allocated id would be reissued after restart; aborting",
+                seq_id,
+                e,
+            );
+        }
     }
 
     /// Reserve `count` ids for a user-table SERIAL sequence. Returns

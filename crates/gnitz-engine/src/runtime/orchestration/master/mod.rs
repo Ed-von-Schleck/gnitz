@@ -358,57 +358,103 @@ fn worker_error_scan<'a>(op: &str, it: impl Iterator<Item = (usize, &'a DecodedW
     None
 }
 
-/// Allocate `nw` per-worker scan request ids, run `submit`, signal all
-/// workers, then await every slot via `join_all`. Returns the raw `W2mSlot`s
-/// in worker order so the caller can forward them to the client without an
-/// intermediate decode/copy.
+fn scan_decode_err(w: usize, e: &'static str) -> String {
+    format!("scan: worker {w}: decode error: {e}")
+}
+
+/// Fan-out shape for a scan-shaped dispatch over `target_id`: `0`
+/// (single-source worker 0) when the relation is REPLICATED — every worker
+/// holds an identical full copy, so a broadcast would stream/merge the same
+/// rows `nw` times — else `-1` (broadcast). The single owner of the
+/// replicated→single-source routing policy for `dispatch_scan_fanout` callers.
+pub(crate) fn replicated_unicast(disp_ptr: *mut MasterDispatcher, target_id: i64) -> i32 {
+    let replicated = unsafe { (*(*disp_ptr).catalog).relation_output_is_replicated(target_id) };
+    if replicated {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Fan a scan/seek group out to the workers under `submit` and await their
+/// raw `W2mSlot` replies, returned so the caller can forward or merge them
+/// without an intermediate decode/copy.
+///
+/// `unicast` selects the shape and is also passed to `submit` so the group
+/// write's unicast argument can never diverge from it:
+/// - `< 0` (broadcast): allocate `nw` distinct per-worker scan request ids,
+///   signal every worker, and await every slot in worker order — the returned
+///   `Vec` holds `nw` slots. The shape a full fan-out or a PK-scatter needs.
+/// - `>= 0` (single-source, the worker index): allocate ONE scan request id
+///   mirrored across the whole `req_ids` array (`write_group_direct` keys
+///   replies by worker slot, and under unicast only that worker's slot is
+///   written and replies — all on this id), signal only worker `unicast`, and
+///   await its single slot — the returned `Vec` holds one slot. Used for a
+///   REPLICATED relation (see `replicated_unicast`) and for
+///   `fan_out_scan_single_worker_async`. The downstream drains
+///   (`drain_index_scan` / `merge_index_scan`) are count-agnostic — they
+///   iterate `slots.len()` — so a length-1 `Vec` merges exactly that worker's
+///   stream.
 ///
 /// `sal_excl` is held only for the synchronous write + signal phase and
 /// released before awaiting replies. This serialises the SAL write against
 /// concurrent checkpoint FLAG_FLUSH groups: without the lock a fan-out
 /// could write with the old epoch during the checkpoint window, workers
 /// would skip it, and the caller would hang waiting for an ACK.
-fn scan_decode_err(w: usize, e: &'static str) -> String {
-    format!("scan: worker {w}: decode error: {e}")
-}
-
 pub(crate) async fn dispatch_scan_fanout<F>(
     disp_ptr: *mut MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
     sal_excl: &Rc<AsyncMutex<()>>,
+    unicast: i32,
     submit: F,
 ) -> Result<(Vec<W2mSlot>, [u64; crate::runtime::sal::MAX_WORKERS], ScanLease), String>
 where
-    F: FnOnce(&mut MasterDispatcher, &[u64]) -> Result<(), String>,
+    F: FnOnce(&mut MasterDispatcher, &[u64], i32) -> Result<(), String>,
 {
     let nw = unsafe { (*disp_ptr).num_workers };
+    let single = unicast >= 0;
     let mut req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
-    for id in req_ids[..nw].iter_mut() {
-        *id = reactor.alloc_scan_request_id();
+    if single {
+        let id = reactor.alloc_scan_request_id();
+        for slot in req_ids[..nw].iter_mut() {
+            *slot = id;
+        }
+    } else {
+        for id in req_ids[..nw].iter_mut() {
+            *id = reactor.alloc_scan_request_id();
+        }
     }
 
     // Register the ids active BEFORE any await so a cancelled first-frame await
     // still deregisters them and route_scan_slot discards late frames. The
     // returned lease MUST be bound to a named local held to end of the caller's
     // drain scope (never a bare `_`, which would drop it immediately and
-    // re-open the wedge).
+    // re-open the wedge). A single-source dispatch has just the one active id.
+    let n_active = if single { 1 } else { nw };
     let mut scan_ids = [0u32; crate::runtime::sal::MAX_WORKERS];
-    for (d, &s) in scan_ids[..nw].iter_mut().zip(&req_ids[..nw]) {
+    for (d, &s) in scan_ids[..n_active].iter_mut().zip(&req_ids[..n_active]) {
         *d = s as u32;
     }
-    let lease = reactor.scan_lease(&scan_ids[..nw]);
+    let lease = reactor.scan_lease(&scan_ids[..n_active]);
 
     {
         let _guard = sal_excl.lock().await;
         unsafe {
             let disp = &mut *disp_ptr;
-            submit(disp, &req_ids[..nw])?;
-            disp.signal_all();
+            submit(disp, &req_ids[..nw], unicast)?;
+            if single {
+                disp.signal_one(unicast as usize);
+            } else {
+                disp.signal_all();
+            }
         }
     }
-    let slots =
+    let slots = if single {
+        vec![reactor.await_scan_slot(req_ids[0] as u32).await]
+    } else {
         crate::runtime::reactor::join_all_unpin(req_ids[..nw].iter().map(|&id| reactor.await_scan_slot(id as u32)))
-            .await;
+            .await
+    };
     Ok((slots, req_ids, lease))
 }
 

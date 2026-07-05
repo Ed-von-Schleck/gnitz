@@ -77,6 +77,59 @@ pub(crate) fn is_index_dir_name(name: &str) -> bool {
     name.strip_prefix("idx_").is_some_and(has_numeric_id)
 }
 
+/// The directory holding THIS process's copy of an index table: the index dir
+/// itself for master/standalone, `{idx_dir}/w{rank}` for a forked worker
+/// (single-writer isolation for spills and compaction, so sibling workers never
+/// collide on same-name `.tmp`/`hcomp` files under the shared tree).
+/// `Table::new` creates the path recursively, so this is a pure path function.
+pub(crate) fn index_table_dir(idx_dir: &str) -> String {
+    if crate::foundation::worker_ctx::is_worker() {
+        format!("{idx_dir}/w{}", crate::foundation::worker_ctx::worker_rank())
+    } else {
+        idx_dir.to_string()
+    }
+}
+
+/// Open this process's copy of an ephemeral secondary-index table under
+/// `idx_dir` (homed by `index_table_dir`). The one recipe for the live CREATE
+/// INDEX hook and the worker-boot rebuild: the `_idx_` name format, the arena
+/// size, and `RecoverySource::Rederive` (load-bearing — a durable source would
+/// double-count its loaded shards on the next open) must never diverge.
+pub(crate) fn new_index_table(idx_dir: &str, index_id: i64, idx_schema: SchemaDescriptor) -> Result<Table, String> {
+    Table::new(
+        &index_table_dir(idx_dir),
+        &format!("_idx_{index_id}"),
+        idx_schema,
+        index_id as u32,
+        SYS_TABLE_ARENA,
+        RecoverySource::Rederive,
+    )
+    .map_err(|e| format!("Failed to create index table {index_id}: error {e}"))
+}
+
+/// True if `name` is a per-rank index subdir (`w<digits>`), as written by
+/// `index_table_dir` for a forked worker.
+pub(crate) fn is_index_rank_dir_name(name: &str) -> bool {
+    name.strip_prefix('w').is_some_and(has_numeric_id)
+}
+
+/// Remove a live index dir's per-rank `w{k}` subdirs. They must never survive
+/// a boot (each worker rebuilds its own slice-local copy afterwards, and a
+/// smaller worker count would otherwise strand `w{k}` dirs forever). Runs once
+/// per boot on the master, pre-fork — no worker exists yet.
+pub(crate) fn remove_stale_index_rank_dirs(idx_dir: &str) {
+    for rank_name in subdir_names(idx_dir) {
+        if !is_index_rank_dir_name(&rank_name) {
+            continue;
+        }
+        let rank_full = format!("{idx_dir}/{rank_name}");
+        match fs::remove_dir_all(&rank_full) {
+            Ok(()) => gnitz_debug!("recovery: removed stale index rank dir {}", rank_full),
+            Err(e) => gnitz_debug!("recovery: failed to remove index rank dir {}: {}", rank_full, e),
+        }
+    }
+}
+
 /// True if `name` is shaped like a table or view directory — both end in
 /// `_<digits>` (`<name>_<tid>` and `view_<name>_<vid>` respectively).
 pub(crate) fn is_table_dir_name(name: &str) -> bool {
@@ -100,14 +153,6 @@ pub(crate) fn subdir_names(path: &str) -> Vec<String> {
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Free function: ingest a batch into a table (avoids borrow conflicts)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn ingest_batch_into(table: &mut Table, batch: &Batch) {
-    let _ = table.ingest_borrowed_batch(batch);
 }
 
 // ---------------------------------------------------------------------------

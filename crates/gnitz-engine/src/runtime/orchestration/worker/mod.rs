@@ -109,14 +109,13 @@ enum DispatchContext {
     },
 }
 
-/// Result of a single `dispatch` call.
+/// Result of a single `dispatch` call. Shutdown is not an outcome: every
+/// shutdown path `_exit`s inline (`shutdown` / `fatal_shutdown` return `!`).
 #[allow(clippy::large_enum_variant)]
 enum DispatchOutcome {
     /// The dispatcher handled the message; the caller should keep
     /// draining the SAL.
     Continue,
-    /// The worker is shutting down; unwind out of the loops.
-    Shutdown,
     /// `InsideExchangeWait` saw the relay it was waiting for; return
     /// this batch to the DAG.
     RelayMatched(Batch),
@@ -341,9 +340,9 @@ impl WorkerProcess {
         sal_reader: SalReader,
         w2m_writer: W2mWriter,
     ) -> Self {
-        // Isolate this worker's scratch operator-state tables from siblings'
-        // (all forked workers share the view directory under one base_dir).
-        crate::foundation::worker_ctx::set_worker_rank(worker_id, num_workers as u32);
+        // Worker rank/count (and role) are latched in the fork child before any
+        // catalog work — see `server_main`. Not set here: boot-compiled plans
+        // would otherwise carry rank 0 / num_workers 1.
         WorkerProcess {
             worker_id,
             num_workers,
@@ -413,7 +412,6 @@ impl WorkerProcess {
                     let ppid = unsafe { libc::getppid() };
                     if ppid != self.master_pid {
                         self.shutdown();
-                        return 0;
                     }
                     continue;
                 }
@@ -422,14 +420,12 @@ impl WorkerProcess {
                 }
             }
 
-            if self.drain_sal() {
-                return 0;
-            }
+            self.drain_sal();
         }
     }
 
-    /// Process all pending SAL message groups. Returns true on shutdown.
-    fn drain_sal(&mut self) -> bool {
+    /// Process all pending SAL message groups. Shutdown `_exit`s inline.
+    fn drain_sal(&mut self) {
         // Emit the next chunk of the FRONT pending train before draining new
         // SAL messages. One chunk per drain_sal pass; send_encoded provides
         // backpressure. Single-frame replies for other requests still go out
@@ -449,7 +445,6 @@ impl WorkerProcess {
                         self.replay_deferred_ticks();
                     }
                 }
-                DispatchOutcome::Shutdown => return true,
                 DispatchOutcome::RelayMatched(_) => {
                     // RelayMatched is only produced inside `do_exchange_wait`;
                     // the top-level dispatcher classifies ExchangeRelay as a
@@ -458,7 +453,6 @@ impl WorkerProcess {
                 }
             }
         }
-        false
     }
 
     /// Emit one frame of the FRONT pending train; pops it off the queue when
@@ -699,15 +693,7 @@ impl WorkerProcess {
                         Err(e) => {
                             // A dropped DDL permanently diverges this worker's
                             // catalog from the master — silently wrong results.
-                            // Shut down rather than continue with a stale catalog.
-                            gnitz_warn!(
-                                "W{} FATAL: failed to decode deferred DDL for tid={}: {}",
-                                self.worker_id,
-                                target_id,
-                                e,
-                            );
-                            self.shutdown(); // calls libc::_exit — does not return
-                            return DispatchOutcome::Shutdown; // unreachable; satisfies type
+                            self.fatal_shutdown(&format!("failed to decode deferred DDL for tid={target_id}: {e}"))
                         }
                     }
                 }
@@ -725,12 +711,28 @@ impl WorkerProcess {
             }
             (DispatchContext::InsideExchangeWait { want_key, schema }, SalMessageKind::ExchangeRelay) => {
                 // source_id is echoed back via seek_pk; the backfill round
-                // decision rides in seek_col_idx. Decode both before taking the
-                // batch out.
-                let decoded = wire.and_then(|d| ipc::decode_wire(d).ok());
-                let relay_source_id = decoded.as_ref().map(|d| d.control.seek_pk as i64).unwrap_or(0);
-                let relay_decision = decoded.as_ref().map(|d| d.control.seek_col_idx).unwrap_or(0);
-                let relay_batch = decoded.and_then(|d| d.data_batch).unwrap_or_else(|| {
+                // decision rides in seek_col_idx. A decode failure here (WAL-block
+                // checksum mismatch / truncation) must NOT silently default to
+                // source_id=0 + an empty batch: a unary exchange's want_key has
+                // source_id=0, so the defaulted relay would match, unblock the
+                // wait, and drop the whole partition's exchanged data — silent
+                // wrong results. Fail-stop, mirroring the deferred-DdlSync decode
+                // arm and honoring the checksum decode_wire just verified.
+                let Some(data) = wire else {
+                    // ExchangeRelay is unicast, so the wire==None guard at the
+                    // top of `dispatch` already filtered a missing payload.
+                    unreachable!("ExchangeRelay with no payload (filtered by dispatch's None guard)")
+                };
+                let decoded = match ipc::decode_wire(data) {
+                    Ok(decoded) => decoded,
+                    Err(e) => self.fatal_shutdown(&format!("failed to decode ExchangeRelay for tid={target_id}: {e}")),
+                };
+                let relay_source_id = decoded.control.seek_pk as i64;
+                let relay_decision = decoded.control.seek_col_idx;
+                // Header-only relay (decode succeeded, no data_batch): a schema'd
+                // empty batch is the correct payload — this fallback now only
+                // applies when the decode itself succeeded.
+                let relay_batch = decoded.data_batch.unwrap_or_else(|| {
                     let empty_schema = schema.unwrap_or_default();
                     Batch::with_schema(empty_schema, 0)
                 });
@@ -805,18 +807,10 @@ impl WorkerProcess {
                     // DDL application failure on trusted master→worker IPC means
                     // memory corruption or an engine bug; continuing would leave
                     // this worker with a permanently stale catalog.
-                    gnitz_warn!(
-                        "W{} FATAL: DdlSync application failed for tid={}: {}. Shutting down.",
-                        self.worker_id,
-                        target_id,
-                        msg,
-                    );
-                    self.shutdown(); // calls libc::_exit — does not return
-                    return DispatchOutcome::Shutdown; // unreachable; satisfies type
+                    self.fatal_shutdown(&format!("DdlSync application failed for tid={target_id}: {msg}"));
                 }
                 DispatchOutcome::Continue
             }
-            DispatchResult::Shutdown => DispatchOutcome::Shutdown,
         }
     }
 
@@ -844,10 +838,7 @@ impl WorkerProcess {
         let batch = decoded.and_then(|d| d.data_batch);
 
         match kind {
-            SalMessageKind::Shutdown => {
-                self.shutdown();
-                DispatchResult::Shutdown
-            }
+            SalMessageKind::Shutdown => self.shutdown(),
 
             SalMessageKind::Flush => {
                 self.advance_read_epoch();
@@ -1242,7 +1233,9 @@ impl WorkerProcess {
         // output trace once after the final chunk. Only when it produced rows
         // (the first source of a join produces none — it just fills its trace).
         if view_id != 0 && produced_any {
-            self.cat().dag.flush(view_id);
+            // On abort the master's worker_watcher turns the dead worker into a
+            // cluster abort, and restart re-derives the view.
+            self.cat().dag.flush_view_or_abort(view_id);
         }
         Ok(())
     }
@@ -1591,17 +1584,21 @@ impl WorkerProcess {
         self.dispatch_deferred();
     }
 
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self) -> ! {
         let _ = self.handle_flush_all();
-        unsafe {
-            libc::_exit(0);
-        }
+        unsafe { libc::_exit(0) }
+    }
+
+    /// Unrecoverable worker fault: log, flush, `_exit`. The master's
+    /// worker_watcher turns the dead worker into a cluster abort.
+    fn fatal_shutdown(&mut self, msg: &str) -> ! {
+        gnitz_warn!("W{} FATAL: {}. Shutting down.", self.worker_id, msg);
+        self.shutdown()
     }
 }
 
 enum DispatchResult {
     Continue,
-    Shutdown,
     Error(String),
 }
 
@@ -2031,10 +2028,38 @@ mod tests {
         );
     }
 
+    /// Encode a header-only ExchangeRelay wire frame (schema, no data batch)
+    /// whose control block echoes `source_id` via `seek_pk`, as the master's
+    /// `emit_relay_with_decision` does. Leaked to `'static` for `dispatch`.
+    /// A DECODABLE frame is now required — a corrupt/undecodable relay fail-stops
+    /// the worker (mirrors the DdlSync decode arm) rather than defaulting to an
+    /// empty batch, so tests can no longer feed `&[]`.
+    fn encode_relay_frame(target_id: u64, source_id: u128, schema: &SchemaDescriptor) -> &'static [u8] {
+        let sz = ipc::wire_size(STATUS_OK, &[], Some(schema), None, None, None, &[]);
+        let mut buf = vec![0u8; sz];
+        ipc::encode_wire_into(
+            &mut buf,
+            0,
+            target_id,
+            0,         // client_id
+            0,         // flags — the dispatch arm is chosen by kind, not wire flags
+            source_id, // seek_pk — echoed source_id the waiter matches on
+            0,         // seek_col_idx — BACKFILL_DECISION_CONTINUE
+            0,         // request_id
+            STATUS_OK,
+            &[],          // error_msg
+            Some(schema), // schema
+            None,         // col_names
+            None,         // data_batch — header-only relay
+            None,         // prebuilt_schema_block
+            &[],          // seek_pk_extra
+        );
+        Box::leak(buf.into_boxed_slice())
+    }
+
     /// ExchangeRelay inside an exchange wait whose `(view_id, source_id)`
     /// matches `want_key` returns `RelayMatched(batch)`; a non-matching
-    /// pair is parked in `pending_relays`. Driving with `Some(&[])`
-    /// gives a decode failure → relay_source_id=0, empty batch.
+    /// pair is parked in `pending_relays`.
     #[test]
     fn test_dispatch_matrix_exchange_relay_inside_exchange() {
         let mut wp = make_worker_for_matrix();
@@ -2045,17 +2070,18 @@ mod tests {
             schema: Some(schema),
         };
 
-        // Mismatched view: parked.
-        let empty: &'static [u8] = &[];
-        let outcome = wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 200, Some(empty));
+        // Mismatched view (target_id=200 ≠ want 100): parked under (200, 0).
+        let frame = encode_relay_frame(200, 0, &schema);
+        let outcome = wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 200, Some(frame));
         assert!(matches!(outcome, DispatchOutcome::Continue));
         assert!(
             wp.exchange.pending_relays.contains_key(&(200, 0)),
             "non-matching relay must be parked in pending_relays"
         );
 
-        // Matching key: returned via RelayMatched.
-        let outcome = wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 100, Some(empty));
+        // Matching key (target_id=100, source_id=0 == want_key): RelayMatched.
+        let frame = encode_relay_frame(100, 0, &schema);
+        let outcome = wp.dispatch(ctx, SalMessageKind::ExchangeRelay, 100, Some(frame));
         assert!(
             matches!(outcome, DispatchOutcome::RelayMatched(_)),
             "key-matching relay must short-circuit with RelayMatched"

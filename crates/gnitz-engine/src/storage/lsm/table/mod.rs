@@ -729,11 +729,9 @@ impl Drop for Table {
 
 pub(crate) fn ensure_dir(dir: &str) -> Result<CString, StorageError> {
     let dir_c = CString::new(dir).map_err(|_| StorageError::InvalidPath)?;
-    match std::fs::create_dir(dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => return Err(StorageError::Io),
-    }
+    // Recursive: a table may home into a nested dir whose parents don't exist
+    // yet (a worker's per-rank index subdir under a fresh index dir).
+    std::fs::create_dir_all(dir).map_err(|_| StorageError::Io)?;
     Ok(dir_c)
 }
 

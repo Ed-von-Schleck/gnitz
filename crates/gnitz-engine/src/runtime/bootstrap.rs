@@ -187,7 +187,20 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) {
             Some(b) if b.count > 0 => b,
             _ => return false,
         };
-        cat.replay_ingest(msg.target_id as i64, batch).is_ok()
+        // Fires pre-readiness-ACK: the master's wait_all_workers probes
+        // fail_if_worker_dead and fails boot BEFORE zeroing the SAL sentinel, so
+        // the replayed data's only durable copy survives. A swallowed error here
+        // would zero the sentinel and orphan the un-applied committed data.
+        match cat.replay_ingest(msg.target_id as i64, batch) {
+            Ok(()) => true,
+            Err(e) => crate::gnitz_fatal_abort!(
+                "SAL replay apply failed (table_id={}, lsn={}): {} — aborting \
+                 before the SAL sentinel is reset",
+                msg.target_id,
+                msg.lsn,
+                e,
+            ),
+        }
     });
 
     if replayed > 0 {
@@ -196,6 +209,38 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) {
             libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
         }
     }
+}
+
+/// Worker-boot catalog recovery, in load-bearing order:
+///
+/// 1. Rebuild every secondary index slice-local, replacing the fork-inherited
+///    full parent-dir copy, BEFORE SAL replay — replay projects the committed
+///    unflushed tail into each index exactly once (`ingest_store_and_indices`),
+///    so a rebuild afterwards would double-count every replayed row.
+/// 2. Replay unflushed push data from the SAL.
+/// 3. Flush the replayed rows to shards before accepting requests: reset_sal()
+///    resets the write cursor to 0, so a second crash before a checkpoint would
+///    overwrite SAL entries and make replayed data unreachable (the SAL walk
+///    stops at the first partially-overwritten group).
+///
+/// The Err rides the startup ACK (see worker.run): a failed boot must abort
+/// before the master zeroes the SAL sentinel, or the replayed rows' only
+/// durable copy is destroyed.
+fn worker_boot_recovery(catalog: &mut CatalogEngine, sal_reader: &SalReader) -> Result<(), String> {
+    catalog
+        .backfill_all_indexes()
+        .map_err(|e| format!("boot index backfill failed: {e}"))?;
+    recover_from_sal(sal_reader, catalog);
+    for tid in catalog.iter_user_table_ids() {
+        catalog
+            .flush_family(tid)
+            .map_err(|e| format!("boot flush of table {tid} failed: {e}"))?;
+    }
+    #[cfg(debug_assertions)]
+    if std::env::var("GNITZ_INJECT_BOOT_FLUSH_ERROR").is_ok() {
+        return Err("injected boot flush fault".to_string());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +274,11 @@ fn backfill_exchange_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterD
 ///
 /// Returns 0 on clean exit, non-zero on error.
 pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_level: u32) -> i32 {
+    // Latch the Master role before any catalog work: the pre-fork replay hooks
+    // in CatalogEngine::open must see Master so they skip the index backfill
+    // their forked children rebuild slice-local.
+    crate::foundation::worker_ctx::set_master_role();
+
     // Raise fd limit (partition directories + shard files)
     posix_io::raise_fd_limit(65536);
 
@@ -447,6 +497,14 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
                 unsafe { libc::_exit(0) };
             }
 
+            // Latch this worker's rank/count (and its Worker role) before ANY
+            // catalog work below (trim, rehome, index rebuild, SAL replay, view
+            // backfill): every plan compiled during boot must see this process's
+            // real (rank, num_workers) and its index tables must home into the
+            // per-rank subdir. Single owner of the rank — no longer set in
+            // WorkerProcess::new.
+            crate::foundation::worker_ctx::set_worker_rank(w as u32, num_workers);
+
             // Redirect stdout/stderr to worker log file
             let log_path = format!("{data_dir}/worker_{w}.log\0");
             unsafe {
@@ -493,28 +551,8 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             let sal_reader = SalReader::new(sal_ptr as *const u8, w as u32, sal_mmap_size(), m2w_efds[w]);
             let w2m_writer = W2mWriter::new(w2m_ptrs[w], W2M_REGION_SIZE as u64);
 
-            // SAL recovery — replay unflushed push data
-            recover_from_sal(&sal_reader, catalog);
-
-            // Durability: flush replayed rows to shards before accepting requests.
-            // reset_sal() resets the write cursor to 0, so a second crash before
-            // a checkpoint would overwrite SAL entries and make replayed data
-            // unreachable (SAL walk stops at the first partially-overwritten group).
-            // The verdict rides the startup ACK (see worker.run): a failed flush
-            // must abort boot before the master zeroes the SAL sentinel, or the
-            // replayed rows' only durable copy is destroyed.
-            let mut boot_flush_err: Option<String> = None;
-            for tid in catalog.iter_user_table_ids() {
-                if let Err(e) = catalog.flush_family(tid) {
-                    boot_flush_err = Some(format!("boot flush of table {tid} failed: {e}"));
-                    break;
-                }
-            }
-            #[cfg(debug_assertions)]
-            if boot_flush_err.is_none() && std::env::var("GNITZ_INJECT_BOOT_FLUSH_ERROR").is_ok() {
-                boot_flush_err = Some("injected boot flush fault".to_string());
-            }
-            if let Some(e) = &boot_flush_err {
+            let boot_err: Option<String> = worker_boot_recovery(catalog, &sal_reader).err();
+            if let Some(e) = &boot_err {
                 // stderr is redirected to worker_N.log above.
                 eprintln!("{e}");
             }
@@ -530,7 +568,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             // view is missed. Backfill sources before dependents (depth order) so a
             // view over another non-exchange view reads a populated source. Skip on
             // a doomed boot — worker.run will abort.
-            if boot_flush_err.is_none() {
+            if boot_err.is_none() {
                 let filled = catalog.dag.exchange_cascade_filled_views();
                 let mut nx_views: Vec<i64> = catalog
                     .iter_user_table_ids()
@@ -567,7 +605,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             crate::foundation::log::init(log_level, wtag.as_bytes());
 
             let mut worker = WorkerProcess::new(w as u32, nw, master_pid, catalog_ptr, sal_reader, w2m_writer);
-            let rc = worker.run(boot_flush_err);
+            let rc = worker.run(boot_err);
 
             // Defensive — WorkerProcess::run() exits via libc::_exit
             unsafe {

@@ -143,31 +143,38 @@ impl MasterDispatcher {
             (schema, missing, guard)
         };
 
+        // Single-source a REPLICATED table's warmup scan: a fan-out would
+        // stream `nw` copies of the same rows back to build one filter (a set —
+        // dedup keeps it correct, but the extra `nw - 1` full-table scans are
+        // pure waste).
+        let unicast = replicated_unicast(disp_ptr, table_id);
+
         // `_lease` held across the full continuation drain below; its workers
         // stream multi-frame trains, and on an early error return (or a
         // mid-scan cancellation) the lease drop discards every undrained
         // frame at the ring boundary.
-        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
-            let (schema, col_names) = disp.get_schema_and_names(table_id);
-            let lsn = disp.next_lsn();
-            disp.write_group_with_req_ids(
-                table_id,
-                lsn,
-                0,
-                0,
-                &[],
-                &schema,
-                &col_names,
-                0,
-                0,
-                req_ids,
-                -1,
-                0,
-                None,
-                &[],
-            )
-        })
-        .await?;
+        let (slots, req_ids, _lease) =
+            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
+                let (schema, col_names) = disp.get_schema_and_names(table_id);
+                let lsn = disp.next_lsn();
+                disp.write_group_with_req_ids(
+                    table_id,
+                    lsn,
+                    0,
+                    0,
+                    &[],
+                    &schema,
+                    &col_names,
+                    0,
+                    0,
+                    req_ids,
+                    unicast,
+                    0,
+                    None,
+                    &[],
+                )
+            })
+            .await?;
 
         // Drain every worker's continuation-frame train into the cold filters.
         // `drain_index_scan` owns the early-return error contract (the lease

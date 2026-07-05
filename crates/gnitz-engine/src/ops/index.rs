@@ -158,7 +158,11 @@ pub fn op_integrate_with_indexes(
 
         if avi_batch.count > 0 {
             let avi_table = unsafe { &mut *avi_desc.table };
-            let _ = avi_table.ingest_owned_batch(avi_batch);
+            // Propagate like the base-table ingest at the top of this fn: `ops`
+            // is a Result-returning library layer (its test/bench callers
+            // `.unwrap()`); the runtime consumer (the VM Integrate instruction)
+            // is what fail-stops.
+            avi_table.ingest_owned_batch(avi_batch)?;
         }
     }
 

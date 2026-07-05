@@ -268,7 +268,7 @@ impl MasterDispatcher {
     pub(crate) fn signal_all(&self) {
         self.sal.signal_all();
     }
-    fn signal_one(&self, worker: usize) {
+    pub(crate) fn signal_one(&self, worker: usize) {
         self.sal.signal_one(worker);
     }
 
@@ -902,27 +902,34 @@ impl MasterDispatcher {
         col_idx: u32,
         key: u128,
     ) -> Result<W2mSlot, String> {
-        // The routing cache is keyed by the OPK-widened `extract_col_key` image,
-        // but `key` is the native seek value. Transform it into the stored
-        // representation before probing; a raw native query always misses for
+        // A REPLICATED owner holds an identical full copy on every worker, so
+        // worker 0 always answers a single-column unique seek — skip the routing
+        // cache and its broadcast-on-miss fallback (which would fire `nw`
+        // identical B-tree seeks and forward one slot). Otherwise probe the
+        // routing cache. It is keyed by the OPK-widened `extract_col_key` image,
+        // but `key` is the native seek value: transform it into the stored
+        // representation before probing — a raw native query always misses for
         // signed integers (and could spuriously hit a different value's
         // OPK-widened key).
-        let cached = unsafe {
-            let schema = (*(*disp_ptr).catalog).get_schema_desc(target_id);
-            match schema.and_then(|s| index_route_key(&s, col_idx, key)) {
-                Some(rk) => (*disp_ptr).router.worker_for_index_key(target_id as u32, col_idx, rk),
-                None => -1,
+        let routed = if replicated_unicast(disp_ptr, target_id) >= 0 {
+            0
+        } else {
+            unsafe {
+                let schema = (*(*disp_ptr).catalog).get_schema_desc(target_id);
+                match schema.and_then(|s| index_route_key(&s, col_idx, key)) {
+                    Some(rk) => (*disp_ptr).router.worker_for_index_key(target_id as u32, col_idx, rk),
+                    None => -1,
+                }
             }
         };
-        if cached >= 0 {
-            let worker = cached as usize;
+        if routed >= 0 {
             return single_worker_async(
                 disp_ptr,
                 reactor,
                 sal_excl,
                 target_id,
                 FLAG_SEEK_BY_INDEX,
-                worker,
+                routed as usize,
                 key,
                 col_idx as u64,
                 "seek_by_index",
@@ -936,27 +943,28 @@ impl MasterDispatcher {
         // `_lease` keeps the scan active across the single-frame inspection
         // below; its workers also stream, so dropping it early would let the
         // gate discard a late frame.
-        let (mut slots, _req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
-            let (schema, col_names) = disp.get_schema_and_names(target_id);
-            let lsn = disp.next_lsn();
-            disp.write_group_with_req_ids(
-                target_id,
-                lsn,
-                FLAG_SEEK_BY_INDEX,
-                0,
-                &[],
-                &schema,
-                &col_names,
-                key,
-                col_idx as u64,
-                req_ids,
-                -1,
-                0,
-                None,
-                &[],
-            )
-        })
-        .await?;
+        let (mut slots, _req_ids, _lease) =
+            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, -1, |disp, req_ids, unicast| {
+                let (schema, col_names) = disp.get_schema_and_names(target_id);
+                let lsn = disp.next_lsn();
+                disp.write_group_with_req_ids(
+                    target_id,
+                    lsn,
+                    FLAG_SEEK_BY_INDEX,
+                    0,
+                    &[],
+                    &schema,
+                    &col_names,
+                    key,
+                    col_idx as u64,
+                    req_ids,
+                    unicast,
+                    0,
+                    None,
+                    &[],
+                )
+            })
+            .await?;
 
         let mut data_idx = None;
         for (w, slot) in slots.iter().enumerate() {
@@ -1079,29 +1087,35 @@ impl MasterDispatcher {
         // guard is definitionally the schema the request was built from; a
         // separate pre-fanout catalog read could diverge across the
         // `sal_excl` await if a DDL interleaves, failing healthy replies.
+        // Single-source a REPLICATED owner: a broadcast-and-merge would append
+        // each matching row `nw` times (`WeightFill::Copy`, no consolidation),
+        // handing the client `nw` duplicates of every row. Hashed owners keep
+        // the fan-out (matches scatter by PK).
+        let unicast = replicated_unicast(disp_ptr, target_id);
         let mut expected: Option<SchemaDescriptor> = None;
-        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
-            let (schema, col_names) = disp.get_schema_and_names(target_id);
-            let lsn = disp.next_lsn();
-            expected = Some(schema);
-            disp.write_group_with_req_ids(
-                target_id,
-                lsn,
-                sal_flag,
-                0,
-                &[],
-                &schema,
-                &col_names,
-                seek_pk,
-                seek_col_idx,
-                req_ids,
-                -1,
-                0,
-                None,
-                seek_pk_extra,
-            )
-        })
-        .await?;
+        let (slots, req_ids, _lease) =
+            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, unicast, |disp, req_ids, unicast| {
+                let (schema, col_names) = disp.get_schema_and_names(target_id);
+                let lsn = disp.next_lsn();
+                expected = Some(schema);
+                disp.write_group_with_req_ids(
+                    target_id,
+                    lsn,
+                    sal_flag,
+                    0,
+                    &[],
+                    &schema,
+                    &col_names,
+                    seek_pk,
+                    seek_col_idx,
+                    req_ids,
+                    unicast,
+                    0,
+                    None,
+                    seek_pk_extra,
+                )
+            })
+            .await?;
         let expected = expected.expect("fan-out closure ran");
 
         let mut acc: Option<Batch> = None;
@@ -1207,30 +1221,31 @@ impl MasterDispatcher {
         // streams a multi-frame train, and a cancelled drain (client
         // disconnect) must keep the ids active until the lease drops so the
         // gate discards — not parks — late frames.
-        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, req_ids| {
-            let (schema, col_names) = disp.get_schema_and_names(target_id);
-            let lsn = disp.next_lsn();
-            // Embed client_version in wire_flags bits 24-39 so workers can
-            // decide whether to include the schema block in their response.
-            let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, client_version);
-            disp.write_group_with_req_ids(
-                target_id,
-                lsn,
-                0,
-                wire_flags,
-                &[],
-                &schema,
-                &col_names,
-                0,
-                0,
-                req_ids,
-                -1,
-                client_id,
-                None,
-                &[],
-            )
-        })
-        .await?;
+        let (slots, req_ids, _lease) =
+            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, -1, |disp, req_ids, unicast| {
+                let (schema, col_names) = disp.get_schema_and_names(target_id);
+                let lsn = disp.next_lsn();
+                // Embed client_version in wire_flags bits 24-39 so workers can
+                // decide whether to include the schema block in their response.
+                let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, client_version);
+                disp.write_group_with_req_ids(
+                    target_id,
+                    lsn,
+                    0,
+                    wire_flags,
+                    &[],
+                    &schema,
+                    &col_names,
+                    0,
+                    0,
+                    req_ids,
+                    unicast,
+                    client_id,
+                    None,
+                    &[],
+                )
+            })
+            .await?;
 
         // Return on the FIRST worker fault, decode error, or client
         // disconnect: `_lease` drops on return and `route_scan_slot` discards
@@ -1265,18 +1280,14 @@ impl MasterDispatcher {
         peer: &Peer,
         client_version: u16,
     ) -> Result<bool, String> {
-        let req_id = {
-            let _guard = sal_excl.lock().await;
-            unsafe {
-                let disp = &mut *disp_ptr;
+        // `_lease` held across the whole continuation drain (see
+        // `fan_out_scan_async`): a cancelled drain must keep the id active so
+        // the gate discards — not parks — late frames.
+        let (mut slots, req_ids, _lease) =
+            dispatch_scan_fanout(disp_ptr, reactor, sal_excl, worker as i32, |disp, req_ids, unicast| {
                 let (schema, col_names) = disp.get_schema_and_names(target_id);
-                let req_id = reactor.alloc_scan_request_id();
                 let lsn = disp.next_lsn();
                 let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, client_version);
-                let nw = disp.num_workers;
-                // write_group_direct keys replies by worker slot; under unicast
-                // only `worker`'s slot is written and replies, all on this req_id.
-                let ids = [req_id; crate::runtime::sal::MAX_WORKERS];
                 disp.write_group_with_req_ids(
                     target_id,
                     lsn,
@@ -1287,22 +1298,16 @@ impl MasterDispatcher {
                     &col_names,
                     0,
                     0,
-                    &ids[..nw],
-                    worker as i32,
+                    req_ids,
+                    unicast,
                     client_id,
                     None,
                     &[],
-                )?;
-                disp.signal_one(worker);
-                req_id
-            }
-        };
-        // Hold the scan id active across the whole continuation drain (see
-        // `fan_out_scan_async`): a cancelled drain must keep the id active so the
-        // gate discards — not parks — late frames.
-        let _lease = reactor.scan_lease(&[req_id as u32]);
-        let slot = reactor.await_scan_slot(req_id as u32).await;
-        drain_scan_train(reactor, peer, slot, req_id as u32, worker).await
+                )
+            })
+            .await?;
+        let slot = slots.pop().expect("unicast fan-out returns one slot");
+        drain_scan_train(reactor, peer, slot, req_ids[0] as u32, worker).await
     }
 
     /// Async version of `execute_pipeline`. Writes each check with
@@ -1466,7 +1471,7 @@ impl MasterDispatcher {
         let expected = crate::catalog::project_schema(&parent_schema, project);
 
         // `_lease` held across the full drain below (see `dispatch_scan_fanout`).
-        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, |disp, rids| {
+        let (slots, req_ids, _lease) = dispatch_scan_fanout(disp_ptr, reactor, sal_excl, -1, |disp, rids, unicast| {
             let nw = disp.num_workers;
             let pk_cols = parent_schema.pk_indices();
             let pooled = disp.pool_pop_batch(target_id);
@@ -1485,7 +1490,7 @@ impl MasterDispatcher {
                     /* seek_pk */ 0,
                     /* seek_col_idx */ col_mask,
                     rids,
-                    /* unicast_worker */ -1,
+                    unicast,
                     None,
                     None,
                 )

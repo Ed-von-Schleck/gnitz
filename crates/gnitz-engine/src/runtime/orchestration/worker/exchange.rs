@@ -7,7 +7,16 @@ use super::*;
 impl WorkerProcess {
     pub(super) fn dispatch_deferred(&mut self) {
         for ddl in std::mem::take(&mut self.exchange.deferred) {
-            let _ = self.cat().ddl_sync(ddl.target_id, ddl.batch);
+            if let Err(e) = self.cat().ddl_sync(ddl.target_id, ddl.batch) {
+                // A failed deferred DDL permanently diverges this worker's
+                // catalog from the master — silently wrong results. Fail-stop,
+                // same as the main-dispatch DdlSync path and the deferred-decode
+                // failure branch.
+                self.fatal_shutdown(&format!(
+                    "deferred DdlSync application failed for tid={}: {}",
+                    ddl.target_id, e
+                ));
+            }
         }
         // See the DdlSync dispatch arm: the master owns physical directory
         // removal for the shared tree; the worker only discards its queue.
@@ -96,11 +105,6 @@ impl WorkerProcess {
                 match self.dispatch(ctx, kind, target_id, wire) {
                     DispatchOutcome::Continue => {}
                     DispatchOutcome::RelayMatched(batch) => return batch,
-                    DispatchOutcome::Shutdown => {
-                        // dispatch_inner's Shutdown arm already called
-                        // libc::_exit — unreachable in practice.
-                        return Batch::with_schema(schema.unwrap_or_default(), 0);
-                    }
                 }
             }
         }

@@ -211,3 +211,66 @@ fn index_rebuilds_across_chunk_boundary_view_defers() {
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ── backfill_all_indexes_rebuilds_exactly_once ──────────────────────────
+// `backfill_all_indexes` is the worker-boot rebuild: it re-creates each index
+// Table (at this process's `index_table_dir` — the parent dir in a Standalone
+// unit test) and repopulates it from the base slice. Assert it is a *replace*
+// (single materialisation, never additive/doubled) and idempotent across
+// repeated calls, and that every key still resolves to its source PK afterward.
+//
+// This exercises the Standalone role path directly, without a fork: no unit
+// test sets a process role, so `index_table_dir` targets the parent dir and the
+// call is a legal idempotent re-create-and-rebuild.
+#[test]
+fn backfill_all_indexes_rebuilds_exactly_once() {
+    const N: i64 = 7;
+    let dir = temp_dir("backfill_all_indexes_once");
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+
+    let cols = vec![u64_col_def("id"), u64_col_def("val")];
+    let tid = engine.create_table("public.base", &cols, &[0], true).unwrap();
+    let schema = engine.get_schema(tid).unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    for i in 0..N as u64 {
+        bb.begin_row(i as u128, 1);
+        bb.put_u64(i * 10);
+        bb.end_row();
+    }
+    engine.ingest_to_family(tid, &bb.finish()).unwrap();
+    engine.flush_family(tid).unwrap();
+
+    // Non-unique secondary index on `val`; the live CREATE backfills once.
+    engine.create_index("public.base", &["val"], false).unwrap();
+
+    // Reference invariant: every key resolves to its PK, total index weight == N
+    // (a doubled rebuild would sum to 2N with an identical row set).
+    let assert_index_intact = |engine: &mut CatalogEngine| {
+        for i in 0..N as u64 {
+            let hit = engine.seek_by_index(tid, &[1], &[(i * 10) as u128]).unwrap();
+            let row = hit.unwrap_or_else(|| panic!("val {} must resolve by index", i * 10));
+            assert_eq!(row.count, 1, "one source row per distinct val");
+            assert_eq!(row.get_pk(0), i as u128, "val {} must resolve to PK {}", i * 10, i);
+        }
+        let entry = engine.dag.tables.get_mut(&tid).unwrap();
+        assert_eq!(entry.index_circuits.len(), 1);
+        assert_eq!(
+            sum_weights(entry.index_circuits[0].table_mut().open_cursor()),
+            N,
+            "index must hold exactly one materialisation, not an additive rebuild"
+        );
+    };
+
+    assert_index_intact(&mut engine);
+
+    // Replace-and-rebuild: swaps in a fresh Table, not additive onto the old.
+    engine.backfill_all_indexes().unwrap();
+    assert_index_intact(&mut engine);
+
+    // Idempotent across repeated calls.
+    engine.backfill_all_indexes().unwrap();
+    assert_index_intact(&mut engine);
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}

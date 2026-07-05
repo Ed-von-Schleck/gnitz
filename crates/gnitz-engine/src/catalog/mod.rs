@@ -78,9 +78,9 @@ pub(in crate::catalog) use sys_tables::SysFamily;
 pub(in crate::catalog) use sys_tables::{PUBLIC_SCHEMA_ID, SYSTEM_SCHEMA_ID};
 pub(in crate::catalog) use types::{FkConstraint, FkParentRef};
 pub(in crate::catalog) use utils::{
-    cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, get_index_key_type, index_dir, ingest_batch_into,
-    is_index_dir_name, is_table_dir_name, make_fk_index_name, retract_rows_by_view, retract_rows_in_pk_range,
-    retract_single_row, schema_dir, subdir_names, table_dir, view_dir,
+    cursor_read_string, cursor_read_u64, ensure_dir, fsync_dir, get_index_key_type, index_dir, is_index_dir_name,
+    is_table_dir_name, make_fk_index_name, new_index_table, remove_stale_index_rank_dirs, retract_rows_by_view,
+    retract_rows_in_pk_range, retract_single_row, schema_dir, subdir_names, table_dir, view_dir,
 };
 #[cfg(test)]
 pub(in crate::catalog) use utils::{make_secondary_index_name, parse_qualified_name};

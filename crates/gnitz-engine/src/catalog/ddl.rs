@@ -1,7 +1,39 @@
 use super::*;
 use crate::storage::PkBuf;
 
+/// Build the one-row IDX_TAB batch registering an index (`weight` +1) or
+/// retracting a failed registration (−1). The single writer of the 6-column
+/// IDX_TAB row layout in the DDL emitters.
+fn idx_tab_row(index_id: i64, owner_id: i64, packed_cols: u64, name: &str, is_unique: bool, weight: i64) -> Batch {
+    let mut bb = BatchBuilder::new(idx_tab_schema());
+    bb.begin_row(index_id as u128, weight);
+    bb.put_u64(owner_id as u64);
+    bb.put_u64(OWNER_KIND_TABLE as u64);
+    bb.put_u64(packed_cols);
+    bb.put_string(name);
+    bb.put_u64(if is_unique { 1 } else { 0 });
+    bb.put_string(""); // cache_directory
+    bb.end_row();
+    bb.finish()
+}
+
 impl CatalogEngine {
+    /// Locally retract an index registration whose +1 was applied but never
+    /// broadcast. A failed rollback leaves the +1 in sys_indices while the
+    /// client is handed an error — a permanently diverged catalog, and the
+    /// next boot's replay would open a missing index directory — so it
+    /// fail-stops, matching `compensate_stage_a`'s rollback abort.
+    fn rollback_index_registration(&mut self, undo: Batch, index_id: i64) {
+        if let Err(undo_err) = self.submit_local(SysFamily::Index, undo) {
+            crate::gnitz_fatal_abort!(
+                "catalog: index registration rollback failed (index_id={}): {} \
+                 — catalog state permanently diverged; aborting",
+                index_id,
+                undo_err,
+            );
+        }
+    }
+
     // -- DDL: CREATE/DROP SCHEMA -------------------------------------------
 
     // Like `create_table` below, the direct-call DDL entry points in this file
@@ -314,17 +346,8 @@ impl CatalogEngine {
         // we retract the +1 so sys_indices stays consistent and the next
         // restart's replay doesn't try to reconstruct a broken index.
         {
-            let schema = idx_tab_schema();
-            let mut bb = BatchBuilder::new(schema);
-            bb.begin_row(index_id as u128, 1);
-            bb.put_u64(owner_id as u64);
-            bb.put_u64(OWNER_KIND_TABLE as u64);
-            bb.put_u64(gnitz_wire::pack_pk_cols(&col_indices));
-            bb.put_string(&index_name);
-            bb.put_u64(if is_unique { 1 } else { 0 });
-            bb.put_string("");
-            bb.end_row();
-            let batch = bb.finish();
+            let packed_cols = gnitz_wire::pack_pk_cols(&col_indices);
+            let batch = idx_tab_row(index_id, owner_id, packed_cols, &index_name, is_unique, 1);
             if let Err(e) = self.submit(SysFamily::Index, batch) {
                 // The +1 failed in hook_index_register *before* it was enqueued
                 // into pending_broadcasts, so it was never broadcast to workers.
@@ -333,17 +356,8 @@ impl CatalogEngine {
                 // Broadcasting the −1 would deliver a phantom retraction to
                 // workers that never saw the +1, leaving an orphaned
                 // negative-weight row in their sys_indices.
-                let mut undo = BatchBuilder::new(schema);
-                undo.begin_row(index_id as u128, -1);
-                undo.put_u64(owner_id as u64);
-                undo.put_u64(OWNER_KIND_TABLE as u64);
-                undo.put_u64(gnitz_wire::pack_pk_cols(&col_indices));
-                undo.put_string(&index_name);
-                undo.put_u64(if is_unique { 1 } else { 0 });
-                undo.put_string("");
-                undo.end_row();
-                let undo_batch = undo.finish();
-                let _ = self.submit_local(SysFamily::Index, undo_batch);
+                let undo = idx_tab_row(index_id, owner_id, packed_cols, &index_name, is_unique, -1);
+                self.rollback_index_registration(undo, index_id);
                 // The hook pre-staged the index directory into
                 // pending_dir_deletions before Table::new; when backfill_index
                 // fails the circuit is never registered, so the -1 retraction
@@ -433,7 +447,7 @@ impl CatalogEngine {
                 }
             }
             if touched {
-                let _ = self.dag.flush(vid);
+                self.dag.flush_view_or_abort(vid);
             }
         }
 
@@ -450,9 +464,9 @@ impl CatalogEngine {
         &mut self,
         owner_id: i64,
         col_indices: &[u32],
-        is_unique: bool,
         idx_table: *mut Table,
         idx_schema: &SchemaDescriptor,
+        check_dups: bool,
     ) -> Result<(), String> {
         // The relation rebuilt here is the *index table* (`owner_id` is the
         // indexed relation, a durable base table). Backfilling into durable
@@ -461,23 +475,104 @@ impl CatalogEngine {
             unsafe { &*idx_table }.recovery_source() == RecoverySource::Rederive,
             "backfill_index into durable storage (owner {owner_id}): would double-count",
         );
-        self.stream_index_projection(owner_id, col_indices, is_unique, Some(idx_table), idx_schema)
+        self.stream_index_projection(owner_id, col_indices, Some(idx_table), idx_schema, check_dups)
+    }
+
+    /// Worker-boot index rebuild: for every registered index circuit, re-create
+    /// its Table at THIS process's `index_table_dir` (replacing the
+    /// fork-inherited parent-dir table) and backfill it from the trimmed/rehomed
+    /// base slice — one scan per owner table, each chunk projected into all of
+    /// its index tables. Must run after trim/rehome and BEFORE SAL replay —
+    /// replay projects the unflushed committed tail into the index exactly once
+    /// through `ingest_store_and_indices`, so a rebuild *after* replay would
+    /// double-count every replayed row. Boot data was validated at original
+    /// write time and a slice-local check cannot see a duplicate that
+    /// legitimately straddles two workers' slices, so the rebuild skips the dup
+    /// check entirely. Fail-fast: an error aborts worker boot via the startup
+    /// ACK.
+    ///
+    /// In a Standalone process this is a legal idempotent re-create-and-rebuild
+    /// at the parent dir — unit-testable without touching the global role.
+    pub fn backfill_all_indexes(&mut self) -> Result<(), String> {
+        // Snapshot the worklist first: each owner's rebuild mutably borrows
+        // self.dag (`replace_index_table`), so no borrow of `dag.tables` may be
+        // held across the loop. Only base tables carry index circuits, so
+        // views/system tables contribute nothing.
+        struct IndexWork {
+            cols: PkColList,
+            index_id: i64,
+            idx_schema: SchemaDescriptor,
+        }
+        let worklist: Vec<(i64, String, Vec<IndexWork>)> = self
+            .dag
+            .tables
+            .iter()
+            .filter(|(_, entry)| !entry.index_circuits.is_empty())
+            .map(|(&owner_id, entry)| {
+                let works = entry
+                    .index_circuits
+                    .iter()
+                    .map(|ic| IndexWork {
+                        cols: ic.col_indices,
+                        index_id: ic.index_id,
+                        idx_schema: ic.index_schema,
+                    })
+                    .collect();
+                (owner_id, entry.directory.clone(), works)
+            })
+            .collect();
+
+        for (owner_id, owner_dir, works) in worklist {
+            // Re-create and install every index table before opening the scan.
+            let mut targets: Vec<(PkColList, SchemaDescriptor, *mut Table)> = Vec::with_capacity(works.len());
+            for w in &works {
+                let table = new_index_table(&index_dir(&owner_dir, w.index_id), w.index_id, w.idx_schema)
+                    .map_err(|e| format!("index table re-create failed (owner {owner_id}): {e}"))?;
+                let ptr = self
+                    .dag
+                    .replace_index_table(owner_id, w.cols.as_slice(), Box::new(table))
+                    .ok_or_else(|| format!("index circuit vanished during rebuild (owner {owner_id})"))?;
+                targets.push((w.cols, w.idx_schema, ptr));
+            }
+
+            // One base-slice scan feeds all of the owner's indexes.
+            let Some(owner_schema) = self.dag.tables.get(&owner_id).map(|e| e.schema) else {
+                continue;
+            };
+            let chunk_rows = self.ddl_scan_chunk_rows;
+            let Some(mut handle) = self.open_store_cursor(owner_id) else {
+                continue;
+            };
+            while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
+                for (cols, idx_schema, table) in &targets {
+                    let projected = DagEngine::batch_project_index(&chunk, cols.as_slice(), &owner_schema, idx_schema);
+                    if projected.count == 0 {
+                        continue;
+                    }
+                    unsafe { &mut **table }
+                        .ingest_owned_batch(projected)
+                        .map_err(|e| format!("index rebuild: ingest failed (owner {owner_id}): {e}"))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Shared streaming pass for `backfill_index` and `promote_index_to_unique`:
     /// scan `owner_id` chunk-wise, project each chunk into the index layout,
-    /// reject duplicate keys when validating, and (backfill only) ingest each
+    /// reject duplicate keys when `check_dups`, and (backfill only) ingest each
     /// projected chunk into `idx_table`. Peak memory is O(chunk × row_width)
-    /// plus, live only, the cross-chunk `seen` set (32 B per scanned key).
+    /// plus, when checking, the cross-chunk `seen` set (32 B per scanned key).
     ///
-    /// The duplicate check runs only in the live phase, matching `promote`'s
-    /// long-standing guard and `hook_cascade_fk`: a boot-replayed IDX_TAB `+1`
-    /// was validated at original write time and every later INSERT went
-    /// through the unique filter, while SAL system-table recovery runs after
-    /// `go_live()`, so a CREATE INDEX recovered from the SAL still validates.
-    /// Skipping it at boot also avoids an O(rows × 32 B) set in the single
-    /// pre-fork master process. The ingest is unconditional — it IS the
-    /// ephemeral index rebuild.
+    /// `check_dups` is a caller policy (hoisted out of this function): the live
+    /// CREATE-INDEX/promote paths pass `is_unique && ctx.is_live()` / `true`; the
+    /// worker/standalone boot rebuild passes `false`. A boot-replayed IDX_TAB
+    /// `+1` was validated at original write time and every later INSERT went
+    /// through the unique filter, so skipping the check at boot cannot admit a
+    /// duplicate; it only avoids an O(rows × 32 B) `seen` set. A slice-local
+    /// rebuild also cannot false-positive (a global duplicate may legitimately
+    /// straddle two workers' slices), so the boot skip is doubly justified. The
+    /// ingest is unconditional — it IS the ephemeral index rebuild.
     ///
     /// On a duplicate found mid-stream the partially-ingested index table is
     /// discarded whole: it is ephemeral, registered nowhere, and its directory
@@ -486,9 +581,9 @@ impl CatalogEngine {
         &mut self,
         owner_id: i64,
         col_indices: &[u32],
-        is_unique: bool,
         idx_table: Option<*mut Table>,
         idx_schema: &SchemaDescriptor,
+        check_dups: bool,
     ) -> Result<(), String> {
         let owner_schema = match self.dag.tables.get(&owner_id) {
             Some(e) => e.schema,
@@ -497,7 +592,6 @@ impl CatalogEngine {
         let chunk_rows = self.ddl_scan_chunk_rows;
         // The duplicate check applies to the full composite leading span.
         let idx_key_size = idx_schema.leading_key_size(col_indices.len());
-        let check_dups = is_unique && self.ctx.is_live();
         let mut seen: rustc_hash::FxHashSet<PkBuf> = rustc_hash::FxHashSet::default();
 
         let Some(mut handle) = self.open_store_cursor(owner_id) else {
@@ -512,7 +606,9 @@ impl CatalogEngine {
                 return Err(self.unique_create_dup_err(owner_id, col_indices));
             }
             if let Some(table) = idx_table {
-                let _ = unsafe { &mut *table }.ingest_owned_batch(projected);
+                unsafe { &mut *table }
+                    .ingest_owned_batch(projected)
+                    .map_err(|e| format!("index backfill: ingest failed (owner {owner_id}): {e}"))?;
             }
         }
         Ok(())
@@ -537,7 +633,7 @@ impl CatalogEngine {
                 .map(|e| e.schema)
                 .ok_or_else(|| format!("Index promote: owner table {owner_id} not found"))?;
             let idx_schema = make_index_schema(col_indices, &owner_schema)?;
-            self.stream_index_projection(owner_id, col_indices, true, None, &idx_schema)?;
+            self.stream_index_projection(owner_id, col_indices, None, &idx_schema, true)?;
         }
         self.dag.set_index_circuit_uniqueness(owner_id, col_indices, true);
         Ok(())
@@ -572,18 +668,9 @@ impl CatalogEngine {
 
             let index_id = self.allocate_index_id();
 
-            // Write index record to sys_indices
-            let idx_schema = idx_tab_schema();
-            let mut bb = BatchBuilder::new(idx_schema);
-            bb.begin_row(index_id as u128, 1);
-            bb.put_u64(table_id as u64); // owner_id
-            bb.put_u64(OWNER_KIND_TABLE as u64); // owner_kind
-            bb.put_u64(gnitz_wire::pack_pk_cols(&[col_idx as u32])); // source_cols (packed)
-            bb.put_string(&index_name); // name
-            bb.put_u64(0); // is_unique (FK indices are not unique)
-            bb.put_string(""); // cache_directory
-            bb.end_row();
-            let batch = bb.finish();
+            // Write index record to sys_indices (FK indices are not unique).
+            let packed_cols = gnitz_wire::pack_pk_cols(&[col_idx as u32]);
+            let batch = idx_tab_row(index_id, table_id, packed_cols, &index_name, false, 1);
             // hook_cascade_fk fires on master and every worker, so each side
             // creates its own FK indices locally; submit_local applies + fires
             // hooks without a broadcast. submit would broadcast IDX_TAB before
@@ -594,17 +681,8 @@ impl CatalogEngine {
                 // reverse the storage write and any partial cache updates;
                 // otherwise the next boot's replay opens a missing index
                 // directory and crashes.
-                let mut ub = BatchBuilder::new(idx_schema);
-                ub.begin_row(index_id as u128, -1);
-                ub.put_u64(table_id as u64);
-                ub.put_u64(OWNER_KIND_TABLE as u64);
-                ub.put_u64(gnitz_wire::pack_pk_cols(&[col_idx as u32])); // source_cols (packed)
-                ub.put_string(&index_name);
-                ub.put_u64(0);
-                ub.put_string("");
-                ub.end_row();
-                let undo = ub.finish();
-                let _ = self.submit_local(SysFamily::Index, undo);
+                let undo = idx_tab_row(index_id, table_id, packed_cols, &index_name, false, -1);
+                self.rollback_index_registration(undo, index_id);
                 return Err(e);
             }
 

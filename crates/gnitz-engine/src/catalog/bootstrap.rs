@@ -121,7 +121,9 @@ impl CatalogEngine {
             bb.put_string("public");
             bb.end_row();
             let batch = bb.finish();
-            ingest_batch_into(&mut self.sys_schemas, &batch);
+            self.sys_schemas
+                .ingest_borrowed_batch(&batch)
+                .map_err(|e| format!("bootstrap: sys_schemas ingest failed: {e}"))?;
         }
 
         // 2. Table records (self-registration of system tables)
@@ -140,7 +142,9 @@ impl CatalogEngine {
                 bb.end_row();
             }
             let batch = bb.finish();
-            ingest_batch_into(&mut self.sys_tables, &batch);
+            self.sys_tables
+                .ingest_borrowed_batch(&batch)
+                .map_err(|e| format!("bootstrap: sys_tables ingest failed: {e}"))?;
         }
 
         // 3. Column records for all system tables
@@ -275,7 +279,9 @@ impl CatalogEngine {
                 }
             }
             let batch = bb.finish();
-            ingest_batch_into(&mut self.sys_columns, &batch);
+            self.sys_columns
+                .ingest_borrowed_batch(&batch)
+                .map_err(|e| format!("bootstrap: sys_columns ingest failed: {e}"))?;
         }
 
         // 4. Sequence high-water marks
@@ -292,7 +298,9 @@ impl CatalogEngine {
             bb.put_u64((FIRST_USER_INDEX_ID - 1) as u64);
             bb.end_row();
             let batch = bb.finish();
-            ingest_batch_into(&mut self.sys_sequences, &batch);
+            self.sys_sequences
+                .ingest_borrowed_batch(&batch)
+                .map_err(|e| format!("bootstrap: sys_sequences ingest failed: {e}"))?;
         }
 
         // Flush all foundational metadata to disk

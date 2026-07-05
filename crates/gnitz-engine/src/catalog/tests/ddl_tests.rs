@@ -712,17 +712,14 @@ fn test_drop_view_cascades_columns_and_view_deps() {
 // ── ddl_emitters_use_no_raw_handle_capability ────────────────────────
 // Capability guard: the DDL emitters mutate catalog state only through
 // submit / submit_local / submit_retraction. They must never name a `sys_*`
-// handle directly — no `ingest_batch_into`, no `sys_table_mut`, no direct
-// `self.sys_*` field access. A violation reintroduces the fused capability the
-// applier/emitter split removed, so it fails here.
+// handle directly — no `sys_table_mut`, no direct `self.sys_*` field access
+// (the only ways to reach a sys-table `ingest_*` from ddl.rs). A violation
+// reintroduces the fused capability the applier/emitter split removed, so it
+// fails here.
 
 #[test]
 fn ddl_emitters_use_no_raw_handle_capability() {
     let src = include_str!("../ddl.rs");
-    assert!(
-        !src.contains("ingest_batch_into"),
-        "ddl.rs must not call ingest_batch_into — route writes through submit/submit_local"
-    );
     assert!(
         !src.contains("sys_table_mut"),
         "ddl.rs must not call sys_table_mut — the emitters cannot name a sys_* handle"
