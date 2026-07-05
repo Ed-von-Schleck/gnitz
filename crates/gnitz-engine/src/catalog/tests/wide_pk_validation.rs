@@ -8,7 +8,7 @@
 use super::*;
 use crate::query::{DagEngine, RelationKind, StoreHandle};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, Persistence, Table};
+use crate::storage::{Batch, RecoverySource, Table};
 
 fn u64c() -> SchemaColumn {
     SchemaColumn::new(type_code::U64, 0)
@@ -66,7 +66,7 @@ fn setup_wide_unique(
             schema,
             tid as u32,
             256 * 1024,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
         )
         .unwrap(),
     );
@@ -76,7 +76,7 @@ fn setup_wide_unique(
         idx_schema,
         tid as u32 + 1,
         256 * 1024,
-        Persistence::Ephemeral,
+        RecoverySource::Rederive,
     )
     .unwrap();
 
@@ -231,7 +231,7 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
         parent_schema,
         parent_tid as u32,
         256 * 1024,
-        Persistence::Ephemeral,
+        RecoverySource::Rederive,
     )
     .unwrap();
     pbase.ingest_owned_batch(pb).unwrap();

@@ -7,7 +7,7 @@ use crate::ops;
 use crate::query::compiler::{self, CompileOutput, ExternalTable, SubPlan};
 use crate::query::vm;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, PartitionedTable, Persistence, Table};
+use crate::storage::{Batch, CursorHandle, FlushOutcome, FlushWork, PartitionedTable, RecoverySource, Table};
 use gnitz_wire::PkColList;
 
 mod store_handle;
@@ -89,13 +89,14 @@ pub enum RelationKind {
 const _: () = assert!(std::mem::size_of::<RelationKind>() == 1);
 
 impl RelationKind {
-    /// Storage durability. Durable kinds load shards from the manifest;
-    /// ephemeral kinds erase on open and live in memory.
+    /// How this relation's tail is recovered. `SalReplay` kinds load shards from
+    /// the manifest and replay the SAL tail; `Rederive` kinds erase on open and
+    /// are rebuilt from their sources.
     #[inline]
-    pub fn persistence(self) -> Persistence {
+    pub fn recovery_source(self) -> RecoverySource {
         match self {
-            RelationKind::SystemCatalog | RelationKind::BaseTable { .. } => Persistence::Durable,
-            RelationKind::View => Persistence::Ephemeral,
+            RelationKind::SystemCatalog | RelationKind::BaseTable { .. } => RecoverySource::SalReplay,
+            RelationKind::View => RecoverySource::Rederive,
         }
     }
 
@@ -454,7 +455,7 @@ impl DagEngine {
             debug_assert!(
                 self.tables
                     .get(&view_id)
-                    .is_none_or(|e| e.kind.persistence() == Persistence::Ephemeral),
+                    .is_none_or(|e| e.kind.recovery_source() == RecoverySource::Rederive),
                 "distributed backfill into durable relation {view_id}: \
                  would double-count loaded shards",
             );
@@ -2019,7 +2020,7 @@ mod tests {
         let schema = SchemaDescriptor::default();
         let dir = dag_test_dir(name);
         let _ = std::fs::remove_dir_all(&dir);
-        Box::new(Table::new(&dir, name, schema, 99, 256 * 1024, Persistence::Ephemeral).unwrap())
+        Box::new(Table::new(&dir, name, schema, 99, 256 * 1024, RecoverySource::Rederive).unwrap())
     }
 
     #[test]
@@ -2194,7 +2195,7 @@ mod tests {
                 idx_schema,
                 1,
                 256 * 1024,
-                Persistence::Durable,
+                RecoverySource::SalReplay,
             )
             .unwrap(),
         );
@@ -2251,7 +2252,7 @@ mod tests {
             schema,
             1234,
             crate::storage::Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -2322,7 +2323,7 @@ mod tests {
             schema,
             1234,
             crate::storage::Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -2393,7 +2394,7 @@ mod tests {
             schema,
             1234,
             crate::storage::Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -2463,7 +2464,7 @@ mod tests {
             schema,
             555,
             crate::storage::Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )

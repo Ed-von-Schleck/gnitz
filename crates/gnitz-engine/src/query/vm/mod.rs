@@ -1044,7 +1044,7 @@ mod tests {
             schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
 
@@ -1131,7 +1131,7 @@ mod tests {
             right_schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
 
@@ -1192,7 +1192,7 @@ mod tests {
             right_schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
 
@@ -1247,7 +1247,7 @@ mod tests {
             schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
 
@@ -1315,7 +1315,7 @@ mod tests {
             out_schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
 
@@ -1329,7 +1329,7 @@ mod tests {
             in_schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
 
@@ -1565,7 +1565,7 @@ mod tests {
             schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
 
@@ -1729,7 +1729,7 @@ mod tests {
             out_schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
         let trace_out_ptr = &mut trace_out_table as *mut Table;
@@ -1741,7 +1741,7 @@ mod tests {
             in_schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
         let trace_in_ptr = &mut trace_in_table as *mut Table;
@@ -1876,7 +1876,7 @@ mod tests {
             out_schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
         let trace_out_ptr = &mut trace_out_table as *mut Table;
@@ -1888,7 +1888,7 @@ mod tests {
             in_schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
         let trace_in_ptr = &mut trace_in_table as *mut Table;
@@ -1983,7 +1983,7 @@ mod tests {
             schema,
             0,
             1 << 20,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
         )
         .unwrap();
 

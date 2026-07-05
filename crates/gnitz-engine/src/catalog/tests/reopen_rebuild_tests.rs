@@ -1,7 +1,7 @@
 //! Reopen-rebuild idempotency for ephemeral relations.
 //!
 //! Secondary indices are repopulated from their sources exactly once when the
-//! engine reopens: their storage is erased at open (`Persistence::Ephemeral`)
+//! engine reopens: their storage is erased at open (`RecoverySource::Rederive`)
 //! so the backfill is the *sole* population — if that storage were durable, the
 //! loaded shards plus the backfill recompute would sum and every weight would
 //! double. These tests are the regression guard for that invariant, which is

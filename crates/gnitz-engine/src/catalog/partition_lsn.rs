@@ -97,7 +97,7 @@ impl CatalogEngine {
                 entry.schema,
                 tid as u32,
                 Routing::Replicated,
-                entry.kind.persistence(),
+                entry.kind.recovery_source(),
                 part_start,
                 part_start + 1,
             )

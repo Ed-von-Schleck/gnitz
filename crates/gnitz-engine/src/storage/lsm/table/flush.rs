@@ -1,38 +1,59 @@
 //! Two-phase flush state machine for [`Table`].
 //!
 //! The flush/spill path carved off `Table`'s ingest/cursor/lookup surface:
-//! `flush_prepare` (Phase 1 — consolidate, then write the shard image to a
-//! `.tmp`, returning `FlushWork`), `flush_commit` (Phase 2 — fsync, rename into
-//! place, publish the manifest), the synchronous `flush`/`flush_inner`
-//! wrappers, and in-memory ceiling enforcement (`compact_in_memory` /
-//! `spill_in_memory_to_disk`). `Table`'s fields are read directly here — `flush`
-//! is a child module of the `table` module that defines the struct.
+//! `flush_to_ram` (ingest overflow — fold the memtable into the RAM tier, no
+//! file I/O), `flush_prepare` (Phase 1 of the barrier / durable path —
+//! consolidate, then write the shard image to a `.tmp`, returning `FlushWork`),
+//! `flush_commit` (Phase 2 — fsync, rename into place, publish the manifest),
+//! the synchronous `flush` wrapper, and in-memory ceiling enforcement
+//! (`compact_in_memory` / `spill_in_memory_to_disk`). `Table`'s fields are read
+//! directly here — `flush` is a child module of the `table` module that defines
+//! the struct.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::rc::Rc;
 
+use super::super::batch::Batch;
 use super::super::error::StorageError;
 use super::super::memtable;
 use super::super::shard_file::{self, PkUniqueChecker};
 use super::{
-    FlushOutcome, FlushWork, FoundSource, Persistence, ShardRename, Table, EPHEMERAL_INMEM_CEILING,
+    FlushOutcome, FlushWork, FoundSource, InMemRun, RecoverySource, ShardRename, Table, INMEM_CEILING,
     INMEM_COMPACT_THRESHOLD,
 };
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 
 impl Table {
-    /// Flush memtable to shard.  Persistent tables also update manifest.
+    /// Synchronous flush. `Rederive` tables fold into the RAM tier (`DoneInline`);
+    /// `SalReplay` tables fold memtable + L0 into one durable shard, fdatasync it
+    /// (and the manifest) inline, commit, and fsync the dir. The sole synchronous
+    /// fsync entry point — used by manual FLUSH and system-table checkpoint.
     pub fn flush(&mut self) -> Result<bool, StorageError> {
-        self.flush_inner(self.persistence)
-    }
-
-    /// Flush with durable shard naming and manifest update, regardless of
-    /// WAL state.  Used by checkpoint: system tables disable WAL (SAL
-    /// provides durability) but still need manifest-tracked shards so
-    /// the data survives restart.
-    pub fn flush_durable(&mut self) -> Result<bool, StorageError> {
-        self.flush_inner(Persistence::Durable)
+        match self.flush_prepare()? {
+            FlushOutcome::Empty => Ok(false),
+            FlushOutcome::DoneInline => Ok(true),
+            FlushOutcome::Pending(mut work) => {
+                if let Some(fd) = work.shard_fd() {
+                    if fdatasync_eintr(fd).is_err() {
+                        return Err(StorageError::Io);
+                    }
+                }
+                if let Some(fd) = work.manifest_fd() {
+                    if fdatasync_eintr(fd).is_err() {
+                        return Err(StorageError::Io);
+                    }
+                }
+                work.close_fds();
+                // fsync the per-flush dir fd; it is not held for the table's life.
+                if let Some(fd) = self.flush_commit(*work)? {
+                    if fsync_eintr(fd.as_raw_fd()).is_err() {
+                        return Err(StorageError::Io);
+                    }
+                }
+                Ok(true)
+            }
+        }
     }
 
     /// Open the partition directory fd on demand (`O_RDONLY|O_DIRECTORY`).
@@ -52,73 +73,106 @@ impl Table {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    /// Phase 1 of two-phase flush, honoring the table's intrinsic persistence.
-    ///
-    /// `Ephemeral` (index circuits, views) with a non-empty consolidated
-    /// snapshot:
-    ///   append the snapshot to `in_memory_l0` — no file I/O, no manifest. The
-    ///   memtable IS reset. The run set is folded once it passes
-    ///   `INMEM_COMPACT_THRESHOLD`, and spilled to a real `eph_shard` only when
-    ///   `in_memory_bytes()` exceeds `EPHEMERAL_INMEM_CEILING` (the spill path
-    ///   restores page-cache reclaimability for the rare oversized table).
-    ///   `DoneInline` is returned.
-    ///
-    /// `Durable` and a non-empty consolidated snapshot:
-    ///   write shard `.tmp` (no fdatasync), open MappedShard against it for
-    ///   metadata, write manifest `.tmp`, return `Pending(FlushWork)`. The
-    ///   memtable is NOT reset.
-    ///
-    /// Empty memtable or `consolidated.count == 0`:
-    ///   reset memtable and return `Empty`. The cancelled rows are still
-    ///   recoverable from the SAL.
-    pub fn flush_prepare(&mut self) -> Result<FlushOutcome, StorageError> {
-        self.flush_prepare_with(self.persistence)
+    // ------------------------------------------------------------------
+    // RAM-tier fold (ingest overflow)
+    // ------------------------------------------------------------------
+
+    /// Fold the residual memtable into the RAM tier (no spill). Handles the
+    /// empty / count==0 cases. `InMemRun::from_batch` builds the per-run bloom.
+    fn fold_memtable_into_l0(&mut self) {
+        if self.memtable.is_empty() {
+            return;
+        }
+        let snapshot = self.memtable.consolidate_for_flush();
+        if snapshot.count > 0 {
+            self.cached_full_scan = None;
+            self.in_memory_l0.push(InMemRun::from_batch(snapshot));
+        }
+        self.memtable.reset();
     }
 
-    /// `flush_prepare` with an explicit per-flush persistence. Internal only:
-    /// the sole override of the table's own value is the worker memonly path
-    /// (`ingest_owned_batch_memonly` forces `Ephemeral` overflow flushes on a
-    /// `Durable` system table — master owns durability via the SAL).
-    fn flush_prepare_with(&mut self, persistence: Persistence) -> Result<FlushOutcome, StorageError> {
+    /// The ingest-overflow path for **every** table: fold the memtable into the
+    /// RAM tier, then keep that tier bounded (fold at `>INMEM_COMPACT_THRESHOLD`
+    /// runs, spill past `INMEM_CEILING`). No file I/O unless the ceiling is
+    /// breached; durability lives in the fsynced SAL until the checkpoint
+    /// barrier folds the tier into a durable shard. Both callers (ingest
+    /// overflow, `flush_prepare`) reset `found_source` before calling.
+    pub(super) fn flush_to_ram(&mut self) -> Result<(), StorageError> {
+        self.fold_memtable_into_l0();
+        self.enforce_inmem_bound()
+    }
+
+    /// Basename and manifest `max_lsn` for the next shard written from the RAM
+    /// tier (spill or barrier) — the unified `shard_{tid}_{lsn}.db` naming.
+    /// `current_lsn` bumps once per ingest and at most one shard is written per
+    /// ingest, so names are unique for this `Table` object. Directories with
+    /// several writer processes (secondary-index dirs, the workers' inherited
+    /// copies of `_sys` tables) can still collide across processes — tolerable
+    /// today only because `Rederive` state is erased at open and readers pin
+    /// their own mmap'd inodes; reloading such state requires making those
+    /// directories single-writer.
+    fn next_shard_name_and_lsn(&self) -> (String, u64) {
+        (
+            format!("shard_{}_{}.db", self.table_id, self.current_lsn),
+            self.current_lsn - 1,
+        )
+    }
+
+    /// `SHARD_FLAG_PK_UNIQUE` (or 0) for a consolidated run about to become a
+    /// shard, computed by observing all rows in sorted order. Only base tables
+    /// set `can_tag_pk_unique`; every other table's runs stay untagged ZSet.
+    fn shard_flush_flags(&self, run: &Batch) -> u8 {
+        if !self.can_tag_pk_unique {
+            return 0;
+        }
+        let mut checker = PkUniqueChecker::new();
+        for i in 0..run.count {
+            checker.observe(run.get_pk_bytes(i), run.get_weight(i));
+        }
+        checker.flags_if(true)
+    }
+
+    // ------------------------------------------------------------------
+    // Barrier / durable flush (two-phase)
+    // ------------------------------------------------------------------
+
+    /// Phase 1 of the barrier flush, branching on the table's `recovery_source`.
+    ///
+    /// `Rederive` (index circuits, views): fold into the RAM tier and return
+    /// `DoneInline` — no file I/O, no manifest. These are rebuilt from their
+    /// sources at open.
+    ///
+    /// `SalReplay` (base tables, master system tables): fold the memtable into
+    /// the RAM tier, then gate — a truly clean tier (`in_memory_l0` empty, or
+    /// fully cancelled to net-zero) returns `Empty`, since it is recoverable from
+    /// the SAL. Otherwise fold L0 to one net-state run, write it as a single
+    /// shard `.tmp` (no fdatasync), open MappedShard for metadata, write manifest
+    /// `.tmp`, and return `Pending(FlushWork)`. `in_memory_l0` is NOT cleared here
+    /// (retry-safe); `flush_commit` clears it once the shard is durable.
+    pub fn flush_prepare(&mut self) -> Result<FlushOutcome, StorageError> {
         self.found_source = FoundSource::None;
-        if self.memtable.is_empty() {
-            return Ok(FlushOutcome::Empty);
-        }
-
-        let snapshot = self.memtable.consolidate_for_flush();
-        if snapshot.count == 0 {
-            self.memtable.reset();
-            return Ok(FlushOutcome::Empty);
-        }
-
-        if persistence == Persistence::Ephemeral {
-            // In-memory ephemeral flush: no file I/O. `snapshot` is the
-            // (PK,payload)-consolidated run; the memtable references it until
-            // reset(), after which `in_memory_l0` keeps it alive.
-            self.cached_full_scan = None;
-            self.in_memory_l0.push(snapshot);
-            self.memtable.reset();
-            self.enforce_inmem_bound()?;
+        if self.recovery_source == RecoverySource::Rederive {
+            self.flush_to_ram()?;
             return Ok(FlushOutcome::DoneInline);
         }
 
-        let shard_name = format!("shard_{}_{}.db", self.table_id, self.current_lsn);
-        let lsn_max = self.current_lsn.saturating_sub(1);
+        // SalReplay barrier flush: fold-first, then gate, then one shard.
+        self.fold_memtable_into_l0();
+        self.compact_in_memory();
+        if self.in_memory_l0.is_empty() {
+            // Nothing ingested since the last checkpoint, or the whole tier
+            // cancelled to net-zero across runs (e.g. insert then delete of the
+            // same rows in separate overflows). The SAL covers either case.
+            return Ok(FlushOutcome::Empty);
+        }
+        // `compact_in_memory` left exactly one net-state run (count > 0). Borrow
+        // it — a write/register failure below leaves heap intact for retry.
+        let run = Rc::clone(&self.in_memory_l0[0].batch);
 
+        let (shard_name, lsn_max) = self.next_shard_name_and_lsn();
         let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
-        let regions = snapshot.regions();
-
-        // Compute PkUnique flag by observing all rows in sorted order.
-        // Only run the checker for base tables; memtable runs are always ZSet.
-        let flush_flags = if self.can_tag_pk_unique {
-            let mut checker = PkUniqueChecker::new();
-            for i in 0..snapshot.count {
-                checker.observe(snapshot.get_pk_bytes(i), snapshot.get_weight(i));
-            }
-            checker.flags_if(true)
-        } else {
-            0
-        };
+        let regions = run.regions();
+        let flush_flags = self.shard_flush_flags(&run);
 
         // Owned for this flush only. The durable branch moves ownership into
         // `ShardRename` (whose Drop closes it on a rollback) and hands it to the
@@ -129,7 +183,7 @@ impl Table {
             dirfd.as_raw_fd(),
             &name_c,
             self.table_id,
-            snapshot.count as u32,
+            run.count as u32,
             &regions,
             flush_flags,
         )?;
@@ -162,7 +216,7 @@ impl Table {
         let manifest_path = self
             .manifest_path
             .as_ref()
-            .expect("durable table must have manifest_path");
+            .expect("SalReplay table must have manifest_path");
         let manifest_c = CString::new(manifest_path.as_str()).map_err(|_| StorageError::InvalidPath)?;
         work.manifest = Some(self.shard_index.prepare_manifest_with_pending(&manifest_c, &pending)?);
         work.pending_shard = Some(pending);
@@ -170,12 +224,13 @@ impl Table {
         Ok(FlushOutcome::Pending(Box::new(work)))
     }
 
-    /// Phase 3: rename shard then manifest into final names; insert
-    /// pending_shard into shard_index; reset the memtable. Returns the per-flush
-    /// directory fd (opened in `flush_prepare`, ownership moved out of
-    /// `ShardRename` here) for the caller to `fsync` after all renames in the
-    /// worker batch. Every path — success and each early error return — releases
-    /// the fd through its `OwnedFd`, so a failed commit never leaks it.
+    /// Phase 2: rename shard then manifest into final names; insert
+    /// pending_shard into shard_index; clear the RAM tier.
+    /// Returns the per-flush directory fd (opened in `flush_prepare`, ownership
+    /// moved out of `ShardRename` here) for the caller to `fsync` after all
+    /// renames in the worker batch. Every path — success and each early error
+    /// return — releases the fd through its `OwnedFd`, so a failed commit never
+    /// leaks it.
     pub(crate) fn flush_commit(&mut self, mut work: FlushWork) -> Result<Option<OwnedFd>, StorageError> {
         // Rename shard .tmp → final.
         let dirfd = if let Some(rename) = work.shard_rename.take() {
@@ -215,43 +270,26 @@ impl Table {
             self.shard_index.add_opened_shard(pending);
         }
 
-        self.memtable.reset();
+        // The barrier folded memtable + L0 into the now-durable shard; drop the
+        // RAM tier. Reached only from a `Pending` outcome (the SalReplay branch),
+        // and only after every rename succeeded — a commit failure returns above
+        // with the RAM tier intact for retry. The memtable was folded (and reset)
+        // by `flush_prepare`; nothing refills it between prepare and commit on
+        // the single-threaded worker.
+        debug_assert!(
+            self.memtable.is_empty(),
+            "rows ingested between flush_prepare and flush_commit would be dropped",
+        );
+        self.in_memory_l0.clear();
         Ok(dirfd)
     }
 
-    pub(super) fn flush_inner(&mut self, persistence: Persistence) -> Result<bool, StorageError> {
-        match self.flush_prepare_with(persistence)? {
-            FlushOutcome::Empty => Ok(false),
-            FlushOutcome::DoneInline => Ok(true),
-            FlushOutcome::Pending(mut work) => {
-                if let Some(fd) = work.shard_fd() {
-                    if fdatasync_eintr(fd).is_err() {
-                        return Err(StorageError::Io);
-                    }
-                }
-                if let Some(fd) = work.manifest_fd() {
-                    if fdatasync_eintr(fd).is_err() {
-                        return Err(StorageError::Io);
-                    }
-                }
-                work.close_fds();
-                // fsync the per-flush dir fd; it is not held for the table's life.
-                if let Some(fd) = self.flush_commit(*work)? {
-                    if fsync_eintr(fd.as_raw_fd()).is_err() {
-                        return Err(StorageError::Io);
-                    }
-                }
-                Ok(true)
-            }
-        }
-    }
-
     // ------------------------------------------------------------------
-    // In-memory ephemeral run set (non-durable flushes)
+    // In-memory run set bounding + spill
     // ------------------------------------------------------------------
 
-    /// The effective per-table heap ceiling — `EPHEMERAL_INMEM_CEILING` in
-    /// production, or the test override when one is set.
+    /// The effective per-table heap ceiling — `INMEM_CEILING` in production, or
+    /// the test override when one is set.
     fn inmem_ceiling(&self) -> usize {
         #[cfg(test)]
         {
@@ -259,7 +297,7 @@ impl Table {
                 return c;
             }
         }
-        EPHEMERAL_INMEM_CEILING
+        INMEM_CEILING
     }
 
     /// Heap footprint of `in_memory_l0` — the byte total that drives the spill
@@ -268,13 +306,13 @@ impl Table {
     /// arithmetic calls, with no cached field for every mutation of
     /// `in_memory_l0` to keep in sync.
     pub(super) fn in_memory_bytes(&self) -> usize {
-        self.in_memory_l0.iter().map(|r| r.total_bytes()).sum()
+        self.in_memory_l0.iter().map(|r| r.batch.total_bytes()).sum()
     }
 
-    /// Keep `in_memory_l0` bounded after a non-durable flush. Called by
-    /// `flush_prepare`'s in-memory branch (the only site that grows the set),
-    /// so on return `in_memory_l0.len() <= INMEM_COMPACT_THRESHOLD` and
-    /// `in_memory_bytes() <= EPHEMERAL_INMEM_CEILING` always hold.
+    /// Keep `in_memory_l0` bounded after a fold into the RAM tier. Called by
+    /// `flush_to_ram` (the only site that grows the set), so on return
+    /// `in_memory_l0.len() <= INMEM_COMPACT_THRESHOLD` and
+    /// `in_memory_bytes() <= INMEM_CEILING` always hold.
     fn enforce_inmem_bound(&mut self) -> Result<(), StorageError> {
         if self.in_memory_l0.len() > INMEM_COMPACT_THRESHOLD {
             self.compact_in_memory();
@@ -291,10 +329,11 @@ impl Table {
         if self.in_memory_l0.len() <= 1 {
             return;
         }
-        let merged = memtable::consolidate_runs(&self.in_memory_l0, &self.schema);
+        let batches: Vec<Rc<Batch>> = self.in_memory_l0.iter().map(|r| Rc::clone(&r.batch)).collect();
+        let merged = memtable::consolidate_runs(&batches, &self.schema);
         self.in_memory_l0.clear();
         if merged.count > 0 {
-            self.in_memory_l0.push(merged);
+            self.in_memory_l0.push(InMemRun::from_batch(merged)); // rebuilds run bloom
         }
     }
 
@@ -302,16 +341,21 @@ impl Table {
     /// churn (an insert in flush N against its retraction in N+1) and can
     /// reclaim enough to fall back under the ceiling — in which case this
     /// returns without touching disk. Otherwise write the folded run to a real
-    /// `eph_shard` (the historical non-durable disk path), register it, drop it
-    /// from heap, then compact the disk tier.
+    /// `shard_{tid}_{lsn}` (unified with the durable/barrier naming), register
+    /// it, drop it from heap, then compact the disk tier.
+    ///
+    /// SalReplay spills are durable + PK-tagged (a later checkpoint barrier's
+    /// manifest references them, but the barrier only fsyncs its own shard — so
+    /// an unsynced spill would be lost on crash yet skipped by the advanced
+    /// watermark). Rederive spills publish no manifest and are erased+rebuilt at
+    /// open, so they stay unsynced + untagged.
     ///
     /// After a spill the table carries disk runs + future heap runs; cross-tier
     /// churn does NOT fold (neither `compact_in_memory`, which is heap-only, nor
     /// `run_compact`, which is disk-only, sees both). This is bounded: it only
     /// occurs for tables that breached the ceiling, affects disk footprint not
     /// heap (heap stays <= ceiling by construction), and the disk tier still
-    /// self-compacts. Eliminating it would need a unified disk+heap compaction —
-    /// out of scope.
+    /// self-compacts.
     ///
     /// Transactional. The consolidated run stays in `in_memory_l0` until the
     /// shard is both written and registered; heap is dropped only on the commit
@@ -327,23 +371,22 @@ impl Table {
             return Ok(());
         }
         // Above the ceiling the byte total is > 0, so `compact_in_memory` left
-        // exactly one net-state run (count > 0) in heap — `flush_prepare` never
+        // exactly one net-state run (count > 0) in heap — `flush_to_ram` never
         // enqueues an empty snapshot and `compact_in_memory` only re-pushes
         // `merged.count > 0`. Borrow it — do not remove — so a write/register
         // failure below leaves heap intact for retry.
         let run = Rc::clone(
-            self.in_memory_l0
+            &self
+                .in_memory_l0
                 .first()
-                .expect("compaction leaves one net-state run when above the spill ceiling"),
+                .expect("compaction leaves one net-state run when above the spill ceiling")
+                .batch,
         );
 
-        self.flush_seq += 1;
-        let pid = unsafe { libc::getpid() };
-        let shard_name = format!(
-            "eph_shard_{}_{}_{}_{}.db",
-            self.table_id, pid, self.flush_seq, self.current_lsn
-        );
+        let (shard_name, lsn_max) = self.next_shard_name_and_lsn();
         let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
+        let flush_flags = self.shard_flush_flags(&run);
+        let durable = self.recovery_source == RecoverySource::SalReplay;
 
         let dirfd = self.open_dirfd()?;
         let res = shard_file::write_shard_streaming(
@@ -352,14 +395,15 @@ impl Table {
             self.table_id,
             run.count as u32,
             &run.regions(),
-            false,
-            0,
+            durable,
+            flush_flags,
         );
         drop(dirfd);
         res?; // Write failed: heap still owns `run`; no on-disk residue.
 
+        // Register with real LSNs so a reopen seeds `current_lsn = max_lsn() + 1`.
         let final_full = format!("{}/{}", self.directory, shard_name);
-        if let Err(e) = self.shard_index.add_shard(&final_full, 0, 0) {
+        if let Err(e) = self.shard_index.add_shard(&final_full, 0, lsn_max) {
             // Registration failed: unlink the shard we wrote, keep heap intact.
             let _ = std::fs::remove_file(&final_full);
             return Err(e);
@@ -369,10 +413,10 @@ impl Table {
         self.in_memory_l0.clear();
 
         // Bound the spilled disk L0. A repeatedly-spilling table is read only
-        // via the non-compacting `open_cursor`, so without this its `eph_shard`s
+        // via the non-compacting `open_cursor`, so without this its shards
         // accumulate unbounded and every cursor merges them all.
         // `compact_if_needed` is a no-op until the disk tier crosses its own
-        // threshold and skips the manifest (None) for this non-durable table.
+        // threshold and skips the manifest (None) for a Rederive table.
         self.compact_if_needed()?;
         Ok(())
     }

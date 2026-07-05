@@ -119,7 +119,7 @@ pub(super) fn create_child_table(
         schema,
         table_id,
         256 * 1024,
-        Persistence::Ephemeral,
+        RecoverySource::Rederive,
     )
 }
 

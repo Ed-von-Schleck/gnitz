@@ -89,7 +89,7 @@ pub fn op_integrate_with_indexes(
     // straight into the memtable's owned copy — one copy per tick, and `batch`
     // stays readable for the AVI population below.
     if let Some(table) = target_table {
-        table.ingest_borrowed_batch_memonly(batch)?;
+        table.ingest_borrowed_batch(batch)?;
     }
 
     let mb = batch.as_mem_batch();
@@ -158,7 +158,7 @@ pub fn op_integrate_with_indexes(
 
         if avi_batch.count > 0 {
             let avi_table = unsafe { &mut *avi_desc.table };
-            let _ = avi_table.ingest_owned_batch_memonly(avi_batch);
+            let _ = avi_table.ingest_owned_batch(avi_batch);
         }
     }
 

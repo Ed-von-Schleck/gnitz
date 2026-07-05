@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use proptest::prelude::*;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_PK_BYTES, MAX_PK_COLUMNS};
-use crate::storage::{Batch, Persistence, Table};
+use crate::storage::{Batch, RecoverySource, Table};
 use crate::test_support::{arb_pk_type, arb_type_code};
 
 // ---------------------------------------------------------------------------
@@ -201,9 +201,9 @@ fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> HashMap<RowKey, i64> {
 // — Rc, not Arc), so every test binds `let mut table`.
 fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> Table {
     let p = if durable {
-        Persistence::Durable
+        RecoverySource::SalReplay
     } else {
-        Persistence::Ephemeral
+        RecoverySource::Rederive
     };
     Table::new(dir.to_str().unwrap(), "t", schema, 1, 1 << 20, p).unwrap()
 }

@@ -8,7 +8,7 @@ use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{AggDescriptor, AggOp};
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{is_fixed_int, type_code, SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{CursorHandle, Persistence, Table};
+use crate::storage::{CursorHandle, RecoverySource, Table};
 
 mod emit;
 mod load;
@@ -1717,7 +1717,7 @@ mod tests {
             nodes_schema,
             0,
             256 * 1024,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
         )
         .unwrap();
         {
@@ -1736,7 +1736,7 @@ mod tests {
             edges_schema,
             0,
             256 * 1024,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
         )
         .unwrap();
         let _ = &mut edges_tab; // empty
@@ -1746,7 +1746,7 @@ mod tests {
             cols_schema,
             0,
             256 * 1024,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
         )
         .unwrap();
         let _ = &mut cols_tab; // empty
@@ -1783,7 +1783,7 @@ mod tests {
             nodes_schema,
             0,
             256 * 1024,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
         )
         .unwrap();
         {
@@ -1810,7 +1810,7 @@ mod tests {
             edges_schema,
             0,
             256 * 1024,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
         )
         .unwrap();
         {
@@ -1829,7 +1829,7 @@ mod tests {
             cols_schema,
             0,
             256 * 1024,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
         )
         .unwrap();
         let _ = &mut cols_tab;

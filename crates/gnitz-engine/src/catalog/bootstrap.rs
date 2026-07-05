@@ -22,7 +22,7 @@ impl CatalogEngine {
                 schema,
                 info.id as u32,
                 SYS_TABLE_ARENA,
-                RelationKind::SystemCatalog.persistence(),
+                RelationKind::SystemCatalog.recovery_source(),
             )
             .map(Box::new)
             .map_err(|e| format!("Failed to create system table '{}': error {}", info.name, e))
@@ -425,8 +425,10 @@ impl CatalogEngine {
     pub fn flush_all_system_tables(&mut self) -> Result<(), String> {
         for info in SYS_TAB_INFOS {
             if let Some(table) = self.sys_table_mut(info.id) {
+                // System tables are `SalReplay`, so `flush()` folds memtable + L0
+                // and writes a durable shard synchronously.
                 table
-                    .flush_durable()
+                    .flush()
                     .map_err(|e| format!("boot flush of system table {} failed: {}", info.id, e))?;
             }
         }

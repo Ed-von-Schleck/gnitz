@@ -4880,7 +4880,7 @@ fn avi_read_extreme(
         avi_schema,
         0,
         1 << 20,
-        crate::storage::Persistence::Ephemeral,
+        crate::storage::RecoverySource::Rederive,
     )
     .unwrap();
     let agg = AggDescriptor {
@@ -6902,7 +6902,7 @@ fn build_combined_avi(
         avi_schema,
         0,
         1 << 20,
-        crate::storage::Persistence::Ephemeral,
+        crate::storage::RecoverySource::Rederive,
     )
     .unwrap();
     // The value-indexed (MIN/MAX) subset, in descriptor order — exactly what the
@@ -7634,14 +7634,14 @@ fn run_reduce_trace_epochs(
         *out_schema,
         0,
         1 << 20,
-        crate::storage::Persistence::Ephemeral,
+        crate::storage::RecoverySource::Rederive,
     )
     .unwrap();
     let mut max_sources = 0usize;
     for (i, d) in epochs.iter().enumerate() {
         // Sources the cursor for THIS epoch's probe sees: memtable runs + folded
         // in-memory runs + shard files (each becomes one CursorSource).
-        let sources = trace.snapshot_runs().len() + trace.in_memory_runs().len() + trace.all_shard_arcs().len();
+        let sources = trace.snapshot_runs().len() + trace.in_memory_runs().count() + trace.all_shard_arcs().len();
         max_sources = max_sources.max(sources);
         let out = {
             let mut ch = trace.open_cursor();
@@ -8015,16 +8015,16 @@ fn run_minmax_epochs(
     global_ground: bool,
 ) -> Vec<std::rc::Rc<Batch>> {
     use crate::ops::index::{make_avi_schema, op_integrate_with_indexes, AviDesc};
-    use crate::storage::{Persistence, Table};
+    use crate::storage::{RecoverySource, Table};
 
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
 
-    let mut trace_out = Table::new(dir, "trace_out", *out_schema, 0, 1 << 20, Persistence::Ephemeral).unwrap();
+    let mut trace_out = Table::new(dir, "trace_out", *out_schema, 0, 1 << 20, RecoverySource::Rederive).unwrap();
     let mut trace_in =
-        (!use_avi).then(|| Table::new(dir, "trace_in", *in_schema, 1, 1 << 20, Persistence::Ephemeral).unwrap());
+        (!use_avi).then(|| Table::new(dir, "trace_in", *in_schema, 1, 1 << 20, RecoverySource::Rederive).unwrap());
     let avi_schema = make_avi_schema(in_schema, group_by);
-    let mut avi_t = use_avi.then(|| Table::new(dir, "avi", avi_schema, 2, 1 << 20, Persistence::Ephemeral).unwrap());
+    let mut avi_t = use_avi.then(|| Table::new(dir, "avi", avi_schema, 2, 1 << 20, RecoverySource::Rederive).unwrap());
 
     // Value-indexed (MIN/MAX) subset in descriptor order — exactly what the
     // compiler feeds the integrate instruction and the reduce read side.

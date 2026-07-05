@@ -43,20 +43,22 @@ pub(crate) fn consolidate_runs(runs: &[Rc<Batch>], schema: &SchemaDescriptor) ->
     Rc::new(consolidate_batches(&sorted, schema))
 }
 
-impl MemTable {
-    /// Insert every row's PK into the bloom, keyed by its leading ≤16 OPK bytes
-    /// via `pack_pk_be` — the same derivation `may_contain_pk` probes with,
-    /// consistent for signed PKs (whose sign-flipped `get_pk` value would not
-    /// be). `pack_pk_be` truncates to the leading 16 OPK bytes, so wide PKs
-    /// (`pk_stride > 16`) hash their prefix: add and probe pack identically, so
-    /// there is no false negative; two wide PKs sharing a 16-byte prefix collide
-    /// to one slot, a tolerated false positive resolved by the run scan.
-    fn bloom_add_batch(&mut self, batch: &Batch) {
-        for i in 0..batch.count {
-            self.bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
-        }
+/// Insert every row's PK into `bloom`, keyed by its leading ≤16 OPK bytes via
+/// `pack_pk_be` — the same derivation the probe side (`may_contain_pk`,
+/// `InMemRun::may_contain`) packs with, consistent for signed PKs (whose
+/// sign-flipped `get_pk` value would not be). `pack_pk_be` truncates to the
+/// leading 16 OPK bytes, so wide PKs (`pk_stride > 16`) hash their prefix: add
+/// and probe pack identically, so there is no false negative; two wide PKs
+/// sharing a 16-byte prefix collide to one slot, a tolerated false positive
+/// resolved by the run scan. The single owner of the PK bloom keying, shared by
+/// the memtable bloom and the per-run `in_memory_l0` blooms.
+pub(crate) fn bloom_add_batch(bloom: &mut super::super::bloom::BloomFilter, batch: &Batch) {
+    for i in 0..batch.count {
+        bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
     }
+}
 
+impl MemTable {
     /// Append a consolidated batch as a new run. The batch must be consolidated
     /// (debug-verified at entry); producers certify it via `into_consolidated`.
     pub fn upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
@@ -68,7 +70,7 @@ impl MemTable {
             return Ok(());
         }
         self.check_capacity()?;
-        self.bloom_add_batch(&batch);
+        bloom_add_batch(&mut self.bloom, &batch);
         self.total_row_count += batch.count;
         self.runs_bytes += batch.total_bytes();
         self.runs.push(Rc::new(batch));
@@ -122,7 +124,7 @@ impl MemTable {
         // weight-cancelled rows are cleared here, reducing false-positive rate.
         self.bloom.reset();
         if merged.count > 0 {
-            self.bloom_add_batch(&merged);
+            bloom_add_batch(&mut self.bloom, &merged);
             self.runs.push(Rc::new(merged));
         }
         self.found = None;

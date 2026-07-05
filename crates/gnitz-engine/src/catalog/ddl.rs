@@ -386,7 +386,7 @@ impl CatalogEngine {
             self.dag
                 .tables
                 .get(&vid)
-                .is_none_or(|e| e.kind.persistence() == Persistence::Ephemeral),
+                .is_none_or(|e| e.kind.recovery_source() == RecoverySource::Rederive),
             "backfill_view on durable relation {vid}: would double-count loaded shards",
         );
         if !self.dag.ensure_compiled(vid) {
@@ -458,7 +458,7 @@ impl CatalogEngine {
         // indexed relation, a durable base table). Backfilling into durable
         // storage would double-count its loaded shards on the next open.
         debug_assert!(
-            unsafe { &*idx_table }.persistence() == Persistence::Ephemeral,
+            unsafe { &*idx_table }.recovery_source() == RecoverySource::Rederive,
             "backfill_index into durable storage (owner {owner_id}): would double-count",
         );
         self.stream_index_projection(owner_id, col_indices, is_unique, Some(idx_table), idx_schema)

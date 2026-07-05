@@ -2441,7 +2441,7 @@ mod tests {
             schema,
             100,
             crate::storage::Routing::Replicated,
-            crate::storage::Persistence::Ephemeral,
+            crate::storage::RecoverySource::Rederive,
             0,
             1,
         )

@@ -49,7 +49,7 @@ use std::rc::Rc;
 
 use crate::query::{DagEngine, RelationKind, StoreHandle};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, CursorHandle, PartitionedTable, Persistence, Routing, Table};
+use crate::storage::{Batch, CursorHandle, PartitionedTable, RecoverySource, Routing, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 pub(crate) use sys_tables::{FIRST_USER_TABLE_ID, SEQ_ID_INDICES, SEQ_ID_SCHEMAS, SEQ_ID_TABLES, SEQ_TAB_ID};

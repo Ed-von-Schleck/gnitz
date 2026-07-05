@@ -202,7 +202,7 @@ impl CatalogEngine {
             schema,
             id as u32,
             routing,
-            kind.persistence(),
+            kind.recovery_source(),
             part_start,
             part_end,
         )
@@ -639,7 +639,7 @@ impl CatalogEngine {
                     idx_schema,
                     idx_id as u32,
                     SYS_TABLE_ARENA,
-                    Persistence::Ephemeral,
+                    RecoverySource::Rederive,
                 )
                 .map_err(|e| format!("Failed to create index table: error {e}"))?;
 

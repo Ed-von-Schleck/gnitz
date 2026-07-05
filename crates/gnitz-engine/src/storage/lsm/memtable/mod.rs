@@ -15,7 +15,7 @@ mod lookup;
 mod runs;
 
 pub(crate) use lookup::run_pk_match_rows;
-pub(crate) use runs::consolidate_runs;
+pub(crate) use runs::{bloom_add_batch, consolidate_runs};
 
 /// Maximum sorted runs before inline consolidation merges them into one.
 const INLINE_CONSOLIDATE_THRESHOLD: usize = 16;

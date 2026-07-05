@@ -14,7 +14,7 @@ use super::columnar;
 use super::error::StorageError;
 use super::read_cursor::{self, CursorHandle};
 use super::shard_reader::MappedShard;
-use super::table::{self, FlushOutcome, FlushWork, Persistence, Table};
+use super::table::{self, FlushOutcome, FlushWork, RecoverySource, Table};
 use crate::schema::SchemaDescriptor;
 
 thread_local! {
@@ -63,7 +63,7 @@ impl PartitionedTable {
         schema: SchemaDescriptor,
         table_id: u32,
         routing: Routing,
-        persistence: Persistence,
+        recovery_source: RecoverySource,
         part_start: u32,
         part_end: u32,
     ) -> Result<Self, StorageError> {
@@ -102,7 +102,7 @@ impl PartitionedTable {
         let mut tables = Vec::with_capacity((part_end - part_start) as usize);
         for p in part_start..part_end {
             let part_dir = format!("{dir}/part_{p}");
-            let t = Table::new(&part_dir, name, schema, table_id, arena_size, persistence)?;
+            let t = Table::new(&part_dir, name, schema, table_id, arena_size, recovery_source)?;
             tables.push(t);
         }
 
@@ -210,7 +210,7 @@ impl PartitionedTable {
     // ------------------------------------------------------------------
 
     /// Gather every live partition's read sources — memtable `snapshot_runs`,
-    /// non-durable `in_memory_runs`, and `all_shard_arcs` — into one
+    /// RAM-tier `in_memory_runs`, and `all_shard_arcs` — into one
     /// (snapshots, shards) pair for `create_cursor_from_snapshots`. The single
     /// owner of the per-partition gather shared by `open_cursor` and
     /// `create_cursor_compacting`; takes `&[Table]` (never compacts), so the
@@ -220,7 +220,7 @@ impl PartitionedTable {
         let mut shards: Vec<Rc<MappedShard>> = Vec::new();
         for table in tables {
             snapshots.extend(table.snapshot_runs().iter().cloned());
-            snapshots.extend(table.in_memory_runs().iter().cloned());
+            snapshots.extend(table.in_memory_runs());
             shards.extend(table.all_shard_arcs());
         }
         (snapshots, shards)
@@ -551,7 +551,7 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
             schema(),
             830,
             Routing::Hashed,
-            Persistence::Durable,
+            RecoverySource::SalReplay,
             0,
             2,
         )
@@ -664,7 +664,7 @@ mod tests {
             schema,
             100,
             Routing::Replicated,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             1,
         )
@@ -691,7 +691,7 @@ mod tests {
             schema,
             200,
             Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -718,7 +718,7 @@ mod tests {
             schema,
             300,
             Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -744,7 +744,7 @@ mod tests {
             schema,
             400,
             Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -794,7 +794,7 @@ mod tests {
             schema,
             900,
             Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -937,7 +937,7 @@ mod tests {
             schema,
             700,
             Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             1,
         )
@@ -984,7 +984,7 @@ mod tests {
             schema,
             500,
             Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -1011,7 +1011,7 @@ mod tests {
             schema,
             600,
             Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -1068,7 +1068,7 @@ mod tests {
             schema,
             800,
             Routing::Hashed,
-            Persistence::Durable,
+            RecoverySource::SalReplay,
             0,
             256,
         )
@@ -1102,7 +1102,7 @@ mod tests {
             schema,
             810,
             Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -1111,11 +1111,11 @@ mod tests {
         pt.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300), (40, 1, 400)]))
             .unwrap();
         let works = pt.flush_prepare().unwrap();
-        assert!(works.is_empty(), "non-durable table must return no Pending work");
+        assert!(works.is_empty(), "Rederive table must return no Pending work");
         assert_eq!(
-            count_tree(&tdir, |n| n.starts_with("shard_") || n.starts_with("eph_shard_")),
+            count_tree(&tdir, |n| n.starts_with("shard_")),
             0,
-            "non-durable checkpoint flush must write no shard files",
+            "Rederive checkpoint flush must write no shard files",
         );
         assert_eq!(count_tree(&tdir, |n| n == "manifest.bin"), 0);
         for pk in [10u128, 20, 30, 40] {
@@ -1139,7 +1139,7 @@ mod tests {
             schema,
             820,
             Routing::Hashed,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
             0,
             256,
         )
@@ -1224,7 +1224,7 @@ mod tests {
             make_schema(),
             table_id,
             Routing::Hashed,
-            Persistence::Durable,
+            RecoverySource::SalReplay,
             0,
             256,
         )

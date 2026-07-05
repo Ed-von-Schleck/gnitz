@@ -433,9 +433,11 @@ impl CatalogEngine {
         }
     }
 
-    /// Worker DDL sync: memonly ingest into system table + fire hooks.
-    /// Workers receive DDL deltas from master and need to update their registry
-    /// without writing to WAL (master owns durability).
+    /// Worker DDL sync: ingest into system table + fire hooks. Workers receive
+    /// DDL deltas from master and update their registry; durability is
+    /// master-side (fsynced SAL + the master's own system-table flush). The
+    /// worker's inherited copy lives in RAM (memtable + `in_memory_l0`) and is
+    /// never flushed by the worker — only the master writes `_sys/` shards.
     pub fn ddl_sync(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
         let family = SysFamily::from_id(table_id).ok_or_else(|| "ddl_sync only for system tables".to_string())?;
         // Fire hooks first (borrow only); the ingest below moves `batch`.
@@ -444,7 +446,7 @@ impl CatalogEngine {
         let table = self
             .sys_table_mut(table_id)
             .ok_or_else(|| format!("Unknown system table_id {table_id}"))?;
-        let _ = table.ingest_owned_batch_memonly(batch);
+        let _ = table.ingest_owned_batch(batch);
         Ok(())
     }
 

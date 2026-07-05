@@ -25,7 +25,7 @@ pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
 pub use lsm::partitioned_table::{partition_for_key, partition_for_pk_bytes, PartitionedTable, Routing};
 pub use lsm::read_cursor::CursorHandle;
-pub use lsm::table::{FlushOutcome, FlushWork, Persistence, Table};
+pub use lsm::table::{FlushOutcome, FlushWork, RecoverySource, Table};
 pub use merge::MemBatch;
 pub use scatter::{scatter_copy, scatter_multi_source};
 

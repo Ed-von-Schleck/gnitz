@@ -9,11 +9,11 @@
 /// forked workers share via the same `base_dir`; embedding the rank keeps each
 /// worker's ephemeral shard isolated so siblings don't clobber each other.
 ///
-/// These scratch tables now flush in-memory (`in_memory_l0`), so the rank only
-/// matters when a table *spills* past `EPHEMERAL_INMEM_CEILING` (which still
-/// writes `eph_shard_*` files into the shared tree) and at construction-time
-/// `erase_stale_shards`. Retained for those paths; a future change that removed
-/// spill entirely could revisit it.
+/// These scratch tables flush in-memory (`in_memory_l0`), so the rank only
+/// matters when a table *spills* past `INMEM_CEILING` (which writes shard
+/// files into the shared tree) and at construction-time `erase_stale_shards`.
+/// Retained for those paths; a future change that removed spill entirely could
+/// revisit it.
 static WORKER_RANK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Sibling of `WORKER_RANK`: the worker count baked into this process's compiled

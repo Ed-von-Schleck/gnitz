@@ -12,7 +12,7 @@
 //!   compose : build the index key into a stack buffer, discard
 //!   assembly: the `extend_*` calls that turn keys into a `Batch` (= build - compose)
 //!   sort    : `into_consolidated` (argsort + dedup of the unsorted batch)
-//!   upsert  : `ingest_owned_batch_memonly` of an *already-consolidated* batch
+//!   upsert  : `ingest_owned_batch` of an *already-consolidated* batch
 //!             (its internal `into_consolidated` short-circuits, so this times
 //!             only the memtable upsert: per-row bloom population + run push)
 //!
@@ -25,7 +25,7 @@ use super::index::{make_avi_schema, op_integrate_with_indexes, AviDesc};
 use super::util::{encode_ordered, GroupKeyExtractor, AVI_AV_BYTES};
 use super::{AggDescriptor, AggOp};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
-use crate::storage::{Batch, Persistence, Table};
+use crate::storage::{Batch, RecoverySource, Table};
 
 const N_ROWS: usize = 500_000;
 const N_GROUPS: u64 = 10_000;
@@ -106,7 +106,7 @@ fn report(index: &str, compose: Duration, build: Duration, sort: Duration, upser
     );
 }
 
-/// Time `ingest_owned_batch_memonly` alone: rebuild + pre-consolidate the index
+/// Time `ingest_owned_batch` alone: rebuild + pre-consolidate the index
 /// batch *outside* the timed region (so `into_consolidated` short-circuits
 /// inside ingest), and create the destination table outside it too.
 fn time_upsert(
@@ -124,11 +124,11 @@ fn time_upsert(
             schema,
             base_id + i,
             arena(),
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
         )
         .unwrap();
         let start = Instant::now();
-        t.ingest_owned_batch_memonly(pre).unwrap();
+        t.ingest_owned_batch(pre).unwrap();
         if i > 0 {
             total += start.elapsed();
         }
@@ -202,7 +202,7 @@ fn secondary_index_bench_avi_decomposition() {
             avi_schema,
             id,
             arena(),
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
         )
         .unwrap();
         id += 1;

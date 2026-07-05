@@ -1408,7 +1408,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
     let handle = engine.get_index_store_handle(tid, &[1]) as *mut Table;
     assert!(!handle.is_null());
     unsafe {
-        (*handle).ingest_owned_batch_memonly(b).unwrap();
+        (*handle).ingest_owned_batch(b).unwrap();
         (*handle).flush().unwrap();
     }
 
@@ -3254,7 +3254,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // which the resolve's binary-search seek relies on.
     use crate::query::{DagEngine, RelationKind, StoreHandle};
     use crate::schema::{SchemaColumn, SchemaDescriptor};
-    use crate::storage::{Persistence, Table};
+    use crate::storage::{RecoverySource, Table};
 
     fn u64c() -> SchemaColumn {
         SchemaColumn::new(type_code::U64, 0)
@@ -3299,7 +3299,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
             schema,
             tid as u32,
             256 * 1024,
-            Persistence::Ephemeral,
+            RecoverySource::Rederive,
         )
         .unwrap(),
     );
@@ -3309,7 +3309,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
         idx_schema,
         tid as u32 + 1,
         256 * 1024,
-        Persistence::Ephemeral,
+        RecoverySource::Rederive,
     )
     .unwrap();
     base.ingest_owned_batch(bb).unwrap();
