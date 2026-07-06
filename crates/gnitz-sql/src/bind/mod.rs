@@ -17,4 +17,6 @@ pub(crate) use resolve::{
 // Used by the multi-way-join provenance map and `predicates.rs`'s unit tests, which
 // build `AliasMap`s directly.
 pub(crate) use resolve::ResolvedRelation;
-pub(crate) use structural::{bind_single_table, bind_structural, fold_null_test, LeafBinder, SingleTable};
+pub(crate) use structural::{
+    bind_single_table, bind_single_table_mark, bind_structural, fold_null_test, LeafBinder, SingleTable,
+};

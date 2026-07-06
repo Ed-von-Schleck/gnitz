@@ -3,8 +3,9 @@ use gnitz_wire::{
     EXPR_CMP_NE, EXPR_COPY_COL, EXPR_EMIT, EXPR_EMIT_NULL, EXPR_FCMP_EQ, EXPR_FCMP_GE, EXPR_FCMP_GT, EXPR_FCMP_LE,
     EXPR_FCMP_LT, EXPR_FCMP_NE, EXPR_FLOAT_ADD, EXPR_FLOAT_DIV, EXPR_FLOAT_MUL, EXPR_FLOAT_NEG, EXPR_FLOAT_SUB,
     EXPR_INT_ADD, EXPR_INT_DIV, EXPR_INT_MOD, EXPR_INT_MUL, EXPR_INT_NEG, EXPR_INT_SUB, EXPR_INT_TO_FLOAT,
-    EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_STR_COL_EQ_COL,
-    EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
+    EXPR_IS_NOT_NULL, EXPR_IS_NULL, EXPR_LOAD_COL_FLOAT, EXPR_LOAD_COL_INT, EXPR_LOAD_CONST, EXPR_LOAD_NULL,
+    EXPR_SELECT, EXPR_STR_COL_EQ_COL, EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LE_COL, EXPR_STR_COL_LE_CONST,
+    EXPR_STR_COL_LT_COL, EXPR_STR_COL_LT_CONST,
 };
 
 /// A compiled expression program: a flat list of 4-word instructions
@@ -343,6 +344,27 @@ impl ExprBuilder {
 
     pub fn int_to_float(&mut self, src: u32) -> u32 {
         self.unary_op(EXPR_INT_TO_FLOAT, src)
+    }
+
+    // --- Conditional ---
+
+    /// Conditional select (SQL CASE blend): result takes `a`'s value + null bit
+    /// where `cond` is non-NULL and truthy, else `b`'s. Packs the three source
+    /// registers into two operand words — `cond` alone in `a1`, `a | (b << 16)`
+    /// in `a2` — the only two-register packing in the encoding (documented on
+    /// `EXPR_SELECT`; the engine decode mirrors this split). Registers cap at 64
+    /// (< 2^16), so the pack never overflows.
+    pub fn select(&mut self, cond: u32, a: u32, b: u32) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_SELECT, dst, cond, (a & 0xFFFF) | (b << 16));
+        dst
+    }
+
+    /// Materialize a NULL value into a fresh register (value 0, null bit set).
+    pub fn load_null(&mut self) -> u32 {
+        let dst = self.alloc_reg();
+        self.emit(EXPR_LOAD_NULL, dst, 0, 0);
+        dst
     }
 
     // --- Output opcodes ---

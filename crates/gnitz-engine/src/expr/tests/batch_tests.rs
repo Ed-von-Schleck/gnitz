@@ -490,6 +490,145 @@ fn golden_is_null_and_is_not_null_single_row() {
 }
 
 // ---------------------------------------------------------------------------
+// SELECT (CASE blend) — word/morsel boundary sweep
+// ---------------------------------------------------------------------------
+
+/// SELECT over nullable branches, differential against a per-row 3VL reference,
+/// across every word/morsel boundary (1, 63, 64, 65, 128, 256, 257 rows). The
+/// nullable arm blends null masks at word granularity and values row-by-row, so
+/// a tail-word or boundary bug shows up as a value/null mismatch on some row.
+#[test]
+fn select_boundary_sweep() {
+    // Schema: pk(u64), cond(i64 nullable), a(i64 nullable), b(i64 nullable).
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
+        LogicalInstr::LoadColInt { dst: 1, col: 2 }, // a
+        LogicalInstr::LoadColInt { dst: 2, col: 3 }, // b
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+    ];
+    let prog = LogicalProgram::new(instrs, 4, 3, vec![]).resolve(&schema, false);
+
+    // Row-parameterized generators (must match the closures passed to build_n_col_batch).
+    let cond_val = |row: usize| (row as i64) % 3 - 1; // cycles -1, 0, 1
+    let a_val = |row: usize| 1000 + row as i64;
+    let b_val = |row: usize| 2000 + row as i64;
+    let cond_null = |row: usize| row.is_multiple_of(5);
+    let a_null = |row: usize| row.is_multiple_of(7);
+    let b_null = |row: usize| row.is_multiple_of(11);
+
+    for &n in &[1, 63, 64, 65, 128, 256, 257] {
+        let batch = build_n_col_batch(
+            &schema,
+            n,
+            3,
+            |row, col| match col {
+                0 => cond_val(row),
+                1 => a_val(row),
+                _ => b_val(row),
+            },
+            |row, col| match col {
+                0 => cond_null(row),
+                1 => a_null(row),
+                _ => b_null(row),
+            },
+        );
+        let mb = batch.as_mem_batch();
+
+        let mut scratch = EvalScratch::new();
+        for morsel_start in (0..n).step_by(MORSEL) {
+            let m = MORSEL.min(n - morsel_start);
+            scratch.ensure_capacity(4, false, m);
+            eval_batch(&prog, &mb, morsel_start, m, &mut scratch);
+            let r = 3usize; // result_reg
+            for i in 0..m {
+                let row = morsel_start + i;
+                let take_a = !cond_null(row) && cond_val(row) != 0;
+                let (exp_val, exp_null) = if take_a {
+                    (a_val(row), a_null(row))
+                } else {
+                    (b_val(row), b_null(row))
+                };
+                let got_null = (scratch.null_bits[r * NULL_WORDS_PER_REG + i / 64] >> (i % 64)) & 1 != 0;
+                assert_eq!(got_null, exp_null, "n={n} row={row}: null mismatch");
+                if !exp_null {
+                    assert_eq!(scratch.regs[r * MORSEL + i], exp_val, "n={n} row={row}: value mismatch");
+                }
+            }
+        }
+    }
+}
+
+/// SELECT on the no-nulls fast arm: NOT NULL branches select `no_nulls=true`, so
+/// the value blend runs through `reg4` with no mask tracking. Verify the blend.
+#[test]
+fn select_no_nulls_fast_arm() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0), // cond, NOT NULL
+            SchemaColumn::new(type_code::I64, 0), // a, NOT NULL
+            SchemaColumn::new(type_code::I64, 0), // b, NOT NULL
+        ],
+        &[0],
+    );
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::LoadColInt { dst: 2, col: 3 },
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+    ];
+    let prog = LogicalProgram::new(instrs, 4, 3, vec![]).resolve(&schema, false);
+    assert!(
+        prog.is_strictly_non_nullable(&schema),
+        "NOT NULL branches must select the no_nulls fast arm"
+    );
+
+    let n = 130usize; // crosses a 64-bit word and the MORSEL boundary isn't hit, but words are
+    let batch = build_n_col_batch(
+        &schema,
+        n,
+        3,
+        |row, col| match col {
+            0 => (row % 2) as i64, // alternating truthy/false
+            1 => 1000 + row as i64,
+            _ => 2000 + row as i64,
+        },
+        |_, _| false,
+    );
+    let mb = batch.as_mem_batch();
+    let mut scratch = EvalScratch::new();
+    scratch.ensure_capacity(4, true, n);
+    eval_batch(&prog, &mb, 0, n, &mut scratch);
+    for row in 0..n {
+        let expected = if row % 2 == 1 {
+            1000 + row as i64
+        } else {
+            2000 + row as i64
+        };
+        assert_eq!(scratch.regs[3 * MORSEL + row], expected, "row {row}: no-nulls blend");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bit-only / bool_bits vectorization tests
 // ---------------------------------------------------------------------------
 

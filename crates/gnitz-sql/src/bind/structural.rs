@@ -5,8 +5,8 @@ use crate::ir::{AggFunc, BinOp, BoundExpr, UnaryOp};
 use crate::types::is_min_max_orderable;
 use gnitz_core::Schema;
 use sqlparser::ast::{
-    BinaryOperator, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator,
-    Value,
+    BinaryOperator, CaseWhen, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    UnaryOperator, Value,
 };
 
 /// Bind an expression against a single-relation schema (WHERE, projections,
@@ -16,6 +16,39 @@ use sqlparser::ast::{
 /// `(expr, schema)` — no binder state is involved.
 pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
     bind_structural(expr, &SingleTable { schema })
+}
+
+/// [`bind_single_table`] with the one `[NOT] EXISTS`/`[NOT] IN (SELECT …)` node
+/// resolved to the constant `mark` — the mark builder's per-branch binding: on
+/// the matched branch the subquery node is its truth value there (EXISTS → 1,
+/// NOT EXISTS → 0), on the unmatched branch the complement, and the surrounding
+/// OR/NOT/CASE evaluates over the constant like any other expression.
+pub(crate) fn bind_single_table_mark(expr: &Expr, schema: &Schema, mark: i64) -> Result<BoundExpr, GnitzSqlError> {
+    struct MarkLeaf<'a> {
+        inner: SingleTable<'a>,
+        mark: i64,
+    }
+    impl LeafBinder for MarkLeaf<'_> {
+        fn bind_column(&self, e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
+            self.inner.bind_column(e)
+        }
+        fn bind_function(&self, f: &Function) -> Result<BoundExpr, GnitzSqlError> {
+            self.inner.bind_function(f)
+        }
+        fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError> {
+            self.inner.bind_null_test(inner, want_null)
+        }
+        fn bind_subquery(&self, _e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
+            Ok(BoundExpr::LitInt(self.mark))
+        }
+    }
+    bind_structural(
+        expr,
+        &MarkLeaf {
+            inner: SingleTable { schema },
+            mark,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -38,6 +71,18 @@ pub(crate) trait LeafBinder {
     fn bind_function(&self, f: &Function) -> Result<BoundExpr, GnitzSqlError>;
     /// `inner IS [NOT] NULL` (`want_null` picks IS NULL vs IS NOT NULL).
     fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<BoundExpr, GnitzSqlError>;
+    /// A `[NOT] EXISTS` / `[NOT] IN (SELECT …)` node. Only the mark builder's
+    /// leaf overrides this — it resolves the node to the branch's `0/1` constant
+    /// ([`bind_single_table_mark`]); every other context keeps the placement
+    /// rejection. (The top-level-AND-conjunct filter path never binds the node:
+    /// the exists builder intercepts it before binding.)
+    fn bind_subquery(&self, _e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
+        Err(GnitzSqlError::Unsupported(
+            "[NOT] EXISTS/IN (SELECT …) is only supported in a single-table CREATE VIEW \
+             (in the WHERE clause or the SELECT list)"
+                .into(),
+        ))
+    }
 }
 
 /// The one structural recursion. Needs no schema — every schema-aware decision
@@ -46,11 +91,46 @@ pub(crate) trait LeafBinder {
 pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<BoundExpr, GnitzSqlError> {
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => leaf.bind_column(expr),
+        // COALESCE / NULLIF are structural desugars into CASE, intercepted before
+        // the leaf's `bind_function` so all three leaf impls stay untouched. Every
+        // other name falls through to the leaf (aggregates, or a context rejection).
+        Expr::Function(f) if fn_name_is(f, "coalesce") => {
+            bind_coalesce(&function_positional_args(f, "COALESCE")?, leaf)
+        }
+        Expr::Function(f) if fn_name_is(f, "nullif") => bind_nullif(&function_positional_args(f, "NULLIF")?, leaf),
         Expr::Function(f) => leaf.bind_function(f),
         Expr::IsNull(i) => leaf.bind_null_test(i, true),
         Expr::IsNotNull(i) => leaf.bind_null_test(i, false),
         Expr::Nested(i) => bind_structural(i, leaf),
         Expr::Value(vws) => bind_literal(&vws.value),
+        // Searched CASE binds each `(condition, result)`; the simple-operand form
+        // desugars each WHEN value `w` to `operand = w` (operand re-bound per
+        // branch, like the BETWEEN desugar). A missing ELSE is the implicit
+        // ELSE NULL (`else_ = None`, lowered to `load_null`).
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            let mut branches = Vec::with_capacity(conditions.len());
+            for CaseWhen { condition, result } in conditions {
+                let cond = match operand {
+                    Some(op) => BoundExpr::BinOp(
+                        Box::new(bind_structural(op, leaf)?),
+                        BinOp::Eq,
+                        Box::new(bind_structural(condition, leaf)?),
+                    ),
+                    None => bind_structural(condition, leaf)?,
+                };
+                branches.push((cond, bind_structural(result, leaf)?));
+            }
+            let else_ = else_result
+                .as_ref()
+                .map(|e| bind_structural(e, leaf))
+                .transpose()?
+                .map(Box::new);
+            Ok(BoundExpr::Case { branches, else_ })
+        }
         Expr::BinaryOp { left, op, right } => {
             let l = bind_structural(left, leaf)?;
             let r = bind_structural(right, leaf)?;
@@ -122,17 +202,10 @@ pub(crate) fn bind_structural<L: LeafBinder>(expr: &Expr, leaf: &L) -> Result<Bo
                 chain
             })
         }
-        // Subquery expressions have exactly one supported placement — one top-level
-        // AND conjunct of a Simple-shaped CREATE VIEW WHERE, where the exists
-        // builder intercepts them before binding. Reaching these arms means the
-        // subquery sits somewhere else (under OR/NOT, in a projection, HAVING, DML,
-        // a direct SELECT), so name the placement rule instead of the generic
-        // catch-all message.
-        Expr::Exists { .. } | Expr::InSubquery { .. } => Err(GnitzSqlError::Unsupported(
-            "[NOT] EXISTS/IN (SELECT …) is only supported as a top-level AND \
-             conjunct of a CREATE VIEW WHERE clause"
-                .into(),
-        )),
+        // Subquery placement is the leaf's decision: the mark builder binds the
+        // node to its branch constant; every other leaf keeps the default
+        // placement rejection (HAVING, DML, a direct SELECT, …).
+        Expr::Exists { .. } | Expr::InSubquery { .. } => leaf.bind_subquery(expr),
         Expr::Subquery(_) => Err(GnitzSqlError::Unsupported("scalar subqueries are not supported".into())),
         Expr::AnyOp { .. } | Expr::AllOp { .. } => Err(GnitzSqlError::Unsupported(
             "ANY/SOME/ALL subquery comparisons are not supported".into(),
@@ -192,6 +265,86 @@ fn bind_literal(v: &Value) -> Result<BoundExpr, GnitzSqlError> {
     }
 }
 
+/// Case-insensitive match on an unqualified single-part function name — no
+/// allocation, unlike `f.name.to_string()`.
+fn fn_name_is(f: &Function, name: &str) -> bool {
+    matches!(f.name.0.as_slice(), [part]
+        if part.as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case(name)))
+}
+
+/// Plain positional argument exprs of a function call, or a clean `Unsupported`
+/// for `*`, named args, DISTINCT, or any qualifier (FILTER/OVER/…) — the shared
+/// qualifier inventory (`reject_unsupported_fn_qualifiers`). Backs the
+/// COALESCE/NULLIF structural desugar, which need bare operand exprs.
+fn function_positional_args<'f>(f: &'f Function, name: &str) -> Result<Vec<&'f Expr>, GnitzSqlError> {
+    reject_unsupported_fn_qualifiers(f, name)?;
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{name}: requires a parenthesized argument list"
+        )));
+    };
+    list.args
+        .iter()
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+            _ => Err(GnitzSqlError::Unsupported(format!(
+                "{name}: expects plain positional arguments (no `*`, named args)"
+            ))),
+        })
+        .collect()
+}
+
+/// `COALESCE(args…)` desugars right-to-left into CASE: the first non-NULL operand
+/// is the result. Total over arity via explicit base cases; a literal operand is
+/// folded at the AST level so it never reaches `bind_null_test` (which resolves a
+/// *column* and would reject a literal with "expected a column reference").
+fn bind_coalesce<L: LeafBinder>(args: &[&Expr], leaf: &L) -> Result<BoundExpr, GnitzSqlError> {
+    let [a, rest @ ..] = args else {
+        // COALESCE() ≡ NULL (parser forbids; stay total) — also the tail after an
+        // all-NULL-literals argument list.
+        return Ok(BoundExpr::LitNull);
+    };
+    if let Expr::Value(v) = a {
+        // A NULL literal contributes nothing; any other literal is non-null → the result.
+        return match &v.value {
+            Value::Null => bind_coalesce(rest, leaf),
+            _ => bind_literal(&v.value),
+        };
+    }
+    if rest.is_empty() {
+        return bind_structural(a, leaf); // last operand: its value is the result
+    }
+    let cond = leaf.bind_null_test(a, /* want_null = */ false)?; // IsNotNull(col) | LitInt(1)
+    if matches!(cond, BoundExpr::LitInt(1)) {
+        return bind_structural(a, leaf); // provably non-null (NOT NULL column) → always taken
+    }
+    Ok(BoundExpr::Case {
+        branches: vec![(cond, bind_structural(a, leaf)?)],
+        else_: Some(Box::new(bind_coalesce(rest, leaf)?)),
+    })
+}
+
+/// `NULLIF(a, b)` ≡ `CASE WHEN a = b THEN NULL ELSE a END`. Both operands bind
+/// through `bind_structural` (not `bind_null_test`), so NULLIF has no
+/// literal-operand pitfall.
+fn bind_nullif<L: LeafBinder>(args: &[&Expr], leaf: &L) -> Result<BoundExpr, GnitzSqlError> {
+    let [a, b] = args else {
+        return Err(GnitzSqlError::Unsupported(
+            "NULLIF: requires exactly two arguments".into(),
+        ));
+    };
+    let a_bound = bind_structural(a, leaf)?;
+    let cond = BoundExpr::BinOp(
+        Box::new(a_bound.clone()),
+        BinOp::Eq,
+        Box::new(bind_structural(b, leaf)?),
+    );
+    Ok(BoundExpr::Case {
+        branches: vec![(cond, BoundExpr::LitNull)],
+        else_: Some(Box::new(a_bound)),
+    })
+}
+
 /// Shared NOT-NULL fold: a never-null value makes `IS [NOT] NULL` a constant
 /// (never null, never — for IS NULL — true), keeping the null-tracking opcode
 /// (which forces `eval_batch`'s slow path — `is_strictly_non_nullable` returns
@@ -228,17 +381,15 @@ impl SingleTable<'_> {
 
 /// Reject any qualifier on an aggregate call that the binder does not implement.
 /// Both aggregate-binding sites (`SingleTable::bind_function` and HAVING's
-/// `having_agg_func`) read only the argument list; every other `Function` field
-/// would otherwise be silently dropped, computing the plain aggregate.
-pub(crate) fn reject_unsupported_agg_qualifiers(func: &Function) -> Result<(), GnitzSqlError> {
+/// `having_agg_func`) and the COALESCE/NULLIF desugar read only the argument
+/// list; every other `Function` field would otherwise be silently dropped,
+/// computing the plain call. `on` names the rejecting context ("aggregates",
+/// "COALESCE", …) in the message.
+pub(crate) fn reject_unsupported_fn_qualifiers(func: &Function, on: &str) -> Result<(), GnitzSqlError> {
     // Colon form ("{what}: not supported …") sidesteps subject-verb number
     // agreement and matches the binder's existing message style
     // (e.g. "{name}: not supported on {:?} columns").
-    let unsupported = |what: &str| {
-        Err(GnitzSqlError::Unsupported(format!(
-            "{what}: not supported on aggregates"
-        )))
-    };
+    let unsupported = |what: &str| Err(GnitzSqlError::Unsupported(format!("{what}: not supported on {on}")));
     if func.filter.is_some() {
         return unsupported("FILTER (WHERE …)");
     }
@@ -256,9 +407,7 @@ pub(crate) fn reject_unsupported_agg_qualifiers(func: &Function) -> Result<(), G
     }
     if let FunctionArguments::List(list) = &func.args {
         if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
-            return Err(GnitzSqlError::Unsupported(
-                "DISTINCT aggregates are not supported".into(),
-            ));
+            return unsupported("DISTINCT");
         }
         if !list.clauses.is_empty() {
             return unsupported("in-argument clauses (ORDER BY / LIMIT / SEPARATOR)");
@@ -272,7 +421,7 @@ impl LeafBinder for SingleTable<'_> {
         Ok(BoundExpr::ColRef(self.idx(e)?))
     }
     fn bind_function(&self, func: &Function) -> Result<BoundExpr, GnitzSqlError> {
-        reject_unsupported_agg_qualifiers(func)?;
+        reject_unsupported_fn_qualifiers(func, "aggregates")?;
         let name = func.name.to_string().to_ascii_lowercase();
         match name.as_str() {
             "count" => {
@@ -569,8 +718,9 @@ mod tests {
         assert_unsupported(bind_single_table(&empty, &f), "empty list");
     }
 
-    /// Subquery expressions outside the one supported placement get the targeted
-    /// message, not the generic catch-all.
+    /// Subquery expressions outside the supported placements get the targeted
+    /// message, not the generic catch-all — while the mark leaf binds the same
+    /// nodes to its branch constant.
     #[test]
     fn test_bind_rejects_subquery_expressions_with_targeted_messages() {
         let schema = schema_with_val(TypeCode::I64);
@@ -579,13 +729,20 @@ mod tests {
             "NOT EXISTS (SELECT c FROM t)",
             "c IN (SELECT c FROM t)",
             "c NOT IN (SELECT c FROM t)",
-            // Under OR the conjunct partitioner never intercepts it either.
             "c = 1 OR EXISTS (SELECT c FROM t)",
         ] {
             assert_unsupported(
                 bind_single_table(&parse(src), &schema),
-                "top-level AND conjunct of a CREATE VIEW WHERE",
+                "only supported in a single-table CREATE VIEW",
             );
+            // The mark leaf resolves the subquery node to its 0/1 constant.
+            assert!(bind_single_table_mark(&parse(src), &schema, 1).is_ok());
+        }
+        // The subquery node is the constant; surrounding structure survives:
+        // `c = 1 OR EXISTS(…)` at mark=0 binds as `(c = 1) OR 0`.
+        match bind_single_table_mark(&parse("c = 1 OR EXISTS (SELECT c FROM t)"), &schema, 0).unwrap() {
+            BoundExpr::BinOp(_, BinOp::Or, r) => assert!(matches!(*r, BoundExpr::LitInt(0))),
+            other => panic!("expected `… OR 0`, got {other:?}"),
         }
         assert_unsupported(
             bind_single_table(&parse("c = ANY (SELECT c FROM t)"), &schema),
@@ -599,6 +756,142 @@ mod tests {
             bind_single_table(&parse("(SELECT c FROM t) = 1"), &schema),
             "scalar subqueries",
         );
+    }
+
+    fn nullable_schema(val_tc: TypeCode) -> Schema {
+        Schema {
+            columns: vec![col("pk", TypeCode::U64), ColumnDef::new("c", val_tc, true)],
+            pk_cols: vec![0],
+        }
+    }
+
+    /// Searched `CASE WHEN … THEN … [ELSE …] END` binds each branch; a missing
+    /// ELSE is `else_ = None` (implicit NULL).
+    #[test]
+    fn test_bind_searched_case() {
+        let s = nullable_schema(TypeCode::I64);
+        match bind_single_table(&parse("CASE WHEN c > 0 THEN 1 WHEN c < 0 THEN 2 ELSE 3 END"), &s).unwrap() {
+            BoundExpr::Case { branches, else_ } => {
+                assert_eq!(branches.len(), 2);
+                assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Gt, _)));
+                assert!(matches!(branches[0].1, BoundExpr::LitInt(1)));
+                assert!(matches!(branches[1].0, BoundExpr::BinOp(_, BinOp::Lt, _)));
+                assert!(matches!(else_.as_deref(), Some(BoundExpr::LitInt(3))));
+            }
+            other => panic!("expected Case, got {other:?}"),
+        }
+        // Missing ELSE → else_ = None.
+        match bind_single_table(&parse("CASE WHEN c > 0 THEN 1 END"), &s).unwrap() {
+            BoundExpr::Case { else_, .. } => assert!(else_.is_none(), "missing ELSE → None"),
+            other => panic!("expected Case, got {other:?}"),
+        }
+    }
+
+    /// Simple-operand `CASE c WHEN v THEN … END` desugars each WHEN to `c = v`.
+    #[test]
+    fn test_bind_simple_case_desugars_to_operand_eq() {
+        let s = nullable_schema(TypeCode::I64);
+        match bind_single_table(&parse("CASE c WHEN 1 THEN 10 WHEN 2 THEN 20 END"), &s).unwrap() {
+            BoundExpr::Case { branches, else_ } => {
+                assert_eq!(branches.len(), 2);
+                assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Eq, _)));
+                assert!(matches!(branches[1].0, BoundExpr::BinOp(_, BinOp::Eq, _)));
+                assert!(else_.is_none());
+            }
+            other => panic!("expected Case, got {other:?}"),
+        }
+    }
+
+    /// COALESCE base cases and shape.
+    #[test]
+    fn test_bind_coalesce_base_cases() {
+        let s = nullable_schema(TypeCode::I64);
+        // COALESCE(c) → c.
+        assert!(matches!(
+            bind_single_table(&parse("COALESCE(c)"), &s).unwrap(),
+            BoundExpr::ColRef(1)
+        ));
+        // COALESCE(NULL, c) → c (a NULL literal contributes nothing).
+        assert!(matches!(
+            bind_single_table(&parse("COALESCE(NULL, c)"), &s).unwrap(),
+            BoundExpr::ColRef(1)
+        ));
+        // COALESCE(c, 0) → Case{[(IsNotNull(c), c)], else: 0}.
+        match bind_single_table(&parse("COALESCE(c, 0)"), &s).unwrap() {
+            BoundExpr::Case { branches, else_ } => {
+                assert_eq!(branches.len(), 1);
+                assert!(matches!(branches[0].0, BoundExpr::IsNotNull(1)));
+                assert!(matches!(branches[0].1, BoundExpr::ColRef(1)));
+                assert!(matches!(else_.as_deref(), Some(BoundExpr::LitInt(0))));
+            }
+            other => panic!("expected Case, got {other:?}"),
+        }
+        // A NOT NULL column folds COALESCE(c, 0) to c directly (provably non-null).
+        let nn = schema_with_val(TypeCode::I64);
+        assert!(matches!(
+            bind_single_table(&parse("COALESCE(c, 0)"), &nn).unwrap(),
+            BoundExpr::ColRef(1)
+        ));
+    }
+
+    /// A 3-arg COALESCE nests right-to-left.
+    #[test]
+    fn test_bind_coalesce_nested_three_arg() {
+        let s = Schema {
+            columns: vec![
+                col("pk", TypeCode::U64),
+                ColumnDef::new("a", TypeCode::I64, true),
+                ColumnDef::new("b", TypeCode::I64, true),
+            ],
+            pk_cols: vec![0],
+        };
+        match bind_single_table(&parse("COALESCE(a, b, 0)"), &s).unwrap() {
+            BoundExpr::Case { branches, else_ } => {
+                assert!(matches!(branches[0].0, BoundExpr::IsNotNull(1)));
+                match else_.as_deref() {
+                    Some(BoundExpr::Case {
+                        branches: inner,
+                        else_: inner_else,
+                    }) => {
+                        assert!(matches!(inner[0].0, BoundExpr::IsNotNull(2)));
+                        assert!(matches!(inner_else.as_deref(), Some(BoundExpr::LitInt(0))));
+                    }
+                    other => panic!("expected nested Case, got {other:?}"),
+                }
+            }
+            other => panic!("expected Case, got {other:?}"),
+        }
+    }
+
+    /// A computed COALESCE operand (`c + 1`) reaches `bind_null_test`, which
+    /// resolves a *column*, so it errors "expected a column reference" rather than
+    /// mis-binding.
+    #[test]
+    fn test_bind_coalesce_computed_operand_rejected() {
+        let s = nullable_schema(TypeCode::I64);
+        assert_unsupported(
+            bind_single_table(&parse("COALESCE(c + 1, 0)"), &s),
+            "expected a column reference",
+        );
+    }
+
+    /// `NULLIF(a, b)` → `CASE WHEN a = b THEN NULL ELSE a END`; wrong arity errors.
+    #[test]
+    fn test_bind_nullif() {
+        let s = nullable_schema(TypeCode::I64);
+        match bind_single_table(&parse("NULLIF(c, 0)"), &s).unwrap() {
+            BoundExpr::Case { branches, else_ } => {
+                assert_eq!(branches.len(), 1);
+                assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Eq, _)));
+                assert!(matches!(branches[0].1, BoundExpr::LitNull));
+                assert!(matches!(else_.as_deref(), Some(BoundExpr::ColRef(1))));
+            }
+            other => panic!("expected Case, got {other:?}"),
+        }
+        // Both operands bind through bind_structural, so a computed operand is fine.
+        assert!(bind_single_table(&parse("NULLIF(c + 1, 0)"), &s).is_ok());
+        // Wrong arity rejected.
+        assert_unsupported(bind_single_table(&parse("NULLIF(c)"), &s), "exactly two");
     }
 
     /// The accepted qualifier (`ALL`, the SQL default — `COUNT(ALL c)` ≡

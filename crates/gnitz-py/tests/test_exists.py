@@ -525,3 +525,244 @@ class TestPureRangeExists:
             assert _weights(client, anti, "v") == {200: 1}
         finally:
             _cleanup(client, sn, "semi", "anti", "a", "b")
+
+
+def _flag_map(client, vid):
+    """{id: flag} over positive-weight rows; asserts no id appears twice (a
+    missing old-mark-row retraction would leave both flag=0 and flag=1 present)."""
+    seen = {}
+    for row in client.scan(vid):
+        if row.weight <= 0:
+            continue
+        assert row.id not in seen, f"id {row.id} present twice — missing mark-flip retraction"
+        seen[row.id] = row.flag
+    return seen
+
+
+def _idset(client, vid):
+    """Set of ids in positive-weight rows."""
+    return sorted(r.id for r in client.scan(vid) if r.weight > 0)
+
+
+class TestMarkSubquery:
+    """Exactly one EXISTS/IN subquery in an arbitrary boolean position, rewritten
+    to a 0/1 mark that ordinary expression evaluation consumes."""
+
+    def _setup(self, client, sn):
+        client.execute_sql(_CREATE_A, schema_name=sn)  # a(id pk, k, v)
+        client.execute_sql(_CREATE_B, schema_name=sn)  # b(id pk, k, w)
+
+    def test_exists_under_or_flips_incrementally(self, client):
+        """WHERE EXISTS(b.k=a.k) OR v = 100 — a row is kept if it matches OR v=100."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW mk AS SELECT id FROM a "
+                "WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR v = 100",
+                schema_name=sn,
+            )
+            mk = client.resolve_table(sn, "mk")[0]
+            # id=1: v=100 → kept via the OR even with no match. id=2: v=200, no match → excluded.
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
+            assert _idset(client, mk) == [1]
+            # Add a match for a.k=20 (id=2) → now kept via EXISTS.
+            client.execute_sql("INSERT INTO b VALUES (1, 20, 7)", schema_name=sn)
+            assert _idset(client, mk) == [1, 2]
+            # Retract the match → id=2 leaves again (v=200 != 100).
+            client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=sn)
+            assert _idset(client, mk) == [1]
+        finally:
+            _cleanup(client, sn, "mk", "a", "b")
+
+    def test_select_star_mark_identity(self, client):
+        """SELECT * under a mark WHERE — the identity projection over the outer
+        columns (no _mark column materialized; the mark is consumed by the WHERE)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW mk AS SELECT * FROM a "
+                "WHERE v = 100 OR EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+                schema_name=sn,
+            )
+            mk = client.resolve_table(sn, "mk")[0]
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
+            assert _idset(client, mk) == [1]
+            client.execute_sql("INSERT INTO b VALUES (1, 20, 7)", schema_name=sn)
+            assert _idset(client, mk) == [1, 2]
+        finally:
+            _cleanup(client, sn, "mk", "a", "b")
+
+    def test_projected_exists_flag_flips(self, client):
+        """SELECT id, EXISTS(...) AS flag — flag flips 0↔1 with no duplicate row
+        (the old-mark row must be retracted when the new one is emitted)."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW mk AS SELECT id, EXISTS (SELECT 1 FROM b WHERE b.k = a.k) AS flag FROM a",
+                schema_name=sn,
+            )
+            mk = client.resolve_table(sn, "mk")[0]
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
+            assert _flag_map(client, mk) == {1: 0, 2: 0}
+            # Match for a.k=10 → id=1 flag flips to 1; the flag=0 row must be gone.
+            client.execute_sql("INSERT INTO b VALUES (1, 10, 7)", schema_name=sn)
+            assert _flag_map(client, mk) == {1: 1, 2: 0}
+            # Retract → flips back to 0.
+            client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=sn)
+            assert _flag_map(client, mk) == {1: 0, 2: 0}
+        finally:
+            _cleanup(client, sn, "mk", "a", "b")
+
+    def test_case_over_exists(self, client):
+        """CASE WHEN EXISTS(...) THEN v ELSE 0 END — computed over the mark."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW mk AS SELECT id, "
+                "CASE WHEN EXISTS (SELECT 1 FROM b WHERE b.k = a.k) THEN v ELSE 0 END AS c FROM a",
+                schema_name=sn,
+            )
+            mk = client.resolve_table(sn, "mk")[0]
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
+            got = {r.id: r.c for r in client.scan(mk) if r.weight > 0}
+            assert got == {1: 0, 2: 0}
+            client.execute_sql("INSERT INTO b VALUES (1, 10, 7)", schema_name=sn)
+            got = {r.id: r.c for r in client.scan(mk) if r.weight > 0}
+            assert got == {1: 100, 2: 0}  # id=1 matched → v; id=2 unmatched → 0
+        finally:
+            _cleanup(client, sn, "mk", "a", "b")
+
+    def test_not_exists_and_under_not(self, client):
+        """WHERE NOT (EXISTS(...) AND v > 150): keep if no match OR v<=150."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW mk AS SELECT id FROM a "
+                "WHERE NOT (EXISTS (SELECT 1 FROM b WHERE b.k = a.k) AND v > 150)",
+                schema_name=sn,
+            )
+            mk = client.resolve_table(sn, "mk")[0]
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
+            # No matches yet → NOT(0 AND ...) = TRUE → both kept.
+            assert _idset(client, mk) == [1, 2]
+            # Match both. id=1: v=100<=150 kept. id=2: v=200>150 AND match → NOT(TRUE)=excluded.
+            client.execute_sql("INSERT INTO b VALUES (1, 10, 7), (2, 20, 8)", schema_name=sn)
+            assert _idset(client, mk) == [1]
+        finally:
+            _cleanup(client, sn, "mk", "a", "b")
+
+    def test_not_in_under_or_nonnullable(self, client):
+        """WHERE v = 100 OR k NOT IN (SELECT k FROM b), all columns NOT NULL."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW mk AS SELECT id FROM a WHERE v = 100 OR k NOT IN (SELECT k FROM b)",
+                schema_name=sn,
+            )
+            mk = client.resolve_table(sn, "mk")[0]
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (1, 20, 5)", schema_name=sn)
+            # id=1: v=100 → kept. id=2: v=200, k=20 IN b → NOT IN false → excluded.
+            assert _idset(client, mk) == [1]
+        finally:
+            _cleanup(client, sn, "mk", "a", "b")
+
+    def test_band_correlation_mark(self, client):
+        """Band correlation (eq prefix + range) in a mark position."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW mk AS SELECT id FROM a "
+                "WHERE v = 100 OR EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w < a.v)",
+                schema_name=sn,
+            )
+            mk = client.resolve_table(sn, "mk")[0]
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
+            # id=1: v=100 → kept via OR. id=2: no b yet → excluded.
+            assert _idset(client, mk) == [1]
+            # b with k=20, w=50 < a.v=200 → id=2 matches the band.
+            client.execute_sql("INSERT INTO b VALUES (1, 20, 50)", schema_name=sn)
+            assert _idset(client, mk) == [1, 2]
+        finally:
+            _cleanup(client, sn, "mk", "a", "b")
+
+    def test_pure_range_correlation_mark(self, client):
+        """Pure-range correlation (only a range conjunct) in a mark position."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW mk AS SELECT id FROM a "
+                "WHERE v = 100 OR EXISTS (SELECT 1 FROM b WHERE b.w < a.v)",
+                schema_name=sn,
+            )
+            mk = client.resolve_table(sn, "mk")[0]
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
+            assert _idset(client, mk) == [1]  # only v=100 kept, no b rows
+            # b.w=50 < both a.v (100, 200) → both match the range → both kept.
+            client.execute_sql("INSERT INTO b VALUES (1, 99, 50)", schema_name=sn)
+            assert _idset(client, mk) == [1, 2]
+        finally:
+            _cleanup(client, sn, "mk", "a", "b")
+
+    def test_nullable_in_mark_position_rejected(self, client):
+        """A nullable IN in a mark position is rejected regardless of polarity,
+        while the positive top-level AND conjunct form keeps working."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )  # a.k nullable
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            # Positive IN under OR — rejected (mark position, nullable operand).
+            for stmt in (
+                "CREATE VIEW m1 AS SELECT id FROM a WHERE v = 1 OR k IN (SELECT k FROM b)",
+                "CREATE VIEW m2 AS SELECT id FROM a WHERE NOT (k IN (SELECT k FROM b))",
+                "CREATE VIEW m3 AS SELECT id, k IN (SELECT k FROM b) AS f FROM a",
+            ):
+                with pytest.raises(Exception):
+                    client.execute_sql(stmt, schema_name=sn)
+            # The positive top-level AND conjunct form is still accepted (nullable k).
+            client.execute_sql(
+                "CREATE VIEW ok AS SELECT id FROM a WHERE k IN (SELECT k FROM b)",
+                schema_name=sn,
+            )
+            assert client.resolve_table(sn, "ok")[0] is not None
+        finally:
+            _cleanup(client, sn, "m1", "m2", "m3", "ok", "a", "b")
+
+    def test_two_subqueries_rejected(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            with pytest.raises(Exception) as ei:
+                client.execute_sql(
+                    "CREATE VIEW mk AS SELECT id FROM a WHERE "
+                    "EXISTS (SELECT 1 FROM b WHERE b.k = a.k) OR "
+                    "EXISTS (SELECT 1 FROM b WHERE b.w = a.v)",
+                    schema_name=sn,
+                )
+            assert "at most one" in str(ei.value).lower() or "compose" in str(ei.value).lower()
+        finally:
+            _cleanup(client, sn, "mk", "a", "b")

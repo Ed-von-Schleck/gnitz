@@ -922,11 +922,12 @@ mod tests {
         assert_eq!(agg_output_type(AggOp::Max, TypeCode::U8), type_code::U8);
         assert_eq!(agg_output_type(AggOp::Min, TypeCode::U16), type_code::U16);
         assert_eq!(agg_output_type(AggOp::Max, TypeCode::U32), type_code::U32);
-        // U64 folds into the general rule (the source type *is* U64); SUM over
-        // U64 still widens to I64.
+        // U64 folds into the general rule (the source type *is* U64); SUM over a
+        // U64 source is also typed U64 (the i64 accumulator bit pattern is the
+        // correct unsigned sum), so a downstream unsigned compare re-seeds right.
         assert_eq!(agg_output_type(AggOp::Min, TypeCode::U64), type_code::U64);
         assert_eq!(agg_output_type(AggOp::Max, TypeCode::U64), type_code::U64);
-        assert_eq!(agg_output_type(AggOp::Sum, TypeCode::U64), type_code::I64);
+        assert_eq!(agg_output_type(AggOp::Sum, TypeCode::U64), type_code::U64);
         // Non-fixed-int sources (STRING / 16-byte) fall to the I64 arm as a
         // total-function default. MIN/MAX over them is rejected at compile (the
         // SQL binder, and emit_reduce's order-encodability guard — see

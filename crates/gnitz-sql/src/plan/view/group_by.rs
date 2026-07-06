@@ -78,10 +78,13 @@ struct AggSpec {
 }
 
 /// Mirror the engine's `agg_output_type`: COUNT/COUNT_NON_NULL → I64, AVG → F64,
-/// float SUM/MIN/MAX → F64. SUM over a non-float column widens to I64 (it can
-/// overflow the source width); MIN/MAX over a non-float column *preserve the
-/// source type* (the extremum is one of the input rows, so it is representable
-/// in that type — incl. U64). The binder restricts MIN/MAX inputs to ≤8-byte
+/// float SUM/MIN/MAX → F64. SUM over a **U64** column is typed U64 (the i64
+/// accumulator's bit pattern already *is* the correct unsigned sum mod 2^64, same
+/// 8-byte width — so U64 is the only correct label, and it re-seeds a downstream
+/// unsigned compare); a narrow unsigned (U8/U16/U32) or signed source widens to
+/// I64 (its sum stays < 2^63, so signed order is correct). MIN/MAX over a
+/// non-float column *preserve the source type* (the extremum is one of the input
+/// rows, so it is representable in that type — incl. U64). The binder restricts MIN/MAX inputs to ≤8-byte
 /// integers and floats, so the source type returned here is always ≤8 bytes —
 /// the engine's I64 fallback for STRING / 16-byte MIN/MAX sources is reachable
 /// only via the low-level circuit API, never from SQL. A planner/compiler
@@ -93,6 +96,7 @@ fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Schema) -> Ty
         AggFunc::Avg => TypeCode::F64,
         AggFunc::Sum => match src_col {
             Some(c) if schema.columns[c].type_code.is_float() => TypeCode::F64,
+            Some(c) if schema.columns[c].type_code == TypeCode::U64 => TypeCode::U64,
             _ => TypeCode::I64,
         },
         AggFunc::Min | AggFunc::Max => match src_col {
@@ -1120,6 +1124,28 @@ mod tests {
         assert!(try_push(AggFunc::Min, Some(1)).is_ok()); // MIN(i64)
         assert!(try_push(AggFunc::Count, None).is_ok()); // COUNT(*)
         assert!(try_push(AggFunc::CountNonNull, Some(2)).is_ok()); // COUNT(blob) — presence only
+    }
+
+    /// SUM over a U64 source is typed U64 (bit pattern is the correct unsigned
+    /// sum), so a downstream unsigned compare re-seeds; a narrow unsigned / signed
+    /// source widens to I64. MIN/MAX preserve the U64 source type as before.
+    #[test]
+    fn agg_result_type_sum_preserves_u64() {
+        let s = Schema {
+            columns: vec![
+                col_def("pk", TypeCode::U64, false),
+                col_def("u", TypeCode::U64, true),
+                col_def("w", TypeCode::U32, true),
+                col_def("i", TypeCode::I64, true),
+                col_def("f", TypeCode::F64, true),
+            ],
+            pk_cols: vec![0],
+        };
+        assert_eq!(agg_result_type(AggFunc::Sum, Some(1), &s), TypeCode::U64); // SUM(u64) → U64
+        assert_eq!(agg_result_type(AggFunc::Sum, Some(2), &s), TypeCode::I64); // SUM(u32) → I64
+        assert_eq!(agg_result_type(AggFunc::Sum, Some(3), &s), TypeCode::I64); // SUM(i64) → I64
+        assert_eq!(agg_result_type(AggFunc::Sum, Some(4), &s), TypeCode::F64); // SUM(f64) → F64
+        assert_eq!(agg_result_type(AggFunc::Min, Some(1), &s), TypeCode::U64); // MIN(u64) preserved
     }
 
     // The Direct-aggregate nullability decision shared by the SELECT projection

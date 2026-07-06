@@ -10,8 +10,9 @@
 use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{ColumnDef, Schema};
-use sqlparser::ast::SelectItem;
+use crate::lower::compile_bound_expr;
+use gnitz_core::{ColumnDef, ExprBuilder, ExprProgram, Schema};
+use sqlparser::ast::{Expr, SelectItem};
 
 /// One output column of a projection: a verbatim source column
 /// (`PassThrough`) or a value derived by an expression (`Computed`).
@@ -34,6 +35,19 @@ fn resolve_proj_col(
     idx: usize,
     source_schema: &Schema,
 ) -> Result<(ProjItem, ColumnDef), GnitzSqlError> {
+    resolve_proj_col_with(item, idx, source_schema, |e| bind_single_table(e, source_schema))
+}
+
+/// [`resolve_proj_col`] with a caller-supplied expression binder — the mark
+/// builder binds through [`crate::bind::bind_single_table_mark`] so a projected
+/// subquery resolves to its branch constant, while the pass-through/computed
+/// split, naming, and typing conventions stay defined here once.
+pub(crate) fn resolve_proj_col_with(
+    item: &SelectItem,
+    idx: usize,
+    source_schema: &Schema,
+    bind: impl FnOnce(&Expr) -> Result<BoundExpr, GnitzSqlError>,
+) -> Result<(ProjItem, ColumnDef), GnitzSqlError> {
     let (expr, alias) = match item {
         SelectItem::UnnamedExpr(expr) => (expr, None),
         SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
@@ -43,7 +57,7 @@ fn resolve_proj_col(
             ))
         }
     };
-    let bound = bind_single_table(expr, source_schema)?;
+    let bound = bind(expr)?;
     // A (possibly aliased / qualified / parenthesized) bare column reference is a
     // pass-through; an alias only renames the output column. Anything else is a
     // computed column, typed by `infer_type` and named by its alias or `_expr{idx}`.
@@ -60,6 +74,30 @@ fn resolve_proj_col(
             ColumnDef::new(alias.unwrap_or_else(|| format!("_expr{idx}")), out_type, true),
         ))
     }
+}
+
+/// Compile the *payload* slice of a projection (`items` must exclude the
+/// leading PK slots, which the engine carries verbatim) into one expr-map
+/// program: a COPY_COL per pass-through, a compiled expression + EMIT per
+/// computed slot. `payload_idx` is the dense output payload position. EMIT
+/// writes the raw register bits via append_int — correct for float. The
+/// program's `result_reg` is unused (EMIT/COPY_COL write directly).
+pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Result<ExprProgram, GnitzSqlError> {
+    let mut eb = ExprBuilder::new();
+    for (payload_idx, item) in items.iter().enumerate() {
+        let payload_idx = payload_idx as u32;
+        match item {
+            ProjItem::PassThrough { src_col } => {
+                let tc = schema.columns[*src_col].type_code as u32;
+                eb.copy_col(tc, *src_col as u32, payload_idx);
+            }
+            ProjItem::Computed { bound_expr } => {
+                let reg = compile_bound_expr(bound_expr, schema, &mut eb)?;
+                eb.emit_col(reg, payload_idx);
+            }
+        }
+    }
+    Ok(eb.build(0))
 }
 
 /// Pin the full source PK to output slots `0..k` in `pk_indices()` order,

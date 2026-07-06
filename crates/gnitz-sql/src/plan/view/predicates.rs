@@ -224,7 +224,7 @@ pub(crate) fn pure_range_m_output_cols(tc: TypeCode) -> Vec<ColumnDef> {
 /// The single range conjunct of a band/range join, canonicalized to
 /// `left_col OP right_col` (both table-relative). `op` is the canonical OP as a
 /// `RangeRel`; `tc` is the pair's common reindex output type.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct RangeConjunct {
     pub(crate) left_col: usize,
     pub(crate) right_col: usize,

@@ -1168,14 +1168,12 @@ fn emit_range_join(
         input_a,
         &left_reindex_cols,
         &left_target_tcs,
-        
         build_reindex_program(left_schema),
     );
     let reindex_b = cb.map_reindex(
         input_b_match,
         &right_reindex_cols,
         &right_target_tcs,
-        
         build_reindex_program(right_schema),
     );
 
@@ -1242,13 +1240,7 @@ fn emit_range_join(
         pair_pk_cols.push(k + left_n + b_pk);
     }
     let zero_tcs = vec![0u8; pair_pk];
-    let rekey = cb.map_reindex(
-        merged,
-        &pair_pk_cols,
-        &zero_tcs,
-        
-        build_reindex_program(&union_schema),
-    );
+    let rekey = cb.map_reindex(merged, &pair_pk_cols, &zero_tcs, build_reindex_program(&union_schema));
 
     // Re-key output layout: `[_pair_pk × pair_pk (PK), _join_pk × k, A cols, B cols]`.
     // The user projection drops the k `_join_pk` slots (they DIFFER per term and
@@ -1414,13 +1406,8 @@ fn emit_range_join(
                     input_a_raw,
                     Some(multi_null_filter_prog(&left_reindex_cols, left_schema, true)?),
                 );
-                let anull_keyed = cb.map_reindex(
-                    anull,
-                    &left_schema.pk_cols,
-                    &zero_a,
-                    
-                    build_reindex_program(left_schema),
-                );
+                let anull_keyed =
+                    cb.map_reindex(anull, &left_schema.pk_cols, &zero_a, build_reindex_program(left_schema));
                 let anull_owned = cb.partition_filter(anull_keyed);
                 cb.union(nf_match, anull_owned)
             } else {
@@ -1446,7 +1433,6 @@ fn emit_range_join(
                     merged,
                     &pair_pk_cols[..pa],
                     &zero_a,
-                    
                     build_reindex_program(&union_schema),
                 );
                 let proj_a = cb.map(rekey_a, &(pa + k..pa + k + left_n).collect::<Vec<_>>()); // π_A(inner)
@@ -1454,7 +1440,6 @@ fn emit_range_join(
                     input_a_raw,
                     &left_schema.pk_cols,
                     &zero_a,
-                    
                     build_reindex_program(left_schema),
                 );
                 let nu_a = cb.positive_diff(a_all, proj_a); // max(0, A − π_A(inner)), keyed [a.pk, A]
@@ -1466,7 +1451,6 @@ fn emit_range_join(
                     merged,
                     &pair_pk_cols[pa..],
                     &zero_b,
-                    
                     build_reindex_program(&union_schema),
                 );
                 let proj_b = cb.map(
@@ -1477,7 +1461,6 @@ fn emit_range_join(
                     input_b_raw,
                     &right_schema.pk_cols,
                     &zero_b,
-                    
                     build_reindex_program(right_schema),
                 );
                 let nu_b = cb.positive_diff(b_all, proj_b); // max(0, B − π_B(inner)), keyed [b.pk, B]

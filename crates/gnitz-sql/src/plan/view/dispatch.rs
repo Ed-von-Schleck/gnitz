@@ -3,9 +3,9 @@
 //! `plan/view` that knows about all the others.
 
 use crate::ast_util::{
-    collect_column_refs, collect_projection_column_refs, extract_name, extract_relation_name,
+    collect_column_refs, collect_projection_column_refs, count_subqueries, extract_name, extract_relation_name,
     extract_table_factor_name, flatten_conjuncts, group_by_is_present, is_wildcard_projection,
-    projection_has_aggregate,
+    projection_has_aggregate, projection_item_expr,
 };
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
@@ -106,6 +106,16 @@ pub(crate) fn execute_create_view(
             }
             exists::emit_exists_pieces(client, final_vid, select, subq, outer_not, &local, binder)?
         }
+        ViewShape::MarkSubquery(select) => {
+            // Shares the exists builder's two-relation resolution; composing over a
+            // compiled CTE/derived-table sub-plan is unsupported (same as Subquery).
+            if !chain.segments.is_empty() {
+                return Err(GnitzSqlError::Unsupported(
+                    "an EXISTS/IN subquery over a compiled CTE/derived-table sub-plan is not supported".to_string(),
+                ));
+            }
+            exists::emit_mark_pieces(client, final_vid, select, binder)?
+        }
     };
 
     // One atomic bundle: the hidden segments (dependency order) then the
@@ -156,6 +166,13 @@ enum ViewShape<'a> {
         /// The remaining WHERE conjuncts, filtering the outer relation.
         local: Vec<&'a Expr>,
     },
+    /// A Simple-shaped view carrying exactly one `[NOT] EXISTS`/`[NOT] IN`
+    /// subquery in an *arbitrary* boolean position (under OR/NOT, inside CASE, or
+    /// projected as a column) — routed to the mark-join builder, which computes
+    /// the subquery's truth value as a `0/1` mark and lets ordinary expression
+    /// evaluation consume it. Reached only when the single-top-level-conjunct
+    /// `Subquery` fast path did not peel a clean conjunct.
+    MarkSubquery(&'a Select),
     GroupBy(&'a Select),
     Simple(&'a Select),
 }
@@ -232,11 +249,28 @@ impl<'a> ViewShape<'a> {
                 },
             );
         }
-        // A single top-level `[NOT] EXISTS` / `[NOT] IN (SELECT …)` WHERE
-        // conjunct routes to the semi/anti-join builder. Checked after JOIN (a
-        // join-view WHERE is rejected wholesale by that builder) and before
-        // GROUP BY, which cannot host the subquery in one circuit (the exists
-        // builder rejects that combination with a targeted message).
+        // Exactly one `[NOT] EXISTS` / `[NOT] IN (SELECT …)` per view is
+        // supported, anywhere in the WHERE or the projection. Two or more →
+        // compose via stacked views. Counted across both surfaces up front (no
+        // regression — multi-subquery was always rejected). Checked after JOIN (a
+        // join-view WHERE is rejected wholesale by that builder) and before GROUP
+        // BY, which cannot host the subquery in one circuit (both subquery
+        // builders reject that combination with a targeted message).
+        let n_subq = select.selection.iter().map(count_subqueries).sum::<usize>()
+            + select
+                .projection
+                .iter()
+                .filter_map(projection_item_expr)
+                .map(count_subqueries)
+                .sum::<usize>();
+        if n_subq >= 2 {
+            return Err(GnitzSqlError::Unsupported(
+                "at most one EXISTS/IN subquery per view; compose via stacked views".into(),
+            ));
+        }
+        // Fast path: the one subquery is a clean top-level `AND` conjunct of the
+        // WHERE (no OR/NOT-combination, not projected) → the direct semi/anti
+        // filter view, which needs no mark column or filter step.
         if let Some(selection) = &select.selection {
             let mut conjuncts = Vec::new();
             flatten_conjuncts(selection, &mut conjuncts);
@@ -244,16 +278,7 @@ impl<'a> ViewShape<'a> {
             let mut local: Vec<&Expr> = Vec::new();
             for &c in &conjuncts {
                 match as_subquery_conjunct(c) {
-                    Some(peeled) => {
-                        if subq.is_some() {
-                            return Err(GnitzSqlError::Unsupported(
-                                "at most one EXISTS/IN subquery conjunct per view WHERE; \
-                                 stack views instead"
-                                    .into(),
-                            ));
-                        }
-                        subq = Some(peeled);
-                    }
+                    Some(peeled) => subq = Some(peeled), // n_subq < 2 guarantees at most one
                     None => local.push(c),
                 }
             }
@@ -265,6 +290,11 @@ impl<'a> ViewShape<'a> {
                     local,
                 });
             }
+        }
+        // The one subquery sits under OR/NOT, inside CASE, or in the projection →
+        // the mark-join builder.
+        if n_subq == 1 {
+            return Ok(ViewShape::MarkSubquery(select));
         }
         // GROUP BY *or* a no-`GROUP BY` aggregate (`SELECT MIN(x) FROM t`) routes
         // to the grouped builder: the latter is one logical group compiled as a

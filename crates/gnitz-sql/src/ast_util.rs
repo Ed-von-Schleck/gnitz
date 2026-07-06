@@ -79,7 +79,7 @@ fn expr_has_aggregate(e: &sqlparser::ast::Expr) -> bool {
 /// HAVING aggregate collection, EXISTS correlation side-counting), so a node
 /// added to the binder's vocabulary reaches them all at once.
 pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
-    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    use sqlparser::ast::{CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
     match e {
         Expr::BinaryOp { left, right, .. } => vec![left, right],
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
@@ -87,6 +87,24 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
         }
         Expr::Between { expr, low, high, .. } => vec![expr, low, high],
         Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
+        // CASE operands: the optional operand, every WHEN condition + result, and
+        // the optional ELSE — the node set `bind_structural`'s Case arm recurses
+        // through, so a subquery or column ref inside a branch stays visible to
+        // `expr_has_aggregate` / `collect_column_refs` / the mark rewrite.
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            let mut ops: Vec<&Expr> = Vec::new();
+            ops.extend(operand.as_deref());
+            for CaseWhen { condition, result } in conditions {
+                ops.push(condition);
+                ops.push(result);
+            }
+            ops.extend(else_result.as_deref());
+            ops
+        }
         Expr::Function(f) => match &f.args {
             FunctionArguments::List(list) => list
                 .args
@@ -99,6 +117,36 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
             _ => Vec::new(),
         },
         _ => Vec::new(),
+    }
+}
+
+/// Count the `[NOT] EXISTS` / `[NOT] IN (SELECT …)` subquery nodes anywhere in
+/// `e`. Subqueries are opaque leaves to `expr_operands`, so the walk visits each
+/// one (under OR/NOT, inside CASE, in a projection) without descending into its
+/// body — the mark dispatcher's "exactly one subquery per view" test.
+pub(crate) fn count_subqueries(e: &sqlparser::ast::Expr) -> usize {
+    use sqlparser::ast::Expr;
+    let here = usize::from(matches!(e, Expr::Exists { .. } | Expr::InSubquery { .. }));
+    here + expr_operands(e).into_iter().map(count_subqueries).sum::<usize>()
+}
+
+/// The first `[NOT] EXISTS` / `[NOT] IN (SELECT …)` subquery node anywhere in
+/// `e` (pre-order), walking the same node set as [`count_subqueries`]; the mark
+/// builder extracts its single subquery with this.
+pub(crate) fn find_subquery(e: &sqlparser::ast::Expr) -> Option<&sqlparser::ast::Expr> {
+    use sqlparser::ast::Expr;
+    if matches!(e, Expr::Exists { .. } | Expr::InSubquery { .. }) {
+        return Some(e);
+    }
+    expr_operands(e).into_iter().find_map(find_subquery)
+}
+
+/// The scalar expression of a projection item, or `None` for a wildcard.
+pub(crate) fn projection_item_expr(item: &sqlparser::ast::SelectItem) -> Option<&sqlparser::ast::Expr> {
+    use sqlparser::ast::SelectItem;
+    match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => None,
     }
 }
 
@@ -135,11 +183,10 @@ pub(crate) fn collect_projection_column_refs<'e>(
     items: &'e [sqlparser::ast::SelectItem],
     out: &mut Vec<(Option<&'e str>, &'e str)>,
 ) -> bool {
-    use sqlparser::ast::SelectItem;
     for item in items {
-        match item {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => collect_column_refs(e, out),
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => return false,
+        match projection_item_expr(item) {
+            Some(e) => collect_column_refs(e, out),
+            None => return false, // wildcard
         }
     }
     true

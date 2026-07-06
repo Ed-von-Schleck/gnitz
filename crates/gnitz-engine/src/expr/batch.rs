@@ -104,6 +104,29 @@ impl EvalScratch {
         }
     }
 
+    /// Split borrows: three shared sources + one mutable destination. Backs the
+    /// SELECT no-nulls value blend (`cond`, `a`, `b` → `dst`).
+    /// Safety: SELECT's SSA anti-alias assert guarantees d != a, b, c.
+    #[allow(clippy::type_complexity)]
+    pub(in crate::expr) fn reg4(
+        &mut self,
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        m: usize,
+    ) -> (&[i64], &[i64], &[i64], &mut [i64]) {
+        debug_assert!(d != a && d != b && d != c, "reg4: dst aliases src register");
+        unsafe {
+            let ptr = self.regs.as_mut_ptr();
+            let ra = std::slice::from_raw_parts(ptr.add(a * MORSEL), m);
+            let rb = std::slice::from_raw_parts(ptr.add(b * MORSEL), m);
+            let rc = std::slice::from_raw_parts(ptr.add(c * MORSEL), m);
+            let rd = std::slice::from_raw_parts_mut(ptr.add(d * MORSEL), m);
+            (ra, rb, rc, rd)
+        }
+    }
+
     /// Zero the null bits for one register's morsel region.
     pub(in crate::expr) fn clear_null_reg(&mut self, reg: usize, m: usize) {
         if self.no_nulls {
@@ -842,6 +865,74 @@ pub(in crate::expr) fn eval_batch(
                 }
                 null_or1(scratch, dst, ai, m);
                 maybe_pack_bool_bits(scratch, prog, dst, m);
+            }
+
+            // ----------------------------------------------------------------
+            // Conditional select (SQL CASE blend) / manufactured NULL
+            // ----------------------------------------------------------------
+            // Rows where `cond` is non-NULL and truthy take `a`'s value + null
+            // bit; all others (false OR NULL cond) take `b`'s.
+            Instr::Select { dst, cond, a, b } => {
+                let dst = dst as usize;
+                let ci = cond as usize;
+                let ai = a as usize;
+                let bi = b as usize;
+                if scratch.no_nulls {
+                    // Fast arm: cond truthiness lives in `regs` (no bool_bits in
+                    // no_nulls mode); a straight per-row blend.
+                    let (rc, ra, rb, rd) = scratch.reg4(ci, ai, bi, dst, m);
+                    for i in 0..m {
+                        rd[i] = if rc[i] != 0 { ra[i] } else { rb[i] };
+                    }
+                } else {
+                    // Nullable arm. `cond` may be bit_only (its producer skips the
+                    // unpack to regs), so read its truthiness from `bool_bits`, not
+                    // `regs`. take_a = cond truthy AND non-null, per row bit.
+                    let words = m.div_ceil(64);
+                    let base_cond_n = ci * NULL_WORDS_PER_REG;
+                    let mut take_a = [0u64; NULL_WORDS_PER_REG];
+                    for w in 0..words {
+                        take_a[w] = scratch.bool_bits[base_cond_n + w] & !scratch.null_bits[base_cond_n + w];
+                    }
+                    // Null mask: dst is null wherever the chosen branch is null.
+                    {
+                        let (na, nb, nd) = scratch.null_words3(ai, bi, dst, words);
+                        for w in 0..words {
+                            nd[w] = (take_a[w] & na[w]) | (!take_a[w] & nb[w]);
+                        }
+                    }
+                    // Value blend, row-level within each word.
+                    {
+                        let (ra, rb, rd) = scratch.reg3(ai, bi, dst, m);
+                        for w in 0..words {
+                            let lo = w * 64;
+                            let hi = (lo + 64).min(m);
+                            let ta = take_a[w];
+                            for i in lo..hi {
+                                rd[i] = if (ta >> (i - lo)) & 1 != 0 { ra[i] } else { rb[i] };
+                            }
+                        }
+                    }
+                    maybe_pack_bool_bits(scratch, prog, dst, m);
+                }
+            }
+            // Manufacture a NULL: zero the value lane, set the null bit for every
+            // live row. Only ever reached on the nullable arm (LoadNull forces
+            // `no_nulls` off via `is_strictly_non_nullable`).
+            Instr::LoadNull { dst } => {
+                let dst = dst as usize;
+                let base_d = dst * MORSEL;
+                scratch.regs[base_d..base_d + m].fill(0);
+                if !scratch.no_nulls {
+                    let words = m.div_ceil(64);
+                    let base_null = dst * NULL_WORDS_PER_REG;
+                    scratch.null_bits[base_null..base_null + words].fill(u64::MAX);
+                    // Mask the tail word so stale high bits past `m` never read as null.
+                    if !m.is_multiple_of(64) {
+                        scratch.null_bits[base_null + words - 1] = (1u64 << (m % 64)) - 1;
+                    }
+                    maybe_pack_bool_bits(scratch, prog, dst, m);
+                }
             }
 
             // ----------------------------------------------------------------

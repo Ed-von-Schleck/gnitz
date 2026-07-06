@@ -34,6 +34,18 @@ pub const EXPR_IS_NOT_NULL: u32 = 31;
 pub const EXPR_EMIT: u32 = 32;
 pub const EXPR_INT_TO_FLOAT: u32 = 33;
 pub const EXPR_COPY_COL: u32 = 34;
+/// Conditional select (SQL CASE blend): `[EXPR_SELECT, dst, cond, a | (b << 16)]`.
+/// Three register sources — `cond`, `a`, `b` — packed into two operand words:
+/// `cond` occupies word `a1` alone, while `a`/`b` are packed as the low/high 16
+/// bits of word `a2`. This is the only opcode that packs two registers into one
+/// word (LOAD_CONST packs a 64-bit *value*, not registers; see the decode site
+/// in `gnitz-engine`'s `program.rs`). Rows where `cond` is non-NULL and truthy
+/// take `a`'s value + null bit; all other rows (false **or NULL** cond) take
+/// `b`'s. Carries a value, never a boolean classification.
+pub const EXPR_SELECT: u32 = 35;
+/// Materialize a NULL value: `[EXPR_LOAD_NULL, dst, 0, 0]` — value 0, null bit
+/// set for every row. Backs `CASE` without `ELSE` (→ `ELSE NULL`) and `NULLIF`.
+pub const EXPR_LOAD_NULL: u32 = 36;
 pub const EXPR_STR_COL_EQ_CONST: u32 = 40;
 pub const EXPR_STR_COL_LT_CONST: u32 = 41;
 pub const EXPR_STR_COL_LE_CONST: u32 = 42;

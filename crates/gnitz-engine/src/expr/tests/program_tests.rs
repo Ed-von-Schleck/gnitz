@@ -1278,6 +1278,303 @@ fn test_string_prefix_le_ordering() {
 }
 
 // ---------------------------------------------------------------------------
+// SELECT / LOAD_NULL (SQL CASE blend)
+// ---------------------------------------------------------------------------
+
+/// SELECT truth table at m=1: `cond` non-NULL and truthy → `a`; `cond` false
+/// OR NULL → `b`. Mirrors SQL CASE (a NULL WHEN falls to the ELSE branch).
+#[test]
+fn test_select_truth_table() {
+    // Schema: pk(u64), cond(i64), a(i64), b(i64).
+    let schema = make_schema(0, &[8, 9, 9, 9]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
+        LogicalInstr::LoadColInt { dst: 1, col: 2 }, // a
+        LogicalInstr::LoadColInt { dst: 2, col: 3 }, // b
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+    ];
+    let prog = make_prog(&schema, instrs, 4, 3, vec![]);
+
+    // cond=1 (truthy) → a=100
+    let batch = make_int_batch(&schema, &[(1, 1, 0, &[1, 100, 200])]);
+    let (v, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert!(!n);
+    assert_eq!(v, 100, "truthy cond takes a");
+
+    // cond=0 (false) → b=200
+    let batch = make_int_batch(&schema, &[(1, 1, 0, &[0, 100, 200])]);
+    let (v, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert!(!n);
+    assert_eq!(v, 200, "false cond takes b");
+
+    // cond=NULL → b=200 (null_word bit 0 = cond/col1); value 7 is truthy but masked.
+    let batch = make_int_batch(&schema, &[(1, 1, 1, &[7, 100, 200])]);
+    let (v, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert!(!n);
+    assert_eq!(v, 200, "NULL cond falls to else (b), not a");
+}
+
+/// SELECT carries the *chosen* branch's null bit; the unchosen branch's null is
+/// irrelevant.
+#[test]
+fn test_select_null_bit_blend() {
+    let schema = make_schema(0, &[8, 9, 9, 9]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
+        LogicalInstr::LoadColInt { dst: 1, col: 2 }, // a
+        LogicalInstr::LoadColInt { dst: 2, col: 3 }, // b
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+    ];
+    let prog = make_prog(&schema, instrs, 4, 3, vec![]);
+
+    // cond truthy, a NULL (payload bit 1) → result NULL.
+    let batch = make_int_batch(&schema, &[(1, 1, 0b010, &[1, 0, 200])]);
+    let (_, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert!(n, "truthy cond + NULL a → NULL");
+
+    // cond truthy, b NULL (payload bit 2), a non-null → result = a; b's null ignored.
+    let batch = make_int_batch(&schema, &[(1, 1, 0b100, &[1, 55, 0])]);
+    let (v, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert!(!n, "truthy cond ignores b's null");
+    assert_eq!(v, 55);
+
+    // cond false, b NULL → result NULL.
+    let batch = make_int_batch(&schema, &[(1, 1, 0b100, &[0, 55, 0])]);
+    let (_, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert!(n, "false cond + NULL b → NULL");
+}
+
+/// `CASE WHEN cond THEN 42 END` (implicit ELSE NULL) lowers to
+/// `select(cond, 42, load_null())`: truthy → 42, else → NULL.
+#[test]
+fn test_load_null_else_branch_eval() {
+    let schema = make_schema(0, &[8, 9]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
+        LogicalInstr::LoadConst { dst: 1, val: 42 }, // a
+        LogicalInstr::LoadNull { dst: 2 },           // else NULL
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+    ];
+    let prog = make_prog(&schema, instrs, 4, 3, vec![]);
+
+    // cond truthy → 42.
+    let batch = make_int_batch(&schema, &[(1, 1, 0, &[5])]);
+    let (v, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert!(!n);
+    assert_eq!(v, 42);
+
+    // cond false → else NULL.
+    let batch = make_int_batch(&schema, &[(1, 1, 0, &[0])]);
+    let (_, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert!(n, "false cond → else NULL");
+
+    // cond NULL → else NULL.
+    let batch = make_int_batch(&schema, &[(1, 1, 1, &[9])]);
+    let (_, n) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert!(n, "NULL cond → else NULL");
+}
+
+/// LoadNull forces the nullable eval path even when every column is NOT NULL:
+/// `is_strictly_non_nullable` must return false whenever a program manufactures
+/// a NULL.
+#[test]
+fn test_load_null_forces_nullable_path() {
+    use crate::schema::type_code;
+    let nonnull_schema = {
+        let cols = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0), // NOT NULL
+        ];
+        SchemaDescriptor::new(&cols, &[0])
+    };
+    // CASE WHEN col1 THEN col1 END: r0=col1, r1=load_null, r2=select(r0, r0, r1).
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadNull { dst: 1 },
+        LogicalInstr::Select {
+            dst: 2,
+            cond: 0,
+            a: 0,
+            b: 1,
+        },
+    ];
+    let prog = make_prog(&nonnull_schema, instrs, 3, 2, vec![]);
+    assert!(
+        !prog.is_strictly_non_nullable(&nonnull_schema),
+        "LoadNull must force the nullable path"
+    );
+}
+
+/// A Select over only NOT NULL branches (no LoadNull) stays strictly-non-nullable:
+/// Select copies branch values and adds no NULL of its own.
+#[test]
+fn test_select_non_nullable_when_branches_non_nullable() {
+    use crate::schema::type_code;
+    let nonnull_schema = {
+        let cols = [
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ];
+        SchemaDescriptor::new(&cols, &[0])
+    };
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::LoadColInt { dst: 1, col: 2 },
+        LogicalInstr::LoadColInt { dst: 2, col: 3 },
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+    ];
+    let prog = make_prog(&nonnull_schema, instrs, 4, 3, vec![]);
+    assert!(
+        prog.is_strictly_non_nullable(&nonnull_schema),
+        "Select over NOT NULL branches must stay strictly-non-nullable"
+    );
+}
+
+/// U64-ness flows through Select (U64 if either branch is U64), so a downstream
+/// ordered compare on the CASE result picks the unsigned variant.
+#[test]
+fn test_select_u64_propagation() {
+    // Schema: pk(u64), u64col(U64), i64col(I64).
+    let schema = make_schema(0, &[8, 8, 9]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 2 }, // cond (i64)
+        LogicalInstr::LoadColInt { dst: 1, col: 1 }, // a (U64)
+        LogicalInstr::LoadColInt { dst: 2, col: 2 }, // b (i64)
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+        LogicalInstr::LoadConst { dst: 4, val: 100 },
+        LogicalInstr::Cmp {
+            op: CmpOp::Gt,
+            dst: 5,
+            a: 3,
+            b: 4,
+        },
+    ];
+    let prog = make_prog(&schema, instrs, 6, 5, vec![]);
+    assert!(
+        matches!(
+            prog.instrs[5],
+            Instr::Cmp {
+                op: CmpOp::Gt,
+                signed: false,
+                ..
+            }
+        ),
+        "Select carrying a U64 branch must make the downstream compare unsigned"
+    );
+}
+
+/// SELECT feeding BOOL_AND: `cond` is a bool_input, the select result feeds the
+/// AND as a bool_input, and the select dst (a value register) is never bit_only.
+#[test]
+fn test_select_classification() {
+    let schema = make_schema(0, &[8, 9, 9, 9, 9]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // cond
+        LogicalInstr::LoadColInt { dst: 1, col: 2 }, // a
+        LogicalInstr::LoadColInt { dst: 2, col: 3 }, // b
+        LogicalInstr::Select {
+            dst: 3,
+            cond: 0,
+            a: 1,
+            b: 2,
+        },
+        LogicalInstr::LoadColInt { dst: 4, col: 4 }, // other bool
+        LogicalInstr::BoolAnd { dst: 5, a: 3, b: 4 },
+    ];
+    let prog = LogicalProgram::new(instrs, 6, 5, vec![]).resolve(&schema, /* is_filter = */ true);
+    let (bit_only, bool_input) = prog.classify_registers(true);
+    assert_ne!(bool_input & (1 << 0), 0, "cond is read as a bool_input");
+    assert_ne!(bool_input & (1 << 3), 0, "select result feeds BOOL_AND as bool_input");
+    assert_eq!(bit_only & (1 << 3), 0, "select dst is a value register, never bit_only");
+}
+
+/// `dst` aliasing any of `cond`/`a`/`b` violates the SELECT anti-alias rule that
+/// makes `reg4`'s raw split borrows sound.
+#[test]
+#[should_panic(expected = "SELECT register aliasing")]
+fn test_select_dst_alias_panics() {
+    // `LogicalProgram::new` validates aliasing before any schema is consulted.
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 },
+        LogicalInstr::Select {
+            dst: 0,
+            cond: 0,
+            a: 0,
+            b: 0,
+        }, // dst == cond
+    ];
+    let _ = LogicalProgram::new(instrs, 1, 0, vec![]);
+}
+
+/// Nested SELECT — `CASE WHEN c1 THEN v1 WHEN c2 THEN v2 ELSE v3 END` lowered as
+/// `select(c1, v1, select(c2, v2, v3))` — must pick the first truthy WHEN.
+#[test]
+fn test_select_nesting() {
+    // Schema: pk, c1, c2, v1, v2, v3.
+    let schema = make_schema(0, &[8, 9, 9, 9, 9, 9]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { dst: 0, col: 1 }, // c1
+        LogicalInstr::LoadColInt { dst: 1, col: 2 }, // c2
+        LogicalInstr::LoadColInt { dst: 2, col: 3 }, // v1
+        LogicalInstr::LoadColInt { dst: 3, col: 4 }, // v2
+        LogicalInstr::LoadColInt { dst: 4, col: 5 }, // v3
+        LogicalInstr::Select {
+            dst: 5,
+            cond: 1,
+            a: 3,
+            b: 4,
+        }, // inner = c2 ? v2 : v3
+        LogicalInstr::Select {
+            dst: 6,
+            cond: 0,
+            a: 2,
+            b: 5,
+        }, // outer = c1 ? v1 : inner
+    ];
+    let prog = make_prog(&schema, instrs, 7, 6, vec![]);
+    // payload cols: c1, c2, v1=10, v2=20, v3=30.
+    // c1 truthy → v1.
+    let batch = make_int_batch(&schema, &[(1, 1, 0, &[1, 1, 10, 20, 30])]);
+    let (v, _) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert_eq!(v, 10, "c1 truthy → v1");
+    // c1 false, c2 truthy → v2.
+    let batch = make_int_batch(&schema, &[(1, 1, 0, &[0, 1, 10, 20, 30])]);
+    let (v, _) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert_eq!(v, 20, "c1 false, c2 truthy → v2");
+    // both false → v3.
+    let batch = make_int_batch(&schema, &[(1, 1, 0, &[0, 0, 10, 20, 30])]);
+    let (v, _) = eval_predicate(&prog, &batch.as_mem_batch(), 0);
+    assert_eq!(v, 30, "both false → else v3");
+}
+
+// ---------------------------------------------------------------------------
 // AND-chain short-circuit detection (`compute_and_chain`)
 // ---------------------------------------------------------------------------
 

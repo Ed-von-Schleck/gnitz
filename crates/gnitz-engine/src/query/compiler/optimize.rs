@@ -377,8 +377,13 @@ pub(super) fn reindex_output_schema(
 /// guard on the low-level circuit API that bypasses the binder — so that schema is
 /// discarded (`build_plan` returns `None`) and the `I64` arm never reaches
 /// execution. The accumulator order-encodes via `encode_ordered`, which has no key
-/// for these types at all. SUM stays I64: it can overflow the source width.
-/// Mirrored by the SQL planner's `agg_result_type`.
+/// for these types at all. SUM over a U64 source is typed **U64**: the i64
+/// `wrapping_add` accumulator's bit pattern already *is* the true sum mod 2^64,
+/// same 8-byte width, so the label is the only choice — and U64 lets a downstream
+/// unsigned compare re-seed correctly (like MIN/MAX preserving their source type).
+/// A narrow unsigned source (U8/U16/U32) still widens to I64 (its sum stays
+/// < 2^63, so signed order is correct). Mirrored by the SQL planner's
+/// `agg_result_type`.
 pub(super) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u8 {
     match agg_op {
         // SumZero sums integer count/sum columns; like COUNT it produces I64.
@@ -386,6 +391,8 @@ pub(super) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u
         AggOp::Sum => {
             if col_type_code.is_float() {
                 type_code::F64
+            } else if col_type_code as u8 == type_code::U64 {
+                type_code::U64
             } else {
                 type_code::I64
             }

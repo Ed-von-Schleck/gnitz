@@ -213,14 +213,15 @@ fn test_exists_rejections() {
          big DECIMAL(38,0) NOT NULL)",
     );
 
-    // Two subquery conjuncts.
+    // Two subqueries anywhere in the view (here two WHERE conjuncts) → rejected
+    // by the total-count guard before any single-conjunct/mark classification.
     assert_rejects(
         &mut client,
         &sn,
         "CREATE VIEW r1 AS SELECT * FROM rj_a \
          WHERE EXISTS (SELECT 1 FROM rj_b WHERE rj_b.k = rj_a.k) \
          AND EXISTS (SELECT 1 FROM rj_b WHERE rj_b.w = rj_a.v)",
-        "at most one EXISTS/IN subquery conjunct",
+        "at most one EXISTS/IN subquery per view",
     );
     // Same relation on both sides.
     assert_rejects(
@@ -289,14 +290,17 @@ fn test_exists_rejections() {
          WHERE EXISTS (SELECT 1 FROM rj_b WHERE rj_b.k = rj_a.k) GROUP BY k",
         "GROUP BY/aggregates",
     );
-    // Under OR the conjunct partitioner never intercepts — the binder's targeted
-    // placement message fires.
-    assert_rejects(
-        &mut client,
-        &sn,
-        "CREATE VIEW r10 AS SELECT * FROM rj_a \
-         WHERE v = 1 OR EXISTS (SELECT 1 FROM rj_b WHERE rj_b.k = rj_a.k)",
-        "top-level AND conjunct",
+    // Under OR the subquery is not a clean top-level conjunct, so it routes to the
+    // mark-join builder and registers cleanly (no longer a rejection).
+    assert!(
+        try_exec(
+            &mut client,
+            &sn,
+            "CREATE VIEW r10 AS SELECT * FROM rj_a \
+             WHERE v = 1 OR EXISTS (SELECT 1 FROM rj_b WHERE rj_b.k = rj_a.k)",
+        )
+        .is_ok(),
+        "EXISTS under OR should register as a mark view"
     );
     // Subquery with a join inside.
     assert_rejects(

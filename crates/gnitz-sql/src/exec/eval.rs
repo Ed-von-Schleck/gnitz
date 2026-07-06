@@ -113,6 +113,28 @@ impl BoundExprBackend for InterpBackend<'_> {
         ))
     }
 
+    fn lit_null(&mut self) -> Result<Self::Out, GnitzSqlError> {
+        Ok(None)
+    }
+
+    fn case(
+        &mut self,
+        branches: &[(BoundExpr, BoundExpr)],
+        else_: Option<&BoundExpr>,
+    ) -> Result<Self::Out, GnitzSqlError> {
+        // SQL CASE 3VL: a WHEN whose condition is NULL or false is skipped; the
+        // first truthy WHEN yields its result, else the ELSE (NULL when absent).
+        for (cond, result) in branches {
+            if lower_bound_expr(cond, self)?.is_some_and(|v| v != 0) {
+                return lower_bound_expr(result, self);
+            }
+        }
+        match else_ {
+            Some(e) => lower_bound_expr(e, self),
+            None => Ok(None),
+        }
+    }
+
     fn binop(&mut self, l: &BoundExpr, op: BinOp, r: &BoundExpr) -> Result<Self::Out, GnitzSqlError> {
         // SQL 3VL: short-circuit before propagating NULL.
         // TRUE OR any = TRUE; FALSE AND any = FALSE — regardless of NULL.

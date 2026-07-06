@@ -21,6 +21,7 @@ gnitz_wire::cast_consts! { u32;
     EXPR_BOOL_AND, EXPR_BOOL_OR, EXPR_BOOL_NOT,
     EXPR_IS_NULL, EXPR_IS_NOT_NULL,
     EXPR_EMIT, EXPR_INT_TO_FLOAT, EXPR_COPY_COL,
+    EXPR_SELECT, EXPR_LOAD_NULL,
     EXPR_STR_COL_EQ_CONST, EXPR_STR_COL_LT_CONST, EXPR_STR_COL_LE_CONST,
     EXPR_STR_COL_EQ_COL, EXPR_STR_COL_LT_COL, EXPR_STR_COL_LE_COL,
     EXPR_EMIT_NULL,
@@ -146,6 +147,19 @@ pub(crate) enum LogicalInstr {
     IntToFloat {
         dst: u16,
         a: u16,
+    },
+    /// SQL CASE blend: `dst` takes `a`'s value + null bit where `cond` is
+    /// non-NULL and truthy, else `b`'s. Carries a value, never a boolean.
+    Select {
+        dst: u16,
+        cond: u16,
+        a: u16,
+        b: u16,
+    },
+    /// Always-NULL value into `dst` (value 0, null bit set): CASE without ELSE,
+    /// NULLIF's match branch.
+    LoadNull {
+        dst: u16,
     },
     BoolAnd {
         dst: u16,
@@ -298,6 +312,18 @@ pub(crate) enum Instr {
         a: u16,
         signed: bool,
     },
+    /// SQL CASE blend (resolved): identical to the logical form — blends raw i64
+    /// bit patterns, so no `signed` flag is needed (the branch producers already
+    /// carry the correct value; §4's float unification is the lowering's job).
+    Select {
+        dst: u16,
+        cond: u16,
+        a: u16,
+        b: u16,
+    },
+    LoadNull {
+        dst: u16,
+    },
     BoolAnd {
         dst: u16,
         a: u16,
@@ -428,6 +454,22 @@ impl LogicalProgram {
                     assert_reg(a, num_regs);
                     assert_reg(b, num_regs);
                 }
+                // Ternary select: three register sources + dst. Anti-aliasing
+                // (dst distinct from every source) makes `reg4`'s raw split
+                // borrows sound — the same expr-VM SSA rule as the binary ALU
+                // above, extended to three sources. (Unrelated to the operator-DAG
+                // "destructive register ordering" invariant in
+                // `query/compiler/emit.rs`, which concerns batch registers.)
+                L::Select { dst, cond, a, b } => {
+                    assert!(
+                        dst != cond && dst != a && dst != b,
+                        "LogicalProgram: SELECT register aliasing dst={dst} cond={cond} a={a} b={b}"
+                    );
+                    assert_reg(dst, num_regs);
+                    assert_reg(cond, num_regs);
+                    assert_reg(a, num_regs);
+                    assert_reg(b, num_regs);
+                }
                 // Unary register readers that write dst: bounds dst, a.
                 L::IntNeg { dst, a } | L::FloatNeg { dst, a } | L::IntToFloat { dst, a } | L::BoolNot { dst, a } => {
                     assert_reg(dst, num_regs);
@@ -435,10 +477,11 @@ impl LogicalProgram {
                 }
                 // EMIT reads a source register; no dst register.
                 L::Emit { src, .. } => assert_reg(src, num_regs),
-                // dst-writers whose other operands are column / const indices.
+                // dst-writers whose other operands are column / const indices, or none.
                 L::LoadColInt { dst, .. }
                 | L::LoadColFloat { dst, .. }
                 | L::LoadConst { dst, .. }
+                | L::LoadNull { dst }
                 | L::IsNull { dst, .. }
                 | L::IsNotNull { dst, .. }
                 | L::StrColConst { dst, .. }
@@ -512,6 +555,19 @@ impl LogicalProgram {
                 EXPR_IS_NOT_NULL => LogicalInstr::IsNotNull { dst, col: q[2] },
                 EXPR_EMIT => LogicalInstr::Emit { src: a, out: q[3] },
                 EXPR_INT_TO_FLOAT => LogicalInstr::IntToFloat { dst, a },
+                // SELECT packs three register sources into two words: `cond` in
+                // `q[2]`, `a`/`b` as the low/high 16 bits of `q[3]`. This is the
+                // only two-register packing in the wire encoding (LOAD_CONST above
+                // packs a 64-bit *value*, not registers). Bind under FRESH names —
+                // reusing the loop-level `a = q[2]`/`b = q[3]` would silently swap
+                // the operands (see the `EXPR_SELECT` doc in gnitz-wire).
+                EXPR_SELECT => LogicalInstr::Select {
+                    dst,
+                    cond: q[2] as u16,
+                    a: (q[3] & 0xFFFF) as u16,
+                    b: (q[3] >> 16) as u16,
+                },
+                EXPR_LOAD_NULL => LogicalInstr::LoadNull { dst },
                 EXPR_COPY_COL => LogicalInstr::CopyCol {
                     src_col: q[2],
                     out: q[3],
@@ -689,6 +745,18 @@ impl LogicalProgram {
                     instrs.push(I::IntToFloat { dst, a, signed });
                     reg_tc[dst as usize] = 0;
                 }
+                L::Select { dst, cond, a, b } => {
+                    // U64-ness flows through Select exactly as through IntAdd: the
+                    // result is U64 if *either* branch is U64, so a downstream
+                    // ordered compare / div / int_to_float on the CASE result picks
+                    // the unsigned variant and values >= 2^63 order correctly.
+                    instrs.push(I::Select { dst, cond, a, b });
+                    reg_tc[dst as usize] = propagate_u64(&reg_tc, a, b);
+                }
+                L::LoadNull { dst } => {
+                    instrs.push(I::LoadNull { dst });
+                    reg_tc[dst as usize] = 0;
+                }
                 L::BoolAnd { dst, a, b } => instrs.push(I::BoolAnd { dst, a, b }),
                 L::BoolOr { dst, a, b } => instrs.push(I::BoolOr { dst, a, b }),
                 L::BoolNot { dst, a } => instrs.push(I::BoolNot { dst, a }),
@@ -836,12 +904,18 @@ fn each_reg_read(i: &Instr, mut f: impl FnMut(u16)) {
             f(a);
             f(b);
         }
+        Select { cond, a, b, .. } => {
+            f(cond);
+            f(a);
+            f(b);
+        }
         IntNeg { a, .. } | FloatNeg { a, .. } | IntToFloat { a, .. } | BoolNot { a, .. } => f(a),
         Emit { src, .. } => f(src),
         LoadPayloadInt { .. }
         | LoadPayloadFloat { .. }
         | LoadPk { .. }
         | LoadConst { .. }
+        | LoadNull { .. }
         | IsNull { .. }
         | IsNotNull { .. }
         | StrColConst { .. }
@@ -994,6 +1068,18 @@ impl ResolvedProgram {
                     debug_assert!((a as usize) < 64, "classify: src {a} >= 64");
                     non_bool_read |= 1u64 << a;
                 }
+                // Ternary select: `cond` is read as a boolean (its producer must
+                // pack `bool_bits`), `a`/`b` as values. `dst` carries a value, so
+                // it is deliberately in neither set — keeping it out of
+                // `bool_produced` keeps it out of `bit_only`.
+                Select { cond, a, b, .. } => {
+                    debug_assert!(
+                        (cond as usize) < 64 && (a as usize) < 64 && (b as usize) < 64,
+                        "classify: SELECT src {cond}/{a}/{b} >= 64"
+                    );
+                    bool_input |= 1u64 << cond;
+                    non_bool_read |= (1u64 << a) | (1u64 << b);
+                }
                 Emit { src, .. } => {
                     debug_assert!((src as usize) < 64, "classify: EMIT src {src} >= 64");
                     non_bool_read |= 1u64 << src;
@@ -1003,6 +1089,7 @@ impl ResolvedProgram {
                 | LoadPayloadFloat { .. }
                 | LoadPk { .. }
                 | LoadConst { .. }
+                | LoadNull { .. }
                 | CopyCol { .. }
                 | EmitNull { .. } => {}
             }
@@ -1051,6 +1138,8 @@ impl ResolvedProgram {
                 IntDiv { .. } | IntMod { .. } | FloatDiv { .. } => return false,
                 // IS_NULL / IS_NOT_NULL read the batch null bits.
                 IsNull { .. } | IsNotNull { .. } => return false,
+                // LoadNull manufactures a NULL for every row — forces the nullable path.
+                LoadNull { .. } => return false,
                 // Column reads: null when the underlying column is nullable.
                 LoadPayloadInt { pi, .. } | LoadPayloadFloat { pi, .. } | StrColConst { pi, .. }
                     if nullable_payload(pi) =>
@@ -1077,6 +1166,11 @@ impl ResolvedProgram {
                 | Cmp { .. }
                 | FCmp { .. }
                 | IntToFloat { .. }
+                // Select only copies branch values — any NULL a branch can
+                // produce is already accounted for by that branch's own producer
+                // (a nullable branch forces `no_nulls` off there), so Select adds
+                // no NULL of its own. LoadNull is handled above (returns false).
+                | Select { .. }
                 | BoolAnd { .. }
                 | BoolOr { .. }
                 | BoolNot { .. }

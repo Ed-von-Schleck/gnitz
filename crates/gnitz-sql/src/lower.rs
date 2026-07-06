@@ -21,11 +21,21 @@ pub(crate) trait BoundExprBackend {
     fn lit_int(&mut self, v: i64) -> Result<Self::Out, GnitzSqlError>;
     fn lit_float(&mut self, v: f64) -> Result<Self::Out, GnitzSqlError>;
     fn lit_str(&mut self, s: &str) -> Result<Self::Out, GnitzSqlError>;
+    /// SQL `NULL` literal (and the implicit CASE ELSE).
+    fn lit_null(&mut self) -> Result<Self::Out, GnitzSqlError>;
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<Self::Out, GnitzSqlError>;
     fn unop(&mut self, op: UnaryOp, inner: &BoundExpr) -> Result<Self::Out, GnitzSqlError>;
     /// `IS NULL` (`want_null = true`) and `IS NOT NULL` (`want_null = false`).
     fn null_test(&mut self, col: usize, want_null: bool) -> Result<Self::Out, GnitzSqlError>;
     fn agg_call(&mut self) -> Result<Self::Out, GnitzSqlError>;
+    /// Searched CASE. Receives its branches (`(condition, result)` taken in order)
+    /// and optional ELSE *unevaluated*, driving the recursion via
+    /// [`lower_bound_expr`] — like `binop`, so a backend can lift/short-circuit.
+    fn case(
+        &mut self,
+        branches: &[(BoundExpr, BoundExpr)],
+        else_: Option<&BoundExpr>,
+    ) -> Result<Self::Out, GnitzSqlError>;
 }
 
 /// Dispatch a single `BoundExpr` node to the backend. The lone `match` over the
@@ -39,11 +49,13 @@ pub(crate) fn lower_bound_expr<B: BoundExprBackend>(
         BoundExpr::LitInt(v) => backend.lit_int(*v),
         BoundExpr::LitFloat(v) => backend.lit_float(*v),
         BoundExpr::LitStr(s) => backend.lit_str(s),
+        BoundExpr::LitNull => backend.lit_null(),
         BoundExpr::BinOp(l, op, r) => backend.binop(l, *op, r),
         BoundExpr::UnaryOp(op, inner) => backend.unop(*op, inner),
         BoundExpr::IsNull(c) => backend.null_test(*c, true),
         BoundExpr::IsNotNull(c) => backend.null_test(*c, false),
         BoundExpr::AggCall { .. } => backend.agg_call(),
+        BoundExpr::Case { branches, else_ } => backend.case(branches, else_.as_deref()),
     }
 }
 
@@ -189,6 +201,55 @@ impl BoundExprBackend for OpcodeBackend<'_> {
         Err(GnitzSqlError::Unsupported(
             "string literals not supported in view expressions".to_string(),
         ))
+    }
+
+    fn lit_null(&mut self) -> Result<Self::Out, GnitzSqlError> {
+        // A NULL value: `is_float = false` — LoadNull carries a zero i64 lane with
+        // the null bit set. If a sibling CASE branch is float, `case` lifts it.
+        Ok((self.eb.load_null(), false))
+    }
+
+    fn case(
+        &mut self,
+        branches: &[(BoundExpr, BoundExpr)],
+        else_: Option<&BoundExpr>,
+    ) -> Result<Self::Out, GnitzSqlError> {
+        // Lower every condition and result, plus the else (implicit NULL when
+        // absent). Conditions stay as 0/1 int registers; only the result *values*
+        // participate in float unification.
+        let mut conds = Vec::with_capacity(branches.len());
+        let mut results = Vec::with_capacity(branches.len());
+        for (cond, result) in branches {
+            let (cond_reg, _cond_float) = lower_bound_expr(cond, self)?;
+            conds.push(cond_reg);
+            results.push(lower_bound_expr(result, self)?);
+        }
+        let else_out = match else_ {
+            Some(e) => lower_bound_expr(e, self)?,
+            None => self.lit_null()?,
+        };
+
+        // Float unification is one GLOBAL decision, not a per-pair fold: EXPR_SELECT
+        // blends raw i64 bit patterns and converts nothing, so if any result or the
+        // else is float, every int branch is lifted to float up front. A per-pair
+        // lift (as in `binop`) would blend int and float bit patterns in one
+        // register — the natural wrong implementation.
+        let any_float = else_out.1 || results.iter().any(|(_, f)| *f);
+        let lift = |eb: &mut ExprBuilder, reg: u32, is_float: bool| -> u32 {
+            if any_float && !is_float {
+                eb.int_to_float(reg)
+            } else {
+                reg
+            }
+        };
+        // Fold right-to-left: acc = else; per pair acc = select(cond, result, acc),
+        // so the first truthy WHEN wins.
+        let mut acc = lift(self.eb, else_out.0, else_out.1);
+        for i in (0..branches.len()).rev() {
+            let result_reg = lift(self.eb, results[i].0, results[i].1);
+            acc = self.eb.select(conds[i], result_reg, acc);
+        }
+        Ok((acc, any_float))
     }
 
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<Self::Out, GnitzSqlError> {
@@ -462,6 +523,81 @@ mod tests {
             matches!(err, GnitzSqlError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
         );
+    }
+
+    /// Opcode words sit at every 4th position of the flat quad stream.
+    fn opcodes(p: &ExprProgram) -> Vec<u32> {
+        p.code.chunks_exact(4).map(|q| q[0]).collect()
+    }
+
+    fn case_schema() -> Schema {
+        Schema {
+            columns: vec![
+                col("pk", TypeCode::U64),
+                col("i", TypeCode::I64),
+                col("f", TypeCode::F64),
+            ],
+            pk_cols: vec![0],
+        }
+    }
+
+    /// CASE lowers to a SELECT; float unification is one global decision —
+    /// an all-int CASE lifts nothing, a mixed int/float CASE lifts every int
+    /// branch to float up front (never a per-pair blend of int/float bits).
+    #[test]
+    fn case_float_unification_lifts_int_branches() {
+        use gnitz_wire::{EXPR_INT_TO_FLOAT, EXPR_SELECT};
+        let schema = case_schema();
+        let gt0 = || {
+            BoundExpr::BinOp(
+                Box::new(BoundExpr::ColRef(1)),
+                BinOp::Gt,
+                Box::new(BoundExpr::LitInt(0)),
+            )
+        };
+
+        // All-int CASE: a SELECT, but no float lift.
+        let case_int = BoundExpr::Case {
+            branches: vec![(gt0(), BoundExpr::ColRef(1))],
+            else_: Some(Box::new(BoundExpr::LitInt(0))),
+        };
+        let ops = opcodes(&compile_bound_expr_to_program(&case_int, &schema).unwrap());
+        assert!(ops.contains(&EXPR_SELECT), "CASE must lower to a SELECT");
+        assert!(!ops.contains(&EXPR_INT_TO_FLOAT), "all-int CASE needs no float lift");
+
+        // Mixed int/float CASE: the int else is lifted to float up front.
+        let case_mixed = BoundExpr::Case {
+            branches: vec![(gt0(), BoundExpr::ColRef(2))],
+            else_: Some(Box::new(BoundExpr::ColRef(1))),
+        };
+        let ops = opcodes(&compile_bound_expr_to_program(&case_mixed, &schema).unwrap());
+        assert!(ops.contains(&EXPR_SELECT), "CASE must lower to a SELECT");
+        assert!(
+            ops.contains(&EXPR_INT_TO_FLOAT),
+            "mixed CASE lifts int branches to float"
+        );
+    }
+
+    /// A string-typed CASE result reaches the integer/string-load path and is
+    /// rejected (the register file carries 8-byte values only).
+    #[test]
+    fn case_string_branch_rejected() {
+        let schema = case_schema();
+        let case_str = BoundExpr::Case {
+            branches: vec![(
+                BoundExpr::BinOp(
+                    Box::new(BoundExpr::ColRef(1)),
+                    BinOp::Gt,
+                    Box::new(BoundExpr::LitInt(0)),
+                ),
+                BoundExpr::LitStr("x".into()),
+            )],
+            else_: Some(Box::new(BoundExpr::LitStr("y".into()))),
+        };
+        assert!(matches!(
+            compile_bound_expr_to_program(&case_str, &schema),
+            Err(GnitzSqlError::Unsupported(_))
+        ));
     }
 
     /// String arithmetic (`a.s + 1`) likewise reaches the integer-load path and is
