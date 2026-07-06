@@ -1478,7 +1478,7 @@ mod tests {
                 &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(key_tc, 0)],
                 &[0],
             );
-            let node_schema = reindex_output_schema(&in_schema, &[1u16], &[]);
+            let node_schema = reindex_output_schema(&in_schema, &[1u16], &[], &[0, 1]);
             assert_eq!(node_schema.columns[0].type_code, want_tc, "key {key_tc} → PK type");
             assert_eq!(node_schema.pk_stride(), want_stride, "key {key_tc} → pk_stride");
         }
@@ -1498,7 +1498,7 @@ mod tests {
             ],
             &[0],
         );
-        let out = reindex_output_schema(&in_schema, &[1u16, 2u16], &[]);
+        let out = reindex_output_schema(&in_schema, &[1u16, 2u16], &[], &[0, 1, 2]);
         assert_eq!(out.pk_indices(), &[0, 1], "2-slot compound PK");
         assert_eq!(out.columns[0].type_code, type_code::I32, "slot0 keeps I32 native width");
         assert_eq!(out.columns[1].type_code, type_code::U128, "slot1 U128");
@@ -1525,10 +1525,33 @@ mod tests {
             ],
             &[0],
         );
-        let out = reindex_output_schema(&in_schema, &[1u16, 2u16], &[type_code::I64, 0]);
+        let out = reindex_output_schema(&in_schema, &[1u16, 2u16], &[type_code::I64, 0], &[0, 1, 2]);
         assert_eq!(out.columns[0].type_code, type_code::I64, "slot0 carried T = I64");
         assert_eq!(out.columns[1].type_code, type_code::I64, "slot1 self-derives I64");
         assert_eq!(out.pk_stride(), 8 + 8, "both slots 8 bytes after promotion");
+    }
+
+    /// `payload_cols` places exactly the listed source columns (in order) behind
+    /// the synthetic PK slots — the dead-column-eliding equi-join layout.
+    #[test]
+    fn test_reindex_output_schema_payload_prune() {
+        // in_schema: [U64 pk, I32, U128, I16]; reindex on col1; keep payload {0, 3}.
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I32, 0),
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::I16, 0),
+            ],
+            &[0],
+        );
+        let out = reindex_output_schema(&in_schema, &[1u16], &[], &[0u16, 3u16]);
+        assert_eq!(out.pk_indices(), &[0], "single synthetic PK slot");
+        assert_eq!(out.columns[0].type_code, type_code::I32, "PK slot = reindex col1 (I32)");
+        // Only the two kept payload columns follow — not all four input columns.
+        assert_eq!(out.num_columns(), 1 + 2, "1 PK + 2 kept payload");
+        assert_eq!(out.columns[1].type_code, type_code::U64, "kept payload col 0");
+        assert_eq!(out.columns[2].type_code, type_code::I16, "kept payload col 3");
     }
 
     /// A compound (len > 1) reindex Map now compiles end-to-end: the gate is
@@ -1564,7 +1587,7 @@ mod tests {
         );
         // The sink validates against the reindex Map's output schema (2 synthetic
         // PK slots [U64, I64] + the two input columns).
-        loaded.out_schema = reindex_output_schema(&in_schema, &[0u16, 1u16], &[]);
+        loaded.out_schema = reindex_output_schema(&in_schema, &[0u16, 1u16], &[], &[0, 1]);
         let ext = [ExternalTable {
             table_id: 99,
             schema: in_schema,
@@ -1612,6 +1635,85 @@ mod tests {
         let ordered = loaded.ordered.clone();
         let result = build_plan(&loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, &[], vec![]);
         assert!(result.is_none(), "reindex list > MAX_PK_COLUMNS must fail the compile");
+    }
+
+    /// The reindex output payload schema is derived from the program's copy list:
+    /// a program that copies only a subset of the input columns compiles to the
+    /// pruned `[key slots ‖ kept columns]` layout end-to-end (`build_plan` returns
+    /// `Some` against a sink schema built from the same kept list).
+    #[test]
+    fn test_build_plan_pruned_reindex_compiles() {
+        // 3-column source; reindex on col0, program keeps only col 2 as payload.
+        let mut eb = gnitz_core::ExprBuilder::new();
+        eb.copy_col(type_code::I64 as u32, 2, 0);
+        let blob = eb.build(0).encode();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(
+            1,
+            gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
+                program: blob,
+                reindex_cols: vec![0],
+                reindex_target_tcs: vec![],
+            }),
+        );
+        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+        let mut loaded = make_loaded(nodes, edges);
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U32, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        loaded.out_schema = reindex_output_schema(&in_schema, &[0u16], &[], &[2]);
+        let ext = [ExternalTable {
+            table_id: 99,
+            schema: in_schema,
+        }];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(&loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, &[], vec![]);
+        assert!(result.is_some(), "pruned reindex must compile to the derived schema");
+    }
+
+    /// A reindex program copying an out-of-range source column is a corrupt/forged
+    /// catalog; `emit_node` must fail the compile cleanly (`build_plan` returns
+    /// None) rather than read a zeroed schema slot.
+    #[test]
+    fn test_build_plan_reindex_program_oob_col_rejected() {
+        // reindex on col0, program copies col 9 on a 2-column source.
+        let mut eb = gnitz_core::ExprBuilder::new();
+        eb.copy_col(type_code::U64 as u32, 9, 0);
+        let blob = eb.build(0).encode();
+        let mut nodes = HashMap::new();
+        nodes.insert(0, gnitz_wire::OpNode::ScanDelta(99));
+        nodes.insert(
+            1,
+            gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Expression {
+                program: blob,
+                reindex_cols: vec![0],
+                reindex_target_tcs: vec![],
+            }),
+        );
+        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
+        let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+        let loaded = make_loaded(nodes, edges);
+        let in_schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let ext = [ExternalTable {
+            table_id: 99,
+            schema: in_schema,
+        }];
+        let ordered = loaded.ordered.clone();
+        let result = build_plan(&loaded, &empty_rw(), &ordered, &ext, "", 0, 99, None, &[], vec![]);
+        assert!(result.is_none(), "out-of-range program copy must fail the compile");
     }
 
     // ── Item 29: scratch dir cleanup on compile failure ─────────────────────

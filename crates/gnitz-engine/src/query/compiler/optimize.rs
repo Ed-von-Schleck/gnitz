@@ -308,27 +308,33 @@ pub(super) fn build_map_output_schema(input: &SchemaDescriptor, src_indices: &[i
 }
 
 /// Build the full output schema of a reindex Map: the synthetic PK column(s)
-/// derived from `reindex_cols` (in key order), followed by every input column.
-/// Each PK slot's width is `gnitz_wire::resolve_reindex_type` — the carried
-/// cross-width promotion target `T_i` when non-zero, else the per-column default
-/// policy (a ≤8-byte integer key keeps its native width; everything else —
+/// derived from `reindex_cols` (in key order), followed by the kept payload
+/// columns. Each PK slot's width is `gnitz_wire::resolve_reindex_type` — the
+/// carried cross-width promotion target `T_i` when non-zero, else the per-column
+/// default policy (a ≤8-byte integer key keeps its native width; everything else —
 /// U128/UUID, the STRING/BLOB content hash, PK-ineligible floats — becomes U128).
 /// This is the same carried-or-derive rule the planner's `_join_pk` stamp uses,
 /// so the engine and catalog strides stay in lockstep. Narrowing is safe for
 /// every view: reindex traces are non-durable and re-derived from the source.
+///
+/// `payload_cols` places exactly `in_schema.columns[payload_cols[i]]` at payload
+/// slot `i` — the source columns the reindex program copies, derived from the
+/// program (and range-checked) by `emit_node`. A join side whose program skips a
+/// dead source column thus stops persisting it in the trace.
 pub(super) fn reindex_output_schema(
     in_schema: &SchemaDescriptor,
     reindex_cols: &[u16],
     target_tcs: &[u8],
+    payload_cols: &[u16],
 ) -> SchemaDescriptor {
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let pk_n = reindex_cols.len();
-    let n = in_schema.num_columns();
+    let payload_n = payload_cols.len();
     // Self-protecting: a future caller that skips `emit_node`'s guard would
-    // otherwise hit a bare slice OOB in the `cols[pk_n..pk_n + n]` copy below.
+    // otherwise hit a bare slice OOB in the `cols[pk_n + i]` writes below.
     assert!(
-        pk_n + n <= crate::schema::MAX_COLUMNS,
-        "reindex_output_schema: {pk_n} + {n} columns exceed MAX_COLUMNS ({})",
+        pk_n + payload_n <= crate::schema::MAX_COLUMNS,
+        "reindex_output_schema: {pk_n} + {payload_n} columns exceed MAX_COLUMNS ({})",
         crate::schema::MAX_COLUMNS,
     );
     for (i, &c) in reindex_cols.iter().enumerate() {
@@ -345,9 +351,11 @@ pub(super) fn reindex_output_schema(
         );
         cols[i] = SchemaColumn::new(out_tc, 0); // PK region: nullable = 0
     }
-    cols[pk_n..pk_n + n].copy_from_slice(&in_schema.columns[..n]);
+    for (i, &c) in payload_cols.iter().enumerate() {
+        cols[pk_n + i] = in_schema.columns[c as usize];
+    }
     let pk_idx: Vec<u32> = (0..pk_n as u32).collect();
-    SchemaDescriptor::new(&cols[..pk_n + n], &pk_idx)
+    SchemaDescriptor::new(&cols[..pk_n + payload_n], &pk_idx)
 }
 
 /// Determine the output type for an aggregate function.

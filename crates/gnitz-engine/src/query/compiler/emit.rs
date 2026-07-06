@@ -316,7 +316,7 @@ pub(super) fn emit_node(
                         return;
                     }
                     // The reindex output schema prepends `pk_n` synthetic PK
-                    // columns to every input column, written into a fixed
+                    // columns to the kept payload columns, written into a fixed
                     // [_; MAX_COLUMNS] / [_; MAX_PK_COLUMNS] array. A hand-assembled
                     // or planner-built list could exceed those bounds, or name a
                     // column >= num_columns() (which `columns[c]` would read as a
@@ -328,7 +328,6 @@ pub(super) fn emit_node(
                     // assert is the tripwire).
                     let pk_n = reindex_cols.len();
                     if pk_n > crate::schema::MAX_PK_COLUMNS
-                        || pk_n + in_reg_schema.num_columns() > crate::schema::MAX_COLUMNS
                         || reindex_cols.iter().any(|&c| c as usize >= in_reg_schema.num_columns())
                     {
                         state.emit_failed = true;
@@ -362,7 +361,34 @@ pub(super) fn emit_node(
                         return;
                     }
                     let node_schema = if !reindex_cols.is_empty() {
-                        reindex_output_schema(&in_reg_schema, reindex_cols, reindex_target_tcs)
+                        // The output payload is exactly what the program copies: a
+                        // reindex program is one `COPY_COL(tc, src, out)` per kept
+                        // payload column with dense outs `0..n` (the planner's
+                        // `build_reindex_program`), so the kept-column list is read
+                        // straight off the blob — the single source of truth, with no
+                        // separate wire list to drift out of sync. A program of any
+                        // other shape falls back to "all input columns" (the
+                        // pre-derivation structural assumption; the range-join
+                        // `nf_rekey` copies at an offset and lands here). An
+                        // out-of-range source column means a corrupt/forged catalog —
+                        // `columns[c]` would read a zeroed slot — so fail the compile.
+                        let prog = LogicalProgram::from_wire(&dep.code, dep.num_regs, 0, Vec::new());
+                        let n_in = in_reg_schema.num_columns();
+                        let payload_cols: Vec<u16> = match prog.payload_copy_srcs() {
+                            Some(srcs) => {
+                                if srcs.iter().any(|&c| c as usize >= n_in) {
+                                    state.emit_failed = true;
+                                    return;
+                                }
+                                srcs.iter().map(|&c| c as u16).collect()
+                            }
+                            None => (0..n_in as u16).collect(),
+                        };
+                        if pk_n + payload_cols.len() > crate::schema::MAX_COLUMNS {
+                            state.emit_failed = true;
+                            return;
+                        }
+                        reindex_output_schema(&in_reg_schema, reindex_cols, reindex_target_tcs, &payload_cols)
                     } else {
                         loaded.out_schema
                     };

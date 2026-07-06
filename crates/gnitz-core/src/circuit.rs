@@ -292,6 +292,12 @@ impl CircuitBuilder {
     /// type from the source column (the same-type / legacy path). Pass an empty
     /// slice (or all-zero) for a non-promoted reindex; the result is byte-identical
     /// to the pre-promotion serialization.
+    ///
+    /// The engine derives the node's output payload schema from `program`'s copy
+    /// list: a program that is one COPY_COL per payload column with dense outputs
+    /// `0..n` places exactly its source columns behind the key slots (so copying a
+    /// column subset prunes the payload); any other program shape gets all input
+    /// columns.
     pub fn map_reindex(
         &mut self,
         input: NodeId,

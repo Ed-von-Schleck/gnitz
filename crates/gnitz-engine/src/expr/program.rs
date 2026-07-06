@@ -564,6 +564,22 @@ impl LogicalProgram {
         self.instrs.len()
     }
 
+    /// If every instruction is `CopyCol` writing dense payload outputs
+    /// `out = [0, 1, 2, …]` (in instruction order), return the copies' source
+    /// columns — the program's payload copy list, from which `emit_node` derives
+    /// a reindex MAP's output payload schema. `None` for any other shape (a
+    /// compute instruction, or a permuted/offset destination).
+    pub(crate) fn payload_copy_srcs(&self) -> Option<Vec<u32>> {
+        self.instrs
+            .iter()
+            .enumerate()
+            .map(|(i, instr)| match *instr {
+                LogicalInstr::CopyCol { src_col, out, .. } if out == i as u32 => Some(src_col),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// If every instruction is `CopyCol` forming one contiguous block copy
     /// `src = [base, base+1, …]` → `out = [0, 1, 2, …]`, return `Some(base)`:
     /// the count of leading columns the program skips (the PK region a finalize
@@ -572,12 +588,9 @@ impl LogicalProgram {
     /// Both checks are load-bearing — sequential sources AND dense destinations;
     /// a permuted-destination program is a real permutation, not an identity.
     pub(crate) fn sequential_copy_base(&self) -> Option<usize> {
-        let LogicalInstr::CopyCol { src_col: base, .. } = *self.instrs.first()? else {
-            return None;
-        };
-        let ok = self.instrs.iter().enumerate().all(|(i, instr)| {
-            matches!(*instr, LogicalInstr::CopyCol { src_col, out, .. } if src_col == base + i as u32 && out == i as u32)
-        });
+        let srcs = self.payload_copy_srcs()?;
+        let &base = srcs.first()?;
+        let ok = srcs.iter().enumerate().all(|(i, &s)| s == base + i as u32);
         ok.then_some(base as usize)
     }
 

@@ -13,8 +13,8 @@ use crate::plan::validate::{
     reject_column_overflow, reject_duplicate_column_names, reject_unhonored_select_clauses, HonoredClauses,
 };
 use crate::plan::view::predicates::{
-    build_reindex_program, build_residual_filter_prog, converse_rel, extract_join_predicates, multi_null_filter_prog,
-    pure_range_m_output_cols, schema_type_codes, RangeConjunct,
+    build_reindex_program, build_reindex_program_keep, build_residual_filter_prog, converse_rel,
+    extract_join_predicates, multi_null_filter_prog, pure_range_m_output_cols, schema_type_codes, RangeConjunct,
 };
 use crate::plan::view::{EmitPieces, ViewChain};
 use gnitz_core::{
@@ -530,6 +530,115 @@ pub(crate) fn plan_join_chain(
     unreachable!("join-chain loop returns on the last (is_last) join")
 }
 
+/// The combined `[left ‖ right]` keep bitset for equi-join reindex-payload pruning:
+/// which source columns must survive into the reindex payload because a downstream
+/// consumer reads them. A column is kept iff referenced by
+///   1. the emit `projection` argument (a `Wildcard`/`tbl.*` — or any item that
+///      cannot be enumerated — marks everything, so `SELECT *` degenerates to the
+///      unpruned layout);
+///   2. a residual-ON conjunct (INNER) or a top-level WHERE conjunct (OUTER); or
+///   3. — on a preserved outer side — a nullable join-key component. The packed
+///      key is not injective across `{NULL, real 0}`, so a NULL-keyed preserved
+///      row (true S = 0) and a 0-keyed row (S from matches) would coarsen to one ν
+///      identity if the key's null-bit-carrying payload copy were dropped; keeping
+///      the nullable components restores the split. Only the *nullable* components
+///      are needed — a non-nullable component packs injectively.
+///
+/// Join keys are otherwise not auto-kept: they live in the PK slots, and a payload
+/// copy exists only if a rule above references them. Resolution reuses the same
+/// `resolve_*` helpers the residual/projection binders use, against the UNPRUNED
+/// `alias_map`, so a keep-set and its later binding never disagree; a resolution
+/// error is the identical error those binders would raise.
+fn equi_keep_combined(projection: &[SelectItem], j: &LoweredJoin) -> Result<Vec<bool>, GnitzSqlError> {
+    let (left_n, right_n) = (j.left_schema.columns.len(), j.right_schema.columns.len());
+    let resolve = |qual: Option<&str>, name: &str| -> Result<usize, GnitzSqlError> {
+        match qual {
+            Some(q) => resolve_qualified_column(q, name, &j.alias_map),
+            None => resolve_unqualified_column(name, &j.alias_map),
+        }
+    };
+    let mut keep = vec![false; left_n + right_n];
+
+    // Rule 1: projection.
+    let mut proj_refs: Vec<(Option<&str>, &str)> = Vec::new();
+    if collect_projection_column_refs(projection, &mut proj_refs) {
+        for (qual, name) in &proj_refs {
+            keep[resolve(*qual, name)?] = true;
+        }
+    } else {
+        // A wildcard references everything — nothing to prune.
+        return Ok(vec![true; left_n + right_n]);
+    }
+
+    // Rule 2: residual ON + top-level WHERE conjuncts.
+    let mut post_refs: Vec<(Option<&str>, &str)> = Vec::new();
+    for e in j.residual.iter().chain(&j.where_filter) {
+        collect_column_refs(e, &mut post_refs);
+    }
+    for (qual, name) in &post_refs {
+        keep[resolve(*qual, name)?] = true;
+    }
+
+    // Rule 3: preserved side's nullable join-key components.
+    if j.join_type.preserves_left() {
+        for &c in &j.left_join_cols {
+            if j.left_schema.columns[c].is_nullable {
+                keep[c] = true;
+            }
+        }
+    }
+    if j.join_type.preserves_right() {
+        for &c in &j.right_join_cols {
+            if j.right_schema.columns[c].is_nullable {
+                keep[left_n + c] = true;
+            }
+        }
+    }
+    Ok(keep)
+}
+
+/// A schema pruned to its `keep` columns (ascending source order), payload-only —
+/// `pk_cols` is dropped (empty), since the pruned schema drives output-layout
+/// derivation and name resolution, never a PK region.
+fn prune_schema(schema: &Schema, keep: &[usize]) -> Schema {
+    Schema {
+        columns: keep.iter().map(|&i| schema.columns[i].clone()).collect(),
+        pk_cols: Vec::new(),
+    }
+}
+
+/// Rebuild the join `alias_map` onto the pruned `[pruned_left ‖ pruned_right]`
+/// layout. Per-alias — a chain segment's left side carries several original
+/// aliases at distinct offsets, so collapsing them all to `{0, pl}` would alias
+/// their column spaces and silently misresolve a later reference. Each alias keeps
+/// only its kept columns (name resolution reads `.columns` by name, so a dropped
+/// column is simply absent) and moves to its offset within the pruned layout =
+/// the count of kept columns before its span, on its own side. `keep` is the
+/// EFFECTIVE combined bitset (post dummy-column), so the offsets it yields match
+/// the physical pruned widths.
+fn prune_alias_map(alias_map: &AliasMap, keep: &[bool], left_n: usize) -> AliasMap {
+    let pl = keep[..left_n].iter().filter(|&&b| b).count();
+    let mut out = AliasMap::with_capacity(alias_map.len());
+    for (alias, rel) in alias_map {
+        let base = rel.col_offset;
+        let kept: Vec<usize> = (0..rel.schema.columns.len()).filter(|j| keep[base + j]).collect();
+        let new_offset = if base < left_n {
+            keep[..base].iter().filter(|&&b| b).count()
+        } else {
+            pl + keep[left_n..base].iter().filter(|&&b| b).count()
+        };
+        out.insert(
+            alias.clone(),
+            ResolvedRelation {
+                table_id: rel.table_id,
+                schema: Rc::new(prune_schema(&rel.schema, &kept)),
+                col_offset: new_offset,
+            },
+        );
+    }
+    out
+}
+
 /// Emit a join view's circuit (equi or range/band, INNER or outer) from its
 /// resolved `LoweredJoin`, returning `(circuit, output_columns, pk_cols)`.
 /// `view_id` is pre-allocated so a chain's downstream segment can reference this
@@ -568,6 +677,16 @@ fn emit_join(
         return emit_range_join(view_id, projection, check_dup_names, &lowered, range);
     }
 
+    // ── Reindex-payload pruning. Keep only the source columns a downstream
+    // consumer reads — the emit `projection` PARAMETER (a chain's synthetic segment
+    // projection, not the user SELECT), the residual/WHERE, and the preserved-side
+    // nullable keys — so a dead column stops flowing through the reindex MAP and
+    // persisting in the join trace. The engine derives the reindex output schema
+    // from the program's copy list, so pruning is entirely a matter of which
+    // columns the reindex programs copy. `SELECT *` marks everything, so the
+    // pruned circuit is identical to the unpruned one.
+    let mut keep = equi_keep_combined(projection, &lowered)?;
+
     let LoweredJoin {
         left_tid,
         right_tid,
@@ -592,18 +711,37 @@ fn emit_join(
     let left_target_tcs = side_target_tcs(&left_join_cols, &left_schema, &target_tcs);
     let right_target_tcs = side_target_tcs(&right_join_cols, &right_schema, &target_tcs);
 
-    // The merged join output is [k _join_pk cols, left cols..., right cols...].
-    reject_column_overflow(
-        "JOIN view output",
-        k + left_schema.columns.len() + right_schema.columns.len(),
-    )?;
-
-    // Build circuit. Each side's reindex program copies all columns as payload and
-    // reindexes by the join key; it is a pure function of the schema, so it is built
-    // fresh at each `map_reindex` site (the inner reindex and, for an outer null-fill,
-    // the `a_all`/`b_all` re-key of the unfiltered input).
     let left_n = left_schema.columns.len();
     let right_n = right_schema.columns.len();
+
+    // A side that keeps nothing still retains source column 0: a zero-payload
+    // batch is an unexercised shape across the storage stack, and the dead column
+    // is dropped by the final projection anyway.
+    if left_n > 0 && !keep[..left_n].iter().any(|&b| b) {
+        keep[0] = true;
+    }
+    if right_n > 0 && !keep[left_n..].iter().any(|&b| b) {
+        keep[left_n] = true;
+    }
+    // Kept source indices (ascending) and the pruned side widths. The pruned
+    // schemas describe the reindex OUTPUT payloads (the reindex INPUT stays the
+    // full source); the pruned alias map re-offsets per alias — a chain segment's
+    // left side carries several aliases at distinct offsets. The unpruned map has
+    // no further reader, so shadow it. Reindex programs are built fresh at each
+    // `map_reindex` site (the inner reindex and, for an outer null-fill, the
+    // `a_all`/`b_all` re-key of the unfiltered input) from the SAME keep list, so
+    // `p_all` and `π_P(inner)` carry byte-identical rows and the null-fill
+    // cancellation is unaffected.
+    let keep_l: Vec<usize> = (0..left_n).filter(|&i| keep[i]).collect();
+    let keep_r: Vec<usize> = (0..right_n).filter(|&i| keep[left_n + i]).collect();
+    let pl = keep_l.len();
+    let pr = keep_r.len();
+    let pruned_left_schema = prune_schema(&left_schema, &keep_l);
+    let pruned_right_schema = prune_schema(&right_schema, &keep_r);
+    let alias_map = prune_alias_map(&alias_map, &keep, left_n);
+
+    // The merged join output is [k _join_pk cols, kept-left cols..., kept-right cols...].
+    reject_column_overflow("JOIN view output", k + pl + pr)?;
 
     // A NULL equi-join key must match nothing (SQL 3VL: NULL = anything, including
     // NULL = NULL, is unknown). map_reindex would promote a NULL integer key to
@@ -634,7 +772,7 @@ fn emit_join(
         input_b_match,
         &right_join_cols,
         &right_target_tcs,
-        build_reindex_program(&right_schema),
+        build_reindex_program_keep(&right_schema, &keep_r),
     );
 
     // Preserved (left) side. A left row with any NULL key component matches nothing
@@ -656,7 +794,7 @@ fn emit_join(
         input_a_match,
         &left_join_cols,
         &left_target_tcs,
-        build_reindex_program(&left_schema),
+        build_reindex_program_keep(&left_schema, &keep_l),
     );
 
     let trace_a = cb.integrate_trace(reindex_a);
@@ -664,8 +802,9 @@ fn emit_join(
     let join_ab = cb.join_with_trace_node(reindex_a, trace_b); // ΔA ⋈ z^{-1}(I(B))
     let join_ba = cb.join_with_trace_node(reindex_b, trace_a); // ΔB ⋈ z^{-1}(I(A))
 
-    // Normalize both terms onto [PK cols, A cols, B cols] and union them.
-    let inner_merged = normalize_to_ab(&mut cb, join_ab, join_ba, k, left_n, right_n);
+    // Normalize both terms onto [PK cols, kept-A cols, kept-B cols] and union them
+    // (widths are the PRUNED payloads `pl`/`pr`).
+    let inner_merged = normalize_to_ab(&mut cb, join_ab, join_ba, k, pl, pr);
 
     let merged = if join_type == JoinType::Inner {
         inner_merged
@@ -701,7 +840,8 @@ fn emit_join(
             if preserved_is_left {
                 ext // [_join_pk, A, NULL-B] — canonical
             } else {
-                let reorder: Vec<usize> = (k + right_n..k + right_n + left_n).chain(k..k + right_n).collect();
+                // Pruned widths: appended NULL-A (pl cols) after B (pr cols).
+                let reorder: Vec<usize> = (k + pr..k + pr + pl).chain(k..k + pr).collect();
                 cb.map(ext, &reorder) // [_join_pk, B, NULL-A] ⇒ [_join_pk, NULL-A, B]
             }
         };
@@ -722,23 +862,23 @@ fn emit_join(
                     input_a_raw,
                     &left_join_cols,
                     &left_target_tcs,
-                    build_reindex_program(&left_schema),
+                    build_reindex_program_keep(&left_schema, &keep_l),
                 )
             } else {
                 reindex_a
             };
-            let nf_a = equi_nf(&mut cb, a_all, k, left_n, &schema_type_codes(&right_schema), true);
+            let nf_a = equi_nf(&mut cb, a_all, k, pl, &schema_type_codes(&pruned_right_schema), true);
             merged = cb.union(nf_a, merged);
         }
-        // ν_B (preserved right): `b_all` re-keys the unfiltered right input; B sits at
-        // `k + left_n` in `inner_merged`.
+        // ν_B (preserved right): `b_all` re-keys the unfiltered right input; kept-B sits
+        // at `k + pl` in `inner_merged`.
         if join_type.preserves_right() {
             let b_all = if right_key_nullable {
                 cb.map_reindex(
                     input_b_raw,
                     &right_join_cols,
                     &right_target_tcs,
-                    build_reindex_program(&right_schema),
+                    build_reindex_program_keep(&right_schema, &keep_r),
                 )
             } else {
                 reindex_b
@@ -746,9 +886,9 @@ fn emit_join(
             let nf_b = equi_nf(
                 &mut cb,
                 b_all,
-                k + left_n,
-                right_n,
-                &schema_type_codes(&left_schema),
+                k + pl,
+                pr,
+                &schema_type_codes(&pruned_left_schema),
                 false,
             );
             merged = cb.union(nf_b, merged);
@@ -756,12 +896,12 @@ fn emit_join(
         merged
     };
 
-    // Build virtual combined output schema: k synthetic join PK cols + all left cols
-    // + all right cols. After proj_ab/proj_ba, the UNION output has this layout (union
-    // col indices):
+    // Build virtual combined output schema: k synthetic join PK cols + kept left
+    // cols + kept right cols. After proj_ab/proj_ba, the UNION output has this layout
+    // (union col indices):
     //   col 0..k: _join_pk[_i] (PK region, one slot per key pair)
-    //   col k..k+left_n: all A columns (in A schema order)
-    //   col k+left_n..k+left_n+right_n: all B columns (in B schema order)
+    //   col k..k+pl: kept A columns (in A schema order)
+    //   col k+pl..k+pl+pr: kept B columns (in B schema order)
     //
     // Each synthetic PK column's type is the pair's `join_key_common_type` `T_i`
     // (returned by validate_join_key_pair): the single persisted stride that both
@@ -783,9 +923,14 @@ fn emit_join(
         // reindex Maps and every cross-process consumer re-derive.
         out_cols.push(ColumnDef::new(name, t, false));
     }
-    // The A‖B payload with outer nullability applied; the `_join_pk` columns above
-    // stay non-nullable (a NULL key packs to the synthetic 0, never a NULL PK).
-    out_cols.extend(combined_payload_coldefs(&left_schema, &right_schema, join_type));
+    // The kept-A‖kept-B payload with outer nullability applied; the `_join_pk`
+    // columns above stay non-nullable (a NULL key packs to the synthetic 0, never a
+    // NULL PK).
+    out_cols.extend(combined_payload_coldefs(
+        &pruned_left_schema,
+        &pruned_right_schema,
+        join_type,
+    ));
 
     // One linear filter over the normalized join output `merged` ([_join_pk × k, A, B])
     // before projection/sink, bound against `out_cols` (which carries each column's real
@@ -809,23 +954,25 @@ fn emit_join(
     };
 
     // Compute the user projection + view schema via the shared join-projection
-    // helper. A lone `SELECT *` flows through its Wildcard arm and stays identity
-    // (the projection map is then skipped below), so no wildcard fast path here.
+    // helper, resolving against the PRUNED alias map / combined width (`pl + pr`) so
+    // every reference lands on its physical column in the pruned layout. A lone
+    // `SELECT *` flows through its Wildcard arm and stays identity (the projection
+    // map is then skipped below), so no wildcard fast path here.
     let is_wildcard = is_wildcard_projection(projection);
     let (final_cols, final_projection) = build_join_view_projection(
         projection,
         &alias_map,
         &out_cols[..k],
-        left_n + right_n,
+        pl + pr,
         k,
         |idx| out_cols[k + idx].clone(),
         "JOIN view",
     )?;
 
     // Apply final column projection before sink when not identity.
-    // Identity = selecting all left+right cols in canonical order [k..k+left_n+right_n].
+    // Identity = selecting all kept left+right cols in canonical order [k..k+pl+pr].
     let is_identity =
-        final_projection.len() == left_n + right_n && final_projection.iter().enumerate().all(|(i, &p)| p == i + k);
+        final_projection.len() == pl + pr && final_projection.iter().enumerate().all(|(i, &p)| p == i + k);
     let sink_input = if is_identity {
         merged
     } else {
@@ -1021,12 +1168,14 @@ fn emit_range_join(
         input_a,
         &left_reindex_cols,
         &left_target_tcs,
+        
         build_reindex_program(left_schema),
     );
     let reindex_b = cb.map_reindex(
         input_b_match,
         &right_reindex_cols,
         &right_target_tcs,
+        
         build_reindex_program(right_schema),
     );
 
@@ -1093,7 +1242,13 @@ fn emit_range_join(
         pair_pk_cols.push(k + left_n + b_pk);
     }
     let zero_tcs = vec![0u8; pair_pk];
-    let rekey = cb.map_reindex(merged, &pair_pk_cols, &zero_tcs, build_reindex_program(&union_schema));
+    let rekey = cb.map_reindex(
+        merged,
+        &pair_pk_cols,
+        &zero_tcs,
+        
+        build_reindex_program(&union_schema),
+    );
 
     // Re-key output layout: `[_pair_pk × pair_pk (PK), _join_pk × k, A cols, B cols]`.
     // The user projection drops the k `_join_pk` slots (they DIFFER per term and
@@ -1259,8 +1414,13 @@ fn emit_range_join(
                     input_a_raw,
                     Some(multi_null_filter_prog(&left_reindex_cols, left_schema, true)?),
                 );
-                let anull_keyed =
-                    cb.map_reindex(anull, &left_schema.pk_cols, &zero_a, build_reindex_program(left_schema));
+                let anull_keyed = cb.map_reindex(
+                    anull,
+                    &left_schema.pk_cols,
+                    &zero_a,
+                    
+                    build_reindex_program(left_schema),
+                );
                 let anull_owned = cb.partition_filter(anull_keyed);
                 cb.union(nf_match, anull_owned)
             } else {
@@ -1286,6 +1446,7 @@ fn emit_range_join(
                     merged,
                     &pair_pk_cols[..pa],
                     &zero_a,
+                    
                     build_reindex_program(&union_schema),
                 );
                 let proj_a = cb.map(rekey_a, &(pa + k..pa + k + left_n).collect::<Vec<_>>()); // π_A(inner)
@@ -1293,6 +1454,7 @@ fn emit_range_join(
                     input_a_raw,
                     &left_schema.pk_cols,
                     &zero_a,
+                    
                     build_reindex_program(left_schema),
                 );
                 let nu_a = cb.positive_diff(a_all, proj_a); // max(0, A − π_A(inner)), keyed [a.pk, A]
@@ -1304,6 +1466,7 @@ fn emit_range_join(
                     merged,
                     &pair_pk_cols[pa..],
                     &zero_b,
+                    
                     build_reindex_program(&union_schema),
                 );
                 let proj_b = cb.map(
@@ -1314,6 +1477,7 @@ fn emit_range_join(
                     input_b_raw,
                     &right_schema.pk_cols,
                     &zero_b,
+                    
                     build_reindex_program(right_schema),
                 );
                 let nu_b = cb.positive_diff(b_all, proj_b); // max(0, B − π_B(inner)), keyed [b.pk, B]
@@ -1551,4 +1715,75 @@ pub(crate) fn build_join_view_projection(
         }
     }
     Ok((cols, proj))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str) -> ColumnDef {
+        ColumnDef::new(name, TypeCode::I64, false)
+    }
+    fn sch(names: &[&str]) -> Rc<Schema> {
+        Rc::new(Schema {
+            columns: names.iter().map(|n| col(n)).collect(),
+            pk_cols: Vec::new(),
+        })
+    }
+    fn rel(tid: u64, schema: Rc<Schema>, col_offset: usize) -> ResolvedRelation {
+        ResolvedRelation {
+            table_id: tid,
+            schema,
+            col_offset,
+        }
+    }
+
+    /// Chain regression: a 3-way chain's left accumulator carries several original
+    /// aliases at distinct offsets, so `prune_alias_map` must recompute each alias's
+    /// offset from the count of kept columns before its span — not collapse all
+    /// left-side aliases to `{0, pl}`, which would silently alias `a.x` and `b.m`
+    /// onto the same physical column.
+    #[test]
+    fn prune_alias_map_recomputes_per_alias_offsets() {
+        // Accumulator layout: [_join_pk(0), a.x(1), b.m(2), b.n(3)] (left_n = 4);
+        // right relation c.z at combined index 4.
+        let mut am = AliasMap::new();
+        am.insert("a".to_string(), rel(10, sch(&["x"]), 1));
+        am.insert("b".to_string(), rel(10, sch(&["m", "n"]), 2));
+        am.insert("c".to_string(), rel(20, sch(&["z"]), 4));
+        let left_n = 4;
+        // Kept: a.x(1), b.m(2), c.z(4). Dropped: _join_pk(0), b.n(3).
+        let keep = vec![false, true, true, false, true];
+        let pl = keep[..left_n].iter().filter(|&&b| b).count(); // 2
+        let pruned = prune_alias_map(&am, &keep, left_n);
+
+        // Each surviving column resolves to its physical index in the pruned layout
+        // [a.x, b.m, c.z] behind the k PK slots.
+        assert_eq!(resolve_qualified_column("a", "x", &pruned).unwrap(), 0);
+        assert_eq!(resolve_qualified_column("b", "m", &pruned).unwrap(), 1);
+        assert_eq!(resolve_qualified_column("c", "z", &pruned).unwrap(), pl); // 2
+                                                                              // The dropped column is absent from its alias's pruned schema.
+        assert!(resolve_qualified_column("b", "n", &pruned).is_err());
+    }
+
+    /// A 2-way join degenerates to the `{0, pl}` layout: left alias at 0, right at
+    /// `pl`. With a fully-kept left and a partly-pruned right, offsets and pruned
+    /// schemas track the kept columns.
+    #[test]
+    fn prune_alias_map_two_way_offsets() {
+        // left a=[p, q] (offsets 0,1); right b=[r, s, t] (offsets 2,3,4). left_n = 2.
+        let mut am = AliasMap::new();
+        am.insert("a".to_string(), rel(1, sch(&["p", "q"]), 0));
+        am.insert("b".to_string(), rel(2, sch(&["r", "s", "t"]), 2));
+        let left_n = 2;
+        // Keep all of a; from b keep only s (idx 3). Dropped: r(2), t(4).
+        let keep = vec![true, true, false, true, false];
+        let pl = 2;
+        let pruned = prune_alias_map(&am, &keep, left_n);
+        assert_eq!(resolve_qualified_column("a", "p", &pruned).unwrap(), 0);
+        assert_eq!(resolve_qualified_column("a", "q", &pruned).unwrap(), 1);
+        assert_eq!(resolve_qualified_column("b", "s", &pruned).unwrap(), pl); // 2
+        assert!(resolve_qualified_column("b", "r", &pruned).is_err());
+        assert!(resolve_qualified_column("b", "t", &pruned).is_err());
+    }
 }

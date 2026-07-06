@@ -78,16 +78,28 @@ pub(crate) fn multi_null_filter_prog(
     compile_bound_expr_to_program(&expr, schema)
 }
 
-/// Build a reindex ExprProgram that copies all columns as payload. Arity-
-/// independent: it copies every source column to payload offsets `0..n`, and
-/// `reindex_output_schema` places those payload columns at physical indices
-/// `k..k+n` regardless of the key arity `k` (the `k` PK slots precede them), so
-/// the payload offsets never shift with the number of key columns.
+/// Build a reindex ExprProgram that copies all columns as payload — the unpruned
+/// identity. Arity-independent: it copies every source column to payload offsets
+/// `0..n`, and `reindex_output_schema` places those payload columns at physical
+/// indices `k..k+n` regardless of the key arity `k` (the `k` PK slots precede
+/// them), so the payload offsets never shift with the number of key columns.
 pub(crate) fn build_reindex_program(schema: &Schema) -> gnitz_core::ExprProgram {
+    build_reindex_program_keep(schema, &(0..schema.columns.len()).collect::<Vec<_>>())
+}
+
+/// Build a reindex ExprProgram that copies only the `keep` source columns (in
+/// order) into payload offsets `0..keep.len()`. A source column the view never
+/// reads is simply not copied, so it never flows through the reindex MAP or
+/// persists in the join trace: the engine derives the reindex output payload
+/// schema from this program's copy list (placing the kept columns at physical
+/// indices `k..k+keep.len()` behind the `k` PK slots), so the program is the
+/// single source of truth for the pruned layout. Passing `0..n` reproduces the
+/// unpruned identity byte-for-byte.
+pub(crate) fn build_reindex_program_keep(schema: &Schema, keep: &[usize]) -> gnitz_core::ExprProgram {
     let mut eb = ExprBuilder::new();
-    for (ci, col) in schema.columns.iter().enumerate() {
-        let tc = col.type_code as u32;
-        eb.copy_col(tc, ci as u32, ci as u32);
+    for (out_pos, &ci) in keep.iter().enumerate() {
+        let tc = schema.columns[ci].type_code as u32;
+        eb.copy_col(tc, ci as u32, out_pos as u32);
     }
     eb.build(0) // result_reg unused — COPY_COL writes directly
 }
