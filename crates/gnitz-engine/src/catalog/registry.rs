@@ -292,6 +292,38 @@ impl CatalogEngine {
         new
     }
 
+    /// Durably advance the checkpoint generation by one **at recovery start**,
+    /// WITHOUT publishing it to `worker_ctx`. The non-windowed recovery resets the
+    /// SAL before its master-driven tick sweep, so a crash after the child boot
+    /// flush + reset but before `boot_checkpoint`'s own gen bump would otherwise
+    /// leave base = `G + tail` durable while every un-checkpointed view is cleanly
+    /// stamped `G` (→ silently resumed as stale) with the SAL already consumed.
+    /// Advancing the durable `_sequences` generation from the recovered `G` to
+    /// `G+1` here means any crash from now until `boot_checkpoint` leaves durable
+    /// gen ≥ `G+1` while those views are stamped `G`, so the per-partition
+    /// generation verdict forces a full rebuild. Every crash window is covered:
+    /// windows inside `boot_checkpoint` by its own gen bump before the ephemeral
+    /// stamp, the reset→boot_checkpoint gap by this one.
+    ///
+    /// `worker_ctx::committed_generation()` is left at `G` on purpose: the resume
+    /// load (`Table::new`) and the boot verdict both compare view manifests
+    /// against `G`, so a clean restart still resumes. `self.committed_generation`
+    /// IS advanced to `G+1` so `boot_checkpoint`'s `bump_checkpoint_generation`
+    /// retracts `G+1` (not `G`) and stamps the resumed+rebuilt views at `G+2`,
+    /// keeping `_sequences` clean (each generation row nets to zero but the latest).
+    ///
+    /// Monotonic, so recovery reads it back through `recover_sequences`' `.max()`
+    /// arm — no toggle, no stuck-dirty residue in the no-unique-PK `_sequences`.
+    pub fn recovery_start_generation_bump(&mut self) -> Result<(), String> {
+        let g = self.committed_generation;
+        // On a fresh DB `g == 0` and the retract of a non-existent `(4, 0)` row
+        // nets to zero (seed-on-first-use), leaving exactly `(4, 1)`.
+        self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, g as i64, (g + 1) as i64);
+        self.committed_generation = g + 1;
+        // Durable before the SAL reset that follows discards the memtable copy.
+        self.flush_all_system_tables()
+    }
+
     /// Record the cluster topology (`worker_count << 32 | STATE_FORMAT`) in
     /// `_sequences` (seq id 5). Idempotent: a same-topology restart already
     /// holds the current value, so the write is skipped. Does not flush — the

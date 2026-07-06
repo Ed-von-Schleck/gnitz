@@ -107,6 +107,25 @@ tick loop across the ephemeral round so no tick runs during the view flush.
 Graceful shutdown sends one **Shutdown** Barrier, which both forces the full
 sequence for its batch and resolves only at sequence end.
 
+**Recovery ordering** (`server_main`, pre-reactor). Boot recovers in a fixed
+order so a crash at any point rebuilds rather than silently resumes stale views:
+(1) master opens the catalog + replays system-table DDL; (2) master computes the
+per-view resume verdict (`compute_invalid_views`) and does the **recovery-start
+generation bump** (durable `G → G+1`, without publishing to `worker_ctx`), both
+pre-fork; (3) each forked worker rebuilds indexes, replays the SAL push tail
+(buffering each view-feeding base's effective delta into `pending_deltas`), and
+**boot-flushes** the replayed base rows durable; (4) master collects readiness
+ACKs and **resets the SAL**; (5) master **tick sweep** — one `drain_tick_blocking`
+per reachable base drains `pending_deltas` into every view (resumed views extended
+state-exactly, invalid views polluted); (6) master **rebuilds** only the invalid
+views — each worker resets its own output partitions + operator scratch on the
+first backfill command, then `fan_out_backfill(vid, src)` refills; (7)
+`boot_checkpoint` bumps `G+1 → G+2` and durably checkpoints the resumed+rebuilt
+state. The monotonic generation is the crash-window guard: the recovery-start bump
+covers the reset→boot_checkpoint gap (durable gen ≥ `G+1` while un-checkpointed
+views are stamped `G` ⇒ forced rebuild), and the committer's step-0 bump covers a
+steady-state checkpoint crash.
+
 **SAL-writer mutex** — `sal_writer_excl: Rc<AsyncMutex<()>>` serialises
 tick, commit, DDL, relay, and all read-only fan-out SAL emissions (seek,
 scan, pipeline checks, unique-filter warmup). Non-reentrant: holders must not

@@ -243,10 +243,37 @@ impl Table {
         // Try to set NOCOW (btrfs; silently ignored on other fs)
         set_nocow_dir(&dir_c);
 
-        // Rederived tables erase stale shards (prefix-matched) and start empty.
-        if recovery_source != RecoverySource::SalReplay {
-            erase_stale_shards(dir, table_id);
-        }
+        // Decide the open action per recovery source:
+        //   SalReplay            → always load the manifest.
+        //   Rederive             → always erase stale shards and start empty.
+        //   RederiveCheckpointed → load only when the manifest's checkpoint
+        //     generation equals the committed generation; otherwise erase the
+        //     shards *and* unlink the manifest so a later re-open cannot re-peek
+        //     a stale `== g` manifest.
+        //
+        // NOTE for future tests: a `RederiveCheckpointed` table force-flushed at
+        // generation 0 (the default `committed_generation()`), then re-opened,
+        // will *load* (peek `Some(0)` == committed `0`). Table unit tests that
+        // want a guaranteed-empty open use `Rederive`, not `RederiveCheckpointed`.
+        let load_shards = match recovery_source {
+            RecoverySource::SalReplay => true,
+            RecoverySource::Rederive => {
+                erase_stale_shards(dir, table_id);
+                false
+            }
+            RecoverySource::RederiveCheckpointed => {
+                let g = crate::foundation::worker_ctx::committed_generation();
+                let manifest_path = format!("{dir}/manifest.bin");
+                let cpath = std::ffi::CString::new(manifest_path.clone()).map_err(|_| StorageError::InvalidPath)?;
+                if super::manifest::peek_generation(&cpath)? == Some(g) {
+                    true
+                } else {
+                    erase_stale_shards(dir, table_id);
+                    let _ = std::fs::remove_file(&manifest_path);
+                    false
+                }
+            }
+        };
 
         let memtable = MemTable::new(schema, arena_size as usize);
         let shard_index = ShardIndex::new(table_id, dir, schema);
@@ -267,7 +294,7 @@ impl Table {
             inmem_ceiling_override: None,
         };
 
-        if recovery_source == RecoverySource::SalReplay {
+        if load_shards {
             table.shard_index.load_manifest(&table.manifest_full_path())?;
             table.shard_index.gc_orphans();
             table.current_lsn = table.shard_index.max_lsn() + 1;
@@ -2198,6 +2225,60 @@ mod tests {
             read_generation(&manifest_path),
             0x2222,
             "later republish re-stamps the newer generation",
+        );
+
+        worker_ctx::set_test_gen_override(None);
+    }
+
+    /// `Table::new`'s `RederiveCheckpointed` open decision: a manifest whose
+    /// generation matches `committed_generation()` loads its shards; a mismatch
+    /// (or absence) erases the shards and unlinks the manifest. The manifest is
+    /// produced by an ordinary `SalReplay` flush — the reload decision keys only
+    /// off the stamped generation, which is identical however the manifest was
+    /// published.
+    #[test]
+    fn rederive_checkpointed_conditional_load() {
+        use crate::foundation::worker_ctx;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("cond_load");
+        let schema = make_u64_i64_schema();
+        let manifest_path = tdir.join("manifest.bin");
+
+        // Publish a durable shard + manifest stamped at generation 7.
+        worker_ctx::set_test_gen_override(Some(7));
+        {
+            let mut t = new_table(&tdir, schema, 7910, 128, RecoverySource::SalReplay);
+            t.ingest_owned_batch(make_batch(&[(1, 1, 1), (2, 1, 1)])).unwrap();
+            assert!(t.flush().unwrap(), "SalReplay flush publishes a manifest");
+            t.close();
+        }
+        assert!(manifest_path.exists(), "manifest published at generation 7");
+
+        // Matching generation ⇒ shards load, rows present.
+        {
+            let mut t = new_table(&tdir, schema, 7910, 128, RecoverySource::RederiveCheckpointed);
+            assert!(
+                t.has_pk(1) && t.has_pk(2),
+                "matching-generation reopen must load the checkpointed shards"
+            );
+            t.close();
+        }
+        assert!(manifest_path.exists(), "matching reopen leaves the manifest in place");
+
+        // Mismatched generation ⇒ shards erased, manifest unlinked.
+        worker_ctx::set_test_gen_override(Some(8));
+        {
+            let mut t = new_table(&tdir, schema, 7910, 128, RecoverySource::RederiveCheckpointed);
+            assert!(
+                !t.has_pk(1) && !t.has_pk(2),
+                "mismatched-generation reopen must erase the stale shards"
+            );
+            t.close();
+        }
+        assert!(
+            !manifest_path.exists(),
+            "mismatched-generation reopen must unlink manifest.bin so a re-open cannot re-peek it"
         );
 
         worker_ctx::set_test_gen_override(None);

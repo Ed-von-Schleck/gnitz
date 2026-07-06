@@ -186,8 +186,6 @@ uint64_t gnitz_circuit_negate(GnitzCircuitBuilder *cb, uint64_t input);
 
 uint64_t gnitz_circuit_union(GnitzCircuitBuilder *cb, uint64_t a, uint64_t b);
 
-uint64_t gnitz_circuit_delay(GnitzCircuitBuilder *cb, uint64_t input);
-
 uint64_t gnitz_circuit_distinct(GnitzCircuitBuilder *cb, uint64_t input);
 
 uint64_t gnitz_circuit_join(GnitzCircuitBuilder *cb, uint64_t delta, uint64_t trace_table_id);

@@ -808,14 +808,11 @@ impl MasterDispatcher {
     // Fan-out operations
     // -----------------------------------------------------------------------
 
-    /// Distributed backfill from `source_id`. `view_id` selects the scope,
-    /// carried to the worker in the frame's `seek_pk`:
-    /// - `view_id == 0` — boot mode: drive `source_id`'s whole dependent
-    ///   closure (every view starts empty at boot, so this is correct and
-    ///   re-derives each view once).
-    /// - `view_id != 0` — live CREATE-VIEW mode: drive ONLY that view. The
-    ///   source already has populated existing dependents that a closure
-    ///   re-drive would double-count.
+    /// Distributed backfill of ONE view from `source_id`; `view_id` rides to
+    /// the worker in the frame's `seek_pk`. Always view-scoped — the source may
+    /// already have populated dependents (live CREATE VIEW; recovery step-4
+    /// rebuild next to resumed siblings) that a closure re-drive would
+    /// double-count.
     ///
     /// May `maybe_checkpoint` to reclaim SAL space before a large source; the
     /// collect loop may further CHECKPOINT mid-stream. Both are safe on the
@@ -850,7 +847,7 @@ impl MasterDispatcher {
     pub(crate) fn drain_tick_blocking(&mut self, source_id: i64) -> Result<(), String> {
         let nw = self.num_workers;
         // The synchronous collect reads W2M rings directly and routes neither by
-        // req_id; any value works. (Boot's `fan_out_backfill` likewise passes 0.)
+        // req_id; any value works.
         let req_ids = [0u64; crate::runtime::sal::MAX_WORKERS];
         let lsn = self.next_lsn();
         self.write_tick_group(source_id, lsn, &req_ids[..nw])?;

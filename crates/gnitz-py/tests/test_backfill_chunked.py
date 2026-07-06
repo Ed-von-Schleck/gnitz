@@ -7,10 +7,11 @@ barrier. Because partitions are unequal, a worker that has drained its partition
 keeps issuing empty *pad* rounds to stay in lockstep until the master — ANDing a
 per-chunk pad bit reported by every worker — stamps the collective stop verdict.
 
-These tests drive the **boot** backfill path (`backfill_exchange_views` →
+These tests drive the **boot rebuild** path (`rebuild_invalid_views` →
 `fan_out_backfill` → worker `handle_backfill`): create an exchange view over
-populated tables, restart the server (views are ephemeral and re-materialize at
-boot over the recovered base data), and assert the rebuilt view is exact. They
+populated tables, crash-restart the server (the un-checkpointed view fails the
+resume verdict and is rebuilt over the recovered base data), and assert the
+rebuilt view is exact. They
 run with a shrunk `GNITZ_DDL_SCAN_CHUNK_ROWS` so even small tables span many
 chunked rounds — exercising lockstep padding, the pad-bit termination, and (with
 the reclaim seam) the per-round SAL checkpoint/reset.

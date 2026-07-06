@@ -101,6 +101,13 @@ pub(super) fn child_scratch_dir(view_dir: &str, child_name: &str) -> String {
     format!("{}/scratch_{}_w{}", view_dir, child_name, worker_rank())
 }
 
+/// True iff `name` is one of THIS worker's rank-stamped scratch dirs — the
+/// inverse of the `child_scratch_dir` convention above, kept adjacent so the
+/// recovery reset sweep can never drift from the naming it must match.
+pub(crate) fn is_worker_scratch_dir_name(name: &str) -> bool {
+    name.starts_with("scratch_") && name.ends_with(&format!("_w{}", worker_rank()))
+}
+
 /// Create a child table in a subdirectory of the view's directory.
 pub(super) fn create_child_table(
     state: &mut EmitState,
@@ -490,15 +497,6 @@ pub(super) fn emit_node(
             };
             reg_meta[reg_id as usize] = RegisterMeta::delta(out_schema);
             builder.add_union(in_a as u16, in_b as u16, has_b, reg_id as u16);
-        }
-
-        gnitz_wire::OpNode::Delay => {
-            let in_reg = in_regs.get(&PORT_IN).copied().unwrap_or(0);
-            let in_schema = reg_meta[in_reg as usize].schema;
-            let state_reg = reg_meta.len() as i32;
-            reg_meta.push(RegisterMeta::delay_state(in_schema));
-            reg_meta[reg_id as usize] = RegisterMeta::delta(in_schema);
-            builder.add_delay(in_reg as u16, state_reg as u16, reg_id as u16);
         }
 
         gnitz_wire::OpNode::Distinct | gnitz_wire::OpNode::PositivePart => {
@@ -989,9 +987,9 @@ pub(super) fn build_plan(
         next_reg += 1;
     }
 
-    // Destructive-register ordering invariant. `Union`, `Distinct`, `PositivePart`,
-    // and `Delay` empty their PORT_IN register in place (std::mem::replace/swap with
-    // an empty batch, to avoid allocation). Every node has one output register
+    // Destructive-register ordering invariant. `Union`, `Distinct`, and
+    // `PositivePart` empty their PORT_IN register in place (std::mem::replace/swap
+    // with an empty batch, to avoid allocation). Every node has one output register
     // shared by all its consumers, so a register that fans into both a
     // non-destructive reader (e.g. integrate_trace) and a destructive consumer is
     // correct only if the destructive op runs LAST among that register's consumers —
@@ -1016,8 +1014,7 @@ pub(super) fn build_plan(
         let dtor_port = match loaded.nodes.get(&nid) {
             Some(gnitz_wire::OpNode::Distinct)
             | Some(gnitz_wire::OpNode::PositivePart)
-            | Some(gnitz_wire::OpNode::Union)
-            | Some(gnitz_wire::OpNode::Delay) => Some(PORT_IN),
+            | Some(gnitz_wire::OpNode::Union) => Some(PORT_IN),
             _ => None,
         };
         let Some(port) = dtor_port else { continue };
@@ -1061,7 +1058,7 @@ pub(super) fn build_plan(
 
     // Register ids are u16 instruction fields. `reg_meta` is sized to the base
     // register per node plus the exchange seeds here; the emitters push the extras
-    // on demand — ScanTrace/Distinct/Delay push 1, Reduce up to 3
+    // on demand — ScanTrace/Distinct push 1, Reduce up to 3
     // (raw_delta + finalize + trace-in). Each node pushes at most 3, so reserving
     // `next_reg + 3 * ordered.len()` holds the whole program in a single
     // allocation, and that same bound — rejected here before the emit loop creates

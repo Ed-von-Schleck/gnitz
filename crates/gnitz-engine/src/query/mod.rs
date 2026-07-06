@@ -10,4 +10,6 @@ mod compiler;
 mod dag;
 mod vm;
 
-pub(crate) use dag::{DagEngine, ExchangeCallback, IndexCircuitEntry, RelationKind, StoreHandle, SysTableRefs};
+pub(crate) use dag::{
+    is_worker_scratch_dir_name, DagEngine, ExchangeCallback, IndexCircuitEntry, RelationKind, StoreHandle, SysTableRefs,
+};

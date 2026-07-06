@@ -56,6 +56,7 @@ impl CatalogEngine {
             active_part_end: NUM_PARTITIONS,
             committed_generation: 0,
             recorded_topology: 0,
+            invalid_views: rustc_hash::FxHashSet::default(),
             sys_schemas,
             sys_tables,
             sys_views,

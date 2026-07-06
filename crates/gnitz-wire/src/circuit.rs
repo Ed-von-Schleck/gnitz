@@ -12,7 +12,8 @@ pub const OPCODE_UNION: u64 = 4;
 pub const OPCODE_JOIN_DELTA_TRACE: u64 = 5;
 // 6 is a retired opcode (the removed fused inner ΔA⋈ΔB join); left a hole.
 pub const OPCODE_INTEGRATE: u64 = 7;
-pub const OPCODE_DELAY: u64 = 8;
+// 8 is a retired opcode (the removed Delay z⁻¹ — every z⁻¹ is realized through a
+//    trace cursor snapshotted at tick start, never a live operator); left a hole.
 pub const OPCODE_REDUCE: u64 = 9;
 pub const OPCODE_DISTINCT: u64 = 10;
 /// Delta input source for a base table. The table id lives in the node row's
@@ -233,7 +234,6 @@ pub enum OpNode {
     Map(MapKind),
     Negate,
     Union,
-    Delay,
     Distinct,
     /// `OPCODE_POSITIVE_PART = 34`. Multiplicity-preserving counterpart to
     /// `Distinct`: per consolidated (PK, payload) emits
@@ -387,7 +387,6 @@ pub fn decode_op_node(
         }
         OPCODE_NEGATE => OpNode::Negate,
         OPCODE_UNION => OpNode::Union,
-        OPCODE_DELAY => OpNode::Delay,
         OPCODE_DISTINCT => OpNode::Distinct,
         OPCODE_POSITIVE_PART => OpNode::PositivePart,
         OPCODE_REDUCE => {

@@ -18,7 +18,7 @@ import time
 import shutil
 import pytest
 import gnitz
-from _serverproc import server_preexec
+from _serverproc import server_preexec, HANG_TIMEOUT, START_TIMEOUT
 
 
 BINARY = os.environ.get(
@@ -31,6 +31,9 @@ WORKERS = int(os.environ.get("GNITZ_WORKERS", "4"))
 # ~500 rows encodes to roughly 30–60 KB, so this fires multiple checkpoints
 # per bulk insert.
 CHECKPOINT_BYTES = 32 * 1024
+
+# Hang ceilings for the concurrent push/scan/seek/insert tests below — see the
+# rationale on the shared constants in _serverproc.py.
 
 
 @pytest.fixture
@@ -210,7 +213,7 @@ def test_views_track_base_under_sustained_ingest_with_scans(checkpoint_server):
         push_started = threading.Event()
 
         def scan_loop():
-            push_started.wait(timeout=15)
+            push_started.wait(timeout=START_TIMEOUT)
             try:
                 for _ in range(30):
                     # Each scan drains pending ticks and must never hang; the
@@ -227,8 +230,8 @@ def test_views_track_base_under_sustained_ingest_with_scans(checkpoint_server):
         scan_t = threading.Thread(target=scan_loop, daemon=True)
         push_t.start()
         scan_t.start()
-        push_t.join(timeout=60)
-        scan_t.join(timeout=30)
+        push_t.join(timeout=HANG_TIMEOUT)
+        scan_t.join(timeout=HANG_TIMEOUT)
 
         assert not push_t.is_alive(), "push loop hung during concurrent checkpoints"
         assert not scan_t.is_alive(), "scan loop hung during concurrent checkpoints"
@@ -281,7 +284,7 @@ def test_seek_during_checkpoints(checkpoint_server):
         push_started = threading.Event()
 
         def seek_loop():
-            push_started.wait(timeout=15)
+            push_started.wait(timeout=START_TIMEOUT)
             try:
                 for _ in range(80):
                     seeker.seek(target_tid, pk=42)
@@ -294,8 +297,8 @@ def test_seek_during_checkpoints(checkpoint_server):
         push_t.start()
         seek_t.start()
 
-        push_t.join(timeout=30)
-        seek_t.join(timeout=15)
+        push_t.join(timeout=HANG_TIMEOUT)
+        seek_t.join(timeout=HANG_TIMEOUT)
 
         assert not push_t.is_alive(), "push loop hung unexpectedly"
         assert not seek_t.is_alive(), \
@@ -326,7 +329,7 @@ def test_scan_during_checkpoints(checkpoint_server):
         push_started = threading.Event()
 
         def scan_loop():
-            push_started.wait(timeout=15)
+            push_started.wait(timeout=START_TIMEOUT)
             try:
                 for _ in range(40):
                     scanner.scan(target_tid)
@@ -339,8 +342,8 @@ def test_scan_during_checkpoints(checkpoint_server):
         push_t.start()
         scan_t.start()
 
-        push_t.join(timeout=30)
-        scan_t.join(timeout=15)
+        push_t.join(timeout=HANG_TIMEOUT)
+        scan_t.join(timeout=HANG_TIMEOUT)
 
         assert not push_t.is_alive(), "push loop hung unexpectedly"
         assert not scan_t.is_alive(), \
@@ -389,7 +392,7 @@ def test_unique_constraint_enforced_under_checkpoint_pressure(checkpoint_server)
         n_rows = 50
 
         def insert_loop():
-            push_started.wait(timeout=15)
+            push_started.wait(timeout=START_TIMEOUT)
             try:
                 for i in range(n_rows):
                     inserter.execute_sql(
@@ -405,8 +408,8 @@ def test_unique_constraint_enforced_under_checkpoint_pressure(checkpoint_server)
         push_t.start()
         insert_t.start()
 
-        push_t.join(timeout=30)
-        insert_t.join(timeout=30)
+        push_t.join(timeout=HANG_TIMEOUT)
+        insert_t.join(timeout=HANG_TIMEOUT)
 
         assert not push_t.is_alive(), "push loop hung unexpectedly"
         assert not insert_t.is_alive(), \

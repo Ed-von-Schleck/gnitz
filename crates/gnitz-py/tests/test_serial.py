@@ -19,7 +19,7 @@ import time
 
 import pytest
 import gnitz
-from _serverproc import server_preexec
+from _serverproc import server_preexec, HANG_TIMEOUT, START_TIMEOUT
 
 
 def _uid():
@@ -437,7 +437,7 @@ def test_concurrent_serial_alloc_with_seeks(server):
                 errors.append(("writer", exc))
 
         def seeker():
-            writers_running.wait(timeout=15)
+            writers_running.wait(timeout=START_TIMEOUT)
             try:
                 with gnitz.connect(server) as c:
                     for _ in range(200):
@@ -454,9 +454,10 @@ def test_concurrent_serial_alloc_with_seeks(server):
         for t in wthreads:
             t.start()
         sthread.start()
+        # Hang ceilings, not perf budgets — see _serverproc.py.
         for t in wthreads:
-            t.join(timeout=60)
-        sthread.join(timeout=30)
+            t.join(timeout=HANG_TIMEOUT)
+        sthread.join(timeout=HANG_TIMEOUT)
 
         assert all(not t.is_alive() for t in wthreads), "a SERIAL writer hung"
         assert not sthread.is_alive(), "the concurrent SEEK loop hung"

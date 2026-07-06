@@ -11,6 +11,7 @@ use crate::storage::{Batch, CursorHandle, PartitionedTable, RecoverySource, Stor
 use gnitz_wire::PkColList;
 
 mod store_handle;
+pub(crate) use crate::query::compiler::is_worker_scratch_dir_name;
 pub(crate) use store_handle::StoreHandle;
 
 impl IndexCircuitEntry {
@@ -68,10 +69,9 @@ pub struct IndexCircuitEntry {
 /// `ingest_store_and_indices`, so the fail-stop abort fires deterministically
 /// without a real disk fault. No one-shot latch — the process aborts on first
 /// fire. The env is read once. Placing the seam at the dag layer keeps
-/// `storage` seam-free and fires exactly on the push-apply/replay path
-/// (`raw_store_ingest` and VM integration bypass it), so a seam-armed server
-/// still boots cleanly on a pushless data dir and fails only on the first
-/// INSERT apply.
+/// `storage` seam-free and fires exactly on the push-apply/replay path (VM
+/// integration bypasses it), so a seam-armed server still boots cleanly on a
+/// pushless data dir and fails only on the first INSERT apply.
 fn inject_ingest_apply_error(
     which: &str,
     r: Result<(), crate::storage::StorageError>,
@@ -467,9 +467,8 @@ impl DagEngine {
 
     /// Transitive dependent closure of `seeds` over the view dependency map:
     /// every view reachable by following `source → dependents` edges, with the
-    /// seeds themselves excluded. Shared by the boot exchange-backfill
-    /// reachability check and the post-backfill regfile-delta release.
-    pub fn dependent_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
+    /// seeds themselves excluded.
+    fn dependent_closure(&mut self, seeds: Vec<i64>) -> FxHashSet<i64> {
         self.get_dep_map();
         let mut reachable: FxHashSet<i64> = FxHashSet::default();
         let mut stack = seeds;
@@ -486,12 +485,11 @@ impl DagEngine {
     }
 
     /// Distributed-backfill analogue of `backfill_view`'s post-loop
-    /// `clear_view_regfile_deltas` (catalog/ddl.rs). A worker's
-    /// `handle_backfill(source_id)` drives `evaluate_dag_multi_worker`, which
-    /// evaluates the whole transitive dependent closure of `source_id`; the last
-    /// chunk's input + intermediate delta registers stay pinned in every touched
-    /// view's regfile after the loop. Release them across that closure, so peak
-    /// resident memory falls back to ~O(chunk) once the backfill drains.
+    /// `clear_view_regfile_deltas` (catalog/ddl.rs). After a worker's
+    /// `handle_backfill(source_id)` loop, the last chunk's input + intermediate
+    /// delta registers stay pinned in the touched views' regfiles. Release them
+    /// across `source_id`'s dependent closure, so peak resident memory falls
+    /// back to ~O(chunk) once the backfill drains.
     ///
     /// Also carries `backfill_view`'s Ephemeral guard: every view backfilled this
     /// way must be ephemeral, else its manifest-loaded shards would double-count
@@ -511,7 +509,11 @@ impl DagEngine {
 
     // ── Cache management ────────────────────────────────────────────────
 
-    #[cfg(test)] // sole callers are the test-only drop_view path and the dag tests
+    /// Drop one view's cached plan + memoized view properties, leaving it
+    /// registered. Callers: the test-only `drop_view`, the dag tests, and the
+    /// recovery step-4 output reset (`reset_view_output_for_rebuild`), which needs
+    /// the next backfill to recompile the view against its freshly-emptied store
+    /// and scratch.
     pub fn invalidate(&mut self, view_id: i64) {
         self.cache.remove(&view_id);
         self.view_props.evict(view_id);
@@ -540,6 +542,28 @@ impl DagEngine {
     pub fn get_source_ids(&mut self, view_id: i64) -> Vec<i64> {
         self.get_dep_map();
         self.dep.reverse.get(&view_id).cloned().unwrap_or_default()
+    }
+
+    /// Every relation this view's circuit scans — both `ScanDelta` (cascade
+    /// dependencies, also returned by `get_source_ids`) AND `ScanTrace` (static
+    /// `ext_trace` reads, e.g. the Python circuit-builder's `join(delta, trace)`,
+    /// which are deliberately NOT cascade dependencies and so absent from
+    /// `get_source_ids`). Deduped. The boot invalid-view verdict's transitive
+    /// check needs the ScanTrace targets too: a resumed view that ext_trace-reads
+    /// a *rebuilt* source view's output store would otherwise be missed by a
+    /// dependency-only walk.
+    pub fn all_scan_source_ids(&self, view_id: i64) -> Vec<i64> {
+        let loaded = self.load_meta_circuit(view_id);
+        let mut ids: Vec<i64> = Vec::new();
+        for op in loaded.nodes.values() {
+            if let gnitz_wire::OpNode::ScanDelta(t) | gnitz_wire::OpNode::ScanTrace(t) = op {
+                let id = *t as i64;
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
     }
 
     /// Order a DDL bundle's view ids by their intra-bundle dependencies (Kahn's
@@ -795,7 +819,7 @@ impl DagEngine {
     /// the underlying `load_meta_circuit` is a `load_circuit` + `topo_sort`
     /// (`O(V+E)` with several allocations). Stays `pub` and derives from the meta
     /// circuit (system tables), not `self.cache`, so it is correct for uncompiled
-    /// views — the startup `backfill_exchange_views` path relies on that.
+    /// views — boot-time classification runs before any plan is compiled.
     pub fn view_needs_exchange(&mut self, view_id: i64) -> bool {
         if let Some(&needs) = self.view_props.needs_exchange.get(&view_id) {
             return needs;
@@ -809,46 +833,14 @@ impl DagEngine {
         needs
     }
 
-    /// Base tables whose dependent closure the boot backfill must drive,
-    /// deduplicated: a base feeding several seed views appears once. A view is a
-    /// seed if `view_seeds_exchange_backfill` holds — it does a cross-worker
-    /// repartition (an `ExchangeShard` node or any `Join`) that the worker-local
-    /// rebuild pass cannot do. An equi-join over bases that root no other such
-    /// view would otherwise reach neither backfill path and under-fill at W>1.
-    /// Walks each seed view's source chain — recursing through view sources —
-    /// down to the base tables. The boot backfill drives `fan_out_backfill` once
-    /// per returned base; `drive_dag(base)` then re-derives that base's whole
-    /// dependent closure — every view above it — once. The result is sorted so
-    /// boot backfill drives bases in a reproducible order.
-    pub fn exchange_base_tables(&mut self) -> Vec<i64> {
-        // Collect the candidate view ids first: view_seeds_exchange_backfill and
-        // get_source_ids take &mut self, so no self.tables borrow can be held
-        // across them. Filtering to views here (off the in-memory `kind`) also
-        // keeps the meta-circuit loads off base tables, which never seed and have
-        // no circuit to load. Qualify the wire const: the catalog's i64
-        // FIRST_USER_TABLE_ID alias is above the query layer, so importing it
-        // would invert layering.
-        let first_user = gnitz_wire::FIRST_USER_TABLE_ID as i64;
-        let candidate_views: Vec<i64> = self
-            .tables
-            .iter()
-            .filter(|(&t, e)| t >= first_user && e.kind == RelationKind::View)
-            .map(|(&t, _)| t)
-            .collect();
-        let seed_views: Vec<i64> = candidate_views
-            .into_iter()
-            .filter(|&t| self.view_seeds_exchange_backfill(t))
-            .collect();
-        self.base_tables_reachable_from(seed_views)
-    }
-
     /// Transitive base-table sources of `seeds` (views), deduplicated and
     /// sorted: walk each seed's source chain — recursing through view sources —
     /// down to the base tables. The live CREATE-VIEW drain ticks exactly these
     /// (so every base feeding the new view, directly or through an existing view
     /// source, has its `pending_deltas` delivered to its existing dependents
-    /// before the new view backfills); boot's `exchange_base_tables` drives them
-    /// through `fan_out_backfill`. Sorted for a reproducible drive order.
+    /// before the new view backfills); boot's recovery tick sweep drives every
+    /// base reachable from *all* views through `drain_tick_blocking`. Sorted for a
+    /// reproducible drive order.
     pub fn base_tables_reachable_from(&mut self, seeds: Vec<i64>) -> Vec<i64> {
         let mut bases: FxHashSet<i64> = FxHashSet::default();
         // `visited` (seeded with the input views) collapses shared sub-graphs
@@ -871,16 +863,6 @@ impl DagEngine {
         bases
     }
 
-    /// The views the master's boot exchange-backfill cascade re-derives: the
-    /// transitive dependent closure of every base table that roots an exchange
-    /// view (driving a base re-derives its whole closure). The single source of
-    /// truth for "what the cascade fills", so the master driver and the worker's
-    /// complementary non-exchange rebuild cannot drift.
-    pub fn exchange_cascade_filled_views(&mut self) -> FxHashSet<i64> {
-        let bases = self.exchange_base_tables();
-        self.dependent_closure(bases)
-    }
-
     /// The equality-conjunct count of a non-equi (range / band) join view, or
     /// `None` if the view is not one — read off its `Join(DeltaTraceRange)` node.
     /// `Some` is the precise discriminator for the range-join driver branch; the
@@ -900,9 +882,9 @@ impl DagEngine {
         n_eq
     }
 
-    /// True iff the boot backfill must drive this view's bases: the view's
-    /// circuit carries an `ExchangeShard` node (GROUP BY / reduce / set-op /
-    /// range-join all do) or any `Join` node. The `Join` arm is load-bearing —
+    /// True iff a live CREATE of this view needs the distributed backfill: the
+    /// view's circuit carries an `ExchangeShard` node (GROUP BY / reduce /
+    /// set-op / range-join all do) or any `Join` node. The `Join` arm is load-bearing —
     /// an equi-join (`DeltaTrace`) repartitions its inputs at runtime through the
     /// join-shard scatter (arm 4 of the multi-worker step) and carries **no**
     /// `ExchangeShard`, so nothing else catches it. Matching any `Join` rather
@@ -912,15 +894,12 @@ impl DagEngine {
     /// join-free union/positive_part arithmetic, not `Join`, and likewise carry an
     /// `ExchangeShard`.)
     ///
-    /// Loads the meta circuit once and reuses it to warm `view_props.needs_exchange`
-    /// for the boot `view_needs_exchange` sweep that runs right after
-    /// `exchange_base_tables` over these same views.
+    /// Loads the meta circuit once and reuses it to warm `view_props.needs_exchange`.
     ///
-    /// `pub` so the live CREATE-VIEW path can classify too: the catalog hook
-    /// gates its inline single-process `backfill_view` on
-    /// `!view_seeds_exchange_backfill` (plain projections/filters only), and the
-    /// executor drives every seeding view through the distributed backfill
-    /// (`fan_out_backfill`) instead — the same split boot uses.
+    /// `pub` for the live CREATE-VIEW path: the catalog hook gates its inline
+    /// single-process `backfill_view` on `!view_seeds_exchange_backfill` (plain
+    /// projections/filters only), and the executor drives every seeding view
+    /// through the distributed backfill (`fan_out_backfill`) instead.
     pub fn view_seeds_exchange_backfill(&mut self, view_id: i64) -> bool {
         let loaded = self.load_meta_circuit(view_id);
         let needs_exchange = loaded

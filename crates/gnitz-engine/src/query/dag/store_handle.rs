@@ -55,6 +55,15 @@ impl StoreHandle {
         }
     }
 
+    /// True iff this is a replicated (one-child-per-worker) partitioned store.
+    /// Borrowed system tables are never replicated stores.
+    pub fn is_replicated(&self) -> bool {
+        match self {
+            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).is_replicated() },
+            StoreHandle::Borrowed(_) => false,
+        }
+    }
+
     /// Dispatched `has_pk` that works for every variant. Takes a **native**
     /// `u128`; routes via `opk_key` internally. Never feed it `get_pk`
     /// (OPK-widened) — use [`has_pk_bytes`] for verbatim OPK bytes.
@@ -94,17 +103,6 @@ impl StoreHandle {
         match self {
             StoreHandle::Borrowed(ptr) => unsafe { (**ptr).create_cursor_compacting() },
             StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).create_cursor_compacting() },
-        }
-    }
-
-    /// Dispatched durable ingest of an already-owned `Batch`. Skips the
-    /// regions memcpy round-trip; moves the batch directly into the
-    /// storage layer (zero-copy for single-partition stores; one
-    /// MemBatch-borrowed scatter for multi-partition).
-    pub fn ingest_owned_batch(&self, batch: Batch) -> Result<(), StorageError> {
-        match self {
-            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).ingest_owned_batch(batch) },
-            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).ingest_owned_batch(batch) },
         }
     }
 

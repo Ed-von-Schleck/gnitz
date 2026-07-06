@@ -131,10 +131,6 @@ impl ProgramBuilder {
         self.instructions.push(Instr::ClearDeltas);
     }
 
-    pub fn add_delay(&mut self, src: u16, state_reg: u16, dst: u16) {
-        self.instructions.push(Instr::Delay { src, state_reg, dst });
-    }
-
     pub fn add_scan_trace(&mut self, trace_reg: u16, out_reg: u16, chunk_limit: i32) {
         self.instructions.push(Instr::ScanTrace {
             trace_reg,

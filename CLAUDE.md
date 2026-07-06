@@ -547,9 +547,31 @@ durability and every table's overflow lives in the RAM tier. A steady-state
 checkpoint runs **two flush rounds** — a base round (`FLAG_FLUSH`, `SalReplay`
 base + system tables) and, after draining pending view ticks, an ephemeral round
 (`FLAG_FLUSH_EPH`) that persists every view's operator-trace tables and output
-stores, stamping each manifest with a monotonic checkpoint generation. Views are
-still erase-and-rebuilt at open today; generation-valid checkpoint reload is a
-later change. Secondary indexes are always rebuilt at open.
+stores, stamping each manifest with a monotonic checkpoint generation. The
+ephemeral round publishes **unconditionally** — every view partition (even empty
+or unchanged) re-stamps its manifest at the current generation, so after a
+completed checkpoint *every* view partition carries generation `g`; that is what
+makes the per-view resume verdict decidable.
+
+At open a view is **resumed from its checkpoint when generation-valid, rebuilt
+otherwise; secondary indexes are always rebuilt.** Resume is *incremental*, not a
+rebuild: the view's checkpointed output store and DBSP operator traces are loaded
+from their shards (`Table::new` conditional load), and only the un-checkpointed
+SAL tail is fed through the circuit by the tick sweep (`O(tail)`) — the view is
+never re-derived from the base. A full rebuild from base
+(`O(base-through-circuits)`) happens only for a generation-*invalid* view. The
+per-view verdict (`compute_invalid_views`, master pre-fork) resumes a view iff
+the recorded topology matches the launched `(worker_count, STATE_FORMAT)`, every one of its
+output-partition manifests is at the committed generation, and every view it
+scans (ScanDelta cascade dep or ScanTrace `ext_trace`) is itself valid; else it
+is reset (on the workers) and rebuilt. Recovery is **non-windowed**: the
+un-checkpointed SAL tail is replayed once and applied by one master-driven tick
+sweep on a freshly-reset SAL, so peak recovery RAM is ~(effective tail)/W per
+worker (≈1.5 GiB only at W=1). A **recovery-start generation bump** (durably
+advancing `SEQ_ID_CHECKPOINT_GEN` `G → G+1` before the fork, without touching
+`worker_ctx`) closes the reset→boot_checkpoint crash window: any crash there
+leaves durable gen ≥ `G+1` while un-checkpointed views are stamped `G`, forcing a
+rebuild rather than a silently-stale resume.
 
 ## Benchmarking
 

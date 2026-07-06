@@ -133,6 +133,7 @@ impl PartitionedTable {
     /// Ingest an already-constructed Batch (owned). Moves into tables[0]
     /// directly for the single-partition case, scatters via a borrowed
     /// `MemBatch` view otherwise.
+    #[cfg(test)] // production ingest goes through ingest_returning_effective
     pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         if batch.count == 0 || self.tables.is_empty() {
             return Ok(());

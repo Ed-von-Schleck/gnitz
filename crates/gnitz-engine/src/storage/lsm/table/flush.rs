@@ -166,7 +166,7 @@ impl Table {
             self.flush_to_ram()?;
             return Ok(FlushOutcome::DoneInline);
         }
-        self.prepare_persist()
+        self.prepare_persist(false)
     }
 
     /// The force-persist body shared by the base barrier round and the ephemeral
@@ -178,23 +178,26 @@ impl Table {
     /// acknowledged rows), OR compaction has superseded files since the last
     /// publish (`has_pending_deletions` — else the deferred drain would unlink
     /// files the surviving manifest still references). When none hold the tier is
-    /// `Empty`. Callers reset `found_source` before invoking (the fold reads it).
-    fn prepare_persist(&mut self) -> Result<FlushOutcome, StorageError> {
+    /// `Empty` — UNLESS `force_publish`, which stages a generation-stamped manifest
+    /// unconditionally (see [`Self::flush_prepare_ephemeral`]). Callers reset
+    /// `found_source` before invoking (the fold reads it).
+    fn prepare_persist(&mut self, force_publish: bool) -> Result<FlushOutcome, StorageError> {
         // Fold-first, then gate, then one shard.
         self.fold_memtable_into_l0();
         self.compact_in_memory();
 
         if !self.in_memory_l0.is_empty() {
             self.persist_l0_run()?;
-        } else if !self.shard_index.has_unsynced() && !self.shard_index.has_pending_deletions() {
+        } else if !force_publish && !self.shard_index.has_unsynced() && !self.shard_index.has_pending_deletions() {
             // Nothing ingested since the last checkpoint, no unpublished spills,
-            // and nothing compacted — the SAL covers it.
+            // and nothing compacted — the SAL covers it (base round only).
             return Ok(FlushOutcome::Empty);
         }
         // Otherwise fall through to publish: capture unpublished spills into a
         // durable manifest before the SAL reset (else the global reset drops
-        // them), and/or republish over a compacted index so the deferred drain
-        // can unlink the superseded inputs.
+        // them), republish over a compacted index so the deferred drain can unlink
+        // the superseded inputs, and — under `force_publish` — re-stamp an
+        // unchanged/empty partition at the current generation.
 
         let sync_paths = self
             .shard_index
@@ -209,13 +212,20 @@ impl Table {
     /// Phase 1 of the **ephemeral** checkpoint round: force-persist this table's
     /// RAM tier to a durable, generation-stamped shard + manifest regardless of
     /// `recovery_source`. Used for the `RederiveCheckpointed` view operator-trace
-    /// tables and output stores the ephemeral round persists (their manifests are
-    /// stamped with the checkpoint generation via
-    /// `worker_ctx::committed_generation`). The retained three-disjunct gate
-    /// means a table dirtied only by deferred compaction still republishes.
+    /// tables and output stores the ephemeral round persists.
+    ///
+    /// **Publishes unconditionally** (`force_publish`), even for an unchanged or
+    /// empty partition: the boot resume verdict (`compute_invalid_views`) and the
+    /// per-partition conditional load (`Table::new`) both require **every** view
+    /// partition's manifest to carry the current checkpoint generation. A gated
+    /// round would leave an empty partition with no manifest and an unchanged
+    /// partition at an older generation, and the verdict would then reject the
+    /// whole (valid) view every restart — resume would never trigger. An empty
+    /// partition publishes a zero-entry manifest at generation `g`; an unchanged
+    /// partition re-stamps its existing shards at `g`.
     pub fn flush_prepare_ephemeral(&mut self) -> Result<FlushOutcome, StorageError> {
         self.found_source = FoundSource::None;
-        self.prepare_persist()
+        self.prepare_persist(true)
     }
 
     /// Commit the RAM tier's single folded net-state run (left by

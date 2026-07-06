@@ -96,8 +96,8 @@ pub(super) fn validate_pk_cols(col_defs: &[super::types::ColumnDef], pk: &PkColL
     // through the byte-path accessors (`get_pk_bytes` / `compare_pk_bytes`). The
     // `PK_LIST_MAX_COLS` cap above bounds a valid PK at 64 bytes (four `U128` at
     // the current cap of 4); MAX_PK_BYTES is the
-    // ceiling, defending the catalog worker against a crafted `raw_store_ingest`
-    // into `TABLE_TAB` whose decoded PK list packs an oversized region.
+    // ceiling, defending the catalog worker against a crafted SAL-replayed
+    // `TABLE_TAB` ingest whose decoded PK list packs an oversized region.
     // `pk_stride == 0` is unreachable once `is_pk_eligible` passed (every
     // eligible type is ≥ 1 byte) but is rejected explicitly as defence in depth.
     let pk_stride: usize = cols

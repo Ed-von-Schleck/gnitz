@@ -208,6 +208,44 @@ fn test_recover_checkpoint_gen_and_topology() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `recovery_start_generation_bump` advances the durable checkpoint generation
+/// G → G+1 and the in-memory field, and the subsequent `boot_checkpoint` bump
+/// then goes G+1 → G+2 (retracting G+1, not G, so `_sequences` stays clean). Each
+/// step is monotonic, recovered across a reopen via the `.max()` arm.
+#[test]
+fn test_recovery_start_generation_bump_monotonic() {
+    let dir = temp_dir("recovery_start_gen_bump");
+    {
+        // Simulate two prior checkpoints so the recovered G is 2, not 0.
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        engine.record_topology(4);
+        assert_eq!(engine.bump_checkpoint_generation(), 1);
+        assert_eq!(engine.bump_checkpoint_generation(), 2);
+        engine.close();
+    }
+    {
+        // Recovery start: bump G=2 → 3 durably; the field advances.
+        let mut engine = CatalogEngine::open(&dir).unwrap();
+        assert_eq!(engine.committed_generation, 2, "recovered G");
+        engine.recovery_start_generation_bump().unwrap();
+        assert_eq!(
+            engine.committed_generation, 3,
+            "recovery-start bump advances the field to G+1"
+        );
+        // boot_checkpoint's bump then retracts G+1 and inserts G+2.
+        assert_eq!(engine.bump_checkpoint_generation(), 4, "boot_checkpoint goes G+1 → G+2");
+        engine.close();
+    }
+    // The final durable generation survives a reopen monotonically.
+    let mut engine = CatalogEngine::open(&dir).unwrap();
+    assert_eq!(
+        engine.committed_generation, 4,
+        "recovery-start + boot_checkpoint bumps recovered monotonically",
+    );
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The `>= FIRST_USER_TABLE_ID` recovery guard must ignore a stray sequence id
 /// in the empty 4..16 gap, never misclassifying it as a user sequence.
 #[test]
@@ -473,34 +511,6 @@ fn test_ddl_sync_zone_lsn_tracking() {
 
     // max_table_current_lsn is at least the highest zone LSN observed.
     assert!(engine.max_table_current_lsn() >= 9);
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-// ── test_raw_store_ingest ─────────────────────────────────────────────
-
-#[test]
-fn test_raw_store_ingest() {
-    let dir = temp_dir("catalog_raw_store_ingest");
-    let mut engine = CatalogEngine::open(&dir).unwrap();
-    let cols = vec![u64_col_def("id"), u64_col_def("val")];
-    let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
-    let schema = engine.get_schema(tid).unwrap();
-
-    // Raw ingest (SAL recovery path — no hooks, no unique_pk, no index projection)
-    let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(10u128, 1);
-    bb.put_u64(1000);
-    bb.end_row();
-    bb.begin_row(20u128, 1);
-    bb.put_u64(2000);
-    bb.end_row();
-    engine.raw_store_ingest(tid, bb.finish()).unwrap();
-    engine.flush_family(tid).unwrap();
-
-    let scan = engine.scan_family(tid).unwrap();
-    assert_eq!(scan.count, 2);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

@@ -17,6 +17,7 @@ mod optimize;
 use emit::*;
 use optimize::*;
 
+pub(crate) use emit::is_worker_scratch_dir_name;
 pub(crate) use load::{
     circuit_range_join_n_eq, load_circuit, reindex_cols_through_filters, scan_tid_through_filters, topo_sort,
 };
@@ -1914,7 +1915,7 @@ mod tests {
 
     // ── §5: destructive-register ordering invariant ─────────────────────────
     //
-    // Union/Distinct/PositivePart/Delay empty their input register in place.
+    // Union/Distinct/PositivePart empty their input register in place.
     // When that register fans out to other
     // consumers, the destructive op must be scheduled LAST among them, or the
     // co-readers see an emptied batch. build_plan rejects violations (returns
@@ -2071,7 +2072,7 @@ mod tests {
         // The trace-side ScanTrace (node 1) uses reg_id as the trace register;
         // no extra delta register is allocated for it.  The minimum register
         // count is: one per node (4) + zero extras from ScanTrace on trace side.
-        // (There are no Distinct/Reduce/Delay nodes adding extras.)
+        // (There are no Distinct/Reduce nodes adding extras.)
         assert!(
             plan.num_regs == 4,
             "expected exactly 4 regs (one per node, no extra for trace-side ScanTrace), got {}",

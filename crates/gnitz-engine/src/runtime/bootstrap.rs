@@ -15,7 +15,8 @@ use crate::runtime::sal::{sal_mmap_size, SalReader, SalWriter, FLAG_DDL_SYNC, FL
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::w2m_ring::{self, W2M_REGION_SIZE};
 use crate::runtime::wire as ipc;
-use crate::runtime::worker::WorkerProcess;
+use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
+use crate::storage::Batch;
 
 // ---------------------------------------------------------------------------
 // Partition assignment
@@ -168,17 +169,54 @@ fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngin
     }
 }
 
+/// Fault-injection seam for the boot-recovery pipeline; no-op in release
+/// builds. In a debug build with `GNITZ_INJECT_RECOVERY_PANIC=<stage>`, panics
+/// when recovery reaches the named stage, so the crash-window E2E tests can cut
+/// boot at a precise point.
+fn inject_recovery_panic(stage: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("GNITZ_INJECT_RECOVERY_PANIC").as_deref() == Ok(stage) {
+        panic!("injected recovery panic at {stage}");
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = stage;
+}
+
+/// Base tables feeding ≥1 view, sorted for a reproducible drive order. The ONE
+/// definition of the recovery sweep set: each worker buffers exactly these
+/// tables' effective deltas during SAL replay, and the master's post-reset tick
+/// sweep drains exactly these — same function, so the swept set equals the
+/// buffered set by construction (no leak, no gap).
+fn swept_base_tables(catalog: &mut CatalogEngine) -> Vec<i64> {
+    let view_ids: Vec<i64> = catalog
+        .dag
+        .tables
+        .iter()
+        .filter(|(_, e)| e.kind == RelationKind::View)
+        .map(|(&t, _)| t)
+        .collect();
+    catalog.dag.base_tables_reachable_from(view_ids)
+}
+
 /// Per-worker post-fork user-table replay. The worker's `sal_reader`
 /// already has the worker's per-cursor view; the apply closure decodes
-/// each FLAG_PUSH group's batch and replays it through the unique-pk
-/// path so retractions cancel correctly.
-fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) {
+/// each FLAG_PUSH group's batch and applies it through the unique-pk path
+/// (`ingest_returning_effective`, the exact call `handle_push` makes) so
+/// retractions cancel correctly, and — for every base table feeding ≥1 view —
+/// buffers the returned effective delta into the returned map. That map seeds
+/// the worker's `pending_deltas`; the master's post-reset recovery tick sweep
+/// drains it into the views. Viewless bases ingest-and-discard (nothing to
+/// drive), so their tail never leaks into the sweep.
+fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) -> HashMap<i64, Batch> {
     let all_lsns = catalog.collect_all_flushed_lsns();
     let family_lsns: HashMap<i64, u64> = all_lsns
         .into_iter()
         .filter(|&(tid, _)| tid >= FIRST_USER_TABLE_ID)
         .collect();
 
+    let buffered_bases: HashSet<i64> = swept_base_tables(catalog).into_iter().collect();
+
+    let mut pending: HashMap<i64, Batch> = HashMap::new();
     let replayed = recover_sal(sal_reader, catalog, &family_lsns, |cat, msg, decoded| {
         if msg.flags & FLAG_PUSH == 0 {
             return false;
@@ -187,12 +225,13 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) {
             Some(b) if b.count > 0 => b,
             _ => return false,
         };
+        let tid = msg.target_id as i64;
         // Fires pre-readiness-ACK: the master's wait_all_workers probes
         // fail_if_worker_dead and fails boot BEFORE zeroing the SAL sentinel, so
         // the replayed data's only durable copy survives. A swallowed error here
         // would zero the sentinel and orphan the un-applied committed data.
-        match cat.replay_ingest(msg.target_id as i64, batch) {
-            Ok(()) => true,
+        let effective = match cat.ingest_returning_effective(tid, batch) {
+            Ok(b) => b,
             Err(e) => crate::gnitz_fatal_abort!(
                 "SAL replay apply failed (table_id={}, lsn={}): {} — aborting \
                  before the SAL sentinel is reset",
@@ -200,7 +239,13 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) {
                 msg.lsn,
                 e,
             ),
+        };
+        // Buffer the effective delta for the sweep; viewless bases discard it
+        // (nothing to drive).
+        if buffered_bases.contains(&tid) {
+            buffer_pending_delta(&mut pending, tid, effective);
         }
+        true
     });
 
     if replayed > 0 {
@@ -209,6 +254,7 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) {
             libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
         }
     }
+    pending
 }
 
 /// Worker-boot catalog recovery, in load-bearing order:
@@ -226,11 +272,14 @@ fn recover_from_sal(sal_reader: &SalReader, catalog: &mut CatalogEngine) {
 /// The Err rides the startup ACK (see worker.run): a failed boot must abort
 /// before the master zeroes the SAL sentinel, or the replayed rows' only
 /// durable copy is destroyed.
-fn worker_boot_recovery(catalog: &mut CatalogEngine, sal_reader: &SalReader) -> Result<(), String> {
+fn worker_boot_recovery(catalog: &mut CatalogEngine, sal_reader: &SalReader) -> Result<HashMap<i64, Batch>, String> {
     catalog
         .backfill_all_indexes()
         .map_err(|e| format!("boot index backfill failed: {e}"))?;
-    recover_from_sal(sal_reader, catalog);
+    let pending_deltas = recover_from_sal(sal_reader, catalog);
+    // Keep the boot flush: the non-windowed recovery resets the SAL before the
+    // master-driven tick sweep, so the replayed base rows must be shard-durable
+    // first — else the reset would drop acknowledged tail data.
     for tid in catalog.iter_user_table_ids() {
         catalog
             .flush_family(tid)
@@ -240,23 +289,52 @@ fn worker_boot_recovery(catalog: &mut CatalogEngine, sal_reader: &SalReader) -> 
     if std::env::var("GNITZ_INJECT_BOOT_FLUSH_ERROR").is_ok() {
         return Err("injected boot flush fault".to_string());
     }
-    Ok(())
+    inject_recovery_panic("bootflush");
+    Ok(pending_deltas)
 }
 
 // ---------------------------------------------------------------------------
-// Backfill exchange views
+// Recovery tick sweep + invalid-view rebuild
 // ---------------------------------------------------------------------------
 
-/// Issue fan_out_backfill once per base table that roots an exchange view.
-///
-/// `drive_dag(base)` re-derives that base's whole closure (every view above it)
-/// exactly once, so one backfill per base fills all of its exchange and
-/// intermediate views without re-driving any shared closure.
-fn backfill_exchange_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispatcher) -> Result<(), String> {
-    for base in catalog.dag.exchange_base_tables() {
-        // view_id = 0: boot's whole-closure mode — drive every view above
-        // `base` once (each starts empty at boot).
-        dispatcher.fan_out_backfill(0, base)?;
+/// Apply the un-checkpointed SAL tail — buffered as `pending_deltas` during
+/// replay — to every view via one master-driven blocking tick per reachable base,
+/// on the freshly-reset SAL. Each tick drains that source's buffered delta through
+/// `handle_tick` → `evaluate_dag`; empty-buffer sources still tick so exchange
+/// views stay in lockstep. The sweep drives ALL views: resumed (valid) views are
+/// extended state-exactly (single-source-per-epoch reduces the whole-tail drive to
+/// a live batched push); invalid views are harmlessly polluted and reset+rebuilt in
+/// step-4. The transitive verdict guarantees no valid view reads an invalid one.
+fn recovery_tick_sweep(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispatcher) -> Result<(), String> {
+    for src in swept_base_tables(catalog) {
+        dispatcher.drain_tick_blocking(src)?;
+    }
+    Ok(())
+}
+
+/// Step-4: rebuild only the views the boot verdict rejected. For each invalid view
+/// in ascending depth (a source view before any dependent that reads it), issue
+/// one view-scoped `fan_out_backfill(vid, src)` per source. The worker resets that
+/// view's output partitions + operator scratch on the FIRST such command (gated on
+/// its COW-inherited `invalid_views` set), then fills — for both exchange and
+/// non-exchange views. A multi-source join iterates every source: the first fills
+/// its trace, the rest join against it. View-scoped (`vid != 0`) so a resumed
+/// sibling's loaded shards are never re-derived and double-counted.
+fn rebuild_invalid_views(catalog: &mut CatalogEngine, dispatcher: &mut MasterDispatcher) -> Result<(), String> {
+    let mut invalid: Vec<i64> = catalog.invalid_views.iter().copied().collect();
+    invalid.sort_by_key(|&vid| catalog.dag.tables.get(&vid).map(|e| e.depth).unwrap_or(0));
+    // Resume-vs-rebuild marker (asserted by the "no backfill on clean restart"
+    // E2E): 0 ⇒ every view resumed from its checkpoint.
+    {
+        let msg = format!("recovery: rebuilding {} invalid view(s)\n", invalid.len());
+        unsafe {
+            libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
+    }
+    for vid in invalid {
+        for src in catalog.dag.get_source_ids(vid) {
+            dispatcher.fan_out_backfill(vid, src)?;
+        }
     }
     Ok(())
 }
@@ -408,6 +486,33 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
         catalog.gc_orphan_directories();
     }
 
+    // --- Boot invalid-view verdict + recovery-start generation bump ---
+    //
+    // Both pre-fork, while the master's active range is still full: the verdict's
+    // manifest peeks see every partition, and the durable generation advance is
+    // COW-inherited by every worker (and is durable long before the parent resets
+    // the SAL after worker readiness).
+    {
+        let catalog = unsafe { &mut *catalog_ptr };
+        // Per-view resume-vs-rebuild verdict against the checkpointed manifests
+        // (generation + topology + transitive source validity). Reads
+        // `worker_ctx::committed_generation()` (the recovered G), so it runs BEFORE
+        // the recovery-start bump advances the durable generation.
+        let invalid = catalog.compute_invalid_views(num_workers);
+        catalog.invalid_views = invalid;
+
+        // Durably advance the checkpoint generation G → G+1 without publishing to
+        // worker_ctx, closing the reset→boot_checkpoint crash window.
+        if let Err(e) = catalog.recovery_start_generation_bump() {
+            let msg = format!("Error: recovery-start generation bump failed: {e}\n");
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
+            return 1;
+        }
+        inject_recovery_panic("genbump");
+    }
+
     // --- W2M regions (memfd-backed, one per worker→master) ---
     let mut w2m_ptrs: Vec<*mut u8> = Vec::with_capacity(nw);
     let mut w2m_fds: Vec<i32> = Vec::with_capacity(nw);
@@ -551,43 +656,22 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             let sal_reader = SalReader::new(sal_ptr as *const u8, w as u32, sal_mmap_size(), m2w_efds[w]);
             let w2m_writer = W2mWriter::new(w2m_ptrs[w], W2M_REGION_SIZE as u64);
 
-            let boot_err: Option<String> = worker_boot_recovery(catalog, &sal_reader).err();
-            if let Some(e) = &boot_err {
-                // stderr is redirected to worker_N.log above.
-                eprintln!("{e}");
-            }
+            // Recover: rebuild indexes, replay the SAL tail (buffering effective
+            // base deltas), boot-flush the replayed rows durable. The buffered
+            // deltas seed `pending_deltas`; the master's post-reset tick sweep
+            // drives them into the views. All view derivation moved to the
+            // master's sweep + step-4 rebuild — no child-side view backfill.
+            let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) =
+                match worker_boot_recovery(catalog, &sal_reader) {
+                    Ok(pd) => (pd, None),
+                    Err(e) => {
+                        // stderr is redirected to worker_N.log above.
+                        eprintln!("{e}");
+                        (HashMap::new(), Some(e))
+                    }
+                };
 
             catalog.invalidate_all_plans();
-
-            // Rebuild the non-exchange views the master's post-ACK exchange
-            // backfill does not reach. recover_from_sal restored unflushed base
-            // rows but bypassed view derivation, and the inline open-time backfill
-            // is now live-only. The cascade re-derives the full dependent closure
-            // of every base feeding an exchange view; fill only the non-exchange
-            // views OUTSIDE that closure here, so neither pass double-counts and no
-            // view is missed. Backfill sources before dependents (depth order) so a
-            // view over another non-exchange view reads a populated source. Skip on
-            // a doomed boot — worker.run will abort.
-            if boot_err.is_none() {
-                let filled = catalog.dag.exchange_cascade_filled_views();
-                let mut nx_views: Vec<i64> = catalog
-                    .iter_user_table_ids()
-                    .into_iter()
-                    .filter(|&vid| {
-                        !filled.contains(&vid)
-                            && catalog
-                                .dag
-                                .tables
-                                .get(&vid)
-                                .is_some_and(|e| e.kind == RelationKind::View)
-                            && !catalog.dag.view_needs_exchange(vid)
-                    })
-                    .collect();
-                nx_views.sort_by_key(|&vid| catalog.dag.tables.get(&vid).map(|e| e.depth).unwrap_or(0));
-                for vid in nx_views {
-                    catalog.backfill_view(vid);
-                }
-            }
 
             let msg = format!(
                 "Worker {} (pid {}) partitions [{}, {})\n",
@@ -604,7 +688,15 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             let wtag = format!("W{w}");
             crate::foundation::log::init(log_level, wtag.as_bytes());
 
-            let mut worker = WorkerProcess::new(w as u32, nw, master_pid, catalog_ptr, sal_reader, w2m_writer);
+            let mut worker = WorkerProcess::new(
+                w as u32,
+                nw,
+                master_pid,
+                catalog_ptr,
+                sal_reader,
+                w2m_writer,
+                pending_deltas,
+            );
             let rc = worker.run(boot_err);
 
             // Defensive — WorkerProcess::run() exits via libc::_exit
@@ -645,19 +737,38 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     }
     dispatcher.reset_sal(0, 1);
 
-    // Backfill exchange views
-    if let Err(e) = backfill_exchange_views(catalog, dispatcher) {
-        let msg = format!("Error: backfill failed: {e}\n");
+    inject_recovery_panic("reset");
+
+    // Recovery tick sweep: apply the un-checkpointed SAL tail (buffered as
+    // pending_deltas during replay) to every view via one master-driven tick per
+    // reachable base, on the freshly-reset SAL. Resumed views are extended;
+    // invalid views are polluted (reset+rebuilt next).
+    if let Err(e) = recovery_tick_sweep(catalog, dispatcher) {
+        let msg = format!("Error: recovery tick sweep failed: {e}\n");
         unsafe {
             libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
         }
         return 1;
     }
 
-    // Boot-end checkpoint: record the launched topology, bump the generation, and
-    // durably checkpoint the freshly backfilled view state (base + ephemeral
-    // rounds) before the socket opens, so a clean restart resumes from it. No
-    // drain — recovery already drained everything and no pushes are admitted yet.
+    inject_recovery_panic("sweep");
+
+    // Step-4: reset (on the workers) and rebuild only the invalid views.
+    if let Err(e) = rebuild_invalid_views(catalog, dispatcher) {
+        let msg = format!("Error: invalid-view rebuild failed: {e}\n");
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
+        return 1;
+    }
+
+    inject_recovery_panic("backfill");
+
+    // Boot-end checkpoint: record the launched topology, bump the generation
+    // (G+1 → G+2), and durably checkpoint the resumed + rebuilt view state (base +
+    // ephemeral rounds) before the socket opens, so a clean restart resumes from
+    // it. No drain — recovery already drained everything and no pushes are admitted
+    // yet.
     if let Err(e) = dispatcher.boot_checkpoint(num_workers) {
         let msg = format!("Error: boot checkpoint failed: {e}\n");
         unsafe {

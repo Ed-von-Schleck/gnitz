@@ -41,3 +41,13 @@ def is_debug_build():
     release builds drop them. There is no reliable signal in the stripped
     binary, so we trust the GNITZ_RELEASE env the bench harness sets."""
     return os.environ.get("GNITZ_RELEASE", "0") == "0"
+
+
+# Deadlock ceilings for concurrent-thread tests, NOT performance budgets. The
+# guarded regression is a thread blocked forever (e.g. on `sal_writer_excl`); a
+# deadlock never completes, so any finite ceiling catches it. Deliberately
+# generous so a slow-but-completing run under saturated-CPU / parallel-suite
+# load never flakes. Do NOT tighten these to "speed up the tests" — that
+# reintroduces the flake.
+HANG_TIMEOUT = 180   # per-thread join ceiling
+START_TIMEOUT = 60   # thread waiting for the first concurrent write to land

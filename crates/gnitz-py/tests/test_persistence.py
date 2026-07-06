@@ -14,12 +14,15 @@ import signal
 
 import pytest
 import gnitz
-from _serverproc import server_preexec
+from _serverproc import server_preexec, is_debug_build
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
 
 
-def _start_server(data_dir, sock_path, workers=None, extra_env=None):
+def _spawn_server(data_dir, sock_path, workers=None, extra_env=None):
+    """Spawn a gnitz-server process without waiting for readiness. The single
+    spawn path for both ready-servers (`_start_server`) and expected-boot-crash
+    servers (`_start_expecting_boot_crash`)."""
     binary = os.environ.get(
         "GNITZ_SERVER_BIN",
         os.path.abspath(os.path.join(os.path.dirname(__file__),
@@ -34,10 +37,14 @@ def _start_server(data_dir, sock_path, workers=None, extra_env=None):
     if extra_env:
         env = os.environ.copy()
         env.update(extra_env)
-    proc = subprocess.Popen(
+    return subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         start_new_session=True, env=env, preexec_fn=server_preexec,
     )
+
+
+def _start_server(data_dir, sock_path, workers=None, extra_env=None):
+    proc = _spawn_server(data_dir, sock_path, workers=workers, extra_env=extra_env)
     for _ in range(100):
         if os.path.exists(sock_path):
             break
@@ -68,6 +75,37 @@ def _crash_and_restart(proc, sock_path, data_dir, workers=None, extra_env=None):
     if os.path.exists(sock_path):
         os.unlink(sock_path)
     return _start_server(data_dir, sock_path, workers=workers, extra_env=extra_env)
+
+
+def _drain_stdout(proc):
+    """Read all currently-available bytes from the master's stdout pipe without
+    blocking. The recovery rebuild marker ('recovery: rebuilding N invalid
+    view(s)') is written by the master (unbuffered libc::write to fd 1) at boot,
+    before 'GnitzDB ready', so it is in the pipe by the time the socket exists."""
+    import fcntl
+    fd = proc.stdout.fileno()
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    out = b""
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    return out.decode(errors="replace")
+
+
+def _rebuilt_view_count(proc):
+    """Parse the most recent 'recovery: rebuilding N invalid view(s)' marker from
+    the master's stdout. Returns N (0 ⇒ every view resumed from its checkpoint),
+    or None if the marker was not seen."""
+    import re
+    text = _drain_stdout(proc)
+    matches = re.findall(r"recovery: rebuilding (\d+) invalid view", text)
+    return int(matches[-1]) if matches else None
 
 
 def _graceful_stop_server(proc, timeout=30):
@@ -249,12 +287,12 @@ def test_view_survives_restart():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_graceful_shutdown_smoke():
-    """Liveness smoke test for the graceful-shutdown path (commit 2): a SIGTERM
-    to the master must drive a final checkpoint and exit cleanly (rc 0, no hang),
-    and a restart must yield correct views. Reload is not wired yet, so the views
-    resume via the (unchanged) rebuild path — this only asserts the signal path
-    is live, not that backfill is skipped (that is a commit-3 assertion)."""
+def test_graceful_shutdown_resumes_without_backfill():
+    """Graceful shutdown (SIGTERM to the master) drives a final checkpoint and
+    exits cleanly (rc 0, no hang); the restart then **resumes** every view from
+    that checkpoint instead of rebuilding it (commit 3). Asserts both correctness
+    (pre-shutdown + post-restart rows) AND that no backfill ran (the master's
+    'recovery: rebuilding 0 invalid view(s)' marker)."""
     tmpdir = tempfile.mkdtemp(
         dir=os.path.expanduser("~/git/gnitz/tmp"),
         prefix="gnitz_graceful_",
@@ -287,8 +325,8 @@ def test_graceful_shutdown_smoke():
         if os.path.exists(sock_path):
             os.unlink(sock_path)
 
-        # Restart: views must be correct (rebuilt) for both the pre-shutdown row
-        # and a freshly pushed one.
+        # Restart: views must resume (no backfill) and be correct for both the
+        # pre-shutdown row and a freshly pushed one.
         proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
         conn = gnitz.connect(sock_path)
         vid2, _ = conn.resolve_table("gs", "v")
@@ -301,6 +339,11 @@ def test_graceful_shutdown_smoke():
             f"post-restart: new row wrong, got {rows}"
         )
         conn.close()
+
+        # The clean restart must resume from the graceful checkpoint — zero views
+        # rebuilt.
+        n = _rebuilt_view_count(proc)
+        assert n == 0, f"clean restart must resume without backfill, but rebuilt {n} view(s)"
         _stop_server(proc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1723,6 +1766,141 @@ def test_global_aggregate_replicated_survives_restart():
         rows = [r for r in conn.scan(vid2) if r.weight > 0]
         assert len(rows) == 1, f"replicated ground must survive restart, got {len(rows)}"
         assert rows[0]["cnt"] == 0 and rows[0]["total"] is None
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _start_expecting_boot_crash(data_dir, sock_path, workers=None, extra_env=None, timeout=20):
+    """Start a server expected to crash during boot recovery (a
+    GNITZ_INJECT_RECOVERY_PANIC seam). Returns its non-zero exit code after
+    confirming it exited without ever creating the socket."""
+    proc = _spawn_server(data_dir, sock_path, workers=workers, extra_env=extra_env)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rc = proc.poll()
+        if rc is not None:
+            return rc
+        if os.path.exists(sock_path):
+            _stop_server(proc)
+            raise RuntimeError("server became ready; expected a boot-recovery crash")
+        time.sleep(0.05)
+    _stop_server(proc)
+    raise RuntimeError("server did not crash within timeout")
+
+
+def _checkpoint_cut(data_dir, sock_path, schema):
+    """Shared 'cut' both checkpoint-resume tests start from: create <schema>.t
+    with view v (dbl = val * 2), insert pks 1..5, then graceful-checkpoint-stop
+    the server and unlink the socket."""
+    proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+    conn = gnitz.connect(sock_path)
+    conn.create_schema(schema)
+    conn.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+        schema_name=schema,
+    )
+    conn.execute_sql(
+        "CREATE VIEW v AS SELECT pk, val * 2 AS dbl FROM t", schema_name=schema,
+    )
+    for k in range(1, 6):
+        conn.execute_sql(f"INSERT INTO t VALUES ({k}, {k * 10})", schema_name=schema)
+    conn.close()
+    rc = _graceful_stop_server(proc)
+    assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}"
+    if os.path.exists(sock_path):
+        os.unlink(sock_path)
+
+
+def test_checkpoint_cut_plus_sigkill_tail_resumes():
+    """A graceful checkpoint (the 'cut'), then more pushes (the 'tail'), then
+    SIGKILL. The restart must resume every view from the checkpoint (0 rebuilt) and
+    replay only the un-checkpointed tail from the SAL, so the view reflects
+    cut + tail."""
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        _checkpoint_cut(data_dir, sock_path, "ct")
+
+        # --- Restart (resumes the cut), then push the tail 6..10, SIGKILL. ---
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        assert _rebuilt_view_count(proc) == 0, "restart after graceful checkpoint must resume the cut"
+        conn = gnitz.connect(sock_path)
+        for k in range(6, 11):
+            conn.execute_sql(f"INSERT INTO t VALUES ({k}, {k * 10})", schema_name="ct")
+        conn.close()
+        proc = _crash_and_restart(proc, sock_path, data_dir, workers=_NUM_WORKERS)
+
+        # --- Resume + tail replay: view = cut + tail, all correct. ---
+        conn = gnitz.connect(sock_path)
+        vid, _ = conn.resolve_table("ct", "v")
+        rows = {r["pk"]: r for r in conn.scan(vid) if r.weight > 0}
+        assert set(rows) == set(range(1, 11)), f"view must reflect cut + tail, got {sorted(rows)}"
+        for k in range(1, 11):
+            assert rows[k]["dbl"] == k * 20, f"pk={k}: expected dbl={k * 20}, got {rows[k]['dbl']}"
+        # The checkpoint was generation-valid, so the tail rode a resume, not a rebuild.
+        assert _rebuilt_view_count(proc) == 0, "SIGKILL with a valid checkpoint must resume + replay the tail"
+        conn.close()
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_recovery_reset_injection_forces_correct_rebuild():
+    """The recovery-start generation bump guards the reset→boot_checkpoint window:
+    a crash there leaves the base durable at cut+tail (boot-flushed) while the
+    views are checkpointed at only the cut and the SAL is reset — a stale-resume
+    trap. The bump advances the durable generation, so the next restart's verdict
+    rejects the stale view and rebuilds it from the (complete) base. Asserts the
+    rebuilt view is CORRECT (cut + tail), not stale (cut only)."""
+    if not is_debug_build():
+        pytest.skip("requires debug build (GNITZ_INJECT_RECOVERY_PANIC seam)")
+
+    tmpdir, data_dir, sock_path = _make_env()
+    try:
+        _checkpoint_cut(data_dir, sock_path, "ri")
+
+        # --- Restart, push the un-checkpointed tail 6..10, then SIGKILL (tail is
+        #     in the SAL, not any view checkpoint). ---
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        for k in range(6, 11):
+            conn.execute_sql(f"INSERT INTO t VALUES ({k}, {k * 10})", schema_name="ri")
+        conn.close()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # --- Restart with the `reset` injection: recovery boot-flushes base to
+        #     cut+tail, resets the SAL, bumps the generation, then crashes before
+        #     boot_checkpoint. The un-checkpointed tail is now durable ONLY in the
+        #     base — the views' checkpoint is still the stale cut. ---
+        rc = _start_expecting_boot_crash(
+            data_dir, sock_path, workers=_NUM_WORKERS,
+            extra_env={"GNITZ_INJECT_RECOVERY_PANIC": "reset"},
+        )
+        assert rc != 0, "injected reset panic must crash boot"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        # --- Clean restart: the bumped durable generation makes the verdict reject
+        #     the stale view and rebuild it from the complete base. The result must
+        #     be cut + tail (1..10), NOT the stale cut (1..5). ---
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vid, _ = conn.resolve_table("ri", "v")
+        rows = {r["pk"]: r for r in conn.scan(vid) if r.weight > 0}
+        assert set(rows) == set(range(1, 11)), (
+            f"gen bump must force a rebuild to the complete base; got {sorted(rows)} "
+            f"(a stale resume would show only 1..5)"
+        )
+        for k in range(1, 11):
+            assert rows[k]["dbl"] == k * 20
+        assert _rebuilt_view_count(proc) >= 1, "the stale view must have been rebuilt, not resumed"
         conn.close()
         _stop_server(proc)
     finally:

@@ -1,24 +1,15 @@
-"""Boot exchange-view backfill must re-derive each exchange view exactly once.
-
-At startup the master rebuilds exchange views by driving each base table that
-roots an exchange view exactly once (drive_dag(base) re-derives that base's whole
-dependent closure). The previous loop drove once per (exchange view, immediate
-source) pair, which re-derived shared closures N times (F1) and drove intermediate
-views as sources (F2), over-counting a view's ephemeral state.
-
-The backfill must also reach views the master classifies by node shape. An
-equi-join carries no `ExchangeShard` node — it scatters its inputs through the
-runtime join-shard path — so the `ExchangeShard`-only classifier used to exclude
-it from the backfill base set. A two-base equi-join whose bases root no other
-exchange view (`x = a JOIN b`) was then driven by neither backfill path and came
-back a deterministic per-key prefix at W>1 (e.g. 9 of 30 rows). The fix seeds the
-base walk with equi-join views too; these tests pin restart-equivalence for the
-join shapes (bare, shared-base) and keep the single-pass-join and range-join
-controls green.
+"""Boot recovery must bring every exchange view back exactly once.
 
 These tests crash-restart a populated server and assert each derived view comes
-back with its pre-restart value, not a multiple. Run at GNITZ_WORKERS=4 (the
-exchange/fanout paths only engage with multiple workers).
+back with its pre-restart value, not a multiple or a per-key prefix. Historical
+regressions they pin: a boot loop that re-derived shared closures once per
+(view, source) pair (doubling every shared-base join), and an
+`ExchangeShard`-only classifier that skipped equi-joins (which scatter through
+the runtime join-shard path, not an `ExchangeShard` node) so a two-base
+equi-join came back a deterministic per-key prefix at W>1 (e.g. 9 of 30 rows).
+The shapes covered: bare and shared-base equi-joins, plus single-pass-join and
+range-join controls. Run at GNITZ_WORKERS=4 (the exchange/fanout paths only
+engage with multiple workers).
 """
 
 import os
@@ -294,11 +285,10 @@ def test_join_sharing_a_base_after_restart():
     `a` must be driven once; the old loop drove it once per listing view, duplicating
     every join output row. Assert both joins match a brute-force join with weight 1.
 
-    These are two-base equi-joins: neither carries an `ExchangeShard` node, so the
-    `ExchangeShard`-only classifier left them out of the backfill base set entirely
-    and both came back a deterministic per-key prefix at W>1 (e.g. 9 of 30). Seeding
-    `exchange_base_tables` with equi-join views drives `a`, `b`, `c`, filling both
-    joins completely.
+    These are two-base equi-joins: neither carries an `ExchangeShard` node, so a
+    node-shape classifier that keys on `ExchangeShard` alone once left them out of
+    the boot re-derivation entirely and both came back a deterministic per-key
+    prefix at W>1 (e.g. 9 of 30). Recovery must fill both joins completely.
     """
     tmpdir, data_dir, sock_path = _make_env("gnitz_joinshare_")
     try:

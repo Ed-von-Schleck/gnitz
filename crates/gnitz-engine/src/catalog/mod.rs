@@ -131,6 +131,13 @@ pub struct CatalogEngine {
     /// compares it against the launched worker count + `STATE_FORMAT` to decide
     /// whether persisted view state is reloadable.
     pub(crate) recorded_topology: u64,
+    /// View ids whose checkpointed output state was rejected at boot (generation
+    /// mismatch, topology change, or a transitively-invalid source view) and must
+    /// be reset-and-rebuilt rather than resumed. Computed pre-fork by
+    /// `compute_invalid_views`, COW-inherited by every worker, and consumed by
+    /// the master's boot rebuild sweep and the per-worker output reset. Empty on
+    /// a clean same-topology restart (every view resumes).
+    pub(crate) invalid_views: rustc_hash::FxHashSet<i64>,
 
     // --- System tables (owned, single-partition, durable) ---
     pub(crate) sys_schemas: Box<Table>,

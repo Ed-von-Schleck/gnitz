@@ -273,6 +273,18 @@ const FD_CHUNK_THRESHOLD: usize = 256;
 
 /// Debug-only test seam: parse env var `var` as a `usize`. Always `None` in
 /// release builds, which never read the environment.
+/// Append-or-insert one base table's effective delta into a `pending_deltas`
+/// map — the single buffering shape shared by the live push path
+/// (`handle_push`) and boot SAL replay (`recover_from_sal`), which must agree
+/// so the recovery tick sweep drains exactly what a live tick would.
+pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, delta: Batch) {
+    if let Some(existing) = pending.get_mut(&tid) {
+        existing.append_batch(&delta, 0, delta.count);
+    } else {
+        pending.insert(tid, delta);
+    }
+}
+
 fn debug_env_usize(var: &str) -> Option<usize> {
     #[cfg(debug_assertions)]
     {
@@ -345,6 +357,11 @@ impl WorkerProcess {
         catalog: *mut CatalogEngine,
         sal_reader: SalReader,
         w2m_writer: W2mWriter,
+        // Effective base-table deltas buffered during SAL replay (the
+        // un-checkpointed tail of every base feeding ≥1 view). The master's
+        // post-reset recovery tick sweep drains these into the views via
+        // `handle_tick`; not cleared on checkpoint, so it survives boot → sweep.
+        pending_deltas: HashMap<i64, Batch>,
     ) -> Self {
         // Worker rank/count (and role) are latched in the fork child before any
         // catalog work — see `server_main`. Not set here: boot-compiled plans
@@ -364,7 +381,7 @@ impl WorkerProcess {
                 backfill_pad: None,
                 backfill_signal: None,
             },
-            pending_deltas: HashMap::new(),
+            pending_deltas,
             pending_streams: VecDeque::new(),
             reply_frame_budget: debug_env_usize("GNITZ_REPLY_FRAME_BUDGET")
                 .filter(|&n| n > 0 && n <= w2m_ring::MAX_W2M_MSG as usize)
@@ -905,7 +922,7 @@ impl WorkerProcess {
 
             SalMessageKind::Backfill => {
                 // `target_id` is the source table; `seek_pk` carries the view to
-                // drive (0 = boot's whole-closure mode, see `handle_backfill`).
+                // drive.
                 if let Err(msg) = self.handle_backfill(target_id, seek_pk as i64, request_id) {
                     return DispatchResult::Error(msg);
                 }
@@ -1159,11 +1176,7 @@ impl WorkerProcess {
             ));
         } else {
             let effective = self.cat().ingest_returning_effective(target_id, batch)?;
-            if let Some(existing) = self.pending_deltas.get_mut(&target_id) {
-                existing.append_batch(&effective, 0, effective.count);
-            } else {
-                self.pending_deltas.insert(target_id, effective);
-            }
+            buffer_pending_delta(&mut self.pending_deltas, target_id, effective);
         }
         gnitz_debug!("W{} push tid={} rows={}", self.worker_id, target_id, row_count);
         Ok(())
@@ -1204,14 +1217,23 @@ impl WorkerProcess {
     /// slot stays `None`, and the worker self-terminates on local drain
     /// exhaustion.
     ///
-    /// **Scope (`view_id`).** `view_id == 0` is boot's *closure* mode: drive
-    /// `source_tid`'s whole dependent closure (`evaluate_dag`), correct because
-    /// every view starts empty at boot. A nonzero `view_id` is the live
-    /// CREATE-VIEW *view-scoped* mode: drive ONLY that new view
-    /// (`backfill_view_step`). The source already has populated existing
-    /// dependents that a closure re-drive would double-count — view-scoping is
-    /// what keeps a live CREATE over a source with prior views correct.
+    /// **View-scoped.** Drives ONLY `view_id` (`backfill_view_step`), never the
+    /// source's whole dependent closure: the source may already have populated
+    /// dependents (live CREATE VIEW over a source with prior views; recovery
+    /// step-4 rebuild next to resumed siblings) that a closure re-drive would
+    /// double-count.
     fn handle_backfill(&mut self, source_tid: i64, view_id: i64, request_id: u64) -> Result<(), String> {
+        // Recovery step-4: the FIRST backfill command for an invalid view resets
+        // its output partitions + operator scratch on THIS worker before any fill,
+        // so the rebuild starts from an empty, well-formed store (the tick sweep
+        // may have polluted its tentatively-loaded state). Gated on the
+        // COW-inherited `invalid_views` set and self-clearing, so a multi-source
+        // join resets once (on its first source) and the remaining sources fill
+        // the just-reset store.
+        if self.cat().invalid_views.contains(&view_id) {
+            self.cat().reset_view_output_for_rebuild(view_id)?;
+            self.cat().invalid_views.remove(&view_id);
+        }
         let chunk_rows = self.cat().ddl_scan_chunk_rows;
         let has = self.cat().has_id(source_tid);
         // Needed to synthesize empty pad chunks. A missing source still pads.
@@ -1234,11 +1256,7 @@ impl WorkerProcess {
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
             self.exchange.backfill_pad = Some(pad);
-            if view_id == 0 {
-                self.evaluate_dag(source_tid, chunk, request_id);
-            } else {
-                produced_any |= self.backfill_view_step(view_id, source_tid, chunk, request_id);
-            }
+            produced_any |= self.backfill_view_step(view_id, source_tid, chunk, request_id);
             // do_exchange_wait applied any inline CHECKPOINT per relay and folded
             // it into Continue; the slot now holds the chunk's stop/continue
             // verdict, or `None` if this chunk issued no exchange (a non-barrier
@@ -1256,11 +1274,11 @@ impl WorkerProcess {
         // chunk's pinned delta registers across the source's dependent closure
         // (and assert each backfilled view is ephemeral).
         self.cat().dag.clear_regfile_deltas_from_source(source_tid);
-        // View-scoped: the closure driver (`drive_dag`) flushes each dirty view
-        // itself, but `backfill_view_step` bypasses it, so flush the new view's
-        // output trace once after the final chunk. Only when it produced rows
-        // (the first source of a join produces none — it just fills its trace).
-        if view_id != 0 && produced_any {
+        // `backfill_view_step` bypasses the closure driver's per-view flush, so
+        // flush the view's output trace once after the final chunk. Only when it
+        // produced rows (the first source of a join produces none — it just
+        // fills its trace).
+        if produced_any {
             // On abort the master's watchdog turns the dead worker into a
             // cluster abort, and restart re-derives the view.
             self.cat().dag.flush_view_or_abort(view_id);

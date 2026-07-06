@@ -1136,11 +1136,6 @@ pub unsafe extern "C" fn gnitz_circuit_union(cb: *mut GnitzCircuitBuilder, a: u6
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn gnitz_circuit_delay(cb: *mut GnitzCircuitBuilder, input: u64) -> u64 {
-    check_ptr_mut!(cb, 0).0.delay(input)
-}
-
-#[no_mangle]
 pub unsafe extern "C" fn gnitz_circuit_distinct(cb: *mut GnitzCircuitBuilder, input: u64) -> u64 {
     check_ptr_mut!(cb, 0).0.distinct(input)
 }

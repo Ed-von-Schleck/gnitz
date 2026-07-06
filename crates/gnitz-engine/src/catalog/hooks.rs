@@ -157,7 +157,7 @@ impl CatalogEngine {
     /// and is pure construction, so callers own crash-cleanup. Hoisting it would need
     /// `&mut self` and still would not unify with the index path, whose cleanup also
     /// wraps `backfill_index`.
-    fn build_partitioned_storage(
+    pub(crate) fn build_partitioned_storage(
         &self,
         kind: RelationKind,
         directory: &str,
@@ -481,22 +481,21 @@ impl CatalogEngine {
 
                 // During DROP VIEW rollback the partition files are intact; re-pushing
                 // source rows through the circuit would double every aggregation.
-                // Boot no longer backfills views inline: recover_from_sal restores
-                // unflushed base rows (bypassing view derivation), then the worker
-                // post-recovery pass rebuilds cascade-unreachable non-exchange views
-                // and the master's backfill_exchange_views cascade re-derives the rest.
+                // Boot never backfills views inline either: valid views resume from
+                // their checkpoint and the master drives the recovery tick sweep +
+                // invalid-view rebuild (see runtime/bootstrap.rs).
                 //
                 // For a live CREATE, only a PLAIN single-source view (no exchange
                 // round, no join-shard scatter) is backfilled inline here — the
                 // single-process `backfill_view` is the right driver for it. Every
                 // exchange view AND every equi-join (`view_seeds_exchange_backfill`)
                 // is left empty here and driven by the live DDL handler's
-                // distributed, view-scoped `fan_out_backfill` (and at boot by
-                // `backfill_exchange_views`): the single-process driver under-fills
-                // them (an exchange view gets no shuffle; a multi-worker equi-join
-                // joins only each worker's local shard). The handler drains the new
-                // view's base sources before this runs, so the inline scan sees
-                // committed data and no deferred tick double-drives it.
+                // distributed, view-scoped `fan_out_backfill`: the single-process
+                // driver under-fills them (an exchange view gets no shuffle; a
+                // multi-worker equi-join joins only each worker's local shard). The
+                // handler drains the new view's base sources before this runs, so
+                // the inline scan sees committed data and no deferred tick
+                // double-drives it.
                 if !self.ctx.in_rollback()
                     && self.ctx.is_live()
                     && self.active_part_start != self.active_part_end

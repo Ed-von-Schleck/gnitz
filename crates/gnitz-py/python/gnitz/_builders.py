@@ -9,7 +9,6 @@ class CircuitBuilder:
     def trace_scan(self, table_id):               return self._native.trace_scan(table_id)
     def negate(self, input):                      return self._native.negate(input)
     def union(self, a, b):                        return self._native.union(a, b)
-    def delay(self, input):                       return self._native.delay(input)
     def distinct(self, input):                    return self._native.distinct(input)
     def filter(self, input, expr=None):           return self._native.filter(input, expr)
     def map(self, input, projection=None):        return self._native.map(input, projection)

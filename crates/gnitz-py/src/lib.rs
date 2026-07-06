@@ -1906,9 +1906,6 @@ impl PyCircuitBuilder {
     pub fn union(&mut self, a: u64, b: u64) -> PyResult<u64> {
         Ok(circuit_builder!(self).union(a, b))
     }
-    pub fn delay(&mut self, input: u64) -> PyResult<u64> {
-        Ok(circuit_builder!(self).delay(input))
-    }
     pub fn distinct(&mut self, input: u64) -> PyResult<u64> {
         Ok(circuit_builder!(self).distinct(input))
     }

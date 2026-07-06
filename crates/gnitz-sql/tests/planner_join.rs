@@ -1,9 +1,9 @@
 #![cfg(feature = "integration")]
 
 use gnitz_core::{
-    OPCODE_DELAY, OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_FILTER, OPCODE_INTEGRATE_TRACE,
-    OPCODE_JOIN_DELTA_TRACE, OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR, OPCODE_MAP_PROJ, OPCODE_NEGATE,
-    OPCODE_NULL_EXTEND, OPCODE_PARTITION_FILTER, OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_SCAN_DELTA, OPCODE_UNION,
+    OPCODE_DISTINCT, OPCODE_EXCHANGE_SHARD, OPCODE_FILTER, OPCODE_INTEGRATE_TRACE, OPCODE_JOIN_DELTA_TRACE,
+    OPCODE_JOIN_DELTA_TRACE_RANGE, OPCODE_MAP_EXPR, OPCODE_MAP_PROJ, OPCODE_NEGATE, OPCODE_NULL_EXTEND,
+    OPCODE_PARTITION_FILTER, OPCODE_POSITIVE_PART, OPCODE_REDUCE, OPCODE_SCAN_DELTA, OPCODE_UNION,
 };
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
@@ -1091,9 +1091,8 @@ fn test_pure_range_left_join_circuit_shape() {
         "two side PartitionFilters; trace_m has none"
     );
 
-    // No equi join machinery, no Delay.
+    // No equi join machinery.
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
-    assert_eq!(n_left(OPCODE_DELAY), 0, "no Delay node");
 
     // No per-view catalog helpers are created (the user-surface leak this redesign
     // removes): neither the old `__m` aggregate view nor the `__sent` sentinel table.
@@ -1394,7 +1393,7 @@ fn test_range_join_partition_filter_circuit_shape() {
 /// chain `distinct(π_A(inner))` → `negate` → `union` (A − D) → `null_extend` →
 /// re-key → project → `union` (inner ∪ null-fill): `map_reindex ×3`, `map ×2`,
 /// `distinct ×1`, `negate ×1`, `union ×2`, `null_extend ×1`. Crucially it adds
-/// **zero** ExchangeShard, range/anti/outer Join, IntegrateTrace, Delay, or
+/// **zero** ExchangeShard, range/anti/outer Join, IntegrateTrace, or
 /// PartitionFilter — the null-fill is partition-local and reuses the inner output,
 /// riding the one existing pair-PK output exchange. The INNER view is unchanged
 /// (no distinct / null_extend / negate).
@@ -1464,7 +1463,7 @@ fn test_band_left_join_circuit_shape() {
         "null_extend(diff)"
     );
 
-    // No extra exchange, no extra join machinery, no extra trace/delay/partition —
+    // No extra exchange, no extra join machinery, no extra trace/partition —
     // the null-fill is partition-local and reuses the inner range output.
     assert_eq!(
         n_left(OPCODE_EXCHANGE_SHARD),
@@ -1486,7 +1485,6 @@ fn test_band_left_join_circuit_shape() {
         0,
         "band LEFT carries no PartitionFilter"
     );
-    assert_eq!(n_left(OPCODE_DELAY), 0, "no Delay node");
     assert_eq!(n_left(OPCODE_JOIN_DELTA_TRACE), 0, "no equi delta-trace join");
 
     // Exactly one positive_part, no distinct, and the INNER view is shape-unchanged.

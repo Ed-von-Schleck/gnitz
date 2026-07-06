@@ -417,42 +417,6 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Raw store ingest: SAL recovery path — no unique_pk, no hooks, no index projection.
-    pub(crate) fn raw_store_ingest(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
-        let entry = self
-            .dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))?;
-        entry
-            .handle
-            .ingest_owned_batch(batch)
-            .map_err(|e| format!("raw_store_ingest: ingest failed (table_id={table_id}): {e}"))?;
-        Ok(())
-    }
-
-    /// SAL recovery replay — unique_pk-aware. Routes user-table batches
-    /// through the full `ingest_returning_effective` path so that
-    /// retractions (which carry zero-padded payloads on the wire) are
-    /// resolved against the actual stored payload instead of being
-    /// added as orphaned rows. The retract-and-insert pattern in
-    /// `enforce_unique_pk` makes the replay idempotent
-    /// w.r.t. already-flushed data.
-    ///
-    /// Index shards see duplicate `(+1, -1)` projections when a batch
-    /// is replayed after already having been flushed. These consolidate
-    /// to zero on read and are pruned at the next compaction.
-    pub fn replay_ingest(&mut self, table_id: i64, batch: Batch) -> Result<(), String> {
-        if table_id < FIRST_USER_TABLE_ID {
-            // System tables: use raw ingest (no unique_pk semantics).
-            return self.raw_store_ingest(table_id, batch);
-        }
-        self.dag
-            .ingest_returning_effective(table_id, batch)
-            .map(|_| ())
-            .ok_or_else(|| format!("replay_ingest failed for table_id={table_id}: not registered"))
-    }
-
     // -- Scan store -------------------------------------------------------
 
     pub(crate) fn scan_store(&mut self, table_id: i64, schema: &SchemaDescriptor) -> Rc<Batch> {

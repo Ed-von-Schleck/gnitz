@@ -10,11 +10,11 @@
 //!
 //! Views are *not* rebuilt at catalog open. The inline open-time `backfill_view`
 //! is gated live-only, so a `CatalogEngine::open` in isolation reopens views
-//! **empty**; the boot view rebuild moved to the runtime layer — the per-worker
-//! post-recovery pass (cascade-unreachable non-exchange views) and the master's
-//! `backfill_exchange_views` cascade — and is exercised by the E2E suite, not
-//! this single-process catalog test. These tests assert the catalog-layer
-//! contract: index rebuilds once, view defers (comes back empty).
+//! **empty**; boot view state lives in the runtime layer — checkpoint resume for
+//! generation-valid views, the master-driven invalid-view rebuild otherwise —
+//! and is exercised by the E2E suite, not this single-process catalog test.
+//! These tests assert the catalog-layer contract: index rebuilds once, view
+//! defers (comes back empty).
 
 use super::*;
 
@@ -41,8 +41,7 @@ fn sum_weights(mut c: CursorHandle) -> i64 {
 //
 // This single-process path exercises `backfill_index` (still inline at open)
 // and the live CREATE VIEW backfill (is_live during the test's CREATE). The
-// boot view rebuild (`backfill_exchange_views` + the worker non-exchange pass)
-// is covered by the E2E suite.
+// boot resume/rebuild of views is covered by the E2E suite.
 
 #[test]
 fn index_rebuilds_once_view_defers_on_reopen() {

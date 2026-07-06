@@ -44,6 +44,9 @@ const ENTRY_SIZE_V6: usize = 338;
 /// always correct because it re-derives.
 pub const STATE_FORMAT: u32 = 1;
 
+// Header offset of the manifest entry count.
+const OFF_ENTRY_COUNT: usize = 16;
+
 // Header offset of the per-table compaction sequence.
 const OFF_COMPACT_SEQ: usize = 32;
 
@@ -150,7 +153,7 @@ pub fn serialize(
     // Write header
     write_u64_le(out_buf, 0, MAGIC);
     write_u64_le(out_buf, 8, VERSION_V6);
-    write_u64_le(out_buf, 16, count as u64);
+    write_u64_le(out_buf, OFF_ENTRY_COUNT, count as u64);
     write_u64_le(out_buf, 24, header.global_max_lsn);
     write_u64_le(out_buf, OFF_COMPACT_SEQ, header.compact_seq);
     write_u64_le(out_buf, OFF_GENERATION, header.generation);
@@ -197,7 +200,7 @@ pub fn parse(
     }
 
     let version = read_u64_le(buf, 8);
-    let count = read_u64_le(buf, 16) as usize;
+    let count = read_u64_le(buf, OFF_ENTRY_COUNT) as usize;
     let header = ManifestHeader {
         global_max_lsn: read_u64_le(buf, 24),
         compact_seq: read_u64_le(buf, OFF_COMPACT_SEQ),
@@ -348,12 +351,11 @@ pub fn prepare_file(
     })
 }
 
-/// Read just the entry count from a manifest file header.
+/// Read one `u64` field at `off` from a manifest file's validated header.
 ///
-/// Returns `Ok(None)` when the file cannot be opened (does not exist yet —
-/// load_manifest treats this as the empty manifest), `Ok(Some(n))` when the
-/// header parses, or `Err(_)` on any other failure.
-pub fn entry_count(path: &std::ffi::CStr) -> Result<Option<usize>, StorageError> {
+/// Returns `Ok(None)` when the file cannot be opened (does not exist yet),
+/// `Ok(Some(v))` when the header parses, or `Err(_)` on any other failure.
+fn peek_header_u64(path: &std::ffi::CStr, off: usize) -> Result<Option<u64>, StorageError> {
     let Some(fd) = open_owned(path, libc::O_RDONLY) else {
         return Ok(None);
     };
@@ -367,7 +369,22 @@ pub fn entry_count(path: &std::ffi::CStr) -> Result<Option<usize>, StorageError>
     if magic != MAGIC {
         return Err(StorageError::InvalidMagic);
     }
-    Ok(Some(read_u64_le(&hdr, 16) as usize))
+    Ok(Some(read_u64_le(&hdr, off)))
+}
+
+/// Read just the entry count from a manifest file header. `Ok(None)` when the
+/// file does not exist yet — load_manifest treats this as the empty manifest.
+pub fn entry_count(path: &std::ffi::CStr) -> Result<Option<usize>, StorageError> {
+    Ok(peek_header_u64(path, OFF_ENTRY_COUNT)?.map(|n| n as usize))
+}
+
+/// Read just the checkpoint generation from a manifest file header. `Ok(None)`
+/// when the file does not exist yet. Used by the conditional view-state reload:
+/// a `RederiveCheckpointed` table loads its shards only when its manifest
+/// generation equals the committed checkpoint generation, and erases them
+/// otherwise.
+pub fn peek_generation(path: &std::ffi::CStr) -> Result<Option<u64>, StorageError> {
+    peek_header_u64(path, OFF_GENERATION)
 }
 
 // ---------------------------------------------------------------------------
@@ -695,5 +712,39 @@ mod tests {
         let (count, header) = read_file(&cpath, &mut out, 1).unwrap();
         assert_eq!(count, 0);
         assert_eq!(header.global_max_lsn, 42);
+    }
+
+    #[test]
+    fn peek_generation_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST_GEN");
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        // Absent file ⇒ Ok(None).
+        assert_eq!(peek_generation(&cpath).unwrap(), None);
+
+        // Non-zero generation round-trips through the header.
+        write_manifest(
+            &cpath,
+            &[make_entry(1, "shard_1.db")],
+            ManifestHeader {
+                global_max_lsn: 7,
+                compact_seq: 3,
+                generation: 42,
+            },
+        );
+        assert_eq!(peek_generation(&cpath).unwrap(), Some(42));
+
+        // Republish at generation 0 (the default committed generation).
+        write_manifest(
+            &cpath,
+            &[make_entry(1, "shard_1.db")],
+            ManifestHeader {
+                global_max_lsn: 7,
+                compact_seq: 3,
+                generation: 0,
+            },
+        );
+        assert_eq!(peek_generation(&cpath).unwrap(), Some(0));
     }
 }

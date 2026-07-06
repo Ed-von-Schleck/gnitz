@@ -163,7 +163,6 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
         }
         OpNode::Negate => ((OPCODE_NEGATE, None, None), Vec::new()),
         OpNode::Union => ((OPCODE_UNION, None, None), Vec::new()),
-        OpNode::Delay => ((OPCODE_DELAY, None, None), Vec::new()),
         OpNode::Distinct => ((OPCODE_DISTINCT, None, None), Vec::new()),
         OpNode::PositivePart => ((OPCODE_POSITIVE_PART, None, None), Vec::new()),
         OpNode::Reduce {
@@ -349,12 +348,6 @@ impl CircuitBuilder {
         let nid = self.alloc_node(OpNode::Union);
         self.connect(a, nid, gnitz_wire::PORT_IN_A);
         self.connect(b, nid, gnitz_wire::PORT_IN_B);
-        nid
-    }
-
-    pub fn delay(&mut self, input: NodeId) -> NodeId {
-        let nid = self.alloc_node(OpNode::Delay);
-        self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
     }
 

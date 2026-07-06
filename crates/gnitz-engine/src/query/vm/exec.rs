@@ -152,24 +152,6 @@ pub(crate) fn execute_epoch_multi(
                 regfile.clear_deltas();
             }
 
-            Instr::Delay { src, state_reg, dst } => {
-                // reg_mut! hands out aliasing &mut via a raw pointer, so
-                // coincident indices would make the swaps below form two &mut to
-                // one register — UB. The compiler always assigns distinct
-                // registers; assert it in every profile (free, once per epoch)
-                // rather than only in debug.
-                assert_ne!(*src, *state_reg, "Delay: src and state_reg must be distinct");
-                assert_ne!(*src, *dst, "Delay: src and dst must be distinct");
-                assert_ne!(*state_reg, *dst, "Delay: state_reg and dst must be distinct");
-                // Rotate the three registers in place with zero allocation:
-                // dst ← old state_reg, state_reg ← old src, src ← old dst.
-                // Correctness of the two-swap rotation relies on `dst` being
-                // empty at epoch start; otherwise `src` would not end empty.
-                debug_assert_eq!(reg!(*dst).batch.count, 0, "Delay: dst must be empty at epoch start");
-                std::mem::swap(&mut reg_mut!(*src).batch, &mut reg_mut!(*state_reg).batch);
-                std::mem::swap(&mut reg_mut!(*src).batch, &mut reg_mut!(*dst).batch);
-            }
-
             Instr::ScanTrace {
                 trace_reg,
                 out_reg,

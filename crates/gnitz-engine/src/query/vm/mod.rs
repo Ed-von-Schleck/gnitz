@@ -19,11 +19,6 @@ pub(crate) use exec::{execute_epoch, execute_epoch_multi};
 pub(crate) enum Instr {
     Halt,
     ClearDeltas,
-    Delay {
-        src: u16,
-        state_reg: u16,
-        dst: u16,
-    },
     ScanTrace {
         trace_reg: u16,
         out_reg: u16,
@@ -255,13 +250,11 @@ impl VmHandle {
 // Program
 // ---------------------------------------------------------------------------
 
-/// Register kind: delta (transient), trace (persistent cursor + table),
-/// or delay_state (persistent batch for z⁻¹ cross-epoch storage).
+/// Register kind: delta (transient) or trace (persistent cursor + table).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegisterKind {
     Delta,
     Trace,
-    DelayState,
 }
 
 /// Per-register metadata.
@@ -282,12 +275,6 @@ impl RegisterMeta {
         Self {
             schema,
             kind: RegisterKind::Trace,
-        }
-    }
-    pub const fn delay_state(schema: SchemaDescriptor) -> Self {
-        Self {
-            schema,
-            kind: RegisterKind::DelayState,
         }
     }
 }
@@ -589,324 +576,10 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // ── Delay (z⁻¹) tests ───────────────────────────────────────────────
-    //
-    // Register layout for all single-delay tests:
-    //   reg 0: Delta     (src / input_reg)
-    //   reg 1: DelayState (state_reg)
-    //   reg 2: Delta     (dst / output_reg)
-
-    #[test]
-    fn test_delay_correct_temporal_semantics() {
-        // At tick t, output must be the input from tick t-1 (z⁻¹ semantics).
-        let schema = schema_1i64();
-
-        let mut builder = ProgramBuilder::new();
-        builder.add_delay(0, 1, 2);
-        builder.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::delay_state(schema),
-            RegisterMeta::delta(schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-
-        // Tick 0: z⁻¹[0] = 0 → None
-        let input0 = make_batch(schema, &[(1u128, 1, 10)]);
-        let r0 = execute_epoch(&vm.program, &mut vm.regfile, input0, 0, 2, &cursors, &[]).unwrap();
-        assert!(r0.is_none(), "tick 0 must return None (z⁻¹[0] = 0)");
-
-        // Tick 1: output = tick 0's input
-        let input1 = make_batch(schema, &[(2u128, 1, 20)]);
-        let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors, &[])
-            .unwrap()
-            .unwrap();
-        let rows1 = extract_rows(&r1);
-        assert_eq!(rows1, vec![(1, 1, 10)]);
-
-        // Tick 2: output = tick 1's input
-        let input2 = make_batch(schema, &[(3u128, 1, 30)]);
-        let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors, &[])
-            .unwrap()
-            .unwrap();
-        let rows2 = extract_rows(&r2);
-        assert_eq!(rows2, vec![(2, 1, 20)]);
-    }
-
-    #[test]
-    fn test_delay_empty_first_tick() {
-        let schema = schema_1i64();
-
-        let mut builder = ProgramBuilder::new();
-        builder.add_delay(0, 1, 2);
-        builder.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::delay_state(schema),
-            RegisterMeta::delta(schema),
-        ];
-        let vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-
-        let input = make_batch(schema, &[(1u128, 1, 99)]);
-        let r = execute_epoch(&vm.program, &mut { vm.regfile }, input, 0, 2, &cursors, &[]).unwrap();
-        assert!(r.is_none(), "tick 0 must always return None regardless of input");
-    }
-
-    #[test]
-    fn test_delay_empty_intermediate_tick() {
-        // An empty input is stored and replayed correctly.
-        let schema = schema_1i64();
-
-        let mut builder = ProgramBuilder::new();
-        builder.add_delay(0, 1, 2);
-        builder.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::delay_state(schema),
-            RegisterMeta::delta(schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-
-        // Tick 0: non-empty input → None
-        let r0 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[(1u128, 1, 10)]),
-            0,
-            2,
-            &cursors,
-            &[],
-        )
-        .unwrap();
-        assert!(r0.is_none());
-
-        // Tick 1: empty input → tick 0's input replayed
-        let r1 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[]),
-            0,
-            2,
-            &cursors,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(extract_rows(&r1), vec![(1, 1, 10)]);
-
-        // Tick 2: non-empty input → empty (tick 1's empty was stored)
-        let r2 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[(2u128, 1, 20)]),
-            0,
-            2,
-            &cursors,
-            &[],
-        )
-        .unwrap();
-        assert!(r2.is_none(), "tick 2 output should be empty (tick 1 input was empty)");
-
-        // Tick 3: empty input → tick 2's input replayed
-        let r3 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[]),
-            0,
-            2,
-            &cursors,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(extract_rows(&r3), vec![(2, 1, 20)]);
-    }
-
-    #[test]
-    fn test_delay_preserves_negative_weights() {
-        let schema = schema_1i64();
-
-        let mut builder = ProgramBuilder::new();
-        builder.add_delay(0, 1, 2);
-        builder.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::delay_state(schema),
-            RegisterMeta::delta(schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-
-        // Tick 0: insertion → None
-        let r0 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[(1u128, 1, 10)]),
-            0,
-            2,
-            &cursors,
-            &[],
-        )
-        .unwrap();
-        assert!(r0.is_none());
-
-        // Tick 1: retraction → tick 0's insertion replayed
-        let r1 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[(1u128, -1, 10)]),
-            0,
-            2,
-            &cursors,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(extract_rows(&r1), vec![(1, 1, 10)]);
-
-        // Tick 2: empty → tick 1's retraction replayed
-        let r2 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[]),
-            0,
-            2,
-            &cursors,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(extract_rows(&r2), vec![(1, -1, 10)]);
-    }
-
-    #[test]
-    fn test_delay_chain() {
-        // Two delays in series: input → Delay1(state1, mid) → Delay2(state2, out)
-        // implements a 2-tick delay.
-        //
-        // Register layout:
-        //   reg 0: Delta      (input)
-        //   reg 1: DelayState (state1)
-        //   reg 2: Delta      (mid, output of delay1 / input of delay2)
-        //   reg 3: DelayState (state2)
-        //   reg 4: Delta      (output)
-        let schema = schema_1i64();
-
-        let mut builder = ProgramBuilder::new();
-        builder.add_delay(0, 1, 2);
-        builder.add_delay(2, 3, 4);
-        builder.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::delay_state(schema),
-            RegisterMeta::delta(schema),
-            RegisterMeta::delay_state(schema),
-            RegisterMeta::delta(schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 5];
-
-        // Tick 0: no output yet
-        let r0 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[(1u128, 1, 10)]),
-            0,
-            4,
-            &cursors,
-            &[],
-        )
-        .unwrap();
-        assert!(r0.is_none());
-
-        // Tick 1: still no output (need 2 ticks of delay)
-        let r1 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[(2u128, 1, 20)]),
-            0,
-            4,
-            &cursors,
-            &[],
-        )
-        .unwrap();
-        assert!(r1.is_none());
-
-        // Tick 2: tick 0's input arrives
-        let r2 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[(3u128, 1, 30)]),
-            0,
-            4,
-            &cursors,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(extract_rows(&r2), vec![(1, 1, 10)]);
-
-        // Tick 3: empty input → tick 1's input arrives
-        let r3 = execute_epoch(
-            &vm.program,
-            &mut vm.regfile,
-            make_batch(schema, &[]),
-            0,
-            4,
-            &cursors,
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(extract_rows(&r3), vec![(2, 1, 20)]);
-    }
-
-    #[test]
-    fn test_delay_state_not_cleared_between_ticks() {
-        // Directly verify that DelayState persists: after tick 0, state_reg holds
-        // the input; after tick 1, it holds the new input.
-        let schema = schema_1i64();
-
-        let mut builder = ProgramBuilder::new();
-        builder.add_delay(0, 1, 2);
-        builder.add_halt();
-
-        let reg_meta = [
-            RegisterMeta::delta(schema),
-            RegisterMeta::delay_state(schema),
-            RegisterMeta::delta(schema),
-        ];
-        let mut vm = *builder.build(&reg_meta);
-        let cursors = vec![std::ptr::null_mut(); 3];
-
-        let input0 = make_batch(schema, &[(1u128, 1, 10)]);
-        execute_epoch(&vm.program, &mut vm.regfile, input0, 0, 2, &cursors, &[]).unwrap();
-        assert_eq!(
-            vm.regfile.registers[1].batch.count, 1,
-            "state_reg must hold tick 0's input"
-        );
-
-        let input1 = make_batch(schema, &[(2u128, 1, 20), (3u128, 1, 30)]);
-        execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors, &[]).unwrap();
-        assert_eq!(
-            vm.regfile.registers[1].batch.count, 2,
-            "state_reg must hold tick 1's input"
-        );
-    }
-
     #[test]
     fn test_union_operator() {
-        // Union combines two batches. Use a pipeline: filter input into reg 1,
-        // then delay input into reg 0 copy, then union reg 0 + reg 1.
-        // Simpler: just union reg 0 with has_b=false (single input mode).
+        // Union combines two batches; here just union reg 0 with has_b=false
+        // (single input mode).
         let schema = schema_1i64();
 
         let mut builder = ProgramBuilder::new();

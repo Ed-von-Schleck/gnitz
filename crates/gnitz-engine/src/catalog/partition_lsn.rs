@@ -3,6 +3,7 @@
 //! allocator read.
 
 use super::*;
+use rustc_hash::FxHashSet;
 
 const SYS_TABLE_IDS: &[i64] = &[
     SCHEMA_TAB_ID,
@@ -16,6 +17,13 @@ const SYS_TABLE_IDS: &[i64] = &[
     CIRCUIT_EDGES_TAB_ID,
     CIRCUIT_NODE_COLUMNS_TAB_ID,
 ];
+
+/// Path of one partition's manifest inside a partitioned store's directory —
+/// the single catalog-side spelling of the `part_{p}/manifest.bin` layout the
+/// resume verdict peeks and the rebuild reset unlinks.
+fn partition_manifest_path(dir: &str, p: u32) -> String {
+    format!("{dir}/part_{p}/manifest.bin")
+}
 
 impl CatalogEngine {
     // -- Partition management (for multi-worker fork) -------------------------
@@ -81,12 +89,7 @@ impl CatalogEngine {
             .dag
             .tables
             .iter()
-            .filter(|(_, e)| {
-                e.handle
-                    .as_partitioned_mut()
-                    .map(|p| p.is_replicated())
-                    .unwrap_or(false)
-            })
+            .filter(|(_, e)| e.handle.is_replicated())
             .map(|(&tid, _)| tid)
             .collect();
         for tid in tids {
@@ -104,6 +107,64 @@ impl CatalogEngine {
             .map_err(|e| format!("rehome single-partition store tid={tid}: {e:?}"))?;
             entry.handle = StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt)));
         }
+        Ok(())
+    }
+
+    /// Reset an invalid view's output store and per-worker operator scratch to an
+    /// empty, well-formed state, then drop its cached plan — recovery step-4, run
+    /// per worker on its own owned partitions before the view is rebuilt.
+    ///
+    /// Unlinks every owned partition's `manifest.bin` first, so the empty rebuild
+    /// below (a `RederiveCheckpointed` open) peeks `None` and *erases* the stale
+    /// generation-`g` shards rather than reloading them — load-bearing for a
+    /// transitively-invalid view whose own manifests are still at `g`. Then
+    /// rebuilds the handle empty via `build_partitioned_storage` (same shape:
+    /// replicated → one child at `part_start`, else the hashed active range),
+    /// removes this worker's `scratch_*_w{rank}` operator dirs, and invalidates the
+    /// plan cache so the next backfill recompiles against the empty store + fresh
+    /// scratch.
+    pub(crate) fn reset_view_output_for_rebuild(&mut self, vid: i64) -> Result<(), String> {
+        let (dir, schema, kind, replicated) = {
+            let entry = self
+                .dag
+                .tables
+                .get(&vid)
+                .ok_or_else(|| format!("reset_view_output_for_rebuild: view {vid} not registered"))?;
+            (
+                entry.directory.clone(),
+                entry.schema,
+                entry.kind,
+                entry.handle.is_replicated(),
+            )
+        };
+
+        // Owned partition indices on THIS worker: one child at `part_start` for a
+        // replicated store, else the full active range.
+        let (p_start, p_end) = if replicated {
+            (self.active_part_start, self.active_part_start + 1)
+        } else {
+            (self.active_part_start, self.active_part_end)
+        };
+        for p in p_start..p_end {
+            let _ = std::fs::remove_file(partition_manifest_path(&dir, p));
+        }
+
+        // Rebuild empty (same shape). Each partition's `Table::new` erases the
+        // stale shards (manifest now absent → `RederiveCheckpointed` peek `None`).
+        let pt = self.build_partitioned_storage(kind, &dir, "", vid, schema, replicated)?;
+        self.dag.tables.get_mut(&vid).expect("view present").handle =
+            StoreHandle::Partitioned(std::cell::UnsafeCell::new(Box::new(pt)));
+
+        // Remove this worker's per-view operator scratch dirs (rank-stamped).
+        for name in subdir_names(&dir) {
+            if crate::query::is_worker_scratch_dir_name(&name) {
+                let _ = std::fs::remove_dir_all(format!("{dir}/{name}"));
+            }
+        }
+
+        // Drop the cached plan so the next backfill recompiles against the empty
+        // store + fresh scratch.
+        self.dag.invalidate(vid);
         Ok(())
     }
 
@@ -180,6 +241,94 @@ impl CatalogEngine {
             }
         }
         map
+    }
+
+    /// Compute the set of view ids whose checkpointed output state must be
+    /// rejected at boot and rebuilt, rather than resumed from its manifests.
+    ///
+    /// A view is **valid** (resumed) iff:
+    ///   * the recorded topology matches the launched `(worker_count, STATE_FORMAT)`
+    ///     — a different worker count re-shapes every hashed store's partition map;
+    ///   * every one of its output-store partition manifests is stamped with the
+    ///     committed checkpoint generation — `worker_ctx::committed_generation()`,
+    ///     the in-memory recovered `G`, NOT the recovery-start-bumped durable
+    ///     `G+1` — matching what `Table::new`'s conditional load peeks; and
+    ///   * every VIEW it scans (ScanDelta cascade dep OR ScanTrace static
+    ///     `ext_trace` read) is itself valid — else it could read a rebuilt
+    ///     sibling's freshly-emptied output store.
+    ///
+    /// Two phases. Phase 1 decides each view's **local** validity (topology +
+    /// output manifests). Phase 2 propagates invalidity to any view scanning an
+    /// invalid source, iterating to a fixpoint — robust to arbitrary source
+    /// orderings, including a `ScanTrace`-of-view (not a cascade dependency, so its
+    /// `depth` need not sit below its reader's).
+    ///
+    /// Output-partition manifests are enumerated by **store shape**: a replicated
+    /// store (one child per worker, homed at `part_{worker.part_start}`) has one
+    /// manifest per launched worker; a hashed store spreads over all 256 partitions.
+    pub fn compute_invalid_views(&mut self, launched_workers: u32) -> FxHashSet<i64> {
+        let g = crate::foundation::worker_ctx::committed_generation();
+        let topo_value = ((launched_workers as u64) << 32) | crate::storage::STATE_FORMAT as u64;
+        let topo_valid = self.recorded_topology == topo_value;
+
+        let view_ids: Vec<i64> = self
+            .dag
+            .tables
+            .iter()
+            .filter(|(_, e)| e.kind == RelationKind::View)
+            .map(|(&vid, _)| vid)
+            .collect();
+
+        // Phase 1: local validity (topology + every output-partition manifest at g).
+        let chunk = NUM_PARTITIONS / launched_workers.max(1);
+        let mut invalid: FxHashSet<i64> = FxHashSet::default();
+        for &vid in &view_ids {
+            let local_ok = topo_valid && {
+                let entry = self.dag.tables.get(&vid).expect("vid taken from tables iter");
+                let dir = &entry.directory;
+                let at_g = |p: u32| match std::ffi::CString::new(partition_manifest_path(dir, p)) {
+                    Ok(c) => matches!(crate::storage::peek_generation(&c), Ok(Some(mg)) if mg == g),
+                    Err(_) => false,
+                };
+                if entry.handle.is_replicated() {
+                    (0..launched_workers).map(|w| w * chunk).all(at_g)
+                } else {
+                    (0..NUM_PARTITIONS).all(at_g)
+                }
+            };
+            if !local_ok {
+                invalid.insert(vid);
+            }
+        }
+        if invalid.is_empty() {
+            // Clean same-topology restart: nothing to propagate, skip the
+            // meta-circuit loads below.
+            return invalid;
+        }
+
+        // Phase 2: propagate invalidity to any still-valid view that scans an
+        // invalid source (ScanDelta or ScanTrace). Base sources never enter
+        // `invalid`, so they pass. Fixpoint over the (finite) view set; each
+        // view's scan sources are loaded once up front (`all_scan_source_ids`
+        // reads the meta circuit off the system tables).
+        let scan_sources: Vec<(i64, Vec<i64>)> = view_ids
+            .iter()
+            .filter(|vid| !invalid.contains(vid))
+            .map(|&vid| (vid, self.dag.all_scan_source_ids(vid)))
+            .collect();
+        loop {
+            let mut changed = false;
+            for (vid, sources) in &scan_sources {
+                if !invalid.contains(vid) && sources.iter().any(|s| invalid.contains(s)) {
+                    invalid.insert(*vid);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        invalid
     }
 
     /// Maximum `current_lsn` across all tables — system and user. The
