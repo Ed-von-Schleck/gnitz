@@ -83,3 +83,73 @@ fn test_empty_batch() {
     let result = func.evaluate_map_batch(&batch, &schema);
     assert_eq!(result.count, 0);
 }
+
+#[test]
+fn test_map_blob_passthrough_and_fallback() {
+    use crate::schema::german_string_content;
+
+    // German-string struct: short (≤12 bytes) inline, else heap-backed.
+    fn push_gs(b: &mut Batch, pi: usize, s: &[u8]) {
+        let gs = crate::test_support::german_string(s, &mut b.blob);
+        b.extend_col(pi, &gs);
+    }
+    fn read_gs(batch: &Batch, pi: usize, row: usize) -> Vec<u8> {
+        german_string_content(&batch.col_data(pi)[row * 16..row * 16 + 16], &batch.blob).to_vec()
+    }
+    // Input: [U64 PK, STRING s1 (short inline), STRING s2 (long, heap-backed)].
+    fn build(schema: &SchemaDescriptor) -> Batch {
+        let mut b = Batch::with_schema(*schema, 2);
+        for (pk, s1, s2) in [
+            (1u128, b"ab".as_slice(), b"long-string-one-xyz".as_slice()),
+            (2u128, b"cd".as_slice(), b"long-string-two-abcdef".as_slice()),
+        ] {
+            b.extend_pk(pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            push_gs(&mut b, 0, s1); // payload idx 0 = s1
+            push_gs(&mut b, 1, s2); // payload idx 1 = s2
+            b.count += 1;
+        }
+        b
+    }
+
+    let in_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
+
+    // (A) Keep BOTH string columns (reordered) → passthrough fires; the shared
+    // blob keeps every long string's heap offset valid through the verbatim copy.
+    {
+        let batch = build(&in_schema);
+        let out_schema = make_schema(0, &[type_code::U64, type_code::STRING, type_code::STRING]);
+        let func = ScalarFunc::from_projection(
+            &[2, 1],
+            &[type_code::STRING, type_code::STRING],
+            &in_schema,
+            &out_schema,
+        );
+        let out = func.evaluate_map_batch(&batch, &out_schema);
+        assert_eq!(out.count, 2);
+        assert_eq!(read_gs(&out, 0, 0), b"long-string-one-xyz"); // s2 → out payload 0
+        assert_eq!(read_gs(&out, 1, 0), b"ab"); // s1 → out payload 1
+        assert_eq!(read_gs(&out, 0, 1), b"long-string-two-abcdef");
+        assert_eq!(read_gs(&out, 1, 1), b"cd");
+    }
+
+    // (B) Drop the long string s2 → passthrough gated OFF (a dropped string column
+    // would leave dead heap in a shared blob), so the relocate path runs and the
+    // output blob carries only the referenced (here empty, short-inline) spans.
+    {
+        let batch = build(&in_schema);
+        let out_schema = make_schema(0, &[type_code::U64, type_code::STRING]);
+        let func = ScalarFunc::from_projection(&[1], &[type_code::STRING], &in_schema, &out_schema);
+        let out = func.evaluate_map_batch(&batch, &out_schema);
+        assert_eq!(out.count, 2);
+        assert_eq!(read_gs(&out, 0, 0), b"ab");
+        assert_eq!(read_gs(&out, 0, 1), b"cd");
+        assert!(
+            out.blob.len() < batch.blob.len(),
+            "dropped-string relocate must not copy the dead heap ({} vs {})",
+            out.blob.len(),
+            batch.blob.len(),
+        );
+    }
+}

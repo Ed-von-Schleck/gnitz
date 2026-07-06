@@ -35,8 +35,7 @@ pub fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) ->
     // in their struct and an empty shared blob is a no-op for the absent long
     // strings. Gating on a non-empty blob needlessly dropped all-short-string
     // batches to the slow `relocate_string_cell` path.
-    let blob_passthrough =
-        (0..schema.num_columns()).any(|ci| gnitz_wire::is_german_string(schema.columns[ci].type_code));
+    let blob_passthrough = schema.has_german_string();
     if blob_passthrough {
         output.share_blob_from(batch);
     }
@@ -58,16 +57,16 @@ pub fn op_filter(batch: &Batch, func: &ScalarFunc, schema: &SchemaDescriptor) ->
     output
 }
 
-/// Map: transform batch via scalar function.
+/// Map: transform batch via scalar function, then stamp the output PK region.
 ///
 /// `reindex_hash` and a non-empty `reindex_cols` are mutually exclusive — each
-/// is produced by a distinct `MapKind` arm:
-/// - `reindex_hash` (HashRow): set each PK to a hash of the full output row
-///   (all payload columns) for EXCEPT/INTERSECT/DISTINCT full-row set identity.
-/// - non-empty `reindex_cols` (Expression reindex): pack the listed source
-///   columns' OPK bytes contiguously into the output PK (the `_join_pk` for an
-///   equijoin / GROUP BY repartition).
-/// - empty `reindex_cols`, `reindex_hash == false`: plain batch map (no reindex).
+/// selects what overwrites `evaluate_map_batch`'s bulk PK copy:
+/// - `reindex_hash`: set each PK to a hash of the full output row (all payload
+///   columns) for EXCEPT/INTERSECT/DISTINCT full-row set identity.
+/// - non-empty `reindex_cols`: pack the listed source columns' OPK bytes
+///   contiguously into the output PK (the `_join_pk` for an equijoin /
+///   GROUP BY repartition).
+/// - neither: plain batch map — the bulk PK copy stands.
 #[allow(clippy::too_many_arguments)]
 pub fn op_map(
     batch: &Batch,
@@ -79,7 +78,6 @@ pub fn op_map(
     reindex_hash: bool,
     branch_id: u8,
 ) -> Batch {
-    // Mutually exclusive: a `reindex_hash` MAP carries no reindex column list.
     debug_assert!(
         !reindex_hash || reindex_cols.is_empty(),
         "op_map: reindex_hash and reindex_cols are mutually exclusive",
@@ -88,61 +86,34 @@ pub fn op_map(
         return Batch::empty_with_schema(out_schema);
     }
 
-    if reindex_hash {
-        // Copy-all map produced the payload; set each PK to a hash of the full
-        // row so rows with identical content collide and distinct content does
-        // not. Rehashing scrambles PK order, so the result is unsorted.
-        let mut output = func.evaluate_map_batch(batch, out_schema);
-        debug_assert_eq!(
-            output.count, batch.count,
-            "MAP output row count must equal input row count",
-        );
-        reindex_hash_row(out_schema, &mut output, branch_id);
-        // `evaluate_map_batch` returns `Raw`; the hash-reindex only rewrites PK
-        // bytes (no layout raise), so the result stays `Raw` — nothing to lower.
-        gnitz_debug!("op_map: in={} out={} reindex=HASH", batch.count, output.count);
-        return output;
-    }
-
-    if reindex_cols.is_empty() {
-        // Batch path
-        let result = func.evaluate_map_batch(batch, out_schema);
-        debug_assert_eq!(
-            result.count, batch.count,
-            "MAP output row count must equal input row count",
-        );
-        // A payload-reordering projection over a duplicate-PK input can break
-        // (PK, payload) order, so keep `evaluate_map_batch`'s `Raw` rather than
-        // propagating the input's `sorted` (the D1 fail-safe: only `into_consolidated`
-        // would ever trust it, and it re-sorts a `Raw` batch anyway).
-        gnitz_debug!("op_map: in={} out={} reindex=none", batch.count, result.count);
-        return result;
-    }
-
-    // Per-row path with column-list reindex.
-    let in_mb = batch.as_mem_batch();
-
-    // Evaluate the map batch (without reindex) to get column data
     let mut output = func.evaluate_map_batch(batch, out_schema);
     debug_assert_eq!(
         output.count, batch.count,
         "MAP output row count must equal input row count",
     );
+    if reindex_hash {
+        // Set each PK to a hash of the full output row so rows with identical
+        // content collide and distinct content does not (EXCEPT/INTERSECT/
+        // DISTINCT full-row set identity).
+        reindex_hash_row(out_schema, &mut output, branch_id);
+    } else if !reindex_cols.is_empty() {
+        // Pack each reindex column's OPK bytes contiguously into the output PK.
+        // The SAME packer routes the exchange scatter (via `ScatterKey`), so the
+        // reindexed `_join_pk` and the delta scatter co-partition byte-for-byte.
+        ReindexPacker::new(in_schema, reindex_cols, target_tcs).promote_into(&batch.as_mem_batch(), &mut output);
+    }
 
-    // Overwrite PK by packing each reindex column's OPK bytes contiguously. The
-    // per-column kind dispatch is hoisted out of the row loop by `new`. The same
-    // packer routes the exchange scatter (exchange.rs), so the reindexed `_join_pk`
-    // and the delta scatter co-partition byte-for-byte.
-    let packer = ReindexPacker::new(in_schema, reindex_cols, target_tcs);
-    packer.promote_into(&in_mb, &mut output);
-
-    // `evaluate_map_batch` returns `Raw`; the column reindex only rewrites PK
-    // bytes, so the result stays `Raw`.
+    // `evaluate_map_batch` returns `Raw`, and every path keeps it there: a
+    // reindex/hash stamp only rewrites PK bytes (no layout raise), and a plain
+    // projection stays `Raw` because a payload-reordering projection over a
+    // duplicate-PK input can break (PK, payload) order (the D1 fail-safe — only
+    // `into_consolidated` would trust `sorted`, and it re-sorts a `Raw` batch).
     gnitz_debug!(
-        "op_map: in={} out={} reindex={}cols",
+        "op_map: in={} out={} reindex_hash={} reindex_cols={}",
         batch.count,
         output.count,
-        reindex_cols.len()
+        reindex_hash,
+        reindex_cols.len(),
     );
     output
 }
@@ -330,11 +301,10 @@ pub fn op_null_extend(batch: &Batch, in_schema: &SchemaDescriptor, right_schema:
 
     // Propagate the input blob so long (> 12 byte) STRING/BLOB values whose
     // 16-byte structs are copied verbatim below still resolve against the
-    // shared heap. Without this they would point into an empty blob.
-    let needs_blob = in_schema
-        .payload_columns()
-        .any(|(_, _, col)| gnitz_wire::is_german_string(col.type_code));
-    if needs_blob && !batch.blob.is_empty() {
+    // shared heap. Without this they would point into an empty blob. No
+    // `!batch.blob.is_empty()` guard, same as `op_filter`: sharing an empty
+    // blob is a no-op and all-short-string batches are still correct.
+    if in_schema.has_german_string() {
         output.share_blob_from(batch);
     }
 
@@ -546,18 +516,7 @@ mod tests {
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
-            let bytes = s.as_bytes();
-            let mut gs = [0u8; 16];
-            gs[0..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
-            if bytes.len() <= crate::schema::SHORT_STRING_THRESHOLD {
-                let copy_len = bytes.len().min(12);
-                gs[4..4 + copy_len].copy_from_slice(&bytes[..copy_len]);
-            } else {
-                gs[4..8].copy_from_slice(&bytes[..4]);
-                let offset = b.blob.len() as u64;
-                gs[8..16].copy_from_slice(&offset.to_le_bytes());
-                b.blob.extend_from_slice(bytes);
-            }
+            let gs = crate::test_support::german_string(s.as_bytes(), &mut b.blob);
             b.extend_col(0, &gs);
             b.count += 1;
         }
@@ -783,15 +742,10 @@ mod tests {
         let in_schema = make_schema_pk_u64_payload_string();
         let mut b = Batch::with_schema(in_schema, 1);
         let long_str: &[u8] = b"a-fairly-long-string-value"; // 26 bytes > 12
-        let heap_off = b.blob.len() as u64;
-        b.blob.extend_from_slice(long_str);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        let mut gs = [0u8; 16];
-        gs[0..4].copy_from_slice(&(long_str.len() as u32).to_le_bytes());
-        gs[4..8].copy_from_slice(&long_str[..4]);
-        gs[8..16].copy_from_slice(&heap_off.to_le_bytes());
+        let gs = crate::test_support::german_string(long_str, &mut b.blob);
         b.extend_col(0, &gs);
         b.count += 1;
 
@@ -847,16 +801,11 @@ mod tests {
         let schema = make_schema_pk_u64_payload_blob();
         let mut b = Batch::with_schema(schema, 2);
         let long_blob: &[u8] = b"a-fairly-long-blob-value-xyz"; // 28 bytes > 12
-        let heap_off = b.blob.len() as u64;
-        b.blob.extend_from_slice(long_blob);
-        // Row 0: long blob, val passes always-true filter.
+                                                                // Row 0: long blob, val passes always-true filter.
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        let mut gs = [0u8; 16];
-        gs[0..4].copy_from_slice(&(long_blob.len() as u32).to_le_bytes());
-        gs[4..8].copy_from_slice(&long_blob[..4]);
-        gs[8..16].copy_from_slice(&heap_off.to_le_bytes());
+        let gs = crate::test_support::german_string(long_blob, &mut b.blob);
         b.extend_col(0, &gs);
         b.count += 1;
         b.certify_layout(Layout::Consolidated, &schema);
@@ -982,7 +931,7 @@ mod tests {
     #[test]
     fn test_op_map_with_reindex_promotes_payload_to_pk() {
         // op_map with reindex_col >= 0 rewrites the output PK by reading the
-        // referenced column through PkPromoter. Verifies (1) every row's
+        // referenced column through the reindex packer. Verifies (1) every row's
         // output PK matches the source column value, (2) the resulting
         // batch is correctly marked unsorted/unconsolidated (sort order on
         // the new PK is not preserved by the row-by-row promote).

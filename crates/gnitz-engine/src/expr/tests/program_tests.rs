@@ -1090,14 +1090,7 @@ fn test_is_strictly_non_nullable_str_col() {
 /// Build a 16-byte inline German String struct for use in test batches.
 fn make_german_string(s: &[u8]) -> [u8; 16] {
     assert!(s.len() <= 12, "test helper only handles inline strings (≤ 12 bytes)");
-    let mut gs = [0u8; 16];
-    gs[0..4].copy_from_slice(&(s.len() as u32).to_le_bytes());
-    let pfx = s.len().min(4);
-    gs[4..4 + pfx].copy_from_slice(&s[..pfx]);
-    if s.len() > 4 {
-        gs[8..8 + (s.len() - 4)].copy_from_slice(&s[4..]);
-    }
-    gs
+    crate::test_support::german_string(s, &mut Vec::new())
 }
 
 /// Build a 1-row batch with the given schema, containing `s` as the first payload column.

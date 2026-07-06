@@ -509,6 +509,15 @@ impl SchemaDescriptor {
         })
     }
 
+    /// Whether the schema carries a STRING/BLOB (German-string) column. Those
+    /// can never be PK columns, so scanning the payload columns is exhaustive.
+    /// Callers use this to decide whether a batch's blob region is live.
+    #[inline]
+    pub(crate) fn has_german_string(&self) -> bool {
+        self.payload_columns()
+            .any(|(_, _, col)| gnitz_wire::is_german_string(col.type_code))
+    }
+
     /// Dense payload slot (batch payload region + null-bitmap bit position) for a
     /// payload column. `None` for a PK column — PK columns have no payload slot.
     /// The only `col_idx -> payload_index` function on `SchemaDescriptor`:

@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use crate::schema::SchemaDescriptor;
 use crate::storage::{partition_for_key, partition_for_pk_bytes, Batch, MemBatch};
 
-use super::super::reindex::{german_string_promote_key, ReindexPacker};
+use super::super::reindex::ReindexPacker;
 use super::super::util::extract_group_key;
 
 // Thread-local pool: reuse Vec<Vec<u32>> index scratch across calls so
@@ -70,79 +70,95 @@ pub(crate) fn op_partition_filter(batch: &Batch, schema: &SchemaDescriptor, work
     out
 }
 
-/// Scatter routing key for `cols` at `row`. Equal to `extract_group_key` for
-/// co-locating equal keys, EXCEPT a NULL in a single non-PK integer column
-/// routes by its raw (zero) bytes via `payload_route_key` rather than the
-/// null-distinct hash `extract_group_key` uses.
-///
-/// This must match `PkPromoter::promote_into`, which ignores the null bitmap and
-/// OPK-encodes the column bytes into the synthetic `_join_pk`. A LEFT-join
-/// NULL-key bypass row reindexes to that same `_join_pk`; routing it by the
-/// null-distinct hash would scatter it to a worker that does NOT own its
-/// `_join_pk` partition, so the view scan (which reads each `_join_pk` from its
-/// partition owner) would never see it. `extract_group_key` itself must keep
-/// NULL distinct because it also generates GROUP BY output PKs (op_reduce),
-/// where a NULL group and a 0 group must not collide on one PK; scatter routing
-/// has no such requirement — local grouping (`compare_by_group_cols`) still
-/// separates co-located groups.
-fn route_partition_key(mb: &MemBatch, row: usize, cols: &[u32], schema: &SchemaDescriptor) -> u128 {
-    if cols.len() == 1 {
-        let c_idx = cols[0] as usize;
-        let col = &schema.columns[c_idx];
-        let tc = col.type_code;
-        if !schema.is_pk_col(c_idx) {
-            let loc = schema.locate(c_idx);
-            if crate::schema::is_routable_int(tc) {
-                // OPK-encode+widen the native value (sign-flip for signed), so it
-                // agrees with the `_join_pk` `PkPromoter::promote_into` writes.
-                return loc.route_key(mb, row);
-            }
-            // A string join key reindexes to the same content hash; route by it
-            // so the row co-locates with its `_join_pk` partition. A NULL string
-            // is a zeroed struct → empty content → 0, matching promote_into.
-            if gnitz_wire::is_german_string(tc) {
-                return german_string_promote_key(loc.bytes(mb, row), mb.blob);
-            }
-        }
-    }
-    extract_group_key(mb, row, schema, cols)
-}
-
-/// Which routing key a non-PK scatter uses. A JOIN scatter must route by the
-/// key the downstream reindex (`promote_into`) writes as `_join_pk`, so a row
-/// lands on the worker that owns its `_join_pk` partition. A GROUP BY / set-op
-/// scatter must route by `extract_group_key`, which op_reduce also uses for the
-/// group's output PK — the two must agree or the result is mis-gathered. The two
-/// keys diverge for nullable and string columns, so the scatter caller picks.
+/// Which routing key a non-PK scatter uses; picks between `ScatterKey::Packed`
+/// and `ScatterKey::Fold` (whose docs carry the two contracts). The two keys
+/// diverge for nullable and string columns, so the scatter caller picks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum RouteMode {
     GroupKey,
     JoinPromote,
 }
 
-pub(super) fn hash_row_for_partition(
-    mb: &MemBatch,
-    row: usize,
-    col_indices: &[u32],
-    schema: &SchemaDescriptor,
-    mode: RouteMode,
-) -> usize {
-    // Reached only on the non-PK-routing path (every caller guards with
-    // `is_pk_routing = col_indices == pk_indices` and routes PK-keyed rows via
-    // `partition_for_pk_bytes`), so `col_indices != pk_indices` here.
-    // Both key functions handle a single PK column internally.
-    let key = match mode {
-        RouteMode::JoinPromote => route_partition_key(mb, row, col_indices, schema),
-        RouteMode::GroupKey => extract_group_key(mb, row, schema, col_indices),
-    };
-    partition_for_key(key)
+/// Per-scatter row router, built once (out of the row loop — a packer's
+/// per-column schema classification is hoisted here) and applied per row. The
+/// variant is picked from circuit metadata, not per-query data:
+///
+/// - `PkBytes`: the key IS the schema's PK list with no promotion
+///   (`scatter_is_pk_routed`) — route by the row's native OPK bytes.
+/// - `Packed`: a `JoinPromote` scatter packs the SAME OPK bytes the downstream
+///   reindex Map stamps as the `_join_pk`, so the delta scatter and the
+///   reindexed trace co-partition byte-for-byte. It is null-blind and
+///   value-preserving by design — a LEFT-join NULL-key bypass row reads its
+///   canonically-zeroed key slot and routes to the `_join_pk 0` partition, the
+///   same place the reindex Map stamps it. (Float columns, the only type whose
+///   OPK image would diverge from the routing hash, cannot be join keys — they
+///   are rejected at plan time — so packing every `JoinPromote` key is exact.)
+///   `buf` is the pack scratch; `pack_into` fully overwrites the `out_stride`
+///   prefix it reads, so no inter-row clear is needed.
+/// - `Fold`: a `GroupKey` (GROUP BY / set-op) scatter routes by the
+///   null-distinct group fold `extract_group_key`, which `op_reduce` also uses
+///   for the group's output PK — the two must agree or the result is
+///   mis-gathered. `extract_group_key` keeps NULL distinct because a NULL group
+///   and a 0 group must not collide on one output PK; scatter routing has no
+///   such requirement, but local grouping (`compare_by_group_cols`) still
+///   separates co-located groups.
+// One `ScatterKey` is built per scatter (a stack local) and read per row, so
+// the `ReindexPacker` and its scratch stay inline — boxing would add a heap
+// alloc and a per-row pointer chase for no benefit.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum ScatterKey<'a> {
+    PkBytes,
+    Packed {
+        packer: ReindexPacker,
+        buf: [u8; gnitz_wire::MAX_PK_BYTES],
+    },
+    Fold {
+        cols: &'a [u32],
+        schema: &'a SchemaDescriptor,
+    },
+}
+
+impl<'a> ScatterKey<'a> {
+    #[inline]
+    pub(super) fn new(mode: RouteMode, cols: &'a [u32], tcs: &[u8], schema: &'a SchemaDescriptor) -> Self {
+        if scatter_is_pk_routed(cols, tcs, schema) {
+            ScatterKey::PkBytes
+        } else {
+            match mode {
+                RouteMode::JoinPromote => ScatterKey::Packed {
+                    packer: ReindexPacker::new(schema, cols, tcs),
+                    buf: [0u8; gnitz_wire::MAX_PK_BYTES],
+                },
+                RouteMode::GroupKey => ScatterKey::Fold { cols, schema },
+            }
+        }
+    }
+
+    /// Whether this scatter routes by native PK bytes — the callers' gate for
+    /// layout propagation (only a PK-routed sub-batch is an in-order subset of
+    /// its source).
+    #[inline]
+    pub(super) fn is_pk_routed(&self) -> bool {
+        matches!(self, ScatterKey::PkBytes)
+    }
+
+    /// Route one row to its partition.
+    #[inline]
+    pub(super) fn partition(&mut self, mb: &MemBatch, row: usize) -> usize {
+        match self {
+            ScatterKey::PkBytes => partition_for_pk_bytes(mb.get_pk_bytes(row)),
+            ScatterKey::Packed { packer, buf } => {
+                packer.pack_into(&mut buf[..packer.out_stride], mb, row);
+                partition_for_pk_bytes(&buf[..packer.out_stride])
+            }
+            ScatterKey::Fold { cols, schema } => partition_for_key(extract_group_key(mb, row, schema, cols)),
+        }
+    }
 }
 
 /// Whether any key slot carries a cross-width promotion target (`tc != 0`). A
-/// promoted key packs at the wider `T`, so it must route through the
-/// `ReindexPacker` and must NOT take the native-PK fast-path. The one home of
-/// this predicate so `compound_join_packer` and the two scatter gates cannot
-/// drift apart.
+/// promoted key packs at the wider `T` (via `ScatterKey::Packed`), so it must
+/// NOT take the native-PK fast-path (`scatter_is_pk_routed`).
 #[inline]
 pub(super) fn key_is_promoted(target_tcs: &[u8]) -> bool {
     target_tcs.iter().any(|&tc| tc != 0)
@@ -153,8 +169,8 @@ pub(super) fn key_is_promoted(target_tcs: &[u8]) -> bool {
 /// permuted compound PK differently from `partition_for_pk_bytes`, which
 /// hashes OPK bytes in schema order) AND no cross-width promotion (a promoted
 /// key packs at the wider `T`; its narrow source PK bytes must not route
-/// natively). Shared by `op_repartition_batches_mode` and
-/// `relay_scatter_merge_walk` so the two scatter paths cannot drift.
+/// natively). Consulted once, in `ScatterKey::new`, so the relay scatter paths
+/// cannot drift.
 ///
 /// Deliberately NOT used by `fill_worker_indices`: the write-path scatter
 /// routes by the table's distribution prefix (`schema.partition_for_pk`), a
@@ -162,51 +178,6 @@ pub(super) fn key_is_promoted(target_tcs: &[u8]) -> bool {
 #[inline]
 pub(super) fn scatter_is_pk_routed(col_indices: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
     col_indices == schema.pk_indices() && !key_is_promoted(target_tcs)
-}
-
-/// The packer that routes a `JoinPromote` scatter by the SAME packed OPK bytes
-/// the reindex Map writes as `_join_pk` — so the delta scatter and the reindexed
-/// trace co-partition byte-for-byte. Fires for a compound (len > 1) key OR any
-/// active cross-width promotion (a single promoted key must also pack at `T`, not
-/// route at its narrow source width). Returns `None` for a non-promoted single
-/// key and every GroupKey scatter, which keep the `hash_row_for_partition` path
-/// (GROUP BY / set-op rows are never reindexed to a packed PK). Centralised so the
-/// two scatter implementations (`op_repartition_batches_mode` and
-/// `relay_scatter_merge_walk`) gate on the exact same predicate and cannot drift.
-pub(super) fn compound_join_packer(
-    mode: RouteMode,
-    col_indices: &[u32],
-    target_tcs: &[u8],
-    schema: &SchemaDescriptor,
-) -> Option<ReindexPacker> {
-    (mode == RouteMode::JoinPromote && (col_indices.len() > 1 || key_is_promoted(target_tcs)))
-        .then(|| ReindexPacker::new(schema, col_indices, target_tcs))
-}
-
-/// Route one non-PK-keyed scatter row to its partition. When `join_packer` is
-/// `Some` (a promoted/compound JoinPromote key) the row packs to the SAME
-/// `_join_pk` OPK bytes the reindex Map writes and routes by `partition_for_pk_bytes`,
-/// so the delta scatter and the reindexed trace co-partition byte-for-byte; every
-/// other non-PK key hashes via `hash_row_for_partition`. The caller hoists
-/// `pack_buf` (one `MAX_PK_BYTES` scratch reused across rows — `pack_into` fully
-/// overwrites the `out_stride` prefix it reads). The single home of the pack-or-hash
-/// decision, shared by `op_repartition_batches_mode` and `relay_scatter_merge_walk`
-/// so the two scatter paths cannot drift.
-pub(super) fn route_nonpk_row(
-    mb: &MemBatch,
-    row: usize,
-    join_packer: &Option<ReindexPacker>,
-    pack_buf: &mut [u8],
-    col_indices: &[u32],
-    schema: &SchemaDescriptor,
-    mode: RouteMode,
-) -> usize {
-    if let Some(p) = join_packer {
-        p.pack_into(pack_buf, mb, row);
-        partition_for_pk_bytes(&pack_buf[..p.out_stride])
-    } else {
-        hash_row_for_partition(mb, row, col_indices, schema, mode)
-    }
 }
 
 fn fill_worker_indices(
@@ -240,9 +211,10 @@ fn fill_worker_indices(
             out[w_map[partition]].push(i as u32);
         }
     } else {
+        // Always a group/seek-style scatter (no `RouteMode` reaches here): route
+        // by the null-distinct group fold directly.
         for i in 0..batch.count {
-            // PK-routing for index seeks; the non-PK fallback uses the group key.
-            let partition = hash_row_for_partition(&mb, i, col_indices, schema, RouteMode::GroupKey);
+            let partition = partition_for_key(extract_group_key(&mb, i, schema, col_indices));
             out[w_map[partition]].push(i as u32);
         }
     }
@@ -403,6 +375,138 @@ mod tests {
                 partition < num_workers,
                 "partition {partition} out of range for pk={pk}"
             );
+        }
+    }
+
+    /// The `ScatterKey` collapse replaced the single-column `route_partition_key`
+    /// (routable-int → `route_key`, string → `german_string_promote_key`) and the
+    /// `compound_join_packer` path with one packed-`ReindexPacker` route.
+    /// For every reachable JoinPromote key shape, the packed partition must equal
+    /// what the pre-collapse routing produced — so no row moves workers. The
+    /// NULL arms are null-blind by design (they read the canonically-zeroed key
+    /// slot), exactly as the deleted `route_partition_key` was.
+    #[test]
+    fn test_scatter_key_packed_matches_legacy_routing() {
+        use crate::storage::MemBatch;
+
+        // Run the JoinPromote `ScatterKey` over `row` and return its partition.
+        fn packed(schema: &SchemaDescriptor, cols: &[u32], tcs: &[u8], mb: &MemBatch, row: usize) -> usize {
+            let mut sk = ScatterKey::new(RouteMode::JoinPromote, cols, tcs, schema);
+            assert!(!sk.is_pk_routed(), "test key shapes must take the packed route");
+            sk.partition(mb, row)
+        }
+
+        // (1) non-null I64 payload; (2) NULL I64 payload (nullable col).
+        {
+            let schema = SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(type_code::U64, 0),
+                    SchemaColumn::new(type_code::I64, 1),
+                ],
+                &[0],
+            );
+            let mut b = Batch::with_schema(schema, 2);
+            b.extend_pk(1u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &(-7i64).to_le_bytes());
+            b.count += 1;
+            b.extend_pk(2u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&1u64.to_le_bytes()); // col1 NULL, slot zeroed
+            b.extend_col(0, &0i64.to_le_bytes());
+            b.count += 1;
+            let mb = b.as_mem_batch();
+            for row in 0..2 {
+                // Legacy: routable-int → loc.route_key → partition_for_key (null-blind).
+                let legacy = partition_for_key(schema.locate(1).route_key(&mb, row));
+                assert_eq!(packed(&schema, &[1], &[], &mb, row), legacy, "I64 row {row}");
+            }
+        }
+
+        // (3) STRING payload; (4) NULL STRING payload.
+        {
+            let schema = SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(type_code::U64, 0),
+                    SchemaColumn::new(type_code::STRING, 1),
+                ],
+                &[0],
+            );
+            let mut b = Batch::with_schema(schema, 2);
+            b.extend_pk(1u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            let gs = crate::test_support::german_string(b"abc", &mut b.blob);
+            b.extend_col(0, &gs);
+            b.count += 1;
+            b.extend_pk(2u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&1u64.to_le_bytes()); // col1 NULL, zeroed struct
+            b.extend_col(0, &[0u8; 16]);
+            b.count += 1;
+            let mb = b.as_mem_batch();
+            for row in 0..2 {
+                // Legacy: string → german_string_promote_key → partition_for_key.
+                let legacy = partition_for_key(crate::ops::reindex::german_string_promote_key(
+                    mb.get_col_ptr(row, 0, 16),
+                    mb.blob,
+                ));
+                assert_eq!(packed(&schema, &[1], &[], &mb, row), legacy, "STRING row {row}");
+            }
+        }
+
+        // (5) U128 payload key — legacy: `is_routable_int` includes U128, so the
+        // wide arm of `loc.route_key` fed `partition_for_key`.
+        {
+            let schema = SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(type_code::U64, 0),
+                    SchemaColumn::new(type_code::U128, 0),
+                ],
+                &[0],
+            );
+            let mut b = Batch::with_schema(schema, 1);
+            b.extend_pk(1u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &(u128::MAX - 7).to_le_bytes());
+            b.count += 1;
+            let mb = b.as_mem_batch();
+            let legacy = partition_for_key(schema.locate(1).route_key(&mb, 0));
+            assert_eq!(packed(&schema, &[1], &[], &mb, 0), legacy, "U128 payload");
+        }
+
+        // (6) single sub-column of a compound PK — the one legacy JoinPromote
+        // shape that fell through `route_partition_key`'s non-PK guard to the
+        // group fold `extract_group_key` (its Pk arm is `pk_route_key`).
+        {
+            let schema = SchemaDescriptor::new(
+                &[
+                    SchemaColumn::new(type_code::U32, 0),
+                    SchemaColumn::new(type_code::I32, 0),
+                    SchemaColumn::new(type_code::I64, 0),
+                ],
+                &[0, 1],
+            );
+            let mut b = Batch::with_schema(schema, 1);
+            let mut pk = [0u8; 8];
+            gnitz_wire::encode_pk_column(&7u32.to_le_bytes(), type_code::U32, &mut pk[0..4]);
+            gnitz_wire::encode_pk_column(&(-9i32).to_le_bytes(), type_code::I32, &mut pk[4..8]);
+            b.extend_pk_bytes(&pk);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &11i64.to_le_bytes());
+            b.count += 1;
+            let mb = b.as_mem_batch();
+            for col in [0u32, 1u32] {
+                let legacy = partition_for_key(extract_group_key(&mb, 0, &schema, &[col]));
+                assert_eq!(
+                    packed(&schema, &[col], &[], &mb, 0),
+                    legacy,
+                    "compound-PK sub-col {col}"
+                );
+            }
         }
     }
 }

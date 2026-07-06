@@ -99,6 +99,23 @@ pub(crate) fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -
     b
 }
 
+/// Encode `s` as a 16-byte German-string struct: length header, ≤12-byte
+/// content stored inline, longer content appended to `blob` with the 4-byte
+/// prefix and heap offset in the struct. The one test-side encoder of the
+/// at-rest STRING/BLOB layout, so no test re-derives it by hand.
+pub(crate) fn german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
+    let mut gs = [0u8; 16];
+    gs[0..4].copy_from_slice(&(s.len() as u32).to_le_bytes());
+    if s.len() <= crate::schema::SHORT_STRING_THRESHOLD {
+        gs[4..4 + s.len()].copy_from_slice(s);
+    } else {
+        gs[4..8].copy_from_slice(&s[..4]);
+        gs[8..16].copy_from_slice(&(blob.len() as u64).to_le_bytes());
+        blob.extend_from_slice(s);
+    }
+    gs
+}
+
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
 /// key (negatives sort before positives only because the encoder sign-flips).
 pub(crate) fn make_schema_i64pk_i64() -> SchemaDescriptor {

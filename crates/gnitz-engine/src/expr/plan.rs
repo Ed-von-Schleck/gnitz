@@ -21,11 +21,18 @@ use crate::storage::{Batch, MemBatch};
 /// the dense payload index in the input batch. The source is read at its own
 /// type's width; when the destination slot (`cm.stride`, from the output
 /// schema) is wider — a promoted integer column — the copy sign/zero-extends
-/// the value into it. `blob_cache` is shared across all ColMoves of one
+/// the value into it.
+///
+/// `blob_cache` doubles as the STRING/BLOB mode switch. `Some`: each cell is
+/// relocated into `output.blob` (else its heap offset dangles once the source
+/// batch is dropped); the cache is shared across all ColMoves of one
 /// `evaluate_map_batch` (and pooled across ticks via `BlobCacheGuard`) so
-/// identical STRING/BLOB heap spans are appended to the output blob at most
-/// once. It is `None` only when the output schema has no German-string column,
-/// in which case the STRING/BLOB branch is never reached.
+/// identical heap spans are appended at most once. `None`: the caller has
+/// already shared `in_batch`'s blob into `output` (blob passthrough — every
+/// long string's heap offset stays valid against the identical blob), so
+/// STRING/BLOB columns fall into the equal-stride bulk copy below and the
+/// 16-byte structs are copied verbatim. (A map never widens a string column,
+/// so both strides are 16.)
 fn copy_column(
     in_batch: &Batch,
     output: &mut Batch,
@@ -56,12 +63,12 @@ fn copy_column(
                 gnitz_wire::widen_native_le(&le[..src_stride], cm.type_code, out);
             }
         }
-    } else if gnitz_wire::is_german_string(cm.type_code) {
+    } else if gnitz_wire::is_german_string(cm.type_code) && blob_cache.is_some() {
         // STRING and BLOB share the 16-byte German-string struct: a long
         // (out-of-line) value's heap-offset field points into the source batch's
-        // blob region, so the bytes must be relocated into the output blob or the
-        // offsets dangle once the source batch is dropped. The shared BlobCache
-        // deduplicates identical spans across all columns/rows of this MAP.
+        // blob region. Relocate each cell's bytes into the output blob; the
+        // shared BlobCache deduplicates identical spans across all columns/rows
+        // of this MAP.
         let in_pi = cm.src_pi as usize;
         let src_col = in_batch.col_data(in_pi);
         for row in 0..n {
@@ -106,6 +113,30 @@ fn copy_column(
             }
         }
     }
+}
+
+/// Whether `evaluate_map_batch` may share `in_batch`'s blob and copy German-
+/// string structs verbatim (see [`copy_column`]) instead of relocating every
+/// cell. True iff some `ColMove` copies a German-string column (else there is
+/// nothing to copy) AND every input German-string column is copied by some
+/// `ColMove` — so the shared blob carries no dead heap. A map never computes a
+/// string (EMIT writes ≤8-byte values), so every string output column is a
+/// verbatim passthrough of an input string column. Mirrors `op_filter`'s
+/// blob-passthrough, which is unconditional only because a filter drops no
+/// column (though a filter's row subset, like a relocate's forgone dedup, can
+/// still carry more blob bytes than a from-scratch relocate would).
+fn compute_blob_passthrough(in_schema: &SchemaDescriptor, col_moves: &[ColMove]) -> bool {
+    if !col_moves.iter().any(|cm| gnitz_wire::is_german_string(cm.type_code)) {
+        return false;
+    }
+    // Each input German-string column (never a PK, so it has a dense payload
+    // index) must be the source of some ColMove; a dropped one leaves dead heap.
+    (0..in_schema.num_columns())
+        .filter(|&ci| gnitz_wire::is_german_string(in_schema.columns[ci].type_code))
+        .all(|ci| {
+            let pi = in_schema.payload_mapping_byte(ci);
+            col_moves.iter().any(|cm| cm.src_pi == pi)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +244,9 @@ pub struct ScalarFunc {
     col_moves: Vec<ColMove>,
     null_perm: NullPerm,
     compute: Option<InterpretedCompute>,
+    /// Precomputed [`compute_blob_passthrough`]: skip per-cell string relocation
+    /// and share the input blob when no string column is dropped.
+    blob_passthrough: bool,
     scratch: RefCell<EvalScratch>,
 }
 
@@ -226,6 +260,7 @@ impl ScalarFunc {
             col_moves: Vec::new(),
             null_perm: NullPerm::default(),
             compute: None,
+            blob_passthrough: false, // a predicate copies no columns
             scratch: RefCell::new(EvalScratch::new()),
         }
     }
@@ -263,11 +298,13 @@ impl ScalarFunc {
             })
             .collect();
         let null_perm = NullPerm::from_projection(&src_pi_bytes);
+        let blob_passthrough = compute_blob_passthrough(in_schema, &col_moves);
         ScalarFunc {
             filter: None,
             col_moves,
             null_perm,
             compute: None,
+            blob_passthrough,
             scratch: RefCell::new(EvalScratch::new()),
         }
     }
@@ -338,11 +375,13 @@ impl ScalarFunc {
             })
         };
 
+        let blob_passthrough = compute_blob_passthrough(in_schema, &col_moves);
         ScalarFunc {
             filter: None,
             col_moves,
             null_perm,
             compute,
+            blob_passthrough,
             scratch: RefCell::new(EvalScratch::new()),
         }
     }
@@ -468,8 +507,8 @@ impl ScalarFunc {
 
         // PK copy: bulk when strides match. When they differ (reindex maps,
         // e.g. U64 input → U128 synthetic PK), the PK region is left zero-
-        // initialized here; `op_map` then overwrites it via `PkPromoter::
-        // promote_into` or `reindex_hash_row`, both of which emit OPK bytes.
+        // initialized here; `op_map` then overwrites it via the reindex packer
+        // or `reindex_hash_row`, both of which emit OPK bytes.
         let in_pk = in_batch.pk_data();
         let out_pk = output.pk_data_mut();
         if in_pk.len() == out_pk.len() {
@@ -477,13 +516,24 @@ impl ScalarFunc {
         }
         output.weight_data_mut().copy_from_slice(in_batch.weight_data());
 
-        // Column moves. The dedup cache is drawn from the thread-local pool only
-        // when the output schema has a German-string column (else `get_mut()` is
-        // None and the STRING/BLOB copy path is never taken). Reserve the output
-        // blob once: dedup keeps it ≤ input blob size, so a single upfront reserve
-        // covers every STRING/BLOB ColMove and avoids per-column reallocation.
-        let mut blob_cache = crate::storage::BlobCacheGuard::acquire(out_schema, n);
-        output.blob.reserve(in_batch.blob.len());
+        // Column moves. When no string column is dropped (`blob_passthrough`),
+        // share the input blob once and copy every String/Blob struct verbatim —
+        // no per-row relocation and no dedup cache (`copy_column` gets `None`).
+        // Otherwise relocate each cell: the dedup cache is drawn from the
+        // thread-local pool only when the output has a German-string column (else
+        // `get_mut()` is None and the relocate path is never reached), and one
+        // upfront `reserve` (dedup keeps the output blob ≤ the input's) covers
+        // every ColMove without per-column realloc.
+        let mut blob_cache = if self.blob_passthrough {
+            output.share_blob_from(in_batch);
+            crate::storage::BlobCacheGuard::empty()
+        } else {
+            let cache = crate::storage::BlobCacheGuard::acquire(out_schema, n);
+            if cache.is_active() {
+                output.blob.reserve(in_batch.blob.len());
+            }
+            cache
+        };
         for cm in &self.col_moves {
             copy_column(in_batch, &mut output, cm, blob_cache.get_mut());
         }

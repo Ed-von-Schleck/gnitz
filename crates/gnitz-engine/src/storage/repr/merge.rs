@@ -122,16 +122,23 @@ pub(crate) struct BlobCacheGuard(Option<BlobCache>);
 
 impl BlobCacheGuard {
     pub(crate) fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
-        let has_strings = schema
-            .payload_columns()
-            .any(|(_, _, col)| is_german_string(col.type_code));
-        if has_strings {
+        if schema.has_german_string() {
             let mut cache = acquire_blob_cache();
             cache.reserve(max_rows);
             Self(Some(cache))
         } else {
             Self(None)
         }
+    }
+
+    /// A guard holding no cache — for callers that already decided the
+    /// relocate/dedup path is not needed (e.g. blob passthrough).
+    pub(crate) fn empty() -> Self {
+        Self(None)
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.0.is_some()
     }
 
     pub(crate) fn get_mut(&mut self) -> Option<&mut BlobCache> {
