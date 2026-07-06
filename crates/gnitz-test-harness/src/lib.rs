@@ -77,7 +77,17 @@ impl ServerHandle {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         let mut backoff = Duration::from_millis(1);
         loop {
-            if sock_path.exists() {
+            // Readiness is "a client connect succeeds", NOT "the socket file
+            // exists". `server_create` creates the AF_UNIX file at `bind()` but
+            // only accepts connections after the later `listen()`; a client that
+            // races into that window (widened by CPU starvation when dozens of
+            // servers boot at once under a parallel `cargo test`) gets
+            // ECONNREFUSED, and the test's real `connect().unwrap()` then flakes.
+            // A successful probe connect proves `listen()` is live — every
+            // subsequent connect then queues in the backlog and succeeds. The
+            // probe stream is dropped immediately; the server treats the pre-HELLO
+            // EOF as a benign client disconnect.
+            if sock_path.exists() && std::os::unix::net::UnixStream::connect(&sock_path).is_ok() {
                 break;
             }
             if let Ok(Some(status)) = proc.try_wait() {
@@ -93,7 +103,7 @@ impl ServerHandle {
                 proc.wait().ok();
                 let tail = read_stderr_tail(&stderr_path);
                 let kept = tmpdir.keep();
-                panic!("server did not create socket within {STARTUP_TIMEOUT:?}\nstderr tail:\n{tail}\nartifacts preserved at: {}",
+                panic!("server did not accept a connection within {STARTUP_TIMEOUT:?}\nstderr tail:\n{tail}\nartifacts preserved at: {}",
                     kept.display());
             }
             thread::sleep(backoff);
