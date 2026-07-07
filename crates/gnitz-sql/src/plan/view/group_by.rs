@@ -14,8 +14,8 @@ use crate::plan::validate::{
 use crate::plan::view::EmitPieces;
 use crate::types::{is_integer_type, is_min_max_orderable, is_wide_int};
 use gnitz_core::{
-    CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, Schema, TypeCode, AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX,
-    AGG_MIN, AGG_SUM, AGG_SUM_ZERO,
+    CircuitBuilder, ColumnDef, ExprBuilder, GnitzClient, ReduceOutKey, Schema, TypeCode, AGG_COUNT, AGG_COUNT_NON_NULL,
+    AGG_MAX, AGG_MIN, AGG_SUM, AGG_SUM_ZERO,
 };
 use sqlparser::ast::{Expr, GroupByExpr, SelectItem};
 
@@ -139,35 +139,26 @@ enum GroupBySelectItem {
 }
 
 /// Reduce-output column index for a group column `src_col`, mirroring the
-/// reduce output schema and the engine's `build_reduce_output_schema`:
+/// reduce output schema layout keyed by `out_key`:
 ///
-/// * `group_set_eq_pk` — the PK region holds the source PK columns in source-PK
+/// * `PkPermutation` — the PK region holds the source PK columns in source-PK
 ///   order; locate `src_col` there.
-/// * `single_col_natural_pk` — the lone group col is the PK at index 0.
-/// * synthetic `_group_pk` — group cols follow the U128 PK, in GROUP BY order.
-///
-/// The branch order mirrors `build_reduce_output_schema`'s decision tree
-/// (`group_set_eq_pk` → `single_col_natural_pk` → synthetic) so the helper and
-/// the reduce-schema build cannot drift. When both natural-PK flags hold
-/// (grouping by a single-column PK) both branches return 0, so correctness does
-/// not depend on the order.
+/// * `SingleNaturalCol` — the lone group col is the PK at index 0.
+/// * `SyntheticFold` — group cols follow the U128 `_group_pk`, in GROUP BY order.
 fn group_col_reduce_pos(
     src_col: usize,
-    group_set_eq_pk: bool,
-    single_col_natural_pk: bool,
+    out_key: ReduceOutKey,
     source_schema: &Schema,
     group_col_indices: &[usize],
 ) -> usize {
-    if group_set_eq_pk {
-        source_schema
+    match out_key {
+        ReduceOutKey::PkPermutation => source_schema
             .pk_cols
             .iter()
             .position(|&pi| pi == src_col)
-            .expect("group_set_eq_pk: every group col is a source PK col")
-    } else if single_col_natural_pk {
-        0
-    } else {
-        1 + group_col_indices.iter().position(|&gi| gi == src_col).unwrap()
+            .expect("PkPermutation: every group col is a source PK col"),
+        ReduceOutKey::SingleNaturalCol => 0,
+        ReduceOutKey::SyntheticFold => 1 + group_col_indices.iter().position(|&gi| gi == src_col).unwrap(),
     }
 }
 
@@ -209,7 +200,7 @@ pub(crate) fn emit_group_by_pieces(
     let source_replicated = client.table_replicated(source_tid).map_err(GnitzSqlError::Exec)?;
     // The compound-PK source guard is intentionally NOT applied here: the engine
     // reduce output already emits a full compound natural-PK region
-    // (`build_reduce_output_schema` walks `pk_columns()` for `group_set_eq_pk`),
+    // (`build_reduce_output_schema` walks `pk_columns()` for `PkPermutation`),
     // the helpers below map group columns through `group_col_reduce_pos`, and the
     // co-partition analyzers now compare the full PK sequence — so a reduce that
     // shards by one component of a compound PK gets the exchange it needs.
@@ -351,42 +342,38 @@ pub(crate) fn emit_group_by_pieces(
         push_agg_specs(AggFunc::Count, None, &source_schema, &mut agg_specs)?;
     }
 
-    // 4. Determine reduce output schema layout.
-    //    A nullable group column cannot become the natural PK — the PK region
-    //    has no null bitmap, so we fall through to the synthetic _group_pk
-    //    (U128, non-nullable) path which is always safe.
-    //
-    //    The two natural-PK cases must mirror the compiler's
-    //    `build_reduce_output_schema` decision (compiler.rs:695-697):
-    //      (a) `group_set_eq_pk`: group cols are a permutation of the source
-    //          PK cols, regardless of PK type — even native I64.
-    //      (b) `is_single_col_natural_pk`: a single non-nullable U64/U128/UUID
-    //          group col. Narrow unsigned/signed group cols still take the
-    //          synthetic path because the engine helper rejects them.
-    //    A divergence between planner and compiler here scrambles the view's
-    //    output column positions silently.
-    let group_set_eq_pk = source_schema.group_cols_eq_pk(&group_col_indices);
-    let single_col_natural_pk = source_schema.is_single_col_natural_pk(&group_col_indices);
+    // 4. The reduce output-key kind, shipped to the engine (see `ReduceOutKey`:
+    //    the planner owns this decision, the engine validates and obeys it).
+    //    Everything below — schema layout, shard key, column positions — derives
+    //    from this one value. The two empty-group reduces (two-phase local /
+    //    combine) always ship `SyntheticFold`: an empty group set is neither
+    //    natural kind.
+    let out_key = source_schema.reduce_out_key(&group_col_indices);
 
-    // Build the reduce output schema (mirrors server's _build_reduce_output_schema).
+    // Build the reduce output schema (mirrors the engine's
+    // `build_reduce_output_schema`, which lays out from the same `out_key`).
     let mut reduce_schema_cols: Vec<ColumnDef> = Vec::new();
     let mut reduce_pk_cols: Vec<usize> = Vec::new();
-    if group_set_eq_pk {
-        for &pi in &source_schema.pk_cols {
-            reduce_pk_cols.push(reduce_schema_cols.len());
-            reduce_schema_cols.push(source_schema.columns[pi].clone());
+    match out_key {
+        ReduceOutKey::PkPermutation => {
+            for &pi in &source_schema.pk_cols {
+                reduce_pk_cols.push(reduce_schema_cols.len());
+                reduce_schema_cols.push(source_schema.columns[pi].clone());
+            }
         }
-    } else if single_col_natural_pk {
-        reduce_pk_cols.push(0);
-        reduce_schema_cols.push(source_schema.columns[group_col_indices[0]].clone());
-    } else {
-        reduce_pk_cols.push(0);
-        // Hidden: the synthetic group key is a physical PK column but not a
-        // presentation column. The group columns follow it as visible payload,
-        // so `SELECT *` shows the grouping values and aggregates, not the hash.
-        reduce_schema_cols.push(ColumnDef::new("_group_pk", TypeCode::U128, false).hidden());
-        for &gi in &group_col_indices {
-            reduce_schema_cols.push(source_schema.columns[gi].clone());
+        ReduceOutKey::SingleNaturalCol => {
+            reduce_pk_cols.push(0);
+            reduce_schema_cols.push(source_schema.columns[group_col_indices[0]].clone());
+        }
+        ReduceOutKey::SyntheticFold => {
+            reduce_pk_cols.push(0);
+            // Hidden: the synthetic group key is a physical PK column but not a
+            // presentation column. The group columns follow it as visible payload,
+            // so `SELECT *` shows the grouping values and aggregates, not the hash.
+            reduce_schema_cols.push(ColumnDef::new("_group_pk", TypeCode::U128, false).hidden());
+            for &gi in &group_col_indices {
+                reduce_schema_cols.push(source_schema.columns[gi].clone());
+            }
         }
     }
     // The aggregate columns are pushed next, so they start at the current width
@@ -422,7 +409,7 @@ pub(crate) fn emit_group_by_pieces(
 
     // REDUCE — always use multi-agg path.
     //
-    // For `group_set_eq_pk`, shard/reindex the reduce by the group columns in
+    // For `PkPermutation`, shard/reindex the reduce by the group columns in
     // source-PK (schema) order, not the user's GROUP BY order. The groups are
     // identical under any permutation of the PK (each group is a PK singleton),
     // and `build_reduce_output_schema` emits the output PK in source-PK order
@@ -434,10 +421,10 @@ pub(crate) fn emit_group_by_pieces(
     // `(pk0, pk1)` — so the multi-worker gather drops the rows that hashed to a
     // different worker. Sharding in PK order keeps the reduce co-partitioned with
     // the source (the exchange is skipped, or routes by `partition_for_pk_bytes`),
-    // so the view stays partitioned by its real PK. The non-eq-pk paths keep the
+    // so the view stays partitioned by its real PK. The other kinds keep the
     // user order: their synthetic/single-natural PK and reduce layout depend on
-    // it (`group_col_reduce_pos`'s synthetic branch indexes by GROUP BY order).
-    let reduce_group_cols: Vec<usize> = if group_set_eq_pk {
+    // it (`group_col_reduce_pos`'s synthetic arm indexes by GROUP BY order).
+    let reduce_group_cols: Vec<usize> = if out_key == ReduceOutKey::PkPermutation {
         source_schema.pk_cols.clone()
     } else {
         group_col_indices.clone()
@@ -462,7 +449,7 @@ pub(crate) fn emit_group_by_pieces(
         // Phase 1 — per-worker local partial. No ExchangeShard, global_ground = false
         // (a worker with no local rows contributes no partial, never a ground row).
         // Output: [_group_pk:U128 (col 0, PK), agg0 (col 1), agg1 (col 2), ...].
-        let local = cb.reduce_multi_local(filtered, &[], &circuit_specs, false);
+        let local = cb.reduce_multi_local(filtered, &[], &circuit_specs, false, ReduceOutKey::SyntheticFold);
 
         // Phase 2 (exchange) + Phase 3 (combine). reduce_multi inserts the single
         // ExchangeShard(∅) routing every partial (all at PK V₀) to V₀'s owner, then
@@ -487,13 +474,13 @@ pub(crate) fn emit_group_by_pieces(
             })
             .collect();
         combine_specs.push((AGG_COUNT, 0)); // COUNT-of-partials existence gate
-        cb.reduce_multi(local, &[], &combine_specs, true)
+        cb.reduce_multi(local, &[], &combine_specs, true, ReduceOutKey::SyntheticFold)
     } else if source_replicated {
         // Shard-free: every worker reduces its full local copy to the same global
         // aggregate (no ExchangeShard ⇒ no gather barrier, no N-fold sum).
-        cb.reduce_multi_local(filtered, &reduce_group_cols, &circuit_specs, global_ground)
+        cb.reduce_multi_local(filtered, &reduce_group_cols, &circuit_specs, global_ground, out_key)
     } else {
-        cb.reduce_multi(filtered, &reduce_group_cols, &circuit_specs, global_ground)
+        cb.reduce_multi(filtered, &reduce_group_cols, &circuit_specs, global_ground, out_key)
     };
 
     // 6. Post-reduce MAP: project group cols + compute aggregates (AVG = SUM/COUNT)
@@ -522,14 +509,8 @@ pub(crate) fn emit_group_by_pieces(
             GroupBySelectItem::GroupCol { src_col, name } => {
                 // Find group col position in reduce output (routed through the
                 // shared helper so SELECT and HAVING cannot drift on the
-                // source-PK-order mapping a permuted `group_set_eq_pk` needs).
-                let reduce_col = group_col_reduce_pos(
-                    *src_col,
-                    group_set_eq_pk,
-                    single_col_natural_pk,
-                    &source_schema,
-                    &group_col_indices,
-                );
+                // source-PK-order mapping a permuted `PkPermutation` grouping needs).
+                let reduce_col = group_col_reduce_pos(*src_col, out_key, &source_schema, &group_col_indices);
                 let tc = reduce_schema.columns[reduce_col].type_code;
                 // On both natural-PK paths `group_col_reduce_pos` returns a position
                 // within the dense PK region, so on the `is_natural` branch
@@ -537,7 +518,7 @@ pub(crate) fn emit_group_by_pieces(
                 // `pk_renamed` (asserted below). `&&` short-circuits, so the index
                 // is only evaluated once `is_natural` holds — the synthetic path's
                 // larger `reduce_col` never reaches it.
-                let is_natural = group_set_eq_pk || single_col_natural_pk;
+                let is_natural = out_key != ReduceOutKey::SyntheticFold;
                 if is_natural && !pk_renamed[reduce_col] {
                     // First projection of this group column: rename the PK slot
                     // in-place. The MAP inherits the PK region verbatim — no
@@ -554,7 +535,7 @@ pub(crate) fn emit_group_by_pieces(
                 } else {
                     // Synthetic-PK path, or second projection of the same group column.
                     post_map_eb.copy_col(tc as u32, reduce_col as u32, payload_idx);
-                    // Natural-PK path (group_set_eq_pk / single_col_natural_pk):
+                    // Natural-PK path (PkPermutation / SingleNaturalCol):
                     // the source col is non-nullable. Synthetic-PK path: propagate
                     // source nullability — nothing forces NOT NULL.
                     out_cols.push(ColumnDef::new(
@@ -652,8 +633,7 @@ pub(crate) fn emit_group_by_pieces(
             &HavingCtx {
                 source_schema: &source_schema,
                 group_col_indices: &group_col_indices,
-                group_set_eq_pk,
-                single_col_natural_pk,
+                out_key,
                 agg_mappings: &agg_mappings,
                 agg_col_offset,
             },
@@ -913,8 +893,7 @@ fn collect_having_aggs(
 struct HavingCtx<'a> {
     source_schema: &'a Schema,
     group_col_indices: &'a [usize],
-    group_set_eq_pk: bool,
-    single_col_natural_pk: bool,
+    out_key: ReduceOutKey,
     agg_mappings: &'a [AggMapping],
     agg_col_offset: usize,
 }
@@ -962,8 +941,8 @@ impl Having<'_> {
     /// enforcing GROUP BY membership. The one name→position pipeline for every
     /// HAVING group-column reference (value position and null test alike), so
     /// the two cannot drift on the source-PK-order mapping a permuted
-    /// `group_set_eq_pk` needs (natural-PK grouping puts group cols in the PK
-    /// region; the synthetic path lays them out after the U128 _group_pk).
+    /// `PkPermutation` grouping needs (natural-PK grouping puts group cols in
+    /// the PK region; the synthetic path lays them out after the U128 _group_pk).
     fn resolve_group_col(&self, col_name: &str) -> Result<(usize, usize), GnitzSqlError> {
         let ctx = self.ctx;
         let src = find_unique_column(&ctx.source_schema.columns, col_name)?
@@ -974,13 +953,7 @@ impl Having<'_> {
                 "HAVING: column '{col_name}' must appear in GROUP BY or an aggregate function"
             )));
         }
-        let reduce_col = group_col_reduce_pos(
-            src,
-            ctx.group_set_eq_pk,
-            ctx.single_col_natural_pk,
-            ctx.source_schema,
-            ctx.group_col_indices,
-        );
+        let reduce_col = group_col_reduce_pos(src, ctx.out_key, ctx.source_schema, ctx.group_col_indices);
         Ok((src, reduce_col))
     }
 }

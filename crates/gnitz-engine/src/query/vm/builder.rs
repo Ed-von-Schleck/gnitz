@@ -295,6 +295,7 @@ impl ProgramBuilder {
         agg_descs: &[AggDescriptor],
         group_cols: &[u32],
         output_schema: SchemaDescriptor,
+        out_key: gnitz_wire::ReduceOutKey,
         // The combined value index table (null if no AVI). `for_max`/type per
         // aggregate are read from `agg_descs` by ordinal on the read side.
         avi_table: *mut Table,
@@ -331,6 +332,7 @@ impl ProgramBuilder {
             group_cols_offset: gc_off,
             group_cols_count: gc_cnt,
             output_schema_idx,
+            out_key,
             avi,
             finalize_func_idx,
             finalize_schema_idx,

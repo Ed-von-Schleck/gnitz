@@ -7,6 +7,7 @@ use rustc_hash::FxHashMap;
 use crate::foundation::codec::{read_u32_le, read_u64_le};
 
 pub(crate) use gnitz_wire::type_code;
+pub(crate) use gnitz_wire::ReduceOutKey;
 pub(crate) use gnitz_wire::TypeCode;
 pub use gnitz_wire::MAX_COLUMNS;
 pub(crate) use gnitz_wire::SHORT_STRING_THRESHOLD;
@@ -563,6 +564,18 @@ impl SchemaDescriptor {
     pub fn group_cols_eq_pk(&self, cols: &[u32]) -> bool {
         let pk = self.pk_indices();
         cols.len() == pk.len() && pk.iter().all(|p| cols.contains(p))
+    }
+
+    /// The output-key kind a reduce grouped by `cols` over this schema warrants
+    /// — re-derived by the engine compiler only to *validate* the planner's
+    /// shipped [`ReduceOutKey`], through the same shared [`ReduceOutKey::decide`]
+    /// chain the planner decided with.
+    pub fn reduce_out_key(&self, cols: &[u32]) -> ReduceOutKey {
+        let single_natural = cols.len() == 1 && {
+            let c = &self.columns[cols[0] as usize];
+            c.nullable == 0 && TypeCode::from_validated_u8(c.type_code).is_natural_reduce_key()
+        };
+        ReduceOutKey::decide(self.group_cols_eq_pk(cols), single_natural)
     }
 
     /// True iff `cols` is **exactly** this table's distribution prefix —
@@ -1383,6 +1396,33 @@ pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDe
 mod tests {
     use super::*;
     use crate::test_support::pk_only_schema;
+
+    // ── Reduce output key ────────────────────────────────────────────────────
+
+    /// A nullable single group column must NOT be promoted to the natural PK
+    /// (the PK region has no null bitmap); a non-nullable one is. Grouping by
+    /// the PK itself takes precedence as `PkPermutation`.
+    #[test]
+    fn nullable_group_col_is_not_natural_reduce_key() {
+        let nullable = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 1),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[1],
+        );
+        assert_eq!(nullable.reduce_out_key(&[0]), ReduceOutKey::SyntheticFold);
+
+        let non_nullable = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::U64, 0),
+            ],
+            &[0],
+        );
+        assert_eq!(non_nullable.reduce_out_key(&[1]), ReduceOutKey::SingleNaturalCol);
+        assert_eq!(non_nullable.reduce_out_key(&[0]), ReduceOutKey::PkPermutation);
+    }
 
     // ── Distribution prefix (CLUSTER BY) ────────────────────────────────────
 

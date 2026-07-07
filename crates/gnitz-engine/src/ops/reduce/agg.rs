@@ -441,22 +441,6 @@ pub(super) fn read_old_minmax_encoded(cursor: &ReadCursor, c_idx: usize, cw: usi
     Some(super::super::util::encode_ordered(bytes, src_tc as u8, false))
 }
 
-/// True iff `group_cols` is a single column whose type permits using
-/// the source column directly as the output PK (vs. a synthetic U128).
-/// Shared between `query::compiler::build_reduce_output_schema` and
-/// `op_reduce` to keep schema construction and execution in lockstep.
-pub(crate) fn is_single_col_natural_pk(schema: &SchemaDescriptor, group_cols: &[u32]) -> bool {
-    if group_cols.len() != 1 {
-        return false;
-    }
-    let col = &schema.columns[group_cols[0] as usize];
-    col.nullable == 0
-        && matches!(
-            TypeCode::from_validated_u8(col.type_code),
-            TypeCode::U64 | TypeCode::U128 | TypeCode::UUID,
-        )
-}
-
 // ---------------------------------------------------------------------------
 // AVI lookup
 // ---------------------------------------------------------------------------
@@ -507,35 +491,6 @@ mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
     use crate::storage::Batch;
-
-    // Item 5: a nullable single group column must NOT be promoted to the
-    // natural PK; the PK region has no null bitmap.
-    #[test]
-    fn nullable_group_col_is_not_natural_pk() {
-        let nullable = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 1),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[1],
-        );
-        assert!(
-            !is_single_col_natural_pk(&nullable, &[0]),
-            "nullable U64 group column must not be a natural PK",
-        );
-
-        let non_nullable = SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        );
-        assert!(
-            is_single_col_natural_pk(&non_nullable, &[0]),
-            "non-nullable U64 group column should be a natural PK",
-        );
-    }
 
     /// Single-row batch with a U64 PK and one F64 payload column carrying `val`.
     fn f64_batch(val: f64) -> Batch {

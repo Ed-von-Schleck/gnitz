@@ -1,6 +1,6 @@
 //! Incremental REDUCE operator: δ_out = Agg(history + δ_in) − Agg(history).
 
-use crate::schema::{SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
+use crate::schema::{ReduceOutKey, SchemaDescriptor, TypeCode, PAYLOAD_MAPPING_PK_SENTINEL};
 use crate::storage::{pk_bytes_eq, scatter_copy, Batch, DrainGuard, MemBatch, ReadCursor};
 
 use super::super::util::{
@@ -8,8 +8,7 @@ use super::super::util::{
     GroupKeyExtractor,
 };
 use super::agg::{
-    apply_agg_from_value_index, fold_old_aggs, is_single_col_natural_pk, read_old_minmax_encoded, Accumulator,
-    AggDescriptor, AggOp,
+    apply_agg_from_value_index, fold_old_aggs, read_old_minmax_encoded, Accumulator, AggDescriptor, AggOp,
 };
 use super::emit::{emit_finalized_row, emit_global_ground, emit_reduce_row};
 use super::sort::{argsort_delta, argsort_pk_canonical, build_sort_descs, compare_by_group_cols, SortDesc};
@@ -133,6 +132,11 @@ pub fn op_reduce(
     output_schema: &SchemaDescriptor,
     group_by_cols: &[u32],
     agg_descs: &[AggDescriptor],
+    // How the output is keyed. Compile-validated against the input schema
+    // (`emit_reduce`) and baked into the instruction, so the runtime obeys it
+    // rather than re-deriving it from the schema; `output_schema` was built
+    // from the same kind.
+    out_key: ReduceOutKey,
     // The one combined-index cursor — keyed `group_cols ‖ ordinal ‖ av_encoded`,
     // serving every MIN/MAX aggregate. `None` for all-linear reduces and the
     // single-scan fallback. `for_max`/type per aggregate come from `agg_descs`.
@@ -223,7 +227,7 @@ pub fn op_reduce(
     // must argsort by canonical PK order to avoid splitting one PK into
     // multiple groups. Output's pk_indices is in source pk-list order
     // regardless of group_by_cols permutation.
-    let group_by_pk = input_schema.group_cols_eq_pk(group_by_cols);
+    let group_by_pk = out_key == ReduceOutKey::PkPermutation;
 
     // Monotone probe eligibility: natural-PK grouping and canonical
     // single-column group keys both visit groups in ascending output-PK order
@@ -261,10 +265,10 @@ pub fn op_reduce(
         argsort_delta(working, input_schema, group_by_cols)
     };
 
-    // Output mapping: matches build_reduce_output_schema's logic — must
-    // stay in sync. Independent of the stride-gated fast-path eligibility
+    // Output mapping: either natural kind keys the emitted row by the group
+    // value itself. Independent of the stride-gated fast-path eligibility
     // above (compound natural-PK at stride > 16 still emits natural PKs).
-    let use_natural_pk = group_by_pk || is_single_col_natural_pk(input_schema, group_by_cols);
+    let use_natural_pk = out_key != ReduceOutKey::SyntheticFold;
 
     let mut raw_output = Batch::with_schema(*output_schema, 32);
     let mut fin_output = finalize_out_schema.map(|fs| Batch::with_schema(*fs, 32));

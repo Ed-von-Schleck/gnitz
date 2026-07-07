@@ -384,7 +384,7 @@ fn test_having_binds_correct_aggregate() {
 //
 // The reduce output carries the source PK in its 0..k region (source-PK order),
 // so a GROUP BY view over a compound-PK table persists a real multi-column PK.
-// Grouping by the full PK is `group_set_eq_pk` (each group a singleton); grouping
+// Grouping by the full PK is `PkPermutation` (each group a singleton); grouping
 // by one PK component is the single-natural path that actually aggregates.
 //
 // Group columns that coincide with the source PK become the view's natural PK
@@ -545,7 +545,7 @@ fn test_group_by_compound_pk_multiworker() {
         &sn,
         "CREATE VIEW g_full AS SELECT a AS ka, b AS kb, COUNT(*) AS n FROM t GROUP BY a, b",
     );
-    // GROUP BY b, a (PERMUTED full PK): group_set_eq_pk shards in PK order, so the
+    // GROUP BY b, a (PERMUTED full PK): PkPermutation shards in PK order, so the
     // view stays partitioned by its real PK (a, b). Without the PK-order shard
     // normalization the shuffle hash-routes by (b, a) and the gather drops the
     // rows that hashed to a different worker than their PK home — wrong only W>1.

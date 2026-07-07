@@ -86,6 +86,7 @@ pub const NODE_COL_KIND_BRANCH_ID: u64 = 5; // MAP_HASH_ROW per-side branch disc
 pub const NODE_COL_KIND_REINDEX: u64 = 6; // MAP_EXPR equijoin pre-index cols (value1=col_idx, position=key order)
 pub const NODE_COL_KIND_RANGE_JOIN: u64 = 7; // JOIN_DELTA_TRACE_RANGE params (value1=n_eq, value2=rel)
 pub const NODE_COL_KIND_GLOBAL_GROUND: u64 = 8; // REDUCE global-aggregate ground discriminator (value1=bool)
+pub const NODE_COL_KIND_REDUCE_OUT_KEY: u64 = 9; // REDUCE output-key kind (value1=ReduceOutKey); absent ⇒ SyntheticFold
 
 // ---------------------------------------------------------------------------
 // Aggregate function IDs
@@ -162,6 +163,60 @@ impl RangeRel {
             1 => Some(RangeRel::Le),
             2 => Some(RangeRel::Gt),
             3 => Some(RangeRel::Ge),
+            _ => None,
+        }
+    }
+    pub fn as_u64(self) -> u64 {
+        self as u64
+    }
+}
+
+/// How a `Reduce` node keys its output. **Decided once, by the circuit author**
+/// (the SQL planner, which tracks schemas) via [`ReduceOutKey::decide`], shipped
+/// on the wire, and *validated* — never re-decided — by the engine compiler: a
+/// shipped kind that differs from what the input schema warrants under the same
+/// `decide` chain is a hard compile rejection, so the output column layout can
+/// never silently scramble. Everything downstream of that validation (output
+/// schema construction, runtime row keying) obeys the kind rather than
+/// re-deriving it.
+///
+/// On the wire the kind rides as one param row (`NODE_COL_KIND_REDUCE_OUT_KEY`),
+/// present iff not `SyntheticFold` — the sparse-default param-row idiom
+/// (`NODE_COL_KIND_GLOBAL_GROUND` works the same way).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum ReduceOutKey {
+    /// Leading synthetic `_group_pk` U128 = null-distinct group fold; the group
+    /// columns ride as payload. What every group set that is neither natural
+    /// kind gets — including the empty (global) group set and the schema-blind
+    /// low-level `CircuitBuilder::reduce` surface.
+    SyntheticFold = 0,
+    /// The group set is a permutation of the source PK; the output PK is the
+    /// source PK columns in pk-list order, verbatim.
+    PkPermutation = 1,
+    /// A single non-nullable U64/U128/UUID group column is the output PK directly.
+    SingleNaturalCol = 2,
+}
+
+impl ReduceOutKey {
+    /// The one precedence chain (eq-PK ▷ single-natural ▷ synthetic). Planner
+    /// decision and engine validation both route through here, each feeding its
+    /// own schema representation's two predicates, so the sides cannot drift.
+    pub fn decide(group_cols_eq_pk: bool, single_col_natural: bool) -> Self {
+        if group_cols_eq_pk {
+            ReduceOutKey::PkPermutation
+        } else if single_col_natural {
+            ReduceOutKey::SingleNaturalCol
+        } else {
+            ReduceOutKey::SyntheticFold
+        }
+    }
+
+    pub fn from_wire(v: u64) -> Option<Self> {
+        match v {
+            0 => Some(ReduceOutKey::SyntheticFold),
+            1 => Some(ReduceOutKey::PkPermutation),
+            2 => Some(ReduceOutKey::SingleNaturalCol),
             _ => None,
         }
     }
@@ -252,6 +307,9 @@ pub enum OpNode {
         /// seed a ground row, so the flag cannot be derived from
         /// `group_cols.is_empty()` and travels explicitly from the planner.
         global_ground: bool,
+        /// How the output is keyed. Decided by the planner, validated (never
+        /// re-decided) by the engine compiler. Wire-absent ⇒ `SyntheticFold`.
+        out_key: ReduceOutKey,
     },
     Join(JoinKind),
     /// `OPCODE_INTEGRATE = 7`. Primary INTEGRATE: writes to view storage.
@@ -404,10 +462,20 @@ pub fn decode_op_node(
                 .iter()
                 .find(|c| c.kind == NODE_COL_KIND_GLOBAL_GROUND)
                 .is_some_and(|c| c.value1 != 0);
+            // Absent row ⇒ `SyntheticFold` (the low-level `reduce` surface and
+            // every payload/empty-group planner reduce); a present row carries a
+            // natural-key kind in value1. An unknown value1 is a corrupt circuit —
+            // reject at this trust boundary rather than mis-keying the output.
+            let out_key = match cols.iter().find(|c| c.kind == NODE_COL_KIND_REDUCE_OUT_KEY) {
+                Some(c) => ReduceOutKey::from_wire(c.value1)
+                    .ok_or_else(|| format!("REDUCE unknown out_key kind {}", c.value1))?,
+                None => ReduceOutKey::SyntheticFold,
+            };
             OpNode::Reduce {
                 group_cols,
                 agg,
                 global_ground,
+                out_key,
             }
         }
         OPCODE_JOIN_DELTA_TRACE => OpNode::Join(JoinKind::DeltaTrace),

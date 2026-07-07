@@ -10,7 +10,8 @@ pub mod protocol;
 pub mod types;
 
 pub use circuit::{
-    AggFunc, AggKind, Circuit, CircuitBuilder, CircuitRows, JoinKind, MapKind, NodeId, OpNode, Port, RangeRel, TableId,
+    AggFunc, AggKind, Circuit, CircuitBuilder, CircuitRows, JoinKind, MapKind, NodeId, OpNode, Port, RangeRel,
+    ReduceOutKey, TableId,
 };
 pub use client::{hidden_view_name, GnitzClient, IndexMeta, InlineUniqueIndex, PlannedView, MAX_CHAIN_SEGMENTS};
 pub use connection::{

@@ -1006,7 +1006,7 @@ mod tests {
             col_type_code: TypeCode::I64,
             _pad: [0; 2],
         }];
-        let out = build_reduce_output_schema(&input, &[1], &aggs);
+        let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SingleNaturalCol);
         // Natural PK (single U64 group col) → [U64_PK, I64_agg]
         assert_eq!(out.num_columns(), 2);
         assert_eq!(out.columns[0].type_code, type_code::U64);
@@ -1031,7 +1031,7 @@ mod tests {
             _pad: [0; 2],
         }];
         // group_cols = [1, 0] — permuted; the set still equals pk_indices.
-        let out = build_reduce_output_schema(&input, &[1, 0], &aggs);
+        let out = build_reduce_output_schema(&input, &[1, 0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation);
         // 2 PK cols + 1 agg col; pk_indices in source's pk-list order [0, 1].
         assert_eq!(out.num_columns(), 3);
         assert_eq!(out.pk_indices(), &[0, 1]);
@@ -1057,7 +1057,7 @@ mod tests {
             col_type_code: TypeCode::I64,
             _pad: [0; 2],
         }];
-        let out = build_reduce_output_schema(&input, &[0], &aggs);
+        let out = build_reduce_output_schema(&input, &[0], &aggs, gnitz_wire::ReduceOutKey::PkPermutation);
         assert_eq!(out.num_columns(), 2);
         assert_eq!(out.pk_indices(), &[0]);
         assert_eq!(out.columns[0].type_code, type_code::U64);
@@ -1080,7 +1080,7 @@ mod tests {
             col_type_code: TypeCode::I64,
             _pad: [0; 2],
         }];
-        let out = build_reduce_output_schema(&input, &[1], &aggs);
+        let out = build_reduce_output_schema(&input, &[1], &aggs, gnitz_wire::ReduceOutKey::SyntheticFold);
         // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
         assert_eq!(out.num_columns(), 3);
         assert_eq!(out.columns[0].type_code, type_code::U128);
@@ -1236,7 +1236,7 @@ mod tests {
         // is the aggregate column's type. The order-encodable I64 agg compiles (Some),
         // proving the circuit shape and view_dir are otherwise valid, so the STRING
         // agg's None is attributable solely to the guard.
-        use gnitz_wire::{AggFunc, AggKind, OpNode};
+        use gnitz_wire::{AggFunc, AggKind, OpNode, ReduceOutKey};
         let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
         std::fs::create_dir_all(&base).unwrap();
 
@@ -1257,6 +1257,8 @@ mod tests {
                     group_cols: vec![0],
                     agg: AggKind::Specs(vec![(AggFunc::Max, 1)]),
                     global_ground: false,
+                    // group_cols = [0] = the single U64 PK ⇒ PkPermutation.
+                    out_key: ReduceOutKey::PkPermutation,
                 },
             );
             nodes.insert(2, OpNode::IntegrateSink);
@@ -1292,6 +1294,106 @@ mod tests {
             !compiles(type_code::STRING, "str"),
             "MAX over a non-order-encodable STRING column must fail the compile (engine guard)"
         );
+    }
+
+    /// The planner ships the reduce output-key kind; the engine validates it
+    /// against the input schema and hard-rejects (build_plan → None) any kind the
+    /// schema does not warrant — the guard that turns a silent output-column
+    /// scramble into a compile failure. Covers all three schema shapes × all three
+    /// kinds: the three matching kinds compile, the six cross pairings reject.
+    #[test]
+    fn reduce_out_key_validation_rejects_mismatch() {
+        use gnitz_wire::{AggFunc, AggKind, OpNode, ReduceOutKey};
+        let base = format!("{}/git/gnitz/tmp", std::env::var("HOME").unwrap());
+        std::fs::create_dir_all(&base).unwrap();
+
+        let compiles = |in_schema: SchemaDescriptor, group: Vec<u16>, out_key: ReduceOutKey, tag: &str| -> bool {
+            let view_dir = format!("{base}/outkey_{tag}_{:?}_{}", out_key, std::process::id());
+            let _ = std::fs::remove_dir_all(&view_dir);
+            std::fs::create_dir_all(&view_dir).unwrap();
+            let mut nodes = HashMap::new();
+            nodes.insert(0, OpNode::ScanDelta(10));
+            nodes.insert(
+                1,
+                OpNode::Reduce {
+                    group_cols: group,
+                    // A linear COUNT keeps the MIN/MAX-eligibility guard out of the
+                    // picture, isolating the out_key validation.
+                    agg: AggKind::Specs(vec![(AggFunc::Count, 0)]),
+                    global_ground: false,
+                    out_key,
+                },
+            );
+            nodes.insert(2, OpNode::IntegrateSink);
+            let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN)];
+            let loaded = make_loaded(nodes, edges);
+            let ext = [ExternalTable {
+                table_id: 10,
+                schema: in_schema,
+            }];
+            let ordered = loaded.ordered.clone();
+            let some = build_plan(
+                &loaded,
+                &empty_rw(),
+                &ordered,
+                &ext,
+                &view_dir,
+                0,
+                1,
+                Some(2),
+                &[],
+                vec![],
+            )
+            .is_some();
+            let _ = std::fs::remove_dir_all(&view_dir);
+            some
+        };
+
+        // (schema, group cols, the ONE kind the schema warrants, tag).
+        let eq_pk = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let single_nat = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::U64, 0), // natural group col
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let synthetic = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(type_code::STRING, 0), // non-natural group col
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let cases = [
+            (eq_pk, vec![0u16], ReduceOutKey::PkPermutation, "eqpk"),
+            (single_nat, vec![1u16], ReduceOutKey::SingleNaturalCol, "single"),
+            (synthetic, vec![1u16], ReduceOutKey::SyntheticFold, "synth"),
+        ];
+        let all_kinds = [
+            ReduceOutKey::SyntheticFold,
+            ReduceOutKey::PkPermutation,
+            ReduceOutKey::SingleNaturalCol,
+        ];
+        for (schema, group, correct, tag) in cases {
+            for kind in all_kinds {
+                let ok = compiles(schema, group.clone(), kind, tag);
+                assert_eq!(
+                    ok,
+                    kind == correct,
+                    "schema {tag}: out_key {kind:?} should {} (schema warrants {correct:?})",
+                    if kind == correct { "compile" } else { "reject" },
+                );
+            }
+        }
     }
 
     fn wide_pk_schema() -> SchemaDescriptor {
@@ -2502,7 +2604,7 @@ mod tests {
 
     #[test]
     fn test_circuit_range_join_n_eq_discriminator() {
-        use gnitz_wire::{AggKind, JoinKind, MapKind, OpNode};
+        use gnitz_wire::{AggKind, JoinKind, MapKind, OpNode, ReduceOutKey};
         let dummy_blob = dummy_expr_blob();
 
         // A GROUP BY view: ScanDelta → Map(reindex) → ExchangeShard → Reduce →
@@ -2527,6 +2629,9 @@ mod tests {
                 group_cols: vec![1],
                 agg: AggKind::Null,
                 global_ground: false,
+                // Only exercises range-join classification, never the reduce
+                // output schema/validation; the kind is immaterial here.
+                out_key: ReduceOutKey::SyntheticFold,
             },
         );
         gb.insert(4, OpNode::IntegrateSink);

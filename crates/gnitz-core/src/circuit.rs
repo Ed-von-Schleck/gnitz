@@ -1,6 +1,6 @@
 use crate::expr::ExprProgram;
 
-pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel};
+pub use gnitz_wire::{AggFunc, AggKind, JoinKind, MapKind, OpNode, RangeRel, ReduceOutKey};
 
 pub type NodeId = u64;
 pub type Port = u8;
@@ -169,6 +169,7 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             group_cols,
             agg,
             global_ground,
+            out_key,
         } => {
             let mut kind_rows = Vec::with_capacity(group_cols.len() + 4);
             for (i, c) in group_cols.iter().enumerate() {
@@ -184,6 +185,11 @@ fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             // keeping every existing reduce circuit byte-identical on the wire.
             if global_ground {
                 kind_rows.push((NODE_COL_KIND_GLOBAL_GROUND, 0, 1, 0));
+            }
+            // Sparse-default param row (the GLOBAL_GROUND idiom above): present
+            // iff not `SyntheticFold`; an absent row decodes to the default.
+            if out_key != ReduceOutKey::SyntheticFold {
+                kind_rows.push((NODE_COL_KIND_REDUCE_OUT_KEY, 0, out_key.as_u64(), 0));
             }
             ((OPCODE_REDUCE, None, None), kind_rows)
         }
@@ -439,6 +445,7 @@ impl CircuitBuilder {
         group_cols: &[usize],
         agg_specs: &[(u64, usize)],
         global_ground: bool,
+        out_key: ReduceOutKey,
     ) -> NodeId {
         let group: Vec<u16> = group_cols.iter().map(|&c| c as u16).collect();
         let specs: Vec<(AggFunc, u16)> = agg_specs
@@ -458,6 +465,7 @@ impl CircuitBuilder {
                 AggKind::Specs(specs)
             },
             global_ground,
+            out_key,
         });
         self.connect(input, nid, gnitz_wire::PORT_IN);
         nid
@@ -468,23 +476,35 @@ impl CircuitBuilder {
         let sharded = self.shard(input, group_cols);
         // The low-level single-agg API is never the user's global scalar
         // aggregate (that path goes through `reduce_multi`/`reduce_multi_local`),
-        // so it never seeds a ground row.
-        self.reduce_node(sharded, group_cols, &[(agg_func_id, agg_col_idx)], false)
+        // so it never seeds a ground row. It also cannot track the input schema,
+        // so it always keys the output synthetically; the engine hard-rejects it
+        // if the group set actually warrants a natural key (only the SQL planner
+        // ships the natural-key kinds).
+        self.reduce_node(
+            sharded,
+            group_cols,
+            &[(agg_func_id, agg_col_idx)],
+            false,
+            ReduceOutKey::SyntheticFold,
+        )
     }
 
     /// Multi-aggregate reduce with automatic shard insertion (required for
     /// multi-worker correctness). `agg_specs`: list of (agg_func_id, col_idx).
     /// `global_ground` is `true` only for the user's ungrouped scalar aggregate
     /// (empty `group_cols`); the grouped builder passes `group_cols.is_empty()`.
+    /// `out_key` is the caller's schema-derived output-key decision; the engine
+    /// validates it against the input schema.
     pub fn reduce_multi(
         &mut self,
         input: NodeId,
         group_cols: &[usize],
         agg_specs: &[(u64, usize)],
         global_ground: bool,
+        out_key: ReduceOutKey,
     ) -> NodeId {
         let sharded = self.shard(input, group_cols);
-        self.reduce_node(sharded, group_cols, agg_specs, global_ground)
+        self.reduce_node(sharded, group_cols, agg_specs, global_ground, out_key)
     }
 
     /// Shard-free multi-aggregate reduce: aggregates `input` **locally on every
@@ -509,8 +529,9 @@ impl CircuitBuilder {
         group_cols: &[usize],
         agg_specs: &[(u64, usize)],
         global_ground: bool,
+        out_key: ReduceOutKey,
     ) -> NodeId {
-        self.reduce_node(input, group_cols, agg_specs, global_ground)
+        self.reduce_node(input, group_cols, agg_specs, global_ground, out_key)
     }
 
     /// Exchange shard: routes rows to workers by hashing the given columns.
@@ -718,7 +739,13 @@ mod tests {
             let mut cb = CircuitBuilder::new(3, 100);
             let input = cb.input_delta();
             // Empty group cols + one COUNT(*) spec, the ungrouped-aggregate shape.
-            let red = cb.reduce_multi(input, &[], &[(gnitz_wire::AGG_COUNT, 0)], ground);
+            let red = cb.reduce_multi(
+                input,
+                &[],
+                &[(gnitz_wire::AGG_COUNT, 0)],
+                ground,
+                ReduceOutKey::SyntheticFold,
+            );
             cb.sink(red);
             let rows = cb.build().into_rows();
 
@@ -736,6 +763,43 @@ mod tests {
                     assert_eq!(*global_ground, ground);
                     assert!(matches!(agg, AggKind::Specs(_)));
                 }
+                other => panic!("expected Reduce, got {other:?}"),
+            }
+        }
+    }
+
+    /// The `out_key` discriminator rides as one sparse-default param row and
+    /// survives into_rows → from_rows for every kind: `SyntheticFold` (the
+    /// default) omits the row, the two natural-key kinds carry it.
+    #[test]
+    fn reduce_out_key_roundtrips() {
+        use gnitz_wire::NODE_COL_KIND_REDUCE_OUT_KEY;
+        for kind in [
+            ReduceOutKey::SyntheticFold,
+            ReduceOutKey::PkPermutation,
+            ReduceOutKey::SingleNaturalCol,
+        ] {
+            let mut cb = CircuitBuilder::new(4, 100);
+            let input = cb.input_delta();
+            let red = cb.reduce_multi(input, &[0], &[(gnitz_wire::AGG_COUNT, 0)], false, kind);
+            cb.sink(red);
+            let rows = cb.build().into_rows();
+
+            // The param row is present iff the kind is not the default.
+            let key_rows = rows
+                .node_columns
+                .iter()
+                .filter(|(nid, k, ..)| *nid == red && *k == NODE_COL_KIND_REDUCE_OUT_KEY)
+                .count();
+            assert_eq!(
+                key_rows,
+                (kind != ReduceOutKey::SyntheticFold) as usize,
+                "out_key row present iff non-default",
+            );
+
+            let decoded = Circuit::from_rows(4, rows).expect("from_rows");
+            match decoded.nodes.get(&red) {
+                Some(OpNode::Reduce { out_key, .. }) => assert_eq!(*out_key, kind),
                 other => panic!("expected Reduce, got {other:?}"),
             }
         }

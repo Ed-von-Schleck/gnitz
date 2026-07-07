@@ -11,8 +11,44 @@ use crate::test_support::make_schema_i64pk_i64;
 use super::super::util::{extract_group_key, ieee_order_bits_f32, ieee_order_bits_f32_reverse};
 use super::agg::{apply_agg_from_value_index, Accumulator, AggDescriptor, AggOp};
 use super::emit::{emit_finalized_row, emit_global_ground, emit_reduce_row};
-use super::op_reduce::{cursor_matches_group, op_reduce};
+use super::op_reduce::cursor_matches_group;
 use super::sort::{argsort_delta, build_sort_descs, compare_by_group_cols};
+use crate::storage::ReadCursor;
+
+/// Shim over [`super::op_reduce::op_reduce`] deriving `out_key` from the input
+/// schema — exactly the one kind compile-time validation admits for a given
+/// (schema, group cols), so the many call sites below need not repeat it.
+#[allow(clippy::too_many_arguments)]
+fn op_reduce(
+    delta: &Batch,
+    trace_in_cursor: Option<&mut ReadCursor>,
+    trace_out_cursor: &mut ReadCursor,
+    input_schema: &SchemaDescriptor,
+    output_schema: &SchemaDescriptor,
+    group_by_cols: &[u32],
+    agg_descs: &[AggDescriptor],
+    avi_cursor: Option<&mut ReadCursor>,
+    finalize_prog: Option<&crate::expr::ResolvedProgram>,
+    finalize_out_schema: Option<&SchemaDescriptor>,
+    global_ground: bool,
+    i_am_owner: bool,
+) -> (Batch, Option<Batch>) {
+    super::op_reduce::op_reduce(
+        delta,
+        trace_in_cursor,
+        trace_out_cursor,
+        input_schema,
+        output_schema,
+        group_by_cols,
+        agg_descs,
+        input_schema.reduce_out_key(group_by_cols),
+        avi_cursor,
+        finalize_prog,
+        finalize_out_schema,
+        global_ground,
+        i_am_owner,
+    )
+}
 
 /// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
 /// bytes back to the native value — the inverse of `extend_pk_opk` for an I64 PK.
@@ -1972,7 +2008,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
     let in_schema = make_compound_pk_2xu64_schema();
 
     // Output schema matches what build_reduce_output_schema would produce
-    // for group_set_eq_pk on this input with a COUNT aggregate:
+    // for a PkPermutation grouping on this input with a COUNT aggregate:
     // 2 PK cols (U64,U64) followed by I64 count.
     let out_schema = SchemaDescriptor::new(
         &[
@@ -2034,7 +2070,7 @@ fn test_reduce_min_pk_col_compound_pk() {
     let in_schema = make_compound_pk_2xu64_schema();
 
     // Output: full natural compound PK + I64 agg, matching the
-    // build_reduce_output_schema layout for group_set_eq_pk.
+    // build_reduce_output_schema layout for PkPermutation.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -2352,7 +2388,7 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
 
     let in_schema = make_compound_pk_2xu64_schema();
     // GROUP BY a single U64 column → use_natural_pk via
-    // is_single_col_natural_pk. Output: U64 pk + I64 count.
+    // SingleNaturalCol. Output: U64 pk + I64 count.
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -3197,7 +3233,7 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
         _pad: [0; 2],
     };
 
-    // Permuted GROUP BY: [1, 0]. group_set_eq_pk still holds.
+    // Permuted GROUP BY: [1, 0]. PkPermutation still holds.
     let (out, _) = op_reduce(
         &delta,
         None,

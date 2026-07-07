@@ -106,6 +106,10 @@ pub(crate) enum Instr {
         group_cols_offset: u32,
         group_cols_count: u16,
         output_schema_idx: u16,
+        // The compile-validated output-key kind (see `ReduceOutKey`); baked at
+        // emit time like `global_ground`/`i_am_owner` so the runtime never
+        // re-derives it from the schema.
+        out_key: gnitz_wire::ReduceOutKey,
         // The combined AVI cursor is created fresh from its table each tick;
         // `None` means the operator has no value index (all-linear or fallback).
         avi: Option<ReduceAvi>,
@@ -1058,6 +1062,7 @@ mod tests {
             &agg_descs,
             &group_cols,
             out_schema,
+            in_schema.reduce_out_key(&group_cols),
             std::ptr::null_mut(),
             std::ptr::null(), // finalize_prog
             std::ptr::null(), // finalize_schema
@@ -1165,6 +1170,7 @@ mod tests {
             &agg_descs,
             &group_cols,
             out_schema,
+            in_schema.reduce_out_key(&group_cols),
             std::ptr::null_mut(),
             std::ptr::null(),
             std::ptr::null(),
@@ -1216,6 +1222,7 @@ mod tests {
             &agg_descs,
             &group_cols,
             out_schema,
+            in_schema.reduce_out_key(&group_cols),
             std::ptr::null_mut(),
             std::ptr::null(),
             std::ptr::null(),
@@ -1464,6 +1471,7 @@ mod tests {
             &agg_descs,
             &group_cols,
             out_schema,
+            in_schema.reduce_out_key(&group_cols),
             std::ptr::null_mut(),
             std::ptr::null(),
             std::ptr::null(),
@@ -1610,6 +1618,7 @@ mod tests {
             &agg_descs,
             &group_cols,
             out_schema,
+            in_schema.reduce_out_key(&group_cols),
             std::ptr::null_mut(),
             std::ptr::null(),
             std::ptr::null(),

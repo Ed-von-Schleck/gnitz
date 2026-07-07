@@ -1,7 +1,7 @@
 use super::error::ProtocolError;
 use std::sync::OnceLock;
 
-pub use gnitz_wire::{FixedInt, TypeCode};
+pub use gnitz_wire::{FixedInt, ReduceOutKey, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, MAX_PK_COLUMNS, PK_LIST_MAX_COLS};
 
 /// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
@@ -192,13 +192,18 @@ impl Schema {
         self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
     }
 
-    /// True iff `cols` is a permutation of `pk_indices()`. Mirrors
-    /// `engine::SchemaDescriptor::group_cols_eq_pk`; planner and engine must
-    /// agree on this predicate or the reduce output schema will not match
-    /// the circuit's actual output.
-    #[inline]
-    pub fn group_cols_eq_pk(&self, cols: &[usize]) -> bool {
-        cols.len() == self.pk_cols.len() && self.pk_cols.iter().all(|p| cols.contains(p))
+    /// The output-key kind a reduce grouped by `cols` over this schema gets —
+    /// the planner-side decision shipped on the wire and validated (never
+    /// re-decided) by the engine, both through [`ReduceOutKey::decide`]. A
+    /// nullable group column can never key the output (the PK region has no
+    /// null bitmap), so it lands on the synthetic fold.
+    pub fn reduce_out_key(&self, cols: &[usize]) -> ReduceOutKey {
+        let eq_pk = cols.len() == self.pk_cols.len() && self.pk_cols.iter().all(|p| cols.contains(p));
+        let single_natural = cols.len() == 1 && {
+            let c = &self.columns[cols[0]];
+            c.type_code.is_natural_reduce_key() && !c.is_nullable
+        };
+        ReduceOutKey::decide(eq_pk, single_natural)
     }
 
     /// Validate a candidate PK index list against the schema's arity and
@@ -229,20 +234,6 @@ impl Schema {
             }
         }
         Ok(())
-    }
-
-    /// True iff `cols` is a single non-nullable column whose type permits
-    /// using the source column directly as the reduce output PK (vs. a
-    /// synthetic U128). Mirrors `engine::ops::is_single_col_natural_pk`;
-    /// narrow signed/unsigned cols stay on the synthetic path.
-    #[inline]
-    pub fn is_single_col_natural_pk(&self, cols: &[usize]) -> bool {
-        cols.len() == 1
-            && matches!(
-                self.columns[cols[0]].type_code,
-                TypeCode::U64 | TypeCode::U128 | TypeCode::UUID,
-            )
-            && !self.columns[cols[0]].is_nullable
     }
 
     /// Structural type-equality used by the warm-push guard. Mirrors the

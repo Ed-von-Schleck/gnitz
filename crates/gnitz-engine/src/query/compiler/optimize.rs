@@ -2,6 +2,7 @@
 //! `annotate`, `opt_*`, co-partition analysis, and join/reduce/map output schemas.
 
 use super::*;
+use gnitz_wire::ReduceOutKey;
 
 pub(super) fn compute_join_shard_map(loaded: &LoadedCircuit) -> HashMap<i64, Vec<(i32, u8)>> {
     let mut join_shard_map = HashMap::new();
@@ -409,49 +410,51 @@ pub(super) const fn agg_output_type(agg_op: AggOp, col_type_code: TypeCode) -> u
     }
 }
 
+/// Build the reduce output schema by **obeying** the planner's shipped
+/// `out_key`. The caller (`emit_reduce`) validates `out_key` against the input
+/// schema (`SchemaDescriptor::reduce_out_key`) before calling this, so the
+/// three arms are byte-identical to what the planner laid out.
 pub(super) fn build_reduce_output_schema(
     input: &SchemaDescriptor,
     group_cols: &[i32],
     agg_descs: &[AggDescriptor],
+    out_key: ReduceOutKey,
 ) -> SchemaDescriptor {
     let mut cols = [SchemaColumn::new(0, 0); crate::schema::MAX_COLUMNS];
     let mut n = 0;
     let mut pk_idx = [0u32; crate::schema::MAX_PK_COLUMNS];
     let mut pk_len = 0usize;
 
-    let group_cols_u32: Vec<u32> = group_cols.iter().map(|&i| i as u32).collect();
-    let group_set_eq_pk = input.group_cols_eq_pk(&group_cols_u32);
-    let use_natural_pk = group_set_eq_pk || crate::ops::is_single_col_natural_pk(input, &group_cols_u32);
-
-    if use_natural_pk {
-        // Output PK region mirrors the source's PK byte layout: walk
-        // `pk_columns()` in pk-list order rather than `group_cols` order.
-        // For single-column natural PK on a non-PK column (e.g. GROUP BY
-        // a U64 payload column), `pk_columns()` would name the wrong
-        // column, so fall back to copying that one group column.
-        if group_set_eq_pk {
+    match out_key {
+        ReduceOutKey::PkPermutation => {
+            // Output PK region mirrors the source's PK byte layout: walk
+            // `pk_columns()` in pk-list order rather than `group_cols` order.
             let k = copy_pk_columns_into(input, &mut cols, &mut pk_idx);
             n = k;
             pk_len = k;
-        } else {
+        }
+        ReduceOutKey::SingleNaturalCol => {
+            // A single non-PK-or-PK natural group column keyed directly (e.g.
+            // GROUP BY a U64 payload column, where `pk_columns()` would name the
+            // wrong column).
             cols[n] = input.columns[group_cols[0] as usize];
             pk_idx[pk_len] = n as u32;
             pk_len += 1;
             n += 1;
         }
-    } else {
-        // Synthetic U128 PK
-        cols[n] = SchemaColumn::new(type_code::U128, 0);
-        pk_idx[pk_len] = n as u32;
-        pk_len += 1;
-        n += 1;
-        // Group columns
-        for &gc in group_cols {
-            cols[n] = input.columns[gc as usize];
+        ReduceOutKey::SyntheticFold => {
+            // Synthetic U128 PK, group columns as payload.
+            cols[n] = SchemaColumn::new(type_code::U128, 0);
+            pk_idx[pk_len] = n as u32;
+            pk_len += 1;
             n += 1;
+            for &gc in group_cols {
+                cols[n] = input.columns[gc as usize];
+                n += 1;
+            }
         }
     }
-    // Aggregate results (same for both branches)
+    // Aggregate results (same for all arms)
     for ad in agg_descs {
         cols[n] = SchemaColumn::new(agg_output_type(ad.agg_op, ad.col_type_code), 0);
         n += 1;

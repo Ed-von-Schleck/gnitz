@@ -573,6 +573,7 @@ pub(super) fn emit_node(
             group_cols,
             agg,
             global_ground,
+            out_key,
         } => {
             emit_reduce(
                 loaded,
@@ -582,6 +583,7 @@ pub(super) fn emit_node(
                 group_cols,
                 agg,
                 *global_ground,
+                *out_key,
                 &in_regs,
                 builder,
                 state,
@@ -739,6 +741,7 @@ pub(super) fn emit_reduce(
     group_cols: &[u16],
     agg: &gnitz_wire::AggKind,
     global_ground: bool,
+    out_key: gnitz_wire::ReduceOutKey,
     in_regs: &HashMap<i32, i32>,
     builder: &mut ProgramBuilder,
     state: &mut EmitState,
@@ -782,7 +785,17 @@ pub(super) fn emit_reduce(
         }
     }
 
-    let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols, &agg_descs);
+    // Validate the planner's shipped output-key kind against the input schema
+    // before building the output schema. Everything downstream — the output
+    // schema layout and `op_reduce`'s row keying — obeys `out_key`, so a kind
+    // the schema does not warrant would silently scramble the output columns;
+    // reject the circuit instead (same failure class as the
+    // MIN/MAX-eligibility guard below).
+    if out_key != in_reg_schema.reduce_out_key(&gcols_u32) {
+        state.emit_failed = true;
+        return;
+    }
+    let reduce_out_schema = build_reduce_output_schema(&in_reg_schema, &gcols, &agg_descs, out_key);
 
     let trace_table = match create_child_table(
         state,
@@ -976,6 +989,7 @@ pub(super) fn emit_reduce(
         &agg_descs,
         &gcols_u32,
         reduce_out_schema,
+        out_key,
         avi_table_ptr,
         fin_prog_ptr,
         fin_schema_ptr,

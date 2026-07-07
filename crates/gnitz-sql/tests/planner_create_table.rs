@@ -602,7 +602,7 @@ fn test_view_over_compound_pk_simple_select_accepted() {
 #[test]
 fn test_view_over_compound_pk_group_by_accepted() {
     // GROUP BY over a compound-PK source is now supported. Grouping by the full
-    // PK (`group_set_eq_pk`) carries the compound PK through to the view; grouping
+    // PK (`PkPermutation`) carries the compound PK through to the view; grouping
     // by a single component takes the single-natural-PK path and registers `[0]`.
     let srv = match ServerHandle::start() {
         Some(s) => s,

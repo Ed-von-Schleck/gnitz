@@ -18,7 +18,8 @@ use crate::plan::view::predicates::{
 };
 use crate::plan::view::{EmitPieces, ViewChain};
 use gnitz_core::{
-    CircuitBuilder, ColumnDef, ExprBuilder, FixedInt, GnitzClient, RangeRel, Schema, TypeCode, AGG_MAX, AGG_MIN,
+    CircuitBuilder, ColumnDef, ExprBuilder, FixedInt, GnitzClient, RangeRel, ReduceOutKey, Schema, TypeCode, AGG_MAX,
+    AGG_MIN,
 };
 use sqlparser::ast::{Expr, Ident, JoinConstraint, JoinOperator, SelectItem};
 use std::collections::{HashMap, HashSet};
@@ -1600,7 +1601,9 @@ pub(crate) fn build_pure_range_threshold(
     };
 
     let mbh = cb.map_hash_row(reindex_b, &[0], &[], 0);
-    let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)], false); // [_group_pk:U128, m:Tc]
+    // Empty group set (one global threshold over the broadcast other side) → the
+    // synthetic `_group_pk` fold, like every other empty-group reduce.
+    let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)], false, ReduceOutKey::SyntheticFold); // [_group_pk:U128, m:Tc]
     let carried_m = range_tc.carried_reindex_tc(range_tc);
     let reindex_m = cb.map_reindex(red, &[1], &[carried_m], build_reindex_program(&m_schema));
     let trace_m = cb.integrate_trace(reindex_m);
