@@ -227,6 +227,9 @@ pub struct Table {
 
 mod flush;
 
+#[cfg(test)]
+mod bench_flush;
+
 impl Table {
     /// Create a new table.  `RecoverySource::SalReplay` loads the manifest at
     /// open; `RecoverySource::Rederive` erases stale storage and starts empty.

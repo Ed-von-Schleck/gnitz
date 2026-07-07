@@ -1017,6 +1017,70 @@ mod tests {
         }
     }
 
+    /// Per-key cost of the from-scratch per-run bloom rebuild that
+    /// `InMemRun::from_batch` performs on every RAM-tier fold — filter
+    /// allocation (`vec![0u8; next_power_of_two]`) plus 7 scattered bit-writes
+    /// per key. Arm (a) is the full rebuild composition (`BloomFilter::new` +
+    /// `bloom_add_batch`, exactly `InMemRun::from_batch`); arm (b) resets one
+    /// reused filter outside the timed span, isolating hashing+probe stores from
+    /// the allocation/zeroing. Sizes cross the cache hierarchy (10 bits/key,
+    /// power-of-two rounded: 1k keys ≈ 2 KiB … 512k keys ≈ 1 MiB).
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+    fn bloom_rebuild_bench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+
+        for (n, iters) in [(1_000usize, 4000usize), (16_000, 400), (128_000, 60), (512_000, 15)] {
+            // One consolidated batch of `n` distinct U64 PKs (only the PK region
+            // is read by the bloom).
+            let mut batch = Batch::with_schema(schema, n);
+            for i in 0..n {
+                batch.extend_pk(i as u128);
+                batch.extend_weight(&1i64.to_le_bytes());
+                batch.extend_null_bmp(&0u64.to_le_bytes());
+                batch.extend_col(0, &(i as i64).to_le_bytes());
+                batch.extend_col(1, &(i as i64).to_le_bytes());
+                batch.count += 1;
+            }
+
+            // (a) rebuild composition — allocate + zero + hash, timed whole.
+            let t = Instant::now();
+            for _ in 0..iters {
+                let mut bf = BloomFilter::new(n as u32);
+                bloom_add_batch(&mut bf, &batch);
+                black_box(&bf);
+            }
+            let secs_a = t.elapsed().as_secs_f64();
+
+            // (b) add-only — reset (untimed) a reused filter, then hash+store.
+            let mut bf = BloomFilter::new(n as u32);
+            let mut secs_b = 0.0f64;
+            for _ in 0..iters {
+                bf.reset();
+                let t = Instant::now();
+                bloom_add_batch(&mut bf, &batch);
+                secs_b += t.elapsed().as_secs_f64();
+                black_box(&bf);
+            }
+
+            let keys = iters as f64 * n as f64;
+            let ns_a = secs_a * 1e9 / keys;
+            let ns_b = secs_b * 1e9 / keys;
+            let mkeys = keys / secs_b / 1e6;
+            println!("bloom/{n}: rebuild {ns_a:.1} ns/key  add-only {ns_b:.1} ns/key ({mkeys:.1} Mkeys/s)");
+        }
+    }
+
     #[test]
     fn test_inline_consolidate_basic() {
         let schema = make_u64_i64_schema();

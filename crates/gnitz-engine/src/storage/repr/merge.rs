@@ -1010,6 +1010,164 @@ mod tests {
         }
     }
 
+    /// The view-output-store shape of `v_rev` (the dominant shape in the
+    /// profiled flush workload): one hidden U64 group key + two non-null I64
+    /// aggregates, 40 B/row, `FixedIntNonnull` payload comparator. Shared by
+    /// `merge_batches_skewed_bench` and `write_to_batch_arena_zeroing_bench`.
+    fn make_schema_flush() -> SchemaDescriptor {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        )
+    }
+
+    /// Build an owned `Batch` of `n` rows for `make_schema_flush`: PK from
+    /// `key_fn(i)`, weight +1, both I64 payload columns derived from the row
+    /// index (payloads are irrelevant when all PKs are distinct).
+    fn bench_flush_batch(schema: &SchemaDescriptor, n: usize, key_fn: impl Fn(usize) -> u64) -> Batch {
+        let mut b = Batch::with_schema(*schema, n.max(1));
+        for i in 0..n {
+            b.extend_pk(key_fn(i) as u128);
+            b.extend_weight(&1i64.to_le_bytes());
+            b.extend_null_bmp(&0u64.to_le_bytes());
+            b.extend_col(0, &(i as i64).to_le_bytes());
+            b.extend_col(1, &((i as i64) * 2).to_le_bytes());
+            b.count += 1;
+        }
+        b
+    }
+
+    /// One `compact_in_memory` unit of work at its real skewed run shape: the
+    /// full `consolidate_batches` composition (`write_to_batch` arena +
+    /// `run_merge` + `scatter_unified_sources_with_weights`) over **1 big run +
+    /// 4 small runs**. Existing merge benches use balanced K=4 only; this is the
+    /// per-delta-row price the tick-cadence amplification factor multiplies. Big
+    /// run = `N` even keys; each small run = `d` odd keys uniformly interleaved
+    /// across the big range (distinct per run via a `+2j` offset), so no
+    /// (PK,payload) ties and consolidation drops nothing.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+    fn merge_batches_skewed_bench() {
+        use super::super::batch::write_to_batch;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let schema = make_schema_flush();
+        for (n, d, iters) in [
+            (16_384usize, 16usize, 400usize),
+            (65_536, 16, 100),
+            (262_144, 16, 25),
+            (262_144, 4096, 25),
+        ] {
+            let big = bench_flush_batch(&schema, n, |i| (2 * i) as u64);
+            let stride = (n / d).max(1);
+            let mut batches: Vec<Batch> = Vec::with_capacity(5);
+            batches.push(big);
+            for j in 0..4usize {
+                batches.push(bench_flush_batch(&schema, d, move |i| {
+                    ((i * stride) * 2 + 1 + 2 * j) as u64
+                }));
+            }
+
+            let mem: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
+            let sorted: Vec<SortedMemBatch> = mem.iter().map(|mb| SortedMemBatch::new_unchecked(mb.clone())).collect();
+            let total_rows: usize = sorted.iter().map(|b| b.count).sum();
+
+            // Warm up the path once (allocator, batch pool, page-in); untimed.
+            black_box(write_to_batch(&schema, total_rows, 0, |w| {
+                merge_batches(&sorted, &schema, w);
+            }));
+
+            let t = Instant::now();
+            for _ in 0..iters {
+                let b = write_to_batch(&schema, total_rows, 0, |w| {
+                    merge_batches(&sorted, &schema, w);
+                });
+                black_box(&b);
+            }
+            let secs = t.elapsed().as_secs_f64();
+
+            let rps = (iters as f64 * total_rows as f64) / secs;
+            let ns_per_delta = secs * 1e9 / (iters as f64 * 4.0 * d as f64);
+            println!("merge_skew/N{n}_d{d}: {total_rows} rows  {rps:.0} merge-rows/s  {ns_per_delta:.0} ns/delta-row");
+        }
+    }
+
+    /// The arena-provisioning cost of `write_to_batch` (the pooled-buffer
+    /// `resize(arena_size, 0)` memset) as a function of `max_rows`, separated
+    /// from the scatter work. Arm (a) is pure acquire+zero+wrap; (b) scatters
+    /// all `max_rows` survivors; (c) scatters every 64th survivor. (a) ≈ (c)
+    /// (both ≪ (b) in written rows) is the direct evidence that provisioning is
+    /// O(max_rows), not O(rows written).
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+    fn write_to_batch_arena_zeroing_bench() {
+        use super::super::batch::write_to_batch;
+        use super::super::scatter::scatter_unified_sources_with_weights;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ROW_BYTES: usize = 40; // pk 8 + weight 8 + null 8 + 2×i64 16
+        let schema = make_schema_flush();
+
+        for (max_rows, iters) in [(6_553usize, 2000usize), (26_214, 500), (104_857, 120)] {
+            let src = bench_flush_batch(&schema, max_rows, |i| i as u64);
+            let mem = src.as_mem_batch();
+            let unified = vec![mem_batch_to_unified(&mem, &schema)];
+            let full: Vec<(u32, u32, i64)> = (0..max_rows).map(|r| (0u32, r as u32, 1i64)).collect();
+            let sparse: Vec<(u32, u32, i64)> = (0..max_rows).step_by(64).map(|r| (0u32, r as u32, 1i64)).collect();
+
+            // (a) pure provision: acquire + zero + wrap, empty writer.
+            black_box(write_to_batch(&schema, max_rows, 0, |_w| {}));
+            let t = Instant::now();
+            for _ in 0..iters {
+                let b = write_to_batch(&schema, max_rows, 0, |_w| {});
+                black_box(&b);
+            }
+            let secs_a = t.elapsed().as_secs_f64();
+
+            // (b) full scatter of every survivor.
+            black_box(write_to_batch(&schema, max_rows, 0, |w| {
+                scatter_unified_sources_with_weights(&unified, &full, w);
+            }));
+            let t = Instant::now();
+            for _ in 0..iters {
+                let b = write_to_batch(&schema, max_rows, 0, |w| {
+                    scatter_unified_sources_with_weights(&unified, &full, w);
+                });
+                black_box(&b);
+            }
+            let secs_b = t.elapsed().as_secs_f64();
+
+            // (c) sparse scatter: same arena, 1/64th the rows written.
+            black_box(write_to_batch(&schema, max_rows, 0, |w| {
+                scatter_unified_sources_with_weights(&unified, &sparse, w);
+            }));
+            let t = Instant::now();
+            for _ in 0..iters {
+                let b = write_to_batch(&schema, max_rows, 0, |w| {
+                    scatter_unified_sources_with_weights(&unified, &sparse, w);
+                });
+                black_box(&b);
+            }
+            let secs_c = t.elapsed().as_secs_f64();
+
+            let us_a = secs_a * 1e6 / iters as f64;
+            let us_b = secs_b * 1e6 / iters as f64;
+            let us_c = secs_c * 1e6 / iters as f64;
+            let gbps = (max_rows * ROW_BYTES * iters) as f64 / secs_a / 1e9;
+            let kib = max_rows * ROW_BYTES / 1024;
+            println!(
+                "arena/{kib}KiB: provision {gbps:.1} GB/s ({us_a:.1} µs/call)  full-scatter {us_b:.1} µs/call  sparse {us_c:.1} µs/call  provision-share {:.0}%",
+                100.0 * us_a / us_b
+            );
+        }
+    }
+
     // Takes &[Batch] so test call sites don't need to construct SortedMemBatch.
     fn merge_to_rows(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(u64, u64, i64, i64)> {
         let mem_batches: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
