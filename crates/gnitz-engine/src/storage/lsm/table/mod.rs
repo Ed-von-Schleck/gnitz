@@ -5,6 +5,7 @@
 //! shard for `SalReplay` tables. `Rederive` tables never publish a manifest —
 //! they are erased at open and rebuilt from their sources.
 
+use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
 use std::os::fd::AsRawFd;
@@ -22,10 +23,21 @@ use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
 use crate::schema::SchemaDescriptor;
 
-/// Fold `in_memory_l0` once it exceeds this many runs. Mirrors the disk
-/// `L0_COMPACT_THRESHOLD`; keeps cursor source count and per-lookup run scans
-/// small, and folds cross-flush retraction churn down to net state.
-const INMEM_COMPACT_THRESHOLD: usize = 4;
+/// Fold `in_memory_l0` once it exceeds this many runs. Each fold re-merges the
+/// whole net-state window into one run, so the per-tick flush amplification is
+/// ∝ 1/threshold (a fold fires every ~threshold ticks) — and that fold (merge +
+/// per-run bloom + scatter) is the dominant cost in the RAM-tier flush profile.
+///
+/// Set from a measured e2e sweep, not the disk `L0_COMPACT_THRESHOLD` (4) it once
+/// mirrored. `test_view_maintenance` throughput peaks at 16 — 125k → 143k → 133k
+/// rows/s at threshold 4 / 16 / 32 (4 MiB ceiling, W=4): below the peak the
+/// write-amp down-slope dominates (fewer, larger-amortized folds); above it the
+/// `perf` profile shows `write_shard_streaming` and the read-cursor merge
+/// (`heap_less_with`, `advance_to`) climbing as the window overshoots
+/// `INMEM_CEILING` and spills, and as more runs widen every cursor's loser-tree
+/// merge. The ceiling was swept jointly (8 MiB regressed at both 16 and 32), so
+/// 4 MiB stays. Also folds cross-flush retraction churn down to net state.
+const INMEM_COMPACT_THRESHOLD: usize = 16;
 
 /// Hard per-table (per child `Table` = per partition) heap ceiling for
 /// `in_memory_l0`. A flush that would exceed it folds first; if the folded net
@@ -118,22 +130,36 @@ impl FlushWork {
 /// One in-RAM L0 run plus a PK bloom over its own rows, so a point probe skips
 /// the sorted-run search on a miss. The bloom is keyed exactly like the memtable
 /// bloom (`pack_pk_be` of the OPK bytes) so probes never false-negative at any
-/// PK width. Built fresh over the run (one hashing pass) at flush-push and at
-/// each fold — correctness never needs an XOR8 or a PK-unique certificate here.
+/// PK width.
+///
+/// The bloom is built **lazily on the first probe**, not at flush-push or fold:
+/// the RAM tier is written far more often than it is point-probed (an ingest-only
+/// or purely-scanned table never retracts), so eager per-fold hashing of the whole
+/// run was pure overhead there. A run that is never probed before the next fold
+/// pays nothing; a hot-probed run builds once and amortizes over every probe until
+/// the fold replaces it. A worker owns its partition single-threaded, so
+/// `OnceCell` needs no synchronization. Correctness never needs an XOR8 or a
+/// PK-unique certificate here.
 struct InMemRun {
     batch: Rc<Batch>,
-    bloom: BloomFilter,
+    bloom: OnceCell<BloomFilter>,
 }
 
 impl InMemRun {
     fn from_batch(batch: Rc<Batch>) -> Self {
-        let mut bloom = BloomFilter::new((batch.count as u32).max(16));
-        memtable::bloom_add_batch(&mut bloom, &batch);
-        Self { batch, bloom }
+        Self {
+            batch,
+            bloom: OnceCell::new(),
+        }
     }
     #[inline]
     fn may_contain(&self, key: &[u8]) -> bool {
-        self.bloom.may_contain(pack_pk_be(key))
+        let bloom = self.bloom.get_or_init(|| {
+            let mut bloom = BloomFilter::new((self.batch.count as u32).max(16));
+            memtable::bloom_add_batch(&mut bloom, &self.batch);
+            bloom
+        });
+        bloom.may_contain(pack_pk_be(key))
     }
 }
 

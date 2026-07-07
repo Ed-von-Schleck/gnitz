@@ -83,7 +83,8 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// Fold the residual memtable into the RAM tier (no spill). Handles the
-    /// empty / count==0 cases. `InMemRun::from_batch` builds the per-run bloom.
+    /// empty / count==0 cases. The new run's PK bloom is built lazily on first
+    /// probe (see `InMemRun`), so this push does no hashing pass.
     fn fold_memtable_into_l0(&mut self) {
         if self.memtable.is_empty() {
             return;
@@ -362,7 +363,7 @@ impl Table {
         let merged = memtable::consolidate_runs(&batches, &self.schema);
         self.in_memory_l0.clear();
         if merged.count > 0 {
-            self.in_memory_l0.push(InMemRun::from_batch(merged)); // rebuilds run bloom
+            self.in_memory_l0.push(InMemRun::from_batch(merged)); // bloom rebuilt lazily on next probe
         }
     }
 
