@@ -82,12 +82,12 @@ Baseline facts this plan builds on (all verified against the tree):
 |---|---|
 | TLS stack | rustls 0.23, **ring** provider (feature `ring` — no cmake/C++ toolchain), TLS 1.3 only, buffered `ServerConnection`/`ClientConnection` API (the `unbuffered` API buys nothing here: gnitz is std, moves large frames, and the buffered loop is the far more trodden path) |
 | ALPN | `b"gnitz/1"` on both sides (server list non-empty ⇒ mismatch fails the handshake) |
-| Server I/O model | per-connection, three tasks: a **read pump** (raw recv → `read_tls` → `process_new_packets` → plaintext → frame queue; never locks, never sends; on any recv-side death it issues the lock-free `shutdown_rdwr` that aborts a parked writer), a **flusher** (serializes ciphertext extraction under `send_mutex`, and owns teardown — the lock-free socket shutdown and the one `close(fd)`), and the existing `connection_loop` consuming via `Peer::recv()` and sending under the same `send_mutex`. No drive task, no flow-control protocol; the only timer is the per-connection handshake watchdog — the kernel owns everything else |
+| Server I/O model | per-connection, three tasks: a **read pump** (raw recv → `read_tls` → `process_new_packets` → plaintext fed into a reused `io::RecvState` deframer; never locks, never sends; on any recv-side death it issues the lock-free `posix_io::shutdown` that aborts a parked writer), a **flusher** (serializes ciphertext extraction under `send_mutex`, and owns teardown — the lock-free socket shutdown and the one `libc::close(fd)`), and the existing `connection_loop` consuming via `Peer::recv()` and sending under the same `send_mutex`. No drive task, no flow-control protocol; the only timer is the per-connection handshake watchdog — the kernel owns everything else |
 | Client I/O model | blocking `std::net::TcpStream` + `rustls::StreamOwned<ClientConnection, TcpStream>` — no async runtime, no threads, no pump. A blocking read IS the wait |
 | HELLO | unchanged, first frames on the stream (keeps the `bound_client_id` auth hook and the pre-handshake 8-byte frame cap) |
-| Idle handling | no engine-level idle timeout — established connections idle indefinitely (a blocking client's kernel `recv` is the wait). `SO_KEEPALIVE` is set on every TCP socket, both sides (conservative kernel default intervals): no engine machinery, but it bounds the one liveness gap AF_UNIX lacks — a silent half-open drop (NAT rebind / physical link loss) that would otherwise hang a client's post-handshake `recv` (its read timeout is cleared to `None`) forever. Probe intervals are left at the kernel defaults so a transient partition never reaps a live idle connection |
+| Idle handling | no engine-level idle timeout — established connections idle indefinitely (a blocking client's kernel `recv` is the wait). Keepalive is set on every TCP socket, both sides, with **tuned intervals** (`SO_KEEPALIVE` + `TCP_KEEPIDLE=120`, `TCP_KEEPINTVL=15`, `TCP_KEEPCNT=6` — dead-peer detection ≈ 210 s), not the kernel default (`TCP_KEEPIDLE` = 7200 s / 2 h). This bounds the one liveness gap AF_UNIX lacks — a silent half-open drop (NAT rebind / physical link loss) that would otherwise hang a client's post-handshake `recv` (its read timeout is cleared to `None`) forever *and*, server-side, pin one of the scarce `MAX_TLS_CONNS = 64` slots for two hours. Tuning is safe: TCP keepalive never reaps a *live* idle peer — the peer's kernel ACKs probes with zero application involvement, so probes only fail against a genuinely dead host or a partition longer than the ~210 s window (in which case the client simply reconnects). No engine machinery — the kernel drives the probes |
 | Handshake timeout | 10 s server-side watchdog per accepted TLS connection (reactor timer). rustls has no socket timeouts, so a peer that completes the TCP handshake but stalls the TLS handshake would park its read pump forever and hold one of the `MAX_TLS_CONNS` slots; on expiry, if still `is_handshaking()`, the watchdog drives recv-side teardown. This is a stuck-connection guard, not a security boundary (the listener is unauthenticated) |
-| Inbound bound | unbounded frame queue per connection (fd-path parity; bounded-slot designs deadlock pipelined clients, see baseline facts) guarded by the reactor's **global** inbound-memory counter (`total_inbound_bytes` + `global_cap` in `ReactorShared`, shared with the Unix path, created if not already present): each held frame weighs `frame_weight(len) = len.max(64)`; the pump adds on enqueue, `Peer::recv` subtracts on pop, and `TlsShared::Drop` reconciles frames still queued at teardown. **No per-connection sub-cap** — a global ceiling must shed *some* connection under pressure, and a per-conn cap neither tightens the OOM bound nor avoids disconnecting a legitimate deep-pipelining client. Breach **closes** the connection with a log line, never pauses |
+| Inbound bound | unbounded frame queue per connection (fd-path parity; bounded-slot designs deadlock pipelined clients, see baseline facts) guarded by the reactor's **global** inbound-memory counter (`total_inbound_bytes: Rc<Cell<usize>>` + `global_cap` in `ReactorShared`, shared with the Unix path). The TLS path **reuses the fd path's `io::RecvState`/`RecvBuf` accounting verbatim** rather than re-implementing it: the counter is charged `frame_weight(len) = len.max(64)` at the **header-parse point** (`RecvAdvance::HeaderDone`) — *before* the payload buffer is `malloc`'d and before any payload byte arrives — with the cap checked first so a breach is refused before allocation; `RecvBuf`'s `Drop` refunds via `saturating_sub` on the *only* release paths (consume by `Peer::recv`, or teardown dropping the queued `VecDeque<RecvBuf>`). This closes the slow-drip OOM (a client that declares a 64 MB frame then dribbles it is charged the full 64 MB at header time, not on completion) and needs **no** manual `inbound_bytes` field, `release_inbound_memory`, or `TlsShared::Drop` reconciliation — RAII on `RecvBuf` reclaims everything. **No per-connection sub-cap** — a global ceiling must shed *some* connection under pressure, and a per-conn cap neither tightens the OOM bound nor avoids disconnecting a legitimate deep-pipelining client. Breach **closes** the connection with a log line, never pauses |
 | Nagle | `TCP_NODELAY` on every TCP socket, both sides (AF_UNIX has no Nagle; without this, small control frames pay 40 ms batching delays) |
 | Connection limit | `MAX_TLS_CONNS = 64`: the accept path closes the fd immediately (before any TLS work) when the live TLS-connection count is at the cap |
 | Server CLI | `--tls-listen=IP:PORT` (port 0 ⇒ ephemeral), `--tls-cert=PEM --tls-key=PEM`; without cert+key a self-signed dev cert is minted (rcgen) for `localhost`/`127.0.0.1`/`::1` (rcgen 0.14 emits real IP SANs; rustls verifies IP `ServerName`s against them) and its PEM is written to `<data_dir>/tls_dev_cert.pem` with a log line noting the identity is ephemeral, regenerated every boot. Bound address written **atomically** (write `tls_endpoint.tmp`, `rename`) to `<data_dir>/tls_endpoint` (`IP:PORT\n`) after bind |
@@ -148,36 +148,65 @@ map(s) (below), which — like every added field — are declared **below**
   backoff timer drains, re-arming every listed listener. The accept unit
   tests (`reactor/mod.rs:3338-3371`) update for the `(fd, listener)`
   queue shape.
-- **Raw stream ops** (TLS ciphertext bypasses the framed `RecvState`
-  machinery): `Reactor::recv_raw(fd, buf: Vec<u8>) -> (Vec<u8>, i32)` — a
-  one-shot recv into the caller's buffer, resolving with the byte count
+- **Raw stream ops** (the reactor's CQE-level `RecvState` deframes *socket
+  bytes*, which under TLS are ciphertext — so the raw ops carry undeframed
+  bytes and a second `RecvState` instance deframes the decrypted plaintext
+  in the pump, below): `Reactor::recv_raw(fd, buf: Vec<u8>) -> (Vec<u8>, i32)`
+  — a one-shot recv into the caller's buffer, resolving with the byte count
   (≤ 0 = EOF/error); the buffer round-trips so the pump reuses one 64 KiB
   allocation forever. `recv_raw` gets its own completion kind
   `KIND_RAW_RECV` (+ a cancel kind) with per-fd park/waker/tombstone maps
   mirroring the deleted UDP-recv machinery — it must NOT ride `KIND_RECV`,
   whose handler silently drops CQEs for fds absent from `conns` (TLS fds
-  never call `register_conn`). `Reactor::send_raw(fd, Vec<u8>) -> i32` —
-  sends the whole buffer, looping partial `OP_SEND` completions like the
+  never call `register_conn`). `Reactor::send_raw(fd, cipher: Rc<Vec<u8>>) -> i32`
+  — sends the whole buffer, looping partial `OP_SEND` completions like the
   existing send path (which already loops partials), riding the existing
   `KIND_SEND`/send-waker routing (its absent-`conns`-key lookup is a
-  benign no-op) with a new `SendAlive::Vec(Vec<u8>)` keep-alive variant
-  replacing the deleted `UdpOp`. Both follow the UDP ops' drop discipline
+  benign no-op) with a new **`SendAlive::RcVec(Rc<Vec<u8>>)`** keep-alive
+  variant replacing the deleted `UdpOp`. It **must be `Rc`-wrapped, not an
+  owned `SendAlive::Vec(Vec<u8>)`**: `send_buf_inner` `.clone()`s the
+  keep-alive on *every* partial-write chunk (`_alive: Some(alive.clone())`
+  per re-submitted SQE), so an owned `Vec` would deep-copy the entire
+  ciphertext buffer once per chunk — every existing variant is `Rc`/`Static`
+  precisely to keep that clone O(1). Both follow the UDP ops' drop discipline
   (drop = AsyncCancel + tombstone); `prep_sendmsg`/`prep_recvmsg` deletion
   hits both the `Ring` trait and the `IoUringRing` impl.
-- **Inbound-counter release**: `Reactor::release_inbound_memory(n: usize)`
-  — saturating-subtracts `n` from `total_inbound_bytes`. The TLS path holds
-  its queued frames in `TlsConn.inbound` (outside the reactor's
-  `pending_recv` map), so `TlsShared::Drop` calls this to reconcile the
-  global counter for frames still queued at a dirty teardown — the analogue
-  of the fd path's `reap_closing_conns` reconciliation. Without it a
-  teardown with unread frames leaks the counter monotonically until it
-  wedges every new connection.
+- **Inbound buffer allocation (shared with the fd path)**: the TLS pump
+  charges and allocates inbound frames through the *same* accounting the fd
+  handler uses — no new counter API, no `release_inbound_memory`. Factor the
+  fd handler's `HeaderDone` body into `Reactor::alloc_inbound_buf(plen:
+  usize) -> Option<RecvBuf>` and call it from both sites:
+
+  ```rust
+  pub(crate) fn alloc_inbound_buf(&self, plen: usize) -> Option<RecvBuf> {
+      let w = io::frame_weight(plen);
+      if self.inner.total_inbound_bytes.get() + w > self.inner.global_cap.get() {
+          return None; // refuse before malloc — no overshoot
+      }
+      let pbuf = unsafe { libc::malloc(plen) as *mut u8 };
+      if pbuf.is_null() {
+          return None;
+      }
+      // RecvBuf::new charges frame_weight(plen); its Drop refunds.
+      Some(io::RecvBuf::new(pbuf, plen, Rc::clone(&self.inner.total_inbound_bytes)))
+  }
+  ```
+
+  `handle_recv_cqe`'s `HeaderDone` arm becomes a call to this helper (its
+  `plen > max_payload_len` guard stays at the call site, since the per-conn
+  cap differs by path). Because every completed frame is a `RecvBuf` whose
+  `Drop` refunds the counter, the queued `VecDeque<RecvBuf>` self-reconciles
+  when a `TlsConn` is dropped at teardown — no manual reconciliation, no
+  `TlsShared::Drop` counter logic. Expose `RecvState`, `RecvBuf`,
+  `RecvBuf::new`, and `RecvAdvance` as `pub(crate)` for the `tls` module
+  (today `pub(super)` within `reactor`).
 
 ## Design — server
 
 New module `crates/gnitz-engine/src/runtime/tls/`: `mod.rs` (conn state,
-read pump, `TlsPeer`), `frame.rs` (`FrameAssembler`), `config.rs`
-(rustls/rcgen building).
+read pump, `TlsPeer`) and `config.rs` (rustls/rcgen building). There is **no**
+`frame.rs`: TLS reuses the reactor's `io::RecvState` deframer over the decrypted
+plaintext (below), so no bespoke frame assembler exists.
 
 ### config.rs
 
@@ -191,38 +220,85 @@ PKCS#8 via `serialize_der`); build
 .with_single_cert(chain, key)?`, set `alpn_protocols = [b"gnitz/1"]`.
 Returns `(Arc<rustls::ServerConfig>, Option<String /*dev PEM*/>)`.
 
-### frame.rs
+### Plaintext framing — reuse `io::RecvState`
 
-`FrameAssembler` mirrors the reactor's `RecvState` on owned buffers:
-consume plaintext bytes, cut `[len:u32 LE][payload]` frames, reject
-`len == 0` (close sentinel) and `len > max_payload_len` (initially
-`HELLO_PRE_HANDSHAKE_LEN = 8`, elevated by `Peer::set_max_payload_len`
-after HELLO — `run_hello_handshake` elevates synchronously *before*
-sending the ACK, so no conforming client's frame can hit the 8-byte cap).
-`TlsConn::feed_assembler` (which wraps it and enqueues completed frames,
-charging the global inbound counter) returns `Result<(), ()>`: `Err` on any
-violation — oversize `len`, the zero-len sentinel, or an inbound-cap breach
-— which the pump turns into recv-side teardown. A violation closes the
-connection. Deliberately *stricter* than the fd
-path in one corner: the pump parses stream bytes on arrival, so a client
-that pipelines a >8-byte frame behind HELLO before the ACK gets closed
-here, while the fd path leaves those bytes unparsed in the kernel buffer
-until the cap is elevated. No conforming client pipelines pre-ACK
-(`hello_handshake` blocks on the ACK) — intended hardening, not a
-compatibility break.
+TLS does **not** re-implement frame assembly. The decrypted plaintext is fed
+into a per-connection `io::RecvState` — the identical deframer the fd path runs
+on socket bytes — so `[len:u32 LE][payload]` cutting, the `len == 0` close
+sentinel, the `len > max_payload_len` cap, header-time inbound-memory charging,
+and `RecvBuf` RAII refund are all inherited verbatim, not duplicated. This
+closes a slow-drip OOM the fd path is already immune to: `RecvState` charges
+`frame_weight(len)` and `malloc`s the payload at `RecvAdvance::HeaderDone`
+(refusing before allocation if the cap would breach), so a client that declares
+a 64 MB frame and then dribbles the payload one byte per second is charged the
+full 64 MB up front — it can never accumulate uncounted in-flight bytes.
+
+`max_payload_len` starts at `HELLO_PRE_HANDSHAKE_LEN = 8`, elevated by
+`Peer::set_max_payload_len` after HELLO — `run_hello_handshake` elevates
+synchronously *before* sending the ACK, so no conforming client's frame can hit
+the 8-byte cap. `TlsConn::feed_decrypted` drives the `RecvState` from the rustls
+plaintext reader and returns `Result<(), ()>`: `Err` on any violation — oversize
+`len`, the zero-len sentinel, or an inbound-cap breach — which the pump turns
+into recv-side teardown. It also achieves one-fewer-copy decryption: rustls reads
+plaintext straight into the `RecvBuf` payload buffer via `RecvState::remaining()`,
+with no intermediate stack bounce buffer.
+
+```rust
+impl TlsConn {
+    /// Drain all currently-available decrypted plaintext into the RecvState,
+    /// enqueuing completed frames. Err ⇒ recv-side teardown (oversize, zero-len
+    /// sentinel, cap breach, or a rustls read error / clean close).
+    fn feed_decrypted(&mut self, reactor: &Reactor) -> Result<(), ()> {
+        loop {
+            let (ptr, len) = self.recv_state.remaining();
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) };
+            match self.sess.reader().read(slice) {
+                Ok(0) => return Err(()),                       // clean TLS close
+                Ok(m) => match self.recv_state.advance(m) {
+                    io::RecvAdvance::NeedMore => {}
+                    io::RecvAdvance::HeaderDone => {
+                        let plen = self.recv_state.payload_len();
+                        if plen > self.max_payload_len {
+                            return Err(());
+                        }
+                        // Charges frame_weight(plen) now, before payload bytes
+                        // arrive; None ⇒ cap breach, refused before malloc.
+                        let buf = reactor.alloc_inbound_buf(plen).ok_or(())?;
+                        self.recv_state.start_payload(buf);
+                    }
+                    io::RecvAdvance::MessageDone => {
+                        self.inbound.push_back(self.recv_state.take_message());
+                    }
+                    io::RecvAdvance::Disconnect => return Err(()), // len == 0 sentinel
+                },
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(_) => return Err(()),
+            }
+        }
+    }
+}
+```
+
+Deliberately *stricter* than the fd path in one corner: the pump parses stream
+bytes on arrival, so a client that pipelines a >8-byte frame behind HELLO before
+the ACK gets closed here, while the fd path leaves those bytes unparsed in the
+kernel buffer until the cap is elevated. No conforming client pipelines pre-ACK
+(`hello_handshake` blocks on the ACK) — intended hardening, not a compatibility
+break.
 
 ### Connection state and read pump
 
 ```rust
 struct TlsConn {
     sess: rustls::ServerConnection,
-    assembler: FrameAssembler,
-    inbound: VecDeque<Vec<u8>>, // complete frame payloads awaiting Peer::recv
-    inbound_bytes: usize,       // Σ frame_weight(len); reactor cap accounting
-    recv_waker: Option<Waker>,  // single slot: exactly one connection_loop recvs
-    recv_closed: bool,          // EOF / close_notify / TLS error / cap breach
-    closed: bool,               // Peer::close() ran; senders refuse, flusher tears down
-    pump_exited: bool,          // pump done; fd may be closed once `closed` too
+    recv_state: io::RecvState,     // reused fd-path deframer over decrypted plaintext
+    max_payload_len: usize,        // 8 pre-HELLO, elevated by set_max_payload_len
+    inbound: VecDeque<RecvBuf>,    // completed frames awaiting Peer::recv; RecvBuf
+                                   //   RAII refunds the inbound counter on drop
+    recv_waker: Option<Waker>,     // single slot: exactly one connection_loop recvs
+    recv_closed: bool,             // EOF / close_notify / TLS error / cap breach
+    closed: bool,                  // Peer::close() ran; senders refuse, flusher tears down
+    pump_exited: bool,             // pump done; fd may be closed once `closed` too
 }
 
 struct TlsShared {
@@ -233,22 +309,13 @@ struct TlsShared {
     flush_tx: mpsc::Sender<()>,     // wakes the flusher task
     conn_guard: TlsConnGuard,       // RAII: decrements the live-conn counter on Drop
 }
-
-impl Drop for TlsShared {
-    fn drop(&mut self) {
-        // Reclaim the global inbound-memory counter for frames still queued in
-        // `inbound` at teardown: they were counted on enqueue but never popped
-        // by `Peer::recv`, so the consume-path decrement never ran. Without
-        // this a dirty teardown (connection_loop exits with frames unread)
-        // leaks the counter monotonically until it wedges every new
-        // connection — the TLS analogue of the fd path's reap reconciliation.
-        let held = self.state.borrow().inbound_bytes;
-        if held > 0 {
-            self.reactor.release_inbound_memory(held);
-        }
-    }
-}
 ```
+
+No `impl Drop for TlsShared` is needed for inbound-memory reconciliation: each
+queued frame is a `RecvBuf` whose own `Drop` refunds `frame_weight(len)`, so a
+dirty teardown that drops the `TlsConn` (and its `VecDeque<RecvBuf>`) with frames
+unread reclaims the counter automatically — the same RAII the fd path relies on.
+`TlsConnGuard` (a distinct field) still handles the live-connection count on drop.
 
 Two lifecycle flags in `TlsConn` drive teardown: `closed` (set once by
 `Peer::close()`) and `pump_exited` (set by the pump on its way out).
@@ -292,22 +359,12 @@ async fn read_pump(conn: Rc<TlsShared>, reactor: Rc<Reactor>) {
                     Ok(_) => match c.sess.process_new_packets() {
                         Err(_) => fatal = true,                // fatal alert queued by rustls
                         Ok(io) => {
-                            let mut pt = [0u8; 32 * 1024];
-                            loop {                             // drain ALL plaintext
-                                match c.sess.reader().read(&mut pt) {
-                                    Ok(0) => { fatal = true; break; }     // clean close
-                                    // frames → inbound; a violation (oversize,
-                                    // zero-len sentinel, or inbound-cap breach)
-                                    // returns Err and tears the recv side down.
-                                    Ok(m) => {
-                                        if c.feed_assembler(&pt[..m]).is_err() {
-                                            fatal = true;
-                                            break;
-                                        }
-                                    }
-                                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                                    Err(_) => { fatal = true; break; }
-                                }
+                            // Deframe all available plaintext straight into the
+                            // reused RecvState (zero-copy into RecvBuf); Err on a
+                            // violation — oversize, zero-len sentinel, cap breach,
+                            // or a clean plaintext close — tears the recv side down.
+                            if c.feed_decrypted(&reactor).is_err() {
+                                fatal = true;
                             }
                             if io.peer_has_closed() { fatal = true; }
                         }
@@ -332,7 +389,9 @@ async fn read_pump(conn: Rc<TlsShared>, reactor: Rc<Reactor>) {
     // — without it, a sender parked mid-scan-train while the client has
     // stopped reading pins the mutex and the flusher can never flush or close.
     // Idempotent with the flusher's own shutdown on the local-close path.
-    posix_io::shutdown_rdwr(conn.fd);
+    // `posix_io::shutdown` (SHUT_RDWR, EINTR-looped, ENOTCONN-tolerant) already
+    // exists — its doc comment describes exactly this ring-slot eviction use.
+    posix_io::shutdown(conn.fd);
     if let Some(w) = conn.take_recv_waker() { w.wake(); }
     conn.notify_flusher();                                     // run teardown
 }
@@ -340,8 +399,8 @@ async fn read_pump(conn: Rc<TlsShared>, reactor: Rc<Reactor>) {
 
 The flusher — it and the senders serialize ciphertext extraction under
 `send_mutex`, and it is the one place the fd is ever closed. Teardown
-(`shutdown_rdwr`, `close_fd`) is lock-free — it never *acquires* the mutex,
-so a writer parked in `send_raw` can never wedge it:
+(`posix_io::shutdown`, then `libc::close`) is lock-free — it never *acquires*
+the mutex, so a writer parked in `send_raw` can never wedge it:
 
 ```rust
 async fn flusher(conn: Rc<TlsShared>, reactor: Rc<Reactor>, mut rx: mpsc::Receiver<()>) {
@@ -350,7 +409,8 @@ async fn flusher(conn: Rc<TlsShared>, reactor: Rc<Reactor>, mut rx: mpsc::Receiv
         // Extract and ship whatever ciphertext rustls has queued: handshake
         // flights, tickets, KeyUpdate, alerts, a close_notify queued by
         // close(). The send mutex is held only for the synchronous `write_tls`
-        // extraction — teardown never *waits* on it.
+        // extraction — teardown never *waits* on it. One pass drains ALL queued
+        // ciphertext, so it services any number of coalesced notifications.
         let out = {
             let _g = conn.send_mutex.lock().await;
             let mut c = conn.state.borrow_mut();
@@ -358,7 +418,7 @@ async fn flusher(conn: Rc<TlsShared>, reactor: Rc<Reactor>, mut rx: mpsc::Receiv
             while c.sess.wants_write() { let _ = c.sess.write_tls(&mut out); }
             out
         };
-        if !out.is_empty() { let _ = reactor.send_raw(conn.fd, out).await; }
+        if !out.is_empty() { let _ = reactor.send_raw(conn.fd, Rc::new(out)).await; }
 
         // Teardown, lock-free. Half-close once either side has begun it: on a
         // *local* close this drives the pump's parked recv to EOF; on any close
@@ -366,19 +426,25 @@ async fn flusher(conn: Rc<TlsShared>, reactor: Rc<Reactor>, mut rx: mpsc::Receiv
         // is always eventually released (no teardown deadlock). Idempotent with
         // the pump's own shutdown.
         if (conn.closed() || conn.recv_closed()) && !shutdown_sent {
-            posix_io::shutdown_rdwr(conn.fd);
+            posix_io::shutdown(conn.fd);
             shutdown_sent = true;
         }
         // The ONE close — only after the local close ran *and* the pump exited.
         // A bare close neither aborts an in-flight io_uring op nor stops a task
         // from touching a recycled fd number, hence close-once-both-are-done.
-        // `TlsShared`'s guard Drop then decrements the live-conn counter and
-        // reconciles the inbound-memory counter.
+        // The fd is unregistered (TLS never calls `register_conn`), so
+        // `Reactor::close_fd` would be a no-op — close it directly with the
+        // codebase's raw idiom. `TlsShared`'s guard Drop (when the last
+        // `Rc<TlsShared>` drops) then decrements the live-conn counter; queued
+        // `RecvBuf`s refund the inbound counter via their own Drop.
         if conn.closed() && conn.pump_exited() {
-            posix_io::close_fd(conn.fd);
+            unsafe { libc::close(conn.fd) };
             return;
         }
+        // Coalesce a burst of notifications: park on the next, then drain any
+        // that piled up so we make exactly one more flush pass, not N.
         if rx.recv().await.is_none() { return; }
+        while rx.try_recv().is_some() {}
     }
 }
 ```
@@ -387,37 +453,43 @@ async fn flusher(conn: Rc<TlsShared>, reactor: Rc<Reactor>, mut rx: mpsc::Receiv
 `Peer::close()` stays a **sync** fn (its many call sites are unchanged):
 the first transition of `closed` calls `sess.send_close_notify()` under the
 borrow and notifies the flusher; repeat calls are no-ops. *Local close:*
-the flusher flushes the close_notify → `shutdown_rdwr` (new `posix_io`
-helper) completes the pump's in-flight `recv_raw` with EOF → the pump exits
-and notifies → the flusher sees `closed && pump_exited` → `close(fd)`.
+the flusher flushes the close_notify → `posix_io::shutdown`
+completes the pump's in-flight `recv_raw` with EOF → the pump exits
+and notifies → the flusher sees `closed && pump_exited` → `libc::close(fd)`.
 *Remote EOF / error / cap-breach:* the pump sets `recv_closed`/`pump_exited`
-**and issues `shutdown_rdwr` itself** → `connection_loop` drains the queue,
+**and issues `posix_io::shutdown` itself** → `connection_loop` drains the queue,
 gets `None`, calls `peer.close()` at its exit (it always does) → same
 convergence.
 
-The load-bearing property is that **`shutdown_rdwr` is lock-free and every
+The load-bearing property is that **`posix_io::shutdown` is lock-free and every
 recv-side death issues it.** A `connection_loop` sender (or the flusher) can
 be parked in `send_raw` on a full kernel sndbuf when the client has stopped
 reading, holding `send_mutex` across the await; if teardown had to *acquire*
 that mutex before it could shut the socket down, it would wedge forever (the
 socket never closes → `send_raw` never errors → the mutex never releases →
-the fd + `MAX_TLS_CONNS` slot leak, with keepalive the only, hours-long
-backstop). Issuing `shutdown_rdwr` **without** the mutex breaks exactly this
+the fd + `MAX_TLS_CONNS` slot leak, with keepalive the only, ~210 s
+backstop). Issuing `posix_io::shutdown` **without** the mutex breaks exactly this
 cycle: the kernel aborts the parked `send_raw` with an error CQE, the writer
 returns `-1` and drops its `send_mutex` guard, and both the flusher's flush
-and the final `close(fd)` proceed. Because the mutex is therefore never held
+and the final `libc::close(fd)` proceed. Because the mutex is therefore never held
 indefinitely, the flusher's brief lock-extract-release step can never wedge.
 
-Notes that keep the rest airtight: `Reactor::close_fd` is a no-op for
-unregistered fds, and a plain `libc::close` neither completes an in-flight
-io_uring recv nor prevents a task from touching a recycled fd number — hence
-shutdown-first, close-once-both-tasks-are-done. In-flight `send_raw` buffers
-are reactor-owned keep-alives until their CQE, and senders check `closed`
+Notes that keep the rest airtight: the TLS fd is never `register_conn`'d, so
+`Reactor::close_fd` would be a no-op on it — the flusher closes it directly with
+raw `libc::close` (the codebase idiom), and only after shutdown + pump-exit,
+because a bare close neither completes an in-flight io_uring recv nor prevents a
+task from touching a recycled fd number. In-flight `send_raw` buffers are
+reactor-owned `Rc` keep-alives until their CQE, and senders check `closed`
 under the borrow in the same poll as submission, so nothing can submit on a
-recycled fd. The live-connection counter *and* the connection's residual
-inbound-memory weight are both reclaimed by RAII (`TlsConnGuard` +
-`TlsShared::Drop`, when the last `Rc<TlsShared>` goes away) — a panicking
-task can never leak a `MAX_TLS_CONNS` slot or the global inbound counter.
+recycled fd. The live-connection counter is reclaimed by `TlsConnGuard`'s Drop
+and the residual inbound-memory weight by each queued `RecvBuf`'s Drop, both
+firing when the last `Rc<TlsShared>` (and hence the `TlsConn`) goes away — on
+normal close, and on reactor teardown, which drops every task future. **Panics
+are not isolated:** the reactor's `poll_task` has no `catch_unwind`, so a panic
+in any handler unwinds the whole reactor thread exactly as it does on the fd path
+today — not a per-connection slot leak, a process-level failure. RAII is the
+recovery for *clean* teardown, not a panic firewall; no `Drop for Peer` is added
+(it would change the fd path's explicit-close semantics for no gain).
 
 The TLS handshake needs no separate phase: the pump's read/process cycle
 *is* the handshake driver and the flusher ships the emitted flights (no
@@ -430,25 +502,28 @@ picks them up, and the pump's notify makes the flusher sweep whatever
 remains after the mutex is released. The pump reads unconditionally —
 fd-path parity — so a pipelining client's sends always drain (no
 four-party deadlock); memory is guarded by the global inbound cap, whose
-breach (in `feed_assembler`) sets `recv_closed`, logs fd and accounted
-backlog, and lets teardown reclaim the queue. Guard the chunked send loop
-against a zero-length
-`writer().write` acceptance (drain, then retry) so a full rustls buffer
-can never spin it.
+breach (in `feed_decrypted`, via `alloc_inbound_buf` returning `None`) sets
+`recv_closed`, logs fd and accounted backlog, and lets teardown reclaim the
+queue. Guard the chunked send loop against a zero-length `writer().write`:
+treat `Ok(0)` on a non-empty slice as fatal (`return -1`) so a full rustls
+buffer can never spin it.
 
 ### TlsPeer (the `PeerInner::Tls` variant)
 
 `peer.rs` gains `Tls(Rc<TlsShared>)`.
 
-- `recv()`: future that pops `inbound` (returning `RecvBuf::Vec(Vec<u8>)` —
-  `RecvBuf`, today a malloc-backed `{ptr, len}` struct in
-  `runtime/reactor/io.rs`, becomes a two-variant enum with
-  `as_slice`/`Drop` dispatch), decrementing `inbound_bytes`; parks in
-  `recv_waker` when empty; resolves `None` once `recv_closed` and the
-  queue is empty.
-- `send_buffer` / `send_slot` / `send_hello_ack`: one shared loop over the
-  complete frame bytes (already length-prefixed exactly as the fd path
-  sends them):
+- `recv()`: future that pops `inbound: VecDeque<RecvBuf>` and returns the
+  `RecvBuf` directly (the same malloc-backed `{ptr, len}` type in
+  `runtime/reactor/io.rs` the fd path already yields — **no two-variant enum
+  change**; the TLS payload buffers are `malloc`'d by `alloc_inbound_buf`
+  exactly like the fd path's). Popping hands the caller the `RecvBuf`, whose
+  eventual `Drop` refunds the inbound counter — no manual decrement. Parks in
+  `recv_waker` when empty; resolves `None` once `recv_closed` and the queue is
+  empty.
+- `send_buffer` / `send_hello_ack`: call the shared `send_bytes` loop over the
+  complete frame bytes (already length-prefixed exactly as the fd path sends
+  them). No deadline — fd parity (`Reactor::send_buffer`/`send_hello_ack` are
+  un-guarded; they pin no shared worker resource):
 
   ```rust
   async fn send_bytes(&self, bytes: &[u8]) -> i32 {
@@ -460,6 +535,7 @@ can never spin it.
               if c.closed || c.recv_closed { return -1; }
               let end = (off + 32 * 1024).min(bytes.len());   // stay under rustls's
               match c.sess.writer().write(&bytes[off..end]) { // 64 KiB buffer_limit
+                  Ok(0) => return -1,   // full rustls buffer we can't drain; kill, don't spin
                   Ok(n) => off += n,
                   Err(_) => return -1,
               }
@@ -467,7 +543,7 @@ can never spin it.
               while c.sess.wants_write() { let _ = c.sess.write_tls(&mut out); }
               out
           };
-          if self.reactor.send_raw(self.fd(), cipher).await < 0 { return -1; }
+          if self.reactor.send_raw(self.fd(), Rc::new(cipher)).await < 0 { return -1; }
       }
       bytes.len() as i32
   }
@@ -476,8 +552,35 @@ can never spin it.
   Chunked writes keep rustls's plaintext buffer under its default 64 KiB
   limit and bound transient ciphertext memory; the awaited `send_raw` is
   where kernel backpressure lands.
-- `set_max_payload_len`: sets the assembler cap (synchronous `RefCell`
-  write).
+- `send_slot`: the W2M ring-slot egress. It **must** re-impose the fd path's
+  per-frame client-send deadline (`Reactor::send_slot`, `conn.rs:160`) — the
+  unified `send_bytes` loop drops it, and a client that simply stops reading
+  (never triggering recv-side EOF/error) would otherwise park the send in
+  `send_raw` forever, holding the `W2mSlot` across the await. That pins the
+  worker's W2M ring, whose fill synchronously futex-blocks the single-threaded
+  worker — a cluster-wide freeze. The slot's frame bytes stay borrowed (hence
+  the slot alive, and W2M backpressure preserved) until the kernel accepts the
+  last ciphertext byte; on stall, `posix_io::shutdown` aborts the parked
+  `send_raw`, releasing both the `send_mutex` and — once the awaited future
+  returns — the slot:
+
+  ```rust
+  async fn send_slot(&self, slot: W2mSlot) -> i32 {
+      let mut send_fut = std::pin::pin!(self.send_bytes(slot.frame_bytes()));
+      let deadline = Instant::now() + client_send_timeout();   // pub(crate) from reactor
+      match select2(send_fut.as_mut(), self.reactor.timer(deadline)).await {
+          Either::A(rc) => rc,
+          Either::B(()) => {
+              gnitz_warn!("tls: client fd={} stalled ring-slot egress past {:?}; evicting",
+                          self.fd(), client_send_timeout());
+              posix_io::shutdown(self.fd());   // abort the parked send_raw → release slot
+              send_fut.await.min(-1)
+          }
+      }
+  }
+  ```
+- `set_max_payload_len`: sets `TlsConn.max_payload_len` (synchronous `RefCell`
+  write) — the same cap `feed_decrypted` enforces per frame.
 - `close()`: sync and idempotent — the first transition of `closed` calls
   `sess.send_close_notify()` under the borrow and notifies the flusher,
   which flushes, shuts the socket down, and (once the pump has exited)
@@ -501,8 +604,9 @@ can never spin it.
 - `executor.rs`: when `Some`, `reactor.attach_listener(tls_fd)` next to the
   unix listener; `accept_loop` matches the listener fd of each accepted
   `(fd, listener)` pair: unix → today's path verbatim; TLS → if the live
-  count is at `MAX_TLS_CONNS`, `posix_io::close(fd)` and log; else set
-  `TCP_NODELAY` **and `SO_KEEPALIVE`** on the accepted fd, build
+  count is at `MAX_TLS_CONNS`, `unsafe { libc::close(fd) }` and log; else set
+  `TCP_NODELAY` and tuned keepalive (`posix_io::set_keepalive`) on the
+  accepted fd, build
   `rustls::ServerConnection::new(cfg)`, create the `TlsShared` (constructing
   the RAII live-conn guard), spawn `read_pump` and `flusher`, spawn the
   **handshake watchdog** (below), wrap `Peer::tls(...)`, spawn
@@ -512,10 +616,11 @@ can never spin it.
   The handshake watchdog is one small task per accepted TLS connection:
 
   ```rust
-  let wd = Rc::clone(&conn);            // Rc<TlsShared>
+  let wd = Rc::downgrade(&conn);        // Weak<TlsShared> — see below
   let wd_reactor = Rc::clone(&reactor);
   reactor.spawn(async move {
       wd_reactor.timer(Instant::now() + Duration::from_secs(10)).await;
+      let Some(wd) = wd.upgrade() else { return; };   // already torn down
       let stalled = {
           let c = wd.state.borrow();
           !c.closed && !c.recv_closed && c.sess.is_handshaking()
@@ -523,7 +628,7 @@ can never spin it.
       if stalled {
           gnitz_warn!("tls: handshake timed out (fd={}), dropping", wd.fd);
           // Same lock-free recv-side teardown the pump runs on error:
-          // set recv_closed, shutdown_rdwr(fd), wake the recv waiter,
+          // set recv_closed, posix_io::shutdown(fd), wake the recv waiter,
           // notify the flusher. The pump exits on the resulting EOF and
           // connection_loop closes via the normal convergence.
           wd.begin_recv_teardown();
@@ -531,8 +636,16 @@ can never spin it.
   });
   ```
 
+  The watchdog holds a **`Weak<TlsShared>`, not a strong `Rc`**: it lives in the
+  reactor's timer queue for the full 10 s, and a strong clone would keep
+  `TlsShared` (and its `TlsConnGuard`) alive that whole time even for a
+  connection that closed in 5 ms — so 64 rapid connect/disconnects would pin all
+  `MAX_TLS_CONNS` slots for 10 s and wedge new connections. With `Weak`, a
+  closed connection's guard drops immediately; the watchdog `upgrade()`s to a
+  no-op when the connection is already gone.
+
   `begin_recv_teardown` factors the pump's exit actions (set `recv_closed`,
-  `shutdown_rdwr`, wake recv waiter, notify flusher) so the pump and the
+  `posix_io::shutdown`, wake recv waiter, notify flusher) so the pump and the
   watchdog share one path; it does **not** set `pump_exited` (only the pump
   does, on its actual exit).
 
@@ -572,12 +685,29 @@ pub struct TransportWaker(RawFd);
 ```
 
 - Unix variant: today's free functions, verbatim.
-- Tls variant: `send_framed_*` coalesce the length prefix + payload (and,
-  in `send_framed_batch`, all frames) into a single buffered `write_all` —
-  each separate `writer().write` emits its own TLS record, so naive
-  per-piece writes would cost two records (2 AEAD ops + 2×~22 B) per small
-  control frame; one write lets rustls fragment into full 16 KiB records
-  internally. `recv_framed` = `read_exact` a 4-byte prefix,
+- Tls variant: `send_framed_*` write the length prefix + payload(s) **directly
+  into rustls's internal plaintext buffer** via `conn.writer().write_all`, then
+  flush once by looping `conn.write_tls(&mut sock)` until `!conn.wants_write()`.
+  This bypasses `StreamOwned`'s `Write` impl, which flushes (`complete_io`) on
+  *every* `write` call — so a naive prefix-then-payload pair emits two TLS
+  records (2 AEAD ops + 2×~22 B overhead) per small control frame — **and**
+  avoids the coalescing `Vec` the prior draft allocated per send (a real cost
+  for a large `send_framed_batch`). Writing straight into `writer()` lets rustls
+  fragment the buffered plaintext into full 16 KiB records at flush time:
+
+  ```rust
+  // ClientTransport::Tls { stream } — StreamOwned exposes .conn and .sock.
+  let prefix = (total as u32).to_le_bytes();
+  stream.conn.writer().write_all(&prefix)?;
+  for buf in bufs {                         // send_framed_batch loops all frames
+      stream.conn.writer().write_all(buf)?;
+  }
+  while stream.conn.wants_write() {
+      stream.conn.write_tls(&mut stream.sock)?;   // blocking TcpStream drains it
+  }
+  ```
+
+  `recv_framed` = `read_exact` a 4-byte prefix,
   validate against `max_payload_len` and the zero-length sentinel exactly
   like the fd path, `read_exact` the payload. `StreamOwned` drives the
   handshake implicitly on first use and handles partial record I/O
@@ -591,12 +721,27 @@ pub struct TransportWaker(RawFd);
 - Connect: parse target — host extraction handles bracketed IPv6
   (`tls://[::1]:PORT`: strip the brackets for `ServerName`/verification,
   keep them for `ToSocketAddrs`; otherwise split on the trailing `:port`)
-  → resolve via `ToSocketAddrs` (first address) →
-  `TcpStream::connect_timeout(addr, 10 s)` → `set_nodelay(true)` →
-  enable `SO_KEEPALIVE` (raw `setsockopt` on the stream fd — std `TcpStream`
-  has no keepalive setter; this bounds a silent half-open drop that would
-  otherwise hang the post-handshake `recv` forever, since its read timeout
-  is cleared below) → `set_read_timeout(Some(10 s))` → rustls `ClientConfig`
+  → resolve via `ToSocketAddrs` and try `connect_timeout` on **each** address
+  in turn (dual-stack fallback — first-address-only would hang 10 s then fail
+  when `localhost` resolves to `[::1]` first but the server listens only on
+  `127.0.0.1`; keep the last error to report if all fail):
+
+  ```rust
+  let mut last_err = None;
+  let stream = target.to_socket_addrs()?
+      .find_map(|addr| match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+          Ok(s) => Some(s),
+          Err(e) => { last_err = Some(e); None }
+      })
+      .ok_or_else(|| ProtocolError::IoError(last_err.unwrap()))?;
+  ```
+
+  → `set_nodelay(true)` → tuned keepalive (raw `setsockopt` on the stream fd —
+  std `TcpStream` has no keepalive setter; `SO_KEEPALIVE` + `TCP_KEEPIDLE=120`
+  / `TCP_KEEPINTVL=15` / `TCP_KEEPCNT=6`, the same values the server sets; this
+  bounds a silent half-open drop that would otherwise hang the post-handshake
+  `recv` forever, since its read timeout is cleared below) →
+  `set_read_timeout(Some(10 s))` → rustls `ClientConfig`
   (ring provider,
   TLS 1.3, ALPN `gnitz/1`) with the chosen verification mode — default
   `RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())`;
@@ -630,16 +775,35 @@ exactly as today (12 ⇒ ACK, anything else ⇒ STATUS_ERROR control block).
 - **C API, Python sync**: no code changes — the connect string flows
   through `GnitzClient::connect` → `Connection::connect` →
   `ClientTransport::connect`. Docstring updates only (`gnitz.h`, `aio.py`).
-- **Python async** (`gnitz-py/src/lib.rs`): `PyAsyncTransport::new` builds a
-  `ClientTransport` (replacing `SocketGuard`), runs `hello_handshake(&mut
-  t)`, takes `t.waker()` (replacing `DupFd` — same dup-fd shutdown
-  mechanism, now transport-generic), and moves the transport into
-  `async_io_loop`, whose `send_framed_batch(sock_fd, ..)` /
-  `recv_framed(sock_fd, ..)` / `recv_scan_response(sock_fd, ..)` calls
-  become transport method calls. `PyAsyncTransport::Drop` keeps today's
+- **Python async** (`gnitz-py/src/lib.rs`): the async loop's per-request calls
+  (`send_framed_batch` / `recv_framed` / `recv_scan_response`) become
+  `ClientTransport` method calls (replacing the `SocketGuard` + raw-fd free
+  functions), and `t.waker()` replaces `DupFd` (same dup-fd shutdown mechanism,
+  now transport-generic). `PyAsyncTransport::Drop` keeps today's
   shutdown-on-drop unblocking. FIFO pipelining semantics are unchanged —
   TLS-over-TCP is order-preserving exactly like the fd, and the server's
   always-reading pump preserves the fd path's pipelining liveness.
+
+  **Connect and HELLO move off the event-loop thread.** Today `new` runs
+  `connect` + `hello_handshake` synchronously on the caller's thread (the
+  asyncio loop thread), spawning the I/O thread only afterward. That is
+  harmless for AF_UNIX (an instant local connect) but under TLS it blocks the
+  loop for the full `connect_timeout` (up to 10 s on an unreachable host) plus
+  the TLS handshake — a multi-second event-loop freeze. So `new` instead spawns
+  the I/O thread immediately and returns at once; the thread's **first** action
+  is `ClientTransport::connect(target)` + `hello_handshake`, after which it
+  signals the loop via the existing result-callback plumbing:
+  `set_result_fn(negotiated_max_payload_len)` on success (the thread then drains
+  the request channel as today) or `set_exception_fn(err)` on failure (the
+  thread exits; queued requests fail). `aio.py`'s `_ConnectContext.__await__`
+  returns a real loop future resolved by that first signal instead of the
+  current `_immediate_return`, so `await connect(...)` / `async with
+  connect(...)` awaits the connection without blocking the loop, and a connect
+  error surfaces as an exception on the await. A `Drop` before the ready signal
+  (client cancels the connect) sets the thread's shutdown flag so the in-flight
+  blocking connect is abandoned. Requests enqueued before the ready signal
+  simply wait in the channel behind the connect — the same FIFO ordering as a
+  post-connect enqueue.
 
 ## Test infrastructure
 
@@ -703,9 +867,12 @@ exactly as today (12 ⇒ ACK, anything else ⇒ STATUS_ERROR control block).
 - **Teardown under write backpressure cannot deadlock**: if a client stops
   reading while the server is mid-send (sender parked in `send_raw`, holding
   `send_mutex`) and teardown is triggered (cap breach, TLS error, or EOF),
-  the pump/flusher issue the lock-free `shutdown_rdwr` that aborts the parked
-  send and releases the mutex — never *acquiring* the mutex to shut down. See
-  the teardown-convergence argument above.
+  the pump/flusher issue the lock-free `posix_io::shutdown` that aborts the
+  parked send and releases the mutex — never *acquiring* the mutex to shut down.
+  A client that stalls a *scan train* without ever triggering recv-side death
+  (it just stops reading) is caught by the `send_slot` client-send deadline,
+  which fires the same lock-free `posix_io::shutdown` on expiry — the fd path's
+  W2M-ring eviction, reproduced. See the teardown-convergence argument above.
 - **close_notify / EOF / RST**: inbound clean close (`reader()` returns
   `Ok(0)` / `peer_has_closed()`), EOF, and RST all set `recv_closed`;
   `connection_loop` exits via `Peer::recv() == None` and calls
@@ -717,15 +884,20 @@ exactly as today (12 ⇒ ACK, anything else ⇒ STATUS_ERROR control block).
   which ships the alert best-effort before the socket is shut down (a
   non-reading peer may miss it — acceptable, same posture as close_notify).
   No panic path; a garbage-spewing client costs one session.
-- **Half-open / dead peer**: `SO_KEEPALIVE` (both sides) eventually reaps a
-  silently-dropped TCP connection whose peer sends no RST — the one liveness
-  gap AF_UNIX does not have. Conservative default intervals mean detection is
-  slow (minutes-to-hours) but a transient partition never kills a live idle
-  connection. On the server the handshake watchdog covers the pre-HELLO
-  window that keepalive's idle timer would not shorten.
-- **Zero-length close sentinel**: the assembler and the client's
-  `recv_framed` reject `len == 0`, matching the fd path. TLS connections
-  close via close_notify/FIN, not the sentinel.
+- **Half-open / dead peer**: tuned keepalive (both sides,
+  `TCP_KEEPIDLE=120`/`TCP_KEEPINTVL=15`/`TCP_KEEPCNT=6`) reaps a silently-dropped
+  TCP connection whose peer sends no RST in ≈ 210 s — the one liveness gap
+  AF_UNIX does not have, and (server-side) the guard that stops a silent
+  half-open from pinning one of the 64 slots for the kernel-default 2 hours.
+  Keepalive never reaps a *live* idle connection: the peer's kernel ACKs probes
+  with no application involvement, so only a genuinely dead host or a partition
+  longer than ~210 s (client then reconnects) is reaped. On the server the
+  handshake watchdog covers the pre-HELLO window that keepalive's idle timer
+  would not shorten.
+- **Zero-length close sentinel**: the reused `RecvState`
+  (`RecvAdvance::Disconnect`) and the client's `recv_framed` reject `len == 0`,
+  matching the fd path. TLS connections close via close_notify/FIN, not the
+  sentinel.
 - **Big frames both directions** (64 MB server-bound / 256 MB
   client-bound): chunked `writer()` writes bound rustls buffering; the
   kernel socket buffer + awaited `send_raw` provide backpressure; the
@@ -740,8 +912,9 @@ exactly as today (12 ⇒ ACK, anything else ⇒ STATUS_ERROR control block).
 - **`tls_endpoint`/`tls_dev_cert.pem` staleness**: rewritten on every boot
   before "GnitzDB ready" (endpoint file atomically); a `?ca=` pin must
   re-read the dev cert after a restart.
-- **DNS**: `ToSocketAddrs` resolution, first result; an unresolvable host
-  is a connect-time `ProtocolError`.
+- **DNS**: `ToSocketAddrs` resolution, every returned address tried in turn
+  (dual-stack fallback); an unresolvable host — or one where every address
+  fails to connect — is a connect-time `ProtocolError`.
 - **EMFILE / accept errors**: the existing accept-error handling covers the
   TCP listener via the same KIND_ACCEPT path, with the per-listener
   backoff re-arm from the reactor section (the single-flag backoff would
@@ -749,21 +922,25 @@ exactly as today (12 ⇒ ACK, anything else ⇒ STATUS_ERROR control block).
 
 ## File changes
 
-1. `crates/gnitz-engine/src/runtime/tls/{mod,frame,config}.rs` (new, ~520
-   lines total): conn state, read pump, flusher, `TlsPeer` internals,
-   `FrameAssembler`, TLS/cert building.
+1. `crates/gnitz-engine/src/runtime/tls/{mod,config}.rs` (new, ~430
+   lines total): conn state, read pump (`feed_decrypted` over a reused
+   `io::RecvState`), flusher, `TlsPeer` internals, TLS/cert building. No
+   `frame.rs` — the deframer is reused, not rebuilt.
 2. `crates/gnitz-engine/src/runtime/reactor/`: delete `udp.rs` + UDP
    kinds/fields/preps (−~450 lines); retarget the `ring`-first drop-order
    SAFETY INVARIANT comment off `udp_recv_ops` onto the new raw-recv maps;
-   add `recv_raw`/`send_raw` (`KIND_RAW_RECV` machinery + `SendAlive::Vec`,
-   ~170), `release_inbound_memory` (~5), and multi-listener accept incl.
-   per-listener EMFILE backoff (~50). `posix_io.rs`: delete
-   `udp_bind`/`udp_local_addr`, add `tcp_bind` (incl. `SO_REUSEADDR`),
-   `tcp_local_addr`, `shutdown_rdwr`, and `set_keepalive` (~65).
+   add `recv_raw`/`send_raw` (`KIND_RAW_RECV` machinery + `SendAlive::RcVec(Rc<Vec<u8>>)`,
+   ~170), `alloc_inbound_buf` factored out of the `handle_recv_cqe`
+   `HeaderDone` arm and shared with the TLS pump (~10), `client_send_timeout`
+   made `pub(crate)`, and multi-listener accept incl. per-listener EMFILE
+   backoff (~50). `posix_io.rs`: delete `udp_bind`/`udp_local_addr`, add
+   `tcp_bind` (incl. `SO_REUSEADDR`), `tcp_local_addr`, and `set_keepalive`
+   (~55); the existing `shutdown` (SHUT_RDWR) is reused as-is.
 3. `crates/gnitz-engine/src/runtime/orchestration/peer.rs` +
-   `runtime/reactor/io.rs`: `PeerInner::Tls` variant; `RecvBuf` becomes a
-   two-variant enum (malloc-backed / `Vec`-backed) with `as_slice`/`Drop`
-   dispatch (~60 lines).
+   `runtime/reactor/io.rs`: `PeerInner::Tls(Rc<TlsShared>)` variant; expose
+   `RecvState`/`RecvBuf`/`RecvBuf::new`/`RecvAdvance` as `pub(crate)` for the
+   `tls` module. `RecvBuf` stays a single malloc-backed variant — no enum
+   change (~30 lines).
 4. `crates/gnitz-engine/src/runtime/orchestration/executor.rs`: optional
    `TlsServerInit` parameter, accept routing + connection cap, task
    spawning (~60 lines).
@@ -791,16 +968,19 @@ exactly as today (12 ⇒ ACK, anything else ⇒ STATUS_ERROR control block).
 `rustls::ServerConfig` successfully; PEM cert+key written to a tempdir
 round-trip through the file-loading path.
 
-**Rust unit (engine `tls::frame`)**: `FrameAssembler` — split delivery,
-pipelined frames, oversize reject, zero-len reject, hard-cap accounting
-(64-byte floor; cap trips after ~`CAP/64` one-byte frames with a
-test-lowered cap).
+**Rust unit (engine `tls`, `feed_decrypted` over a reused `RecvState`)**: feed
+a `TlsConn` decrypted plaintext (via a test rustls loopback or a direct
+`RecvState` harness) — split delivery, pipelined frames, oversize reject,
+zero-len reject, and header-time charging (cap trips after ~`CAP/64` one-byte
+frames with a test-lowered cap; and a declared-but-undelivered oversize frame
+is charged/refused at `HeaderDone`, before any payload byte, proving the
+slow-drip OOM is closed).
 
-**Rust unit (engine `tls`)**: inbound-counter reclaim on dirty drop —
-enqueue several frames into a `TlsConn`'s `inbound` (charging
-`total_inbound_bytes`), then drop the owning `TlsShared` *without* popping
-them; assert `total_inbound_bytes` returns to its pre-connection value
-(proves `TlsShared::Drop` reconciles the global counter).
+**Rust unit (engine `tls`)**: inbound-counter reclaim on dirty drop — enqueue
+several completed `RecvBuf`s into a `TlsConn`'s `inbound` (charging
+`total_inbound_bytes`), then drop the `TlsConn` *without* popping them; assert
+`total_inbound_bytes` returns to its pre-connection value (proves the queued
+`RecvBuf`s' own `Drop` reconciles the counter — no manual reconciliation).
 
 **Rust unit (gnitz-core)**: target parsing (`tls://h:p`, `?insecure`,
 `?ca=`, bare paths, malformed → error); compile-time
@@ -844,7 +1024,20 @@ in gnitz-core/Cargo.toml, mirroring gnitz-sql's harness tests)**:
 11. Handshake watchdog: open a raw `TcpStream`, complete only the TCP
     handshake, send no TLS bytes; assert the server drops the connection and
     frees its `MAX_TLS_CONNS` slot within ~10–12 s (a fresh `?insecure`
-    connect afterward, with the cap set to 1, succeeds).
+    connect afterward, with the cap set to 1, succeeds). Watchdog does **not**
+    pin the slot: with the cap at 1, open a connection, complete HELLO, and
+    close it *cleanly* well under 10 s; a second connect immediately afterward
+    succeeds (proves the `Weak` watchdog released the slot on close, not 10 s
+    later).
+12. Client-send-timeout eviction (the `send_slot` W2M-ring guard): with
+    `GNITZ_CLIENT_SEND_TIMEOUT_MS` test-lowered and `SO_SNDBUF`/`SO_RCVBUF`
+    pinned small, one connection issues a multi-worker scan whose response
+    exceeds the buffers, then **stops reading entirely** (sending nothing, so
+    no recv-side death and no inbound-cap breach — only the send deadline can
+    fire). Assert the server evicts it within the lowered timeout, the W2M
+    slot and live-conn count are reclaimed, and a concurrent second client is
+    unaffected (no cluster freeze). Same thread + join-with-timeout watchdog as
+    test 8.
 
 **E2E (`test_tls.py`, runs inside the normal suite — the listener is
 always on in the test conftest)**: sync + async Python clients over
@@ -874,7 +1067,7 @@ path).
 - [ ] 3. `gnitz-engine`: delete the UDP reactor ops; add
        `recv_raw`/`send_raw`, multi-listener accept, `tcp_bind`; deps,
        `runtime/tls`, `PeerInner::Tls`, executor/bootstrap/CLI wiring;
-       harness TLS support; Rust integration tests 1–9. `make test` green.
+       harness TLS support; Rust integration tests 1–12. `make test` green.
 - [ ] 4. E2E: conftest always-on listener + `GNITZ_TRANSPORT`,
        `test_tls.py`, `Makefile` `e2e-tls`. `make e2e` and `make e2e-tls`
        green.
