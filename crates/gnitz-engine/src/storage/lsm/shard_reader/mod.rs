@@ -109,7 +109,6 @@ pub(crate) enum ScalarRegion {
 pub(crate) enum WeightRegion {
     Raw {
         offset: usize,
-        size: usize,
     },
     /// All weights identical; `value` holds the i64 bytes.
     Constant {
@@ -182,7 +181,17 @@ mod tests {
         ];
 
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, false, 0).unwrap();
+        super::super::shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            0,
+            count,
+            &regions,
+            &test_schema(),
+            false,
+            0,
+        )
+        .unwrap();
         path.to_str().unwrap().to_string()
     }
 
@@ -204,7 +213,17 @@ mod tests {
         ];
 
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, false, 0).unwrap();
+        super::super::shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            0,
+            count,
+            &regions,
+            &test_schema(),
+            false,
+            0,
+        )
+        .unwrap();
         path.to_str().unwrap().to_string()
     }
 
@@ -752,7 +771,17 @@ mod tests {
         ];
 
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, false, 0).unwrap();
+        super::super::shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            0,
+            count,
+            &regions,
+            &u128_pk_schema(),
+            false,
+            0,
+        )
+        .unwrap();
         path.to_str().unwrap().to_string()
     }
 
@@ -847,11 +876,10 @@ mod tests {
         // &value[..stride] from a 16-byte buffer and would panic for stride
         // 24 — see §6 caveat).
         //
-        // Schema is all-PK (num_payload = 0) so MappedShard::open's payload
-        // validation loop is empty. The shard image must still carry the
-        // (3 + (num_cols - 1) + 1) = 6 regions open() reads from the
-        // directory; the trailing slots beyond pk/weight/null/blob are
-        // never accessed via the byte path.
+        // Schema is all-PK (num_payload = 0), so the region count is the
+        // writer↔reader contract 3 + num_payload_cols + 1 = 4:
+        // [pk, weight, null_bmp, blob]. open() reads exactly that many directory
+        // entries.
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let schema = SchemaDescriptor::new(
@@ -889,19 +917,17 @@ mod tests {
         let null_bm: Vec<u64> = vec![0; count as usize];
         let empty: Vec<u8> = Vec::new();
 
-        // 6 regions: pk, weight, null_bmp, two "phantom non-pk" slots
-        // (num_non_pk = num_cols - 1 = 2), blob.
+        // 4 regions: pk, weight, null_bmp, blob (num_payload_cols = 0).
         let regions: Vec<(*const u8, usize)> = vec![
             (pk_bytes.as_ptr(), pk_bytes.len()),
             (weights.as_ptr() as *const u8, weights.len() * 8),
             (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
             (empty.as_ptr(), 0),
-            (empty.as_ptr(), 0),
-            (empty.as_ptr(), 0),
         ];
         let path = dir.path().join("wide_pk.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, false, 0).unwrap();
+        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, &schema, false, 0)
+            .unwrap();
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         assert_eq!(shard.pk_stride, 24);
         assert!(
@@ -959,17 +985,17 @@ mod tests {
         let weights: Vec<i64> = vec![1; count as usize];
         let null_bm: Vec<u64> = vec![0; count as usize];
         let empty: Vec<u8> = Vec::new();
+        // 4 regions: pk, weight, null_bmp, blob (num_payload_cols = 0).
         let regions: Vec<(*const u8, usize)> = vec![
             (pk_bytes.as_ptr(), pk_bytes.len()),
             (weights.as_ptr() as *const u8, weights.len() * 8),
             (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
             (empty.as_ptr(), 0),
-            (empty.as_ptr(), 0),
-            (empty.as_ptr(), 0),
         ];
         let path = dir.path().join("wide_const.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, false, 0).unwrap();
+        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, &schema, false, 0)
+            .unwrap();
 
         // Sanity: unpatched shard opens fine with a Raw PK region.
         assert!(MappedShard::open(&cpath, &schema, false).is_ok());

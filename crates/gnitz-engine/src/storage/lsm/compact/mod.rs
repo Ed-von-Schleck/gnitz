@@ -58,7 +58,7 @@ mod tests {
         }
 
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch.write_as_shard(&cpath, 0).unwrap();
+        batch.write_as_shard(&cpath, 0, schema, 0).unwrap();
     }
 
     fn make_test_schema() -> SchemaDescriptor {
@@ -371,7 +371,7 @@ mod tests {
         }
         let s1 = dir.join("s1.db");
         let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-        batch.write_as_shard(&cpath, 0).unwrap();
+        batch.write_as_shard(&cpath, 0, &schema, 0).unwrap();
 
         // Compact it (single shard, should roundtrip)
         let output = dir.join("merged.db");
@@ -422,7 +422,7 @@ mod tests {
 
         let s1 = dir.join("s1.db");
         let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-        batch.write_as_shard(&cpath, 0).unwrap();
+        batch.write_as_shard(&cpath, 0, &schema, 0).unwrap();
 
         // Compact
         let output = dir.join("merged.db");
@@ -469,7 +469,7 @@ mod tests {
             batch.count += 1;
         }
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch.write_as_shard(&cpath, 0).unwrap();
+        batch.write_as_shard(&cpath, 0, schema, 0).unwrap();
     }
 
     /// Read all rows from a 3-col shard as (pk, weight, col1, col2).
@@ -842,7 +842,7 @@ mod tests {
             batch.count += 1;
         }
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch.write_as_shard(&cpath, 0).unwrap();
+        batch.write_as_shard(&cpath, 0, schema, 0).unwrap();
     }
 
     fn assert_compare_pk_bytes_sorted(shard: &MappedShard) {
@@ -1100,7 +1100,7 @@ mod tests {
             batch.count += 1;
         }
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch.write_as_shard(&cpath, 0).unwrap();
+        batch.write_as_shard(&cpath, 0, schema, 0).unwrap();
     }
 
     /// Read a compacted shard back to `(is_pk_unique, rows)`, decoding strings to
@@ -1155,7 +1155,7 @@ mod tests {
             batch.append_row_from_source_bytes(pk_bytes, w, &shards[src], row, blob_cache.get_mut());
         });
         batch
-            .write_as_shard_with_flags(output_file, 0, checker.flags_if(can_tag))
+            .write_as_shard(output_file, 0, schema, checker.flags_if(can_tag))
             .unwrap();
     }
 
@@ -1321,7 +1321,7 @@ mod tests {
                 let path = out_dir.join(format!("oracle_G{g}.db"));
                 let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
                 batches[g]
-                    .write_as_shard_with_flags(&cpath, 0, checkers[g].flags_if(can_tag))
+                    .write_as_shard(&cpath, 0, schema, checkers[g].flags_if(can_tag))
                     .unwrap();
                 Some(path.to_str().unwrap().to_string())
             })

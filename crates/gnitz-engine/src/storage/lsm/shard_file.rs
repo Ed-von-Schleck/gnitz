@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use libc::c_int;
 
+use super::super::repr::batch::{strides_from_schema, REG_PK, REG_WEIGHT};
 use super::error::StorageError;
 use super::layout::*;
 use super::merge::pack_pk_be;
@@ -15,7 +16,7 @@ use super::xor8;
 use crate::foundation::codec::write_u64_le;
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr};
 use crate::foundation::xxh;
-use crate::schema::MAX_PK_BYTES;
+use crate::schema::{SchemaDescriptor, MAX_PK_BYTES};
 use xorf::Xor8;
 
 fn align64(val: usize) -> usize {
@@ -173,11 +174,10 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
     }
 }
 
-fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, n: usize) -> Option<Xor8> {
-    if pk_ptr.is_null() || n == 0 || pk_sz == 0 {
+fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, stride: usize) -> Option<Xor8> {
+    if pk_ptr.is_null() || pk_sz == 0 || stride == 0 {
         return None;
     }
-    let stride = pk_sz / n;
     let pk_bytes = unsafe { std::slice::from_raw_parts(pk_ptr, pk_sz) };
     // One fingerprint per row's OPK region (`stride` bytes); `xor8::fingerprint`
     // owns the narrow/wide derivation that the probe side must match exactly.
@@ -217,16 +217,18 @@ unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> Result<(
 /// `basename`. The sole shard writer: spills and barrier folds pass
 /// `durable = false` (the barrier's by-path sweep fdatasyncs them), compaction
 /// outputs and WAL-block conversions pass `durable = true`.
+#[allow(clippy::too_many_arguments)]
 pub fn write_shard_streaming(
     dirfd: c_int,
     basename: &CStr,
     table_id: u32,
     row_count: u32,
     regions: &[(*const u8, usize)],
+    schema: &SchemaDescriptor,
     durable: bool,
     flags: u8,
 ) -> Result<(), StorageError> {
-    let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, table_id, row_count, regions, flags)?;
+    let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, table_id, row_count, regions, schema, flags)?;
     if durable && fdatasync_eintr(fd.as_raw_fd()).is_err() {
         unsafe {
             libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
@@ -260,11 +262,18 @@ fn write_shard_streaming_inner(
     table_id: u32,
     row_count: u32,
     regions: &[(*const u8, usize)],
+    schema: &SchemaDescriptor,
     flags: u8,
 ) -> Result<(OwnedFd, std::ffi::CString), StorageError> {
     let num_regions = regions.len();
     let n = row_count as usize;
-    let last_region = if num_regions > 0 { num_regions - 1 } else { 0 };
+    // Writer↔reader region-layout contract, shared with `MappedShard::open`:
+    // `strides` holds each fixed-width region's per-element width, `nr` is the
+    // trailing blob region's index. Debug-only checks: production callers derive
+    // `regions` and `schema` from the same batch.
+    let (strides, nr) = strides_from_schema(schema);
+    let nr = nr as usize;
+    debug_assert_eq!(num_regions, nr + 1, "region count must be 3 + num_payload_cols + 1");
 
     // --- Phase 1: detect encodings and compute actual sizes ---
     let mut encodings: Vec<RegionEncoding> = Vec::with_capacity(num_regions);
@@ -272,31 +281,41 @@ fn write_shard_streaming_inner(
 
     for i in 0..num_regions {
         let (src_ptr, orig_sz) = regions[i];
-        if n == 0 || i == last_region || orig_sz == 0 || src_ptr.is_null() {
+        // The blob region is variable-length (always Raw); null/empty regions
+        // never reach `from_raw_parts`.
+        if n == 0 || orig_sz == 0 || src_ptr.is_null() || i >= nr {
             encodings.push(RegionEncoding::Raw);
             actual_sizes.push(orig_sz);
-        } else {
-            let elem_width = orig_sz / n;
-            let src = unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) };
-            let enc = if i == 1 {
-                detect_weight_encoding(src)
-            } else {
-                detect_encoding(src, elem_width)
-            };
-            let actual = match &enc {
-                RegionEncoding::Raw => orig_sz,
-                RegionEncoding::Constant => elem_width,
-                RegionEncoding::TwoValue { bitvec, .. } => 16 + bitvec.len(),
-            };
-            encodings.push(enc);
-            actual_sizes.push(actual);
+            continue;
         }
+        // A wrong-stride schema would silently mis-chunk the directory.
+        let width = strides[i] as usize;
+        debug_assert_eq!(
+            orig_sz,
+            n * width,
+            "region {i}: schema width {width} × {n} rows != region size {orig_sz}"
+        );
+        let src = unsafe { std::slice::from_raw_parts(src_ptr, orig_sz) };
+        // `detect_encoding` returns Raw for any width > 16, so wide-PK /
+        // wide-payload regions naturally stay Raw.
+        let enc = if i == REG_WEIGHT {
+            detect_weight_encoding(src)
+        } else {
+            detect_encoding(src, width)
+        };
+        let actual = match &enc {
+            RegionEncoding::Raw => orig_sz,
+            RegionEncoding::Constant => width,
+            RegionEncoding::TwoValue { bitvec, .. } => 16 + bitvec.len(),
+        };
+        encodings.push(enc);
+        actual_sizes.push(actual);
     }
 
     // --- Phase 2: XOR8 filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
     let xor8_filter = if row_count > 0 && num_regions >= 1 {
-        let (pk_ptr, pk_sz) = regions[0];
-        build_xor8_from_pk_region(pk_ptr, pk_sz, n)
+        let (pk_ptr, pk_sz) = regions[REG_PK];
+        build_xor8_from_pk_region(pk_ptr, pk_sz, schema.pk_stride() as usize)
     } else {
         None
     };
@@ -447,7 +466,7 @@ mod tests {
     use super::super::shard_reader::MappedShard;
     use super::*;
     use crate::foundation::codec::read_u64_le;
-    use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+    use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 
     fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
         let mut cols = [SchemaColumn::new(0, 0); MAX_COLUMNS];
@@ -484,7 +503,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("build_image.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        write_shard_streaming(libc::AT_FDCWD, &cpath, 42, row_count, &regions, false, 0).unwrap();
+        write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            42,
+            row_count,
+            &regions,
+            &make_schema_desc(2, 0),
+            false,
+            0,
+        )
+        .unwrap();
         let image = std::fs::read(&path).unwrap();
 
         assert_eq!(read_u64_le(&image, OFF_MAGIC), SHARD_MAGIC);
@@ -508,9 +537,10 @@ mod tests {
             (std::ptr::null(), 0),
         ];
 
-        write_shard_streaming(libc::AT_FDCWD, &cpath, 1, 0, &regions, false, 0).unwrap();
-
+        // All-PK single-column schema (num_payload_cols = 0) → 4 regions.
         let schema = make_schema_desc(1, 0);
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 1, 0, &regions, &schema, false, 0).unwrap();
+
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 0);
         assert!(!shard.has_xor8());
@@ -540,9 +570,9 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        write_shard_streaming(libc::AT_FDCWD, &cpath, 42, row_count, &regions, true, 0).unwrap();
-
         let schema = make_schema_desc(2, 0);
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 42, row_count, &regions, &schema, true, 0).unwrap();
+
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 3);
         assert_eq!(shard.get_pk(0), 10);
@@ -581,11 +611,11 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        write_shard_streaming(libc::AT_FDCWD, &cpath, 99, n, &regions, false, 0).unwrap();
+        let schema = make_schema_desc(2, 0);
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 99, n, &regions, &schema, false, 0).unwrap();
         let image = std::fs::read(&path).unwrap();
         assert_eq!(read_u64_le(&image, OFF_VERSION), SHARD_VERSION, "must write V7");
 
-        let schema = make_schema_desc(2, 0);
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.pk_stride, 8, "pk_stride must be 8 for U64 schema");
         assert_eq!(shard.count, n as usize);
@@ -622,19 +652,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("u64_const.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        write_shard_streaming(libc::AT_FDCWD, &cpath, 1, n, &regions, false, 0).unwrap();
+        write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            1,
+            n,
+            &regions,
+            &make_schema_desc(2, 0),
+            false,
+            0,
+        )
+        .unwrap();
         let image = std::fs::read(&path).unwrap();
 
-        // PK region should be Constant-encoded → directory entry size == 8 (one elem).
-        let dir_off = read_u64_le(&image, OFF_DIR_OFFSET) as usize;
-        let pk_region_sz = read_u64_le(&image, dir_off + 8) as usize;
-        assert_eq!(pk_region_sz, 8, "Constant PK region must store a single 8B value");
-
-        // Verify encoding byte is ENCODING_CONSTANT.
+        // Constant-encoded PK region → directory entry size == 8 (one elem).
         assert_eq!(
-            image[dir_off + 24],
-            ENCODING_CONSTANT,
-            "PK region must use Constant encoding"
+            region_dir(&image, 0),
+            (8, ENCODING_CONSTANT),
+            "PK region must be Constant-encoded, storing a single 8B value"
         );
     }
 
@@ -662,15 +697,136 @@ mod tests {
             (blob.as_ptr(), 0),
         ];
 
-        write_shard_streaming(libc::AT_FDCWD, &cpath, 7, row_count, &regions, true, 0).unwrap();
-
         let schema = make_schema_desc(2, 0);
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 7, row_count, &regions, &schema, true, 0).unwrap();
+
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 4);
         for i in 0..4 {
             assert_eq!(shard.get_pk(i), (i + 1) as u128);
             assert_eq!(shard.get_weight(i), 1);
         }
+    }
+
+    /// Directory entry `(size, encoding_byte)` for region `i` of a shard image.
+    fn region_dir(image: &[u8], i: usize) -> (usize, u8) {
+        let dir_off = read_u64_le(image, OFF_DIR_OFFSET) as usize;
+        let d = dir_off + i * DIR_ENTRY_SIZE;
+        (read_u64_le(image, d + 8) as usize, image[d + 24])
+    }
+
+    /// Pins every `(region role → encoding)` pair the writer can emit to today's
+    /// behavior. A shard has one weight and one null_bmp region, so one shard can
+    /// pin at most one weight and one null encoding; three shards choreograph all
+    /// ten pairs — PK{Constant,Raw}, Weight{Constant,TwoValue,Raw},
+    /// NullBmp{Constant,Raw}, Payload{Constant,Raw}, Blob{Raw}.
+    #[test]
+    fn encoding_selection_pins_all_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_and_read =
+            |schema: &SchemaDescriptor, n: u32, regions: &[(*const u8, usize)], name: &str| -> Vec<u8> {
+                let path = dir.path().join(name);
+                let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                write_shard_streaming(libc::AT_FDCWD, &cpath, 0, n, regions, schema, false, 0).unwrap();
+                std::fs::read(&path).unwrap()
+            };
+
+        // --- Shard A (Constant-heavy): constant PK, all-1 weight, all-0 nulls,
+        // one constant + one varying payload column, non-empty blob. ---
+        let schema_a = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0), // PK
+                SchemaColumn::new(type_code::I64, 0), // constant payload
+                SchemaColumn::new(type_code::I64, 0), // varying payload
+            ],
+            &[0],
+        );
+        let n_a = 4usize;
+        let pk_a: Vec<u8> = vec![7u64; n_a].iter().flat_map(|p| p.to_be_bytes()).collect();
+        let w_a: Vec<i64> = vec![1; n_a];
+        let null_a: Vec<u64> = vec![0; n_a];
+        let const_col: Vec<i64> = vec![42; n_a];
+        let vary_col: Vec<i64> = (0..n_a as i64).collect();
+        let blob_a: Vec<u8> = vec![0xAA, 0xBB, 0xCC];
+        let regions_a: Vec<(*const u8, usize)> = vec![
+            (pk_a.as_ptr(), pk_a.len()),
+            (w_a.as_ptr() as *const u8, w_a.len() * 8),
+            (null_a.as_ptr() as *const u8, null_a.len() * 8),
+            (const_col.as_ptr() as *const u8, const_col.len() * 8),
+            (vary_col.as_ptr() as *const u8, vary_col.len() * 8),
+            (blob_a.as_ptr(), blob_a.len()),
+        ];
+        let img_a = write_and_read(&schema_a, n_a as u32, &regions_a, "pin_a.db");
+        assert_eq!(region_dir(&img_a, 0), (8, ENCODING_CONSTANT), "A pk constant");
+        assert_eq!(region_dir(&img_a, 1), (8, ENCODING_CONSTANT), "A weight constant");
+        assert_eq!(region_dir(&img_a, 2), (8, ENCODING_CONSTANT), "A null constant");
+        assert_eq!(region_dir(&img_a, 3), (8, ENCODING_CONSTANT), "A payload constant");
+        assert_eq!(
+            region_dir(&img_a, 4),
+            (n_a * 8, ENCODING_RAW),
+            "A payload varying → raw"
+        );
+        assert_eq!(region_dir(&img_a, 5), (blob_a.len(), ENCODING_RAW), "A blob raw");
+
+        // --- Shard B (TwoValue weight, Raw nulls): distinct PKs, alternating
+        // 1/-1 weights, a nullable column NULL on a subset so the null_bmp holds
+        // ≥2 distinct null-words. ---
+        let schema_b = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 1), // nullable
+            ],
+            &[0],
+        );
+        let n_b = 4usize;
+        let pk_b: Vec<u8> = (1u64..=n_b as u64).flat_map(|p| p.to_be_bytes()).collect();
+        let w_b: Vec<i64> = vec![1, -1, 1, -1];
+        let null_b: Vec<u64> = vec![1, 0, 1, 0]; // col-0 null bit set on rows 0,2
+        let pay_b: Vec<i64> = vec![10, 20, 30, 40];
+        let blob_b: Vec<u8> = vec![];
+        let regions_b: Vec<(*const u8, usize)> = vec![
+            (pk_b.as_ptr(), pk_b.len()),
+            (w_b.as_ptr() as *const u8, w_b.len() * 8),
+            (null_b.as_ptr() as *const u8, null_b.len() * 8),
+            (pay_b.as_ptr() as *const u8, pay_b.len() * 8),
+            (blob_b.as_ptr(), 0),
+        ];
+        let img_b = write_and_read(&schema_b, n_b as u32, &regions_b, "pin_b.db");
+        assert_eq!(region_dir(&img_b, 0), (n_b * 8, ENCODING_RAW), "B pk distinct → raw");
+        assert_eq!(
+            region_dir(&img_b, 1),
+            (16 + n_b.div_ceil(8), ENCODING_TWO_VALUE),
+            "B weight two-value"
+        );
+        assert_eq!(region_dir(&img_b, 2), (n_b * 8, ENCODING_RAW), "B null mixed → raw");
+
+        // --- Shard C (Raw weight): ≥3 distinct weight values. ---
+        let schema_c = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
+        );
+        let n_c = 3usize;
+        let pk_c: Vec<u8> = (1u64..=n_c as u64).flat_map(|p| p.to_be_bytes()).collect();
+        let w_c: Vec<i64> = vec![1, -1, 2];
+        let null_c: Vec<u64> = vec![0; n_c];
+        let pay_c: Vec<i64> = vec![5, 6, 7];
+        let blob_c: Vec<u8> = vec![];
+        let regions_c: Vec<(*const u8, usize)> = vec![
+            (pk_c.as_ptr(), pk_c.len()),
+            (w_c.as_ptr() as *const u8, w_c.len() * 8),
+            (null_c.as_ptr() as *const u8, null_c.len() * 8),
+            (pay_c.as_ptr() as *const u8, pay_c.len() * 8),
+            (blob_c.as_ptr(), 0),
+        ];
+        let img_c = write_and_read(&schema_c, n_c as u32, &regions_c, "pin_c.db");
+        assert_eq!(
+            region_dir(&img_c, 1),
+            (n_c * 8, ENCODING_RAW),
+            "C weight ≥3 distinct → raw"
+        );
     }
 
     #[test]
@@ -680,7 +836,7 @@ mod tests {
             .map(|r| (0..stride).map(|b| r.wrapping_add(b as u8)).collect())
             .collect();
         let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
-        let f = build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), rows.len())
+        let f = build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), stride)
             .expect("wide compound region must build a filter");
         for row in &rows {
             assert!(
@@ -697,7 +853,7 @@ mod tests {
             .map(|r| (0..stride).map(|b| r.wrapping_mul(7).wrapping_add(b as u8)).collect())
             .collect();
         let pk_bytes: Vec<u8> = rows.iter().flatten().copied().collect();
-        let f = build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), rows.len())
+        let f = build_xor8_from_pk_region(pk_bytes.as_ptr(), pk_bytes.len(), stride)
             .expect("narrow compound region must build a filter");
         for row in &rows {
             // Builder fingerprint for stride <= 16 is widen_pk_be(OPK bytes);
@@ -714,8 +870,7 @@ mod tests {
         let pks64: Vec<u64> = vec![10, 20, 30, 40];
         // OPK at rest: U64 region is big-endian.
         let b64: Vec<u8> = pks64.iter().flat_map(|p| p.to_be_bytes()).collect();
-        let f64 =
-            build_xor8_from_pk_region(b64.as_ptr(), b64.len(), pks64.len()).expect("8-byte region must build a filter");
+        let f64 = build_xor8_from_pk_region(b64.as_ptr(), b64.len(), 8).expect("8-byte region must build a filter");
         for p in &pks64 {
             assert!(xor8::may_contain(&f64, *p as u128));
         }
@@ -723,8 +878,8 @@ mod tests {
         let pks128: Vec<u128> = vec![1, 1 << 64, u128::MAX, 12345];
         // OPK at rest: U128 region is big-endian.
         let b128: Vec<u8> = pks128.iter().flat_map(|p| p.to_be_bytes()).collect();
-        let f128 = build_xor8_from_pk_region(b128.as_ptr(), b128.len(), pks128.len())
-            .expect("16-byte region must build a filter");
+        let f128 =
+            build_xor8_from_pk_region(b128.as_ptr(), b128.len(), 16).expect("16-byte region must build a filter");
         for p in &pks128 {
             assert!(xor8::may_contain(&f128, *p));
         }

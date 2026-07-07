@@ -1897,6 +1897,7 @@ mod tests {
             0,
             rows.len() as u32,
             &regions,
+            schema,
             false,
             flag,
         )
@@ -1934,6 +1935,7 @@ mod tests {
             0,
             rows.len() as u32,
             &regions,
+            schema,
             false,
             flag,
         )
@@ -2108,6 +2110,167 @@ mod tests {
         std::hint::black_box(sink);
         let rps = (ITERS as u64 * total_rows) as f64 / secs;
         println!("drive_pk_unique_multi_u64: {total_rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
+    }
+
+    /// Baseline: shard-backed merge-scan throughput. Four overlapping-key shards
+    /// of 256K rows each (U64 PK; I64, nullable I64, STRING payload) built via the
+    /// production `BatchBuilder`/`write_as_shard` region layout — the STRING values
+    /// exceed `SHORT_STRING_THRESHOLD` so they live in the blob heap and the drain's
+    /// German-string blob relocation on the scatter path is exercised; the nullable
+    /// I64 column is NULL on a subset. Drains a 4-source `ReadCursor` via
+    /// `drain_to_batch`, pinning the loser-tree merge + scatter over mmap'd shards.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+    fn shard_merge_scan_bench() {
+        use super::super::batch::BatchBuilder;
+        use std::time::Instant;
+        crate::foundation::posix_io::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),    // PK
+                SchemaColumn::new(type_code::I64, 0),    // I64 payload
+                SchemaColumn::new(type_code::I64, 1),    // nullable I64
+                SchemaColumn::new(type_code::STRING, 0), // long-string payload
+            ],
+            &[0],
+        );
+
+        const N_SHARDS: usize = 4;
+        const PER_SHARD: u64 = 256 * 1024;
+        // Overlapping key ranges: shard `s` spans [s·OFFSET, s·OFFSET + PER_SHARD),
+        // so adjacent shards share keys and the loser tree does real cross-source
+        // merge/consolidation work.
+        const OFFSET: u64 = 100_000;
+
+        // Construction + open outside the timed region (validate_checksums = false,
+        // the query-time read path's flag).
+        let shards: Vec<Rc<MappedShard>> = (0..N_SHARDS as u64)
+            .map(|s| {
+                let mut bb = BatchBuilder::new(schema);
+                for i in 0..PER_SHARD {
+                    let key = i + s * OFFSET;
+                    bb.begin_row(key as u128, 1);
+                    bb.put_u64(key); // I64 region (bytes reused; value irrelevant)
+                    if i % 4 == 0 {
+                        bb.put_null(); // nullable I64 NULL on a subset
+                    } else {
+                        bb.put_u64(key.wrapping_mul(7));
+                    }
+                    bb.put_string(&format!("payload-string-value-{key}"));
+                    bb.end_row();
+                }
+                let batch = bb.finish();
+                let path = dir.path().join(format!("ms_{s}.db"));
+                let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+                batch.write_as_shard(&cpath, 0, &schema, 0).unwrap();
+                Rc::new(MappedShard::open(&cpath, &schema, false).unwrap())
+            })
+            .collect();
+
+        let input_rows = N_SHARDS as u64 * PER_SHARD;
+
+        // Build the cursor once (construction stays off the clock). One untimed
+        // warm-up drain faults in the cold PK/payload pages (lazy mmap, no
+        // MAP_POPULATE) so the timed region reflects merge/scatter compute.
+        let mut c = create_read_cursor(&[], &shards, schema);
+        std::hint::black_box(c.drain_to_batch(0));
+
+        const ITERS: usize = 10;
+        let mut sink = 0usize;
+        let t = Instant::now();
+        for _ in 0..ITERS {
+            c.rewind();
+            let out = c.drain_to_batch(0).expect("non-empty drain");
+            sink = sink.wrapping_add(out.count);
+            std::hint::black_box(&out);
+        }
+        let secs = t.elapsed().as_secs_f64();
+        std::hint::black_box(sink);
+        let rps = (ITERS as u64 * input_rows) as f64 / secs;
+        println!("shard_merge_scan: {input_rows} input rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
+    }
+
+    /// Baseline: shard PK point-probe throughput. One 1M-row shard (U64 PK, single
+    /// I64 payload). 100K `advance_to_exact_live` probes over present keys in
+    /// ascending order (the exact-hit lower-bound / monotone-sweep path) plus 100K
+    /// shuffled `seek_bytes` probes drawn ~50/50 from present keys and absent keys
+    /// (odd keys landing *between* the sparse even shard keys → lower-bound
+    /// resolution). Both APIs run a raw-`memcmp` binary-search/gallop over the PK
+    /// region — they do not consult the XOR8 filter — so this pins the
+    /// gallop/binary-search cost.
+    #[test]
+    #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+    fn shard_point_probe_bench() {
+        use std::time::Instant;
+        crate::foundation::posix_io::raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = make_schema_u64(); // U64 PK | I64 payload
+
+        const N: u64 = 1_000_000;
+        const PROBES: usize = 100_000;
+
+        // Sparse (even) shard keys so odd probes resolve a lower bound *between*
+        // two present keys. Construction + open outside the timed region.
+        let rows: Vec<(u64, i64, i64)> = (0..N).map(|i| (i * 2, 1, i as i64)).collect();
+        let shard = write_test_shard_u64(&dir, &schema, 0, &rows, 0);
+
+        // Evenly-spaced ascending present keys for the monotone advance sweep.
+        let step = (N / PROBES as u64).max(1);
+        let asc_keys: Vec<[u8; 8]> = (0..PROBES as u64).map(|j| (j * step * 2).to_be_bytes()).collect();
+
+        // Shuffled 50/50 present (even) / absent (odd, between keys) probes.
+        let mut rng = crate::test_rng::Rng::new(0xC0DE_1234_5678_9ABC);
+        let seek_keys: Vec<[u8; 8]> = (0..PROBES)
+            .map(|_| {
+                let base = rng.gen_range(N) * 2; // an even present key
+                if rng.next_u64() & 1 == 0 {
+                    base.to_be_bytes() // present → exact hit
+                } else {
+                    (base + 1).to_be_bytes() // odd → lower bound between keys
+                }
+            })
+            .collect();
+
+        let mut c = create_read_cursor(&[], std::slice::from_ref(&shard), schema);
+
+        // Untimed warm-up: one full ascending sweep faults in the PK pages.
+        for k in &asc_keys {
+            std::hint::black_box(c.advance_to_exact_live(k));
+        }
+
+        // Timed: advance_to_exact_live monotone forward sweep over present keys.
+        c.rewind();
+        let mut hits = 0usize;
+        let t1 = Instant::now();
+        for k in &asc_keys {
+            if std::hint::black_box(c.advance_to_exact_live(k)) {
+                hits += 1;
+            }
+        }
+        let s1 = t1.elapsed().as_secs_f64();
+        std::hint::black_box(hits);
+        println!(
+            "point_probe advance_to_exact_live: {PROBES} probes in {s1:.4}s = {:.0} probes/s ({hits} hits)",
+            PROBES as f64 / s1
+        );
+
+        // Timed: seek_bytes shuffled present/absent probes (absolute seeks).
+        let mut sink = 0u64;
+        let t2 = Instant::now();
+        for k in &seek_keys {
+            c.seek_bytes(k);
+            if c.valid {
+                sink = sink.wrapping_add(c.current_key_narrow() as u64);
+            }
+        }
+        let s2 = t2.elapsed().as_secs_f64();
+        std::hint::black_box(sink);
+        println!(
+            "point_probe seek_bytes: {PROBES} probes in {s2:.4}s = {:.0} probes/s",
+            PROBES as f64 / s2
+        );
     }
 
     /// A long-string struct (len > 12) whose blob offset overruns the (empty) blob

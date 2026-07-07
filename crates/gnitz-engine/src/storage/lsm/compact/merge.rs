@@ -134,7 +134,7 @@ pub(super) fn compact_routed(
         });
         let cpath = std::ffi::CString::new(path.as_str()).unwrap();
         let flags = checkers[g].flags_if(can_tag_pk_unique);
-        if let Err(e) = batch.write_as_shard_with_flags(&cpath, table_id, flags) {
+        if let Err(e) = batch.write_as_shard(&cpath, table_id, schema, flags) {
             unlink_written(&out);
             return Err(e);
         }

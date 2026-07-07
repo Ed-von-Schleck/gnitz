@@ -257,6 +257,7 @@ impl Table {
             self.table_id,
             run.count as u32,
             &run.regions(),
+            &self.schema,
             false, // unsynced; the barrier sweep fdatasyncs it by path
             flush_flags,
         );

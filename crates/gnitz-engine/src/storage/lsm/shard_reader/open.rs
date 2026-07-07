@@ -4,6 +4,7 @@
 
 use std::ffi::CStr;
 
+use super::super::super::repr::batch::{strides_from_schema, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::xor8;
@@ -36,11 +37,12 @@ impl MappedShard {
 
         let num_cols = schema.num_columns();
         let pk_stride = schema.pk_stride();
-        // num_payload_cols is non-PK columns; matches what `Batch::regions`
-        // writes (PK + weight + null_bmp + per-payload + blob). The historical
-        // `num_cols - 1` form only held for single-PK schemas.
-        let num_non_pk = schema.num_payload_cols();
-        let num_regions = 3 + num_non_pk + 1;
+        // Writer↔reader region-layout contract, shared with
+        // `write_shard_streaming`: `strides` holds each fixed-width region's
+        // per-element width, `nr` is the trailing blob region's index.
+        let (strides, nr) = strides_from_schema(schema);
+        let nr = nr as usize;
+        let num_regions = nr + 1;
 
         // Parse directory entries
         struct DirEntry {
@@ -93,6 +95,14 @@ impl MappedShard {
             }
         }
 
+        // Validate Raw region sizes up front: the has_ghosts scan and to_unified
+        // read `count × stride` bytes and must not overrun.
+        for (i, e) in entries.iter().take(nr).enumerate() {
+            if e.encoding == ENCODING_RAW && e.size < count * strides[i] as usize {
+                return Err(StorageError::InvalidShard);
+            }
+        }
+
         // Decode each region. Only the weight region may use the TwoValue
         // encoding, so a forged TwoValue on a scalar region (pk / null_bmp /
         // payload) is rejected at its decode site (`build_scalar_region`)
@@ -134,16 +144,13 @@ impl MappedShard {
                         bitvec_off: e.offset + 16,
                     })
                 }
-                _ => Ok(WeightRegion::Raw {
-                    offset: e.offset,
-                    size: e.size,
-                }),
+                _ => Ok(WeightRegion::Raw { offset: e.offset }),
             }
         };
 
-        let pk = build_scalar_region(&entries[0])?;
-        let weight = build_weight_region(&entries[1])?;
-        let null_bmp = build_scalar_region(&entries[2])?;
+        let pk = build_scalar_region(&entries[REG_PK])?;
+        let weight = build_weight_region(&entries[REG_WEIGHT])?;
+        let null_bmp = build_scalar_region(&entries[REG_NULL_BMP])?;
 
         // Wide PK must be Raw: a Constant region holds only a 16-byte `value`,
         // so `get_pk_bytes` would slice `&value[..stride]` out of bounds. The
@@ -152,23 +159,6 @@ impl MappedShard {
         // forged file.
         if pk_stride as usize > crate::schema::NARROW_PK_MAX_BYTES && !matches!(pk, ScalarRegion::Raw { .. }) {
             return Err(StorageError::InvalidShard);
-        }
-        // Validate Raw region sizes before the has_ghosts scan (which reads
-        // count*8 bytes from the weight region and would panic on undersize).
-        if let WeightRegion::Raw { size, .. } = &weight {
-            if *size < count * 8 {
-                return Err(StorageError::InvalidShard);
-            }
-        }
-        if let ScalarRegion::Raw { size, .. } = &pk {
-            if *size < count * pk_stride as usize {
-                return Err(StorageError::InvalidShard);
-            }
-        }
-        if let ScalarRegion::Raw { size, .. } = &null_bmp {
-            if *size < count * 8 {
-                return Err(StorageError::InvalidShard);
-            }
         }
 
         // has_ghosts: true only if at least one row actually has weight == 0.
@@ -184,8 +174,8 @@ impl MappedShard {
         };
 
         let mut col_to_payload = Vec::with_capacity(num_cols);
-        let mut col_regions = Vec::with_capacity(num_non_pk);
-        let mut reg_idx = 3;
+        let mut col_regions = Vec::with_capacity(nr - REG_PAYLOAD_START);
+        let mut reg_idx = REG_PAYLOAD_START;
         for ci in 0..num_cols {
             if schema.is_pk_col(ci) {
                 col_to_payload.push(usize::MAX);
@@ -195,18 +185,9 @@ impl MappedShard {
                 reg_idx += 1;
             }
         }
-        // Validate Raw payload sizes so to_unified can be infallible. (TwoValue
-        // on a payload column was already rejected by build_scalar_region.)
-        for (pi, _ci, col) in schema.payload_columns() {
-            if let ScalarRegion::Raw { size, .. } = &col_regions[pi] {
-                if *size < count * col.size() as usize {
-                    return Err(StorageError::InvalidShard);
-                }
-            }
-        }
 
-        let blob_off = entries[reg_idx].offset;
-        let blob_len = entries[reg_idx].size;
+        let blob_off = entries[nr].offset;
+        let blob_len = entries[nr].size;
 
         let xor8_off = read_u64_le(data, OFF_XOR8_OFFSET) as usize;
         let xor8_sz = read_u64_le(data, OFF_XOR8_SIZE) as usize;
