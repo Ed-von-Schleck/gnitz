@@ -90,7 +90,7 @@ struct AggSpec {
 /// only via the low-level circuit API, never from SQL. A planner/compiler
 /// mismatch silently scrambles the view's output column positions, widths, and
 /// types.
-fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Schema) -> TypeCode {
+pub(crate) fn agg_result_type(func: AggFunc, src_col: Option<usize>, schema: &Schema) -> TypeCode {
     match func {
         AggFunc::Count | AggFunc::CountNonNull => TypeCode::I64,
         AggFunc::Avg => TypeCode::F64,

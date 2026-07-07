@@ -974,7 +974,7 @@ fn build_mark_projection(
 }
 
 /// AND a conjunct into the accumulating correlation tree.
-fn and_into(acc: &mut Option<Expr>, e: Expr) {
+pub(crate) fn and_into(acc: &mut Option<Expr>, e: Expr) {
     *acc = Some(match acc.take() {
         None => e,
         Some(prev) => Expr::BinaryOp {
@@ -991,7 +991,7 @@ fn and_into(acc: &mut Option<Expr>, e: Expr) {
 /// subquery expressions are rejected — they cannot be composed here. Every
 /// other construct references no columns of its own and its operands are
 /// walked; an unsupported construct raises its precise error at binding.
-fn count_side_refs(
+pub(crate) fn count_side_refs(
     e: &Expr,
     alias_map: &AliasMap,
     outer_n: usize,

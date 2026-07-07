@@ -13,7 +13,7 @@ use crate::plan::validate::{
     reject_unhonored_query_clauses, reject_unhonored_select_clauses, unsupported_clause, validate_user_name,
     HonoredClauses, HonoredQueryClauses,
 };
-use crate::plan::view::{exists, group_by, join, set_op, simple, ViewChain};
+use crate::plan::view::{exists, group_by, join, scalar, set_op, simple, ViewChain};
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, PlannedView, Schema};
 use sqlparser::ast::{
@@ -55,6 +55,12 @@ pub(crate) fn execute_create_view(
     let mut chain = ViewChain::new();
     inline_ctes(client, query, binder, &mut chain)?;
     compile_derived_tables(client, query, binder, &mut chain)?;
+
+    // `x = ANY (sub)` / `x <> ALL (sub)` are equivalent to IN / NOT IN — rewrite
+    // them up front so they classify to the existing semi/anti-join path rather
+    // than the scalar-subquery builder (range ANY/ALL stay for the scalar path).
+    let any_all_rewritten = scalar::rewrite_eq_any_ne_all(query);
+    let query: &Query = any_all_rewritten.as_ref().unwrap_or(query);
 
     // Classify the final body's shape once (the load-bearing precedence the old
     // guard ladder encoded), then emit its circuit pieces.
@@ -116,6 +122,18 @@ pub(crate) fn execute_create_view(
             }
             exists::emit_mark_pieces(client, final_vid, select, binder)?
         }
+        ViewShape::ScalarSubquery(select) => {
+            // Decorrelates each scalar aggregate into a hidden reduce + join; the
+            // final linear runs over the composed hidden join `H`. Composing over a
+            // pre-compiled CTE/derived-table sub-plan is unsupported (same guard as
+            // the EXISTS paths).
+            if !chain.segments.is_empty() {
+                return Err(GnitzSqlError::Unsupported(
+                    "a scalar subquery over a compiled CTE/derived-table sub-plan is not supported".to_string(),
+                ));
+            }
+            scalar::emit_scalar_subquery_pieces(client, final_vid, select, binder, &mut chain)?
+        }
     };
 
     // One atomic bundle: the hidden segments (dependency order) then the
@@ -173,6 +191,10 @@ enum ViewShape<'a> {
     /// evaluation consume it. Reached only when the single-top-level-conjunct
     /// `Subquery` fast path did not peel a clean conjunct.
     MarkSubquery(&'a Select),
+    /// A Simple-shaped view whose WHERE or projection carries a scalar aggregate
+    /// subquery (`(SELECT AGG …)`) or an ANY/ALL quantifier — routed to the
+    /// scalar-subquery builder, which decorrelates each into a reduce + join.
+    ScalarSubquery(&'a Select),
     GroupBy(&'a Select),
     Simple(&'a Select),
 }
@@ -306,6 +328,13 @@ impl<'a> ViewShape<'a> {
         // by that validator, not by `Simple`'s lowering.
         if group_by_is_present(&select.group_by) || projection_has_aggregate(select) {
             return Ok(ViewShape::GroupBy(select));
+        }
+        // A scalar aggregate subquery / ANY / ALL in the WHERE or projection routes
+        // to the scalar-subquery builder. Checked after the EXISTS/IN and GROUP BY
+        // paths: a view mixing an EXISTS/IN subquery with a scalar one lands on the
+        // EXISTS/mark path above and its scalar node is rejected at bind.
+        if scalar::has_scalar_subquery(select) {
+            return Ok(ViewShape::ScalarSubquery(select));
         }
         Ok(ViewShape::Simple(select))
     }

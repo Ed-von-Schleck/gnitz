@@ -8,6 +8,7 @@ mod exists;
 mod group_by;
 mod join;
 mod predicates;
+mod scalar;
 mod set_op;
 mod simple;
 

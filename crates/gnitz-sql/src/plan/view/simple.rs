@@ -16,6 +16,23 @@ use gnitz_core::CircuitBuilder;
 /// `k` source-PK columns (`pk_cols == 0..k`). `view_id` is the segment's
 /// allocated id (pre-allocated so a chain's downstream segment can reference it).
 pub(crate) fn emit_linear(view_id: u64, rel: Rel) -> Result<EmitPieces, GnitzSqlError> {
+    emit_linear_opts(view_id, rel, false)
+}
+
+/// [`emit_linear`] with an optional trailing identity `ExchangeShard` on the
+/// view's PK. A plain filter/map over a *base* table is backfilled inline from
+/// committed data; but a linear view whose source is an in-bundle **exchange**
+/// segment (a hidden join/reduce, e.g. the scalar-subquery `final` over `H`)
+/// must be backfilled by the dependency-ordered `fan_out_backfill` *after* that
+/// source is filled — and the master only fans a view out when its circuit
+/// carries an exchange (`view_seeds_exchange_backfill`). The shard is a same-PK
+/// identity (its source already partitions by this PK, so no row moves), added
+/// solely to route the view through the ordered distributed backfill.
+pub(crate) fn emit_linear_sharded(view_id: u64, rel: Rel) -> Result<EmitPieces, GnitzSqlError> {
+    emit_linear_opts(view_id, rel, true)
+}
+
+fn emit_linear_opts(view_id: u64, rel: Rel, shard: bool) -> Result<EmitPieces, GnitzSqlError> {
     // A lowered linear view is rooted at a Project (lowering appends one
     // unconditionally), over an optional Filter, over one Source.
     let Rel::Project {
@@ -97,7 +114,12 @@ pub(crate) fn emit_linear(view_id: u64, rel: Rel) -> Result<EmitPieces, GnitzSql
         filtered
     };
 
-    cb.sink(out_node);
+    let sink_input = if shard {
+        cb.shard(out_node, &(0..k).collect::<Vec<_>>())
+    } else {
+        out_node
+    };
+    cb.sink(sink_input);
     let circuit = cb.build();
 
     // The view's physical PK is the leading k columns (the source PK passed
