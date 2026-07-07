@@ -81,32 +81,38 @@ pub struct PyColumnDef {
     pub type_code: u32,
     pub is_nullable: bool,
     pub primary_key: bool,
+    pub is_hidden: bool,
 }
 
 #[pymethods]
 impl PyColumnDef {
     #[new]
-    #[pyo3(signature = (name, type_code, is_nullable = false, primary_key = false))]
-    pub fn new(name: String, type_code: u32, is_nullable: bool, primary_key: bool) -> Self {
+    #[pyo3(signature = (name, type_code, is_nullable = false, primary_key = false, is_hidden = false))]
+    pub fn new(name: String, type_code: u32, is_nullable: bool, primary_key: bool, is_hidden: bool) -> Self {
         PyColumnDef {
             name,
             type_code,
             is_nullable,
             primary_key,
+            is_hidden,
         }
     }
 
     pub fn __repr__(&self) -> String {
         format!(
-            "ColumnDef(name={:?}, type_code={}, is_nullable={}, primary_key={})",
-            self.name, self.type_code, self.is_nullable, self.primary_key
+            "ColumnDef(name={:?}, type_code={}, is_nullable={}, primary_key={}, is_hidden={})",
+            self.name, self.type_code, self.is_nullable, self.primary_key, self.is_hidden
         )
     }
 }
 
 fn py_col_to_rust(c: &PyColumnDef) -> PyResult<ColumnDef> {
     type_code_from_u64(c.type_code as u64)
-        .map(|tc| ColumnDef::new(c.name.clone(), tc, c.is_nullable))
+        .map(|tc| {
+            let mut cd = ColumnDef::new(c.name.clone(), tc, c.is_nullable);
+            cd.is_hidden = c.is_hidden;
+            cd
+        })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
 
@@ -118,6 +124,7 @@ fn rust_col_to_py(py: Python<'_>, c: &ColumnDef, primary_key: bool) -> PyResult<
             type_code: c.type_code as u32,
             is_nullable: c.is_nullable,
             primary_key,
+            is_hidden: c.is_hidden,
         },
     )?
     .into_any())
@@ -920,43 +927,51 @@ struct SharedBatchData {
     batch: ZSetBatch,
     /// Pre-computed field-name tuple, created once and shared across all iterators.
     fields: Py<PyTuple>,
-    /// field name → column index, built once and shared via Arc for O(1) row attr lookup.
+    /// field name → visible-relative position, built once and shared via Arc for
+    /// O(1) row attr lookup. Positions index into `present_cols`, so they line up
+    /// with `fields` and the per-row values tuple.
     field_index: Arc<HashMap<String, usize>>,
     /// Per-column decode metadata, hoisted out of the per-row loop.
     layout: ColLayout,
+    /// Physical column indices to present, in order. All columns when
+    /// `include_hidden`; the non-hidden columns otherwise. Rows, `fields`,
+    /// `field_index`, and `scalars` all index through this, so every
+    /// presentation surface agrees on positions.
+    present_cols: Vec<usize>,
 }
 
-fn build_field_index(schema: &Schema) -> Arc<HashMap<String, usize>> {
-    Arc::new(
-        schema
-            .columns
+fn make_shared_batch_data(
+    py: Python<'_>,
+    s: Arc<Schema>,
+    b: ZSetBatch,
+    include_hidden: bool,
+) -> PyResult<Arc<SharedBatchData>> {
+    let present_cols: Vec<usize> = if include_hidden {
+        (0..s.columns.len()).collect()
+    } else {
+        s.visible_columns().map(|(i, _)| i).collect()
+    };
+    let names: Vec<&str> = present_cols.iter().map(|&ci| s.columns[ci].name.as_str()).collect();
+    let fields = PyTuple::new(py, names)?.unbind();
+    let field_index = Arc::new(
+        present_cols
             .iter()
             .enumerate()
-            .map(|(i, c)| (c.name.clone(), i))
-            .collect(),
-    )
-}
-
-fn make_shared_batch_data(py: Python<'_>, s: Arc<Schema>, b: ZSetBatch) -> PyResult<Arc<SharedBatchData>> {
-    if b.is_empty() {
-        return Ok(Arc::new(SharedBatchData {
-            schema: s,
-            batch: b,
-            fields: PyTuple::empty(py).unbind(),
-            field_index: Arc::new(HashMap::new()),
-            layout: ColLayout::default(),
-        }));
-    }
-    let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
-    let fields = PyTuple::new(py, names)?.unbind();
-    let field_index = build_field_index(s.as_ref());
-    let layout = ColLayout::for_schema(s.as_ref());
+            .map(|(pos, &ci)| (s.columns[ci].name.clone(), pos))
+            .collect::<HashMap<String, usize>>(),
+    );
+    let layout = if b.is_empty() {
+        ColLayout::default()
+    } else {
+        ColLayout::for_schema(s.as_ref())
+    };
     Ok(Arc::new(SharedBatchData {
         schema: s,
         batch: b,
         fields,
         field_index,
         layout,
+        present_cols,
     }))
 }
 
@@ -971,7 +986,7 @@ fn build_row_values_into(py: Python<'_>, data: &SharedBatchData, row: usize, out
     let pk_tuple = batch.pks.get_tuple(row, pk_stride);
 
     let layout = &data.layout;
-    for ci in 0..schema.columns.len() {
+    for &ci in &data.present_cols {
         if layout.is_pk[ci] {
             out.push(pk_value_from_tuple(py, schema, ci, &pk_tuple));
         } else {
@@ -1264,27 +1279,28 @@ impl PyScanResult {
             None => return Ok(PyList::empty(py).unbind()),
             Some(d) => d,
         };
-        // Resolve col: None→0, int→index, str→name lookup
-        let col_idx = match col {
+        // Resolve col: None→first presented column, int→presented position
+        // (consistent with row indexing), str→presented-name lookup.
+        let pos = match col {
             None => 0usize,
             Some(ref obj) => {
                 if let Ok(idx) = obj.extract::<usize>(py) {
                     idx
                 } else if let Ok(name) = obj.extract::<String>(py) {
-                    data.schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == name)
+                    data.field_index
+                        .get(&name)
+                        .copied()
                         .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(name))?
                 } else {
                     return Err(pyo3::exceptions::PyTypeError::new_err("col must be int or str"));
                 }
             }
         };
+        let col_idx = *data
+            .present_cols
+            .get(pos)
+            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("column index out of range"))?;
         let n = data.batch.len();
-        if col_idx >= data.schema.columns.len() {
-            return Err(pyo3::exceptions::PyIndexError::new_err("column index out of range"));
-        }
 
         // Specialize by column kind. Use get_tuple so compound-PK
         // (PkColumn::Bytes) batches work too.
@@ -1434,12 +1450,12 @@ fn response_to_py_tuple(py: Python<'_>, result: ClientResponse) -> PyResult<PyOb
 }
 
 /// Shared helper: wrap a (Option<Arc<Schema>>, Option<ZSetBatch>, u64) into a lazy PyScanResult.
-fn response_to_lazy(py: Python<'_>, result: ClientResponse) -> PyResult<Py<PyScanResult>> {
+fn response_to_lazy(py: Python<'_>, result: ClientResponse, include_hidden: bool) -> PyResult<Py<PyScanResult>> {
     let (opt_schema, opt_batch, view_lsn) = to_py_err(result)?;
     let data = match opt_schema {
         Some(s) => {
             let b = opt_batch.unwrap_or_else(|| ZSetBatch::new(s.as_ref()));
-            Some(make_shared_batch_data(py, s, b)?)
+            Some(make_shared_batch_data(py, s, b, include_hidden)?)
         }
         None => None,
     };
@@ -1681,31 +1697,44 @@ impl PyGnitzClient {
 
     // ----- Lazy scan/seek (Phase 2) — skip rust_batch_to_py entirely -----
 
-    /// scan_lazy(target_id) -> ScanResult (native)
-    pub fn scan_lazy(&mut self, py: Python<'_>, target_id: u64) -> PyResult<Py<PyScanResult>> {
-        response_to_lazy(py, client!(self).scan(target_id))
+    /// scan_lazy(target_id, include_hidden=False) -> ScanResult (native)
+    #[pyo3(signature = (target_id, include_hidden = false))]
+    pub fn scan_lazy(&mut self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<Py<PyScanResult>> {
+        response_to_lazy(py, client!(self).scan(target_id), include_hidden)
     }
 
-    /// seek_lazy(table_id, pk) -> ScanResult (native)
-    pub fn seek_lazy(&mut self, py: Python<'_>, table_id: u64, pk: Bound<'_, PyAny>) -> PyResult<Py<PyScanResult>> {
+    /// seek_lazy(table_id, pk, include_hidden=False) -> ScanResult (native)
+    #[pyo3(signature = (table_id, pk, include_hidden = false))]
+    pub fn seek_lazy(
+        &mut self,
+        py: Python<'_>,
+        table_id: u64,
+        pk: Bound<'_, PyAny>,
+        include_hidden: bool,
+    ) -> PyResult<Py<PyScanResult>> {
         let t = pk_tuple_from_py(&pk)?;
-        response_to_lazy(py, client!(self).seek(table_id, &t))
+        response_to_lazy(py, client!(self).seek(table_id, &t), include_hidden)
     }
 
-    /// seek_by_index_lazy(table_id, col_indices, key_vals) -> ScanResult (native)
-    #[pyo3(signature = (table_id, col_indices, key_vals))]
+    /// seek_by_index_lazy(table_id, col_indices, key_vals, include_hidden=False) -> ScanResult (native)
+    #[pyo3(signature = (table_id, col_indices, key_vals, include_hidden = false))]
     pub fn seek_by_index_lazy(
         &mut self,
         py: Python<'_>,
         table_id: u64,
         col_indices: Vec<u32>,
         key_vals: Bound<'_, PyList>,
+        include_hidden: bool,
     ) -> PyResult<Py<PyScanResult>> {
         let keys: Vec<u128> = key_vals
             .iter()
             .map(|item| extract_uuid_or_u128(&item))
             .collect::<PyResult<_>>()?;
-        response_to_lazy(py, client!(self).seek_by_index(table_id, &col_indices, &keys))
+        response_to_lazy(
+            py,
+            client!(self).seek_by_index(table_id, &col_indices, &keys),
+            include_hidden,
+        )
     }
 
     /// execute_sql(schema_name, sql) -> list of result dicts
@@ -1739,7 +1768,7 @@ impl PyGnitzClient {
                 }
                 SqlResult::Rows { schema, batch } => {
                     d.set_item("type", "Rows")?;
-                    let data = make_shared_batch_data(py, Arc::new(schema), batch)?;
+                    let data = make_shared_batch_data(py, Arc::new(schema), batch, false)?;
                     let scan_result = Py::new(
                         py,
                         PyScanResult {
@@ -2068,8 +2097,11 @@ fn pk_tuple_from_py_with_stride(pk: &Bound<'_, PyAny>, stride: usize) -> PyResul
 
 #[derive(Clone, Copy)]
 enum ResponseKind {
-    Push, // resolve with u64 (seek_pk as u64 = ingest LSN)
-    Scan, // resolve with PyScanResult
+    /// Resolve with u64 (seek_pk as u64 = ingest LSN).
+    Push,
+    /// Resolve with PyScanResult; `include_hidden` presents hidden columns in
+    /// the resulting rows.
+    Scan { include_hidden: bool },
 }
 
 struct IoRequest {
@@ -2222,7 +2254,8 @@ impl PyAsyncTransport {
         self.enqueue(py, payload, None, target_id, ResponseKind::Push)
     }
 
-    fn scan(&self, py: Python<'_>, target_id: u64) -> PyResult<PyObject> {
+    #[pyo3(signature = (target_id, include_hidden = false))]
+    fn scan(&self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<PyObject> {
         let (flags, hint) = {
             let cache = self.schema_cache.lock().unwrap();
             match cache.peek(&target_id) {
@@ -2242,10 +2275,11 @@ impl PyAsyncTransport {
             None,
             None,
         ))?;
-        self.enqueue(py, payload, hint, target_id, ResponseKind::Scan)
+        self.enqueue(py, payload, hint, target_id, ResponseKind::Scan { include_hidden })
     }
 
-    fn seek(&self, py: Python<'_>, target_id: u64, pk: Bound<'_, PyAny>) -> PyResult<PyObject> {
+    #[pyo3(signature = (target_id, pk, include_hidden = false))]
+    fn seek(&self, py: Python<'_>, target_id: u64, pk: Bound<'_, PyAny>, include_hidden: bool) -> PyResult<PyObject> {
         let t = pk_tuple_from_py(&pk)?;
         let (flags, hint) = {
             let cache = self.schema_cache.lock().unwrap();
@@ -2266,7 +2300,7 @@ impl PyAsyncTransport {
             None,
             None,
         ))?;
-        self.enqueue(py, payload, hint, target_id, ResponseKind::Scan)
+        self.enqueue(py, payload, hint, target_id, ResponseKind::Scan { include_hidden })
     }
 
     #[getter]
@@ -2350,6 +2384,7 @@ struct ScanData {
     batch: Option<ZSetBatch>,
     lsn: u64,
     target_id: u64,
+    include_hidden: bool,
 }
 
 enum LoopResult {
@@ -2376,7 +2411,7 @@ fn async_io_loop(
     // unwind through this loop cannot leak it either.
     let sock_fd = sock.0;
 
-    let mut pending_futures: VecDeque<(Py<PyAny>, ResponseKind)> = VecDeque::with_capacity(IO_BATCH_MAX);
+    let mut pending_futures: VecDeque<Py<PyAny>> = VecDeque::with_capacity(IO_BATCH_MAX);
 
     // Hoisted scratch — .clear()ed each iteration so the outer slot
     // arrays are reused. (Inner `Vec<u8>` payloads are still produced
@@ -2405,7 +2440,7 @@ fn async_io_loop(
         kinds.push(first.kind);
         hints.push(first.hint);
         target_ids.push(first.target_id);
-        pending_futures.push_back((first.future, first.kind));
+        pending_futures.push_back(first.future);
         while payloads.len() < IO_BATCH_MAX {
             match rx.try_recv() {
                 Ok(req) => {
@@ -2413,7 +2448,7 @@ fn async_io_loop(
                     kinds.push(req.kind);
                     hints.push(req.hint);
                     target_ids.push(req.target_id);
-                    pending_futures.push_back((req.future, req.kind));
+                    pending_futures.push_back(req.future);
                 }
                 Err(_) => break,
             }
@@ -2427,7 +2462,7 @@ fn async_io_loop(
                     .unwrap()
                     .into_any()
                     .unbind();
-                for (fut, _) in pending_futures.drain(..) {
+                for fut in pending_futures.drain(..) {
                     let _ = loop_ref.call_method1(py, "call_soon_threadsafe", (&se_fn, &fut, exc.clone_ref(py)));
                 }
             });
@@ -2442,7 +2477,7 @@ fn async_io_loop(
         let mut recv_err: Option<String> = None;
         for (i, &kind) in kinds.iter().enumerate() {
             let r: Result<LoopResult, String> = match kind {
-                ResponseKind::Scan => {
+                ResponseKind::Scan { include_hidden } => {
                     let hint = hints[i].take();
                     match recv_scan_response(sock_fd, max_payload_len, hint) {
                         Ok(Ok((schema, schema_version, batch, lsn))) => Ok(LoopResult::Scan(Box::new(ScanData {
@@ -2451,6 +2486,7 @@ fn async_io_loop(
                             batch,
                             lsn,
                             target_id: target_ids[i],
+                            include_hidden,
                         }))),
                         Ok(Err(err_text)) => Ok(LoopResult::ScanError(err_text)),
                         Err(e) => Err(e),
@@ -2489,7 +2525,7 @@ fn async_io_loop(
         let conn_lost = recv_err.is_some();
         Python::with_gil(|py| {
             for result in results.drain(..) {
-                let (fut, _kind) = pending_futures.pop_front().unwrap();
+                let fut = pending_futures.pop_front().unwrap();
                 match result {
                     LoopResult::Push(msg) => {
                         let msg = *msg;
@@ -2510,11 +2546,17 @@ fn async_io_loop(
                         let _ = loop_ref.call_method1(py, "call_soon_threadsafe", (&se_fn, &fut, exc));
                     }
                     LoopResult::Scan(sd) => {
-                        let ScanData { schema, batch, lsn, .. } = *sd;
+                        let ScanData {
+                            schema,
+                            batch,
+                            lsn,
+                            include_hidden,
+                            ..
+                        } = *sd;
                         let data = match schema {
                             Some(s) => {
                                 let b = batch.unwrap_or_else(|| ZSetBatch::new(s.as_ref()));
-                                Some(make_shared_batch_data(py, s, b).unwrap())
+                                Some(make_shared_batch_data(py, s, b, include_hidden).unwrap())
                             }
                             None => None,
                         };
@@ -2535,7 +2577,7 @@ fn async_io_loop(
             }
             if let Some(e) = recv_err {
                 let exc = GnitzError::new_err(e).into_pyobject(py).unwrap().into_any().unbind();
-                for (fut, _) in pending_futures.drain(..) {
+                for fut in pending_futures.drain(..) {
                     let _ = loop_ref.call_method1(py, "call_soon_threadsafe", (&se_fn, &fut, exc.clone_ref(py)));
                 }
             }

@@ -41,6 +41,7 @@ fn u64_col_def(name: &str) -> ColumnDef {
         is_nullable: false,
         fk_table_id: 0,
         fk_col_idx: 0,
+        is_hidden: false,
     }
 }
 fn i64_col_def(name: &str) -> ColumnDef {
@@ -50,6 +51,7 @@ fn i64_col_def(name: &str) -> ColumnDef {
         is_nullable: false,
         fk_table_id: 0,
         fk_col_idx: 0,
+        is_hidden: false,
     }
 }
 fn u8_col_def(name: &str) -> ColumnDef {
@@ -59,6 +61,7 @@ fn u8_col_def(name: &str) -> ColumnDef {
         is_nullable: false,
         fk_table_id: 0,
         fk_col_idx: 0,
+        is_hidden: false,
     }
 }
 fn u16_col_def(name: &str) -> ColumnDef {
@@ -68,6 +71,7 @@ fn u16_col_def(name: &str) -> ColumnDef {
         is_nullable: false,
         fk_table_id: 0,
         fk_col_idx: 0,
+        is_hidden: false,
     }
 }
 fn i32_col_def(name: &str) -> ColumnDef {
@@ -77,6 +81,7 @@ fn i32_col_def(name: &str) -> ColumnDef {
         is_nullable: false,
         fk_table_id: 0,
         fk_col_idx: 0,
+        is_hidden: false,
     }
 }
 fn str_col_def(name: &str) -> ColumnDef {
@@ -86,6 +91,7 @@ fn str_col_def(name: &str) -> ColumnDef {
         is_nullable: false,
         fk_table_id: 0,
         fk_col_idx: 0,
+        is_hidden: false,
     }
 }
 fn u128_col_def(name: &str) -> ColumnDef {
@@ -95,6 +101,7 @@ fn u128_col_def(name: &str) -> ColumnDef {
         is_nullable: false,
         fk_table_id: 0,
         fk_col_idx: 0,
+        is_hidden: false,
     }
 }
 

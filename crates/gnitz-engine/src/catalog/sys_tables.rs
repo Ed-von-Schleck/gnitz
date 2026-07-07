@@ -123,6 +123,7 @@ pub(super) const COLTAB_COL_TYPE_CODE: usize = 5;
 pub(super) const COLTAB_COL_IS_NULLABLE: usize = 6;
 pub(super) const COLTAB_COL_FK_TABLE_ID: usize = 7;
 pub(super) const COLTAB_COL_FK_COL_IDX: usize = 8;
+pub(super) const COLTAB_COL_IS_HIDDEN: usize = 10;
 
 pub(super) const IDXTAB_COL_OWNER_ID: usize = 1;
 // Holds `pack_pk_cols(&col_indices)` for every row (single- and multi-column
@@ -218,9 +219,10 @@ pub(super) const fn view_tab_schema() -> SchemaDescriptor {
     )
 }
 pub(super) const fn col_tab_schema() -> SchemaDescriptor {
-    // 10 columns (indices 0-9). The trailing u64 (index 9) is the client's
-    // `is_serial` marker; the engine stores it verbatim and never reads it
-    // (`scan_column_defs` reads only indices 4-8), so it has no index constant.
+    // 11 columns (indices 0-10). The trailing u64s are the client's `is_serial`
+    // (index 9, stored verbatim, never read by the engine — no index constant)
+    // and `is_hidden` (index 10, echoed into reply schema blocks as
+    // `META_FLAG_HIDDEN` but never branched on).
     make_schema(
         &[
             u64_col(),
@@ -228,6 +230,7 @@ pub(super) const fn col_tab_schema() -> SchemaDescriptor {
             u64_col(),
             u64_col(),
             str_col(),
+            u64_col(),
             u64_col(),
             u64_col(),
             u64_col(),

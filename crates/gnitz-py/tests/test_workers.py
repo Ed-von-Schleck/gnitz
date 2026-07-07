@@ -37,6 +37,11 @@ def test_push_scan_multiworker(client):
     client.drop_schema(sn)
 
 
+def _reduce_totals(client, vid):
+    """Scan a reduce view -> {group_val: agg_val} over the visible [grp, agg] layout."""
+    return {r[0]: r[1] for r in client.scan(vid) if r.weight > 0}
+
+
 def _drop_all(client, sn, tables=(), views=(), indices=()):
     for idx in indices:
         try:
@@ -426,8 +431,9 @@ def test_workers_reduce_sum(client):
         client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
 
         vid, _ = client.resolve_table(sn, "v")
+        # Visible layout: row[0]=grp, row[1]=total (the synthetic group PK is hidden).
         rows = [r for r in client.scan(vid) if r.weight > 0]
-        totals = {r[1]: r[2] for r in rows}
+        totals = {r[0]: r[1] for r in rows}
 
         # group 1: even PKs (2,4,...,100) — sum = 2+4+...+100 = 2550
         # group 2: odd PKs (1,3,...,99) — sum = 1+3+...+99 = 2500
@@ -458,31 +464,31 @@ def test_workers_reduce_incremental(client):
         client.execute_sql(
             "INSERT INTO t VALUES (1, 1, 100), (2, 1, 200)", schema_name=sn
         )
-        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 300
+        assert _reduce_totals(client, vid)[1] == 300
 
         # Tick 2: delete pk=2 → sum=100
         client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 100
+        assert _reduce_totals(client, vid)[1] == 100
 
         # Tick 3: insert (3,1,50) → sum=150
         client.execute_sql("INSERT INTO t VALUES (3, 1, 50)", schema_name=sn)
-        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 150
+        assert _reduce_totals(client, vid)[1] == 150
 
         # Tick 4: insert (4,1,75) → sum=225
         client.execute_sql("INSERT INTO t VALUES (4, 1, 75)", schema_name=sn)
-        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 225
+        assert _reduce_totals(client, vid)[1] == 225
 
         # Tick 5: delete pk=1 → sum=125  [compaction fires here]
         client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 125
+        assert _reduce_totals(client, vid)[1] == 125
 
         # Tick 6: insert (5,1,30) → sum=155
         client.execute_sql("INSERT INTO t VALUES (5, 1, 30)", schema_name=sn)
-        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 155
+        assert _reduce_totals(client, vid)[1] == 155
 
         # Tick 7: delete pk=3 → sum=105
         client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
-        assert {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}[1] == 105
+        assert _reduce_totals(client, vid)[1] == 105
     finally:
         _drop_all(client, sn, views=["v"], tables=["t"])
 
@@ -519,7 +525,9 @@ def test_trivial_preplan_no_exchange(client):
             client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
 
         vid, _ = client.resolve_table(sn, "v")
-        rows = {r[1]: r[2] for r in client.scan(vid) if r.weight > 0}
+        # Visible layout: row[0]=grp, row[1]=cnt (the synthetic group PK is hidden).
+        rows = {r[0]: r[1]
+                for r in client.scan(vid) if r.weight > 0}
         # 50 rows in each group
         assert rows[1] == 50, f"group 1 count: expected 50, got {rows.get(1)}"
         assert rows[2] == 50, f"group 2 count: expected 50, got {rows.get(2)}"
@@ -589,15 +597,17 @@ def test_copartitioned_join(client):
         client.execute_sql(f"INSERT INTO b VALUES {b_vals}", schema_name=sn)
 
         vid, _ = client.resolve_table(sn, "v")
+        # Visible layout: row[0]=a.id, row[1]=a.x, row[2]=b.y (the synthetic
+        # _join_pk is hidden).
         rows = client.scan(vid)
         live_rows = [r for r in rows if r.weight > 0]
         assert len(live_rows) == n, f"expected {n} join rows, got {len(live_rows)}"
-        by_id = {r[1]: r for r in live_rows}
+        by_id = {r[0]: r for r in live_rows}
         for i in range(1, n + 1):
             r = by_id.get(i)
             assert r is not None, f"id={i} missing from join result"
-            assert r[2] == i * 2, f"id={i} x: expected {i * 2}, got {r[2]}"
-            assert r[3] == i * 3, f"id={i} y: expected {i * 3}, got {r[3]}"
+            assert r[1] == i * 2, f"id={i} x: expected {i * 2}, got {r[1]}"
+            assert r[2] == i * 3, f"id={i} y: expected {i * 3}, got {r[2]}"
     finally:
         _drop_all(client, sn, views=["v"], tables=["a", "b"])
 
@@ -1170,8 +1180,10 @@ def _range_ref(a_rows, b_rows, pred):
 
 
 def _view_pairs(client, vid):
-    """The live (pair-PK) set of a range-join view: r[0] = a.pk, r[1] = b.pk."""
-    return {(r[0], r[1]) for r in client.scan(vid) if r.weight > 0}
+    """The live (pair-PK) set of a range-join view: r[0] = a.pk, r[1] = b.pk.
+    The pair-PK slots are hidden key columns, so `include_hidden=True` surfaces
+    them at their physical positions for this positional read."""
+    return {(r[0], r[1]) for r in client.scan(vid, include_hidden=True) if r.weight > 0}
 
 
 def _band_left_ref(a_rows, b_rows, pred):
@@ -1605,12 +1617,13 @@ class TestRangeJoin:
                 ",".join(f"({k1},{k2},{y})" for (k1, k2), y in b_rows), schema_name=sn)
             vid, _ = client.resolve_table(sn, "v")
             # pair-PK = (a.k1, a.k2, b.k1, b.k2) at r[0..4]; payload ax=r[4], by=r[5].
-            got = {(r[0], r[1], r[2], r[3]) for r in client.scan(vid) if r.weight > 0}
+            # The pair-PK slots are hidden, so include_hidden surfaces them here.
+            got = {(r[0], r[1], r[2], r[3]) for r in client.scan(vid, include_hidden=True) if r.weight > 0}
             want = {(ak1, ak2, bk1, bk2)
                     for ((ak1, ak2), ax) in a_rows for ((bk1, bk2), by) in b_rows if ax < by}
             assert got == want, "wide pair-PK routing dropped or duplicated matches"
             # The projected payload values are correct on every emitted row.
-            for r in client.scan(vid):
+            for r in client.scan(vid, include_hidden=True):
                 if r.weight > 0:
                     assert r[4] < r[5], f"projected ax={r[4]} must be < by={r[5]}"
         finally:
@@ -1660,9 +1673,10 @@ class TestRangeJoin:
             client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 30)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (5, 20), (6, 40)", schema_name=sn)
             vid, _ = client.resolve_table(sn, "v")
-            # Output layout: [_pair_pk_0=a.id, _pair_pk_1=b.id, a.id, a.x, b.id, b.y].
+            # Physical layout: [_pair_pk_0=a.id, _pair_pk_1=b.id, a.id, a.x, b.id, b.y].
+            # The leading pair-PK slots are hidden; include_hidden reads them here.
             got = {(r[0], r[1]): (r[2], r[3], r[4], r[5])
-                   for r in client.scan(vid) if r.weight > 0}
+                   for r in client.scan(vid, include_hidden=True) if r.weight > 0}
             assert set(got.keys()) == {(1, 5), (1, 6), (2, 6)}
             # pair-PK twins (r[2]=a.id, r[4]=b.id) match the PK region; range cols hold.
             assert got[(1, 5)] == (1, 10, 5, 20)

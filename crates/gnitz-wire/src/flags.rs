@@ -200,6 +200,13 @@ pub const STATUS_NO_INDEX: u32 = 3;
 
 pub const META_FLAG_NULLABLE: u64 = 1;
 pub const META_FLAG_IS_PK: u64 = 2;
+/// The column is a hidden key slot: a physical schema column (it holds a real
+/// PK/routing value) that no presentation surface exposes — excluded from
+/// wildcard expansion, name resolution, duplicate-name checks, and client rows.
+/// Purely a presentation marker: the PK region, routing, sort, and
+/// consolidation are all blind to it. Bit 2 (value 4), between `META_FLAG_IS_PK`
+/// (bit 1) and the PK-pos byte at bits 8..16.
+pub const META_FLAG_HIDDEN: u64 = 4;
 
 /// PK position (0-indexed) within the PK tuple for the column carrying
 /// `META_FLAG_IS_PK`. Bits 8..16 of the per-column flags word. Single-PK

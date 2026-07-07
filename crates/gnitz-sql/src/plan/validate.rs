@@ -5,11 +5,17 @@
 use crate::error::GnitzSqlError;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 
-/// Reject an output column list that names the same column twice. The binder's
-/// name->index lookup silently binds to the first match, so a duplicate would
-/// bind ambiguously for any downstream query. `context` names the DDL surface
-/// for the error message (e.g. "table definition", "CREATE VIEW projection").
-pub(crate) fn reject_duplicate_column_names<'a>(
+/// Reject an output column list that names the same *visible* column twice.
+/// Hidden key slots are skipped — they are excluded from name resolution, so
+/// they cannot bind ambiguously. `context` names the DDL surface for the error
+/// message (e.g. "CREATE VIEW projection", "join view").
+pub(crate) fn reject_duplicate_column_names(cols: &[ColumnDef], context: &str) -> Result<(), GnitzSqlError> {
+    reject_duplicate_names(cols.iter().filter(|c| !c.is_hidden).map(|c| c.name.as_str()), context)
+}
+
+/// Raw-name form of [`reject_duplicate_column_names`], for surfaces that have
+/// only parser-AST names (CREATE TABLE — base-table columns are never hidden).
+pub(crate) fn reject_duplicate_names<'a>(
     names: impl Iterator<Item = &'a str>,
     context: &str,
 ) -> Result<(), GnitzSqlError> {

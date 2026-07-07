@@ -920,8 +920,12 @@ fn emit_join(
             format!("_join_pk_{i}")
         };
         // The pair's common type T_i — the single persisted stride both sides'
-        // reindex Maps and every cross-process consumer re-derive.
-        out_cols.push(ColumnDef::new(name, t, false));
+        // reindex Maps and every cross-process consumer re-derive. Hidden: the
+        // synthetic join key is a physical PK column but not a presentation
+        // column — `SELECT *` over the view omits it, and it is not resolvable
+        // by name. The key value stays reconstructible from the payload columns
+        // that produced it (both originals ride the payload).
+        out_cols.push(ColumnDef::new(name, t, false).hidden());
     }
     // The kept-A‖kept-B payload with outer nullability applied; the `_join_pk`
     // columns above stay non-nullable (a NULL key packs to the synthetic 0, never a
@@ -990,7 +994,7 @@ fn emit_join(
     // established wildcard contract, so the guard applies only to explicit
     // projections.
     if !is_wildcard && check_dup_names {
-        reject_duplicate_column_names(final_cols.iter().map(|c| c.name.as_str()), "join view")?;
+        reject_duplicate_column_names(&final_cols, "join view")?;
     }
     Ok((circuit, final_cols, view_pk))
 }
@@ -1262,11 +1266,14 @@ fn emit_range_join(
         .chain(right_schema.pk_cols.iter().map(|&c| (right_schema, c)))
         .enumerate()
         .map(|(slot, (schema, c))| {
+            // Hidden: the synthetic pair-PK is a physical PK column, not a
+            // presentation column (`SELECT *` omits it; not name-resolvable).
             ColumnDef::new(
                 format!("_pair_pk_{slot}"),
                 schema.columns[c].type_code.reindex_output_type(),
                 false,
             )
+            .hidden()
         })
         .collect();
 
@@ -1518,7 +1525,7 @@ fn emit_range_join(
         "range join: ExchangeShard cols must equal view_pk in strict order"
     );
     if !is_wildcard && check_dup_names {
-        reject_duplicate_column_names(final_cols.iter().map(|c| c.name.as_str()), "range join view")?;
+        reject_duplicate_column_names(&final_cols, "range join view")?;
     }
     Ok((circuit, final_cols, view_pk))
 }
@@ -1685,8 +1692,16 @@ pub(crate) fn build_join_view_projection(
                 proj.push(payload_offset + idx);
             }
             SelectItem::Wildcard(_) => {
+                // Visible combined columns only: a `SELECT *` join must not
+                // re-admit an upstream source's hidden key (e.g. joining over a
+                // view whose PK is a synthetic `_join_pk`) into this view's
+                // payload.
                 for i in 0..n_combined {
-                    cols.push(coldef(i));
+                    let cd = coldef(i);
+                    if cd.is_hidden {
+                        continue;
+                    }
+                    cols.push(cd);
                     proj.push(payload_offset + i);
                 }
             }

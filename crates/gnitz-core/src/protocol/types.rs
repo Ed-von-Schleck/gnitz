@@ -26,6 +26,15 @@ pub struct ColumnDef {
     /// distinguish it from a user-supplied non-null integer PK. The engine
     /// stores the marker but has no SERIAL awareness.
     pub is_serial: bool,
+    /// True for a hidden key slot — a physical schema column carrying a real
+    /// PK/routing value (a synthetic view key like `_join_pk`/`_group_pk`, or an
+    /// unprojected passthrough source PK) that no presentation surface exposes.
+    /// Round-trips through the wire meta-schema (`META_FLAG_HIDDEN`) and
+    /// `COL_TAB`. Presentation layers (wildcard expansion, name resolution,
+    /// duplicate-name checks, client rows) skip it; physical layout, routing,
+    /// sort, and consolidation are unaffected. Base-table columns are never
+    /// hidden.
+    pub is_hidden: bool,
 }
 
 impl ColumnDef {
@@ -42,6 +51,7 @@ impl ColumnDef {
             fk_table_id: 0,
             fk_col_idx: 0,
             is_serial: false,
+            is_hidden: false,
         }
     }
 
@@ -50,6 +60,14 @@ impl ColumnDef {
     /// builder of SERIAL columns.
     pub fn serial(mut self) -> Self {
         self.is_serial = true;
+        self
+    }
+
+    /// Mark this column a hidden key slot (see [`ColumnDef::is_hidden`]). Chains
+    /// onto [`ColumnDef::new`]; the view emitters that fabricate synthetic keys
+    /// and `place_pk_front`'s auto-prepend arm are the only builders.
+    pub fn hidden(mut self) -> Self {
+        self.is_hidden = true;
         self
     }
 }
@@ -161,6 +179,17 @@ impl Schema {
             .filter(move |ci| !self.is_pk_col(*ci))
             .enumerate()
             .map(move |(pi, ci)| (pi, ci, &self.columns[ci]))
+    }
+
+    /// Iterate over the *visible* (non-hidden) columns, yielding
+    /// `(physical_col_idx, &ColumnDef)`. The index is the column's real position
+    /// in the full physical schema — hidden slots are skipped but do not shift
+    /// the indices of the visible ones, so every wildcard/presentation surface
+    /// that enumerates through this stays byte-offset-correct. Base-table schemas
+    /// have no hidden columns, so this is the full column list there.
+    #[inline]
+    pub fn visible_columns(&self) -> impl Iterator<Item = (usize, &ColumnDef)> {
+        self.columns.iter().enumerate().filter(|(_, c)| !c.is_hidden)
     }
 
     /// True iff `cols` is a permutation of `pk_indices()`. Mirrors

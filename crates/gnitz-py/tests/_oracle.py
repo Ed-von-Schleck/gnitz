@@ -300,10 +300,11 @@ def scan_multiset(client, view_tid, project):
 
     Weights are summed per projected tuple, so multiple physical rows that share
     projected content (e.g. UNION ALL's two branches, distinct synthetic PKs)
-    coalesce to one entry with the combined weight. The synthetic PKs
-    ``_join_pk`` / ``_set_pk`` are excluded automatically — ``project`` only
-    lists meaningful columns, so they are never read. Float columns are
-    canonicalized to bits (``_canon``) so MIN/MAX/AVG values compare bit-exactly.
+    coalesce to one entry with the combined weight. Synthetic PKs such as
+    ``_join_pk`` / ``_set_pk`` are hidden columns, so ``r._asdict()`` omits them
+    automatically and ``project`` only names visible, meaningful columns. Float
+    columns are canonicalized to bits (``_canon``) so MIN/MAX/AVG values compare
+    bit-exactly.
     A negative *net* weight means a retraction underflowed and is a hard error.
     """
     c = Counter()

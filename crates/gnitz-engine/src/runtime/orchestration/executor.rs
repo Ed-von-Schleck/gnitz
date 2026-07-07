@@ -143,9 +143,15 @@ impl Shared {
             .get_schema_desc(target_id)
             .unwrap_or_else(SchemaDescriptor::minimal_u64);
         let col_names = cat.get_col_names_bytes(target_id);
+        let hidden = cat.get_col_hidden_mask(target_id);
         let (name_refs, n) = ipc::col_names_as_refs(&col_names);
         let names_slice = &name_refs[..n];
-        let block = Rc::new(ipc::build_schema_wire_block(&schema, names_slice, target_id as u32));
+        let block = Rc::new(ipc::build_schema_wire_block(
+            &schema,
+            names_slice,
+            hidden,
+            target_id as u32,
+        ));
         let version = cat.get_schema_version(target_id);
         let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(&schema);
         cat.set_schema_wire_block(target_id, block.clone(), wire_safe, wire_row_stride);
@@ -1245,7 +1251,7 @@ async fn handle_get_indices(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
     // schema and never needs — or pollutes — the per-table schema cache.
     let desc = index_meta_schema_desc();
     // Build the schema block before the descriptor is moved into BatchBuilder.
-    let schema_block = ipc::build_schema_wire_block(&desc, &INDEX_META_COL_NAMES[..], target_id as u32);
+    let schema_block = ipc::build_schema_wire_block(&desc, &INDEX_META_COL_NAMES[..], 0, target_id as u32);
     let mut bb = BatchBuilder::new(desc);
     if let Some(entry) = shared.cat().dag.tables.get(&target_id) {
         for ic in &entry.index_circuits {

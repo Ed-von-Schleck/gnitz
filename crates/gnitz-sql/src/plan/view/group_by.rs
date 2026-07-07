@@ -381,7 +381,10 @@ pub(crate) fn emit_group_by_pieces(
         reduce_schema_cols.push(source_schema.columns[group_col_indices[0]].clone());
     } else {
         reduce_pk_cols.push(0);
-        reduce_schema_cols.push(ColumnDef::new("_group_pk", TypeCode::U128, false));
+        // Hidden: the synthetic group key is a physical PK column but not a
+        // presentation column. The group columns follow it as visible payload,
+        // so `SELECT *` shows the grouping values and aggregates, not the hash.
+        reduce_schema_cols.push(ColumnDef::new("_group_pk", TypeCode::U128, false).hidden());
         for &gi in &group_col_indices {
             reduce_schema_cols.push(source_schema.columns[gi].clone());
         }
@@ -674,7 +677,7 @@ pub(crate) fn emit_group_by_pieces(
     // A SELECT that names the same group column twice (e.g. `k, k AS k2` is fine,
     // but `k, k` collides) must be caught cleanly rather than registering a view
     // with duplicate column names.
-    reject_duplicate_column_names(out_cols.iter().map(|c| c.name.as_str()), "GROUP BY view")?;
+    reject_duplicate_column_names(&out_cols, "GROUP BY view")?;
 
     // The view's physical PK is the reduce output's PK region: the full source
     // PK (source-PK order) for a compound natural PK, else the lone leading

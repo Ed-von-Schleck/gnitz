@@ -283,6 +283,7 @@ impl CatalogEngine {
                     bb.put_u64(0); // fk_table_id
                     bb.put_u64(0); // fk_col_idx
                     bb.put_u64(0); // is_serial (system columns are never SERIAL)
+                    bb.put_u64(0); // is_hidden (system columns are never hidden)
                     bb.end_row();
                 }
             }

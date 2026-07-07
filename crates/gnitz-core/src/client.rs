@@ -1151,13 +1151,11 @@ impl GnitzClient {
         let col_batch = col_batch.ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
 
         let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-        Ok((
-            record.tid,
-            Schema {
-                columns,
-                pk_cols: decode_pk_cols(record.pk_col_idx)?,
-            },
-        ))
+        let schema = Schema {
+            columns,
+            pk_cols: decode_pk_cols(record.pk_col_idx)?,
+        };
+        Ok((record.tid, schema))
     }
 
     pub fn resolve_table_or_view_id(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema), ClientError> {
@@ -1177,13 +1175,11 @@ impl GnitzClient {
         if let Some(ref tbl_batch) = tbl_batch {
             if let Ok(record) = find_table_record(tbl_batch, schema_id, &name) {
                 let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-                return Ok((
-                    record.tid,
-                    Schema {
-                        columns,
-                        pk_cols: decode_pk_cols(record.pk_col_idx)?,
-                    },
-                ));
+                let schema = Schema {
+                    columns,
+                    pk_cols: decode_pk_cols(record.pk_col_idx)?,
+                };
+                return Ok((record.tid, schema));
             }
         }
 
@@ -1196,13 +1192,11 @@ impl GnitzClient {
         // The view PK is the persisted leading-k column list: a single synthetic
         // hash column for join/set-op/distinct views, or the source PK passed
         // through (0..k) for a plain projection over a compound-PK table.
-        Ok((
-            record.vid,
-            Schema {
-                columns,
-                pk_cols: decode_pk_cols(record.pk_col_idx)?,
-            },
-        ))
+        let schema = Schema {
+            columns,
+            pk_cols: decode_pk_cols(record.pk_col_idx)?,
+        };
+        Ok((record.vid, schema))
     }
 
     /// True iff base table `tid` is REPLICATED (decoded from `TABLE_TAB.flags`).
@@ -1230,7 +1224,9 @@ impl GnitzClient {
 }
 
 fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) -> Result<Vec<ColumnDef>, ClientError> {
-    let mut col_entries: Vec<(u64, String, TypeCode, bool, u64, u64, bool)> = Vec::new();
+    // Keyed by COL_TAB `col_idx` so the returned columns are in schema order
+    // regardless of storage/scan order.
+    let mut col_entries: Vec<(u64, ColumnDef)> = Vec::new();
     for i in col_batch.live_rows() {
         let row_owner_id = col_u64(&col_batch.columns[1], i)?;
         let row_owner_kind = col_u64(&col_batch.columns[2], i)?;
@@ -1242,34 +1238,21 @@ fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) ->
         let name = col_str(&col_batch.columns[4], i)?.unwrap_or("").to_string();
         let tc_val = col_u64(&col_batch.columns[5], i)?;
         let type_code = type_code_from_u64(tc_val).map_err(ClientError::Protocol)?;
-        let is_nullable = col_u64(&col_batch.columns[6], i)? != 0;
-        let fk_table_id = col_u64(&col_batch.columns[7], i)?;
-        let fk_col_idx = col_u64(&col_batch.columns[8], i)?;
-        let is_serial = col_u64(&col_batch.columns[9], i)? != 0;
         col_entries.push((
             col_idx,
-            name,
-            type_code,
-            is_nullable,
-            fk_table_id,
-            fk_col_idx,
-            is_serial,
+            ColumnDef {
+                name,
+                type_code,
+                is_nullable: col_u64(&col_batch.columns[6], i)? != 0,
+                fk_table_id: col_u64(&col_batch.columns[7], i)?,
+                fk_col_idx: col_u64(&col_batch.columns[8], i)?,
+                is_serial: col_u64(&col_batch.columns[9], i)? != 0,
+                is_hidden: col_u64(&col_batch.columns[10], i)? != 0,
+            },
         ));
     }
     col_entries.sort_by_key(|e| e.0);
-    Ok(col_entries
-        .into_iter()
-        .map(
-            |(_, name, type_code, is_nullable, fk_table_id, fk_col_idx, is_serial)| ColumnDef {
-                name,
-                type_code,
-                is_nullable,
-                fk_table_id,
-                fk_col_idx,
-                is_serial,
-            },
-        )
-        .collect())
+    Ok(col_entries.into_iter().map(|(_, cd)| cd).collect())
 }
 
 fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
@@ -1404,7 +1387,8 @@ fn append_col_rows(
             .u64_val(if col.is_nullable { 1 } else { 0 })
             .u64_val(col.fk_table_id)
             .u64_val(col.fk_col_idx)
-            .u64_val(if col.is_serial { 1 } else { 0 });
+            .u64_val(if col.is_serial { 1 } else { 0 })
+            .u64_val(if col.is_hidden { 1 } else { 0 });
     }
     Ok(())
 }

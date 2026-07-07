@@ -89,13 +89,13 @@ class AsyncConnection:
         raw = batch._raw if hasattr(batch, "_raw") else batch
         return await self._transport.push(target_id, raw)
 
-    async def scan(self, target_id):
+    async def scan(self, target_id, include_hidden=False):
         """Scan a table/view.  Returns a ``ScanResult``."""
-        return await self._transport.scan(target_id)
+        return await self._transport.scan(target_id, include_hidden)
 
-    async def seek(self, table_id, pk=0):
+    async def seek(self, table_id, pk=0, include_hidden=False):
         """Point-lookup by primary key.  Returns a ``ScanResult``."""
-        return await self._transport.seek(table_id, pk)
+        return await self._transport.seek(table_id, pk, include_hidden)
 
     async def aclose(self):
         """Close the connection."""
@@ -157,14 +157,14 @@ class Pipeline:
         self._futures.append(fut)
         return fut
 
-    def scan(self, target_id):
+    def scan(self, target_id, include_hidden=False):
         """Queue a scan.  Does not ``await`` — sends immediately."""
-        fut = self._conn._transport.scan(target_id)
+        fut = self._conn._transport.scan(target_id, include_hidden)
         self._futures.append(fut)
         return fut
 
-    def seek(self, table_id, pk=0):
+    def seek(self, table_id, pk=0, include_hidden=False):
         """Queue a seek.  Does not ``await`` — sends immediately."""
-        fut = self._conn._transport.seek(table_id, pk)
+        fut = self._conn._transport.seek(table_id, pk, include_hidden)
         self._futures.append(fut)
         return fut

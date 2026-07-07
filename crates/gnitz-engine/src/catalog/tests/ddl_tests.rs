@@ -148,7 +148,8 @@ fn test_edge_cases() {
                 type_code: type_code::STRING,
                 is_nullable: false,
                 fk_table_id: 0,
-                fk_col_idx: 0
+                fk_col_idx: 0,
+                is_hidden: false
             }],
             &[0],
             true
@@ -429,6 +430,7 @@ fn test_nullable_pk_rejected() {
             is_nullable: true,
             fk_table_id: 0,
             fk_col_idx: 0,
+            is_hidden: false,
         },
         str_col_def("name"),
     ];
@@ -467,6 +469,7 @@ fn test_hook_table_register_rejects_malformed_pk() {
             is_nullable: true,
             fk_table_id: 0,
             fk_col_idx: 0,
+            is_hidden: false,
         },
         ColumnDef {
             name: "c3".into(),
@@ -474,6 +477,7 @@ fn test_hook_table_register_rejects_malformed_pk() {
             is_nullable: false,
             fk_table_id: 0,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let tid = engine.allocate_table_id();

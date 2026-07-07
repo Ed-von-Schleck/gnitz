@@ -94,6 +94,14 @@ Multiple output rows may share the same PK with different payloads.
 All operators use full (PK, payload) identity — none assume PK
 uniqueness for intermediate results.
 
+**Hidden key slots.** A key slot need not be user-visible: synthetic view
+keys (`_join_pk`, `_set_pk`, `_group_pk`, …) and unprojected passthrough PK
+columns are physical schema columns flagged hidden (`META_FLAG_HIDDEN` /
+COL_TAB `is_hidden`). Hidden columns are excluded from wildcard expansion,
+name resolution, duplicate-name checks, and client rows; the PK region,
+routing, sort, and consolidation are unaffected. Base-table columns are
+never hidden.
+
 ## 2. Z-Set Operations
 
 **Addition:** `(A + B)(x) = A(x) + B(x)`. Implemented by batch

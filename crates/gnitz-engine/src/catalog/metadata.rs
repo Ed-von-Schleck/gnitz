@@ -140,14 +140,33 @@ impl CatalogEngine {
             .map(|ic| ic.index_schema)
     }
 
-    /// Get column names for a table/view. Cached after first lookup.
+    /// Get column names for a table/view. Cached after first lookup; the same
+    /// COL_TAB read fills the hidden-column bitmask cache.
     pub fn get_column_names(&mut self, table_id: i64) -> Vec<String> {
         if let Some(names) = self.caches.col_names.get(&table_id) {
             return names.clone();
         }
-        let names: Vec<String> = self.read_column_defs(table_id).into_iter().map(|cd| cd.name).collect();
+        let defs = self.read_column_defs(table_id);
+        let mut hidden: u128 = 0;
+        for (i, cd) in defs.iter().enumerate() {
+            if cd.is_hidden {
+                hidden |= 1 << i;
+            }
+        }
+        self.caches.col_hidden.insert(table_id, hidden);
+        let names: Vec<String> = defs.into_iter().map(|cd| cd.name).collect();
         self.caches.col_names.insert(table_id, names.clone());
         names
+    }
+
+    /// Hidden-column bitmask for a table/view (bit N ⇔ column N is a hidden key
+    /// slot). Shares the COL_TAB read and invalidation with `get_column_names`.
+    pub fn get_col_hidden_mask(&mut self, table_id: i64) -> u128 {
+        if let Some(&mask) = self.caches.col_hidden.get(&table_id) {
+            return mask;
+        }
+        self.get_column_names(table_id);
+        self.caches.col_hidden.get(&table_id).copied().unwrap_or(0)
     }
 
     /// Get column names as byte vectors. Backed by col_names cache; lazy-populated.

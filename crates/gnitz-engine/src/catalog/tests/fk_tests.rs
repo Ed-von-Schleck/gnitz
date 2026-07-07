@@ -35,6 +35,7 @@ fn test_fk_lock_set() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
@@ -60,6 +61,7 @@ fn test_fk_lock_set() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child2_tid = engine.create_table("public.child2", &child2_cols, &[0], true).unwrap();
@@ -99,6 +101,7 @@ fn test_fk_referential_integrity() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine.create_table("public.children", &child_cols, &[0], true).unwrap();
@@ -151,6 +154,7 @@ fn test_fk_nullability_and_retractions() {
             is_nullable: true,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine.create_table("public.c", &child_cols, &[0], true).unwrap();
@@ -194,6 +198,7 @@ fn test_fk_drop_protections() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     engine.create_table("public.child", &child_cols, &[0], true).unwrap();
@@ -233,6 +238,7 @@ fn test_fk_invalid_targets() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 1,
+            is_hidden: false,
         },
     ];
     assert!(engine.create_table("public.c_bad", &bad_cols, &[0], true).is_err());
@@ -258,6 +264,7 @@ fn test_fk_self_reference() {
             is_nullable: true,
             fk_table_id: next_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let emp_tid = engine.create_table("public.employees", &emp_cols, &[0], true).unwrap();
@@ -289,6 +296,7 @@ fn test_fk_parent_map_cleanup() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     engine.create_table("public.child", &child_cols, &[0], true).unwrap();
@@ -330,6 +338,7 @@ fn test_fk_multiple_children_same_parent() {
                 is_nullable: false,
                 fk_table_id: parent_tid,
                 fk_col_idx: 0,
+                is_hidden: false,
             },
         ];
         engine.create_table(name, &cols, &[0], true).unwrap()
@@ -378,6 +387,7 @@ fn test_fk_u128() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine
@@ -433,6 +443,7 @@ fn test_fk_inline_child_pk_column_is_fk() {
         is_nullable: false,
         fk_table_id: parent_tid,
         fk_col_idx: 0,
+        is_hidden: false,
     }];
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
 

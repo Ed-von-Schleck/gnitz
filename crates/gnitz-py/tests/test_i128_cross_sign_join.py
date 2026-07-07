@@ -2,8 +2,9 @@
 
 A cross-sign integer equijoin whose unsigned side is `U64` (`BIGINT UNSIGNED`)
 co-partitions through the signed-128 common type `I128`. The join view's
-`_join_pk` is then an `I128` column — a first-class, queryable schema member
-that ships to clients and surfaces as a signed Python int.
+`_join_pk` is then an `I128` column — a hidden key slot (physical, so it still
+keys/routes/decodes the view, but excluded from `SELECT *` and not
+name-resolvable). `include_hidden=True` surfaces it as a signed Python int.
 
 Two surfaces are tested:
 
@@ -137,7 +138,9 @@ def test_cross_sign_u64_i64_join(client):
             schema_name=sn,
         )
 
-        rows = [r for r in client.scan(vid) if r.weight > 0]
+        # `_join_pk` is a hidden key slot, so `include_hidden=True` surfaces it at
+        # its physical position (column 0) for this wide-PK decode tripwire.
+        rows = [r for r in client.scan(vid, include_hidden=True) if r.weight > 0]
 
         # Equality + co-partition: exactly the logically-equal pairs match.
         # customer -7 (signed) matches no unsigned order; order customer_id
@@ -149,10 +152,10 @@ def test_cross_sign_u64_i64_join(client):
             ("Hundred", 2000),
         ], f"cross-sign join multiset mismatch: {got}"
 
-        # The `_join_pk` (column 0) is an I128 surfaced via the wide-PK client
-        # decode (decode_wal_block OPK round-trip). The matched keys are non-
-        # negative, so the §4.6.1 sign-flip is exactly what makes them decode
-        # back to 5 / 100 rather than a large negative number.
+        # The `_join_pk` (column 0, surfaced by include_hidden) is an I128 decoded
+        # via the wide-PK client decode (decode_wal_block OPK round-trip). The
+        # matched keys are non-negative, so the §4.6.1 sign-flip is exactly what
+        # makes them decode back to 5 / 100 rather than a large negative number.
         join_pks = sorted(r[0] for r in rows)
         assert join_pks == [5, 5, 100], (
             f"matched _join_pk must surface as its true non-negative value; got {join_pks}"
@@ -164,9 +167,11 @@ def test_cross_sign_u64_i64_join(client):
         _cleanup(client, sn, tables=["orders", "customers"], views=["v"])
 
 
-def test_cross_sign_u64_i64_select_join_pk(client):
-    """`SELECT _join_pk FROM v` and a downstream `GROUP BY _join_pk` view both
-    surface / aggregate the I128 key without error, and report the matched keys."""
+def test_cross_sign_u64_i64_project_key_column(client):
+    """The synthetic `_join_pk` is a hidden key slot, so it is not name-resolvable
+    downstream. Keying downstream work on the join key means projecting the
+    underlying source key column: a `SELECT customers.id AS cust_id` view exposes
+    the join key as a real column that a downstream `SELECT`/`GROUP BY` can name."""
     sn = "s" + _uid()
     client.create_schema(sn)
     try:
@@ -179,22 +184,22 @@ def test_cross_sign_u64_i64_select_join_pk(client):
             "customer_id BIGINT UNSIGNED NOT NULL, amount BIGINT NOT NULL)",
             schema_name=sn,
         )
+        # Project the join key's source column (`customers.id`) as `cust_id`. For a
+        # matched pair `customer_id == id`, so `cust_id` carries the same value the
+        # hidden `_join_pk` would.
         client.execute_sql(
-            "CREATE VIEW v AS SELECT customers.name AS name, orders.amount AS amount "
+            "CREATE VIEW v AS SELECT customers.id AS cust_id, orders.amount AS amount "
             "FROM orders JOIN customers ON orders.customer_id = customers.id",
             schema_name=sn,
         )
-        # A view selecting the I128 `_join_pk` directly (as a result column).
         # `amount` is kept so the two key-5 rows stay distinct tuples rather than
         # consolidating to a single weight-2 row under Z-set projection.
         client.execute_sql(
-            "CREATE VIEW vpk AS SELECT _join_pk AS k, amount AS a FROM v",
+            "CREATE VIEW vpk AS SELECT cust_id AS k, amount AS a FROM v",
             schema_name=sn,
         )
-        # GROUP BY the I128 key with COUNT (an aggregate that does not need to
-        # order-decode the 16-byte key — MIN/MAX/SUM/AVG over it are rejected).
         client.execute_sql(
-            "CREATE VIEW vgrp AS SELECT _join_pk AS k, COUNT(*) AS n FROM v GROUP BY _join_pk",
+            "CREATE VIEW vgrp AS SELECT cust_id AS k, COUNT(*) AS n FROM v GROUP BY cust_id",
             schema_name=sn,
         )
         vpk_id = client.resolve_table(sn, "vpk")[0]
@@ -210,9 +215,9 @@ def test_cross_sign_u64_i64_select_join_pk(client):
         )
 
         pk_rows = sorted(r["k"] for r in client.scan(vpk_id) if r.weight > 0)
-        assert pk_rows == [5, 5, 100], f"SELECT _join_pk mismatch: {pk_rows}"
+        assert pk_rows == [5, 5, 100], f"projected key mismatch: {pk_rows}"
 
         grp = {r["k"]: r["n"] for r in client.scan(vgrp_id) if r.weight > 0}
-        assert grp == {5: 2, 100: 1}, f"GROUP BY _join_pk mismatch: {grp}"
+        assert grp == {5: 2, 100: 1}, f"GROUP BY projected key mismatch: {grp}"
     finally:
         _cleanup(client, sn, tables=["orders", "customers"], views=["v", "vpk", "vgrp"])

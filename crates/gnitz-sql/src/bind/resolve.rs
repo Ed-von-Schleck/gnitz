@@ -49,10 +49,21 @@ pub(crate) fn build_alias_map(relations: &[(&str, u64, &Rc<Schema>)]) -> AliasMa
 ///
 /// Single home for the name→index lookup that was previously
 /// `columns.iter().position(...)` (first-match) at every call site.
+///
+/// Hidden columns (`is_hidden`) are skipped as match candidates but keep their
+/// physical position, so the returned index is always the real offset into
+/// `columns` (every caller adds a physical `col_offset` to it). Every
+/// readable-relation (table or view) name→index resolution funnels through
+/// here, so a synthetic view key (`_join_pk`, `_group_pk`, …) or an unprojected
+/// passthrough PK is unresolvable by name everywhere, without pruning any
+/// schema or shifting any offset — and a visible name shared with a hidden
+/// column is not spuriously ambiguous. (The DML sites that resolve names by
+/// hand — INSERT/UPDATE column lists — target base tables only, which never
+/// carry hidden columns.)
 pub(crate) fn find_unique_column(columns: &[ColumnDef], col_name: &str) -> Result<Option<usize>, GnitzSqlError> {
     let mut found: Option<usize> = None;
     for (i, c) in columns.iter().enumerate() {
-        if c.name.eq_ignore_ascii_case(col_name) {
+        if !c.is_hidden && c.name.eq_ignore_ascii_case(col_name) {
             if found.is_some() {
                 return Err(GnitzSqlError::Bind(format!(
                     "column reference '{col_name}' is ambiguous"

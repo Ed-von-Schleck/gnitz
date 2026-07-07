@@ -12,6 +12,7 @@ fn uuid_col_def(name: &str) -> ColumnDef {
         is_nullable: false,
         fk_table_id: 0,
         fk_col_idx: 0,
+        is_hidden: false,
     }
 }
 
@@ -104,6 +105,7 @@ fn test_uuid_fk_valid_single() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine.create_table("public.uuid_chi", &child_cols, &[0], true).unwrap();
@@ -145,6 +147,7 @@ fn test_uuid_fk_invalid_single() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine
@@ -181,6 +184,7 @@ fn test_uuid_fk_multiple_children_same_parent() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine
@@ -227,6 +231,7 @@ fn test_uuid_fk_multiple_children_mixed() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine
@@ -273,6 +278,7 @@ fn test_uuid_fk_parent_not_yet_ingested() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine
@@ -310,6 +316,7 @@ fn test_uuid_fk_nullable_column() {
             is_nullable: true,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine
@@ -348,6 +355,7 @@ fn test_uuid_fk_u64pk_parent_rejected() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     assert!(engine
@@ -378,6 +386,7 @@ fn test_uuid_fk_u128_col_references_uuid_pk() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     assert!(engine

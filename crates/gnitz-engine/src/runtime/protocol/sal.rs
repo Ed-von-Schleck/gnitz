@@ -986,7 +986,7 @@ impl SalWriter {
             Some(b) => b,
             None => {
                 let col_names = col_names_opt.unwrap_or(&[]);
-                owned_block = build_schema_wire_block(schema, col_names, target_id);
+                owned_block = build_schema_wire_block(schema, col_names, 0, target_id);
                 &owned_block
             }
         };

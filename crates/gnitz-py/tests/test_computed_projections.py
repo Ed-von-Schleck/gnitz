@@ -29,9 +29,9 @@ def _cleanup(client, sn):
         pass
 
 
-def _scan_dicts(client, tid):
+def _scan_dicts(client, tid, include_hidden=False):
     """Scan and return list of dicts."""
-    return client.scan(tid).mappings()
+    return client.scan(tid, include_hidden=include_hidden).mappings()
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +162,7 @@ class TestComputedProjections:
                 "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
                 schema_name=sn,
             )
-            # PK (id) not in projection — should be auto-prepended
+            # PK (id) not in projection — auto-prepended as a hidden column
             client.execute_sql(
                 "CREATE VIEW v AS SELECT val + 1 AS v FROM t",
                 schema_name=sn,
@@ -172,14 +172,15 @@ class TestComputedProjections:
                 schema_name=sn,
             )
             vid = client.resolve_table(sn, "v")[0]
-            rows = _scan_dicts(client, vid)
+            # id is the hidden auto-prepended PK — surface it with include_hidden.
+            rows = _scan_dicts(client, vid, include_hidden=True)
             vals = sorted([(r["id"], r["v"]) for r in rows])
             assert vals == [(1, 11), (2, 21)]
         finally:
             _cleanup(client, sn)
 
     def test_computed_pk_auto_prepend(self, client):
-        """When only computed exprs are given, PK is auto-prepended."""
+        """When only computed exprs are given, PK is auto-prepended (hidden)."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -194,7 +195,8 @@ class TestComputedProjections:
             )
             client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20)", schema_name=sn)
             vid = client.resolve_table(sn, "v")[0]
-            rows = _scan_dicts(client, vid)
+            # id is the hidden auto-prepended PK — surface it with include_hidden.
+            rows = _scan_dicts(client, vid, include_hidden=True)
             vals = sorted([(r["id"], r["doubled"]) for r in rows])
             assert vals == [(1, 2), (2, 4)]
         finally:

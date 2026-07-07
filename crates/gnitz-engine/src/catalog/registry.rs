@@ -57,6 +57,7 @@ impl CatalogEngine {
                     is_nullable: cursor_read_u64(&cursor, COLTAB_COL_IS_NULLABLE) != 0,
                     fk_table_id: cursor_read_u64(&cursor, COLTAB_COL_FK_TABLE_ID) as i64,
                     fk_col_idx: cursor_read_u64(&cursor, COLTAB_COL_FK_COL_IDX) as u32,
+                    is_hidden: cursor_read_u64(&cursor, COLTAB_COL_IS_HIDDEN) != 0,
                 });
             }
             cursor.cursor.advance();

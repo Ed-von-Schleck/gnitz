@@ -126,8 +126,13 @@ fn place_pk_front(items: &mut Vec<ProjItem>, out_cols: &mut Vec<ColumnDef>, sour
                 out_cols.insert(target, col);
             }
             None => {
+                // Auto-prepended: the source PK column the user did not project.
+                // It must ride the view (the physical key), but the user never
+                // named it, so it is hidden — `SELECT b FROM t` no longer leaks
+                // the PK `a`. (A source PK that is itself already hidden, e.g. a
+                // synthetic `_join_pk`, stays hidden — `.hidden()` is idempotent.)
                 items.insert(target, ProjItem::PassThrough { src_col: pk });
-                out_cols.insert(target, source_schema.columns[pk].clone());
+                out_cols.insert(target, source_schema.columns[pk].clone().hidden());
             }
         }
     }
@@ -149,7 +154,13 @@ pub(crate) fn build_projection(
             // place_pk_front below, so the source PK is pinned to slots 0..k
             // even when it is not the table's leading column. A PK already at
             // the front degenerates to the verbatim identity order.
-            for i in 0..source_schema.columns.len() {
+            //
+            // Hidden key slots are excluded — a `SELECT *` over a view whose key
+            // is synthetic (`_join_pk`, …) must not re-admit that column into the
+            // new view's payload. A hidden *source PK* is not lost: place_pk_front
+            // re-prepends it below (staying hidden), so the derived view still
+            // carries the full source PK verbatim.
+            for (i, _col) in source_schema.visible_columns() {
                 items.push(ProjItem::PassThrough { src_col: i });
                 out_cols.push(source_schema.columns[i].clone());
             }

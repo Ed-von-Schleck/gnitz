@@ -1796,7 +1796,7 @@ pub(crate) fn send_unique_preflight_keys(
     keys: &mut crate::storage::KeyProducer,
 ) {
     debug_assert!(keys_per_frame > 0, "keys_per_frame must be positive");
-    let schema_block = ipc::build_schema_wire_block(frame_schema, &[], target_id as u32);
+    let schema_block = ipc::build_schema_wire_block(frame_schema, &[], 0, target_id as u32);
 
     // Reusable chunk batch: filled, encoded, and cleared per frame, sized up
     // front to exactly one frame's fill.
@@ -2472,7 +2472,7 @@ mod tests {
     fn test_pending_scan_first_chunk_includes_schema() {
         let schema = test_schema();
         let batch = make_n_row_batch(schema, 10);
-        let schema_block = Rc::new(ipc::build_schema_wire_block(&schema, &[], 1));
+        let schema_block = Rc::new(ipc::build_schema_wire_block(&schema, &[], 0, 1));
 
         let (ptr, writer) = make_ring();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
@@ -2679,8 +2679,8 @@ mod tests {
         );
         let batch_a = make_n_row_batch(schema_a, 10);
         let batch_b = make_n_row_batch(schema_b, 5);
-        let block_a = Rc::new(ipc::build_schema_wire_block(&schema_a, &[], 1));
-        let block_b = Rc::new(ipc::build_schema_wire_block(&schema_b, &[], 2));
+        let block_a = Rc::new(ipc::build_schema_wire_block(&schema_a, &[], 0, 1));
+        let block_b = Rc::new(ipc::build_schema_wire_block(&schema_b, &[], 0, 2));
 
         // Budget: first chunk (with A's schema block) carries ~4 rows, so
         // train A spans at least two frames.
@@ -2864,6 +2864,7 @@ mod tests {
                 is_nullable: false,
                 fk_table_id: 0,
                 fk_col_idx: 0,
+                is_hidden: false,
             },
             ColumnDef {
                 name: "s".into(),
@@ -2871,6 +2872,7 @@ mod tests {
                 is_nullable: false,
                 fk_table_id: 0,
                 fk_col_idx: 0,
+                is_hidden: false,
             },
         ];
         let tid = engine.create_table("public.tstr", &cols, &[0], true).unwrap();
@@ -2916,6 +2918,7 @@ mod tests {
             is_nullable: false,
             fk_table_id: 0,
             fk_col_idx: 0,
+            is_hidden: false,
         };
         let cols = vec![mk("id"), mk("a"), mk("b")];
         let tid = engine.create_table("public.tproj", &cols, &[0], true).unwrap();
@@ -2946,7 +2949,7 @@ mod tests {
             .stream_batch_response(tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0)
             .is_none());
         assert_eq!(wp.pending_streams.len(), 1);
-        let expected_block = ipc::build_schema_wire_block(&projected, &[], tid as u32);
+        let expected_block = ipc::build_schema_wire_block(&projected, &[], 0, tid as u32);
         let ps = wp.pending_streams.front().unwrap();
         assert_eq!(
             ps.prebuilt_schema.as_deref().map(Vec::as_slice),

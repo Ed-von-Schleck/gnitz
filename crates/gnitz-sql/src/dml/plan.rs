@@ -202,10 +202,15 @@ pub(crate) fn try_extract_pk_in(expr: &Expr, schema: &Schema) -> Option<Vec<u128
             Expr::Identifier(id) => &id.value,
             _ => return None,
         };
-        let pk_col = &schema.columns[schema.pk_indices()[0]];
-        if !pk_col.name.eq_ignore_ascii_case(col_name) {
+        let pk_idx = schema.pk_indices()[0];
+        // Resolve through the visibility-aware chokepoint: a hidden PK (a view
+        // keyed by a synthetic `_join_pk`/`_group_pk`) is not name-resolvable, so
+        // the WHERE falls through to the binder, which raises a clean "column
+        // not found" rather than silently seeking it.
+        if find_unique_column(&schema.columns, col_name).ok().flatten() != Some(pk_idx) {
             return None;
         }
+        let pk_col = &schema.columns[pk_idx];
         let mut seen = HashSet::with_capacity(list.len());
         let mut pks = Vec::with_capacity(list.len());
         for item in list {

@@ -261,17 +261,19 @@ class TestJoinOperator:
                 schema_name=sn,
             )
             vid, v_schema = client.resolve_table(sn, "v")
-            # _join_pk (U128 synthetic) + pk + a_val + b_val = 4 columns
+            # Physical schema (introspection stays physical): hidden _join_pk
+            # (U128 synthetic) + pk + a_val + b_val = 4 columns.
             assert len(v_schema.columns) == 4
+            assert v_schema.columns[0].is_hidden  # _join_pk is a hidden key slot
 
             client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
             client.execute_sql("INSERT INTO b VALUES (1, 20)", schema_name=sn)
 
             rows = [r for r in client.scan(vid) if r.weight > 0]
             assert len(rows) == 1
-            row = rows[0]  # schema: _join_pk (U128), pk, a_val, b_val
-            assert row[2] == 10  # a_val from table a
-            assert row[3] == 20  # b_val from table b
+            row = rows[0]  # visible row: pk, a_val, b_val (hidden _join_pk excluded)
+            assert row["a_val"] == 10  # from table a
+            assert row["b_val"] == 20  # from table b
         finally:
             for sql in ["DROP VIEW v", "DROP TABLE a", "DROP TABLE b"]:
                 try:

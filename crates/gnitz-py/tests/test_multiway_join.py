@@ -137,19 +137,27 @@ class TestMultiwayJoin:
         finally:
             _cleanup(client, sn)
 
-    def test_join_cte_column_aliases_rejected(self, client):
-        """Positional column aliases on a JOIN-body CTE are rejected (synthetic PK)."""
+    def test_join_cte_column_aliases_apply_to_visible(self, client):
+        """Positional column aliases on a JOIN-body CTE apply to its *visible*
+        columns — the synthetic join PK is hidden and skipped, so `h0(x, y)`
+        renames the two visible projected columns, and a downstream reference
+        (`h0.y` in the ON, `h0.x` in the SELECT) resolves them by the new names."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
             _tables(client, sn, ["a", "b", "c"])
-            with pytest.raises(Exception) as ei:
-                client.execute_sql(
-                    "CREATE VIEW v AS WITH h0(x, y) AS (SELECT a.id AS aid, b.k AS bk FROM a JOIN b ON a.k = b.id) "
-                    "SELECT h0.x AS x FROM h0 JOIN c ON h0.y = c.id",
-                    schema_name=sn,
-                )
-            assert "alias" in str(ei.value).lower(), str(ei.value)
+            client.execute_sql(
+                "CREATE VIEW v AS WITH h0(x, y) AS (SELECT a.id AS aid, b.k AS bk FROM a JOIN b ON a.k = b.id) "
+                "SELECT h0.x AS x FROM h0 JOIN c ON h0.y = c.id",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # a.k=10 → b.id=10 (h0: x=a.id=1, y=b.k=20); h0.y=20 → c.id=20.
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 1)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (10, 20, 2)", schema_name=sn)
+            client.execute_sql("INSERT INTO c VALUES (20, 0, 3)", schema_name=sn)
+            rows = [r for r in client.scan(vid) if r.weight > 0]
+            assert [r["x"] for r in rows] == [1], [r._asdict() for r in rows]
         finally:
             _cleanup(client, sn)
 
@@ -259,9 +267,13 @@ class TestDirectMultiwayJoin:
             vid = client.resolve_table(sn, "v")[0]
             rows = [r for r in client.scan(vid) if r.weight > 0]
             assert len(rows) == 1
-            names = list(rows[0]._asdict().keys())
-            # Exactly one `_join_pk` (the final segment's) — no accumulated intermediate PK.
-            assert names.count("_join_pk") == 1, names
+            # The synthetic key is hidden: `SELECT *` exposes only the real columns.
+            assert "_join_pk" not in rows[0]._asdict()
+            # include_hidden surfaces the physical schema: exactly one `_join_pk`
+            # (the final segment's) — no accumulated intermediate PK.
+            raw = [r for r in client.scan(vid, include_hidden=True) if r.weight > 0]
+            raw_names = list(raw[0]._asdict().keys())
+            assert raw_names.count("_join_pk") == 1, raw_names
         finally:
             _cleanup(client, sn)
 
@@ -794,9 +806,13 @@ class TestMultiwayPruning:
             vid = client.resolve_table(sn, "v")[0]
             rows = [r for r in client.scan(vid) if r.weight > 0]
             assert len(rows) == 1
-            names = list(rows[0]._asdict().keys())
-            # One final synthetic PK, no accumulated intermediate PK (wildcard = no pruning).
-            assert names.count("_join_pk") == 1, names
+            # The synthetic key is hidden: `SELECT *` exposes only the real columns.
+            assert "_join_pk" not in rows[0]._asdict()
+            # include_hidden surfaces the physical schema: one final `_join_pk`, no
+            # accumulated intermediate PK (wildcard = no pruning).
+            raw = [r for r in client.scan(vid, include_hidden=True) if r.weight > 0]
+            raw_names = list(raw[0]._asdict().keys())
+            assert raw_names.count("_join_pk") == 1, raw_names
 
             # Wildcard DISTINCT over a join keeps the wildcard H and dedups full rows.
             # Distinct column names so the DISTINCT output has no duplicate-name clash.

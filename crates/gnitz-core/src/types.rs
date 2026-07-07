@@ -88,6 +88,12 @@ pub fn col_tab_schema() -> &'static Schema {
             // a connection that only fetched the schema distinguish an
             // auto-assigned SERIAL PK from a user-supplied non-null integer PK.
             ColumnDef::new("is_serial", TypeCode::U64, false),
+            // is_hidden marker (index 10): 1 for a hidden key slot, else 0. Lets
+            // a connection that only fetched the schema know which physical
+            // columns the presentation layers suppress (synthetic view keys and
+            // unprojected passthrough PKs). The engine stores it verbatim and
+            // never reads it.
+            ColumnDef::new("is_hidden", TypeCode::U64, false),
         ],
         pk_cols: vec![0],
     })

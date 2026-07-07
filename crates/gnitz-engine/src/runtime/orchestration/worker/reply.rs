@@ -35,14 +35,15 @@ impl WorkerProcess {
     fn reply_schema_block(&mut self, tid_key: i64, schema: ReplySchema<'_>) -> (Option<Rc<Vec<u8>>>, u16) {
         let block = match schema {
             ReplySchema::None => return (None, 0),
-            ReplySchema::OneOff(s) => Rc::new(ipc::build_schema_wire_block(s, &[], tid_key as u32)),
+            ReplySchema::OneOff(s) => Rc::new(ipc::build_schema_wire_block(s, &[], 0, tid_key as u32)),
             ReplySchema::Table(s) => {
                 if let Some(cached) = self.cat().get_cached_schema_wire_block(tid_key) {
                     return (Some(cached.block), cached.version);
                 }
                 let col_names = self.cat().get_col_names_bytes(tid_key);
+                let hidden = self.cat().get_col_hidden_mask(tid_key);
                 let (name_refs, n) = ipc::col_names_as_refs(&col_names);
-                let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], tid_key as u32));
+                let block = Rc::new(ipc::build_schema_wire_block(s, &name_refs[..n], hidden, tid_key as u32));
                 let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(s);
                 self.cat()
                     .set_schema_wire_block(tid_key, block.clone(), wire_safe, wire_row_stride);

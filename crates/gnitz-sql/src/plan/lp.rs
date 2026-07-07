@@ -78,7 +78,7 @@ pub(crate) fn lower_linear(
     let is_wildcard = is_wildcard_projection(&select.projection);
     let (items, out_cols) = build_projection(&select.projection, &source_schema)?;
     if !is_wildcard {
-        reject_duplicate_column_names(out_cols.iter().map(|c| c.name.as_str()), "CREATE VIEW projection")?;
+        reject_duplicate_column_names(&out_cols, "CREATE VIEW projection")?;
     }
     let pk_arity = source_schema.pk_count();
     rel = Rel::Project {

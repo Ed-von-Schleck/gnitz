@@ -709,6 +709,7 @@ impl CatalogEngine {
             bb.put_u64(cd.fk_table_id as u64);
             bb.put_u64(cd.fk_col_idx as u64);
             bb.put_u64(0); // is_serial (engine ColumnDef has no SERIAL marker)
+            bb.put_u64(if cd.is_hidden { 1 } else { 0 });
             bb.end_row();
         }
         bb.finish()

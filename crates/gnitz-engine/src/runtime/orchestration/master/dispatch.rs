@@ -81,10 +81,12 @@ impl MasterDispatcher {
             return (schema, cached.block, cached.wire_safe, cached.wire_row_fixed_stride);
         }
         let names = cat.get_col_names_bytes(target_id);
+        let hidden = cat.get_col_hidden_mask(target_id);
         let (name_refs, n) = col_names_as_refs(&names);
         let block = Rc::new(crate::runtime::wire::build_schema_wire_block(
             &schema,
             &name_refs[..n],
+            hidden,
             target_id as u32,
         ));
         let (wire_safe, wire_row_stride) = crate::runtime::sal::compute_wire_props(&schema);

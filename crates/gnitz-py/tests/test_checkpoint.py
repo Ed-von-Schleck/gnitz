@@ -494,7 +494,7 @@ def test_low_space_relay_checkpoints_without_aborting_master(relay_lowspace_serv
             if proc.poll() is not None:
                 break  # master died — assertion below reports it
             try:
-                totals = {row[1]: row[2]
+                totals = {row[0]: row[1]
                           for row in client.scan(vid) if row.weight > 0}
             except Exception:
                 break  # connection broke (likely a dead master)

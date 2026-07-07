@@ -134,19 +134,24 @@ fn resolve_set_projection(
     source_schema: &Schema,
     context: &str,
 ) -> Result<(Vec<usize>, Vec<ColumnDef>), GnitzSqlError> {
+    // Wildcard expands to *visible* columns only: an upstream synthetic key
+    // (`_join_pk`, `_set_pk`, …) must not participate in UNION/INTERSECT/
+    // EXCEPT/DISTINCT row identity — hashing it into the dedup key would keep
+    // otherwise-identical rows distinct.
     if is_wildcard_projection(projection) {
-        let indices: Vec<usize> = (0..source_schema.columns.len()).collect();
+        let (indices, cols): (Vec<usize>, Vec<ColumnDef>) =
+            source_schema.visible_columns().map(|(i, c)| (i, c.clone())).unzip();
         reject_float_keys(source_schema, &indices)?;
-        return Ok((indices, source_schema.columns.clone()));
+        return Ok((indices, cols));
     }
     let mut indices: Vec<usize> = Vec::new();
     let mut out_cols: Vec<ColumnDef> = Vec::new();
     for item in projection {
         match item {
             SelectItem::Wildcard(_) => {
-                for i in 0..source_schema.columns.len() {
+                for (i, col) in source_schema.visible_columns() {
                     indices.push(i);
-                    out_cols.push(source_schema.columns[i].clone());
+                    out_cols.push(col.clone());
                 }
             }
             SelectItem::UnnamedExpr(expr) => match bind_single_table(expr, source_schema)? {
@@ -367,7 +372,9 @@ pub(crate) fn emit_set_op_pieces(
     // The column name comes from the left side (SQL takes output names from the
     // first query); the type is the shared physical layout both sides emit.
     let mut out_cols_final: Vec<ColumnDef> = Vec::new();
-    out_cols_final.push(ColumnDef::new("_set_pk", TypeCode::U128, false));
+    // Hidden: the salted set-operation key is a physical PK column, not a
+    // presentation column — `SELECT *` shows only the projected content.
+    out_cols_final.push(ColumnDef::new("_set_pk", TypeCode::U128, false).hidden());
     for ((l, r), &ct) in left_cols.iter().zip(&right_cols).zip(&common_tcs) {
         let mut col = l.clone();
         col.type_code = ct;
@@ -386,7 +393,7 @@ pub(crate) fn emit_set_op_pieces(
         };
         out_cols_final.push(col);
     }
-    reject_duplicate_column_names(out_cols_final.iter().map(|c| c.name.as_str()), "set operation view")?;
+    reject_duplicate_column_names(&out_cols_final, "set operation view")?;
 
     // Set-op views emit a synthetic single-column content-hash PK at slot 0.
     Ok((circuit, out_cols_final, vec![0]))
@@ -416,9 +423,11 @@ pub(crate) fn emit_distinct_pieces(
 
     // Output schema: synthetic U128 PK + the projected columns.
     let mut out_cols: Vec<ColumnDef> = Vec::with_capacity(proj_cols.len() + 1);
-    out_cols.push(ColumnDef::new("_distinct_pk", TypeCode::U128, false));
+    // Hidden: the synthetic DISTINCT key is a physical PK column, not a
+    // presentation column.
+    out_cols.push(ColumnDef::new("_distinct_pk", TypeCode::U128, false).hidden());
     out_cols.extend(proj_cols);
-    reject_duplicate_column_names(out_cols.iter().map(|c| c.name.as_str()), "SELECT DISTINCT view")?;
+    reject_duplicate_column_names(&out_cols, "SELECT DISTINCT view")?;
 
     // DISTINCT views emit a synthetic single-column content-hash PK at slot 0.
     Ok((circuit, out_cols, vec![0]))

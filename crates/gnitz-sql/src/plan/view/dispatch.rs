@@ -329,32 +329,27 @@ fn is_compilable_hidden_body(s: &Select) -> bool {
     s.selection.is_some() || group_by_is_present(&s.group_by) || projection_has_aggregate(s)
 }
 
-/// Apply positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`) to a
-/// hidden segment's columns. Rejected for a JOIN body: its leading synthetic-PK region is
-/// invisible, so positional aliases would misalign — alias in the subquery's SELECT.
+/// Apply positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`)
+/// to a hidden segment's *visible* columns, in order. A JOIN body's leading
+/// synthetic-PK region is hidden and skipped automatically, so positional
+/// aliases name exactly the visible output columns — the same columns a
+/// downstream query sees — with no misalignment.
 fn apply_hidden_column_aliases(
     aliases: &[sqlparser::ast::TableAliasColumnDef],
     cols: &mut [ColumnDef],
-    is_join: bool,
     ctx_name: &str,
 ) -> Result<(), GnitzSqlError> {
     if aliases.is_empty() {
         return Ok(());
     }
-    if is_join {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{ctx_name}: column aliases on a JOIN subquery are not supported; alias columns in the \
-             subquery's SELECT instead"
-        )));
-    }
-    if aliases.len() != cols.len() {
+    let n_visible = cols.iter().filter(|c| !c.is_hidden).count();
+    if aliases.len() != n_visible {
         return Err(GnitzSqlError::Plan(format!(
-            "{ctx_name} defines {} column aliases but body returns {} columns",
+            "{ctx_name} defines {} column aliases but body returns {n_visible} columns",
             aliases.len(),
-            cols.len()
         )));
     }
-    for (col, alias) in cols.iter_mut().zip(aliases) {
+    for (col, alias) in cols.iter_mut().filter(|c| !c.is_hidden).zip(aliases) {
         col.name = alias.name.value.clone();
     }
     Ok(())
@@ -470,7 +465,7 @@ fn inline_passthrough_cte(
     // Apply CTE column aliases (`WITH cte(a, b) AS ...`).
     let cte_schema = if !cte.alias.columns.is_empty() {
         let mut s = (*cte_schema).clone();
-        apply_hidden_column_aliases(&cte.alias.columns, &mut s.columns, false, ctx)?;
+        apply_hidden_column_aliases(&cte.alias.columns, &mut s.columns, ctx)?;
         std::rc::Rc::new(s)
     } else {
         cte_schema
@@ -524,7 +519,7 @@ fn compile_hidden_body(
             simple::emit_linear(vid, rel)?
         };
         // Positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`).
-        apply_hidden_column_aliases(column_aliases, &mut cols, is_plain_join, ctx)?;
+        apply_hidden_column_aliases(column_aliases, &mut cols, ctx)?;
         Ok((circuit, cols, pk))
     })
 }

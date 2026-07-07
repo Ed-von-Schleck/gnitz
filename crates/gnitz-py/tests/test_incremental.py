@@ -767,14 +767,14 @@ class TestNullThroughOperators:
                 schema_name=sn,
             )
 
+            # Visible layout: row[0]=grp, row[1]=agg (cnt / total).
             count_rows = [r for r in client.scan(count_vid) if r.weight > 0]
             assert len(count_rows) == 1
-            # row[2] is the agg column (cnt)
-            assert count_rows[0][2] == 3
+            assert count_rows[0][1] == 3
 
             sum_rows = [r for r in client.scan(sum_vid) if r.weight > 0]
             assert len(sum_rows) == 1
-            assert sum_rows[0][2] == 30  # 10+20, null excluded
+            assert sum_rows[0][1] == 30  # 10+20, null excluded
         finally:
             for sql in ["DROP VIEW v_count", "DROP VIEW v_sum", "DROP TABLE t"]:
                 try:

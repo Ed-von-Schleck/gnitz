@@ -18,6 +18,10 @@ pub(crate) struct CatalogCacheSet {
     pub(crate) pk_col_of: FxHashMap<i64, PkColList>,
     pub(crate) col_names: FxHashMap<i64, Vec<String>>,
     pub(crate) col_names_bytes: FxHashMap<i64, Rc<Vec<Vec<u8>>>>,
+    /// Per-table hidden-column bitmask (bit N ⇔ column N is a hidden key slot;
+    /// u128 covers MAX_COLUMNS = 65). Echoed into reply schema blocks as
+    /// `META_FLAG_HIDDEN`; filled from COL_TAB alongside `col_names`.
+    pub(crate) col_hidden: FxHashMap<i64, u128>,
     /// Cached schema wire data per table: (encoded block, wire_safe, wire_row_fixed_stride).
     /// Built from (SchemaDescriptor, col_names) and reused across SEEK/SCAN responses.
     /// `wire_row_fixed_stride` is only meaningful when `wire_safe == true`.
@@ -74,6 +78,7 @@ impl CatalogCacheSet {
     pub(crate) fn clear_col_cache_no_bump(&mut self, id: i64) {
         self.col_names.remove(&id);
         self.col_names_bytes.remove(&id);
+        self.col_hidden.remove(&id);
         self.schema_wire_cache.remove(&id);
     }
 

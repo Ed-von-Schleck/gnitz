@@ -208,7 +208,7 @@ fn test_wire_size_includes_request_id() {
 fn test_schema_roundtrip_with_names() {
     let sd = string_schema();
     let names: Vec<&[u8]> = vec![b"pk_col", b"int_col", b"name_col"];
-    let batch = schema_to_batch(&sd, &names);
+    let batch = schema_to_batch(&sd, &names, 0);
     let (sd2, names2) = batch_to_schema(&batch).unwrap();
     assert_eq!(sd2.num_columns(), 3);
     assert_eq!(sd2.pk_indices(), &[0]);
@@ -250,7 +250,7 @@ fn test_schema_roundtrip_long_names() {
     let sd = simple_schema();
     let long_name = b"this_is_a_very_long_column_name_exceeding_twelve_bytes";
     let names: Vec<&[u8]> = vec![b"pk", long_name];
-    let batch = schema_to_batch(&sd, &names);
+    let batch = schema_to_batch(&sd, &names, 0);
     let (sd2, names2) = batch_to_schema(&batch).unwrap();
     assert_eq!(sd2.num_columns(), 2);
     assert_eq!(names2[0], b"pk");
@@ -273,7 +273,7 @@ fn schema_roundtrip_wire_preserves_pk_order() {
     ];
     for &(cols, pk_indices) in cases {
         let original = SchemaDescriptor::new(cols, pk_indices);
-        let batch = schema_to_batch(&original, &[]);
+        let batch = schema_to_batch(&original, &[], 0);
         let (decoded, _names) = batch_to_schema(&batch).unwrap();
         assert!(
             original == decoded,
@@ -497,7 +497,7 @@ fn prebuilt_schema_block_matches_inline_encode() {
     );
 
     // Prebuilt path.
-    let prebuilt = build_schema_wire_block(&sd, &names, target_id as u32);
+    let prebuilt = build_schema_wire_block(&sd, &names, 0, target_id as u32);
     let sz = wire_size(STATUS_OK, b"", Some(&sd), None, Some(&batch), Some(&prebuilt), &[]);
     let mut buf = vec![0u8; sz];
     encode_wire_into(
@@ -525,7 +525,7 @@ fn prebuilt_schema_block_matches_inline_encode() {
 #[test]
 fn prebuilt_schema_block_no_col_names_roundtrips() {
     let sd = simple_schema();
-    let prebuilt = build_schema_wire_block(&sd, &[], 5);
+    let prebuilt = build_schema_wire_block(&sd, &[], 0, 5);
     let sz = wire_size(STATUS_OK, b"", Some(&sd), None, None, Some(&prebuilt), &[]);
     let mut buf = vec![0u8; sz];
     encode_wire_into(

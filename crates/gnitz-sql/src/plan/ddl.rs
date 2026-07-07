@@ -5,7 +5,7 @@ use crate::ast_util::extract_name;
 use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::plan::validate::{
-    default_index_name, disambiguate_index_name, reject_duplicate_column_names, reject_non_key_eligible,
+    default_index_name, disambiguate_index_name, reject_duplicate_names, reject_non_key_eligible,
     reject_unhonored_column_options, reject_unhonored_table_constraints, validate_user_index_name, validate_user_name,
 };
 use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
@@ -211,7 +211,7 @@ pub(crate) fn execute_create_table(
 
     // Reject duplicate column names up front: the PK/UNIQUE column lookups
     // below resolve by name and would silently bind to the first match.
-    reject_duplicate_column_names(sql_cols.iter().map(|c| c.name.value.as_str()), "table definition")?;
+    reject_duplicate_names(sql_cols.iter().map(|c| c.name.value.as_str()), "table definition")?;
 
     // Reject every column option / table constraint the table builder does not
     // honor (DEFAULT, CHECK, GENERATED, FK referential actions, inline INDEX, …)

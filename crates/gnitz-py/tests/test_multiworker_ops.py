@@ -36,8 +36,12 @@ def _scan_positive(client, vid):
 
 
 def _scan_reduce_map(client, vid):
-    """Scan a reduce view → {group_val: agg_val} for positive-weight rows."""
-    return {row[1]: row[2] for row in client.scan(vid) if row.weight > 0}
+    """Scan a reduce view → {group_val: agg_val} for positive-weight rows.
+
+    The visible layout of a GROUP BY view is [group_col, agg] whether the view
+    is keyed naturally or by a (hidden) synthetic group PK.
+    """
+    return {row[0]: row[1] for row in client.scan(vid) if row.weight > 0}
 
 
 # -----------------------------------------------------------------------
@@ -69,8 +73,10 @@ def _make_i32_reduce_view(client, sn, tid, agg_func_id, vname=None):
     # MIN/MAX (3/4) emit the source column's type — the I32 `val` stays I32, not
     # widened to BIGINT. SUM (2) still widens to I64 (it can overflow I32).
     agg_tc = gnitz.TypeCode.I32 if agg_func_id in (3, 4) else gnitz.TypeCode.I64
+    # The synthetic group-hash PK is a hidden key slot, matching the SQL
+    # GROUP BY convention — rows present the visible [grp, agg] layout.
     out_cols = [
-        gnitz.ColumnDef("pk", gnitz.TypeCode.U128, primary_key=True),
+        gnitz.ColumnDef("pk", gnitz.TypeCode.U128, primary_key=True, is_hidden=True),
         gnitz.ColumnDef("grp", gnitz.TypeCode.I64),
         gnitz.ColumnDef("agg", agg_tc),
     ]
@@ -182,8 +188,7 @@ def test_string_group_by_multiworker(client):
         ])
         client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
 
-        rows = _scan_positive(client, vid)
-        totals = {r[1]: r[2] for r in rows}
+        totals = _scan_reduce_map(client, vid)
 
         assert totals["alpha"] == 60, f"alpha: {totals.get('alpha')}"
         assert totals["beta"] == 300, f"beta: {totals.get('beta')}"

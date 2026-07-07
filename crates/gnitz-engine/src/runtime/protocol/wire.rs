@@ -116,8 +116,13 @@ fn schema_wal_block_size(schema: &SchemaDescriptor, row_count: usize, blob_size:
 /// `encode_wire_into` would embed. Callers cache this per table and pass it
 /// as `prebuilt_schema_block` to `wire_size` / `encode_wire_into` to skip the
 /// `Batch` allocation on every SEEK/SCAN response.
-pub fn build_schema_wire_block(schema: &SchemaDescriptor, col_names: &[&[u8]], target_tid: u32) -> Vec<u8> {
-    let schema_batch = schema_to_batch(schema, col_names);
+pub fn build_schema_wire_block(
+    schema: &SchemaDescriptor,
+    col_names: &[&[u8]],
+    hidden_mask: u128,
+    target_tid: u32,
+) -> Vec<u8> {
+    let schema_batch = schema_to_batch(schema, col_names, hidden_mask);
     let sz = schema_batch.wire_byte_size(target_tid);
     let mut block = vec![0u8; sz];
     schema_batch.encode_to_wire(target_tid, &mut block, 0, true);
@@ -135,7 +140,11 @@ pub(crate) fn col_names_as_refs(names: &[Vec<u8>]) -> ([&[u8]; crate::schema::MA
     (refs, n)
 }
 
-pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) -> Batch {
+/// `hidden_mask`: bit N set ⇔ column N is a hidden key slot (COL_TAB
+/// `is_hidden`), echoed as `META_FLAG_HIDDEN` so clients can suppress the
+/// column in presentation. Engine-internal blocks (SAL entries, nameless
+/// one-offs) pass 0 — nothing engine-side reads the flag.
+pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]], hidden_mask: u128) -> Batch {
     let ncols = schema.num_columns();
     let meta = META_SCHEMA_DESC;
     let mut batch = Batch::with_schema(meta, ncols);
@@ -145,6 +154,9 @@ pub(crate) fn schema_to_batch(schema: &SchemaDescriptor, col_names: &[&[u8]]) ->
         let mut flags: u64 = 0;
         if col.nullable != 0 {
             flags |= META_FLAG_NULLABLE;
+        }
+        if hidden_mask & (1 << ci) != 0 {
+            flags |= gnitz_wire::META_FLAG_HIDDEN;
         }
         // For compound PKs the position within `schema.pk_indices()` is
         // what determines decode order — column order ≠ PK order in
@@ -703,7 +715,7 @@ pub fn encode_wire_into_range(
             out[pos..end].copy_from_slice(prebuilt);
             pos = end;
         } else if let Some(s) = schema {
-            let schema_batch = schema_to_batch(s, &[]);
+            let schema_batch = schema_to_batch(s, &[], 0);
             let w = schema_batch.encode_to_wire(target_id as u32, out, pos, false);
             pos += w;
         }
@@ -775,7 +787,7 @@ fn encode_wire_into_impl(
         } else {
             let eff_schema = schema.unwrap();
             let names = col_names.unwrap_or(&[]);
-            let schema_batch = schema_to_batch(eff_schema, names);
+            let schema_batch = schema_to_batch(eff_schema, names, 0);
             let written = schema_batch.encode_to_wire(target_id as u32, out, pos, checksum);
             pos += written;
         }
@@ -1403,10 +1415,11 @@ mod tests {
                         .u64_val(i as u64)
                         .str_val(&format!("c{i}"))
                         .u64_val(4) // type_code U64
-                        .u64_val(0)
-                        .u64_val(0)
-                        .u64_val(0)
-                        .u64_val(0);
+                        .u64_val(0) // is_nullable
+                        .u64_val(0) // fk_table_id
+                        .u64_val(0) // fk_col_idx
+                        .u64_val(0) // is_serial
+                        .u64_val(0); // is_hidden
                 }
             }
             b
@@ -1663,7 +1676,7 @@ mod tests {
                 .map(|i| format!("c{i}").into_bytes())
                 .collect();
             let (refs, n) = col_names_as_refs(&names);
-            let wire = build_schema_wire_block(original, &refs[..n], 0);
+            let wire = build_schema_wire_block(original, &refs[..n], 0, 0);
             let decoded = decode_schema_block(&wire, true)
                 .expect("decode must succeed for any valid schema");
             assert_descriptor_eq(original, &decoded)?;
@@ -1701,7 +1714,7 @@ mod tests {
                 .map(|i| format!("c{i}").into_bytes())
                 .collect();
             let (refs, n) = col_names_as_refs(&names);
-            let wire = build_schema_wire_block(original, &refs[..n], 0);
+            let wire = build_schema_wire_block(original, &refs[..n], 0, 0);
 
             let ms = meta_schema();
             let (decoded_batch, _, _) =
@@ -1742,7 +1755,7 @@ mod tests {
         // mirroring how the nullable-PK test patches the flags region.
         let cols = [SchemaColumn::new(type_code::U64, 0)];
         let sd = SchemaDescriptor::new(&cols, &[0]);
-        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0);
+        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
         let (tc_off, _) = wal_dir_entry(&wire, 3);
         wire[tc_off..tc_off + 8].copy_from_slice(&(type_code::F64 as u64).to_le_bytes());
         // verify_checksum=false: the type_code region is inside the checksummed body.
@@ -1761,7 +1774,7 @@ mod tests {
     fn decode_schema_block_rejects_nullable_pk() {
         let cols = [SchemaColumn::new(type_code::U64, 0)];
         let sd = SchemaDescriptor::new(&cols, &[0]);
-        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0);
+        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
         // Region 4 is the flags column; OR in NULLABLE on the PK (col 0).
         let (fl_off, _) = wal_dir_entry(&wire, 4);
         let f = u64::from_le_bytes(wire[fl_off..fl_off + 8].try_into().unwrap()) | META_FLAG_NULLABLE;
@@ -1780,7 +1793,7 @@ mod tests {
     fn decode_schema_block_rejects_directory_overflow() {
         let cols = [SchemaColumn::new(type_code::U64, 0)];
         let sd = SchemaDescriptor::new(&cols, &[0]);
-        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0);
+        let mut wire = build_schema_wire_block(&sd, &[b"c0".as_slice()], 0, 0);
         // num_regions lives in the header (outside the checksummed body), so a
         // huge value still passes the checksum and trips the directory guard.
         wire[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].copy_from_slice(&100_000u32.to_le_bytes());

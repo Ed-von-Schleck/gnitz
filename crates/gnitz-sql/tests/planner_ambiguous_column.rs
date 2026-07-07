@@ -25,6 +25,17 @@ fn setup_dup_view(client: &mut gnitz_core::GnitzClient, sn: &str) {
         .unwrap();
 }
 
+/// Join view `ju` with schema `[_join_pk(hidden), id, val, rid, val]` —
+/// `id`/`rid` unique and visible, `val` duplicated.
+fn setup_partial_dup_view(client: &mut gnitz_core::GnitzClient, sn: &str) {
+    let mut p = SqlPlanner::new(client, sn);
+    p.execute("CREATE TABLE l (id BIGINT PRIMARY KEY, val BIGINT)").unwrap();
+    p.execute("CREATE TABLE r (rid BIGINT PRIMARY KEY, val BIGINT)")
+        .unwrap();
+    p.execute("CREATE VIEW ju AS SELECT * FROM l JOIN r ON l.val = r.val")
+        .unwrap();
+}
+
 /// Assert `r` is a `Bind` error whose message reports an ambiguous column.
 fn assert_ambiguous(r: Result<Vec<gnitz_sql::SqlResult>, GnitzSqlError>) {
     match r.unwrap_err() {
@@ -125,22 +136,16 @@ fn test_create_view_ambiguous_having() {
         None => return,
     };
     let (mut client, sn) = make_planner(&srv);
+    setup_partial_dup_view(&mut client, &sn);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    // jv2 schema: [_join_pk, id, val, rid, val] — `id`/`rid` unique, `val` dup.
-    p.execute("CREATE TABLE l2 (id BIGINT PRIMARY KEY, val BIGINT)")
-        .unwrap();
-    p.execute("CREATE TABLE r2 (rid BIGINT PRIMARY KEY, val BIGINT)")
-        .unwrap();
-    p.execute("CREATE VIEW jv2 AS SELECT * FROM l2 JOIN r2 ON l2.val = r2.val")
-        .unwrap();
-
-    assert_ambiguous(p.execute("CREATE VIEW gv AS SELECT id, COUNT(*) FROM jv2 GROUP BY id HAVING SUM(val) > 0"));
+    assert_ambiguous(p.execute("CREATE VIEW gv AS SELECT id, COUNT(*) FROM ju GROUP BY id HAVING SUM(val) > 0"));
 }
 
-/// Qualified reference within a dup-named source of a join — `b.id` resolves to
-/// both of `jv`'s `id` columns via `resolve_qualified_column` (§5.1). The
-/// qualifier names the relation, not left-vs-right within it, so it is still
-/// ambiguous.
+/// Qualified reference within a dup-named source of a join — `b.val` resolves to
+/// both of the join view's `val` columns via `resolve_qualified_column` (§5.1).
+/// The qualifier names the relation, not left-vs-right within it, so it is still
+/// ambiguous. The join is keyed on the *unique visible* `id` (the synthetic
+/// `_join_pk` is hidden and not name-resolvable).
 #[test]
 fn test_join_qualified_ambiguous_source() {
     let srv = match ServerHandle::start() {
@@ -148,13 +153,10 @@ fn test_join_qualified_ambiguous_source() {
         None => return,
     };
     let (mut client, sn) = make_planner(&srv);
-    setup_dup_view(&mut client, &sn);
-
+    setup_partial_dup_view(&mut client, &sn);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    // `_join_pk` is I64 (the `l.val = r.val` common type), so `x BIGINT` joins it
-    // same-type; `b.id` is the ambiguous projection.
     p.execute("CREATE TABLE t (x BIGINT PRIMARY KEY)").unwrap();
-    assert_ambiguous(p.execute("CREATE VIEW jq AS SELECT a.x, b.id FROM t a JOIN jv b ON a.x = b._join_pk"));
+    assert_ambiguous(p.execute("CREATE VIEW jq AS SELECT a.x, b.val FROM t a JOIN ju b ON a.x = b.id"));
 }
 
 // ── dup-named views stay usable positionally (regression guards) ──────────────
@@ -208,7 +210,10 @@ fn test_wildcard_passthrough_over_dup_view_succeeds() {
     p.execute("SELECT * FROM v2").unwrap();
 }
 
-/// A reference to a non-duplicated name in a dup-named view still resolves.
+/// A reference to a non-duplicated *visible* name in a dup-named view still
+/// resolves. (The unique name used to be the synthetic `_join_pk`; that is now a
+/// hidden key slot — see `test_hidden_join_key_not_name_resolvable` — so the
+/// unique name is a real projected column.)
 #[test]
 fn test_unique_name_in_dup_view_resolves() {
     let srv = match ServerHandle::start() {
@@ -216,9 +221,33 @@ fn test_unique_name_in_dup_view_resolves() {
         None => return,
     };
     let (mut client, sn) = make_planner(&srv);
+    setup_partial_dup_view(&mut client, &sn);
+    let mut p = SqlPlanner::new(&mut client, &sn);
+    // Resolve the unique `id` through a CREATE VIEW: the view's PK is the hidden
+    // `_join_pk` (unnameable), so a direct SELECT — which requires a PK column in
+    // its projection — can't name it; the simple-view path re-prepends the hidden
+    // source PK automatically, exercising pure name resolution of `id`.
+    p.execute("CREATE VIEW jz AS SELECT id FROM ju").unwrap();
+}
+
+/// The synthetic join key is a hidden key slot: it rides the view physically (it
+/// is the PK), surfaces in the physical schema, but is not resolvable by name.
+#[test]
+fn test_hidden_join_key_not_name_resolvable() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
     setup_dup_view(&mut client, &sn);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    p.execute("SELECT _join_pk FROM jv").unwrap();
+    match p.execute("SELECT _join_pk FROM jv").unwrap_err() {
+        GnitzSqlError::Bind(s) => assert!(
+            s.contains("not found") || s.contains("_join_pk"),
+            "expected a not-found Bind error for the hidden key, got: {s}"
+        ),
+        e => panic!("expected Bind(not found), got {:?}", e),
+    }
 }
 
 // ── views are read-only: INSERT / UPDATE / DELETE reject a view (§5.4) ────────

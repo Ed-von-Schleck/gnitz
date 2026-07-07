@@ -3060,9 +3060,9 @@ class TestGlobalAggregate:
         finally:
             client.drop_schema(sn)
 
-    def test_select_star_pins_group_pk(self, client):
-        """SELECT * over a global aggregate ships the synthetic `_group_pk` U128
-        constant plus the aggregate column (documented limitation)."""
+    def test_select_star_hides_group_pk(self, client):
+        """SELECT * over a global aggregate hides the synthetic `_group_pk` U128
+        constant and ships only the aggregate column."""
         sn = "gss_" + _uid()
         client.create_schema(sn)
         try:
@@ -3075,8 +3075,8 @@ class TestGlobalAggregate:
             client.execute_sql("INSERT INTO t VALUES (1, 3)", schema_name=sn)
             r = self._one_row(client, vid)
             cols = set(r._asdict().keys())
-            assert "_group_pk" in cols, f"_group_pk must be present, got {cols}"
-            assert "lo" in cols and r["lo"] == 3
+            assert "_group_pk" not in cols, f"_group_pk must be hidden, got {cols}"
+            assert cols == {"lo"} and r["lo"] == 3
         finally:
             client.drop_schema(sn)
 

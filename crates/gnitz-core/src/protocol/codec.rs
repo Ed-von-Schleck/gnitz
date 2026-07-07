@@ -1,5 +1,7 @@
 use super::error::ProtocolError;
-use super::header::{META_FLAG_IS_PK, META_FLAG_NULLABLE, META_FLAG_PK_POS_MASK, META_FLAG_PK_POS_SHIFT};
+use super::header::{
+    META_FLAG_HIDDEN, META_FLAG_IS_PK, META_FLAG_NULLABLE, META_FLAG_PK_POS_MASK, META_FLAG_PK_POS_SHIFT,
+};
 use super::types::{
     meta_schema, type_code_from_u64, BatchAppender, ColData, ColumnDef, Schema, ZSetBatch, MAX_COLUMNS,
 };
@@ -19,6 +21,9 @@ pub fn schema_to_batch(schema: &Schema) -> ZSetBatch {
             let mut flags: u64 = 0;
             if col.is_nullable {
                 flags |= META_FLAG_NULLABLE;
+            }
+            if col.is_hidden {
+                flags |= META_FLAG_HIDDEN;
             }
             // Encode position-in-PK-tuple so compound `PRIMARY KEY (b, a)`
             // decodes back to the user-declared order.
@@ -81,13 +86,18 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
         let tc = type_code_from_u64(type_code_raw)?;
         let is_nullable = (flags & META_FLAG_NULLABLE) != 0;
         let is_pk = (flags & META_FLAG_IS_PK) != 0;
+        let is_hidden = (flags & META_FLAG_HIDDEN) != 0;
 
         if is_pk {
             let pos = ((flags & META_FLAG_PK_POS_MASK) >> META_FLAG_PK_POS_SHIFT) as u8;
             pk_pairs.push((pos, i));
         }
 
-        columns.push(ColumnDef::new(name, tc, is_nullable));
+        let mut col = ColumnDef::new(name, tc, is_nullable);
+        if is_hidden {
+            col = col.hidden();
+        }
+        columns.push(col);
     }
 
     pk_pairs.sort_by_key(|(p, _)| *p);
@@ -256,7 +266,7 @@ mod tests {
     fn test_schema_meta_roundtrip() {
         let original = Schema {
             columns: vec![
-                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("id", TypeCode::U64, false).hidden(),
                 ColumnDef::new("name", TypeCode::String, true),
                 ColumnDef::new("score", TypeCode::F64, false),
                 ColumnDef::new("tag", TypeCode::I32, true),

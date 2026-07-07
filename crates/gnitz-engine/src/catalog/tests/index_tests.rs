@@ -1111,6 +1111,7 @@ fn test_drop_table_cascades_fk_index() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     engine.create_table("public.child", &child_cols, &[0], true).unwrap();
@@ -1234,6 +1235,7 @@ fn test_compound_pk_secondary_index_seek() {
             is_nullable: false,
             fk_table_id: 0,
             fk_col_idx: 0,
+            is_hidden: false,
         },
         ColumnDef {
             name: "b".into(),
@@ -1241,6 +1243,7 @@ fn test_compound_pk_secondary_index_seek() {
             is_nullable: false,
             fk_table_id: 0,
             fk_col_idx: 0,
+            is_hidden: false,
         },
         u64_col_def("val"),
     ];
@@ -1298,6 +1301,7 @@ fn test_compound_pk_secondary_index_retract() {
             is_nullable: false,
             fk_table_id: 0,
             fk_col_idx: 0,
+            is_hidden: false,
         },
         ColumnDef {
             name: "b".into(),
@@ -1305,6 +1309,7 @@ fn test_compound_pk_secondary_index_retract() {
             is_nullable: false,
             fk_table_id: 0,
             fk_col_idx: 0,
+            is_hidden: false,
         },
         u64_col_def("val"),
     ];
@@ -1527,6 +1532,7 @@ fn index_version_bumps_on_fk_auto_index() {
             is_nullable: false,
             fk_table_id: parent_tid,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0], true).unwrap();
@@ -1589,6 +1595,7 @@ fn test_create_unique_index_on_string_blob_rejected() {
         is_nullable: false,
         fk_table_id: 0,
         fk_col_idx: 0,
+        is_hidden: false,
     };
     let cols = vec![u64_col_def("id"), str_col_def("name"), blob_col];
     engine.create_table("public.t", &cols, &[0], false).unwrap();
@@ -1646,6 +1653,7 @@ fn fk_col_def(name: &str, parent_tid: i64, parent_col: u32) -> ColumnDef {
         is_nullable: false,
         fk_table_id: parent_tid,
         fk_col_idx: parent_col,
+        is_hidden: false,
     }
 }
 
@@ -2283,6 +2291,7 @@ fn test_composite_index_null_in_any_key_skipped() {
             is_nullable: true,
             fk_table_id: 0,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();
@@ -2946,6 +2955,7 @@ fn test_seek_by_index_range_null_excluded() {
             is_nullable: true,
             fk_table_id: 0,
             fk_col_idx: 0,
+            is_hidden: false,
         },
     ];
     let tid = engine.create_table("public.t", &cols, &[0], false).unwrap();

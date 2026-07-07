@@ -589,7 +589,9 @@ fn emit_equi_exists(view_id: u64, ctx: ExistsCtx<'_>, is_mark: bool) -> Result<E
         } else {
             format!("_join_pk_{i}")
         };
-        out_pk_cols.push(ColumnDef::new(name, t, false));
+        // Hidden: the synthetic correlation key is a physical PK column, not a
+        // presentation column — `SELECT *` shows the outer projection only.
+        out_pk_cols.push(ColumnDef::new(name, t, false).hidden());
     }
     if is_mark {
         // Both branches over one shared ν, keyed [_join_pk, A].
@@ -789,20 +791,21 @@ fn emit_range_exists(
         }
     };
 
-    // View PK = the outer source PK, exposed under fresh `_src_pk_{i}` names
-    // (the outer PK columns also appear verbatim in the payload, and reusing
-    // their names would trip the duplicate-name guard on explicit projections).
+    // View PK = the outer source PK, hidden (the outer PK columns also ride the
+    // payload verbatim, so nothing is lost; hidden columns are exempt from the
+    // duplicate-name guard and name resolution, so the names can stay verbatim
+    // too — matching `place_pk_front`'s hidden auto-prepend convention).
     let src_pk_coldefs: Vec<ColumnDef> = ctx
         .outer_schema
         .pk_cols
         .iter()
-        .enumerate()
-        .map(|(i, &c)| {
+        .map(|&c| {
             ColumnDef::new(
-                format!("_src_pk_{i}"),
+                ctx.outer_schema.columns[c].name.clone(),
                 ctx.outer_schema.columns[c].type_code.reindex_output_type(),
                 false,
             )
+            .hidden()
         })
         .collect();
     match unmatched {
@@ -848,7 +851,7 @@ fn finish_exists_pieces(
     let circuit = cb.build();
 
     if !is_wildcard_projection(&ctx.select.projection) {
-        reject_duplicate_column_names(final_cols.iter().map(|c| c.name.as_str()), "EXISTS view")?;
+        reject_duplicate_column_names(&final_cols, "EXISTS view")?;
     }
     let view_pk: Vec<u32> = (0..npk as u32).collect();
     Ok((circuit, final_cols, view_pk))
@@ -892,7 +895,7 @@ fn finish_mark_pieces(
     let circuit = cb.build();
 
     if !is_wildcard_projection(&ctx.select.projection) {
-        reject_duplicate_column_names(out_cols.iter().map(|c| c.name.as_str()), "mark view")?;
+        reject_duplicate_column_names(&out_cols, "mark view")?;
     }
     let view_pk: Vec<u32> = (0..npk as u32).collect();
     Ok((circuit, out_cols, view_pk))
@@ -949,8 +952,13 @@ fn build_mark_projection(
     }
     for (idx, item) in projection.iter().enumerate() {
         if projection_item_expr(item).is_none() {
-            // `*` / `t.*` → the outer columns only (single outer relation).
+            // `*` / `t.*` → the visible outer columns only (single outer
+            // relation). A hidden outer key (EXISTS over a view with a synthetic
+            // PK) is not re-admitted into this view's payload.
             for i in npk..npk + outer_n {
+                if branch_schema.columns[i].is_hidden {
+                    continue;
+                }
                 items.push(ProjItem::PassThrough { src_col: i });
                 out_cols.push(branch_schema.columns[i].clone());
             }

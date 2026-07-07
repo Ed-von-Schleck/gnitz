@@ -10,6 +10,10 @@ pub(crate) struct ColumnDef {
     pub(crate) is_nullable: bool,
     pub(crate) fk_table_id: i64,
     pub(crate) fk_col_idx: u32,
+    /// Hidden key slot (COL_TAB `is_hidden`). The engine never branches on it —
+    /// it is echoed verbatim into reply schema blocks (`META_FLAG_HIDDEN`) so
+    /// clients can suppress the column in presentation.
+    pub(crate) is_hidden: bool,
 }
 
 // `CircuitGraph` previously lived here as the DTO for the now-deleted

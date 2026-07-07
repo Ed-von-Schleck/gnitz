@@ -244,8 +244,10 @@ class TestJoins:
             client.execute_sql("INSERT INTO t1 VALUES " + ",".join(f"({i},{a})" for i, a in t1), schema_name=sn)
             client.execute_sql("INSERT INTO t2 VALUES " + ",".join(f"({i},{b})" for i, b in t2), schema_name=sn)
             vid = client.resolve_table(sn, "v")[0]
-            # The view's pair-PK columns (r[0], r[1]) = (t1.id, t2.id).
-            pairs = {(r[0], r[1]) for r in client.scan(vid) if r.weight > 0}
+            # The view's pair-PK columns are hidden synthetic keys; surface them
+            # with include_hidden so (r[0], r[1]) = (t1.id, t2.id).
+            pairs = {(r[0], r[1]) for r in client.scan(vid, include_hidden=True)
+                     if r.weight > 0}
             want = {(ai, bi) for (ai, a) in t1 for (bi, b) in t2 if a < b}
             assert pairs == want, f"range join: got {pairs}, want {want}"
         finally:

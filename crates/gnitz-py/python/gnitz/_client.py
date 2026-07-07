@@ -43,8 +43,8 @@ class Connection:
     def push(self, target_id, batch):
         return self._client.push(target_id, batch._raw)
 
-    def scan(self, target_id):
-        return self._client.scan_lazy(target_id)
+    def scan(self, target_id, include_hidden=False):
+        return self._client.scan_lazy(target_id, include_hidden)
 
     def delete(self, target_id, schema, pks):
         self._client.delete(target_id, schema, pks)
@@ -79,8 +79,8 @@ class Connection:
     def resolve_table_id(self, schema_name, table_name):
         return self.resolve_table(schema_name, table_name)
 
-    def seek(self, table_id: int, pk: int = 0):
-        return self._client.seek_lazy(table_id, pk)
+    def seek(self, table_id: int, pk: int = 0, include_hidden=False):
+        return self._client.seek_lazy(table_id, pk, include_hidden)
 
     def seek_by_index(self, table_id: int, col_indices, key_vals):
         """Seek a secondary index. ``col_indices`` is the index's full declared
