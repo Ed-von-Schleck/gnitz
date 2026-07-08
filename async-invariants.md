@@ -95,6 +95,19 @@ per tick). Releasing it before a round's await would let concurrent writers
 write SAL groups with the old epoch; workers skip mismatched epochs, and the
 round's reset then orphans those groups and hangs the writers.
 
+**SAL prefix-epoch gate** — a group's size and epoch are published together in
+the one atomically-stored u64 prefix (`(epoch << 32) | payload_size`,
+Release-stored by `SalGroup::commit`, Acquire-loaded by
+`sal_read_group_header`). A live reader dereferences a group's header/payload
+bytes **only after** the prefix's epoch equals its `expected_epoch`; on any
+mismatch it parks (`NO_MESSAGE`) without a single plain read. This is what
+makes the post-checkpoint in-place rewrite of offset 0 safe: a slot's prefix
+transitions `0 → (epoch | size)` at most once per epoch, and slot reuse always
+changes the published word (the reset bumps the epoch), so a matching prefix
+proves the group is fully written, immutable, and ordered-visible. The
+ungated (`expected_epoch = None`) read exists only for the recovery walkers,
+which run against a quiescent SAL with no concurrent writer.
+
 **Drain-window servicing.** While the committer awaits a Drain `done` /
 Quiesce `acked` (`await_servicing`), it keeps the SAL live: a **Reclaim**
 Barrier (relay-space) is serviced by a reclaim-only base round (no gen

@@ -21,8 +21,11 @@ use crate::storage::{carve_writer_slices, scatter_copy, Batch, DirectWriter};
 // ---------------------------------------------------------------------------
 
 pub const MAX_WORKERS: usize = 64;
-/// Group header: 32 fixed + MAX_WORKERS*4 offsets + MAX_WORKERS*4 sizes + 32 pad
-pub(crate) const GROUP_HEADER_SIZE: usize = 576;
+/// Group header: 16 fixed (lsn u64, flags u32, target_id u32) +
+/// MAX_WORKERS*4 offsets + MAX_WORKERS*4 sizes = 528, a multiple of 8.
+/// The group's size and epoch live in the atomically-published u64 prefix
+/// preceding the header (`(epoch << 32) | payload_size`), not in the header.
+pub(crate) const GROUP_HEADER_SIZE: usize = 16 + 2 * MAX_WORKERS * 4;
 pub const SAL_MMAP_SIZE: usize = 1 << 30;
 
 /// Floor for a `GNITZ_SAL_BYTES` override — must comfortably exceed one DDL zone
@@ -421,6 +424,7 @@ pub(crate) struct SalGroup {
     base: usize,
     total: usize,
     payload_size: usize,
+    epoch: u32,
     mmap_size: usize,
     committed: bool,
 }
@@ -442,7 +446,10 @@ impl SalGroup {
 
     pub(crate) unsafe fn commit(mut self) -> u64 {
         sal_write_sentinel(self.sal_ptr, self.base + self.total, self.mmap_size);
-        atomic_store_u64(self.sal_ptr.add(self.base), self.payload_size as u64);
+        atomic_store_u64(
+            self.sal_ptr.add(self.base),
+            (self.epoch as u64) << 32 | self.payload_size as u64,
+        );
         let cursor = (self.base + self.total) as u64;
         self.committed = true;
         cursor
@@ -469,8 +476,12 @@ pub(crate) unsafe fn sal_begin_group(
     if num_workers > MAX_WORKERS {
         return None;
     }
+    debug_assert!(
+        epoch >= 1,
+        "SAL group epoch must be >= 1 — epoch 0 is indistinguishable from the empty-slot sentinel prefix"
+    );
 
-    // payload_size starts as GROUP_HEADER_SIZE (576, a multiple of 8) and grows
+    // payload_size starts as GROUP_HEADER_SIZE (528, a multiple of 8) and grows
     // only by align8(sz) increments, so it is always a multiple of 8.
     let mut payload_size = GROUP_HEADER_SIZE;
     for &sz in &worker_sizes[..num_workers] {
@@ -486,23 +497,20 @@ pub(crate) unsafe fn sal_begin_group(
     let base = write_cursor;
     let hdr_off = base + 8;
 
-    write_u64_raw(sal_ptr, hdr_off, payload_size as u64);
-    write_u64_raw(sal_ptr, hdr_off + 8, lsn);
-    write_u32_raw(sal_ptr, hdr_off + 16, num_workers as u32);
-    write_u32_raw(sal_ptr, hdr_off + 20, flags);
-    write_u32_raw(sal_ptr, hdr_off + 24, target_id);
-    write_u32_raw(sal_ptr, hdr_off + 28, epoch);
+    write_u64_raw(sal_ptr, hdr_off, lsn);
+    write_u32_raw(sal_ptr, hdr_off + 8, flags);
+    write_u32_raw(sal_ptr, hdr_off + 12, target_id);
 
     let mut data_offset = GROUP_HEADER_SIZE;
     for w in 0..num_workers {
         let sz = worker_sizes[w] as usize;
         if sz > 0 {
-            write_u32_raw(sal_ptr, hdr_off + 32 + w * 4, data_offset as u32);
-            write_u32_raw(sal_ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, worker_sizes[w]);
+            write_u32_raw(sal_ptr, hdr_off + 16 + w * 4, data_offset as u32);
+            write_u32_raw(sal_ptr, hdr_off + 16 + MAX_WORKERS * 4 + w * 4, worker_sizes[w]);
             data_offset += align8(sz);
         } else {
-            write_u32_raw(sal_ptr, hdr_off + 32 + w * 4, 0);
-            write_u32_raw(sal_ptr, hdr_off + 32 + MAX_WORKERS * 4 + w * 4, 0);
+            write_u32_raw(sal_ptr, hdr_off + 16 + w * 4, 0);
+            write_u32_raw(sal_ptr, hdr_off + 16 + MAX_WORKERS * 4 + w * 4, 0);
         }
     }
 
@@ -512,6 +520,7 @@ pub(crate) unsafe fn sal_begin_group(
         base,
         total,
         payload_size,
+        epoch,
         mmap_size,
         committed: false,
     })
@@ -597,39 +606,61 @@ pub(crate) struct SalReadResult {
     pub _pad2: u32,
 }
 
+const NO_MESSAGE_RESULT: SalReadResult = SalReadResult {
+    status: SAL_STATUS_NO_MESSAGE,
+    advance: 0,
+    lsn: 0,
+    flags: 0,
+    target_id: 0,
+    epoch: 0,
+    _pad: 0,
+    data_ptr: std::ptr::null(),
+    data_size: 0,
+    _pad2: 0,
+};
+
 /// Read a SAL group header and extract this worker's data pointer/size.
+///
+/// The group's `(epoch << 32) | payload_size` prefix is Acquire-loaded first;
+/// `expected_epoch: Some(e)` returns `NO_MESSAGE` on any mismatch **before a
+/// single header byte is read** (live worker path). `None` skips the gate —
+/// only valid against a quiescent SAL (recovery walkers, no concurrent writer).
 ///
 /// # Safety
 /// `sal_ptr` must be a valid mmap pointer. `read_cursor` must be within bounds.
-pub(crate) unsafe fn sal_read_group_header(sal_ptr: *const u8, read_cursor: u64, worker_id: u32) -> SalReadResult {
+pub(crate) unsafe fn sal_read_group_header(
+    sal_ptr: *const u8,
+    read_cursor: u64,
+    worker_id: u32,
+    expected_epoch: Option<u32>,
+) -> SalReadResult {
     let rc = read_cursor as usize;
     let wid = worker_id as usize;
 
-    let payload_size = atomic_load_u64(sal_ptr.add(rc)) as usize;
+    let word = atomic_load_u64(sal_ptr.add(rc));
+    let payload_size = (word & 0xFFFF_FFFF) as usize;
+    let epoch = (word >> 32) as u32;
     if payload_size == 0 {
-        return SalReadResult {
-            status: SAL_STATUS_NO_MESSAGE,
-            advance: 0,
-            lsn: 0,
-            flags: 0,
-            target_id: 0,
-            epoch: 0,
-            _pad: 0,
-            data_ptr: std::ptr::null(),
-            data_size: 0,
-            _pad2: 0,
-        };
+        return NO_MESSAGE_RESULT;
+    }
+    // The load-bearing gate: on an epoch mismatch, return before ANY plain
+    // read of the header region. A stale slot at offset 0 after an epoch
+    // transition may be concurrently overwritten by the master; its bytes
+    // are unreadable until the prefix proves the slot belongs to our epoch.
+    if let Some(exp) = expected_epoch {
+        if epoch != exp {
+            return NO_MESSAGE_RESULT;
+        }
     }
 
     let hdr_off = rc + 8;
-    let lsn = read_u64_raw(sal_ptr, hdr_off + 8);
-    let flags = read_u32_raw(sal_ptr, hdr_off + 20);
-    let target_id = read_u32_raw(sal_ptr, hdr_off + 24);
-    let epoch = read_u32_raw(sal_ptr, hdr_off + 28);
+    let lsn = read_u64_raw(sal_ptr, hdr_off);
+    let flags = read_u32_raw(sal_ptr, hdr_off + 8);
+    let target_id = read_u32_raw(sal_ptr, hdr_off + 12);
     let advance = (8 + align8(payload_size)) as u64;
 
-    let my_offset = read_u32_raw(sal_ptr, hdr_off + 32 + wid * 4) as usize;
-    let my_size = read_u32_raw(sal_ptr, hdr_off + 32 + MAX_WORKERS * 4 + wid * 4) as usize;
+    let my_offset = read_u32_raw(sal_ptr, hdr_off + 16 + wid * 4) as usize;
+    let my_size = read_u32_raw(sal_ptr, hdr_off + 16 + MAX_WORKERS * 4 + wid * 4) as usize;
 
     if my_size > 0 && my_offset > 0 {
         debug_assert!(
@@ -1276,10 +1307,13 @@ impl SalReader {
         self.mmap_size
     }
 
-    /// Read next group at `cursor`. Returns None if no message.
+    /// Read next group at `cursor`. Returns None if no message, or — with
+    /// `expected_epoch: Some(e)` — if the group's prefix epoch differs from
+    /// `e` (the group stays parked at the cursor; its header bytes are never
+    /// dereferenced). Pass `None` only for quiescent-SAL recovery walks.
     /// On success returns (message, new_cursor).
-    pub fn try_read(&self, cursor: u64) -> Option<(SalMessage<'static>, u64)> {
-        let result = unsafe { sal_read_group_header(self.ptr, cursor, self.worker_id) };
+    pub fn try_read(&self, cursor: u64, expected_epoch: Option<u32>) -> Option<(SalMessage<'static>, u64)> {
+        let result = unsafe { sal_read_group_header(self.ptr, cursor, self.worker_id, expected_epoch) };
         if result.advance == 0 {
             return None;
         }

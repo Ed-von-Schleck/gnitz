@@ -1,7 +1,8 @@
 use crate::foundation::syscall;
 use crate::runtime::sal::{
-    sal_begin_group, sal_read_group_header, sal_write_group, SalReader, SalWriter, FLAG_DDL_SYNC, FLAG_TXN_COMMIT,
-    MAX_WORKERS, SAL_STATUS_HAS_DATA, SAL_STATUS_NO_DATA_FOR_WORKER, SAL_STATUS_NO_MESSAGE,
+    atomic_load_u64, sal_begin_group, sal_read_group_header, sal_write_group, SalReader, SalWriter, FLAG_DDL_SYNC,
+    FLAG_TXN_COMMIT, GROUP_HEADER_SIZE, MAX_WORKERS, SAL_STATUS_HAS_DATA, SAL_STATUS_NO_DATA_FOR_WORKER,
+    SAL_STATUS_NO_MESSAGE,
 };
 
 unsafe fn alloc_mmap(size: usize) -> *mut u8 {
@@ -57,7 +58,7 @@ fn test_sal_round_trip() {
         assert!(res.new_cursor > 0);
 
         for w in 0..4u32 {
-            let rr = sal_read_group_header(ptr, 0, w);
+            let rr = sal_read_group_header(ptr, 0, w, None);
             assert_eq!(rr.lsn, 100);
             assert_eq!(rr.target_id, 42);
             assert_eq!(rr.epoch, 1);
@@ -93,11 +94,11 @@ fn test_sal_unicast_isolation() {
         assert_eq!(res.status, 0);
 
         for w in [0u32, 1, 3] {
-            let rr = sal_read_group_header(ptr, 0, w);
+            let rr = sal_read_group_header(ptr, 0, w, None);
             assert_eq!(rr.status, SAL_STATUS_NO_DATA_FOR_WORKER);
             assert!(rr.advance > 0);
         }
-        let rr = sal_read_group_header(ptr, 0, 2);
+        let rr = sal_read_group_header(ptr, 0, 2, None);
         assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
         let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
         assert_eq!(data, buf.as_slice());
@@ -137,7 +138,7 @@ fn test_sal_multiple_groups() {
 
         let mut rc = 0u64;
         for g in 0..3u64 {
-            let rr = sal_read_group_header(ptr, rc, 0);
+            let rr = sal_read_group_header(ptr, rc, 0, None);
             assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
             assert_eq!(rr.lsn, g * 10);
             assert_eq!(rr.target_id, g as u32);
@@ -145,7 +146,7 @@ fn test_sal_multiple_groups() {
             assert_eq!(data, vec![(g + 1) as u8; 64].as_slice());
             rc += rr.advance;
         }
-        let rr = sal_read_group_header(ptr, rc, 0);
+        let rr = sal_read_group_header(ptr, rc, 0, None);
         assert_eq!(rr.status, SAL_STATUS_NO_MESSAGE);
 
         free_mmap(ptr, size);
@@ -165,7 +166,7 @@ fn test_sal_epoch_write_read() {
         let res = sal_write_group(ptr, 0, 1, 0, 0, 0, 42, size as u64, ptrs.as_ptr(), sizes.as_ptr());
         assert_eq!(res.status, 0);
 
-        let rr = sal_read_group_header(ptr, 0, 0);
+        let rr = sal_read_group_header(ptr, 0, 0, None);
         assert_eq!(rr.epoch, 42);
 
         free_mmap(ptr, size);
@@ -210,7 +211,7 @@ fn test_sal_cross_process() {
         let r = syscall::eventfd_wait(efd, 5000);
         assert!(r > 0, "eventfd timed out");
 
-        let rr = sal_read_group_header(ptr, 0, 0);
+        let rr = sal_read_group_header(ptr, 0, 0, None);
         assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
         assert_eq!(rr.lsn, 555);
         assert_eq!(rr.target_id, 99);
@@ -243,7 +244,7 @@ fn test_sal_checkpoint_reset() {
         let res2 = sal_write_group(ptr, 0, 1, 0, 0, 0, 2, size as u64, ptrs2.as_ptr(), sizes2.as_ptr());
         assert_eq!(res2.status, 0);
 
-        let rr = sal_read_group_header(ptr, 0, 0);
+        let rr = sal_read_group_header(ptr, 0, 0, None);
         assert_eq!(rr.epoch, 2);
         let data = std::slice::from_raw_parts(rr.data_ptr, rr.data_size as usize);
         assert_eq!(data, vec![0x22u8; 32].as_slice());
@@ -309,9 +310,9 @@ fn test_sal_epoch_fence() {
         );
         assert_eq!(res2.status, 0);
 
-        let rr1 = sal_read_group_header(ptr, 0, 0);
+        let rr1 = sal_read_group_header(ptr, 0, 0, None);
         assert_eq!(rr1.epoch, 5);
-        let rr2 = sal_read_group_header(ptr, rr1.advance, 0);
+        let rr2 = sal_read_group_header(ptr, rr1.advance, 0, None);
         assert_eq!(rr2.epoch, 6);
 
         free_mmap(ptr, size);
@@ -375,10 +376,10 @@ fn test_commit_sentinel_round_trip() {
 
         // Walk the SAL via SalReader (worker 0 perspective).
         let reader = SalReader::new(ptr as *const u8, 0, size, efd1);
-        let (m1, c1) = reader.try_read(0).unwrap();
-        let (m2, c2) = reader.try_read(c1).unwrap();
-        let (m3, c3) = reader.try_read(c2).unwrap();
-        let (m4, _) = reader.try_read(c3).unwrap();
+        let (m1, c1) = reader.try_read(0, None).unwrap();
+        let (m2, c2) = reader.try_read(c1, None).unwrap();
+        let (m3, c3) = reader.try_read(c2, None).unwrap();
+        let (m4, _) = reader.try_read(c3, None).unwrap();
 
         assert_eq!(m1.lsn, 7);
         assert_eq!(m2.lsn, 7);
@@ -415,7 +416,7 @@ fn test_commit_sentinel_zero_payload() {
 
         for w in 0..4 {
             let reader = SalReader::new(ptr as *const u8, w, size, efd1);
-            let (msg, _) = reader.try_read(0).unwrap();
+            let (msg, _) = reader.try_read(0, None).unwrap();
             assert_eq!(msg.lsn, 123);
             assert!(
                 msg.wire_data.is_none(),
@@ -481,9 +482,9 @@ fn test_batched_push_shares_zone_lsn() {
         writer.write_commit_sentinel(zone_lsn).unwrap();
 
         let reader = SalReader::new(ptr as *const u8, 0, size, efds[0]);
-        let (m1, c1) = reader.try_read(0).unwrap();
-        let (m2, c2) = reader.try_read(c1).unwrap();
-        let (m3, _) = reader.try_read(c2).unwrap();
+        let (m1, c1) = reader.try_read(0, None).unwrap();
+        let (m2, c2) = reader.try_read(c1, None).unwrap();
+        let (m3, _) = reader.try_read(c2, None).unwrap();
         assert_eq!(m1.lsn, zone_lsn);
         assert_eq!(m2.lsn, zone_lsn);
         assert_eq!(m3.lsn, zone_lsn);
@@ -496,7 +497,7 @@ fn test_batched_push_shares_zone_lsn() {
             let mut set = std::collections::HashSet::new();
             let mut off = 0u64;
             while (off as usize) + 8 < size {
-                let (msg, next) = match reader.try_read(off) {
+                let (msg, next) = match reader.try_read(off, None) {
                     Some(v) => v,
                     None => break,
                 };
@@ -577,9 +578,9 @@ fn test_zone_two_groups_one_sentinel() {
         // Walk on every worker's perspective; assert zone shape.
         for w in 0..nw {
             let reader = SalReader::new(ptr as *const u8, w, size, efds[w as usize]);
-            let (m1, c1) = reader.try_read(0).unwrap();
-            let (m2, c2) = reader.try_read(c1).unwrap();
-            let (m3, _) = reader.try_read(c2).unwrap();
+            let (m1, c1) = reader.try_read(0, None).unwrap();
+            let (m2, c2) = reader.try_read(c1, None).unwrap();
+            let (m3, _) = reader.try_read(c2, None).unwrap();
             assert_eq!(m1.lsn, zone_lsn);
             assert_eq!(m2.lsn, zone_lsn);
             assert_eq!(m3.lsn, zone_lsn);
@@ -632,8 +633,8 @@ fn test_two_groups_same_lsn() {
         );
         assert_eq!(res2.status, 0);
 
-        let rr1 = sal_read_group_header(ptr, 0, 0);
-        let rr2 = sal_read_group_header(ptr, rr1.advance, 0);
+        let rr1 = sal_read_group_header(ptr, 0, 0, None);
+        let rr2 = sal_read_group_header(ptr, rr1.advance, 0, None);
         assert_eq!(rr1.lsn, 42);
         assert_eq!(rr2.lsn, 42);
         assert_eq!(rr1.target_id, 7);
@@ -672,13 +673,13 @@ fn test_sal_cross_process_checkpoint() {
         }
 
         syscall::eventfd_wait(efd, 5000);
-        let rr1 = sal_read_group_header(ptr, 0, 0);
+        let rr1 = sal_read_group_header(ptr, 0, 0, None);
         assert_eq!(rr1.epoch, 1);
         assert_eq!(rr1.lsn, 10);
         syscall::eventfd_signal(efd2);
 
         syscall::eventfd_wait(efd, 5000);
-        let rr2 = sal_read_group_header(ptr, 0, 0);
+        let rr2 = sal_read_group_header(ptr, 0, 0, None);
         assert_eq!(rr2.epoch, 2);
         assert_eq!(rr2.lsn, 20);
 
@@ -687,5 +688,100 @@ fn test_sal_cross_process_checkpoint() {
         free_mmap(ptr, size);
         libc::close(efd);
         libc::close(efd2);
+    }
+}
+
+#[test]
+fn test_sal_prefix_epoch_gate() {
+    // The reader-side epoch gate: the group's (epoch << 32 | payload_size)
+    // prefix is checked BEFORE any header byte is read. A mismatched
+    // expectation parks the reader (no message, cursor unmoved); a matching
+    // or absent expectation reads the group normally.
+    unsafe {
+        let size = 1 << 20;
+        let ptr = alloc_mmap(size);
+
+        let buf = make_test_data(0x5A, 48);
+        let ptrs = [buf.as_ptr()];
+        let sizes = [buf.len() as u32];
+        let res = sal_write_group(ptr, 0, 1, 7, 11, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
+        assert_eq!(res.status, 0);
+
+        let reader = SalReader::new(ptr as *const u8, 0, size, -1);
+
+        // Wrong expected epoch: parked without touching header bytes.
+        assert!(
+            reader.try_read(0, Some(2)).is_none(),
+            "epoch-mismatched slot must park the reader"
+        );
+
+        // Matching epoch: consumable.
+        let (msg, cursor) = reader.try_read(0, Some(1)).expect("matching epoch reads the group");
+        assert_eq!(msg.epoch, 1);
+        assert_eq!(msg.lsn, 11);
+        assert_eq!(msg.target_id, 7);
+        assert_eq!(cursor, res.new_cursor);
+
+        // Ungated recovery read: consumable without knowing the epoch.
+        let (msg, _) = reader
+            .try_read(0, None)
+            .expect("recovery walk reads without an expectation");
+        assert_eq!(msg.epoch, 1);
+
+        free_mmap(ptr, size);
+    }
+}
+
+#[test]
+fn test_sal_prefix_packing_boundaries() {
+    // The (epoch << 32 | payload_size) prefix word must round-trip at the
+    // boundaries: a header-only group (payload_size == GROUP_HEADER_SIZE)
+    // with epoch u32::MAX, and a multi-MiB group with epoch 1.
+    unsafe {
+        let size = 8 << 20;
+        let ptr = alloc_mmap(size);
+
+        // Header-only group (no worker data), epoch u32::MAX.
+        let ptrs0 = [std::ptr::null::<u8>()];
+        let sizes0 = [0u32];
+        let res = sal_write_group(
+            ptr,
+            0,
+            1,
+            0,
+            0,
+            0,
+            u32::MAX,
+            size as u64,
+            ptrs0.as_ptr(),
+            sizes0.as_ptr(),
+        );
+        assert_eq!(res.status, 0);
+        let word = atomic_load_u64(ptr);
+        assert_eq!((word >> 32) as u32, u32::MAX);
+        assert_eq!((word & 0xFFFF_FFFF) as usize, GROUP_HEADER_SIZE);
+        let rr = sal_read_group_header(ptr, 0, 0, None);
+        assert_eq!(rr.epoch, u32::MAX);
+        assert_eq!(rr.advance, (8 + GROUP_HEADER_SIZE) as u64);
+        assert_eq!(res.new_cursor, rr.advance);
+
+        // Multi-MiB group, epoch 1.
+        std::ptr::write_bytes(ptr, 0, size);
+        let big = make_test_data(0xEE, 3 << 20);
+        let ptrs = [big.as_ptr()];
+        let sizes = [big.len() as u32];
+        let res = sal_write_group(ptr, 0, 1, 0, 0, 0, 1, size as u64, ptrs.as_ptr(), sizes.as_ptr());
+        assert_eq!(res.status, 0);
+        let expected_payload = GROUP_HEADER_SIZE + (3 << 20); // 3 MiB is already 8-aligned
+        let word = atomic_load_u64(ptr);
+        assert_eq!((word >> 32) as u32, 1);
+        assert_eq!((word & 0xFFFF_FFFF) as usize, expected_payload);
+        let rr = sal_read_group_header(ptr, 0, 0, Some(1));
+        assert_eq!(rr.status, SAL_STATUS_HAS_DATA);
+        assert_eq!(rr.epoch, 1);
+        assert_eq!(rr.advance, (8 + expected_payload) as u64);
+        assert_eq!(rr.data_size as usize, 3 << 20);
+
+        free_mmap(ptr, size);
     }
 }

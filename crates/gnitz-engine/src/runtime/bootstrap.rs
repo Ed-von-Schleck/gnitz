@@ -64,7 +64,7 @@ fn collect_committed_lsns(sal_reader: &SalReader) -> HashSet<u64> {
     let mut offset: u64 = 0;
     let mut last_epoch: u32 = 0;
     while offset + 8 < sal_reader.mmap_size() {
-        let (msg, new_offset) = match sal_reader.try_read(offset) {
+        let (msg, new_offset) = match sal_reader.try_read(offset, None) {
             Some(v) => v,
             None => break,
         };
@@ -99,7 +99,7 @@ where
     let mut applied: u32 = 0;
     let mut last_epoch: u32 = 0;
     while offset + 8 < sal_reader.mmap_size() {
-        let (msg, new_offset) = match sal_reader.try_read(offset) {
+        let (msg, new_offset) = match sal_reader.try_read(offset, None) {
             Some(v) => v,
             None => break,
         };
@@ -920,7 +920,7 @@ mod recovery_tests {
             let mut applied = 0u32;
             let mut offset = 0u64;
             while (offset as usize) + 8 < size {
-                let (msg, next) = match reader.try_read(offset) {
+                let (msg, next) = match reader.try_read(offset, None) {
                     Some(v) => v,
                     None => break,
                 };

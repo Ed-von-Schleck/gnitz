@@ -565,18 +565,18 @@ impl WorkerProcess {
     ///
     /// `expected_epoch` is re-read on each call: a FLAG_FLUSH dispatched
     /// inline bumps it, and a stale snapshot would cause every
-    /// post-checkpoint message to fail the epoch check forever (spinning
-    /// at an unchanged cursor). The cursor is advanced *only* on a
-    /// successful epoch match — a post-epoch group remains parked at the
-    /// cursor until the cursor is reset by checkpoint.
+    /// post-checkpoint message to fail the prefix epoch gate forever
+    /// (spinning at an unchanged cursor). The cursor is advanced *only* on
+    /// a successful epoch match — a post-epoch group remains parked at the
+    /// cursor until the cursor is reset by checkpoint. The gate lives in
+    /// the reader (`try_read` checks the group's atomically-published
+    /// `(epoch | size)` prefix before touching header bytes), so a stale
+    /// group being overwritten in place by the master is never parsed.
     fn next_sal_message(&mut self) -> Option<(SalMessageKind, i64, Option<&'static [u8]>)> {
         if self.read_cursor + 8 >= self.sal_reader.mmap_size() {
             return None;
         }
-        let (msg, new_cursor) = self.sal_reader.try_read(self.read_cursor)?;
-        if msg.epoch != self.expected_epoch {
-            return None;
-        }
+        let (msg, new_cursor) = self.sal_reader.try_read(self.read_cursor, Some(self.expected_epoch))?;
         self.read_cursor = new_cursor;
         // The ephemeral flush round carries the checkpoint generation in the
         // group header's `lsn` field. Latch it into `worker_ctx` before dispatch
