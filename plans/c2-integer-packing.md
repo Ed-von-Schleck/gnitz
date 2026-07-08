@@ -1,196 +1,148 @@
-# FastLanes integer packing: FoR + bit-packed payload columns in compacted shards
+# Frame-of-reference integer packing: byte-width-truncated payload columns in compacted shards
 
 ## Problem
 
-Integer payload columns are stored raw in shard files — 8 bytes per row for
-an I64 that is usually a small value, a re-keyed ex-PK, or a
-narrow-cardinality attribute. This is the dominant disk cost of the engine's
-DBSP state: every stateful operator keeps a full integral (`_int_` join
-traces of both inputs, `_hist_` distinct history, `_reduce_in_` aggregation
-history), each payload-widened by `map_reindex` (the original PK columns move
-into payload as integers), each duplicated per view. After every checkpoint
-the RAM tier is dropped (`persist_l0_run` clears `in_memory_l0`,
-`storage/lsm/table/flush.rs:277-278`), so shards are the steady-state read
-substrate for every tick — but the per-tick trace access is monotone
-galloping merges and sequential drains, which tolerate materialized-on-open
-columns; only the byte-compared OPK PK region needs in-place random access,
-and it is not touched here.
+Integer payload columns are stored raw in shard files — 8 bytes per row for an
+I64 that is usually a small value, a re-keyed ex-PK, or a narrow-cardinality
+attribute. This is the dominant disk cost of the engine's DBSP state: every
+stateful operator keeps a full integral (`_int_` join traces of both inputs,
+`_hist_` distinct history, `_reduce_in_` aggregation history), each
+payload-widened by `map_reindex` (the original PK columns move into payload as
+integers), each duplicated per view. Payload regions today are encoded only as
+Constant (all rows equal) or Raw (`detect_encoding`, `shard_file.rs:117`;
+TwoValue is weight-only) — so a payload column of a handful of small distinct
+values pays the full 8 bytes/row.
 
-This plan encodes eligible integer payload regions with frame-of-reference +
-FastLanes bit-packing in 1024-row blocks, on **compaction outputs only**.
-Spill/checkpoint L0 shards stay plain — they sit on the mid-epoch latency
-path and are merged away once a table accrues `L0_COMPACT_THRESHOLD = 4` L0
-runs (`storage/lsm/shard_index/mod.rs:35`; `compact_if_needed` runs after
-every spill, `table/flush.rs:400-407`, and on every per-epoch
-`create_cursor_compacting`, `table/mod.rs:420-424`). The savings are
-therefore **disk footprint and read/page-fault volume of the compacted bulk
-(L1/L2 plus compacted L0), amortized post-compaction**; checkpoint-write
-bandwidth itself is unchanged, and up to 4 uncompacted L0 runs per partition
-remain raw at any time. Reads materialize an encoded region once per shard
-open via a safe `OnceCell`-backed decode; all consumers are unchanged.
+After every checkpoint the RAM tier is dropped (`persist_l0_run` clears
+`in_memory_l0`), so shards are the steady-state read substrate for every tick.
+Per-tick trace access is monotone galloping merges and sequential drains, which
+tolerate materialized-on-open columns; only the byte-compared OPK PK region
+needs in-place random access, and it is not touched here.
 
-## Load-bearing facts
+This plan adds a **frame-of-reference (FoR) + byte-width truncation** encoding
+for eligible integer payload regions, on **compaction outputs only**.
+Spill/checkpoint L0 shards stay plain — they sit on the mid-epoch latency path
+and are merged away once a table accrues `L0_COMPACT_THRESHOLD = 4` L0 runs. The
+savings are therefore **disk footprint and read/page-fault volume of the
+compacted bulk (L1/L2 plus compacted L0), amortized post-compaction**;
+checkpoint-write bandwidth is unchanged, and up to 4 uncompacted L0 runs per
+partition remain raw. Reads materialize an encoded region once per shard open
+via a safe `OnceCell`-backed decode; all consumers are unchanged.
 
-### Precondition — the shard-codec-layer restructure (not yet in the tree)
+### Why byte-width truncation, not bit-packing
 
-This plan is **blocked on** a preceding behavior-neutral restructure of the
-shard writer and must not start before it lands. That restructure delivers,
-and this plan assumes as its starting state: a schema-aware writer —
-`write_shard_streaming(dirfd, basename, table_id, row_count, regions,
-schema, durable, flags)` (with `Batch::write_as_shard_with_flags` forwarding
-a `schema: &SchemaDescriptor` param from its compaction call sites and
-`persist_l0_run` passing `&self.schema`) — classifying each region by a
-`RegionRole` (Pk/Weight/NullBmp/Payload{col}/Blob) with one selection
-function owning the role → encoding mapping; and baseline microbenches
-`shard_merge_scan_bench` / `shard_point_probe_bench` in
-`storage/lsm/read_cursor`. On-disk format and reader are untouched by that
-restructure: `SHARD_VERSION == 7`, encodings 0x00/0x01/0x02 =
-Raw/Constant/TwoValue. Everything in this subsection describes that
-delivered state; all other citations in this plan are against the current
-tree.
+The committed encoding stores, per region, one 8-byte reference (the region's
+minimum) and each row's `value − min` truncated to the fewest whole bytes that
+hold the region's offset range. Decode is a widening loop.
 
-### Current tree
+This deliberately trades sub-byte compression ratio for radical simplicity over
+a bit-packing library (FastLanes / FoR-bitpacking): **no new dependency, no SIMD
+`unsafe`, no 1024-row block bookkeeping, no per-block descriptor, byte-aligned
+throughout, portable little-endian.** It captures the win the Problem section
+names — wide integer columns holding small or narrow-range values, 8 → 1–2
+bytes — because that win is at *byte* granularity already. Bit-packing's extra
+leverage (sub-byte widths; per-1024-block adaptivity) is declined on purpose:
+the target columns are arbitrary-order re-keyed ex-PKs and attributes with no
+guaranteed local clustering for per-block widths to exploit, and Constant
+already claims the all-equal case. A byte-truncated row is also independently
+decodable, so a single corrupt byte damages one row's value — unlike
+bit-lane-interleaved packing, where it can smear across a whole block on the
+checksum-skipped read path (most production opens pass `validate_checksums =
+false`).
 
-- Payload regions are read through exactly four surfaces on `MappedShard`
-  (verified exhaustive: `col_regions` is read only in
-  `shard_reader/access.rs` and `open.rs`): `get_col_ptr` (row-at-a-time via
-  `ColumnarSource`, `access.rs:115-131`), `col_ptr_by_logical`
-  (`access.rs:137-172`, serving `ReadCursor::col_ptr` for join/reduce reads,
-  `read_cursor/mod.rs:757-783`, and the point-get `found_row` path,
-  `table/mod.rs:181`), `to_unified` (`access.rs:353-407`, serving compaction
-  scatter `compact/merge.rs:102` and cursor drains
-  `read_cursor/output.rs:322-330`), and `slice_to_owned_batch`
-  (`access.rs:244-336`, the single-source drain fast path,
-  `read_cursor/output.rs:212-217`). All four can serve from an owned decoded
-  buffer with a stable address; none require the bytes to live in the mmap.
-- `to_unified` and `slice_to_owned_batch` touch **every** payload column
-  (`access.rs:385-397`, `:310-314`) — a drain or compaction over a packed
-  shard decodes all of its payload regions, not just "hot" ones.
-- Expression evaluation never reads shard memory — `eval_batch` runs only
-  over owned delta batches in VM registers (`expr/batch.rs:1-16`,
-  `query/vm/exec.rs:178-236`).
-- `MappedShard` is `Rc`-owned, single-threaded (`read_cursor/source.rs:25`;
-  no `Arc<MappedShard>`, no thread spawns in compact/flush paths);
-  `OnceCell<Box<[u8]>>` decode is safe Rust and its content address is
-  stable for the shard's lifetime, matching `to_unified`'s existing "caller
-  keeps `self` alive" pointer contract (`access.rs:346-348`).
-- Compaction writes every long-lived shard: `compact_routed`
-  (`storage/lsm/compact/merge.rs:62-144`) via
-  `Batch::write_as_shard_with_flags` (`merge.rs:137`, `compact/mod.rs:1158`,
-  `:1324`). Compaction opens up to `L1_TARGET_FILES = 16` inputs at once
-  (`shard_index/mod.rs:34-38`) and `to_unified`s all of them
-  (`merge.rs:102`). Spill/checkpoint L0 shards come only from
-  `Table::persist_l0_run` (`table/flush.rs:241-280`).
-- Point probes (`Table::has_pk_bytes`, `table/mod.rs:496-508`) read PK bytes
-  and weights only (`scan_shards_for_pk_bytes` with `need_candidates =
-  false`) — no payload region, no decode. The point-**get**/retract path
-  (`found_row`, `table/mod.rs:665-669`, then `get_col_ptr` at
-  `table/mod.rs:181`) does read single payload cells from a shard row.
-- Directory entries carry per-region `{offset, size, xxh3, encoding u8}`;
-  checksums cover the **encoded** bytes (`shard_file.rs:339-364`). Region
-  starts are 64-byte aligned (`ALIGNMENT = 64`, `layout.rs:7`; `align64`,
-  `shard_file.rs:21-23`).
-- Eligible type codes (`gnitz-wire/src/types.rs:5-18`): `is_fixed_int`
-  (`types.rs:259`) admits exactly U8=1, I8=2, U16=3, I16=4, U32=5, I32=6,
-  U64=8, I64=9 (strides 1/2/4/8) — floats (F32=7, F64=10) and all 16-byte
-  codes (STRING=11, U128=12, UUID=13, BLOB=14, I128=15) are outside it, so
-  `is_fixed_int(col.type_code)` alone is the eligibility predicate.
-- NULL cells occupy normal payload bytes, zeroed by writers
-  (`fill_col_zero`, e.g. `ops/join/rowwrite.rs:29`); comparisons consult the
-  null word first (`storage/repr/columnar.rs:47-61`). Packing is bit-exact
-  on whatever bytes are stored, so correctness needs no special casing — but
-  a NULL's zero cell does join the block's `[min, max]`, so a
-  large-magnitude column with occasional NULLs packs at the width its range
-  spans down to zero (a ratio cost, not a correctness one).
-- The engine's on-disk regions are little-endian throughout (§6 region
-  convention); this plan's packed payloads add one more LE-only surface
-  (below). `fsync`/checksum plumbing is unaffected.
-- The `fastlanes` crate (spiraldb), v0.5.2, Apache-2.0, `no_std`,
-  deps: `const_for`, `core_detect`, `num-traits`, `paste`, `seq-macro`.
-  Exercised in production by Vortex (`vortex-fastlanes`). API facts
-  (docs.rs/fastlanes):
-  - `BitPacking` implemented for `u8/u16/u32/u64` **only** (no u128, no
-    signed types). Blocks are exactly **1024 elements**; a packed block is
-    `1024 * W` bits = **`128 * W` bytes** for every element type.
-  - Runtime-width entry points (the intended dispatch — no hand-written
-    match over widths):
-    `unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self])`,
-    `unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self])`.
-    Preconditions (debug-checked only): exact slice lengths
-    (1024 unpacked, `1024*W/T::BITS` packed elements), `width <= T::BITS`.
-  - `FoR` trait: `unsafe fn unchecked_unfor_pack(width, input, reference: Self,
-    output)` — fused unpack + **wrapping add** of `reference`.
-  - No partial-block API: the caller pads the tail block to 1024 and tracks
-    the true count (the Vortex convention).
-  - MSRV 1.91 (repo policy: stable Rust, nothing version-pinned — satisfied).
+## Load-bearing facts (current tree)
+
+The schema-aware shard writer is already in the tree (delivered by the shipped
+codec-layer refactor, commit `447206e8`):
+
+- `Batch::write_as_shard(path, table_id, schema, flags)` (`batch_wire.rs:28`)
+  forwards `&SchemaDescriptor` into `write_shard_streaming(dirfd, basename,
+  table_id, row_count, regions, schema, durable, flags)` (`shard_file.rs:221`),
+  which sizes regions from the schema via `strides_from_schema`. Region roles
+  are **index-based**, not a `RegionRole` enum (none exists): `REG_PK = 0`,
+  `REG_WEIGHT = 1`, `REG_NULL_BMP = 2`, `REG_PAYLOAD_START = 3`
+  (`storage/repr/batch.rs:44-47`); the trailing index `nr` is the blob region.
+  Encoding selection is inline in `write_shard_streaming_inner`'s Phase-1 loop
+  (`shard_file.rs:301-305`): `detect_weight_encoding` for `REG_WEIGHT`, else
+  `detect_encoding`.
+- `SHARD_VERSION == 7` (`layout.rs:4`); encodings `0x00`/`0x01`/`0x02` =
+  Raw/Constant/TwoValue (`layout.rs:17-19`). Directory entries carry per-region
+  `{offset, size, xxh3, encoding u8}`; checksums cover the **encoded** bytes and
+  are validated in `open()` before any region view is built. Region starts are
+  64-byte aligned.
+- Payload regions are read through exactly four `MappedShard` surfaces (verified
+  exhaustive — `col_regions` / `ScalarRegion` are referenced only in
+  `shard_reader/{open,access}.rs`): `get_col_ptr` (row-at-a-time),
+  `col_ptr_by_logical` (join/reduce reads + point-get `found_row`), `to_unified`
+  (compaction scatter + cursor drains), `slice_to_owned_batch` (single-source
+  drain fast path). All four can serve from an owned decoded buffer with a
+  stable address; none require the bytes to live in the mmap. `to_unified` and
+  `slice_to_owned_batch` touch **every** payload column, so a drain or
+  compaction over a packed shard decodes all of its packed payload regions.
+- Point probes (`Table::has_pk_bytes`) read PK bytes and weights only — no
+  payload region, no decode. The point-**get** path (`found_row` →
+  `get_col_ptr`) does read single payload cells from a shard row.
+- Eligible type codes: `is_fixed_int` (`gnitz-wire/src/types.rs`) admits
+  U8/I8/U16/I16/U32/I32/U64/I64 (strides 1/2/4/8); floats (F32/F64) and all
+  16-byte codes are excluded, so `is_fixed_int(col.type_code)` alone is the
+  eligibility predicate. `col.size()` is pinned to the type code by a
+  compile-time round-trip assertion, so stride and eligibility can never
+  disagree.
+- NULL cells occupy normal payload bytes, zeroed by writers; `compare_rows`
+  consults the null bitmap and short-circuits *before* reading a NULL cell's
+  bytes. FoR is an exact wrapping-sub/add pair, so a zeroed NULL cell round-trips
+  to zero exactly — packing needs no NULL special-casing (a NULL's zero does join
+  the region's `[min, max]`, a ratio cost only, not a correctness one).
+- `MappedShard` is `Rc`-owned and single-threaded; an `OnceCell`-backed decode
+  is safe Rust with a lifetime-stable content address, matching `to_unified`'s
+  "caller keeps `self` alive" pointer contract. Compaction writes every
+  long-lived shard (`compact_routed` via `write_as_shard`, `compact/merge.rs:137`,
+  `compact/mod.rs:1158`, `:1324`), opening up to `L1_TARGET_FILES = 16` inputs at
+  once; L0 spill shards come only from `persist_l0_run`.
 
 ## Committed design
 
-### Encoding: `ENCODING_PACKED = 0x03`, payload regions only
+### Encoding: `ENCODING_FOR = 0x03`, integer payload regions only
 
-Eligibility: `RegionRole::Payload { col }` with
-`is_fixed_int(col.type_code)`, `row_count > 0`, and the writer's
-`pack_ints` policy bit set (below). Selection order per payload region:
-Constant first (unchanged), then Packed, else Raw. Packed is kept only if it
-is strictly smaller than raw (`encoded_size < count * stride`); otherwise
-Raw. Deterministic — no sampling, no tuning knob.
+Eligibility: a payload region (`REG_PAYLOAD_START ≤ i < nr`) whose column is
+`is_fixed_int`, with `row_count > 0` and the writer's `pack_ints` policy bit set
+(below). Selection order per payload region: Constant first (unchanged), then
+FoR, else Raw.
 
-**Region layout** (all offsets relative to the region start, which is
-64-byte aligned):
+**Region layout** (region start is 64-byte aligned):
 
 ```
-refs:    nb × u64 LE      — per-block FoR reference (native value's bit
-                            pattern zero-extended to 64 bits)
-widths:  nb × u8          — per-block packed bit width W ∈ [0, 8*stride]
-pad:     to 8-byte alignment
-blocks:  concatenated packed payloads, block i occupying 128 * W_i bytes
+ref:    8 bytes LE          — frame reference = region min's bit pattern, zero-extended to u64
+values: count × bw bytes LE — each row's (value − min) truncated to its low bw bytes
 ```
 
-`nb = count.div_ceil(1024)`. Block payload offsets are the running prefix
-sum of `128 * W_i` — recomputed during the (single, sequential) decode, never
-stored. `W_i == 0` (block constant at `ref_i`) contributes zero payload
-bytes. Every block start is 8-byte aligned (region start 64-aligned; refs
-`8·nb` + widths `nb` padded to 8; each block length `128·W` is a multiple of
-8), so the packed bytes can be viewed as `&[u64]`/`&[u32]`/… without
-unaligned access.
+`bw` is any width in `[1, stride)`; the encoded size is `8 + count·bw`, byte-
+aligned with no interior padding. (U8/I8 columns, stride 1, can never pack.)
 
-**Encode** (writer phase 1, per eligible region; monomorphized over
-`T ∈ {u8, u16, u32, u64}` selected by `col.size()`):
+**Encode** (one pass over `widen(v)`, the row cell widened to u64):
 
-```rust
-// Per block of ≤1024 values:
-//  1. min/max in the column's order — signed compare for signed type codes,
-//     unsigned otherwise (order only affects the offset range, never
-//     correctness: offsets are wrapping, decode wraps back).
-//  2. offsets[j] = v[j].wrapping_sub(min)  (tail padded with `min` → offset 0)
-//  3. W = T::BITS - max_offset.leading_zeros()
-//  4. if W > 0 { unsafe { T::unchecked_pack(W, &offsets, &mut packed[..1024*W/T::BITS]) } }
+```
+// widen(v): sign-extend to i64→u64 for signed type codes, zero-extend for
+// unsigned — the existing read_signed / read_unsigned convention (schema.rs).
+lo = min widen(v) ; hi = max widen(v)                  // column's signed/unsigned order
+max_offset = hi.wrapping_sub(lo)                       // the true value span
+bw = (64 - max_offset.leading_zeros()).div_ceil(8)     // whole bytes, 1..=8
+keep FoR iff bw < stride AND 8 + count·bw < count·stride
+ref = lo                                               // = widen(min), stored as 8 LE bytes
+per row: offset = widen(v).wrapping_sub(ref)           // store low bw bytes LE
 ```
 
-The encoder computes offsets itself (a trivially vectorizable
-`wrapping_sub` loop) rather than relying on `for_pack`'s subtract semantics;
-decode uses the fused `unchecked_unfor_pack` whose wrapping-add exactly
-inverts it. Signed types (`I8/I16/I32/I64`) take `min` in signed order and
-carry its bit pattern as the reference: `v.wrapping_sub(min)` as unsigned
-then spans exactly `[0, smax − smin]`, so mixed-sign blocks pack to the true
-signed range instead of degenerating to full width. (Extremes are covered:
-`min = MIN, max = MAX` gives `max_offset = u64::MAX` → `W = 64` → the
-encoded region is not smaller than raw → Raw by the size rule.)
-
-The encoded region bytes are assembled into an owned buffer (like today's
-TwoValue path, `shard_file.rs:332,356-362`), checksummed, and pwritten;
-`actual_sizes[i]` is the encoded size.
-
-**Policy** — `write_shard_streaming` gains a `pack_ints: bool` parameter
-(threaded like `flags`): `true` from `Batch::write_as_shard_with_flags`'
-compaction callers (`compact/merge.rs:137`, `compact/mod.rs:1158`, `:1324`),
-`false` from `persist_l0_run` and from `write_as_shard` (test-only). L0
-spill/checkpoint shards therefore stay plain; every compaction output packs.
-Rationale: spills run mid-epoch on the latency path and their data is merged
-away at the L0 threshold; compaction is the amortized rewrite that produces
-the shards the per-tick merges live on. Consequence stated plainly:
-checkpoint write bandwidth does not shrink, and a table's ≤ 4 pending L0
-runs are always raw — the packing ratio applies to the compacted bulk.
+The size test is closed-form from the one min/max scan — **no** value buffer is
+allocated to measure a region that ends up Raw. The widening **must** match the
+column's signedness: sign-extend for signed type codes, zero-extend for unsigned
+(`read_signed` / `read_unsigned` in `schema.rs`). Zero-extending a *signed*
+negative leaves its set sign bit in the high bytes, so any range spanning zero
+computes `max_offset ≈ 2^64` and is silently forced to Raw — the common
+signed-attribute / delta / negative-with-a-NULL-zero case would never pack. With
+the correct extension a signed column with negatives frames on its signed min, so
+`[smin, smax]` packs to `smax − smin`. Extremes fall back to Raw by the size test
+(`min = MIN, max = MAX` ⇒ `bw ≥ stride`). Decode needs no signedness flag: it
+reads the 8-byte `ref` (already sign/zero-extended at encode) and adds.
 
 ### Decode: `ScalarRegion::Packed`, materialized once per shard open
 
@@ -199,167 +151,167 @@ runs are always raw — the packing ratio applies to the compacted bulk.
 pub(crate) enum ScalarRegion {
     Raw { offset: usize, size: usize },
     Constant { value: [u8; 16], offset: usize },
-    /// FoR + FastLanes-packed integer payload region. `decoded` lazily holds
-    /// the full `count × elem_width` little-endian image; every accessor
-    /// serves from it. Populated at most once per shard open; the content
+    /// FoR + byte-width-truncated integer payload region. `decoded` lazily holds
+    /// the full `count × elem_width` little-endian image. Backed by `Box<[u64]>`
+    /// (8-aligned) so `col_ptr_by_logical` hands out naturally-aligned pointers,
+    /// matching the `Constant` variant's mmap-offset contract and the reader
+    /// tests' typed reads. Populated at most once per shard open; the content
     /// address is stable for the shard's lifetime.
-    Packed {
-        offset: usize,
-        size: usize,
-        elem_width: usize,
-        decoded: OnceCell<Box<[u8]>>,
-    },
+    Packed { offset: usize, size: usize, elem_width: usize, decoded: OnceCell<Box<[u64]>> },
 }
 ```
 
-`MappedShard` gains one private method, the single decode site:
+Single decode site on `MappedShard`:
 
 ```rust
 fn packed_bytes(&self, region: &ScalarRegion) -> &[u8] {
     let ScalarRegion::Packed { offset, size, elem_width, decoded } = region else { unreachable!() };
-    decoded.get_or_init(|| {
-        // Sequential walk: refs[], widths[], prefix-sum offsets; for each
-        // block: W == 0 → splat ref; else unchecked_unfor_pack(W, block,
-        // ref as T, out_block). Tail block decodes into a stack [T; 1024]
-        // scratch, then copies count % 1024 elements.
-        decode_packed_region(&self.data()[*offset..*offset + *size], self.count, *elem_width)
-    })
+    let words = decoded.get_or_init(|| decode_for_region(
+        &self.data()[*offset..*offset + *size], self.count, *elem_width));
+    let byte_len = self.count * *elem_width;
+    // SAFETY: `words` is 8-aligned and holds ≥ byte_len bytes.
+    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, byte_len) }
 }
 ```
 
-Accessor arms:
+`decode_for_region` reads `ref` (first 8 bytes), derives `bw = (size − 8) /
+count`, and for each row: read the row's `bw` bytes LE → zero-extend to u64 →
+`wrapping_add(ref)` → write the low `elem_width` bytes LE into the output. Pure
+byte copies — no `unsafe` reinterpret, no SIMD, no block or tail special case.
+The uniform u64 add-then-truncate reconstructs every width's bit pattern exactly
+(borrow bits above `elem_width` are discarded on the final truncation), so it is
+byte-exact for signed narrow types with negative minimums.
 
-- `get_col_ptr` → `&self.packed_bytes(region)[row * cs..][..cs]`.
-- `col_ptr_by_logical` → `self.packed_bytes(region).as_ptr().add(row * col_size)`
-  (bounds-checked like the Raw arm).
-- `to_unified` → `ColPtr { base: self.packed_bytes(region).as_ptr(), stride: cs }`.
-- `slice_to_owned_batch`'s `expand_scalar` → copy from
-  `packed_bytes(region)` at `start * stride` (one memcpy, same as Raw).
+Accessor arms all serve from `packed_bytes` at the same `row * elem_width`
+offset the Raw arm uses: `get_col_ptr` (slice), `col_ptr_by_logical` (pointer),
+`to_unified`'s per-column `ColPtr { base, stride }`, and `slice_to_owned_batch`'s
+`expand_scalar` memcpy. PK, weight, and null regions are never Packed.
 
-PK stays `Raw`/`Constant` only (Packed on region 0 rejected at open — the
-memcmp binary search, gallop, and XOR8 build read OPK bytes in place and are
-untouched). Weight and null regions are untouched.
+**Open-time validation and role restriction.** `ENCODING_FOR` is legal **only on
+payload column directory entries**. `build_scalar_region` gains an `allow_for`
+flag — `true` only in the payload-column loop; the PK and null-bitmap calls pass
+`false`, and a `false` site seeing `ENCODING_FOR` returns `InvalidShard`.
+`build_weight_region` and the blob-entry read likewise reject any encoding
+outside their legal set (weight: Raw/Constant/TwoValue; blob: Raw). On an
+accepted payload entry, validate `size == 8 + count·bw` with `1 ≤ bw < stride`;
+after that `decode_for_region` is infallible (pure arithmetic on validated
+bounds), keeping `to_unified` infallible. Adding the variant forces a new match
+arm at **every** `ScalarRegion` site in `access.rs` (Rust exhaustiveness catches
+each — nothing is silently skipped): the payload-serving sites (`get_col_ptr`,
+`col_ptr_by_logical`'s payload branch, `to_unified`'s payload loop, and
+`slice_to_owned_batch`'s `expand_scalar` when it serves a payload column) decode
+via `packed_bytes`; the PK-only and null-bmp-only sites (`get_pk`, `get_pk_bytes`,
+`get_null_word`, the PK/null-bmp branches of `col_ptr_by_logical` / `to_unified`,
+and `expand_scalar` when it serves PK/null-bmp) are `unreachable!()`, sound
+because open rejects Packed on every non-payload entry.
 
-**Unsafe inventory.** Three `fastlanes` calls (`unchecked_pack`,
-`unchecked_unpack` for the tail scratch, `unchecked_unfor_pack`) plus the
-`&[u8]` ↔ `&[T]` reinterpretations feeding them (on encode: over owned,
-naturally-aligned buffers; on decode: over the mmap'd packed blocks, whose
-8-byte alignment the region layout guarantees, asserted in debug). The
-reinterpret is little-endian-only — packed words are stored as native-`T`
-LE, consistent with every other region in the format. There is no existing
-typed-slice-over-mmap precedent in the tree, so each cast site carries a
-`// SAFETY:` comment stating the alignment/length invariant it relies on;
-no `bytemuck` dependency (two call sites do not justify one).
+### Policy
 
-**Open-time validation** (`build_scalar_region`'s Packed arm, payload
-entries only; Packed on pk/null/weight/blob entries → `InvalidShard`):
-region size ≥ `9 * nb` padded; per-block `W_i <= 8 * elem_width`;
-`descriptor_end + Σ 128·W_i == size`. After validation, decode cannot fail —
-`decode_packed_region` is infallible (pure arithmetic on validated bounds),
-keeping `to_unified` infallible (`read_cursor/source.rs:102-114`).
+`write_shard_streaming` gains a `pack_ints: bool` parameter (threaded like
+`flags`): `true` from `write_as_shard`'s compaction callers (`compact/merge.rs:137`,
+`compact/mod.rs:1158`, `:1324`), `false` from `persist_l0_run` and from the
+test-only direct `write_as_shard` calls. L0 spill/checkpoint shards stay plain;
+every compaction output packs. Consequence, stated plainly: checkpoint write
+bandwidth does not shrink, and a table's ≤ 4 pending L0 runs are always raw — the
+ratio applies to the compacted bulk.
 
-**Memory accounting (accepted trade, stated honestly).** A decoded region
-lives as long as its `MappedShard` is open, and any drain, scan, or
-compaction over the shard decodes **all** of its packed payload columns
-(`to_unified` builds every column's `ColPtr`). Peak RSS for a scanned packed
-shard is therefore the decoded raw-size heap **plus** whatever packed file
-pages the decode faulted in — more than today's raw-only page cache for the
-same shard, with the difference that the packed pages are reclaimable page
-cache while the decoded heap is pinned until shard close. Compaction
-transiently decodes all payload columns of up to 16 input shards at once
-(`merge.rs:102`), on top of the output batch it already materializes today.
-The point-get path (`found_row` → `get_col_ptr`) pays a whole-region decode
-for its first single-cell read on a shard — a first-touch cliff bounded by
-one decode per column per shard open. What shrinks: disk footprint,
-compacted-read page-fault volume (boot resume, backfills, cold scans), and
-the bytes a *probe-only* shard occupies (probes decode nothing). What does
-not shrink: steady-state RSS of actively scanned tables, checkpoint write
-bandwidth.
+### Memory accounting (accepted trade, stated honestly)
+
+A decoded region lives as long as its `MappedShard` is open, and any drain,
+scan, or compaction over the shard decodes **all** of its packed payload
+columns. For a hot, actively-scanned trace shard the `OnceCell` laziness
+essentially never helps: the first tick after the shard opens decodes and
+**pins** the full raw-size image, and `compact_if_needed` runs on the per-tick
+VM path, so a freshly-compacted packed shard takes that decode synchronously on
+its next read, not only at cold boot. Net RSS for such a shard therefore **can
+rise**, not merely stay flat: what was reclaimable raw page cache becomes a
+pinned decoded heap allocation (freed only at shard close) plus the smaller,
+reclaimable packed page cache. The point-get path pays a whole-region decode for
+its first single-cell read on a shard.
+
+What shrinks: disk footprint, compacted-read page-fault volume (boot resume,
+backfills, cold scans), and the bytes a *probe-only* shard occupies (probes
+decode nothing). What does not shrink and may regress under memory pressure:
+steady-state RSS of actively scanned tables; checkpoint write bandwidth. **The
+value case rests on disk and cold-read savings, not RAM** — a memory-pressure
+test (many long-lived L1/L2 shards, constrained RSS ceiling) gates acceptance
+(Testing).
 
 ### Format: version 8
 
-`SHARD_VERSION` 7 → 8 (`layout.rs`); `ENCODING_PACKED = 0x03` added to
-`layout.rs` and the open-time known-encoding check (`open.rs:71-73`). The
-bump is a hard break with no migration: on an un-wiped data dir the reader
-fails `MappedShard::open` with `InvalidVersion` at boot/resume — base-table
-shards have no self-healing gate, so the failure mode is a boot error, not
-a rebuild; data dirs are wiped across format bumps (pre-alpha convention).
-`STATE_FORMAT` (`storage/lsm/manifest.rs:45`, the resume-topology knob)
-deliberately stays 1 — it
-gates resume-vs-rebuild of *views*, and bumping it cannot save an un-wiped
-dir whose base shards are unreadable anyway. Stale version strings updated
-in the same commit: the `"must write V7"` assert message
-(`shard_file.rs:586`), the "Old v7 shards" comment (`open.rs:219-221`), the
-"V7 format decision" comment (`storage/lsm/manifest.rs:78`).
-
-### Dependency
-
-`fastlanes = "0.5"` in `crates/gnitz-engine/Cargo.toml`.
+`SHARD_VERSION` 7 → 8 (`layout.rs`); `ENCODING_FOR = 0x03` added and admitted by
+the open-time known-encoding check (`open.rs:73`) only via the role-aware paths
+above. The bump is a hard break with no migration: on an un-wiped data dir the
+reader fails `MappedShard::open` with `InvalidVersion` at boot — data dirs are
+wiped across format bumps (pre-alpha convention). `STATE_FORMAT` stays 1 (it
+gates view resume, and cannot save a dir whose base shards are unreadable
+anyway). Stale V7 strings updated in the same commit (the `shard_file.rs`
+assert message, the `open.rs` / `manifest.rs` comments).
 
 ### Explicitly out of scope
 
-- Floats (F32/F64) and 16-byte types (U128/UUID/I128, German-string structs)
+- Floats (F32/F64) and all 16-byte types (U128/UUID/I128, German-string structs)
   — stay Raw/Constant.
-- The PK region, weight, null, and blob regions.
-- Packing spill/checkpoint L0 shards (`pack_ints = false` there by design,
-  not deferral).
-- Delta/RLE/dictionary encodings, per-block min-key indexes, and any
-  block-granular (partial-region) decode: the committed decode unit is the
-  whole region, once per shard open.
+- The PK, weight, null, and blob regions.
+- Packing spill/checkpoint L0 shards (`pack_ints = false` there by design).
+- Bit-packing, per-block widths, delta/RLE/dictionary encodings, and any
+  partial-region (block-granular) decode: whole-region byte-width is the
+  committed granularity and the whole region decodes once per shard open.
+- String/blob payload compression (a separate concern).
 - The WAL/SAL block format (client wire surface).
 
 ## Sequencing
 
-- [ ] **Codec module.** `storage/lsm/pack.rs`: `encode_packed_region` /
-      `decode_packed_region` / `packed_encoded_size`, monomorphized over
-      u8/u16/u32/u64 with signed-min handling by type code. Exhaustive unit
-      tests (below) including `i64::MIN/MAX` mixes and W=0 blocks. Add the
-      `fastlanes` dependency. `make verify`.
+- [ ] **Codec + measurement gate.** `encode_for_region` / `decode_for_region` /
+      `for_encoded_size`, alongside `detect_encoding` in `shard_file.rs` (no new
+      module — the codec is ~30 lines). Exhaustive unit tests (below). **Before
+      the format bump:** a throwaway pass computing `for_encoded_size` over the
+      integer payload columns of a real compacted `_int_` / `_hist_` /
+      `_reduce_in_` shard, plus a decode-throughput microbench — record the
+      compacted-shard size reduction and decode values/s in the commit message,
+      and proceed only if the ratio justifies the irreversible format bump.
+      `make verify`.
 - [ ] **Writer + reader + v8, one commit** (the version bump makes a split
-      unbuildable: after the bump every shard the old reader arm opens would
-      fail, so writer and reader land together). `pack_ints` parameter
-      threaded through `write_shard_streaming{,_inner}` /
-      `write_as_shard_with_flags`; Packed selection for eligible payload
-      regions; compaction callers pass `true`, `persist_l0_run` `false`;
-      `ScalarRegion::Packed`, `packed_bytes`, the four accessor arms,
-      open-time validation and role restrictions; `SHARD_VERSION = 8`,
-      `ENCODING_PACKED = 0x03`, stale-V7 string updates. Roundtrip +
-      rejection tests in the same commit. `make verify` + `make e2e` (W=4).
-- [ ] **Benches.** Extend `shard_merge_scan_bench` /
-      `shard_point_probe_bench` with packed-shard variants; add
-      `packed_decode_bench` (region decode throughput, values/s) and a
-      packed-input compaction variant (compact 4 packed vs 4 raw inputs —
-      pins the decode-inputs + re-encode-output cost). Run `make bench`
-      before/after and compare `summary.json`; judge merge-scan deltas by
-      the microbench (e2e has ±3-4% noise); record the compacted-shard size
-      reduction on the bench dataset in the commit message. `make verify` +
-      `make e2e`.
+      unbuildable: after the bump the old reader would fail on every new shard, so
+      writer and reader land together). `pack_ints` threaded through
+      `write_shard_streaming{,_inner}` / `write_as_shard`; FoR selection for
+      eligible payload regions (compaction callers `true`, `persist_l0_run`
+      `false`); `ScalarRegion::Packed`, `packed_bytes`, the four accessor arms,
+      `allow_for` role-aware rejection (payload-only; PK/weight/null/blob →
+      `InvalidShard`) and size validation; `SHARD_VERSION = 8`, `ENCODING_FOR =
+      0x03`, stale-V7 string updates. Roundtrip + rejection tests in the same
+      commit. `make verify` + `make e2e` (W=4).
+- [ ] **Benches + memory-pressure test.** Extend `shard_merge_scan_bench` /
+      `shard_point_probe_bench` with packed-shard variants; add a packed-input
+      compaction variant (decode 4 packed inputs → merge → re-encode); run a
+      constrained-RSS test over many long-lived L1/L2 packed shards to confirm no
+      unacceptable resident-memory regression. Run `make bench` before/after and
+      compare `summary.json`; judge merge-scan deltas by the microbench (e2e has
+      ±3-4% noise). `make verify` + `make e2e`.
 
 ## Testing
 
-- Codec unit tests: roundtrip over seeded-random blocks for every eligible
-  type code × widths {sparse small values, dense full-range, all-equal
-  (W=0), mixed-sign for signed types, `MIN`/`MAX` extremes, exact-1024 and
-  ragged tails (1, 1023, 1025 rows)}; encoded-size formula matches
-  `packed_encoded_size`; byte-exact reproduction of input (bit-pattern
-  equality, including whatever bytes NULL cells carried); NULL-zero
-  widening case (large values + zeros packs at full-span width, still
-  roundtrips).
-- Reader tests: packed shard roundtrip through all four surfaces —
-  `get_col_ptr` per row, `col_ptr_by_logical` (including a
-  `found_row`-shaped single-cell read), a multi-source cursor drain
-  (`to_unified` scatter) against a Raw-shard control producing
-  byte-identical batches, and `slice_to_owned_batch` slices;
-  `packed_bytes` pointer stable across calls; forged Packed encoding on
-  pk/weight/null/blob dir entries → `InvalidShard`; truncated descriptor /
-  oversized `W` / size-sum mismatch → `InvalidShard`; checksum over encoded
-  bytes still caught by `validate_checksums` on a corrupted packed region.
+- Codec unit tests: roundtrip over seeded-random regions for every eligible type
+  code — {small unsigned values (bw 1/2), high-floor unsigned ranges (FoR drops a
+  byte), signed with negative min (frames on the signed min), all-equal (→
+  Constant wins first), `MIN`/`MAX` extremes (→ Raw by the size test), NULL-zero
+  cells among large values (bit-exact zero round-trip), row counts 1 / 1023 /
+  1024 / 10000}; `for_encoded_size` matches the emitted size; byte-exact
+  reproduction of input (bit-pattern equality, including whatever bytes NULL
+  cells carried).
+- Reader tests: packed shard roundtrip through all four surfaces against a
+  Raw-shard control producing byte-identical batches (including a `found_row`-
+  shaped single-cell read and a multi-source `to_unified` drain); `packed_bytes`
+  pointer stable across calls and 8-byte aligned; forged `ENCODING_FOR` on
+  pk/weight/null/blob dir entries → `InvalidShard`; `size ≠ 8 + count·bw` or
+  `bw ∉ [1, stride)` → `InvalidShard`; checksum over encoded bytes still caught
+  by `validate_checksums` on a corrupted packed region.
 - Compaction integration: ingest mixed-type rows (incl. nullable ints and
   strings) into a `Table`, spill, compact; assert compaction outputs carry
-  `ENCODING_PACKED` on eligible columns (read the dir entry), L0 spill
-  shards do not; cursor reads and point probes over the packed table match
-  a RAM-only control with weight-verified equality; re-compaction of packed
-  inputs (decode → merge → re-encode) preserves content.
+  `ENCODING_FOR` on eligible columns (read the dir entry) and L0 spill shards do
+  not; cursor reads and point probes over the packed table match a RAM-only
+  control with weight-verified equality; re-compaction of packed inputs (decode →
+  merge → re-encode) preserves content.
 - Full `make verify` + `make e2e` (W=4) after every checkbox — the existing
-  ~1100-test e2e suite over compacted views is the behavioral regression
-  net, since packing is transparent above `MappedShard`.
+  ~1100-test e2e suite over compacted views is the behavioral regression net,
+  since packing is transparent above `MappedShard`.
