@@ -77,23 +77,31 @@ fn validate_index_col_type(tc: TypeCode) -> Result<(), ClientError> {
     Ok(())
 }
 
-/// Decode the persisted PK-list `u64` (from `TABLE_TAB.pk_col_idx`) into a
-/// `Vec<usize>` for the `Schema` type. The shared `gnitz_wire::unpack_pk_cols`
-/// handles both the bare-scalar (pre-compound) row form and the packed
-/// compound form. Rejects a malformed count (`is_well_formed`) — an empty or
-/// over-`PK_LIST_MAX_COLS` payload the server's `validate_pk_cols` would have
-/// rejected too; silently truncating here would hide the divergence from the
-/// client.
-fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
+/// Unpack a persisted column-list `u64` (`TABLE_TAB.pk_col_idx`,
+/// `IDX_TAB.source_col_idx`). The shared `gnitz_wire::unpack_pk_cols` handles
+/// both the bare-scalar (pre-compound) row form and the packed compound form.
+/// Rejects a malformed count (`is_well_formed`) — an empty or
+/// over-`PK_LIST_MAX_COLS` payload the server would have rejected too;
+/// silently truncating here would hide the divergence from the client.
+fn unpack_well_formed(packed: u64) -> Result<gnitz_wire::PkColList, ClientError> {
     let pkl = gnitz_wire::unpack_pk_cols(packed);
     if !pkl.is_well_formed() {
         return Err(ClientError::ServerError(format!(
-            "PK column count {} out of range 1..={}",
+            "packed column-list count {} out of range 1..={}",
             pkl.decoded_count(),
             gnitz_wire::PK_LIST_MAX_COLS
         )));
     }
-    Ok(pkl.as_slice().iter().map(|&c| c as usize).collect())
+    Ok(pkl)
+}
+
+/// Decode the persisted PK-list `u64` into a `Vec<usize>` for the `Schema` type.
+fn decode_pk_cols(packed: u64) -> Result<Vec<usize>, ClientError> {
+    Ok(unpack_well_formed(packed)?
+        .as_slice()
+        .iter()
+        .map(|&c| c as usize)
+        .collect())
 }
 
 fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
@@ -401,16 +409,8 @@ impl GnitzClient {
         if let Some(b) = batch {
             // None ⇒ changed-to-empty list
             for i in b.live_rows() {
-                let cols = gnitz_wire::unpack_pk_cols(b.pks.get(i) as u64);
-                if !cols.is_well_formed() {
-                    return Err(ClientError::ServerError(format!(
-                        "index column count {} out of range 1..={}",
-                        cols.decoded_count(),
-                        gnitz_wire::PK_LIST_MAX_COLS
-                    )));
-                }
                 fresh.push(IndexMeta {
-                    cols,
+                    cols: unpack_well_formed(b.pks.get(i) as u64)?,
                     is_unique: col_u64(&b.columns[1], i)? != 0,
                 });
             }
@@ -544,45 +544,14 @@ impl GnitzClient {
         if count == 0 {
             return Ok(());
         }
-        // Bulk-fill payload columns directly. BatchAppender is single-PK only
-        // (its cursor mapping calls `pk_index_single`), so the delete path
-        // bypasses it. The server's `retract_pk` matches by PK alone, so the
-        // payload bytes are inert filler.
-        let columns: Vec<ColData> = schema
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(ci, col)| {
-                if schema.is_pk_col(ci) {
-                    ColData::Fixed(vec![])
-                } else {
-                    match col.type_code {
-                        TypeCode::String => {
-                            if col.is_nullable {
-                                ColData::Strings(vec![None; count])
-                            } else {
-                                ColData::Strings(vec![Some(String::new()); count])
-                            }
-                        }
-                        TypeCode::Blob => {
-                            if col.is_nullable {
-                                ColData::Bytes(vec![None; count])
-                            } else {
-                                ColData::Bytes(vec![Some(Vec::new()); count])
-                            }
-                        }
-                        TypeCode::U128 | TypeCode::UUID => ColData::U128s(vec![0u128; count]),
-                        _ => ColData::Fixed(vec![0u8; count * col.type_code.wire_stride()]),
-                    }
-                }
-            })
-            .collect();
-
+        // Retraction rows: the server's `retract_pk` matches by PK alone, so the
+        // payload columns are inert filler. Built directly (not via
+        // BatchAppender, whose `add_row` takes a single scalar PK value).
         let batch = ZSetBatch {
             pks,
             weights: vec![-1; count],
             nulls: vec![0; count],
-            columns,
+            columns: ZSetBatch::filler_columns(schema, count),
         };
         self.conn.push(table_id, schema, &batch, &mut self.schema_cache)?;
         Ok(())
@@ -714,11 +683,20 @@ impl GnitzClient {
         }
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
-        if !(1..=gnitz_wire::PK_LIST_MAX_COLS).contains(&pk_cols.len()) {
+        // Full schema-admissibility rule set (column cap + PK rules), applied
+        // here so a non-SQL (capi) caller gets a clean error before any id
+        // allocation instead of relying on the server-side reject (and
+        // `pack_pk_cols` below can never panic).
+        let pk_indices: Vec<usize> = pk_cols.iter().map(|&c| c as usize).collect();
+        Schema::validate_parts(&pk_indices, columns)
+            .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
+        // `dist_prefix_len` is a leading-PK-prefix length (0 = default = full PK);
+        // a value past the PK count is meaningless and the engine would silently
+        // clamp it, so reject it here to catch the caller's mistake.
+        if dist_prefix_len > pk_cols.len() {
             return Err(ClientError::ServerError(format!(
-                "create_table: PK column count {} out of range 1..={}",
-                pk_cols.len(),
-                gnitz_wire::PK_LIST_MAX_COLS,
+                "create_table: distribution prefix length {dist_prefix_len} exceeds PK column count {}",
+                pk_cols.len()
             )));
         }
 
@@ -754,8 +732,12 @@ impl GnitzClient {
         // used. Empty ⇒ the bundle is just `[COL_TAB, TABLE_TAB]`.
         let mut index_ids: Vec<u64> = Vec::with_capacity(unique_indexes.len());
         for spec in unique_indexes {
-            gnitz_wire::validate_pk_col_list(spec.col_indices)
-                .map_err(|e| ClientError::ServerError(format!("create_table: unique index: {e}")))?;
+            // Structural rules only (arity, in-range, no duplicates) — unlike a
+            // PK, an indexed column may be nullable. In-range against the actual
+            // column list also keeps the `columns[c]` read below panic-free.
+            let idx_indices: Vec<usize> = spec.col_indices.iter().map(|&c| c as usize).collect();
+            Schema::validate_pk_cols(&idx_indices, columns.len())
+                .map_err(|e| ClientError::ServerError(format!("create_table: unique index '{}': {e}", spec.name)))?;
             for &c in spec.col_indices {
                 validate_index_col_type(columns[c as usize].type_code)?;
             }
@@ -878,12 +860,10 @@ impl GnitzClient {
         }
 
         // Per-view pre-flight validation up front, before any id allocation, so a
-        // bad schema surfaces with no residue. The view's PK region is the leading
-        // `k` columns and has no null
-        // bitmap, so a nullable PK slot is internally inconsistent; validate every
-        // PK slot. The MAX_COLUMNS choke point surfaces an over-wide output schema
-        // as a clean error before the DDL round-trip (else the engine's
-        // build_schema_from_col_defs assert trips).
+        // bad schema surfaces with no residue. The VIEW_TAB register path has no
+        // server-side schema precheck, so a malformed spec would panic the client
+        // at `pack_pk_cols`, trip the engine's build_schema_from_col_defs assert,
+        // or abort the master in `SchemaDescriptor::new`; reject it all here.
         for pv in &views {
             // Gateway backstop for non-SQL front ends (capi): enforce the ASCII
             // `[A-Za-z0-9_]` charset `canon_name` relies on. Hidden segment names
@@ -892,35 +872,9 @@ impl GnitzClient {
             if !is_hidden_view_name(&pv.name) {
                 crate::validate_user_identifier(&pv.name).map_err(ClientError::ServerError)?;
             }
-            if pv.output_columns.is_empty() {
-                return Err(ClientError::ServerError(
-                    "View must have at least one output column".into(),
-                ));
-            }
-            if pv.output_columns.len() > gnitz_wire::MAX_COLUMNS {
-                return Err(ClientError::ServerError(format!(
-                    "View has {} output columns, exceeding the {}-column limit",
-                    pv.output_columns.len(),
-                    gnitz_wire::MAX_COLUMNS
-                )));
-            }
-            for &p in &pv.pk_cols {
-                match pv.output_columns.get(p as usize) {
-                    Some(c) if !c.is_nullable => {}
-                    Some(_) => {
-                        return Err(ClientError::ServerError(
-                            "View Primary Key column must not be nullable".into(),
-                        ))
-                    }
-                    None => {
-                        return Err(ClientError::ServerError(format!(
-                            "View PK column index {} out of range ({} output columns)",
-                            p,
-                            pv.output_columns.len()
-                        )))
-                    }
-                }
-            }
+            let pk_indices: Vec<usize> = pv.pk_cols.iter().map(|&c| c as usize).collect();
+            Schema::validate_parts(&pk_indices, &pv.output_columns)
+                .map_err(|e| ClientError::ServerError(format!("View '{}': {e}", pv.name)))?;
         }
 
         let schema_id = self.lookup_schema_id(&schema_name)?;

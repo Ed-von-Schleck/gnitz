@@ -236,14 +236,21 @@ impl Schema {
         Ok(())
     }
 
-    /// Fallible constructor for a schema assembled from untrusted parts — a
-    /// wire schema block or catalog rows. Runs [`Schema::validate_pk_cols`]
-    /// plus the PK-column invariants the engine's `SchemaDescriptor::new`
-    /// hard-asserts (non-nullable, PK-eligible type), so every decode boundary
-    /// applies the same rule set.
-    pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: Vec<usize>) -> Result<Schema, &'static str> {
-        Self::validate_pk_cols(&pk_cols, columns.len())?;
-        for &pk in &pk_cols {
+    /// The single definition of "these parts form an admissible schema": the
+    /// `MAX_COLUMNS` cap (the region null bitmap is one u64 word), the
+    /// structural PK rules ([`Schema::validate_pk_cols`] — non-empty,
+    /// `≤ PK_LIST_MAX_COLS`, every index `< columns.len()`, no duplicates), and
+    /// the per-column invariants the engine's `SchemaDescriptor::new`
+    /// hard-asserts — each PK column non-nullable and PK-eligible. Shared by
+    /// [`Schema::from_parts`], the client's `create_table` / `create_view_chain`
+    /// DDL gateways, and capi's `gnitz_batch_new`, so a malformed spec is a
+    /// clean client error rather than a server-side assert.
+    pub fn validate_parts(pk_cols: &[usize], columns: &[ColumnDef]) -> Result<(), &'static str> {
+        if columns.len() > MAX_COLUMNS {
+            return Err("column count exceeds MAX_COLUMNS");
+        }
+        Self::validate_pk_cols(pk_cols, columns.len())?;
+        for &pk in pk_cols {
             if columns[pk].is_nullable {
                 return Err("PK column must be non-nullable");
             }
@@ -251,6 +258,14 @@ impl Schema {
                 return Err("PK column type not PK-eligible");
             }
         }
+        Ok(())
+    }
+
+    /// Fallible constructor for a schema assembled from untrusted parts — a
+    /// wire schema block or catalog rows. Runs [`Schema::validate_parts`],
+    /// so every decode boundary applies the same rule set.
+    pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: Vec<usize>) -> Result<Schema, &'static str> {
+        Self::validate_parts(&pk_cols, &columns)?;
         Ok(Schema { columns, pk_cols })
     }
 
@@ -678,7 +693,22 @@ pub struct ZSetBatch {
 
 impl ZSetBatch {
     pub fn new(schema: &Schema) -> Self {
-        let columns = schema
+        ZSetBatch {
+            pks: PkColumn::empty_for_schema(schema),
+            weights: vec![],
+            nulls: vec![],
+            columns: Self::filler_columns(schema, 0),
+        }
+    }
+
+    /// One `ColData` per schema column, zero-filled for `count` rows — the
+    /// canonical TypeCode→variant choice the wire encoder accepts (PK slots are
+    /// empty `Fixed` placeholders). `new` is the `count = 0` case; the client's
+    /// `delete` uses `count > 0` as inert payload filler for retraction rows
+    /// (the server's `retract_pk` matches by PK alone, so an empty `Some` value
+    /// encoding to zero bytes under the all-present null bitmap is fine).
+    pub fn filler_columns(schema: &Schema, count: usize) -> Vec<ColData> {
+        schema
             .columns
             .iter()
             .enumerate()
@@ -687,20 +717,14 @@ impl ZSetBatch {
                     ColData::Fixed(vec![])
                 } else {
                     match col.type_code {
-                        TypeCode::String => ColData::Strings(vec![]),
-                        TypeCode::Blob => ColData::Bytes(vec![]),
-                        TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => ColData::U128s(vec![]),
-                        _ => ColData::Fixed(vec![]),
+                        TypeCode::String => ColData::Strings(vec![Some(String::new()); count]),
+                        TypeCode::Blob => ColData::Bytes(vec![Some(Vec::new()); count]),
+                        TypeCode::U128 | TypeCode::UUID | TypeCode::I128 => ColData::U128s(vec![0u128; count]),
+                        _ => ColData::Fixed(vec![0u8; count * col.type_code.wire_stride()]),
                     }
                 }
             })
-            .collect();
-        ZSetBatch {
-            pks: PkColumn::empty_for_schema(schema),
-            weights: vec![],
-            nulls: vec![],
-            columns,
-        }
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -1125,6 +1149,90 @@ impl<'a> BatchAppender<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_parts_enforces_full_rule_set() {
+        let cols = vec![
+            ColumnDef::new("a", TypeCode::U64, false),    // 0: eligible, non-null
+            ColumnDef::new("b", TypeCode::I32, false),    // 1: eligible, non-null
+            ColumnDef::new("s", TypeCode::String, false), // 2: ineligible type
+            ColumnDef::new("n", TypeCode::U64, true),     // 3: nullable
+            ColumnDef::new("f", TypeCode::F64, false),    // 4: ineligible type
+        ];
+
+        // Valid single and compound PKs (including the I128 join-key type).
+        assert!(Schema::validate_parts(&[0], &cols).is_ok());
+        assert!(Schema::validate_parts(&[0, 1], &cols).is_ok());
+
+        // Structural rejects: empty, over-long, out-of-range, duplicate.
+        assert_eq!(Schema::validate_parts(&[], &cols), Err("pk_cols must not be empty"));
+        assert_eq!(
+            Schema::validate_parts(&[0, 1, 0, 1, 0], &cols),
+            Err("pk_cols exceeds PK_LIST_MAX_COLS")
+        );
+        assert_eq!(Schema::validate_parts(&[9], &cols), Err("pk_cols index out of range"));
+        assert_eq!(
+            Schema::validate_parts(&[0, 0], &cols),
+            Err("pk_cols contains duplicates")
+        );
+
+        // Per-column rejects: nullable and PK-ineligible (String/float).
+        assert_eq!(
+            Schema::validate_parts(&[3], &cols),
+            Err("PK column must be non-nullable")
+        );
+        assert_eq!(
+            Schema::validate_parts(&[2], &cols),
+            Err("PK column type not PK-eligible")
+        );
+        assert_eq!(
+            Schema::validate_parts(&[4], &cols),
+            Err("PK column type not PK-eligible")
+        );
+
+        // Column-count cap: the null bitmap is one u64, so > MAX_COLUMNS rejects.
+        let wide: Vec<ColumnDef> = (0..=MAX_COLUMNS)
+            .map(|i| ColumnDef::new(format!("c{i}"), TypeCode::U64, i > 0))
+            .collect();
+        assert_eq!(
+            Schema::validate_parts(&[0], &wide),
+            Err("column count exceeds MAX_COLUMNS")
+        );
+        assert!(Schema::validate_parts(&[0], &wide[..MAX_COLUMNS]).is_ok());
+    }
+
+    #[test]
+    fn filler_columns_encode_without_panic() {
+        // The client delete path builds retraction batches from `filler_columns`
+        // (bypassing BatchAppender, whose `add_row` takes a scalar PK). Each
+        // payload variant must match the wire encoder's expectation; regression:
+        // a duplicated copy of this mapping once sent an I128 payload column as
+        // `Fixed` and panicked in `encode_wal_block` ("expected U128s"). Cover
+        // every payload family — including a nullable String — the same way
+        // `push` exercises them: validate, then encode.
+        let schema = Schema {
+            columns: vec![
+                ColumnDef::new("pk", TypeCode::U64, false),
+                ColumnDef::new("i", TypeCode::I64, false),    // Fixed
+                ColumnDef::new("big", TypeCode::I128, false), // U128s (the regression)
+                ColumnDef::new("u", TypeCode::U128, false),   // U128s
+                ColumnDef::new("uid", TypeCode::UUID, false), // U128s
+                ColumnDef::new("s", TypeCode::String, true),  // Strings, nullable
+                ColumnDef::new("b", TypeCode::Blob, false),   // Bytes
+            ],
+            pk_cols: vec![0],
+        };
+        let count = 2;
+        let batch = ZSetBatch {
+            pks: PkColumn::U64s(vec![10, 20]),
+            weights: vec![-1; count],
+            nulls: vec![0; count],
+            columns: ZSetBatch::filler_columns(&schema, count),
+        };
+        batch.validate(&schema).expect("filler batch must validate");
+        // Must not panic: I128/U128/UUID → U128s, String/Blob → 16 zero bytes.
+        let _ = crate::protocol::encode_wal_block(&schema, 7, &batch);
+    }
 
     #[test]
     fn test_num_payload_cols() {

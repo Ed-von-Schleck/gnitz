@@ -181,7 +181,7 @@ impl PySchema {
             }
         };
         Schema::validate_pk_cols(&list, ncols).map_err(pyo3::exceptions::PyValueError::new_err)?;
-        // Reject nullable PK columns; reject String/Blob PK types; validate total stride.
+        // Reject nullable and PK-ineligible PK columns; validate total stride.
         let mut total_stride: usize = 0;
         for &ci in &list {
             let item = columns.get_item(ci)?;
@@ -194,7 +194,7 @@ impl PySchema {
             }
             let tc = type_code_from_u64(col.type_code as u64)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-            if matches!(tc, TypeCode::String | TypeCode::Blob) {
+            if !tc.is_pk_eligible() {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "column {:?} has type {:?} which cannot be a PK column",
                     col.name, tc

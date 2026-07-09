@@ -189,8 +189,9 @@ pub unsafe extern "C" fn gnitz_disconnect(conn: *mut GnitzConn) {
 /// then column 1". Single-PK callers pass `pk_count = 1` and a pointer to the
 /// one PK index.
 ///
-/// In-bounds validation (each index must reference an existing column) is
-/// deferred until `gnitz_batch_new`, because columns are added *after* schema
+/// Full validation against the column list (in-bounds, non-nullable,
+/// PK-eligible types) is deferred until the schema is consumed
+/// (`gnitz_batch_new`, DDL calls), because columns are added *after* schema
 /// creation. Duplicates and `pk_count` out of range are caught here.
 ///
 /// Returns NULL on error.
@@ -242,20 +243,9 @@ pub unsafe extern "C" fn gnitz_schema_add_col(
             return -1;
         }
     };
-    let is_pk_col = s.0.pk_cols.contains(&s.0.columns.len());
-    if is_pk_col {
-        if nullable != 0 {
-            set_error("nullable columns cannot be primary key columns");
-            return -1;
-        }
-        if matches!(tc, TypeCode::String | TypeCode::Blob) {
-            set_error(format!(
-                "column {:?}: String/Blob columns cannot be PK columns",
-                cstr(name)
-            ));
-            return -1;
-        }
-    }
+    // Per-column PK rules (non-nullable, PK-eligible type) are enforced by
+    // `Schema::validate_parts` at the consuming choke points (`gnitz_batch_new`,
+    // the DDL calls), where the full column list exists.
     s.0.columns
         .push(ColumnDef::new(cstr(name).to_owned(), tc, nullable != 0));
     0
@@ -287,23 +277,11 @@ pub unsafe extern "C" fn gnitz_schema_free(schema: *mut GnitzSchema) {
 pub unsafe extern "C" fn gnitz_batch_new(schema: *const GnitzSchema) -> *mut GnitzBatch {
     clear_error();
     let s = check_ptr!(schema, std::ptr::null_mut());
-    let ncols = s.0.columns.len();
-    if let Err(e) = Schema::validate_pk_cols(&s.0.pk_cols, ncols) {
+    // Full schema admissibility (column cap, PK rules) — the first point where
+    // the complete column list exists. Implies PK stride ≤ MAX_PK_BYTES: at most
+    // PK_LIST_MAX_COLS eligible columns of wire stride ≤ 16 each.
+    if let Err(e) = Schema::validate_parts(&s.0.pk_cols, &s.0.columns) {
         set_error(format!("gnitz_batch_new: {e}"));
-        return std::ptr::null_mut();
-    }
-    let pk_stride = s.0.pk_stride();
-    if pk_stride > gnitz_core::MAX_PK_BYTES {
-        set_error(format!(
-            "gnitz_batch_new: schema total PK stride {} exceeds maximum {} bytes",
-            pk_stride,
-            gnitz_core::MAX_PK_BYTES,
-        ));
-        return std::ptr::null_mut();
-    }
-    let payload_count = ncols - s.0.pk_cols.len();
-    if payload_count > 64 {
-        set_error("gnitz_batch_new: null bitmap supports at most 64 payload columns");
         return std::ptr::null_mut();
     }
     let schema_clone = s.0.clone();
@@ -1814,48 +1792,28 @@ mod tests {
         }
     }
 
-    /// Fix 5b: gnitz_schema_add_col must reject nullable PK columns.
+    /// PK rules are enforced at the `gnitz_batch_new` choke point via
+    /// `Schema::validate_parts`: nullable, String/Blob, and float PK columns
+    /// are all rejected there (adding the column itself succeeds).
     #[test]
-    fn test_schema_add_col_rejects_nullable_pk() {
-        unsafe {
-            let pk_cols: [u32; 1] = [0];
-            let sch = gnitz_schema_new(1, pk_cols.as_ptr());
-            assert!(!sch.is_null());
-            let name = CString::new("id").unwrap();
-            let rc = gnitz_schema_add_col(sch, name.as_ptr(), GNITZ_TYPE_U64 as c_int, 1);
-            assert_eq!(rc, -1, "nullable PK column must be rejected");
-            assert!(!gnitz_last_error().is_null());
-            gnitz_schema_free(sch);
-        }
-    }
-
-    /// Fix 5b: gnitz_schema_add_col must reject String PK columns.
-    #[test]
-    fn test_schema_add_col_rejects_string_pk() {
-        unsafe {
-            let pk_cols: [u32; 1] = [0];
-            let sch = gnitz_schema_new(1, pk_cols.as_ptr());
-            assert!(!sch.is_null());
-            let name = CString::new("s").unwrap();
-            let rc = gnitz_schema_add_col(sch, name.as_ptr(), GNITZ_TYPE_STRING as c_int, 0);
-            assert_eq!(rc, -1, "String PK column must be rejected");
-            assert!(!gnitz_last_error().is_null());
-            gnitz_schema_free(sch);
-        }
-    }
-
-    /// Fix 5b: gnitz_schema_add_col must reject Blob PK columns.
-    #[test]
-    fn test_schema_add_col_rejects_blob_pk() {
-        unsafe {
-            let pk_cols: [u32; 1] = [0];
-            let sch = gnitz_schema_new(1, pk_cols.as_ptr());
-            assert!(!sch.is_null());
-            let name = CString::new("b").unwrap();
-            let rc = gnitz_schema_add_col(sch, name.as_ptr(), GNITZ_TYPE_BLOB as c_int, 0);
-            assert_eq!(rc, -1, "Blob PK column must be rejected");
-            assert!(!gnitz_last_error().is_null());
-            gnitz_schema_free(sch);
+    fn test_batch_new_rejects_invalid_pk_column() {
+        for (tc, nullable) in [
+            (GNITZ_TYPE_U64, 1),    // nullable PK
+            (GNITZ_TYPE_STRING, 0), // ineligible type
+            (GNITZ_TYPE_BLOB, 0),   // ineligible type
+            (GNITZ_TYPE_F64, 0),    // ineligible type (deny-lists missed floats)
+        ] {
+            unsafe {
+                let pk_cols: [u32; 1] = [0];
+                let sch = gnitz_schema_new(1, pk_cols.as_ptr());
+                assert!(!sch.is_null());
+                let name = CString::new("id").unwrap();
+                assert_eq!(gnitz_schema_add_col(sch, name.as_ptr(), tc as c_int, nullable), 0);
+                let b = gnitz_batch_new(sch);
+                assert!(b.is_null(), "PK column (tc={tc}, nullable={nullable}) must be rejected");
+                assert!(!gnitz_last_error().is_null());
+                gnitz_schema_free(sch);
+            }
         }
     }
 

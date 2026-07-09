@@ -664,7 +664,7 @@ fn test_view_over_compound_pk_too_wide_rejected() {
         GnitzSqlError::Exec(e) => {
             let s = format!("{:?}", e);
             assert!(
-                s.contains("output columns") && s.contains("limit"),
+                s.contains("exceeds MAX_COLUMNS"),
                 "expected the column-limit guard message, got: {}",
                 s
             );
