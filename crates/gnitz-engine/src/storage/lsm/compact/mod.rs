@@ -18,9 +18,11 @@ pub use merge::{compact_shards, merge_and_route};
 #[cfg(test)]
 mod tests {
     use super::super::batch::Batch;
+    use super::super::batch::REG_PAYLOAD_START;
     use super::super::columnar;
+    use super::super::layout::{ENCODING_FOR, ENCODING_RAW};
     use super::super::merge::{pack_pk_be, run_merge, BlobCacheGuard};
-    use super::super::shard_file::PkUniqueChecker;
+    use super::super::shard_file::{region_dir, PkUniqueChecker, ShardWriteOpts};
     use super::super::shard_reader::MappedShard;
     use super::merge::{find_guard_for_key, open_shards};
     use super::*;
@@ -58,11 +60,92 @@ mod tests {
         }
 
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch.write_as_shard(&cpath, 0, schema, 0).unwrap();
+        batch
+            .write_as_shard(&cpath, 0, schema, ShardWriteOpts::default())
+            .unwrap();
     }
 
     fn make_test_schema() -> SchemaDescriptor {
         SchemaDescriptor::new(&[SchemaColumn::new(TYPE_U64, 0), SchemaColumn::new(TYPE_I64, 0)], &[0])
+    }
+
+    /// Encoding byte of a shard's payload directory entry.
+    fn payload_encoding(path: &str) -> u8 {
+        region_dir(&fs::read(path).unwrap(), REG_PAYLOAD_START).1
+    }
+
+    /// Compaction packs eligible integer payload columns (`pack_ints = true` at
+    /// the `compact_shards` entry) while the raw L0-style inputs stay plain; the
+    /// packed output is content-identical (weight + payload) to the inputs, and
+    /// re-compacting a packed input preserves content and repacks.
+    #[test]
+    fn compaction_packs_eligible_int_payload() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_for_pack");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let schema = make_test_schema();
+
+        // Two raw L0-style inputs (write_test_shard → pack_ints = false). Payload
+        // == PK, a narrow range that FoR packs once merged.
+        let s1 = dir.join("s1.db");
+        let s2 = dir.join("s2.db");
+        let pks1: Vec<u64> = (0..300).map(|i| i * 2).collect(); // evens
+        let pks2: Vec<u64> = (0..300).map(|i| i * 2 + 1).collect(); // odds
+        write_test_shard(s1.to_str().unwrap(), &pks1, &vec![1i64; 300], &schema);
+        write_test_shard(s2.to_str().unwrap(), &pks2, &vec![1i64; 300], &schema);
+        // L0 spill inputs stay Raw (policy: only compaction packs).
+        assert_eq!(
+            payload_encoding(s1.to_str().unwrap()),
+            ENCODING_RAW,
+            "L0 input stays raw"
+        );
+        assert_eq!(payload_encoding(s2.to_str().unwrap()), ENCODING_RAW);
+
+        let out = dir.join("merged.db");
+        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
+        let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
+        let cout = std::ffi::CString::new(out.to_str().unwrap()).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0, false).unwrap();
+
+        // Compaction output packs the eligible payload.
+        assert_eq!(
+            payload_encoding(out.to_str().unwrap()),
+            ENCODING_FOR,
+            "compaction packs payload"
+        );
+
+        // Content: every merged row's decoded payload == its PK, weight 1.
+        let merged = MappedShard::open(&cout, &schema, false).unwrap();
+        assert_eq!(merged.count, 600);
+        for r in 0..merged.count {
+            let pk = merged.get_pk(r);
+            let pay = read_i64_le(merged.get_col_ptr(r, 0, 8), 0);
+            assert_eq!(pay as u128, pk, "row {r} payload == pk");
+            assert_eq!(merged.get_weight(r), 1);
+        }
+
+        // Re-compaction of a packed input (decode → merge → re-encode).
+        let out2 = dir.join("merged2.db");
+        let cout2 = std::ffi::CString::new(out2.to_str().unwrap()).unwrap();
+        compact_shards(&[cout.as_c_str()], &cout2, &schema, 0, false).unwrap();
+        assert_eq!(
+            payload_encoding(out2.to_str().unwrap()),
+            ENCODING_FOR,
+            "re-compaction repacks"
+        );
+        let merged2 = MappedShard::open(&cout2, &schema, false).unwrap();
+        assert_eq!(merged2.count, merged.count);
+        for r in 0..merged2.count {
+            assert_eq!(merged2.get_pk(r), merged.get_pk(r));
+            assert_eq!(
+                read_i64_le(merged2.get_col_ptr(r, 0, 8), 0),
+                read_i64_le(merged.get_col_ptr(r, 0, 8), 0),
+                "re-compaction preserves payload at row {r}",
+            );
+            assert_eq!(merged2.get_weight(r), merged.get_weight(r));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -371,7 +454,9 @@ mod tests {
         }
         let s1 = dir.join("s1.db");
         let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-        batch.write_as_shard(&cpath, 0, &schema, 0).unwrap();
+        batch
+            .write_as_shard(&cpath, 0, &schema, ShardWriteOpts::default())
+            .unwrap();
 
         // Compact it (single shard, should roundtrip)
         let output = dir.join("merged.db");
@@ -422,7 +507,9 @@ mod tests {
 
         let s1 = dir.join("s1.db");
         let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-        batch.write_as_shard(&cpath, 0, &schema, 0).unwrap();
+        batch
+            .write_as_shard(&cpath, 0, &schema, ShardWriteOpts::default())
+            .unwrap();
 
         // Compact
         let output = dir.join("merged.db");
@@ -469,7 +556,9 @@ mod tests {
             batch.count += 1;
         }
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch.write_as_shard(&cpath, 0, schema, 0).unwrap();
+        batch
+            .write_as_shard(&cpath, 0, schema, ShardWriteOpts::default())
+            .unwrap();
     }
 
     /// Read all rows from a 3-col shard as (pk, weight, col1, col2).
@@ -842,7 +931,9 @@ mod tests {
             batch.count += 1;
         }
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch.write_as_shard(&cpath, 0, schema, 0).unwrap();
+        batch
+            .write_as_shard(&cpath, 0, schema, ShardWriteOpts::default())
+            .unwrap();
     }
 
     fn assert_compare_pk_bytes_sorted(shard: &MappedShard) {
@@ -1100,7 +1191,9 @@ mod tests {
             batch.count += 1;
         }
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch.write_as_shard(&cpath, 0, schema, 0).unwrap();
+        batch
+            .write_as_shard(&cpath, 0, schema, ShardWriteOpts::default())
+            .unwrap();
     }
 
     /// Read a compacted shard back to `(is_pk_unique, rows)`, decoding strings to
@@ -1154,9 +1247,12 @@ mod tests {
             }
             batch.append_row_from_source_bytes(pk_bytes, w, &shards[src], row, blob_cache.get_mut());
         });
-        batch
-            .write_as_shard(output_file, 0, schema, checker.flags_if(can_tag))
-            .unwrap();
+        let opts = ShardWriteOpts {
+            flags: checker.flags_if(can_tag),
+            pack_ints: true, // mirror the production compaction write
+            ..Default::default()
+        };
+        batch.write_as_shard(output_file, 0, schema, opts).unwrap();
     }
 
     /// Compact `shard_rows` both ways (`compact_shards` and the oracle) with
@@ -1320,9 +1416,12 @@ mod tests {
                 }
                 let path = out_dir.join(format!("oracle_G{g}.db"));
                 let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-                batches[g]
-                    .write_as_shard(&cpath, 0, schema, checkers[g].flags_if(can_tag))
-                    .unwrap();
+                let opts = ShardWriteOpts {
+                    flags: checkers[g].flags_if(can_tag),
+                    pack_ints: true, // mirror the production compaction write
+                    ..Default::default()
+                };
+                batches[g].write_as_shard(&cpath, 0, schema, opts).unwrap();
                 Some(path.to_str().unwrap().to_string())
             })
             .collect()

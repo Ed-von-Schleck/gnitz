@@ -1898,8 +1898,10 @@ mod tests {
             rows.len() as u32,
             &regions,
             schema,
-            false,
-            flag,
+            super::super::shard_file::ShardWriteOpts {
+                flags: flag,
+                ..Default::default()
+            },
         )
         .unwrap();
         Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
@@ -1936,8 +1938,10 @@ mod tests {
             rows.len() as u32,
             &regions,
             schema,
-            false,
-            flag,
+            super::super::shard_file::ShardWriteOpts {
+                flags: flag,
+                ..Default::default()
+            },
         )
         .unwrap();
         Rc::new(MappedShard::open(&cpath, schema, false).unwrap())
@@ -2164,7 +2168,9 @@ mod tests {
                 let batch = bb.finish();
                 let path = dir.path().join(format!("ms_{s}.db"));
                 let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-                batch.write_as_shard(&cpath, 0, &schema, 0).unwrap();
+                batch
+                    .write_as_shard(&cpath, 0, &schema, super::super::shard_file::ShardWriteOpts::default())
+                    .unwrap();
                 Rc::new(MappedShard::open(&cpath, &schema, false).unwrap())
             })
             .collect();

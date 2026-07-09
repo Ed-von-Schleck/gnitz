@@ -298,8 +298,7 @@ mod tests {
             n as u32,
             &regions,
             &compound_schema(),
-            false,
-            0,
+            shard_file::ShardWriteOpts::default(),
         )
         .unwrap();
         path.to_str().unwrap().to_string()
@@ -331,8 +330,16 @@ mod tests {
 
         let path = dir.join(name);
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 42, n as u32, &regions, &test_schema(), false, 0)
-            .unwrap();
+        shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            42,
+            n as u32,
+            &regions,
+            &test_schema(),
+            shard_file::ShardWriteOpts::default(),
+        )
+        .unwrap();
         path.to_str().unwrap().to_string()
     }
 

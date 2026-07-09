@@ -5,6 +5,7 @@
 //! accessors ([`access`]); the type definitions and the `mmap` RAII handle
 //! live here, so both sub-modules read the (otherwise private) fields directly.
 
+use std::cell::OnceCell;
 use std::ffi::CStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
@@ -13,8 +14,9 @@ use xorf::Xor8;
 
 use super::error::StorageError;
 use super::layout::*;
+use super::shard_file::DecodedRegion;
 #[cfg(test)]
-use crate::foundation::codec::{read_i64_le, read_u64_le};
+use crate::foundation::codec::{read_i64_le, read_u64_le, write_u64_le};
 use crate::foundation::posix_io;
 
 mod access;
@@ -86,9 +88,10 @@ impl Drop for Mmap {
 // ScalarRegion / WeightRegion — self-describing region accessors
 // ---------------------------------------------------------------------------
 
-/// A pk / null-bitmap / payload-column region. These never carry the
-/// `TwoValue` encoding (only the weight region does), so the variant is
-/// unrepresentable here rather than rejected-then-asserted at every accessor.
+/// A pk / null-bitmap region. These never carry the `TwoValue` encoding (only
+/// the weight region does) nor `ENCODING_FOR` (only payload regions do, as
+/// [`PayloadRegion::Packed`]), so those variants are unrepresentable here
+/// rather than rejected-then-asserted at every accessor.
 #[derive(Clone)]
 pub(crate) enum ScalarRegion {
     Raw {
@@ -102,6 +105,27 @@ pub(crate) enum ScalarRegion {
         value: [u8; 16],
         offset: usize,
     },
+}
+
+/// A payload-column region — the only role that may carry `ENCODING_FOR`.
+#[derive(Clone)]
+pub(crate) enum PayloadRegion {
+    Scalar(ScalarRegion),
+    Packed(PackedRegion),
+}
+
+/// FoR + byte-width-truncated integer payload region (`ENCODING_FOR`).
+/// `decoded` lazily holds the full `count × elem_width` little-endian image
+/// (8-aligned, so `col_ptr_by_logical` hands out naturally-aligned pointers,
+/// matching the `Constant` variant's mmap-offset contract). Populated at most
+/// once per shard open (`packed_bytes`); the content address is stable for
+/// the shard's lifetime.
+#[derive(Clone)]
+pub(crate) struct PackedRegion {
+    offset: usize,
+    size: usize,
+    elem_width: usize,
+    decoded: OnceCell<DecodedRegion>,
 }
 
 /// The weight region — the only region that may use the two-value encoding.
@@ -132,7 +156,7 @@ pub struct MappedShard {
     pub(crate) weight: WeightRegion,
     pub(crate) null_bmp: ScalarRegion,
     /// Non-PK column regions indexed by payload position.
-    pub(crate) col_regions: Vec<ScalarRegion>,
+    pub(crate) col_regions: Vec<PayloadRegion>,
     pub(crate) blob_off: usize,
     pub(crate) blob_len: usize,
     /// Column index mapping: logical col_idx -> payload col index.
@@ -156,47 +180,30 @@ pub struct MappedShard {
 
 #[cfg(test)]
 mod tests {
+    use super::super::batch::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+    use super::super::shard_file::{region_dir, ShardWriteOpts};
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
     /// Build a shard via write_shard_streaming (uses encoding detection).
     fn build_test_shard(dir: &std::path::Path, rows: &[(u64, i64)]) -> String {
-        let path = dir.join("test.db");
-        let count = rows.len() as u32;
-
-        // PK region holds OPK (order-preserving big-endian) bytes at rest.
-        let pk_bytes: Vec<u8> = rows.iter().flat_map(|&(pk, _)| pk.to_be_bytes()).collect();
+        let pks: Vec<u64> = rows.iter().map(|&(pk, _)| pk).collect();
         let weights: Vec<i64> = rows.iter().map(|_| 1i64).collect();
-        let null_bm: Vec<u64> = rows.iter().map(|_| 0u64).collect();
-        let col1_data: Vec<i64> = rows.iter().map(|&(_, v)| v).collect();
-        let blob: Vec<u8> = Vec::new();
-
-        let regions: Vec<(*const u8, usize)> = vec![
-            (pk_bytes.as_ptr(), pk_bytes.len()),
-            (weights.as_ptr() as *const u8, weights.len() * 8),
-            (null_bm.as_ptr() as *const u8, null_bm.len() * 8),
-            (col1_data.as_ptr() as *const u8, col1_data.len() * 8),
-            (blob.as_ptr(), blob.len()),
-        ];
-
-        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(
-            libc::AT_FDCWD,
-            &cpath,
-            0,
-            count,
-            &regions,
-            &test_schema(),
-            false,
-            0,
-        )
-        .unwrap();
-        path.to_str().unwrap().to_string()
+        let vals: Vec<i64> = rows.iter().map(|&(_, v)| v).collect();
+        build_test_shard_weights(dir, "test.db", &pks, &weights, &vals, false)
     }
 
-    /// Build a shard with custom weights via write_shard_streaming.
-    fn build_test_shard_weights(dir: &std::path::Path, name: &str, pks: &[u64], wts: &[i64], vals: &[i64]) -> String {
+    /// Build a `(U64 PK | I64 payload)` shard with custom weights via
+    /// write_shard_streaming; `pack` toggles FoR on the payload region.
+    fn build_test_shard_weights(
+        dir: &std::path::Path,
+        name: &str,
+        pks: &[u64],
+        wts: &[i64],
+        vals: &[i64],
+        pack: bool,
+    ) -> String {
         let path = dir.join(name);
         let count = pks.len() as u32;
         // PK region holds OPK (order-preserving big-endian) bytes at rest.
@@ -220,8 +227,10 @@ mod tests {
             count,
             &regions,
             &test_schema(),
-            false,
-            0,
+            ShardWriteOpts {
+                pack_ints: pack,
+                ..Default::default()
+            },
         )
         .unwrap();
         path.to_str().unwrap().to_string()
@@ -348,7 +357,7 @@ mod tests {
         let pks: Vec<u64> = (1..=n).collect();
         let wts: Vec<i64> = vec![1; n as usize];
         let vals: Vec<i64> = (1..=n).map(|i| i as i64 * 10).collect();
-        let path = build_test_shard_weights(dir.path(), "const_w.db", &pks, &wts, &vals);
+        let path = build_test_shard_weights(dir.path(), "const_w.db", &pks, &wts, &vals, false);
         let schema = test_schema();
         let cpath = std::ffi::CString::new(path.clone()).unwrap();
 
@@ -374,7 +383,7 @@ mod tests {
         let pks: Vec<u64> = (1..=n as u64).collect();
         let wts: Vec<i64> = (0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
         let vals: Vec<i64> = (0..n).map(|i| i as i64 * 10).collect();
-        let path = build_test_shard_weights(dir.path(), "twoval_w.db", &pks, &wts, &vals);
+        let path = build_test_shard_weights(dir.path(), "twoval_w.db", &pks, &wts, &vals, false);
         let schema = test_schema();
         let cpath = std::ffi::CString::new(path).unwrap();
 
@@ -395,7 +404,7 @@ mod tests {
         let pks: Vec<u64> = vec![1, 2, 3];
         let wts: Vec<i64> = vec![1, -1, 2];
         let vals: Vec<i64> = vec![10, 20, 30];
-        let path = build_test_shard_weights(dir.path(), "raw_w.db", &pks, &wts, &vals);
+        let path = build_test_shard_weights(dir.path(), "raw_w.db", &pks, &wts, &vals, false);
         let schema = test_schema();
         let cpath = std::ffi::CString::new(path).unwrap();
 
@@ -450,7 +459,7 @@ mod tests {
         let pks: Vec<u64> = (1..=n).collect();
         let wts: Vec<i64> = vec![1; n as usize];
         let vals: Vec<i64> = vec![42; n as usize]; // all same
-        let path = build_test_shard_weights(dir.path(), "const_col.db", &pks, &wts, &vals);
+        let path = build_test_shard_weights(dir.path(), "const_col.db", &pks, &wts, &vals, false);
         let schema = test_schema();
         let cpath = std::ffi::CString::new(path).unwrap();
 
@@ -519,7 +528,7 @@ mod tests {
         let pks: Vec<u64> = (1..=n as u64).collect();
         let wts: Vec<i64> = (0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
         let vals: Vec<i64> = (0..n).map(|i| i as i64).collect();
-        let path = build_test_shard_weights(dir.path(), "twoval_trunc.db", &pks, &wts, &vals);
+        let path = build_test_shard_weights(dir.path(), "twoval_trunc.db", &pks, &wts, &vals, false);
         let schema = test_schema();
 
         // The weight region must be TwoValue.  Shrink its size field in the
@@ -561,7 +570,7 @@ mod tests {
         let pks: Vec<u64> = (1..=n as u64).collect();
         let wts: Vec<i64> = vec![1; n];
         let vals: Vec<i64> = (0..n).map(|i| i as i64).collect();
-        let path = build_test_shard_weights(dir.path(), "twoval_pk.db", &pks, &wts, &vals);
+        let path = build_test_shard_weights(dir.path(), "twoval_pk.db", &pks, &wts, &vals, false);
         let schema = test_schema();
 
         // Patch the pk directory entry's encoding byte (entry 0, offset +24) to
@@ -631,7 +640,7 @@ mod tests {
         let pks: Vec<u64> = (1..=n).collect();
         let wts: Vec<i64> = vec![1; n as usize];
         let vals: Vec<i64> = vec![42; n as usize]; // constant payload
-        let path = build_test_shard_weights(dir.path(), "const_batch.db", &pks, &wts, &vals);
+        let path = build_test_shard_weights(dir.path(), "const_batch.db", &pks, &wts, &vals, false);
         let schema = test_schema();
         let cpath = std::ffi::CString::new(path).unwrap();
 
@@ -654,7 +663,7 @@ mod tests {
         let pks: Vec<u64> = (1..=n as u64).collect();
         let wts: Vec<i64> = (0..n).map(|i| if i % 2 == 0 { 1 } else { -1 }).collect();
         let vals: Vec<i64> = (0..n).map(|i| i as i64 * 10).collect();
-        let path = build_test_shard_weights(dir.path(), "twoval_batch.db", &pks, &wts, &vals);
+        let path = build_test_shard_weights(dir.path(), "twoval_batch.db", &pks, &wts, &vals, false);
         let schema = test_schema();
         let cpath = std::ffi::CString::new(path).unwrap();
 
@@ -778,8 +787,7 @@ mod tests {
             count,
             &regions,
             &u128_pk_schema(),
-            false,
-            0,
+            ShardWriteOpts::default(),
         )
         .unwrap();
         path.to_str().unwrap().to_string()
@@ -926,8 +934,16 @@ mod tests {
         ];
         let path = dir.path().join("wide_pk.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, &schema, false, 0)
-            .unwrap();
+        super::super::shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            0,
+            count,
+            &regions,
+            &schema,
+            ShardWriteOpts::default(),
+        )
+        .unwrap();
         let shard = MappedShard::open(&cpath, &schema, false).unwrap();
         assert_eq!(shard.pk_stride, 24);
         assert!(
@@ -994,8 +1010,16 @@ mod tests {
         ];
         let path = dir.path().join("wide_const.db");
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        super::super::shard_file::write_shard_streaming(libc::AT_FDCWD, &cpath, 0, count, &regions, &schema, false, 0)
-            .unwrap();
+        super::super::shard_file::write_shard_streaming(
+            libc::AT_FDCWD,
+            &cpath,
+            0,
+            count,
+            &regions,
+            &schema,
+            ShardWriteOpts::default(),
+        )
+        .unwrap();
 
         // Sanity: unpatched shard opens fine with a Raw PK region.
         assert!(MappedShard::open(&cpath, &schema, false).is_ok());
@@ -1010,6 +1034,266 @@ mod tests {
             MappedShard::open(&cpath, &schema, false).err(),
             Some(StorageError::InvalidShard),
             "wide PK region declaring ENCODING_CONSTANT must be rejected",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FoR (ENCODING_FOR) packed-payload reader tests
+    // -----------------------------------------------------------------------
+
+    /// Build a `(U64 PK | I64 payload)` shard with all-1 weights;
+    /// `pack` toggles FoR on the payload region.
+    fn build_i64_shard(dir: &std::path::Path, name: &str, pks: &[u64], vals: &[i64], pack: bool) -> String {
+        build_test_shard_weights(dir, name, pks, &vec![1i64; pks.len()], vals, pack)
+    }
+
+    /// The directory entry's `(size, encoding)` for an on-disk shard.
+    fn payload_dir_entry(path: &str, region_idx: usize) -> (usize, u8) {
+        region_dir(&std::fs::read(path).unwrap(), region_idx)
+    }
+
+    /// Clone `base`, apply `patch`, write it to `name` under `dir`, and open it
+    /// with checksum validation off (so a stale checksum doesn't mask the
+    /// verdict under test).
+    fn open_patched(
+        dir: &std::path::Path,
+        name: &str,
+        base: &[u8],
+        patch: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<MappedShard, StorageError> {
+        let mut data = base.to_vec();
+        patch(&mut data);
+        let path = dir.join(name);
+        std::fs::write(&path, &data).unwrap();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        MappedShard::open(&cpath, &test_schema(), false)
+    }
+
+    #[test]
+    fn packed_roundtrip_all_surfaces() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        // Small, narrow-range payload → FoR-eligible; distinct so not Constant.
+        let n = 500usize;
+        let pks: Vec<u64> = (0..n as u64).collect();
+        let vals: Vec<i64> = (0..n as i64).map(|i| 1_000_000 + (i % 300)).collect();
+
+        let packed_path = build_i64_shard(dir.path(), "packed.db", &pks, &vals, true);
+        let raw_path = build_i64_shard(dir.path(), "raw.db", &pks, &vals, false);
+
+        // Writer verdict: packed shard carries ENCODING_FOR on the payload,
+        // control stays Raw.
+        assert_eq!(payload_dir_entry(&packed_path, REG_PAYLOAD_START).1, ENCODING_FOR);
+        assert_eq!(payload_dir_entry(&raw_path, REG_PAYLOAD_START).1, ENCODING_RAW);
+
+        let pc = std::ffi::CString::new(packed_path).unwrap();
+        let rc = std::ffi::CString::new(raw_path).unwrap();
+        let packed = MappedShard::open(&pc, &schema, true).unwrap();
+        let raw = MappedShard::open(&rc, &schema, true).unwrap();
+        assert!(matches!(packed.col_regions[0], PayloadRegion::Packed(_)));
+        assert!(matches!(
+            raw.col_regions[0],
+            PayloadRegion::Scalar(ScalarRegion::Raw { .. })
+        ));
+
+        // Surface 1 (get_col_ptr) and 2 (col_ptr_by_logical): per-row equality
+        // vs the Raw control and vs the source values.
+        for (r, &want) in vals.iter().enumerate() {
+            assert_eq!(
+                packed.get_col_ptr(r, 0, 8),
+                raw.get_col_ptr(r, 0, 8),
+                "get_col_ptr row {r}"
+            );
+            let pv = unsafe { *(packed.col_ptr_by_logical(r, 1, 8) as *const i64) };
+            let rv = unsafe { *(raw.col_ptr_by_logical(r, 1, 8) as *const i64) };
+            assert_eq!(pv, want, "col_ptr_by_logical row {r}");
+            assert_eq!(pv, rv);
+        }
+
+        // Surface 3 (slice_to_owned_batch / to_owned_batch): byte-identical
+        // payload region against the control.
+        let pb = packed.to_owned_batch(&schema);
+        let rb = raw.to_owned_batch(&schema);
+        let (pp, ps) = pb.regions()[REG_PAYLOAD_START];
+        let (rp, rs) = rb.regions()[REG_PAYLOAD_START];
+        assert_eq!(ps, rs);
+        let pbytes = unsafe { std::slice::from_raw_parts(pp, ps) };
+        let rbytes = unsafe { std::slice::from_raw_parts(rp, rs) };
+        assert_eq!(pbytes, rbytes, "to_owned_batch payload region byte-identical");
+
+        // Surface 4 (to_unified): read the payload ColPtr per row.
+        let pu = packed.to_unified(&schema);
+        for (r, &want) in vals.iter().enumerate() {
+            let base = pu.cols[0].base;
+            let v = unsafe { *(base.add(r * pu.cols[0].stride) as *const i64) };
+            assert_eq!(v, want, "to_unified row {r}");
+        }
+    }
+
+    #[test]
+    fn packed_bytes_stable_and_aligned() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let pks: Vec<u64> = (0..300).collect();
+        let vals: Vec<i64> = (0..300).map(|i| 500 + (i % 100)).collect();
+        let path = build_i64_shard(dir.path(), "stable.db", &pks, &vals, true);
+        let cpath = std::ffi::CString::new(path).unwrap();
+        let shard = MappedShard::open(&cpath, &schema, true).unwrap();
+        assert!(matches!(shard.col_regions[0], PayloadRegion::Packed(_)));
+
+        let p1 = shard.get_col_ptr(0, 0, 8).as_ptr();
+        let p2 = shard.get_col_ptr(0, 0, 8).as_ptr();
+        assert_eq!(p1, p2, "packed_bytes address stable across calls");
+        assert_eq!(p1 as usize % 8, 0, "packed_bytes 8-aligned");
+    }
+
+    #[test]
+    fn forged_for_on_non_payload_rejected() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let pks: Vec<u64> = (0..8).collect();
+        let vals: Vec<i64> = (0..8).map(|i| 1000 + i).collect();
+        let path = build_i64_shard(dir.path(), "forge.db", &pks, &vals, false);
+
+        // Forge ENCODING_FOR onto each non-payload role (pk / weight / null /
+        // blob); every one must be rejected at open (`open_patched` disables
+        // checksum validation, isolating the role check).
+        let base = std::fs::read(&path).unwrap();
+        for region_idx in [REG_PK, REG_WEIGHT, REG_NULL_BMP, 4 /* blob */] {
+            let opened = open_patched(dir.path(), &format!("forged_{region_idx}.db"), &base, |data| {
+                let dir_off = read_u64_le(data, OFF_DIR_OFFSET) as usize;
+                data[dir_off + region_idx * DIR_ENTRY_SIZE + 24] = ENCODING_FOR;
+            });
+            assert_eq!(
+                opened.err(),
+                Some(StorageError::InvalidShard),
+                "forged ENCODING_FOR on region {region_idx} must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn forged_for_payload_bad_size_rejected() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let pks: Vec<u64> = (0..16).collect();
+        let vals: Vec<i64> = (0..16).map(|i| 2000 + (i % 5)).collect();
+        let path = build_i64_shard(dir.path(), "packed16.db", &pks, &vals, true);
+        // Confirm it packed.
+        assert_eq!(payload_dir_entry(&path, REG_PAYLOAD_START).1, ENCODING_FOR);
+        let base = std::fs::read(&path).unwrap();
+        let dir_off = read_u64_le(&base, OFF_DIR_OFFSET) as usize;
+        let d = dir_off + REG_PAYLOAD_START * DIR_ENTRY_SIZE;
+        let sz = read_u64_le(&base, d + 8);
+
+        // (a) count == 0: patch the header row count to 0.
+        assert_eq!(
+            open_patched(dir.path(), "count0.db", &base, |data| write_u64_le(
+                data,
+                OFF_ROW_COUNT,
+                0
+            ))
+            .err(),
+            Some(StorageError::InvalidShard),
+            "count == 0 must be rejected",
+        );
+        // (b) size < 8: patch the payload entry size to 4.
+        assert_eq!(
+            open_patched(dir.path(), "size4.db", &base, |data| write_u64_le(data, d + 8, 4)).err(),
+            Some(StorageError::InvalidShard),
+            "size < 8 must be rejected",
+        );
+        // (c) size not an exact 8 + count·bw: bump by one non-multiple byte.
+        assert_eq!(
+            open_patched(dir.path(), "size_off.db", &base, |data| write_u64_le(
+                data,
+                d + 8,
+                sz + 1
+            ))
+            .err(),
+            Some(StorageError::InvalidShard),
+            "inexact 8 + count·bw size must be rejected",
+        );
+    }
+
+    #[test]
+    fn writer_packs_by_aligned_footprint() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        // (U64 PK | U32 payload). 10 rows: raw 40 B vs packed 28 B both align to
+        // 64 → stays Raw. 100 rows: packs.
+        let schema = SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U64, 0),
+                SchemaColumn::new(type_code::U32, 0),
+            ],
+            &[0],
+        );
+        let build = |name: &str, n: u32| -> String {
+            let pks: Vec<u8> = (0..n as u64).flat_map(|p| p.to_be_bytes()).collect();
+            let weights = vec![1i64; n as usize];
+            let nulls = vec![0u64; n as usize];
+            let vals: Vec<u32> = (0..n).map(|i| i % 50000).collect();
+            let blob: Vec<u8> = Vec::new();
+            let regions: Vec<(*const u8, usize)> = vec![
+                (pks.as_ptr(), pks.len()),
+                (weights.as_ptr() as *const u8, weights.len() * 8),
+                (nulls.as_ptr() as *const u8, nulls.len() * 8),
+                (vals.as_ptr() as *const u8, vals.len() * 4),
+                (blob.as_ptr(), 0),
+            ];
+            let path = dir.path().join(name);
+            let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            super::super::shard_file::write_shard_streaming(
+                libc::AT_FDCWD,
+                &cpath,
+                0,
+                n,
+                &regions,
+                &schema,
+                ShardWriteOpts {
+                    pack_ints: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            path.to_str().unwrap().to_string()
+        };
+        assert_eq!(
+            payload_dir_entry(&build("u32_10.db", 10), REG_PAYLOAD_START).1,
+            ENCODING_RAW
+        );
+        assert_eq!(
+            payload_dir_entry(&build("u32_100.db", 100), REG_PAYLOAD_START).1,
+            ENCODING_FOR
+        );
+    }
+
+    #[test]
+    fn checksum_catches_corrupted_packed_region() {
+        raise_fd_limit_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let pks: Vec<u64> = (0..200).collect();
+        let vals: Vec<i64> = (0..200).map(|i| 7000 + (i % 120)).collect();
+        let path = build_i64_shard(dir.path(), "corrupt.db", &pks, &vals, true);
+        let (_sz, enc) = payload_dir_entry(&path, REG_PAYLOAD_START);
+        assert_eq!(enc, ENCODING_FOR);
+
+        // Flip a byte in the packed payload region's on-disk offset bytes.
+        let mut data = std::fs::read(&path).unwrap();
+        let dir_off = read_u64_le(&data, OFF_DIR_OFFSET) as usize;
+        let d = dir_off + REG_PAYLOAD_START * DIR_ENTRY_SIZE;
+        let roff = read_u64_le(&data, d) as usize;
+        data[roff + 16] ^= 0xFF; // past the 8-byte ref, into the offset bytes
+        std::fs::write(&path, &data).unwrap();
+        let cpath = std::ffi::CString::new(path).unwrap();
+        assert_eq!(
+            MappedShard::open(&cpath, &schema, true).err(),
+            Some(StorageError::ChecksumMismatch),
+            "corrupted packed region caught by validate_checksums",
         );
     }
 }

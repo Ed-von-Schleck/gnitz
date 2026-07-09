@@ -259,8 +259,11 @@ impl Table {
             run.count as u32,
             &run.regions(),
             &self.schema,
-            false, // unsynced; the barrier sweep fdatasyncs it by path
-            flush_flags,
+            shard_file::ShardWriteOpts {
+                durable: false, // unsynced; the barrier sweep fdatasyncs it by path
+                flags: flush_flags,
+                pack_ints: false, // L0 spill/checkpoint shards stay plain (no FoR packing)
+            },
         );
         drop(dirfd);
         res?; // Write failed: heap still owns `run`; no on-disk residue.

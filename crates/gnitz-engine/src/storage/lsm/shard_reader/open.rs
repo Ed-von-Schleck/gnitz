@@ -8,7 +8,7 @@ use super::super::super::repr::batch::{strides_from_schema, REG_NULL_BMP, REG_PA
 use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::xor8;
-use super::{MappedShard, Mmap, ScalarRegion, WeightRegion};
+use super::{MappedShard, Mmap, PackedRegion, PayloadRegion, ScalarRegion, WeightRegion};
 use crate::foundation::codec::{read_i64_le, read_u64_le};
 use crate::foundation::xxh;
 
@@ -62,18 +62,16 @@ impl MappedShard {
             let r_sz = read_u64_le(data, entry_off + 8) as usize;
             let r_cs = read_u64_le(data, entry_off + 16);
 
-            let enc = data[entry_off + 24];
+            let encoding = data[entry_off + 24];
             // Validate reserved bytes [25..32] are all zero
             for b in &data[entry_off + 25..entry_off + 32] {
                 if *b != 0 {
                     return Err(StorageError::InvalidShard);
                 }
             }
-            // Validate known encoding
-            if enc != ENCODING_RAW && enc != ENCODING_CONSTANT && enc != ENCODING_TWO_VALUE {
-                return Err(StorageError::InvalidShard);
-            }
-            let encoding = enc;
+            // The encoding byte is validated per role by the region builders
+            // below — each role accepts exactly its legal encoding set, so an
+            // unknown or misplaced byte is rejected at its decode site.
 
             if r_off.saturating_add(r_sz) > file_size {
                 return Err(StorageError::InvalidShard);
@@ -117,16 +115,44 @@ impl MappedShard {
         };
         let build_scalar_region = |e: &DirEntry| -> Result<ScalarRegion, StorageError> {
             match e.encoding {
+                ENCODING_RAW => Ok(ScalarRegion::Raw {
+                    offset: e.offset,
+                    size: e.size,
+                }),
                 ENCODING_CONSTANT => Ok(ScalarRegion::Constant {
                     value: read_const_value(e),
                     offset: e.offset,
                 }),
-                ENCODING_TWO_VALUE => Err(StorageError::InvalidShard),
-                _ => Ok(ScalarRegion::Raw {
-                    offset: e.offset,
-                    size: e.size,
-                }),
+                _ => Err(StorageError::InvalidShard),
             }
+        };
+        // Payload columns are the sole `ENCODING_FOR`-eligible role; every other
+        // encoding decodes exactly as a pk / null scalar region. `stride` is the
+        // region's per-element width (validates `bw < stride` for a FoR region).
+        let build_payload_region = |e: &DirEntry, stride: usize| -> Result<PayloadRegion, StorageError> {
+            if e.encoding != ENCODING_FOR {
+                return build_scalar_region(e).map(PayloadRegion::Scalar);
+            }
+            // Decoder panic / OOB surface — these three checks make
+            // `decode_for_region` pure arithmetic over in-bounds slices:
+            // (1) count > 0 guards the divisor (the writer never emits an
+            // empty FoR region — n == 0 short-circuits to Raw of size 0);
+            // (2) size >= 8 guards the `size − 8` subtraction against a
+            // truncated entry; (3) an exact `size == 8 + count·bw` with
+            // `1 <= bw < stride` rejects trailing / short bytes.
+            if count == 0 || e.size < 8 {
+                return Err(StorageError::InvalidShard);
+            }
+            let bw = (e.size - 8) / count;
+            if bw < 1 || bw >= stride || e.size != 8 + count * bw {
+                return Err(StorageError::InvalidShard);
+            }
+            Ok(PayloadRegion::Packed(PackedRegion {
+                offset: e.offset,
+                size: e.size,
+                elem_width: stride,
+                decoded: std::cell::OnceCell::new(),
+            }))
         };
         let build_weight_region = |e: &DirEntry| -> Result<WeightRegion, StorageError> {
             match e.encoding {
@@ -144,7 +170,10 @@ impl MappedShard {
                         bitvec_off: e.offset + 16,
                     })
                 }
-                _ => Ok(WeightRegion::Raw { offset: e.offset }),
+                ENCODING_RAW => Ok(WeightRegion::Raw { offset: e.offset }),
+                // The weight region's legal set is Raw/Constant/TwoValue; anything
+                // else (e.g. a forged ENCODING_FOR) is rejected.
+                _ => Err(StorageError::InvalidShard),
             }
         };
 
@@ -181,11 +210,15 @@ impl MappedShard {
                 col_to_payload.push(usize::MAX);
             } else {
                 col_to_payload.push(col_regions.len());
-                col_regions.push(build_scalar_region(&entries[reg_idx])?);
+                col_regions.push(build_payload_region(&entries[reg_idx], strides[reg_idx] as usize)?);
                 reg_idx += 1;
             }
         }
 
+        // The blob region is always Raw; reject any other (forged) encoding.
+        if entries[nr].encoding != ENCODING_RAW {
+            return Err(StorageError::InvalidShard);
+        }
         let blob_off = entries[nr].offset;
         let blob_len = entries[nr].size;
 
@@ -197,9 +230,8 @@ impl MappedShard {
             None
         };
 
-        // Read the flags byte written at OFF_FLAGS (byte 56). Old v7 shards that
-        // predate this field have 0 there (written by vec![0u8; total_size]), so
-        // they are conservatively treated as ZSet (not PkUnique).
+        // Read the flags byte written at OFF_FLAGS (byte 56). The `file_size`
+        // guard is a defensive backstop; a well-formed shard always carries it.
         let is_pk_unique = file_size > OFF_FLAGS && (data[OFF_FLAGS] & SHARD_FLAG_PK_UNIQUE != 0);
 
         Ok(MappedShard {

@@ -9,7 +9,7 @@ use std::ptr;
 use super::super::batch::FIXED_REGION_BYTES;
 use super::super::merge::{ColPtr, UnifiedSource};
 use super::super::xor8;
-use super::{MappedShard, ScalarRegion, WeightRegion};
+use super::{MappedShard, PackedRegion, PayloadRegion, ScalarRegion, WeightRegion};
 use crate::foundation::codec::{read_i64_le, read_u64_le};
 use crate::schema::key::PkBuf;
 use crate::schema::{SchemaDescriptor, MAX_COLUMNS};
@@ -18,6 +18,24 @@ impl MappedShard {
     #[inline]
     pub(crate) fn data(&self) -> &[u8] {
         self.mmap.as_slice()
+    }
+
+    /// Materialize a [`PackedRegion`] (FoR payload) to its full
+    /// `count × elem_width` little-endian raw image, decoding once per shard
+    /// open and caching it in the region's `OnceCell`. The returned slice serves
+    /// every payload accessor at the same `row * elem_width` offset the Raw arm
+    /// uses; its content address is stable for the shard's lifetime.
+    fn packed_bytes<'a>(&'a self, region: &'a PackedRegion) -> &'a [u8] {
+        region
+            .decoded
+            .get_or_init(|| {
+                super::super::shard_file::decode_for_region(
+                    &self.data()[region.offset..region.offset + region.size],
+                    self.count,
+                    region.elem_width,
+                )
+            })
+            .as_bytes()
     }
 
     // The value accessor: production reads PK regions as raw OPK bytes
@@ -114,7 +132,7 @@ impl MappedShard {
     #[inline]
     pub fn get_col_ptr(&self, row: usize, payload_col_idx: usize, col_size: usize) -> &[u8] {
         match &self.col_regions[payload_col_idx] {
-            ScalarRegion::Raw { offset, size } => {
+            PayloadRegion::Scalar(ScalarRegion::Raw { offset, size }) => {
                 let start = offset + row * col_size;
                 assert!(
                     start + col_size <= offset + size,
@@ -126,7 +144,13 @@ impl MappedShard {
                 );
                 &self.data()[start..start + col_size]
             }
-            ScalarRegion::Constant { value, .. } => &value[..col_size],
+            PayloadRegion::Scalar(ScalarRegion::Constant { value, .. }) => &value[..col_size],
+            // `col_size == elem_width`; the decoded image serves the same
+            // `row * col_size` slice the Raw arm would.
+            PayloadRegion::Packed(p) => {
+                let start = row * col_size;
+                &self.packed_bytes(p)[start..start + col_size]
+            }
         }
     }
 
@@ -160,14 +184,25 @@ impl MappedShard {
             return ptr::null();
         }
         match &self.col_regions[payload_idx] {
-            ScalarRegion::Raw { offset, size } => {
+            PayloadRegion::Scalar(ScalarRegion::Raw { offset, size }) => {
                 let off = offset + row * col_size;
                 if off + col_size > offset + size {
                     return ptr::null();
                 }
                 unsafe { base.add(off) }
             }
-            ScalarRegion::Constant { offset, .. } => unsafe { base.add(*offset) },
+            PayloadRegion::Scalar(ScalarRegion::Constant { offset, .. }) => unsafe { base.add(*offset) },
+            // Point into the decoded image (col_size == elem_width). The address
+            // is stable for the shard's lifetime, matching the mmap-pointer
+            // contract of the Raw/Constant arms.
+            PayloadRegion::Packed(p) => {
+                let bytes = self.packed_bytes(p);
+                let off = row * col_size;
+                if off + col_size > bytes.len() {
+                    return ptr::null();
+                }
+                unsafe { bytes.as_ptr().add(off) }
+            }
         }
     }
 
@@ -282,6 +317,15 @@ impl MappedShard {
             ScalarRegion::Raw { offset, .. } => copy_raw(*offset, stride, dst),
             ScalarRegion::Constant { value, .. } => fill_const(value, stride, dst),
         };
+        let expand_payload = |region: &PayloadRegion, stride: usize, dst: &mut [u8]| match region {
+            PayloadRegion::Scalar(s) => expand_scalar(s, stride, dst),
+            // Payload strides equal `elem_width`, so the decoded image is
+            // `count · stride` long.
+            PayloadRegion::Packed(p) => {
+                let bytes = self.packed_bytes(p);
+                dst.copy_from_slice(&bytes[start * stride..(start + row_count) * stride]);
+            }
+        };
         let expand_weight = |region: &WeightRegion, dst: &mut [u8]| match region {
             WeightRegion::Raw { offset, .. } => copy_raw(*offset, 8, dst),
             WeightRegion::Constant { value } => fill_const(value, 8, dst),
@@ -311,7 +355,7 @@ impl MappedShard {
             let stride = col.size() as usize;
             let off = offsets[3 + pi];
             let sz = row_count * stride;
-            expand_scalar(&self.col_regions[pi], stride, &mut data[off..][..sz]);
+            expand_payload(&self.col_regions[pi], stride, &mut data[off..][..sz]);
         }
 
         // Blob: one allocation, copy entire blob region (string offsets stay valid).
@@ -385,13 +429,19 @@ impl MappedShard {
         for (pi, _ci, col) in schema.payload_columns() {
             let cs = col.size() as usize;
             cols[pi] = match &self.col_regions[pi] {
-                ScalarRegion::Raw { offset, .. } => ColPtr {
+                PayloadRegion::Scalar(ScalarRegion::Raw { offset, .. }) => ColPtr {
                     base: unsafe { data_ptr.add(*offset) },
                     stride: cs,
                 },
-                ScalarRegion::Constant { value, .. } => ColPtr {
+                PayloadRegion::Scalar(ScalarRegion::Constant { value, .. }) => ColPtr {
                     base: value.as_ptr(),
                     stride: 0,
+                },
+                // Decoded image (`cs == elem_width`), stable for the shard's
+                // lifetime; the caller already keeps `self` alive for the view.
+                PayloadRegion::Packed(p) => ColPtr {
+                    base: self.packed_bytes(p).as_ptr(),
+                    stride: cs,
                 },
             };
         }

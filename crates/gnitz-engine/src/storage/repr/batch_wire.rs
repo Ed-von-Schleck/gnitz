@@ -23,14 +23,14 @@ use crate::schema::SchemaDescriptor;
 impl Batch {
     /// Write this batch as a shard file directly to disk. `schema` is passed
     /// explicitly (not read from `Batch.schema`, which is `Option` and absent
-    /// for some constructors). Pass `SHARD_FLAG_PK_UNIQUE` in `flags` when the
-    /// output was verified by `PkUniqueChecker`.
+    /// for some constructors); `opts` carries the durability / flags / FoR
+    /// packing policy (see [`shard_file::ShardWriteOpts`]).
     pub fn write_as_shard(
         &self,
         path: &CStr,
         table_id: u32,
         schema: &SchemaDescriptor,
-        flags: u8,
+        opts: shard_file::ShardWriteOpts,
     ) -> Result<(), StorageError> {
         let regions = self.regions();
         shard_file::write_shard_streaming(
@@ -40,8 +40,7 @@ impl Batch {
             self.count as u32,
             &regions,
             schema,
-            true,
-            flags,
+            opts,
         )
     }
 

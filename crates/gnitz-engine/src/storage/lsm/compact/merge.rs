@@ -17,7 +17,7 @@ use super::super::batch::write_to_batch;
 use super::super::error::StorageError;
 use super::super::merge::{pack_pk_be, run_merge, UnifiedSource};
 use super::super::scatter::scatter_unified_sources_with_weights;
-use super::super::shard_file::PkUniqueChecker;
+use super::super::shard_file::{PkUniqueChecker, ShardWriteOpts};
 use super::super::shard_reader::MappedShard;
 use crate::schema::SchemaDescriptor;
 
@@ -133,8 +133,12 @@ pub(super) fn compact_routed(
             scatter_unified_sources_with_weights(&unified, bucket, writer);
         });
         let cpath = std::ffi::CString::new(path.as_str()).unwrap();
-        let flags = checkers[g].flags_if(can_tag_pk_unique);
-        if let Err(e) = batch.write_as_shard(&cpath, table_id, schema, flags) {
+        let opts = ShardWriteOpts {
+            durable: true, // compaction outputs must survive a crash on their own
+            flags: checkers[g].flags_if(can_tag_pk_unique),
+            pack_ints: true,
+        };
+        if let Err(e) = batch.write_as_shard(&cpath, table_id, schema, opts) {
             unlink_written(&out);
             return Err(e);
         }
