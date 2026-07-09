@@ -115,7 +115,6 @@ fn pack_col_id(owner_id: u64, col_idx: usize) -> Result<u64, ClientError> {
 struct TableRecord {
     tid: u64,
     schema_id: u64,
-    name: String,
     directory: String,
     pk_col_idx: u64,
     created_lsn: u64,
@@ -656,9 +655,7 @@ impl GnitzClient {
     /// the `SCHEMA_TAB` row are never retracted, so no orphan results.
     pub fn drop_schema(&mut self, name: &str) -> Result<(), ClientError> {
         let name = canon_name(name);
-        let (_, sdata, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let sdata = sdata.ok_or_else(|| ClientError::ServerError(format!("Schema '{name}' not found")))?;
-        let schema_id = find_schema_id(&sdata, &name)?;
+        let schema_id = self.lookup_schema_id(&name)?;
 
         // Views first — a view may read a member table; the drain retries to
         // resolve intra-schema view-on-view chains across passes. Synthesized
@@ -726,11 +723,7 @@ impl GnitzClient {
         }
 
         let new_tid = self.conn.alloc_table_id()?;
-
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch =
-            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
+        let schema_id = self.lookup_schema_id(&schema_name)?;
 
         // Encode the PK list using the shared wire packer so the engine
         // catalog decodes it identically. Single-PK callers still flow
@@ -794,22 +787,17 @@ impl GnitzClient {
     pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> Result<(), ClientError> {
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch =
-            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
-
-        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
-        let tbl_batch = tbl_batch
+        let schema_id = self.lookup_schema_id(&schema_name)?;
+        let record = self
+            .lookup_table_record(schema_id, &table_name)?
             .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
-        let record = find_table_record(&tbl_batch, schema_id, &table_name)?;
 
         let tbl_schema = table_tab_schema();
         let mut tb = ZSetBatch::new(tbl_schema);
         BatchAppender::new(&mut tb, tbl_schema)
             .add_row(record.tid as u128, -1)
             .u64_val(record.schema_id)
-            .str_val(&record.name)
+            .str_val(&table_name)
             .str_val(&record.directory)
             .u64_val(record.pk_col_idx)
             .u64_val(record.created_lsn)
@@ -935,10 +923,7 @@ impl GnitzClient {
             }
         }
 
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch =
-            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
+        let schema_id = self.lookup_schema_id(&schema_name)?;
 
         // Each view's vid: its circuit's pre-allocated id, or a fresh one. A chain
         // pre-sets every id (downstream circuits reference upstream hidden views),
@@ -1102,15 +1087,13 @@ impl GnitzClient {
     pub fn drop_view(&mut self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
         let schema_name = canon_name(schema_name);
         let view_name = canon_name(view_name);
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch =
-            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
+        let schema_id = self.lookup_schema_id(&schema_name)?;
 
         let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
         let view_batch = view_batch
             .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found")))?;
-        let vr = find_view_record(&view_batch, schema_id, &view_name)?;
+        let vr = find_view_record(&view_batch, schema_id, &view_name)?
+            .ok_or_else(|| ClientError::ServerError(format!("View '{schema_name}.{view_name}' not found")))?;
 
         // Hidden segment members this view owns. Ownership is name-encoded
         // (hidden views are never shared across user views); the shared
@@ -1137,65 +1120,36 @@ impl GnitzClient {
     pub fn resolve_table_id(&mut self, schema_name: &str, table_name: &str) -> Result<(u64, Schema), ClientError> {
         let schema_name = canon_name(schema_name);
         let table_name = canon_name(table_name);
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch =
-            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
-
-        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
-        let tbl_batch = tbl_batch
+        let schema_id = self.lookup_schema_id(&schema_name)?;
+        let record = self
+            .lookup_table_record(schema_id, &table_name)?
             .ok_or_else(|| ClientError::ServerError(format!("Table '{schema_name}.{table_name}' not found")))?;
-        let record = find_table_record(&tbl_batch, schema_id, &table_name)?;
-
-        let (_, col_batch, _) = self.conn.scan(COL_TAB, &mut self.schema_cache)?;
-        let col_batch = col_batch.ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
-
-        let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-        let schema = Schema {
-            columns,
-            pk_cols: decode_pk_cols(record.pk_col_idx)?,
-        };
+        let schema = self.load_owner_schema(record.tid, OWNER_KIND_TABLE, record.pk_col_idx)?;
         Ok((record.tid, schema))
     }
 
     pub fn resolve_table_or_view_id(&mut self, schema_name: &str, name: &str) -> Result<(u64, Schema), ClientError> {
         let schema_name = canon_name(schema_name);
         let name = canon_name(name);
-        let (_, schema_batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
-        let schema_batch =
-            schema_batch.ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))?;
-        let schema_id = find_schema_id(&schema_batch, &schema_name)?;
+        let schema_id = self.lookup_schema_id(&schema_name)?;
 
-        // Scan COL_TAB once — shared by both the table and view branches below
-        let (_, col_batch, _) = self.conn.scan(COL_TAB, &mut self.schema_cache)?;
-        let col_batch = col_batch.ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
-
-        // Try TABLE_TAB first (most common path)
-        let (_, tbl_batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
-        if let Some(ref tbl_batch) = tbl_batch {
-            if let Ok(record) = find_table_record(tbl_batch, schema_id, &name) {
-                let columns = extract_col_entries(&col_batch, record.tid, OWNER_KIND_TABLE)?;
-                let schema = Schema {
-                    columns,
-                    pk_cols: decode_pk_cols(record.pk_col_idx)?,
-                };
-                return Ok((record.tid, schema));
-            }
+        // Try TABLE_TAB first (most common path). A decode error there is real
+        // catalog corruption and must surface — only a genuine miss falls
+        // through to the view branch.
+        if let Some(record) = self.lookup_table_record(schema_id, &name)? {
+            let schema = self.load_owner_schema(record.tid, OWNER_KIND_TABLE, record.pk_col_idx)?;
+            return Ok((record.tid, schema));
         }
 
-        // Fall back to VIEW_TAB
         let (_, view_batch, _) = self.conn.scan(VIEW_TAB, &mut self.schema_cache)?;
         let view_batch = view_batch
             .ok_or_else(|| ClientError::ServerError(format!("Table or view '{schema_name}.{name}' not found")))?;
-        let record = find_view_record(&view_batch, schema_id, &name)?;
-        let columns = extract_col_entries(&col_batch, record.vid, OWNER_KIND_VIEW)?;
+        let record = find_view_record(&view_batch, schema_id, &name)?
+            .ok_or_else(|| ClientError::ServerError(format!("Table or view '{schema_name}.{name}' not found")))?;
         // The view PK is the persisted leading-k column list: a single synthetic
         // hash column for join/set-op/distinct views, or the source PK passed
         // through (0..k) for a plain projection over a compound-PK table.
-        let schema = Schema {
-            columns,
-            pk_cols: decode_pk_cols(record.pk_col_idx)?,
-        };
+        let schema = self.load_owner_schema(record.vid, OWNER_KIND_VIEW, record.pk_col_idx)?;
         Ok((record.vid, schema))
     }
 
@@ -1220,7 +1174,41 @@ impl GnitzClient {
         Ok(false)
     }
 
-    // --- Private helpers (delegating to module-level functions) ---
+    // --- Private catalog-lookup helpers ---
+
+    /// Resolve `schema_name` (already canonicalized) to its SCHEMA_TAB id. A
+    /// missing row — or an entirely empty SCHEMA_TAB — is the one
+    /// schema-qualified "not found" error every DDL/resolve path reports.
+    fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
+        let (_, batch, _) = self.conn.scan(SCHEMA_TAB, &mut self.schema_cache)?;
+        match &batch {
+            Some(b) => find_schema_id(b, schema_name)?,
+            None => None,
+        }
+        .ok_or_else(|| ClientError::ServerError(format!("Schema '{schema_name}' not found")))
+    }
+
+    /// Find `table_name`'s TABLE_TAB record under `schema_id`. `Ok(None)` = the
+    /// name is absent (an empty TABLE_TAB folds into the same miss); `Err` = a
+    /// decode error on a corrupt batch, which must surface rather than be
+    /// masked as a miss.
+    fn lookup_table_record(&mut self, schema_id: u64, table_name: &str) -> Result<Option<TableRecord>, ClientError> {
+        let (_, batch, _) = self.conn.scan(TABLE_TAB, &mut self.schema_cache)?;
+        match &batch {
+            Some(b) => find_table_record(b, schema_id, table_name),
+            None => Ok(None),
+        }
+    }
+
+    /// Load an owner's (table's or view's) columns from COL_TAB and assemble
+    /// its validated `Schema`. Called only on a resolved owner, so miss paths
+    /// never pay the COL_TAB scan.
+    fn load_owner_schema(&mut self, owner_id: u64, owner_kind: u64, pk_col_idx: u64) -> Result<Schema, ClientError> {
+        let (_, col_batch, _) = self.conn.scan(COL_TAB, &mut self.schema_cache)?;
+        let col_batch = col_batch.ok_or_else(|| ClientError::ServerError("COL_TAB is empty".to_string()))?;
+        let columns = extract_col_entries(&col_batch, owner_id, owner_kind)?;
+        assemble_schema(columns, pk_col_idx)
+    }
 }
 
 fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) -> Result<Vec<ColumnDef>, ClientError> {
@@ -1252,19 +1240,46 @@ fn extract_col_entries(col_batch: &ZSetBatch, owner_id: u64, owner_kind: u64) ->
         ));
     }
     col_entries.sort_by_key(|e| e.0);
+    // The physical `col_idx` values must be exactly `0..n`. A gap or duplicate
+    // (`[0, 2]`) would silently condense to contiguous positions, shifting every
+    // column's schema position relative to the server's physical layout — a
+    // silent type/offset corruption. Surface it as an error instead.
+    for (expected, (actual, _)) in col_entries.iter().enumerate() {
+        if *actual != expected as u64 {
+            return Err(ClientError::ServerError(format!(
+                "COL_TAB for owner {owner_id} (kind {owner_kind}): column index gap or \
+                 duplicate — expected {expected}, got {actual}"
+            )));
+        }
+    }
     Ok(col_entries.into_iter().map(|(_, cd)| cd).collect())
 }
 
-fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<u64, ClientError> {
-    for i in batch.live_rows() {
-        if col_str(&batch.columns[1], i)? == Some(name) {
-            return Ok(batch.pks.get(i) as u64);
-        }
-    }
-    Err(ClientError::ServerError(format!("Schema '{name}' not found")))
+/// Assemble and validate a `Schema` from decoded catalog parts.
+/// `Schema::from_parts` (shared with the wire schema-block decoder) checks the
+/// PK indices — bounds, duplicates, non-nullable, PK-eligible type — so a
+/// corrupt `pk_col_idx` or COL_TAB row surfaces as a clean error here rather
+/// than a `columns[ci]` panic in `pk_stride`/sort-merge downstream.
+fn assemble_schema(columns: Vec<ColumnDef>, pk_col_idx: u64) -> Result<Schema, ClientError> {
+    let pk_cols = decode_pk_cols(pk_col_idx)?;
+    Schema::from_parts(columns, pk_cols)
+        .map_err(|e| ClientError::ServerError(format!("catalog schema is invalid: {e}")))
 }
 
-fn find_table_record(batch: &ZSetBatch, schema_id: u64, table_name: &str) -> Result<TableRecord, ClientError> {
+/// `Ok(None)` = name absent (a legitimate miss); `Err` = a decode error on a
+/// corrupt catalog batch.
+fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientError> {
+    for i in batch.live_rows() {
+        if col_str(&batch.columns[1], i)? == Some(name) {
+            return Ok(Some(batch.pks.get(i) as u64));
+        }
+    }
+    Ok(None)
+}
+
+/// `Ok(None)` = name absent (a legitimate miss); `Err` = a decode error on a
+/// corrupt `TABLE_TAB` batch.
+fn find_table_record(batch: &ZSetBatch, schema_id: u64, table_name: &str) -> Result<Option<TableRecord>, ClientError> {
     for i in batch.live_rows() {
         if col_u64(&batch.columns[1], i)? != schema_id {
             continue;
@@ -1272,17 +1287,16 @@ fn find_table_record(batch: &ZSetBatch, schema_id: u64, table_name: &str) -> Res
         if col_str(&batch.columns[2], i)? != Some(table_name) {
             continue;
         }
-        return Ok(TableRecord {
+        return Ok(Some(TableRecord {
             tid: batch.pks.get(i) as u64,
             schema_id,
-            name: table_name.to_string(),
             directory: col_str(&batch.columns[3], i)?.unwrap_or("").to_string(),
             pk_col_idx: col_u64(&batch.columns[4], i)?,
             created_lsn: col_u64(&batch.columns[5], i)?,
             flags: col_u64(&batch.columns[6], i)?,
-        });
+        }));
     }
-    Err(ClientError::ServerError(format!("Table '{table_name}' not found")))
+    Ok(None)
 }
 
 /// Decode row `i` of a `VIEW_TAB` batch into a `ViewRecord` — the single home
@@ -1314,7 +1328,9 @@ fn append_view_row(a: &mut BatchAppender<'_>, weight: i64, rec: &ViewRecord) {
         .u64_val(rec.pk_col_idx);
 }
 
-fn find_view_record(batch: &ZSetBatch, schema_id: u64, view_name: &str) -> Result<ViewRecord, ClientError> {
+/// `Ok(None)` = absent (a legitimate miss); `Err` = a decode error on a corrupt
+/// `VIEW_TAB` batch.
+fn find_view_record(batch: &ZSetBatch, schema_id: u64, view_name: &str) -> Result<Option<ViewRecord>, ClientError> {
     for i in batch.live_rows() {
         if col_u64(&batch.columns[1], i)? != schema_id {
             continue;
@@ -1322,9 +1338,9 @@ fn find_view_record(batch: &ZSetBatch, schema_id: u64, view_name: &str) -> Resul
         if col_str(&batch.columns[2], i)? != Some(view_name) {
             continue;
         }
-        return decode_view_record(batch, i);
+        return Ok(Some(decode_view_record(batch, i)?));
     }
-    Err(ClientError::ServerError(format!("View '{view_name}' not found")))
+    Ok(None)
 }
 
 /// Collect the full `ViewRecord`s of every live `VIEW_TAB` row whose `schema_id`
@@ -1487,5 +1503,118 @@ mod tests {
             ),
             other => panic!("expected ServerError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn find_table_record_surfaces_decode_error_not_miss() {
+        let schema = table_tab_schema();
+        let mut batch = ZSetBatch::new(schema);
+        BatchAppender::new(&mut batch, schema)
+            .add_row(7, 1)
+            .u64_val(1) // schema_id
+            .str_val("t") // name
+            .str_val("") // directory
+            .u64_val(0) // pk_col_idx
+            .u64_val(0) // created_lsn
+            .u64_val(0); // flags
+
+        // Truncate columns[1] (schema_id, Fixed) so `col_u64` on the live row is
+        // out of bounds — a real decode error, which must surface as Err rather
+        // than be masked as an absent-name miss.
+        let ColData::Fixed(bytes) = &mut batch.columns[1] else {
+            panic!("expected Fixed column");
+        };
+        bytes.clear();
+        match find_table_record(&batch, 1, "t") {
+            Err(ClientError::ServerError(s)) => assert!(s.contains("out of bounds"), "got: {s}"),
+            _ => panic!("expected decode ServerError, got a non-error result"),
+        }
+    }
+
+    #[test]
+    fn find_table_record_miss_is_none() {
+        let schema = table_tab_schema();
+        let mut batch = ZSetBatch::new(schema);
+        BatchAppender::new(&mut batch, schema)
+            .add_row(7, 1)
+            .u64_val(1)
+            .str_val("t")
+            .str_val("")
+            .u64_val(0)
+            .u64_val(0)
+            .u64_val(0);
+        assert!(find_table_record(&batch, 1, "absent").unwrap().is_none());
+        assert!(find_table_record(&batch, 1, "t").unwrap().is_some());
+    }
+
+    #[test]
+    fn find_schema_id_miss_vs_hit() {
+        let schema = schema_tab_schema();
+        let mut batch = ZSetBatch::new(schema);
+        BatchAppender::new(&mut batch, schema).add_row(3, 1).str_val("foo");
+        assert_eq!(find_schema_id(&batch, "foo").unwrap(), Some(3));
+        assert!(find_schema_id(&batch, "bar").unwrap().is_none());
+    }
+
+    #[test]
+    fn assemble_schema_rejects_out_of_range_pk() {
+        let cols = vec![
+            ColumnDef::new("a", TypeCode::U64, false),
+            ColumnDef::new("b", TypeCode::U64, false),
+        ];
+        // pk_col_idx 5 decodes to the single-column PK `[5]`, out of range for a
+        // 2-column table — must surface here, not panic downstream.
+        match assemble_schema(cols.clone(), 5).expect_err("expected invalid schema") {
+            ClientError::ServerError(s) => assert!(s.contains("catalog schema is invalid"), "got: {s}"),
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+        // A valid `(columns, pk_col_idx)` returns the Schema.
+        let assembled = assemble_schema(cols, 0).unwrap();
+        assert_eq!(assembled.pk_cols, vec![0]);
+        assert_eq!(assembled.columns.len(), 2);
+    }
+
+    fn push_col_row(a: &mut BatchAppender<'_>, owner_id: u64, col_idx: u64, name: &str) {
+        a.add_row(pack_col_id(owner_id, col_idx as usize).unwrap() as u128, 1)
+            .u64_val(owner_id) // owner_id
+            .u64_val(OWNER_KIND_TABLE) // owner_kind
+            .u64_val(col_idx) // col_idx
+            .str_val(name) // name
+            .u64_val(TypeCode::U64 as u64) // type_code
+            .u64_val(0) // is_nullable
+            .u64_val(0) // fk_table_id
+            .u64_val(0) // fk_col_idx
+            .u64_val(0) // is_serial
+            .u64_val(0); // is_hidden
+    }
+
+    #[test]
+    fn extract_col_entries_rejects_index_gap() {
+        let schema = col_tab_schema();
+        let mut batch = ZSetBatch::new(schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, schema);
+            push_col_row(&mut a, 1, 0, "a");
+            push_col_row(&mut a, 1, 2, "c"); // gap: col_idx 1 is missing
+        }
+        match extract_col_entries(&batch, 1, OWNER_KIND_TABLE).expect_err("expected gap error") {
+            ClientError::ServerError(s) => assert!(s.contains("column index gap or duplicate"), "got: {s}"),
+            other => panic!("expected ServerError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_col_entries_contiguous_ok() {
+        let schema = col_tab_schema();
+        let mut batch = ZSetBatch::new(schema);
+        {
+            let mut a = BatchAppender::new(&mut batch, schema);
+            push_col_row(&mut a, 1, 1, "b"); // out of storage order
+            push_col_row(&mut a, 1, 0, "a");
+        }
+        let cols = extract_col_entries(&batch, 1, OWNER_KIND_TABLE).unwrap();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "a");
+        assert_eq!(cols[1].name, "b");
     }
 }

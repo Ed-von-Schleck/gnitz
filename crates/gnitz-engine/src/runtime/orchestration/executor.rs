@@ -914,6 +914,25 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
         return;
     }
 
+    // ---------- Empty push ----------
+    // A push of an empty batch is a legitimate empty Z-set delta: it commits
+    // nothing, so ACK immediately with the "nothing written" LSN 0 (trivially
+    // satisfied by any later freshness check). FLAG_PUSH is what separates it
+    // from the data-less scan request below — without the flag an empty push
+    // would be routed to handle_scan, whose streamed table dump desyncs push
+    // reply readers (they read exactly one frame).
+    if flags & gnitz_wire::FLAG_PUSH != 0 && (!has_batch || batch_count == 0) {
+        // Same existence check as the INSERT path below; system-table ids are
+        // fixed and always present, so only user tables are probed.
+        if target_id >= FIRST_USER_TABLE_ID && !shared.cat().has_id(target_id) {
+            let msg = format!("table {target_id} not found");
+            send_error(peer, target_id, client_id, msg.as_bytes()).await;
+            return;
+        }
+        send_ok_response(shared, peer, target_id, None, client_id, 0, client_version).await;
+        return;
+    }
+
     if target_id >= FIRST_USER_TABLE_ID && (!has_batch || batch_count == 0) {
         handle_scan(shared, peer, client_id, target_id, client_version).await;
         return;

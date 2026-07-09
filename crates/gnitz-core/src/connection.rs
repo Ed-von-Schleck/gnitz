@@ -8,7 +8,7 @@ use crate::protocol::{
     send_message_noschema, send_message_with_extra, wire_flags_get_index_version, wire_flags_get_schema_version,
     wire_flags_set_conflict_mode, wire_flags_set_index_version, wire_flags_set_schema_version, Message, PkTuple,
     Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID, FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE,
-    FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
+    FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_GET_INDICES, FLAG_PUSH, FLAG_SEEK, FLAG_SEEK_BY_INDEX,
     FLAG_SEEK_BY_INDEX_RANGE, STATUS_ERROR, STATUS_NO_INDEX, STATUS_SCHEMA_MISMATCH,
 };
 use lru::LruCache;
@@ -331,7 +331,10 @@ impl Connection {
         mode: WireConflictMode,
         cache: &mut LruCache<u64, (Arc<Schema>, u16)>,
     ) -> Result<Message, ClientError> {
-        let base_flags = wire_flags_set_conflict_mode(0, mode);
+        // FLAG_PUSH marks the frame as a push independent of data presence, so
+        // an empty batch (a legitimate empty Z-set delta) is ACKed as a no-op
+        // push instead of being mistaken for a scan request.
+        let base_flags = wire_flags_set_conflict_mode(FLAG_PUSH, mode);
         let warm_version: Option<u16> = match cache.peek(&target_id) {
             Some((cached_schema, v)) if *v != 0 && schema.types_match(cached_schema.as_ref()) => Some(*v),
             _ => None,

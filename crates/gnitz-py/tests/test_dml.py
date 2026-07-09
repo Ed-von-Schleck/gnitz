@@ -37,6 +37,34 @@ def test_scan_empty_table(client):
     client.drop_schema(sn)
 
 
+def test_empty_push_no_desync(client):
+    """A push of an empty batch is a no-op push on the wire (FLAG_PUSH with no
+    data rows) that the server ACKs with the "nothing written" LSN 0 — never a
+    scan, whose streamed table dump would desync the one-frame push reply
+    reader. A following non-empty push must return a genuine ingest LSN and
+    scan must reflect exactly the real writes."""
+    sn, tid, schema = _setup(client)
+
+    # Seed a row so a mis-routed scan would actually stream table data.
+    seed = gnitz.ZSetBatch(schema)
+    seed.append(pk=1, val=10)
+    client.push(tid, seed)
+
+    empty = gnitz.ZSetBatch(schema)
+    assert len(empty) == 0
+    assert client.push(tid, empty) == 0
+
+    # Connection is still aligned: a real push returns a real LSN and the scan
+    # sees exactly the two written rows (seed + this one), nothing leaked.
+    batch = gnitz.ZSetBatch(schema)
+    batch.append(pk=2, val=20)
+    assert client.push(tid, batch) > 0
+    rows = {r.pk: r.val for r in client.scan(tid) if r.weight > 0}
+    assert rows == {1: 10, 2: 20}
+    client.drop_table(sn, "t")
+    client.drop_schema(sn)
+
+
 def test_delete_rows(client):
     sn, tid, schema = _setup(client)
     batch = gnitz.ZSetBatch(schema)

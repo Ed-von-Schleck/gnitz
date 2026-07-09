@@ -2019,10 +2019,14 @@ fn encode_push_payload(
     schema: &Schema,
     batch: &ZSetBatch,
 ) -> Result<Vec<u8>, gnitz_core::ProtocolError> {
+    // FLAG_PUSH marks the frame as a push independent of data presence, so an
+    // empty batch (a legitimate empty Z-set delta) is ACKed as a no-op push
+    // (LSN 0) instead of being mistaken for a scan — a mis-route whose streamed
+    // table dump would desync the one-frame Push reply reader.
     gnitz_core::encode_message(
         target_id,
         client_id,
-        0,
+        gnitz_core::FLAG_PUSH,
         &gnitz_core::PkTuple::EMPTY,
         0,
         Some(schema),

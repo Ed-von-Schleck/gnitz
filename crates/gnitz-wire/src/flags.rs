@@ -13,6 +13,10 @@ const SAL_FLAGS_MASK: u64 = 0x0000_FFFF;
 pub const FLAG_SHUTDOWN: u64 = 4;
 pub const FLAG_DDL_SYNC: u64 = 8;
 pub const FLAG_EXCHANGE: u64 = 16;
+/// Marks a frame as a data push, on both the client→master and master→SAL/
+/// worker legs. Client push frames carry it so push-vs-scan routing never
+/// depends on data presence: an empty batch (a legitimate empty Z-set delta)
+/// is ACKed as a no-op push (LSN 0) instead of being mistaken for a scan.
 pub const FLAG_PUSH: u64 = 32;
 pub const FLAG_HAS_PK: u64 = 64;
 pub const FLAG_SEEK: u64 = 128;

@@ -176,6 +176,39 @@ async def test_scan_system_table(aconn):
 
 
 # ---------------------------------------------------------------------------
+# Empty push (regression: the server must ACK an empty push as a no-op push —
+# LSN 0 — never mis-route it to a scan whose streamed table dump desyncs the
+# one-frame push reply reader; the sync-connection variant lives in test_dml)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pipeline_empty_push_interleaved(aconn, table):
+    """Interleave an empty push among non-empty pushes in one pipeline block.
+    Every queued push gets exactly one result: the empty one is 0, the rest are
+    non-decreasing non-zero LSNs, and a post-block scan shows only the non-empty
+    rows (no frame misalignment across the batch)."""
+    tid, cols, _ = table
+    schema = gnitz.Schema(cols)
+
+    async with aconn.pipeline() as pipe:
+        pipe.push(tid, _batch(cols, [{"pk": 1, "val": 10}]))
+        pipe.push(tid, gnitz.ZSetBatch(schema))  # empty — the interleaved no-op
+        pipe.push(tid, _batch(cols, [{"pk": 2, "val": 20}]))
+        pipe.push(tid, _batch(cols, [{"pk": 3, "val": 30}]))
+
+    results = pipe.results
+    assert len(results) == 4
+    assert results[1] == 0
+    nonzero = [results[0], results[2], results[3]]
+    assert all(r > 0 for r in nonzero)
+    assert nonzero == sorted(nonzero)
+
+    result = await aconn.scan(tid)
+    rows = {r.pk: r.val for r in result if r.weight > 0}
+    assert rows == {1: 10, 2: 20, 3: 30}
+
+
+# ---------------------------------------------------------------------------
 # Connection lifecycle
 # ---------------------------------------------------------------------------
 

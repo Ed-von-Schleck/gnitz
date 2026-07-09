@@ -103,19 +103,7 @@ pub fn batch_to_schema(batch: &ZSetBatch) -> Result<Schema, ProtocolError> {
     pk_pairs.sort_by_key(|(p, _)| *p);
     let pk_cols: Vec<usize> = pk_pairs.into_iter().map(|(_, i)| i).collect();
 
-    Schema::validate_pk_cols(&pk_cols, columns.len()).map_err(|e| ProtocolError::DecodeError(e.into()))?;
-    // PK columns must additionally be non-nullable and PK-eligible — the same
-    // invariants the engine's SchemaDescriptor::new hard-asserts.
-    for &pk in &pk_cols {
-        if columns[pk].is_nullable {
-            return Err(ProtocolError::DecodeError("PK column must be non-nullable".into()));
-        }
-        if !columns[pk].type_code.is_pk_eligible() {
-            return Err(ProtocolError::DecodeError("PK column type not PK-eligible".into()));
-        }
-    }
-
-    Ok(Schema { columns, pk_cols })
+    Schema::from_parts(columns, pk_cols).map_err(|e| ProtocolError::DecodeError(e.into()))
 }
 
 #[cfg(test)]

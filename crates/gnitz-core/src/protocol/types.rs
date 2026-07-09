@@ -236,6 +236,24 @@ impl Schema {
         Ok(())
     }
 
+    /// Fallible constructor for a schema assembled from untrusted parts — a
+    /// wire schema block or catalog rows. Runs [`Schema::validate_pk_cols`]
+    /// plus the PK-column invariants the engine's `SchemaDescriptor::new`
+    /// hard-asserts (non-nullable, PK-eligible type), so every decode boundary
+    /// applies the same rule set.
+    pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: Vec<usize>) -> Result<Schema, &'static str> {
+        Self::validate_pk_cols(&pk_cols, columns.len())?;
+        for &pk in &pk_cols {
+            if columns[pk].is_nullable {
+                return Err("PK column must be non-nullable");
+            }
+            if !columns[pk].type_code.is_pk_eligible() {
+                return Err("PK column type not PK-eligible");
+            }
+        }
+        Ok(Schema { columns, pk_cols })
+    }
+
     /// Structural type-equality used by the warm-push guard. Mirrors the
     /// server's `validate_schema_match` field set: column count, per-column
     /// `type_code`, `pk_cols`, and per-column nullability. Deliberately does
