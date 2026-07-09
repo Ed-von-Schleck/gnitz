@@ -3342,7 +3342,6 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     let mut base = Box::new(
         Table::new(
             &format!("{dir}/base"),
-            "base",
             schema,
             tid as u32,
             256 * 1024,
@@ -3352,7 +3351,6 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     );
     let mut idx = Table::new(
         &format!("{dir}/idx"),
-        "idx",
         idx_schema,
         tid as u32 + 1,
         256 * 1024,

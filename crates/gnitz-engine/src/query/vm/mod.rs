@@ -3,7 +3,7 @@
 use crate::expr::ScalarFunc;
 use crate::ops::AggDescriptor;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, CursorHandle, Table};
+use crate::storage::{Batch, ReadCursor, Table};
 
 mod builder;
 mod exec;
@@ -162,7 +162,7 @@ pub(crate) struct VmHandle {
     /// Indexed in parallel with `owned_trace_regs`. Cursor destructors
     /// dereference the `Table` they were opened against, so this MUST drop
     /// before `owned_tables`.
-    owned_cursor_handles: Vec<Option<Box<CursorHandle>>>,
+    owned_cursor_handles: Vec<Option<Box<ReadCursor>>>,
     /// Child tables created during compilation (history, reduce-in, AVI).
     /// `program.tables` may point into these.  Dropped AFTER `program`.
     pub owned_tables: Vec<Box<Table>>,
@@ -209,25 +209,18 @@ impl VmHandle {
             // because owned_trace_regs is not modified here, and the table is
             // accessed through owned_tables which is a separate field.
             let table: &mut Table = unsafe { &mut *(&mut *self.owned_tables[table_idx] as *mut Table) };
-            // Operator-state read path: keep compacting so L0 on owned trace
-            // tables stays bounded (no background compactor yet). Not a
-            // validator, so a compaction Err safely degrades to a null cursor
-            // pointer.
-            #[allow(clippy::disallowed_methods)] // explicit maintenance: owned-trace operator state
-            match table.create_cursor_compacting() {
-                Ok(ch) => {
-                    // Store the Box into its slot first, then derive the
-                    // pointer from the slot — taking the pointer before the
-                    // move raises Stacked Borrows aliasing questions even
-                    // though the heap address is stable across the move.
-                    self.owned_cursor_handles[slot] = Some(Box::new(ch));
-                    let ptr = self.owned_cursor_handles[slot].as_mut().unwrap().as_mut() as *mut CursorHandle;
-                    self.regfile.registers[reg_id as usize].cursor_ptr = ptr;
-                }
-                Err(_) => {
-                    self.regfile.registers[reg_id as usize].cursor_ptr = std::ptr::null_mut();
-                }
-            }
+            // Operator-state read path: compact first so L0 on owned trace
+            // tables stays bounded (no background compactor yet). A compaction
+            // Err leaves the shard index unchanged, so the cursor still opens
+            // on a consistent snapshot.
+            let _ = table.compact_if_needed();
+            // Store the Box into its slot first, then derive the
+            // pointer from the slot — taking the pointer before the
+            // move raises Stacked Borrows aliasing questions even
+            // though the heap address is stable across the move.
+            self.owned_cursor_handles[slot] = Some(Box::new(table.open_cursor()));
+            let ptr = self.owned_cursor_handles[slot].as_mut().unwrap().as_mut() as *mut ReadCursor;
+            self.regfile.registers[reg_id as usize].cursor_ptr = ptr;
         }
     }
 
@@ -316,7 +309,7 @@ pub(crate) struct Register {
     /// Delta: current batch.  Trace: unused (empty).
     pub batch: Batch,
     /// Trace: current cursor.  Borrowed each epoch.  Delta: None.
-    pub cursor_ptr: *mut CursorHandle,
+    pub cursor_ptr: *mut ReadCursor,
 }
 
 /// Collection of registers for a single plan execution.
@@ -357,7 +350,7 @@ impl RegisterFile {
                 if is_owned {
                     // Cursor was set by refresh_owned_cursors; leave it alone.
                 } else if i < handles.len() && !handles[i].is_null() {
-                    reg.cursor_ptr = handles[i] as *mut CursorHandle;
+                    reg.cursor_ptr = handles[i] as *mut ReadCursor;
                 } else {
                     reg.cursor_ptr = std::ptr::null_mut();
                 }
@@ -732,7 +725,6 @@ mod tests {
         let tdir = dir.path().join("dist_test");
         let mut table = Table::new(
             tdir.to_str().unwrap(),
-            "hist",
             schema,
             0,
             1 << 20,
@@ -771,7 +763,7 @@ mod tests {
         assert_eq!(rows1[0], (1, 1, 42)); // clamped to +1
 
         unsafe {
-            drop(Box::from_raw(ch1 as *mut CursorHandle));
+            drop(Box::from_raw(ch1 as *mut ReadCursor));
         }
 
         // Tick 2: delta w=-1, integral before tick = +3, after = +2 (still positive).
@@ -783,7 +775,7 @@ mod tests {
         let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors2, &[]).unwrap();
         assert!(r2.is_none(), "no boundary crossing: output should be empty");
         unsafe {
-            drop(Box::from_raw(ch2 as *mut CursorHandle));
+            drop(Box::from_raw(ch2 as *mut ReadCursor));
         }
 
         // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
@@ -799,10 +791,8 @@ mod tests {
         assert_eq!(rows3.len(), 1);
         assert_eq!(rows3[0], (1, -1, 42)); // retraction
         unsafe {
-            drop(Box::from_raw(ch3 as *mut CursorHandle));
+            drop(Box::from_raw(ch3 as *mut ReadCursor));
         }
-
-        table.close();
     }
 
     #[test]
@@ -819,7 +809,6 @@ mod tests {
         let tdir = dir.path().join("join_test");
         let mut table = Table::new(
             tdir.to_str().unwrap(),
-            "trace",
             right_schema,
             0,
             1 << 20,
@@ -864,9 +853,8 @@ mod tests {
         assert_eq!(c1, 200);
 
         unsafe {
-            drop(Box::from_raw(ch as *mut CursorHandle));
+            drop(Box::from_raw(ch as *mut ReadCursor));
         }
-        table.close();
     }
 
     #[test]
@@ -880,7 +868,6 @@ mod tests {
         let tdir = dir.path().join("join_multi_test");
         let mut table = Table::new(
             tdir.to_str().unwrap(),
-            "trace",
             right_schema,
             0,
             1 << 20,
@@ -921,9 +908,8 @@ mod tests {
         }
 
         unsafe {
-            drop(Box::from_raw(ch as *mut CursorHandle));
+            drop(Box::from_raw(ch as *mut ReadCursor));
         }
-        table.close();
     }
 
     #[test]
@@ -935,7 +921,6 @@ mod tests {
         let tdir = dir.path().join("cursor_test");
         let mut table = Table::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             0,
             1 << 20,
@@ -947,7 +932,7 @@ mod tests {
         table.ingest_owned_batch(batch).unwrap();
 
         let mut ch = table.open_cursor();
-        let cursor = ch.cursor_mut();
+        let cursor = &mut ch;
 
         // Verify cursor iteration
         let mut count = 0;
@@ -956,8 +941,6 @@ mod tests {
             cursor.advance();
         }
         assert_eq!(count, 3);
-
-        table.close();
     }
 
     #[test]
@@ -1003,7 +986,6 @@ mod tests {
         let tout_dir = dir.path().join("tr_out");
         let mut trace_out_table = Table::new(
             tout_dir.to_str().unwrap(),
-            "tr_out",
             out_schema,
             0,
             1 << 20,
@@ -1017,7 +999,6 @@ mod tests {
         let tin_dir = dir.path().join("tr_in");
         let mut trace_in_table = Table::new(
             tin_dir.to_str().unwrap(),
-            "tr_in",
             in_schema,
             0,
             1 << 20,
@@ -1134,14 +1115,11 @@ mod tests {
 
         // Cleanup
         unsafe {
-            drop(Box::from_raw(tr_out_ch as *mut CursorHandle));
+            drop(Box::from_raw(tr_out_ch as *mut ReadCursor));
         }
         unsafe {
-            drop(Box::from_raw(tr_in_ch as *mut CursorHandle));
+            drop(Box::from_raw(tr_in_ch as *mut ReadCursor));
         }
-
-        trace_out_table.close();
-        trace_in_table.close();
     }
 
     // Item 41: a non-linear aggregate (MIN) requires trace_in to recompute on
@@ -1256,7 +1234,6 @@ mod tests {
         let tdir = dir.path().join("seek_test");
         let mut table = Table::new(
             tdir.to_str().unwrap(),
-            "trace",
             schema,
             0,
             1 << 20,
@@ -1296,9 +1273,8 @@ mod tests {
         assert_eq!(pk0, 5);
 
         unsafe {
-            drop(Box::from_raw(ch as *mut CursorHandle));
+            drop(Box::from_raw(ch as *mut ReadCursor));
         }
-        table.close();
     }
 
     #[test]
@@ -1420,7 +1396,6 @@ mod tests {
         let tout_dir = dir.path().join("ma_tr_out");
         let mut trace_out_table = Table::new(
             tout_dir.to_str().unwrap(),
-            "ma_tr_out",
             out_schema,
             0,
             1 << 20,
@@ -1432,7 +1407,6 @@ mod tests {
         let tin_dir = dir.path().join("ma_tr_in");
         let mut trace_in_table = Table::new(
             tin_dir.to_str().unwrap(),
-            "ma_tr_in",
             in_schema,
             0,
             1 << 20,
@@ -1519,13 +1493,11 @@ mod tests {
         assert_eq!(sum_val, 60, "SUM should be 60");
 
         unsafe {
-            drop(Box::from_raw(tr_out_ch as *mut CursorHandle));
+            drop(Box::from_raw(tr_out_ch as *mut ReadCursor));
         }
         unsafe {
-            drop(Box::from_raw(tr_in_ch as *mut CursorHandle));
+            drop(Box::from_raw(tr_in_ch as *mut ReadCursor));
         }
-        trace_out_table.close();
-        trace_in_table.close();
     }
 
     // ── Fix regression: identity MAP (null func_ptr) ─────────────────────
@@ -1568,7 +1540,6 @@ mod tests {
         let tout_dir = dir.path().join("sv_tr_out");
         let mut trace_out_table = Table::new(
             tout_dir.to_str().unwrap(),
-            "sv_tr_out",
             out_schema,
             0,
             1 << 20,
@@ -1580,7 +1551,6 @@ mod tests {
         let tin_dir = dir.path().join("sv_tr_in");
         let mut trace_in_table = Table::new(
             tin_dir.to_str().unwrap(),
-            "sv_tr_in",
             in_schema,
             0,
             1 << 20,
@@ -1653,13 +1623,11 @@ mod tests {
         assert_eq!(sum_val, 60, "SUM(10+20+30) must be 60");
 
         unsafe {
-            drop(Box::from_raw(tr_out_ch as *mut CursorHandle));
+            drop(Box::from_raw(tr_out_ch as *mut ReadCursor));
         }
         unsafe {
-            drop(Box::from_raw(tr_in_ch as *mut CursorHandle));
+            drop(Box::from_raw(tr_in_ch as *mut ReadCursor));
         }
-        trace_out_table.close();
-        trace_in_table.close();
     }
 
     // ── Fix regression: stale external cursor in bind_cursors ─────────────
@@ -1674,9 +1642,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("stale_cursor_test");
-        let mut table = Table::new(
+        let table = Table::new(
             tdir.to_str().unwrap(),
-            "ext",
             schema,
             0,
             1 << 20,
@@ -1710,7 +1677,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        unsafe { drop(Box::from_raw(ch1 as *mut CursorHandle)) };
+        unsafe { drop(Box::from_raw(ch1 as *mut ReadCursor)) };
         // ch1 is now freed; reg 1's cursor_ptr would be dangling if not cleared.
 
         // Epoch 2: pass null for the external trace register.
@@ -1734,7 +1701,5 @@ mod tests {
             vm.regfile.registers[1].cursor_ptr.is_null(),
             "external trace register must be null after epoch with null handle"
         );
-
-        table.close();
     }
 }

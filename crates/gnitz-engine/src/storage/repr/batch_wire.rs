@@ -12,12 +12,12 @@
 use std::ffi::CStr;
 
 use super::super::error::StorageError;
-use super::super::lsm::shard_file;
-use super::super::lsm::wal;
 use super::batch::{
     pk_stride, Batch, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
 };
 use super::merge::MemBatch;
+use super::shard_file;
+use super::wal;
 use crate::schema::SchemaDescriptor;
 
 impl Batch {
@@ -28,20 +28,11 @@ impl Batch {
     pub fn write_as_shard(
         &self,
         path: &CStr,
-        table_id: u32,
         schema: &SchemaDescriptor,
         opts: shard_file::ShardWriteOpts,
     ) -> Result<(), StorageError> {
         let regions = self.regions();
-        shard_file::write_shard_streaming(
-            libc::AT_FDCWD,
-            path,
-            table_id,
-            self.count as u32,
-            &regions,
-            schema,
-            opts,
-        )
+        shard_file::write_shard_streaming(libc::AT_FDCWD, path, self.count as u32, &regions, schema, opts)
     }
 
     // ── Wire serialization (used by runtime::sal / runtime::wire) ───────────
@@ -124,19 +115,17 @@ impl Batch {
         let new_offset = wal::encode(
             out,
             offset,
-            0,
             table_id,
             count as u32,
             &ptrs[..nr_wire],
             &sizes[..nr_wire],
-            0,
             checksum,
         )
         .expect("WAL encode failed: buffer too small");
         new_offset - offset
     }
 
-    /// Encode self into WAL V4 wire format at out[offset..]. Returns bytes written.
+    /// Encode self into WAL wire format at out[offset..]. Returns bytes written.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize, checksum: bool) -> usize {
         let nr_wire = self.num_regions_total();
         let mut ptrs = [std::ptr::null::<u8>(); MAX_WIRE_REGIONS];
@@ -145,111 +134,39 @@ impl Batch {
             ptrs[i] = self.region_ptr(i);
             sizes[i] = self.region_size(i) as u32;
         }
-        let blob_size = self.blob.len() as u64;
         let new_offset = wal::encode(
             out,
             offset,
-            0,
             table_id,
             self.count as u32,
             &ptrs[..nr_wire],
             &sizes[..nr_wire],
-            blob_size,
             checksum,
         )
         .expect("WAL encode failed: buffer too small");
         new_offset - offset
     }
 
-    /// Decode a WAL block from `data` using `schema`. Returns (Batch, bytes_consumed).
-    /// Does not set sorted/consolidated — caller derives those from wire header flags.
+    /// Decode a WAL block from `data` using `schema` into an owned `Batch`.
+    /// Returns (Batch, bytes_consumed). Does not set sorted/consolidated —
+    /// caller derives those from wire header flags. One parse
+    /// (`decode_mem_batch_from_wal_block`) + one bulk region copy.
     /// Set `verify_checksum = false` for trusted IPC paths (W2M ring).
     pub fn decode_from_wal_block(
         data: &[u8],
         schema: &SchemaDescriptor,
         verify_checksum: bool,
     ) -> Result<(Self, usize), &'static str> {
-        let npc = schema.num_payload_cols();
-        // V4: 3 fixed regions (pk pk_stride*B, weight 8B, null_bmp 8B) + npc payload + blob
-        let expected_regions = 3 + npc + 1;
-
-        let mut lsn = 0u64;
-        let mut tid = 0u32;
-        let mut count = 0u32;
-        let mut num_regions = 0u32;
-        let mut blob_size = 0u64;
-        let mut offsets = [0u64; MAX_WIRE_REGIONS];
-        let mut sizes = [0u32; MAX_WIRE_REGIONS];
-
-        if wal::validate_and_parse(
-            data,
-            &mut lsn,
-            &mut tid,
-            &mut count,
-            &mut num_regions,
-            &mut blob_size,
-            &mut offsets,
-            &mut sizes,
-            MAX_WIRE_REGIONS as u32,
-            verify_checksum,
-        )
-        .is_err()
-        {
-            return Err("WAL block validation failed");
-        }
-        if (num_regions as usize) != expected_regions {
-            return Err("WAL block region count mismatch");
-        }
-
-        let bytes_consumed = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-        let n = count as usize;
-
-        // Zero-row block: `from_regions` would hard-code pk_stride=16; use the
-        // schema-correct empty batch so callers never observe a stale stride
-        // (e.g. empty transaction boundaries in the SAL).
-        if n == 0 {
-            let mut batch = Batch::empty_with_schema(schema);
-            batch.set_schema(*schema);
-            return Ok((batch, bytes_consumed));
-        }
-
-        // Validate per-region byte sizes against the schema-expected strides
-        // (`n > 0` here — the zero-row block returned early above). `from_regions`
-        // derives strides by dividing the supplied sizes by `count`, so a
-        // mismatch would silently propagate into the decoded Batch — and
-        // `get_pk` reads `strides[REG_PK]`, which a stride > 16 would make
-        // `widen_pk_le` panic on. (Blob region is variable-length.)
-        let pk_stride = schema.pk_stride() as usize;
-        if sizes[REG_PK] as usize != n * pk_stride {
-            return Err("WAL block PK region size mismatch");
-        }
-        if sizes[REG_WEIGHT] as usize != n * 8 {
-            return Err("WAL block weight region size mismatch");
-        }
-        if sizes[REG_NULL_BMP] as usize != n * 8 {
-            return Err("WAL block null bitmap region size mismatch");
-        }
-        for (pi, _, col) in schema.payload_columns() {
-            if sizes[REG_PAYLOAD_START + pi] as usize != n * col.size() as usize {
-                return Err("WAL block payload region size mismatch");
-            }
-        }
-
-        let nr_mem = expected_regions;
-        let mut ptrs = [std::ptr::null::<u8>(); MAX_WIRE_REGIONS];
-        let mut region_sizes = [0u32; MAX_WIRE_REGIONS];
-
-        // `validate_and_parse` guaranteed every region's `[off, off + sz)` lies
-        // within the block, so each pointer is in-bounds; a zero-size region
-        // keeps its null pointer.
-        for i in 0..nr_mem {
-            region_sizes[i] = sizes[i];
-            if sizes[i] > 0 {
-                ptrs[i] = unsafe { data.as_ptr().add(offsets[i] as usize) };
-            }
-        }
-
-        let mut batch = unsafe { Batch::from_regions(&ptrs[..nr_mem], &region_sizes[..nr_mem], n, npc) };
+        let (mb, bytes_consumed) = decode_mem_batch_inner(data, schema, verify_checksum)?;
+        // Zero-row block: use the schema-correct empty batch so callers never
+        // observe a stale stride (e.g. empty transaction boundaries in the SAL).
+        let mut batch = if mb.count == 0 {
+            Batch::empty_with_schema(schema)
+        } else {
+            let mut owned = Batch::with_schema(*schema, mb.count);
+            owned.append_mem_batch_range(&mb, 0, mb.count, super::batch::WeightFill::Copy);
+            owned
+        };
         batch.set_schema(*schema);
         Ok((batch, bytes_consumed))
     }
@@ -259,59 +176,51 @@ impl Batch {
 /// directly. No allocation; caller must keep `data` live for as long as the
 /// returned `MemBatch` is used. Checksum verification is skipped (IPC trusted
 /// path).
-///
-/// The returned `MemBatch` carries the parsed region offsets by value.
-/// `validate_and_parse` guarantees every region's `[offset, offset + size)`
-/// lies within the block; here we additionally require each fixed region to be
-/// large enough for `count` rows at its schema stride, so the hot-path `get_*`
-/// accessors never read past a region on a corrupted WAL block.
 pub fn decode_mem_batch_from_wal_block<'a>(
     data: &'a [u8],
     schema: &SchemaDescriptor,
 ) -> Result<MemBatch<'a>, &'static str> {
+    decode_mem_batch_inner(data, schema, false).map(|(mb, _)| mb)
+}
+
+/// The one WAL-block parser: validate the block, check every fixed region's
+/// size is exactly `count * stride` for `schema` (every producer writes exact
+/// sizes; the blob region is variable), and return a borrowed `MemBatch` view
+/// plus the block's total size (the bytes one block consumes in a multi-block
+/// buffer).
+fn decode_mem_batch_inner<'a>(
+    data: &'a [u8],
+    schema: &SchemaDescriptor,
+    verify_checksum: bool,
+) -> Result<(MemBatch<'a>, usize), &'static str> {
     let npc = schema.num_payload_cols();
     let expected_regions = 3 + npc + 1; // pk, weight, null_bmp, payload…, blob
 
-    let mut _lsn = 0u64;
-    let mut _tid = 0u32;
-    let mut count = 0u32;
-    let mut num_regions = 0u32;
-    let mut _blob_size = 0u64;
     let mut wal_offsets = [0u64; MAX_WIRE_REGIONS];
     let mut sizes = [0u32; MAX_WIRE_REGIONS];
 
-    wal::validate_and_parse(
-        data,
-        &mut _lsn,
-        &mut _tid,
-        &mut count,
-        &mut num_regions,
-        &mut _blob_size,
-        &mut wal_offsets,
-        &mut sizes,
-        MAX_WIRE_REGIONS as u32,
-        false,
-    )
-    .map_err(|_| "data WAL block invalid")?;
+    let header = wal::validate_and_parse(data, &mut wal_offsets, &mut sizes, verify_checksum)
+        .map_err(|_| "data WAL block invalid")?;
 
-    if num_regions as usize != expected_regions {
+    if header.num_regions as usize != expected_regions {
         return Err("data WAL block region count mismatch");
     }
 
-    let n = count as usize;
+    let n = header.entry_count as usize;
     let pk_stride_val = pk_stride(schema);
 
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
 
-    // Each fixed region must be large enough for `n` rows at its schema stride.
-    // `validate_and_parse` already bounded `off + sz` to the block, so a region
-    // big enough for the rows is also fully in-bounds.
+    // Each fixed region must be exactly `n` rows at its schema stride —
+    // every producer writes exact sizes, and stride-deriving consumers divide
+    // size by count, so an inexact size is a corrupt or mis-schema'd block. `validate_and_parse` already bounded
+    // `off + sz` to the block, so an exact-size region is also fully in-bounds.
     let validate = |r: usize, row_stride: usize| -> Result<usize, &'static str> {
         if n == 0 {
             return Ok(0);
         }
-        if (sizes[r] as usize) < n * row_stride {
-            return Err("data WAL region too small");
+        if sizes[r] as usize != n * row_stride {
+            return Err("data WAL region size mismatch");
         }
         Ok(wal_offsets[r] as usize)
     };
@@ -338,13 +247,16 @@ pub fn decode_mem_batch_from_wal_block<'a>(
         }
     };
 
-    Ok(MemBatch {
-        data,
-        offsets,
-        pk_stride: pk_stride_val,
-        blob,
-        count: n,
-    })
+    Ok((
+        MemBatch {
+            data,
+            offsets,
+            pk_stride: pk_stride_val,
+            blob,
+            count: n,
+        },
+        header.total_size,
+    ))
 }
 
 #[cfg(test)]
@@ -373,7 +285,7 @@ mod tests {
         let size_off = gnitz_wire::WAL_HEADER_SIZE + REG_PK * 8 + 4;
         buf[size_off..size_off + 4].copy_from_slice(&24u32.to_le_bytes());
         let r = Batch::decode_from_wal_block(&buf, &schema, false);
-        assert_eq!(r.err(), Some("WAL block PK region size mismatch"));
+        assert_eq!(r.err(), Some("data WAL region size mismatch"));
     }
 
     #[test]
@@ -393,7 +305,7 @@ mod tests {
         let size_off = gnitz_wire::WAL_HEADER_SIZE + REG_WEIGHT * 8 + 4;
         buf[size_off..size_off + 4].copy_from_slice(&4u32.to_le_bytes());
         let r = Batch::decode_from_wal_block(&buf, &schema, false);
-        assert_eq!(r.err(), Some("WAL block weight region size mismatch"));
+        assert_eq!(r.err(), Some("data WAL region size mismatch"));
     }
 
     #[test]
@@ -418,7 +330,7 @@ mod tests {
         buf[off_off..off_off + 4].copy_from_slice(&block_end.to_le_bytes());
         // verify_checksum = false: the unverified IPC path is the one this guards.
         let r = Batch::decode_from_wal_block(&buf, &schema, false);
-        assert_eq!(r.err(), Some("WAL block validation failed"));
+        assert_eq!(r.err(), Some("data WAL block invalid"));
     }
 
     #[test]

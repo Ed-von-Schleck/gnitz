@@ -4,11 +4,10 @@
 //!
 //! Both variants own their backing data via `Rc`, so a `CursorSource` (and the
 //! enclosing `ReadCursor`) is a self-contained owning value with no borrow
-//! lifetime — what lets `CursorHandle` cross DAG/VM boundaries without a
+//! lifetime — what lets `ReadCursor` cross DAG/VM boundaries without a
 //! `'static` transmute. The accessors are `pub(super)`: the parent merge engine
 //! and the `output` drain submodule read through them.
 
-use std::ptr;
 use std::rc::Rc;
 
 use super::super::batch::Batch;
@@ -26,52 +25,6 @@ pub(super) enum CursorSource {
 }
 
 impl CursorSource {
-    #[inline]
-    pub(super) fn get_weight(&self, row: usize) -> i64 {
-        match self {
-            CursorSource::Batch(b) => b.get_weight(row),
-            CursorSource::Shard(s) => s.get_weight(row),
-        }
-    }
-
-    #[inline]
-    pub(super) fn get_null_word(&self, row: usize) -> u64 {
-        match self {
-            CursorSource::Batch(b) => b.get_null_word(row),
-            CursorSource::Shard(s) => s.get_null_word(row),
-        }
-    }
-
-    /// Column data as a slice, indexed by PAYLOAD column position.
-    #[inline]
-    pub(super) fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
-        match self {
-            CursorSource::Batch(b) => b.get_col_ptr(row, payload_col, col_size),
-            CursorSource::Shard(s) => s.get_col_ptr(row, payload_col, col_size),
-        }
-    }
-
-    #[inline]
-    pub(super) fn blob_ptr(&self) -> *const u8 {
-        match self {
-            CursorSource::Batch(b) => {
-                if b.blob.is_empty() {
-                    ptr::null()
-                } else {
-                    b.blob.as_ptr()
-                }
-            }
-            CursorSource::Shard(s) => s.blob_ptr(),
-        }
-    }
-
-    pub(super) fn blob_slice(&self) -> &[u8] {
-        match self {
-            CursorSource::Batch(b) => &b.blob,
-            CursorSource::Shard(s) => s.blob_slice(),
-        }
-    }
-
     /// First row whose OPK bytes are `>= key`. A raw `memcmp` binary search
     /// over the order-preserving PK regions — correct at every PK width with no
     /// schema dependency. `key` must be exactly `pk_stride` OPK bytes.
@@ -88,14 +41,6 @@ impl CursorSource {
         match self {
             CursorSource::Batch(b) => b.advance_to(key, hint),
             CursorSource::Shard(s) => s.advance_to(key, hint),
-        }
-    }
-
-    #[inline]
-    pub(super) fn get_pk_bytes(&self, row: usize) -> &[u8] {
-        match self {
-            CursorSource::Batch(b) => b.get_pk_bytes(row),
-            CursorSource::Shard(s) => s.get_pk_bytes(row),
         }
     }
 
@@ -117,22 +62,37 @@ impl CursorSource {
 impl ColumnarSource for CursorSource {
     #[inline]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {
-        CursorSource::get_pk_bytes(self, row)
+        match self {
+            CursorSource::Batch(b) => b.get_pk_bytes(row),
+            CursorSource::Shard(s) => s.get_pk_bytes(row),
+        }
     }
     #[inline]
     fn get_weight(&self, row: usize) -> i64 {
-        CursorSource::get_weight(self, row)
+        match self {
+            CursorSource::Batch(b) => b.get_weight(row),
+            CursorSource::Shard(s) => s.get_weight(row),
+        }
     }
     #[inline]
     fn get_null_word(&self, row: usize) -> u64 {
-        CursorSource::get_null_word(self, row)
+        match self {
+            CursorSource::Batch(b) => b.get_null_word(row),
+            CursorSource::Shard(s) => s.get_null_word(row),
+        }
     }
     #[inline]
     fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &[u8] {
-        CursorSource::get_col_ptr(self, row, payload_col, col_size)
+        match self {
+            CursorSource::Batch(b) => b.get_col_ptr(row, payload_col, col_size),
+            CursorSource::Shard(s) => s.get_col_ptr(row, payload_col, col_size),
+        }
     }
     #[inline]
     fn blob_slice(&self) -> &[u8] {
-        CursorSource::blob_slice(self)
+        match self {
+            CursorSource::Batch(b) => &b.blob,
+            CursorSource::Shard(s) => s.blob_slice(),
+        }
     }
 }

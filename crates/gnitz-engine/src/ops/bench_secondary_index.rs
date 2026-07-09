@@ -120,7 +120,6 @@ fn time_upsert(
         let pre = build_pre();
         let mut t = Table::new(
             tmp.to_str().unwrap(),
-            "u",
             schema,
             base_id + i,
             arena(),
@@ -198,7 +197,6 @@ fn secondary_index_bench_avi_decomposition() {
     let full = time(|| {
         let mut t = Table::new(
             tmp.path().to_str().unwrap(),
-            "avi",
             avi_schema,
             id,
             arena(),

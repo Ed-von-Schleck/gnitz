@@ -8,8 +8,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use libc::c_int;
 
-use super::super::repr::batch::{strides_from_schema, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
-use super::error::StorageError;
+use super::super::error::StorageError;
+use super::batch::{strides_from_schema, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
 use super::merge::pack_pk_be;
 use super::xor8;
@@ -54,9 +54,12 @@ impl PkUniqueChecker {
         }
     }
 
-    /// Observe one output row. `pk_bytes` is the OPK-encoded key slice (sorted).
-    /// `weight` is the net row weight after consolidation.
-    pub fn observe(&mut self, pk_bytes: &[u8], weight: i64) {
+    /// Observe one output row. `prefix` must be `pack_pk_be(pk_bytes)` — the
+    /// compaction emit loop already has it for guard routing, so it is taken
+    /// rather than recomputed. `pk_bytes` is the OPK-encoded key slice (sorted;
+    /// needed to confirm a prefix tie for wide keys). `weight` is the net row
+    /// weight after consolidation.
+    pub fn observe(&mut self, prefix: u128, pk_bytes: &[u8], weight: i64) {
         if !self.qualifies {
             return;
         }
@@ -64,7 +67,7 @@ impl PkUniqueChecker {
             self.qualifies = false;
             return;
         }
-        let prefix = pack_pk_be(pk_bytes);
+        debug_assert_eq!(prefix, pack_pk_be(pk_bytes));
         let n = pk_bytes.len().min(MAX_PK_BYTES);
         // Is this row an adjacent duplicate of its predecessor? For narrow keys
         // (n ≤ 16) pack_pk_be is injective, so an equal prefix *is* an equal PK
@@ -87,11 +90,12 @@ impl PkUniqueChecker {
         self.has_last = true;
     }
 
-    /// Returns `SHARD_FLAG_PK_UNIQUE` when `enabled` and the observed stream
-    /// was unique, otherwise 0. Convenience for flush and compaction callers.
-    pub fn flags_if(&self, enabled: bool) -> u8 {
+    /// Returns `SHARD_FLAG_PK_UNIQUE` when the observed stream was unique,
+    /// otherwise 0. Callers gate on `can_tag_pk_unique` before constructing a
+    /// checker — a never-observed checker vacuously qualifies.
+    pub fn flags(&self) -> u8 {
         use super::layout::SHARD_FLAG_PK_UNIQUE;
-        if enabled && self.qualifies {
+        if self.qualifies {
             SHARD_FLAG_PK_UNIQUE
         } else {
             0
@@ -145,40 +149,39 @@ fn detect_weight_encoding(data: &[u8]) -> RegionEncoding {
     debug_assert!(!data.is_empty() && data.len().is_multiple_of(8));
     let n = data.len() / 8;
     let first = i64::from_le_bytes(data[..8].try_into().unwrap());
-    let mut second: Option<i64> = None;
-
-    // Pass 1: determine how many distinct values exist without allocating.
+    // Single decode pass. The bitvec is allocated lazily at the first sighting
+    // of a second distinct value — every earlier row equals `first`, so its bit
+    // is already 0 — keeping the dominant all-equal (Constant) region
+    // allocation-free; a 3+-distinct region still aborts to Raw at the third
+    // value (paying at most one wasted bitvec allocation).
+    let mut second: Option<(i64, Vec<u8>)> = None;
     for i in 1..n {
         let v = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
         if v == first {
-            // matches first value
-        } else if let Some(b) = second {
-            if v != b {
-                return RegionEncoding::Raw; // 3+ distinct values
+            continue;
+        }
+        match &mut second {
+            None => {
+                let mut bitvec = vec![0u8; n.div_ceil(8)];
+                bitvec[i / 8] |= 1 << (i % 8);
+                second = Some((v, bitvec));
             }
-        } else {
-            second = Some(v);
+            Some((b, bitvec)) => {
+                if v != *b {
+                    return RegionEncoding::Raw; // 3+ distinct values
+                }
+                bitvec[i / 8] |= 1 << (i % 8);
+            }
         }
     }
 
     match second {
         None => RegionEncoding::Constant,
-        Some(second_val) => {
-            // Pass 2: exactly 2 distinct values — build the bitvec now.
-            let bitvec_len = n.div_ceil(8);
-            let mut bitvec = vec![0u8; bitvec_len];
-            for i in 1..n {
-                let v = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
-                if v != first {
-                    bitvec[i / 8] |= 1 << (i % 8);
-                }
-            }
-            RegionEncoding::TwoValue {
-                value_a: first,
-                value_b: second_val,
-                bitvec,
-            }
-        }
+        Some((value_b, bitvec)) => RegionEncoding::TwoValue {
+            value_a: first,
+            value_b,
+            bitvec,
+        },
     }
 }
 
@@ -369,29 +372,6 @@ fn build_xor8_from_pk_region(pk_ptr: *const u8, pk_sz: usize, stride: usize) -> 
     xor8::build(&pks)
 }
 
-/// pwrite loop that handles short writes and EINTR.
-unsafe fn pwrite_all(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> Result<(), StorageError> {
-    let mut remaining = buf.len();
-    let mut p = buf.as_ptr();
-    while remaining > 0 {
-        let written = libc::pwrite(fd, p as *const libc::c_void, remaining, offset);
-        if written < 0 {
-            let e = *libc::__errno_location();
-            if e == libc::EINTR {
-                continue;
-            }
-            return Err(StorageError::Io);
-        }
-        if written == 0 {
-            return Err(StorageError::Io);
-        }
-        remaining -= written as usize;
-        p = p.add(written as usize);
-        offset += written as libc::off_t;
-    }
-    Ok(())
-}
-
 /// Per-call policy for the shard writers ([`write_shard_streaming`] /
 /// `Batch::write_as_shard`).
 ///
@@ -413,13 +393,12 @@ pub struct ShardWriteOpts {
 pub fn write_shard_streaming(
     dirfd: c_int,
     basename: &CStr,
-    table_id: u32,
     row_count: u32,
     regions: &[(*const u8, usize)],
     schema: &SchemaDescriptor,
     opts: ShardWriteOpts,
 ) -> Result<(), StorageError> {
-    let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, table_id, row_count, regions, schema, opts)?;
+    let (fd, tmp_name) = write_shard_streaming_inner(dirfd, basename, row_count, regions, schema, opts)?;
     if opts.durable && fdatasync_eintr(fd.as_raw_fd()).is_err() {
         unsafe {
             libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
@@ -450,7 +429,6 @@ pub fn write_shard_streaming(
 fn write_shard_streaming_inner(
     dirfd: c_int,
     basename: &CStr,
-    table_id: u32,
     row_count: u32,
     regions: &[(*const u8, usize)],
     schema: &SchemaDescriptor,
@@ -519,7 +497,7 @@ fn write_shard_streaming_inner(
     }
 
     // --- Phase 2: XOR8 filter built from pk region (pk_stride bytes/row, zero-extended to u128) ---
-    let xor8_filter = if row_count > 0 && num_regions >= 1 {
+    let xor8_filter = if row_count > 0 {
         let (pk_ptr, pk_sz) = regions[REG_PK];
         build_xor8_from_pk_region(pk_ptr, pk_sz, schema.pk_stride() as usize)
     } else {
@@ -535,11 +513,8 @@ fn write_shard_streaming_inner(
         region_offsets.push(pos);
         pos = align64(pos + actual_sz);
     }
-    let data_end = if num_regions == 0 {
-        HEADER_SIZE
-    } else {
-        region_offsets[num_regions - 1] + actual_sizes[num_regions - 1]
-    };
+    // num_regions >= 4 always (pk, weight, null, blob at minimum).
+    let data_end = region_offsets[num_regions - 1] + actual_sizes[num_regions - 1];
 
     let xor8_data = xor8_filter.as_ref().map(xor8::serialize);
     let xor8_offset = if xor8_data.is_some() { align64(data_end) } else { 0 };
@@ -551,11 +526,10 @@ fn write_shard_streaming_inner(
     };
 
     // --- Phase 4: build header + directory buffer ---
-    // For TwoValue regions, precompute the on-disk bytes now so they can be
-    // used for both the checksum and the later write (avoids building them
-    // twice); FoR regions already carry their image in the variant.  Slot is
-    // None for Raw / Constant / For regions.
-    let mut two_value_bufs: Vec<Option<Vec<u8>>> = (0..num_regions).map(|_| None).collect();
+    // For the (at most one) TwoValue region — only REG_WEIGHT can be TwoValue —
+    // precompute the on-disk bytes now so they serve both the checksum and the
+    // later write; FoR regions already carry their image in the variant.
+    let mut two_value_buf: Option<Vec<u8>> = None;
 
     let hdr_dir_size = HEADER_SIZE + dir_size;
     let mut hdr_buf = vec![0u8; hdr_dir_size];
@@ -584,7 +558,8 @@ fn write_shard_streaming_inner(
                 buf.extend_from_slice(&value_b.to_le_bytes());
                 buf.extend_from_slice(bitvec);
                 let cs = xxh::checksum(&buf);
-                two_value_bufs[i] = Some(buf);
+                debug_assert!(i == REG_WEIGHT && two_value_buf.is_none());
+                two_value_buf = Some(buf);
                 cs
             }
             RegionEncoding::For { buf } => xxh::checksum(buf),
@@ -607,12 +582,11 @@ fn write_shard_streaming_inner(
     write_u64_le(&mut hdr_buf, OFF_VERSION, SHARD_VERSION);
     write_u64_le(&mut hdr_buf, OFF_ROW_COUNT, row_count as u64);
     write_u64_le(&mut hdr_buf, OFF_DIR_OFFSET, dir_offset as u64);
-    write_u64_le(&mut hdr_buf, OFF_TABLE_ID, table_id as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_OFFSET, xor8_offset as u64);
     write_u64_le(&mut hdr_buf, OFF_XOR8_SIZE, xor8_size as u64);
     hdr_buf[OFF_FLAGS] = opts.flags;
 
-    let tmp_name = super::cstr_with_tmp_suffix(basename)?;
+    let tmp_name = super::super::cstr_with_tmp_suffix(basename)?;
 
     unsafe {
         let fd = libc::openat(
@@ -637,7 +611,7 @@ fn write_shard_streaming_inner(
             return Err(abort());
         }
 
-        pwrite_all(fd.as_raw_fd(), &hdr_buf, 0).map_err(|_| abort())?;
+        crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), &hdr_buf, 0).map_err(|_| abort())?;
 
         for i in 0..num_regions {
             let (src_ptr, orig_sz) = regions[i];
@@ -647,26 +621,27 @@ fn write_shard_streaming_inner(
                 RegionEncoding::Raw => {
                     if actual_sizes[i] > 0 && !src_ptr.is_null() {
                         let src = std::slice::from_raw_parts(src_ptr, orig_sz);
-                        pwrite_all(fd.as_raw_fd(), src, r_off).map_err(|_| abort())?;
+                        crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), src, r_off).map_err(|_| abort())?;
                     }
                 }
                 RegionEncoding::Constant => {
                     let elem_width = actual_sizes[i];
                     let src = std::slice::from_raw_parts(src_ptr, elem_width);
-                    pwrite_all(fd.as_raw_fd(), src, r_off).map_err(|_| abort())?;
+                    crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), src, r_off).map_err(|_| abort())?;
                 }
                 RegionEncoding::TwoValue { .. } => {
-                    let buf = two_value_bufs[i].as_ref().expect("TwoValue buf precomputed");
-                    pwrite_all(fd.as_raw_fd(), buf, r_off).map_err(|_| abort())?;
+                    let buf = two_value_buf.as_ref().expect("TwoValue buf precomputed");
+                    crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), buf, r_off).map_err(|_| abort())?;
                 }
                 RegionEncoding::For { buf } => {
-                    pwrite_all(fd.as_raw_fd(), buf, r_off).map_err(|_| abort())?;
+                    crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), buf, r_off).map_err(|_| abort())?;
                 }
             }
         }
 
         if let Some(ref data) = xor8_data {
-            pwrite_all(fd.as_raw_fd(), data, xor8_offset as libc::off_t).map_err(|_| abort())?;
+            crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), data, xor8_offset as libc::off_t)
+                .map_err(|_| abort())?;
         }
 
         Ok((fd, tmp_name))
@@ -675,10 +650,10 @@ fn write_shard_streaming_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::super::shard_reader::MappedShard;
     use super::*;
     use crate::foundation::codec::read_u64_le;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+    use crate::storage::lsm::shard_reader::MappedShard;
 
     fn make_schema_desc(num_cols: u32, pk_index: u32) -> SchemaDescriptor {
         let mut cols = [SchemaColumn::new(0, 0); MAX_COLUMNS];
@@ -718,7 +693,6 @@ mod tests {
         write_shard_streaming(
             libc::AT_FDCWD,
             &cpath,
-            42,
             row_count,
             &regions,
             &make_schema_desc(2, 0),
@@ -730,7 +704,6 @@ mod tests {
         assert_eq!(read_u64_le(&image, OFF_MAGIC), SHARD_MAGIC);
         assert_eq!(read_u64_le(&image, OFF_VERSION), SHARD_VERSION);
         assert_eq!(read_u64_le(&image, OFF_ROW_COUNT), 3);
-        assert_eq!(read_u64_le(&image, OFF_TABLE_ID), 42);
         assert!(read_u64_le(&image, OFF_XOR8_OFFSET) > 0);
         assert!(read_u64_le(&image, OFF_XOR8_SIZE) > 0);
     }
@@ -750,16 +723,7 @@ mod tests {
 
         // All-PK single-column schema (num_payload_cols = 0) → 4 regions.
         let schema = make_schema_desc(1, 0);
-        write_shard_streaming(
-            libc::AT_FDCWD,
-            &cpath,
-            1,
-            0,
-            &regions,
-            &schema,
-            ShardWriteOpts::default(),
-        )
-        .unwrap();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, 0, &regions, &schema, ShardWriteOpts::default()).unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 0);
@@ -795,7 +759,7 @@ mod tests {
             durable: true,
             ..Default::default()
         };
-        write_shard_streaming(libc::AT_FDCWD, &cpath, 42, row_count, &regions, &schema, opts).unwrap();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, row_count, &regions, &schema, opts).unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 3);
@@ -836,16 +800,7 @@ mod tests {
         ];
 
         let schema = make_schema_desc(2, 0);
-        write_shard_streaming(
-            libc::AT_FDCWD,
-            &cpath,
-            99,
-            n,
-            &regions,
-            &schema,
-            ShardWriteOpts::default(),
-        )
-        .unwrap();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, n, &regions, &schema, ShardWriteOpts::default()).unwrap();
         let image = std::fs::read(&path).unwrap();
         assert_eq!(
             read_u64_le(&image, OFF_VERSION),
@@ -892,7 +847,6 @@ mod tests {
         write_shard_streaming(
             libc::AT_FDCWD,
             &cpath,
-            1,
             n,
             &regions,
             &make_schema_desc(2, 0),
@@ -938,7 +892,7 @@ mod tests {
             durable: true,
             ..Default::default()
         };
-        write_shard_streaming(libc::AT_FDCWD, &cpath, 7, row_count, &regions, &schema, opts).unwrap();
+        write_shard_streaming(libc::AT_FDCWD, &cpath, row_count, &regions, &schema, opts).unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 4);
@@ -960,8 +914,7 @@ mod tests {
             |schema: &SchemaDescriptor, n: u32, regions: &[(*const u8, usize)], name: &str| -> Vec<u8> {
                 let path = dir.path().join(name);
                 let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-                write_shard_streaming(libc::AT_FDCWD, &cpath, 0, n, regions, schema, ShardWriteOpts::default())
-                    .unwrap();
+                write_shard_streaming(libc::AT_FDCWD, &cpath, n, regions, schema, ShardWriteOpts::default()).unwrap();
                 std::fs::read(&path).unwrap()
             };
 
@@ -1121,13 +1074,13 @@ mod tests {
 
     const FLAG: u8 = SHARD_FLAG_PK_UNIQUE;
 
-    /// `flags_if(true)` after observing the given OPK byte rows in order.
+    /// `flags()` after observing the given OPK byte rows in order.
     fn tag(rows: &[(&[u8], i64)]) -> u8 {
         let mut c = PkUniqueChecker::new();
         for &(pk, w) in rows {
-            c.observe(pk, w);
+            c.observe(pack_pk_be(pk), pk, w);
         }
-        c.flags_if(true)
+        c.flags()
     }
 
     #[test]
@@ -1185,15 +1138,11 @@ mod tests {
     }
 
     #[test]
-    fn pk_unique_checker_weight_and_disabled() {
+    fn pk_unique_checker_negative_weight() {
         let k1 = 1u64.to_be_bytes();
         let k2 = 2u64.to_be_bytes();
         // A negative weight disqualifies regardless of PK distinctness.
         assert_eq!(tag(&[(&k1, 1), (&k2, -1)]), 0, "negative weight disqualifies");
-        // flags_if(false) never tags, even for a clean unique stream.
-        let mut c = PkUniqueChecker::new();
-        c.observe(&k1, 1);
-        assert_eq!(c.flags_if(false), 0, "disabled tagging never sets the flag");
     }
 }
 

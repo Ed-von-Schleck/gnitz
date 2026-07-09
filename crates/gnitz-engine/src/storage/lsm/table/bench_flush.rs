@@ -106,7 +106,6 @@ fn flush_cadence_amplification_bench() {
         let dir = tempfile::tempdir().unwrap();
         let mut table = Table::new(
             dir.path().join("warmup").to_str().unwrap(),
-            "bench",
             schema,
             1,
             ARENA,
@@ -138,7 +137,6 @@ fn flush_cadence_amplification_bench() {
         let dir = tempfile::tempdir().unwrap();
         let mut table = Table::new(
             dir.path().join(label).to_str().unwrap(),
-            "bench",
             schema,
             100 + id as u32,
             ARENA,

@@ -1252,7 +1252,7 @@ impl WorkerProcess {
             // `None` ⇒ partition exhausted (or absent): this round is an empty
             // PAD. The master ANDs the pad bit across workers and stamps the
             // collective stop/continue/checkpoint decision back onto each relay.
-            let drained = handle.as_mut().and_then(|h| h.cursor.drain_chunk(chunk_rows));
+            let drained = handle.as_mut().and_then(|h| h.drain_chunk(chunk_rows));
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
             self.exchange.backfill_pad = Some(pad);
@@ -1399,7 +1399,7 @@ impl WorkerProcess {
         let mut sorter = crate::storage::SpillSort::new(&dir, stride, unique_preflight_spill_bytes());
         let mut keybuf = PkBuf::empty(0);
         if let Some(mut handle) = self.cat().open_store_cursor(owner_id) {
-            while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
+            while let Some(chunk) = handle.drain_chunk(chunk_rows) {
                 let mb = chunk.as_mem_batch();
                 for row in 0..chunk.count {
                     let w = chunk.get_weight(row);
@@ -1483,7 +1483,7 @@ impl WorkerProcess {
                 // a source-width prefix would match only the zero high bytes.
                 let idx_key_size = schema.leading_key_size(cols.as_slice().len());
                 let result = filter_by_pk_bytes(&batch, schema, n, |pkb| {
-                    cursor.cursor.seek_first_positive_with_prefix(&pkb[..idx_key_size])
+                    cursor.seek_first_positive_with_prefix(&pkb[..idx_key_size])
                 });
                 // The index schema is not table `target_id`'s own — one-off block.
                 self.send_response(
@@ -1544,8 +1544,11 @@ impl WorkerProcess {
     fn handle_flush_all_ephemeral(&mut self) -> Result<(), String> {
         let dag = self.cat().get_dag_ptr();
         let (traces, outputs) = unsafe { &mut *dag }.collect_ephemeral_flush_tables();
-        self.flush_tables(&traces, Table::flush_prepare_ephemeral)?; // Pass 1: all traces fully durable FIRST
-        self.flush_tables(&outputs, Table::flush_prepare_ephemeral) // Pass 2: all output stores
+        // Stamp every manifest with the generation latched at the classify site
+        // (`set_committed_generation` on the FlushEph message).
+        let generation = crate::foundation::worker_ctx::committed_generation();
+        self.flush_tables(&traces, |t| t.flush_prepare_ephemeral(generation))?; // Pass 1: all traces fully durable FIRST
+        self.flush_tables(&outputs, |t| t.flush_prepare_ephemeral(generation)) // Pass 2: all output stores
     }
 
     /// The flush body shared by the base round and each ephemeral pass; only
@@ -1561,7 +1564,7 @@ impl WorkerProcess {
     fn flush_tables(
         &mut self,
         tables: &[*mut Table],
-        prepare: fn(&mut Table) -> Result<FlushOutcome, StorageError>,
+        prepare: impl Fn(&mut Table) -> Result<FlushOutcome, StorageError>,
     ) -> Result<(), String> {
         if tables.is_empty() {
             return Ok(());
@@ -1582,7 +1585,7 @@ impl WorkerProcess {
         for &t in tables {
             let outcome = prepare(unsafe { &mut *t }).map_err(|e| format!("flush_prepare: {e}"))?;
             let work = match outcome {
-                FlushOutcome::Empty | FlushOutcome::DoneInline => continue,
+                FlushOutcome::Done => continue,
                 FlushOutcome::Pending(w) => w,
             };
             // Each work opens one fd per unsynced file (the by-path sweep) plus

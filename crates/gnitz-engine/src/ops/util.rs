@@ -77,12 +77,7 @@ pub(super) fn compare_cursor_payload_to_batch_row(
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
-    let cursor_blob = cursor.blob_ptr();
-    let cursor_blob_slice: &[u8] = if cursor_blob.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(cursor_blob, cursor.blob_len()) }
-    };
+    let cursor_blob_slice: &[u8] = cursor.blob_slice();
 
     for (pi, ci, col) in schema.payload_columns() {
         let cs = col.size() as usize;

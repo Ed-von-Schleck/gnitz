@@ -13,7 +13,10 @@ pub enum VerifyChecksum {
     No,
 }
 
-use gnitz_wire::{align8, WAL_FORMAT_VERSION, WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE};
+use gnitz_wire::{
+    align8, WAL_FORMAT_VERSION, WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE, WAL_OFF_CHECKSUM, WAL_OFF_COUNT,
+    WAL_OFF_NUM_REGIONS, WAL_OFF_SIZE, WAL_OFF_TID, WAL_OFF_VERSION,
+};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -239,8 +242,6 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
         }
     }
 
-    let blob_size = blob.len();
-
     // --- Assemble buffer: header + directory + aligned regions ---
     let dir_start = WAL_BLOCK_HEADER_SIZE;
     let dir_size = num_regions * 8;
@@ -280,34 +281,31 @@ pub fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Ve
         buf[base + 4..base + 8].copy_from_slice(&sz.to_le_bytes());
     }
 
-    // Backfill header  (lsn=0 at offset 0 is already zero)
-    buf[8..12].copy_from_slice(&table_id.to_le_bytes()); // table_id
-    buf[12..16].copy_from_slice(&(count as u32).to_le_bytes()); // entry_count
-    buf[16..20].copy_from_slice(&(total_size as u32).to_le_bytes()); // total_size
-    buf[20..24].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes()); // format_version
-                                                                    // checksum at [24..32] — filled below
-    buf[32..36].copy_from_slice(&(num_regions as u32).to_le_bytes()); // num_regions
-                                                                      // reserved [36..40] stays zero
-    buf[40..48].copy_from_slice(&(blob_size as u64).to_le_bytes()); // blob_size
+    // Backfill header (checksum filled below).
+    buf[WAL_OFF_TID..WAL_OFF_TID + 4].copy_from_slice(&table_id.to_le_bytes());
+    buf[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].copy_from_slice(&(count as u32).to_le_bytes());
+    buf[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].copy_from_slice(&(total_size as u32).to_le_bytes());
+    buf[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+    buf[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].copy_from_slice(&(num_regions as u32).to_le_bytes());
 
-    // Compute and write checksum over buf[48..]
+    // Compute and write checksum over the body.
     let checksum = if total_size > WAL_BLOCK_HEADER_SIZE {
         xxh3_64(&buf[WAL_BLOCK_HEADER_SIZE..])
     } else {
         0
     };
-    buf[24..32].copy_from_slice(&checksum.to_le_bytes());
+    buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
 
     buf
 }
 
 /// Decode a WAL block from `data`, expecting columns described by `schema`.
-/// Returns `(ZSetBatch, table_id, lsn)`.
+/// Returns `(ZSetBatch, table_id)`.
 pub fn decode_wal_block(
     data: &[u8],
     schema: &Schema,
     verify_checksum: VerifyChecksum,
-) -> Result<(ZSetBatch, u32, u64), ProtocolError> {
+) -> Result<(ZSetBatch, u32), ProtocolError> {
     if data.len() < WAL_BLOCK_HEADER_SIZE {
         return Err(ProtocolError::DecodeError(format!(
             "WAL block too small: {} < {}",
@@ -316,14 +314,13 @@ pub fn decode_wal_block(
         )));
     }
 
-    let lsn = u64::from_le_bytes(data[0..8].try_into().unwrap());
-    let table_id = u32::from_le_bytes(data[8..12].try_into().unwrap());
-    let entry_count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
-    let total_size = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-    let format_ver = u32::from_le_bytes(data[20..24].try_into().unwrap());
-    let exp_checksum = u64::from_le_bytes(data[24..32].try_into().unwrap());
-    let num_regions = u32::from_le_bytes(data[32..36].try_into().unwrap()) as usize;
-    // blob_size from header (informational; we use the blob region's directory entry)
+    let table_id = u32::from_le_bytes(data[WAL_OFF_TID..WAL_OFF_TID + 4].try_into().unwrap());
+    let entry_count = u32::from_le_bytes(data[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].try_into().unwrap()) as usize;
+    let total_size = u32::from_le_bytes(data[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
+    let format_ver = u32::from_le_bytes(data[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].try_into().unwrap());
+    let exp_checksum = u64::from_le_bytes(data[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].try_into().unwrap());
+    let num_regions =
+        u32::from_le_bytes(data[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].try_into().unwrap()) as usize;
 
     if format_ver != WAL_FORMAT_VERSION {
         return Err(ProtocolError::DecodeError(format!(
@@ -375,7 +372,7 @@ pub fn decode_wal_block(
     let count = entry_count;
 
     if count == 0 {
-        return Ok((ZSetBatch::new(schema), table_id, lsn));
+        return Ok((ZSetBatch::new(schema), table_id));
     }
 
     // Read system regions
@@ -582,7 +579,6 @@ pub fn decode_wal_block(
             columns,
         },
         table_id,
-        lsn,
     ))
 }
 
@@ -592,10 +588,10 @@ pub fn recompute_block_checksum(block: &mut [u8]) {
     if block.len() <= WAL_BLOCK_HEADER_SIZE {
         return;
     }
-    let total_size = u32::from_le_bytes(block[16..20].try_into().unwrap()) as usize;
+    let total_size = u32::from_le_bytes(block[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()) as usize;
     let end = total_size.min(block.len());
     let checksum = xxh3_64(&block[WAL_BLOCK_HEADER_SIZE..end]);
-    block[24..32].copy_from_slice(&checksum.to_le_bytes());
+    block[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].copy_from_slice(&checksum.to_le_bytes());
 }
 
 /// Return the `(offset, size)` of a region from a block's directory.
@@ -649,25 +645,37 @@ mod tests {
     #[test]
     fn test_header_roundtrip() {
         let mut buf = [0u8; WAL_BLOCK_HEADER_SIZE];
-        buf[0..8].copy_from_slice(&123u64.to_le_bytes());
-        buf[8..12].copy_from_slice(&456u32.to_le_bytes());
-        buf[12..16].copy_from_slice(&10u32.to_le_bytes());
-        buf[16..20].copy_from_slice(&200u32.to_le_bytes());
-        buf[20..24].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
-        buf[24..32].copy_from_slice(&789u64.to_le_bytes());
-        buf[32..36].copy_from_slice(&5u32.to_le_bytes());
-        buf[36..40].copy_from_slice(&0u32.to_le_bytes());
-        buf[40..48].copy_from_slice(&100u64.to_le_bytes());
+        buf[WAL_OFF_TID..WAL_OFF_TID + 4].copy_from_slice(&456u32.to_le_bytes());
+        buf[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].copy_from_slice(&10u32.to_le_bytes());
+        buf[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].copy_from_slice(&200u32.to_le_bytes());
+        buf[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].copy_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+        buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].copy_from_slice(&789u64.to_le_bytes());
+        buf[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].copy_from_slice(&5u32.to_le_bytes());
 
-        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 123);
-        assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 456);
-        assert_eq!(u32::from_le_bytes(buf[12..16].try_into().unwrap()), 10);
-        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 200);
-        assert_eq!(u32::from_le_bytes(buf[20..24].try_into().unwrap()), WAL_FORMAT_VERSION);
-        assert_eq!(u64::from_le_bytes(buf[24..32].try_into().unwrap()), 789);
-        assert_eq!(u32::from_le_bytes(buf[32..36].try_into().unwrap()), 5);
-        assert_eq!(u32::from_le_bytes(buf[36..40].try_into().unwrap()), 0);
-        assert_eq!(u64::from_le_bytes(buf[40..48].try_into().unwrap()), 100);
+        assert_eq!(
+            u32::from_le_bytes(buf[WAL_OFF_TID..WAL_OFF_TID + 4].try_into().unwrap()),
+            456
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[WAL_OFF_COUNT..WAL_OFF_COUNT + 4].try_into().unwrap()),
+            10
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[WAL_OFF_SIZE..WAL_OFF_SIZE + 4].try_into().unwrap()),
+            200
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].try_into().unwrap()),
+            WAL_FORMAT_VERSION
+        );
+        assert_eq!(
+            u64::from_le_bytes(buf[WAL_OFF_CHECKSUM..WAL_OFF_CHECKSUM + 8].try_into().unwrap()),
+            789
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[WAL_OFF_NUM_REGIONS..WAL_OFF_NUM_REGIONS + 4].try_into().unwrap()),
+            5
+        );
     }
 
     // ── German String ─────────────────────────────────────────────────────
@@ -753,7 +761,7 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 42, &batch);
-        let (decoded, tid, _lsn) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
 
         assert_eq!(tid, 42);
         assert_eq!(decoded.pks, pks);
@@ -791,7 +799,7 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 0, &batch);
-        let (decoded, _, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
 
         assert_eq!(decoded.nulls, nulls);
         match &decoded.columns[1] {
@@ -814,7 +822,7 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 1, &batch);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 1);
         assert!(
             matches!(decoded.pks, PkColumn::U128s(_)),
@@ -873,7 +881,7 @@ mod tests {
         };
 
         let encoded = encode_wal_block(&schema, 3, &batch);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 3);
 
         // (a) No PK-variant drift: a lone 16-byte PK stays U128s.
@@ -905,7 +913,7 @@ mod tests {
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
         };
         let encoded = encode_wal_block(&schema, 7, &empty);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 7);
         assert_eq!(decoded.len(), 0);
     }
@@ -936,9 +944,9 @@ mod tests {
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(8u64.to_le_bytes().to_vec())],
         };
         let mut encoded = encode_wal_block(&schema, 0, &batch);
-        // Set format_version = 1 (in header, offset 20..24)
-        encoded[20..24].copy_from_slice(&1u32.to_le_bytes());
-        // Note: checksum covers buf[48..] so changing header bytes does NOT invalidate checksum
+        // Set format_version = 1.
+        encoded[WAL_OFF_VERSION..WAL_OFF_VERSION + 4].copy_from_slice(&1u32.to_le_bytes());
+        // Note: checksum covers only the body, so changing header bytes does NOT invalidate it
         let res = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes);
         assert!(matches!(res, Err(ProtocolError::DecodeError(ref s)) if s.contains("version")));
     }
@@ -966,7 +974,7 @@ mod tests {
         let expected_first = 1u64.to_be_bytes();
         assert_eq!(&encoded[pk_off..pk_off + 8], &expected_first);
 
-        let (decoded, _, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(decoded.pks, pks);
         assert!(
             matches!(decoded.pks, PkColumn::U64s(_)),
@@ -990,7 +998,7 @@ mod tests {
         let (_, pk_sz) = get_region_offset_size(&encoded, 0);
         assert_eq!(pk_sz, n * 16, "U128 PK region must be 16B/row");
 
-        let (decoded, _, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(decoded.pks, pks);
         assert!(
             matches!(decoded.pks, PkColumn::U128s(_)),
@@ -1011,7 +1019,7 @@ mod tests {
             columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![0u8; n * 8])],
         };
         let encoded = encode_wal_block(&schema, 5, &batch);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 5);
         assert_eq!(decoded.pks, pks);
         assert_eq!(decoded.weights, weights, "negative weight must survive encode/decode");
@@ -1029,7 +1037,7 @@ mod tests {
             a.add_row((u32::MAX as u128) + 1, -1).i64_val(300);
         }
         let encoded = encode_wal_block(&schema, 7, &batch);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 7);
         assert_eq!(decoded.pks.len(), 3);
         assert_eq!(decoded.pks.get(0), 1u128);
@@ -1054,7 +1062,7 @@ mod tests {
             }
         }
         let encoded = encode_wal_block(&schema, 9, &batch);
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 9);
         assert_eq!(decoded.pks.len(), pks.len());
         for (i, &expected) in pks.iter().enumerate() {
@@ -1170,7 +1178,7 @@ mod tests {
         let (_, pk_sz) = get_region_offset_size(&encoded, 0);
         assert_eq!(pk_sz, n * 24, "wide PK region must be 24B/row");
 
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 77);
         assert_eq!(decoded.weights, weights);
         assert_eq!(decoded.nulls, nulls);
@@ -1241,7 +1249,7 @@ mod tests {
         let (_, pk_sz) = get_region_offset_size(&encoded, 0);
         assert_eq!(pk_sz, n * 64, "wide PK region must be 64B/row");
 
-        let (decoded, tid, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, tid) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(tid, 3);
         match &decoded.pks {
             PkColumn::Bytes { stride, buf } => {

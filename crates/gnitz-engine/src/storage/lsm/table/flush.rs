@@ -10,8 +10,7 @@
 //! directly here — `flush` is a child module of the `table` module that defines
 //! the struct.
 
-use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 
 use super::super::batch::Batch;
@@ -19,22 +18,19 @@ use super::super::error::StorageError;
 use super::super::manifest::PreparedManifest;
 use super::super::memtable;
 use super::super::shard_file::{self, PkUniqueChecker};
-use super::{
-    FlushOutcome, FlushWork, FoundSource, InMemRun, RecoverySource, Table, INMEM_CEILING, INMEM_COMPACT_THRESHOLD,
-};
+use super::{FlushOutcome, FlushWork, InMemRun, RecoverySource, Table, INMEM_CEILING, INMEM_COMPACT_THRESHOLD};
 use crate::foundation::posix_io::{fdatasync_eintr, fsync_eintr, open_owned};
 
 impl Table {
-    /// Synchronous flush. `Rederive` tables fold into the RAM tier (`DoneInline`);
+    /// Synchronous flush. `Rederive` tables fold into the RAM tier;
     /// `SalReplay` tables fold memtable + L0 into one shard written at its final
     /// name (unsynced), fdatasync every unsynced file by path + the manifest
     /// `.tmp`, rename the manifest, fsync the dir, then drain deferred cleanup.
     /// The sole synchronous fsync entry point — used by manual FLUSH and the
     /// system-table checkpoint (which never reach the worker-barrier drain).
-    pub fn flush(&mut self) -> Result<bool, StorageError> {
+    pub fn flush(&mut self) -> Result<(), StorageError> {
         match self.flush_prepare()? {
-            FlushOutcome::Empty => Ok(false),
-            FlushOutcome::DoneInline => Ok(true),
+            FlushOutcome::Done => Ok(()),
             FlushOutcome::Pending(work) => {
                 // Sweep: fdatasync every unpublished/unsynced file by path (prior
                 // spills + this barrier's folded shard) before the manifest rename.
@@ -56,7 +52,7 @@ impl Table {
                 // compacted index durably, so superseded inputs are safe to
                 // unlink. (The worker barrier drains user families instead.)
                 self.drain_deletions();
-                Ok(true)
+                Ok(())
             }
         }
     }
@@ -68,14 +64,8 @@ impl Table {
     /// The caller owns the returned `OwnedFd`, which closes it on drop — so an
     /// error `?` anywhere downstream releases it with no manual close.
     pub(super) fn open_dirfd(&self) -> Result<OwnedFd, StorageError> {
-        let dir_c = CString::new(self.directory.as_str()).map_err(|_| StorageError::InvalidPath)?;
-        let fd = unsafe { libc::open(dir_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-        if fd < 0 {
-            return Err(StorageError::Io);
-        }
-        // SAFETY: `fd` is a fresh, valid descriptor from `open`; ownership
-        // transfers to the `OwnedFd`, the sole closer from here on.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        let dir_c = super::super::cstr(self.directory.as_str())?;
+        open_owned(&dir_c, libc::O_RDONLY | libc::O_DIRECTORY).ok_or(StorageError::Io)
     }
 
     // ------------------------------------------------------------------
@@ -101,8 +91,7 @@ impl Table {
     /// RAM tier, then keep that tier bounded (fold at `>INMEM_COMPACT_THRESHOLD`
     /// runs, spill past `INMEM_CEILING`). No file I/O unless the ceiling is
     /// breached; durability lives in the fsynced SAL until the checkpoint
-    /// barrier folds the tier into a durable shard. Both callers (ingest
-    /// overflow, `flush_prepare`) reset `found_source` before calling.
+    /// barrier folds the tier into a durable shard.
     pub(super) fn flush_to_ram(&mut self) -> Result<(), StorageError> {
         self.fold_memtable_into_l0();
         self.enforce_inmem_bound()
@@ -119,7 +108,7 @@ impl Table {
     /// directories single-writer.
     fn next_shard_name_and_lsn(&self) -> (String, u64) {
         (
-            format!("shard_{}_{}.db", self.table_id, self.current_lsn),
+            super::super::naming::spill_shard_name(self.table_id, self.current_lsn),
             self.current_lsn - 1,
         )
     }
@@ -128,14 +117,15 @@ impl Table {
     /// shard, computed by observing all rows in sorted order. Only base tables
     /// set `can_tag_pk_unique`; every other table's runs stay untagged ZSet.
     fn shard_flush_flags(&self, run: &Batch) -> u8 {
-        if !self.can_tag_pk_unique {
+        if !self.shard_index.can_tag_pk_unique() {
             return 0;
         }
         let mut checker = PkUniqueChecker::new();
         for i in 0..run.count {
-            checker.observe(run.get_pk_bytes(i), run.get_weight(i));
+            let pk = run.get_pk_bytes(i);
+            checker.observe(super::super::merge::pack_pk_be(pk), pk, run.get_weight(i));
         }
-        checker.flags_if(true)
+        checker.flags()
     }
 
     // ------------------------------------------------------------------
@@ -162,12 +152,13 @@ impl Table {
     /// barrier's by-path sweep fdatasyncs every unsynced file; `flush_commit`
     /// renames the manifest alone.
     pub fn flush_prepare(&mut self) -> Result<FlushOutcome, StorageError> {
-        self.found_source = FoundSource::None;
         if self.recovery_source != RecoverySource::SalReplay {
             self.flush_to_ram()?;
-            return Ok(FlushOutcome::DoneInline);
+            return Ok(FlushOutcome::Done);
         }
-        self.prepare_persist(false)
+        // Base (`SalReplay`) manifests stamp generation 0 — never read back
+        // (only `RederiveCheckpointed` opens gate on the generation).
+        self.prepare_persist(false, 0)
     }
 
     /// The force-persist body shared by the base barrier round and the ephemeral
@@ -180,9 +171,8 @@ impl Table {
     /// publish (`has_pending_deletions` — else the deferred drain would unlink
     /// files the surviving manifest still references). When none hold the tier is
     /// `Empty` — UNLESS `force_publish`, which stages a generation-stamped manifest
-    /// unconditionally (see [`Self::flush_prepare_ephemeral`]). Callers reset
-    /// `found_source` before invoking (the fold reads it).
-    fn prepare_persist(&mut self, force_publish: bool) -> Result<FlushOutcome, StorageError> {
+    /// unconditionally (see [`Self::flush_prepare_ephemeral`]).
+    fn prepare_persist(&mut self, force_publish: bool, generation: u64) -> Result<FlushOutcome, StorageError> {
         // Fold-first, then gate, then one shard.
         self.fold_memtable_into_l0();
         self.compact_in_memory();
@@ -192,7 +182,7 @@ impl Table {
         } else if !force_publish && !self.shard_index.has_unsynced() && !self.shard_index.has_pending_deletions() {
             // Nothing ingested since the last checkpoint, no unpublished spills,
             // and nothing compacted — the SAL covers it (base round only).
-            return Ok(FlushOutcome::Empty);
+            return Ok(FlushOutcome::Done);
         }
         // Otherwise fall through to publish: capture unpublished spills into a
         // durable manifest before the SAL reset (else the global reset drops
@@ -204,9 +194,9 @@ impl Table {
             .shard_index
             .unsynced_paths()
             .iter()
-            .map(|p| CString::new(p.as_str()).map_err(|_| StorageError::InvalidPath))
+            .map(|p| super::super::cstr(p.as_str()))
             .collect::<Result<Vec<_>, _>>()?;
-        let manifest = self.prepare_manifest_tmp()?;
+        let manifest = self.prepare_manifest_tmp(generation)?;
         Ok(FlushOutcome::Pending(FlushWork { sync_paths, manifest }))
     }
 
@@ -224,9 +214,8 @@ impl Table {
     /// whole (valid) view every restart — resume would never trigger. An empty
     /// partition publishes a zero-entry manifest at generation `g`; an unchanged
     /// partition re-stamps its existing shards at `g`.
-    pub fn flush_prepare_ephemeral(&mut self) -> Result<FlushOutcome, StorageError> {
-        self.found_source = FoundSource::None;
-        self.prepare_persist(true)
+    pub fn flush_prepare_ephemeral(&mut self, generation: u64) -> Result<FlushOutcome, StorageError> {
+        self.prepare_persist(true, generation)
     }
 
     /// Commit the RAM tier's single folded net-state run (left by
@@ -248,14 +237,13 @@ impl Table {
                 .batch,
         );
         let (shard_name, lsn_max) = self.next_shard_name_and_lsn();
-        let name_c = CString::new(shard_name.as_str()).map_err(|_| StorageError::InvalidPath)?;
+        let name_c = super::super::cstr(shard_name.as_str())?;
         let flush_flags = self.shard_flush_flags(&run);
 
         let dirfd = self.open_dirfd()?;
         let res = shard_file::write_shard_streaming(
             dirfd.as_raw_fd(),
             &name_c,
-            self.table_id,
             run.count as u32,
             &run.regions(),
             &self.schema,
@@ -270,7 +258,7 @@ impl Table {
 
         // Register with real LSNs so a reopen seeds `current_lsn = max_lsn() + 1`.
         let final_full = format!("{}/{}", self.directory, shard_name);
-        if let Err(e) = self.shard_index.add_shard(&final_full, 0, lsn_max) {
+        if let Err(e) = self.shard_index.add_shard(&final_full, lsn_max) {
             // Registration failed: unlink the shard we wrote, keep heap intact.
             let _ = std::fs::remove_file(&final_full);
             return Err(e);
@@ -287,9 +275,9 @@ impl Table {
     /// Stage the manifest `.tmp` over the current index for the barrier to
     /// rename. The barrier's one-shot shard write already registered its shard
     /// via `add_shard`, so the live index is authoritative.
-    fn prepare_manifest_tmp(&self) -> Result<PreparedManifest, StorageError> {
-        let manifest_c = CString::new(self.manifest_full_path()).map_err(|_| StorageError::InvalidPath)?;
-        self.shard_index.prepare_manifest(&manifest_c)
+    fn prepare_manifest_tmp(&self, generation: u64) -> Result<PreparedManifest, StorageError> {
+        let manifest_c = super::super::cstr(self.manifest_full_path())?;
+        self.shard_index.prepare_manifest(&manifest_c, generation)
     }
 
     /// Phase 2: rename the manifest `.tmp` into place and return the per-flush
@@ -301,13 +289,7 @@ impl Table {
     /// `PreparedManifest`'s Drop and the shard survives as an orphan (GC'd next
     /// open); every fd is released through its `OwnedFd` on every path.
     pub(crate) fn flush_commit(&mut self, work: FlushWork) -> Result<OwnedFd, StorageError> {
-        let mut m = work.manifest;
-        let rc = unsafe { libc::rename(m.tmp_path.as_ptr(), m.final_path.as_ptr()) };
-        if rc < 0 {
-            // `m` drops here: `PreparedManifest`'s Drop unlinks the .tmp.
-            return Err(StorageError::Io);
-        }
-        m.committed = true; // renamed; suppress the .tmp unlink in Drop
+        work.manifest.commit()?;
 
         // The files in `unsynced` were fdatasync'd by the barrier sweep and are
         // now referenced by the renamed manifest; clear so the next barrier does

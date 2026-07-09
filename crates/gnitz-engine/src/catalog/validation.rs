@@ -148,11 +148,7 @@ impl CatalogEngine {
                     // leading column (idx_key_size), not a source-width LE
                     // prefix.
                     let opk = crate::schema::index_opk_prefix(fk_key, loc.type_code(), idx_key_type.unwrap());
-                    idx_cursor
-                        .as_mut()
-                        .unwrap()
-                        .cursor
-                        .seek_first_positive_with_prefix(&opk[..ks])
+                    idx_cursor.as_mut().unwrap().seek_first_positive_with_prefix(&opk[..ks])
                 };
                 if !found {
                     let (sn, tn) = self.caches.entity_by_id.get(&table_id).cloned().unwrap_or_default();
@@ -336,10 +332,10 @@ impl CatalogEngine {
                 // idx_key_size bytes total) followed by the full source PK bytes —
                 // always idx_key_size + src_pk_stride wide. `keybuf` already holds
                 // the OPK composite span; prefix-match it whole.
-                if !cursor.cursor.seek_first_positive_with_prefix(keybuf.pk_bytes()) {
+                if !cursor.seek_first_positive_with_prefix(keybuf.pk_bytes()) {
                     continue;
                 }
-                let pk_bytes = cursor.cursor.current_pk_bytes();
+                let pk_bytes = cursor.current_pk_bytes();
 
                 // The committed holder's full source PK. Slice by raw bytes; at
                 // any width truncating to 16 bytes would misread two wide PKs

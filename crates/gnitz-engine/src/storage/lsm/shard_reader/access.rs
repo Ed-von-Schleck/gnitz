@@ -107,20 +107,6 @@ impl MappedShard {
         }
     }
 
-    /// Advance `pos` past any ghost (weight == 0) rows. Returns the first
-    /// position at or after `pos` whose weight is non-zero, or `self.count`
-    /// if no such row exists.
-    #[inline]
-    pub fn next_non_ghost(&self, mut pos: usize) -> usize {
-        if !self.has_ghosts {
-            return pos;
-        }
-        while pos < self.count && self.get_weight(pos) == 0 {
-            pos += 1;
-        }
-        pos
-    }
-
     #[inline]
     pub fn get_null_word(&self, row: usize) -> u64 {
         match &self.null_bmp {
@@ -134,7 +120,9 @@ impl MappedShard {
         match &self.col_regions[payload_col_idx] {
             PayloadRegion::Scalar(ScalarRegion::Raw { offset, size }) => {
                 let start = offset + row * col_size;
-                assert!(
+                // Region size >= count * stride is validated once at open; the
+                // safe slice below still bounds-checks against the mmap.
+                debug_assert!(
                     start + col_size <= offset + size,
                     "get_col_ptr out of bounds: row={} payload_col={} col_size={} region_end={}",
                     row,
@@ -163,14 +151,14 @@ impl MappedShard {
             return ptr::null();
         }
         let payload_idx = self.col_to_payload[col_idx];
-        let base = self.mmap.ptr;
+        let base = self.mmap.as_ptr();
         if payload_idx == usize::MAX {
             // PK column (pk_stride bytes)
             match &self.pk {
                 ScalarRegion::Raw { offset, .. } => {
                     let stride = self.pk_stride as usize;
                     let off = offset + row * stride;
-                    if off + stride > self.mmap.len {
+                    if off + stride > self.mmap.len() {
                         return ptr::null();
                     }
                     return unsafe { base.add(off) };
@@ -209,11 +197,6 @@ impl MappedShard {
     #[inline]
     pub fn blob_slice(&self) -> &[u8] {
         &self.data()[self.blob_off..self.blob_off + self.blob_len]
-    }
-
-    #[inline]
-    pub fn blob_ptr(&self) -> *const u8 {
-        unsafe { self.mmap.ptr.add(self.blob_off) }
     }
 
     pub fn has_xor8(&self) -> bool {
@@ -374,7 +357,7 @@ impl MappedShard {
         let mut batch = unsafe { Batch::from_prebuilt(data, blob, strides, offsets, num_regions_u8, row_count) };
         batch.set_schema(*schema);
         // Shards are written consolidated; a contiguous slice stays (PK, payload)-
-        // sorted and ghost-free (callers guard `!has_ghosts`). Certify it.
+        // sorted and ghost-free (shards are ghost-free by construction). Certify it.
         batch.certify_layout(Layout::Consolidated, schema);
         batch
     }
@@ -484,9 +467,5 @@ impl super::super::merge::MergeSource for MappedShard {
     #[inline]
     fn row_count(&self) -> usize {
         self.count
-    }
-    #[inline]
-    fn next_non_ghost(&self, pos: usize) -> usize {
-        MappedShard::next_non_ghost(self, pos)
     }
 }

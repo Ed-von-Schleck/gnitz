@@ -774,13 +774,9 @@ fn test_view_backfill_chunked_matches_unchunked() {
     fn scan_rows(engine: &CatalogEngine, id: i64) -> Vec<(u128, i64, String)> {
         let mut c = engine.dag.tables.get(&id).unwrap().handle.open_cursor();
         let mut rows = Vec::new();
-        while c.cursor.valid {
-            rows.push((
-                c.cursor.current_key_narrow(),
-                c.cursor.current_weight,
-                cursor_read_string(&c, 1),
-            ));
-            c.cursor.advance();
+        while c.valid {
+            rows.push((c.current_key_narrow(), c.current_weight, cursor_read_string(&c, 1)));
+            c.advance();
         }
         rows
     }

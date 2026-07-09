@@ -30,16 +30,16 @@ impl CatalogEngine {
         let end_pk = pack_column_id(owner_id + 1, 0);
         let mut cursor = self.sys_columns.open_cursor();
         // sys_columns has a single U64 PK; OPK == big-endian.
-        cursor.cursor.seek_bytes(&start_pk.to_be_bytes());
+        cursor.seek_bytes(&start_pk.to_be_bytes());
 
         let mut defs = Vec::new();
         let mut expected: i64 = 0;
-        while cursor.cursor.valid {
-            let pk = cursor.cursor.current_key_narrow() as u64;
+        while cursor.valid {
+            let pk = cursor.current_key_narrow() as u64;
             if pk >= end_pk {
                 break;
             }
-            if cursor.cursor.current_weight > 0 {
+            if cursor.current_weight > 0 {
                 if check_contiguity {
                     // pack_column_id layout: owner_id << 9 | col_idx (lower 9 bits).
                     let actual = (pk & 0x1FF) as i64;
@@ -60,7 +60,7 @@ impl CatalogEngine {
                     is_hidden: cursor_read_u64(&cursor, COLTAB_COL_IS_HIDDEN) != 0,
                 });
             }
-            cursor.cursor.advance();
+            cursor.advance();
         }
         Ok(defs)
     }
@@ -249,7 +249,7 @@ impl CatalogEngine {
         (
             hw + 1,
             build_seq_delta(seq_id, hw, new_hw),
-            self.sys_sequences.current_lsn,
+            self.sys_sequences.current_lsn(),
         )
     }
 

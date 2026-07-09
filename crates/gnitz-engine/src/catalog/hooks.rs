@@ -198,7 +198,6 @@ impl CatalogEngine {
         };
         let mut pt = PartitionedTable::new(
             directory,
-            name,
             schema,
             id as u32,
             routing,

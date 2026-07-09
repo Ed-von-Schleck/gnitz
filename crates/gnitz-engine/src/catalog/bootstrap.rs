@@ -18,7 +18,6 @@ impl CatalogEngine {
             let schema = sys_tab_schema(info.id);
             Table::new(
                 &dir,
-                info.name,
                 schema,
                 info.id as u32,
                 SYS_TABLE_ARENA,
@@ -40,7 +39,7 @@ impl CatalogEngine {
         let sys_circuit_node_columns = create_sys_table(&SYS_TAB_INFOS[9])?;
 
         // Check if this is a fresh database (no table records yet)
-        let is_new = !sys_tables.open_cursor().cursor.valid;
+        let is_new = !sys_tables.open_cursor().valid;
 
         let dag = DagEngine::new();
 
@@ -325,9 +324,9 @@ impl CatalogEngine {
 
     fn recover_sequences(&mut self) {
         let mut cursor = self.sys_sequences.open_cursor();
-        while cursor.cursor.valid {
-            if cursor.cursor.current_weight > 0 {
-                let seq_id = cursor.cursor.current_key_narrow() as u64 as i64;
+        while cursor.valid {
+            if cursor.current_weight > 0 {
+                let seq_id = cursor.current_key_narrow() as u64 as i64;
                 let val = cursor_read_u64(&cursor, SEQTAB_COL_VALUE) as i64;
                 match seq_id {
                     SEQ_ID_SCHEMAS => raise_id_counter(&mut self.next_schema_id, val),
@@ -348,7 +347,7 @@ impl CatalogEngine {
                     other => self.observe_user_sequence(other, val),
                 }
             }
-            cursor.cursor.advance();
+            cursor.advance();
         }
     }
 
@@ -436,8 +435,8 @@ impl CatalogEngine {
         Ok(())
     }
 
-    pub(crate) fn copy_cursor_row_to_batch(&self, cursor: &CursorHandle, batch: &mut Batch) {
-        cursor.cursor.copy_current_row_into(batch, cursor.cursor.current_weight);
+    pub(crate) fn copy_cursor_row_to_batch(&self, cursor: &ReadCursor, batch: &mut Batch) {
+        cursor.copy_current_row_into(batch, cursor.current_weight);
     }
 
     // -- Close engine ------------------------------------------------------
@@ -463,13 +462,11 @@ impl CatalogEngine {
     /// flushes durably per zone and exits via abort or process teardown).
     #[cfg(test)]
     pub(crate) fn close(&mut self) {
-        // Flush and close all user tables before clearing DagEngine.
-        // System tables hold Borrowed handles and are flushed below.
+        // Flush all user tables before clearing DagEngine. System tables hold
+        // Borrowed handles and are flushed below.
         for entry in self.dag.tables.values_mut() {
             if let StoreHandle::Partitioned(cell) = &mut entry.handle {
-                let pt = cell.get_mut();
-                let _ = pt.flush();
-                pt.close();
+                let _ = cell.get_mut().flush();
             }
         }
         // tables.clear() in dag.close() drops Box<PartitionedTable> automatically.

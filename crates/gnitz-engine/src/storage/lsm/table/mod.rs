@@ -8,7 +8,6 @@
 use std::cell::OnceCell;
 use std::cmp::Ordering;
 use std::ffi::{CStr, CString};
-use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
 use super::batch::Batch;
@@ -18,7 +17,7 @@ use super::error::StorageError;
 use super::manifest::PreparedManifest;
 use super::memtable::{self, MemTable};
 use super::merge::pack_pk_be;
-use super::read_cursor::{self, CursorHandle};
+use super::read_cursor::{self, ReadCursor};
 use super::shard_index::ShardIndex;
 use super::shard_reader::MappedShard;
 use crate::schema::SchemaDescriptor;
@@ -67,12 +66,17 @@ pub enum RecoverySource {
     Rederive,
     /// Rederived like `Rederive`, but the ephemeral checkpoint round
     /// force-persists this table with a generation-stamped manifest (view
-    /// operator-trace tables and output stores). Compaction cleanup therefore
-    /// defers to the next publish like `SalReplay` — an immediate drain would
-    /// unlink a compacted-away shard the last-published manifest still
-    /// references (stranded at reload). Still erased at open today;
-    /// generation-gated conditional reload replaces the erase in a later step.
-    RederiveCheckpointed,
+    /// operator-trace tables and output stores), and the open conditionally
+    /// reloads it: the checkpointed shards load iff the manifest's generation
+    /// equals `committed` (the caller's committed checkpoint generation);
+    /// otherwise the state is erased and rebuilt. Compaction cleanup defers to
+    /// the next publish like `SalReplay` — an immediate drain would unlink a
+    /// compacted-away shard the last-published manifest still references
+    /// (stranded at reload).
+    RederiveCheckpointed {
+        /// The committed checkpoint generation the reload gate compares against.
+        committed: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -81,12 +85,11 @@ pub enum RecoverySource {
 
 /// Outcome of `Table::flush_prepare`.
 pub enum FlushOutcome {
-    /// `SalReplay` table with memtable and RAM tier net-empty after the fold, no
-    /// unpublished spills, and no compaction pending — nothing to publish; the
-    /// SAL covers it.
-    Empty,
-    /// `Rederive` table folded into the RAM tier; no file I/O, no deferred work.
-    DoneInline,
+    /// Nothing left to publish: a `Rederive` table folded into the RAM tier
+    /// (no file I/O), or a `SalReplay` table whose memtable and RAM tier are
+    /// net-empty with no unpublished spills and no compaction pending (the
+    /// SAL covers it).
+    Done,
     /// `SalReplay`: the folded shard is written at its final name (unsynced) and
     /// a manifest `.tmp` is staged; the barrier fdatasyncs `sync_paths` then
     /// renames the manifest.
@@ -119,7 +122,7 @@ impl FlushWork {
     /// `flush_commit` consumes the work (it closes when the `PreparedManifest`
     /// drops after the rename).
     pub fn manifest_fd(&self) -> libc::c_int {
-        self.manifest.fd.as_raw_fd()
+        self.manifest.fd()
     }
 }
 
@@ -163,54 +166,47 @@ impl InMemRun {
     }
 }
 
-enum FoundSource {
-    None,
-    MemTable,
+/// The live (PK, payload) row a `retract_pk_bytes` hit located, as an owned
+/// [`ColumnarSource`](super::columnar::ColumnarSource) view: each arm keeps its
+/// container alive via `Rc` — a memtable/RAM-tier run (`Batch`) or a
+/// `MappedShard` — so the row stays readable with no borrow on the table and no
+/// armed state to invalidate. Pinned to its single located row, so the trait's
+/// `row` argument is ignored; the stored (PK, payload) is copied into a batch
+/// through `Batch::append_row_from_source_bytes`.
+pub(crate) enum RowRef {
+    Mem(Rc<Batch>, usize),
     Shard(Rc<MappedShard>, usize),
-    InMemRun(Rc<Batch>, usize),
 }
 
-/// A [`ColumnarSource`](super::columnar::ColumnarSource) view over the row a
-/// `retract_pk*` call most recently located (the "found row"). Both arms wrap a
-/// type that already implements `ColumnarSource` — a memtable run (`Batch`) or a
-/// `MappedShard` — so the found row flows as the canonical columnar abstraction
-/// rather than a raw-pointer triple, and the stored (PK, payload) can be copied
-/// into a batch through `Batch::append_row_from_source_bytes`. A `FoundRow` is
-/// pinned to its single located row, so the trait's `row` argument is ignored.
-pub(crate) enum FoundRow<'a> {
-    Mem(&'a Batch, usize),
-    Shard(&'a MappedShard, usize),
-}
-
-impl columnar::ColumnarSource for FoundRow<'_> {
+impl columnar::ColumnarSource for RowRef {
     fn get_pk_bytes(&self, _row: usize) -> &[u8] {
-        match *self {
-            FoundRow::Mem(b, r) => columnar::ColumnarSource::get_pk_bytes(b, r),
-            FoundRow::Shard(s, r) => columnar::ColumnarSource::get_pk_bytes(s, r),
+        match self {
+            RowRef::Mem(b, r) => columnar::ColumnarSource::get_pk_bytes(b.as_ref(), *r),
+            RowRef::Shard(s, r) => columnar::ColumnarSource::get_pk_bytes(s.as_ref(), *r),
         }
     }
     fn get_weight(&self, _row: usize) -> i64 {
-        match *self {
-            FoundRow::Mem(b, r) => columnar::ColumnarSource::get_weight(b, r),
-            FoundRow::Shard(s, r) => columnar::ColumnarSource::get_weight(s, r),
+        match self {
+            RowRef::Mem(b, r) => columnar::ColumnarSource::get_weight(b.as_ref(), *r),
+            RowRef::Shard(s, r) => columnar::ColumnarSource::get_weight(s.as_ref(), *r),
         }
     }
     fn get_null_word(&self, _row: usize) -> u64 {
-        match *self {
-            FoundRow::Mem(b, r) => columnar::ColumnarSource::get_null_word(b, r),
-            FoundRow::Shard(s, r) => columnar::ColumnarSource::get_null_word(s, r),
+        match self {
+            RowRef::Mem(b, r) => columnar::ColumnarSource::get_null_word(b.as_ref(), *r),
+            RowRef::Shard(s, r) => columnar::ColumnarSource::get_null_word(s.as_ref(), *r),
         }
     }
     fn get_col_ptr(&self, _row: usize, payload_col: usize, col_size: usize) -> &[u8] {
-        match *self {
-            FoundRow::Mem(b, r) => columnar::ColumnarSource::get_col_ptr(b, r, payload_col, col_size),
-            FoundRow::Shard(s, r) => columnar::ColumnarSource::get_col_ptr(s, r, payload_col, col_size),
+        match self {
+            RowRef::Mem(b, r) => columnar::ColumnarSource::get_col_ptr(b.as_ref(), *r, payload_col, col_size),
+            RowRef::Shard(s, r) => columnar::ColumnarSource::get_col_ptr(s.as_ref(), *r, payload_col, col_size),
         }
     }
     fn blob_slice(&self) -> &[u8] {
-        match *self {
-            FoundRow::Mem(b, _) => columnar::ColumnarSource::blob_slice(b),
-            FoundRow::Shard(s, _) => columnar::ColumnarSource::blob_slice(s),
+        match self {
+            RowRef::Mem(b, _) => columnar::ColumnarSource::blob_slice(b.as_ref()),
+            RowRef::Shard(s, _) => columnar::ColumnarSource::blob_slice(s.as_ref()),
         }
     }
 }
@@ -228,15 +224,14 @@ pub struct Table {
 
     recovery_source: RecoverySource,
 
-    pub current_lsn: u64,
+    current_lsn: u64,
 
-    found_source: FoundSource,
+    /// Reused candidate pool for `retract_pk_bytes`' grouping pass; cleared per
+    /// call (dropping its `Rc`s) with capacity retained, so the multi-candidate
+    /// path stops allocating once warmed up.
+    retract_scratch: Vec<RowRef>,
 
     cached_full_scan: Option<Rc<Batch>>,
-    /// When true, flushed and compacted shards may be tagged `SHARD_FLAG_PK_UNIQUE`
-    /// if `PkUniqueChecker` confirms the invariant. Must only be set for base tables
-    /// with a user-defined PK constraint enforced by the DML layer.
-    can_tag_pk_unique: bool,
 
     /// Flushed runs held in heap instead of on disk, each paired with a per-run
     /// PK bloom for point-probe gating. Populated for **every** table on ingest
@@ -261,7 +256,6 @@ impl Table {
     /// open; `RecoverySource::Rederive` erases stale storage and starts empty.
     pub fn new(
         dir: &str,
-        _name: &str,
         schema: SchemaDescriptor,
         table_id: u32,
         arena_size: u64,
@@ -276,25 +270,24 @@ impl Table {
         //   SalReplay            → always load the manifest.
         //   Rederive             → always erase stale shards and start empty.
         //   RederiveCheckpointed → load only when the manifest's checkpoint
-        //     generation equals the committed generation; otherwise erase the
-        //     shards *and* unlink the manifest so a later re-open cannot re-peek
-        //     a stale `== g` manifest.
+        //     generation equals the caller's committed generation; otherwise
+        //     erase the shards *and* unlink the manifest so a later re-open
+        //     cannot re-peek a stale `== g` manifest.
         //
         // NOTE for future tests: a `RederiveCheckpointed` table force-flushed at
-        // generation 0 (the default `committed_generation()`), then re-opened,
-        // will *load* (peek `Some(0)` == committed `0`). Table unit tests that
-        // want a guaranteed-empty open use `Rederive`, not `RederiveCheckpointed`.
+        // generation 0, then re-opened with `committed: 0`, will *load* (peek
+        // `Some(0)` == committed `0`). Table unit tests that want a
+        // guaranteed-empty open use `Rederive`, not `RederiveCheckpointed`.
         let load_shards = match recovery_source {
             RecoverySource::SalReplay => true,
             RecoverySource::Rederive => {
                 erase_stale_shards(dir, table_id);
                 false
             }
-            RecoverySource::RederiveCheckpointed => {
-                let g = crate::foundation::worker_ctx::committed_generation();
+            RecoverySource::RederiveCheckpointed { committed } => {
                 let manifest_path = format!("{dir}/manifest.bin");
-                let cpath = std::ffi::CString::new(manifest_path.clone()).map_err(|_| StorageError::InvalidPath)?;
-                if super::manifest::peek_generation(&cpath)? == Some(g) {
+                let cpath = super::super::cstr(manifest_path.clone())?;
+                if super::manifest::peek_generation(&cpath)? == Some(committed) {
                     true
                 } else {
                     erase_stale_shards(dir, table_id);
@@ -315,9 +308,8 @@ impl Table {
             directory: dir.to_string(),
             recovery_source,
             current_lsn: 1,
-            found_source: FoundSource::None,
+            retract_scratch: Vec::new(),
             cached_full_scan: None,
-            can_tag_pk_unique: false,
             in_memory_l0: Vec::new(),
             #[cfg(test)]
             inmem_ceiling_override: None,
@@ -346,7 +338,6 @@ impl Table {
     /// Only call this for base tables with a user-defined PK constraint enforced
     /// by the DML layer. Idempotent.
     pub fn enable_pk_unique_tagging(&mut self) {
-        self.can_tag_pk_unique = true;
         self.shard_index.enable_pk_unique_tagging();
     }
 
@@ -357,32 +348,9 @@ impl Table {
     /// Ingest an already-constructed Batch into the memtable.
     /// Used by PartitionedTable after hash-routing.
     pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
-        self.upsert_owned_and_maybe_flush(batch)
-    }
-
-    /// Ingest a borrowed Batch, copying it exactly once: an unconsolidated
-    /// batch is consolidated straight into the owned copy the memtable keeps
-    /// (the consolidation pass IS the copy), an already-consolidated batch is
-    /// cloned verbatim. The borrow-based twin of [`Self::ingest_owned_batch`]
-    /// for callers that keep reading `batch` afterwards — `clone_batch()` +
-    /// `ingest_owned_batch()` would copy an unconsolidated batch twice.
-    pub fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
-        self.upsert_borrowed_and_maybe_flush(batch)
-    }
-
-    fn upsert_borrowed_and_maybe_flush(&mut self, batch: &Batch) -> Result<(), StorageError> {
         if batch.count == 0 {
             return Ok(());
         }
-        let owned = Batch::consolidate_if_needed(batch, &self.schema).unwrap_or_else(|| batch.clone_batch());
-        self.upsert_owned_and_maybe_flush(owned)
-    }
-
-    fn upsert_owned_and_maybe_flush(&mut self, batch: Batch) -> Result<(), StorageError> {
-        if batch.count == 0 {
-            return Ok(());
-        }
-        self.found_source = FoundSource::None;
         self.cached_full_scan = None;
 
         // Ingest overflow always folds into the RAM tier; durability lives in the
@@ -395,14 +363,25 @@ impl Table {
         if self.memtable.should_flush() {
             self.flush_to_ram()?;
         }
-        // The should_flush() pre-check above ensures runs_bytes is either 0
-        // (post-flush) or <= 75% of max_bytes, so check_capacity() inside
-        // upsert_sorted_batch (which fires at 100%) cannot return ERR_CAPACITY.
-        self.memtable.upsert_sorted_batch(consolidated)?;
+        self.memtable.upsert_sorted_batch(consolidated);
         if self.memtable.should_flush() {
             self.flush_to_ram()?;
         }
         Ok(())
+    }
+
+    /// Ingest a borrowed Batch, copying it exactly once: an unconsolidated
+    /// batch is consolidated straight into the owned copy the memtable keeps
+    /// (the consolidation pass IS the copy), an already-consolidated batch is
+    /// cloned verbatim. The borrow-based twin of [`Self::ingest_owned_batch`]
+    /// for callers that keep reading `batch` afterwards — `clone_batch()` +
+    /// `ingest_owned_batch()` would copy an unconsolidated batch twice.
+    pub fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
+        if batch.count == 0 {
+            return Ok(());
+        }
+        let owned = Batch::consolidate_if_needed(batch, &self.schema).unwrap_or_else(|| batch.clone_batch());
+        self.ingest_owned_batch(owned)
     }
 
     // ------------------------------------------------------------------
@@ -415,40 +394,39 @@ impl Table {
         self.recovery_source
     }
 
+    /// The next-shard LSN counter. Seeded `max_lsn + 1` at open, bumped on every
+    /// ingest; feeds spill/barrier shard naming and the master's zone-LSN
+    /// allocator floor.
+    pub fn current_lsn(&self) -> u64 {
+        self.current_lsn
+    }
+
+    /// Pin the LSN counter to a recovery watermark, monotonically: the counter
+    /// only ever moves forward. Idempotent SAL re-replay legitimately presents
+    /// an older zone LSN (the dedupe filter under-dedupes by design), and
+    /// regressing the counter would let a later spill reuse a live shard name.
+    pub fn pin_lsn(&mut self, lsn: std::num::NonZeroU64) {
+        self.current_lsn = self.current_lsn.max(lsn.get());
+    }
+
     // ------------------------------------------------------------------
     // Cursor
     // ------------------------------------------------------------------
 
     /// Open a read-only cursor over (memtable runs + shards).
     /// Does NOT mutate the table — compaction is a maintenance operation,
-    /// not part of the read path. Cheap and infallible.
-    ///
-    /// This is the recommended default. Use `create_cursor_compacting` only
-    /// when the caller explicitly wants L0→L1 to run synchronously (manual
-    /// FLUSH, foreground checkpoint, etc.). The snapshot-driven cursor itself
-    /// doesn't care whether L0 has accumulated past the compact threshold.
-    pub fn open_cursor(&self) -> CursorHandle {
+    /// not part of the read path. Cheap and infallible. Maintenance paths
+    /// that want an up-to-date L1 call `compact_if_needed` first.
+    pub fn open_cursor(&self) -> ReadCursor {
         let mt = self.memtable.snapshot_runs();
         let shard_arcs = self.shard_index.all_shard_arcs();
         if self.in_memory_l0.is_empty() {
-            return read_cursor::create_cursor_from_snapshots(mt, &shard_arcs, self.schema);
+            return read_cursor::create_read_cursor(mt, &shard_arcs, self.schema);
         }
         let mut snaps: Vec<Rc<Batch>> = Vec::with_capacity(mt.len() + self.in_memory_l0.len());
         snaps.extend(mt.iter().cloned());
         snaps.extend(self.in_memory_runs());
-        read_cursor::create_cursor_from_snapshots(&snaps, &shard_arcs, self.schema)
-    }
-
-    /// Open a cursor after running `compact_if_needed`. Intended for
-    /// maintenance / flush paths that want an up-to-date L1.
-    ///
-    /// **Do not use from validators.** A compaction `Err` returned here is a
-    /// correctness hazard if the caller treats cursor absence as "no match":
-    /// a transient Io turns "value exists" into "value absent", silently
-    /// corrupting unique-index / FK checks. Use `open_cursor` instead.
-    pub fn create_cursor_compacting(&mut self) -> Result<CursorHandle, StorageError> {
-        self.compact_if_needed()?;
-        Ok(self.open_cursor())
+        read_cursor::create_read_cursor(&snaps, &shard_arcs, self.schema)
     }
 
     /// Return the fully consolidated batch of all live rows, caching the result.
@@ -459,7 +437,7 @@ impl Table {
         if let Some(ref rc) = self.cached_full_scan {
             return Rc::clone(rc);
         }
-        let rc = self.open_cursor().cursor.materialize();
+        let rc = self.open_cursor().materialize();
         self.cached_full_scan = Some(Rc::clone(&rc));
         rc
     }
@@ -496,9 +474,9 @@ impl Table {
 
     /// Test helper: upsert a consolidated batch directly into the memtable (no WAL).
     #[cfg(test)]
-    pub(crate) fn memtable_upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
+    pub(crate) fn memtable_upsert_sorted_batch(&mut self, batch: Batch) {
         self.cached_full_scan = None;
-        self.memtable.upsert_sorted_batch(batch)
+        self.memtable.upsert_sorted_batch(batch);
     }
 
     /// Test helper: the highest LSN registered in the shard index (0 when no
@@ -522,182 +500,143 @@ impl Table {
     /// Byte-keyed PK existence check. The OPK-keyed memtable bloom gates the
     /// sorted-run lookup at every PK width (a wide-PK probe matches the 16-byte
     /// prefix the insert side hashed, so there are no false negatives).
-    pub fn has_pk_bytes(&mut self, key: &[u8]) -> bool {
+    pub fn has_pk_bytes(&self, key: &[u8]) -> bool {
         let mut w: i64 = 0;
         if self.memtable.may_contain_pk(key) {
             let (mt_w, _, _) = self.memtable.lookup_pk_bytes(key);
             w += mt_w;
         }
-        let (shard_w, _) = self.scan_shards_for_pk_bytes(key, false);
-        w += shard_w;
+        self.for_each_shard_pk_match(key, |shard, idx| w += shard.get_weight(idx));
         // Between checkpoints any table can hold live rows in `in_memory_l0`
         // (ingest overflow), so the RAM tier is scanned too.
-        w += self.scan_inmem(key, false).0;
+        self.for_each_inmem_pk_match(key, |run, idx| w += run.get_weight(idx));
         w > 0
     }
 
-    /// Net weight and (optionally) the matching rows for `key` across
-    /// `in_memory_l0`, bloom-gated per run. Mirrors `scan_shards_for_pk_bytes`.
-    fn scan_inmem(&self, key: &[u8], need_candidates: bool) -> (i64, Vec<(Rc<Batch>, usize)>) {
-        let mut total_w: i64 = 0;
-        let mut candidates: Vec<(Rc<Batch>, usize)> = Vec::new();
+    /// Visit every RAM-tier row whose PK equals `key`, bloom-gated per run.
+    fn for_each_inmem_pk_match(&self, key: &[u8], mut f: impl FnMut(&Rc<Batch>, usize)) {
         for run in &self.in_memory_l0 {
             if !run.may_contain(key) {
                 continue;
             }
             for lo in memtable::run_pk_match_rows(&run.batch, key) {
-                total_w += run.batch.get_weight(lo);
-                if need_candidates {
-                    candidates.push((Rc::clone(&run.batch), lo));
-                }
+                f(&run.batch, lo);
             }
         }
-        (total_w, candidates)
     }
 
-    /// Look up a PK for retraction.  Returns (net_weight, found).
-    /// If found, sets `found_source` so `found_*` accessors can read the row.
+    /// Visit every shard row whose PK equals `key`. The start index comes from
+    /// `ShardIndex::find_pk_bytes` (XOR8- and range-gated binary search); this
+    /// walks only the contiguous exact-match range.
+    fn for_each_shard_pk_match(&self, key: &[u8], mut f: impl FnMut(&Rc<MappedShard>, usize)) {
+        self.shard_index.find_pk_bytes(key, &mut |shard_rc, start_idx| {
+            let mut idx = start_idx;
+            while idx < shard_rc.count && columnar::pk_bytes_eq(shard_rc.get_pk_bytes(idx), key) {
+                f(&shard_rc, idx);
+                idx += 1;
+            }
+        });
+    }
+
+    /// Look up a PK for retraction.  Returns (net_weight, located row).
     ///
     /// Takes a **native** `u128` and `opk_key`s it; the DML retraction path now
     /// keys on verbatim OPK bytes via `retract_pk_bytes`, so this native entry
     /// point has no production caller and is retained only for unit tests.
     #[cfg(test)]
-    pub(crate) fn retract_pk(&mut self, key: u128) -> (i64, bool) {
+    pub(crate) fn retract_pk(&mut self, key: u128) -> (i64, Option<RowRef>) {
         let (opk, n) = columnar::opk_key(&self.schema, &key.to_le_bytes());
         self.retract_pk_bytes(&opk[..n])
     }
 
-    /// Look up a PK for retraction by its OPK `key` bytes. Returns
-    /// `(net_weight, found)`; on a hit sets `found_source` so the `found_*`
-    /// accessors expose the live (PK, payload) row. The OPK-keyed memtable
-    /// bloom gates the run lookup at every PK width.
-    pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, bool) {
-        self.found_source = FoundSource::None;
-
-        let (mt_w, _, mt_row_count) = if self.memtable.may_contain_pk(key) {
+    /// Look up a PK for retraction by its OPK `key` bytes. Returns the net
+    /// weight and, when it is positive, the live (PK, payload) row as an owned
+    /// [`RowRef`]. The OPK-keyed memtable bloom gates the run lookup at every
+    /// PK width.
+    ///
+    /// Winner selection is one grouping pass over a cross-tier candidate pool —
+    /// memtable rows first (arming priority: the newest history), then RAM
+    /// runs, then shards. Groups form by payload equality; the first group (in
+    /// pool order) whose weights net strictly positive holds the live row. The
+    /// common hot-key upsert (exactly one memtable row, positive) skips the
+    /// pool entirely.
+    pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, Option<RowRef>) {
+        let (mt_w, mt_first, mt_row_count) = if self.memtable.may_contain_pk(key) {
             self.memtable.lookup_pk_bytes(key)
         } else {
-            (0, false, 0)
+            (0, None, 0)
         };
+        let single_live_mem_row = mt_row_count == 1 && mt_w > 0;
 
-        let need_candidates = !(mt_row_count == 1 && mt_w > 0);
-        let (inmem_w, inmem_candidates) = self.scan_inmem(key, need_candidates);
-        let (shard_w, shard_candidates) = self.scan_shards_for_pk_bytes(key, need_candidates);
-        let total_w = mt_w + inmem_w + shard_w;
-
-        if total_w <= 0 {
-            return (total_w, false);
-        }
-
-        let in_memtable = if mt_row_count == 1 && mt_w > 0 {
-            true
-        } else if mt_row_count > 1 {
-            self.memtable.find_positive_payload_row_bytes(key)
-        } else {
-            false
-        };
-
-        // Tier-agnostic candidate list, RAM runs before shards. Each candidate
-        // is already a `FoundSource`, so arming the winner is a move.
-        let mut candidates: Vec<FoundSource> = inmem_candidates
-            .into_iter()
-            .map(|(rc, idx)| FoundSource::InMemRun(rc, idx))
-            .chain(
-                shard_candidates
-                    .into_iter()
-                    .map(|(rc, idx)| FoundSource::Shard(rc, idx)),
-            )
-            .collect();
-
-        self.found_source = if in_memtable {
-            FoundSource::MemTable
-        } else if candidates.len() == 1 {
-            // Single candidate + total_w > 0 + not in memtable ⇒ it is the live row.
-            candidates.pop().expect("len checked")
-        } else {
-            // Multi-candidate: arm the first candidate whose global net weight is
-            // positive — `candidate_weight` is the sole liveness oracle across
-            // all three tiers.
-            let mut winner = FoundSource::None;
-            for cand in candidates {
-                if self.candidate_weight(key, &cand) > 0 {
-                    winner = cand;
-                    break;
-                }
-            }
-            winner
-        };
-
-        (total_w, true)
-    }
-
-    /// Global net weight of a located candidate row, dispatching on its tier.
-    fn candidate_weight(&mut self, key: &[u8], cand: &FoundSource) -> i64 {
-        match cand {
-            FoundSource::InMemRun(rc, idx) => self.get_weight_for_row_bytes(key, rc.as_ref(), *idx),
-            FoundSource::Shard(rc, idx) => self.get_weight_for_row_bytes(key, rc.as_ref(), *idx),
-            FoundSource::None | FoundSource::MemTable => 0,
-        }
-    }
-
-    /// Net weight for a specific (PK, payload) row, keyed by OPK `key` bytes.
-    /// The OPK-keyed memtable bloom gates the run scan at every PK width.
-    fn get_weight_for_row_bytes<S: columnar::ColumnarSource>(
-        &mut self,
-        key: &[u8],
-        ref_source: &S,
-        ref_row: usize,
-    ) -> i64 {
-        let mut total_w: i64 = 0;
-
-        if self.memtable.may_contain_pk(key) {
-            total_w += self.memtable.find_weight_for_row_bytes(key, ref_source, ref_row);
-        }
-
-        // RAM tier: bloom-gated and payload-aware, mirroring
-        // `MemTable::find_weight_for_row_bytes`. This immutable borrow of
-        // `in_memory_l0` ends before the shard split-borrow below.
-        for run in &self.in_memory_l0 {
-            if !run.may_contain(key) {
-                continue;
-            }
-            for lo in memtable::run_pk_match_rows(&run.batch, key) {
-                if columnar::compare_rows(&self.schema, run.batch.as_ref(), lo, ref_source, ref_row) == Ordering::Equal
-                {
-                    total_w += run.batch.get_weight(lo);
+        let mut pool = std::mem::take(&mut self.retract_scratch);
+        debug_assert!(pool.is_empty());
+        if !single_live_mem_row && mt_row_count > 0 {
+            for run in self.memtable.snapshot_runs() {
+                for lo in memtable::run_pk_match_rows(run, key) {
+                    pool.push(RowRef::Mem(Rc::clone(run), lo));
                 }
             }
         }
-
-        self.shard_index.find_pk_bytes(key, &mut |shard_rc, start_idx| {
-            let mut idx = start_idx;
-            while idx < shard_rc.count && columnar::pk_bytes_eq(shard_rc.get_pk_bytes(idx), key) {
-                let ord = columnar::compare_rows(&self.schema, shard_rc.as_ref(), idx, ref_source, ref_row);
-                if ord == Ordering::Equal {
-                    total_w += shard_rc.get_weight(idx);
-                }
-                idx += 1;
+        let mut inmem_w: i64 = 0;
+        self.for_each_inmem_pk_match(key, |run, lo| {
+            inmem_w += run.get_weight(lo);
+            if !single_live_mem_row {
+                pool.push(RowRef::Mem(Rc::clone(run), lo));
+            }
+        });
+        let mut shard_w: i64 = 0;
+        self.for_each_shard_pk_match(key, |shard, idx| {
+            shard_w += shard.get_weight(idx);
+            if !single_live_mem_row {
+                pool.push(RowRef::Shard(Rc::clone(shard), idx));
             }
         });
 
-        total_w
-    }
-
-    // ------------------------------------------------------------------
-    // Found-row accessors (after retract_pk)
-    // ------------------------------------------------------------------
-
-    /// The row most recently located by `retract_pk*`, as a `ColumnarSource`
-    /// view, or `None` when the last probe missed. The memtable arm resolves
-    /// through `MemTable::found_entry`; the shard arm borrows the mapped shard
-    /// held live by `FoundSource::Shard`.
-    pub(crate) fn found_row(&self) -> Option<FoundRow<'_>> {
-        match &self.found_source {
-            FoundSource::None => None,
-            FoundSource::MemTable => self.memtable.found_entry().map(|(b, r)| FoundRow::Mem(b, r)),
-            FoundSource::Shard(arc, idx) => Some(FoundRow::Shard(arc, *idx)),
-            FoundSource::InMemRun(rc, idx) => Some(FoundRow::Mem(rc.as_ref(), *idx)),
+        let total_w = mt_w + inmem_w + shard_w;
+        if total_w <= 0 {
+            pool.clear();
+            self.retract_scratch = pool;
+            return (total_w, None);
         }
+
+        if single_live_mem_row {
+            let (ri, lo) = mt_first.expect("row_count == 1 implies a first match");
+            let row = RowRef::Mem(Rc::clone(&self.memtable.snapshot_runs()[ri]), lo);
+            self.retract_scratch = pool;
+            return (total_w, Some(row));
+        }
+
+        // Group equal payloads via `== Equal` and take the first group (in pool
+        // order) whose weights net strictly positive. Skipping an already-
+        // grouped payload is load-bearing for correctness, not just speed: a
+        // later candidate whose own weight is positive but whose full group
+        // nets ≤ 0 must not be returned.
+        let mut winner: Option<usize> = None;
+        'cands: for i in 0..pool.len() {
+            for j in 0..i {
+                if columnar::compare_rows(&self.schema, &pool[j], 0, &pool[i], 0) == Ordering::Equal {
+                    continue 'cands;
+                }
+            }
+            let mut net = columnar::ColumnarSource::get_weight(&pool[i], 0);
+            for k in i + 1..pool.len() {
+                if columnar::compare_rows(&self.schema, &pool[i], 0, &pool[k], 0) == Ordering::Equal {
+                    net += columnar::ColumnarSource::get_weight(&pool[k], 0);
+                }
+            }
+            if net > 0 {
+                winner = Some(i);
+                break;
+            }
+        }
+        debug_assert!(
+            winner.is_some(),
+            "positive net PK weight implies a positive payload group"
+        );
+        let row = winner.map(|i| pool.swap_remove(i));
+        pool.clear();
+        self.retract_scratch = pool;
+        (total_w, row)
     }
 
     // ------------------------------------------------------------------
@@ -722,7 +661,6 @@ impl Table {
         if !self.shard_index.should_compact() {
             return Ok(());
         }
-        self.found_source = FoundSource::None;
         self.shard_index.run_compact()?;
         if self.recovery_source == RecoverySource::Rederive {
             self.drain_deletions();
@@ -738,44 +676,6 @@ impl Table {
     pub(crate) fn drain_deletions(&mut self) {
         self.shard_index.try_cleanup();
     }
-
-    // ------------------------------------------------------------------
-    // Close
-    // ------------------------------------------------------------------
-
-    pub fn close(&mut self) {
-        // ShardIndex + MemTable drop with the Table. Directory fds are opened
-        // per flush/compaction and closed there, so nothing is held to close.
-    }
-
-    // ------------------------------------------------------------------
-    // Internal helpers
-    // ------------------------------------------------------------------
-
-    /// Scan shards for a PK by its OPK `key` bytes.
-    fn scan_shards_for_pk_bytes(&self, key: &[u8], need_candidates: bool) -> (i64, Vec<(Rc<MappedShard>, usize)>) {
-        let mut total_w: i64 = 0;
-        let mut candidates: Vec<(Rc<MappedShard>, usize)> = Vec::new();
-
-        self.shard_index.find_pk_bytes(key, &mut |shard_rc, start_idx| {
-            let mut idx = start_idx;
-            while idx < shard_rc.count && columnar::pk_bytes_eq(shard_rc.get_pk_bytes(idx), key) {
-                total_w += shard_rc.get_weight(idx);
-                if need_candidates {
-                    candidates.push((Rc::clone(&shard_rc), idx));
-                }
-                idx += 1;
-            }
-        });
-
-        (total_w, candidates)
-    }
-}
-
-impl Drop for Table {
-    fn drop(&mut self) {
-        self.close();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -783,7 +683,7 @@ impl Drop for Table {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn ensure_dir(dir: &str) -> Result<CString, StorageError> {
-    let dir_c = CString::new(dir).map_err(|_| StorageError::InvalidPath)?;
+    let dir_c = super::super::cstr(dir)?;
     // Recursive: a table may home into a nested dir whose parents don't exist
     // yet (a worker's per-rank index subdir under a fresh index dir).
     std::fs::create_dir_all(dir).map_err(|_| StorageError::Io)?;
@@ -791,39 +691,22 @@ pub(crate) fn ensure_dir(dir: &str) -> Result<CString, StorageError> {
 }
 
 fn set_nocow_dir(dir_c: &CStr) {
-    unsafe {
-        let fd = libc::open(dir_c.as_ptr(), libc::O_RDONLY);
-        if fd >= 0 {
-            // FS_IOC_SETFLAGS = 0x40086602, FS_NOCOW_FL = 0x00800000
-            let mut flags: libc::c_ulong = 0;
-            libc::ioctl(fd, 0x80086601, &mut flags); // FS_IOC_GETFLAGS
-            flags |= 0x00800000; // FS_NOCOW_FL
-            libc::ioctl(fd, 0x40086602, &flags); // FS_IOC_SETFLAGS
-            libc::close(fd);
-        }
+    use std::os::fd::AsRawFd;
+    if let Some(fd) = crate::foundation::posix_io::open_owned(dir_c, libc::O_RDONLY) {
+        crate::foundation::posix_io::try_set_nocow(fd.as_raw_fd());
     }
 }
 
 fn erase_stale_shards(dir: &str, table_id: u32) {
-    // Remove all shard files belonging to this Rederive table: spill shards
-    // (`shard_*`) and compaction outputs (`hcomp_*`) left by a previous
-    // process. Both patterns include table_id, so only this table's files are
-    // touched even when tables share the same directory.
+    // Remove all shard files belonging to this Rederive table (spill shards
+    // and compaction outputs left by a previous process). The grammar includes
+    // table_id, so only this table's files are touched even when tables share
+    // the same directory.
     //
     // In steady state a Rederive table writes no shard files at all — its
     // flushes land in `in_memory_l0` (heap); files appear only past the
     // `INMEM_CEILING` spill and its disk compaction.
-    let shard_prefix = format!("shard_{table_id}_");
-    let hcomp_prefix = format!("hcomp_{table_id}_");
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with(&shard_prefix) || name.starts_with(&hcomp_prefix) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
+    super::naming::remove_shard_files(dir, table_id, &std::collections::HashSet::new());
 }
 
 // ---------------------------------------------------------------------------
@@ -865,7 +748,7 @@ mod tests {
 
     /// `Table::new(...)` with the per-test boilerplate folded away.
     fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, id: u32, arena: u64, rs: RecoverySource) -> Table {
-        Table::new(dir.to_str().unwrap(), "test", schema, id, arena, rs).unwrap()
+        Table::new(dir.to_str().unwrap(), schema, id, arena, rs).unwrap()
     }
 
     /// Names of the "flat" `shard_{table_id}_{lsn}.db` files directly in `dir` —
@@ -891,30 +774,37 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Count compaction-output files for `table_id`. L0→L1 outputs are named
-    /// `shard_{tid}_{seq}_L{n}_G{gk}.db` (the `_L` marker distinguishes them from
-    /// flat spill/barrier shards); guard compactions use the `hcomp_{tid}_`
-    /// prefix. Either presence proves a compaction ran.
+    /// Count compaction-output files for `table_id` — named
+    /// `shard_{tid}_{seq}_L{n}_G{gk}.db`; the `_L` marker distinguishes them
+    /// from flat spill/barrier shards. Presence proves a compaction ran.
     fn compaction_output_count(dir: &std::path::Path, table_id: u32) -> usize {
         let shard = format!("shard_{table_id}_");
-        let hcomp = format!("hcomp_{table_id}_");
-        count_files(dir, |n| {
-            (n.starts_with(&shard) && n.contains("_L")) || n.starts_with(&hcomp)
-        })
+        count_files(dir, |n| n.starts_with(&shard) && n.contains("_L"))
     }
 
-    /// Count every on-disk shard/compaction-output file for `table_id`
-    /// (`shard_{tid}_*` + `hcomp_{tid}_*`).
+    /// Count every on-disk shard/compaction-output file for `table_id`.
     fn all_shard_file_count(dir: &std::path::Path, table_id: u32) -> usize {
         let shard = format!("shard_{table_id}_");
-        let hcomp = format!("hcomp_{table_id}_");
-        count_files(dir, |n| n.starts_with(&shard) || n.starts_with(&hcomp))
+        count_files(dir, |n| n.starts_with(&shard))
+    }
+
+    /// Run a full synchronous force-publish flush stamped at `generation` —
+    /// the ephemeral checkpoint round's prepare + commit, minus the fsyncs the
+    /// tests don't observe.
+    fn flush_ephemeral_at(t: &mut Table, generation: u64) {
+        match t.flush_prepare_ephemeral(generation).unwrap() {
+            FlushOutcome::Pending(work) => {
+                let _ = t.flush_commit(work).unwrap();
+                t.drain_deletions();
+            }
+            FlushOutcome::Done => {}
+        }
     }
 
     /// Materialize `open_cursor` into a (pk -> net_weight) map.
     fn materialize_weights(t: &Table) -> std::collections::HashMap<u64, i64> {
         let mut out = std::collections::HashMap::new();
-        let batch = t.open_cursor().cursor.materialize();
+        let batch = t.open_cursor().materialize();
         for i in 0..batch.count {
             out.insert(batch.get_pk(i) as u64, batch.get_weight(i));
         }
@@ -942,8 +832,6 @@ mod tests {
         // After flush, data is in shards
         assert!(t.has_pk(10));
         assert!(t.has_pk(20));
-
-        t.close();
     }
 
     #[test]
@@ -958,7 +846,6 @@ mod tests {
         t.flush().unwrap();
 
         assert!(t.has_pk(10));
-        t.close();
 
         // Re-open and recover
         let mut t2 = new_table(&tdir, schema, 200, 1 << 20, RecoverySource::SalReplay);
@@ -966,7 +853,6 @@ mod tests {
         // Data should be in shards via manifest
         assert!(t2.has_pk(10));
         assert!(t2.has_pk(20));
-        t2.close();
     }
 
     #[test]
@@ -981,8 +867,8 @@ mod tests {
             .unwrap();
 
         let cursor = t.open_cursor();
-        assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key_narrow() as u64, 10);
+        assert!(cursor.valid);
+        assert_eq!(cursor.current_key_narrow() as u64, 10);
         // Don't need to iterate further — cursor creation works
     }
 
@@ -998,16 +884,16 @@ mod tests {
 
         let (w, found) = t.retract_pk(10);
         assert_eq!(w, 1);
-        assert!(found);
+        assert!(found.is_some());
         // The retracted row is the found row: a valid null word and an
         // accessible payload column, read through the ColumnarSource view.
-        let fr = t.found_row().expect("retracted row is the found row");
+        let fr = found.expect("retracted row is the found row");
         assert_ne!(columnar::ColumnarSource::get_null_word(&fr, 0), u64::MAX);
         assert_eq!(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).len(), 8);
 
         let (w, found) = t.retract_pk(99);
         assert_eq!(w, 0);
-        assert!(!found);
+        assert!(found.is_none());
     }
 
     #[test]
@@ -1058,10 +944,10 @@ mod tests {
         // Net state: val=100 has weight 0 (cancelled), val=200 has weight 1
         let (w, found) = t.retract_pk(10);
         assert_eq!(w, 1);
-        assert!(found);
+        assert!(found.is_some());
 
         // The found row must be val=200, not the cancelled val=100
-        let fr = t.found_row().expect("retracted row is the found row");
+        let fr = found.expect("retracted row is the found row");
         let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
         assert_eq!(
             val, 200,
@@ -1088,9 +974,9 @@ mod tests {
 
         // Cursor must yield rows in ascending PK order
         let cursor = t.open_cursor();
-        assert!(cursor.cursor.valid);
+        assert!(cursor.valid);
         assert_eq!(
-            cursor.cursor.current_key_narrow() as u64,
+            cursor.current_key_narrow() as u64,
             10,
             "cursor should start at PK=10 (smallest)"
         );
@@ -1114,7 +1000,7 @@ mod tests {
         // (bypasses auto-flush so runs_bytes exceeds max_bytes).
         let fill_batch = make_batch(&[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
         let fill_batch = fill_batch.into_consolidated(&schema);
-        t.memtable_upsert_sorted_batch(fill_batch).unwrap();
+        t.memtable_upsert_sorted_batch(fill_batch);
         // runs_bytes (~120) > max_bytes (40) — next ingest must pre-flush
         // before upsert. The new owned-batch path checks should_flush()
         // before upserting, so the pre-fill goes to a shard cleanly.
@@ -1126,9 +1012,9 @@ mod tests {
 
         // fill batch (1,2,3) is now in shard; sorted (30,40,50) is in memtable.
         let cursor = t.open_cursor();
-        assert!(cursor.cursor.valid);
+        assert!(cursor.valid);
         assert_eq!(
-            cursor.cursor.current_key_narrow() as u64,
+            cursor.current_key_narrow() as u64,
             1,
             "cursor should start at PK=1 from flushed shard"
         );
@@ -1195,9 +1081,9 @@ mod tests {
         // retract_pk must find val=200 (net weight 1), not val=100 (net weight 0).
         let (w, found) = t.retract_pk(10);
         assert_eq!(w, 1);
-        assert!(found);
+        assert!(found.is_some());
 
-        let fr = t.found_row().expect("retracted row is the found row");
+        let fr = found.expect("retracted row is the found row");
         let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
         assert_eq!(
             val, 200,
@@ -1233,14 +1119,7 @@ mod tests {
                 );
                 drop(work);
             }
-            other => panic!(
-                "expected Pending, got non-pending outcome: {}",
-                match other {
-                    FlushOutcome::Empty => "Empty",
-                    FlushOutcome::DoneInline => "DoneInline",
-                    _ => "?",
-                }
-            ),
+            FlushOutcome::Done => panic!("expected Pending, got Done"),
         }
 
         let leftover_tmp: Vec<String> = std::fs::read_dir(&tdir)
@@ -1272,20 +1151,13 @@ mod tests {
         let stray = tdir.join("shard_200_1.db");
         std::fs::write(&stray, b"orphan").unwrap();
 
-        let result = Table::new(
-            tdir.to_str().unwrap(),
-            "test",
-            schema,
-            200,
-            1 << 20,
-            RecoverySource::SalReplay,
-        );
+        let result = Table::new(tdir.to_str().unwrap(), schema, 200, 1 << 20, RecoverySource::SalReplay);
         assert!(result.is_err(), "Table::new must fail on corrupted manifest");
         assert!(stray.exists(), "stray shard must survive when gc_orphans did not run");
     }
 
     /// Non-durable `flush_prepare` consolidates the snapshot into the in-memory
-    /// run set and returns `DoneInline`; the memtable is reset, no shard file is
+    /// run set and returns `Done`; the memtable is reset, no shard file is
     /// written, and the rows stay visible to subsequent reads.
     #[test]
     fn flush_prepare_non_durable_done_inline() {
@@ -1297,9 +1169,8 @@ mod tests {
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200)])).unwrap();
         match t.flush_prepare().unwrap() {
-            FlushOutcome::DoneInline => {}
-            FlushOutcome::Empty => panic!("expected DoneInline, got Empty"),
-            FlushOutcome::Pending(_) => panic!("expected DoneInline, got Pending"),
+            FlushOutcome::Done => {}
+            FlushOutcome::Pending(_) => panic!("expected Done, got Pending"),
         }
         assert!(
             t.memtable_is_empty(),
@@ -1374,12 +1245,10 @@ mod tests {
         // retract_pk_bytes reports the live (PK, payload) row.
         let (w, found) = t.retract_pk_bytes(&pk3(1, 1, 200));
         assert_eq!(w, 1);
-        assert!(found);
+        assert!(found.is_some());
         let (w2, found2) = t.retract_pk_bytes(&pk3(1, 1, 100));
         assert_eq!(w2, 0);
-        assert!(!found2);
-
-        t.close();
+        assert!(found2.is_none());
     }
 
     /// Wide (`pk_stride = 24`) PK with a *signed* leading column: OPK must order a
@@ -1447,11 +1316,10 @@ mod tests {
         // key at wide width — a read-only probe; the row is removed by a DBSP -1
         // ingest, whose memtable weight nets the shard's +1 to zero.
         let (w, found) = t.retract_pk_bytes(&key(-5, 0, 0));
-        assert_eq!((w, found), (1, true));
+        assert_eq!(w, 1);
+        assert!(found.is_some());
         t.ingest_owned_batch(row(-5, -1)).unwrap();
         assert!(!t.has_pk_bytes(&key(-5, 0, 0)), "retracted signed key is gone");
-
-        t.close();
     }
 
     // ── In-memory Rederive flush (RAM tier, no file I/O) ─────────────────
@@ -1467,7 +1335,7 @@ mod tests {
 
         t.ingest_owned_batch(make_batch(&[(10, 1, 100), (20, 1, 200), (30, 1, 300)]))
             .unwrap();
-        assert!(matches!(t.flush_prepare().unwrap(), FlushOutcome::DoneInline));
+        assert!(matches!(t.flush_prepare().unwrap(), FlushOutcome::Done));
 
         let shard_files: Vec<String> = std::fs::read_dir(&tdir)
             .unwrap()
@@ -1500,7 +1368,7 @@ mod tests {
         for i in 0..6 {
             let w = if i % 2 == 0 { 1 } else { -1 };
             t.ingest_owned_batch(make_batch(&[(7, w, 70)])).unwrap();
-            assert!(t.flush().unwrap());
+            t.flush().unwrap();
         }
         assert!(!t.has_pk(7), "net-zero key must not be present");
         let weights = materialize_weights(&t);
@@ -1527,7 +1395,7 @@ mod tests {
         let n = INMEM_COMPACT_THRESHOLD as u64 + 4;
         for k in 0..n {
             t.ingest_owned_batch(make_batch(&[(k, 1, (k * 10) as i64)])).unwrap();
-            assert!(t.flush().unwrap());
+            t.flush().unwrap();
             assert!(
                 t.in_memory_runs().count() <= INMEM_COMPACT_THRESHOLD,
                 "run count exceeded threshold after flush {k}",
@@ -1551,7 +1419,7 @@ mod tests {
 
         let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
         t.ingest_owned_batch(make_batch(&rows)).unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
 
         assert!(
             !shard_db_files(&tdir, 100).is_empty(),
@@ -1583,7 +1451,7 @@ mod tests {
                 .map(|j| (r * PER + j, 1, ((r * PER + j) * 10) as i64))
                 .collect();
             t.ingest_owned_batch(make_batch(&rows)).unwrap();
-            assert!(t.flush().unwrap());
+            t.flush().unwrap();
             assert_eq!(t.in_memory_bytes(), 0, "round {r}: heap drained after spill");
             // Raw spill shards do not accumulate with rounds — disk L0 self-folds
             // into L1 and the consumed raw shards are unlinked.
@@ -1609,12 +1477,12 @@ mod tests {
         let mut t = new_table(&tdir, schema, 100, 1 << 20, RecoverySource::Rederive);
 
         t.ingest_owned_batch(make_batch(&[(5, 1, 50)])).unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
         assert!(t.memtable_is_empty());
         assert!(t.has_pk(5), "in-memory positive-weight row must be found");
 
         t.ingest_owned_batch(make_batch(&[(5, -1, 50)])).unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
         assert!(!t.has_pk(5), "net-zero key across in-memory runs must be absent");
     }
 
@@ -1632,7 +1500,7 @@ mod tests {
         t.set_inmem_ceiling_for_test(100);
         let disk_rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (k, 1, (k * 10) as i64)).collect();
         t.ingest_owned_batch(make_batch(&disk_rows)).unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
         assert!(!t.all_shard_arcs().is_empty(), "first flush must spill to disk");
         assert_eq!(t.in_memory_bytes(), 0);
 
@@ -1640,12 +1508,12 @@ mod tests {
         t.set_inmem_ceiling_for_test(usize::MAX);
         let heap_rows: Vec<(u64, i64, i64)> = (100..105).map(|k| (k, 1, (k * 10) as i64)).collect();
         t.ingest_owned_batch(make_batch(&heap_rows)).unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
         assert!(t.in_memory_runs().count() > 0, "second flush stays in heap");
 
         // Cross-tier retraction: cancel disk key 3 (payload 30) from heap.
         t.ingest_owned_batch(make_batch(&[(3, -1, 30)])).unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
 
         assert!(!t.has_pk(3), "disk insert + heap retraction nets zero");
         let weights = materialize_weights(&t);
@@ -1682,18 +1550,19 @@ mod tests {
 
         // Run 1: INSERT (PK=10, +1, val=100).
         t.ingest_owned_batch(make_batch(&[(10, 1, 100)])).unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
         // Run 2: UPDATE delta — retract val=100, insert val=200.
         t.ingest_owned_batch(make_batch(&[(10, -1, 100), (10, 1, 200)]))
             .unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
 
         assert!(t.memtable_is_empty());
         assert_eq!(t.in_memory_runs().count(), 2, "two sub-ceiling flushes → two L0 runs");
 
         let (w, found) = t.retract_pk(10);
-        assert_eq!((w, found), (1, true), "net weight 1 across the RAM runs");
-        let fr = t.found_row().expect("retracted row is the found row");
+        assert_eq!(w, 1, "net weight 1 across the RAM runs");
+        assert!(found.is_some());
+        let fr = found.expect("retracted row is the found row");
         let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
         assert_eq!(
             val, 200,
@@ -1732,7 +1601,7 @@ mod tests {
             (pk3(2, 0, 0), 1, 30),
         ]))
         .unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
         assert!(t.has_pk_bytes(&pk3(1, 1, 100)));
         assert!(t.has_pk_bytes(&pk3(1, 1, 200)));
         assert!(t.has_pk_bytes(&pk3(2, 0, 0)));
@@ -1740,19 +1609,20 @@ mod tests {
 
         // Retract one twin via a second in-memory run; the other must survive.
         t.ingest_owned_batch(wide_batch(&[(pk3(1, 1, 100), -1, 10)])).unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
         assert!(!t.has_pk_bytes(&pk3(1, 1, 100)), "retracted twin gone");
         assert!(t.has_pk_bytes(&pk3(1, 1, 200)), "the other twin survives");
 
         let (w, found) = t.retract_pk_bytes(&pk3(1, 1, 200));
-        assert_eq!((w, found), (1, true));
-        let fr = t.found_row().expect("live twin is the found row");
+        assert_eq!(w, 1);
+        assert!(found.is_some());
+        let fr = found.expect("live twin is the found row");
         let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
         assert_eq!(val, 20, "found row must be the surviving twin's payload");
 
         let (w2, found2) = t.retract_pk_bytes(&pk3(1, 1, 100));
-        assert_eq!((w2, found2), (0, false), "net-zero twin reports absent");
-        t.close();
+        assert_eq!(w2, 0, "net-zero twin reports absent");
+        assert!(found2.is_none());
     }
 
     /// Twin of `table_wide_signed_compound_pk_opk_order`, in RAM: a signed
@@ -1780,7 +1650,7 @@ mod tests {
         for a in [3i64, -5, 0, -1] {
             t.ingest_owned_batch(row(a, 1)).unwrap();
         }
-        assert!(t.flush().unwrap()); // one in-memory L0 run
+        t.flush().unwrap(); // one in-memory L0 run
         assert!(t.in_memory_runs().count() > 0, "rows land in in_memory_l0");
 
         assert!(t.has_pk_bytes(&key(-5, 0, 0)));
@@ -1799,16 +1669,16 @@ mod tests {
         );
 
         let (w, found) = t.retract_pk_bytes(&key(-5, 0, 0));
-        assert_eq!((w, found), (1, true));
-        let fr = t.found_row().expect("signed key is the found row");
+        assert_eq!(w, 1);
+        assert!(found.is_some());
+        let fr = found.expect("signed key is the found row");
         let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
         assert_eq!(val, -5, "found row payload marks the retracted signed key");
 
         // Retraction across a second run nets the signed key to zero.
         t.ingest_owned_batch(row(-5, -1)).unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
         assert!(!t.has_pk_bytes(&key(-5, 0, 0)), "retracted signed key is gone");
-        t.close();
     }
 
     /// The live row sits in RAM while the memtable holds a *negative*-weight
@@ -1824,7 +1694,7 @@ mod tests {
 
         // RAM run: two payloads for PK=5 (val=50, val=60), each +1.
         t.ingest_owned_batch(make_batch(&[(5, 1, 50), (5, 1, 60)])).unwrap();
-        assert!(t.flush().unwrap());
+        t.flush().unwrap();
         // Memtable (unflushed): retract val=50, leaving (5,60) globally live.
         t.ingest_owned_batch(make_batch(&[(5, -1, 50)])).unwrap();
         assert!(!t.memtable_is_empty(), "retraction stays in the memtable");
@@ -1832,12 +1702,52 @@ mod tests {
         assert!(t.has_pk(5), "PK 5 nets +1 across RAM (+2) and memtable (-1)");
 
         let (w, found) = t.retract_pk(5);
-        assert_eq!((w, found), (1, true), "global net weight is 1");
-        let fr = t.found_row().expect("live row found");
+        assert_eq!(w, 1, "global net weight is 1");
+        assert!(found.is_some());
+        let fr = found.expect("live row found");
         let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
         assert_eq!(
             val, 60,
             "global oracle rejects the cancelled val=50, arms live val=60 from RAM"
+        );
+    }
+
+    /// Three-tier retract grouping: one PK with distinct payloads split across
+    /// a durable shard, the RAM tier, and the memtable. The grouping pass must
+    /// net each payload across ALL tiers — the shard payload cancelled by a
+    /// memtable retraction must not be armed even though its shard row alone
+    /// carries +1; the RAM payload is the only globally-live group.
+    #[test]
+    fn retract_groups_across_all_three_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let tdir = dir.path().join("retract_three_tier");
+        let schema = make_u64_i64_schema();
+        // Durable: shard tier participation requires SalReplay persistence.
+        let mut t = new_table(&tdir, schema, 5014, 1 << 20, RecoverySource::SalReplay);
+
+        // Shard: (7, val=70, +1) — flushed durably.
+        t.ingest_owned_batch(make_batch(&[(7, 1, 70)])).unwrap();
+        t.flush().unwrap();
+        assert!(t.shard_index_max_lsn() > 0, "row landed in a durable shard");
+
+        // RAM tier: (7, val=80, +1) — folded into in_memory_l0, not durable.
+        t.ingest_owned_batch(make_batch(&[(7, 1, 80)])).unwrap();
+        t.flush_to_ram().unwrap();
+        assert!(t.in_memory_runs().count() > 0, "val=80 sits in the RAM tier");
+
+        // Memtable: retract the SHARD payload (7, val=70, -1) — unflushed.
+        t.ingest_owned_batch(make_batch(&[(7, -1, 70)])).unwrap();
+        assert!(!t.memtable_is_empty(), "retraction stays in the memtable");
+
+        // Global nets: val=70 → shard +1, memtable −1 = 0 (dead);
+        //              val=80 → RAM +1 (live). Total = +1.
+        let (w, found) = t.retract_pk(7);
+        assert_eq!(w, 1, "total net weight across all three tiers");
+        let fr = found.expect("live row found");
+        let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
+        assert_eq!(
+            val, 80,
+            "grouping must net val=70 across shard+memtable to zero and arm the RAM-tier val=80"
         );
     }
 
@@ -1858,7 +1768,7 @@ mod tests {
         let n = INMEM_COMPACT_THRESHOLD as u64 + 2;
         for k in 0..n {
             t.ingest_owned_batch(make_batch(&[(k, 1, 100 + k as i64)])).unwrap();
-            assert!(t.flush().unwrap());
+            t.flush().unwrap();
         }
         assert!(
             t.in_memory_runs().count() <= INMEM_COMPACT_THRESHOLD,
@@ -1870,14 +1780,17 @@ mod tests {
             assert!(t.has_pk(k as u128), "key {k} must survive fold + bloom rebuild");
         }
         let (w, found) = t.retract_pk(0);
-        assert_eq!((w, found), (1, true));
-        let fr = t.found_row().expect("folded key is the found row");
+        assert_eq!(w, 1);
+        assert!(found.is_some());
+        let fr = found.expect("folded key is the found row");
         let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
         assert_eq!(val, 100, "found row payload survives the fold");
 
         // A PK absent from every run: bloom-miss path must equal the linear miss.
         assert!(!t.has_pk(9999), "absent PK reports absent (bloom miss)");
-        assert_eq!(t.retract_pk(9999), (0, false), "absent PK retract nets zero, not found");
+        let (w_absent, found_absent) = t.retract_pk(9999);
+        assert_eq!(w_absent, 0, "absent PK retract nets zero");
+        assert!(found_absent.is_none(), "absent PK retract finds no row");
     }
 
     // ── Unified checkpointing: RAM-tier lifecycle for SalReplay tables ────
@@ -1906,21 +1819,16 @@ mod tests {
 
         // `flush()` returns false iff `flush_prepare` said `Empty` — which here
         // would mean the fold-first gate dropped a populated `in_memory_l0`.
-        assert!(
-            t.flush().unwrap(),
-            "fold-first gate dropped populated in_memory_l0 (data loss)"
-        );
+        t.flush().unwrap();
 
         assert!(t.in_memory_runs().count() == 0, "flush_commit clears the RAM tier");
         assert!(!t.all_shard_arcs().is_empty(), "barrier wrote a durable shard");
-        t.close();
 
         // Reopen (SalReplay loads the manifest) → every row survives.
         let mut t2 = new_table(&tdir, schema, 7100, 128, RecoverySource::SalReplay);
         for k in 0..8u128 {
             assert!(t2.has_pk(k), "row {k} must survive barrier flush + reopen");
         }
-        t2.close();
     }
 
     /// Spill unification (SalReplay): a ceiling breach spills to
@@ -1968,8 +1876,7 @@ mod tests {
         // Publish a manifest so reopen sees the spilled shards: a small in-memtable
         // batch + barrier flush references the whole index.
         t.ingest_owned_batch(make_batch(&[(500, 1, 5000)])).unwrap();
-        assert!(t.flush().unwrap(), "barrier flush must publish a manifest");
-        t.close();
+        t.flush().unwrap();
 
         let mut t2 = new_table(&tdir, schema, 7200, 128, RecoverySource::SalReplay);
         assert_eq!(
@@ -1985,7 +1892,6 @@ mod tests {
             assert!(t2.has_pk(k), "second-spill row {k} survives reopen");
         }
         assert!(t2.has_pk(500), "barrier-flushed row survives reopen");
-        t2.close();
     }
 
     /// A `can_tag_pk_unique` base table's barrier shard carries
@@ -2010,7 +1916,7 @@ mod tests {
                 .unwrap();
             assert!(!t.memtable_is_empty(), "small second batch stays live in the memtable");
 
-            assert!(t.flush().unwrap(), "barrier flush must write the shard");
+            t.flush().unwrap();
             let shards = t.all_shard_arcs();
             assert_eq!(shards.len(), 1, "barrier folds memtable + L0 into one shard");
             assert!(shards[0].is_pk_unique, "barrier shard must carry SHARD_FLAG_PK_UNIQUE");
@@ -2086,8 +1992,9 @@ mod tests {
             assert!(t.has_pk(k), "row {k} readable from the RAM tier");
         }
         let (w, found) = t.retract_pk(3);
-        assert_eq!((w, found), (1, true), "retract resolves the live row in in_memory_l0");
-        let fr = t.found_row().expect("found row from RAM tier");
+        assert_eq!(w, 1, "retract resolves the live row in in_memory_l0");
+        assert!(found.is_some());
+        let fr = found.expect("found row from RAM tier");
         let val = i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap());
         assert_eq!(val, 30, "found-row payload matches the RAM-tier row");
     }
@@ -2115,11 +2022,9 @@ mod tests {
         assert_eq!(t.in_memory_bytes(), 0, "ceiling breach spilled to disk");
         assert_eq!(t.all_shard_arcs().len(), 1, "exactly one lone spill shard");
 
-        assert!(
-            t.flush().unwrap(),
-            "barrier must publish the lone unpublished spill (F1), not return Empty"
-        );
-        t.close();
+        // F1 regression: the barrier must publish the lone unpublished spill
+        // (verified below via the manifest/shard the reopen sees).
+        t.flush().unwrap();
 
         let mut t2 = new_table(&tdir, schema, 7600, 128, RecoverySource::SalReplay);
         assert!(
@@ -2129,7 +2034,6 @@ mod tests {
         for k in 0..10u128 {
             assert!(t2.has_pk(k), "spilled row {k} must survive checkpoint + reopen");
         }
-        t2.close();
     }
 
     /// Deferred-cleanup crash simulation. After a mid-epoch compaction that did
@@ -2146,7 +2050,7 @@ mod tests {
 
         // Cut A: one row, published by a barrier (manifest M0 references its shard).
         t.ingest_owned_batch(make_batch(&[(1000, 1, 1)])).unwrap();
-        assert!(t.flush().unwrap(), "cut A publishes M0");
+        t.flush().unwrap();
 
         // Post-cut churn: spill > L0_COMPACT_THRESHOLD shards so run_compact fires,
         // swapping the index and deferring cleanup (no mid-epoch publish).
@@ -2169,7 +2073,6 @@ mod tests {
             0,
             "deferred compaction outputs (never in M0) must be gc'd at open"
         );
-        t2.close();
     }
 
     /// Compact-then-quiet. A table that compacts mid-epoch and then goes quiet
@@ -2196,8 +2099,7 @@ mod tests {
         assert!(t.memtable_is_empty(), "no live memtable rows");
         assert!(compaction_output_count(&tdir, 7800) > 0, "compaction ran");
 
-        assert!(t.flush().unwrap(), "quiet compacted table must still publish");
-        t.close();
+        t.flush().unwrap();
 
         let mut t2 = new_table(&tdir, schema, 7800, 128, RecoverySource::SalReplay);
         for pk in &all_keys {
@@ -2206,111 +2108,103 @@ mod tests {
                 "row {pk} present after compact + barrier + reopen"
             );
         }
-        t2.close();
     }
 
-    /// The manifest generation is stamped from `worker_ctx::committed_generation()`
-    /// at every publish, so a compaction republish carries the *current*
-    /// generation, and a later republish re-stamps a newer one. Uses the
-    /// thread-local generation override for determinism under parallel
-    /// `cargo test` (the process-global atomic is clobbered by every
-    /// `CatalogEngine::open`).
+    /// The manifest generation is stamped from the value the publish path
+    /// passes explicitly (`flush_prepare_ephemeral(generation)`), so a
+    /// compaction republish carries the caller's generation, and a later
+    /// republish re-stamps a newer one.
     #[test]
     fn generation_preserved_by_compaction_republish() {
         use super::super::manifest::{read_file, ManifestEntryRaw};
-        use crate::foundation::worker_ctx;
 
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("gen_republish");
         let schema = make_u64_i64_schema();
         let manifest_path = std::ffi::CString::new(tdir.join("manifest.bin").to_str().unwrap()).unwrap();
         let read_generation = |path: &std::ffi::CStr| -> u64 {
-            let mut out = vec![ManifestEntryRaw::zeroed(); 64];
-            read_file(path, &mut out, 64).unwrap().1.generation
+            let mut out = vec![ManifestEntryRaw::default(); 64];
+            read_file(path, &mut out).unwrap().1.generation
         };
 
         // Publish at generation G1 with a compaction pending.
-        worker_ctx::set_test_gen_override(Some(0x1111));
         let mut t = new_table(&tdir, schema, 7900, 128, RecoverySource::SalReplay);
         t.set_inmem_ceiling_for_test(100);
         for r in 0..6u64 {
             let rows: Vec<(u64, i64, i64)> = (0..10).map(|k| (r * 100 + k, 1, 1)).collect();
             t.ingest_owned_batch(make_batch(&rows)).unwrap();
+            flush_ephemeral_at(&mut t, 0x1111);
         }
         assert!(compaction_output_count(&tdir, 7900) > 0, "compaction ran");
-        assert!(t.flush().unwrap(), "compacted table republishes");
+        flush_ephemeral_at(&mut t, 0x1111);
         assert_eq!(
             read_generation(&manifest_path),
             0x1111,
-            "republished manifest carries the current generation",
+            "republished manifest carries the passed generation",
         );
 
         // A later publish at a higher generation re-stamps the manifest.
-        worker_ctx::set_test_gen_override(Some(0x2222));
         t.ingest_owned_batch(make_batch(&[(9999, 1, 1)])).unwrap();
-        assert!(t.flush().unwrap(), "second barrier republishes");
-        t.close();
+        flush_ephemeral_at(&mut t, 0x2222);
         assert_eq!(
             read_generation(&manifest_path),
             0x2222,
             "later republish re-stamps the newer generation",
         );
-
-        worker_ctx::set_test_gen_override(None);
     }
 
     /// `Table::new`'s `RederiveCheckpointed` open decision: a manifest whose
-    /// generation matches `committed_generation()` loads its shards; a mismatch
-    /// (or absence) erases the shards and unlinks the manifest. The manifest is
-    /// produced by an ordinary `SalReplay` flush — the reload decision keys only
-    /// off the stamped generation, which is identical however the manifest was
-    /// published.
+    /// generation matches the caller's `committed` loads its shards; a mismatch
+    /// (or absence) erases the shards and unlinks the manifest.
     #[test]
     fn rederive_checkpointed_conditional_load() {
-        use crate::foundation::worker_ctx;
-
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("cond_load");
         let schema = make_u64_i64_schema();
         let manifest_path = tdir.join("manifest.bin");
 
         // Publish a durable shard + manifest stamped at generation 7.
-        worker_ctx::set_test_gen_override(Some(7));
         {
             let mut t = new_table(&tdir, schema, 7910, 128, RecoverySource::SalReplay);
-            t.ingest_owned_batch(make_batch(&[(1, 1, 1), (2, 1, 1)])).unwrap();
-            assert!(t.flush().unwrap(), "SalReplay flush publishes a manifest");
-            t.close();
+            t.ingest_owned_batch(make_batch(&[(1, 1, 100), (2, 1, 200)])).unwrap();
+            flush_ephemeral_at(&mut t, 7);
         }
         assert!(manifest_path.exists(), "manifest published at generation 7");
 
         // Matching generation ⇒ shards load, rows present.
         {
-            let mut t = new_table(&tdir, schema, 7910, 128, RecoverySource::RederiveCheckpointed);
+            let t = new_table(
+                &tdir,
+                schema,
+                7910,
+                128,
+                RecoverySource::RederiveCheckpointed { committed: 7 },
+            );
             assert!(
-                t.has_pk(1) && t.has_pk(2),
+                t.has_pk_bytes(&1u64.to_be_bytes()) && t.has_pk_bytes(&2u64.to_be_bytes()),
                 "matching-generation reopen must load the checkpointed shards"
             );
-            t.close();
         }
         assert!(manifest_path.exists(), "matching reopen leaves the manifest in place");
 
         // Mismatched generation ⇒ shards erased, manifest unlinked.
-        worker_ctx::set_test_gen_override(Some(8));
         {
-            let mut t = new_table(&tdir, schema, 7910, 128, RecoverySource::RederiveCheckpointed);
+            let t = new_table(
+                &tdir,
+                schema,
+                7910,
+                128,
+                RecoverySource::RederiveCheckpointed { committed: 8 },
+            );
             assert!(
-                !t.has_pk(1) && !t.has_pk(2),
+                !t.has_pk_bytes(&1u64.to_be_bytes()) && !t.has_pk_bytes(&2u64.to_be_bytes()),
                 "mismatched-generation reopen must erase the stale shards"
             );
-            t.close();
         }
         assert!(
             !manifest_path.exists(),
             "mismatched-generation reopen must unlink manifest.bin so a re-open cannot re-peek it"
         );
-
-        worker_ctx::set_test_gen_override(None);
     }
 
     /// The three-disjunct barrier gate, one arm each: RAM empty + nothing →
@@ -2318,7 +2212,6 @@ mod tests {
     /// the sweep list; RAM empty + compaction pending only (unsynced cleared) →
     /// `Pending` with an empty sweep and no new shard.
     #[test]
-    #[allow(clippy::disallowed_methods)] // arm 3 forces a compaction via create_cursor_compacting
     fn barrier_gate_matrix() {
         let schema = make_u64_i64_schema();
 
@@ -2328,10 +2221,10 @@ mod tests {
             let tdir = dir.path().join("gate_empty");
             let mut t = new_table(&tdir, schema, 7900, 1 << 20, RecoverySource::SalReplay);
             t.ingest_owned_batch(make_batch(&[(1, 1, 1)])).unwrap();
-            assert!(t.flush().unwrap(), "first barrier publishes the folded row");
+            t.flush().unwrap();
             assert!(
-                matches!(t.flush_prepare().unwrap(), FlushOutcome::Empty),
-                "a clean SalReplay tier (no RAM, no unsynced, no pending) gates to Empty"
+                matches!(t.flush_prepare().unwrap(), FlushOutcome::Done),
+                "a clean SalReplay tier (no RAM, no unsynced, no pending) gates to Done"
             );
         }
 
@@ -2365,11 +2258,11 @@ mod tests {
             // barrier clearing `unsynced` on commit.
             for k in 0..5u64 {
                 t.ingest_owned_batch(make_batch(&[(k, 1, 1)])).unwrap();
-                assert!(t.flush().unwrap());
+                t.flush().unwrap();
             }
             // Force the compaction of those durable shards: pending_deletions set,
             // unsynced empty, RAM tier empty.
-            let _ = t.create_cursor_compacting().unwrap();
+            t.compact_if_needed().unwrap();
             let shards_before = shard_db_files(&tdir, 7902).len();
             match t.flush_prepare().unwrap() {
                 FlushOutcome::Pending(w) => assert!(
@@ -2434,7 +2327,7 @@ mod tests {
         assert!(compaction_output_count(&tdir, 8100) > 0, "compaction ran");
         let files_before = all_shard_file_count(&tdir, 8100);
 
-        assert!(t.flush().unwrap(), "flush republishes over the compacted index");
+        t.flush().unwrap();
         assert!(
             all_shard_file_count(&tdir, 8100) < files_before,
             "flush must drain the deferred compaction inputs (no intra-session leak)"
@@ -2445,7 +2338,6 @@ mod tests {
                 assert!(t.has_pk((r * 100 + k) as u128), "row present after flush-drain");
             }
         }
-        t.close();
 
         let mut t2 = new_table(&tdir, schema, 8100, 128, RecoverySource::SalReplay);
         for r in 0..6u64 {
@@ -2453,6 +2345,5 @@ mod tests {
                 assert!(t2.has_pk((r * 100 + k) as u128), "row survives flush-drain + reopen");
             }
         }
-        t2.close();
     }
 }

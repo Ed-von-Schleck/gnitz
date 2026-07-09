@@ -2044,7 +2044,7 @@ mod tests {
             a.add_row(42, 1).str_null().bytes_null();
         }
         let encoded = encode_wal_block(&schema, 1, &batch);
-        let (decoded, _, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
+        let (decoded, _) = decode_wal_block(&encoded, &schema, VerifyChecksum::Yes).unwrap();
         assert_eq!(decoded.nulls[0], batch.nulls[0], "null bitmap round-trips");
         // The read side gates on the bitmap, so both columns must decode as NULL.
         assert_eq!(

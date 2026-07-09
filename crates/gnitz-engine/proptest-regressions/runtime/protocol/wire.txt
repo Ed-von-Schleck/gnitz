@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2b1d3ab3745c07e67b88672aeba2bb56c9f6dc3de9d0276556eda2430caef09d # shrinks to original = SchemaDescriptor { columns: [U8 pk], pk_indices: [0] }

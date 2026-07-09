@@ -62,7 +62,6 @@ fn setup_wide_unique(
     let mut base = Box::new(
         Table::new(
             &format!("{dir}/base"),
-            "base",
             schema,
             tid as u32,
             256 * 1024,
@@ -72,7 +71,6 @@ fn setup_wide_unique(
     );
     let mut idx = Table::new(
         &format!("{dir}/idx"),
-        "idx",
         idx_schema,
         tid as u32 + 1,
         256 * 1024,
@@ -227,7 +225,6 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
     let pb = wide_val_batch(&parent_schema, &[(parent_pk, 555, 1)]);
     let mut pbase = Table::new(
         &format!("{dir}/p_base"),
-        "pbase",
         parent_schema,
         parent_tid as u32,
         256 * 1024,

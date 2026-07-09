@@ -38,16 +38,12 @@ const LMAX_FILE_THRESHOLD: usize = 1;
 const L1_TARGET_FILES: usize = 16;
 
 fn to_cstrings(strings: &[String]) -> Result<Vec<CString>, StorageError> {
-    strings
-        .iter()
-        .map(|f| CString::new(f.as_str()).map_err(|_| StorageError::InvalidPath))
-        .collect()
+    strings.iter().map(|f| super::super::cstr(f.as_str())).collect()
 }
 
 pub struct ShardEntry {
     shard: Rc<MappedShard>,
     filename: String,
-    min_lsn: u64,
     max_lsn: u64,
     pk_min: PkBuf,
     pk_max: PkBuf,
@@ -66,22 +62,21 @@ impl ShardEntry {
 
     /// Build an entry from an already-mmap'd shard, deriving its PK bounds via
     /// `MappedShard::pk_bounds`.
-    fn from_mapped(shard: Rc<MappedShard>, filename: String, min_lsn: u64, max_lsn: u64) -> Self {
+    fn from_mapped(shard: Rc<MappedShard>, filename: String, max_lsn: u64) -> Self {
         let (pk_min, pk_max) = shard.pk_bounds();
         ShardEntry {
             shard,
             filename,
-            min_lsn,
             max_lsn,
             pk_min,
             pk_max,
         }
     }
 
-    fn open(path: &str, schema: &SchemaDescriptor, min_lsn: u64, max_lsn: u64) -> Result<Self, StorageError> {
-        let cpath = CString::new(path).map_err(|_| StorageError::InvalidPath)?;
+    fn open(path: &str, schema: &SchemaDescriptor, max_lsn: u64) -> Result<Self, StorageError> {
+        let cpath = super::super::cstr(path)?;
         let shard = Rc::new(MappedShard::open(&cpath, schema, false)?);
-        Ok(Self::from_mapped(shard, path.to_string(), min_lsn, max_lsn))
+        Ok(Self::from_mapped(shard, path.to_string(), max_lsn))
     }
 
     /// Probe this shard for a PK by its OPK `key` bytes (exactly `pk_stride`
@@ -131,10 +126,8 @@ impl FLSMLevel {
     }
 
     fn find_guard_idx(&self, key: u128) -> Option<usize> {
-        // Saturate below-first-guard keys to bucket 0, matching the writer's
-        // `compact::find_guard_for_key` — a key written to bucket 0 is read from
-        // bucket 0. Empty level → `None` (skip this level).
-        (!self.guards.is_empty()).then(|| self.guards.partition_point(|g| g.guard_key <= key).saturating_sub(1))
+        // Empty level → `None` (skip this level).
+        (!self.guards.is_empty()).then(|| super::guard_slot(&self.guards, key, |g| g.guard_key))
     }
 
     fn find_guards_for_range(&self, range_min: u128, range_max: u128) -> Vec<usize> {
@@ -179,7 +172,6 @@ pub struct ShardIndex {
     l0: Vec<ShardEntry>,
     levels: Vec<FLSMLevel>,
 
-    needs_compaction: bool,
     compact_seq: u64,
     pending_deletions: Vec<String>,
     /// Full paths of shard files written unsynced since the last manifest
@@ -203,7 +195,6 @@ impl ShardIndex {
             schema,
             l0: Vec::new(),
             levels: Vec::new(),
-            needs_compaction: false,
             compact_seq: 0,
             pending_deletions: Vec::new(),
             unsynced: Vec::new(),
@@ -294,7 +285,6 @@ mod tests {
         shard_file::write_shard_streaming(
             libc::AT_FDCWD,
             &cpath,
-            42,
             n as u32,
             &regions,
             &compound_schema(),
@@ -305,10 +295,10 @@ mod tests {
     }
 
     /// Guard key for a native u64 PK value, in the order-preserving
-    /// `pk_sort_key` space (the same key the read router and the compaction
+    /// `pack_pk_be` space (the same key the read router and the compaction
     /// merge use), so multi-guard levels route data keys correctly.
     fn gk(v: u64) -> u128 {
-        crate::storage::merge::pk_sort_key(&v.to_be_bytes())
+        crate::storage::merge::pack_pk_be(&v.to_be_bytes())
     }
 
     /// Build and write a shard file with the given PK/value pairs.
@@ -333,7 +323,6 @@ mod tests {
         shard_file::write_shard_streaming(
             libc::AT_FDCWD,
             &cpath,
-            42,
             n as u32,
             &regions,
             &test_schema(),
@@ -349,9 +338,8 @@ mod tests {
     /// doesn't observe).
     fn publish_manifest(idx: &ShardIndex, path: &std::path::Path) {
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let mut m = idx.prepare_manifest(&cpath).unwrap();
-        assert_eq!(unsafe { libc::rename(m.tmp_path.as_ptr(), m.final_path.as_ptr()) }, 0);
-        m.committed = true;
+        let m = idx.prepare_manifest(&cpath, 0).unwrap();
+        m.commit().unwrap();
     }
 
     #[test]
@@ -364,8 +352,8 @@ mod tests {
         let path1 = write_test_shard(dir.path(), "s1.db", &[10, 20, 30], &[100, 200, 300]);
         let path2 = write_test_shard(dir.path(), "s2.db", &[25, 35, 40], &[250, 350, 400]);
 
-        idx.add_shard(&path1, 1, 10).unwrap();
-        idx.add_shard(&path2, 11, 20).unwrap();
+        idx.add_shard(&path1, 10).unwrap();
+        idx.add_shard(&path2, 20).unwrap();
 
         // Find existing keys
         let mut hits = Vec::new();
@@ -394,7 +382,7 @@ mod tests {
             let name = format!("s{i}.db");
             let pk = i * 10 + 1;
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 100]);
-            idx.add_shard(&path, i, i + 1).unwrap();
+            idx.add_shard(&path, i + 1).unwrap();
         }
         idx.run_compact().unwrap();
 
@@ -438,7 +426,7 @@ mod tests {
             let name = format!("s{i}.db");
             let pk = (i + 1) * 10;
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64]);
-            idx.add_shard(&path, i, i + 1).unwrap();
+            idx.add_shard(&path, i + 1).unwrap();
             all_pks.push(pk);
         }
 
@@ -474,7 +462,7 @@ mod tests {
             let name = format!("guard_s{i}.db");
             let pk = i + 1;
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
-            let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 100).unwrap();
             guard.entries.push(entry);
             all_pks.push(pk);
         }
@@ -504,13 +492,13 @@ mod tests {
         // Build a guard at key 0 with 3 entries.
         for i in 0..3u64 {
             let path = write_test_shard(dir.path(), &format!("src_{i}.db"), &[i + 1], &[(i as i64 + 1) * 10]);
-            let e = ShardEntry::open(&path, &schema, 0, 100).unwrap();
+            let e = ShardEntry::open(&path, &schema, 100).unwrap();
             idx.levels[0].get_or_create_guard(0).entries.push(e);
         }
         // Second guard so worst_count > 1 condition is met in compact_guard_vertical
         {
             let path = write_test_shard(dir.path(), "other.db", &[9999], &[42]);
-            let e = ShardEntry::open(&path, &schema, 0, 50).unwrap();
+            let e = ShardEntry::open(&path, &schema, 50).unwrap();
             idx.levels[0].get_or_create_guard(5000).entries.push(e);
         }
 
@@ -555,7 +543,7 @@ mod tests {
         // L1 already has a guard at key 100 (keys 100, 200).
         idx.ensure_level(1);
         let path = write_test_shard(dir.path(), "l1_g100.db", &[100, 200], &[1000, 2000]);
-        let entry = ShardEntry::open(&path, &schema, 0, 1).unwrap();
+        let entry = ShardEntry::open(&path, &schema, 1).unwrap();
         idx.levels[0].get_or_create_guard(100).entries.push(entry);
 
         // Insert 5 L0 shards (> L0_COMPACT_THRESHOLD) with keys all below 100.
@@ -563,7 +551,7 @@ mod tests {
         for (i, &k) in low_keys.iter().enumerate() {
             let name = format!("l0_{i}.db");
             let p = write_test_shard(dir.path(), &name, &[k], &[k as i64 * 10]);
-            idx.add_shard(&p, (i + 2) as u64, (i + 2) as u64).unwrap();
+            idx.add_shard(&p, (i + 2) as u64).unwrap();
         }
         assert!(idx.should_compact());
         idx.run_compact().unwrap();
@@ -651,7 +639,7 @@ mod tests {
         for i in 0..5u64 {
             let pk = (i + 1) * 10;
             let p = write_test_shard(dir.path(), &format!("shard_42_{i}.db"), &[pk], &[pk as i64]);
-            idx.add_shard(&p, i, i + 1).unwrap();
+            idx.add_shard(&p, i + 1).unwrap();
             idx.mark_unsynced(&p);
         }
         assert!(idx.has_unsynced());
@@ -669,7 +657,7 @@ mod tests {
 
         // clear_unsynced empties whatever a later spill marked.
         let p = write_test_shard(dir.path(), "shard_42_late.db", &[999], &[9990]);
-        idx.add_shard(&p, 9, 9).unwrap();
+        idx.add_shard(&p, 9).unwrap();
         idx.mark_unsynced(&p);
         assert!(idx.has_unsynced());
         idx.clear_unsynced();
@@ -686,15 +674,15 @@ mod tests {
         assert_eq!(idx.max_lsn(), 0);
 
         let path1 = write_test_shard(dir.path(), "lsn1.db", &[10], &[100]);
-        idx.add_shard(&path1, 5, 50).unwrap();
+        idx.add_shard(&path1, 50).unwrap();
         assert_eq!(idx.max_lsn(), 50);
 
         let path2 = write_test_shard(dir.path(), "lsn2.db", &[20], &[200]);
-        idx.add_shard(&path2, 100, 200).unwrap();
+        idx.add_shard(&path2, 200).unwrap();
         assert_eq!(idx.max_lsn(), 200);
 
         let path3 = write_test_shard(dir.path(), "lsn3.db", &[30], &[300]);
-        idx.add_shard(&path3, 10, 75).unwrap();
+        idx.add_shard(&path3, 75).unwrap();
         // max_lsn should still be 200 (from second shard)
         assert_eq!(idx.max_lsn(), 200);
     }
@@ -725,7 +713,7 @@ mod tests {
         for i in 0..5u64 {
             let pk = (i + 1) * 10;
             let path = write_test_shard(dir.path(), &format!("s{i}.db"), &[pk], &[pk as i64]);
-            idx.add_shard(&path, i, i + 1).unwrap();
+            idx.add_shard(&path, i + 1).unwrap();
             all_pks.push(pk);
         }
 
@@ -738,8 +726,8 @@ mod tests {
         // L0 must be unchanged — atomicity fix ensures this.
         assert_eq!(idx.l0.len(), l0_before, "L0 must not be modified on failure");
 
-        // needs_compaction must still be true (update_flags was not called).
-        assert!(idx.should_compact(), "needs_compaction must remain true after failure");
+        // A failed run_compact leaves l0 intact, so should_compact still holds.
+        assert!(idx.should_compact(), "should_compact must remain true after failure");
 
         // All original keys must still be findable via L0.
         for pk in &all_pks {
@@ -767,21 +755,21 @@ mod tests {
         for (i, &pk) in src_pks.iter().enumerate() {
             let name = format!("src_{i}.db");
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
-            let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 100).unwrap();
             idx.levels[0].get_or_create_guard(100).entries.push(entry);
         }
 
         // L1 guard at key=500: 1 shard (so worst_guard picks key=100)
         {
             let path = write_test_shard(dir.path(), "high.db", &[500], &[5000]);
-            let entry = ShardEntry::open(&path, &schema, 0, 50).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 50).unwrap();
             idx.levels[0].get_or_create_guard(500).entries.push(entry);
         }
 
         // L2 guard at key=200: 1 shard with key=250
         {
             let path = write_test_shard(dir.path(), "dest.db", &[250], &[2500]);
-            let entry = ShardEntry::open(&path, &schema, 0, 80).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 80).unwrap();
             idx.levels[1].get_or_create_guard(200).entries.push(entry);
         }
 
@@ -822,14 +810,14 @@ mod tests {
         for (i, &pk) in src_pks.iter().enumerate() {
             let name = format!("l2_src_{i}.db");
             let path = write_test_shard(dir.path(), &name, &[pk], &[pk as i64 * 10]);
-            let entry = ShardEntry::open(&path, &schema, 0, 100).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 100).unwrap();
             idx.levels[1].get_or_create_guard(100).entries.push(entry);
         }
 
         // L2 guard at key=500: 1 shard (so worst_guard picks key=100).
         {
             let path = write_test_shard(dir.path(), "l2_high.db", &[500], &[5000]);
-            let entry = ShardEntry::open(&path, &schema, 0, 50).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 50).unwrap();
             idx.levels[1].get_or_create_guard(500).entries.push(entry);
         }
 
@@ -837,7 +825,7 @@ mod tests {
         // source range, so the source keys land below it.
         {
             let path = write_test_shard(dir.path(), "l3_dest.db", &[250], &[2500]);
-            let entry = ShardEntry::open(&path, &schema, 0, 80).unwrap();
+            let entry = ShardEntry::open(&path, &schema, 80).unwrap();
             idx.levels[2].get_or_create_guard(200).entries.push(entry);
         }
 
@@ -884,7 +872,7 @@ mod tests {
             idx.levels[0]
                 .get_or_create_guard(gk(100))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100).unwrap());
         }
         // L1 guard gk(5000): two entries (keys 5000, 5010).
         for (i, &k) in [5000u64, 5010].iter().enumerate() {
@@ -892,7 +880,7 @@ mod tests {
             idx.levels[0]
                 .get_or_create_guard(gk(5000))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100).unwrap());
         }
         // L2 pre-seed: guard gk(100) (key 250) and guard gk(5000) (key 6000) at the
         // same max_lsn, so both vertical calls compute the identical `vert_max_lsn`
@@ -902,12 +890,12 @@ mod tests {
             idx.levels[1]
                 .get_or_create_guard(gk(100))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100).unwrap());
             let p = write_test_shard(dir.path(), "l2b.db", &[6000], &[60000]);
             idx.levels[1]
                 .get_or_create_guard(gk(5000))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100).unwrap());
         }
 
         // Call 1 folds L1 guard 100 → L2 guard 100; call 2 folds L1 guard 5000 →
@@ -959,7 +947,7 @@ mod tests {
             idx.levels[1]
                 .get_or_create_guard(gk(100))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100).unwrap());
         }
         // L1 guard gk(100): two entries (keys 100, 110).
         for (i, &k) in [100u64, 110].iter().enumerate() {
@@ -967,7 +955,7 @@ mod tests {
             idx.levels[0]
                 .get_or_create_guard(gk(100))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100).unwrap());
         }
         idx.compact_guard_vertical(1).unwrap();
 
@@ -978,7 +966,7 @@ mod tests {
             idx.levels[0]
                 .get_or_create_guard(gk(100))
                 .entries
-                .push(ShardEntry::open(&p, &schema, 0, 100).unwrap());
+                .push(ShardEntry::open(&p, &schema, 100).unwrap());
         }
         idx.compact_guard_vertical(1).unwrap();
 
@@ -1015,7 +1003,7 @@ mod tests {
 
         // Write a live shard and add it to the index.
         let live_path = write_test_shard(dir.path(), "shard_42_1.db", &[10], &[100]);
-        idx.add_shard(&live_path, 1, 1).unwrap();
+        idx.add_shard(&live_path, 1).unwrap();
 
         // Drop an orphan shard that the manifest never referenced.
         let orphan_path = dir.path().join("shard_42_99.db");
@@ -1037,13 +1025,16 @@ mod tests {
         // Files belonging to a different table must not be touched.
         let other_path = dir.path().join("shard_99_1.db");
         std::fs::write(&other_path, b"data").unwrap();
-        let other_hcomp = dir.path().join("hcomp_99_L1_G0_1.db");
-        std::fs::write(&other_hcomp, b"data").unwrap();
+        let other_compact = dir.path().join("shard_99_1_L1_G0.db");
+        std::fs::write(&other_compact, b"data").unwrap();
 
         let removed = idx.gc_orphans();
         assert_eq!(removed, 0);
         assert!(other_path.exists(), "other-table shard must not be removed");
-        assert!(other_hcomp.exists(), "other-table hcomp must not be removed");
+        assert!(
+            other_compact.exists(),
+            "other-table compaction output must not be removed"
+        );
     }
 
     #[test]
@@ -1070,13 +1061,13 @@ mod tests {
 
         let shard_tmp = dir.path().join("shard_42_5.db.tmp");
         std::fs::write(&shard_tmp, b"half-written").unwrap();
-        let hcomp_tmp = dir.path().join("hcomp_42_L1_G0_3.db.tmp");
-        std::fs::write(&hcomp_tmp, b"half-written").unwrap();
+        let compact_tmp = dir.path().join("shard_42_3_L1_G0.db.tmp");
+        std::fs::write(&compact_tmp, b"half-written").unwrap();
 
         let removed = idx.gc_orphans();
         assert_eq!(removed, 2);
         assert!(!shard_tmp.exists(), "shard .tmp must be removed");
-        assert!(!hcomp_tmp.exists(), "hcomp .tmp must be removed");
+        assert!(!compact_tmp.exists(), "compaction-output .tmp must be removed");
     }
 
     #[test]
@@ -1105,8 +1096,8 @@ mod tests {
 
         let p_lo = write_test_shard(dir.path(), "lo.db", &[10, 20], &[1, 2]);
         let p_hi = write_test_shard(dir.path(), "hi.db", &[30, 40], &[3, 4]);
-        let e_lo = ShardEntry::open(&p_lo, &schema, 0, 1).unwrap();
-        let e_hi = ShardEntry::open(&p_hi, &schema, 0, 1).unwrap();
+        let e_lo = ShardEntry::open(&p_lo, &schema, 1).unwrap();
+        let e_hi = ShardEntry::open(&p_hi, &schema, 1).unwrap();
 
         // Range gate: in-range key passes (and resolves), out-of-range
         // key is pruned. OPK for a U64 PK is the value's big-endian bytes.
@@ -1121,9 +1112,9 @@ mod tests {
         // L0 sort orders by pk_min, empty entries last (golden order).
         let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema);
         let p_empty = write_test_shard(dir.path(), "empty.db", &[], &[]);
-        idx.add_shard(&p_hi, 0, 1).unwrap();
-        idx.add_shard(&p_lo, 0, 1).unwrap();
-        idx.add_shard(&p_empty, 0, 1).unwrap();
+        idx.add_shard(&p_hi, 1).unwrap();
+        idx.add_shard(&p_lo, 1).unwrap();
+        idx.add_shard(&p_empty, 1).unwrap();
         let order: Vec<bool> = idx.l0.iter().map(|e| e.is_empty()).collect();
         // pk_min holds OPK bytes; widen_pk_be recovers the native U64 value.
         let pk_min_val = |e: &ShardEntry| {
@@ -1145,14 +1136,14 @@ mod tests {
 
         let single = test_schema();
         let p = write_test_shard(dir.path(), "e_single.db", &[], &[]);
-        let e = ShardEntry::open(&p, &single, 0, 0).unwrap();
+        let e = ShardEntry::open(&p, &single, 0).unwrap();
         assert!(e.is_empty());
         assert!(e.probe_pk_bytes(&0u64.to_be_bytes()).is_none());
         assert!(e.probe_pk_bytes(&u64::MAX.to_be_bytes()).is_none());
 
         let compound = compound_schema();
         let pc = write_compound_shard(dir.path(), "e_compound.db", &[], &[]);
-        let ec = ShardEntry::open(&pc, &compound, 0, 0).unwrap();
+        let ec = ShardEntry::open(&pc, &compound, 0).unwrap();
         assert!(ec.is_empty());
         assert_eq!(ec.pk_min.len, compound.pk_stride());
         // Short-circuits before the stride assert / pk_in_range.
@@ -1202,7 +1193,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         raise_fd_limit_for_tests();
         let p = write_compound_shard(dir.path(), "compound.db", &[(1, 5), (1, 9), (2, 3)], &[10, 20, 30]);
-        let entry = ShardEntry::open(&p, &schema, 0, 1).unwrap();
+        let entry = ShardEntry::open(&p, &schema, 1).unwrap();
         assert_eq!(entry.pk_min.pk_bytes(), &opk2(1, 5));
         assert_eq!(entry.pk_max.pk_bytes(), &opk2(2, 3));
         assert!(

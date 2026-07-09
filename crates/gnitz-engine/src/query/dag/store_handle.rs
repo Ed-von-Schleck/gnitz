@@ -4,7 +4,7 @@
 //! owned by `CatalogEngine`. There is no custom `Drop`: the `Partitioned`
 //! box is freed by the default drop glue when its registry entry is removed.
 
-use crate::storage::{Batch, CursorHandle, PartitionedTable, StorageError, Table};
+use crate::storage::{Batch, PartitionedTable, ReadCursor, StorageError, Table};
 use std::cell::UnsafeCell;
 
 /// Storage handle of a registered relation. `Partitioned` owns its boxed
@@ -88,21 +88,19 @@ impl StoreHandle {
     /// Dispatched non-compacting `open_cursor` across all variants.
     /// Infallible, non-mutating — the recommended default. See
     /// `Table::open_cursor`.
-    pub fn open_cursor(&self) -> CursorHandle {
+    pub fn open_cursor(&self) -> ReadCursor {
         match self {
             StoreHandle::Borrowed(ptr) => unsafe { (**ptr).open_cursor() },
             StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).open_cursor() },
         }
     }
 
-    /// Dispatched compacting cursor across all variants. Maintenance-only —
-    /// see `Table::create_cursor_compacting` for the validator hazard this
-    /// name surfaces. The lint guards external callers, not this dispatch.
-    #[allow(clippy::disallowed_methods)]
-    pub fn create_cursor_compacting(&self) -> Result<CursorHandle, StorageError> {
+    /// Dispatched `compact_if_needed` across all variants. Maintenance-only;
+    /// readers that want an up-to-date L1 call this before `open_cursor`.
+    pub fn compact_if_needed(&self) -> Result<(), StorageError> {
         match self {
-            StoreHandle::Borrowed(ptr) => unsafe { (**ptr).create_cursor_compacting() },
-            StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).create_cursor_compacting() },
+            StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.compact_if_needed(),
+            StoreHandle::Partitioned(cell) => unsafe { &mut *cell.get() }.compact_if_needed(),
         }
     }
 
@@ -117,7 +115,7 @@ impl StoreHandle {
     }
 
     /// Dispatched flush across all variants.
-    pub fn flush(&mut self) -> Result<bool, StorageError> {
+    pub fn flush(&mut self) -> Result<(), StorageError> {
         match self {
             StoreHandle::Borrowed(ptr) => unsafe { &mut **ptr }.flush(),
             StoreHandle::Partitioned(cell) => cell.get_mut().flush(),
@@ -127,7 +125,7 @@ impl StoreHandle {
     /// Current LSN of the store (Table: current_lsn field; Partitioned: max across shards).
     pub fn current_lsn(&self) -> u64 {
         match self {
-            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
+            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn(),
             StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).current_lsn() },
         }
     }
@@ -139,7 +137,7 @@ impl StoreHandle {
     /// lagging partition's unflushed rows.
     pub fn recovery_lsn(&self) -> u64 {
         match self {
-            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn,
+            StoreHandle::Borrowed(ptr) => unsafe { &**ptr }.current_lsn(),
             StoreHandle::Partitioned(cell) => unsafe { (**cell.get()).min_flushed_lsn() },
         }
     }

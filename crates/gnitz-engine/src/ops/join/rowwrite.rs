@@ -109,7 +109,7 @@ mod tests {
     /// shift would panic in debug without the width guard.
     #[test]
     fn test_write_join_row_shift_guard_64() {
-        use crate::storage::CursorHandle;
+        use crate::storage::ReadCursor;
         use std::rc::Rc;
         let left_schema = make_wide_left_schema_64();
         let right_schema = pk_only_schema();
@@ -122,8 +122,8 @@ mod tests {
         trace.count += 1;
         trace.certify_layout(Layout::Consolidated, &right_schema);
         let trace = Rc::new(trace);
-        let mut ch = CursorHandle::from_owned(&[trace], right_schema);
-        let cursor = ch.cursor_mut();
+        let mut ch = ReadCursor::from_owned(&[trace], right_schema);
+        let cursor = &mut ch;
         cursor.seek_bytes(&1u64.to_be_bytes());
 
         let mut output = Batch::with_schema(left_schema, 1);

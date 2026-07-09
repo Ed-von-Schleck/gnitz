@@ -3,7 +3,7 @@
 //! trigger, and `run_compact` with its L0→L1 / vertical guard merges.
 
 use std::cmp::Ordering;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::fs;
 use std::rc::Rc;
 
@@ -22,6 +22,11 @@ impl ShardIndex {
         self.can_tag_pk_unique = true;
     }
 
+    /// Whether flushed/compacted shards may be tagged `SHARD_FLAG_PK_UNIQUE`.
+    pub(in crate::storage) fn can_tag_pk_unique(&self) -> bool {
+        self.can_tag_pk_unique
+    }
+
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
         self.l0.iter().chain(
             self.levels
@@ -34,11 +39,10 @@ impl ShardIndex {
         level_idx + 1
     }
 
-    pub fn add_shard(&mut self, path: &str, min_lsn: u64, max_lsn: u64) -> Result<(), StorageError> {
-        let entry = ShardEntry::open(path, &self.schema, min_lsn, max_lsn)?;
+    pub fn add_shard(&mut self, path: &str, max_lsn: u64) -> Result<(), StorageError> {
+        let entry = ShardEntry::open(path, &self.schema, max_lsn)?;
         self.l0.push(entry);
         self.sort_l0();
-        self.update_flags();
         Ok(())
     }
 
@@ -54,12 +58,9 @@ impl ShardIndex {
         });
     }
 
-    pub(super) fn update_flags(&mut self) {
-        self.needs_compaction = self.l0.len() > L0_COMPACT_THRESHOLD;
-    }
-
+    /// Derived, not cached: the L0 tier crossed its compaction threshold.
     pub fn should_compact(&self) -> bool {
-        self.needs_compaction
+        self.l0.len() > L0_COMPACT_THRESHOLD
     }
 
     /// Record a shard file written unsynced (spill or barrier fold) so the next
@@ -140,11 +141,6 @@ impl ShardIndex {
         self.all_entries().map(|e| e.max_lsn).max().unwrap_or(0)
     }
 
-    pub(super) fn get_or_create_level(&mut self, level_num: usize) -> &mut FLSMLevel {
-        self.ensure_level(level_num);
-        &mut self.levels[level_num - 1]
-    }
-
     pub(super) fn ensure_level(&mut self, level_num: usize) {
         let idx = level_num - 1;
         while self.levels.len() <= idx {
@@ -167,7 +163,7 @@ impl ShardIndex {
     fn open_outputs(&self, outputs: &[(u128, String)], max_lsn: u64) -> Result<Vec<(u128, ShardEntry)>, StorageError> {
         let mut opened = Vec::with_capacity(outputs.len());
         for (gk, filename) in outputs {
-            match ShardEntry::open(filename, &self.schema, 0, max_lsn) {
+            match ShardEntry::open(filename, &self.schema, max_lsn) {
                 Ok(entry) => opened.push((*gk, entry)),
                 Err(e) => {
                     for (_, f) in outputs {
@@ -181,10 +177,6 @@ impl ShardIndex {
     }
 
     pub fn run_compact(&mut self) -> Result<(), StorageError> {
-        if !self.needs_compaction {
-            return Ok(());
-        }
-
         let compact_seq = self.next_compact_seq();
         let l0_filenames: Vec<String> = self.l0.iter().map(|e| e.filename.clone()).collect();
         let l0_max_lsn = self.l0.iter().map(|e| e.max_lsn).max().unwrap_or(0);
@@ -194,7 +186,7 @@ impl ShardIndex {
         let l0_cstrings = to_cstrings(&l0_filenames)?;
         let l0_cstrs: Vec<&CStr> = l0_cstrings.iter().map(|c| c.as_c_str()).collect();
 
-        let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| StorageError::InvalidPath)?;
+        let out_dir = super::super::cstr(self.output_dir.as_str())?;
 
         let guard_outputs = compact::merge_and_route(
             &l0_cstrs,
@@ -235,8 +227,9 @@ impl ShardIndex {
             // guard keys need no 0-anchor.
             self.levels[0].guards.iter().map(|g| g.guard_key).collect()
         } else {
-            // The guard space is the order-preserving `pk_sort_key`
-            // (= `pack_pk_be` of the OPK pk_min bytes), the same key the read
+            // The guard space is the order-preserving `pack_pk_be` image of
+            // the OPK pk_min bytes (a 16-byte prefix for wide PKs, the whole
+            // key otherwise), the same key the read
             // router (`find_pk_bytes`) and the compaction merge order use. Skip
             // empty shards; dedup consecutive keys (L0 is sorted by pk_min, so
             // equal OPK keys are adjacent).
@@ -245,7 +238,7 @@ impl ShardIndex {
                 if e.is_empty() {
                     continue;
                 }
-                let pk = super::super::merge::pk_sort_key(e.pk_min.pk_bytes());
+                let pk = super::super::merge::pack_pk_be(e.pk_min.pk_bytes());
                 if keys.last().copied() != Some(pk) {
                     keys.push(pk);
                 }
@@ -271,7 +264,6 @@ impl ShardIndex {
         for (gk, entry) in new_entries {
             self.levels[0].get_or_create_guard(gk).entries.push(entry);
         }
-        self.update_flags();
         Ok(())
     }
 
@@ -309,26 +301,17 @@ impl ShardIndex {
         let guard_key = guard.guard_key;
         let guard_max_lsn = guard.entries.iter().map(|e| e.max_lsn).max().unwrap_or(0);
         let out_path = format!(
-            "{}/hcomp_{}_L{}_G{}_{}.db",
+            "{}/{}",
             self.output_dir,
-            self.table_id,
-            Self::level_num(level_idx),
-            guard_key,
-            compact_seq,
+            super::super::naming::compact_shard_name(self.table_id, compact_seq, Self::level_num(level_idx), guard_key),
         );
 
         let input_filenames: Vec<String> = guard.entries.iter().map(|e| e.filename.clone()).collect();
         let input_cstrings = to_cstrings(&input_filenames)?;
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
-        let out_cstr = CString::new(out_path.as_str()).map_err(|_| StorageError::InvalidPath)?;
+        let out_cstr = super::super::cstr(out_path.as_str())?;
 
-        if let Err(e) = compact::compact_shards(
-            &input_cstrs,
-            &out_cstr,
-            &self.schema,
-            self.table_id,
-            self.can_tag_pk_unique,
-        ) {
+        if let Err(e) = compact::compact_shards(&input_cstrs, &out_cstr, &self.schema, self.can_tag_pk_unique) {
             let _ = fs::remove_file(&out_path);
             return Err(e);
         }
@@ -411,7 +394,7 @@ impl ShardIndex {
 
         let input_cstrings = to_cstrings(&all_input_files)?;
         let input_cstrs: Vec<&CStr> = input_cstrings.iter().map(|c| c.as_c_str()).collect();
-        let out_dir = CString::new(self.output_dir.as_str()).map_err(|_| StorageError::InvalidPath)?;
+        let out_dir = super::super::cstr(self.output_dir.as_str())?;
 
         let guard_outputs = compact::merge_and_route(
             &input_cstrs,
@@ -436,8 +419,6 @@ impl ShardIndex {
         for (gk, entry) in opened {
             self.levels[dest_idx].get_or_create_guard(gk).entries.push(entry);
         }
-
-        self.update_flags();
 
         if Self::level_num(dest_idx) == MAX_LEVELS - 1 {
             self.compact_overfull_guards(dest_idx, LMAX_FILE_THRESHOLD)?;

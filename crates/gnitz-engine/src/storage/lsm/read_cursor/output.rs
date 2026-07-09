@@ -11,8 +11,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use super::super::batch::{write_to_batch, Batch, Layout};
-use super::super::columnar::with_row_cmp;
-use super::super::merge::{DirectWriter, MemBatch};
+use super::super::columnar::{with_row_cmp, ColumnarSource};
+use super::super::merge::DirectWriter;
 use super::super::scatter::scatter_unified_sources_with_weights;
 use super::source::CursorSource;
 use super::{ReadCursor, RowComparator};
@@ -157,10 +157,10 @@ impl ReadCursor {
                 CursorSource::Batch(rc) if rc.consolidated_verified(&self.schema) => {
                     return Rc::clone(rc);
                 }
-                CursorSource::Shard(rc) if !rc.has_ghosts => {
+                CursorSource::Batch(_) => {}
+                CursorSource::Shard(rc) => {
                     return Rc::new(rc.to_owned_batch(&self.schema));
                 }
-                _ => {}
             }
         }
         self.drain_to_batch(0)
@@ -181,8 +181,8 @@ impl ReadCursor {
     }
 
     /// Bulk-drain a single-source cursor into an Batch, bypassing
-    /// per-row iteration. Returns `None` for multi-source cursors or
-    /// sources with ghosts, signaling the caller to fall back to row-at-a-time.
+    /// per-row iteration. Returns `None` for multi-source cursors, signaling
+    /// the caller to fall back to row-at-a-time.
     ///
     /// `limit == 0` means drain all remaining rows.
     pub(super) fn drain_single_source(&mut self, limit: usize) -> Option<Batch> {
@@ -209,36 +209,13 @@ impl ReadCursor {
                 out.inherit_layout(b);
                 out
             }
-            CursorSource::Shard(s) => {
-                if s.has_ghosts {
-                    return None;
-                }
-                s.slice_to_owned_batch(start, row_count, schema)
-            }
+            CursorSource::Shard(s) => s.slice_to_owned_batch(start, row_count, schema),
         };
 
         // Advance position past the drained rows
         self.states[0].position = start + row_count;
         self.drive();
         Some(batch)
-    }
-
-    /// If this cursor is backed by exactly one in-memory `Batch` source,
-    /// returns a `MemBatch` view over it and the current row position
-    /// (`states[0].position`).  Returns `None` for multi-source or
-    /// shard-backed cursors.
-    ///
-    /// Used by the bulk retraction path in the catalog to avoid per-row
-    /// overhead when copying a contiguous range of rows from a single
-    /// in-memory source.
-    pub(crate) fn single_mem_batch(&self) -> Option<(MemBatch<'_>, usize)> {
-        if !self.valid || self.sources.len() != 1 {
-            return None;
-        }
-        match &self.sources[0] {
-            CursorSource::Batch(b) => Some((b.as_mem_batch(), self.states[0].position)),
-            CursorSource::Shard(_) => None,
-        }
     }
 
     /// Sum of blob arena sizes across every source. Tight upper bound on the

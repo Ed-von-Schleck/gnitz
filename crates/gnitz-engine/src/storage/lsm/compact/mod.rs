@@ -60,9 +60,7 @@ mod tests {
         }
 
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch
-            .write_as_shard(&cpath, 0, schema, ShardWriteOpts::default())
-            .unwrap();
+        batch.write_as_shard(&cpath, schema, ShardWriteOpts::default()).unwrap();
     }
 
     fn make_test_schema() -> SchemaDescriptor {
@@ -105,7 +103,7 @@ mod tests {
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
         let cout = std::ffi::CString::new(out.to_str().unwrap()).unwrap();
-        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0, false).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, false).unwrap();
 
         // Compaction output packs the eligible payload.
         assert_eq!(
@@ -127,7 +125,7 @@ mod tests {
         // Re-compaction of a packed input (decode → merge → re-encode).
         let out2 = dir.join("merged2.db");
         let cout2 = std::ffi::CString::new(out2.to_str().unwrap()).unwrap();
-        compact_shards(&[cout.as_c_str()], &cout2, &schema, 0, false).unwrap();
+        compact_shards(&[cout.as_c_str()], &cout2, &schema, false).unwrap();
         assert_eq!(
             payload_encoding(out2.to_str().unwrap()),
             ENCODING_FOR,
@@ -170,7 +168,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         // Read back merged shard
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
@@ -209,7 +207,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         // Key 2 should be eliminated (net weight = 0)
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
@@ -235,34 +233,10 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 3);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn test_compact_ghost_rows() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/compact_test_ghost");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-
-        let schema = make_test_schema();
-        // Shard with ghost rows (weight=0)
-        let s1 = dir.join("s1.db");
-        write_test_shard(s1.to_str().unwrap(), &[1, 2, 3, 4, 5], &[1, 0, 1, 0, 1], &schema);
-
-        let output = dir.join("merged.db");
-        let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
-        let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
-
-        let inputs = [cs1.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
-
-        let merged = MappedShard::open(&cout, &schema, false).unwrap();
-        assert_eq!(merged.count, 3); // only keys 1, 3, 5
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -298,7 +272,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs: [&CStr; 0] = [];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         // Output shard should exist with 0 rows
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
@@ -329,7 +303,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 0);
@@ -338,14 +312,15 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "at least one guard")]
     fn test_merge_and_route_rejects_empty_guards() {
         // Empty guard_keys would index batches[0] out of bounds inside the
-        // merge loop; the function must reject it up front.
+        // merge loop; a caller passing one has violated the contract — fail
+        // loudly up front.
         let schema = make_test_schema();
         let cdir = std::ffi::CString::new("/tmp").unwrap();
         let guards: [u128; 0] = [];
-        let r = merge_and_route(&[], &cdir, &guards, &schema, 0, 1, 0, false);
-        assert!(r.is_err(), "empty guard_keys must return Err, not panic");
+        let _ = merge_and_route(&[], &cdir, &guards, &schema, 0, 1, 0, false);
     }
 
     #[test]
@@ -368,8 +343,8 @@ mod tests {
         // order-preserving pack_pk_be space as the router's sort key, so derive
         // them from the OPK bytes of the boundary values (not native u128s).
         let guards: [u128; 2] = [
-            crate::storage::merge::pk_sort_key(&0u64.to_be_bytes()),
-            crate::storage::merge::pk_sort_key(&100u64.to_be_bytes()),
+            crate::storage::merge::pack_pk_be(&0u64.to_be_bytes()),
+            crate::storage::merge::pack_pk_be(&100u64.to_be_bytes()),
         ];
         let guard_outputs = merge_and_route(&inputs, &cdir, &guards, &schema, 0, 1, 99, false).unwrap();
         assert_eq!(guard_outputs.len(), 2); // both guards should have rows
@@ -455,14 +430,14 @@ mod tests {
         let s1 = dir.join("s1.db");
         let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         batch
-            .write_as_shard(&cpath, 0, &schema, ShardWriteOpts::default())
+            .write_as_shard(&cpath, &schema, ShardWriteOpts::default())
             .unwrap();
 
         // Compact it (single shard, should roundtrip)
         let output = dir.join("merged.db");
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
         let inputs = [cpath.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 3);
@@ -508,14 +483,14 @@ mod tests {
         let s1 = dir.join("s1.db");
         let cpath = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         batch
-            .write_as_shard(&cpath, 0, &schema, ShardWriteOpts::default())
+            .write_as_shard(&cpath, &schema, ShardWriteOpts::default())
             .unwrap();
 
         // Compact
         let output = dir.join("merged.db");
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
         let inputs = [cpath.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 2);
@@ -556,9 +531,7 @@ mod tests {
             batch.count += 1;
         }
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch
-            .write_as_shard(&cpath, 0, schema, ShardWriteOpts::default())
-            .unwrap();
+        batch.write_as_shard(&cpath, schema, ShardWriteOpts::default()).unwrap();
     }
 
     /// Read all rows from a 3-col shard as (pk, weight, col1, col2).
@@ -606,7 +579,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         let rows = read_3col_shard(output.to_str().unwrap(), &schema);
         assert_eq!(rows.len(), 1, "expected 1 surviving row, got {rows:?}");
@@ -656,7 +629,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         let rows = read_3col_shard(output.to_str().unwrap(), &schema);
         assert_eq!(
@@ -704,7 +677,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str(), cs3.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         let rows = read_3col_shard(output.to_str().unwrap(), &schema);
         assert_eq!(rows.len(), 2, "expected 2 surviving rows, got {rows:?}");
@@ -751,7 +724,7 @@ mod tests {
         let inputs: Vec<_> = cstrs.iter().map(|c| c.as_c_str()).collect();
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         let rows = read_3col_shard(output.to_str().unwrap(), &schema);
         assert_eq!(
@@ -823,7 +796,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false)
+        compact_shards(&inputs, &cout, &schema, false)
             .expect("compact with checksums enabled must succeed for valid data");
 
         let merged = MappedShard::open(&cout, &schema, true).unwrap();
@@ -860,7 +833,7 @@ mod tests {
         let cout = std::ffi::CString::new(output.to_str().unwrap()).unwrap();
 
         let inputs = [cs1.as_c_str(), cs2.as_c_str()];
-        compact_shards(&inputs, &cout, &schema, 0, false).unwrap();
+        compact_shards(&inputs, &cout, &schema, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, true).unwrap();
         assert_eq!(merged.count, 10000);
@@ -931,9 +904,7 @@ mod tests {
             batch.count += 1;
         }
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch
-            .write_as_shard(&cpath, 0, schema, ShardWriteOpts::default())
-            .unwrap();
+        batch.write_as_shard(&cpath, schema, ShardWriteOpts::default()).unwrap();
     }
 
     fn assert_compare_pk_bytes_sorted(shard: &MappedShard) {
@@ -1000,7 +971,7 @@ mod tests {
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
         let cout = std::ffi::CString::new(dir.join("merged.db").to_str().unwrap()).unwrap();
-        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0, false).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         // (2,3) cancels (+1 -1 = 0). The cross-shard duplicate must fold, which
@@ -1049,7 +1020,7 @@ mod tests {
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
         let cout = std::ffi::CString::new(dir.join("merged.db").to_str().unwrap()).unwrap();
-        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0, false).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 4);
@@ -1106,7 +1077,7 @@ mod tests {
         let cs1 = std::ffi::CString::new(s1.to_str().unwrap()).unwrap();
         let cs2 = std::ffi::CString::new(s2.to_str().unwrap()).unwrap();
         let cout = std::ffi::CString::new(dir.join("merged.db").to_str().unwrap()).unwrap();
-        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, 0, false).unwrap();
+        compact_shards(&[cs1.as_c_str(), cs2.as_c_str()], &cout, &schema, false).unwrap();
 
         let merged = MappedShard::open(&cout, &schema, false).unwrap();
         assert_eq!(merged.count, 2, "prefix-colliding distinct wide PKs must not fold");
@@ -1191,9 +1162,7 @@ mod tests {
             batch.count += 1;
         }
         let cpath = std::ffi::CString::new(path).unwrap();
-        batch
-            .write_as_shard(&cpath, 0, schema, ShardWriteOpts::default())
-            .unwrap();
+        batch.write_as_shard(&cpath, schema, ShardWriteOpts::default()).unwrap();
     }
 
     /// Read a compacted shard back to `(is_pk_unique, rows)`, decoding strings to
@@ -1243,16 +1212,16 @@ mod tests {
         run_merge(&shards, schema, |src, row, w| {
             let pk_bytes = shards[src].get_pk_bytes(row);
             if can_tag {
-                checker.observe(pk_bytes, w);
+                checker.observe(pack_pk_be(pk_bytes), pk_bytes, w);
             }
             batch.append_row_from_source_bytes(pk_bytes, w, &shards[src], row, blob_cache.get_mut());
         });
         let opts = ShardWriteOpts {
-            flags: checker.flags_if(can_tag),
+            flags: if can_tag { checker.flags() } else { 0 },
             pack_ints: true, // mirror the production compaction write
             ..Default::default()
         };
-        batch.write_as_shard(output_file, 0, schema, opts).unwrap();
+        batch.write_as_shard(output_file, schema, opts).unwrap();
     }
 
     /// Compact `shard_rows` both ways (`compact_shards` and the oracle) with
@@ -1279,7 +1248,7 @@ mod tests {
         let cnew = std::ffi::CString::new(out_new.to_str().unwrap()).unwrap();
         let cold = std::ffi::CString::new(out_old.to_str().unwrap()).unwrap();
 
-        compact_shards(&inputs, &cnew, schema, 0, can_tag).unwrap();
+        compact_shards(&inputs, &cnew, schema, can_tag).unwrap();
         oracle_compact_row_at_a_time(&inputs, &cold, schema, can_tag);
 
         let (uniq_new, rows_new) = decode_diff_shard(out_new.to_str().unwrap(), schema);
@@ -1403,9 +1372,10 @@ mod tests {
         let mut checkers: Vec<PkUniqueChecker> = (0..n).map(|_| PkUniqueChecker::new()).collect();
         run_merge(&shards, schema, |src, row, w| {
             let pk = shards[src].get_pk_bytes(row);
-            let g = find_guard_for_key(guard_keys, pack_pk_be(pk));
+            let prefix = pack_pk_be(pk);
+            let g = find_guard_for_key(guard_keys, prefix);
             if can_tag {
-                checkers[g].observe(pk, w);
+                checkers[g].observe(prefix, pk, w);
             }
             batches[g].append_row_from_source_bytes(pk, w, &shards[src], row, blob_caches[g].get_mut());
         });
@@ -1417,11 +1387,11 @@ mod tests {
                 let path = out_dir.join(format!("oracle_G{g}.db"));
                 let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
                 let opts = ShardWriteOpts {
-                    flags: checkers[g].flags_if(can_tag),
+                    flags: if can_tag { checkers[g].flags() } else { 0 },
                     pack_ints: true, // mirror the production compaction write
                     ..Default::default()
                 };
-                batches[g].write_as_shard(&cpath, 0, schema, opts).unwrap();
+                batches[g].write_as_shard(&cpath, schema, opts).unwrap();
                 Some(path.to_str().unwrap().to_string())
             })
             .collect()
@@ -1467,7 +1437,7 @@ mod tests {
         // router's sort key, so derive them from the boundary values' OPK bytes.
         let guard_keys: Vec<u128> = [0u64, 100, 200, 300]
             .iter()
-            .map(|&b| crate::storage::merge::pk_sort_key(&b.to_be_bytes()))
+            .map(|&b| crate::storage::merge::pack_pk_be(&b.to_be_bytes()))
             .collect();
 
         let cdir = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();

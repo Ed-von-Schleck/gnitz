@@ -28,8 +28,6 @@ pub enum StorageError {
     ChecksumMismatch,
     /// Output buffer was too small to hold the encoded form.
     BufferTooSmall,
-    /// MemTable hit its `max_bytes` ceiling — caller should flush and retry.
-    Capacity,
     /// Shard directory entry / encoding byte / region offset failed validation.
     InvalidShard,
     /// CString conversion failed (path contained an interior NUL).
@@ -45,7 +43,6 @@ impl fmt::Display for StorageError {
             StorageError::InvalidVersion => "invalid version",
             StorageError::ChecksumMismatch => "checksum mismatch",
             StorageError::BufferTooSmall => "buffer too small",
-            StorageError::Capacity => "capacity exceeded",
             StorageError::InvalidShard => "invalid shard layout",
             StorageError::InvalidPath => "invalid path",
         };

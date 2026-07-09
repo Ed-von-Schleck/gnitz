@@ -20,8 +20,11 @@ impl MappedShard {
     ) -> Result<Self, StorageError> {
         // `Mmap`'s Drop unmaps the file on any early `?` return below — no
         // manual cleanup needed in the validation path.
-        let mmap = Mmap::open(path)?;
-        let file_size = mmap.len;
+        let mmap = Mmap::open_ro(path).map_err(|_| StorageError::Io)?;
+        let file_size = mmap.len();
+        if file_size < HEADER_SIZE {
+            return Err(StorageError::Truncated);
+        }
         let data = mmap.as_slice();
 
         if read_u64_le(data, OFF_MAGIC) != SHARD_MAGIC {
@@ -93,7 +96,7 @@ impl MappedShard {
             }
         }
 
-        // Validate Raw region sizes up front: the has_ghosts scan and to_unified
+        // Validate Raw region sizes up front: to_unified
         // read `count × stride` bytes and must not overrun.
         for (i, e) in entries.iter().take(nr).enumerate() {
             if e.encoding == ENCODING_RAW && e.size < count * strides[i] as usize {
@@ -190,17 +193,22 @@ impl MappedShard {
             return Err(StorageError::InvalidShard);
         }
 
-        // has_ghosts: true only if at least one row actually has weight == 0.
-        // For Raw regions we scan the weight data once at open rather than
-        // assuming any Raw-encoded shard has ghosts. The drain-then-scatter
-        // path writes Raw weights that are all non-zero (drain filters w=0
-        // before scatter), so the conservative `Raw => true` caused skip_ghosts
-        // to do a full linear scan on every advance for ghost-free shards.
-        let has_ghosts = match &weight {
-            WeightRegion::Raw { offset, .. } => (0..count).any(|i| read_i64_le(data, offset + i * 8) == 0),
-            WeightRegion::Constant { value } => i64::from_le_bytes(value[..8].try_into().unwrap()) == 0,
-            WeightRegion::TwoValue { value_a, value_b, .. } => *value_a == 0 || *value_b == 0,
-        };
+        // Shards are ghost-free by construction: flush persists the memtable's
+        // consolidated net-state run and compaction's merge drops net-zero
+        // groups, so no writer ever emits a weight-0 row. Debug builds verify
+        // (the normal open path skips checksums, so this doubles as a cheap
+        // bit-rot canary on the weight region).
+        #[cfg(debug_assertions)]
+        {
+            let ghost = match &weight {
+                WeightRegion::Raw { offset, .. } => (0..count).any(|i| read_i64_le(data, offset + i * 8) == 0),
+                WeightRegion::Constant { value } => {
+                    count > 0 && i64::from_le_bytes(value[..8].try_into().unwrap()) == 0
+                }
+                WeightRegion::TwoValue { value_a, value_b, .. } => *value_a == 0 || *value_b == 0,
+            };
+            debug_assert!(!ghost, "shard contains weight-0 rows; every writer consolidates");
+        }
 
         let mut col_to_payload = Vec::with_capacity(num_cols);
         let mut col_regions = Vec::with_capacity(nr - REG_PAYLOAD_START);
@@ -245,7 +253,6 @@ impl MappedShard {
             blob_len,
             col_to_payload,
             xor8_filter,
-            has_ghosts,
             pk_stride,
             is_pk_unique,
         })

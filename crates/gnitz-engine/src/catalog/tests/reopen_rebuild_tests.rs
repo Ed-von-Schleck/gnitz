@@ -21,11 +21,11 @@ use super::*;
 /// Net weight summed over every (PK, payload) the cursor yields. Row *counts*
 /// would hide a double-materialisation: rebuilding the same rows twice leaves
 /// the row set identical and only the weights doubled.
-fn sum_weights(mut c: CursorHandle) -> i64 {
+fn sum_weights(mut c: ReadCursor) -> i64 {
     let mut sum = 0;
-    while c.cursor.valid {
-        sum += c.cursor.current_weight;
-        c.cursor.advance();
+    while c.valid {
+        sum += c.current_weight;
+        c.advance();
     }
     sum
 }

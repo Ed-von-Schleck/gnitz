@@ -205,7 +205,7 @@ fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> 
     } else {
         RecoverySource::Rederive
     };
-    Table::new(dir.to_str().unwrap(), "t", schema, 1, 1 << 20, p).unwrap()
+    Table::new(dir.to_str().unwrap(), schema, 1, 1 << 20, p).unwrap()
 }
 
 proptest! {
@@ -245,7 +245,6 @@ proptest! {
             // in_memory_l0 and are served by full_scan (asserted above).
             prop_assert!(shards.is_empty());
         }
-        table.close();
     }
 
     /// has_pk_bytes re-finds every ingested row before and after flush; an
@@ -277,7 +276,6 @@ proptest! {
             prop_assert!(table.has_pk_bytes(original.get_pk_bytes(i)));
         }
         prop_assert!(!table.has_pk_bytes(&absent));
-        table.close();
     }
 
     /// retract_pk_bytes is a read-only probe; physical retraction ingests a
@@ -295,8 +293,9 @@ proptest! {
 
         // Read-only probe of the live shard rows.
         for i in 0..half {
-            let probe = table.retract_pk_bytes(original.get_pk_bytes(i));
-            prop_assert_eq!(probe, (original.get_weight(i), true));
+            let (w, found) = table.retract_pk_bytes(original.get_pk_bytes(i));
+            prop_assert_eq!(w, original.get_weight(i));
+            prop_assert!(found.is_some());
         }
 
         // Physical retraction: ingest the same rows negated into the memtable.
@@ -314,7 +313,6 @@ proptest! {
             expected.remove(&row_key(&original, &schema, i));
         }
         prop_assert_eq!(&expected, &zset_of(table.full_scan().as_ref(), &schema));
-        table.close();
     }
 
     /// Flush in 5 waves (> L0_COMPACT_THRESHOLD == 4), then compact: the k-way
@@ -352,6 +350,5 @@ proptest! {
 
         let expected = zset_of(&original, &schema);
         prop_assert_eq!(&expected, &zset_of(table.full_scan().as_ref(), &schema));
-        table.close();
     }
 }

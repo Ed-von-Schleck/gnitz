@@ -24,7 +24,7 @@ pub use batch::{write_to_batch, Batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::StorageError;
 pub use lsm::partitioned_table::{partition_for_key, partition_for_pk_bytes, PartitionedTable, Routing};
-pub use lsm::read_cursor::CursorHandle;
+
 pub use lsm::table::{FlushOutcome, FlushWork, RecoverySource, Table};
 pub use merge::MemBatch;
 pub use scatter::{scatter_copy, scatter_multi_source};
@@ -46,9 +46,15 @@ pub(crate) use lsm::partitioned_table::partial_flush_lsn_fixture;
 pub(crate) use lsm::read_cursor::REWIND_CALLS;
 pub(crate) use lsm::read_cursor::{DrainGuard, ReadCursor, DDL_SCAN_CHUNK_ROWS};
 pub(crate) use lsm::spill::{KeyProducer, SpillSort};
-pub(crate) use lsm::wal::block_size as wal_block_size;
-pub(crate) use merge::{pk_sort_key, BlobCacheGuard, DirectWriter};
+pub(crate) use merge::{pack_pk_be, BlobCacheGuard, DirectWriter};
 pub(crate) use range_key::{increment_key_in_place, range_cut_points};
+pub(crate) use repr::wal::block_size as wal_block_size;
+
+/// Convert a path string to a `CString`, mapping an interior NUL to
+/// `InvalidPath` — the one conversion every storage path takes.
+pub(super) fn cstr(s: impl Into<Vec<u8>>) -> Result<std::ffi::CString, error::StorageError> {
+    std::ffi::CString::new(s).map_err(|_| error::StorageError::InvalidPath)
+}
 
 /// Append the `.tmp` suffix to a CStr basename and return a new CString.
 pub(super) fn cstr_with_tmp_suffix(base: &std::ffi::CStr) -> Result<std::ffi::CString, error::StorageError> {

@@ -4,8 +4,7 @@
 
 use super::*;
 use crate::ops::{self, AviDesc};
-use crate::storage::ReadCursor;
-use crate::storage::{Batch, CursorHandle};
+use crate::storage::{Batch, ReadCursor};
 
 // ---------------------------------------------------------------------------
 // Execution
@@ -138,7 +137,7 @@ pub(crate) fn execute_epoch_multi(
             if r.cursor_ptr.is_null() {
                 None
             } else {
-                Some(unsafe { &mut *r.cursor_ptr }.cursor_mut())
+                Some(unsafe { &mut *r.cursor_ptr })
             }
         }};
     }
@@ -433,12 +432,12 @@ pub(crate) fn execute_epoch_multi(
                 // Combined AVI cursor — created fresh from the value-index table
                 // (not a register). Must be created AFTER INTEGRATE populates the
                 // table, so the prefix seek returns the post-delta extreme.
-                // Operator-state read; keep compacting (see refresh_owned_cursors).
-                #[allow(clippy::disallowed_methods)] // explicit maintenance: REDUCE AVI operator state
-                let mut avi_cursor_handle: Option<Box<CursorHandle>> = if let Some(avi) = avi {
+                // Operator-state read; compact first (see refresh_owned_cursors).
+                let mut avi_cursor_handle: Option<Box<ReadCursor>> = if let Some(avi) = avi {
                     let avi_ptr = program.tables[avi.table_idx as usize];
                     let avi_table = unsafe { &mut *avi_ptr };
-                    avi_table.create_cursor_compacting().ok().map(Box::new)
+                    let _ = avi_table.compact_if_needed();
+                    Some(Box::new(avi_table.open_cursor()))
                 } else {
                     None
                 };
@@ -461,7 +460,7 @@ pub(crate) fn execute_epoch_multi(
                 } else {
                     None
                 };
-                let avi_opt: Option<&mut ReadCursor> = avi_cursor_handle.as_deref_mut().map(|ch| ch.cursor_mut());
+                let avi_opt: Option<&mut ReadCursor> = avi_cursor_handle.as_deref_mut();
 
                 let (raw_out, fin_out) = ops::op_reduce(
                     &reg!(*in_reg).batch,

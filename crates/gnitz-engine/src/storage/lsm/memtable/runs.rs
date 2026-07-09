@@ -5,7 +5,6 @@
 use std::rc::Rc;
 
 use super::super::batch::{write_to_batch, Batch, Layout};
-use super::super::error::StorageError;
 use super::super::merge::{self, pack_pk_be, SortedMemBatch};
 use super::{MemTable, INLINE_CONSOLIDATE_THRESHOLD};
 use crate::schema::SchemaDescriptor;
@@ -59,6 +58,12 @@ pub(crate) fn consolidate_runs(runs: &[Rc<Batch>], schema: &SchemaDescriptor) ->
 /// sharing a 16-byte prefix collide to one slot, a tolerated false positive
 /// resolved by the run scan. The single owner of the PK bloom keying, shared by
 /// the memtable bloom and the per-run `in_memory_l0` blooms.
+/// Construct an empty bloom for `expected_n` keys — the one constructor the
+/// memtable's lazy build uses.
+pub(super) fn new_bloom(expected_n: u32) -> super::super::bloom::BloomFilter {
+    super::super::bloom::BloomFilter::new(expected_n)
+}
+
 pub(crate) fn bloom_add_batch(bloom: &mut super::super::bloom::BloomFilter, batch: &Batch) {
     for i in 0..batch.count {
         bloom.add(pack_pk_be(batch.get_pk_bytes(i)));
@@ -68,33 +73,37 @@ pub(crate) fn bloom_add_batch(bloom: &mut super::super::bloom::BloomFilter, batc
 impl MemTable {
     /// Append a consolidated batch as a new run. The batch must be consolidated
     /// (debug-verified at entry); producers certify it via `into_consolidated`.
-    pub fn upsert_sorted_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
+    pub fn upsert_sorted_batch(&mut self, batch: Batch) {
         debug_assert!(
             batch.consolidated_verified(&self.schema),
             "upsert_sorted_batch requires a consolidated batch",
         );
+        // The sole production caller pre-flushes at 75% of `max_bytes`
+        // (`Table::ingest_owned_batch`), so the arena can never
+        // overfill here.
+        debug_assert!(
+            self.runs_bytes <= self.max_bytes,
+            "memtable overfilled: caller skipped the pre-flush"
+        );
         if batch.count == 0 {
-            return Ok(());
+            return;
         }
-        self.check_capacity()?;
-        bloom_add_batch(&mut self.bloom, &batch);
-        self.total_row_count += batch.count;
+        // Maintain the bloom only once built (first probe); an unprobed
+        // memtable pays nothing.
+        if let Some(bloom) = self.bloom.get_mut() {
+            bloom_add_batch(bloom, &batch);
+        }
         self.runs_bytes += batch.total_bytes();
         self.runs.push(Rc::new(batch));
         self.maybe_inline_consolidate();
-        Ok(())
     }
     pub fn should_flush(&self) -> bool {
         self.runs_bytes > self.max_bytes * 3 / 4
     }
 
     pub fn is_empty(&self) -> bool {
-        self.total_row_count == 0
-    }
-
-    #[cfg(test)]
-    pub(crate) fn total_row_count(&self) -> usize {
-        self.total_row_count
+        // Empty batches are never pushed, so no runs ⇔ no rows.
+        self.runs.is_empty()
     }
 
     fn runs_as_sorted(&self) -> Vec<SortedMemBatch<'_>> {
@@ -126,15 +135,19 @@ impl MemTable {
         drop(batches);
         self.runs.clear();
         self.runs_bytes = merged.total_bytes();
-        self.total_row_count = merged.count;
-        // Rebuild bloom from surviving rows only: stale hashes from
-        // weight-cancelled rows are cleared here, reducing false-positive rate.
-        self.bloom.reset();
+        // Rebuild the bloom (iff built) from surviving rows only: stale hashes
+        // from weight-cancelled rows are cleared here, reducing the
+        // false-positive rate. Re-adding into the live filter instead would
+        // ratchet the FP rate up across folds.
+        if let Some(bloom) = self.bloom.get_mut() {
+            bloom.reset();
+            if merged.count > 0 {
+                bloom_add_batch(bloom, &merged);
+            }
+        }
         if merged.count > 0 {
-            bloom_add_batch(&mut self.bloom, &merged);
             self.runs.push(Rc::new(merged));
         }
-        self.found = None;
     }
 
     /// Consolidate runs and return an `Rc<Batch>` of the merged result.
@@ -148,13 +161,11 @@ impl MemTable {
             Rc::clone(&self.runs[0])
         }
     }
-    /// Clear all runs and bloom filter.  Ready for reuse.
+    /// Clear all runs and the bloom filter.  Ready for reuse.
     pub fn reset(&mut self) {
         self.runs.clear();
         self.runs_bytes = 0;
-        self.total_row_count = 0;
-        self.found = None;
-        self.bloom.reset();
+        self.bloom.take();
     }
 
     /// If the run count has reached the threshold, merge all runs into a
@@ -164,12 +175,5 @@ impl MemTable {
         if self.runs.len() >= INLINE_CONSOLIDATE_THRESHOLD {
             self.force_consolidate();
         }
-    }
-
-    fn check_capacity(&self) -> Result<(), StorageError> {
-        if self.runs_bytes > self.max_bytes {
-            return Err(StorageError::Capacity);
-        }
-        Ok(())
     }
 }

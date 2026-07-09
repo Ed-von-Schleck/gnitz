@@ -66,12 +66,7 @@ pub(super) fn cursor_matches_group(
     let exemplar_null_word = exemplar_mb.get_null_word(exemplar_row);
 
     // Hoisted once: the cursor's blob arena backs any German-string group column.
-    let cursor_blob = cursor.blob_ptr();
-    let cursor_blob_slice: &[u8] = if cursor_blob.is_null() {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(cursor_blob, cursor.blob_len()) }
-    };
+    let cursor_blob_slice: &[u8] = cursor.blob_slice();
 
     for desc in descs {
         if desc.pi == PAYLOAD_MAPPING_PK_SENTINEL {

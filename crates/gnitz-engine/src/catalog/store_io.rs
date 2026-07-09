@@ -61,7 +61,7 @@ impl CatalogEngine {
             self.dag.tables.get(&table_id).unwrap().handle.open_cursor()
         };
 
-        if !cursor.cursor.seek_exact_live(pk) {
+        if !cursor.seek_exact_live(pk) {
             return Ok(None);
         }
 
@@ -105,7 +105,7 @@ impl CatalogEngine {
             // Order is not required for correctness; `advance_to` is
             // backward-capable, so it matches `seek_exact_live` on any input and
             // additionally fast-paths the (common) ascending-`pks` caller.
-            if cursor.cursor.advance_to_exact_live(pk.pk_bytes()) {
+            if cursor.advance_to_exact_live(pk.pk_bytes()) {
                 copy_cursor_cols_to_batch(&cursor, &mut out, &schema, project);
             }
         }
@@ -173,14 +173,14 @@ impl CatalogEngine {
         let mut idx_cursor = ic.table_mut().open_cursor();
         let mut pks: Vec<crate::storage::PkBuf> = Vec::new();
 
-        let mut hit = idx_cursor.cursor.seek_first_positive_with_prefix(opk_prefix);
+        let mut hit = idx_cursor.seek_first_positive_with_prefix(opk_prefix);
         while hit {
-            let cur_pk = idx_cursor.cursor.current_pk_bytes();
+            let cur_pk = idx_cursor.current_pk_bytes();
             pks.push(crate::storage::PkBuf::from_bytes(
                 &cur_pk[idx_key_size..idx_key_size + src_pk_stride],
             ));
-            idx_cursor.cursor.advance();
-            hit = idx_cursor.cursor.walk_to_positive_with_prefix(opk_prefix);
+            idx_cursor.advance();
+            hit = idx_cursor.walk_to_positive_with_prefix(opk_prefix);
         }
         // Free the index merge tree and its shard snapshots before the base
         // cursor opens, so the two never coexist.
@@ -229,9 +229,9 @@ impl CatalogEngine {
         for pk in pks {
             // PKs are asserted ascending above, so the galloping `advance_to`
             // seeds each probe at the prior position — one monotone forward sweep.
-            if src_cursor.cursor.advance_to_exact_live(pk.pk_bytes()) {
-                let w = src_cursor.cursor.current_weight;
-                src_cursor.cursor.copy_current_row_into(&mut acc, w);
+            if src_cursor.advance_to_exact_live(pk.pk_bytes()) {
+                let w = src_cursor.current_weight;
+                src_cursor.copy_current_row_into(&mut acc, w);
             }
         }
         (acc.count > 0).then_some(acc)
@@ -350,18 +350,18 @@ impl CatalogEngine {
         let mut idx_cursor = ic.table_mut().open_cursor();
         let mut pks: Vec<crate::storage::PkBuf> = Vec::new();
 
-        idx_cursor.cursor.seek_bytes(&start[..idx_pk_stride]);
-        while idx_cursor.cursor.valid {
-            let cur_pk = idx_cursor.cursor.current_pk_bytes();
+        idx_cursor.seek_bytes(&start[..idx_pk_stride]);
+        while idx_cursor.valid {
+            let cur_pk = idx_cursor.current_pk_bytes();
             if end.is_some_and(|e| cur_pk >= e) {
                 break;
             }
-            if idx_cursor.cursor.current_weight > 0 {
+            if idx_cursor.current_weight > 0 {
                 pks.push(crate::storage::PkBuf::from_bytes(
                     &cur_pk[idx_key_size..idx_key_size + src_pk_stride],
                 ));
             }
-            idx_cursor.cursor.advance();
+            idx_cursor.advance();
         }
         // Free the index merge tree and its shard snapshots before the base
         // cursor opens, so the two never coexist and obsolete shards can be
@@ -424,7 +424,7 @@ impl CatalogEngine {
             Some(e) => e,
             None => return Rc::new(Batch::empty_with_schema(schema)),
         };
-        entry.handle.open_cursor().cursor.materialize()
+        entry.handle.open_cursor().materialize()
     }
 
     /// Cursor-returning sibling of `scan_store` for callers that stream the
@@ -435,7 +435,7 @@ impl CatalogEngine {
     /// The handle owns its sources via `Rc`, so it stays valid while the
     /// caller mutates OTHER relations (index table, view family) between
     /// chunks; the scanned relation itself must not be written mid-loop.
-    pub(crate) fn open_store_cursor(&mut self, table_id: i64) -> Option<CursorHandle> {
+    pub(crate) fn open_store_cursor(&mut self, table_id: i64) -> Option<ReadCursor> {
         self.dag.tables.get(&table_id).map(|e| e.handle.open_cursor())
     }
 }
@@ -446,15 +446,15 @@ impl CatalogEngine {
 /// at position `k` corresponds to source column `project[k]`; the projected
 /// null bit `k` mirrors the source row's null bit for that column. Projected
 /// columns are scalar, so no blob relocation is required.
-fn copy_cursor_cols_to_batch(cursor: &CursorHandle, out: &mut Batch, src_schema: &SchemaDescriptor, project: &[u8]) {
+fn copy_cursor_cols_to_batch(cursor: &ReadCursor, out: &mut Batch, src_schema: &SchemaDescriptor, project: &[u8]) {
     // `current_pk_bytes()` is the verbatim OPK PK region for any width, and the
     // read cursor always tracks it regardless of stride. For narrow PKs it
     // equals `widen_pk_be(current_pk_bytes) == current_key_narrow()`; for wide
     // PKs it is the only PK form, so one path serves both.
-    out.extend_pk_bytes(cursor.cursor.current_pk_bytes());
+    out.extend_pk_bytes(cursor.current_pk_bytes());
     out.extend_weight(&1i64.to_le_bytes());
 
-    let src_null = cursor.cursor.current_null_word;
+    let src_null = cursor.current_null_word;
     let mut proj_null = 0u64;
     for (k, &p) in project.iter().enumerate() {
         // The projection is master-built and excludes PK columns
@@ -471,7 +471,7 @@ fn copy_cursor_cols_to_batch(cursor: &CursorHandle, out: &mut Batch, src_schema:
 
     for (k, &p) in project.iter().enumerate() {
         let col_size = src_schema.columns[p as usize].size() as usize;
-        let ptr = cursor.cursor.col_ptr(p as usize, col_size);
+        let ptr = cursor.col_ptr(p as usize, col_size);
         if !ptr.is_null() {
             let data = unsafe { std::slice::from_raw_parts(ptr, col_size) };
             out.extend_col(k, data);

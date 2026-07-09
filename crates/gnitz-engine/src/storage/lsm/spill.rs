@@ -35,8 +35,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use super::compare_pk_bytes;
 use super::heap::{HeapNode, LoserTree};
-use super::shard_reader::Mmap;
 use crate::foundation::posix_io;
+use crate::foundation::posix_io::Mmap;
 
 /// Sort `idx` (rebuilt as `0..flat.len()/stride`) by the byte-lexicographic
 /// order of the fixed-`stride` records of `flat` — the same `compare_pk_bytes`

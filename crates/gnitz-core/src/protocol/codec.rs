@@ -266,7 +266,7 @@ mod tests {
         let ms = meta_schema();
         let meta_batch = schema_to_batch(&original);
         let encoded = encode_wal_block(ms, 0, &meta_batch);
-        let (decoded_batch, _, _) = decode_wal_block(&encoded, ms, VerifyChecksum::Yes).unwrap();
+        let (decoded_batch, _) = decode_wal_block(&encoded, ms, VerifyChecksum::Yes).unwrap();
         let reconstructed = batch_to_schema(&decoded_batch).unwrap();
 
         assert_eq!(original, reconstructed, "schema mismatch after meta roundtrip");

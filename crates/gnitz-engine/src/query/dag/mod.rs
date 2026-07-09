@@ -7,7 +7,7 @@ use crate::ops;
 use crate::query::compiler::{self, CompileOutput, ExternalTable, SubPlan};
 use crate::query::vm;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, CursorHandle, PartitionedTable, RecoverySource, StorageError, Table};
+use crate::storage::{Batch, PartitionedTable, ReadCursor, RecoverySource, StorageError, Table};
 use gnitz_wire::PkColList;
 
 mod store_handle;
@@ -126,7 +126,9 @@ impl RelationKind {
     pub fn recovery_source(self) -> RecoverySource {
         match self {
             RelationKind::SystemCatalog | RelationKind::BaseTable { .. } => RecoverySource::SalReplay,
-            RelationKind::View => RecoverySource::RederiveCheckpointed,
+            RelationKind::View => RecoverySource::RederiveCheckpointed {
+                committed: crate::foundation::worker_ctx::committed_generation(),
+            },
         }
     }
 
@@ -283,13 +285,13 @@ impl DepMap {
         if !dep_tab.is_null() {
             let t = unsafe { &*dep_tab };
             let mut ch = t.open_cursor();
-            while ch.cursor.valid {
-                let w = ch.cursor.current_weight;
+            while ch.valid {
+                let w = ch.current_weight;
                 if w > 0 {
                     // DepTab compound PK = (view_id, dep_table_id); both live in
                     // the 16-byte PK region as OPK (big-endian for these unsigned
                     // columns): view_id_BE in bytes 0..8, dep_BE in 8..16.
-                    let pk = ch.cursor.current_pk_bytes();
+                    let pk = ch.current_pk_bytes();
                     let v_id = u64::from_be_bytes(pk[0..8].try_into().unwrap()) as i64;
                     let dep_tid = u64::from_be_bytes(pk[8..16].try_into().unwrap()) as i64;
                     if dep_tid > 0 {
@@ -303,7 +305,7 @@ impl DepMap {
                         }
                     }
                 }
-                ch.cursor.advance();
+                ch.advance();
             }
         }
         self.valid = true;
@@ -1576,29 +1578,27 @@ impl DagEngine {
         tables: &FxHashMap<i64, TableEntry>,
         ext_trace_regs: &[(u16, i64)],
         num_regs: usize,
-    ) -> (Vec<*mut libc::c_void>, Vec<Box<CursorHandle>>) {
+    ) -> (Vec<*mut libc::c_void>, Vec<Box<ReadCursor>>) {
         let mut ptrs: Vec<*mut libc::c_void> = vec![std::ptr::null_mut(); num_regs];
-        let mut storage: Vec<Box<CursorHandle>> = Vec::new();
+        let mut storage: Vec<Box<ReadCursor>> = Vec::new();
         for &(reg_id, table_id) in ext_trace_regs {
             if let Some(entry) = tables.get(&table_id) {
-                // External-trace reads are the operator-state read path: keep
-                // them compacting so L0 on intermediate/trace tables stays
-                // bounded (no background compactor yet). These are not
-                // validators, so a compaction Err safely degrades to `None`.
-                #[allow(clippy::disallowed_methods)] // explicit maintenance: operator-state trace read
-                let cursor_opt = entry.handle.create_cursor_compacting().ok();
-                if let Some(ch) = cursor_opt {
-                    storage.push(Box::new(ch));
-                    if (reg_id as usize) < num_regs {
-                        // Derive the raw pointer AFTER the move, from the box's
-                        // stable heap address inside `storage`. Deriving it from
-                        // a local Box and then moving the box would invalidate it
-                        // under Stacked/Tree Borrows. The CursorHandle heap
-                        // allocation is stable across later Vec growth, so the
-                        // pointer remains valid.
-                        let p = storage.last_mut().unwrap().as_mut() as *mut CursorHandle;
-                        ptrs[reg_id as usize] = p as *mut libc::c_void;
-                    }
+                // External-trace reads are the operator-state read path:
+                // compact first so L0 on intermediate/trace tables stays
+                // bounded (no background compactor yet). A compaction Err
+                // leaves the shard index unchanged; the cursor still opens
+                // on a consistent snapshot.
+                let _ = entry.handle.compact_if_needed();
+                storage.push(Box::new(entry.handle.open_cursor()));
+                if (reg_id as usize) < num_regs {
+                    // Derive the raw pointer AFTER the move, from the box's
+                    // stable heap address inside `storage`. Deriving it from
+                    // a local Box and then moving the box would invalidate it
+                    // under Stacked/Tree Borrows. The ReadCursor heap
+                    // allocation is stable across later Vec growth, so the
+                    // pointer remains valid.
+                    let p = storage.last_mut().unwrap().as_mut() as *mut ReadCursor;
+                    ptrs[reg_id as usize] = p as *mut libc::c_void;
                 }
             }
         }
@@ -1978,13 +1978,14 @@ impl DagEngine {
             // Stored-row retraction — shared by insert and delete. Probe the
             // store and, the first time this PK is found, emit a retraction of
             // the stored (PK, payload) so downstream views drop the old payload.
-            let (_existing_w, found) = ptable.retract_pk_bytes(pkb);
-            if found && !store_retracted.contains(pkb) {
-                // `retract_pk_bytes` armed the stored row as a `ColumnarSource`
-                // view; copy it in at weight -1 via the canonical source-append.
-                let found_row = ptable.found_row().expect("retract_pk_bytes reported a found row");
-                effective.append_row_from_source_bytes(pkb, -1, &found_row, 0, None);
-                store_retracted.insert(pkb);
+            let (_existing_w, stored_row) = ptable.retract_pk_bytes(pkb);
+            if let Some(stored_row) = stored_row {
+                if !store_retracted.contains(pkb) {
+                    // The located stored row is an owned `ColumnarSource` view;
+                    // copy it in at weight -1 via the canonical source-append.
+                    effective.append_row_from_source_bytes(pkb, -1, &stored_row, 0, None);
+                    store_retracted.insert(pkb);
+                }
             }
 
             if w > 0 {
@@ -2114,7 +2115,7 @@ mod tests {
         let schema = SchemaDescriptor::default();
         let dir = dag_test_dir(name);
         let _ = std::fs::remove_dir_all(&dir);
-        Box::new(Table::new(&dir, name, schema, 99, 256 * 1024, RecoverySource::Rederive).unwrap())
+        Box::new(Table::new(&dir, schema, 99, 256 * 1024, RecoverySource::Rederive).unwrap())
     }
 
     #[test]
@@ -2282,17 +2283,7 @@ mod tests {
         let idx_schema = crate::schema::SchemaDescriptor::minimal_u64();
         let idx_dir = dag_test_dir("flush_ic_idx");
         let _ = std::fs::remove_dir_all(&idx_dir);
-        let idx_tbl = Box::new(
-            Table::new(
-                &idx_dir,
-                "flush_ic_idx",
-                idx_schema,
-                1,
-                256 * 1024,
-                RecoverySource::SalReplay,
-            )
-            .unwrap(),
-        );
+        let idx_tbl = Box::new(Table::new(&idx_dir, idx_schema, 1, 256 * 1024, RecoverySource::SalReplay).unwrap());
         dag.add_index_circuit(70, &[1], 999, idx_tbl, idx_schema, false);
 
         // Put one row in the index table's memtable.
@@ -2342,7 +2333,6 @@ mod tests {
         let tdir = dir.path().join("enforce_signed");
         let mut pt = crate::storage::PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "enforce_signed",
             schema,
             1234,
             crate::storage::Routing::Hashed,
@@ -2413,7 +2403,6 @@ mod tests {
         let tdir = dir.path().join("enforce_weight_norm");
         let mut pt = crate::storage::PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "enforce_weight_norm",
             schema,
             1234,
             crate::storage::Routing::Hashed,
@@ -2484,7 +2473,6 @@ mod tests {
         let tdir = dir.path().join("enforce_absent");
         let mut pt = crate::storage::PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "enforce_absent",
             schema,
             1234,
             crate::storage::Routing::Hashed,
@@ -2554,7 +2542,6 @@ mod tests {
         let tdir = dir.path().join("enforce_wide");
         let mut pt = crate::storage::PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "enforce_wide",
             schema,
             555,
             crate::storage::Routing::Hashed,
@@ -2676,8 +2663,7 @@ mod tests {
         let schema = crate::schema::SchemaDescriptor::minimal_u64();
         let dir = dag_test_dir("seam_abort");
         let _ = std::fs::remove_dir_all(&dir);
-        let mut tbl =
-            Box::new(Table::new(&dir, "seam_abort", schema, 99, 256 * 1024, RecoverySource::Rederive).unwrap());
+        let mut tbl = Box::new(Table::new(&dir, schema, 99, 256 * 1024, RecoverySource::Rederive).unwrap());
         dag.register_table(
             70,
             StoreHandle::Borrowed(&mut *tbl as *mut Table),

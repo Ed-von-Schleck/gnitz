@@ -222,13 +222,6 @@ impl<'a> ColumnarSource for SortedMemBatch<'a> {
 pub(crate) trait MergeSource {
     /// Total rows in this source (the cursor's exclusive upper bound).
     fn row_count(&self) -> usize;
-    /// First live (weight ≠ 0) row at or after `pos`, or `row_count()` if none.
-    /// Pre-consolidated batches have no ghosts — the default no-op — so the
-    /// advance lowers to `pos`; shards override to skip weight-0 rows.
-    #[inline]
-    fn next_non_ghost(&self, pos: usize) -> usize {
-        pos
-    }
 }
 
 impl<'a> MergeSource for SortedMemBatch<'a> {
@@ -504,10 +497,10 @@ impl<'a> DirectWriter<'a> {
 // Narrow-region PK key packing
 // ---------------------------------------------------------------------------
 
-// `pack_pk_be` / `pk_sort_key` moved to `schema::key`; re-exported so
-// `merge::*` / `super::merge::*` call sites and this module's own `pk_sort_key`
+// `pack_pk_be` moved to `schema::key`; re-exported so `merge::*` /
+// `super::merge::*` call sites and this module's own uses
 // uses are unchanged.
-pub(crate) use crate::schema::key::{pack_pk_be, pk_sort_key};
+pub(crate) use crate::schema::key::pack_pk_be;
 
 // ---------------------------------------------------------------------------
 // run_merge: the generic N-way (PK, payload) merge + consolidation
@@ -542,7 +535,7 @@ pub(crate) fn run_merge<S: ColumnarSource + MergeSource>(
     let mut cursors: Vec<PosCursor> = sources
         .iter()
         .map(|s| PosCursor {
-            position: s.next_non_ghost(0),
+            position: 0,
             count: s.row_count(),
         })
         .collect();
@@ -550,6 +543,66 @@ pub(crate) fn run_merge<S: ColumnarSource + MergeSource>(
     // Dispatch the payload comparator, monomorphizing one branch-free copy of the
     // merge loop; the PK axis is `compare_pk_ordering` (no stride dispatch).
     with_payload_cmp!(schema, run_merge_body, sources, &mut cursors, schema, emit)
+}
+
+/// The (PK, payload) merge comparator trio, shared by the flush/compaction
+/// kernel ([`run_merge_body`]) and the read cursor's loser-tree drives so the
+/// two can never diverge on the §4 total order. All three are `#[inline]`
+/// closure builders, generic over the concrete source type — no `dyn` — so
+/// each caller monomorphizes its own branch-free copy.
+///
+/// `merge_less` is the full heap order: `compare_pk_ordering` on each player's
+/// full OPK bytes (exact at every width — no cached key, no stride dispatch),
+/// then the payload `row_cmp`.
+#[inline]
+pub(crate) fn merge_less<'a, S, RowCmp>(
+    schema: &'a SchemaDescriptor,
+    sources: &'a [S],
+    row_cmp: RowCmp,
+) -> impl Fn(&HeapNode, &HeapNode) -> bool + Copy + 'a
+where
+    S: ColumnarSource,
+    RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy + 'a,
+{
+    move |a, b| {
+        let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
+        let (b_src, b_row) = (b.source_idx as usize, b.row as usize);
+        match compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less,
+        }
+    }
+}
+
+/// OPK equality via `compare_pk_ordering == Equal` — deliberately not a raw
+/// `get_pk_bytes(..) == get_pk_bytes(..)`: on the runtime-width slices
+/// `get_pk_bytes` yields, raw `==` lowers to an out-of-line `bcmp` call,
+/// whereas `compare_pk_ordering` inlines to a register `pack_pk_be` compare
+/// for the dominant ≤16-byte PK (the `compare_pk_bytes` tiebreak fires only
+/// when two wide PKs share a 16-byte prefix, so they never fold).
+#[inline]
+pub(crate) fn merge_same_pk<S: ColumnarSource>(
+    sources: &[S],
+) -> impl Fn(usize, usize, usize, usize) -> bool + Copy + '_ {
+    move |a_src, a_row, b_src, b_row| {
+        compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) == Ordering::Equal
+    }
+}
+
+/// The payload-equality term of the trio (`row_cmp == Equal`; the PK term is
+/// [`merge_same_pk`]).
+#[inline]
+pub(crate) fn merge_eq_payload<'a, S, RowCmp>(
+    schema: &'a SchemaDescriptor,
+    sources: &'a [S],
+    row_cmp: RowCmp,
+) -> impl Fn(usize, usize, usize, usize) -> bool + Copy + 'a
+where
+    S: ColumnarSource,
+    RowCmp: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy + 'a,
+{
+    move |a_src, a_row, b_src, b_row| row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
 }
 
 /// N-way merge closure builder + driver. The keyless heap reads each player's
@@ -579,21 +632,9 @@ fn run_merge_body<S, RowCmp>(
     // `less` reads `a.row` / `b.row` from the heap node directly — never
     // touches `cursors` — so it coexists with the `&mut cursors` borrow held
     // by `advance`.  `source_idx` doubles as the source index here.
-    let less = |a: &HeapNode, b: &HeapNode| -> bool {
-        let (a_src, a_row) = (a.source_idx as usize, a.row as usize);
-        let (b_src, b_row) = (b.source_idx as usize, b.row as usize);
-        match compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) {
-            Ordering::Less => true,
-            Ordering::Greater => false,
-            Ordering::Equal => row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Less,
-        }
-    };
-    let same_pk = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-        compare_pk_ordering(sources[a_src].get_pk_bytes(a_row), sources[b_src].get_pk_bytes(b_row)) == Ordering::Equal
-    };
-    let eq_payload = |a_src: usize, a_row: usize, b_src: usize, b_row: usize| {
-        row_cmp(schema, &sources[a_src], a_row, &sources[b_src], b_row) == Ordering::Equal
-    };
+    let less = merge_less(schema, sources, row_cmp);
+    let same_pk = merge_same_pk(sources);
+    let eq_payload = merge_eq_payload(schema, sources, row_cmp);
     let mut tree = LoserTree::build(
         cursors.len(),
         |i| cursors[i].is_valid().then(|| cursors[i].position as u32),
@@ -604,7 +645,7 @@ fn run_merge_body<S, RowCmp>(
         less,
         |src| {
             // Skip ghosts (a no-op for consolidated batches) then report validity.
-            cursors[src].position = sources[src].next_non_ghost(cursors[src].position + 1);
+            cursors[src].position += 1;
             cursors[src].is_valid().then(|| cursors[src].position as u32)
         },
         same_pk,
@@ -693,7 +734,7 @@ pub(crate) fn sort_and_consolidate(batch: &MemBatch, schema: &SchemaDescriptor, 
 }
 
 /// Sort-plus-consolidate for all PK widths. Primary key is the order-preserving
-/// `pk_sort_key`; ties break on raw OPK bytes (implied-equal/free for narrow,
+/// `pack_pk_be`; ties break on raw OPK bytes (implied-equal/free for narrow,
 /// separating wide low-16 collisions) then payload.
 #[inline]
 fn sort_consolidate_inner<RowCmp>(
@@ -707,7 +748,7 @@ fn sort_consolidate_inner<RowCmp>(
 {
     let mut entries: Vec<SortEntry> = (0..n as u32)
         .map(|i| SortEntry {
-            pk: pk_sort_key(batch.get_pk_bytes(i as usize)),
+            pk: pack_pk_be(batch.get_pk_bytes(i as usize)),
             idx: i,
         })
         .collect();

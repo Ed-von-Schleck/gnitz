@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 
 use crate::schema::SchemaDescriptor;
-use crate::storage::{compare_pk_ordering, pk_sort_key, scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
+use crate::storage::{compare_pk_ordering, pack_pk_be, scatter_multi_source, write_to_batch, Batch, Layout, MemBatch};
 
 use super::router::{build_w_map, RouteMode, ScatterKey};
 // The `ReindexPacker`, `scatter_is_pk_routed`, and the rest below are reached
@@ -171,9 +171,9 @@ pub(crate) fn op_repartition_batches_mode(
 }
 
 /// Unified K-way merge-walk skeleton — one body, one comparator, every PK width.
-/// `order_cache[si]` holds each active source's order-preserving `pk_sort_key`
+/// `order_cache[si]` holds each active source's order-preserving `pack_pk_be`
 /// (the leading-≤16 OPK bytes packed big-endian: the whole key for `pk_stride ≤ 16`,
-/// the order-preserving prefix for `> 16`; `pk_sort_key` never panics, unlike
+/// the order-preserving prefix for `> 16`; `pack_pk_be` never panics, unlike
 /// `get_pk`, which debug_asserts `stride ≤ 16`). The winner each step is the source
 /// whose cached key is smallest — the register compare is the common fast path, and
 /// a key tie defers to the canonical `compare_pk_ordering` on the live OPK bytes,
@@ -208,7 +208,7 @@ fn relay_walk_inner<'a, Route>(
             return;
         }
 
-        // Winner = smallest cached `pk_sort_key`, a cache tie settled by the
+        // Winner = smallest cached `pack_pk_be`, a cache tie settled by the
         // comparator below, then by ascending source index.
         let mut best_pos = 0usize;
         let mut best_si = active_sources[0];
@@ -253,7 +253,7 @@ fn relay_walk_inner<'a, Route>(
             num_active -= 1;
             active_sources[best_pos] = active_sources[num_active];
         } else {
-            order_cache[best_si] = pk_sort_key(mb.get_pk_bytes(new_cur));
+            order_cache[best_si] = pack_pk_be(mb.get_pk_bytes(new_cur));
         }
     }
 }
@@ -287,13 +287,13 @@ fn relay_scatter_merge_walk(
     worker_rows[..num_workers].iter_mut().for_each(Vec::clear);
 
     // One order-preserving winner key per active source, valid at every PK width:
-    // `pk_sort_key` packs the leading ≤16 OPK bytes big-endian — the whole key for
+    // `pack_pk_be` packs the leading ≤16 OPK bytes big-endian — the whole key for
     // stride ≤ 16, the order-preserving prefix for > 16. Never panics (unlike
     // `get_pk`, which debug_asserts stride ≤ 16).
     for (si, mb_opt) in mem_batches.iter().enumerate() {
         if let Some(mb) = mb_opt {
             if mb.count > 0 {
-                order_cache[si] = pk_sort_key(mb.get_pk_bytes(0));
+                order_cache[si] = pack_pk_be(mb.get_pk_bytes(0));
                 active_sources[num_active] = si as u8;
                 num_active += 1;
             }
@@ -667,7 +667,7 @@ mod tests {
         // `<` would order (2, 0) before (1, 10), but lexicographic order says
         // (1, 10) < (2, 0). Likewise (1, 5) < (1, 10) < (1, 15) lexicographically.
         let schema = make_narrow_compound_schema();
-        // A 16-byte key: the cached `pk_sort_key` is the whole PK, so the comparator
+        // A 16-byte key: the cached `pack_pk_be` is the whole PK, so the comparator
         // decides on the register compare alone and never runs the byte tiebreak.
         assert!(schema.pk_stride() <= 16, "pk_stride must be 16 (narrow)");
         assert!(schema.pk_indices().len() > 1, "fixture is a compound (multi-column) PK");
@@ -1154,21 +1154,21 @@ mod tests {
 
     #[test]
     fn test_distinct_update_same_pk() {
-        use crate::storage::CursorHandle;
+        use crate::storage::ReadCursor;
         use std::rc::Rc;
 
         let schema = make_schema_u64_i64();
 
         // Trace: (PK=1, val=100, w=+1) — a row inserted in a previous tick.
         let trace_batch = Rc::new(make_batch(&schema, &[(1, 1, 100)]));
-        let mut cursor_handle = CursorHandle::from_owned(&[trace_batch], schema);
+        let mut cursor_handle = ReadCursor::from_owned(&[trace_batch], schema);
 
         // Delta: UPDATE PK=1 sets val=100 → 200.
         // _enforce_unique_pk emits (PK=1, val=100, w=-1) and (PK=1, val=200, w=+1).
         // Both rows have the same PK but different payloads; sorted by payload ascending.
         let delta = make_batch(&schema, &[(1, -1, 100), (1, 1, 200)]);
 
-        let (out, _consolidated) = crate::ops::op_distinct(delta, cursor_handle.cursor_mut(), &schema);
+        let (out, _consolidated) = crate::ops::op_distinct(delta, &mut cursor_handle, &schema);
 
         assert_eq!(
             out.count, 2,
@@ -1613,7 +1613,7 @@ mod tests {
             let reset_cache = |oc: &mut [u128; 256]| {
                 for &s8 in active_sources.iter().take(num_active) {
                     let s = s8 as usize;
-                    oc[s] = pk_sort_key(mem_batches[s].as_ref().unwrap().get_pk_bytes(0));
+                    oc[s] = pack_pk_be(mem_batches[s].as_ref().unwrap().get_pk_bytes(0));
                 }
             };
             let mut wr_a: Vec<Vec<(u8, u32)>> = (0..num_workers).map(|_| Vec::with_capacity(total)).collect();

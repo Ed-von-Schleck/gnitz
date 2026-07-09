@@ -8,7 +8,7 @@ use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::{AggDescriptor, AggOp};
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{is_fixed_int, type_code, SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{CursorHandle, RecoverySource, Table};
+use crate::storage::{ReadCursor, RecoverySource, Table};
 
 mod emit;
 mod load;
@@ -1919,7 +1919,6 @@ mod tests {
 
         let mut nodes_tab = Table::new(
             &format!("{dir}/nodes"),
-            "nodes",
             nodes_schema,
             0,
             256 * 1024,
@@ -1938,7 +1937,6 @@ mod tests {
         }
         let mut edges_tab = Table::new(
             &format!("{dir}/edges"),
-            "edges",
             edges_schema,
             0,
             256 * 1024,
@@ -1948,7 +1946,6 @@ mod tests {
         let _ = &mut edges_tab; // empty
         let mut cols_tab = Table::new(
             &format!("{dir}/cols"),
-            "cols",
             cols_schema,
             0,
             256 * 1024,
@@ -1985,7 +1982,6 @@ mod tests {
 
         let mut nodes_tab = Table::new(
             &format!("{dir}/nodes"),
-            "nodes",
             nodes_schema,
             0,
             256 * 1024,
@@ -2012,7 +2008,6 @@ mod tests {
         }
         let mut edges_tab = Table::new(
             &format!("{dir}/edges"),
-            "edges",
             edges_schema,
             0,
             256 * 1024,
@@ -2031,7 +2026,6 @@ mod tests {
         }
         let mut cols_tab = Table::new(
             &format!("{dir}/cols"),
-            "cols",
             cols_schema,
             0,
             256 * 1024,
@@ -3197,7 +3191,7 @@ mod tests {
     #[test]
     fn test_union_nullability_merge_coalesces_null_garbage() {
         use crate::ops::{op_distinct, op_union};
-        use crate::storage::{compare_rows, compare_rows_fixedint_nonnull, Batch, CursorHandle, Layout};
+        use crate::storage::{compare_rows, compare_rows_fixedint_nonnull, Batch, Layout, ReadCursor};
         use std::cmp::Ordering;
         use std::rc::Rc;
 
@@ -3246,8 +3240,8 @@ mod tests {
         let unioned = op_union(single(g0), Some(&single(g1)), &merged);
         assert_eq!(unioned.count, 2, "Z-Set + keeps both rows before consolidation");
         let empty = Rc::new(Batch::empty(1, 16));
-        let mut ch = CursorHandle::from_owned(std::slice::from_ref(&empty), merged);
-        let (out, _) = op_distinct(unioned, ch.cursor_mut(), &merged);
+        let mut ch = ReadCursor::from_owned(std::slice::from_ref(&empty), merged);
+        let (out, _) = op_distinct(unioned, &mut ch, &merged);
         assert_eq!(out.count, 1, "null-aware comparator coalesces the two NULL rows");
         assert_eq!(out.get_weight(0), 1, "distinct clamps the coalesced weight 2 → 1");
     }

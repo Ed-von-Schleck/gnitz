@@ -10,7 +10,7 @@ pub(crate) const OFF_MAGIC: usize = 0;
 pub(crate) const OFF_VERSION: usize = 8;
 pub(crate) const OFF_ROW_COUNT: usize = 16;
 pub(crate) const OFF_DIR_OFFSET: usize = 24;
-pub(crate) const OFF_TABLE_ID: usize = 32;
+// Bytes [32,40) reserved (zero).
 pub(crate) const OFF_XOR8_OFFSET: usize = 40;
 pub(crate) const OFF_XOR8_SIZE: usize = 48;
 
@@ -25,7 +25,7 @@ pub(crate) const ENCODING_TWO_VALUE: u8 = 0x02;
 pub(crate) const ENCODING_FOR: u8 = 0x03;
 
 /// Byte offset of the one-byte flags field in the shard header.
-/// Bytes 56–63 were previously unused (zero); byte 56 is now the flags byte.
+/// Bytes [57,64) are reserved (zero).
 pub(crate) const OFF_FLAGS: usize = 56;
 
 /// Shard header flag: at most one positive-weight row per PK key in this shard.

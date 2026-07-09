@@ -11,7 +11,7 @@ use super::batch::Batch;
 #[cfg(test)] // only the test-only native-u128 has_pk/retract_pk need opk_key
 use super::columnar;
 use super::error::StorageError;
-use super::read_cursor::{self, CursorHandle};
+use super::read_cursor::{self, ReadCursor};
 use super::shard_reader::MappedShard;
 use super::table::{self, RecoverySource, Table};
 #[cfg(test)]
@@ -47,14 +47,11 @@ pub struct PartitionedTable {
     routing: Routing,
     part_offset: u32,
     schema: SchemaDescriptor,
-    last_found_partition: Option<usize>,
 }
 
 impl PartitionedTable {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dir: &str,
-        name: &str,
         schema: SchemaDescriptor,
         table_id: u32,
         routing: Routing,
@@ -97,7 +94,7 @@ impl PartitionedTable {
         let mut tables = Vec::with_capacity((part_end - part_start) as usize);
         for p in part_start..part_end {
             let part_dir = format!("{dir}/part_{p}");
-            let t = Table::new(&part_dir, name, schema, table_id, arena_size, recovery_source)?;
+            let t = Table::new(&part_dir, schema, table_id, arena_size, recovery_source)?;
             tables.push(t);
         }
 
@@ -106,7 +103,6 @@ impl PartitionedTable {
             routing,
             part_offset: part_start,
             schema,
-            last_found_partition: None,
         })
     }
 
@@ -205,10 +201,7 @@ impl PartitionedTable {
 
     /// Gather every live partition's read sources — memtable `snapshot_runs`,
     /// RAM-tier `in_memory_runs`, and `all_shard_arcs` — into one
-    /// (snapshots, shards) pair for `create_cursor_from_snapshots`. The single
-    /// owner of the per-partition gather shared by `open_cursor` and
-    /// `create_cursor_compacting`; takes `&[Table]` (never compacts), so the
-    /// `&self`/`&mut self` split stays at the call sites.
+    /// (snapshots, shards) pair for `create_read_cursor`.
     fn gather_runs(tables: &[Table]) -> (Vec<Rc<Batch>>, Vec<Rc<MappedShard>>) {
         let mut snapshots: Vec<Rc<Batch>> = Vec::new();
         let mut shards: Vec<Rc<MappedShard>> = Vec::new();
@@ -223,37 +216,24 @@ impl PartitionedTable {
     /// Open a read-only cursor over every partition (memtable runs + shards).
     /// Infallible, non-mutating — the recommended default. See
     /// `Table::open_cursor`.
-    pub fn open_cursor(&self) -> CursorHandle {
+    pub fn open_cursor(&self) -> ReadCursor {
         if self.tables.is_empty() {
-            return read_cursor::create_cursor_from_snapshots(&[], &[], self.schema);
+            return read_cursor::create_read_cursor(&[], &[], self.schema);
         }
         if self.is_replicated() {
             return self.tables[0].open_cursor();
         }
         let (snaps, shards) = Self::gather_runs(&self.tables);
-        read_cursor::create_cursor_from_snapshots(&snaps, &shards, self.schema)
+        read_cursor::create_read_cursor(&snaps, &shards, self.schema)
     }
 
-    /// Open a cursor after running `compact_if_needed` on each partition.
-    /// Maintenance-only — see `Table::create_cursor_compacting` for the
-    /// validator hazard this name surfaces. The lint guards external callers,
-    /// not this delegation.
-    #[allow(clippy::disallowed_methods)]
-    pub fn create_cursor_compacting(&mut self) -> Result<CursorHandle, StorageError> {
-        if self.tables.is_empty() {
-            return Ok(read_cursor::create_cursor_from_snapshots(&[], &[], self.schema));
-        }
-
-        if self.is_replicated() {
-            return self.tables[0].create_cursor_compacting();
-        }
-
+    /// Run `compact_if_needed` on every partition. Maintenance-only; readers
+    /// that want an up-to-date L1 call this before `open_cursor`.
+    pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         for table in &mut self.tables {
             table.compact_if_needed()?;
         }
-
-        let (snaps, shards) = Self::gather_runs(&self.tables);
-        Ok(read_cursor::create_cursor_from_snapshots(&snaps, &shards, self.schema))
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -273,7 +253,7 @@ impl PartitionedTable {
     }
 
     #[cfg(test)] // no production caller after the §4 DML/UPSERT byte-path fixes
-    pub fn retract_pk(&mut self, key: u128) -> (i64, bool) {
+    pub fn retract_pk(&mut self, key: u128) -> (i64, Option<table::RowRef>) {
         let (opk, n) = columnar::opk_key(&self.schema, &key.to_le_bytes());
         self.retract_pk_bytes(&opk[..n])
     }
@@ -292,51 +272,32 @@ impl PartitionedTable {
         }
     }
 
-    /// Byte-keyed sibling of [`retract_pk`] for wide PKs.
-    pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, bool) {
-        self.last_found_partition = None;
+    /// Byte-keyed sibling of [`retract_pk`] for wide PKs. Returns the net
+    /// weight and, when positive, the live stored row as an owned `RowRef`.
+    pub fn retract_pk_bytes(&mut self, key: &[u8]) -> (i64, Option<table::RowRef>) {
         if self.tables.is_empty() {
-            return (0, false);
+            return (0, None);
         }
         let local = if self.is_replicated() {
             0
         } else {
             match self.local_index_bytes(key) {
                 Some(l) => l,
-                None => return (0, false),
+                None => return (0, None),
             }
         };
-        let (w, found) = self.tables[local].retract_pk_bytes(key);
-        if found {
-            self.last_found_partition = Some(local);
-        }
-        (w, found)
-    }
-
-    // ------------------------------------------------------------------
-    // Found-row accessor
-    // ------------------------------------------------------------------
-
-    /// The row most recently located by `retract_pk*`, as a `ColumnarSource`
-    /// view, or `None` when the last probe missed (no partition armed). Routes
-    /// to the found row of the partition that held the hit.
-    pub(crate) fn found_row(&self) -> Option<table::FoundRow<'_>> {
-        self.last_found_partition
-            .and_then(|local| self.tables[local].found_row())
+        self.tables[local].retract_pk_bytes(key)
     }
 
     // ------------------------------------------------------------------
     // Broadcast operations
     // ------------------------------------------------------------------
 
-    pub fn flush(&mut self) -> Result<bool, StorageError> {
-        let mut any_wrote = false;
+    pub fn flush(&mut self) -> Result<(), StorageError> {
         for table in &mut self.tables {
-            if table.flush()? {
-                any_wrote = true;
-            }
+            table.flush()?;
         }
-        Ok(any_wrote)
+        Ok(())
     }
 
     /// Mutable access to every partition's `Table`. The checkpoint flush rounds
@@ -348,7 +309,7 @@ impl PartitionedTable {
     }
 
     pub fn current_lsn(&self) -> u64 {
-        self.tables.iter().map(|t| t.current_lsn).max().unwrap_or(0)
+        self.tables.iter().map(|t| t.current_lsn()).max().unwrap_or(0)
     }
 
     /// Recovery watermark: the **min** `current_lsn` across partitions, 0 when
@@ -359,7 +320,7 @@ impl PartitionedTable {
     /// SAL zones whose rows the lagging partition never flushed. Under-dedupe
     /// (re-replaying already-flushed zones) is safe: replay is idempotent.
     pub fn min_flushed_lsn(&self) -> u64 {
-        self.tables.iter().map(|t| t.current_lsn).min().unwrap_or(0)
+        self.tables.iter().map(|t| t.current_lsn()).min().unwrap_or(0)
     }
 
     // ------------------------------------------------------------------
@@ -367,9 +328,6 @@ impl PartitionedTable {
     // ------------------------------------------------------------------
 
     pub fn close_partitions_outside(&mut self, start: u32, end: u32) {
-        // The cached index refers to the old `tables` layout; rebuilding the
-        // vector below would leave it dangling.
-        self.last_found_partition = None;
         assert!(start <= end, "close_partitions_outside: start ({start}) > end ({end})",);
         assert!(
             start >= self.part_offset,
@@ -391,13 +349,8 @@ impl PartitionedTable {
     }
 
     pub fn close_all_partitions(&mut self) {
-        self.last_found_partition = None;
         self.tables.clear();
         self.part_offset = 0;
-    }
-
-    pub fn close(&mut self) {
-        self.tables.clear();
     }
 
     // ------------------------------------------------------------------
@@ -426,12 +379,6 @@ impl PartitionedTable {
     /// prefix-twins coexist in one partition, distinguished by their full PK.
     fn local_index_bytes(&self, key: &[u8]) -> Option<usize> {
         self.local_slot(self.schema.partition_for_pk(key))
-    }
-}
-
-impl Drop for PartitionedTable {
-    fn drop(&mut self) {
-        self.close();
     }
 }
 
@@ -505,19 +452,8 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
     let path = tdir.to_str().unwrap().to_owned();
 
     // Two live partitions (0 and 1) of a 256-way durable table.
-    let open = || {
-        PartitionedTable::new(
-            &path,
-            "test",
-            schema(),
-            830,
-            Routing::Hashed,
-            RecoverySource::SalReplay,
-            0,
-            2,
-        )
-        .unwrap()
-    };
+    let open =
+        || PartitionedTable::new(&path, schema(), 830, Routing::Hashed, RecoverySource::SalReplay, 0, 2).unwrap();
     let mut pt = open();
 
     // PKs that route to live partitions 0 and 1 (narrow PK ⇒ partition_for_key
@@ -543,8 +479,8 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
     }
     pt.ingest_owned_batch(row(p1[0], 0)).unwrap();
 
-    let lsn_a = pt.tables[0].current_lsn;
-    let lsn_b = pt.tables[1].current_lsn;
+    let lsn_a = pt.tables[0].current_lsn();
+    let lsn_b = pt.tables[1].current_lsn();
     assert!(
         lsn_a > lsn_b,
         "partition A must lead before the partial flush ({lsn_a} vs {lsn_b})"
@@ -552,13 +488,13 @@ pub(crate) fn partial_flush_lsn_fixture() -> PartialFlushLsn {
 
     // Partial family flush: only partition A commits a durable shard; B's rows
     // stay in its memtable.
-    assert!(pt.tables[0].flush().unwrap(), "partition A flush must write a shard");
+    pt.tables[0].flush().unwrap();
     drop(pt);
 
     // Next boot: reopen both partitions from disk.
     let pt = open();
-    let a_reloaded = pt.tables[0].current_lsn;
-    let b_reloaded = pt.tables[1].current_lsn;
+    let a_reloaded = pt.tables[0].current_lsn();
+    let b_reloaded = pt.tables[1].current_lsn();
 
     // A's flushed shard stamps lsn_max = current_lsn-1; reopen restores +1.
     // B never flushed, so it reopens at the floor, below A.
@@ -621,7 +557,6 @@ mod tests {
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             100,
             Routing::Replicated,
@@ -648,7 +583,6 @@ mod tests {
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             200,
             Routing::Hashed,
@@ -675,7 +609,6 @@ mod tests {
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             300,
             Routing::Hashed,
@@ -689,8 +622,8 @@ mod tests {
             .unwrap();
 
         let cursor = pt.open_cursor();
-        assert!(cursor.cursor.valid);
-        assert_eq!(cursor.cursor.current_key_narrow() as u64, 10);
+        assert!(cursor.valid);
+        assert_eq!(cursor.current_key_narrow() as u64, 10);
     }
 
     #[test]
@@ -701,7 +634,6 @@ mod tests {
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             400,
             Routing::Hashed,
@@ -716,11 +648,10 @@ mod tests {
 
         let (w, found) = pt.retract_pk(10);
         assert_eq!(w, 1);
-        assert!(found);
-        assert!(pt.found_row().is_some());
+        assert!(found.is_some());
 
         let (_, found) = pt.retract_pk(99);
-        assert!(!found);
+        assert!(found.is_none());
     }
 
     /// §4.4 regression: a `CLUSTER BY prefix` table with a compound PK. Two rows
@@ -751,7 +682,6 @@ mod tests {
         // All 256 partitions live so any prefix-routed partition exists locally.
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             900,
             Routing::Hashed,
@@ -808,23 +738,24 @@ mod tests {
         // payload — not the other twin's. Under the §4.4 bug (probe not sliced to
         // the prefix) it would route by the full key to a different partition and
         // miss the row entirely.
-        let read_found_val = |pt: &PartitionedTable| {
-            let fr = pt.found_row().expect("found-row payload available");
-            i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(&fr, 0, 0, 8).try_into().unwrap())
+        let read_found_val = |fr: &table::RowRef| {
+            i64::from_le_bytes(columnar::ColumnarSource::get_col_ptr(fr, 0, 0, 8).try_into().unwrap())
         };
         let (wa, fa) = pt.retract_pk_bytes(&twin_a);
-        assert_eq!((wa, fa), (1, true), "twin A found in its prefix-partition");
-        assert_eq!(read_found_val(&pt), 100, "found the correct twin (A), not B");
+        assert_eq!(wa, 1, "twin A found in its prefix-partition");
+        let fa = fa.expect("found-row payload available");
+        assert_eq!(read_found_val(&fa), 100, "found the correct twin (A), not B");
 
         let (wb, fb) = pt.retract_pk_bytes(&twin_b);
-        assert_eq!((wb, fb), (1, true), "twin B found in the same prefix-partition");
-        assert_eq!(read_found_val(&pt), 200, "twin B's payload is distinct from A's");
+        assert_eq!(wb, 1, "twin B found in the same prefix-partition");
+        let fb = fb.expect("found-row payload available");
+        assert_eq!(read_found_val(&fb), 200, "twin B's payload is distinct from A's");
 
         // An absent suffix routing to the same populated prefix-partition is not
         // found — confirms the in-partition match keys on the full PK.
         let (_, found_absent) = pt.retract_pk_bytes(&pk_bytes(c0, 999));
         assert!(
-            !found_absent,
+            found_absent.is_none(),
             "absent suffix in a populated prefix-partition is not found"
         );
     }
@@ -894,7 +825,6 @@ mod tests {
         // wide *routing* loop end-to-end with no downstream Table ingest.
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             700,
             Routing::Hashed,
@@ -941,7 +871,6 @@ mod tests {
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             500,
             Routing::Hashed,
@@ -955,43 +884,6 @@ mod tests {
         pt.close_partitions_outside(100, 110);
         assert_eq!(pt.tables.len(), 10);
         assert_eq!(pt.part_offset, 100);
-    }
-
-    /// A stale `last_found_partition` (set by a prior `retract_pk` hit) must be
-    /// invalidated when `close_partitions_outside` rebuilds the `tables` vector,
-    /// or `found_row()` would index into the now-smaller vector.
-    #[test]
-    fn close_partitions_outside_invalidates_found_partition() {
-        raise_fd_limit_for_tests();
-        let dir = tempfile::tempdir().unwrap();
-        let tdir = dir.path().join("cpo_stale_test");
-        let schema = make_schema();
-        let mut pt = PartitionedTable::new(
-            tdir.to_str().unwrap(),
-            "test",
-            schema,
-            600,
-            Routing::Hashed,
-            RecoverySource::Rederive,
-            0,
-            256,
-        )
-        .unwrap();
-
-        // Pick a PK whose partition we can exclude from the surviving range.
-        let pk = 12345u128;
-        let part = partition_for_key(pk) as u32;
-        pt.ingest_owned_batch(make_batch(&[(pk as u64, 1, 999)])).unwrap();
-
-        let (_, found) = pt.retract_pk(pk);
-        assert!(found, "row must be found, setting last_found_partition");
-
-        // Close every partition except a small range that excludes `part`.
-        let (start, end) = if part >= 200 { (0u32, 10u32) } else { (200u32, 210u32) };
-        pt.close_partitions_outside(start, end);
-
-        // Must not panic and must report the cleared-found state (no found row).
-        assert!(pt.found_row().is_none());
     }
 
     // ── In-memory ephemeral flush across partitions ──────────────────────
@@ -1021,7 +913,7 @@ mod tests {
         let mut works = Vec::new();
         for (i, t) in pt.partitions_mut().iter_mut().enumerate() {
             match t.flush_prepare().unwrap() {
-                FlushOutcome::Empty | FlushOutcome::DoneInline => {}
+                FlushOutcome::Done => {}
                 FlushOutcome::Pending(w) => works.push((i, w)),
             }
         }
@@ -1040,7 +932,6 @@ mod tests {
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             800,
             Routing::Hashed,
@@ -1080,7 +971,6 @@ mod tests {
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             810,
             Routing::Hashed,
@@ -1105,19 +995,17 @@ mod tests {
         }
     }
 
-    /// `create_cursor_compacting` (the operator-state / `ScanTrace` read path)
-    /// must surface each partition's `in_memory_l0`, not just `open_cursor`.
+    /// The compact-then-open read path (operator-state / `ScanTrace`) must
+    /// surface each partition's `in_memory_l0`, not just `open_cursor`.
     /// Fails pre-fix (multi-partition branch dropped `in_memory_runs`).
     #[test]
-    #[allow(clippy::disallowed_methods)] // the test's whole point is this read path
-    fn create_cursor_compacting_gathers_in_memory_runs() {
+    fn compacted_open_cursor_gathers_in_memory_runs() {
         raise_fd_limit_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let tdir = dir.path().join("pt_ccc_inmem");
         let schema = make_schema();
         let mut pt = PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             820,
             Routing::Hashed,
@@ -1133,14 +1021,15 @@ mod tests {
         // Flush all partitions into in_memory_l0; memtables now empty.
         assert!(prepare_all(&mut pt).is_empty());
 
-        let batch = pt.create_cursor_compacting().unwrap().cursor.materialize();
+        pt.compact_if_needed().unwrap();
+        let batch = pt.open_cursor().materialize();
         let mut seen = std::collections::HashSet::new();
         for i in 0..batch.count {
             assert_eq!(batch.get_weight(i), 1);
             seen.insert(batch.get_pk(i) as u64);
         }
         for &(pk, _, _) in &rows {
-            assert!(seen.contains(&pk), "pk {pk} missing from create_cursor_compacting");
+            assert!(seen.contains(&pk), "pk {pk} missing from the compacted cursor");
         }
         assert_eq!(seen.len(), rows.len(), "all rows surfaced via compacting cursor");
     }
@@ -1202,7 +1091,6 @@ mod tests {
     fn durable_hashed(dir: &std::path::Path, name: &str, table_id: u32) -> PartitionedTable {
         PartitionedTable::new(
             dir.join(name).to_str().unwrap(),
-            "test",
             make_schema(),
             table_id,
             Routing::Hashed,

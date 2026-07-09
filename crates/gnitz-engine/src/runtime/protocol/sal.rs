@@ -719,12 +719,11 @@ fn write_scattered_data_block(
 
     // Write WAL header (zeroed first; checksum filled in after scatter).
     data_slot[..gnitz_wire::WAL_HEADER_SIZE].fill(0);
-    write_u32_le(data_slot, 8, table_id);
-    write_u32_le(data_slot, 12, count as u32);
-    write_u32_le(data_slot, 16, total_size as u32);
-    write_u32_le(data_slot, 20, gnitz_wire::WAL_FORMAT_VERSION);
-    write_u32_le(data_slot, 32, num_regions as u32);
-    // LSN=0, BLOB_SIZE=0 already zeroed.
+    write_u32_le(data_slot, gnitz_wire::WAL_OFF_TID, table_id);
+    write_u32_le(data_slot, gnitz_wire::WAL_OFF_COUNT, count as u32);
+    write_u32_le(data_slot, gnitz_wire::WAL_OFF_SIZE, total_size as u32);
+    write_u32_le(data_slot, gnitz_wire::WAL_OFF_VERSION, gnitz_wire::WAL_FORMAT_VERSION);
+    write_u32_le(data_slot, gnitz_wire::WAL_OFF_NUM_REGIONS, num_regions as u32);
 
     // Write directory. All strides % 8 == 0 (schema_wire_safe), so no align8 padding.
     let mut pos = header_dir_size;
@@ -764,7 +763,7 @@ fn write_scattered_data_block(
 
     // Compute and write the XXH3 checksum over the body (same as wal::encode).
     let cs = xxh::checksum(&data_slot[gnitz_wire::WAL_HEADER_SIZE..total_size]);
-    data_slot[24..32].copy_from_slice(&cs.to_le_bytes());
+    data_slot[gnitz_wire::WAL_OFF_CHECKSUM..gnitz_wire::WAL_OFF_CHECKSUM + 8].copy_from_slice(&cs.to_le_bytes());
 }
 
 // ---------------------------------------------------------------------------

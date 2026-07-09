@@ -53,8 +53,6 @@ pub(in crate::storage) const FIXED_REGION_BYTES: usize = FIXED_REGION_STRIDE as 
 pub(crate) enum WeightFill {
     /// Copy per-row weights verbatim from `src`.
     Copy,
-    /// Broadcast one constant weight into every copied row.
-    Const(i64),
     /// Write `-src` weight per row.
     Negate,
 }
@@ -369,82 +367,6 @@ impl Batch {
             count: 0,
             layout: Layout::Raw,
             schema: Some(schema),
-            blob_id: next_blob_id(),
-        }
-    }
-
-    /// Construct by copying data in from region pointers.
-    ///
-    /// Region layout: pk (16 bytes/row), weight, null_bmp,
-    /// payload_col_0 .. payload_col_{N-1}, blob.
-    ///
-    /// # Safety
-    /// `ptrs[i]` must point to at least `sizes[i]` readable bytes.
-    #[allow(clippy::uninit_vec)]
-    pub unsafe fn from_regions(ptrs: &[*const u8], sizes: &[u32], count: usize, num_payload_cols: usize) -> Self {
-        if count == 0 {
-            return Self::empty(num_payload_cols, 16);
-        }
-
-        let nr = REG_PAYLOAD_START + num_payload_cols;
-        // Derive strides from sizes / count.
-        let mut strides = [0u8; MAX_BATCH_REGIONS];
-        for i in 0..nr {
-            assert_eq!(
-                sizes[i] as usize % count,
-                0,
-                "from_regions: region {i} size ({}) is not a multiple of row count ({count})",
-                sizes[i],
-            );
-            let stride = sizes[i] as usize / count;
-            assert!(
-                stride <= u8::MAX as usize,
-                "from_regions: region {i} stride ({stride}) exceeds u8::MAX",
-            );
-            strides[i] = stride as u8;
-        }
-        let (offsets, total_size) = compute_offsets(&strides, nr, count);
-
-        let mut data = super::batch_pool::acquire_buf();
-        data.clear();
-        data.resize(total_size, 0);
-
-        // Copy each region into the contiguous buffer.
-        for i in 0..nr {
-            let sz = sizes[i] as usize;
-            if sz > 0 && !ptrs[i].is_null() {
-                let off = offsets[i];
-                std::ptr::copy_nonoverlapping(ptrs[i], data.as_mut_ptr().add(off), sz);
-            }
-        }
-
-        // Blob is separate — try pool first.
-        let blob_idx = REG_PAYLOAD_START + num_payload_cols;
-        let blob_sz = sizes[blob_idx] as usize;
-        let blob = if blob_sz > 0 && !ptrs[blob_idx].is_null() {
-            // SAFETY: copy_nonoverlapping below writes all blob_sz bytes.
-            let mut v = super::batch_pool::acquire_buf();
-            v.clear();
-            v.reserve(blob_sz);
-            unsafe {
-                v.set_len(blob_sz);
-            }
-            std::ptr::copy_nonoverlapping(ptrs[blob_idx], v.as_mut_ptr(), blob_sz);
-            v
-        } else {
-            Vec::new()
-        };
-
-        Batch {
-            data,
-            blob,
-            offsets,
-            strides,
-            num_regions: nr as u8,
-            capacity: count as u32,
-            count,
-            layout: Layout::Raw,
-            schema: None,
             blob_id: next_blob_id(),
         }
     }
@@ -901,14 +823,6 @@ impl Batch {
         match fill {
             WeightFill::Copy => {
                 self.bulk_copy_region(REG_WEIGHT, src.weight(), start, end);
-            }
-            WeightFill::Const(w) => {
-                let dst_off = self.offsets[REG_WEIGHT] + self.count * 8;
-                let w_bytes = w.to_le_bytes();
-                let dest = &mut self.data[dst_off..dst_off + n * 8];
-                for chunk in dest.chunks_exact_mut(8) {
-                    chunk.copy_from_slice(&w_bytes);
-                }
             }
             WeightFill::Negate => {
                 let dst_off = self.offsets[REG_WEIGHT] + self.count * 8;
@@ -2437,7 +2351,6 @@ mod tests {
         );
         let mut pt = crate::storage::PartitionedTable::new(
             tdir.to_str().unwrap(),
-            "test",
             schema,
             100,
             crate::storage::Routing::Replicated,
@@ -2457,11 +2370,10 @@ mod tests {
         src.count += 1;
         pt.ingest_owned_batch(src).unwrap();
 
-        // retract_pk arms `last_found_partition`; found_row() exposes the stored
-        // row as a ColumnarSource that append_row_from_source_bytes copies in.
+        // retract_pk returns the stored row as an owned ColumnarSource that
+        // append_row_from_source_bytes copies in.
         let (_w, found) = pt.retract_pk(pk_val as u128);
-        assert!(found);
-        let found_row = pt.found_row().expect("retract_pk armed the found row");
+        let found_row = found.expect("retract_pk located the stored row");
 
         let mut dst = Batch::with_schema(schema, 1);
         // PK region is OPK (big-endian) at rest; the lookup key must match.

@@ -29,7 +29,7 @@ const NODECOL_COL_VALUE2: usize = cidx(gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS, "v
 /// Open a cursor for a system table. Returns None if the table handle is null.
 /// Positioning is done by the caller via `seek_first_positive_with_prefix` on
 /// the `view_id` prefix (the circuit tables use a compound `(view_id, sub)` PK).
-fn open_system_cursor(table: *mut Table) -> Option<CursorHandle> {
+fn open_system_cursor(table: *mut Table) -> Option<ReadCursor> {
     if table.is_null() {
         return None;
     }
@@ -52,13 +52,13 @@ pub(crate) fn load_circuit(
     {
         let prefix = view_id.to_be_bytes();
         let mut ch = open_system_cursor(sys_node_cols)?;
-        let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
+        let mut hit = ch.seek_first_positive_with_prefix(&prefix);
         while hit {
-            let node_id = ch.cursor.read_i64(NODECOL_COL_NODE_ID) as i32;
-            let kind = ch.cursor.read_i64(NODECOL_COL_KIND) as u64;
-            let position = ch.cursor.read_i64(NODECOL_COL_POSITION) as u16;
-            let v1 = ch.cursor.read_i64(NODECOL_COL_VALUE1) as u64;
-            let v2 = ch.cursor.read_i64(NODECOL_COL_VALUE2) as u64;
+            let node_id = ch.read_i64(NODECOL_COL_NODE_ID) as i32;
+            let kind = ch.read_i64(NODECOL_COL_KIND) as u64;
+            let position = ch.read_i64(NODECOL_COL_POSITION) as u16;
+            let v1 = ch.read_i64(NODECOL_COL_VALUE1) as u64;
+            let v2 = ch.read_i64(NODECOL_COL_VALUE2) as u64;
             cols_by_node
                 .entry(node_id)
                 .or_default()
@@ -68,8 +68,8 @@ pub(crate) fn load_circuit(
                     value1: v1,
                     value2: v2,
                 });
-            ch.cursor.advance();
-            hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
+            ch.advance();
+            hit = ch.walk_to_positive_with_prefix(&prefix);
         }
     }
     // Sort each node's cols by (kind, position) so decode_op_node sees ordered slices.
@@ -81,20 +81,20 @@ pub(crate) fn load_circuit(
     {
         let prefix = view_id.to_be_bytes();
         let mut ch = open_system_cursor(sys_nodes)?;
-        let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
+        let mut hit = ch.seek_first_positive_with_prefix(&prefix);
         while hit {
-            let node_id = ch.cursor.read_i64(NODES_COL_NODE_ID) as i32;
-            let opcode = ch.cursor.read_i64(NODES_COL_OPCODE_NEW) as u64;
+            let node_id = ch.read_i64(NODES_COL_NODE_ID) as i32;
+            let opcode = ch.read_i64(NODES_COL_OPCODE_NEW) as u64;
 
-            let src_tab: Option<u64> = if ch.cursor.col_is_null(NODES_COL_SOURCE_TABLE) {
+            let src_tab: Option<u64> = if ch.col_is_null(NODES_COL_SOURCE_TABLE) {
                 None
             } else {
-                Some(ch.cursor.read_i64(NODES_COL_SOURCE_TABLE) as u64)
+                Some(ch.read_i64(NODES_COL_SOURCE_TABLE) as u64)
             };
-            let expr_blob: Option<Vec<u8>> = if ch.cursor.col_is_null(NODES_COL_EXPR_PROGRAM) {
+            let expr_blob: Option<Vec<u8>> = if ch.col_is_null(NODES_COL_EXPR_PROGRAM) {
                 None
             } else {
-                let b = ch.cursor.read_german_bytes(NODES_COL_EXPR_PROGRAM);
+                let b = ch.read_german_bytes(NODES_COL_EXPR_PROGRAM);
                 if b.is_empty() {
                     None
                 } else {
@@ -108,8 +108,8 @@ pub(crate) fn load_circuit(
             // an invalid topological order or silent output corruption.
             let op = gnitz_wire::decode_op_node(opcode, src_tab, expr_blob, cols).ok()?;
             nodes.insert(node_id, op);
-            ch.cursor.advance();
-            hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
+            ch.advance();
+            hit = ch.walk_to_positive_with_prefix(&prefix);
         }
     }
 
@@ -117,14 +117,14 @@ pub(crate) fn load_circuit(
     {
         let prefix = view_id.to_be_bytes();
         let mut ch = open_system_cursor(sys_edges)?;
-        let mut hit = ch.cursor.seek_first_positive_with_prefix(&prefix);
+        let mut hit = ch.seek_first_positive_with_prefix(&prefix);
         while hit {
-            let dst = ch.cursor.read_i64(EDGES_COL_DST_NODE) as i32;
-            let port = ch.cursor.read_i64(EDGES_COL_DST_PORT) as i32;
-            let src = ch.cursor.read_i64(EDGES_COL_SRC_NODE) as i32;
+            let dst = ch.read_i64(EDGES_COL_DST_NODE) as i32;
+            let port = ch.read_i64(EDGES_COL_DST_PORT) as i32;
+            let src = ch.read_i64(EDGES_COL_SRC_NODE) as i32;
             edges.push((src, dst, port));
-            ch.cursor.advance();
-            hit = ch.cursor.walk_to_positive_with_prefix(&prefix);
+            ch.advance();
+            hit = ch.walk_to_positive_with_prefix(&prefix);
         }
     }
 

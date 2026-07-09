@@ -229,7 +229,7 @@ pub(crate) fn cogroup_union(
 mod tests {
     use super::*;
     use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-    use crate::storage::{Batch, CursorHandle, Layout};
+    use crate::storage::{Batch, Layout, ReadCursor};
     use std::rc::Rc;
 
     fn schema() -> SchemaDescriptor {
@@ -386,8 +386,8 @@ mod tests {
             assert_eq!(got_bc, want, "BatchCursor delta={di:?} match={mi:?}");
 
             // M = ReadCursor (single source)
-            let mut ch = CursorHandle::from_owned(std::slice::from_ref(&mb), s);
-            let got_rc = strip(&run_intersection(&delta, ch.cursor_mut(), step_rc));
+            let mut ch = ReadCursor::from_owned(std::slice::from_ref(&mb), s);
+            let got_rc = strip(&run_intersection(&delta, &mut ch, step_rc));
             assert_eq!(got_rc, want, "ReadCursor delta={di:?} match={mi:?}");
         }
     }
@@ -415,8 +415,8 @@ mod tests {
             let got_bc = strip(&run_left(&delta, &mut bc, step_bc));
             assert_eq!(got_bc, want, "BatchCursor delta={di:?} match={mi:?}");
 
-            let mut ch = CursorHandle::from_owned(std::slice::from_ref(&mb), s);
-            let got_rc = strip(&run_left(&delta, ch.cursor_mut(), step_rc));
+            let mut ch = ReadCursor::from_owned(std::slice::from_ref(&mb), s);
+            let got_rc = strip(&run_left(&delta, &mut ch, step_rc));
             assert_eq!(got_rc, want, "ReadCursor delta={di:?} match={mi:?}");
         }
     }
@@ -437,8 +437,8 @@ mod tests {
         let live = make_batch(&[(1, 1, 10), (5, 1, 50)]);
         let want = strip(&naive_intersection(&delta, &live));
 
-        let mut ch = CursorHandle::from_owned(&[Rc::clone(&src_a), Rc::clone(&src_b)], s);
-        let got = strip(&run_intersection(&delta, ch.cursor_mut(), step_rc));
+        let mut ch = ReadCursor::from_owned(&[Rc::clone(&src_a), Rc::clone(&src_b)], s);
+        let got = strip(&run_intersection(&delta, &mut ch, step_rc));
         assert_eq!(got, want, "ghost group pk=3 must be skipped");
     }
 
@@ -453,15 +453,12 @@ mod tests {
         let delta = make_batch(&[(1, 1, 1), (3, 1, 3), (5, 1, 5)]);
         let want = strip(&naive_intersection(&delta, &mb));
 
-        let mut ch = CursorHandle::from_owned(std::slice::from_ref(&mb), s);
+        let mut ch = ReadCursor::from_owned(std::slice::from_ref(&mb), s);
         // Stale-advance the cursor past several keys before co-grouping.
-        ch.cursor_mut().advance_to(&(4u128).to_be_bytes()[8..]);
-        assert!(
-            ch.cursor_mut().valid && ch.cursor_mut().current_key_narrow() == 4,
-            "precondition: stale at pk=4"
-        );
+        ch.advance_to(&(4u128).to_be_bytes()[8..]);
+        assert!(ch.valid && ch.current_key_narrow() == 4, "precondition: stale at pk=4");
 
-        let got = strip(&run_intersection(&delta, ch.cursor_mut(), step_rc));
+        let got = strip(&run_intersection(&delta, &mut ch, step_rc));
         assert_eq!(got, want, "stale cursor must be reset by self-positioning");
     }
 

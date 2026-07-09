@@ -6,83 +6,17 @@
 //! live here, so both sub-modules read the (otherwise private) fields directly.
 
 use std::cell::OnceCell;
-use std::ffi::CStr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::ptr;
 
 use xorf::Xor8;
 
-use super::error::StorageError;
-use super::layout::*;
 use super::shard_file::DecodedRegion;
 #[cfg(test)]
 use crate::foundation::codec::{read_i64_le, read_u64_le, write_u64_le};
-use crate::foundation::posix_io;
 
 mod access;
 mod open;
 
-/// RAII handle for an mmap'd file region. Shared with the LSM siblings
-/// (`spill` maps its external-sort file through it), so the unmap path lives
-/// in exactly one place — neither `MappedShard::open`'s error returns nor
-/// `MappedShard::Drop` need to repeat the `munmap` call.
-pub(super) struct Mmap {
-    ptr: *mut u8,
-    len: usize,
-}
-
-impl Mmap {
-    /// mmap `[0, len)` of `fd` read-only with a sequential-access hint.
-    /// `len` must be `> 0`. The mapping holds its own reference to the inode,
-    /// so the caller may close `fd` immediately after.
-    pub(super) fn from_fd(fd: i32, len: usize) -> std::io::Result<Self> {
-        debug_assert!(len > 0);
-        let raw = unsafe { libc::mmap(ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
-        if raw == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error());
-        }
-        let ptr = raw as *mut u8;
-        posix_io::madvise_sequential(ptr, len);
-        Ok(Mmap { ptr, len })
-    }
-
-    /// Open `path` read-only, mmap the whole file, and apply huge-page +
-    /// sequential madvise hints.  Returns `Truncated` for a file shorter than
-    /// `HEADER_SIZE` (the minimum a shard header occupies).
-    fn open(path: &CStr) -> Result<Self, StorageError> {
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
-        if fd < 0 {
-            return Err(StorageError::Io);
-        }
-        // SAFETY: fresh descriptor from `open`; the `OwnedFd` is the sole
-        // closer, so every return below closes it (the mapping outlives the fd).
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } < 0 {
-            return Err(StorageError::Io);
-        }
-        let len = st.st_size as usize;
-        if len < HEADER_SIZE {
-            return Err(StorageError::Truncated);
-        }
-        let map = Self::from_fd(fd.as_raw_fd(), len).map_err(|_| StorageError::Io)?;
-        posix_io::madvise_hugepage(map.ptr, map.len);
-        Ok(map)
-    }
-
-    #[inline]
-    pub(super) fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-}
-
-impl Drop for Mmap {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, self.len);
-        }
-    }
-}
+pub(super) use crate::foundation::posix_io::Mmap;
 
 // ---------------------------------------------------------------------------
 // ScalarRegion / WeightRegion — self-describing region accessors
@@ -164,9 +98,6 @@ pub struct MappedShard {
     col_to_payload: Vec<usize>,
     /// XOR8 membership filter (loaded from embedded header data).
     xor8_filter: Option<Xor8>,
-    /// True if weight region is Raw (may contain zero-weight ghosts).
-    /// False for Constant/TwoValue (non-zero weights guaranteed).
-    pub(crate) has_ghosts: bool,
     /// Physical byte width of each PK value on disk (8 for U64, 16 for U128/String).
     pub(crate) pk_stride: u8,
     /// True when `SHARD_FLAG_PK_UNIQUE` is set: this shard contains at most one
@@ -181,6 +112,8 @@ pub struct MappedShard {
 #[cfg(test)]
 mod tests {
     use super::super::batch::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+    use super::super::error::StorageError;
+    use super::super::layout::*;
     use super::super::shard_file::{region_dir, ShardWriteOpts};
     use super::*;
     use crate::foundation::posix_io::raise_fd_limit_for_tests;
@@ -223,7 +156,6 @@ mod tests {
         super::super::shard_file::write_shard_streaming(
             libc::AT_FDCWD,
             &cpath,
-            0,
             count,
             &regions,
             &test_schema(),
@@ -260,7 +192,6 @@ mod tests {
         assert_eq!(shard.get_pk(0), 1);
         assert_eq!(shard.get_pk(9), 10);
         assert_eq!(shard.get_weight(0), 1);
-        assert!(!shard.has_ghosts);
     }
 
     #[test]
@@ -363,7 +294,6 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, n as usize);
-        assert!(!shard.has_ghosts);
         for i in 0..n as usize {
             assert_eq!(shard.get_weight(i), 1);
         }
@@ -389,8 +319,6 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, n);
-        // TwoValue weight -> has_ghosts = false (neither value is 0)
-        assert!(!shard.has_ghosts);
         for i in 0..n {
             let expected = if i % 2 == 0 { 1i64 } else { -1i64 };
             assert_eq!(shard.get_weight(i), expected, "row {i}");
@@ -409,7 +337,6 @@ mod tests {
         let cpath = std::ffi::CString::new(path).unwrap();
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
-        assert!(!shard.has_ghosts); // Raw encoding but no zero weights → no ghosts
         assert_eq!(shard.get_weight(0), 1);
         assert_eq!(shard.get_weight(1), -1);
         assert_eq!(shard.get_weight(2), 2);
@@ -599,7 +526,6 @@ mod tests {
 
         let shard = MappedShard::open(&cpath, &schema, true).unwrap();
         assert_eq!(shard.count, 1);
-        assert!(!shard.has_ghosts);
         assert_eq!(shard.get_pk(0), 42);
         assert_eq!(shard.get_weight(0), 1);
         assert_eq!(shard.get_null_word(0), 0);
@@ -783,7 +709,6 @@ mod tests {
         super::super::shard_file::write_shard_streaming(
             libc::AT_FDCWD,
             &cpath,
-            0,
             count,
             &regions,
             &u128_pk_schema(),
@@ -937,7 +862,6 @@ mod tests {
         super::super::shard_file::write_shard_streaming(
             libc::AT_FDCWD,
             &cpath,
-            0,
             count,
             &regions,
             &schema,
@@ -1013,7 +937,6 @@ mod tests {
         super::super::shard_file::write_shard_streaming(
             libc::AT_FDCWD,
             &cpath,
-            0,
             count,
             &regions,
             &schema,
@@ -1249,7 +1172,6 @@ mod tests {
             super::super::shard_file::write_shard_streaming(
                 libc::AT_FDCWD,
                 &cpath,
-                0,
                 n,
                 &regions,
                 &schema,

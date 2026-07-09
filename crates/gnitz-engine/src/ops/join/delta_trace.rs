@@ -74,18 +74,18 @@ mod tests {
     /// (regression guard for the byte-seek path at sub-8-byte stride).
     #[test]
     fn test_join_dt_i32_key_all_match() {
-        use crate::storage::CursorHandle;
+        use crate::storage::ReadCursor;
         use std::rc::Rc;
 
         let left_schema = make_schema_i32();
         let right_schema = make_schema_i32();
         // Trace (right): keys 1 and 2, both present.
         let trace = Rc::new(make_i32_batch(&right_schema, &[(1, 1, 100), (2, 1, 200)]));
-        let mut ch = CursorHandle::from_owned(&[trace], right_schema);
+        let mut ch = ReadCursor::from_owned(&[trace], right_schema);
         // Delta (left): keys 1 and 2.
         let delta = make_i32_batch(&left_schema, &[(1, 1, 10), (2, 1, 20)]);
 
-        let out = op_join_delta_trace(&delta, ch.cursor_mut(), &left_schema, &right_schema);
+        let out = op_join_delta_trace(&delta, &mut ch, &left_schema, &right_schema);
         assert_eq!(out.count, 2, "both I32 keys must join (smallest key not dropped)");
         assert_eq!(out.get_pk(0) as i32, 1);
         assert_eq!(out.get_pk(1) as i32, 2);
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn test_join_dt_many_to_many_output_unsorted() {
-        use crate::storage::CursorHandle;
+        use crate::storage::ReadCursor;
         use std::rc::Rc;
         // Many-to-many inner join: the unified co-group walks each trace group
         // once and products it against the whole delta group, emitting the
@@ -102,11 +102,11 @@ mod tests {
         let schema = make_schema_u64_i64();
         // Trace: PK=1 with two right payloads (100, 200).
         let trace = Rc::new(make_batch(&schema, &[(1, 1, 100), (1, 1, 200)]));
-        let mut ch = CursorHandle::from_owned(&[trace], schema);
+        let mut ch = ReadCursor::from_owned(&[trace], schema);
         // Delta: PK=1 with three left payloads.
         let delta = make_batch(&schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]);
 
-        let out = op_join_delta_trace(&delta, ch.cursor_mut(), &schema, &schema);
+        let out = op_join_delta_trace(&delta, &mut ch, &schema, &schema);
         assert_eq!(out.count, 6, "3 left × 2 right = 6 join outputs");
 
         // col 0 = left payload, col 1 = right payload (all PKs equal). The sorted
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn test_join_dt_wide_pk_multiset_delta() {
-        use crate::storage::CursorHandle;
+        use crate::storage::ReadCursor;
         use std::rc::Rc;
         // Two delta rows sharing the same wide PK but different payloads (multiset
         // delta). One trace row for that PK. Inner join must produce 2 output rows.
@@ -135,7 +135,7 @@ mod tests {
         // once, producted against the once-walked trace group (no re-seek).
         let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 0, 0, 1, 100)]));
-        let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
+        let mut ch = ReadCursor::from_owned(&[trace_batch], schema);
 
         let mut delta = Batch::with_schema(schema, 2);
         // Row 0: pk=(1,0,0) payload=10 w=+1
@@ -152,7 +152,7 @@ mod tests {
         delta.count += 1;
         delta.certify_layout(Layout::Sorted, &schema);
 
-        let out = op_join_delta_trace(&delta, ch.cursor_mut(), &schema, &schema);
+        let out = op_join_delta_trace(&delta, &mut ch, &schema, &schema);
         // 2 delta rows × 1 trace row = 2 output rows
         assert_eq!(out.count, 2, "multiset delta: expected 2 join outputs");
         assert_eq!(out.get_weight(0), 1);
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn test_join_dt_wide_pk_prefix_collision() {
-        use crate::storage::CursorHandle;
+        use crate::storage::ReadCursor;
         use std::rc::Rc;
         // Two wide-PK rows sharing the same first 16 OPK bytes (columns 0 and 1
         // identical) but differing in column 2. The co-group must treat them
@@ -175,7 +175,7 @@ mod tests {
         // Large delta (2 rows) vs 1-row trace.
         let schema = wide_pk_3xu64_schema();
         let trace_batch = Rc::new(make_wide_batch(&schema, &[(1, 1, 2, 1, 100)]));
-        let mut ch = CursorHandle::from_owned(&[trace_batch], schema);
+        let mut ch = ReadCursor::from_owned(&[trace_batch], schema);
 
         let delta = make_wide_batch(
             &schema,
@@ -185,7 +185,7 @@ mod tests {
             ],
         );
 
-        let out = op_join_delta_trace(&delta, ch.cursor_mut(), &schema, &schema);
+        let out = op_join_delta_trace(&delta, &mut ch, &schema, &schema);
         // Only Row A matches (delta row 0 × trace row 0). Row B has no trace entry.
         assert_eq!(out.count, 1, "prefix-collision: only matching PK should produce output");
         assert_eq!(out.get_pk_bytes(0), wide_pk_bytes(&schema, 1, 1, 2).as_slice());

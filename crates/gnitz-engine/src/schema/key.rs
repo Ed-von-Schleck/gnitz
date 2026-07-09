@@ -181,16 +181,6 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
     }
 }
 
-/// Order-preserving sort key for a PK region. After the OPK-at-rest flip the PK
-/// bytes are already order-preserving big-endian, so this is just `pack_pk_be`:
-///   * `pk_stride ≤ 16`  — the *whole* PK, exact and authoritative.
-///   * `pk_stride > 16`   — the order-preserving 16-byte *prefix*, needing a
-///     `compare_pk_bytes` tiebreak on a prefix collision.
-#[inline]
-pub(crate) fn pk_sort_key(pk_bytes: &[u8]) -> u128 {
-    pack_pk_be(pk_bytes)
-}
-
 /// A fixed-width order-preserving sort key built by left-aligning a row's
 /// `pk_stride` OPK bytes big-endian. The OPK bytes are order-preserving, and every
 /// row in one batch shares a single `pk_stride` (hence identical zero padding past

@@ -96,7 +96,6 @@ impl CatalogEngine {
             let entry = self.dag.tables.get_mut(&tid).expect("tid taken from iter");
             let pt = PartitionedTable::new(
                 &entry.directory,
-                "",
                 entry.schema,
                 tid as u32,
                 Routing::Replicated,
@@ -220,7 +219,7 @@ impl CatalogEngine {
             CIRCUIT_NODE_COLUMNS_TAB_ID => &self.sys_circuit_node_columns,
             _ => return 0,
         };
-        table.current_lsn
+        table.current_lsn()
     }
 
     /// Build a map of every known table id → max flushed LSN, covering

@@ -421,7 +421,7 @@ impl CatalogEngine {
             let mut touched = false;
             let mut first = true;
             loop {
-                let chunk = match handle.cursor.drain_chunk(chunk_rows) {
+                let chunk = match handle.drain_chunk(chunk_rows) {
                     Some(chunk) => chunk,
                     // Source dry on the first iteration: feed one empty epoch
                     // through the same body so a global-aggregate reduce's n==0
@@ -543,7 +543,7 @@ impl CatalogEngine {
             let Some(mut handle) = self.open_store_cursor(owner_id) else {
                 continue;
             };
-            while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
+            while let Some(chunk) = handle.drain_chunk(chunk_rows) {
                 for (cols, idx_schema, table) in &targets {
                     let projected = DagEngine::batch_project_index(&chunk, cols.as_slice(), &owner_schema, idx_schema);
                     if projected.count == 0 {
@@ -597,7 +597,7 @@ impl CatalogEngine {
         let Some(mut handle) = self.open_store_cursor(owner_id) else {
             return Ok(());
         };
-        while let Some(chunk) = handle.cursor.drain_chunk(chunk_rows) {
+        while let Some(chunk) = handle.drain_chunk(chunk_rows) {
             let projected = DagEngine::batch_project_index(&chunk, col_indices, &owner_schema, idx_schema);
             if projected.count == 0 {
                 continue;

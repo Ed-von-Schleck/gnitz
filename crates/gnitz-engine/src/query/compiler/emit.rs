@@ -126,11 +126,12 @@ pub(super) fn create_child_table(
     // index-circuit compilation (index tables stay plain `Rederive`).
     Table::new(
         &child_dir,
-        child_name,
         schema,
         table_id,
         256 * 1024,
-        RecoverySource::RederiveCheckpointed,
+        RecoverySource::RederiveCheckpointed {
+            committed: crate::foundation::worker_ctx::committed_generation(),
+        },
     )
 }
 

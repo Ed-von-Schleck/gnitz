@@ -80,7 +80,7 @@ pub(crate) fn is_index_dir_name(name: &str) -> bool {
 /// The directory holding THIS process's copy of an index table: the index dir
 /// itself for master/standalone, `{idx_dir}/w{rank}` for a forked worker
 /// (single-writer isolation for spills and compaction, so sibling workers never
-/// collide on same-name `.tmp`/`hcomp` files under the shared tree).
+/// collide on same-name `.tmp`/compaction files under the shared tree).
 /// `Table::new` creates the path recursively, so this is a pure path function.
 pub(crate) fn index_table_dir(idx_dir: &str) -> String {
     if crate::foundation::worker_ctx::is_worker() {
@@ -92,13 +92,12 @@ pub(crate) fn index_table_dir(idx_dir: &str) -> String {
 
 /// Open this process's copy of an ephemeral secondary-index table under
 /// `idx_dir` (homed by `index_table_dir`). The one recipe for the live CREATE
-/// INDEX hook and the worker-boot rebuild: the `_idx_` name format, the arena
-/// size, and `RecoverySource::Rederive` (load-bearing — a durable source would
+/// INDEX hook and the worker-boot rebuild: the arena size and
+/// `RecoverySource::Rederive` (load-bearing — a durable source would
 /// double-count its loaded shards on the next open) must never diverge.
 pub(crate) fn new_index_table(idx_dir: &str, index_id: i64, idx_schema: SchemaDescriptor) -> Result<Table, String> {
     Table::new(
         &index_table_dir(idx_dir),
-        &format!("_idx_{index_id}"),
         idx_schema,
         index_id as u32,
         SYS_TABLE_ARENA,
@@ -161,13 +160,13 @@ pub(crate) fn subdir_names(path: &str) -> Vec<String> {
 
 /// Read a u64 from a cursor column. `logical_col` is the schema column index.
 /// `read_i64(col) as u64` is bit-for-bit `u64::from_le_bytes` of the same 8 bytes.
-pub(crate) fn cursor_read_u64(cursor: &CursorHandle, logical_col: usize) -> u64 {
-    cursor.cursor.read_i64(logical_col) as u64
+pub(crate) fn cursor_read_u64(cursor: &ReadCursor, logical_col: usize) -> u64 {
+    cursor.read_i64(logical_col) as u64
 }
 
 /// Read a German string from a cursor column. `logical_col` is the schema column index.
-pub(crate) fn cursor_read_string(cursor: &CursorHandle, logical_col: usize) -> String {
-    String::from_utf8(cursor.cursor.read_german_bytes(logical_col)).unwrap_or_default()
+pub(crate) fn cursor_read_string(cursor: &ReadCursor, logical_col: usize) -> String {
+    String::from_utf8(cursor.read_german_bytes(logical_col)).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -203,8 +202,8 @@ pub(crate) fn retract_single_row(table: &Table, schema: &SchemaDescriptor, pk: u
     let mut cursor = table.open_cursor();
     // OPK-encode the native PK; correct for single-column and compound system PKs.
     let (opk, stride) = crate::storage::opk_key(schema, &pk.to_le_bytes());
-    if cursor.cursor.seek_exact_live(&opk[..stride]) {
-        cursor.cursor.copy_current_row_into(&mut batch, -1);
+    if cursor.seek_exact_live(&opk[..stride]) {
+        cursor.copy_current_row_into(&mut batch, -1);
     }
     batch
 }
@@ -218,27 +217,16 @@ pub(crate) fn retract_rows_in_pk_range(table: &Table, schema: &SchemaDescriptor,
     let mut cursor = table.open_cursor();
     // U64-PK system table: OPK == big-endian; the native-value range
     // comparisons below (`current_key_narrow()`/`get_pk` vs `pk_end`) stay valid.
-    cursor.cursor.seek_bytes(&(start as u64).to_be_bytes());
+    cursor.seek_bytes(&(start as u64).to_be_bytes());
 
-    // Bulk path: single consolidated MemBatch source.
-    if let Some((src, start_idx)) = cursor.cursor.single_mem_batch() {
-        let mut end = start_idx;
-        while end < src.count && src.get_pk(end) < pk_end {
-            end += 1;
-        }
-        batch.append_mem_batch_range(&src, start_idx, end, crate::storage::WeightFill::Const(-1));
-        return batch;
-    }
-
-    // Row-at-a-time fallback for multi-source cursors.
-    while cursor.cursor.valid {
-        if cursor.cursor.current_key_narrow() >= pk_end {
+    while cursor.valid {
+        if cursor.current_key_narrow() >= pk_end {
             break;
         }
-        if cursor.cursor.current_weight > 0 {
-            cursor.cursor.copy_current_row_into(&mut batch, -1);
+        if cursor.current_weight > 0 {
+            cursor.copy_current_row_into(&mut batch, -1);
         }
-        cursor.cursor.advance();
+        cursor.advance();
     }
     batch
 }
@@ -254,11 +242,11 @@ pub(crate) fn retract_rows_by_view(table: &Table, schema: &SchemaDescriptor, vie
     // big-endian, so the prefix must be OPK (BE), not native LE.
     let prefix = view_id.to_be_bytes();
     let mut cursor = table.open_cursor();
-    let mut hit = cursor.cursor.seek_first_positive_with_prefix(&prefix);
+    let mut hit = cursor.seek_first_positive_with_prefix(&prefix);
     while hit {
-        cursor.cursor.copy_current_row_into(&mut batch, -1);
-        cursor.cursor.advance();
-        hit = cursor.cursor.walk_to_positive_with_prefix(&prefix);
+        cursor.copy_current_row_into(&mut batch, -1);
+        cursor.advance();
+        hit = cursor.walk_to_positive_with_prefix(&prefix);
     }
     batch
 }

@@ -94,7 +94,7 @@ pub fn encode_control_block(header: &Header, error_msg: &str, seek_pk_extra: &[u
 pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), ProtocolError> {
     use gnitz_wire::control as ctrl;
     let cs = control_schema();
-    let (batch, tid, _lsn) = decode_wal_block(data, cs, VerifyChecksum::No)?;
+    let (batch, tid) = decode_wal_block(data, cs, VerifyChecksum::No)?;
 
     if tid != IPC_CONTROL_TID {
         return Err(ProtocolError::DecodeError(format!(
@@ -377,7 +377,11 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         return Err(ProtocolError::DecodeError("message too small".into()));
     }
 
-    let ctrl_size = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
+    let ctrl_size = u32::from_le_bytes(
+        buf[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     if ctrl_size > buf.len() {
         return Err(ProtocolError::DecodeError("control block truncated".into()));
     }
@@ -396,12 +400,16 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         if off + WAL_BLOCK_HEADER_SIZE > buf.len() {
             return Err(ProtocolError::DecodeError("schema block header truncated".into()));
         }
-        let sz = u32::from_le_bytes(buf[off + 16..off + 20].try_into().unwrap()) as usize;
+        let sz = u32::from_le_bytes(
+            buf[off + gnitz_wire::WAL_OFF_SIZE..off + gnitz_wire::WAL_OFF_SIZE + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         if off + sz > buf.len() {
             return Err(ProtocolError::DecodeError("schema block truncated".into()));
         }
         let ms = meta_schema();
-        let (sbatch, _, _) = decode_wal_block(&buf[off..off + sz], ms, VerifyChecksum::No)?;
+        let (sbatch, _) = decode_wal_block(&buf[off..off + sz], ms, VerifyChecksum::No)?;
         wire_schema = Some(batch_to_schema(&sbatch)?);
         schema_batch = Some(sbatch);
         off += sz;
@@ -434,11 +442,15 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         if off + WAL_BLOCK_HEADER_SIZE > buf.len() {
             return Err(ProtocolError::DecodeError("data block header truncated".into()));
         }
-        let sz = u32::from_le_bytes(buf[off + 16..off + 20].try_into().unwrap()) as usize;
+        let sz = u32::from_le_bytes(
+            buf[off + gnitz_wire::WAL_OFF_SIZE..off + gnitz_wire::WAL_OFF_SIZE + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         if off + sz > buf.len() {
             return Err(ProtocolError::DecodeError("data block truncated".into()));
         }
-        let (batch, _, _) = decode_wal_block(&buf[off..off + sz], eff, VerifyChecksum::No)?;
+        let (batch, _) = decode_wal_block(&buf[off..off + sz], eff, VerifyChecksum::No)?;
         Some(batch)
     } else {
         None
@@ -863,7 +875,11 @@ mod tests {
         let pk = PkTuple::from_bytes(&(0..24u8).collect::<Vec<_>>());
         let payload = encode_message(7, 1, FLAG_SEEK, &pk, 0, None, None).unwrap();
 
-        let ctrl_size = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as usize;
+        let ctrl_size = u32::from_le_bytes(
+            payload[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         let (hdr, _err, extra) = decode_control_block(&payload[..ctrl_size]).unwrap();
 
         let (want_lo, want_extra) = pk.split_wire();

@@ -31,6 +31,33 @@ pub unsafe fn write_all_fd(fd: c_int, data: &[u8]) -> i32 {
     0
 }
 
+/// pwrite all bytes to `fd` at `offset`, handling short writes and EINTR —
+/// the positional twin of [`write_all_fd`].
+pub(crate) fn pwrite_all_fd(fd: c_int, buf: &[u8], mut offset: libc::off_t) -> std::io::Result<()> {
+    let mut remaining = buf.len();
+    let mut p = buf.as_ptr();
+    while remaining > 0 {
+        let written = unsafe { libc::pwrite(fd, p as *const libc::c_void, remaining, offset) };
+        if written < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        if written == 0 {
+            // POSIX guarantees regular files never return 0 for a non-zero
+            // count, but some device types can — without this guard the loop
+            // would spin forever at 100% CPU. Treat it as an error.
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        remaining -= written as usize;
+        p = unsafe { p.add(written as usize) };
+        offset += written as libc::off_t;
+    }
+    Ok(())
+}
+
 /// Read up to `buf.len()` bytes from fd. Returns bytes read, or -3 on error.
 pub unsafe fn read_all_fd(fd: c_int, buf: &mut [u8]) -> i64 {
     let total = buf.len();
@@ -474,6 +501,74 @@ pub(crate) fn raise_fd_limit_for_tests() {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Size of the file behind `fd` (fstat), in bytes.
+pub(crate) fn fd_size(fd: c_int) -> std::io::Result<usize> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st.st_size as usize)
+}
+
+/// RAII handle for a read-only mmap'd file region, so the unmap path lives in
+/// exactly one place — no consumer's error return or Drop repeats the `munmap`.
+pub(crate) struct Mmap {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Mmap {
+    /// mmap `[0, len)` of `fd` read-only with a sequential-access hint.
+    /// `len` must be `> 0`. The mapping holds its own reference to the inode,
+    /// so the caller may close `fd` immediately after.
+    pub(crate) fn from_fd(fd: c_int, len: usize) -> std::io::Result<Self> {
+        debug_assert!(len > 0);
+        let raw = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
+        if raw == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ptr = raw as *mut u8;
+        madvise_sequential(ptr, len);
+        Ok(Mmap { ptr, len })
+    }
+
+    /// Open `path` read-only, mmap the whole (non-empty) file, and apply
+    /// huge-page + sequential madvise hints.
+    pub(crate) fn open_ro(path: &std::ffi::CStr) -> std::io::Result<Self> {
+        let fd = open_owned(path, libc::O_RDONLY).ok_or_else(std::io::Error::last_os_error)?;
+        let len = fd_size(std::os::fd::AsRawFd::as_raw_fd(&fd))?;
+        if len == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        let map = Self::from_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), len)?;
+        madvise_hugepage(map.ptr, map.len);
+        Ok(map)
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for Mmap {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -113,7 +113,7 @@ impl CatalogEngine {
             .ingest_borrowed_batch(batch)
             .map_err(|e| format!("apply_local: sys-table ingest failed (family={id}): {e}"))?;
         if let Some(lsn) = pin_lsn {
-            table.current_lsn = lsn.get();
+            table.pin_lsn(lsn);
         }
         batch.set_schema(sys_tab_schema(id));
         self.fire_hooks(family, batch)
@@ -230,17 +230,17 @@ impl CatalogEngine {
     /// to zero weight are skipped by the cursor.
     pub(crate) fn for_each_index_on_cols(&self, owner_id: i64, cols: &[u32], mut f: impl FnMut(i64, bool)) {
         let mut cursor = self.sys_indices.open_cursor();
-        while cursor.cursor.valid {
-            if cursor.cursor.current_weight > 0 {
+        while cursor.valid {
+            if cursor.current_weight > 0 {
                 let row_owner = cursor_read_u64(&cursor, IDXTAB_COL_OWNER_ID) as i64;
                 let row_cols = gnitz_wire::unpack_pk_cols(cursor_read_u64(&cursor, IDXTAB_COL_SOURCE_COLS));
                 if row_owner == owner_id && row_cols.as_slice() == cols {
-                    let row_id = cursor.cursor.current_key_narrow() as u64 as i64;
+                    let row_id = cursor.current_key_narrow() as u64 as i64;
                     let is_uniq = cursor_read_u64(&cursor, IDXTAB_COL_IS_UNIQUE) != 0;
                     f(row_id, is_uniq);
                 }
             }
-            cursor.cursor.advance();
+            cursor.advance();
         }
     }
 
@@ -447,8 +447,8 @@ impl CatalogEngine {
                 let (owner_id, cols) = {
                     let mut cursor = self.sys_indices.open_cursor();
                     // sys_indices has a single U64 PK; OPK == big-endian.
-                    cursor.cursor.seek_bytes(&(idx_id as u64).to_be_bytes());
-                    if !cursor.cursor.valid || cursor.cursor.current_key_narrow() as u64 != idx_id as u64 {
+                    cursor.seek_bytes(&(idx_id as u64).to_be_bytes());
+                    if !cursor.valid || cursor.current_key_narrow() as u64 != idx_id as u64 {
                         continue;
                     }
                     (

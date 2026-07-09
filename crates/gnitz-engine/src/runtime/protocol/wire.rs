@@ -52,12 +52,8 @@ pub(crate) fn layout_from_wire_flags(flags: u64) -> crate::storage::Layout {
 
 // WAL block header field offsets (matches storage/lsm/wal.rs; duplicated here to
 // avoid cross-module coupling between runtime and storage internals).
-const WAL_OFF_TID: usize = 8;
-const WAL_OFF_COUNT: usize = 12;
-pub(crate) const WAL_OFF_SIZE: usize = 16;
-const WAL_OFF_VERSION: usize = 20;
-const WAL_OFF_CHECKSUM: usize = 24;
-const WAL_OFF_NUM_REGIONS: usize = 32;
+pub(crate) use gnitz_wire::WAL_OFF_SIZE;
+use gnitz_wire::{WAL_OFF_CHECKSUM, WAL_OFF_COUNT, WAL_OFF_NUM_REGIONS, WAL_OFF_TID, WAL_OFF_VERSION};
 
 // ---------------------------------------------------------------------------
 // Internal schema descriptors for the wire control and schema blocks
@@ -1696,7 +1692,7 @@ mod tests {
             let ms = meta_schema();
             let batch = schema_to_batch(&client);
             let encoded = encode_wal_block(ms, 0, &batch);
-            let (decoded_batch, _, _) =
+            let (decoded_batch, _) =
                 decode_wal_block(&encoded, ms, VerifyChecksum::Yes).unwrap();
             let reconstructed = batch_to_schema(&decoded_batch).unwrap();
             prop_assert_eq!(client, reconstructed);
@@ -1717,7 +1713,7 @@ mod tests {
             let wire = build_schema_wire_block(original, &refs[..n], 0, 0);
 
             let ms = meta_schema();
-            let (decoded_batch, _, _) =
+            let (decoded_batch, _) =
                 decode_wal_block(&wire, ms, VerifyChecksum::Yes)
                     .expect("client failed to decode engine-encoded WAL block");
             let client_schema = batch_to_schema(&decoded_batch)

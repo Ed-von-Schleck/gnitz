@@ -239,7 +239,11 @@ fn test_flag_has_data_requires_schema() {
         Some(&names),
         Some(&batch),
     );
-    let ctrl_size = u32::from_le_bytes(wire[16..20].try_into().unwrap()) as usize;
+    let ctrl_size = u32::from_le_bytes(
+        wire[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     wire.truncate(ctrl_size);
     let result = decode_wire(&wire);
     assert!(result.is_err());
@@ -652,7 +656,7 @@ fn peek_routing_header_on_valid_wire() {
 
 #[test]
 fn peek_routing_header_rejects_short_data() {
-    // Any slice shorter than WAL_HEADER_SIZE (48 bytes) must fail.
+    // Any slice shorter than WAL_HEADER_SIZE must fail.
     let result = peek_routing_header(&[0u8; 10]);
     assert!(
         result.is_err(),
@@ -669,7 +673,11 @@ fn decode_wire_truncated_schema_block_returns_err() {
     // The control block occupies [0..ctrl_size). Truncate in the middle of the
     // schema block (keep only the first WAL_HEADER_SIZE bytes of it so the
     // header is readable but the body is missing).
-    let ctrl_size = u32::from_le_bytes(wire[16..20].try_into().unwrap()) as usize;
+    let ctrl_size = u32::from_le_bytes(
+        wire[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     let truncated = &wire[..ctrl_size + gnitz_wire::WAL_HEADER_SIZE / 2];
     let result = decode_wire(truncated);
     assert!(result.is_err(), "decode_wire should reject truncated schema block");
@@ -694,8 +702,16 @@ fn decode_wire_truncated_data_block_returns_err() {
         Some(&batch),
     );
     // Find where the data block starts: after control + schema blocks.
-    let ctrl_size = u32::from_le_bytes(wire[16..20].try_into().unwrap()) as usize;
-    let schema_size = u32::from_le_bytes(wire[ctrl_size + 16..ctrl_size + 20].try_into().unwrap()) as usize;
+    let ctrl_size = u32::from_le_bytes(
+        wire[gnitz_wire::WAL_OFF_SIZE..gnitz_wire::WAL_OFF_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let schema_size = u32::from_le_bytes(
+        wire[ctrl_size + gnitz_wire::WAL_OFF_SIZE..ctrl_size + gnitz_wire::WAL_OFF_SIZE + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     let data_start = ctrl_size + schema_size;
     // Truncate in the middle of the data block.
     let truncated = &wire[..data_start + gnitz_wire::WAL_HEADER_SIZE / 2];

@@ -1,5 +1,0 @@
-disallowed-methods = [
-    { path = "gnitz_server::storage::Table::create_cursor_compacting", reason = "synchronous compaction is a correctness hazard for validators; use open_cursor unless this is explicit maintenance" },
-    { path = "gnitz_server::storage::PartitionedTable::create_cursor_compacting", reason = "synchronous compaction is a correctness hazard for validators; use open_cursor unless this is explicit maintenance" },
-    { path = "gnitz_server::query::dag::StoreHandle::create_cursor_compacting", reason = "synchronous compaction is a correctness hazard for validators; use open_cursor unless this is explicit maintenance" },
-]

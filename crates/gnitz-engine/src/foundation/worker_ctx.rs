@@ -79,33 +79,12 @@ pub(crate) fn worker_rank() -> u32 {
     WORKER_RANK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-// Per-test-thread override of the committed generation. The process-global
-// `COMMITTED_GENERATION` is clobbered by every `CatalogEngine::open` (which sets
-// it from the recovered value), so a test that publishes a manifest and checks
-// its generation would flake under parallel `cargo test`. A thread-local
-// override is per-test-thread, so it never races another test.
-#[cfg(test)]
-thread_local! {
-    static TEST_GEN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
-
-/// The checkpoint generation stamped into manifests this process publishes.
-/// Read by `ShardIndex::manifest_header` at every publish.
+/// The committed checkpoint generation this process last latched — the value
+/// the ephemeral flush round stamps into manifests and `RederiveCheckpointed`
+/// opens gate on. Storage never reads this directly; the catalog/runtime
+/// callers pass it down as data.
 pub(crate) fn committed_generation() -> u64 {
-    #[cfg(test)]
-    {
-        if let Some(g) = TEST_GEN_OVERRIDE.with(|c| c.get()) {
-            return g;
-        }
-    }
     COMMITTED_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Test-only: pin the generation `manifest_header` stamps on the current thread
-/// (`Some`) or clear the override (`None`).
-#[cfg(test)]
-pub(crate) fn set_test_gen_override(g: Option<u64>) {
-    TEST_GEN_OVERRIDE.with(|c| c.set(g));
 }
 
 /// Set the checkpoint generation this process stamps into published manifests.
