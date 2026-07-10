@@ -563,30 +563,57 @@ impl ScalarFunc {
             let mut scratch = self.scratch.borrow_mut();
             scratch.ensure_capacity(num_regs, no_nulls, n);
 
-            let null_arr = output.null_bmp_data_mut().as_mut_ptr() as *mut u64;
-
             for morsel_start in (0..n).step_by(MORSEL) {
                 let m = MORSEL.min(n - morsel_start);
                 eval_batch(prog, &in_mb, morsel_start, m, &mut scratch);
 
-                // EMIT: write each computed register to its output column
+                // EMIT: write each computed register to its output column.
+                // Value store and null merge run as two sequential loops, each
+                // taking a fresh borrow of `output`. `Batch::data` is a single
+                // `Vec<u8>` holding every region, so a pointer into the null
+                // region derived once and held across a `col_data_mut` reborrow
+                // would be invalidated by it.
                 for ((&out_payload, &reg), &stride_u8) in
                     emit_payloads.iter().zip(emit_regs.iter()).zip(emit_strides.iter())
                 {
                     let stride = stride_u8 as usize;
-                    let dst8 = output.col_data_mut(out_payload);
                     let base_r = reg * MORSEL;
                     let base_null_r = reg * NULL_WORDS_PER_REG;
-                    for i in 0..m {
-                        let row = morsel_start + i;
-                        let is_null = !no_nulls && (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
-                        let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
-                        dst8[row * stride..(row + 1) * stride].copy_from_slice(&val.to_le_bytes()[..stride]);
 
-                        // Merge null bit into row-major output null bitmap
-                        if is_null {
-                            unsafe {
-                                *null_arr.add(row) |= 1u64 << out_payload;
+                    {
+                        let dst8 = output.col_data_mut(out_payload);
+                        for i in 0..m {
+                            let is_null = !no_nulls && (scratch.null_bits[base_null_r + i / 64] >> (i % 64)) & 1 != 0;
+                            let val = if is_null { 0i64 } else { scratch.regs[base_r + i] };
+                            let off = (morsel_start + i) * stride;
+                            dst8[off..off + stride].copy_from_slice(&val.to_le_bytes()[..stride]);
+                        }
+                    }
+
+                    // The two bitmaps are transposed: `scratch.null_bits` is
+                    // register-major (bit i = row i), the output bitmap row-major
+                    // (one u64 per row, bit c = payload column c). The merge is a
+                    // scatter, never a word-at-a-time OR.
+                    if !no_nulls {
+                        let words = m.div_ceil(64);
+                        let nb = output.null_bmp_data_mut();
+                        for w in 0..words {
+                            let mut null_word = scratch.null_bits[base_null_r + w];
+                            // Every producer writes only rows `0..m`, so bits at
+                            // index >= m are zero and the bit-scan stays in the
+                            // morsel — no tail re-masking needed.
+                            debug_assert!(
+                                w + 1 < words || m.is_multiple_of(64) || (null_word >> (m % 64)) == 0,
+                                "null_bits tail word has bits set beyond m={m}",
+                            );
+                            let lo = w * 64;
+                            while null_word != 0 {
+                                let bit = null_word.trailing_zeros() as usize;
+                                null_word &= null_word - 1;
+                                let off = (morsel_start + lo + bit) * 8;
+                                let merged =
+                                    u64::from_le_bytes(nb[off..off + 8].try_into().unwrap()) | (1u64 << out_payload);
+                                nb[off..off + 8].copy_from_slice(&merged.to_le_bytes());
                             }
                         }
                     }
