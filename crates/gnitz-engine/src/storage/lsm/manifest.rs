@@ -85,9 +85,16 @@ impl Default for ManifestEntryRaw {
     }
 }
 
+/// The NUL-terminated (or buffer-length) prefix of `buf` as UTF-8, `""` if
+/// the bytes are not valid UTF-8.
+fn cstr_from_buf(buf: &[u8]) -> &str {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end]).unwrap_or("")
+}
+
 impl ManifestEntryRaw {
     pub fn filename_str(&self) -> &str {
-        crate::foundation::codec::cstr_from_buf(&self.filename)
+        cstr_from_buf(&self.filename)
     }
 }
 
@@ -271,9 +278,7 @@ pub fn prepare_file(
 
     let fd = open_owned(&tmp_path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC).ok_or(StorageError::Io)?;
 
-    // SAFETY: `buf[..written]` is a valid initialized byte range.
-    let rc = unsafe { crate::foundation::posix_io::write_all_fd(fd.as_raw_fd(), &buf[..written]) };
-    if rc < 0 {
+    if crate::foundation::posix_io::write_all_fd(fd.as_raw_fd(), &buf[..written]).is_err() {
         unsafe {
             libc::unlink(tmp_path.as_ptr());
         }
@@ -297,9 +302,8 @@ fn peek_header_u64(path: &std::ffi::CStr, off: usize) -> Result<Option<u64>, Sto
         return Ok(None);
     };
     let mut hdr = [0u8; HEADER_SIZE];
-    // SAFETY: `hdr` is a valid writable buffer of `HEADER_SIZE` bytes.
-    let n = unsafe { crate::foundation::posix_io::read_all_fd(fd.as_raw_fd(), &mut hdr) };
-    if n < HEADER_SIZE as i64 {
+    let n = crate::foundation::posix_io::read_all_fd(fd.as_raw_fd(), &mut hdr).unwrap_or(0);
+    if n < HEADER_SIZE {
         return Err(StorageError::Truncated);
     }
     let magic = read_u64_le(&hdr, 0);

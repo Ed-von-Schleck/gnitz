@@ -2,6 +2,7 @@
 
 use super::error::ProtocolError;
 use super::types::{ColData, PkColumn, Schema, TypeCode, ZSetBatch};
+use xxhash_rust::xxh3::xxh3_64;
 
 /// Whether `decode_wal_block` should verify the xxh3 checksum.
 /// Use `Yes` for WAL recovery and roundtrip tests.
@@ -109,10 +110,6 @@ fn append_pk_region(buf: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize, schema:
             (aligned as u32, pk_buf.len() as u32)
         }
     }
-}
-
-fn xxh3_64(data: &[u8]) -> u64 {
-    xxhash_rust::xxh3::xxh3_64(data)
 }
 
 fn encode_german_string(s: &str, blob: &mut Vec<u8>) -> [u8; 16] {

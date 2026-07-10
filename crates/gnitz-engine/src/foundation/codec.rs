@@ -1,6 +1,6 @@
 //! Little-endian byte codec: fixed-width integer pack/unpack (aligned and
-//! unaligned), C-string extraction, and 8-byte alignment. The genuine
-//! cross-layer leaf — every wire/shard/mmap path reads and writes through it.
+//! unaligned) and 8-byte alignment. The genuine cross-layer leaf — every
+//! wire/shard/mmap path reads and writes through it.
 
 #[inline]
 pub fn read_u32_le(buf: &[u8], off: usize) -> u32 {
@@ -25,11 +25,6 @@ pub fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
 #[inline]
 pub fn write_u64_le(buf: &mut [u8], off: usize, val: u64) {
     buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
-}
-
-pub fn cstr_from_buf(buf: &[u8]) -> &str {
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    std::str::from_utf8(&buf[..end]).unwrap_or("")
 }
 
 pub use gnitz_wire::align8;

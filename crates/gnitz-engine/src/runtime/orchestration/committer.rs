@@ -25,7 +25,7 @@
 //!   graceful-shutdown watchdog (see `BarrierKind`).
 
 use super::executor::TickTrigger;
-use crate::foundation::posix_io::guard_panic;
+use super::guard_panic;
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{first_worker_error_opt, MasterDispatcher};
 use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, AsyncMutex, Either, Reactor, ReplyFuture};

@@ -25,12 +25,12 @@ static WORKER_RANK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 static NUM_WORKERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 /// The committed checkpoint generation baked into every manifest this process
-/// publishes. A process-global `AtomicU64` mirroring `WORKER_RANK`: the manifest
-/// stamp is read deep inside `storage/lsm` (L3), far below any place a parameter
-/// could be threaded, and workers are single-threaded processes. The master sets
-/// it at each gen-bump (and once at boot after `recover_sequences`, so the value
-/// is COW-inherited by the forked workers); each worker sets it from the
-/// `FLAG_FLUSH_EPH` group header before flushing its ephemeral view state.
+/// publishes. A process-global `AtomicU64` mirroring `WORKER_RANK`: its readers
+/// span the query, catalog, and runtime layers, and under strict layering L0 is
+/// the only point they all share. The master sets it at each gen-bump (and once
+/// at boot after `recover_sequences`, so the value is COW-inherited by the
+/// forked workers); each worker sets it from the `FLAG_FLUSH_EPH` group header
+/// before flushing its ephemeral view state.
 ///
 /// Test caveat (same footgun as `WORKER_RANK`): `cargo test` shares one process
 /// across test threads, so this atomic is shared. A test that reads a published

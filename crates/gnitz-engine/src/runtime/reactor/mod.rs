@@ -37,7 +37,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use self::ring::{Cqe, Ring, CQE_F_MORE};
 use self::uring::IoUringRing;
 
-use crate::foundation::syscall::FUTEX2_SIZE_U32;
+use crate::foundation::posix_io::FUTEX2_SIZE_U32;
 use crate::runtime::sal::MAX_WORKERS;
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::w2m_ring::FLAG_MASTER_PARKED;
@@ -2029,7 +2029,7 @@ mod tests {
     #[test]
     fn fsync_future_roundtrip() {
         let r = make_reactor();
-        let fd = crate::foundation::syscall::memfd_create(b"reactor_fsync_future");
+        let fd = crate::foundation::posix_io::memfd_create(b"reactor_fsync_future");
         let rc: Rc<StdCell<i32>> = Rc::new(StdCell::new(1));
         let rc2 = Rc::clone(&rc);
         let fsync = r.fsync(fd);
@@ -2222,7 +2222,7 @@ mod tests {
     #[test]
     fn fsync_real_memfd_roundtrip() {
         let r = make_reactor();
-        let fd = crate::foundation::syscall::memfd_create(b"reactor_fsync_ok");
+        let fd = crate::foundation::posix_io::memfd_create(b"reactor_fsync_ok");
         let id = r.submit_fsync(fd);
         let rc = r.block_on_fsync(id);
         unsafe {
@@ -2257,7 +2257,7 @@ mod tests {
     #[test]
     fn fsync_submit_flushes_sqe_before_returning() {
         let r = make_reactor();
-        let fd = crate::foundation::syscall::memfd_create(b"reactor_fsync_flush");
+        let fd = crate::foundation::posix_io::memfd_create(b"reactor_fsync_flush");
         let id = r.submit_fsync(fd);
 
         // Spin briefly (no further ticks driven from outside) until the
@@ -3014,10 +3014,10 @@ mod tests {
         const N_MESSAGES: u64 = 500;
         const TIMEOUT_SECS: u64 = 30;
 
-        let fd = crate::foundation::syscall::memfd_create(b"w2m_stress");
+        let fd = crate::foundation::posix_io::memfd_create(b"w2m_stress");
         assert!(fd >= 0, "memfd_create failed");
-        assert_eq!(crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64), 0);
-        let ptr = crate::foundation::syscall::mmap_shared(fd, CAPACITY);
+        crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64).unwrap();
+        let ptr = crate::foundation::posix_io::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null(), "mmap_shared failed");
         unsafe {
             w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
@@ -3137,10 +3137,10 @@ mod tests {
         const N_MESSAGES: u64 = 5_000;
         const TIMEOUT_SECS: u64 = 60;
 
-        let fd = crate::foundation::syscall::memfd_create(b"w2m_stress_hv");
+        let fd = crate::foundation::posix_io::memfd_create(b"w2m_stress_hv");
         assert!(fd >= 0);
-        assert_eq!(crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64), 0);
-        let ptr = crate::foundation::syscall::mmap_shared(fd, CAPACITY);
+        crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64).unwrap();
+        let ptr = crate::foundation::posix_io::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null());
         unsafe {
             w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);
@@ -3270,10 +3270,10 @@ mod tests {
 
         // memfd + mmap a tiny shared W2M ring (same setup the existing
         // cross-process stress tests use, but shared with a thread).
-        let fd = crate::foundation::syscall::memfd_create(b"w2m_refresh_pin");
+        let fd = crate::foundation::posix_io::memfd_create(b"w2m_refresh_pin");
         assert!(fd >= 0, "memfd_create failed");
-        assert_eq!(crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64), 0);
-        let ptr = crate::foundation::syscall::mmap_shared(fd, CAPACITY);
+        crate::foundation::posix_io::ftruncate(fd, CAPACITY as i64).unwrap();
+        let ptr = crate::foundation::posix_io::mmap_shared(fd, CAPACITY);
         assert!(!ptr.is_null(), "mmap_shared failed");
         unsafe {
             w2m_ring::init_region_for_tests(ptr, CAPACITY as u64);

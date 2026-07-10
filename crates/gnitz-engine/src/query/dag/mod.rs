@@ -1585,8 +1585,8 @@ impl DagEngine {
         tables: &FxHashMap<i64, TableEntry>,
         ext_trace_regs: &[(u16, i64)],
         num_regs: usize,
-    ) -> (Vec<*mut libc::c_void>, Vec<Box<ReadCursor>>) {
-        let mut ptrs: Vec<*mut libc::c_void> = vec![std::ptr::null_mut(); num_regs];
+    ) -> (Vec<*mut ReadCursor>, Vec<Box<ReadCursor>>) {
+        let mut ptrs: Vec<*mut ReadCursor> = vec![std::ptr::null_mut(); num_regs];
         let mut storage: Vec<Box<ReadCursor>> = Vec::new();
         for &(reg_id, table_id) in ext_trace_regs {
             if let Some(entry) = tables.get(&table_id) {
@@ -1605,7 +1605,7 @@ impl DagEngine {
                     // allocation is stable across later Vec growth, so the
                     // pointer remains valid.
                     let p = storage.last_mut().unwrap().as_mut() as *mut ReadCursor;
-                    ptrs[reg_id as usize] = p as *mut libc::c_void;
+                    ptrs[reg_id as usize] = p;
                 }
             }
         }

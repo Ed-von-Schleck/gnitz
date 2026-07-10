@@ -31,7 +31,7 @@
 //!   messages verbatim to the client (a failed DDL), so they carry the path
 //!   and OS error instead of collapsing into an opaque `Io` variant.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::heap::{HeapNode, LoserTree};
 use crate::foundation::posix_io;
@@ -115,16 +115,9 @@ impl SpillSort {
     /// Lazily open the anonymous spill file in `dir`, returning its raw fd.
     fn ensure_spill_fd(&mut self) -> Result<i32, String> {
         if self.spill.is_none() {
-            let fd = posix_io::open_tmpfile(&self.dir);
-            if fd < 0 {
-                return Err(format!(
-                    "external sort: cannot create spill file in {}: {}",
-                    self.dir,
-                    std::io::Error::last_os_error()
-                ));
-            }
-            // SAFETY: fresh fd from `open_tmpfile`; `OwnedFd` is its sole closer.
-            self.spill = Some(unsafe { OwnedFd::from_raw_fd(fd) });
+            let fd = posix_io::open_tmpfile(&self.dir)
+                .map_err(|e| format!("external sort: cannot create spill file in {}: {e}", self.dir))?;
+            self.spill = Some(fd);
         }
         Ok(self.spill.as_ref().unwrap().as_raw_fd())
     }
@@ -147,12 +140,7 @@ impl SpillSort {
         // `write_all_fd` fully writes or returns an error, so a short/ENOSPC
         // write becomes an `Err` here and the sort aborts before the merge —
         // a truncated (misaligned) run can never reach it.
-        if unsafe { posix_io::write_all_fd(fd, &self.scratch) } != 0 {
-            return Err(format!(
-                "external sort: spill write failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        posix_io::write_all_fd(fd, &self.scratch).map_err(|e| format!("external sort: spill write failed: {e}"))?;
         self.runs.push(n);
         self.flat.clear();
         Ok(())

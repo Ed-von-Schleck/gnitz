@@ -38,85 +38,67 @@ pub fn is_info() -> bool {
 }
 
 /// Format and write a log line to stderr. Called by macros, not directly.
+///
+/// Formats straight into a fixed stack buffer — no heap allocation, so
+/// `gnitz_fatal_abort!` can log with a broken SAL mmap — and has no panic
+/// paths. An over-long message is truncated; the trailing `\n` is always the
+/// final byte, so even a truncated line terminates inside the one `write(2)`.
 #[cold]
-pub fn _emit(level_tag: &str, msg: &str) {
-    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+pub fn _emit(level_tag: &str, args: core::fmt::Arguments<'_>) {
+    let mut buf = [0u8; 512];
+    let len = format_line(&mut buf, level_tag, args);
     unsafe {
-        libc::gettimeofday(&mut tv, core::ptr::null_mut());
+        libc::write(2, buf.as_ptr() as *const libc::c_void, len);
     }
-    let secs = tv.tv_sec as u64;
-    let millis = (tv.tv_usec / 1000) as u32;
+}
+
+/// Truncating `fmt::Write` over a fixed buffer: keeps what fits in
+/// `buf[..limit]`, silently discards the rest, and never returns `Err`
+/// (a propagated `fmt::Error` would panic inside `write!`).
+struct TruncatingWriter<'a> {
+    buf: &'a mut [u8],
+    limit: usize,
+    pos: usize,
+}
+
+impl core::fmt::Write for TruncatingWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.limit - self.pos);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.pos += n;
+        Ok(())
+    }
+}
+
+/// Assemble `secs.millis tag LEVEL msg\n` into `buf`, truncating an over-long
+/// message so the trailing `\n` is always the final byte. Returns the line
+/// length in bytes.
+fn format_line(buf: &mut [u8; 512], level_tag: &str, args: core::fmt::Arguments<'_>) -> usize {
+    use core::fmt::Write;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
 
     let packed = TAG.load(Ordering::Relaxed);
     let tag_bytes = u32::to_ne_bytes(packed);
-    let tag_len = tag_bytes[3] as usize;
+    let tag_len = (tag_bytes[3] as usize).min(3);
+    let tag = std::str::from_utf8(&tag_bytes[..tag_len]).unwrap_or("");
 
-    let mut buf = [0u8; 512];
-    let mut pos = 0;
-
-    pos += write_u64(&mut buf[pos..], secs);
-    buf[pos] = b'.';
-    pos += 1;
-    pos += write_millis(&mut buf[pos..], millis);
-    buf[pos] = b' ';
-    pos += 1;
-
-    let n = tag_len.min(buf.len() - pos - 1);
-    buf[pos..pos + n].copy_from_slice(&tag_bytes[..n]);
-    pos += n;
-    buf[pos] = b' ';
-    pos += 1;
-
-    let lb = level_tag.as_bytes();
-    let n = lb.len().min(buf.len() - pos - 1);
-    buf[pos..pos + n].copy_from_slice(&lb[..n]);
-    pos += n;
-    buf[pos] = b' ';
-    pos += 1;
-
-    let mb = msg.as_bytes();
-    let n = mb.len().min(buf.len() - pos - 1);
-    buf[pos..pos + n].copy_from_slice(&mb[..n]);
-    pos += n;
+    let limit = buf.len() - 1; // reserve the final byte for '\n'
+    let mut w = TruncatingWriter { buf, limit, pos: 0 };
+    let _ = write!(w, "{}.{:03} {} {} ", now.as_secs(), now.subsec_millis(), tag, level_tag);
+    let _ = w.write_fmt(args);
+    let pos = w.pos;
     buf[pos] = b'\n';
-    pos += 1;
-
-    unsafe {
-        libc::write(2, buf.as_ptr() as *const libc::c_void, pos);
-    }
-}
-
-fn write_u64(buf: &mut [u8], val: u64) -> usize {
-    if val == 0 {
-        buf[0] = b'0';
-        return 1;
-    }
-    let mut tmp = [0u8; 20];
-    let mut n = val;
-    let mut i = 0;
-    while n > 0 {
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    for j in 0..i {
-        buf[j] = tmp[i - 1 - j];
-    }
-    i
-}
-
-fn write_millis(buf: &mut [u8], val: u32) -> usize {
-    buf[0] = b'0' + ((val / 100) % 10) as u8;
-    buf[1] = b'0' + ((val / 10) % 10) as u8;
-    buf[2] = b'0' + (val % 10) as u8;
-    3
+    pos + 1
 }
 
 /// Log at ERROR level (always emits).
 #[macro_export]
 macro_rules! gnitz_error {
     ($($arg:tt)*) => {
-        $crate::foundation::log::_emit("ERROR", &format!($($arg)*));
+        $crate::foundation::log::_emit("ERROR", format_args!($($arg)*));
     };
 }
 
@@ -124,7 +106,7 @@ macro_rules! gnitz_error {
 #[macro_export]
 macro_rules! gnitz_warn {
     ($($arg:tt)*) => {
-        $crate::foundation::log::_emit("WARN", &format!($($arg)*));
+        $crate::foundation::log::_emit("WARN", format_args!($($arg)*));
     };
 }
 
@@ -133,7 +115,7 @@ macro_rules! gnitz_warn {
 macro_rules! gnitz_info {
     ($($arg:tt)*) => {
         if $crate::foundation::log::is_info() {
-            $crate::foundation::log::_emit("INFO", &format!($($arg)*));
+            $crate::foundation::log::_emit("INFO", format_args!($($arg)*));
         }
     };
 }
@@ -143,7 +125,7 @@ macro_rules! gnitz_info {
 macro_rules! gnitz_debug {
     ($($arg:tt)*) => {
         if $crate::foundation::log::is_debug() {
-            $crate::foundation::log::_emit("DEBUG", &format!($($arg)*));
+            $crate::foundation::log::_emit("DEBUG", format_args!($($arg)*));
         }
     };
 }
@@ -156,7 +138,7 @@ macro_rules! gnitz_debug {
 #[macro_export]
 macro_rules! gnitz_fatal_abort {
     ($($arg:tt)*) => {{
-        $crate::foundation::log::_emit("FATAL", &format!($($arg)*));
+        $crate::foundation::log::_emit("FATAL", format_args!($($arg)*));
         unsafe { ::libc::_exit(134) };
     }};
 }
@@ -202,25 +184,30 @@ mod tests {
     }
 
     #[test]
-    fn test_write_u64_formatting() {
-        let mut buf = [0u8; 20];
-        let n = write_u64(&mut buf, 1711712345);
-        assert_eq!(&buf[..n], b"1711712345");
-
-        let n = write_u64(&mut buf, 0);
-        assert_eq!(&buf[..n], b"0");
+    fn test_format_line_shape() {
+        // `secs.millis tag LEVEL msg\n` — millis zero-padded to 3 digits.
+        init(NORMAL, b"W2");
+        let mut buf = [0u8; 512];
+        let len = format_line(&mut buf, "INFO", format_args!("hello {}", 42));
+        let line = std::str::from_utf8(&buf[..len]).unwrap();
+        assert!(line.ends_with(" W2 INFO hello 42\n"), "got: {line:?}");
+        let (secs, rest) = line.split_once('.').unwrap();
+        assert!(secs.parse::<u64>().is_ok(), "secs field: {secs:?}");
+        assert_eq!(rest.split(' ').next().unwrap().len(), 3, "millis must be 3 digits");
+        init(QUIET, b"");
     }
 
     #[test]
-    fn test_write_millis_formatting() {
-        let mut buf = [0u8; 3];
-        write_millis(&mut buf, 42);
-        assert_eq!(&buf, b"042");
-
-        write_millis(&mut buf, 7);
-        assert_eq!(&buf, b"007");
-
-        write_millis(&mut buf, 999);
-        assert_eq!(&buf, b"999");
+    fn test_format_line_truncates_with_trailing_newline() {
+        // An oversized message fills the buffer exactly; the final byte is
+        // still the terminating '\n' inside the single write.
+        init(QUIET, b"M");
+        let long = "x".repeat(4096);
+        let mut buf = [0u8; 512];
+        let len = format_line(&mut buf, "ERROR", format_args!("{long}"));
+        assert_eq!(len, 512, "truncated line must fill the buffer");
+        assert_eq!(buf[511], b'\n', "trailing newline must be the final byte");
+        assert!(std::str::from_utf8(&buf[..len]).unwrap().contains("ERROR xxx"));
+        init(QUIET, b"");
     }
 }

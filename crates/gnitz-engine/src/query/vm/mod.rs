@@ -343,14 +343,14 @@ impl RegisterFile {
     /// `refresh_owned_cursors`) are skipped entirely. External trace registers
     /// are always written from `handles` — stale pointers from prior epochs are
     /// never preserved.
-    pub fn bind_cursors(&mut self, handles: &[*mut libc::c_void], owned_trace_reg_ids: &[(u16, usize)]) {
+    pub fn bind_cursors(&mut self, handles: &[*mut ReadCursor], owned_trace_reg_ids: &[(u16, usize)]) {
         for (i, reg) in self.registers.iter_mut().enumerate() {
             if reg.kind == RegisterKind::Trace {
                 let is_owned = owned_trace_reg_ids.iter().any(|&(rid, _)| rid as usize == i);
                 if is_owned {
                     // Cursor was set by refresh_owned_cursors; leave it alone.
                 } else if i < handles.len() && !handles[i].is_null() {
-                    reg.cursor_ptr = handles[i] as *mut ReadCursor;
+                    reg.cursor_ptr = handles[i];
                 } else {
                     reg.cursor_ptr = std::ptr::null_mut();
                 }
@@ -751,7 +751,7 @@ mod tests {
         let input1 = make_batch(schema, &[(1u128, 3, 42)]);
         // Need to create a cursor for the history register
         let cursor1 = table.open_cursor();
-        let ch1 = Box::into_raw(Box::new(cursor1)) as *mut libc::c_void;
+        let ch1 = Box::into_raw(Box::new(cursor1));
         let cursors1 = vec![std::ptr::null_mut(), ch1, std::ptr::null_mut()];
 
         let r1 = execute_epoch(&vm.program, &mut vm.regfile, input1, 0, 2, &cursors1, &[])
@@ -763,25 +763,25 @@ mod tests {
         assert_eq!(rows1[0], (1, 1, 42)); // clamped to +1
 
         unsafe {
-            drop(Box::from_raw(ch1 as *mut ReadCursor));
+            drop(Box::from_raw(ch1));
         }
 
         // Tick 2: delta w=-1, integral before tick = +3, after = +2 (still positive).
         // No boundary crossing → output should be empty.
         let cursor2 = table.open_cursor();
-        let ch2 = Box::into_raw(Box::new(cursor2)) as *mut libc::c_void;
+        let ch2 = Box::into_raw(Box::new(cursor2));
         let cursors2 = vec![std::ptr::null_mut(), ch2, std::ptr::null_mut()];
         let input2 = make_batch(schema, &[(1u128, -1, 42)]);
         let r2 = execute_epoch(&vm.program, &mut vm.regfile, input2, 0, 2, &cursors2, &[]).unwrap();
         assert!(r2.is_none(), "no boundary crossing: output should be empty");
         unsafe {
-            drop(Box::from_raw(ch2 as *mut ReadCursor));
+            drop(Box::from_raw(ch2));
         }
 
         // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
         // Positive→non-positive boundary crossed → retraction: output pk=1 w=-1.
         let cursor3 = table.open_cursor();
-        let ch3 = Box::into_raw(Box::new(cursor3)) as *mut libc::c_void;
+        let ch3 = Box::into_raw(Box::new(cursor3));
         let cursors3 = vec![std::ptr::null_mut(), ch3, std::ptr::null_mut()];
         let input3 = make_batch(schema, &[(1u128, -2, 42)]);
         let r3 = execute_epoch(&vm.program, &mut vm.regfile, input3, 0, 2, &cursors3, &[])
@@ -791,7 +791,7 @@ mod tests {
         assert_eq!(rows3.len(), 1);
         assert_eq!(rows3[0], (1, -1, 42)); // retraction
         unsafe {
-            drop(Box::from_raw(ch3 as *mut ReadCursor));
+            drop(Box::from_raw(ch3));
         }
     }
 
@@ -821,7 +821,7 @@ mod tests {
         table.ingest_owned_batch(trace_batch).unwrap();
 
         let cursor = table.open_cursor();
-        let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
+        let ch = Box::into_raw(Box::new(cursor));
 
         let mut builder = ProgramBuilder::new();
         // reg 0 = left delta, reg 1 = right trace, reg 2 = output
@@ -853,7 +853,7 @@ mod tests {
         assert_eq!(c1, 200);
 
         unsafe {
-            drop(Box::from_raw(ch as *mut ReadCursor));
+            drop(Box::from_raw(ch));
         }
     }
 
@@ -880,7 +880,7 @@ mod tests {
         table.ingest_owned_batch(trace_batch).unwrap();
 
         let cursor = table.open_cursor();
-        let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
+        let ch = Box::into_raw(Box::new(cursor));
 
         let mut builder = ProgramBuilder::new();
         builder.add_join_dt(0, 1, 2, right_schema);
@@ -908,7 +908,7 @@ mod tests {
         }
 
         unsafe {
-            drop(Box::from_raw(ch as *mut ReadCursor));
+            drop(Box::from_raw(ch));
         }
     }
 
@@ -1092,9 +1092,9 @@ mod tests {
 
         // Create cursors for trace registers
         let tr_out_cursor = trace_out_table.open_cursor();
-        let tr_out_ch = Box::into_raw(Box::new(tr_out_cursor)) as *mut libc::c_void;
+        let tr_out_ch = Box::into_raw(Box::new(tr_out_cursor));
         let tr_in_cursor = trace_in_table.open_cursor();
-        let tr_in_ch = Box::into_raw(Box::new(tr_in_cursor)) as *mut libc::c_void;
+        let tr_in_ch = Box::into_raw(Box::new(tr_in_cursor));
 
         let cursors1 = vec![
             std::ptr::null_mut(), // reg 0: delta
@@ -1115,10 +1115,10 @@ mod tests {
 
         // Cleanup
         unsafe {
-            drop(Box::from_raw(tr_out_ch as *mut ReadCursor));
+            drop(Box::from_raw(tr_out_ch));
         }
         unsafe {
-            drop(Box::from_raw(tr_in_ch as *mut ReadCursor));
+            drop(Box::from_raw(tr_in_ch));
         }
     }
 
@@ -1245,7 +1245,7 @@ mod tests {
         table.ingest_owned_batch(trace_batch).unwrap();
 
         let cursor = table.open_cursor();
-        let ch = Box::into_raw(Box::new(cursor)) as *mut libc::c_void;
+        let ch = Box::into_raw(Box::new(cursor));
 
         // Build: reg0=key input, reg1=trace, reg2=scan output
         let mut builder = ProgramBuilder::new();
@@ -1273,7 +1273,7 @@ mod tests {
         assert_eq!(pk0, 5);
 
         unsafe {
-            drop(Box::from_raw(ch as *mut ReadCursor));
+            drop(Box::from_raw(ch));
         }
     }
 
@@ -1469,9 +1469,9 @@ mod tests {
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
 
         let tr_out_cursor = trace_out_table.open_cursor();
-        let tr_out_ch = Box::into_raw(Box::new(tr_out_cursor)) as *mut libc::c_void;
+        let tr_out_ch = Box::into_raw(Box::new(tr_out_cursor));
         let tr_in_cursor = trace_in_table.open_cursor();
-        let tr_in_ch = Box::into_raw(Box::new(tr_in_cursor)) as *mut libc::c_void;
+        let tr_in_ch = Box::into_raw(Box::new(tr_in_cursor));
 
         let cursors = vec![
             std::ptr::null_mut(),
@@ -1493,10 +1493,10 @@ mod tests {
         assert_eq!(sum_val, 60, "SUM should be 60");
 
         unsafe {
-            drop(Box::from_raw(tr_out_ch as *mut ReadCursor));
+            drop(Box::from_raw(tr_out_ch));
         }
         unsafe {
-            drop(Box::from_raw(tr_in_ch as *mut ReadCursor));
+            drop(Box::from_raw(tr_in_ch));
         }
     }
 
@@ -1610,8 +1610,8 @@ mod tests {
         // Three rows all in the same group (same pk), values 10, 20, 30 → SUM=60
         let input = make_batch(in_schema, &[(1u128, 1, 10), (1u128, 1, 20), (1u128, 1, 30)]);
 
-        let tr_out_ch = Box::into_raw(Box::new(trace_out_table.open_cursor())) as *mut libc::c_void;
-        let tr_in_ch = Box::into_raw(Box::new(trace_in_table.open_cursor())) as *mut libc::c_void;
+        let tr_out_ch = Box::into_raw(Box::new(trace_out_table.open_cursor()));
+        let tr_in_ch = Box::into_raw(Box::new(trace_in_table.open_cursor()));
         let cursors = vec![std::ptr::null_mut(), tr_out_ch, tr_in_ch, std::ptr::null_mut()];
 
         let result = execute_epoch(&vm.program, &mut vm.regfile, input, 0, 3, &cursors, &[])
@@ -1623,10 +1623,10 @@ mod tests {
         assert_eq!(sum_val, 60, "SUM(10+20+30) must be 60");
 
         unsafe {
-            drop(Box::from_raw(tr_out_ch as *mut ReadCursor));
+            drop(Box::from_raw(tr_out_ch));
         }
         unsafe {
-            drop(Box::from_raw(tr_in_ch as *mut ReadCursor));
+            drop(Box::from_raw(tr_in_ch));
         }
     }
 
@@ -1665,7 +1665,7 @@ mod tests {
 
         // Epoch 1: supply a real cursor for reg 1.
         let cursor1 = table.open_cursor();
-        let ch1 = Box::into_raw(Box::new(cursor1)) as *mut libc::c_void;
+        let ch1 = Box::into_raw(Box::new(cursor1));
         let cursors1 = vec![std::ptr::null_mut(), ch1, std::ptr::null_mut()];
         execute_epoch(
             &vm.program,
@@ -1677,7 +1677,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        unsafe { drop(Box::from_raw(ch1 as *mut ReadCursor)) };
+        unsafe { drop(Box::from_raw(ch1)) };
         // ch1 is now freed; reg 1's cursor_ptr would be dangling if not cleared.
 
         // Epoch 2: pass null for the external trace register.

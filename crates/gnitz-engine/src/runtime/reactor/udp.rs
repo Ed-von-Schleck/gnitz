@@ -279,10 +279,91 @@ impl Drop for UdpRecvFuture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::foundation::posix_io::{udp_bind, udp_local_addr};
     use std::time::Duration;
 
     const BUF_BYTES: usize = 1 << 20;
+
+    /// Create + bind a UDP socket on `addr`. Requests `rcvbuf_bytes` /
+    /// `sndbuf_bytes` via SO_RCVBUF/SO_SNDBUF (best-effort; the kernel may
+    /// clamp). Returns the fd, or a negative value on error.
+    ///
+    /// The socket is left unconnected — every send carries an explicit
+    /// destination — and blocking (O_NONBLOCK is irrelevant under io_uring).
+    /// Test-only until the network transport binds its QUIC socket.
+    fn udp_bind(addr: std::net::SocketAddr, rcvbuf_bytes: usize, sndbuf_bytes: usize) -> i32 {
+        let family = match addr {
+            std::net::SocketAddr::V4(_) => libc::AF_INET,
+            std::net::SocketAddr::V6(_) => libc::AF_INET6,
+        };
+        unsafe {
+            let fd = libc::socket(family, libc::SOCK_DGRAM, 0);
+            if fd < 0 {
+                return -1;
+            }
+            if !set_sock_buf(fd, libc::SO_RCVBUF, rcvbuf_bytes) {
+                libc::close(fd);
+                return -2;
+            }
+            if !set_sock_buf(fd, libc::SO_SNDBUF, sndbuf_bytes) {
+                libc::close(fd);
+                return -3;
+            }
+            let (ss, len) = sockaddr_from_addr(&addr);
+            if libc::bind(fd, &ss as *const libc::sockaddr_storage as *const libc::sockaddr, len) < 0 {
+                libc::close(fd);
+                return -4;
+            }
+            fd
+        }
+    }
+
+    /// Set a socket buffer-size option (SO_RCVBUF / SO_SNDBUF). These options
+    /// take a *const c_int (4 bytes); passing a pointer to `usize` would hand
+    /// the kernel 4 of its 8 bytes — correct only by luck on little-endian.
+    /// Copy into a c_int and point at that.
+    unsafe fn set_sock_buf(fd: i32, opt: libc::c_int, bytes: usize) -> bool {
+        let v = bytes as libc::c_int;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            &v as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        ) >= 0
+    }
+
+    /// getsockname() as a SocketAddr — resolves the real port after a
+    /// port-0 bind. Returns None on error or non-INET family.
+    fn udp_local_addr(fd: i32) -> Option<std::net::SocketAddr> {
+        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let rc = unsafe { libc::getsockname(fd, &mut ss as *mut _ as *mut libc::sockaddr, &mut len) };
+        if rc < 0 {
+            return None;
+        }
+        addr_from_sockaddr(&ss)
+    }
+
+    #[test]
+    fn test_udp_bind_resolves_port() {
+        let fd = udp_bind("127.0.0.1:0".parse().unwrap(), BUF_BYTES, BUF_BYTES);
+        assert!(fd >= 0, "udp_bind failed: {fd}");
+        let local = udp_local_addr(fd).expect("udp_local_addr");
+        assert!(local.is_ipv4());
+        assert_eq!(local.ip().to_string(), "127.0.0.1");
+        assert_ne!(local.port(), 0, "port-0 bind must resolve to a real port");
+        close(fd);
+    }
+
+    #[test]
+    fn test_udp_bind_v6() {
+        let fd = udp_bind("[::1]:0".parse().unwrap(), BUF_BYTES, BUF_BYTES);
+        assert!(fd >= 0, "udp_bind v6 failed: {fd}");
+        let local = udp_local_addr(fd).expect("udp_local_addr");
+        assert!(local.is_ipv6());
+        assert_ne!(local.port(), 0);
+        close(fd);
+    }
 
     fn make_reactor() -> Reactor {
         Reactor::new(64).expect("reactor")

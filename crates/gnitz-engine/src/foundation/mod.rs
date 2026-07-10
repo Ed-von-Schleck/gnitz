@@ -4,14 +4,13 @@
 //!   - `log`        — the `gnitz_*` logging macros + level/tag state
 //!   - `codec`      — little-endian byte pack/unpack
 //!   - `xxh`        — XXH3 hashing
-//!   - `posix_io`   — fd I/O, fsync, fallocate, madvise, server socket, panic guard
-//!   - `syscall`    — non-blocking IPC syscalls (eventfd, futex, memfd, mmap_shared)
+//!   - `posix_io`   — POSIX I/O and Linux syscall wrappers (file I/O, sockets,
+//!     mmap, eventfd/futex/memfd IPC)
 //!   - `worker_ctx` — per-process worker rank / count
 
 #[macro_use]
 pub(crate) mod log;
 pub(crate) mod codec;
 pub(crate) mod posix_io;
-pub(crate) mod syscall;
 pub(crate) mod worker_ctx;
 pub(crate) mod xxh;

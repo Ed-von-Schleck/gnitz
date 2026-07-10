@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::foundation::posix_io;
-use crate::foundation::syscall;
 use crate::query::RelationKind;
 use crate::runtime::executor::ServerExecutor;
 use crate::runtime::master::MasterDispatcher;
@@ -348,10 +347,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     let catalog = match CatalogEngine::open(data_dir) {
         Ok(c) => c,
         Err(e) => {
-            let msg = format!("Error: failed to open catalog: {e}\n");
-            unsafe {
-                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
+            gnitz_error!("failed to open catalog: {e}");
             return 1;
         }
     };
@@ -379,27 +375,17 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
         )
     };
     if sal_fd < 0 {
-        let msg = b"Error: failed to open SAL file\n";
-        unsafe {
-            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
+        gnitz_error!("failed to open SAL file");
         return 1;
     }
     posix_io::try_set_nocow(sal_fd);
     // Check existing size and fallocate if needed
-    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::fstat(sal_fd, &mut stat);
+    if posix_io::fd_size(sal_fd).unwrap_or(0) < sal_mmap_size() {
+        let _ = posix_io::fallocate(sal_fd, sal_mmap_size() as i64);
     }
-    if (stat.st_size as usize) < sal_mmap_size() {
-        posix_io::fallocate(sal_fd, sal_mmap_size() as i64);
-    }
-    let sal_ptr = syscall::mmap_shared(sal_fd, sal_mmap_size());
+    let sal_ptr = posix_io::mmap_shared(sal_fd, sal_mmap_size());
     if sal_ptr.is_null() {
-        let msg = b"Error: failed to mmap SAL\n";
-        unsafe {
-            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
+        gnitz_error!("failed to mmap SAL");
         return 1;
     }
     // Pre-fault writable PTEs so the hot write path never page-faults.
@@ -426,10 +412,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             }
             posix_io::madvise_populate_write(sal_ptr, sal_mmap_size());
             if let Err(e) = std::fs::File::create(&v2_marker_path) {
-                let msg = format!("Error: failed to create wal.sal.v2 marker: {e}\n");
-                unsafe {
-                    libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-                }
+                gnitz_error!("failed to create wal.sal.v2 marker: {e}");
                 return 1;
             }
             gnitz_info!("First boot under V2: pre-V2 SAL discarded, shards are authoritative");
@@ -446,18 +429,12 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
         // its only durable copy (and gc_orphan_directories would later delete
         // the now-catalog-less entities' flushed shards).
         if let Err(e) = catalog.flush_all_system_tables() {
-            let msg = format!("Error: {e}\n");
-            unsafe {
-                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
+            gnitz_error!("{e}");
             return 1;
         }
         #[cfg(debug_assertions)]
         if std::env::var("GNITZ_INJECT_SYS_FLUSH_ERROR").is_ok() {
-            let msg = b"Error: injected system table flush fault\n";
-            unsafe {
-                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
+            gnitz_error!("injected system table flush fault");
             return 1;
         }
 
@@ -487,10 +464,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
         // Durably advance the checkpoint generation G → G+1 without publishing to
         // worker_ctx, closing the reset→boot_checkpoint crash window.
         if let Err(e) = catalog.recovery_start_generation_bump() {
-            let msg = format!("Error: recovery-start generation bump failed: {e}\n");
-            unsafe {
-                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
+            gnitz_error!("recovery-start generation bump failed: {e}");
             return 1;
         }
         inject_recovery_panic("genbump");
@@ -502,21 +476,15 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     let mut w2m_sizes: Vec<u64> = Vec::with_capacity(nw);
     for w in 0..nw {
         let name = format!("w2m_{w}");
-        let wfd = syscall::memfd_create(name.as_bytes());
+        let wfd = posix_io::memfd_create(name.as_bytes());
         if wfd < 0 {
-            let msg = b"Error: memfd_create failed\n";
-            unsafe {
-                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
+            gnitz_error!("memfd_create failed");
             return 1;
         }
-        posix_io::ftruncate(wfd, W2M_REGION_SIZE as i64);
-        let wptr = syscall::mmap_shared(wfd, W2M_REGION_SIZE);
+        let _ = posix_io::ftruncate(wfd, W2M_REGION_SIZE as i64);
+        let wptr = posix_io::mmap_shared(wfd, W2M_REGION_SIZE);
         if wptr.is_null() {
-            let msg = b"Error: mmap W2M failed\n";
-            unsafe {
-                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
+            gnitz_error!("mmap W2M failed");
             return 1;
         }
         // Hint THP backing for the W2M region (memfd/shmem backing).
@@ -536,12 +504,9 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     // --- M2W eventfds (master→worker signaling; W2M uses futex now) ---
     let mut m2w_efds: Vec<i32> = Vec::with_capacity(nw);
     for _ in 0..nw {
-        let m2w = syscall::eventfd_create();
+        let m2w = posix_io::eventfd_create();
         if m2w < 0 {
-            let msg = b"Error: eventfd_create failed\n";
-            unsafe {
-                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
+            gnitz_error!("eventfd_create failed");
             return 1;
         }
         m2w_efds.push(m2w);
@@ -568,10 +533,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     for w in 0..nw {
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            let msg = b"Error: fork failed\n";
-            unsafe {
-                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            }
+            gnitz_error!("fork failed");
             return 1;
         }
         if pid == 0 {
@@ -629,10 +591,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
             // directory, so a fixed `part_0` would collide. The inherited store is
             // empty; FLAG_PUSH replay (below) fills the re-homed store.
             if let Err(e) = catalog.rehome_single_partition_stores(part_start) {
-                let msg = format!("W{w} rehome single-partition stores failed: {e}\n");
-                unsafe {
-                    libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-                }
+                gnitz_error!("W{w} rehome single-partition stores failed: {e}");
             }
 
             // Construct channel types for this worker
@@ -705,10 +664,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     // Wait for all workers to complete recovery and signal readiness
     let dispatcher = unsafe { &mut *dispatcher_ptr };
     if let Err(e) = dispatcher.collect_acks() {
-        let msg = format!("Error collecting worker acks: {e}\n");
-        unsafe {
-            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
+        gnitz_error!("Error collecting worker acks: {e}");
         return 1;
     }
 
@@ -727,10 +683,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     // reachable base, on the freshly-reset SAL. Resumed views are extended;
     // invalid views are polluted (reset+rebuilt next).
     if let Err(e) = recovery_tick_sweep(catalog, dispatcher) {
-        let msg = format!("Error: recovery tick sweep failed: {e}\n");
-        unsafe {
-            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
+        gnitz_error!("recovery tick sweep failed: {e}");
         return 1;
     }
 
@@ -738,10 +691,7 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
 
     // Step-4: reset (on the workers) and rebuild only the invalid views.
     if let Err(e) = rebuild_invalid_views(catalog, dispatcher) {
-        let msg = format!("Error: invalid-view rebuild failed: {e}\n");
-        unsafe {
-            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
+        gnitz_error!("invalid-view rebuild failed: {e}");
         return 1;
     }
 
@@ -753,23 +703,19 @@ pub fn server_main(data_dir: &str, socket_path: &str, num_workers: u32, log_leve
     // it. No drain — recovery already drained everything and no pushes are admitted
     // yet.
     if let Err(e) = dispatcher.boot_checkpoint(num_workers) {
-        let msg = format!("Error: boot checkpoint failed: {e}\n");
-        unsafe {
-            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-        }
+        gnitz_error!("boot checkpoint failed: {e}");
         return 1;
     }
 
     // Create server socket and run executor
     gnitz_info!("Listening on {}", socket_path);
-    let server_fd = posix_io::server_create(socket_path);
-    if server_fd < 0 {
-        let msg = b"Error: failed to create server socket\n";
-        unsafe {
-            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+    let server_fd = match posix_io::server_create(socket_path) {
+        Ok(fd) => std::os::fd::IntoRawFd::into_raw_fd(fd),
+        Err(e) => {
+            gnitz_error!("failed to create server socket: {e}");
+            return 1;
         }
-        return 1;
-    }
+    };
     let msg = b"GnitzDB ready\n";
     unsafe {
         libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
@@ -854,7 +800,7 @@ mod recovery_tests {
 
             cur = write_ddl_group(ptr, cur, nw, 102, 6, 1, size as u64);
             // Sentinel for lsn=6.
-            let efds: Vec<i32> = (0..nw).map(|_| syscall::eventfd_create()).collect();
+            let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
             let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
             writer.reset(cur, 1);
             writer.write_commit_sentinel(6).unwrap();
@@ -885,7 +831,7 @@ mod recovery_tests {
             cur = write_ddl_group(ptr, cur, nw, 201, 9, 1, size as u64);
             cur = write_ddl_group(ptr, cur, nw, 202, 9, 1, size as u64);
 
-            let efds: Vec<i32> = (0..nw).map(|_| syscall::eventfd_create()).collect();
+            let efds: Vec<i32> = (0..nw).map(|_| posix_io::eventfd_create()).collect();
             let mut writer = SalWriter::new(ptr, -1, size as u64, efds.clone());
             writer.reset(cur, 1);
             writer.write_commit_sentinel(9).unwrap();
@@ -956,7 +902,7 @@ mod recovery_tests {
             assert_eq!(res.status, 0);
             // No sentinel — zone unclosed.
 
-            let efd = syscall::eventfd_create();
+            let efd = posix_io::eventfd_create();
             let reader = SalReader::new(ptr as *const u8, 0, size, efd);
             let committed = collect_committed_lsns(&reader);
             assert!(

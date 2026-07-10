@@ -42,7 +42,7 @@ pub(crate) fn execute_epoch(
     input_batch: Batch,
     input_reg: u16,
     output_reg: u16,
-    cursor_handles: &[*mut libc::c_void],
+    cursor_handles: &[*mut ReadCursor],
     owned_trace_reg_ids: &[(u16, usize)],
 ) -> Result<Option<Batch>, i32> {
     execute_epoch_multi(
@@ -68,7 +68,7 @@ pub(crate) fn execute_epoch_multi(
     regfile: &mut RegisterFile,
     inputs: impl IntoIterator<Item = (u16, Batch)>,
     output_reg: u16,
-    cursor_handles: &[*mut libc::c_void],
+    cursor_handles: &[*mut ReadCursor],
     owned_trace_reg_ids: &[(u16, usize)],
 ) -> Result<Option<Batch>, i32> {
     gnitz_debug!(

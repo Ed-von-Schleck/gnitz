@@ -4,7 +4,7 @@
 //! (`memtable.rs`).
 
 use std::ffi::CStr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use libc::c_int;
 
@@ -589,28 +589,19 @@ fn write_shard_streaming_inner(
 
     let tmp_name = super::super::cstr_with_tmp_suffix(basename)?;
 
-    unsafe {
-        let fd = libc::openat(
-            dirfd,
-            tmp_name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
-            0o644,
-        );
-        if fd < 0 {
-            return Err(StorageError::Io);
-        }
-        // SAFETY: fresh descriptor from `openat`; the `OwnedFd` is the sole
-        // closer, so every error return below closes it — `abort` only unlinks.
-        let fd = OwnedFd::from_raw_fd(fd);
+    // The `OwnedFd` is the sole closer, so every error return below closes
+    // it — `abort` only unlinks.
+    let fd =
+        crate::foundation::posix_io::openat_owned(dirfd, &tmp_name, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC)
+            .ok_or(StorageError::Io)?;
 
+    unsafe {
         let abort = || -> StorageError {
             libc::unlinkat(dirfd, tmp_name.as_ptr(), 0);
             StorageError::Io
         };
 
-        if libc::ftruncate(fd.as_raw_fd(), total_size as libc::off_t) < 0 {
-            return Err(abort());
-        }
+        crate::foundation::posix_io::ftruncate(fd.as_raw_fd(), total_size as i64).map_err(|_| abort())?;
 
         crate::foundation::posix_io::pwrite_all_fd(fd.as_raw_fd(), &hdr_buf, 0).map_err(|_| abort())?;
 

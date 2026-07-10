@@ -21,11 +21,11 @@ use std::time::{Duration, Instant};
 use crate::storage::batch_pool::PooledSendBuf;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::guard_panic;
 use crate::catalog::{
     CatalogEngine, FIRST_USER_TABLE_ID, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_ID,
     SEQ_TAB_ID, TABLE_TAB_ID, VIEW_TAB_ID,
 };
-use crate::foundation::posix_io::guard_panic;
 use crate::runtime::committer::{self, BarrierKind, CommitRequest};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{first_worker_error_opt, MasterDispatcher};

@@ -1634,7 +1634,7 @@ impl MasterDispatcher {
                     break; // still running
                 }
                 // rpid == -1
-                let err = crate::foundation::syscall::errno();
+                let err = crate::foundation::posix_io::errno();
                 if err == libc::EINTR {
                     continue; // signal, not death — retry
                 }

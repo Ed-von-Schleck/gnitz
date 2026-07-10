@@ -3,7 +3,7 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::foundation::syscall;
+use crate::foundation::posix_io;
 use crate::runtime::w2m_ring::{self, TryReserve, W2mRingHeader, FLAG_MASTER_PARKED, FLAG_WRITER_PARKED};
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire};
 
@@ -11,7 +11,7 @@ use crate::runtime::wire::{decode_wire_ipc, DecodedWire};
 // and `num_workers <= MAX_WORKERS`. Pin `MAX_WORKERS <= MAX_FUTEX_WAITV` here —
 // the one site that names both constants — so a future `MAX_WORKERS` bump that
 // outgrows the syscall cap is a build error, not a silent truncation.
-const _: () = assert!(crate::runtime::sal::MAX_WORKERS <= crate::foundation::syscall::MAX_FUTEX_WAITV);
+const _: () = assert!(crate::runtime::sal::MAX_WORKERS <= crate::foundation::posix_io::MAX_FUTEX_WAITV);
 
 /// Worker's write side of a single W2M ring.
 pub struct W2mWriter {
@@ -52,12 +52,12 @@ impl W2mWriter {
                     hdr.waiter_flags().fetch_or(FLAG_WRITER_PARKED, Ordering::AcqRel);
                     let room_now = unsafe { w2m_ring::has_room(hdr, sz) };
                     if !room_now {
-                        let rc = syscall::futex_wait_u32(hdr.writer_seq() as *const AtomicU32, expected, -1);
+                        let rc = posix_io::futex_wait_u32(hdr.writer_seq() as *const AtomicU32, expected, -1);
                         // libc::syscall returns -1 on error (not -errno); read errno
                         // directly. EINTR (signal) and EAGAIN (value already changed)
                         // are both harmless — retry. Anything else is fatal.
                         if rc < 0 {
-                            let errno = syscall::errno();
+                            let errno = posix_io::errno();
                             if errno != libc::EINTR && errno != libc::EAGAIN {
                                 crate::gnitz_fatal_abort!(
                                     "W2mWriter::send_encoded: futex_wait_u32 failed: \
@@ -83,12 +83,12 @@ impl W2mWriter {
 
         hdr.reader_seq().fetch_add(1, Ordering::Release);
         if hdr.waiter_flags().load(Ordering::Acquire) & FLAG_MASTER_PARKED != 0 {
-            let rc = syscall::futex_wake_u32(hdr.reader_seq() as *const AtomicU32, 1);
+            let rc = posix_io::futex_wake_u32(hdr.reader_seq() as *const AtomicU32, 1);
             if rc < 0 {
                 crate::gnitz_fatal_abort!(
                     "W2mWriter::send_encoded: futex_wake_u32 failed: rc={} errno={}",
                     rc,
-                    syscall::errno(),
+                    posix_io::errno(),
                 );
             }
         }
@@ -168,12 +168,12 @@ impl InFlightState {
             self.hdr.advance_consume_cursor(last_vrc);
             self.hdr.writer_seq().fetch_add(1, Ordering::Release);
             if self.hdr.waiter_flags().load(Ordering::Acquire) & FLAG_WRITER_PARKED != 0 {
-                let rc = syscall::futex_wake_u32(self.hdr.writer_seq() as *const AtomicU32, 1);
+                let rc = posix_io::futex_wake_u32(self.hdr.writer_seq() as *const AtomicU32, 1);
                 if rc < 0 {
                     crate::gnitz_fatal_abort!(
                         "W2mSlot::drop: futex_wake_u32 failed: rc={} errno={}",
                         rc,
-                        syscall::errno(),
+                        posix_io::errno(),
                     );
                 }
             }
@@ -300,7 +300,7 @@ impl W2mReceiver {
         let rc = if has_unread {
             0
         } else {
-            syscall::futex_wait_u32(hdr.reader_seq() as *const AtomicU32, expected, timeout_ms)
+            posix_io::futex_wait_u32(hdr.reader_seq() as *const AtomicU32, expected, timeout_ms)
         };
         hdr.waiter_flags().fetch_and(!FLAG_MASTER_PARKED, Ordering::AcqRel);
         rc
@@ -343,7 +343,7 @@ impl W2mReceiver {
         if n == 0 {
             return 0;
         }
-        syscall::futex_waitv_u32(&ptrs[..n], &expected[..n], timeout_ms)
+        posix_io::futex_waitv_u32(&ptrs[..n], &expected[..n], timeout_ms)
     }
 
     pub fn num_workers(&self) -> usize {

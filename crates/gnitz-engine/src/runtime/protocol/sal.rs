@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::foundation::codec::{align8, read_u32_raw, read_u64_raw, write_u32_raw, write_u64_raw};
 use crate::foundation::posix_io;
-use crate::foundation::syscall;
 use crate::runtime::wire::{
     build_schema_wire_block, encode_ctrl_block_direct, encode_wire_into, layout_to_wire_flags, wire_size,
     CTRL_BLOCK_SIZE_NO_BLOB, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK,
@@ -1203,12 +1202,12 @@ impl SalWriter {
 
     pub fn signal_all(&self) {
         for w in 0..self.num_workers {
-            syscall::eventfd_signal(self.m2w_efds[w]);
+            posix_io::eventfd_signal(self.m2w_efds[w]);
         }
     }
 
     pub fn signal_one(&self, worker: usize) {
-        syscall::eventfd_signal(self.m2w_efds[worker]);
+        posix_io::eventfd_signal(self.m2w_efds[worker]);
     }
 
     pub fn needs_checkpoint(&self) -> bool {
@@ -1315,6 +1314,6 @@ impl SalReader {
     }
 
     pub fn wait(&self, timeout_ms: i32) -> i32 {
-        syscall::eventfd_wait(self.m2w_efd, timeout_ms)
+        posix_io::eventfd_wait(self.m2w_efd, timeout_ms)
     }
 }

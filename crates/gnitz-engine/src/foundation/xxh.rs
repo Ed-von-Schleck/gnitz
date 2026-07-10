@@ -3,8 +3,6 @@ use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 /// Hash a 128-bit key to a 64-bit hash via XXH3-64.
 #[inline]
 pub fn hash_u128(pk: u128) -> u64 {
-    // `pk.to_le_bytes()` is byte-for-byte the low-half-then-high-half layout
-    // the lo/hi split produced, so the hash output is unchanged.
     xxh3_64(&pk.to_le_bytes())
 }
 
@@ -34,7 +32,6 @@ mod tests {
     #[test]
     fn hash_u128_zero_extension_invariant() {
         assert_eq!(hash_u128(42u64 as u128), hash_u128(42u128));
-        assert_eq!(hash_u128(u64::MAX as u128), hash_u128(u64::MAX as u128));
     }
 
     #[test]
@@ -46,14 +43,6 @@ mod tests {
     fn different_keys_differ() {
         assert_ne!(hash_u128(pk(1, 2)), hash_u128(pk(2, 1)));
         assert_ne!(hash_u128(pk(0, 0)), hash_u128(pk(0, 1)));
-    }
-
-    #[test]
-    fn hash_u128_equals_checksum_of_le_bytes() {
-        // The simplified body must be bit-identical to checksum(&to_le_bytes()).
-        for k in [0u128, 1, 42, u64::MAX as u128, pk(7, 13), pk(u64::MAX, 1), u128::MAX] {
-            assert_eq!(hash_u128(k), checksum(&k.to_le_bytes()));
-        }
     }
 
     #[test]
