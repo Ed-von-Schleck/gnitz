@@ -922,12 +922,17 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
     // would be routed to handle_scan, whose streamed table dump desyncs push
     // reply readers (they read exactly one frame).
     if flags & gnitz_wire::FLAG_PUSH != 0 && (!has_batch || batch_count == 0) {
-        // Same existence check as the INSERT path below; system-table ids are
-        // fixed and always present, so only user tables are probed.
-        if target_id >= FIRST_USER_TABLE_ID && !shared.cat().has_id(target_id) {
-            let msg = format!("table {target_id} not found");
-            send_error(peer, target_id, client_id, msg.as_bytes()).await;
-            return;
+        // Same existence + writability gate as the INSERT path below; system
+        // tids are fixed and always present, so only user tables are probed.
+        // An empty push commits nothing, but a view target is rejected here
+        // too so a client bug that happens to produce an empty batch (e.g.
+        // `delete` with an empty pk list) fails the same way a non-empty one
+        // does instead of being masked by a no-op ACK.
+        if target_id >= FIRST_USER_TABLE_ID {
+            let _cat = shared.catalog_rwlock.read().await;
+            if push_target_rejected(shared, peer, target_id, client_id).await {
+                return;
+            }
         }
         send_ok_response(shared, peer, target_id, None, client_id, 0, client_version).await;
         return;
@@ -955,9 +960,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>, bound_cli
         let batch = decoded.data_batch.unwrap();
 
         let _cat = shared.catalog_rwlock.read().await;
-        if !shared.cat().has_id(target_id) {
-            let msg = format!("table {target_id} not found");
-            send_error(peer, target_id, client_id, msg.as_bytes()).await;
+        if push_target_rejected(shared, peer, target_id, client_id).await {
             return;
         }
         // Acquire all FK-related table locks in ascending tid order.
@@ -1886,6 +1889,32 @@ async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8
     // flags=0: client ignores schema version on error responses.
     let buf = encode_response_buffer(target_id, client_id, None, STATUS_ERROR, error_msg, None, 0, 0);
     peer.send_buffer_or_close(buf).await;
+}
+
+/// Existence + writability gate shared by the empty-push and INSERT arms.
+/// A view registers into the same id space as base tables (shared
+/// `next_table_id`), so a raw client push addressed to a view tid would
+/// otherwise commit rows into the view's output store that its circuit
+/// never produced — permanently divergent derived state. Only base tables
+/// are push targets; system-catalog tids never reach this (both arms gate
+/// on `FIRST_USER_TABLE_ID`). Caller holds the catalog read lock. Returns
+/// `true` iff an error frame was sent and the caller must return.
+async fn push_target_rejected(shared: &Shared, peer: &Peer, target_id: i64, client_id: u64) -> bool {
+    // `kind` is `Copy`; `.map` ends the `dag.tables` borrow before the
+    // awaits below.
+    match shared.cat().dag.tables.get(&target_id).map(|e| e.kind) {
+        None => {
+            let msg = format!("table {target_id} not found");
+            send_error(peer, target_id, client_id, msg.as_bytes()).await;
+            true
+        }
+        Some(kind) if !kind.is_base_table() => {
+            let msg = format!("table {target_id} is not writable: pushes must target a base table");
+            send_error(peer, target_id, client_id, msg.as_bytes()).await;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Emit a closed catalog zone to the SAL: broadcast each drained family batch

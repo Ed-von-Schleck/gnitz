@@ -349,6 +349,65 @@ def test_graceful_shutdown_resumes_without_backfill():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_rejected_view_push_leaves_no_trace_across_restart():
+    """A push addressed to a view tid is rejected before anything commits, so
+    nothing divergent reaches the view's output store or its checkpoint. The
+    graceful shutdown persists every view store and the restart *resumes* from
+    that checkpoint (rebuilt count 0) — so the post-restart scan reads the
+    checkpointed store itself, which must be byte-for-byte the circuit's own
+    output. A rebuild would re-derive the view from base and silently repair
+    any corruption, proving nothing."""
+    tmpdir = tempfile.mkdtemp(
+        dir=os.path.expanduser("~/git/gnitz/tmp"),
+        prefix="gnitz_persist_vguard_",
+    )
+    data_dir = os.path.join(tmpdir, "data")
+    sock_path = os.path.join(tmpdir, "gnitz.sock")
+
+    try:
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        conn.create_schema("vguard")
+        conn.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name="vguard",
+        )
+        conn.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM t WHERE val > 50",
+            schema_name="vguard",
+        )
+        conn.execute_sql("INSERT INTO t VALUES (1, 100), (2, 10)", schema_name="vguard")
+        vid, v_schema = conn.resolve_table("vguard", "v")
+        before = sorted((r.pk, r.val, r.weight) for r in conn.scan(vid))
+        assert before == [(1, 100, 1)], f"pre-push view content wrong: {before}"
+
+        batch = gnitz.ZSetBatch(v_schema)
+        batch.append(pk=999, val=999)
+        with pytest.raises(gnitz.GnitzError, match="not writable"):
+            conn.push(vid, batch)
+        with pytest.raises(gnitz.GnitzError, match="not writable"):
+            conn.delete(vid, v_schema, [1])
+        conn.close()
+
+        rc = _graceful_stop_server(proc)
+        assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        proc = _start_server(data_dir, sock_path, workers=_NUM_WORKERS)
+        conn = gnitz.connect(sock_path)
+        vid2, _ = conn.resolve_table("vguard", "v")
+        after = sorted((r.pk, r.val, r.weight) for r in conn.scan(vid2))
+        assert after == before, f"view changed across restart: {before} -> {after}"
+        conn.close()
+
+        n = _rebuilt_view_count(proc)
+        assert n == 0, f"restart must resume from the checkpoint, but rebuilt {n} view(s)"
+        _stop_server(proc)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_nonexchange_view_retains_unflushed_data_after_restart():
     """A non-exchange (projection) view must reflect ACKed-but-unflushed base
     rows after a crash restart. The INSERT is fdatasync'd to the SAL but never

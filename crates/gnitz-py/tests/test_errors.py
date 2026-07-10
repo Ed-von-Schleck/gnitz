@@ -145,6 +145,114 @@ class TestSchemaMismatch:
 
 
 # ---------------------------------------------------------------------------
+# Push target writability — a view's tid lives in the same id space as base
+# tables, so a raw-client push/delete addressed to a view would otherwise
+# commit rows into the view's output store that its circuit never produced.
+# SQL DML already refuses view targets in the binder; the raw push API is the
+# only exposure, and the server is the only place the guard can live (the
+# client's schema cache carries no relation kind).
+# ---------------------------------------------------------------------------
+
+_NOT_WRITABLE = "is not writable: pushes must target a base table"
+
+
+class TestPushViewTargetRejected:
+    def _make_table_and_view(self, client, sn):
+        """t(pk, val) with a filter view v; rows (1,100) in v, (2,10) not."""
+        client.create_schema(sn)
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT * FROM t WHERE val > 50",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO t VALUES (1, 100), (2, 10)", schema_name=sn)
+        tid, t_schema = client.resolve_table(sn, "t")
+        vid, v_schema = client.resolve_table(sn, "v")
+        return tid, t_schema, vid, v_schema
+
+    def _teardown(self, client, sn):
+        for sql in ["DROP VIEW v", "DROP TABLE t"]:
+            try:
+                client.execute_sql(sql, schema_name=sn)
+            except Exception:
+                pass
+        try:
+            client.drop_schema(sn)
+        except Exception:
+            pass
+
+    def _view_rows(self, client, vid):
+        return sorted((r.pk, r.val, r.weight) for r in client.scan(vid))
+
+    def test_push_to_view_rejected_content_unchanged(self, client):
+        """A non-empty push to a view tid errors on both the cold path (schema
+        block on the wire) and the warm path (schema-omitted after a scan),
+        and the view's content is untouched either way."""
+        sn = "err" + _uid()
+        try:
+            _, _, vid, v_schema = self._make_table_and_view(client, sn)
+            batch = gnitz.ZSetBatch(v_schema)
+            batch.append(pk=999, val=999)
+            # Cold path: no prior scan, the push frame carries a schema block.
+            with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
+                client.push(vid, batch)
+            before = self._view_rows(client, vid)
+            assert before == [(1, 100, 1)]
+            # Warm path: the scan above cached the view schema client-side.
+            with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
+                client.push(vid, batch)
+            assert self._view_rows(client, vid) == before
+        finally:
+            self._teardown(client, sn)
+
+    def test_delete_to_view_rejected_content_unchanged(self, client):
+        """delete is a plain negative-weight push — same rejection."""
+        sn = "err" + _uid()
+        try:
+            _, _, vid, v_schema = self._make_table_and_view(client, sn)
+            before = self._view_rows(client, vid)
+            with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
+                client.delete(vid, v_schema, [1])
+            assert self._view_rows(client, vid) == before
+        finally:
+            self._teardown(client, sn)
+
+    def test_empty_push_to_view_rejected(self, client):
+        """The empty-push arm applies the same gate: a client bug that happens
+        to produce an empty batch fails identically instead of being masked by
+        the no-op ACK."""
+        sn = "err" + _uid()
+        try:
+            _, _, vid, v_schema = self._make_table_and_view(client, sn)
+            empty = gnitz.ZSetBatch(v_schema)
+            with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
+                client.push(vid, empty)
+        finally:
+            self._teardown(client, sn)
+
+    def test_empty_push_to_base_table_still_noop_acks(self, client):
+        sn = "err" + _uid()
+        try:
+            tid, t_schema, _, _ = self._make_table_and_view(client, sn)
+            empty = gnitz.ZSetBatch(t_schema)
+            assert client.push(tid, empty) == 0
+        finally:
+            self._teardown(client, sn)
+
+    def test_push_to_absent_tid_still_not_found(self, client):
+        """The consolidated gate preserves the existence-check semantics: a
+        genuinely absent tid reports 'not found', not 'not writable'."""
+        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
+        batch = gnitz.ZSetBatch(gnitz.Schema(cols))
+        batch.append(pk=1)
+        with pytest.raises(gnitz.GnitzError, match="not found"):
+            client.push(99999999, batch)
+
+
+# ---------------------------------------------------------------------------
 # Schema construction limits
 # ---------------------------------------------------------------------------
 
